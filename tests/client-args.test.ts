@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { clientCommandCandidate, handleClientCommand, parseClientArgs } from "../packages/host/src/client.js";
+import { clientCommandCandidate, handleClientCommand, outcomeCellLines, parseClientArgs } from "../packages/host/src/client.js";
+import type { CellsResult } from "../packages/host/src/outcome-reads.js";
 
 test("codex defaults to cloud execution; --laptop is the explicit opt-in", () => {
   const cloud = parseClientArgs(["codex", "--model", "m", "Inspect"]);
@@ -86,4 +87,35 @@ test("team review logs are a view flag and do not replace json", () => {
   assert.equal(parsed.options["--logs"], true);
   assert.throws(() => parseClientArgs(["team", "status", "team-1", "--logs", "--json"]), /either --logs or --json/);
   assert.throws(() => parseClientArgs(["list", "--logs"]), /--logs applies to infinite team/);
+});
+
+test("cell lines show unknown beside every rate", () => {
+  const level = (yes: number, no: number, unknown: number, rate: number | null, interval: [number, number] | null) => ({ yes, no, unknown, rate, interval });
+  const none = level(0, 0, 0, null, null);
+  const cell = (key: Record<string, string>, levels: Partial<Record<"integrated" | "accepted" | "firstPass" | "held", ReturnType<typeof level>>>) => ({
+    key, sources: ["production"], from: null, to: null, attempts: 4, open: 0,
+    excluded: { limit: 0, owner: 0, host: 0, duel: 0 }, withheld: { backfilled: 0, gap: 0, unfrozen: 0 },
+    flagged: { backfilled: 0, gap: 0, "empty-result": 0, "same-model-review": 0 },
+    levels: { integrated: none, accepted: none, firstPass: none, held: none, ...levels },
+    tokens: null, spentUsd: null, listUsd: null, minutes: null, ownerRating: null, enough: false,
+  });
+  const result = (cells: unknown[], unreadable = 0) => ({ cells, unreadable }) as unknown as CellsResult;
+
+  const [line] = outcomeCellLines(result([cell({ profile: "light" }, { accepted: level(1, 0, 3, 1, [0.21, 1]) })]));
+  assert.ok(line!.includes("1 yes, 0 no, 3 unknown"), line);
+  assert.ok(line!.includes("fewer than 10 counted attempts"), line);
+
+  const [unknownRate] = outcomeCellLines(result([cell({ profile: "light" }, {})]));
+  assert.ok(unknownRate!.includes("rate unknown"), unknownRate);
+  assert.ok(!unknownRate!.includes("0%"), "a null rate never prints as 0%");
+
+  const [controlled] = outcomeCellLines(result([cell({ profile: "li\u0007ght" }, {})]));
+  assert.ok(controlled!.includes("profile=li ght"), controlled);
+
+  assert.deepEqual(outcomeCellLines(result([])), ["No outcome rows match."]);
+
+  const parsed = parseClientArgs(["usage", "outcomes", "--by", "profile", "--sources", "production,duel", "--days", "7"]);
+  assert.equal(parsed.options["--by"], "profile");
+  assert.equal(parsed.options["--sources"], "production,duel");
+  assert.equal(parsed.options["--days"], "7");
 });

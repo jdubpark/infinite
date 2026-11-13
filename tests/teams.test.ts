@@ -3318,3 +3318,40 @@ test("an unreadable record directory keeps the run's evidence", { skip: process.
     assert.equal(evidence.events({ runId: f.run.id, limit: 10 }).events.length, 1);
   } finally { chmodSync(directory, 0o700); evidence.close(); teams.close(); f.close(); }
 });
+
+test("a steered run keeps its integrated attempts in the scorecard", { timeout: 180000 }, async () => {
+  // The usage scenario assigns each task a configured implementer profile, which the scorecard needs.
+  const lineup = structuredClone(mixedLineup);
+  lineup.implementers = [lineup.implementers[0]!, { id: "deepseek-high", label: "DeepSeek implementer", provider: "opencode", model: "deepseek/deepseek-flash", variant: "high", tier: "light", dataUse: "contributor" }];
+  const f = await fixture("usage", lineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const settled = await f.settled(created.body.id);
+    assert.equal(settled.status, "ready-for-review", JSON.stringify(settled));
+    const before = await waitFor(() => f.host.fetchApi(`/outcomes/runs/${settled.id}`, "owner"), response => response.status === 200 && response.body.rows.length > 0, 30000);
+    const integratedBefore = before.body.rows.filter((row: { integrated: number | null }) => row.integrated === 1).map((row: { memberId: string }) => row.memberId);
+    assert.ok(integratedBefore.length > 0);
+
+    const steer = { requestId: randomUUID(), revision: settled.revision, text: "Keep the original acceptance criteria and add nothing new." };
+    let steered = await f.host.fetchApi(`/teams/${settled.id}/steer`, "owner", steer);
+    for (let attempt = 0; attempt < 40 && steered.status === 409 && steered.body.code === "team-operation-running"; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      steered = await f.host.fetchApi(`/teams/${settled.id}/steer`, "owner", steer);
+    }
+    assert.equal(steered.status, 200, JSON.stringify(steered.body));
+    const finished = await waitFor(() => f.get(settled.id), run => run.revision > settled.revision && ["ready-for-review", "merged", "blocked"].includes(run.status), 90000);
+
+    const view = await waitFor(() => f.host.fetchApi(`/outcomes/runs/${settled.id}`, "owner"), response => response.status === 200, 30000);
+    for (const memberId of integratedBefore) {
+      const row = view.body.rows.find((candidate: { memberId: string }) => candidate.memberId === memberId);
+      assert.equal(row?.integrated, 1, `row ${memberId} stays integrated after the steer`);
+    }
+    const integratedRows = view.body.rows.filter((row: { integrated: number | null }) => row.integrated === 1).length;
+    const summed = (models: { rows: { integrated: number }[] }) => models.rows.reduce((sum, row) => sum + row.integrated, 0);
+    const models = await waitFor(() => f.host.fetchApi("/usage/models"), response => response.status === 200 && summed(response.body) === integratedRows, 30000);
+    assert.equal(summed(models.body), integratedRows);
+    const currentIntegrated = finished.tasks.filter(task => task.status === "integrated").length;
+    assert.ok(integratedRows > currentIntegrated, `${integratedRows} integrated rows against ${currentIntegrated} in the current revision`);
+  } finally { await f.close(); }
+});

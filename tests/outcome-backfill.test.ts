@@ -8,7 +8,7 @@ import { configurationModule } from "../packages/host/src/configuration-store.js
 import type { EvidenceIndexClass } from "../packages/host/src/evidence/crypto.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { EventOutbox } from "../packages/host/src/evidence/outbox.js";
-import { backfillRun, backfillTick } from "../packages/host/src/outcome-backfill.js";
+import { backfillRun, backfillTick, outcomeBackfill } from "../packages/host/src/outcome-backfill.js";
 import { type OutcomeRow, type RunSummaryRow, outcomeModule, readOutcome, readSummary, writeOutcome, writeSummary } from "../packages/host/src/outcome-store.js";
 import { runEventKey } from "../packages/host/src/run-events.js";
 import type { TeamContinuation, TeamMember, TeamRun, TeamTask } from "../packages/host/src/team-types.js";
@@ -364,6 +364,34 @@ test("a summary that an event made first takes the record's facts", () => {
     assert.deepEqual(known?.flags, ["gap"]);
   } finally {
     close();
+  }
+});
+
+test("the first backfill call writes every run", () => {
+  const { store, close } = openStore();
+  try {
+    const all = Array.from({ length: 25 }, (_, index) => approvedRun(`run-${String(index).padStart(2, "0")}`));
+    let calls = 0;
+    const drive = outcomeBackfill(store, () => { calls += 1; return all; }, { mapOf: () => undefined, limit: 20, now: () => AT });
+    // The scorecard reads these rows, so the first call leaves no run for a later minute.
+    drive();
+    assert.equal(calls, 1);
+    for (const item of all) assert.ok(store.read(db => readSummary(db, item.id)), item.id);
+    drive();
+    assert.equal(calls, 1, "nothing remained, so the driver stopped for good");
+  } finally {
+    close();
+  }
+
+  const unready = openStore(false);
+  try {
+    let calls = 0;
+    const drive = outcomeBackfill(unready.store, () => { calls += 1; return [approvedRun("run-x")]; }, { mapOf: () => undefined, now: () => AT });
+    drive();
+    drive();
+    assert.equal(calls, 0);
+  } finally {
+    unready.close();
   }
 });
 

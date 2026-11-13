@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 import { evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { teamLineupSchema } from "../packages/host/src/team-types.js";
 import { startHost, waitFor } from "./helpers.js";
-import { fixture } from "./team-fixture.js";
+import { fixture, mixedLineup } from "./team-fixture.js";
 
 const coordinator = { id: "coordinator", label: "Coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" };
 const lineup = {
@@ -247,5 +247,102 @@ test("a host with no events for a run rebuilds its rows at the next start", { ti
       assert.deepEqual([row.integrated, row.accepted, row.firstPass, row.held], [1, 1, 1, null], JSON.stringify(row));
     }
     assert.deepEqual(view.body.members, [], "member results are not backfilled");
+  } finally { await f.close(); }
+});
+
+test("display cells over a full run", { timeout: 120000 }, async () => {
+  const f = await fixture();
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const run = await f.settled(created.body.id);
+    assert.equal(run.status, "ready-for-review", JSON.stringify(run));
+    const view = await waitFor(() => f.host.fetchApi(`/outcomes/runs/${run.id}`, "owner"), response => response.status === 200 && response.body.rows.length === 2, 30000);
+    const implementerRows = view.body.rows.filter((row: { role: string }) => row.role === "implementer").length;
+    assert.equal(implementerRows, 2);
+
+    const cells = await f.host.fetchApi("/outcomes?by=profile", "viewer");
+    assert.equal(cells.status, 200, JSON.stringify(cells.body));
+    assert.equal(cells.body.use, "display");
+    assert.deepEqual(cells.body.query, { role: "implementer", by: ["profile"], sources: ["production"] });
+    assert.equal(cells.body.unreadable, 0);
+    assert.equal(cells.body.cells.reduce((sum: number, cell: { attempts: number }) => sum + cell.attempts, 0), implementerRows);
+    for (const cell of cells.body.cells) {
+      // This fixture's members have no effort, and a missing effort adds no key entry.
+      assert.deepEqual(Object.keys(cell.key).sort(), ["epoch", "model", "profile", "provider"]);
+      assert.deepEqual(cell.sources, ["production"]);
+    }
+
+    const legacy = await f.host.fetchApi("/outcomes?sources=legacy", "owner");
+    assert.equal(legacy.status, 200);
+    assert.deepEqual(legacy.body.cells, []);
+
+    for (const query of ["by=owner", "by=profile,profile", "days=0", "role=reviewer"])
+      assert.equal((await f.host.fetchApi(`/outcomes?${query}`, "owner")).status, 400, query);
+  } finally { await f.close(); }
+});
+
+test("the outcomes command prints cells", { timeout: 120000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "inf-outcome-cells-cli-"));
+  const f = await fixture();
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const run = await f.settled(created.body.id);
+    assert.equal(run.status, "ready-for-review", JSON.stringify(run));
+    await waitFor(() => f.host.fetchApi(`/outcomes/runs/${run.id}`, "owner"), response => response.status === 200 && response.body.rows.length === 2, 30000);
+
+    const owner = clientCli(f.host, root, "owner");
+    const lines = (await owner("usage", "outcomes", "--by", "profile")).stdout.trim().split("\n");
+    assert.ok(lines.length >= 1);
+    for (const line of lines) assert.ok(line.includes("attempts"), line);
+
+    const json = JSON.parse((await owner("usage", "outcomes", "--by", "profile", "--json")).stdout);
+    assert.ok(Array.isArray(json.cells));
+    assert.equal(json.use, "display");
+
+    await assert.rejects(owner("usage", "outcomes", "--days", "0"), (error: { stderr?: string }) => {
+      assert.match(error.stderr ?? "", /The host refused the outcome query\./);
+      return true;
+    });
+  } finally {
+    await f.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an advanced epoch retires a profile's scorecard row", { timeout: 180000 }, async () => {
+  const lineup = structuredClone(mixedLineup);
+  lineup.implementers = [lineup.implementers[0]!, { id: "deepseek-high", label: "DeepSeek implementer", provider: "opencode", model: "deepseek/deepseek-flash", variant: "high", tier: "light", dataUse: "contributor" }];
+  const f = await fixture("usage", lineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const settled = await f.settled(created.body.id);
+    assert.equal(settled.status, "ready-for-review", JSON.stringify(settled));
+    const profiles = (body: { rows: { profileId: string }[] }) => body.rows.map(row => row.profileId).sort();
+    const before = await waitFor(() => f.host.fetchApi("/usage/models"), response => response.status === 200 && response.body.rows.length === 2, 30000);
+    assert.deepEqual(profiles(before.body), ["deepseek-high", lineup.implementers[0]!.id].sort());
+
+    // The owner says the backend behind this profile changed. No attempt has started under the new epoch, so the
+    // old history must not stand as the profile's row.
+    const advanced = await f.host.fetchApi("/outcomes/epochs", "owner", { profileId: "deepseek-high", requestId: randomUUID() });
+    assert.equal(advanced.status, 200, JSON.stringify(advanced.body));
+    assert.equal(advanced.body.epoch, 2);
+    const after = await f.host.fetchApi("/usage/models");
+    assert.equal(after.status, 200, JSON.stringify(after.body));
+    assert.deepEqual(profiles(after.body), [lineup.implementers[0]!.id]);
+
+    // A run that starts after the advance is stamped with the new epoch, and the profile's row starts again from
+    // those attempts only. This holds only if the projector's stamp and the route's lookup use the same identity.
+    const second = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(second.status), JSON.stringify(second.body));
+    const again = await f.settled(second.body.id);
+    assert.equal(again.status, "ready-for-review", JSON.stringify(again));
+    const view = await waitFor(() => f.host.fetchApi(`/outcomes/runs/${again.id}`, "owner"), response => response.status === 200 && response.body.rows.length > 0, 30000);
+    const fresh = view.body.rows.filter((row: { profileId: string }) => row.profileId === "deepseek-high");
+    assert.ok(fresh.length > 0, JSON.stringify(view.body.rows));
+    for (const row of fresh) assert.equal(row.profileEpoch, 2, JSON.stringify(row));
+    const restarted = await waitFor(() => f.host.fetchApi("/usage/models"), response => response.status === 200 && response.body.rows.length === 2, 30000);
+    const deepseek = restarted.body.rows.find((row: { profileId: string }) => row.profileId === "deepseek-high");
+    assert.equal(deepseek.attempts, fresh.length, "only the attempts of the new epoch count");
   } finally { await f.close(); }
 });

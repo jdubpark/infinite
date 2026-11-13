@@ -270,9 +270,9 @@ A goal roll-up sums the run summaries and rows that carry the goal id. A mission
 
 ### Part 7. Reads
 
-**Scorecard.** `GET /api/usage/models` returns the same `ModelUsage` shape, built from rows with source `production`. `attempts` is the ended rows with no exclusion, `integrated` is the rows with integrated yes, and `meanReviewRounds` uses `rounds.run`. The other fields read the payload. The response gains two additive fields, `sources` and `excluded`. `infinite usage models` needs no change.
+**Scorecard.** `GET /api/usage/models` returns the same `ModelUsage` shape, built from rows with source `production`. `attempts` is the counted rows, `integrated` is the rows with integrated yes, and `meanReviewRounds` uses `rounds.run`. The other fields read the payload. The response gains two additive fields: `sources` at the top (`["production"]`), and `excluded` on each row (`limit`, `owner`, `host`, `duel` counts). `infinite usage models` needs no change. When the store is unavailable the route answers 503 with `code: "evidence-unavailable"`; it does not fall back to run records.
 
-The numbers change in three ways, on purpose. An attempt integrated before a steer, a resume, or a continuation now counts. An attempt from a deleted run stays. Owner stops and host stops leave the denominator.
+The numbers change on purpose. Three changes are named here: an attempt integrated before a steer, a resume, or a continuation now counts; an attempt from a deleted run stays; owner stops and host stops leave the denominator. Five more are listed in `docs/teams.md`, "Model scorecard".
 
 **Cells.** Other designs call one in-process query:
 
@@ -287,24 +287,26 @@ type CellQuery = {
 type LevelCount = { yes: number; no: number; unknown: number; rate: number | null; interval: [number, number] | null };
 type Spread = { n: number; median: number; iqr: [number, number] };
 type Cell = {
-  key: Record<string, string>; sources: Source[]; from: string; to: string;
+  key: Record<string, string>; sources: Source[]; from: string | null; to: string | null;
   attempts: number; open: number; excluded: { limit: number; owner: number; host: number; duel: number };
+  withheld: { backfilled: number; gap: number; unfrozen: number };
+  flagged: { backfilled: number; gap: number; "empty-result": number; "same-model-review": number };
   levels: { integrated: LevelCount; accepted: LevelCount; firstPass: LevelCount; held: LevelCount };
+  completed?: LevelCount;                  // role "scout" only
   tokens: Spread | null; spentUsd: Spread | null; listUsd: Spread | null; minutes: Spread | null;
-  ownerRating: { mean: number; n: number } | null;
-  enough: boolean;
+  ownerRating: { mean: number; n: number } | null; enough: boolean;
 };
 ```
 
-For role `scout`, a cell leaves the four levels empty and reports a fifth count, `completed`.
+For role `scout`, a cell leaves the four levels empty and reports a fifth count, `completed`. `withheld` counts the rows a `decision` cannot use, and `flagged` counts the rows a `display` reports with a flag, so no left-out row is silent. `from` and `to` are null when no row has a time. The query result is `{ cells, unreadable }`, where `unreadable` counts rows whose payload did not open.
 
-A `decision` query refuses the `legacy` source. It leaves out an integrated row that is not frozen, and it includes a row that ended without integration as soon as the attempt ends.
+A `decision` query refuses the `legacy` source, and a `decision` without `profile` in `by` (`decision-without-profile`), because a cell that pools profiles pools their epochs. It leaves out an integrated row that is not frozen, and it includes a row that ended without integration as soon as the attempt ends.
 
-A second query groups rows by assignment and returns the first profile, the final profile, the attempt count, and the total cost. A third query returns the rows themselves for a `decision` use: identifiers, source, features, profile identity and epoch, `configId`, disposition, exclusion, the four levels, the owner rating, cost, the end and freeze times, and `experiment_ref`. The router design computes its reward from these rows. Memory's `routing-outcome` source (INF-132) reads cells.
+Deferred from the switch-over slice: the assignment query and the rows query below. Nothing reads them yet, and the assignment query needs the usage ledger. A second query groups rows by assignment and returns the first profile, the final profile, the attempt count, and the total cost. A third query returns the rows themselves for a `decision` use: identifiers, source, features, profile identity and epoch, `configId`, disposition, exclusion, the four levels, the owner rating, cost, the end and freeze times, and `experiment_ref`. The router design computes its reward from these rows. Memory's `routing-outcome` source (INF-132) reads cells.
 
 **API and CLI.**
 
-- `GET /api/outcomes` returns cells for a `display` query. `infinite usage outcomes [--project ID] [--role ROLE] [--by LIST] [--sources LIST] [--days N] [--json]`.
+- `GET /api/outcomes?project=&role=&by=&sources=&days=` returns `{ use: "display", query, cells, unreadable }`, for every paired device. `by` defaults to `profile` and `sources` to `production`; `days` is an integer from 1 to 3650. A refused query answers 400 with its code, and an unavailable store answers 503. `infinite usage outcomes [--project ID] [--role ROLE] [--by LIST] [--sources LIST] [--days N] [--json]`.
 - `GET /api/outcomes/runs/:runId` returns a run's summary, rows, and signals, also after the run record is deleted. `infinite usage outcomes --run ID`.
 - `GET /api/outcomes/rollup` takes `goal=ID` or `mission=ID`. `infinite usage outcomes --goal ID` or `--mission ID`.
 - `POST /api/outcomes/signals`, owner only, records or withdraws a `linked-fix` or an `exclusion`. `infinite usage outcomes link-fix` and `exclude`.

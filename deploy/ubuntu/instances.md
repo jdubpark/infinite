@@ -234,11 +234,11 @@ Confirm with `tailscale serve status` that the first instance's listener is
 unchanged. A tailnet that uses Tailscale Services can instead publish the
 instance under its own service name.
 
-Keep the host firewall closed to public API traffic. Allow SSH only from the
-operator's approved address and preserve the existing Tailscale access:
+The host firewall is shared with the first instance. Do not change it: the
+instance's API stays on loopback and is published only through Tailscale Serve.
+Confirm that the firewall is unchanged:
 
 ```sh
-sudo ufw allow from SERVER_PUBLIC_IP to any port 22 proto tcp
 sudo ufw status verbose
 ```
 
@@ -536,17 +536,22 @@ issue text, account IDs, or credentials in this repository.
 
 1. **Linear author and thread fields.** Read the test issue through the API.
    Identify the creator field and whether it reports the owner or Linear's app,
-   and identify how the Slack thread link is represented. Set
-   `intake.linear.creatorId` to the owner's Linear ID when Linear attributes
-   the issue to the person. If Linear attributes it to an app, omit
-   `creatorId`; the owner mention check in the thread becomes the authorship
-   gate and the separate creator check is dropped. If the API exposes no thread
-   link, set `intake.slack.bindByMention` to enable binding when the owner
-   mentions the bot in that thread with the ID of an admitted issue, and set
-   `intake.requireSlackThread` to `false`. Until a thread is bound, outcomes go
-   to Linear and the apps; do not require a Slack thread for admission. Set
-   `intake.slack.linearAgentUserId` to Linear's Slack agent ID for the mention
-   check.
+   and identify how the Slack thread link is represented.
+   `intake.linear.creatorId` is always the owner's Linear user ID. If Linear
+   attributes a Slack-filed issue to an app or to any account other than the
+   owner, intake skips it as `creator-mismatch` and admits nothing filed that
+   way; do not enable intake until an attribution rule has been designed from
+   what Linear records. Also file one test issue through Linear's Slack agent
+   from a teammate's Slack account that has a linked Linear account, and one
+   from a Slack account with no Linear account, each in a thread where the
+   owner mentioned Linear's agent earlier. Read the creator of each. Enable
+   intake only when neither issue reports the owner as its creator. If the API
+   exposes no thread link, set `intake.slack.bindByMention` to enable binding
+   when the owner mentions the bot in that thread with the ID of an admitted
+   issue, and set `intake.requireSlackThread` to `false`. Until a thread is
+   bound, outcomes go to Linear and the apps; do not require a Slack thread for
+   admission. Set `intake.slack.linearAgentUserId` to Linear's Slack agent ID
+   for the mention check.
 2. **Linear comment mirroring.** Add a top-level comment to the test issue and
    check whether it appears in the Slack thread. Set
    `intake.linear.commentsMirrorToSlack` to `true` if Linear mirrors it. In
@@ -560,5 +565,5 @@ issue text, account IDs, or credentials in this repository.
 
 Keep intake disabled until these three outcomes, the host acceptance checks,
 the owner identity, allowed Linear teams and label, Slack app, and credentials
-have been configured. Do not use teammate identities or a public callback
-endpoint.
+have been configured. Do not configure teammate identities or a public
+callback endpoint.

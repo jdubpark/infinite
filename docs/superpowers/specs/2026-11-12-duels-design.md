@@ -28,7 +28,7 @@ A field of a sibling design that is named here is defined in that design.
 3. An objective gate decides before a judge does.
 4. The run pays for one attempt. The learning budget pays for the rest.
 5. A judge judges only while its measured accuracy stays above a threshold.
-6. A failure inside a duel falls back to a single attempt. A duel never blocks a run that a single attempt would not have blocked. It delays work only in `live` mode, and by at most its allowance (Part 8).
+6. A failure inside a duel falls back to a single attempt. A duel never blocks a run that a single attempt would not have blocked. In `live` mode it delays work by at most its allowance (Part 8). In `shadow` mode the only delay is behind a challenger capture that is already running.
 
 ## Non-goals
 
@@ -48,7 +48,7 @@ A field of a sibling design that is named here is defined in that design.
 
 **A. Hold and choose.** The host holds both results and integrates the preferred one. The run gets the better result. The task waits, and a judge influences what is integrated.
 
-**B. Shadow.** The champion integrates on today's path. The challenger and the judgement finish beside it, and the host records the preference. The champion's integration never waits, and nothing shipped changes. A better challenger result is wasted.
+**B. Shadow.** The champion integrates on today's path. The challenger and the judgement finish beside it, and the host records the preference. The champion's integration is never held for the challenger or the judge, and nothing shipped changes. A better challenger result is wasted.
 
 **C. Replay only.** Paired evidence comes from eval tasks alone. It covers only past tasks with tests, and a test grader does not weigh what a reviewer weighs.
 
@@ -125,7 +125,7 @@ type Contestant = { memberId: string; profileId: string; captured?: true; commit
 3. When a contestant reports `result`, the host captures it with `captureMemberResult` and sets `captured`. An unchanged tree yields no commit, which `consume` accepts as a result today, so an empty capture is complete. In `live` mode the host does not integrate yet. The first capture starts the grace period.
 4. With both results captured, the gate runs (Part 4). If the gate does not decide, the judge does (Part 5).
 5. In `live` mode the winner's result enters today's integration path, and `task.memberId` becomes the winner.
-6. In `shadow` mode the champion integrates when it reports, as today. Steps 3 and 4 run for the record only, and the champion's integration never waits for them.
+6. In `shadow` mode the champion integrates when it reports, as today. Steps 3 and 4 run for the record only, and the champion's integration is never held for them.
 
 A contestant **leaves** when it stalls, hits a provider limit, exits without a report, fails preparation, or reports `question`, `blocked`, or `escalate`. A challenger also leaves when it opens any provider permission prompt. The duel is then `abandoned`. In `live` mode the host stops the contestant that left and starts no replacement, and the other contestant becomes the task's only member under today's rules. When both leave, the task follows the champion's case under today's rules. In `shadow` mode the champion always follows today's rules, and an abandoned duel stops the challenger.
 
@@ -133,7 +133,7 @@ This design adds no permission reuse rule. `TeamService` reuses a recorded verdi
 
 A late second result (`graceMinutes` after the first), a steer, a pause, a cancel, or a routing revocation also abandons the duel. So do the two cases of Part 8: preemption for a ready task, and an allowance that no longer fits before the deadline. In `live` mode the host then stops the contestant that has not reported, or the challenger when neither has.
 
-`assertBudget` and `GoalService` skip `duel` members and judges. Like a permission coordinator, a judge holds no worker slot and does not stop new implementers from starting. A contestant that was not integrated, and the judge, become removable `memberMinutes` after the duel ends. `memberIntegratedAt` gains that case.
+`assertBudget` and `GoalService` skip `duel` members and judges. Like a permission coordinator, a judge holds no worker slot and does not stop new implementers from starting. A contestant that was not integrated becomes removable `memberMinutes` after the duel ends, and `memberIntegratedAt` gains that case. The host removes the judge's clone and package as soon as the judge reports or its time ends (Part 5).
 
 ### Part 4: The objective gate
 
@@ -173,9 +173,9 @@ The host accepts a judgement when the `duelId` matches, `assertMemberReadOnly` p
 
 **Isolation (C9 rule 3).** Today `teamContext` copies every task, continuation snapshot, and member report, and the lineup, into each member's context file. It filters only an implementer's copy. This design removes `task.duel` from every task for every role, continuation snapshots included. `memberReports` and the blackboard's `report` entries cover a contestant only after its result is integrated, and never a judge or a `judgement`. The blackboard hides a contestant's own entries from other members under the same rule, and the host posts no entry about a duel. A shadow champion is treated as today.
 
-**Limit.** On the reference deployment blindness is a procedural claim. Member clones of one run share a `members` directory and an agent identity, and this design found no operating-system boundary between them. A judge can read a contestant's clone, and a contestant can write text for the judge inside a diff. Part 9 measures the effect.
+**Blindness.** Member clones of one run share a `members` directory and an agent identity, and this design found no operating-system boundary between them. The judge therefore runs under the eval identity of the replay eval design, with a clone built from a one-branch bundle of `baseCommit`. That identity cannot read the production team roots, so the judge cannot read a contestant's clone. Part 9 needs the eval identity for calibration, so every deployment that can run a duel has it.
 
-Where the replay eval design's eval identity exists, the judge may run under it, with a clone built from a one-branch bundle. It then cannot read a contestant's clone. A judge session under the eval identity counts as that identity's one live session, so no replay trial runs beside it. Each duel records its blindness, `procedural` or `enforced`, in its payload.
+A judge session is the eval identity's one live session. The host removes the judge's clone and package when the judge reports or its time ends, before it releases the identity. When the identity is not free within `judgeMinutes`, the duel resolves by `tie-break`. One limit remains: a contestant can write text for the judge inside a diff. Part 9 measures the effect.
 
 ### Part 6: Records
 
@@ -225,11 +225,11 @@ Every other contestant row keeps its own disposition and source `production`: a 
 
 `assertBudget` stops a goal run at its `deadlineAt`. The host therefore requires the allowance to fit before the deadline at admission, and again when the first result arrives. *(My call: it does not count on `extendDeadline`, which needs recent member activity and room under the ceiling.)*
 
-In `shadow` mode the champion's integration never waits for the challenger or the judge. A challenger capture or a gate command starts only when the run has no workspace operation waiting. The host aborts a running gate command when the run needs the slot, and then skips gate checks for both contestants. A capture is one short Git operation that cannot be aborted safely, so production work that arrives during a challenger capture waits for that one operation. The `shadow` setting is the owner's authorization for that delay.
+In `shadow` mode the champion's integration is never held for the challenger or the judge. A challenger capture or a gate command starts only when the run has no workspace operation waiting. The host aborts a running gate command when the run needs the slot, and then skips gate checks for both contestants. A capture is a short series of Git commands that cannot be aborted safely. Production work that arrives during a challenger capture, the champion's own result included, waits until that capture ends. The `shadow` setting is the owner's authorization for that delay.
 
 ### Part 9: Judge calibration and monitors
 
-A calibration pair is two graded trials of one eval task where exactly one is `resolved`. A pair comes from a dev set task only, at most one per task, because the judge is a member and a member never sees holdout content. The judge receives the live package and never sees hidden tests, the reference patch, or a grade. Each pair is judged twice with the labels swapped.
+A calibration pair is two graded trials of one eval task where exactly one is `resolved`. A pair comes from a dev set task only, at most one per task, because the judge is a member and a member never sees holdout content. The judge receives the live package and never sees hidden tests, the reference patch, or a grade. Each pair is judged twice with the labels swapped. A calibration judge session runs under the eval identity, because the mirror holds the reference result of a past task. A pair counts only when both of its trials are `isolated`.
 
 The unit is the pair. A pair is correct only when both orderings prefer the resolved trial. Any other result, a tie included, is incorrect. `accuracy` is the share of correct pairs. Swap agreement, the share of pairs whose two orderings prefer the same trial, is reported apart. *(My call: it leaves the threshold, because a correct pair already needs both orderings.)*
 
@@ -301,12 +301,12 @@ Each phase is its own pull request and is useful alone.
 4. `gateChecks` per project. The default is none.
 5. Whether a challenger may use the run's delegated permission reviewer under its own cap. As designed it leaves at its first permission prompt.
 6. The calibration threshold (30 pairs and a lower bound of 0.60 are proposed), whether a calibration must come from one project's pairs alone, and whether a judge may share a model vendor with one contestant. As designed pairs pool across the tenant's projects, and it may.
-7. Whether `live` mode may run with procedural blindness. As designed it may, and each duel records which it had.
+7. The two accounts of the replay eval design. Calibration and the judge need them, and no duel runs without them.
 
 ## Left to the builder
 
 - The Git commands that export the two patches and build a verification clone at a captured commit.
-- How captures, gate commands, and their failure paths use the run's one operation slot without blocking the run.
+- How captures, gate commands, and their failure paths use the run's one operation slot under the rules of Part 8.
 - The judge prompt wording, the seeded draws, and default cost estimates before the ledger has measured values.
 - The calibration job's records, and the columns of `judge_calibrations`.
 - The layout of `infinite duels status` and the client views.

@@ -296,7 +296,7 @@ It then submits a `record_propose` operation of the Memory S1 contract under its
 
 - **Capability.** Entry tools use the existing report capability: the hook token plus the assignment binding that the session worker checks. The Memory S1 task binding covers memory actions only, in a workspace where the owner enabled memory, so it is not reused.
 - **Read scope.** An entry outside the caller's scope returns the same "not found" as an unknown ID.
-- **Duels.** While a task has an open duel, an entry that one contestant wrote is served to no other member. When the duel ends, the entries of the contestant whose result was integrated become visible, and the other contestant's entries are withdrawn. A judge has no entry tools. The duels design defines these terms.
+- **Duels.** An entry that a duel contestant wrote is served to no other member until that contestant's result is integrated. A shadow champion's entries therefore become visible when it integrates, as today. When the duel ends, the entries of a contestant that was not integrated are withdrawn. A judge has no entry tools. The duels design defines these terms.
 - **Untrusted text.** Member text is rendered only inside the labelled digest or a tool result. It never enters a permission reviewer's evidence. A member can never write authority `receipt` or `direction`.
 - **Secrets.** The session worker refuses a post that contains a private key block, a common token format, or the member's own hook token or hook URL. The refusal names the field and never echoes the value. The owner can withdraw an entry.
 - **Scores.** No entry carries a rubric, a rating, `diffStat`, or usage (C9 rule 3).

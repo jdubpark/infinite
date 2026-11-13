@@ -136,7 +136,7 @@ If a kept run record has `deliveryReceipt.mergeCommit` equal to the commit, the 
 
 **Provenance groups.** Tasks that derive from one change share a group. Set assignment, holdout rotation, and every exclusion act on whole groups. A run's captured tasks form one group. A mined commit joins it when the run's `deliveryReceipt.mergeCommit` equals the commit, or when the outcome ledger's base branch scan matched the commit to the run. The mined task is then `rejected` with `duplicate-of-captured` while the group has a `candidate` or `valid` captured task. Any other mined commit is its own group.
 
-A mined commit with unclear lineage never enters the holdout set. Its lineage is unclear when its changed files overlap the `changedPaths` of a run that has captured tasks, was approved before the commit, and has no observed landing. The mined task then joins that run's group. It is rejected while the group has a `candidate` or `valid` captured task, as above. Otherwise it is kept with the mark `lineage-unclear`, and its group is assigned to the dev set only. *(My call: a pull request delivery records no merge commit, and a squash merge onto a moved base matches no exact rule, so the host cannot prove that such a commit is a new change.)*
+A mined commit with unclear lineage never enters the holdout set. Its lineage is unclear when it changes a file that a stored reference patch of some run's captured tasks also changes, that run was approved before the commit, and that run has no observed landing. The host reads the files from the stored patches, because `TeamTask.changedPaths` can be absent or truncated. The mined task then joins that run's group. When several runs match, their groups merge into one. The mined task is rejected while the group has a `candidate` or `valid` captured task, as above. Otherwise it is kept with the mark `lineage-unclear`. A group that holds such a task, or that was merged this way, is assigned to the dev set only. *(My call: a pull request delivery records no merge commit, and a squash merge onto a moved base matches no exact rule, so the host cannot prove that such a commit is a new change.)*
 
 **Validation.** A `validate` job runs host commands only and spends no model tokens. A candidate becomes `valid` when:
 
@@ -189,9 +189,9 @@ Two accounts isolate a trial. Each serves every project, so each control below c
 | Later commits in the clone | The one-branch bundle | `git cat-file -e` fails for the reference commit and the mirror head |
 | Mirror, project checkouts, production team roots, production agent home | The eval identity cannot read them | It cannot read a canary file in each, and its fetch of the repository fails |
 | Hidden tests and grading clones | Hidden material leaves the evidence store only into the grader's root. The eval identity cannot read that root, the grader's home, or its temporary directory | It cannot read a canary file in each. The trial workspace holds no hidden file content |
-| Other trials, of any project | One live trial per eval identity. The host removes the previous trial's workspace first | The eval root holds no other trial workspace |
-| Surviving processes | The host stops every process of the eval identity between trials | No process runs under the eval identity |
-| Local provider state | After usage capture the harness removes what a trial left in the eval home | The eval home holds no session history and no memory file |
+| Other sessions, of any project | One live session per eval identity: a trial member or a duel judge. The host removes the previous session's workspace and package first | The eval root holds no other workspace |
+| Surviving processes | The host stops every process of the eval identity between sessions | No process runs under the eval identity |
+| Local provider state | After usage capture the harness removes what a session left in the eval home | The eval home holds no session history and no memory file |
 
 The harness lists and stops processes by user with the means in `packages/host/src/team-retirement.ts`. It removes each grading clone when its commands end. The clone has no remote, as today. Recall tools are off, guidance is as of the base commit, and prompt text is fixed at the time of the work.
 
@@ -276,7 +276,7 @@ Reservations are rows in the evidence store. The month is a calendar month in UT
 
 The host checks the job limits and reserves from the learning budget before each trial starts. It cannot cap tokens inside a session, so a job can exceed a limit by the trials already running. An exhausted limit pauses the job with `budget-exhausted`.
 
-No trial starts while its provider has an active limit in `ProviderLimits`, outside the job's windows, or when fewer than four host session slots are free. *(My call: real work keeps priority.)* A later job reuses a valid trial under 30 days old when the eval task, the `configId`, the profile epoch, and the harness version match. The harness version changes with grading or the trial lifecycle. A `confirm` job never reuses a trial.
+No trial starts while its provider has an active limit in `ProviderLimits`, while any run has an open duel, outside the job's windows, or when fewer than four host session slots are free. *(My call: real work keeps priority.)* A later job reuses a valid trial under 30 days old when the eval task, the `configId`, the profile epoch, and the harness version match. The harness version changes with grading or the trial lifecycle. A `confirm` job never reuses a trial.
 
 ### Part 7. Statistics
 
@@ -366,7 +366,7 @@ A later version needs a runnable interface on the host, which INF-110 tracks. It
 2. A fixture commit whose test fails at its parent and passes with its diff becomes `valid`. One whose test passes at its parent is rejected with `not-fail-to-pass`, and one that fails one of three reference runs with `flaky`.
 3. A captured task and the mined commit of its run's merge share a group, the mined task is rejected with `duplicate-of-captured`, and no group spans both sets.
 4. In a prepared trial workspace, `git cat-file -e` fails for the reference commit, `git remote` prints nothing, and no hidden file content exists.
-5. No trial starts while a process runs under the eval identity, or while another trial's workspace, of any project, exists in the eval root. Without both launch profiles a trial is labelled `none`, and the prior export omits it.
+5. No trial starts while a process runs under the eval identity, or while another session's workspace, of any project, exists in the eval root. Without both launch profiles a trial is labelled `none`, and the prior export omits it.
 6. A replay run makes no publication, Linear, or notifier call, and `GET /api/teams` does not list it.
 7. A trial whose member applies the reference is `resolved`. A result that makes `focusedTest` exit zero without running the hidden tests is not. A result that edits a file under `gradingPaths` is graded with the reference's file and reports `overwritten` above zero.
 8. An empty result ends `no-result`, an edit outside the task's paths ends `scope-violation`, and an undecided permission prompt ends `permission`. A provider limit voids the trial, and it runs again.

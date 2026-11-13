@@ -245,7 +245,7 @@ Each design lists its own. These six cut across them:
 
 1. Whether to delegate routing to the host (`auto` mode) for a project, and for which decision points.
 2. The learning budget per project and its split across duels, replay, and gate trials.
-3. Whether to add two accounts for replay: an eval identity with its own provider logins for trial members, and a grader identity with no provider login for validation and grading. Without them a replay trial can read the mirror, so its result feeds neither the router nor the gate.
+3. Whether to add two accounts for replay: an eval identity with its own provider logins for trial members, and a grader identity with no provider login for validation and grading. Without them a replay trial can read the mirror, so its result feeds neither the router nor the gate, and no duel runs.
 4. Whether `listUsd` is an acceptable routing weight for subscription profiles.
 5. Whether outcome rows, which hold no run text, may outlive a deleted cancelled run.
 6. Whether the blackboard takes the role of the memory design's session working context, stored outside memory.

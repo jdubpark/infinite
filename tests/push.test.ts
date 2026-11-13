@@ -505,6 +505,26 @@ test("storage alerts once on startup when already high and honor the host-storag
   } finally { Date.now = originalNow; enabled.stop(); disabled.stop(); rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("a fuse push for a long project id has a short collapse id", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("controller", "ExponentPushToken[a]", "android");
+  const sent: { collapseId: string }[][] = [];
+  const sender = async (messages: never[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  // The configuration sets no length limit on a project id, and a push service limits the collapse id.
+  const long = "p".repeat(200), other = `${"p".repeat(199)}q`;
+  const pending = [long, other, "short"].map((projectId, index) => ({ tripId: `trip-${index}`, scope: "project" as const, projectId, label: "Fixture", cause: "launch-rate" as const, ownerClose: true, openedAt: "2026-11-13T10:00:00.000Z" }));
+  const fuse = { interrupts: () => pending, markAnnounced: () => {} };
+  const notifier = new Notifier({ list: async () => [] } as never, store, sender, { detail: "minimal", events: ["autonomy-interrupt"], intervalMs: 100000 }, undefined, undefined, undefined, fuse);
+  await notifier.tick();
+  const ids = sent[0]!.map(message => message.collapseId);
+  assert.equal(ids.length, 3);
+  for (const id of ids) assert.ok(Buffer.byteLength(id, "utf8") <= 64, id);
+  assert.notEqual(ids[0], ids[1], "two long ids keep different collapse ids");
+  assert.equal(ids[2], "interrupt:fuse:short");
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("a fuse interrupt whose push failed is offered again", async () => {
   const dir = mkdtempSync("/tmp/inf-push-");
   const store = new PushStore(dir, randomBytes(32));

@@ -506,13 +506,14 @@ test("a released launch retried after its hour counts again", () => {
 test("a project name is cleaned and bounded in an interrupt", () => {
   const r = rig({ project: { launchesPerHour: 2 } });
   try {
-    r.config.projects[0]!.name = `Proj\n\u001b[2Ject\u2028 ${"x".repeat(300)}`;
+    r.config.projects[0]!.name = `Proj\n\u001b[2Ject\u2028\u202e\u200b ${"x".repeat(300)}`;
     const fuse = service(r);
     fuse.admit(launch("a1"));
     fuse.admit(launch("a2"));
     const [trip] = fuse.interrupts();
     assert.ok(trip);
     assert.equal(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(trip.label), false, "no control character reaches a push body");
+    assert.equal(/[\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/.test(trip.label), false, "no direction or zero-width character either");
     assert.ok(trip.label.length <= 80);
     assert.ok(trip.label.startsWith("Proj"));
   } finally { r.close(); }

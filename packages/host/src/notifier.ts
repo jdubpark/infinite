@@ -2,6 +2,11 @@ import { PROVIDER_NAMES, type Attention, type Prompt, type Provider } from "@inf
 import type { Manager } from "./manager.js";
 import type { PushSender, PushStore } from "./push.js";
 import type { FuseService, FuseInterrupt } from "./fuse/service.js";
+import { createHash } from "node:crypto";
+
+/** The subject part of a fuse collapse id. A push service limits the id's length, and a project id has no limit, so a long one is replaced by a digest. */
+const fuseSubject = (projectId: string | undefined) =>
+  projectId === undefined ? "host" : projectId.length <= 40 ? projectId : createHash("sha256").update(projectId, "utf8").digest("hex").slice(0, 32);
 
 type Row = { id: string; title: string; provider: Provider; attention: Attention; reading?: { now?: { text: string } } };
 type TeamRow = { id: string; title: string; status: string; reason?: string; resumable?: boolean; goal?: boolean; mission?: boolean };
@@ -167,7 +172,10 @@ export class Notifier {
   }
   /** Open spend-fuse trips the owner has not been told about. Nothing is read or marked unless the event is enabled. */
   private fuseEvents(): FuseInterrupt[] {
-    if (!this.fuse || !this.enabled("autonomy-interrupt") || Date.now() < this.fuseRetryAt) return [];
+    const now = Date.now();
+    // A clock that stepped back must not hold fuse pushes longer than the minute.
+    if (this.fuseRetryAt > now + 60_000) this.fuseRetryAt = now + 60_000;
+    if (!this.fuse || !this.enabled("autonomy-interrupt") || now < this.fuseRetryAt) return [];
     try { return this.fuse.interrupts(); } catch { return []; }
   }
   private fuseMessage(item: FuseInterrupt, to: string) {
@@ -179,7 +187,7 @@ export class Notifier {
     return {
       to, title: "Spend fuse open", body: `Launches paused for ${item.label}: ${cause}. ${closing}`,
       data: { url: "/teams", ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
-      priority: "high" as const, collapseId: `interrupt:fuse:${item.projectId ?? "host"}`,
+      priority: "high" as const, collapseId: `interrupt:fuse:${fuseSubject(item.projectId)}`,
     };
   }
   private storageMessage(item: StorageAlert, to: string) {

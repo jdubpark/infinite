@@ -129,7 +129,8 @@ function limitsOf(fuse: FuseConfig | undefined): FuseLimits {
 
 /** A project name as one short line: the label goes into a push body, and the configuration sets no rule for it. */
 function plainLabel(name: string): string {
-  const line = name.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim();
+  // Control, line-break, direction, and zero-width characters go: none may shape how a notification reads.
+  const line = name.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]+/g, " ").replace(/\s+/g, " ").trim();
   return [...line].slice(0, 80).join("") || "a project";
 }
 

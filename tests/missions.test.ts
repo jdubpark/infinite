@@ -1,97 +1,27 @@
-import test from "node:test";
+import test, { mock } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { createServer as createNetServer } from "node:net";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
-import { stopSessionWorkers, waitFor } from "./helpers.js";
+import { waitFor } from "./helpers.js";
 import { inProcessHost } from "./helpers.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { Manager } from "../packages/host/src/manager.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { MissionService, missionBoard, type ProjectGroupLookup } from "../packages/host/src/missions.js";
 import { createMissionReportEnvelope } from "../packages/host/src/team-report-client.js";
-import { missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, type MissionOpenChildDecision, type MissionMessage } from "../packages/host/src/team-prompts.js";
+import { missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, subteamReport, type MissionOpenChildDecision, type MissionMessage } from "../packages/host/src/team-prompts.js";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+import { git, lineup, missionHarness as harness, scriptedMissionHarness as scripted } from "./mission-harness.js";
 import type { Config, Session } from "../packages/host/src/types.js";
-import type { CreateTeam, NativeContinuation, TeamAssignment, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
-import type { CreateMission, Mission, MissionReport } from "../packages/host/src/mission-types.js";
-import { emptyRollup, emptyUsage, type UsageRollup } from "../packages/host/src/team-usage.js";
-import { applySignal, initialAttention, screenDecision, type Attention, type Signal, type SignalEvent } from "@infinite/attention";
-
-const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-const lineup: TeamLineup = {
-  coordinator: { id: "coordinator", label: "Coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
-  implementers: [{ id: "light", label: "Light worker", provider: "codex", model: "gpt-6-luna", effort: "high", tier: "light" }],
-  integrator: { id: "integrator", label: "Integrator", provider: "claude", model: "claude-opus-5-5", effort: "high", tier: "strong" },
-  reviewer: { id: "reviewer", label: "Reviewer", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
-};
-
-/** Real team and mission services over real session workers, with a two-repository project behind a fake group lookup. */
-function harness() {
-  const root = realpathSync(mkdtempSync("/tmp/inf-mission-"));
-  const receipts = join(root, "receipts");
-  mkdirSync(receipts, { mode: 0o700 });
-  const repo = (name: string) => {
-    const path = join(root, name);
-    mkdirSync(path);
-    writeFileSync(join(path, "check.mjs"), `import { existsSync } from "node:fs";\nif (!existsSync("${name}.txt")) process.exit(1);\n`);
-    git(path, "init", "--initial-branch=main"); git(path, "add", "check.mjs");
-    git(path, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", `Initial ${name}`);
-    return path;
-  };
-  const api = repo("api"), web = repo("web");
-  const key = randomBytes(32), keyFile = join(root, "key");
-  writeFileSync(keyFile, key, { mode: 0o600 });
-  const agent = (provider: string) => ({ command: process.execPath, args: [resolve("tests/fixtures/mission-agent.mjs"), "mission", receipts, provider] });
-  const checks = [{ command: process.execPath, args: ["check.mjs"] }];
-  const config: Config = { port: 0, origin: "http://127.0.0.1", keyFile, stateDir: join(root, "state"), runDir: join(root, "run"), tokens: [],
-    environment: "local", enableDemo: true, maxSessions: 24, agents: { claude: agent("claude"), codex: agent("codex") },
-    projects: [{ id: "api", name: "API", path: api, team: { checks } }, { id: "web", name: "Web", path: web, team: { checks } }],
-    teams: { workspaceDir: join(root, "teams"), lineup } };
-  const at = new Date().toISOString();
-  const groups: ProjectGroupLookup = { get: id => {
-    if (id !== "shop") throw new TeamError(404, "project-group-not-found", "This project does not exist.");
-    return { id, name: "Shop", kind: "owner", hidden: false, implicit: false, revision: 1, createdAt: at, updatedAt: at,
-      repos: [
-        { projectId: "api", name: "API", path: api, checkouts: [{ projectId: "api", name: "API", path: api, primary: true, teamReady: true }] },
-        { projectId: "web", name: "Web", path: web, checkouts: [{ projectId: "web", name: "Web", path: web, primary: true, teamReady: true }] },
-      ] };
-  } };
-  let services: { teams: TeamService; missions: MissionService } | undefined;
-  const open = () => {
-    const manager = new Manager(config, key);
-    const teams = new TeamService(config, key, manager, (_project, start) => start());
-    const missions = new MissionService(config, key, manager, teams, groups);
-    teams.start(); missions.start();
-    services = { teams, missions };
-    return services;
-  };
-  const shut = () => { services?.missions.close(); services?.teams.close(); services = undefined; };
-  const coordinatorReceipts = () => readdirSync(receipts).filter(name => name.endsWith(".json"))
-    .map(name => JSON.parse(readFileSync(join(receipts, name), "utf8"))).filter(receipt => receipt.role === "mission-coordinator");
-  const create = (objective = "Add an endpoint to the API and call it from the web client"): CreateMission =>
-    ({ requestId: randomUUID(), groupId: "shop", objective, maxSubtasks: 8, maxMinutes: 30 });
-  const release = (name: string) => writeFileSync(join(receipts, name), "go", { mode: 0o600 });
-  const close = async () => {
-    const closing = services;
-    shut();
-    // A tick already under way can still launch a coordinator attempt or subteam member after close().
-    await closing?.missions.idle(); await closing?.teams.idle();
-    // Workers exit 1.5 s after their child. Sweep until none answers, so no worker or provider outlives the test.
-    for (let pass = 1; await stopSessionWorkers(config); pass++) {
-      if (pass === 8) throw new Error("Session workers still answer after the mission test stopped them");
-      await new Promise(done => setTimeout(done, 500));
-    }
-    await new Promise(done => setTimeout(done, 1700));
-    rmSync(root, { recursive: true, force: true });
-  };
-  return { root, api, web, open, shut, close, create, release, coordinatorReceipts, services: () => services! };
-}
+import type { CreateTeam, TeamAssignment, TeamView } from "../packages/host/src/team-types.js";
+import type { CreateMission, Mission, MissionOrigin } from "../packages/host/src/mission-types.js";
+import { initialAttention } from "@infinite/attention";
+import { emptyUsage, type UsageRollup } from "../packages/host/src/team-usage.js";
 
 const until = (read: () => Mission, accepts: (mission: Mission) => boolean, timeout = 60000) => waitFor(async () => read(), accepts, timeout);
 const standaloneRequest = (projectId: string): CreateTeam => ({
@@ -697,215 +627,6 @@ test("a mission coordinator reports through its own MCP tool and envelope, separ
   assert.deepEqual(await tools({ INFINITE_MISSION_ASSIGNMENT: "", INFINITE_TEAM_ASSIGNMENT: JSON.stringify({ runId: missionId, memberId, revision: 3, role: "implementer" }) }), ["report"]);
 });
 
-type FakeRun = { id: string; projectId: string; missionId: string; status: TeamView["status"]; revision: number; updatedAt: string; parallelism?: number; parallelismCeiling?: number;
-  usage?: UsageRollup; workspaceRemovedAt?: string;
-  recovery?: { attempts: number; status: "stopping" | "planning" | "exhausted"; source: { code: string; memberId: string; revision: number; reportKind?: string; reason: string; at: string } };
-  decisions: { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string }[] };
-
-/**
- * The real mission service over scripted coordinator sessions and subteams: each coordinator attempt
- * reports what the test tells it to, and each subteam is in whatever state the test sets.
- */
-function scripted() {
-  const root = realpathSync(mkdtempSync("/tmp/inf-mission-script-"));
-  const repo = (name: string) => { const path = join(root, name); mkdirSync(path); return path; };
-  const checks = [{ command: process.execPath, args: ["-e", "0"] }];
-  const config: Config = { port: 0, origin: "http://127.0.0.1", keyFile: join(root, "key"), stateDir: join(root, "state"), runDir: join(root, "run"), tokens: [],
-    environment: "local", enableDemo: false, maxSessions: 24, agents: { claude: { command: process.execPath, args: [] } },
-    projects: [{ id: "api", name: "API", path: repo("api"), team: { checks } }, { id: "web", name: "Web", path: repo("web"), team: { checks } }],
-    teams: { workspaceDir: join(root, "teams"), lineup } };
-  type CoordinatorRequest = { requestId: string; prompt: string; continuation?: NativeContinuation };
-  const attempts: { sessionId: string; assignment: TeamAssignment; prompt: string; request: CoordinatorRequest }[] = [];
-  const reports = new Map<string, MissionReport>();
-  // Each coordinator session's journaled signals and the attention the real reducer derives from them.
-  const signals = new Map<string, SignalEvent[]>(), attention = new Map<string, Attention>();
-  const stateReads = new Map<string, number>(), sessionStatuses = new Map<string, "running" | "exited">();
-  const nativeSessions = new Map<string, { id: string; source: "hook" }>();
-  const held = new Set<string>(), stops: string[] = [];
-  const signal = (sessionId: string, data: Signal, at = new Date()) => {
-    const journal = signals.get(sessionId)!;
-    const event: SignalEvent = { seq: journal.length + 1, at: at.toISOString(), type: "signal", data: { ...data, source: "hook", provider: "claude" } };
-    journal.push(event);
-    attention.set(sessionId, applySignal(attention.get(sessionId)!, event));
-  };
-  const manager = {
-    async createTeamSession(request: CoordinatorRequest, assignment: TeamAssignment) {
-      if (!attempts.some(item => item.sessionId === request.requestId)) {
-        attempts.push({ sessionId: request.requestId, assignment, prompt: request.prompt, request });
-        signals.set(request.requestId, []); attention.set(request.requestId, initialAttention(new Date().toISOString(), true));
-        sessionStatuses.set(request.requestId, "running");
-        signal(request.requestId, { kind: "turn-start" });
-      }
-      return { status: "running" };
-    },
-    events(sessionId: string, cursor: number, _limit: number, types: Set<string>) {
-      if (types.has("signal")) { const events = signals.get(sessionId)!.filter(event => event.seq > cursor); return { events, cursor: events.at(-1)?.seq ?? cursor, more: false }; }
-      const report = reports.get(sessionId), attempt = attempts.find(item => item.sessionId === sessionId)!;
-      if (!report || cursor > 0) return { events: [], cursor, more: false };
-      const { runId, memberId, revision } = attempt.assignment;
-      return { events: [{ data: { requestId: randomUUID(), missionId: runId, memberId, revision, report } }], cursor: 1, more: false };
-    },
-    meta() { return {}; },
-    async state(sessionId: string) {
-      stateReads.set(sessionId, (stateReads.get(sessionId) ?? 0) + 1);
-      return { status: sessionStatuses.get(sessionId) ?? "running", attention: attention.get(sessionId), nativeSession: nativeSessions.get(sessionId) };
-    },
-    async stopTeamSession(sessionId: string) {
-      stops.push(sessionId);
-      if (!held.has(sessionId)) sessionStatuses.set(sessionId, "exited");
-      return { status: held.has(sessionId) ? "running" : "exited", nativeSession: nativeSessions.get(sessionId) };
-    },
-  };
-  const runs = new Map<string, FakeRun>(), standalone = new Set<string>(), failing = new Set<string>();
-  let resumeBusy = false;
-  const created: { request: CreateTeam; options?: { baseRunId?: string; parallelismCeiling?: number } }[] = [];
-  const answers: { teamId: string; decisionId: string; text: string; by?: string }[] = [];
-  const steers: { teamId: string; text: string }[] = [];
-  const capacityCalls: { teamId: string; requestId: string; revision: number; parallelism: number }[] = [];
-  const capacityReceipts = new Map<string, string>();
-  let loseCapacityReply = false, bumpCapacityRevision = false;
-  const steerReceipts = new Map<string, string>();
-  let steerLimit: boolean | Set<string> = false, steerBusy = false, loseSteerReply = false;
-  const key = randomBytes(32);
-  const view = (run: FakeRun) => ({ ...structuredClone(run), title: run.id, tasks: [], usage: run.usage ?? emptyRollup() }) as unknown as TeamView;
-  const run = (id: string) => { const value = runs.get(id); if (!value) throw new TeamError(404, "team-not-found", "This team does not exist."); return value; };
-  const set = (id: string, patch: Partial<FakeRun>) => Object.assign(run(id), patch, { updatedAt: new Date().toISOString() });
-  const teams = {
-    useMissionReservations(_lookup: (projectId: string, exceptMissionId?: string) => string | undefined) {},
-    isActiveRun(id: string) {
-      const current = runs.get(id);
-      return Boolean(current && !["cancelled", "ready-for-review", "merged", "no-change"].includes(current.status));
-    },
-    async createForMission(request: CreateTeam, missionId: string, _lineup: TeamLineup, options?: { baseRunId?: string; parallelismCeiling?: number }) {
-      if (runs.has(request.requestId)) return view(run(request.requestId));
-      if (failing.has(request.projectId)) throw new TeamError(409, "team-start-failed", "The repository could not start a team run.");
-      created.push({ request, options });
-      runs.set(request.requestId, { id: request.requestId, projectId: request.projectId, missionId, status: "implementing", revision: 1, decisions: [], updatedAt: new Date().toISOString(), parallelism: request.parallelism, parallelismCeiling: options?.parallelismCeiling });
-      return view(run(request.requestId));
-    },
-    get: (id: string) => view(run(id)),
-    list: () => [...runs.values()].map(view),
-    async answer(id: string, decisionId: string, body: { text: string }, _authorize?: () => void, by?: string) {
-      answers.push({ teamId: id, decisionId, text: body.text, by });
-      const target = run(id);
-      target.decisions.find(item => item.id === decisionId)!.answer = body.text;
-      if (target.decisions.every(item => item.answer)) set(id, { status: "implementing" });
-      return view(target);
-    },
-    async setMissionParallelism(id: string, body: { requestId: string; revision: number; parallelism: number }) {
-      const fingerprint = JSON.stringify(body), prior = capacityReceipts.get(body.requestId);
-      capacityCalls.push({ teamId: id, ...body });
-      if (prior) {
-        if (prior !== fingerprint) throw new TeamError(409, "request-conflict", "This request ID belongs to a different team action.");
-        return view(run(id));
-      }
-      const target = run(id);
-      if (bumpCapacityRevision) { bumpCapacityRevision = false; target.revision++; }
-      if (body.revision !== target.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before sending this action.");
-      if (body.parallelism > (target.parallelismCeiling ?? 4)) throw new TeamError(409, "team-parallelism-limit", "The subteam capacity ceiling was exceeded.");
-      capacityReceipts.set(body.requestId, fingerprint);
-      target.parallelism = body.parallelism;
-      if (loseCapacityReply) { loseCapacityReply = false; throw new TeamError(409, "team-operation-running", "The reply was lost after the capacity change was recorded."); }
-      return view(target);
-    },
-    // Mirrors TeamService.steer: a known request replays, then busy, stale, and limit refusals, then a new revision.
-    async steer(id: string, body: { requestId: string; revision: number; text: string }) {
-      const fingerprint = JSON.stringify(body);
-      if (steerReceipts.has(body.requestId)) {
-        if (steerReceipts.get(body.requestId) !== fingerprint) throw new TeamError(409, "request-conflict", "This request ID belongs to a different team action.");
-        return view(run(id));
-      }
-      if (steerBusy) throw new TeamError(409, "team-operation-running", "A workspace operation is in progress. Retry steering after it settles.");
-      if (body.revision !== run(id).revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before sending this action.");
-      if (steerLimit === true || (steerLimit && steerLimit.has(id))) throw new TeamError(409, "team-steering-limit", "This team reached its steering limit. Start a new team from the reviewed integration branch.");
-      steerReceipts.set(body.requestId, fingerprint);
-      steers.push({ teamId: id, text: body.text });
-      const steered = view(set(id, { status: "planning", revision: run(id).revision + 1 }));
-      if (loseSteerReply) { loseSteerReply = false; throw new TeamError(409, "team-operation-running", "The reply was lost after the steer was recorded."); }
-      return steered;
-    },
-    async pause(id: string) { return view(set(id, { status: "paused" })); },
-    async resume(id: string) {
-      if (resumeBusy) throw new TeamError(409, "team-operation-running", "Another team operation is running.");
-      return view(set(id, { status: "implementing" }));
-    },
-    async cancel(id: string) { return view(set(id, { status: "cancelled" })); },
-    async removeRun(id: string) { runs.delete(id); },
-    activeForProject: (projectId: string) => standalone.has(projectId) ||
-      [...runs.values()].some(item => item.projectId === projectId && !["cancelled", "ready-for-review", "merged", "no-change"].includes(item.status)),
-  };
-  let removed = false;
-  const at = new Date().toISOString();
-  const groups: ProjectGroupLookup = { get: id => {
-    if (id !== "shop" || removed) throw new TeamError(404, "project-group-not-found", "This project does not exist.");
-    return { id, name: "Shop", kind: "owner", hidden: false, implicit: false, revision: 1, createdAt: at, updatedAt: at,
-      repos: [
-        { projectId: "api", name: "API", path: config.projects[0].path, checkouts: [{ projectId: "api", name: "API", path: config.projects[0].path, primary: true, teamReady: true }] },
-        { projectId: "web", name: "Web", path: config.projects[1].path, checkouts: [{ projectId: "web", name: "Web", path: config.projects[1].path, primary: true, teamReady: true }] },
-      ] };
-  } };
-  const missions = new MissionService(config, key, manager as unknown as Manager, teams as unknown as TeamService, groups);
-  missions.start();
-  const attempt = async (n: number) => (await waitFor(async () => attempts[n - 1], value => Boolean(value), 20000))!;
-  const parse = (prompt: string, label: string) => JSON.parse(prompt.split("\n").find(line => line.startsWith(label))!.slice(label.length));
-  return {
-    missions, runs, standalone, failing, created, answers, steers, capacityCalls, set,
-    /** Later steers of these subteams, or of every subteam, are refused at the steering limit. */
-    limitSteering: (teamIds?: string[]) => { steerLimit = teamIds ? new Set(teamIds) : true; },
-    /** Subteam steers are refused as busy until released. */
-    holdSteers: (held: boolean) => { steerBusy = held; },
-    /** The next steer is recorded by the subteam, but the mission sees a retryable error instead of its reply. */
-    loseNextSteerReply: () => { loseSteerReply = true; },
-    loseNextCapacityReply: () => { loseCapacityReply = true; },
-    bumpNextCapacityRevision: () => { bumpCapacityRevision = true; },
-    remove: () => { removed = true; },
-    attempts: () => attempts.length,
-    attempt,
-    confirmNative: async (n: number) => {
-      const current = await attempt(n), sessionId = current.sessionId;
-      const nativeSessionId = current.request.continuation?.nativeSessionId;
-      if (!nativeSessionId) throw new Error("Coordinator attempt has no native continuation ID");
-      const previousReads = stateReads.get(sessionId) ?? 0;
-      nativeSessions.set(sessionId, { id: nativeSessionId, source: "hook" });
-      await waitFor(async () => stateReads.get(sessionId) ?? 0, reads => reads > previousReads, 5000);
-    },
-    exitWithoutNative: async (n: number) => {
-      const sessionId = (await attempt(n)).sessionId;
-      nativeSessions.delete(sessionId);
-      sessionStatuses.set(sessionId, "exited");
-    },
-    refusals: (id: string) => unseal<{ refusals: number }>(key, "mission:" + id, readFileSync(join(config.stateDir, "missions", id + ".sealed"), "utf8")).refusals,
-    messages: async (n: number) => parse((await attempt(n)).prompt, "Messages since your last attempt (JSON): "),
-    state: async (n: number) => parse((await attempt(n)).prompt, "Mission state (JSON): "),
-    report: async (n: number, report: MissionReport) => { reports.set((await attempt(n)).sessionId, report); },
-    /** The coordinator's turn ends without a report; its session stays alive at the prompt. */
-    endTurn: async (n: number, at?: Date) => { signal((await attempt(n)).sessionId, { kind: "turn-end" }, at); },
-    signal: async (n: number, data: Signal) => signal((await attempt(n)).sessionId, data),
-    /** What the session worker publishes when the screen goes quiet without a dialog. */
-    quietScreen: async (n: number) => {
-      const sessionId = (await attempt(n)).sessionId, current = attention.get(sessionId)!;
-      const decision = screenDecision(current, null, true, false, new Date().toISOString());
-      if (decision.idle) attention.set(sessionId, { ...current, state: decision.idle, since: current.state === decision.idle ? current.since : new Date().toISOString(), source: "screen" });
-      return decision.idle;
-    },
-    /** Stop requests for that attempt's session report it still running until released. */
-    /** An earlier turn ended a minute ago and the provider continued in a new turn. */
-    continueAfterTurnEnd: async (n: number) => {
-      const sessionId = (await attempt(n)).sessionId;
-      signal(sessionId, { kind: "turn-end" }, new Date(Date.now() - 60000)); signal(sessionId, { kind: "turn-start" });
-    },
-    holdStop: async (n: number) => { held.add((await attempt(n)).sessionId); },
-    releaseStop: async (n: number) => { held.delete((await attempt(n)).sessionId); },
-    /** Subteam resumes are refused as busy and retried until released. */
-    holdResume: () => { resumeBusy = true; },
-    /** Releases the held stop and resume together, so one tick applies the resume and then consumes the report. */
-    releaseStopAndResume: async (n: number) => { const sessionId = (await attempt(n)).sessionId; held.delete(sessionId); resumeBusy = false; },
-    stops: async (n: number) => { const sessionId = (await attempt(n)).sessionId; return stops.filter(item => item === sessionId).length; },
-    create: (objective = "Change the API and the web client") => missions.create({ requestId: randomUUID(), groupId: "shop", objective, maxSubtasks: 8, maxMinutes: 30 }),
-    get: (id: string) => missions.get(id),
-    close: () => { missions.close(); rmSync(root, { recursive: true, force: true }); },
-  };
-}
 const plan = (id: string, repoProjectId: string, dependsOn: string[] = []) =>
   ({ id, repoProjectId, title: `Subtask ${id}`, objective: `Do ${id}`, size: "solo" as const, parallelism: 1, dependsOn });
 const teamPlan = (id: string, repoProjectId: string, parallelism = 1, dependsOn: string[] = []) =>
@@ -1661,5 +1382,294 @@ test("a direction delivered between refused ones resets the refusal count in del
     await new Promise(done => setTimeout(done, 1500));
     assert.notEqual(h.get(id).status, "blocked", "Only two refusals follow the delivered direction");
     assert.equal(h.get(id).events.filter(event => /steer-subtask report was refused/.test(event.text)).length, 3);
+  } finally { h.close(); }
+});
+
+const intakeOrigin: MissionOrigin = { kind: "intake", issueId: "issue-1", identifier: "TEST-1", url: "https://linear.example.invalid/issue/TEST-1", rule: 'label "infinite", owner creator' };
+const missionRequest = (maxMinutes = 30): CreateMission => ({ requestId: randomUUID(), groupId: "shop", objective: "Change the API", maxSubtasks: 8, maxMinutes });
+const timeLimitText = "The approved time limit has expired. Active subteams were cancelled; their workspaces remain available.";
+
+test("a saved mission notifies listeners, and peek returns it without usage", { timeout: 30000 }, async () => {
+  const h = scripted();
+  try {
+    const seen: string[] = [];
+    const off = h.missions.onChange(mission => seen.push(`${mission.id}:${mission.status}`));
+    const mission = await h.missions.create(missionRequest());
+    assert.ok(seen.includes(`${mission.id}:planning`));
+    assert.equal(h.missions.peek(mission.id)!.usage, undefined, "peek computes no usage");
+    assert.equal(h.missions.peek("00000000-0000-4000-8000-000000000000"), undefined, "peek is undefined for an unknown mission");
+    off();
+    await h.missions.pause(mission.id, { requestId: randomUUID(), revision: mission.revision });
+    assert.equal(seen.some(item => item === `${mission.id}:paused`), false, "A removed listener is not called again");
+  } finally { h.close(); }
+});
+
+test("a throwing listener does not break a save", { timeout: 30000 }, async () => {
+  const h = scripted();
+  try {
+    h.missions.onChange(() => { throw new Error("listener"); });
+    const mission = await h.missions.create(missionRequest());
+    assert.equal(mission.status, "planning");
+    assert.equal(h.missions.peek(mission.id)!.status, "planning", "The save persisted before the listener ran");
+  } finally { h.close(); }
+});
+
+test("an intake mission records its origin and names the issue in its first event", { timeout: 30000 }, async () => {
+  const h = scripted();
+  try {
+    const mission = await h.missions.create(missionRequest(), undefined, intakeOrigin);
+    assert.deepEqual(mission.origin, intakeOrigin);
+    assert.match(mission.events[0].text, /^Mission started by intake from TEST-1: label "infinite", owner creator\./);
+    assert.equal(mission.events[0].text, `Mission started by intake from TEST-1: ${intakeOrigin.rule}. The coordinator will inspect the repositories and dispatch subtasks.`);
+    const plain = await h.missions.create(missionRequest());
+    assert.equal(plain.origin, undefined, "A mission started from the apps has no origin");
+    assert.equal(plain.events[0].text, "Mission approved. The coordinator will inspect the repositories and dispatch subtasks.");
+  } finally { h.close(); }
+});
+
+test("a Slack answer and a Slack steer are recorded as the owner's, with the source", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "question", question: "Which response format?", options: ["JSON", "Text"] });
+    const asked = await until(() => h.get(id), mission => mission.status === "needs-input");
+    const answered = await h.missions.answer(id, asked.decisions[0].id, { requestId: randomUUID(), revision: asked.revision, text: "JSON" }, "slack");
+    assert.equal(answered.decisions[0].answeredBy, "owner");
+    assert.equal(answered.decisions[0].answer, "JSON");
+    assert.ok(answered.events.some(event => event.text === "The owner answered the coordinator's question from Slack."));
+    const steered = await h.missions.steer(id, { requestId: randomUUID(), revision: answered.revision, text: "Keep the change small" }, "slack");
+    assert.ok(steered.events.some(event => event.text === "Owner direction recorded from Slack for the coordinator. Subtasks started later include it; the coordinator decides whether to forward it to running ones."));
+    assert.equal(steered.steering.at(-1)!.text, "Keep the change small");
+  } finally { h.close(); }
+});
+
+test("an intake pause carries its reason", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const created = await h.missions.create(missionRequest(), undefined, intakeOrigin);
+    await h.attempt(1);
+    const paused = await h.missions.pause(created.id, { requestId: randomUUID(), revision: created.revision }, "The Linear issue was closed.");
+    assert.equal(paused.status, "paused");
+    assert.equal(paused.reason, "The Linear issue was closed.");
+    assert.equal(paused.events.at(-1)!.text, "Mission paused: The Linear issue was closed.");
+    const resumed = await h.missions.resume(created.id, { requestId: randomUUID(), revision: paused.revision });
+    assert.equal(resumed.reason, undefined, "Resuming clears the pause reason");
+  } finally { h.close(); }
+});
+
+test("an intake mission waiting on the owner past its original deadline still resumes work", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(5), undefined, intakeOrigin);
+    await h.report(1, { kind: "question", question: "Which response format?", options: ["JSON", "Text"] });
+    const asked = await until(() => h.get(id), mission => mission.status === "needs-input");
+    // Ten minutes pass while the owner is away, which is more than the five-minute limit.
+    mock.timers.tick(10 * 60000);
+    await new Promise(done => setTimeout(done, 1200));
+    assert.equal(h.missions.peek(id)!.status, "needs-input", "The stopped clock does not block the mission");
+    const answered = await h.missions.answer(id, asked.decisions[0].id, { requestId: randomUUID(), revision: asked.revision, text: "JSON" });
+    assert.ok(["planning", "working"].includes(answered.status), `The answered mission resumes work, not ${answered.status}`);
+    assert.ok(Date.parse(h.missions.peek(id)!.deadlineAt) - Date.now() > 4 * 60000, "The owner's wait is added back to the deadline");
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("a paused intake mission with no subtask resumes to planning after its original deadline", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const created = await h.missions.create(missionRequest(5), undefined, intakeOrigin);
+    await h.attempt(1);
+    const paused = await h.missions.pause(created.id, { requestId: randomUUID(), revision: created.revision }, "Waiting for the owner.");
+    mock.timers.tick(10 * 60000);
+    const resumed = await h.missions.resume(created.id, { requestId: randomUUID(), revision: paused.revision });
+    // No subtask exists yet, so the resumed mission settles back to planning rather than working.
+    assert.equal(resumed.status, "planning");
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("a paused intake mission resumes working after its original deadline", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(5), undefined, intakeOrigin);
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const working = await until(() => h.get(id), mission => mission.status === "working" && Boolean(teamOf(mission, "a")));
+    const paused = await h.missions.pause(id, { requestId: randomUUID(), revision: working.revision }, "Waiting for the owner.");
+    assert.equal(paused.status, "paused");
+    mock.timers.tick(10 * 60000);
+    const resumed = await h.missions.resume(id, { requestId: randomUUID(), revision: paused.revision });
+    assert.equal(resumed.status, "working");
+    assert.equal(resumed.reason, undefined);
+    assert.ok(Date.parse(h.missions.peek(id)!.deadlineAt) - Date.now() > 4 * 60000, "The paused span is added back to the deadline");
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("a pause reason is part of the request fingerprint, and an identical retry replays", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const created = await h.missions.create(missionRequest(30));
+    const requestId = randomUUID();
+    const first = await h.missions.pause(created.id, { requestId, revision: created.revision }, "Waiting for the owner.");
+    const pauseEvents = (mission: Mission) => mission.events.filter(event => event.text === "Mission paused: Waiting for the owner.").length;
+    assert.equal(pauseEvents(first), 1);
+    const replayed = await h.missions.pause(created.id, { requestId, revision: created.revision }, "Waiting for the owner.");
+    assert.equal(replayed.revision, first.revision, "An identical retry returns the first result");
+    assert.equal(pauseEvents(h.missions.peek(created.id)!), 1, "An identical retry records no second event");
+    await assert.rejects(h.missions.pause(created.id, { requestId, revision: created.revision }, "The Linear issue was closed."), (error: TeamError) => error.code === "request-conflict");
+    assert.equal(h.missions.peek(created.id)!.reason, "Waiting for the owner.", "A conflicting retry changes nothing");
+  } finally { h.close(); }
+});
+
+test("a pause without a reason keeps its fingerprint and replays as before", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const created = await h.missions.create(missionRequest(30));
+    const requestId = randomUUID();
+    const first = await h.missions.pause(created.id, { requestId, revision: created.revision });
+    const replayed = await h.missions.pause(created.id, { requestId, revision: created.revision });
+    assert.equal(replayed.revision, first.revision);
+    assert.equal(replayed.status, "paused");
+    assert.equal(replayed.events.filter(event => event.text === "Mission paused.").length, 1, "An identical retry records no second event");
+  } finally { h.close(); }
+});
+
+test("an intake mission still expires on working time", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(5), undefined, intakeOrigin);
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const working = await until(() => h.get(id), mission => Boolean(teamOf(mission, "a")));
+    assert.equal(working.status, "working");
+    mock.timers.tick(6 * 60000);
+    const blocked = await until(() => h.get(id), mission => mission.status === "blocked");
+    assert.equal(blocked.reason, timeLimitText);
+    assert.ok(blocked.events.some(event => event.text === timeLimitText));
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("a mission started from the apps keeps the wall-clock deadline", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const created = await h.missions.create(missionRequest(5));
+    await h.attempt(1);
+    const paused = await h.missions.pause(created.id, { requestId: randomUUID(), revision: created.revision });
+    // Stop the tick, so no step can block the paused mission between the clock move and the resume.
+    h.missions.close();
+    mock.timers.tick(10 * 60000);
+    await assert.rejects(h.missions.resume(created.id, { requestId: randomUUID(), revision: paused.revision }), (error: TeamError) => error.code === "mission-deadline");
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("subteams of an intake mission are not tracked in Linear", { timeout: 120000 }, async () => {
+  const h = harness({ configure: config => { config.projects[0].linear = { teamId: "T00000000" }; } });
+  try {
+    const { missions, teams } = h.open();
+    h.release("release-dispatch");
+    const created = await missions.create(h.create("HOLD-SUBTEAM so the subteam stays active"), undefined, intakeOrigin);
+    const running = await until(() => missions.get(created.id), mission => mission.subtasks[0]?.status === "running");
+    assert.equal(running.subtasks[0].repoProjectId, "api");
+    assert.equal(teams.get(running.subtasks[0].teamId!).linearTracking, false, "An intake mission's subteam is not Linear-tracked");
+  } finally { await h.close(); }
+});
+
+test("a no-change subteam's findings reach the coordinator and the mission result", { timeout: 180000 }, async () => {
+  const h = harness();
+  try {
+    const { missions } = h.open();
+    const finished = (created: Mission) => until(() => missions.get(created.id), mission => ["ready-for-review", "blocked", "cancelled"].includes(mission.status), 150000);
+    const mission = await finished(await missions.create(h.create("ANSWER-ONLY which exports failed?"), undefined, intakeOrigin));
+    assert.equal(mission.status, "ready-for-review");
+    assert.equal(mission.subtasks[0].teamStatus, "no-change");
+    assert.match(mission.result!.summary, /Three exports failed last week\./);
+    assert.match(mission.result!.summary, /- export log: Rows 14, 90 and 212 were empty\./);
+  } finally { await h.close(); }
+});
+
+test("subteamReport prefers no-change, then the result summary, then findings, and bounds the text", () => {
+  const view = (fields: Record<string, unknown>) => ({ tasks: [], ...fields }) as unknown as TeamView;
+  const noChange = { summary: "Three exports failed last week.", evidence: [{ source: "export log", observation: "Rows 14, 90 and 212 were empty." }] };
+  const pullRequest = { revision: 1, headCommit: "a".repeat(40), pullRequestUrl: "https://github.com/OWNER/REPO/pull/1", summary: "Opened the change.", reportedAt: new Date(0).toISOString() };
+  const discovery = { revision: 1, summary: "The exports read the wrong table.", tasks: [] };
+  assert.deepEqual(subteamReport(view({ noChange, pullRequest })), { kind: "no-change", text: "Three exports failed last week.\n- export log: Rows 14, 90 and 212 were empty." });
+  assert.deepEqual(subteamReport(view({ pullRequest })), { kind: "result", text: "Opened the change." });
+  assert.deepEqual(subteamReport(view({ discovery })), { kind: "findings", text: "The exports read the wrong table." });
+  assert.equal(subteamReport(view({})), undefined);
+  const long = subteamReport(view({ noChange: { summary: "x\n".repeat(5000), evidence: [] } }))!.text;
+  assert.ok(long.length <= 4000 && long.endsWith("[truncated]"), `Bounded text is ${long.length} characters`);
+  assert.ok(long.endsWith("x\n[truncated]"), "The cut falls on a line boundary before the marker");
+});
+
+test("a report whose first line alone exceeds the bound keeps the start of that line", () => {
+  const view = (fields: Record<string, unknown>) => ({ tasks: [], ...fields }) as unknown as TeamView;
+  const evidence = [{ source: "export log", observation: "Rows 14, 90 and 212 were empty." }];
+  const oneLine = subteamReport(view({ noChange: { summary: "x".repeat(4000), evidence } }))!.text;
+  assert.equal(oneLine.length, 4000, "The kept text fills the bound exactly");
+  assert.equal(oneLine, `${"x".repeat(3988)}\n[truncated]`, "No newline fits, so the first 3,988 characters of the line are kept");
+  const boundary = subteamReport(view({ noChange: { summary: `${"a".repeat(100)}\n${"b".repeat(4000)}`, evidence: [] } }))!.text;
+  assert.equal(boundary, `${"a".repeat(100)}\n[truncated]`, "The cut ends at the last line boundary that fits, with no partial line after it");
+});
+
+test("subteamReport falls through empty result sources in order", () => {
+  const view = (fields: Record<string, unknown>) => ({ tasks: [], ...fields }) as unknown as TeamView;
+  const discovery = { revision: 1, summary: "The exports read the wrong table.", tasks: [] };
+  const cases: { name: string; team: Record<string, unknown>; expected: ReturnType<typeof subteamReport> }[] = [
+    { name: "a delivery receipt", team: { deliveryReceipt: { summary: "Merged the change." } }, expected: { kind: "result", text: "Merged the change." } },
+    { name: "ordered task summaries that skip missing ones", team: { tasks: [{ id: "a", summary: "First." }, { id: "b" }, { id: "c", summary: "Third." }] }, expected: { kind: "result", text: "First.\n\nThird." } },
+    { name: "an empty pull request summary and empty task summaries", team: { pullRequest: { summary: "" }, tasks: [{ id: "a", summary: "" }], discovery }, expected: { kind: "findings", text: "The exports read the wrong table." } },
+    { name: "no result source and no discovery", team: { tasks: [{ id: "a" }] }, expected: undefined },
+  ];
+  for (const { name, team, expected } of cases) assert.deepEqual(subteamReport(view(team)), expected, name);
+});
+
+test("an intake mission's prompt carries the answer-only guidance and an app mission's does not", { timeout: 60000 }, async () => {
+  const h = scripted({ configure: config => {
+    config.intake = { linear: { teamIds: [randomUUID()], creatorId: randomUUID(), label: "infinite", commentsMirrorToSlack: false },
+      mission: { groupId: "shop", maxSubtasks: 8, maxMinutes: 240, answerProjectId: "api" }, maxActive: 3, requireSlackThread: true };
+  } });
+  try {
+    await h.missions.create(missionRequest(), undefined, intakeOrigin);
+    const intakePrompt = (await h.attempt(1)).prompt;
+    assert.match(intakePrompt, /Decide first whether the request changes code\./);
+    assert.match(intakePrompt, /in repository api/);
+    await h.missions.create(missionRequest());
+    const appPrompt = (await h.attempt(2)).prompt;
+    assert.doesNotMatch(appPrompt, /Decide first whether the request changes code\./);
+  } finally { h.close(); }
+});
+
+test("answer-only guidance names only a mission repository and reaches resumed attempts", { timeout: 30000 }, async () => {
+  const h = scripted();
+  try {
+    const intake = await h.missions.create(missionRequest(), undefined, intakeOrigin);
+    const plain = await h.create();
+    const repos = [{ projectId: "api", name: "API", path: "/srv/infinite-data/api", teamReady: true }];
+    const context = (answerProjectId?: string) => ({ openChildDecisions: [], waiting: 0, answerProjectId });
+    const initial = (mission: Mission, answerProjectId?: string) => missionPromptWithMessageCount(mission, repos, [], 1, "claude", lineup.coordinator, context(answerProjectId)).prompt;
+    const resumed = (mission: Mission, answerProjectId?: string) => missionFollowUpPromptWithMessageCount(mission, repos, [], 2, "claude", lineup.coordinator, context(answerProjectId)).prompt;
+    assert.match(initial(intake, "api"), /dispatch exactly one solo subtask in repository api whose objective says/);
+    assert.match(resumed(intake, "api"), /Decide first whether the request changes code\.[\s\S]*dispatch exactly one solo subtask in repository api whose objective says/);
+    for (const answerProjectId of [undefined, "web"]) {
+      const first = initial(intake, answerProjectId), again = resumed(intake, answerProjectId);
+      assert.match(first, /dispatch exactly one solo subtask whose objective says to change no files/, `answerProjectId ${answerProjectId}`);
+      assert.doesNotMatch(first, /in repository/, `answerProjectId ${answerProjectId}`);
+      assert.match(again, /Decide first whether the request changes code\./, `answerProjectId ${answerProjectId}`);
+      assert.doesNotMatch(again, /in repository/, `answerProjectId ${answerProjectId}`);
+    }
+    assert.doesNotMatch(initial(plain, "api"), /Decide first whether the request changes code\./, "An app mission has no answer-only guidance");
+    assert.doesNotMatch(resumed(plain, "api"), /Decide first whether the request changes code\./, "An app mission has no answer-only guidance on resume");
+  } finally { h.close(); }
+});
+
+test("the report survives the recent-message window", { timeout: 30000 }, async () => {
+  const h = scripted();
+  try {
+    const created = await h.create("Answer which exports failed");
+    const report = { kind: "no-change", text: "Three exports failed last week.\n- export log: Rows 14, 90 and 212 were empty." };
+    const message: MissionMessage = { type: "subtask-finished", subtaskId: "answer", teamId: "team-1", status: "done", teamStatus: "no-change", report };
+    const prompt = missionPromptWithMessageCount(created, [], [message], 1, "claude", lineup.coordinator, { openChildDecisions: [], waiting: 0 }).prompt;
+    assert.match(prompt, /"report":\{"kind":"no-change","text":"Three exports failed last week\.\\n- export log: Rows 14, 90 and 212 were empty\."\}/);
   } finally { h.close(); }
 });

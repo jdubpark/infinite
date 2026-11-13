@@ -73,9 +73,13 @@ export interface MissionDecision {
   answeredAt?: string;
   answeredBy?: "owner" | "coordinator";
 }
+export type MissionOrigin = { kind: "intake"; issueId: string; identifier: string; url: string; rule: string };
+export type MissionInputSource = "slack";
 export interface Mission {
   id: string;
   groupId: string;
+  /** Set when an intake rule created the mission from a Linear issue. */
+  origin?: MissionOrigin;
   /** Group name and repositories pinned at creation; later group edits do not change a running mission. */
   groupName: string;
   repoProjectIds: string[];

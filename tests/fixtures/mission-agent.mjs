@@ -31,6 +31,15 @@ async function coordinator() {
   const state = json("Mission state (JSON): "), messages = json("Messages since your last attempt (JSON): ");
   const held = prompt.includes("HOLD-SUBTEAM"), refusal = messages.find(message => message.type === "refused")?.reason ?? "";
   const step = (id, repoProjectId, dependsOn) => ({ id, repoProjectId, title: id, objective: "HOLD-SUBTEAM", size: "solo", dependsOn });
+  // Answer-only missions: the resumed attempt's prompt omits the objective, so the state's subtask objective marks it too.
+  if (prompt.includes("ANSWER-ONLY") || state.subtasks.some(subtask => subtask.objective === "NO-CHANGE-ANSWER")) {
+    const answered = messages.find(message => message.type === "subtask-finished" && message.report);
+    if (answered) { await report({ kind: "result", summary: answered.report.text }); return; }
+    if (messages.some(message => message.type === "start")) {
+      await report({ kind: "dispatch", summary: "Answer the question from the export logs", subtasks: [{ id: "answer", repoProjectId: "api", title: "Answer the question", objective: "NO-CHANGE-ANSWER", size: "solo", dependsOn: [] }] });
+      return;
+    }
+  }
   if (prompt.includes("INVALID-DISPATCH") && messages.some(message => message.type === "start")) {
     await report({ kind: "dispatch", summary: "Two subtasks that wait on each other", subtasks: [step("first", "api", ["second"]), step("second", "web", ["first"])] });
     return;
@@ -68,6 +77,10 @@ async function subteam() {
   const api = prompt.includes("Subtask api-change"), file = api ? "api.txt" : "web.txt";
   if (assignment.role === "project-manager") {
     if (prompt.includes("HOLD-SUBTEAM")) return hold();
+    if (prompt.includes("NO-CHANGE-ANSWER")) {
+      await report({ kind: "no-change", summary: "Three exports failed last week.", evidence: [{ source: "export log", observation: "Rows 14, 90 and 212 were empty." }] });
+      return;
+    }
     if (!api) await until(() => existsSync(join(receipts, "release-web-question")));
     if (!/(?:User|Mission coordinator) answered:/.test(prompt)) {
       await report({ kind: "question", question: api ? "Which response format should the endpoint use?" : "Should the button be primary?", options: api ? ["JSON", "Text"] : ["Primary", "Secondary"] });

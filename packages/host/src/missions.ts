@@ -8,13 +8,14 @@ import type { Config } from "./types.js";
 import type { CreateTeam, NativeContinuation, TeamAssignment, TeamView } from "./team-types.js";
 import type { ProductGoal } from "./goal-types.js";
 import type { ProjectGroup } from "./project-group-types.js";
-import { createMissionSchema, missionActionSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionReport, type MissionSubtaskPlan } from "./mission-types.js";
-import { missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
+import { createMissionSchema, missionActionSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionInputSource, type MissionOrigin, type MissionReport, type MissionSubtaskPlan } from "./mission-types.js";
+import { missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, subteamReport, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
 import { addRollups, emptyRollup, teamUsage } from "./team-usage.js";
 import type { UsageService } from "./usage-service.js";
 import { missionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { ensureDefaultTeamRoot, ensureHostDirectory } from "./team-workspace.js";
 import { resumeFailed } from "./native-continuation.js";
+import { HOST_LOAD_REASON_PREFIX, LaunchHeldError, holdsHostLoadReason } from "./host-load.js";
 
 /** The mission's only view of projects; the project group service implements it. */
 export type ProjectGroupLookup = { get(id: string): ProjectGroup };
@@ -57,6 +58,8 @@ type Stored = {
   ownerInputs?: number;
   /** The finished same-repository subtask run a pending launch starts from, keyed by subtask ID. */
   bases?: Record<string, string>;
+  /** When an intake mission's clock stopped (waiting on the owner or paused); the stopped span is added to its deadline on resume. */
+  clockStoppedAt?: string;
 };
 
 const now = () => new Date().toISOString();
@@ -88,6 +91,7 @@ export class MissionService {
   private closed = false;
   private tickQueued = false;
   private usage?: UsageService;
+  private readonly listeners = new Set<(mission: Mission) => void>();
 
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly teams: TeamService, private readonly groups: ProjectGroupLookup) {
     this.directory = join(config.stateDir, "missions");
@@ -160,14 +164,47 @@ export class MissionService {
     if (!stored) throw new TeamError(404, "mission-not-found", "This mission does not exist.");
     return stored;
   }
+  /** Calls each listener after a sealed write, with the stored mission and no computed usage. */
+  onChange(listener: (mission: Mission) => void) {
+    this.listeners.add(listener);
+    return () => { this.listeners.delete(listener); };
+  }
+  /** The stored mission without computed usage, for callers that read on every change. */
+  peek(id: string): Mission | undefined {
+    const stored = this.records.get(id);
+    return stored && structuredClone(stored.mission);
+  }
   private save(stored: Stored) {
     const attempt = stored.attempts.at(-1), mission = stored.mission;
     mission.coordinator = attempt && { memberId: attempt.memberId, sessionId: attempt.sessionId,
       status: attempt.status !== "stopped" ? "running" : live.has(mission.status) ? "waiting" : "stopped" };
+    this.settleClock(stored);
     if (this.saved.get(mission.id) === digest(stored)) return;
     mission.updatedAt = now();
     writeSealed(join(this.directory, `${mission.id}.sealed`), this.key, `mission:${mission.id}`, stored);
     this.saved.set(mission.id, digest(stored));
+    for (const listener of [...this.listeners]) {
+      // A listener that throws must not fail a save that is already written.
+      try { listener(structuredClone(mission)); } catch { /* the listener owns its failure */ }
+    }
+  }
+  /**
+   * An intake mission's clock stops while it waits on the owner or is paused; the stopped span is added to its
+   * deadline when it leaves that state, so only working time counts. Other missions keep the wall-clock deadline.
+   */
+  private settleClock(stored: Stored) {
+    const mission = stored.mission;
+    if (mission.origin?.kind !== "intake") return;
+    const stopped = mission.status === "needs-input" || mission.status === "paused";
+    if (stopped && !stored.clockStoppedAt) stored.clockStoppedAt = now();
+    else if (!stopped && stored.clockStoppedAt) {
+      mission.deadlineAt = new Date(this.deadlineMs(stored, Date.now())).toISOString();
+      delete stored.clockStoppedAt;
+    }
+  }
+  /** The deadline on the clock as it reads at this moment: a stopped intake clock adds its stopped time back. */
+  private deadlineMs(stored: Stored, at: number) {
+    return Date.parse(stored.mission.deadlineAt) + (stored.clockStoppedAt ? at - Date.parse(stored.clockStoppedAt) : 0);
   }
   private event(stored: Stored, text: string) {
     stored.mission.events.push({ at: now(), text });
@@ -203,7 +240,7 @@ export class MissionService {
       throw new TeamError(409, "request-conflict", "This request ID belongs to a different mission.");
     return this.view(prior);
   }
-  create(input: CreateMission, originalInput?: CreateMission) {
+  create(input: CreateMission, originalInput?: CreateMission, origin?: MissionOrigin) {
     const request = createMissionSchema.parse(input);
     const originalFingerprint = originalInput && digest(createMissionSchema.parse(originalInput));
     return this.enqueue(() => {
@@ -244,12 +281,14 @@ export class MissionService {
       const createdAt = now();
       const stored: Stored = { fingerprint, ...(originalFingerprint && originalFingerprint !== fingerprint ? { requestFingerprints: [originalFingerprint] } : {}),
         receipts: {}, folder, repos, attempts: [], inbox: [{ type: "start" }], notes: [], notified: [], launches: {}, ops: [], refusals: 0, mission: {
-        id: request.requestId, groupId: group.id, groupName: group.name, repoProjectIds: repos.map(repo => repo.projectId),
+        id: request.requestId, ...(origin ? { origin: structuredClone(origin) } : {}), groupId: group.id, groupName: group.name, repoProjectIds: repos.map(repo => repo.projectId),
         title: request.title ?? request.objective.split("\n")[0].trim().slice(0, 100), objective: request.objective,
         maxSubtasks: request.maxSubtasks, maxMinutes: request.maxMinutes, deadlineAt: new Date(Date.parse(createdAt) + request.maxMinutes * 60000).toISOString(),
         revision: 1, status: "planning", createdAt, updatedAt: createdAt, lineup, subtasks: [], decisions: [], steering: [], events: [],
       } };
-      this.event(stored, "Mission approved. The coordinator will inspect the repositories and dispatch subtasks.");
+      this.event(stored, origin
+        ? `Mission started by intake from ${origin.identifier}: ${origin.rule}. The coordinator will inspect the repositories and dispatch subtasks.`
+        : "Mission approved. The coordinator will inspect the repositories and dispatch subtasks.");
       for (const text of checkoutEvents) this.event(stored, text);
       this.records.set(stored.mission.id, stored); this.save(stored);
       return this.view(stored);
@@ -279,21 +318,27 @@ export class MissionService {
     stored.receipts[body.requestId] = digest({ action, ...body });
     stored.mission.revision++;
   }
-  pause(id: string, input: Action) { return this.action(id, "pause", missionActionSchema.parse(input)); }
+  pause(id: string, input: Action, reason?: string) {
+    // A supplied reason joins the request fingerprint; an omitted one leaves the fingerprint as it was before reasons existed.
+    const body = { ...missionActionSchema.parse(input), ...(reason === undefined ? {} : { reason }) };
+    return this.action(id, "pause", body);
+  }
   resume(id: string, input: Action) { return this.action(id, "resume", missionActionSchema.parse(input)); }
   cancel(id: string, input: Action) { return this.action(id, "cancel", missionActionSchema.parse(input)); }
-  private action(id: string, action: "pause" | "resume" | "cancel", body: Action) {
+  private action(id: string, action: "pause" | "resume" | "cancel", body: Action & { reason?: string }) {
+    const reason = body.reason;
     return this.enqueue(() => {
       const stored = this.record(id), mission = stored.mission;
       if (this.replay(stored, action, body)) return this.view(stored);
       if (action === "pause" && !live.has(mission.status)) throw new TeamError(409, "mission-not-running", "Only a running mission can be paused.");
       if (action === "resume" && mission.status !== "paused") throw new TeamError(409, "mission-not-paused", "Only a paused mission can resume.");
-      if (action === "resume" && Date.now() >= Date.parse(mission.deadlineAt)) throw new TeamError(409, "mission-deadline", "This mission's time limit has expired. Start a new mission to approve more time.");
+      // The paused status still holds here, so the stopped clock is added to the deadline without writing it yet.
+      if (action === "resume" && Date.now() >= this.deadlineMs(stored, Date.now())) throw new TeamError(409, "mission-deadline", "This mission's time limit has expired. Start a new mission to approve more time.");
       if (action === "cancel" && mission.status === "cancelled") throw new TeamError(409, "mission-cancelled", "This mission has already been cancelled.");
       this.admit(stored, action, body);
       if (action === "cancel") this.stop(stored, "cancelled", "Cancelled by the owner. Subteam workspaces remain available for inspection.");
       else if (action === "pause") {
-        mission.status = "paused"; mission.reason = "Paused by the owner. The coordinator and active subteams are stopping.";
+        mission.status = "paused"; mission.reason = reason ?? "Paused by the owner. The coordinator and active subteams are stopping.";
         for (const subtask of mission.subtasks.filter(item => item.teamId && item.status === "running")) this.queueOp(stored, { kind: "pause", subtaskId: subtask.id, teamId: subtask.teamId! });
       } else {
         mission.status = "working"; mission.reason = undefined;
@@ -306,11 +351,11 @@ export class MissionService {
         stored.inbox.push({ type: "resumed" });
         this.settle(stored);
       }
-      this.event(stored, `Mission ${action === "pause" ? "paused" : action === "resume" ? "resumed" : "cancelled"}.`);
+      this.event(stored, action === "pause" && reason ? `Mission paused: ${reason}` : `Mission ${action === "pause" ? "paused" : action === "resume" ? "resumed" : "cancelled"}.`);
       this.save(stored); return this.view(stored);
     });
   }
-  steer(id: string, input: Action & { text: string }) {
+  steer(id: string, input: Action & { text: string }, source?: MissionInputSource) {
     const body = missionTextSchema.parse(input);
     return this.enqueue(() => {
       const stored = this.record(id), mission = stored.mission;
@@ -322,11 +367,13 @@ export class MissionService {
       mission.steering.push({ text: body.text, revision: mission.revision, at: now() });
       stored.ownerInputs = (stored.ownerInputs ?? 0) + 1;
       stored.inbox.push({ type: "owner-direction", text: body.text });
-      this.event(stored, "Owner direction recorded for the coordinator. Subtasks started later include it; the coordinator decides whether to forward it to running ones.");
+      this.event(stored, source === "slack"
+        ? "Owner direction recorded from Slack for the coordinator. Subtasks started later include it; the coordinator decides whether to forward it to running ones."
+        : "Owner direction recorded for the coordinator. Subtasks started later include it; the coordinator decides whether to forward it to running ones.");
       this.save(stored); return this.view(stored);
     });
   }
-  answer(id: string, decisionId: string, input: Action & { text: string }) {
+  answer(id: string, decisionId: string, input: Action & { text: string }, source?: MissionInputSource) {
     const body = missionTextSchema.parse(input);
     return this.enqueue(() => {
       const stored = this.record(id), mission = stored.mission;
@@ -343,10 +390,12 @@ export class MissionService {
       if (decision.childDecisionId && subtask?.teamId) {
         this.queueOp(stored, { kind: "answer", subtaskId: subtask.id, teamId: subtask.teamId, decisionId: decision.childDecisionId, text: body.text, by: "owner" });
         stored.notes.push({ ...message, forwardedTo: { subtaskId: subtask.id, childDecisionId: decision.childDecisionId } });
-        this.event(stored, `The owner answered a question; the answer is being forwarded to subtask ${subtask.id}.`);
+        this.event(stored, source === "slack"
+          ? `The owner answered a question from Slack; the answer is being forwarded to subtask ${subtask.id}.`
+          : `The owner answered a question; the answer is being forwarded to subtask ${subtask.id}.`);
       } else {
         stored.inbox.push(message);
-        this.event(stored, "The owner answered the coordinator's question.");
+        this.event(stored, source === "slack" ? "The owner answered the coordinator's question from Slack." : "The owner answered the coordinator's question.");
       }
       this.settle(stored);
       this.save(stored); return this.view(stored);
@@ -386,7 +435,9 @@ export class MissionService {
     if (["blocked", "ready-for-review", "cancelled"].includes(mission.status) && !stored.ops.length && !Object.keys(stored.launches).length &&
         (stored.attempts.at(-1)?.status ?? "stopped") === "stopped" &&
         !mission.subtasks.some(subtask => subtask.status === "running" || subtask.status === "cancelled" && subtask.teamId)) return;
-    if ((live.has(mission.status) || mission.status === "paused") && Date.now() >= Date.parse(mission.deadlineAt)) {
+    this.settleClock(stored);
+    // A stopped intake clock is not checked; its deadline moves when the owner or the pause releases it.
+    if ((live.has(mission.status) || mission.status === "paused") && !stored.clockStoppedAt && Date.now() >= Date.parse(mission.deadlineAt)) {
       this.stop(stored, "blocked", timeLimitReason); this.event(stored, timeLimitReason); this.save(stored);
     }
     await this.launchSubteams(stored);
@@ -449,7 +500,8 @@ export class MissionService {
       }
       const baseRunId = stored.bases?.[subtaskId];
       try {
-        const team = await this.teams.createForMission(request, mission.id, mission.lineup, { ...(baseRunId ? { baseRunId } : {}), parallelismCeiling: subtask.size === "solo" ? 1 : 4 });
+        // Owner-requested intake work is not mirrored to Linear as a team; the intake issue is the record.
+        const team = await this.teams.createForMission(request, mission.id, mission.lineup, { ...(baseRunId ? { baseRunId } : {}), parallelismCeiling: subtask.size === "solo" ? 1 : 4, ...(mission.origin?.kind === "intake" ? { linearTracking: false } : {}) });
         if (this.closed) return;
         Object.assign(subtask, { teamId: team.id, status: "running", teamStatus: team.status });
         const base = baseRunId && mission.subtasks.find(item => item.teamId === baseRunId);
@@ -552,10 +604,13 @@ export class MissionService {
       subtask.status = status;
       if (status === "cancelled") subtask.finalEvidence = { ...(team.reason ? { reason: team.reason } : {}), ...(team.headCommit ? { headCommit: team.headCommit } : {}), usage: team.usage };
       if (changed && status !== "running") this.event(stored, `Subtask ${subtask.id} is ${status} (subteam ${team.status}).`);
-      if (live.has(mission.status) && status !== "running")
+      if (live.has(mission.status) && status !== "running") {
+        const report = subteamReport(team);
         this.message(stored, `${team.id}:${status === "cancelled" ? "cancelled" : `${status}:${team.revision}`}`, { type: "subtask-finished", subtaskId: subtask.id, teamId: team.id, status, teamStatus: team.status,
           ...(team.reason ? { reason: team.reason } : {}),
+          ...(report ? { report } : {}),
           ...(status === "cancelled" ? { retentionNote: "Cancelled run data and its workspace are deleted after its members settle. If work is still needed, dispatch a replacement subtask with a new ID in the same repository." } : {}) });
+      }
       if (status === "cancelled" && team.workspaceRemovedAt) {
         // Persist the host-observed cancellation and its final evidence before deleting the child record.
         this.save(stored);
@@ -685,8 +740,17 @@ export class MissionService {
       this.config.teams?.workspaceDir, this.config.teams?.trustWorkspaces === true);
       if (this.closed) return;
       attempt.status = "running"; attempt.startedAt ??= now();
+      if (mission.reason?.startsWith(HOST_LOAD_REASON_PREFIX)) mission.reason = undefined;
       if (session.status === "unavailable") this.event(stored, "The coordinator runtime is unavailable; the mission is waiting for confirmed state.");
     } catch (error) {
+      if (error instanceof LaunchHeldError) {
+        // Only an empty reason or an earlier host-load hold is replaced; the event records the first hold, not each tick.
+        if (holdsHostLoadReason(mission.reason)) {
+          if (mission.reason === undefined) this.event(stored, `The coordinator launch is waiting: ${error.reason}`);
+          mission.reason = error.reason; this.save(stored);
+        }
+        return;
+      }
       if (error instanceof Error && /configured session limit/.test(error.message)) return;
       throw error;
     }
@@ -776,7 +840,7 @@ export class MissionService {
     const inbox = stored.inbox.slice(0, messageLimit), notes = stored.notes.slice(0, messageLimit - inbox.length);
     const waiting = stored.inbox.length + stored.notes.length - inbox.length - notes.length;
     // The prompt keeps a byte budget by leaving trailing messages queued, so inbox messages lead and notes are deferred first.
-    const messages = [...inbox, ...notes], context = { openChildDecisions: this.openChildDecisions(stored), waiting };
+    const messages = [...inbox, ...notes], context = { openChildDecisions: this.openChildDecisions(stored), waiting, answerProjectId: this.config.intake?.mission.answerProjectId };
     const build = (list: MissionMessage[], promptContext: typeof context) => continuation?.mode === "resume"
       ? missionFollowUpPromptWithMessageCount(mission, stored.repos, list, revision, profile.provider, profile, promptContext)
       : missionPromptWithMessageCount(mission, stored.repos, list, revision, profile.provider, profile, promptContext);

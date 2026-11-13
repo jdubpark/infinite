@@ -42,6 +42,7 @@ export function schedulerFixture() {
   let permissionAnswers = 0;
   let reads = 0;
   const manager = {
+    hostLoad: { held: () => undefined },
     list: async () => [],
     meta: (requestedId: string) => {
       // The base member's session carries its assignment like a real team session, so pre-review live checks pass.

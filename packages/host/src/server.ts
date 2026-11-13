@@ -30,6 +30,9 @@ import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
 import { UsageService } from "./usage-service.js";
 import { EvidenceStore, evidenceDatabasePath } from "./evidence/store.js";
 import { EventOutbox } from "./evidence/outbox.js";
+import { Blackboard } from "./evidence/blackboard.js";
+import { ENTRY_KINDS } from "./evidence/entry-types.js";
+import { EvidenceError } from "./evidence/types.js";
 import { usagePlanSchema } from "./usage-api.js";
 import { TeamService, TeamError } from "./teams.js";
 import { spawnTeamBundle } from "./team-workspace.js";
@@ -177,10 +180,12 @@ export function createApp(config: Config, key: Buffer) {
   // A store that cannot open stays unavailable with a fixed reason. It never blocks the host, a run, or a removal.
   const evidence = new EvidenceStore({ databasePath: evidenceDatabasePath(config.stateDir), vaultKey: key });
   const outbox = new EventOutbox(evidence);
+  const blackboard = new Blackboard(evidence);
   const teams = new TeamService(config, key, manager, startInProject, linear, readings, {
     source: projectSource,
     graphs: repositoryGraphs,
     events: outbox,
+    entries: blackboard,
     onMerged: id => void projectSource.refresh(id).then(status => {
       sourceChanged(id);
       if (status.appliedHead && !status.pending) scheduleGraphForSession(id);
@@ -787,6 +792,42 @@ export function createApp(config: Config, key: Buffer) {
     return res.json(missionBoard(missions.list(), teams.list(), goals.list(), config.projects, id => memberships.get(id)));
   });
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
+  // Entries and launch sizes are read-only. They follow the role rule of GET /api/teams/:id and do not refresh tracking.
+  const entryQuery = z.object({
+    kind: z.union([z.enum(ENTRY_KINDS), z.array(z.enum(ENTRY_KINDS)).min(1).max(8)]).optional(),
+    task: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/).optional(),
+    since: z.string().regex(/^\d{1,15}$/).transform(Number).optional(),
+    limit: z.string().regex(/^\d{1,3}$/).transform(Number).pipe(z.number().int().min(1).max(100)).optional(),
+  }).strict();
+  const entryRead = (req: express.Request, res: express.Response, read: (runId: string) => unknown) => {
+    const runId = id.parse(req.params.id);
+    if (!teams.hasRecordFile(runId)) throw new TeamError(404, "team-not-found", "Team not found.");
+    try { return res.json(read(runId)); }
+    catch (error) {
+      if (error instanceof EvidenceError && error.code === "unavailable")
+        return res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
+  };
+  app.get("/api/teams/:id/entries", (req, res) => {
+    const query = entryQuery.parse(req.query);
+    const kinds = query.kind === undefined ? undefined : Array.isArray(query.kind) ? query.kind : [query.kind];
+    return entryRead(req, res, runId => blackboard.list(runId, {
+      ...(kinds ? { kinds } : {}),
+      ...(query.task ? { taskId: query.task } : {}),
+      ...(query.since !== undefined ? { since: query.since } : {}),
+      ...(query.limit !== undefined ? { limit: query.limit } : {}),
+    }));
+  });
+  app.get("/api/teams/:id/entries/:entryId", (req, res) => {
+    const entryId = id.parse(req.params.entryId);
+    return entryRead(req, res, runId => {
+      const found = blackboard.get(runId, entryId);
+      if (!found) throw new TeamError(404, "entry-not-found", "Entry not found.");
+      return found;
+    });
+  });
+  app.get("/api/teams/:id/context-usage", (req, res) => entryRead(req, res, runId => ({ members: blackboard.contextUsage(runId) })));
   app.delete("/api/teams/:id", requireRole(["owner"]), async (req, res) => {
     const teamId = id.parse(req.params.id);
     if (goals.ownsActiveTeam(teamId)) throw new TeamError(409, "goal-owned-team", "Control this feature from its goal.");

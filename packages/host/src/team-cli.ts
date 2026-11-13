@@ -9,6 +9,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import { createTeamSchema, gitBranchSchema, githubRepositorySchema, teamDeliverySchema, teamDeliveryReconcileSchema, teamPermissionsSchema, type ProjectSource, type TeamDelivery, DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE} from "./team-types.js";
 import { describeSource } from "./client.js";
+import type { EntryPage } from "./evidence/blackboard.js";
+import type { EntryHead } from "./evidence/entry-types.js";
 import type { ProjectSourceStatus } from "./project-source.js";
 import { captureWorkspace } from "./workspace-checkpoint.js";
 import { uploadMissingChunks } from "./chunk-upload.js";
@@ -410,6 +412,15 @@ async function askForBrief(api: Api, team: any, rows: BriefRow[], signal: AbortS
   }
 }
 
+/** One line per entry head. Host text is cleaned before it reaches the terminal. */
+function entryLine(head: EntryHead) {
+  const parts = [String(head.seq), head.kind, `${head.author}/${head.authority}`, ...(head.taskId ? [`task ${head.taskId}`] : []), head.summary];
+  return parts.map(part => clean(part)).join("  ");
+}
+/** Indented JSON with C1 control characters escaped, so a host body cannot move the terminal. */
+function terminalJson(value: unknown) {
+  return JSON.stringify(value, null, 2).replace(/[\u007f-\u009f\u2028\u2029]/g, character => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
 function outputTeam(team: any, json: boolean) {
   if (json) { console.log(JSON.stringify(team, null, 2)); return; }
   console.log(`${clean(team.id)}  ${clean(team.status)}  ${clean(team.title)}`);
@@ -820,6 +831,41 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     }
     return true;
   }
+  if (subcommand === "entries" || subcommand === "entry") {
+    const json = Boolean(options["--json"]);
+    const flag = (name: string) => {
+      const value = options[name];
+      if (value === undefined) return undefined;
+      if (typeof value !== "string") throw new Error(`${name} needs a value.`);
+      return value;
+    };
+    if (subcommand === "entries") {
+      if (!id || rest.length) throw new Error("Usage: infinite team entries ID [--kind K] [--task T] [--since N] [--json]");
+      z.uuid().parse(id);
+      const params = new URLSearchParams();
+      for (const [name, key] of [["--kind", "kind"], ["--task", "task"], ["--since", "since"]] as const) {
+        const value = flag(name);
+        if (value !== undefined) params.set(key, value);
+      }
+      const page = await api.json<EntryPage>(`/teams/${id}/entries${params.size ? `?${params}` : ""}`);
+      if (json) console.log(terminalJson(page));
+      else {
+        for (const head of page.entries) console.log(entryLine(head));
+        if (page.more) console.log(`More entries: --since ${page.cursor}`);
+      }
+      return true;
+    }
+    if (!id || rest.length !== 1) throw new Error("Usage: infinite team entry ID ENTRY_ID [--json]");
+    z.uuid().parse(id);
+    z.uuid().parse(rest[0]);
+    const found = await api.json<{ head: EntryHead; body: unknown }>(`/teams/${id}/entries/${rest[0]}`);
+    if (json) console.log(terminalJson(found));
+    else {
+      console.log(entryLine(found.head));
+      console.log(terminalJson(found.body));
+    }
+    return true;
+  }
   if (subcommand === "status" || subcommand === "watch") {
     if (subcommand === "watch" && !id) throw new Error("Usage: infinite team watch ID [--logs]");
     if (options["--logs"] && !id) throw new Error("Usage: infinite team status ID --logs");
@@ -1136,5 +1182,5 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     }
     return true;
   }
-  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|continue|delete|reconcile-delivery|reconcile-verification|retire-member|cancel|revoke-permissions ...");
+  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|continue|delete|entries|entry|reconcile-delivery|reconcile-verification|retire-member|cancel|revoke-permissions ...");
 }

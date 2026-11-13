@@ -888,3 +888,231 @@ openTeamService(serviceOptions?: { /* existing fields */ events?: EventOutbox })
 - The base branch scan, landing, revert, and the hold window.
 - `configId` and the profile epoch.
 - The test that `team-prompts.ts` does not import the ledger. It arrives with the ledger module in the projection slice.
+
+---
+
+# Slice: configuration identity
+
+Spec part 3, "Configurations and profile epochs", under umbrella C7. After a member's session starts, `TeamService` computes the member's `configId` and emits it as an enrichment event, `member.configured`. A new evidence module keeps one row per `configId` with its six components, and the profile epochs with the time each one began. The owner can advance an epoch.
+
+The projection slice reads both: it puts `config_id` and `profile_epoch` on outcome rows. This slice writes no outcome row.
+
+## Trust boundary, and what a review checks
+
+`config-identity.ts`, `configuration-store.ts`, the projector, the enrichment in `launch`, and the owner route are host code. Every event is built by the host from its own run record and its own configuration. These values have an outside origin:
+
+- The profile identity: provider, model, and effort or variant. The owner configures it, and `teamModelProfileSchema` checks the model pattern. Umbrella C1 counts it as an enumeration.
+- The guidance digest. Repository authors and members write `AGENTS.md` and `CLAUDE.md`. The host's own Git lists the object ids of those files in the member's base commit. Only a SHA-256 over the paths and object ids leaves the read. No path, file content, or object id is stored.
+- The rendered prompt. `teamPrompt` renders fixed fixture runs, never the live run. Only its digest is kept.
+- The owner's epoch request: a profile id and a request id.
+
+The rule for derived rows is spec part 3: "Plaintext columns hold opaque identifiers, enumerations, numbers, and times. Names from the repository or the run stay in the encrypted payload." Neither table of this slice has a run id, a member id, a task id, a path, or text. Both tables are durable, and nothing in them belongs to a run.
+
+The slice must survive:
+
+- A guidance read that fails, stalls, is refused by the command prefix, or truncates its output. The member starts at the same moment as without `events`, no `member.configured` is emitted, and the configuration reads as unknown.
+- A prompt fixture that `teamPrompt` refuses. No event, and the configuration reads as unknown.
+- `member.configured` that arrives after `member.reported`, `member.stopped`, or `run.settled`, or never. It is a fact about the start, so it is never refused for being late.
+- A store that is unavailable. The event waits in the outbox like any other.
+- The configurations projector behind or blocked. Its rows arrive later. No run decision reads them.
+- A run deleted before its `member.configured` was projected. The event is lost and counted in `event-outbox.lost`. The outcome row then keeps `config_id` null.
+- An epoch advanced while a projector is behind. A reader takes the epoch in effect at the member's start time, never the current one.
+- A repeated owner request. One epoch, by request id.
+- A service built without `events`. No Git read and no new key in a sealed record.
+
+Outside this slice: the per-project guidance pattern list, a knowledge snapshot other than `none`, a routing policy other than `off`, the `trial` shape, `configId` on the usage session header, and outcome rows.
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `packages/host/src/config-identity.ts` (create) | Pure rules: the profile identity key, `configId`, the prompt version and its fixture runs, the guidance tree parser and digest, and `memberConfiguration`, which runs the read |
+| `packages/host/src/configuration-store.ts` (create) | The `configurations` evidence module, its projector, `epochAt`, and `advanceEpoch` |
+| `packages/host/src/teams.ts` (modify) | `launch`: start the `member.configured` enrichment after `member.started` |
+| `packages/host/src/server.ts` (modify) | Register the module and the projector; `POST /api/outcomes/epochs` |
+| `packages/host/src/client.ts` (modify) | `infinite usage outcomes new-epoch --profile ID [--json]` |
+| `docs/superpowers/specs/2026-11-12-outcome-ledger-design.md` (modify) | Part 1 table: the `member.started` row and a new `member.configured` row. Part 3: the epoch paragraph |
+| `tests/config-identity.test.ts` (create) | Rule and read tests |
+| `tests/configuration-store.test.ts` (create) | Module, projector, and epoch tests |
+| `tests/team-events.test.ts`, `tests/run-event-coverage.test.ts` (modify) | The enrichment, and 26 kinds |
+| `tests/outcome-routes.test.ts` (create) | The epoch route, as `tests/usage-routes.test.ts` builds its host |
+
+## Event kinds
+
+| Kind | Emitted in | Key parts | `data` besides `v` | Why the key is unique and stable |
+|---|---|---|---|---|
+| `member.configured` | `launch`, a read after the session starts | `[memberId]` | `configId`, `provider`, `model?`, `effort?`, `promptVersion`, `guidance`, `knowledge`, `routing`, `shape` | A host-issued member id. The first configured event wins, as for `member.started` |
+
+## Review Focus
+
+1. A guidance read that sleeps 3 seconds. Expect `member.started` and the running status before the 3 seconds pass, and `member.configured` after.
+2. Two members of one run on one base commit with one profile. Expect one `configId` and one configurations row.
+3. An epoch advanced at time T. Expect `epochAt` to give the old epoch for a time before T and the new one from T on.
+4. One owner request sent twice. Expect one new epoch.
+5. A service without `events`. Expect no `ls-tree` in a logging command prefix.
+
+### Task 1: the identity rules and the guidance read
+
+**Files:** `packages/host/src/config-identity.ts` (create), `tests/config-identity.test.ts` (create).
+
+**Interfaces (consumes):** `teamPrompt` (`team-prompts.ts`), `teamCommand` and `teamGitArgs` (`team-workspace.ts`), `canonicalJson` (`evidence/crypto.ts`), `TeamMember`, `TeamModelProfile`, `TeamCommand`, `Provider`, `profileIdentity` (`run-events.ts`).
+
+**Interfaces (produces):**
+
+```ts
+export const GUIDANCE_FILES = ["AGENTS.md", "CLAUDE.md"] as const;
+export type ProfileKey = { provider: string; model: string | null; effort: string | null };
+export interface ConfigComponents {
+  profile: ProfileKey;
+  promptVersion: string;          // 64 hex
+  guidance: string;               // 64 hex
+  knowledge: "none";
+  routing: "off";
+  shape: "team" | "trial";
+}
+/** SHA-256 hex of the canonical JSON of the key. The profile id and label are not part of it. */
+export function profileIdentityKey(profile: ProfileKey): string;
+/** SHA-256 hex of the canonical JSON of exactly the six components (umbrella C7). */
+export function configId(components: ConfigComponents): string;
+/** Digest of `teamPrompt` over the fixture runs. Cached per role, provider, profile, and publishHeads. Throws when teamPrompt throws. */
+export function promptVersion(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean): string;
+/** The guidance blobs of `git ls-tree -r -z --full-tree` output, sorted by path. */
+export function parseGuidanceTree(stdout: string): { path: string; object: string }[];
+export function guidanceDigest(entries: readonly { path: string; object: string }[]): string;
+/** Best effort. Undefined on any failure. Never throws. Successes are cached per workspace and commit. */
+export function readGuidanceDigest(workspace: string, commit: string, prefix: TeamCommand | undefined, signal: AbortSignal): Promise<string | undefined>;
+export type MemberConfiguration = ConfigComponents["profile"] & Omit<ConfigComponents, "profile"> & { configId: string };
+/** The data of `member.configured`, or undefined when any component is unknown. Never throws. */
+export function memberConfiguration(input: {
+  workspace: string; baseCommit: string; role: TeamMember["role"]; provider: Provider;
+  profile?: TeamModelProfile; publishHeads: boolean; prefix?: TeamCommand;
+}, signal: AbortSignal): Promise<MemberConfiguration | undefined>;
+```
+
+**Decisions:**
+
+- **Profile key.** `{ provider, model: model ?? null, effort: effort ?? null }`, from `profileIdentity`. `effort` is the effort, or the variant for OpenCode. A member with no profile has `model` and `effort` null.
+- **Prompt version.** The module holds two frozen fixture runs: a single-provider run with one implementer task, and a run with a goal, a lineup, and one scout. Values are neutral placeholders: project id `example`, workspace `/home/dev/projects/example`, fixed UUIDs, and fixed times. For each fixture, `teamPrompt(run, role, taskOrScoutFor(role), undefined, provider, profile, { checks: [FIXTURE_CHECK] }, [], publishHeads)`. The version is the SHA-256 hex of the canonical JSON of the rendered strings, in fixture order. *(My call: it renders with the member's own profile object, so a profile-specific branch of `teamPrompt` is covered. Any wording change then changes the version, which is the point of C7 component 2.)*
+- The cache is a module `Map` keyed by role, provider, `profileIdentityKey`, the profile id, and `publishHeads`. The rendering is pure CPU work, and it runs inside the enrichment, never in `launch`.
+- **Guidance read.** `git ls-tree -r -z --full-tree <commit>` in `workspace`, through `teamCommand` and `teamGitArgs`, as `readTree` in `teams.ts` reads. Exit code 0, not interrupted, and not truncated, or the result is undefined. The parser keeps entries of type `blob` whose last path segment equals a `GUIDANCE_FILES` name, case-sensitively. A commit with no guidance file gives the digest of an empty list, which is a known state. *(My call: the default set of C7 only. The per-project pattern list needs a project configuration key and a routine-digest decision.)*
+- The guidance cache holds at most 64 successes and evicts the oldest. A commit's tree never changes, so a cached digest is always valid.
+- **`memberConfiguration`** reads the guidance, computes the prompt version, and returns `{ ...profile, promptVersion, guidance, knowledge: "none", routing: "off", shape: "team", configId }`. Any throw or an undefined digest gives undefined.
+
+- [ ] **Step 1: Write the failing tests** in `tests/config-identity.test.ts`.
+
+| Test name | Assertions |
+|---|---|
+| `a configId covers all six components` | Fixed components give a 64-hex id, equal across two calls and across two key orders of the input. A changed `profile.model`, `profile.effort`, `promptVersion`, `guidance`, `routing` cast to `"x"`, or `shape: "trial"` each gives another id. |
+| `a profile key leaves out the id and the label` | `profileIdentityKey({ provider: "claude", model: "m", effort: "high" })` is one 64-hex key. `effort: null` gives another. Two profiles with ids `a` and `b` and one identity give one key. |
+| `the prompt version is stable per role and provider` | Two calls with equal arguments are equal and 64 hex. `implementer` and `reviewer` differ. `claude` and `codex` differ. |
+| `the guidance parser keeps guidance blobs only` | NUL-separated entries `100644 blob O1\tAGENTS.md`, `100644 blob O2\tpackages/host/CLAUDE.md`, `100644 blob O3\tdocs/agents.md`, `160000 commit O4\tvendor/AGENTS.md`, and `100644 blob O5\tsrc/MY-AGENTS.md` give exactly the first two, sorted by path. |
+| `the guidance digest is order-free and bound to content` | Two orders of one list give one digest. A changed object id gives another. The empty list gives a fixed 64-hex digest unlike any one-entry list. |
+| `guidance is read from a commit` | In a temporary repository with `AGENTS.md` and `a/CLAUDE.md` committed, the digest equals `guidanceDigest` of the two paths with the ids from `git rev-parse HEAD:AGENTS.md` and `HEAD:a/CLAUDE.md`. After a commit that edits `a/CLAUDE.md`, the new commit gives another digest and the first commit still gives its own. |
+| `a failed guidance read gives nothing` | An unknown commit, a command prefix that exits 1 for `ls-tree`, and an aborted signal each resolve to undefined without throwing. `memberConfiguration` then resolves to undefined. |
+
+- [ ] **Step 2: Run the tests and confirm they fail** with a missing module error.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** `node --import tsx --test tests/config-identity.test.ts`, then `npm run typecheck -w @infinite/host`.
+
+### Task 2: the configurations module, its projector, and epochs
+
+**Files:** `packages/host/src/configuration-store.ts` (create), `tests/configuration-store.test.ts` (create). It can run in parallel with Task 1: it imports only `configId` and `profileIdentityKey`, whose signatures are fixed above.
+
+**Interfaces (consumes):** `EvidenceStore`, `EvidenceModule`, `EvidenceDb`, `EventProjector`, `EvidenceError`.
+
+**Interfaces (produces):**
+
+```sql
+-- Every column is plain: digests are opaque, profile fields are enumerations (umbrella C1).
+CREATE TABLE configurations (
+  config_id      TEXT PRIMARY KEY,   -- 64 hex
+  provider       TEXT NOT NULL,
+  model          TEXT,
+  effort         TEXT,
+  prompt_version TEXT NOT NULL,      -- 64 hex
+  guidance       TEXT NOT NULL,      -- 64 hex
+  knowledge      TEXT NOT NULL,      -- none
+  routing        TEXT NOT NULL,      -- off
+  shape          TEXT NOT NULL,      -- team | trial
+  first_seen_at  TEXT NOT NULL
+);
+CREATE TABLE profile_epochs (
+  identity   TEXT NOT NULL,          -- profileIdentityKey
+  epoch      INTEGER NOT NULL,       -- 2 and up. Epoch 1 has no row
+  provider   TEXT NOT NULL, model TEXT, effort TEXT,
+  since      TEXT NOT NULL,          -- ISO 8601, host clock
+  request_id TEXT NOT NULL UNIQUE,
+  PRIMARY KEY (identity, epoch)
+);
+```
+
+```ts
+export const CONFIGURATIONS_MODULE = "configurations";
+/** Version 1. No deleteRun and no runIds: nothing in it belongs to a run. counts: { configurations, epochs }. */
+export function configurationModule(): EvidenceModule;
+/** Name "configurations", module "configurations", kinds ["member.configured"]. */
+export function configurationProjector(): EventProjector;
+/** The highest epoch whose `since` is at or before `at`, or 1. */
+export function epochAt(db: EvidenceDb, identity: string, at: string): number;
+/** One write. Throws EvidenceError("unavailable") when the store is not ready. */
+export function advanceEpoch(store: EvidenceStore, input: { profile: ProfileKey; requestId: string; now: string }): { epoch: number; since: string; repeated: boolean };
+```
+
+**Decisions:**
+
+- *(My call: the guidance digest is a plain column. It is a SHA-256 over object ids, as opaque as `configId`, which the spec keeps plain and which is computed from it.)*
+- **The projector** parses `event.data` with a strict schema and recomputes `configId` from the components. On a parse failure or a mismatch it skips the event and logs one fixed line per process. *(My call: it does not throw, because a throw would hold every later event behind a bad one.)* Otherwise it inserts with `ON CONFLICT(config_id) DO NOTHING` and `first_seen_at = event.at`. A replayed page inserts nothing new.
+- **Epochs keep their history.** *(My call, and a change to spec part 3, which keeps only the current epoch. A projector that falls behind must still give an attempt the epoch it started in, and `TeamService` must not read the store at launch.)* Epoch 1 is implicit, so a fresh store needs no rows.
+- `epochAt` compares ISO strings. Every writer uses `new Date().toISOString()`, so string order equals time order.
+- **`advanceEpoch`** in one write: a row with the request id is returned with `repeated: true`. Otherwise the new epoch is the identity's highest plus one, or 2, with `since = now`.
+
+- [ ] **Step 1: Write the failing tests** in `tests/configuration-store.test.ts`. Each builds a store in a fresh temporary directory with a 32-byte key, an `EventOutbox`, the module, and the projector.
+
+| Test name | Assertions |
+|---|---|
+| `a configured member records its configuration once` | A flushed `member.configured` with valid components gives one row with every component and `first_seen_at` equal to the event's `at`. A second event for another member with equal components adds no row. |
+| `an event whose configId does not match is skipped` | With `configId` of 64 `0` characters: no row, `advance()` returns `pending: false`, and a later valid event is stored. |
+| `the epoch in effect at a time` | With no rows, `epochAt` is 1. After `advanceEpoch` at `2026-11-01T00:00:00.000Z` and at `2026-11-10T00:00:00.000Z`: `epochAt` is 1 at `2026-10-31T23:59:59.999Z`, 2 at `2026-11-01T00:00:00.000Z` and at `2026-11-05T00:00:00.000Z`, and 3 at `2026-11-10T00:00:00.000Z`. Another identity is 1. |
+| `a repeated epoch request advances once` | Two calls with one request id both return epoch 2, the second with `repeated: true`. The table has one row. |
+| `the module reports its counts` | `store.describe().counts` has `configurations.configurations` 1 and `configurations.epochs` 1. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** `node --import tsx --test tests/configuration-store.test.ts`, then the typecheck.
+
+### Task 3: the enrichment, the wiring, the route, and the CLI
+
+**Files:** `packages/host/src/teams.ts`, `packages/host/src/server.ts`, `packages/host/src/client.ts`, the spec, `tests/team-events.test.ts`, `tests/run-event-coverage.test.ts`, `tests/outcome-routes.test.ts`. Needs Tasks 1 and 2.
+
+**Decisions:**
+
+- **`launch` in `teams.ts`.** Right after the `member.started` `emitWith`, under the same `permission-coordinator` condition, about five lines: capture `{ memberId, taskId, revision, workspace: run.workspace, baseCommit, role, provider, profile }` and `publishHeadsEnabled()`, then `this.enrich(stored, async signal => { const data = await memberConfiguration(captured, signal); return data && (() => this.emitWith(stored, "member.configured", [captured.memberId], { memberId, taskId, revision }, () => data)); })`. The identity is captured before the read, as the review and repair enrichments do. *(My call, and a change to spec part 1, which puts `configId` and the epoch on `member.started`. Guidance needs a Git read, and a ledger-only read never sits in a run path.)*
+- `enrich` already does nothing without `events`, bounds the read to 30 seconds, and drops the emit when the record is no longer live.
+- **Spec.** The `member.started` row's data becomes "role, purpose, session, profile identity, replaced member and cause". A new row follows it: `member.configured` | `launch`, a read after the session starts | `configId` and its six components; absent when the read fails. The part 3 paragraph says that an enrichment after launch computes `configId`, and that `profile_epochs` keeps each epoch with its start time. The coverage test expects 26 kinds.
+- **`server.ts`.** After `new EventOutbox(evidence)`: `evidence.register(configurationModule())`, then `outbox.registerProjector(configurationProjector())`. A projector needs its module registered first.
+- **`POST /api/outcomes/epochs`**, `requireRole(["owner"])`. The body is strict: `{ profileId, requestId }`, the profile id pattern of `teamModelProfileSchema` and a UUID. The route collects the distinct profile keys of every profile with that id in `config.teams.lineup` (coordinator, integrator, reviewer, implementers, escalations, fallbacks, permissionReviewer). None gives 404 `profile-not-found`. More than one gives 409 `profile-ambiguous`. *(My call: one id can name two identities in different pools, and an epoch must name one.)* A store that is not ready gives 503 `evidence-unavailable`. Otherwise 200 with `{ profileId, provider, model, effort, epoch, since, repeated }`.
+- **CLI.** `infinite usage outcomes new-epoch --profile ID [--json]` sends a new `randomUUID()` request id and prints `Profile ID (provider model effort) is in epoch N since TIME.` A 403 prints `Advancing a profile epoch requires an owner device key.`
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `a launched member records its configuration` (team-events) | With `mixedLineup`, the `spark-high` implementer of task `a` launches. A `member.configured` follows with its `memberId`, `taskId` `a`, revision 1, and data `provider` `opencode`, the profile's `model`, `effort` `high`, 64-hex `promptVersion` and `guidance`, `knowledge` `none`, `routing` `off`, `shape` `team`, and `configId` equal to `configId` of those components. `guidance` equals `readGuidanceDigest` at the fixture base. |
+| `a stalled guidance read does not delay the launch` (team-events) | A command prefix that sleeps 3 seconds for `ls-tree`: `member.started` is stored and the member is `running` before the 3 seconds pass. `member.configured` arrives after. |
+| `a refused guidance read records no configuration` (team-events) | A command prefix that exits 1 for `ls-tree`: `member.started` is stored, and after 500 ms there is no `member.configured`. |
+| `a service without the ledger reads no guidance` (team-events) | Without `events`, a logging command prefix shows no `ls-tree` after a launch. |
+| `every spec event kind has an emission site…` (run-event-coverage) | The existing test, now with 26 kinds and `member.configured` among them. |
+| `the owner advances a profile epoch` (outcome-routes, host) | Two posts with one request id return epoch 2, the second with `repeated: true`. A new request id returns 3. An unknown profile id returns 404. A non-owner device returns 403. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.**
+- [ ] **Step 3: Implement**, and amend the spec.
+- [ ] **Step 4: Run** `node --import tsx --test tests/config-identity.test.ts tests/configuration-store.test.ts tests/team-events.test.ts tests/run-event-coverage.test.ts`, then `tests/outcome-routes.test.ts` on the host, then the typecheck.
+- [ ] **Step 5: The coordinator runs `npm run check`, requests the independent review, and commits.**
+
+## Not in this slice
+
+- `config_id` and `profile_epoch` on outcome rows and member results. The projection slice reads `member.configured` and `epochAt`.
+- The per-project guidance pattern list of C7 component 3.
+- A knowledge snapshot reference other than `none`, a routing policy version other than `off`, and the `trial` shape.
+- `configId` on the usage session header. The usage capture design owns the header.
+- A route that lists epochs, and pruning of configuration rows that no outcome row references.

@@ -136,7 +136,8 @@ export function advanceEpoch(
       identity,
     );
     const epoch = (top?.epoch ?? 1) + 1;
-    // An epoch never starts before the one before it, so a clock that stepped back cannot hide an epoch from `epochAt`.
+    // An epoch never starts before the one before it, so `epochAt` never puts a later epoch ahead of an earlier one.
+    // After a clock that stepped back, the two start together, and the earlier epoch is in effect for no time.
     const since = top !== undefined && top.since > now ? top.since : now;
     tx.run(
       "INSERT INTO profile_epochs (identity, epoch, provider, model, effort, since, request_id) "

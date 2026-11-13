@@ -262,7 +262,8 @@ test("an epoch never starts before the one before it", () => {
     store.register(configurationModule());
     const identity = profileIdentityKey(PROFILE);
     advanceEpoch(store, { profile: PROFILE, requestId: "77777777-7777-4777-8777-777777777777", now: "2026-11-10T00:00:00.000Z" });
-    // The clock stepped back. The new epoch must still be the one in effect from its start.
+    // The clock stepped back. The new epoch starts with the one before it, never ahead of it, so that earlier
+    // epoch is in effect for no time and the newest one is in effect from then on.
     const next = advanceEpoch(store, { profile: PROFILE, requestId: "88888888-8888-4888-8888-888888888888", now: "2026-11-09T00:00:00.000Z" });
     assert.equal(next.epoch, 3);
     assert.equal(next.since, "2026-11-10T00:00:00.000Z");

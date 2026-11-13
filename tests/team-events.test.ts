@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { EventOutbox, type OutboxEvent } from "../packages/host/src/evidence/outbox.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
@@ -12,7 +13,7 @@ import { DEFAULT_TEAM_RETENTION, type TeamRun } from "../packages/host/src/team-
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { prepareMemberWorkspace } from "../packages/host/src/team-workspace.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
-import { limitLineup, mixedLineup } from "./team-fixture.js";
+import { git, limitLineup, mixedLineup } from "./team-fixture.js";
 
 const SUMMARY_KEYS = ["tasks", "integrated", "members", "round", "checks", "recoveries", "decisionsByOwner",
   "decisionsByCoordinator", "steering", "permissionEscalations", "continuations"];
@@ -1169,59 +1170,6 @@ async function reviewScene(f: Fixture, report: Record<string, unknown>) {
 
 const rubricScore = (score: number) => ({ score, why: "Private rubric reason" });
 
-test("an approved review records its verdict, tree, and kept scores", async () => {
-  const f = schedulerFixture();
-  const store = openStore(f, f.key);
-  try {
-    const reviewer = await reviewScene(f, { kind: "review", verdict: "approved", summary: "Looks right", rubric: [
-      { taskId: "a", correctness: rubricScore(3), cleanliness: rubricScore(3), extensibility: rubricScore(3), docs: rubricScore(3) },
-      { taskId: "b", correctness: rubricScore(4), cleanliness: rubricScore(3), extensibility: rubricScore(5), docs: rubricScore(2) },
-    ] });
-    f.writeTeam({ checkHead: f.run.baseCommit });
-    const teams = f.openTeam({ events: new EventOutbox(store) });
-    const scheduler = internal(teams);
-    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
-    scheduler.consume(stored, reviewer);
-    await waitFor(() => stored.pending === undefined, "the review completes");
-    await teams.idle();
-    const [recorded] = eventsOfKind(store, f.run.id, "review.recorded");
-    assert.ok(recorded, "review.recorded is stored");
-    assert.equal(recorded.memberId, reviewer.memberId);
-    assert.equal(recorded.revision, 1);
-    const tree = execFileSync("git", ["rev-parse", `${f.run.baseCommit}^{tree}`], { cwd: f.run.workspace, encoding: "utf8" }).trim();
-    assert.deepEqual(recorded.data, { v: 1, verdict: "approved", headCommit: f.run.baseCommit, baseCommit: f.run.baseCommit, tree,
-      reviewer: { profileId: "opus-reviewer", provider: "claude", model: "claude-opus-5-5", effort: "xhigh" },
-      rubric: [{ taskId: "b", correctness: 4, cleanliness: 3, extensibility: 5, docs: 2 }] });
-    assert.equal(JSON.stringify(allEvents(store, f.run.id)).includes("Private rubric reason"), false, "a rubric reason is never stored");
-    assert.equal(JSON.stringify(allEvents(store, f.run.id)).includes("Looks right"), false, "a review summary is never stored");
-  } finally { store.close(); f.close(); }
-});
-
-test("a refused tree read leaves the tree out", async () => {
-  const f = schedulerFixture();
-  const store = openStore(f, f.key);
-  try {
-    const refusal = `const [command, ...args] = process.argv.slice(2);
-if (command === "git" && args.some(arg => arg.endsWith("^{tree}"))) process.exit(1);
-const { spawnSync } = require("node:child_process");
-const result = spawnSync(command, args, { cwd: process.cwd(), stdio: "inherit" });
-process.exit(result.status ?? 1);`;
-    const reviewer = await reviewScene(f, { kind: "review", verdict: "approved", summary: "Looks right" });
-    f.config.teams!.commandPrefix = { command: process.execPath, args: ["-e", refusal, "unused"] };
-    f.writeTeam({ checkHead: f.run.baseCommit });
-    const teams = f.openTeam({ events: new EventOutbox(store) });
-    const scheduler = internal(teams);
-    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
-    scheduler.consume(stored, reviewer);
-    await waitFor(() => stored.pending === undefined, "the review completes");
-    await teams.idle();
-    const [recorded] = eventsOfKind(store, f.run.id, "review.recorded");
-    assert.ok(recorded, "review.recorded is stored");
-    assert.equal("tree" in recorded.data, false);
-    assert.equal(stored.run.review?.verdict, "approved");
-  } finally { store.close(); f.close(); }
-});
-
 test("a changes-requested review records its verdict", async () => {
   const f = schedulerFixture();
   const store = openStore(f, f.key);
@@ -1298,38 +1246,6 @@ test("a repair past its limit starts no round", async () => {
   } finally { store.close(); f.close(); }
 });
 
-test("an integrator result answers its round with its changed paths", async () => {
-  const f = schedulerFixture();
-  const store = openStore(f, f.key);
-  try {
-    const memberId = randomUUID(), cwd = await memberClone(f, memberId);
-    writeFileSync(join(cwd, "fix.txt"), "fixed\n");
-    f.run.headCommit = f.run.baseCommit;
-    f.run.round = 1;
-    f.run.tasks = [];
-    const member = { ...f.run.members[0]!, memberId, role: "integrator" as const, cwd, status: "reported" as const,
-      report: { kind: "result" as const, summary: "Fixed the file" } };
-    f.run.members = [member];
-    f.writeTeam();
-    const teams = f.openTeam({ events: new EventOutbox(store) });
-    const scheduler = internal(teams);
-    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
-    scheduler.consume(stored, member);
-    await waitFor(() => stored.pending === undefined, "the integration completes");
-    await teams.idle();
-    const [event] = eventsOfKind(store, f.run.id, "repair.integrated");
-    assert.ok(event, "repair.integrated is stored");
-    assert.equal(event.memberId, memberId);
-    assert.equal(event.revision, 1);
-    assert.equal(event.data.round, 1);
-    assert.match(String(event.data.commit), /^[0-9a-f]{40}$/);
-    assert.equal(event.data.headCommit, stored.run.headCommit);
-    assert.equal(event.data.baseCommit, f.run.baseCommit);
-    assert.deepEqual(event.data.paths, ["fix.txt"]);
-    assert.equal(eventsOfKind(store, f.run.id, "task.integrated").length, 0);
-  } finally { store.close(); f.close(); }
-});
-
 test("a round-zero integrator records no repair", async () => {
   const f = schedulerFixture();
   const store = openStore(f, f.key);
@@ -1375,4 +1291,239 @@ test("a rating records the score once per request", async () => {
     assert.equal(eventsOfKind(store, f.run.id, "rating.recorded").length, 2, "a new request is a new fact");
     assert.equal(JSON.stringify(allEvents(store, f.run.id)).includes("Useful"), false, "a rating note is never stored");
   } finally { store.close(); f.close(); }
+});
+
+test("an approved review records its verdict and kept scores", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const reviewer = await reviewScene(f, { kind: "review", verdict: "approved", summary: "Looks right", rubric: [
+      { taskId: "a", correctness: rubricScore(3), cleanliness: rubricScore(3), extensibility: rubricScore(3), docs: rubricScore(3) },
+      { taskId: "b", correctness: rubricScore(4), cleanliness: rubricScore(3), extensibility: rubricScore(5), docs: rubricScore(2) },
+    ] });
+    f.writeTeam({ checkHead: f.run.baseCommit });
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    scheduler.consume(stored, reviewer);
+    await waitFor(() => stored.pending === undefined, "the review completes");
+    await teams.idle();
+    const [recorded] = eventsOfKind(store, f.run.id, "review.recorded");
+    assert.ok(recorded, "review.recorded is stored");
+    assert.equal(recorded.memberId, reviewer.memberId);
+    assert.equal(recorded.revision, 1);
+    assert.deepEqual(recorded.data, { v: 1, verdict: "approved", headCommit: f.run.baseCommit, baseCommit: f.run.baseCommit,
+      reviewer: { profileId: "opus-reviewer", provider: "claude", model: "claude-opus-5-5", effort: "xhigh" },
+      rubric: [{ taskId: "b", correctness: 4, cleanliness: 3, extensibility: 5, docs: 2 }] });
+    assert.equal(JSON.stringify(allEvents(store, f.run.id)).includes("Private rubric reason"), false, "a rubric reason is never stored");
+    assert.equal(JSON.stringify(allEvents(store, f.run.id)).includes("Looks right"), false, "a review summary is never stored");
+  } finally { store.close(); f.close(); }
+});
+
+test("the reviewed tree arrives as its own event", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const reviewer = await reviewScene(f, { kind: "review", verdict: "approved", summary: "Looks right" });
+    f.writeTeam({ checkHead: f.run.baseCommit });
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    scheduler.consume(stored, reviewer);
+    await waitFor(() => eventsOfKind(store, f.run.id, "review.tree").length > 0, "the tree is recorded");
+    await teams.idle();
+    const [recorded] = eventsOfKind(store, f.run.id, "review.recorded");
+    assert.ok(recorded, "review.recorded is stored");
+    assert.equal("tree" in recorded.data, false, "the review carries no tree");
+    const [tree] = eventsOfKind(store, f.run.id, "review.tree");
+    assert.ok(tree, "review.tree is stored");
+    assert.equal(tree.memberId, reviewer.memberId);
+    assert.equal(tree.revision, 1);
+    const expected = execFileSync("git", ["rev-parse", `${f.run.baseCommit}^{tree}`], { cwd: f.run.workspace, encoding: "utf8" }).trim();
+    assert.deepEqual(tree.data, { v: 1, headCommit: f.run.baseCommit, tree: expected });
+  } finally { store.close(); f.close(); }
+});
+
+test("a refused tree read stores no tree event", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const refusal = `const [command, ...args] = process.argv.slice(2);
+if (command === "git" && args.some(arg => arg.endsWith("^{tree}"))) process.exit(1);
+const { spawnSync } = require("node:child_process");
+const result = spawnSync(command, args, { cwd: process.cwd(), stdio: "inherit" });
+process.exit(result.status ?? 1);`;
+    const reviewer = await reviewScene(f, { kind: "review", verdict: "approved", summary: "Looks right" });
+    f.config.teams!.commandPrefix = { command: process.execPath, args: ["-e", refusal, "unused"] };
+    f.writeTeam({ checkHead: f.run.baseCommit });
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    scheduler.consume(stored, reviewer);
+    await waitFor(() => stored.pending === undefined, "the review completes");
+    await teams.idle();
+    await new Promise(resolve => setTimeout(resolve, 500));
+    await teams.idle();
+    assert.equal(eventsOfKind(store, f.run.id, "review.recorded").length, 1, "review.recorded is stored");
+    assert.equal(eventsOfKind(store, f.run.id, "review.tree").length, 0, "no tree event is stored");
+    assert.equal(stored.run.review?.verdict, "approved");
+  } finally { store.close(); f.close(); }
+});
+
+test("a stalled tree read does not delay the review", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const stall = `const [command, ...args] = process.argv.slice(2);
+if (command === "git" && args.some(arg => arg.endsWith("^{tree}"))) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3000);
+const { spawnSync } = require("node:child_process");
+const result = spawnSync(command, args, { cwd: process.cwd(), stdio: "inherit" });
+process.exit(result.status ?? 1);`;
+    const reviewer = await reviewScene(f, { kind: "review", verdict: "approved", summary: "Looks right" });
+    f.config.teams!.commandPrefix = { command: process.execPath, args: ["-e", stall, "unused"] };
+    f.writeTeam({ checkHead: f.run.baseCommit });
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    const started = Date.now();
+    scheduler.consume(stored, reviewer);
+    await waitFor(() => stored.pending === undefined && stored.run.review?.verdict === "approved", "the review applies");
+    assert.ok(Date.now() - started < 2500, "the review applied before the stalled read finished");
+    assert.equal(eventsOfKind(store, f.run.id, "review.tree").length, 0, "the tree read is still running");
+    await waitFor(() => eventsOfKind(store, f.run.id, "review.tree").length > 0, "the late tree arrives");
+    await teams.idle();
+  } finally { store.close(); f.close(); }
+});
+
+test("the repair's changed paths arrive as their own event", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const memberId = randomUUID(), cwd = await memberClone(f, memberId);
+    writeFileSync(join(cwd, "fix.txt"), "fixed\n");
+    f.run.headCommit = f.run.baseCommit;
+    f.run.round = 1;
+    f.run.tasks = [];
+    const member = { ...f.run.members[0]!, memberId, role: "integrator" as const, cwd, status: "reported" as const,
+      report: { kind: "result" as const, summary: "Fixed the file" } };
+    f.run.members = [member];
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    scheduler.consume(stored, member);
+    await waitFor(() => eventsOfKind(store, f.run.id, "repair.paths").length > 0, "the paths are recorded");
+    await teams.idle();
+    const [integrated] = eventsOfKind(store, f.run.id, "repair.integrated");
+    assert.ok(integrated, "repair.integrated is stored");
+    assert.equal(integrated.memberId, memberId);
+    assert.equal(integrated.revision, 1);
+    assert.equal(integrated.data.round, 1);
+    assert.match(String(integrated.data.commit), /^[0-9a-f]{40}$/);
+    assert.equal(integrated.data.headCommit, stored.run.headCommit);
+    assert.equal(integrated.data.baseCommit, f.run.baseCommit);
+    assert.equal("paths" in integrated.data || "pathsOmitted" in integrated.data, false, "no path field on repair.integrated");
+    const [paths] = eventsOfKind(store, f.run.id, "repair.paths");
+    assert.ok(paths, "repair.paths is stored");
+    assert.equal(paths.memberId, memberId);
+    assert.deepEqual(paths.data, { v: 1, round: 1, commit: integrated.data.commit, paths: ["fix.txt"] });
+    assert.equal(eventsOfKind(store, f.run.id, "task.integrated").length, 0);
+  } finally { store.close(); f.close(); }
+});
+
+test("a refused changed-path read marks the paths omitted", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    // Refuses only the ledger's read: a name-only diff between two commits. Member capture diffs against a tree.
+    const refusal = `const { spawnSync } = require("node:child_process");
+const [command, ...args] = process.argv.slice(2);
+const isCommit = value => value !== undefined && spawnSync("git", ["cat-file", "-t", value], { cwd: process.cwd(), encoding: "utf8" }).stdout.trim() === "commit";
+if (command === "git" && args.includes("--name-only") && args.length >= 4 && isCommit(args[args.length - 3]) && isCommit(args[args.length - 2])) process.exit(1);
+const result = spawnSync(command, args, { cwd: process.cwd(), stdio: "inherit" });
+process.exit(result.status ?? 1);`;
+    const memberId = randomUUID(), cwd = await memberClone(f, memberId);
+    writeFileSync(join(cwd, "fix.txt"), "fixed\n");
+    f.run.headCommit = f.run.baseCommit;
+    f.run.round = 1;
+    f.run.tasks = [];
+    const member = { ...f.run.members[0]!, memberId, role: "integrator" as const, cwd, status: "reported" as const,
+      report: { kind: "result" as const, summary: "Fixed the file" } };
+    f.run.members = [member];
+    f.config.teams!.commandPrefix = { command: process.execPath, args: ["-e", refusal, "unused"] };
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    scheduler.consume(stored, member);
+    await waitFor(() => eventsOfKind(store, f.run.id, "repair.paths").length > 0, "the paths are recorded");
+    await teams.idle();
+    assert.equal(stored.run.status, "implementing", "the integration succeeds as without the ledger");
+    const [integrated] = eventsOfKind(store, f.run.id, "repair.integrated");
+    assert.ok(integrated, "repair.integrated is stored");
+    const [paths] = eventsOfKind(store, f.run.id, "repair.paths");
+    assert.equal(paths.data.pathsOmitted, true);
+    assert.equal("paths" in paths.data, false);
+    assert.equal(paths.data.commit, integrated.data.commit);
+  } finally { store.close(); f.close(); }
+});
+
+test("a service without the ledger runs no ledger read", async () => {
+  const logDir = mkdtempSync(join(tmpdir(), "inf-ledger-log-"));
+  const log = join(logDir, "commands.log");
+  const logging = `const { appendFileSync } = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const [file, command, ...args] = process.argv.slice(1);
+appendFileSync(file, JSON.stringify([command, ...args]) + "\\n");
+const result = spawnSync(command, args, { cwd: process.cwd(), stdio: "inherit" });
+process.exit(result.status ?? 1);`;
+  try {
+    const f = schedulerFixture();
+    try {
+      const reviewer = await reviewScene(f, { kind: "review", verdict: "approved", summary: "Looks right" });
+      f.config.teams!.commandPrefix = { command: process.execPath, args: ["-e", logging, log] };
+      f.writeTeam({ checkHead: f.run.baseCommit });
+      const teams = f.openTeam();
+      const scheduler = internal(teams);
+      const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+      scheduler.consume(stored, reviewer);
+      await waitFor(() => stored.pending === undefined && stored.run.review?.verdict === "approved", "the review applies");
+      await teams.idle();
+      const sealed = f.readRecord<Record<string, unknown>>("team", f.run.id);
+      for (const field of ["outbox", "ledgerStatus", "ledgerReplaces"]) assert.equal(field in sealed, false, field);
+    } finally { f.close(); }
+    const commands = readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as string[]);
+    assert.ok(commands.length > 0, "the prefix ran");
+    assert.equal(commands.some(args => args.some(arg => arg.endsWith("^{tree}"))), false, "no tree read");
+    const integrator = await (async () => {
+      const g = schedulerFixture();
+      const memberId = randomUUID(), cwd = await memberClone(g, memberId);
+      writeFileSync(join(cwd, "fix.txt"), "fixed\n");
+      g.run.headCommit = g.run.baseCommit;
+      g.run.round = 1;
+      g.run.tasks = [];
+      const member = { ...g.run.members[0]!, memberId, role: "integrator" as const, cwd, status: "reported" as const,
+        report: { kind: "result" as const, summary: "Fixed the file" } };
+      g.run.members = [member];
+      g.config.teams!.commandPrefix = { command: process.execPath, args: ["-e", logging, log] };
+      g.writeTeam();
+      const teams = g.openTeam();
+      const scheduler = internal(teams);
+      const stored = scheduler.record(g.run.id) as { run: TeamRun; pending?: unknown };
+      writeFileSync(log, "");
+      scheduler.consume(stored, member);
+      await waitFor(() => stored.pending === undefined && stored.run.status === "implementing", "the integration completes");
+      await teams.idle();
+      const sealed = g.readRecord<Record<string, unknown>>("team", g.run.id);
+      for (const field of ["outbox", "ledgerStatus", "ledgerReplaces"]) assert.equal(field in sealed, false, field);
+      g.close();
+      return readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as string[]);
+    })();
+    assert.ok(integrator.length > 0, "the integrator ran");
+    const resultRef = integrator.find(args => args.includes("update-ref") && args.includes("refs/heads/infinite-result"));
+    assert.ok(resultRef, "the integrator's result commit was made");
+    const resultCommit = resultRef.at(-1)!;
+    assert.equal(integrator.some(args => args.includes("--name-only") && args.includes(resultCommit)), false,
+      "no changed-path read of the integrator's commit");
+  } finally { rmSync(logDir, { recursive: true, force: true }); }
 });

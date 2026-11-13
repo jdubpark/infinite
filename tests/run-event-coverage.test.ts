@@ -32,7 +32,7 @@ test("every spec event kind has an emission site, and every emitted kind is in t
 
   const declared = specKinds();
   assert.equal(new Set(declared).size, declared.length, "no kind is listed twice");
-  assert.equal(declared.length, 23, "the part 1 table lists 23 kinds");
+  assert.equal(declared.length, 25, "the part 1 table lists 25 kinds");
   const sourceKinds = new Set(emitted);
   // Both directions in one assertion, so a failure names every kind on either side.
   assert.deepEqual({

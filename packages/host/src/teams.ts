@@ -4254,8 +4254,7 @@ export class TeamService {
         throw new TeamError(409, "ui-review-evidence-required", "Approval of UI changes requires the reviewer's evidence from inspecting the runnable interface.");
       this.operation(stored, "result", async signal => {
         await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
-        return { tree: this.options?.events ? await this.readTree(run, member.baseCommit, signal) : undefined };
-      }, ({ tree }) => {
+      }, () => {
         run.review = { verdict: report.verdict, summary: report.summary, revision: run.revision, ...(report.uiEvidence ? { uiEvidence: report.uiEvidence } : {}) };
         const rubricKept: { taskId: string; correctness: number; cleanliness: number; extensibility: number; docs: number }[] = [];
         if (report.verdict === "approved" && report.rubric?.length) {
@@ -4274,7 +4273,7 @@ export class TeamService {
         }
         this.emitWith(stored, "review.recorded", [member.revision, member.memberId], { memberId: member.memberId, revision: member.revision }, () => {
           const reviewer = member.modelProfile ?? this.memberProfile(run, "reviewer");
-          return { verdict: report.verdict, headCommit: member.baseCommit, baseCommit: run.baseCommit, tree,
+          return { verdict: report.verdict, headCommit: member.baseCommit, baseCommit: run.baseCommit,
             reviewer: profileIdentity(reviewer, member.provider ?? run.provider), rubric: rubricKept.length ? rubricKept : undefined };
         });
         if (report.verdict === "changes-requested") {
@@ -4282,6 +4281,11 @@ export class TeamService {
           this.repair(stored, report.summary, "review");
         }
         else run.status = "reviewing";
+        this.enrich(stored, async signal => {
+          const tree = await this.readTree(run, member.baseCommit, signal);
+          return tree === undefined ? undefined : () => this.emitWith(stored, "review.tree", [member.revision, member.memberId],
+            { memberId: member.memberId, revision: member.revision }, () => ({ headCommit: member.baseCommit, tree }));
+        });
       }, member); return;
     }
     if (report.kind !== "result") throw new TeamError(409, "wrong-agent-report", "The member did not submit an implementation result.");
@@ -4299,7 +4303,7 @@ export class TeamService {
       const change = commit ? {
         nameStatus: await gitRead(["diff", "--no-ext-diff", "--no-textconv", "--name-status", "-M", "-z", run.baseCommit, head, "--"]),
         numstat: await gitRead(["diff", "--no-ext-diff", "--no-textconv", "--numstat", "-M", "-z", run.baseCommit, head, "--"]),
-        taskPaths: task || (member.role === "integrator" && this.options?.events) ? await gitRead(["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", member.baseCommit, commit, "--"]) : undefined,
+        taskPaths: task ? await gitRead(["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", member.baseCommit, commit, "--"]) : undefined,
       } : undefined;
       return { commit, head, diff: diff?.exitCode === 0 ? diff.stdout : undefined,
         changes: change ? changeIndex(change.nameStatus, change.numstat, head, timestamp()) : undefined,
@@ -4320,8 +4324,15 @@ export class TeamService {
       if (member.role === "integrator" && run.round > 0) {
         this.emitWith(stored, "repair.integrated", [member.revision, run.round], { memberId: member.memberId, revision: member.revision }, () => ({
           round: run.round, commit, headCommit: head, baseCommit: run.baseCommit,
-          ...(!commit ? { paths: [] } : changedPaths && !changedPaths.truncated ? pathField(changedPaths.paths) : { pathsOmitted: true }),
         }));
+        if (commit) this.enrich(stored, async signal => {
+          const result = await teamCommand({ command: "git", args: teamGitArgs(run.workspace, ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", member.baseCommit, commit, "--"]) },
+            run.workspace, signal, 30000, this.config.teams?.commandPrefix).catch(() => undefined);
+          const list = result && result.exitCode === 0 && !result.interrupted ? changedPathList(result.stdout) : undefined;
+          return () => this.emitWith(stored, "repair.paths", [member.revision, run.round], { memberId: member.memberId, revision: member.revision }, () => ({
+            round: run.round, commit, ...(list && !list.truncated ? pathField(list.paths) : { pathsOmitted: true }),
+          }));
+        });
       }
       if (member.role === "implementer" || member.role === "integrator") this.retentionState(stored).integratedAt[member.memberId] = this.retentionNow();
       this.event(stored, `${member.title} reported a result; its validated changes were integrated.`);
@@ -4349,6 +4360,24 @@ export class TeamService {
     if (setup) commands.push({ command: setup, phase: "setup" });
     commands.push(...required.map(command => ({ command })));
     return commands;
+  }
+  /** Starts a read that only the ledger needs, outside every run operation. Returns at once. The read's own 30 s limit
+   *  applies. A read that fails, times out, or is refused emits nothing. The emit runs only while the record is still live. */
+  private enrich(stored: Stored, read: (signal: AbortSignal) => Promise<(() => void) | undefined>): void {
+    if (!this.options?.events) return;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30000);
+    // A pending enrichment must not keep the host process alive at shutdown.
+    timer.unref();
+    void (async () => {
+      try {
+        const emit = await read(controller.signal);
+        if (!emit || this.closed || this.records.get(stored.run.id) !== stored) return;
+        emit();
+        this.flushOutbox(stored);
+      } catch { /* A ledger read never changes the run. */ }
+      finally { clearTimeout(timer); }
+    })();
   }
   /** Best-effort `git rev-parse --verify <commit>^{tree}` in `run.workspace` through `teamCommand` and `teamGitArgs`, 30 s. A 40- or 64-hex stdout, else undefined. Never throws. */
   private async readTree(run: TeamRun, commit: string, signal: AbortSignal): Promise<string | undefined> {

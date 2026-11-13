@@ -81,9 +81,11 @@ Another design may add event kinds under its own prefix and register a projector
 | `task.escalated` | `consume` (`escalate`) | from and to profile |
 | `task.limit-switched` | `switchLimitedMember` | from and to profile |
 | `check.finished` | `check` | round, head, result per command |
-| `review.recorded` | `consume` (`review`) | verdict, head, base commit, reviewed tree, reviewer profile identity, rubric scores |
+| `review.recorded` | `consume` (`review`) | verdict, head, base commit, reviewer profile identity, rubric scores |
+| `review.tree` | `consume` (`review`), a read after the review operation | head, reviewed tree; absent when the read fails |
 | `repair.started` | `repair` | round, cause: `check`, `review`, `delivery` |
-| `repair.integrated` | `consume` (integrator `result`) | commit, head, changed paths |
+| `repair.integrated` | `consume` (integrator `result`) | round, commit, head, base commit |
+| `repair.paths` | `consume` (integrator `result`), a read after the operation | round, commit, changed paths or `pathsOmitted` |
 | `delivery.recorded` | `consume` (delivery reports) | `merge` or `pull-request`, head, merge commit |
 | `rating.recorded` | `rateTask` | task, score |
 | `run.blocked` | `block` | block code, source member |

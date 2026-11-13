@@ -57,12 +57,16 @@ export interface ProjectSourceStatus {
   /** Local branches holding tracked edits a session left in the working tree before a refresh. */
   savedBranches?: string[];
 }
+/** One successful fetch of the base branch into the host mirror; `previousHead` is absent when the mirror had no head. */
+export type MirrorFetch = { projectId: string; repository: string; baseBranch: string; head: string; previousHead?: string; fetchedAt: string };
 export interface ProjectSourceOptions {
   /** Whether a cloud session is running or starting in the project directory. Teams, goals and handoffs do not count. */
   running: (projectId: string) => Promise<boolean>;
   prefix?: TeamCommand;
   /** Called after a refresh moved the project working tree to a new HEAD. */
   onApplied?: (projectId: string, head: string) => void;
+  /** Called after every successful fetch into the mirror, even when the head did not move. */
+  onMirror?: (fetch: MirrorFetch) => void;
 }
 
 export class ProjectSourceError extends Error {
@@ -234,13 +238,18 @@ export class ProjectSourceService {
     const fetchedStatus = status.pending?.reason === "fetch-failed" ? withoutPending(status) : status;
     delete fetchedStatus.fetchFailures;
     const now = new Date().toISOString();
+    const previousHead = status.mirrorHead;
     status = {
       ...fetchedStatus,
       mirrorHead: fetchedHead,
       fetchedAt: now,
       attemptedAt: now,
     };
-    this.writeStatus(projectId, status, source);
+    if (this.writeStatus(projectId, status, source)) {
+      try {
+        this.options.onMirror?.({ projectId, repository: source.repository, baseBranch: source.baseBranch, head: fetchedHead, ...(previousHead === undefined ? {} : { previousHead }), fetchedAt: now });
+      } catch { /* A listener failure must not fail the refresh. */ }
+    }
 
     if (status.mirrorHead === status.appliedHead) {
       const rootFailure = await this.checkoutRootFailure(project.path, options?.signal);

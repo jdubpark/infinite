@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { ProjectSourceError, ProjectSourceService } from "../packages/host/src/project-source.js";
+import { ProjectSourceError, ProjectSourceService, type MirrorFetch } from "../packages/host/src/project-source.js";
 import type { Config } from "../packages/host/src/types.js";
 
 const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-c", "commit.gpgsign=false", ...args], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -418,4 +418,57 @@ test("a timer refresh backs off a failing fetch while an explicit refresh retrie
     assert.equal(recovered.mirrorHead, f.commitA);
     assert.ok(recovered.attemptedAt && recovered.fetchedAt);
   } finally { f.close(); }
+});
+
+test("the mirror callback fires after each successful fetch", async () => {
+  const f = fixture();
+  try {
+    const calls: MirrorFetch[] = [];
+    const service = new ProjectSourceService(f.config, { running: idle, onMirror: fetch => { calls.push(fetch); } });
+
+    const commitB = f.push("B\n", "Commit B");
+    const first = await service.refresh("example");
+    assert.equal(calls.length, 1, "the first successful fetch fires once");
+    assert.equal("previousHead" in calls[0]!, false, "a mirror with no head before the fetch has no previousHead key");
+    assert.equal(calls[0]!.projectId, "example");
+    assert.equal(calls[0]!.repository, "example/product");
+    assert.equal(calls[0]!.baseBranch, "main");
+    assert.equal(calls[0]!.head, first.mirrorHead);
+    assert.equal(calls[0]!.head, commitB);
+    assert.equal(calls[0]!.fetchedAt, first.fetchedAt);
+
+    const commitC = f.push("C\n", "Commit C");
+    const second = await service.refresh("example");
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1]!.previousHead, commitB, "the second call names the first call's head as the previous head");
+    assert.equal(calls[1]!.head, commitC);
+    assert.equal(calls[1]!.head, second.mirrorHead);
+    assert.equal(calls[1]!.fetchedAt, second.fetchedAt);
+    assert.equal(calls[1]!.repository, "example/product");
+    assert.equal(calls[1]!.baseBranch, "main");
+
+    const third = await service.refresh("example");
+    assert.equal(calls.length, 3, "a fetch that finds the same head still fires");
+    assert.equal(calls[2]!.previousHead, commitC);
+    assert.equal(calls[2]!.head, commitC);
+    assert.equal(calls[2]!.fetchedAt, third.fetchedAt);
+
+    f.config.source!.remoteOverrides!.example = join(f.root, "missing.git");
+    const failed = await service.refresh("example");
+    assert.equal(failed.pending?.reason, "fetch-failed");
+    assert.equal(calls.length, 3, "a failed fetch fires nothing");
+  } finally { f.close(); }
+
+  // A second, independent fixture: a listener that throws must not change the refresh result.
+  const g = fixture();
+  try {
+    const commitB = g.push("B\n", "Commit B");
+    const service = new ProjectSourceService(g.config, { running: idle, onMirror: () => { throw new Error("listener failed"); } });
+    const status = await service.refresh("example");
+    assert.equal(status.pending, undefined, JSON.stringify(status));
+    assert.equal(status.mirrorHead, commitB);
+    assert.equal(status.appliedHead, commitB);
+    assert.equal(git(g.projectPath, "rev-parse", "HEAD"), commitB);
+    assert.deepEqual(service.status("example"), status, "the status read back equals the status the refresh returned");
+  } finally { g.close(); }
 });

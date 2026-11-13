@@ -10,6 +10,7 @@ import { MAX_OUTBOX_EVENTS } from "../packages/host/src/run-events.js";
 import { DEFAULT_TEAM_RETENTION, type TeamRun } from "../packages/host/src/team-types.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
+import { mixedLineup } from "./team-fixture.js";
 
 const SUMMARY_KEYS = ["tasks", "integrated", "members", "round", "checks", "recoveries", "decisionsByOwner",
   "decisionsByCoordinator", "steering", "permissionEscalations", "continuations"];
@@ -43,6 +44,7 @@ type Internal = {
   block(stored: unknown, error: unknown, member?: unknown): void;
   step(stored: unknown): Promise<void>;
   retire(stored: unknown): Promise<void>;
+  consume(stored: unknown, member: unknown): void;
 };
 const internal = (teams: TeamService) => teams as unknown as Internal;
 
@@ -430,5 +432,127 @@ test("a deleted run's last event is projected before its events are removed", as
     assert.deepEqual(projected, [`run.deleted:${f.run.id}`], "the probe saw run.deleted exactly once");
     assert.deepEqual(store.events({ runId: f.run.id, limit: 100 }).events, [], "no event for the run remains in the store");
     assert.equal(store.describe().counts["event-outbox.lost"], 0);
+  } finally { store.close(); f.close(); }
+});
+
+/** The project manager's record, read from the sealed store, with its report set for `consume`. */
+function reportFrom(teams: TeamService, runId: string, report: unknown) {
+  const stored = internal(teams).record(runId) as { run: TeamRun; members?: never };
+  const member = stored.run.members[0]!;
+  member.report = report as TeamRun["members"][number]["report"];
+  return { stored, member };
+}
+
+test("an accepted plan records the plan and each task with its features", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    Object.assign(f.config.projects[0]!, { team: { checks: [{ command: "npm", args: ["test"] }], features: { areas: [{ id: "host", paths: ["packages/host"] }] } } });
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const { stored, member } = reportFrom(teams, f.run.id, { kind: "plan", summary: "Two tasks", parallelism: 4, tasks: [
+      { id: "a", title: "Session fix", instructions: "Repair the session", paths: ["packages/host/src/auth/session.ts"], dependsOn: [], kind: "fix" },
+      { id: "b", title: "Docs", instructions: "Document it", paths: ["docs/teams.md"], dependsOn: ["a"] },
+    ] });
+    internal(teams).consume(stored, member);
+    await waitFor(() => (stored as { pending?: unknown }).pending === undefined, "the report's operation completes");
+    await teams.idle();
+
+    const [plan] = eventsOfKind(store, f.run.id, "plan.accepted");
+    assert.ok(plan, "plan.accepted is stored");
+    assert.equal(plan.revision, 1);
+    assert.equal(plan.memberId, member.memberId);
+    assert.equal(plan.data.taskCount, 2);
+    assert.match(String(plan.data.planDigest), /^[0-9a-f]{64}$/);
+    assert.equal(plan.data.parallelism, 4);
+
+    const tasks = eventsOfKind(store, f.run.id, "task.planned");
+    assert.deepEqual(tasks.map(event => event.taskId), ["a", "b"]);
+    const [first, second] = tasks;
+    assert.equal(first!.data.profileId, undefined, "a single-provider run names no profile");
+    assert.deepEqual(first!.data.paths, ["packages/host/src/auth/session.ts"]);
+    const firstFeatures = first!.data.features as Record<string, unknown>;
+    assert.equal(firstFeatures.role, "implementer");
+    assert.equal(firstFeatures.area, "host");
+    assert.equal(firstFeatures.kind, "fix");
+    assert.equal(firstFeatures.risk, "elevated");
+    assert.equal(firstFeatures.featureVersion, 1);
+    assert.match(String(firstFeatures.featureMap), /^[0-9a-f]{64}$/);
+    const secondFeatures = second!.data.features as Record<string, unknown>;
+    assert.equal(secondFeatures.area, "docs/");
+    assert.equal(secondFeatures.kind, null);
+    assert.equal(secondFeatures.risk, "normal");
+    assert.equal("dependsOn" in second!.data, false, "dependencies and instructions are not stored");
+    assert.equal("instructions" in second!.data, false);
+  } finally { store.close(); f.close(); }
+});
+
+test("oversized owned paths leave the task event without them", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    Object.assign(f.config.projects[0]!, { team: { checks: [{ command: "npm", args: ["test"] }], features: { areas: [{ id: "host", paths: ["packages/host"] }] } } });
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const paths = Array.from({ length: 32 }, (_, index) => `${"é".repeat(296)}/${index}`);
+    const { stored, member } = reportFrom(teams, f.run.id, { kind: "plan", summary: "Wide task", tasks: [
+      { id: "a", title: "Wide", instructions: "Touch many files", paths, dependsOn: [] },
+    ] });
+    internal(teams).consume(stored, member);
+    await waitFor(() => (stored as { pending?: unknown }).pending === undefined, "the report's operation completes");
+    await teams.idle();
+    const [event] = eventsOfKind(store, f.run.id, "task.planned");
+    assert.ok(event, "task.planned is stored");
+    assert.equal(event.data.pathsOmitted, true);
+    assert.equal("paths" in event.data, false);
+    assert.equal(typeof (event.data.features as { area?: unknown }).area, "string");
+  } finally { store.close(); f.close(); }
+});
+
+test("discovery records each scout with its profile", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    f.run.lineup = structuredClone(mixedLineup);
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const { stored, member } = reportFrom(teams, f.run.id, { kind: "explore", summary: "Two scouts", parallelism: 2, tasks: [
+      { id: "s1", title: "First scout", instructions: "Read the parser", agentProfileId: "spark-high" },
+      { id: "s2", title: "Second scout", instructions: "Read the store", agentProfileId: "astra-xhigh" },
+    ] });
+    internal(teams).consume(stored, member);
+    await waitFor(() => (stored as { pending?: unknown }).pending === undefined, "the report's operation completes");
+    await teams.idle();
+    const [event] = eventsOfKind(store, f.run.id, "discovery.accepted");
+    assert.ok(event, "discovery.accepted is stored");
+    assert.equal(event.revision, 1);
+    assert.equal(event.data.parallelism, 2);
+    const scouts = event.data.scouts as { taskId: string; profileId: string; features: Record<string, unknown> }[];
+    assert.deepEqual(scouts.map(scout => [scout.taskId, scout.profileId]), [["s1", "spark-high"], ["s2", "astra-xhigh"]]);
+    for (const scout of scouts) {
+      assert.equal(scout.features.role, "scout");
+      assert.equal(scout.features.area, "none");
+      assert.equal(scout.features.kind, "investigation");
+      assert.equal(scout.features.risk, "normal");
+    }
+  } finally { store.close(); f.close(); }
+});
+
+test("a refused plan records no plan", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const { stored, member } = reportFrom(teams, f.run.id, { kind: "plan", summary: "Self dependent", tasks: [
+      { id: "a", title: "Loop", instructions: "Depends on itself", paths: ["src/a.ts"], dependsOn: ["a"] },
+    ] });
+    // `step` turns a refused report into a block; this drives the same path without the scheduler loop.
+    try { internal(teams).consume(stored, member); }
+    catch (error) { internal(teams).block(stored, error, member); }
+    await teams.idle();
+    assert.equal(stored.run.status, "blocked");
+    assert.equal(eventsOfKind(store, f.run.id, "plan.accepted").length, 0);
+    assert.equal(eventsOfKind(store, f.run.id, "task.planned").length, 0);
   } finally { store.close(); f.close(); }
 });

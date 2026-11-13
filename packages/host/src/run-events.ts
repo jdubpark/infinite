@@ -1,4 +1,5 @@
-import type { TeamRun } from "./team-types.js";
+import { createHash } from "node:crypto";
+import type { TeamRun, TeamTaskPlan } from "./team-types.js";
 
 /** The most events one run keeps waiting for the store. */
 export const MAX_OUTBOX_EVENTS = 2000;
@@ -29,4 +30,18 @@ export function runSummaryCounts(run: TeamRun): RunSummaryCounts {
     permissionEscalations: (run.permissionDecisions ?? []).filter(decision => decision.status === "escalated").length,
     continuations: run.continuations?.length ?? 0,
   };
+}
+
+/** SHA-256 hex of the JSON of one tuple per task, in order, covering every field a plan sets. */
+export function planDigest(tasks: readonly TeamTaskPlan[]): string {
+  const tuples = tasks.map(task => [task.id, task.title, task.instructions, task.agentProfileId ?? null, task.paths, task.dependsOn, task.kind ?? null, task.risk ?? null]);
+  return createHash("sha256").update(JSON.stringify(tuples)).digest("hex");
+}
+
+/** The most UTF-8 bytes of an owned-path list one event keeps. The store refuses data over 16 KiB. */
+export const PATH_FIELD_BUDGET = 12 * 1024;
+
+/** `{ paths }` when the UTF-8 JSON of the list is at most `budget` bytes, else `{ pathsOmitted: true }`. */
+export function pathField(paths: readonly string[], budget = PATH_FIELD_BUDGET): { paths: string[] } | { pathsOmitted: true } {
+  return Buffer.byteLength(JSON.stringify(paths), "utf8") <= budget ? { paths: [...paths] } : { pathsOmitted: true };
 }

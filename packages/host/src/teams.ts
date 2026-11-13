@@ -16,7 +16,8 @@ import { resumeFailed } from "./native-continuation.js";
 import type { UsageService } from "./usage-service.js";
 import { type EvidenceStore, eventProblem } from "./evidence/store.js";
 import type { EventOutbox, OutboxEvent } from "./evidence/outbox.js";
-import { MAX_OUTBOX_EVENTS, runEventKey, runSummaryCounts } from "./run-events.js";
+import { MAX_OUTBOX_EVENTS, pathField, planDigest, runEventKey, runSummaryCounts } from "./run-events.js";
+import { taskFeatures } from "./task-features.js";
 import { teamUsage } from "./team-usage.js";
 import { ProviderLimits, switchesMember, type LimitObservation } from "./provider-limits.js";
 import type { LinearService } from "./linear.js";
@@ -58,6 +59,8 @@ const EVIDENCE_WAIT_MS = 24 * 3600_000;
 const REVIEW_QUIET_WINDOW_MS = 5 * 60_000;
 /** Event kinds whose drop has been logged; one line per kind for the life of the process. */
 const droppedEventKinds = new Set<string>();
+/** Event kinds whose build failed; one line per kind for the life of the process. */
+const unbuiltEventKinds = new Set<string>();
 function deliveryInspectionHash(report: DeliveryReconciliationReport) {
   return digest({ headCommit: report.headCommit, repository: report.repository, branch: report.branch,
     baseHeadCommit: report.baseHeadCommit, disposition: report.disposition, remoteHeadCommit: report.remoteHeadCommit });
@@ -719,6 +722,21 @@ export class TeamService {
       }
       outbox.push(event);
     } catch { /* A run event never changes the run. */ }
+  }
+  /** Builds the data only when the ledger is on, then emits. A failed build drops the event and never reaches the run. */
+  private emitWith(stored: Stored, kind: string, keyParts: readonly (string | number)[],
+    ids: { memberId?: string; taskId?: string; revision?: number }, build: () => Record<string, unknown>): void {
+    if (!this.options?.events) return;
+    let data: Record<string, unknown>;
+    try { data = build(); }
+    catch {
+      if (!unbuiltEventKinds.has(kind)) {
+        unbuiltEventKinds.add(kind);
+        console.warn(`A run event of kind ${kind} could not be built; the run continues without it.`);
+      }
+      return;
+    }
+    this.emit(stored, kind, keyParts, ids, data);
   }
   /** Sends the outbox to the store. True when nothing is left waiting. Never throws. */
   private flushOutbox(stored: Stored, afterGap = false): boolean {
@@ -3935,6 +3953,13 @@ export class TeamService {
         run.discovery = { revision: run.revision, summary: report.summary, tasks: report.tasks.map(task => ({ ...task, status: "pending" })) };
         run.status = "discovering";
         this.event(stored, `The coordinator requested ${report.tasks.length} read-only discovery tasks.`);
+        const map = (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features;
+        this.emitWith(stored, "discovery.accepted", [member.revision], { memberId: member.memberId, revision: member.revision }, () => ({
+          parallelism: run.parallelism,
+          scouts: (run.discovery?.tasks ?? []).map(scout => ({
+            taskId: scout.id, profileId: scout.agentProfileId, features: taskFeatures({ role: "scout", paths: [] }, map),
+          })),
+        }));
       }, member); return;
     }
     if (report.kind === "findings") {
@@ -4001,6 +4026,15 @@ export class TeamService {
         }
         run.status = "implementing";
         this.event(stored, `Project manager planned ${run.tasks.length} tasks.`);
+        const map = (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features;
+        this.emitWith(stored, "plan.accepted", [member.revision], { memberId: member.memberId, revision: member.revision }, () => ({
+          taskCount: run.tasks.length, planDigest: planDigest(run.tasks), parallelism: run.parallelism,
+        }));
+        for (const task of run.tasks) this.emitWith(stored, "task.planned", [member.revision, task.id], { taskId: task.id, revision: member.revision }, () => ({
+          profileId: task.agentProfileId,
+          ...pathField(task.paths),
+          features: taskFeatures({ role: "implementer", paths: task.paths, kind: task.kind, risk: task.risk }, map),
+        }));
       }, member); return;
     }
     if (report.kind === "delivery-reconciliation") {

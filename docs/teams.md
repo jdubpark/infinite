@@ -645,6 +645,12 @@ search; `global` is not included automatically. An Infinite context link does no
 create a brain link. Each surface grants only its named kind of context, and
 neither grants filesystem or network permissions.
 
+A project's `team` object may set `features`, a private feature map of areas, each an `id` with
+repository-relative path prefixes, plus optional `elevated` prefixes and `elevatedTokens`. The host reads it when a
+plan is accepted and records each task's area, kind, and risk in its run events. It never sends the map to a member:
+member context files and prompts leave it out. A plan task may add `kind` and `risk: "elevated"` as labels; a label
+can raise risk but never lower it. The key has no default, so a project without a map keeps its configuration as it was.
+
 ## Let an ordinary session request a team
 
 `infinite repo init` enables automatic handoff for new sessions in that project.

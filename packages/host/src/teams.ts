@@ -10,6 +10,7 @@ import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { PROVIDER_NAMES, recoveryTurnEnd, type Prompt, type SignalData } from "@infinite/attention";
 import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamPermissionRecoveryOutcome, type TeamPermissionRecoveryRequest, type TeamPermissionRecoveryStep, type TeamPermissionRecoveryView, type TeamPublication, type TeamPublicationCategory, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, DEFAULT_TEAM_RETENTION } from "./team-types.js";
+import { memberConfiguration, type MemberConfiguration } from "./config-identity.js";
 import { ownerDirectionLines, permissionFollowUpPrompt, refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { resumeFailed } from "./native-continuation.js";
@@ -56,6 +57,9 @@ type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedA
 const REMOVAL_RETRY_MS = 5 * 60_000;
 /** A run's record waits at most this long for its events to reach the evidence store before retention removes it. */
 const EVIDENCE_WAIT_MS = 24 * 3600_000;
+/** Ledger-only reads that may be pending in one service. A read that never ends keeps its place. */
+const ENRICH_LIMIT = 16;
+let enrichSkipLogged = false;
 const REVIEW_QUIET_WINDOW_MS = 5 * 60_000;
 /** Event kinds whose drop has been logged; one line per kind for the life of the process. */
 const droppedEventKinds = new Set<string>();
@@ -351,6 +355,12 @@ function blockedTeamCanContinue(run: TeamRun, allowRemovedWorkspace = false): bo
       : run.reason === missingAgentReportReason ? "missing-agent-report" : undefined);
   return code !== undefined && recoverableContinueCodes.has(code);
 }
+/** The `member.configured` data: the six components and `configId`. A profile field the member lacks is absent, not null. */
+const configuredData = (data: MemberConfiguration) => ({
+  configId: data.configId, provider: data.provider,
+  ...(data.model == null ? {} : { model: data.model }), ...(data.effort == null ? {} : { effort: data.effort }),
+  promptVersion: data.promptVersion, guidance: data.guidance, knowledge: data.knowledge, routing: data.routing, shape: data.shape,
+});
 /** Milliseconds since the member last showed attention activity, or since it started before any was observed. */
 const quietFor = (member: TeamMember) => Date.now() - Date.parse(member.lastActivityAt ?? member.startedAt ?? timestamp());
 // The flag is persisted on the member at creation, so a recovered or stopped session keeps the fingerprint it launched with.
@@ -368,6 +378,8 @@ export class TeamService {
   private running = false;
   private closed = false;
   private tickQueued = false;
+  /** Ledger-only reads in flight. See `enrich`. */
+  private enrichments = 0;
   private readonly commands = new Map<string, AbortController>();
   private readonly removingRuns = new Set<string>();
   private readonly removalTasks = new Set<Promise<void>>();
@@ -3945,6 +3957,18 @@ export class TeamService {
         ...profileIdentity(member.modelProfile, member.provider ?? run.provider),
         ...(result.status === "unavailable" ? { unavailable: true } : {}), ...(replaces ? { replaces } : {}),
       }));
+    // The configuration read runs after the launch and never delays it. Its identity is fixed before the read.
+    if (member.role !== "permission-coordinator") {
+      const captured = { memberId: member.memberId, taskId: member.taskId, revision: member.revision, workspace: stored.run.workspace,
+        baseCommit: member.baseCommit, role: member.role, provider: member.provider ?? run.provider, profile: member.modelProfile,
+        publishHeads: this.publishHeadsEnabled(), prefix: this.config.teams?.commandPrefix };
+      this.enrich(stored, async signal => {
+        const data = await memberConfiguration(captured, signal);
+        if (!data) return undefined;
+        return () => this.emitWith(stored, "member.configured", [captured.memberId],
+          { memberId: captured.memberId, taskId: captured.taskId, revision: captured.revision }, () => configuredData(data));
+      });
+    }
     if (stored.ledgerReplaces) {
       delete stored.ledgerReplaces[member.memberId];
       if (!Object.keys(stored.ledgerReplaces).length) delete stored.ledgerReplaces;
@@ -4369,6 +4393,14 @@ export class TeamService {
    *  applies. A read that fails, times out, or is refused emits nothing. The emit runs only while the record is still live. */
   private enrich(stored: Stored, read: (signal: AbortSignal) => Promise<(() => void) | undefined>): void {
     if (!this.options?.events) return;
+    // Under a launcher the host cannot signal, a stalled read may never end. A fixed number may be pending, so a
+    // stall leaves a bounded number behind. One more is skipped, and its event is absent.
+    if (this.enrichments >= ENRICH_LIMIT) {
+      // A skip is not a failed read, so it is said once.
+      if (!enrichSkipLogged) { enrichSkipLogged = true; console.warn("Ledger reads are waiting on earlier reads that have not ended; some run events are skipped."); }
+      return;
+    }
+    this.enrichments += 1;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 30000);
     // A pending enrichment must not keep the host process alive at shutdown.
@@ -4380,7 +4412,7 @@ export class TeamService {
         emit();
         this.flushOutbox(stored);
       } catch { /* A ledger read never changes the run. */ }
-      finally { clearTimeout(timer); }
+      finally { clearTimeout(timer); this.enrichments -= 1; }
     })();
   }
   /** Best-effort `git rev-parse --verify <commit>^{tree}` in `run.workspace` through `teamCommand` and `teamGitArgs`, 30 s. A 40- or 64-hex stdout, else undefined. Never throws. */

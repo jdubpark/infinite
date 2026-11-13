@@ -166,7 +166,7 @@ Every outcome row and every statistic names its sources. `production` and `duel`
 5. **Routing policy version**: the router's policy digest, or `off`.
 6. **Shape**: `team` for a member of a team run, or `trial` for a replay trial.
 
-`TeamService` computes `configId` when it starts a member. It puts the value on the member-started event and on the usage session header. The outcome ledger design delivers this and keeps one row per `configId` with its components, so a reader can tell which component changed.
+`TeamService` computes `configId` after it starts a member, in a read that never delays the launch. It emits the value as the `member.configured` event, and the usage session header carries it once the usage capture design adds the field. A member whose read fails has no `configId`. The outcome ledger design delivers this and keeps one row per `configId` with its components, so a reader can tell which component changed.
 
 ### C8. Purpose and the learning budget
 

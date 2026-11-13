@@ -33,18 +33,19 @@ Only the owner's Linear user ID causes work. The first two
 checks apply to every issue. The Slack checks apply only when
 `requireSlackThread` is on, which is the default.
 
-Without `requireSlackThread`, a Slack thread link is read in the background
-when present. A failed or unreadable read starts the mission without a thread
-section and binds no thread, and nothing waits or retries.
+Without `requireSlackThread`, a linked Slack thread is still read when present.
+A failed or unreadable read starts the mission without a thread section and
+binds no thread, and nothing waits or retries.
 
 The objective is the Linear title, the description (up to 12,000 characters), a
-fixed note that only the owner's words are instructions, and the Slack thread as
-background. The thread is read once, at admission. The host labels every line of
-every message `[owner]` or `[other]`, so a line of someone else's message can never
-read as an owner line. Blank lines are dropped. Other people's messages are kept
-in the objective, and bot messages are left out. The coordinator is told that this
-text is information, not instructions. The thread is cut to fit the
-24,000-character objective limit; the oldest lines go first. See
+fixed note that only the owner's words are instructions, and only the owner's own
+messages from the linked Slack thread, under `Slack thread (the owner's messages):`.
+The thread is read once, at admission. Messages from anyone else, and bot
+messages, are read at admission to check authorship and are not stored, shown to
+agents, or logged. The owner's messages are kept oldest first, each trimmed, and
+empty ones are dropped. The thread section is cut to fit the 24,000-character
+objective limit: the owner's first message stays, the oldest of the rest go first,
+and one line counts how many were omitted. See
 [security](security.md#request-intake). The mission title is the issue
 identifier and title, up to 100 characters.
 
@@ -122,12 +123,17 @@ order as the mission moves:
 - an edit note when the Linear issue changes after the run started. The run keeps
   the original text.
 
-Text leaves the host only after a filter. Paths under the instance's configured
-directories (`stateDir`, `runDir`, `teams.workspaceDir`, and every project path)
-and under `/srv/`, `/opt/`, `/run/`, and `/etc/` become `[local path omitted]`, as
-do the home and temporary paths shared Linear text already drops. Every IPv4
-address becomes `[address omitted]`. Links, such as pull request URLs, and branch
-names are kept. The filter applies to every Slack message and every Linear comment.
+Text leaves the host only after a filter. A `file://` URL, and a path that starts
+with a configured directory (`stateDir`, `runDir`, `teams.workspaceDir`, or a
+project path), a host root (`/srv/`, `/opt/`, `/run/`, `/etc/`, `/Users/`, `/home/`,
+`/tmp/`, `/private/tmp/`, `/private/var/`, `/var/folders/`), `~/`, or a Windows drive
+such as `C:\`, becomes `[local path omitted]` when it is at the start of the text
+or after any character other than a letter, a digit, or one of `. _ ~ % / -`, so
+links and branch names keep their paths. Repeated slashes and `./` segments do not
+hide a path; a path ends at whitespace, a quote, a backtick, or an angle bracket,
+and a trailing run of `) ] , ; : . ! ?` stays in the text. Then every IPv4 literal
+becomes `[address omitted]`, which also hides four-part version numbers. The filter
+applies to every Slack message and every Linear comment.
 
 Text longer than 3,000 characters is split across messages. Code fences are kept
 whole where the split allows it. Each message has a key, and a message whose
@@ -135,6 +141,9 @@ last send may have reached Slack is looked up in the thread before it is sent
 again. A permanent Slack error marks the message `failed`. A transient error is
 retried after 5 seconds, 30 seconds, and 2 minutes, then every 10 minutes. A
 message that is still unsent 24 hours after it was created is marked `failed`.
+Past 400 messages a record drops only the bot's oldest sent or failed replies, and
+past 200 received replies only the oldest applied ones, so nothing still to be
+sent or applied is lost.
 
 The bot accepts only `app_mention` events from `slack.ownerUserId` in a bound
 thread, and only those whose team matches `slack.teamId`. Everything else is
@@ -169,7 +178,9 @@ in order:
 
 The bot never approves a provider permission, never infers completion, and never
 changes a Linear issue's state, assignee, or labels. Replies are applied once,
-and a saved call is replayed exactly on retry.
+and a saved call is replayed exactly on retry. A redelivered event adds nothing and
+gets no reply, but a reply its record has not yet applied, for example after a
+failed write, is applied then.
 
 Delivery never gates a mission. An outage of Slack or Linear pauses nothing.
 

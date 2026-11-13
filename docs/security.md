@@ -261,16 +261,11 @@ Slack surface:
   bound to a record. A mention or reply from anyone else in a bound thread is
   dropped before anything is stored; the surface keeps only a count of dropped
   events. Nothing from that message reaches the record, the mission, or an agent.
-- The thread the issue links is read once, at admission. Its messages, the
-  owner's and other people's, are kept in the mission objective as background.
-  The host labels every line of every message `owner` or `other`, so no line of a
-  teammate's message can read as the owner's, and bot messages are left out. The
-  coordinator is told that this text is information, never instructions, and that
-  only the owner's words are instructions. The Slack surface also reads the bound
-  thread to find its own posts after an uncertain send; it stores nothing from that
-  read.
-- So text that teammates wrote in the linked thread is stored in the host's sealed
-  mission state and shown to coordinator and subteam agents.
+- The thread the issue links is read once, at admission. The objective keeps only
+  the owner's own messages from it. Messages from anyone else, and bot messages,
+  are read at admission to check authorship and are not stored, shown to agents,
+  or logged. The Slack surface also reads the bound thread to find its own posts
+  after an uncertain send; it stores nothing from that read.
 - A skipped issue's title and description are not stored. Its record keeps the
   issue's IDs, URL, times, and skip reason, and no text from the issue.
 
@@ -282,11 +277,13 @@ and neither approves a provider permission or marks work complete. Results are
 labelled as agent reports.
 
 Host paths and addresses do not leave the host through intake. Before any Slack
-message or Linear comment is made, paths under the instance's configured
-directories and under `/srv/`, `/opt/`, `/run/`, and `/etc/` become
-`[local path omitted]`, the home and temporary paths that shared Linear text
-already drops are dropped too, and every IPv4 address becomes
-`[address omitted]`.
+message or Linear comment is made, a `file://` URL, and a path that starts with a
+configured directory, a host root (`/srv/`, `/opt/`, `/run/`, `/etc/`, `/Users/`,
+`/home/`, `/tmp/`, `/private/tmp/`, `/private/var/`, `/var/folders/`), `~/`, or a
+Windows drive, becomes `[local path omitted]` when it is at the start of the text or
+after any character other than a letter, a digit, or one of `. _ ~ % / -`.
+Repeated slashes and `./` segments do not hide a path. Then every IPv4 literal
+becomes `[address omitted]`, which also hides four-part version numbers.
 
 Slack and Linear credentials are regular files with mode `0600`, outside
 `stateDir`, `runDir`, `teams.workspaceDir`, and every project path. The host reads
@@ -304,11 +301,11 @@ places: a mission service refusal (`TeamError`), a Slack request failure
 (`LinearFailure`, whose text is fixed).
 
 Residual risk: the objective carries the Linear title and description, and the
-Slack thread, to the coordinator and subteams. Anyone who can write to the issue
-or the thread can put instructions in that text. The objective labels only the
-owner's lines as instructions, and the coordinator is told that other people's
-messages are information. That is a prompt boundary, not a guarantee, and it does
-not stop an injected request from the owner's own account.
+owner's Slack messages, to the coordinator and subteams. Anyone who can edit the
+issue before it is admitted can put instructions in its title or description. The
+coordinator is told that only the owner's words are instructions and that anything
+read through a connector is information. That is a prompt boundary, not a
+guarantee, and it does not stop an injected request from the owner's own account.
 
 ## Dependency audit
 

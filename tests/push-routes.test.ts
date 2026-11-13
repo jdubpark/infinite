@@ -35,6 +35,7 @@ test("/api/me reports capabilities by role", { timeout: 30000 }, async () => {
     assert.deepEqual((await host.fetchApi("/me", "controller")).body.capabilities, {
       signals: true, answer: true, push: false, workspaceMirror: 1, mirrorForget: 1,
       desktop: { resources: 1, files: 1, fileTransfer: 1, chunkBytes: 49152, maxFileBytes: 268435456 },
+      swarmContext: 1,
     });
     assert.equal((await host.fetchApi("/me", "viewer")).body.capabilities.answer, false);
   } finally {

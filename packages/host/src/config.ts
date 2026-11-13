@@ -9,8 +9,9 @@ import { projectSourceSchema, teamProjectSchema, teamCommandSchema, teamRetentio
 import { intakeConfigSchema } from "./intake-types.js";
 
 /**
- * Provider hooks injected at launch when the config does not say. Codex hooks stay off until
- * spike S2 confirms that `-c hooks.*` and `--dangerously-bypass-hook-trust` work as intended.
+ * Provider hooks injected at launch when the config does not say. Codex hooks stay off: spike S2
+ * (2026-11-13) showed that `--dangerously-bypass-hook-trust`, which the injected `-c hooks.*` need,
+ * also lets hooks defined in the working directory run without review.
  */
 export const DEFAULT_HOOKS = { claude: true, codex: false } as const;
 const nonNegative = z.number().min(0).finite();

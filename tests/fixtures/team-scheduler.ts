@@ -5,6 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmdirSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initialAttention } from "@infinite/attention";
+import type { EventOutbox } from "../../packages/host/src/evidence/outbox.js";
 import type { Manager } from "../../packages/host/src/manager.js";
 import type { Config, WorkerState } from "../../packages/host/src/types.js";
 import type { TeamAssignment, TeamModelProfile, TeamReportEnvelope, TeamRun } from "../../packages/host/src/team-types.js";
@@ -114,8 +115,8 @@ export function schedulerFixture() {
       return () => { rmdirSync(file); renameSync(backup, file); };
     },
     writeTeam: (extra: object = {}) => writeRecord("team", id, { run, prepared: true, fingerprint: "fixture", receipts: {}, ...extra }),
-    openTeam: () => {
-      const service = new TeamService(config, key, manager as unknown as Manager, (_project, start) => start());
+    openTeam: (options?: { events?: EventOutbox }) => {
+      const service = new TeamService(config, key, manager as unknown as Manager, (_project, start) => start(), undefined, undefined, options);
       services.push(service); return service;
     },
     close: () => { for (const service of services) service.close(); rmSync(root, { recursive: true, force: true }); },

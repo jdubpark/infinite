@@ -13,12 +13,12 @@ import { Manager } from "../packages/host/src/manager.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { MissionService, missionBoard, type ProjectGroupLookup } from "../packages/host/src/missions.js";
 import { createMissionReportEnvelope } from "../packages/host/src/team-report-client.js";
-import { missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, type MissionOpenChildDecision, type MissionMessage } from "../packages/host/src/team-prompts.js";
+import { missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, subteamReport, type MissionOpenChildDecision, type MissionMessage } from "../packages/host/src/team-prompts.js";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { git, lineup, missionHarness as harness, scriptedMissionHarness as scripted } from "./mission-harness.js";
 import type { Config, Session } from "../packages/host/src/types.js";
-import type { CreateTeam, TeamAssignment } from "../packages/host/src/team-types.js";
+import type { CreateTeam, TeamAssignment, TeamView } from "../packages/host/src/team-types.js";
 import type { CreateMission, Mission, MissionOrigin } from "../packages/host/src/mission-types.js";
 import { initialAttention } from "@infinite/attention";
 import { emptyUsage, type UsageRollup } from "../packages/host/src/team-usage.js";
@@ -1573,4 +1573,58 @@ test("subteams of an intake mission are not tracked in Linear", { timeout: 12000
     assert.equal(running.subtasks[0].repoProjectId, "api");
     assert.equal(teams.get(running.subtasks[0].teamId!).linearTracking, false, "An intake mission's subteam is not Linear-tracked");
   } finally { await h.close(); }
+});
+
+test("a no-change subteam's findings reach the coordinator and the mission result", { timeout: 180000 }, async () => {
+  const h = harness();
+  try {
+    const { missions } = h.open();
+    const finished = (created: Mission) => until(() => missions.get(created.id), mission => ["ready-for-review", "blocked", "cancelled"].includes(mission.status), 150000);
+    const mission = await finished(await missions.create(h.create("ANSWER-ONLY which exports failed?"), undefined, intakeOrigin));
+    assert.equal(mission.status, "ready-for-review");
+    assert.equal(mission.subtasks[0].teamStatus, "no-change");
+    assert.match(mission.result!.summary, /Three exports failed last week\./);
+    assert.match(mission.result!.summary, /- export log: Rows 14, 90 and 212 were empty\./);
+  } finally { await h.close(); }
+});
+
+test("subteamReport prefers no-change, then the result summary, then findings, and bounds the text", () => {
+  const view = (fields: Record<string, unknown>) => ({ tasks: [], ...fields }) as unknown as TeamView;
+  const noChange = { summary: "Three exports failed last week.", evidence: [{ source: "export log", observation: "Rows 14, 90 and 212 were empty." }] };
+  const pullRequest = { revision: 1, headCommit: "a".repeat(40), pullRequestUrl: "https://github.com/OWNER/REPO/pull/1", summary: "Opened the change.", reportedAt: new Date(0).toISOString() };
+  const discovery = { revision: 1, summary: "The exports read the wrong table.", tasks: [] };
+  assert.deepEqual(subteamReport(view({ noChange, pullRequest })), { kind: "no-change", text: "Three exports failed last week.\n- export log: Rows 14, 90 and 212 were empty." });
+  assert.deepEqual(subteamReport(view({ pullRequest })), { kind: "result", text: "Opened the change." });
+  assert.deepEqual(subteamReport(view({ discovery })), { kind: "findings", text: "The exports read the wrong table." });
+  assert.equal(subteamReport(view({})), undefined);
+  const long = subteamReport(view({ noChange: { summary: "x\n".repeat(5000), evidence: [] } }))!.text;
+  assert.ok(long.length <= 4000 && long.endsWith("[truncated]"), `Bounded text is ${long.length} characters`);
+  assert.ok(long.endsWith("x\n[truncated]"), "The cut falls on a line boundary before the marker");
+});
+
+test("an intake mission's prompt carries the answer-only guidance and an app mission's does not", { timeout: 60000 }, async () => {
+  const h = scripted({ configure: config => {
+    config.intake = { linear: { teamIds: [randomUUID()], creatorId: randomUUID(), label: "infinite", commentsMirrorToSlack: false },
+      mission: { groupId: "shop", maxSubtasks: 8, maxMinutes: 240, answerProjectId: "api" }, maxActive: 3, requireSlackThread: true };
+  } });
+  try {
+    await h.missions.create(missionRequest(), undefined, intakeOrigin);
+    const intakePrompt = (await h.attempt(1)).prompt;
+    assert.match(intakePrompt, /Decide first whether the request changes code\./);
+    assert.match(intakePrompt, /in repository api/);
+    await h.missions.create(missionRequest());
+    const appPrompt = (await h.attempt(2)).prompt;
+    assert.doesNotMatch(appPrompt, /Decide first whether the request changes code\./);
+  } finally { h.close(); }
+});
+
+test("the report survives the recent-message window", { timeout: 30000 }, async () => {
+  const h = scripted();
+  try {
+    const created = await h.create("Answer which exports failed");
+    const report = { kind: "no-change", text: "Three exports failed last week.\n- export log: Rows 14, 90 and 212 were empty." };
+    const message: MissionMessage = { type: "subtask-finished", subtaskId: "answer", teamId: "team-1", status: "done", teamStatus: "no-change", report };
+    const prompt = missionPromptWithMessageCount(created, [], [message], 1, "claude", lineup.coordinator, { openChildDecisions: [], waiting: 0 }).prompt;
+    assert.match(prompt, /"report":\{"kind":"no-change","text":"Three exports failed last week\.\\n- export log: Rows 14, 90 and 212 were empty\."\}/);
+  } finally { h.close(); }
 });

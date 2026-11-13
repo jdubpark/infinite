@@ -24,6 +24,7 @@ import type { ProjectSourceService } from "./project-source.js";
 import type { RepositoryGraphs, RepositoryGraphResult } from "./repository-graphs.js";
 import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, publishTeamHead, removeMemberWorkspace, removeTeamWorkspace, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
+import { HOST_LOAD_REASON_PREFIX, LaunchHeldError, holdsHostLoadReason } from "./host-load.js";
 import { isCollapsedPermissionPrompt, oneShotPermissionOption, permissionAuthorityHash, permissionEvidenceHash, permissionReuseKey, refusedBeforeSend } from "./team-permissions.js";
 import { storageShortfall, volumeUsage, type VolumeUsage } from "./storage.js";
 import { collectPermissionEvidence } from "./team-permission-evidence.js";
@@ -2494,7 +2495,12 @@ export class TeamService {
       if (activeCount) return;
       if (run.establishChecks && !run.verification?.checks.length)
         throw new TeamError(409, "verification-required", "Required verification commands have not been established; review cannot start.");
-      if (stored.checkHead !== run.headCommit) { this.check(stored); return; }
+      if (stored.checkHead !== run.headCommit) {
+        const hold = this.manager.hostLoad.held();
+        if (hold) { this.holdForHostLoad(stored, hold); return; }
+        if (run.reason?.startsWith(HOST_LOAD_REASON_PREFIX)) run.reason = undefined;
+        this.check(stored); return;
+      }
       if (!run.review || run.review.revision !== run.revision) {
         this.prepareMember(stored, "reviewer"); return;
       }
@@ -3738,6 +3744,10 @@ export class TeamService {
       if (tracking?.status === "blocked") throw new TeamError(409, "linear-issue-changed", tracking.reason ?? "The Linear issue no longer permits this work.");
       if (tracking && tracking.status !== "synced") return;
     }
+    if (!this.hasLaunch(member)) {
+      const hold = this.manager.hostLoad.held();
+      if (hold) { this.holdForHostLoad(stored, hold); return; }
+    }
     if (!this.hasLaunch(member) && (await this.manager.list()).filter(session => session.status === "running" || session.status === "starting").length >= this.config.maxSessions) { stored.run.reason = "Waiting for an available host session slot."; this.save(stored); return; }
     if (member.role === "delivery") {
       this.assertDelivery(stored);
@@ -3770,12 +3780,22 @@ export class TeamService {
       projectId: stored.run.projectId, title: member.title, prompt: member.prompt,
       ...(member.role === "permission-coordinator" ? { continuation: member.continuation } : {}) };
     try { result = await this.startInProject(stored.run.projectId, () => this.manager.createTeamSession(request, assignment(member), member.cwd, member.modelProfile, stored.root, this.config.teams?.trustWorkspaces === true)); }
-    catch (error) { if (error instanceof Error && /configured session limit/.test(error.message)) { stored.run.reason = "Waiting for an available host session slot."; this.save(stored); return; } throw error; }
+    catch (error) {
+      if (error instanceof LaunchHeldError) { this.holdForHostLoad(stored, error.reason); return; }
+      if (error instanceof Error && /configured session limit/.test(error.message)) { stored.run.reason = "Waiting for an available host session slot."; this.save(stored); return; }
+      throw error;
+    }
+    if (stored.run.reason?.startsWith(HOST_LOAD_REASON_PREFIX)) stored.run.reason = undefined;
     member.status = result.status === "unavailable" ? "unavailable" : "running";
     member.startedAt ??= timestamp();
     const turn = member.turns?.at(-1);
     if (turn?.sessionId === member.sessionId) turn.startedAt = member.startedAt;
     this.save(stored);
+  }
+  /** Shows a host-load hold on the run without replacing a reason that belongs to another cause. */
+  private holdForHostLoad(stored: Stored, reason: string) {
+    if (!holdsHostLoadReason(stored.run.reason) || stored.run.reason === reason) return;
+    stored.run.reason = reason; this.save(stored);
   }
   private applyProjectManagerCapacity(stored: Stored, requested?: number) {
     const run = stored.run, ceiling = capacityCeiling(run), limit = requested ?? ceiling;

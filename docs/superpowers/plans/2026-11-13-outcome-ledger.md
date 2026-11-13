@@ -289,3 +289,175 @@ In `tests/evidence-store.test.ts`:
 - `Stored.outbox`, `emit`, and the flush calls in `TeamService`. They arrive with the run events.
 - Any projector. The projection slice registers the first one, and it starts from the beginning of the event table.
 - A scheduled `advance`. The run events slice calls it at start and on a timer.
+
+---
+
+# Slice: run events
+
+Spec part 1, the emission half, for the kinds that belong to the run itself. `TeamService` gains an outbox in the sealed run record and emits the run-level events. The member, task, check, review, repair, and delivery kinds follow in later slices.
+
+Emission is off unless the host passes an `EventOutbox` to `TeamService`. `server.ts` passes one.
+
+## Trust boundary, and what a review checks
+
+`TeamService` is host code, and every event is built by the host from its own run record. No member, provider, or client supplies an event or any part of one. The failures this slice must survive are a crash between two writes, a store that is unavailable for a while, a restart, and a run record that was written before this slice existed. A review looks for a lost or doubled event under those failures, a changed behaviour of a run, and a sealed record that grows without bound. Hostile event shapes are outside this slice: the outbox of the previous slice refuses what the store cannot take.
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `packages/host/src/run-events.ts` (create) | Pure helpers: the event key, the run summary counts, the limits. No service code |
+| `packages/host/src/teams.ts` (modify) | The outbox in `Stored`, `emit`, the flush, the status events in `save`, the startup flush, the run-level emission sites, the `deleteRecord` rule |
+| `packages/host/src/server.ts` (modify) | Build the `EventOutbox` from the evidence store, pass it to `TeamService`, and run `advance` at start and on a timer |
+| `tests/run-events.test.ts` (create) | Helper tests |
+| `tests/team-events.test.ts` (create) | Service tests with a real store, through `schedulerFixture()` |
+| `tests/fixtures/team-scheduler.ts` (modify) | `openTeam(options?)` passes service options |
+| `docs/superpowers/specs/2026-11-12-outcome-ledger-design.md` (modify) | The `deleteRecord` paragraph of part 1 |
+| `docs/teams.md` (modify) | One short paragraph: what the run events are, and that they never change a run |
+
+## Review Focus
+
+1. A host that restarts between the sealed write and the store append. Expect each key once in the store after the restart.
+2. A store that is unavailable for a whole run. Expect the run to behave exactly as before, the outbox to stop at 2,000 events, and one `ledger.gap` once the store is back.
+3. A record written before this slice (no `ledgerStatus`). Expect no status event for the status it already has, and an event on the next change.
+4. An owner who removes a run while the store cannot take events. Expect the run to be removed.
+5. A `TeamService` built without an outbox, as most tests build it. Expect no `outbox` key in any sealed record and no behaviour change.
+
+### Task 1: the outbox in the run record, status events, and run creation
+
+**Interfaces (consumes):** `EventOutbox` (`flush`, `advance`), `OutboxEvent`, `FlushResult`, and `eventProblem` from the event outbox slice. `EvidenceStore` from INF-182 phase 1.
+
+**Interfaces (produces):**
+
+```ts
+// packages/host/src/run-events.ts
+/** The most events one run keeps waiting for the store. */
+export const MAX_OUTBOX_EVENTS = 2000;
+/** `[kind, runId, ...parts].join(":")`. A part is a string or a number. */
+export function runEventKey(kind: string, runId: string, parts?: readonly (string | number)[]): string;
+export interface RunSummaryCounts {
+  tasks: number; integrated: number; members: number; round: number; checks: number;
+  recoveries: number; decisionsByOwner: number; decisionsByCoordinator: number;
+  steering: number; permissionEscalations: number; continuations: number;
+}
+/** Counts from the run record as it is now. Numbers only. */
+export function runSummaryCounts(run: TeamRun): RunSummaryCounts;
+
+// packages/host/src/teams.ts
+type TeamServiceOptions = { /* existing fields */ events?: EventOutbox };
+type Stored = {
+  /* existing fields */
+  /** Events waiting for the evidence store. Sealed with the record, so a crash loses none. */
+  outbox?: OutboxEvent[];
+  /** The run status that the last status event was emitted for. */
+  ledgerStatus?: TeamRun["status"];
+  /** The member whose report or failure caused the block that the next status event reports. */
+  ledgerBlockSource?: string;
+  /** Events dropped since the last stored flush. */
+  ledgerGap?: { dropped: number; firstAt: string };
+};
+```
+
+Private methods of `TeamService` (the names are fixed, so later slices can call them):
+
+```ts
+/** Appends one event to the run's outbox. Never throws. A no-op without `options.events`. */
+private emit(stored: Stored, kind: string, keyParts: readonly (string | number)[],
+  ids: { memberId?: string; taskId?: string; revision?: number }, data: Record<string, unknown>): void;
+/** Sends the outbox to the store. True when nothing is left waiting. Never throws. */
+private flushOutbox(stored: Stored): boolean;
+```
+
+**Decisions:**
+
+- **Attach by constructor option**, not by a setter. The constructor loads records and can `save` during restart recovery, before any setter runs. With no `events`, `emit` and the flush do nothing, so most tests and every sealed-record snapshot stay as they are.
+- `runSummaryCounts`: `tasks` is `run.tasks.length`. `integrated` counts tasks with status `integrated`. `members` is `run.members.length`. `round` is `run.round`. `checks` is `run.checks.length`. `recoveries` is `run.recovery?.attempts ?? 0`. `decisionsByOwner` and `decisionsByCoordinator` count `run.decisions` by `answeredBy`. `steering` is `run.steering.length`. `permissionEscalations` counts `run.permissionDecisions` with status `escalated`. `continuations` is `run.continuations?.length ?? 0`.
+- `emit` builds `{ key: runEventKey(kind, run.id, keyParts), runId: run.id, revision: ids.revision ?? run.revision, at: timestamp(), kind, memberId?, taskId?, data: { v: 1, ...data } }`. A data value that is `undefined` is left out.
+- `emit` drops an event for which `eventProblem` returns a value, and logs one line per kind for the life of the process. The line names the kind and the problem code, never the data.
+- `emit` skips an event whose key is already waiting in the outbox.
+- When the outbox would exceed `MAX_OUTBOX_EVENTS`, `emit` removes the oldest event first and adds one to `ledgerGap.dropped`. `firstAt` is the time of the first drop.
+- `flushOutbox` returns true at once when there is no `options.events` or the outbox is empty. Otherwise it calls `options.events.flush(stored.outbox)`. When the result is stored, it clears the outbox in memory and adds `refused` to `ledgerGap.dropped`. Then, when `ledgerGap` is set, it emits `ledger.gap` with key part `firstAt` and data `{ dropped }`, clears `ledgerGap`, and flushes once more. It does not write the sealed record. `flush` never waits for a projector, so only a store that cannot take events keeps them waiting.
+- **`save`.** The order is: the retention sync that exists today, the status events, `updatedAt`, the sealed write, then `flushOutbox`. The sealed file can keep events that the store already holds until the next save. That is safe, because an append is idempotent by key. *(My call: one sealed write per save. A second write after every flush would double the cost of the most frequent operation.)*
+- **Status events.** `save` compares `run.status` with `stored.ledgerStatus`. When they differ it sets `ledgerStatus`, and emits:
+  - `run.blocked` when the new status is `blocked`: key parts `[revision, retention.statusAt]`, data `{ code: run.blockCode, sourceMemberId: stored.ledgerBlockSource }`.
+  - `run.settled` when the new status is `ready-for-review`, `merged`, `no-change`, or `cancelled`: key parts `[revision, status, retention.statusAt]`, data `{ status, summary: runSummaryCounts(run) }`.
+  It always clears `ledgerBlockSource` afterwards. *(`retentionState` syncs `retention.status` whenever it is called, so `save` cannot find a status change there. `ledgerStatus` is the ledger's own marker.)*
+- `block` sets `stored.ledgerBlockSource = sourceMember?.memberId` on the line before its last `save`, the one that follows the final status assignment. The two early returns for an automatic recovery do not set it.
+- **Load.** In the constructor, a loaded record with no `ledgerStatus` gets its current `run.status`, in memory only. A record that the constructor then blocks and saves emits `run.blocked` through `save`.
+- **Startup flush.** At the end of the constructor, `flushOutbox` runs for every loaded record whose outbox is not empty. It saves nothing.
+- **`run.created`.** `createRun` emits it before its first `save`: no key parts, `revision: 1`, data `{ projectId, purpose: "work", goalId: goal?.id, goalCycle: goal?.cycle, missionId, handoff: Boolean(internal?.handoff), parentRunId: internal?.baseRunId, lineup: Boolean(lineup), deliveryMode: run.delivery?.mode }`.
+- **`server.ts`** builds `new EventOutbox(evidence)` after the store and passes it as `events` in the `TeamService` options. After the services start, it calls `outbox.advance()` up to 20 times while the result is `pending` with no blocked projector, and then once a minute on an unref'd timer that both shutdown paths clear. *(My call: a projector that was behind or failing catches up without waiting for the next event. With no projector registered yet, `advance` returns at once.)*
+- With no `options.events`, no method adds an `outbox`, `ledgerStatus`, `ledgerBlockSource`, or `ledgerGap` key to a record.
+
+- [ ] **Step 1: Write the failing tests.**
+
+`tests/run-events.test.ts`:
+
+| Test name | Assertions |
+|---|---|
+| `a run event key joins the kind, the run, and the parts` | `runEventKey("run.created", "r1")` is `run.created:r1`. `runEventKey("run.blocked", "r1", [2, "2026-01-01T00:00:00.000Z"])` is `run.blocked:r1:2:2026-01-01T00:00:00.000Z`. |
+| `run summary counts read the record` | A run with two tasks (one integrated), three members, round 2, four checks, `recovery.attempts` 1, three decisions (one by the owner, one by a coordinator, one unanswered), two steering entries, one escalated and one approved permission decision, and one continuation gives exactly the eleven counts. A minimal run gives zeros. |
+
+`tests/team-events.test.ts`. Each test builds `schedulerFixture()`, an `EvidenceStore` under the fixture's state directory with the fixture's key, and an `EventOutbox`. `events(runId)` reads `store.events({ runId, limit: 100 })`.
+
+| Test name | Assertions |
+|---|---|
+| `a service without an outbox writes no ledger fields` | `openTeam()` with no options, then `pause`. The sealed record read back has none of `outbox`, `ledgerStatus`, `ledgerBlockSource`, `ledgerGap`. |
+| `a settled status emits run.settled once` | With the outbox, `cancel` the fixture run and wait for it to settle. The store has one `run.settled` event with `data.status` `cancelled`, `data.v` 1, and a `summary` with the eleven counts. A later mutation that keeps the status adds no second event. |
+| `a blocked status emits run.blocked with its code` | Drive the fixture to a block with a known code (a wrong-agent report, as `tests/teams.test.ts` does). The store has one `run.blocked` event with that `data.code` and the reporting member as `data.sourceMemberId`. |
+| `a legacy record emits only on the next change` | `writeTeam()` with status `paused` and no `ledgerStatus`. Opening the service stores no event. A later `cancel` stores one `run.settled`. |
+| `events wait while the store is unavailable and arrive after a restart` | Open the service with an outbox over a store opened with a wrong key. `cancel` the run. The sealed record's `outbox` holds the `run.settled` event. Close. Open a second service with an outbox over a store with the right key. The store now holds the event, with no further mutation. |
+| `a repeated flush stores each key once` | After an event is stored, write the sealed record back with the same event in `outbox`, and open a new service. The store still has one event with that key. |
+| `the outbox stops at its limit and reports the gap` | With an unavailable store, put 2,000 synthetic waiting events in the sealed record, open the service, and `cancel`. The outbox still has 2,000 events, and `ledgerGap.dropped` is 1. After a restart over a ready store, the store has one `ledger.gap` event with `data.dropped` 1. |
+| `run creation emits run.created` | `service.create(...)` for the fixture project, as an existing creation test does. The store has `run.created` with `revision` 1, `data.projectId`, `data.purpose` `work`, and `data.lineup` false. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** `node --import tsx --test tests/run-events.test.ts tests/team-events.test.ts tests/teams.test.ts`, then `npm run typecheck -w @infinite/host`.
+
+### Task 2: prepare, revision, retire, and delete events
+
+**Interfaces (consumes):** task 1.
+
+**Decisions:**
+
+- **`run.prepared`.** The completion callback of the `prepare` operation in `createRun`, where `Object.assign(run, workspace)` sets the base commit: no key parts, data `{ baseCommit: run.baseCommit }`.
+- **`run.revision-advanced`.** Emitted at each of the six places that advance `run.revision`, after the new revision is set and before that path's `save`: key parts `[new revision]`, data `{ cause, fromRevision, baseChanged }`.
+
+  | Place | `cause` | `baseChanged` |
+  |---|---|---|
+  | `steer` | `steer` | false |
+  | `continueRun` (on the clone `next`, before `save(next)`) | `continue` | false |
+  | `resumeVerificationRecovery` | `verification-recovery` | false |
+  | `action` (resume) | `resume` | false |
+  | `startAutomaticRecovery` | `automatic-recovery` | false |
+  | `consume`, moved base | `moved-base` | true |
+
+- **`run.settled` from `retire`.** Where `retire` first sets `run.workspaceRemovedAt` for a run whose status is `blocked`, before that `save`: key parts `[revision, "blocked", "workspace-removed"]`, data `{ status: "blocked", summary: runSummaryCounts(run) }`. The clone of a blocked run can no longer be resumed, so its rows freeze. The key holds no timestamp, so a retried removal names the same fact once. When that `save` fails, `retire` reverts `workspaceRemovedAt` and also removes the waiting event with that key from the outbox: a removal that did not start leaves no settled event. *(Decided during the build: `retire` is the one path that reverts its state after a failed save.)*
+- **`run.deleted` and the `deleteRecord` rule.** `deleteRecord(stored, waitForEvidence)` emits `run.deleted` (no key parts, data `{ status: run.status }`), calls `flushOutbox`, and calls `options.events.advance()` once, before it persists the tombstone.
+  - `retire` passes `waitForEvidence: true`. When the flush fails, or `advance` reports `pending` with no blocked projector, `deleteRecord` throws `TeamError(503, "team-evidence-pending", …)` before it removes anything. `retire` already reports a `deleteRecord` failure through `reportRemovalFailure(stored, "record", error)`, whose backoff retries it. `retention.evidenceHeldAt` records the first such failure. Once 24 hours have passed since then, `deleteRecord` removes the record anyway and logs one line. A blocked projector does not hold a delete: it cannot catch up without a repair, and the outbox records the loss.
+  - `removeRun` passes `waitForEvidence: false`. The flush and the advance are tried once. The record is removed whatever the result, and one line is logged when events were lost.
+  *(My call, and a change to spec part 1, which kept every record until its outbox was empty. An owner's explicit removal is never held back by measurement. An unavailable store is a state of the whole process, such as a missing SQLite build or a changed key, so an unbounded wait would keep records forever.)*
+- The existing evidence `deleteRun` call in `deleteRecord` stays after the file is removed.
+
+- [ ] **Step 1: Write the failing tests** in `tests/team-events.test.ts`.
+
+| Test name | Assertions |
+|---|---|
+| `steering advances the revision and says why` | `steer` stores `run.revision-advanced` with `revision` 2 and data `{ v: 1, cause: "steer", fromRevision: 1, baseChanged: false }`. |
+| `a continuation, a resume, and a recovery each name their cause` | One event per path, with `cause` `continue`, `resume`, and `automatic-recovery`, reached as `tests/teams.test.ts` reaches those paths. |
+| `preparing a run records its base commit` | After creation and the prepare operation, `run.prepared` has `data.baseCommit` equal to the run's base commit. |
+| `removing a blocked run's workspace settles it` | With `now` moved past the blocked retention, a retention pass stores `run.settled` with `data.status` `blocked`. A second pass stores no second event. |
+| `an owner removes a run while the store is unavailable` | With an unavailable store, `removeRun` on a cancelled, settled run resolves, and the sealed record is gone. |
+| `retention keeps a record while its events wait, for at most a day` | With an unavailable store, a retention pass on a cancelled run past its window keeps the sealed record and records `retention.evidenceHeldAt`. With `now` moved 25 hours on, the next pass removes it. |
+| `a deleted run's last event is projected before its events are removed` | With a ready store and a probe projector for `run.deleted`, `removeRun` resolves, the probe saw the event once, and the outbox module's `lost` count is 0. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.**
+- [ ] **Step 3: Implement**, and amend the spec paragraph.
+- [ ] **Step 4: Run** the three test files of task 1 and the typecheck.
+- [ ] **Step 5: The coordinator runs `npm run check`, requests the independent review, and commits.**
+
+## Not in this slice
+
+- Member, task, check, review, repair, delivery, and rating events.
+- `configId`, task features on `task.planned`, and any projector.

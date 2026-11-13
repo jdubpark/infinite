@@ -70,7 +70,8 @@ export function sharedText(value: string) {
   return value.replace(/(?:\/(?:Users|home|tmp|private\/tmp|private\/var|var\/folders)\/|~\/|[A-Za-z]:\\)[^\s<>"'`]+/g, "[local path omitted]");
 }
 
-class LinearFailure extends Error {
+/** Linear's own failure. Its text is fixed, so it may be shown or stored. */
+export class LinearFailure extends Error {
   constructor(readonly retryAfterMs = 0) { super("Linear could not confirm synchronization. Check the connection and host credential; execution is waiting."); }
 }
 

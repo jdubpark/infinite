@@ -8,7 +8,8 @@ import { missionRequestId, type IntakeThread, type IntakeThreadReader, type Slac
 import { IntakeStore } from "../packages/host/src/intake-store.js";
 import { IntakeLinear, issueFacts, parseSlackThreadLink, type IntakeIssue } from "../packages/host/src/intake-linear.js";
 import { IntakeService, failureSummary, intakeObjective, outboundText } from "../packages/host/src/intake.js";
-import { LinearService } from "../packages/host/src/linear.js";
+import { LinearFailure, LinearService } from "../packages/host/src/linear.js";
+import { SlackError } from "../packages/host/src/slack-client.js";
 import type { Config } from "../packages/host/src/types.js";
 import type { MissionService } from "../packages/host/src/missions.js";
 import { TeamError } from "../packages/host/src/teams.js";
@@ -116,10 +117,13 @@ test("an owner's labelled issue with the owner's Slack mention starts one missio
 test("a teammate's labelled issue is skipped and nothing is written to it", { timeout: 60000 }, async () => {
   const ctx = await setup();
   try {
-    const teammate = ctx.issue({ creatorId: randomUUID() });
+    const teammate = ctx.issue({ creatorId: randomUUID(), description: "A teammate's description" });
     await ctx.intake.poll();
     assert.deepEqual(ctx.list().map(view => [view.state, view.skipReason]), [["skipped", "creator-mismatch"]]);
     assert.equal(ctx.linearServer.comments(teammate.id).length, 0, "The skipped issue receives no comment");
+    const record = ctx.store.get(teammate.id)!;
+    assert.deepEqual([record.title, record.description], ["", ""], "A skipped issue's text is not stored");
+    assert.deepEqual([record.identifier, record.url, record.issueCreatedAt, record.skipReason], [teammate.identifier, teammate.url, teammate.createdAt, "creator-mismatch"]);
     assert.equal(ctx.missions.list().length, 0);
   } finally { await ctx.close(); }
 });
@@ -559,6 +563,7 @@ test("with the thread not required, a readable thread is background for the obje
     assert.equal(viewOf(ctx, issue.id)!.state, "started");
     const objective = ctx.missions.peek(missionRequestId(issue.id))!.objective;
     assert.match(objective, /Slack thread \(background\):\n\[owner\] Background line for the export/);
+    assert.equal(viewOf(ctx, issue.id)!.threadBound, true, "A thread read at admission is bound");
   } finally { await ctx.close(); }
 });
 
@@ -578,6 +583,7 @@ test("with the thread not required, an unreadable or failing thread admits the i
       const objective = ctx.missions.peek(missionRequestId(issue.id))!.objective;
       assert.equal(objective.includes("Slack thread (background):"), false, `${issue.identifier} has no thread section`);
       assert.match(objective, /^Request filed in Linear as /);
+      assert.equal(viewOf(ctx, issue.id)!.threadBound, false, `${issue.identifier} binds no thread it could not read`);
     }
   } finally { await ctx.close(); }
 });
@@ -788,4 +794,70 @@ test("failureSummary gives the error's name and code, and a fixed name for anyth
   assert.equal(failureSummary(named), "CustomFailure");
   assert.equal(failureSummary("a string with /srv/infinite-data"), "Error");
   assert.equal(failureSummary(undefined), "Error");
+});
+
+test("an unread linked thread binds nothing, so the Linear comments are kept even when they mirror to Slack", { timeout: 60000 }, async () => {
+  const ctx = await setup({ requireSlackThread: false, mirror: true });
+  try {
+    const unreadable = ctx.addThread(2000, ownerMention);
+    ctx.threads.unreadable.add(unreadable.root);
+    const issue = ctx.linearServer.file({ createdAt: ctx.iso(1000), attachmentUrls: [unreadable.link] });
+    await ctx.intake.poll();
+    const view = viewOf(ctx, issue.id)!;
+    assert.equal(view.state, "started");
+    assert.equal(view.threadBound, false);
+    assert.equal(view.comments.started, "delivered");
+    assert.equal(ctx.linearServer.comments(issue.id).length, 1, "The started comment goes to Linear");
+    // Without a thread reader nothing is read, so a readable link binds nothing either.
+    const readerless = new IntakeService(ctx.config, ctx.store, ctx.missions, new IntakeLinear(ctx.linear), { pollMs: 3600000, log: () => undefined });
+    const readable = ctx.addThread(2100, ownerMention);
+    const second = ctx.linearServer.file({ createdAt: ctx.iso(1100), attachmentUrls: [readable.link] });
+    await readerless.poll();
+    readerless.close();
+    assert.equal(viewOf(ctx, second.id)!.threadBound, false);
+    assert.equal(ctx.store.get(second.id)!.comments.started?.delivered, true);
+  } finally { await ctx.close(); }
+});
+
+test("the candidate query reads every page of open labelled issues and asks for no finished or archived ones", { timeout: 60000 }, async () => {
+  const ctx = await setup();
+  try {
+    const open = Array.from({ length: 201 }, () => ctx.linearServer.file({ createdAt: ctx.iso(1000) }));
+    ctx.linearServer.file({ createdAt: ctx.iso(1000), stateType: "completed" });
+    ctx.linearServer.file({ createdAt: ctx.iso(1000), stateType: "canceled" });
+    const read = await new IntakeLinear(ctx.linear).candidates({ teamIds: [ctx.linearServer.teamId], label: "infinite", createdAfter: ctx.iso(0) });
+    assert.equal(read.capped, false);
+    assert.deepEqual(read.issues.map(issue => issue.id).sort(), open.map(issue => issue.id).sort(), "Every open issue is seen, and no finished one");
+    const queries = ctx.linearServer.calls.filter(call => call.operation === "InfiniteIntakeCandidates");
+    assert.equal(queries.length, 2, "Two pages of 200");
+    assert.ok(queries.every(call => !call.query.includes("includeArchived")), "Archived issues are not asked for");
+  } finally { await ctx.close(); }
+});
+
+test("past ten pages of candidates the issues read are still processed and the cap is reported", { timeout: 120000 }, async () => {
+  const ctx = await setup();
+  try {
+    const cap = "More labelled issues than one intake cycle reads.";
+    const admitted = ctx.issue();
+    // Issues older than the enable time are read and set aside without a record, which keeps this cycle cheap.
+    for (let index = 0; index < 2000; index++) ctx.linearServer.file({ createdAt: new Date(ctx.enabled - 60000).toISOString() });
+    await ctx.intake.poll();
+    assert.equal(viewOf(ctx, admitted.id)!.state, "started", "An issue on a page that was read is admitted");
+    assert.deepEqual([ctx.intake.status().lastError?.step, ctx.intake.status().lastError?.message], ["admit", cap]);
+    assert.ok(ctx.logged.some(entry => entry.error instanceof Error && entry.error.message === cap), "The cap reaches the host log");
+    const read = await new IntakeLinear(ctx.linear).candidates({ teamIds: [ctx.linearServer.teamId], label: "infinite", createdAfter: ctx.iso(0) });
+    assert.deepEqual([read.issues.length, read.capped], [2000, true]);
+  } finally { await ctx.close(); }
+});
+
+test("failureSummary keeps the fixed text of a Slack or Linear request failure, so lastError names what failed", { timeout: 60000 }, async () => {
+  assert.equal(failureSummary(new SlackError("invalid_auth", false)), "Slack request failed: invalid_auth");
+  const linearText = new LinearFailure().message;
+  assert.equal(failureSummary(new LinearFailure()), linearText);
+  const ctx = await setup();
+  try {
+    ctx.linearServer.unavailable(true);
+    await ctx.intake.poll();
+    assert.deepEqual([ctx.intake.status().lastError?.step, ctx.intake.status().lastError?.message], ["admit", linearText]);
+  } finally { await ctx.close(); }
 });

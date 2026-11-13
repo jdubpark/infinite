@@ -19,6 +19,8 @@ const NOT_STARTED = "This request has not started yet.";
 const NO_REASON = "No reason was recorded.";
 const UNEXPECTED = "The request could not be applied.";
 const ACTIONS = new Set(["status", "pause", "resume", "cancel"]);
+/** Identity failures a retry cannot fix: the surface stops with a reason, as it does for another workspace's token. */
+const PERMANENT_IDENTITY = new Set(["invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired", "credential_unavailable"]);
 const QUESTION = /^Q(\d+)(?!\w)\s*/i;
 
 interface Outcome { outcome: string; reply?: string }
@@ -120,7 +122,11 @@ export class IntakeSlackSurface {
     let identity: { teamId: string; userId: string };
     try {
       identity = await this.client.authTest();
-    } catch {
+    } catch (error) {
+      if (error instanceof SlackError && !error.transient && PERMANENT_IDENTITY.has(error.code)) {
+        this.reason = `The Slack identity check failed: ${error.code}.`;
+        return;
+      }
       this.identityTimer = setTimeout(() => { this.identityTimer = undefined; void this.verify(); }, IDENTITY_RETRY_MS);
       return;
     }

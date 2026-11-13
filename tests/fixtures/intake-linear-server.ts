@@ -15,8 +15,9 @@ export interface IntakeFixtureIssue {
 export interface IntakeFixtureComment { id: string; body: string; issueId: string }
 
 /**
- * A loopback GraphQL peer for intake. It filters by team only, so the service's own re-checks (label, creator,
- * archived, state, creation time) are what the tests exercise. Its writes commit before a lost response is returned.
+ * A loopback GraphQL peer for intake. Candidates are filtered by team and, as Linear does, by a state-type `nin`
+ * filter, and are paged by `first` and `after`; label, creator, archived, and creation time are left to the service's
+ * own re-checks, which is what the tests exercise. Its writes commit before a lost response is returned.
  */
 export async function startIntakeLinearServer(options: { clock?: () => number } = {}) {
   const apiKey = randomBytes(32).toString("hex"), teamId = randomUUID(), ownerId = randomUUID();
@@ -24,7 +25,7 @@ export async function startIntakeLinearServer(options: { clock?: () => number } 
   const apiKeyFile = join(directory, "linear-key");
   writeFileSync(apiKeyFile, apiKey, { mode: 0o600 });
   const issues = new Map<string, IntakeFixtureIssue>(), comments = new Map<string, IntakeFixtureComment>();
-  const calls: { operation: string; variables: Record<string, any> }[] = [];
+  const calls: { operation: string; query: string; variables: Record<string, any> }[] = [];
   let loseNext = false, unavailableValue = false, count = 0;
   const malformed = new Set<string>(), malformedCreator = new Set<string>();
   const now = options.clock ?? (() => Date.now());
@@ -47,13 +48,17 @@ export async function startIntakeLinearServer(options: { clock?: () => number } 
     const parsed = JSON.parse(body);
     const operation: string = parsed.operationName;
     const variables = parsed.variables ?? {};
-    calls.push({ operation, variables });
+    calls.push({ operation, query: String(parsed.query ?? ""), variables });
     if (unavailableValue) { reply(503, { errors: [{ message: "Fixture transport unavailable" }] }); return; }
     switch (operation) {
       case "InfiniteIntakeCandidates": {
         const teams: string[] = variables.filter?.team?.id?.in ?? [];
-        const nodes = [...issues.values()].filter(issue => teams.includes(issue.teamId)).map(node);
-        reply(200, { data: { issues: { nodes } } });
+        const excluded: string[] = variables.filter?.state?.type?.nin ?? [];
+        const matching = [...issues.values()].filter(issue => teams.includes(issue.teamId) && !excluded.includes(issue.stateType));
+        const start = variables.after ? matching.findIndex(issue => issue.id === variables.after) + 1 : 0;
+        const page = matching.slice(start, start + (Number(variables.first) || 50));
+        const hasNextPage = start + page.length < matching.length;
+        reply(200, { data: { issues: { nodes: page.map(node), pageInfo: { hasNextPage, endCursor: page.at(-1)?.id ?? null } } } });
         return;
       }
       case "InfiniteIntakeIssueStates": {

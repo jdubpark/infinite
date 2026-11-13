@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { splitSlackText } from "../packages/host/src/slack-text.js";
 import { IntakeSlackSurface } from "../packages/host/src/intake-slack.js";
@@ -945,4 +945,34 @@ test("a record over the message bound keeps its composed messages, so nothing is
     assert.equal(s.slack.posts(BINDING).length, 0, "A reconcile after the trim posts nothing");
     assert.equal(s.store.get(ISSUE)!.messages.length, 400);
   } finally { await close(); }
+});
+
+test("a permanent Slack identity failure sets a reason that names Slack's code, and a transient one sets none", { timeout: 60000 }, async () => {
+  const sh = scripted();
+  const services = { missions: sh.missions as unknown as MissionService, teams: sh.teams as unknown as TeamService };
+  const roots: string[] = [], surfaces: Awaited<ReturnType<typeof surfaceFor>>[] = [];
+  const open = async () => {
+    const root = mkdtempSync(join(tmpdir(), "intake-identity-"));
+    roots.push(root);
+    const s = await surfaceFor(services, root);
+    surfaces.push(s);
+    return s;
+  };
+  try {
+    for (const [token, reason] of [["not-a-bot-token\n", "The Slack identity check failed: invalid_auth."], ["\n", "The Slack identity check failed: credential_unavailable."]]) {
+      const s = await open();
+      writeFileSync(s.slack.botTokenFile, token, { mode: 0o600 });
+      await s.surface.start();
+      assert.equal(s.surface.status().reason, reason);
+      assert.equal(s.surface.status().connected, false);
+    }
+    const s = await open();
+    s.slack.unavailable(true);
+    await s.surface.start();
+    assert.equal(s.surface.status().reason, undefined, "A transient failure is retried with no reason");
+  } finally {
+    for (const s of surfaces) await s.close();
+    sh.close();
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  }
 });

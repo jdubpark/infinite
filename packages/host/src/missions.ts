@@ -15,6 +15,8 @@ import type { UsageService } from "./usage-service.js";
 import { missionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { ensureDefaultTeamRoot, ensureHostDirectory } from "./team-workspace.js";
 import { resumeFailed } from "./native-continuation.js";
+import { applyFuseReason, workLaunch } from "./fuse/rules.js";
+import type { FuseAdmission, FuseCheck, FuseGate } from "./fuse/types.js";
 
 /** The mission's only view of projects; the project group service implements it. */
 export type ProjectGroupLookup = { get(id: string): ProjectGroup };
@@ -88,6 +90,7 @@ export class MissionService {
   private closed = false;
   private tickQueued = false;
   private usage?: UsageService;
+  private fuse?: FuseGate;
 
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly teams: TeamService, private readonly groups: ProjectGroupLookup) {
     this.directory = join(config.stateDir, "missions");
@@ -125,6 +128,8 @@ export class MissionService {
   }
   /** The usage ledger that prices coordinator sessions; subteam usage comes from their runs. */
   useUsage(service: UsageService) { this.usage = service; }
+  /** The launch-rate fuse. A service without one launches every coordinator attempt it would have launched before. */
+  useFuse(fuse: FuseGate) { this.fuse = fuse; }
   /** Whether the mission's sealed record file is on disk, so a record that failed to load still counts. Only a missing file is false. */
   hasRecordFile(id: string) {
     if (!/^[a-f0-9-]{36}$/.test(id)) return false;
@@ -677,9 +682,22 @@ export class MissionService {
     try { this.manager.meta(attempt.sessionId); return true; }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
   }
+  /** Applies a fuse result to the mission reason. True when the launch must wait. */
+  private fuseWait(stored: Stored, result: FuseCheck | FuseAdmission) {
+    const { wait, changed } = applyFuseReason(stored.mission, result);
+    if (changed && wait) this.event(stored, stored.mission.reason!);
+    if (changed) this.save(stored);
+    return wait;
+  }
   private async launch(stored: Stored, attempt: Attempt) {
     const mission = stored.mission;
     try {
+      if (this.fuse && !this.launched(attempt)) {
+        const projectId = mission.repoProjectIds[0];
+        if (this.fuseWait(stored, this.fuse.check({ projectId }))) return;
+        if (this.fuseWait(stored, this.fuse.admit(workLaunch({ launchId: attempt.sessionId, projectId, provider: mission.lineup.coordinator.provider,
+          team: this.assignment(stored, attempt), profile: mission.lineup.coordinator })))) return;
+      }
       const session = await this.manager.createTeamSession({ requestId: attempt.sessionId, provider: mission.lineup.coordinator.provider, projectId: mission.repoProjectIds[0],
         title: `Mission coordinator: ${mission.title}`.slice(0, 100), prompt: attempt.prompt, ...(attempt.continuation ? { continuation: attempt.continuation } : {}) }, this.assignment(stored, attempt), stored.folder, mission.lineup.coordinator,
       this.config.teams?.workspaceDir, this.config.teams?.trustWorkspaces === true);
@@ -687,6 +705,8 @@ export class MissionService {
       attempt.status = "running"; attempt.startedAt ??= now();
       if (session.status === "unavailable") this.event(stored, "The coordinator runtime is unavailable; the mission is waiting for confirmed state.");
     } catch (error) {
+      this.fuse?.release(attempt.sessionId);
+      if (error instanceof TeamError && error.code === "fuse-open") return;
       if (error instanceof Error && /configured session limit/.test(error.message)) return;
       throw error;
     }

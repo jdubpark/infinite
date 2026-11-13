@@ -26,6 +26,8 @@ import { DEFAULT_HOOKS } from "./config.js";
 import { validateNativeCodexArgs } from "./native-codex.js";
 import { validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { ContentError } from "./session-content.js";
+import { fuseReason, workLaunch } from "./fuse/rules.js";
+import type { FuseGate } from "./fuse/types.js";
 import { isCollapsedPermissionPrompt, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { nativeContinuationSchema, teamModelProfileSchema, type NativeContinuation, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
 import { missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
@@ -177,6 +179,9 @@ const unavailable = (now = new Date().toISOString()): WorkerState => ({
 export class Manager {
   private serial: Promise<unknown> = Promise.resolve();
   private readonly handoffProjects = new Map<string, string>();
+  private fuse?: FuseGate;
+  /** The launch-rate fuse. Without one, every session starts as before and nothing is counted. */
+  useFuse(fuse: FuseGate) { this.fuse = fuse; }
   reserveHandoff(projectId: string) {
     const project = this.config.projects.find(project => project.id === projectId);
     if (!project) throw new ContentError("Handoff project is unavailable");
@@ -824,7 +829,19 @@ export class Manager {
     // Use the same admission queue as create, without re-entering it.
     return remember(await this.createOnce(request));
   }
+  /**
+   * Creates the session, or returns the one its request already made. A team launch that fails before its session
+   * record exists gives its fuse launch back: the count stays, and a retry with the same id is not counted twice.
+   */
   private async createOnce(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile }, workspaceTrusted = false) {
+    try { return await this.createRecorded(request, workspaceTrusted); }
+    catch (error) {
+      // A started launch stays started, and a failing fuse never hides the launch error.
+      if (request.team) try { this.fuse?.release(request.requestId); } catch { /* the launch error is the one to report */ }
+      throw error;
+    }
+  }
+  private async createRecorded(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile }, workspaceTrusted = false) {
     if (!request.resumedFrom && request.nativeArgs) assertFreshNativeContext(request.provider, request.nativeArgs);
     if (request.workspace && (request.provider !== "codex" || !request.localUi))
       throw new Error("Laptop execution requires the Codex native interface");
@@ -863,6 +880,12 @@ export class Manager {
       ).length >= this.config.maxSessions
     )
       throw new Error("The configured session limit has been reached");
+    // The backstop: a team session is charged before any session directory exists. A replay returned above, and a
+    // launch that its caller already admitted is recognised by its id and not charged again.
+    if (request.team && this.fuse) {
+      const admission = this.fuse.admit(workLaunch({ launchId: id, projectId: request.projectId, provider: request.provider, team: request.team, profile: request.teamModelProfile }));
+      if (!admission.ok) throw new TeamError(409, "fuse-open", fuseReason("open" in admission ? admission.open : "write-failed"));
+    }
     if (!request.team && [...this.handoffProjects.values()].some(path => handoffPathsOverlap(path, realpathSync(project.path)))) throw new ContentError("This project is capturing an accepted team handoff");
     const configuredProfile = this.config.agents[request.provider];
     if (!configuredProfile) throw new Error("Provider is not configured on this host");
@@ -931,6 +954,8 @@ export class Manager {
       session,
       fingerprint,
     });
+    // The session record exists now, so the launch counts as started even if the worker fails to spawn.
+    if (request.team) try { this.fuse?.started(id); } catch { /* fuse bookkeeping never fails a session */ }
     const worker = fileURLToPath(
       new URL(
         import.meta.url.endsWith(".ts") ? "./worker.ts" : "./worker.js",

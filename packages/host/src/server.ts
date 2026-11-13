@@ -30,6 +30,7 @@ import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
 import { UsageService } from "./usage-service.js";
 import { EvidenceStore, evidenceDatabasePath } from "./evidence/store.js";
 import { EventOutbox } from "./evidence/outbox.js";
+import { FuseService } from "./fuse/service.js";
 import { usagePlanSchema } from "./usage-api.js";
 import { TeamService, TeamError } from "./teams.js";
 import { spawnTeamBundle } from "./team-workspace.js";
@@ -177,6 +178,10 @@ export function createApp(config: Config, key: Buffer) {
   // A store that cannot open stays unavailable with a fixed reason. It never blocks the host, a run, or a removal.
   const evidence = new EvidenceStore({ databasePath: evidenceDatabasePath(config.stateDir), vaultKey: key });
   const outbox = new EventOutbox(evidence);
+  // The launch-rate fuse is built before any service that receives it starts. It stops before the store closes.
+  const fuse = new FuseService({ config, key, store: evidence, sessionExists: id => {
+    try { manager.meta(id); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
+  } });
   const teams = new TeamService(config, key, manager, startInProject, linear, readings, {
     source: projectSource,
     graphs: repositoryGraphs,
@@ -212,7 +217,7 @@ export function createApp(config: Config, key: Buffer) {
     }
   };
   let outboxTimer: NodeJS.Timeout | undefined;
-  const closeEvidence = () => { clearInterval(evidenceSweep); clearInterval(outboxTimer); evidence.close(); };
+  const closeEvidence = () => { clearInterval(evidenceSweep); clearInterval(outboxTimer); fuse.stop(); evidence.close(); };
   missions.useUsage(usage);
   usage.useResolvers({
     goalOfRun: runId => { const goal = goals.list().find(value => value.cycles.some(cycle => cycle.teamId === runId)); return goal ? { id: goal.id, title: goal.title } : undefined; },
@@ -346,6 +351,12 @@ export function createApp(config: Config, key: Buffer) {
       } finally { routineStarts.delete(request.projectId); }
     },
   });
+  manager.useFuse(fuse);
+  teams.useFuse(fuse);
+  goals.useFuse(fuse);
+  missions.useFuse(fuse);
+  routines.useFuse(fuse);
+  fuse.start();
   const desktopResources = new DesktopResources(config, listSessions);
   const changeProjectFiles = async <T>(projectId: string, action: () => Promise<T>) => {
     if (projectFileChanges.has(projectId)) throw new DesktopError("files-changing", "Project files are being changed. Retry after the transfer finishes.");
@@ -605,6 +616,22 @@ export function createApp(config: Config, key: Buffer) {
   );
   app.get("/api/usage", (_req, res) => res.json(usage.summary()));
   app.get("/api/evidence/status", (_req, res) => res.json(evidence.describe()));
+  app.get("/api/fuse", (_req, res) => res.json(fuse.view()));
+  const fuseCloseSchema = z.discriminatedUnion("scope", [
+    z.object({ scope: z.literal("host") }).strict(),
+    z.object({ scope: z.literal("project"), projectId: z.string().min(1) }).strict(),
+  ]);
+  app.post("/api/fuse/close", requireRole(["owner"]), (req, res) => {
+    const body = fuseCloseSchema.safeParse(req.body);
+    if (!body.success) return void res.status(400).json({ error: "Invalid fuse close request" });
+    const scope = body.data, projectId = scope.scope === "project" ? scope.projectId : undefined;
+    if (projectId !== undefined && !config.projects.some(project => project.id === projectId))
+      return void res.status(404).json({ error: "Project not found" });
+    const result = fuse.close(scope);
+    if (result === "unmeasurable") return void res.status(409).json({ error: "The fuse cannot close until its launch record can be read", code: "unmeasurable" });
+    if (result === "write-failed") return void res.status(503).json({ error: "The fuse could not record the close", code: "write-failed" });
+    return void res.json({ result, view: fuse.view() });
+  });
   app.get("/api/usage/models", (req, res) => {
     const query = z.object({ role: z.string().trim().min(1).max(40).optional() }).strict().parse(req.query);
     return res.json(scorecard(teams.list(), sessionId => {
@@ -1627,5 +1654,5 @@ export function createApp(config: Config, key: Buffer) {
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
   const closeConnections = () => { routines.close(); live.close(); handoffs.close(); missions.close(); readings.stop(); goals.close(); teams.close(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
-  return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, closeConnections };
+  return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, closeConnections, fuse };
 }

@@ -24,12 +24,21 @@ export const usageConfigSchema = z.object({
 export type UsageConfig = z.infer<typeof usageConfigSchema>;
 export const machineLabelSchema = z.string().trim().min(1).max(80);
 
+/** Launches per rolling hour. No default: an absent key stays absent, and the service supplies 30 and 80. */
+const fuseCeilingsSchema = z.object({ launchesPerHour: z.number().int().min(1).max(1000).optional() }).strict();
+export const fuseConfigSchema = z.object({
+  project: fuseCeilingsSchema.optional(),
+  host: fuseCeilingsSchema.optional(),
+  projects: z.record(z.string().min(1), fuseCeilingsSchema).optional(),
+}).strict();
+export type FuseConfig = z.infer<typeof fuseConfigSchema>;
+
 const schema = z
   .object({
     linear: z.object({ apiKeyFile: z.string().refine(isAbsolute), endpoint: z.url().optional() }).strict().optional(),
     teams: z.object({ workspaceDir: z.string().refine(isAbsolute), commandPrefix: teamCommandSchema.optional(), lineup: teamLineupSchema.optional(), trustWorkspaces: z.boolean().optional(), publishHeads: z.boolean().default(true), stallMinutes: z.number().int().min(5).max(1440).optional(), checkMinutes: z.number().positive().max(240).optional(), retention: teamRetentionSchema.optional(), storageFloor: storageFloorSchema.optional() }).strict().optional(),
     machine: z.object({ id: z.uuid(), label: machineLabelSchema }).strict().optional(),
-    autonomy: z.object({ defaultMode: autonomyModeSchema.optional() }).strict().optional(),
+    autonomy: z.object({ defaultMode: autonomyModeSchema.optional(), fuse: fuseConfigSchema.optional() }).strict().optional(),
     cmux: z.object({ enabled: z.boolean(), command: z.string().min(1).optional(), hooksDir: z.string().refine(isAbsolute).optional() }).strict().optional(),
     remote: z.object({ enabled: z.boolean(), relay: z.object({ url: z.url(), tokenFile: z.string().refine(isAbsolute) }).strict().optional() }).strict().optional(),
     deployment: z.unknown().optional(),
@@ -129,8 +138,8 @@ const schema = z
         endpoint: z.url().default("https://exp.host/--/api/v2/push/send"),
         detail: z.enum(["minimal", "full"]).default("minimal"),
         events: z
-          .array(z.enum(["needs-you", "turn-finished", "exited", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "team-blocked", "host-storage"]))
-          .default(["needs-you", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "host-storage"]),
+          .array(z.enum(["needs-you", "turn-finished", "exited", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "team-blocked", "host-storage", "autonomy-interrupt"]))
+          .default(["needs-you", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "host-storage", "autonomy-interrupt"]),
       })
       .strict()
       .optional(),
@@ -161,7 +170,11 @@ export function validateLinearConfig(config: Config) {
   } catch { throw new Error("Linear API key must be a nonempty private 0600 file outside runtime state and project workspaces"); }
 }
 export function readConfig(file: string): { config: Config; key: Buffer } {
-  const config = schema.parse(JSON.parse(readFileSync(file, "utf8"))) as Config;
+  const parsed = schema.parse(JSON.parse(readFileSync(file, "utf8")));
+  for (const id of Object.keys(parsed.autonomy?.fuse?.projects ?? {})) {
+    if (!parsed.projects.some(project => project.id === id)) throw new Error("Fuse limits name a project that is not configured");
+  }
+  const config = parsed as Config;
   config.deployment = parseDeployment(config.deployment);
   validateLinearConfig(config);
   assertRunnerDeployment(config);

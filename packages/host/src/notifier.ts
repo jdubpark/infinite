@@ -1,6 +1,12 @@
 import { PROVIDER_NAMES, type Attention, type Prompt, type Provider } from "@infinite/attention";
 import type { Manager } from "./manager.js";
 import type { PushSender, PushStore } from "./push.js";
+import type { FuseService, FuseInterrupt } from "./fuse/service.js";
+import { createHash } from "node:crypto";
+
+/** The subject part of a fuse collapse id. A push service limits the id's length, and a project id has no limit, so a long one is replaced by a digest. */
+const fuseSubject = (projectId: string | undefined) =>
+  projectId === undefined ? "host" : projectId.length <= 40 ? projectId : createHash("sha256").update(projectId, "utf8").digest("hex").slice(0, 32);
 
 type Row = { id: string; title: string; provider: Provider; attention: Attention; reading?: { now?: { text: string } } };
 type TeamRow = { id: string; title: string; status: string; reason?: string; resumable?: boolean; goal?: boolean; mission?: boolean };
@@ -57,7 +63,11 @@ export class Notifier {
     private readonly teams?: Teams,
     private readonly goals?: { statuses(): GoalRow[] },
     private readonly storage?: { sample(): Promise<StorageVolume[]> },
+    private readonly fuse?: Pick<FuseService, "interrupts" | "markAnnounced">,
   ) {}
+  /** After a fuse push that reached no device, the time of the next attempt, on a clock that never steps back. */
+  private fuseRetryAt = 0;
+  private monotonic = () => performance.now();
   /** Lifecycle baselines are taken now, synchronously, so a change during the first interval is not absorbed as startup state. */
   start() { this.teamEvents(); this.goalEvents(); this.timer = setInterval(() => void this.tick().catch(() => {}), this.options.intervalMs); this.timer.unref(); }
   stop() { clearInterval(this.timer); }
@@ -95,13 +105,15 @@ export class Notifier {
     } catch {}
     const lifecycle = [...this.teamEvents(), ...this.goalEvents()];
     const storageDue = await this.storageEvents(Date.now());
-    if (!due.length && !lifecycle.length && !storageDue.length) return;
+    const fuseDue = this.fuseEvents();
+    if (!due.length && !lifecycle.length && !storageDue.length && !fuseDue.length) return;
     const devices = this.store.list();
     if (!devices.length) return;
     const messages = [
       ...due.flatMap((row) => devices.map((d) => this.message(row, d.token))),
       ...lifecycle.flatMap((item) => devices.map((d) => this.lifecycleMessage(item, d.token))),
       ...storageDue.flatMap((item) => devices.map((d) => this.storageMessage(item, d.token))),
+      ...fuseDue.flatMap((item) => devices.map((d) => this.fuseMessage(item, d.token))),
     ];
     let tickets: Awaited<ReturnType<PushSender>>;
     try {
@@ -109,6 +121,16 @@ export class Notifier {
     } catch (error) {
       console.warn(`push: sender failed (${(error as Error).name})`);
       return;
+    }
+    // The sender resolves even when the push service refuses a message, with one ticket per message. A trip is
+    // marked when at least one device received it, so a push that reached nobody is offered again.
+    if (fuseDue.length) {
+      const first = messages.length - fuseDue.length * devices.length;
+      const reached = fuseDue.filter((_item, index) =>
+        devices.some((_device, device) => tickets[first + index * devices.length + device]?.status === "ok"));
+      if (reached.length) this.fuse?.markAnnounced(reached.map((item) => item.tripId));
+      // A trip that reached nobody is tried again after a minute, not on every tick.
+      if (reached.length < fuseDue.length) this.fuseRetryAt = this.monotonic() + 60_000;
     }
     const failures = new Set<string>();
     tickets.forEach((ticket, i) => {
@@ -148,6 +170,23 @@ export class Notifier {
       this.storageStatus.set(volume.label, { previous: volume.fullness, warningArmed, criticalArmed });
     }
     return due;
+  }
+  /** Open spend-fuse trips the owner has not been told about. Nothing is read or marked unless the event is enabled. */
+  private fuseEvents(): FuseInterrupt[] {
+    if (!this.fuse || !this.enabled("autonomy-interrupt") || this.monotonic() < this.fuseRetryAt) return [];
+    try { return this.fuse.interrupts(); } catch { return []; }
+  }
+  private fuseMessage(item: FuseInterrupt, to: string) {
+    const cause = item.cause === "unmeasurable" ? "its launch record cannot be read"
+      : item.cause === "write-failed" ? "it cannot record a launch" : "it reached its launch limit for the last hour";
+    const closing = item.cause === "unmeasurable" ? "It closes once the record can be read."
+      : item.cause === "write-failed" ? "Launches resume once the host can write its state again."
+      : item.ownerClose ? "It stays open until you close it." : "It closes on its own as launches leave the last hour.";
+    return {
+      to, title: "Spend fuse open", body: `Launches paused for ${item.label}: ${cause}. ${closing}`,
+      data: { url: "/teams", ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
+      priority: "high" as const, collapseId: `interrupt:fuse:${fuseSubject(item.projectId)}`,
+    };
   }
   private storageMessage(item: StorageAlert, to: string) {
     const count = (value: number) => value >= 1_000_000 ? `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}M` : value >= 1_000 ? `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}K` : String(Math.round(value));

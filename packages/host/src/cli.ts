@@ -323,7 +323,7 @@ else if (command === "plan-fleet") {
     const fd = openSync(lock, "wx", 0o600);
     writeFileSync(fd, String(process.pid));
     closeSync(fd);
-    const { sessions, teams, goals, pushStore, server, closeConnections } = createApp(config, key);
+    const { sessions, teams, goals, pushStore, server, closeConnections, fuse } = createApp(config, key);
     server.listen(config.port, "127.0.0.1", () =>
       console.log(
         `Infinite: ${config.origin}\nExecution host: ${config.environment}\nClosing this API does not stop agent workers.`,
@@ -351,8 +351,10 @@ else if (command === "plan-fleet") {
               ? []
               : [{ label: volume.label, path: volume.path, fullness: volume.fullness, availableBytes: volume.availableBytes, availableInodes: volume.availableInodes, fullnessBy: volume.fullnessBy }]),
         },
+        fuse,
       ).start();
       console.log(`Push notifications: enabled (${config.push.detail} bodies)`);
+      if (!config.push.events.includes("autonomy-interrupt")) console.warn("Push is on, but push.events has no autonomy-interrupt: an open spend fuse will send no notification.");
     }
     const unlock = () => {
       try {

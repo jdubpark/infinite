@@ -38,6 +38,9 @@ import { GoalService } from "./goals.js";
 import { RoutineService } from "./routines.js";
 import { createRoutineSchema, routineActionSchema } from "./routine-types.js";
 import { MissionService, missionBoard } from "./missions.js";
+import { IntakeStore } from "./intake-store.js";
+import { IntakeLinear } from "./intake-linear.js";
+import { IntakeService } from "./intake.js";
 import { createMissionSchema, missionActionSchema, missionTextSchema } from "./mission-types.js";
 import { ProjectGroupService } from "./project-groups.js";
 import { LinearService } from "./linear.js";
@@ -198,6 +201,8 @@ export function createApp(config: Config, key: Buffer) {
   const projectGroups = new ProjectGroupService(config, key, undefined, { appliedAt: id => projectSync.status(id).appliedAt });
   const missions = new MissionService(config, key, manager, teams, projectGroups);
   ownerServices.missions = missions;
+  // Intake exists only when configured; without it the intake route lists no records.
+  const intake = config.intake ? new IntakeService(config, new IntakeStore(config, key), missions, new IntakeLinear(linear)) : undefined;
   // A run is live while its sealed record file exists, so a record that failed to load keeps its evidence.
   const sweepEvidence = () => evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
   let evidenceSweep: NodeJS.Timeout | undefined;
@@ -754,6 +759,7 @@ export function createApp(config: Config, key: Buffer) {
   app.post("/api/goals/:id/extend", requireRole(["owner"]), async (req, res) => res.json(await goals.extend(id.parse(req.params.id), goalExtendSchema.parse(req.body))));
   app.get("/api/missions", (_req, res) => res.json({ missions: missions.list() }));
   app.get("/api/missions/:id", (req, res) => res.json(missions.get(id.parse(req.params.id))));
+  app.get("/api/intake", (_req, res) => res.json({ records: intake?.list() ?? [] }));
   app.post("/api/missions", requireRole(["owner"]), async (req, res) => {
     const body = createMissionSchema.parse(req.body);
     // A retry returns the recorded mission even if the group or a handoff changed since it was admitted.
@@ -1572,6 +1578,7 @@ export function createApp(config: Config, key: Buffer) {
     goals.start();
     routines.start();
     missions.start();
+    intake?.start();
     handoffs.start();
     readings.start();
     // The timer checks each tick which projects follow GitHub, so one enrolled while the server runs is picked up too.
@@ -1591,6 +1598,7 @@ export function createApp(config: Config, key: Buffer) {
     goals.close();
     routines.close();
     missions.close();
+    intake?.close();
     repositoryBriefings?.close();
     repositoryGraphs?.close();
     void understandingRuntime.close();
@@ -1605,6 +1613,6 @@ export function createApp(config: Config, key: Buffer) {
   const closeTerminals = connectTerminals(server, manager, authenticate, missionManagedSession);
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { routines.close(); live.close(); handoffs.close(); missions.close(); readings.stop(); goals.close(); teams.close(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  const closeConnections = () => { routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); readings.stop(); goals.close(); teams.close(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
   return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

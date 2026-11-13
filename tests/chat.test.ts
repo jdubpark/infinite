@@ -262,7 +262,8 @@ test("a drain that hangs is stopped at its limit and the session still closes", 
   const folder = mkdtempSync(join(tmpdir(), "inf-drain-"));
   try {
     const pidFile = join(folder, "drain.pid");
-    const profile = sudoStandIns(folder, `echo $$ > '${pidFile}'\nexec sleep 60`, false);
+    // The stand-ins exec, so the sleeping drain's parent is the worker that started it.
+    const profile = sudoStandIns(folder, `echo "$$ $PPID" > '${pidFile}'\nexec sleep 60`, false);
     const host = await startHost({ config: { attention }, agents: { demo: profile } });
     try {
       const id = randomUUID();
@@ -279,11 +280,12 @@ test("a drain that hangs is stopped at its limit and the session still closes", 
       assert.ok(coverage.seq > exited.seq, "the coverage record follows the exit record");
       const waited = Date.parse(coverage.at) - Date.parse(exited.at);
       assert.ok(waited >= 9000 && waited < 14000, `the drain ran to its 10 second limit, not ${waited} ms`);
-      // The worker's exit is observed through the session status: the coverage record closes the watch before it exits.
-      await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.status === "exited", 5000);
-      const pid = Number(readFileSync(pidFile, "utf8"));
-      const alive = await waitFor(async () => { try { process.kill(pid, 0); return true; } catch { return false; } }, (running) => !running, 2000);
-      assert.equal(alive, false, "the sleeping drain process is gone");
+      const [pid, workerPid] = readFileSync(pidFile, "utf8").trim().split(" ").map(Number);
+      assert.equal(Number.isSafeInteger(workerPid) && workerPid > 1, true, "the drain recorded the worker that started it");
+      const gone = (target: number, limit: number) => waitFor(async () => { try { process.kill(target, 0); return true; } catch { return false; } }, (running) => !running, limit);
+      assert.equal(await gone(pid, 2000), false, "the sleeping drain process is gone");
+      // The worker process itself ends within its exit timer once the coverage record is written.
+      assert.equal(await gone(workerPid, 5000), false, "the worker process ended after the drain window");
     } finally {
       await host.stop();
     }

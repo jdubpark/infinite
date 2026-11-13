@@ -370,6 +370,14 @@ test("scouts report completion", () => {
   }
 });
 
+test("an unknown flag is ignored", () => {
+  // A later slice adds flags, and a newer host can write rows that an older one reads after a rollback.
+  const cell = only(buildCells([row({ flags: ["gap", "scan-gap"] as unknown as Flag[] })], query({ by: [] })));
+  assert.equal(cell.flagged.gap, 1);
+  assert.deepEqual(Object.keys(cell.flagged).sort(), ["backfilled", "empty-result", "gap", "same-model-review"]);
+  for (const value of Object.values(cell.flagged)) assert.ok(Number.isFinite(value), JSON.stringify(cell.flagged));
+});
+
 test("enough needs ten counted rows", () => {
   const open = (count: number) => Array.from({ length: count }, () => row({ disposition: "open" }));
   const counted = (count: number) => Array.from({ length: count }, () => row());

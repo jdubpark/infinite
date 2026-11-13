@@ -15,12 +15,16 @@ export type ModelRow = {
 export type Suggestion = { text: string; profileId: string; comparedTo: string; role: string; n: [number, number] };
 export type Scorecard = { rubricVersion: 1; minAttempts: number; sources: Source[]; rows: ModelRow[]; suggestions: Suggestion[] };
 
+/** The identity that the configured lineup gives a profile id now. Undefined when the lineup does not have the id. */
+export type ProfileIdentityOf = (profileId: string) => { provider: string; model: string; effort: string | null } | undefined;
+
 type Group = { profileId: string; provider: string; epoch: number; identity: string; newest: number; rows: OutcomeRow[] };
 
-/** Newest rowTime first, then the higher epoch, then the smaller identity string. */
+const identityOf = (provider: string, model: string, effort: string | null) => JSON.stringify([provider, model, effort ?? "none"]);
+
+/** Between identities of an id that the lineup no longer has: the newest rowTime, then the smaller identity string. */
 function preferred(candidate: Group, current: Group): boolean {
   if (candidate.newest !== current.newest) return candidate.newest > current.newest;
-  if (candidate.epoch !== current.epoch) return candidate.epoch > current.epoch;
   return candidate.identity < current.identity;
 }
 
@@ -84,21 +88,41 @@ function suggestionsOf(rows: readonly SuggestableRow[], role: string): Suggestio
 }
 
 /** One row per profile id, from production rows of one role. Reads the display use of each row. */
-export function scorecardFromRows(rows: readonly OutcomeRow[], options: { role: string; label: (profileId: string) => string | undefined; cost?: CostLookup; minAttempts?: number }): Scorecard {
+export function scorecardFromRows(rows: readonly OutcomeRow[], options: { role: string; label: (profileId: string) => string | undefined; identity?: ProfileIdentityOf; cost?: CostLookup; minAttempts?: number }): Scorecard {
   const minAttempts = options.minAttempts ?? MIN_COUNTED_ROWS;
   const groups = new Map<string, Group>();
   for (const row of rows) {
     if (row.source !== "production" || row.role !== options.role) continue;
     if (row.profileId === "default" || row.profileId === "unknown") continue;
-    const identity = JSON.stringify([row.provider, row.model, row.effort ?? "none"]);
+    const identity = identityOf(row.provider, row.model, row.effort);
     const key = JSON.stringify([row.profileId, identity, row.profileEpoch]);
     const group = groups.get(key) ?? { profileId: row.profileId, provider: row.provider, epoch: row.profileEpoch, identity, newest: -Infinity, rows: [] };
     group.rows.push(row);
     group.newest = Math.max(group.newest, timeOf(row));
     groups.set(key, group);
   }
-  const chosen = new Map<string, Group>();
+  // Within one identity the higher epoch is always the newer one: an attempt keeps the epoch it started in, so an
+  // attempt from before an advance can end after it, and its end time must not bring the retired epoch back.
+  const candidates = new Map<string, Group>();
   for (const group of groups.values()) {
+    const key = JSON.stringify([group.profileId, group.identity]);
+    const current = candidates.get(key);
+    if (!current || group.epoch > current.epoch) candidates.set(key, group);
+  }
+  // The configured lineup says which identity an id names now. A goal or a mission pins its lineup, so two
+  // identities behind one id can both keep ending attempts, and end times cannot choose between them.
+  const chosen = new Map<string, Group>();
+  const configured = new Map<string, string | undefined>();
+  for (const group of candidates.values()) {
+    if (!configured.has(group.profileId)) {
+      const named = options.identity?.(group.profileId);
+      configured.set(group.profileId, named ? identityOf(named.provider, named.model, named.effort) : undefined);
+    }
+    const wanted = configured.get(group.profileId);
+    if (wanted !== undefined) {
+      if (group.identity === wanted) chosen.set(group.profileId, group);
+      continue;
+    }
     const current = chosen.get(group.profileId);
     if (!current || preferred(group, current)) chosen.set(group.profileId, group);
   }

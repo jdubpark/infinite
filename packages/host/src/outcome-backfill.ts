@@ -218,6 +218,22 @@ export function backfillTick(store: EvidenceStore, runs: () => TeamRun[], option
   }
 }
 
+/**
+ * The driver the server calls. Its first call writes EVERY pending run, so a reader of the rows never sees a part
+ * of the history as if it were all of it. Later calls write at most `limit` settled runs, for a run whose write
+ * failed. Once a call reports nothing remaining, the driver does nothing for the life of the process.
+ */
+export function outcomeBackfill(store: EvidenceStore, runs: () => TeamRun[], options: { mapOf: (projectId: string) => FeatureMap | undefined; limit?: number; now: () => string }): () => void {
+  let done = false;
+  let first = true;
+  return () => {
+    if (done) return;
+    const tick = backfillTick(store, runs, first ? { ...options, limit: Number.MAX_SAFE_INTEGER } : options);
+    first = false;
+    if (tick.remaining === 0) done = true;
+  };
+}
+
 function ready(store: EvidenceStore): boolean {
   const status = store.status();
   return status.state === "ready" && status.modules[OUTCOMES_MODULE] === "ready" && status.modules[CONFIGURATIONS_MODULE] === "ready";

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { wilsonInterval } from "../packages/host/src/scorecard.js";
-import { scorecardFromRows } from "../packages/host/src/scorecard.js";
+import { scorecardFromRows, type ProfileIdentityOf } from "../packages/host/src/scorecard.js";
 import type { CostLookup, SessionCost } from "../packages/host/src/outcome-cells.js";
 import type { OutcomePayload, OutcomeRow } from "../packages/host/src/outcome-store.js";
 import { exclusionOf, type Disposition, type Flag, type Level } from "../packages/host/src/outcome-rules.js";
@@ -99,7 +99,7 @@ function stalledRow(overrides: Partial<Omit<OutcomeRow, "payload">> & { payload?
 
 const label = () => undefined;
 
-function scorecardOf(rows: OutcomeRow[], options: { cost?: CostLookup; minAttempts?: number; role?: string } = {}) {
+function scorecardOf(rows: OutcomeRow[], options: { cost?: CostLookup; minAttempts?: number; role?: string; identity?: ProfileIdentityOf } = {}) {
   return scorecardFromRows(rows, { role: options.role ?? "implementer", label, ...options });
 }
 
@@ -201,12 +201,29 @@ test("one row per profile id, newest epoch only", () => {
   const card = scorecardOf([...oldEpoch, ...newEpoch]);
   assert.equal(card.rows.length, 1);
   assert.equal(card.rows[0]!.attempts, 2);
+  // An attempt keeps the epoch it started in. One that started before the advance and ends after every newer
+  // attempt must not bring the retired epoch back.
+  const late = integratedRow({ profileId: "fast", profileEpoch: 1, endedAt: "2026-11-12T00:00:00.000Z" });
+  const afterLate = scorecardOf([...oldEpoch, ...newEpoch, late]);
+  assert.equal(afterLate.rows.length, 1);
+  assert.equal(afterLate.rows[0]!.attempts, 2, "the higher epoch of one identity always wins");
 
   const modelA = [1, 2].map(() => integratedRow({ profileId: "fast", model: "model-a", endedAt: "2026-11-01T00:00:00.000Z" }));
   const modelB = [integratedRow({ profileId: "fast", model: "model-b", endedAt: "2026-11-05T00:00:00.000Z" })];
-  const switched = scorecardOf([...modelA, ...modelB]);
-  assert.equal(switched.rows.length, 1);
-  assert.equal(switched.rows[0]!.attempts, 1, "The model that ran later is the only one counted");
+  const lateA = integratedRow({ profileId: "fast", model: "model-a", endedAt: "2026-11-09T00:00:00.000Z" });
+  const lineup = (model: string): ProfileIdentityOf => profileId => (profileId === "fast" ? { provider: "claude", model, effort: null } : undefined);
+
+  // The configured lineup says which identity the id names now. A pinned older lineup can keep ending attempts.
+  const configured = scorecardOf([...modelA, ...modelB, lateA], { identity: lineup("model-b") });
+  assert.equal(configured.rows.length, 1);
+  assert.equal(configured.rows[0]!.attempts, 1, "only the configured model's rows count");
+  // The lineup names a model that has no row yet: the profile's row has not started.
+  assert.deepEqual(scorecardOf([...modelA, ...modelB], { identity: lineup("model-c") }).rows, []);
+  // The id is not in the lineup any more: the identity that ended last stands.
+  const retired = scorecardOf([...modelA, ...modelB], { identity: () => undefined });
+  assert.equal(retired.rows.length, 1);
+  assert.equal(retired.rows[0]!.attempts, 1, "The model that ran later is the only one counted");
+  assert.equal(scorecardOf([...modelA, ...modelB, lateA], { identity: () => undefined }).rows[0]!.attempts, 3);
 });
 
 test("profiles with nothing counted are left out", () => {

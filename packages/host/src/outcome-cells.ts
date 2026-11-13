@@ -163,7 +163,8 @@ function summarize(key: Record<string, string>, rows: readonly OutcomeRow[], que
     else if (use.kind === "withheld") withheld[use.reason]++;
     else {
       counted.push({ row, levels: use.levels, completed: use.completed });
-      for (const flag of row.flags) flagged[flag]++;
+      // A row can carry a flag this code does not know. It is ignored, and never makes a count NaN.
+      for (const flag of row.flags) if (Object.hasOwn(flagged, flag)) flagged[flag]++;
     }
   }
 

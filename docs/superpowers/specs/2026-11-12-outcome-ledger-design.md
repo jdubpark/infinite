@@ -90,7 +90,7 @@ Another design may add event kinds under its own prefix and register a projector
 | `delivery.recorded` | `consume` (delivery reports) | `merge` or `pull-request`, head, merge commit |
 | `rating.recorded` | `rateTask` | task, score |
 | `run.blocked` | `block` | block code, source member |
-| `run.revision-advanced` | `steer`, `action`, `continueRun`, `startAutomaticRecovery`, `resumeVerificationRecovery`, `consume` (moved base) | cause, base commit changed |
+| `run.revision-advanced` | `steer`, `action`, `continueRun`, `startAutomaticRecovery`, `resumeVerificationRecovery`, `consume` (moved base) | cause, base commit changed, recovery source |
 | `run.settled` | `save`, `retire` | status, run summary counts |
 | `run.deleted` | `deleteRecord` | |
 | `ledger.gap` | `flushOutbox`, after a stored flush | dropped count |

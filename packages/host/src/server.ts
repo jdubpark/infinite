@@ -32,6 +32,9 @@ import { EvidenceStore, evidenceDatabasePath } from "./evidence/store.js";
 import { EventOutbox } from "./evidence/outbox.js";
 import { EvidenceError } from "./evidence/types.js";
 import { advanceEpoch, configurationModule, configurationProjector, EpochRequestConflict } from "./configuration-store.js";
+import { backfillTick } from "./outcome-backfill.js";
+import { outcomeProjector } from "./outcome-projector.js";
+import { OUTCOMES_MODULE, outcomeModule, runOutcomeView, sweepExpiredOutcomes } from "./outcome-store.js";
 import { profileKeyOf } from "./config-identity.js";
 import { lineupProfiles } from "./team-types.js";
 import { usagePlanSchema } from "./usage-api.js";
@@ -184,6 +187,8 @@ export function createApp(config: Config, key: Buffer) {
   // The module registers before its projector, which reads its tables.
   evidence.register(configurationModule());
   outbox.registerProjector(configurationProjector());
+  evidence.register(outcomeModule());
+  outbox.registerProjector(outcomeProjector(evidence));
   const teams = new TeamService(config, key, manager, startInProject, linear, readings, {
     source: projectSource,
     graphs: repositoryGraphs,
@@ -198,6 +203,20 @@ export function createApp(config: Config, key: Buffer) {
     },
   });
   teams.useEvidence(evidence);
+  // The one-time outcome backfill. Its first tick runs here, before any timer can fire, so no member event of a run
+  // that predates emission is projected before that run's rows. (The constructor above can already have emitted a
+  // `run.blocked` for a record that the restart blocked; it makes only a summary, which the backfill completes.)
+  // The tick then runs after each outbox pass until no run is left.
+  let outcomeBackfillDone = false;
+  const backfillOutcomes = () => {
+    if (outcomeBackfillDone) return;
+    const tick = backfillTick(evidence, () => teams.understandingRecords(), {
+      mapOf: projectId => config.projects.find(project => project.id === projectId)?.team?.features,
+      now: () => new Date().toISOString(),
+    });
+    if (tick.remaining === 0) outcomeBackfillDone = true;
+  };
+  backfillOutcomes();
   const usage = new UsageService(config, key, manager);
   const balances = new BalanceService(config.usage?.accounts ?? {});
   usage.useBalances(balances);
@@ -209,7 +228,10 @@ export function createApp(config: Config, key: Buffer) {
   const missions = new MissionService(config, key, manager, teams, projectGroups);
   ownerServices.missions = missions;
   // A run is live while its sealed record file exists, so a record that failed to load keeps its evidence.
-  const sweepEvidence = () => evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
+  const sweepEvidence = () => {
+    evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
+    sweepExpiredOutcomes(evidence, new Date().toISOString());
+  };
   let evidenceSweep: NodeJS.Timeout | undefined;
   // A projector that fell behind catches up without waiting for the next event. Each pass is bounded.
   const advanceOutbox = () => {
@@ -217,6 +239,7 @@ export function createApp(config: Config, key: Buffer) {
       const result = outbox.advance();
       if (!result.pending || result.blocked.length > 0) break;
     }
+    backfillOutcomes();
   };
   let outboxTimer: NodeJS.Timeout | undefined;
   const closeEvidence = () => { clearInterval(evidenceSweep); clearInterval(outboxTimer); evidence.close(); };
@@ -635,6 +658,21 @@ export function createApp(config: Config, key: Buffer) {
     return void res.json({ accounts: usage.summary().accounts });
   });
   app.post("/api/usage/balances/refresh", requireRole(["owner"]), async (_req, res) => { await balances.refresh(true); return res.json({ accounts: usage.summary().accounts }); });
+  // The outcome rows of one run, also after the run record is removed. Every paired device may read them, as it may read usage models.
+  app.get("/api/outcomes/runs/:runId", (req, res) => {
+    const runId = id.parse(req.params.runId);
+    try {
+      if (evidence.status().modules[OUTCOMES_MODULE] !== "ready") throw new EvidenceError("unavailable", "The evidence store is unavailable.");
+      const view = runOutcomeView(evidence, runId);
+      if (view === undefined) return void res.status(404).json({ code: "outcomes-not-found", error: "No outcome rows exist for this run." });
+      // Blind indexes are store internals. The opened payload already names the project, the task, and the area.
+      const served = (row: object) => Object.fromEntries(Object.entries(row).filter(([name]) => !["projectRef", "taskRef", "areaRef"].includes(name)));
+      return void res.json({ ...(view.summary ? { summary: served(view.summary) } : {}), rows: view.rows.map(served), members: view.members.map(served) });
+    } catch (error) {
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
+  });
   // Advances one profile's epoch. The profile ID names one identity across the whole lineup.
   app.post("/api/outcomes/epochs", requireRole(["owner"]), (req, res) => {
     const body = z.object({ profileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/), requestId: z.uuid() }).strict().parse(req.body);

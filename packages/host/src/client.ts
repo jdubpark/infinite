@@ -486,7 +486,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
 
 const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "evidence", "resources", "close", "sync", "pull", "team", "repo", "routine"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
-const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role", "--profile"]);
+const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role", "--profile", "--run"]);
 const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs"]);
 
 /**
@@ -788,9 +788,35 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       return true;
     }
     if (command === "usage" && positional[0] === "outcomes") {
+      const runId = options["--run"];
+      if (positional.length === 1 && typeof runId === "string" && runId) {
+        type Level = 0 | 1 | null;
+        type OutcomeView = {
+          rows: { memberId: string; role: string; profileId: string; disposition: string; integrated: Level; accepted: Level; firstPass: Level; held: Level }[];
+          members: { memberId: string; role: string; profileId: string; disposition: string }[];
+        };
+        const level = (value: Level) => value === 1 ? "yes" : value === 0 ? "no" : "unknown";
+        let view: OutcomeView;
+        try {
+          view = await api.json<OutcomeView>(`/outcomes/runs/${encodeURIComponent(runId)}`);
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 404) throw new Error(`No outcome rows exist for run \"${clean(runId)}\".`);
+          if (error instanceof HttpError && error.status === 503) throw new Error("The evidence store is unavailable.");
+          throw error;
+        }
+        if (options["--json"]) console.log(JSON.stringify(view, null, 2));
+        else if (view.rows.length === 0 && view.members.length === 0) console.log("No outcome rows exist for this run.");
+        else {
+          for (const row of view.rows)
+            console.log(`${clean(row.memberId)} ${clean(row.role)} ${clean(row.profileId)} ${clean(row.disposition)} integrated=${level(row.integrated)} accepted=${level(row.accepted)} firstPass=${level(row.firstPass)} held=${level(row.held)}`);
+          for (const member of view.members)
+            console.log(`${clean(member.memberId)} ${clean(member.role)} ${clean(member.profileId)} ${clean(member.disposition)}`);
+        }
+        return true;
+      }
       const profileId = options["--profile"];
       if (positional.length !== 2 || positional[1] !== "new-epoch" || typeof profileId !== "string" || !profileId)
-        throw new Error("Usage: infinite usage outcomes new-epoch --profile ID [--json]");
+        throw new Error("Usage: infinite usage outcomes --run ID [--json] | infinite usage outcomes new-epoch --profile ID [--json]");
       type Epoch = { profileId: string; provider: string; model: string | null; effort: string | null; epoch: number; since: string; repeated: boolean };
       let result: Epoch;
       try {

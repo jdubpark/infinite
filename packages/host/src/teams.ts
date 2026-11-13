@@ -4281,10 +4281,12 @@ export class TeamService {
           this.repair(stored, report.summary, "review");
         }
         else run.status = "reviewing";
+        // The identity of an enrichment is fixed here, at completion: the run may have moved on when the read ends.
+        const reviewed = { revision: member.revision, memberId: member.memberId, headCommit: member.baseCommit };
         this.enrich(stored, async signal => {
-          const tree = await this.readTree(run, member.baseCommit, signal);
-          return tree === undefined ? undefined : () => this.emitWith(stored, "review.tree", [member.revision, member.memberId],
-            { memberId: member.memberId, revision: member.revision }, () => ({ headCommit: member.baseCommit, tree }));
+          const tree = await this.readTree(run, reviewed.headCommit, signal);
+          return tree === undefined ? undefined : () => this.emitWith(stored, "review.tree", [reviewed.revision, reviewed.memberId],
+            { memberId: reviewed.memberId, revision: reviewed.revision }, () => ({ headCommit: reviewed.headCommit, tree }));
         });
       }, member); return;
     }
@@ -4325,12 +4327,14 @@ export class TeamService {
         this.emitWith(stored, "repair.integrated", [member.revision, run.round], { memberId: member.memberId, revision: member.revision }, () => ({
           round: run.round, commit, headCommit: head, baseCommit: run.baseCommit,
         }));
+        // The identity of an enrichment is fixed here, at completion: a later round may have started when the read ends.
+        const repaired = { revision: member.revision, memberId: member.memberId, round: run.round, base: member.baseCommit, workspace: run.workspace };
         if (commit) this.enrich(stored, async signal => {
-          const result = await teamCommand({ command: "git", args: teamGitArgs(run.workspace, ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", member.baseCommit, commit, "--"]) },
-            run.workspace, signal, 30000, this.config.teams?.commandPrefix).catch(() => undefined);
+          const result = await teamCommand({ command: "git", args: teamGitArgs(repaired.workspace, ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", repaired.base, commit, "--"]) },
+            repaired.workspace, signal, 30000, this.config.teams?.commandPrefix).catch(() => undefined);
           const list = result && result.exitCode === 0 && !result.interrupted ? changedPathList(result.stdout) : undefined;
-          return () => this.emitWith(stored, "repair.paths", [member.revision, run.round], { memberId: member.memberId, revision: member.revision }, () => ({
-            round: run.round, commit, ...(list && !list.truncated ? pathField(list.paths) : { pathsOmitted: true }),
+          return () => this.emitWith(stored, "repair.paths", [repaired.revision, repaired.round], { memberId: repaired.memberId, revision: repaired.revision }, () => ({
+            round: repaired.round, commit, ...(list && !list.truncated ? pathField(list.paths) : { pathsOmitted: true }),
           }));
         });
       }

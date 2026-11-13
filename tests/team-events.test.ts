@@ -1468,6 +1468,45 @@ process.exit(result.status ?? 1);`;
   } finally { store.close(); f.close(); }
 });
 
+test("a path read that ends after the next round starts keeps its own round", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    // Delays only the ledger's read: a name-only diff between two commits. Member capture diffs against a tree.
+    const delay = `const { spawnSync } = require("node:child_process");
+const [command, ...args] = process.argv.slice(2);
+const isCommit = value => value !== undefined && spawnSync("git", ["cat-file", "-t", value], { cwd: process.cwd(), encoding: "utf8" }).stdout.trim() === "commit";
+if (command === "git" && args.includes("--name-only") && args.length >= 4 && isCommit(args[args.length - 3]) && isCommit(args[args.length - 2])) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+const result = spawnSync(command, args, { cwd: process.cwd(), stdio: "inherit" });
+process.exit(result.status ?? 1);`;
+    const memberId = randomUUID(), cwd = await memberClone(f, memberId);
+    writeFileSync(join(cwd, "fix.txt"), "fixed\n");
+    f.run.headCommit = f.run.baseCommit;
+    f.run.round = 1;
+    f.run.tasks = [];
+    const member = { ...f.run.members[0]!, memberId, role: "integrator" as const, cwd, status: "reported" as const,
+      report: { kind: "result" as const, summary: "Fixed the file" } };
+    f.run.members = [member];
+    f.config.teams!.commandPrefix = { command: process.execPath, args: ["-e", delay, "unused"] };
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    scheduler.consume(stored, member);
+    await waitFor(() => eventsOfKind(store, f.run.id, "repair.integrated").length > 0 && !stored.pending, "the integration completes first");
+    assert.equal(eventsOfKind(store, f.run.id, "repair.paths").length, 0, "the path read is still running");
+    // The next repair round starts while the read of round 1 is still running.
+    stored.run.round = 2;
+    await waitFor(() => eventsOfKind(store, f.run.id, "repair.paths").length > 0, "the paths are recorded");
+    const [integrated] = eventsOfKind(store, f.run.id, "repair.integrated");
+    const [paths] = eventsOfKind(store, f.run.id, "repair.paths");
+    assert.equal(paths.data.round, 1, "the paths belong to the round whose commit they describe");
+    assert.equal(paths.key.endsWith(`:${member.revision}:1`), true, "the key names round 1");
+    assert.equal(paths.data.commit, integrated.data.commit);
+    assert.deepEqual(paths.data.paths, ["fix.txt"]);
+  } finally { store.close(); f.close(); }
+});
+
 test("a service without the ledger runs no ledger read", async () => {
   const logDir = mkdtempSync(join(tmpdir(), "inf-ledger-log-"));
   const log = join(logDir, "commands.log");

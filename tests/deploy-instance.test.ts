@@ -8,7 +8,8 @@ import { tmpdir } from "node:os";
 const renderer = resolve("scripts/render-instance.mjs");
 const temporaryDirectories: string[] = [];
 const templateFiles = ["agent-anchor.sh", "agent-env.sh", "agent-wrapper.sh", "config.example.json", "github-app-gh.sh",
-  "infinite-github-refresh.service", "infinite-github-refresh.timer", "infinite.service", "infinite.sudoers", "infinite-tmpfiles.conf", "install-agent-env.sh"];
+  "infinite-github-refresh.service", "infinite-github-refresh.timer", "infinite.service", "infinite.sudoers", "infinite-tmpfiles.conf", "install-agent-env.sh",
+  "transcript-drain.sh"];
 
 function tmp() {
   const path = mkdtempSync(join(tmpdir(), "infinite-instance-"));
@@ -49,7 +50,8 @@ test("no rendered file for an instance names the first instance", () => {
     /\/etc\/infinite\//, /\/run\/infinite(\/|-key)/, /\/usr\/local\/libexec\/infinite(\/|\s|"|$)/m, /\/opt\/infinite(\/|\s|"|$)/m, /\/opt\/infinite-agents/, /\/etc\/infinite-github/];
   const files = rendered(["--instance", "work"]);
   assert.deepEqual(files.map(([name]) => name).sort(), ["agent-anchor.sh", "agent-env.sh", "agent-wrapper.sh", "config.example.json", "github-app-gh.sh",
-    "infinite-work-github-refresh.service", "infinite-work-github-refresh.timer", "infinite-work.service", "infinite-work.sudoers", "infinite-work-tmpfiles.conf", "install-agent-env.sh"].sort());
+    "infinite-work-github-refresh.service", "infinite-work-github-refresh.timer", "infinite-work.service", "infinite-work.sudoers", "infinite-work-tmpfiles.conf", "install-agent-env.sh",
+    "transcript-drain.sh"].sort());
   for (const [name, text] of files)
     for (const pattern of first) assert.doesNotMatch(text, pattern, `${name} ${pattern}`);
 });
@@ -66,6 +68,38 @@ test("the instance unit has weights and an OOM preference and no ceiling", () =>
 test("both sudoers files keep the mission assignment", () => {
   assert.match(readFileSync("deploy/ubuntu/infinite.sudoers", "utf8"), /env_keep \+= "[^"]*INFINITE_MISSION_ASSIGNMENT/);
   assert.match(file("infinite-work.sudoers"), /^Defaults:infinite-work-host env_keep \+= "[^"]*INFINITE_MISSION_ASSIGNMENT/m);
+});
+
+test("the instance drain wrapper runs the instance's relay, and the instance sudoers permits it and neither jevcode nor repository-graph", () => {
+  const out = render(["--instance", "work"]);
+  assert.match(readFileSync(join(out, "transcript-drain.sh"), "utf8"),
+    /^exec \/usr\/local\/bin\/node \/opt\/infinite-work\/packages\/host\/dist\/hook-relay\.js drain$/m);
+  const sudoers = readFileSync(join(out, "infinite-work.sudoers"), "utf8");
+  assert.match(sudoers, /^infinite-work-host ALL=\(infinite-work-agent\) NOPASSWD: \/usr\/local\/libexec\/infinite-work\/transcript-drain ""$/m);
+  assert.match(sudoers, /NOPASSWD: \/usr\/local\/libexec\/infinite-work\/claude \*, /);
+  assert.doesNotMatch(sudoers, /jevcode|repository-graph/);
+});
+
+test("every tracked deploy file that names a first-instance path is rendered for an instance or kept for the first instance only", () => {
+  const firstInstanceOnly = new Map([
+    ["README.md", "the first instance's install guide; a second instance follows instances.md"],
+    ["backup.py", "the machine's one backup job, which reads the whole data volume"],
+    ["backups.md", "documents that one backup job"],
+    ["infinite-backup.service", "runs that one backup job"],
+    ["commissioning.md", "the record of commissioning the machine and its first instance"],
+    ["github-app.md", "the first instance's GitHub App setup; instances.md gives an instance's own"],
+    ["public-relay.md", "the relay and the first instance's connection to it; instances.md registers an instance"],
+    ["instances.md", "names first-instance paths to tell them apart from an instance's"],
+    ["jevcode-wrapper.sh", "repository briefings, which an instance runs without until an instance wrapper exists"],
+    ["repository-graph-wrapper.py", "the code graph, which an instance runs without until an instance wrapper exists"],
+  ]);
+  const firstPath = /\/opt\/infinite\/|\/opt\/infinite-agents|\/srv\/infinite-data|\/usr\/local\/libexec\/infinite\//;
+  const tracked = execFileSync("git", ["ls-files", "deploy/ubuntu"], { encoding: "utf8" }).split("\n").filter(Boolean)
+    .map(path => path.slice("deploy/ubuntu/".length));
+  for (const name of firstInstanceOnly.keys()) assert.ok(tracked.includes(name), `${name} is listed but not tracked`);
+  const templated = new Set(readdirSync(render()));
+  const unlisted = tracked.filter(name => firstPath.test(readFileSync(join("deploy/ubuntu", name), "utf8")) && !templated.has(name) && !firstInstanceOnly.has(name));
+  assert.deepEqual(unlisted, []);
 });
 
 test("every wrapper path derives from the instance name", () => {
@@ -97,7 +131,7 @@ test("valid names that overlap template words are substituted only once", async 
 
 test("rendered shell files parse", () => {
   const out = render(["--instance", "work"]);
-  for (const name of ["agent-wrapper.sh", "github-app-gh.sh", "install-agent-env.sh"])
+  for (const name of ["agent-wrapper.sh", "github-app-gh.sh", "install-agent-env.sh", "transcript-drain.sh"])
     execFileSync("sh", ["-n", join(out, name)]);
 });
 

@@ -174,6 +174,16 @@ run the rendered `install-agent-env.sh` so the instance-specific environment
 loader is installed. Install `github-app-gh.sh` as
 `/usr/local/libexec/infinite-NAME/bin/gh`. That location is first on the
 instance wrapper `PATH`; do not replace the shared `/usr/local/bin/gh`.
+Install the rendered `transcript-drain.sh` as
+`/usr/local/libexec/infinite-NAME/transcript-drain`, owned `root:root` with
+mode `0755`, beside the provider wrappers; it is the path the rendered sudoers
+permits, and without it the instance's sudo sessions report
+`finalDrain: "skipped"`.
+
+The rendered sudoers permits no `jevcode` or `repository-graph` wrapper,
+because the tracked ones name the first instance's paths. The instance runs
+without repository briefings and the code graph until instance wrappers for
+them exist.
 
 ```sh
 sudo install -o root -g root -m 0644 ".local/instance-$NAME/infinite-$NAME.service" \
@@ -195,6 +205,8 @@ for provider in claude codex grok opencode; do
   sudo install -o root -g root -m 0755 ".local/instance-$NAME/agent-wrapper.sh" \
     "/usr/local/libexec/infinite-$NAME/$provider"
 done
+sudo install -o root -g root -m 0755 ".local/instance-$NAME/transcript-drain.sh" \
+  "/usr/local/libexec/infinite-$NAME/transcript-drain"
 sudo sh ".local/instance-$NAME/install-agent-env.sh"
 sudo systemctl daemon-reload
 sudo systemd-tmpfiles --create "/etc/tmpfiles.d/infinite-$NAME.conf"

@@ -949,7 +949,7 @@ Outside this slice: the per-project guidance pattern list, a knowledge snapshot 
 2. Two members of one run on one base commit with one profile. Expect one `configId` and one configurations row.
 3. An epoch advanced at time T. Expect `epochAt` to give the old epoch for a time before T and the new one from T on.
 4. One owner request sent twice. Expect one new epoch.
-5. A service without `events`. Expect no `ls-tree` in a logging command prefix.
+5. A service without `events`. Expect no `diff-tree` in a logging command prefix.
 
 ### Task 1: the identity rules and the guidance read
 
@@ -976,7 +976,7 @@ export function profileIdentityKey(profile: ProfileKey): string;
 export function configId(components: ConfigComponents): string;
 /** Digest of `teamPrompt` over the fixture runs. Cached per role, provider, profile, and publishHeads. Throws when teamPrompt throws. */
 export function promptVersion(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean): string;
-/** The guidance blobs of `git ls-tree -r -z --full-tree` output, sorted by path. */
+/** The guidance entries of `git diff-tree -r -z --raw --no-abbrev` output against the empty tree, sorted by path. */
 export function parseGuidanceTree(stdout: string): { path: string; object: string }[];
 export function guidanceDigest(entries: readonly { path: string; object: string }[]): string;
 /** Best effort. Undefined on any failure. Never throws. Successes are cached per workspace and commit. */
@@ -994,7 +994,7 @@ export function memberConfiguration(input: {
 - **Profile key.** `{ provider, model: model ?? null, effort: effort ?? null }`, from `profileIdentity`. `effort` is the effort, or the variant for OpenCode. A member with no profile has `model` and `effort` null.
 - **Prompt version.** The module holds two frozen fixture runs: a single-provider run with one implementer task, and a run with a goal, a lineup, and one scout. Values are neutral placeholders: project id `example`, workspace `/home/dev/projects/infinite`, fixed UUIDs, and fixed times. For each fixture, `teamPrompt(run, role, taskOrScoutFor(role), undefined, provider, profile, { checks: [FIXTURE_CHECK] }, [], publishHeads)`. The version is the SHA-256 hex of the canonical JSON of the rendered strings, in fixture order. *(My call: it renders with the member's own profile object, so a profile-specific branch of `teamPrompt` is covered. Any wording change then changes the version, which is the point of C7 component 2.)*
 - The cache is a module `Map` keyed by role, provider, `profileIdentityKey`, the profile id, and `publishHeads`. The rendering is pure CPU work, and it runs inside the enrichment, never in `launch`.
-- **Guidance read.** `git ls-tree -r -z --full-tree <commit>` in `workspace`, through `teamCommand` and `teamGitArgs`, as `readTree` in `teams.ts` reads. Exit code 0, not interrupted, and not truncated, or the result is undefined. The parser keeps entries of type `blob` whose last path segment equals a `GUIDANCE_FILES` name, case-sensitively. A commit with no guidance file gives the digest of an empty list, which is a known state. *(My call: the default set of C7 only. The per-project pattern list needs a project configuration key and a routine-digest decision.)*
+- **Guidance read.** One bounded command in `workspace`, through `teamCommand` and `teamGitArgs`: `git diff-tree -r -z --raw --no-abbrev --no-renames <empty tree> <commit> -- ':(glob)**/AGENTS.md' ':(glob)**/CLAUDE.md'` (one glob per `GUIDANCE_FILES` name). It compares the commit with the empty tree, so every matching file of the commit is listed as added with its object id, and only the matching files are printed. *(Decided during the build: a whole-tree `git ls-tree -r` is cut at the command's 64 KiB output cap for a repository of about 700 files, and a cut listing reads as unknown, so most real repositories would have no identity. `git ls-tree` takes no glob.)* The empty tree id is `4b825dc642cb6eb9a060e54bf8d69288fbee4904`, or `6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321` when the commit id has 64 characters. With `-z` the output is pairs of records: `:000000 <mode> <zero id> <object id> A`, then the path. `parseGuidanceTree` keeps a pair whose status is `A`, whose mode is a file or a symbolic link (`100644`, `100755`, `120000`), and whose last path segment equals a `GUIDANCE_FILES` name, case-sensitively. No matching file gives the digest of an empty list. An empty guidance file and a symbolic link each count, by object id. The result is undefined when the command exits non-zero, is interrupted, or is truncated.
 - The guidance cache holds at most 64 successes and evicts the oldest. A commit's tree never changes, so a cached digest is always valid.
 - **`memberConfiguration`** reads the guidance, computes the prompt version, and returns `{ ...profile, promptVersion, guidance, knowledge: "none", routing: "off", shape: "team", configId }`. Any throw or an undefined digest gives undefined.
 
@@ -1005,10 +1005,13 @@ export function memberConfiguration(input: {
 | `a configId covers all six components` | Fixed components give a 64-hex id, equal across two calls and across two key orders of the input. A changed `profile.model`, `profile.effort`, `promptVersion`, `guidance`, `routing` cast to `"x"`, or `shape: "trial"` each gives another id. |
 | `a profile key leaves out the id and the label` | `profileIdentityKey({ provider: "claude", model: "m", effort: "high" })` is one 64-hex key. `effort: null` gives another. Two profiles with ids `a` and `b` and one identity give one key. |
 | `the prompt version is stable per role and provider` | Two calls with equal arguments are equal and 64 hex. `implementer` and `reviewer` differ. `claude` and `codex` differ. |
-| `the guidance parser keeps guidance blobs only` | NUL-separated entries `100644 blob O1\tAGENTS.md`, `100644 blob O2\tpackages/host/CLAUDE.md`, `100644 blob O3\tdocs/agents.md`, `160000 commit O4\tvendor/AGENTS.md`, and `100644 blob O5\tsrc/MY-AGENTS.md` give exactly the first two, sorted by path. |
+| `the guidance parser keeps guidance entries only` | NUL-separated pairs (`:000000 <mode> <zero id> <object id> A`, then the path) for `AGENTS.md` (`100644`, O1), `packages/host/CLAUDE.md` (`100755`, O2), `docs/agents.md` (`100644`, O3), `vendor/AGENTS.md` (`160000`, O4), `src/MY-AGENTS.md` (`100644`, O5), and `a/CLAUDE.md` (`120000`, O6) give exactly `AGENTS.md`, `a/CLAUDE.md`, and `packages/host/CLAUDE.md`, sorted by path. A pair with status `M` is left out. |
+| `a large repository still has a guidance digest` | A temporary repository with 1,500 committed files whose `git ls-tree -r` listing is over 65,536 bytes, plus `AGENTS.md`: the digest is defined and equals `guidanceDigest` of the one path with its id from `git rev-parse`. |
+| `no guidance file gives the empty-list digest` | A commit with no guidance file gives `guidanceDigest([])`. |
+| `an empty file and a symbolic link count` | A commit with an empty `AGENTS.md` and `a/CLAUDE.md` as a symbolic link gives the digest of both paths with their ids from `git rev-parse`. |
 | `the guidance digest is order-free and bound to content` | Two orders of one list give one digest. A changed object id gives another. The empty list gives a fixed 64-hex digest unlike any one-entry list. |
 | `guidance is read from a commit` | In a temporary repository with `AGENTS.md` and `a/CLAUDE.md` committed, the digest equals `guidanceDigest` of the two paths with the ids from `git rev-parse HEAD:AGENTS.md` and `HEAD:a/CLAUDE.md`. After a commit that edits `a/CLAUDE.md`, the new commit gives another digest and the first commit still gives its own. |
-| `a failed guidance read gives nothing` | An unknown commit, a command prefix that exits 1 for `ls-tree`, and an aborted signal each resolve to undefined without throwing. `memberConfiguration` then resolves to undefined. |
+| `a failed guidance read gives nothing` | An unknown commit, a command prefix that exits 1 for `diff-tree`, and an aborted signal each resolve to undefined without throwing. `memberConfiguration` then resolves to undefined. |
 
 - [ ] **Step 2: Run the tests and confirm they fail** with a missing module error.
 - [ ] **Step 3: Implement.**
@@ -1098,9 +1101,9 @@ export function advanceEpoch(store: EvidenceStore, input: { profile: ProfileKey;
 | Test name | Assertions |
 |---|---|
 | `a launched member records its configuration` (team-events) | With `mixedLineup`, the `spark-high` implementer of task `a` launches. A `member.configured` follows with its `memberId`, `taskId` `a`, revision 1, and data `provider` `opencode`, the profile's `model`, `effort` `high`, 64-hex `promptVersion` and `guidance`, `knowledge` `none`, `routing` `off`, `shape` `team`, and `configId` equal to `configId` of those components. `guidance` equals `readGuidanceDigest` at the fixture base. |
-| `a stalled guidance read does not delay the launch` (team-events) | A command prefix that sleeps 3 seconds for `ls-tree`: `member.started` is stored and the member is `running` before the 3 seconds pass. `member.configured` arrives after. |
-| `a refused guidance read records no configuration` (team-events) | A command prefix that exits 1 for `ls-tree`: `member.started` is stored, and after 500 ms there is no `member.configured`. |
-| `a service without the ledger reads no guidance` (team-events) | Without `events`, a logging command prefix shows no `ls-tree` after a launch. |
+| `a stalled guidance read does not delay the launch` (team-events) | A command prefix that sleeps 3 seconds for `diff-tree`: `member.started` is stored and the member is `running` before the 3 seconds pass. `member.configured` arrives after. |
+| `a refused guidance read records no configuration` (team-events) | A command prefix that exits 1 for `diff-tree`: `member.started` is stored, and after 500 ms there is no `member.configured`. |
+| `a service without the ledger reads no guidance` (team-events) | Without `events`, a logging command prefix shows no `diff-tree` after a launch. |
 | `every spec event kind has an emission site…` (run-event-coverage) | The existing test, now with 26 kinds and `member.configured` among them. |
 | `the owner advances a profile epoch` (outcome-routes, host) | Two posts with one request id return epoch 2, the second with `repeated: true`. A new request id returns 3. An unknown profile id returns 404. A non-owner device returns 403. |
 

@@ -63,7 +63,10 @@ export class IntakeLinear {
     return nodes.flatMap(node => { try { return [issueFacts(node)]; } catch { return []; } });
   }
 
-  /** The current state of each issue; an ID Linear no longer returns is `deleted`. A failed read throws. */
+  /**
+   * The current state of each issue. `deleted` only when Linear answered for that ID and returned no node. A node that
+   * fails `issueFacts` is left out of the map, so its issue changes nothing this cycle. A failed request throws.
+   */
   async states(issueIds: string[]): Promise<Map<string, IntakeIssue | "deleted">> {
     const result = new Map<string, IntakeIssue | "deleted">();
     for (let index = 0; index < issueIds.length; index += 100) {
@@ -72,13 +75,18 @@ export class IntakeLinear {
         `query InfiniteIntakeIssueStates($filter: IssueFilter!, $first: Int!) { issues(filter: $filter, includeArchived: true, first: $first) { nodes { ${issueFields} } } }`,
         { filter: { id: { in: chunk } }, first: chunk.length });
       const nodes = z.object({ issues: z.object({ nodes: z.array(z.unknown()).max(chunk.length) }) }).parse(data).issues.nodes;
-      const found = new Map<string, IntakeIssue>();
+      const answered = new Set<string>(), found = new Map<string, IntakeIssue>();
       for (const node of nodes) {
-        const facts = issueFacts(node);
-        if (!chunk.includes(facts.id)) throw new Error("Linear returned an issue that was not requested.");
-        found.set(facts.id, facts);
+        const id = z.object({ id: z.string() }).safeParse(node).data?.id;
+        if (id === undefined || !chunk.includes(id)) continue;
+        answered.add(id);
+        try { found.set(id, issueFacts(node)); } catch { /* left out of the map: this issue is unchanged this cycle */ }
       }
-      for (const id of chunk) result.set(id, found.get(id) ?? "deleted");
+      for (const id of chunk) {
+        const facts = found.get(id);
+        if (facts) result.set(id, facts);
+        else if (!answered.has(id)) result.set(id, "deleted");
+      }
     }
     return result;
   }

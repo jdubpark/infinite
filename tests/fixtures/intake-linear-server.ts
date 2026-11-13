@@ -26,10 +26,11 @@ export async function startIntakeLinearServer(options: { clock?: () => number } 
   const issues = new Map<string, IntakeFixtureIssue>(), comments = new Map<string, IntakeFixtureComment>();
   const calls: { operation: string; variables: Record<string, any> }[] = [];
   let loseNext = false, unavailableValue = false, count = 0;
+  const malformed = new Set<string>();
   const now = options.clock ?? (() => Date.now());
   const stamp = () => new Date(now()).toISOString();
 
-  const node = (issue: IntakeFixtureIssue) => ({
+  const node = (issue: IntakeFixtureIssue) => malformed.has(issue.id) ? { id: issue.id, unexpected: true } : ({
     id: issue.id, identifier: issue.identifier, url: issue.url, title: issue.title, description: issue.description,
     createdAt: issue.createdAt, updatedAt: issue.updatedAt, archivedAt: issue.archivedAt,
     team: { id: issue.teamId }, state: { type: issue.stateType },
@@ -107,6 +108,8 @@ export async function startIntakeLinearServer(options: { clock?: () => number } 
       if (!issue) throw new Error("Fixture has no such issue");
       Object.assign(issue, change, { updatedAt: stamp() });
     },
+    /** Returns the issue's node in a shape that intake cannot read; the issue still exists. */
+    corrupt(id: string) { malformed.add(id); },
     /** Deletes an issue; later state reads omit it. */
     remove(id: string) { issues.delete(id); },
     /** Comments on an issue, oldest first. */

@@ -2,7 +2,7 @@ import test, { mock } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { waitFor, inProcessHost } from "./helpers.js";
-import { missionHarness } from "./mission-harness.js";
+import { missionHarness, scriptedMissionHarness } from "./mission-harness.js";
 import { startIntakeLinearServer, type IntakeFixtureIssue } from "./fixtures/intake-linear-server.js";
 import { missionRequestId, type IntakeThread, type IntakeThreadReader, type SlackThreadMessage } from "../packages/host/src/intake-types.js";
 import { IntakeStore } from "../packages/host/src/intake-store.js";
@@ -10,6 +10,8 @@ import { IntakeLinear, issueFacts, parseSlackThreadLink, type IntakeIssue } from
 import { IntakeService, intakeObjective } from "../packages/host/src/intake.js";
 import { LinearService } from "../packages/host/src/linear.js";
 import type { Config } from "../packages/host/src/types.js";
+import type { MissionService } from "../packages/host/src/missions.js";
+import { TeamError } from "../packages/host/src/teams.js";
 import type { IntakeView } from "../packages/host/src/intake-types.js";
 
 const OWNER_SLACK = "U00000000", TEAMMATE_SLACK = "U22222222", AGENT_SLACK = "U11111111";
@@ -34,11 +36,13 @@ class FakeThreads implements IntakeThreadReader {
   }
 }
 
-async function setup(options: { groupId?: string; maxActive?: number; requireSlackThread?: boolean; mirror?: boolean; creator?: boolean } = {}) {
+async function setup(options: { groupId?: string; maxActive?: number; requireSlackThread?: boolean; mirror?: boolean; creator?: boolean; scripted?: boolean } = {}) {
   const linearServer = await startIntakeLinearServer();
   const threads = new FakeThreads();
+  /** While `blocked` is set, a start is refused with it, as the route's admission refuses a mid-handoff project. */
+  const control: { blocked?: Error } = {};
   let config!: Config;
-  const h = missionHarness({ configure: target => {
+  const configure = (target: Config) => {
     config = target;
     target.linear = { apiKeyFile: linearServer.apiKeyFile, endpoint: linearServer.endpoint };
     target.intake = {
@@ -49,13 +53,19 @@ async function setup(options: { groupId?: string; maxActive?: number; requireSla
       maxActive: options.maxActive ?? 3,
       requireSlackThread: options.requireSlackThread ?? true,
     };
-  } });
+  };
+  const built = options.scripted ? scriptedMissionHarness({ configure }) : missionHarness({ configure });
+  let missions: MissionService;
+  if ("open" in built) { built.open(); missions = built.services().missions; }
+  else missions = built.missions;
   const store = new IntakeStore(config, randomBytes(32));
   const enabled = Date.parse(store.enabledAt());
   const linear = new LinearService(config, randomBytes(32));
-  h.open();
-  const { missions } = h.services();
-  const service = () => new IntakeService(config, store, missions, new IntakeLinear(linear), { threads, pollMs: 3600000 });
+  const service = () => new IntakeService(config, store, missions, new IntakeLinear(linear), { threads, pollMs: 3600000,
+    create: async (request, origin) => {
+      if (control.blocked) throw control.blocked;
+      return missions.create(request, undefined, origin);
+    } });
   const intake = service();
   /** Registers a thread whose root is `offset` ms after the enable time, and returns its Slack link. */
   const addThread = (offset: number, messages: (root: string) => SlackThreadMessage[]) => {
@@ -69,14 +79,14 @@ async function setup(options: { groupId?: string; maxActive?: number; requireSla
     return linearServer.file({ createdAt: new Date(enabled + 1000).toISOString(), attachmentUrls: [thread.link], ...overrides });
   };
   return {
-    h, store, missions, threads, linear, linearServer, config, enabled, intake, service, addThread, issue,
+    h: built, scripted: built as ReturnType<typeof scriptedMissionHarness>, store, missions, threads, control, linear, linearServer, config, enabled, intake, service, addThread, issue,
     iso: (offset: number) => new Date(enabled + offset).toISOString(),
     list: () => intake.list(),
     close: async () => {
       intake.close();
       linear.close();
       await linearServer.close();
-      await h.close();
+      await built.close();
     },
   };
 }
@@ -302,7 +312,7 @@ test("removing the label after the start changes nothing", { timeout: 60000 }, a
   } finally { await ctx.close(); }
 });
 
-test("the started and outcome comments are delivered once each, even after a lost response", { timeout: 120000 }, async () => {
+test("the started and cancelled comments are delivered once each, even after a lost response", { timeout: 120000 }, async () => {
   const ctx = await setup();
   try {
     const issue = ctx.issue();
@@ -406,4 +416,124 @@ test("GET /api/intake returns no records for any role when intake is not configu
       assert.deepEqual(response.body, { records: [] });
     }
   } finally { await host.stop(); }
+});
+
+test("a start refused by the route's admission stays queued with its reason, then starts when the refusal clears", { timeout: 60000 }, async () => {
+  const ctx = await setup();
+  try {
+    const issue = ctx.issue();
+    const refusal = new TeamError(409, "handoff-in-progress", "This project is transferring a task to a team. Wait for its checkpoint to finish.");
+    ctx.control.blocked = refusal;
+    await ctx.intake.poll();
+    const refused = viewOf(ctx, issue.id)!;
+    assert.equal(refused.state, "queued");
+    assert.equal(refused.holdReason, refusal.message);
+    assert.equal(ctx.missions.list().length, 0, "No mission exists while the start is refused");
+    ctx.control.blocked = undefined;
+    await ctx.intake.poll();
+    assert.equal(viewOf(ctx, issue.id)!.state, "started");
+    assert.equal(viewOf(ctx, issue.id)!.holdReason, undefined);
+    assert.equal(ctx.missions.list().length, 1);
+  } finally { await ctx.close(); }
+});
+
+test("the started and ready-for-review comments are delivered once each, even after a lost response", { timeout: 180000 }, async () => {
+  const ctx = await setup({ scripted: true });
+  try {
+    const h = ctx.scripted;
+    const issue = ctx.issue();
+    ctx.linearServer.loseNextCommentResponse();
+    await ctx.intake.poll();
+    const id = missionRequestId(issue.id);
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [{ id: "a", repoProjectId: "api", title: "Subtask a", objective: "Do a", size: "solo", parallelism: 1, dependsOn: [] }] });
+    const teamId = (await waitFor(async () => ctx.missions.peek(id), mission => Boolean(mission?.subtasks[0]?.teamId), 60000))!.subtasks[0].teamId!;
+    h.set(teamId, { status: "ready-for-review" });
+    await h.attempt(2);
+    await h.report(2, { kind: "result", summary: "The API change is in place" });
+    await waitFor(async () => ctx.missions.peek(id)?.status, status => status === "ready-for-review", 60000);
+    await ctx.intake.poll();
+    assert.equal(viewOf(ctx, issue.id)!.comments.outcome, "delivered");
+    assert.deepEqual(ctx.linearServer.comments(issue.id).map(comment => comment.body.split("\n")[0]), [
+      "Infinite agent report: a mission started on this issue. Questions and the result will follow.",
+      "Infinite agent report: ready for review.",
+    ]);
+    assert.equal(ctx.linearServer.comments(issue.id)[1].body, "Infinite agent report: ready for review.\n\nThe API change is in place");
+  } finally { await ctx.close(); }
+});
+
+test("GET /api/intake lists a record for any role when intake is configured", { timeout: 120000 }, async () => {
+  const linearServer = await startIntakeLinearServer();
+  // Enable time is set at the first poll, which runs when the host starts, so the issue is dated just ahead of now.
+  const issue = linearServer.file({ createdAt: new Date(Date.now() + 60000).toISOString(), attachmentUrls: [] });
+  const host = await inProcessHost({ configure: config => {
+    config.linear = { apiKeyFile: linearServer.apiKeyFile, endpoint: linearServer.endpoint };
+    config.intake = {
+      linear: { teamIds: [linearServer.teamId], creatorId: linearServer.ownerId, label: "infinite", commentsMirrorToSlack: false },
+      mission: { groupId: "shop", maxSubtasks: 8, maxMinutes: 30 }, maxActive: 3, requireSlackThread: false,
+    };
+  } });
+  try {
+    const { records } = await waitFor(async () => (await host.fetchApi("/intake", "viewer")).body as { records: IntakeView[] }, body => body.records.length === 1, 60000);
+    assert.equal(records[0].issueId, issue.id);
+    assert.equal(records[0].identifier, issue.identifier);
+    // The start went through the route's admission: the project group lookup refused it, and the refusal is kept.
+    assert.equal(records[0].state, "queued");
+    assert.match(records[0].holdReason!, /project/i);
+    for (const role of ["owner", "controller"] as const) {
+      const response = await host.fetchApi("/intake", role);
+      assert.equal(response.status, 200);
+      assert.equal((response.body as { records: IntakeView[] }).records.length, 1, `${role} sees the records`);
+    }
+  } finally { await host.stop(); await linearServer.close(); }
+});
+
+test("with the thread not required, a readable thread is background for the objective", { timeout: 60000 }, async () => {
+  const ctx = await setup({ requireSlackThread: false });
+  try {
+    const thread = ctx.addThread(2000, root => [{ ts: root, user: OWNER_SLACK, text: "Background line for the export" }]);
+    const issue = ctx.linearServer.file({ createdAt: ctx.iso(1000), attachmentUrls: [thread.link] });
+    await ctx.intake.poll();
+    assert.equal(viewOf(ctx, issue.id)!.state, "started");
+    const objective = ctx.missions.peek(missionRequestId(issue.id))!.objective;
+    assert.match(objective, /Slack thread \(background\):\n\[owner\] Background line for the export/);
+  } finally { await ctx.close(); }
+});
+
+test("with the thread not required, an unreadable or failing thread admits the issue without a thread section", { timeout: 60000 }, async () => {
+  const ctx = await setup({ requireSlackThread: false });
+  try {
+    // Reads run in candidate order, so the failing read is the first issue's and the unreadable thread is the second's.
+    const failing = ctx.addThread(2000, ownerMention);
+    const failingIssue = ctx.linearServer.file({ createdAt: ctx.iso(1000), attachmentUrls: [failing.link] });
+    const unreadable = ctx.addThread(2100, ownerMention);
+    ctx.threads.unreadable.add(unreadable.root);
+    const unreadableIssue = ctx.linearServer.file({ createdAt: ctx.iso(1100), attachmentUrls: [unreadable.link] });
+    ctx.threads.failNext = 1;
+    await ctx.intake.poll();
+    for (const issue of [unreadableIssue, failingIssue]) {
+      assert.equal(viewOf(ctx, issue.id)!.state, "started", `${issue.identifier} is admitted`);
+      const objective = ctx.missions.peek(missionRequestId(issue.id))!.objective;
+      assert.equal(objective.includes("Slack thread (background):"), false, `${issue.identifier} has no thread section`);
+      assert.match(objective, /^Request filed in Linear as /);
+    }
+  } finally { await ctx.close(); }
+});
+
+test("a malformed Linear node leaves its issue unchanged, and another issue's closure still pauses", { timeout: 60000 }, async () => {
+  const ctx = await setup();
+  try {
+    const malformed = ctx.issue({}, 2000), closed = ctx.issue({}, 2100);
+    await ctx.intake.poll();
+    assert.equal(viewOf(ctx, malformed.id)!.state, "started");
+    assert.equal(viewOf(ctx, closed.id)!.state, "started");
+    ctx.linearServer.corrupt(malformed.id);
+    ctx.linearServer.edit(closed.id, { stateType: "completed" });
+    await ctx.intake.poll();
+    const untouched = ctx.store.get(malformed.id)!;
+    assert.equal(untouched.closure, undefined, "A malformed node is not read as deleted or closed");
+    assert.equal(untouched.state, "started");
+    assert.equal(ctx.missions.peek(missionRequestId(malformed.id))!.status, "planning");
+    assert.equal(ctx.missions.peek(missionRequestId(closed.id))!.status, "paused");
+    assert.equal(ctx.missions.peek(missionRequestId(closed.id))!.reason, "The Linear issue was closed.");
+  } finally { await ctx.close(); }
 });

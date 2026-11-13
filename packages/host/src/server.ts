@@ -41,7 +41,7 @@ import { MissionService, missionBoard } from "./missions.js";
 import { IntakeStore } from "./intake-store.js";
 import { IntakeLinear } from "./intake-linear.js";
 import { IntakeService } from "./intake.js";
-import { createMissionSchema, missionActionSchema, missionTextSchema } from "./mission-types.js";
+import { createMissionSchema, missionActionSchema, missionTextSchema, type CreateMission, type Mission, type MissionOrigin } from "./mission-types.js";
 import { ProjectGroupService } from "./project-groups.js";
 import { LinearService } from "./linear.js";
 import { createGoalSchema, goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema, goalParallelismSchema } from "./goal-types.js";
@@ -201,8 +201,6 @@ export function createApp(config: Config, key: Buffer) {
   const projectGroups = new ProjectGroupService(config, key, undefined, { appliedAt: id => projectSync.status(id).appliedAt });
   const missions = new MissionService(config, key, manager, teams, projectGroups);
   ownerServices.missions = missions;
-  // Intake exists only when configured; without it the intake route lists no records.
-  const intake = config.intake ? new IntakeService(config, new IntakeStore(config, key), missions, new IntakeLinear(linear)) : undefined;
   // A run is live while its sealed record file exists, so a record that failed to load keeps its evidence.
   const sweepEvidence = () => evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
   let evidenceSweep: NodeJS.Timeout | undefined;
@@ -236,6 +234,18 @@ export function createApp(config: Config, key: Buffer) {
   const assertNoHandoff = (projectId: string) => {
     if (handoffs.activeForProject(projectId)) throw new TeamError(409, "handoff-in-progress", "This project is transferring a task to a team. Wait for its checkpoint to finish.");
   };
+  // The owner's route and intake start missions through this one admission.
+  const createMission = async (body: CreateMission, origin?: MissionOrigin): Promise<Mission> => {
+    // A retry returns the recorded mission even if the group or a handoff changed since it was admitted.
+    const recorded = missions.replayCreate(body);
+    if (recorded) return recorded;
+    const group = projectGroups.get(body.groupId);
+    for (const repo of group.repos)
+      for (const checkout of repo.checkouts) assertNoHandoff(checkout.projectId);
+    return missions.create({ ...body, groupId: group.id }, body, origin);
+  };
+  // Intake exists only when configured; without it the intake route lists no records.
+  const intake = config.intake ? new IntakeService(config, new IntakeStore(config, key), missions, new IntakeLinear(linear), { create: createMission }) : undefined;
   const resumable = (session: { status: string; provider: string; workspace?: unknown; team?: unknown; nativeSession?: unknown; resumeNativeSession?: unknown }) =>
     session.status === "exited" && !session.workspace && !session.team && Boolean(session.nativeSession ?? session.resumeNativeSession) && ["claude", "codex", "opencode"].includes(session.provider);
   // Native records written before executionLocation existed carry only the hybrid workspace.
@@ -760,17 +770,7 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/missions", (_req, res) => res.json({ missions: missions.list() }));
   app.get("/api/missions/:id", (req, res) => res.json(missions.get(id.parse(req.params.id))));
   app.get("/api/intake", (_req, res) => res.json({ records: intake?.list() ?? [] }));
-  app.post("/api/missions", requireRole(["owner"]), async (req, res) => {
-    const body = createMissionSchema.parse(req.body);
-    // A retry returns the recorded mission even if the group or a handoff changed since it was admitted.
-    const recorded = missions.replayCreate(body);
-    if (recorded) return res.json(recorded);
-    const group = projectGroups.get(body.groupId);
-    const resolvedBody = { ...body, groupId: group.id };
-    for (const repo of group.repos)
-      for (const checkout of repo.checkouts) assertNoHandoff(checkout.projectId);
-    return res.json(await missions.create(resolvedBody, body));
-  });
+  app.post("/api/missions", requireRole(["owner"]), async (req, res) => res.json(await createMission(createMissionSchema.parse(req.body))));
   // Mission controls and answers are owner-only, so every recorded mission answer is the owner's.
   app.post("/api/missions/:id/steer", requireRole(["owner"]), async (req, res) => res.json(await missions.steer(id.parse(req.params.id), missionTextSchema.parse(req.body))));
   app.post("/api/missions/:id/answer/:decisionId", requireRole(["owner"]), async (req, res) =>

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { sharedText } from "./linear.js";
 import { IntakeLinear, type IntakeIssue } from "./intake-linear.js";
-import { deterministicUuid, missionRequestId, type IntakeRecord, type IntakeSkipReason, type IntakeThreadReader, type IntakeView, type SlackThreadMessage } from "./intake-types.js";
+import { deterministicUuid, missionRequestId, type IntakeRecord, type IntakeSkipReason, type IntakeThread, type IntakeThreadReader, type IntakeView, type SlackThreadMessage } from "./intake-types.js";
 import type { IntakeStore } from "./intake-store.js";
 import type { MissionService } from "./missions.js";
 import { TeamError } from "./teams.js";
@@ -85,7 +85,7 @@ export class IntakeService {
     private readonly store: IntakeStore,
     private readonly missions: MissionService,
     private readonly linear: IntakeLinear,
-    private readonly options: { threads?: IntakeThreadReader; pollMs?: number } = {},
+    private readonly options: { threads?: IntakeThreadReader; pollMs?: number; create?: (request: CreateMission, origin: MissionOrigin) => Promise<Mission> } = {},
   ) {
     this.pollMs = options.pollMs ?? 30000;
   }
@@ -190,6 +190,9 @@ export class IntakeService {
       }
       if (!this.mentionsAgent(read, issue)) return this.skip(issue, "no-owner-mention");
       messages = read;
+    } else if (issue.thread && this.options.threads) {
+      // Background only: a failed or unreadable read admits the issue without a thread section, with no wait or retry.
+      messages = await this.readBackground(issue.thread);
     }
     const rule = [
       `label "${intake.linear.label}"`,
@@ -209,6 +212,13 @@ export class IntakeService {
       ...this.facts(issue), state: "queued", rule, ...(issue.thread ? { thread: issue.thread } : {}), request,
       comments: {}, messages: [], questions: [], inbound: [], createdAt: now, updatedAt: now,
     });
+  }
+
+  private async readBackground(thread: IntakeThread): Promise<SlackThreadMessage[] | undefined> {
+    try {
+      const read = await this.options.threads!.thread(thread);
+      return Array.isArray(read) ? read : undefined;
+    } catch { return undefined; }
   }
 
   private mentionsAgent(thread: SlackThreadMessage[], issue: IntakeIssue): boolean {
@@ -238,7 +248,7 @@ export class IntakeService {
       if (slots <= 0) { this.hold(record.issueId, "max-active"); continue; }
       const origin: MissionOrigin = { kind: "intake", issueId: record.issueId, identifier: record.identifier, url: record.url, rule: record.rule! };
       try {
-        const mission = await this.missions.create(record.request!, undefined, origin);
+        const mission = await this.createMission(record.request!, origin);
         slots -= 1;
         this.store.update(record.issueId, next => {
           next.state = "started";
@@ -251,6 +261,11 @@ export class IntakeService {
         if (error instanceof TeamError) this.hold(record.issueId, error.message);
       }
     }
+  }
+
+  /** The server passes its route admission here; without it the mission service is called directly. */
+  private createMission(request: CreateMission, origin: MissionOrigin): Promise<Mission> {
+    return this.options.create ? this.options.create(request, origin) : this.missions.create(request, undefined, origin);
   }
 
   private active(record: IntakeRecord): boolean {

@@ -5,6 +5,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { stopSessionWorkers, waitFor } from "./helpers.js";
 import { unseal } from "../packages/host/src/vault.js";
 import { Manager } from "../packages/host/src/manager.js";
+import type { HostLoadProbe } from "../packages/host/src/host-load.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { MissionService, type ProjectGroupLookup } from "../packages/host/src/missions.js";
 import type { Config } from "../packages/host/src/types.js";
@@ -22,7 +23,7 @@ export const lineup: TeamLineup = {
 };
 
 /** Real team and mission services over real session workers, with a two-repository project behind a fake group lookup. */
-export function missionHarness(options?: { configure?: (config: Config) => void }) {
+export function missionHarness(options?: { configure?: (config: Config) => void; hostProbe?: HostLoadProbe }) {
   const root = realpathSync(mkdtempSync("/tmp/inf-mission-"));
   const receipts = join(root, "receipts");
   mkdirSync(receipts, { mode: 0o700 });
@@ -55,7 +56,7 @@ export function missionHarness(options?: { configure?: (config: Config) => void 
   } };
   let services: { teams: TeamService; missions: MissionService } | undefined;
   const open = () => {
-    const manager = new Manager(config, key);
+    const manager = new Manager(config, key, options?.hostProbe);
     const teams = new TeamService(config, key, manager, (_project, start) => start());
     const missions = new MissionService(config, key, manager, teams, groups);
     teams.start(); missions.start();

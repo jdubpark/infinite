@@ -9,12 +9,13 @@ import type { CreateTeam, NativeContinuation, TeamAssignment, TeamView } from ".
 import type { ProductGoal } from "./goal-types.js";
 import type { ProjectGroup } from "./project-group-types.js";
 import { createMissionSchema, missionActionSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionInputSource, type MissionOrigin, type MissionReport, type MissionSubtaskPlan } from "./mission-types.js";
-import { missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
+import { missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, subteamReport, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
 import { addRollups, emptyRollup, teamUsage } from "./team-usage.js";
 import type { UsageService } from "./usage-service.js";
 import { missionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { ensureDefaultTeamRoot, ensureHostDirectory } from "./team-workspace.js";
 import { resumeFailed } from "./native-continuation.js";
+import { HOST_LOAD_REASON_PREFIX, LaunchHeldError, holdsHostLoadReason } from "./host-load.js";
 
 /** The mission's only view of projects; the project group service implements it. */
 export type ProjectGroupLookup = { get(id: string): ProjectGroup };
@@ -603,10 +604,13 @@ export class MissionService {
       subtask.status = status;
       if (status === "cancelled") subtask.finalEvidence = { ...(team.reason ? { reason: team.reason } : {}), ...(team.headCommit ? { headCommit: team.headCommit } : {}), usage: team.usage };
       if (changed && status !== "running") this.event(stored, `Subtask ${subtask.id} is ${status} (subteam ${team.status}).`);
-      if (live.has(mission.status) && status !== "running")
+      if (live.has(mission.status) && status !== "running") {
+        const report = subteamReport(team);
         this.message(stored, `${team.id}:${status === "cancelled" ? "cancelled" : `${status}:${team.revision}`}`, { type: "subtask-finished", subtaskId: subtask.id, teamId: team.id, status, teamStatus: team.status,
           ...(team.reason ? { reason: team.reason } : {}),
+          ...(report ? { report } : {}),
           ...(status === "cancelled" ? { retentionNote: "Cancelled run data and its workspace are deleted after its members settle. If work is still needed, dispatch a replacement subtask with a new ID in the same repository." } : {}) });
+      }
       if (status === "cancelled" && team.workspaceRemovedAt) {
         // Persist the host-observed cancellation and its final evidence before deleting the child record.
         this.save(stored);
@@ -736,8 +740,17 @@ export class MissionService {
       this.config.teams?.workspaceDir, this.config.teams?.trustWorkspaces === true);
       if (this.closed) return;
       attempt.status = "running"; attempt.startedAt ??= now();
+      if (mission.reason?.startsWith(HOST_LOAD_REASON_PREFIX)) mission.reason = undefined;
       if (session.status === "unavailable") this.event(stored, "The coordinator runtime is unavailable; the mission is waiting for confirmed state.");
     } catch (error) {
+      if (error instanceof LaunchHeldError) {
+        // Only an empty reason or an earlier host-load hold is replaced; the event records the first hold, not each tick.
+        if (holdsHostLoadReason(mission.reason)) {
+          if (mission.reason === undefined) this.event(stored, `The coordinator launch is waiting: ${error.reason}`);
+          mission.reason = error.reason; this.save(stored);
+        }
+        return;
+      }
       if (error instanceof Error && /configured session limit/.test(error.message)) return;
       throw error;
     }
@@ -827,7 +840,7 @@ export class MissionService {
     const inbox = stored.inbox.slice(0, messageLimit), notes = stored.notes.slice(0, messageLimit - inbox.length);
     const waiting = stored.inbox.length + stored.notes.length - inbox.length - notes.length;
     // The prompt keeps a byte budget by leaving trailing messages queued, so inbox messages lead and notes are deferred first.
-    const messages = [...inbox, ...notes], context = { openChildDecisions: this.openChildDecisions(stored), waiting };
+    const messages = [...inbox, ...notes], context = { openChildDecisions: this.openChildDecisions(stored), waiting, answerProjectId: this.config.intake?.mission.answerProjectId };
     const build = (list: MissionMessage[], promptContext: typeof context) => continuation?.mode === "resume"
       ? missionFollowUpPromptWithMessageCount(mission, stored.repos, list, revision, profile.provider, profile, promptContext)
       : missionPromptWithMessageCount(mission, stored.repos, list, revision, profile.provider, profile, promptContext);

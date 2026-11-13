@@ -24,6 +24,7 @@ import type { ProjectSourceService } from "./project-source.js";
 import type { RepositoryGraphs, RepositoryGraphResult } from "./repository-graphs.js";
 import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, publishTeamHead, removeMemberWorkspace, removeTeamWorkspace, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
+import { HOST_LOAD_REASON_PREFIX, LaunchHeldError } from "./host-load.js";
 import { isCollapsedPermissionPrompt, oneShotPermissionOption, permissionAuthorityHash, permissionEvidenceHash, permissionReuseKey, refusedBeforeSend } from "./team-permissions.js";
 import { storageShortfall, volumeUsage, type VolumeUsage } from "./storage.js";
 import { collectPermissionEvidence } from "./team-permission-evidence.js";
@@ -52,6 +53,8 @@ function deliveryInspectionHash(report: DeliveryReconciliationReport) {
   return digest({ headCommit: report.headCommit, repository: report.repository, branch: report.branch,
     baseHeadCommit: report.baseHeadCommit, disposition: report.disposition, remoteHeadCommit: report.remoteHeadCommit });
 }
+/** Shown while the session limit holds a team launch; a host-capacity hold may replace it. */
+const SESSION_SLOT_REASON = "Waiting for an available host session slot.";
 type PendingOperation = { id: string; kind: "prepare" | "member" | "result" | "check"; revision: number;
   source?: { memberId: string; role: TeamMember["role"]; cwd: string; baseCommit: string; headCommit: string; workspace: "member" | "integration" };
   failure?: { code?: string; reason: string; at: string };
@@ -2494,7 +2497,12 @@ export class TeamService {
       if (activeCount) return;
       if (run.establishChecks && !run.verification?.checks.length)
         throw new TeamError(409, "verification-required", "Required verification commands have not been established; review cannot start.");
-      if (stored.checkHead !== run.headCommit) { this.check(stored); return; }
+      if (stored.checkHead !== run.headCommit) {
+        const hold = this.manager.hostLoad.held();
+        if (hold) { this.holdForHostLoad(stored, hold); return; }
+        if (run.reason?.startsWith(HOST_LOAD_REASON_PREFIX)) run.reason = undefined;
+        this.check(stored); return;
+      }
       if (!run.review || run.review.revision !== run.revision) {
         this.prepareMember(stored, "reviewer"); return;
       }
@@ -3738,7 +3746,11 @@ export class TeamService {
       if (tracking?.status === "blocked") throw new TeamError(409, "linear-issue-changed", tracking.reason ?? "The Linear issue no longer permits this work.");
       if (tracking && tracking.status !== "synced") return;
     }
-    if (!this.hasLaunch(member) && (await this.manager.list()).filter(session => session.status === "running" || session.status === "starting").length >= this.config.maxSessions) { stored.run.reason = "Waiting for an available host session slot."; this.save(stored); return; }
+    if (!this.hasLaunch(member)) {
+      const hold = this.manager.hostLoad.held();
+      if (hold) { this.holdForHostLoad(stored, hold); return; }
+    }
+    if (!this.hasLaunch(member) && (await this.manager.list()).filter(session => session.status === "running" || session.status === "starting").length >= this.config.maxSessions) { stored.run.reason = SESSION_SLOT_REASON; this.save(stored); return; }
     if (member.role === "delivery") {
       this.assertDelivery(stored);
       const attempt = stored.deliveryAttempt;
@@ -3770,12 +3782,24 @@ export class TeamService {
       projectId: stored.run.projectId, title: member.title, prompt: member.prompt,
       ...(member.role === "permission-coordinator" ? { continuation: member.continuation } : {}) };
     try { result = await this.startInProject(stored.run.projectId, () => this.manager.createTeamSession(request, assignment(member), member.cwd, member.modelProfile, stored.root, this.config.teams?.trustWorkspaces === true)); }
-    catch (error) { if (error instanceof Error && /configured session limit/.test(error.message)) { stored.run.reason = "Waiting for an available host session slot."; this.save(stored); return; } throw error; }
+    catch (error) {
+      if (error instanceof LaunchHeldError) { this.holdForHostLoad(stored, error.reason); return; }
+      if (error instanceof Error && /configured session limit/.test(error.message)) { stored.run.reason = SESSION_SLOT_REASON; this.save(stored); return; }
+      throw error;
+    }
+    if (stored.run.reason?.startsWith(HOST_LOAD_REASON_PREFIX)) stored.run.reason = undefined;
     member.status = result.status === "unavailable" ? "unavailable" : "running";
     member.startedAt ??= timestamp();
     const turn = member.turns?.at(-1);
     if (turn?.sessionId === member.sessionId) turn.startedAt = member.startedAt;
     this.save(stored);
+  }
+  /** Shows a host-load hold on the run. It replaces an empty reason, an earlier host-load hold, or the session-slot wait; any other reason stays. */
+  private holdForHostLoad(stored: Stored, reason: string) {
+    const current = stored.run.reason;
+    const replaceable = current === undefined || current === SESSION_SLOT_REASON || current.startsWith(HOST_LOAD_REASON_PREFIX);
+    if (!replaceable || current === reason) return;
+    stored.run.reason = reason; this.save(stored);
   }
   private applyProjectManagerCapacity(stored: Stored, requested?: number) {
     const run = stored.run, ceiling = capacityCeiling(run), limit = requested ?? ceiling;

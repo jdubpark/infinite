@@ -1,0 +1,259 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { UsageService, type UsageSessionRow } from "../packages/host/src/usage-service.js";
+import { EvidenceError } from "../packages/host/src/evidence/types.js";
+import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
+import { writeSealed } from "../packages/host/src/vault.js";
+import type { Config } from "../packages/host/src/types.js";
+import type { Manager } from "../packages/host/src/manager.js";
+import type { UsageRecord } from "../packages/host/src/usage.js";
+
+// FIXTURE-START
+const NOW = new Date("2026-10-21T12:00:00.000Z");
+const usageRow = (completedAt: string, modelId: string, providerId: string, partId: string, extra: Partial<UsageRecord> = {}): UsageRecord => ({
+  provider: "opencode", providerId, modelId, messageId: `msg-${partId}`, partId, modelSource: "reported", completedAt,
+  tokens: { input: 1000, output: 500, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, reportedCost: 0, ...extra,
+});
+function fixtureConfig(stateDir: string): Config {
+  return { stateDir, usage: {
+    prices: { "deepseek/deepseek-flash": { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } },
+    budgets: { opencode: { usd: 10, period: "week" } },
+    accounts: {
+      deepseek: { kind: "metered", match: ["deepseek/*"] },
+      claude: { kind: "subscription", match: ["claude/*"], planUsd: 200 },
+    },
+  } } as unknown as Config;
+}
+function fixtureLedger() {
+  const team = { runId: "run-1", memberId: "member-a", taskId: "task-1", role: "implementer", revision: 1 };
+  return {
+    cursors: { "member-a": 7, local: 1 },
+    sessions: {
+      "member-a": { provider: "opencode", projectId: "demo", createdAt: "2026-10-20T01:00:00.000Z", lastActiveAt: "2026-10-20T03:00:00.000Z", measured: true, team, profileId: "ds", exited: true },
+      local: { provider: "opencode", projectId: "demo", createdAt: "2026-09-30T22:00:00.000Z", lastActiveAt: "2026-09-30T23:30:00.000Z", measured: true, exited: true },
+      "claude-a": { provider: "claude", projectId: "demo", createdAt: "2026-10-19T00:00:00.000Z", lastActiveAt: "2026-10-20T00:00:00.000Z", measured: false, exited: true },
+      "claude-b": { provider: "claude", projectId: "other", createdAt: "2026-09-10T00:00:00.000Z", lastActiveAt: "2026-09-10T01:00:00.000Z", measured: false, exited: true },
+    },
+    rows: {
+      "member-a/msg-p1/p1": usageRow("2026-10-21T01:00:00.000Z", "deepseek-flash", "deepseek", "p1"),
+      "member-a/msg-p2/p2": usageRow("2026-10-20T02:30:00.000Z", "deepseek-v4-pro", "deepseek", "p2"),
+      "member-a/msg-p3/p3": usageRow("2026-10-20T04:00:00.000Z", "unlisted", "deepseek", "p3", { reportedCost: 0.0012345678 }),
+      "member-a/msg-p4/p4": usageRow("2026-10-20T05:00:00.000Z", "deepseek-flash", "deepseek", "p4", { modelSource: "unknown" }),
+      "local/msg-p5/p5": usageRow("2026-09-30T23:00:00.000Z", "deepseek-flash", "deepseek", "p5"),
+    },
+    briefings: {
+      "brief-1/2026-10-21T00:00:00.000Z": { projectId: "demo", at: "2026-10-21T00:00:00.000Z",
+        record: usageRow("2026-10-21T00:00:00.000Z", "deepseek-flash", "deepseek", "2026-10-21T00:00:00.000Z", { messageId: "brief-1" }) },
+      "brief-2/2026-10-20T00:00:00.000Z": { projectId: "other", at: "2026-10-20T00:00:00.000Z" },
+    },
+  };
+}
+// FIXTURE-END
+
+function subset(actual: unknown, expected: unknown, path = "$"): void {
+  if (Array.isArray(expected)) {
+    assert.ok(Array.isArray(actual), path);
+    assert.equal(actual.length, expected.length, `${path} length`);
+    expected.forEach((value, index) => subset(actual[index], value, `${path}[${index}]`));
+    return;
+  }
+  if (expected !== null && typeof expected === "object") {
+    assert.ok(actual !== null && typeof actual === "object", path);
+    for (const [key, value] of Object.entries(expected)) subset((actual as Record<string, unknown>)[key], value, `${path}.${key}`);
+    return;
+  }
+  assert.equal(actual, expected, path);
+}
+
+/** A service over a fixture ledger sealed the way the host wrote it. */
+function fixtureService(dir: string, key: Buffer): { usage: UsageService; store: EvidenceStore } {
+  writeSealed(join(dir, "usage.sealed"), key, "usage", fixtureLedger());
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(dir), vaultKey: key });
+  const usage = new UsageService(fixtureConfig(dir), key, {} as Manager, store);
+  return { usage, store };
+}
+
+test("the store gives the bodies of the sealed ledger it imports", () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  try {
+    const { usage, store } = fixtureService(dir, key);
+    try {
+      subset(usage.summary(NOW), {
+        period: { start: "2026-10-01T00:00:00.000Z", end: "2026-11-01T00:00:00.000Z" },
+        providers: {
+          claude: { measured: false, unmeasuredSessions: 1 },
+          codex: { measured: false, unmeasuredSessions: 0 },
+          grok: { measured: false, unmeasuredSessions: 0 },
+          opencode: {
+            period: { start: "2026-10-19T00:00:00.000Z", end: "2026-10-26T00:00:00.000Z" },
+            measured: true, unmeasuredSessions: 1,
+            spent: { cost: 0.008535, tokens: { input: 5000, output: 2500, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, messages: 5, pricing: { configured: 2, catalog: 1, provider: 1, unknown: 1 } },
+            previous: { cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, messages: 0, pricing: { configured: 0, catalog: 0, provider: 0, unknown: 0 } },
+            budget: { usd: 10, period: "week" },
+          },
+          demo: { measured: false, unmeasuredSessions: 0 },
+        },
+        month: { start: "2026-10-01T00:00:00.000Z", end: "2026-11-01T00:00:00.000Z", spent: { usd: 0.008535, unpriced: 1 }, previous: { usd: 0.002, unpriced: 0 }, plansUsd: 200, unmeasuredSessions: 2 },
+        accounts: [
+          { id: "deepseek", kind: "metered", month: { usd: 0.008535, unpriced: 1 }, balance: null },
+          { id: "claude", kind: "subscription", planUsd: 200, planSource: "config", balance: null },
+        ],
+      });
+      subset(usage.daily({ days: 3, tz: "Asia/Seoul", now: NOW }), {
+        tz: "Asia/Seoul", accounts: ["claude", "deepseek"],
+        days: [
+          { date: "2026-10-19", usd: 0, byAccount: {} },
+          { date: "2026-10-20", usd: 0.004535, byAccount: { deepseek: 0.004535 } },
+          { date: "2026-10-21", usd: 0.004, byAccount: { deepseek: 0.004 } },
+        ],
+      });
+      subset(usage.projects({ now: NOW }), {
+        projects: [
+          { id: "demo", name: "demo", total: { usd: 0.010535, unpriced: 1 }, month: { usd: 0.008535, unpriced: 1, unmeasured: 1 }, unmeasured: 1 },
+          { id: "other", name: "other", total: { usd: 0, unpriced: 0 }, month: { usd: 0, unpriced: 0, unmeasured: 1 }, unmeasured: 2 },
+        ],
+      });
+      subset(usage.project("demo", { now: NOW }), {
+        id: "demo", name: "demo", total: { usd: 0.010535, unpriced: 1 }, unmeasured: 1,
+        byKind: { goals: 0, teams: 0.006535, sessions: 0.002, briefings: 0.002 }, goals: [],
+        teams: [{ id: "run-1", title: "run-1", total: { usd: 0.006535, unpriced: 1 } }],
+        sessions: [{ id: "local", title: "local", total: { usd: 0.002, unpriced: 0 } }],
+        briefings: { total: { usd: 0.002, unpriced: 0 }, runs: 1, unmeasured: 0 },
+      });
+      subset(usage.project("other", { now: NOW }), {
+        id: "other", name: "other", total: { usd: 0, unpriced: 0 }, unmeasured: 2,
+        byKind: { goals: 0, teams: 0, sessions: 0, briefings: 0 }, goals: [], teams: [], sessions: [],
+        briefings: { total: { usd: 0, unpriced: 0 }, runs: 1, unmeasured: 1 },
+      });
+      subset(usage.taskUsage("run-1", "task-1", 1), { usd: 0.006535, unpriced: 1, tokens: 6000, attempts: 1, profiles: ["ds"] });
+      subset(usage.session("member-a"), {
+        cost: 0.006535, tokens: { input: 4000, output: 2000, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, messages: 4,
+        pricing: { configured: 1, catalog: 1, provider: 1, unknown: 1 }, measured: true,
+      });
+      subset(usage.session("claude-a"), { measured: false });
+    } finally { store.close(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("the sealed ledger is imported once and never written again", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32), file = join(dir, "usage.sealed");
+  try {
+    writeSealed(file, key, "usage", fixtureLedger());
+    const before = readFileSync(file);
+    const store = new EvidenceStore({ databasePath: evidenceDatabasePath(dir), vaultKey: key });
+    const manager = { events: (_id: string, after: number) => ({ events: [], cursor: after, more: false }) } as unknown as Manager;
+    const service = new UsageService(fixtureConfig(dir), key, manager, store);
+    const row = { id: "new-session", provider: "opencode", projectId: "demo", createdAt: "2026-10-21T10:00:00.000Z", status: "exited", runtime: { nativeUi: "opencode" } } as unknown as UsageSessionRow;
+    await service.tick([row]);
+    service.recordBriefing("demo", "brief-3", "2026-10-21T05:00:00.000Z", null);
+    assert.deepEqual(readFileSync(file), before, "the sealed file keeps its bytes");
+    const first = JSON.stringify(service.summary(NOW));
+    store.close();
+
+    writeSealed(file, key, "usage", { cursors: {}, sessions: {}, rows: {}, briefings: {} });
+    const restarted = new EvidenceStore({ databasePath: evidenceDatabasePath(dir), vaultKey: key });
+    try {
+      const again = new UsageService(fixtureConfig(dir), key, manager, restarted);
+      assert.equal(JSON.stringify(again.summary(NOW)), first, "a second service returns the first bodies");
+    } finally { restarted.close(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a page and its cursor commit together", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(dir), vaultKey: key });
+  try {
+    const pages = [1, 2, 3].map(index => ({ index, record: usageRow(`2026-10-21T0${index}:00:00.000Z`, "deepseek-flash", "deepseek", `j${index}`) }));
+    const afters: number[] = [];
+    const manager = { events: (_id: string, after: number) => {
+      afters.push(after);
+      const page = pages.find(item => item.index === after + 1);
+      return page ? { events: [{ seq: page.index, at: page.record.completedAt, type: "usage", data: page.record }], cursor: page.index, more: page.index < pages.length } : { events: [], cursor: after, more: false };
+    } } as unknown as Manager;
+    let writes = 0, armed = false;
+    const flaky = { register: (module: Parameters<EvidenceStore["register"]>[0]) => store.register(module), status: () => store.status(),
+      read: <T>(fn: Parameters<EvidenceStore["read"]>[0]) => store.read(fn),
+      write: <T>(fn: Parameters<EvidenceStore["write"]>[0]) => { if (armed && ++writes === 2) throw new Error("disk full"); return store.write(fn); },
+    } as unknown as EvidenceStore;
+    const usage = new UsageService(fixtureConfig(dir), key, manager, flaky);
+    armed = true;
+    const row = { id: "journal", provider: "opencode", projectId: "demo", createdAt: "2026-10-21T10:00:00.000Z", status: "running", runtime: { nativeUi: "opencode" } } as unknown as UsageSessionRow;
+    await usage.tick([row]);
+    assert.equal(store.read(db => db.get<{ journal_cursor: number }>("SELECT journal_cursor FROM usage_sessions WHERE session_id=?", "journal"))!.journal_cursor, 1);
+    assert.equal(store.read(db => db.all("SELECT record_key FROM usage_records")).length, 1, "page 2 stores nothing");
+    await usage.tick([row]);
+    assert.deepEqual(afters, [0, 1, 1, 2], "the next tick asks for events after the stored cursor");
+    assert.equal((usage.session("journal") as { messages: number }).messages, 3);
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a tick reads at most 20 pages", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(dir), vaultKey: key });
+  try {
+    const calls: number[] = [];
+    const manager = { events: (_id: string, after: number) => {
+      calls.push(after);
+      const index = after + 1, record = usageRow(`2026-10-21T00:${String(index % 60).padStart(2, "0")}:00.000Z`, "deepseek-flash", "deepseek", `q${index}`);
+      return { events: [{ seq: index, at: record.completedAt, type: "usage", data: record }], cursor: index, more: index < 25 };
+    } } as unknown as Manager;
+    const usage = new UsageService(fixtureConfig(dir), key, manager, store);
+    const row = { id: "long", provider: "opencode", projectId: "demo", createdAt: "2026-10-21T10:00:00.000Z", status: "exited", runtime: { nativeUi: "opencode" } } as unknown as UsageSessionRow;
+    await usage.tick([row]);
+    assert.equal(calls.length, 20);
+    assert.equal(store.read(db => db.get<{ exited: number }>("SELECT exited FROM usage_sessions WHERE session_id=?", "long"))!.exited, 0, "the session stays open");
+    await usage.tick([row]);
+    assert.equal(calls.length, 25);
+    assert.equal(store.read(db => db.get<{ exited: number }>("SELECT exited FROM usage_sessions WHERE session_id=?", "long"))!.exited, 1);
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("an unavailable store never throws", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  const blocker = join(dir, "blocker");
+  writeFileSync(blocker, "a regular file, not a folder");
+  const warn = console.warn, warnings: string[] = [];
+  console.warn = (...args: unknown[]) => { warnings.push(args.join(" ")); };
+  try {
+    const store = new EvidenceStore({ databasePath: join(blocker, "evidence.sqlite3"), vaultKey: key });
+    const usage = new UsageService(fixtureConfig(dir), key, { list: () => { throw new Error("no listing without a store"); } } as unknown as Manager, store);
+    assert.equal(usage.available(), false);
+    await usage.tick([]);
+    assert.deepEqual(usage.session("x"), { measured: false, unavailable: true });
+    assert.throws(() => usage.summary(), (error: unknown) => error instanceof EvidenceError && error.code === "unavailable");
+    const before = warnings.length;
+    usage.recordBriefing("demo", "brief", "2026-10-21T05:00:00.000Z", null);
+    assert.equal(warnings.length - before, 1, "a lost briefing warns once");
+  } finally { console.warn = warn; rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a new service resumes from the stored cursors", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  const journal = (calls: number[]) => ({ events: (_id: string, after: number) => {
+    calls.push(after);
+    if (after >= 3) return { events: [], cursor: after, more: false };
+    const index = after + 1, record = usageRow(`2026-10-21T0${index}:00:00.000Z`, "deepseek-flash", "deepseek", `r${index}`);
+    return { events: [{ seq: index, at: record.completedAt, type: "usage", data: record }], cursor: index, more: index < 3 };
+  } }) as unknown as Manager;
+  const row = { id: "resume", provider: "opencode", projectId: "demo", createdAt: "2026-10-21T10:00:00.000Z", status: "running", runtime: { nativeUi: "opencode" } } as unknown as UsageSessionRow;
+  try {
+    const first = new EvidenceStore({ databasePath: evidenceDatabasePath(dir), vaultKey: key });
+    const firstCalls: number[] = [];
+    const usage = new UsageService(fixtureConfig(dir), key, journal(firstCalls), first);
+    await usage.tick([row]);
+    first.close();
+    await usage.tick([row]);
+    const second = new EvidenceStore({ databasePath: evidenceDatabasePath(dir), vaultKey: key });
+    try {
+      const calls: number[] = [];
+      const resumed = new UsageService(fixtureConfig(dir), key, journal(calls), second);
+      await resumed.tick([row]);
+      assert.deepEqual(calls, [3], "the resumed service asks only for events after the stored cursor");
+      assert.equal((resumed.session("resume") as { messages: number }).messages, 3, "no total doubles");
+    } finally { second.close(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

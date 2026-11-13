@@ -136,7 +136,10 @@ test("a host with an unusable evidence location still serves and reports the sto
     rmSync(location, { recursive: true, force: true });
     writeFileSync(location, "not a directory");
     await host.start();
-    assert.equal((await host.fetchApi("/usage")).status, 200);
+    const usage = await host.fetchApi("/usage");
+    assert.equal(usage.status, 503);
+    assert.deepEqual(usage.body, { error: "The usage ledger is unavailable" });
+    assert.equal((await host.fetchApi("/sessions")).status, 200);
     const status = await host.fetchApi("/evidence/status");
     assert.equal(status.status, 200);
     assert.equal(status.body.state, "unavailable");

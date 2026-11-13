@@ -423,26 +423,32 @@ test("a same-model approval is flagged", () => {
 });
 
 test("a replayed page writes the same rows", () => {
+  // A member result, a changes-requested review, one repair round with its paths, an approval, and a settle, so
+  // every table of the module holds something.
   const events = [
-    created(RUN), prepared(RUN), planned(RUN, "a", ["a.txt"]), planned(RUN, "b", ["b.txt"]),
-    started(RUN, "m1", 2, { taskId: "a" }), stopped(RUN, "m1", 3, "stall", "implementer", "a"),
-    started(RUN, "m2", 4, { taskId: "a", replaces: { memberId: "m1", cause: "stall" } }), integrated(RUN, "m2", "a", 5),
-    started(RUN, "m3", 6, { taskId: "b" }), integrated(RUN, "m3", "b", 7),
-    review(RUN, 8, "approved", { profileId: "rev", model: "r-1" }),
-    settled(RUN, 9, "ready-for-review"),
+    ...repairScenario(RUN),
+    started(RUN, "reviewer-1", 11, { role: "reviewer" }),
+    ev("member.reported", RUN, at(12), { memberId: "reviewer-1", data: { role: "reviewer", reportKind: "review" } }),
+    settled(RUN, 13, "ready-for-review"),
   ];
   const clean = harness();
   let seen = 0;
-  const flaky = harness(projector => ({
-    name: projector.name,
-    module: projector.module,
-    kinds: projector.kinds,
-    project(tx, event) {
-      seen += 1;
-      if (seen === 5) throw new Error("injected failure");
-      projector.project(tx, event);
-    },
-  }));
+  const applied: Parameters<EventProjector["project"]>[1][] = [];
+  let inner: EventProjector | undefined;
+  const flaky = harness(projector => {
+    inner = projector;
+    return {
+      name: projector.name,
+      module: projector.module,
+      kinds: projector.kinds,
+      project(tx, event) {
+        seen += 1;
+        if (seen === 5) throw new Error("injected failure");
+        projector.project(tx, event);
+        if (seen > 5) applied.push(event);
+      },
+    };
+  });
   try {
     clean.flush(events);
     // The injected failure rolls the whole page back, so the cursor stays where it was.
@@ -451,12 +457,29 @@ test("a replayed page writes the same rows", () => {
     flaky.outbox.advance();
     assert.ok(seen > 5);
     // Blind indexes are keyed per store, so two stores never agree on them. Everything else must match.
-    const dump = (h: Harness) => h.store.read(db => JSON.stringify({
+    const tables = (h: Harness) => h.store.read(db => ({
       rows: runOutcomes(db, RUN).map(({ projectRef: _p, taskRef: _t, areaRef: _a, ...row }) => row),
       summary: (({ projectRef: _p, ...summary }) => summary)(readSummary(db, RUN)!),
-      links: db.all("SELECT * FROM outcome_round_links ORDER BY outcome_id, revision, round"),
+      members: db.all<{ result_id: string }>("SELECT result_id FROM member_results WHERE run_id=? ORDER BY result_id", RUN)
+        .map(({ result_id: id }) => (({ projectRef: _p, ...result }) => result)(readMemberResult(db, id)!)),
+      rounds: db.all("SELECT * FROM outcome_rounds ORDER BY run_id, revision, round").map(row => ({ ...row })),
+      links: db.all("SELECT * FROM outcome_round_links ORDER BY outcome_id, revision, round").map(row => ({ ...row })),
+      state: db.all("SELECT * FROM outcome_state ORDER BY key").map(row => ({ ...row })),
     }));
-    assert.equal(dump(flaky), dump(clean));
+    const expected = tables(clean);
+    assert.equal(expected.rows.length, 2);
+    assert.equal(expected.members.length, 1);
+    assert.equal(expected.rounds.length, 1);
+    assert.equal(expected.links.length, 2);
+    assert.equal(expected.state.length, 1);
+    assert.deepEqual(tables(flaky), expected);
+
+    // Every write is a set or a recount: applying the whole page a second time, in order, changes nothing.
+    // The projector receives its own kinds only; `task.planned` is read on demand and never projected.
+    assert.equal(applied.length, events.filter(event => inner!.kinds.includes(event.kind)).length);
+    assert.ok(applied.length > 10);
+    flaky.store.write(tx => { for (const event of applied) inner!.project(tx, event); });
+    assert.deepEqual(tables(flaky), expected);
   } finally {
     clean.close();
     flaky.close();
@@ -658,17 +681,18 @@ test("a later event keeps a backfilled row's unknown rounds", () => {
   try {
     const run = "run-backfilled";
     const id = `${run}:m1`;
-    // Written as Task 4 writes it: an accepted row, one round at revision 0, and one unknown link to it.
+    // Written as Task 4 writes it: an accepted row at the member's revision with no base commit, one round at
+    // revision 0, and one unknown link to it.
     h.store.write(tx => {
       writeOutcome(tx, {
-        outcomeId: id, source: "production", projectRef: "", taskRef: "", areaRef: "", runId: run, revision: 0,
+        outcomeId: id, source: "production", projectRef: "", taskRef: "", areaRef: "", runId: run, revision: 1,
         memberId: "m1", sessionId: null, attemptIndex: 1, inherited: false, role: "implementer", profileId: "p",
         provider: "claude", model: "m-1", effort: null, profileEpoch: 1, configId: null, experimentRef: null,
         kind: null, risk: "normal", featureVersion: 1, disposition: "integrated", exclusion: null,
         flags: ["backfilled"], integrated: 1, accepted: 1, firstPass: null, held: null, startedAt: null,
         endedAt: null, frozenAt: null, holdUntil: null, runDeletedAt: null,
         payload: {
-          projectId: "example", taskId: "a", area: "core", featureMap: "default", baseCommit: BASE,
+          projectId: "example", taskId: "a", area: "core", featureMap: "default",
           rounds: { run: 1, attributed: 0, unknown: 1 }, limitEvents: 0, costCoverage: "none",
         },
       });
@@ -763,6 +787,69 @@ test("a replacement of a sentinel is attempt 2", () => {
     const replacement = rowOf(h.store, RUN, "m2");
     assert.equal(replacement?.attemptIndex, 2);
     assert.equal(replacement?.inherited, true);
+  } finally {
+    h.close();
+  }
+});
+
+test("a report read after a halt's stop still counts", () => {
+  const h = harness();
+  try {
+    h.flush([
+      created(RUN), prepared(RUN), planned(RUN, "a", ["a.txt"]), planned(RUN, "b", ["b.txt"]),
+      // A halt stops a member before the host has read its whole journal, so the report can follow the stop.
+      started(RUN, "m1", 2, { taskId: "a" }), stopped(RUN, "m1", 3, "host", "implementer", "a"),
+      ev("member.reported", RUN, at(4), { memberId: "m1", taskId: "a", data: { role: "implementer", reportKind: "question" } }),
+      started(RUN, "m2", 2, { taskId: "b" }), stopped(RUN, "m2", 3, "owner", "implementer", "b"),
+      ev("member.reported", RUN, at(5), { memberId: "m2", taskId: "b", data: { role: "implementer", reportKind: "blocked" } }),
+    ]);
+    const first = rowOf(h.store, RUN, "m1");
+    assert.equal(first?.disposition, "question");
+    assert.equal(first?.exclusion, null);
+    assert.deepEqual(levelsOf(first), [0, 0, 0, 0]);
+    assert.equal(first?.endedAt, at(3), "the stop ended the attempt, and its time is kept");
+    const second = rowOf(h.store, RUN, "m2");
+    assert.equal(second?.disposition, "blocked");
+    assert.equal(second?.exclusion, null);
+  } finally {
+    h.close();
+  }
+});
+
+test("a run deleted while the projector is behind keeps and flags its rows", () => {
+  let behind = false;
+  const h = harness(projector => ({
+    name: projector.name,
+    module: projector.module,
+    kinds: projector.kinds,
+    project(tx, event) {
+      if (behind) throw new Error("the projector is behind");
+      projector.project(tx, event);
+    },
+  }));
+  try {
+    h.flush([created(RUN), prepared(RUN), planned(RUN, "a", ["a.txt"]), started(RUN, "m1", 2, { taskId: "a" })]);
+    assert.equal(rowOf(h.store, RUN, "m1")?.disposition, "open");
+    // The integration is stored, and the projector never applies it.
+    behind = true;
+    h.flush([integrated(RUN, "m1", "a", 5)]);
+    assert.equal(rowOf(h.store, RUN, "m1")?.disposition, "open");
+
+    assert.equal(h.store.deleteRun(RUN), true);
+    const row = rowOf(h.store, RUN, "m1");
+    assert.equal(row?.disposition, "open", "a fact that never arrived stays unknown");
+    assert.equal(row?.runDeletedAt, at(59));
+    assert.ok(row?.flags.includes("gap"));
+    const summary = summaryOf(h.store, RUN);
+    assert.equal(summary?.runDeletedAt, at(59));
+    assert.ok(summary?.flags.includes("gap"));
+    assert.equal(h.store.events({ runId: RUN, after: 0, limit: 10 }).events.length, 0);
+    const dump = h.store.read(db => JSON.stringify([
+      db.all("SELECT * FROM outcomes"), db.all("SELECT * FROM run_summaries"), db.all("SELECT * FROM outcome_rounds"),
+      db.all("SELECT * FROM outcome_round_links"), db.all("SELECT * FROM member_results"),
+      runOutcomes(db, RUN), readSummary(db, RUN),
+    ]));
+    assert.equal(dump.includes("a.txt"), false);
   } finally {
     h.close();
   }

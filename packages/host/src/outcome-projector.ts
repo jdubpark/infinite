@@ -211,10 +211,10 @@ function memberReported(ctx: Ctx): void {
   if (isRowRole(role)) {
     const row = readOutcome(tx, outcomeId(event.runId, memberId)) ?? sentinelRow(ctx, memberId, role);
     const next = kind === undefined ? undefined : reportDisposition(kind);
-    // A question or a blocker ends the attempt at its report.
+    // A question or a blocker ends the attempt at its report, unless a halt's stop already ended it.
     if (next !== undefined && replaces(row.disposition, next)) {
       row.disposition = next;
-      row.endedAt = event.at;
+      row.endedAt ??= event.at;
     }
     saveRow(tx, row);
     return;

@@ -52,11 +52,16 @@ export function exclusionOf(disposition: Disposition): Exclusion | undefined {
   return EXCLUSIONS[disposition];
 }
 
-/** A host stop yields to a fault the attempt itself caused. Integration and completion win over everything else. */
+/**
+ * A host stop yields to a fault the attempt itself caused. A halt's stop (host or owner) also yields to a question
+ * or a blocker: the halt stops a member before the host has read its whole journal, so a report that the member
+ * wrote before the stop can arrive after it. Integration and completion win over everything else.
+ */
 export function replaces(current: Disposition, next: Disposition): boolean {
   if (next === "integrated") return current !== "completed";
   if (next === "completed") return current !== "integrated";
   if (next === "wrong-report" || next === "out-of-scope") return current === "open" || current === "host-stop";
+  if (next === "question" || next === "blocked") return current === "open" || current === "host-stop" || current === "owner-stop";
   return current === "open";
 }
 

@@ -44,6 +44,12 @@ test("a later fact replaces an earlier one only by precedence", () => {
   assert.equal(replaces("owner-stop", "out-of-scope"), false);
   assert.equal(replaces("host-stop", "integrated"), true);
   assert.equal(replaces("integrated", "host-stop"), false);
+  // A halt stops a member before every journal page is read, so a report can follow the stop it preceded.
+  assert.equal(replaces("host-stop", "question"), true);
+  assert.equal(replaces("owner-stop", "blocked"), true);
+  assert.equal(replaces("stalled", "question"), false);
+  assert.equal(replaces("limit", "blocked"), false);
+  assert.equal(replaces("question", "host-stop"), false);
 });
 
 test("levels by row state", () => {

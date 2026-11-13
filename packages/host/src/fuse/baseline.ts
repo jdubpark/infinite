@@ -15,12 +15,14 @@ const everyRoleListed: Exclude<LaunchRole, typeof LAUNCH_ROLES[number]> extends 
 void everyRoleListed;
 
 const id = z.string().min(1).max(128);
+/** The host configuration sets no length limit on a project id, so this one is wide. */
+const projectId = z.string().min(1).max(1024);
 const seq = z.number().int().min(0);
 const time = z.number().int();
 
 const launchSchema = z.object({
   launchId: id,
-  projectId: id,
+  projectId,
   purpose: z.enum(["work", "duel", "replay", "gate"]),
   role: z.enum(LAUNCH_ROLES),
   profileId: id,
@@ -33,7 +35,7 @@ const launchSchema = z.object({
 const tripSchema = z.object({
   tripId: id,
   scope: z.enum(["project", "host"]),
-  projectId: id.optional(),
+  projectId: projectId.optional(),
   cause: z.enum(["launch-rate", "unmeasurable"]),
   window: z.enum(["hour", "day", "week"]).optional(),
   openedAt: time,
@@ -73,6 +75,12 @@ export function writeBaseline(file: string, key: Buffer, baseline: FuseBaseline)
   }
 }
 
+/**
+ * The baseline a cold start works from. The file is written before the store, so it has seen every item up to its
+ * own `seq`: an item that only the store holds, from at or before that `seq`, is one the file dropped, and it stays
+ * dropped. For an item in both copies the higher `seq` wins, and the file wins a tie. A trip never reopens, so the
+ * later copy of a trip is the closed one, and no closed trip comes back.
+ */
 export function mergeBaselines(file: FuseBaseline | undefined, store: FuseBaseline | undefined, now: number): FuseBaseline | undefined {
   if (!file) return store && pruneBaseline(store, now);
   if (!store) return pruneBaseline(file, now);
@@ -80,8 +88,8 @@ export function mergeBaselines(file: FuseBaseline | undefined, store: FuseBaseli
     {
       version: 1,
       seq: Math.max(file.seq, store.seq),
-      launches: mergeById(file.launches, store.launches, (item) => item.launchId, pickLaunch),
-      trips: mergeById(file.trips, store.trips, (item) => item.tripId, pickTrip),
+      launches: mergeById(file.launches, store.launches, (item) => item.launchId, file.seq),
+      trips: mergeById(file.trips, store.trips, (item) => item.tripId, file.seq),
     },
     now,
   );
@@ -98,32 +106,14 @@ export function pruneBaseline(baseline: FuseBaseline, now: number): FuseBaseline
   };
 }
 
-/** Items from `file` come first, so `pick` gets the file copy first; a tie keeps the file copy. */
-function mergeById<T>(file: T[], store: T[], idOf: (item: T) => string, pick: (file: T, store: T) => T): T[] {
+/** The union by id. The higher seq wins, the file on a tie. A store-only item the file has already seen is left out. */
+function mergeById<T extends { seq: number }>(file: T[], store: T[], idOf: (item: T) => string, fileSeq: number): T[] {
   const merged = new Map<string, T>();
   for (const item of file) merged.set(idOf(item), item);
   for (const item of store) {
     const existing = merged.get(idOf(item));
-    merged.set(idOf(item), existing === undefined ? item : pick(existing, item));
+    if (existing === undefined) { if (item.seq > fileSeq) merged.set(idOf(item), item); }
+    else if (item.seq > existing.seq) merged.set(idOf(item), item);
   }
   return [...merged.values()];
-}
-
-function pickLaunch(file: FuseLaunchRecord, store: FuseLaunchRecord): FuseLaunchRecord {
-  return store.seq > file.seq ? store : file;
-}
-
-/**
- * A trip open in either copy stays open, except that an owner close is final: a trip never reopens, so the copy
- * that still has it open is the older one, and reopening it would hold every launch until the owner acted again.
- * Otherwise the higher seq wins, and a tie keeps the file copy.
- */
-function pickTrip(file: FuseTripRecord, store: FuseTripRecord): FuseTripRecord {
-  const fileOpen = file.closedAt === undefined;
-  const storeOpen = store.closedAt === undefined;
-  if (fileOpen !== storeOpen) {
-    const closed = fileOpen ? store : file;
-    return closed.closedBy === "owner" ? closed : fileOpen ? file : store;
-  }
-  return store.seq > file.seq ? store : file;
 }

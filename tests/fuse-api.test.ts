@@ -53,6 +53,8 @@ test("fuse lines and arguments", () => {
     "Host: closed, 3 of 80 launches in the last hour",
     "Project fixture: open (launch rate, the owner must close it)",
   ]);
+  assert.equal(fuseLines({ ...view, writeFailedAt: "2026-11-13T10:00:00.000Z" }).at(-1),
+    "The host could not record a launch at 2026-11-13T10:00:00.000Z. New team launches wait until it can.");
   const hostile = fuseLines({ ...view, projects: [{ ...view.projects[0], projectId: "fix\nture\u001b[2J" }] });
   assert.ok(hostile.every(line => !/[\x00-\x1f\x7f-\x9f]/.test(line)), "host text is cleaned");
 

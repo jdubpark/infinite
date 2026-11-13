@@ -354,6 +354,7 @@ else if (command === "plan-fleet") {
         fuse,
       ).start();
       console.log(`Push notifications: enabled (${config.push.detail} bodies)`);
+      if (!config.push.events.includes("autonomy-interrupt")) console.warn("Push is on, but push.events has no autonomy-interrupt: an open spend fuse will send no notification.");
     }
     const unlock = () => {
       try {

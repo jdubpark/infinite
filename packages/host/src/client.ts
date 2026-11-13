@@ -726,6 +726,7 @@ export function fuseLines(view: import("./fuse/service.js").FuseView): string[] 
   return [
     line("Host", view.host),
     ...view.projects.map(project => line(`Project ${clean(String(project.projectId))}`, project)),
+    ...(view.writeFailedAt ? [`The host could not record a launch at ${clean(String(view.writeFailedAt))}. New team launches wait until it can.`] : []),
   ];
 }
 

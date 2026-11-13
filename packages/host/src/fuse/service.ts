@@ -37,6 +37,8 @@ export type FuseScopeView = {
 
 export type FuseView = {
   authoritative: boolean;
+  /** The time of the last baseline write that failed. Absent after a write that succeeded. */
+  writeFailedAt?: string;
   host: FuseScopeView;
   projects: (FuseScopeView & { projectId: string })[];
 };
@@ -46,10 +48,14 @@ export type FuseInterrupt = {
   scope: FuseScope;
   projectId?: string;
   label: string;
-  cause: FuseCause;
+  /** `write-failed` is not a trip: the host cannot record launches, so every admission is refused. */
+  cause: FuseCause | "write-failed";
   ownerClose: boolean;
   openedAt: string;
 };
+
+/** The id of the interrupt for a failing baseline write, which has no stored trip. */
+const WRITE_FAILED_ID = "write-failed";
 
 const MODULE = "fuse";
 const TICK_MS = 60_000;
@@ -137,8 +143,8 @@ export class FuseService implements FuseGate {
   private readonly now: () => number;
   private readonly file: string;
   private readonly limits: FuseLimits;
-  private readonly projectIds: string[];
-  private readonly projectNames: Map<string, string>;
+  /** Read when asked: the host adds mirrored projects while it runs. */
+  private readonly config: Config;
   private readonly sessionExistsOf: (sessionId: string) => boolean;
   private launches = new Map<string, FuseLaunchRecord>();
   private trips = new Map<string, FuseTripRecord>();
@@ -146,6 +152,9 @@ export class FuseService implements FuseGate {
   private authoritative = false;
   private unmeasurableId: string | undefined;
   private timer: ReturnType<typeof setInterval> | undefined;
+  /** The time of the last failed baseline write, and the UTC day its interrupt was announced. */
+  private writeFailedAt: number | undefined;
+  private writeFailureAnnouncedDay: string | undefined;
 
   constructor(options: FuseServiceOptions) {
     const config = options.config;
@@ -154,8 +163,7 @@ export class FuseService implements FuseGate {
     this.now = options.now ?? Date.now;
     this.file = join(config.stateDir, BASELINE_FILE);
     this.limits = limitsOf(config.autonomy?.fuse);
-    this.projectIds = config.projects.map(project => project.id);
-    this.projectNames = new Map(config.projects.map(project => [project.id, project.name]));
+    this.config = options.config;
     this.sessionExistsOf = (sessionId) => {
       try {
         return options.sessionExists(sessionId);
@@ -238,7 +246,12 @@ export class FuseService implements FuseGate {
       .filter(trip => trip.closedAt === undefined && trip.cause === "launch-rate" && trip.scope === scope && (scope === "host" || trip.projectId === projectId))
       .map((trip): FuseTripRecord => ({ ...trip, closedAt: now, closedBy: "owner", seq }));
     if (closing.length === 0) return "not-open";
-    return this.persist(seq, [], closing) ? "closed" : "write-failed";
+    // A launch stamped after now still counts, and the close time is now. After a clock that stepped back, every
+    // counted launch would lie after the close, and the close would clear nothing. So those launches move to now.
+    const moved = [...this.launches.values()]
+      .filter(launch => launch.admittedAt > now && (scope === "host" || launch.projectId === projectId))
+      .map((launch): FuseLaunchRecord => ({ ...launch, admittedAt: now, seq }));
+    return this.persist(seq, moved, closing) ? "closed" : "write-failed";
   }
 
   view(): FuseView {
@@ -247,35 +260,48 @@ export class FuseService implements FuseGate {
     const trips = [...this.trips.values()];
     return {
       authoritative: this.authoritative,
+      ...(this.writeFailedAt === undefined ? {} : { writeFailedAt: new Date(this.writeFailedAt).toISOString() }),
       host: this.scopeView(launches, trips, "host", undefined, this.limits.host, now),
-      projects: this.projectIds.map(projectId => ({
-        projectId,
-        ...this.scopeView(launches, trips, "project", projectId, projectLimit(this.limits, projectId), now),
+      projects: this.config.projects.map(project => ({
+        projectId: project.id,
+        ...this.scopeView(launches, trips, "project", project.id, projectLimit(this.limits, project.id), now),
       })),
     };
   }
 
-  /** Open trips not yet announced, one per subject per UTC day. */
+  /**
+   * What the owner has not been told yet. A trip that closes by itself is held back when its subject already had a
+   * trip announced today. A trip that only the owner or a readable baseline can end is always offered, because
+   * every launch of its scope waits on it. A failing baseline write is offered once per UTC day while it lasts.
+   */
   interrupts(): FuseInterrupt[] {
-    const today = utcDay(this.now());
+    const now = this.now();
+    const today = utcDay(now);
     const trips = [...this.trips.values()];
     const announced = new Set(trips.filter(trip => trip.announcedAt !== undefined && utcDay(trip.announcedAt) === today).map(subjectOf));
-    return trips
-      .filter(trip => trip.closedAt === undefined && trip.announcedAt === undefined && !announced.has(subjectOf(trip)))
+    const needsAction = (trip: FuseTripRecord) => trip.ownerClose || trip.cause === "unmeasurable";
+    const due: FuseInterrupt[] = trips
+      .filter(trip => trip.closedAt === undefined && trip.announcedAt === undefined && (needsAction(trip) || !announced.has(subjectOf(trip))))
       .map(trip => ({
         tripId: trip.tripId,
         scope: trip.scope,
         ...(trip.projectId === undefined ? {} : { projectId: trip.projectId }),
-        label: trip.scope === "host" ? "the host" : (this.projectNames.get(trip.projectId ?? "") ?? trip.projectId ?? ""),
+        label: trip.scope === "host" ? "the host" : (this.config.projects.find(project => project.id === trip.projectId)?.name ?? trip.projectId ?? ""),
         cause: trip.cause,
         ownerClose: trip.ownerClose,
         openedAt: new Date(trip.openedAt).toISOString(),
       }));
+    if (this.writeFailedAt !== undefined && this.writeFailureAnnouncedDay !== today) {
+      due.push({ tripId: WRITE_FAILED_ID, scope: "host", label: "the host", cause: "write-failed", ownerClose: false, openedAt: new Date(this.writeFailedAt).toISOString() });
+    }
+    return due;
   }
 
   markAnnounced(tripIds: readonly string[]): void {
     const now = this.now();
     const ids = new Set(tripIds);
+    // The write failure has no stored trip, so its announcement lives in memory, by UTC day.
+    if (ids.delete(WRITE_FAILED_ID)) this.writeFailureAnnouncedDay = utcDay(now);
     const targets = [...this.trips.values()].filter(trip => ids.has(trip.tripId) && trip.announcedAt === undefined);
     if (targets.length === 0) return;
     if (!this.authoritative) {
@@ -363,7 +389,11 @@ export class FuseService implements FuseGate {
     const tripMap = new Map(this.trips);
     for (const trip of trips) tripMap.set(trip.tripId, trip);
     const next = pruneBaseline({ version: 1, seq, launches: [...launchMap.values()], trips: [...tripMap.values()] }, this.now());
-    if (!writeBaseline(this.file, this.key, next)) return false;
+    if (!writeBaseline(this.file, this.key, next)) {
+      this.writeFailedAt = this.now();
+      return false;
+    }
+    this.writeFailedAt = undefined;
     this.adopt(next);
     this.mirror(launches, trips);
     return true;
@@ -515,6 +545,12 @@ export class FuseService implements FuseGate {
     this.store.tryWrite(tx => {
       tx.run("DELETE FROM fuse_launches WHERE admitted_at < ?", now - LAUNCH_RETENTION_MS);
       tx.run("DELETE FROM fuse_trips WHERE closed_at IS NOT NULL AND closed_at < ?", now - TRIP_RETENTION_MS);
+      // A failed mirror can leave a row open that the baseline has closed and dropped. It goes when it is old
+      // enough, unless the trip is still open in memory.
+      const open = new Set([...this.trips.values()].filter(trip => trip.closedAt === undefined).map(trip => trip.tripId));
+      for (const row of tx.all<{ trip_id: string }>("SELECT trip_id FROM fuse_trips WHERE closed_at IS NULL AND opened_at < ?", now - TRIP_RETENTION_MS)) {
+        if (!open.has(row.trip_id)) tx.run("DELETE FROM fuse_trips WHERE trip_id=?", row.trip_id);
+      }
     });
   }
 

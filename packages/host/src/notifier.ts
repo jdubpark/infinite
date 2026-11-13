@@ -161,8 +161,10 @@ export class Notifier {
     try { return this.fuse.interrupts(); } catch { return []; }
   }
   private fuseMessage(item: FuseInterrupt, to: string) {
-    const cause = item.cause === "unmeasurable" ? "its launch record cannot be read" : "it reached its launch limit for the last hour";
+    const cause = item.cause === "unmeasurable" ? "its launch record cannot be read"
+      : item.cause === "write-failed" ? "it cannot record a launch" : "it reached its launch limit for the last hour";
     const closing = item.cause === "unmeasurable" ? "It closes once the record can be read."
+      : item.cause === "write-failed" ? "Launches resume once the host can write its state again."
       : item.ownerClose ? "It stays open until you close it." : "It closes on its own as launches leave the last hour.";
     return {
       to, title: "Spend fuse open", body: `Launches paused for ${item.label}: ${cause}. ${closing}`,

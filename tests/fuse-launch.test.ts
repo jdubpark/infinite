@@ -2,14 +2,14 @@ import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { BASELINE_FILE, readBaseline } from "../packages/host/src/fuse/baseline.js";
 import { isFuseReason } from "../packages/host/src/fuse/rules.js";
 import { FuseService } from "../packages/host/src/fuse/service.js";
 import type { FuseLaunch } from "../packages/host/src/fuse/types.js";
 import { Manager } from "../packages/host/src/manager.js";
-import { TeamError, TeamService } from "../packages/host/src/teams.js";
+import { TeamError, TeamService, providerInputReason } from "../packages/host/src/teams.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 import { fixture, mixedLineup } from "./team-fixture.js";
 
@@ -26,6 +26,24 @@ function rig(f: Fixture) {
   const clock = { now: START };
   const fuse = new FuseService({ config: f.config, key: f.key, store, sessionExists: () => false, now: () => clock.now });
   return { store, clock, fuse, file: join(f.config.stateDir, BASELINE_FILE) };
+}
+
+/**
+ * A fixture's own ids, commit ids, times, and temporary paths, replaced by placeholders in order of first use.
+ * Two fixtures that did the same work give the same text.
+ */
+function normalized(text: string, f: Fixture): string {
+  const names = new Map<string, string>();
+  const place = (kind: string, value: string) => {
+    let name = names.get(value);
+    if (name === undefined) { name = `<${kind}-${names.size}>`; names.set(value, name); }
+    return name;
+  };
+  return text
+    .split(dirname(f.config.stateDir)).join("<root>")
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, value => place("id", value))
+    .replace(/\b[0-9a-f]{40}\b/g, value => place("commit", value))
+    .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/g, "<time>");
 }
 
 function launch(id: string, projectId = "fixture"): FuseLaunch {
@@ -113,8 +131,9 @@ test("ten passes with the fuse open change only the reason", async () => {
     for (let pass = 0; pass < 10; pass++) await scheduler(teams).step(scheduler(teams).record(f.run.id));
     await teams.idle();
     assert.equal(f.launches.length, 0);
-    const stored = f.readRecord<{ run: { status: string; reason?: string }; }>("team", f.run.id).run;
+    const stored = f.readRecord<{ run: { status: string; reason?: string; members: { status: string }[] }; }>("team", f.run.id).run;
     assert.equal(stored.status, "implementing");
+    assert.equal(stored.members[0]!.status, "queued", "the member waits");
     assert.equal(isFuseReason(stored.reason), true);
     assert.deepEqual(readFileSync(file), before);
 
@@ -123,6 +142,36 @@ test("ten passes with the fuse open change only the reason", async () => {
     await teams.idle();
     assert.equal(f.launches.length, 1);
     assert.equal(isFuseReason(f.readRecord<{ run: { reason?: string } }>("team", f.run.id).run.reason), false);
+  } finally { store.close(); f.close(); }
+});
+
+test("a member's state keeps the reason while the fuse holds a launch", async () => {
+  const f = schedulerFixture();
+  const { store, fuse } = rig(f);
+  try {
+    trip(fuse);
+    // The coordinator runs and waits on a person at a provider prompt. The scheduler writes that reason from the
+    // member's state on every pass, so a fuse text there would be replaced and put back each pass.
+    const coordinator = f.run.members[0]!;
+    f.state.attention = { state: "needs-you", prompt: { id: 1, kind: "question", title: "Which store?", options: [], acceptsText: true, source: "screen", hash: "c".repeat(64) } } as typeof f.state.attention;
+    const queued = queueImplementer(f);
+    f.run.members = [coordinator, queued];
+    f.run.reason = providerInputReason;
+    f.writeTeam();
+    const teams = f.openTeam();
+    teams.useFuse(fuse);
+    setRunning(f, []);
+    const internal = teams as unknown as { save(stored: unknown): void };
+    const save = internal.save.bind(teams);
+    let fuseSaves = 0;
+    internal.save = (stored: unknown) => { if (new Error().stack!.includes("fuseWait")) fuseSaves += 1; return save(stored); };
+    for (let pass = 0; pass < 10; pass++) await scheduler(teams).step(scheduler(teams).record(f.run.id));
+    await teams.idle();
+    assert.equal(f.launches.length, 0, "the launch still waits");
+    assert.equal(fuseSaves, 0, "the fuse adds no save while a member's state holds the reason");
+    const stored = f.readRecord<{ run: { reason?: string; members: { status: string }[] } }>("team", f.run.id).run;
+    assert.equal(stored.reason, providerInputReason);
+    assert.equal(stored.members[1]!.status, "queued");
   } finally { store.close(); f.close(); }
 });
 
@@ -179,6 +228,9 @@ test("without a fuse the launch and the record are as today", async () => {
     const fusedRecord = fused.readRecord<{ run: Record<string, unknown> }>("team", fused.run.id).run;
     assert.deepEqual(Object.keys(fusedRecord).sort(), Object.keys(plainRecord).sort());
     assert.deepEqual(Object.keys(fusedRecord.members[0] as object).sort(), Object.keys(plainRecord.members[0] as object).sort());
+    // Keys alone would let a changed status or reason pass, so the whole records are compared, value for value.
+    assert.equal(normalized(JSON.stringify(fused.readRecord("team", fused.run.id)), fused), normalized(JSON.stringify(plain.readRecord("team", plain.run.id)), plain));
+    assert.equal(normalized(fused.launches[0]!.prompt, fused), normalized(plain.launches[0]!.prompt, plain), "the launch prompt is the same");
   } finally { store.close(); plain.close(); fused.close(); }
 });
 

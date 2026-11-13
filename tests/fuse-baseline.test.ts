@@ -75,17 +75,17 @@ test("writing a baseline never throws", () => {
   });
 });
 
-test("merge takes the union and keeps a trip open in either", () => {
+test("merge takes the union and the later copy of each item", () => {
   const file = baseline({
     seq: 3,
     launches: [launch("A", "a", now - 10 * minute, "admitted", 3), launch("C", "a", now - 9 * minute, "admitted", 5)],
     trips: [trip({ tripId: "T", scope: "host", cause: "launch-rate", openedAt: now - 30 * minute, closedAt: now - 20 * minute, closedBy: "rate", seq: 3 })],
   });
   const store = baseline({
-    seq: 4,
+    seq: 5,
     launches: [
       launch("A", "a", now - 10 * minute, "started", 4),
-      launch("B", "b", now - 5 * minute, "released", 2),
+      launch("B", "b", now - 5 * minute, "released", 5),
       launch("C", "a", now - 9 * minute, "started", 5),
     ],
     trips: [trip({ tripId: "T", scope: "host", cause: "launch-rate", openedAt: now - 30 * minute, seq: 2 })],
@@ -93,12 +93,12 @@ test("merge takes the union and keeps a trip open in either", () => {
 
   const merged = mergeBaselines(file, store, now);
   assert.ok(merged);
-  assert.equal(merged.seq, 4);
+  assert.equal(merged.seq, 5);
   assert.equal(merged.launches.find((item) => item.launchId === "A")?.state, "started");
-  assert.equal(merged.launches.find((item) => item.launchId === "B")?.state, "released");
+  assert.equal(merged.launches.find((item) => item.launchId === "B")?.state, "released", "a store-only item newer than the file is kept");
   assert.equal(merged.launches.find((item) => item.launchId === "C")?.state, "admitted", "file wins a seq tie");
   assert.equal(merged.trips.length, 1);
-  assert.equal(merged.trips[0].closedAt, undefined, "open in the store stays open");
+  assert.equal(merged.trips[0].closedBy, "rate", "the later copy of the trip is the closed one");
 
   const fromStore = mergeBaselines(undefined, store, now);
   assert.equal(fromStore?.launches.length, 3);
@@ -107,15 +107,31 @@ test("merge takes the union and keeps a trip open in either", () => {
   assert.equal(mergeBaselines(undefined, undefined, now), undefined);
 });
 
-test("an owner close is final in a merge", () => {
-  // The file is written first, so the store can still hold the trip open after the owner closed it.
-  const closed = trip({ tripId: "T", scope: "project", projectId: "a", cause: "launch-rate", openedAt: now - 30 * minute, closedAt: now - 5 * minute, closedBy: "owner", ownerClose: true, announcedAt: now - 29 * minute, seq: 9 });
-  const open = trip({ tripId: "T", scope: "project", projectId: "a", cause: "launch-rate", openedAt: now - 30 * minute, ownerClose: true, announcedAt: now - 29 * minute, seq: 7 });
-  for (const [file, store] of [[closed, open], [open, closed]] as const) {
-    const merged = mergeBaselines(baseline({ seq: 9, trips: [file] }), baseline({ seq: 9, trips: [store] }), now);
-    assert.equal(merged?.trips.length, 1);
-    assert.equal(merged?.trips[0].closedBy, "owner");
-    assert.equal(merged?.trips[0].closedAt, now - 5 * minute);
+test("the file has seen everything up to its own seq", () => {
+  // The file is written first. An item that only the store holds, from before the file's seq, is one the file dropped.
+  const staleTrip = trip({ tripId: "T", scope: "project", projectId: "a", cause: "launch-rate", openedAt: now - 30 * minute, ownerClose: true, seq: 7 });
+  const staleLaunch = launch("L", "a", now - 10 * minute, "started", 6);
+  const newerTrip = trip({ tripId: "N", scope: "project", projectId: "a", cause: "launch-rate", openedAt: now - 5 * minute, seq: 10 });
+  const store = baseline({ seq: 10, launches: [staleLaunch], trips: [staleTrip, newerTrip] });
+  const merged = mergeBaselines(baseline({ seq: 9 }), store, now);
+  assert.deepEqual(merged?.trips.map((item) => item.tripId), ["N"], "the trip the file dropped stays dropped");
+  assert.deepEqual(merged?.launches, []);
+  // With no file, the store is all there is.
+  const alone = mergeBaselines(undefined, store, now);
+  assert.deepEqual(alone?.trips.map((item) => item.tripId).sort(), ["N", "T"]);
+  assert.equal(alone?.launches.length, 1);
+});
+
+test("a closed trip stays closed in a merge", () => {
+  for (const closedBy of ["owner", "rate"] as const) {
+    const closed = trip({ tripId: "T", scope: "project", projectId: "a", cause: "launch-rate", openedAt: now - 30 * minute, closedAt: now - 5 * minute, closedBy, ownerClose: closedBy === "owner", announcedAt: now - 29 * minute, seq: 9 });
+    const open = trip({ tripId: "T", scope: "project", projectId: "a", cause: "launch-rate", openedAt: now - 30 * minute, ownerClose: closedBy === "owner", announcedAt: now - 29 * minute, seq: 7 });
+    for (const [file, store] of [[closed, open], [open, closed]] as const) {
+      const merged = mergeBaselines(baseline({ seq: 9, trips: [file] }), baseline({ seq: 9, trips: [store] }), now);
+      assert.equal(merged?.trips.length, 1);
+      assert.equal(merged?.trips[0].closedBy, closedBy);
+      assert.equal(merged?.trips[0].closedAt, now - 5 * minute);
+    }
   }
 });
 
@@ -140,6 +156,18 @@ test("prune keeps only what the windows need", () => {
 
   assert.deepEqual(pruned.launches.map((item) => item.launchId), ["admitted-3-hours"]);
   assert.deepEqual(pruned.trips.map((item) => item.tripId), ["opened-today", "owner-yesterday", "open-last-week"]);
+});
+
+test("a long project id is stored", () => {
+  withDirectory((directory) => {
+    const key = randomBytes(32);
+    const file = join(directory, BASELINE_FILE);
+    // The host configuration sets no length limit on a project id.
+    const projectId = "p".repeat(300);
+    const value = baseline({ launches: [launch("A", projectId, now)], trips: [trip({ tripId: "T", scope: "project", projectId, cause: "launch-rate", openedAt: now })] });
+    assert.equal(writeBaseline(file, key, value), true);
+    assert.deepEqual(readBaseline(file, key), value);
+  });
 });
 
 test("an oversized baseline is unreadable", () => {

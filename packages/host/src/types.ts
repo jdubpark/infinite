@@ -168,7 +168,7 @@ export interface Config {
     accessTokenFile?: string;
     endpoint: string;
     detail: "minimal" | "full";
-    events: ("needs-you" | "turn-finished" | "exited" | "recording-error" | "goal-started" | "goal-finished" | "goal-stuck" | "goal-cancelled" | "team-started" | "team-finished" | "team-stuck" | "team-cancelled" | "team-blocked" | "host-storage")[];
+    events: ("needs-you" | "turn-finished" | "exited" | "recording-error" | "goal-started" | "goal-finished" | "goal-stuck" | "goal-cancelled" | "team-started" | "team-finished" | "team-stuck" | "team-cancelled" | "team-blocked" | "host-storage" | "autonomy-interrupt")[];
   };
 }
 export interface Receipt {

@@ -211,6 +211,112 @@ test("an admission closes every open rate trip that its scope no longer holds", 
   }
 });
 
+test("a trip that needs the owner always sends its push", () => {
+  const r = rig({ project: { launchesPerHour: 2 } });
+  try {
+    const fuse = service(r);
+    fuse.admit(launch("a1"));
+    fuse.admit(launch("a2"));
+    const [first] = fuse.interrupts();
+    assert.ok(first, "the first trip is offered");
+    assert.equal(first.ownerClose, false);
+    fuse.markAnnounced([first.tripId]);
+    assert.equal(fuse.interrupts().length, 0);
+
+    // The first trip closes by rate, and the limit is reached again on the same UTC day.
+    r.clock.now += HOUR + 1;
+    fuse.admit(launch("b1"));
+    fuse.admit(launch("b2"));
+    const open = fuse.check({ projectId: "p" });
+    assertOpen(open);
+    assert.equal(open.ownerClose, true);
+    // Every launch of the project now waits for the owner, so the owner is told at once and not a day later.
+    const second = fuse.interrupts();
+    assert.equal(second.length, 1);
+    assert.equal(second[0]!.ownerClose, true);
+    assert.equal(second[0]!.tripId, open.tripId);
+  } finally { r.close(); }
+});
+
+test("an owner close clears launches stamped after it", () => {
+  const r = rig({ project: { launchesPerHour: 3 } });
+  try {
+    const fuse = service(r);
+    for (const id of ["a1", "a2", "a3"]) fuse.admit(launch(id));
+    assertOpen(fuse.check({ projectId: "p" }));
+    // The clock steps back, so every counted launch now lies after the time of the owner's close.
+    r.clock.now -= 90 * 60_000;
+    assert.equal(fuse.close({ scope: "project", projectId: "p" }), "closed");
+    assert.equal(fuse.check({ projectId: "p" }).state, "closed");
+    assert.deepEqual(fuse.admit(launch("after")), { ok: true, launchId: "after" });
+    assert.equal(fuse.check({ projectId: "p" }).state, "closed", "the close cleared the count, and no new trip opened");
+  } finally { r.close(); }
+});
+
+test("a failed write is visible and sends one interrupt", () => {
+  const r = rig();
+  try {
+    const fuse = service(r);
+    assert.equal(fuse.view().writeFailedAt, undefined);
+    rmSync(r.file, { force: true });
+    mkdirSync(r.file);
+    const refused = fuse.admit(launch("A"));
+    assert.equal(refused.ok, false);
+    assert.equal("failure" in refused && refused.failure, "write-failed");
+    assert.equal(fuse.view().writeFailedAt, new Date(r.clock.now).toISOString());
+    const interrupts = fuse.interrupts();
+    assert.equal(interrupts.length, 1);
+    assert.equal(interrupts[0]!.cause, "write-failed");
+    assert.equal(interrupts[0]!.scope, "host");
+    fuse.markAnnounced([interrupts[0]!.tripId]);
+    assert.equal(fuse.interrupts().length, 0, "one interrupt per UTC day while writes fail");
+
+    rmSync(r.file, { recursive: true, force: true });
+    assert.deepEqual(fuse.admit(launch("A")), { ok: true, launchId: "A" });
+    assert.equal(fuse.view().writeFailedAt, undefined, "a successful write clears it");
+  } finally { r.close(); }
+});
+
+test("a restart does not bring back a trip the file dropped", () => {
+  const r = rig({ project: { launchesPerHour: 2 } });
+  try {
+    const fuse = service(r);
+    fuse.admit(launch("a1"));
+    fuse.admit(launch("a2"));
+    r.clock.now += HOUR + 1;
+    fuse.admit(launch("b1"));
+    fuse.admit(launch("b2"));
+    const open = fuse.check({ projectId: "p" });
+    assertOpen(open);
+    assert.equal(open.ownerClose, true);
+
+    // The owner closes the trip while store writes fail: the file holds the close, and the store row stays open.
+    r.store.close();
+    assert.equal(fuse.close({ scope: "project", projectId: "p" }), "closed");
+    // The next day a write prunes the closed trip from the file.
+    r.clock.now += 25 * HOUR;
+    assert.equal(fuse.admit(launch("c1")).ok, true);
+    assert.equal(baselineOf(r).trips.some(trip => trip.tripId === open.tripId), false, "the file dropped the closed trip");
+
+    const again = restart(r);
+    assert.equal(again.check({ projectId: "p" }).state, "closed", "the store's stale open row does not come back");
+    assert.equal(again.interrupts().length, 0);
+  } finally { r.close(); }
+});
+
+test("a project added while the host runs is in the view", () => {
+  const r = rig();
+  try {
+    const fuse = service(r);
+    assert.equal(fuse.view().projects.some(project => project.projectId === "late"), false);
+    r.config.projects.push({ id: "late", name: "Late project", path: join(r.root, "project-late") } as Config["projects"][number]);
+    const late = fuse.view().projects.find(project => project.projectId === "late");
+    assert.ok(late, "the view reads the project list when asked");
+    assert.equal(late.hour.limit, 30);
+    assert.equal(late.state, "closed");
+  } finally { r.close(); }
+});
+
 test("the host limit spans projects", () => {
   const r = rig({ project: { launchesPerHour: 50 } });
   try {
@@ -294,7 +400,10 @@ test("a failed baseline write refuses and changes nothing", () => {
     rmSync(r.file);
     mkdirSync(r.file);
     assert.deepEqual(fuse.admit(launch("A")), { ok: false, launchId: "A", failure: "write-failed" });
-    assert.deepEqual(fuse.view(), before);
+    // Counts, limits, and states are as before. The view only adds that a write failed.
+    const { writeFailedAt, ...after } = fuse.view();
+    assert.deepEqual(after, before);
+    assert.equal(writeFailedAt, new Date(r.clock.now).toISOString());
     assert.equal(fuse.check({ projectId: "p" }).state, "closed");
   } finally {
     r.close();

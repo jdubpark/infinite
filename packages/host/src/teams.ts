@@ -17,7 +17,7 @@ import { resumeFailed } from "./native-continuation.js";
 import type { UsageService } from "./usage-service.js";
 import { type EvidenceStore, eventProblem } from "./evidence/store.js";
 import { applyFuseReason, workLaunch } from "./fuse/rules.js";
-import type { FuseGate } from "./fuse/types.js";
+import type { FuseAdmission, FuseCheck, FuseGate } from "./fuse/types.js";
 import type { EventOutbox, OutboxEvent } from "./evidence/outbox.js";
 import { MAX_OUTBOX_EVENTS, pathField, planDigest, profileIdentity, runEventKey, runSummaryCounts, type MemberStopDetail, type MemberStopReason, type ReplacementCause } from "./run-events.js";
 import { taskFeatures } from "./task-features.js";
@@ -122,6 +122,8 @@ const underReview = (run: TeamRun, sessionId: string, promptId?: number) => prom
     ["pending", "reviewing", "approved", "answering"].includes(decision.status)) || promptId !== undefined &&
   (run.permissionRecovery?.requests ?? []).some(request => request.targetSessionId === sessionId && request.promptId === promptId && livePermissionRecoveryStatuses.has(request.status));
 const runtimeUnavailableReason = "An agent runtime is unavailable; the team is waiting for confirmed state.";
+/** Reasons that report a member's state. The scheduler writes them again from each running member on every pass. */
+const memberStateReasons: ReadonlySet<string> = new Set([runtimeUnavailableReason, permissionReviewReason, providerInputReason]);
 const clock = (iso: string) => `${iso.slice(11, 16)} UTC`;
 const runEvent = (run: TeamRun, text: string) => {
   run.events.push({ at: timestamp(), text });
@@ -543,6 +545,17 @@ export class TeamService {
   useEvidence(store: EvidenceStore) { this.evidence = store; }
   /** The launch-rate fuse. Without one, every member launches as before and no record gains a fuse reason. */
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
+  /**
+   * Applies a fuse result to the run's reason. True when the launch must wait. A reason that reports a member's
+   * state stays as it is: the scheduler writes it again on every pass, so a fuse text there would be replaced and
+   * put back each pass, with a save each time. The launch waits either way.
+   */
+  private fuseWait(stored: Stored, result: FuseCheck | FuseAdmission): boolean {
+    const keeps = memberStateReasons.has(stored.run.reason ?? "");
+    const fuse = applyFuseReason(keeps ? {} : stored.run, result);
+    if (!keeps && fuse.changed) this.save(stored);
+    return fuse.wait;
+  }
   /** Whether the run's sealed record file is on disk, so a record that failed to load still counts. Only a missing file is false. */
   hasRecordFile(id: string) {
     if (!/^[a-f0-9-]{36}$/.test(id)) return false;
@@ -3909,11 +3922,7 @@ export class TeamService {
       if (tracking && tracking.status !== "synced") return;
     }
     // The fuse is asked before any launch work. It reads memory only, so a queued member costs no write per pass.
-    if (this.fuse && !this.hasLaunch(member)) {
-      const fuse = applyFuseReason(stored.run, this.fuse.check({ projectId: stored.run.projectId, role: member.role }));
-      if (fuse.changed) this.save(stored);
-      if (fuse.wait) return;
-    }
+    if (this.fuse && !this.hasLaunch(member) && this.fuseWait(stored, this.fuse.check({ projectId: stored.run.projectId, role: member.role }))) return;
     if (!this.hasLaunch(member) && (await this.manager.list()).filter(session => session.status === "running" || session.status === "starting").length >= this.config.maxSessions) { stored.run.reason = "Waiting for an available host session slot."; this.save(stored); return; }
     if (member.role === "delivery") {
       this.assertDelivery(stored);
@@ -3942,11 +3951,8 @@ export class TeamService {
       await writeTeamContext(member.cwd, { ...teamContext(stored.run, member.contextFeedback, configuredProject, member.role, this.permissionRecoveryHistory(stored.run)), assignment: assignment(member), memberBaseCommit: member.baseCommit, scratchDirectory: member.scratchDirectory }, this.config.teams?.commandPrefix);
     }
     // The launch is charged once, right before its session starts. A member whose session exists is a replay.
-    if (this.fuse && !this.hasLaunch(member)) {
-      const fuse = applyFuseReason(stored.run, this.fuse.admit(workLaunch({ launchId: member.sessionId, projectId: stored.run.projectId, provider: member.provider ?? stored.run.provider, team: assignment(member), profile: member.modelProfile })));
-      if (fuse.changed) this.save(stored);
-      if (fuse.wait) return;
-    }
+    if (this.fuse && !this.hasLaunch(member) && this.fuseWait(stored, this.fuse.admit(workLaunch({ launchId: member.sessionId, projectId: stored.run.projectId,
+      provider: member.provider ?? stored.run.provider, team: assignment(member), profile: member.modelProfile })))) return;
     let result;
     const request = { requestId: member.sessionId, provider: member.provider ?? stored.run.provider,
       projectId: stored.run.projectId, title: member.title, prompt: member.prompt,

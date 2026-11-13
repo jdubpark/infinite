@@ -1,5 +1,7 @@
 import { z } from "zod";
 import type { UsageTokens } from "./usage.js";
+import type { LedgerCoverageReason } from "./usage-store.js";
+import type { SessionPurpose } from "./types.js";
 
 export type Money = { usd: number; unpriced: number };
 export type Balance = { amount: number; currency: string; asOf: string; stale: boolean } | null;
@@ -11,7 +13,7 @@ const planUsdSchema = z.number().finite().min(0).max(100_000).refine(value => {
 }, "Plan fees may have at most two decimal places");
 export const usagePlanSchema = z.object({ planUsd: planUsdSchema.nullable() }).strict();
 export type UsagePlanRequest = z.infer<typeof usagePlanSchema>;
-export type TaskUsage = { usd: number; unpriced: number; tokens: number; attempts: number; profiles: string[] };
+export type TaskUsage = { usd: number; unpriced: number; tokens: number; attempts: number; profiles: string[]; coverage: "partial" | "complete"; coverageReason?: LedgerCoverageReason };
 export type BriefingUsage = { providerId: string; modelId: string; tokens: UsageTokens; reportedCost?: number };
 export type UsageResolvers = {
   goalOfRun(runId: string): { id: string; title: string } | undefined;
@@ -19,12 +21,13 @@ export type UsageResolvers = {
   projectName(id: string): string | undefined;
   sessionTitle(id: string): string | undefined;
 };
-export type UsageMonth = { start: string; end: string; spent: Money; previous: Money; plansUsd: number; unmeasuredSessions: number };
+export type UsageMonth = { start: string; end: string; spent: Money; previous: Money; plansUsd: number; unmeasuredSessions: number; partialSessions: number };
 export type UsageApiSummary = import("./usage-service.js").UsageSummary;
 export type DailyUsage = { tz: string; accounts: string[]; days: { date: string; usd: number; byAccount: Record<string, number> }[] };
-export type ProjectUsage = { id: string; name: string; total: Money; month: Money & { unmeasured: number }; unmeasured: number; spark: number[] };
+export type ProjectUsage = { id: string; name: string; total: Money; month: Money & { unmeasured: number; partial: number }; unmeasured: number; partial: number; spark: number[] };
 export type ProjectUsageDetail = {
-  id: string; name: string; total: Money; unmeasured: number;
+  id: string; name: string; total: Money; unmeasured: number; partial: number;
+  byPurpose: Record<SessionPurpose, { total: Money; members: number }>;
   byKind: { goals: number; teams: number; sessions: number; briefings: number };
   goals: { id: string; title: string; total: Money; tasks: number }[];
   teams: { id: string; title: string; goalId?: string; total: Money }[];

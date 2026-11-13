@@ -29,6 +29,7 @@ import { handoffPathsOverlap } from "./handoff-types.js";
 import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
 import { UsageService } from "./usage-service.js";
 import { EvidenceStore, evidenceDatabasePath } from "./evidence/store.js";
+import { EvidenceError } from "./evidence/types.js";
 import { usagePlanSchema } from "./usage-api.js";
 import { TeamService, TeamError } from "./teams.js";
 import { spawnTeamBundle } from "./team-workspace.js";
@@ -188,7 +189,7 @@ export function createApp(config: Config, key: Buffer) {
     },
   });
   teams.useEvidence(evidence);
-  const usage = new UsageService(config, key, manager);
+  const usage = new UsageService(config, key, manager, evidence);
   const balances = new BalanceService(config.usage?.accounts ?? {});
   usage.useBalances(balances);
   // TeamService ticks on every host and drives the ledger from its own session listing.
@@ -592,14 +593,26 @@ export function createApp(config: Config, key: Buffer) {
       },
     }),
   );
+  // The ledger observes: while it is unavailable every usage route answers 503 and nothing else changes.
+  const usageUnavailable = { error: "The usage ledger is unavailable" };
+  const ledgerUnavailable = (error: unknown) => error instanceof EvidenceError && error.code === "unavailable";
+  // A route that changes something reads the ledger first, so an unreadable ledger answers 503 before the change.
+  // The error handler below maps `unavailable` for every usage route.
+  const requireLedger = () => { if (!usage.readable()) throw new EvidenceError("unavailable", "The usage ledger is unavailable."); };
+  app.use("/api/usage", (_req, res, next) => usage.available() ? next() : void res.status(503).json(usageUnavailable));
   app.get("/api/usage", (_req, res) => res.json(usage.summary()));
   app.get("/api/evidence/status", (_req, res) => res.json(evidence.describe()));
   app.get("/api/usage/models", (req, res) => {
     const query = z.object({ role: z.string().trim().min(1).max(40).optional() }).strict().parse(req.query);
-    return res.json(scorecard(teams.list(), sessionId => {
+    // An unreadable session is not "no measurement": the whole scorecard answers 503 instead.
+    let unreadable = false;
+    const rows = scorecard(teams.list(), sessionId => {
       const found = usage.session(sessionId);
+      if (!found.measured && found.unavailable) unreadable = true;
       return found.measured ? { cost: found.cost, tokens: found.tokens.input + found.tokens.output + found.tokens.reasoning + found.tokens.cacheRead + found.tokens.cacheWrite, unpriced: found.pricing.unknown } : undefined;
-    }, { role: query.role }));
+    }, { role: query.role });
+    if (unreadable) throw new EvidenceError("unavailable", "The usage ledger is unavailable.");
+    return res.json(rows);
   });
   app.get("/api/usage/daily", (req, res, next) => {
     try { const query = z.object({ days: z.coerce.number().int().min(1).max(366).default(30), tz: z.string().default("UTC"), project: z.string().optional() }).strict().parse(req.query); return void res.json(usage.daily({ days: query.days, tz: query.tz, projectId: query.project })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone or day range" }); return next(error); }
@@ -613,10 +626,13 @@ export function createApp(config: Config, key: Buffer) {
     if (account.kind !== "subscription") return void res.status(400).json({ error: "Only subscription plans can be updated" });
     const body = usagePlanSchema.safeParse(req.body);
     if (!body.success) return void res.status(400).json({ error: "Invalid usage plan" });
+    requireLedger();
     usage.setPlan(accountId, body.data.planUsd);
     return void res.json({ accounts: usage.summary().accounts });
   });
-  app.post("/api/usage/balances/refresh", requireRole(["owner"]), async (_req, res) => { await balances.refresh(true); return res.json({ accounts: usage.summary().accounts }); });
+  app.post("/api/usage/balances/refresh", requireRole(["owner"]), async (_req, res) => { requireLedger(); await balances.refresh(true); return res.json({ accounts: usage.summary().accounts }); });
+  // Maps a ledger read that found the store unavailable to the usage 503 answer, whichever route made it.
+  app.use("/api/usage", (error: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => ledgerUnavailable(error) ? void res.status(503).json(usageUnavailable) : next(error));
   app.post("/api/dictation/cleanup", requireRole(["owner", "controller"]), async (req, res) => {
     const body = z.object({ text: z.string().trim().min(1).max(32000) }).strict().parse(req.body);
     if (!dictationCleaner) return void res.status(503).json({ code: "dictation-unavailable", error: "This host has no dictation model configured." });

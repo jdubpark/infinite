@@ -691,9 +691,17 @@ export function usageLines(summary: import("./usage-service.js").UsageSummary): 
   const width = Math.max(...Object.keys(summary.providers).map(name => name.length));
   return Object.entries(summary.providers).map(([name, entry]) => {
     const label = name.padEnd(width);
-    if (!entry.measured || !entry.spent) return `${label}  unmeasured (${entry.unmeasuredSessions} session${entry.unmeasuredSessions === 1 ? "" : "s"}, no usage is recorded for this provider)`;
     const days = Math.round((Date.parse(entry.period.end) - Date.parse(entry.period.start)) / 86_400_000);
     const word = entry.budget?.period ?? (days <= 1 ? "day" : days <= 7 ? "week" : "month");
+    if (!entry.measured || !entry.spent) {
+      // A provider without Spent still shows the tokens its ledger recorded, with its gaps counted beside them.
+      if (entry.recorded && entry.recorded.messages > 0) {
+        const tokens = Object.values(entry.recorded.tokens).reduce((sum, value) => sum + value, 0);
+        const partial = entry.partialSessions ? `, ${entry.partialSessions} partial` : "";
+        return `${label}  ${tokens} tokens for ${word} from ${entry.period.start.slice(0, 10)} (${entry.recorded.messages} steps${partial}, ${entry.unmeasuredSessions} unmeasured sessions)`;
+      }
+      return `${label}  unmeasured (${entry.unmeasuredSessions} session${entry.unmeasuredSessions === 1 ? "" : "s"}, no usage is recorded for this provider)`;
+    }
     const unpriced = entry.spent.pricing.unknown;
     const detail = [`${entry.spent.messages} steps`, ...(unpriced ? [`${unpriced} unpriced`] : []), `${entry.unmeasuredSessions} unmeasured sessions`].join(", ");
     const { messages, pricing } = entry.spent, noPrice = messages > 0 && pricing.unknown === messages;

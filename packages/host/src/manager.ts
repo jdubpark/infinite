@@ -32,6 +32,10 @@ import { missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch 
 import { withNativeContinuation } from "./native-continuation.js";
 import { agentBoundary, inventoryRuntimeProcesses, runtimeIdentity, stopRuntimeTree, type RuntimeProcess, type TeamRuntimeInspection, type TeamRuntimeRetirement } from "./team-retirement.js";
 import { TeamError } from "./team-workspace.js";
+import {
+  SESSION_PURPOSES,
+  type SessionPurpose,
+} from "./types.js";
 import type {
   Config,
   Provider,
@@ -387,9 +391,12 @@ export class Manager {
     return operation;
   }
   /** The team scheduler owns cwd selection, below the root its run was created under. Public create requests never accept this override. */
-  createTeamSession(request: CreateSession, team: TeamAssignment, cwd: string, modelProfile?: TeamModelProfile, workspaceRoot?: string, workspaceTrusted = false): Promise<Session & WorkerState> {
+  createTeamSession(request: CreateSession, team: TeamAssignment, cwd: string, modelProfile?: TeamModelProfile, workspaceRoot?: string, workspaceTrusted = false,
+    header: { purpose?: SessionPurpose; configId?: string } = {}): Promise<Session & WorkerState> {
     if (!this.config.teams || request.nativeArgs !== undefined || request.localUi || request.workspace || request.resumedFrom)
       throw new ContentError("Team sessions require a configured team workspace and managed launch", 400);
+    if (header.purpose !== undefined && !SESSION_PURPOSES.includes(header.purpose)) throw new ContentError("The session purpose is not recognized", 400);
+    if (header.configId !== undefined && !/^[0-9a-f]{64}$/.test(header.configId)) throw new ContentError("The session config ID must be a lowercase SHA-256 digest", 400);
     let continuation: NativeContinuation | undefined;
     if (request.continuation !== undefined) {
       const parsed = nativeContinuationSchema.safeParse(request.continuation);
@@ -406,7 +413,10 @@ export class Manager {
     const rel = relative(root, canonical);
     if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new ContentError("Invalid team working directory", 400);
     // Trust is outside the request fingerprint: a replay returns the session as first created.
-    const operation = this.serial.then(() => this.createOnce({ ...request, ...(continuation ? { continuation } : {}), team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}) }, workspaceTrusted));
+    const operation = this.serial.then(() => this.createOnce({
+      ...request, ...(continuation ? { continuation } : {}), team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}),
+      ...(header.purpose !== undefined ? { purpose: header.purpose } : {}), ...(header.configId !== undefined ? { configId: header.configId } : {}),
+    }, workspaceTrusted));
     this.serial = operation.catch(() => {});
     return operation;
   }
@@ -824,7 +834,7 @@ export class Manager {
     // Use the same admission queue as create, without re-entering it.
     return remember(await this.createOnce(request));
   }
-  private async createOnce(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile }, workspaceTrusted = false) {
+  private async createOnce(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false) {
     if (!request.resumedFrom && request.nativeArgs) assertFreshNativeContext(request.provider, request.nativeArgs);
     if (request.workspace && (request.provider !== "codex" || !request.localUi))
       throw new Error("Laptop execution requires the Codex native interface");
@@ -875,6 +885,8 @@ export class Manager {
       id,
       ...(request.team ? { team: request.team } : {}),
       ...(request.teamModelProfile ? { teamModelProfile: request.teamModelProfile } : {}),
+      ...(request.purpose !== undefined ? { purpose: request.purpose } : {}),
+      ...(request.configId !== undefined ? { configId: request.configId } : {}),
       ...(request.team && workspaceTrusted ? { workspaceTrusted: true as const } : {}),
       backend: "infinite",
       machineId: this.config.machine?.id,

@@ -42,7 +42,7 @@ import { teamReportEnvelopeSchema, type TeamAssignment } from "./team-types.js";
 import { missionReportEnvelopeSchema } from "./mission-types.js";
 import { isCollapsedPermissionPrompt, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import type { TranscriptMessage } from "./transcript.js";
-import { TranscriptWatch } from "./transcript-watch.js";
+import { TranscriptWatch, closesTurn } from "./transcript-watch.js";
 import { buildLaunch } from "./launch.js";
 import { addProjectIdToLaunchEnv } from "./worker-env.js";
 import { claudeConfigPath, recordClaudeTrust } from "./workspace-trust.js";
@@ -329,7 +329,7 @@ function onTranscript(body: unknown): HookReply | void {
   const reply = transcriptWatch.post(body);
   if (!reply) return;
   for (const message of reply.messages) recordMessage(message);
-  return { after: reply.after };
+  return reply.secondaries ? { after: reply.after, secondaries: reply.secondaries } : { after: reply.after };
 }
 let handoffReceipt: string | undefined;
 let handoffStopping = false;
@@ -423,14 +423,15 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | void
   }
   // The same authenticated primary hook names the conversation file; the reply asks the relay
   // for its bytes from where the worker left off.
-  // Every provider hook reaches the watch. Only the authenticated primary hook names the conversation file.
+  // Every provider hook reaches the watch. A subagent hook may name the conversation file as well: the watch
+  // lets it drain the primary it already reads, and never lets it open or replace one.
   const path = b.transcript_path;
   const transcriptPath = nativeId !== undefined && typeof path === "string" && path.startsWith("/") && path.endsWith(".jsonl") && path.length <= 4096 && !/[\x00-\x1f]/.test(path)
     ? path
     : undefined;
   const started = transcriptWatch.hook({
     subagent: b.agent_id !== undefined,
-    turnEnd: signals.some(signal => signal.kind === "turn-end") || event === "SessionEnd",
+    turnEnd: closesTurn(signals, event),
     ...(transcriptPath !== undefined ? { transcript: { path: transcriptPath, provider: route === "claude" ? "claude" : "codex" } } : {}),
   });
   let reply: HookReply | void = started ? { transcript: started } : undefined;

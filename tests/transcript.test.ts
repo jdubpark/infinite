@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import fs, { appendFileSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { TranscriptTail, parseTranscriptRecord } from "../packages/host/src/transcript.js";
 import { findCodexRollout, relay } from "../packages/host/src/hook-relay.js";
 import { startHookServer, type HookReply } from "../packages/host/src/hooks.js";
@@ -216,5 +217,278 @@ test("the relay sends no end mark when a post after a chunk fails", async () => 
     await relay("claude", JSON.stringify({ hook_event_name: "Stop", session_id: "s", transcript_path: path }), { url: "http://worker.test", token: "t", fetch: worker.fetch });
     assert.equal(worker.posts.length, 2);
     assert.equal(worker.posts.some(post => post.end === true), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+/**
+ * A worker for the secondary tests. It asks for secondaries unless `ask` is false, answers the primary
+ * end mark with `wanted`, and moves a secondary's cursor only when `advance` allows that name.
+ */
+function fakeSecondaryWorker(path: string, options: { ask?: boolean; wanted?: unknown[]; advance?: (name: string) => boolean; onEnd?: () => void; onSecondaryPost?: (name: string) => void } = {}) {
+  const posts: Record<string, unknown>[] = [];
+  const cursors = new Map<string, number>();
+  const reply = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+  const fake = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    if (!url.endsWith("/transcript")) return reply({ transcript: { path, after: 0, drain: 7, ...(options.ask === false ? {} : { secondaries: true }) } });
+    posts.push(body);
+    if (typeof body.secondary !== "string") {
+      if (body.end === true) {
+        options.onEnd?.();
+        // The wanted list names where each file starts, so its cursor starts there too.
+        for (const item of options.wanted ?? []) {
+          const want = item as { name: string; after: number };
+          cursors.set(want.name, want.after);
+        }
+        return reply({ after: body.offset, secondaries: options.wanted });
+      }
+      return reply({ after: Number(body.offset) + Buffer.byteLength(String(body.text)) });
+    }
+    const name = body.secondary;
+    if (body.end === true || typeof body.text !== "string") return reply({});
+    options.onSecondaryPost?.(name);
+    const current = cursors.get(name) ?? 0;
+    if (body.offset !== current || !(options.advance?.(name) ?? true)) return reply({ after: current });
+    const after = current + Buffer.byteLength(body.text);
+    cursors.set(name, after);
+    return reply({ after });
+  }) as typeof fetch;
+  return { fetch: fake, posts };
+}
+
+/** A primary transcript and the subagent folder Claude Code writes beside it. */
+function secondaryFixture(root: string) {
+  const path = join(root, "s.jsonl");
+  const folder = join(root, "s", "subagents");
+  mkdirSync(folder, { recursive: true });
+  writeFileSync(path, claude("user", "u1", "short") + "\n");
+  writeFileSync(join(folder, "agent-a.jsonl"), "a".repeat(20));
+  writeFileSync(join(folder, "agent-a.meta.json"), "{}");
+  writeFileSync(join(folder, "agent-b.jsonl"), "0123456789");
+  writeFileSync(join(folder, "notes.jsonl"), "{}");
+  mkdirSync(join(folder, "agent-dir.jsonl"));
+  symlinkSync(join(folder, "agent-a.jsonl"), join(folder, "agent-link.jsonl"));
+  return { path, folder };
+}
+
+const secondaryEvent = JSON.stringify({ hook_event_name: "Stop", session_id: "s", transcript_path: "unused" });
+
+/** A file's identity as the relay reports it: `<device>:<inode>`, exact for large inode numbers. */
+const idOf = (file: string) => {
+  const info = lstatSync(file, { bigint: true });
+  return `${info.dev}:${info.ino}`;
+};
+
+test("the relay lists secondary transcripts on the end mark when asked", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-secondary-list-"));
+  try {
+    const { path, folder } = secondaryFixture(root);
+    const asked = fakeSecondaryWorker(path);
+    await relay("claude", secondaryEvent, { url: "http://worker.test", token: "t", fetch: asked.fetch });
+    const size = Buffer.byteLength(claude("user", "u1", "short") + "\n");
+    assert.deepEqual(asked.posts.at(-1), {
+      path, offset: size, end: true, drain: 7,
+      secondaries: {
+        files: [
+          { name: "agent-a.jsonl", size: 20, id: idOf(join(folder, "agent-a.jsonl")) },
+          { name: "agent-b.jsonl", size: 10, id: idOf(join(folder, "agent-b.jsonl")) },
+        ],
+        total: 2,
+      },
+    });
+    assert.notEqual(idOf(join(folder, "agent-a.jsonl")), idOf(join(folder, "agent-b.jsonl")), "two files have different ids");
+
+    const quiet = fakeSecondaryWorker(path, { ask: false });
+    await relay("claude", secondaryEvent, { url: "http://worker.test", token: "t", fetch: quiet.fetch });
+    assert.equal("secondaries" in (quiet.posts.at(-1) ?? {}), false, "no listing when the reply does not ask");
+
+    const lonely = join(root, "lonely.jsonl");
+    writeFileSync(lonely, claude("user", "u2", "short") + "\n");
+    const missing = fakeSecondaryWorker(lonely);
+    await relay("claude", secondaryEvent, { url: "http://worker.test", token: "t", fetch: missing.fetch });
+    assert.deepEqual(missing.posts.at(-1)?.secondaries, { files: [], total: 0 }, "a missing folder lists nothing");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("the relay streams the secondary transcripts the worker asks for", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-secondary-stream-"));
+  try {
+    const { path } = secondaryFixture(root);
+    const worker = fakeSecondaryWorker(path, { wanted: [{ name: "agent-a.jsonl", after: 0 }, { name: "agent-b.jsonl", after: 4 }] });
+    await relay("claude", secondaryEvent, { url: "http://worker.test", token: "t", fetch: worker.fetch });
+    const streamed = worker.posts.filter(post => post.secondary !== undefined);
+    assert.deepEqual(streamed, [
+      { path, secondary: "agent-a.jsonl", offset: 0, text: "a".repeat(20), drain: 7 },
+      { path, secondary: "agent-a.jsonl", offset: 20, end: true, drain: 7 },
+      { path, secondary: "agent-b.jsonl", offset: 4, text: "456789", drain: 7 },
+      { path, secondary: "agent-b.jsonl", offset: 10, end: true, drain: 7 },
+    ]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("the relay opens only the names it listed", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-secondary-names-"));
+  const realOpen = fs.openSync;
+  try {
+    const { path } = secondaryFixture(root);
+    const worker = fakeSecondaryWorker(path, { wanted: [
+      { name: "notes.jsonl", after: 0 },
+      { name: "../s.jsonl", after: 0 },
+      { name: "agent-missing.jsonl", after: 0 },
+      { name: "agent-link.jsonl", after: 0 },
+      { name: "agent-a.jsonl", after: -1 },
+      { name: "agent-b.jsonl", after: 0 },
+      // A repeated name is streamed once.
+      { name: "agent-b.jsonl", after: 0 },
+    ] });
+    const opened: string[] = [];
+    fs.openSync = ((file: fs.PathLike, ...rest: unknown[]) => {
+      opened.push(String(file));
+      return (realOpen as (...args: unknown[]) => number)(file, ...rest);
+    }) as typeof fs.openSync;
+    syncBuiltinESMExports();
+    try {
+      await relay("claude", secondaryEvent, { url: "http://worker.test", token: "t", fetch: worker.fetch });
+    } finally {
+      fs.openSync = realOpen;
+      syncBuiltinESMExports();
+    }
+    const streamed = worker.posts.filter(post => post.secondary !== undefined);
+    assert.deepEqual([...new Set(streamed.map(post => post.secondary))], ["agent-b.jsonl"]);
+    assert.equal(streamed.filter(post => post.text !== undefined).length, 1, "streamed once");
+    assert.deepEqual(opened.filter(file => file.includes("subagents")).map(file => basename(file)), ["agent-b.jsonl"]);
+  } finally { fs.openSync = realOpen; rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a symbolic link in the secondary folder path is not listed", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-secondary-link-"));
+  try {
+    // The subagents folder is a link to a folder that holds a subagent transcript.
+    const linked = join(root, "s.jsonl");
+    writeFileSync(linked, claude("user", "u1", "short") + "\n");
+    const elsewhere = join(root, "elsewhere");
+    mkdirSync(elsewhere);
+    writeFileSync(join(elsewhere, "agent-x.jsonl"), "xxxx");
+    mkdirSync(join(root, "s"));
+    symlinkSync(elsewhere, join(root, "s", "subagents"));
+    const first = fakeSecondaryWorker(linked);
+    await relay("claude", secondaryEvent, { url: "http://worker.test", token: "t", fetch: first.fetch });
+    assert.deepEqual(first.posts.at(-1)?.secondaries, { files: [], total: 0 });
+
+    // The session folder is a link to a folder whose subagents folder holds a subagent transcript.
+    const other = join(root, "other");
+    mkdirSync(join(other, "subagents"), { recursive: true });
+    writeFileSync(join(other, "subagents", "agent-x.jsonl"), "xxxx");
+    const throughLink = join(root, "t.jsonl");
+    writeFileSync(throughLink, claude("user", "u2", "short") + "\n");
+    symlinkSync(other, join(root, "t"));
+    const second = fakeSecondaryWorker(throughLink);
+    await relay("claude", secondaryEvent, { url: "http://worker.test", token: "t", fetch: second.fetch });
+    assert.deepEqual(second.posts.at(-1)?.secondaries, { files: [], total: 0 });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a file replaced after the listing is not streamed", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-secondary-replace-"));
+  try {
+    const { path, folder } = secondaryFixture(root);
+    const wanted = [{ name: "agent-a.jsonl", after: 0 }];
+    // Control: the same reply streams the listed file when nothing replaces it.
+    const control = fakeSecondaryWorker(path, { wanted });
+    await relay("claude", secondaryEvent, { url: "http://worker.test", token: "t", fetch: control.fetch });
+    assert.ok(control.posts.some(post => post.secondary === "agent-a.jsonl" && post.text !== undefined));
+
+    // The file is replaced with a new one of the same name while the end mark is answered. The old file stays
+    // under another name, so the new file cannot reuse its identity.
+    const replaced = fakeSecondaryWorker(path, {
+      wanted,
+      onEnd: () => {
+        renameSync(join(folder, "agent-a.jsonl"), join(folder, "agent-a.old"));
+        writeFileSync(join(folder, "agent-a.jsonl"), "y".repeat(20));
+      },
+    });
+    await relay("claude", secondaryEvent, { url: "http://worker.test", token: "t", fetch: replaced.fetch });
+    assert.equal(replaced.posts.some(post => post.secondary === "agent-a.jsonl"), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a secondary that grows while it is read ends at the new size", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-secondary-grow-"));
+  try {
+    const { path, folder } = secondaryFixture(root);
+    const worker = fakeSecondaryWorker(path, {
+      wanted: [{ name: "agent-a.jsonl", after: 0 }],
+      onSecondaryPost: name => { if (name === "agent-a.jsonl" && worker.posts.filter(post => post.secondary === name).length === 1) appendFileSync(join(folder, name), "b".repeat(10)); },
+    });
+    await relay("claude", secondaryEvent, { url: "http://worker.test", token: "t", fetch: worker.fetch });
+    assert.deepEqual(worker.posts.filter(post => post.secondary !== undefined), [
+      { path, secondary: "agent-a.jsonl", offset: 0, text: "a".repeat(20), drain: 7 },
+      { path, secondary: "agent-a.jsonl", offset: 20, text: "b".repeat(10), drain: 7 },
+      { path, secondary: "agent-a.jsonl", offset: 30, end: true, drain: 7 },
+    ]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a route other than claude never lists", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-secondary-codex-"));
+  try {
+    const { path } = secondaryFixture(root);
+    // The same transcript listed under claude is the positive control.
+    const claudeWorker = fakeSecondaryWorker(path);
+    await relay("claude", secondaryEvent, { url: "http://worker.test", token: "t", fetch: claudeWorker.fetch });
+    assert.ok("secondaries" in (claudeWorker.posts.at(-1) ?? {}));
+    const worker = fakeSecondaryWorker(path);
+    await relay("codex", JSON.stringify({ hook_event_name: "Stop", session_id: "s", transcript_path: path }), { url: "http://worker.test", token: "t", fetch: worker.fetch });
+    assert.equal("secondaries" in (worker.posts.at(-1) ?? {}), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("more than 64 secondary files are listed as a cut", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-secondary-cut-"));
+  try {
+    const { path, folder } = secondaryFixture(root);
+    for (let i = 0; i < 70; i++) writeFileSync(join(folder, `agent-${String(i).padStart(3, "0")}.jsonl`), "");
+    const worker = fakeSecondaryWorker(path);
+    await relay("claude", secondaryEvent, { url: "http://worker.test", token: "t", fetch: worker.fetch });
+    const listing = worker.posts.at(-1)?.secondaries as { files: { name: string }[]; total: number };
+    assert.equal(listing.total, 72, "70 generated files plus agent-a and agent-b");
+    assert.equal(listing.files.length, 64);
+    assert.deepEqual(listing.files.slice(0, 2).map(file => file.name), ["agent-000.jsonl", "agent-001.jsonl"]);
+    const sorted = [...Array.from({ length: 70 }, (_, i) => `agent-${String(i).padStart(3, "0")}.jsonl`), "agent-a.jsonl", "agent-b.jsonl"].sort();
+    assert.deepEqual(listing.files.map(file => file.name), sorted.slice(0, 64));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("the secondary budget is shared and stops the stream", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-secondary-budget-"));
+  try {
+    const { path, folder } = secondaryFixture(root);
+    rmSync(join(folder, "agent-a.jsonl"));
+    writeFileSync(join(folder, "agent-a.jsonl"), Buffer.alloc(25 * 1024 * 1024, "x"));
+    const worker = fakeSecondaryWorker(path, { wanted: [{ name: "agent-a.jsonl", after: 0 }, { name: "agent-b.jsonl", after: 0 }] });
+    await relay("claude", secondaryEvent, { url: "http://worker.test", token: "t", fetch: worker.fetch });
+    const streamed = worker.posts.filter(post => post.secondary !== undefined);
+    assert.equal(streamed.length, 128);
+    assert.equal(streamed.some(post => post.end === true), false);
+    assert.equal(streamed.some(post => post.secondary === "agent-b.jsonl"), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a secondary that stops early does not stop the next one", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-secondary-early-"));
+  try {
+    const { path } = secondaryFixture(root);
+    const worker = fakeSecondaryWorker(path, {
+      wanted: [{ name: "agent-a.jsonl", after: 0 }, { name: "agent-b.jsonl", after: 0 }],
+      advance: name => name === "agent-b.jsonl",
+    });
+    await relay("claude", secondaryEvent, { url: "http://worker.test", token: "t", fetch: worker.fetch });
+    const streamed = worker.posts.filter(post => post.secondary !== undefined);
+    assert.deepEqual(streamed, [
+      { path, secondary: "agent-a.jsonl", offset: 0, text: "a".repeat(20), drain: 7 },
+      { path, secondary: "agent-b.jsonl", offset: 0, text: "0123456789", drain: 7 },
+      { path, secondary: "agent-b.jsonl", offset: 10, end: true, drain: 7 },
+    ]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

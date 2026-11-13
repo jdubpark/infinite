@@ -1,7 +1,7 @@
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { relay } from "./hook-relay.js";
+import { relay, secondaryFolder } from "./hook-relay.js";
 const request = process.argv[2] ?? "";
 console.log("Infinite · local continuity rehearsal");
 console.log("This is a deterministic demo process. No model requests are made.");
@@ -16,6 +16,19 @@ const withHooks = request.includes("hook") && Boolean(hookUrl) && Boolean(hookTo
 const transcriptPath = join(tmpdir(), `infinite-rehearsal-${process.pid}.jsonl`);
 if (withHooks) writeFileSync(transcriptPath, "", { mode: 0o600 });
 let records = 0;
+// With `subagent` in the request, one subagent row is written to its own file in the session's subagents
+// folder, as Claude Code writes it. The relay reads that file through the secondary listing, never through chat.
+const subagentRequest = request.includes("subagent");
+function transcribeSubagent() {
+  if (!withHooks || !subagentRequest) return;
+  mkdirSync(secondaryFolder(transcriptPath), { recursive: true, mode: 0o700 });
+  const row = {
+    type: "assistant", uuid: `demo-sub-${process.pid}`, isSidechain: true, timestamp: new Date().toISOString(), sessionId: "demo",
+    message: { id: `msg-demo-sub-${process.pid}`, role: "assistant", model: "rehearsal-sub-model", content: "Checked the build layout.",
+      usage: { input_tokens: 200, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } },
+  };
+  appendFileSync(join(secondaryFolder(transcriptPath), "agent-rehearsal.jsonl"), JSON.stringify(row) + "\n", { mode: 0o600 });
+}
 function transcribe(type: "user" | "assistant", content: unknown) {
   if (!withHooks) return;
   const n = ++records;
@@ -85,6 +98,7 @@ function selectOption(index: number) {
     console.log("Tell Claude what to do differently:");
   } else {
     hook({ hook_event_name: "PostToolUse", tool_name: "Bash", tool_input: { command: "rm -rf build" }, tool_response: { stdout: "", exitCode: 0 }, tool_use_id: "demo-1", duration_ms: 42 });
+    transcribeSubagent();
     transcribe("assistant", [{ type: "text", text: "Removed the build directory. Nothing else changed." }]);
     hook({ hook_event_name: "Stop", stop_hook_active: false, last_assistant_message: "Removed the build directory. Nothing else changed.", background_tasks: [] });
   }

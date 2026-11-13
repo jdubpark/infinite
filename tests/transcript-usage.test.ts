@@ -225,7 +225,7 @@ test("usageRecordKey joins the provider and the message", () => {
 });
 
 test("usage coverage follows the rule table", () => {
-  const complete: UsageCoverageInput = { provider: "claude", hooks: true, rows: 5, records: 2, dropped: false, lastDrain: { complete: true, turnEnd: true }, subagents: false, childThreads: false, totalMismatch: false };
+  const complete: UsageCoverageInput = { provider: "claude", hooks: true, rows: 5, records: 2, dropped: false, lastDrain: { complete: true, turnEnd: true }, secondary: "none", childThreads: false, totalMismatch: false };
   const none = (reason: string) => ({ coverage: "none", reason });
   const partial = (reason: string) => ({ coverage: "partial", reason });
   assert.deepEqual(usageCoverage(complete), { coverage: "complete" });
@@ -239,7 +239,8 @@ test("usage coverage follows the rule table", () => {
   assert.deepEqual(usageCoverage({ ...complete, lastDrain: undefined }), partial("drain-incomplete"));
   assert.deepEqual(usageCoverage({ ...complete, lastDrain: { complete: false, turnEnd: true } }), partial("drain-incomplete"));
   assert.deepEqual(usageCoverage({ ...complete, lastDrain: { complete: true, turnEnd: false } }), partial("stopped-mid-turn"));
-  assert.deepEqual(usageCoverage({ ...complete, subagents: true }), partial("secondary-missing"));
+  assert.deepEqual(usageCoverage({ ...complete, secondary: "complete" }), { coverage: "complete" });
+  assert.deepEqual(usageCoverage({ ...complete, secondary: "missing" }), partial("secondary-missing"));
   assert.deepEqual(usageCoverage({ ...complete, childThreads: true }), partial("child-threads"));
 });
 

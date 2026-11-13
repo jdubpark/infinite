@@ -87,6 +87,33 @@ test("a rehearsal turn journals its usage, and its exit journals the coverage of
   }
 });
 
+test("a rehearsal subagent's usage is journaled from its own transcript", { timeout: 60000 }, async () => {
+  const host = await startHost({ config: { attention } });
+  try {
+    const id = randomUUID();
+    await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "Subagent usage", prompt: "hook dialog subagent" });
+    const detail = await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 15000);
+    const control = await claimControl(host, id, "owner");
+    const answer = await host.fetchApi(`/sessions/${id}/answer`, "owner", { requestId: randomUUID(), promptId: detail.body.attention.prompt.id, option: 0 }, control.headers);
+    assert.equal(answer.body.result, "closed");
+    await waitFor(() => host.fetchApi(`/sessions/${id}/messages`), (r) => r.body.messages.some((m: any) => m.role === "assistant" && /Removed the build directory/.test(m.text)), 15000);
+    await host.fetchApi(`/sessions/${id}/stop`, "owner", { requestId: randomUUID() }, control.headers);
+    await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.status === "exited", 15000);
+    const usage = await journalEvents(host, id, "usage");
+    // The subagent row lives in its own file. Its usage is journaled as secondary, and its text never reaches chat.
+    assert.ok(usage.some((e: any) => e.data.secondary === true && e.data.modelId === "rehearsal-sub-model" && e.data.tokens.input === 200 && e.data.tokens.output === 50));
+    assert.ok(usage.some((e: any) => e.data.secondary !== true && e.data.modelId === "rehearsal-model"));
+    const messages = await host.fetchApi(`/sessions/${id}/messages`);
+    assert.equal(messages.body.messages.some((m: any) => /Checked the build layout\./.test(m.text ?? "")), false, "subagent text never reaches chat");
+    const coverage = await journalEvents(host, id, "usage-coverage");
+    assert.equal(coverage.length, 1);
+    assert.equal(coverage[0].data.coverage, "complete");
+    assert.equal(coverage[0].data.reason, undefined);
+  } finally {
+    await host.stop();
+  }
+});
+
 test("a rehearsal without hooks journals no usage and coverage none for hooks-off", { timeout: 60000 }, async () => {
   const host = await startHost({ config: { attention } });
   try {

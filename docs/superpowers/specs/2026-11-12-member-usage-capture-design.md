@@ -149,7 +149,7 @@ Each session has a coverage value and a fixed reason code. The worker appends on
 
 - `none`: no usage record arrived. Reasons: `hooks-off`, `no-transcript`, `no-usage-fields`, `unsupported`.
 - `partial`: at least one usage record arrived and a gap is possible. Reasons: `running`, `stopped-mid-turn`, `drain-incomplete`, `secondary-missing`, `child-threads`, `row-dropped`.
-- `complete`: the last drain before provider exit reached the end marker for the primary transcript and for every listed secondary transcript, and that drain ran at a turn end or a session end.
+- `complete`: the last drain before provider exit reached the end marker for the primary transcript and for every listed secondary transcript, and that drain ran at a session end, or at a turn end that did not fail and left no background task running.
 
 A session that the host stopped mid-turn stays `partial` with reason `stopped-mid-turn`, also when its final drain reached the end marker. A request in flight at the stop leaves no transcript row, so the end of the file does not prove that every request was counted. The final drain still adds every row the transcript holds.
 
@@ -253,7 +253,7 @@ There is no MCP surface. A member gets no usage tool.
 - A usage total and a limit event record what the host saw. Neither says a task is complete, failed, or valuable.
 - The relay stays the only process that opens a provider file, and the ledger stores no transcript path.
 - The usage tail copies numbers, identifiers, model names, and timestamps. A test asserts that no other key reaches the journal or the store.
-- The transcript reaches the worker through the agent's account, which can write the file. Usage from this path is the provider's record as relayed, not a host receipt, so consumers must not treat cost as tamper-proof.
+- The transcript reaches the worker through the agent's account, which can write the file. Usage from this path is the provider's record as relayed, not a host receipt, so consumers must not treat cost as tamper-proof. The relay's path checks keep an honest session from reading the wrong files. They are not a boundary against a process in the agent's account, which can read the same files and write any transcript row.
 - Usage numbers, list prices, and limit counts never enter a member prompt (C9), and `listUsd` is never shown as money spent (C5).
 
 ## Failure modes

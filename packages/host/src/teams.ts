@@ -944,10 +944,10 @@ export class TeamService {
     return this.createRun(createTeamSchema.parse(request), { goal: teamGoalContextSchema.parse(goal), lineup: teamLineupSchema.parse(lineup) }, linearTracking);
   }
   /** A mission subteam is an ordinary run of one repository under that repository's own policies; the mission pins its lineup. */
-  createForMission(request: CreateTeam, missionId: string, lineup: TeamLineup, options: { baseRunId?: string; parallelismCeiling?: number } = {}): Promise<TeamView> {
+  createForMission(request: CreateTeam, missionId: string, lineup: TeamLineup, options: { baseRunId?: string; parallelismCeiling?: number; linearTracking?: boolean } = {}): Promise<TeamView> {
     const parsed = createTeamSchema.parse(request);
     const project = this.config.projects.find(item => item.id === parsed.projectId);
-    return this.createRun(parsed, { missionId, ...(options.baseRunId ? { baseRunId: options.baseRunId } : {}), parallelismCeiling: options.parallelismCeiling ?? 4, lineup: teamLineupSchema.parse(lineup) }, Boolean(project?.linear));
+    return this.createRun(parsed, { missionId, ...(options.baseRunId ? { baseRunId: options.baseRunId } : {}), parallelismCeiling: options.parallelismCeiling ?? 4, lineup: teamLineupSchema.parse(lineup) }, options.linearTracking ?? Boolean(project?.linear));
   }
   assertHandoffPolicy(policy: HandoffPolicy) {
     const project = this.config.projects.find(item => item.id === policy.projectId);

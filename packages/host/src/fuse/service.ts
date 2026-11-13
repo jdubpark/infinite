@@ -129,8 +129,10 @@ function limitsOf(fuse: FuseConfig | undefined): FuseLimits {
 
 /** A project name as one short line: the label goes into a push body, and the configuration sets no rule for it. */
 function plainLabel(name: string): string {
-  // Control, line-break, direction, and zero-width characters go: none may shape how a notification reads.
-  const line = name.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]+/g, " ").replace(/\s+/g, " ").trim();
+  // Every character of the Unicode "other" classes goes (control, format, surrogate, private use, unassigned),
+  // with the line and paragraph separators and each direction control: none may shape how a notification reads.
+  // A class is used, not a list, so a character such as U+061C cannot be left out.
+  const line = name.replace(/[\p{C}\p{Zl}\p{Zp}\p{Bidi_Control}]+/gu, " ").replace(/\s+/g, " ").trim();
   return [...line].slice(0, 80).join("") || "a project";
 }
 

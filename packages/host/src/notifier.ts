@@ -65,8 +65,9 @@ export class Notifier {
     private readonly storage?: { sample(): Promise<StorageVolume[]> },
     private readonly fuse?: Pick<FuseService, "interrupts" | "markAnnounced">,
   ) {}
-  /** After a fuse push that reached no device, the time of the next attempt. */
+  /** After a fuse push that reached no device, the time of the next attempt, on a clock that never steps back. */
   private fuseRetryAt = 0;
+  private monotonic = () => performance.now();
   /** Lifecycle baselines are taken now, synchronously, so a change during the first interval is not absorbed as startup state. */
   start() { this.teamEvents(); this.goalEvents(); this.timer = setInterval(() => void this.tick().catch(() => {}), this.options.intervalMs); this.timer.unref(); }
   stop() { clearInterval(this.timer); }
@@ -129,7 +130,7 @@ export class Notifier {
         devices.some((_device, device) => tickets[first + index * devices.length + device]?.status === "ok"));
       if (reached.length) this.fuse?.markAnnounced(reached.map((item) => item.tripId));
       // A trip that reached nobody is tried again after a minute, not on every tick.
-      if (reached.length < fuseDue.length) this.fuseRetryAt = Date.now() + 60_000;
+      if (reached.length < fuseDue.length) this.fuseRetryAt = this.monotonic() + 60_000;
     }
     const failures = new Set<string>();
     tickets.forEach((ticket, i) => {
@@ -172,10 +173,7 @@ export class Notifier {
   }
   /** Open spend-fuse trips the owner has not been told about. Nothing is read or marked unless the event is enabled. */
   private fuseEvents(): FuseInterrupt[] {
-    const now = Date.now();
-    // A clock that stepped back must not hold fuse pushes longer than the minute.
-    if (this.fuseRetryAt > now + 60_000) this.fuseRetryAt = now + 60_000;
-    if (!this.fuse || !this.enabled("autonomy-interrupt") || now < this.fuseRetryAt) return [];
+    if (!this.fuse || !this.enabled("autonomy-interrupt") || this.monotonic() < this.fuseRetryAt) return [];
     try { return this.fuse.interrupts(); } catch { return []; }
   }
   private fuseMessage(item: FuseInterrupt, to: string) {

@@ -547,9 +547,15 @@ test("a fuse interrupt whose push failed is offered again", async () => {
   // The next attempt waits a minute, so an outage does not send on every tick.
   await notifier.tick();
   assert.equal(sends, 1);
-  // The minute has passed, and one device now receives its pushes. A trip that reached one device is announced.
-  (notifier as unknown as { fuseRetryAt: number }).fuseRetryAt = 0;
+  // Just under a minute later nothing is sent yet. The wait is measured on a clock that never steps back.
+  const clock = notifier as unknown as { monotonic: () => number };
+  const started = clock.monotonic();
   failing = false;
+  clock.monotonic = () => started + 59_000;
+  await notifier.tick();
+  assert.equal(sends, 1);
+  // The minute has passed, and one device now receives its pushes. A trip that reached one device is announced.
+  clock.monotonic = () => started + 61_000;
   await notifier.tick();
   assert.equal(sends, 2);
   assert.deepEqual(marked, [["trip-1", "trip-2"]]);

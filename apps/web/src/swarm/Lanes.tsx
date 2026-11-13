@@ -126,7 +126,7 @@ function QuietRow({ unit, selection, onSelect, openTeam, now }: Pick<ViewProps, 
     </div>
     <div className="sw-quiet-cell">
       {holdGlyph(unit.hold) ?? terminalGlyph(unit.terminal)}
-      <span className="sw-dim">{elapsed(unit.updatedAt, now)}</span>
+      <span className="sw-dim">{elapsed(unit.lastActivityAt, now)}</span>
     </div>
   </div>;
 }
@@ -169,6 +169,7 @@ export function Lanes(props: ViewProps) {
       <span />
     </div>
     {model.live.map(swarm => <LaneSwarm key={swarm.id} swarm={swarm} {...props} />)}
+    {model.live.length === 0 && <div className="sw-none-live sw-dim">no live agents</div>}
     {model.quiet.length > 0 && <section className="sw-quiet" aria-label="quiet">
       <div className="sw-group-label sw-dim">quiet</div>
       {model.quiet.map(unit => <QuietRow key={unit.id} unit={unit} selection={props.selection} onSelect={props.onSelect} openTeam={props.openTeam} now={props.now} />)}

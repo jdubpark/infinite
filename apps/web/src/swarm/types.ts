@@ -125,7 +125,8 @@ export interface Unit {
   costUsd?: number;
   goalCycle?: number;
   createdAt: string;
-  updatedAt: string;
+  /** When an agent of this run last started, acted, or reported; the run's creation time when none did. */
+  lastActivityAt: string;
   baseCommit: string;
   headCommit?: string;
   tasks: SwarmTask[];

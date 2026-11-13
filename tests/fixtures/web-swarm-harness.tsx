@@ -7,12 +7,12 @@ import { SwarmView, type SwarmViewName } from "../../apps/web/src/swarm/SwarmVie
 import type { SwarmSession, SwarmTeam } from "../../apps/web/src/swarm/types";
 import { swarmFixture, type SwarmFixture } from "./web-swarm-data";
 
-type Variant = { shuffleUpdated: boolean; flipState: boolean };
+type Variant = { shuffleUpdated: boolean; flipState: boolean; idle: boolean };
 const control = {
   requests: [] as string[],
   /** `off` answers the context paths with 404, as a host that predates them does. */
   context: (new URLSearchParams(window.location.search).get("context") === "off" ? "off" : "on") as "on" | "off",
-  variant: { shuffleUpdated: false, flipState: false } as Variant,
+  variant: { shuffleUpdated: false, flipState: false, idle: false } as Variant,
   /** Requests whose path matches fail with a server error until this is cleared. */
   failing: null as RegExp | null,
   view: (_view: SwarmViewName) => {},
@@ -27,6 +27,12 @@ function fixture(): SwarmFixture {
     // The host rewrites `updatedAt` on every monitor pass; a later poll can carry any order of these times.
     base.teams.forEach((team, index) => { if (team.status !== "merged" && team.status !== "cancelled" && team.status !== "blocked") team.updatedAt = new Date(NOW - ((index * 7919) % 97) * 1000).toISOString(); });
     base.missions.forEach(mission => { mission.updatedAt = new Date(NOW - 50_000).toISOString(); });
+  }
+  if (control.variant.idle) {
+    // A host with nothing running: only settled standalone runs remain.
+    base.teams = base.teams.filter(team => !team.missionId && (team.status === "merged" || team.status === "cancelled" || team.status === "blocked"));
+    base.missions = [];
+    base.sessions = base.sessions.filter(session => session.status === "exited");
   }
   if (control.variant.flipState) {
     // One working agent finishes its turn: a state change with no change to who exists.

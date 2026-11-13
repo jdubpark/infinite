@@ -25,7 +25,8 @@ export type GraphData = {
   nodes: GraphNode[];
   links: GraphLink[];
   dropped: { agents: number; projects: number; areas: number; codeLinks: number };
-  codeGraph: "on" | "partial" | "off";
+  /** `none` when no project is drawn, so there is no code graph to report on. */
+  codeGraph: "on" | "partial" | "off" | "none";
   unobserved: number;
 };
 export type GraphInput = {
@@ -300,10 +301,10 @@ export function buildGraph({ model, maps, touches, projectNames }: GraphInput): 
   dropped.codeLinks = Math.max(0, sortedCode.length - GRAPH_BUDGET.codeLinks);
   for (const link of sortedCode.slice(0, GRAPH_BUDGET.codeLinks)) links.set(link.id, link);
 
-  // 9. Code graph state: on when every drawn project has a ready map, off when none does.
+  // 9. Code graph state: on when every drawn project has a ready map, off when none does, none when no project is drawn.
   const projectIds = [...keptProjects];
   const withMap = projectIds.filter(id => readyMap(id)).length;
-  const codeGraph: GraphData["codeGraph"] = withMap === 0 || projectIds.length === 0 ? "off" : withMap === projectIds.length ? "on" : "partial";
+  const codeGraph: GraphData["codeGraph"] = projectIds.length === 0 ? "none" : withMap === 0 ? "off" : withMap === projectIds.length ? "on" : "partial";
 
   return {
     nodes: [...nodes.values()].sort((a, b) => a.id.localeCompare(b.id)),

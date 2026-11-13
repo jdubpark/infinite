@@ -34,7 +34,9 @@ A unit is **live** while it works, waits for input, is paused, or still has an
 agent that is queued, working, waiting, or holding a prompt. Other runs are
 **quiet** and collapse to one row. A quiet run inside a live mission keeps its
 place in that mission. Runs of swarms with nothing live move to a quiet group,
-where each stays for 72 hours by its own age and at most 12 are shown. Vitals
+where each stays for 72 hours after its agents last started, acted, or
+reported, or after its creation when none did, and at most 12 are shown. The host rewrites a run's update time on
+every save, so that time is not used. Vitals
 count agents of live swarms only.
 
 Rows keep their order between polls. Live swarms are ordered by creation time,

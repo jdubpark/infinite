@@ -78,5 +78,6 @@ export function Wall(props: ViewProps) {
   return <div className="sw-wall">
     <div className="sw-wall-note sw-dim">activity: observed since this page opened</div>
     {props.model.live.map(swarm => <WallSwarm key={swarm.id} swarm={swarm} {...props} />)}
+    {props.model.live.length === 0 && <div className="sw-none-live sw-dim">no live agents</div>}
   </div>;
 }

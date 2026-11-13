@@ -254,6 +254,11 @@
   height: 24px;
   line-height: 24px;
 }
+/* Nothing live, but settled runs remain: one quiet line where the rows or tiles would be. */
+.sw-none-live {
+  padding: 28px 0;
+  text-align: center;
+}
 
 /* Wall: fixed tiles on an auto-fill grid. */
 .sw-wall-swarm {

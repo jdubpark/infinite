@@ -73,6 +73,17 @@ function soloState(session: SwarmSession): AgentState {
   return "waiting";
 }
 
+/**
+ * When a run last did something. The host rewrites a run's `updatedAt` on every save, including for settled runs,
+ * so a run's age comes from what its agents did.
+ */
+function lastActivity(team: SwarmTeam): string {
+  let latest = timeOf(team.createdAt);
+  for (const member of team.members)
+    latest = Math.max(latest, timeOf(member.startedAt), timeOf(member.lastActivityAt), timeOf(member.reportedAt));
+  return new Date(latest).toISOString();
+}
+
 const stageIndex = (stage: Stage | undefined) => (stage === undefined ? STAGES.length : STAGES.indexOf(stage));
 
 function sessionAgent(args: {
@@ -188,7 +199,7 @@ function buildUnit(args: {
     costUsd: team.usage?.total.cost,
     goalCycle: team.goal?.cycle,
     createdAt: team.createdAt,
-    updatedAt: team.updatedAt,
+    lastActivityAt: lastActivity(team),
     baseCommit: team.baseCommit,
     headCommit: team.headCommit,
     tasks: team.tasks,
@@ -201,8 +212,6 @@ function waitingOn(swarm: Pick<Swarm, "units" | "coordinator" | "loose">, missio
   return agents.filter(agent => agent.state === "needs-you").length + swarm.units.reduce((sum, unit) => sum + unit.waiting, 0) + missionDecisions;
 }
 
-type Built = { swarm: Swarm; updatedAt: string };
-
 /** Joins the host's session, team, and mission lists into the model the Swarm views render. */
 export function buildSwarm(input: SwarmInput): SwarmModel {
   const sessions = new Map(input.sessions.map(session => [session.id, session]));
@@ -212,7 +221,7 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
     ...input.teams.flatMap(team => team.members.map(member => member.sessionId)),
     ...input.missions.flatMap(mission => mission.coordinator ? [mission.coordinator.sessionId] : []),
   ]);
-  const built: Built[] = [];
+  const built: Swarm[] = [];
 
   for (const mission of input.missions) {
     const subtaskTeams = mission.subtasks.flatMap(subtask => subtask.teamId ? [subtask.teamId] : []);
@@ -254,7 +263,7 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
     };
     const openMissionDecisions = mission.decisions.filter(decision => decision.answer === undefined).length;
     swarm.waiting = waitingOn(swarm, openMissionDecisions);
-    built.push({ swarm, updatedAt: mission.updatedAt });
+    built.push(swarm);
   }
 
   for (const team of input.teams) {
@@ -264,7 +273,7 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
       id: team.id, kind: "team", title: team.title, live: unit.live, units: [unit], ghosts: [], loose: [],
       waiting: waitingOn({ units: [unit], loose: [] }, 0), costUsd: team.usage?.total.cost, createdAt: team.createdAt,
     };
-    built.push({ swarm, updatedAt: team.updatedAt });
+    built.push(swarm);
   }
 
   const loose = input.sessions
@@ -274,27 +283,26 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
       title: session.title, provider: session.provider, costUsd: session.usage?.cost,
     }));
   if (loose.length > 0) {
-    built.push({ swarm: {
+    built.push({
       id: "solo", kind: "solo", title: "solo", live: true, units: [], ghosts: [], loose,
       waiting: loose.filter(agent => agent.state === "needs-you").length,
       costUsd: loose.reduce((sum, agent) => sum + (agent.costUsd ?? 0), 0),
       createdAt: new Date(input.now).toISOString(),
-    }, updatedAt: new Date(input.now).toISOString() });
+    });
   }
 
   // Order never depends on state: a swarm that starts waiting on a person keeps its row. Its marks and the vitals carry that.
   const rank = (swarm: Swarm) => (swarm.kind === "solo" ? 1 : 0);
   const live = built
-    .map(item => item.swarm)
     .filter(swarm => swarm.live)
     .sort((a, b) => rank(a) - rank(b) || timeOf(b.createdAt) - timeOf(a.createdAt) || a.id.localeCompare(b.id));
 
-  // Quiet runs are counted one by one, by their own age: a mission's twenty finished runs are twenty rows to cap, not one.
+  // Quiet runs are counted one by one, by the age of their own last activity: a mission's twenty finished runs are twenty rows to cap, not one.
   const cutoff = input.now - QUIET_WINDOW_MS;
-  const quietAll = built.filter(item => !item.swarm.live && item.swarm.kind !== "solo").flatMap(item => item.swarm.units);
+  const quietAll = built.filter(swarm => !swarm.live && swarm.kind !== "solo").flatMap(swarm => swarm.units);
   const quiet = quietAll
-    .filter(unit => timeOf(unit.updatedAt) >= cutoff)
-    .sort((a, b) => timeOf(b.updatedAt) - timeOf(a.updatedAt) || a.id.localeCompare(b.id))
+    .filter(unit => timeOf(unit.lastActivityAt) >= cutoff)
+    .sort((a, b) => timeOf(b.lastActivityAt) - timeOf(a.lastActivityAt) || a.id.localeCompare(b.id))
     .slice(0, QUIET_LIMIT);
 
   const byState = Object.fromEntries(AGENT_STATES.map(state => [state, 0])) as Record<AgentState, number>;

@@ -168,7 +168,7 @@ test("live and quiet", () => {
   const model = buildSwarm(input({
     teams: [
       team("checkout-v2", { status: "blocked", members: [member("stopped-a", { status: "stopped" })] }),
-      team("api", { status: "merged", updatedAt: iso(80 * HOUR) }),
+      team("api", { status: "merged", createdAt: iso(90 * HOUR), members: [member("old", { status: "stopped", lastActivityAt: iso(80 * HOUR) })] }),
     ],
   }));
   assert.equal(model.live.length, 0);
@@ -177,7 +177,7 @@ test("live and quiet", () => {
   assert.equal(model.quietOlder, 1);
 
   const many = buildSwarm(input({
-    teams: Array.from({ length: 14 }, (_, index) => team(`run-${index}`, { status: "blocked", updatedAt: iso(index * 60_000) })),
+    teams: Array.from({ length: 14 }, (_, index) => team(`run-${index}`, { status: "blocked", createdAt: iso(HOUR + index * 60_000) })),
   }));
   assert.equal(many.quiet.length, 12);
   assert.equal(many.quietOlder, 2);
@@ -185,8 +185,8 @@ test("live and quiet", () => {
   // Quiet runs are capped and aged one by one, even inside one finished mission that changed a moment ago.
   const mission14 = buildSwarm(input({
     teams: [
-      ...Array.from({ length: 14 }, (_, index) => team(`sub-${index}`, { missionId: "M-1", status: "merged", updatedAt: iso(index * 60_000) })),
-      team("sub-old", { missionId: "M-1", status: "merged", updatedAt: iso(80 * HOUR) }),
+      ...Array.from({ length: 14 }, (_, index) => team(`sub-${index}`, { missionId: "M-1", status: "merged", createdAt: iso(HOUR + index * 60_000) })),
+      team("sub-old", { missionId: "M-1", status: "merged", createdAt: iso(80 * HOUR) }),
     ],
     missions: [mission("M-1", { status: "ready-for-review", updatedAt: iso(1_000), coordinator: { memberId: "c", sessionId: "s-gone", status: "stopped" } })],
   }));
@@ -194,6 +194,21 @@ test("live and quiet", () => {
   assert.equal(mission14.quiet.length, 12);
   assert.ok(!mission14.quiet.some(unit => unit.id === "sub-old"), "an old run does not ride on its mission's newer timestamp");
   assert.equal(mission14.quietOlder, 3);
+
+  // The host rewrites updatedAt on every save, so a settled run ages by what its agents last did.
+  const churned = buildSwarm(input({
+    teams: [
+      team("weeks-old", { status: "merged", createdAt: iso(500 * HOUR), updatedAt: iso(2_000),
+        members: [member("w", { status: "stopped", startedAt: iso(499 * HOUR), lastActivityAt: iso(498 * HOUR), reportedAt: iso(497 * HOUR) })] }),
+      team("yesterday", { status: "merged", createdAt: iso(40 * HOUR), updatedAt: iso(2_000),
+        members: [member("y1", { status: "stopped", lastActivityAt: iso(30 * HOUR) }), member("y2", { status: "stopped", revision: 0, reportedAt: iso(26 * HOUR) })] }),
+      team("no-members", { status: "cancelled", createdAt: iso(10 * HOUR), updatedAt: iso(2_000) }),
+    ],
+  }));
+  assert.deepEqual(churned.quiet.map(unit => unit.id), ["no-members", "yesterday"]);
+  assert.equal(churned.quietOlder, 1);
+  assert.equal(findUnit(churned, "yesterday")?.lastActivityAt, iso(26 * HOUR), "the latest activity of any member counts, whatever its revision");
+  assert.equal(findUnit(churned, "no-members")?.lastActivityAt, iso(10 * HOUR), "a run without members ages from its creation");
 });
 
 test("stable order", () => {

@@ -57,6 +57,8 @@ type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedA
 const REMOVAL_RETRY_MS = 5 * 60_000;
 /** A run's record waits at most this long for its events to reach the evidence store before retention removes it. */
 const EVIDENCE_WAIT_MS = 24 * 3600_000;
+/** Ledger-only reads that may be pending in one service. A read that never ends keeps its place. */
+const ENRICH_LIMIT = 16;
 const REVIEW_QUIET_WINDOW_MS = 5 * 60_000;
 /** Event kinds whose drop has been logged; one line per kind for the life of the process. */
 const droppedEventKinds = new Set<string>();
@@ -375,6 +377,8 @@ export class TeamService {
   private running = false;
   private closed = false;
   private tickQueued = false;
+  /** Ledger-only reads in flight. See `enrich`. */
+  private enrichments = 0;
   private readonly commands = new Map<string, AbortController>();
   private readonly removingRuns = new Set<string>();
   private readonly removalTasks = new Set<Promise<void>>();
@@ -4388,6 +4392,10 @@ export class TeamService {
    *  applies. A read that fails, times out, or is refused emits nothing. The emit runs only while the record is still live. */
   private enrich(stored: Stored, read: (signal: AbortSignal) => Promise<(() => void) | undefined>): void {
     if (!this.options?.events) return;
+    // Under a launcher the host cannot signal, a stalled read may never end. A fixed number may be pending, so a
+    // stall leaves a bounded number behind. One more is skipped, and its event is absent.
+    if (this.enrichments >= ENRICH_LIMIT) return;
+    this.enrichments += 1;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 30000);
     // A pending enrichment must not keep the host process alive at shutdown.
@@ -4399,7 +4407,7 @@ export class TeamService {
         emit();
         this.flushOutbox(stored);
       } catch { /* A ledger read never changes the run. */ }
-      finally { clearTimeout(timer); }
+      finally { clearTimeout(timer); this.enrichments -= 1; }
     })();
   }
   /** Best-effort `git rev-parse --verify <commit>^{tree}` in `run.workspace` through `teamCommand` and `teamGitArgs`, 30 s. A 40- or 64-hex stdout, else undefined. Never throws. */

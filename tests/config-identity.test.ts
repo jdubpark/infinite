@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -263,6 +263,96 @@ test("guidance is read from a commit", async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/** A command prefix that logs each command line to `log`, runs `act` for a guidance read, and then runs the command. */
+function loggingPrefix(log: string, act = "") {
+  const script = `const { appendFileSync } = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const [log, command, ...args] = process.argv.slice(1);
+appendFileSync(log, JSON.stringify([command, ...args]) + "\\n");
+if (args.includes("diff-tree")) { ${act} }
+const result = spawnSync(command, args, { cwd: process.cwd(), stdio: "inherit" });
+process.exit(result.status ?? 1);`;
+  return { command: process.execPath, args: ["-e", script, log] };
+}
+const guidanceReads = (log: string) => readFileSync(log, "utf8").split("\n").filter(line => line.includes("diff-tree")).length;
+
+test("one guidance read serves every caller of a commit", async () => {
+  const repo = temporaryRepository();
+  try {
+    writeFileSync(join(repo.dir, "AGENTS.md"), "shared guidance\n");
+    repo.git(["add", "."]);
+    repo.git(["commit", "-q", "-m", "shared"]);
+    const commit = repo.git(["rev-parse", "HEAD"]);
+    const log = join(repo.dir, ".git", "commands.log");
+    writeFileSync(log, "");
+    const signal = new AbortController().signal;
+    const digests = await Promise.all(Array.from({ length: 5 }, () => readGuidanceDigest(repo.dir, commit, loggingPrefix(log), signal)));
+    assert.match(digests[0] ?? "", HEX64);
+    assert.deepEqual(new Set(digests).size, 1);
+    assert.equal(guidanceReads(log), 1, "five callers start one Git process");
+  } finally {
+    repo.cleanup();
+  }
+});
+
+test("a stalled read ends at the caller's deadline and leaves a bounded number behind", async () => {
+  const repo = temporaryRepository();
+  try {
+    const commits: string[] = [];
+    for (let index = 0; index < 7; index++) {
+      writeFileSync(join(repo.dir, "AGENTS.md"), `guidance ${index}\n`);
+      repo.git(["add", "."]);
+      repo.git(["commit", "-q", "-m", `commit ${index}`]);
+      commits.push(repo.git(["rev-parse", "HEAD"]));
+    }
+    const log = join(repo.dir, ".git", "commands.log");
+    writeFileSync(log, "");
+    // The read sleeps and takes no signal from its callers, as a command that the host cannot stop.
+    const stalled = loggingPrefix(log, "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2000);");
+    const started = Date.now();
+    const results = await Promise.all(commits.slice(0, 6).map(commit => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 100);
+      return readGuidanceDigest(repo.dir, commit, stalled, controller.signal);
+    }));
+    assert.ok(Date.now() - started < 1500, "every caller's wait ends at its own deadline");
+    assert.deepEqual(results, [undefined, undefined, undefined, undefined, undefined, undefined]);
+    // Four reads were started. The fifth and sixth callers found no free place and started none.
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(guidanceReads(log), 4);
+    // The stalled reads end, their places free up, and a new commit is read.
+    await new Promise(resolve => setTimeout(resolve, 2600));
+    const later = await readGuidanceDigest(repo.dir, commits[6]!, loggingPrefix(log), new AbortController().signal);
+    assert.match(later ?? "", HEX64);
+  } finally {
+    repo.cleanup();
+  }
+}, { timeout: 30_000 });
+
+test("a caller with no free place waits for one", async () => {
+  const repo = temporaryRepository();
+  try {
+    const commits: string[] = [];
+    for (let index = 0; index < 6; index++) {
+      writeFileSync(join(repo.dir, "AGENTS.md"), `waiting ${index}\n`);
+      repo.git(["add", "."]);
+      repo.git(["commit", "-q", "-m", `waiting ${index}`]);
+      commits.push(repo.git(["rev-parse", "HEAD"]));
+    }
+    const log = join(repo.dir, ".git", "commands.log");
+    writeFileSync(log, "");
+    // Each read takes a moment, so the fifth and sixth callers find every place taken. They have time to wait.
+    const slow = loggingPrefix(log, "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);");
+    const signal = new AbortController().signal;
+    const digests = await Promise.all(commits.map(commit => readGuidanceDigest(repo.dir, commit, slow, signal)));
+    for (const digest of digests) assert.match(digest ?? "", HEX64);
+    assert.equal(new Set(digests).size, 6);
+    assert.equal(guidanceReads(log), 6, "every commit is read once, four at a time");
+  } finally {
+    repo.cleanup();
+  }
+}, { timeout: 30_000 });
 
 test("a failed guidance read gives nothing", async () => {
   const dir = mkdtempSync(join(tmpdir(), "config-identity-"));

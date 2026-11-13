@@ -133,24 +133,41 @@ test("a configured member records its configuration once", () => {
 });
 
 test("a profile field may be absent or null", () => {
+  // A member with no model and no effort: the emitter leaves both out, and another emitter may send null.
+  const absent = configuredData({}, { model: null, effort: null });
+  delete absent.model;
+  delete absent.effort;
+  const nulls = configuredData({}, { model: null, effort: null });
+  const expected = configId(components({ model: null, effort: null }));
+  // Each form is stored on its own, in an empty store, so neither passes on the other's row.
+  for (const [name, data] of [["absent", absent], ["null", nulls]] as const) {
+    const f = fixture();
+    let store: EvidenceStore | undefined;
+    try {
+      store = open(f);
+      store.register(configurationModule());
+      setupOutbox(store).flush([configuredEvent(`member-${name}`, "2026-11-13T01:00:00.000Z", data)]);
+      const rows = configurationRows(store);
+      assert.equal(rows.length, 1, `${name} fields are stored`);
+      assert.equal(rows[0]!.model, null);
+      assert.equal(rows[0]!.effort, null);
+      assert.equal(rows[0]!.config_id, expected);
+    } finally {
+      store?.close();
+      f.close();
+    }
+  }
+  // Both forms name one configuration.
   const f = fixture();
   let store: EvidenceStore | undefined;
   try {
     store = open(f);
     store.register(configurationModule());
     const outbox = setupOutbox(store);
-    // A member with no model and no effort: the emitter leaves both out, and an older or other emitter may send null.
-    const absent = configuredData({}, { model: null, effort: null });
-    delete absent.model;
-    delete absent.effort;
-    // The null form comes first, so the row's first-seen time proves that it was stored and not skipped.
-    outbox.flush([configuredEvent("member-null", "2026-11-13T01:00:00.000Z", configuredData({}, { model: null, effort: null }))]);
+    outbox.flush([configuredEvent("member-null", "2026-11-13T01:00:00.000Z", nulls)]);
     outbox.flush([configuredEvent("member-absent", "2026-11-13T02:00:00.000Z", absent)]);
     const rows = configurationRows(store);
-    assert.equal(rows.length, 1, "both forms name one configuration");
-    assert.equal(rows[0]!.model, null);
-    assert.equal(rows[0]!.effort, null);
-    assert.equal(rows[0]!.config_id, configId(components({ model: null, effort: null })));
+    assert.equal(rows.length, 1);
     assert.equal(rows[0]!.first_seen_at, "2026-11-13T01:00:00.000Z");
   } finally {
     store?.close();

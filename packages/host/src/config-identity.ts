@@ -12,6 +12,8 @@ export const GUIDANCE_FILES = ["AGENTS.md", "CLAUDE.md"] as const;
 
 const GUIDANCE_READ_TIMEOUT_MS = 30_000;
 const GUIDANCE_CACHE_LIMIT = 64;
+/** Guidance reads that may run at once in the host. A stalled read that cannot be stopped keeps its place. */
+const GUIDANCE_READS_LIMIT = 4;
 /** Git's empty tree ids. Compared with the commit's id length, so a SHA-256 repository gets its own. */
 const EMPTY_TREE_SHA1 = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const EMPTY_TREE_SHA256 = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321";
@@ -89,6 +91,8 @@ const FIXTURES: { run: TeamRun; work: TeamTask | TeamScout }[] = [
 
 const promptCache = new Map<string, string>();
 const guidanceCache = new Map<string, string>();
+/** Reads in flight, by workspace and commit. A read leaves only when its child has ended. */
+const guidanceReads = new Map<string, Promise<string | undefined>>();
 
 /**
  * The fixture renders of `teamPrompt`. The report command holds the Node path and the reporter's own file path,
@@ -145,17 +149,44 @@ export function guidanceDigest(entries: readonly { path: string; object: string 
   return sha256(canonicalJson(sorted));
 }
 
-/** Best effort. Undefined on any failure. Never throws. Successes are cached per workspace and commit. */
+/**
+ * Best effort. Undefined on any failure. Never throws. Successes are cached per workspace and commit.
+ *
+ * Under a launcher such as sudo the host may not signal the command, so a stalled read cannot be stopped. Three
+ * rules keep that bounded: one read per workspace and commit runs at a time and later callers share it; at most
+ * GUIDANCE_READS_LIMIT reads run at once, and a caller that finds no free place waits for one; and a caller's wait
+ * ends when its signal aborts, whether or not any child has ended.
+ */
 export async function readGuidanceDigest(workspace: string, commit: string, prefix: TeamCommand | undefined, signal: AbortSignal): Promise<string | undefined> {
   const key = JSON.stringify([workspace, commit]);
-  const cached = guidanceCache.get(key);
-  if (cached !== undefined) return cached;
+  const aborted = new Promise<undefined>(resolve => {
+    if (signal.aborted) resolve(undefined);
+    else signal.addEventListener("abort", () => resolve(undefined), { once: true });
+  });
+  for (;;) {
+    const cached = guidanceCache.get(key);
+    if (cached !== undefined) return cached;
+    if (signal.aborted) return undefined;
+    let read = guidanceReads.get(key);
+    if (read === undefined && guidanceReads.size < GUIDANCE_READS_LIMIT) {
+      read = guidanceRead(workspace, commit, prefix, key);
+      guidanceReads.set(key, read);
+      void read.then(() => { guidanceReads.delete(key); });
+    }
+    if (read !== undefined) return Promise.race([read, aborted]);
+    // No place is free. Wait for one, or for this caller's deadline, and look again.
+    await Promise.race([...guidanceReads.values(), aborted]);
+  }
+}
+
+/** One read under its own time limit. It takes no caller's signal, because several callers share it. Never rejects. */
+async function guidanceRead(workspace: string, commit: string, prefix: TeamCommand | undefined, key: string): Promise<string | undefined> {
   try {
     // One bounded read: the commit against the empty tree lists only the guidance files, so a large repository is not cut by the output cap.
     const emptyTree = commit.length === 64 ? EMPTY_TREE_SHA256 : EMPTY_TREE_SHA1;
     const pathspecs = GUIDANCE_FILES.map(name => `:(glob)**/${name}`);
     // Quoted paths keep the output ASCII: the command decodes each output chunk on its own, and a split character would change the digest.
-    const result = await teamCommand({ command: "git", args: teamGitArgs(workspace, ["-c", "core.quotePath=true", "diff-tree", "-r", "--raw", "--no-abbrev", "--no-renames", emptyTree, commit, "--", ...pathspecs]) }, workspace, signal, GUIDANCE_READ_TIMEOUT_MS, prefix);
+    const result = await teamCommand({ command: "git", args: teamGitArgs(workspace, ["-c", "core.quotePath=true", "diff-tree", "-r", "--raw", "--no-abbrev", "--no-renames", emptyTree, commit, "--", ...pathspecs]) }, workspace, undefined, GUIDANCE_READ_TIMEOUT_MS, prefix);
     if (result.exitCode !== 0 || result.interrupted || result.truncated) return undefined;
     const digest = guidanceDigest(parseGuidanceTree(result.stdout));
     if (guidanceCache.size >= GUIDANCE_CACHE_LIMIT) guidanceCache.delete(guidanceCache.keys().next().value!);

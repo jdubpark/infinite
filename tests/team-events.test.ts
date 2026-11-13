@@ -697,6 +697,22 @@ test("a refused guidance read records no configuration", async () => {
   } finally { store.close(); f.close(); }
 });
 
+test("a read that never ends leaves a bounded number in flight", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams) as unknown as { enrich(stored: unknown, read: (signal: AbortSignal) => Promise<undefined>): void; record(id: string): unknown };
+    const stored = scheduler.record(f.run.id);
+    let started = 0;
+    // Under a launcher the host cannot signal, a stalled read never settles.
+    for (let index = 0; index < 20; index++) scheduler.enrich(stored, () => { started += 1; return new Promise<undefined>(() => {}); });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(started, 16, "the seventeenth read is not started");
+  } finally { store.close(); f.close(); }
+});
+
 test("a service without the ledger reads no guidance", async () => {
   const logDir = mkdtempSync(join(tmpdir(), "inf-config-log-"));
   const log = join(logDir, "commands.log");

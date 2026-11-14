@@ -135,6 +135,8 @@ export class UsageService {
   private kept?: Ledger;
   /** When the kept read was taken. */
   private keptAt = 0;
+  /** When a whole read last failed. For the same time a kept read answers, the ledger answers `unavailable` without another read. */
+  private failedAt?: number;
   private readonly planFile: string;
   private planOverrides: Record<string, number> = Object.create(null) as Record<string, number>;
   private balances?: { get(id: string): Balance };
@@ -178,7 +180,7 @@ export class UsageService {
   }
   /** Every write of the ledger goes through here, so the kept read never outlives a change, also one that failed halfway. */
   private write<T>(fn: (tx: EvidenceTx) => T): T {
-    try { return this.store.write(fn); } finally { this.kept = undefined; }
+    try { return this.store.write(fn); } finally { this.kept = undefined; this.failedAt = undefined; }
   }
   /** The store has the usage module and the sealed import is recorded. Ticks run on this, so a failed tick retries. */
   private storeReady(): boolean { return this.imported && this.store.status().modules[usageModule.name] === "ready"; }
@@ -336,8 +338,8 @@ export class UsageService {
   /**
    * The whole ledger, from the kept read or from one store read. A failure of the store, a row that does not open, or
    * an unavailable ledger throws `unavailable`, and a failed read is never kept. The kept read answers until this
-   * service writes the ledger, and for at most `LEDGER_KEEP_MS`. What it returns is shared between calls and frozen:
-   * a caller copies before it sorts or adds.
+   * service writes the ledger, and for at most `LEDGER_KEEP_MS`; a failure answers for the same time. What it returns
+   * is shared between calls and frozen: a caller copies before it sorts or adds.
    */
   private ledger(): Ledger {
     if (!this.available()) throw new EvidenceError("unavailable", "The usage ledger is unavailable.");
@@ -345,12 +347,17 @@ export class UsageService {
     const now = Date.now();
     if (this.kept && now >= this.keptAt && now - this.keptAt < LEDGER_KEEP_MS) return this.kept;
     this.kept = undefined;
+    // A failed read is not tried again at once. A list asks once for each member or session, and each try would read
+    // most of the ledger before it fails, so an unreadable ledger would block the host that a readable one no longer blocks.
+    if (this.failedAt !== undefined && now >= this.failedAt && now - this.failedAt < LEDGER_KEEP_MS) throw new EvidenceError("unavailable", "The usage ledger is unavailable.");
     let data: { sessions: StoredSession[]; records: { sessionId: string; record: UsageRecord }[]; briefings: Snapshot["briefings"] };
     try {
       data = this.store.read(db => ({ sessions: readSessions(db), records: readRecords(db), briefings: readBriefings(db) }));
     } catch {
+      this.failedAt = now;
       throw new EvidenceError("unavailable", "The usage ledger is unavailable.");
     }
+    this.failedAt = undefined;
     const byId = new Map<string, StoredSession>(), members = new Map<string, StoredSession[]>();
     for (const session of data.sessions) {
       Object.freeze(session);

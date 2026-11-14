@@ -64,7 +64,7 @@ test("lookups read the store once until the ledger changes, and one row that doe
       teamModelProfile: { id: "light", provider: "opencode" } }) as unknown as UsageSessionRow);
     // A tick reads a bounded number of pages, so a ledger of this size takes more than one.
     for (let pass = 0; pass < 4; pass++) await usage.tick(rows);
-    usage.recordBriefing("project-0", "briefing-session", new Date().toISOString(),
+    usage.recordBriefing("briefing-project", "briefing-session", new Date().toISOString(),
       { providerId: "deepseek", modelId: "deepseek-flash", tokens: { input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, reportedCost: 0.001 });
     // The clock stands still from here, so the time the kept read may answer passes only when the test says so.
     t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
@@ -98,7 +98,8 @@ test("lookups read the store once until the ledger changes, and one row that doe
     // also when nothing writes the ledger: the kept read answers for one tick at most.
     assert.equal(usage.session("session-01").measured, true);
     const raw = new DatabaseSync(evidenceDatabasePath(dir));
-    try { assert.equal(raw.prepare("UPDATE usage_models SET encrypted_model = ?").run("not-sealed").changes, 1); }
+    // The project that only the briefing uses: no session and no record needs it.
+    try { assert.equal(raw.prepare("UPDATE usage_projects SET encrypted_project = ? WHERE project_ref IN (SELECT project_ref FROM usage_briefings)").run("not-sealed").changes, 1); }
     finally { raw.close(); }
     let writes = 0;
     const write = store.write.bind(store);
@@ -107,8 +108,14 @@ test("lookups read the store once until the ledger changes, and one row that doe
     assert.equal(writes, 0, "This tick writes nothing, so no write drops the kept read");
     assert.equal(usage.session("session-01").measured, true, "Within the tick period the kept read still answers");
     t.mock.timers.tick(LEDGER_KEEP_MS);
+    reads = 0;
     assert.deepEqual(usage.session("session-01"), { measured: false, coverage: "none", unavailable: true });
     assert.deepEqual(usage.member(runId, "member-2"), { measured: false, coverage: "none", unavailable: true });
+    for (const id of ids) assert.equal(usage.session(id).measured, false, id);
+    assert.equal(reads, 1, "An unreadable ledger is read once, not once for each lookup");
+    t.mock.timers.tick(LEDGER_KEEP_MS);
+    assert.deepEqual(usage.session("session-01"), { measured: false, coverage: "none", unavailable: true });
+    assert.equal(reads, 2, "After the same time, the ledger is tried again");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

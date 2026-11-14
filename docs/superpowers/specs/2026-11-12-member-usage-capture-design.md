@@ -6,7 +6,7 @@ Date: 2026-11-12. Status: design for review. Part of `2026-11-12-self-improving-
 
 The host knows what an attempt cost only when its member ran on OpenCode. Claude Code and Codex members show `Unmeasured`. The outcome ledger, the router, and the learning budget need a cost for every attempt.
 
-This design records token usage for the Claude Code and Codex sessions that the host runs, turns provider limit observations into durable limit events, and adds a list-price equivalent to every usage record.
+This design records token usage for the Claude Code and Codex sessions that the host runs, turns provider limit observations into durable limit events, and adds a list-price equivalent to every usage record. Codex sessions stay at coverage `none` with reason `hooks-off` until Codex capture has a route that needs no hook-trust bypass (owner decision 2).
 
 It amends two earlier non-goals. The 2026-10-17 usage ledger design excluded cost for Claude Code and Codex. The 2026-10-19 cost and effectiveness design said: "Capturing Claude Code or Codex token usage. They remain unmeasured." Both end here. The rule that Spent holds only metered money stays.
 
@@ -292,8 +292,12 @@ Fixtures come from synthetic sessions against a scratch repository. A script rep
 ## Owner decisions
 
 1. **Visibility.** The 2026-10-19 design made an API-price value for subscription use a non-goal (INF-71). This design shows Claude and Codex tokens everywhere and their list-price equivalent only in the Models tab and the CLI.
-2. **Codex hooks.** Codex capture needs `attention.hooks.codex` on the deployment. The default is off.
-3. **Final drain wrapper.** One more root-owned wrapper lets the host read the rest of a stopped member's transcript. Without it those sessions lose the rows written after the last hook.
+2. **Codex hooks. Decided 2026-11-13 as "on", then withdrawn the same day on the evidence of spike S2.** Codex hooks stay off, in code (`DEFAULT_HOOKS`) and on the execution host, while they need `--dangerously-bypass-hook-trust`. On codex-cli 0.167.2 the flag is not limited to the hooks the host injects: untrusted hooks committed in the working directory also run, outside the command sandbox and with network access. A Codex member on a repository checkout would therefore run any hook that the repository commits, unreviewed. Until capture has a route that needs no bypass flag, Codex sessions keep coverage `none` with reason `hooks-off`. Two candidate routes are open work, not designs:
+   - Read the transcript from the `notify` route with hooks off. Codex's `notify` fires without the flag, and the relay can resolve the rollout from its thread id. It needs one verification that a notify reply can start the transcript stream.
+   - Host-recorded trust for the host's own hooks only. The trust key and hash format for hooks set by session flags are unknown.
+
+   **Open owner decision:** which route to take. The proposed next step is the first.
+3. **Final drain wrapper. Decided 2026-11-13: added.** The Ubuntu template gains the root-owned wrapper and its line in `deploy/ubuntu/infinite.sudoers`.
 4. **Retention.** Usage rows hold no text and are kept without limit in the first version.
 
 ## Left to the builder

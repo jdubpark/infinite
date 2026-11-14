@@ -3,6 +3,7 @@ import type { TeamBrief, TeamLineup } from "./team-types.js";
 import type { UsageTotals } from "./usage.js";
 import type { UsageRollup } from "./team-usage.js";
 import type { LinearTrackingView } from "./linear-types.js";
+import type { AutonomyMode } from "./autonomy.js";
 
 const scopedPath = z.string().trim().min(1).max(300).refine(value => value === "." || (!value.startsWith("/") && !value.includes("\\") && !/[\0*?\[\]:]/.test(value) && !value.split("/").some(part => ["", ".", "..", ".git"].includes(part))), "Use a repository-relative file or folder, or . for the whole project");
 export const createGoalSchema = z.object({
@@ -36,6 +37,8 @@ export const goalOutcomeSchema = goalActionSchema.extend({
 }).strict();
 export type GoalStatus = "running" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-opportunity" | "limit-reached" | "cancelled" | "achieved";
 export interface GoalCycle {
+  /** The mode the cycle's launch was prepared in; read once, when the launch is prepared. */
+  autonomy?: AutonomyMode;
   teamId: string;
   cycle: number;
   goalRevision: number;
@@ -69,6 +72,8 @@ export interface ProductGoal extends Omit<CreateGoal, "requestId"> {
   /** Absent on goals recorded before time ceilings existed; they use createdAt plus maxTotalMinutes or maxMinutes. */
   ceilingAt?: string;
   lineup: TeamLineup;
+  /** The mode the goal started in. Absent on goals recorded before the mode existed; read with autonomyOf(). */
+  autonomy?: AutonomyMode;
   activeTeamId?: string;
   cycles: GoalCycle[];
   memberCount: number;

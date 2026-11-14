@@ -1,6 +1,7 @@
 import type { TeamMember, TeamRole, TeamRun } from "../team-types.js";
 import { canonicalJson } from "./crypto.js";
 import { ENTRY_KINDS, MEMBER_ENTRY_KINDS, type EntryHead, type EntryKind, type HostEntry, type HostEntryKind } from "./entry-types.js";
+import { ENTRY_NOTICE, addressedHeads, entryDigest, type EntryDigest } from "./entry-reads.js";
 import { hostEntry, hostEntryId, hostEntrySources } from "./host-entries.js";
 import { memberEntryId, memberScopeOf, postAllowed, type MemberEntryEnvelope, type MemberEntryPost } from "./member-entry.js";
 import type { EvidenceStore } from "./store.js";
@@ -459,6 +460,21 @@ export class Blackboard {
       listCalls: row.list_calls,
       getCalls: row.get_calls,
     })));
+  }
+
+  /**
+   * The digest a member's context file carries at launch. Undefined unless the member holds the entry tools. Unavailable
+   * when the store or the module is not ready, the launch seq is unknown, or the read throws. Never throws.
+   */
+  memberDigest(run: TeamRun, member: TeamMember, launchSeq: number | undefined): EntryDigest | undefined {
+    try {
+      if (member.entryTools !== true) return undefined;
+      if (launchSeq === undefined || !this.ready()) return { notice: ENTRY_NOTICE, state: "unavailable" };
+      const scope = memberScopeOf(run, member, launchSeq);
+      return this.store.read(db => entryDigest(addressedHeads(db, scope), launchSeq));
+    } catch {
+      return { notice: ENTRY_NOTICE, state: "unavailable" };
+    }
   }
 
   private mirrorRun(run: TeamRun): MirrorResult {

@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { clientCommandCandidate, handleClientCommand, outcomeCellLines, parseClientArgs } from "../packages/host/src/client.js";
+import { clientCommandCandidate, handleClientCommand, legacyImportLines, legacyRefusedLines, outcomeCellLines, outcomeRollupLines, parseClientArgs } from "../packages/host/src/client.js";
+import type { OutcomeRollup } from "../packages/host/src/outcome-rollup.js";
+import type { LegacyLineOutcome } from "../packages/host/src/outcome-legacy.js";
 import type { CellsResult } from "../packages/host/src/outcome-reads.js";
 
 test("codex defaults to cloud execution; --laptop is the explicit opt-in", () => {
@@ -131,4 +133,116 @@ test("signal options parse", () => {
   const excluded = parseClientArgs(["usage", "outcomes", "exclude", "--run", "R", "--member", "M", "--reason", "trial", "--withdraw", "S"]);
   assert.equal(excluded.options["--reason"], "trial");
   assert.equal(excluded.options["--withdraw"], "S");
+});
+
+const rollupRuns = (over: Record<string, unknown> = {}) => ({
+  total: 0, withSummary: 0, withCounts: 0, deleted: 0, status: {}, blockCodes: {}, counts: null, rounds: null,
+  flagged: { backfilled: 0, gap: 0 }, ...over,
+});
+const rollupOf = (over: Record<string, unknown> = {}) => ({
+  target: { kind: "goal", id: "G1" }, known: true, assessment: null, runs: rollupRuns(), attempts: {},
+  implementer: [], scout: [], members: 0,
+  cost: { sessions: 0, complete: 0, noSession: 0, tokens: null, spentUsd: null },
+  unreadable: { summaries: 0, rows: 0, members: 0 }, unindexed: 0, ...over,
+}) as unknown as OutcomeRollup;
+const cellOf = (key: Record<string, string>, levels: Record<string, unknown> = {}) => {
+  const none = { yes: 0, no: 0, unknown: 0, rate: null, interval: null };
+  return {
+    key, sources: ["production"], from: null, to: null, attempts: 1, open: 0,
+    excluded: { limit: 0, owner: 0, host: 0, duel: 0 }, withheld: { backfilled: 0, gap: 0, unfrozen: 0 },
+    flagged: { backfilled: 0, gap: 0, "empty-result": 0, "same-model-review": 0, "scan-gap": 0 },
+    levels: { integrated: none, accepted: none, firstPass: none, held: none, ...levels },
+    tokens: null, spentUsd: null, listUsd: null, minutes: null, ownerRating: null, enough: false,
+  };
+};
+
+test("roll-up and import options parse", () => {
+  const parsed = parseClientArgs(["usage", "outcomes", "--goal", "G1", "--mission", "M1", "--file", "legacy.jsonl", "--dry-run"]);
+  assert.equal(parsed.options["--goal"], "G1");
+  assert.equal(parsed.options["--mission"], "M1");
+  assert.equal(parsed.options["--file"], "legacy.jsonl");
+  assert.equal(parsed.options["--dry-run"], true);
+  assert.equal(clientCommandCandidate(["--dry-run", "usage"]), "usage");
+});
+
+test("roll-up lines show unknown, never zero", () => {
+  const unsettled = outcomeRollupLines(rollupOf({ runs: rollupRuns({ total: 1, withSummary: 1, status: { unsettled: 1 } }) }));
+  assert.ok(unsettled.some(line => line.includes("No run has settled, so its counts are unknown.")), unsettled.join("\n"));
+  assert.ok(!unsettled.some(line => line.startsWith("Rounds:")), "a null rounds never prints a Rounds line");
+
+  const noCost = outcomeRollupLines(rollupOf());
+  assert.ok(noCost.some(line => line.includes("Cost: tokens unknown over 0 of 0 sessions")), noCost.join("\n"));
+  assert.ok(!noCost.some(line => line.includes("tokens 0")), "a null token sum never prints as 0");
+
+  const noAssessment = outcomeRollupLines(rollupOf());
+  assert.ok(noAssessment[0]!.includes("no assessment"), noAssessment[0]);
+
+  const notHeld = outcomeRollupLines(rollupOf({ known: false }));
+  assert.ok(notHeld[0]!.includes("not held by the host"), notHeld[0]);
+
+  const unreadable = outcomeRollupLines(rollupOf({ unreadable: { summaries: 0, rows: 2, members: 0 } }));
+  assert.ok(unreadable.some(line => line.includes("2 rows")), unreadable.join("\n"));
+
+  const unindexed = outcomeRollupLines(rollupOf({ unindexed: 3 }));
+  assert.ok(unindexed.some(line => line.includes("index: 3")), unindexed.join("\n"));
+
+  const controlled = outcomeRollupLines(rollupOf({ implementer: [cellOf({ profile: "li\u0007ght" })] }));
+  assert.ok(controlled.some(line => line.includes("profile=li ght")), controlled.join("\n"));
+
+  const mission = outcomeRollupLines(rollupOf({ target: { kind: "mission", id: "M1" } }));
+  assert.equal(mission[0], "Mission M1");
+  assert.ok(!mission.some(line => line.includes("assessment")), mission.join("\n"));
+});
+
+test("roll-up lines for a settled goal", () => {
+  const implementer = cellOf({ profile: "light" }, { integrated: { yes: 1, no: 1, unknown: 0, rate: 0.5, interval: [0.1, 0.9] } });
+  const [cellLine] = outcomeCellLines({ cells: [implementer as never], unreadable: 0 });
+  const rollup = rollupOf({
+    target: { kind: "goal", id: "G1" },
+    assessment: { result: "achieved", at: "2026-11-13T10:00:00Z", revision: 2 },
+    runs: rollupRuns({
+      // The blocked run has a status and no counts, so only one run is settled: the one whose counts are summed.
+      total: 2, withSummary: 2, withCounts: 1, deleted: 0, status: { merged: 1, blocked: 1 }, blockCodes: { "delivery-recovery": 1 },
+      counts: { tasks: 2, integrated: 1, members: 3, round: 1, checks: 2, recoveries: 1, decisionsByOwner: 0, decisionsByCoordinator: 0, steering: 0, permissionEscalations: 0, continuations: 0 },
+      rounds: { total: 3, attributed: 2, unattributed: 1, unknown: 0 },
+    }),
+    attempts: { integrated: 2, stalled: 1 },
+    implementer: [implementer],
+    members: 3,
+    cost: { sessions: 4, complete: 2, noSession: 1, tokens: 1400, spentUsd: 0.5 },
+  });
+  assert.deepEqual(outcomeRollupLines(rollup), [
+    "Goal G1 · assessment achieved at 2026-11-13T10:00:00Z",
+    "Runs 2 · with a summary 2 · settled 1 · deleted 0 · status blocked 1, merged 1 · blocked by delivery-recovery 1",
+    "Counts: tasks 2, integrated 1, members 3, round 1, checks 2, recoveries 1, decisionsByOwner 0, decisionsByCoordinator 0, steering 0, permissionEscalations 0, continuations 0",
+    "Rounds: total 3, attributed 2, unattributed 1, unknown 0",
+    "Attempts: integrated 2, stalled 1",
+    "Implementers:",
+    cellLine!,
+    "Members without a task: 3",
+    "Cost: tokens 1400 over 2 of 4 sessions · spent $0.50 · 1 without a session",
+  ]);
+});
+
+test("import lines name refused lines and count the rest", () => {
+  const outcome = (line: number, value: LegacyLineOutcome) => ({ line, outcome: value });
+  assert.deepEqual(legacyImportLines({
+    dryRun: false,
+    lines: [outcome(1, "imported"), outcome(2, "changed"), outcome(3, "repeated"), outcome(5, "conflict"), outcome(6, "superseded"), outcome(7, "expired")],
+    removed: 1, batches: 1,
+  }), ["Line 2: changed", "Line 5: conflict", "Imported 1, repeated 1, superseded 1, expired 1, refused 2, removed 1."]);
+
+  const oneBatch = legacyImportLines({ dryRun: true, lines: [outcome(1, "imported")], removed: 0, batches: 1 });
+  assert.equal(oneBatch.length, 1);
+  assert.ok(oneBatch[0]!.startsWith("Dry run, nothing was written: Imported"), oneBatch[0]);
+  assert.ok(!oneBatch[0]!.includes("on its own"), oneBatch[0]);
+
+  const twoBatches = legacyImportLines({ dryRun: true, lines: [outcome(1, "imported")], removed: 0, batches: 2 });
+  assert.ok(twoBatches.at(-1)!.endsWith("A dry run checks each batch of 50 lines on its own."), twoBatches.at(-1));
+});
+
+test("refused lines are named on their own", () => {
+  const outcome = (line: number, value: LegacyLineOutcome) => ({ line, outcome: value });
+  assert.deepEqual(legacyRefusedLines([outcome(1, "imported"), outcome(2, "changed"), outcome(3, "repeated"), outcome(5, "conflict")]), ["Line 2: changed", "Line 5: conflict"]);
+  assert.deepEqual(legacyRefusedLines([outcome(1, "imported"), outcome(2, "repeated")]), []);
 });

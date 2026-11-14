@@ -282,7 +282,7 @@ Six hours is several times the mirror fetch's back-off, which is at most an hour
 
 `member_results` keeps the same facts for a member that has no task (project manager, integrator, reviewer, delivery): role, profile identity, `configId`, disposition, times, and cost. *(My call: capture these now, because this evidence cannot be backfilled. The permission coordinator has its own decision records and is left out.)*
 
-A goal roll-up sums the run summaries and rows that carry the goal id. A mission roll-up does the same for the mission id. A goal roll-up also shows the owner's latest verdict from `ProductGoal.outcomes`. This design calls that verdict a **goal assessment**, so that outcome keeps one meaning.
+A goal roll-up sums the rows and member results of the runs whose run summary or one of whose rows carries the goal id. A row copies the goal when it is made, so a row that an event made before `run.created` carries none. The goal is a fact of the run. A mission roll-up does the same for the mission id. Counts and rounds are summed over settled runs only. A goal roll-up also shows the owner's latest verdict from `ProductGoal.outcomes`. This design calls that verdict a **goal assessment**, so that outcome keeps one meaning.
 
 ### Part 7. Reads
 
@@ -324,9 +324,10 @@ Deferred from the switch-over slice: the assignment query and the rows query bel
 
 - `GET /api/outcomes?project=&role=&by=&sources=&days=` returns `{ use: "display", query, cells, unreadable }`, for every paired device. `by` defaults to `profile` and `sources` to `production`; `days` is an integer from 1 to 3650. A refused query answers 400 with its code, and an unavailable store answers 503. `infinite usage outcomes [--project ID] [--role ROLE] [--by LIST] [--sources LIST] [--days N] [--json]`.
 - `GET /api/outcomes/runs/:runId` returns a run's summary, rows, and signals, also after the run record is deleted. `infinite usage outcomes --run ID`.
-- `GET /api/outcomes/rollup` takes `goal=ID` or `mission=ID`. `infinite usage outcomes --goal ID` or `--mission ID`.
+- `GET /api/outcomes/rollup` takes exactly one of `goal=ID` or `mission=ID`. `infinite usage outcomes --goal ID` or `--mission ID`. The response reuses the display cells of `GET /api/outcomes`. It answers 404 `rollup-not-found` when the host holds no record of the goal or mission and the ledger holds no run of it, so a mistyped id does not read as an empty goal, and 503 when the store is unavailable.
 - `POST /api/outcomes/signals`, owner only, records or withdraws a `linked-fix` or an `exclusion`. `infinite usage outcomes link-fix` and `exclude`.
 - `POST /api/outcomes/epochs`, owner only, advances a profile epoch. `infinite usage outcomes new-epoch --profile ID`.
+- `POST /api/outcomes/legacy`, owner only, imports a batch of legacy lines. `infinite usage outcomes import-legacy --file FILE` (Part 8).
 
 There is no MCP surface. A member never reads the ledger.
 
@@ -345,9 +346,13 @@ type LegacyOutcome = {
 };
 ```
 
-Each line becomes a row with source `legacy` and id `legacy:<id>`. `accepted` sets integrated and accepted to yes, and firstPass to yes only when `attempts` is 1. `rejected` sets accepted to no. `excluded` sets exclusion `host`. Held is unknown. The import is idempotent by id, drops a superseded line, and refuses a changed line under a known id.
+Each line becomes a row with source `legacy` and id `legacy:` followed by a blind index of the line's `id`, not the literal id. The id is operator text and the outcome id is a plain column, so the line's id stays in the sealed payload. `accepted` sets integrated and accepted to yes, and firstPass to yes only when `attempts` is 1, so a higher count gives firstPass no. Held is unknown for an accepted line. `rejected` sets accepted to no, and firstPass and held to no by their definitions. Integrated is unknown, because the operator's ledger does not say whether rejected work was integrated. `excluded` sets disposition `host-stop` and exclusion `host`, and its levels are unknown. Every other column is fixed: profile `(legacy)`, epoch 0, role `implementer`, and a run id of the row's own, so no legacy row shares a cell with a production row.
 
-A legacy row is an unauthenticated claim. It appears only in `display` queries, under its own source label. Memory's import of the same evidence (INF-141) reads these rows and does not import the operator's ledger a second time.
+The import decides each line on its own and writes each batch in one store write. A line gets one of six outcomes: `imported`; `repeated`, for the same id with the same body; `superseded`, when a line the host holds replaces it, so it is not stored; `expired`, when `recordedAt` is older than the retention window; `changed`, for a known id with another body; and `conflict`, when its row id belongs to a row the import did not write. A refused line does not stop the other lines of its batch. A changed line under a known id is refused, and the operator issues a new id with `supersedes`. A superseded line is dropped in either order: when it arrives after the line that supersedes it, it is not stored, and its mark takes its own hash and time. A line that is itself superseded still supersedes the line it names, so a chain keeps only its last line and a cycle keeps no line. A mark for a line the host has not seen holds the latest time among the lines that name it. So the stored result depends on the set of lines, never on their order or on where the file is cut into batches. A replay changes nothing.
+
+Retention counts from `recordedAt`, not from the import, so a line recorded longer ago than `teams.outcomes.retentionDays` is `expired` when it arrives. The limits are 20,000 lines a file, 1,024 bytes a line, 50 lines a batch, and 50,000 legacy lines on a host. The CLI checks the whole file before it sends anything.
+
+A legacy row is an unauthenticated claim. It appears only in `display` queries, under its own source label. No scorecard, `decision` read, or roll-up counts it, and the host never recomputes it. Memory's import of the same evidence (INF-141) reads these rows and does not import the operator's ledger a second time.
 
 ## Authority and safety
 

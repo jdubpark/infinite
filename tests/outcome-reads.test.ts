@@ -8,14 +8,20 @@ import { CellQueryRefused } from "../packages/host/src/outcome-cells.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { EvidenceError } from "../packages/host/src/evidence/types.js";
 import { advanceEpoch, configurationModule } from "../packages/host/src/configuration-store.js";
-import { currentEpochs, productionRows, queryCells } from "../packages/host/src/outcome-reads.js";
+import { rollupMissing } from "../packages/host/src/outcome-rollup.js";
+import { currentEpochs, productionRows, queryCells, queryRollup } from "../packages/host/src/outcome-reads.js";
 import {
+  type MemberResultRow,
   type OutcomeRow,
   outcomeModule,
   type OutcomePayload,
+  type RunSummaryRow,
   selectOutcomes,
+  writeMemberResult,
   writeOutcome,
+  writeSummary,
 } from "../packages/host/src/outcome-store.js";
+import type { Cell } from "../packages/host/src/outcome-cells.js";
 
 type Fixture = { root: string; path: string; key: Buffer; close: () => void };
 
@@ -386,5 +392,262 @@ test("the current epoch comes from the store", () => {
   } finally {
     unready?.close();
     bare.close();
+  }
+});
+
+const GOAL = "goal-7";
+const OTHER_GOAL = "goal-8";
+const MISSION = "mission-7";
+const OTHER_MISSION = "mission-8";
+
+/** A row of one run, with the goal and mission given, or none. Its role is the implementer's. */
+function rowIn(runId: string, memberId: string, goal?: string, mission?: string): OutcomeRow {
+  const base = outcomeRow();
+  const payload: OutcomePayload = { ...base.payload };
+  delete payload.goal;
+  delete payload.missionId;
+  if (goal !== undefined) payload.goal = { id: goal, cycle: 1 };
+  if (mission !== undefined) payload.missionId = mission;
+  return outcomeRow({ outcomeId: `${runId}:${memberId}`, runId, memberId, payload });
+}
+
+/** A summary of one run, with the goal and mission given, or none. */
+function summaryWith(runId: string, goal?: string, mission?: string): RunSummaryRow {
+  const payload: RunSummaryRow["payload"] = {
+    projectId: "example",
+    attempts: { completed: 1 },
+    rounds: { total: 0, attributed: 0, unattributed: 0, unknown: 0 },
+  };
+  if (goal !== undefined) payload.goal = { id: goal, cycle: 1 };
+  if (mission !== undefined) payload.missionId = mission;
+  return {
+    runId,
+    source: "production",
+    projectRef: "",
+    revision: 1,
+    status: "ready-for-review",
+    blockCode: null,
+    flags: [],
+    createdAt: "2026-11-13T09:00:00.000Z",
+    settledAt: null,
+    approvedAt: null,
+    runDeletedAt: null,
+    payload,
+  };
+}
+
+function memberOf(runId: string, memberId: string): MemberResultRow {
+  return {
+    resultId: `${runId}:${memberId}`,
+    source: "production",
+    projectRef: "",
+    runId,
+    revision: 1,
+    memberId,
+    sessionId: null,
+    role: "reviewer",
+    profileId: "profile-b",
+    provider: "opencode",
+    model: "model-two",
+    effort: null,
+    profileEpoch: 1,
+    configId: null,
+    reportKind: "review",
+    disposition: "reported",
+    flags: [],
+    startedAt: "2026-11-13T10:00:00.000Z",
+    endedAt: "2026-11-13T10:10:00.000Z",
+    runDeletedAt: null,
+    payload: { projectId: "example" },
+  };
+}
+
+/** Every implementer row a cell counts: attempts, open, and each exclusion. */
+function rowsIn(cells: readonly Cell[]): number {
+  return cells.reduce((sum, cell) => sum + cell.attempts + cell.open
+    + Object.values(cell.excluded).reduce((all, n) => all + n, 0), 0);
+}
+
+test("a goal roll-up reads the runs of its goal", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = readyStore(f);
+    store.write(tx => {
+      // R1: the summary and one row carry the goal; a second row of R1 carries none, and still counts.
+      writeSummary(tx, summaryWith("R1", GOAL));
+      writeOutcome(tx, rowIn("R1", "m1", GOAL));
+      writeOutcome(tx, rowIn("R1", "m2"));
+      writeMemberResult(tx, memberOf("R1", "member-4"));
+      // R2: the summary has no goal; one row carries it.
+      writeSummary(tx, summaryWith("R2"));
+      writeOutcome(tx, rowIn("R2", "m1", GOAL));
+      // R3: another goal.
+      writeSummary(tx, summaryWith("R3", OTHER_GOAL));
+      writeOutcome(tx, rowIn("R3", "m1", OTHER_GOAL));
+    });
+
+    const goal = queryRollup(store, { kind: "goal", id: GOAL }, { known: true, assessment: null });
+    assert.equal(goal.runs.total, 2);
+    assert.equal(goal.members, 1);
+    assert.equal(rowsIn(goal.implementer), 3, "R1's two rows and R2's one row");
+
+    const other = queryRollup(store, { kind: "goal", id: OTHER_GOAL }, { known: true, assessment: null });
+    assert.equal(other.runs.total, 1);
+
+    // What the route gives passes through: the assessment and the session cost lookup.
+    const assessment = { result: "achieved" as const, at: "2026-11-13T12:00:00.000Z", revision: 2 };
+    const costed = queryRollup(store, { kind: "goal", id: GOAL },
+      { known: true, assessment, cost: () => ({ complete: true, tokens: 100, usd: 0.25 }) });
+    assert.deepEqual(costed.assessment, assessment);
+    assert.equal(costed.cost.tokens, 100, "the three rows share one session");
+    assert.equal(goal.cost.tokens, null, "no lookup, so the tokens are unknown");
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("a mission roll-up reads the runs of its mission", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = readyStore(f);
+    store.write(tx => {
+      // R1: its rows carry mission M.
+      writeOutcome(tx, rowIn("R1", "m1", undefined, MISSION));
+      // R2: its summary carries mission N, and its row carries none.
+      writeSummary(tx, summaryWith("R2", undefined, OTHER_MISSION));
+      writeOutcome(tx, rowIn("R2", "m1"));
+    });
+
+    const mission = queryRollup(store, { kind: "mission", id: MISSION }, { known: true, assessment: null });
+    assert.equal(mission.runs.total, 1);
+    assert.equal(rowsIn(mission.implementer), 1);
+
+    const other = queryRollup(store, { kind: "mission", id: OTHER_MISSION }, { known: true, assessment: null });
+    assert.equal(other.runs.total, 1);
+    assert.equal(rowsIn(other.implementer), 1);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("a goal the host no longer holds still rolls up", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = readyStore(f);
+    store.write(tx => {
+      writeSummary(tx, summaryWith("R1", GOAL));
+      writeOutcome(tx, rowIn("R1", "m1", GOAL));
+    });
+
+    const rollup = queryRollup(store, { kind: "goal", id: GOAL }, { known: false, assessment: null });
+    assert.equal(rollup.known, false);
+    assert.equal(rollup.runs.total, 1);
+    assert.equal(rollup.assessment, null);
+    assert.equal(rollupMissing(rollup), false);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("a known mission with no runs rolls up empty", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = readyStore(f);
+
+    const known = queryRollup(store, { kind: "mission", id: MISSION }, { known: true, assessment: null });
+    assert.equal(known.runs.total, 0);
+    assert.equal(known.runs.counts, null);
+    assert.deepEqual(known.implementer, []);
+    assert.equal(rollupMissing(known), false);
+
+    const unknown = queryRollup(store, { kind: "mission", id: MISSION }, { known: false, assessment: null });
+    assert.equal(rollupMissing(unknown), true);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("a deleted run's rows still roll up", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = readyStore(f);
+    store.write(tx => {
+      writeSummary(tx, summaryWith("R1", GOAL));
+      writeOutcome(tx, rowIn("R1", "m1", GOAL));
+    });
+    assert.equal(store.deleteRun("R1"), true);
+
+    const rollup = queryRollup(store, { kind: "goal", id: GOAL }, { known: true, assessment: null });
+    assert.equal(rollup.runs.deleted, 1);
+    assert.equal(rowsIn(rollup.implementer), 1);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("unreadable records are counted", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = readyStore(f);
+    store.write(tx => {
+      writeSummary(tx, summaryWith("R1", GOAL));
+      writeOutcome(tx, rowIn("R1", "m1", GOAL));
+      writeOutcome(tx, rowIn("R1", "m2", GOAL));
+    });
+    store.write(tx => {
+      tx.run("UPDATE outcomes SET payload=? WHERE outcome_id=?", "x", "R1:m1");
+    });
+
+    const rollup = queryRollup(store, { kind: "goal", id: GOAL }, { known: true, assessment: null });
+    assert.equal(rollup.unreadable.rows, 1);
+    assert.equal(rowsIn(rollup.implementer), 1, "the other row still counts");
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("a roll-up needs a ready module", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    assert.throws(
+      () => queryRollup(store!, { kind: "goal", id: GOAL }, { known: true, assessment: null }),
+      (error: unknown) => error instanceof EvidenceError && error.code === "unavailable",
+    );
+  } finally {
+    store?.close();
+    f.close();
+  }
+
+  // A store whose database path cannot open: its parent is a regular file.
+  const blocked = fixture();
+  let unopened: EvidenceStore | undefined;
+  try {
+    writeFileSync(join(blocked.root, "blocked"), "not a directory");
+    unopened = new EvidenceStore({
+      databasePath: join(blocked.root, "blocked", "evidence.sqlite3"),
+      vaultKey: blocked.key,
+    });
+    unopened.register(outcomeModule({ now: () => NOW }));
+    assert.throws(
+      () => queryRollup(unopened!, { kind: "goal", id: GOAL }, { known: true, assessment: null }),
+      (error: unknown) => error instanceof EvidenceError && error.code === "unavailable",
+    );
+  } finally {
+    unopened?.close();
+    blocked.close();
   }
 });

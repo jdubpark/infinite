@@ -135,6 +135,8 @@ export function rowSignals(db: EvidenceDb, row: OutcomeRow): RowSignalFacts {
  * facts. It never changes `acceptance`, the review's own fact. A row without `acceptance` takes `accepted` first.
  */
 export function saveOutcomeRow(tx: EvidenceTx, row: OutcomeRow): void {
+  // A legacy row keeps the levels its import gave it. Host rules must not rewrite the operator's claim.
+  if (row.source === "legacy") throw new Error("A legacy row keeps the levels of its import.");
   row.acceptance = row.acceptance === undefined ? row.accepted : row.acceptance;
   const links = linksOf(tx, row.outcomeId);
   const facts = rowSignals(tx, row);

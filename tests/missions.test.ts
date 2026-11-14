@@ -21,6 +21,12 @@ import type { Config, Session } from "../packages/host/src/types.js";
 import type { CreateTeam, NativeContinuation, TeamAssignment, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
 import type { CreateMission, Mission, MissionReport } from "../packages/host/src/mission-types.js";
 import { emptyRollup, emptyUsage, type UsageRollup } from "../packages/host/src/team-usage.js";
+import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
+import { EventOutbox } from "../packages/host/src/evidence/outbox.js";
+import { configurationModule, configurationProjector } from "../packages/host/src/configuration-store.js";
+import { outcomeProjector } from "../packages/host/src/outcome-projector.js";
+import { outcomeModule, runOutcomes } from "../packages/host/src/outcome-store.js";
+import { queryRollup } from "../packages/host/src/outcome-reads.js";
 import { applySignal, initialAttention, screenDecision, type Attention, type Signal, type SignalEvent } from "@infinite/attention";
 
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -63,9 +69,9 @@ function harness() {
       ] };
   } };
   let services: { teams: TeamService; missions: MissionService } | undefined;
-  const open = () => {
+  const open = (options?: ConstructorParameters<typeof TeamService>[6]) => {
     const manager = new Manager(config, key);
-    const teams = new TeamService(config, key, manager, (_project, start) => start());
+    const teams = new TeamService(config, key, manager, (_project, start) => start(), undefined, undefined, options);
     const missions = new MissionService(config, key, manager, teams, groups);
     teams.start(); missions.start();
     services = { teams, missions };
@@ -77,7 +83,7 @@ function harness() {
   const create = (objective = "Add an endpoint to the API and call it from the web client"): CreateMission =>
     ({ requestId: randomUUID(), groupId: "shop", objective, maxSubtasks: 8, maxMinutes: 30 });
   const release = (name: string) => writeFileSync(join(receipts, name), "go", { mode: 0o600 });
-  const close = async () => {
+  const close = async (beforeRemove?: () => void) => {
     const closing = services;
     shut();
     // A tick already under way can still launch a coordinator attempt or subteam member after close().
@@ -88,9 +94,11 @@ function harness() {
       await new Promise(done => setTimeout(done, 500));
     }
     await new Promise(done => setTimeout(done, 1700));
+    // A test that opened a store under the root closes it here: after the services stopped, before the folder goes.
+    beforeRemove?.();
     rmSync(root, { recursive: true, force: true });
   };
-  return { root, api, web, open, shut, close, create, release, coordinatorReceipts, services: () => services! };
+  return { root, state: config.stateDir, key, api, web, open, shut, close, create, release, coordinatorReceipts, services: () => services! };
 }
 
 const until = (read: () => Mission, accepts: (mission: Mission) => boolean, timeout = 60000) => waitFor(async () => read(), accepts, timeout);
@@ -481,8 +489,16 @@ test("mission create replays the original host-project group alias after canonic
 
 test("a mission dispatches dependent subteams across two repositories, routes their questions, and reports only after every subtask finishes", { timeout: 240000 }, async () => {
   const h = harness();
+  // The subteams write their run events to an evidence store, so the mission's roll-up can be read at service level.
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(h.state), vaultKey: h.key });
+  store.register(configurationModule());
+  store.register(outcomeModule());
+  const outbox = new EventOutbox(store);
+  outbox.registerProjector(configurationProjector());
+  outbox.registerProjector(outcomeProjector(store));
+  const open = () => h.open({ events: outbox });
   try {
-    let { missions, teams } = h.open();
+    let { missions, teams } = open();
     const request = h.create();
     await assert.rejects(missions.create({ ...request, groupId: "unknown" }), (error: TeamError) => error.code === "project-group-not-found");
     const created = await missions.create(request);
@@ -499,7 +515,7 @@ test("a mission dispatches dependent subteams across two repositories, routes th
     const first = missions.get(created.id).coordinator!;
     assert.equal(first.status, "running");
     assert.ok(realpathSync(h.coordinatorReceipts()[0].cwd).startsWith(join(h.root, "teams", "missions")), "The coordinator runs in a mission folder under the team workspace root");
-    h.shut(); ({ missions, teams } = h.open());
+    h.shut(); ({ missions, teams } = open());
     h.release("release-dispatch");
     const asked = await until(() => missions.get(created.id), mission => mission.status === "needs-input");
     assert.equal(h.coordinatorReceipts().filter(receipt => receipt.memberId === first.memberId).length, 1);
@@ -516,7 +532,7 @@ test("a mission dispatches dependent subteams across two repositories, routes th
     assert.equal(teams.list().length, 1, "The dependent web subtask waits for the API subtask");
 
     // Restart while the owner question is open: nothing is duplicated, and the answer reaches the subteam.
-    h.shut(); ({ missions, teams } = h.open());
+    h.shut(); ({ missions, teams } = open());
     const answer = { requestId: randomUUID(), revision: asked.revision, text: "JSON" };
     const answered = await missions.answer(created.id, decision.id, answer);
     assert.equal(answered.decisions[0].answeredBy, "owner");
@@ -551,7 +567,17 @@ test("a mission dispatches dependent subteams across two repositories, routes th
     assert.equal(git(h.api, "status", "--porcelain"), "", "Subteams work in isolated copies; the source repositories are unchanged");
     assert.equal(existsSync(join(h.web, "web.txt")), false);
     assert.equal(h.coordinatorReceipts().length, 5, "Dispatch, escalate, early result, answer, and final result each used one attempt");
-  } finally { await h.close(); }
+
+    // The roll-up of the mission counts the implementer rows of its two subteams, and no other.
+    const rollup = queryRollup(store, { kind: "mission", id: created.id }, { known: true, assessment: null });
+    assert.equal(rollup.runs.total, 2);
+    const subteamRows = ready.subtasks.flatMap(subtask => store.read(db => runOutcomes(db, subtask.teamId!)));
+    const implementerRows = subteamRows.filter(row => row.role === "implementer");
+    assert.ok(implementerRows.length > 0, "The subteams wrote implementer rows");
+    const counted = rollup.implementer.reduce((sum, cell) => sum + cell.attempts + cell.open + cell.excluded.limit + cell.excluded.owner + cell.excluded.host + cell.excluded.duel, 0);
+    assert.equal(counted, implementerRows.length);
+    assert.equal(queryRollup(store, { kind: "mission", id: randomUUID() }, { known: false, assessment: null }).runs.total, 0);
+  } finally { await h.close(() => store.close()); }
 });
 
 test("standalone team creation is reserved only while a mission subteam holds that repository", { timeout: 180000 }, async () => {

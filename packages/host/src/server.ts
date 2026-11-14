@@ -47,7 +47,10 @@ import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamDeliveryR
 import { scorecardFromRows, type ProfileIdentityOf } from "./scorecard.js";
 import { profileIdentity } from "./run-events.js";
 import { CellQueryRefused, type CellQuery, type CostLookup } from "./outcome-cells.js";
-import { currentEpochs, productionRows, queryCells } from "./outcome-reads.js";
+import { currentEpochs, productionRows, queryCells, queryRollup } from "./outcome-reads.js";
+import { latestAssessment, rollupMissing, type RollupTarget } from "./outcome-rollup.js";
+import { importLegacy, LegacyImportRefused } from "./outcome-import.js";
+import { legacyBatchSchema } from "./outcome-legacy.js";
 import { GoalService } from "./goals.js";
 import { RoutineService } from "./routines.js";
 import { createRoutineSchema, routineActionSchema } from "./routine-types.js";
@@ -715,6 +718,39 @@ export function createApp(config: Config, key: Buffer) {
       return void res.json({ use: "display", query: scope, cells: result.cells, unreadable: result.unreadable });
     } catch (error) {
       if (error instanceof CellQueryRefused) return void res.status(400).json({ code: error.code, error: "The host refused the outcome query." });
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
+  });
+  // The roll-up of one goal or mission. Every paired device may read it, as it may read the cells. The goal's assessment comes from the goal record.
+  const lowerUuid = z.uuid().transform(value => value.toLowerCase());
+  const rollupQuery = z.union([z.strictObject({ goal: lowerUuid }), z.strictObject({ mission: lowerUuid })]);
+  app.get("/api/outcomes/rollup", (req, res) => {
+    const query = rollupQuery.parse(req.query);
+    const target: RollupTarget = "goal" in query ? { kind: "goal", id: query.goal } : { kind: "mission", id: query.mission };
+    try {
+      const goal = target.kind === "goal" ? goals.understandingRecords().find(record => record.id === target.id) : undefined;
+      const known = target.kind === "goal" ? goal !== undefined : missions.hasRecordFile(target.id);
+      const rollup = queryRollup(evidence, target, { known, assessment: goal ? latestAssessment(goal.outcomes) : null, cost: sessionCost });
+      if (rollupMissing(rollup)) return void res.status(404).json({ code: "rollup-not-found", error: "No roll-up exists for this goal or mission." });
+      return void res.json(rollup);
+    } catch (error) {
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
+  });
+  // The owner's legacy batch. A line is an unauthenticated claim, so the owner key is required. The route takes no request id: a replay is idempotent by line id.
+  app.post("/api/outcomes/legacy", requireRole(["owner"]), (req, res) => {
+    const now = Date.now();
+    // The general handler returns each issue's message, and the message for an unknown key names the key. A key or a
+    // value of the operator's file is operator text, so a body that does not parse gets one fixed answer.
+    const parsed = legacyBatchSchema(now).safeParse(req.body);
+    if (!parsed.success) return void res.status(400).json({ code: "legacy-invalid", error: "The legacy batch is invalid." });
+    const body = parsed.data;
+    try {
+      return void res.json(importLegacy(evidence, body, { now: new Date(now).toISOString(), retentionDays: config.teams?.outcomes?.retentionDays }));
+    } catch (error) {
+      if (error instanceof LegacyImportRefused) return void res.status(409).json({ code: "legacy-limit", error: "The host holds too many legacy lines." });
       if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
       throw error;
     }

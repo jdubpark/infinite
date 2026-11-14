@@ -5,18 +5,24 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  type LegacyLineState,
   type MemberResultRow,
   type OutcomeRow,
   outcomeModule,
+  deleteLegacyOutcome,
   landingCandidates,
+  legacyLineCount,
   checkScan,
   lastScan,
   type OutcomePayload,
+  outcomeSources,
+  readLegacyLines,
   readMemberResult,
   readOutcome,
   readScanState,
   readSignal,
   readSummary,
+  rollupRecords,
   type RunSummaryRow,
   runOutcomeView,
   runOutcomes,
@@ -27,6 +33,7 @@ import {
   type SignalPayload,
   type SignalRow,
   sweepExpiredOutcomes,
+  writeLegacyLine,
   writeMemberResult,
   writeOutcome,
   writeScan,
@@ -34,7 +41,7 @@ import {
   writeSummary,
 } from "../packages/host/src/outcome-store.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
-import type { EvidenceModule } from "../packages/host/src/evidence/types.js";
+import { EvidenceError, type EvidenceDb, type EvidenceModule, type EvidenceTx } from "../packages/host/src/evidence/types.js";
 
 type Fixture = { root: string; path: string; key: Buffer; close: () => void };
 
@@ -591,7 +598,15 @@ test("a version 1 store migrates in place", () => {
       .map(table => table.name);
     for (const table of ["outcome_signals", "base_scans", "base_scan_state"]) assert.ok(tables.includes(table), table);
     const stored = store.read(db => db.get<{ version: number }>("SELECT version FROM schema_modules WHERE name='outcomes'"));
-    assert.equal(stored?.version, 2);
+    assert.equal(stored?.version, 3);
+    const columns = store.read(db => db.all<{ name: string }>("SELECT name FROM pragma_table_info('outcomes')"))
+      .map(column => column.name);
+    const summaryColumns = store.read(db => db.all<{ name: string }>("SELECT name FROM pragma_table_info('run_summaries')"))
+      .map(column => column.name);
+    for (const column of ["goal_ref", "mission_ref"]) {
+      assert.ok(columns.includes(column), `outcomes.${column}`);
+      assert.ok(summaryColumns.includes(column), `run_summaries.${column}`);
+    }
     const counts = store.describe().counts;
     assert.equal(counts["outcomes.signals"], 0);
     assert.equal(counts["outcomes.scans"], 0);
@@ -804,6 +819,409 @@ test("the run view lists signals", () => {
     });
     const view = runOutcomeView(store, "run-1");
     assert.deepEqual(view?.signals.map(signal => signal.signalId), ["sig-early", "sig-late"]);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+const GOAL = "goal-7";
+const OTHER_GOAL = "goal-8";
+const MISSION = "mission-7";
+
+/** A row with the given goal and mission, or none. Unlike `outcomeRow`, it carries no default goal or mission. */
+function rowIn(runId: string, memberId: string, goal?: string, mission?: string): OutcomeRow {
+  const payload: OutcomePayload = { ...outcomeRow().payload };
+  delete payload.goal;
+  delete payload.missionId;
+  if (goal !== undefined) payload.goal = { id: goal, cycle: 1 };
+  if (mission !== undefined) payload.missionId = mission;
+  return outcomeRow({ outcomeId: `${runId}:${memberId}`, runId, memberId, payload });
+}
+
+/** A summary with the given goal and mission, or none. */
+function summaryWith(runId: string, goal?: string, mission?: string): RunSummaryRow {
+  const base = summaryRow(runId);
+  const payload: RunSummaryRow["payload"] = { ...base.payload };
+  delete payload.goal;
+  delete payload.missionId;
+  if (goal !== undefined) payload.goal = { id: goal, cycle: 1 };
+  if (mission !== undefined) payload.missionId = mission;
+  return { ...base, payload };
+}
+
+/** Version 2 as it shipped: the version 1 statements, then the version 2 statements. */
+function outcomesVersion2(): EvidenceModule {
+  const version1 = outcomesVersion1();
+  return {
+    name: "outcomes",
+    version: 2,
+    readVersion: 2,
+    migrate(tx, from) {
+      if (from < 1) version1.migrate(tx, from);
+      tx.exec("ALTER TABLE outcomes ADD COLUMN acceptance INTEGER");
+      tx.exec("UPDATE outcomes SET acceptance = accepted");
+      tx.exec(
+        "CREATE TABLE IF NOT EXISTS outcome_signals (signal_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, outcome_id TEXT, "
+        + "kind TEXT NOT NULL, author TEXT NOT NULL, authority TEXT NOT NULL, state TEXT NOT NULL, at TEXT NOT NULL, "
+        + "payload TEXT NOT NULL)",
+      );
+      tx.exec(
+        "CREATE TABLE IF NOT EXISTS base_scans (project_ref TEXT NOT NULL, seq INTEGER NOT NULL, at TEXT NOT NULL, "
+        + "checked_at TEXT NOT NULL, commits INTEGER NOT NULL, gap TEXT, payload TEXT NOT NULL, "
+        + "PRIMARY KEY (project_ref, seq))",
+      );
+      tx.exec(
+        "CREATE TABLE IF NOT EXISTS base_scan_state (project_ref TEXT PRIMARY KEY, seq INTEGER NOT NULL, "
+        + "payload TEXT NOT NULL)",
+      );
+      tx.exec("CREATE INDEX IF NOT EXISTS outcome_signals_by_run ON outcome_signals (run_id)");
+      tx.exec("CREATE INDEX IF NOT EXISTS outcome_signals_by_outcome ON outcome_signals (outcome_id)");
+      tx.exec("CREATE INDEX IF NOT EXISTS outcome_signals_by_kind ON outcome_signals (kind, at)");
+    },
+  };
+}
+
+/** Inserts an outcome row the way a version 2 host did, with no ref columns. `sealed` is the stored payload text. */
+function insertOutcomeAtVersion2(tx: EvidenceTx, outcomeId: string, runId: string, sealed: string): void {
+  tx.run(
+    "INSERT INTO outcomes (outcome_id, source, project_ref, task_ref, run_id, revision, member_id, attempt_index, "
+    + "inherited, role, profile_id, provider, model, profile_epoch, area_ref, risk, feature_version, disposition, "
+    + "flags, integrated, accepted, acceptance, first_pass, payload) "
+    + "VALUES (?, 'production', ?, ?, ?, 1, 'member-1', 1, 0, 'implementer', 'profile-a', 'opencode', "
+    + "'model-one', 1, ?, 'low', 1, 'completed', '', 1, 1, 1, 1, ?)",
+    outcomeId,
+    tx.index("project", "example"),
+    tx.index("task", "task-a"),
+    runId,
+    tx.index("area", "packages/host"),
+    sealed,
+  );
+}
+
+/** Inserts a summary the way a version 2 host did, with no ref columns. */
+function insertSummaryAtVersion2(tx: EvidenceTx, runId: string, sealed: string): void {
+  tx.run(
+    "INSERT INTO run_summaries (run_id, source, project_ref, revision, flags, payload) "
+    + "VALUES (?, 'production', ?, 1, '', ?)",
+    runId,
+    tx.index("project", "example"),
+    sealed,
+  );
+}
+
+test("a version 2 store migrates to version 3 and indexes goals and missions", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    store.register(outcomesVersion2());
+    store.write(tx => {
+      insertSummaryAtVersion2(tx, "run-1", tx.seal("run_summaries", "run-1", summaryWith("run-1", GOAL).payload));
+      insertOutcomeAtVersion2(tx, "run-1:member-1", "run-1", tx.seal("outcomes", "run-1:member-1", rowIn("run-1", "member-1", undefined, MISSION).payload));
+      insertOutcomeAtVersion2(tx, "run-2:member-1", "run-2", tx.seal("outcomes", "run-2:member-1", rowIn("run-2", "member-1").payload));
+      insertOutcomeAtVersion2(tx, "run-3:member-1", "run-3", "x");
+    });
+    const earlier = store.read(db => ({
+      outcomes: db.all("SELECT * FROM outcomes ORDER BY outcome_id"),
+      summaries: db.all("SELECT * FROM run_summaries ORDER BY run_id"),
+    }));
+    store.close();
+
+    store = open(f);
+    store.register(outcomeModule({ now: () => NOW }));
+    assert.equal(store.status().modules.outcomes, "ready");
+    // Version 3 only adds the two ref columns: every earlier column of every row keeps its value.
+    const later = store.read(db => ({
+      outcomes: db.all("SELECT * FROM outcomes ORDER BY outcome_id"),
+      summaries: db.all("SELECT * FROM run_summaries ORDER BY run_id"),
+    }));
+    // Rows of node:sqlite have no prototype; both sides are copied to plain objects before the comparison.
+    const withoutRefs = (row: Record<string, unknown>) => {
+      const { goal_ref: _goal, mission_ref: _mission, ...rest } = row;
+      return { ...rest };
+    };
+    assert.equal(later.outcomes.length, earlier.outcomes.length);
+    assert.equal(later.summaries.length, earlier.summaries.length);
+    earlier.outcomes.forEach((row, index) => assert.deepEqual(withoutRefs(later.outcomes[index]!), { ...row }));
+    earlier.summaries.forEach((row, index) => assert.deepEqual(withoutRefs(later.summaries[index]!), { ...row }));
+    const stored = store.read(db => db.get<{ version: number; read_version: number }>(
+      "SELECT version, read_version FROM schema_modules WHERE name='outcomes'",
+    ));
+    assert.deepEqual({ ...stored }, { version: 3, read_version: 2 });
+
+    const refs = store.read(db => ({
+      goal: db.index("goal", GOAL),
+      mission: db.index("mission", MISSION),
+      summary: db.get<{ goal_ref: string | null; mission_ref: string | null }>(
+        "SELECT goal_ref, mission_ref FROM run_summaries WHERE run_id='run-1'",
+      ),
+      withMission: db.get<{ goal_ref: string | null; mission_ref: string | null }>(
+        "SELECT goal_ref, mission_ref FROM outcomes WHERE outcome_id='run-1:member-1'",
+      ),
+      plain: db.get<{ goal_ref: string | null; mission_ref: string | null }>(
+        "SELECT goal_ref, mission_ref FROM outcomes WHERE outcome_id='run-2:member-1'",
+      ),
+      damaged: db.get<{ goal_ref: string | null; mission_ref: string | null }>(
+        "SELECT goal_ref, mission_ref FROM outcomes WHERE outcome_id='run-3:member-1'",
+      ),
+      lines: db.get<{ name: string }>("SELECT name FROM sqlite_master WHERE type='table' AND name='legacy_lines'"),
+    }));
+    assert.equal(refs.summary?.goal_ref, refs.goal);
+    assert.equal(refs.summary?.mission_ref, null);
+    assert.equal(refs.withMission?.mission_ref, refs.mission);
+    assert.equal(refs.withMission?.goal_ref, null);
+    assert.deepEqual({ ...refs.plain }, { goal_ref: null, mission_ref: null });
+    assert.deepEqual({ ...refs.damaged }, { goal_ref: "unreadable", mission_ref: "unreadable" });
+    assert.equal(refs.lines?.name, "legacy_lines");
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("writes keep the goal and mission indexes", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    store.register(outcomeModule({ now: () => NOW }));
+    store.write(tx => {
+      writeOutcome(tx, rowIn("run-1", "member-1", GOAL, MISSION));
+      writeSummary(tx, summaryWith("run-1", GOAL, MISSION));
+    });
+    const dump = JSON.stringify(store.read(db => [db.all("SELECT * FROM outcomes"), db.all("SELECT * FROM run_summaries")]));
+    assert.ok(!dump.includes(GOAL), "the goal id is in a plain column");
+    assert.ok(!dump.includes(MISSION), "the mission id is in a plain column");
+
+    const written = store.read(db => ({
+      row: db.get<{ goal_ref: string | null; mission_ref: string | null }>("SELECT goal_ref, mission_ref FROM outcomes WHERE outcome_id='run-1:member-1'"),
+      summary: db.get<{ goal_ref: string | null; mission_ref: string | null }>("SELECT goal_ref, mission_ref FROM run_summaries WHERE run_id='run-1'"),
+      goal: db.index("goal", GOAL),
+      mission: db.index("mission", MISSION),
+    }));
+    assert.deepEqual({ ...written.row }, { goal_ref: written.goal, mission_ref: written.mission });
+    assert.deepEqual({ ...written.summary }, { goal_ref: written.goal, mission_ref: written.mission });
+
+    store.write(tx => {
+      writeOutcome(tx, rowIn("run-1", "member-1"));
+      writeSummary(tx, summaryWith("run-1"));
+    });
+    const cleared = store.read(db => ({
+      row: db.get<{ goal_ref: string | null; mission_ref: string | null }>("SELECT goal_ref, mission_ref FROM outcomes WHERE outcome_id='run-1:member-1'"),
+      summary: db.get<{ goal_ref: string | null; mission_ref: string | null }>("SELECT goal_ref, mission_ref FROM run_summaries WHERE run_id='run-1'"),
+    }));
+    assert.deepEqual({ ...cleared.row }, { goal_ref: null, mission_ref: null });
+    assert.deepEqual({ ...cleared.summary }, { goal_ref: null, mission_ref: null });
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("roll-up records follow the goal through summaries and rows", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    store.register(outcomeModule({ now: () => NOW }));
+    store.write(tx => {
+      writeSummary(tx, summaryWith("R1", GOAL));
+      writeOutcome(tx, rowIn("R1", "m1", GOAL));
+      writeOutcome(tx, rowIn("R1", "m2", GOAL));
+      writeOutcome(tx, rowIn("R1", "m3"));
+      writeMemberResult(tx, memberRow("R1", "member-4"));
+      writeSummary(tx, summaryWith("R2"));
+      writeOutcome(tx, rowIn("R2", "m1", GOAL));
+      writeSummary(tx, summaryWith("R3", OTHER_GOAL));
+      writeOutcome(tx, rowIn("R3", "m1", OTHER_GOAL));
+      writeOutcome(tx, rowIn("R4", "m1", undefined, MISSION));
+    });
+    const goal = store.read(db => rollupRecords(db, "goal", db.index("goal", GOAL)));
+    assert.deepEqual(goal.runIds, ["R1", "R2"]);
+    assert.equal(goal.summaries.length, 2);
+    assert.equal(goal.rows.length, 4);
+    assert.equal(goal.members.length, 1);
+    assert.deepEqual(goal.unreadable, { summaries: 0, rows: 0, members: 0 });
+
+    const other = store.read(db => rollupRecords(db, "goal", db.index("goal", OTHER_GOAL)));
+    assert.deepEqual(other.runIds, ["R3"]);
+
+    const mission = store.read(db => rollupRecords(db, "mission", db.index("mission", MISSION)));
+    assert.deepEqual(mission.runIds, ["R4"]);
+    const wrongColumn = store.read(db => rollupRecords(db, "mission", db.index("goal", GOAL)));
+    assert.deepEqual(wrongColumn.runIds, []);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("roll-up records count unreadable payloads", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    store.register(outcomeModule({ now: () => NOW }));
+    store.write(tx => {
+      writeSummary(tx, summaryWith("R1", GOAL));
+      writeOutcome(tx, rowIn("R1", "m1", GOAL));
+      writeOutcome(tx, rowIn("R1", "m2", GOAL));
+      writeOutcome(tx, rowIn("R1", "m3"));
+    });
+    const goal = (db: EvidenceDb) => rollupRecords(db, "goal", db.index("goal", GOAL));
+
+    store.write(tx => tx.run("UPDATE outcomes SET payload='x' WHERE outcome_id='R1:m1'"));
+    const damagedRow = store.read(goal);
+    assert.equal(damagedRow.unreadable.rows, 1);
+    assert.deepEqual(damagedRow.rows.map(row => row.outcomeId), ["R1:m2", "R1:m3"]);
+
+    store.write(tx => tx.run("UPDATE run_summaries SET payload='x' WHERE run_id='R1'"));
+    const damagedSummary = store.read(goal);
+    assert.equal(damagedSummary.unreadable.summaries, 1);
+    assert.deepEqual(damagedSummary.summaries, []);
+    assert.deepEqual(damagedSummary.runIds, ["R1"]);
+
+    assert.equal(damagedSummary.unindexed, 0);
+    store.write(tx => tx.run("UPDATE outcomes SET goal_ref='unreadable' WHERE outcome_id='R1:m3'"));
+    assert.equal(store.read(goal).unindexed, 1);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("legacy lines round-trip sealed", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    store.register(outcomeModule({ now: () => NOW }));
+    const hash = "f".repeat(64);
+    const state: LegacyLineState = { state: "imported", lineHash: hash, recordedAt: NOW };
+    const ref = store.read(db => db.index("legacy", "op-line-1"));
+    store.write(tx => writeLegacyLine(tx, ref, state));
+
+    const absent = store.read(db => db.index("legacy", "op-line-absent"));
+    const read = store.read(db => readLegacyLines(db, [ref, absent]));
+    assert.deepEqual(read.get(ref), state);
+    assert.equal(read.has(absent), false);
+    const raw = JSON.stringify(store.read(db => db.all("SELECT * FROM legacy_lines")));
+    assert.ok(!raw.includes(hash), "the line hash is in a plain column");
+
+    store.write(tx => tx.run("UPDATE legacy_lines SET payload='x' WHERE line_ref=?", ref));
+    assert.throws(
+      () => store?.read(db => readLegacyLines(db, [ref])),
+      error => error instanceof EvidenceError && error.code === "unavailable",
+    );
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("a legacy row is never a run", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    const outcomes = outcomeModule({ now: () => NOW });
+    store.register(outcomes);
+    const legacy = outcomeRow({
+      outcomeId: "legacy-run-1:op-line-1",
+      source: "legacy",
+      runId: "legacy-run-1",
+      memberId: "op-line-1",
+      runDeletedAt: "2026-11-13T10:00:00.000Z",
+    });
+    const production = outcomeRow();
+    store.write(tx => {
+      writeOutcome(tx, legacy);
+      writeOutcome(tx, production);
+    });
+
+    const listed = store.read(db => outcomes.runIds?.(db) ?? []);
+    assert.ok(!listed.includes("legacy-run-1"), "a legacy run is listed as a run");
+
+    assert.equal(sweepExpiredOutcomes(store, NOW), 0);
+    store.sweep(() => false);
+    assert.equal(store.read(db => readOutcome(db, legacy.outcomeId))?.source, "legacy");
+
+    // A legacy row has no summary, so it is never a landing candidate. The approved production run of the same
+    // project is the one candidate, which shows that the query read this project.
+    store.write(tx => writeSummary(tx, summaryRow(production.runId, { approvedAt: "2026-11-13T12:00:00.000Z" })));
+    const candidates = store.read(db => landingCandidates(db, db.index("project", legacy.payload.projectId), "1970-01-01T00:00:00.000Z"));
+    assert.deepEqual(candidates.map(candidate => candidate.runId), [production.runId]);
+
+    assert.equal(store.write(tx => deleteLegacyOutcome(tx, production.outcomeId)), false);
+    assert.equal(store.read(db => readOutcome(db, production.outcomeId))?.source, "production");
+    assert.equal(store.write(tx => deleteLegacyOutcome(tx, legacy.outcomeId)), true);
+    assert.equal(store.read(db => readOutcome(db, legacy.outcomeId)), undefined);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("retention removes legacy rows and lines on their recorded time", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    store.register(outcomeModule({ now: () => NOW }));
+    const expired = "2024-01-01T00:00:00.000Z";
+    const kept = "2025-06-01T00:00:00.000Z";
+    const late = "2025-12-31T00:00:00.001Z";
+    store.write(tx => {
+      writeOutcome(tx, outcomeRow({
+        outcomeId: "legacy-old:op-1",
+        source: "legacy",
+        runId: "legacy-old",
+        memberId: "op-1",
+        runDeletedAt: expired,
+      }));
+      writeLegacyLine(tx, "line-old", { state: "imported", lineHash: "a".repeat(64), recordedAt: expired });
+      writeLegacyLine(tx, "line-kept", { state: "imported", lineHash: "b".repeat(64), recordedAt: kept });
+    });
+
+    assert.equal(sweepExpiredOutcomes(store, late), 1);
+    assert.equal(store.read(db => readOutcome(db, "legacy-old:op-1")), undefined);
+    assert.equal(store.read(db => legacyLineCount(db)), 1);
+
+    store.write(tx => {
+      writeLegacyLine(tx, "line-expired-a", { state: "imported", lineHash: "c".repeat(64), recordedAt: expired });
+      writeLegacyLine(tx, "line-expired-b", { state: "imported", lineHash: "d".repeat(64), recordedAt: expired });
+    });
+    assert.equal(store.read(db => legacyLineCount(db)), 3);
+    sweepExpiredOutcomes(store, late, 1);
+    assert.equal(store.read(db => legacyLineCount(db)), 2);
+    sweepExpiredOutcomes(store, late);
+    assert.equal(store.read(db => legacyLineCount(db)), 1);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("the module reports legacy counts", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    store.register(outcomeModule({ now: () => NOW }));
+    store.write(tx => {
+      writeOutcome(tx, outcomeRow({ outcomeId: "legacy-run-1:op-1", source: "legacy", runId: "legacy-run-1", memberId: "op-1" }));
+      writeOutcome(tx, outcomeRow({ outcomeId: "legacy-run-1:op-2", source: "legacy", runId: "legacy-run-1", memberId: "op-2" }));
+      writeOutcome(tx, outcomeRow());
+      for (const ref of ["line-1", "line-2", "line-3"]) {
+        writeLegacyLine(tx, ref, { state: "imported", lineHash: null, recordedAt: NOW });
+      }
+    });
+    const counts = store.describe().counts;
+    assert.equal(counts["outcomes.legacy"], 2);
+    // One row of the three is a production row; the module's outcomes count leaves the legacy rows out.
+    assert.equal(counts["outcomes.outcomes"], 1);
+    assert.equal(counts["outcomes.legacyLines"], 3);
   } finally {
     store?.close();
     f.close();

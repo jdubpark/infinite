@@ -9,6 +9,7 @@ import { advanceEpoch, configurationModule, configurationProjector } from "../pa
 import { EventOutbox, type EventProjector, type OutboxEvent } from "../packages/host/src/evidence/outbox.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { outcomeProjector } from "../packages/host/src/outcome-projector.js";
+import { queryRollup } from "../packages/host/src/outcome-reads.js";
 import {
   outcomeModule,
   readMemberResult,
@@ -901,6 +902,41 @@ test("a stop after the settle updates the summary's attempts", () => {
     });
     h.flush([ev("rating.recorded", run, at(6), { memberId: "m1", taskId: "a", data: { score: 2 } })]);
     assert.deepEqual(levelsOf(rowOf(h.store, run, "m1")), [0, 0, 0, 0]);
+  } finally {
+    h.close();
+  }
+});
+
+test("the goal and the mission of a run reach its rows and its roll-up", () => {
+  const h = harness();
+  try {
+    const goal = { id: "goal-1", cycle: 2 };
+    const missionId = "mission-1";
+    h.flush([
+      // A member that starts before `run.created` gets a row with no goal: the run still belongs through its summary.
+      started(RUN, "m0", 0, { taskId: "a" }),
+      ev("run.created", RUN, at(0), { data: { projectId: "example", purpose: "work", goalId: goal.id, goalCycle: goal.cycle, missionId } }),
+      prepared(RUN), planned(RUN, "a", ["a.txt"]),
+      started(RUN, "m1", 2, { taskId: "a" }),
+      integrated(RUN, "m1", "a", 3),
+      // A run of no goal and no mission.
+      created("run-2"), prepared("run-2"), planned("run-2", "a", ["a.txt"]),
+      started("run-2", "m1", 2, { taskId: "a" }),
+    ]);
+    assert.deepEqual(summaryOf(h.store, RUN)?.payload.goal, goal);
+    assert.equal(summaryOf(h.store, RUN)?.payload.missionId, missionId);
+    assert.deepEqual(rowOf(h.store, RUN, "m1")?.payload.goal, goal);
+    assert.equal(rowOf(h.store, RUN, "m1")?.payload.missionId, missionId);
+    assert.equal(rowOf(h.store, RUN, "m0")?.payload.goal, undefined, "a row made before run.created carries no goal");
+
+    const counted = (rollup: ReturnType<typeof queryRollup>) => Object.values(rollup.attempts).reduce((sum, n) => sum + (n ?? 0), 0);
+    for (const target of [{ kind: "goal", id: goal.id }, { kind: "mission", id: missionId }] as const) {
+      const rollup = queryRollup(h.store, target, { known: true, assessment: null });
+      assert.equal(rollup.runs.total, 1, target.kind);
+      assert.equal(counted(rollup), 2, "both rows of the run count, also the one that carries no goal");
+    }
+    assert.equal(queryRollup(h.store, { kind: "mission", id: goal.id }, { known: true, assessment: null }).runs.total, 0, "a goal id is no mission id");
+    assert.equal(queryRollup(h.store, { kind: "goal", id: "goal-2" }, { known: true, assessment: null }).runs.total, 0);
   } finally {
     h.close();
   }

@@ -1927,6 +1927,161 @@ commit that the scan read before its run's approval reached the ledger is never
 matched. The scan does not infer a landing from a pull request number, a commit
 subject, or the GitHub API.
 
+### Roll-ups
+
+`GET /api/outcomes/rollup?goal=ID` and `GET /api/outcomes/rollup?mission=ID`
+return one roll-up for a goal or a mission. Pass exactly one of them, and the
+value must be a UUID. Every paired device can read it, as it reads
+`GET /api/outcomes`. `infinite usage outcomes --goal ID` or `--mission ID`
+prints the roll-up, and `--json` prints the response.
+
+A run belongs to a roll-up when its run summary or one of its rows carries the
+goal or mission id. Every row and member result of such a run counts. A row
+copies the goal when it is made, so a row that an event made before
+`run.created` can carry none. The run still belongs through its summary or its
+other rows. A deleted run still rolls up while the ledger keeps its rows.
+
+The response holds these fields:
+
+- `target` and `known`. `known` is true when the host holds a record of the
+  goal or mission.
+- `assessment`: the goal's latest assessment, with `result`, `at`, and
+  `revision`. A mission has none. The assessment text stays with the goal.
+- `runs`: `total`, `withSummary`, `withCounts`, `deleted`, the `status` and
+  `blockCodes` counts, the summed `counts` and `rounds`, and `flagged` with
+  `backfilled` and `gap`.
+- `attempts`: rows by disposition, for both roles.
+- `implementer` and `scout`: the display cells of each role. They count the
+  same way as the cells of `GET /api/outcomes`.
+- `members`: the member results counted.
+- `cost`: `sessions`, `complete`, `noSession`, `tokens`, and `spentUsd`.
+- `unreadable`: the stored records of the runs that the store could not open.
+- `unindexed`: the stored rows and summaries whose goal or mission reference
+  could not be read at migration. It counts across the whole store.
+
+Unknown values stay unknown:
+
+- `counts` and `rounds` are summed over settled runs only. Both are null when
+  no run has settled.
+- A session's cost counts only when its cost is complete. A session left out
+  of the cost is never counted as zero.
+- `tokens` and `spentUsd` are null when nothing was summed, never 0.
+- Only a metered provider adds to `spentUsd`.
+
+The route answers:
+
+- `400` for a bad query, for example both parameters, neither, or a value that
+  is not a UUID.
+- `404` with `code: "rollup-not-found"` when the host holds no record of the
+  goal or mission and the ledger holds no run of it.
+- `503` with `code: "evidence-unavailable"` when the store is unavailable.
+
+A known goal or mission with no run answers `200` with zero runs, null
+`counts`, and empty cells. The remote relay refuses this route with `403` and
+`code: "remote-endpoint-denied"`.
+
+### Legacy import
+
+`infinite usage outcomes import-legacy --file FILE [--dry-run] [--json]`
+imports the operator's own ledger. Only the owner can run it. The operator
+converts the ledger to JSON lines outside this repository. The CLI reads the
+file, and the host never reads a path. Each line is one outcome, and each line
+is an unauthenticated claim.
+
+The fields of a line:
+
+| Field | Rule |
+|---|---|
+| `id` | Required. Letters, digits, `.`, `_`, `:`, and `-`. 1 to 80 characters, starting with a letter or digit. |
+| `projectId` | Required. Lowercase letters, digits, and `-`. 1 to 80 characters. The project need not exist on this host. |
+| `profile` | Required. `provider` and `effort` (optional): lowercase letters, digits, and `-`, starting with a letter, 1 to 40 characters. `model`: letters, digits, `.`, `_`, `:`, `/`, and `-`, 1 to 120 characters. |
+| `label` | Optional. At most 40 characters, with no control character. |
+| `result` | Required. `accepted`, `rejected`, or `excluded`. |
+| `attempts` | Required. An integer from 1 to 100. |
+| `totalTokens` | Optional. An integer from 0 to 10^12. |
+| `elapsedMs` | Optional. An integer from 0 to 31,536,000,000. |
+| `reviewerModel` | Optional. The same form as `model`. |
+| `recordedAt` | Required. An ISO time with an offset, not later than the import. |
+| `supersedes` | Optional. The same form as `id`, and not equal to `id`. |
+
+An unknown key fails the line. One line looks like this:
+
+```json
+{"id":"op-2026-10-01-example","projectId":"alpha","profile":{"provider":"opencode","model":"model-a","effort":"high"},"label":"ABC-12","result":"accepted","attempts":1,"totalTokens":120000,"reviewerModel":"model-b","recordedAt":"2026-10-01T09:00:00Z"}
+```
+
+The limits are:
+
+- 20,000 lines in a file.
+- 1,024 bytes in a line.
+- 50 lines in a batch.
+- 50,000 legacy lines on a host.
+
+The CLI checks the whole file before it sends anything. A file with a wrong
+line, a blank line, or a repeated id with another body is refused, and the
+CLI prints `Line N: <reason>` for each error and `Nothing was sent.`. It then
+exits non-zero. A valid file goes out in batches of 50, in file order, one batch
+at a time. The command then prints `Line N: changed` or `Line N: conflict` for
+each refused line and one summary line, such as
+`Imported 3, repeated 0, superseded 0, expired 0, refused 0, removed 0.` It
+exits non-zero when a line was refused. `removed` counts the stored rows that a
+superseding line replaced. `--json` prints each line's number and outcome.
+
+A line becomes a row with these values:
+
+- Source `legacy`. Its outcome id is `legacy:` followed by a blind index of the
+  line's `id`. The operator's `id`, `label`, `projectId`, `reviewerModel`, and
+  `supersedes` stay in the sealed payload.
+- Profile `(legacy)` at epoch 0, role `implementer`, and a run id of its own.
+  No legacy row shares a cell with a production row.
+- `accepted`: integrated yes, accepted yes, firstPass yes only when `attempts`
+  is 1, and held unknown.
+- `rejected`: integrated unknown, accepted no, firstPass no, and held no. The
+  operator's ledger does not say whether rejected work was integrated.
+- `excluded`: disposition `host-stop`, exclusion `host`, and all four levels
+  unknown.
+
+The host gives each line one of six outcomes:
+
+- `imported`: the line is stored as a new row.
+- `repeated`: the same id came with the same body, so nothing changes.
+- `superseded`: a line that the host holds replaces this id, so the line is not
+  stored.
+- `expired`: `recordedAt` is older than the retention window.
+- `changed`: the id is known with another body. The line is refused. To change
+  an outcome, the operator issues a new id with `supersedes`.
+- `conflict`: the outcome id belongs to a row that the import did not write.
+  The line is refused.
+
+A refused line does not stop the other lines of its batch. A replay changes
+nothing. What the host stores depends on the set of lines, not on their order
+or on where the file is cut into batches. A line that was itself superseded
+still replaces the line it names. So a chain of `supersedes` keeps only its
+last line, and a cycle keeps no line. This holds for one body per id: of two
+bodies under one id, the first that the host sees stays, and the other is
+`changed`.
+
+`--dry-run` writes nothing. It decides each batch against what the host holds,
+so it reports what a real import of that batch would. In a file of more than
+50 lines, a later batch does not see an earlier one: a line that repeats or
+supersedes a line of an earlier batch reads `imported`.
+
+Legacy rows appear only in `display` cells that name the `legacy` source, such
+as `GET /api/outcomes?sources=legacy`. They never enter the Models scorecard,
+a `decision` read, or a roll-up. The host never recomputes a legacy row. A
+legacy row is kept `teams.outcomes.retentionDays` after its `recordedAt`, and a
+line recorded longer ago than that is `expired` when it is imported.
+
+`POST /api/outcomes/legacy` is the route behind the command. It is owner only.
+The body holds `dryRun` and 1 to 50 `lines`. The route has no request id,
+because a replay is idempotent by line id. It answers `400` with
+`code: "legacy-invalid"` and no detail for a body that does not parse, so no
+key or value of the operator's file comes back in an error. It answers `403`
+for a caller that is not the owner, `409` with
+`code: "legacy-limit"` when the host would exceed 50,000 legacy lines, and
+`503` when the store is unavailable. The remote relay refuses this route with
+`403` and `code: "remote-endpoint-denied"`.
+
 ### Other route rules
 
 Goal-owned team lifecycle and steering routes return `409` with

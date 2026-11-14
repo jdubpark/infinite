@@ -280,6 +280,19 @@ give the agent account access that mode bits do not show, and a cached token tha
 is still valid is not rewritten by the renewal service, so it would keep any
 access it had. This step removes every ACL and replaces every cached file.
 
+The boundary does not hold when this step ends. It holds one hour after the
+cutoff below, when every token minted before it has expired. See
+[Wait out the old tokens](#wait-out-the-old-tokens).
+
+Stop the renewal service first, so no token is minted while access changes and
+the cutoff is one known moment:
+
+```sh
+sudo systemctl stop infinite-github-refresh.timer
+sudo systemctl stop infinite-github-refresh.service
+systemctl is-active infinite-github-refresh.service     # inactive
+```
+
 ```sh
 TOKENS=/srv/infinite-data/github-app-tokens
 # Keep the current ACLs and ownership for rollback.
@@ -293,12 +306,14 @@ sudo find "$TOKENS" -mindepth 1 -type d -exec setfacl -b -k {} +
 sudo find "$TOKENS" -mindepth 1 -type f -exec setfacl -b {} +
 sudo chgrp infinite-github-proxy "$TOKENS"
 sudo chmod 0750 "$TOKENS"
+date -u +%Y-%m-%dT%H:%M:%SZ     # the cutoff: write it down
 ```
 
-Tokens the agent account read before this step, or holds open, stay valid at
-GitHub until they expire, at most one hour after they were minted. Revoke them
-now so the boundary holds at once. This reads each cached token as root and sends
-it only in a request header, never in a command line:
+From the cutoff on, the agent account cannot read the cache. Tokens it read
+before the cutoff stay valid at GitHub until they expire, at most one hour after
+they were minted. Revoke the ones the cache holds now. This shortens the
+exposure for those tokens only; it does not end it. It reads each cached token
+as root and sends it only in a request header, never in a command line:
 
 ```sh
 sudo node --input-type=module -e '
@@ -319,6 +334,7 @@ before the switch survives, and mint new ones:
 sudo find "$TOKENS" -maxdepth 1 -type f -name '*.json' -delete
 sudo systemctl start infinite-github-refresh.service
 sudo systemctl status infinite-github-refresh.service --no-pager
+sudo systemctl start infinite-github-refresh.timer
 ```
 
 GitHub access through the proxy fails between the revocation and the end of the
@@ -358,6 +374,29 @@ deny the agent account and `getfacl` finds no extended ACL on the directory or o
 any entry in it. An ACL, a missing or failing `getfacl`, or an unreadable
 directory makes it `unknown`, which `doctor` prints as `UNKNOWN`. Repeat the
 checks from steps 5 and 6.
+
+### Wait out the old tokens
+
+The checks above show that the agent account cannot read the cache. They do not
+show that it holds no token. The renewal service replaces a token 15 minutes
+before it expires and does not revoke the one it replaces, and GitHub's
+revocation request ends only the token that authenticates it. A token the agent
+account copied before the cutoff, and that the cache had already replaced, was
+therefore not revoked above, and nothing on this host can revoke it. Used
+directly against GitHub, it skips the proxy's branch and API limits.
+
+Every such token was minted before the cutoff, so the last one expires at most
+one hour after it. Until then:
+
+- Treat the agent account as still holding an unrestricted token for every
+  enrolled repository. `"tokenCache":"proxy-only"` describes file access only.
+- Do not start work that relies on the proxy's limits, and do not report the
+  boundary as on.
+
+One hour after the cutoff, repeat the three read checks and the `/health` check.
+The boundary holds from then on. Any later step that gives the agent account
+access to the cache again, including the rollback below, starts a new cutoff
+when it is undone.
 
 After this step the App credential helper for `https://github.com` in the agent
 account's config can no longer read the cache. Remove it, so other public

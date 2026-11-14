@@ -38,6 +38,10 @@ import {
 import { Journal, writeSealed } from "./vault.js";
 import { socketPath } from "./ipc.js";
 import { startHookServer, HookPayloadError, type HookReply, type HookRoute } from "./hooks.js";
+import { EvidenceReader } from "./evidence/reader.js";
+import { evidenceDatabasePath } from "./evidence/store.js";
+import { BLACKBOARD_READ_VERSION } from "./evidence/blackboard.js";
+import { createEntryRoute, ENTRY_REFUSALS } from "./team-entry-route.js";
 import { teamReportEnvelopeSchema, type TeamAssignment } from "./team-types.js";
 import { missionReportEnvelopeSchema } from "./mission-types.js";
 import { isCollapsedPermissionPrompt, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
@@ -311,6 +315,21 @@ let hooksReady = false;
 /** True only while the final drain runs: the relay may read the transcript after the provider exited. */
 let drainOpen = false;
 let teamReportReceipt: { requestId: string; digest: string } | undefined;
+// The worker's read-only evidence connection, opened on the first entry read and closed at exit.
+let evidenceReader: EvidenceReader | undefined;
+const entryRoute = session.team?.entryTools
+  ? createEntryRoute({
+      team: session.team,
+      own: () => ({ token: hookToken, url: hookServer?.url ?? "" }),
+      reader: () => {
+        evidenceReader ??= new EvidenceReader({ databasePath: evidenceDatabasePath(stateDir), vaultKey: key, modules: { blackboard: BLACKBOARD_READ_VERSION } });
+        return evidenceReader;
+      },
+      running: () => state.status === "running",
+      reported: () => teamReportReceipt !== undefined,
+      append: (type, data) => { append(type, data); },
+    })
+  : undefined;
 // ---- Chat: the provider's own conversation record ------------------------------------------
 // The relay streams the transcript file from the worker's cursor; the worker never opens it.
 // The watch owns the byte reader, the usage reader, the drains, and the coverage facts.
@@ -338,6 +357,10 @@ let handoffReceipt: string | undefined;
 let handoffStopping = false;
 let handoffInFlight = false;
 async function onHook(route: HookRoute, body: unknown): Promise<HookReply | void> {
+  if (route === "team-entry") {
+    if (!entryRoute) throw new HookPayloadError(403, ENTRY_REFUSALS["entry-tools-off"]);
+    return entryRoute.handle(body);
+  }
   if (route === "team-handoff") {
     const parsed = handoffEnvelopeSchema.safeParse(body);
     if (!parsed.success || !session.handoff?.policy) throw new HookPayloadError(400);
@@ -1360,6 +1383,7 @@ async function exitWorker(code: number) {
   executor?.close();
   server.close();
   hookServer?.close();
+  evidenceReader?.close();
   await workspaceClosing?.catch(() => {});
   try {
     unlinkSync(socketPath(runDir, session.id));
@@ -1401,7 +1425,7 @@ server.listen(socketPath(runDir, session.id), async () => {
     if (session.team) {
       if (!hookServer) throw new Error("Team report channel could not start");
       // The verification flag is host policy; the agent's binding stays the stable assignment identity.
-      const { verificationRefused: _refused, ...binding } = session.team;
+      const { verificationRefused: _refused, entryTools: _entryTools, ...binding } = session.team;
       env.INFINITE_TEAM_ASSIGNMENT = JSON.stringify(binding);
       if (session.team.role === "mission-coordinator")
         env.INFINITE_MISSION_ASSIGNMENT = JSON.stringify({ missionId: session.team.runId, memberId: session.team.memberId, revision: session.team.revision });
@@ -1435,6 +1459,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       session.teamModelProfile,
       session.handoff?.policy ? session.id : undefined,
       session.workspaceTrusted ? session.cwd : undefined,
+      Boolean(session.team?.entryTools),
     );
     if (session.runtime?.nativeUi === "codex") {
       if (session.workspace) {

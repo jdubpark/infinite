@@ -427,8 +427,9 @@ one that it replaced. `--direction` sets the direction text, which can only
 narrow what the permission agent allows in that workspace, and
 `--clear-direction` removes it. `revoke` removes a workspace's delegation. A
 missing `--request-id` is generated, so pass one to retry a request safely.
-`W` is a workspace id as `status` prints it, or the id of a project in that
-workspace. When two workspaces show the same id, `revoke` clears both, and
+`W` is a workspace id as `status` prints it. Only when no workspace has that
+id is `W` read as a project id, and it then names the workspace that holds that
+project. When two workspaces show the same id, `revoke` clears both, and
 `delegate --workspace` is refused: use `--all`, or regroup so that the id names
 one workspace.
 
@@ -438,6 +439,12 @@ again. When the owner moves a project to another workspace or deletes its
 workspace, that project's coverage ends, and moving it back restores nothing:
 delegate again. A retried `--request-id` prints the recorded result and changes
 nothing.
+
+A project that is not on the host is covered by nothing. If it returns under
+the same id and path, it keeps the coverage it had, unless the owner delegated
+or revoked its workspace while it was away: either act ends that project's
+coverage, so delegate again after it returns. `revoke --workspace` with the id
+of a project that left the host ends that project's coverage too.
 
 The record has no effect yet. The permission agent is not active on this host,
 so requests are handled as before. Until the agent is activated,

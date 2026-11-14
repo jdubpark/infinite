@@ -437,6 +437,12 @@ export class ProjectGroupService {
     return `${this.state.ownerMoves.id}:${own(this.state.ownerMoves.counts, projectId) ?? 0}`;
   }
 
+  /** Every checkout stored in the project with this id, including one that is not enrolled on the host now. */
+  storedMembers(groupId: string): string[] {
+    this.reconcile();
+    return [...(own(this.state.groups, groupId)?.members ?? [])];
+  }
+
   private findContaining(candidate: CurrentStored, projectId: string) {
     return Object.values(candidate.groups).find(group => group.members.includes(projectId));
   }

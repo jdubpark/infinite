@@ -48,6 +48,9 @@ class FakeGroups {
     for (const id of ids) if (before.get(id) !== this.containing(id)?.id) this.moves.set(id, (this.moves.get(id) ?? 0) + 1);
   }
   ownerMoveMark(projectId: string): string { return `fake-moves:${this.moves.get(projectId) ?? 0}`; }
+  storedMembers(groupId: string): string[] {
+    return this.groups.filter(group => group.id === groupId).flatMap(group => group.repos.flatMap(repo => repo.checkouts.map(checkout => checkout.projectId)));
+  }
   list(): ProjectGroupList { return { groups: this.groups, suggestions: [] }; }
   containing(projectId: string): { id: string; name: string } | undefined {
     const group = this.groups.find(value => value.repos.some(repo => repo.checkouts.some(checkout => checkout.projectId === projectId)));
@@ -618,6 +621,61 @@ test("with the real group service, a project id names the workspace that holds i
     for (const id of ["alpha", "beta"]) assert.equal(service.coverage(id).covered, false, id);
     assert.throws(() => service.delegate("missing", request(), actor), failsWith(404, "project-group-not-found"));
     assert.throws(() => service.revoke("missing", request(), actor), failsWith(404, "project-group-not-found"));
+  } finally { f.cleanup(); }
+});
+
+test("with the real group service, an owner act on a workspace ends the entry of a member that is off the host at that time", () => {
+  const f = fixture(["alpha", "beta", "gamma"]);
+  try {
+    const { config, groups, service } = realGroups(f);
+    const workspace = groups.create({ requestId: randomUUID(), name: "Client", repos: ["alpha", "beta"] }).id;
+    const leave = (id: string) => config.projects.splice(config.projects.findIndex(project => project.id === id), 1)[0]!;
+    const notCovered = (id: string) => ({ covered: false, projectId: id, reason: "not-covered" });
+
+    // Revoked while alpha is away: alpha returns to the same id and path and is not covered.
+    service.delegate(workspace, { ...request(), direction: "Wide." }, actor);
+    let away = leave("alpha");
+    assert.equal(service.revoke(workspace, request(), actor).state, "not-delegated");
+    config.projects.push(away);
+    assert.deepEqual(service.coverage("alpha"), notCovered("alpha"));
+    assert.equal(service.status().find(view => view.workspaceId === workspace)?.state, "not-delegated");
+
+    // Delegated again with narrower direction while alpha is away: alpha does not return under the older, wider entry.
+    service.delegate(workspace, { ...request(), direction: "Wide." }, actor);
+    away = leave("alpha");
+    service.delegate(workspace, { ...request(), direction: "Narrow." }, actor);
+    config.projects.push(away);
+    assert.deepEqual(service.coverage("alpha"), notCovered("alpha"));
+    assert.equal(service.status().find(view => view.workspaceId === workspace)?.state, "partly-delegated");
+
+    // The same for every workspace at once, and for an ungrouped project.
+    service.delegateAll(request(), actor);
+    away = leave("gamma");
+    service.delegateAll(request(), actor);
+    config.projects.push(away);
+    assert.deepEqual(service.coverage("gamma"), notCovered("gamma"));
+    assert.equal(service.coverage("alpha").covered, true);
+
+    // With no owner act while it is away, a project keeps its entry.
+    away = leave("beta");
+    assert.deepEqual(service.coverage("beta"), { covered: false, projectId: "beta", reason: "unknown-project" });
+    config.projects.push(away);
+    assert.equal(service.coverage("beta").covered, true);
+  } finally { f.cleanup(); }
+});
+
+test("with the real group service, the id of a project that left the host still ends its entry", () => {
+  const f = fixture();
+  try {
+    const { config, service } = realGroups(f);
+    service.delegate("alpha", request(), actor);
+    const away = config.projects.splice(config.projects.findIndex(project => project.id === "alpha"), 1)[0]!;
+
+    assert.deepEqual(service.revoke("alpha", request(), actor), { workspaceId: "alpha", name: "alpha", state: "not-delegated", projects: [] });
+    assert.throws(() => service.revoke("alpha", request(), actor), failsWith(404, "project-group-not-found"));
+    config.projects.push(away);
+    assert.deepEqual(service.coverage("alpha"), { covered: false, projectId: "alpha", reason: "not-covered" });
+    assert.deepEqual(service.coverProject("alpha", request(), actor), { covered: false, projectId: "alpha", reason: "not-covered" });
   } finally { f.cleanup(); }
 });
 

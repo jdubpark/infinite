@@ -29,7 +29,7 @@ type Stored = {
   receipts: Record<string, Receipt>;
 };
 type StateWriter = (file: string, key: Buffer, scope: string, value: unknown) => void;
-type Groups = Pick<ProjectGroupService, "list" | "containing" | "ownerMoveMark">;
+type Groups = Pick<ProjectGroupService, "list" | "containing" | "ownerMoveMark" | "storedMembers">;
 type Options = { now?: () => number; writeState?: StateWriter; policyVersion?: number };
 
 const SCOPE = "permission-delegations";
@@ -37,6 +37,7 @@ const emptyState = (): Stored => ({ entries: {}, optOuts: {}, knownProjectIds: [
 const own = <T>(map: Record<string, T>, key: string): T | undefined => Object.hasOwn(map, key) ? map[key] : undefined;
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const conflict = (message: string) => new TeamError(409, "request-conflict", message);
+const notFound = () => new TeamError(404, "project-group-not-found", "This project group does not exist.");
 const projectIds = (group: PermissionDelegationGroup): string[] =>
   [...new Set(group.repos.flatMap(repo => repo.checkouts.map(checkout => checkout.projectId)))];
 
@@ -49,6 +50,10 @@ const projectIds = (group: PermissionDelegationGroup): string[] =>
  * service is unavailable at that moment, and regrouping never waits on a write here. Nothing is
  * pruned: an opt-out, a revocation and the fact that a project was onboarded before all survive a
  * project that leaves the host and returns.
+ *
+ * A project that is not enrolled is covered by nothing, and its entry waits. An owner act on a
+ * workspace cannot see such a project, so the act ends the entry of every checkout stored in that
+ * workspace that is not enrolled at that time: an older entry never outlives a newer decision.
  */
 export class PermissionDelegationService {
   private readonly file: string;
@@ -151,9 +156,18 @@ export class PermissionDelegationService {
   private workspaces(id: string): PermissionDelegationGroup[] {
     const listed = this.groups.list().groups as PermissionDelegationGroup[];
     const named = listed.filter(group => group.id === id);
-    const found = named.length > 0 ? named : listed.filter(group => projectIds(group).includes(id));
-    if (found.length === 0) throw new TeamError(404, "project-group-not-found", "This project group does not exist.");
-    return found;
+    if (named.length > 0) return named;
+    return listed.filter(group => projectIds(group).includes(id) || this.groups.storedMembers(group.id).includes(id));
+  }
+
+  /** Checkouts stored in these workspaces that are not enrolled now. */
+  private absentMembers(found: PermissionDelegationGroup[]): string[] {
+    return [...new Set(found.flatMap(group => this.groups.storedMembers(group.id)))].filter(id => !this.enrolled(id));
+  }
+
+  private endCoverage(candidate: Stored, ids: string[]) {
+    this.remember(candidate, ids);
+    for (const projectId of ids) delete candidate.entries[projectId];
   }
 
   private members(group: PermissionDelegationGroup) {
@@ -254,12 +268,14 @@ export class PermissionDelegationService {
     if (replay) return replay;
 
     const found = this.workspaces(workspaceId);
+    if (found.length === 0) throw notFound();
     // A grant must name one workspace. A revocation below takes every match instead.
     if (found.length > 1)
       throw new TeamError(409, "permission-workspace-ambiguous", "Two workspaces share this id. Regroup so that the id names one workspace, or delegate every workspace.");
     const group = found[0]!;
     const candidate = structuredClone(this.state);
     const replacedOptOuts = this.applyDelegate(candidate, group, request.direction, actor, this.timestamp());
+    this.endCoverage(candidate, this.absentMembers(found));
     return this.record(candidate, request.requestId, fingerprint, {
       view: this.view(group, candidate),
       replacedOptOuts: replacedOptOuts.sort(),
@@ -282,6 +298,8 @@ export class PermissionDelegationService {
     const replacedOptOuts: string[] = [];
     for (const group of groups)
       replacedOptOuts.push(...this.applyDelegate(candidate, group, request.direction, actor, at));
+    // The owner decided for every workspace, so no entry of a project that is not enrolled now outlives the decision.
+    this.endCoverage(candidate, Object.keys(candidate.entries).filter(projectId => !this.enrolled(projectId)));
     return this.record(candidate, request.requestId, fingerprint, {
       views: groups.map(group => this.view(group, candidate)),
       replacedOptOuts: [...new Set(replacedOptOuts)].sort(),
@@ -340,11 +358,16 @@ export class PermissionDelegationService {
 
     // Every workspace under this id is revoked, so no project that the id can name stays covered.
     const found = this.workspaces(workspaceId);
-    const group = { ...found[0]!, repos: found.flatMap(workspace => workspace.repos) };
     const candidate = structuredClone(this.state);
-    const memberIds = this.members(group);
-    this.remember(candidate, memberIds);
-    for (const projectId of memberIds) delete candidate.entries[projectId];
+    if (found.length === 0) {
+      // A project that left the host is in no listed workspace. Its own id still ends its entry.
+      if (!own(candidate.entries, workspaceId)) throw notFound();
+      this.endCoverage(candidate, [workspaceId]);
+      return this.record<WorkspaceDelegationView>(candidate, request.requestId, fingerprint,
+        { workspaceId, name: workspaceId, state: "not-delegated", projects: [] });
+    }
+    const group = { ...found[0]!, repos: found.flatMap(workspace => workspace.repos) };
+    this.endCoverage(candidate, [...this.members(group), ...this.absentMembers(found)]);
     return this.record(candidate, request.requestId, fingerprint, this.view(group, candidate));
   }
 

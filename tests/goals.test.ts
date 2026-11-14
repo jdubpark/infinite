@@ -228,6 +228,21 @@ test("a goal with no justified change records evidence without starting implemen
     assert.equal(run.headCommit, f.base);
     assert.equal(git(run.workspace, "status", "--porcelain"), "");
     assert.equal((await f.host.fetchApi(`/goals/${stopped.id}/resume`, "owner", { requestId: randomUUID(), revision: stopped.revision })).status, 409);
+
+    // The owner's assessment sits beside the roll-up of the goal's run.
+    const recorded = await f.host.fetchApi(`/goals/${stopped.id}/outcome`, "owner", { requestId: randomUUID(), revision: stopped.revision, result: "not-achieved", summary: "No change was justified", evidence: "The progress file was already complete" });
+    assert.equal(recorded.status, 200, JSON.stringify(recorded.body));
+    const rollup = await waitFor(() => f.host.fetchApi(`/outcomes/rollup?goal=${stopped.id}`, "viewer"), response => response.status === 200 && response.body.runs.status["no-change"] === 1 && response.body.members === 1, 30000);
+    assert.equal(rollup.body.runs.total, 1);
+    assert.equal(rollup.body.known, true);
+    assert.equal(rollup.body.assessment.result, "not-achieved");
+    assert.deepEqual(rollup.body.runs.status, { "no-change": 1 });
+    assert.deepEqual(rollup.body.implementer, []);
+    assert.equal(rollup.body.members, 1);
+    const clientFile = join(f.host.root, "client-owner.json");
+    writeFileSync(clientFile, JSON.stringify({ origin: f.host.origin, token: f.host.tokens.owner, projectId: "rehearsal" }), { mode: 0o600 });
+    const printed = execFileSync(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile, "usage", "outcomes", "--goal", stopped.id], { encoding: "utf8" });
+    assert.match(printed, /assessment not-achieved/);
   } finally { await f.close(); }
 });
 

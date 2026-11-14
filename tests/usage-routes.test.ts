@@ -177,3 +177,27 @@ test("a host with an unusable evidence location still serves and reports the sto
     await host.stop();
   }
 });
+
+test("the ledger reads answer 503 when the store is unavailable", { timeout: 90000 }, async () => {
+  const host = await startHost();
+  try {
+    await host.stopApi();
+    const location = join(host.config.stateDir, "evidence");
+    rmSync(location, { recursive: true, force: true });
+    writeFileSync(location, "not a directory");
+    await host.start();
+
+    // The usage ledger lives in the same store, so every usage route answers for it first, the scorecard included.
+    const models = await host.fetchApi("/usage/models");
+    assert.equal(models.status, 503, JSON.stringify(models.body));
+    assert.deepEqual(models.body, { error: "The usage ledger is unavailable" });
+    assert.equal((await host.fetchApi("/usage/models?role=reviewer")).status, 503);
+    assert.equal((await host.fetchApi("/usage")).status, 503);
+
+    const cells = await host.fetchApi("/outcomes");
+    assert.equal(cells.status, 503, JSON.stringify(cells.body));
+    assert.equal(cells.body.code, "evidence-unavailable");
+
+    assert.equal((await host.fetchApi("/teams")).status, 200, "the rest of the host still serves");
+  } finally { await host.stop(); }
+});

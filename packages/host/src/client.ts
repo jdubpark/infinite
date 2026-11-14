@@ -24,7 +24,13 @@ import { boundTeamProject, forgetBoundTeamProject, handleTeamClientCommand } fro
 import { handleBoardClientCommand, projectsLines } from "./board-cli.js";
 import { handleUnderstandingCommand } from "./understanding-cli.js";
 import { handleRoutineClientCommand } from "./routine-cli.js";
+import { handleAutonomyClientCommand } from "./autonomy-cli.js";
 import type { ProjectGroupList } from "./project-group-types.js";
+import { MIN_COUNTED_ROWS, type LevelCount } from "./outcome-cells.js";
+import type { CellsResult } from "./outcome-reads.js";
+import type { OutcomeRollup } from "./outcome-rollup.js";
+import { LEGACY_BATCH_MAX, parseLegacyFile, type LegacyLineOutcome } from "./outcome-legacy.js";
+import type { LegacyImportResult } from "./outcome-import.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
 type Me = { role: string; capabilities?: { workspaceMirror?: number; mirrorForget?: number }; machine?: { label?: string }; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
@@ -484,10 +490,10 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   }
 }
 
-const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "evidence", "resources", "close", "sync", "pull", "team", "repo", "routine"]);
+const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "evidence", "fuse", "resources", "close", "sync", "pull", "team", "repo", "routine", "autonomy"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
-const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role"]);
-const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs"]);
+const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role", "--autonomy", "--profile", "--run", "--by", "--sources", "--days", "--member", "--issue", "--commit", "--at", "--reason", "--withdraw", "--goal", "--mission"]);
+const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--host", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs", "--dry-run"]);
 
 /**
  * The provider or client command that `handleClientCommand` dispatches on. A token that directly follows
@@ -722,6 +728,102 @@ export function evidenceStatusLines(status: import("./evidence/types.js").Eviden
   ];
 }
 
+/** Lines for `infinite fuse`, one per scope. Host text is cleaned before it reaches the terminal. */
+export function fuseLines(view: import("./fuse/service.js").FuseView): string[] {
+  const line = (name: string, scope: import("./fuse/service.js").FuseScopeView) => {
+    if (scope.state === "closed") return `${name}: closed, ${Number(scope.hour.launches)} of ${Number(scope.hour.limit)} launches in the last hour`;
+    const cause = scope.trip?.cause === "unmeasurable" ? "launch record unreadable, it closes once it can be read"
+      : scope.trip?.ownerClose ? "launch rate, the owner must close it" : "launch rate, it closes on its own";
+    return `${name}: open (${clean(cause)})`;
+  };
+  return [
+    line("Host", view.host),
+    ...view.projects.map(project => line(`Project ${clean(String(project.projectId))}`, project)),
+    ...(view.writeFailedAt ? [`The host could not record a launch at ${clean(String(view.writeFailedAt))}. New team launches wait until it can.`] : []),
+  ];
+}
+
+export type FuseCommand = { action: "view" } | { action: "close"; scope: { scope: "host" } | { scope: "project"; projectId: string } };
+const FUSE_USAGE = "Usage: infinite fuse [--json] | infinite fuse close --project ID | --host";
+/** `infinite fuse` reads the state. `infinite fuse close` takes exactly one of --project ID or --host. */
+export function parseFuseCommand(positional: readonly string[], options: Record<string, string | boolean>): FuseCommand {
+  const host = options["--host"] === true, project = options["--project"];
+  if (positional.length === 0 && !host && project === undefined) return { action: "view" };
+  if (positional.length !== 1 || positional[0] !== "close" || host === (project !== undefined)) throw new Error(FUSE_USAGE);
+  if (host) return { action: "close", scope: { scope: "host" } };
+  return { action: "close", scope: { scope: "project", projectId: String(project) } };
+}
+
+/**
+ * One line per display cell, then a line for unreadable rows. A rate prints as a percentage with its interval, or as
+ * `rate unknown` when no attempt counts. A missing fact never prints as zero.
+ */
+export function outcomeCellLines(result: CellsResult): string[] {
+  const level = (count: LevelCount) => `${count.yes} yes, ${count.no} no, ${count.unknown} unknown, ${count.rate === null ? "rate unknown" : `${Math.round(count.rate * 100)}%${count.interval ? ` (${Math.round(count.interval[0] * 100)}–${Math.round(count.interval[1] * 100)}%)` : ""}`}`;
+  const lines = result.cells.length === 0 ? ["No outcome rows match."] : result.cells.map(cell => {
+    const key = Object.entries(cell.key).map(([name, value]) => `${clean(name)}=${clean(value)}`).join(" ") || "all";
+    const excluded = `excluded limit ${cell.excluded.limit}, owner ${cell.excluded.owner}, host ${cell.excluded.host}, duel ${cell.excluded.duel}`;
+    const counts = cell.completed ? [`completed ${level(cell.completed)}`]
+      : (["integrated", "accepted", "firstPass", "held"] as const).map(name => `${name} ${level(cell.levels[name])}`);
+    return [`${key} · sources ${cell.sources.map(clean).join(", ")} · attempts ${cell.attempts} · open ${cell.open} · ${excluded}`, ...counts,
+      ...(cell.enough ? [] : [`fewer than ${MIN_COUNTED_ROWS} counted attempts`])].join(" · ");
+  });
+  if (result.unreadable > 0) lines.push(`Unreadable rows left out: ${result.unreadable}.`);
+  return lines;
+}
+
+/**
+ * The roll-up as lines, in the order of the coordinator's ruling. A null count, rounds, or token sum prints as unknown,
+ * never as zero, and every value from the host passes through `clean`.
+ */
+export function outcomeRollupLines(rollup: OutcomeRollup): string[] {
+  const { runs, cost, unreadable } = rollup;
+  const names = (record: Record<string, number>) => Object.keys(record).sort().map(name => `${clean(name)} ${record[name]}`).join(", ");
+  const held = rollup.known ? "" : " · not held by the host";
+  const head = rollup.target.kind === "goal"
+    ? `Goal ${clean(rollup.target.id)}${rollup.assessment ? ` · assessment ${clean(rollup.assessment.result)} at ${clean(rollup.assessment.at)}` : " · no assessment"}`
+    : `Mission ${clean(rollup.target.id)}`;
+  const blocked = Object.keys(runs.blockCodes).length > 0 ? ` · blocked by ${names(runs.blockCodes)}` : "";
+  const lines = [
+    `${head}${held}`,
+    `Runs ${runs.total} · with a summary ${runs.withSummary} · settled ${runs.withCounts} · deleted ${runs.deleted} · status ${Object.keys(runs.status).length ? names(runs.status) : "none"}${blocked}${runs.flagged.backfilled > 0 ? ` · backfilled ${runs.flagged.backfilled}` : ""}${runs.flagged.gap > 0 ? ` · gap ${runs.flagged.gap}` : ""}`,
+  ];
+  if (runs.counts === null) lines.push("No run has settled, so its counts are unknown.");
+  else {
+    lines.push(`Counts: ${Object.entries(runs.counts).map(([name, value]) => `${clean(name)} ${value}`).join(", ")}`);
+    if (runs.rounds) lines.push(`Rounds: total ${runs.rounds.total}, attributed ${runs.rounds.attributed}, unattributed ${runs.rounds.unattributed}, unknown ${runs.rounds.unknown}`);
+  }
+  const attempts = Object.entries(rollup.attempts).filter((entry): entry is [string, number] => entry[1] !== undefined);
+  lines.push(attempts.length ? `Attempts: ${attempts.map(([name, value]) => `${clean(name)} ${value}`).join(", ")}` : "Attempts: none");
+  lines.push("Implementers:", ...outcomeCellLines({ cells: rollup.implementer, unreadable: 0 }));
+  if (rollup.scout.length > 0) lines.push("Scouts:", ...outcomeCellLines({ cells: rollup.scout, unreadable: 0 }));
+  lines.push(`Members without a task: ${rollup.members}`);
+  const tokens = cost.tokens === null ? "tokens unknown" : `tokens ${cost.tokens}`;
+  lines.push(`Cost: ${tokens} over ${cost.complete} of ${cost.sessions} sessions${cost.spentUsd === null ? "" : ` · spent $${formatUsd(cost.spentUsd)}`}${cost.noSession > 0 ? ` · ${cost.noSession} without a session` : ""}`);
+  if (unreadable.summaries + unreadable.rows + unreadable.members > 0)
+    lines.push(`Unreadable records left out: ${unreadable.summaries} summaries, ${unreadable.rows} rows, ${unreadable.members} member results.`);
+  if (rollup.unindexed > 0) lines.push(`Records with no goal or mission index: ${rollup.unindexed}.`);
+  return lines;
+}
+
+/** One line for each refused line of an import, in the order given. */
+export function legacyRefusedLines(lines: readonly { line: number; outcome: LegacyLineOutcome }[]): string[] {
+  return lines.filter(line => line.outcome === "changed" || line.outcome === "conflict").map(line => `Line ${line.line}: ${line.outcome}`);
+}
+
+/**
+ * The import result as lines: each refused line in file order, then one summary. A dry run says nothing was written,
+ * and a dry run over several batches says that each batch was checked on its own.
+ */
+export function legacyImportLines(result: { dryRun: boolean; lines: { line: number; outcome: LegacyLineOutcome }[]; removed: number; batches: number }): string[] {
+  const count = (name: LegacyLineOutcome) => result.lines.filter(line => line.outcome === name).length;
+  const refused = legacyRefusedLines(result.lines);
+  const summary = `Imported ${count("imported")}, repeated ${count("repeated")}, superseded ${count("superseded")}, expired ${count("expired")}, refused ${refused.length}, removed ${result.removed}.`;
+  const dry = result.dryRun ? "Dry run, nothing was written: " : "";
+  const perBatch = result.dryRun && result.batches > 1 ? ` A dry run checks each batch of ${LEGACY_BATCH_MAX} lines on its own.` : "";
+  return [...refused, `${dry}${summary}${perBatch}`];
+}
+
 export function usageBars(values: number[]): string {
   const levels = "▁▂▃▄▅▆▇█", max = Math.max(0, ...values);
   return values.map(value => levels[max > 0 ? Math.max(0, Math.min(7, Math.floor(value / max * 7))) : 0]).join("");
@@ -786,6 +888,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     const config = loadConfig(path), api = connection(config);
     if (command === "understand") return await handleUnderstandingCommand(positional, options, api);
     if (command === "routine") return await handleRoutineClientCommand(positional, options, api);
+    if (command === "autonomy") return await handleAutonomyClientCommand(positional, options, api);
     if (command === "team" || command === "repo") {
       return await handleTeamClientCommand(command, positional, options, config, api, path, argv);
     }
@@ -793,6 +896,173 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const { sessions } = await api.json<{ sessions: Session[] }>("/sessions");
       if (options["--json"]) console.log(JSON.stringify(sessions, null, 2));
       else printSessions(sessions, (await api.json<Me>("/me")).machine?.label || new URL(config.origin).hostname);
+      return true;
+    }
+    if (command === "usage" && positional[0] === "outcomes") {
+      const runId = options["--run"];
+      const goalId = options["--goal"], missionId = options["--mission"];
+      if (positional.length === 1 && (goalId !== undefined || missionId !== undefined)) {
+        if (goalId !== undefined && missionId !== undefined) throw new Error("Usage: infinite usage outcomes --goal ID | --mission ID [--json]. Give one of --goal or --mission, not both.");
+        const [kind, id] = goalId !== undefined ? ["goal", String(goalId)] : ["mission", String(missionId)];
+        let rollup: OutcomeRollup;
+        try {
+          rollup = await api.json<OutcomeRollup>(`/outcomes/rollup?${kind}=${encodeURIComponent(id)}`);
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 404) throw new Error("No roll-up exists for this goal or mission. Check the ID.");
+          if (error instanceof HttpError && error.status === 400) throw new Error("The host refused the roll-up query.");
+          if (error instanceof HttpError && error.status === 503) throw new Error("The evidence store is unavailable.");
+          throw error;
+        }
+        if (options["--json"]) console.log(JSON.stringify(rollup, null, 2));
+        else for (const line of outcomeRollupLines(rollup)) console.log(line);
+        return true;
+      }
+      if (positional.length === 2 && positional[1] === "import-legacy") {
+        const file = options["--file"];
+        if (typeof file !== "string" || !file) throw new Error("Usage: infinite usage outcomes import-legacy --file FILE [--dry-run] [--json]");
+        let text: string;
+        try { text = readFileSync(file, "utf8"); } catch { throw new Error("The file could not be read."); }
+        const parsed = parseLegacyFile(text, Date.now());
+        if ("errors" in parsed) {
+          for (const error of parsed.errors) console.log(`Line ${error.line}: ${clean(error.reason)}${error.path === undefined ? "" : ` at ${clean(error.path)}`}`);
+          console.log("Nothing was sent.");
+          process.exitCode = 1;
+          return true;
+        }
+        const dryRun = options["--dry-run"] === true;
+        const { lines, numbers } = parsed;
+        const outcomes: { line: number; outcome: LegacyLineOutcome }[] = [];
+        let removed = 0, batches = 0;
+        for (let start = 0; start < lines.length; start += LEGACY_BATCH_MAX) {
+          const batch = lines.slice(start, start + LEGACY_BATCH_MAX);
+          const first = numbers[start]!;
+          const sentThrough = start === 0 ? "" : ` Lines 1 to ${numbers[start - 1]} were sent; run the same command again to continue.`;
+          let answer: LegacyImportResult;
+          try {
+            answer = await api.json<LegacyImportResult>("/outcomes/legacy", { dryRun, lines: batch }, undefined, undefined, "POST");
+            // One outcome answers one line. Another count means the host and this command disagree about the batch.
+            if (!Array.isArray(answer.outcomes) || answer.outcomes.length !== batch.length)
+              throw new Error(`The host answered the batch that starts at line ${first} with another number of lines. Check that the host and this command are the same version.`);
+          } catch (error) {
+            // Lines of the batches already answered are kept by the host; name the refused ones before the failure.
+            for (const line of legacyRefusedLines(outcomes)) console.log(line);
+            if (error instanceof HttpError && error.status === 403) throw new Error("Importing legacy outcomes requires an owner device key.");
+            if (error instanceof HttpError && error.status === 409) throw new Error(`The host holds too many legacy lines: the limit is 50,000. The batch that starts at line ${first} was not imported.`);
+            if (error instanceof HttpError && error.status === 400) throw new Error(`The host refused the batch that starts at line ${first} as invalid. Nothing of it was imported.`);
+            if (error instanceof HttpError && error.status === 503) throw new Error(start === 0 ? "The evidence store is unavailable. No line was imported; run the same command again." : `The evidence store is unavailable.${sentThrough}`);
+            throw error;
+          }
+          batches++;
+          removed += answer.removed;
+          outcomes.push(...answer.outcomes.map((outcome, index) => ({ line: numbers[start + index]!, outcome })));
+        }
+        if (options["--json"]) console.log(JSON.stringify({ dryRun, lines: outcomes, removed }, null, 2));
+        else for (const line of legacyImportLines({ dryRun, lines: outcomes, removed, batches })) console.log(line);
+        if (outcomes.some(line => line.outcome === "changed" || line.outcome === "conflict")) process.exitCode = 1;
+        return true;
+      }
+      if (positional.length === 1 && typeof runId === "string" && runId) {
+        type Level = 0 | 1 | null;
+        type OutcomeView = {
+          rows: { memberId: string; role: string; profileId: string; disposition: string; integrated: Level; accepted: Level; firstPass: Level; held: Level }[];
+          members: { memberId: string; role: string; profileId: string; disposition: string }[];
+          signals?: { signalId: string; outcomeId: string | null; kind: string; author: string; state: string; at: string }[];
+        };
+        const level = (value: Level) => value === 1 ? "yes" : value === 0 ? "no" : "unknown";
+        let view: OutcomeView;
+        try {
+          view = await api.json<OutcomeView>(`/outcomes/runs/${encodeURIComponent(runId)}`);
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 404) throw new Error(`No outcome rows exist for run \"${clean(runId)}\".`);
+          if (error instanceof HttpError && error.status === 503) throw new Error("The evidence store is unavailable.");
+          throw error;
+        }
+        if (options["--json"]) console.log(JSON.stringify(view, null, 2));
+        else if (view.rows.length === 0 && view.members.length === 0) console.log("No outcome rows exist for this run.");
+        else {
+          for (const row of view.rows)
+            console.log(`${clean(row.memberId)} ${clean(row.role)} ${clean(row.profileId)} ${clean(row.disposition)} integrated=${level(row.integrated)} accepted=${level(row.accepted)} firstPass=${level(row.firstPass)} held=${level(row.held)}`);
+          for (const member of view.members)
+            console.log(`${clean(member.memberId)} ${clean(member.role)} ${clean(member.profileId)} ${clean(member.disposition)}`);
+          for (const signal of view.signals ?? []) {
+            const member = signal.outcomeId?.slice(runId.length + 1);
+            console.log(`signal ${clean(signal.signalId.slice(0, 12))} ${clean(signal.kind)} ${clean(signal.author)} ${clean(signal.state)} ${clean(signal.at)}${member ? ` ${clean(member)}` : ""}`);
+          }
+        }
+        return true;
+      }
+      if (positional.length === 1 && runId === undefined && options["--profile"] === undefined) {
+        const params = new URLSearchParams();
+        for (const [flag, name] of [["--project", "project"], ["--role", "role"], ["--by", "by"], ["--sources", "sources"], ["--days", "days"]] as const) {
+          const value = options[flag];
+          if (typeof value === "string") params.set(name, value);
+        }
+        let view: CellsResult & { use: string };
+        try {
+          view = await api.json<CellsResult & { use: string }>(`/outcomes${params.size ? `?${params}` : ""}`);
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 503) throw new Error("The evidence store is unavailable.");
+          if (error instanceof HttpError && error.status === 400) throw new Error(`The host refused the outcome query.${error.code ? ` Code: ${clean(error.code)}.` : ""}`);
+          throw error;
+        }
+        if (options["--json"]) console.log(JSON.stringify(view, null, 2));
+        else for (const line of outcomeCellLines(view)) console.log(line);
+        return true;
+      }
+      if (positional.length === 2 && (positional[1] === "link-fix" || positional[1] === "exclude")) {
+        const signalUsage = "Usage: infinite usage outcomes link-fix --run ID [--member ID] (--issue KEY | --commit SHA) [--at TIME] [--request-id ID] [--json] | infinite usage outcomes exclude --run ID --member ID --reason REASON [--request-id ID] [--json] | either form with --withdraw SIGNAL";
+        const optionValue = (name: string) => { const value = options[name]; return typeof value === "string" && value ? value : undefined; };
+        const signalKind = positional[1] === "link-fix" ? "linked-fix" : "exclusion";
+        const requestId = optionValue("--request-id") ?? randomUUID();
+        const withdraw = optionValue("--withdraw");
+        const signalRun = optionValue("--run");
+        const signalMember = optionValue("--member");
+        let body: Record<string, unknown>;
+        if (withdraw !== undefined) body = { action: "withdraw", kind: signalKind, signalId: withdraw };
+        else if (positional[1] === "link-fix") {
+          const issue = optionValue("--issue"), commit = optionValue("--commit"), at = optionValue("--at");
+          if (signalRun === undefined || (issue === undefined && commit === undefined)) throw new Error(signalUsage);
+          body = { action: "record", kind: signalKind, requestId, runId: signalRun, ...(signalMember === undefined ? {} : { memberId: signalMember }),
+            ...(issue === undefined ? {} : { issue }), ...(commit === undefined ? {} : { commit }), ...(at === undefined ? {} : { at }) };
+        } else {
+          const reason = optionValue("--reason");
+          if (signalRun === undefined || signalMember === undefined || reason === undefined) throw new Error(signalUsage);
+          body = { action: "record", kind: signalKind, requestId, runId: signalRun, memberId: signalMember, reason };
+        }
+        type Signal = { signalId: string; kind: string; author: string; state: string; at: string };
+        let signalResult: { signal: Signal; repeated: boolean };
+        try {
+          signalResult = await api.json<{ signal: Signal; repeated: boolean }>("/outcomes/signals", body, undefined, undefined, "POST");
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 403) throw new Error("Recording a signal requires an owner device key.");
+          if (error instanceof HttpError && error.status === 404) throw new Error("The run, the member, or the signal was not found.");
+          if (error instanceof HttpError && error.status === 409) throw new Error("The request conflicts with a recorded signal.");
+          if (error instanceof HttpError && error.status === 503) throw new Error("The evidence store is unavailable.");
+          if (error instanceof HttpError && error.status === 400) throw new Error(signalUsage);
+          throw error;
+        }
+        if (options["--json"]) console.log(JSON.stringify(signalResult, null, 2));
+        else console.log(`Signal ${clean(signalResult.signal.signalId)} ${clean(signalResult.signal.state)}${signalResult.repeated ? " (repeated)" : ""}`);
+        return true;
+      }
+      const profileId = options["--profile"];
+      if (positional.length !== 2 || positional[1] !== "new-epoch" || typeof profileId !== "string" || !profileId)
+        throw new Error("Usage: infinite usage outcomes --run ID [--json] | infinite usage outcomes new-epoch --profile ID [--json] | infinite usage outcomes link-fix|exclude ... (see --withdraw) | infinite usage outcomes [--project ID] [--role ROLE] [--by LIST] [--sources LIST] [--days N] [--json] | infinite usage outcomes --goal ID | --mission ID [--json] | infinite usage outcomes import-legacy --file FILE [--dry-run] [--json]");
+      type Epoch = { profileId: string; provider: string; model: string | null; effort: string | null; epoch: number; since: string; repeated: boolean };
+      let result: Epoch;
+      try {
+        result = await api.json<Epoch>("/outcomes/epochs", { profileId, requestId: randomUUID() }, undefined, undefined, "POST");
+      } catch (error) {
+        if (error instanceof HttpError && error.status === 403) throw new Error("Advancing a profile epoch requires an owner device key.");
+        if (error instanceof HttpError && error.status === 404) throw new Error(`No configured profile has ID \"${clean(profileId)}\". Check the lineup in the team settings.`);
+        if (error instanceof HttpError && error.status === 409 && error.code === "request-conflict") throw new Error("This request was already used for another profile. No epoch was advanced.");
+        if (error instanceof HttpError && error.status === 409 && error.code === "profile-ambiguous") throw new Error(`Profile \"${clean(profileId)}\" names more than one configuration. Give each its own ID.`);
+        if (error instanceof HttpError && error.status === 503) throw new Error("The evidence store is unavailable. No epoch was advanced; retry later.");
+        throw error;
+      }
+      if (options["--json"]) console.log(JSON.stringify(result, null, 2));
+      // A missing model or effort is left out: `none` is a real OpenCode variant, and must not stand for "no effort".
+      else console.log(`Profile ${clean(result.profileId)} (${[result.provider, result.model, result.effort].filter((value): value is string => value !== null).map(clean).join(" ")}) is in epoch ${result.epoch} since ${clean(result.since)}.`);
       return true;
     }
     if (command === "cost" && positional[0] === "plan") {
@@ -836,6 +1106,22 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const status = await api.json<import("./evidence/types.js").EvidenceDescription>("/evidence/status");
       if (options["--json"]) console.log(JSON.stringify(status, null, 2));
       else for (const line of evidenceStatusLines(status)) console.log(line);
+      return true;
+    }
+    if (command === "fuse") {
+      const fuseCommand = parseFuseCommand(positional, options);
+      if (fuseCommand.action === "view") {
+        const view = await api.json<import("./fuse/service.js").FuseView>("/fuse");
+        if (options["--json"]) console.log(JSON.stringify(view, null, 2));
+        else for (const line of fuseLines(view)) console.log(line);
+        return true;
+      }
+      const closed = await api.json<{ result: string; view: import("./fuse/service.js").FuseView }>("/fuse/close", fuseCommand.scope);
+      if (options["--json"]) console.log(JSON.stringify(closed, null, 2));
+      else {
+        console.log(`Close result: ${clean(String(closed.result))}`);
+        for (const line of fuseLines(closed.view)) console.log(line);
+      }
       return true;
     }
     if (command === "resources") { await resources(api, options); return true; }

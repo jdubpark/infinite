@@ -987,6 +987,53 @@ test("a team builds concurrently in isolated copies and produces checked, review
   } finally { owner.close(); viewer.close(); await f.close(); }
 });
 
+test("a full run stores its events in order", { timeout: 120000 }, async () => {
+  const f = await fixture();
+  let store: EvidenceStore | undefined, apiStopped = false;
+  try {
+    const request = f.create();
+    const created = await f.host.fetchApi("/teams", "owner", request);
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    const finished = await f.settled(created.body.id);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    await f.host.stopApi();
+    apiStopped = true;
+    store = new EvidenceStore({ databasePath: evidenceDatabasePath(f.host.config.stateDir), vaultKey: readFileSync(f.host.config.keyFile) });
+    const events: { seq: number; kind: string; memberId?: string; data: Record<string, unknown> }[] = [];
+    for (let after = 0; ;) {
+      const page = store.events({ runId: finished.id, after, limit: 500 });
+      events.push(...page.events);
+      if (!page.more) break;
+      after = page.cursor;
+    }
+    const kinds = (kind: string) => events.filter(event => event.kind === kind);
+    for (const kind of ["run.created", "run.prepared", "plan.accepted", "check.finished", "review.recorded", "run.settled"])
+      assert.equal(kinds(kind).length, 1, kind);
+    assert.equal(kinds("task.planned").length, 2);
+    assert.equal(kinds("task.integrated").length, 2);
+    for (const kind of ["member.stopped", "repair.started", "ledger.gap"]) assert.equal(kinds(kind).length, 0, kind);
+    assert.equal(kinds("check.finished")[0]!.data.passed, true);
+    assert.equal(kinds("review.recorded")[0]!.data.verdict, "approved");
+    assert.equal(kinds("run.settled")[0]!.data.status, "ready-for-review");
+    for (const member of finished.members) {
+      const started = events.filter(event => event.kind === "member.started" && event.memberId === member.memberId);
+      const reported = events.filter(event => event.kind === "member.reported" && event.memberId === member.memberId);
+      assert.equal(started.length, 1, `one member.started for ${member.role}`);
+      assert.equal(reported.length, 1, `one member.reported for ${member.role}`);
+      assert.ok(started[0]!.seq < reported[0]!.seq, `${member.role} starts before it reports`);
+    }
+    // Each stage's events precede the next stage's.
+    const stages = [["run.created"], ["run.prepared"], ["plan.accepted"], ["task.planned"], ["task.integrated"], ["check.finished"], ["review.recorded"], ["run.settled"]];
+    const seqs = stages.map(([kind]) => kinds(kind!).map(event => event.seq));
+    for (let i = 1; i < seqs.length; i++)
+      assert.ok(Math.max(...seqs[i - 1]!) < Math.min(...seqs[i]!), `${stages[i - 1]![0]} precedes ${stages[i]![0]}`);
+  } finally {
+    store?.close();
+    if (apiStopped) await f.host.start();
+    await f.close();
+  }
+});
+
 test("changeIndex parses name-status and numstat -z records with statuses, counts, and binary nulls", () => {
   const nameStatus = ["A", "a.txt", "M", "src/b.ts", "D", "gone.md", "R100", "old/c.ts", "new/c.ts", "", ""].join("\0");
   const numstat = ["1\t0\ta.txt", "3\t2\tsrc/b.ts", "0\t4\tgone.md", "2\t1\t", "old/c.ts", "new/c.ts", "-\t-\tlogo.png", ""].join("\0");
@@ -1067,6 +1114,29 @@ test("legacy create capacity is ignored and ready work uses the PM-selected limi
     for (const [, delta] of moments) { running += delta; maximum = Math.max(maximum, running); }
     assert.ok(maximum <= 4, `Observed ${maximum} overlapping implementers`);
     assert.ok(maximum >= 2, "Independent ready work uses the capacity selected by the PM");
+  } finally { await f.close(); }
+});
+
+test("a full run projects its outcomes", { timeout: 120000 }, async () => {
+  const f = await fixture();
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const run = await f.settled(created.body.id);
+    assert.equal(run.status, "ready-for-review", JSON.stringify(run));
+    const view = await waitFor(() => f.host.fetchApi(`/outcomes/runs/${run.id}`, "owner"), response => response.status === 200 && response.body.rows.length === 2, 30000);
+    assert.equal(view.body.summary.status, "ready-for-review", JSON.stringify(view.body));
+    // Blind indexes are store internals and are never served.
+    for (const served of [view.body.summary, ...view.body.rows, ...view.body.members])
+      for (const name of ["projectRef", "taskRef", "areaRef"]) assert.equal(Object.hasOwn(served, name), false, name);
+    assert.equal(view.body.rows[0].payload.projectId, run.projectId);
+    for (const row of view.body.rows)
+      assert.deepEqual([row.integrated, row.accepted, row.firstPass, row.held, row.disposition], [1, 1, 1, null, "integrated"], JSON.stringify(row));
+    const roles = view.body.members.map((member: { role: string }) => member.role);
+    assert.ok(roles.includes("project-manager"), JSON.stringify(roles));
+    assert.ok(roles.includes("reviewer"), JSON.stringify(roles));
+    assert.equal((await f.host.fetchApi(`/outcomes/runs/${run.id}`, "viewer")).status, 200);
+    assert.equal((await f.host.fetchApi(`/outcomes/runs/${randomUUID()}`, "owner")).status, 404);
   } finally { await f.close(); }
 });
 
@@ -3277,4 +3347,41 @@ test("an unreadable record directory keeps the run's evidence", { skip: process.
     chmodSync(directory, 0o700);
     assert.equal(evidence.events({ runId: f.run.id, limit: 10 }).events.length, 1);
   } finally { chmodSync(directory, 0o700); evidence.close(); teams.close(); f.close(); }
+});
+
+test("a steered run keeps its integrated attempts in the scorecard", { timeout: 180000 }, async () => {
+  // The usage scenario assigns each task a configured implementer profile, which the scorecard needs.
+  const lineup = structuredClone(mixedLineup);
+  lineup.implementers = [lineup.implementers[0]!, { id: "deepseek-high", label: "DeepSeek implementer", provider: "opencode", model: "deepseek/deepseek-flash", variant: "high", tier: "light", dataUse: "contributor" }];
+  const f = await fixture("usage", lineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const settled = await f.settled(created.body.id);
+    assert.equal(settled.status, "ready-for-review", JSON.stringify(settled));
+    const before = await waitFor(() => f.host.fetchApi(`/outcomes/runs/${settled.id}`, "owner"), response => response.status === 200 && response.body.rows.length > 0, 30000);
+    const integratedBefore = before.body.rows.filter((row: { integrated: number | null }) => row.integrated === 1).map((row: { memberId: string }) => row.memberId);
+    assert.ok(integratedBefore.length > 0);
+
+    const steer = { requestId: randomUUID(), revision: settled.revision, text: "Keep the original acceptance criteria and add nothing new." };
+    let steered = await f.host.fetchApi(`/teams/${settled.id}/steer`, "owner", steer);
+    for (let attempt = 0; attempt < 40 && steered.status === 409 && steered.body.code === "team-operation-running"; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      steered = await f.host.fetchApi(`/teams/${settled.id}/steer`, "owner", steer);
+    }
+    assert.equal(steered.status, 200, JSON.stringify(steered.body));
+    const finished = await waitFor(() => f.get(settled.id), run => run.revision > settled.revision && ["ready-for-review", "merged", "blocked"].includes(run.status), 90000);
+
+    const view = await waitFor(() => f.host.fetchApi(`/outcomes/runs/${settled.id}`, "owner"), response => response.status === 200, 30000);
+    for (const memberId of integratedBefore) {
+      const row = view.body.rows.find((candidate: { memberId: string }) => candidate.memberId === memberId);
+      assert.equal(row?.integrated, 1, `row ${memberId} stays integrated after the steer`);
+    }
+    const integratedRows = view.body.rows.filter((row: { integrated: number | null }) => row.integrated === 1).length;
+    const summed = (models: { rows: { integrated: number }[] }) => models.rows.reduce((sum, row) => sum + row.integrated, 0);
+    const models = await waitFor(() => f.host.fetchApi("/usage/models"), response => response.status === 200 && summed(response.body) === integratedRows, 30000);
+    assert.equal(summed(models.body), integratedRows);
+    const currentIntegrated = finished.tasks.filter(task => task.status === "integrated").length;
+    assert.ok(integratedRows > currentIntegrated, `${integratedRows} integrated rows against ${currentIntegrated} in the current revision`);
+  } finally { await f.close(); }
 });

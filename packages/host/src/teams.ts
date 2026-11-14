@@ -9,12 +9,19 @@ import { TeamStopRefused, type Manager } from "./manager.js";
 import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { PROVIDER_NAMES, recoveryTurnEnd, type Prompt, type SignalData } from "@infinite/attention";
+import { autonomyOf, type AutonomyMode } from "./autonomy.js";
 import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamPermissionRecoveryOutcome, type TeamPermissionRecoveryRequest, type TeamPermissionRecoveryStep, type TeamPermissionRecoveryView, type TeamPublication, type TeamPublicationCategory, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, DEFAULT_TEAM_RETENTION } from "./team-types.js";
+import { memberConfiguration, type MemberConfiguration } from "./config-identity.js";
 import { ownerDirectionLines, permissionFollowUpPrompt, refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { resumeFailed } from "./native-continuation.js";
 import { combineCoverage, type UsageService } from "./usage-service.js";
-import type { EvidenceStore } from "./evidence/store.js";
+import { type EvidenceStore, eventProblem } from "./evidence/store.js";
+import { applyFuseReason, workLaunch } from "./fuse/rules.js";
+import type { FuseAdmission, FuseCheck, FuseGate } from "./fuse/types.js";
+import type { EventOutbox, OutboxEvent } from "./evidence/outbox.js";
+import { MAX_OUTBOX_EVENTS, pathField, planDigest, profileIdentity, runEventKey, runSummaryCounts, type MemberStopDetail, type MemberStopReason, type ReplacementCause } from "./run-events.js";
+import { taskFeatures } from "./task-features.js";
 import { teamUsage } from "./team-usage.js";
 import { ProviderLimits, switchesMember, type LimitObservation } from "./provider-limits.js";
 import type { LinearService } from "./linear.js";
@@ -24,6 +31,7 @@ import type { ProjectSourceService } from "./project-source.js";
 import type { RepositoryGraphs, RepositoryGraphResult } from "./repository-graphs.js";
 import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, publishTeamHead, removeMemberWorkspace, removeTeamWorkspace, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
+import { HOST_LOAD_REASON_PREFIX, LaunchHeldError } from "./host-load.js";
 import { isCollapsedPermissionPrompt, oneShotPermissionOption, permissionAuthorityHash, permissionEvidenceHash, permissionReuseKey, refusedBeforeSend } from "./team-permissions.js";
 import { storageShortfall, volumeUsage, type VolumeUsage } from "./storage.js";
 import { collectPermissionEvidence } from "./team-permission-evidence.js";
@@ -43,15 +51,30 @@ type TeamServiceOptions = {
   ownerActive?: (run: TeamRun) => boolean;
   now?: () => number;
   volumeUsage?: (path: string) => Promise<VolumeUsage>;
+  /** Run events for the evidence store. Without it no record gains a ledger field and nothing is emitted. */
+  events?: EventOutbox;
 };
-type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedAt: Record<string, string>; removalErrors: Record<string, string[]>; retryAt?: Record<string, string> };
+type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedAt: Record<string, string>; removalErrors: Record<string, string[]>; retryAt?: Record<string, string>;
+  /** When a record removal first waited for its events to reach the evidence store. */
+  evidenceHeldAt?: string };
 /** How long a failed workspace removal waits before the scheduler tries it again. */
 const REMOVAL_RETRY_MS = 5 * 60_000;
+/** A run's record waits at most this long for its events to reach the evidence store before retention removes it. */
+const EVIDENCE_WAIT_MS = 24 * 3600_000;
+/** Ledger-only reads that may be pending in one service. A read that never ends keeps its place. */
+const ENRICH_LIMIT = 16;
+let enrichSkipLogged = false;
 const REVIEW_QUIET_WINDOW_MS = 5 * 60_000;
+/** Event kinds whose drop has been logged; one line per kind for the life of the process. */
+const droppedEventKinds = new Set<string>();
+/** Event kinds whose build failed; one line per kind for the life of the process. */
+const unbuiltEventKinds = new Set<string>();
 function deliveryInspectionHash(report: DeliveryReconciliationReport) {
   return digest({ headCommit: report.headCommit, repository: report.repository, branch: report.branch,
     baseHeadCommit: report.baseHeadCommit, disposition: report.disposition, remoteHeadCommit: report.remoteHeadCommit });
 }
+/** Shown while the session limit holds a team launch; a host-capacity hold may replace it. */
+const SESSION_SLOT_REASON = "Waiting for an available host session slot.";
 type PendingOperation = { id: string; kind: "prepare" | "member" | "result" | "check"; revision: number;
   source?: { memberId: string; role: TeamMember["role"]; cwd: string; baseCommit: string; headCommit: string; workspace: "member" | "integration" };
   failure?: { code?: string; reason: string; at: string };
@@ -59,6 +82,14 @@ type PendingOperation = { id: string; kind: "prepare" | "member" | "result" | "c
 type Stored = {
   run: TeamRun; fingerprint: string; receipts: Record<string, string>; prepared: boolean; root?: string; anchor?: string;
   retention?: RetentionState;
+  /** Events waiting for the evidence store. Sealed with the record, so a crash loses none. */
+  outbox?: OutboxEvent[];
+  /** The run status that the last status event was emitted for. */
+  ledgerStatus?: TeamRun["status"];
+  /** The member whose report or failure caused the block that the next status event reports. */
+  ledgerBlockSource?: string;
+  /** Events dropped since the last stored flush. */
+  ledgerGap?: { dropped: number; firstAt: string };
   pending?: PendingOperation;
   verificationRecovery?: { pendingId: string; pendingKind: "check"; revision: number; headCommit: string; failure: "setup-changed-files" | "verification-changed-files" | "legacy-completed-check" };
   halt?: "pause" | "cancel" | "steer" | "block";
@@ -69,6 +100,8 @@ type Stored = {
   handoffPolicy?: HandoffPolicy;
   goalExtensions?: Record<string, { deadlineAt: string; ceilingAt: string }>;
   ratings?: Record<string, { fingerprint: string; result: TeamTask["ownerRating"] }>;
+  /** The member each queued replacement continues, until it starts. Written only with `options.events`. */
+  ledgerReplaces?: Record<string, { memberId: string; cause: ReplacementCause }>;
 };
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const timestamp = () => new Date().toISOString();
@@ -96,6 +129,8 @@ const underReview = (run: TeamRun, sessionId: string, promptId?: number) => prom
     ["pending", "reviewing", "approved", "answering"].includes(decision.status)) || promptId !== undefined &&
   (run.permissionRecovery?.requests ?? []).some(request => request.targetSessionId === sessionId && request.promptId === promptId && livePermissionRecoveryStatuses.has(request.status));
 const runtimeUnavailableReason = "An agent runtime is unavailable; the team is waiting for confirmed state.";
+/** Reasons that report a member's state. The scheduler writes them again from each running member on every pass. */
+const memberStateReasons: ReadonlySet<string> = new Set([runtimeUnavailableReason, permissionReviewReason, providerInputReason]);
 const clock = (iso: string) => `${iso.slice(11, 16)} UTC`;
 const runEvent = (run: TeamRun, text: string) => {
   run.events.push({ at: timestamp(), text });
@@ -328,6 +363,12 @@ function blockedTeamCanContinue(run: TeamRun, allowRemovedWorkspace = false): bo
       : run.reason === missingAgentReportReason ? "missing-agent-report" : undefined);
   return code !== undefined && recoverableContinueCodes.has(code);
 }
+/** The `member.configured` data: the six components and `configId`. A profile field the member lacks is absent, not null. */
+const configuredData = (data: MemberConfiguration) => ({
+  configId: data.configId, provider: data.provider,
+  ...(data.model == null ? {} : { model: data.model }), ...(data.effort == null ? {} : { effort: data.effort }),
+  promptVersion: data.promptVersion, guidance: data.guidance, knowledge: data.knowledge, routing: data.routing, shape: data.shape,
+});
 /** Milliseconds since the member last showed attention activity, or since it started before any was observed. */
 const quietFor = (member: TeamMember) => Date.now() - Date.parse(member.lastActivityAt ?? member.startedAt ?? timestamp());
 // The flag is persisted on the member at creation, so a recovered or stopped session keeps the fingerprint it launched with.
@@ -345,6 +386,8 @@ export class TeamService {
   private running = false;
   private closed = false;
   private tickQueued = false;
+  /** Ledger-only reads in flight. See `enrich`. */
+  private enrichments = 0;
   private readonly commands = new Map<string, AbortController>();
   private readonly removingRuns = new Set<string>();
   private readonly removalTasks = new Set<Promise<void>>();
@@ -357,6 +400,7 @@ export class TeamService {
   private readonly directory: string;
   private usage?: UsageService;
   private evidence?: EvidenceStore;
+  private fuse?: FuseGate;
   private missionReservations?: MissionReservationLookup;
   private readonly limits: ProviderLimits;
   private reconciledAt = 0;
@@ -381,6 +425,7 @@ export class TeamService {
       const stored = unseal<Stored>(key, `team:${id}`, readFileSync(join(this.directory, file), "utf8"));
       if (stored.run.id !== id) throw new TeamError(409, "invalid-team-record", "A team record cannot be authenticated.");
       this.records.set(id, stored);
+      if (this.options?.events && stored.ledgerStatus === undefined) stored.ledgerStatus = stored.run.status;
       for (const request of stored.run.permissionRecovery?.requests ?? []) if (request.status === "expanding" &&
           (request.expansion?.status === "intent" || request.expansion?.status === "uncertain")) {
         request.expansion.status = "uncertain";
@@ -504,6 +549,8 @@ export class TeamService {
       this.recoverLegacyBlocked(stored);
       this.admitBlockedDeliveryRecovery(stored);
     }
+    // Events a previous process sealed but did not store go out now. Nothing is saved here.
+    if (this.options?.events) for (const stored of this.records.values()) if (stored.outbox?.length) this.flushOutbox(stored);
   }
   /** The usage ledger this service prices member usage from; its tick also drives the ledger's reads. */
   useUsage(service: UsageService) { this.usage = service; }
@@ -511,6 +558,19 @@ export class TeamService {
   useMissionReservations(lookup: MissionReservationLookup) { this.missionReservations = lookup; }
   /** The evidence store that a deleted run's events leave with its record. */
   useEvidence(store: EvidenceStore) { this.evidence = store; }
+  /** The launch-rate fuse. Without one, every member launches as before and no record gains a fuse reason. */
+  useFuse(fuse: FuseGate) { this.fuse = fuse; }
+  /**
+   * Applies a fuse result to the run's reason. True when the launch must wait. A reason that reports a member's
+   * state stays as it is: the scheduler writes it again on every pass, so a fuse text there would be replaced and
+   * put back each pass, with a save each time. The launch waits either way.
+   */
+  private fuseWait(stored: Stored, result: FuseCheck | FuseAdmission): boolean {
+    const keeps = memberStateReasons.has(stored.run.reason ?? "");
+    const fuse = applyFuseReason(keeps ? {} : stored.run, result);
+    if (!keeps && fuse.changed) this.save(stored);
+    return fuse.wait;
+  }
   /** Whether the run's sealed record file is on disk, so a record that failed to load still counts. Only a missing file is false. */
   hasRecordFile(id: string) {
     if (!/^[a-f0-9-]{36}$/.test(id)) return false;
@@ -653,8 +713,97 @@ export class TeamService {
       retention.status = stored.run.status;
       retention.statusAt = this.retentionNow();
     }
+    if (this.options?.events) this.emitStatusEvents(stored, retention.statusAt);
     stored.run.updatedAt = timestamp();
     writeSealed(join(this.directory, `${stored.run.id}.sealed`), this.key, `team:${stored.run.id}`, stored);
+    if (this.options?.events) this.flushOutbox(stored);
+  }
+  /** Emits run.blocked or run.settled when the run status differs from the status the ledger last saw. */
+  private emitStatusEvents(stored: Stored, statusAt: string) {
+    const run = stored.run;
+    if (stored.ledgerStatus !== run.status) {
+      stored.ledgerStatus = run.status;
+      if (run.status === "blocked") {
+        this.emit(stored, "run.blocked", [run.revision, statusAt], {}, { code: run.blockCode, sourceMemberId: stored.ledgerBlockSource });
+      } else if (["ready-for-review", "merged", "no-change", "cancelled"].includes(run.status)) {
+        this.emit(stored, "run.settled", [run.revision, run.status, statusAt], {}, { status: run.status, summary: runSummaryCounts(run) });
+      }
+    }
+    stored.ledgerBlockSource = undefined;
+  }
+  /** Appends one event to the run's outbox. Never throws. A no-op without `options.events`. */
+  private emit(stored: Stored, kind: string, keyParts: readonly (string | number)[],
+    ids: { memberId?: string; taskId?: string; revision?: number }, data: Record<string, unknown>): void {
+    try {
+      if (!this.options?.events) return;
+      const run = stored.run, key = runEventKey(kind, run.id, keyParts);
+      const outbox = (stored.outbox ??= []);
+      if (outbox.some(waiting => waiting.key === key)) return;
+      const event: OutboxEvent = {
+        key, runId: run.id, revision: ids.revision ?? run.revision, at: timestamp(), kind,
+        ...(ids.memberId === undefined ? {} : { memberId: ids.memberId }),
+        ...(ids.taskId === undefined ? {} : { taskId: ids.taskId }),
+        data: { v: 1, ...Object.fromEntries(Object.entries(data).filter(([, value]) => value !== undefined)) },
+      };
+      const problem = eventProblem(event);
+      if (problem !== undefined) {
+        if (!droppedEventKinds.has(kind)) {
+          droppedEventKinds.add(kind);
+          console.warn(`A run event of kind ${kind} was dropped: ${problem}.`);
+        }
+        return;
+      }
+      if (outbox.length >= MAX_OUTBOX_EVENTS) {
+        outbox.shift();
+        stored.ledgerGap = { dropped: (stored.ledgerGap?.dropped ?? 0) + 1, firstAt: stored.ledgerGap?.firstAt ?? timestamp() };
+      }
+      outbox.push(event);
+    } catch { /* A run event never changes the run. */ }
+  }
+  /** Builds the data only when the ledger is on, then emits. A failed build drops the event and never reaches the run. */
+  private emitWith(stored: Stored, kind: string, keyParts: readonly (string | number)[],
+    ids: { memberId?: string; taskId?: string; revision?: number }, build: () => Record<string, unknown>): void {
+    if (!this.options?.events) return;
+    let data: Record<string, unknown>;
+    try { data = build(); }
+    catch {
+      if (!unbuiltEventKinds.has(kind)) {
+        unbuiltEventKinds.add(kind);
+        console.warn(`A run event of kind ${kind} could not be built; the run continues without it.`);
+      }
+      return;
+    }
+    this.emit(stored, kind, keyParts, ids, data);
+  }
+  /** Records that `next` continues `previous`, until `next` starts. A no-op without `options.events`. */
+  private linkReplacement(stored: Stored, next: TeamMember, previous: TeamMember, cause: ReplacementCause): void {
+    if (!this.options?.events) return;
+    (stored.ledgerReplaces ??= {})[next.memberId] = { memberId: previous.memberId, cause };
+  }
+  /** Records why a member stopped. Callers emit only on the transition to `stopped`, so the first stop is the stored one. A permission coordinator emits nothing. */
+  private memberStopped(stored: Stored, member: TeamMember, reason: MemberStopReason, detail?: MemberStopDetail): void {
+    if (member.role === "permission-coordinator") return;
+    this.emitWith(stored, "member.stopped", [member.memberId],
+      { memberId: member.memberId, taskId: member.taskId, revision: member.revision },
+      () => ({ role: member.role, reason, ...(detail ? { detail } : {}), reported: Boolean(member.report) }));
+  }
+  /** Sends the outbox to the store. True when nothing is left waiting. Never throws. */
+  private flushOutbox(stored: Stored, afterGap = false): boolean {
+    const events = this.options?.events;
+    if (!events) return true;
+    try {
+      if (stored.outbox?.length) {
+        const result = events.flush(stored.outbox);
+        if (!result.stored) return false;
+        stored.outbox = [];
+        if (result.refused > 0) stored.ledgerGap = { dropped: (stored.ledgerGap?.dropped ?? 0) + result.refused, firstAt: stored.ledgerGap?.firstAt ?? timestamp() };
+      }
+      const gap = stored.ledgerGap;
+      if (!gap || afterGap) return !stored.outbox?.length;
+      stored.ledgerGap = undefined;
+      this.emit(stored, "ledger.gap", [gap.firstAt], {}, { dropped: gap.dropped });
+      return this.flushOutbox(stored, true);
+    } catch { return false; }
   }
   private async nameRequest(id: string, objective: string) {
     try {
@@ -869,8 +1018,22 @@ export class TeamService {
     this.removalTasks.add(task);
     return true;
   }
-  private async deleteRecord(stored: Stored) {
+  private async deleteRecord(stored: Stored, waitForEvidence: boolean) {
     const finalView = this.view(stored);
+    if (this.options?.events) {
+      this.emit(stored, "run.deleted", [], {}, { status: stored.run.status });
+      const flushed = this.flushOutbox(stored);
+      const advanced = this.options.events.advance();
+      // A blocked projector cannot catch up without a repair, so it does not hold the deletion.
+      if (!flushed || advanced.pending && advanced.blocked.length === 0) {
+        const retention = this.retentionState(stored);
+        retention.evidenceHeldAt ??= this.retentionNow();
+        const heldFor = (this.options.now?.() ?? Date.now()) - Date.parse(retention.evidenceHeldAt);
+        if (waitForEvidence && heldFor < EVIDENCE_WAIT_MS)
+          throw new TeamError(503, "team-evidence-pending", "The team's run events are not yet in the evidence store; its record is kept until they are stored.");
+        console.warn("Run events for a removed team were not stored; its record is removed anyway.");
+      }
+    }
     try { this.persistRetiredRunId(stored.run.id); }
     catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's deletion tombstone could not be saved; its record was kept."); }
     try { await rmAsync(join(this.directory, `${stored.run.id}.sealed`), { force: true }); }
@@ -898,7 +1061,7 @@ export class TeamService {
         this.event(stored, "Workspaces removed by the owner through removeRun after the run settled.");
         this.save(stored);
       }
-      return this.deleteRecord(stored);
+      return this.deleteRecord(stored, false);
     });
   }
   rateTask(id: string, taskId: string, input: { requestId: string; score: number; note?: string }) {
@@ -913,6 +1076,7 @@ export class TeamService {
     const rating = { score: input.score as 1 | 2 | 3 | 4 | 5, ...(input.note ? { note: input.note } : {}), at: timestamp() };
     task.ownerRating = rating;
     (stored.ratings ??= {})[input.requestId] = { fingerprint, result: rating };
+    this.emitWith(stored, "rating.recorded", [input.requestId], { taskId, memberId: task.memberId, revision: task.revision }, () => ({ score: input.score }));
     this.event(stored, `The owner rated task ${taskId}.`); this.save(stored);
     return task;
   }
@@ -941,14 +1105,14 @@ export class TeamService {
     return this.createRun(parsed);
   }
   /** Goal authority and model snapshots come from the host, never from a public create body. */
-  createForGoal(request: CreateTeam, goal: TeamGoalContext, lineup: TeamLineup, linearTracking = false): Promise<TeamView> {
-    return this.createRun(createTeamSchema.parse(request), { goal: teamGoalContextSchema.parse(goal), lineup: teamLineupSchema.parse(lineup) }, linearTracking);
+  createForGoal(request: CreateTeam, goal: TeamGoalContext, lineup: TeamLineup, linearTracking = false, autonomy: AutonomyMode = "supervised"): Promise<TeamView> {
+    return this.createRun(createTeamSchema.parse(request), { goal: teamGoalContextSchema.parse(goal), lineup: teamLineupSchema.parse(lineup), autonomy }, linearTracking);
   }
   /** A mission subteam is an ordinary run of one repository under that repository's own policies; the mission pins its lineup. */
-  createForMission(request: CreateTeam, missionId: string, lineup: TeamLineup, options: { baseRunId?: string; parallelismCeiling?: number } = {}): Promise<TeamView> {
+  createForMission(request: CreateTeam, missionId: string, lineup: TeamLineup, options: { baseRunId?: string; parallelismCeiling?: number; linearTracking?: boolean } = {}): Promise<TeamView> {
     const parsed = createTeamSchema.parse(request);
     const project = this.config.projects.find(item => item.id === parsed.projectId);
-    return this.createRun(parsed, { missionId, ...(options.baseRunId ? { baseRunId: options.baseRunId } : {}), parallelismCeiling: options.parallelismCeiling ?? 4, lineup: teamLineupSchema.parse(lineup) }, Boolean(project?.linear));
+    return this.createRun(parsed, { missionId, ...(options.baseRunId ? { baseRunId: options.baseRunId } : {}), parallelismCeiling: options.parallelismCeiling ?? 4, lineup: teamLineupSchema.parse(lineup) }, options.linearTracking ?? Boolean(project?.linear));
   }
   assertHandoffPolicy(policy: HandoffPolicy) {
     const project = this.config.projects.find(item => item.id === policy.projectId);
@@ -967,12 +1131,12 @@ export class TeamService {
     this.assertHandoffPolicy(policy);
     return this.createRun(parsed, { handoff, handoffPolicy: policy, lineup: policy.lineup }, Boolean(policy.linear));
   }
-  private createRun(parsed: CreateTeam, internal?: { goal?: TeamGoalContext; missionId?: string; parallelismCeiling?: number; baseRunId?: string; handoff?: TeamHandoffContext; handoffPolicy?: HandoffPolicy; lineup: TeamLineup }, linearTracking = false): Promise<TeamView> {
+  private createRun(parsed: CreateTeam, internal?: { goal?: TeamGoalContext; missionId?: string; parallelismCeiling?: number; baseRunId?: string; handoff?: TeamHandoffContext; handoffPolicy?: HandoffPolicy; lineup: TeamLineup; autonomy?: AutonomyMode }, linearTracking = false): Promise<TeamView> {
     return this.enqueue(async () => {
       // Preserve the fingerprints written before lineup selection existed.
       const { useConfiguredLineup, ...singleProviderRequest } = parsed;
       // The host derives the ceiling; adding it must not change a pending mission launch's identity.
-      const { parallelismCeiling: _ceiling, ...creationContext } = internal ?? {};
+      const { parallelismCeiling: _ceiling, autonomy: _autonomy, ...creationContext } = internal ?? {};
       const prior = this.records.get(parsed.requestId), fingerprint = digest(internal ? { request: parsed, ...creationContext } : useConfiguredLineup ? parsed : singleProviderRequest);
       if (prior) {
         if (prior.fingerprint !== fingerprint) throw new TeamError(409, "request-conflict", "This request ID belongs to a different team request.");
@@ -1047,6 +1211,8 @@ export class TeamService {
       if (initialParallelism > ceiling)
         throw new TeamError(409, "team-parallelism-limit", "The initial worker limit exceeds this run's capacity ceiling.");
       const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(project.team.permissions ? { permissions: currentPermissions(structuredClone(project.team.permissions)), permissionDecisions: [] } : {}), ...(goal ? { goal } : {}), ...(internal?.missionId ? { missionId: internal.missionId } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), ...(titleSource ? { titleSource } : {}), title: parsed.title, objective: parsed.objective, parallelismCeiling: ceiling, parallelism: initialParallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
+      // A goal run takes the mode its cycle passes; every other run takes the project's current mode.
+      run.autonomy = goal ? autonomyOf(internal) : autonomyOf(project);
       if (project.team.delivery) {
         if (!lineup || lineup.coordinator.tier !== "strong" || lineup.reviewer.tier !== "strong")
           throw new TeamError(409, "delivery-lineup-required", "Automatic delivery requires a configured strong coordinator and independent strong reviewer.");
@@ -1063,7 +1229,10 @@ export class TeamService {
         ensureHostDirectory(anchor, root, 0o750);
       } else ensureDefaultTeamRoot(root, true);
       const stored: Stored = { run, fingerprint, receipts: {}, prepared: false, root, retention: { status: run.status, statusAt: at, integratedAt: {}, removalErrors: {} }, ...(anchor ? { anchor } : {}), source, ...(internal?.handoffPolicy ? { handoffPolicy: structuredClone(internal.handoffPolicy) } : {}) };
-      this.records.set(run.id, stored); this.event(stored, "Team created; preparing an isolated copy of the configured project."); this.save(stored);
+      this.records.set(run.id, stored); this.event(stored, "Team created; preparing an isolated copy of the configured project.");
+      this.emit(stored, "run.created", [], { revision: 1 }, { projectId: run.projectId, purpose: "work", goalId: goal?.id, goalCycle: goal?.cycle,
+        missionId: internal?.missionId, handoff: Boolean(internal?.handoff), parentRunId: internal?.baseRunId, lineup: Boolean(lineup), deliveryMode: run.delivery?.mode });
+      this.save(stored);
       if (run.titleSource === "request" && this.titler) void this.nameRequest(run.id, parsed.objective).catch(error => console.warn("Best-effort team naming failed.", error));
       this.operation(stored, "prepare", async signal => {
         const assertParent = () => {
@@ -1121,7 +1290,7 @@ export class TeamService {
         // The refresh above has released its working-tree hold by now, so the ordinary project gate still applies:
         // it keeps a run from preparing while repository setup changes and lets a sync apply see the start.
         return this.startInProject(run.projectId, prepareWorkspace);
-      }, workspace => { Object.assign(run, workspace); run.headCommit = workspace.baseCommit; stored.prepared = true; this.event(stored, "Isolated project ready. Starting the project manager."); });
+      }, workspace => { Object.assign(run, workspace); run.headCommit = workspace.baseCommit; stored.prepared = true; this.emit(stored, "run.prepared", [], {}, { baseCommit: run.baseCommit }); this.event(stored, "Isolated project ready. Starting the project manager."); });
       return this.view(stored);
     });
   }
@@ -1162,6 +1331,7 @@ export class TeamService {
         this.event(stored, "User steering superseded automatic recovery; its original report remains recorded as evidence.");
       }
       stored.run.revision++; stored.run.steering.push({ text: body.text, revision: stored.run.revision, at: timestamp() });
+      this.emit(stored, "run.revision-advanced", [stored.run.revision], {}, { cause: "steer", fromRevision: stored.run.revision - 1, baseChanged: false });
       stored.run.status = "planning"; stored.halt = "steer"; stored.run.reason = "Stopping earlier members before planning the updated request."; stored.run.blockCode = undefined;
       stored.run.tasks = []; stored.run.review = undefined; stored.run.round = 0; stored.checkHead = undefined;
       stored.run.brief = undefined; stored.run.noChange = undefined;
@@ -1381,11 +1551,13 @@ export class TeamService {
       catch (error) {
         if (!this.mutation(stored, "retire-member", body)) return this.view(stored);
         member.status = "stopped"; member.stoppedReason = "Recording failed; runtime retired after confirmed process exit"; member.retirement = retirement;
+        this.memberStopped(stored, member, "host", "retired");
         this.block(stored, error, member);
         return this.view(stored);
       }
       if (!this.mutation(stored, "retire-member", body)) return this.view(stored);
       member.status = "stopped"; member.stoppedReason = "Recording failed; runtime retired after confirmed process exit"; member.retirement = retirement;
+      this.memberStopped(stored, member, "host", "retired");
       if (run.reason === runtimeUnavailableReason) run.reason = undefined;
       this.event(stored, `The owner authorized retirement of reviewer ${member.memberId} at ${member.baseCommit}. Operator claim, not host-verified: ${JSON.stringify(body.text.slice(0, 500))}. The original journal and reports are retained.`);
       this.save(stored);
@@ -1516,6 +1688,7 @@ export class TeamService {
           member.role === "permission-coordinator" && member.status === "waiting") member.status = "stopped";
       next.run.continuations = [...(next.run.continuations ?? []), continuation];
       next.run.revision = nextRevision;
+      this.emit(next, "run.revision-advanced", [nextRevision], {}, { cause: "continue", fromRevision: nextRevision - 1, baseChanged: false });
       next.run.tasks = [];
       next.run.review = undefined;
       next.run.round = 0;
@@ -1565,6 +1738,7 @@ export class TeamService {
     next.verificationRecovery = undefined;
     next.halt = undefined;
     next.run.revision++; next.run.tasks = []; next.run.review = undefined; next.run.round = 0; next.checkHead = undefined;
+    this.emit(next, "run.revision-advanced", [next.run.revision], {}, { cause: "verification-recovery", fromRevision: next.run.revision - 1, baseChanged: false });
     next.run.brief = undefined; next.run.noChange = undefined;
     if (next.run.discovery && !next.run.discovery.completedAt) next.run.discovery.completedAt = timestamp();
     next.run.status = "planning"; next.run.reason = undefined; next.run.blockCode = undefined;
@@ -1597,6 +1771,7 @@ export class TeamService {
         if (run.status !== "paused" && !this.canResume(stored)) { this.save(stored); return this.view(stored); }
         // Pausing stopped native agents. Replan from the confirmed integration head, preserving stopped copies for inspection.
         run.revision++; run.tasks = []; run.review = undefined; run.round = 0; stored.checkHead = undefined;
+        this.emit(stored, "run.revision-advanced", [run.revision], {}, { cause: "resume", fromRevision: run.revision - 1, baseChanged: false });
         run.brief = undefined; run.noChange = undefined;
         if (run.discovery && !run.discovery.completedAt) run.discovery.completedAt = timestamp();
         await this.invalidatePermissionDecisions(stored, "The team resumed under a new revision.");
@@ -1860,6 +2035,7 @@ export class TeamService {
     stored.run.reason = stored.run.stopReason === "deadline" ? "The goal reached its deadline. Active work is being stopped and retained for inspection."
       : stored.run.stopReason === "member-limit" ? "The goal reached this run's agent attempt limit. Active work is being stopped and retained for inspection."
         : error instanceof TeamError ? error.message : genericOperationFailureReason;
+    if (this.options?.events) stored.ledgerBlockSource = sourceMember?.memberId ?? pending?.source?.memberId;
     this.event(stored, stored.run.reason); this.save(stored); this.trackBlocked(stored);
   }
   private async startAutomaticDeliveryRecovery(stored: Stored, trackingReady: boolean) {
@@ -1964,6 +2140,7 @@ export class TeamService {
         ...(run.brief ? { brief: structuredClone(run.brief) } : {}),
       }];
       run.revision = nextRevision;
+      this.emit(stored, "run.revision-advanced", [nextRevision], {}, { cause: "automatic-recovery", fromRevision: nextRevision - 1, baseChanged: false, sourceCode: source.code, sourceMemberId: source.memberId === "unattributed" ? undefined : source.memberId });
       run.tasks = [];
       run.review = undefined;
       run.round = 0;
@@ -2142,7 +2319,7 @@ export class TeamService {
             this.event(stored, `Workspaces removed under the retention policy after this ${run.status} run settled. See docs/teams.md.`);
           try { this.save(stored); } catch (error) { console.warn("Could not persist a removed team workspace marker.", error); }
           if (run.status === "cancelled" && !run.goal && !run.missionId && !this.ownerPreventsRemoval(run) && !this.hasPendingPreparationFrom(stored) && await this.membersSettled(stored)) {
-            try { await this.deleteRecord(stored); }
+            try { await this.deleteRecord(stored, true); }
             catch (error) { await this.reportRemovalFailure(stored, "record", error); }
           }
         },
@@ -2215,7 +2392,7 @@ export class TeamService {
         }
         if (completionChanged) try { this.save(stored); } catch (error) { console.warn("Could not persist a completed team workspace removal.", error); }
         if (run.status === "cancelled" && !run.goal && !run.missionId && retentionMs !== undefined && elapsed >= retentionMs && await this.membersSettled(stored)) {
-          try { await this.deleteRecord(stored); }
+          try { await this.deleteRecord(stored, true); }
           catch (error) { await this.reportRemovalFailure(stored, "record", error); }
         }
         return;
@@ -2224,12 +2401,16 @@ export class TeamService {
       if (this.needsPublication(stored)) { this.startPublication(stored); return; }
 
       run.workspaceRemovedAt = this.retentionNow();
+      // The key names the fact, not the time, so a retried removal stores the same event once.
+      const settledKey = runEventKey("run.settled", run.id, [run.revision, "blocked", "workspace-removed"]);
+      if (run.status === "blocked") this.emit(stored, "run.settled", [run.revision, "blocked", "workspace-removed"], {}, { status: "blocked", summary: runSummaryCounts(run) });
       const startedAt = run.workspaceRemovedAt, previousEvents = run.events.slice();
       this.event(stored, "Workspace removal under the retention policy started.");
       try { this.save(stored); }
       catch (error) {
         run.workspaceRemovedAt = undefined;
         run.events = previousEvents;
+        if (stored.outbox) stored.outbox = stored.outbox.filter(event => event.key !== settledKey);
         console.warn("Could not persist a started team workspace removal.", error);
         return;
       }
@@ -2270,7 +2451,9 @@ export class TeamService {
           member.role === "permission-coordinator" && member.status === "waiting" ||
           drainRevision !== undefined && member.revision === drainRevision) &&
           !(drainRevision !== undefined && member.revision === drainRevision && member.status !== "waiting" && terminalPermissionCoordinator(run, member)));
+        const halt = stored.halt;
         for (const member of membersToStop) {
+          const statusBefore = member.status;
           try {
             if (member.role === "permission-coordinator" && member.status === "waiting") {
               member.status = "stopped"; member.report = undefined; continue;
@@ -2292,10 +2475,14 @@ export class TeamService {
               if (member.role === "permission-coordinator") member.status = "unavailable";
               all = false; continue;
             }
-            const { page } = this.readMemberJournal(run, member, false, true);
+            const { page } = this.readMemberJournal(stored, member, false, true);
             member.status = "stopped";
             if (page.more || member.cursor < stopped.seq) all = false;
           } catch { all = false; member.status = "unavailable"; }
+          finally {
+            if (statusBefore !== "stopped" && member.status === "stopped")
+              this.memberStopped(stored, member, halt === "block" ? "host" : "owner", halt);
+          }
         }
         const safePendingRecovery = Boolean(run.recovery?.status === "stopping" && stored.pending &&
           (recoverableOperationFailure(stored, stored.pending) || recoverableUnattributedResult(stored, stored.pending)));
@@ -2346,7 +2533,7 @@ export class TeamService {
             if (decisionChanged || member.status !== before) this.save(stored);
             continue;
           }
-          const { page, limit } = this.readMemberJournal(run, member);
+          const { page, limit } = this.readMemberJournal(stored, member);
           if (!member.report && limit) {
             await this.switchLimitedMember(stored, member, limit);
             if (stored.pending || run.status === "blocked") return;
@@ -2409,6 +2596,7 @@ export class TeamService {
                 this.event(stored, "The permission coordinator exited without a decision; the provider request remains with the user."); this.save(stored); continue;
               }
               member.status = "stopped";
+              this.memberStopped(stored, member, "no-report");
               this.block(stored, new TeamError(409, "missing-agent-report", "An agent exited without a valid structured report. Its task is unresolved."), member); return;
             }
             // A member back from an outage may come back straight into a prompt; it is running again.
@@ -2456,6 +2644,7 @@ export class TeamService {
         // A limit substitution may have pinned a fallback profile on another provider.
         next.provider = next.modelProfile?.provider ?? prior.provider ?? run.provider;
         prior.status = "stopped"; run.members.push(next);
+        this.linkReplacement(stored, next, prior, "answer");
         if (prior.role === "delivery" && stored.deliveryAttempt?.memberId === prior.memberId)
           stored.deliveryAttempt.memberId = next.memberId;
         const task = prior.role === "scout" ? run.discovery?.tasks.find(item => item.id === prior.taskId) : run.tasks.find(item => item.id === prior.taskId);
@@ -2495,7 +2684,12 @@ export class TeamService {
       if (activeCount) return;
       if (run.establishChecks && !run.verification?.checks.length)
         throw new TeamError(409, "verification-required", "Required verification commands have not been established; review cannot start.");
-      if (stored.checkHead !== run.headCommit) { this.check(stored); return; }
+      if (stored.checkHead !== run.headCommit) {
+        const hold = this.manager.hostLoad.held();
+        if (hold) { this.holdForHostLoad(stored, hold); return; }
+        if (run.reason?.startsWith(HOST_LOAD_REASON_PREFIX)) run.reason = undefined;
+        this.check(stored); return;
+      }
       if (!run.review || run.review.revision !== run.revision) {
         this.prepareMember(stored, "reviewer"); return;
       }
@@ -3497,7 +3691,8 @@ export class TeamService {
    * A limit acts only on the whole journal: a report or recovery in an unread tail wins.
    * After a confirmed exit, drain the tail even without a limit before considering replacement.
    */
-  private readMemberJournal(run: TeamRun, member: TeamMember, exited = false, singlePage = false) {
+  private readMemberJournal(stored: Stored, member: TeamMember, exited = false, singlePage = false) {
+    const run = stored.run;
     let page: ReturnType<Manager["events"]>, limit: LimitSwitch | undefined;
     do {
       page = this.manager.events(member.sessionId, member.cursor, 200, new Set(["team-report", "signal"]));
@@ -3516,6 +3711,8 @@ export class TeamService {
         if (envelope.runId !== run.id || envelope.memberId !== member.memberId || envelope.revision !== member.revision) continue;
         member.report = envelope.report; member.status = "reported"; member.reportedAt = timestamp(); member.stalledAt = undefined;
         if (member.stoppedReason?.startsWith("No activity for ")) member.stoppedReason = undefined;
+        if (member.role !== "permission-coordinator") this.emitWith(stored, "member.reported", [member.memberId],
+          { memberId: member.memberId, taskId: member.taskId, revision: member.revision }, () => ({ role: member.role, reportKind: envelope.report.kind }));
         break;
       }
     } while (!singlePage && !member.report && (exited || limit) && page.more);
@@ -3542,7 +3739,7 @@ export class TeamService {
       }
       member.status = "unavailable"; run.reason = "An agent could not be stopped. Release its input control or inspect its terminal before integration."; this.save(stored); return;
     }
-    const { page, limit } = this.readMemberJournal(run, member, true);
+    const { page, limit } = this.readMemberJournal(stored, member, true);
     if (member.report) { this.save(stored); return; }
     if (page.more || member.cursor < exited.seq) { member.status = "unavailable"; this.save(stored); return; }
     if (limit) {
@@ -3550,6 +3747,7 @@ export class TeamService {
       if (member.stoppedReason?.startsWith("No activity for ")) member.stoppedReason = undefined;
       await this.switchLimitedMember(stored, member, limit); return;
     }
+    this.memberStopped(stored, member, "stall");
     // A delivery member may already have published; a replacement must not repeat it unseen.
     if (member.role === "delivery" && stored.deliveryAttempt) {
       this.block(stored, new TeamError(409, "delivery-reconciliation-required", "The delivery agent stalled after a publication attempt. Inspect the remote branch and PR before replacing it.")); return;
@@ -3568,6 +3766,7 @@ export class TeamService {
       if (task) { task.memberId = next.memberId; task.status = "running"; }
       if (scout) scout.memberId = next.memberId;
       run.members.push(next);
+      this.linkReplacement(stored, next, member, "stall");
       this.event(stored, `${member.title} stalled with no activity for ${minutes} minutes; its workspace was preserved and a replacement continues the assignment.`);
     });
   }
@@ -3595,6 +3794,7 @@ export class TeamService {
       this.save(stored);
       return;
     }
+    this.memberStopped(stored, member, "limit");
     // A delivery member may already have published; a replacement must not repeat it unseen.
     if (member.role === "delivery" && stored.deliveryAttempt) {
       this.block(stored, new TeamError(409, "delivery-reconciliation-required", "The delivery provider stopped at a limit. Inspect the remote branch and PR before replacing a possibly completed publication.")); return;
@@ -3630,6 +3830,10 @@ export class TeamService {
         if (decision && decision.status === "reviewing") decision.coordinatorMemberId = next.memberId;
       }
       run.members.push(next);
+      this.linkReplacement(stored, next, member, "limit");
+      this.emitWith(stored, "task.limit-switched", [member.memberId], { memberId: member.memberId, taskId: member.taskId, revision: member.revision }, () => ({
+        role: member.role, fromProfileId: from.id, toProfileId: fallback.id,
+      }));
       this.event(stored, `${from.label} hit a ${name} ${kind}${resets ? ` (resets ${resets})` : ""}; ${task?.title ?? member.title} continues on ${fallback.label}${editing ? " with partial work preserved" : ""}.`);
     });
   }
@@ -3739,7 +3943,14 @@ export class TeamService {
       if (tracking?.status === "blocked") throw new TeamError(409, "linear-issue-changed", tracking.reason ?? "The Linear issue no longer permits this work.");
       if (tracking && tracking.status !== "synced") return;
     }
-    if (!this.hasLaunch(member) && (await this.manager.list()).filter(session => session.status === "running" || session.status === "starting").length >= this.config.maxSessions) { stored.run.reason = "Waiting for an available host session slot."; this.save(stored); return; }
+    // The fuse is asked before any launch work. It reads memory only, so a queued member costs no write per pass.
+    if (this.fuse && !this.hasLaunch(member) && this.fuseWait(stored, this.fuse.check({ projectId: stored.run.projectId, role: member.role }))) return;
+    // The host's load is asked next, so a launch that it holds is never charged to the fuse.
+    if (!this.hasLaunch(member)) {
+      const hold = this.manager.hostLoad.held();
+      if (hold) { this.holdForHostLoad(stored, hold); return; }
+    }
+    if (!this.hasLaunch(member) && (await this.manager.list()).filter(session => session.status === "running" || session.status === "starting").length >= this.config.maxSessions) { stored.run.reason = SESSION_SLOT_REASON; this.save(stored); return; }
     if (member.role === "delivery") {
       this.assertDelivery(stored);
       const attempt = stored.deliveryAttempt;
@@ -3766,17 +3977,60 @@ export class TeamService {
       const configuredProject = stored.run.handoff?.project ?? this.config.projects.find(project => project.id === stored.run.projectId)?.team;
       await writeTeamContext(member.cwd, { ...teamContext(stored.run, member.contextFeedback, configuredProject, member.role, this.permissionRecoveryHistory(stored.run)), assignment: assignment(member), memberBaseCommit: member.baseCommit, scratchDirectory: member.scratchDirectory }, this.config.teams?.commandPrefix);
     }
+    // The launch is charged once, right before its session starts. A member whose session exists is a replay.
+    if (this.fuse && !this.hasLaunch(member) && this.fuseWait(stored, this.fuse.admit(workLaunch({ launchId: member.sessionId, projectId: stored.run.projectId,
+      provider: member.provider ?? stored.run.provider, team: assignment(member), profile: member.modelProfile })))) return;
     let result;
     const request = { requestId: member.sessionId, provider: member.provider ?? stored.run.provider,
       projectId: stored.run.projectId, title: member.title, prompt: member.prompt,
       ...(member.role === "permission-coordinator" ? { continuation: member.continuation } : {}) };
     try { result = await this.startInProject(stored.run.projectId, () => this.manager.createTeamSession(request, assignment(member), member.cwd, member.modelProfile, stored.root, this.config.teams?.trustWorkspaces === true)); }
-    catch (error) { if (error instanceof Error && /configured session limit/.test(error.message)) { stored.run.reason = "Waiting for an available host session slot."; this.save(stored); return; } throw error; }
+    catch (error) {
+      this.fuse?.release(member.sessionId);
+      if (error instanceof LaunchHeldError) { this.holdForHostLoad(stored, error.reason); return; }
+      if (error instanceof Error && /configured session limit/.test(error.message)) { stored.run.reason = SESSION_SLOT_REASON; this.save(stored); return; }
+      if (error instanceof TeamError && error.code === "fuse-open") {
+        if (stored.run.reason !== error.message) { stored.run.reason = error.message; this.save(stored); }
+        return;
+      }
+      throw error;
+    }
+    if (stored.run.reason?.startsWith(HOST_LOAD_REASON_PREFIX)) stored.run.reason = undefined;
     member.status = result.status === "unavailable" ? "unavailable" : "running";
     member.startedAt ??= timestamp();
     const turn = member.turns?.at(-1);
     if (turn?.sessionId === member.sessionId) turn.startedAt = member.startedAt;
+    const replaces = stored.ledgerReplaces?.[member.memberId];
+    if (member.role !== "permission-coordinator") this.emitWith(stored, "member.started", [member.memberId],
+      { memberId: member.memberId, taskId: member.taskId, revision: member.revision }, () => ({
+        role: member.role, purpose: "work", sessionId: member.sessionId, startedAt: member.startedAt, baseCommit: member.baseCommit,
+        ...profileIdentity(member.modelProfile, member.provider ?? run.provider),
+        ...(result.status === "unavailable" ? { unavailable: true } : {}), ...(replaces ? { replaces } : {}),
+      }));
+    // The configuration read runs after the launch and never delays it. Its identity is fixed before the read.
+    if (member.role !== "permission-coordinator") {
+      const captured = { memberId: member.memberId, taskId: member.taskId, revision: member.revision, workspace: stored.run.workspace,
+        baseCommit: member.baseCommit, role: member.role, provider: member.provider ?? run.provider, profile: member.modelProfile,
+        publishHeads: this.publishHeadsEnabled(), prefix: this.config.teams?.commandPrefix };
+      this.enrich(stored, async signal => {
+        const data = await memberConfiguration(captured, signal);
+        if (!data) return undefined;
+        return () => this.emitWith(stored, "member.configured", [captured.memberId],
+          { memberId: captured.memberId, taskId: captured.taskId, revision: captured.revision }, () => configuredData(data));
+      });
+    }
+    if (stored.ledgerReplaces) {
+      delete stored.ledgerReplaces[member.memberId];
+      if (!Object.keys(stored.ledgerReplaces).length) delete stored.ledgerReplaces;
+    }
     this.save(stored);
+  }
+  /** Shows a host-load hold on the run. It replaces an empty reason, an earlier host-load hold, or the session-slot wait; any other reason stays. */
+  private holdForHostLoad(stored: Stored, reason: string) {
+    const current = stored.run.reason;
+    const replaceable = current === undefined || current === SESSION_SLOT_REASON || current.startsWith(HOST_LOAD_REASON_PREFIX);
+    if (!replaceable || current === reason) return;
+    stored.run.reason = reason; this.save(stored);
   }
   private applyProjectManagerCapacity(stored: Stored, requested?: number) {
     const run = stored.run, ceiling = capacityCeiling(run), limit = requested ?? ceiling;
@@ -3826,6 +4080,13 @@ export class TeamService {
         run.discovery = { revision: run.revision, summary: report.summary, tasks: report.tasks.map(task => ({ ...task, status: "pending" })) };
         run.status = "discovering";
         this.event(stored, `The coordinator requested ${report.tasks.length} read-only discovery tasks.`);
+        const map = (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features;
+        this.emitWith(stored, "discovery.accepted", [member.revision], { memberId: member.memberId, revision: member.revision }, () => ({
+          parallelism: run.parallelism,
+          scouts: (run.discovery?.tasks ?? []).map(scout => ({
+            taskId: scout.id, profileId: scout.agentProfileId, features: taskFeatures({ role: "scout", paths: [] }, map),
+          })),
+        }));
       }, member); return;
     }
     if (report.kind === "findings") {
@@ -3834,6 +4095,7 @@ export class TeamService {
       this.operation(stored, "result", signal => assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal), () => {
         scout.status = "complete"; scout.summary = report.summary; scout.evidence = report.evidence;
         this.event(stored, `${member.title} returned evidence without changing its working copy.`);
+        this.emitWith(stored, "scout.completed", [member.revision, scout.id], { memberId: member.memberId, taskId: scout.id, revision: member.revision }, () => ({}));
       }, member); return;
     }
     if (report.kind === "escalate") {
@@ -3843,9 +4105,12 @@ export class TeamService {
         throw new TeamError(409, "invalid-escalation", "An implementer may escalate once to a different profile in the approved escalation pool.");
       this.operation(stored, "result", signal => assertMemberScope(member.cwd, member.baseCommit, task.paths, this.config.teams?.commandPrefix, signal), () => {
         task.escalation = { ...(member.modelProfile ? { fromProfileId: member.modelProfile.id } : {}), toProfileId: profile.id, reason: report.reason, memberId: member.memberId, at: timestamp() };
+        this.emitWith(stored, "task.escalated", [member.revision, task.id], { memberId: member.memberId, taskId: task.id, revision: member.revision }, () => ({
+          fromProfileId: task.escalation?.fromProfileId, toProfileId: task.escalation?.toProfileId,
+        }));
         const next = this.newMember(run, "implementer", member.cwd, member.baseCommit, task.id, undefined, profile);
         next.prompt = teamPrompt(run, "implementer", task, `The previous implementer requested escalation: ${report.reason}. Its partial edits are present in this working copy and have passed the host's path-scope check. Inspect them before continuing.`, next.provider ?? run.provider, next.modelProfile);
-        run.members.push(next); task.memberId = next.memberId; task.status = "running";
+        run.members.push(next); this.linkReplacement(stored, next, member, "escalation"); task.memberId = next.memberId; task.status = "running";
         run.status = "implementing";
         this.event(stored, `${task.title} escalated to ${profile.label}; the stopped member's partial work was preserved.`);
       }, member); return;
@@ -3892,6 +4157,15 @@ export class TeamService {
         }
         run.status = "implementing";
         this.event(stored, `Project manager planned ${run.tasks.length} tasks.`);
+        const map = (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features;
+        this.emitWith(stored, "plan.accepted", [member.revision], { memberId: member.memberId, revision: member.revision }, () => ({
+          taskCount: run.tasks.length, planDigest: planDigest(run.tasks), parallelism: run.parallelism,
+        }));
+        for (const task of run.tasks) this.emitWith(stored, "task.planned", [member.revision, task.id], { taskId: task.id, revision: member.revision }, () => ({
+          profileId: task.agentProfileId,
+          ...pathField(task.paths),
+          features: taskFeatures({ role: "implementer", paths: task.paths, kind: task.kind, risk: task.risk }, map),
+        }));
       }, member); return;
     }
     if (report.kind === "delivery-reconciliation") {
@@ -3954,6 +4228,8 @@ export class TeamService {
         if (report.disposition === "pull-request" && run.delivery?.mode === "pr") {
           stored.deliveryAttempt = undefined;
           run.pullRequest = { revision: run.revision, headCommit: report.headCommit, pullRequestUrl: report.pullRequestUrl!, summary: report.summary, reportedAt: timestamp() };
+          this.emitWith(stored, "delivery.recorded", [member.revision, member.memberId], { memberId: member.memberId, revision: member.revision }, () => ({
+            method: "pull-request", headCommit: report.headCommit }));
           run.status = "ready-for-review"; run.reason = undefined;
           if (run.recovery) run.recovery.status = "complete";
           if (run.deliveryRecovery) run.deliveryRecovery.status = "complete";
@@ -3974,6 +4250,7 @@ export class TeamService {
           }];
           run.workspace = result.workspace; run.baseCommit = result.baseHeadCommit; run.headCommit = result.baseHeadCommit;
           run.revision++; run.tasks = []; run.review = undefined; run.round = 0; stored.checkHead = undefined;
+          this.emit(stored, "run.revision-advanced", [run.revision], {}, { cause: "moved-base", fromRevision: previousRevision, baseChanged: true });
           run.brief = undefined; run.noChange = undefined; stored.deliveryAttempt = undefined;
           const attempts = run.deliveryRecovery?.attempts ?? run.recovery?.attempts ?? 0;
           run.deliveryRecovery = { attempts, status: "replanning", revision: run.revision, headCommit: run.headCommit,
@@ -4016,6 +4293,8 @@ export class TeamService {
           await this.enqueue(() => {
             if (this.closed) return;
             run.deliveryReceipt = { revision: run.revision, headCommit: report.headCommit, pullRequestUrl: report.pullRequestUrl, mergeCommit: report.mergeCommit, summary: report.summary, reportedAt: timestamp() };
+            this.emitWith(stored, "delivery.recorded", [member.revision, member.memberId], { memberId: member.memberId, revision: member.revision }, () => ({
+              method: "merge", headCommit: report.headCommit, mergeCommit: report.mergeCommit }));
             this.save(stored);
           });
           await captureDeliveryBaseline(run.workspace, member.cwd, member.baseCommit, report.mergeCommit, this.config.teams?.commandPrefix, signal);
@@ -4030,10 +4309,12 @@ export class TeamService {
           if (recovery && recovery.attempts > 0 && recovery.status !== "complete" && !inspected)
             throw new TeamError(409, "delivery-reconciliation-required", "An automatic recovery requires structured remote evidence before a delivery repair can change the reviewed head.");
           stored.deliveryAttempt = undefined;
-          this.repair(stored, `Delivery requires a scoped repair before checks and independent review run again. No merge was reported.\n${report.summary}`);
+          this.repair(stored, `Delivery requires a scoped repair before checks and independent review run again. No merge was reported.\n${report.summary}`, "delivery");
         } else if (report.kind === "pull-request") {
           stored.deliveryAttempt = undefined;
           run.pullRequest = { revision: run.revision, headCommit: report.headCommit, pullRequestUrl: report.pullRequestUrl, summary: report.summary, reportedAt: timestamp() };
+          this.emitWith(stored, "delivery.recorded", [member.revision, member.memberId], { memberId: member.memberId, revision: member.revision }, () => ({
+            method: "pull-request", headCommit: report.headCommit }));
           run.status = "ready-for-review"; run.reason = undefined;
           if (run.recovery) run.recovery.status = "complete";
           if (run.deliveryRecovery) run.deliveryRecovery.status = "complete";
@@ -4052,8 +4333,11 @@ export class TeamService {
       if (member.baseCommit !== run.headCommit || stored.checkHead !== run.headCommit) { this.block(stored, new TeamError(409, "stale-review", "The reviewer did not review the currently verified integration commit.")); return; }
       if (run.brief?.uiChanges && report.verdict === "approved" && !report.uiEvidence)
         throw new TeamError(409, "ui-review-evidence-required", "Approval of UI changes requires the reviewer's evidence from inspecting the runnable interface.");
-      this.operation(stored, "result", signal => assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal), () => {
+      this.operation(stored, "result", async signal => {
+        await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
+      }, () => {
         run.review = { verdict: report.verdict, summary: report.summary, revision: run.revision, ...(report.uiEvidence ? { uiEvidence: report.uiEvidence } : {}) };
+        const rubricKept: { taskId: string; correctness: number; cleanliness: number; extensibility: number; docs: number }[] = [];
         if (report.verdict === "approved" && report.rubric?.length) {
           const reviewer = member.modelProfile ?? this.memberProfile(run, "reviewer");
           for (const entry of report.rubric) {
@@ -4065,13 +4349,26 @@ export class TeamService {
               continue;
             }
             task.rubric = { version: 1, correctness: entry.correctness, cleanliness: entry.cleanliness, extensibility: entry.extensibility, docs: entry.docs, reviewerProfileId: reviewer?.id ?? "unknown" };
+            rubricKept.push({ taskId: task.id, correctness: entry.correctness.score, cleanliness: entry.cleanliness.score, extensibility: entry.extensibility.score, docs: entry.docs.score });
           }
         }
+        this.emitWith(stored, "review.recorded", [member.revision, member.memberId], { memberId: member.memberId, revision: member.revision }, () => {
+          const reviewer = member.modelProfile ?? this.memberProfile(run, "reviewer");
+          return { verdict: report.verdict, headCommit: member.baseCommit, baseCommit: run.baseCommit,
+            reviewer: profileIdentity(reviewer, member.provider ?? run.provider), rubric: rubricKept.length ? rubricKept : undefined };
+        });
         if (report.verdict === "changes-requested") {
           for (const task of run.tasks) if (task.status === "integrated") task.reviewRounds = (task.reviewRounds ?? 0) + 1;
-          this.repair(stored, report.summary);
+          this.repair(stored, report.summary, "review");
         }
         else run.status = "reviewing";
+        // The identity of an enrichment is fixed here, at completion: the run may have moved on when the read ends.
+        const reviewed = { revision: member.revision, memberId: member.memberId, headCommit: member.baseCommit };
+        this.enrich(stored, async signal => {
+          const tree = await this.readTree(run, reviewed.headCommit, signal);
+          return tree === undefined ? undefined : () => this.emitWith(stored, "review.tree", [reviewed.revision, reviewed.memberId],
+            { memberId: reviewed.memberId, revision: reviewed.revision }, () => ({ headCommit: reviewed.headCommit, tree }));
+        });
       }, member); return;
     }
     if (report.kind !== "result") throw new TeamError(409, "wrong-agent-report", "The member did not submit an implementation result.");
@@ -4103,16 +4400,36 @@ export class TeamService {
       if (task) {
         task.status = "integrated"; task.commit = commit; task.summary = report.summary; task.diffStat = diffStat(diff);
         if (changedPaths) task.changedPaths = changedPaths; else delete task.changedPaths;
+        this.emitWith(stored, "task.integrated", [member.revision, task.id], { memberId: member.memberId, taskId: task.id, revision: member.revision }, () => ({
+          commit, headCommit: head, baseCommit: run.baseCommit, memberBaseCommit: member.baseCommit, diff: task.diffStat,
+        }));
+      }
+      if (member.role === "integrator" && run.round > 0) {
+        this.emitWith(stored, "repair.integrated", [member.revision, run.round], { memberId: member.memberId, revision: member.revision }, () => ({
+          round: run.round, commit, headCommit: head, baseCommit: run.baseCommit,
+        }));
+        // The identity of an enrichment is fixed here, at completion: a later round may have started when the read ends.
+        const repaired = { revision: member.revision, memberId: member.memberId, round: run.round, base: member.baseCommit, workspace: run.workspace };
+        if (commit) this.enrich(stored, async signal => {
+          const result = await teamCommand({ command: "git", args: teamGitArgs(repaired.workspace, ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", repaired.base, commit, "--"]) },
+            repaired.workspace, signal, 30000, this.config.teams?.commandPrefix).catch(() => undefined);
+          const list = result && result.exitCode === 0 && !result.interrupted ? changedPathList(result.stdout) : undefined;
+          return () => this.emitWith(stored, "repair.paths", [repaired.revision, repaired.round], { memberId: repaired.memberId, revision: repaired.revision }, () => ({
+            round: repaired.round, commit, ...(list && !list.truncated ? pathField(list.paths) : { pathsOmitted: true }),
+          }));
+        });
       }
       if (member.role === "implementer" || member.role === "integrator") this.retentionState(stored).integratedAt[member.memberId] = this.retentionNow();
       this.event(stored, `${member.title} reported a result; its validated changes were integrated.`);
       run.status = "implementing";
     }, member, "integration");
   }
-  private repair(stored: Stored, feedback: string) {
+  private repair(stored: Stored, feedback: string, cause: "check" | "review" | "delivery") {
     if (stored.halt || ["paused", "cancelled"].includes(stored.run.status)) return;
     if (stored.run.round >= 2) { this.block(stored, new TeamError(409, "repair-limit", repairLimitReason)); return; }
     stored.run.round++; stored.run.review = undefined; stored.checkHead = undefined;
+    const round = stored.run.round;
+    this.emitWith(stored, "repair.started", [stored.run.revision, round], {}, () => ({ round, cause, headCommit: stored.run.headCommit }));
     this.prepareMember(stored, "integrator", undefined, feedback);
   }
   /** The checks the host runs after integration: established by the plan, or configured for the project. */
@@ -4128,6 +4445,40 @@ export class TeamService {
     if (setup) commands.push({ command: setup, phase: "setup" });
     commands.push(...required.map(command => ({ command })));
     return commands;
+  }
+  /** Starts a read that only the ledger needs, outside every run operation. Returns at once. The read's own 30 s limit
+   *  applies. A read that fails, times out, or is refused emits nothing. The emit runs only while the record is still live. */
+  private enrich(stored: Stored, read: (signal: AbortSignal) => Promise<(() => void) | undefined>): void {
+    if (!this.options?.events) return;
+    // Under a launcher the host cannot signal, a stalled read may never end. A fixed number may be pending, so a
+    // stall leaves a bounded number behind. One more is skipped, and its event is absent.
+    if (this.enrichments >= ENRICH_LIMIT) {
+      // A skip is not a failed read, so it is said once.
+      if (!enrichSkipLogged) { enrichSkipLogged = true; console.warn("Ledger reads are waiting on earlier reads that have not ended; some run events are skipped."); }
+      return;
+    }
+    this.enrichments += 1;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30000);
+    // A pending enrichment must not keep the host process alive at shutdown.
+    timer.unref();
+    void (async () => {
+      try {
+        const emit = await read(controller.signal);
+        if (!emit || this.closed || this.records.get(stored.run.id) !== stored) return;
+        emit();
+        this.flushOutbox(stored);
+      } catch { /* A ledger read never changes the run. */ }
+      finally { clearTimeout(timer); this.enrichments -= 1; }
+    })();
+  }
+  /** Best-effort `git rev-parse --verify <commit>^{tree}` in `run.workspace` through `teamCommand` and `teamGitArgs`, 30 s. A 40- or 64-hex stdout, else undefined. Never throws. */
+  private async readTree(run: TeamRun, commit: string, signal: AbortSignal): Promise<string | undefined> {
+    try {
+      const result = await teamCommand({ command: "git", args: teamGitArgs(run.workspace, ["rev-parse", "--verify", `${commit}^{tree}`]) }, run.workspace, signal, 30000, this.config.teams?.commandPrefix);
+      const tree = result.exitCode === 0 && !result.interrupted ? result.stdout.trim() : "";
+      return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(tree) ? tree : undefined;
+    } catch { return undefined; }
   }
   private check(stored: Stored) {
     const run = stored.run, revision = run.revision, head = run.headCommit!;
@@ -4162,6 +4513,14 @@ export class TeamService {
       if (!this.closed && !signal.aborted) await assertMemberReadOnly(run.workspace, head, this.config.teams?.commandPrefix, signal, "integration");
       return results;
     }, results => {
+      if (results.length) {
+        const first = results[0]!;
+        this.emitWith(stored, "check.finished", [revision, first.round ?? 0, first.startedAt ?? ""], { revision }, () => ({
+          round: first.round, headCommit: head, expected: commands.length,
+          passed: results.length === commands.length && results.every(result => result.status === "passed"),
+          commands: results.map(result => ({ phase: result.phase ?? "verification", status: result.status, exitCode: result.exitCode ?? null })),
+        }));
+      }
       if (revision !== run.revision || stored.halt || run.status === "paused" || run.status === "cancelled") return;
       if (results.length === commands.length && results.every(result => result.status === "passed")) {
         stored.checkHead = head; this.event(stored, "All configured verification commands passed against the integrated commit."); run.status = "reviewing";
@@ -4174,7 +4533,7 @@ export class TeamService {
           prior.headCommit === head && (prior.phase ?? "verification") === (result.phase ?? "verification") &&
           prior.command.command === result.command.command && JSON.stringify(prior.command.args) === JSON.stringify(result.command.args)));
         if (repeated) this.block(stored, new TeamError(409, "repeated-check-failure", repeatedCheckFailureReason));
-        else this.repair(stored, `Configured verification failed:\n${JSON.stringify(results)}`);
+        else this.repair(stored, `Configured verification failed:\n${JSON.stringify(results)}`, "check");
       }
     });
   }

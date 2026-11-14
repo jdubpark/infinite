@@ -43,8 +43,18 @@ export interface ProjectSourceStatus {
   mode: "github" | "laptop";
   repository?: string;
   baseBranch?: string;
-  /** Base-branch head in the host mirror after the last successful fetch. */
+  /**
+   * Base-branch head the host last found in the mirror: the head the last successful fetch returned, or a head that a
+   * fetch left there before it failed. `fetchedAt` is the time of the last successful fetch only.
+   */
   mirrorHead?: string;
+  /**
+   * The order stamp of the last successful fetch: its time, or one millisecond after the previous stamp when the host
+   * clock stepped back. So the stamps of one project never go back, also across a source change.
+   */
+  fetchStamp?: string;
+  /** The stamp of the fetch that first returned `mirrorHead`: every successful fetch since then returned the same head. */
+  mirrorHeadSince?: string;
   /** Commit the project working tree was last fast-forwarded to. */
   appliedHead?: string;
   fetchedAt?: string;
@@ -57,12 +67,23 @@ export interface ProjectSourceStatus {
   /** Local branches holding tracked edits a session left in the working tree before a refresh. */
   savedBranches?: string[];
 }
+/**
+ * One head that a fetch of the base branch left in the host mirror. The host tells a listener of every such head: the
+ * one a refresh fetched, and before that fetch any head that an earlier fetch left without a status (it failed after
+ * it moved the mirror, or the host stopped). `fetchedAt` is the fetch's order stamp (see
+ * `ProjectSourceStatus.fetchStamp`): the time of the fetch, and never earlier than an earlier fetch of the project.
+ * `previousHead` is the head before this fetch, and `previousSince` the stamp of the fetch that first returned it;
+ * both are absent when the status held neither.
+ */
+export type MirrorFetch = { projectId: string; repository: string; baseBranch: string; head: string; previousHead?: string; previousSince?: string; fetchedAt: string };
 export interface ProjectSourceOptions {
   /** Whether a cloud session is running or starting in the project directory. Teams, goals and handoffs do not count. */
   running: (projectId: string) => Promise<boolean>;
   prefix?: TeamCommand;
   /** Called after a refresh moved the project working tree to a new HEAD. */
   onApplied?: (projectId: string, head: string) => void;
+  /** Called for every head a fetch left in the mirror, even when the head did not move: see `MirrorFetch`. */
+  onMirror?: (fetch: MirrorFetch) => void;
 }
 
 export class ProjectSourceError extends Error {
@@ -116,6 +137,8 @@ export class ProjectSourceService {
         repository: project.source.repository,
         baseBranch: project.source.baseBranch,
         ...(saved.savedBranches ? { savedBranches: saved.savedBranches } : {}),
+        // The order of the project's fetches does not restart with a new source.
+        ...(saved.fetchStamp ? { fetchStamp: saved.fetchStamp } : {}),
       };
     }
     return { ...saved, mode: "github", repository: project.source.repository, baseBranch: project.source.baseBranch };
@@ -163,6 +186,37 @@ export class ProjectSourceService {
     if (!parentExisted) chmodSync(parent, mode);
     await this.git(parent, ["init", "--bare", mirror], signal);
     return mirror;
+  }
+  /**
+   * Records a head that the mirror holds. The status takes it with the next order stamp, and a listener hears of it
+   * as a fetch. `fetched` is true for the head a fetch of this refresh returned, and false for a head that an
+   * earlier, unrecorded fetch left behind.
+   */
+  private noteMirrorHead(projectId: string, status: ProjectSourceStatus, source: { repository: string; baseBranch: string }, head: string, fetched: boolean): ProjectSourceStatus {
+    const now = new Date().toISOString();
+    // The stamp orders this project's fetches for a listener. It is the time of the fetch unless the host clock
+    // stepped back, and then it is one millisecond after the previous stamp.
+    const lastStamp = status.fetchStamp === undefined ? Number.NaN : Date.parse(status.fetchStamp);
+    const stamp = Number.isNaN(lastStamp) || Date.parse(now) > lastStamp ? now : new Date(lastStamp + 1).toISOString();
+    const previousHead = status.mirrorHead;
+    // A head the status holds with no start stamp (a status written before this field) has no provable start.
+    const previousSince = previousHead === undefined ? undefined : status.mirrorHeadSince;
+    const next: ProjectSourceStatus = {
+      ...status,
+      mirrorHead: head,
+      mirrorHeadSince: previousHead === head && previousSince !== undefined ? previousSince : stamp,
+      fetchStamp: stamp,
+      ...(fetched ? { fetchedAt: now, attemptedAt: now } : {}),
+    };
+    if (this.writeStatus(projectId, next, source)) {
+      try {
+        this.options.onMirror?.({
+          projectId, repository: source.repository, baseBranch: source.baseBranch, head,
+          ...(previousHead === undefined ? {} : { previousHead }), ...(previousSince === undefined ? {} : { previousSince }), fetchedAt: stamp,
+        });
+      } catch { /* A listener failure must not fail the refresh. */ }
+    }
+    return next;
   }
   private fetchFailure(projectId: string, status: ProjectSourceStatus, source: { repository: string; baseBranch: string }, category: SourceFetchCategory) {
     const repository = source.repository;
@@ -216,6 +270,23 @@ export class ProjectSourceService {
     let fetchedHead: string;
     try {
       await this.ensureMirror(projectId, options?.signal);
+      if (status.mirrorHead !== undefined) {
+        // Before a fetch can replace it, the host notes the head it finds in the mirror. A head that the status does
+        // not name was left by a fetch that failed after it moved the mirror, or by a host that stopped before it
+        // wrote the status. A branch that cannot be read leaves the recorded head without a start the host can vouch for.
+        const held = await this.command(mirror, ["rev-parse", `refs/heads/${source.baseBranch}`], options?.signal);
+        if (options?.signal?.aborted) throw options.signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+        if (!this.sourceMatches(projectId, source)) return this.status(projectId);
+        const heldHead = commandSucceeded(held) ? held.stdout.trim() : undefined;
+        if (heldHead === undefined) {
+          const unproven = { ...status };
+          delete unproven.mirrorHeadSince;
+          status = unproven;
+          this.writeStatus(projectId, status, source);
+        } else if (heldHead !== status.mirrorHead) {
+          status = this.noteMirrorHead(projectId, status, source, heldHead, false);
+        }
+      }
       const fetched = await this.command(mirror, ["fetch", "--no-tags", remote, `+refs/heads/${source.baseBranch}:refs/heads/${source.baseBranch}`], options?.signal, FETCH_TIMEOUT_MS);
       if (options?.signal?.aborted) throw options.signal.reason ?? new DOMException("The operation was aborted", "AbortError");
       if (!this.sourceMatches(projectId, source)) return this.status(projectId);
@@ -233,14 +304,7 @@ export class ProjectSourceService {
     if (!this.sourceMatches(projectId, source)) return this.status(projectId);
     const fetchedStatus = status.pending?.reason === "fetch-failed" ? withoutPending(status) : status;
     delete fetchedStatus.fetchFailures;
-    const now = new Date().toISOString();
-    status = {
-      ...fetchedStatus,
-      mirrorHead: fetchedHead,
-      fetchedAt: now,
-      attemptedAt: now,
-    };
-    this.writeStatus(projectId, status, source);
+    status = this.noteMirrorHead(projectId, fetchedStatus, source, fetchedHead, true);
 
     if (status.mirrorHead === status.appliedHead) {
       const rootFailure = await this.checkoutRootFailure(project.path, options?.signal);

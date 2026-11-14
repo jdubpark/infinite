@@ -23,23 +23,45 @@ import { connectRemoteAccess } from "./remote-access.js";
 import { ProjectSync, ProjectSyncError, syncFailure } from "./project-sync.js";
 import { ProjectSourceError, ProjectSourceService } from "./project-source.js";
 import { MirroredProjects } from "./mirrored-projects.js";
-import { RepoEnrollmentService, repoEnrollmentRequestSchema } from "./repo-enrollment.js";
+import { RepoEnrollmentService, autonomyChangeSchema, repoEnrollmentRequestSchema } from "./repo-enrollment.js";
 import { HandoffService } from "./handoffs.js";
 import { handoffPathsOverlap } from "./handoff-types.js";
 import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
 import { UsageService } from "./usage-service.js";
 import { EvidenceStore, evidenceDatabasePath } from "./evidence/store.js";
+import { EventOutbox } from "./evidence/outbox.js";
+import { FuseService } from "./fuse/service.js";
 import { EvidenceError } from "./evidence/types.js";
+import { advanceEpoch, configurationModule, configurationProjector, EpochRequestConflict } from "./configuration-store.js";
+import { outcomeBackfill } from "./outcome-backfill.js";
+import { outcomeProjector } from "./outcome-projector.js";
+import { EXCLUSION_REASONS, OUTCOMES_MODULE, outcomeModule, runOutcomeView, sweepExpiredOutcomes, type SignalRow } from "./outcome-store.js";
+import { ownerSignal, SignalRequestError, type OwnerSignalInput } from "./outcome-signals.js";
+import { COMMIT_ID, HOLD_DAYS_DEFAULT } from "./outcome-hold.js";
+import { BaseScanner } from "./outcome-scan.js";
+import { profileKeyOf } from "./config-identity.js";
+import { lineupProfiles } from "./team-types.js";
 import { usagePlanSchema } from "./usage-api.js";
 import { TeamService, TeamError } from "./teams.js";
 import { spawnTeamBundle } from "./team-workspace.js";
 import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
-import { scorecard } from "./scorecard.js";
+import { scorecardFromRows, type ProfileIdentityOf } from "./scorecard.js";
+import { profileIdentity } from "./run-events.js";
+import { CellQueryRefused, type CellQuery, type CostLookup } from "./outcome-cells.js";
+import { currentEpochs, productionRows, queryCells, queryRollup } from "./outcome-reads.js";
+import { latestAssessment, rollupMissing, type RollupTarget } from "./outcome-rollup.js";
+import { importLegacy, LegacyImportRefused } from "./outcome-import.js";
+import { legacyBatchSchema } from "./outcome-legacy.js";
 import { GoalService } from "./goals.js";
 import { RoutineService } from "./routines.js";
 import { createRoutineSchema, routineActionSchema } from "./routine-types.js";
 import { MissionService, missionBoard } from "./missions.js";
-import { createMissionSchema, missionActionSchema, missionTextSchema } from "./mission-types.js";
+import { IntakeStore } from "./intake-store.js";
+import { IntakeLinear } from "./intake-linear.js";
+import { IntakeService } from "./intake.js";
+import { IntakeSlackSurface } from "./intake-slack.js";
+import { SlackClient } from "./slack-client.js";
+import { createMissionSchema, missionActionSchema, missionTextSchema, type CreateMission, type Mission, type MissionOrigin } from "./mission-types.js";
 import { ProjectGroupService } from "./project-groups.js";
 import { LinearService } from "./linear.js";
 import { createGoalSchema, goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema, goalParallelismSchema } from "./goal-types.js";
@@ -50,6 +72,7 @@ import { Summarizer, SummaryError } from "./summary.js";
 import { DictationCleaner, DictationError } from "./dictation.js";
 import { RepositoryBriefings } from "./repository-briefings.js";
 import { RepositoryGraphs } from "./repository-graphs.js";
+import { ContextTouches, type SessionTouches } from "./context-touches.js";
 import { UnderstandingService } from "./understanding.js";
 import { UnderstandingCatalog, CatalogError } from "./understanding-catalog.js";
 import { UnderstandingRuntime } from "./understanding-runtime.js";
@@ -143,7 +166,9 @@ export function createApp(config: Config, key: Buffer) {
   const projectConfigChanges = new Set<string>();
   let sourceChanged: (projectId: string) => void = () => {};
   let sourceAppliedGraph: (projectId: string, head: string) => void = () => {};
-  const projectSource = new ProjectSourceService(config, { running: id => sessionRunningInProject(id), prefix: config.teams?.commandPrefix, onApplied: (id, head) => { sourceChanged(id); sourceAppliedGraph(id, head); } });
+  // The base scanner needs the evidence store, which opens after the project source service; its notices wait for it.
+  let baseScanner: BaseScanner | undefined;
+  const projectSource = new ProjectSourceService(config, { running: id => sessionRunningInProject(id), prefix: config.teams?.commandPrefix, onApplied: (id, head) => { sourceChanged(id); sourceAppliedGraph(id, head); }, onMirror: fetch => baseScanner?.notify(fetch) });
   const repositoryGraphs = config.repositoryGraphs
     ? new RepositoryGraphs(config.repositoryGraphs, config.projects, config.teams?.workspaceDir, config.teams?.commandPrefix)
     : undefined;
@@ -176,9 +201,21 @@ export function createApp(config: Config, key: Buffer) {
   const ownerServices: { goals?: GoalService; missions?: MissionService; handoffs?: HandoffService } = {};
   // A store that cannot open stays unavailable with a fixed reason. It never blocks the host, a run, or a removal.
   const evidence = new EvidenceStore({ databasePath: evidenceDatabasePath(config.stateDir), vaultKey: key });
+  const outbox = new EventOutbox(evidence);
+  // The module registers before its projector, which reads its tables.
+  evidence.register(configurationModule());
+  outbox.registerProjector(configurationProjector());
+  evidence.register(outcomeModule());
+  baseScanner = new BaseScanner({ store: evidence, mirrorPath: id => projectSource.mirrorPath(id), prefix: config.teams?.commandPrefix, holdDays: () => config.teams?.outcomes?.holdDays ?? HOLD_DAYS_DEFAULT });
+  outbox.registerProjector(outcomeProjector(evidence));
+  // The launch-rate fuse is built before any service that receives it starts. It stops before the store closes.
+  const fuse = new FuseService({ config, key, store: evidence, sessionExists: id => {
+    try { manager.meta(id); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
+  } });
   const teams = new TeamService(config, key, manager, startInProject, linear, readings, {
     source: projectSource,
     graphs: repositoryGraphs,
+    events: outbox,
     onMerged: id => void projectSource.refresh(id).then(status => {
       sourceChanged(id);
       if (status.appliedHead && !status.pending) scheduleGraphForSession(id);
@@ -189,6 +226,16 @@ export function createApp(config: Config, key: Buffer) {
     },
   });
   teams.useEvidence(evidence);
+  // The one-time outcome backfill. Its first tick runs here, before any timer can fire, so no member event of a run
+  // that predates emission is projected before that run's rows. (The constructor above can already have emitted a
+  // `run.blocked` for a record that the restart blocked; it makes only a summary, which the backfill completes.)
+  // The tick then runs after each outbox pass until no run is left.
+  // The first call writes every pending run, so the scorecard never shows a part of the history as all of it.
+  const backfillOutcomes = outcomeBackfill(evidence, () => teams.understandingRecords(), {
+    mapOf: projectId => config.projects.find(project => project.id === projectId)?.team?.features,
+    now: () => new Date().toISOString(),
+  });
+  backfillOutcomes();
   const usage = new UsageService(config, key, manager, evidence);
   const balances = new BalanceService(config.usage?.accounts ?? {});
   usage.useBalances(balances);
@@ -200,9 +247,21 @@ export function createApp(config: Config, key: Buffer) {
   const missions = new MissionService(config, key, manager, teams, projectGroups);
   ownerServices.missions = missions;
   // A run is live while its sealed record file exists, so a record that failed to load keeps its evidence.
-  const sweepEvidence = () => evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
+  const sweepEvidence = () => {
+    evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
+    sweepExpiredOutcomes(evidence, new Date().toISOString(), undefined, config.teams?.outcomes?.retentionDays);
+  };
   let evidenceSweep: NodeJS.Timeout | undefined;
-  const closeEvidence = () => { clearInterval(evidenceSweep); evidence.close(); };
+  // A projector that fell behind catches up without waiting for the next event. Each pass is bounded.
+  const advanceOutbox = () => {
+    for (let pass = 0; pass < 20; pass++) {
+      const result = outbox.advance();
+      if (!result.pending || result.blocked.length > 0) break;
+    }
+    backfillOutcomes();
+  };
+  let outboxTimer: NodeJS.Timeout | undefined;
+  const closeEvidence = () => { baseScanner?.close(); clearInterval(evidenceSweep); clearInterval(outboxTimer); fuse.stop(); evidence.close(); };
   missions.useUsage(usage);
   usage.useResolvers({
     goalOfRun: runId => { const goal = goals.list().find(value => value.cycles.some(cycle => cycle.teamId === runId)); return goal ? { id: goal.id, title: goal.title } : undefined; },
@@ -232,6 +291,23 @@ export function createApp(config: Config, key: Buffer) {
   const assertNoHandoff = (projectId: string) => {
     if (handoffs.activeForProject(projectId)) throw new TeamError(409, "handoff-in-progress", "This project is transferring a task to a team. Wait for its checkpoint to finish.");
   };
+  // The owner's route and intake start missions through this one admission.
+  const createMission = async (body: CreateMission, origin?: MissionOrigin): Promise<Mission> => {
+    // A retry returns the recorded mission even if the group or a handoff changed since it was admitted.
+    const recorded = missions.replayCreate(body);
+    if (recorded) return recorded;
+    const group = projectGroups.get(body.groupId);
+    for (const repo of group.repos)
+      for (const checkout of repo.checkouts) assertNoHandoff(checkout.projectId);
+    return missions.create({ ...body, groupId: group.id }, body, origin);
+  };
+  // Intake exists only when configured; without it the intake route lists no records.
+  // One store serves the service and the Slack surface, so a record the service admits is the record the surface posts.
+  const intakeStore = config.intake ? new IntakeStore(config, key) : undefined;
+  const intakeSlackClient = config.intake?.slack ? new SlackClient({ botTokenFile: config.intake.slack.botTokenFile, appTokenFile: config.intake.slack.appTokenFile, endpoint: config.intake.slack.endpoint }) : undefined;
+  const intake = config.intake && intakeStore ? new IntakeService(config, intakeStore, missions, new IntakeLinear(linear), { create: createMission, threads: intakeSlackClient }) : undefined;
+  // The Slack surface exists only with an intake Slack block; without one, intake runs on Linear alone.
+  const intakeSlack = intakeStore && intakeSlackClient ? new IntakeSlackSurface(config, intakeStore, missions, teams, intakeSlackClient) : undefined;
   const resumable = (session: { status: string; provider: string; workspace?: unknown; team?: unknown; nativeSession?: unknown; resumeNativeSession?: unknown }) =>
     session.status === "exited" && !session.workspace && !session.team && Boolean(session.nativeSession ?? session.resumeNativeSession) && ["claude", "codex", "opencode"].includes(session.provider);
   // Native records written before executionLocation existed carry only the hybrid workspace.
@@ -336,6 +412,12 @@ export function createApp(config: Config, key: Buffer) {
       } finally { routineStarts.delete(request.projectId); }
     },
   });
+  manager.useFuse(fuse);
+  teams.useFuse(fuse);
+  goals.useFuse(fuse);
+  missions.useFuse(fuse);
+  routines.useFuse(fuse);
+  fuse.start();
   const desktopResources = new DesktopResources(config, listSessions);
   const changeProjectFiles = async <T>(projectId: string, action: () => Promise<T>) => {
     if (projectFileChanges.has(projectId)) throw new DesktopError("files-changing", "Project files are being changed. Retry after the transfer finishes.");
@@ -574,7 +656,7 @@ export function createApp(config: Config, key: Buffer) {
       providers: Object.keys(config.agents).filter(
         (p) => p !== "demo" || config.enableDemo,
       ),
-      teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, projectSource: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
+      teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, projectSource: 1, autonomyMode: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
       goals: { enabled: goals.enabled() },
       missions: { enabled: missions.enabled() },
       usage: { enabled: Boolean(config.usage), budgets: config.usage?.budgets ?? {} },
@@ -590,6 +672,8 @@ export function createApp(config: Config, key: Buffer) {
         ...(repositoryBriefings ? { repositoryBriefings: { model: repositoryBriefings.model, automatic: config.repositoryBriefings!.automatic } } : {}),
         ...(config.remote?.enabled ? { remoteTerminal: 1 } : {}),
         desktop: { resources: 1, files: 1, fileTransfer: 1, chunkBytes: DESKTOP_LIMITS.chunkBytes, maxFileBytes: DESKTOP_LIMITS.maxFileBytes },
+        // The Swarm graph's read-only code map and touch endpoints.
+        swarmContext: 1,
       },
     }),
   );
@@ -602,17 +686,62 @@ export function createApp(config: Config, key: Buffer) {
   app.use("/api/usage", (_req, res, next) => usage.available() ? next() : void res.status(503).json(usageUnavailable));
   app.get("/api/usage", (_req, res) => res.json(usage.summary()));
   app.get("/api/evidence/status", (_req, res) => res.json(evidence.describe()));
+  app.get("/api/fuse", (_req, res) => res.json(fuse.view()));
+  const fuseCloseSchema = z.discriminatedUnion("scope", [
+    z.object({ scope: z.literal("host") }).strict(),
+    z.object({ scope: z.literal("project"), projectId: z.string().min(1) }).strict(),
+  ]);
+  app.post("/api/fuse/close", requireRole(["owner"]), (req, res) => {
+    const body = fuseCloseSchema.safeParse(req.body);
+    if (!body.success) return void res.status(400).json({ error: "Invalid fuse close request" });
+    const scope = body.data, projectId = scope.scope === "project" ? scope.projectId : undefined;
+    if (projectId !== undefined && !config.projects.some(project => project.id === projectId))
+      return void res.status(404).json({ error: "Project not found" });
+    const result = fuse.close(scope);
+    if (result === "unmeasurable") return void res.status(409).json({ error: "The fuse cannot close until its launch record can be read", code: "unmeasurable" });
+    if (result === "write-failed") return void res.status(503).json({ error: "The fuse could not record the close", code: "write-failed" });
+    return void res.json({ result, view: fuse.view() });
+  });
+  // The cost of a session as the usage service measured it. A session it did not measure has no cost, and no scorecard or cell counts it as zero.
+  // A session that the usage ledger could not read is not "no measurement": the read fails, and the route answers 503.
+  const sessionCost: CostLookup = sessionId => {
+    const found = usage.session(sessionId);
+    if (!found.measured && found.unavailable) throw new EvidenceError("unavailable", "The usage ledger is unavailable.");
+    return found.measured ? { usd: found.cost, tokens: found.tokens.input + found.tokens.output + found.tokens.reasoning + found.tokens.cacheRead + found.tokens.cacheWrite, complete: found.pricing.unknown === 0 } : undefined;
+  };
+  // The configured lineup's label, then the newest held run whose member names the profile. Otherwise the scorecard shows the profile ID.
+  // Built once per request: the Cost views poll this route.
+  const profileLabels = (): ((profileId: string) => string | undefined) => {
+    const labels = new Map<string, string>();
+    for (const run of teams.list()) for (const member of run.members) {
+      const profile = member.modelProfile;
+      if (profile && !labels.has(profile.id)) labels.set(profile.id, profile.label);
+    }
+    for (const profile of config.teams?.lineup ? lineupProfiles(config.teams.lineup) : []) labels.set(profile.id, profile.label);
+    return profileId => labels.get(profileId);
+  };
+  // The identity that the configured lineup gives a profile ID now. A row of another identity behind the same ID is
+  // history: a goal or a mission can pin an older lineup and keep ending attempts under it.
+  const configuredIdentity: ProfileIdentityOf = profileId => {
+    const profile = config.teams?.lineup ? lineupProfiles(config.teams.lineup).find(candidate => candidate.id === profileId) : undefined;
+    if (!profile) return undefined;
+    const identity = profileIdentity(profile, profile.provider);
+    return { provider: identity.provider, model: identity.model ?? "default", effort: identity.effort ?? null };
+  };
   app.get("/api/usage/models", (req, res) => {
     const query = z.object({ role: z.string().trim().min(1).max(40).optional() }).strict().parse(req.query);
-    // An unreadable session is not "no measurement": the whole scorecard answers 503 instead.
-    let unreadable = false;
-    const rows = scorecard(teams.list(), sessionId => {
-      const found = usage.session(sessionId);
-      if (!found.measured && found.unavailable) unreadable = true;
-      return found.measured ? { cost: found.cost, tokens: found.tokens.input + found.tokens.output + found.tokens.reasoning + found.tokens.cacheRead + found.tokens.cacheWrite, unpriced: found.pricing.unknown } : undefined;
-    }, { role: query.role });
-    if (unreadable) throw new EvidenceError("unavailable", "The usage ledger is unavailable.");
-    return res.json(rows);
+    const role = query.role ?? "implementer";
+    try {
+      // Only implementers and scouts have outcome rows. Another role gives an empty scorecard without a read.
+      if (role !== "implementer" && role !== "scout") return void res.json(scorecardFromRows([], { role, label: () => undefined, cost: sessionCost }));
+      const { rows } = productionRows(evidence, role);
+      // The current epoch of each identity comes from the store, so an epoch the owner advanced never keeps its old rows.
+      const epoch = currentEpochs(evidence, new Date().toISOString());
+      return void res.json(scorecardFromRows(rows, { role, label: profileLabels(), identity: configuredIdentity, epoch, cost: sessionCost }));
+    } catch (error) {
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
   });
   app.get("/api/usage/daily", (req, res, next) => {
     try { const query = z.object({ days: z.coerce.number().int().min(1).max(366).default(30), tz: z.string().default("UTC"), project: z.string().optional() }).strict().parse(req.query); return void res.json(usage.daily({ days: query.days, tz: query.tz, projectId: query.project })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone or day range" }); return next(error); }
@@ -633,6 +762,121 @@ export function createApp(config: Config, key: Buffer) {
   app.post("/api/usage/balances/refresh", requireRole(["owner"]), async (_req, res) => { requireLedger(); await balances.refresh(true); return res.json({ accounts: usage.summary().accounts }); });
   // Maps a ledger read that found the store unavailable to the usage 503 answer, whichever route made it.
   app.use("/api/usage", (error: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => ledgerUnavailable(error) ? void res.status(503).json(usageUnavailable) : next(error));
+  // Display cells over production rows, or over the sources named. Every paired device may read them, as it may read usage models.
+  const outcomeCellsQuery = z.object({
+    project: z.string().regex(/^[a-z0-9-]{1,80}$/).optional(),
+    role: z.enum(["implementer", "scout"]).default("implementer"),
+    by: z.string().max(200).optional()
+      .transform(value => value === undefined ? ["profile"] : value === "" ? [] : value.split(","))
+      .pipe(z.array(z.enum(["project", "profile", "area", "kind", "risk"])).refine(list => new Set(list).size === list.length, { message: "A dimension may appear once." })),
+    sources: z.string().max(200).optional()
+      .transform(value => (value ?? "production").split(","))
+      .pipe(z.array(z.enum(["production", "duel", "replay", "legacy"])).min(1)),
+    days: z.coerce.number().int().min(1).max(3650).optional(),
+  }).strict();
+  app.get("/api/outcomes", (req, res) => {
+    const query = outcomeCellsQuery.parse(req.query);
+    const scope = { role: query.role, by: query.by, sources: query.sources, ...(query.project === undefined ? {} : { projectId: query.project }), ...(query.days === undefined ? {} : { days: query.days }) };
+    try {
+      const result = queryCells(evidence, { use: "display", ...scope } satisfies CellQuery, { now: new Date().toISOString(), cost: sessionCost });
+      return void res.json({ use: "display", query: scope, cells: result.cells, unreadable: result.unreadable });
+    } catch (error) {
+      if (error instanceof CellQueryRefused) return void res.status(400).json({ code: error.code, error: "The host refused the outcome query." });
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
+  });
+  // The roll-up of one goal or mission. Every paired device may read it, as it may read the cells. The goal's assessment comes from the goal record.
+  const lowerUuid = z.uuid().transform(value => value.toLowerCase());
+  const rollupQuery = z.union([z.strictObject({ goal: lowerUuid }), z.strictObject({ mission: lowerUuid })]);
+  app.get("/api/outcomes/rollup", (req, res) => {
+    const query = rollupQuery.parse(req.query);
+    const target: RollupTarget = "goal" in query ? { kind: "goal", id: query.goal } : { kind: "mission", id: query.mission };
+    try {
+      const goal = target.kind === "goal" ? goals.understandingRecords().find(record => record.id === target.id) : undefined;
+      const known = target.kind === "goal" ? goal !== undefined : missions.hasRecordFile(target.id);
+      const rollup = queryRollup(evidence, target, { known, assessment: goal ? latestAssessment(goal.outcomes) : null, cost: sessionCost });
+      if (rollupMissing(rollup)) return void res.status(404).json({ code: "rollup-not-found", error: "No roll-up exists for this goal or mission." });
+      return void res.json(rollup);
+    } catch (error) {
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
+  });
+  // The owner's legacy batch. A line is an unauthenticated claim, so the owner key is required. The route takes no request id: a replay is idempotent by line id.
+  app.post("/api/outcomes/legacy", requireRole(["owner"]), (req, res) => {
+    const now = Date.now();
+    // The general handler returns each issue's message, and the message for an unknown key names the key. A key or a
+    // value of the operator's file is operator text, so a body that does not parse gets one fixed answer.
+    const parsed = legacyBatchSchema(now).safeParse(req.body);
+    if (!parsed.success) return void res.status(400).json({ code: "legacy-invalid", error: "The legacy batch is invalid." });
+    const body = parsed.data;
+    try {
+      return void res.json(importLegacy(evidence, body, { now: new Date(now).toISOString(), retentionDays: config.teams?.outcomes?.retentionDays }));
+    } catch (error) {
+      if (error instanceof LegacyImportRefused) return void res.status(409).json({ code: "legacy-limit", error: "The host holds too many legacy lines." });
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
+  });
+  // A signal as the owner sees it. The request hash stays in the store: it only checks that a replayed request matches.
+  const servedSignal = (signal: SignalRow) => ({ ...signal, payload: Object.fromEntries(Object.entries(signal.payload).filter(([name]) => name !== "request")) });
+  // The outcome rows of one run, also after the run record is removed. Every paired device may read them, as it may read usage models.
+  app.get("/api/outcomes/runs/:runId", (req, res) => {
+    const runId = id.parse(req.params.runId);
+    try {
+      if (evidence.status().modules[OUTCOMES_MODULE] !== "ready") throw new EvidenceError("unavailable", "The evidence store is unavailable.");
+      const view = runOutcomeView(evidence, runId);
+      if (view === undefined) return void res.status(404).json({ code: "outcomes-not-found", error: "No outcome rows exist for this run." });
+      // Blind indexes are store internals. The opened payload already names the project, the task, and the area.
+      const served = (row: object) => Object.fromEntries(Object.entries(row).filter(([name]) => !["projectRef", "taskRef", "areaRef"].includes(name)));
+      return void res.json({ ...(view.summary ? { summary: served(view.summary) } : {}), rows: view.rows.map(served), members: view.members.map(served), signals: view.signals.map(servedSignal), unreadable: view.unreadable });
+    } catch (error) {
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
+  });
+  // Advances one profile's epoch. The profile ID names one identity across the whole lineup.
+  app.post("/api/outcomes/epochs", requireRole(["owner"]), (req, res) => {
+    const body = z.object({ profileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/), requestId: z.uuid() }).strict().parse(req.body);
+    const profile = config.teams?.lineup ? profileKeyOf(lineupProfiles(config.teams.lineup), body.profileId) : undefined;
+    if (profile === undefined) return void res.status(404).json({ code: "profile-not-found", error: "No configured profile has this ID." });
+    // The lineup schema gives one identity per profile ID, so this answer guards that rule and no loaded lineup reaches it.
+    if (profile === "ambiguous") return void res.status(409).json({ code: "profile-ambiguous", error: "This profile ID names more than one configuration. Give each its own ID." });
+    try {
+      const advanced = advanceEpoch(evidence, { profile, requestId: body.requestId, now: new Date().toISOString() });
+      return void res.json({ profileId: body.profileId, provider: profile.provider, model: profile.model, effort: profile.effort,
+        epoch: advanced.epoch, since: advanced.since, repeated: advanced.repeated });
+    } catch (error) {
+      if (error instanceof EpochRequestConflict) return void res.status(409).json({ code: "request-conflict", error: error.message });
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
+  });
+  // An owner's claim about one run: a linked fix, an exclusion, or the withdrawal of either. A member cannot write one.
+  const signalIssue = z.string().regex(/^[A-Za-z][A-Za-z0-9]{0,9}-[0-9]{1,9}$/);
+  const signalCommit = z.string().regex(COMMIT_ID);
+  const signalTime = z.iso.datetime({ offset: true }).refine(value => Date.parse(value) <= Date.now(), "A signal time cannot be later than the request.").transform(value => new Date(value).toISOString());
+  const ownerSignalSchema = z.union([
+    z.object({ action: z.literal("record"), kind: z.literal("linked-fix"), requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid().optional(),
+      issue: signalIssue.optional(), commit: signalCommit.optional(), at: signalTime.optional() }).strict()
+      .refine(body => body.issue !== undefined || body.commit !== undefined, "A linked fix names an issue, a commit, or both."),
+    z.object({ action: z.literal("record"), kind: z.literal("exclusion"), requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), reason: z.enum(EXCLUSION_REASONS) }).strict(),
+    // A withdrawal is idempotent by the signal's state, so it carries no request id.
+    z.object({ action: z.literal("withdraw"), kind: z.enum(["linked-fix", "exclusion"]), signalId: z.string().regex(/^[0-9a-f]{64}$/) }).strict(),
+  ]);
+  const signalStatus = { "request-conflict": 409, "signal-not-withdrawable": 409, "outcome-not-found": 404, "signal-not-found": 404 } as const;
+  app.post("/api/outcomes/signals", requireRole(["owner"]), (req, res) => {
+    const body = ownerSignalSchema.parse(req.body);
+    try {
+      const result = ownerSignal(evidence, body as OwnerSignalInput, new Date().toISOString());
+      return void res.json({ signal: servedSignal(result.signal), repeated: result.repeated });
+    } catch (error) {
+      if (error instanceof SignalRequestError) return void res.status(signalStatus[error.code]).json({ code: error.code, error: error.message });
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
+  });
   app.post("/api/dictation/cleanup", requireRole(["owner", "controller"]), async (req, res) => {
     const body = z.object({ text: z.string().trim().min(1).max(32000) }).strict().parse(req.body);
     if (!dictationCleaner) return void res.status(503).json({ code: "dictation-unavailable", error: "This host has no dictation model configured." });
@@ -770,17 +1014,8 @@ export function createApp(config: Config, key: Buffer) {
   app.post("/api/goals/:id/extend", requireRole(["owner"]), async (req, res) => res.json(await goals.extend(id.parse(req.params.id), goalExtendSchema.parse(req.body))));
   app.get("/api/missions", (_req, res) => res.json({ missions: missions.list() }));
   app.get("/api/missions/:id", (req, res) => res.json(missions.get(id.parse(req.params.id))));
-  app.post("/api/missions", requireRole(["owner"]), async (req, res) => {
-    const body = createMissionSchema.parse(req.body);
-    // A retry returns the recorded mission even if the group or a handoff changed since it was admitted.
-    const recorded = missions.replayCreate(body);
-    if (recorded) return res.json(recorded);
-    const group = projectGroups.get(body.groupId);
-    const resolvedBody = { ...body, groupId: group.id };
-    for (const repo of group.repos)
-      for (const checkout of repo.checkouts) assertNoHandoff(checkout.projectId);
-    return res.json(await missions.create(resolvedBody, body));
-  });
+  app.get("/api/intake", (_req, res) => res.json({ records: intake?.list() ?? [], ...intake?.status(), ...(intakeSlack ? { slack: intakeSlack.status() } : {}) }));
+  app.post("/api/missions", requireRole(["owner"]), async (req, res) => res.json(await createMission(createMissionSchema.parse(req.body))));
   // Mission controls and answers are owner-only, so every recorded mission answer is the owner's.
   app.post("/api/missions/:id/steer", requireRole(["owner"]), async (req, res) => res.json(await missions.steer(id.parse(req.params.id), missionTextSchema.parse(req.body))));
   app.post("/api/missions/:id/answer/:decisionId", requireRole(["owner"]), async (req, res) =>
@@ -792,6 +1027,26 @@ export function createApp(config: Config, key: Buffer) {
     return res.json(missionBoard(missions.list(), teams.list(), goals.list(), config.projects, id => memberships.get(id)));
   });
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
+  // Which files each agent's recorded tool inputs pointed at. Read-only; observed inputs are not evidence of use or of a landed change.
+  const contextTouches = new ContextTouches({
+    // Only signals carry tool inputs. The type filter keeps terminal output out of the result, though each read still scans it.
+    read: (sessionId, after) => manager.events(sessionId, after, 200, new Set(["signal"])),
+    areas: projectId => repositoryGraphs?.areas(projectId),
+  });
+  const unobservedTouches = (sessionId: string): SessionTouches => ({ sessionId, observable: false, complete: true, graphQueries: 0, files: [], truncated: false });
+  const sessionTouches = async (source: { sessionId: string; cwd: string; provider: string; projectId: string }) => {
+    // A cmux session has no host journal, and an unreadable journal yields no touches.
+    if (!existsSync(join(config.stateDir, "sessions", source.sessionId, "meta.sealed"))) return unobservedTouches(source.sessionId);
+    try { return await contextTouches.session(source); }
+    catch { return unobservedTouches(source.sessionId); }
+  };
+  app.get("/api/teams/:id/context", async (req, res) => {
+    const team = teams.get(id.parse(req.params.id));
+    const shown = team.members.filter(member => member.revision === team.revision || member.status === "running" || member.status === "waiting");
+    const members = await Promise.all(shown.map(async member => ({ memberId: member.memberId,
+      ...await sessionTouches({ sessionId: member.sessionId, cwd: member.cwd, provider: member.provider ?? team.provider, projectId: team.projectId }) })));
+    res.json({ teamId: team.id, revision: team.revision, members });
+  });
   app.delete("/api/teams/:id", requireRole(["owner"]), async (req, res) => {
     const teamId = id.parse(req.params.id);
     if (goals.ownsActiveTeam(teamId)) throw new TeamError(409, "goal-owned-team", "Control this feature from its goal.");
@@ -909,6 +1164,13 @@ export function createApp(config: Config, key: Buffer) {
     projectConfigChanges.add(projectId);
     try { res.json(await enrollment.put(projectId, body)); }
     finally { projectConfigChanges.delete(projectId); }
+  });
+  app.put("/api/projects/:id/autonomy", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
+    const projectId = projectSchema.parse(req.params.id);
+    const body = autonomyChangeSchema.parse(req.body);
+    if (runtimeSecurity(config.deployment).tenancy !== "single-tenant")
+      throw new TeamError(403, "single-tenant-required", "Repository enrollment requires a single-tenant host.");
+    res.json(await enrollment.setAutonomy(projectId, body));
   });
   app.get("/api/projects/:id/files", async (req, res) => {
     res.json(await desktopFiles.list(projectSchema.parse(req.params.id), z.string().max(4096).default("").parse(req.query.path),
@@ -1121,6 +1383,12 @@ export function createApp(config: Config, key: Buffer) {
     res.json(await sessionDetail(id.parse(req.params.id)));
   });
   app.get("/api/sessions/:id/handoff", (req, res) => res.json(handoffs.view(id.parse(req.params.id))));
+  app.get("/api/sessions/:id/context", async (req, res) => {
+    const sessionId = id.parse(req.params.id);
+    if (cmux && !existsSync(join(config.stateDir, "sessions", sessionId, "meta.sealed"))) { await cmux.get(sessionId); return void res.json(unobservedTouches(sessionId)); }
+    const session = manager.meta(sessionId).session;
+    res.json(await sessionTouches({ sessionId, cwd: session.cwd, provider: session.provider, projectId: session.projectId }));
+  });
   app.get("/api/sessions/:id/messages", async (req, res) => {
     const sessionId = id.parse(req.params.id);
     const session = manager.meta(sessionId).session;
@@ -1415,6 +1683,13 @@ export function createApp(config: Config, key: Buffer) {
     if (!project) return void res.status(404).json({ error: "Unknown project" });
     res.json({ id: project.id, name: project.name, path: project.path, source: projectSource.status(projectId), sync: await projectSync.liveStatus(projectId, () => projectRunning(projectId)) });
   });
+  // The directory-level code map for one graph lane: names and counts only, served from the builder's receipt.
+  app.get("/api/projects/:id/graph/map", (req, res) => {
+    const projectId = projectSchema.parse(req.params.id);
+    if (!config.projects.some(project => project.id === projectId)) return void res.status(404).json({ error: "Unknown project" });
+    const lane = z.string().regex(/^(?:shared|run-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/).default("shared").parse(req.query.lane);
+    res.json(repositoryGraphs ? repositoryGraphs.codeMap(projectId, lane) : { state: "disabled" });
+  });
   app.get("/api/projects/:id/graph", requireRole(["owner"]), (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
     if (!config.projects.some(project => project.id === projectId)) return void res.status(404).json({ error: "Unknown project" });
@@ -1588,6 +1863,8 @@ export function createApp(config: Config, key: Buffer) {
     goals.start();
     routines.start();
     missions.start();
+    intake?.start();
+    void intakeSlack?.start().catch(() => undefined);
     handoffs.start();
     readings.start();
     // The timer checks each tick which projects follow GitHub, so one enrolled while the server runs is picked up too.
@@ -1599,6 +1876,9 @@ export function createApp(config: Config, key: Buffer) {
     sweepEvidence();
     evidenceSweep = setInterval(sweepEvidence, 60 * 60 * 1000);
     evidenceSweep.unref();
+    advanceOutbox();
+    outboxTimer = setInterval(advanceOutbox, 60 * 1000);
+    outboxTimer.unref();
   });
   server.once("close", () => {
     teams.close();
@@ -1607,6 +1887,8 @@ export function createApp(config: Config, key: Buffer) {
     goals.close();
     routines.close();
     missions.close();
+    intake?.close();
+    intakeSlack?.close();
     repositoryBriefings?.close();
     repositoryGraphs?.close();
     void understandingRuntime.close();
@@ -1621,6 +1903,6 @@ export function createApp(config: Config, key: Buffer) {
   const closeTerminals = connectTerminals(server, manager, authenticate, missionManagedSession);
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { routines.close(); live.close(); handoffs.close(); missions.close(); readings.stop(); goals.close(); teams.close(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
-  return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, closeConnections };
+  const closeConnections = () => { routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); intakeSlack?.close(); readings.stop(); goals.close(); teams.close(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, closeConnections, fuse };
 }

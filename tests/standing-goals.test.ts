@@ -185,6 +185,44 @@ test("a standing goal needs an autonomous project at creation and at each cycle 
   assert.equal(second.context.parentRunId, first.request.requestId);
 });
 
+test("a halt that outlasts a cycle's window releases a standing goal back to its cadence, unless its project left autonomous mode", async t => {
+  const { f, teams, goals, advance } = fixture(t);
+  const created = await goals.create(standing());
+  goals.start();
+  const first = await until(() => teams.launches[0], Boolean);
+  teams.settle(first.request.requestId, "ready-for-review");
+  await until(() => goals.get(created.id), goal => goal.cycles.length === 1 && !goal.activeTeamId);
+
+  const everything = () => true, none = () => undefined;
+  const halt = { haltId: randomUUID(), reason: "Halted by the owner for the whole host." };
+  assert.deepEqual((await goals.haltPause(halt, everything)).map(item => item.result), ["paused"]);
+  // The halt lasts far longer than the five-minute window of the cycle that ended, and one cadence passes under it.
+  advance(120);
+  assert.equal(teams.launches.length, 1, "A halted goal starts no cycle");
+  assert.deepEqual((await goals.haltResume(halt.haltId, none, false)).map(item => item.result), ["resumed"]);
+  assert.equal(goals.get(created.id).status, "running");
+  const second = await until(() => teams.launches[1], Boolean);
+  assert.equal(second.context.parentRunId, first.request.requestId);
+  teams.settle(second.request.requestId, "ready-for-review");
+  await until(() => goals.get(created.id), goal => goal.cycles.length === 2 && !goal.activeTeamId);
+
+  // A project that became supervised under the halt keeps its standing goal paused, as the owner's resume would.
+  const later = { haltId: randomUUID(), reason: "Halted by the owner for the whole host." };
+  await goals.haltPause(later, everything);
+  f.config.projects[0]!.autonomy = "supervised";
+  const [refused] = await goals.haltResume(later.haltId, none, false);
+  assert.equal(refused?.result, "refused");
+  assert.match(refused?.reason ?? "", /autonomous again/);
+  const held = goals.get(created.id);
+  assert.equal(held.status, "paused");
+  advance(120);
+  await sleep(100);
+  assert.equal(teams.launches.length, 2, "No cycle starts while the goal stays paused");
+  f.config.projects[0]!.autonomy = "autonomous";
+  await goals.resume(created.id, action(held));
+  await until(() => teams.launches[2], Boolean);
+});
+
 test("a standing goal folds cycles past the newest 50, never folds the next cycle's parent, and keeps every cycle's usage in its total", async t => {
   const { f, teams, open, advance } = fixture(t);
   const at = (minutesAgo: number) => new Date(Date.now() - minutesAgo * minute).toISOString();

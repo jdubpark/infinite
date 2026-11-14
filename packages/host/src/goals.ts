@@ -352,7 +352,10 @@ export class GoalService {
             stored.ownerHalt = { haltId: other.haltId, revision: goal.revision }; goal.reason = other.reason; this.save(stored);
             outcomes.push({ ...base, result: "held", reason: STILL_HALTED }); continue;
           }
-          if (Date.now() >= Date.parse(goal.deadlineAt)) { refuse("This goal's time limit has expired. Extend it or start a new goal to approve more time."); continue; }
+          // The owner's resume rules. A standing goal's time limit belongs to its cycle, so a halt that outlasts the
+          // cycle's window does not end the goal; it resumes only while its project is still autonomous.
+          if (goal.standing && autonomyOf(this.config.projects.find(value => value.id === goal.projectId)) !== "autonomous") { refuse("This standing goal can resume only after its project is autonomous again."); continue; }
+          if (!goal.standing && Date.now() >= Date.parse(goal.deadlineAt)) { refuse("This goal's time limit has expired. Extend it or start a new goal to approve more time."); continue; }
           goal.revision++; goal.status = "running"; goal.reason = undefined;
           this.setControl(stored, "resume");
           stored.ownerHalt = undefined;

@@ -126,12 +126,13 @@ function proxyOrigin(value) {
 
 /**
  * The GitHub credential proxy and this session's grant, when both are present. The owner's client config names the
- * proxy; without it the host-provided INFINITE_GITHUB_PROXY is used. The grant only ever comes from the environment.
+ * proxy; without it the host-provided INFINITE_GITHUB_PROXY is used. The grant only ever comes from the environment,
+ * and only its shape is checked here; the proxy verifies it.
  */
 function proxyTarget(config, env) {
   const origin = config.proxyUrl ?? proxyOrigin(env.INFINITE_GITHUB_PROXY);
   if (!origin) return undefined;
-  const grant = typeof env.INFINITE_GITHUB_GRANT === "string" && /^v1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u.test(env.INFINITE_GITHUB_GRANT) && env.INFINITE_GITHUB_GRANT.length <= 4096
+  const grant = typeof env.INFINITE_GITHUB_GRANT === "string" && /^v[0-9]{1,3}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u.test(env.INFINITE_GITHUB_GRANT) && env.INFINITE_GITHUB_GRANT.length <= 4096
     ? env.INFINITE_GITHUB_GRANT : undefined;
   return { origin, grant };
 }

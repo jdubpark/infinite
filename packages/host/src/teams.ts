@@ -990,7 +990,7 @@ export class TeamService {
       let outcome: Awaited<ReturnType<typeof publishTeamHead>> = { published: false, category: "other" };
       let branch = runBranch, diverged = false;
       // With the GitHub proxy configured, each push carries a host grant for exactly the ref it publishes.
-      const grantEnv = (ref: string) => hostGithubGrantEnvironment(this.config, { sid: `publish:${id}`, repo: target.repository, ops: ["push"], refs: [ref] });
+      const grantEnv = (ref: string) => hostGithubGrantEnvironment(this.config, { sid: `publish:${id}`, project: run.projectId, repo: target.repository, ops: ["push"], refs: [ref] });
       try {
         outcome = await publishTeamHead(run.workspace, target.remoteUrl, commit, runBranch, this.config.teams?.commandPrefix, controller.signal, grantEnv);
         if (!outcome.published && outcome.category === "rejected") {

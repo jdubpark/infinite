@@ -46,9 +46,10 @@ process.stdin.on("end", () => {
 
 let proxy: http.Server;
 let port = 0;
+const records: Record<string, unknown>[] = [];
 test.before(async () => {
   const config = validateProxyConfig({ listen: { host: "127.0.0.1", port: 0 }, grantKeyFile: join(root, "grant.key"), tokenDirectory, githubCli: fakeGh });
-  proxy = createGithubProxy({ config, key, log: () => {}, broker: createGhBroker(config) });
+  proxy = createGithubProxy({ config, key, log: (record: Record<string, unknown>) => records.push(record), broker: createGhBroker(config) });
   await new Promise<void>(done => proxy.listen(0, "127.0.0.1", done));
   port = (proxy.address() as { port: number }).port;
 });
@@ -57,7 +58,7 @@ test.after(async () => {
   rmSync(root, { recursive: true, force: true });
 });
 
-const grant = (ops: GithubGrantOp[], refs?: string[]) => mintGithubGrant(key, { sub: "test", sid: "session-1", repo: "example/product", ops, ...(refs ? { refs } : {}) });
+const grant = (ops: GithubGrantOp[], refs?: string[]) => mintGithubGrant(key, { sub: "test", sid: "session-1", project: "product-web", repo: "example/product", ops, ...(refs ? { refs } : {}) });
 const prGrant = grant(["fetch", "push", "pr"], ["refs/heads/infinite/*"]);
 const mergeGrant = grant(["fetch", "push", "pr", "merge"], ["refs/heads/infinite/*"]);
 const calls = () => existsSync(capture) ? readFileSync(capture, "utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
@@ -81,6 +82,7 @@ test("allowlisted pull request commands run with the grant's repository, a clean
   assert.deepEqual(call.env, { GH_TOKEN: TOKEN, GH_REPO: null, GH_HOST: "github.com", GH_PROMPT_DISABLED: "1", GITHUB_TOKEN: null });
   assert.deepEqual(call.entries, []);
   assert.equal(existsSync(call.cwd), false);
+  assert.deepEqual([records.at(-1)!.project, records.at(-1)!.command, records.at(-1)!.decision], ["product-web", "pr view", "allow"]);
 
   const create = await gh(prGrant, ["pr", "create", "--head", "infinite/team-1", "--base", "main", "--title", "Fix it", "--body-file", "-", "--label", "a", "--label", "b"], "- first\n- second\n");
   assert.equal(create.status, 200);

@@ -13,14 +13,16 @@ operation on the server; this repository installs nothing.
 
 ## What a grant allows
 
-A grant names one repository, a list of operations (`fetch`, `push`, `pr`,
-`merge`), the refs a push may update, and an expiry. The host signs it with
-HMAC-SHA256 using a key that only the host account and the proxy account can
-read. The proxy refuses an unsigned, altered, expired, or unknown-field grant.
+A grant names one project, one repository, a list of operations (`fetch`,
+`push`, `pr`, `merge`), the refs a push may update, and an expiry. The host signs
+it with HMAC-SHA256 using a key that only the host account and the proxy account
+can read. The proxy refuses an unsigned, altered, expired, or unknown-field grant,
+and any grant format other than the current one (`v2`).
 
 | Session | Repository | Operations | Push refs |
 | --- | --- | --- | --- |
-| Owner-started session | the project's GitHub repository | fetch, push, pr, merge | `refs/heads/*` |
+| Session the owner started (the owner-only create and resume routes, `infinite new`) | the project's GitHub repository | fetch, push, pr, merge | `refs/heads/*` |
+| Any other session outside a team | the project's GitHub repository | fetch | none |
 | Team delivery member | the run's delivery repository | fetch, push, pr (+ merge when delivery mode is `merge`) | the run's head branch only |
 | Other team members | the run's repository | fetch | none |
 | Mission and permission coordinators | none | none | none |
@@ -48,7 +50,8 @@ The proxy enforces these rules on every request:
 - The agent never sees the installation token. The proxy strips the client's
   `Authorization`, refuses GitHub redirects, and redacts the token from `gh`
   output. Each request writes one JSON line to the journal without the token or
-  the grant.
+  the grant. Every authenticated line names the grant's `project`, `sid`, and
+  `sub`, so two projects that use one repository stay apart.
 
 ## Before you start
 
@@ -58,6 +61,14 @@ The proxy enforces these rules on every request:
   (`getent group GID`). The template uses the agent account's group,
   `infinite-agent`; substitute yours below.
 - Pick a free loopback port. This runbook uses `8417`.
+- Install the `acl` package (`getfacl`, `setfacl`). The proxy's `/health` reports
+  the token cache as closed to the agent only after `/usr/bin/getfacl` finds no
+  extended ACL on it; without `getfacl` it reports `unknown`.
+- Check that `/srv`, `/srv/infinite-data`, and `/etc/infinite-github` are real
+  directories (not links) owned by root and not writable by their group or
+  others: `namei -l /srv/infinite-data/x /etc/infinite-github/x`. The host and
+  the proxy refuse the grant key, and the proxy its configuration, under any
+  other directory.
 - List the GitHub owners (users or organizations) whose repositories the App is
   installed on. The examples use `OWNER`.
 - Remove every other GitHub credential from the agent account: SSH keys known to
@@ -86,9 +97,12 @@ sudo -u infinite-agent cat /srv/infinite-data/github-grant/grant.key   # must fa
 sudo -u infinite-github-proxy test -x /srv/infinite-data && echo traversable
 ```
 
-The host and the proxy both refuse a key file that is group-writable or open to
-other users. The host account's new group takes effect at its next restart
-(step 4).
+The host and the proxy apply one rule to the key: a regular file owned by root,
+not writable by its group or others and not open to others, below real
+directories owned by root and not writable by their group or others, with no
+symbolic link on the way. Each opens the file without following a link and
+checks and reads the open file. The host account's new group takes effect at its
+next restart (step 4).
 
 Rollback: `sudo userdel infinite-github-proxy`, `sudo groupdel
 infinite-github-grant`, and remove `/srv/infinite-data/github-grant`.
@@ -175,7 +189,7 @@ sudo -H -u infinite-host /usr/local/bin/infinite doctor --config /etc/infinite/c
 Expect `GitHub proxy: http://127.0.0.1:8417 reachable · grant key readable ·
 token cache READABLE by the agent account, which bypasses the proxy`. A key
 reported as `UNREADABLE` usually means the API started before step 1's group
-change.
+change; `UNSAFE (...)` names the file or directory that breaks the key rule.
 
 From now on `gh` in a new session goes through the broker. Start an owner
 session in a GitHub-tracked project and run `gh pr list`. The journal
@@ -261,34 +275,89 @@ Rollback: restore the previous launcher. It keeps working until step 7.
 
 ## 7. Take the cache away from the agent account
 
+Changing groups is not enough. An ACL entry on the token directory or a file can
+give the agent account access that mode bits do not show, and a cached token that
+is still valid is not rewritten by the renewal service, so it would keep any
+access it had. This step removes every ACL and replaces every cached file.
+
 ```sh
-GID=$(getent group infinite-github-proxy | cut -d: -f3)
-# Set "tokenGroupId" in /etc/infinite-github/issuer.json to $GID, then:
-sudo chgrp infinite-github-proxy /srv/infinite-data/github-app-tokens \
-  /srv/infinite-data/github-app-tokens/*.json
+TOKENS=/srv/infinite-data/github-app-tokens
+# Keep the current ACLs and ownership for rollback.
+sudo sh -c "getfacl -R -p $TOKENS > /root/github-token-acl-before.txt"
+# Point the renewal service at the proxy's group: set "tokenGroupId" in
+# /etc/infinite-github/issuer.json to the number this prints.
+getent group infinite-github-proxy | cut -d: -f3
+# Remove every extended ACL entry, access and default, from the directory and everything in it.
+sudo setfacl -b -k "$TOKENS"
+sudo find "$TOKENS" -mindepth 1 -type d -exec setfacl -b -k {} +
+sudo find "$TOKENS" -mindepth 1 -type f -exec setfacl -b {} +
+sudo chgrp infinite-github-proxy "$TOKENS"
+sudo chmod 0750 "$TOKENS"
+```
+
+Tokens the agent account read before this step, or holds open, stay valid at
+GitHub until they expire, at most one hour after they were minted. Revoke them
+now so the boundary holds at once. This reads each cached token as root and sends
+it only in a request header, never in a command line:
+
+```sh
+sudo node --input-type=module -e '
+import { readdirSync, readFileSync } from "node:fs";
+const dir = "/srv/infinite-data/github-app-tokens";
+for (const name of readdirSync(dir).filter(entry => /^[a-f0-9]{64}\.json$/.test(entry))) {
+  const { token } = JSON.parse(readFileSync(`${dir}/${name}`, "utf8"));
+  const response = await fetch("https://api.github.com/installation/token", {
+    method: "DELETE", headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json" } });
+  console.log(name.slice(0, 12), response.status);
+}'
+```
+
+Each line should end in `204`. Then delete every cached file, so no file from
+before the switch survives, and mint new ones:
+
+```sh
+sudo find "$TOKENS" -maxdepth 1 -type f -name '*.json' -delete
 sudo systemctl start infinite-github-refresh.service
 sudo systemctl status infinite-github-refresh.service --no-pager
 ```
 
-Change the existing files' group too: the renewal service refuses a cache file
-whose group differs from `tokenGroupId` (`cache-permissions`). It sets the
-directory group itself on each run.
+GitHub access through the proxy fails between the revocation and the end of the
+refresh. The new files are owned by root, in the proxy's group, with mode `0640`
+and no ACL, because the directory no longer has a default ACL.
 
-Then end the transition and restart the proxy without the agent group:
+End the transition and restart the proxy without the agent group:
 
 ```sh
 sudo rm /etc/systemd/system/infinite-github-proxy.service.d/transition.conf
 sudo systemctl daemon-reload
 sudo systemctl restart infinite-github-proxy.service
+```
+
+Verify by reading, not by listing. Each of these must print nothing:
+
+```sh
+sudo getfacl -R -s -p "$TOKENS"
+sudo -u infinite-agent test -x "$TOKENS" && echo "AGENT CAN ENTER $TOKENS"
+sudo find "$TOKENS" -mindepth 1 -maxdepth 1 -type f -print0 |
+  while IFS= read -r -d '' file; do
+    sudo -u infinite-agent head -c 1 "$file" >/dev/null 2>&1 && echo "AGENT CAN READ $file"
+  done
+```
+
+The last loop tries to read one byte of every token file by its full name as the
+agent account and discards it. Then:
+
+```sh
 curl -s http://127.0.0.1:8417/health
-sudo -u infinite-agent ls /srv/infinite-data/github-app-tokens   # must fail
 sudo -H -u infinite-host /usr/local/bin/infinite doctor --config /etc/infinite/config.json
 ```
 
 Expect `"tokenCache":"proxy-only"` and `token cache not readable by the agent
-account`. `/health` reads mode bits and group membership only; if the token
-directory carries ACLs, check them with `getfacl`. Repeat the checks from steps
-5 and 6.
+account`. The proxy says `proxy-only` only when mode bits and group membership
+deny the agent account and `getfacl` finds no extended ACL on the directory or on
+any entry in it. An ACL, a missing or failing `getfacl`, or an unreadable
+directory makes it `unknown`, which `doctor` prints as `UNKNOWN`. Repeat the
+checks from steps 5 and 6.
 
 After this step the App credential helper for `https://github.com` in the agent
 account's config can no longer read the cache. Remove it, so other public
@@ -299,16 +368,28 @@ account's own GitHub CLI login, not the token cache. This step does not change
 them.
 
 Rollback (do this before undoing steps 5 or 6): set `tokenGroupId` back to the
-agent group's id, `chgrp` the directory and files back, rerun the renewal
-service, and restore the transition drop-in.
+agent group's id, give the directory and its files back to that group, rerun the
+renewal service, and restore the transition drop-in:
+
+```sh
+sudo chgrp infinite-agent "$TOKENS"
+sudo find "$TOKENS" -maxdepth 1 -type f -name '*.json' -exec chgrp infinite-agent {} +
+sudo systemctl start infinite-github-refresh.service
+printf '[Service]\nSupplementaryGroups=infinite-agent\n' |
+  sudo tee /etc/systemd/system/infinite-github-proxy.service.d/transition.conf
+sudo systemctl daemon-reload && sudo systemctl restart infinite-github-proxy.service
+```
+
+If `/root/github-token-acl-before.txt` lists ACL entries the deployment relied
+on, restore them with `sudo setfacl --restore=/root/github-token-acl-before.txt`.
 
 ## Operate
 
 - The proxy restarts on failure. While it is down, agents and host Git
   operations cannot reach GitHub; delivery waits and nothing falls back to the
   cache.
-- Rotate the grant key by installing a new key file with the same owner and
-  mode, then restarting the proxy. The host reads the key for every grant it
+- Rotate the grant key by installing a new key file with the same owner, mode,
+  and directory, then restarting the proxy. The host reads the key for every grant it
   signs. Grants signed with the old key stop working, so restart running
   sessions.
 - A second instance needs its own key, proxy account, port, unit name, and
@@ -331,3 +412,6 @@ service, and restore the transition drop-in.
   allowlist are unavailable to agents. Pushes with unknown protocol capabilities,
   push certificates, or non-ASCII ref names are refused.
 - Codex members run with networking off and reach neither GitHub nor the proxy.
+- `/health` rules out ACLs only on the token directory and its entries, and reads
+  group membership from `/etc/passwd` and `/etc/group`; groups from another
+  directory service are not seen.

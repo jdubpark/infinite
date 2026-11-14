@@ -210,10 +210,14 @@ this does not add filesystem isolation or change provider approval controls.
 
 The optional [GitHub credential proxy](../deploy/ubuntu/github-proxy.md)
 (`autonomy.boundary.github`) moves the token cache to its own account. The host
-signs a grant for each session and host Git operation: one repository; the
-operations fetch, push, pr, or merge; and the branches a push may update. Team
-members other than delivery can only fetch, delivery can push and open or merge
-pull requests only for its own head branch, and coordinators get no grant. The
+signs a grant for each session and host Git operation: one project and one
+repository; the operations fetch, push, pr, or merge; and the branches a push may
+update. A session outside a team gets the owner's scope only when an owner-only
+route started it; any other caller gets fetch only. Team members other than
+delivery can only fetch, delivery can push and open or merge pull requests only
+for its own head branch, and coordinators get no grant. The grant key must be a
+root-owned file below root-owned directories, and the proxy reports the cache as
+closed to agents only after ruling out ACLs. The
 proxy refuses tags, deletions, other refs, and `gh` commands outside a
 pull-request allowlist. A push grant can still push any content to its own
 branches, so base-branch protection stays necessary. Sessions share the agent

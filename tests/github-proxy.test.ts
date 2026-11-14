@@ -1,13 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { gzipSync } from "node:zlib";
 import { mintGithubGrant } from "../packages/host/src/github-grants.js";
-import { createGithubProxy, validateProxyConfig } from "../scripts/github-proxy.mjs";
+import { agentTokenAccess, createGithubProxy, getfaclProbe, inspectReceivePack, validateProxyConfig } from "../scripts/github-proxy.mjs";
 
 const TOKEN = "ghs_fixtureInstallationToken0123456789";
 const root = mkdtempSync(join(tmpdir(), "github-proxy-test-"));
@@ -51,14 +52,14 @@ test.after(async () => {
   // Nothing the proxy sent or logged may carry the installation token or a grant.
   const everything = `${responses.join("\n")}\n${JSON.stringify(logs)}`;
   assert.equal(everything.includes(TOKEN), false);
-  assert.equal(everything.includes("v1."), false);
+  assert.equal(everything.includes("v2."), false);
   await new Promise(done => proxy.close(done));
   await new Promise(done => upstream.close(done));
   rmSync(root, { recursive: true, force: true });
 });
 
 const grant = (claims: { ops: ("fetch" | "push" | "pr" | "merge")[]; refs?: string[]; repo?: string }) =>
-  mintGithubGrant(key, { sub: "test", sid: "session-1", repo: claims.repo ?? "example/product", ops: claims.ops, ...(claims.refs ? { refs: claims.refs } : {}) });
+  mintGithubGrant(key, { sub: "test", sid: "session-1", project: "product-web", repo: claims.repo ?? "example/product", ops: claims.ops, ...(claims.refs ? { refs: claims.refs } : {}) });
 const basic = (value: string) => `Basic ${Buffer.from(`x:${value}`).toString("base64")}`;
 const fetchGrant = grant({ ops: ["fetch"] });
 const pushGrant = grant({ ops: ["fetch", "push"], refs: ["refs/heads/infinite/team-1"] });
@@ -134,6 +135,8 @@ test("a push to the granted branch is forwarded byte for byte, also when the com
     assert.deepEqual(seen.at(-1)!.body, body);
   }
   assert.deepEqual(logs.at(-1)!.refs, ["refs/heads/infinite/team-1"]);
+  // Every authenticated record names the grant's project, so two projects on one repository stay apart.
+  assert.deepEqual([logs.at(-1)!.project, logs.at(-1)!.sid, logs.at(-1)!.repo], ["product-web", "session-1", "example/product"]);
 });
 
 test("pushes outside the grant are refused before any request reaches GitHub", async () => {
@@ -170,6 +173,96 @@ test("a gzip push body is inspected after decompression and forwarded compressed
   const refused = await send({ method: "POST", path: "/example/product.git/git-receive-pack", auth: basic(pushGrant), headers: { ...receivePack, "content-encoding": "gzip" }, body: denied, pieces: 5 });
   assert.match(refused.body, /ng refs\/heads\/main Infinite GitHub proxy: ref-not-granted/);
   assert.equal(seen.length, before);
+
+  // A short command list before a large pack, gzipped, through HTTP: allowed and forwarded unchanged.
+  const large = gzipSync(pushBody([`${oid("0")} ${oid("a")} refs/heads/infinite/team-1`], { afterFlush: Buffer.concat([Buffer.from("PACK\0\0\0\x02\0\0\0\0", "latin1"), randomBytes(1024 * 1024)]) }));
+  const sent = await send({ method: "POST", path: "/example/product.git/git-receive-pack", auth: basic(pushGrant), headers: { ...receivePack, "content-encoding": "gzip" }, body: large });
+  assert.equal(sent.status, 200, sent.body);
+  assert.deepEqual(seen.at(-1)!.body, large);
+});
+
+/** A request stand-in that already holds every chunk, so it delivers them as fast as the inspector lets it. */
+function bufferedRequest(body: Buffer, chunkSize: number) {
+  const req = new PassThrough();
+  for (let offset = 0; offset < body.length; offset += chunkSize) req.write(body.subarray(offset, offset + chunkSize));
+  req.end();
+  return req;
+}
+async function rest(req: PassThrough) {
+  // The inspector leaves an accepted request paused; forwarding resumes it through pipe(), this helper by hand.
+  const chunks: Buffer[] = [];
+  req.on("data", chunk => chunks.push(chunk));
+  const ended = new Promise(done => req.once("end", done));
+  req.resume();
+  await ended;
+  return chunks;
+}
+
+test("a gzip body is decoded chunk by chunk, so a short command list before a large pack passes in 64 KiB pieces", async () => {
+  // The review's case: before the fix, all 1 MiB arrived before zlib caught up and the raw bound refused the push.
+  const pack = Buffer.concat([Buffer.from("PACK\0\0\0\x02\0\0\0\0", "latin1"), randomBytes(1024 * 1024)]);
+  const plain = pushBody([`${oid("0")} ${oid("a")} refs/heads/infinite/team-1`], { afterFlush: pack });
+  const gzipped = gzipSync(plain);
+  for (const [body, gzip] of [[plain, false], [gzipped, true]] as const) {
+    const req = bufferedRequest(body, 64 * 1024);
+    const inspected = await inspectReceivePack(req, gzip);
+    assert.deepEqual(inspected.commands.map((command: { ref: string }) => command.ref), ["refs/heads/infinite/team-1"]);
+    // Only what the verdict needed was read, and those bytes plus the rest are the original body.
+    assert.ok(Buffer.concat(inspected.raw).length <= 2 * 64 * 1024, `read ${Buffer.concat(inspected.raw).length} bytes`);
+    assert.deepEqual(Buffer.concat([...inspected.raw, ...(await rest(req))]), body);
+  }
+});
+
+test("the decoded prefix of a gzip body is bounded, so a small upload cannot expand without limit", async () => {
+  const commands = Array.from({ length: 40 }, (_, index) => `${oid("0")} ${oid("1")} refs/heads/infinite/b${index}`);
+  const body = gzipSync(pushBody(commands));
+  assert.ok(body.length < 1024);
+  await assert.rejects(inspectReceivePack(bufferedRequest(body, 64), true, { maxDecodedBytes: 1024 }), /command-list-too-large/);
+  assert.equal((await inspectReceivePack(bufferedRequest(body, 64), true)).commands.length, 40);
+  // A gzip bomb (32 MiB of zeros in a few KiB) is refused at its first bytes, without decoding the rest.
+  await assert.rejects(inspectReceivePack(bufferedRequest(gzipSync(Buffer.alloc(32 * 1024 * 1024, "0")), 64 * 1024), true), /command-list-empty|command-list-too-large/);
+});
+
+test("the token cache is reported proxy-only only when mode bits deny the agent and no extended ACL can grant it", async () => {
+  // `nobody` exists on Linux and macOS and is neither the owner nor in the group of these fixtures.
+  const cacheRoot = mkdtempSync(join(tmpdir(), "github-proxy-acl-"));
+  try {
+    const directory = join(cacheRoot, "tokens");
+    mkdirSync(directory);
+    const file = join(directory, `${"a".repeat(64)}.json`);
+    writeFileSync(file, "{}");
+    const config = validateProxyConfig({ listen: { host: "127.0.0.1", port: 0 }, grantKeyFile: "/x/grant.key", tokenDirectory: directory, githubCli: "/x/gh", agentUser: "nobody" });
+    const probed: string[][] = [];
+    const probe = (answer: boolean | undefined) => async (paths: string[]) => { probed.push(paths); return answer; };
+
+    chmodSync(directory, 0o755);
+    chmodSync(file, 0o644);
+    assert.equal(await agentTokenAccess(config, probe(false)), "agent-readable");
+    assert.equal(probed.length, 0);
+
+    chmodSync(directory, 0o700);
+    chmodSync(file, 0o600);
+    assert.equal(await agentTokenAccess(config, probe(false)), "proxy-only");
+    assert.deepEqual(probed.at(-1), [directory, file]);
+    // An ACL entry on the directory or a file, or a probe that cannot answer, leaves the verdict unknown.
+    assert.equal(await agentTokenAccess(config, probe(true)), "unknown");
+    assert.equal(await agentTokenAccess(config, probe(undefined)), "unknown");
+    assert.equal(await agentTokenAccess(config, getfaclProbe(join(cacheRoot, "missing-getfacl"))), "unknown");
+
+    // The real probe reads getfacl's answer: output means an extended ACL, silence means none, failure means unknown.
+    const fake = (name: string, script: string) => { const path = join(cacheRoot, name); writeFileSync(path, `#!/bin/sh\n${script}\n`); chmodSync(path, 0o755); return path; };
+    assert.equal(await getfaclProbe(fake("acl.sh", 'printf "# file: %s\\nuser:nobody:r--\\n" "$4"'))([file]), true);
+    assert.equal(await getfaclProbe(fake("none.sh", 'test "$1" = --skip-base && exit 0; echo unexpected'))([file]), false);
+    assert.equal(await getfaclProbe(fake("fail.sh", "exit 1"))([file]), undefined);
+
+    // /health and doctor get the same verdict.
+    const health = createGithubProxy({ config, key, log: () => {}, extendedAcl: probe(true) });
+    await new Promise<void>(done => health.listen(0, "127.0.0.1", done));
+    try {
+      const response = await fetch(`http://127.0.0.1:${(health.address() as { port: number }).port}/health`);
+      assert.deepEqual(await response.json(), { ok: true, grantKey: "loaded", tokenCache: "unknown" });
+    } finally { await new Promise(done => health.close(done)); }
+  } finally { rmSync(cacheRoot, { recursive: true, force: true }); }
 });
 
 test("other repositories, encoded or dotted paths, foreign hosts, and uncovered repositories are refused", async () => {

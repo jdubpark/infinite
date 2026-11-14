@@ -394,7 +394,8 @@ else if (command === "plan-fleet") {
         title: values.title?.trim() || `${provider} session`,
         ...(generatedTitle ? { generatedTitle: true as const } : {}),
         prompt: values.prompt ?? "",
-      });
+      // The local CLI runs with the host's own configuration and key: the owner started this session.
+      }, "owner");
       console.log(`${session.id}  ${session.status}`);
     } else if (command === "attach") await attach(manager, positionals[1]);
     else if (command === "doctor") {

@@ -1,18 +1,21 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHmac, randomBytes } from "node:crypto";
-import { mintGithubGrant } from "../packages/host/src/github-grants.js";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { mintGithubGrant, readGithubGrantKey } from "../packages/host/src/github-grants.js";
 // The proxy is a plain Node script; the host and the proxy must agree on every grant.
-import { verifyGrant } from "../scripts/github-proxy.mjs";
+import { loadGrantKey, verifyGrant } from "../scripts/github-proxy.mjs";
 
 const key = randomBytes(32);
 const now = Date.UTC(2026, 10, 14, 12, 0, 0);
 const nowSeconds = Math.floor(now / 1000);
-const claims = { sub: "team:delivery", sid: "session-1", repo: "example/product", ops: ["fetch", "push", "pr"] as ("fetch" | "push" | "pr")[], refs: ["refs/heads/infinite/team-1"] };
+const claims = { sub: "team:delivery", sid: "session-1", project: "product-web", repo: "example/product", ops: ["fetch", "push", "pr"] as ("fetch" | "push" | "pr")[], refs: ["refs/heads/infinite/team-1"] };
 
 /** Signs an arbitrary payload the way the host does, so the proxy's own field checks are what refuses it. */
-function signed(payload: unknown, signingKey = key) {
-  const body = `v1.${Buffer.from(JSON.stringify(payload)).toString("base64url")}`;
+function signed(payload: unknown, signingKey = key, version = "v2") {
+  const body = `${version}.${Buffer.from(JSON.stringify(payload)).toString("base64url")}`;
   return `${body}.${createHmac("sha256", signingKey).update(body).digest("base64url")}`;
 }
 
@@ -32,8 +35,20 @@ test("a tampered grant or another key is refused", () => {
   const flipped = mac!.slice(0, -2) + (mac!.at(-2) === "A" ? "B" : "A") + mac!.at(-1);
   assert.deepEqual(verifyGrant(`${version}.${payload}.${flipped}`, key, nowSeconds), { ok: false, reason: "grant-signature" });
   assert.deepEqual(verifyGrant(grant, randomBytes(32), nowSeconds), { ok: false, reason: "grant-signature" });
-  assert.deepEqual(verifyGrant(`v2.${payload}.${mac}`, key, nowSeconds), { ok: false, reason: "grant-malformed" });
+  assert.deepEqual(verifyGrant(`x2.${payload}.${mac}`, key, nowSeconds), { ok: false, reason: "grant-malformed" });
   assert.deepEqual(verifyGrant(`${grant}.extra`, key, nowSeconds), { ok: false, reason: "grant-malformed" });
+});
+
+test("grants carry a project, and a version 1 grant, which has none, is refused even with a valid signature", () => {
+  const grant = mintGithubGrant(key, claims, now);
+  assert.equal(grant.startsWith("v2."), true);
+  assert.equal((verifyGrant(grant, key, nowSeconds) as { claims: { project: string } }).claims.project, "product-web");
+  const { project: _project, ...v1Claims } = claims;
+  assert.deepEqual(verifyGrant(signed({ ...v1Claims, exp: nowSeconds + 600 }, key, "v1"), key, nowSeconds), { ok: false, reason: "grant-version" });
+  assert.deepEqual(verifyGrant(signed({ ...claims, exp: nowSeconds + 600 }, key, "v1"), key, nowSeconds), { ok: false, reason: "grant-version" });
+  assert.deepEqual(verifyGrant(signed({ ...v1Claims, exp: nowSeconds + 600 }), key, nowSeconds), { ok: false, reason: "grant-fields" });
+  assert.deepEqual(verifyGrant(signed({ ...claims, project: "../x", exp: nowSeconds + 600 }), key, nowSeconds), { ok: false, reason: "grant-fields" });
+  assert.throws(() => mintGithubGrant(key, { ...claims, project: "" }, now));
 });
 
 test("an expired grant, or one that lives longer than 24 hours, is refused", () => {
@@ -52,4 +67,50 @@ test("unknown or malformed fields are refused even with a valid signature", () =
   assert.deepEqual(verifyGrant(signed({ ...claims, exp, ops: ["fetch"] }), key, nowSeconds), { ok: false, reason: "grant-fields" });
   assert.deepEqual(verifyGrant(signed({ ...claims, exp, repo: "example/product/../other" }), key, nowSeconds), { ok: false, reason: "grant-fields" });
   assert.throws(() => mintGithubGrant(key, { ...claims, refs: ["refs/heads/a\nb"] }, now));
+});
+
+test("the host and the proxy read the grant key only from a root-owned file below root-owned directories", () => {
+  // Tests run without root: `trustedUid` names this process's uid as the one owner accepted besides root. The fixture
+  // lives under the home directory because a shared temporary directory is world-writable and fails the rule.
+  const uid = process.getuid!();
+  const root = realpathSync(mkdtempSync(join(homedir(), ".github-grant-key-")));
+  try {
+    chmodSync(root, 0o700);
+    const keyHex = randomBytes(32).toString("hex");
+    const write = (path: string, mode: number) => { writeFileSync(path, `${keyHex}\n`); chmodSync(path, mode); return path; };
+    const host = (path: string, trustedUid = uid) => readGithubGrantKey(path, { trustedUid });
+    const proxy = (path: string, trustedUid = uid) => loadGrantKey(path, { trustedUid });
+    const both = (path: string) => {
+      const verdicts = [() => host(path), () => proxy(path)].map(read => { try { return read().toString("hex"); } catch { return "refused"; } });
+      assert.equal(verdicts[0], verdicts[1], `host and proxy disagree on ${path}`);
+      return verdicts[0];
+    };
+
+    const good = write(join(root, "grant.key"), 0o440);
+    assert.equal(both(good), keyHex);
+    // The same file and directories owned by an account that is neither root nor trusted (the agent-owned key of the
+    // review): the production default, trustedUid 0, refuses them.
+    if (uid !== 0) {
+      assert.throws(() => host(good, 0), /unsafe/);
+      assert.throws(() => proxy(good, 0), /grant-key-(?:directory-)?permissions/);
+    }
+    assert.equal(both(write(join(root, "other-readable.key"), 0o444)), "refused");
+    assert.equal(both(write(join(root, "group-writable.key"), 0o460)), "refused");
+    const link = join(root, "link.key");
+    symlinkSync(good, link);
+    assert.equal(both(link), "refused");
+
+    const shared = join(root, "shared");
+    mkdirSync(shared);
+    const underShared = write(join(shared, "grant.key"), 0o440);
+    chmodSync(shared, 0o770);
+    assert.equal(both(underShared), "refused");
+    chmodSync(shared, 0o750);
+    assert.equal(both(underShared), keyHex);
+    const linkedDirectory = join(root, "linked");
+    symlinkSync(shared, linkedDirectory);
+    assert.equal(both(join(linkedDirectory, "grant.key")), "refused");
+    assert.equal(both(join(root, "missing.key")), "refused");
+    assert.equal(both(`${root}/./grant.key`), "refused");
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -3,14 +3,15 @@
 // host-signed grant on every request. Node standard library only. See deploy/ubuntu/github-proxy.md.
 import { spawn } from "node:child_process";
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
-import { closeSync, constants as fsConstants, fstatSync, lstatSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createGunzip } from "node:zlib";
 
+const GRANT_VERSION = "v2";
 const GRANT_OPS = new Set(["fetch", "push", "pr", "merge"]);
 const GRANT_MAX_TTL_SECONDS = 24 * 60 * 60;
 const GRANT_MAX_LENGTH = 4096;
@@ -48,17 +49,19 @@ function canonicalBase64url(text) {
 }
 
 /**
- * Verifies `v1.<payload>.<mac>` and returns `{ ok: true, claims }` or `{ ok: false, reason }`. The MAC is compared in
+ * Verifies `v2.<payload>.<mac>` and returns `{ ok: true, claims }` or `{ ok: false, reason }`. The MAC is compared in
  * constant time before the payload is parsed; the payload must be canonical base64url JSON with exactly the known fields.
+ * Version 2 added the project; a version 1 grant, which has none, is refused as `grant-version`.
  */
 export function verifyGrant(text, key, nowSeconds = Math.floor(Date.now() / 1000)) {
   const refuse = reason => ({ ok: false, reason });
   if (typeof text !== "string" || text.length === 0 || text.length > GRANT_MAX_LENGTH) return refuse("grant-malformed");
   const parts = text.split(".");
-  if (parts.length !== 3 || parts[0] !== "v1") return refuse("grant-malformed");
+  if (parts.length !== 3) return refuse("grant-malformed");
+  if (parts[0] !== GRANT_VERSION) return refuse(/^v[0-9]{1,3}$/.test(parts[0]) ? "grant-version" : "grant-malformed");
   const mac = canonicalBase64url(parts[2]);
   if (!mac || mac.length !== 32) return refuse("grant-malformed");
-  const expected = createHmac("sha256", key).update(`v1.${parts[1]}`, "utf8").digest();
+  const expected = createHmac("sha256", key).update(`${GRANT_VERSION}.${parts[1]}`, "utf8").digest();
   if (!timingSafeEqual(mac, expected)) return refuse("grant-signature");
   const payload = canonicalBase64url(parts[1]);
   if (!payload) return refuse("grant-malformed");
@@ -66,8 +69,8 @@ export function verifyGrant(text, key, nowSeconds = Math.floor(Date.now() / 1000
   try { claims = JSON.parse(payload.toString("utf8")); } catch { return refuse("grant-malformed"); }
   if (!claims || typeof claims !== "object" || Array.isArray(claims)) return refuse("grant-malformed");
   const keys = Object.keys(claims).sort().join(",");
-  if (keys !== (Object.hasOwn(claims, "refs") ? "exp,ops,refs,repo,sid,sub" : "exp,ops,repo,sid,sub")) return refuse("grant-fields");
-  if (typeof claims.sub !== "string" || !LABEL.test(claims.sub) || typeof claims.sid !== "string" || !LABEL.test(claims.sid)) return refuse("grant-fields");
+  if (keys !== (Object.hasOwn(claims, "refs") ? "exp,ops,project,refs,repo,sid,sub" : "exp,ops,project,repo,sid,sub")) return refuse("grant-fields");
+  if (![claims.sub, claims.sid, claims.project].every(value => typeof value === "string" && LABEL.test(value))) return refuse("grant-fields");
   if (!validRepository(claims.repo)) return refuse("grant-fields");
   if (!Array.isArray(claims.ops) || claims.ops.length === 0 || new Set(claims.ops).size !== claims.ops.length || !claims.ops.every(op => typeof op === "string" && GRANT_OPS.has(op))) return refuse("grant-fields");
   if (Object.hasOwn(claims, "refs")) {
@@ -94,11 +97,31 @@ export class ProxyError extends Error {
 
 const CONFIG_KEYS = new Set(["listen", "grantKeyFile", "tokenDirectory", "githubCli", "repositories", "agentUser", "upstream"]);
 
-function regularPrivateFile(path, code, { otherReadable }) {
-  let info;
-  try { info = lstatSync(path); } catch { throw new ProxyError(`${code}-unavailable`); }
-  if (info.isSymbolicLink() || !info.isFile() || (info.mode & 0o022) !== 0 || (!otherReadable && (info.mode & 0o007) !== 0)) throw new ProxyError(`${code}-permissions`);
-  return readFileSync(path, "utf8");
+/**
+ * Reads a file that no account but root could have written or replaced: a regular root-owned file that is not group- or
+ * world-writable (and, unless `otherReadable`, not open to others at all), below real directories (no symbolic links)
+ * that are owned by root and not group- or world-writable. The file is opened without following a link, checked on the
+ * open descriptor, and read from it, so the file checked is the file read. `trustedUid` (default 0) is the one other
+ * owner accepted besides root; only tests pass their own uid. The host's readGithubGrantKey applies the same rule.
+ */
+export function readTrustedFile(path, code, { otherReadable, trustedUid = 0, maxBytes = 64 * 1024 }) {
+  const trusted = uid => uid === 0 || uid === trustedUid;
+  if (typeof path !== "string" || !isAbsolute(path) || resolve(path) !== path) throw new ProxyError(`${code}-path`);
+  for (let directory = dirname(path); ; directory = dirname(directory)) {
+    let info;
+    try { info = lstatSync(directory); } catch { throw new ProxyError(`${code}-unavailable`); }
+    if (info.isSymbolicLink() || !info.isDirectory() || !trusted(info.uid) || (info.mode & 0o022) !== 0) throw new ProxyError(`${code}-directory-permissions`);
+    if (directory === "/") break;
+  }
+  let fd;
+  try { fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK); }
+  catch (error) { throw new ProxyError(error?.code === "ELOOP" ? `${code}-permissions` : `${code}-unavailable`); }
+  try {
+    const info = fstatSync(fd);
+    if (!info.isFile() || !trusted(info.uid) || (info.mode & 0o022) !== 0 || (!otherReadable && (info.mode & 0o007) !== 0) || info.size > maxBytes)
+      throw new ProxyError(`${code}-permissions`);
+    return readFileSync(fd, "utf8");
+  } finally { closeSync(fd); }
 }
 
 /** Validates the proxy configuration. `upstream` defaults to https://github.com; loopback is allowed for tests only. */
@@ -122,15 +145,15 @@ export function validateProxyConfig(input) {
   return { ...input, upstream, repositories: input.repositories?.map(name => name.toLowerCase()) };
 }
 
-export function loadProxyConfig(path) {
+export function loadProxyConfig(path, { trustedUid = 0 } = {}) {
   let parsed;
-  try { parsed = JSON.parse(regularPrivateFile(path, "config", { otherReadable: true })); }
+  try { parsed = JSON.parse(readTrustedFile(path, "config", { otherReadable: true, trustedUid })); }
   catch (error) { throw error instanceof ProxyError ? error : new ProxyError("config-json"); }
   return validateProxyConfig(parsed);
 }
 
-export function loadGrantKey(path) {
-  return parseGrantKey(regularPrivateFile(path, "grant-key", { otherReadable: false }));
+export function loadGrantKey(path, { trustedUid = 0 } = {}) {
+  return parseGrantKey(readTrustedFile(path, "grant-key", { otherReadable: false, trustedUid, maxBytes: 1024 }));
 }
 
 const BASE_PERMISSIONS = { contents: "write", pull_requests: "write", checks: "read", statuses: "read", actions: "read", metadata: "read" };
@@ -310,6 +333,8 @@ const REQUEST_TYPES = { "git-upload-pack": "application/x-git-upload-pack-reques
 const OWNER = "[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?";
 const GIT_PATH = new RegExp(`^/(${OWNER})/([A-Za-z0-9][A-Za-z0-9._-]{0,103})/(info/refs|git-upload-pack|git-receive-pack)$`);
 const MAX_RAW_INSPECTION_BYTES = 512 * 1024;
+/** Decoded bytes the inspector may see before it must reach a verdict; the command list itself is capped at 64 KiB. */
+const MAX_DECODED_INSPECTION_BYTES = 256 * 1024;
 const MAX_REQUEST_MS = 30 * 60_000;
 const IDLE_MS = 120_000;
 
@@ -352,8 +377,34 @@ function bearerGrant(header) {
   return /^Bearer ([A-Za-z0-9._-]{1,4096})$/.exec(header)?.[1];
 }
 
-function agentTokenAccess(config) {
+/**
+ * A probe for extended POSIX ACLs. Resolves true when any of `paths` carries an ACL entry beyond owner, group, and
+ * other (named users or groups, a mask, or a default ACL), false when none does, and undefined when that cannot be
+ * ruled out: getfacl missing, failing, slow, or answering too much. Node has no ACL interface, so this asks getfacl
+ * from the `acl` package, which the Ubuntu template installs. `--skip-base` prints nothing for a base-only file.
+ */
+export function getfaclProbe(getfacl = "/usr/bin/getfacl", { timeoutMs = 5000 } = {}) {
+  return paths => new Promise(settle => {
+    let child, output = 0, done = false;
+    const finish = value => { if (!done) { done = true; clearTimeout(timer); settle(value); } };
+    try { child = spawn(getfacl, ["--skip-base", "--absolute-names", "--", ...paths], { stdio: ["ignore", "pipe", "ignore"], env: { PATH: "/usr/bin:/bin", LC_ALL: "C" } }); }
+    catch { return settle(undefined); }
+    const timer = setTimeout(() => { child.kill("SIGKILL"); finish(undefined); }, timeoutMs);
+    child.stdout.on("data", chunk => { output += chunk.length; if (output > 1024 * 1024) { child.kill("SIGKILL"); finish(undefined); } });
+    child.once("error", () => finish(undefined));
+    child.once("close", code => finish(code === 0 ? output > 0 : undefined));
+  });
+}
+
+/**
+ * Whether the agent account can read the token cache: "agent-readable", "proxy-only", or "unknown". Mode bits can show
+ * that the agent reads it; they cannot show that it does not, because an ACL entry can grant a named account access the
+ * mode bits do not reveal (and the group bits then show the ACL mask). So "proxy-only" needs the mode bits to deny the
+ * agent and the probe to rule out every extended ACL on the directory and each entry in it; otherwise "unknown".
+ */
+export async function agentTokenAccess(config, extendedAcl) {
   if (!config.agentUser) return "unknown";
+  let verdict, paths;
   try {
     const user = readFileSync("/etc/passwd", "utf8").split("\n").map(line => line.split(":")).find(fields => fields[0] === config.agentUser);
     if (!user) return "unknown";
@@ -362,12 +413,21 @@ function agentTokenAccess(config) {
     for (const fields of readFileSync("/etc/group", "utf8").split("\n").map(line => line.split(":")))
       if (fields.length >= 4 && fields[3].split(",").includes(config.agentUser)) groups.add(Number(fields[2]));
     const allowed = (info, bit) => info.uid === uid ? Boolean((info.mode >> 6) & bit) : groups.has(info.gid) ? Boolean((info.mode >> 3) & bit) : Boolean(info.mode & bit);
-    const directory = statSync(config.tokenDirectory);
-    if (!allowed(directory, 1)) return "proxy-only";
-    const files = readdirSync(config.tokenDirectory).filter(name => /^[a-f0-9]{64}\.json$/.test(name));
-    if (files.length === 0) return groups.has(directory.gid) ? "agent-readable" : "proxy-only";
-    return files.some(name => allowed(statSync(join(config.tokenDirectory, name)), 4)) ? "agent-readable" : "proxy-only";
+    const directory = lstatSync(config.tokenDirectory);
+    if (!directory.isDirectory()) return "unknown";
+    const entries = readdirSync(config.tokenDirectory);
+    const files = entries.filter(name => /^[a-f0-9]{64}\.json$/.test(name));
+    if (allowed(directory, 1) && (files.length === 0 ? groups.has(directory.gid) : files.some(name => allowed(lstatSync(join(config.tokenDirectory, name)), 4))))
+      return "agent-readable";
+    verdict = "proxy-only";
+    paths = [config.tokenDirectory, ...entries.map(name => join(config.tokenDirectory, name))];
   } catch { return "unknown"; }
+  // Probe in bounded batches; a single unknown answer makes the whole verdict unknown.
+  for (let index = 0; index < paths.length; index += 200) {
+    const acl = await extendedAcl(paths.slice(index, index + 200));
+    if (acl !== false) return "unknown";
+  }
+  return verdict;
 }
 
 function defaultLog(record) {
@@ -378,7 +438,7 @@ function defaultLog(record) {
  * Creates the proxy's HTTP server (not yet listening). `options.broker` handles `POST /gh`; see createGhBroker.
  * Records are one JSON object per request with no token and no grant text.
  */
-export function createGithubProxy({ config, key, log = defaultLog, now = () => Date.now(), maxConcurrent = 32, broker } = {}) {
+export function createGithubProxy({ config, key, log = defaultLog, now = () => Date.now(), maxConcurrent = 32, broker, extendedAcl = getfaclProbe() } = {}) {
   const tokenFor = tokenStore(config, now);
   let active = 0;
   const server = http.createServer((req, res) => {
@@ -412,8 +472,9 @@ export function createGithubProxy({ config, key, log = defaultLog, now = () => D
   async function handle(req, res, record, reply, done) {
     if (!loopbackHost(req.headers.host)) return reply(403, "host-refused");
     if (req.method === "GET" && req.url === "/health") {
+      const tokenCache = await agentTokenAccess(config, extendedAcl);
       res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-      res.end(JSON.stringify({ ok: true, grantKey: "loaded", tokenCache: agentTokenAccess(config) }));
+      res.end(JSON.stringify({ ok: true, grantKey: "loaded", tokenCache }));
       return done({ decision: "allow", reason: "health", status: 200 });
     }
     if (req.url === "/gh") {
@@ -421,7 +482,7 @@ export function createGithubProxy({ config, key, log = defaultLog, now = () => D
       if (req.method !== "POST") return reply(405, "request-invalid");
       const verified = verifyGrant(bearerGrant(req.headers.authorization), key, Math.floor(now() / 1000));
       if (!verified.ok) return reply(401, verified.reason);
-      Object.assign(record, { sub: verified.claims.sub, sid: verified.claims.sid, repo: verified.claims.repo, service: "gh" });
+      Object.assign(record, { sub: verified.claims.sub, sid: verified.claims.sid, project: verified.claims.project, repo: verified.claims.repo, service: "gh" });
       if (!verified.claims.ops.includes("pr")) return reply(403, "pr-not-granted");
       const token = tokenFor(verified.claims.repo);
       if (!token) return reply(403, "repository-not-covered");
@@ -435,7 +496,7 @@ export function createGithubProxy({ config, key, log = defaultLog, now = () => D
     const verified = verifyGrant(grantText, key, Math.floor(now() / 1000));
     if (!verified.ok) return reply(401, verified.reason);
     const claims = verified.claims;
-    Object.assign(record, { sub: claims.sub, sid: claims.sid });
+    Object.assign(record, { sub: claims.sub, sid: claims.sid, project: claims.project });
     if (claims.repo.toLowerCase() !== route.repository.toLowerCase()) return reply(403, "repository-not-granted");
     const op = route.service === "git-receive-pack" ? "push" : "fetch";
     if (!claims.ops.includes(op)) return reply(403, `${op}-not-granted`);
@@ -508,12 +569,18 @@ export function createGithubProxy({ config, key, log = defaultLog, now = () => D
   return server;
 }
 
-/** Reads the request until the command list is checked. Returns the raw bytes read so far, which are forwarded unchanged. */
-function inspectReceivePack(req, gzip) {
+/**
+ * Reads the request until the command list is checked, and returns the raw bytes read so far, which are forwarded
+ * unchanged. A gzip body is decoded one received chunk at a time: the request stays paused until zlib has decoded that
+ * chunk and the inspector has seen the output, so the raw bound measures the compressed command list rather than how
+ * far the network ran ahead of zlib. The decoded bytes are bounded too, so a small compressed body cannot expand
+ * without limit. On success the request is left paused for forwarding.
+ */
+export function inspectReceivePack(req, gzip, { maxRawBytes = MAX_RAW_INSPECTION_BYTES, maxDecodedBytes = MAX_DECODED_INSPECTION_BYTES } = {}) {
   return new Promise((resolveInspection, reject) => {
     const inspector = new ReceivePackInspector();
     const raw = [];
-    let rawBytes = 0, finished = false, ended = false;
+    let rawBytes = 0, decodedBytes = 0, finished = false, ended = false;
     const gunzip = gzip ? createGunzip() : undefined;
     const stop = (error, result) => {
       if (finished) return;
@@ -521,11 +588,14 @@ function inspectReceivePack(req, gzip) {
       req.off("data", onData);
       req.off("end", onEnd);
       gunzip?.destroy();
+      // A refused body is read and discarded so the response can be sent; an accepted one waits for forwarding.
       if (error) { req.resume(); reject(error); }
       else { req.pause(); resolveInspection({ ...result, raw, ended }); }
     };
     const feed = data => {
       if (finished) return;
+      decodedBytes += data.length;
+      if (decodedBytes > maxDecodedBytes) return stop(new ProxyError("command-list-too-large"));
       try {
         const result = inspector.push(data);
         if (result.done) stop(undefined, result);
@@ -534,9 +604,10 @@ function inspectReceivePack(req, gzip) {
     const onData = chunk => {
       raw.push(chunk);
       rawBytes += chunk.length;
-      if (rawBytes > MAX_RAW_INSPECTION_BYTES) return stop(new ProxyError("command-list-too-large"));
-      if (gunzip) gunzip.write(chunk);
-      else feed(chunk);
+      if (rawBytes > maxRawBytes) return stop(new ProxyError("command-list-too-large"));
+      if (!gunzip) return feed(chunk);
+      req.pause();
+      gunzip.write(chunk, () => { if (!finished) req.resume(); });
     };
     const onEnd = () => {
       ended = true;

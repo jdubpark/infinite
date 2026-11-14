@@ -1352,7 +1352,8 @@ export function createApp(config: Config, key: Buffer) {
     }
     const { backend: _backend, ...nativeRequest } = request;
     scheduleGraphForSession(request.projectId);
-    res.status(201).json(await startInProject(request.projectId, () => manager.create(nativeRequest)));
+    // Owner-only route: the owner started this session, which decides its GitHub grant under autonomy.boundary.github.
+    res.status(201).json(await startInProject(request.projectId, () => manager.create(nativeRequest, "owner")));
   });
   // Imported sessions keep their own transport and journal. Authorization is the same
   // as the managed-worker routes; raw native gateways remain worker-only.
@@ -1502,7 +1503,7 @@ export function createApp(config: Config, key: Buffer) {
     const { requestId } = z.object({ requestId: id }).strict().parse(req.body);
     const projectId = manager.meta(sessionId).session.projectId;
     scheduleGraphForSession(projectId);
-    res.json(await startInProject(projectId, () => manager.resume(sessionId, requestId)));
+    res.json(await startInProject(projectId, () => manager.resume(sessionId, requestId, "owner")));
   });
   app.get("/api/sessions/:id/native", refuseMissionManaged, requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer) return res.status(403).json({ error: "Pair an owner CLI to use the native frontend" });

@@ -289,7 +289,7 @@ export class ProjectSourceService {
         }
       }
       // With the GitHub proxy configured, this fetch carries a host grant for exactly this repository and operation.
-      const grant = hostGithubGrantEnvironment(this.config, { sid: `source:${projectId}`, repo: source.repository, ops: ["fetch"] });
+      const grant = hostGithubGrantEnvironment(this.config, { sid: `source:${projectId}`, project: projectId, repo: source.repository, ops: ["fetch"] });
       const fetched = await this.command(mirror, ["fetch", "--no-tags", remote, `+refs/heads/${source.baseBranch}:refs/heads/${source.baseBranch}`], options?.signal, FETCH_TIMEOUT_MS, grant);
       if (options?.signal?.aborted) throw options.signal.reason ?? new DOMException("The operation was aborted", "AbortError");
       if (!this.sourceMatches(projectId, source)) return this.status(projectId);

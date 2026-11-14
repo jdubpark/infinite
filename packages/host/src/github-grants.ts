@@ -1,17 +1,20 @@
 import { createHmac } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
 import type { Config, Project } from "./types.js";
 import type { TeamAssignment, TeamDelivery } from "./team-types.js";
 
 /**
  * GitHub grants: host-signed capabilities that the GitHub credential proxy checks on every request.
- * Format `v1.<payload>.<mac>`: `payload` is base64url JSON `{ sub, sid, repo, ops, refs?, exp }` and `mac` is
- * base64url HMAC-SHA256 over `v1.<payload>` with a key shared only by the host account and the proxy account.
- * The proxy (`scripts/github-proxy.mjs`) verifies with the same rules; `tests/github-grants.test.ts` proves they agree.
+ * Format `v2.<payload>.<mac>`: `payload` is base64url JSON `{ sub, sid, project, repo, ops, refs?, exp }` and `mac` is
+ * base64url HMAC-SHA256 over `v2.<payload>` with a key shared only by the host account and the proxy account.
+ * Version 2 added `project`; the proxy refuses version 1. The proxy (`scripts/github-proxy.mjs`) verifies with the
+ * same rules; `tests/github-grants.test.ts` proves they agree.
  */
+export const GITHUB_GRANT_VERSION = "v2";
 export const GITHUB_GRANT_OPS = ["fetch", "push", "pr", "merge"] as const;
 export type GithubGrantOp = typeof GITHUB_GRANT_OPS[number];
-export type GithubGrantClaims = { sub: string; sid: string; repo: string; ops: GithubGrantOp[]; refs?: string[]; exp: number };
+export type GithubGrantClaims = { sub: string; sid: string; project: string; repo: string; ops: GithubGrantOp[]; refs?: string[]; exp: number };
 /** A grant never lives longer than this; the proxy refuses a later `exp`. */
 export const GITHUB_GRANT_MAX_TTL_SECONDS = 24 * 60 * 60;
 const MAX_REFS = 32;
@@ -41,8 +44,8 @@ export function validGrantRef(value: unknown, pattern: boolean): value is string
 
 function assertClaims(claims: GithubGrantClaims, nowSeconds: number) {
   const keys = Object.keys(claims).sort().join(",");
-  if (keys !== (claims.refs === undefined ? "exp,ops,repo,sid,sub" : "exp,ops,refs,repo,sid,sub")) throw new GithubGrantError("Grant claims have unknown or missing fields.");
-  if (!LABEL.test(claims.sub) || !LABEL.test(claims.sid)) throw new GithubGrantError("Grant subject and session must be short labels.");
+  if (keys !== (claims.refs === undefined ? "exp,ops,project,repo,sid,sub" : "exp,ops,project,refs,repo,sid,sub")) throw new GithubGrantError("Grant claims have unknown or missing fields.");
+  if (!LABEL.test(claims.sub) || !LABEL.test(claims.sid) || !LABEL.test(claims.project)) throw new GithubGrantError("Grant subject, session, and project must be short labels.");
   if (!validGrantRepository(claims.repo)) throw new GithubGrantError("Grant repository must be OWNER/NAME.");
   if (!Array.isArray(claims.ops) || claims.ops.length === 0 || new Set(claims.ops).size !== claims.ops.length || claims.ops.some(op => !GITHUB_GRANT_OPS.includes(op)))
     throw new GithubGrantError("Grant operations must be a non-empty list of fetch, push, pr, and merge.");
@@ -61,12 +64,12 @@ export function mintGithubGrant(key: Buffer, claims: Omit<GithubGrantClaims, "ex
   const nowSeconds = Math.floor(nowMs / 1000);
   const { ttlSeconds = GITHUB_GRANT_MAX_TTL_SECONDS, ...rest } = claims;
   const payload: GithubGrantClaims = {
-    sub: rest.sub, sid: rest.sid, repo: rest.repo, ops: [...rest.ops],
+    sub: rest.sub, sid: rest.sid, project: rest.project, repo: rest.repo, ops: [...rest.ops],
     ...(rest.refs !== undefined ? { refs: [...rest.refs] } : {}),
     exp: nowSeconds + ttlSeconds,
   };
   assertClaims(payload, nowSeconds);
-  const signed = `v1.${Buffer.from(JSON.stringify(payload), "utf8").toString("base64url")}`;
+  const signed = `${GITHUB_GRANT_VERSION}.${Buffer.from(JSON.stringify(payload), "utf8").toString("base64url")}`;
   return `${signed}.${createHmac("sha256", key).update(signed, "utf8").digest("base64url")}`;
 }
 
@@ -77,13 +80,40 @@ export function parseGithubGrantKey(text: string): Buffer {
   return Buffer.from(hex, "hex");
 }
 
-/** Refuses a key other users could read: anyone holding it can mint grants. */
-export function readGithubGrantKey(path: string): Buffer {
-  let info: ReturnType<typeof statSync>, text: string;
-  try { info = statSync(path); text = readFileSync(path, "utf8"); }
-  catch { throw new GithubGrantKeyError("unreadable"); }
-  if (!info.isFile() || (info.mode & 0o027) !== 0) throw new GithubGrantKeyError("unsafe (writable by its group or open to other users)");
-  return parseGithubGrantKey(text);
+/** Who may own the key file and every directory above it: root, and in tests the test's own account. */
+export type GithubKeyOwner = { trustedUid?: number };
+
+/**
+ * Reads the grant key. Anyone who can read the key can sign grants, and anyone who can replace the file or a directory
+ * above it can substitute a key they know. So the key must be a regular file owned by root, not writable by its group
+ * or others and not open to others at all, below real directories (no symbolic links) that are owned by root and not
+ * writable by their group or others. The file is opened without following a link, checked on the open descriptor,
+ * and read from that descriptor, so the file checked is the file read. `trustedUid` (default 0) names the one other
+ * owner accepted besides root; only tests pass their own uid. The proxy's `loadGrantKey` applies the same rule.
+ */
+export function readGithubGrantKey(path: string, { trustedUid = 0 }: GithubKeyOwner = {}): Buffer {
+  const trusted = (uid: number) => uid === 0 || uid === trustedUid;
+  if (!isAbsolute(path) || resolve(path) !== path) throw new GithubGrantKeyError("unsafe (the path must be absolute and normalized)");
+  for (let directory = dirname(path); ; directory = dirname(directory)) {
+    let info;
+    try { info = lstatSync(directory); } catch { throw new GithubGrantKeyError("unreadable"); }
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new GithubGrantKeyError(`unsafe (${directory} is not a real directory)`);
+    if (!trusted(info.uid) || (info.mode & 0o022) !== 0) throw new GithubGrantKeyError(`unsafe (${directory} is writable by an account other than root)`);
+    if (directory === "/") break;
+  }
+  let fd: number;
+  try { fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK); }
+  catch (error) { throw new GithubGrantKeyError((error as NodeJS.ErrnoException).code === "ELOOP" ? "unsafe (a symbolic link)" : "unreadable"); }
+  try {
+    const info = fstatSync(fd);
+    if (!info.isFile()) throw new GithubGrantKeyError("unsafe (not a regular file)");
+    if (!trusted(info.uid)) throw new GithubGrantKeyError("unsafe (not owned by root)");
+    if ((info.mode & 0o027) !== 0) throw new GithubGrantKeyError("unsafe (writable by its group or open to other users)");
+    if (info.size > 1024) throw new GithubGrantKeyError("invalid (it must hold 32 to 128 bytes as hex)");
+    let text: string;
+    try { text = readFileSync(fd, "utf8"); } catch { throw new GithubGrantKeyError("unreadable"); }
+    return parseGithubGrantKey(text);
+  } finally { closeSync(fd); }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -91,9 +121,13 @@ export function readGithubGrantKey(path: string): Buffer {
 
 export type GithubBoundary = { proxyUrl: string; keyPath: string };
 export type GithubGrantScope = { sub: string; repo: string; ops: GithubGrantOp[]; refs?: string[] };
-/** What the host knows about a session when it decides its grant. */
+/**
+ * What the host knows about a session when it decides its grant. `owner` is only for a creation path that states the
+ * owner started the session; any other non-team session, including one whose caller is unknown, is `unattributed`.
+ */
 export type GithubSessionContext =
   | { kind: "owner"; repository?: string }
+  | { kind: "unattributed"; repository?: string }
   | { kind: "team"; role: TeamAssignment["role"]; repository?: string; delivery?: { mode: TeamDelivery["mode"]; repository: string; headBranch: string } };
 
 export function githubBoundary(config: Pick<Config, "autonomy">): GithubBoundary | undefined {
@@ -110,12 +144,15 @@ export function projectGithubRepository(project: Pick<Project, "source" | "team"
  * The grant rules. No repository means no grant. Mission coordinators and permission reviewers get none. The delivery
  * role gets fetch, push on the run's head branch only, pull requests, and merge only under a merge delivery policy.
  * Every other team member gets fetch. A session the owner started directly gets fetch, push on any branch, pull
- * requests and merge; branch protection on GitHub still governs the base branch.
+ * requests and merge; branch protection on GitHub still governs the base branch. A session nobody vouched for as
+ * owner-started gets fetch only.
  */
 export function sessionGithubScope(context: GithubSessionContext): GithubGrantScope | undefined {
-  if (context.kind === "owner") {
+  if (context.kind === "owner" || context.kind === "unattributed") {
     if (!context.repository || !validGrantRepository(context.repository)) return undefined;
-    return { sub: "owner", repo: context.repository, ops: ["fetch", "push", "pr", "merge"], refs: ["refs/heads/*"] };
+    return context.kind === "owner"
+      ? { sub: "owner", repo: context.repository, ops: ["fetch", "push", "pr", "merge"], refs: ["refs/heads/*"] }
+      : { sub: "unattributed", repo: context.repository, ops: ["fetch"] };
   }
   if (context.role === "mission-coordinator" || context.role === "permission-coordinator") return undefined;
   if (context.role === "delivery" && context.delivery) {
@@ -127,12 +164,30 @@ export function sessionGithubScope(context: GithubSessionContext): GithubGrantSc
   return { sub: `team:${context.role}`, repo: context.repository, ops: ["fetch"] };
 }
 
-/** Mints a session's grant, or returns undefined when the boundary is off, there is no scope, or the key is unreadable. */
-export function sessionGithubGrant(config: Pick<Config, "autonomy">, scope: GithubGrantScope | undefined, sessionId: string, nowMs = Date.now()): { proxy: string; grant: string } | undefined {
+/**
+ * Who decided a session's GitHub grant: a team member's scope from its run, or `owner-started` from a creation path that
+ * states the owner started the session. Undefined means nobody vouched for the session.
+ */
+export type SessionGithubOrigin = { team: GithubGrantScope | undefined } | "owner-started";
+
+/**
+ * The grant scope for a session being created. A team session gets exactly the scope its run decided. A session outside
+ * a team gets the owner's scope only when its creation path says the owner started it; any other caller, including an
+ * unknown one, gets fetch only.
+ */
+export function sessionGithubScopeFor(input: { team: boolean; origin: SessionGithubOrigin | undefined; repository: string | undefined }): GithubGrantScope | undefined {
+  if (input.team) return typeof input.origin === "object" ? input.origin.team : undefined;
+  return sessionGithubScope({ kind: input.origin === "owner-started" ? "owner" : "unattributed", repository: input.repository });
+}
+
+/** Mints a session's grant, or returns undefined when the boundary is off, there is no scope, or the key is unusable. */
+export function sessionGithubGrant(config: Pick<Config, "autonomy">, scope: GithubGrantScope | undefined,
+  session: { sessionId: string; projectId: string; nowMs?: number } & GithubKeyOwner): { proxy: string; grant: string } | undefined {
   const boundary = githubBoundary(config);
   if (!boundary || !scope) return undefined;
   try {
-    return { proxy: boundary.proxyUrl, grant: mintGithubGrant(readGithubGrantKey(boundary.keyPath), { ...scope, sid: sessionId }, nowMs) };
+    const key = readGithubGrantKey(boundary.keyPath, session);
+    return { proxy: boundary.proxyUrl, grant: mintGithubGrant(key, { ...scope, sid: session.sessionId, project: session.projectId }, session.nowMs) };
   } catch (error) {
     const reason = error instanceof GithubGrantKeyError ? ` (the grant key file is ${error.message})` : "";
     console.warn(`A GitHub grant could not be minted${reason}; the session starts without GitHub access through the proxy.`);
@@ -150,11 +205,12 @@ const HOST_CREDENTIAL_HELPER = `!f() { test "$1" = get || exit 0; test -n "$INFI
  * Through `teams.commandPrefix`, sudo drops the GIT_CONFIG_* entries and the root-owned launcher adds the same settings.
  * Empty when the boundary is off, so the environment stays exactly as it was.
  */
-export function hostGithubGrantEnvironment(config: Pick<Config, "autonomy">, operation: { sid: string; repo: string; ops: GithubGrantOp[]; refs?: string[] }, nowMs = Date.now()): Record<string, string> {
+export function hostGithubGrantEnvironment(config: Pick<Config, "autonomy">, operation: { sid: string; project: string; repo: string; ops: GithubGrantOp[]; refs?: string[] },
+  { nowMs, trustedUid }: { nowMs?: number } & GithubKeyOwner = {}): Record<string, string> {
   const boundary = githubBoundary(config);
   if (!boundary) return {};
   let grant: string;
-  try { grant = mintGithubGrant(readGithubGrantKey(boundary.keyPath), { sub: "host", ...operation, ttlSeconds: HOST_GRANT_TTL_SECONDS }, nowMs); }
+  try { grant = mintGithubGrant(readGithubGrantKey(boundary.keyPath, { trustedUid }), { sub: "host", ...operation, ttlSeconds: HOST_GRANT_TTL_SECONDS }, nowMs); }
   catch { return {}; }
   const origin = new URL(boundary.proxyUrl).origin;
   return {
@@ -167,12 +223,15 @@ export function hostGithubGrantEnvironment(config: Pick<Config, "autonomy">, ope
   };
 }
 
-/** One `doctor` line: proxy reachable, grant key readable, and whether the agent account can still read the token cache. */
-export async function githubProxyDoctorLine(config: Pick<Config, "autonomy">): Promise<string | undefined> {
+/**
+ * One `doctor` line: proxy reachable, grant key readable, and whether the agent account can still read the token cache.
+ * The cache is reported as closed only when the proxy says `proxy-only`, which it says only after ruling out ACLs.
+ */
+export async function githubProxyDoctorLine(config: Pick<Config, "autonomy">, owner: GithubKeyOwner = {}): Promise<string | undefined> {
   const boundary = githubBoundary(config);
   if (!boundary) return undefined;
   let key = "readable";
-  try { readGithubGrantKey(boundary.keyPath); } catch (error) { key = error instanceof GithubGrantKeyError ? error.message.replace(/^[a-z]+/, (word) => word.toUpperCase()) : "UNREADABLE"; }
+  try { readGithubGrantKey(boundary.keyPath, owner); } catch (error) { key = error instanceof GithubGrantKeyError ? error.message.replace(/^[a-z]+/, (word) => word.toUpperCase()) : "UNREADABLE"; }
   let reachable = "unreachable", cache = "unknown";
   try {
     const response = await fetch(new URL("/health", boundary.proxyUrl), { redirect: "error", signal: AbortSignal.timeout(3000) });
@@ -181,6 +240,7 @@ export async function githubProxyDoctorLine(config: Pick<Config, "autonomy">): P
       reachable = "reachable";
       if (body.tokenCache === "agent-readable") cache = "READABLE by the agent account, which bypasses the proxy";
       else if (body.tokenCache === "proxy-only") cache = "not readable by the agent account";
+      else cache = "UNKNOWN: agent access could not be ruled out (check ACLs with getfacl)";
     }
   } catch { /* reported as unreachable */ }
   return `GitHub proxy: ${boundary.proxyUrl} ${reachable} · grant key ${key} · token cache ${cache}`;

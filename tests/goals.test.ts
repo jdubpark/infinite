@@ -6,7 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { startHost, waitFor, type Host } from "./helpers.js";
 import { createGoalSchema, type CreateGoal, type ProductGoal } from "../packages/host/src/goal-types.js";
-import type { TeamLineup, TeamView } from "../packages/host/src/team-types.js";
+import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, type TeamLineup, type TeamView } from "../packages/host/src/team-types.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { startLinearServer } from "./fixtures/linear-server.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
@@ -624,6 +624,61 @@ function extensionFixture() {
     writeGoal: (extra: object = {}) => f.writeRecord("goal", goal.id, { goal, receipts: {}, fingerprint: "fixture", ...extra }),
   };
 }
+
+test("a blocked goal past blockedHours closes with its blocker in the reason", async () => {
+  const f = extensionFixture();
+  f.config.teams!.retention = { ...DEFAULT_TEAM_RETENTION, blockedHours: 1 };
+  const blocker = "The active team stopped before producing a reviewed result.";
+  f.goal.status = "blocked"; f.goal.reason = blocker; f.goal.activeTeamId = undefined;
+  f.goal.blockedAt = new Date(Date.now() - 3_600_001).toISOString();
+  f.writeGoal();
+  const teams = f.openTeam(), goals = new GoalService(f.config, f.key, teams);
+  try {
+    goals.start();
+    const closed = await waitFor(() => f.readRecord<{ goal: ProductGoal }>("goal", f.goal.id), value => value.goal.status === "cancelled", 5000);
+    const reason = hostClosedBlockedReason(1, blocker);
+    assert.equal(closed.goal.reason, reason);
+    assert.equal(closed.goal.events.filter(event => event.text === reason).length, 1);
+  } finally { goals.close(); teams.close(); f.close(); }
+});
+
+test("a goal blocked before the host recorded block times starts its period at its last save, not its last event", async () => {
+  const f = extensionFixture();
+  f.config.teams!.retention = { ...DEFAULT_TEAM_RETENTION, blockedHours: 1 };
+  const blocker = "The active team stopped before producing a reviewed result.";
+  f.goal.status = "blocked"; f.goal.reason = blocker; delete f.goal.blockedAt; f.goal.activeTeamId = undefined;
+  // A child's block wrote no goal event, so the newest event is older than the block itself.
+  f.goal.events = [{ at: new Date(Date.now() - 7_200_000).toISOString(), text: "Started feature." }];
+  f.goal.updatedAt = new Date().toISOString();
+  f.writeGoal();
+  const teams = f.openTeam(), goals = new GoalService(f.config, f.key, teams);
+  try {
+    goals.start();
+    const saved = await waitFor(() => f.readRecord<{ goal: ProductGoal }>("goal", f.goal.id), value => Boolean(value.goal.blockedAt), 5000);
+    assert.equal(saved.goal.status, "blocked");
+    assert.ok(Date.parse(saved.goal.blockedAt!) >= Date.parse(f.goal.updatedAt));
+  } finally { goals.close(); teams.close(); f.close(); }
+});
+
+test("a blocked goal inside blockedHours remains blocked", async () => {
+  const f = extensionFixture();
+  f.config.teams!.retention = { ...DEFAULT_TEAM_RETENTION, blockedHours: 1 };
+  const blocker = "The active team stopped before producing a reviewed result.";
+  f.goal.status = "running"; f.goal.activeTeamId = undefined;
+  f.goal.linear = { status: "blocked", reason: blocker } as NonNullable<ProductGoal["linear"]>;
+  f.goal.events = [];
+  f.writeGoal();
+  const teams = f.openTeam(), goals = new GoalService(f.config, f.key, teams);
+  try {
+    goals.start();
+    await new Promise(resolve => setTimeout(resolve, 700));
+    const saved = f.readRecord<{ goal: ProductGoal }>("goal", f.goal.id);
+    assert.equal(saved.goal.status, "blocked");
+    assert.equal(saved.goal.reason, blocker);
+    assert.ok(saved.goal.blockedAt, "entering the blocked state records its start time");
+    assert.ok(Date.now() - Date.parse(saved.goal.blockedAt!) < 5000);
+  } finally { goals.close(); teams.close(); f.close(); }
+});
 
 test("a deleted cancelled goal cycle keeps its measured usage in the goal total", async () => {
   const f = extensionFixture();

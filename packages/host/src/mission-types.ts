@@ -107,6 +107,16 @@ export interface Mission {
 
 /** One row of the owner's board, across missions and runs started outside a mission. */
 export type BoardColumn = "needs-input" | "working" | "review" | "ended";
+/** One of several starts of the same work: missions or standalone runs of one project with the same objective. */
+export interface BoardAttempt {
+  /** Shared by every attempt of the work. */
+  workId: string;
+  /** Position among the attempts the host still holds, oldest first, from 1. */
+  number: number;
+  of: number;
+  /** A newer attempt exists and this one is blocked or cancelled, so a client may fold it behind the newest. */
+  superseded: boolean;
+}
 export interface BoardItem {
   kind: "mission" | "team" | "goal";
   id: string;
@@ -118,8 +128,11 @@ export interface BoardItem {
   status: string;
   /** One line: the open question, the block reason, or the current step. */
   detail: string;
+  createdAt: string;
   updatedAt: string;
   subtasks?: { total: number; running: number; done: number };
+  /** Present only when the host holds more than one attempt of this work. */
+  attempt?: BoardAttempt;
 }
 export interface Board {
   items: BoardItem[];

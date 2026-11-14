@@ -1573,6 +1573,27 @@ test("an intake mission still expires on working time", { timeout: 60000 }, asyn
   } finally { h.close(); mock.timers.reset(); }
 });
 
+test("the host closes a mission that stays blocked for the blocked-work retention period, and says so", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(5));
+    await h.attempt(1);
+    mock.timers.tick(6 * 60000);
+    const blocked = await until(() => h.get(id), mission => mission.status === "blocked");
+    assert.equal(blocked.reason, timeLimitText);
+    // One hour short of the default 72 hours: the mission still waits on the owner.
+    mock.timers.tick(71 * 3600000);
+    await new Promise(done => setTimeout(done, 1200));
+    assert.equal(h.missions.peek(id)!.status, "blocked");
+    mock.timers.tick(2 * 3600000);
+    const closed = await until(() => h.get(id), mission => mission.status === "cancelled");
+    const reason = `Closed by the host after 72 hours blocked without owner action. Last blocker: ${timeLimitText}`;
+    assert.equal(closed.reason, reason);
+    assert.equal(closed.events.filter(event => event.text === reason).length, 1, "The closing event is recorded once");
+  } finally { h.close(); mock.timers.reset(); }
+});
+
 test("a mission started from the apps keeps the wall-clock deadline", { timeout: 60000 }, async () => {
   const h = scripted();
   mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });

@@ -6,7 +6,8 @@ import { missionReportEnvelopeSchema, missionReportSchema } from "./mission-type
 export class ReportError extends Error {}
 export const MAX_TEAM_REPORT_BYTES = 64 * 1024;
 const bindingSchema = teamReportEnvelopeSchema.pick({ runId: true, memberId: true, revision: true }).strip();
-function reportEnvironment(env: NodeJS.ProcessEnv) {
+/** The worker's loopback hook capability for one team route: the report path or the entry path. */
+export function hookCapability(env: NodeJS.ProcessEnv, route: "team-report" | "team-entry") {
   const { INFINITE_HOOK_URL: url, INFINITE_HOOK_TOKEN: token, INFINITE_TEAM_ASSIGNMENT: assignment } = env;
   if (!url || !token || !assignment) throw new ReportError("Team reporting is unavailable in this process.");
   if (url.length > 2048 || token.length > 512 || /[\x00-\x20\x7f]/.test(token) || assignment.length > 4096)
@@ -15,7 +16,7 @@ function reportEnvironment(env: NodeJS.ProcessEnv) {
   try { endpoint = new URL(url); } catch { throw new ReportError("Invalid team report endpoint."); }
   if (endpoint.protocol !== "http:" || endpoint.hostname !== "127.0.0.1" || !endpoint.port || endpoint.username || endpoint.password || endpoint.pathname !== "/hook" || endpoint.search || endpoint.hash)
     throw new ReportError("Invalid team report endpoint.");
-  endpoint.pathname = "/hook/team-report";
+  endpoint.pathname = `/hook/${route}`;
   let binding: z.infer<typeof bindingSchema>;
   try { binding = bindingSchema.parse(JSON.parse(assignment)); }
   catch { throw new ReportError("Invalid team assignment."); }
@@ -41,7 +42,7 @@ function reportIdentity(value: unknown) {
 }
 /** Accept a raw report or an explicit retry envelope, always bound to this worker's assignment. */
 export function createReportEnvelope(input: unknown, env: NodeJS.ProcessEnv = process.env): TeamReportEnvelope {
-  const { binding } = reportEnvironment(env);
+  const { binding } = hookCapability(env, "team-report");
   let envelope: TeamReportEnvelope;
   if (input !== null && typeof input === "object" && !Array.isArray(input) && "report" in input) {
     envelope = teamReportEnvelopeSchema.parse(input);
@@ -56,7 +57,7 @@ export function createReportEnvelope(input: unknown, env: NodeJS.ProcessEnv = pr
 }
 /** HTTP 204 is sent by the worker only after its authenticated journal append has succeeded. */
 export async function submitTeamReport(input: unknown, env: NodeJS.ProcessEnv = process.env): Promise<TeamReportEnvelope> {
-  const { endpoint, token } = reportEnvironment(env);
+  const { endpoint, token } = hookCapability(env, "team-report");
   const envelope = createReportEnvelope(input, env);
   let response: Response;
   try {

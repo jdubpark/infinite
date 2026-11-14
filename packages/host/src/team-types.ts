@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { featureMapSchema, TASK_KINDS } from "./task-features.js";
 import type { Prompt, AnswerResult } from "@infinite/attention";
 import type { Receipt } from "./types.js";
 import type { Provider } from "./types.js";
@@ -195,6 +196,8 @@ export const teamProjectSchema = z.object({
   handoffMinutes: z.number().int().min(5).max(1440).optional(),
   handoffExtendMinutes: z.number().int().min(0).max(240).optional(),
   handoffMaxTotalMinutes: z.number().int().min(5).max(1440).optional(),
+  /** The private feature map. Read at acceptance; never sent to a member. No default, so the authority digest is unchanged when unset. */
+  features: featureMapSchema.optional(),
 }).strict().superRefine((project, context) => {
   if (project.establishChecks ? project.checks.length > 0 : project.checks.length === 0)
     context.addIssue({ code: "custom", path: ["checks"], message: "Configure required checks, or explicitly authorize the team to establish them with an empty checks array." });
@@ -360,6 +363,9 @@ export const teamTaskPlanSchema = z.object({
   agentProfileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/).optional(),
   paths: z.array(ownedPath).min(1).max(32),
   dependsOn: z.array(taskId).max(12),
+  /** Optional labels. A model may label, and `risk` may only be raised. No default. */
+  kind: z.enum(TASK_KINDS).optional(),
+  risk: z.literal("elevated").optional(),
 }).strict();
 export type TeamTaskPlan = z.infer<typeof teamTaskPlanSchema>;
 export const teamReportSchema = z.discriminatedUnion("kind", [

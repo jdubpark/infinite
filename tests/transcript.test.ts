@@ -5,7 +5,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { TranscriptTail, parseTranscriptRecord } from "../packages/host/src/transcript.js";
-import { findCodexRollout, relay } from "../packages/host/src/hook-relay.js";
+import { drain, findCodexRollout, relay } from "../packages/host/src/hook-relay.js";
 import { startHookServer, type HookReply } from "../packages/host/src/hooks.js";
 import { nativeItemMessage } from "../packages/host/src/native-codex.js";
 
@@ -224,13 +224,18 @@ test("the relay sends no end mark when a post after a chunk fails", async () => 
  * A worker for the secondary tests. It asks for secondaries unless `ask` is false, answers the primary
  * end mark with `wanted`, and moves a secondary's cursor only when `advance` allows that name.
  */
-function fakeSecondaryWorker(path: string, options: { ask?: boolean; wanted?: unknown[]; advance?: (name: string) => boolean; onEnd?: () => void; onSecondaryPost?: (name: string) => void } = {}) {
+function fakeSecondaryWorker(path: string, options: { ask?: boolean; wanted?: unknown[]; advance?: (name: string) => boolean; onEnd?: () => void; onSecondaryPost?: (name: string) => void; drain?: unknown } = {}) {
   const posts: Record<string, unknown>[] = [];
+  const requests: { url: string; body: string }[] = [];
   const cursors = new Map<string, number>();
   const reply = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
   const fake = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
-    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    const raw = String(init?.body);
+    requests.push({ url, body: raw });
+    const body = JSON.parse(raw) as Record<string, unknown>;
+    // The drain route answers with its window, or 204 when nothing is owed.
+    if (url.endsWith("/drain")) return options.drain === undefined ? new Response(null, { status: 204 }) : reply(options.drain);
     if (!url.endsWith("/transcript")) return reply({ transcript: { path, after: 0, drain: 7, ...(options.ask === false ? {} : { secondaries: true }) } });
     posts.push(body);
     if (typeof body.secondary !== "string") {
@@ -254,7 +259,7 @@ function fakeSecondaryWorker(path: string, options: { ask?: boolean; wanted?: un
     cursors.set(name, after);
     return reply({ after });
   }) as typeof fetch;
-  return { fetch: fake, posts };
+  return { fetch: fake, posts, requests };
 }
 
 /** A primary transcript and the subagent folder Claude Code writes beside it. */
@@ -490,5 +495,52 @@ test("a secondary that stops early does not stop the next one", async () => {
       { path, secondary: "agent-b.jsonl", offset: 0, text: "0123456789", drain: 7 },
       { path, secondary: "agent-b.jsonl", offset: 10, end: true, drain: 7 },
     ]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("the drain relay asks the worker what to read and streams it like a hook", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-drain-relay-"));
+  try {
+    const { path } = secondaryFixture(root);
+    const worker = fakeSecondaryWorker(path, {
+      drain: { transcript: { path, after: 0, drain: 9, secondaries: true } },
+      wanted: [{ name: "agent-a.jsonl", after: 0 }, { name: "agent-b.jsonl", after: 4 }],
+    });
+    await drain({ url: "http://worker.test", token: "t", fetch: worker.fetch });
+    assert.deepEqual(worker.requests[0], { url: "http://worker.test/drain", body: "{}" });
+    const sent = worker.posts.map(post => [post.secondary ?? "primary", post.offset, post.end === true ? "end" : "chunk", post.drain]);
+    assert.deepEqual(sent, [
+      ["primary", 0, "chunk", 9],
+      ["primary", Buffer.byteLength(claude("user", "u1", "short") + "\n"), "end", 9],
+      ["agent-a.jsonl", 0, "chunk", 9],
+      ["agent-a.jsonl", 20, "end", 9],
+      ["agent-b.jsonl", 4, "chunk", 9],
+      ["agent-b.jsonl", 10, "end", 9],
+    ]);
+    assert.ok(worker.posts[1].secondaries, "the primary end mark carries the listing the reply asked for");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("the drain relay lists secondaries only when the reply asks", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-drain-quiet-"));
+  try {
+    const { path } = secondaryFixture(root);
+    const worker = fakeSecondaryWorker(path, { drain: { transcript: { path, after: 0, drain: 9 } } });
+    await drain({ url: "http://worker.test", token: "t", fetch: worker.fetch });
+    const end = worker.posts.find(post => post.end === true);
+    assert.ok(end, "the primary end mark is sent");
+    assert.equal("secondaries" in end, false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("the drain relay does nothing when the worker has nothing to drain", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-drain-none-"));
+  try {
+    const { path } = secondaryFixture(root);
+    const worker = fakeSecondaryWorker(path);
+    await drain({ url: "http://worker.test", token: "t", fetch: worker.fetch });
+    assert.equal(worker.requests.length, 1);
+    assert.equal(worker.requests[0].url, "http://worker.test/drain");
+    assert.equal(worker.posts.length, 0);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

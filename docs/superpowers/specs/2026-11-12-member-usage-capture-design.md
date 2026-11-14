@@ -145,10 +145,10 @@ A hook payload only names the transcript. No usage comes from the payload.
 
 ### Part 3: coverage
 
-Each session has a coverage value and a fixed reason code. The worker appends one `usage-coverage` journal record when the provider process exits.
+Each session has a coverage value and a fixed reason code. The worker appends one `usage-coverage` journal record after the provider process exits and its final drain ends. The record carries `finalDrain` (`complete`, `incomplete`, or `skipped`) when a drain was owed.
 
 - `none`: no usage record arrived. Reasons: `hooks-off`, `no-transcript`, `no-usage-fields`, `unsupported`.
-- `partial`: at least one usage record arrived and a gap is possible. Reasons: `running`, `stopped-mid-turn`, `drain-incomplete`, `secondary-missing`, `child-threads`, `row-dropped`.
+- `partial`: at least one usage record arrived and a gap is possible. Reasons: `running`, `stopped-mid-turn`, `drain-incomplete`, `drain-skipped`, `secondary-missing`, `child-threads`, `row-dropped`.
 - `complete`: the last drain before provider exit reached the end marker for the primary transcript and for every listed secondary transcript, and that drain ran at a session end, or at a turn end that did not fail and left no background task running.
 
 A session that the host stopped mid-turn stays `partial` with reason `stopped-mid-turn`, also when its final drain reached the end marker. A request in flight at the stop leaves no transcript row, so the end of the file does not prove that every request was counted. The final drain still adds every row the transcript holds.
@@ -281,7 +281,7 @@ Fixtures come from synthetic sessions against a scratch repository. A script rep
 1. A Claude fixture has one request split over three rows, one synthetic row, and one request with thinking tokens and one-hour cache writes. The parser yields two usage records, `output + reasoning` equals `output_tokens`, and `cacheWrite1h` is set.
 2. A Codex fixture has `token_usage_record` rows and repeated `token_count` rows. Usage records equal distinct `response_id` values and sum to the last `thread_token_usage`. A fixture without `token_usage_record` rows yields one record that equals the final cumulative total.
 3. With usage rows added to the rehearsal provider's transcript (`packages/host/src/demo.ts`), a team run shows member tokens, `coverage: "complete"`, and unchanged Spent.
-4. A member stopped mid-turn is `partial` with reason `drain-incomplete` without the final drain. With it, the session is `partial` with reason `stopped-mid-turn`, and its totals include the rows written after the last hook.
+4. A member stopped mid-turn is `partial` with reason `drain-skipped` when its final drain cannot run. With it, the session is `partial` with reason `stopped-mid-turn`, and its totals include the rows written after the last hook.
 5. A transcript re-read from offset zero changes no total. Neither does a second session whose transcript replays the first.
 6. Usage records under a `subscription` account add 0 to month Spent and to the daily series, and `unpriced` does not change. With no configured account they count as unpriced.
 7. A usage record with an unknown model raises `list.unpriced`, and no client prints a list figure for that total.

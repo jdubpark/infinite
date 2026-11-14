@@ -1,7 +1,7 @@
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { relay, secondaryFolder } from "./hook-relay.js";
+import { drain, relay, secondaryFolder } from "./hook-relay.js";
 const request = process.argv[2] ?? "";
 console.log("Infinite · local continuity rehearsal");
 console.log("This is a deterministic demo process. No model requests are made.");
@@ -29,12 +29,12 @@ function transcribeSubagent() {
   };
   appendFileSync(join(secondaryFolder(transcriptPath), "agent-rehearsal.jsonl"), JSON.stringify(row) + "\n", { mode: 0o600 });
 }
-function transcribe(type: "user" | "assistant", content: unknown) {
+function transcribe(type: "user" | "assistant", content: unknown, id = `msg-demo-${process.pid}-${records + 1}`) {
   if (!withHooks) return;
   const n = ++records;
   // Assistant rows carry the usage a provider reports on each request. The counts are fixed.
   const message = type === "assistant"
-    ? { id: `msg-demo-${process.pid}-${n}`, role: type, model: "rehearsal-model", content, usage: { input_tokens: 120, output_tokens: 30, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }
+    ? { id, role: type, model: "rehearsal-model", content, usage: { input_tokens: 120, output_tokens: 30, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }
     : { role: type, content };
   appendFileSync(transcriptPath, JSON.stringify({ type, uuid: `demo-${process.pid}-${n}`, timestamp: new Date().toISOString(), message }) + "\n");
 }
@@ -72,6 +72,8 @@ const RM_INPUT = { command: "rm -rf build", description: "Remove the stale build
 const turnHooks = () => {
   transcribe("user", request);
   hook({ hook_event_name: "UserPromptSubmit", prompt: request });
+  // With `drain-early`, a final-drain post arrives while the provider still runs: the worker must ignore it.
+  if (request.includes("drain-early")) chain = chain.then(() => drain({ url: hookUrl!, token: hookToken! })).catch(() => {});
   transcribe("assistant", [{ type: "text", text: "I will remove the stale build directory." }, { type: "tool_use", name: "Bash", input: RM_INPUT }]);
   hook({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: RM_INPUT, tool_use_id: "demo-1" });
 };
@@ -144,6 +146,8 @@ process.on("SIGTERM", () => {
   const deadline = setTimeout(() => process.exit(0), 3000);
   void chain.finally(() => {
     clearTimeout(deadline);
+    // With `late-row`, the provider writes one row after its last hook, as a provider does when stopped mid-reply.
+    if (request.includes("late-row")) transcribe("assistant", [{ type: "text", text: "Stopped before the reply was finished." }], `msg-demo-${process.pid}-late`);
     process.exit(0);
   });
 });

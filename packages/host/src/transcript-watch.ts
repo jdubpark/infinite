@@ -7,12 +7,17 @@ import { UsageTail, usageCoverage, type SecondaryState, type UsageCoverage, type
 import { MAX_SECONDARY_FILES, SECONDARY_ID, SECONDARY_NAME, type SecondaryListing, type SecondaryRequest } from "./transcript-secondary.js";
 import type { UsageRecord } from "./usage.js";
 
+/** How the final drain after the provider exited ended: it never ran, it reached the end, or it did not. */
+export type FinalDrainState = "complete" | "incomplete" | "skipped";
+
 /** The coverage of one session, journaled by the worker when the provider exits. */
 export interface CoverageRecord {
   coverage: UsageCoverage;
   reason?: UsageCoverageReason;
   records: number;
   provider: string;
+  /** Present only when `finish` was told a drain was owed and a primary transcript was open. */
+  finalDrain?: FinalDrainState;
 }
 
 /**
@@ -42,6 +47,8 @@ export interface WatchHook {
   turnEnd: boolean;
   /** The hook names a primary transcript file. Absent when the hook names none. */
   transcript?: { path: string; provider: TranscriptProvider };
+  /** The hook is the provider's `SessionEnd`. */
+  sessionEnd?: boolean;
 }
 
 /** A secondary transcript the watch reads, with its own end evidence for one drain. */
@@ -71,6 +78,7 @@ interface Listing {
  */
 interface Current {
   path: string;
+  provider: TranscriptProvider;
   tail: TranscriptTail;
   usage: UsageTail;
   readers: Map<string, Reader>;
@@ -130,6 +138,14 @@ export class TranscriptWatch {
   /** A subagent hook that arrived before any transcript was open. It counts for the first transcript that opens. */
   private pendingSubagent = false;
   private writeFailed = false;
+  /** The host asked the provider to stop. Sticky. */
+  private stopped = false;
+  /** The provider exited and the watch closed. Sticky. */
+  private closed = false;
+  /** The id of the final drain, once one started. */
+  private finalDrain: number | undefined;
+  /** The reply that started the final drain. A later start repeats it from the current cursor. */
+  private finalStart: { path: string; after: number; drain: number; secondaries?: true } | undefined;
   /** What replaced transcripts held. Each fact stays sticky. `secondary` is the worst state of them all. */
   private readonly retired: { rows: number; records: number; dropped: boolean; gap: boolean; midTurn: boolean; secondary: SecondaryState; mismatch: boolean; childThreads: boolean } = {
     rows: 0, records: 0, dropped: false, gap: false, midTurn: false, secondary: "none", mismatch: false, childThreads: false,
@@ -139,22 +155,66 @@ export class TranscriptWatch {
     this.options = options;
   }
 
-  /** Every provider hook. Returns what the relay must send when the hook names a transcript. */
+  /** A primary transcript is open, so a final drain has a file to read. */
+  get reading(): boolean {
+    return this.current !== undefined && !this.closed;
+  }
+
+  /** The host asked the provider to stop. Idempotent. */
+  stopRequested(): void {
+    this.stopped = true;
+  }
+
+  /**
+   * Every provider hook. Returns what the relay must send when the hook names a transcript. After the final drain
+   * starts, a hook changes nothing: the provider has exited, so no late hook can describe a turn.
+   */
   hook(input: WatchHook): { path: string; after: number; drain: number; secondaries?: true } | undefined {
-    return guard(undefined, () => this.receiveHook(input));
+    return guard(undefined, () => {
+      if (this.closed || this.finalDrain !== undefined) return undefined;
+      // After a stop request, the provider's SessionEnd proves the process is ending, not that the turn ended: it keeps the turn boundary of the hook before it.
+      const turnEnd = input.sessionEnd === true && this.stopped ? (this.last?.turnEnd ?? false) : input.turnEnd;
+      return this.receiveHook({ ...input, turnEnd });
+    });
+  }
+
+  /**
+   * Starts the final drain on the current transcript, once per session. It takes the turn boundary of the last
+   * provider hook. A later call while the watch is open returns the same drain, from the current cursor, and resets
+   * nothing: any process of the agent's account may post to the drain route first, and the worker's relay must still
+   * get the transcript. Undefined when no primary transcript is open, or after the watch closed.
+   */
+  drainFinal(): { path: string; after: number; drain: number; secondaries?: true } | undefined {
+    return guard(undefined, () => {
+      const current = this.current;
+      if (this.closed || !current) return undefined;
+      if (this.finalStart) return { ...this.finalStart, after: current.tail.offset };
+      const started = this.receiveHook({
+        subagent: false, turnEnd: this.last?.turnEnd ?? false, transcript: { path: current.path, provider: current.provider },
+      });
+      if (started) {
+        this.finalDrain = started.drain;
+        this.finalStart = started;
+      }
+      return started;
+    });
   }
 
   /**
    * One post to the transcript route: a chunk or an end mark, for the primary or a secondary. Undefined
-   * when the post is not for the current transcript. `secondaries` lists the files the worker wants.
+   * when the post is not for the current transcript, or the watch closed. `secondaries` lists the files the worker wants.
    */
   post(body: unknown): { messages: TranscriptMessage[]; after: number; secondaries?: SecondaryRequest[] } | undefined {
-    return guard(undefined, () => this.receivePost(body));
+    return guard(undefined, () => (this.closed ? undefined : this.receivePost(body)));
   }
 
-  /** The provider exited. Journals the last usage records, and returns the coverage of the session. */
-  finish(hooks: boolean): CoverageRecord {
-    return guard<CoverageRecord>({ coverage: "partial", reason: "row-dropped", records: 0, provider: this.options.provider }, () => this.coverage(hooks));
+  /**
+   * The provider exited. Journals the last usage records, and returns the coverage of the session. With `finalDrain`
+   * true a drain was owed: the record states how it ended, and the watch closes.
+   */
+  finish(hooks: boolean, finalDrain = false): CoverageRecord {
+    if (finalDrain) this.closed = true;
+    return guard<CoverageRecord>({ coverage: "partial", reason: "row-dropped", records: 0, provider: this.options.provider }, () => this.coverage(hooks, finalDrain));
   }
 
   private receiveHook(input: WatchHook): { path: string; after: number; drain: number; secondaries?: true } | undefined {
@@ -326,7 +386,7 @@ export class TranscriptWatch {
     this.evidence = undefined;
     const usage = new UsageTail({ provider: next.provider, requestedModel: this.options.requestedModel });
     const tail = new TranscriptTail(next.provider, 4096, row => this.emit(usage.push(row)));
-    this.current = { path: next.path, tail, usage, readers: new Map(), cut: false, subagentHook: this.pendingSubagent, listedAny: false };
+    this.current = { path: next.path, provider: next.provider, tail, usage, readers: new Map(), cut: false, subagentHook: this.pendingSubagent, listedAny: false };
     this.pendingSubagent = false;
     return this.current;
   }
@@ -366,9 +426,13 @@ export class TranscriptWatch {
   }
 
   /** The coverage of the session, from the current transcript and every retired fact. */
-  private coverage(hooks: boolean): CoverageRecord {
+  private coverage(hooks: boolean, finalDrain: boolean): CoverageRecord {
     const current = this.current;
     if (current) this.emit(current.usage.finish());
+    // The final drain is the last drain. It is complete when it is the current drain and the primary transcript reached its end.
+    const finalState: FinalDrainState | undefined = finalDrain && current
+      ? (this.finalDrain === undefined ? "skipped" : this.drain === this.finalDrain && this.complete(current) ? "complete" : "incomplete")
+      : undefined;
     const readers = current ? [...current.readers.values()] : [];
     for (const reader of readers) this.emit(reader.usage.finish());
     const tail = current?.usage;
@@ -387,10 +451,11 @@ export class TranscriptWatch {
         complete: current !== undefined && this.complete(current) && !this.retired.gap,
         turnEnd: (this.last?.turnEnd ?? false) && !this.retired.midTurn,
       },
+      finalDrain: finalState,
       secondary: this.sessionSecondary(current),
       childThreads: this.retired.childThreads || (tail?.sawChildThreads() ?? false),
       totalMismatch: this.retired.mismatch || (tail !== undefined && !tail.reconciled()) || readers.some(reader => !reader.usage.reconciled()),
     });
-    return { ...result, records, provider: this.options.provider };
+    return { ...result, records, provider: this.options.provider, ...(finalState ? { finalDrain: finalState } : {}) };
   }
 }

@@ -122,7 +122,13 @@ key and the identity it authenticates; this is not independent hardware attestat
 or an expiring enrollment protocol.
 
 The allowlist now includes terminal and live-event streams, resource observations,
-and bounded project file operations. `terminal-open`, `terminal-send`,
+and bounded project file operations. It also admits three read-only `GET`
+paths for the web [Swarm view](swarm.md): a project's directory-level code map
+(`/api/projects/:id/graph/map`) and the touched-file sets of a team or a
+session (`/api/teams/:id/context`, `/api/sessions/:id/context`). They carry
+directory names, repository-relative file paths, and counts, which is the
+class of data the file listing and session events already serve, and no source
+text. `terminal-open`, `terminal-send`,
 `terminal-close`, and the `events-*` messages
 travel inside ciphertext, together with device credentials and session identifiers.
 Server `terminal-event` frames carry original output, snapshots, state, receipts,
@@ -215,10 +221,10 @@ Use encrypted off-host backups with restore testing. Keep the backup decryption 
 - Agents can leak data through allowed tools, the internet, model API requests, or prompt injection. Provider retention policies are a separate boundary.
 - Native terminal recordings are not a complete audit of every filesystem operation or hidden model context. An agent can write a file without printing it.
 - Hook tokens are readable by the agent process. Each worker passes `INFINITE_HOOK_URL` and `INFINITE_HOOK_TOKEN` in the agent's environment, so the agent can post forged signals. Signals are evidence about the agent, never authority over it. They are labeled by source, never approve anything, and the screen checks run independently. The answer endpoint only presses keys for a dialog the terminal shows and checks it before and after.
-- Codex hooks are off by default. When `attention.hooks.codex` is enabled, they are injected with `--dangerously-bypass-hook-trust`. Unverified until spike S2: the flag applies only to the hooks Infinite injects for that one process, and hooks the person configured keep their own trust requirements. `doctor` prints a line naming the flag when Codex hooks are enabled.
+- Codex hooks are off by default, and they must stay off for a repository whose contents you do not trust. When `attention.hooks.codex` is enabled, the hooks are injected with `--dangerously-bypass-hook-trust`. Spike S2 (2026-11-13, Codex CLI 0.167) showed that the flag is wider than the hooks Infinite injects: for that one process it also lets hooks that the working directory defines run without review, outside the command sandbox. It persists no trust. `doctor` prints a warning that names the flag when Codex hooks are enabled.
 - Push is an optional outbound dependency of the host. Bodies are minimal by default and carry no session content; `push.detail: "full"` is opt-in. Messages go through Expo's push service and can be cached there. The Expo access token lives in a 0600 file outside the state directory. Push can be left disabled.
 - Signal payloads can contain commands and file contents. They are journaled encrypted like the rest of the recording and shown only to paired roles.
-- Transcript bytes reach the worker only through the authenticated hook relay, which runs as the agent and reads only a regular `.jsonl` file the provider's own hook named, and for Claude Code the subagent transcript files in that session's `subagents` folder, for their usage only. These path checks prevent accidental reads. They are not a boundary against the agent's own account, which can read the same files. The worker records them as `message` events in the encrypted journal, so chat carries the same plaintext the provider already stores in its home. On the Linux deployment the hook variables must be in sudo's `env_keep`, or hooks and transcripts never leave the agent account.
+- Transcript bytes reach the worker only through the authenticated hook relay, which runs as the agent and reads only a regular `.jsonl` file the provider's own hook named, and for Claude Code the subagent transcript files in that session's `subagents` folder, for their usage only. After a provider exits, the same relay runs once more in drain mode; on the Ubuntu deployment that runs through the root-owned `transcript-drain` wrapper, which takes no arguments, and the worker's authenticated reply names the file. The path checks do not change for the drain. These path checks prevent accidental reads. They are not a boundary against the agent's own account, which can read the same files. The worker records them as `message` events in the encrypted journal, so chat carries the same plaintext the provider already stores in its home. On the Linux deployment the hook variables must be in sudo's `env_keep`, or hooks and transcripts never leave the agent account.
 - Chat summaries send recorded messages to the configured external model (`summaries`). With `jev` configured, the host can also send candidate sentences from an agent's last message and the clipped first line of a long default-titled prompt to TypeSafe; the summary writer's provider receives that prompt only when Jev finds its clipped first line unclear. A team run's long untitled request is handled the same way, except that local paths and file URLs are removed before either model sees it and, with no `jev` configured, the request goes to the summary writer directly. Configure `jev` with an absolute `apiKeyFile` to a private 0600 file outside the state directory, and optional `model` (default `jev-latest`) and `baseUrl` (default TypeSafe API URL). The summary writer's key file follows the same private-file rule. Provider retention policies remain separate boundaries. With no `jev` key configured, no TypeSafe calls occur.
 - Speech recognition runs in the platform's recognizer (Apple, Google, or the browser vendor), which may process audio on its own servers. With `dictation` configured, the transcript text goes to that model with `store: false`. Leave the block unset to send no transcripts to a model; clients then insert raw transcripts.
 - Confidential VMs can narrow provider/hypervisor threats, but they do not protect against compromised software inside the trusted guest. Attestation and external key release would be a separate security project, not a box to check on this service. [Confidential VM model](https://docs.cloud.google.com/confidential-computing/confidential-vm/docs/about-cvm).
@@ -244,6 +250,68 @@ repository-scoped App credential. The refspec is an exact commit SHA to
 `refs/heads/infinite/team-*`. The host never forces or deletes a remote branch. The
 point is durability: work survives workspace removal and loss of the host disk. See
 [Head publication](teams.md#head-publication).
+
+## Request intake
+
+Intake lets the owner start a mission from a Linear issue and follow it in a Slack
+thread. See [intake](intake.md) for the flow.
+
+Only the owner causes work, and the rule holds for both the intake service and the
+Slack surface:
+
+- An issue starts a mission only when its creator is the owner's Linear user ID,
+  `intake.linear.creatorId`. When a Slack thread is required, the thread must also
+  hold a message from the owner's Slack user ID, `intake.slack.ownerUserId`, that
+  mentions Linear's agent and was sent before the issue was filed.
+- The bot acts only on `app_mention` events from the owner's Slack user in a thread
+  bound to a record. A mention or reply from anyone else in a bound thread is
+  dropped before anything is stored; the surface keeps only a count of dropped
+  events. Nothing from that message reaches the record, the mission, or an agent.
+- The thread the issue links is read once, at admission. The objective keeps only
+  the owner's own messages from it. Messages from anyone else, and bot messages,
+  are read at admission to check authorship and are not stored, shown to agents,
+  or logged. The Slack surface also reads the bound thread to find its own posts
+  after an uncertain send; it stores nothing from that read.
+- A skipped issue's title and description are not stored. Its record keeps the
+  issue's IDs, URL, times, and skip reason, and no text from the issue.
+
+The bot posts only into the thread a record is bound to. Every outbound Slack
+function takes an intake record and reads its thread; none takes a channel ID
+from an inbound event. Linear comments go only to the issue whose record they
+belong to. Neither surface changes a Linear issue's state, assignee, or labels,
+and neither approves a provider permission or marks work complete. Results are
+labelled as agent reports.
+
+Host paths and addresses do not leave the host through intake. Before any Slack
+message or Linear comment is made, a `file://` URL, and a path that starts with a
+configured directory, a host root (`/srv/`, `/opt/`, `/run/`, `/etc/`, `/Users/`,
+`/home/`, `/tmp/`, `/private/tmp/`, `/private/var/`, `/var/folders/`), `~/`, or a
+Windows drive, becomes `[local path omitted]` when it is at the start of the text or
+after any character other than a letter, a digit, or one of `. _ ~ % / -`.
+Repeated slashes and `./` segments do not hide a path. Then every IPv4 literal
+becomes `[address omitted]`, which also hides four-part version numbers.
+
+Slack and Linear credentials are regular files with mode `0600`, outside
+`stateDir`, `runDir`, `teams.workspaceDir`, and every project path. The host reads
+them for its own requests. They never enter an agent's environment. Loopback HTTP
+endpoints are accepted only when `environment` is `"local"`; every other endpoint
+must be the official one. Slack uses Socket Mode, so the host has no inbound
+public endpoint, and Linear is polled.
+
+Errors are not shared as text. For an unexpected failure, the intake service's
+`lastError`, the Slack surface's `lastError`, and every failure a record keeps
+carry only the error's name and, when it has one, its code. The message and stack
+go to the host log only. Three known failures keep their own fixed text in shared
+places: a mission service refusal (`TeamError`), a Slack request failure
+(`SlackError`, whose text names only its code), and a Linear request failure
+(`LinearFailure`, whose text is fixed).
+
+Residual risk: the objective carries the Linear title and description, and the
+owner's Slack messages, to the coordinator and subteams. Anyone who can edit the
+issue before it is admitted can put instructions in its title or description. The
+coordinator is told that only the owner's words are instructions and that anything
+read through a connector is information. That is a prompt boundary, not a
+guarantee, and it does not stop an injected request from the owner's own account.
 
 ## Dependency audit
 

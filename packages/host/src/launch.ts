@@ -3,28 +3,20 @@ import type { AgentProfile, Provider } from "./types.js";
 import { dirname, join } from "node:path";
 import { teamModelProfileSchema, type TeamModelProfile } from "./team-types.js";
 import { codexTrustArgs } from "./workspace-trust.js";
+import { sudoShape } from "./sudo-profile.js";
 
 /** Only model controls are added here; the configured provider permissions remain unchanged. */
 export function teamModelLaunch(profile: AgentProfile, input: TeamModelProfile): AgentProfile {
   const selection = teamModelProfileSchema.parse(input);
   let providerArgs = profile.args;
   if (/(^|\/)sudo$/.test(profile.command)) {
-    const sudoBoundary = profile.args.indexOf("--");
-    const invalidWrapper = () => new Error("Mixed-model sudo profiles require an explicit -- executable boundary, with only -n, -H, -u USER, or -g GROUP before it.");
-    if (sudoBoundary < 0) throw invalidWrapper();
-    // Recognize the supported wrapper instead of mistaking a provider's -- for sudo's.
-    for (let index = 0; index < sudoBoundary; index++) {
-      const arg = profile.args[index];
-      if (["-n", "-H", "--non-interactive", "--set-home"].includes(arg)) continue;
-      if (["-u", "-g", "--user", "--group"].includes(arg)) {
-        const value = profile.args[++index];
-        if (index < sudoBoundary && value && !value.startsWith("-")) continue;
-      }
-      throw invalidWrapper();
+    const shape = sudoShape(profile.args);
+    if (!shape.ok) {
+      throw shape.problem === "wrapper"
+        ? new Error("Mixed-model sudo profiles require an explicit -- executable boundary, with only -n, -H, -u USER, or -g GROUP before it.")
+        : new Error("The sudo provider profile must name an executable after --.");
     }
-    const executable = profile.args[sudoBoundary + 1];
-    if (!executable || executable.startsWith("-")) throw new Error("The sudo provider profile must name an executable after --.");
-    providerArgs = profile.args.slice(sudoBoundary + 2);
+    providerArgs = shape.providerArgs;
   }
   const conflict = providerArgs.some((arg, index, args) => {
     if (arg === "--" || /^--(?:model|effort|fallback-model)(?:=|$)/.test(arg)) return true;

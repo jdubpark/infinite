@@ -250,6 +250,24 @@ every subtask finished. It does not establish product impact or acceptance. Each
 subteam delivers only under its repository's own delivery policy; the mission
 does not push, merge, or deploy.
 
+### Working-time limit
+
+Every mission has a deadline `maxMinutes` after it is created. The default is 240
+minutes; an intake mission takes `intake.mission.maxMinutes`. When it passes, the
+coordinator and active subteams stop like a team deadline.
+
+An intake mission stops its working-time clock while it is `needs-input` or
+`paused`, and the deadline moves forward by the time it was stopped. Waiting for
+an owner answer does not use up the limit. Other missions keep a fixed deadline.
+
+### Origin
+
+A mission started by intake records `origin`: `kind: "intake"`, the Linear issue
+ID, its identifier and URL, and the rule that admitted it (the label, the owner
+creator, and the owner's Slack mention when a thread is required). Missions the
+owner creates through `POST /api/missions` have no origin. The origin is recorded
+at creation and does not change. See [intake](intake.md).
+
 ## Board
 
 `GET /api/board` returns `Board`: every mission, plus team runs and goals that

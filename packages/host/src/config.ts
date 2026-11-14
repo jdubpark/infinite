@@ -177,8 +177,10 @@ export function validateIntakeConfig(config: Config): void {
   // Without a Slack block no thread is read or bound, so mirroring would leave the outcome nowhere.
   if (intake.linear.commentsMirrorToSlack && !intake.slack) throw new Error("commentsMirrorToSlack needs intake.slack");
   const slack = intake.slack;
+  // Without admission and without direct requests nothing could ever start a mission.
+  if (intake.linear.admitIssues === false && !slack?.directRequests) throw new Error("admitIssues false needs intake.slack.directRequests");
   if (slack) {
-    if (intake.requireSlackThread && !slack.linearAgentUserId) throw new Error("requireSlackThread needs intake.slack.linearAgentUserId");
+    if (intake.requireSlackThread && intake.linear.admitIssues !== false && !slack.linearAgentUserId) throw new Error("requireSlackThread needs intake.slack.linearAgentUserId");
     if (slack.bindByMention && intake.requireSlackThread) throw new Error("bindByMention cannot be used with requireSlackThread");
     const tokenMessage = "Slack token must be a nonempty private 0600 file outside runtime state and project workspaces";
     for (const file of [slack.appTokenFile, slack.botTokenFile]) {

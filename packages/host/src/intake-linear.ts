@@ -16,6 +16,10 @@ const issueNode = z.object({
   labels: z.object({ nodes: z.array(z.object({ name: z.string().max(200) })).max(250) }),
 });
 const comment = z.object({ id: z.uuid(), body: z.string().max(64000), issue: z.object({ id: z.uuid() }) });
+/** The intake label is not in Linear. Its message is fixed text, safe to show. */
+export class MissingLabelError extends Error {
+  constructor() { super("The intake label does not exist in Linear."); this.name = "MissingLabelError"; }
+}
 const candidatePage = 200, candidatePages = 10;
 
 /**
@@ -114,6 +118,32 @@ export class IntakeLinear {
       }
     }
     return result;
+  }
+
+  /**
+   * Files an issue under the client-supplied ID with the named label, which is the team's own label or else a workspace
+   * label. A missing label is an error with a fixed text. A create that fails or is not confirmed is checked by reading the
+   * ID back, so a lost response that still committed resolves and a retry never files a second issue.
+   */
+  async createIssue(input: { id: string; teamId: string; title: string; description: string; label: string }): Promise<IntakeIssue> {
+    const labelData = await this.linear.request("InfiniteIntakeLabel",
+      "query InfiniteIntakeLabel($filter: IssueLabelFilter!, $first: Int!) { issueLabels(filter: $filter, first: $first) { nodes { id team { id } } } }",
+      { filter: { name: { eqIgnoreCase: input.label } }, first: 50 });
+    const labels = z.object({ issueLabels: z.object({ nodes: z.array(z.object({ id: z.uuid(), team: z.object({ id: z.uuid() }).nullable().optional() })).max(50) }) }).parse(labelData).issueLabels.nodes;
+    const label = labels.find(item => item.team?.id === input.teamId) ?? labels.find(item => !item.team);
+    if (!label) throw new MissingLabelError();
+    let failure: unknown;
+    try {
+      const data = await this.linear.request("InfiniteIntakeIssueCreate",
+        `mutation InfiniteIntakeIssueCreate($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { ${issueFields} } } }`,
+        { input: { id: input.id, teamId: input.teamId, title: input.title, description: input.description, labelIds: [label.id] } });
+      const issue = issueFacts(z.object({ issueCreate: z.object({ success: z.literal(true), issue: z.unknown() }) }).parse(data).issueCreate.issue);
+      if (issue.id === input.id) return issue;
+      failure = new Error("Linear did not confirm the issue.");
+    } catch (error) { failure = error; }
+    const found = (await this.states([input.id])).get(input.id);
+    if (found && found !== "deleted") return found;
+    throw failure;
   }
 
   /**

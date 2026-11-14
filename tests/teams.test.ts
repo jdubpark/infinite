@@ -7,6 +7,7 @@ import { createInterface } from "node:readline";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { tmpdir } from "node:os";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createRemoteClient, type RemoteClient } from "@infinite/remote";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
@@ -43,6 +44,35 @@ test("team session creation refuses native continuation for other providers or r
     error instanceof Error && error.message.includes("only supported for Claude Code") && (error as Error & { status?: number }).status === 400);
   assert.throws(() => manager.createTeamSession({ ...request, provider: "claude" }, { ...assignment, role: "implementer" }, "workspace"), error =>
     error instanceof Error && error.message.includes("only supported for permission or mission coordinators") && (error as Error & { status?: number }).status === 400);
+});
+
+test("team session creation checks its header fields", async () => {
+  const manager = Object.create(Manager.prototype) as Manager;
+  const root = mkdtempSync(join(tmpdir(), "infinite-header-"));
+  try {
+    const cwd = join(root, "member");
+    mkdirSync(cwd);
+    Object.defineProperty(manager, "config", { value: { teams: { workspaceDir: root } } });
+    Object.defineProperty(manager, "serial", { value: Promise.resolve(), writable: true });
+    const seen: unknown[] = [];
+    Object.defineProperty(manager, "createOnce", { value: async (request: unknown) => { seen.push(request); return request; } });
+    const request = { requestId: randomUUID(), provider: "claude" as const, projectId: "project", title: "Member", prompt: "Work" };
+    const assignment = { runId: randomUUID(), memberId: randomUUID(), revision: 1, role: "implementer" as const };
+    const header = await manager.createTeamSession(request, assignment, cwd, undefined, root, false, { purpose: "gate", configId: "a".repeat(64) }) as unknown as Record<string, unknown>;
+    assert.equal(header.purpose, "gate");
+    assert.equal(header.configId, "a".repeat(64));
+    const plain = await manager.createTeamSession(request, assignment, cwd, undefined, root, false, {}) as unknown as Record<string, unknown>;
+    assert.equal("purpose" in plain, false);
+    assert.equal("configId" in plain, false);
+    assert.equal("purpose" in (seen[1] as object), false);
+    const refused = (error: unknown) =>
+      error instanceof Error && (error as Error & { status?: number }).status === 400;
+    assert.throws(() => manager.createTeamSession(request, assignment, cwd, undefined, root, false, { purpose: "learning" as never }), refused);
+    assert.throws(() => manager.createTeamSession(request, assignment, cwd, undefined, root, false, { configId: "abc" }), refused);
+    assert.throws(() => manager.createTeamSession(request, assignment, cwd, undefined, root, false, { configId: "A".repeat(64) }), refused);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 function permissionWorkspaceEvidenceHash(prompt: Prompt, cwd: string, changedPaths: string[]) {

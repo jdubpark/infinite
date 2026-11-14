@@ -236,7 +236,7 @@ export function createApp(config: Config, key: Buffer) {
     now: () => new Date().toISOString(),
   });
   backfillOutcomes();
-  const usage = new UsageService(config, key, manager);
+  const usage = new UsageService(config, key, manager, evidence);
   const balances = new BalanceService(config.usage?.accounts ?? {});
   usage.useBalances(balances);
   // TeamService ticks on every host and drives the ledger from its own session listing.
@@ -677,6 +677,13 @@ export function createApp(config: Config, key: Buffer) {
       },
     }),
   );
+  // The ledger observes: while it is unavailable every usage route answers 503 and nothing else changes.
+  const usageUnavailable = { error: "The usage ledger is unavailable" };
+  const ledgerUnavailable = (error: unknown) => error instanceof EvidenceError && error.code === "unavailable";
+  // A route that changes something reads the ledger first, so an unreadable ledger answers 503 before the change.
+  // The error handler below maps `unavailable` for every usage route.
+  const requireLedger = () => { if (!usage.readable()) throw new EvidenceError("unavailable", "The usage ledger is unavailable."); };
+  app.use("/api/usage", (_req, res, next) => usage.available() ? next() : void res.status(503).json(usageUnavailable));
   app.get("/api/usage", (_req, res) => res.json(usage.summary()));
   app.get("/api/evidence/status", (_req, res) => res.json(evidence.describe()));
   app.get("/api/fuse", (_req, res) => res.json(fuse.view()));
@@ -696,8 +703,10 @@ export function createApp(config: Config, key: Buffer) {
     return void res.json({ result, view: fuse.view() });
   });
   // The cost of a session as the usage service measured it. A session it did not measure has no cost, and no scorecard or cell counts it as zero.
+  // A session that the usage ledger could not read is not "no measurement": the read fails, and the route answers 503.
   const sessionCost: CostLookup = sessionId => {
     const found = usage.session(sessionId);
+    if (!found.measured && found.unavailable) throw new EvidenceError("unavailable", "The usage ledger is unavailable.");
     return found.measured ? { usd: found.cost, tokens: found.tokens.input + found.tokens.output + found.tokens.reasoning + found.tokens.cacheRead + found.tokens.cacheWrite, complete: found.pricing.unknown === 0 } : undefined;
   };
   // The configured lineup's label, then the newest held run whose member names the profile. Otherwise the scorecard shows the profile ID.
@@ -746,10 +755,13 @@ export function createApp(config: Config, key: Buffer) {
     if (account.kind !== "subscription") return void res.status(400).json({ error: "Only subscription plans can be updated" });
     const body = usagePlanSchema.safeParse(req.body);
     if (!body.success) return void res.status(400).json({ error: "Invalid usage plan" });
+    requireLedger();
     usage.setPlan(accountId, body.data.planUsd);
     return void res.json({ accounts: usage.summary().accounts });
   });
-  app.post("/api/usage/balances/refresh", requireRole(["owner"]), async (_req, res) => { await balances.refresh(true); return res.json({ accounts: usage.summary().accounts }); });
+  app.post("/api/usage/balances/refresh", requireRole(["owner"]), async (_req, res) => { requireLedger(); await balances.refresh(true); return res.json({ accounts: usage.summary().accounts }); });
+  // Maps a ledger read that found the store unavailable to the usage 503 answer, whichever route made it.
+  app.use("/api/usage", (error: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => ledgerUnavailable(error) ? void res.status(503).json(usageUnavailable) : next(error));
   // Display cells over production rows, or over the sources named. Every paired device may read them, as it may read usage models.
   const outcomeCellsQuery = z.object({
     project: z.string().regex(/^[a-z0-9-]{1,80}$/).optional(),

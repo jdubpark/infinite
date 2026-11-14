@@ -41,7 +41,14 @@ export interface ExecutionState {
   reason?: string;
   reconciliation?: "available";
 }
+/** Why a team session exists. Only the host sets it, through createTeamSession. */
+export type SessionPurpose = "work" | "duel" | "replay" | "gate";
+export const SESSION_PURPOSES: readonly SessionPurpose[] = ["work", "duel", "replay", "gate"];
 export interface Session {
+  /** Host-owned (contract C8). Set only through createTeamSession, and never changed. */
+  purpose?: SessionPurpose;
+  /** Host-owned (contract C7). A lowercase SHA-256 hex digest. */
+  configId?: string;
   handoff?: { policy?: import("./handoff-types.js").HandoffPolicy; reason?: string };
   id: string;
   managedBy?: { kind: "mission"; missionId: string; teamId?: string };

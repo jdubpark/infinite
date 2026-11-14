@@ -871,3 +871,344 @@ Tasks 1 and 2 touch separate files and can run in parallel. Task 3 runs last.
 - Confirming whether Claude Code runs `SessionEnd` on `SIGTERM`.
 - Codex usage capture. Codex hooks stay off (Task 4), so a Codex session keeps coverage `none` with `hooks-off` until capture has a route that needs no bypass flag.
 - Codex child threads, native Codex sessions, and OpenCode.
+
+---
+
+# Phase 3: the usage ledger in the evidence store
+
+Spec part 4, the ledger side of part 3, the roll-up and header items of part 7, and delivery item 3. The usage ledger moves from `usage.sealed` into a `usage` module of the evidence store, which closes INF-40. The fold reads the `usage` and `usage-coverage` records that phase 2 journals, so Claude Code, Codex, and rehearsal sessions show tokens and coverage in every roll-up, and a member's total covers all of its sessions. What stays the same: every existing response field keeps its name, type, and meaning; OpenCode figures and the plan-override file do not change; capture in the worker does not change. Claude Code and Codex records stay unpriced until phase 4.
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `packages/host/src/types.ts` (modify) | `SessionPurpose`, and `purpose` and `configId` on `Session` |
+| `packages/host/src/manager.ts` (modify) | `createTeamSession` checks and stores the two header fields |
+| `packages/host/src/evidence/crypto.ts` (modify) | Index classes `model` and `usage-record` |
+| `packages/host/src/usage-store.ts` (create) | The `usage` module: tables, record checks, keys, the merge rule, the import, row reads |
+| `packages/host/src/usage-service.ts` (modify) | The ledger on the store: import, fold, coverage, roll-ups, `member()` |
+| `packages/host/src/usage-api.ts` (modify) | The added fields of task and project usage |
+| `packages/host/src/team-usage.ts` (modify) | `teamUsage` reads members, and rollups count partial members |
+| `packages/host/src/teams.ts` (modify) | Task usage in the team view carries coverage |
+| `packages/host/src/server.ts` (modify) | Passes the store to the ledger, and answers 503 while the ledger is unavailable |
+| `packages/host/src/client.ts` (modify) | `usageLines` prints tokens for a provider without Spent |
+| `docs/teams.md` (modify) | The two paragraphs that call Claude and Codex unmeasured |
+| `tests/usage-store.test.ts`, `tests/usage-ledger.test.ts` (create) | Store and service tests that start no host |
+| `tests/usage-service.test.ts`, `tests/usage-routes.test.ts`, `tests/team-usage.test.ts`, `tests/usage-lines.test.ts`, `tests/chat.test.ts`, `tests/teams.test.ts` (modify) | Changed and added cases |
+
+## Review Focus
+
+1. **One request seen twice.** A Claude or Codex record from a second session, a transcript read again from byte 0, a smaller copy after a larger one, or an import after a tick. Expect one row: the larger whole record, owned by the first session.
+2. **A store that fails.** A write that throws on page 2 of 3, a store that cannot open, or one closed during a run. Expect rows and cursor to roll back together, no throw into the team loop, 503 from the usage routes, and an exact resume from the stored cursors.
+3. **Sessions from before the upgrade.** The sealed ledger marked Claude sessions exited without reading their journals, and phase 2 workers already journaled their usage. Expect those sessions read again from cursor 0, and measured OpenCode sessions kept at their cursors.
+4. **Text where an id or a number belongs.** A record with message content, a path, a native id, or a model name over 200 characters; a header with a project or task name. Expect no plain column and no database byte to hold them, and a refused record to make its session `partial`.
+5. **Coverage edges.** Usage records that follow the exit record, an exited session with no coverage record, a running session with records, a refused record under `complete`, and a member whose sessions disagree. Expect the coverage table of Task 4.
+
+Each has a test in the task that owns the code.
+
+## When the store is unavailable
+
+The ledger observes. Capture continues in the session journals, and the fold resumes from the stored cursors when the store returns. Every `/api/usage` route answers 503 with `{ "error": "The usage ledger is unavailable" }`. The session listing carries no `usage` key. A team view's rollup carries `unavailable: true` and counts its members as unmeasured. No run, session, or host start waits on the store. A briefing recorded while it is unavailable is lost with one warning.
+
+### Task 1: the session header fields
+
+**Files:** modify `types.ts` and `manager.ts`. Test in `tests/teams.test.ts`, beside `team session creation refuses native continuation for other providers or roles`.
+
+**Interfaces (produces):**
+
+```ts
+// types.ts
+export type SessionPurpose = "work" | "duel" | "replay" | "gate";
+export interface Session {
+  /** Host-owned (contract C8). Set only through createTeamSession, and never changed. */
+  purpose?: SessionPurpose;
+  /** Host-owned (contract C7). A lowercase SHA-256 hex digest. */
+  configId?: string;
+}
+// manager.ts
+createTeamSession(request: CreateSession, team: TeamAssignment, cwd: string, modelProfile?: TeamModelProfile,
+  workspaceRoot?: string, workspaceTrusted = false, header: { purpose?: SessionPurpose; configId?: string } = {}): Promise<Session & WorkerState>;
+```
+
+**Decisions:**
+
+- A purpose outside the four values, or a `configId` that does not match `/^[0-9a-f]{64}$/`, throws `ContentError` with status 400, next to the continuation checks.
+- The fields join the `createOnce` request only when present. A request without them keeps its fingerprint, so a member replayed after the upgrade still matches its session. `createOnce` copies them onto the session next to `team`.
+- No caller passes them in this phase. *(My call: the launchers that set `duel`, `replay`, and `gate`, and the outcome ledger that computes `configId`, come later. The ledger records `work` for a member session without a purpose.)*
+- Neither field enters `TeamAssignment`. *(My call: the assignment is written into the member's context file, and a member that can read its purpose can tell a trial from real work. C9.)*
+
+| Test name | Assertions |
+|---|---|
+| `team session creation checks its header fields` | With `Object.create(Manager.prototype)`, `config.teams.workspaceDir` set to a temporary folder, a `cwd` inside it, a resolved `serial`, and a `createOnce` stub that returns its request: `{ purpose: "gate", configId: "a".repeat(64) }` reaches the request. An empty header leaves neither key in it. `purpose: "learning"`, `configId: "abc"`, and `"A".repeat(64)` each throw with status 400. |
+
+- [ ] **Step 1: Write the failing test.**
+- [ ] **Step 2: Run `node --import tsx --test --test-name-pattern "team session creation" tests/teams.test.ts` and confirm it fails.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run the same command and `npm run typecheck -w @infinite/host`.** Hand to the coordinator.
+
+### Task 2: the usage module
+
+**Files:** create `usage-store.ts` and `tests/usage-store.test.ts`. Modify `evidence/crypto.ts`.
+
+**Interfaces (consumes):** Task 1; `EvidenceModule`, `EvidenceTx`, `EvidenceDb`; `UsageRecord`; `UsageCoverage`, `UsageCoverageReason`, and `usageRecordKey` from `transcript-usage.ts`.
+
+**Interfaces (produces):**
+
+```ts
+// evidence/crypto.ts
+export type EvidenceIndexClass = "project" | "task" | "area" | "model" | "usage-record";
+
+// usage-store.ts
+export const SESSION_PURPOSES: readonly SessionPurpose[];
+export type LedgerCoverageReason = UsageCoverageReason | "running"; export interface LedgerCoverage { coverage: UsageCoverage; reason?: LedgerCoverageReason }
+export interface LedgerHeader { sessionId: string; provider: Provider; projectId: string; createdAt: string; lastActiveAt?: string;
+  team?: TeamAssignment; profileId?: string; purpose?: SessionPurpose; configId?: string }
+export interface LedgerState extends LedgerCoverage { cursor: number; seen: number; refused: number; exited: boolean;
+  /** The worker's usage-coverage record, once the fold has read it. */ journaled?: LedgerCoverage & { finalDrain?: "complete" | "incomplete" | "skipped" } }
+export interface StoredSession extends LedgerState { sessionId: string; provider: Provider; projectId: string; createdAt: string;
+  lastActiveAt?: string; runId?: string; memberId?: string; revision?: number; role?: string; taskKey?: string;
+  profileId?: string; purpose?: SessionPurpose; configId?: string }
+/** The `Ledger` and `LedgerSession` types of usage-service.ts, moved here under these names. */
+export type SealedLedger; export type SealedSession;
+export const usageModule: EvidenceModule;
+/** A copy with only UsageRecord keys, or undefined when a field is missing or invalid. */
+export function ledgerRecord(value: unknown): UsageRecord | undefined;
+export function ledgerKey(record: UsageRecord, sessionId: string): string;
+/** False, with nothing written, when an id or a time is invalid. */
+export function writeSession(tx: EvidenceTx, header: LedgerHeader, state: LedgerState): boolean;
+/** The session row must exist. */
+export function writeRecord(tx: EvidenceTx, sessionId: string, record: UsageRecord): "inserted" | "replaced" | "kept";
+export function writeBriefing(tx: EvidenceTx, key: string, projectId: string, at: string, record?: UsageRecord): void;
+export function readSessions(db: EvidenceDb): StoredSession[];
+/** `from` is inclusive and `to` exclusive. */
+export function readRecords(db: EvidenceDb, filter?: { sessionIds?: string[]; from?: string; to?: string }): { sessionId: string; record: UsageRecord }[];
+export function readBriefings(db: EvidenceDb): { projectId: string; at: string; record?: UsageRecord }[];
+export function importState(db: EvidenceDb): "pending" | "done";
+export function importLedger(tx: EvidenceTx, ledger: SealedLedger | undefined, outcome: "imported" | "absent" | "unreadable"):
+  { sessions: number; records: number; briefings: number; refused: number };
+```
+
+**Schema** (migration from 0 to 1):
+
+```sql
+CREATE TABLE usage_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE usage_projects (project_ref TEXT PRIMARY KEY, encrypted_project TEXT NOT NULL);
+CREATE TABLE usage_models (model_ref INTEGER PRIMARY KEY, model_key TEXT NOT NULL UNIQUE, encrypted_model TEXT NOT NULL);
+CREATE TABLE usage_sessions (
+  session_id TEXT PRIMARY KEY, provider TEXT NOT NULL,
+  project_ref TEXT NOT NULL REFERENCES usage_projects(project_ref),
+  created_at TEXT NOT NULL, last_active_at TEXT,
+  coverage TEXT NOT NULL, coverage_reason TEXT, journaled_coverage TEXT, journaled_reason TEXT, final_drain TEXT,
+  run_id TEXT, member_id TEXT, revision INTEGER, role TEXT, task_key TEXT,
+  profile_id TEXT, purpose TEXT, config_id TEXT,
+  journal_cursor INTEGER NOT NULL DEFAULT 0, records_seen INTEGER NOT NULL DEFAULT 0,
+  records_refused INTEGER NOT NULL DEFAULT 0, exited INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE usage_records (
+  record_key TEXT PRIMARY KEY, provider TEXT NOT NULL,
+  session_id TEXT NOT NULL REFERENCES usage_sessions(session_id),
+  completed_at TEXT NOT NULL, model_ref INTEGER NOT NULL REFERENCES usage_models(model_ref), model_source TEXT NOT NULL,
+  input INTEGER NOT NULL, output INTEGER NOT NULL, reasoning INTEGER NOT NULL,
+  cache_read INTEGER NOT NULL, cache_write INTEGER NOT NULL, cache_write_1h INTEGER NOT NULL DEFAULT 0,
+  reported_cost REAL NOT NULL DEFAULT 0, secondary INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE usage_briefings (
+  briefing_key TEXT PRIMARY KEY, project_ref TEXT NOT NULL REFERENCES usage_projects(project_ref), at TEXT NOT NULL,
+  model_ref INTEGER REFERENCES usage_models(model_ref), model_source TEXT,
+  input INTEGER, output INTEGER, reasoning INTEGER, cache_read INTEGER, cache_write INTEGER, reported_cost REAL
+);
+CREATE INDEX usage_records_by_session ON usage_records (session_id);
+CREATE INDEX usage_records_by_time ON usage_records (completed_at);
+CREATE INDEX usage_sessions_by_member ON usage_sessions (run_id, member_id);
+CREATE INDEX usage_sessions_by_project ON usage_sessions (project_ref);
+```
+
+**Decisions:**
+
+- The module is `usage`, version 1, read version 1. `counts` returns `{ sessions, records, briefings }`. It has no `deleteRun` and no `runIds`: usage rows outlive their run and are kept without a limit (owner decision, 2026-11-13).
+- **Plain columns** hold only opaque ids, enumerations, numbers, and times. `session_id`, `run_id`, and `member_id` must match `/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/`, the store's `OPAQUE_ID`. `profile_id` is a configured id (C1). `config_id` is stored only when it matches `/^[0-9a-f]{64}$/`, else null. Every time is stored as `new Date(value).toISOString()`, and a time that does not parse refuses its header or record. A reason column holds a token matching `/^[a-z][a-z0-9-]{0,39}$/`.
+- **Sealed values.** The project id is sealed in `usage_projects` under `project_ref = index("project", projectId)`. `{ providerId, modelId }` is sealed in `usage_models` under `model_key = index("model", providerId + "\u0000" + modelId)`, and rows hold the integer `model_ref`. `task_key = index("task", taskId)`. Record and briefing keys exist only as `index("usage-record", key)`. Each `seal` and `open` uses the table name and that row's key column. *(My call: the design keeps `model_id` plain and C1 calls a model id an enumeration, but the brief puts model names behind a seal, and here a model, a message id, and a native id come from a transcript the agent's account can write. The dictionary decrypts each name once per read, not once per row.)*
+- **Stored keys.** A record keeps `provider`, `providerId`, `modelId`, `modelSource`, `completedAt`, the five token classes, `cacheWrite1h`, `reportedCost`, and `secondary`. `messageId`, `partId`, and `nativeId` survive only inside the keyed hash. A read record has `messageId: ""` and `partId: ""`, `cacheWrite1h` only when above 0, and `secondary` only when true. *(My call: no reader needs them. The design's `native_id` and `provider_version` columns wait for the capture endpoint.)*
+- `reported_cost` is `REAL`. *(My call: a micro-dollar integer rounds a reported cost, and the bodies before and after import would differ in the sixth decimal.)*
+- **Checks** (`ledgerRecord`). `provider` is `opencode`, `claude`, or `codex`. `providerId` and `modelId` have 1 to 200 characters, `messageId` 1 to 512, `partId` 0 to 512. `modelSource` is one of its three values. `completedAt` parses. Each token class is a non-negative safe integer. `cacheWrite1h` is absent or an integer from 0 to `cacheWrite`. `reportedCost` is finite and at least 0. `secondary` is absent or `true`.
+- **Keys.** `ledgerKey` is `usageRecordKey(record)` for `claude` and `codex`, which is global across sessions, and `opencode:${sessionId}/${messageId}/${partId}` for OpenCode, the sealed ledger's key. *(My call: the design's three-column key becomes one keyed hash of the same parts, so no message id sits in a plain column.)*
+- **Merge** (`writeRecord`). A new key inserts with the given session. For `claude` and `codex`, a stored row is replaced only by a larger record, compared by token total over the five classes, then `reasoning`, then `cacheWrite1h`. The replacement writes every column of the new record and keeps the stored `session_id`. Equal or smaller changes nothing. For `opencode` the last copy replaces the row, as today. *(My call: the brief keeps OpenCode behaviour unchanged.)*
+- **Purpose.** Stored as the header's purpose, as `work` when the header has a `team` and no purpose, and as null without a `team`. *(My call: a mission coordinator has a team assignment, so it counts as a member.)*
+- `writeBriefing` keys its row by `index("usage-record", "briefing:" + key)`. The model and token columns are set only with a record. The last write for a key wins.
+- **Import**, in the caller's one transaction. A `measured` session imports as `complete` with its cursor and `exited` flag. Any other session imports as `none` with `unsupported`, cursor 0, and `exited` false. *(My call: the sealed ledger marked unmeasured sessions exited without reading them, so a Claude session that ran under a phase 2 worker would never show its usage.)* A row's session is the text before the first `/` of its sealed key. A row whose session was not imported, a row that `ledgerRecord` refuses, and a briefing whose record it refuses are skipped and counted in `refused`. Sessions are written before records, because `foreign_keys` is on. The call writes `usage_meta('sealed-import', outcome)` last. The import runs once: when that row exists, `importLedger` writes nothing and returns zero counts, so a later call cannot rewind a cursor or a record that the fold wrote since. `importState` is `done` once that row exists.
+
+| Test name | Assertions |
+|---|---|
+| `the usage module creates its tables once` | On a new store, `status().modules.usage` is `ready`, and `sqlite_master` lists exactly the six `usage_` tables. A second store on the same file registers it as `ready`. `describe().counts` holds `usage.sessions`, `usage.records`, and `usage.briefings`. |
+| `a Claude or Codex key belongs to its first session` | One Claude record written for session A and then B: one row with `session_id` A, results `inserted` then `kept`. The same for a Codex record. |
+| `the larger whole record wins` | From a Claude record with total 100: total 90 is `kept`; total 100 with more reasoning is `replaced`; then equal reasoning with a larger `cacheWrite1h` is `replaced`; an equal record is `kept`. After each replacement every class equals the new record's, and `session_id` stays A. |
+| `an OpenCode key is scoped to its session and its last copy wins` | One message and part in sessions A and B: two rows. A smaller copy for A is `replaced`. |
+| `a stored record keeps only usage fields` | A record that also has `nativeId: "native-marker"`, `messageId: "msg-marker"`, `modelId: "model-marker"`, `text: "private-marker"`, and `cwd: "/home/dev/projects/infinite"`, in a session of project `project-marker` with task `task-marker`. The read record's keys are exactly `provider, providerId, modelId, messageId, partId, modelSource, completedAt, tokens, reportedCost`. `SELECT *` of its row gives exactly the 14 columns. Neither the database file nor its `-wal` file contains a marker or the path. |
+| `a journal record is checked before it is stored` | `ledgerRecord` is undefined for: no `provider`, provider `grok`, an empty `modelId`, a 201-character `modelId`, `input` of `-1`, `1.5`, or `"7"`, no `cacheWrite`, `cacheWrite1h` above `cacheWrite`, `reportedCost` of `NaN` or `-0.1`, `completedAt: "not a time"`, and `secondary: false`. A valid record with an extra key returns a copy without it, and `2026-01-01T00:00:00Z` becomes `2026-01-01T00:00:00.000Z`. |
+| `session rows hold opaque columns` | `project_ref` and `task_key` are 64 hex characters. `readSessions` returns the project id and `taskKey === db.index("task", "task-marker")`. A team header without a purpose stores `work`; a header without a team stores none. A session id `bad id` or an unparseable `createdAt` returns false and writes nothing. A `configId` of `abc` is stored as null. |
+| `the import maps the sealed ledger` | A ledger with a measured exited OpenCode session at cursor 7, an unmeasured exited Claude session, three valid rows, a row of a missing session, a row with a string token, and two briefings, one without a record. The result is `{ sessions: 2, records: 3, briefings: 2, refused: 2 }`. OpenCode: `complete`, cursor 7, exited. Claude: `none`, `unsupported`, cursor 0, not exited. `importState` is `done`. A second call leaves every table equal. |
+| `records are read by session and time` | `readRecords` by `sessionIds`, by `from`, and by `to` returns the expected rows, with `from` inclusive and `to` exclusive. `index("model", v)` differs from `index("usage-record", v)`. |
+
+- [ ] **Step 1: Write the failing tests.** Build the store as `tests/evidence-store.test.ts` does, register `usageModule`, and read raw rows with `store.read(db => db.all(...))`.
+- [ ] **Step 2: Run `node --import tsx --test tests/usage-store.test.ts` and confirm it fails** with a missing module.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run it, `node --import tsx --test tests/evidence-store.test.ts`, and `npm run typecheck -w @infinite/host`.** Hand to the coordinator.
+
+### Task 3: the ledger on the store
+
+A storage swap with today's rules. Only OpenCode sessions in a measured launch mode are read.
+
+**Files:** modify `usage-service.ts`, `server.ts`, `tests/usage-service.test.ts`, `tests/usage-routes.test.ts`. Create `tests/usage-ledger.test.ts`.
+
+**Interfaces:** consumes Task 2. Produces `constructor(config: Config, key: Buffer, manager: Manager, store: EvidenceStore)` and `available(): boolean`, true when the module is ready and the import is done. Every other public signature stays.
+
+**Decisions:**
+
+- The constructor registers `usageModule`. When `importState` is `pending`, it reads `usage.sealed` with today's checks and calls `importLedger` in one `store.write`: `imported`, `absent` when there is no file, or `unreadable` with today's warning. A throw from that write logs one fixed warning and leaves the ledger unavailable until the next start, which tries again, so no tick writes before the import.
+- Afterwards the service never reads, writes, or deletes `usage.sealed`. It stays unread for one release. `usage-plans.sealed` is unchanged.
+- **Fold.** In this task an OpenCode session in a measured launch mode is `complete`, and every other session is `none` with `unsupported`. `tick` reads the stored sessions once and skips exited ones. Each journal page is one `store.write` holding the session row with its new cursor and every record of the page. A session with no new events is written only when its row changed.
+- A tick reads at most 20 pages over all sessions. A session not read to its end stays unexited and continues next tick. *(My call: Task 4 reads every Claude session from before the upgrade from cursor 0, and the tick blocks the team loop while it reads. 20 pages is about 10 MB of journal.)*
+- A write that throws ends the tick with one warning. Nothing of that page is stored, and the next tick reads it again from the stored cursor. An unreadable journal keeps today's warn-once rule and does not stop other sessions. A record that `ledgerRecord` refuses is skipped and counted in `records_refused`.
+- `recordBriefing` uses `writeBriefing`. When the store is unavailable or the write fails, the briefing is lost with one warning.
+- **Reads.** Each method takes its rows from `readSessions`, `readRecords` (filtered by session or time where it has one), and `readBriefings` inside one `store.read`, then keeps today's arithmetic: `priceUsage` per record, the same rounding, the same grouping. A session is measured when its coverage is not `none`. No records are kept between calls (INF-40).
+- **Unavailable.** `tick` returns at once. `session` returns `{ measured: false, unavailable: true }`. `taskUsage` returns undefined and `sessions` zero totals. `summary`, `daily`, `projects`, and `project` throw `EvidenceError` with code `unavailable`. A throw inside `store.read` counts the same.
+- **Routes.** `server.ts` passes its `EvidenceStore`. One handler before the usage routes gives every `/api/usage` request the 503 answer while `available()` is false, before anything changes. A route that catches `EvidenceError` code `unavailable` gives the same answer.
+
+Tests in `tests/usage-ledger.test.ts` use a helper that builds a store in a temporary folder, and `subset(actual, expected)`, which checks every key of `expected` recursively, with arrays of equal length, so later tasks can add fields.
+
+**Fixture ledger.** `now` is `2026-10-21T12:00:00.000Z`. Prices `deepseek/deepseek-flash` `{ input: 1, output: 2 }`. Accounts `deepseek` (metered, `deepseek/*`) and `claude` (subscription, `claude/*`, `planUsd: 200`). Budget `opencode` `{ usd: 10, period: "week" }`. Session `member-a`: OpenCode, measured, exited, project `demo`, team `run-1`, `member-a`, `task-1`, revision 1, `implementer`, profile `ds`, with four rows: a configured-price row on 2026-10-21, `deepseek-v4-pro` at 02:30 UTC on 2026-10-20 (a catalog peak), `unlisted` with `reportedCost: 0.0012345678`, and one with `modelSource: "unknown"`. Session `local`: OpenCode, measured, exited, `demo`, one row on 2026-09-30T23:00Z. Session `claude-a`: Claude, unmeasured, exited, `demo`, active this month. Session `claude-b`: Claude, unmeasured, project `other`, last active in September. Briefings: one with a `deepseek-flash` record on 2026-10-21 for `demo`, one without a record for `other`.
+
+| Test name | Assertions |
+|---|---|
+| `the store gives the bodies of the sealed ledger it imports` | `summary(now)`, `daily({ days: 3, tz: "Asia/Seoul", now })`, `projects({ now })`, `project("demo", { now })`, `project("other", { now })`, `taskUsage("run-1", "task-1", 1)`, `session("member-a")`, and `session("claude-a")` are `subset`-equal to literals printed by the current code. |
+| `the sealed ledger is imported once and never written again` | After the constructor, a tick that adds a session, and `recordBriefing`, the file's bytes equal the fixture's. A second service on the same database, after the file is replaced by another ledger, returns the first bodies. |
+| `a page and its cursor commit together` | A journal of three pages, and a store wrapper whose `write` throws for page 2 once. After tick 1 the stored rows are page 1's, and `journal_cursor` is page 1's cursor. Tick 2 asks for events after that cursor, and `messages` equals the three pages' records. |
+| `a tick reads at most 20 pages` | An exited session with 25 pages. Tick 1 asks for 20 pages and leaves it unexited. Tick 2 asks for 5 and marks it exited. |
+| `an unavailable store never throws` | A store whose path lies under a regular file. `available()` is false, `tick()` resolves, `session("x")` is `{ measured: false, unavailable: true }`, `summary()` throws code `unavailable`, and `recordBriefing` returns with one warning. |
+| `a new service resumes from the stored cursors` | After one tick, `store.close()`, and the next tick resolves. A new store and service on the same file ask for events after the stored cursor, and no total doubles. |
+
+Changes to existing tests: the unit tests of `tests/usage-service.test.ts` build the service with a store, and the loop in `an unreadable or misshapen ledger is discarded with a warning and the service starts empty` uses a new folder per case. `one unreadable journal does not hide another measured session's usage` rebuilds by deleting `evidence/evidence.sqlite3` with its `-wal` and `-shm` files instead of `usage.sealed`. `a host with an unusable evidence location still serves and reports the store unavailable` expects the 503 answer from `/usage` and 200 from `/sessions`.
+
+- [ ] **Step 1: Write the fixture test and run it against the current code** with `node --import tsx --test tests/usage-ledger.test.ts`. It must pass. tsx does not type-check, so the fourth argument is ignored.
+- [ ] **Step 2: Write the other tests and confirm they fail.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run `tests/usage-ledger.test.ts`, `tests/usage-store.test.ts`, `tests/team-usage.test.ts`, the unit tests of `tests/usage-service.test.ts` with `--test-name-pattern`, and the typecheck.**
+- [ ] **Step 5: The coordinator runs `tests/usage-service.test.ts` and `tests/usage-routes.test.ts`, which start hosts.**
+
+### Task 4: Claude Code, Codex, and coverage in every roll-up
+
+**Files:** modify `usage-service.ts`, `usage-api.ts`, `tests/usage-ledger.test.ts`, `tests/usage-service.test.ts`, `tests/chat.test.ts`.
+
+**Interfaces (produces):**
+
+```ts
+// usage-service.ts
+export interface SessionUsage extends UsageTotals { measured: true; coverage: "partial" | "complete"; coverageReason?: LedgerCoverageReason }
+export type UnmeasuredUsage = { measured: false; coverage: "none"; coverageReason?: LedgerCoverageReason; unavailable?: true };
+export function ledgerCoverage(input: { provider: Provider; measuredLaunch: boolean; closed: boolean;
+  journaled?: LedgerCoverage; valid: number; refused: number }): LedgerCoverage;
+export function combineCoverage(parts: readonly { coverage: UsageCoverage; coverageReason?: LedgerCoverageReason }[]): LedgerCoverage;
+// UsageSummary: providers[p] gains partialSessions: number and recorded: { tokens: UsageTokens; messages: number }; month gains partialSessions: number.
+// usage-api.ts: TaskUsage gains coverage: "partial" | "complete" and coverageReason?. ProjectUsage gains partial and month.partial. ProjectUsageDetail gains partial.
+```
+
+**Decisions:**
+
+- **Fold.** Sessions of provider `claude`, `codex`, and `demo` are read with event types `usage` and `usage-coverage`, whatever their coverage. Grok and OpenCode sessions outside a measured launch are not read. `seen` counts usage events read, and `valid` is `seen - refused`.
+- A `usage-coverage` event is kept as `journaled` when its `coverage` is one of the three values, its `reason` is absent or a token matching `/^[a-z][a-z0-9-]{0,39}$/`, and `complete` has no reason. A reason the type does not name, such as `drain-skipped` from phase 2c, is stored and reported as given. `finalDrain` goes to `final_drain` when it is `complete`, `incomplete`, or `skipped`, and is dropped otherwise. Other fields are ignored. A failing event is ignored, and the last valid one wins.
+- **Closing.** The coverage record is a session's last usage record, and after phase 2c usage records follow the exit record. So a `claude`, `codex`, or `demo` session closes (`exited` set) only when it is listed as exited, its journal is read to the end, and either a `journaled` record was read or the ledger first saw it exited at least 60 seconds ago. That first-seen time lives in memory. A coverage event before the exit and one after it close the session the same way. *(My call: a session whose worker wrote no coverage record must stop being read at some point. The final drain runs for at most 10 seconds after exit, and a restart only delays closing.)* Other providers close as in Task 3, when listed as exited and read to the end.
+- **Coverage.** `ledgerCoverage` returns the first match.
+
+| Order | Session | Result |
+|---|---|---|
+| 1 | `opencode` in a measured launch mode (today's rule) | `complete`, or `partial` with `row-dropped` when `refused > 0` |
+| 2 | any other `opencode`, and `grok` | `none`, `unsupported` |
+| 3 | `claude`, `codex`, or `demo` with `journaled` | `journaled`, except `complete` becomes `partial` with `row-dropped` when `refused > 0` |
+| 4 | same, no `journaled`, not closed | `partial` when `valid > 0`, else `none`; reason `running` |
+| 5 | same, no `journaled`, closed | `partial` with `drain-incomplete` when `valid > 0`, else `none` with `unsupported` |
+
+*(My call: rows 4 and 5 cover a session whose worker wrote no coverage record, from before phase 2 or after a crash. Row 4 also covers the final drain's window, so a drain in progress never counts as a gap. The refusal in row 1 is new for OpenCode, whose records the sealed ledger stores unchecked today.)*
+
+- **Counts.** A session is measured when its coverage is not `none`. Unmeasured counts keep today's meaning: coverage `none`. Every unmeasured count gains a partial count beside it: coverage `partial` with a reason other than `running`. *(My call: a running session is partial by nature and would mark every live figure. Only a gap that can no longer close is counted, which is the mark the design asks clients to show.)*
+- **`combineCoverage`** ignores `none` parts and returns `none` when none are left. All `complete` gives `complete`. Otherwise `partial`, with the reason of the first part, in the given order, whose reason is not `running`, else `running`.
+- **Pricing.** A `claude` or `codex` record prices as `{ cost: 0, pricing: "unknown" }` everywhere, whatever the configured prices. *(My call: the account rule of part 5 keeps a subscription token from showing as money, and it comes with phase 4. Until then these records are unpriced steps. Spent in dollars does not change, member totals read "No price available", and a money figure that holds Claude or Codex steps becomes a lower bound.)*
+- `providers[p].measured` and `spent` keep today's rule, `opencode` only. `recorded` sums the provider's measured sessions over its own period, plus briefings for `opencode`: the rows `spent` would sum. *(My call: Spent for Claude and Codex needs the phase 4 account rule.)*
+- `session()` and `taskUsage()` carry coverage. `taskUsage` combines its sessions in `created_at` order.
+
+| Test name | Assertions |
+|---|---|
+| `ledger coverage follows the rule table` | One assertion per row, each differing from the previous case in one field, plus `complete` with `refused: 1`. |
+| `a Claude session is measured from its journal` | An exited `claude` session whose journal holds two usage events and a `complete` coverage event. `session(id)` has `measured: true`, `coverage: "complete"`, `messages: 2`, the summed tokens, `cost: 0`, and `pricing.unknown: 2`. |
+| `a configured price does not price a Claude or Codex record` | With a price for `claude/model-a`, the record still has `cost: 0` and `unknown` pricing. `month.spent.usd` equals the OpenCode-only figure, and `month.spent.unpriced` rises by the Claude record count. |
+| `a replay adds nothing` | Sessions A and B journal the same two Claude message ids, A first, and A's journal repeats each record once. `providers.claude.recorded.messages` is 2. `session(B)` is measured with `messages: 0`. |
+| `a session from before the upgrade is read again` | The fixture ledger's `claude-a`, exited, with a journal holding one usage event and a `complete` coverage event. After import and one tick, `session("claude-a").coverage` is `complete` with `messages: 1`. |
+| `partial sessions are counted beside unmeasured ones` | Claude sessions in project `demo`: complete; exited `partial` with `stopped-mid-turn`; running with records; exited `none` with `hooks-off`. `providers.claude` has `unmeasuredSessions: 1` and `partialSessions: 1`. `month.partialSessions`, the project row's `partial` and `month.partial`, and `project("demo").partial` are 1. |
+| `a refused record makes a complete session partial` | One usage event with `output: "7"` beside a valid one, and a `complete` coverage event. `partial`, `row-dropped`, `messages: 1`. |
+| `aggregate coverage takes the first lasting gap` | `combineCoverage` of complete and complete is `complete`; of complete and running `partial` is `partial` with `running`; of running, `drain-incomplete`, and `stopped-mid-turn` is `partial` with `drain-incomplete`; of only `none` parts is `none`. |
+| `task usage carries coverage` | A task with a complete session and an exited `partial` `drain-incomplete` session: `coverage: "partial"`, `coverageReason: "drain-incomplete"`. |
+| `usage after the exit record is still read` | A `claude` session listed as exited, whose journal first ends after one usage event. Tick 1 leaves it open, `partial` with `running`. The journal then gains a usage event and a coverage event. Tick 2 gives `messages: 2` and the journaled coverage, and closes it, so tick 3 asks for no events. A coverage event read while the session is still listed as running is kept, and the session closes on the first tick that lists it exited. |
+| `an exited session without a coverage record closes after 60 seconds` | With `mock.timers` for `Date`: an exited session with one usage event stays open, `partial` with `running`, at 59 seconds, and closes as `partial` with `drain-incomplete` at 60. With no usage event it closes as `none` with `unsupported`. |
+| `a coverage record is kept as the worker wrote it` | `{ coverage: "partial", reason: "drain-skipped", finalDrain: "skipped" }` plus an extra key is kept: the session reports `drain-skipped`, `final_drain` is `skipped`, and it counts in `partialSessions`. `finalDrain: "maybe"` stores null. `reason: "Not A Reason!"`, `coverage: "full"`, and `complete` with a reason are each ignored. |
+
+In `tests/chat.test.ts`, `a rehearsal turn journals its usage, and its exit journals the coverage of the session` also waits until the session listing's `usage` has `measured: true` and `coverage: "complete"`, with `tokens.input` and `tokens.output` equal to the sums over the journal's usage events, and `/api/usage` has `month.spent.usd === 0`. Existing expected objects gain the new fields: `session("any")` is `{ measured: false, coverage: "none" }`, the unavailable result of Task 3 gains `coverage: "none"`, and the `taskUsage` objects gain `coverage: "complete"`. No assertion is removed.
+
+- [ ] **Step 1: Write the failing tests.**
+- [ ] **Step 2: Run `node --import tsx --test tests/usage-ledger.test.ts` and confirm they fail.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run it, `tests/usage-store.test.ts`, the unit tests of `tests/usage-service.test.ts`, `tests/usage-lines.test.ts`, and the typecheck.**
+- [ ] **Step 5: The coordinator runs `tests/chat.test.ts` and `tests/usage-service.test.ts`.**
+
+### Task 5: members, purposes, and the CLI
+
+**Files:** modify `usage-service.ts`, `team-usage.ts`, `teams.ts`, `client.ts`, `docs/teams.md`, `tests/team-usage.test.ts`, `tests/usage-ledger.test.ts`, `tests/usage-lines.test.ts`.
+
+**Interfaces (produces):**
+
+```ts
+member(runId: string, memberId: string): SessionUsage | UnmeasuredUsage;   // usage-service.ts
+// usage-api.ts: ProjectUsageDetail gains byPurpose: Record<SessionPurpose, { total: Money; members: number }>.
+// team-usage.ts
+export interface UsageRollup { /* existing fields */ partialMembers: number; unavailable?: true }
+interface UsageMember { sessionId: string; runId?: string; memberId?: string; provider?: Provider; modelProfile?: { id: string } }
+// teamUsage keeps its signature. A member's usage is UsageTotals & { coverage: "partial" | "complete"; coverageReason?: LedgerCoverageReason }.
+```
+
+**Decisions:**
+
+- `member(runId, memberId)` sums every stored session with that `run_id` and `member_id`, in `created_at` then `session_id` order, with `combineCoverage` over them. With no session it returns `{ measured: false, coverage: "none" }`. This covers a permission reviewer's turn sessions.
+- `teamUsage` calls `member` when the member has `runId` and `memberId`, and `session(sessionId)` otherwise, so a mission coordinator attempt keeps reading its session. Coverage `none` counts in `unmeasuredMembers`. Coverage `partial` with a reason other than `running` also counts in `partialMembers`, and its usage is still added. An `unavailable` result sets `rollup.unavailable` and counts as unmeasured.
+- `emptyRollup` sets `partialMembers: 0`. `addRollups` sums `partialMembers`, reading a missing value as 0, because goal records hold rollup snapshots from before this phase. It sets `unavailable` when any part has it.
+- `teams.ts`: the task usage built in the team view adds the result of `combineCoverage` over its attempts' usage, as `coverage` and `coverageReason`.
+- **`byPurpose`** holds all four keys. `total` is the money of the project's measured member sessions with that purpose, priced as everywhere. `members` counts distinct `(run_id, member_id)` among the project's sessions with that purpose. A session without a purpose is in no key, and the headline total is unchanged (design: money is money). The design's `list` field waits for phase 4.
+- **`usageLines`.** A provider without `spent` whose `recorded.messages` is above 0 prints `${label}  ${tokens} tokens for ${word} from ${start} (${messages} steps, ${partial} partial, ${unmeasured} unmeasured sessions)`. `tokens` is the sum of the five classes in plain digits, `word` and `start` follow today's rule, and the partial part is left out when 0. Every other line is unchanged.
+- **`docs/teams.md`.** Replace the sentence "Claude and Codex remain unmeasured per use and appear only as fixed plan fees." and the paragraph that starts "Only some work is measured." with: the ledger records Claude Code and Codex tokens for sessions whose hooks stream a transcript; each figure states its coverage; those records are not priced yet and count as unpriced steps; Grok and OpenCode in a native terminal stay unmeasured.
+
+| Test name | Assertions |
+|---|---|
+| `a member sums every session it ran` | Three sessions of run `r` and member `m`, one record each. `member("r", "m").messages` is 3, and `teamUsage` with one member whose `sessionId` is the third session reports 3. |
+| `member coverage is the worst of its sessions` | Complete with running `partial`: the member is `partial` with `running` and `partialMembers` is 0. Complete with exited `partial` `stopped-mid-turn`: `partial` with that reason and `partialMembers` 1. Only `none` sessions: no usage, and `unmeasuredMembers` 1. |
+| `rollups count and merge partial members` | `addRollups` of 1 and 2 partial members is 3. A part without the key counts 0. `emptyRollup(4).partialMembers` is 0. |
+| `an unavailable ledger marks the rollup` | `teamUsage` over an unavailable service: `rollup.unavailable` is true, every member is unmeasured, and no member has usage. |
+| `a mission attempt reads its own session` | A member without `runId` gets `session(sessionId)`'s totals. |
+| `project usage reports spend by purpose` | A member session with no purpose, a member session with header purpose `gate`, and a session without a team, each with one priced record. `byPurpose.work` and `byPurpose.gate` have `members: 1` and their record's money. `duel` and `replay` are `{ total: { usd: 0, unpriced: 0 }, members: 0 }`. The headline total equals the sum of all three records. |
+| `a provider without Spent prints its tokens` | `claude` with `recorded` `{ tokens: { input: 100, output: 20, reasoning: 5, cacheRead: 1000, cacheWrite: 0 }, messages: 3 }`, `partialSessions: 1`, `unmeasuredSessions: 2` prints `claude    1125 tokens for month from 2026-10-01 (3 steps, 1 partial, 2 unmeasured sessions)`, with the label padded as today. With `messages: 0` the line is today's unmeasured line. |
+
+- [ ] **Step 1: Write the failing tests.**
+- [ ] **Step 2: Run `node --import tsx --test tests/usage-ledger.test.ts tests/team-usage.test.ts tests/usage-lines.test.ts` and confirm they fail.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run the same command and `npm run typecheck -w @infinite/host`.**
+- [ ] **Step 5: The coordinator runs `tests/usage-service.test.ts`, `tests/teams.test.ts`, `tests/missions.test.ts`, `tests/goals.test.ts`, and `npm run check`, requests the independent review, and commits.**
+
+## Order
+
+Tasks 1 and 2 touch different files, but Task 2 imports `SessionPurpose`, so Task 1 goes first. It is small. Tasks 3, 4, and 5 each change `usage-service.ts` and build on the previous task's interfaces, so they run one after another.
+
+## Not in this phase
+
+- List price (part 5, phase 4): catalog prices, `listPrice`, `list` totals, the `subscription` pricing value, the account rule for Spent, and the Models column. Until then every Claude and Codex record is unpriced.
+- Limit events (part 6, phase 5), `GET /api/usage/limits`, and `infinite usage limits`.
+- `GET /api/usage/capture`, `infinite usage capture`, and the `native_id` and `provider_version` columns.
+- Web, phone, and Mac rendering: tokens where a member showed `Unmeasured`, the partial mark, and the web line that says only OpenCode members report usage. These clients decode the new fields and ignore them until then.
+- Computing `configId` (outcome ledger, C7), and the launchers that set `duel`, `replay`, or `gate`.
+- Deleting `usage.sealed`, one release after this one.
+- The final drain (phase 2c) and Codex child threads.

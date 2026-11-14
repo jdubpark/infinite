@@ -206,6 +206,36 @@ merge or infer that the goal was achieved.
 Missed schedule ticks are coalesced, so downtime does not produce a burst of
 catch-up goals.
 
+A routine can also wake on [project signals](#project-signals). Add `wakeOn`
+to the file with up to four signal kinds, for example
+`"wakeOn": ["revert", "owner"]`. When a matching signal arrives, the routine
+starts its next occurrence early instead of waiting for its next due time:
+
+- It reads signals only while it is scheduled or running. A paused, blocked,
+  or ended routine reads nothing and keeps its place in the inbox.
+- Signals recorded before the approval never wake it.
+- It ignores signals about the team runs of goals it started, so its own
+  delivery never wakes it.
+- An early start waits until `autonomy.continuity.wakeMinGapMinutes` (0 to
+  1,440, default 5) have passed since the previous occurrence ended.
+- Every other rule still applies: the start time, the expiry,
+  `maxOccurrences`, the time budget, the launch-rate fuse, and the busy-project
+  rule. When the project is busy, the waiting signals wait for the next due
+  time.
+- Signals that arrive while an occurrence runs start at most one follow-on
+  occurrence.
+- Signals that arrive together start one occurrence. The routine reads 50
+  signals a pass and starts nothing while more wait, so a large batch delays
+  the start by a few seconds and never splits into two occurrences.
+- An early start needs a readable inbox. While the inbox cannot be read, the
+  routine runs on its schedule only, and the waiting signals keep waiting for
+  the next start that can read all of them.
+- The occurrence lists the signal IDs it started on under `wake`. It submits
+  the same goal as any other occurrence.
+
+`wakeOn` is part of the approval and cannot change later. A routine without it
+runs on its schedule only.
+
 ### Navigating large repositories
 
 For large codebases, agents can use [Graphify](https://github.com/Graphify-Labs/graphify)
@@ -1403,6 +1433,53 @@ Only the owner can change the mode, from the paired owner CLI. Members, other ro
 
 The host limits how often it starts team sessions: 30 per project and 80 across the host in a rolling hour. A launch that would pass a limit waits. The member or goal shows a reason that starts "Waiting for the spend fuse:", names the project or the host, and gives no figures. The first trip of a UTC day closes by itself when fewer than half the limit remain in the last hour. If the limit is reached again on the same UTC day, the trip stays open until the owner closes it with `infinite fuse close --project PROJECT_ID` or `infinite fuse close --host`. The permission coordinator is never counted or held. The limits can be changed under `autonomy.fuse` in the host configuration (`project`, `host`, and `projects.PROJECT_ID`, each with `launchesPerHour`). A trip opened because the launch record cannot be read closes once the record can be read. Run `infinite fuse` to read every scope, or add `--json` for the full view. The `autonomy-interrupt` push event is on by default and sends the owner one notification per trip and subject per UTC day.
 
+## Project signals
+
+A project signal is a fact the host recorded about a project, or an item the
+owner added. Each project has an inbox of signals, oldest first. There are four
+kinds:
+
+- `delivery-landed`: the base branch scan saw a team run's delivered change on
+  the base branch. The signal names the run and the landed commit.
+- `revert`: the base branch scan saw a revert of a landed run's change. The
+  signal names the reverted run and the revert commit.
+- `external-commit`: a fetch moved the base branch, and at least one new commit
+  is neither a landing nor a revert that the scan attributed to a team run of
+  the project. The signal names the new base head. The host records it only
+  when the scan read exactly the new commits, so never on a project's first
+  scan or after a rewritten history. A run can land as several commits, and
+  the scan names only the last one, so a commit before a landing in the same
+  fetch may belong to that run and does not count. The one exception is a
+  landing by a merge commit whose second parent is the run's reviewed head: the
+  run's commits sit behind that parent, so a commit before it counts.
+- `owner`: direction the owner added with `infinite signal add`.
+
+Only the owner can add a signal, and only owner signals carry text. The host
+never copies text from a commit, a pull request, an issue, or an agent into a
+signal. Scan signals hold commit and run IDs only.
+
+A signal starts nothing by itself. A [routine](#scheduled-routines) with
+`wakeOn` reads the inbox on its own scheduler pass and decides within its own
+limits.
+
+The host keeps signals for 30 days, and at most 20,000 across all projects. The
+oldest go first. A reader whose place is older than the oldest kept signal
+continues from that signal. Signals live in the evidence store. While the
+store is unavailable, nothing is recorded and readers wait.
+
+Each signal has a key from its source: a request ID, a ledger ID, or a commit.
+The host records one key once per project and kind, and remembers the key for
+the full 30 days, also after the 20,000 limit removed the signal itself. A
+repeat within 30 days records nothing. After 30 days the same key is a new
+signal, so a source uses a key once. The host remembers at most 200,000 keys.
+At that number it refuses new signals until old keys expire; it never forgets
+a key early to make room.
+
+```sh
+infinite signal add --project PROJECT_ID "Check the release notes before the next run"
+infinite signal list --project PROJECT_ID [--after SEQ] [--json]
+```
+
 ## Configuration
 
 Each new run gets a folder named from its UTC creation date, a slug of its
@@ -1826,6 +1903,21 @@ on a later request. See [Swarm view](swarm.md).
 The continue request accepts exactly `requestId`, `revision`, and optional
 `text`; omit `text` when no direction is needed. A supplied direction is trimmed
 and must contain 1–8,000 characters.
+
+### Project signals
+
+| Method and endpoint | Body | Role |
+| --- | --- | --- |
+| `GET /api/projects/:id/signals?after=SEQ&limit=N` | None; returns `{signals, head}`, oldest first. `after` defaults to 0; `limit` is 1–200, default 50 | Any paired device |
+| `POST /api/projects/:id/signals` | `requestId` (UUID), `text` (trimmed, 1–2,000 characters); returns `{recorded, signal}` | Owner |
+
+`head` is the highest signal number on the host, across all projects. A repeated
+`requestId` records nothing and returns the signal stored first, with
+`recorded: false`. A repeated `requestId` whose signal the row limit already
+removed is `410` with `code: "signal-gone"`; nothing new is recorded. An unknown
+project is `404`. An unavailable evidence store is `503` with
+`code: "evidence-unavailable"`, and a full key record is `503` with
+`code: "signal-inbox-full"`. See [Project signals](#project-signals).
 
 ## Model scorecard
 

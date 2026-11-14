@@ -124,6 +124,25 @@ target, Enter to open the selected row or submit a mission, `a` to answer its
 open decision, and `q` or Ctrl+C to exit. Missions open their decision and
 subtask summary; team rows use `infinite team watch`.
 
+## Project signals
+
+```sh
+infinite signal add --project PROJECT_ID "Check the release notes before the next run"
+infinite signal add --project PROJECT_ID TEXT --request-id UUID [--json]
+infinite signal list --project PROJECT_ID [--after SEQ] [--json]
+```
+
+`signal add` adds owner direction to a project's signal inbox. It needs an owner
+key. The text is at most 2,000 characters. The CLI prints the request ID before
+it sends. To repeat an uncertain request, pass the same `--request-id`; a repeat
+records nothing and prints the signal stored first. A signal starts nothing by
+itself.
+
+`signal list` prints a project's signals, oldest first, one per line: number,
+time, kind, run, commit, and text. `--after SEQ` starts after that number. Any
+paired device can read the list. Signal text is data: the output escapes
+control characters. See [Project signals](teams.md#project-signals).
+
 ## Team CLI
 
 Initialize a project from a clean Git checkout, then start and control teams from that directory:

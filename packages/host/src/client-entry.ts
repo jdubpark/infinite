@@ -37,6 +37,8 @@ infinite team start [OBJECTIVE] [--prd FILE] [--provider PROVIDER]
 infinite routine create --file FILE [--request-id UUID] [--json]
 infinite routine list [--json] | status ID [--json]
 infinite routine pause|resume|cancel ID --revision N [--request-id UUID] [--json]
+infinite signal add --project ID TEXT [--request-id UUID] [--json]
+infinite signal list --project ID [--after SEQ] [--json]
 infinite understand [--workspace ID] [--json]  Read workspace Understanding
 infinite understand catalog|components|component ID|policy|refresh --workspace ID
 infinite understand create COLLECTION|update COLLECTION ID|archive COLLECTION ID --workspace ID

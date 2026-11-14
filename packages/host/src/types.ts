@@ -140,7 +140,7 @@ export interface Config {
   };
   machine?: { id: string; label: string };
   /** Operator default for an enrollment that has no saved mode. Only defaultMode exists in this block so far. */
-  autonomy?: { defaultMode?: import("./autonomy.js").AutonomyMode; fuse?: import("./config.js").FuseConfig };
+  autonomy?: { defaultMode?: import("./autonomy.js").AutonomyMode; fuse?: import("./config.js").FuseConfig; continuity?: import("./config.js").ContinuityConfig };
   cmux?: { enabled: boolean; command?: string; hooksDir?: string };
   remote?: { enabled: boolean; relay?: { url: string; tokenFile: string } };
   /** Token prices (USD per million) and per-provider spend budgets for the usage ledger. */

@@ -20,6 +20,7 @@ writeFileSync(join(tokenDirectory, `${createHash("sha256").update("example/produ
   permissions: { contents: "write", pull_requests: "write", checks: "read", statuses: "read", actions: "read", metadata: "read" },
 }), { mode: 0o600 });
 const capture = join(root, "gh-calls.jsonl");
+const lookupCapture = join(root, "gh-lookups.jsonl");
 const fakeGh = join(root, "gh.mjs");
 // The broker runs gh with a clean environment; the fixture records what it received and echoes the token to prove redaction.
 writeFileSync(fakeGh, `#!${process.execPath}
@@ -27,6 +28,16 @@ import { appendFileSync, readdirSync } from "node:fs";
 let stdin = "";
 process.stdin.on("data", chunk => { stdin += chunk; });
 process.stdin.on("end", () => {
+  const args = process.argv.slice(2);
+  // Pull request lookups: 12 is this repository's infinite/team-1, 13 is main, 14 comes from a fork, others are missing.
+  if (args[1] === "view" && args[3] === "--json=number,headRefName,isCrossRepository") {
+    appendFileSync(${JSON.stringify(lookupCapture)}, JSON.stringify(args) + "\\n");
+    const pulls = { "12": ["infinite/team-1", false], "infinite/team-1": ["infinite/team-1", false], "13": ["main", false], "14": ["infinite/team-1", true] };
+    const pull = pulls[args[2]];
+    if (!pull) { process.stderr.write("no pull requests found\\n"); process.exit(1); }
+    process.stdout.write(JSON.stringify({ number: args[2] === "infinite/team-1" ? 12 : Number(args[2]), headRefName: pull[0], isCrossRepository: pull[1] }, null, 2) + "\\n");
+    return;
+  }
   const env = Object.fromEntries(["GH_TOKEN", "GH_REPO", "GH_HOST", "GH_PROMPT_DISABLED", "GITHUB_TOKEN"].map(name => [name, process.env[name] ?? null]));
   appendFileSync(${JSON.stringify(capture)}, JSON.stringify({ args: process.argv.slice(2), cwd: process.cwd(), entries: readdirSync(process.cwd()), env, stdin }) + "\\n");
   process.stdout.write("ran with " + process.env.GH_TOKEN + "\\n");
@@ -46,9 +57,9 @@ test.after(async () => {
   rmSync(root, { recursive: true, force: true });
 });
 
-const grant = (ops: GithubGrantOp[]) => mintGithubGrant(key, { sub: "test", sid: "session-1", repo: "example/product", ops });
-const prGrant = grant(["fetch", "pr"]);
-const mergeGrant = grant(["fetch", "pr", "merge"]);
+const grant = (ops: GithubGrantOp[], refs?: string[]) => mintGithubGrant(key, { sub: "test", sid: "session-1", repo: "example/product", ops, ...(refs ? { refs } : {}) });
+const prGrant = grant(["fetch", "push", "pr"], ["refs/heads/infinite/*"]);
+const mergeGrant = grant(["fetch", "push", "pr", "merge"], ["refs/heads/infinite/*"]);
 const calls = () => existsSync(capture) ? readFileSync(capture, "utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
 
 async function gh(grantText: string, argv: string[], stdin?: string) {
@@ -105,6 +116,27 @@ test("other commands, other repositories, and flags that read files, open editor
   assert.match((await gh(prGrant, ["pr", "view", "12"], "unused")).text, /stdin-unused/);
   assert.match((await gh(grant(["fetch"]), ["pr", "view", "12"])).text, /pr-not-granted/);
   assert.equal(calls().length, before);
+});
+
+test("pull request writes reach only pull requests whose head branch the grant covers", async () => {
+  const before = calls().length;
+  const create = ["pr", "create", "--base", "main", "--title", "t", "--body", "b"];
+  assert.match((await gh(prGrant, [...create, "--head", "main"])).text, /head-not-granted/);
+  assert.match((await gh(grant(["fetch", "pr"]), [...create, "--head", "infinite/team-1"])).text, /head-not-granted/);
+  assert.match((await gh(prGrant, ["pr", "ready", "13"])).text, /head-not-granted/);
+  assert.match((await gh(prGrant, ["pr", "comment", "14", "--body", "x"])).text, /head-not-granted:other-repository/);
+  assert.match((await gh(mergeGrant, ["pr", "merge", "13", "--squash", "--match-head-commit", "a".repeat(40)])).text, /head-not-granted/);
+  assert.match((await gh(prGrant, ["pr", "ready", "99"])).text, /pull-request-unresolved/);
+  assert.equal(calls().length, before);
+
+  // A branch selector runs against the number the lookup resolved; reads need no lookup.
+  const comment = await gh(prGrant, ["pr", "comment", "infinite/team-1", "--body", "x"]);
+  assert.equal(comment.status, 200);
+  assert.deepEqual(calls().at(-1).args, ["pr", "comment", "12", "--body=x", "--repo=example/product"]);
+  assert.equal((await gh(prGrant, ["pr", "view", "13"])).status, 200);
+  assert.deepEqual(calls().at(-1).args, ["pr", "view", "13", "--repo=example/product"]);
+  const lookups = readFileSync(lookupCapture, "utf8").trim().split("\n").map(line => JSON.parse(line));
+  assert.deepEqual(lookups.at(-1), ["pr", "view", "infinite/team-1", "--json=number,headRefName,isCrossRepository", "--repo=example/product"]);
 });
 
 test("a merge needs the merge operation and an exact head commit, and never admin or branch deletion", async () => {

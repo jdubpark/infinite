@@ -576,10 +576,12 @@ const REPEATABLE = new Set(["label", "reviewer", "assignee"]);
 /**
  * Allowed `gh pr` subcommands. Every other gh command, and every flag not listed, is refused: notably --web, --editor,
  * --body-file with a path, --template, --recover, --fill (local Git), --jq (its $ENV would expose GH_TOKEN), --admin,
- * --delete-branch, --auto, and --watch.
+ * --delete-branch, --auto, and --watch. Commands marked `writes` act only on a pull request whose head branch is in this
+ * repository and covered by the grant's refs: `create` checks `--head`, the others are resolved first (see
+ * resolvePullRequest). Reads (view, list, checks) cover every pull request in the granted repository.
  */
 const GH_COMMANDS = {
-  create: { op: "pr", selector: false, required: ["head", "base", "title"],
+  create: { op: "pr", selector: false, writes: true, required: ["head", "base", "title"],
     flags: { head: "branch", base: "branch", title: "text", body: "body", "body-file": "stdin", draft: "bool", label: "text", reviewer: "text", assignee: "text" },
     short: { H: "head", B: "base", t: "title", b: "body", F: "body-file", d: "draft", l: "label", r: "reviewer", a: "assignee" } },
   view: { op: "pr", selector: true, flags: { json: "fields", comments: "bool" }, short: { c: "comments" } },
@@ -587,9 +589,9 @@ const GH_COMMANDS = {
     flags: { state: "state", base: "branch", head: "branch", limit: "limit", json: "fields", label: "text", author: "text", assignee: "text", search: "text", draft: "bool" },
     short: { s: "state", B: "base", H: "head", L: "limit", l: "label", A: "author", a: "assignee", S: "search", d: "draft" } },
   checks: { op: "pr", selector: true, flags: { json: "fields", required: "bool" }, short: {} },
-  ready: { op: "pr", selector: true, flags: { undo: "bool" }, short: {} },
-  comment: { op: "pr", selector: true, oneOf: ["body", "body-file"], flags: { body: "body", "body-file": "stdin" }, short: { b: "body", F: "body-file" } },
-  merge: { op: "merge", selector: true, required: ["match-head-commit"], exactlyOne: ["merge", "squash", "rebase"],
+  ready: { op: "pr", selector: true, writes: true, flags: { undo: "bool" }, short: {} },
+  comment: { op: "pr", selector: true, writes: true, oneOf: ["body", "body-file"], flags: { body: "body", "body-file": "stdin" }, short: { b: "body", F: "body-file" } },
+  merge: { op: "merge", selector: true, writes: true, required: ["match-head-commit"], exactlyOne: ["merge", "squash", "rebase"],
     flags: { "match-head-commit": "sha", merge: "bool", squash: "bool", rebase: "bool", subject: "text", body: "body", "body-file": "stdin" },
     short: { m: "merge", s: "squash", r: "rebase", t: "subject", b: "body", F: "body-file" } },
 };
@@ -656,10 +658,28 @@ export function parseGhCommand(argv, claims) {
   if (spec.oneOf && spec.oneOf.filter(name => values.has(name)).length !== 1) throw new ProxyError(`flag-required:--${spec.oneOf.join("|--")}`);
   if (values.has("body") && values.has("body-file")) throw new ProxyError("body-ambiguous");
   if (spec.selector && selector === undefined) throw new ProxyError("selector-required");
+  if (spec.writes && argv[1] === "create" && !refAllowed(claims.refs, `refs/heads/${values.get("head")[0]}`)) throw new ProxyError("head-not-granted");
   const args = ["pr", argv[1], ...(selector === undefined ? [] : [selector])];
   for (const [name, list] of values) for (const value of list) args.push(value === true ? `--${name}` : `--${name}=${value}`);
   args.push(`--repo=${claims.repo}`);
-  return { args, stdin: values.has("body-file") };
+  return { args, stdin: values.has("body-file"), resolve: spec.writes === true && spec.selector };
+}
+
+/**
+ * Before a write to an existing pull request, looks it up with the token and checks that its head branch is in the
+ * granted repository and covered by the grant's refs. The command then runs against the resolved number, so gh cannot
+ * pick a different pull request for a branch selector. Returns a refusal reason, or undefined after rewriting `args`.
+ */
+async function resolvePullRequest(githubCli, parsed, claims, token) {
+  const lookup = await runGh(githubCli, ["pr", "view", parsed.args[2], "--json=number,headRefName,isCrossRepository", `--repo=${claims.repo}`], undefined, token);
+  let pr;
+  try { pr = lookup.code === 0 && !lookup.truncated ? JSON.parse(lookup.stdout) : undefined; } catch { pr = undefined; }
+  if (!pr || typeof pr !== "object" || !Number.isSafeInteger(pr.number) || pr.number < 1 || typeof pr.headRefName !== "string" || typeof pr.isCrossRepository !== "boolean")
+    return "pull-request-unresolved";
+  if (pr.isCrossRepository) return "head-not-granted:other-repository";
+  if (!validBranch(pr.headRefName) || !refAllowed(claims.refs, `refs/heads/${pr.headRefName}`)) return "head-not-granted";
+  parsed.args[2] = String(pr.number);
+  return undefined;
 }
 
 const GH_OUTPUT_MAX = 1024 * 1024;
@@ -738,8 +758,11 @@ export function createGhBroker(config, { maxConcurrent = 4 } = {}) {
     if (running >= maxConcurrent) return reply(503, "busy");
     running++;
     let result;
-    try { result = await runGh(config.githubCli, parsed.args, parsed.stdin ? body.stdin ?? "" : undefined, token); }
-    finally { running--; }
+    try {
+      const refusal = parsed.resolve ? await resolvePullRequest(config.githubCli, parsed, claims, token) : undefined;
+      if (refusal) return reply(403, refusal);
+      result = await runGh(config.githubCli, parsed.args, parsed.stdin ? body.stdin ?? "" : undefined, token);
+    } finally { running--; }
     res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
     res.end(JSON.stringify(result));
     done({ decision: "allow", reason: "ran", status: 200, exitCode: result.code });

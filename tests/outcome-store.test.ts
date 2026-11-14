@@ -585,6 +585,8 @@ test("a version 1 store migrates in place", () => {
     const row = store.read(db => readOutcome(db, "run-1:member-1"));
     assert.equal(row?.accepted, 1);
     assert.equal(row?.acceptance, 1);
+    // The migration rewrites no level, exclusion, or flag of an existing row.
+    assert.deepEqual([row?.integrated, row?.firstPass, row?.held, row?.exclusion, row?.flags, row?.holdUntil], [1, 1, null, null, [], null]);
     const tables = store.read(db => db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type='table'"))
       .map(table => table.name);
     for (const table of ["outcome_signals", "base_scans", "base_scan_state"]) assert.ok(tables.includes(table), table);

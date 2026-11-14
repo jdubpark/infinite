@@ -14,7 +14,8 @@ const DAY_MS = 86_400_000;
 /** One commit of a base scan. A scan lists them oldest first. */
 export type ScanCommit = { id: string; tree: string; parents: string[] };
 
-export type LandingCandidate = { runId: string; reviewedHead?: string; reviewedTree?: string; mergeCommit?: string };
+/** `base` is the base commit the run's reviewed head was built on. */
+export type LandingCandidate = { runId: string; reviewedHead?: string; reviewedTree?: string; mergeCommit?: string; base?: string };
 export type Landing = { runId: string; commit: string; method: LandingMethod; position: number; reviewedHead?: string };
 /** `position` is set when the run landed in this scan. */
 export type LandedRun = { runId: string; signalId: string; ids: string[]; holdUntil: string; position?: number };
@@ -24,13 +25,28 @@ export type RevertMatch = { runId: string; signalId: string; commit: string; rev
  * Rules 1 to 3 of spec part 5. Exact matches only. Commits are taken oldest first; a run
  * lands at its first matching commit, and within one commit rule 1 comes before 2 and 2
  * before 3. Several runs may land on one commit.
+ *
+ * A tree can recur, so rule 3 also needs proof that the commit is not older than the run: the
+ * commit is the reviewed head itself, or the run's base is in the list before the commit, or
+ * the base is not in the list and the scan read no history older than the ledger's head
+ * (`older` is false). A run whose reviewed head is its base changed nothing and never lands.
  */
-export function matchLandings(commits: readonly ScanCommit[], candidates: readonly LandingCandidate[]): Landing[] {
+export function matchLandings(commits: readonly ScanCommit[], candidates: readonly LandingCandidate[], older = false): Landing[] {
   const landed = new Set<string>();
   const landings: Landing[] = [];
+  const positions = new Map<string, number>();
+  commits.forEach((commit, position) => {
+    if (!positions.has(commit.id)) positions.set(commit.id, position);
+  });
+  const afterBase = (candidate: LandingCandidate, commit: ScanCommit, position: number): boolean => {
+    if (commit.id === candidate.reviewedHead) return true;
+    const base = candidate.base === undefined ? undefined : positions.get(candidate.base);
+    return base === undefined ? !older : position > base;
+  };
   commits.forEach((commit, position) => {
     for (const candidate of candidates) {
       if (landed.has(candidate.runId)) continue;
+      if (candidate.base !== undefined && candidate.reviewedHead === candidate.base) continue;
       if (candidate.mergeCommit !== undefined && commit.id === candidate.mergeCommit) {
         landed.add(candidate.runId);
         landings.push({ runId: candidate.runId, commit: commit.id, method: "merge-commit", position });
@@ -43,7 +59,7 @@ export function matchLandings(commits: readonly ScanCommit[], candidates: readon
           position,
           reviewedHead: candidate.reviewedHead,
         });
-      } else if (candidate.reviewedTree !== undefined && commit.tree === candidate.reviewedTree) {
+      } else if (candidate.reviewedTree !== undefined && commit.tree === candidate.reviewedTree && afterBase(candidate, commit, position)) {
         landed.add(candidate.runId);
         landings.push({ runId: candidate.runId, commit: commit.id, method: "tree-equal", position });
       }

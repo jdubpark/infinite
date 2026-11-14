@@ -74,6 +74,41 @@ test("the match rules", () => {
   );
 });
 
+test("a tree match needs the base before it", () => {
+  // The tree T recurs: c0 has it before the run's base c1, and c2 has it after.
+  const commits: ScanCommit[] = [
+    { id: "c0", tree: "T", parents: [] },
+    { id: "c1", tree: "X", parents: ["c0"] },
+    { id: "c2", tree: "T", parents: ["c1"] },
+  ];
+  const afterBase = matchLandings(commits, [{ runId: "r", reviewedTree: "T", base: "c1" }]);
+  assert.deepEqual(afterBase.map(l => [l.commit, l.position, l.method]), [["c2", 2, "tree-equal"]]);
+  // The same holds in a scan of older history, because the base is in the list.
+  assert.deepEqual(matchLandings(commits, [{ runId: "r", reviewedTree: "T", base: "c1" }], true).map(l => l.commit), ["c2"]);
+
+  // The base is not in the list. A scan of new commits only takes the first match; a scan of older history takes none.
+  const unknownBase = [{ runId: "r", reviewedTree: "T", base: "zz" }];
+  assert.deepEqual(matchLandings(commits, unknownBase).map(l => l.commit), ["c0"]);
+  assert.deepEqual(matchLandings(commits, unknownBase, true), []);
+  assert.deepEqual(matchLandings(commits, [{ runId: "r", reviewedTree: "T" }], true), []);
+
+  // The reviewed head itself always counts: a fast-forward cannot be older than the run.
+  assert.deepEqual(
+    matchLandings(commits, [{ runId: "r", reviewedHead: "c2", reviewedTree: "T", base: "zz" }], true).map(l => [l.commit, l.method]),
+    [["c2", "tree-equal"]],
+  );
+
+  // A run whose reviewed head is its base changed nothing: it lands by no rule.
+  const empty = { runId: "r", reviewedHead: "c1", reviewedTree: "X", base: "c1", mergeCommit: "c2" };
+  assert.deepEqual(matchLandings(commits, [empty]), []);
+  assert.deepEqual(matchLandings(commits, [empty], true), []);
+
+  // Rules 1 and 2 need no base.
+  const merge: ScanCommit[] = [{ id: "M", tree: "Z", parents: ["P", "H"] }];
+  assert.deepEqual(matchLandings(merge, [{ runId: "r", reviewedHead: "H", base: "zz" }], true).map(l => l.method), ["merge-parent"]);
+  assert.deepEqual(matchLandings(merge, [{ runId: "r", mergeCommit: "M", base: "zz" }], true).map(l => l.method), ["merge-commit"]);
+});
+
 test("landed ids", () => {
   assert.deepEqual(landedIds("merge-parent", "C", "H"), ["C", "H"]);
   assert.deepEqual(landedIds("merge-commit", "C"), ["C"]);

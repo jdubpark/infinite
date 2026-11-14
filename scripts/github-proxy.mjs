@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // GitHub credential proxy. It holds the GitHub App installation token under its own account and checks a
 // host-signed grant on every request. Node standard library only. See deploy/ubuntu/github-proxy.md.
+import { spawn } from "node:child_process";
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
-import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createGunzip } from "node:zlib";
@@ -553,6 +555,198 @@ function inspectReceivePack(req, gzip) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// The gh broker: an allowlist of pull request commands, run as the proxy account with the token in gh's environment.
+
+const TEXT_MAX = 1024;
+const BODY_MAX = 65536;
+const SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const validBranch = value => validRef(`refs/heads/${value}`, false);
+const VALUES = {
+  bool: undefined,
+  branch: value => validBranch(value),
+  text: value => value.length > 0 && value.length <= TEXT_MAX && !value.includes("\0"),
+  body: value => value.length <= BODY_MAX && !value.includes("\0"),
+  stdin: value => value === "-",
+  fields: value => /^[A-Za-z]+(?:,[A-Za-z]+)*$/.test(value) && value.length <= 1024,
+  state: value => ["open", "closed", "merged", "all"].includes(value),
+  limit: value => /^[1-9][0-9]{0,3}$/.test(value),
+  sha: value => SHA.test(value),
+};
+const REPEATABLE = new Set(["label", "reviewer", "assignee"]);
+/**
+ * Allowed `gh pr` subcommands. Every other gh command, and every flag not listed, is refused: notably --web, --editor,
+ * --body-file with a path, --template, --recover, --fill (local Git), --jq (its $ENV would expose GH_TOKEN), --admin,
+ * --delete-branch, --auto, and --watch.
+ */
+const GH_COMMANDS = {
+  create: { op: "pr", selector: false, required: ["head", "base", "title"],
+    flags: { head: "branch", base: "branch", title: "text", body: "body", "body-file": "stdin", draft: "bool", label: "text", reviewer: "text", assignee: "text" },
+    short: { H: "head", B: "base", t: "title", b: "body", F: "body-file", d: "draft", l: "label", r: "reviewer", a: "assignee" } },
+  view: { op: "pr", selector: true, flags: { json: "fields", comments: "bool" }, short: { c: "comments" } },
+  list: { op: "pr", selector: false,
+    flags: { state: "state", base: "branch", head: "branch", limit: "limit", json: "fields", label: "text", author: "text", assignee: "text", search: "text", draft: "bool" },
+    short: { s: "state", B: "base", H: "head", L: "limit", l: "label", A: "author", a: "assignee", S: "search", d: "draft" } },
+  checks: { op: "pr", selector: true, flags: { json: "fields", required: "bool" }, short: {} },
+  ready: { op: "pr", selector: true, flags: { undo: "bool" }, short: {} },
+  comment: { op: "pr", selector: true, oneOf: ["body", "body-file"], flags: { body: "body", "body-file": "stdin" }, short: { b: "body", F: "body-file" } },
+  merge: { op: "merge", selector: true, required: ["match-head-commit"], exactlyOne: ["merge", "squash", "rebase"],
+    flags: { "match-head-commit": "sha", merge: "bool", squash: "bool", rebase: "bool", subject: "text", body: "body", "body-file": "stdin" },
+    short: { m: "merge", s: "squash", r: "rebase", t: "subject", b: "body", F: "body-file" } },
+};
+
+function flagLabel(token) {
+  const name = token.split("=", 1)[0];
+  return /^-{1,2}[A-Za-z][A-Za-z-]{0,40}$/.test(name) ? `:${name}` : "";
+}
+
+/**
+ * Parses `argv` (without the leading `gh`) strictly against the allowlist and returns the argv to run, with the
+ * repository always set from the grant. Throws ProxyError with a short reason.
+ */
+export function parseGhCommand(argv, claims) {
+  if (!Array.isArray(argv) || argv.length < 2 || argv.length > 64 || !argv.every(arg => typeof arg === "string" && arg.length <= BODY_MAX && !arg.includes("\0")))
+    throw new ProxyError("argv-invalid");
+  if (argv[0] !== "pr" || !Object.hasOwn(GH_COMMANDS, argv[1])) throw new ProxyError("command-refused");
+  const spec = GH_COMMANDS[argv[1]];
+  if (!claims.ops.includes(spec.op)) throw new ProxyError(`${spec.op}-not-granted`);
+  const values = new Map();
+  let selector;
+  for (let index = 2; index < argv.length; index++) {
+    const token = argv[index];
+    if (token === "--") throw new ProxyError("separator-refused");
+    let name, inline;
+    if (token.startsWith("--")) {
+      const equals = token.indexOf("=");
+      name = equals < 0 ? token.slice(2) : token.slice(2, equals);
+      inline = equals < 0 ? undefined : token.slice(equals + 1);
+    } else if (token.startsWith("-")) {
+      if (token.length !== 2) throw new ProxyError(`flag-refused${flagLabel(token)}`);
+      name = token[1] === "R" ? "repo" : spec.short[token[1]];
+      if (!name) throw new ProxyError(`flag-refused${flagLabel(token)}`);
+    } else {
+      if (!spec.selector || selector !== undefined) throw new ProxyError("argument-refused");
+      if (!/^[1-9][0-9]{0,9}$/.test(token) && !validBranch(token)) throw new ProxyError("selector-invalid");
+      selector = token;
+      continue;
+    }
+    const kind = name === "repo" ? "text" : Object.hasOwn(spec.flags, name) ? spec.flags[name] : undefined;
+    if (kind === undefined) throw new ProxyError(`flag-refused${flagLabel(token)}`);
+    let value = true;
+    if (kind === "bool") {
+      if (inline !== undefined) throw new ProxyError(`flag-value-refused${flagLabel(token)}`);
+    } else {
+      if (inline !== undefined) value = inline;
+      else {
+        value = argv[++index];
+        // A separate value that looks like a flag is ambiguous and refused; such text needs --flag=value. A Markdown
+        // list item ("- item") or stdin ("-") is not a flag. Every value is passed on as --flag=value, never alone.
+        if (value === undefined || /^--?[A-Za-z]/.test(value)) throw new ProxyError(`flag-value-missing${flagLabel(token)}`);
+      }
+      if (!VALUES[kind](value)) throw new ProxyError(`flag-value-refused${flagLabel(token)}`);
+    }
+    if (name === "repo") {
+      if (value.toLowerCase().replace(/\.git$/, "") !== claims.repo.toLowerCase()) throw new ProxyError("repository-not-granted");
+      continue;
+    }
+    if (values.has(name) && !REPEATABLE.has(name)) throw new ProxyError(`flag-repeated${flagLabel(token)}`);
+    values.set(name, [...(values.get(name) ?? []), value]);
+  }
+  for (const name of spec.required ?? []) if (!values.has(name)) throw new ProxyError(`flag-required:--${name}`);
+  if (spec.exactlyOne && spec.exactlyOne.filter(name => values.has(name)).length !== 1) throw new ProxyError(`flag-required:--${spec.exactlyOne.join("|--")}`);
+  if (spec.oneOf && spec.oneOf.filter(name => values.has(name)).length !== 1) throw new ProxyError(`flag-required:--${spec.oneOf.join("|--")}`);
+  if (values.has("body") && values.has("body-file")) throw new ProxyError("body-ambiguous");
+  if (spec.selector && selector === undefined) throw new ProxyError("selector-required");
+  const args = ["pr", argv[1], ...(selector === undefined ? [] : [selector])];
+  for (const [name, list] of values) for (const value of list) args.push(value === true ? `--${name}` : `--${name}=${value}`);
+  args.push(`--repo=${claims.repo}`);
+  return { args, stdin: values.has("body-file") };
+}
+
+const GH_OUTPUT_MAX = 1024 * 1024;
+const GH_TIMEOUT_MS = 60_000;
+
+function runGh(githubCli, args, stdin, token) {
+  return new Promise(settle => {
+    const directory = mkdtempSync(join(tmpdir(), "infinite-gh-"));
+    const env = {
+      PATH: "/usr/local/bin:/usr/bin:/bin", HOME: directory, GH_CONFIG_DIR: join(directory, "gh"),
+      XDG_CONFIG_HOME: directory, XDG_CACHE_HOME: directory, XDG_STATE_HOME: directory, XDG_DATA_HOME: directory,
+      GH_TOKEN: token, GH_HOST: "github.com", GH_PROMPT_DISABLED: "1", GH_NO_UPDATE_NOTIFIER: "1", GH_NO_EXTENSION_UPDATE_NOTIFIER: "1",
+      GH_SPINNER_DISABLED: "1", NO_COLOR: "1", CLICOLOR: "0", GH_PAGER: "cat", PAGER: "cat", GIT_TERMINAL_PROMPT: "0", LANG: "C.UTF-8",
+      GH_EDITOR: "/bin/false", EDITOR: "/bin/false", VISUAL: "/bin/false", GH_BROWSER: "/bin/false", BROWSER: "/bin/false",
+    };
+    let child;
+    try { child = spawn(githubCli, args, { cwd: directory, env, stdio: [stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"], detached: true }); }
+    catch { rmSync(directory, { recursive: true, force: true }); return settle({ code: 127, stdout: "", stderr: "gh could not be started.\n", truncated: false }); }
+    const output = { stdout: [], stderr: [], bytes: { stdout: 0, stderr: 0 } };
+    let truncated = false, timedOut = false;
+    const collect = stream => chunk => {
+      const room = GH_OUTPUT_MAX - output.bytes[stream];
+      if (room <= 0) { truncated = true; return; }
+      if (chunk.length > room) truncated = true;
+      const kept = chunk.subarray(0, room);
+      output[stream].push(kept);
+      output.bytes[stream] += kept.length;
+    };
+    child.stdout.on("data", collect("stdout"));
+    child.stderr.on("data", collect("stderr"));
+    const timer = setTimeout(() => { timedOut = true; try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); } }, GH_TIMEOUT_MS);
+    if (stdin !== undefined) { child.stdin.on("error", () => {}); child.stdin.end(stdin, "utf8"); }
+    let finished = false;
+    const finish = code => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      rmSync(directory, { recursive: true, force: true });
+      const redact = parts => Buffer.concat(parts).toString("utf8").split(token).join("[redacted]");
+      settle({ code, stdout: redact(output.stdout), stderr: `${redact(output.stderr)}${timedOut ? "\nInfinite GitHub proxy: gh timed out.\n" : ""}`, truncated });
+    };
+    child.once("error", () => finish(127));
+    child.once("close", (code, signal) => finish(code ?? (signal ? 1 : 0)));
+  });
+}
+
+function readJsonBody(req, max) {
+  return new Promise((settle, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on("data", chunk => {
+      size += chunk.length;
+      if (size > max) { req.destroy(); return reject(new ProxyError("request-too-large")); }
+      chunks.push(chunk);
+    });
+    req.once("end", () => {
+      try { settle(JSON.parse(Buffer.concat(chunks).toString("utf8"))); } catch { reject(new ProxyError("request-invalid")); }
+    });
+    req.once("error", () => reject(new ProxyError("request-aborted")));
+  });
+}
+
+/** Handles `POST /gh` with `{ argv, stdin? }` and answers `{ code, stdout, stderr, truncated }`. */
+export function createGhBroker(config, { maxConcurrent = 4 } = {}) {
+  let running = 0;
+  return async (req, res, claims, token, record, reply, done) => {
+    if (!/^application\/json(?:;\s*charset=utf-8)?$/i.test(String(req.headers["content-type"] ?? ""))) return reply(415, "content-type-invalid");
+    let body;
+    try { body = await readJsonBody(req, 512 * 1024); } catch (error) { return reply(400, error.code ?? "request-invalid"); }
+    if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(key => key !== "argv" && key !== "stdin") ||
+      (body.stdin !== undefined && (typeof body.stdin !== "string" || Buffer.byteLength(body.stdin) > BODY_MAX))) return reply(400, "request-invalid");
+    let parsed;
+    try { parsed = parseGhCommand(body.argv, claims); } catch (error) { return reply(403, error instanceof ProxyError ? error.code : "argv-invalid"); }
+    record.command = `pr ${parsed.args[1]}`;
+    if (body.stdin !== undefined && !parsed.stdin) return reply(403, "stdin-unused");
+    if (running >= maxConcurrent) return reply(503, "busy");
+    running++;
+    let result;
+    try { result = await runGh(config.githubCli, parsed.args, parsed.stdin ? body.stdin ?? "" : undefined, token); }
+    finally { running--; }
+    res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+    res.end(JSON.stringify(result));
+    done({ decision: "allow", reason: "ran", status: 200, exitCode: result.code });
+  };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 
 function listen(server, config) {
   const fds = Number(process.env.LISTEN_FDS);
@@ -564,7 +758,7 @@ async function main(argv) {
   if (argv.length !== 2 || argv[0] !== "--config") throw new ProxyError("usage");
   const config = loadProxyConfig(argv[1]);
   const key = loadGrantKey(config.grantKeyFile);
-  const server = createGithubProxy({ config, key });
+  const server = createGithubProxy({ config, key, broker: createGhBroker(config) });
   listen(server, config);
   for (const signal of ["SIGTERM", "SIGINT"]) process.once(signal, () => server.close());
 }

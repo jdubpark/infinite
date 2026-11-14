@@ -78,7 +78,7 @@ The owner records one delegation for each workspace. The host stores it as one c
 - An opt-out is recorded for one project. Only an explicit `permissions delegate` replaces it.
 - A project that the owner moves out of the workspace loses its coverage at once. When the host itself folds a covered checkout into its repository's group, that checkout keeps its coverage and no other project gains any.
 - A workspace with no record has no permission agent. Its requests wait for the owner, with today's notifications.
-- Owner-initiated onboarding of a project covers that project in its workspace by default. `--permissions off` records an opt-out for that project. This keeps today's product rule.
+- Owner-initiated onboarding of a project covers that project in its workspace by default. `--permissions off` records an opt-out for that project. Onboarding covers a project only the first time: a repeat onboarding changes nothing, so a revoke, an opt-out, a removal after a regrouping and existing direction text all stay. This keeps today's product rule.
 - A revoke stops new decisions at once. Decisions that are pending for that workspace are retired and never applied. `infinite team revoke-permissions TEAM_ID` still returns one run's requests to the owner.
 - The record pins the interrupt classes. A host release can add a class to existing delegations. It cannot remove one: a shorter list needs a new delegation from the owner.
 - Owner direction text can only narrow what the permission agent allows in that workspace. The interrupt classes and the host rules apply whatever the text says. A change to the text changes the authority: earlier verdicts are not replayed and open rejects are closed.
@@ -263,7 +263,7 @@ A strong profile from a second family needs a noninteractive, tool-less reviewer
 
 Focused tests protect the authority rules. Each one fails if the rule is removed:
 
-- No request is allowed for a project with no delegation, after a revoke, under a retired authority, on a host that is not ready, or for a project that joined a delegated workspace after its delegation, by a host fold or by the owner's grouping. A project whose scanned identity names a covered repository gains no coverage. Onboarding with an opt-out covers nothing.
+- No request is allowed for a project with no delegation, after a revoke, under a retired authority, on a host that is not ready, or for a project that joined a delegated workspace after its delegation, by a host fold or by the owner's grouping. A project whose scanned identity names a covered repository gains no coverage. Onboarding with an opt-out covers nothing. A repeat onboarding does not cover a project again after a revoke, and it does not remove direction text.
 - For each of the five classes, a concrete request that matches its class rule reaches the owner with no model turn, cannot be allowed by a report, and is not replayed. A persistent-only approval and a workspace trust prompt reach the owner although they offer no one-shot choice.
 - The light tier cannot produce a reject or an owner route. A host rule cannot produce an allow.
 - A raised request never gets a light verdict. A request with the destructive flag is not delivered on a light verdict.
@@ -305,7 +305,7 @@ The amended `PRODUCT.md` text is the authority rule, and it is true from slice 3
 
 - "Workspace" is read as a project group as the clients show it. A session whose project has no delegation stays with the owner.
 - Decision 4 is read as: drop both the count limit and the spend fuse. The rate is tracked and shown, and nothing stops on it.
-- A project that the owner onboards later is covered by default, and `--permissions off` opts out. A project that joins a delegated workspace any other way needs `permissions delegate`.
+- A project that the owner onboards later is covered by default, the first time only, and `--permissions off` opts out. A project that joins a delegated workspace any other way needs `permissions delegate`.
 - `permissions delegate` replaces a saved opt-out or custom scope and prints what it replaced.
 - The light tier can only allow or refer. Every reject and every owner route comes from the strong tier or a host rule.
 - The requester receives a fixed notice and a code, never the model's reason. The reason is kept for the owner.

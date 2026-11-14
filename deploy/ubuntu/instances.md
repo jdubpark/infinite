@@ -521,6 +521,14 @@ app and the owner's account, including `intake.slack.linearAgentUserId` for
 Linear's Slack agent. The intake binding must post only into the issue's
 recorded Slack thread.
 
+Direct requests need no new scope: the bot already reads the thread and posts in
+it. Set `intake.slack.directRequests` to `true` to let the owner's mention of the
+bot file the Linear issue and start the mission. The first test issue through
+Linear's Slack agent (pre-build check 1) is then optional for direct requests.
+Until that attribution check has passed, set `intake.linear.admitIssues` to
+`false`, so that only the owner's direct requests start work and no issue filed
+through Linear's Slack agent is admitted.
+
 Configure external connectors as MCP servers in the instance agent account,
 with read scopes only. A delegated permission request may add read-only
 connector calls within the owner's approved task; it does not authorize a

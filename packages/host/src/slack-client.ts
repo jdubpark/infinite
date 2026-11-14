@@ -20,7 +20,7 @@ const MAX_THREAD_PAGES = 50;
 const MAX_RECONNECT_DELAY_MS = 60_000;
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 /** Read methods take their arguments from a form body; write methods such as chat.postMessage take JSON. */
-const FORM_METHODS = new Set(["auth.test", "conversations.replies", "apps.connections.open"]);
+const FORM_METHODS = new Set(["auth.test", "conversations.replies", "apps.connections.open", "chat.getPermalink"]);
 
 /** Slack's Web API and Socket Mode, with bot and app tokens read from files on every call. */
 export class SlackClient implements IntakeThreadReader {
@@ -78,6 +78,13 @@ export class SlackClient implements IntakeThreadReader {
     });
     if (typeof data.ts !== "string") throw new SlackError("invalid_response", false);
     return { ts: data.ts };
+  }
+
+  /** The message's permanent link (`chat.getPermalink`, bot token). A response without one is an error. */
+  async permalink(binding: IntakeThread, ts: string): Promise<string> {
+    const data = await this.call("chat.getPermalink", "bot", { channel: binding.channelId, message_ts: ts });
+    if (typeof data.permalink !== "string" || data.permalink === "") throw new SlackError("invalid_response", false);
+    return data.permalink;
   }
 
   /** Opens Socket Mode. The envelope is acknowledged only after `handle` resolves; a rejection leaves it for redelivery. */

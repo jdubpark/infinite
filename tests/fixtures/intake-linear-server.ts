@@ -26,7 +26,12 @@ export async function startIntakeLinearServer(options: { clock?: () => number } 
   writeFileSync(apiKeyFile, apiKey, { mode: 0o600 });
   const issues = new Map<string, IntakeFixtureIssue>(), comments = new Map<string, IntakeFixtureComment>();
   const calls: { operation: string; query: string; variables: Record<string, any> }[] = [];
-  let loseNext = false, unavailableValue = false, count = 0;
+  let editNextCreated: Partial<IntakeFixtureIssue> | undefined;
+  let loseNext = false, loseNextIssue = false, refuseNextIssue = false, unavailableValue = false, count = 0;
+  /** The issue labels Linear holds; `teamId` null is a workspace label. */
+  const labels: { id: string; name: string; teamId: string | null }[] = [{ id: randomUUID(), name: "infinite", teamId }];
+  /** Who Linear reports as the creator of an issue the host files; the owner unless a test changes it. */
+  let creatorOfCreated: string | null = ownerId;
   const malformed = new Set<string>(), malformedCreator = new Set<string>();
   const now = options.clock ?? (() => Date.now());
   const stamp = () => new Date(now()).toISOString();
@@ -80,6 +85,34 @@ export async function startIntakeLinearServer(options: { clock?: () => number } 
         reply(200, { data: { commentCreate: { success: true, comment: { id: input.id, body: input.body, issue: { id: input.issueId } } } } });
         return;
       }
+      case "InfiniteIntakeLabel": {
+        const name = String(variables.filter?.name?.eqIgnoreCase ?? "").toLowerCase();
+        const scopes: { team?: { id?: { eq?: string }; null?: boolean } }[] = variables.filter?.or ?? [];
+        const inScope = (label: { teamId: string | null }) => scopes.length === 0 || scopes.some(scope =>
+          scope.team?.null ? label.teamId === null : scope.team?.id?.eq !== undefined && label.teamId === scope.team.id.eq);
+        const nodes = labels.filter(label => label.name.toLowerCase() === name && inScope(label)).slice(0, Number(variables.first) || 50).map(label => ({ id: label.id, team: label.teamId ? { id: label.teamId } : null }));
+        reply(200, { data: { issueLabels: { nodes } } });
+        return;
+      }
+      case "InfiniteIntakeIssueCreate": {
+        const input = variables.input;
+        if (refuseNextIssue) { refuseNextIssue = false; reply(200, { errors: [{ message: "Fixture refused the issue" }] }); return; }
+        if (!input?.id || !input.teamId || typeof input.title !== "string" || !Array.isArray(input.labelIds)) throw new Error("Incomplete issue creation");
+        if (issues.has(input.id)) { reply(200, { errors: [{ message: "Issue ID already exists" }] }); return; }
+        count += 1;
+        const at = stamp();
+        const created: IntakeFixtureIssue = {
+          id: input.id, identifier: `TEST-${count}`, url: `https://linear.example.invalid/issue/TEST-${count}`,
+          title: input.title, description: input.description ?? "", createdAt: at, updatedAt: at, archivedAt: null,
+          teamId: input.teamId, stateType: "unstarted", creatorId: creatorOfCreated, attachmentUrls: [],
+          labels: input.labelIds.map((id: string) => labels.find(label => label.id === id)?.name).filter(Boolean),
+        };
+        if (editNextCreated) { Object.assign(created, editNextCreated); editNextCreated = undefined; }
+        issues.set(created.id, created);
+        if (loseNextIssue) { loseNextIssue = false; response.destroy(); return; }
+        reply(200, { data: { issueCreate: { success: true, issue: node(created) } } });
+        return;
+      }
       case "InfiniteIntakeComment": {
         const found = comments.get(variables.filter?.id?.eq);
         reply(200, { data: { comments: { nodes: found ? [{ id: found.id, body: found.body, issue: { id: found.issueId } }] : [] } } });
@@ -125,6 +158,18 @@ export async function startIntakeLinearServer(options: { clock?: () => number } 
     },
     /** The next comment create commits, but its HTTP response is lost. */
     loseNextCommentResponse() { loseNext = true; },
+    /** The next issue create commits, but its HTTP response is lost. */
+    loseNextIssueResponse() { loseNextIssue = true; },
+    /** The next issue create commits with these fields changed, as if a teammate edited the issue at once. */
+    editNextCreated(change: Partial<IntakeFixtureIssue>) { editNextCreated = change; },
+    /** The next issue create is refused with a GraphQL error and commits nothing. */
+    refuseNextIssue() { refuseNextIssue = true; },
+    /** Replaces the labels Linear holds. */
+    setLabels(next: { name: string; teamId: string | null }[]) { labels.splice(0, labels.length, ...next.map(label => ({ id: randomUUID(), ...label }))); },
+    /** The creator Linear reports for issues the host files. */
+    createdBy(id: string | null) { creatorOfCreated = id; },
+    /** Every issue Linear holds. */
+    allIssues(): IntakeFixtureIssue[] { return [...issues.values()]; },
     /** While true, every request fails with a 503. */
     unavailable(value: boolean) { unavailableValue = value; },
     async close() {

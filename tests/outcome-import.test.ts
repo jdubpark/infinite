@@ -156,6 +156,10 @@ test("a superseded line is dropped in either order across batches", () => {
     assert.deepEqual(importLegacy(second, { dryRun: false, lines: [line("B", { supersedes: "A" })] }, OPTIONS).outcomes, ["imported"]);
     assert.deepEqual(importLegacy(second, { dryRun: false, lines: [line("A")] }, OPTIONS).outcomes, ["superseded"]);
 
+    // An edit of the dropped line is refused, as an edit of a stored line is: the first body the host saw stays.
+    assert.deepEqual(importLegacy(first, { dryRun: false, lines: [line("A", { attempts: 2 })] }, OPTIONS).outcomes, ["changed"]);
+    assert.deepEqual(importLegacy(first, { dryRun: false, lines: [line("A")] }, OPTIONS).outcomes, ["superseded"]);
+
     const forwardState = snapshot(first);
     assert.deepEqual(forwardState.rows, { A: null, B: "B" });
     assert.equal(forwardState.states.A?.state, "superseded");

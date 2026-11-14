@@ -291,9 +291,9 @@ test("a superseded line is dropped in either order", () => {
  * A model of the two tables. `run` plans one batch against the model and applies its effects in order, as the import
  * does against the store.
  */
-function model() {
+function model(held: Iterable<[string, string]> = []) {
   const lines = new Map<string, LegacyLineState>();
-  const rows = new Map<string, string>();
+  const rows = new Map<string, string>(held);
   return {
     run(batch: LegacyOutcome[]) {
       const plan = planLegacyBatch(batch, { lines: new Map(lines), rows: new Map(rows) }, ctx);
@@ -432,6 +432,26 @@ test("tables do not depend on order, repetition, or batch cuts", () => {
     }
   }
   assert.ok(compared > 2000, "the comparison ran");
+});
+
+test("a conflict is refused in either order", () => {
+  // A row that the import did not write holds X's outcome id. X is refused wherever it comes, also under a mark.
+  const P = line({ id: "op-p", recordedAt: "2026-10-01T00:00:00.000Z" });
+  const X = line({ id: "op-x", supersedes: "op-p", recordedAt: "2026-10-02T00:00:00.000Z" });
+  const Y = line({ id: "op-y", supersedes: "op-x", recordedAt: "2026-10-03T00:00:00.000Z" });
+  const held: [string, string][] = [[legacyOutcomeId(ref(X.id)), "production"]];
+  const expected = {
+    lines: [imported(P), [ref(X.id), { state: "superseded", lineHash: null, recordedAt: Y.recordedAt }], imported(Y)],
+    rows: [legacyOutcomeId(ref(P.id)), legacyOutcomeId(ref(X.id)), legacyOutcomeId(ref(Y.id))].sort(),
+  };
+  for (const order of orders([P, X, Y])) {
+    const one = model(held);
+    const plan = one.run(order);
+    assert.equal(plan.outcomes[order.indexOf(X)], "conflict", order.map(item => item.id).join(" "));
+    const each = model(held);
+    for (const item of order) each.run([item]);
+    for (const tables of [one.tables(), each.tables()]) assert.deepEqual(tables, expected, order.map(item => item.id).join(" "));
+  }
 });
 
 test("another body under a superseded id is refused", () => {

@@ -2057,7 +2057,9 @@ A refused line does not stop the other lines of its batch. A replay changes
 nothing. What the host stores depends on the set of lines, not on their order
 or on where the file is cut into batches. A line that was itself superseded
 still replaces the line it names. So a chain of `supersedes` keeps only its
-last line, and a cycle keeps no line.
+last line, and a cycle keeps no line. This holds for one body per id: of two
+bodies under one id, the first that the host sees stays, and the other is
+`changed`.
 
 `--dry-run` writes nothing. It decides each batch against what the host holds,
 so it reports what a real import of that batch would. In a file of more than

@@ -2519,6 +2519,7 @@ The local reviewer proved two faults in `planLegacyBatch` with probes and named 
 6. **The roll-up route lowercases the id.** A UUID is case-insensitive and the host's ids are lower case, so an upper-case query of a held goal or mission answered 404.
 7. **The module's `outcomes` count leaves out legacy rows.** `legacy` counts them, so a reader of the status does not take an operator's claim for a host row.
 8. The migration test also compares every earlier column of every row before and after.
+9. **After the second local pass** (approve, both blockers closed): the rule of ruling 1 holds for lines with one body per id; of two bodies under one id, the first that the host sees stays (the refuse-edits rule), and the planner's comment and the docs say so. **A line whose outcome id a row of another source holds answers `conflict` wherever it comes, also under a mark.** Before, such a line under a mark completed the mark and applied its `supersedes`, so the refusal depended on the order. No host write makes an id of the form `legacy:` plus a blind index, so this is a guard, not a reachable state. Test `a conflict is refused in either order`. `a superseded line is dropped in either order across batches` also sends an edit of the dropped line through the import and expects `changed`.
 
 ## Not in this slice
 

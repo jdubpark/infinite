@@ -179,10 +179,11 @@ export type LegacyEffect = { kind: "insert"; ref: string; row: OutcomeRow; state
 export type LegacyPlan = { outcomes: LegacyLineOutcome[]; effects: LegacyEffect[]; removed: number; newLines: number };
 
 /**
- * Walks the lines in array order. Each line sees the effects of the earlier lines. The tables that result depend on
- * the set of lines, never on their order or on how a client cut its batches: a line has a row when the host saw it and
- * no seen line names it, and it is superseded when a seen line names it. Only the answer for each line depends on
- * what came before it. Never reads or writes the store.
+ * Walks the lines in array order. Each line sees the effects of the earlier lines. For lines with one body per id, the
+ * tables that result depend on the set of lines, never on their order or on how a client cut its batches: a line has
+ * a row when the host saw it and no seen line names it, and it is superseded when a seen line names it. Only the
+ * answer for each line depends on what came before it. Of two bodies under one id, the first that the host sees
+ * stays, and the other is refused with no effect. Never reads or writes the store.
  */
 export function planLegacyBatch(lines: readonly LegacyOutcome[],
   known: { lines: ReadonlyMap<string, LegacyLineState>; rows: ReadonlyMap<string, string> },   // by ref; outcome id -> source
@@ -228,6 +229,13 @@ export function planLegacyBatch(lines: readonly LegacyOutcome[],
 
     if (Date.parse(line.recordedAt) <= cutoff) {
       outcomes.push("expired");
+      continue;
+    }
+    // A row that the import did not write holds this outcome id. The line is refused wherever it comes, also under a
+    // mark, so the refusal does not depend on the order. No host write makes an id of this form; this is a guard.
+    const holder = rows.get(id);
+    if (holder !== undefined && holder !== "legacy") {
+      outcomes.push("conflict");
       continue;
     }
     const current = states.get(ref);

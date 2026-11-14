@@ -1,9 +1,10 @@
 import type { EvidenceStore } from "./evidence/store.js";
 import { EvidenceError } from "./evidence/types.js";
 import { buildCells, checkCellQuery, type Cell, type CellQuery, type CostLookup } from "./outcome-cells.js";
-import { OUTCOMES_MODULE, type OutcomeRow, selectOutcomes } from "./outcome-store.js";
+import { OUTCOMES_MODULE, type OutcomeRow, rollupRecords, selectOutcomes } from "./outcome-store.js";
 import { profileIdentityKey } from "./config-identity.js";
 import { CONFIGURATIONS_MODULE, epochAt } from "./configuration-store.js";
+import { buildRollup, type GoalAssessment, type OutcomeRollup, type RollupTarget } from "./outcome-rollup.js";
 
 export type CellsResult = { cells: Cell[]; unreadable: number };
 
@@ -69,4 +70,17 @@ function noteUnreadable(unreadable: number): void {
   if (unreadable === 0 || loggedUnreadable) return;
   loggedUnreadable = true;
   console.warn("Outcome reads skipped unreadable rows.");
+}
+
+/**
+ * The roll-up of one goal or mission. Throws `EvidenceError` with code `unavailable` when the `outcomes` module is not
+ * ready. `known` and `assessment` come from the route, which holds the goal and mission services. This never reads them.
+ */
+export function queryRollup(store: EvidenceStore, target: RollupTarget,
+  options: { known: boolean; assessment: GoalAssessment | null; cost?: CostLookup }): OutcomeRollup {
+  requireOutcomes(store);
+  const records = store.read(db => rollupRecords(db, target.kind, db.index(target.kind, target.id)));
+  const { summaries, rows, members } = records.unreadable;
+  noteUnreadable(summaries + rows + members);
+  return buildRollup(records, { target, known: options.known, assessment: options.assessment, cost: options.cost });
 }

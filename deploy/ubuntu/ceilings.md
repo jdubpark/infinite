@@ -138,6 +138,7 @@ Removing a ceiling removes the protection. Doctor then reports `missing`. Do thi
 ## Limits
 
 - The ceilings are machine-wide. Every account on this server that runs the provider CLI reads them. They do not apply to other machines.
+- The four `Read` deny rules name the first instance's paths. A second instance's agents read the same file, so the two mode keys apply to them, but its own issuer directory, key directory, token cache, and vault key directory are not named. File modes still protect those. Doctor compares the installed file with the shipped template, so adding an instance's paths by hand makes the hash check report `changed`.
 - The install script has not been run. It needs root on Linux, and no test in this repository covers it.
 - A `Read` deny rule does not block shell commands. See the note in the Claude Code table.
 - Doctor reads the installed files as the account that runs it. A file the account cannot read is reported as `changed`.

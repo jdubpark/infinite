@@ -114,6 +114,8 @@ test("the instance drain wrapper runs the instance's relay, and the instance sud
 test("every tracked deploy file that names a first-instance path is rendered for an instance or kept for the first instance only", () => {
   const firstInstanceOnly = new Map([
     ["README.md", "the first instance's install guide; a second instance follows instances.md"],
+    ["ceilings.md", "the machine's one set of provider ceilings; its deny rules name the first instance's secret paths"],
+    ["ceilings/managed-settings.json", "one file for the whole machine; an instance's secret paths are not in its deny rules, as ceilings.md says"],
     ["backup.py", "the machine's one backup job, which reads the whole data volume"],
     ["backups.md", "documents that one backup job"],
     ["infinite-backup.service", "runs that one backup job"],

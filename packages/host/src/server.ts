@@ -53,6 +53,7 @@ import { CellQueryRefused, type CellQuery, type CostLookup } from "./outcome-cel
 import { currentEpochs, productionRows, queryCells, queryRollup } from "./outcome-reads.js";
 import { latestAssessment, rollupMissing, type RollupTarget } from "./outcome-rollup.js";
 import { importLegacy, LegacyImportRefused } from "./outcome-import.js";
+import { sessionCostOf } from "./outcome-cost.js";
 import { legacyBatchSchema } from "./outcome-legacy.js";
 import { GoalService } from "./goals.js";
 import { RoutineService } from "./routines.js";
@@ -706,13 +707,8 @@ export function createApp(config: Config, key: Buffer) {
     if (result === "write-failed") return void res.status(503).json({ error: "The fuse could not record the close", code: "write-failed" });
     return void res.json({ result, view: fuse.view() });
   });
-  // The cost of a session as the usage service measured it. A session it did not measure has no cost, and no scorecard or cell counts it as zero.
-  // A session that the usage ledger could not read is not "no measurement": the read fails, and the route answers 503.
-  const sessionCost: CostLookup = sessionId => {
-    const found = usage.session(sessionId);
-    if (!found.measured && found.unavailable) throw new EvidenceError("unavailable", "The usage ledger is unavailable.");
-    return found.measured ? { usd: found.cost, tokens: found.tokens.input + found.tokens.output + found.tokens.reasoning + found.tokens.cacheRead + found.tokens.cacheWrite, complete: found.pricing.unknown === 0 } : undefined;
-  };
+  // The cost of a session as the usage ledger measured it. The rules are in `sessionCostOf`.
+  const sessionCost: CostLookup = sessionId => sessionCostOf(usage.session(sessionId));
   // The configured lineup's label, then the newest held run whose member names the profile. Otherwise the scorecard shows the profile ID.
   // Built once per request: the Cost views poll this route.
   const profileLabels = (): ((profileId: string) => string | undefined) => {

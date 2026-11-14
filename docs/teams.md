@@ -1837,8 +1837,8 @@ The numbers changed on purpose in these eight ways:
 The first start after an upgrade writes the rows of every retained run that predates the ledger before the host serves, so the scorecard never shows a part of the history as all of it.
 
 Cost is the usage service's measured total for each session. A session it did
-not measure, or one with partly unpriced usage, is left out of every cost figure
-and is never counted as zero. A rate with no counted attempt prints as
+not measure, one it covered only in part, or one with partly unpriced usage is
+left out of every cost figure and is never counted as zero. A rate with no counted attempt prints as
 `rate unknown`, never as 0%.
 
 `GET /api/outcomes?project=&role=&by=&sources=&days=` returns display cells to
@@ -2021,8 +2021,9 @@ Unknown values stay unknown:
 
 - `counts` and `rounds` are summed over settled runs only. Both are null when
   no run has settled.
-- A session's cost counts only when its cost is complete. A session left out
-  of the cost is never counted as zero.
+- A session's cost counts only when it is complete: the usage ledger covered
+  the whole session, and every step has a price. A session left out of the cost
+  is never counted as zero.
 - `tokens` and `spentUsd` are null when nothing was summed, never 0.
 - Only a metered provider adds to `spentUsd`.
 

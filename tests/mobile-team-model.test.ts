@@ -23,8 +23,8 @@ test("phone team controls follow the documented roles and goal ownership", () =>
   assert.deepEqual(teamControls(team(), "viewer", true), { answer: false, steer: false, pause: false, resume: false, cancel: false });
   // A goal-owned team is steered and stopped from its goal; its decisions stay answerable here.
   assert.deepEqual(teamControls(team({ goal: { id: "goal", revision: 1, cycle: 1 } }), "owner", true), { answer: true, steer: false, pause: false, resume: false, cancel: false });
-  // A mission subteam is run only by its coordinator; the owner talks to the coordinator instead.
-  assert.deepEqual(teamControls(team({ missionId: "mission", status: "blocked", resumable: true }), "owner", true), { answer: false, steer: false, pause: false, resume: false, cancel: false });
+  // A mission subteam is run only by its coordinator; the owner talks to the coordinator instead, but may cancel it once blocked.
+  assert.deepEqual(teamControls(team({ missionId: "mission", status: "blocked", resumable: true }), "owner", true), { answer: false, steer: false, pause: false, resume: false, cancel: true });
   // A stale view offers nothing until a poll succeeds.
   assert.deepEqual(teamControls(team(), "owner", false), { answer: false, steer: false, pause: false, resume: false, cancel: false });
   assert.deepEqual(teamControls(team({ status: "paused" }), "owner", true), { answer: false, steer: true, pause: false, resume: true, cancel: true });
@@ -40,6 +40,18 @@ test("phone team controls follow the documented roles and goal ownership", () =>
   assert.deepEqual(teamControls(team({ status: "blocked", deliveryReceipt: receipt }), "owner", true), { answer: true, steer: false, pause: false, resume: false, cancel: true });
   for (const status of ["blocked", "ready-for-review", "no-change"] as const) assert.equal(teamControls(team({ status }), "owner", true).pause, false, status);
   assert.deepEqual(teamControls(team({ status: "cancelled" }), "owner", true), { answer: false, steer: false, pause: false, resume: false, cancel: false });
+});
+
+test("an owner may cancel a blocked goal or mission run only while the view is fresh", () => {
+  const goalRun = { id: "goal", revision: 1, cycle: 1 };
+  assert.equal(teamControls(team({ status: "blocked", goal: goalRun }), "owner", true).cancel, true);
+  assert.equal(teamControls(team({ status: "implementing", goal: goalRun }), "owner", true).cancel, false);
+  assert.equal(teamControls(team({ status: "blocked", goal: goalRun }), "controller", true).cancel, false);
+  assert.equal(teamControls(team({ status: "blocked", goal: goalRun }), "owner", false).cancel, false);
+  assert.equal(teamControls(team({ status: "blocked", missionId: "mission" }), "owner", true).cancel, true);
+  assert.equal(teamControls(team({ status: "blocked", missionId: "mission" }), "viewer", true).cancel, false);
+  // A blocked standalone run keeps its existing rule: the owner can cancel it regardless of goal or mission.
+  assert.equal(teamControls(team({ status: "blocked" }), "owner", true).cancel, true);
 });
 
 test("phone worker status reports live capacity and waiting ready tasks", () => {

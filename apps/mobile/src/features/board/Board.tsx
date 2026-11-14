@@ -7,11 +7,11 @@ import { Avatar } from "../../components/Avatar";
 import { Chip, GroupHeader, LiveStatus, Sheet, SheetRow } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
 import { FloatingNotice } from "../../components/FloatingNotice";
-import { age, type StatusKind } from "../../status";
+import { age } from "../../status";
 import { theme } from "../../theme";
 import { visibleGroups } from "../projects/model";
 import { Composer } from "./Composer";
-import { groupBoard, missionStatusLabel } from "./model";
+import { attemptLabel, boardKind, boardStatusLabel, groupBoard } from "./model";
 
 export function Board({ connection, machines, pushNote, onSelectMachine, onAddMachine, onDisconnect }: {
   connection: Connection; machines: Connection[]; pushNote?: string;
@@ -42,19 +42,6 @@ export function Board({ connection, machines, pushNote, onSelectMachine, onAddMa
     else if (item.kind === "team") router.push({ pathname: "/team/[id]", params: { id: item.id, machine } });
     else router.push({ pathname: "/goal/[id]", params: { id: item.id, machine } });
   };
-  const titleOfStatus = (item: BoardItem) => {
-    if (item.kind === "mission") return missionStatusLabel(item.status as Parameters<typeof missionStatusLabel>[0]);
-    const words = item.status.replace(/-/g, " ");
-    return words.charAt(0).toUpperCase() + words.slice(1);
-  };
-  const kindOf = (item: BoardItem): StatusKind => {
-    if (item.status === "needs-input") return "attention";
-    if (item.status === "blocked") return "blocked";
-    if (item.status === "paused") return "paused";
-    if (item.column === "review") return "review";
-    if (item.column === "ended") return item.status === "cancelled" ? "cancelled" : "done";
-    return "progress";
-  };
   const refresh = () => poll.refresh();
 
   return <View style={s.fill}>
@@ -82,9 +69,9 @@ export function Board({ connection, machines, pushNote, onSelectMachine, onAddMa
             onToggle={section.id === "ended" ? () => setEndedOpen(value => !value) : undefined} />
           {section.id !== "ended" ? <Text style={s.subtitle}>{section.subtitle}</Text> : null}
           {folded ? null : section.items.map(item => <Pressable key={`${item.kind}/${item.id}`} accessibilityRole="button"
-            accessibilityLabel={`Open ${item.kind} ${item.title}, ${titleOfStatus(item)}`} onPress={() => open(item)}
+            accessibilityLabel={`Open ${item.kind} ${item.title}, ${boardStatusLabel(item)}${attemptLabel(item) ? `, ${attemptLabel(item)}` : ""}`} onPress={() => open(item)}
             style={({ pressed }) => [s.row, pressed && s.pressed]}>
-            <View style={s.icon}><StatusIcon kind={kindOf(item)} size={18} /></View>
+            <View style={s.icon}><StatusIcon kind={boardKind(item)} size={18} /></View>
             <View style={s.main}>
               <View style={s.rowHead}>
                 <Text style={s.rowTitle} numberOfLines={1}>{item.title}</Text>
@@ -92,7 +79,8 @@ export function Board({ connection, machines, pushNote, onSelectMachine, onAddMa
               </View>
               <View style={s.rowMeta}>
                 <Chip label={item.projectName} accessibilityLabel={`Project: ${item.projectName}`} />
-                <Text style={[s.status, (item.column === "needs-input" || item.status === "paused") && s.attention]} numberOfLines={1}>{titleOfStatus(item)}</Text>
+                <Text style={[s.status, (item.column === "needs-input" || item.status === "paused") && s.attention]} numberOfLines={1}>{boardStatusLabel(item)}</Text>
+                {attemptLabel(item) ? <Text style={s.progress}>{attemptLabel(item)}</Text> : null}
                 {item.subtasks?.total ? <Text style={s.progress}>{item.subtasks.done}/{item.subtasks.total}</Text> : null}
               </View>
               <Text style={s.detail} numberOfLines={1}>{item.detail}</Text>

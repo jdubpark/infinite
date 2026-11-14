@@ -741,7 +741,7 @@ criteria as `c0`, the non-goals, the evidence, and the allowed paths, and it
 gets one direction for each steering message, in steering order. Each change
 is logged. The owner reads the record, or any past version of it, with
 `infinite goal record ID [--version N] [--json]` or `GET /api/goals/:id/record`.
-A standalone run gets its record at its first accepted plan. Goal cycle runs
+A standalone run gets its record at its first accepted plan. Goal cycle runs,
 mission subteams, and handoff runs have no record of their own. The record changes no prompt
 yet, and the relay does not carry it.
 

@@ -527,6 +527,12 @@ test("a refused patch form leaves the patch missing", async () => {
     const parts = partsOf(w.store);
     assert.notEqual(parts.capsule, undefined);
     assert.equal(parts.reference, undefined);
+    // An empty reference read is a read that failed without saying so: it is missing, not stored.
+    w.git.answer("names", OTHER_COMMIT, { state: "read", names: ["a.txt", "tests/a.test.ts"] });
+    w.git.answer("patch", OTHER_COMMIT, { state: "read", bytes: Buffer.alloc(0) });
+    w.capture.integrated(start({ memberId: OTHER_MEMBER, commit: OTHER_COMMIT }));
+    await w.capture.idle();
+    assert.equal((taskRow(w.store, OTHER_MEMBER)?.payload as { reference?: string } | undefined)?.reference, "missing");
     writeLedger(w.store, ledger());
     w.capture.reconcile();
     const row = taskRow(w.store);

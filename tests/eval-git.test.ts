@@ -71,7 +71,7 @@ test("the patch form is exact and checked", async () => {
     assert.equal((await git.patch(dir, from, to)).state, "read");
     assert.deepEqual(
       readFileSync(record, "utf8").split("\n").filter(Boolean),
-      ["git", ...teamGitArgs(dir, ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--binary", "--default-prefix", "--no-renames", from, to, "--"])],
+      ["git", ...teamGitArgs(dir, ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--binary", "--default-prefix", "--no-renames", "--submodule=short", "--ignore-submodules=none", from, to, "--"])],
     );
 
     for (const bad of ["HEAD", "-x", FAKE_HEX]) {
@@ -150,6 +150,27 @@ test("names and the base check", async () => {
     const refused = captureGit(() => failingPrefix(dir));
     assert.equal(await refused.onBaseBranch(dir, base, three), "not-proven");
     assert.deepEqual(await refused.names(dir, base, three, 500), { state: "failed" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a refused patch is failed, and a cut name list is too-wide", async () => {
+  const dir = makeRepo();
+  try {
+    const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
+    const to = commit(dir, writeFiles({ "a.txt": "two\n" }), "to");
+    // A launcher that refuses the form exits 1: the answer is a failed read, never an empty patch.
+    const refused = captureGit(() => failingPrefix(dir));
+    assert.deepEqual(await refused.patch(dir, from, to), { state: "failed" });
+
+    // About 400 names of about 180 characters each: more than 64 KiB of names, so teamCommand cuts the list.
+    const wide = commit(dir, (root) => {
+      for (let index = 0; index < 400; index++) {
+        writeFileSync(join(root, `n${String(index).padStart(3, "0")}-${"x".repeat(170)}.txt`), "x\n");
+      }
+    }, "wide names");
+    assert.deepEqual(await captureGit(() => undefined).names(dir, from, wide, 500), { state: "too-wide" });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

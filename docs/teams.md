@@ -506,12 +506,12 @@ Promotion codes. The ledger's decision rule runs first, then the facts, in this 
 
 An unfrozen ledger row waits. A ledger row that does not open leaves its task as it is, and the pass counts it as `unreadable`.
 
-A missing fact stays missing. A refused patch is never stored as empty. A truncated list is never read as complete. An unknown acceptance is never a refusal or an acceptance.
+A missing fact stays missing. A refused patch is never stored as empty. A truncated list is never read as complete. An unknown acceptance is never a refusal or an acceptance. An empty reference patch counts as missing, because a captured task has at least two files, so an empty read means the read failed without saying so. An empty base delta is kept, because two different commits may have equal trees.
 
 ### Deletion and retention
 
-- When a cancelled run's record is deleted, its captured tasks and all their sealed material are deleted at once. A run with no readable status is treated the same way.
-- When any other run is deleted, its tasks stay. They are stamped with the deletion time, and retention removes them later.
+- A deleted run keeps its captured tasks only when it merged, needed no change, or was ready for review. Any other deleted run, and a run with no readable status, takes its tasks and their sealed material with it. The status is the run's last `run.deleted` or `run.settled` event.
+- A kept task is stamped with the deletion time, and retention removes it later.
 - Retention removes a task once its capture time is older than the project's `retentionDays`. A task whose project is no longer configured keeps the default of 365 days. The sweep removes at most 100 rows a pass.
 - Removing a run's clones does not change a captured task.
 
@@ -526,8 +526,10 @@ These are the defaults this slice ships. The owner has not yet decided them (spe
 | Reference file list | 500 names | `reference-too-wide` |
 | Later-change list | 2,000 names | `reference-unknown` |
 | Tasks, per project | 20,000 rows, rejected rows included | No new row |
-| Material, per project | 134,217,728 bytes (128 MiB) | No new row, or `corpus-full` |
-| Material, per host | 536,870,912 bytes (512 MiB) | No new row, or `corpus-full` |
+| Material, per project | 134,217,728 bytes (128 MiB) | `corpus-full` at completion |
+| Material, per host | 536,870,912 bytes (512 MiB) | `corpus-full` at completion |
+
+A new task is refused at 20,000 tasks for a project. The byte caps are checked when the material completes: a completion that would pass either material cap rejects the task `corpus-full`, and every part is removed.
 
 ### Queue limits
 
@@ -547,7 +549,7 @@ Each capture read runs through the team Git prefix, with the six `-c` settings. 
 
 | Form | Command | Limit | If refused |
 |---|---|---|---|
-| 1. Patch (new) | `git diff --no-ext-diff --no-textconv --no-color --binary --default-prefix --no-renames FROM TO --`, in the run's integration checkout | 1,048,576 bytes; Git 2.41 or later | The patch is `missing`, and the task ends `patch-missing`. |
+| 1. Patch (new) | `git diff --no-ext-diff --no-textconv --no-color --binary --default-prefix --no-renames --submodule=short --ignore-submodules=none FROM TO --`, in the run's integration checkout | 1,048,576 bytes; Git 2.41 or later | The patch is `missing`, and the task ends `patch-missing`. |
 | 2. Name list (reused) | `git diff --no-ext-diff --no-textconv --name-only --no-renames -z FROM TO --`, in the same checkout | 500 names for a reference; 2,000 for later changes; 64 KiB of output | The reference ends `capture-failed`; a later-change list leaves the approval unknown. |
 | 3. Base check (reused, form 1 of the base scan) | `git merge-base --is-ancestor ANCHOR HEAD`, in the source mirror, where `HEAD` is the mirror's head | 30 seconds | Every task ends `base-not-proven`. |
 

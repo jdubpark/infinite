@@ -9,7 +9,7 @@ export const PATCH_MAX_BYTES = 1_048_576, CAPTURE_READ_MS = 30_000;
 /** The new form (see "Git commands"). Throws TypeError when an id fails COMMIT_ID. */
 export function patchArgs(from: string, to: string): string[] {
   if (!COMMIT_ID.test(from) || !COMMIT_ID.test(to)) throw new TypeError("A capture patch needs two full commit ids.");
-  return ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--binary", "--default-prefix", "--no-renames", from, to, "--"];
+  return ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--binary", "--default-prefix", "--no-renames", "--submodule=short", "--ignore-submodules=none", from, to, "--"];
 }
 
 function namesArgs(from: string, to: string) {

@@ -30,6 +30,9 @@ export const SWEEP_BATCH = 100;
 
 const DAY_MS = 86_400_000;
 
+/** The last statuses of a deleted run that keep its tasks. Any other status, or none, takes them. */
+const KEEP_STATUSES: ReadonlySet<string> = new Set(["merged", "no-change", "ready-for-review"]);
+
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS eval_tasks (
     task_id TEXT PRIMARY KEY,
@@ -52,7 +55,10 @@ const SCHEMA = [
   )`,
   "CREATE INDEX IF NOT EXISTS eval_tasks_run ON eval_tasks (run_id)",
   "CREATE INDEX IF NOT EXISTS eval_tasks_project ON eval_tasks (project_ref, captured_at)",
-  "CREATE INDEX IF NOT EXISTS eval_tasks_check ON eval_tasks (state, checked_at)",
+  "CREATE INDEX IF NOT EXISTS eval_tasks_check ON eval_tasks (state, checked_at, task_id)",
+  "CREATE INDEX IF NOT EXISTS eval_tasks_bytes ON eval_tasks (project_ref, material_bytes)",
+  "CREATE INDEX IF NOT EXISTS eval_tasks_live_runs ON eval_tasks (run_id) WHERE run_deleted_at IS NULL",
+  "CREATE INDEX IF NOT EXISTS eval_tasks_captured ON eval_tasks (captured_at)",
   `CREATE TABLE IF NOT EXISTS eval_material (
     task_id TEXT NOT NULL,
     part TEXT NOT NULL,
@@ -115,15 +121,14 @@ export function evalCorpusModule(store: EvidenceStore, now: () => string): Evide
       if (owned === 0) return;
       // Read before the store deletes the run's events: the hook runs first.
       const status = lastRunStatus(store, tx, runId);
-      if (status !== undefined && status !== "cancelled") {
+      if (status !== undefined && KEEP_STATUSES.has(status)) {
         tx.run("UPDATE eval_tasks SET run_deleted_at=COALESCE(run_deleted_at, ?) WHERE run_id=?", now(), runId);
         return;
       }
       tx.run("DELETE FROM eval_material WHERE task_id IN (SELECT task_id FROM eval_tasks WHERE run_id=?)", runId);
       tx.run("DELETE FROM eval_tasks WHERE run_id=?", runId);
     },
-    runIds: db => db.all<{ run_id: string }>("SELECT DISTINCT run_id FROM eval_tasks WHERE run_deleted_at IS NULL")
-      .map(row => row.run_id),
+    runIds: db => db.all<{ run_id: string }>(LIVE_RUN_IDS_SQL).map(row => row.run_id),
     counts: db => {
       const row = db.get<{ captured: number; candidate: number; rejected: number; bytes: number }>(
         "SELECT COALESCE(SUM(state='captured'), 0) AS captured, COALESCE(SUM(state='candidate'), 0) AS candidate, "
@@ -144,8 +149,8 @@ export function capturedTaskId(runId: string, memberId: string): string {
 }
 
 /**
- * Writes the marker row, and for a captured task its capsule part. `full` when the project holds 20,000 rows, or
- * when the capsule would take the project or the host past its material cap. Nothing is written then.
+ * Writes the marker row, and for a captured task its capsule part. `full` when the project holds 20,000 rows. Nothing
+ * is written then. The byte caps apply at completion, in `completeMaterial`.
  */
 export function insertMarker(tx: EvidenceTx, start: CaptureStart, outcome: MarkerOutcome, at: string): "inserted" | "exists" | "full" {
   const taskId = capturedTaskId(start.runId, start.memberId);
@@ -153,13 +158,6 @@ export function insertMarker(tx: EvidenceTx, start: CaptureStart, outcome: Marke
   const rows = tx.get<{ n: number }>("SELECT count(*) AS n FROM eval_tasks WHERE project_ref=?", ref)?.n ?? 0;
   if (rows >= PROJECT_TASK_MAX) return "full";
   const capsuleBytes = outcome.state === "captured" ? Buffer.byteLength(canonicalJson(outcome.capsule), "utf8") : 0;
-  if (outcome.state === "captured") {
-    const projectBytes = materialBytesOf(tx, "project_ref=?", ref);
-    const hostBytes = materialBytesOf(tx, "1=1");
-    if (projectBytes + capsuleBytes > PROJECT_MATERIAL_MAX_BYTES || hostBytes + capsuleBytes > HOST_MATERIAL_MAX_BYTES) {
-      return "full";
-    }
-  }
   const captured = outcome.state === "captured";
   const payload: CapturedPayload | RejectedPayload = captured
     ? {
@@ -292,25 +290,42 @@ export function completeApproval(tx: EvidenceTx, taskId: string, approvedAt: str
 }
 
 /**
- * The restart rule. Material pending outside `inFlight` is rejected `capture-failed`; approval pending outside it
- * becomes `unknown`. Returns the number of tasks changed.
+ * The restart rule. Material pending outside `materialInFlight` is rejected `capture-failed`; approval pending outside
+ * `approvalInFlight` becomes `unknown`. Each half looks only at its own kind of job. Returns the number of tasks changed.
  */
-export function failPending(tx: EvidenceTx, inFlight: ReadonlySet<string>, at: string): number {
+export function failPending(
+  tx: EvidenceTx,
+  materialInFlight: ReadonlySet<string>,
+  approvalInFlight: ReadonlySet<string>,
+  at: string,
+): number {
   const touched = new Set<string>();
   const material = tx.all<{ task_id: string; payload: string }>("SELECT task_id, payload FROM eval_tasks WHERE material='pending'");
   for (const row of material) {
-    if (inFlight.has(row.task_id)) continue;
+    if (materialInFlight.has(row.task_id)) continue;
     rejectRow(tx, row.task_id, "capture-failed", at, projectIdOf(tx, row.task_id, row.payload));
     touched.add(row.task_id);
   }
   const approvals = tx.all<{ task_id: string }>("SELECT task_id FROM eval_tasks WHERE approval='pending'");
   for (const row of approvals) {
-    if (inFlight.has(row.task_id)) continue;
+    if (approvalInFlight.has(row.task_id)) continue;
     tx.run("UPDATE eval_tasks SET approval='unknown' WHERE task_id=?", row.task_id);
     touched.add(row.task_id);
   }
   return touched.size;
 }
+
+/** The reconcile pass's order query, run once per state through `eval_tasks_check`. */
+export const RECONCILE_ORDER_SQL = "SELECT task_id, checked_at FROM eval_tasks WHERE state = ? ORDER BY checked_at, task_id LIMIT ?";
+/** The runs with rows still held, read through `eval_tasks_live_runs`. */
+export const LIVE_RUN_IDS_SQL = "SELECT DISTINCT run_id FROM eval_tasks WHERE run_deleted_at IS NULL";
+/** The sweep's fallback for rows of no configured project, read through `eval_tasks_captured`. */
+export function sweepFallbackSql(configuredCount: number): string {
+  const exclude = configuredCount === 0 ? "" : ` AND project_ref NOT IN (${Array.from({ length: configuredCount }, () => "?").join(", ")})`;
+  return `SELECT task_id FROM eval_tasks WHERE captured_at < ?${exclude} ORDER BY captured_at LIMIT ?`;
+}
+/** One task's full row, by its key. */
+export const TASK_BY_ID_SQL = `SELECT ${TASK_COLUMNS} FROM eval_tasks WHERE task_id=?`;
 
 /**
  * Visits at most `limit` captured or candidate rows, oldest `checked_at` first. A payload that does not open rejects
@@ -318,11 +333,15 @@ export function failPending(tx: EvidenceTx, inFlight: ReadonlySet<string>, at: s
  */
 export function reconcileBatch(tx: EvidenceTx, decide: Decide, at: string, limit = SWEEP_BATCH): ReconcileResult {
   const result: ReconcileResult = { visited: 0, promoted: 0, rejected: 0, demoted: 0, waiting: 0, unreadable: 0 };
-  const rows = tx.all<TaskRow>(
-    `SELECT ${TASK_COLUMNS} FROM eval_tasks WHERE state IN ('captured', 'candidate') ORDER BY checked_at, task_id LIMIT ?`,
-    limit,
-  );
-  for (const row of rows) {
+  const order = [
+    ...tx.all<{ task_id: string; checked_at: string }>(RECONCILE_ORDER_SQL, "captured", limit),
+    ...tx.all<{ task_id: string; checked_at: string }>(RECONCILE_ORDER_SQL, "candidate", limit),
+  ]
+    .sort((a, b) => (a.checked_at === b.checked_at ? compareText(a.task_id, b.task_id) : compareText(a.checked_at, b.checked_at)))
+    .slice(0, limit);
+  for (const picked of order) {
+    const row = tx.get<TaskRow>(TASK_BY_ID_SQL, picked.task_id);
+    if (!row) continue;
     result.visited++;
     tx.run("UPDATE eval_tasks SET checked_at=? WHERE task_id=?", at, row.task_id);
     let task: EvalTaskRow & { payload: CapturedPayload };
@@ -361,7 +380,7 @@ export function reconcileBatch(tx: EvidenceTx, decide: Decide, at: string, limit
 }
 
 export function readEvalTask(db: EvidenceDb, taskId: string): EvalTaskRow | undefined {
-  const row = db.get<TaskRow>(`SELECT ${TASK_COLUMNS} FROM eval_tasks WHERE task_id=?`, taskId);
+  const row = db.get<TaskRow>(TASK_BY_ID_SQL, taskId);
   return row === undefined ? undefined : taskOf(db, row);
 }
 
@@ -416,9 +435,8 @@ export function sweepEvalTasks(
     remaining -= old.length;
   }
   if (remaining > 0) {
-    const exclude = configured.length === 0 ? "" : ` AND project_ref NOT IN (${configured.map(() => "?").join(", ")})`;
     const old = tx.all<{ task_id: string }>(
-      `SELECT task_id FROM eval_tasks WHERE captured_at < ?${exclude} ORDER BY captured_at LIMIT ?`,
+      sweepFallbackSql(configured.length),
       cutoff(fallbackDays),
       ...configured,
       remaining,
@@ -443,6 +461,11 @@ function rejectRow(tx: EvidenceTx, taskId: string, reason: EvalReason, at: strin
     payload,
     taskId,
   );
+}
+
+/** Code-unit order, the order SQLite's BINARY collation gives for these ASCII keys. */
+function compareText(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 function insertPart(tx: EvidenceTx, taskId: string, part: "base-delta" | "reference", bytes: Buffer): void {

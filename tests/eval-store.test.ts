@@ -17,11 +17,15 @@ import {
   capturedTaskId,
   completeApproval,
   completeMaterial,
+  LIVE_RUN_IDS_SQL,
+  RECONCILE_ORDER_SQL,
+  TASK_BY_ID_SQL,
   evalCorpusModule,
   insertMarker,
   markApproval,
   readMaterial,
   sweepEvalTasks,
+  sweepFallbackSql,
   type MaterialResult,
 } from "../packages/host/src/eval-store.js";
 
@@ -197,7 +201,9 @@ test("deleting a cancelled run deletes its tasks; another status stamps them", (
     const runA = "run-cancelled-a";
     const runB = "run-merged-b";
     const runC = "run-no-event-c";
-    for (const run of [runA, runB, runC]) {
+    const runD = "run-blocked-d";
+    const runE = "run-ready-e";
+    for (const run of [runA, runB, runC, runD, runE]) {
       f.store.write(tx => insertMarker(tx, captureStart("m-1", COMMIT, { runId: run }), { state: "captured", capsule: capsule() }, NOW));
       f.store.write(tx => insertMarker(tx, captureStart("m-2", HEAD, { runId: run }), { state: "rejected", reason: "ui-changes" }, NOW));
     }
@@ -205,6 +211,8 @@ test("deleting a cancelled run deletes its tasks; another status stamps them", (
     appendRunEvent(f, runA, "a-deleted", "run.deleted", "cancelled");
     appendRunEvent(f, runB, "b-settled", "run.settled", "merged");
     appendRunEvent(f, runB, "b-deleted", "run.deleted", "merged");
+    appendRunEvent(f, runD, "d-settled", "run.settled", "blocked");
+    appendRunEvent(f, runE, "e-deleted", "run.deleted", "ready-for-review");
 
     assert.equal(f.store.deleteRun(runA), true);
     assert.equal(count(f, "eval_tasks", "run_id=?", runA), 0);
@@ -218,6 +226,14 @@ test("deleting a cancelled run deletes its tasks; another status stamps them", (
 
     assert.equal(f.store.deleteRun(runC), true);
     assert.equal(count(f, "eval_tasks", "run_id=?", runC), 0);
+
+    // A run whose only status is `blocked` loses its tasks and material, even though it has an event.
+    assert.equal(f.store.deleteRun(runD), true);
+    assert.equal(count(f, "eval_tasks", "run_id=?", runD), 0);
+    assert.equal(count(f, "eval_material", "task_id LIKE ?", `%${runD}%`), 0);
+
+    assert.equal(f.store.deleteRun(runE), true);
+    assert.equal(count(f, "eval_tasks", "run_id=? AND run_deleted_at IS NOT NULL", runE), 2);
   } finally {
     f.close();
   }
@@ -348,6 +364,30 @@ test("retention removes old tasks per project", () => {
     assert.equal(first, 100);
     assert.equal(second, 50);
     assert.equal(count(f, "eval_tasks", "run_id=?", "run-ret-bulk"), 0);
+  } finally {
+    f.close();
+  }
+});
+
+test("the periodic passes read through an index", () => {
+  const f = ready();
+  try {
+    // The statements the reconcile pass, the hook's run list, and the sweep's fallback run, with their bound values.
+    const statements: { sql: string; params: (string | number)[] }[] = [
+      { sql: RECONCILE_ORDER_SQL, params: ["captured", 100] },
+      { sql: RECONCILE_ORDER_SQL, params: ["candidate", 100] },
+      { sql: TASK_BY_ID_SQL, params: ["captured:run-x:m-x"] },
+      { sql: LIVE_RUN_IDS_SQL, params: [] },
+      { sql: sweepFallbackSql(0), params: [NOW, 100] },
+      { sql: sweepFallbackSql(2), params: [NOW, "project-a", "project-b", 100] },
+    ];
+    for (const { sql, params } of statements) {
+      const plan = f.store.read(db => db.all<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, ...params)).map(row => row.detail);
+      for (const line of plan) {
+        assert.equal(line.includes("SCAN eval_tasks") && !line.includes("USING"), false, `${sql}: ${line}`);
+        assert.equal(line.includes("USE TEMP B-TREE"), false, `${sql}: ${line}`);
+      }
+    }
   } finally {
     f.close();
   }

@@ -34,7 +34,8 @@ export type TaskCaptureOptions = {
   deadlineMs?: number;
 };
 
-type Job = { taskId: string; run: () => Promise<void> };
+type JobKind = "material" | "approval";
+type Job = { kind: JobKind; taskId: string; run: () => Promise<void> };
 type BaseDelta = Extract<MaterialResult, { kind: "store" }>["baseDelta"];
 
 /** The skip lines already written in this process: one per code. */
@@ -83,8 +84,8 @@ export class TaskCapture implements CaptureSink {
   private readonly now: () => string;
   private readonly deadlineMs: number;
   private readonly queue: Job[] = [];
-  /** Task ids with a job queued or running. A restart rule must not fail these. */
-  private readonly live = new Map<string, number>();
+  /** Task ids with a job of each kind queued or running. The restart rule must not fail these for their own half. */
+  private readonly live: Record<JobKind, Map<string, number>> = { material: new Map(), approval: new Map() };
   private readonly waiters: Array<() => void> = [];
   private running = 0;
   /** Git calls that passed their deadline and have not settled yet. */
@@ -133,7 +134,7 @@ export class TaskCapture implements CaptureSink {
         return;
       }
       if (result === "inserted" && outcome.state === "captured") {
-        this.enqueue(capturedTaskId(start.runId, start.memberId), () => this.captureJob(start, settings, map));
+        this.enqueue("material", capturedTaskId(start.runId, start.memberId), () => this.captureJob(start, settings, map));
       }
     } catch {
       // Capture never changes a run.
@@ -159,7 +160,7 @@ export class TaskCapture implements CaptureSink {
       });
       if (!ok) return;
       for (const task of reads) {
-        this.enqueue(task.taskId, () => this.approvalJob(task.taskId, start, task.integratedHead));
+        this.enqueue("approval", task.taskId, () => this.approvalJob(task.taskId, start, task.integratedHead));
       }
     } catch {
       // Capture never changes a run.
@@ -172,7 +173,9 @@ export class TaskCapture implements CaptureSink {
       if (this.closed || !this.ready(EVAL_MODULE) || !this.ready(OUTCOMES_MODULE)) return emptyResult();
       let result = emptyResult();
       this.store.write(tx => {
-        if (!this.restartChecked) failPending(tx, new Set(this.live.keys()), this.now());
+        if (!this.restartChecked) {
+          failPending(tx, new Set(this.live.material.keys()), new Set(this.live.approval.keys()), this.now());
+        }
         result = reconcileBatch(tx, decideWith(tx), this.now(), RECONCILE_BATCH);
       });
       this.restartChecked = true;
@@ -209,7 +212,7 @@ export class TaskCapture implements CaptureSink {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    for (const job of this.queue.splice(0)) this.untrack(job.taskId);
+    for (const job of this.queue.splice(0)) this.untrack(job);
     this.notifyIdle();
   }
 
@@ -232,9 +235,9 @@ export class TaskCapture implements CaptureSink {
     return Math.max(0, CAPTURE_QUEUE_MAX - this.queue.length - this.running);
   }
 
-  private enqueue(taskId: string, run: () => Promise<void>): void {
-    this.live.set(taskId, (this.live.get(taskId) ?? 0) + 1);
-    this.queue.push({ taskId, run });
+  private enqueue(kind: JobKind, taskId: string, run: () => Promise<void>): void {
+    this.live[kind].set(taskId, (this.live[kind].get(taskId) ?? 0) + 1);
+    this.queue.push({ kind, taskId, run });
     this.pump();
   }
 
@@ -246,17 +249,18 @@ export class TaskCapture implements CaptureSink {
         .catch(() => undefined)
         .finally(() => {
           this.running -= 1;
-          this.untrack(job.taskId);
+          this.untrack(job);
           this.pump();
           this.notifyIdle();
         });
     }
   }
 
-  private untrack(taskId: string): void {
-    const count = (this.live.get(taskId) ?? 1) - 1;
-    if (count > 0) this.live.set(taskId, count);
-    else this.live.delete(taskId);
+  private untrack(job: Job): void {
+    const live = this.live[job.kind];
+    const count = (live.get(job.taskId) ?? 1) - 1;
+    if (count > 0) live.set(job.taskId, count);
+    else live.delete(job.taskId);
   }
 
   private notifyIdle(): void {
@@ -337,7 +341,8 @@ export class TaskCapture implements CaptureSink {
       files: verdict.files,
       hiddenFiles: verdict.hiddenFiles,
       baseDelta,
-      reference: reference.state === "read" ? { state: "stored", bytes: reference.bytes } : { state: "missing" },
+      // An empty reference is a read that failed without saying so: a captured task has at least two files.
+      reference: reference.state === "read" && reference.bytes.length > 0 ? { state: "stored", bytes: reference.bytes } : { state: "missing" },
       base,
     };
   }

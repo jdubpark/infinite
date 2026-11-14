@@ -24,6 +24,7 @@ import { workerCall } from "./ipc.js";
 import { Manager } from "./manager.js";
 import { parseDeployment } from "./deployment.js";
 import { planFleet } from "./fleet.js";
+import { CEILING_TARGETS, checkCeiling, nodeCeilingFs, shippedCeilingTemplate, type CeilingProvider } from "./ceilings.js";
 import type { Config, Provider, Role } from "./types.js";
 
 import { handleClientCommand } from "./client.js";
@@ -412,6 +413,23 @@ else if (command === "plan-fleet") {
         } catch {
           console.log(
             `${provider}: unavailable; install and authenticate on this host`,
+          );
+        }
+      }
+      for (const provider of ["claude", "codex"] as const satisfies readonly CeilingProvider[]) {
+        const profile = config.agents[provider];
+        if (!profile) continue;
+        for (const line of checkCeiling({
+          provider,
+          systemPath: CEILING_TARGETS[provider].systemPath,
+          templatePath: shippedCeilingTemplate(provider),
+          launchArgs: [...profile.args, ...(profile.appServerArgs ?? [])],
+          fs: nodeCeilingFs,
+        })) {
+          console.log(
+            line.status === "ok"
+              ? `ceiling ${line.provider} ${line.check}: ok (${line.detail})`
+              : `Warning: ceiling ${line.provider} ${line.check}: ${line.status} (${line.detail})`,
           );
         }
       }

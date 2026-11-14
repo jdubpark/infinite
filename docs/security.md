@@ -187,6 +187,8 @@ lease grants permission to bypass provider approval. The existing Infinite cmux
 discovery adapter continues to verify its target surface and foreground process;
 it is a different attachment path from direct native cmux.
 
+Provider ceilings are root-owned Claude Code and Codex policy files that the agent account cannot change. They are installed by the owner on a server, not by the host. See [provider ceilings](../deploy/ubuntu/ceilings.md) for the keys, what each one does not stop, and how `infinite doctor` checks them.
+
 ## Required on a real host
 
 Use Tailscale with device approval, restrictive ACLs, and SSH policy. Expose the API through **Serve**, never Funnel. Serve is private to the tailnet; it is a transport layer, not file encryption or runtime isolation. Check with a device outside the tailnet that the host is inaccessible. [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve).

@@ -97,7 +97,7 @@ The permission agent serves a workspace only when the host is ready: a light pro
 |---|---|
 | Team members in every role, including the project manager, the integrator, the reviewer and the delivery role | Yes. A delivery request keeps the pinned delivery policy and its host checks as additional conditions. |
 | Goal and mission coordinators, and sessions that the owner, a routine or intake starts in a workspace | Yes. While a person holds input control of the session, the request stays with that person. |
-| Headless sessions | Yes, through the permission channel, for providers that pass the spike. |
+| Headless sessions | Yes, through the permission channel. Claude Code passed the spike of 2026-11-14. Any other provider needs its own spike first. |
 | The permission agent's own model turns | Never. A permission need inside one is denied, as today. |
 | Sessions whose project has no delegation | No. They stay with the owner. |
 
@@ -160,7 +160,8 @@ The requester receives a fixed notice that the host wrote, with a reason code fr
 | `uncertain` | The permission agent could not decide with confidence. |
 | `unavailable` | No qualifying model could review the request in time. |
 | `locked` | The assignment repeated a rejected request twice. |
-| `needs-owner` | Headless only: the request needs the owner's own answer and cannot wait. |
+| `needs-owner` | Headless only, for a provider that cannot defer a call: the request needs the owner's own answer and cannot wait. |
+| `pending` | Headless only: another call of this session waits for the owner. The agent retries this call after that decision. |
 
 No other agent receives model text from the permission agent either. Permission recovery keeps bounded evidence collection and the guarded display expansion. Where it informs a project manager or a mission coordinator, it sends a fixed host outcome with the code. The written cause of a diagnostic turn stays in the record. Run status, Swarm and Linear show codes and host-written text, never the note.
 
@@ -191,16 +192,54 @@ A session outside a run has no assignment. The permission agent uses the host's 
 
 ### Headless sessions
 
-A headless session has no dialog. Its request reaches the permission agent through a permission channel, and the provider waits for the answer inside its own timeout.
+A headless session has no dialog. Its request reaches the permission agent through a permission channel. A request that the permission agent can decide is answered while the provider waits. A request that needs the owner is deferred: the provider stops with the call pending, no process waits, and the host resumes the session when the owner has decided.
 
 - The channel is separate from the signal hooks. A signal hook reply still never becomes a provider decision.
 - The channel is bound to the session's assignment token, like the report tool. One session cannot ask for, or answer, another session's request.
 - The answer is `allow` or `deny` with the fixed notice.
-- A launch profile's allowlist and deny rules stay and keep priority. The channel decides only the calls that they leave open.
+- A launch profile's allowlist and deny rules stay. The permission agent decides only the calls that they leave open.
 - If the channel is down or the answer does not arrive in time, the call is denied.
-- A request in an interrupt class cannot wait for the owner. It is denied with `needs-owner`, recorded, and pushed to the owner with the class. If the owner approves it, the host records a single-use grant as the owner's own decision. The grant is bound to the requesting session and to the request's evidence, which includes the tool input and the session root. The host consumes the grant durably and exclusively before it answers, so two requests cannot use it. The grant is never replayed as a verdict, it is retired when its delivery is uncertain, and it ends with the session. A replacement session of the same assignment can use it only when the owner chose that in the answer. It is not a persistent approval.
 
-For Claude Code, the documentation (read 2026-11-14) describes two mechanisms for a session that cannot show a prompt: a permission prompt tool, which is an MCP tool named at launch, and the `PermissionRequest` hook. It states that allow rules run without consulting either, and that a call a deny rule refuses stays refused. It does not state the timeout of a permission prompt tool call, or whether that tool's deny message reaches the model. The spike in "Delivery slices" measures both on the host's provider version before the mechanism is chosen. A provider whose headless mode fails the spike keeps today's behaviour, and `permissions status` lists it as not served.
+#### Spike result (Claude Code 2.1.325, 2026-11-14)
+
+The spike ran about 40 probes against the real CLI in throwaway repositories, with host-style hooks passed through `--settings`. The full record is kept privately, outside this repository. Each line below was observed unless it says documented.
+
+| Question | Result |
+|---|---|
+| Can a headless run wait for an outside decision with no process alive? | Yes. A `PreToolUse` hook that returns `defer` ends the run with `stop_reason: "tool_deferred"` and the pending call's id, name and input. `--resume` with no prompt fires the hook again for the same call. On `allow` the call runs exactly once. A second resume is refused. |
+| What does the model see after a deny? | The hook's reason, verbatim. It did not retry. |
+| Does a deny rule still win? | Yes over `allow`. A `defer` is taken first, and the deny rule applies after the resume. So the owner can be asked about a call that a deny rule will then refuse. |
+| Several calls in one turn | The documentation says `defer` is ignored. Observed: each call was deferred, only the last was reported, and the earlier ones were dropped on resume. Deferring the first undecided call and denying the others with a "retry after the pending decision" reason reported the right call, and the model retried the denied one after the resume. |
+| A resume that carries a prompt | The pending call is lost for good. The model gets an error in its place. |
+| Can a blocking hook decide open calls? | Yes. The `PermissionRequest` hook fires only for calls that the rules leave open. It allowed and denied in headless mode, and its deny message reached the model. It blocked for 90 seconds under the default timeout. When it timed out, the call went to the normal flow, which denied it. |
+| The permission prompt tool | It waited 300 seconds and its deny message reached the model. It is not consulted for calls an allow rule covers. A `PermissionRequest` hook from a project file answered before it and won. |
+| Can project files change the outcome? | Yes. A project settings file takes effect within a second, in the same session and on resume. `{"disableAllHooks": true}` there switched the host's `--settings` hooks off, unless the `--settings` JSON itself set `"disableAllHooks": false`. A project hook that returns `allow` approved every call the host hook abstained on. `--setting-sources ""` loaded no user, project or local settings and still applied `--settings`. |
+| A hook that cannot start | It is not a gate. The call continued through the normal flow. |
+| How long does a deferred session last? | Documented: no timeout and no retry limit. The session stays until the provider's retention sweep, 30 days by default. |
+
+Not tested: writes to provider settings through an interpreter, tool calls inside subagents, managed settings, two processes that resume one session, and any provider other than Claude Code.
+
+#### Mechanism
+
+For Claude Code the channel is two host hooks. The permission prompt tool is not used, because a project hook can win against it.
+
+1. **Class check, on every call.** The host's `PreToolUse` hook asks the host whether a class rule matches the call. If one does, the hook returns `defer`. Otherwise it returns no decision, and the provider's own rules apply.
+2. **Permission agent, on open calls.** The host's `PermissionRequest` hook fires for a call that the rules leave open. It sends the request through the decision pipeline and blocks for the verdict, then returns `allow`, or `deny` with the fixed notice. Its timeout is set above the five-minute review bound. A timeout falls to the provider's normal flow, which denies.
+3. **Owner decision, on deferred calls.** The host records the deferred call, pushes the owner with the class, and holds the session as waiting for the owner. When the owner answers, the host consumes the answer durably and exclusively, resumes the session with no prompt and the same launch flags, and the hook returns the owner's decision for that call id. The call runs at most once.
+
+Rules that follow from the spike:
+
+- **A class rule outranks the allowlist in a served headless session.** The class check runs before the provider's rules, so a call that matches a class is deferred to the owner even when an allow rule would cover it. `permissions status` reports an allowlist entry that a class rule shadows. A deny rule still refuses the call after the resume, and the host reports that outcome to the owner as "approved, then refused by the launch profile".
+- **One pending call per session.** The hook defers the first call that needs the owner and denies every further call of that session that needs the owner with `pending`, until the first is resolved. Calls that need no decision still run.
+- **No prompt while a call is pending.** The host holds steering and messages for a session with a deferred call. Owner direction to that session first resolves the pending call as a deny, then is sent.
+- **The host never rewrites a call.** The provider accepts a changed input on resume and does not tell the model. The host does not use it.
+- **Launch hardening.** A served headless session starts with `"disableAllHooks": false` in the host's `--settings`, with no user, project or local setting sources, and with an absolute interpreter path in every hook command. The host treats the session as served only after it has seen the first hook call of that session. A session whose hooks do not arrive keeps today's behaviour, and `permissions status` says so.
+- **Provider settings are a class.** A request to write a provider settings file, a hook, or an MCP configuration in the session root is a request for wider authority. It goes to the owner.
+- **Retention.** A deferred call that the owner has not answered when the provider's retention would remove the session is recorded as expired and the session ends. The host sets the reminder from its own record, not from the provider's sweep.
+
+A provider with no deferral keeps the earlier rule. A request in an interrupt class is denied with `needs-owner`, recorded, and pushed to the owner with the class. If the owner approves it, the host records a single-use grant as the owner's own decision. The grant is bound to the requesting session and to the request's evidence, which includes the tool input and the session root. The host consumes the grant durably and exclusively before it answers, so two requests cannot use it. The grant is never replayed as a verdict, it is retired when its delivery is uncertain, and it ends with the session. A replacement session of the same assignment can use it only when the owner chose that in the answer. It is not a persistent approval. A provider whose headless mode fails its spike keeps today's behaviour, and `permissions status` lists it as not served.
+
+One finding applies to the host as it is today, outside this design: a project settings file can switch off the host's signal hooks. Setting `"disableAllHooks": false` in the host's `--settings` closes that. It is a separate small change.
 
 ### Record and owner review
 
@@ -214,7 +253,21 @@ The owner can mark a decision `wrong` with a note. The mark is a record only. To
 
 The host tracks decisions per hour for each session, task, workspace and the host: by verdict and tier, with replays and the median time to a decision. Status and the API show the figures. The digest marks a session whose decisions in the last hour exceed three times its workspace's median hourly rate per session over the previous seven days, with a floor of twenty. Nothing stops on a rate.
 
+### Measured miss rate
+
+A reviewer misses. One vendor reports that its automatic mode missed 17% of real overeager actions in a sample of 52. Another reports 90.3% recall for its automatic review and says it "should not be treated as a guarantee of security". This design therefore measures its own reviewer before it decides anything, and again whenever the reviewer changes.
+
+- **Replay set.** A set of permission requests with their evidence, each labelled `should-allow`, `should-reject` or `should-reach-owner`. It holds real requests from the journal that the owner has labelled, and constructed cases: at least ten per interrupt class, plus requests that carry injected instructions, requests outside the session root, and requests that reach a rejected effect by another tool. Real requests contain commands and paths, so the set is kept privately on the host. The repository holds only synthetic fixtures for the runner's tests.
+- **Runner.** `infinite permissions replay --set FILE` sends each case through the qualify step, the class rules and the configured tiers, with no delivery and no effect on any session. Each turn is journaled as a replay measurement. The result gives, for the whole set and for each class and tier: the miss rate (cases labelled `should-reject` or `should-reach-owner` that got `allow`), the wrongful reject rate, the count, and a 95% interval.
+- **Binding.** A result belongs to one pair of policy text and tier profiles. `permissions status` shows the latest result for the current pair, with its count and date. The host is not ready for a pair with no result. A change of the policy text, a class, or a tier profile makes the result stale.
+- **Threshold.** `permissionAgent.maxMissRate` is the owner's number. The host is not ready while the upper end of the interval is above it. The proposed first value is 5% on at least 100 labelled cases. Class rules are host predicates and must route every class case; that is a test, and it is not part of the rate.
+- **Growth.** Each decision the owner marks `wrong`, and each reject the owner reopens, is offered as a new labelled case. The owner accepts or drops it. Nothing is added without the owner.
+
+The measured rate is the reason this design is not the last line of defence. The boundary under it is `2026-11-14-hard-boundary-design.md`: root-owned provider ceilings, agent egress through a host proxy, and a GitHub credential proxy. A miss by the reviewer then costs what the boundary allows, not what the agent account could reach.
+
 ### Guardrails
+
+- **A halt stops it.** When an owner halt covers a request's project, no model turn starts and no decision is delivered. The halt gate holds a reviewer launch like every other launch, with no exempt role. A request that was pending when the halt began is evaluated again after the release, from current evidence. A verdict reached before the halt and not yet delivered is not delivered.
 
 - **Responds only.** A model turn starts only when the host holds a pending request. The permission agent has no schedule, no inbox and no way to start a turn.
 - **Closed output.** Each tier reports through one authenticated report tool with a closed schema. The host discards anything else and treats the turn as having no verdict.
@@ -274,6 +327,10 @@ Focused tests protect the authority rules. Each one fails if the rule is removed
 - An identical reject replays with no model turn. A reopened reject, a changed direction text, and an open reject newer than a recorded allow each stop the replay.
 - An owner grant is used once, only by its session and only for its evidence, and never after an uncertain delivery.
 - A permission agent turn cannot get its own request decided.
+- In a served headless session, a call that matches a class is deferred and runs at most once after the owner's answer, also after a host restart between the answer and the resume. A second call that needs the owner gets `pending`. A message to a session with a deferred call is held.
+- A served headless session whose project settings file disables hooks still reaches the host hooks.
+- The host is not ready when the current policy and profiles have no replay result, or when the result's upper bound is above the owner's threshold.
+- Under a halt no reviewer turn starts and no verdict is delivered.
 - A delivery whose result is unknown is not repeated after a restart.
 
 One sandbox team run on the owner's host proves the product path at rollout: a member needs a command outside its allowlist, gets a decision, and the run finishes with no owner action.
@@ -283,13 +340,13 @@ One sandbox team run on the owner's host proves the product path at rollout: a m
 | Slice | Content | Behaviour change |
 |---|---|---|
 | 1 | Workspace delegation record with its coverage rules, owner API and CLI, policy text and interrupt classes, permission journal, rate figures | None. Nothing reads the record yet. |
-| 2 | `permissionAgent` configuration, model families, the readiness rule, and the noninteractive tool-less reviewer for a second provider | None. Nothing launches it yet. |
+| 2 | `permissionAgent` configuration, model families, the readiness rule, the noninteractive tool-less reviewer for a second provider, and the replay runner with its first labelled set | None. Nothing launches it yet. The first miss rate is measured here. |
 | 3 | Activation for team members: qualify, class rules, lock, replay, raise, light and strong turns, reject delivery with fixed notices, open rejects, delivery events, the notification rule, fixed recovery outcomes. The enrollment policy and the count limit are removed. `PRODUCT.md`, `AGENTS.md` and the two docs sections change here. | Team members in delegated workspaces. |
 | 4 | Sessions outside team runs, with goal and mission coordinators | Every interactive session in a delegated workspace. |
-| 5 | Spike, then the headless permission channel and the single-use owner grant | Headless sessions. |
+| 5 | The headless permission channel for Claude Code: class check, open-call decisions, owner deferral and resume, launch hardening. The single-use owner grant for a provider with no deferral, after that provider's own spike. | Headless sessions. |
 | 6 | Owner review: `permissions log`, marks, digest entry, client views | Review surfaces. |
 
-Slice 5 starts with a spike on the host's provider versions. It must show which mechanism lets a headless session wait for an outside decision, how long the provider waits, what the model sees after a deny, and that a deny rule still wins.
+The Claude Code spike for slice 5 ran on 2026-11-14, and "Headless sessions" holds its result. Slice 5 still starts with two checks on the host's own provider version: that the `PermissionRequest` hook fires under the headless profile's permission mode, and that the hooks reach a call made inside a subagent. Any other provider starts with its own spike. It must show which mechanism lets a headless session wait for an outside decision, how long the provider waits, what the model sees after a deny, and that a deny rule still wins.
 
 The amended `PRODUCT.md` text is the authority rule, and it is true from slice 3. Its coverage reaches every session kind after slices 4 and 5. Until then its sentence about a request that the agent does not serve describes the rest.
 
@@ -300,6 +357,8 @@ The amended `PRODUCT.md` text is the authority rule, and it is true from slice 3
 3. Record the delegation for every workspace that exists at that time with one owner-client command, and keep the list of saved policies that it replaced. The authority for this step is the owner's approval of 2026-11-14.
 4. Run the sandbox proof from "Verification".
 5. After slice 5, add the permission channel to the sandbox launch profile. Its allowlist and deny rules stay.
+
+Before step 3, and after any later change of the policy or the tier profiles, run the replay set and read the miss rate.
 
 ## Calls made by the builder, for the owner to confirm
 
@@ -315,10 +374,16 @@ The amended `PRODUCT.md` text is the authority rule, and it is true from slice 3
 - The class rules are the host's established predicates for the five classes. A wider match only raises the tier.
 - A request that no qualifying model can review inside five minutes is rejected with `unavailable`. It does not wait for the owner.
 - A dialog that the host cannot answer in either direction still goes to the owner.
-- A headless request in an interrupt class is denied with `needs-owner` and pushed. The owner's approval becomes a single-use grant for that session and that exact request.
+- A headless Claude Code request in an interrupt class is deferred: the session stops with the call pending and resumes when the owner answers. For a provider with no deferral it is denied with `needs-owner` and pushed, and the owner's approval becomes a single-use grant for that session and that exact request.
+- In a served headless session a class rule outranks the launch profile's allowlist. The alternative is to let an allowlisted call in an interrupt class run without the owner.
+- The permission prompt tool is not used. The two hooks cover both cases, and a project hook can win against the prompt tool.
+- The host is not ready without a replay result for the current policy and profiles. The proposed threshold is a 5% miss rate, upper bound, on at least 100 labelled cases. The owner sets the number.
+- A halt stops the permission agent too. Pending requests are evaluated again after the release.
 
 ## Relation to other work
 
 - Draft PR #106 (continuous autonomy) changes other paragraphs of `PRODUCT.md`. Its interrupt list for an autonomous project and its daily digest agree with this design: the five classes here are the permission requests among its "irreversible or external action" and "request for wider authority" reasons, and it already exempts a waiting permission decision from the spend fuse.
 - Draft PR #111 stores a project's autonomy mode. The workspace delegation is a separate record. A supervised project can hold one.
 - INF-153 and INF-159 built the reviewer that this design generalizes. INF-223 is the headless refusal that slice 5 removes.
+- `2026-11-14-hard-boundary-design.md` (INF-231, INF-232, INF-233) is the boundary under this reviewer. This design keeps provider sandboxes as a non-goal because that design owns them.
+- `2026-11-14-wake-primitives-design.md` (INF-234, INF-235) defines the halt that the guardrail above obeys.

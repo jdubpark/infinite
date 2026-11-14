@@ -2,14 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { teamLineupSchema } from "../packages/host/src/team-types.js";
 import { startHost, waitFor } from "./helpers.js";
-import { fixture, mixedLineup } from "./team-fixture.js";
+import { fixture, git, mixedLineup } from "./team-fixture.js";
 
 const coordinator = { id: "coordinator", label: "Coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" };
 const lineup = {
@@ -461,4 +461,85 @@ test("the signal commands", { timeout: 180000 }, async () => {
     await f.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+/**
+ * Switches the fixture's project to a GitHub source served by a local bare remote, behind the restricted mirror
+ * launcher. The restricted launcher does not set the checks' identity variable, so a test creates its runs first.
+ */
+async function followGithub(f: Awaited<ReturnType<typeof fixture>>) {
+  const remote = join(f.host.root, "scan-remote.git");
+  git(f.source, "clone", "--bare", f.source, remote);
+  f.host.config.projects[0]!.source = { mode: "github", repository: "example/app", baseBranch: "main" };
+  f.host.config.source = { ...f.host.config.source, remoteOverrides: { rehearsal: remote } };
+  f.host.config.teams!.commandPrefix = { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--mirror-restricted-prefix", f.receipts] };
+  await f.host.stopApi();
+  writeFileSync(join(f.host.root, "config.json"), JSON.stringify(f.host.config));
+  await f.host.start();
+  return remote;
+}
+
+test("a refresh scans the base branch through the launcher", { timeout: 180000 }, async () => {
+  const f = await fixture();
+  const remote = await followGithub(f);
+  try {
+    const refresh = async () => {
+      const response = await f.host.fetchApi("/projects/rehearsal/source/refresh", "owner", {});
+      assert.equal(response.status, 200, JSON.stringify(response.body));
+    };
+    const scans = async () => {
+      const status = await f.host.fetchApi("/evidence/status");
+      assert.equal(status.status, 200);
+      return status.body.counts["outcomes.scans"];
+    };
+
+    await refresh();
+    assert.equal(await waitFor(scans, count => count === 1, 10000), 1, "the first refresh scans once");
+
+    writeFileSync(join(f.source, "scanned.txt"), "A second base commit.\n");
+    git(f.source, "add", "scanned.txt");
+    git(f.source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Second base commit");
+    git(f.source, "push", remote, "HEAD:refs/heads/main");
+
+    await refresh();
+    assert.equal(await waitFor(scans, count => count === 2, 10000), 2, "a moved base scans again");
+
+    const logPath = join(f.receipts, "mirror-commands.jsonl");
+    const refused = existsSync(logPath) ? readFileSync(logPath, "utf8").trim() : "";
+    assert.equal(refused, "", "the launcher refused no scan command");
+  } finally { await f.close(); }
+});
+
+test("an approved run lands on the next refresh", { timeout: 180000 }, async () => {
+  const f = await fixture();
+  let remote = "";
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const run = await f.settled(created.body.id);
+    assert.equal(run.status, "ready-for-review", JSON.stringify(run));
+    remote = await followGithub(f);
+
+    // The reviewed head descends from the remote's main, so this push is a fast-forward and its tree is the reviewed tree.
+    const reviewed = await f.host.fetchApi(`/outcomes/runs/${run.id}`, "owner");
+    assert.equal(reviewed.status, 200, JSON.stringify(reviewed.body));
+    const reviewedHead = reviewed.body.summary.payload.reviewedHead as string;
+    const base = git(remote, "rev-parse", "refs/heads/main");
+    git(run.workspace, "merge-base", "--is-ancestor", base, reviewedHead);
+    git(run.workspace, "push", remote, `${reviewedHead}:refs/heads/main`);
+
+    const refreshed = await f.host.fetchApi("/projects/rehearsal/source/refresh", "owner", {});
+    assert.equal(refreshed.status, 200, JSON.stringify(refreshed.body));
+
+    const view = await waitFor(() => f.host.fetchApi(`/outcomes/runs/${run.id}`, "owner"),
+      response => response.status === 200 && response.body.signals.some((signal: { kind: string }) => signal.kind === "landing"), 10000);
+    const landing = view.body.signals.find((signal: { kind: string }) => signal.kind === "landing");
+    assert.equal(landing.payload.method, "tree-equal");
+
+    const holdUntil = new Date(Date.parse(landing.at) + 30 * 86_400_000).toISOString();
+    const accepted = view.body.rows.filter((row: { accepted: number }) => row.accepted === 1);
+    assert.ok(accepted.length > 0, "the approved run has an accepted row");
+    for (const row of accepted) assert.equal(row.holdUntil, holdUntil, JSON.stringify(row));
+    for (const row of view.body.rows.filter((row: { accepted: number }) => row.accepted !== 1))
+      assert.equal(row.holdUntil, null, JSON.stringify(row));
+  } finally { await f.close(); }
 });

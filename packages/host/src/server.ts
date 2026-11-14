@@ -36,7 +36,8 @@ import { outcomeBackfill } from "./outcome-backfill.js";
 import { outcomeProjector } from "./outcome-projector.js";
 import { EXCLUSION_REASONS, OUTCOMES_MODULE, outcomeModule, runOutcomeView, sweepExpiredOutcomes, type SignalRow } from "./outcome-store.js";
 import { ownerSignal, SignalRequestError, type OwnerSignalInput } from "./outcome-signals.js";
-import { COMMIT_ID } from "./outcome-hold.js";
+import { COMMIT_ID, HOLD_DAYS_DEFAULT } from "./outcome-hold.js";
+import { BaseScanner } from "./outcome-scan.js";
 import { profileKeyOf } from "./config-identity.js";
 import { lineupProfiles } from "./team-types.js";
 import { usagePlanSchema } from "./usage-api.js";
@@ -155,7 +156,9 @@ export function createApp(config: Config, key: Buffer) {
   const projectConfigChanges = new Set<string>();
   let sourceChanged: (projectId: string) => void = () => {};
   let sourceAppliedGraph: (projectId: string, head: string) => void = () => {};
-  const projectSource = new ProjectSourceService(config, { running: id => sessionRunningInProject(id), prefix: config.teams?.commandPrefix, onApplied: (id, head) => { sourceChanged(id); sourceAppliedGraph(id, head); } });
+  // The base scanner needs the evidence store, which opens after the project source service; its notices wait for it.
+  let baseScanner: BaseScanner | undefined;
+  const projectSource = new ProjectSourceService(config, { running: id => sessionRunningInProject(id), prefix: config.teams?.commandPrefix, onApplied: (id, head) => { sourceChanged(id); sourceAppliedGraph(id, head); }, onMirror: fetch => baseScanner?.notify(fetch) });
   const repositoryGraphs = config.repositoryGraphs
     ? new RepositoryGraphs(config.repositoryGraphs, config.projects, config.teams?.workspaceDir, config.teams?.commandPrefix)
     : undefined;
@@ -193,6 +196,7 @@ export function createApp(config: Config, key: Buffer) {
   evidence.register(configurationModule());
   outbox.registerProjector(configurationProjector());
   evidence.register(outcomeModule());
+  baseScanner = new BaseScanner({ store: evidence, mirrorPath: id => projectSource.mirrorPath(id), prefix: config.teams?.commandPrefix, holdDays: () => config.teams?.outcomes?.holdDays ?? HOLD_DAYS_DEFAULT });
   outbox.registerProjector(outcomeProjector(evidence));
   const teams = new TeamService(config, key, manager, startInProject, linear, readings, {
     source: projectSource,
@@ -243,7 +247,7 @@ export function createApp(config: Config, key: Buffer) {
     backfillOutcomes();
   };
   let outboxTimer: NodeJS.Timeout | undefined;
-  const closeEvidence = () => { clearInterval(evidenceSweep); clearInterval(outboxTimer); evidence.close(); };
+  const closeEvidence = () => { baseScanner?.close(); clearInterval(evidenceSweep); clearInterval(outboxTimer); evidence.close(); };
   missions.useUsage(usage);
   usage.useResolvers({
     goalOfRun: runId => { const goal = goals.list().find(value => value.cycles.some(cycle => cycle.teamId === runId)); return goal ? { id: goal.id, title: goal.title } : undefined; },

@@ -7,6 +7,9 @@ Defaults:infinite-host env_keep += "INFINITE_NATIVE_TOKEN OPENCODE_SERVER_PASSWO
 Defaults:infinite-host env_keep += "INFINITE_HOOK_URL INFINITE_HOOK_TOKEN INFINITE_TEAM_ASSIGNMENT INFINITE_PROJECT_ID INFINITE_MISSION_ASSIGNMENT"
 # The member folder under an owner-trusted team root (teams.trustWorkspaces), for the Claude wrapper.
 Defaults:infinite-host env_keep += "INFINITE_TRUSTED_WORKSPACE"
+# Optional egress proxy (deploy/ubuntu/egress.md): a loopback proxy URL holding a per-session
+# attribution credential. The proxy key itself is never in the environment.
+Defaults:infinite-host env_keep += "HTTPS_PROXY HTTP_PROXY https_proxy http_proxy NO_PROXY no_proxy"
 # Session prompts are command arguments; do not copy them to plaintext sudo logs.
 Defaults:infinite-host !log_allowed, !log_denied
 infinite-host ALL=(infinite-agent) NOPASSWD: /usr/local/libexec/infinite/claude *, /usr/local/libexec/infinite/codex *, /usr/local/libexec/infinite/codex-app-server *, /usr/local/libexec/infinite/grok *, /usr/local/libexec/infinite/opencode *, /usr/local/libexec/infinite/demo *, /usr/local/libexec/infinite/jevcode *

@@ -73,6 +73,8 @@ On Ubuntu 24.04, check Bubblewrap's namespace support before a Codex tool run. I
 
 Install `deploy/ubuntu/infinite.sudoers` as `/etc/sudoers.d/infinite` after checking it with `visudo -cf`. Its `env_keep` lines pass the per-session hook listener address and token through to the agent account; without them Claude Code and Codex hooks, and the chat transcript they carry, never reach the worker, and sessions fall back to screen heuristics. `INFINITE_TRUSTED_WORKSPACE` lets the Claude wrapper record folder trust for team members when `teams.trustWorkspaces` is on. `INFINITE_MISSION_ASSIGNMENT` carries the owner-authorized mission assignment through sudo to its worker. Existing sessions keep their old environment; end and recreate them after installing the file.
 
+The proxy variables in that file serve the optional [agent egress proxy](egress.md), which routes sessions through a loopback proxy that records each destination by project and can refuse unlisted hosts. It stays off until its runbook is followed.
+
 ## Session environment files
 
 The provider wrappers load owner-managed files from `/usr/local/libexec/infinite`: sorted `secrets/*.env` files first, then `android.env`, then `projects/PROJECT_ID.env` for a safe project ID. Later values override earlier values. The host sets `INFINITE_PROJECT_ID` from the session's project; the wrapper uses it only to select that project's file. Create `secrets/` and `projects/` as `root:infinite-agent` mode `0750`, and keep files `root:infinite-agent` mode `0640` so the agent can read them without changing them.

@@ -359,6 +359,8 @@ Each integration records what changed. The run's `changes` lists the files chang
 
 Runs also write run events to the evidence store: `run.created`, `run.blocked`, and `run.settled`, with a summary of the run's counts when it settles. Each run keeps its events in a small outbox inside its record until the store accepts them, and a restart does not lose them. The events only record what the run did. A run behaves the same whether or not its events are stored, and a store that stays unavailable never stops or changes a run.
 
+Runs also mirror their reports, integrations, check results, and owner directions into the evidence store as entries, and record each member's launch sizes. The owner reads them with `infinite team entries` and `infinite team entry`. Entries and sizes never change a run, and no member reads an entry yet.
+
 ## Workspace retention
 
 Team workspaces are host-managed temporary copies. By default, merged and

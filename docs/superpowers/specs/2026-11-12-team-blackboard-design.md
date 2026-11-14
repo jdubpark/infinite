@@ -131,7 +131,7 @@ An entry is addressed by task, paths, or mission subtask. It is never addressed 
 | `finding` | 1 to 8 items of `teamEvidenceSchema` | scout, implementer, integrator, reviewer | A fact that helps another task. |
 | `blocker` | the blocker evidence shape of INF-170 | any role with entry tools | A report or a mission message carries only the entry ID. |
 | `handoff` | `done`, `remaining`, `notes`, `commands` | implementer, integrator | A replacement reads the latest one for its task. |
-| `report` | the recorded report, without `rubric` | host process, from the journal | Replaces `memberReports`. Author `member`, authority `claim`. |
+| `report` | the recorded report, without `rubric` | host process, from the saved run record | Replaces `memberReports`. Author `member`, authority `claim`. |
 | `integration` | `taskId`, `commit`, `changedPaths` | host process | A dependent task sees what landed. Authority `receipt`. |
 | `check` | command, status, exit code, round, output | host process | Takes check output out of the context file. Authority `receipt`. |
 | `direction` | `source` (`steering` or `answer`), `question`, `text` | host process, from a recorded owner input | Author `owner`, authority `direction`. |

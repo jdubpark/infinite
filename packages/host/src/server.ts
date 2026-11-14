@@ -90,6 +90,7 @@ import { BalanceService } from "./balances.js";
 import { LiveFeed, type LiveTopic } from "./live.js";
 import { MAX_EVENTS_BUFFERED_BYTES, MAX_EVENTS_STREAMS } from "@infinite/remote/protocol";
 import { Readings } from "./readings.js";
+import { EGRESS_PROJECT, egressView } from "./egress.js";
 
 const id = z.uuid();
 const MAX_LOGIN_ATTEMPT_BUCKETS = 1024;
@@ -714,6 +715,11 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/usage", (_req, res) => res.json(usage.summary()));
   app.get("/api/evidence/status", (_req, res) => res.json(evidence.describe()));
   app.get("/api/fuse", (_req, res) => res.json(fuse.view()));
+  app.get("/api/egress", requireRole(["owner"]), (req, res) => {
+    const project = req.query.project;
+    if (project !== undefined && (typeof project !== "string" || !EGRESS_PROJECT.test(project))) return void res.status(400).json({ error: "Invalid project" });
+    res.json(egressView(config, project));
+  });
   const fuseCloseSchema = z.discriminatedUnion("scope", [
     z.object({ scope: z.literal("host") }).strict(),
     z.object({ scope: z.literal("project"), projectId: z.string().min(1) }).strict(),

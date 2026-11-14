@@ -73,6 +73,8 @@ On Ubuntu 24.04, check Bubblewrap's namespace support before a Codex tool run. I
 
 Install `deploy/ubuntu/infinite.sudoers` as `/etc/sudoers.d/infinite` after checking it with `visudo -cf`. Its `env_keep` lines pass the per-session hook listener address and token through to the agent account; without them Claude Code and Codex hooks, and the chat transcript they carry, never reach the worker, and sessions fall back to screen heuristics. `INFINITE_TRUSTED_WORKSPACE` lets the Claude wrapper record folder trust for team members when `teams.trustWorkspaces` is on. `INFINITE_MISSION_ASSIGNMENT` carries the owner-authorized mission assignment through sudo to its worker. Existing sessions keep their old environment; end and recreate them after installing the file.
 
+The proxy variables in that file serve the optional [agent egress proxy](egress.md), which routes sessions through a loopback proxy that records each destination by project and can refuse unlisted hosts. It stays off until its runbook is followed.
+
 ## Provider ceilings
 
 The owner installs root-owned provider ceilings with `deploy/ubuntu/install-ceilings.sh`. They limit what Claude Code and Codex may do on their own, and the agent account cannot change them. Read [provider ceilings](ceilings.md) before installing, and run `install-ceilings.sh --check` and `infinite doctor` after.

@@ -24,6 +24,8 @@ infinite usage models [--role implementer]
 infinite usage --json
 infinite evidence status               # evidence store state, modules, sizes, and event count
 infinite evidence status --json
+infinite egress                        # hosts agents reached through the egress proxy, per project
+infinite egress --project PROJECT_ID --json
 infinite resources
 infinite resources --watch
 infinite resources --json
@@ -42,6 +44,8 @@ infinite close SESSION_ID  # confirm before ending its provider process
 `usage` prints the current and previous month, plan fees, account balances, and a 30-day bar chart in the local timezone. `projects`, `project`, `goal`, and `models` show the corresponding roll-up. Every form accepts `--json`; `models` accepts `--role ROLE`. Unpriced totals are marked `≥`. Balances are shown only when the provider returned one; otherwise the CLI prints `—`. Budgets are informational. See [Usage and budgets](teams.md#usage-and-budgets).
 
 `evidence status` prints the state of the host's evidence store, the reason when it is unavailable, each module's state, the file and WAL sizes, and the event count. `--json` prints the host's full status. Any paired device can read it. See [Evidence store](architecture.md#evidence-store).
+
+`egress` prints what the optional [egress proxy](../deploy/ubuntu/egress.md) recorded: its mode, the age of its summary, a failed policy reload if any, and each project's hosts with would-deny counts first. `--project` narrows it to one project and `--json` prints the host's full view. It needs an owner key, and it reports `not configured` on a host without `autonomy.boundary.egress`.
 
 ## Workspace Understanding
 

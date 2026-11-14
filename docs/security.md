@@ -420,3 +420,32 @@ the repository policy does not opt existing runs in. Coordinator prompts never
 qualify for recursive approval; workspace trust, persistent allow rules and
 unsupported native requests require owner handling. This does not isolate
 processes sharing a Unix account or grant permission beyond the accepted task.
+
+## Agent egress boundary
+
+The optional egress proxy narrows where agent sessions on the Ubuntu host can
+connect. It is off unless `autonomy.boundary.egress` is configured; without it,
+session environments are unchanged. When configured, each new session receives
+`HTTPS_PROXY` and `HTTP_PROXY` pointing at a loopback proxy, with a credential
+that names the session's project and expires. The host reads the shared key;
+no session receives it. When the key cannot be read, sessions and host commands
+still get the proxy address, without a credential, so their requests are
+refused rather than sent direct. The proxy refuses cloud metadata, loopback, private,
+shared, link-local, multicast, documentation, and other non-public addresses in
+both modes, after resolving the name once and connecting to the checked
+address. It records one line per connection with project, host, port, address,
+decision, and byte counts, never paths, headers, or credentials. In enforce mode
+it also refuses hosts that the owner's policy does not list. An nftables rule
+for the agent account logs, or in enforce mode refuses, connections that skip
+the proxy, and refuses link-local destinations in both modes. The owner reads
+the per-project summary with `infinite egress` (owner role only).
+
+This is attribution and destination control for one shared agent account, not
+isolation. The credential lives in the session environment, which every process
+of that account can read, so the recorded project says which credential was
+used rather than which project acted. The proxy never inspects TLS content: an
+allowed host such as a code host or package registry can still carry data out,
+as can DNS through the local resolver, and services on loopback remain
+reachable. Tools that ignore proxy variables go direct, which observe mode only
+logs. Installation, rollout, rollback, and the full list of limits are in the
+[egress runbook](../deploy/ubuntu/egress.md).

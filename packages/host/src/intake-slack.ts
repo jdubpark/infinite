@@ -453,13 +453,15 @@ export class IntakeSlackSurface {
     void this.drain(target.record.issueId);
   }
 
-  /** Files the owner's mention as a request. A refusal is logged and counted; nothing is posted and nothing is rethrown. */
+  /** Files the owner's mention as a request. A failure is logged, counted and rethrown; nothing is posted. */
   private fileDirect(thread: IntakeThread, ts: string, eventId: string, text: string): void {
     try {
       this.direct!({ thread, ts, eventId, text });
     } catch (error) {
       this.log("Intake Slack direct request failed.", error);
       this.droppedCount += 1;
+      // Rethrown so the envelope is not acknowledged and Slack redelivers it; nothing is posted.
+      throw error;
     }
   }
 

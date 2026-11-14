@@ -100,9 +100,12 @@ restart, or a redelivered Slack event reaches the same issue and the same missio
 
 **The thread section.** The objective starts with `Request filed from Slack as ID:
 TITLE`, the owner's text, and the note that only the owner's words are
-instructions. It ends with the Slack thread as it stood when the owner asked,
-oldest first, under `Slack thread, oldest first, as it stood when the owner asked:`.
-Only messages sent at or before the owner's mention are included. Every line of
+instructions. It ends with the Slack thread up to the owner's mention, oldest
+first, under `Slack thread, oldest first, as it stood when the owner asked:`. The
+host reads the thread when it files the request, and again if filing is retried, so
+a message edited before the read appears with its edited text.
+The host keeps messages whose timestamp is at or before the mention and discards
+later ones before anything is stored, passed to an agent, shown, or logged. Every line of
 every message carries its author:
 
 | Marker | Author |
@@ -114,8 +117,9 @@ every message carries its author:
 Before marking, every line-break character in a message (`\r\n`, `\r`, U+000B,
 U+000C, U+0085, U+2028, U+2029) becomes `\n`, and empty lines are dropped. A line
 forged inside another person's message therefore still starts with that person's
-marker. One message adds at most 4,000 characters; a message cut to fit ends with
-`[… message cut]`. The section is bounded by the 24,000-character objective limit
+marker. Each message is cut at 4,000 characters, and a marked cut line,
+`[… message cut]`, follows a message that was cut; the notice is in addition to
+the 4,000. The section is bounded by the 24,000-character objective limit
 in the way the linked-thread section is. An unreadable thread files the request
 without a thread section. See [security](security.md#request-intake).
 
@@ -126,6 +130,18 @@ REASON`, then `I'll post questions and the result here once it starts.` Once it 
 filed and started, the acknowledgement is `Started on ID "TITLE" (URL). I'll post
 questions and the result here.` and a `Started on ID (URL).` line follows when the
 first message was a notice.
+
+**No acknowledgement without a save.** A request whose first save fails is not
+acknowledged to Slack, so Slack redelivers it. The failure is logged and counted as
+dropped, and nothing is posted.
+
+**What the tracker receives.** For a direct request the Linear issue holds only the
+owner's text and the Slack link, and the outcome comment is a fixed receipt:
+`Infinite agent report: ready for review. The report is in the Slack thread this request came from.`,
+or the same with `blocked. The reason is` or `cancelled. The reason is`. Agent
+reports and questions go to the Slack thread only. Reports posted in the thread may
+restate thread content, and pull requests the agents open are written by the
+agents; both are residual risks. See [security](security.md#request-intake).
 
 **Linear's own issues.** With `linear.admitIssues` set to `false`, the host does
 not poll Linear for labelled issues, and only direct requests start work.
@@ -147,7 +163,7 @@ The `intake` block is validated by `intakeConfigSchema` in
 | `slack.botTokenFile` | absolute path, required with `slack` | The bot token. The same file rules as `appTokenFile`. |
 | `slack.teamId` | `T` followed by 2 to 20 uppercase letters or digits, required with `slack` | The workspace. A token for another workspace, or a token Slack refuses, stops the surface with a reason. |
 | `slack.ownerUserId` | `U` or `W` ID, required with `slack` | The only Slack user whose messages cause work. |
-| `slack.linearAgentUserId` | `U` or `W` ID, optional; required when `requireSlackThread` is on | Linear's agent user in Slack, mentioned by the owner to file a request. |
+| `slack.linearAgentUserId` | `U` or `W` ID, optional; required unless `linear.admitIssues` is `false` | Linear's agent user in Slack, mentioned by the owner to file a request. |
 | `slack.directRequests` | boolean, default `false` | Lets the owner's mention of the bot file a Linear issue and start a mission. See [direct requests](#direct-requests). |
 | `slack.bindByMention` | boolean, default `false` | Binds a thread by a mention of an identifier. Cannot be used with `requireSlackThread`. |
 | `slack.endpoint` | URL, optional | The Slack Web API base. Only the official HTTPS endpoint, or loopback HTTP when `environment` is `"local"`. |
@@ -156,7 +172,7 @@ The `intake` block is validated by `intakeConfigSchema` in
 | `mission.maxMinutes` | integer 5 to 1440, default `240` | The working-time limit for each mission. See [missions](missions.md#working-time-limit). |
 | `mission.answerProjectId` | project ID, optional | A configured project. When the mission's repositories include it, the coordinator is told to answer from it. Must name a configured project. |
 | `maxActive` | integer 1 to 12, default `3` | Missions intake may have running at once. |
-| `requireSlackThread` | boolean, default `true` | Requires a Slack thread and an owner mention before admission. Needs `slack` and `slack.linearAgentUserId`. |
+| `requireSlackThread` | boolean, default `true` | Requires a Slack thread and an owner mention before admission. Needs `slack`, and `slack.linearAgentUserId` unless `linear.admitIssues` is `false`. |
 
 Linear credentials are a separate block, `linear.apiKeyFile`, a `0600` file with
 the same location rules. Linear's endpoint must be its official HTTPS endpoint,

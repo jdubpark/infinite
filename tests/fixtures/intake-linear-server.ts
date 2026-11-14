@@ -26,6 +26,7 @@ export async function startIntakeLinearServer(options: { clock?: () => number } 
   writeFileSync(apiKeyFile, apiKey, { mode: 0o600 });
   const issues = new Map<string, IntakeFixtureIssue>(), comments = new Map<string, IntakeFixtureComment>();
   const calls: { operation: string; query: string; variables: Record<string, any> }[] = [];
+  let editNextCreated: Partial<IntakeFixtureIssue> | undefined;
   let loseNext = false, loseNextIssue = false, refuseNextIssue = false, unavailableValue = false, count = 0;
   /** The issue labels Linear holds; `teamId` null is a workspace label. */
   const labels: { id: string; name: string; teamId: string | null }[] = [{ id: randomUUID(), name: "infinite", teamId }];
@@ -106,6 +107,7 @@ export async function startIntakeLinearServer(options: { clock?: () => number } 
           teamId: input.teamId, stateType: "unstarted", creatorId: creatorOfCreated, attachmentUrls: [],
           labels: input.labelIds.map((id: string) => labels.find(label => label.id === id)?.name).filter(Boolean),
         };
+        if (editNextCreated) { Object.assign(created, editNextCreated); editNextCreated = undefined; }
         issues.set(created.id, created);
         if (loseNextIssue) { loseNextIssue = false; response.destroy(); return; }
         reply(200, { data: { issueCreate: { success: true, issue: node(created) } } });
@@ -158,6 +160,8 @@ export async function startIntakeLinearServer(options: { clock?: () => number } 
     loseNextCommentResponse() { loseNext = true; },
     /** The next issue create commits, but its HTTP response is lost. */
     loseNextIssueResponse() { loseNextIssue = true; },
+    /** The next issue create commits with these fields changed, as if a teammate edited the issue at once. */
+    editNextCreated(change: Partial<IntakeFixtureIssue>) { editNextCreated = change; },
     /** The next issue create is refused with a GraphQL error and commits nothing. */
     refuseNextIssue() { refuseNextIssue = true; },
     /** Replaces the labels Linear holds. */

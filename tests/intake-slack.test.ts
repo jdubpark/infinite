@@ -1215,14 +1215,28 @@ test("a filed direct record is acknowledged with its issue link", { timeout: 600
   } finally { await s.close(); await h.close(); }
 });
 
-test("a direct request that cannot be recorded is logged and counted, with nothing posted", { timeout: 60000 }, async () => {
+test("a direct request that cannot be recorded is logged, counted and not acknowledged, and its redelivery files once", { timeout: 60000 }, async () => {
   const h = harness(); const services = h.open(); const logs = collector();
-  const s = await surfaceFor(services, h.root, { directRequests: true, log: logs.log, direct: () => () => { throw new Error("store write failed"); } });
+  let failing = true;
+  const calls: Parameters<DirectRequest>[0][] = [];
+  const s = await surfaceFor(services, h.root, { directRequests: true, log: logs.log, direct: store => input => {
+    if (failing) throw new Error("store write failed");
+    calls.push(input);
+    store.create(intakeRecord(randomUUID(), "queued", { identifier: "", url: "", thread: input.thread, direct: { eventId: input.eventId, ts: input.ts, text: input.text } }));
+    return "accepted";
+  } });
   try {
     await s.surface.start(); await s.connected();
-    await s.slack.emit(inOther("fix the export"));
+    const event = inOther("fix the export");
+    const envelope = await s.slack.emit(event, { eventId: "EvLost" });
     await waitFor(() => Promise.resolve(s.surface.status().dropped), dropped => dropped === 1);
     assert.equal(logs.calls.length, 1);
+    assert.deepEqual(s.texts(OTHER), []);
+    assert.equal(s.slack.acks().includes(envelope), false, "The envelope is not acknowledged, so Slack redelivers it");
+    failing = false;
+    await s.slack.redeliver(envelope);
+    await waitFor(async () => calls, list => list.length === 1);
+    assert.equal(s.store.boundTo(OTHER).length, 1);
     assert.deepEqual(s.texts(OTHER), []);
   } finally { await s.close(); await h.close(); }
 });

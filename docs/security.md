@@ -281,9 +281,12 @@ Slack surface:
   at the time of the mention, sent no later than the mention, are put in the
   mission objective, stored with the mission, and shown to agents. They are not
   logged, not copied into the Linear issue or any comment, and not posted to
-  Slack. The host reads the thread when it files the request; messages sent
-  after the owner's mention are discarded before anything is stored, passed to an
-  agent, shown, or logged. Every line carries its author
+  Slack. The host reads the thread when it files the request, and again if
+  filing is retried. It keeps messages whose timestamp is at or before the mention
+  and discards later ones before anything is stored, passed to an agent, shown, or
+  logged. A message edited before the read appears with its edited text. The
+  tracker receives only the owner's text and the Slack link, and fixed receipts for
+  the outcome; agent reports and questions go to the Slack thread. Every line carries its author
   (`owner | `, `other N | `, `bot | `), and line-break characters in a message are
   normalised first, so a forged line inside another person's message keeps that
   person's marker. The markers are a prompt boundary and not a guarantee: agents
@@ -325,7 +328,9 @@ places: a mission service refusal (`TeamError`), a Slack request failure
 Residual risk: the objective carries the Linear title and description, and the
 owner's Slack messages, to the coordinator and subteams. For a direct request it
 also carries the other people's text in the thread, so anyone who can post in a
-thread where the owner mentions the bot can put words in front of agents. Anyone
+thread where the owner mentions the bot can put words in front of agents. Agent reports posted in the
+thread may restate thread content, and pull requests the agents open are written by
+the agents. Anyone
 who can edit the issue before it is admitted can put instructions in its title or
 description. The
 coordinator is told that only the owner's words are instructions and that anything

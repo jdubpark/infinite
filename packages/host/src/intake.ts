@@ -208,7 +208,15 @@ export function outboundText(config: Config, value: string): string {
     .replace(ipv4, "[address omitted]");
 }
 
-function outcomeBody(config: Config, mission: Mission): string {
+/** A direct request's tracker comment is a fixed receipt: agent text may quote other people's Slack messages. */
+const directReceipts = {
+  ready: "Infinite agent report: ready for review. The report is in the Slack thread this request came from.",
+  blocked: "Infinite agent report: blocked. The reason is in the Slack thread this request came from.",
+  cancelled: "Infinite agent report: cancelled. The reason is in the Slack thread this request came from.",
+};
+
+function outcomeBody(config: Config, mission: Mission, direct = false): string {
+  if (direct) return mission.status === "ready-for-review" ? directReceipts.ready : mission.status === "blocked" ? directReceipts.blocked : directReceipts.cancelled;
   if (mission.status === "ready-for-review")
     return outboundText(config, `Infinite agent report: ready for review.${mission.result?.summary ? `\n\n${mission.result.summary}` : ""}`);
   const label = mission.status === "blocked" ? "blocked" : "cancelled";
@@ -223,6 +231,8 @@ export class IntakeService {
   private lastError?: { at: string; step: string; message: string };
   private readonly log: (line: string, error: unknown) => void;
   private readonly pollMs: number;
+  /** The issue ID chosen for a mention (channel and timestamp) until its record is saved, so a retry rewrites the same file. */
+  private readonly pendingMentions = new Map<string, string>();
 
   constructor(
     private readonly config: Config,
@@ -272,12 +282,16 @@ export class IntakeService {
     const firstLine = input.text.replace(lineBreaks, "\n").split("\n").map(line => line.replace(/\s+/g, " ").trim()).find(line => line !== "");
     const now = new Date().toISOString();
     const running = this.inFlight !== undefined;
+    const mention = `${input.thread.channelId}|${input.ts}`;
+    const issueId = this.pendingMentions.get(mention) ?? randomUUID();
+    this.pendingMentions.set(mention, issueId);
     this.store.create({
-      issueId: randomUUID(), identifier: "", url: "", title: (firstLine ?? "Request from a Slack thread").slice(0, 120),
+      issueId, identifier: "", url: "", title: (firstLine ?? "Request from a Slack thread").slice(0, 120),
       description: input.text.trim().slice(0, descriptionLimit), issueCreatedAt: now, issueUpdatedAt: now,
       state: "queued", thread: input.thread, direct: { eventId: input.eventId, ts: input.ts, text: input.text },
       comments: {}, messages: [], questions: [], inbound: [], createdAt: now, updatedAt: now,
     });
+    this.pendingMentions.delete(mention);
     const cycle = this.poll();
     // A cycle already past `file` would leave this record to the timer; one more cycle files it now.
     if (running) void cycle.then(() => {
@@ -389,13 +403,14 @@ export class IntakeService {
     const request: CreateMission = {
       requestId: missionRequestId(record.issueId),
       groupId: intake.mission.groupId,
-      title: `${issue.identifier}: ${issue.title}`.slice(0, 100),
-      objective: directObjective(issue, direct.text, messages, direct.ts, intake.slack?.ownerUserId ?? ""),
+      title: `${issue.identifier}: ${record.title}`.slice(0, 100),
+      objective: directObjective({ identifier: issue.identifier, title: record.title }, direct.text, messages, direct.ts, intake.slack?.ownerUserId ?? ""),
       maxSubtasks: intake.mission.maxSubtasks,
       maxMinutes: intake.mission.maxMinutes,
     };
     this.store.update(record.issueId, next => {
-      Object.assign(next, this.facts(issue));
+      // The owner's own text, not what the tracker returns: a teammate may have edited the issue since it was created.
+      Object.assign(next, this.facts(issue), { title: record.title, description });
       next.direct = { ...direct, filedAt: new Date().toISOString() };
       next.rule = "owner Slack mention of the bot";
       next.request = request;
@@ -535,7 +550,7 @@ export class IntakeService {
     if (!record || record.state !== "started") return;
     this.attemptSync("observe", () => this.store.update(record.issueId, next => {
       next.state = "finished";
-      if (!this.mirrors(next)) next.comments.outcome = { id: randomUUID(), body: outcomeBody(this.config, mission), delivered: false, attempts: 0 };
+      if (!this.mirrors(next)) next.comments.outcome = { id: randomUUID(), body: outcomeBody(this.config, mission, Boolean(next.direct)), delivered: false, attempts: 0 };
     }), record.identifier);
   }
 

@@ -427,6 +427,10 @@ one that it replaced. `--direction` sets the direction text, which can only
 narrow what the permission agent allows in that workspace, and
 `--clear-direction` removes it. `revoke` removes a workspace's delegation. A
 missing `--request-id` is generated, so pass one to retry a request safely.
+`W` is a workspace id as `status` prints it, or the id of a project in that
+workspace. When two workspaces show the same id, `revoke` clears both, and
+`delegate --workspace` is refused: use `--all`, or regroup so that the id names
+one workspace.
 
 An owner act covers only the projects that sit in the workspace at that time.
 A project that joins a workspace later is not covered until the owner delegates

@@ -29,7 +29,7 @@ type Stored = {
   receipts: Record<string, Receipt>;
 };
 type StateWriter = (file: string, key: Buffer, scope: string, value: unknown) => void;
-type Groups = Pick<ProjectGroupService, "get" | "list" | "containing" | "ownerMoveMark">;
+type Groups = Pick<ProjectGroupService, "list" | "containing" | "ownerMoveMark">;
 type Options = { now?: () => number; writeState?: StateWriter; policyVersion?: number };
 
 const SCOPE = "permission-delegations";
@@ -143,6 +143,19 @@ export class PermissionDelegationService {
     return digest({ action, target, request, actor });
   }
 
+  /**
+   * Every workspace the host lists under this id, or else the workspace that holds the project with this id.
+   * More than one can match: a stored project keeps its id when the owner removes the checkout that the id came
+   * from, and that checkout's own implicit project is then listed under the same id.
+   */
+  private workspaces(id: string): PermissionDelegationGroup[] {
+    const listed = this.groups.list().groups as PermissionDelegationGroup[];
+    const named = listed.filter(group => group.id === id);
+    const found = named.length > 0 ? named : listed.filter(group => projectIds(group).includes(id));
+    if (found.length === 0) throw new TeamError(404, "project-group-not-found", "This project group does not exist.");
+    return found;
+  }
+
   private members(group: PermissionDelegationGroup) {
     return projectIds(group).filter(projectId => this.enrolled(projectId));
   }
@@ -240,7 +253,11 @@ export class PermissionDelegationService {
     const replay = this.replay<{ view: WorkspaceDelegationView; replacedOptOuts: string[] }>(request.requestId, fingerprint);
     if (replay) return replay;
 
-    const group = this.groups.get(workspaceId) as PermissionDelegationGroup;
+    const found = this.workspaces(workspaceId);
+    // A grant must name one workspace. A revocation below takes every match instead.
+    if (found.length > 1)
+      throw new TeamError(409, "permission-workspace-ambiguous", "Two workspaces share this id. Regroup so that the id names one workspace, or delegate every workspace.");
+    const group = found[0]!;
     const candidate = structuredClone(this.state);
     const replacedOptOuts = this.applyDelegate(candidate, group, request.direction, actor, this.timestamp());
     return this.record(candidate, request.requestId, fingerprint, {
@@ -321,7 +338,9 @@ export class PermissionDelegationService {
     const replay = this.replay<WorkspaceDelegationView>(request.requestId, fingerprint);
     if (replay) return replay;
 
-    const group = this.groups.get(workspaceId) as PermissionDelegationGroup;
+    // Every workspace under this id is revoked, so no project that the id can name stays covered.
+    const found = this.workspaces(workspaceId);
+    const group = { ...found[0]!, repos: found.flatMap(workspace => workspace.repos) };
     const candidate = structuredClone(this.state);
     const memberIds = this.members(group);
     this.remember(candidate, memberIds);

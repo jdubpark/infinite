@@ -48,11 +48,6 @@ class FakeGroups {
     for (const id of ids) if (before.get(id) !== this.containing(id)?.id) this.moves.set(id, (this.moves.get(id) ?? 0) + 1);
   }
   ownerMoveMark(projectId: string): string { return `fake-moves:${this.moves.get(projectId) ?? 0}`; }
-  get(id: string): ProjectGroup {
-    const group = this.groups.find(value => value.id === id || value.repos.some(repo => repo.checkouts.some(checkout => checkout.projectId === id)));
-    if (!group) throw new TeamError(404, "project-group-not-found", "This project group does not exist.");
-    return group;
-  }
   list(): ProjectGroupList { return { groups: this.groups, suggestions: [] }; }
   containing(projectId: string): { id: string; name: string } | undefined {
     const group = this.groups.find(value => value.repos.some(repo => repo.checkouts.some(checkout => checkout.projectId === projectId)));
@@ -565,12 +560,16 @@ test("a replayed request id returns its recorded result and restores no coverage
   } finally { f.cleanup(); }
 });
 
+function realGroups(f: ReturnType<typeof fixture>) {
+  const config = { ...f.config, sync: { homeDir: join(f.root, "home") }, teams: { workspaceDir: join(f.root, "workspace") } } as Config;
+  const groups = new ProjectGroupService(config, f.key, undefined, { git: () => undefined });
+  return { config, groups, service: new PermissionDelegationService(config, f.key, groups) };
+}
+
 test("with the real group service, coverage ends when the owner removes a project from the workspace that carries its id", () => {
   const f = fixture();
   try {
-    const config = { ...f.config, sync: { homeDir: join(f.root, "home") }, teams: { workspaceDir: join(f.root, "workspace") } } as Config;
-    const groups = new ProjectGroupService(config, f.key, undefined, { git: () => undefined });
-    const service = new PermissionDelegationService(config, f.key, groups);
+    const { config, groups, service } = realGroups(f);
     assert.equal(service.delegate("alpha", request(), actor).view.state, "delegated");
 
     const stored = groups.update("alpha", { requestId: randomUUID(), revision: 1, name: "Alpha Space" });
@@ -585,3 +584,40 @@ test("with the real group service, coverage ends when the owner removes a projec
       { covered: false, projectId: "alpha", reason: "not-covered" });
   } finally { f.cleanup(); }
 });
+
+test("with the real group service, an id shared by a stored and an implicit workspace is revoked whole and refused for one delegation", () => {
+  const f = fixture();
+  try {
+    const { groups, service } = realGroups(f);
+    groups.update("alpha", { requestId: randomUUID(), revision: 1, repos: ["beta"] });
+    assert.deepEqual(service.status().map(view => view.workspaceId), ["alpha", "alpha"], "the stored project that holds beta and the implicit project of alpha");
+
+    assert.throws(() => service.delegate("alpha", request(), actor), failsWith(409, "permission-workspace-ambiguous"));
+    for (const id of ["alpha", "beta"]) assert.equal(service.coverage(id).covered, false, id);
+    service.delegateAll(request(), actor);
+    for (const id of ["alpha", "beta"]) assert.equal(service.coverage(id).covered, true, id);
+
+    const view = service.revoke("alpha", request(), actor);
+    assert.equal(view.state, "not-delegated");
+    assert.deepEqual(view.projects.map(project => [project.projectId, project.state]).sort(), [["alpha", "not-covered"], ["beta", "not-covered"]]);
+    for (const id of ["alpha", "beta"]) assert.deepEqual(service.coverage(id), { covered: false, projectId: id, reason: "not-covered" });
+    assert.deepEqual(service.status().map(status => status.state), ["not-delegated", "not-delegated"]);
+  } finally { f.cleanup(); }
+});
+
+test("with the real group service, a project id names the workspace that holds it and an unknown id is refused", () => {
+  const f = fixture();
+  try {
+    const { groups, service } = realGroups(f);
+    const client = groups.create({ requestId: randomUUID(), name: "Client", repos: ["alpha", "beta"] });
+    assert.notEqual(client.id, "alpha");
+
+    const delegated = service.delegate("alpha", request(), actor);
+    assert.deepEqual([delegated.view.workspaceId, delegated.view.state], [client.id, "delegated"]);
+    assert.equal(service.revoke("beta", request(), actor).workspaceId, client.id);
+    for (const id of ["alpha", "beta"]) assert.equal(service.coverage(id).covered, false, id);
+    assert.throws(() => service.delegate("missing", request(), actor), failsWith(404, "project-group-not-found"));
+    assert.throws(() => service.revoke("missing", request(), actor), failsWith(404, "project-group-not-found"));
+  } finally { f.cleanup(); }
+});
+

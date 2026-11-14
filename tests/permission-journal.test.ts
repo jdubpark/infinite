@@ -473,15 +473,16 @@ test("rates count verdicts, final tiers, replays, median duration, and empty win
   ] }));
   journal.appendDecision(decision({ id: "rate-owner", at: "2026-11-14T10:25:00.000Z", verdict: "owner", interruptClass: "money" }));
   journal.appendDecision(decision({ id: "rate-allow-replay", at: "2026-11-14T10:35:00.000Z", replayOf: "rate-allow-light" }));
-  journal.appendDecision(decision({ id: "rate-reject-light", at: "2026-11-14T10:45:00.000Z", verdict: "reject", code: "uncertain", tiers: [
-    tier("light", "2026-11-14T10:45:00.000Z", "2026-11-14T10:45:04.000Z"),
+  journal.appendDecision(decision({ id: "rate-reject-uncertain", at: "2026-11-14T10:45:00.000Z", verdict: "reject", code: "uncertain", tiers: [
+    tier("light", "2026-11-14T10:45:00.000Z", "2026-11-14T10:45:01.000Z"),
+    tier("strong", "2026-11-14T10:45:02.000Z", "2026-11-14T10:45:04.000Z"),
   ] }));
 
   assert.deepEqual(journal.rates({ scope: "workspace", id: "workspace-1", since: start, until: end }), {
     decisions: 5,
     perHour: 2.5,
     byVerdict: { allow: 2, reject: 2, owner: 1 },
-    byTier: { none: 2, light: 2, strong: 1 },
+    byTier: { none: 2, light: 1, strong: 2 },
     replays: 1,
     medianDecisionMs: 4_000,
   });

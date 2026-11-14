@@ -19,6 +19,7 @@ import { combineCoverage, type UsageService } from "./usage-service.js";
 import { type EvidenceStore, eventProblem } from "./evidence/store.js";
 import { applyFuseReason, workLaunch } from "./fuse/rules.js";
 import type { FuseAdmission, FuseCheck, FuseGate } from "./fuse/types.js";
+import { KEPT_PAUSED, LEFT_AS_IS, STILL_HALTED, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 import type { EventOutbox, OutboxEvent } from "./evidence/outbox.js";
 import type { Blackboard } from "./evidence/blackboard.js";
 import { MAX_OUTBOX_EVENTS, pathField, planDigest, profileIdentity, runEventKey, runSummaryCounts, type MemberStopDetail, type MemberStopReason, type ReplacementCause } from "./run-events.js";
@@ -98,6 +99,12 @@ type Stored = {
   pending?: PendingOperation;
   verificationRecovery?: { pendingId: string; pendingKind: "check"; revision: number; headCommit: string; failure: "setup-changed-files" | "verification-changed-files" | "legacy-completed-check" };
   halt?: "pause" | "cancel" | "steer" | "block";
+  /**
+   * Set when the owner's halt paused this run: its id, and the reason the paused run shows. A release resumes the run
+   * only under that id. Any accepted owner request clears it. After a release that could not resume the run, only the
+   * reason stays.
+   */
+  ownerHalt?: { haltId?: string; reason: string };
   deliveryAttempt?: { memberId: string; revision: number; headCommit: string };
   continuationHead?: { revision: number; headCommit: string };
   checkHead?: string;
@@ -124,6 +131,8 @@ const holdsWorkerSlot = (member: TeamMember, revision: number) => member.revisio
   (member.role === "scout" || member.role === "implementer") &&
   (["queued", "running", "unavailable"].includes(member.status) || member.status === "reported" && !member.exitConfirmedAt);
 const inactiveTeamStatuses = new Set(["cancelled", "ready-for-review", "merged", "no-change"]);
+/** The statuses an owner's halt pauses: work in progress, not paused, blocked, waiting for input, or ended. */
+const haltRunning: ReadonlySet<string> = new Set(["planning", "discovering", "implementing", "integrating", "verifying", "reviewing", "delivering"]);
 const activeTeamRun = (status: string) => !inactiveTeamStatuses.has(status);
 const capacityCeiling = (run: Pick<TeamRun, "parallelismCeiling" | "handoff">) => run.parallelismCeiling ?? (run.handoff ? 2 : 4);
 export const providerInputReason = "A provider needs user input. Open the member session to respond; the team will not approve it.";
@@ -1363,6 +1372,8 @@ export class TeamService {
     if (body.revision !== stored.run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before sending this action.");
     if (stored.run.status === "cancelled") throw new TeamError(409, "team-cancelled", "This team has been cancelled.");
     stored.receipts[body.requestId] = fingerprint;
+    // The owner acted on the run, so a halt release leaves it as the owner set it.
+    stored.ownerHalt = undefined;
     return true;
   }
   steer(id: string, input: Mutation) {
@@ -1809,38 +1820,118 @@ export class TeamService {
       if (this.replay(stored, action, body)) return this.view(stored);
       if (action === "pause" && (["ready-for-review", "merged", "no-change"].includes(run.status) || run.status === "blocked" && !run.workspaceRemovedAt)) throw new TeamError(409, "team-not-running", "This team is not running and cannot be paused.");
       const verificationRecovery = action === "resume" && validVerificationRecovery(stored) ? stored.verificationRecovery : undefined;
-      // Uncertain operations and started deliveries keep their reconciliation contract; a removed
-      // workspace is reported next, before the generic blocked-run resume check it would otherwise fail.
-      if (action === "resume" && ((stored.pending && !verificationRecovery) || stored.deliveryAttempt || run.deliveryReceipt))
-        throw new TeamError(409, "team-reconciliation-required", "This team requires workspace reconciliation. Inspect its evidence and start a new team rather than replaying uncertain work.");
-      if (action === "resume" && run.workspaceRemovedAt) throw new TeamError(409, "team-workspace-removed", "This run's workspaces were removed under the retention policy; start a new run.");
-      if (action === "resume" && (!stored.prepared || (run.status === "blocked" && !this.canResume(stored, undefined, true))))
-        throw new TeamError(409, "team-reconciliation-required", "This team requires workspace reconciliation. Inspect its evidence and start a new team rather than replaying uncertain work.");
-      if (action === "resume" && verificationRecovery && this.commands.has(id)) throw new TeamError(409, "team-operation-running", "The verification operation is still stopping. Retry Resume after it settles.");
-      if (action === "resume" && stored.halt) throw new TeamError(409, "members-stopping", "Wait for the team's active members to stop before resuming.");
+      if (action === "resume") { const refusal = this.resumeRefusal(stored, verificationRecovery); if (refusal) throw refusal; }
       if (action === "resume" && verificationRecovery) return this.resumeVerificationRecovery(stored, body, verificationRecovery);
       if (!this.mutation(stored, action, body)) return this.view(stored);
       if (action === "resume") {
         if (run.status !== "paused" && !this.canResume(stored)) { this.save(stored); return this.view(stored); }
-        // Pausing stopped native agents. Replan from the confirmed integration head, preserving stopped copies for inspection.
-        run.revision++; run.tasks = []; run.review = undefined; run.round = 0; stored.checkHead = undefined;
-        this.emit(stored, "run.revision-advanced", [run.revision], {}, { cause: "resume", fromRevision: run.revision - 1, baseChanged: false });
-        run.brief = undefined; run.noChange = undefined;
-        if (run.discovery && !run.discovery.completedAt) run.discovery.completedAt = timestamp();
-        await this.invalidatePermissionDecisions(stored, "The team resumed under a new revision.");
-        run.status = "planning"; run.reason = undefined; run.blockCode = undefined;
-      } else {
-        if (run.recovery && run.recovery.status !== "exhausted") {
-          run.recovery.status = "exhausted";
-          run.recovery.source = { ...run.recovery.source, code: `owner-${action}`, reason: `The owner ${action} the team before automatic recovery finished.` };
-        }
-        run.status = action === "pause" ? "paused" : "cancelled"; stored.halt = action;
-        await this.invalidatePermissionDecisions(stored, `The team was ${action} before the permission request could be answered.`);
-        run.reason = "Stopping active team members; any human input lease remains authoritative.";
-        this.commands.get(id)?.abort();
-      }
+        await this.resumeRun(stored);
+      } else await this.stopRun(stored, action);
       this.event(stored, `Team ${action === "resume" ? "resumed with a fresh plan" : action === "pause" ? "paused" : "cancelled"}.`); this.save(stored);
       return this.view(stored);
+    });
+  }
+  /** Why the run cannot resume now, or undefined. The owner's resume and a halt release both apply these rules. */
+  private resumeRefusal(stored: Stored, verificationRecovery: Stored["verificationRecovery"]): TeamError | undefined {
+    const run = stored.run;
+    // Uncertain operations and started deliveries keep their reconciliation contract; a removed
+    // workspace is reported next, before the generic blocked-run resume check it would otherwise fail.
+    if ((stored.pending && !verificationRecovery) || stored.deliveryAttempt || run.deliveryReceipt)
+      return new TeamError(409, "team-reconciliation-required", "This team requires workspace reconciliation. Inspect its evidence and start a new team rather than replaying uncertain work.");
+    if (run.workspaceRemovedAt) return new TeamError(409, "team-workspace-removed", "This run's workspaces were removed under the retention policy; start a new run.");
+    if (!stored.prepared || (run.status === "blocked" && !this.canResume(stored, undefined, true)))
+      return new TeamError(409, "team-reconciliation-required", "This team requires workspace reconciliation. Inspect its evidence and start a new team rather than replaying uncertain work.");
+    if (verificationRecovery && this.commands.has(run.id)) return new TeamError(409, "team-operation-running", "The verification operation is still stopping. Retry Resume after it settles.");
+    if (stored.halt) return new TeamError(409, "members-stopping", "Wait for the team's active members to stop before resuming.");
+    return undefined;
+  }
+  /** Pausing stopped native agents. Replan from the confirmed integration head, preserving stopped copies for inspection. */
+  private async resumeRun(stored: Stored) {
+    const run = stored.run;
+    run.revision++; run.tasks = []; run.review = undefined; run.round = 0; stored.checkHead = undefined;
+    this.emit(stored, "run.revision-advanced", [run.revision], {}, { cause: "resume", fromRevision: run.revision - 1, baseChanged: false });
+    run.brief = undefined; run.noChange = undefined;
+    if (run.discovery && !run.discovery.completedAt) run.discovery.completedAt = timestamp();
+    await this.invalidatePermissionDecisions(stored, "The team resumed under a new revision.");
+    run.status = "planning"; run.reason = undefined; run.blockCode = undefined;
+  }
+  /** Pause or cancel: active members stop on the next pass. The owner's action and the owner's halt both use it. */
+  private async stopRun(stored: Stored, action: "pause" | "cancel") {
+    const run = stored.run;
+    if (run.recovery && run.recovery.status !== "exhausted") {
+      run.recovery.status = "exhausted";
+      run.recovery.source = { ...run.recovery.source, code: `owner-${action}`, reason: `The owner ${action} the team before automatic recovery finished.` };
+    }
+    run.status = action === "pause" ? "paused" : "cancelled"; stored.halt = action;
+    await this.invalidatePermissionDecisions(stored, `The team was ${action} before the permission request could be answered.`);
+    run.reason = "Stopping active team members; any human input lease remains authoritative.";
+    this.commands.get(run.id)?.abort();
+  }
+  /**
+   * Host-internal: the owner's halt pauses each running run in scope through the owner's pause path, without an owner
+   * request, and marks it. A paused, blocked, waiting, or ended run is not touched. `covers` leaves out a run that a
+   * live goal or mission owns: its owner pauses it.
+   */
+  haltPause(mark: HaltMark, covers: HaltCovers) {
+    return this.enqueue(async () => {
+      const outcomes: HaltOutcome[] = [];
+      for (const stored of this.records.values()) {
+        const run = stored.run;
+        if (!haltRunning.has(run.status) || !covers([run.projectId], run.id)) continue;
+        try {
+          await this.stopRun(stored, "pause");
+          run.reason = mark.reason;
+          stored.ownerHalt = { haltId: mark.haltId, reason: mark.reason };
+          this.event(stored, `Team paused: ${mark.reason}`); this.save(stored);
+          outcomes.push({ kind: "team", id: run.id, title: run.title, result: "paused" });
+        } catch (error) { outcomes.push(pauseFailure("team", run.id, run.title, error)); }
+      }
+      return outcomes;
+    });
+  }
+  /**
+   * Host-internal: resumes each run that this halt paused and that is still paused under its mark, through the owner's
+   * resume rules. A run that another halt still covers moves to that halt. A run that the rules refuse stays paused and
+   * says why. With `keep`, no run resumes.
+   */
+  haltResume(haltId: string, heldBy: HaltHeldBy, keep: boolean) {
+    return this.enqueue(async () => {
+      const outcomes: HaltOutcome[] = [];
+      for (const stored of this.records.values()) {
+        const run = stored.run, base = { kind: "team" as const, id: run.id, title: run.title };
+        if (stored.ownerHalt?.haltId !== haltId) continue;
+        try {
+          if (run.status !== "paused") {
+            stored.ownerHalt = undefined; this.save(stored);
+            outcomes.push({ ...base, result: "left", reason: LEFT_AS_IS }); continue;
+          }
+          if (keep) {
+            stored.ownerHalt = { reason: KEPT_PAUSED };
+            if (!stored.halt) run.reason = KEPT_PAUSED;
+            this.save(stored);
+            outcomes.push({ ...base, result: "kept", reason: KEPT_PAUSED }); continue;
+          }
+          const other = heldBy([run.projectId]);
+          if (other) {
+            stored.ownerHalt = { ...other };
+            if (!stored.halt) run.reason = other.reason;
+            this.save(stored);
+            outcomes.push({ ...base, result: "held", reason: STILL_HALTED }); continue;
+          }
+          const refusal = this.resumeRefusal(stored, undefined);
+          if (refusal) {
+            stored.ownerHalt = { reason: releaseRefusal(refusal.message) };
+            if (!stored.halt) run.reason = stored.ownerHalt.reason;
+            this.save(stored);
+            outcomes.push({ ...base, result: "refused", reason: refusal.message }); continue;
+          }
+          await this.resumeRun(stored);
+          stored.ownerHalt = undefined;
+          this.event(stored, "Team resumed with a fresh plan: the owner released the halt."); this.save(stored);
+          outcomes.push({ ...base, result: "resumed" });
+        } catch (error) { outcomes.push({ ...base, result: "refused", reason: error instanceof Error ? error.message : "The run could not resume." }); }
+      }
+      return outcomes;
     });
   }
   start() {
@@ -2540,7 +2631,8 @@ export class TeamService {
         }
         const safePendingRecovery = Boolean(run.recovery?.status === "stopping" && stored.pending &&
           (recoverableOperationFailure(stored, stored.pending) || recoverableUnattributedResult(stored, stored.pending)));
-        if (all && (!stored.pending || safePendingRecovery || run.status === "blocked" || run.status === "cancelled")) { stored.halt = undefined; if (!["blocked", "cancelled"].includes(run.status)) run.reason = undefined; }
+        // A run that the owner's halt paused keeps saying so once its members have stopped.
+        if (all && (!stored.pending || safePendingRecovery || run.status === "blocked" || run.status === "cancelled")) { stored.halt = undefined; if (!["blocked", "cancelled"].includes(run.status)) run.reason = run.status === "paused" ? stored.ownerHalt?.reason : undefined; }
         this.save(stored); return;
       }
       if (await this.startAutomaticRecovery(stored, trackingReady)) return;
@@ -4045,7 +4137,7 @@ export class TeamService {
       this.fuse?.release(member.sessionId);
       if (error instanceof LaunchHeldError) { this.holdForHostLoad(stored, error.reason); return; }
       if (error instanceof Error && /configured session limit/.test(error.message)) { stored.run.reason = SESSION_SLOT_REASON; this.save(stored); return; }
-      if (error instanceof TeamError && error.code === "fuse-open") {
+      if (error instanceof TeamError && (error.code === "fuse-open" || error.code === "halted")) {
         if (stored.run.reason !== error.message) { stored.run.reason = error.message; this.save(stored); }
         return;
       }

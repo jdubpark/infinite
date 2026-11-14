@@ -9,6 +9,7 @@ import { createRoutineSchema, routineActionSchema, type CreateRoutine, type Rout
 import type { GoalService } from "./goals.js";
 import { applyFuseReason } from "./fuse/rules.js";
 import type { FuseGate } from "./fuse/types.js";
+import { KEPT_PAUSED, LEFT_AS_IS, STILL_HALTED, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 
 type HookSet = {
   isProjectBusy(projectId: string): Promise<boolean>;
@@ -21,6 +22,8 @@ type Stored = {
   authority: string;
   receipts: Record<string, string>;
   launch?: LaunchIntent;
+  /** Set when the owner's halt paused this routine. Any accepted owner action clears it. */
+  ownerHalt?: { haltId: string };
 };
 const now = () => new Date().toISOString();
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -145,14 +148,85 @@ export class RoutineService {
       if (body.revision !== routine.revision) throw new TeamError(409, "stale-routine-revision", "The routine changed. Refresh it before sending this action.");
       if (terminal.has(routine.status)) throw new TeamError(409, "routine-stopped", "This routine has stopped and cannot be changed.");
       if (action === "pause" && routine.status === "paused") throw new TeamError(409, "routine-not-running", "This routine is already paused.");
-      if (action === "resume" && routine.status !== "paused" && routine.status !== "blocked") throw new TeamError(409, "routine-not-paused", "Only a paused or blocked routine can resume.");
-      if (action === "resume" && Date.now() >= Date.parse(routine.expiresAt)) throw new TeamError(409, "routine-expired", "This routine's approval has expired.");
-      if (action === "resume" && !this.assertAuthority(stored)) throw new TeamError(409, "routine-authority-changed", routine.reason!);
+      if (action === "resume") { const refusal = this.resumeRefusal(stored); if (refusal) throw refusal; }
       routine.revision++; stored.receipts[body.requestId] = digest({ action, ...body });
+      // The owner acted on the routine, so a halt release leaves it as the owner set it.
+      stored.ownerHalt = undefined;
       if (action === "pause") { routine.status = "paused"; routine.reason = routine.activeGoalId ? "Future routine triggers are paused. The active goal retains its own controls and limits." : "Future routine triggers are paused."; }
       else if (action === "cancel") { routine.status = "cancelled"; routine.reason = routine.activeGoalId ? "Future routine triggers are cancelled. The active goal retains its own controls and limits." : "Future routine triggers are cancelled."; }
-      else { routine.status = routine.occurrences.length ? "running" : "scheduled"; routine.reason = undefined; if (stored.launch) stored.launch.attempted = false; }
+      else this.applyResume(stored);
       this.save(stored); return this.view(stored);
+    });
+  }
+  /** Why the routine cannot resume now, or undefined. The owner's resume and a halt release both apply these rules. */
+  private resumeRefusal(stored: Stored): TeamError | undefined {
+    const routine = stored.routine;
+    if (routine.status !== "paused" && routine.status !== "blocked") return new TeamError(409, "routine-not-paused", "Only a paused or blocked routine can resume.");
+    if (Date.now() >= Date.parse(routine.expiresAt)) return new TeamError(409, "routine-expired", "This routine's approval has expired.");
+    if (!this.assertAuthority(stored)) return new TeamError(409, "routine-authority-changed", routine.reason!);
+    return undefined;
+  }
+  private applyResume(stored: Stored) {
+    const routine = stored.routine;
+    routine.status = routine.occurrences.length ? "running" : "scheduled"; routine.reason = undefined; if (stored.launch) stored.launch.attempted = false;
+  }
+  /**
+   * Host-internal: the owner's halt pauses each scheduled or running routine in scope, as the owner's pause does,
+   * without an owner request, and marks it. The active goal is paused by the goal pass that follows.
+   */
+  haltPause(mark: HaltMark, covers: HaltCovers) {
+    return this.enqueue(() => {
+      const outcomes: HaltOutcome[] = [];
+      for (const stored of this.records.values()) {
+        const routine = stored.routine, title = routine.goal.title;
+        if ((routine.status !== "scheduled" && routine.status !== "running") || !covers([routine.goal.projectId], routine.id)) continue;
+        try {
+          routine.revision++; routine.status = "paused"; routine.reason = mark.reason;
+          stored.ownerHalt = { haltId: mark.haltId };
+          this.save(stored);
+          outcomes.push({ kind: "routine", id: routine.id, title, result: "paused" });
+        } catch (error) { outcomes.push(pauseFailure("routine", routine.id, title, error)); }
+      }
+      return outcomes;
+    });
+  }
+  /** Host-internal: resumes each routine still paused under this halt's mark, with the owner's resume rules. */
+  haltResume(haltId: string, heldBy: HaltHeldBy, keep: boolean) {
+    return this.enqueue(() => {
+      const outcomes: HaltOutcome[] = [];
+      for (const stored of this.records.values()) {
+        const routine = stored.routine, base = { kind: "routine" as const, id: routine.id, title: routine.goal.title };
+        if (stored.ownerHalt?.haltId !== haltId) continue;
+        try {
+          if (routine.status !== "paused") {
+            stored.ownerHalt = undefined; this.save(stored);
+            outcomes.push({ ...base, result: "left", reason: LEFT_AS_IS }); continue;
+          }
+          if (keep) {
+            stored.ownerHalt = undefined; routine.reason = KEPT_PAUSED; this.save(stored);
+            outcomes.push({ ...base, result: "kept", reason: KEPT_PAUSED }); continue;
+          }
+          const other = heldBy([routine.goal.projectId]);
+          if (other) {
+            stored.ownerHalt = { haltId: other.haltId }; routine.reason = other.reason; this.save(stored);
+            outcomes.push({ ...base, result: "held", reason: STILL_HALTED }); continue;
+          }
+          const refusal = this.resumeRefusal(stored);
+          if (refusal) {
+            stored.ownerHalt = undefined;
+            // A changed approval policy blocks the routine with its own reason; any other refusal leaves it paused and says why.
+            if (routine.status === "paused") routine.reason = releaseRefusal(refusal.message);
+            this.save(stored);
+            outcomes.push({ ...base, result: "refused", reason: refusal.message }); continue;
+          }
+          routine.revision++;
+          this.applyResume(stored);
+          stored.ownerHalt = undefined;
+          this.save(stored);
+          outcomes.push({ ...base, result: "resumed" });
+        } catch (error) { outcomes.push({ ...base, result: "refused", reason: error instanceof Error ? error.message : "The routine could not resume." }); }
+      }
+      return outcomes;
     });
   }
   pause(id: string, action: RoutineAction) { return this.action(id, "pause", action); }

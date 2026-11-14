@@ -11,6 +11,7 @@ import { addRollups, emptyRollup, type UsageRollup } from "./team-usage.js";
 import type { LinearService } from "./linear.js";
 import { applyFuseReason } from "./fuse/rules.js";
 import type { FuseGate } from "./fuse/types.js";
+import { KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 
 type Action = { requestId: string; revision: number };
 /** `parallelism` remains readable only so a pre-migration queued owner control can be discarded safely. */
@@ -23,6 +24,8 @@ type Stored = {
   launch?: { request: CreateTeam; context: TeamGoalContext; autonomy?: AutonomyMode };
   control?: PendingControl;
   extensionIntent?: GoalExtensionIntent;
+  /** Set when the owner's halt paused this goal, with the goal revision it left. Any owner action moves the revision on. */
+  ownerHalt?: { haltId: string; revision: number };
 };
 const now = () => new Date().toISOString();
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -223,6 +226,67 @@ export class GoalService {
       this.setControl(stored, action);
       this.event(stored, `Goal ${action === "pause" ? "paused" : action === "resume" ? "resumed" : "cancelled"}.`);
       this.save(stored); return structuredClone(goal);
+    });
+  }
+  /**
+   * Host-internal: the owner's halt pauses each running goal in scope as the owner's pause does, without an owner
+   * request, and marks it with the revision it leaves. A pending steer is delivered first, never dropped.
+   */
+  haltPause(mark: HaltMark, covers: HaltCovers) {
+    return this.enqueue(async () => {
+      const outcomes: HaltOutcome[] = [];
+      for (const stored of this.records.values()) {
+        const goal = stored.goal;
+        if (goal.status !== "running" || !covers([goal.projectId], goal.id)) continue;
+        try {
+          if (stored.control?.action === "steer" && !await this.applyControl(stored)) throw new TeamError(409, "goal-control-pending", "The previous goal action is still being applied.");
+          if (goal.status !== "running") continue;
+          goal.revision++; goal.status = "paused"; goal.reason = mark.reason;
+          this.setControl(stored, "pause");
+          stored.ownerHalt = { haltId: mark.haltId, revision: goal.revision };
+          this.event(stored, `Goal paused: ${mark.reason}`); this.save(stored);
+          outcomes.push({ kind: "goal", id: goal.id, title: goal.title, result: "paused" });
+        } catch (error) { outcomes.push(pauseFailure("goal", goal.id, goal.title, error)); }
+      }
+      return outcomes;
+    });
+  }
+  /** Host-internal: resumes each goal still paused, unchanged, under this halt's mark, with the owner's resume rules. */
+  haltResume(haltId: string, heldBy: HaltHeldBy, keep: boolean) {
+    return this.enqueue(async () => {
+      const outcomes: HaltOutcome[] = [];
+      for (const stored of this.records.values()) {
+        const goal = stored.goal, mark = stored.ownerHalt, base = { kind: "goal" as const, id: goal.id, title: goal.title };
+        if (mark?.haltId !== haltId) continue;
+        const refuse = (reason: string) => {
+          stored.ownerHalt = undefined; goal.reason = releaseRefusal(reason); this.save(stored);
+          outcomes.push({ ...base, result: "refused", reason });
+        };
+        try {
+          if (goal.status !== "paused" || goal.revision !== mark.revision) {
+            if (goal.status === "paused" && isHaltReason(goal.reason)) goal.reason = LEFT_PAUSED;
+            stored.ownerHalt = undefined; this.save(stored);
+            outcomes.push({ ...base, result: "left", reason: LEFT_AS_IS }); continue;
+          }
+          if (keep) {
+            stored.ownerHalt = undefined; goal.reason = KEPT_PAUSED; this.save(stored);
+            outcomes.push({ ...base, result: "kept", reason: KEPT_PAUSED }); continue;
+          }
+          if (stored.control && !await this.applyControl(stored)) { refuse("The previous goal action is still being applied."); continue; }
+          const other = heldBy([goal.projectId]);
+          if (other) {
+            stored.ownerHalt = { haltId: other.haltId, revision: goal.revision }; goal.reason = other.reason; this.save(stored);
+            outcomes.push({ ...base, result: "held", reason: STILL_HALTED }); continue;
+          }
+          if (Date.now() >= Date.parse(goal.deadlineAt)) { refuse("This goal's time limit has expired. Extend it or start a new goal to approve more time."); continue; }
+          goal.revision++; goal.status = "running"; goal.reason = undefined;
+          this.setControl(stored, "resume");
+          stored.ownerHalt = undefined;
+          this.event(stored, "Goal resumed: the owner released the halt."); this.save(stored);
+          outcomes.push({ ...base, result: "resumed" });
+        } catch (error) { refuse(error instanceof Error ? error.message : "The goal could not resume."); }
+      }
+      return outcomes;
     });
   }
   private async finishExtension(stored: Stored, intent: GoalExtensionIntent) {

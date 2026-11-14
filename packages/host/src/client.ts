@@ -771,17 +771,22 @@ export function outcomeRollupLines(rollup: OutcomeRollup): string[] {
   return lines;
 }
 
+/** One line for each refused line of an import, in the order given. */
+export function legacyRefusedLines(lines: readonly { line: number; outcome: LegacyLineOutcome }[]): string[] {
+  return lines.filter(line => line.outcome === "changed" || line.outcome === "conflict").map(line => `Line ${line.line}: ${line.outcome}`);
+}
+
 /**
  * The import result as lines: each refused line in file order, then one summary. A dry run says nothing was written,
  * and a dry run over several batches says that each batch was checked on its own.
  */
 export function legacyImportLines(result: { dryRun: boolean; lines: { line: number; outcome: LegacyLineOutcome }[]; removed: number; batches: number }): string[] {
   const count = (name: LegacyLineOutcome) => result.lines.filter(line => line.outcome === name).length;
-  const refused = result.lines.filter(line => line.outcome === "changed" || line.outcome === "conflict");
+  const refused = legacyRefusedLines(result.lines);
   const summary = `Imported ${count("imported")}, repeated ${count("repeated")}, superseded ${count("superseded")}, expired ${count("expired")}, refused ${refused.length}, removed ${result.removed}.`;
   const dry = result.dryRun ? "Dry run, nothing was written: " : "";
   const perBatch = result.dryRun && result.batches > 1 ? ` A dry run checks each batch of ${LEGACY_BATCH_MAX} lines on its own.` : "";
-  return [...refused.map(line => `Line ${line.line}: ${line.outcome}`), `${dry}${summary}${perBatch}`];
+  return [...refused, `${dry}${summary}${perBatch}`];
 }
 
 export function usageBars(values: number[]): string {
@@ -899,16 +904,18 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
           let answer: LegacyImportResult;
           try {
             answer = await api.json<LegacyImportResult>("/outcomes/legacy", { dryRun, lines: batch }, undefined, undefined, "POST");
+            // One outcome answers one line. Another count means the host and this command disagree about the batch.
+            if (!Array.isArray(answer.outcomes) || answer.outcomes.length !== batch.length)
+              throw new Error(`The host answered the batch that starts at line ${first} with another number of lines. Check that the host and this command are the same version.`);
           } catch (error) {
+            // Lines of the batches already answered are kept by the host; name the refused ones before the failure.
+            for (const line of legacyRefusedLines(outcomes)) console.log(line);
             if (error instanceof HttpError && error.status === 403) throw new Error("Importing legacy outcomes requires an owner device key.");
             if (error instanceof HttpError && error.status === 409) throw new Error(`The host holds too many legacy lines: the limit is 50,000. The batch that starts at line ${first} was not imported.`);
             if (error instanceof HttpError && error.status === 400) throw new Error(`The host refused the batch that starts at line ${first} as invalid. Nothing of it was imported.`);
             if (error instanceof HttpError && error.status === 503) throw new Error(start === 0 ? "The evidence store is unavailable. No line was imported; run the same command again." : `The evidence store is unavailable.${sentThrough}`);
             throw error;
           }
-          // One outcome answers one line. Another count means the host and this command disagree about the batch.
-          if (!Array.isArray(answer.outcomes) || answer.outcomes.length !== batch.length)
-            throw new Error(`The host answered the batch that starts at line ${first} with another number of lines. Check that the host and this command are the same version.`);
           batches++;
           removed += answer.removed;
           outcomes.push(...answer.outcomes.map((outcome, index) => ({ line: numbers[start + index]!, outcome })));

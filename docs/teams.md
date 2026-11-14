@@ -2054,9 +2054,10 @@ The host gives each line one of six outcomes:
   The line is refused.
 
 A refused line does not stop the other lines of its batch. A replay changes
-nothing. Two lines that supersede each other give the same result in either
-order, and the result does not depend on where the file is cut into batches.
-In a cycle of `supersedes`, the first line in the file wins.
+nothing. What the host stores depends on the set of lines, not on their order
+or on where the file is cut into batches. A line that was itself superseded
+still replaces the line it names. So a chain of `supersedes` keeps only its
+last line, and a cycle keeps no line.
 
 `--dry-run` writes nothing. It decides each batch against what the host holds,
 so it reports what a real import of that batch would. In a file of more than

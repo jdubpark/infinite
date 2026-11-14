@@ -179,8 +179,10 @@ export type LegacyEffect = { kind: "insert"; ref: string; row: OutcomeRow; state
 export type LegacyPlan = { outcomes: LegacyLineOutcome[]; effects: LegacyEffect[]; removed: number; newLines: number };
 
 /**
- * Walks the lines in array order. Each line sees the effects of the earlier lines, so the result depends on the
- * order of the file and never on how a client cut its batches. Never reads or writes the store.
+ * Walks the lines in array order. Each line sees the effects of the earlier lines. The tables that result depend on
+ * the set of lines, never on their order or on how a client cut its batches: a line has a row when the host saw it and
+ * no seen line names it, and it is superseded when a seen line names it. Only the answer for each line depends on
+ * what came before it. Never reads or writes the store.
  */
 export function planLegacyBatch(lines: readonly LegacyOutcome[],
   known: { lines: ReadonlyMap<string, LegacyLineState>; rows: ReadonlyMap<string, string> },   // by ref; outcome id -> source
@@ -191,6 +193,33 @@ export function planLegacyBatch(lines: readonly LegacyOutcome[],
   const effects: LegacyEffect[] = [];
   let removed = 0;
   const cutoff = Date.parse(context.now) - context.retentionDays * DAY_MS;
+
+  /**
+   * A line replaces the line it names when the host first sees the line, whether the line is stored or only
+   * completes its own mark. So a chain keeps its last line in every order, and a cycle keeps none.
+   */
+  const supersede = (line: LegacyOutcome): void => {
+    if (line.supersedes === undefined) return;
+    const oldRef = context.ref(line.supersedes);
+    const old = states.get(oldRef);
+    if (old === undefined) {
+      const mark: LegacyLineState = { state: "superseded", lineHash: null, recordedAt: line.recordedAt };
+      effects.push({ kind: "supersede", ref: oldRef, state: mark, removeRow: false });
+      states.set(oldRef, mark);
+    } else if (old.state === "imported") {
+      const mark: LegacyLineState = { state: "superseded", lineHash: old.lineHash, recordedAt: old.recordedAt };
+      effects.push({ kind: "supersede", ref: oldRef, state: mark, removeRow: true });
+      states.set(oldRef, mark);
+      rows.delete(legacyOutcomeId(oldRef));
+      removed++;
+    } else if (old.lineHash === null && Date.parse(old.recordedAt) < Date.parse(line.recordedAt)) {
+      // The host has not seen the named line. Its mark holds the latest time among the lines that name it, so two
+      // such lines leave one mark in either order.
+      const mark: LegacyLineState = { ...old, recordedAt: line.recordedAt };
+      effects.push({ kind: "supersede", ref: oldRef, state: mark, removeRow: false });
+      states.set(oldRef, mark);
+    }
+  };
 
   for (const line of lines) {
     const ref = context.ref(line.id);
@@ -203,14 +232,18 @@ export function planLegacyBatch(lines: readonly LegacyOutcome[],
     }
     const current = states.get(ref);
     if (current?.state === "superseded") {
-      // A mark made before its line was seen has no hash. The line completes it with its own hash and time, so the
-      // mark is the same whichever of the two lines came first.
       if (current.lineHash === null) {
+        // A mark made before its line was seen has no hash. The line completes it with its own hash and time, so the
+        // mark is the same whichever line came first. The line is not stored, and it still replaces the line it names.
         const mark: LegacyLineState = { state: "superseded", lineHash: hash, recordedAt: line.recordedAt };
         effects.push({ kind: "supersede", ref, state: mark, removeRow: false });
         states.set(ref, mark);
+        supersede(line);
+        outcomes.push("superseded");
+      } else {
+        // The mark holds the hash of the body the host saw. Another body is an edit, refused as under an imported id.
+        outcomes.push(current.lineHash === hash ? "superseded" : "changed");
       }
-      outcomes.push("superseded");
       continue;
     }
     if (current) {
@@ -221,21 +254,7 @@ export function planLegacyBatch(lines: readonly LegacyOutcome[],
       outcomes.push("conflict");
       continue;
     }
-    if (line.supersedes !== undefined) {
-      const oldRef = context.ref(line.supersedes);
-      const old = states.get(oldRef);
-      if (old === undefined) {
-        const mark: LegacyLineState = { state: "superseded", lineHash: null, recordedAt: line.recordedAt };
-        effects.push({ kind: "supersede", ref: oldRef, state: mark, removeRow: false });
-        states.set(oldRef, mark);
-      } else if (old.state === "imported") {
-        const mark: LegacyLineState = { state: "superseded", lineHash: old.lineHash, recordedAt: old.recordedAt };
-        effects.push({ kind: "supersede", ref: oldRef, state: mark, removeRow: true });
-        states.set(oldRef, mark);
-        rows.delete(legacyOutcomeId(oldRef));
-        removed++;
-      }
-    }
+    supersede(line);
     const state: LegacyLineState = { state: "imported", lineHash: hash, recordedAt: line.recordedAt };
     effects.push({ kind: "insert", ref, row: legacyRow(line, ref), state });
     states.set(ref, state);

@@ -922,11 +922,29 @@ test("a version 2 store migrates to version 3 and indexes goals and missions", (
       insertOutcomeAtVersion2(tx, "run-2:member-1", "run-2", tx.seal("outcomes", "run-2:member-1", rowIn("run-2", "member-1").payload));
       insertOutcomeAtVersion2(tx, "run-3:member-1", "run-3", "x");
     });
+    const earlier = store.read(db => ({
+      outcomes: db.all("SELECT * FROM outcomes ORDER BY outcome_id"),
+      summaries: db.all("SELECT * FROM run_summaries ORDER BY run_id"),
+    }));
     store.close();
 
     store = open(f);
     store.register(outcomeModule({ now: () => NOW }));
     assert.equal(store.status().modules.outcomes, "ready");
+    // Version 3 only adds the two ref columns: every earlier column of every row keeps its value.
+    const later = store.read(db => ({
+      outcomes: db.all("SELECT * FROM outcomes ORDER BY outcome_id"),
+      summaries: db.all("SELECT * FROM run_summaries ORDER BY run_id"),
+    }));
+    // Rows of node:sqlite have no prototype; both sides are copied to plain objects before the comparison.
+    const withoutRefs = (row: Record<string, unknown>) => {
+      const { goal_ref: _goal, mission_ref: _mission, ...rest } = row;
+      return { ...rest };
+    };
+    assert.equal(later.outcomes.length, earlier.outcomes.length);
+    assert.equal(later.summaries.length, earlier.summaries.length);
+    earlier.outcomes.forEach((row, index) => assert.deepEqual(withoutRefs(later.outcomes[index]!), { ...row }));
+    earlier.summaries.forEach((row, index) => assert.deepEqual(withoutRefs(later.summaries[index]!), { ...row }));
     const stored = store.read(db => db.get<{ version: number; read_version: number }>(
       "SELECT version, read_version FROM schema_modules WHERE name='outcomes'",
     ));
@@ -1198,6 +1216,8 @@ test("the module reports legacy counts", () => {
     });
     const counts = store.describe().counts;
     assert.equal(counts["outcomes.legacy"], 2);
+    // One row of the three is a production row; the module's outcomes count leaves the legacy rows out.
+    assert.equal(counts["outcomes.outcomes"], 1);
     assert.equal(counts["outcomes.legacyLines"], 3);
   } finally {
     store?.close();

@@ -723,7 +723,8 @@ export function createApp(config: Config, key: Buffer) {
     }
   });
   // The roll-up of one goal or mission. Every paired device may read it, as it may read the cells. The goal's assessment comes from the goal record.
-  const rollupQuery = z.union([z.strictObject({ goal: z.uuid() }), z.strictObject({ mission: z.uuid() })]);
+  const lowerUuid = z.uuid().transform(value => value.toLowerCase());
+  const rollupQuery = z.union([z.strictObject({ goal: lowerUuid }), z.strictObject({ mission: lowerUuid })]);
   app.get("/api/outcomes/rollup", (req, res) => {
     const query = rollupQuery.parse(req.query);
     const target: RollupTarget = "goal" in query ? { kind: "goal", id: query.goal } : { kind: "mission", id: query.mission };

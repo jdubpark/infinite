@@ -169,6 +169,47 @@ test("a superseded line is dropped in either order across batches", () => {
   }
 });
 
+test("a chain keeps its last line in every order across batches", () => {
+  // B replaced A, and C replaced B. Each store has its own key, so the facts are compared by operator id.
+  const chain = [
+    line("A", { recordedAt: "2026-11-01T00:00:00.000Z" }),
+    line("B", { supersedes: "A", recordedAt: "2026-11-02T00:00:00.000Z" }),
+    line("C", { supersedes: "B", recordedAt: "2026-11-03T00:00:00.000Z" }),
+  ];
+  const ids = ["A", "B", "C"];
+  const snapshot = (store: EvidenceStore) => store.read(db => {
+    const refs = ids.map(id => db.index("legacy", id));
+    const states = readLegacyLines(db, refs);
+    return {
+      states: ids.map((id, index) => [id, states.get(refs[index]!) ?? null]),
+      rows: ids.map((id, index) => [id, readOutcome(db, legacyOutcomeId(refs[index]!))?.payload.legacy?.id ?? null]),
+      count: db.get<{ n: number }>("SELECT count(*) AS n FROM outcomes")?.n,
+    };
+  });
+  const orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+  let expected: ReturnType<typeof snapshot> | undefined;
+  for (const order of orders) {
+    const f = fixture();
+    const store = open(f);
+    try {
+      let removed = 0;
+      for (const index of order) removed += importLegacy(store, { dryRun: false, lines: [chain[index]!] }, OPTIONS).removed;
+      const got = snapshot(store);
+      assert.deepEqual(got.rows, [["A", null], ["B", null], ["C", "C"]], order.join(" "));
+      assert.equal(got.count, 1, order.join(" "));
+      assert.deepEqual(got.states.map(([id, state]) => [id, (state as { state: string } | null)?.state]),
+        [["A", "superseded"], ["B", "superseded"], ["C", "imported"]], order.join(" "));
+      // A row is removed once for each line that was stored before the line that replaced it arrived.
+      assert.equal(removed, order.indexOf(0) < order.indexOf(1) ? (order.indexOf(1) < order.indexOf(2) ? 2 : 1) : (order.indexOf(1) < order.indexOf(2) ? 1 : 0), order.join(" "));
+      if (expected === undefined) expected = got;
+      else assert.deepEqual(got, expected, order.join(" "));
+    } finally {
+      store.close();
+      f.close();
+    }
+  }
+});
+
 test("a batch cut in the middle writes nothing", () => {
   const f = fixture();
   const store = open(f);

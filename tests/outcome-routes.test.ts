@@ -517,6 +517,11 @@ test("roll-up queries are checked", { timeout: 60000 }, async () => {
     assert.equal(empty.body.runs.counts, null);
     assert.deepEqual(empty.body.implementer, []);
     assert.equal(empty.body.cost.tokens, null);
+    // A UUID is case-insensitive: an upper-case query names the same mission.
+    const upper = await host.fetchApi(`/outcomes/rollup?mission=${held.toUpperCase()}`, "viewer");
+    assert.equal(upper.status, 200, JSON.stringify(upper.body));
+    assert.equal(upper.body.known, true);
+    assert.deepEqual(upper.body.target, { kind: "mission", id: held });
 
     // The command prints the same roll-up, and says so when the host holds nothing under the id.
     const viewer = clientCli(host, root, "viewer");

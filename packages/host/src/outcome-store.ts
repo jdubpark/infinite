@@ -407,7 +407,7 @@ export function outcomeModule(options?: { now?: () => string }): EvidenceModule 
     counts(db) {
       const count = (sql: string) => db.get<{ n: number }>(sql)?.n ?? 0;
       return {
-        outcomes: count("SELECT count(*) AS n FROM outcomes"),
+        outcomes: count("SELECT count(*) AS n FROM outcomes WHERE source<>'legacy'"),
         open: count("SELECT count(*) AS n FROM outcomes WHERE disposition='open'"),
         gap: count("SELECT count(*) AS n FROM outcomes WHERE (','||flags||',') LIKE '%,gap,%'"),
         backfilled: count("SELECT count(*) AS n FROM outcomes WHERE (','||flags||',') LIKE '%,backfilled,%'"),

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { clientCommandCandidate, handleClientCommand, legacyImportLines, outcomeCellLines, outcomeRollupLines, parseClientArgs } from "../packages/host/src/client.js";
+import { clientCommandCandidate, handleClientCommand, legacyImportLines, legacyRefusedLines, outcomeCellLines, outcomeRollupLines, parseClientArgs } from "../packages/host/src/client.js";
 import type { OutcomeRollup } from "../packages/host/src/outcome-rollup.js";
 import type { LegacyLineOutcome } from "../packages/host/src/outcome-legacy.js";
 import type { CellsResult } from "../packages/host/src/outcome-reads.js";
@@ -239,4 +239,10 @@ test("import lines name refused lines and count the rest", () => {
 
   const twoBatches = legacyImportLines({ dryRun: true, lines: [outcome(1, "imported")], removed: 0, batches: 2 });
   assert.ok(twoBatches.at(-1)!.endsWith("A dry run checks each batch of 50 lines on its own."), twoBatches.at(-1));
+});
+
+test("refused lines are named on their own", () => {
+  const outcome = (line: number, value: LegacyLineOutcome) => ({ line, outcome: value });
+  assert.deepEqual(legacyRefusedLines([outcome(1, "imported"), outcome(2, "changed"), outcome(3, "repeated"), outcome(5, "conflict")]), ["Line 2: changed", "Line 5: conflict"]);
+  assert.deepEqual(legacyRefusedLines([outcome(1, "imported"), outcome(2, "repeated")]), []);
 });

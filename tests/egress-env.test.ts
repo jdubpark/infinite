@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { egressConfigSchema, installHostEgress, workerEgressEnvironment } from "../packages/host/src/egress.js";
+import { egressConfigSchema, egressDoctorLine, installHostEgress, workerEgressEnvironment } from "../packages/host/src/egress.js";
 import { teamCommandEnvironment } from "../packages/host/src/team-workspace.js";
 // @ts-ignore -- a dependency-free script without type declarations
 import { verifyProxyAuthorization } from "../scripts/egress-proxy.mjs";
@@ -63,11 +63,29 @@ test("with the egress block, each session gets its own credential in the proxy U
   }
 });
 
-test("a session whose key cannot be read gets no proxy variables, and the worker can record the gap", () => {
+test("without a readable key, sessions and host commands still get the proxy, with no credential, so nothing goes direct", async () => {
   const unreadable = join(root, "open.key");
   writeFileSync(unreadable, key, { mode: 0o644 });
-  assert.deepEqual(workerEgressEnvironment("project-a", "0b6a3c52-6c1e-4b0e-9a55-3f1f2d0c9e71", { INFINITE_EGRESS_PROXY_URL: egress.proxyUrl, INFINITE_EGRESS_KEY_FILE: unreadable }), { status: "no-key", env: {} });
-  assert.deepEqual(workerEgressEnvironment("project-a", "0b6a3c52-6c1e-4b0e-9a55-3f1f2d0c9e71", { INFINITE_EGRESS_PROXY_URL: egress.proxyUrl, INFINITE_EGRESS_KEY_FILE: join(root, "missing.key") }), { status: "no-key", env: {} });
+  const uncredentialed = Object.fromEntries(PROXY_NAMES.map(name => [name, name.toLowerCase() === "no_proxy" ? "localhost,127.0.0.1,::1" : "http://127.0.0.1:3128"]));
+  for (const keyFile of [unreadable, join(root, "missing.key"), "relative.key", ""])
+    assert.deepEqual(workerEgressEnvironment("project-a", "0b6a3c52-6c1e-4b0e-9a55-3f1f2d0c9e71", { INFINITE_EGRESS_PROXY_URL: egress.proxyUrl, INFINITE_EGRESS_KEY_FILE: keyFile }), { status: "no-key", env: uncredentialed }, keyFile);
+  assert.deepEqual(workerEgressEnvironment("project-a", "0b6a3c52-6c1e-4b0e-9a55-3f1f2d0c9e71", { INFINITE_EGRESS_PROXY_URL: egress.proxyUrl }), { status: "no-key", env: uncredentialed });
+  for (const proxyUrl of [undefined, "", "http://proxy.example.test:3128"])
+    assert.deepEqual(workerEgressEnvironment("project-a", "0b6a3c52-6c1e-4b0e-9a55-3f1f2d0c9e71", { INFINITE_EGRESS_PROXY_URL: proxyUrl, INFINITE_EGRESS_KEY_FILE: keyPath }).status, "invalid", String(proxyUrl));
+  // The host-identity path: a team Git command run as the host account, which the firewall rule does not match.
+  const inherited: NodeJS.ProcessEnv = {};
+  const warn = console.warn;
+  console.warn = () => {};
+  installHostEgress({ autonomy: { boundary: { egress: { ...egress, keyPath: unreadable } } } }, inherited);
+  try {
+    const team = teamCommandEnvironment();
+    for (const name of PROXY_NAMES) assert.equal(team[name], uncredentialed[name], name);
+  } finally {
+    installHostEgress({}, inherited);
+    console.warn = warn;
+  }
+  const line = await egressDoctorLine({ proxyUrl: "http://127.0.0.1:9", keyPath: unreadable });
+  assert.match(line, /key UNREADABLE \(permissions\): .*refused with 407/);
 });
 
 test("the egress block accepts only a bare loopback HTTP proxy address", () => {

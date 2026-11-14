@@ -426,7 +426,9 @@ connect. It is off unless `autonomy.boundary.egress` is configured; without it,
 session environments are unchanged. When configured, each new session receives
 `HTTPS_PROXY` and `HTTP_PROXY` pointing at a loopback proxy, with a credential
 that names the session's project and expires. The host reads the shared key;
-no session receives it. The proxy refuses cloud metadata, loopback, private,
+no session receives it. When the key cannot be read, sessions and host commands
+still get the proxy address, without a credential, so their requests are
+refused rather than sent direct. The proxy refuses cloud metadata, loopback, private,
 shared, link-local, multicast, documentation, and other non-public addresses in
 both modes, after resolving the name once and connecting to the checked
 address. It records one line per connection with project, host, port, address,

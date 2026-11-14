@@ -22,6 +22,8 @@ const MAX_CONFIG_BYTES = 64 * 1024;
 const MAX_POLICY_BYTES = 1024 * 1024;
 const MAX_SUMMARY_BYTES = 16 * 1024 * 1024;
 const KEY_BYTES = 32;
+// What a client may send after its CONNECT before the tunnel opens (a TLS client hello fits many times over).
+const MAX_EARLY_BYTES = 64 * 1024;
 
 export const DEFAULT_LIMITS = Object.freeze({
   connectTimeoutMs: 10_000,
@@ -33,6 +35,8 @@ export const DEFAULT_LIMITS = Object.freeze({
   maxConnections: 1024,
   maxTunnels: 512,
   maxTunnelsPerSession: 64,
+  maxLookups: 64,
+  maxLookupsPerSession: 16,
   summaryIntervalMs: 30_000,
 });
 const LIMIT_BOUNDS = Object.freeze({
@@ -45,6 +49,8 @@ const LIMIT_BOUNDS = Object.freeze({
   maxConnections: [1, 65_536],
   maxTunnels: [1, 65_536],
   maxTunnelsPerSession: [1, 65_536],
+  maxLookups: [1, 4_096],
+  maxLookupsPerSession: [1, 4_096],
   summaryIntervalMs: [10, 3_600_000],
 });
 
@@ -560,6 +566,7 @@ const STATUS_TEXT = {
   431: "Request Header Fields Too Large",
   501: "Not Implemented",
   502: "Bad Gateway",
+  503: "Service Unavailable",
   504: "Gateway Timeout",
 };
 const HOP_BY_HOP = new Set(["connection", "proxy-connection", "keep-alive", "proxy-authorization", "proxy-authenticate", "te", "trailer", "transfer-encoding", "upgrade", "expect"]);
@@ -578,6 +585,9 @@ function refusalBody(reason, entry) {
     "bad-target": "Infinite egress proxy: the destination is not a valid host and port.",
     "host-mismatch": "Infinite egress proxy: the Host header does not name the requested destination.",
     "upgrade-unsupported": "Infinite egress proxy: protocol upgrades over plain HTTP are not supported; use CONNECT.",
+    "bad-framing": "Infinite egress proxy: the request body length is ambiguous (conflicting Content-Length or Transfer-Encoding).",
+    "transfer-coding": "Infinite egress proxy: only the chunked transfer coding is supported for request bodies.",
+    "dns-busy": "Infinite egress proxy: too many name lookups are pending; try again shortly.",
     "no-policy": "Infinite egress proxy has no valid policy and refuses every destination.",
     port: `Infinite egress proxy refused ${where}: the port is not allowed.`,
     "not-listed": `Infinite egress proxy refused ${where}: the host is not in the egress allowlist.`,
@@ -594,9 +604,10 @@ function refusalBody(reason, entry) {
 
 function statusFor(reason, decision) {
   if (decision === "unauthenticated") return 407;
-  if (reason === "bad-target" || reason === "host-mismatch") return 400;
+  if (reason === "bad-target" || reason === "host-mismatch" || reason === "bad-framing") return 400;
   if (reason === "too-many-connections") return 429;
-  if (reason === "upgrade-unsupported") return 501;
+  if (reason === "upgrade-unsupported" || reason === "transfer-coding") return 501;
+  if (reason === "dns-busy") return 503;
   if (reason === "connect-timeout" || reason === "dns-timeout") return 504;
   if (reason === "dns-failed" || reason === "connect-failed") return 502;
   return 403;
@@ -624,6 +635,41 @@ function forwardedHeaders(rawHeaders, hostHeader) {
   return headers;
 }
 
+// Methods whose requests carry no body unless they say so; any other method states its length, even when it is zero.
+const BODYLESS_METHODS = new Set(["GET", "HEAD", "DELETE", "OPTIONS", "TRACE"]);
+
+/**
+ * How a request delimits its body, read from the raw headers. Only framing the proxy can reproduce exactly is
+ * accepted: one Content-Length, or the chunked coding alone. Anything else is refused, never guessed at.
+ */
+export function requestFraming(rawHeaders) {
+  const lengths = [];
+  const codings = [];
+  for (let index = 0; index + 1 < rawHeaders.length; index += 2) {
+    const name = rawHeaders[index].toLowerCase();
+    if (name === "content-length") lengths.push(rawHeaders[index + 1]);
+    else if (name === "transfer-encoding") codings.push(rawHeaders[index + 1]);
+  }
+  if (lengths.length > 0 && codings.length > 0) return { error: "bad-framing" };
+  if (codings.length > 0) return codings.length === 1 && codings[0].trim().toLowerCase() === "chunked" ? { kind: "chunked" } : { error: "transfer-coding" };
+  if (lengths.length > 1) return { error: "bad-framing" };
+  if (lengths.length === 1) {
+    const value = lengths[0].trim();
+    return /^[0-9]{1,15}$/.test(value) ? { kind: "length", length: Number(value) } : { error: "bad-framing" };
+  }
+  return { kind: "none" };
+}
+
+/** The forwarded body's framing, set explicitly for every method after the hop-by-hop headers are gone. */
+function frameHeaders(headers, framing, method) {
+  delete headers["content-length"];
+  delete headers["transfer-encoding"];
+  if (framing.kind === "chunked") headers["transfer-encoding"] = "chunked";
+  else if (framing.kind === "length") headers["content-length"] = String(framing.length);
+  else if (!BODYLESS_METHODS.has(method)) headers["content-length"] = "0";
+  return headers;
+}
+
 /**
  * Creates the proxy. `resolve(host)` returns `[{ address, family }]` (default: the system resolver, every address);
  * `log(record)` receives each record (default: one JSON line on stdout); `now()` is the clock.
@@ -634,6 +680,7 @@ export function createEgressProxy(options) {
   const policyFile = options.policyFile;
   const summaryFile = options.summaryFile;
   const resolveName = options.resolve ?? (host => lookup(host, { all: true }));
+  const openSocket = options.connect ?? netConnect;
   const emit = options.log ?? (record => process.stdout.write(`${JSON.stringify(record)}\n`));
   const clock = options.now ?? Date.now;
   const limits = Object.freeze({ ...DEFAULT_LIMITS, ...(options.limits ?? {}) });
@@ -650,6 +697,9 @@ export function createEgressProxy(options) {
   const active = new Set();
   const perSession = new Map();
   let open = 0;
+  const lookupsByName = new Map();
+  const lookupsBySession = new Map();
+  let lookups = 0;
 
   const iso = (ms = clock()) => new Date(ms).toISOString();
   const say = record => {
@@ -718,21 +768,62 @@ export function createEgressProxy(options) {
     return reloading;
   }
 
+  /**
+   * A connection's place in the global and per-session limits. The client connection holds it, and so does every
+   * piece of work started for it (the handler, a name lookup); it is freed only when all of them have settled. A
+   * client that disconnects therefore cannot leave lookups or connection attempts running outside the limits.
+   */
   function acquire(identity) {
     const id = `${identity.project}.${identity.session}`;
     const count = perSession.get(id) ?? 0;
     if (open >= limits.maxTunnels || count >= limits.maxTunnelsPerSession) return undefined;
     open += 1;
     perSession.set(id, count + 1);
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      open -= 1;
-      const left = (perSession.get(id) ?? 1) - 1;
-      if (left > 0) perSession.set(id, left);
-      else perSession.delete(id);
+    let holds = 0;
+    let freed = false;
+    return {
+      id,
+      hold() {
+        holds += 1;
+        let released = false;
+        return () => {
+          if (released) return;
+          released = true;
+          holds -= 1;
+          if (holds > 0 || freed) return;
+          freed = true;
+          open -= 1;
+          const left = (perSession.get(id) ?? 1) - 1;
+          if (left > 0) perSession.set(id, left);
+          else perSession.delete(id);
+        };
+      },
     };
+  }
+
+  /**
+   * The system lookup for a name. Concurrent requests for one name share a single lookup. A new lookup counts against
+   * the global and the starting session's lookup limits until it settles, however long that takes: a timeout ends a
+   * wait for it, never its count, because the system resolver cannot cancel it.
+   */
+  function lookupName(host, sessionId) {
+    const shared = lookupsByName.get(host);
+    if (shared) return shared;
+    const mine = lookupsBySession.get(sessionId) ?? 0;
+    if (lookups >= limits.maxLookups || mine >= limits.maxLookupsPerSession) fail("dns-busy");
+    lookups += 1;
+    lookupsBySession.set(sessionId, mine + 1);
+    const pending = Promise.resolve().then(() => resolveName(host));
+    lookupsByName.set(host, pending);
+    const settled = () => {
+      lookups -= 1;
+      const left = (lookupsBySession.get(sessionId) ?? 1) - 1;
+      if (left > 0) lookupsBySession.set(sessionId, left);
+      else lookupsBySession.delete(sessionId);
+      if (lookupsByName.get(host) === pending) lookupsByName.delete(host);
+    };
+    pending.then(settled, settled);
+    return pending;
   }
 
   function newEntry(kind) {
@@ -759,12 +850,16 @@ export function createEgressProxy(options) {
     entry.port = target.port;
   }
 
-  async function resolveTarget(target) {
+  async function resolveTarget(target, slot) {
     if (target.kind !== "name") return [{ address: target.host, family: target.kind === "ipv4" ? 4 : 6 }];
+    const pending = lookupName(target.host, slot.id);
+    // The connection keeps its slot until the lookup it waited on settles, even when the wait below times out.
+    const settled = slot.hold();
+    pending.then(settled, settled);
     let timer;
     try {
       const result = await Promise.race([
-        Promise.resolve().then(() => resolveName(target.host)),
+        pending,
         new Promise((_, reject) => { timer = setTimeout(() => reject(new EgressError("dns-timeout")), limits.dnsTimeoutMs); }),
       ]);
       if (!Array.isArray(result) || result.length === 0 || result.length > 64) fail("dns-failed");
@@ -780,7 +875,7 @@ export function createEgressProxy(options) {
    * The policy decision for one destination. Enforce refuses an unlisted host before any lookup, so the proxy never
    * resolves a name it would refuse. Every address a name resolves to is checked; one refused address refuses the name.
    */
-  async function decide(identity, target) {
+  async function decide(identity, target, slot) {
     const current = policy;
     if (!current) return { refuse: true, decision: "refused", reason: "no-policy" };
     if (!current.ports.has(target.port)) return { refuse: true, decision: "refused", reason: "port" };
@@ -789,7 +884,7 @@ export function createEgressProxy(options) {
     const decision = listed ? "allowed" : "would-deny";
     let addresses;
     try {
-      addresses = await resolveTarget(target);
+      addresses = await resolveTarget(target, slot);
     } catch (error) {
       return { refuse: true, decision, reason: errorCode(error, "dns-failed") };
     }
@@ -802,28 +897,32 @@ export function createEgressProxy(options) {
     return { refuse: false, decision, reason: listed ? "listed" : "not-listed", addresses };
   }
 
-  /** Connects to the checked addresses in order, by address, so no second lookup can change the target. */
-  function connectUpstream(addresses, port) {
+  /**
+   * Connects to the checked addresses in order, by address, so no second lookup can change the target. `signal`
+   * aborts when the client goes away; the attempt in progress is then destroyed at once.
+   */
+  function connectUpstream(addresses, port, signal) {
     return new Promise((resolvePromise, reject) => {
       let index = 0;
       let settled = false;
       let current;
-      const overall = setTimeout(() => {
+      const stop = code => {
         if (settled) return;
         settled = true;
+        clearTimeout(overall);
+        signal.removeEventListener("abort", abandoned);
         current?.destroy();
-        reject(new EgressError("connect-timeout"));
-      }, limits.connectTimeoutMs);
+        reject(new EgressError(code));
+      };
+      const abandoned = () => stop("client-closed");
+      const overall = setTimeout(() => stop("connect-timeout"), limits.connectTimeoutMs);
+      if (signal.aborted) { stop("client-closed"); return; }
+      signal.addEventListener("abort", abandoned, { once: true });
       const attempt = () => {
         if (settled) return;
-        if (index >= addresses.length) {
-          settled = true;
-          clearTimeout(overall);
-          reject(new EgressError("connect-failed"));
-          return;
-        }
+        if (index >= addresses.length) { stop("connect-failed"); return; }
         const { address, family } = addresses[index++];
-        const socket = netConnect({ host: address, port, family, noDelay: true });
+        const socket = openSocket({ host: address, port, family, noDelay: true });
         current = socket;
         socket.once("error", () => {
           socket.destroy();
@@ -833,6 +932,7 @@ export function createEgressProxy(options) {
           if (settled) { socket.destroy(); return; }
           settled = true;
           clearTimeout(overall);
+          signal.removeEventListener("abort", abandoned);
           socket.removeAllListeners("error");
           socket.on("error", () => {});
           if (!sameAddress(socket.remoteAddress, address)) {
@@ -851,7 +951,7 @@ export function createEgressProxy(options) {
     entry.decision = decision;
     entry.reason = reason;
     record(entry);
-    if (socket.destroyed) return;
+    if (socket.destroyed || reason === "client-closed") { socket.destroy(); return; }
     const status = statusFor(reason, decision);
     const extra = status === 407 ? 'Proxy-Authenticate: Basic realm="infinite-egress"\r\n' : "";
     // Bytes the client already sent are read and dropped, never forwarded, so the close is not a reset.
@@ -912,7 +1012,7 @@ export function createEgressProxy(options) {
     // The client already carries the idle timeout set when its CONNECT arrived.
     upstream.setTimeout(limits.idleTimeoutMs, () => upstream.destroy());
     client.write("HTTP/1.1 200 Connection established\r\n\r\n");
-    // Bytes the client sent after the CONNECT head, in the same packet, belong to the tunnel.
+    // Bytes the client sent after the CONNECT head, before the tunnel opened, belong to the tunnel.
     if (head && head.length) upstream.write(head);
     client.pipe(upstream);
     upstream.pipe(client);
@@ -930,27 +1030,50 @@ export function createEgressProxy(options) {
     entry.project = auth.project;
     entry.session = auth.session;
     if (!target) return refuseSocket(client, entry, "refused", "bad-target");
-    const release = acquire(auth);
-    if (!release) return refuseSocket(client, entry, "refused", "too-many-connections");
-    client.once("close", release);
-    const verdict = await decide(auth, target);
-    if (verdict.refuse) return refuseSocket(client, entry, verdict.decision, verdict.reason);
-    entry.decision = verdict.decision;
-    entry.reason = verdict.reason;
-    if (client.destroyed) { entry.reason = "client-closed"; record(entry); return; }
-    let upstream;
+    const slot = acquire(auth);
+    if (!slot) return refuseSocket(client, entry, "refused", "too-many-connections");
+    const gone = new AbortController();
+    const clientHold = slot.hold();
+    client.once("close", () => { gone.abort(); clientHold(); });
+    // Until the tunnel opens, read what the client sends and keep it for the tunnel, so that a client leaving is seen
+    // at once, even as a half-close. Leaving before the tunnel opens ends the request and any pending connection.
+    const early = [];
+    let earlyBytes = 0;
+    let tunnelled = false;
+    const keep = chunk => {
+      earlyBytes += chunk.length;
+      if (earlyBytes > MAX_EARLY_BYTES) client.destroy();
+      else early.push(chunk);
+    };
+    client.on("data", keep);
+    client.once("end", () => { if (!tunnelled) client.destroy(); });
+    client.resume();
+    const working = slot.hold();
     try {
-      ({ socket: upstream, address: entry.address } = await connectUpstream(verdict.addresses, target.port));
-    } catch (error) {
-      return refuseSocket(client, entry, verdict.decision, errorCode(error, "connect-failed"));
+      const verdict = await decide(auth, target, slot);
+      if (verdict.refuse) return refuseSocket(client, entry, verdict.decision, verdict.reason);
+      entry.decision = verdict.decision;
+      entry.reason = verdict.reason;
+      if (client.destroyed) { entry.reason = "client-closed"; record(entry); return; }
+      let upstream;
+      try {
+        ({ socket: upstream, address: entry.address } = await connectUpstream(verdict.addresses, target.port, gone.signal));
+      } catch (error) {
+        return refuseSocket(client, entry, verdict.decision, errorCode(error, "connect-failed"));
+      }
+      if (client.destroyed || closing) {
+        upstream.destroy();
+        client.destroy();
+        entry.reason = "client-closed";
+        record(entry);
+        return;
+      }
+      client.off("data", keep);
+      tunnelled = true;
+      tunnel(client, upstream, Buffer.concat([head ?? Buffer.alloc(0), ...early]), entry);
+    } finally {
+      working();
     }
-    if (client.destroyed || closing) {
-      upstream.destroy();
-      entry.reason = "client-closed";
-      record(entry);
-      return;
-    }
-    tunnel(client, upstream, head, entry);
   }
 
   /** Absolute-form `http://` requests. Each response closes its connection, so one connection carries one decision. */
@@ -972,16 +1095,29 @@ export function createEgressProxy(options) {
       const named = parseAuthority(req.headers.host, 80);
       if (!named || hostKey(named) !== hostKey(target) || named.port !== target.port) return refuseResponse(res, entry, "refused", "host-mismatch");
     }
-    const release = acquire(auth);
-    if (!release) return refuseResponse(res, entry, "refused", "too-many-connections");
-    res.once("close", release);
-    const verdict = await decide(auth, target);
+    const framing = requestFraming(req.rawHeaders);
+    if (framing.error) return refuseResponse(res, entry, "refused", framing.error);
+    const slot = acquire(auth);
+    if (!slot) return refuseResponse(res, entry, "refused", "too-many-connections");
+    const gone = new AbortController();
+    const clientHold = slot.hold();
+    res.once("close", () => { gone.abort(); clientHold(); });
+    const working = slot.hold();
+    try {
+      await forward(req, res, entry, auth, target, rest, framing, slot, gone.signal);
+    } finally {
+      working();
+    }
+  }
+
+  async function forward(req, res, entry, auth, target, rest, framing, slot, signal) {
+    const verdict = await decide(auth, target, slot);
     if (verdict.refuse) return refuseResponse(res, entry, verdict.decision, verdict.reason);
     entry.decision = verdict.decision;
     entry.reason = verdict.reason;
     let upstream;
     try {
-      ({ socket: upstream, address: entry.address } = await connectUpstream(verdict.addresses, target.port));
+      ({ socket: upstream, address: entry.address } = await connectUpstream(verdict.addresses, target.port, signal));
     } catch (error) {
       return refuseResponse(res, entry, verdict.decision, errorCode(error, "connect-failed"));
     }
@@ -995,7 +1131,8 @@ export function createEgressProxy(options) {
     upstream.setTimeout(limits.idleTimeoutMs, () => upstream.destroy());
     const path = rest === "" ? "/" : rest.startsWith("?") ? `/${rest}` : rest;
     const hostHeader = target.port === 80 ? hostKey(target) : `${hostKey(target)}:${target.port}`;
-    const headers = Object.assign(forwardedHeaders(req.rawHeaders, hostHeader), { connection: "close" });
+    // A fresh upstream connection per request, closed after its response: no connection is reused after a body.
+    const headers = Object.assign(frameHeaders(forwardedHeaders(req.rawHeaders, hostHeader), framing, req.method), { connection: "close" });
     let outgoing;
     try {
       // No agent: `createConnection` hands over the socket already connected to the checked address. The same
@@ -1120,7 +1257,7 @@ export function createEgressProxy(options) {
     reload,
     flush,
     loadSummary,
-    state: () => ({ mode: policy?.mode ?? null, policyError, open, sessions: perSession.size }),
+    state: () => ({ mode: policy?.mode ?? null, policyError, open, sessions: perSession.size, lookups }),
   };
 }
 

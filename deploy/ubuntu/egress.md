@@ -18,9 +18,20 @@ Policy mode and firewall variant are separate switches. Run both in observe, rea
 | `egress/infinite-egress-proxy.socket` | `/etc/systemd/system/`, optional |
 | `egress/egress-observe.nft`, `egress/egress-enforce.nft` | One of them as `/etc/infinite-egress/firewall.nft` |
 | `egress/infinite-egress-firewall.service` | `/etc/systemd/system/` |
+| `egress/infinite-requires-egress-firewall.conf` | `/etc/systemd/system/infinite.service.d/egress-firewall.conf`, in enforce mode |
 | `infinite.sudoers` | `/etc/sudoers.d/infinite`; it keeps the proxy variables through sudo |
 
 Run the commands from a checkout of the release that the host runs. Port 4785 is an example; any free loopback port works if the proxy config, the optional socket unit, and the host's `proxyUrl` agree.
+
+## Stopping agent work
+
+Any step that removes the firewall table leaves the agent account's direct connections unlogged and unrefused, cloud metadata addresses included, from that moment until a rule loads again. Those steps are: stopping or restarting `infinite-egress-firewall.service`, and restarting, reloading, or stopping `nftables.service`, which flushes every table. Before any of them, stop agent work:
+
+1. Close every session: `infinite list`, then `infinite close SESSION_ID` for each one, including team and goal members.
+2. Stop the API so it launches nothing new: `sudo systemctl stop infinite.service`.
+3. Check that the agent account runs nothing: `pgrep -u infinite-agent -a` prints nothing. Stopping the API alone is not enough, because its workers and their agents outlive it (`KillMode=process`). End anything still listed after reading what it is.
+
+Start the API again when the step is done. Changing the firewall variant needs none of this: `systemctl reload infinite-egress-firewall` replaces the table in one transaction, and a file that fails to load leaves the previous table in force.
 
 ## 1. Account, group, and key
 
@@ -67,11 +78,22 @@ Edit `/etc/infinite-egress/policy.json` before relying on it: keep `"mode": "obs
 
 `sudo systemctl reload infinite-egress-proxy` re-reads the policy. A policy that fails to load leaves the previous one in force, and `infinite egress` names the error. The proxy refuses to start when its config is missing, invalid, or names a listen address that is not loopback; the journal shows `egress-proxy: failed (CODE)`.
 
-Optional: with `infinite-egress-proxy.socket` enabled (`sudo systemctl enable --now infinite-egress-proxy.socket`), systemd holds the port, so connections wait during a proxy restart instead of failing.
+Optional socket activation: systemd then holds the port, so connections wait during a proxy restart instead of failing. The running service holds the port itself, so stop it before the socket starts:
+
+```sh
+sudo install -o root -g root -m 0644 deploy/ubuntu/egress/infinite-egress-proxy.socket /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl stop infinite-egress-proxy.service
+sudo systemctl enable --now infinite-egress-proxy.socket
+sudo systemctl start infinite-egress-proxy.service
+sudo ss -ltnp 'sport = :4785'      # lists systemd as well as node: the proxy uses the socket systemd holds
+```
+
+Sessions' requests fail between the stop and the socket start. To go back, reverse the order: `sudo systemctl stop infinite-egress-proxy.socket infinite-egress-proxy.service`, `sudo systemctl disable infinite-egress-proxy.socket`, `sudo rm /etc/systemd/system/infinite-egress-proxy.socket`, `sudo systemctl daemon-reload`, `sudo systemctl start infinite-egress-proxy.service`. The service then listens on its own port again.
 
 Each connection writes one JSON line to the journal (`journalctl -u infinite-egress-proxy -o cat`) with time, kind, project, session, host, port, checked address, decision, reason, byte counts, and duration. It never records paths, queries, headers, or credentials. The proxy also keeps a 14-day summary in `/var/lib/infinite-egress/summary.json`, mode 0640, which the host reads.
 
-Rollback: `sudo systemctl disable --now infinite-egress-proxy.service infinite-egress-proxy.socket`, then remove the unit files and `/opt/infinite-egress`. Do this only after step 3 is rolled back, or sessions that still carry proxy variables lose the network.
+Rollback: `sudo systemctl disable --now infinite-egress-proxy.socket infinite-egress-proxy.service`, then remove the unit files and `/opt/infinite-egress`. Do this only after step 3 is rolled back, or sessions that still carry proxy variables lose the network.
 
 ## 3. Point the host at the proxy
 
@@ -98,9 +120,11 @@ sudo systemctl restart infinite.service
 sudo -H -u infinite-host /usr/local/bin/infinite doctor --config /etc/infinite/config.json
 ```
 
-The doctor line reads `Egress: proxy reachable at 127.0.0.1:4785 · key readable · summary ...`. A worker reads the key when its session launches and gives the provider only the proxy URL with a session credential. A session started before this step keeps its old environment until it is recreated. If the key is unreadable, sessions start without proxy variables and the worker journals `no-credential`.
+The doctor line reads `Egress: proxy reachable at 127.0.0.1:4785 · key readable · summary ...`. A worker reads the key when its session launches and gives the provider only the proxy URL with a session credential. A session started before this step keeps its old environment until it is recreated.
 
-If `teams.commandPrefix` runs a root-owned launcher that resets the environment, make it keep `HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`, `http_proxy`, `NO_PROXY`, and `no_proxy`. Otherwise team Git fetches and pushes go direct: logged in observe, refused in enforce.
+If the key cannot be read, the host still hands out the proxy address, without a credential. Network requests from new sessions and host commands are then refused with `407` rather than sent direct, local work is unaffected, the worker journals `no-credential`, and `doctor` reports `key UNREADABLE (...)` with that consequence. Fix the key's owner, group, or mode; new sessions and the next host command pick it up.
+
+If `teams.commandPrefix` runs a root-owned launcher that resets the environment, make it keep `HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`, `http_proxy`, `NO_PROXY`, and `no_proxy`. Otherwise team Git fetches and pushes run as the agent account without the proxy: logged in observe, refused in enforce. Without `teams.commandPrefix`, those commands run as the host account, which the firewall rule does not match, so only the proxy variables route them.
 
 Rollback: remove the `egress` block, restart `infinite.service`, and recreate sessions. The sudoers line has no effect while the host sets no proxy variables.
 
@@ -117,7 +141,7 @@ sudo systemctl enable --now infinite-egress-firewall.service
 sudo nft list table inet infinite_egress
 ```
 
-The unit replaces only the `inet infinite_egress` table, so Tailscale's and the system's tables stay as they are. Do not add the rule to `/etc/nftables.conf`, whose `flush ruleset` removes other tables. Restarting `nftables.service` restarts this unit too.
+The unit replaces only the `inet infinite_egress` table, so Tailscale's and the system's tables stay as they are. Do not add the rule to `/etc/nftables.conf`, whose `flush ruleset` removes other tables. Restarting or reloading `nftables.service` flushes this table too; the unit then restarts or reloads after it, which leaves a moment without a rule (see [Stopping agent work](#stopping-agent-work)).
 
 Run real work for at least a week, then read what agents reached:
 
@@ -129,11 +153,11 @@ journalctl -k --grep 'infinite-egress'   # direct connections that skipped the p
 
 Add the hosts that agents legitimately need to `allow` or to a project's entry and reload. A `bypass` kernel line names a destination address and port, not the program; `sudo ss -tnp` while it happens shows which process holds the socket. Each tool that bypasses the proxy will fail in enforce mode.
 
-Rollback: `sudo systemctl disable --now infinite-egress-firewall.service` deletes the table.
+Rollback: [stop agent work](#stopping-agent-work), then `sudo systemctl disable --now infinite-egress-firewall.service`, which deletes the table. From then on the agent account's direct connections are neither logged nor refused, metadata addresses included.
 
 ## 5. Enforce
 
-Switch the proxy first, then the firewall:
+Switch the proxy first, then the firewall, then make the API depend on the firewall:
 
 ```sh
 sudo sed -i 's/"mode": "observe"/"mode": "enforce"/' /etc/infinite-egress/policy.json
@@ -141,17 +165,29 @@ sudo systemctl reload infinite-egress-proxy
 infinite egress | head -2          # Egress: enforce · ... and no Policy: line
 sudo install -o root -g root -m 0644 deploy/ubuntu/egress/egress-enforce.nft /etc/infinite-egress/firewall.nft
 sudo nft -c -f /etc/infinite-egress/firewall.nft
-sudo systemctl restart infinite-egress-firewall.service
+sudo systemctl reload infinite-egress-firewall.service
+sudo nft list chain inet infinite_egress agent     # shows "jump refuse" after the loopback rule
+sudo install -d -o root -g root -m 0755 /etc/systemd/system/infinite.service.d
+sudo install -o root -g root -m 0644 deploy/ubuntu/egress/infinite-requires-egress-firewall.conf \
+  /etc/systemd/system/infinite.service.d/egress-firewall.conf
+sudo systemctl daemon-reload
+systemctl show infinite.service -p Requires -p After   # both list infinite-egress-firewall.service
 sudo -u infinite-agent curl -sS --max-time 5 https://example.com   # refused: no proxy variables
 ```
 
+Reload, never restart, the firewall unit: restart stops it first, which removes the table while agents keep running. The drop-in makes the API start only after the rule has loaded, and not at all when loading fails, so a host with the boundary on never launches agents without it. It also means that stopping or restarting the firewall unit stops or restarts the API, though not the agents already running. If the API does not come up after a reboot, read `systemctl status infinite-egress-firewall`.
+
 Then start a session and confirm it reaches its model and a listed registry, and that an unlisted host fails with `403`. The enforce rule also resets direct connections that were open when it loaded.
 
-Rollback, fastest first: `sudo systemctl stop infinite-egress-firewall.service` removes the rule at once; reinstalling the observe variant and restarting the unit returns to logging; setting `"mode": "observe"` and reloading the proxy stops allow-list refusals.
+Rollback, fastest first:
+
+- Back to logging, with no gap and no agent stop: install `egress-observe.nft` as `/etc/infinite-egress/firewall.nft` and `sudo systemctl reload infinite-egress-firewall`. The drop-in can stay.
+- Stop allow-list refusals: set `"mode": "observe"` and `sudo systemctl reload infinite-egress-proxy`.
+- Remove the rule entirely: [stop agent work](#stopping-agent-work); remove the drop-in (`sudo rm /etc/systemd/system/infinite.service.d/egress-firewall.conf` and `sudo systemctl daemon-reload`) so the API no longer depends on the firewall; then `sudo systemctl disable --now infinite-egress-firewall.service` and start the API. From then on the agent account's direct connections are neither logged nor refused, metadata addresses included.
 
 ## When the proxy is down
 
-Sessions with proxy variables cannot reach the network: model calls, package installs, and Git over HTTPS fail with connection refused. The host API, web client, and phone keep working, because the host's own requests do not use the proxy and the firewall rule matches only the agent account. Systemd restarts the proxy after two seconds; with the socket unit, new connections wait instead of failing. `infinite doctor` shows `proxy UNREACHABLE`.
+Sessions with proxy variables cannot reach the network: model calls, package installs, and Git over HTTPS fail with connection refused. The firewall rule is separate and stays in force. The host API, web client, and phone keep working, because the host's own requests do not use the proxy and the firewall rule matches only the agent account. Systemd restarts the proxy after two seconds; with the socket unit, new connections wait instead of failing. `infinite doctor` shows `proxy UNREACHABLE`.
 
 ## Rotating the key
 
@@ -176,5 +212,6 @@ The proxy reads the key at start, and the API caches it for host commands, so bo
 - **Credential lifetime.** Session credentials last 30 days and host-command credentials one day. The proxy refuses credentials that claim more than 31 days. Rotating the key is the only revocation.
 - **Observe resolves everything.** In observe mode the proxy resolves every name it is asked for; in enforce mode it resolves only listed names.
 - **Launches without proxy variables.** Repository briefings and code graph extraction run through their own sudo wrappers, and the host does not give them proxy variables. In enforce mode their network calls fail. Check that these features can do without the network, or keep the firewall in observe, before enforcing.
+- **Host-account commands.** Without `teams.commandPrefix`, team Git commands run as the host account. The firewall rule matches only the agent account, so the proxy variables are their only route; a tool that ignores them goes direct in every mode.
 - **One instance.** The rule matches `infinite-agent` only. A second instance's agent account is not covered, and its host account is not in the `infinite-egress` group. Cover it by adding its account to the rule and the group, or with a second proxy, key, and port.
 - **Records hold destinations.** The journal and summary list every host each project reached. Members of `adm` and `systemd-journal` can read the journal; the agent account must not be one of them.

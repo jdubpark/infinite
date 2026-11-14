@@ -89,6 +89,15 @@ export function egressProxyEnvironment(proxyUrl: string, key: Buffer, identity: 
   return { HTTPS_PROXY: value, HTTP_PROXY: value, https_proxy: value, http_proxy: value, NO_PROXY: EGRESS_NO_PROXY, no_proxy: EGRESS_NO_PROXY };
 }
 
+/**
+ * The six proxy variables with no credential, for a configured host that cannot mint one: every request through the
+ * proxy is answered 407, so nothing reaches the network by accident and local work is unaffected.
+ */
+export function egressUncredentialedEnvironment(proxyUrl: string): Record<string, string> {
+  const value = `http://${new URL(proxyUrl).host}`;
+  return { HTTPS_PROXY: value, HTTP_PROXY: value, https_proxy: value, http_proxy: value, NO_PROXY: EGRESS_NO_PROXY, no_proxy: EGRESS_NO_PROXY };
+}
+
 /** A session's identity: its project, or `_none` when it has no valid one. */
 export function sessionEgressIdentity(projectId: string | undefined, sessionId: string): EgressIdentity {
   return { project: projectId && PROJECT_ID.test(projectId) ? projectId : "_none", session: sessionId };
@@ -116,35 +125,42 @@ export function installHostEgress(config: Pick<Config, "autonomy">, env: NodeJS.
 }
 
 /**
- * Proxy variables for a host-run command, with a fresh host credential. Empty when egress is not configured, or
- * when the key cannot be read: the command then goes direct, which the firewall logs in observe mode and refuses
- * in enforce mode. Local Git operations never depend on the key.
+ * Proxy variables for a host-run command, with a fresh host credential. Empty only when egress is not configured.
+ * When the key cannot be read, the command still gets the proxy address, without a credential: its network requests
+ * are refused with 407 rather than sent direct. That matters because a command run as the host account, which
+ * happens without `teams.commandPrefix`, is outside the firewall rule, which matches only the agent account.
+ * Local Git operations never use the proxy.
  */
 export function hostEgressEnvironment(nowMs = Date.now()): Record<string, string> {
   if (!hostEgress) return {};
   if (!hostEgress.key) {
     try { hostEgress.key = readEgressKey(hostEgress.keyPath); }
     catch (error) {
-      if (!hostEgress.warned) console.warn(`Egress: the host cannot read the egress key (${error instanceof EgressKeyError ? error.reason : "unavailable"}); host commands run without proxy variables until it can.`);
+      if (!hostEgress.warned) console.warn(`Egress: the host cannot read the egress key (${error instanceof EgressKeyError ? error.reason : "unavailable"}); the proxy refuses host commands' network requests until it can.`);
       hostEgress.warned = true;
-      return {};
+      return egressUncredentialedEnvironment(hostEgress.proxyUrl);
     }
   }
   return egressProxyEnvironment(hostEgress.proxyUrl, hostEgress.key, HOST_IDENTITY, HOST_CREDENTIAL_SECONDS, nowMs);
 }
 
 /**
- * In a worker: the proxy variables for its session, from what the host process exported. `off` when egress is not
- * configured (no variables, the environment is unchanged); `no-key` when the key cannot be read (no variables; the
- * worker records the gap and the firewall decides).
+ * In a worker: the proxy variables for its session, from what the host process exported.
+ * - `off`: egress is not configured. No variables; the environment is unchanged.
+ * - `on`: the proxy address with the session's credential.
+ * - `no-key`: the key cannot be read. The proxy address without a credential, so requests get 407 instead of going
+ *   direct; the worker records the gap.
+ * - `invalid`: the inherited proxy address is unusable. No session may start, since none could be routed.
  */
 export function workerEgressEnvironment(projectId: string | undefined, sessionId: string, env: NodeJS.ProcessEnv = process.env, nowMs = Date.now()):
-  { status: "off" | "on" | "no-key"; env: Record<string, string> } {
+  { status: "off" | "on" | "no-key" | "invalid"; env: Record<string, string> } {
   const proxyUrl = env[WORKER_PROXY_URL], keyPath = env[WORKER_KEY_FILE];
   if (proxyUrl === undefined && keyPath === undefined) return { status: "off", env: {} };
-  if (!proxyUrl || !keyPath || !loopbackProxyUrl(proxyUrl) || !isAbsolute(keyPath)) return { status: "no-key", env: {} };
+  if (!proxyUrl || !loopbackProxyUrl(proxyUrl)) return { status: "invalid", env: {} };
+  const refused = { status: "no-key" as const, env: egressUncredentialedEnvironment(proxyUrl) };
+  if (!keyPath || !isAbsolute(keyPath)) return refused;
   let key: Buffer;
-  try { key = readEgressKey(keyPath); } catch { return { status: "no-key", env: {} }; }
+  try { key = readEgressKey(keyPath); } catch { return refused; }
   return { status: "on", env: egressProxyEnvironment(proxyUrl, key, sessionEgressIdentity(projectId, sessionId), SESSION_CREDENTIAL_SECONDS, nowMs) };
 }
 
@@ -291,7 +307,8 @@ export async function egressDoctorLine(egress: EgressConfig, nowMs = Date.now())
   const url = new URL(egress.proxyUrl);
   const reachable = await probe(url.hostname.replace(/^\[|\]$/g, ""), Number(url.port), 2000);
   let key = "key readable";
-  try { readEgressKey(egress.keyPath); } catch (error) { key = `key UNREADABLE (${error instanceof EgressKeyError ? error.reason : "unavailable"})`; }
+  try { readEgressKey(egress.keyPath); }
+  catch (error) { key = `key UNREADABLE (${error instanceof EgressKeyError ? error.reason : "unavailable"}): new sessions and host commands get the proxy without a credential, so their network requests are refused with 407`; }
   let summary = "summary not configured";
   if (egress.summaryPath) {
     const view = egressView({ autonomy: { boundary: { egress } } }, undefined, nowMs);

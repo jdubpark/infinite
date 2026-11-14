@@ -20,7 +20,8 @@ export function teamCommandEnvironment(): NodeJS.ProcessEnv {
   env.GIT_OPTIONAL_LOCKS = "0";
   env.GIT_CONFIG_NOSYSTEM = "1";
   env.GIT_CONFIG_GLOBAL = "/dev/null";
-  // Empty unless autonomy.boundary.egress is configured: then the egress proxy, under the host identity.
+  // Empty unless autonomy.boundary.egress is configured: then the egress proxy, under the host identity when the key
+  // is readable and with no credential (every request refused) when it is not.
   Object.assign(env, hostEgressEnvironment());
   return env;
 }

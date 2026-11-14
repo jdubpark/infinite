@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createServer as createNetServer, connect, type Server, type Socket } from "node:net";
+import { createServer as createNetServer, connect, Socket, type Server } from "node:net";
 import { createServer as createHttpServer } from "node:http";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -34,7 +34,7 @@ async function echoServer() {
 }
 
 let fixtureCount = 0;
-async function startProxy(policy: unknown, names: Record<string, string[]> = {}, limits: Record<string, number> = {}) {
+async function startProxy(policy: unknown, names: Record<string, string[]> = {}, limits: Record<string, number> = {}, overrides: Record<string, unknown> = {}) {
   const directory = join(root, `proxy-${++fixtureCount}`);
   const { mkdirSync } = await import("node:fs");
   mkdirSync(directory, { mode: 0o700 });
@@ -52,6 +52,7 @@ async function startProxy(policy: unknown, names: Record<string, string[]> = {},
       if (!addresses) throw Object.assign(new Error("not found"), { code: "ENOTFOUND" });
       return addresses.map(address => ({ address, family: address.includes(":") ? 6 : 4 }));
     },
+    ...overrides,
   });
   await proxy.reload();
   const address = await proxy.listen({ host: "127.0.0.1", port: 0 });
@@ -356,4 +357,136 @@ test("oversized headers are refused and per-session tunnel limits hold", async t
   const again = await send(fixture.port, connectRequest(`echo.test:${echo.port}`, basic("project-a", SESSION)));
   assert.equal(again.status, 200);
   again.socket.destroy();
+});
+
+test("clients that disconnect at once cannot pile up name lookups outside the session and global limits", async t => {
+  const echo = await echoServer();
+  t.after(() => echo.server.close());
+  // The reviewer's case: lookups that do not settle on their own, and clients that leave as soon as they have asked.
+  const waiting: (() => void)[] = [];
+  const calls: string[] = [];
+  const resolve = (host: string) => {
+    calls.push(host);
+    const answer = [{ address: "127.0.0.1", family: 4 }];
+    if (host === "fast.test") return Promise.resolve(answer);
+    return new Promise(done => waiting.push(() => done(answer)));
+  };
+  const fixture = await startProxy({ mode: "observe", ports: [echo.port], allow: [], allowPrivate: [`fast.test:${echo.port}`] }, {},
+    { maxLookups: 6, maxLookupsPerSession: 3, maxTunnelsPerSession: 8, dnsTimeoutMs: 50 }, { resolve });
+  t.after(() => fixture.proxy.close());
+  const records = (session: string) => fixture.records.filter(record => record.session === session);
+  const askAndLeave = (session: string, count: number, prefix: string) => {
+    for (let index = 0; index < count; index++) {
+      const socket = connect(fixture.port, "127.0.0.1");
+      socket.on("error", () => {});
+      socket.write(connectRequest(`${prefix}-${index}.test:${echo.port}`, basic("project-a", session)), () => socket.destroy());
+    }
+  };
+
+  askAndLeave(SESSION, 40, "slow");
+  await until(() => records(SESSION).length === 40, "every request from the first session to be decided");
+  assert.equal(calls.length, 3, "one session starts at most its own lookup limit");
+  assert.deepEqual(fixture.proxy.state(), { mode: "observe", policyError: null, open: 3, sessions: 1, lookups: 3 }, "timed-out lookups still hold their slots");
+  assert.equal(records(SESSION).filter(record => record.reason === "dns-timeout").length, 3);
+  assert.ok(records(SESSION).every(record => ["dns-timeout", "dns-busy", "too-many-connections"].includes(record.reason as string)));
+
+  // Another session is not starved: its lookups have their own allowance.
+  const other = await send(fixture.port, connectRequest(`fast.test:${echo.port}`, basic("project-a", OTHER)));
+  assert.equal(other.status, 200);
+  other.socket.destroy();
+  askAndLeave(OTHER, 10, "other");
+  await until(() => records(OTHER).length === 11, "every request from the second session to be decided");
+  assert.equal(fixture.proxy.state().lookups, 6);
+  // The global limit holds for a third session, but a name already being looked up is shared, not looked up again.
+  const third = "7a2b3c4d-2222-4333-8444-955566677788";
+  const busy = await send(fixture.port, connectRequest(`new.test:${echo.port}`, basic("project-a", third)));
+  assert.equal(busy.status, 503);
+  assert.equal(fixture.records.at(-1)?.reason, "dns-busy");
+  const joined = await send(fixture.port, connectRequest(`slow-0.test:${echo.port}`, basic("project-a", third)));
+  assert.equal(joined.status, 504);
+  assert.equal(calls.length, 7, "the shared name was not looked up again");
+
+  for (const settle of waiting.splice(0)) settle();
+  await until(() => { const state = fixture.proxy.state(); return state.open === 0 && state.sessions === 0 && state.lookups === 0; }, "all slots and lookups to be released");
+});
+
+test("a pending upstream connection is cancelled when its client goes away", async t => {
+  const attempts: Socket[] = [];
+  const fixture = await startProxy({ mode: "observe", ports: [443], allow: [], allowPrivate: ["hang.test:443"] }, { "hang.test": ["192.0.2.10"] },
+    { connectTimeoutMs: 60_000 }, { connect: () => { const socket = new Socket(); attempts.push(socket); return socket; } });
+  t.after(() => fixture.proxy.close());
+  const client = connect(fixture.port, "127.0.0.1");
+  client.on("error", () => {});
+  client.write(connectRequest("hang.test:443", basic("project-a", SESSION)));
+  await until(() => attempts.length === 1, "the upstream attempt");
+  assert.equal(fixture.proxy.state().open, 1);
+  client.destroy();
+  await until(() => attempts[0].destroyed, "the attempt to be cancelled, long before its timeout");
+  await until(() => fixture.proxy.state().open === 0, "the slot to be released");
+  await until(() => fixture.records.some(record => record.reason === "client-closed"), "the record");
+
+  // The same for plain HTTP, and for a CONNECT client that only half-closes.
+  for (const [index, raw] of [
+    `GET http://hang.test:443/ HTTP/1.1\r\nHost: hang.test:443\r\nProxy-Authorization: ${basic("project-a", SESSION)}\r\n\r\n`,
+    connectRequest("hang.test:443", basic("project-a", SESSION)),
+  ].entries()) {
+    const next = connect(fixture.port, "127.0.0.1");
+    next.on("error", () => {});
+    next.write(raw);
+    await until(() => attempts.length === index + 2, "the next upstream attempt");
+    if (index === 0) next.destroy();
+    else next.end();
+    await until(() => attempts[index + 1].destroyed, "the next attempt to be cancelled");
+    await until(() => fixture.proxy.state().open === 0, "the slot to be released again");
+    next.destroy();
+  }
+});
+
+test("plain HTTP sets the forwarded body's framing for every method and refuses ambiguous framing", async t => {
+  const seen: { method?: string; te?: string; cl?: string; body: string }[] = [];
+  let upstreamErrors = 0;
+  const web = createHttpServer((req, res) => {
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", chunk => { body += chunk; });
+    req.on("end", () => {
+      seen.push({ method: req.method, te: req.headers["transfer-encoding"], cl: req.headers["content-length"], body });
+      res.end("ok");
+    });
+  });
+  web.on("clientError", (_error, socket) => { upstreamErrors += 1; socket.destroy(); });
+  const webPort = await listening(web);
+  t.after(() => web.close());
+  const fixture = await startProxy({ mode: "observe", ports: [webPort], allow: ["web.test"], allowPrivate: [`web.test:${webPort}`] }, { "web.test": ["127.0.0.1"] });
+  t.after(() => fixture.proxy.close());
+  const authorization = basic("project-a", SESSION);
+  const request = (method: string, framing: string, body: string) =>
+    send(fixture.port, `${method} http://web.test:${webPort}/items HTTP/1.1\r\nHost: web.test:${webPort}\r\nProxy-Authorization: ${authorization}\r\n${framing}\r\n${body}`);
+  const json = JSON.stringify({ ids: [1, 2, 3] });
+  const chunked = `${json.length.toString(16)}\r\n${json}\r\n0\r\n\r\n`;
+
+  // The reviewer's case: Node does not chunk a DELETE body by itself, so the proxy must say how it is framed.
+  assert.equal((await request("DELETE", "Transfer-Encoding: chunked\r\nContent-Type: application/json\r\n", chunked)).status, 200);
+  assert.equal((await request("POST", `Content-Length: ${json.length}\r\n`, json)).status, 200);
+  assert.equal((await request("POST", "", "")).status, 200);
+  assert.equal((await request("GET", "", "")).status, 200);
+  assert.deepEqual(seen, [
+    { method: "DELETE", te: "chunked", cl: undefined, body: json },
+    { method: "POST", te: undefined, cl: String(json.length), body: json },
+    { method: "POST", te: undefined, cl: "0", body: "" },
+    { method: "GET", te: undefined, cl: undefined, body: "" },
+  ]);
+
+  const refusals: [string, string, string, number][] = [
+    ["a length and a coding", "Content-Length: 5\r\nTransfer-Encoding: chunked\r\n", "0\r\n\r\n", 400],
+    ["two equal lengths", "Content-Length: 5\r\nContent-Length: 5\r\n", "hello", 400],
+    ["two different lengths", "Content-Length: 5\r\nContent-Length: 6\r\n", "hello!", 400],
+    ["a list of lengths", "Content-Length: 5, 5\r\n", "hello", 400],
+    ["a coding the proxy cannot reproduce", "Transfer-Encoding: gzip, chunked\r\n", "0\r\n\r\n", 501],
+    // Node's own parser refuses this one before the proxy sees it.
+    ["two coding headers", "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n", "0\r\n\r\n", 400],
+  ];
+  for (const [label, framing, body, status] of refusals) assert.equal((await request("DELETE", framing, body)).status, status, label);
+  assert.equal(seen.length, 4, "no refused request reached the upstream");
+  assert.equal(upstreamErrors, 0, "the upstream never saw stray body bytes");
 });

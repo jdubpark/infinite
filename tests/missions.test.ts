@@ -19,7 +19,7 @@ import { createInterface } from "node:readline";
 import { git, lineup, missionHarness as harness, scriptedMissionHarness as scripted } from "./mission-harness.js";
 import type { Config, Session } from "../packages/host/src/types.js";
 import type { CreateTeam, TeamAssignment, TeamView } from "../packages/host/src/team-types.js";
-import type { CreateMission, Mission, MissionOrigin } from "../packages/host/src/mission-types.js";
+import type { CreateMission, Mission, MissionOrigin, MissionReport } from "../packages/host/src/mission-types.js";
 import { initialAttention } from "@infinite/attention";
 import { emptyUsage, type UsageRollup } from "../packages/host/src/team-usage.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
@@ -1737,17 +1737,36 @@ test("an answer mission accepts a result with no subtask", { timeout: 60000 }, a
   } finally { h.close(); }
 });
 
-test("an answer mission refuses a dispatch", { timeout: 60000 }, async () => {
+const answerForbiddenReports: MissionReport[] = [
+  { kind: "dispatch", summary: "Fix it", subtasks: [plan("a", "api")] },
+  { kind: "resize-subtask", subtaskId: "a", parallelism: 2, summary: "More workers" },
+  { kind: "cancel-subtask", subtaskId: "a", reason: "Not needed" },
+  { kind: "steer-subtask", subtaskId: "a", text: "Change it" },
+  { kind: "answer-child", subtaskId: "a", decisionId: randomUUID(), text: "Yes" },
+];
+for (const forbidden of answerForbiddenReports) {
+  test(`an answer mission refuses a ${forbidden.kind} report with the answer-mode reason`, { timeout: 60000 }, async () => {
+    const h = scripted();
+    try {
+      const { id } = await h.missions.create(answerRequest());
+      await h.report(1, forbidden);
+      const refusal = (await h.messages(2)).find((message: { type: string }) => message.type === "refused");
+      assert.equal(refusal.kind, forbidden.kind);
+      assert.equal(refusal.reason, answerDispatchRefusal);
+      assert.equal(h.get(id).subtasks.length, 0);
+      assert.equal(h.created.length, 0, "No team run was created");
+    } finally { h.close(); }
+  });
+}
+
+test("three refused reports in a row block an answer mission", { timeout: 60000 }, async () => {
   const h = scripted();
   try {
     const { id } = await h.missions.create(answerRequest());
-    await h.report(1, { kind: "dispatch", summary: "Fix it", subtasks: [plan("a", "api")] });
-    const refusal = (await h.messages(2)).find((message: { type: string }) => message.type === "refused");
-    assert.equal(refusal.kind, "dispatch");
-    assert.equal(refusal.reason, answerDispatchRefusal);
-    const mission = h.get(id);
-    assert.equal(mission.subtasks.length, 0);
-    assert.equal(h.created.length, 0, "No team run was created");
+    for (const [index, report] of answerForbiddenReports.slice(0, 3).entries()) await h.report(index + 1, report);
+    const blocked = await until(() => h.get(id), mission => mission.status === "blocked", 20000);
+    assert.match(blocked.reason ?? "", /refused three times in a row/);
+    assert.ok(blocked.reason?.endsWith(answerDispatchRefusal));
   } finally { h.close(); }
 });
 

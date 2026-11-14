@@ -29,6 +29,7 @@ import type { Config, Provider, Role } from "./types.js";
 import { handleClientCommand } from "./client.js";
 import { handleMachineCommand } from "./machine-cli.js";
 import { handleLocalBehaviorCheckCommand } from "./understanding-cli.js";
+import { githubProxyDoctorLine } from "./github-grants.js";
 
 const argv = process.argv.slice(2);
 if (!await handleLocalBehaviorCheckCommand(argv) && !await handleMachineCommand(argv) && !await handleClientCommand(argv)) {
@@ -442,6 +443,8 @@ else if (command === "plan-fleet") {
           `Push: enabled · ${config.push.detail} bodies · token file ${config.push.accessTokenFile ?? "none"} (mode ${mode})`,
         );
       } else console.log("Push: disabled");
+      const githubProxy = await githubProxyDoctorLine(config);
+      if (githubProxy) console.log(githubProxy);
       if ((config.attention?.hooks ?? DEFAULT_HOOKS).codex)
         console.log(
           "Warning: Codex hooks are on. They run with --dangerously-bypass-hook-trust, which also lets hooks defined in a session's working directory run without review. Use them only with repositories you trust.",

@@ -35,6 +35,7 @@ import { missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch 
 import { withNativeContinuation } from "./native-continuation.js";
 import { agentBoundary, inventoryRuntimeProcesses, runtimeIdentity, stopRuntimeTree, type RuntimeProcess, type TeamRuntimeInspection, type TeamRuntimeRetirement } from "./team-retirement.js";
 import { TeamError } from "./team-workspace.js";
+import { projectGithubRepository, sessionGithubGrant, sessionGithubScope, type GithubGrantScope } from "./github-grants.js";
 import {
   SESSION_PURPOSES,
   type SessionPurpose,
@@ -402,7 +403,7 @@ export class Manager {
   }
   /** The team scheduler owns cwd selection, below the root its run was created under. Public create requests never accept this override. */
   createTeamSession(request: CreateSession, team: TeamAssignment, cwd: string, modelProfile?: TeamModelProfile, workspaceRoot?: string, workspaceTrusted = false,
-    header: { purpose?: SessionPurpose; configId?: string } = {}): Promise<Session & WorkerState> {
+    header: { purpose?: SessionPurpose; configId?: string } = {}, github?: GithubGrantScope): Promise<Session & WorkerState> {
     if (!this.config.teams || request.nativeArgs !== undefined || request.localUi || request.workspace || request.resumedFrom)
       throw new ContentError("Team sessions require a configured team workspace and managed launch", 400);
     if (header.purpose !== undefined && !SESSION_PURPOSES.includes(header.purpose)) throw new ContentError("The session purpose is not recognized", 400);
@@ -426,7 +427,7 @@ export class Manager {
     const operation = this.serial.then(() => this.createOnce({
       ...request, ...(continuation ? { continuation } : {}), team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}),
       ...(header.purpose !== undefined ? { purpose: header.purpose } : {}), ...(header.configId !== undefined ? { configId: header.configId } : {}),
-    }, workspaceTrusted));
+    }, workspaceTrusted, github));
     this.serial = operation.catch(() => {});
     return operation;
   }
@@ -848,15 +849,16 @@ export class Manager {
    * Creates the session, or returns the one its request already made. A team launch that fails before its session
    * record exists gives its fuse launch back: the count stays, and a retry with the same id is not counted twice.
    */
-  private async createOnce(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false) {
-    try { return await this.createRecorded(request, workspaceTrusted); }
+  private async createOnce(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false, github?: GithubGrantScope) {
+    try { return await this.createRecorded(request, workspaceTrusted, github); }
     catch (error) {
       // A started launch stays started, and a failing fuse never hides the launch error.
       if (request.team) try { this.fuse?.release(request.requestId); } catch { /* the launch error is the one to report */ }
       throw error;
     }
   }
-  private async createRecorded(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false) {
+  /** `github` is a team session's grant scope, decided by its caller; a session without a team gets the owner's scope. */
+  private async createRecorded(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false, github?: GithubGrantScope) {
     if (!request.resumedFrom && request.nativeArgs) assertFreshNativeContext(request.provider, request.nativeArgs);
     if (request.workspace && (request.provider !== "codex" || !request.localUi))
       throw new Error("Laptop execution requires the Codex native interface");
@@ -994,6 +996,8 @@ export class Manager {
     });
     child.on("error", () => {});
     child.stdin.on("error", () => {});
+    // Inert unless autonomy.boundary.github is configured; the grant travels only in the private bootstrap pipe.
+    const githubGrant = sessionGithubGrant(this.config, request.team ? github : sessionGithubScope({ kind: "owner", repository: projectGithubRepository(project) }), id);
     child.stdin.end(
       JSON.stringify({
         session,
@@ -1005,6 +1009,7 @@ export class Manager {
         key: this.key.toString("base64"),
         prompt,
         ...(request.workspace ? { executorTokenHash: createHash("sha256").update(request.workspace.token).digest("hex") } : {}),
+        ...(githubGrant ? { github: githubGrant } : {}),
         attention: {
           // Native CLI launches keep their exact argv: no hook settings are injected.
           hooks: request.nativeArgs !== undefined

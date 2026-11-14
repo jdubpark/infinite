@@ -11,7 +11,8 @@ export class TeamError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) { super(message); }
 }
 export interface CommandResult { exitCode: number | null; output: string; stdout: string; interrupted: boolean; truncated: boolean }
-export function teamCommandEnvironment(): NodeJS.ProcessEnv {
+/** `extra` carries a host GitHub grant for one operation; without it the environment is exactly the fixed allowlist below. */
+export function teamCommandEnvironment(extra?: Record<string, string>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const name of ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"])
     if (process.env[name]) env[name] = process.env[name];
@@ -19,15 +20,15 @@ export function teamCommandEnvironment(): NodeJS.ProcessEnv {
   env.GIT_OPTIONAL_LOCKS = "0";
   env.GIT_CONFIG_NOSYSTEM = "1";
   env.GIT_CONFIG_GLOBAL = "/dev/null";
-  return env;
+  return extra ? { ...env, ...extra } : env;
 }
 export function teamGitArgs(cwd: string, args: string[]) {
   return ["-c", `safe.directory=${cwd}`, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", "-c", "user.name=Infinite", "-c", "user.email=agent@example.invalid", ...args];
 }
 /** Commands are argv arrays, from owner configuration or an explicitly authorized plan. */
-export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand, input?: string): Promise<CommandResult> {
+export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand, input?: string, extraEnv?: Record<string, string>): Promise<CommandResult> {
   return new Promise((resolveResult, reject) => {
-    const env = teamCommandEnvironment();
+    const env = teamCommandEnvironment(extraEnv);
     const child = spawn(prefix?.command ?? command.command, prefix ? [...prefix.args, command.command, ...command.args] : command.args, { cwd, env, stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
     let output = "", stdout = "", interrupted = false, settled = false, truncated = false;
     const stop = () => {
@@ -59,9 +60,11 @@ export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSig
     child.once("close", exitCode => { if (settled) return; settled = true; finish(); resolveResult({ exitCode, output, stdout, interrupted, truncated }); });
   });
 }
-export async function publishTeamHead(workspace: string, remoteUrl: string, commit: string, branch: string, prefix?: TeamCommand, signal?: AbortSignal): Promise<{ published: true } | { published: false; category: TeamPublicationCategory }> {
+/** `grantEnv` maps the pushed ref to a host GitHub grant (`push` on exactly that ref) when the GitHub proxy is configured. */
+export async function publishTeamHead(workspace: string, remoteUrl: string, commit: string, branch: string, prefix?: TeamCommand, signal?: AbortSignal, grantEnv?: (ref: string) => Record<string, string>): Promise<{ published: true } | { published: false; category: TeamPublicationCategory }> {
   try {
-    const result = await teamCommand({ command: "git", args: teamGitArgs(workspace, ["push", remoteUrl, `${commit}:refs/heads/${branch}`]) }, workspace, signal, 120000, prefix);
+    const ref = `refs/heads/${branch}`;
+    const result = await teamCommand({ command: "git", args: teamGitArgs(workspace, ["push", remoteUrl, `${commit}:${ref}`]) }, workspace, signal, 120000, prefix, undefined, grantEnv?.(ref));
     if (result.exitCode === 0 && !result.interrupted && !result.truncated) return { published: true };
     // Only Git's own ref status line marks divergence; a branch name or remote hook text must not route the head to a sibling.
     return { published: false, category: /^\s*!\s+\[rejected\]\s.*\((?:non-fast-forward|fetch first)\)\s*$/m.test(result.output) ? "rejected" : fetchCategory(result.output) };

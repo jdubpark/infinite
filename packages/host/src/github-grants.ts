@@ -1,5 +1,7 @@
 import { createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
+import type { Config, Project } from "./types.js";
+import type { TeamAssignment, TeamDelivery } from "./team-types.js";
 
 /**
  * GitHub grants: host-signed capabilities that the GitHub credential proxy checks on every request.
@@ -78,4 +80,103 @@ export function readGithubGrantKey(path: string): Buffer {
   try { text = readFileSync(path, "utf8"); }
   catch { throw new GithubGrantError("The grant key file is unreadable."); }
   return parseGithubGrantKey(text);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Which grant a session or a host Git operation receives. All of this is inert unless `autonomy.boundary.github` is set.
+
+export type GithubBoundary = { proxyUrl: string; keyPath: string };
+export type GithubGrantScope = { sub: string; repo: string; ops: GithubGrantOp[]; refs?: string[] };
+/** What the host knows about a session when it decides its grant. */
+export type GithubSessionContext =
+  | { kind: "owner"; repository?: string }
+  | { kind: "team"; role: TeamAssignment["role"]; repository?: string; delivery?: { mode: TeamDelivery["mode"]; repository: string; headBranch: string } };
+
+export function githubBoundary(config: Pick<Config, "autonomy">): GithubBoundary | undefined {
+  return config.autonomy?.boundary?.github;
+}
+
+/** The GitHub repository a project maps to: its GitHub-source enrollment, else its delivery policy's repository. */
+export function projectGithubRepository(project: Pick<Project, "source" | "team"> | undefined): string | undefined {
+  if (project?.source?.mode === "github") return project.source.repository;
+  return project?.team?.delivery?.repository;
+}
+
+/**
+ * The grant rules. No repository means no grant. Mission coordinators and permission reviewers get none. The delivery
+ * role gets fetch, push on the run's head branch only, pull requests, and merge only under a merge delivery policy.
+ * Every other team member gets fetch. A session the owner started directly gets fetch, push on any branch, pull
+ * requests and merge; branch protection on GitHub still governs the base branch.
+ */
+export function sessionGithubScope(context: GithubSessionContext): GithubGrantScope | undefined {
+  if (context.kind === "owner") {
+    if (!context.repository || !validGrantRepository(context.repository)) return undefined;
+    return { sub: "owner", repo: context.repository, ops: ["fetch", "push", "pr", "merge"], refs: ["refs/heads/*"] };
+  }
+  if (context.role === "mission-coordinator" || context.role === "permission-coordinator") return undefined;
+  if (context.role === "delivery" && context.delivery) {
+    const ref = `refs/heads/${context.delivery.headBranch}`;
+    if (!validGrantRepository(context.delivery.repository) || !validGrantRef(ref, false)) return undefined;
+    return { sub: "team:delivery", repo: context.delivery.repository, ops: context.delivery.mode === "merge" ? ["fetch", "push", "pr", "merge"] : ["fetch", "push", "pr"], refs: [ref] };
+  }
+  if (!context.repository || !validGrantRepository(context.repository)) return undefined;
+  return { sub: `team:${context.role}`, repo: context.repository, ops: ["fetch"] };
+}
+
+/** Mints a session's grant, or returns undefined when the boundary is off, there is no scope, or the key is unreadable. */
+export function sessionGithubGrant(config: Pick<Config, "autonomy">, scope: GithubGrantScope | undefined, sessionId: string, nowMs = Date.now()): { proxy: string; grant: string } | undefined {
+  const boundary = githubBoundary(config);
+  if (!boundary || !scope) return undefined;
+  try {
+    return { proxy: boundary.proxyUrl, grant: mintGithubGrant(readGithubGrantKey(boundary.keyPath), { ...scope, sid: sessionId }, nowMs) };
+  } catch {
+    console.warn("A GitHub grant could not be minted; the session starts without GitHub access through the proxy.");
+    return undefined;
+  }
+}
+
+/** Host-run Git operations live minutes, not hours. */
+const HOST_GRANT_TTL_SECONDS = 15 * 60;
+const HOST_CREDENTIAL_HELPER = `!f() { test "$1" = get || exit 0; test -n "$INFINITE_GITHUB_GRANT" || exit 0; printf 'username=x-infinite-grant\\npassword=%s\\n' "$INFINITE_GITHUB_GRANT"; }; f`;
+
+/**
+ * Environment for one host-run Git operation: the grant, the proxy, and (for Git run without a command prefix) Git
+ * configuration that rewrites github.com to the proxy and answers the proxy's credential request with the grant.
+ * Through `teams.commandPrefix`, sudo drops the GIT_CONFIG_* entries and the root-owned launcher adds the same settings.
+ * Empty when the boundary is off, so the environment stays exactly as it was.
+ */
+export function hostGithubGrantEnvironment(config: Pick<Config, "autonomy">, operation: { sid: string; repo: string; ops: GithubGrantOp[]; refs?: string[] }, nowMs = Date.now()): Record<string, string> {
+  const boundary = githubBoundary(config);
+  if (!boundary) return {};
+  let grant: string;
+  try { grant = mintGithubGrant(readGithubGrantKey(boundary.keyPath), { sub: "host", ...operation, ttlSeconds: HOST_GRANT_TTL_SECONDS }, nowMs); }
+  catch { return {}; }
+  const origin = new URL(boundary.proxyUrl).origin;
+  return {
+    INFINITE_GITHUB_GRANT: grant,
+    INFINITE_GITHUB_PROXY: origin,
+    GIT_CONFIG_COUNT: "3",
+    GIT_CONFIG_KEY_0: `url.${origin}/.insteadOf`, GIT_CONFIG_VALUE_0: "https://github.com/",
+    GIT_CONFIG_KEY_1: `credential.${origin}.helper`, GIT_CONFIG_VALUE_1: "",
+    GIT_CONFIG_KEY_2: `credential.${origin}.helper`, GIT_CONFIG_VALUE_2: HOST_CREDENTIAL_HELPER,
+  };
+}
+
+/** One `doctor` line: proxy reachable, grant key readable, and whether the agent account can still read the token cache. */
+export async function githubProxyDoctorLine(config: Pick<Config, "autonomy">): Promise<string | undefined> {
+  const boundary = githubBoundary(config);
+  if (!boundary) return undefined;
+  let key = "readable";
+  try { readGithubGrantKey(boundary.keyPath); } catch { key = "UNREADABLE"; }
+  let reachable = "unreachable", cache = "unknown";
+  try {
+    const response = await fetch(new URL("/health", boundary.proxyUrl), { redirect: "error", signal: AbortSignal.timeout(3000) });
+    const body = await response.json() as { ok?: unknown; tokenCache?: unknown };
+    if (response.ok && body.ok === true) {
+      reachable = "reachable";
+      if (body.tokenCache === "agent-readable") cache = "READABLE by the agent account, which bypasses the proxy";
+      else if (body.tokenCache === "proxy-only") cache = "not readable by the agent account";
+    }
+  } catch { /* reported as unreachable */ }
+  return `GitHub proxy: ${boundary.proxyUrl} ${reachable} · grant key ${key} · token cache ${cache}`;
 }

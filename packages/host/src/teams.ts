@@ -28,6 +28,7 @@ import { ProviderLimits, switchesMember, type LimitObservation } from "./provide
 import type { LinearService } from "./linear.js";
 import type { Readings } from "./readings.js";
 import { mirrorRemoteUrl } from "./project-source.js";
+import { hostGithubGrantEnvironment, projectGithubRepository, sessionGithubScope } from "./github-grants.js";
 import type { ProjectSourceService } from "./project-source.js";
 import type { RepositoryGraphs, RepositoryGraphResult } from "./repository-graphs.js";
 import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, publishTeamHead, removeMemberWorkspace, removeTeamWorkspace, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
@@ -988,11 +989,13 @@ export class TeamService {
     task = (async () => {
       let outcome: Awaited<ReturnType<typeof publishTeamHead>> = { published: false, category: "other" };
       let branch = runBranch, diverged = false;
+      // With the GitHub proxy configured, each push carries a host grant for exactly the ref it publishes.
+      const grantEnv = (ref: string) => hostGithubGrantEnvironment(this.config, { sid: `publish:${id}`, repo: target.repository, ops: ["push"], refs: [ref] });
       try {
-        outcome = await publishTeamHead(run.workspace, target.remoteUrl, commit, runBranch, this.config.teams?.commandPrefix, controller.signal);
+        outcome = await publishTeamHead(run.workspace, target.remoteUrl, commit, runBranch, this.config.teams?.commandPrefix, controller.signal, grantEnv);
         if (!outcome.published && outcome.category === "rejected") {
           branch = `${runBranch}-${commit.slice(0, 8)}`;
-          outcome = await publishTeamHead(run.workspace, target.remoteUrl, commit, branch, this.config.teams?.commandPrefix, controller.signal);
+          outcome = await publishTeamHead(run.workspace, target.remoteUrl, commit, branch, this.config.teams?.commandPrefix, controller.signal, grantEnv);
           diverged = outcome.published;
         }
       } catch {
@@ -4040,7 +4043,12 @@ export class TeamService {
     const request = { requestId: member.sessionId, provider: member.provider ?? stored.run.provider,
       projectId: stored.run.projectId, title: member.title, prompt: member.prompt,
       ...(member.role === "permission-coordinator" ? { continuation: member.continuation } : {}) };
-    try { result = await this.startInProject(stored.run.projectId, () => this.manager.createTeamSession(request, assignment(member), member.cwd, member.modelProfile, stored.root, this.config.teams?.trustWorkspaces === true)); }
+    // The GitHub grant scope (used only with autonomy.boundary.github): delivery pushes the run's head branch, others fetch.
+    const delivery = stored.run.delivery;
+    const github = sessionGithubScope({ kind: "team", role: member.role,
+      repository: delivery?.repository ?? projectGithubRepository(this.config.projects.find(project => project.id === stored.run.projectId)),
+      ...(delivery ? { delivery: { mode: delivery.mode, repository: delivery.repository, headBranch: teamDeliveryBranch(stored.run) } } : {}) });
+    try { result = await this.startInProject(stored.run.projectId, () => this.manager.createTeamSession(request, assignment(member), member.cwd, member.modelProfile, stored.root, this.config.teams?.trustWorkspaces === true, {}, github)); }
     catch (error) {
       this.fuse?.release(member.sessionId);
       if (error instanceof LaunchHeldError) { this.holdForHostLoad(stored, error.reason); return; }

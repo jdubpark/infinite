@@ -7,6 +7,7 @@ import {
   COMMIT_PAGE,
   holdUntil,
   landedIds,
+  type Landing,
   type LandedRun,
   matchLandings,
   matchReverts,
@@ -18,7 +19,7 @@ import {
   type ScanCommit,
   SCAN_BOUND,
 } from "./outcome-hold.js";
-import { applyCheck, applyScan, landingSignalId, type ScanInputs, scanInputs, type ScanWrite } from "./outcome-signals.js";
+import { applyCheck, applyScan, landingSignalId, type RecordedScanSignal, type ScanInputs, scanInputs, type ScanWrite } from "./outcome-signals.js";
 import { OUTCOMES_MODULE } from "./outcome-store.js";
 import type { TeamCommand } from "./team-types.js";
 import { type CommandResult, teamCommand, teamGitArgs } from "./team-workspace.js";
@@ -47,12 +48,32 @@ export const SCAN_COMMAND_LIMIT = 600;
  */
 export const UNREAD_LIMIT = 8;
 
+/**
+ * What one recorded scan saw, for a listener such as the project signal inbox. It holds commit ids, run ids, and
+ * parent lists only: no commit message or other text from Git.
+ */
+export type AppliedScan = {
+  projectId: string;
+  head: string;
+  /** True when the scan read exactly the first-parent commits added since the ledger's stored head. */
+  continuous: boolean;
+  /** The commits the scan read, oldest first. */
+  commits: readonly ScanCommit[];
+  /** Every landing and revert the scan matched, including ones the ledger had already recorded. */
+  landings: readonly Landing[];
+  reverts: readonly RevertMatch[];
+  /** The landing and revert signals this scan wrote. */
+  recorded: readonly RecordedScanSignal[];
+};
+
 export type ScanOnceInput = {
   store: EvidenceStore; git: ScanGit; mirror: string; fetch: MirrorFetch; holdDays: number;
   /** Defaults to `SCAN_COMMAND_LIMIT`. */
   commandLimit?: number;
   /** Fetches since the last recorded scan that no recorded scan read, oldest first, with none missing between them. */
   earlier?: readonly MirrorFetch[];
+  /** Called after a scan's write commits. A throw is ignored: it never fails or repeats the scan. */
+  onApplied?: (scan: AppliedScan) => void;
 };
 
 const SKIPPED: ScanResult = { state: "skipped", commits: 0, gap: null, landings: 0, reverts: 0 };
@@ -267,7 +288,18 @@ export async function scanOnce(input: ScanOnceInput): Promise<ScanResult> {
       reverts,
       holdDays,
     };
-    const applied = store.write(tx => applyScan(tx, write)).applied;
+    const recorded: RecordedScanSignal[] = [];
+    const applied = store.write(tx => applyScan(tx, write, recorded)).applied;
+    if (applied && input.onApplied) {
+      try {
+        input.onApplied({
+          projectId: fetch.projectId, head: fetch.head, continuous: gap === null && from !== undefined,
+          commits, landings, reverts, recorded,
+        });
+      } catch {
+        // The scan is recorded. A listener's failure must not report it as failed, or the next scan would reread it.
+      }
+    }
     return { state: applied ? "scanned" : "skipped", commits: commits.length, gap, landings: landings.length, reverts: reverts.length };
   } catch {
     return { ...FAILED };
@@ -281,6 +313,8 @@ export type BaseScannerOptions = {
   holdDays: () => number;
   git?: ScanGit;
   log?: (line: string) => void;
+  /** Passed to each scan. See `ScanOnceInput.onApplied`. */
+  onApplied?: (scan: AppliedScan) => void;
 };
 
 /**
@@ -390,6 +424,7 @@ export class BaseScanner {
         fetch,
         holdDays: this.options.holdDays(),
         earlier,
+        ...(this.options.onApplied === undefined ? {} : { onApplied: this.options.onApplied }),
       });
     } catch {
       return { ...FAILED };

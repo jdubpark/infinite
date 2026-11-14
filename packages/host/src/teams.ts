@@ -21,6 +21,9 @@ import { applyFuseReason, workLaunch } from "./fuse/rules.js";
 import type { FuseAdmission, FuseCheck, FuseGate } from "./fuse/types.js";
 import type { EventOutbox, OutboxEvent } from "./evidence/outbox.js";
 import type { Blackboard } from "./evidence/blackboard.js";
+import { canonicalJson } from "./evidence/crypto.js";
+import { entryToolsFor } from "./entry-roles.js";
+import { ENTRY_DROP_TEXT, ENTRY_INGEST_MEMBERS, ENTRY_INGEST_MS, entryIngestPending, ingestRunEntries } from "./team-entry-ingest.js";
 import { MAX_OUTBOX_EVENTS, pathField, planDigest, profileIdentity, runEventKey, runSummaryCounts, type MemberStopDetail, type MemberStopReason, type ReplacementCause } from "./run-events.js";
 import { taskFeatures } from "./task-features.js";
 import { teamUsage } from "./team-usage.js";
@@ -378,7 +381,7 @@ const configuredData = (data: MemberConfiguration) => ({
 const quietFor = (member: TeamMember) => Date.now() - Date.parse(member.lastActivityAt ?? member.startedAt ?? timestamp());
 // The flag is persisted on the member at creation, so a recovered or stopped session keeps the fingerprint it launched with.
 const assignment = (member: TeamMember): TeamAssignment => ({ runId: member.runId, memberId: member.memberId, revision: member.revision, role: member.role, ...(member.taskId ? { taskId: member.taskId } : {}),
-  ...(member.verificationRefused ? { verificationRefused: true } : {}) });
+  ...(member.verificationRefused ? { verificationRefused: true } : {}), ...(member.entryTools ? { entryTools: true as const } : {}) });
 
 /** Durable orchestration; reports describe agent claims, configured checks describe host evidence. */
 /** Delivery evidence may name the run branch (recorded before publication) or the branch the host published the head to. */
@@ -395,6 +398,11 @@ export class TeamService {
   private enrichments = 0;
   /** Runs whose blackboard entries are not all stored yet. In memory only: the drain retries them without a save. */
   private readonly entryBacklog = new Set<string>();
+  /** Members whose entry journals are settled for good in this process. In memory only. */
+  private readonly entryDone = new Set<string>();
+  private entryIngestAt = 0;
+  /** The member position where the next ingest pass starts, so every member is read in turn. */
+  private entryTurn = 0;
   private readonly commands = new Map<string, AbortController>();
   private readonly removingRuns = new Set<string>();
   private readonly removalTasks = new Set<Promise<void>>();
@@ -763,6 +771,30 @@ export class TeamService {
       // bring it back before the next start. A removed run never gets here: `deleteRecord` takes it out of the backlog.
       if (run === undefined) { entries.noteUnread(id); this.entryBacklog.add(id); continue; }
       if (entries.retry(run) !== "done") this.entryBacklog.add(id);
+    }
+  }
+  /**
+   * One ingest pass over the runs with the tools pinned: at most ENTRY_INGEST_MEMBERS journals, from a start that moves
+   * on each pass, so every pending member is read in turn. A run is saved only when a cursor moved or a drop is new.
+   */
+  private ingestEntries() {
+    const entries = this.options?.entries;
+    if (!entries) return;
+    const pending = [...this.records.values()].filter(stored => stored.run.blackboard?.tools === true)
+      .flatMap(stored => stored.run.members.filter(member => entryIngestPending(member, this.entryDone)).map(member => ({ stored, member })));
+    if (pending.length === 0) return;
+    const start = this.entryTurn % pending.length, count = Math.min(ENTRY_INGEST_MEMBERS, pending.length);
+    this.entryTurn = (start + count) % pending.length;
+    const runs = new Map<string, { stored: Stored; members: TeamMember[] }>();
+    for (const { stored, member } of [...pending.slice(start), ...pending].slice(0, count)) {
+      const group = runs.get(stored.run.id) ?? { stored, members: [] };
+      group.members.push(member); runs.set(stored.run.id, group);
+    }
+    for (const { stored, members } of runs.values()) {
+      const { advanced, dropped } = ingestRunEntries(stored.run, { events: (id, after, limit, types) => this.manager.events(id, after, limit, types), entries, done: this.entryDone, members });
+      const newDrop = dropped > 0 && !stored.run.events.some(event => event.text === ENTRY_DROP_TEXT);
+      if (newDrop) this.event(stored, ENTRY_DROP_TEXT);
+      if (newDrop || advanced) this.save(stored);
     }
   }
   /** The run as its sealed record file holds it, or undefined when the file is missing or cannot be read or opened now. */
@@ -1266,6 +1298,7 @@ export class TeamService {
       const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(project.team.permissions ? { permissions: currentPermissions(structuredClone(project.team.permissions)), permissionDecisions: [] } : {}), ...(goal ? { goal } : {}), ...(internal?.missionId ? { missionId: internal.missionId } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), ...(titleSource ? { titleSource } : {}), title: parsed.title, objective: parsed.objective, parallelismCeiling: ceiling, parallelism: initialParallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
       // A goal run takes the mode its cycle passes; every other run takes the project's current mode.
       run.autonomy = goal ? autonomyOf(internal) : autonomyOf(project);
+      if (this.config.teams?.blackboard?.tools === true && this.options?.entries?.available()) run.blackboard = { tools: true };
       if (project.team.delivery) {
         if (!lineup || lineup.coordinator.tier !== "strong" || lineup.reviewer.tier !== "strong")
           throw new TeamError(409, "delivery-lineup-required", "Automatic delivery requires a configured strong coordinator and independent strong reviewer.");
@@ -1884,6 +1917,7 @@ export class TeamService {
           }
           for (const stored of this.records.values()) await this.step(stored);
           this.drainEntries();
+          if (Date.now() - this.entryIngestAt >= ENTRY_INGEST_MS) { this.entryIngestAt = Date.now(); this.ingestEntries(); }
         }
         finally { this.tickQueued = false; }
       }).catch(() => { this.tickQueued = false; });
@@ -3763,7 +3797,7 @@ export class TeamService {
     if (role !== "permission-coordinator" && Buffer.byteLength(instructions) > 80 * 1024)
       instructions = teamPrompt(run, role, task, prompt, provider, modelProfile, configuredProject, permissionRecoveryHistory, this.publishHeadsEnabled());
     if (Buffer.byteLength(instructions) > 80 * 1024) throw new TeamError(409, "team-prompt-too-large", "The accumulated team requirements exceed the prompt limit. Start a new team with consolidated requirements.");
-    return { runId: run.id, memberId, revision: run.revision, role, ...(role === "project-manager" && !run.establishChecks && !run.verification ? { verificationRefused: true as const } : {}), provider, ...(modelProfile ? { modelProfile } : {}), ...(taskId ? { taskId } : {}), sessionId: randomUUID(), title: `${role}: ${taskId ?? run.title}`.slice(0, 100), status: "queued", cwd, baseCommit, prompt: instructions, ...(prompt ? { contextFeedback: prompt } : {}), cursor: 0, stopRequestId: randomUUID() };
+    return { runId: run.id, memberId, revision: run.revision, role, ...(role === "project-manager" && !run.establishChecks && !run.verification ? { verificationRefused: true as const } : {}), ...(entryToolsFor(run, role) ? { entryTools: true as const } : {}), provider, ...(modelProfile ? { modelProfile } : {}), ...(taskId ? { taskId } : {}), sessionId: randomUUID(), title: `${role}: ${taskId ?? run.title}`.slice(0, 100), status: "queued", cwd, baseCommit, prompt: instructions, ...(prompt ? { contextFeedback: prompt } : {}), cursor: 0, stopRequestId: randomUUID() };
   }
   /**
    * A limit acts only on the whole journal: a report or recovery in an unread tail wins.
@@ -4054,8 +4088,9 @@ export class TeamService {
       }
       const configuredProject = stored.run.handoff?.project ?? this.config.projects.find(project => project.id === stored.run.projectId)?.team;
       const launchSeq = this.options?.entries?.launchMark(stored.run.id);
-      const contextBytes = await writeTeamContext(member.cwd, { ...teamContext(stored.run, member.contextFeedback, configuredProject, member.role, this.permissionRecoveryHistory(stored.run)), assignment: assignment(member), memberBaseCommit: member.baseCommit, scratchDirectory: member.scratchDirectory }, this.config.teams?.commandPrefix);
-      this.options?.entries?.recordLaunch(stored.run, member, { launchSeq, promptBytes: Buffer.byteLength(member.prompt, "utf8"), contextBytes });
+      const digest = this.options?.entries?.memberDigest(stored.run, member, launchSeq);
+      const contextBytes = await writeTeamContext(member.cwd, { ...teamContext(stored.run, member.contextFeedback, configuredProject, member.role, this.permissionRecoveryHistory(stored.run)), ...(digest ? { entries: digest } : {}), assignment: assignment(member), memberBaseCommit: member.baseCommit, scratchDirectory: member.scratchDirectory }, this.config.teams?.commandPrefix);
+      this.options?.entries?.recordLaunch(stored.run, member, { launchSeq, promptBytes: Buffer.byteLength(member.prompt, "utf8"), contextBytes, digestBytes: digest ? Buffer.byteLength(canonicalJson(digest), "utf8") : 0 });
     }
     // The launch is charged once, right before its session starts. A member whose session exists is a replay.
     if (this.fuse && !this.hasLaunch(member) && this.fuseWait(stored, this.fuse.admit(workLaunch({ launchId: member.sessionId, projectId: stored.run.projectId,
@@ -4091,7 +4126,7 @@ export class TeamService {
     if (member.role !== "permission-coordinator") {
       const captured = { memberId: member.memberId, taskId: member.taskId, revision: member.revision, workspace: stored.run.workspace,
         baseCommit: member.baseCommit, role: member.role, provider: member.provider ?? run.provider, profile: member.modelProfile,
-        publishHeads: this.publishHeadsEnabled(), prefix: this.config.teams?.commandPrefix };
+        publishHeads: this.publishHeadsEnabled(), prefix: this.config.teams?.commandPrefix, entryTools: Boolean(member.entryTools) };
       this.enrich(stored, async signal => {
         const data = await memberConfiguration(captured, signal);
         if (!data) return undefined;

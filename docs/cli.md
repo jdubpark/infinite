@@ -430,7 +430,10 @@ missing `--request-id` is generated, so pass one to retry a request safely.
 
 An owner act covers only the projects that sit in the workspace at that time.
 A project that joins a workspace later is not covered until the owner delegates
-again. Moving a project out of a workspace drops its coverage.
+again. When the owner moves a project to another workspace or deletes its
+workspace, that project's coverage ends, and moving it back restores nothing:
+delegate again. A retried `--request-id` prints the recorded result and changes
+nothing.
 
 The record has no effect yet. The permission agent is not active on this host,
 so requests are handled as before. Until the agent is activated,

@@ -31,6 +31,10 @@ export interface PermissionCoverageEntry {
   at: string;
   interruptClasses: string[];
   policyVersion: number;
+  /** The project's root path at the owner act. Another checkout enrolled later under the same id is not covered. */
+  path: string;
+  /** The project's owner-move mark at the owner act. An owner regrouping that moves the project changes the mark. */
+  moveMark: string;
   direction?: string;
 }
 
@@ -42,6 +46,8 @@ export const permissionCoverageEntrySchema = z.object({
   at: timestampSchema,
   interruptClasses: z.array(z.string().min(1)),
   policyVersion: z.number().int().positive(),
+  path: z.string().min(1).max(4096),
+  moveMark: z.string().min(1).max(200),
   direction: z.string().max(4000).optional(),
 }).strict();
 
@@ -65,26 +71,23 @@ const permissionReceiptSchema = z.object({
   result: z.unknown(),
 }).strict();
 
-/** `knownProjectIds` is optional only for state written before this field was introduced. */
 export const permissionDelegationStoredStateSchema = z.object({
   entries: z.record(permissionProjectIdSchema, permissionCoverageEntrySchema),
   optOuts: z.record(permissionProjectIdSchema, permissionOptOutSchema),
-  knownProjectIds: permissionKnownProjectIdsSchema.optional(),
-  /** Present only while an owner's regrouping is unsettled: each covered project and its holder before the regrouping. */
-  pendingRegroup: z.record(permissionProjectIdSchema, permissionProjectIdSchema).optional(),
+  knownProjectIds: permissionKnownProjectIdsSchema,
   receipts: z.record(z.uuid(), permissionReceiptSchema),
 }).strict().superRefine((state, context) => {
-  const known = state.knownProjectIds ? new Set(state.knownProjectIds) : undefined;
+  const known = new Set(state.knownProjectIds);
   for (const [projectId, entry] of Object.entries(state.entries)) {
     if (entry.projectId !== projectId)
       context.addIssue({ code: "custom", path: ["entries", projectId, "projectId"], message: "Entry project ID does not match its key." });
-    if (known && !known.has(projectId))
+    if (!known.has(projectId))
       context.addIssue({ code: "custom", path: ["knownProjectIds"], message: "Known project IDs must include every coverage entry." });
   }
   for (const [projectId, optOut] of Object.entries(state.optOuts)) {
     if (optOut.projectId !== projectId)
       context.addIssue({ code: "custom", path: ["optOuts", projectId, "projectId"], message: "Opt-out project ID does not match its key." });
-    if (known && !known.has(projectId))
+    if (!known.has(projectId))
       context.addIssue({ code: "custom", path: ["knownProjectIds"], message: "Known project IDs must include every opt-out." });
   }
 });
@@ -117,10 +120,8 @@ export interface WorkspaceDelegationView {
   projects: WorkspaceDelegationProjectView[];
 }
 
-
 export type PermissionDelegationGroup = {
   id: string;
   name: string;
   repos: Array<{ checkouts: Array<{ projectId: string; name?: string }> }>;
 };
-

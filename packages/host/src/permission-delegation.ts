@@ -10,6 +10,7 @@ import {
   permissionDelegationActorSchema,
   permissionDelegationMutationRequestSchema,
   permissionDelegationRequestSchema,
+  permissionDelegationStoredStateSchema,
   type CoverageResult,
   type PermissionCoverageEntry,
   type PermissionDelegationActor,
@@ -17,19 +18,18 @@ import {
   type PermissionOptOut,
   type WorkspaceDelegationProjectView,
   type WorkspaceDelegationView,
-  permissionDelegationStoredStateSchema,
 } from "./permission-delegation-types.js";
 
 type Receipt = { fingerprint: string; result: unknown };
 type Stored = {
   entries: Record<string, PermissionCoverageEntry>;
   optOuts: Record<string, PermissionOptOut>;
+  /** Every project that has had an owner act here. Onboarding covers a project only when it is absent. */
   knownProjectIds: string[];
-  pendingRegroup?: Record<string, string>;
   receipts: Record<string, Receipt>;
 };
 type StateWriter = (file: string, key: Buffer, scope: string, value: unknown) => void;
-type Groups = Pick<ProjectGroupService, "get" | "list" | "containing">;
+type Groups = Pick<ProjectGroupService, "get" | "list" | "containing" | "ownerMoveMark">;
 type Options = { now?: () => number; writeState?: StateWriter; policyVersion?: number };
 
 const SCOPE = "permission-delegations";
@@ -40,7 +40,16 @@ const conflict = (message: string) => new TeamError(409, "request-conflict", mes
 const projectIds = (group: PermissionDelegationGroup): string[] =>
   [...new Set(group.repos.flatMap(repo => repo.checkouts.map(checkout => checkout.projectId)))];
 
-/** Durable owner authority, recorded once for each covered host project. */
+/**
+ * Durable owner authority, recorded once for each covered host project.
+ *
+ * An entry covers its project only while the project is enrolled at the path the owner act saw and
+ * the project group service reports the owner-move mark the act pinned. The group service bumps
+ * that mark in the same write as an owner regrouping, so coverage ends with the move even when this
+ * service is unavailable at that moment, and regrouping never waits on a write here. Nothing is
+ * pruned: an opt-out, a revocation and the fact that a project was onboarded before all survive a
+ * project that leaves the host and returns.
+ */
 export class PermissionDelegationService {
   private readonly file: string;
   private readonly writeState: StateWriter;
@@ -72,20 +81,11 @@ export class PermissionDelegationService {
       throw error;
     }
 
-    try {
-      const parsed = permissionDelegationStoredStateSchema.safeParse(unseal<unknown>(key, SCOPE, raw));
-      if (!parsed.success) throw new Error("Invalid permission-delegation state");
-      const stored = parsed.data;
-      this.state = {
-        entries: stored.entries,
-        optOuts: stored.optOuts,
-        knownProjectIds: stored.knownProjectIds ?? [...new Set([...Object.keys(stored.entries), ...Object.keys(stored.optOuts)])],
-        ...(stored.pendingRegroup ? { pendingRegroup: stored.pendingRegroup } : {}),
-        receipts: stored.receipts,
-      };
-    } catch {
-      throw new Error("Invalid permission-delegation state");
-    }
+    let parsed;
+    try { parsed = permissionDelegationStoredStateSchema.safeParse(unseal<unknown>(key, SCOPE, raw)); }
+    catch { throw new Error("Invalid permission-delegation state"); }
+    if (!parsed.success) throw new Error("Invalid permission-delegation state");
+    this.state = parsed.data;
   }
 
   private timestamp() { return new Date(this.clock()).toISOString(); }
@@ -94,27 +94,31 @@ export class PermissionDelegationService {
     return this.config.projects.find(project => project.id === projectId);
   }
 
-  private prune(candidate: Stored): boolean {
-    const enrolled = new Set(this.config.projects.map(project => project.id));
-    let changed = false;
-    for (const projectId of Object.keys(candidate.entries)) {
-      if (enrolled.has(projectId)) continue;
-      delete candidate.entries[projectId];
-      changed = true;
-    }
-    for (const projectId of Object.keys(candidate.optOuts)) {
-      if (enrolled.has(projectId)) continue;
-      delete candidate.optOuts[projectId];
-      changed = true;
-    }
-    const knownProjectIds = candidate.knownProjectIds.filter(projectId => enrolled.has(projectId));
-    if (knownProjectIds.length !== candidate.knownProjectIds.length) changed = true;
-    candidate.knownProjectIds = knownProjectIds;
-    return changed;
+  /** The project's entry, when it still names this checkout and no owner regrouping has moved it since. */
+  private validEntry(projectId: string, state: Stored): PermissionCoverageEntry | undefined {
+    const project = this.enrolled(projectId), entry = own(state.entries, projectId);
+    if (!project || !entry || own(state.optOuts, projectId)) return undefined;
+    if (entry.path !== resolve(project.path) || entry.moveMark !== this.groups.ownerMoveMark(projectId)) return undefined;
+    return entry;
   }
 
-  private remember(candidate: Stored, projectIds: string[]) {
-    candidate.knownProjectIds = [...new Set([...candidate.knownProjectIds, ...projectIds])].sort();
+  private newEntry(project: Project, act: PermissionCoverageEntry["act"], workspaceId: string, actor: PermissionDelegationActor, at: string, direction?: string): PermissionCoverageEntry {
+    return {
+      projectId: project.id,
+      act,
+      workspaceId,
+      by: actor.deviceId,
+      at,
+      interruptClasses: [...INTERRUPT_CLASSES],
+      policyVersion: this.policyVersion,
+      path: resolve(project.path),
+      moveMark: this.groups.ownerMoveMark(project.id),
+      ...(direction === undefined ? {} : { direction }),
+    };
+  }
+
+  private remember(candidate: Stored, ids: string[]) {
+    candidate.knownProjectIds = [...new Set([...candidate.knownProjectIds, ...ids])].sort();
   }
 
   private persist(candidate: Stored) {
@@ -146,7 +150,7 @@ export class PermissionDelegationService {
   private directionForDelegate(candidate: Stored, memberIds: string[], direction: string | null | undefined) {
     if (direction !== undefined) return direction ?? undefined;
     const existing = [...new Set(memberIds.flatMap(projectId => {
-      const entry = own(candidate.entries, projectId);
+      const entry = this.validEntry(projectId, candidate);
       return entry ? [entry.direction ?? null] : [];
     }))];
     if (existing.length > 1)
@@ -164,31 +168,21 @@ export class PermissionDelegationService {
     const memberIds = this.members(group);
     const selectedDirection = this.directionForDelegate(candidate, memberIds, direction);
     const replaced: string[] = [];
+    this.remember(candidate, memberIds);
     for (const projectId of memberIds) {
-      this.remember(candidate, [projectId]);
       if (own(candidate.optOuts, projectId)) {
         delete candidate.optOuts[projectId];
         replaced.push(projectId);
       }
-      candidate.entries[projectId] = {
-        projectId,
-        act: "delegate",
-        workspaceId: group.id,
-        by: actor.deviceId,
-        at,
-        interruptClasses: [...INTERRUPT_CLASSES],
-        policyVersion: this.policyVersion,
-        ...(selectedDirection === undefined ? {} : { direction: selectedDirection }),
-      };
+      candidate.entries[projectId] = this.newEntry(this.enrolled(projectId)!, "delegate", group.id, actor, at, selectedDirection);
     }
     return replaced;
   }
 
   private projectView(projectId: string, state: Stored): WorkspaceDelegationProjectView {
     const project = this.enrolled(projectId)!;
-    const optOut = own(state.optOuts, projectId);
-    if (optOut) return { projectId, name: project.name, state: "opt-out" };
-    const entry = own(state.entries, projectId);
+    if (own(state.optOuts, projectId)) return { projectId, name: project.name, state: "opt-out" };
+    const entry = this.validEntry(projectId, state);
     return entry
       ? { projectId, name: project.name, state: "covered", act: entry.act, at: entry.at }
       : { projectId, name: project.name, state: "not-covered" };
@@ -196,29 +190,27 @@ export class PermissionDelegationService {
 
   private view(group: PermissionDelegationGroup, state: Stored): WorkspaceDelegationView {
     const ids = this.members(group);
-    const projects = ids.map(projectId => this.projectView(projectId, state));
-    const covered = ids.filter(projectId => own(state.entries, projectId) && !own(state.optOuts, projectId));
+    const covered = ids.flatMap(projectId => this.validEntry(projectId, state) ?? []);
     const stateName = ids.length > 0 && covered.length === ids.length
       ? "delegated"
       : covered.length > 0 ? "partly-delegated" : "not-delegated";
-    const directions = [...new Set(covered.map(projectId => own(state.entries, projectId)!.direction ?? null))];
+    const directions = [...new Set(covered.map(entry => entry.direction ?? null))];
     const direction = directions.length === 1 ? directions[0] : undefined;
     return {
       workspaceId: group.id,
       name: group.name,
       state: stateName,
       ...(direction === undefined || direction === null ? {} : { direction }),
-      projects,
+      projects: ids.map(projectId => this.projectView(projectId, state)),
     };
   }
 
   private coverageFrom(projectId: string, state: Stored): CoverageResult {
     if (!this.enrolled(projectId)) return { covered: false, projectId, reason: "unknown-project" };
     if (own(state.optOuts, projectId)) return { covered: false, projectId, reason: "opt-out" };
-    const entry = own(state.entries, projectId);
-    if (!entry) return { covered: false, projectId, reason: "not-covered" };
-    const holder = this.groups.containing(projectId);
-    if (!holder) return { covered: false, projectId, reason: "not-covered" };
+    const entry = this.validEntry(projectId, state);
+    const holder = entry && this.groups.containing(projectId);
+    if (!entry || !holder) return { covered: false, projectId, reason: "not-covered" };
     const classes = interruptClassesInForce(entry.interruptClasses);
     return {
       covered: true,
@@ -236,58 +228,12 @@ export class PermissionDelegationService {
     };
   }
 
-  private start() {
-    const next = structuredClone(this.state);
-    this.prune(next);
-    return next;
-  }
-
-  /**
-   * Finishes an owner regrouping that left its marker: every covered project whose holder differs
-   * from the one sealed before the regrouping loses its coverage. Each public method calls this
-   * first, so a failed write here surfaces as an error instead of a stale "covered" answer.
-   */
-  private settle() {
-    const pending = this.state.pendingRegroup;
-    if (!pending) return;
-    const candidate = this.start();
-    for (const [projectId, holderId] of Object.entries(pending)) {
-      if (!own(candidate.entries, projectId) || this.groups.containing(projectId)?.id === holderId) continue;
-      delete candidate.entries[projectId];
-      this.remember(candidate, [projectId]);
-    }
-    delete candidate.pendingRegroup;
-    this.persist(candidate);
-  }
-
-  /**
-   * Runs an owner's regrouping so that coverage cannot outlive a move out of a workspace. The holder
-   * of every covered project is sealed before `mutate` runs; afterwards each covered project whose
-   * holder changed loses its coverage. If the host stops or the second write fails in between, the
-   * sealed marker remains and the next call settles it. A host fold inside that window also drops
-   * the folded project's coverage, which is the safe direction.
-   */
-  aroundOwnerRegroup<T>(mutate: () => T): T {
-    this.settle();
-    const candidate = this.start();
-    const holders: Record<string, string> = {};
-    for (const projectId of Object.keys(candidate.entries)) {
-      const holder = this.groups.containing(projectId);
-      if (holder) holders[projectId] = holder.id;
-    }
-    if (!Object.keys(holders).length) return mutate();
-    candidate.pendingRegroup = holders;
-    this.persist(candidate);
-    try { return mutate(); }
-    finally { this.settle(); }
-  }
-
+  /** The owner delegates every project that is in the workspace now. This is the only act that replaces an opt-out. */
   delegate(
     workspaceId: string,
     input: { requestId: string; direction?: string | null },
     actorInput: { deviceId: string },
   ): { view: WorkspaceDelegationView; replacedOptOuts: string[] } {
-    this.settle();
     const request = permissionDelegationRequestSchema.parse(input);
     const actor = permissionDelegationActorSchema.parse(actorInput);
     const fingerprint = this.fingerprint("delegate", workspaceId, request, actor);
@@ -295,7 +241,7 @@ export class PermissionDelegationService {
     if (replay) return replay;
 
     const group = this.groups.get(workspaceId) as PermissionDelegationGroup;
-    const candidate = this.start();
+    const candidate = structuredClone(this.state);
     const replacedOptOuts = this.applyDelegate(candidate, group, request.direction, actor, this.timestamp());
     return this.record(candidate, request.requestId, fingerprint, {
       view: this.view(group, candidate),
@@ -307,7 +253,6 @@ export class PermissionDelegationService {
     input: { requestId: string; direction?: string | null },
     actorInput: { deviceId: string },
   ): { views: WorkspaceDelegationView[]; replacedOptOuts: string[] } {
-    this.settle();
     const request = permissionDelegationRequestSchema.parse(input);
     const actor = permissionDelegationActorSchema.parse(actorInput);
     const fingerprint = this.fingerprint("delegateAll", undefined, request, actor);
@@ -315,7 +260,7 @@ export class PermissionDelegationService {
     if (replay) return replay;
 
     const groups = this.groups.list().groups as PermissionDelegationGroup[];
-    const candidate = this.start();
+    const candidate = structuredClone(this.state);
     const at = this.timestamp();
     const replacedOptOuts: string[] = [];
     for (const group of groups)
@@ -326,40 +271,35 @@ export class PermissionDelegationService {
     });
   }
 
+  /**
+   * The owner's onboarding of one project. It covers the project only the first time: a project that
+   * has had any owner act here keeps what that act left, so a repeat onboarding cannot undo a
+   * revocation or an opt-out, restore coverage after a regrouping, or drop direction text.
+   */
   coverProject(
     projectId: string,
     input: { requestId: string },
     actorInput: { deviceId: string },
   ): CoverageResult {
-    this.settle();
     const request = permissionDelegationMutationRequestSchema.parse(input);
     const actor = permissionDelegationActorSchema.parse(actorInput);
     const fingerprint = this.fingerprint("coverProject", projectId, request, actor);
     const replay = this.replay<CoverageResult>(request.requestId, fingerprint);
     if (replay) return replay;
-    if (!this.enrolled(projectId)) throw new TeamError(404, "unknown-project", "The selected project is not configured on this host.");
+    const project = this.enrolled(projectId);
+    if (!project) throw new TeamError(404, "unknown-project", "The selected project is not configured on this host.");
 
-    const candidate = this.start();
-    if (candidate.knownProjectIds.includes(projectId))
-      return this.record(candidate, request.requestId, fingerprint, this.coverageFrom(projectId, candidate));
-
-    const holder = this.groups.containing(projectId);
-    if (!holder) throw new TeamError(409, "project-workspace-unavailable", "The selected project has no current workspace.");
-    this.remember(candidate, [projectId]);
-    candidate.entries[projectId] = {
-      projectId,
-      act: "onboarding",
-      workspaceId: holder.id,
-      by: actor.deviceId,
-      at: this.timestamp(),
-      interruptClasses: [...INTERRUPT_CLASSES],
-      policyVersion: this.policyVersion,
-    };
+    const candidate = structuredClone(this.state);
+    if (!candidate.knownProjectIds.includes(projectId)) {
+      const holder = this.groups.containing(projectId);
+      if (!holder) throw new TeamError(409, "project-workspace-unavailable", "The selected project has no current workspace.");
+      this.remember(candidate, [projectId]);
+      candidate.entries[projectId] = this.newEntry(project, "onboarding", holder.id, actor, this.timestamp());
+    }
     return this.record(candidate, request.requestId, fingerprint, this.coverageFrom(projectId, candidate));
   }
 
   optOut(projectId: string, input: { requestId: string }, actorInput: { deviceId: string }): CoverageResult {
-    this.settle();
     const request = permissionDelegationMutationRequestSchema.parse(input);
     const actor = permissionDelegationActorSchema.parse(actorInput);
     const fingerprint = this.fingerprint("optOut", projectId, request, actor);
@@ -367,7 +307,7 @@ export class PermissionDelegationService {
     if (replay) return replay;
     if (!this.enrolled(projectId)) throw new TeamError(404, "unknown-project", "The selected project is not configured on this host.");
 
-    const candidate = this.start();
+    const candidate = structuredClone(this.state);
     delete candidate.entries[projectId];
     this.remember(candidate, [projectId]);
     candidate.optOuts[projectId] = { projectId, by: actor.deviceId, at: this.timestamp() };
@@ -375,7 +315,6 @@ export class PermissionDelegationService {
   }
 
   revoke(workspaceId: string, input: { requestId: string }, actorInput: { deviceId: string }): WorkspaceDelegationView {
-    this.settle();
     const request = permissionDelegationMutationRequestSchema.parse(input);
     const actor = permissionDelegationActorSchema.parse(actorInput);
     const fingerprint = this.fingerprint("revoke", workspaceId, request, actor);
@@ -383,29 +322,18 @@ export class PermissionDelegationService {
     if (replay) return replay;
 
     const group = this.groups.get(workspaceId) as PermissionDelegationGroup;
-    const candidate = this.start();
+    const candidate = structuredClone(this.state);
     const memberIds = this.members(group);
     this.remember(candidate, memberIds);
     for (const projectId of memberIds) delete candidate.entries[projectId];
     return this.record(candidate, request.requestId, fingerprint, this.view(group, candidate));
   }
 
-  /** Throws when an unsettled regrouping cannot be settled; a caller must treat that as not covered. */
   coverage(projectId: string): CoverageResult {
-    this.settle();
     return this.coverageFrom(projectId, this.state);
   }
 
   status(): WorkspaceDelegationView[] {
-    this.settle();
-    const groups = this.groups.list().groups as PermissionDelegationGroup[];
-    const enrolled = new Set(this.config.projects.map(project => project.id));
-    return groups.map(group => ({
-      ...group,
-      repos: group.repos.map(repo => ({
-        ...repo,
-        checkouts: repo.checkouts.filter(checkout => enrolled.has(checkout.projectId)),
-      })),
-    })).map(group => this.view(group, this.state));
+    return (this.groups.list().groups as PermissionDelegationGroup[]).map(group => this.view(group, this.state));
   }
 }

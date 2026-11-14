@@ -517,6 +517,64 @@ test("sealed project groups, identities, and request receipts survive a service 
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test("an owner regrouping changes the moved checkout's mark in the same write; a fold, a rename and a restart do not", () => {
+  const f = fixture(), other = fixture();
+  try {
+    type Written = { groups: Record<string, { members: string[] }>; ownerMoves: { counts: Record<string, number> } };
+    let last: Written | undefined, failing = false;
+    const writer = (file: string, key: Buffer, scope: string, value: unknown) => {
+      if (failing) throw new Error("write failed");
+      if (scope === "project-groups") last = structuredClone(value) as Written;
+      writeSealed(file, key, scope, value);
+    };
+    const service = f.service(writer);
+    const mark = (id: string) => service.ownerMoveMark(id);
+    const initial = { rehearsal: mark("rehearsal"), codex: mark("alpha-codex"), beta: mark("beta") };
+    assert.deepEqual(last!.groups.alpha!.members.sort(), ["alpha-codex", "rehearsal"], "the host folded both checkouts");
+    assert.deepEqual(last!.ownerMoves.counts, {}, "a host fold records no owner move");
+    assert.notEqual(other.service().ownerMoveMark("beta"), initial.beta, "another host's record never matches");
+
+    const alpha = service.get("alpha");
+    service.update("alpha", { requestId: randomUUID(), revision: alpha.revision, name: "Alpha Renamed", hidden: true });
+    assert.deepEqual([mark("rehearsal"), mark("alpha-codex")], [initial.rehearsal, initial.codex], "a rename moves nothing");
+
+    failing = true;
+    const request = { requestId: randomUUID(), name: "Client", repos: ["beta", "rehearsal"] };
+    assert.throws(() => service.create(request), /write failed/);
+    failing = false;
+    const created = service.create(request);
+    assert.deepEqual(last!.groups[created.id]!.members, ["beta", "rehearsal"]);
+    assert.deepEqual(last!.ownerMoves.counts, { beta: 1, rehearsal: 1 }, "the move and its count are one write, once");
+    assert.notEqual(mark("beta"), initial.beta);
+    assert.notEqual(mark("rehearsal"), initial.rehearsal);
+    assert.equal(mark("alpha-codex"), initial.codex);
+
+    const restarted = f.service();
+    const moved = restarted.ownerMoveMark("beta");
+    assert.equal(moved, mark("beta"));
+    assert.equal(restarted.ownerMoveMark("alpha-codex"), initial.codex);
+    restarted.remove(created.id, { requestId: randomUUID(), revision: created.revision });
+    assert.notEqual(restarted.ownerMoveMark("beta"), moved, "deleting a project moves its checkouts out");
+    assert.equal(restarted.ownerMoveMark("alpha-codex"), initial.codex);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+    rmSync(other.root, { recursive: true, force: true });
+  }
+});
+
+test("a stored state from before owner moves were recorded gets one record that survives a restart", () => {
+  const f = fixture();
+  try {
+    writeSealed(join(f.config.stateDir, "project-groups", "state.sealed"), f.key, "project-groups", { groups: {}, receipts: {}, tombstones: [] });
+    const first = f.service().ownerMoveMark("beta");
+    assert.equal(f.service().ownerMoveMark("beta"), first);
+    writeSealed(join(f.config.stateDir, "project-groups", "state.sealed"), f.key, "project-groups", {
+      groups: {}, receipts: {}, tombstones: [], ownerMoves: { id: "not-a-record", counts: {} },
+    });
+    assert.throws(() => f.service(), /Invalid project-group owner moves/);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test("project group API exposes reads to paired roles and restricts all mutations to owners", async () => {
   const f = fixture();
   let host: Host | undefined;

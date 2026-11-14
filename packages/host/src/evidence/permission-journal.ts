@@ -118,6 +118,9 @@ type DecisionRow = {
   input_sealed: string;
   replay_of: string | null;
   repeats: string | null;
+  raised: number;
+  last_tier: "none" | "light" | "strong";
+  duration_ms: number | null;
 };
 
 type ControlRow = {
@@ -144,7 +147,7 @@ export const permissionJournalModule: EvidenceModule = {
       + "role TEXT, provider TEXT NOT NULL, family TEXT, evidence_hash TEXT NOT NULL, reuse_key TEXT, "
       + "action_tool TEXT NOT NULL, action_summary TEXT NOT NULL, rules_json TEXT NOT NULL, tiers_json TEXT NOT NULL, "
       + "verdict TEXT NOT NULL, code TEXT, interrupt_class TEXT, note_sealed TEXT, input_sealed TEXT NOT NULL, "
-      + "replay_of TEXT, repeats TEXT)",
+      + "replay_of TEXT, repeats TEXT, raised INTEGER NOT NULL, last_tier TEXT NOT NULL, duration_ms INTEGER)",
     );
     tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_at_ms ON ${DECISIONS}(at_ms DESC, seq DESC)`);
     tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_workspace_at_ms ON ${DECISIONS}(workspace_id, at_ms DESC, seq DESC)`);
@@ -154,6 +157,7 @@ export const permissionJournalModule: EvidenceModule = {
     tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_assignment_at_ms ON ${DECISIONS}(assignment, at_ms DESC, seq DESC)`);
     tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_task_rejects ON ${DECISIONS}(task_id, verdict, code, repeats, at_ms, seq)`);
     tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_assignment_repeats ON ${DECISIONS}(assignment, repeats, at_ms, seq)`);
+    tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_raised ON ${DECISIONS}(raised, at_ms DESC, seq DESC)`);
     tx.exec(
       `CREATE TABLE IF NOT EXISTS ${DELIVERIES} (`
       + "seq INTEGER PRIMARY KEY, decision_id TEXT NOT NULL, at TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT)",
@@ -214,12 +218,18 @@ export class PermissionJournal {
         `INSERT INTO ${DECISIONS} (`
         + "seq,id,at,at_ms,workspace_id,project_id,task_id,assignment,session_id,role,provider,family,evidence_hash,"
         + "reuse_key,action_tool,action_summary,rules_json,tiers_json,verdict,code,interrupt_class,note_sealed,"
-        + "input_sealed,replay_of,repeats) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        + "input_sealed,replay_of,repeats,raised,last_tier,duration_ms) "
+        + "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         seq, decision.id, decision.at, Date.parse(decision.at), decision.workspaceId, decision.projectId, decision.taskId,
         decision.assignment, decision.sessionId, decision.role ?? null, decision.provider, decision.family ?? null,
         decision.evidenceHash, decision.reuseKey ?? null, decision.action.tool, decision.action.summary,
         JSON.stringify(decision.rules), JSON.stringify(decision.tiers), decision.verdict, decision.code ?? null,
         decision.interruptClass ?? null, noteSealed, inputSealed, decision.replayOf ?? null, canonicalRepeat ?? null,
+        decision.rules.some(rule => rule.startsWith("raise:")) ? 1 : 0,
+        decision.tiers.at(-1)?.tier ?? "none",
+        decision.tiers.length === 0
+          ? null
+          : Date.parse(decision.tiers.at(-1)!.endedAt) - Date.parse(decision.tiers[0].startedAt),
       );
     });
   }
@@ -258,7 +268,8 @@ export class PermissionJournal {
     const at = requiredTimestamp(input.at, "at");
     const by = requiredString(input.by, "by");
     this.store.write(tx => {
-      const decision = tx.get<DecisionRow>(`SELECT * FROM ${DECISIONS} WHERE id=?`, decisionId);
+      const cited = tx.get<DecisionRow>(`SELECT * FROM ${DECISIONS} WHERE id=?`, decisionId);
+      const decision = cited && replaySource(tx, cited);
       if (!decision || decision.verdict !== "reject") throw new TypeError("Only a reject can be reopened.");
       insertControl(tx, { kind: "reopen", at, by, decisionId: decision.repeats ?? decision.id });
     });
@@ -375,27 +386,17 @@ export class PermissionJournal {
         params.push(query.verdict);
       }
       if (query.rejectedOnly === true) clauses.push("verdict='reject'");
+      if (query.raisedOnly === true) clauses.push("raised=1");
       if (since !== undefined) {
         clauses.push("at_ms>=?");
         params.push(Date.parse(since));
       }
 
       const where = clauses.length === 0 ? "" : ` WHERE ${clauses.join(" AND ")}`;
-      const pageSize = query.raisedOnly === true ? Math.max(100, limit) : limit;
-      const sql = `SELECT * FROM ${DECISIONS}${where} ORDER BY at_ms DESC, seq DESC LIMIT ? OFFSET ?`;
-      const rows: DecisionRow[] = [];
-      let offset = 0;
-      do {
-        const page = db.all<DecisionRow>(sql, ...params, pageSize, offset);
-        if (query.raisedOnly !== true) {
-          rows.push(...page);
-          break;
-        }
-        rows.push(...page.filter(isRaised));
-        offset += page.length;
-        if (page.length < pageSize) break;
-      } while (rows.length < limit);
-      return rows.slice(0, limit).map(row => hydrateDecision(db, row));
+      const rows = db.all<DecisionRow>(
+        `SELECT * FROM ${DECISIONS}${where} ORDER BY at_ms DESC, seq DESC LIMIT ?`, ...params, limit,
+      );
+      return rows.map(row => hydrateDecision(db, row));
     });
   }
 
@@ -423,11 +424,18 @@ export class PermissionJournal {
     });
   }
 
+  /**
+   * Whether a model has ever rejected a request from this assignment. The host raises every later
+   * request from such an assignment to the strong tier, so an owner reopening the reject, the reject
+   * closing with its task, and an unlock all leave this history in place.
+   */
   hasRejectHistory(assignment: string): boolean {
     requiredString(assignment, "assignment");
-    return this.store.read(db => db.all<DecisionRow>(
-      `SELECT * FROM ${DECISIONS} WHERE assignment=? AND verdict='reject'`, assignment,
-    ).some(row => (isEffectReject(row.code ?? undefined) || isEvidenceReject(row.code ?? undefined)) && !ownerReopened(db, row)));
+    const codes = [...EFFECT_REJECT_CODES, ...EVIDENCE_REJECT_CODES];
+    return this.store.read(db => db.get(
+      `SELECT 1 AS found FROM ${DECISIONS} WHERE assignment=? AND verdict='reject' AND code IN (${placeholders(codes.length)}) LIMIT 1`,
+      assignment, ...codes,
+    ) !== undefined);
   }
 
   repeatCount(assignment: string, rejectId: string): number {
@@ -453,20 +461,37 @@ export class PermissionJournal {
     });
   }
 
-  replayEligible(decisionId: string, options: { taskId: string }): boolean {
+  /**
+   * Whether the host may answer an identical request from `requesterFamily` with this recorded
+   * verdict. A replay record is judged as the decision it replays. A verdict that a strong reviewer
+   * gave is not replayed to a requester of that reviewer's family, nor to a requester whose family
+   * the host could not establish (`requesterFamily: undefined`).
+   */
+  replayEligible(decisionId: string, options: { taskId: string; requesterFamily: string | undefined }): boolean {
     requiredString(decisionId, "decisionId");
-    assertPlainObject(options, "A replay query needs a taskId.");
-    assertOnlyKeys(options, ["taskId"]);
+    assertPlainObject(options, "A replay query needs a taskId and the requester's family.");
+    assertOnlyKeys(options, ["taskId", "requesterFamily"]);
+    if (!Object.hasOwn(options, "requesterFamily")) {
+      throw new TypeError("A replay query must state the requester's family, or undefined when it is unknown.");
+    }
     const taskId = requiredString(options.taskId, "taskId");
+    const requesterFamily = optionalString(options.requesterFamily, "requesterFamily");
     return this.store.read(db => {
-      const row = db.get<DecisionRow>(`SELECT * FROM ${DECISIONS} WHERE id=?`, decisionId);
-      if (!row || row.task_id !== taskId || row.verdict === "owner") return false;
+      const cited = db.get<DecisionRow>(`SELECT * FROM ${DECISIONS} WHERE id=?`, decisionId);
+      const row = cited && replaySource(db, cited);
+      if (!cited || !row || cited.task_id !== taskId || row.task_id !== taskId || row.verdict === "owner") return false;
+      const strongFamilies = (JSON.parse(row.tiers_json) as PermissionTier[])
+        .filter(tier => tier.tier === "strong").map(tier => tier.family);
+      if (strongFamilies.length > 0
+        && (requesterFamily === undefined || strongFamilies.some(family => sameFamily(family, requesterFamily)))) {
+        return false;
+      }
       if (row.verdict === "allow") {
         return !db.all<DecisionRow>(
           `SELECT * FROM ${DECISIONS} WHERE task_id=? AND verdict='reject' AND code IN (${placeholders(EFFECT_REJECT_CODES.length)}) `
-          + "AND repeats IS NULL",
-          taskId, ...EFFECT_REJECT_CODES,
-        ).some(reject => isOpen(db, reject) && compareOrder(reject.at, reject.seq, row.at, row.seq) > 0);
+          + "AND repeats IS NULL AND seq>?",
+          taskId, ...EFFECT_REJECT_CODES, row.seq,
+        ).some(reject => isOpen(db, reject));
       }
       if (row.code === "unavailable" || row.code === "locked" || row.code === "needs-owner") return false;
       if (isEffectReject(row.code ?? undefined)) return isOpen(db, row);
@@ -506,34 +531,36 @@ export class PermissionJournal {
         clauses.push("workspace_id=?");
         params.push(id!);
       }
-      const decisions = db.all<DecisionRow>(
-        `SELECT * FROM ${DECISIONS} WHERE ${clauses.join(" AND ")} ORDER BY at_ms,seq`,
+      const where = clauses.join(" AND ");
+      const groups = db.all<{ verdict: PermissionVerdict; last_tier: DecisionRow["last_tier"]; n: number; replays: number }>(
+        `SELECT verdict, last_tier, COUNT(*) AS n, COUNT(replay_of) AS replays FROM ${DECISIONS} WHERE ${where} `
+        + "GROUP BY verdict, last_tier",
         ...params,
       );
       const byVerdict = { allow: 0, reject: 0, owner: 0 };
       const byTier = { none: 0, light: 0, strong: 0 };
-      const durations: number[] = [];
-      let replays = 0;
-      for (const row of decisions) {
-        byVerdict[row.verdict] += 1;
-        const tiers = JSON.parse(row.tiers_json) as PermissionTier[];
-        const lastTier = tiers.at(-1);
-        byTier[lastTier?.tier ?? "none"] += 1;
-        if (row.replay_of !== null) replays += 1;
-        if (tiers.length > 0) {
-          const firstStart = Date.parse(tiers[0].startedAt);
-          const lastEnd = Date.parse(tiers.at(-1)!.endedAt);
-          durations.push(lastEnd - firstStart);
-        }
+      let decisions = 0, replays = 0;
+      for (const group of groups) {
+        byVerdict[group.verdict] += group.n;
+        byTier[group.last_tier] += group.n;
+        decisions += group.n;
+        replays += group.replays;
       }
-      durations.sort((a, b) => a - b);
+      const timed = db.get<{ n: number }>(
+        `SELECT COUNT(duration_ms) AS n FROM ${DECISIONS} WHERE ${where}`, ...params,
+      )?.n ?? 0;
+      const middle = timed === 0 ? [] : db.all<{ duration_ms: number }>(
+        `SELECT duration_ms FROM ${DECISIONS} WHERE ${where} AND duration_ms IS NOT NULL `
+        + "ORDER BY duration_ms LIMIT ? OFFSET ?",
+        ...params, timed % 2 === 1 ? 1 : 2, Math.floor((timed - 1) / 2),
+      ).map(row => row.duration_ms);
       return {
-        decisions: decisions.length,
-        perHour: decisions.length / ((endMs - startMs) / 3_600_000),
+        decisions,
+        perHour: decisions / ((endMs - startMs) / 3_600_000),
         byVerdict,
         byTier,
         replays,
-        medianDecisionMs: median(durations),
+        medianDecisionMs: median(middle),
       };
     });
   }
@@ -654,8 +681,17 @@ function hydrateDecision(db: EvidenceDb, row: DecisionRow): PermissionDecision {
   };
 }
 
-function isRaised(row: DecisionRow): boolean {
-  return (JSON.parse(row.rules_json) as string[]).some(rule => rule.startsWith("raise:"));
+/** The decision a replay record answers with: the end of its `replayOf` chain. */
+function replaySource(db: EvidenceDb, row: DecisionRow, seen = new Set<string>()): DecisionRow | undefined {
+  if (seen.has(row.id)) return undefined;
+  seen.add(row.id);
+  if (row.replay_of === null) return row;
+  const source = db.get<DecisionRow>(`SELECT * FROM ${DECISIONS} WHERE id=?`, row.replay_of);
+  return source === undefined ? undefined : replaySource(db, source, seen);
+}
+
+function sameFamily(left: string, right: string): boolean {
+  return left.trim().toLowerCase() === right.trim().toLowerCase();
 }
 
 function isOpen(db: EvidenceDb, row: DecisionRow): boolean {
@@ -723,8 +759,12 @@ function nextSequence(tx: EvidenceTx): number {
   return tx.run(`INSERT INTO ${ORDER} DEFAULT VALUES`).lastInsertRowid;
 }
 
-function compareOrder(leftAt: string, leftSeq: number, rightAt: string, rightSeq: number): number {
-  return compareAt(leftAt, rightAt) || leftSeq - rightSeq;
+/**
+ * The journal's own sequence is the order of record. Timestamps are labels: two events can carry
+ * the same one, and a host clock can step backwards.
+ */
+function compareOrder(_leftAt: string, leftSeq: number, _rightAt: string, rightSeq: number): number {
+  return leftSeq - rightSeq;
 }
 
 function compareAt(left: string, right: string): number {

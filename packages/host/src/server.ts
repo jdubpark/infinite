@@ -83,6 +83,13 @@ const permissionDelegationBodySchema = z.object({
   direction: z.string().max(4000).nullable().optional(),
 }).strict().refine(body => (body.workspaceId === undefined) !== (body.all === undefined), { message: "Name exactly one workspace, or all: true." });
 const permissionRevocationBodySchema = z.object({ requestId: id, workspaceId: projectGroupIdSchema }).strict();
+const permissionRatesQuerySchema = z.object({
+  scope: z.enum(["session", "task", "workspace", "host"]),
+  id: z.string().min(1).max(200).optional(),
+  hours: z.coerce.number().int().min(1).max(168).default(1),
+}).strict().refine(query => (query.scope === "host") === (query.id === undefined), {
+  message: "A session, task or workspace scope needs an id, and the host scope takes none.",
+});
 const MAX_LOGIN_ATTEMPT_BUCKETS = 1024;
 /** A recorded pid still names a process. EPERM means it runs under another account, such as the agent user. */
 function alive(pid: unknown) {
@@ -798,13 +805,10 @@ export function createApp(config: Config, key: Buffer) {
     }));
   });
   app.get("/api/project-groups/:id", requireRole(["owner", "controller", "viewer"]), (req, res) => res.json(projectGroups.get(projectGroupIdSchema.parse(req.params.id))));
-  // An owner regroup can move a project to another workspace, which ends that project's coverage. The delegation
-  // service seals the holders first, so a failure between the two writes can never leave a moved project covered.
-  const regrouping = <T>(change: () => T): T => permissionDelegation ? permissionDelegation.aroundOwnerRegroup(change) : change();
+  app.post("/api/project-groups", requireRole(["owner"]), (req, res) => res.json(projectGroups.create(createProjectGroupSchema.parse(req.body))));
+  app.put("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.update(projectGroupIdSchema.parse(req.params.id), updateProjectGroupSchema.parse(req.body))));
+  app.delete("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.remove(projectGroupIdSchema.parse(req.params.id), z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict().parse(req.body))));
   const permissionsUnavailable = (res: express.Response) => res.status(503).json({ error: "Permission delegation is unavailable on this host." });
-  app.post("/api/project-groups", requireRole(["owner"]), (req, res) => res.json(regrouping(() => projectGroups.create(createProjectGroupSchema.parse(req.body)))));
-  app.put("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(regrouping(() => projectGroups.update(projectGroupIdSchema.parse(req.params.id), updateProjectGroupSchema.parse(req.body)))));
-  app.delete("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(regrouping(() => projectGroups.remove(projectGroupIdSchema.parse(req.params.id), z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict().parse(req.body)))));
   app.get("/api/permissions/status", requireRole(["owner", "controller"]), (_req, res) => {
     if (!permissionDelegation) return permissionsUnavailable(res);
     const journal = permissionJournal;
@@ -819,6 +823,23 @@ export function createApp(config: Config, key: Buffer) {
       interruptClasses: [...INTERRUPT_CLASSES],
       workspaces: permissionDelegation.status(),
       rates,
+    });
+  });
+  // Decision figures for one session, task or workspace, or for the host, over the last `hours` (one hour to seven days).
+  app.get("/api/permissions/rates", requireRole(["owner", "controller"]), (req, res) => {
+    if (!permissionJournal) return res.status(503).json({ error: "The permission journal is unavailable on this host." });
+    const query = permissionRatesQuerySchema.parse(req.query);
+    const until = Date.now();
+    return res.json({
+      scope: query.scope,
+      ...(query.id === undefined ? {} : { id: query.id }),
+      hours: query.hours,
+      rates: permissionJournal.rates({
+        scope: query.scope,
+        ...(query.id === undefined ? {} : { id: query.id }),
+        since: new Date(until - query.hours * HOUR_MS).toISOString(),
+        until: new Date(until).toISOString(),
+      }),
     });
   });
   app.post("/api/permissions/delegations", requireRole(["owner"]), requireOwnerCli, (req, res) => {

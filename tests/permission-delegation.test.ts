@@ -35,8 +35,18 @@ function makeGroup(id: string, name: string, ids: string[]): ProjectGroup {
 }
 
 class FakeGroups {
+  private readonly moves = new Map<string, number>();
   constructor(private groups: ProjectGroup[]) {}
+  /** A host fold: membership changes and no owner move is recorded. */
   set(groups: ProjectGroup[]) { this.groups = groups; }
+  /** An owner regrouping: every project whose holder changed is recorded as moved, as the group service does. */
+  ownerRegroup(groups: ProjectGroup[]) {
+    const ids = new Set([...this.groups, ...groups].flatMap(group => group.repos.flatMap(repo => repo.checkouts.map(checkout => checkout.projectId))));
+    const before = new Map([...ids].map(id => [id, this.containing(id)?.id]));
+    this.groups = groups;
+    for (const id of ids) if (before.get(id) !== this.containing(id)?.id) this.moves.set(id, (this.moves.get(id) ?? 0) + 1);
+  }
+  ownerMoveMark(projectId: string): string { return `fake-moves:${this.moves.get(projectId) ?? 0}`; }
   get(id: string): ProjectGroup {
     const group = this.groups.find(value => value.id === id || value.repos.some(repo => repo.checkouts.some(checkout => checkout.projectId === id)));
     if (!group) throw new TeamError(404, "project-group-not-found", "This project group does not exist.");
@@ -51,7 +61,7 @@ class FakeGroups {
 
 function fixture(ids = ["alpha", "beta"]) {
   const root = mkdtempSync(join(tmpdir(), "permission-delegation-"));
-  const projects: Project[] = ids.map(id => ({ id, name: `${id} project`, path: "project-root" }));
+  const projects: Project[] = ids.map(id => ({ id, name: `${id} project`, path: join(root, "projects", id) }));
   const config = { stateDir: join(root, "state"), projects } as Config;
   const key = randomBytes(32);
   const groups = new FakeGroups([makeGroup("workspace-one", "Workspace One", ids)]);
@@ -63,8 +73,14 @@ function fixture(ids = ["alpha", "beta"]) {
   };
   const service = (options: { policyVersion?: number } = {}) =>
     new PermissionDelegationService(config, key, groups, { now: () => now, writeState, ...options });
+  const file = join(config.stateDir, "permission-delegations", "state.sealed");
+  const stored = (projectId: string, extra: Partial<PermissionCoverageEntry> = {}): PermissionCoverageEntry => ({
+    projectId, act: "delegate", workspaceId: "workspace-one", by: "prior-owner",
+    at: "2026-11-13T12:00:00.000Z", interruptClasses: [...INTERRUPT_CLASSES], policyVersion: 1,
+    path: join(root, "projects", projectId), moveMark: groups.ownerMoveMark(projectId), ...extra,
+  });
   return {
-    root, config, key, groups, service,
+    root, config, key, groups, service, file, stored,
     get writes() { return writes; },
     get now() { return now; },
     set now(value: number) { now = value; },
@@ -188,7 +204,7 @@ test("onboarding does not restore coverage removed by owner regrouping, but dele
   try {
     const service = f.service();
     service.delegate("workspace-one", request(), actor);
-    service.aroundOwnerRegroup(() => f.groups.set([makeGroup("workspace-two", "Workspace Two", ["alpha"])]));
+    f.groups.ownerRegroup([makeGroup("workspace-two", "Workspace Two", ["alpha"])]);
     assert.deepEqual(service.coverage("alpha"), { covered: false, projectId: "alpha", reason: "not-covered" });
 
     assert.deepEqual(service.coverProject("alpha", request(), actor), { covered: false, projectId: "alpha", reason: "not-covered" });
@@ -228,6 +244,8 @@ test("delegate applies explicit direction text to every covered entry", () => {
           at: "2026-11-14T12:00:00.000Z",
           interruptClasses: [...INTERRUPT_CLASSES],
           policyVersion: PERMISSION_POLICY_VERSION,
+          path: join(f.root, "projects", id),
+          moveMark: f.groups.ownerMoveMark(id),
           direction: "Only allow routine project work.",
         });
       }
@@ -352,12 +370,9 @@ test("authorityHash includes the host policy version in force", () => {
 test("classes in force retain a pinned class absent from this release", () => {
   const f = fixture(["alpha"]);
   try {
-    const entry = {
-      projectId: "alpha", act: "delegate", workspaceId: "workspace-one", by: "prior-owner",
-      at: "2026-11-13T12:00:00.000Z", interruptClasses: ["retired-interrupt-class"], policyVersion: 1,
-    };
-    writeSealed(join(f.config.stateDir, "permission-delegations", "state.sealed"), f.key, "permission-delegations", {
-      entries: { alpha: entry }, optOuts: {}, receipts: {},
+    writeSealed(f.file, f.key, "permission-delegations", {
+      entries: { alpha: f.stored("alpha", { interruptClasses: ["retired-interrupt-class"] }) },
+      optOuts: {}, knownProjectIds: ["alpha"], receipts: {},
     });
     const coverage = f.service().coverage("alpha");
 
@@ -398,44 +413,11 @@ test("coverage and request receipts survive a restart", () => {
   } finally { f.cleanup(); }
 });
 
-test("legacy sealed state initializes known project IDs from entries and opt-outs", () => {
-  const f = fixture();
-  try {
-    const originalEntry: PermissionCoverageEntry = {
-      projectId: "alpha", act: "delegate", workspaceId: "workspace-one", by: "prior-owner",
-      at: "2026-11-13T12:00:00.000Z", interruptClasses: [...INTERRUPT_CLASSES], policyVersion: 1,
-      direction: "Preserve this direction.",
-    };
-    const originalOptOut = { projectId: "beta", by: "prior-owner", at: "2026-11-13T12:00:00.000Z" };
-    writeSealed(join(f.config.stateDir, "permission-delegations", "state.sealed"), f.key, "permission-delegations", {
-      entries: { alpha: originalEntry }, optOuts: { beta: originalOptOut }, receipts: {},
-    });
-    const service = f.service();
-    const originalCoverage = service.coverage("alpha");
-
-    assert.deepEqual(service.coverProject("alpha", request(), actor), originalCoverage);
-    assert.deepEqual(service.coverProject("beta", request(), actor), { covered: false, projectId: "beta", reason: "opt-out" });
-    const migrated = unseal<{ knownProjectIds: string[] }>(
-      f.key, "permission-delegations", readFileSync(join(f.config.stateDir, "permission-delegations", "state.sealed"), "utf8"),
-    );
-    assert.deepEqual(migrated.knownProjectIds, ["alpha", "beta"]);
-  } finally { f.cleanup(); }
-});
-
 test("invalid sealed state fails with the fixed error before loading any entries", () => {
   const f = fixture();
   try {
-    writeSealed(join(f.config.stateDir, "permission-delegations", "state.sealed"), f.key, "permission-delegations", {
-      entries: {
-        alpha: {
-          projectId: "alpha", act: "delegate", workspaceId: "workspace-one", by: "prior-owner",
-          at: "2026-11-13T12:00:00.000Z", interruptClasses: [...INTERRUPT_CLASSES], policyVersion: 1,
-        },
-        beta: {
-          projectId: "beta", act: "invalid-act", workspaceId: "workspace-one", by: "prior-owner",
-          at: "2026-11-13T12:00:00.000Z", interruptClasses: [...INTERRUPT_CLASSES], policyVersion: 1,
-        },
-      },
+    writeSealed(f.file, f.key, "permission-delegations", {
+      entries: { alpha: f.stored("alpha"), beta: { ...f.stored("beta"), act: "invalid-act" } },
       optOuts: {},
       knownProjectIds: ["alpha", "beta"],
       receipts: {},
@@ -456,39 +438,6 @@ test("sealed state does not expose direction text in plaintext", () => {
   } finally { f.cleanup(); }
 });
 
-test("unenrolled entries are hidden from reads and pruned by the next mutation", () => {
-  const f = fixture(["alpha", "removed"]);
-  try {
-    writeSealed(join(f.config.stateDir, "permission-delegations", "state.sealed"), f.key, "permission-delegations", {
-      entries: {
-        removed: {
-          projectId: "removed", act: "delegate", workspaceId: "workspace-one", by: "prior-owner",
-          at: "2026-11-13T12:00:00.000Z", interruptClasses: [...INTERRUPT_CLASSES], policyVersion: 1,
-        },
-      },
-      optOuts: { removed: { projectId: "removed", by: "prior-owner", at: "2026-11-13T12:00:00.000Z" } },
-      receipts: {},
-    });
-    f.config.projects = f.config.projects.filter(project => project.id !== "removed");
-    f.groups.set([makeGroup("workspace-one", "Workspace One", ["alpha", "removed"])]);
-    const service = f.service();
-
-    assert.deepEqual(service.coverage("removed"), { covered: false, projectId: "removed", reason: "unknown-project" });
-    assert.deepEqual(service.status()[0]!.projects.map(project => project.projectId), ["alpha"]);
-    service.optOut("alpha", request(), actor);
-    const saved = unseal<{ entries: Record<string, unknown>; optOuts: Record<string, unknown>; knownProjectIds: string[] }>(
-      f.key, "permission-delegations", readFileSync(join(f.config.stateDir, "permission-delegations", "state.sealed"), "utf8"),
-    );
-    assert.equal(Object.hasOwn(saved.entries, "removed"), false);
-    assert.equal(Object.hasOwn(saved.optOuts, "removed"), false);
-    assert.equal(saved.knownProjectIds.includes("removed"), false);
-
-    f.config.projects.push({ id: "removed", name: "removed project", path: "project-root" });
-    f.groups.set([makeGroup("workspace-one", "Workspace One", ["alpha", "removed"])]);
-    assert.equal(service.coverProject("removed", request(), actor).covered, true);
-  } finally { f.cleanup(); }
-});
-
 test("delegateAll covers each listed workspace and reports replaced opt-outs", () => {
   const f = fixture();
   try {
@@ -503,25 +452,31 @@ test("delegateAll covers each listed workspace and reports replaced opt-outs", (
   } finally { f.cleanup(); }
 });
 
-test("an owner regrouping drops the coverage of a project that changed workspace and keeps the rest", () => {
+test("an owner regrouping ends the moved project's coverage with no write to this service, and moving it back restores nothing", () => {
   const f = fixture();
   try {
     const service = f.service();
     service.delegate("workspace-one", request(), actor);
+    const writesBefore = f.writes;
 
-    const result = service.aroundOwnerRegroup(() => {
-      f.groups.set([makeGroup("workspace-one", "Workspace One", ["beta"]), makeGroup("workspace-two", "Workspace Two", ["alpha"])]);
-      return "regrouped";
-    });
-
-    assert.equal(result, "regrouped");
+    f.groups.ownerRegroup([makeGroup("workspace-one", "Workspace One", ["beta"]), makeGroup("workspace-two", "Workspace Two", ["alpha"])]);
     assert.deepEqual(service.coverage("alpha"), { covered: false, projectId: "alpha", reason: "not-covered" });
     assert.equal(service.coverage("beta").covered, true);
+    assert.deepEqual(service.status().map(view => [view.workspaceId, view.state]), [
+      ["workspace-one", "delegated"], ["workspace-two", "not-delegated"],
+    ]);
+    assert.equal(f.writes, writesBefore);
+
+    f.groups.ownerRegroup([makeGroup("workspace-one", "Workspace One", ["alpha", "beta"])]);
+    assert.deepEqual(service.coverage("alpha"), { covered: false, projectId: "alpha", reason: "not-covered" });
+    assert.equal(service.status()[0]!.state, "partly-delegated");
     assert.deepEqual(service.coverProject("alpha", request(), actor), { covered: false, projectId: "alpha", reason: "not-covered" });
+    assert.equal(service.delegate("workspace-one", request(), actor).view.state, "delegated");
+    assert.equal(service.coverage("alpha").covered, true);
   } finally { f.cleanup(); }
 });
 
-test("a regrouping that cannot seal its marker does not run", () => {
+test("a regrouping made while this service could not write or was not running still ends coverage after recovery", () => {
   const f = fixture();
   try {
     let failing = false;
@@ -531,35 +486,80 @@ test("a regrouping that cannot seal its marker does not run", () => {
     };
     const service = new PermissionDelegationService(f.config, f.key, f.groups, { writeState });
     service.delegate("workspace-one", request(), actor);
-    failing = true;
-    let ran = false;
 
-    assert.throws(() => service.aroundOwnerRegroup(() => { ran = true; }), /write failed/);
-    assert.equal(ran, false);
+    failing = true;
+    f.groups.ownerRegroup([makeGroup("workspace-one", "Workspace One", ["beta"]), makeGroup("workspace-two", "Workspace Two", ["alpha"])]);
+    assert.deepEqual(service.coverage("alpha"), { covered: false, projectId: "alpha", reason: "not-covered" });
+    assert.throws(() => service.revoke("workspace-one", request(), actor), /write failed/);
     failing = false;
+
+    const restarted = f.service();
+    assert.deepEqual(restarted.coverage("alpha"), { covered: false, projectId: "alpha", reason: "not-covered" });
+    assert.equal(restarted.coverage("beta").covered, true);
+  } finally { f.cleanup(); }
+});
+
+test("an opt-out, a revocation and the onboarding history survive a project that leaves the host and returns", () => {
+  const f = fixture(["alpha", "beta", "gamma"]);
+  try {
+    const service = f.service();
+    service.optOut("alpha", request(), actor);
+    service.coverProject("beta", request(), actor);
+    service.revoke("workspace-one", request(), actor);
+    const enrolled = [...f.config.projects];
+
+    f.config.projects = enrolled.filter(project => project.id === "gamma");
+    f.groups.set([makeGroup("workspace-one", "Workspace One", ["gamma"])]);
+    assert.deepEqual(service.coverage("alpha"), { covered: false, projectId: "alpha", reason: "unknown-project" });
+    assert.deepEqual(service.status()[0]!.projects.map(project => project.projectId), ["gamma"]);
+    service.coverProject("gamma", request(), actor);
+    service.optOut("gamma", request(), actor);
+
+    f.config.projects = enrolled;
+    f.groups.set([makeGroup("workspace-one", "Workspace One", ["alpha", "beta", "gamma"])]);
+    const restarted = f.service();
+    assert.deepEqual(restarted.coverProject("alpha", request(), actor), { covered: false, projectId: "alpha", reason: "opt-out" });
+    assert.deepEqual(restarted.coverProject("beta", request(), actor), { covered: false, projectId: "beta", reason: "not-covered" });
+    assert.deepEqual(restarted.status()[0]!.projects.map(project => project.state), ["opt-out", "not-covered", "opt-out"]);
+  } finally { f.cleanup(); }
+});
+
+test("another checkout enrolled under a covered project's id is not covered until the owner delegates it", () => {
+  const f = fixture(["alpha"]);
+  try {
+    const service = f.service();
+    service.delegate("workspace-one", request(), actor);
+    f.config.projects = [{ id: "alpha", name: "alpha project", path: join(f.root, "projects", "another-checkout") }];
+
+    assert.deepEqual(service.coverage("alpha"), { covered: false, projectId: "alpha", reason: "not-covered" });
+    assert.equal(service.status()[0]!.state, "not-delegated");
+    assert.deepEqual(service.coverProject("alpha", request(), actor), { covered: false, projectId: "alpha", reason: "not-covered" });
+    assert.equal(service.delegate("workspace-one", request(), actor).view.state, "delegated");
     assert.equal(service.coverage("alpha").covered, true);
   } finally { f.cleanup(); }
 });
 
-test("a regrouping whose final write fails never reports the moved project as covered, also after a restart", () => {
+test("a replayed request id returns its recorded result and restores no coverage", () => {
   const f = fixture();
   try {
-    let failAfter = Number.POSITIVE_INFINITY, writes = 0;
-    const writeState = (file: string, stateKey: Buffer, scope: string, value: unknown) => {
-      if (++writes > failAfter) throw new Error("write failed");
-      writeSealed(file, stateKey, scope, value);
-    };
-    const service = new PermissionDelegationService(f.config, f.key, f.groups, { writeState });
-    service.delegate("workspace-one", request(), actor);
-    failAfter = writes + 1; // the marker is sealed, the write that settles it fails
+    f.groups.set([makeGroup("workspace-one", "Workspace One", ["alpha"]), makeGroup("workspace-two", "Workspace Two", ["beta"])]);
+    const service = f.service();
+    const delegated = request(), onboarded = request(), all = request();
+    const first = service.delegate("workspace-one", delegated, actor);
+    service.revoke("workspace-one", request(), actor);
+    const covered = service.coverProject("beta", onboarded, actor);
+    const everything = service.delegateAll(all, actor);
+    service.revoke("workspace-one", request(), actor);
+    service.revoke("workspace-two", request(), actor);
+    f.groups.ownerRegroup([makeGroup("workspace-one", "Workspace One", ["alpha", "beta"])]);
+    const writesBefore = f.writes;
 
-    assert.throws(() => service.aroundOwnerRegroup(() => {
-      f.groups.set([makeGroup("workspace-one", "Workspace One", ["beta"]), makeGroup("workspace-two", "Workspace Two", ["alpha"])]);
-    }), /write failed/);
-    assert.throws(() => service.coverage("alpha"), /write failed/);
-
-    const restarted = new PermissionDelegationService(f.config, f.key, f.groups);
-    assert.deepEqual(restarted.coverage("alpha"), { covered: false, projectId: "alpha", reason: "not-covered" });
-    assert.equal(restarted.coverage("beta").covered, true);
+    assert.deepEqual(service.delegate("workspace-one", delegated, actor), first);
+    assert.deepEqual(service.coverProject("beta", onboarded, actor), covered);
+    assert.deepEqual(service.delegateAll(all, actor), everything);
+    assert.equal(f.writes, writesBefore);
+    for (const id of ["alpha", "beta"])
+      assert.deepEqual(service.coverage(id), { covered: false, projectId: id, reason: "not-covered" });
+    assert.equal(f.service().status()[0]!.state, "not-delegated");
   } finally { f.cleanup(); }
 });

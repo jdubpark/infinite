@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startHost, type Host } from "./helpers.js";
@@ -13,7 +13,7 @@ type View = { workspaceId: string; name: string; state: string; direction?: stri
 const viewOf = (views: View[], workspaceId: string) => views.find(view => view.workspaceId === workspaceId);
 const projectStates = (view: View | undefined) => view?.projects.map(project => project.state);
 
-test("owner delegation covers one workspace or all, drops coverage on regroup, and reports an inactive agent", { timeout: 120000 }, async () => {
+test("owner delegation covers one workspace or all, ends on an owner regroup also while unavailable, and reports an inactive agent", { timeout: 120000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "permissions-api-"));
   const repository = (name: string) => {
     const path = join(root, name);
@@ -50,6 +50,11 @@ test("owner delegation covers one workspace or all, drops coverage on regroup, a
       method: "POST", headers: { "Content-Type": "application/json", Cookie: cookie, Origin: host.origin }, body: JSON.stringify(oneWorkspace),
     });
     assert.equal(browser.status, 403, "an owner browser session without the CLI bearer cannot delegate");
+    const browserRevocation = await fetch(`${host.origin}/api/permissions/revocations`, {
+      method: "POST", headers: { "Content-Type": "application/json", Cookie: cookie, Origin: host.origin },
+      body: JSON.stringify({ requestId: randomUUID(), workspaceId: shopWorkspace }),
+    });
+    assert.equal(browserRevocation.status, 403, "an owner browser session without the CLI bearer cannot revoke");
 
     // One workspace: the other stays not-delegated, and a retry with the same request ID replays the same body.
     const first = await host.fetchApi("/permissions/delegations", "owner", oneWorkspace);
@@ -113,9 +118,21 @@ test("owner delegation covers one workspace or all, drops coverage on regroup, a
     assert.equal(settled.body.rates.lastDay.perHour, 0);
     assert.deepEqual((await host.fetchApi("/me", "owner")).body.permissions, { workspaceDelegation: 1 });
 
+    // Scoped figures: a workspace, a session and a task need an id, the host takes none, and the window is bounded.
+    const scoped = await host.fetchApi(`/permissions/rates?scope=workspace&id=${webWorkspace}&hours=24`, "controller");
+    assert.equal(scoped.status, 200, JSON.stringify(scoped.body));
+    assert.deepEqual([scoped.body.scope, scoped.body.id, scoped.body.hours, scoped.body.rates.decisions], ["workspace", webWorkspace, 24, 0]);
+    assert.equal((await host.fetchApi("/permissions/rates?scope=host", "owner")).body.hours, 1);
+    for (const query of ["scope=workspace", `scope=host&id=${webWorkspace}`, "scope=host&hours=169", "scope=team"])
+      assert.equal((await host.fetchApi(`/permissions/rates?${query}`, "owner")).status, 400, query);
+    assert.equal((await host.fetchApi("/permissions/rates?scope=host", "viewer")).status, 403);
+
     // A state file that will not open leaves delegation unavailable: its routes answer 503, and regrouping still works.
+    assert.equal((await host.fetchApi("/permissions/delegations", "owner", { requestId: randomUUID(), workspaceId: webWorkspace })).body.views[0].state, "delegated");
     await host.stopApi();
-    writeFileSync(join(host.config.stateDir, "permission-delegations", "state.sealed"), "not a sealed state\n", { mode: 0o600 });
+    const delegationFile = join(host.config.stateDir, "permission-delegations", "state.sealed");
+    const recorded = readFileSync(delegationFile);
+    writeFileSync(delegationFile, "not a sealed state\n", { mode: 0o600 });
     await host.start();
     const unavailable = { error: "Permission delegation is unavailable on this host." };
     assert.deepEqual(await host.fetchApi("/permissions/status", "owner").then(response => [response.status, response.body]), [503, unavailable]);
@@ -123,6 +140,15 @@ test("owner delegation covers one workspace or all, drops coverage on regroup, a
     assert.equal((await host.fetchApi("/permissions/revocations", "owner", revocation)).status, 503);
     const grouped = await host.fetchApi("/project-groups", "owner", { requestId: randomUUID(), name: "Catalog", repos: ["web-app"] });
     assert.equal(grouped.status, 200, JSON.stringify(grouped.body));
+
+    // The regrouping happened while delegation was unavailable. Once its state opens again, the moved project is not covered.
+    await host.stopApi();
+    writeFileSync(delegationFile, recorded, { mode: 0o600 });
+    await host.start();
+    const recovered = await host.fetchApi("/permissions/status", "owner");
+    assert.equal(recovered.status, 200, JSON.stringify(recovered.body));
+    assert.equal(viewOf(recovered.body.workspaces, grouped.body.id)?.state, "not-delegated");
+    assert.deepEqual(projectStates(viewOf(recovered.body.workspaces, grouped.body.id)), ["not-covered"]);
   } finally {
     if (host) await host.stop();
     rmSync(root, { recursive: true, force: true });

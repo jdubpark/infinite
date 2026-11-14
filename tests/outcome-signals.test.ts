@@ -8,21 +8,25 @@ import { configId } from "../packages/host/src/config-identity.js";
 import { configurationModule, configurationProjector } from "../packages/host/src/configuration-store.js";
 import { EventOutbox, type EventProjector, type OutboxEvent } from "../packages/host/src/evidence/outbox.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
-import { EvidenceError, type RunEvent } from "../packages/host/src/evidence/types.js";
-import { holdUntil } from "../packages/host/src/outcome-hold.js";
+import { EvidenceError, type EvidenceDb, type RunEvent } from "../packages/host/src/evidence/types.js";
+import type { Landing, LandingCandidate, RevertMatch } from "../packages/host/src/outcome-hold.js";
 import { outcomeProjector } from "../packages/host/src/outcome-projector.js";
 import {
   type OutcomeRow,
   outcomeModule,
   readOutcome,
+  readScanState,
   readSignal,
   readSummary,
   runOutcomes,
   runSignals,
+  type RunSummaryRow,
   type SignalRow,
-  writeSignal,
+  writeSummary,
 } from "../packages/host/src/outcome-store.js";
 import {
+  applyCheck,
+  applyScan,
   landingSignalId,
   ownerSignal,
   ownerSignalId,
@@ -30,22 +34,30 @@ import {
   ratingSignalId,
   recomputeRun,
   revertSignalId,
+  type ScanInputs,
+  type ScanWrite,
+  scanInputs,
   SignalRequestError,
 } from "../packages/host/src/outcome-signals.js";
-import type { LandingMethod } from "../packages/host/src/outcome-rules.js";
+import type { LandingMethod, ScanGap } from "../packages/host/src/outcome-rules.js";
 import { runEventKey } from "../packages/host/src/run-events.js";
 
 // The harness and the event builders below are copied from tests/outcome-projector.test.ts, which this file does not
-// import. The landing, verdict, and revert helpers stand in for the scan until Task 4b.
+// import. The landing, verdict, and revert helpers drive the real scan functions with fixed times.
 
 const RUN = "run-1";
 const RUN_B = "run-b";
 const RUN_2 = "run-2";
+const RUN_E = "run-e";
+const PROJECT = "example";
+const REPO = "example-repo";
 const BASE = "b".repeat(40);
 const HEAD = "h".repeat(40);
 const MERGE = "m".repeat(40);
 const REVERT = "f".repeat(40);
 const COMMIT_2 = "d".repeat(40);
+const TREE = "7".repeat(40);
+const SCAN_HEAD = "5".repeat(40);
 const HEX_A = "a".repeat(64);
 const HEX_B = "e".repeat(64);
 const DIFF = { added: 3, removed: 1, files: 1, docs: false, tests: true };
@@ -198,38 +210,47 @@ function standardRun(runId: string): OutboxEvent[] {
   ];
 }
 
-/** The run's landing, as the scan records it. Task 4b replaces this body with `applyScan`. */
-function land(h: Harness, runId: string, landedAt: string, method: LandingMethod = "merge-commit"): void {
-  h.store.write(tx => {
-    writeSignal(tx, {
-      signalId: landingSignalId(runId), runId, outcomeId: null, kind: "landing", author: "host", authority: "receipt",
-      state: "active", at: landedAt,
-      payload: { kind: "landing", commit: MERGE, method, scanSeq: 1, holdDays: 30, holdUntil: holdUntil(landedAt, 30) },
-    });
-    recomputeRun(tx, runId);
-  });
+/** The next `expectedSeq` of the project: the stored state's seq, or 0 before the first scan. */
+function nextSeq(tx: EvidenceDb): number {
+  return readScanState(tx, tx.index("project", PROJECT))?.seq ?? 0;
 }
 
-/** The window's verdict, as a later scan stores it. Task 4b replaces this body with `applyScan` or `applyCheck`. */
+/** One scan of the project. Each helper below calls it with the next seq, so the project's scans move forward. */
+function scanOf(h: Harness, fields: Partial<ScanWrite> & { at: string }): { applied: boolean; seq: number } {
+  return h.store.write(tx => applyScan(tx, {
+    projectId: PROJECT, repository: REPO, baseBranch: "main", head: SCAN_HEAD, commits: 1, gap: null,
+    expectedSeq: nextSeq(tx), landings: [], reverts: [], holdDays: 30, ...fields,
+  }));
+}
+
+/** The window check at `at`, at the state's seq and head. */
+function checkAt(h: Harness, at: string): { applied: boolean } {
+  return h.store.write(tx => applyCheck(tx, {
+    projectId: PROJECT, head: SCAN_HEAD, at, expectedSeq: nextSeq(tx),
+  }));
+}
+
+/** The run's landing, as the scan records it. Every helper below asserts that its scan applied. */
+function land(h: Harness, runId: string, landedAt: string, method: LandingMethod = "merge-commit", holdDays = 30): void {
+  const landing: Landing = { runId, commit: MERGE, method, position: 0 };
+  assert.equal(scanOf(h, { at: landedAt, landings: [landing], holdDays }).applied, true);
+}
+
+/**
+ * The window's verdict. `covered` is a check at `decidedAt`. `gap` is a scan inside the window (day 5) with a gap, then
+ * the check at `decidedAt`.
+ */
 function decide(h: Harness, runId: string, state: "covered" | "gap", decidedAt: string): void {
-  h.store.write(tx => {
-    const signal = readSignal(tx, landingSignalId(runId));
-    if (!signal || signal.payload.kind !== "landing") throw new Error("the run has no landing");
-    writeSignal(tx, { ...signal, payload: { ...signal.payload, window: { state, decidedAt } } });
-    recomputeRun(tx, runId);
-  });
+  const signal = h.store.read(db => readSignal(db, landingSignalId(runId)));
+  if (!signal || signal.payload.kind !== "landing") throw new Error("the run has no landing");
+  if (state === "gap") assert.equal(scanOf(h, { at: day(5), gap: "bound", commits: 0 }).applied, true);
+  assert.equal(checkAt(h, decidedAt).applied, true);
 }
 
-/** A revert of the run's landing, as a scan records it. Task 4b replaces this body with `applyScan`. */
+/** A revert of the run's landing, recorded by a scan at `revertedAt`. */
 function revert(h: Harness, runId: string, revertedAt: string): void {
-  h.store.write(tx => {
-    writeSignal(tx, {
-      signalId: revertSignalId(landingSignalId(runId), REVERT), runId, outcomeId: null, kind: "revert", author: "host",
-      authority: "receipt", state: "active", at: revertedAt,
-      payload: { kind: "revert", commit: REVERT, reverts: MERGE, landingSignalId: landingSignalId(runId), scanSeq: 2 },
-    });
-    recomputeRun(tx, runId);
-  });
+  const match: RevertMatch = { runId, signalId: landingSignalId(runId), commit: REVERT, reverts: MERGE };
+  assert.equal(scanOf(h, { at: revertedAt, reverts: [match] }).applied, true);
 }
 
 /** Every run event of the store, in `seq` order. */
@@ -317,21 +338,29 @@ test("a quiet window holds and a reverted one does not", () => {
   const h = harness();
   try {
     h.flush([...standardRun(RUN), ...standardRun(RUN_B), ...standardRun(RUN_2)]);
+    // Reordered for Task 4b: the three landings are scanned first, so the project's scans move forward in time. The
+    // draft landed RUN_2 after RUN_B's day 10 revert and day 31 check, which would have been a scan going back in time.
     land(h, RUN, day(0));
+    land(h, RUN_B, day(0));
+    land(h, RUN_2, day(0));
+    revert(h, RUN_B, day(10));
+    assert.equal(rowOf(h.store, RUN_B, "m1")?.held, 0);
+
     decide(h, RUN, "covered", day(30, 60_000));
     assert.equal(rowOf(h.store, RUN, "m1")?.held, 1);
 
-    land(h, RUN_B, day(0));
-    revert(h, RUN_B, day(10));
-    assert.equal(rowOf(h.store, RUN_B, "m1")?.held, 0);
+    // A revert recorded after the close is outside the window: the row held. The scan writes no revert signal.
+    revert(h, RUN_2, day(30, 120_000));
+    assert.equal(rowOf(h.store, RUN_2, "m1")?.held, 1);
+    assert.equal(signalsOf(h.store, RUN_2).some(signal => signal.kind === "revert"), false);
+
+    // The day 31 check leaves the reverted run at 0: its verdict is stored once, and the revert stands.
     decide(h, RUN_B, "covered", day(31));
     assert.equal(rowOf(h.store, RUN_B, "m1")?.held, 0);
 
-    // A revert recorded after the close is outside the window: the row held.
-    land(h, RUN_2, day(0));
-    decide(h, RUN_2, "covered", day(30, 60_000));
-    revert(h, RUN_2, day(30, 120_000));
-    assert.equal(rowOf(h.store, RUN_2, "m1")?.held, 1);
+    // A verdict is stored once: the later scan and check did not decide RUN's window again.
+    const first = h.store.read(db => readSignal(db, landingSignalId(RUN)));
+    assert.deepEqual(first?.payload.kind === "landing" ? first.payload.window : undefined, { state: "covered", decidedAt: day(30, 60_000) });
   } finally {
     h.close();
   }
@@ -583,6 +612,129 @@ test("a rating is a signal", () => {
     replay(h);
     assert.equal(signalsOf(h.store, RUN).filter(signal => signal.kind === "rating").length, 1);
     assert.deepEqual(levelsOf(rowOf(h.store, RUN, "m1")), before);
+  } finally {
+    h.close();
+  }
+});
+
+/** Every stored row of the scan and signal tables, as raw values. */
+function rawRows(h: Harness): { table: string; values: unknown[] }[] {
+  const tables = ["outcomes", "run_summaries", "outcome_signals", "base_scans", "base_scan_state"];
+  return h.store.read(db => tables.map(table => ({
+    table,
+    values: db.all<Record<string, unknown>>(`SELECT * FROM ${table}`).flatMap(row => Object.values(row)),
+  })));
+}
+
+test("a scan applies once and a run lands once", () => {
+  const h = harness();
+  try {
+    h.flush(standardRun(RUN));
+    const landing: Landing = { runId: RUN, commit: MERGE, method: "merge-commit", position: 0 };
+
+    // A stale expectedSeq writes nothing: no scan row, no signal.
+    const stale = h.store.write(tx => applyScan(tx, {
+      projectId: PROJECT, repository: REPO, baseBranch: "main", head: SCAN_HEAD, at: day(0), commits: 1, gap: null,
+      expectedSeq: 5, landings: [landing], reverts: [], holdDays: 30,
+    }));
+    assert.deepEqual(stale, { applied: false, seq: 0 });
+    assert.equal(h.store.read(db => db.all("SELECT * FROM base_scans")).length, 0);
+    assert.equal(signalsOf(h.store, RUN).length, 0);
+
+    land(h, RUN, day(0));
+    assert.equal(h.store.read(db => readScanState(db, db.index("project", PROJECT)))?.seq, 1);
+
+    // A second landing of the same run in a later scan does not replace the first.
+    const second = scanOf(h, { at: day(1), landings: [{ runId: RUN, commit: COMMIT_2, method: "tree-equal", position: 0 }] });
+    assert.deepEqual(second, { applied: true, seq: 2 });
+    const landed = h.store.read(db => readSignal(db, landingSignalId(RUN)));
+    assert.equal(landed?.payload.kind === "landing" ? landed.payload.commit : undefined, MERGE);
+    assert.equal(signalsOf(h.store, RUN).filter(signal => signal.kind === "landing").length, 1);
+  } finally {
+    h.close();
+  }
+});
+
+test("no plain column holds a commit id or an issue key", () => {
+  const h = harness();
+  try {
+    h.flush(standardRun(RUN));
+    land(h, RUN, day(0));
+    revert(h, RUN, day(10));
+    ownerSignal(h.store, { action: "record", kind: "linked-fix", requestId: "fix-1", runId: RUN, issue: "ABC-12", commit: MERGE }, at(20));
+    ownerSignal(h.store, { action: "record", kind: "exclusion", requestId: "excl-1", runId: RUN, memberId: "m1", reason: "trial" }, at(21));
+
+    const needles = [MERGE, REVERT, BASE, HEAD, COMMIT_2, "c".repeat(40), TREE, SCAN_HEAD, "ABC-12", "trial"];
+    const found: string[] = [];
+    for (const { table, values } of rawRows(h)) {
+      for (const value of values) {
+        for (const needle of needles) {
+          if (typeof value === "string" && value.includes(needle)) found.push(`${table}:${needle.slice(0, 6)}`);
+          if (value instanceof Uint8Array && Buffer.from(value).includes(Buffer.from(needle))) {
+            found.push(`${table}:${needle.slice(0, 6)}:bytes`);
+          }
+        }
+      }
+    }
+    assert.deepEqual(found, []);
+  } finally {
+    h.close();
+  }
+});
+
+test("scan inputs list candidates and open landings", () => {
+  const h = harness();
+  try {
+    h.flush(standardRun(RUN));
+    land(h, RUN, day(0));
+    h.flush(standardRun(RUN_E));
+    land(h, RUN_E, day(0), "merge-commit", 0);
+
+    // The commit ids of the candidates must be lower-case hex, so these differ from the non-hex constants above.
+    const candHead = "1".repeat(40);
+    const candMerge = "2".repeat(40);
+    // Summaries of runs with no outcome rows. A candidate's approval must fall within the last APPROVAL_DAYS of `at`.
+    const summary = (runId: string, approvedAt: string, mergeCommit: string | undefined): RunSummaryRow => ({
+      runId, source: "test", projectRef: "", revision: 1, status: "approved", blockCode: null, flags: [], createdAt: null,
+      settledAt: null, approvedAt, runDeletedAt: null,
+      payload: {
+        projectId: PROJECT, attempts: {}, rounds: { total: 0, attributed: 0, unattributed: 0, unknown: 0 },
+        reviewedHead: candHead, reviewedTree: TREE, ...(mergeCommit === undefined ? {} : { mergeCommit }),
+      },
+    });
+    h.store.write(tx => {
+      writeSummary(tx, summary("cand-a", day(-9), candMerge));
+      writeSummary(tx, summary("cand-old", day(-90), candMerge));
+      // An uppercase merge commit is not a commit id, so the candidate keeps no mergeCommit.
+      writeSummary(tx, summary("cand-odd", day(-9), "A".repeat(40)));
+    });
+
+    const at1 = day(1);
+    const inputs: ScanInputs = h.store.read(db => scanInputs(db, PROJECT, at1));
+    assert.deepEqual(inputs.state, { seq: 2, head: SCAN_HEAD, repository: REPO, baseBranch: "main", lastAt: day(0) });
+    assert.deepEqual(inputs.candidates, [
+      { runId: "cand-a", reviewedHead: candHead, reviewedTree: TREE, mergeCommit: candMerge },
+      { runId: "cand-odd", reviewedHead: candHead, reviewedTree: TREE },
+    ] satisfies LandingCandidate[]);
+    // RUN has an active landing, so it is not a candidate though its approval is in range.
+    assert.equal(inputs.candidates.some(candidate => candidate.runId === RUN), false);
+
+    // RUN's hold runs to day 30, so it is open. RUN_E's hold ended at day 0, before `at`.
+    assert.deepEqual(inputs.open, [{ runId: RUN, signalId: landingSignalId(RUN), ids: [MERGE], holdUntil: day(30) }]);
+  } finally {
+    h.close();
+  }
+});
+
+test("a window of the longest hold is decided", () => {
+  const h = harness();
+  try {
+    h.flush(standardRun(RUN));
+    land(h, RUN, day(0), "merge-commit", 365);
+    decide(h, RUN, "covered", day(365, 60_000));
+    const landed = h.store.read(db => readSignal(db, landingSignalId(RUN)));
+    assert.equal(landed?.payload.kind === "landing" ? landed.payload.window?.state : undefined, "covered");
+    assert.equal(rowOf(h.store, RUN, "m1")?.held, 1);
   } finally {
     h.close();
   }

@@ -35,11 +35,14 @@ import {
   ratingSignalId,
   recomputeRun,
   revertSignalId,
+  saveOutcomeRow,
   type ScanInputs,
   type ScanWrite,
   scanInputs,
   SignalRequestError,
 } from "../packages/host/src/outcome-signals.js";
+import { importLegacy } from "../packages/host/src/outcome-import.js";
+import { legacyOutcomeId } from "../packages/host/src/outcome-legacy.js";
 import type { LandingMethod, ScanGap } from "../packages/host/src/outcome-rules.js";
 import { runEventKey } from "../packages/host/src/run-events.js";
 
@@ -913,6 +916,39 @@ test("an unreadable row makes an owner claim unavailable", () => {
       error => error instanceof EvidenceError && error.code === "unavailable",
     );
     assert.equal(h.store.read(db => db.get("SELECT COUNT(*) AS n FROM outcome_signals"))?.n, 0);
+  } finally {
+    h.close();
+  }
+});
+
+test("a legacy row is never recomputed", () => {
+  const h = harness();
+  try {
+    importLegacy(h.store, {
+      dryRun: false,
+      lines: [{
+        id: "op-legacy-1",
+        projectId: PROJECT,
+        profile: { provider: "claude", model: "claude-x" },
+        result: "accepted",
+        attempts: 1,
+        recordedAt: "2026-11-01T00:00:00.000Z",
+      }],
+    }, { now: at(59) });
+    const runId = legacyOutcomeId(h.store.read(db => db.index("legacy", "op-legacy-1")));
+    const rowsOf = () => h.store.read(db => db.all("SELECT * FROM outcomes WHERE outcome_id=?", runId));
+    const before = rowsOf();
+    assert.equal(before.length, 1);
+
+    assert.throws(
+      () => h.store.write(tx => saveOutcomeRow(tx, readOutcome(tx, runId)!)),
+      (error: unknown) => error instanceof Error && error.message === "A legacy row keeps the levels of its import.",
+    );
+    assert.throws(
+      () => h.store.write(tx => recomputeRun(tx, runId)),
+      (error: unknown) => error instanceof Error && error.message === "A legacy row keeps the levels of its import.",
+    );
+    assert.deepEqual(rowsOf(), before);
   } finally {
     h.close();
   }

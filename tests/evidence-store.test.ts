@@ -6,7 +6,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, s
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { blindIndex, canonicalJson, openRow, sealRow } from "../packages/host/src/evidence/crypto.js";
+import { type EvidenceIndexClass, blindIndex, canonicalJson, openRow, sealRow } from "../packages/host/src/evidence/crypto.js";
 import { EvidenceStore, evidenceDatabasePath, transactionOpen } from "../packages/host/src/evidence/store.js";
 import { EvidenceError, type EvidenceModule } from "../packages/host/src/evidence/types.js";
 
@@ -154,6 +154,10 @@ test("blind indexes separate classes", () => {
   assert.notEqual(blindIndex(key, "task", "a"), blindIndex(key, "project", "a"));
   assert.equal(blindIndex(key, "task", "a"), blindIndex(key, "task", "a"));
   assert.match(blindIndex(key, "task", "a"), /^[0-9a-f]{64}$/);
+  // A goal, a mission, and a legacy line id each have a class of their own, so equal values never share an index.
+  const classes = ["project", "task", "area", "goal", "mission", "legacy"] as const;
+  assert.equal(new Set(classes.map(cls => blindIndex(key, cls, "a"))).size, classes.length);
+  assert.throws(() => blindIndex(key, "run" as EvidenceIndexClass, "a"), TypeError);
 });
 
 test("a module migrates once and records its version", () => {

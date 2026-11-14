@@ -4,9 +4,9 @@ export const EVIDENCE_KEY_VERSION = 1;
 
 export type EvidenceKeyPurpose = "row-encryption" | "blind-index" | "event-key";
 
-export type EvidenceIndexClass = "project" | "task" | "area";
+export type EvidenceIndexClass = "project" | "task" | "area" | "goal" | "mission" | "legacy";
 
-const INDEX_CLASSES: ReadonlySet<string> = new Set<EvidenceIndexClass>(["project", "task", "area"]);
+const INDEX_CLASSES: ReadonlySet<string> = new Set<EvidenceIndexClass>(["project", "task", "area", "goal", "mission", "legacy"]);
 const TABLE_NAME = /^[a-z][a-z0-9_]{0,63}$/;
 const NONCE_BYTES = 12;
 const TAG_BYTES = 16;

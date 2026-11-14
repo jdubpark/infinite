@@ -1,5 +1,5 @@
 import type { EvidenceStore } from "./evidence/store.js";
-import type { EvidenceDb, EvidenceModule, EvidenceTx } from "./evidence/types.js";
+import { EvidenceError, type EvidenceDb, type EvidenceModule, type EvidenceTx } from "./evidence/types.js";
 import type {
   Coverage,
   Disposition,
@@ -26,8 +26,13 @@ const OUTCOME_SIGNALS = "outcome_signals";
 const BASE_SCANS = "base_scans";
 const BASE_SCAN_STATE = "base_scan_state";
 const BACKFILL_RUNS = "backfill_runs";
+const LEGACY_LINES = "legacy_lines";
 const DAY_MS = 86_400_000;
 const DEFAULT_SWEEP_LIMIT = 100;
+/** The goal and mission ref of a payload that does not open. It cannot equal an index, which is 64 hex characters. */
+export const UNREADABLE_REF = "unreadable";
+/** Keys per `IN (...)` statement, so no read exceeds the parameter limit. */
+const IN_CHUNK = 500;
 const LAST_SEQ = "last_seq";
 /** The four tables with a `run_deleted_at` column. The deletion stamp and the retention sweep both use them. */
 const RUN_TABLES = [OUTCOMES, OUTCOME_ROUNDS, RUN_SUMMARIES, MEMBER_RESULTS] as const;
@@ -59,6 +64,8 @@ export type OutcomePayload = {
   rubric?: { version: 1; correctness: number; cleanliness: number; extensibility: number; docs: number; reviewerProfileId: string };
   ownerRating?: { score: number; at: string };
   landing?: { at: string; method: LandingMethod };
+  /** Set only on a row of source `legacy`: what the operator's line said. */
+  legacy?: LegacyPayload;
   diff?: TeamTask["diffStat"];
   wallMs?: number;
   limitEvents: number;
@@ -129,6 +136,20 @@ export type OutcomeRow = {
   runDeletedAt: string | null;
   payload: OutcomePayload;
 };
+
+/** The operator's own facts of one imported line (spec part 8). All of it is operator text or claims, so it is sealed. */
+export type LegacyPayload = {
+  id: string;
+  label?: string;
+  result: "accepted" | "rejected" | "excluded";
+  attempts: number;
+  totalTokens?: number;
+  reviewerModel?: string;
+  supersedes?: string;
+};
+
+/** One legacy id's state. `state` and `recordedAt` are plain columns; `lineHash` is sealed. */
+export type LegacyLineState = { state: "imported" | "superseded"; lineHash: string | null; recordedAt: string };
 
 export type SignalKind = "rating" | "landing" | "revert" | "linked-fix" | "exclusion";
 export type ExclusionReason = "outside-cause" | "invalid-task" | "trial" | "other";
@@ -222,16 +243,30 @@ export type MemberResultRow = {
   payload: MemberResultPayload;
 };
 
+/**
+ * What the ledger holds for the runs of one goal or one mission. `unreadable` counts the records of those runs whose
+ * payload did not open; they are left out. `unindexed` counts rows and summaries, store-wide, that the version 3
+ * migration could not open and so could not index by goal or mission.
+ */
+export type RollupRecords = {
+  runIds: string[];
+  summaries: RunSummaryRow[];
+  rows: OutcomeRow[];
+  members: MemberResultRow[];
+  unreadable: { summaries: number; rows: number; members: number };
+  unindexed: number;
+};
+
 const OUTCOME_COLUMNS = [
   "outcome_id", "source", "project_ref", "task_ref", "run_id", "revision", "member_id", "session_id",
   "attempt_index", "inherited", "role", "profile_id", "provider", "model", "effort", "profile_epoch", "config_id",
   "experiment_ref", "area_ref", "kind", "risk", "feature_version", "disposition", "exclusion", "flags",
   "integrated", "accepted", "acceptance", "first_pass", "held", "started_at", "ended_at", "frozen_at", "hold_until",
-  "run_deleted_at", "payload",
+  "run_deleted_at", "payload", "goal_ref", "mission_ref",
 ] as const;
 const SUMMARY_COLUMNS = [
   "run_id", "source", "project_ref", "revision", "status", "block_code", "flags", "created_at", "settled_at",
-  "approved_at", "run_deleted_at", "payload",
+  "approved_at", "run_deleted_at", "payload", "goal_ref", "mission_ref",
 ] as const;
 const MEMBER_COLUMNS = [
   "result_id", "source", "project_ref", "run_id", "revision", "member_id", "session_id", "role", "profile_id",
@@ -281,6 +316,8 @@ type OutcomeSql = {
   hold_until: string | null;
   run_deleted_at: string | null;
   payload: string;
+  goal_ref: string | null;
+  mission_ref: string | null;
 };
 
 type SummarySql = {
@@ -296,6 +333,8 @@ type SummarySql = {
   approved_at: string | null;
   run_deleted_at: string | null;
   payload: string;
+  goal_ref: string | null;
+  mission_ref: string | null;
 };
 
 type MemberSql = {
@@ -330,11 +369,12 @@ export function outcomeModule(options?: { now?: () => string }): EvidenceModule 
   const now = options?.now ?? (() => new Date().toISOString());
   return {
     name: OUTCOMES_MODULE,
-    version: 2,
+    version: 3,
     readVersion: 2,
     migrate(tx, from) {
       if (from < 1) migrateVersion1(tx);
       if (from < 2) migrateVersion2(tx);
+      if (from < 3) migrateVersion3(tx);
     },
     deleteRun(tx, runId) {
       const stamp = now();
@@ -367,7 +407,7 @@ export function outcomeModule(options?: { now?: () => string }): EvidenceModule 
     counts(db) {
       const count = (sql: string) => db.get<{ n: number }>(sql)?.n ?? 0;
       return {
-        outcomes: count("SELECT count(*) AS n FROM outcomes"),
+        outcomes: count("SELECT count(*) AS n FROM outcomes WHERE source<>'legacy'"),
         open: count("SELECT count(*) AS n FROM outcomes WHERE disposition='open'"),
         gap: count("SELECT count(*) AS n FROM outcomes WHERE (','||flags||',') LIKE '%,gap,%'"),
         backfilled: count("SELECT count(*) AS n FROM outcomes WHERE (','||flags||',') LIKE '%,backfilled,%'"),
@@ -375,6 +415,8 @@ export function outcomeModule(options?: { now?: () => string }): EvidenceModule 
         memberResults: count("SELECT count(*) AS n FROM member_results"),
         signals: count("SELECT count(*) AS n FROM outcome_signals"),
         scans: count("SELECT count(*) AS n FROM base_scans"),
+        legacy: count("SELECT count(*) AS n FROM outcomes WHERE source='legacy'"),
+        legacyLines: count("SELECT count(*) AS n FROM legacy_lines"),
       };
     },
   };
@@ -449,6 +491,55 @@ function migrateVersion2(tx: EvidenceTx): void {
   tx.exec("CREATE INDEX IF NOT EXISTS outcome_signals_by_kind ON outcome_signals (kind, at)");
 }
 
+/**
+ * Version 3 adds the goal and mission refs, the legacy lines, and the indexes the roll-ups read. The refs are filled
+ * once from each stored payload. A payload that does not open gets `UNREADABLE_REF`, so the migration never fails on it.
+ */
+function migrateVersion3(tx: EvidenceTx): void {
+  tx.exec("ALTER TABLE outcomes ADD COLUMN goal_ref TEXT");
+  tx.exec("ALTER TABLE outcomes ADD COLUMN mission_ref TEXT");
+  tx.exec("ALTER TABLE run_summaries ADD COLUMN goal_ref TEXT");
+  tx.exec("ALTER TABLE run_summaries ADD COLUMN mission_ref TEXT");
+  tx.exec(
+    "CREATE TABLE IF NOT EXISTS legacy_lines (line_ref TEXT PRIMARY KEY, state TEXT NOT NULL, "
+    + "recorded_at TEXT NOT NULL, payload TEXT NOT NULL)",
+  );
+  tx.exec("CREATE INDEX IF NOT EXISTS outcomes_by_goal ON outcomes (goal_ref)");
+  tx.exec("CREATE INDEX IF NOT EXISTS outcomes_by_mission ON outcomes (mission_ref)");
+  tx.exec("CREATE INDEX IF NOT EXISTS run_summaries_by_goal ON run_summaries (goal_ref)");
+  tx.exec("CREATE INDEX IF NOT EXISTS run_summaries_by_mission ON run_summaries (mission_ref)");
+  tx.exec("CREATE INDEX IF NOT EXISTS legacy_lines_by_recorded ON legacy_lines (recorded_at)");
+  for (const row of tx.all<{ outcome_id: string; payload: string }>("SELECT outcome_id, payload FROM outcomes")) {
+    const refs = migrationRefs(tx, OUTCOMES, row.outcome_id, row.payload);
+    tx.run("UPDATE outcomes SET goal_ref=?, mission_ref=? WHERE outcome_id=?", refs.goalRef, refs.missionRef, row.outcome_id);
+  }
+  for (const row of tx.all<{ run_id: string; payload: string }>("SELECT run_id, payload FROM run_summaries")) {
+    const refs = migrationRefs(tx, RUN_SUMMARIES, row.run_id, row.payload);
+    tx.run("UPDATE run_summaries SET goal_ref=?, mission_ref=? WHERE run_id=?", refs.goalRef, refs.missionRef, row.run_id);
+  }
+}
+
+/** The refs of one stored payload. Both are `UNREADABLE_REF` when the payload does not open or does not read. */
+function migrationRefs(tx: EvidenceTx, table: string, rowId: string, sealed: string): GoalMissionRefs {
+  try {
+    return refsOf(tx, tx.open<GoalMissionPayload>(table, rowId, sealed));
+  } catch {
+    return { goalRef: UNREADABLE_REF, missionRef: UNREADABLE_REF };
+  }
+}
+
+/** The goal and mission refs a payload carries. Each is null when the payload has no such id. */
+type GoalMissionPayload = { goal?: { id: string }; missionId?: string };
+type GoalMissionRefs = { goalRef: string | null; missionRef: string | null };
+
+/** Derived on every write from the sealed ids, so a caller's value is never stored. */
+function refsOf(db: EvidenceDb, payload: GoalMissionPayload): GoalMissionRefs {
+  return {
+    goalRef: payload.goal === undefined ? null : db.index("goal", payload.goal.id),
+    missionRef: payload.missionId === undefined ? null : db.index("mission", payload.missionId),
+  };
+}
+
 export function readOutcome(db: EvidenceDb, outcomeId: string): OutcomeRow | undefined {
   const row = db.get<OutcomeSql>("SELECT * FROM outcomes WHERE outcome_id=?", outcomeId);
   return row === undefined ? undefined : toOutcome(db, row);
@@ -494,6 +585,7 @@ export function selectOutcomes(db: EvidenceDb, filter: OutcomeFilter): { rows: O
 /** Writes the whole row. The three blind-index fields are derived from `payload`, never taken from the caller. */
 export function writeOutcome(tx: EvidenceTx, row: OutcomeRow): void {
   const payload = row.payload;
+  const refs = refsOf(tx, payload);
   tx.run(
     OUTCOME_UPSERT,
     row.outcomeId,
@@ -532,12 +624,17 @@ export function writeOutcome(tx: EvidenceTx, row: OutcomeRow): void {
     row.holdUntil,
     row.runDeletedAt,
     tx.seal(OUTCOMES, row.outcomeId, payload),
+    refs.goalRef,
+    refs.missionRef,
   );
 }
 
 export function readSummary(db: EvidenceDb, runId: string): RunSummaryRow | undefined {
   const row = db.get<SummarySql>("SELECT * FROM run_summaries WHERE run_id=?", runId);
-  if (row === undefined) return undefined;
+  return row === undefined ? undefined : toSummary(db, row);
+}
+
+function toSummary(db: EvidenceDb, row: SummarySql): RunSummaryRow {
   return {
     runId: row.run_id,
     source: row.source,
@@ -554,7 +651,9 @@ export function readSummary(db: EvidenceDb, runId: string): RunSummaryRow | unde
   };
 }
 
+/** Writes the whole summary. The project and the goal and mission refs are derived from `payload`. */
 export function writeSummary(tx: EvidenceTx, row: RunSummaryRow): void {
+  const refs = refsOf(tx, row.payload);
   tx.run(
     SUMMARY_UPSERT,
     row.runId,
@@ -569,6 +668,8 @@ export function writeSummary(tx: EvidenceTx, row: RunSummaryRow): void {
     row.approvedAt,
     row.runDeletedAt,
     tx.seal(RUN_SUMMARIES, row.runId, row.payload),
+    refs.goalRef,
+    refs.missionRef,
   );
 }
 
@@ -628,6 +729,7 @@ export function runOutcomeView(
 /**
  * Removes the rows of runs whose rows were stamped more than `retentionDays` (730 by default) before `now`, at most
  * `limit` runs per call. A removed run also loses its signals; base scans stay. A run with any unstamped row is kept.
+ * Legacy lines recorded at or before the cutoff go too, at most `limit` per call.
  * Never throws: it returns 0 when the store cannot take the write. It returns 0 at once, with no statement and no log
  * line, unless the `outcomes` module is ready.
  */
@@ -658,6 +760,12 @@ export function sweepExpiredOutcomes(
           tx.run(`DELETE FROM ${table} WHERE run_id=?`, runId);
         }
       }
+      tx.run(
+        "DELETE FROM legacy_lines WHERE line_ref IN "
+        + "(SELECT line_ref FROM legacy_lines WHERE recorded_at<=? ORDER BY line_ref LIMIT ?)",
+        cutoff,
+        max,
+      );
       return runIds.length;
     });
     if (removed > 0) console.log(`Outcome retention removed ${removed} run(s).`);
@@ -666,6 +774,125 @@ export function sweepExpiredOutcomes(
     console.warn("Outcome retention sweep failed.");
     return 0;
   }
+}
+
+/**
+ * What the ledger holds for the runs of one goal or mission. A run belongs when its summary or one of its rows carries
+ * the ref. Every row and member result of such a run is read. This tolerant read is for display only.
+ */
+export function rollupRecords(db: EvidenceDb, by: "goal" | "mission", ref: string): RollupRecords {
+  const column = by === "goal" ? "goal_ref" : "mission_ref";
+  const runIds = db.all<{ run_id: string }>(
+    `SELECT run_id FROM run_summaries WHERE ${column}=? UNION SELECT run_id FROM outcomes WHERE ${column}=? ORDER BY run_id`,
+    ref,
+    ref,
+  ).map(row => row.run_id);
+  const records: RollupRecords = {
+    runIds,
+    summaries: [],
+    rows: [],
+    members: [],
+    unreadable: { summaries: 0, rows: 0, members: 0 },
+    unindexed: 0,
+  };
+  for (const keys of chunks(runIds)) {
+    const marks = placeholders(keys.length);
+    for (const row of db.all<SummarySql>(`SELECT * FROM run_summaries WHERE run_id IN (${marks})`, ...keys)) {
+      try {
+        records.summaries.push(toSummary(db, row));
+      } catch {
+        records.unreadable.summaries += 1;
+      }
+    }
+    for (const row of db.all<OutcomeSql>(`SELECT * FROM outcomes WHERE run_id IN (${marks})`, ...keys)) {
+      try {
+        records.rows.push(toOutcome(db, row));
+      } catch {
+        records.unreadable.rows += 1;
+      }
+    }
+    for (const row of db.all<MemberSql>(`SELECT * FROM member_results WHERE run_id IN (${marks})`, ...keys)) {
+      try {
+        records.members.push(toMember(db, row));
+      } catch {
+        records.unreadable.members += 1;
+      }
+    }
+  }
+  records.summaries.sort((a, b) => compareKeys(a.runId, b.runId));
+  records.rows.sort((a, b) => compareKeys(a.outcomeId, b.outcomeId));
+  records.members.sort((a, b) => compareKeys(a.resultId, b.resultId));
+  records.unindexed = db.get<{ n: number }>(
+    "SELECT (SELECT count(*) FROM outcomes WHERE goal_ref=?) + (SELECT count(*) FROM run_summaries WHERE goal_ref=?) AS n",
+    UNREADABLE_REF,
+    UNREADABLE_REF,
+  )?.n ?? 0;
+  return records;
+}
+
+/**
+ * The stored state of the named legacy lines, by line ref. A ref that no line holds is absent. This strict read is for
+ * the write path: a stored line that does not open throws `EvidenceError` `unavailable`.
+ */
+export function readLegacyLines(db: EvidenceDb, refs: readonly string[]): Map<string, LegacyLineState> {
+  const lines = new Map<string, LegacyLineState>();
+  for (const keys of chunks(refs)) {
+    const rows = db.all<LegacyLineSql>(`SELECT * FROM legacy_lines WHERE line_ref IN (${placeholders(keys.length)})`, ...keys);
+    for (const row of rows) {
+      let sealed: { lineHash: string | null };
+      try {
+        sealed = db.open<{ lineHash: string | null }>(LEGACY_LINES, row.line_ref, row.payload);
+      } catch {
+        throw new EvidenceError("unavailable", "A stored legacy line does not open.");
+      }
+      lines.set(row.line_ref, { state: row.state, lineHash: sealed.lineHash, recordedAt: row.recorded_at });
+    }
+  }
+  return lines;
+}
+
+/** Writes the whole legacy line. The line hash is sealed under the ref. */
+export function writeLegacyLine(tx: EvidenceTx, ref: string, state: LegacyLineState): void {
+  tx.run(LEGACY_LINE_UPSERT, ref, state.state, state.recordedAt, tx.seal(LEGACY_LINES, ref, { lineHash: state.lineHash }));
+}
+
+export function legacyLineCount(db: EvidenceDb): number {
+  return db.get<{ n: number }>("SELECT count(*) AS n FROM legacy_lines")?.n ?? 0;
+}
+
+/** The source of each named row, by outcome id. It opens no payload. An id that no row holds is absent. */
+export function outcomeSources(db: EvidenceDb, outcomeIds: readonly string[]): Map<string, string> {
+  const sources = new Map<string, string>();
+  for (const keys of chunks(outcomeIds)) {
+    const rows = db.all<{ outcome_id: string; source: string }>(
+      `SELECT outcome_id, source FROM outcomes WHERE outcome_id IN (${placeholders(keys.length)})`,
+      ...keys,
+    );
+    for (const row of rows) sources.set(row.outcome_id, row.source);
+  }
+  return sources;
+}
+
+/** Removes the row only when its source is `legacy`. Returns whether it removed one. */
+export function deleteLegacyOutcome(tx: EvidenceTx, outcomeId: string): boolean {
+  return tx.run("DELETE FROM outcomes WHERE outcome_id=? AND source='legacy'", outcomeId).changes > 0;
+}
+
+/** The raw columns of `legacy_lines`. The payload is sealed. */
+type LegacyLineSql = { line_ref: string; state: LegacyLineState["state"]; recorded_at: string; payload: string };
+
+function chunks<T>(items: readonly T[]): T[][] {
+  const out: T[][] = [];
+  for (let start = 0; start < items.length; start += IN_CHUNK) out.push(items.slice(start, start + IN_CHUNK));
+  return out;
+}
+
+function placeholders(count: number): string {
+  return Array.from({ length: count }, () => "?").join(", ");
+}
+
+function compareKeys(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 function toOutcome(db: EvidenceDb, row: OutcomeSql): OutcomeRow {
@@ -760,6 +987,7 @@ function upsertSql(table: string, key: string, columns: readonly string[]): stri
   return `INSERT INTO ${table} (${columns.join(", ")}) VALUES (${values}) ON CONFLICT(${key}) DO UPDATE SET ${updates}`;
 }
 
+const LEGACY_LINE_UPSERT = upsertSql(LEGACY_LINES, "line_ref", ["line_ref", "state", "recorded_at", "payload"]);
 const SIGNAL_UPSERT = upsertSql(OUTCOME_SIGNALS, "signal_id", [
   "signal_id", "run_id", "outcome_id", "kind", "author", "authority", "state", "at", "payload",
 ]);
@@ -981,3 +1209,4 @@ function toScanPoint(row: ScanSql): ScanPoint {
 function scanRowId(projectRef: string, seq: number): string {
   return `${projectRef}:${seq}`;
 }
+

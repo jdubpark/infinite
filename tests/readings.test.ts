@@ -382,11 +382,18 @@ test("requestRoute returns the chosen route with its confidence and sends only t
 test("requestRoute is undefined without jev, on a transport error, and on an unknown choice", async () => {
   const failing = { systemOne: async () => { throw new Error("down"); } } as unknown as JevTransport;
   const odd = { systemOne: async () => ({ model: "m", answers: { route: { type: "choice", choice: "other", confidence: 0.9, probabilities: {} } } }) } as unknown as JevTransport;
-  const a = setup({ transport: failing }), b = setup({ transport: odd }), c = setup({ transport: failing });
+  let calls = 0;
+  const working = { systemOne: async () => { calls++; return { model: "m", answers: { route: { type: "choice", choice: "work", confidence: 0.9, probabilities: {} } } }; } } as unknown as JevTransport;
+  const a = setup({ transport: failing }), b = setup({ transport: odd }), c = setup({ transport: working });
   try {
     assert.equal(await a.readings.requestRoute("what is this?"), undefined);
     assert.equal(await b.readings.requestRoute("what is this?"), undefined);
     delete (c.config as any).jev;
+    let asks = 0;
+    const ask = (c.readings as any).ask.bind(c.readings);
+    (c.readings as any).ask = (...args: unknown[]) => { asks++; return ask(...args); };
     assert.equal(await c.readings.requestRoute("what is this?"), undefined);
+    assert.equal(calls, 0);
+    assert.equal(asks, 0, "the reading service is never asked");
   } finally { a.dispose(); b.dispose(); c.dispose(); }
 });

@@ -156,8 +156,13 @@ test("reverts follow their landing", () => {
   // A landing commit that is not in the list leaves the order unknown, and nothing is matched.
   const absent: LandedRun = { ...reread, commit: "gone", ids: ["gone", "head"] };
   assert.deepEqual(matchReverts(commits, [absent], named, "2026-12-01T00:00:00.000Z", true), []);
-  // A scan of new commits lists only commits after an earlier landing, so both count there.
-  assert.deepEqual(matchReverts(commits, [reread], named, "2026-12-01T00:00:00.000Z").map((m) => m.commit), ["c1", "c3"]);
+  // The list holds the landing commit, so the same holds in a scan of new commits: a rewind and a push of the old
+  // history can put commits from before the landing into such a scan.
+  assert.deepEqual(matchReverts(commits, [reread], named, "2026-12-01T00:00:00.000Z").map((m) => m.commit), ["c3"]);
+  // A landing with a rewrite or source scan since its own scan: without the landing commit in the list, the stored head
+  // may not descend from it, and nothing is matched. With no such scan, the commits of a scan of new commits follow it.
+  assert.deepEqual(matchReverts(commits, [{ ...absent, unsure: true }], named, "2026-12-01T00:00:00.000Z"), []);
+  assert.deepEqual(matchReverts(commits, [absent], named, "2026-12-01T00:00:00.000Z").map((m) => m.commit), ["c1", "c3"]);
   // A run that landed in this scan keeps its own position in both kinds of scan.
   assert.deepEqual(matchReverts(commits, [{ ...reread, position: 2 }], named, "2026-12-01T00:00:00.000Z", true).map((m) => m.commit), ["c3"]);
 });

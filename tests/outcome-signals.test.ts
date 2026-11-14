@@ -740,6 +740,29 @@ test("scan inputs list candidates and open landings", () => {
   }
 });
 
+test("an open landing is unsure after a scan that reread or replaced the history", () => {
+  const h = harness();
+  try {
+    h.flush(standardRun(RUN));
+    land(h, RUN, day(0));
+    const open = (when: string) => h.store.read(db => scanInputs(db, PROJECT, when)).open.map(run => run.unsure === true);
+    assert.deepEqual(open(day(1)), [false]);
+    // A jump past the bound moves the stored head forward only: the head still descends from the landing commit.
+    gapScan(h, day(2));
+    assert.deepEqual(open(day(3)), [false]);
+    assert.equal(scanOf(h, { at: day(4), gap: "rewrite", commits: 0 }).applied, true);
+    assert.deepEqual(open(day(5)), [true]);
+
+    // A run that lands in the rewrite scan or after it is sure again: no such scan followed its own.
+    h.flush(standardRun(RUN_B));
+    land(h, RUN_B, day(6));
+    const runs = h.store.read(db => scanInputs(db, PROJECT, day(7))).open.map(run => [run.runId, run.unsure === true]);
+    assert.deepEqual(runs.sort(), [[RUN, true], [RUN_B, false]].sort());
+  } finally {
+    h.close();
+  }
+});
+
 test("a window of the longest hold is decided", () => {
   const h = harness();
   try {
@@ -836,13 +859,25 @@ test("a signal that does not open stops every recomputation of its run", () => {
     const view = runOutcomeView(h.store, RUN);
     assert.deepEqual([view?.signals.map(signal => signal.kind), view?.unreadable], [["landing"], 1]);
 
-    // An exclusion that stops opening does not put its row back into the rates.
-    ownerSignal(h.store, { action: "record", kind: "exclusion", requestId: "excl-b", runId: RUN_B, memberId: "m1", reason: "trial" }, at(41));
-    assert.equal(rowOf(h.store, RUN_B, "m1")?.exclusion, "owner");
-    corruptPayload(h, "outcome_signals", ownerSignalId("excl-b"), "signal_id");
-    h.flush([ev("rating.recorded", RUN_B, at(42), { memberId: "m1", data: { score: 5 } })]);
-    assert.equal(rowOf(h.store, RUN_B, "m1")?.exclusion, "owner");
-    assert.deepEqual(levelsOf(rowOf(h.store, RUN_B, "m1")), [null, null, null, null]);
+  } finally {
+    h.close();
+  }
+});
+
+test("an exclusion that does not open keeps its row out of the rates", () => {
+  const h = harness();
+  try {
+    h.flush(standardRun(RUN));
+    ownerSignal(h.store, { action: "record", kind: "exclusion", requestId: "excl-1", runId: RUN, memberId: "m1", reason: "trial" }, at(41));
+    assert.equal(rowOf(h.store, RUN, "m1")?.exclusion, "owner");
+    corruptPayload(h, "outcome_signals", ownerSignalId("excl-1"), "signal_id");
+    const before = plain(rowOf(h.store, RUN, "m1"));
+
+    // The next projector event of the run would save the row again. It cannot read the exclusion, so it writes nothing.
+    h.flush([ev("rating.recorded", RUN, at(42), { memberId: "m1", data: { score: 5 } })]);
+    assert.deepEqual(plain(rowOf(h.store, RUN, "m1")), before);
+    assert.deepEqual(levelsOf(rowOf(h.store, RUN, "m1")), [null, null, null, null]);
+    assert.equal(signalsOf(h.store, RUN).some(signal => signal.kind === "rating"), false);
   } finally {
     h.close();
   }

@@ -43,7 +43,10 @@ export interface ProjectSourceStatus {
   mode: "github" | "laptop";
   repository?: string;
   baseBranch?: string;
-  /** Base-branch head in the host mirror after the last successful fetch. */
+  /**
+   * Base-branch head the host last found in the mirror: the head the last successful fetch returned, or a head that a
+   * fetch left there before it failed. `fetchedAt` is the time of the last successful fetch only.
+   */
   mirrorHead?: string;
   /**
    * The order stamp of the last successful fetch: its time, or one millisecond after the previous stamp when the host

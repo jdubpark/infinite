@@ -17,8 +17,12 @@ export type ScanCommit = { id: string; tree: string; parents: string[] };
 /** `base` is the base commit the run's reviewed head was built on. */
 export type LandingCandidate = { runId: string; reviewedHead?: string; reviewedTree?: string; mergeCommit?: string; base?: string };
 export type Landing = { runId: string; commit: string; method: LandingMethod; position: number; reviewedHead?: string };
-/** `commit` is the landing commit, the first of `ids`. `position` is set when the run landed in this scan. */
-export type LandedRun = { runId: string; signalId: string; commit: string; ids: string[]; holdUntil: string; position?: number };
+/**
+ * `commit` is the landing commit, the first of `ids`. `position` is set when the run landed in this scan. `unsure` is
+ * true for an earlier landing with a `rewrite` or `source` scan since its own scan: the stored head may then not
+ * descend from the landing commit, so a commit of a later scan may be older than the landing.
+ */
+export type LandedRun = { runId: string; signalId: string; commit: string; ids: string[]; holdUntil: string; position?: number; unsure?: boolean };
 export type RevertMatch = { runId: string; signalId: string; commit: string; reverts: string };
 
 /**
@@ -84,9 +88,10 @@ export function revertPattern(id: string): string {
  * Rule 4. `hits` maps a landed id to the commits whose message names it, as form 5 reports them.
  * A revert counts once per landing signal and reverting commit. It needs `holdUntil >= at`, and
  * it must come after the landing commit. A run that landed in this scan has its position. For a
- * landing of an earlier scan, a scan of new commits lists only commits after it. A scan that
- * rereads older history (`older`) must find the landing commit in its list; when it cannot, the
- * order is unknown and nothing is matched.
+ * landing of an earlier scan, the list may hold the landing commit, and then a revert must come
+ * after it. When the list does not hold it, the commits of a scan of new commits follow it only
+ * while the stored head descends from it: not in a scan that rereads older history (`older`),
+ * and not for an `unsure` landing. In those cases the order is unknown and nothing is matched.
  */
 export function matchReverts(
   commits: readonly ScanCommit[],
@@ -104,9 +109,9 @@ export function matchReverts(
   for (const run of landed) {
     if (Date.parse(run.holdUntil) < atMs) continue;
     let landing = run.position;
-    if (landing === undefined && older) {
+    if (landing === undefined) {
       landing = positions.get(run.commit);
-      if (landing === undefined) continue;
+      if (landing === undefined && (older || run.unsure === true)) continue;
     }
     const seen = new Set<string>();
     for (const id of run.ids) {

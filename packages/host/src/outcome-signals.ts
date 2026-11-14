@@ -306,12 +306,20 @@ export function scanInputs(db: EvidenceDb, projectId: string, at: string): ScanI
   const candidates = landingCandidates(db, ref, daysBefore(at, APPROVAL_DAYS))
     .map(({ runId, payload }) => candidateOf(runId, payload));
   const atMs = Date.parse(at);
+  // After a scan that reread or replaced the history, the stored head may not descend from an earlier landing commit.
+  const rewound = db.get<{ seq: number | null }>(
+    "SELECT max(seq) AS seq FROM base_scans WHERE project_ref=? AND gap IN ('rewrite', 'source')",
+    ref,
+  )?.seq ?? 0;
   const open: LandedRun[] = [];
   for (const signal of projectLandings(db, ref, daysBefore(at, HOLD_DAYS_MAX + APPROVAL_DAYS))) {
     if (signal.payload.kind !== "landing") continue;
-    const { commit, method, reviewedHead, holdUntil: close } = signal.payload;
+    const { commit, method, reviewedHead, holdUntil: close, scanSeq } = signal.payload;
     if (Date.parse(close) < atMs) continue;
-    open.push({ runId: signal.runId, signalId: signal.signalId, commit, ids: landedIds(method, commit, reviewedHead), holdUntil: close });
+    open.push({
+      runId: signal.runId, signalId: signal.signalId, commit, ids: landedIds(method, commit, reviewedHead), holdUntil: close,
+      ...(rewound > scanSeq ? { unsure: true } : {}),
+    });
   }
   return { ...(state === undefined ? {} : { state }), candidates, open };
 }

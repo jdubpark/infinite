@@ -1895,7 +1895,10 @@ The remote relay refuses this route with `403` and `code:
 `GET /api/outcomes/runs/:runId` lists the run's signals, withdrawn ones included.
 `unreadable` counts the signals of the run that the store could not read. A run
 with such a signal keeps the levels it had: the host does not recompute its rows
-without every signal, and an owner claim on it answers `503`.
+without every signal, and an owner claim on it answers `503`. The ledger's
+projector also waits at the next event of that run, as it does for an outcome row
+it cannot read, so no later event of any run is projected until the store is
+repaired.
 `infinite usage outcomes --run ID` prints one line per signal.
 
 ```sh

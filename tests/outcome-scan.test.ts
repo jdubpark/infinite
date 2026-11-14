@@ -927,6 +927,44 @@ test("a rescan of older history counts no revert from before the landing", async
   }
 });
 
+test("commits pushed back after a rewind are no reverts of an earlier landing", async () => {
+  for (const pushed of ["all", "part"] as const) {
+    const repo = repos();
+    const store = openStore(repo.root, "state");
+    try {
+      const a0 = commitFile(repo.seed, "base.txt", "base");
+      const tip = branchCommit(repo.seed, "run-r", "r.txt");
+      git(repo.seed, "commit", "-q", "--allow-empty", "-m", `Undo an earlier try\n\nThis reverts commit ${tip}.`);
+      const x = head(repo.seed, "HEAD");
+      const merge = mergeBranch(repo.seed, "run-r");
+      push(repo.seed);
+      recordRun(store, "run-r", { reviewedHead: tip });
+      assert.deepEqual((await scanFetch(store, repo, fetchOf(repo, 0))).landings, 1);
+
+      // The base is rewound below the landing commit. The scan cannot see the landing commit, so it matches nothing.
+      forceMain(repo.seed, a0);
+      const rewound = await scanFetch(store, repo, fetchOf(repo, 1));
+      assert.deepEqual({ gap: rewound.gap, reverts: rewound.reverts }, { gap: "rewrite", reverts: 0 });
+
+      // The old history comes back, all of it or only the part before the landing. It is a scan of new commits from
+      // the rewound head, and it lists a commit from before the landing that names the landed head.
+      git(repo.seed, "reset", "-q", "--hard", pushed === "all" ? merge : x);
+      push(repo.seed);
+      const back = await scanFetch(store, repo, fetchOf(repo, 2));
+      assert.deepEqual({ state: back.state, gap: back.gap, reverts: back.reverts }, { state: "scanned", gap: null, reverts: 0 }, pushed);
+      assert.equal(store.read(db => db.get<{ n: number }>("SELECT count(*) AS n FROM outcome_signals WHERE kind='revert'"))?.n, 0, pushed);
+
+      // The window had a rewrite inside it, so it closes unknown, with the flag.
+      assert.equal((await scanFetch(store, repo, fetchOf(repo, 31))).state, "checked");
+      const row = outcomeOf(store, "run-r");
+      assert.deepEqual([row?.held, row?.flags.includes("scan-gap")], [null, true], pushed);
+    } finally {
+      store.close();
+      repo.close();
+    }
+  }
+});
+
 test("older history lands a tree only on the reviewed head", async () => {
   const repo = repos();
   const store = openStore(repo.root, "state");

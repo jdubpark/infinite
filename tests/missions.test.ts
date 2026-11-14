@@ -1935,3 +1935,28 @@ test("after a rotation, an unconfirmed new conversation never brings back the re
     assert.equal(h.get(id).events.filter(event => /new conversation \(rule: /.test(event.text)).length, 1, "One rotation, not one per wake");
   } finally { h.close(); mock.timers.reset(); }
 });
+
+test("a main conversation at the size limit starts fresh; subagent usage does not count toward it", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.missions.create(missionRequest(240));
+    const first = (await h.attempt(1)).request.continuation?.nativeSessionId;
+    await h.confirmNative(1);
+    await h.usage(1, 50000);
+    await h.usage(1, 500000, true);
+    await h.report(1, followUp(120));
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 1);
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Keep the change small" });
+    const second = await h.attempt(2);
+    assert.deepEqual([second.request.continuation?.mode, second.request.continuation?.nativeSessionId], ["resume", first]);
+
+    await h.usage(2, 130000);
+    await h.report(2, { kind: "wait", summary: "Waiting for the release page" });
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && mission.events.some(event => /waiting for subteam progress/.test(event.text)));
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Mention the release" });
+    const third = await h.attempt(3);
+    assert.equal(third.request.continuation?.mode, "start");
+    assert.notEqual(third.request.continuation?.nativeSessionId, first);
+    assert.equal(h.get(id).events.filter(event => event.text.startsWith("The coordinator continues in a new conversation (rule: size)")).length, 1);
+  } finally { h.close(); }
+});

@@ -114,6 +114,8 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
   const stateReads = new Map<string, number>(), sessionStatuses = new Map<string, "running" | "exited">();
   const nativeSessions = new Map<string, { id: string; source: "hook" }>();
   const held = new Set<string>(), stops: string[] = [];
+  // Each coordinator session's journaled usage records, as the provider usage readers append them.
+  const usage = new Map<string, { seq: number; at: string; type: "usage"; data: unknown }[]>();
   const signal = (sessionId: string, data: Signal, at = new Date()) => {
     const journal = signals.get(sessionId)!;
     const event: SignalEvent = { seq: journal.length + 1, at: at.toISOString(), type: "signal", data: { ...data, source: "hook", provider: "claude" } };
@@ -132,6 +134,7 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
     },
     events(sessionId: string, cursor: number, _limit: number, types: Set<string>) {
       if (types.has("signal")) { const events = signals.get(sessionId)!.filter(event => event.seq > cursor); return { events, cursor: events.at(-1)?.seq ?? cursor, more: false }; }
+      if (types.has("usage")) { const events = (usage.get(sessionId) ?? []).filter(event => event.seq > cursor); return { events, cursor: events.at(-1)?.seq ?? cursor, more: false }; }
       const filed = reports.get(sessionId), attempt = attempts.find(item => item.sessionId === sessionId)!;
       if (!filed || cursor > 0) return { events: [], cursor, more: false };
       const { runId, memberId, revision } = attempt.assignment;
@@ -270,6 +273,13 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
       sessionStatuses.set(sessionId, "exited");
     },
     refusals: (id: string) => unseal<{ refusals: number }>(key, "mission:" + id, readFileSync(join(config.stateDir, "missions", id + ".sealed"), "utf8")).refusals,
+    /** The attempt records one model call whose context is this many input tokens; `secondary` marks a subagent's call. */
+    usage: async (n: number, contextTokens: number, secondary = false) => {
+      const sessionId = (await attempt(n)).sessionId, journal = usage.get(sessionId) ?? [], at = new Date().toISOString();
+      journal.push({ seq: journal.length + 1, at, type: "usage", data: { provider: "claude", providerId: "claude", modelId: "test-model", messageId: randomUUID(), partId: "",
+        modelSource: "requested", completedAt: at, tokens: { input: contextTokens, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, reportedCost: 0, ...(secondary ? { secondary: true } : {}) } });
+      usage.set(sessionId, journal);
+    },
     messages: async (n: number) => parse((await attempt(n)).prompt, "Messages since your last attempt (JSON): "),
     state: async (n: number) => parse((await attempt(n)).prompt, "Mission state (JSON): "),
     /** The attempt files this report, with the optional note beside it as the mission report tool sends it. */

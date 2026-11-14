@@ -2142,3 +2142,366 @@ The independent reviewer found three blockers. These rulings are settled, and th
 - A revert by any other evidence. Rule 4 sees a commit that names the landing commit or the reviewed head. Work removed by a revert of one commit of the branch, by a revert of a second merge of the same head (a local merge that reached the base through a pull merge), or by a plain edit is not seen, and held can be yes for it. The hindsight measure is the planned answer.
 - A form 1 proof that a landing commit is an ancestor of the stored head, which would keep a later revert after a `rewrite` or `source` scan (ruling 13).
 - A `decision` rule for `scan-gap` rows beyond held unknown, and relay access to any `/api/outcomes` route.
+
+# Slice: roll-ups and the legacy import
+
+Spec part 6 (the roll-up paragraphs), part 7 (`GET /api/outcomes/rollup` and its CLI forms), and part 8, delivery order 5, with acceptance 7. A goal or mission roll-up sums what the ledger holds for the runs of that goal or mission, beside the owner's latest goal assessment. An owner-only import turns the operator's converted ledger into rows of source `legacy`, which only `display` cells show. It builds on the signals slice, which must merge first.
+
+**A roll-up finds its runs through blind-index columns.** Module version 3 adds `goal_ref` and `mission_ref` to `outcomes` and `run_summaries`. The migration fills them once by opening each payload, and `writeOutcome` and `writeSummary` keep them on every write. *(My call. A scan opens every summary on every request, so its cost grows with 730 days of runs, not with the goal. With the columns, a request costs two indexed lookups and one open per summary, row, and member result of the matched runs. A goal has at most 10 runs (`maxRuns` in `goal-types.ts`) and a mission at most 12 subtasks (`maxSubtasks` in `mission-types.ts`), so a roll-up opens tens to a few hundred payloads and needs no cap of its own. Plain id columns would cost less, but the spec seals the goal and the mission, and one rule then holds: an id that lives in a sealed payload is matched through `db.index`. The cost is three index classes in `evidence/crypto.ts` and one pass over the store when the module registers.)*
+
+**A roll-up is a set of runs, and its levels are cells.** A run belongs to a roll-up when its summary or one of its rows carries the id. Every row and member result of such a run counts. *(My call: spec part 6 says "rows that carry the goal id". A row copies the goal from its summary when it is made (`factsOf` in `outcome-projector.ts`), so a row that an event made before `run.created` carries none. The goal is a fact of the run.)* The levels are `buildCells(rows, { use: "display", sources: SOURCES, by: [] , role })`, once per role, so no second counting rule exists.
+
+**A legacy row is written directly and never recomputed.** `saveOutcomeRow` derives levels from host facts: the disposition, the review's acceptance, round links, and signals. A legacy row has none of them, and `levels` would turn an accepted line with `attempts` 2 into firstPass yes. So the import calls `writeOutcome` with the levels of part 8, and `saveOutcomeRow` refuses a row of source `legacy`.
+
+**The import decides per line and writes per batch.** Each line of a batch gets its own outcome. A refused line has no effect, and the other lines of the batch are written. One batch is one store write. *(My call. Per line, the stored result depends only on the file and the stored state, never on where the client cut the batches. A refusal of the whole batch would make it depend on the cut. A rerun after a fix is safe either way, because the import is idempotent by id.)*
+
+## Trust boundary, and what a review checks
+
+The readers, the import, and both routes are host code. These inputs originate outside the host:
+
+- **Roll-up queries** come from any paired device (owner, controller, or viewer), the role rule of `GET /api/outcomes`. The query names one goal or mission by UUID. The response holds counts, enumerations, cells with an empty key or a `source` key, profile identities inside cells, and the assessment's result, time, and revision. It holds no assessment text, project id, task id, or commit.
+- **Legacy lines** come from the operator's file through an owner device key. Each line is an unauthenticated claim (spec part 8). The host checks every field strictly and never reads a path. `id`, `projectId`, `label`, `supersedes`, and `reviewerModel` are operator text: they go into the sealed payload, and plain columns hold only their blind indexes. `provider`, `model`, and `effort` are plain, as for a production row, because a cell key reads them; their format admits no space and no control character.
+- **The goal assessment** is the newest entry of `ProductGoal.outcomes`, which the owner or a controller records through `POST /api/goals/:id/outcome`. The roll-up reports its result; it infers nothing.
+
+Neither route is on the relay allow-list (`allowedPath` in `remote-access.ts`). No member reads them: there is no MCP surface, and the existing test `team prompts never import the ledger` already refuses every `outcome-` specifier in `team-prompts.ts` and `team-mcp.ts`, which covers the three new files.
+
+The slice must survive these sequences. Each has a named test.
+
+| Sequence | Expected | Test |
+|---|---|---|
+| A batch, then the same batch again | The second answers `repeated` for each line and changes no table | Task 6 `a batch imports and a replay changes nothing` |
+| A line, then a line with the same id and another body | `changed`, the stored row unchanged, the rest of the batch written | Task 4 `the plan imports, repeats, and refuses by id`; Task 6 `the same id with another body is refused, and the rest of the batch imports` |
+| A batch whose write fails after its first row | Nothing of the batch stored; the same batch then imports every line | Task 6 `a batch cut in the middle writes nothing` |
+| A line, then a later line that supersedes it; and the reverse order | The same final tables: the later line's row only, the earlier id marked superseded | Task 4 `a superseded line is dropped in either order`; Task 6 `a superseded line is dropped in either order across batches` |
+| An unavailable store, or an `outcomes` module that is not ready | Import and roll-up throw `EvidenceError` `unavailable`; the routes answer 503; nothing written | Task 5 `a roll-up needs a ready module`; Task 6 `an unavailable store or module writes nothing`; Task 7 `roll-up queries are checked` |
+| A stored legacy line whose payload does not open | The batch throws `unavailable` and writes nothing (the write path reads all or fails) | Task 6 `a stored line that does not open stops the batch` |
+| A row or summary payload that does not open | The roll-up counts it in `unreadable`; at migration it gets the ref `unreadable` and the roll-up reports it in `unindexed` | Task 2 `a version 2 store migrates to version 3 and indexes goals and missions`, `roll-up records count unreadable payloads` |
+| A legacy id whose outcome id equals a stored row that the import did not write | `conflict`, the stored row unchanged | Task 6 `an id that collides with a stored row is refused` |
+| A file over 20,000 lines, a line over 1,024 bytes, a batch over 50 lines, a store at 50,000 legacy lines | Refused before sending; 400; 409 `legacy-limit`; nothing written | Task 4 `the file is checked before anything is sent`, `a line is validated strictly`; Task 6 `the host caps legacy lines` |
+| A goal the host no longer holds | Its runs still roll up; `known` false, no assessment | Task 5 `a goal the host no longer holds still rolls up` |
+| A known mission with no runs | 200 with zero runs, `counts` null, empty cells | Task 5 `a known mission with no runs rolls up empty` |
+| A legacy row before a production reader or a recomputation | No reader counts it as production, a run, or a landing candidate; a recomputation throws | Task 6 `legacy rows stay out of production readers`, `a legacy row is never recomputed` |
+| A rollback to a host with module version 2 | The stored version 3 makes its `outcomes` module unavailable, so it answers 503 and writes no row | Store rule of `register`, no new test |
+
+Outside this slice: stored cost from the usage ledger (the roll-up uses the session lookup of the scorecard), every client view of a roll-up or of legacy rows, relay access, and memory's import of legacy rows (INF-141).
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `packages/host/src/evidence/crypto.ts` (modify) | Index classes `goal`, `mission`, `legacy` |
+| `packages/host/src/outcome-store.ts` (modify) | Shared types; module version 3: the two ref columns, `legacy_lines`, their helpers, the run-set read, retention of legacy lines |
+| `packages/host/src/outcome-rollup.ts` (create) | Pure: the roll-up from records, the latest assessment, the 404 rule |
+| `packages/host/src/outcome-legacy.ts` (create) | Pure: the line schema, limits, file check, line hash, legacy row, batch plan |
+| `packages/host/src/outcome-reads.ts` (modify) | `queryRollup`: readiness, the read, the roll-up |
+| `packages/host/src/outcome-import.ts` (create) | `importLegacy`: readiness, known state, the cap, the write |
+| `packages/host/src/outcome-signals.ts` (modify) | `saveOutcomeRow` refuses a legacy row |
+| `packages/host/src/server.ts`, `client.ts` (modify) | `GET /api/outcomes/rollup`, `POST /api/outcomes/legacy`, `--goal`, `--mission`, `import-legacy` |
+| `docs/teams.md`, the spec (modify) | Roll-ups, the import, and the part 6 and part 8 amendments |
+| `tests/outcome-{rollup,legacy,import}.test.ts` (create); `tests/{evidence-store,outcome-store,outcome-reads,outcome-signals,outcome-routes,goals,missions,remote-access,client-args}.test.ts` (modify) | Pure rules, a real store, the host |
+
+**Order and owners.** Task 1 runs first and is small. Then Tasks 2, 3, and 4 run in parallel. Then Tasks 5 and 6 run in parallel. Task 7 runs last. Each file has one writer: Task 1 and Task 2 both write `outcome-store.ts`, one after the other.
+
+## Review Focus
+
+1. A legacy row that a production reader counts, or that a host write recomputes: the scorecard, `sources=production` cells, the run view, the backfill, the store sweep, landing candidates, `recomputeRun`. Expect none (Task 6 `legacy rows stay out of production readers`, `a legacy row is never recomputed`).
+2. An import whose result depends on order, repetition, or batch cuts. Expect equal tables (Task 4 `a superseded line is dropped in either order`, `a cycle resolves to the first line`; Task 6 `a batch imports and a replay changes nothing`, `a batch cut in the middle writes nothing`, `a superseded line is dropped in either order across batches`).
+3. Unknown shown as a number in a roll-up: an unsettled run's counts summed as zero, a missing cost as zero, a rate with no decided row. Expect null and a count of what was left out (Task 3 `run facts sum settled summaries only`, `cost sums complete sessions and never counts a missing one as zero`, `levels come from the cell rules`).
+4. A roll-up that misses a run or adds one: a row whose summary has no goal, a run of another goal, a deleted run, an unreadable payload, a store migrated from version 2. Expect exactly the target's runs, with unreadable records counted (Task 2 `a version 2 store migrates to version 3 and indexes goals and missions`, `roll-up records follow the goal through summaries and rows`, `roll-up records count unreadable payloads`).
+5. Operator text in a plain column or a response, or a route open to a viewer or the relay. Expect none (Task 2 `writes keep the goal and mission indexes`; Task 6 `no plain column holds operator text`; Task 7 `the legacy import is owner-only and idempotent`, `the relay refuses roll-ups and imports`).
+
+### Task 1: the shared types
+
+**Files:** `packages/host/src/evidence/crypto.ts`, `packages/host/src/outcome-store.ts` (types only), `tests/evidence-store.test.ts`. Runs first. Tasks 2, 3, and 4 start from its commit.
+
+**Interfaces (produces):**
+```ts
+// evidence/crypto.ts
+export type EvidenceIndexClass = "project" | "task" | "area" | "goal" | "mission" | "legacy";
+// outcome-store.ts
+export type LegacyPayload = { id: string; label?: string; result: "accepted" | "rejected" | "excluded"; attempts: number;
+  totalTokens?: number; reviewerModel?: string; supersedes?: string };
+// OutcomePayload gains `legacy?: LegacyPayload`.
+/** One legacy id's state. `state` and `recordedAt` are plain; `lineHash` is sealed. */
+export type LegacyLineState = { state: "imported" | "superseded"; lineHash: string | null; recordedAt: string };
+export type RollupRecords = { runIds: string[]; summaries: RunSummaryRow[]; rows: OutcomeRow[]; members: MemberResultRow[];
+  unreadable: { summaries: number; rows: number; members: number }; unindexed: number };
+```
+
+**Decisions:** `INDEX_CLASSES` gains the three classes. *(My call: a class per kind of id keeps two kinds that share a value apart, as the existing classes do.)*
+
+- [ ] **Step 1: Extend the test** `blind indexes separate classes` in `tests/evidence-store.test.ts`: `goal`, `mission`, and `legacy` give three different indexes for the value `a`, each different from `task`, and `blindIndex(key, "run" as EvidenceIndexClass, "a")` throws `TypeError`. **Step 2: Run it and confirm it fails.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/evidence-store.test.ts` and the typecheck, then commit.
+
+### Task 2: the store, version 3
+
+**Files:** `packages/host/src/outcome-store.ts`, `tests/outcome-store.test.ts`. Needs Task 1. Runs in parallel with Tasks 3 and 4.
+
+**Interfaces (produces):** module `outcomes`, version 3, `readVersion` 2. `migrate(tx, from)` runs versions 1 and 2 as today, then, when `from < 3`:
+```sql
+ALTER TABLE outcomes ADD COLUMN goal_ref TEXT;        -- index('goal', payload.goal.id), NULL without a goal
+ALTER TABLE outcomes ADD COLUMN mission_ref TEXT;     -- index('mission', payload.missionId), NULL without one
+ALTER TABLE run_summaries ADD COLUMN goal_ref TEXT;
+ALTER TABLE run_summaries ADD COLUMN mission_ref TEXT;
+CREATE TABLE IF NOT EXISTS legacy_lines (line_ref TEXT PRIMARY KEY,   -- index('legacy', LegacyOutcome.id)
+  state TEXT NOT NULL, recorded_at TEXT NOT NULL, payload TEXT NOT NULL);   -- sealed { lineHash: string | null }
+-- Indexes: outcomes (goal_ref), (mission_ref); run_summaries (goal_ref), (mission_ref); legacy_lines (recorded_at).
+-- Then every row of outcomes and run_summaries: open the payload and set both refs. A payload that does not open sets both to 'unreadable'.
+```
+```ts
+export const UNREADABLE_REF = "unreadable";
+export function rollupRecords(db: EvidenceDb, by: "goal" | "mission", ref: string): RollupRecords;
+/** Throws EvidenceError `unavailable` when a payload of a requested ref does not open. */
+export function readLegacyLines(db: EvidenceDb, refs: readonly string[]): Map<string, LegacyLineState>;
+export function writeLegacyLine(tx: EvidenceTx, ref: string, state: LegacyLineState): void;   // whole-row upsert
+export function legacyLineCount(db: EvidenceDb): number;
+export function outcomeSources(db: EvidenceDb, outcomeIds: readonly string[]): Map<string, string>;   // id -> source, no open
+/** Removes the row only when its source is `legacy`. */
+export function deleteLegacyOutcome(tx: EvidenceTx, outcomeId: string): boolean;
+```
+
+**Decisions:**
+
+- **The migration never fails on a payload.** Each open runs in its own `try`. *(My call: a failed migration makes the whole module unavailable, so one damaged row would take every ledger read to 503. The sentinel cannot equal an index, which is 64 hex.)* It runs inside the registration write and opens each payload of the two tables once.
+- **Writers keep the refs.** `writeOutcome` and `writeSummary` derive `goal_ref` and `mission_ref` from the payload, as they derive `project_ref`, and ignore a caller's value. They are the only writers of the two tables (checked: no other `INSERT` or `UPDATE` of them outside this file sets a payload).
+- **`rollupRecords`**: the run ids are `SELECT run_id FROM run_summaries WHERE <col>=? UNION SELECT run_id FROM outcomes WHERE <col>=?`, sorted, where `<col>` is `goal_ref` or `mission_ref`, chosen in code. Then summaries, rows (in `outcome_id` order), and member results of those runs, read with `run_id IN (…)` in chunks of 500. Each payload opens in its own `try`; a failure is counted in `unreadable` and the record left out. This tolerant read is for display only. `unindexed` counts rows and summaries whose `goal_ref` is `unreadable`, store-wide.
+- **`readLegacyLines` reads all or fails.** The import decides from the stored hash, so a hash that cannot be read stops the write.
+- **Retention.** A legacy row's `run_deleted_at` is its `recordedAt` (Task 4), so the existing sweep removes it `retentionDays` after it was recorded, one run group per row. The sweep also removes `legacy_lines` rows with `recorded_at` at or before the cutoff, at most `limit` per call, through `DELETE … WHERE line_ref IN (SELECT … LIMIT ?)`. The `runIds` hook lists only rows with no `run_deleted_at`, so it never lists a legacy row.
+- `counts` gains `legacy` (rows with source `legacy`) and `legacyLines`. *(My call for `readVersion` 2: the field rises only when a reader must change. A version 2 reader of these rows would be right, because cells already keep `legacy` apart. A version 2 host never reads them: the stored version 3 makes its module unavailable.)*
+- The existing `a version 1 store migrates in place` now expects version 3 and the two columns.
+
+- [ ] **Step 1: Write the failing tests** in `tests/outcome-store.test.ts`.
+
+| Test name | Assertions |
+|---|---|
+| `a version 2 store migrates to version 3 and indexes goals and missions` | A store first opened with a module named `outcomes` at version 2 (the version 1 and 2 statements copied into the test) holds a summary with goal G, a row with mission M, a row with neither, and a row whose payload is `"x"`. Reopened with `outcomeModule()`: version 3 and ready; the summary's `goal_ref` equals `db.index("goal", G)`; the row's `mission_ref` equals `db.index("mission", M)`; the plain row has NULL refs; the damaged row has `unreadable` in both; `legacy_lines` exists. |
+| `writes keep the goal and mission indexes` | `writeOutcome` with goal G gives `goal_ref` of G; a rewrite without a goal gives NULL. The same for `writeSummary` and `mission_ref`. No plain column contains G or M. |
+| `roll-up records follow the goal through summaries and rows` | R1: summary with goal G, two rows with G, one row without a goal, one member result. R2: summary without a goal, one row with G. R3: goal H. `rollupRecords(db, "goal", ref(G))`: `runIds` `[R1, R2]`, two summaries, four rows, one member. For H: R3 only. A mission query matches `mission_ref` only. |
+| `roll-up records count unreadable payloads` | One row of R1 with payload `"x"`: `unreadable.rows` 1 and the other rows returned. R1's summary payload set to `"x"` after its refs: `unreadable.summaries` 1, and R1 is still found through its rows. A row with `goal_ref` `unreadable`: `unindexed` 1. |
+| `legacy lines round-trip sealed` | A line written with hash `h` reads back equal; a ref never written is absent from the map; no raw column holds `h`. A line whose payload is `"x"` makes `readLegacyLines` throw `EvidenceError` `unavailable`. |
+| `a legacy row is never a run` | A row with source `legacy` and `run_deleted_at` set: `runIds` does not list it, `store.sweep(() => false)` leaves it unchanged, and `landingCandidates` for its project is empty. `deleteLegacyOutcome` on a production row's id returns false and leaves it. |
+| `retention removes legacy rows and lines on their recorded time` | A legacy row and line recorded `2024-01-01T00:00:00.000Z`: a sweep at `2025-12-31T00:00:00.001Z` removes both; one recorded `2025-06-01T00:00:00.000Z` stays. With `limit` 1 and two expired lines, one call removes one. |
+| `the module reports legacy counts` | Two legacy rows and three legacy lines: `outcomes.legacy` 2 and `outcomes.legacyLines` 3. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/outcome-store.test.ts tests/outcome-reads.test.ts tests/outcome-signals.test.ts` and the typecheck.
+
+### Task 3: the roll-up rules
+
+**Files:** `packages/host/src/outcome-rollup.ts`, `tests/outcome-rollup.test.ts`. Needs Task 1. Runs in parallel with Tasks 2 and 4.
+
+**Interfaces (produces):** pure, no I/O, no clock.
+```ts
+export type RollupTarget = { kind: "goal" | "mission"; id: string };
+export type GoalAssessment = { result: "achieved" | "not-achieved" | "inconclusive"; at: string; revision: number };
+export type RollupCost = { sessions: number; complete: number; noSession: number; tokens: number | null; spentUsd: number | null };
+export type RollupRuns = { total: number; withSummary: number; withCounts: number; deleted: number;
+  status: Record<string, number>; blockCodes: Record<string, number>;
+  counts: RunSummaryCounts | null; rounds: RunSummaryPayload["rounds"] | null; flagged: { backfilled: number; gap: number } };
+export type OutcomeRollup = { target: RollupTarget; known: boolean; assessment: GoalAssessment | null; runs: RollupRuns;
+  attempts: Partial<Record<Disposition, number>>; implementer: Cell[]; scout: Cell[]; members: number; cost: RollupCost;
+  unreadable: RollupRecords["unreadable"]; unindexed: number };
+export function latestAssessment(outcomes: readonly { result: GoalAssessment["result"]; at: string; revision: number }[]): GoalAssessment | null;
+export function buildRollup(records: RollupRecords, context: { target: RollupTarget; known: boolean; assessment: GoalAssessment | null; cost?: CostLookup }): OutcomeRollup;
+/** True when the host holds no record of the target and the ledger no run of it. The route answers 404. */
+export function rollupMissing(rollup: OutcomeRollup): boolean;
+```
+
+**Decisions:**
+
+- **Levels** are `buildCells(records.rows, { use: "display", sources: [...SOURCES], by: [], role })` for `implementer` and for `scout`. Rows of every source are read. Replay rows get a cell of their own through the existing key rule, and a legacy row carries no goal or mission, so none appears.
+- **Run facts.** `total` is `runIds.length`. A run with no summary counts in `total` only. `status` counts summaries by status, and a null status counts as `unsettled`. `blockCodes` counts summaries with a block code. `deleted` counts runs whose summary, a row, or a member result has `runDeletedAt`.
+- **Counts and rounds are summed over settled summaries only**, the summaries with `payload.counts` (`withCounts`). Both are null when no summary has counts. *(My call: an unsettled summary holds zero rounds as a placeholder and no counts, so a sum over it would show unknown as zero. The sums hold what each run's last settle recorded; `counts.tasks` is the current revision's tasks, as `runSummaryCounts` defines it.)*
+- **Attempts** count every row by disposition, of both roles.
+- **Cost.** The lookup is called once per distinct session id of the rows and member results. A session counts only when the lookup gives `complete: true`, the rule of `completeCost`. `tokens` sums complete sessions; `spentUsd` sums complete sessions whose row or member has a provider for which `isMetered` is true. Each is null when it summed nothing. `noSession` counts rows and member results with no session id. Without a lookup, `complete` is 0 and both sums are null. The sessions left out are `sessions − complete`.
+- **Assessment.** `latestAssessment` gives the last entry, which `GoalService.outcome` appends in time order, without its summary or evidence text. *(My call: the goal's own view shows the text; the roll-up stays numeric.)* A mission has none.
+- **404.** `rollupMissing` is `!known && runs.total === 0`. *(My call: a known goal or mission with no run is a real state, and a goal assessment exists without runs. An id that neither the host nor the ledger holds answers 404, so a mistyped id never reads as an empty goal.)*
+
+- [ ] **Step 1: Write the failing tests** in `tests/outcome-rollup.test.ts`, with row, summary, and member literals from one helper.
+
+| Test name | Assertions |
+|---|---|
+| `levels come from the cell rules` | Production rows (integrated and accepted, stalled, `owner-stop`, open) and a scout row: `implementer` deep-equals `buildCells(rows, { use: "display", sources: [...SOURCES], by: [], role: "implementer" })`, and `scout` the same for scouts. A replay row adds a second implementer cell with `key.source` `replay`. |
+| `run facts sum settled summaries only` | Summary A: status `merged`, counts with tasks 2, integrated 2, recoveries 1, decisionsByOwner 1; rounds total 1, attributed 1. Summary B: status `blocked`, block code `delivery-recovery`, counts with tasks 1; rounds total 2, unknown 2. Summary C: status null, no counts, rounds all 0. `withCounts` 2, `counts.tasks` 3, `counts.recoveries` 1, `rounds` `{ total: 3, attributed: 1, unattributed: 0, unknown: 2 }`, `status` `{ merged: 1, blocked: 1, unsettled: 1 }`, `blockCodes` `{ "delivery-recovery": 1 }`. With C alone: `counts` and `rounds` null. |
+| `attempts count every row by disposition` | Two integrated implementers, one stalled, one completed scout: `{ integrated: 2, stalled: 1, completed: 1 }`. |
+| `cost sums complete sessions and never counts a missing one as zero` | `s1` complete (0.5 USD, 1000 tokens) on an `opencode` row; `s2` not complete; `s3` undefined; `s4` complete (400 tokens) on a `codex` member result; `s1` again on a second row; one row with no session. `sessions` 4, `complete` 2, `tokens` 1400, `spentUsd` 0.5, `noSession` 1. Every lookup undefined: `tokens` and `spentUsd` null. No lookup: `complete` 0. |
+| `runs known by rows, deleted runs, and flags` | `runIds` `[R1, R2]` with a summary for R1 only: `total` 2, `withSummary` 1. A row of R2 with `runDeletedAt`: `deleted` 1. R1's summary flagged `backfilled`: `flagged.backfilled` 1. |
+| `unreadable and unindexed records are reported` | Records with `unreadable` `{ summaries: 1, rows: 2, members: 0 }` and `unindexed` 3 give the same values. |
+| `the latest assessment` | Two entries: the second, without text. None: null. |
+| `an empty roll-up` | Known, no records: `total` 0, `counts` and `rounds` null, both cell lists `[]`, cost `{ sessions: 0, complete: 0, noSession: 0, tokens: null, spentUsd: null }`, `rollupMissing` false. Not known: true. Not known with one run: false. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/outcome-rollup.test.ts` and the typecheck.
+
+### Task 4: the legacy rules
+
+**Files:** `packages/host/src/outcome-legacy.ts`, `tests/outcome-legacy.test.ts`. Needs Task 1. Runs in parallel with Tasks 2 and 3.
+
+**Interfaces (produces):** pure, no I/O, no clock.
+```ts
+export const LEGACY_BATCH_MAX = 50, LEGACY_LINE_BYTES = 1024, LEGACY_FILE_LINES = 20_000, LEGACY_LINE_CAP = 50_000, LEGACY_ERRORS_SHOWN = 20;
+export const LEGACY_PROFILE_ID = "(legacy)", LEGACY_MEMBER_ID = "legacy";
+export type LegacyOutcome = { id: string; projectId: string; profile: { provider: string; model: string; effort?: string };
+  label?: string; result: "accepted" | "rejected" | "excluded"; attempts: number; totalTokens?: number; elapsedMs?: number;
+  reviewerModel?: string; recordedAt: string; supersedes?: string };   // spec part 8
+export function legacyLineSchema(now: number): z.ZodType<LegacyOutcome>;
+export function legacyBatchSchema(now: number): z.ZodType<{ dryRun: boolean; lines: LegacyOutcome[] }>;
+export type LegacyFileError = { line: number; reason: "file-too-long" | "blank-line" | "line-too-long" | "not-json" | "invalid" | "id-conflict"; path?: string };
+export function parseLegacyFile(text: string, now: number): { lines: LegacyOutcome[]; numbers: number[] } | { errors: LegacyFileError[] };
+export function legacyLineHash(line: LegacyOutcome): string;     // SHA-256 hex of canonicalJson(line)
+export function legacyOutcomeId(ref: string): string;             // "legacy:" + ref
+export function legacyRow(line: LegacyOutcome, ref: string): OutcomeRow;
+export type LegacyLineOutcome = "imported" | "repeated" | "superseded" | "expired" | "changed" | "conflict";
+export type LegacyEffect = { kind: "insert"; ref: string; row: OutcomeRow; state: LegacyLineState }
+  | { kind: "supersede"; ref: string; state: LegacyLineState; removeRow: boolean };
+export type LegacyPlan = { outcomes: LegacyLineOutcome[]; effects: LegacyEffect[]; removed: number; newLines: number };
+export function planLegacyBatch(lines: readonly LegacyOutcome[],
+  known: { lines: ReadonlyMap<string, LegacyLineState>; rows: ReadonlyMap<string, string> },   // by ref; outcome id -> source
+  context: { now: string; retentionDays: number; ref: (id: string) => string }): LegacyPlan;
+```
+
+**Decisions:**
+
+- **Schema**, strict at both levels, so an unknown key fails. `id` and `supersedes`: `/^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/`, and `supersedes` differs from `id`. `projectId`: `/^[a-z0-9-]{1,80}$/`, the host's project id form; a project need not exist now. `provider` and `effort`: `/^[a-z][a-z0-9-]{0,39}$/`. `model` and `reviewerModel`: `/^[A-Za-z0-9][A-Za-z0-9._:\/-]{0,119}$/`. `label`: `/^[^\x00-\x1f\x7f-\x9f]{1,40}$/u` (spec: at most 40 characters). `attempts`: integer 1 to 100. `totalTokens`: integer 0 to 10^12. `elapsedMs`: integer 0 to 31,536,000,000. `recordedAt`: an ISO time with offset, not later than `now`, stored as `toISOString()`. A batch has `dryRun` (required boolean) and 1 to 50 lines.
+- **The hash** is of the schema's output, so key order and the form of `recordedAt` never change it.
+- **The file check** runs in the CLI before anything is sent. The text splits on `\n`; one final empty segment is dropped, and a trailing `\r` is removed. More than 20,000 lines gives the single error `file-too-long` at line 20,001. Otherwise each line is checked in order: empty, more than 1,024 UTF-8 bytes, not JSON, not valid (`path` is the first issue's path), or an id that an earlier line gave another hash (`id-conflict`). At most 20 errors are returned. The same id with the same body passes; the host answers `repeated`.
+- **The row.** One value for every column:
+
+| Column | Value |
+|---|---|
+| `outcome_id`, `run_id` | `legacyOutcomeId(ref)`, where `ref` is `index("legacy", id)` (64 hex) |
+| `member_id`, `source`, `role` | `legacy`, `legacy`, `implementer` |
+| `project_ref`, `task_ref`, `area_ref`, `goal_ref`, `mission_ref` | Derived by `writeOutcome`: the project, `unknown`, `(unknown)`, NULL, NULL |
+| `revision`, `attempt_index`, `inherited` | 0, `attempts`, 0 |
+| `profile_id`, `provider`, `model`, `effort`, `profile_epoch` | `(legacy)`, the line's provider, model, effort or NULL, 0 |
+| `session_id`, `config_id`, `experiment_ref`, `kind`, `started_at`, `hold_until` | NULL |
+| `risk`, `feature_version` | `unknown`, 0 |
+| `disposition`, `exclusion` | `integrated` and NULL for `accepted` and `rejected`; `host-stop` and `host` for `excluded` |
+| `integrated`, `accepted` (= `acceptance`), `first_pass`, `held` | `accepted`: 1, 1, 1 when `attempts` is 1 else 0, NULL. `rejected`: NULL, 0, 0, 0. `excluded`: NULL, NULL, NULL, NULL |
+| `flags` | `same-model-review` for an `accepted` line whose `reviewerModel` equals the model, else none |
+| `ended_at`, `frozen_at`, `run_deleted_at` | `recordedAt` |
+| `payload` | `projectId`, `taskId` `unknown`, `area` `(unknown)`, `featureMap` `unknown`, rounds 0, `limitEvents` 0, `costCoverage` `none`, `wallMs` from `elapsedMs`, and `legacy` with `id`, `label`, `result`, `attempts`, `totalTokens`, `reviewerModel`, `supersedes` |
+
+  *Reasons.* The outcome id is a blind index because `id` is operator text and `outcome_id` is plain *(my call; spec part 8 says `legacy:<id>`, and is amended)*. A UUID run id never equals `legacy`, so a legacy id never collides with a production `runId:memberId`. One run id per row makes the retention sweep, which groups by run, remove each row on its own time. `(legacy)` and epoch 0 match no lineup profile id (`/^[a-z][a-z0-9-]{0,39}$/`) and no epoch of this host, and `cellKey` already adds `source: legacy`, so a legacy row never shares a cell with production. A `rejected` line sets accepted to no, which is all that part 8 says of it. FirstPass and held are then no by their definitions in parts 4 and 5 (each is no when accepted is no), so part 8's "Held is unknown" is read as the accepted case. Integrated stays unknown *(coordinator's ruling: the operator's ledger marks a line rejected both when a reviewer refused integrated work and when another agent took the work over before it was integrated, so the line does not say which. The disposition `integrated` only classes the row as an ended, counted attempt with a reviewed result; `payload.legacy.result` holds what the operator said)*. `attempts` above 1 gives firstPass no: part 8 allows yes only at 1 *(my call)*. `started_at` stays NULL, because a start time derived from `elapsedMs` would be invented; `wallMs` keeps it. `run_deleted_at` is `recordedAt`, because a legacy row has no run here and its retention clock starts when it was recorded.
+- **The plan**, line by line in array order, each line seeing the earlier lines' effects. For a line with ref R: (1) `recordedAt` at or before `now − retentionDays` gives `expired`, with no effect, its `supersedes` included. (2) R superseded gives `superseded`. (3) R imported with the same hash gives `repeated`; with another hash, `changed`. (4) R unknown while `known.rows` (or an earlier insert) holds its outcome id gives `conflict`. (5) Otherwise, when the line supersedes S: S imported gives a `supersede` effect with `removeRow: true`, keeping S's hash and time; S unknown gives a mark with the line's `recordedAt` and hash null; S superseded gives nothing. Then an `insert` effect, and `imported`. `removed` counts `removeRow` effects, so the net change of rows is `imported − removed`. `newLines` counts refs that the effects add to `legacy_lines`. *(My call: a cycle A supersedes B, B supersedes A resolves to the first line in file order. A changed line under a known id is refused, never applied: the operator issues a new id with `supersedes`.)*
+
+- [ ] **Step 1: Write the failing tests** in `tests/outcome-legacy.test.ts`. `ref` is `id => "r-" + id`.
+
+| Test name | Assertions |
+|---|---|
+| `a line is validated strictly` | A full line parses. Each fails: an unknown key, a label of 41 characters, `attempts` 0, `recordedAt` one millisecond after `now`, `supersedes` equal to `id`, an id with a space, `projectId` `Alpha`, provider `Claude`, a model with a space. A batch of 51 lines and one of 0 fail; a batch without `dryRun` fails. |
+| `the hash is of the canonical line` | The same line with keys in another order and `recordedAt` `2026-10-01T02:00:00+02:00` against `2026-10-01T00:00:00.000Z` gives one hash. `attempts` 2 gives another. |
+| `the file is checked before anything is sent` | 20,001 lines give one error `file-too-long`. A blank line 2, a line 3 of 1,025 bytes, a line 4 that is not JSON, a line 5 with an unknown key, and a line 6 that repeats line 1's id with another body give those five errors with those numbers. The same id and body twice passes. A final newline and `\r\n` endings pass. 25 bad lines give 20 errors. |
+| `a line becomes a legacy row` | `accepted` with `attempts` 1: every column of the table above, and levels 1, 1, 1, null. `attempts` 2: firstPass 0. `rejected`: null, 0, 0, 0 with `acceptance` 0. `excluded`: `host-stop`, `host`, all null. `reviewerModel` equal to the model: `same-model-review` on `accepted`, none on `rejected`. No plain field of the row holds the id, the label, or the project id. |
+| `the plan imports, repeats, and refuses by id` | Empty known state: `imported` with one insert. Known imported with the same hash: `repeated`, no effect. Another hash: `changed`, no effect. Unknown ref whose outcome id is in `known.rows` with source `production`: `conflict`. |
+| `a superseded line is dropped in either order` | `[A, B supersedes A]`: `[imported, imported]`, effects insert A, supersede A with `removeRow`, insert B, `removed` 1. `[B, A]`: `[imported, superseded]`, a mark for A with hash null, no insert of A. Known A imported and `[B]`: supersede A with `removeRow`. Known A superseded and `[A]`: `superseded`. |
+| `a cycle resolves to the first line` | `[A supersedes B, B supersedes A]`: `[imported, superseded]`. |
+| `expired lines have no effect` | With `retentionDays` 730, a line recorded 731 days before `now` that supersedes a known imported S: `expired`, and no effect on S. |
+| `the same id twice in one batch` | Identical: `[imported, repeated]`. Another body: `[imported, changed]`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/outcome-legacy.test.ts` and the typecheck.
+
+### Task 5: the roll-up read
+
+**Files:** `packages/host/src/outcome-reads.ts`, `tests/outcome-reads.test.ts`. Needs Tasks 2 and 3. Runs in parallel with Task 6.
+
+**Interfaces (produces):**
+```ts
+/** Throws EvidenceError `unavailable` when the `outcomes` module is not ready. */
+export function queryRollup(store: EvidenceStore, target: RollupTarget,
+  options: { known: boolean; assessment: GoalAssessment | null; cost?: CostLookup }): OutcomeRollup;
+```
+
+**Decisions:** the readiness check of `queryCells` first, then one `store.read` that computes `db.index(target.kind, target.id)` and calls `rollupRecords`, then `buildRollup`. `unreadable` above 0 logs the existing once-per-process line. The assessment and `known` come from the route, because the goal and mission services live there.
+
+- [ ] **Step 1: Write the failing tests** in `tests/outcome-reads.test.ts`, with rows written through `writeOutcome`, `writeSummary`, and `writeMemberResult`.
+
+| Test name | Assertions |
+|---|---|
+| `a goal roll-up reads the runs of its goal` | R1 (summary and rows with goal G, one member result), R2 (summary with no goal, one row with G), R3 (goal H): `runs.total` 2, `members` 1, and the implementer cells' attempts plus open plus excluded equal the implementer rows of R1 and R2. Target H: `runs.total` 1. |
+| `a mission roll-up reads the runs of its mission` | Rows with mission M and a summary with mission N: target M gives the run of M only. |
+| `a goal the host no longer holds still rolls up` | `known` false with R1 stored: `runs.total` 1, `assessment` null, `rollupMissing` false. |
+| `a known mission with no runs rolls up empty` | `known` true, no row: `runs.total` 0, `counts` null, `implementer` `[]`, `rollupMissing` false. `known` false: true. |
+| `a deleted run's rows still roll up` | After `store.deleteRun(R1)`: `runs.deleted` 1 and R1's rows still counted. |
+| `unreadable records are counted` | One row's payload overwritten with `"x"` through `tx.run`: `unreadable.rows` 1, the other rows counted. |
+| `a roll-up needs a ready module` | With no `outcomes` module, and with a store whose path cannot open: `EvidenceError` with code `unavailable`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/outcome-reads.test.ts` and the typecheck.
+
+### Task 6: the import, and the guard on recomputation
+
+**Files:** `packages/host/src/outcome-import.ts`, `packages/host/src/outcome-signals.ts`, `tests/outcome-import.test.ts`, `tests/outcome-signals.test.ts`. Needs Tasks 2 and 4. Runs in parallel with Task 5.
+
+**Interfaces (produces):**
+```ts
+export type LegacyImportResult = { dryRun: boolean; outcomes: LegacyLineOutcome[]; removed: number };
+export class LegacyImportRefused extends Error { constructor(readonly code: "legacy-limit") }
+/** Throws EvidenceError `unavailable` when the module is not ready or a stored line does not open. */
+export function importLegacy(store: EvidenceStore, input: { dryRun: boolean; lines: LegacyOutcome[] },
+  options: { now: string; retentionDays?: number; cap?: number }): LegacyImportResult;
+// outcome-signals.ts: saveOutcomeRow throws Error("A legacy row keeps the levels of its import.") for source `legacy`.
+```
+
+**Decisions:**
+
+- **One transaction decides and writes.** A real import runs in one `store.write`: it reads the known state (`readLegacyLines` for every line's ref and `supersedes` ref, `outcomeSources` for every outcome id), calls `planLegacyBatch` with `ref: id => tx.index("legacy", id)`, checks the cap, and applies the effects in order. An insert is `writeOutcome` then `writeLegacyLine`. A supersede is `deleteLegacyOutcome` when `removeRow`, then `writeLegacyLine` with state `superseded`. A dry run computes the same plan in one `store.read` and writes nothing, so its outcomes equal those of a real run against the same state.
+- **The cap.** When `legacyLineCount + plan.newLines` exceeds `cap` (default `LEGACY_LINE_CAP`), the batch throws `LegacyImportRefused("legacy-limit")` and writes nothing, in a dry run too. *(My call: the host cannot see the file, so this bounds the table against a client that loops.)*
+- `retentionDays` defaults to `OUTCOME_RETENTION_DAYS`; the server passes the configured value. Any throw rolls the batch back, so a cut batch leaves no row and no line.
+- **No recomputation reaches a legacy row.** Every caller of `recomputeRun` names a run that has a run record or a summary: the signal route (a UUID), a scan (summaries), and the backfill (records). The guard in `saveOutcomeRow` makes a future caller fail loudly instead of rewriting the stored claim with host rules.
+
+- [ ] **Step 1: Write the failing tests** in `tests/outcome-import.test.ts`, with a temporary store and the `outcomes` and `configurations` modules registered.
+
+| Test name | Assertions |
+|---|---|
+| `a batch imports and a replay changes nothing` | Three lines: `[imported, imported, imported]`, three rows of source `legacy`, three lines `imported`. The same batch again: `[repeated, repeated, repeated]`, and every raw row of `outcomes` and `legacy_lines` is byte-equal to before. |
+| `the same id with another body is refused, and the rest of the batch imports` | Stored A; then `[A with attempts 2, C]`: `[changed, imported]`, A's raw row unchanged, C stored. |
+| `a superseded line is dropped in either order across batches` | Batch `[A]` then `[B supersedes A]`: A's row gone, `removed` 1. In a second store, `[B]` then `[A]`: `[superseded]` for A. Both stores then hold B's row only, A `superseded`, and B `imported`. |
+| `a batch cut in the middle writes nothing` | A wrapper around `store.write` whose `tx.run` throws at the batch's second `INSERT INTO outcomes`: `importLegacy` throws, and no row or line of the batch exists. The same batch then imports every line. |
+| `a dry run reports and writes nothing` | A dry run of `[A, B supersedes A]` gives the outcomes and `removed` of the real run that follows, and the tables are unchanged between them. |
+| `an unavailable store or module writes nothing` | No `outcomes` module, and a closed store: `EvidenceError` `unavailable`. |
+| `a stored line that does not open stops the batch` | A's `legacy_lines` payload set to `"x"`; batch `[A, C]`: throws `unavailable`, C not stored. |
+| `an id that collides with a stored row is refused` | A production row written with outcome id `legacyOutcomeId(index("legacy", "A"))`: line A gives `conflict`, and the row keeps source `production`. |
+| `the host caps legacy lines` | With `cap` 3 and two stored lines: a batch of two new lines throws `LegacyImportRefused` `legacy-limit` and writes nothing; a batch of the two stored lines and one new line imports. |
+| `legacy rows stay out of production readers` | After an import of an accepted and a rejected line: `productionRows` is empty; `queryCells` for `production` gives no cell; for `legacy` by `profile`, one cell with `key.source` `legacy`, `key.profile` `(legacy)`, `key.epoch` `0`, and `sources` `["legacy"]`; a `decision` that names `legacy` throws `CellQueryRefused` (acceptance 7, beside the existing `a query is refused in a fixed order` and `a refused query never reads`); `scorecardFromRows` over `productionRows` gives `rows: []`; the store sweep leaves both rows. |
+| `no plain column holds operator text` | A line with id `op-2026-10-01-oauth`, project `alpha`, label `oauth fix`, reviewer model `review-x`, and supersedes `op-old`: no plain column of `outcomes` or `legacy_lines` contains any of the five; the opened payload holds them. |
+| `a legacy row is never recomputed` (outcome-signals) | `saveOutcomeRow` on an imported row throws. `recomputeRun` for its run id throws, the write rolls back, and the raw row is unchanged. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/outcome-import.test.ts tests/outcome-signals.test.ts` and the typecheck.
+
+### Task 7: the routes, the CLI, and the docs
+
+**Files:** `server.ts`, `client.ts`, `docs/teams.md`, the spec, `tests/outcome-routes.test.ts`, `tests/goals.test.ts`, `tests/missions.test.ts`, `tests/remote-access.test.ts`, `tests/client-args.test.ts`. Needs Tasks 5 and 6.
+
+**Interfaces (produces):** `GET /api/outcomes/rollup?goal=ID | ?mission=ID` returning `OutcomeRollup`; `POST /api/outcomes/legacy` with a `legacyBatchSchema` body, returning `LegacyImportResult`; `infinite usage outcomes --goal ID | --mission ID [--json]`; `infinite usage outcomes import-legacy --file FILE [--dry-run] [--json]`; `export function outcomeRollupLines(rollup: OutcomeRollup): string[]` in `client.ts`.
+
+**Decisions:**
+
+- **`GET /api/outcomes/rollup`**, every paired device, as `GET /api/outcomes`. A strict query with `goal` or `mission`, each a UUID, exactly one of them; anything else is 400 through the existing handler. For a goal, `known` and `assessment` come from `goals.understandingRecords()`, which runs no tracker or usage refresh, and `latestAssessment(goal.outcomes)`. For a mission, `known` is `missions.hasRecordFile(id)` and the assessment is null. `cost` is the route's `sessionCost`. `rollupMissing` answers 404 `{ code: "rollup-not-found" }`; `unavailable` answers 503 `evidence-unavailable`.
+- **`POST /api/outcomes/legacy`**, `requireRole(["owner"])`. The body is `legacyBatchSchema(Date.now())`, so a batch of 50 lines of at most 1 KiB stays under the 96 KiB JSON limit. It carries no request id: a replay is idempotent by line id. `LegacyImportRefused` answers 409 `legacy-limit`; `unavailable` answers 503.
+- **The CLI.** `--goal` and `--mission` join `CLIENT_STRING_OPTIONS`, and `--dry-run` joins `CLIENT_BOOLEAN_OPTIONS`. The roll-up form runs before the cells form. `import-legacy` reads the file, calls `parseLegacyFile`, and on errors prints `Line N: <reason>` for each and `Nothing was sent.`, exiting non-zero. Otherwise it sends batches of 50 in file order, one at a time. It prints `Line N: changed` or `Line N: conflict` for each refused line, then one line `Imported I, repeated R, superseded S, expired E, refused F, removed X.`, prefixed `Dry run, nothing was written: ` for a dry run. It exits non-zero when a line was refused. A 403 prints `Importing legacy outcomes requires an owner device key.`; a 409 prints the cap; a 503 prints `The evidence store is unavailable. Lines 1 to N were sent; run the same command again to continue.` `--json` prints `{ dryRun, lines: [{ line, outcome }], removed }`.
+- **`outcomeRollupLines`.** (1) `Goal <id>` or `Mission <id>`, then ` · assessment <result> at <at>`, or ` · no assessment` for a goal without one, and ` · not held by the host` when `known` is false. (2) Runs, settled, deleted, and the status counts. (3) The summed counts and rounds, or `No run has settled, so its counts are unknown.` (4) Attempts by disposition. (5) The `outcomeCellLines` of each role's cells. (6) `Cost: tokens <n> over <complete> of <sessions> sessions`, or `tokens unknown`, then the metered spend when known, and the sessionless count when above 0. (7) Unreadable and unindexed counts when above 0. Every value passes through `clean`.
+- **Docs.** `docs/teams.md`, the ledger section: roll-ups, their membership rule, the assessment, the import, its limits, and that legacy rows appear only in `display` cells under `source=legacy`. The spec: part 6 "rows of the runs that carry the goal id"; part 7 the response, the 404 rule, and `POST /api/outcomes/legacy`; part 8 the outcome id form, the column values, rejected and `attempts` rules, retention by `recordedAt`, and the per-line outcomes.
+- No change to `remote-access.ts`, the web, the phone, or the Mac.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `a goal roll-up over a goal's run` (goals, host) | Extends `a goal with no justified change records evidence without starting implementation or claiming success`: after the stop, the owner records `not-achieved`; `/outcomes/rollup?goal=ID` as a viewer gives 200 with `assessment.result` `not-achieved`, `runs.total` 1, `runs.status` `{ "no-change": 1 }`, `implementer` `[]`, and `members` 1, within a `waitFor`. `usage outcomes --goal ID` prints a line that contains `assessment not-achieved`. |
+| `a mission roll-up over its subteams` (missions, host) | Extends `a mission dispatches dependent subteams across two repositories, routes their questions, and reports only after every subtask finishes`: `/outcomes/rollup?mission=ID` gives `runs.total` 2, and the implementer cells' attempts plus open plus excluded equal the implementer rows of the two subteams in `/outcomes/runs/:id`. |
+| `roll-up queries are checked` (outcome-routes, host) | `goal=x`, both parameters, and neither give 400. A random UUID gives 404 `rollup-not-found`. Extends `an unavailable store answers 503 and the status route still reports it`: the roll-up gives 503 `evidence-unavailable`. |
+| `the legacy import is owner-only and idempotent` (outcome-routes, host) | A file of three lines: `--dry-run` prints `Dry run` and `Imported 3`, and `/evidence/status` keeps `outcomes.legacy` 0. The import prints `Imported 3`; a second run prints `repeated 3`. `/outcomes?sources=legacy` gives one cell with `key.source` `legacy`; `/outcomes` gives no cell; `/usage/models` gives `rows: []`. A viewer key prints the owner-key sentence. A POST of 51 lines, or of a line with an unknown key, gives 400. |
+| `the CLI checks the file before it sends` (outcome-routes, host) | A file whose line 2 is not JSON exits non-zero with `Line 2` and `Nothing was sent.`, and `outcomes.legacy` is unchanged. A file of 20,001 lines exits non-zero with `file-too-long`. |
+| `the relay refuses roll-ups and imports` (remote-access) | `["GET", "/outcomes/rollup?goal=<uuid>"]` and `["POST", "/outcomes/legacy"]` join the paths that answer 403 `remote-endpoint-denied`. |
+| `roll-up and import options parse` (client-args) | `parseClientArgs` keeps the values of `--goal`, `--mission`, and `--file`, and sets `--dry-run` to true. `clientCommandCandidate(["--dry-run", "usage"])` is `usage`. |
+| `roll-up lines show unknown, never zero` (client-args) | A roll-up with `counts` null prints `counts are unknown`; `tokens` null prints `tokens unknown`; a goal with no assessment prints `no assessment`; `known` false prints `not held by the host`; `unreadable.rows` 2 prints a line with `2 rows`; a key value with a control character prints a space there. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement**, and amend the docs and the spec. **Step 4: Run** `tests/client-args.test.ts`, then `tests/outcome-routes.test.ts` and `tests/remote-access.test.ts` on the host, then the two extended tests in `tests/goals.test.ts` and `tests/missions.test.ts` on the host, then the typecheck.
+- [ ] **Step 5: The coordinator runs `npm run check` once, requests the independent review, and commits.**
+
+## Not in this slice
+
+- A roll-up per goal cycle, a cache for roll-ups, and any web, phone, or Mac view of a roll-up or of legacy rows.
+- Stored cost from the usage ledger. The roll-up uses the session lookup, as the scorecard does.
+- Relay access to `/api/outcomes/rollup` or `/api/outcomes/legacy`.
+- A `decision` use of legacy rows (umbrella C6), and memory's read of them (INF-141).
+- A withdrawal or edit of a legacy line other than a new id with `supersedes`, and a purge of legacy rows by project.
+- A goal removal path. `goals.ts` has none, so the host test cannot reach a removed goal; Task 5 holds the rule.
+- Rates for members that have no task (a spec non-goal). The roll-up counts member results and their cost only.

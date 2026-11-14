@@ -17,8 +17,8 @@ export type ScanCommit = { id: string; tree: string; parents: string[] };
 /** `base` is the base commit the run's reviewed head was built on. */
 export type LandingCandidate = { runId: string; reviewedHead?: string; reviewedTree?: string; mergeCommit?: string; base?: string };
 export type Landing = { runId: string; commit: string; method: LandingMethod; position: number; reviewedHead?: string };
-/** `position` is set when the run landed in this scan. */
-export type LandedRun = { runId: string; signalId: string; ids: string[]; holdUntil: string; position?: number };
+/** `commit` is the landing commit, the first of `ids`. `position` is set when the run landed in this scan. */
+export type LandedRun = { runId: string; signalId: string; commit: string; ids: string[]; holdUntil: string; position?: number };
 export type RevertMatch = { runId: string; signalId: string; commit: string; reverts: string };
 
 /**
@@ -82,14 +82,18 @@ export function revertPattern(id: string): string {
 
 /**
  * Rule 4. `hits` maps a landed id to the commits whose message names it, as form 5 reports them.
- * A revert counts once per landing signal and reverting commit. It needs `holdUntil >= at`, and,
- * for a run that landed in this scan, a position after the landing's.
+ * A revert counts once per landing signal and reverting commit. It needs `holdUntil >= at`, and
+ * it must come after the landing commit. A run that landed in this scan has its position. For a
+ * landing of an earlier scan, a scan of new commits lists only commits after it. A scan that
+ * rereads older history (`older`) must find the landing commit in its list; when it cannot, the
+ * order is unknown and nothing is matched.
  */
 export function matchReverts(
   commits: readonly ScanCommit[],
   landed: readonly LandedRun[],
   hits: ReadonlyMap<string, ReadonlySet<string>>,
   at: string,
+  older = false,
 ): RevertMatch[] {
   const positions = new Map<string, number>();
   commits.forEach((commit, position) => {
@@ -99,13 +103,18 @@ export function matchReverts(
   const matches: RevertMatch[] = [];
   for (const run of landed) {
     if (Date.parse(run.holdUntil) < atMs) continue;
+    let landing = run.position;
+    if (landing === undefined && older) {
+      landing = positions.get(run.commit);
+      if (landing === undefined) continue;
+    }
     const seen = new Set<string>();
     for (const id of run.ids) {
       for (const commit of hits.get(id) ?? []) {
         if (seen.has(commit)) continue;
         const position = positions.get(commit);
         if (position === undefined) continue;
-        if (run.position !== undefined && position <= run.position) continue;
+        if (landing !== undefined && position <= landing) continue;
         seen.add(commit);
         matches.push({ runId: run.runId, signalId: run.signalId, commit, reverts: id });
       }

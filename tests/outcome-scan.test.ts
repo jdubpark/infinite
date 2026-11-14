@@ -889,6 +889,44 @@ test("a fetch whose head is not a commit id is ignored", async () => {
   }
 });
 
+test("a rescan of older history counts no revert from before the landing", async () => {
+  const repo = repos();
+  const store = openStore(repo.root, "state");
+  try {
+    commitFile(repo.seed, "base.txt", "base");
+    const tip = branchCommit(repo.seed, "run-r", "r.txt");
+    // A commit on main that names the run's head, before the merge that lands it.
+    git(repo.seed, "commit", "-q", "--allow-empty", "-m", `Undo an earlier try\n\nThis reverts commit ${tip}.`);
+    const merge = mergeBranch(repo.seed, "run-r");
+    push(repo.seed);
+    recordRun(store, "run-r", { reviewedHead: tip });
+    const landed = await scanFetch(store, repo, fetchOf(repo, 0));
+    assert.deepEqual({ landings: landed.landings, reverts: landed.reverts }, { landings: 1, reverts: 0 });
+    const reverts = () => store.read(db => db.get<{ n: number }>("SELECT count(*) AS n FROM outcome_signals WHERE kind='revert'"))?.n;
+
+    // One more commit, and a fetch that cannot continue the ledger: the scan rereads the whole history.
+    commitFile(repo.seed, "next.txt", "next");
+    push(repo.seed);
+    const { previousSince: _first, ...unproven } = fetchOf(repo, 1);
+    const reread = await scanFetch(store, repo, unproven);
+    assert.deepEqual({ state: reread.state, gap: reread.gap, reverts: reread.reverts }, { state: "scanned", gap: "rewrite", reverts: 0 });
+    assert.equal(reverts(), 0);
+    assert.equal(outcomeOf(store, "run-r")?.held, null);
+
+    // A revert after the landing commit is still found by such a scan.
+    git(repo.seed, "revert", "--no-edit", "-m", "1", merge);
+    push(repo.seed);
+    const { previousSince: _second, ...again } = fetchOf(repo, 2);
+    const found = await scanFetch(store, repo, again);
+    assert.deepEqual({ gap: found.gap, reverts: found.reverts }, { gap: "rewrite", reverts: 1 });
+    assert.equal(reverts(), 1);
+    assert.equal(outcomeOf(store, "run-r")?.held, 0);
+  } finally {
+    store.close();
+    repo.close();
+  }
+});
+
 test("older history lands a tree only on the reviewed head", async () => {
   const repo = repos();
   const store = openStore(repo.root, "state");

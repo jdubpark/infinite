@@ -464,6 +464,20 @@ test("a backfilled run takes the signals it already has", () => {
     assert.equal(store.read(db => readOutcome(db, "run-signal:m1"))?.held, 0);
     // Control: the run with no signal keeps its unknown hold, as before.
     assert.equal(store.read(db => readOutcome(db, "run-plain:m1"))?.held, null);
+
+    // A run whose signal does not open is not written: its rows could not take the signal. It stays pending, and
+    // the runs after it are still written.
+    store.write(tx => {
+      writeSummary(tx, eventMade("run-broken"));
+      writeSummary(tx, eventMade("run-after"));
+    });
+    ownerSignal(store, { action: "record", kind: "linked-fix", requestId: "fix-2", runId: "run-broken" }, AT);
+    const unreadable = JSON.stringify({ v: 1, n: "AAAAAAAAAAAAAAAA", c: "AA==", t: "AAAAAAAAAAAAAAAAAAAAAA==" });
+    store.write(tx => tx.run("UPDATE outcome_signals SET payload=? WHERE run_id=?", unreadable, "run-broken"));
+    const more = () => [approvedRun("run-broken"), approvedRun("run-after")];
+    assert.deepEqual(backfillTick(store, more, options), { written: 1, remaining: 1 });
+    assert.equal(store.read(db => readOutcome(db, "run-broken:m1")), undefined);
+    assert.equal(store.read(db => readOutcome(db, "run-after:m1"))?.held, null);
   } finally {
     close();
   }

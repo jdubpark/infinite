@@ -539,3 +539,43 @@ test("the head's start stamp follows the head, and stamps never go back", async 
     assert.deepEqual([changed.mirrorHead, changed.mirrorHeadSince, changed.fetchStamp], [undefined, undefined, sixth.fetchStamp]);
   } finally { f.close(); }
 });
+
+test("a head that an unrecorded fetch left in the mirror is noted before the next fetch", async () => {
+  const f = fixture();
+  try {
+    const calls: MirrorFetch[] = [];
+    const service = new ProjectSourceService(f.config, { running: async () => true, onMirror: fetch => { calls.push(fetch); } });
+    const first = await service.refresh("example");
+    assert.equal(first.mirrorHead, f.commitA);
+    const mirror = service.mirrorPath("example");
+
+    // A fetch moves the mirror to B, and the host stops before it writes the status. Then the remote goes back to A.
+    const commitB = f.push("B\n", "Commit B");
+    git(mirror, "fetch", "--no-tags", f.origin, "+refs/heads/main:refs/heads/main");
+    git(f.seed, "reset", "--hard", f.commitA);
+    git(f.seed, "push", "--force", "origin", "main");
+    const second = await service.refresh("example");
+
+    // The head the mirror held is noted as a fetch of its own, before the fetch that replaces it.
+    assert.equal(calls.length, 3);
+    assert.deepEqual([calls[1]!.head, calls[1]!.previousHead, calls[1]!.previousSince], [commitB, f.commitA, first.mirrorHeadSince]);
+    assert.deepEqual([calls[2]!.head, calls[2]!.previousHead, calls[2]!.previousSince], [f.commitA, commitB, calls[1]!.fetchedAt]);
+    assert.ok(Date.parse(first.fetchStamp!) < Date.parse(calls[1]!.fetchedAt) && Date.parse(calls[1]!.fetchedAt) < Date.parse(calls[2]!.fetchedAt));
+    assert.equal(second.mirrorHead, f.commitA);
+    assert.equal(second.mirrorHeadSince, calls[2]!.fetchedAt, "the head that came back stands since this fetch, not since the first one");
+    assert.equal(second.fetchStamp, calls[2]!.fetchedAt);
+
+    // An unmoved mirror adds no notice of its own.
+    await service.refresh("example");
+    assert.equal(calls.length, 4);
+    assert.deepEqual([calls[3]!.previousHead, calls[3]!.previousSince], [f.commitA, second.mirrorHeadSince]);
+
+    // A branch that cannot be read: the recorded head has no start the host can vouch for, so the notice names none.
+    git(mirror, "update-ref", "-d", "refs/heads/main");
+    const fifth = await service.refresh("example");
+    assert.equal(calls.length, 5);
+    assert.equal(calls[4]!.previousHead, f.commitA);
+    assert.equal("previousSince" in calls[4]!, false);
+    assert.equal(fifth.mirrorHeadSince, fifth.fetchStamp);
+  } finally { f.close(); }
+});

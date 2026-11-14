@@ -1456,7 +1456,8 @@ GitHub-tracked sources add these operations. The host runs each through
 
 - in a host mirror: `init --bare` when the mirror is created, `fetch --no-tags` of
   the base branch from the GitHub URL into `refs/heads/BASE`, and `rev-parse` of
-  that ref;
+  that ref before and after the fetch. The read before the fetch finds a head
+  that an earlier fetch left without a record, and the host notes it first;
 - in a host mirror, after each successful fetch: the base scan forms in the
   table below;
 - in a project source directory: `rev-parse --show-toplevel` (the refresh
@@ -1892,6 +1893,9 @@ The remote relay refuses this route with `403` and `code:
 "remote-endpoint-denied"`.
 
 `GET /api/outcomes/runs/:runId` lists the run's signals, withdrawn ones included.
+`unreadable` counts the signals of the run that the store could not read. A run
+with such a signal keeps the levels it had: the host does not recompute its rows
+without every signal, and an owner claim on it answers `503`.
 `infinite usage outcomes --run ID` prints one line per signal.
 
 ```sh

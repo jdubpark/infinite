@@ -69,6 +69,14 @@ export class SignalRequestError extends Error {
 }
 
 const DAY_MS = 86_400_000;
+/** A signal of the run does not open, so no level of the run can be recomputed from its signals. */
+export class SignalUnreadableError extends EvidenceError {
+  constructor() {
+    super("unavailable", "A signal of the run cannot be read.");
+    this.name = "SignalUnreadableError";
+  }
+}
+
 const TIME_INVALID = "The signal time is not a date.";
 const UNAVAILABLE = "The outcome signals are unavailable.";
 
@@ -95,7 +103,7 @@ export function ratingSignalId(eventKey: string): string {
  * review accepted it. A fix counts when the run has no landing, or when it is no later than the landing's close.
  */
 export function rowSignals(db: EvidenceDb, row: OutcomeRow): RowSignalFacts {
-  const active = runSignals(db, row.runId).filter(signal => signal.state === "active");
+  const active = everySignal(db, row.runId).filter(signal => signal.state === "active");
   const excluded = active.some(signal => signal.payload.kind === "exclusion" && signal.outcomeId === row.outcomeId);
   let landing: { signal: SignalRow; payload: LandingPayload } | undefined;
   for (const signal of active) {
@@ -151,6 +159,18 @@ export function saveOutcomeRow(tx: EvidenceTx, row: OutcomeRow): void {
   if (facts.landing) row.payload.landing = { at: facts.landing.at, method: facts.landing.method };
   else delete row.payload.landing;
   writeOutcome(tx, row);
+}
+
+/**
+ * The run's signals for a recomputation. Each one must open: a signal that cannot be read may be the linked fix that
+ * makes held no, or the exclusion that keeps a row out of the rates. A display may leave such a signal out; a save
+ * may not.
+ */
+function everySignal(db: EvidenceDb, runId: string): SignalRow[] {
+  const signals = runSignals(db, runId);
+  const stored = db.get<{ n: number }>("SELECT count(*) AS n FROM outcome_signals WHERE run_id=?", runId)?.n ?? 0;
+  if (signals.length !== stored) throw new SignalUnreadableError();
+  return signals;
 }
 
 /** Saves every row of a run, deleted runs included. It writes no summary. */
@@ -291,7 +311,7 @@ export function scanInputs(db: EvidenceDb, projectId: string, at: string): ScanI
     if (signal.payload.kind !== "landing") continue;
     const { commit, method, reviewedHead, holdUntil: close } = signal.payload;
     if (Date.parse(close) < atMs) continue;
-    open.push({ runId: signal.runId, signalId: signal.signalId, ids: landedIds(method, commit, reviewedHead), holdUntil: close });
+    open.push({ runId: signal.runId, signalId: signal.signalId, commit, ids: landedIds(method, commit, reviewedHead), holdUntil: close });
   }
   return { ...(state === undefined ? {} : { state }), candidates, open };
 }
@@ -400,7 +420,7 @@ export function applyScan(tx: EvidenceTx, scan: ScanWrite): { applied: boolean; 
     touched.add(landing.runId);
   }
   for (const runId of decideWindows(tx, ref, at)) touched.add(runId);
-  for (const runId of touched) recomputeRun(tx, runId);
+  for (const runId of touched) recomputeAfterScan(tx, runId);
   return { applied: true, seq };
 }
 
@@ -418,8 +438,21 @@ export function applyCheck(tx: EvidenceTx, check: { projectId: string; head: str
   if (last !== undefined && time < Date.parse(last.checkedAt)) return { applied: false };
   const at = new Date(time).toISOString();
   checkScan(tx, ref, state.seq, at);
-  for (const runId of decideWindows(tx, ref, at)) recomputeRun(tx, runId);
+  for (const runId of decideWindows(tx, ref, at)) recomputeAfterScan(tx, runId);
   return { applied: true };
+}
+
+/**
+ * Recomputes a run that a scan touched. A run with a signal that does not open is left as it is, so that it cannot hold
+ * up the other runs of the project. Its rows keep their levels: a scan writes a landing, a revert inside an open
+ * window, or a verdict, so the levels it leaves stale are unknown or no, never a yes that should be a no.
+ */
+function recomputeAfterScan(tx: EvidenceTx, runId: string): void {
+  try {
+    recomputeRun(tx, runId);
+  } catch (error) {
+    if (!(error instanceof SignalUnreadableError)) throw error;
+  }
 }
 
 /**

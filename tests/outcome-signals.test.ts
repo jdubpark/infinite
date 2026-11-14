@@ -19,6 +19,7 @@ import {
   readSignal,
   readSummary,
   runOutcomes,
+  runOutcomeView,
   runSignals,
   type RunSummaryRow,
   type SignalRow,
@@ -733,7 +734,7 @@ test("scan inputs list candidates and open landings", () => {
     assert.equal(inputs.candidates.some(candidate => candidate.runId === RUN), false);
 
     // RUN's hold runs to day 30, so it is open. RUN_E's hold ended at day 0, before `at`.
-    assert.deepEqual(inputs.open, [{ runId: RUN, signalId: landingSignalId(RUN), ids: [MERGE], holdUntil: day(30) }]);
+    assert.deepEqual(inputs.open, [{ runId: RUN, signalId: landingSignalId(RUN), commit: MERGE, ids: [MERGE], holdUntil: day(30) }]);
   } finally {
     h.close();
   }
@@ -797,6 +798,55 @@ function corruptPayload(h: Harness, table: "outcome_signals" | "outcomes", key: 
   const garbage = JSON.stringify({ v: 1, n: "AAAAAAAAAAAAAAAA", c: "AA==", t: "AAAAAAAAAAAAAAAAAAAAAA==" });
   h.store.write(tx => tx.run(`UPDATE ${table} SET payload=? WHERE ${column}=?`, garbage, key));
 }
+
+test("a signal that does not open stops every recomputation of its run", () => {
+  const h = harness();
+  try {
+    h.flush([...standardRun(RUN), ...standardRun(RUN_B)]);
+    land(h, RUN, day(0));
+    land(h, RUN_B, day(0));
+    // A linked fix inside the window makes RUN's accepted row not held. Then its payload stops opening.
+    ownerSignal(h.store, { action: "record", kind: "linked-fix", requestId: "fix-1", runId: RUN }, at(20));
+    assert.equal(rowOf(h.store, RUN, "m1")?.held, 0);
+    corruptPayload(h, "outcome_signals", ownerSignalId("fix-1"), "signal_id");
+    const before = plain(rowOf(h.store, RUN, "m1"));
+
+    // A direct recomputation fails: the fix may be the one signal that makes held no.
+    assert.throws(
+      () => h.store.write(tx => recomputeRun(tx, RUN)),
+      error => error instanceof EvidenceError && error.code === "unavailable",
+    );
+    // The check that closes both windows still applies. RUN_B is decided and recomputed; RUN keeps its row.
+    assert.equal(checkAt(h, day(31)).applied, true);
+    assert.equal(rowOf(h.store, RUN_B, "m1")?.held, 1);
+    assert.deepEqual(plain(rowOf(h.store, RUN, "m1")), before);
+    const landing = h.store.read(db => readSignal(db, landingSignalId(RUN)));
+    assert.equal(landing?.payload.kind === "landing" ? landing.payload.window?.state : undefined, "covered");
+
+    // A projector event of the run cannot save the row, so the row does not turn to held yes and takes no rating.
+    h.flush([ev("rating.recorded", RUN, at(30), { memberId: "m1", data: { score: 4 } })]);
+    assert.deepEqual(plain(rowOf(h.store, RUN, "m1")), before);
+    // An owner claim on the run is unavailable and writes nothing.
+    assert.throws(
+      () => ownerSignal(h.store, { action: "record", kind: "exclusion", requestId: "excl-1", runId: RUN, memberId: "m1", reason: "trial" }, at(40)),
+      error => error instanceof EvidenceError && error.code === "unavailable",
+    );
+    assert.equal(h.store.read(db => readSignal(db, ownerSignalId("excl-1"))), undefined);
+    // A display still lists the signals that open, and counts the one that does not.
+    const view = runOutcomeView(h.store, RUN);
+    assert.deepEqual([view?.signals.map(signal => signal.kind), view?.unreadable], [["landing"], 1]);
+
+    // An exclusion that stops opening does not put its row back into the rates.
+    ownerSignal(h.store, { action: "record", kind: "exclusion", requestId: "excl-b", runId: RUN_B, memberId: "m1", reason: "trial" }, at(41));
+    assert.equal(rowOf(h.store, RUN_B, "m1")?.exclusion, "owner");
+    corruptPayload(h, "outcome_signals", ownerSignalId("excl-b"), "signal_id");
+    h.flush([ev("rating.recorded", RUN_B, at(42), { memberId: "m1", data: { score: 5 } })]);
+    assert.equal(rowOf(h.store, RUN_B, "m1")?.exclusion, "owner");
+    assert.deepEqual(levelsOf(rowOf(h.store, RUN_B, "m1")), [null, null, null, null]);
+  } finally {
+    h.close();
+  }
+});
 
 test("an unreadable signal is never overwritten", () => {
   const h = harness();

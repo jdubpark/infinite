@@ -139,6 +139,7 @@ async function findReverts(
   commits: readonly ScanCommit[],
   landed: readonly LandedRun[],
   at: string,
+  older: boolean,
 ): Promise<RevertMatch[]> {
   const patterns = [...new Set(landed.flatMap(run => run.ids))];
   const hits = new Map<string, Set<string>>();
@@ -160,7 +161,7 @@ async function findReverts(
       }
     }
   }
-  return matchReverts(commits, landed, hits, at);
+  return matchReverts(commits, landed, hits, at, older);
 }
 
 /**
@@ -243,12 +244,13 @@ export async function scanOnce(input: ScanOnceInput): Promise<ScanResult> {
       ...landings.map(landing => ({
         runId: landing.runId,
         signalId: landingSignalId(landing.runId),
+        commit: landing.commit,
         ids: landedIds(landing.method, landing.commit, landing.reviewedHead),
         holdUntil: holdUntil(fetch.fetchedAt, holdDays),
         position: landing.position,
       })),
     ];
-    const reverts = landed.length === 0 ? [] : await findReverts(git, mirror, commits, landed, fetch.fetchedAt);
+    const reverts = landed.length === 0 ? [] : await findReverts(git, mirror, commits, landed, fetch.fetchedAt, older);
 
     const write: ScanWrite = {
       projectId: fetch.projectId,

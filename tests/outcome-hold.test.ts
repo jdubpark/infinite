@@ -122,13 +122,13 @@ test("reverts follow their landing", () => {
     new Map(ids.map((id) => [id, new Set([commit])] as const));
 
   // A landing of an earlier scan, with a hit at position 0.
-  const earlier: LandedRun = { runId: "r", signalId: "s1", ids: ["L"], holdUntil: H };
+  const earlier: LandedRun = { runId: "r", signalId: "s1", commit: "L", ids: ["L"], holdUntil: H };
   const earlierMatches = matchReverts(commits, [earlier], hitsAt(["L"], "c0"), "2026-12-01T00:00:00.000Z");
   assert.equal(earlierMatches.length, 1);
   assert.equal(earlierMatches[0].commit, "c0");
 
   // A landing at position 2 of this scan, with hits at positions 1 and 3.
-  const sameScan: LandedRun = { runId: "r", signalId: "s2", ids: ["L"], holdUntil: H, position: 2 };
+  const sameScan: LandedRun = { runId: "r", signalId: "s2", commit: "L", ids: ["L"], holdUntil: H, position: 2 };
   const hits = new Map([["L", new Set(["c1", "c3"])]]);
   const sameMatches = matchReverts(commits, [sameScan], hits, "2026-12-01T00:00:00.000Z");
   assert.deepEqual(
@@ -137,16 +137,29 @@ test("reverts follow their landing", () => {
   );
 
   // holdUntil one millisecond before the time of the scan: no match.
-  const expired: LandedRun = { runId: "r", signalId: "s3", ids: ["L"], holdUntil: H };
+  const expired: LandedRun = { runId: "r", signalId: "s3", commit: "L", ids: ["L"], holdUntil: H };
   assert.deepEqual(matchReverts(commits, [expired], hitsAt(["L"], "c0"), "2026-12-13T00:00:00.001Z"), []);
 
   // Two ids of one run naming one commit: one match.
-  const twoIds: LandedRun = { runId: "r", signalId: "s4", ids: ["L1", "L2"], holdUntil: H };
+  const twoIds: LandedRun = { runId: "r", signalId: "s4", commit: "L1", ids: ["L1", "L2"], holdUntil: H };
   const both = new Map([
     ["L1", new Set(["c0"])],
     ["L2", new Set(["c0"])],
   ]);
   assert.equal(matchReverts(commits, [twoIds], both, "2026-12-01T00:00:00.000Z").length, 1);
+
+  // A scan of older history rereads commits from before an earlier landing. There a revert must follow the landing
+  // commit in the list: c1 names the reviewed head and comes before the landing commit c2, so only c3 counts.
+  const reread: LandedRun = { runId: "r", signalId: "s5", commit: "c2", ids: ["c2", "head"], holdUntil: H };
+  const named = new Map([["head", new Set(["c1", "c3"])]]);
+  assert.deepEqual(matchReverts(commits, [reread], named, "2026-12-01T00:00:00.000Z", true).map((m) => m.commit), ["c3"]);
+  // A landing commit that is not in the list leaves the order unknown, and nothing is matched.
+  const absent: LandedRun = { ...reread, commit: "gone", ids: ["gone", "head"] };
+  assert.deepEqual(matchReverts(commits, [absent], named, "2026-12-01T00:00:00.000Z", true), []);
+  // A scan of new commits lists only commits after an earlier landing, so both count there.
+  assert.deepEqual(matchReverts(commits, [reread], named, "2026-12-01T00:00:00.000Z").map((m) => m.commit), ["c1", "c3"]);
+  // A run that landed in this scan keeps its own position in both kinds of scan.
+  assert.deepEqual(matchReverts(commits, [{ ...reread, position: 2 }], named, "2026-12-01T00:00:00.000Z", true).map((m) => m.commit), ["c3"]);
 });
 
 test("window coverage", () => {

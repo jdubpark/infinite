@@ -125,13 +125,33 @@ function replaceable(systemPath: string, installed: CeilingFileStat, fs: Ceiling
   return problems;
 }
 
-// The value of a Codex `key=value` override, with one pair of TOML quotes removed.
+const TOML_ESCAPES: Record<string, string> = { b: "\b", t: "\t", n: "\n", f: "\f", r: "\r", e: "\u001b", '"': '"', "\\": "\\" };
+
+// What a TOML string literal means: basic and literal strings, one-line and multi-line. Text that is not a
+// string literal is returned as written, which is how Codex reads an override value that is not valid TOML.
+function tomlString(value: string): string {
+  const unescape = (text: string) =>
+    text.replace(/\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|([\s\S]))/g, (whole, short?: string, long?: string, char?: string) => {
+      if (short || long) {
+        const point = Number.parseInt(short ?? long!, 16);
+        return point <= 0x10ffff ? String.fromCodePoint(point) : whole;
+      }
+      return TOML_ESCAPES[char!] ?? whole;
+    });
+  for (const [quote, basic] of [['"""', true], ["'''", false], ['"', true], ["'", false]] as const) {
+    if (value.length < quote.length * 2 || !value.startsWith(quote) || !value.endsWith(quote)) continue;
+    let inner = value.slice(quote.length, value.length - quote.length);
+    if (quote.length === 3) inner = inner.replace(/^\r?\n/, "");
+    return basic ? unescape(inner) : inner;
+  }
+  return value;
+}
+
+// The value of a Codex `key=value` override, read as Codex reads it.
 function overrideValue(text: string, key: string): string | undefined {
   const equals = text.indexOf("=");
   if (equals < 0 || text.slice(0, equals).trim() !== key) return undefined;
-  const value = text.slice(equals + 1).trim();
-  const quoted = /^"(.*)"$/.exec(value) ?? /^'(.*)'$/.exec(value);
-  return quoted ? quoted[1] : value;
+  return tomlString(text.slice(equals + 1).trim());
 }
 
 // Launch arguments the ceiling forbids. Matching is on argument boundaries: a flag, a flag with its value as the
@@ -178,7 +198,10 @@ export function checkCeiling(input: CeilingCheckInput): CeilingLine[] {
     else line("writable", "ok", "a regular root-owned file, not group- or world-writable, under root-owned directories");
 
     const template = fs.read(templatePath);
-    if (!template) {
+    // Only a regular file is read. Opening a pipe or a device here would block, and the warning above would never print.
+    if (installed.kind !== "file") {
+      line("hash", "changed", `${systemPath} was not read: it is not a regular file`);
+    } else if (!template) {
       line("hash", "missing", `shipped template not found at ${templatePath}; this release cannot verify the ceiling`);
     } else {
       const expected = sha256(template);

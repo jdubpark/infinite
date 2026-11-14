@@ -106,6 +106,16 @@ test("a ceiling that is a symbolic link reports writable, even when its target m
   assert.match(writable.detail, /symbolic link/);
 });
 
+test("an entry that is not a regular file is reported without being opened", () => {
+  // A named pipe with no writer would block a read forever.
+  const base = healthy({ [SYSTEM]: { kind: "other", mode: 0o644 } });
+  const fs: CeilingFs = { stat: base.stat, read: (path) => { assert.notEqual(path, SYSTEM, "the ceiling path must not be read"); return base.read(path); } };
+  const lines = run({ fs });
+  assert.equal(byCheck(lines, "writable").status, "writable");
+  assert.equal(byCheck(lines, "hash").status, "changed");
+  assert.equal(byCheck(lines, "profile").status, "ok");
+});
+
 test("a directory higher up that another account can change reports writable", () => {
   assert.match(byCheck(run({ fs: healthy({ "/etc": { uid: 1001, mode: 0o755 } }) }), "writable").detail, /\/etc is owned by uid 1001/);
   assert.match(byCheck(run({ fs: healthy({ "/etc/claude-code": { kind: "symlink", mode: 0o777 } }) }), "writable").detail, /\/etc\/claude-code is a symbolic link/);
@@ -114,6 +124,9 @@ test("a directory higher up that another account can change reports writable", (
 test("launch flags the ceilings turn off are found in each spelling, and look-alikes are not", () => {
   for (const args of [["--permission-mode", "auto"], ["--permission-mode=auto"], ["--permission-mode=bypassPermissions"]])
     assert.equal(forbiddenLaunchFlags("claude", args).length, 1, args.join(" "));
+  // Codex reads an override value as TOML, so every string form of the same value counts.
+  for (const value of ['"""danger-full-access"""', "'''danger-full-access'''", '"\\u0064anger-full-access"', '"danger\\u002Dfull-access"'])
+    assert.equal(forbiddenLaunchFlags("codex", ["--config", `sandbox_mode=${value}`]).length, 1, value);
   for (const args of [["--yolo"], ["-c", "sandbox_mode='danger-full-access'"], ["--config", "sandbox_mode = \"danger-full-access\""], ["--config=sandbox_mode=danger-full-access"], ["--sandbox=danger-full-access"], ["-s", "danger-full-access"]])
     assert.equal(forbiddenLaunchFlags("codex", args).length, 1, args.join(" "));
   // Another key whose value only mentions the mode, and a prompt that mentions the flag text.

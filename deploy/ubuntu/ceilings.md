@@ -91,7 +91,7 @@ What the install script does:
 - Creates each directory as `root:root` mode `0755` if it does not exist. If it exists with another owner or mode, the script sets `root:root` `0755` and lists the directory, because another account could write it before. Remove any entry that does not belong.
 - Installs each file as `root:root` mode `0644`.
 - Writes through a temporary file and renames it into place. The rename replaces the entry itself, so a symbolic link at the file's path is replaced and never followed.
-- If a regular file exists and differs, keeps a copy under a new name with a UTC timestamp and a random suffix, for example `/etc/codex/requirements.toml.before-ceilings-20260101T000000Z.Ab3dEf`. If the entry was a symbolic link or a special file, no copy is kept.
+- If a regular file exists and differs, keeps a copy under a new name with a UTC timestamp and a random suffix, for example `/etc/codex/requirements.toml.before-ceilings-20260101T000000Z.Ab3dEf`. The copy is readable by root only, because the file it copies may have been restricted. If the entry was a symbolic link or a special file, no copy is kept.
 - Prints the SHA-256 of each installed file.
 - Changes no file when the installed file already matches the template and has the right owner and mode.
 
@@ -101,7 +101,7 @@ What the install script does:
 
 - `present`: the system file exists.
 - `writable`: the file is a regular root-owned file that is not group- or world-writable, and every directory above it up to the root is a real root-owned directory that is not group- or world-writable. A symbolic link at the file's path or above it is reported, even when its target matches the template.
-- `hash`: the installed file matches the template shipped in the running release.
+- `hash`: the installed file matches the template shipped in the running release. An entry that is not a regular file is reported as `changed` and is not opened.
 - `profile`: the configured launch arguments and app-server arguments contain no flag that the ceiling forbids.
 
 A `missing`, `changed`, `writable`, or `conflict` word prints as a warning. Doctor does not stop on a warning.
@@ -109,9 +109,9 @@ A `missing`, `changed`, `writable`, or `conflict` word prints as a warning. Doct
 Forbidden flags:
 
 - Claude Code: `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`, `--enable-auto-mode`, and `--permission-mode` with `bypassPermissions` or `auto`.
-- Codex: `--dangerously-bypass-approvals-and-sandbox`, `--yolo`, `--sandbox` or `-s` with `danger-full-access`, and a `-c` or `--config` override that sets `sandbox_mode` to `danger-full-access`, with or without quotes.
+- Codex: `--dangerously-bypass-approvals-and-sandbox`, `--yolo`, `--sandbox` or `-s` with `danger-full-access`, and a `-c` or `--config` override that sets `sandbox_mode` to `danger-full-access`, written bare or as any TOML string.
 
-A value may follow its flag as the next argument or after `=`. The check reads the configured arguments only. It does not read a Codex profile or a configuration file that an argument names.
+A value may follow its flag as the next argument or after `=`. The check reads the configured arguments only. It does not read a Codex profile or a configuration file that an argument names. It is a warning for the owner. The ceiling file is what clamps the mode.
 
 ## How the hash check works
 

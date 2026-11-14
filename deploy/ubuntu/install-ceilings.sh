@@ -149,10 +149,10 @@ process() {
       printf 'Replacing %s, which was not a regular file. No copy was kept.\n' "$target"
     elif [ -f "$target" ]; then
       # A new file with an unpredictable name: an existing name here could be a planted link.
+      # It stays readable by root only: the file it copies may have been restricted.
       backup=$(mktemp "$target.before-ceilings-$stamp.XXXXXX")
       cat "$target" > "$backup"
-      chmod 0644 "$backup"
-      printf 'Kept previous copy at %s\n' "$backup"
+      printf 'Kept previous copy at %s (root only)\n' "$backup"
     fi
     # Write beside the target and rename, so a reader never sees a partial file.
     temporary=$(mktemp "$dir/.ceiling.XXXXXX")

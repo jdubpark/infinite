@@ -23,7 +23,7 @@ const slackLink = (thread: IntakeThread) => `https://example.slack.com/archives/
  * A real host through createApp, with Linear and (optionally) Slack fakes and two repository projects the mission
  * fixture agent can work in. Intake polls Linear every 30 seconds, so each issue is filed after the host starts.
  */
-async function intakeHost(withSlack: boolean) {
+async function intakeHost(withSlack: boolean, direct = false) {
   const root = realpathSync(mkdtempSync("/tmp/inf-intake-e2e-"));
   const receipts = join(root, "receipts");
   mkdirSync(receipts, { mode: 0o700 });
@@ -46,9 +46,9 @@ async function intakeHost(withSlack: boolean) {
     config.teams = { workspaceDir: join(root, "teams"), lineup };
     config.linear = { apiKeyFile: linear.apiKeyFile, endpoint: linear.endpoint };
     config.intake = {
-      linear: { teamIds: [linear.teamId], creatorId: linear.ownerId, label: "infinite", commentsMirrorToSlack: false },
+      linear: { teamIds: [linear.teamId], creatorId: linear.ownerId, label: "infinite", commentsMirrorToSlack: false, ...(direct ? { admitIssues: false } : {}) },
       ...(slack ? { slack: { appTokenFile: slack.appTokenFile, botTokenFile: slack.botTokenFile, teamId: "T00000000", ownerUserId: OWNER,
-        linearAgentUserId: AGENT, bindByMention: false, endpoint: slack.endpoint } } : {}),
+        linearAgentUserId: AGENT, bindByMention: false, endpoint: slack.endpoint, ...(direct ? { directRequests: true } : {}) } } : {}),
       mission: { groupId: "api", maxSubtasks: 8, maxMinutes: 30 },
       maxActive: 3,
       requireSlackThread: slack !== undefined,
@@ -158,6 +158,33 @@ test("without a Slack block intake still starts missions and comments in Linear"
       "Infinite agent report: ready for review.",
     ]);
     assert.equal("slack" in body, false, "The API has no slack member without an intake Slack block");
+  } finally {
+    await world.close();
+  }
+});
+
+test("the owner's mention files one issue, starts the mission, and is acknowledged in the thread", { timeout: 150 * 1000 }, async () => {
+  const world = await intakeHost(true, true);
+  const { host, linear, slack } = world;
+  try {
+    slack!.seedThread(BINDING, [{ user: OWNER, text: "ANSWER-ONLY which exports failed?" }]);
+    const texts = () => slack!.posts(BINDING).map(post => post.text);
+    const event = { type: "app_mention", user: OWNER, channel: BINDING.channelId, ts: "1700000900.000100", thread_ts: BINDING.threadTs, text: `<@${slack!.botUserId}> ANSWER-ONLY which exports failed?` };
+    await waitFor(async () => (await host.fetchApi("/intake")).body, body => body.slack?.connected === true, 30000);
+    const envelope = await slack!.emit(event);
+
+    await waitFor(async () => texts(), list => list.some(text => text.startsWith('Started on TEST-1 "ANSWER-ONLY which exports failed?" (')), 90000);
+    await waitFor(async () => texts(), list => list.some(text => text.startsWith("Answer (agent report):")), 120000);
+    await slack!.redeliver(envelope);
+    const { body } = await waitFor(async () => (await host.fetchApi("/intake")), response => response.body.records[0]?.state === "finished", 60000);
+
+    assert.equal(linear.allIssues().length, 1, "One issue is filed in Linear");
+    assert.equal(body.records.length, 1);
+    assert.ok(body.records[0].missionId, "A mission started for the request");
+    assert.equal(body.slack.dropped, 0);
+    assert.equal(texts().filter(text => text.startsWith("Started on TEST-1")).length, 1, "One acknowledgement");
+    const postCalls = slack!.calls.filter(call => call.method === "chat.postMessage").length;
+    assert.equal(postCalls, texts().length, "Each post the bot sent landed in the thread");
   } finally {
     await world.close();
   }

@@ -13,7 +13,7 @@ interface StoredMessage {
 
 const bindingKey = (channelId: string, threadTs: string) => `${channelId}:${threadTs}`;
 /** Methods whose arguments Slack reads only from a form body; a JSON body is refused, as Slack ignores its arguments. */
-const FORM_METHODS = new Set(["auth.test", "conversations.replies", "apps.connections.open"]);
+const FORM_METHODS = new Set(["auth.test", "conversations.replies", "apps.connections.open", "chat.getPermalink"]);
 /** Slack timestamps are microseconds since the epoch written as `seconds.micros`; comparing them as integers keeps order exact. */
 const toMicros = (ts: string) => {
   const [seconds, fraction = ""] = ts.split(".");
@@ -86,6 +86,10 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
           const page = all.slice(offset, offset + limit);
           const next = offset + limit < all.length ? Buffer.from(String(offset + limit)).toString("base64") : "";
           reply(200, { ok: true, messages: page.map(messagePayload), has_more: next !== "", response_metadata: { next_cursor: next } }); return;
+        }
+        case "chat.getPermalink": {
+          if (typeof body.channel !== "string" || typeof body.message_ts !== "string") { reply(200, { ok: false, error: "invalid_arguments" }); return; }
+          reply(200, { ok: true, channel: body.channel, permalink: `https://example.slack.com/archives/${body.channel}/p${body.message_ts.replace(".", "")}` }); return;
         }
         case "chat.postMessage": {
           const message: StoredMessage = {

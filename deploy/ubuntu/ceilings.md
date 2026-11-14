@@ -86,19 +86,21 @@ What the install script does:
 
 - Refuses to run unless it is root.
 - Validates both templates before touching any file. A bad template installs nothing.
-- Creates `/etc/claude-code` and `/etc/codex` as `root:root` mode `0755` if they do not exist.
+- Stops when a directory above `/etc/claude-code` or `/etc/codex` is a symbolic link, is not root-owned, or is group- or world-writable. Whoever can write such a directory can replace everything below it.
+- Stops when `/etc/claude-code` or `/etc/codex` is a symbolic link or not a directory.
+- Creates each directory as `root:root` mode `0755` if it does not exist. If it exists with another owner or mode, the script sets `root:root` `0755` and lists the directory, because another account could write it before. Remove any entry that does not belong.
 - Installs each file as `root:root` mode `0644`.
-- Writes through a temporary file and renames it into place.
-- If the file exists and differs, keeps a copy named with a UTC timestamp, for example `/etc/codex/requirements.toml.before-ceilings-20260101T000000Z`.
+- Writes through a temporary file and renames it into place. The rename replaces the entry itself, so a symbolic link at the file's path is replaced and never followed.
+- If a regular file exists and differs, keeps a copy under a new name with a UTC timestamp and a random suffix, for example `/etc/codex/requirements.toml.before-ceilings-20260101T000000Z.Ab3dEf`. If the entry was a symbolic link or a special file, no copy is kept.
 - Prints the SHA-256 of each installed file.
-- Does nothing more when the installed file already matches the template and has the right owner and mode.
+- Changes no file when the installed file already matches the template and has the right owner and mode.
 
-`--check` changes nothing. It exits non-zero if a file is missing, has a different hash, or has the wrong owner or mode. It also runs as root.
+`--check` changes nothing. It exits non-zero if a file is missing, is not a regular file, has a different hash, or has the wrong owner or mode, or if its directory or a directory above it is not a real root-only directory. It also runs as root.
 
 `infinite doctor` adds one line per check for each configured provider with a ceiling. The lines are:
 
 - `present`: the system file exists.
-- `writable`: the file and its parent directory are root-owned and not group- or world-writable.
+- `writable`: the file is a regular root-owned file that is not group- or world-writable, and every directory above it up to the root is a real root-owned directory that is not group- or world-writable. A symbolic link at the file's path or above it is reported, even when its target matches the template.
 - `hash`: the installed file matches the template shipped in the running release.
 - `profile`: the configured launch arguments and app-server arguments contain no flag that the ceiling forbids.
 
@@ -106,8 +108,10 @@ A `missing`, `changed`, `writable`, or `conflict` word prints as a warning. Doct
 
 Forbidden flags:
 
-- Claude Code: `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`, `--permission-mode bypassPermissions`.
-- Codex: `--dangerously-bypass-approvals-and-sandbox`, `--sandbox danger-full-access`, `-s danger-full-access`, and any `sandbox_mode = "danger-full-access"` in a `-c` override.
+- Claude Code: `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`, `--enable-auto-mode`, and `--permission-mode` with `bypassPermissions` or `auto`.
+- Codex: `--dangerously-bypass-approvals-and-sandbox`, `--yolo`, `--sandbox` or `-s` with `danger-full-access`, and a `-c` or `--config` override that sets `sandbox_mode` to `danger-full-access`, with or without quotes.
+
+A value may follow its flag as the next argument or after `=`. The check reads the configured arguments only. It does not read a Codex profile or a configuration file that an argument names.
 
 ## How the hash check works
 
@@ -133,7 +137,8 @@ Removing a ceiling removes the protection. Doctor then reports `missing`. Do thi
 
 ## Limits
 
-- The ceilings apply only to the provider CLIs on this server. They do not apply to other machines or to a provider that runs in a different account.
+- The ceilings are machine-wide. Every account on this server that runs the provider CLI reads them. They do not apply to other machines.
+- The install script has not been run. It needs root on Linux, and no test in this repository covers it.
 - A `Read` deny rule does not block shell commands. See the note in the Claude Code table.
 - Doctor reads the installed files as the account that runs it. A file the account cannot read is reported as `changed`.
 - The Claude Code `disableAutoMode` key has two spellings in the vendor documentation. This template uses the one from the permissions page. Confirm it with `claude doctor` after install.

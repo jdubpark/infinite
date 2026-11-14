@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import { posix } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -26,14 +26,19 @@ export const CEILING_TARGETS: Record<CeilingProvider, CeilingTarget> = {
   },
 };
 
+export type CeilingFileKind = "file" | "directory" | "symlink" | "other";
+
 export interface CeilingFileStat {
   uid: number;
   // Permission bits only (st_mode & 0o7777).
   mode: number;
+  // What the path itself is. A symbolic link is reported as a link, never as its target.
+  kind: CeilingFileKind;
 }
 
 // Injected so the checks run without root and without the real system paths.
 export interface CeilingFs {
+  // Describes the path itself and does not follow a symbolic link.
   stat(path: string): CeilingFileStat | undefined;
   read(path: string): Uint8Array | undefined;
 }
@@ -41,8 +46,9 @@ export interface CeilingFs {
 export const nodeCeilingFs: CeilingFs = {
   stat(path) {
     try {
-      const info = statSync(path);
-      return { uid: info.uid, mode: info.mode & 0o7777 };
+      const info = lstatSync(path);
+      const kind: CeilingFileKind = info.isSymbolicLink() ? "symlink" : info.isFile() ? "file" : info.isDirectory() ? "directory" : "other";
+      return { uid: info.uid, mode: info.mode & 0o7777, kind };
     } catch {
       return undefined;
     }
@@ -91,38 +97,68 @@ function sha256(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-// Flags the ceiling forbids, per provider. Matching is literal on argument
-// boundaries; `pairs` match a flag followed by its value.
-const FORBIDDEN: Record<CeilingProvider, { flags: string[]; pairs: [string, string][]; equals: string[]; patterns: RegExp[] }> = {
-  claude: {
-    flags: ["--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"],
-    pairs: [["--permission-mode", "bypassPermissions"]],
-    equals: ["--permission-mode=bypassPermissions"],
-    patterns: [],
-  },
-  codex: {
-    flags: ["--dangerously-bypass-approvals-and-sandbox"],
-    pairs: [
-      ["--sandbox", "danger-full-access"],
-      ["-s", "danger-full-access"],
-    ],
-    equals: ["--sandbox=danger-full-access"],
-    // Covers `-c sandbox_mode="danger-full-access"` and `--config=sandbox_mode=...`.
-    patterns: [/sandbox_mode\s*=\s*"?danger-full-access"?/],
-  },
-};
+// Every directory above the path, nearest first, ending at the root.
+function ancestors(path: string): string[] {
+  const out: string[] = [];
+  for (let dir = posix.dirname(path); ; dir = posix.dirname(dir)) {
+    out.push(dir);
+    if (dir === "/" || dir === ".") return out;
+  }
+}
 
+// Whoever can write a directory on the way to the file, or the target of a link on that way, can replace the file.
+// So the file must be a regular root-owned file, and every directory above it a real root-owned directory.
+function replaceable(systemPath: string, installed: CeilingFileStat, fs: CeilingFs): string[] {
+  const problems: string[] = [];
+  if (installed.kind === "symlink") problems.push(`${systemPath} is a symbolic link; whoever controls its target controls the ceiling`);
+  else if (installed.kind !== "file") problems.push(`${systemPath} is not a regular file`);
+  if (installed.uid !== 0) problems.push(`${systemPath} is owned by uid ${installed.uid}, not root`);
+  if (installed.kind === "file" && installed.mode & WRITE_BITS) problems.push(`${systemPath} is group- or world-writable (${octal(installed.mode)})`);
+  for (const dir of ancestors(systemPath)) {
+    const info = fs.stat(dir);
+    if (!info) { problems.push(`${dir} cannot be inspected`); continue; }
+    if (info.kind === "symlink") { problems.push(`${dir} is a symbolic link`); continue; }
+    if (info.kind !== "directory") { problems.push(`${dir} is not a directory`); continue; }
+    if (info.uid !== 0) problems.push(`${dir} is owned by uid ${info.uid}, not root`);
+    if (info.mode & WRITE_BITS) problems.push(`${dir} is group- or world-writable (${octal(info.mode)})`);
+  }
+  return problems;
+}
+
+// The value of a Codex `key=value` override, with one pair of TOML quotes removed.
+function overrideValue(text: string, key: string): string | undefined {
+  const equals = text.indexOf("=");
+  if (equals < 0 || text.slice(0, equals).trim() !== key) return undefined;
+  const value = text.slice(equals + 1).trim();
+  const quoted = /^"(.*)"$/.exec(value) ?? /^'(.*)'$/.exec(value);
+  return quoted ? quoted[1] : value;
+}
+
+// Launch arguments the ceiling forbids. Matching is on argument boundaries: a flag, a flag with its value as the
+// next argument, or a flag joined to its value with "=".
 export function forbiddenLaunchFlags(provider: CeilingProvider, args: string[]): string[] {
-  const rule = FORBIDDEN[provider];
-  const hits: string[] = [];
-  args.forEach((arg, index) => {
-    if (rule.flags.includes(arg) || rule.equals.includes(arg)) hits.push(arg);
-    if (rule.patterns.some((pattern) => pattern.test(arg))) hits.push(arg);
-    for (const [flag, value] of rule.pairs) {
-      if (arg === flag && args[index + 1] === value) hits.push(`${flag} ${value}`);
+  const hits = new Set<string>();
+  const valued = (index: number, flags: string[]): string | undefined => {
+    const arg = args[index];
+    for (const flag of flags) {
+      if (arg === flag) return args[index + 1];
+      if (arg.startsWith(`${flag}=`)) return arg.slice(flag.length + 1);
     }
+    return undefined;
+  };
+  args.forEach((arg, index) => {
+    if (provider === "claude") {
+      if (["--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--enable-auto-mode"].includes(arg)) hits.add(arg);
+      const mode = valued(index, ["--permission-mode"]);
+      if (mode === "bypassPermissions" || mode === "auto") hits.add(`--permission-mode ${mode}`);
+      return;
+    }
+    if (["--dangerously-bypass-approvals-and-sandbox", "--yolo"].includes(arg)) hits.add(arg);
+    if (valued(index, ["--sandbox", "-s"]) === "danger-full-access") hits.add("--sandbox danger-full-access");
+    const override = valued(index, ["-c", "--config"]);
+    if (override !== undefined && overrideValue(override, "sandbox_mode") === "danger-full-access") hits.add(`-c sandbox_mode="danger-full-access"`);
   });
-  return [...new Set(hits)];
+  return [...hits];
 }
 
 export function checkCeiling(input: CeilingCheckInput): CeilingLine[] {
@@ -137,18 +173,9 @@ export function checkCeiling(input: CeilingCheckInput): CeilingLine[] {
   } else {
     line("present", "ok", systemPath);
 
-    const problems: string[] = [];
-    if (installed.uid !== 0) problems.push(`${systemPath} is owned by uid ${installed.uid}, not root`);
-    if (installed.mode & WRITE_BITS) problems.push(`${systemPath} is group- or world-writable (${octal(installed.mode)})`);
-    const parent = posix.dirname(systemPath);
-    const parentStat = fs.stat(parent);
-    if (!parentStat) problems.push(`${parent} cannot be inspected`);
-    else {
-      if (parentStat.uid !== 0) problems.push(`${parent} is owned by uid ${parentStat.uid}, not root`);
-      if (parentStat.mode & WRITE_BITS) problems.push(`${parent} is group- or world-writable (${octal(parentStat.mode)})`);
-    }
+    const problems = replaceable(systemPath, installed, fs);
     if (problems.length > 0) line("writable", "writable", problems.join("; "));
-    else line("writable", "ok", "root-owned, not group- or world-writable, parent directory too");
+    else line("writable", "ok", "a regular root-owned file, not group- or world-writable, under root-owned directories");
 
     const template = fs.read(templatePath);
     if (!template) {

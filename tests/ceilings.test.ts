@@ -3,20 +3,24 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { createHash } from "node:crypto";
-import { checkCeiling, type CeilingFs, type CeilingCheckInput, type CeilingLine } from "../packages/host/src/ceilings.js";
+import { checkCeiling, forbiddenLaunchFlags, type CeilingFileKind, type CeilingFs, type CeilingCheckInput, type CeilingLine } from "../packages/host/src/ceilings.js";
 
 const SYSTEM = "/etc/claude-code/managed-settings.json";
 const TEMPLATE = "/repo/deploy/ubuntu/ceilings/managed-settings.json";
 const TEMPLATE_BYTES = new TextEncoder().encode('{"permissions":{"disableBypassPermissionsMode":"disable"}}\n');
 const SHIPPED_HASH = createHash("sha256").update(TEMPLATE_BYTES).digest("hex");
 
-// In-memory filesystem: paths map to uid, mode and bytes.
-function fakeFs(files: Record<string, { uid?: number; mode?: number; bytes?: Uint8Array }>): CeilingFs {
+type Entry = { uid?: number; mode?: number; bytes?: Uint8Array; kind?: CeilingFileKind };
+
+// In-memory filesystem: paths map to uid, mode, kind and bytes. A path with bytes is a file, any other a directory.
+// The root and /etc are healthy unless a test replaces them.
+function fakeFs(given: Record<string, Entry>): CeilingFs {
+  const files: Record<string, Entry> = { "/": { mode: 0o755 }, "/etc": { mode: 0o755 }, ...given };
   return {
     stat(path) {
       const entry = files[path];
       if (!entry) return undefined;
-      return { uid: entry.uid ?? 0, mode: entry.mode ?? 0o644 };
+      return { uid: entry.uid ?? 0, mode: entry.mode ?? 0o644, kind: entry.kind ?? (entry.bytes ? "file" : "directory") };
     },
     read(path) {
       return files[path]?.bytes;
@@ -25,7 +29,7 @@ function fakeFs(files: Record<string, { uid?: number; mode?: number; bytes?: Uin
 }
 
 // Healthy installed state: root-owned file and parent, 0644/0755, bytes equal to the template.
-function healthy(extra: Record<string, { uid?: number; mode?: number; bytes?: Uint8Array }> = {}) {
+function healthy(extra: Record<string, Entry> = {}) {
   return fakeFs({
     "/etc/claude-code": { mode: 0o755 },
     [SYSTEM]: { mode: 0o644, bytes: TEMPLATE_BYTES },
@@ -92,6 +96,29 @@ test("a world-writable parent directory reports writable even when the file is s
   assert.equal(writable.status, "writable");
   assert.match(writable.detail, /\/etc\/claude-code is group- or world-writable/);
   assert.equal(byCheck(lines, "hash").status, "ok");
+});
+
+test("a ceiling that is a symbolic link reports writable, even when its target matches the template", () => {
+  // The link's target can sit in a directory an agent owns. Reading through the link still gives matching bytes.
+  const lines = run({ fs: healthy({ [SYSTEM]: { kind: "symlink", mode: 0o777, bytes: TEMPLATE_BYTES } }) });
+  const writable = byCheck(lines, "writable");
+  assert.equal(writable.status, "writable");
+  assert.match(writable.detail, /symbolic link/);
+});
+
+test("a directory higher up that another account can change reports writable", () => {
+  assert.match(byCheck(run({ fs: healthy({ "/etc": { uid: 1001, mode: 0o755 } }) }), "writable").detail, /\/etc is owned by uid 1001/);
+  assert.match(byCheck(run({ fs: healthy({ "/etc/claude-code": { kind: "symlink", mode: 0o777 } }) }), "writable").detail, /\/etc\/claude-code is a symbolic link/);
+});
+
+test("launch flags the ceilings turn off are found in each spelling, and look-alikes are not", () => {
+  for (const args of [["--permission-mode", "auto"], ["--permission-mode=auto"], ["--permission-mode=bypassPermissions"]])
+    assert.equal(forbiddenLaunchFlags("claude", args).length, 1, args.join(" "));
+  for (const args of [["--yolo"], ["-c", "sandbox_mode='danger-full-access'"], ["--config", "sandbox_mode = \"danger-full-access\""], ["--config=sandbox_mode=danger-full-access"], ["--sandbox=danger-full-access"], ["-s", "danger-full-access"]])
+    assert.equal(forbiddenLaunchFlags("codex", args).length, 1, args.join(" "));
+  // Another key whose value only mentions the mode, and a prompt that mentions the flag text.
+  assert.deepEqual(forbiddenLaunchFlags("codex", ["-c", 'notes="sandbox_mode=danger-full-access"', "--sandbox", "workspace-write"]), []);
+  assert.deepEqual(forbiddenLaunchFlags("claude", ["--permission-mode", "dontAsk", "--append-system-prompt", "never use --permission-mode auto"]), []);
 });
 
 test("a configured bypass-permissions profile conflicts with the ceiling", () => {

@@ -369,7 +369,7 @@ test("a mission halt pauses only working subteams and resumes only the ones it p
   const teams = f.openTeam();
   const manager = { meta: () => { throw Object.assign(new Error("No session."), { code: "ENOENT" }); }, hostLoad: { held: () => undefined } } as unknown as Manager;
   const missions = new MissionService(f.config, f.key, manager, teams, { get: () => { throw new Error("Not queried in this test"); } });
-  const records = (missions as unknown as { records: Map<string, { mission: Mission; ops: { kind: string; teamId: string }[]; ownerHalt?: { children?: { teamId: string }[] } }> }).records;
+  const records = (missions as unknown as { records: Map<string, { mission: Mission; ops: { kind: string; teamId: string }[]; ownerHalt?: { children: string[] } }> }).records;
   const stored = [...records.values()][0]!;
   const applyOps = () => (missions as unknown as { applyOps(stored: unknown): Promise<void> }).applyOps(stored);
   const halt = new HaltService({ config: f.config, key: f.key });
@@ -385,7 +385,7 @@ test("a mission halt pauses only working subteams and resumes only the ones it p
     assert.equal(teams.get(working).status, "paused");
     assert.equal(teams.get(waiting).status, "needs-input");
     assert.equal(teams.get(turning).status, "needs-input", "a pause never reaches a subteam that now waits for input");
-    assert.deepEqual(stored.ownerHalt?.children?.map(item => item.teamId), [working]);
+    assert.deepEqual(stored.ownerHalt?.children, [working]);
     await step(teams, working);
 
     const revisions = { waiting: teams.get(waiting).revision, turning: teams.get(turning).revision };
@@ -452,4 +452,57 @@ test("a routine pauses and resumes under a halt, and host and project halts over
     await routines.tick();
     assert.equal(started.length, 1, "the routine starts its goal once no halt covers it");
   } finally { halt.stop(); routines.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a subteam's halt pause and resume are decided in its own queue, and the owner's later actions win", async () => {
+  const f = schedulerFixture();
+  const missionId = randomUUID();
+  const child = (title: string) => writeRun(f, { status: "implementing", missionId, title } as Partial<TeamRun>);
+  const ownerPaused = child("Owner pauses it"), ownerCycled = child("Owner resumes then pauses it"), turning = child("Turns to input");
+  const subtask = (id: string, teamId: string) => ({ id, title: id, instructions: id, repoProjectId: "fixture", dependsOn: [], size: "team", status: "running", teamId });
+  writeMission(f, "fixture", [subtask("a", ownerPaused), subtask("b", ownerCycled), subtask("c", turning)], missionId);
+  const teams = f.openTeam();
+  const internal = teams as unknown as { record(id: string): { run: TeamRun }; enqueue<T>(task: () => Promise<T>): Promise<T> };
+  const manager = { meta: () => { throw Object.assign(new Error("No session."), { code: "ENOENT" }); }, hostLoad: { held: () => undefined } } as unknown as Manager;
+  const missions = new MissionService(f.config, f.key, manager, teams, { get: () => { throw new Error("Not queried in this test"); } });
+  const stored = [...(missions as unknown as { records: Map<string, { ops: { kind: string; teamId: string }[]; ownerHalt?: { children: string[] } }> }).records.values()][0]!;
+  const applyOps = () => (missions as unknown as { applyOps(stored: unknown): Promise<void> }).applyOps(stored);
+  const halt = new HaltService({ config: f.config, key: f.key });
+  halt.useServices({ routines: noRoutines, goals: noRoutines, missions, teams }, id => missions.ownsActiveSubteam(id));
+  const ownerAction = (id: string, action: "pause" | "resume") => teams[action](id, { requestId: randomUUID(), revision: teams.get(id).revision });
+  try {
+    await halt.engage(fixtureScope, { requestId: randomUUID() }, owner);
+    assert.deepEqual(stored.ops.map(op => op.teamId), [ownerPaused, ownerCycled, turning], "every subteam was working when the mission read it");
+
+    // (c) A team pass already in the queue finds pending input before the halt's pause reaches the team.
+    let open!: () => void;
+    const gate = new Promise<void>(resolve => { open = resolve; });
+    const tick = internal.enqueue(async () => { await gate; internal.record(turning).run.status = "needs-input"; });
+    const turningRevision = teams.get(turning).revision;
+    const delivered = applyOps();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    open();
+    await tick; await delivered;
+    assert.equal(teams.get(turning).status, "needs-input", "a subteam waiting for input is not paused");
+    assert.deepEqual(stored.ownerHalt?.children, [ownerPaused, ownerCycled], "and is not recorded");
+    await step(teams, ownerPaused); await step(teams, ownerCycled);
+
+    // (a) The owner pauses a subteam the halt paused.
+    await ownerAction(ownerPaused, "pause");
+    await step(teams, ownerPaused);
+    await halt.release(fixtureScope, { requestId: randomUUID() }, owner);
+    assert.deepEqual(stored.ops.map(op => `${op.kind}:${op.teamId}`), [`resume:${ownerPaused}`, `resume:${ownerCycled}`]);
+
+    // (b) Before the queued resumes are delivered, the owner resumes one subteam and pauses it again.
+    await ownerAction(ownerCycled, "resume");
+    await ownerAction(ownerCycled, "pause");
+    await step(teams, ownerCycled);
+    const revisions = [ownerPaused, ownerCycled].map(id => teams.get(id).revision);
+    await applyOps();
+    assert.equal(teams.get(ownerPaused).status, "paused", "the owner's pause outlasts the release");
+    assert.equal(teams.get(ownerCycled).status, "paused", "a newer owner pause is not overridden by the queued resume");
+    assert.deepEqual([ownerPaused, ownerCycled].map(id => teams.get(id).revision), revisions, "neither replans");
+    assert.equal(teams.get(turning).status, "needs-input");
+    assert.equal(teams.get(turning).revision, turningRevision, "the waiting subteam does not replan on release");
+  } finally { halt.stop(); missions.close(); f.close(); }
 });

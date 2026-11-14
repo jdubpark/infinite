@@ -39,8 +39,12 @@ type Attempt = { memberId: string; sessionId: string; revision: number; prompt: 
   signalCursor?: number; turnSignal?: { kind: string; at: string } };
 /** A subteam action recorded before it is sent, so a restart replays it under the same request ID. */
 type ChildOp = { kind: "answer" | "steer" | "pause" | "resume" | "cancel" | "parallelism"; subtaskId: string; teamId: string; requestId: string; revision?: number; decisionId?: string; text?: string; parallelism?: number; by?: "owner" | "coordinator";
-  /** Set on a pause that the owner's halt queued. It reaches only a subteam that is still working. */
-  halt?: true };
+  /**
+   * Set on a pause or resume that the owner's halt queued, with the token of the mission's halt and, on a pause, the
+   * reason the paused subteam shows. The subteam decides in its own queue: a pause reaches it only while it is working,
+   * and a resume only while it is still paused under that token.
+   */
+  halt?: { token: string; reason?: string } };
 type Stored = {
   mission: Mission;
   fingerprint: string;
@@ -48,9 +52,9 @@ type Stored = {
   receipts: Record<string, string>;
   /**
    * Set when the owner's halt paused this mission, with the mission revision it left; any owner action moves the
-   * revision on. `children` are the subteams whose halt pause was delivered, at the team revision it left them.
+   * revision on. `token` marks the subteams this halt paused, and `children` lists the ones whose pause they confirmed.
    */
-  ownerHalt?: { haltId: string; revision: number; children?: { teamId: string; revision: number }[] };
+  ownerHalt?: { haltId: string; revision: number; token: string; children: string[] };
   folder: string;
   repos: MissionPromptRepo[];
   attempts: Attempt[];
@@ -385,8 +389,9 @@ export class MissionService {
             try { return HALT_RUNNING_TEAM.has(this.teams.get(item.teamId).status); } catch (error) { if (notFound(error)) return false; throw error; }
           });
           mission.revision++; mission.status = "paused"; mission.reason = mark.reason;
-          for (const subtask of working) this.queueOp(stored, { kind: "pause", subtaskId: subtask.id, teamId: subtask.teamId!, halt: true });
-          stored.ownerHalt = { haltId: mark.haltId, revision: mission.revision, children: [] };
+          const token = randomUUID();
+          for (const subtask of working) this.queueOp(stored, { kind: "pause", subtaskId: subtask.id, teamId: subtask.teamId!, halt: { token, reason: mark.reason } });
+          stored.ownerHalt = { haltId: mark.haltId, revision: mission.revision, token, children: [] };
           this.event(stored, `Mission paused: ${mark.reason}`); this.save(stored);
           outcomes.push({ kind: "mission", id: mission.id, title: mission.title, result: "paused" });
         } catch (error) { outcomes.push(pauseFailure("mission", mission.id, mission.title, error)); }
@@ -422,14 +427,12 @@ export class MissionService {
             outcomes.push({ ...base, result: "refused", reason }); continue;
           }
           mission.revision++; mission.status = "working"; mission.reason = undefined;
-          // A halt pause that never reached its subteam is withdrawn. A subteam whose pause was delivered resumes only
-          // while it is still paused at the revision the halt left it; any other subteam stays as it is.
+          // A halt pause that never reached its subteam is withdrawn. Each subteam the halt paused gets a resume that
+          // its own queue applies only while it is still paused under this halt's token.
           stored.ops = stored.ops.filter(op => !(op.kind === "pause" && op.halt));
-          for (const child of mark.children ?? []) {
-            const subtask = mission.subtasks.find(item => item.teamId === child.teamId && item.status === "running");
-            let team: TeamView | undefined;
-            try { team = subtask && this.teams.get(child.teamId); } catch (error) { if (!notFound(error)) throw error; }
-            if (subtask && team?.status === "paused" && team.revision === child.revision) this.queueOp(stored, { kind: "resume", subtaskId: subtask.id, teamId: child.teamId });
+          for (const teamId of mark.children) {
+            const subtask = mission.subtasks.find(item => item.teamId === teamId && item.status === "running");
+            if (subtask) this.queueOp(stored, { kind: "resume", subtaskId: subtask.id, teamId, halt: { token: mark.token } });
           }
           stored.inbox.push({ type: "resumed" });
           this.settle(stored);
@@ -555,8 +558,9 @@ export class MissionService {
     mission.reason = undefined;
   }
   private queueOp(stored: Stored, op: Omit<ChildOp, "requestId">) {
-    // A cancel supersedes any earlier action on the same subteam.
+    // A cancel supersedes any earlier action on the same subteam, and a later pause supersedes a halt's resume.
     if (op.kind === "cancel") stored.ops = stored.ops.filter(item => item.teamId !== op.teamId);
+    else if (op.kind === "pause") stored.ops = stored.ops.filter(item => !(item.kind === "resume" && item.halt && item.teamId === op.teamId));
     else if (op.kind === "parallelism") stored.ops = stored.ops.filter(item => item.kind !== "parallelism" || item.teamId !== op.teamId);
     stored.ops.push({ ...op, requestId: randomUUID() });
   }
@@ -730,8 +734,20 @@ export class MissionService {
       let team: TeamView;
       try { team = this.teams.get(op.teamId); } catch (error) { if (notFound(error)) continue; throw error; }
       const settled = teamDone.has(team.status) || team.status === "cancelled";
-      // A halt pause reaches only a subteam that is still working; one that now waits for input is left as it is.
-      if (op.kind === "pause" && op.halt && !HALT_RUNNING_TEAM.has(team.status)) continue;
+      if (op.halt) {
+        // The halt's own pause or resume: the subteam decides in its own queue, against the halt's token.
+        try {
+          const done = op.kind === "pause" ? await this.teams.haltPauseChild(op.teamId, op.halt.token, op.halt.reason ?? stored.mission.reason ?? "") : await this.teams.haltResumeChild(op.teamId, op.halt.token);
+          const mark = stored.ownerHalt;
+          if (op.kind === "pause" && done && mark?.token === op.halt.token && !mark.children.includes(op.teamId)) mark.children.push(op.teamId);
+        } catch (error) {
+          if (this.closed) return;
+          if (!(error instanceof TeamError)) throw error;
+          if (["members-stopping", "team-operation-running"].includes(error.code)) { remaining.push(op); continue; }
+          this.event(stored, `A ${op.kind} for subtask ${op.subtaskId} was not applied: ${error.message}`);
+        }
+        continue;
+      }
       if ((op.kind === "cancel" && settled) || (op.kind === "parallelism" && settled) || (op.kind === "pause" && (settled || ["paused", "blocked"].includes(team.status))) || (op.kind === "resume" && team.status !== "paused")) continue;
       // Steering restarts a paused or blocked subteam, so direction waits until both it and the mission are running again.
       if (op.kind === "steer" && (team.status === "paused" || stored.mission.status === "paused")) { remaining.push(op); continue; }
@@ -757,7 +773,6 @@ export class MissionService {
         continue;
       }
       if (op.kind === "answer") this.event(stored, `Decision ${op.decisionId} of subtask ${op.subtaskId} was answered by the ${op.by}.`);
-      if (op.kind === "pause" && op.halt && stored.ownerHalt) (stored.ownerHalt.children ??= []).push({ teamId: op.teamId, revision: op.revision! });
       if (op.kind === "parallelism") {
         const subtask = stored.mission.subtasks.find(item => item.id === op.subtaskId);
         if (subtask) subtask.parallelism = team.parallelism;

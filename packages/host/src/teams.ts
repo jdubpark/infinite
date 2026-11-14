@@ -102,7 +102,7 @@ type Stored = {
   /**
    * Set when the owner's halt paused this run: its id, and the reason the paused run shows. A release resumes the run
    * only under that id. Any accepted owner request clears it. After a release that could not resume the run, only the
-   * reason stays.
+   * reason stays. For a mission's subteam the id is the token of the mission's halt, and only the mission resumes it.
    */
   ownerHalt?: { haltId?: string; reason: string };
   deliveryAttempt?: { memberId: string; revision: number; headCommit: string };
@@ -1930,6 +1930,47 @@ export class TeamService {
         } catch (error) { outcomes.push({ ...base, result: "refused", reason: error instanceof Error ? error.message : "The run could not resume." }); }
       }
       return outcomes;
+    });
+  }
+  /**
+   * Host-internal: a mission's halt pauses one of its subteams. Decided in this team's queue, so it sees the state that
+   * every earlier operation left: only a working run is paused, and the pause and the token are saved together. True
+   * when the run is paused under this token, including a replay after the mission lost its record of the first call.
+   */
+  haltPauseChild(id: string, token: string, reason: string): Promise<boolean> {
+    return this.enqueue(async () => {
+      const stored = this.record(id), run = stored.run;
+      if (stored.ownerHalt?.haltId === token) return run.status === "paused";
+      if (!HALT_RUNNING_TEAM.has(run.status)) return false;
+      await this.stopRun(stored, "pause");
+      run.reason = reason;
+      stored.ownerHalt = { haltId: token, reason };
+      this.event(stored, `Team paused: ${reason}`); this.save(stored);
+      return true;
+    });
+  }
+  /**
+   * Host-internal: a mission's halt release resumes one subteam that its halt paused. Decided in this team's queue: the
+   * run resumes only if it is still paused and still carries this token, which any accepted owner request clears.
+   * Otherwise nothing changes and the run keeps the state the owner gave it. Members still stopping are reported, so
+   * the mission retries; any other refusal leaves the run paused and says why.
+   */
+  haltResumeChild(id: string, token: string): Promise<boolean> {
+    return this.enqueue(async () => {
+      const stored = this.record(id), run = stored.run;
+      if (run.status !== "paused" || stored.ownerHalt?.haltId !== token) return false;
+      const refusal = this.resumeRefusal(stored, undefined);
+      if (refusal?.code === "members-stopping") throw refusal;
+      if (refusal) {
+        stored.ownerHalt = { reason: releaseRefusal(refusal.message) };
+        if (!stored.halt) run.reason = stored.ownerHalt.reason;
+        this.save(stored);
+        throw refusal;
+      }
+      await this.resumeRun(stored);
+      stored.ownerHalt = undefined;
+      this.event(stored, "Team resumed with a fresh plan: the owner released the halt."); this.save(stored);
+      return true;
     });
   }
   start() {

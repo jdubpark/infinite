@@ -1900,3 +1900,38 @@ test("notes yield to a near-limit prompt when the coordinator starts a new conve
     assert.equal(mission.reason, undefined);
   } finally { h.close(); mock.timers.reset(); }
 });
+
+test("after a rotation, an unconfirmed new conversation never brings back the retired one", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(240));
+    const retired = (await h.attempt(1)).request.continuation?.nativeSessionId;
+    await h.confirmNative(1);
+    await h.report(1, followUp(120), "Chose JSON responses because the web client parses JSON.");
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 1);
+    const waits = (count: number) => until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && mission.events.filter(event => /waiting for subteam progress/.test(event.text)).length === count);
+
+    mock.timers.tick(61 * 60000);
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Keep the change small" });
+    const second = await h.attempt(2);
+    assert.equal(second.request.continuation?.mode, "start");
+    // The new conversation ends without the host confirming its native session.
+    await h.report(2, { kind: "wait", summary: "Waiting for the release page" });
+    await waits(1);
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Mention the release" });
+    const third = await h.attempt(3);
+    assert.equal(third.request.continuation?.mode, "start");
+    assert.ok(![retired, second.request.continuation?.nativeSessionId].includes(third.request.continuation?.nativeSessionId));
+
+    // With the idle rule off, the retired conversation still is not resumed.
+    h.config.autonomy = { continuity: { rotateIdleMinutes: 0 } };
+    await h.report(3, { kind: "wait", summary: "Waiting for the release page" });
+    await waits(2);
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Keep the summary short" });
+    const fourth = await h.attempt(4);
+    assert.equal(fourth.request.continuation?.mode, "start");
+    assert.notEqual(fourth.request.continuation?.nativeSessionId, retired);
+    assert.equal(h.get(id).events.filter(event => /new conversation \(rule: /.test(event.text)).length, 1, "One rotation, not one per wake");
+  } finally { h.close(); mock.timers.reset(); }
+});

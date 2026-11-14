@@ -41,7 +41,7 @@ type Attempt = { memberId: string; sessionId: string; revision: number; prompt: 
   endedAt?: string;
   /** The note filed with the report, held until the report is consumed. */
   note?: string;
-  /** The rule that made this attempt start a new conversation instead of resuming. */
+  /** The rule that made this attempt start a new conversation instead of resuming. It also marks the boundary that retires every older conversation. */
   rotated?: RotationRule;
   /** The journal position read for usage, and the context size of the newest main-conversation model call seen there. */
   usageCursor?: number; contextTokens?: number };
@@ -920,9 +920,11 @@ export class MissionService {
     if (profile.provider === "claude") {
       for (let index = stored.attempts.length - 1; index >= 0; index--) {
         const previous = stored.attempts[index], nativeSessionId = previous.continuation?.nativeSessionId;
-        if (!previous.nativeConfirmed || !nativeSessionId) continue;
-        const failedLater = stored.attempts.slice(index + 1).some(attempt => attempt.resumeFailed && attempt.continuation?.nativeSessionId === nativeSessionId);
-        if (!failedLater) { continuation = { mode: "resume", nativeSessionId }; break; }
+        const failedLater = (id: string) => stored.attempts.slice(index + 1).some(attempt => attempt.resumeFailed && attempt.continuation?.nativeSessionId === id);
+        if (previous.nativeConfirmed && nativeSessionId && !failedLater(nativeSessionId)) { continuation = { mode: "resume", nativeSessionId }; break; }
+        // A rotation retired every older conversation. When nothing from the rotation on can be resumed, the next
+        // attempt starts fresh again rather than selecting, or rotating away from, a retired conversation.
+        if (previous.rotated) break;
       }
       // A conversation that is idle, large, or long-lived costs more to resume than to restart from the mission state and notes.
       rotated = continuation && this.rotation(stored, continuation.nativeSessionId);

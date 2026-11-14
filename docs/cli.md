@@ -409,3 +409,29 @@ that explicit command to change the scope or ten-decision limit (maximum twenty)
 `infinite repo init --permissions off` disables it for future runs. Workspace
 trust and unsupported prompts remain visible for owner handling. See
 [delegated permission behavior](teams.md#delegating-permission-decisions).
+
+### Workspace permission delegation
+
+```sh
+infinite permissions status [--json]
+infinite permissions delegate (--workspace W | --all) [--direction TEXT | --clear-direction] [--request-id UUID]
+infinite permissions revoke --workspace W [--request-id UUID]
+```
+
+`delegate` and `revoke` need an owner CLI. An owner or a controller can read
+`status`. `status` lists each workspace, which is a project group, with its
+projects. A workspace is `delegated`, `partly-delegated`, or `not-delegated`.
+`delegate` records the owner's delegation for one workspace, or for every
+workspace with `--all`. It replaces a project's saved opt-out and prints each
+one that it replaced. `--direction` sets the direction text, which can only
+narrow what the permission agent allows in that workspace, and
+`--clear-direction` removes it. `revoke` removes a workspace's delegation. A
+missing `--request-id` is generated, so pass one to retry a request safely.
+
+An owner act covers only the projects that sit in the workspace at that time.
+A project that joins a workspace later is not covered until the owner delegates
+again. Moving a project out of a workspace drops its coverage.
+
+The record has no effect yet. The permission agent is not active on this host,
+so requests are handled as before. Until the agent is activated,
+`infinite repo init --permissions` still governs team runs.

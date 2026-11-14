@@ -46,6 +46,9 @@ import { IntakeSlackSurface } from "./intake-slack.js";
 import { SlackClient } from "./slack-client.js";
 import { createMissionSchema, missionActionSchema, missionTextSchema, type CreateMission, type Mission, type MissionOrigin } from "./mission-types.js";
 import { ProjectGroupService } from "./project-groups.js";
+import { PermissionDelegationService } from "./permission-delegation.js";
+import { INTERRUPT_CLASSES, PERMISSION_POLICY_VERSION } from "./permission-policy.js";
+import { PermissionJournal, permissionJournalModule } from "./evidence/permission-journal.js";
 import { LinearService } from "./linear.js";
 import { createGoalSchema, goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema, goalParallelismSchema } from "./goal-types.js";
 import { createProjectGroupSchema, projectGroupIdSchema, updateProjectGroupSchema } from "./project-group-types.js";
@@ -69,6 +72,17 @@ import { MAX_EVENTS_BUFFERED_BYTES, MAX_EVENTS_STREAMS } from "@infinite/remote/
 import { Readings } from "./readings.js";
 
 const id = z.uuid();
+// The permission agent does not run yet, so no delegation is read for a decision. The slice that activates the agent changes this constant.
+const PERMISSION_AGENT_STATE = "inactive";
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+const permissionDelegationBodySchema = z.object({
+  requestId: id,
+  workspaceId: projectGroupIdSchema.optional(),
+  all: z.literal(true).optional(),
+  direction: z.string().max(4000).nullable().optional(),
+}).strict().refine(body => (body.workspaceId === undefined) !== (body.all === undefined), { message: "Name exactly one workspace, or all: true." });
+const permissionRevocationBodySchema = z.object({ requestId: id, workspaceId: projectGroupIdSchema }).strict();
 const MAX_LOGIN_ATTEMPT_BUCKETS = 1024;
 /** A recorded pid still names a process. EPERM means it runs under another account, such as the agent user. */
 function alive(pid: unknown) {
@@ -205,6 +219,15 @@ export function createApp(config: Config, key: Buffer) {
   const goals = new GoalService(config, key, teams, linear);
   ownerServices.goals = goals;
   const projectGroups = new ProjectGroupService(config, key, undefined, { appliedAt: id => projectSync.status(id).appliedAt });
+  // Each optional permission service stays undefined when its state will not open, and its routes answer 503.
+  let permissionJournal: PermissionJournal | undefined;
+  try {
+    evidence.register(permissionJournalModule);
+    permissionJournal = new PermissionJournal(evidence);
+  } catch { permissionJournal = undefined; }
+  let permissionDelegation: PermissionDelegationService | undefined;
+  try { permissionDelegation = new PermissionDelegationService(config, key, projectGroups); }
+  catch { console.warn("[Infinite] Permission delegation is unavailable on this host."); }
   const missions = new MissionService(config, key, manager, teams, projectGroups);
   ownerServices.missions = missions;
   // A run is live while its sealed record file exists, so a record that failed to load keeps its evidence.
@@ -608,6 +631,7 @@ export function createApp(config: Config, key: Buffer) {
         (p) => p !== "demo" || config.enableDemo,
       ),
       teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, projectSource: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
+      permissions: { workspaceDelegation: 1 },
       goals: { enabled: goals.enabled() },
       missions: { enabled: missions.enabled() },
       usage: { enabled: Boolean(config.usage), budgets: config.usage?.budgets ?? {} },
@@ -774,9 +798,47 @@ export function createApp(config: Config, key: Buffer) {
     }));
   });
   app.get("/api/project-groups/:id", requireRole(["owner", "controller", "viewer"]), (req, res) => res.json(projectGroups.get(projectGroupIdSchema.parse(req.params.id))));
-  app.post("/api/project-groups", requireRole(["owner"]), (req, res) => res.json(projectGroups.create(createProjectGroupSchema.parse(req.body))));
-  app.put("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.update(projectGroupIdSchema.parse(req.params.id), updateProjectGroupSchema.parse(req.body))));
-  app.delete("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.remove(projectGroupIdSchema.parse(req.params.id), z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict().parse(req.body))));
+  // An owner regroup can move a project to another workspace, which ends that project's coverage. The delegation
+  // service seals the holders first, so a failure between the two writes can never leave a moved project covered.
+  const regrouping = <T>(change: () => T): T => permissionDelegation ? permissionDelegation.aroundOwnerRegroup(change) : change();
+  const permissionsUnavailable = (res: express.Response) => res.status(503).json({ error: "Permission delegation is unavailable on this host." });
+  app.post("/api/project-groups", requireRole(["owner"]), (req, res) => res.json(regrouping(() => projectGroups.create(createProjectGroupSchema.parse(req.body)))));
+  app.put("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(regrouping(() => projectGroups.update(projectGroupIdSchema.parse(req.params.id), updateProjectGroupSchema.parse(req.body)))));
+  app.delete("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(regrouping(() => projectGroups.remove(projectGroupIdSchema.parse(req.params.id), z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict().parse(req.body)))));
+  app.get("/api/permissions/status", requireRole(["owner", "controller"]), (_req, res) => {
+    if (!permissionDelegation) return permissionsUnavailable(res);
+    const journal = permissionJournal;
+    const now = Date.now();
+    const rateWindow = (windowMs: number) => journal!.rates({ scope: "host", since: new Date(now - windowMs).toISOString(), until: new Date(now).toISOString() });
+    // Rates are informational: an unreadable journal reports null and never hides the delegation status.
+    let rates: { lastHour: ReturnType<PermissionJournal["rates"]>; lastDay: ReturnType<PermissionJournal["rates"]> } | null = null;
+    if (journal) { try { rates = { lastHour: rateWindow(HOUR_MS), lastDay: rateWindow(DAY_MS) }; } catch { rates = null; } }
+    res.json({
+      agent: PERMISSION_AGENT_STATE,
+      policyVersion: PERMISSION_POLICY_VERSION,
+      interruptClasses: [...INTERRUPT_CLASSES],
+      workspaces: permissionDelegation.status(),
+      rates,
+    });
+  });
+  app.post("/api/permissions/delegations", requireRole(["owner"]), requireOwnerCli, (req, res) => {
+    if (!permissionDelegation) return permissionsUnavailable(res);
+    const body = permissionDelegationBodySchema.parse(req.body);
+    const actor = { deviceId: String(res.locals.deviceId) };
+    const request = { requestId: body.requestId, direction: body.direction };
+    if (body.all) {
+      const result = permissionDelegation.delegateAll(request, actor);
+      return res.json({ agent: PERMISSION_AGENT_STATE, views: result.views, replacedOptOuts: result.replacedOptOuts });
+    }
+    const result = permissionDelegation.delegate(body.workspaceId!, request, actor);
+    return res.json({ agent: PERMISSION_AGENT_STATE, views: [result.view], replacedOptOuts: result.replacedOptOuts });
+  });
+  app.post("/api/permissions/revocations", requireRole(["owner"]), requireOwnerCli, (req, res) => {
+    if (!permissionDelegation) return permissionsUnavailable(res);
+    const body = permissionRevocationBodySchema.parse(req.body);
+    const view = permissionDelegation.revoke(body.workspaceId, { requestId: body.requestId }, { deviceId: String(res.locals.deviceId) });
+    return res.json({ agent: PERMISSION_AGENT_STATE, view });
+  });
   app.post("/api/goals", requireRole(["owner"]), async (req, res) => {
     const body = createGoalSchema.parse(req.body);
     assertNoHandoff(body.projectId);

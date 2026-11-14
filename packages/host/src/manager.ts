@@ -401,9 +401,13 @@ export class Manager {
     this.serial = operation.catch(() => {});
     return operation;
   }
-  /** The team scheduler owns cwd selection, below the root its run was created under. Public create requests never accept this override. */
+  /**
+   * The team scheduler owns cwd selection, below the root its run was created under. Public create requests never accept this override.
+   * `haltScope` names every project the work covers when that is more than the request's own project; the owner's halt
+   * over any of them refuses the launch at its final admission.
+   */
   createTeamSession(request: CreateSession, team: TeamAssignment, cwd: string, modelProfile?: TeamModelProfile, workspaceRoot?: string, workspaceTrusted = false,
-    header: { purpose?: SessionPurpose; configId?: string } = {}): Promise<Session & WorkerState> {
+    header: { purpose?: SessionPurpose; configId?: string; haltScope?: readonly string[] } = {}): Promise<Session & WorkerState> {
     if (!this.config.teams || request.nativeArgs !== undefined || request.localUi || request.workspace || request.resumedFrom)
       throw new ContentError("Team sessions require a configured team workspace and managed launch", 400);
     if (header.purpose !== undefined && !SESSION_PURPOSES.includes(header.purpose)) throw new ContentError("The session purpose is not recognized", 400);
@@ -423,11 +427,11 @@ export class Manager {
     const canonical = realpathSync(cwd);
     const rel = relative(root, canonical);
     if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new ContentError("Invalid team working directory", 400);
-    // Trust is outside the request fingerprint: a replay returns the session as first created.
+    // Trust and the halt scope are outside the request fingerprint: a replay returns the session as first created.
     const operation = this.serial.then(() => this.createOnce({
       ...request, ...(continuation ? { continuation } : {}), team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}),
       ...(header.purpose !== undefined ? { purpose: header.purpose } : {}), ...(header.configId !== undefined ? { configId: header.configId } : {}),
-    }, workspaceTrusted));
+    }, workspaceTrusted, header.haltScope));
     this.serial = operation.catch(() => {});
     return operation;
   }
@@ -849,15 +853,15 @@ export class Manager {
    * Creates the session, or returns the one its request already made. A team launch that fails before its session
    * record exists gives its fuse launch back: the count stays, and a retry with the same id is not counted twice.
    */
-  private async createOnce(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false) {
-    try { return await this.createRecorded(request, workspaceTrusted); }
+  private async createOnce(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false, haltScope?: readonly string[]) {
+    try { return await this.createRecorded(request, workspaceTrusted, haltScope); }
     catch (error) {
       // A started launch stays started, and a failing fuse never hides the launch error.
       if (request.team) try { this.fuse?.release(request.requestId); } catch { /* the launch error is the one to report */ }
       throw error;
     }
   }
-  private async createRecorded(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false) {
+  private async createRecorded(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false, haltScope?: readonly string[]) {
     if (!request.resumedFrom && request.nativeArgs) assertFreshNativeContext(request.provider, request.nativeArgs);
     if (request.workspace && (request.provider !== "codex" || !request.localUi))
       throw new Error("Laptop execution requires the Codex native interface");
@@ -903,10 +907,17 @@ export class Manager {
       throw new Error("The configured session limit has been reached");
     // The backstop: a team session is charged before any session directory exists. A replay returned above, and a
     // launch that its caller already admitted is recognised by its id and not charged again. The owner's halt sits in
-    // front of the fuse, so a halted launch is refused with its own code and is never charged.
+    // front of the fuse, so a halted launch is refused with its own code. It runs after every wait above and right
+    // before the session record is written, over every project the work covers, and it gives back any admission that
+    // the caller made for this launch, so a launch the halt refuses leaves the fuse count as it was.
     if (request.team && this.fuse) {
-      const admission = this.fuse.admit(workLaunch({ launchId: id, projectId: request.projectId, provider: request.provider, team: request.team, profile: request.teamModelProfile }));
-      if (!admission.ok && "halted" in admission) throw new TeamError(409, "halted", haltReason(admission.halted));
+      const spanning = haltScope?.length ? this.fuse.held?.(haltScope) : undefined;
+      const admission = spanning ? { ok: false as const, launchId: id, halted: spanning }
+        : this.fuse.admit(workLaunch({ launchId: id, projectId: request.projectId, provider: request.provider, team: request.team, profile: request.teamModelProfile }));
+      if (!admission.ok && "halted" in admission) {
+        this.fuse.refund?.(id);
+        throw new TeamError(409, "halted", haltReason(admission.halted));
+      }
       if (!admission.ok) throw new TeamError(409, "fuse-open", fuseReason("open" in admission ? admission.open : "write-failed"));
     }
     if (!request.team && [...this.handoffProjects.values()].some(path => handoffPathsOverlap(path, realpathSync(project.path)))) throw new ContentError("This project is capturing an accepted team handoff");

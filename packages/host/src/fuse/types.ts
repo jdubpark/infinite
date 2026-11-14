@@ -66,4 +66,6 @@ export interface FuseGate {
   started(launchId: string): void;
   /** The owner's halt over any of these projects, for work that spans several. Only the halt's gate has it. */
   held?(projectIds: readonly string[]): LaunchHalted | undefined;
+  /** Gives back this process's admission of a launch that the owner's halt refused before its session existed. */
+  refund?(launchId: string): void;
 }

@@ -164,6 +164,11 @@ export class FuseService implements FuseGate {
   /** The time of the last failed baseline write, and the UTC day its interrupt was announced. */
   private writeFailedAt: number | undefined;
   private writeFailureAnnouncedDay: string | undefined;
+  /**
+   * What each admission of this process changed: the launch's record before it, and the trips it opened. Kept in
+   * memory only, so that a launch the owner's halt refuses before its session exists can be given back exactly.
+   */
+  private readonly admissions = new Map<string, { prior?: FuseLaunchRecord; opened: string[] }>();
 
   constructor(options: FuseServiceOptions) {
     const config = options.config;
@@ -236,7 +241,46 @@ export class FuseService implements FuseGate {
     const counted = [...launches.filter(item => item.launchId !== launchId), record];
     const changed = this.settle(launches, counted, trips, projectId, now, seq);
     if (!this.persist(seq, [record], changed)) return { ok: false, launchId, failure: "write-failed" };
+    const known = new Set(trips.map(trip => trip.tripId));
+    this.admissions.delete(launchId);
+    this.admissions.set(launchId, { ...(prior === undefined ? {} : { prior }), opened: changed.filter(trip => !known.has(trip.tripId)).map(trip => trip.tripId) });
+    // Every admission ends in started, released, or refunded, which forget it; the bound covers a caller that never does.
+    if (this.admissions.size > 1000) this.admissions.delete(this.admissions.keys().next().value!);
     return { ok: true, launchId };
+  }
+
+  /**
+   * Gives back an admission that the owner's halt refused before its session existed. The launch's record returns to
+   * what it was before the admission, so the count is as if the launch had never been admitted, and a trip that only
+   * this admission opened, still open and not yet announced, is removed. Only an admission that this process made and
+   * that is still admitted can be given back: after a restart the launch is settled as released and keeps its count.
+   */
+  refund(launchId: string): void {
+    const admission = this.admissions.get(launchId);
+    this.admissions.delete(launchId);
+    const launch = this.launches.get(launchId);
+    if (!this.authoritative || admission === undefined || launch?.state !== "admitted") return;
+    const seq = this.seq + 1;
+    const launches = new Map(this.launches), trips = new Map(this.trips);
+    if (admission.prior === undefined) launches.delete(launchId);
+    else launches.set(launchId, { ...admission.prior, seq });
+    const removed = admission.opened.filter(tripId => {
+      const trip = trips.get(tripId);
+      return trip !== undefined && trip.closedAt === undefined && trip.announcedAt === undefined && trips.delete(tripId);
+    });
+    const next = pruneBaseline({ version: 1, seq, launches: [...launches.values()], trips: [...trips.values()] }, this.now());
+    if (!writeBaseline(this.file, this.key, next)) {
+      this.writeFailedAt = this.now();
+      return;
+    }
+    this.writeFailedAt = undefined;
+    this.adopt(next);
+    // The file's higher seq already leaves the old rows out of a merge; the store drops them too.
+    this.store.tryWrite(tx => {
+      if (admission.prior === undefined) tx.run("DELETE FROM fuse_launches WHERE launch_id = ?", launchId);
+      for (const tripId of removed) tx.run("DELETE FROM fuse_trips WHERE trip_id = ?", tripId);
+    });
+    if (admission.prior !== undefined) this.mirror([{ ...admission.prior, seq }], []);
   }
 
   release(launchId: string): void {
@@ -370,6 +414,7 @@ export class FuseService implements FuseGate {
   }
 
   private transition(launchId: string, to: "released" | "started"): void {
+    this.admissions.delete(launchId);
     if (!this.authoritative) return;
     const launch = this.launches.get(launchId);
     if (!launch || launch.state !== "admitted") return;

@@ -6,7 +6,7 @@ import type { Config } from "../types.js";
 import { HALT_FILE, MAX_RECEIPTS, readHaltRecord, writeHaltRecord, type HaltActor, type HaltEntry, type HaltReceipt, type HaltRecord } from "./record.js";
 import { haltReason, STILL_HALTED, type HaltCheck, type HaltCovers, type HaltHeldBy, type HaltItemKind, type HaltOutcome, type HaltTarget, type HaltTargets, type LaunchHalted } from "./rules.js";
 
-export type HaltServiceOptions = { config: Config; key: Buffer; now?: () => number };
+export type HaltServiceOptions = { config: Config; key: Buffer; now?: () => number; /** How often an unreadable record is read again. */ retryMs?: number };
 
 /** The services a halt stops, in the order it stops them. A release resumes them in reverse. */
 export type HaltServices = { routines: HaltTargets; goals: HaltTargets; missions: HaltTargets; teams: HaltTargets };
@@ -43,6 +43,7 @@ export class HaltService {
   private readonly key: Buffer;
   private readonly file: string;
   private readonly now: () => number;
+  private readonly retryMs: number;
   private record: HaltRecord = { version: 1, halts: [], receipts: [] };
   private readable = true;
   private services?: HaltServices;
@@ -53,6 +54,7 @@ export class HaltService {
   constructor(options: HaltServiceOptions) {
     this.key = options.key;
     this.now = options.now ?? Date.now;
+    this.retryMs = options.retryMs ?? RETRY_MS;
     this.file = join(options.config.stateDir, HALT_FILE);
     this.load();
   }
@@ -82,6 +84,7 @@ export class HaltService {
       release: launchId => fuse.release(launchId),
       started: launchId => fuse.started(launchId),
       held: projectIds => this.hold(projectIds),
+      refund: launchId => fuse.refund?.(launchId),
     };
   }
 
@@ -100,7 +103,7 @@ export class HaltService {
 
   engage(target: HaltTarget, body: { requestId: string; reason?: string }, by: HaltActor): Promise<HaltEngageResult> {
     return this.enqueue(async () => {
-      this.assertReadable();
+      if (!await this.recover()) throw unreadableError();
       const fingerprint = digest({ action: "engage", ...target, reason: body.reason ?? null });
       const prior = this.receipt(body.requestId, fingerprint);
       if (prior) {
@@ -128,7 +131,7 @@ export class HaltService {
 
   release(target: HaltTarget, body: { requestId: string; keepPaused?: boolean }, by: HaltActor): Promise<HaltReleaseResult> {
     return this.enqueue(async () => {
-      this.assertReadable();
+      if (!await this.recover()) throw unreadableError();
       const keepPaused = body.keepPaused === true;
       const fingerprint = digest({ action: "release", ...target, keepPaused });
       const prior = this.receipt(body.requestId, fingerprint);
@@ -150,19 +153,16 @@ export class HaltService {
     });
   }
 
-  /** Finishes any pass a previous process left unsettled, and retries an unreadable record every minute. */
+  /**
+   * Finishes any pass a previous process left unsettled, and reads an unreadable record again every minute. A record
+   * that becomes readable has its unsettled passes finished the same way, in turn with engage and release.
+   */
   start(): Promise<void> {
     if (this.timer === undefined) {
-      this.timer = setInterval(() => { if (!this.readable) this.load(); }, RETRY_MS);
+      this.timer = setInterval(() => { if (!this.readable) void this.enqueue(() => this.recover()).catch(() => {}); }, this.retryMs);
       this.timer.unref();
     }
-    return this.enqueue(async () => {
-      if (!this.readable) return;
-      for (const receipt of this.record.receipts.filter(value => !value.settled)) {
-        if (receipt.action === "engage") await this.finishEngage(receipt);
-        else await this.finishRelease(receipt);
-      }
-    });
+    return this.enqueue(async () => { if (this.readable) await this.finishUnsettled(); });
   }
 
   stop(): void {
@@ -272,9 +272,22 @@ export class HaltService {
     };
   }
 
-  private assertReadable() {
-    if (!this.readable) this.load();
-    if (!this.readable) throw unreadableError();
+  /** True when the record is readable. A record read again after it was unreadable first finishes its unsettled passes. */
+  private async recover(): Promise<boolean> {
+    if (this.readable) return true;
+    this.load();
+    if (!this.readable) return false;
+    await this.finishUnsettled();
+    return true;
+  }
+
+  /** Runs every pass the record holds as unsettled. Without the services there is nothing to pause yet, so it waits. */
+  private async finishUnsettled() {
+    if (!this.services) return;
+    for (const receipt of this.record.receipts.filter(value => !value.settled)) {
+      if (receipt.action === "engage") await this.finishEngage(receipt);
+      else await this.finishRelease(receipt);
+    }
   }
 
   /** Writes the file, then memory. False when the write failed; memory is unchanged then. */

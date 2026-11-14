@@ -19,7 +19,7 @@ import { combineCoverage, type UsageService } from "./usage-service.js";
 import { type EvidenceStore, eventProblem } from "./evidence/store.js";
 import { applyFuseReason, workLaunch } from "./fuse/rules.js";
 import type { FuseAdmission, FuseCheck, FuseGate } from "./fuse/types.js";
-import { KEPT_PAUSED, LEFT_AS_IS, STILL_HALTED, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
+import { HALT_RUNNING_TEAM, KEPT_PAUSED, LEFT_AS_IS, STILL_HALTED, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 import type { EventOutbox, OutboxEvent } from "./evidence/outbox.js";
 import type { Blackboard } from "./evidence/blackboard.js";
 import { MAX_OUTBOX_EVENTS, pathField, planDigest, profileIdentity, runEventKey, runSummaryCounts, type MemberStopDetail, type MemberStopReason, type ReplacementCause } from "./run-events.js";
@@ -131,8 +131,6 @@ const holdsWorkerSlot = (member: TeamMember, revision: number) => member.revisio
   (member.role === "scout" || member.role === "implementer") &&
   (["queued", "running", "unavailable"].includes(member.status) || member.status === "reported" && !member.exitConfirmedAt);
 const inactiveTeamStatuses = new Set(["cancelled", "ready-for-review", "merged", "no-change"]);
-/** The statuses an owner's halt pauses: work in progress, not paused, blocked, waiting for input, or ended. */
-const haltRunning: ReadonlySet<string> = new Set(["planning", "discovering", "implementing", "integrating", "verifying", "reviewing", "delivering"]);
 const activeTeamRun = (status: string) => !inactiveTeamStatuses.has(status);
 const capacityCeiling = (run: Pick<TeamRun, "parallelismCeiling" | "handoff">) => run.parallelismCeiling ?? (run.handoff ? 2 : 4);
 export const providerInputReason = "A provider needs user input. Open the member session to respond; the team will not approve it.";
@@ -1877,7 +1875,7 @@ export class TeamService {
       const outcomes: HaltOutcome[] = [];
       for (const stored of this.records.values()) {
         const run = stored.run;
-        if (!haltRunning.has(run.status) || !covers([run.projectId], run.id)) continue;
+        if (!HALT_RUNNING_TEAM.has(run.status) || !covers([run.projectId], run.id)) continue;
         try {
           await this.stopRun(stored, "pause");
           run.reason = mark.reason;

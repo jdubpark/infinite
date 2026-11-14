@@ -20,6 +20,9 @@ export type HaltOutcome = {
   result: typeof HALT_RESULTS[number];
   reason?: string;
 };
+/** The team statuses a halt pauses: work in progress, not paused, blocked, waiting for input, or ended. */
+export const HALT_RUNNING_TEAM: ReadonlySet<string> = new Set(["planning", "discovering", "implementing", "integrating", "verifying", "reviewing", "delivering"]);
+
 /** Whether an item that works in these projects is in the halt's scope. */
 export type HaltCovers = (projectIds: readonly string[], id: string) => boolean;
 /** The halt that still covers an item in these projects after a release, if any. */

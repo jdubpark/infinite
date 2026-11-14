@@ -1,11 +1,13 @@
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 
 const renderer = resolve("scripts/render-instance.mjs");
+const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 const temporaryDirectories: string[] = [];
 const templateFiles = ["agent-anchor.sh", "agent-env.sh", "agent-wrapper.sh", "config.example.json", "github-app-gh.sh",
   "infinite-github-refresh.service", "infinite-github-refresh.timer", "infinite.service", "infinite.sudoers", "infinite-tmpfiles.conf", "install-agent-env.sh",
@@ -32,6 +34,35 @@ function rendered(args: string[] = []) {
 function file(name: string, args: string[] = ["--instance", "work"]) {
   const out = render(args);
   return readFileSync(join(out, name), "utf8");
+}
+
+// A release stage made by `git archive` has no .git, so it lists the files from disk instead.
+function gitTopLevel(root: string) {
+  const result = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: root, encoding: "utf8" });
+  return result.status === 0 ? realpathSync(result.stdout.trim()) : undefined;
+}
+
+function isGitCheckout(root: string) {
+  return gitTopLevel(root) === realpathSync(root);
+}
+
+function gitDeployFiles(root: string) {
+  return execFileSync("git", ["ls-files", "deploy/ubuntu"], { cwd: root, encoding: "utf8" }).split("\n").filter(Boolean)
+    .map(path => path.slice("deploy/ubuntu/".length));
+}
+
+function diskDeployFiles(root: string) {
+  const base = join(root, "deploy/ubuntu");
+  const walk = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) return walk(path);
+    return entry.isFile() ? [relative(base, path).split(sep).join("/")] : [];
+  });
+  return walk(base).sort();
+}
+
+function deployFiles(root = repositoryRoot) {
+  return isGitCheckout(root) ? gitDeployFiles(root) : diskDeployFiles(root);
 }
 
 afterEach(() => {
@@ -94,12 +125,23 @@ test("every tracked deploy file that names a first-instance path is rendered for
     ["repository-graph-wrapper.py", "the code graph, which an instance runs without until an instance wrapper exists"],
   ]);
   const firstPath = /\/opt\/infinite\/|\/opt\/infinite-agents|\/srv\/infinite-data|\/usr\/local\/libexec\/infinite\//;
-  const tracked = execFileSync("git", ["ls-files", "deploy/ubuntu"], { encoding: "utf8" }).split("\n").filter(Boolean)
-    .map(path => path.slice("deploy/ubuntu/".length));
+  const tracked = deployFiles();
   for (const name of firstInstanceOnly.keys()) assert.ok(tracked.includes(name), `${name} is listed but not tracked`);
   const templated = new Set(readdirSync(render()));
   const unlisted = tracked.filter(name => firstPath.test(readFileSync(join("deploy/ubuntu", name), "utf8")) && !templated.has(name) && !firstInstanceOnly.has(name));
   assert.deepEqual(unlisted, []);
+});
+
+test("the disk listing of a copy of the tracked deploy files matches the Git listing", t => {
+  if (!isGitCheckout(repositoryRoot)) return t.skip("the repository is not a Git checkout");
+  const copy = tmp();
+  const tracked = gitDeployFiles(repositoryRoot);
+  for (const name of tracked) {
+    const to = join(copy, "deploy/ubuntu", name);
+    mkdirSync(dirname(to), { recursive: true });
+    cpSync(join(repositoryRoot, "deploy/ubuntu", name), to);
+  }
+  assert.deepEqual(diskDeployFiles(copy), tracked);
 });
 
 test("every wrapper path derives from the instance name", () => {

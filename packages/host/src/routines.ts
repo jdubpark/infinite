@@ -7,6 +7,8 @@ import type { Config, Project } from "./types.js";
 import { createGoalSchema, type CreateGoal, type ProductGoal } from "./goal-types.js";
 import { createRoutineSchema, routineActionSchema, type CreateRoutine, type Routine, type RoutineAction } from "./routine-types.js";
 import type { GoalService } from "./goals.js";
+import { applyFuseReason } from "./fuse/rules.js";
+import type { FuseGate } from "./fuse/types.js";
 
 type HookSet = {
   isProjectBusy(projectId: string): Promise<boolean>;
@@ -37,6 +39,7 @@ export class RoutineService {
   private timer?: NodeJS.Timeout;
   private closed = false;
   private tickQueued = false;
+  private fuse?: FuseGate;
 
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly goals: GoalService, private readonly hooks: HookSet) {
     this.directory = join(config.stateDir, "routines");
@@ -90,6 +93,8 @@ export class RoutineService {
     }
     return true;
   }
+  /** The launch-rate fuse. A service without one starts every goal it would have started before. */
+  useFuse(fuse: FuseGate) { this.fuse = fuse; }
   create(input: CreateRoutine): Promise<Routine> {
     const request = createRoutineSchema.parse(input);
     return this.enqueue(() => {
@@ -220,6 +225,10 @@ export class RoutineService {
     if (current + budgetMinutes * minute > Date.parse(routine.expiresAt)) {
       routine.status = "expired"; routine.revision++; routine.reason = "The remaining approval window cannot fit the full goal time budget."; this.save(stored); return;
     }
+    // A wait keeps the schedule: the first tick after the fuse closes starts one goal, and missed intervals coalesce.
+    const fuse = applyFuseReason(routine, this.fuse?.check({ projectId: routine.goal.projectId }));
+    if (fuse.changed) this.save(stored);
+    if (fuse.wait) return;
     if (await this.hooks.isProjectBusy(routine.goal.projectId)) { routine.status = "scheduled"; routine.reason = "The project has active work. The routine will check again at its next interval."; routine.nextRunAt = new Date(current + routine.intervalMinutes * minute).toISOString(); this.save(stored); return; }
     if (this.closed || terminal.has(routine.status)) return;
     if (Date.now() >= Date.parse(routine.expiresAt)) {

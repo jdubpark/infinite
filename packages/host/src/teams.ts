@@ -720,17 +720,22 @@ export class TeamService {
       if (!entries.retryable()) return;
       this.entryBacklog.delete(id);
       if (!this.records.has(id)) continue;
-      // A run that waits out its own failed write goes to the end without a read, so it does not hold the others back.
-      if (entries.held(id)) { this.entryBacklog.add(id); continue; }
+      // A run that waits out its own failed write, or whose record could not be read a moment ago, goes to the end
+      // without a read, so it does not hold the others back.
+      if (entries.held(id) || entries.unread(id)) { this.entryBacklog.add(id); continue; }
       const run = this.sealedRun(id);
-      // An unreadable record leaves the backlog. Its next save adds it again.
-      if (run && entries.retry(run) !== "done") this.entryBacklog.add(id);
+      // A record file that is gone leaves the backlog: its run was removed.
+      if (run === "missing") continue;
+      // A record that cannot be read now keeps its place. A settled run is never saved again, so nothing else would
+      // bring it back before the next start.
+      if (run === "unreadable") { entries.noteUnread(id); this.entryBacklog.add(id); continue; }
+      if (entries.retry(run) !== "done") this.entryBacklog.add(id);
     }
   }
-  /** The run as its sealed record file holds it, or undefined when the file cannot be read. */
-  private sealedRun(id: string): TeamRun | undefined {
+  /** The run as its sealed record file holds it. `missing`: the file is gone. `unreadable`: it cannot be read or opened now. */
+  private sealedRun(id: string): TeamRun | "missing" | "unreadable" {
     try { return unseal<Stored>(this.key, `team:${id}`, readFileSync(join(this.directory, `${id}.sealed`), "utf8")).run; }
-    catch { return undefined; }
+    catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unreadable"; }
   }
   /** Emits run.blocked or run.settled when the run status differs from the status the ledger last saw. */
   private emitStatusEvents(stored: Stored, statusAt: string) {

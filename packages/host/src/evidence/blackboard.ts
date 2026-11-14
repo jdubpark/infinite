@@ -109,6 +109,7 @@ export class Blackboard {
   private readonly now: () => number;
   private readonly known = new Map<string, Map<string, Known>>();
   private readonly failedAt = new Map<string, number>();
+  private readonly unreadAt = new Map<string, number>();
   private retryFailedAt: number | undefined;
   private readonly warned = new Set<HostEntryKind>();
   private refused = 0;
@@ -164,6 +165,31 @@ export class Blackboard {
   held(runId: string): boolean {
     try {
       return this.recent(this.failedAt.get(runId), this.now());
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Notes that the caller could not read the run's saved record now. It holds no write back: only `unread` reports
+   * it, so the retry pass can leave the record alone for a minute. Never throws.
+   */
+  noteUnread(runId: string): void {
+    try {
+      this.unreadAt.set(runId, this.now());
+    } catch {
+      // Without a time the next pass reads the record again.
+    }
+  }
+
+  /** True while the run's record could not be read under a minute ago. Never throws. */
+  unread(runId: string): boolean {
+    try {
+      const at = this.unreadAt.get(runId);
+      if (at === undefined) return false;
+      if (this.recent(at, this.now())) return true;
+      this.unreadAt.delete(runId);
+      return false;
     } catch {
       return false;
     }
@@ -429,6 +455,7 @@ export class Blackboard {
         tx.run("DELETE FROM member_scopes WHERE run_id=?", runId);
         this.known.delete(runId);
         this.failedAt.delete(runId);
+        this.unreadAt.delete(runId);
       },
       runIds: db => db.all<{ run_id: string }>(
         "SELECT run_id FROM entries UNION SELECT run_id FROM member_scopes",

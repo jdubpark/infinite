@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
-import { readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Blackboard } from "../packages/host/src/evidence/blackboard.js";
@@ -455,6 +455,45 @@ test("one failing run does not hold back the others", async () => {
     clock += 61_000;
     internal(teams).drainEntries();
     assert.equal(entries.list(f.run.id, { kinds: ["direction"] }).entries.length, 2);
+  } finally { store.close(); f.close(); }
+});
+
+test("a record that cannot be read for a while keeps its run in the backlog", async () => {
+  const f = schedulerFixture(), store = openStore(f, f.key, 0);
+  try {
+    let clock = Date.now();
+    const entries = new Blackboard(store, { now: () => clock });
+    f.writeTeam();
+    const teams = f.openTeam({ entries });
+    // A failed entry write at a save puts the run in the backlog. No later save of the run follows.
+    const blocker = new DatabaseSync(evidenceDatabasePath(f.config.stateDir));
+    try {
+      blocker.exec("BEGIN IMMEDIATE");
+      await teams.steer(f.run.id, { requestId: randomUUID(), revision: 1, text: "Keep the API stable" });
+    } finally {
+      blocker.exec("ROLLBACK");
+      blocker.close();
+    }
+    await teams.idle();
+    clock += 61_000;
+    const stored = () => entries.list(f.run.id, { kinds: ["direction"] }).entries.length;
+
+    // The record cannot be read during one pass, as under a descriptor limit or a disk fault: a folder stands in its place.
+    const file = join(f.config.stateDir, "teams", `${f.run.id}.sealed`);
+    renameSync(file, `${file}.aside`);
+    mkdirSync(file);
+    try { internal(teams).drainEntries(); }
+    finally { rmdirSync(file); renameSync(`${file}.aside`, file); }
+    assert.equal(stored(), 0);
+
+    // The record reads again. The drain leaves it alone for a minute, then stores the entry without a save.
+    const before = recordBytes(f);
+    internal(teams).drainEntries();
+    assert.equal(stored(), 0, "the drain waits before it reads the record again");
+    clock += 61_000;
+    internal(teams).drainEntries();
+    assert.equal(stored(), 1, "the run kept its place in the backlog");
+    assert.deepEqual(recordBytes(f), before, "the drain saves nothing");
   } finally { store.close(); f.close(); }
 });
 

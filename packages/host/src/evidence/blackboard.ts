@@ -1,15 +1,22 @@
 import type { TeamMember, TeamRole, TeamRun } from "../team-types.js";
 import { canonicalJson } from "./crypto.js";
-import { ENTRY_KINDS, type EntryHead, type EntryKind, type HostEntry, type HostEntryKind } from "./entry-types.js";
+import { ENTRY_KINDS, MEMBER_ENTRY_KINDS, type EntryHead, type EntryKind, type HostEntry, type HostEntryKind } from "./entry-types.js";
 import { hostEntry, hostEntryId, hostEntrySources } from "./host-entries.js";
+import { memberEntryId, memberScopeOf, postAllowed, type MemberEntryEnvelope, type MemberEntryPost } from "./member-entry.js";
 import type { EvidenceStore } from "./store.js";
 import { EvidenceError, type EvidenceDb, type EvidenceModule, type EvidenceTx } from "./types.js";
 
 export const BLACKBOARD_MODULE = "blackboard";
+/** The layout this host writes. Version 2 adds `entries.supersedes` and `member_scopes.read_seq`. */
+export const BLACKBOARD_VERSION = 2;
+/** Raised only when a reader must change. Version 2 is the first layout a member-tools reader may open. */
+export const BLACKBOARD_READ_VERSION = 2;
 /** A host body larger than this is refused whole, never truncated (plan, phase 2). */
 export const MAX_HOST_BODY_BYTES = 1024 * 1024;
 export const MIRROR_BATCH = 64;
 export const MIRROR_RETRY_MS = 60_000;
+/** Member entries one run may hold. Posts past it are dropped at ingest and counted (spec part 4). */
+export const MAX_MEMBER_ENTRIES = 400;
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 100;
@@ -17,7 +24,12 @@ const MAX_QUERY_KINDS = 8;
 
 export type EntryQuery = { kinds?: EntryKind[]; taskId?: string; since?: number; limit?: number };
 export type EntryPage = { entries: EntryHead[]; cursor: number; more: boolean };
-export type LaunchSizes = { launchSeq: number | undefined; promptBytes: number; contextBytes: number };
+/** One journaled member post, as the worker's `team-entry` event holds it. The host checks it again before it stores it. */
+export type MemberPostRecord = { seq: number; at: string; envelope: Extract<MemberEntryEnvelope, { op: "post" }> };
+/** One journaled read receipt of a member: a list or a get call, and the bytes it served. */
+export type MemberReadRecord = { seq: number; op: "list" | "get"; servedBytes: number };
+export type IngestOutcome = { result: "stored" | "unready" | "held" | "failed"; stored: number; dropped: number; invalid: number };
+export type LaunchSizes = { launchSeq: number | undefined; promptBytes: number; contextBytes: number; digestBytes?: number };
 export type MemberContextUsage = {
   memberId: string;
   role: TeamRole;
@@ -46,6 +58,7 @@ type EntryRow = {
   authority: string;
   state: string;
   body_bytes: number;
+  supersedes: string | null;
   encrypted_head: string;
 };
 type SealedHead = { taskId?: string; authorRole?: TeamRole | "mission-coordinator"; paths: string[]; summary: string };
@@ -61,8 +74,12 @@ type ScopeRow = {
   get_calls: number;
 };
 
-const HEAD_COLUMNS = "seq, entry_id, scope, run_id, revision, at, kind, author, authority, state, body_bytes, encrypted_head";
+/** The member kinds as SQL text. A report is a member's entry too, but it is a host kind, so the cap counts by kind. */
+const MEMBER_KIND_SQL = MEMBER_ENTRY_KINDS.map(kind => `'${kind}'`).join(", ");
 
+const HEAD_COLUMNS ="seq, entry_id, scope, run_id, revision, at, kind, author, authority, state, body_bytes, supersedes, encrypted_head";
+
+/** Version 1: the tables of phase 2. */
 const SCHEMA = [
   "CREATE TABLE entries ("
   + "seq INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -100,6 +117,13 @@ const SCHEMA = [
   "CREATE INDEX member_scopes_by_run ON member_scopes (run_id)",
 ];
 
+/** Version 2: the member supersede column and the receipt cursor. Version 1 rows keep their values. */
+const SCHEMA_V2 = [
+  "ALTER TABLE entries ADD COLUMN supersedes TEXT",
+  "CREATE INDEX entries_by_supersedes ON entries (supersedes) WHERE supersedes IS NOT NULL",
+  "ALTER TABLE member_scopes ADD COLUMN read_seq INTEGER NOT NULL DEFAULT 0",
+];
+
 /**
  * Host-written entries and member launch sizes in the shared evidence store. The host mirrors each entry
  * from a saved run record, after the record is written. Entry bodies and heads are sealed. Plain columns
@@ -113,6 +137,8 @@ export class Blackboard {
   private retryFailedAt: number | undefined;
   private readonly warned = new Set<HostEntryKind>();
   private refused = 0;
+  private dropped = 0;
+  private invalid = 0;
 
   /** Registers the `blackboard` module. Throws a TypeError when the store already has one. */
   constructor(private readonly store: EvidenceStore, options: { now?: () => number } = {}) {
@@ -215,23 +241,26 @@ export class Blackboard {
     try {
       const launchSeq = sizes.launchSeq;
       if (!this.ready() || !isRunShape(run) || launchSeq === undefined) return false;
-      if (![launchSeq, sizes.promptBytes, sizes.contextBytes].every(value => Number.isSafeInteger(value) && value >= 0)) {
+      const digestBytes = sizes.digestBytes ?? 0;
+      if (![launchSeq, sizes.promptBytes, sizes.contextBytes, digestBytes].every(value => Number.isSafeInteger(value) && value >= 0)) {
         return false;
       }
       // A run whose last write failed under a minute ago waits, so a locked database costs one failed write
       // per run per minute, launches included.
       const time = this.now();
       if (this.recent(this.failedAt.get(run.id), time)) return false;
+      const planned = memberScopeOf(run, member, launchSeq);
       const scope = {
-        ...(member.taskId === undefined ? {} : { taskId: member.taskId }),
-        paths: ownedPaths(run, member),
+        ...(planned.taskId === undefined ? {} : { taskId: planned.taskId }),
+        paths: planned.paths,
+        ...(planned.dependsOn.length > 0 ? { dependsOn: planned.dependsOn } : {}),
       };
       const written = this.store.tryWrite(tx => {
         tx.run(
           "INSERT INTO member_scopes (member_id, run_id, mission_id, role, launch_seq, prompt_bytes, context_bytes, "
-          + "digest_bytes, encrypted_scope) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?) "
+          + "digest_bytes, encrypted_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
           + "ON CONFLICT(member_id) DO UPDATE SET launch_seq=excluded.launch_seq, prompt_bytes=excluded.prompt_bytes, "
-          + "context_bytes=excluded.context_bytes, digest_bytes=0, encrypted_scope=excluded.encrypted_scope",
+          + "context_bytes=excluded.context_bytes, digest_bytes=excluded.digest_bytes, encrypted_scope=excluded.encrypted_scope",
           member.memberId,
           run.id,
           run.missionId ?? null,
@@ -239,6 +268,7 @@ export class Blackboard {
           launchSeq,
           sizes.promptBytes,
           sizes.contextBytes,
+          digestBytes,
           tx.seal("member_scopes", member.memberId, scope),
         );
       });
@@ -247,6 +277,117 @@ export class Blackboard {
     } catch {
       return false;
     }
+  }
+
+  /** True when the store and the module are ready. Never throws. */
+  available(): boolean {
+    try {
+      return this.ready();
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Stores one journal page of a member: its posts, then the receipts of its reads, in one write. Each post is
+   * checked again against the member record, and a post that fails a check stores nothing and counts as invalid.
+   * Stored states depend only on the set of stored posts, so the order of a page does not matter. Never throws.
+   */
+  ingest(run: TeamRun, member: TeamMember, posts: readonly MemberPostRecord[], reads: readonly MemberReadRecord[]): IngestOutcome {
+    const failed: IngestOutcome = { result: "failed", stored: 0, dropped: 0, invalid: 0 };
+    try {
+      if (!this.ready() || !isRunShape(run)) return { ...failed, result: "unready" };
+      const time = this.now();
+      if (this.recent(this.failedAt.get(run.id), time)) return { ...failed, result: "held" };
+      if (posts.length === 0 && reads.length === 0) return { ...failed, result: "stored" };
+
+      const counts = { stored: 0, dropped: 0, invalid: 0 };
+      const written = this.store.tryWrite(tx => {
+        counts.stored = 0;
+        counts.dropped = 0;
+        counts.invalid = 0;
+        let members = tx.get<{ n: number }>(
+          `SELECT count(*) AS n FROM entries WHERE run_id=? AND kind IN (${MEMBER_KIND_SQL})`,
+          run.id,
+        )?.n ?? 0;
+        for (const record of posts) {
+          const entry = checkedPost(run, member, record);
+          if (entry === undefined) {
+            counts.invalid += 1;
+          } else if (tx.get("SELECT 1 AS n FROM entries WHERE entry_id=?", record.envelope.requestId) !== undefined) {
+            counts.stored += 1;
+          } else if (members >= MAX_MEMBER_ENTRIES) {
+            counts.dropped += 1;
+          } else {
+            this.insertMember(tx, run, member, record, entry);
+            members += 1;
+            counts.stored += 1;
+          }
+        }
+        recordReads(tx, run.id, member.memberId, reads);
+      });
+      if (!written) {
+        this.failedAt.set(run.id, time);
+        return failed;
+      }
+      this.failedAt.delete(run.id);
+      this.dropped += counts.dropped;
+      this.invalid += counts.invalid;
+      return { result: "stored", ...counts };
+    } catch {
+      return failed;
+    }
+  }
+
+  /**
+   * The owner's withdrawal of one entry of a run. The body stays, so the owner still reads the entry. Returns
+   * undefined when the run holds no such entry. Throws EvidenceError `unavailable` when the store is not ready or the write fails.
+   */
+  withdraw(runId: string, entryId: string): "withdrawn" | "unchanged" | undefined {
+    this.requireReady();
+    const outcome: { value: "withdrawn" | "unchanged" | undefined } = { value: undefined };
+    const written = this.store.tryWrite(tx => {
+      const row = tx.get<{ state: string }>("SELECT state FROM entries WHERE run_id=? AND entry_id=?", runId, entryId);
+      if (row === undefined) return;
+      if (row.state === "withdrawn") {
+        outcome.value = "unchanged";
+        return;
+      }
+      tx.run("UPDATE entries SET state='withdrawn' WHERE run_id=? AND entry_id=?", runId, entryId);
+      outcome.value = "withdrawn";
+    });
+    if (!written) throw new EvidenceError("unavailable", "The blackboard is unavailable.");
+    return outcome.value;
+  }
+
+  /** Writes one member row, then applies the supersede rules to it. The caller has checked the post. */
+  private insertMember(tx: EvidenceTx, run: TeamRun, member: TeamMember, record: MemberPostRecord, entry: MemberEntryPost): void {
+    const id = record.envelope.requestId;
+    const head: SealedHead = {
+      ...(entry.taskId === undefined ? {} : { taskId: entry.taskId }),
+      authorRole: member.role,
+      paths: entry.paths,
+      summary: entry.summary,
+    };
+    const supersedes = "supersedes" in entry ? entry.supersedes ?? null : null;
+    const inserted = tx.run(
+      "INSERT INTO entries (entry_id, scope, run_id, mission_id, revision, at, kind, author, authority, author_member_id, "
+      + "task_key, state, body_bytes, supersedes, encrypted_head, encrypted_body) "
+      + "VALUES (?, 'run', ?, ?, ?, ?, ?, 'member', 'claim', ?, ?, 'active', ?, ?, ?, ?) ON CONFLICT(entry_id) DO NOTHING",
+      id,
+      run.id,
+      run.missionId ?? null,
+      member.revision,
+      record.at,
+      entry.kind,
+      member.memberId,
+      entry.taskId === undefined ? null : tx.index("task", entry.taskId),
+      Buffer.byteLength(canonicalJson(entry.body), "utf8"),
+      supersedes,
+      tx.seal("entries", `${id}:head`, head),
+      tx.seal("entries", `${id}:body`, entry.body),
+    );
+    if (inserted.changes === 1) settleSupersedes(tx, run.id, id);
   }
 
   /** One page of the run's entry heads in `seq` order. Throws EvidenceError `unavailable` when the store is not ready. */
@@ -446,11 +587,11 @@ export class Blackboard {
   private storageModule(): EvidenceModule {
     return {
       name: BLACKBOARD_MODULE,
-      version: 1,
-      readVersion: 1,
+      version: BLACKBOARD_VERSION,
+      readVersion: BLACKBOARD_READ_VERSION,
       migrate(tx, from) {
-        if (from >= 1) return;
-        for (const statement of SCHEMA) tx.exec(statement);
+        if (from < 1) for (const statement of SCHEMA) tx.exec(statement);
+        if (from < 2) for (const statement of SCHEMA_V2) tx.exec(statement);
       },
       deleteRun: (tx, runId) => {
         tx.run("DELETE FROM entries WHERE run_id=?", runId);
@@ -465,7 +606,10 @@ export class Blackboard {
       counts: db => ({
         entries: db.get<{ n: number }>("SELECT count(*) AS n FROM entries")?.n ?? 0,
         scopes: db.get<{ n: number }>("SELECT count(*) AS n FROM member_scopes")?.n ?? 0,
+        memberEntries: db.get<{ n: number }>(`SELECT count(*) AS n FROM entries WHERE kind IN (${MEMBER_KIND_SQL})`)?.n ?? 0,
         refused: this.refused,
+        dropped: this.dropped,
+        invalid: this.invalid,
       }),
     };
   }
@@ -489,6 +633,7 @@ function headOf(db: EvidenceDb, row: EntryRow): EntryHead {
     paths: sealed.paths,
     summary: sealed.summary,
     bodyBytes: row.body_bytes,
+    ...(row.supersedes === null ? {} : { supersedes: row.supersedes }),
     state: row.state as EntryHead["state"],
   };
 }
@@ -499,10 +644,105 @@ function kindOf(source: string): HostEntryKind {
   return prefix as HostEntryKind;
 }
 
-function ownedPaths(run: TeamRun, member: TeamMember): string[] {
-  if (member.taskId === undefined) return [];
-  const task = run.tasks.find(item => item.id === member.taskId);
-  return task === undefined ? [] : [...task.paths];
+/**
+ * The post's entry when it matches the member record: the run, the binding, the entry id, the role and kind, the
+ * task, and the entry tools. Undefined otherwise. Never throws.
+ */
+function checkedPost(run: TeamRun, member: TeamMember, record: MemberPostRecord): MemberEntryPost | undefined {
+  try {
+    const { envelope } = record;
+    const binding = { runId: member.runId, memberId: member.memberId, revision: member.revision };
+    if (member.runId !== run.id || member.entryTools !== true) return undefined;
+    if (envelope.runId !== binding.runId || envelope.memberId !== binding.memberId || envelope.revision !== binding.revision) {
+      return undefined;
+    }
+    if (envelope.requestId !== memberEntryId(binding, envelope.entry)) return undefined;
+    if (postAllowed(member, envelope.entry) !== "ok") return undefined;
+    return envelope.entry;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Applies the supersede rules to a row just inserted. Each rule changes only an active row, so a withdrawn row never
+ * changes. The result depends only on which posts are stored, never on the order they arrived in.
+ */
+function settleSupersedes(tx: EvidenceTx, runId: string, id: string): void {
+  const row = tx.get<{ kind: string; author_member_id: string | null; task_key: string | null; supersedes: string | null; at: string }>(
+    "SELECT kind, author_member_id, task_key, supersedes, at FROM entries WHERE entry_id=?",
+    id,
+  );
+  if (row === undefined) return;
+  // The new row names an earlier row that it may supersede.
+  if (row.supersedes !== null) {
+    tx.run(
+      "UPDATE entries SET state='superseded' WHERE run_id=? AND entry_id=? AND state='active' AND author='member' AND kind=? "
+      + "AND (author_member_id=? OR (task_key IS NOT NULL AND task_key=?))",
+      runId,
+      row.supersedes,
+      row.kind,
+      row.author_member_id,
+      row.task_key,
+    );
+  }
+  // A stored row that names the new row supersedes it, when the new row may be superseded by that row.
+  tx.run(
+    "UPDATE entries SET state='superseded' WHERE run_id=? AND entry_id=? AND state='active' AND author='member' "
+    + "AND EXISTS (SELECT 1 FROM entries AS X WHERE X.run_id=? AND X.supersedes=entries.entry_id AND X.kind=entries.kind "
+    + "AND (X.author_member_id=entries.author_member_id OR (entries.task_key IS NOT NULL AND X.task_key=entries.task_key)))",
+    runId,
+    id,
+    runId,
+  );
+  // A handoff of a task is superseded by any later handoff of that task, and it supersedes every earlier active one.
+  if (row.kind === "handoff" && row.task_key !== null) {
+    tx.run(
+      "UPDATE entries SET state='superseded' WHERE run_id=? AND kind='handoff' AND task_key=? AND state='active' "
+      + "AND (at < ? OR (at = ? AND entry_id < ?))",
+      runId,
+      row.task_key,
+      row.at,
+      row.at,
+      id,
+    );
+    tx.run(
+      "UPDATE entries SET state='superseded' WHERE run_id=? AND entry_id=? AND state='active' "
+      + "AND EXISTS (SELECT 1 FROM entries AS L WHERE L.run_id=? AND L.kind='handoff' AND L.task_key=entries.task_key "
+      + "AND (L.at > entries.at OR (L.at = entries.at AND L.entry_id > entries.entry_id)))",
+      runId,
+      id,
+      runId,
+    );
+  }
+}
+
+/** Adds each receipt newer than the member's `read_seq` once, then moves `read_seq` to the newest. No scope row, no change. */
+function recordReads(tx: EvidenceTx, runId: string, memberId: string, reads: readonly MemberReadRecord[]): void {
+  const scope = tx.get<{ read_seq: number }>("SELECT read_seq FROM member_scopes WHERE member_id=? AND run_id=?", memberId, runId);
+  if (scope === undefined) return;
+  let highest = scope.read_seq;
+  let servedBytes = 0;
+  let listCalls = 0;
+  let getCalls = 0;
+  for (const read of [...reads].sort((a, b) => a.seq - b.seq)) {
+    if (read.seq <= highest) continue;
+    highest = read.seq;
+    servedBytes += read.servedBytes;
+    if (read.op === "list") listCalls += 1;
+    else getCalls += 1;
+  }
+  if (highest === scope.read_seq) return;
+  tx.run(
+    "UPDATE member_scopes SET served_bytes=served_bytes+?, list_calls=list_calls+?, get_calls=get_calls+?, read_seq=? "
+    + "WHERE member_id=? AND run_id=?",
+    servedBytes,
+    listCalls,
+    getCalls,
+    highest,
+    memberId,
+    runId,
+  );
 }
 
 /** The fields the mirror reads must be arrays. Anything else is not a run record. */

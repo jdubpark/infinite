@@ -2,14 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { teamLineupSchema } from "../packages/host/src/team-types.js";
 import { startHost, waitFor } from "./helpers.js";
-import { fixture, mixedLineup } from "./team-fixture.js";
+import { fixture, git, mixedLineup } from "./team-fixture.js";
 
 const coordinator = { id: "coordinator", label: "Coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" };
 const lineup = {
@@ -344,5 +344,209 @@ test("an advanced epoch retires a profile's scorecard row", { timeout: 180000 },
     const restarted = await waitFor(() => f.host.fetchApi("/usage/models"), response => response.status === 200 && response.body.rows.length === 2, 30000);
     const deepseek = restarted.body.rows.find((row: { profileId: string }) => row.profileId === "deepseek-high");
     assert.equal(deepseek.attempts, fresh.length, "only the attempts of the new epoch count");
+  } finally { await f.close(); }
+});
+
+test("owner signals are owner-only and idempotent", { timeout: 180000 }, async () => {
+  const f = await fixture();
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const run = await f.settled(created.body.id);
+    assert.equal(run.status, "ready-for-review", JSON.stringify(run));
+    const view = await waitFor(() => f.host.fetchApi(`/outcomes/runs/${run.id}`, "owner"), response => response.status === 200 && response.body.rows.length === 2, 30000);
+    const memberId = view.body.rows[0].memberId as string;
+    const exclusion = { action: "record", kind: "exclusion", requestId: randomUUID(), runId: run.id, memberId, reason: "trial" };
+
+    for (const role of ["viewer", "controller"] as const)
+      assert.equal((await f.host.fetchApi("/outcomes/signals", role, exclusion)).status, 403, role);
+
+    const first = await f.host.fetchApi("/outcomes/signals", "owner", exclusion);
+    assert.equal(first.status, 200, JSON.stringify(first.body));
+    assert.deepEqual(Object.keys(first.body).sort(), ["repeated", "signal"]);
+    assert.equal(first.body.repeated, false);
+    assert.equal(first.body.signal.kind, "exclusion");
+    assert.equal(first.body.signal.outcomeId, `${run.id}:${memberId}`);
+    assert.equal(first.body.signal.payload.reason, "trial");
+    assert.equal("request" in first.body.signal.payload, false, "the served signal has no request");
+
+    const repeated = await f.host.fetchApi("/outcomes/signals", "owner", exclusion);
+    assert.equal(repeated.status, 200);
+    assert.equal(repeated.body.repeated, true);
+    assert.equal(repeated.body.signal.signalId, first.body.signal.signalId);
+
+    const conflict = await f.host.fetchApi("/outcomes/signals", "owner", { ...exclusion, reason: "other" });
+    assert.equal(conflict.status, 409);
+    assert.equal(conflict.body.code, "request-conflict");
+
+    const unknownRun = await f.host.fetchApi("/outcomes/signals", "owner", { ...exclusion, requestId: randomUUID(), runId: randomUUID() });
+    assert.equal(unknownRun.status, 404);
+    assert.equal(unknownRun.body.code, "outcome-not-found");
+
+    const unknownKey = await f.host.fetchApi("/outcomes/signals", "owner", { ...exclusion, requestId: randomUUID(), extra: true });
+    assert.equal(unknownKey.status, 400);
+
+    const neitherFix = await f.host.fetchApi("/outcomes/signals", "owner", { action: "record", kind: "linked-fix", requestId: randomUUID(), runId: run.id });
+    assert.equal(neitherFix.status, 400);
+
+    // The time is stored in one form, and a time later than the request is refused.
+    const pastZ = new Date(Date.now() - 3600_000).toISOString();
+    const past = await f.host.fetchApi("/outcomes/signals", "owner", { action: "record", kind: "linked-fix", requestId: randomUUID(), runId: run.id, issue: "ABC-7", at: pastZ.replace("Z", "+00:00") });
+    assert.equal(past.status, 200, JSON.stringify(past.body));
+    assert.equal(past.body.signal.at, pastZ, "the stored time is the UTC form");
+    assert.equal(past.body.signal.payload.issue, "ABC-7");
+    assert.equal("request" in past.body.signal.payload, false);
+    const ahead = await f.host.fetchApi("/outcomes/signals", "owner", { action: "record", kind: "linked-fix", requestId: randomUUID(), runId: run.id, issue: "ABC-7", at: new Date(Date.now() + 3600_000).toISOString() });
+    assert.equal(ahead.status, 400);
+
+    const withdrawn = await f.host.fetchApi("/outcomes/signals", "owner", { action: "withdraw", kind: "exclusion", signalId: first.body.signal.signalId });
+    assert.equal(withdrawn.status, 200, JSON.stringify(withdrawn.body));
+    assert.equal(withdrawn.body.signal.state, "withdrawn");
+    assert.equal("request" in withdrawn.body.signal.payload, false);
+
+    // A withdrawal is idempotent by state: a second one repeats, and a request id is refused.
+    const again = await f.host.fetchApi("/outcomes/signals", "owner", { action: "withdraw", kind: "exclusion", signalId: first.body.signal.signalId });
+    assert.equal(again.status, 200, JSON.stringify(again.body));
+    assert.equal(again.body.repeated, true);
+    const withId = await f.host.fetchApi("/outcomes/signals", "owner", { action: "withdraw", kind: "exclusion", requestId: randomUUID(), signalId: first.body.signal.signalId });
+    assert.equal(withId.status, 400);
+
+    const wrongKind = await f.host.fetchApi("/outcomes/signals", "owner", { action: "withdraw", kind: "linked-fix", signalId: first.body.signal.signalId });
+    assert.equal(wrongKind.status, 409);
+    assert.equal(wrongKind.body.code, "signal-not-withdrawable");
+
+    const missing = await f.host.fetchApi("/outcomes/signals", "owner", { action: "withdraw", kind: "exclusion", signalId: "a".repeat(64) });
+    assert.equal(missing.status, 404);
+    assert.equal(missing.body.code, "signal-not-found");
+
+    const after = await f.host.fetchApi(`/outcomes/runs/${run.id}`, "owner");
+    assert.equal(after.status, 200, JSON.stringify(after.body));
+    const listed = after.body.signals.find((signal: { signalId: string }) => signal.signalId === first.body.signal.signalId);
+    assert.equal(listed.state, "withdrawn");
+    assert.equal("request" in listed.payload, false);
+    for (const signal of after.body.signals) assert.equal("request" in signal.payload, false, JSON.stringify(signal));
+  } finally { await f.close(); }
+});
+
+test("the signal commands", { timeout: 180000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "inf-outcome-signal-cli-"));
+  const f = await fixture();
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const run = await f.settled(created.body.id);
+    assert.equal(run.status, "ready-for-review", JSON.stringify(run));
+    const view = await waitFor(() => f.host.fetchApi(`/outcomes/runs/${run.id}`, "owner"), response => response.status === 200 && response.body.rows.length === 2, 30000);
+    const memberId = view.body.rows[0].memberId as string;
+
+    const owner = clientCli(f.host, root, "owner");
+    const excluded = (await owner("usage", "outcomes", "exclude", "--run", run.id, "--member", memberId, "--reason", "trial")).stdout.trim();
+    const match = /^Signal ([0-9a-f]{64}) active$/.exec(excluded);
+    assert.ok(match, excluded);
+    const signalId = match[1]!;
+
+    const withdrawn = (await owner("usage", "outcomes", "exclude", "--run", run.id, "--withdraw", signalId)).stdout.trim();
+    assert.equal(withdrawn, `Signal ${signalId} withdrawn`);
+
+    const linked = (await owner("usage", "outcomes", "link-fix", "--run", run.id, "--issue", "ABC-7")).stdout.trim();
+    assert.match(linked, /^Signal [0-9a-f]{64} active$/);
+
+    const lines = (await owner("usage", "outcomes", "--run", run.id)).stdout.trim().split("\n");
+    const signalLines = lines.filter(line => line.startsWith("signal "));
+    assert.equal(signalLines.length, 2, lines.join("\n"));
+    assert.ok(signalLines.some(line => line.includes(signalId.slice(0, 12)) && line.includes("withdrawn") && line.includes(memberId)), lines.join("\n"));
+
+    const viewer = clientCli(f.host, root, "viewer");
+    await assert.rejects(viewer("usage", "outcomes", "exclude", "--run", run.id, "--member", memberId, "--reason", "trial"), (error: { stderr?: string }) => {
+      assert.match(error.stderr ?? "", /Recording a signal requires an owner device key\./);
+      return true;
+    });
+
+    await assert.rejects(owner("usage", "outcomes", "link-fix", "--run", randomUUID(), "--issue", "ABC-8"), (error: { stderr?: string }) => {
+      assert.match(error.stderr ?? "", /The run, the member, or the signal was not found\./);
+      return true;
+    });
+  } finally {
+    await f.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Switches the fixture's project to a GitHub source served by a local bare remote, behind the restricted mirror
+ * launcher. The restricted launcher does not set the checks' identity variable, so a test creates its runs first.
+ */
+async function followGithub(f: Awaited<ReturnType<typeof fixture>>) {
+  const remote = join(f.host.root, "scan-remote.git");
+  git(f.source, "clone", "--bare", f.source, remote);
+  f.host.config.projects[0]!.source = { mode: "github", repository: "example/app", baseBranch: "main" };
+  f.host.config.source = { ...f.host.config.source, remoteOverrides: { rehearsal: remote } };
+  f.host.config.teams!.commandPrefix = { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--mirror-restricted-prefix", f.receipts] };
+  await f.host.stopApi();
+  writeFileSync(join(f.host.root, "config.json"), JSON.stringify(f.host.config));
+  await f.host.start();
+  return remote;
+}
+
+test("a refresh scans the base branch through the launcher", { timeout: 180000 }, async () => {
+  const f = await fixture();
+  const remote = await followGithub(f);
+  try {
+    const refresh = async () => {
+      const response = await f.host.fetchApi("/projects/rehearsal/source/refresh", "owner", {});
+      assert.equal(response.status, 200, JSON.stringify(response.body));
+    };
+    const scans = async () => {
+      const status = await f.host.fetchApi("/evidence/status");
+      assert.equal(status.status, 200);
+      return status.body.counts["outcomes.scans"];
+    };
+
+    await refresh();
+    assert.equal(await waitFor(scans, count => count === 1, 10000), 1, "the first refresh scans once");
+
+    writeFileSync(join(f.source, "scanned.txt"), "A second base commit.\n");
+    git(f.source, "add", "scanned.txt");
+    git(f.source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Second base commit");
+    git(f.source, "push", remote, "HEAD:refs/heads/main");
+
+    await refresh();
+    assert.equal(await waitFor(scans, count => count === 2, 10000), 2, "a moved base scans again");
+
+    const logPath = join(f.receipts, "mirror-commands.jsonl");
+    const refused = existsSync(logPath) ? readFileSync(logPath, "utf8").trim() : "";
+    assert.equal(refused, "", "the launcher refused no scan command");
+  } finally { await f.close(); }
+});
+
+test("an approved run lands on the next refresh", { timeout: 180000 }, async () => {
+  const f = await fixture();
+  let remote = "";
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const run = await f.settled(created.body.id);
+    assert.equal(run.status, "ready-for-review", JSON.stringify(run));
+    remote = await followGithub(f);
+
+    // The reviewed head descends from the remote's main, so this push is a fast-forward and its tree is the reviewed tree.
+    const reviewed = await f.host.fetchApi(`/outcomes/runs/${run.id}`, "owner");
+    assert.equal(reviewed.status, 200, JSON.stringify(reviewed.body));
+    const reviewedHead = reviewed.body.summary.payload.reviewedHead as string;
+    const base = git(remote, "rev-parse", "refs/heads/main");
+    git(run.workspace, "merge-base", "--is-ancestor", base, reviewedHead);
+    git(run.workspace, "push", remote, `${reviewedHead}:refs/heads/main`);
+
+    const refreshed = await f.host.fetchApi("/projects/rehearsal/source/refresh", "owner", {});
+    assert.equal(refreshed.status, 200, JSON.stringify(refreshed.body));
+
+    const view = await waitFor(() => f.host.fetchApi(`/outcomes/runs/${run.id}`, "owner"),
+      response => response.status === 200 && response.body.signals.some((signal: { kind: string }) => signal.kind === "landing"), 10000);
+    const landing = view.body.signals.find((signal: { kind: string }) => signal.kind === "landing");
+    assert.equal(landing.payload.method, "tree-equal");
+
+    const holdUntil = new Date(Date.parse(landing.at) + 30 * 86_400_000).toISOString();
+    const accepted = view.body.rows.filter((row: { accepted: number }) => row.accepted === 1);
+    assert.ok(accepted.length > 0, "the approved run has an accepted row");
+    for (const row of accepted) assert.equal(row.holdUntil, holdUntil, JSON.stringify(row));
+    for (const row of view.body.rows.filter((row: { accepted: number }) => row.accepted !== 1))
+      assert.equal(row.holdUntil, null, JSON.stringify(row));
   } finally { await f.close(); }
 });

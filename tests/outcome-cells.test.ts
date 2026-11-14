@@ -377,11 +377,29 @@ test("scouts report completion", () => {
   }
 });
 
+test("an owner exclusion is excluded in both uses", () => {
+  const owned = row({ disposition: "integrated", exclusion: "owner", integrated: null, accepted: null, firstPass: null, held: null });
+  for (const use of ["display", "decision"] as const) {
+    const cell = only(buildCells([owned], query({ use, by: ["profile"] })));
+    assert.equal(cell.attempts, 0, use);
+    assert.equal(cell.excluded.owner, 1, use);
+  }
+});
+
+test("a scan gap is reported", () => {
+  const gap = row({ flags: ["scan-gap"], integrated: 1, accepted: 1, firstPass: 1, held: null });
+  const cell = only(buildCells([gap], query({ by: ["profile"] })));
+  assert.equal(cell.attempts, 1);
+  assert.equal(cell.flagged["scan-gap"], 1);
+  assert.equal(cell.levels.held.unknown, 1);
+});
+
 test("an unknown flag is ignored", () => {
   // A later slice adds flags, and a newer host can write rows that an older one reads after a rollback.
-  const cell = only(buildCells([row({ flags: ["gap", "scan-gap"] as unknown as Flag[] })], query({ by: [] })));
+  const cell = only(buildCells([row({ flags: ["gap", "future-flag"] as unknown as Flag[] })], query({ by: [] })));
   assert.equal(cell.flagged.gap, 1);
-  assert.deepEqual(Object.keys(cell.flagged).sort(), ["backfilled", "empty-result", "gap", "same-model-review"]);
+  assert.equal(Object.hasOwn(cell.flagged, "future-flag"), false);
+  assert.deepEqual(Object.keys(cell.flagged).sort(), ["backfilled", "empty-result", "gap", "same-model-review", "scan-gap"]);
   for (const value of Object.values(cell.flagged)) assert.ok(Number.isFinite(value), JSON.stringify(cell.flagged));
 });
 

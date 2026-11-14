@@ -128,6 +128,8 @@ export interface Config {
     retention?: import("./team-types.js").TeamRetention;
     /** Free inodes and bytes the workspace volume must keep for a new run to start. */
     storageFloor?: import("./team-types.js").StorageFloor;
+    /** Outcome measurement settings; they never change a routine's work, so routine approvals ignore them. */
+    outcomes?: { holdDays?: number; retentionDays?: number };
   };
   machine?: { id: string; label: string };
   /** Operator default for an enrollment that has no saved mode. Only defaultMode exists in this block so far. */

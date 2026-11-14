@@ -4,6 +4,7 @@ import { type EvidenceIndexClass, canonicalJson } from "./evidence/crypto.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceTx } from "./evidence/types.js";
 import { type Disposition, type Flag, type LinkState, exclusionOf, levels, replaces, reportDisposition, roundCounts } from "./outcome-rules.js";
+import { recomputeRun } from "./outcome-signals.js";
 import { OUTCOMES_MODULE, type OutcomePayload, type OutcomeRow, type RunSummaryPayload, type RunSummaryRow, readOutcome, readSummary, writeOutcome, writeSummary } from "./outcome-store.js";
 import { type FeatureMap, taskFeatures } from "./task-features.js";
 import { profileIdentity, runEventKey, runSummaryCounts } from "./run-events.js";
@@ -305,6 +306,8 @@ function writeRun(store: EvidenceStore, tx: EvidenceTx, run: TeamRun, options: {
     inserted.length,
     result.skipped,
   );
+  // A run that already has signals takes them. The raw probe counts a signal whose payload does not open.
+  if (tx.get("SELECT 1 AS found FROM outcome_signals WHERE run_id=? LIMIT 1", run.id) !== undefined) recomputeRun(tx, run.id);
   return "written";
 }
 

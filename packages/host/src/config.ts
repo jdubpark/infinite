@@ -33,13 +33,18 @@ export const fuseConfigSchema = z.object({
   projects: z.record(z.string().min(1), fuseCeilingsSchema).optional(),
 }).strict();
 export type FuseConfig = z.infer<typeof fuseConfigSchema>;
+/** Outcome measurement settings. No default here: each consumer applies its own default where it reads the value. */
+export const outcomeSettingsSchema = z.object({
+  holdDays: z.number().int().min(1).max(365).optional(),
+  retentionDays: z.number().int().min(30).max(3650).optional(),
+}).strict();
 
 const schema = z
   .object({
     linear: z.object({ apiKeyFile: z.string().refine(isAbsolute), endpoint: z.url().optional() }).strict().optional(),
     hostLoad: z.object({ minAvailableMemoryGiB: z.number().min(0).max(4096), maxLoadPerCpu: z.number().positive().max(64) }).strict().optional(),
     intake: intakeConfigSchema.optional(),
-    teams: z.object({ workspaceDir: z.string().refine(isAbsolute), commandPrefix: teamCommandSchema.optional(), lineup: teamLineupSchema.optional(), trustWorkspaces: z.boolean().optional(), publishHeads: z.boolean().default(true), stallMinutes: z.number().int().min(5).max(1440).optional(), checkMinutes: z.number().positive().max(240).optional(), retention: teamRetentionSchema.optional(), storageFloor: storageFloorSchema.optional() }).strict().optional(),
+    teams: z.object({ workspaceDir: z.string().refine(isAbsolute), commandPrefix: teamCommandSchema.optional(), lineup: teamLineupSchema.optional(), trustWorkspaces: z.boolean().optional(), publishHeads: z.boolean().default(true), stallMinutes: z.number().int().min(5).max(1440).optional(), checkMinutes: z.number().positive().max(240).optional(), retention: teamRetentionSchema.optional(), storageFloor: storageFloorSchema.optional(), outcomes: outcomeSettingsSchema.optional() }).strict().optional(),
     machine: z.object({ id: z.uuid(), label: machineLabelSchema }).strict().optional(),
     autonomy: z.object({ defaultMode: autonomyModeSchema.optional(), fuse: fuseConfigSchema.optional() }).strict().optional(),
     cmux: z.object({ enabled: z.boolean(), command: z.string().min(1).optional(), hooksDir: z.string().refine(isAbsolute).optional() }).strict().optional(),

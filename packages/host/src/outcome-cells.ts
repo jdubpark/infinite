@@ -22,7 +22,7 @@ export type Cell = {
   key: Record<string, string>; sources: Source[]; from: string | null; to: string | null;
   attempts: number; open: number; excluded: ExclusionCounts;
   withheld: { backfilled: number; gap: number; unfrozen: number };
-  flagged: { backfilled: number; gap: number; "empty-result": number; "same-model-review": number };
+  flagged: { backfilled: number; gap: number; "empty-result": number; "same-model-review": number; "scan-gap": number };
   levels: { integrated: LevelCount; accepted: LevelCount; firstPass: LevelCount; held: LevelCount };
   completed?: LevelCount;                          // role "scout" only
   tokens: Spread | null; spentUsd: Spread | null; listUsd: Spread | null; minutes: Spread | null;
@@ -53,7 +53,7 @@ export function rowUse(row: OutcomeRow, use: CellUse): RowUse {
   if (decision && row.flags.includes("backfilled")) return { kind: "withheld", reason: "backfilled" };
   if (decision && row.flags.includes("gap")) return { kind: "withheld", reason: "gap" };
   if (row.disposition === "open") return { kind: "open" };
-  const exclusion = exclusionOf(row.disposition);
+  const exclusion = row.exclusion ?? exclusionOf(row.disposition);
   if (exclusion !== undefined) return { kind: "excluded", exclusion };
   if (decision && row.disposition === "integrated" && row.frozenAt === null) return { kind: "withheld", reason: "unfrozen" };
   const stored: Levels = { integrated: row.integrated, accepted: row.accepted, firstPass: row.firstPass, held: row.held };
@@ -156,7 +156,7 @@ function summarize(key: Record<string, string>, rows: readonly OutcomeRow[], que
   let open = 0;
   const excluded: ExclusionCounts = { limit: 0, owner: 0, host: 0, duel: 0 };
   const withheld = { backfilled: 0, gap: 0, unfrozen: 0 };
-  const flagged = { backfilled: 0, gap: 0, "empty-result": 0, "same-model-review": 0 };
+  const flagged = { backfilled: 0, gap: 0, "empty-result": 0, "same-model-review": 0, "scan-gap": 0 };
   for (const row of rows) {
     const use = rowUse(row, query.use);
     if (use.kind === "open") open++;

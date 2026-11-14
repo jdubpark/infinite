@@ -10,6 +10,8 @@ import {
   replaces,
   reportDisposition,
   roundCounts,
+  rowExclusion,
+  scanGap,
   stopDisposition,
   type LinkState,
   type RowState,
@@ -17,6 +19,11 @@ import {
 
 function row(overrides: Partial<RowState> & Pick<RowState, "disposition">): RowState {
   return { role: "implementer", accepted: null, links: [], ...overrides };
+}
+
+function fourLevels(state: RowState): (0 | 1 | null)[] {
+  const result = levels(state);
+  return [result.integrated, result.accepted, result.firstPass, result.held];
 }
 
 test("dispositions follow the spec table", () => {
@@ -69,6 +76,61 @@ test("levels by row state", () => {
   assert.deepEqual(as(row({ disposition: "integrated", accepted: 1, links: ["pending"] })), [1, 1, null, null]);
   assert.deepEqual(as(row({ disposition: "integrated", links: ["attributed"] })), [1, null, 0, null]);
   assert.deepEqual(as(row({ disposition: "integrated", accepted: 0 })), [1, 0, 0, 0]);
+});
+
+test("an owner exclusion removes every level", () => {
+  const excluded = { excluded: true, negative: false, landing: "covered" as const };
+  const owned = row({ disposition: "integrated", accepted: 1, links: ["clear"], signals: excluded });
+  assert.deepEqual(fourLevels(owned), [null, null, null, null]);
+  assert.equal(rowExclusion("integrated", owned.signals), "owner");
+
+  const kept = row({ disposition: "integrated", accepted: 1, links: ["clear"], signals: { ...excluded, excluded: false } });
+  assert.deepEqual(fourLevels(kept), [1, 1, 1, 1]);
+  assert.equal(rowExclusion("integrated", kept.signals), undefined);
+
+  const limited = row({ disposition: "limit", signals: { excluded: true, negative: false } });
+  assert.equal(rowExclusion("limit", limited.signals), "limit");
+  assert.deepEqual(fourLevels(limited), [null, null, null, null]);
+});
+
+test("held follows the window", () => {
+  const accepted = { accepted: 1 as const, links: ["clear" as const] };
+  const at = (landing: "covered" | "open" | "gap") => row({ disposition: "integrated", ...accepted, signals: { excluded: false, negative: false, landing } });
+  assert.equal(fourLevels(at("covered"))[3], 1);
+  assert.equal(scanGap(at("covered")), false);
+  assert.equal(fourLevels(at("open"))[3], null);
+  assert.equal(scanGap(at("open")), false);
+  assert.equal(fourLevels(at("gap"))[3], null);
+  assert.equal(scanGap(at("gap")), true);
+
+  const noLanding = row({ disposition: "integrated", ...accepted, signals: { excluded: false, negative: false } });
+  assert.equal(fourLevels(noLanding)[3], null);
+  assert.equal(scanGap(noLanding), false);
+
+  const unaccepted = row({ disposition: "integrated", signals: { excluded: false, negative: false, landing: "covered" } });
+  assert.equal(fourLevels(unaccepted)[3], null);
+});
+
+test("a negative signal makes held no", () => {
+  const negative = { excluded: false, negative: true };
+  const reverted = row({ disposition: "integrated", accepted: 1, signals: { ...negative, landing: "covered" } });
+  assert.equal(fourLevels(reverted)[3], 0);
+  assert.equal(scanGap(row({ disposition: "integrated", accepted: 1, signals: { ...negative, landing: "gap" } })), false);
+
+  const unaccepted = row({ disposition: "integrated", links: ["clear"], signals: negative });
+  assert.equal(fourLevels(unaccepted)[3], 0);
+  assert.equal(levels(unaccepted).firstPass, levels(row({ disposition: "integrated", links: ["clear"] })).firstPass);
+
+  const rejected = row({ disposition: "integrated", accepted: 0, signals: { excluded: false, negative: false, landing: "covered" } });
+  assert.equal(fourLevels(rejected)[3], 0);
+});
+
+test("rows without signals keep today's levels", () => {
+  const stalledWithSignals = row({ disposition: "stalled", signals: { excluded: false, negative: true, landing: "covered" } });
+  assert.deepEqual(fourLevels(stalledWithSignals), [0, 0, 0, 0]);
+  const integrated = row({ disposition: "integrated", accepted: 1, links: ["clear"] });
+  assert.deepEqual(fourLevels(integrated), [1, 1, 1, null]);
+  assert.equal(scanGap(integrated), false);
 });
 
 test("a freeze decides acceptance from the last covering review", () => {

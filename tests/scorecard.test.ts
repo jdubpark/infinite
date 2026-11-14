@@ -138,6 +138,15 @@ test("counted attempts leave open and excluded rows out", () => {
   assert.deepEqual(card.sources, ["production"]);
 });
 
+test("an owner exclusion leaves the scorecard denominator", () => {
+  const card = scorecardOf([integratedRow({ profileId: "light" }), integratedRow({ profileId: "light", exclusion: "owner" })]);
+  assert.equal(card.rows.length, 1);
+  const light = card.rows[0]!;
+  assert.equal(light.attempts, 1);
+  assert.equal(light.integrated, 1);
+  assert.deepEqual(light.excluded, { limit: 0, owner: 1, host: 0, duel: 0 });
+});
+
 test("metered medians use complete costs of integrated rows", () => {
   const sessions = new Map<string, SessionCost>([
     ["s1", { usd: 0.002, tokens: 1504, complete: true }],

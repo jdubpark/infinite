@@ -504,3 +504,94 @@ test("storage alerts once on startup when already high and honor the host-storag
     assert.equal(sent.length, 1, "host-storage can be disabled");
   } finally { Date.now = originalNow; enabled.stop(); disabled.stop(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("a fuse push for a long project id has a short collapse id", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("controller", "ExponentPushToken[a]", "android");
+  const sent: { collapseId: string }[][] = [];
+  const sender = async (messages: never[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  // The configuration sets no length limit on a project id, and a push service limits the collapse id.
+  const long = "p".repeat(200), other = `${"p".repeat(199)}q`;
+  const pending = [long, other, "short"].map((projectId, index) => ({ tripId: `trip-${index}`, scope: "project" as const, projectId, label: "Fixture", cause: "launch-rate" as const, ownerClose: true, openedAt: "2026-11-13T10:00:00.000Z" }));
+  const fuse = { interrupts: () => pending, markAnnounced: () => {} };
+  const notifier = new Notifier({ list: async () => [] } as never, store, sender, { detail: "minimal", events: ["autonomy-interrupt"], intervalMs: 100000 }, undefined, undefined, undefined, fuse);
+  await notifier.tick();
+  const ids = sent[0]!.map(message => message.collapseId);
+  assert.equal(ids.length, 3);
+  for (const id of ids) assert.ok(Buffer.byteLength(id, "utf8") <= 64, id);
+  assert.notEqual(ids[0], ids[1], "two long ids keep different collapse ids");
+  assert.equal(ids[2], "interrupt:fuse:short");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a fuse interrupt whose push failed is offered again", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("controller", "ExponentPushToken[a]", "android");
+  store.add("controller", "ExponentPushToken[b]", "android");
+  let failing = true;
+  let sends = 0;
+  // The sender resolves even when the push service refuses a message: each message gets its own ticket.
+  const sender = async (messages: { to: string }[]) => { sends += 1; return messages.map(message => failing || message.to.endsWith("[b]") ? { status: "error" as const, message: "network" } : { status: "ok" as const, id: "x" }); };
+  const pending = [
+    { tripId: "trip-1", scope: "project" as const, projectId: "p", label: "Fixture", cause: "launch-rate" as const, ownerClose: true, openedAt: "2026-11-13T10:00:00.000Z" },
+    { tripId: "trip-2", scope: "host" as const, label: "the host", cause: "unmeasurable" as const, ownerClose: false, openedAt: "2026-11-13T10:00:00.000Z" },
+  ];
+  const marked: string[][] = [];
+  const fuse = { interrupts: () => pending.filter(trip => !marked.flat().includes(trip.tripId)), markAnnounced: (ids: readonly string[]) => { marked.push([...ids]); } };
+  const notifier = new Notifier({ list: async () => [] } as never, store, sender as never, { detail: "minimal", events: ["autonomy-interrupt"], intervalMs: 100000 }, undefined, undefined, undefined, fuse);
+  // The wait is measured on a clock that never steps back. The test holds that clock, so real time cannot move it.
+  const clock = notifier as unknown as { monotonic: () => number };
+  const started = 1_000_000;
+  clock.monotonic = () => started;
+  await notifier.tick();
+  assert.equal(sends, 1);
+  assert.deepEqual(marked, [], "no device received either trip, so neither is marked");
+  // The next attempt waits a minute, so an outage does not send on every tick.
+  await notifier.tick();
+  assert.equal(sends, 1);
+  // Just under a minute later nothing is sent yet.
+  failing = false;
+  clock.monotonic = () => started + 59_000;
+  await notifier.tick();
+  assert.equal(sends, 1);
+  // The minute has passed, and one device now receives its pushes. A trip that reached one device is announced.
+  clock.monotonic = () => started + 61_000;
+  await notifier.tick();
+  assert.equal(sends, 2);
+  assert.deepEqual(marked, [["trip-1", "trip-2"]]);
+  await notifier.tick();
+  assert.equal(sends, 2, "announced trips are not sent again");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("the notifier pushes one fuse interrupt and marks it announced", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("controller", "ExponentPushToken[a]", "android");
+  const sent: { to: string; title: string; body: string; data: { url: string }; channelId: string; priority: string; collapseId: string }[][] = [];
+  const sender = async (messages: never[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  let pending = [{ tripId: "trip-1", scope: "project" as const, projectId: "p", label: "Fixture", cause: "launch-rate" as const, ownerClose: true, openedAt: "2026-11-13T10:00:00.000Z" }];
+  const marked: string[][] = [];
+  const fuse = {
+    interrupts: () => pending,
+    markAnnounced: (ids: readonly string[]) => { marked.push([...ids]); pending = pending.filter(trip => !ids.includes(trip.tripId)); },
+  };
+  const notifier = new Notifier({ list: async () => [] } as never, store, sender, { detail: "minimal", events: ["autonomy-interrupt"], intervalMs: 100000 }, undefined, undefined, undefined, fuse);
+  await notifier.tick();
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0], [{ to: "ExponentPushToken[a]", title: "Spend fuse open",
+    body: "Launches paused for Fixture: it reached its launch limit for the last hour. It stays open until you close it.",
+    data: { url: "/teams" }, channelId: "attention", priority: "high", collapseId: "interrupt:fuse:p" }]);
+  assert.deepEqual(marked, [["trip-1"]]);
+  await notifier.tick();
+  assert.equal(sent.length, 1, "an announced trip is not pushed again");
+
+  pending = [{ tripId: "trip-2", scope: "host" as const, cause: "unmeasurable" as const, ownerClose: false, openedAt: "2026-11-13T10:00:00.000Z" }];
+  const off = new Notifier({ list: async () => [] } as never, store, sender, { detail: "minimal", events: ["needs-you"], intervalMs: 100000 }, undefined, undefined, undefined, fuse);
+  await off.tick();
+  assert.equal(sent.length, 1, "without the autonomy-interrupt event nothing is sent");
+  assert.deepEqual(marked, [["trip-1"]], "and nothing is marked");
+  rmSync(dir, { recursive: true, force: true });
+});

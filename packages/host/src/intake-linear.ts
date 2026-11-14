@@ -126,9 +126,10 @@ export class IntakeLinear {
    * ID back, so a lost response that still committed resolves and a retry never files a second issue.
    */
   async createIssue(input: { id: string; teamId: string; title: string; description: string; label: string }): Promise<IntakeIssue> {
+    // Only this team's labels and workspace labels can be used, so another team's same-name labels never fill the page.
     const labelData = await this.linear.request("InfiniteIntakeLabel",
       "query InfiniteIntakeLabel($filter: IssueLabelFilter!, $first: Int!) { issueLabels(filter: $filter, first: $first) { nodes { id team { id } } } }",
-      { filter: { name: { eqIgnoreCase: input.label } }, first: 50 });
+      { filter: { name: { eqIgnoreCase: input.label }, or: [{ team: { id: { eq: input.teamId } } }, { team: { null: true } }] }, first: 50 });
     const labels = z.object({ issueLabels: z.object({ nodes: z.array(z.object({ id: z.uuid(), team: z.object({ id: z.uuid() }).nullable().optional() })).max(50) }) }).parse(labelData).issueLabels.nodes;
     const label = labels.find(item => item.team?.id === input.teamId) ?? labels.find(item => !item.team);
     if (!label) throw new MissingLabelError();
@@ -141,8 +142,11 @@ export class IntakeLinear {
       if (issue.id === input.id) return issue;
       failure = new Error("Linear did not confirm the issue.");
     } catch (error) { failure = error; }
-    const found = (await this.states([input.id])).get(input.id);
-    if (found && found !== "deleted") return found;
+    // A failed read-back must not hide the creation error that caused it.
+    try {
+      const found = (await this.states([input.id])).get(input.id);
+      if (found && found !== "deleted") return found;
+    } catch { /* the creation error below is the one to report */ }
     throw failure;
   }
 

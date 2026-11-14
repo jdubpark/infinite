@@ -86,7 +86,10 @@ export async function startIntakeLinearServer(options: { clock?: () => number } 
       }
       case "InfiniteIntakeLabel": {
         const name = String(variables.filter?.name?.eqIgnoreCase ?? "").toLowerCase();
-        const nodes = labels.filter(label => label.name.toLowerCase() === name).map(label => ({ id: label.id, team: label.teamId ? { id: label.teamId } : null }));
+        const scopes: { team?: { id?: { eq?: string }; null?: boolean } }[] = variables.filter?.or ?? [];
+        const inScope = (label: { teamId: string | null }) => scopes.length === 0 || scopes.some(scope =>
+          scope.team?.null ? label.teamId === null : scope.team?.id?.eq !== undefined && label.teamId === scope.team.id.eq);
+        const nodes = labels.filter(label => label.name.toLowerCase() === name && inScope(label)).slice(0, Number(variables.first) || 50).map(label => ({ id: label.id, team: label.teamId ? { id: label.teamId } : null }));
         reply(200, { data: { issueLabels: { nodes } } });
         return;
       }

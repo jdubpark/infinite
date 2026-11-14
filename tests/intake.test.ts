@@ -32,11 +32,15 @@ class FakeThreads implements IntakeThreadReader {
   failNext = 0;
   failure: Error = new Error("Slack is unavailable");
   permalinkFails = false;
+  /** While set, every thread read waits for it. */
+  gate?: Promise<void>;
+  waiting = 0;
   async permalink(binding: IntakeThread, ts: string): Promise<string> {
     if (this.permalinkFails) throw new SlackError("internal_error", true);
     return `https://example.slack.com/archives/${binding.channelId}/p${ts.replace(".", "")}`;
   }
   async thread(binding: IntakeThread): Promise<SlackThreadMessage[] | "unreadable"> {
+    if (this.gate) { this.waiting += 1; await this.gate; }
     if (this.failNext > 0) { this.failNext -= 1; throw this.failure; }
     if (this.unreadable.has(binding.threadTs)) return "unreadable";
     return this.threads.get(binding.threadTs) ?? [];
@@ -920,8 +924,8 @@ test("failureSummary keeps the fixed text of a Slack or Linear request failure, 
 });
 
 /** A direct request: the owner's mention is the thread's root, `later` messages follow it, and the thread is registered. */
-function direct(ctx: Ctx, text = "Export fails on empty rows\nPlease fix the exporter", more: (root: string) => SlackThreadMessage[] = () => []) {
-  const root = slackTs(ctx.enabled + 2000);
+function direct(ctx: Ctx, text = "Export fails on empty rows\nPlease fix the exporter", more: (root: string) => SlackThreadMessage[] = () => [], offset = 2000) {
+  const root = slackTs(ctx.enabled + offset);
   const thread: IntakeThread = { channelId: "C0000000000", threadTs: root };
   ctx.threads.threads.set(root, [{ ts: root, user: OWNER_SLACK, text }, ...more(root)]);
   return { thread, ts: root, eventId: `Ev${randomUUID().slice(0, 8)}`, text };
@@ -1049,5 +1053,52 @@ test("with admitIssues false a labelled owner issue filed in Linear is not admit
     assert.deepEqual(ctx.list(), []);
     assert.equal(ctx.missions.list().length, 0);
     assert.ok(!ctx.linearServer.calls.some(call => call.operation === "InfiniteIntakeCandidates"));
+  } finally { await ctx.close(); }
+});
+
+test("a request made during an in-flight cycle is filed without waiting for the timer", { timeout: 60000 }, async () => {
+  const ctx = await setup({ requireSlackThread: false });
+  try {
+    let release!: () => void;
+    ctx.threads.gate = new Promise<void>(resolve => { release = resolve; });
+    ctx.intake.requestFromSlack(direct(ctx));
+    // The first cycle is blocked reading the first request's thread; the second request misses its `file` loop.
+    await waitFor(async () => ctx.threads.waiting, count => count > 0, 10000);
+    assert.equal(ctx.intake.requestFromSlack(direct(ctx, "Second request", () => [], 2400)), "accepted");
+    release();
+    await waitFor(async () => ctx.linearServer.allIssues().length, count => count === 2, 20000);
+  } finally { await ctx.close(); }
+});
+
+test("a long root message cannot push out the newest message or the cut notice", () => {
+  const text = directObjective({ identifier: "TEST-1", title: "t" }, "do it", [
+    { ts: "1700000000.000001", user: OWNER_SLACK, text: "x".repeat(30000) },
+    { ts: "1700000000.000002", user: TEAMMATE_SLACK, text: "newest" },
+  ], "1700000000.000002", OWNER_SLACK);
+  assert.ok(text.length <= 24000);
+  assert.match(text, /\nowner \| \[… message cut\]\nother 1 \| newest$/);
+});
+
+test("a label that shares its name with dozens of other teams' labels still resolves", { timeout: 60000 }, async () => {
+  const ctx = await setup({ requireSlackThread: false });
+  try {
+    ctx.linearServer.setLabels([
+      ...Array.from({ length: 60 }, () => ({ name: "infinite", teamId: randomUUID() })),
+      { name: "infinite", teamId: ctx.linearServer.teamId },
+    ]);
+    ctx.intake.requestFromSlack(direct(ctx));
+    await ctx.intake.poll();
+    assert.equal(ctx.linearServer.allIssues().length, 1);
+  } finally { await ctx.close(); }
+});
+
+test("a failed read-back keeps the creation error", { timeout: 60000 }, async () => {
+  const ctx = await setup({ requireSlackThread: false });
+  try {
+    const failing = new IntakeLinear({ request: async (operation: string) => {
+      if (operation === "InfiniteIntakeLabel") return { issueLabels: { nodes: [{ id: randomUUID(), team: null }] } };
+      throw new Error(operation === "InfiniteIntakeIssueCreate" ? "creation failed" : "read-back failed");
+    } });
+    await assert.rejects(failing.createIssue({ id: randomUUID(), teamId: randomUUID(), title: "t", description: "", label: "infinite" }), /creation failed/);
   } finally { await ctx.close(); }
 });

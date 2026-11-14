@@ -404,7 +404,9 @@ export class ProjectGroupService {
 
   /**
    * Every owner mutation persists through here, so a move and its count are one write. A host fold never passes.
-   * A checkout moved when the project that holds it changed, or when the owner deleted that project.
+   * A checkout moved when it left the stored project that held it, by removal, by transfer or because the owner
+   * deleted that project, or when it joined a stored project from its own implicit one. Giving an implicit project
+   * a stored record under its own id moves nothing.
    */
   private record(candidate: CurrentStored, requestId: string, fingerprint: string, result: ProjectGroup) {
     // A stored member that is not enrolled now is counted too, so a checkout that returns does not skip a move made meanwhile.
@@ -414,9 +416,8 @@ export class ProjectGroupService {
     ]);
     for (const id of ids) {
       const before = this.findContaining(this.state, id), after = this.findContaining(candidate, id);
-      const deleted = before !== undefined && !own(candidate.groups, before.id);
-      if (!deleted && (before?.id ?? id) === (after?.id ?? id)) continue;
-      candidate.ownerMoves.counts[id] = (own(candidate.ownerMoves.counts, id) ?? 0) + 1;
+      const moved = before === undefined ? after !== undefined && after.id !== id : after?.id !== before.id;
+      if (moved) candidate.ownerMoves.counts[id] = (own(candidate.ownerMoves.counts, id) ?? 0) + 1;
     }
     candidate.receipts[requestId] = { fingerprint, result: structuredClone(result) };
     this.persist(candidate);

@@ -194,7 +194,28 @@ export class PermissionJournal {
         return;
       }
 
-      let canonicalRepeat = decision.repeats;
+      // A replay record answers with one earlier decision of the same task and carries that decision's outcome.
+      // It is stored against the source, so no chain of replays exists and no link can cross a task.
+      let replaySourceId: string | undefined;
+      let replayedRepeat: string | undefined;
+      if (decision.replayOf !== undefined) {
+        const cited = tx.get<DecisionRow>(`SELECT * FROM ${DECISIONS} WHERE id=?`, decision.replayOf);
+        const source = cited && replaySource(tx, cited);
+        if (!cited || !source || cited.task_id !== decision.taskId || source.task_id !== decision.taskId) {
+          throw new TypeError("A replay must cite a decision of the same task.");
+        }
+        if (source.verdict === "owner" || (HOST_REJECT_CODES as readonly string[]).includes(source.code ?? "")) {
+          throw new TypeError("An owner verdict and a host result are never replayed.");
+        }
+        if (source.verdict !== decision.verdict || (source.code ?? undefined) !== decision.code) {
+          throw new TypeError("A replay must carry the verdict and code of the decision it replays.");
+        }
+        replaySourceId = source.id;
+        // A replayed effect reject is a repeat of that reject, whether or not the caller said so.
+        if (isEffectReject(source.code ?? undefined)) replayedRepeat = source.repeats ?? source.id;
+      }
+
+      let canonicalRepeat = decision.repeats ?? replayedRepeat;
       if (canonicalRepeat !== undefined) {
         const cited = tx.get<DecisionRow>(`SELECT * FROM ${DECISIONS} WHERE id=?`, canonicalRepeat);
         if (!cited || cited.task_id !== decision.taskId || !isEffectReject(cited.code ?? undefined)
@@ -206,6 +227,9 @@ export class PermissionJournal {
         if (!canonical || canonical.task_id !== decision.taskId || !isEffectReject(canonical.code ?? undefined)
           || !isOpen(tx, canonical)) {
           throw new TypeError("A repeated decision must resolve to an open canonical effect reject.");
+        }
+        if (replayedRepeat !== undefined && replayedRepeat !== canonicalRepeat) {
+          throw new TypeError("A replayed reject cannot be recorded as a repeat of a different reject.");
         }
       }
 
@@ -224,7 +248,7 @@ export class PermissionJournal {
         decision.assignment, decision.sessionId, decision.role ?? null, decision.provider, decision.family ?? null,
         decision.evidenceHash, decision.reuseKey ?? null, decision.action.tool, decision.action.summary,
         JSON.stringify(decision.rules), JSON.stringify(decision.tiers), decision.verdict, decision.code ?? null,
-        decision.interruptClass ?? null, noteSealed, inputSealed, decision.replayOf ?? null, canonicalRepeat ?? null,
+        decision.interruptClass ?? null, noteSealed, inputSealed, replaySourceId ?? null, canonicalRepeat ?? null,
         decision.rules.some(rule => rule.startsWith("raise:")) ? 1 : 0,
         decision.tiers.at(-1)?.tier ?? "none",
         decision.tiers.length === 0
@@ -269,9 +293,9 @@ export class PermissionJournal {
     const by = requiredString(input.by, "by");
     this.store.write(tx => {
       const cited = tx.get<DecisionRow>(`SELECT * FROM ${DECISIONS} WHERE id=?`, decisionId);
-      const decision = cited && replaySource(tx, cited);
+      const decision = cited && canonicalDecision(tx, cited);
       if (!decision || decision.verdict !== "reject") throw new TypeError("Only a reject can be reopened.");
-      insertControl(tx, { kind: "reopen", at, by, decisionId: decision.repeats ?? decision.id });
+      insertControl(tx, { kind: "reopen", at, by, decisionId: decision.id });
     });
   }
 
@@ -479,7 +503,7 @@ export class PermissionJournal {
     return this.store.read(db => {
       const cited = db.get<DecisionRow>(`SELECT * FROM ${DECISIONS} WHERE id=?`, decisionId);
       const row = cited && replaySource(db, cited);
-      if (!cited || !row || cited.task_id !== taskId || row.task_id !== taskId || row.verdict === "owner") return false;
+      if (!cited || !row || cited.task_id !== taskId || row.verdict === "owner") return false;
       const strongFamilies = (JSON.parse(row.tiers_json) as PermissionTier[])
         .filter(tier => tier.tier === "strong").map(tier => tier.family);
       if (strongFamilies.length > 0
@@ -681,13 +705,17 @@ function hydrateDecision(db: EvidenceDb, row: DecisionRow): PermissionDecision {
   };
 }
 
-/** The decision a replay record answers with: the end of its `replayOf` chain. */
+/**
+ * The decision a replay record answers with. Every link must stay in one task and carry one outcome; a
+ * citation that does not has no source.
+ */
 function replaySource(db: EvidenceDb, row: DecisionRow, seen = new Set<string>()): DecisionRow | undefined {
   if (seen.has(row.id)) return undefined;
   seen.add(row.id);
   if (row.replay_of === null) return row;
   const source = db.get<DecisionRow>(`SELECT * FROM ${DECISIONS} WHERE id=?`, row.replay_of);
-  return source === undefined ? undefined : replaySource(db, source, seen);
+  if (!source || source.task_id !== row.task_id || source.verdict !== row.verdict || source.code !== row.code) return undefined;
+  return replaySource(db, source, seen);
 }
 
 function sameFamily(left: string, right: string): boolean {
@@ -711,11 +739,16 @@ function ownerReopened(db: EvidenceDb, row: DecisionRow): boolean {
   ).some(event => compareOrder(event.at, event.seq, canonical.at, canonical.seq) > 0);
 }
 
+/**
+ * The one decision whose open, closed and reopened state a record shares: the reject it repeats, else the
+ * decision it replays, else itself.
+ */
 function canonicalDecision(db: EvidenceDb, row: DecisionRow, seen = new Set<string>()): DecisionRow | undefined {
   if (seen.has(row.id)) return undefined;
   seen.add(row.id);
-  if (row.repeats === null) return row;
-  const canonical = db.get<DecisionRow>(`SELECT * FROM ${DECISIONS} WHERE id=?`, row.repeats);
+  const next = row.repeats ?? row.replay_of;
+  if (next === null) return row;
+  const canonical = db.get<DecisionRow>(`SELECT * FROM ${DECISIONS} WHERE id=?`, next);
   return canonical === undefined ? undefined : canonicalDecision(db, canonical, seen);
 }
 

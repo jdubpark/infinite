@@ -300,6 +300,50 @@ test("reopening a replay record reopens the reject it replays", () => withJourna
     assert.equal(journal.replayEligible(id, { taskId: "task-1", requesterFamily: "family-a" }), false, id);
 }));
 
+test("a replayed effect reject is a repeat of that reject whether or not the record says so", () => withJournal(journal => {
+  journal.appendDecision(effectReject("reject"));
+  journal.appendDecision(effectReject("other-reject", { code: "unrelated" }));
+  journal.appendDecision(effectReject("replay-1", { replayOf: "reject" }));
+  journal.appendDecision(effectReject("replay-2", { replayOf: "replay-1" }));
+
+  assert.deepEqual([journal.decision("replay-2")?.replayOf, journal.decision("replay-2")?.repeats], ["reject", "reject"]);
+  assert.equal(journal.repeatCount("assignment-1", "reject"), 2);
+  assert.equal(journal.isLocked("assignment-1"), true);
+  assert.deepEqual(journal.openRejects("task-1").map(row => row.id), ["reject", "other-reject"]);
+  assert.throws(() => journal.appendDecision(effectReject("conflicting", { replayOf: "reject", repeats: "other-reject" })), TypeError);
+
+  journal.reopen({ decisionId: "replay-2", at: "2026-11-14T10:01:00.000Z", by: "owner" });
+  assert.deepEqual(journal.openRejects("task-1").map(row => row.id), ["other-reject"]);
+  assert.equal(journal.isLocked("assignment-1"), false);
+  for (const id of ["reject", "replay-1", "replay-2"])
+    assert.equal(journal.replayEligible(id, { taskId: "task-1", requesterFamily: "family-a" }), false, id);
+  assert.throws(() => journal.appendDecision(effectReject("after-reopen", { replayOf: "reject" })), TypeError);
+}));
+
+test("a replay record must stay in its task and carry the outcome it replays", () => withJournal(journal => {
+  journal.appendDecision(decision({ id: "allow" }));
+  journal.appendDecision(effectReject("reject"));
+  journal.appendDecision(decision({ id: "owner", verdict: "owner", interruptClass: "money" }));
+  journal.appendDecision(decision({ id: "outage", verdict: "reject", code: "unavailable" }));
+
+  const refused: Array<Partial<PermissionDecision>> = [
+    { taskId: "task-2", replayOf: "allow" },
+    { replayOf: "missing" },
+    { verdict: "reject", code: "uncertain", replayOf: "allow" },
+    { verdict: "reject", code: "unrelated", replayOf: "reject" },
+    { verdict: "owner", interruptClass: "money", replayOf: "owner" },
+    { verdict: "reject", code: "unavailable", replayOf: "outage" },
+  ];
+  for (const [index, overrides] of refused.entries())
+    assert.throws(() => journal.appendDecision(decision({ id: `refused-${index}`, ...overrides })), TypeError, JSON.stringify(overrides));
+  assert.equal(journal.decisions().length, 4);
+
+  journal.appendDecision(decision({ id: "allow-replay", replayOf: "allow" }));
+  journal.appendDecision(decision({ id: "allow-replay-2", replayOf: "allow-replay" }));
+  assert.equal(journal.decision("allow-replay-2")?.replayOf, "allow", "a replay is stored against its source");
+  assert.equal(journal.replayEligible("allow-replay-2", { taskId: "task-2", requesterFamily: "family-a" }), false);
+}));
+
 test("the journal's own order decides, also for equal timestamps and a clock that steps back", () => withJournal(journal => {
   const at = "2026-11-14T10:00:00.000Z", earlier = "2026-11-14T09:00:00.000Z";
   journal.appendDecision(decision({ id: "allow", at }));

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProjectGroup, ProjectGroupList } from "../packages/host/src/project-group-types.js";
 import { PermissionDelegationService } from "../packages/host/src/permission-delegation.js";
+import { ProjectGroupService } from "../packages/host/src/project-groups.js";
 import type { PermissionCoverageEntry } from "../packages/host/src/permission-delegation-types.js";
 import { INTERRUPT_CLASSES, PERMISSION_POLICY_VERSION } from "../packages/host/src/permission-policy.js";
 import type { Config, Project } from "../packages/host/src/types.js";
@@ -561,5 +562,26 @@ test("a replayed request id returns its recorded result and restores no coverage
     for (const id of ["alpha", "beta"])
       assert.deepEqual(service.coverage(id), { covered: false, projectId: id, reason: "not-covered" });
     assert.equal(f.service().status()[0]!.state, "not-delegated");
+  } finally { f.cleanup(); }
+});
+
+test("with the real group service, coverage ends when the owner removes a project from the workspace that carries its id", () => {
+  const f = fixture();
+  try {
+    const config = { ...f.config, sync: { homeDir: join(f.root, "home") }, teams: { workspaceDir: join(f.root, "workspace") } } as Config;
+    const groups = new ProjectGroupService(config, f.key, undefined, { git: () => undefined });
+    const service = new PermissionDelegationService(config, f.key, groups);
+    assert.equal(service.delegate("alpha", request(), actor).view.state, "delegated");
+
+    const stored = groups.update("alpha", { requestId: randomUUID(), revision: 1, name: "Alpha Space" });
+    assert.equal(service.coverage("alpha").covered, true, "storing the implicit workspace moves nothing");
+    const joined = groups.update("alpha", { requestId: randomUUID(), revision: stored.revision, repos: ["alpha", "beta"] });
+    assert.equal(service.coverage("alpha").covered, true);
+    assert.deepEqual(service.coverage("beta"), { covered: false, projectId: "beta", reason: "not-covered" });
+
+    groups.update("alpha", { requestId: randomUUID(), revision: joined.revision, repos: ["beta"] });
+    assert.deepEqual(service.coverage("alpha"), { covered: false, projectId: "alpha", reason: "not-covered" });
+    assert.deepEqual(new PermissionDelegationService(config, f.key, new ProjectGroupService(config, f.key, undefined, { git: () => undefined })).coverage("alpha"),
+      { covered: false, projectId: "alpha", reason: "not-covered" });
   } finally { f.cleanup(); }
 });

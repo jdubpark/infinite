@@ -31,6 +31,7 @@ import { UsageService } from "./usage-service.js";
 import { EvidenceStore, evidenceDatabasePath } from "./evidence/store.js";
 import { EventOutbox } from "./evidence/outbox.js";
 import { FuseService } from "./fuse/service.js";
+import { MAX_SIGNAL_PAGE, MAX_SIGNAL_TEXT_LENGTH, SignalService } from "./signals/service.js";
 import { EvidenceError } from "./evidence/types.js";
 import { advanceEpoch, configurationModule, configurationProjector, EpochRequestConflict } from "./configuration-store.js";
 import { outcomeBackfill } from "./outcome-backfill.js";
@@ -208,7 +209,12 @@ export function createApp(config: Config, key: Buffer) {
   evidence.register(configurationModule());
   outbox.registerProjector(configurationProjector());
   evidence.register(outcomeModule());
-  baseScanner = new BaseScanner({ store: evidence, mirrorPath: id => projectSource.mirrorPath(id), prefix: config.teams?.commandPrefix, holdDays: () => config.teams?.outcomes?.holdDays ?? HOLD_DAYS_DEFAULT });
+  // The project signal inbox. Sources record facts into it; only consumers' own scheduler passes act on them.
+  const signals = new SignalService({ store: evidence });
+  baseScanner = new BaseScanner({
+    store: evidence, mirrorPath: id => projectSource.mirrorPath(id), prefix: config.teams?.commandPrefix, holdDays: () => config.teams?.outcomes?.holdDays ?? HOLD_DAYS_DEFAULT,
+    onApplied: scan => { signals.recordScan(scan); },
+  });
   outbox.registerProjector(outcomeProjector(evidence));
   // The launch-rate fuse is built before any service that receives it starts. It stops before the store closes.
   const fuse = new FuseService({ config, key, store: evidence, sessionExists: id => {
@@ -254,6 +260,7 @@ export function createApp(config: Config, key: Buffer) {
   const sweepEvidence = () => {
     evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
     sweepExpiredOutcomes(evidence, new Date().toISOString(), undefined, config.teams?.outcomes?.retentionDays);
+    signals.sweep();
   };
   let evidenceSweep: NodeJS.Timeout | undefined;
   // A projector that fell behind catches up without waiting for the next event. Each pass is bounded.
@@ -421,6 +428,12 @@ export function createApp(config: Config, key: Buffer) {
   goals.useFuse(fuse);
   missions.useFuse(fuse);
   routines.useFuse(fuse);
+  // A routine drops signals about the team runs of goals it started, so it never wakes on its own delivery.
+  routines.useSignals(signals.reader(), goalIds => {
+    const wanted = new Set(goalIds);
+    return goals.understandingRecords().filter(goal => wanted.has(goal.id))
+      .flatMap(goal => [...goal.cycles.map(cycle => cycle.teamId), ...(goal.activeTeamId ? [goal.activeTeamId] : [])]);
+  });
   fuse.start();
   const desktopResources = new DesktopResources(config, listSessions);
   const changeProjectFiles = async <T>(projectId: string, action: () => Promise<T>) => {
@@ -1735,6 +1748,32 @@ export function createApp(config: Config, key: Buffer) {
     if (!config.projects.some(project => project.id === projectId)) return void res.status(404).json({ error: "Unknown project" });
     const enabled = Boolean(repositoryGraphs && (!config.repositoryGraphs?.projectIds || config.repositoryGraphs.projectIds.includes(projectId)));
     res.json({ enabled, state: enabled ? "enabled" : "disabled", receipts: enabled ? repositoryGraphs!.status(projectId) : [] });
+  });
+  // The project signal inbox. The owner adds direction here; host sources add facts. A signal starts nothing by itself.
+  const signalsUnavailable = { code: "evidence-unavailable", error: "The evidence store is unavailable." };
+  const ownerSignalBody = z.object({ requestId: z.uuid(), text: z.string().trim().min(1).max(MAX_SIGNAL_TEXT_LENGTH) }).strict();
+  const signalPageQuery = z.object({
+    after: z.coerce.number().int().min(0).default(0),
+    limit: z.coerce.number().int().min(1).max(MAX_SIGNAL_PAGE).default(50),
+  });
+  app.post("/api/projects/:id/signals", requireRole(["owner"]), (req, res) => {
+    const projectId = projectSchema.parse(req.params.id);
+    if (!config.projects.some(project => project.id === projectId)) return void res.status(404).json({ error: "Unknown project" });
+    const body = ownerSignalBody.parse(req.body);
+    // The request ID is the key, so a replay records nothing and returns the signal stored first.
+    const result = signals.record({ projectId, kind: "owner", key: body.requestId, text: body.text });
+    if ("failure" in result) {
+      return void res.status(result.failure === "invalid" ? 400 : 503).json(result.failure === "invalid" ? { error: "Invalid signal" } : signalsUnavailable);
+    }
+    res.json({ recorded: result.recorded, signal: result.signal });
+  });
+  app.get("/api/projects/:id/signals", requireRole(["owner", "controller", "viewer"]), (req, res) => {
+    const projectId = projectSchema.parse(req.params.id);
+    if (!config.projects.some(project => project.id === projectId)) return void res.status(404).json({ error: "Unknown project" });
+    const query = signalPageQuery.parse(req.query);
+    const page = signals.page(projectId, query.after, { limit: query.limit });
+    if (!page) return void res.status(503).json(signalsUnavailable);
+    res.json(page);
   });
   app.post("/api/projects/:id/source/refresh", requireRole(["owner"]), async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);

@@ -262,6 +262,8 @@ infinite team answer ID QUESTION_ID TEXT    Answer a pending question
 infinite routine create --file FILE [--request-id UUID] [--json]
 infinite routine list [--json] | status ID [--json]
 infinite routine pause|resume|cancel ID --revision N [--request-id UUID] [--json]
+infinite signal add --project ID TEXT [--request-id UUID] [--json]
+infinite signal list --project ID [--after SEQ] [--json]
 
 Ctrl+] detaches. Ctrl+G returns to monitor mode. Flags after a provider
 name belong to that provider and use cloud paths.

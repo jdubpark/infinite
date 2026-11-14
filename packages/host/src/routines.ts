@@ -31,6 +31,13 @@ function digestedTeams(teams: Config["teams"]): Config["teams"] {
   delete rest.outcomes;
   return rest as Config["teams"];
 }
+/** The eval block changes what the host measures, never a routine's work (umbrella C11), so it is removed before hashing. */
+function digestedProjectTeam(team: Project["team"]): Project["team"] {
+  if (!team || !("eval" in team)) return team;
+  const rest: Partial<NonNullable<Project["team"]>> = { ...team };
+  delete rest.eval;
+  return rest as Project["team"];
+}
 const terminal = new Set<Routine["status"]>(["completed", "cancelled", "expired"]);
 const allowedSettled = new Set(["no-opportunity", "achieved"]);
 const maxRecords = 1000;
@@ -83,7 +90,7 @@ export class RoutineService {
     try { canonicalPath = realpathSync(project.path); }
     catch { throw new TeamError(409, "routine-project-missing", "The project path cannot be resolved. Routine approval requires an existing canonical project path."); }
     return digest({
-      project: { path: canonicalPath, team: project.team, teamworkDir: project.teamworkDir, source: project.source, linear: project.linear },
+      project: { path: canonicalPath, team: digestedProjectTeam(project.team), teamworkDir: project.teamworkDir, source: project.source, linear: project.linear },
       teams: digestedTeams(this.config.teams),
       source: this.config.source,
       linear: this.config.linear,

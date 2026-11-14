@@ -225,18 +225,21 @@ test("the project manager may label kind and raise risk", () => {
   assert.doesNotMatch(implementer, /feature, fix, refactor, test, docs, or investigation/);
 });
 
-test("a member context never carries the feature map", () => {
+test("a member context never carries the feature map or the eval block", () => {
   const features = { areas: [{ id: "host", paths: ["packages/host"] }], elevatedTokens: ["ledger"] };
+  const eval_ = { capture: true, excludeAreas: ["web"] };
   const checks = [{ command: "npm", args: ["test"] }];
   const base = largeRun();
   const run = { ...base, handoff: {
     sourceSessionId: "session", checkpointHead: base.baseCommit, deadlineAt: "2026-11-13T12:00:00.000Z", maxMembers: 1,
-    project: { checks, features },
+    project: { checks, features, eval: eval_ },
   } } as unknown as TeamRun;
-  const snapshot = teamContext(run, undefined, { checks, features } as Parameters<typeof teamContext>[2], "implementer");
+  const snapshot = teamContext(run, undefined, { checks, features, eval: eval_ } as Parameters<typeof teamContext>[2], "implementer");
   const serialized = JSON.stringify(snapshot);
   assert.doesNotMatch(serialized, /"features"/);
   assert.doesNotMatch(serialized, /"elevatedTokens"/);
+  assert.doesNotMatch(serialized, /"eval"/);
+  assert.doesNotMatch(serialized, /"excludeAreas"/);
   assert.match(serialized, /"checks"/, "the configured checks are still present");
   assert.ok((snapshot.authority.handoff as { project?: unknown } | undefined)?.project, "the handoff project is still present");
 });

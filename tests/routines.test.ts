@@ -98,6 +98,19 @@ test("outcome settings stay out of the routine approval digest", async () => {
   } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test("eval settings stay out of the routine approval digest", async () => {
+  const f = setup(); const service = f.createService();
+  try {
+    await service.create(f.create()); await wait(30); await service.tick();
+    f.config.projects[0]!.team!.eval = { capture: true, retentionDays: 90 };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "running");
+    f.config.projects[0]!.team!.features = { areas: [{ id: "host", paths: ["src"] }] };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "blocked");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test("a pending project run prevents overlap and launch is skipped when the approved budget cannot fit", async () => {
   const f = setup({ busy: async () => true }); const service = f.createService();
   try {

@@ -402,6 +402,22 @@ the knowledge service, remote memory, cmux, demo, and contributor models
 disabled until each has a separate reviewed configuration and an owner
 decision.
 
+Give the instance its own provider logins. Do not copy a login whose tokens
+rotate from another instance's agent account: the first refresh on either
+side can sign the other one out.
+
+A headless reply does not prove that an interactive session starts. A new
+agent account stops at Claude Code's first-run screens, and then at the
+folder-trust prompt for each project, before the host can drive the session.
+Complete the first run once as `infinite-$NAME-agent`, start one interactive
+session from each project, and have the owner answer the folder-trust prompt.
+The host never answers it.
+
+If `teams.lineup` was copied from another instance, check every profile and
+fallback it names against the providers authenticated on this instance. Remove
+the entries this instance cannot run, and have the installed release's config
+reader accept the candidate file before it replaces the live config.
+
 ## Private host tools to extend
 
 These tools belong to the private deployment and are not shipped here. Extend
@@ -423,7 +439,13 @@ them to support the second instance before activation:
   never removes the active release of either one.
 - Secrets sync stores the instance's Linear, Slack, GitHub App, and relay
   credentials in a vault of its own and keeps them outside state, run,
-  workspace, and project paths.
+  workspace, and project paths. Give it a service credential of its own that
+  can read and write that vault and no other; a secret store may fix those
+  permissions when the credential is created and default to read only. Keep
+  the credential on the encrypted state volume. Before enabling the sync
+  timer, confirm that the credential lists exactly that vault and that a test
+  write succeeds: a read-only credential otherwise fails on every run, and
+  refused writes can still count against the store's write limit.
 - The activation guard checks the instance-specific config, key, mount,
   launcher, and account boundaries before the service can start.
 

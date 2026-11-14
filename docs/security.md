@@ -369,8 +369,9 @@ A wrong route costs differently in each direction. A change request routed to an
 answer gets an answer and no change, and its reply says how to ask again (`work:`).
 A question routed to work files a Linear issue and starts a mission that may open a
 pull request, and its acknowledgement says how to ask instead (`ask:`); the owner can
-cancel it. That asymmetry is why the default and the threshold favour work only when
-a reading is confident, and why an explicit word always wins.
+cancel it. That asymmetry is why an unsure reading goes to the answer route, which changes
+nothing, and why an explicit word always wins. With no reading at all the route is
+work, because that is the behavior the owner already had.
 
 ## Dependency audit
 

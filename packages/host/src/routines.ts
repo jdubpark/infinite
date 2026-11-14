@@ -5,16 +5,20 @@ import { writeSealed, unseal } from "./vault.js";
 import { TeamError } from "./teams.js";
 import type { Config, Project } from "./types.js";
 import { createGoalSchema, type CreateGoal, type ProductGoal } from "./goal-types.js";
-import { createRoutineSchema, routineActionSchema, type CreateRoutine, type Routine, type RoutineAction } from "./routine-types.js";
+import { createRoutineSchema, routineActionSchema, type CreateRoutine, type Routine, type RoutineAction, type RoutineWake } from "./routine-types.js";
 import type { GoalService } from "./goals.js";
 import { applyFuseReason } from "./fuse/rules.js";
 import type { FuseGate } from "./fuse/types.js";
+import { readSignals } from "./signals/consume.js";
+import { addToPendingWake, type SignalReader } from "./signals/types.js";
 
 type HookSet = {
   isProjectBusy(projectId: string): Promise<boolean>;
   startGoal(request: CreateGoal, admit: () => void): Promise<ProductGoal>;
 };
-type LaunchIntent = { request: CreateGoal; createdAt: string; attempted?: boolean };
+/** The team runs of the given goals, so that a routine never wakes on its own delivery. */
+type RunsOfGoals = (goalIds: readonly string[]) => Iterable<string>;
+type LaunchIntent = { request: CreateGoal; createdAt: string; attempted?: boolean; wake?: RoutineWake };
 type Stored = {
   routine: Routine;
   fingerprint: string;
@@ -36,6 +40,7 @@ const allowedSettled = new Set(["no-opportunity", "achieved"]);
 const maxRecords = 1000;
 const maxApprovalMs = 30 * 24 * 60 * 60 * 1000;
 const minute = 60_000;
+const defaultWakeMinGapMinutes = 5;
 
 /** Owner-approved finite schedules. Every occurrence still enters GoalService's full approval pipeline. */
 export class RoutineService {
@@ -47,6 +52,7 @@ export class RoutineService {
   private closed = false;
   private tickQueued = false;
   private fuse?: FuseGate;
+  private signals?: { reader: SignalReader; runsOfGoals: RunsOfGoals };
 
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly goals: GoalService, private readonly hooks: HookSet) {
     this.directory = join(config.stateDir, "routines");
@@ -102,6 +108,8 @@ export class RoutineService {
   }
   /** The launch-rate fuse. A service without one starts every goal it would have started before. */
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
+  /** The project signal inbox. A service without one never reads signals and starts only on its schedule. */
+  useSignals(reader: SignalReader, runsOfGoals: RunsOfGoals) { this.signals = { reader, runsOfGoals }; }
   create(input: CreateRoutine): Promise<Routine> {
     const request = createRoutineSchema.parse(input);
     return this.enqueue(() => {
@@ -126,6 +134,12 @@ export class RoutineService {
         startsAt: request.startsAt, expiresAt: request.expiresAt, nextRunAt: request.startsAt,
         occurrences: [], createdAt: new Date(created).toISOString(), updatedAt: new Date(created).toISOString(),
       };
+      if (request.wakeOn) {
+        routine.wakeOn = [...request.wakeOn];
+        // Signals recorded before the approval never wake the routine.
+        const head = this.signals?.reader.head();
+        if (head !== undefined) routine.signalCursor = head;
+      }
       const stored: Stored = { routine, fingerprint, authority: this.authority(project), receipts: {} };
       this.records.set(routine.id, stored); this.save(stored);
       return this.view(stored);
@@ -184,6 +198,47 @@ export class RoutineService {
     stored.routine.status = "blocked"; stored.routine.reason = reason;
     this.save(stored);
   }
+  /**
+   * Reads the inbox for a scheduled or running routine with `wakeOn`, folds new signals into its pending wake, and
+   * saves the cursor and the wake in one write. A signal about a team run of a goal this routine started is dropped.
+   */
+  private readWake(stored: Stored) {
+    const routine = stored.routine;
+    if (!this.signals || !routine.wakeOn?.length) return;
+    const read = readSignals(this.signals.reader, routine.goal.projectId, routine.signalCursor, routine.wakeOn);
+    if (!read) return;
+    let pending = routine.pendingWake;
+    if (read.signals.length) {
+      // The goals this routine started, including one whose launch is not yet receipted (its ID is the request ID).
+      const goalIds = new Set([
+        ...routine.occurrences.map(value => value.goalId),
+        ...(routine.activeGoalId ? [routine.activeGoalId] : []),
+        ...(stored.launch ? [stored.launch.request.requestId] : []),
+      ]);
+      let own: Set<string>;
+      try {
+        own = read.signals.some(signal => signal.runId !== undefined) ? new Set(this.signals.runsOfGoals([...goalIds])) : new Set();
+      } catch {
+        // Which runs are this routine's own is unknown, so nothing is read: the next pass tries again.
+        return;
+      }
+      pending = addToPendingWake(pending, read.signals.filter(signal => signal.runId === undefined || !own.has(signal.runId)), now());
+    }
+    if (read.cursor === routine.signalCursor && pending === routine.pendingWake) return;
+    routine.signalCursor = read.cursor;
+    if (pending) routine.pendingWake = pending;
+    this.save(stored);
+  }
+  /** Whether a pending wake may start the next occurrence now: not after a busy refusal, and not inside the gap. */
+  private wakeDue(routine: Routine, current: number) {
+    if (!routine.pendingWake || routine.wakeDeferred) return false;
+    const last = routine.occurrences[routine.occurrences.length - 1];
+    if (!last) return true;
+    // Without a recorded end the gap cannot be measured, so the routine waits for its schedule.
+    if (!last.endedAt) return false;
+    const gap = this.config.autonomy?.continuity?.wakeMinGapMinutes ?? defaultWakeMinGapMinutes;
+    return current >= Date.parse(last.endedAt) + gap * minute;
+  }
   private async step(stored: Stored) {
     const routine = stored.routine;
     if (stored.launch && ["paused", "cancelled", "expired"].includes(routine.status)) {
@@ -200,6 +255,7 @@ export class RoutineService {
       routine.status = "expired"; routine.revision++; routine.reason = "The routine approval expired; no further goals will start."; this.save(stored); return;
     }
     if (!this.assertAuthority(stored)) return;
+    this.readWake(stored);
     if (routine.activeGoalId) {
       let goal: ProductGoal;
       try { goal = this.goals.get(routine.activeGoalId); }
@@ -208,6 +264,8 @@ export class RoutineService {
       const cyclesSettled = goal.cycles.every(cycle => ["merged", "no-change"].includes(cycle.status));
       const safelySettled = !goal.activeTeamId && cyclesSettled && (allowedSettled.has(goal.status) || (goal.status === "ready-for-review" && goal.cycles.length > 0));
       if (safelySettled) {
+        const ended = routine.occurrences.find(value => value.goalId === routine.activeGoalId);
+        if (ended && !ended.endedAt) ended.endedAt = now();
         routine.activeGoalId = undefined; routine.reason = undefined;
         if (routine.occurrences.length >= routine.maxOccurrences) routine.status = "completed";
         else { routine.status = "running"; routine.nextRunAt = new Date(Date.now() + routine.intervalMinutes * minute).toISOString(); }
@@ -226,7 +284,8 @@ export class RoutineService {
       await this.replayLaunch(stored); return;
     }
     if (routine.occurrences.length >= routine.maxOccurrences) { routine.status = "completed"; routine.revision++; routine.reason = undefined; this.save(stored); return; }
-    if (current < Date.parse(routine.nextRunAt)) return;
+    // A pending wake may start the next occurrence before its time. Every gate below still applies.
+    if (current < Date.parse(routine.nextRunAt) && !this.wakeDue(routine, current)) return;
     if (current < Date.parse(routine.startsAt)) return;
     const budgetMinutes = routine.goal.maxTotalMinutes ?? routine.goal.maxMinutes;
     if (current + budgetMinutes * minute > Date.parse(routine.expiresAt)) {
@@ -236,7 +295,12 @@ export class RoutineService {
     const fuse = applyFuseReason(routine, this.fuse?.check({ projectId: routine.goal.projectId }));
     if (fuse.changed) this.save(stored);
     if (fuse.wait) return;
-    if (await this.hooks.isProjectBusy(routine.goal.projectId)) { routine.status = "scheduled"; routine.reason = "The project has active work. The routine will check again at its next interval."; routine.nextRunAt = new Date(current + routine.intervalMinutes * minute).toISOString(); this.save(stored); return; }
+    if (await this.hooks.isProjectBusy(routine.goal.projectId)) {
+      routine.status = "scheduled"; routine.reason = "The project has active work. The routine will check again at its next interval."; routine.nextRunAt = new Date(current + routine.intervalMinutes * minute).toISOString();
+      // The busy rule wins over a wake: a pending wake waits for the next interval too.
+      if (routine.pendingWake) routine.wakeDeferred = true;
+      this.save(stored); return;
+    }
     if (this.closed || terminal.has(routine.status)) return;
     if (Date.now() >= Date.parse(routine.expiresAt)) {
       routine.status = "expired"; routine.revision++; routine.reason = "The routine approval expired; no further goals will start."; this.save(stored); return;
@@ -246,7 +310,10 @@ export class RoutineService {
     }
     if (!this.assertAuthority(stored)) return;
     const request = createGoalSchema.parse({ requestId: randomUUID(), ...routine.goal });
-    stored.launch = { request, createdAt: now() };
+    // The goal template is unchanged by a wake. The signals are recorded on the occurrence, and the wake is cleared.
+    const wake = routine.pendingWake ? { signalIds: routine.pendingWake.signals.map(signal => signal.id), dropped: routine.pendingWake.dropped } : undefined;
+    stored.launch = { request, createdAt: now(), ...(wake ? { wake } : {}) };
+    delete routine.pendingWake; delete routine.wakeDeferred;
     routine.status = "running"; routine.reason = undefined; routine.revision++;
     this.save(stored); // The exact request is durable before GoalService can accept it.
     await this.replayLaunch(stored);
@@ -285,7 +352,9 @@ export class RoutineService {
   }
   private recordLaunchReceipt(stored: Stored, goal: ProductGoal) {
     if (!stored.launch) return;
-    if (!stored.routine.occurrences.some(value => value.goalId === goal.id)) stored.routine.occurrences.push({ goalId: goal.id, startedAt: stored.launch.createdAt });
+    if (!stored.routine.occurrences.some(value => value.goalId === goal.id)) {
+      stored.routine.occurrences.push({ goalId: goal.id, startedAt: stored.launch.createdAt, ...(stored.launch.wake ? { wake: stored.launch.wake } : {}) });
+    }
     stored.routine.activeGoalId = goal.id;
     if (!["paused", "cancelled", "blocked", "expired"].includes(stored.routine.status)) { stored.routine.status = "running"; stored.routine.reason = undefined; }
     stored.routine.nextRunAt = new Date(Date.parse(stored.launch.createdAt) + stored.routine.intervalMinutes * minute).toISOString();

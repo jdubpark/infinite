@@ -1867,3 +1867,36 @@ test("a follow-up that fires while an attempt runs lets that attempt wait, even 
     assert.equal(h.refusals(id), 0);
   } finally { h.close(); mock.timers.reset(); }
 });
+
+test("notes yield to a near-limit prompt when the coordinator starts a new conversation", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T09:00:00Z") });
+  try {
+    // About 9 KB of the 80 KiB prompt remains for notes: room for one 2000-character note, not two.
+    const { id } = await h.missions.create({ ...missionRequest(240), objective: "界".repeat(21000) });
+    const note = (n: number) => `Note ${n}: ${"界".repeat(1990)}`;
+    await h.confirmNative(1);
+    await h.report(1, followUp(120), note(1));
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 1);
+    for (const n of [2, 3]) {
+      mock.timers.tick(10 * 60000);
+      await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: `Direction ${n}` });
+      assert.equal((await h.attempt(n)).request.continuation?.mode, "resume");
+      await h.report(n, { kind: "wait", summary: "Waiting for the check" }, note(n));
+      await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && mission.events.filter(event => /waiting for subteam progress/.test(event.text)).length === n - 1);
+    }
+
+    mock.timers.tick(61 * 60000);
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Direction 4" });
+    const fourth = await h.attempt(4);
+    assert.equal(fourth.request.continuation?.mode, "start");
+    assert.ok(Buffer.byteLength(fourth.prompt) <= 80 * 1024);
+    assert.match(fourth.prompt, /Note 3: /);
+    assert.doesNotMatch(fourth.prompt, /Note [12]: /);
+    assert.match(fourth.prompt, /2 older notes did not fit in this prompt and were left out\./);
+    assert.ok(((await h.messages(4)) as PromptMessage[]).some(message => message.type === "owner-direction" && message.text === "Direction 4"));
+    const mission = h.get(id);
+    assert.equal(mission.status, "planning");
+    assert.equal(mission.reason, undefined);
+  } finally { h.close(); mock.timers.reset(); }
+});

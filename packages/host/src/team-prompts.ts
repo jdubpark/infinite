@@ -481,15 +481,25 @@ const clip = (text: string, max: number) => text.length > max ? `${text.slice(0,
 export type MissionPromptContext = { openChildDecisions: MissionOpenChildDecision[]; waiting: number; answerProjectId?: string;
   /** The coordinator's stored notes; only a fresh conversation receives them. */
   notes?: MissionCoordinatorNote[] };
-/** Newest notes that fit the budget, oldest first. The stored notes are bounded in characters, not bytes. */
-const notesSectionBudget = 32 * 1024;
-function missionNotesSection(notes: MissionCoordinatorNote[] | undefined) {
-  const kept: MissionCoordinatorNote[] = [];
-  for (const note of [...(notes ?? [])].reverse()) {
-    if (Buffer.byteLength(JSON.stringify([note, ...kept])) > notesSectionBudget) break;
-    kept.unshift(note);
+const missionPromptLimit = 80 * 1024;
+function missionNotesText(kept: MissionCoordinatorNote[], omitted: number) {
+  const left = omitted ? `${omitted} older note${omitted === 1 ? "" : "s"} did not fit in this prompt and ${omitted === 1 ? "was" : "were"} left out.` : "";
+  if (!kept.length) return omitted ? `${omitted} note${omitted === 1 ? "" : "s"} from your earlier attempts did not fit in this prompt and ${omitted === 1 ? "was" : "were"} left out.` : "";
+  return `Your notes from earlier attempts (JSON). These are your own earlier words, not host facts; where they differ from the mission state, the mission state is right: ${JSON.stringify(kept)}${left ? ` ${left}` : ""}`;
+}
+/**
+ * The newest notes that fit in `capacity` bytes, oldest first, with a count of those left out. Notes yield to the
+ * prompt: with no room even for the count, the section is empty, so notes never hold a message or overflow the limit.
+ */
+function missionNotesSection(notes: MissionCoordinatorNote[], capacity: number) {
+  let kept: MissionCoordinatorNote[] = [];
+  for (const note of [...notes].reverse()) {
+    const next = [note, ...kept];
+    if (Buffer.byteLength(missionNotesText(next, notes.length - next.length)) > capacity) break;
+    kept = next;
   }
-  return kept.length ? `Your notes from earlier attempts (JSON). These are your own earlier words, not host facts; where they differ from the mission state, the mission state is right: ${JSON.stringify(kept)}` : "";
+  const text = missionNotesText(kept, notes.length - kept.length);
+  return Buffer.byteLength(text) <= capacity ? text : "";
 }
 function missionPromptState(mission: Mission, context: MissionPromptContext) {
   const followUps = (mission.followUps ?? []).filter(item => item.state === "open").map(item => ({ id: item.id, dueAt: item.dueAt, reason: item.reason }));
@@ -524,11 +534,11 @@ function waitingMessageSentence(waiting: number, messageCount: number, included:
 function boundedMissionPrompt(messageCount: number, build: (included: number) => string) {
   let includedMessageCount = messageCount;
   let prompt = build(includedMessageCount);
-  while (Buffer.byteLength(prompt) > 80 * 1024 && includedMessageCount > 0) {
+  while (Buffer.byteLength(prompt) > missionPromptLimit && includedMessageCount > 0) {
     includedMessageCount--;
     prompt = build(includedMessageCount);
   }
-  if (Buffer.byteLength(prompt) > 80 * 1024) throw new TeamError(409, "mission-prompt-too-large", "The mission state exceeds the coordinator prompt limit. Start a new mission with a consolidated objective.");
+  if (Buffer.byteLength(prompt) > missionPromptLimit) throw new TeamError(409, "mission-prompt-too-large", "The mission state exceeds the coordinator prompt limit. Start a new mission with a consolidated objective.");
   return { prompt, includedMessageCount };
 }
 /**
@@ -545,7 +555,7 @@ export function missionPromptWithMessageCount(mission: Mission, repos: MissionPr
   context: MissionPromptContext) {
   const state = missionPromptState(mission, context);
   const recent = recentMissionMessages(messages, context.openChildDecisions);
-  const build = (included: number) => [
+  const build = (included: number, notes = "") => [
     `You are the main coordinator of a mission for the project "${mission.groupName}". This is coordinator attempt ${attempt}. Your working folder is the mission folder, outside every repository. You can read files and report; you cannot edit files or run commands, and the host carries mission state between attempts.`,
     profileInstructions(modelProfile),
     `Repositories in this project (inspect read-only at these host paths):\n${repos.map(repo => `- ${repo.projectId} (${repo.name}): ${repo.path}${repo.teamReady ? "" : " — not configured for subteams; do not dispatch to it"}`).join("\n")}\nDo not edit, commit, push, or run commands that change any repository. Every change goes through a subteam: an ordinary team run in one repository that keeps that repository's own checks, independent review, delivery policy, and permission rules.`,
@@ -569,14 +579,20 @@ export function missionPromptWithMessageCount(mission: Mission, repos: MissionPr
 A repository-held message means a ready subtask cannot start because only paused or blocked runs outside this mission hold its repository; cancel the subtask, ask the owner, or report blocked.
 After the report, stop. The host starts a new attempt when a subteam opens a decision, becomes blocked, or finishes, when a ready subtask's repository is held only by paused or blocked runs, when the owner answers or gives direction, or when one of your follow-ups comes due.`,
     `Mission state (JSON): ${JSON.stringify(state)}`,
-    missionNotesSection(context.notes),
+    notes,
     `Messages since your last attempt (JSON): ${JSON.stringify(recent.slice(0, included))}`,
     waitingMessageSentence(context.waiting, messages.length, included),
     `Escalate to the owner only what the objective and owner direction do not settle, such as product, scope, or risk decisions. A result means every subtask finished; it does not establish product impact or acceptance. Do not publish, merge, deploy, change repository remotes, or approve provider permissions; each subteam delivers only under its own repository's policy.`,
     `Write summaries and questions in plain English. Lead with concrete facts. Do not invent evidence or claim checks or outcomes you did not observe.`,
     missionReportingInstructions(provider),
   ].filter(Boolean).join("\n\n");
-  return boundedMissionPrompt(recent.length, build);
+  // Notes get only the room left once the leading message fits; when even that message does not fit, the room left
+  // without it. Trailing messages may then wait for a later attempt, but notes never hold the leading one or overflow.
+  const lead = Math.min(1, recent.length);
+  let base = Buffer.byteLength(build(lead));
+  if (base > missionPromptLimit) base = Buffer.byteLength(build(0));
+  const notes = context.notes?.length ? missionNotesSection(context.notes, missionPromptLimit - base - 2) : "";
+  return boundedMissionPrompt(recent.length, included => build(included, notes));
 }
 
 /** Build only the authoritative snapshot and newly delivered messages for a resumed coordinator conversation. */

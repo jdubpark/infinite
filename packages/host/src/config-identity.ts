@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { basename } from "node:path";
 import { canonicalJson } from "./evidence/crypto.js";
 import { profileIdentity } from "./run-events.js";
-import { reportCommand, teamPrompt } from "./team-prompts.js";
+import { entryCommand, reportCommand, teamPrompt } from "./team-prompts.js";
 import { teamCommand, teamGitArgs } from "./team-workspace.js";
 import type { TeamCommand, TeamMember, TeamModelProfile, TeamRun, TeamScout, TeamTask } from "./team-types.js";
 import type { Provider } from "./types.js";
@@ -116,21 +116,23 @@ function waitIn<T>(waiters: Set<(value: T | undefined) => void>, signal: AbortSi
  * which change with the install directory and not with the wording, so a placeholder stands in for it.
  * Throws when teamPrompt throws.
  */
-export function renderedPrompts(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean): string[] {
+export function renderedPrompts(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean, entryTools = false): string[] {
   const command = reportCommand();
+  const entry = entryCommand();
   return FIXTURES.map(({ run, work }) =>
-    teamPrompt(run, role, work, undefined, provider, profile, { checks: FIXTURE_CHECKS }, [], publishHeads).split(command).join("<report-command>"));
+    teamPrompt(entryTools ? { ...run, blackboard: { tools: true } } : run, role, work, undefined, provider, profile, { checks: FIXTURE_CHECKS }, [], publishHeads)
+      .split(command).join("<report-command>").split(entry).join("<entry-command>"));
 }
 
 /**
  * The digest of `renderedPrompts`. Cached per exact render input: the prompt prints the whole profile object, so
  * every profile field is part of the key. Throws when teamPrompt throws.
  */
-export function promptVersion(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean): string {
-  const key = JSON.stringify([role, provider, profile ?? null, publishHeads]);
+export function promptVersion(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean, entryTools = false): string {
+  const key = JSON.stringify([role, provider, profile ?? null, publishHeads, entryTools]);
   const cached = promptCache.get(key);
   if (cached !== undefined) return cached;
-  const version = sha256(canonicalJson(renderedPrompts(role, provider, profile, publishHeads)));
+  const version = sha256(canonicalJson(renderedPrompts(role, provider, profile, publishHeads, entryTools)));
   if (promptCache.size >= PROMPT_CACHE_LIMIT) promptCache.delete(promptCache.keys().next().value!);
   promptCache.set(key, version);
   return version;
@@ -218,14 +220,14 @@ async function guidanceRead(workspace: string, commit: string, prefix: TeamComma
 /** The data of `member.configured`, or undefined when any component is unknown. Never throws. */
 export async function memberConfiguration(input: {
   workspace: string; baseCommit: string; role: TeamMember["role"]; provider: Provider;
-  profile?: TeamModelProfile; publishHeads: boolean; prefix?: TeamCommand;
+  profile?: TeamModelProfile; publishHeads: boolean; entryTools?: boolean; prefix?: TeamCommand;
 }, signal: AbortSignal): Promise<MemberConfiguration | undefined> {
   try {
     const guidance = await readGuidanceDigest(input.workspace, input.baseCommit, input.prefix, signal);
     if (guidance === undefined) return undefined;
     const identity = profileIdentity(input.profile, input.provider);
     const profile: ProfileKey = { provider: identity.provider, model: identity.model ?? null, effort: identity.effort ?? null };
-    const version = promptVersion(input.role, input.provider, input.profile, input.publishHeads);
+    const version = promptVersion(input.role, input.provider, input.profile, input.publishHeads, input.entryTools === true);
     const components: ConfigComponents = { profile, promptVersion: version, guidance, knowledge: "none", routing: "off", shape: "team" };
     return { ...profile, promptVersion: version, guidance, knowledge: "none", routing: "off", shape: "team", configId: configId(components) };
   } catch {

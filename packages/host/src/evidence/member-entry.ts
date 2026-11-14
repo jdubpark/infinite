@@ -5,9 +5,7 @@ import { ownedPathSchema, taskIdSchema, teamEvidenceSchema } from "../team-types
 import { canonicalJson } from "./crypto.js";
 import { ENTRY_KINDS } from "./entry-types.js";
 import type { MemberEntryKind } from "./entry-types.js";
-
-/** Roles that may hold the entry tools (spec part 4). Permission coordinators, delivery, and mission coordinators hold none. */
-export const ENTRY_ROLES: ReadonlySet<TeamRole> = new Set<TeamRole>(["project-manager", "scout", "implementer", "integrator", "reviewer"]);
+export { ENTRY_ROLES, entryToolsFor } from "../entry-roles.js";
 
 /** Which member kinds each role may post (spec part 4). */
 export const ROLE_KINDS: Readonly<Record<"project-manager" | "scout" | "implementer" | "integrator" | "reviewer", readonly MemberEntryKind[]>> = {
@@ -113,11 +111,6 @@ export function memberEntryId(entryBinding: EntryBinding, entry: MemberEntryPost
   bytes[8] = (bytes[8] & 0x3f) | 0x80;
   const hex = bytes.toString("hex");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
-
-/** True only when the run pinned the switch and the role holds the entry tools. */
-export function entryToolsFor(run: Pick<TeamRun, "blackboard">, role: TeamMember["role"] | "mission-coordinator"): boolean {
-  return run.blackboard?.tools === true && ENTRY_ROLES.has(role as TeamRole);
 }
 
 /** Whether the assignment may post this entry, by role and kind, then by task. */

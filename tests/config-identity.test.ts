@@ -376,3 +376,14 @@ test("a failed guidance read gives nothing", async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("entry tools change the prompt version only for entry roles", () => {
+  assert.notEqual(promptVersion("implementer", "claude", undefined, false, true), promptVersion("implementer", "claude", undefined, false));
+  assert.equal(promptVersion("delivery", "claude", undefined, false, true), promptVersion("delivery", "claude", undefined, false));
+  const renders = renderedPrompts("implementer", "opencode", undefined, true, true);
+  assert.ok(renders.length > 0);
+  for (const text of renders) {
+    assert.ok(text.includes("<entry-command>"));
+    assert.ok(!text.includes("team-entry"));
+  }
+});

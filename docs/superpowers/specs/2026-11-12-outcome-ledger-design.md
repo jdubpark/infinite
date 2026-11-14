@@ -258,7 +258,7 @@ The host never infers a defect. A `revert` records only that a base-branch commi
 1. A commit whose id is a run's reported merge commit lands that run (`merge-commit`).
 2. A commit whose second parent is a run's reviewed head lands that run (`merge-parent`).
 3. A commit whose tree is a run's reviewed tree lands that run (`tree-equal`). A tree can recur, so the commit must also be the reviewed head itself, or come after the run's base in the scanned commits. When the base is not among them, the rule holds only in a scan of new commits, never in one that reads history older than the ledger's own head. A run whose reviewed head is its base never lands.
-4. A commit whose message contains `This reverts commit` followed by a landed commit's id records a `revert`.
+4. A commit whose message contains `This reverts commit` followed by a landed commit's id records a `revert`. The landed ids are the landing commit and, for a landing by the second parent, the reviewed head. The reverting commit must come after the landing commit. Work that is removed another way is not seen: a revert of one commit of the branch, a revert of a second merge of the same head, or a plain edit. Held can then be yes for work that is gone; the hindsight measure of surviving lines is the planned answer.
 
 *(My call: exact matches only. A pull request number in a commit subject is text that anyone can write. The cost is that a squash merge onto a moved base stays unobserved.)*
 

@@ -2139,4 +2139,6 @@ The independent reviewer found three blockers. These rulings are settled, and th
 - A second look at commits already scanned. A landing commit scanned before its run's approval reached the ledger is never matched, and held stays unknown.
 - Pruning of `base_scans`, which grows by one row per fetch that saw new commits.
 - A landing by any other evidence: pull request numbers in subjects, the GitHub API, or a squash onto a moved base (spec part 5's exact-match rule).
+- A revert by any other evidence. Rule 4 sees a commit that names the landing commit or the reviewed head. Work removed by a revert of one commit of the branch, by a revert of a second merge of the same head (a local merge that reached the base through a pull merge), or by a plain edit is not seen, and held can be yes for it. The hindsight measure is the planned answer.
+- A form 1 proof that a landing commit is an ancestor of the stored head, which would keep a later revert after a `rewrite` or `source` scan (ruling 13).
 - A `decision` rule for `scan-gap` rows beyond held unknown, and relay access to any `/api/outcomes` route.

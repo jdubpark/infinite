@@ -1910,6 +1910,12 @@ Either command takes `--withdraw SIGNAL` to withdraw that signal; a withdrawal
 needs no other option. For a record, pass `--request-id` to make a retry safe.
 Otherwise each run of the command is a new request.
 
+A revert is seen only when a first-parent commit's message names the landing
+commit or, for a landing by the second parent, the reviewed head. Work that is
+removed another way is not seen: a revert of one commit of the branch, a revert
+of a second merge of the same head, or a plain edit. Held can then be yes for
+work that is gone.
+
 A landing is a receipt of what the mirror showed at a fetch. The agent identity
 can write the mirror, so a receipt is not proof against a member that alters the
 mirror itself. A `merge-commit` landing also rests on the merge commit that the

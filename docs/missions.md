@@ -153,7 +153,7 @@ The coordinator reports through its mission report tool:
 | `cancel-subtask` | Cancels that subtask's subteam. A subtask that never started is cancelled at once, and the coordinator is told in its next attempt. A cancelled subteam is deleted with its workspace after every member settles; the mission keeps the cancelled status and final reason, and the coordinator is asked to decide whether a replacement subtask is needed. |
 | `result` | Accepted only when every subtask is `done` or `cancelled`, at least one is `done`, and no owner decision is open. A `blocked` subtask, or a queued one whose dependency ended `blocked` or `cancelled`, must be cancelled explicitly first. Moves the mission to `ready-for-review`. |
 | `blocked` | Moves the mission to `blocked` with the summary as its reason. |
-| `wait` | Ends the attempt without a decision. Refused while a subteam decision is open that the coordinator has neither answered nor escalated. Otherwise accepted only while something else will start a later attempt: an open owner decision, a subteam that is not paused, a queued subtask that can start without anyone acting, or an open follow-up. A queued subtask whose repository any paused or blocked run holds does not count, since that run keeps the repository reserved after the others finish. |
+| `wait` | Ends the attempt without a decision. Refused while a subteam decision is open that the coordinator has neither answered nor escalated. Otherwise accepted only while something else will start a later attempt: a message that arrived during the attempt and already waits for the next one (such as a follow-up that fired while the attempt ran), an open owner decision, a subteam that is not paused, a queued subtask that can start without anyone acting, or an open follow-up. A queued subtask whose repository any paused or blocked run holds does not count, since that run keeps the repository reserved after the others finish. |
 | `follow-up` | Ends the attempt like `wait` and asks the host to start another at a set time, with `inMinutes` (5–10,080), `reason` (up to 500 characters), and `check` (up to 1,000 characters). Accepted even when nothing else would start an attempt. Refused when five follow-ups are already open, when the time falls at or after the mission deadline, or under the same open subteam decision rule as `wait`. |
 
 Every report can carry a `note` of up to 2,000 characters beside it, in the
@@ -310,6 +310,18 @@ facts, the open follow-ups in the mission state, and the pending messages. No
 extra model turn is spent on the switch. A rotation is not a missed report and
 does not count toward the three-refusal block. The host records a mission event
 that names the rule.
+
+Notes take only the prompt room left after the full prompt and its leading
+pending message, within the 80 KiB prompt limit. The host keeps the newest
+notes that fit and says how many older ones it left out; with no room, it
+leaves every note out. Notes therefore never hold a message back or make the
+prompt too large.
+
+A rotation retires every older conversation. The host resumes only a
+conversation from the rotation on that a confirmed native session ID names. If
+none does, for example because the new conversation's hook never reported its
+session, the next attempt starts another new conversation. It neither resumes
+nor rotates away from the retired one again, so one rotation records one event.
 
 Set the rules in host config under `autonomy.continuity`:
 `rotateIdleMinutes` (0–10,080), `rotateContextTokens` (0–10,000,000), and

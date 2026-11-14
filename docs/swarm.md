@@ -98,13 +98,15 @@ Observed tool inputs show what an agent's tools were pointed at. They do not
 show that the agent understood or used the content, and an observed edit is
 not a landed change.
 
-An agent is marked `no signal` when the host has recorded no tool input from
-its session. That is the case when its provider's hooks are off (Codex hooks
-are off by default), when it was started with native arguments or in the
-native UI, and until its first tool call. Agents of providers other than
-Claude Code and Codex are always marked `no signal`. The mark describes what
-the host has seen, not what the agent did, and a `no signal` agent keeps its
-planned and integrated links.
+An agent has `no signal` until the host has read a tool input that a provider
+hook recorded for its session. The legend counts those agents, and each one's
+role is underlined with dots and says so on hover. That is the case when the
+provider's hooks are off (Codex hooks are off by default), when the session
+was started with native arguments or in the native UI, before the agent's
+first tool call, and while the host is still reading a long journal. Agents of
+providers other than Claude Code and Codex always have no signal. The mark
+describes what the host has seen, not what the agent did, and such an agent
+keeps its planned and integrated links.
 
 The code map comes from the repository graph checkpoints described in
 [repository graphs](repository-graphs.md). The view reads each project's

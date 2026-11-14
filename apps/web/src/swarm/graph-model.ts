@@ -18,6 +18,8 @@ export type GraphNode = {
   symbols?: number;
   touched?: boolean;
   heat?: number;
+  /** An agent the host has no tool-input signal for; its observed links are not drawn. */
+  unobserved?: boolean;
 };
 export type LinkKind = "member" | "dispatch" | "depends" | "planned" | "read" | "edit" | "integrated" | "code" | "contains";
 export type GraphLink = { id: string; source: string; target: string; kind: LinkKind; weight: number };
@@ -216,6 +218,8 @@ export function buildGraph({ model, maps, touches, projectNames }: GraphInput): 
     const observed = touches[agent.sessionId ?? agent.id];
     if (!agent.observable || observed?.observable === false) {
       unobserved++;
+      const node = nodes.get(nodeId.agent(agent.id));
+      if (node) node.unobserved = true;
       continue;
     }
     for (const file of observed?.files ?? []) {

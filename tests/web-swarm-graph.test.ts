@@ -121,6 +121,7 @@ describe("swarm graph model", () => {
       touches: { "s-a1": touches("s-a1", [{ path: "packages/host/src/a.ts", reads: 3, edits: 2, lastAt: "2026-11-13T09:01:00.000Z" }]) },
     });
     assert.equal(data.unobserved, 1);
+    assert.equal(data.nodes.find(node => node.agentId === "a1")?.unobserved, true, "the node says which agent has no signal");
     assert.equal(data.links.filter(link => link.kind === "read" || link.kind === "edit").length, 0);
     assert.ok(data.links.some(link => link.kind === "planned"));
     assert.ok(data.links.some(link => link.kind === "integrated"));

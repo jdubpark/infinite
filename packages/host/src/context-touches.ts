@@ -5,8 +5,8 @@ export type FileTouch = { path: string; reads: number; edits: number; lastAt: st
 export type SessionTouches = {
   sessionId: string;
   /**
-   * False when the host has no tool input from this session: its provider has no extraction, or its journal was
-   * read to the end and holds no recorded tool input. A gap in sight, not a fact about the agent.
+   * False until the host has read a tool input that a provider hook recorded for this session. With
+   * `complete: false` the index may still find one. A gap in sight, not a fact about the agent.
    */
   observable: boolean;
   complete: boolean;
@@ -46,9 +46,9 @@ interface FileState { reads: number; edits: number; lastAt: string; seq: number 
 interface SessionState {
   cursor: number;
   /**
-   * The journal holds a recorded tool input. Nothing else proves the host can see this session's tools: launch
-   * settings can differ from the current configuration, and the native protocol and the notify route send
-   * turn signals that carry no tool input.
+   * The index has read a tool input that a provider hook recorded, or one that named a path. Nothing else proves
+   * the host can see this session's tools: launch settings can differ from the current configuration, the native
+   * protocol and the notify route send turn signals without a tool input, and a headless run line carries an empty one.
    */
   signalled: boolean;
   files: Map<string, FileState>;
@@ -199,7 +199,8 @@ export class ContextTouches {
     const state = this.stateFor(source.sessionId);
     // The index is full of sessions that are still being read. Nothing is allocated for this one;
     // it is told to come back, which keeps both the index and the wait queue within the bound.
-    if (!state) return { sessionId: source.sessionId, observable: true, complete: false, graphQueries: 0, files: [], truncated: false };
+    // Nothing was read, so nothing is known: that is a gap, not an observed agent with no files.
+    if (!state) return { sessionId: source.sessionId, observable: false, complete: false, graphQueries: 0, files: [], truncated: false };
     state.lastUsed = ++this.clock;
     state.inflight ??= this.advanceInTurn(state, source).finally(() => { state.inflight = undefined; });
     await state.inflight;
@@ -262,8 +263,8 @@ export class ContextTouches {
       if (event.seq <= from || event.type !== "signal" || event.data.kind !== "tool-start") continue;
       const { tool, input } = event.data;
       if (typeof tool !== "string") continue;
-      state.signalled = true;
       const found = extractTouches(tool, isRecord(input) ? input : {}, source.cwd, inArea);
+      if (event.data.source === "hook" || found.graphQuery || found.reads.length > 0 || found.edits.length > 0) state.signalled = true;
       if (found.graphQuery) state.graphQueries++;
       for (const path of found.reads) this.touch(state, path, "reads", event);
       for (const path of found.edits) this.touch(state, path, "edits", event);
@@ -304,8 +305,8 @@ export class ContextTouches {
       .map(([path, file]) => ({ path, reads: file.reads, edits: file.edits, lastAt: file.lastAt }));
     return {
       sessionId,
-      // Until the journal is read to its end the answer is not known, so nothing is called unobserved yet.
-      observable: state.signalled || !state.complete,
+      // Before the first recorded input is read the answer is not known. The view draws that as a gap.
+      observable: state.signalled,
       complete: state.complete,
       graphQueries: state.graphQueries,
       files,

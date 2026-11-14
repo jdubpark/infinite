@@ -108,7 +108,7 @@ test("paths inside a Git directory are never touches", () => {
   const everything = () => true;
   assert.deepEqual(extractTouches("Read", { file_path: ".git/infinite-team-context.json" }, CWD, everything).reads, []);
   assert.deepEqual(extractTouches("Read", { file_path: "sub/.git/config" }, CWD, everything).reads, []);
-  assert.deepEqual(extractTouches("Bash", { command: "cat .git/HEAD" }, CWD, everything).reads, []);
+  assert.deepEqual(extractTouches("Bash", { command: "cat .git/hooks/pre-commit.sample" }, CWD, everything).reads, []);
 
   // Names that only start with a dot-git prefix are repository content.
   assert.deepEqual(extractTouches("Read", { file_path: ".github/workflows/ci.yml" }, CWD, everything).reads, [
@@ -227,10 +227,12 @@ test("a session is observable only when its journal holds a recorded tool input"
   assert.deepEqual(await facts([signal(1, { kind: "turn-start", source: "protocol" }), signal(2, { kind: "turn-end", source: "protocol" })], "codex"), [false, true, 0]);
   // A hook signal without a tool input is not evidence either: the notify route sends those.
   assert.deepEqual(await facts([signal(1, { kind: "turn-start", source: "hook" }), signal(2, { kind: "turn-end", source: "hook" })], "codex"), [false, true, 0]);
-  // One recorded tool input is the evidence, even when its path is outside the workspace and is dropped.
+  // A headless run line is a tool start with an empty input and no hook behind it.
+  assert.deepEqual(await facts([signal(1, { kind: "tool-start", source: "protocol", tool: "bash", toolUseId: "t1", input: {}, quiet: false })], "codex"), [false, true, 0]);
+  // One tool input recorded by a hook is the evidence, even when its path is outside the workspace and is dropped.
   assert.deepEqual(await facts([toolStart(1, "Read", { file_path: "/etc/hosts" })]), [true, true, 0]);
-  // While the journal is still being read the answer is not known, so the session is not called unobserved.
-  assert.deepEqual(await facts([signal(1, { kind: "turn-start", source: "screen" }), signal(2, { kind: "turn-start", source: "screen" })], "claude", 1), [true, false, 0]);
+  // While the journal is still being read nothing is known yet, and that reads as a gap, not as an agent that touched nothing.
+  assert.deepEqual(await facts([signal(1, { kind: "turn-start", source: "screen" }), toolStart(2, "Read", { file_path: "src/a.ts" })], "claude", 1), [false, false, 0]);
 });
 
 test("incremental cursor", async () => {
@@ -366,7 +368,7 @@ test("concurrent sessions are read a few at a time and never outgrow the index",
   assert.equal(peak, 2, "no more than two journals are read at once");
   // Three sessions fit. The other six are told to come back and nothing is allocated or read for them.
   assert.equal(results.filter((result) => result.complete).length, 3);
-  assert.deepEqual(results.filter((result) => !result.complete).map((result) => [result.observable, result.files.length]), Array(6).fill([true, 0]));
+  assert.deepEqual(results.filter((result) => !result.complete).map((result) => [result.observable, result.files.length]), Array(6).fill([false, 0]));
   assert.equal(largest, 3);
   assert.equal(touches.indexed, 3);
   // Once the three are idle a refused session is admitted in place of the least recently used one.

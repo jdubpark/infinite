@@ -582,6 +582,7 @@ Spec part 4 (posting and reading), the digest and prompt paragraphs of part 5, t
 
 - Line numbers and "after this line" places in this section were read on main before the cost-coverage fix. Find each place by the quoted code.
 - The four owner decisions above stand as written until the owner changes one.
+- Nothing periodic may cost more as history grows. `ingestEntries` reads at most `ENTRY_INGEST_MEMBERS = 16` journal pages a pass, in member order across runs, and continues with the next members on the next pass; after a restart every member with tools is pending once, and one pass must not read them all. Task 9 adds the constant to `team-entry-ingest.ts` and the test `a pass reads a bounded number of journals` (40 pending members: the first pass makes 16 journal reads, and three passes reach all 40). No list route or tick reads the store once for each member or session.
 - The host adds no `--allowedTools`. A Claude profile whose own arguments set an allow-list must name `mcp__infinite_team__entry_post`, `mcp__infinite_team__entry_list`, and `mcp__infinite_team__entry_get`, or the provider refuses the three tools. Task 10 says so in `docs/teams.md`, beside the switch.
 
 This phase adds no Git command.

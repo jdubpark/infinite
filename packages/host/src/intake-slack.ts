@@ -253,13 +253,15 @@ export class IntakeSlackSurface {
     } else if (draft.state === "started") {
       add("ack", "ack", `Started on ${title}. I'll post questions and the result here.\nReply with a mention to answer or steer.${hint}`);
     } else if (draft.state === "queued" && draft.holdReason === "max-active") {
-      add("ack", "ack", `Queued ${title}. It starts when a running request finishes. I'll post questions and the result here.`);
+      add("ack", "ack", `Queued ${title}. It starts when a running request finishes. I'll post questions and the result here.${hint}`);
     } else if (draft.state === "queued" && draft.holdReason) {
       // Posted once: the key exists after the first hold, so a later hold reason posts nothing.
       add("ack", "ack", `Received ${title}. It has not started: ${draft.holdReason}\nI'll post questions and the result here once it starts.${hint}`);
     }
     // A split acknowledgement is decided by its first part.
     const ack = draft.messages.find(message => message.key === "ack" || message.key === "ack#1");
+    // A held answer's first message was the hold notice, so its start is announced under its own key.
+    if (draft.state === "started" && answer && ack && ack.text !== ANSWER_START) add("started", "started", ANSWER_START);
     if (draft.state === "started" && !answer && ack && !ack.text.startsWith("Started on ")) {
       add("started", "started", draft.direct ? `Started on ${draft.identifier} (${draft.url}).` : `Started on ${draft.identifier}.`);
     }

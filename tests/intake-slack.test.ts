@@ -1377,3 +1377,29 @@ test("with two open records one of them an answer, the ambiguity reply names the
     assert.ok(!s.texts()[2].includes(", ,") && !s.texts()[2].includes(": ,"), "No empty identifier is listed");
   } finally { await close(); }
 });
+
+test("a held answer announces its start once, and queued work keeps the ask hint through its start", { timeout: 90000 }, async () => {
+  const h = harness(); const services = h.open(); const s = await surfaceFor(services, h.root, { directRequests: true, direct: () => () => "accepted" });
+  try {
+    s.store.create(intakeRecord(ISSUE, "queued", { identifier: "", url: "", title: "which exports failed?", thread: BINDING, direct: answerDirect, holdReason: "The project is busy." }));
+    const work = randomUUID();
+    s.store.create(intakeRecord(work, "queued", { thread: OTHER, holdReason: "max-active", direct: { eventId: "EvW", ts: "1700000000.000200", text: "x", filedAt: NOW, route: { kind: "work", by: "default", at: NOW } } }));
+    await s.surface.start();
+    await waitFor(async () => [s.texts().length, s.texts(OTHER).length], counts => counts[0] === 1 && counts[1] === 1);
+    const { id } = await services.missions.create({ requestId: randomUUID(), groupId: "shop", objective: "Question asked from Slack: q", mode: "answer", maxSubtasks: 1, maxMinutes: 30 }, undefined, answerOrigin(ISSUE));
+    s.store.update(ISSUE, record => { record.state = "started"; record.missionId = id; delete record.holdReason; });
+    const other = await services.missions.create(h.create(), undefined, origin(work));
+    s.store.update(work, record => { record.state = "started"; record.missionId = other.id; delete record.holdReason; });
+    await waitFor(async () => [s.texts().length, s.texts(OTHER).length], counts => counts[0] === 2 && counts[1] === 2);
+    // A further change to each record composes again and must add nothing.
+    s.store.update(ISSUE, record => { record.updatedAt = new Date().toISOString(); });
+    s.store.update(work, record => { record.updatedAt = new Date().toISOString(); });
+    await delay(400);
+    assert.deepEqual(s.texts().map(text => text === ANSWER_START), [false, true]);
+    assert.equal(s.texts().filter(text => text === ANSWER_START).length, 1);
+    const hint = 'To ask a question instead, mention me with "ask:".';
+    assert.equal(s.texts(OTHER).length, 2);
+    assert.equal(s.texts(OTHER).filter(text => text.includes(hint)).length, 1, "The hint reaches the owner exactly once");
+    assert.ok(s.texts(OTHER)[0].startsWith("Queued ") && s.texts(OTHER)[0].includes(hint));
+  } finally { await s.close(); await h.close(); }
+});

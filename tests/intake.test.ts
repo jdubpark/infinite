@@ -1382,7 +1382,7 @@ test("an answer record is skipped by the Linear watch", { timeout: 60000 }, asyn
   } finally { await ctx.close(); }
 });
 
-test("an answer mission's result and cancellation leave no Linear comment and no empty identifier", { timeout: 90000 }, async () => {
+test("an answer mission's result leaves the record finished with no Linear comment and no Linear request", { timeout: 90000 }, async () => {
   const ctx = await setup({ ...askOptions, scripted: true });
   try {
     ctx.intake.requestFromSlack(direct(ctx, "ask: which exports failed?"));

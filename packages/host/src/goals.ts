@@ -95,6 +95,28 @@ export class GoalService {
     return [...this.records.values()].some(({ goal }) =>
       !terminal.has(goal.status) && (goal.activeTeamId === teamId || goal.cycles.some(cycle => cycle.teamId === teamId)));
   }
+  /**
+   * Cancels a run that its stopped goal left blocked or paused (a goal cancel skips a stopped goal),
+   * and records the cancelled cycle so the goal's cleanup removes the run once its workspace is gone.
+   */
+  cancelReleasedRun(teamId: string, body: Action) {
+    return this.enqueue(async () => {
+      const goalId = this.teams.get(teamId).goal?.id;
+      // The goal still controls the run while it is live, has a queued control for it, or can be
+      // extended from it after a deadline stop.
+      const held = this.retainsTeamRun(teamId) || [...this.records.values()].some(({ goal, control }) => control?.teamId === teamId ||
+        (goal.status === "limit-reached" && goal.stopReason === "deadline" && goal.cycles.some(cycle => cycle.teamId === teamId)));
+      if (held) throw new TeamError(409, "goal-owned-team", "Control this feature from its goal. Team decisions can still be answered here.");
+      const team = await this.teams.cancel(teamId, body);
+      const stored = goalId ? this.records.get(goalId) : undefined, cycle = stored?.goal.cycles.find(value => value.teamId === teamId);
+      if (stored && cycle && cycle.status !== "cancelled") {
+        this.refresh(stored, team);
+        this.event(stored, `The owner cancelled feature ${cycle.cycle}'s stopped run after the goal had stopped.`);
+        this.save(stored);
+      }
+      return team;
+    });
+  }
   /** Persisted goal records for the read-only Understanding view; performs no tracker or usage refresh. */
   understandingRecords() { return [...this.records.values()].map(({ goal }) => structuredClone(goal)); }
   list() { return [...this.records.values()].map(({ goal }) => this.get(goal.id)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }

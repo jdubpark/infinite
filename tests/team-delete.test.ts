@@ -268,6 +268,27 @@ test("active owner guards and retention references diverge after a goal cycle st
   } finally { goals.close(); teams.close(); fixture.close(); }
 });
 
+test("a stopped goal keeps its run from a team cancel while it has a queued control or can still be extended", async () => {
+  const fixture = schedulerFixture();
+  fixture.run.status = "blocked";
+  fixture.run.members = [];
+  fixture.writeTeam();
+  const teams = fixture.openTeam();
+  const goals = new GoalService(fixture.config, fixture.key, teams);
+  try {
+    const records = (goals as unknown as { records: Map<string, unknown> }).records, goalId = randomUUID(), teamId = fixture.run.id;
+    const action = { requestId: randomUUID(), revision: fixture.run.revision };
+    const refused = (error: unknown) => error instanceof TeamError && error.code === "goal-owned-team";
+    // An owner extension revives a deadline-stopped goal from its latest cycle.
+    records.set(goalId, { goal: { id: goalId, status: "limit-reached", stopReason: "deadline", cycles: [{ teamId }] } });
+    await assert.rejects(goals.cancelReleasedRun(teamId, action), refused);
+    records.set(goalId, { goal: { id: goalId, status: "cancelled", cycles: [{ teamId }] },
+      control: { action: "cancel", teamId, requestId: randomUUID(), revision: fixture.run.revision } });
+    await assert.rejects(goals.cancelReleasedRun(teamId, action), refused);
+    assert.equal(teams.get(teamId).status, "blocked");
+  } finally { goals.close(); teams.close(); fixture.close(); }
+});
+
 test("mission delete guards follow active subtask state while retention follows live references", () => {
   const fixture = schedulerFixture();
   const missionKey = randomBytes(32), missionId = randomUUID();

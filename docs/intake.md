@@ -249,8 +249,9 @@ in order:
    the thread can be named, finished or not.
 4. Otherwise, with one unfinished request in the thread, the reply goes to it. With
    none, it goes to the newest finished request, except that with direct requests
-   on, a mention that starts with neither `Q<n>`, an identifier, nor one of
-   `status`, `pause`, `resume`, `cancel` files a follow-up request instead.
+   on, a mention that starts with neither `Q<n>` nor an identifier, and is not
+   exactly `status`, `pause`, `resume`, or `cancel`, files a follow-up request
+   instead.
 5. With more than one unfinished request, nothing is applied to any mission, and
    the bot replies:
    `More than one request is open in this thread: ID1, ID2. Start your reply with an identifier or a question number.`

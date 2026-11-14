@@ -425,16 +425,17 @@ export class IntakeSlackSurface {
       this.droppedCount += 1;
       return;
     }
-    if (this.directOn() && bound.every(record => record.state === "finished") && !this.routesToRecord(bound, text)) {
-      this.fileDirect(thread, ts, eventId, text);
-      return;
-    }
     const duplicate = (record: IntakeRecord) => record.inbound.some(item => item.eventId === eventId || item.ts === ts);
     // A redelivered event, or a second event for the same message, is dropped with no write and no reply. An entry a
     // failed store write left unhandled on the record that holds it is applied now.
     const holders = bound.filter(duplicate);
     if (holders.length > 0) {
       for (const record of holders) if (record.inbound.some(item => !item.handledAt)) void this.drain(record.issueId);
+      return;
+    }
+    // Only after the duplicate check, so a redelivered earlier reply never files a request.
+    if (this.directOn() && bound.every(record => record.state === "finished") && !this.routesToRecord(bound, text)) {
+      this.fileDirect(thread, ts, eventId, text);
       return;
     }
     const target = this.target(bound, text);

@@ -281,7 +281,9 @@ Slack surface:
   at the time of the mention, sent no later than the mention, are put in the
   mission objective, stored with the mission, and shown to agents. They are not
   logged, not copied into the Linear issue or any comment, and not posted to
-  Slack. Messages others send later are never read. Every line carries its author
+  Slack. The host reads the thread when it files the request; messages sent
+  after the owner's mention are discarded before anything is stored, passed to an
+  agent, shown, or logged. Every line carries its author
   (`owner | `, `other N | `, `bot | `), and line-break characters in a message are
   normalised first, so a forged line inside another person's message keeps that
   person's marker. The markers are a prompt boundary and not a guarantee: agents

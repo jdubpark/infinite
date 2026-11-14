@@ -1142,7 +1142,7 @@ test("a redelivered triggering event makes no second call, no inbound entry and 
     const records = s.store.boundTo(OTHER);
     assert.equal(records.length, 1);
     assert.equal(records[0].inbound.length, 0);
-    assert.deepEqual(s.texts(OTHER).slice(1), [], "Nothing is posted beyond the thread's root");
+    assert.deepEqual(s.texts(OTHER), [], "Nothing is posted");
   } finally { await close(); }
 });
 
@@ -1223,7 +1223,7 @@ test("a direct request that cannot be recorded is logged and counted, with nothi
     await s.slack.emit(inOther("fix the export"));
     await waitFor(() => Promise.resolve(s.surface.status().dropped), dropped => dropped === 1);
     assert.equal(logs.calls.length, 1);
-    assert.deepEqual(s.texts(OTHER).slice(1), []);
+    assert.deepEqual(s.texts(OTHER), []);
   } finally { await s.close(); await h.close(); }
 });
 
@@ -1238,5 +1238,27 @@ test("with direct requests off, mentions behave as before", { timeout: 60000 }, 
     await waitFor(async () => s.texts(), list => list.length === 1);
     assert.equal(s.texts()[0], FINISHED);
     assert.equal(calls().length, 0);
+  } finally { await close(); }
+});
+
+test("a redelivered earlier reply never files a follow-up once its record has finished", { timeout: 60000 }, async () => {
+  const { s, calls, close } = await directSurface();
+  try {
+    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING }));
+    await s.surface.start(); await s.connected();
+    const reply = mention("also cover the CSV export");
+    const envelope = await s.slack.emit(reply, { eventId: "EvReply" });
+    await waitFor(async () => s.store.get(ISSUE)!.inbound.length, count => count === 1);
+    await waitFor(async () => s.store.get(ISSUE)!.inbound[0].handledAt, handled => Boolean(handled));
+    await waitFor(async () => s.texts(), list => list.includes("This request has not started yet."));
+    s.store.update(ISSUE, record => { record.state = "finished"; });
+    const before = s.texts();
+    await s.slack.redeliver(envelope);
+    await s.slack.emit(reply, { eventId: "EvOtherId" });
+    await delay(500);
+    assert.equal(calls().length, 0, "No request is filed");
+    assert.equal(s.store.list().length, 1);
+    assert.equal(s.store.get(ISSUE)!.inbound.length, 1);
+    assert.deepEqual(s.texts(), before, "Nothing is posted");
   } finally { await close(); }
 });

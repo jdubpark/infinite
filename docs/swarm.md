@@ -19,6 +19,10 @@ One model feeds three views. Switching between them does not refetch.
 | Wall | `#/swarm/wall` | One fixed-size tile per agent: role, model, state, activity, tool in flight, cost. |
 | Graph | `#/swarm/graph` | Every live swarm beside the code areas its agents touched, with links between them. |
 
+Cost counts measured usage only. A cost ends in `+` when some agents of that
+run, mission, or the solo group have no usage data, and a dash replaces it when
+no measured usage gives a figure.
+
 Controls float above the canvas as glass: the vitals strip, the view switch,
 the focus toggle, the legend, and the inspector. The `f` key hides the sidebar
 for wallboard use. Escape clears the selection.

@@ -6,7 +6,7 @@ import { Graph } from "./Graph";
 import { Lanes, agentTitle, holdGlyph, stateWords, terminalGlyph } from "./Lanes";
 import { Wall } from "./Wall";
 import { RoleChip, StateMark } from "./marks";
-import { clockTime, elapsed, shortModel, usd } from "./format";
+import { clockTime, cost, elapsed, shortModel, usd } from "./format";
 import { allAgents, buildSwarm, findAgent, findUnit } from "./model";
 import { createActivity } from "./activity";
 import { AGENT_STATES, STATE_LABEL, type AgentState, type Selection, type SwarmMission, type SwarmSession, type SwarmTeam, type ViewProps } from "./types";
@@ -84,9 +84,11 @@ export function SwarmView(props: SwarmViewProps) {
   }, [focus, setFocus]);
 
   const totals = model.totals;
+  const spend = cost(totals.costUsd, totals.unmeasured);
   const empty = model.live.length === 0 && model.quiet.length === 0;
   const selectedAgent = selection?.kind === "agent" ? findAgent(model, selection.id) : undefined;
   const selectedUnit = selection?.kind === "unit" ? findUnit(model, selection.id) : undefined;
+  const unitSpend = cost(selectedUnit?.costUsd, selectedUnit?.unmeasured ?? 0);
   const memory = resources?.memory;
   const memoryPercent = memory && memory.availableBytes !== null && memory.totalBytes > 0 ? 100 * (1 - memory.availableBytes / memory.totalBytes) : null;
   const cpuPercent = resources?.cpu?.usagePercent ?? null;
@@ -122,7 +124,7 @@ export function SwarmView(props: SwarmViewProps) {
           <span className="sw-count sw-num">{totals.slots.running}</span>
           <small>/{totals.slots.limit}</small>
         </span>
-        <span className={`sw-vital${totals.costUsd ? "" : " sw-dim"}`}><span className="sw-cost sw-num">{usd(totals.costUsd)}</span></span>
+        <span className={`sw-vital${totals.costUsd ? "" : " sw-dim"}`}><span className="sw-cost sw-num" title={spend.title}>{spend.text}</span></span>
         <Meter label="cpu" value={cpuPercent} />
         <Meter label="mem" value={memoryPercent} />
         {limits.map(limit => <span key={limit.provider} className="sw-flag">lim {limit.provider}</span>)}
@@ -166,7 +168,7 @@ export function SwarmView(props: SwarmViewProps) {
           <span className="sw-inspector-fact">r{selectedUnit.revision}</span>
           {selectedUnit.workers && <span className="sw-inspector-fact"><small>slots</small>{selectedUnit.workers.running}/{selectedUnit.workers.limit}</span>}
           <span className="sw-inspector-fact" title="passed / failed / running"><small>checks</small>{selectedUnit.checks.passed}/{selectedUnit.checks.failed}/{selectedUnit.checks.running}</span>
-          {selectedUnit.costUsd !== undefined && <span className="sw-inspector-fact sw-num">{usd(selectedUnit.costUsd)}</span>}
+          {(selectedUnit.costUsd !== undefined || selectedUnit.unmeasured > 0) && <span className="sw-inspector-fact sw-num" title={unitSpend.title}>{unitSpend.text}</span>}
           {holdGlyph(selectedUnit.hold)}
           {terminalGlyph(selectedUnit.terminal)}
           <span className="sw-inspector-links"><button type="button" className="sw-link" onClick={() => openTeam(selectedUnit.id)}>team</button></span>

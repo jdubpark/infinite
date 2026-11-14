@@ -30,7 +30,8 @@ export type SwarmTeam = {
   /** Owner delegation of routine one-shot permissions; absent on runs without it. */
   permissions?: { maxDecisions: number }; permissionsRevokedAt?: string;
   permissionDecisions?: { targetSessionId: string; promptId: number; status: string }[];
-  usage?: { total: UsageTotals };
+  /** `unmeasuredMembers` counts members the provider reports no usage for; their cost is unknown, not zero. */
+  usage?: { total: UsageTotals; unmeasuredMembers?: number };
   workers?: { limit: number; max: number; running: number; ready: number };
 };
 export type SwarmMission = {
@@ -40,7 +41,8 @@ export type SwarmMission = {
   subtasks: { id: string; repoProjectId: string; title: string; dependsOn: string[]; status: "queued" | "running" | "done" | "cancelled" | "blocked"; teamId?: string }[];
   decisions: { id: string; answer?: string }[];
   lineup?: { coordinator: TeamModelProfile };
-  usage?: { total: UsageTotals };
+  /** Sums the coordinator and subteams; `unmeasuredMembers` counts members with no usage data. */
+  usage?: { total: UsageTotals; unmeasuredMembers?: number };
 };
 export type SwarmInput = { sessions: SwarmSession[]; teams: SwarmTeam[]; missions: SwarmMission[]; now: number };
 
@@ -123,6 +125,8 @@ export interface Unit {
   /** Open owner decisions of the current revision; zero for mission-managed units. */
   waiting: number;
   costUsd?: number;
+  /** Members of this run with no usage data. `costUsd` counts measured usage only. */
+  unmeasured: number;
   goalCycle?: number;
   createdAt: string;
   /** When an agent of this run last started, acted, or reported; the run's creation time when none did. */
@@ -147,6 +151,8 @@ export interface Swarm {
   /** Person-owned prompts plus open owner decisions in this swarm. */
   waiting: number;
   costUsd?: number;
+  /** Agents of this swarm with no usage data; `costUsd` counts measured usage only. */
+  unmeasured: number;
   createdAt: string;
 }
 export interface SwarmTotals {
@@ -156,6 +162,8 @@ export interface SwarmTotals {
   waitingOnPerson: number;
   slots: { running: number; limit: number };
   costUsd: number;
+  /** Agents with no usage data, summed over live swarms. */
+  unmeasured: number;
 }
 export interface SwarmModel {
   live: Swarm[];

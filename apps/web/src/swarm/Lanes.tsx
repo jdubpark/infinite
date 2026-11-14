@@ -1,6 +1,6 @@
 import { CircleHelp, Eye, GitMerge, Minus, OctagonAlert, Pause, X } from "lucide-react";
 import { RoleChip, StateMark, agentName } from "./marks";
-import { elapsed, usd } from "./format";
+import { cost, elapsed } from "./format";
 import { allAgents, findUnit } from "./model";
 import { ROLE_NAME, STAGES, STAGE_LABEL, STATE_LABEL, type Agent, type Ghost, type Hold, type Selection, type Stage, type Swarm, type Terminal, type Unit, type ViewProps } from "./types";
 
@@ -92,6 +92,7 @@ function LaneRow({ unit, own, ...props }: ViewProps & { unit: Unit; own: boolean
   const checkStage = STAGES.indexOf("check");
   const running = unit.workers?.running;
   const limit = unit.workers?.limit;
+  const spend = cost(unit.costUsd, unit.unmeasured);
   return <div className="sw-lane-row" data-unit={unit.id}>
     <UnitLabel unit={unit} own={own} model={model} selection={selection} onSelect={onSelect} openTeam={openTeam} />
     {STAGES.map((stage: Stage, index) => <div key={stage} className={`sw-stage${index <= reached ? " sw-reached" : ""}${index === active ? " sw-active" : ""}`}>
@@ -106,7 +107,7 @@ function LaneRow({ unit, own, ...props }: ViewProps & { unit: Unit; own: boolean
       </span>)}
       <span className="sw-glyph-slot">{terminalGlyph(unit.terminal)}</span>
       <span className="sw-slots sw-num">{unit.workers ? `${running}/${limit}` : ""}</span>
-      <span className="sw-cost sw-num">{usd(unit.costUsd)}</span>
+      <span className="sw-cost sw-num" title={spend.title}>{spend.text}</span>
     </div>
   </div>;
 }
@@ -134,6 +135,7 @@ function QuietRow({ unit, selection, onSelect, openTeam, now }: Pick<ViewProps, 
 function LaneSwarm({ swarm, ...props }: ViewProps & { swarm: Swarm }) {
   const { selection, onSelect, openSession } = props;
   const agents = allAgents(swarm);
+  const spend = cost(swarm.costUsd, swarm.unmeasured);
   return <section className="sw-lane-swarm" aria-label={swarm.title}>
     <header className="sw-swarm-head">
       {swarm.kind !== "solo" && <span className="sw-swarm-kind sw-dim">{swarm.kind}</span>}
@@ -143,7 +145,7 @@ function LaneSwarm({ swarm, ...props }: ViewProps & { swarm: Swarm }) {
       {swarm.kind === "mission" && <span className="sw-count sw-dim">{plural(swarm.units.length, "unit")}</span>}
       <span className="sw-count sw-dim">{plural(agents.length, "agent")}</span>
       {/* A team's single row already carries its cost. */}
-      <span className="sw-cost sw-num">{swarm.kind === "team" ? "" : usd(swarm.costUsd)}</span>
+      <span className="sw-cost sw-num" title={swarm.kind === "team" ? undefined : spend.title}>{swarm.kind === "team" ? "" : spend.text}</span>
     </header>
     {swarm.loose.length > 0 && <div className="sw-lane-row sw-solo-row">
       <div className="sw-lane-label" />

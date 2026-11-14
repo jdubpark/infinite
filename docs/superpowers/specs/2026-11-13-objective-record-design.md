@@ -41,7 +41,7 @@ Two statements in the amendment brief differ from the code. The brief says cycle
 ## Non-goals
 
 - Judging whether an objective is met. The host checks shape only.
-- Mission-level records. A subteam run gets a run record from its subtask objective, as a standalone run does.
+- Mission-level records. In step 1, goal cycle runs, mission subteams, and handoff runs hold no run record; only a standalone run does.
 - Reopening a goal after a later regression. A goal stopped on a provisional `met` stays stopped until the owner acts.
 - Learning on the record. No learning changes a criterion, a constraint, or the register.
 - Client screen design. This design names what each client shows.
@@ -328,7 +328,7 @@ The four ledger levels keep their meaning and stay empty on scout rows. A `scout
 
 The record digest goes into `TeamGoalContext` as `record`: criteria (ID, statement, check label, producer), active assumptions with status, and open questions with defaults. It is at most 6 KiB plus `c0`'s statement, so at most 22 KiB. It replaces `successCriteria`, which can already take 16,000 bytes, so a prompt grows by at most 6 KiB, inside the 80 KiB limit. It carries no criterion status, which reaches the coordinator only through the goal digest. The goal context section that member prompts print today shows it in place of `successCriteria`, whose text is `c0`. Non-goals, allowed paths, and evidence print as today. In autonomous mode, the section's sentence "Ask for a user decision if a material scope decision is required" becomes an instruction to propose an assumption. No member reads the log, a verdict row, an agreement rate, a finding measure, or the evaluator's identity.
 
-- `GET /api/goals/:id/record` and `GET /api/teams/:id/record` return the record and its log, for owner, controller, and viewer devices. `?version=N` rebuilds a past version. Step 1 adds these reads with the codes `objective-version-not-found`, `objective-record-of-goal`, `objective-record-of-mission`, `objective-record-invalid`, `objective-record-newer`, `objective-source-invalid`, and `objective-record-absent`. The relay refuses both paths, as it refuses the outcome routes, and no code changes for that.
+- `GET /api/goals/:id/record` and `GET /api/teams/:id/record` return the record and its log, for owner, controller, and viewer devices. `?version=N` rebuilds a past version. Step 1 adds these reads with the codes `objective-version-not-found`, `objective-record-of-goal`, `objective-record-of-mission`, `objective-record-of-handoff`, `objective-record-invalid`, `objective-record-newer`, `objective-source-invalid`, and `objective-record-absent`. The relay refuses both paths, as it refuses the outcome routes, and no code changes for that.
 - `POST /api/goals/:id/record` and `POST /api/teams/:id/record` apply owner ops.
 - `GET /api/goals/:id/verdicts` returns each cycle's verdict with its receipts.
 - `infinite goal record ID [--version N] [--json]` is the first CLI form, in step 1. `confirm CID`, `retire CID`, `set-assumption AID STATUS`, and `answer QID TEXT` follow in step 2 and step 3. `infinite team record` is not planned for this design.
@@ -406,7 +406,7 @@ The criteria:
 
 ## Delivery order
 
-1. **The record.** Schema, validation, storage in sealed goal and run records, migration of existing goals, the log, and the read API and CLI. Steering appends directions. A standalone run gets its record at its first accepted plan. Goal cycle runs and mission subteams hold none. Nothing else changes a run.
+1. **The record.** Schema, validation, storage in sealed goal and run records, migration of existing goals, the log, and the read API and CLI. Steering appends directions. A standalone run gets its record at its first accepted plan. Goal cycle runs, mission subteams, and handoff runs hold none. Nothing else changes a run.
 2. **Owner ops and prompts.** The correction API, the record digest in prompts and the context file, and the `evaluators` lineup slot.
 3. **The intent check.** The role, the report, item application, the batched question, the corrected-plan attempt, and derived criteria. Until C16 lands, a scout item is converted to `assume` and logged.
 4. **Tests and proposals.** Command, artifact, citation, and owner tests. Proposals need the blackboard member tools (C17).

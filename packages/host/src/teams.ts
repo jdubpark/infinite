@@ -1765,6 +1765,7 @@ export class TeamService {
       this.event(next, `Owner continued the run from its clean integration commit at revision ${nextRevision}. Prior tasks, checks, member records, permissions, and review evidence remain available in the run history.`);
       this.save(next);
       Object.assign(stored, next);
+      if (!("objectiveNotice" in next)) delete stored.objectiveNotice;
       return this.view(stored);
     });
   }

@@ -984,7 +984,7 @@ test("a team builds concurrently in isolated copies and produces checked, review
     assert.equal(record.body.log[0].op, "record.created"); assert.equal(record.body.log[0].actor, "host");
     const missing = await f.host.fetchApi(`/teams/${randomUUID()}/record`, "viewer");
     assert.equal(missing.status, 404); assert.equal(missing.body.code, "team-not-found");
-    const commands =readFileSync(join(f.receipts, "commands.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const commands = readFileSync(join(f.receipts, "commands.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     assert.ok(commands.some(command => command.cwd === f.source && command.command === "git"), "Source Git inspection must use the configured execution identity");
     for (const worker of workers)
       assert.ok(commands.some(command => command.cwd === worker.cwd && command.command === "git" && command.args.includes("add")), "Git must not stage agent-controlled files as the API identity");

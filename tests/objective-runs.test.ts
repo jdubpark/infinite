@@ -76,13 +76,13 @@ test("a run's record starts at its first accepted plan", async () => {
   const f = schedulerFixture();
   const store = openStore(f, f.key);
   try {
-    f.run.revision = 2;
-    f.run.members[0]!.revision = 2;
-    f.run.steering = [{ text: "Keep the API stable", revision: 2, at: new Date().toISOString() }];
     f.writeTeam();
     const teams = f.openTeam({ events: new EventOutbox(store) });
+    await teams.steer(f.run.id, { requestId: randomUUID(), revision: f.run.revision, text: "Keep the API stable" });
+    await teams.idle();
     assert.throws(() => teams.objectiveRecord(f.run.id), (error: unknown) =>
       error instanceof TeamError && error.status === 404 && error.code === "objective-record-absent");
+    assert.equal(f.readRecord<{ objectiveRecord?: unknown }>("team", f.run.id).objectiveRecord, undefined);
 
     const { stored, member } = reportFrom(teams, f.run.id, planReport());
     internal(teams).consume(stored, member);
@@ -203,6 +203,26 @@ test("a goal cycle run has no record of its own", async () => {
       assert.equal(f.readRecord<{ objectiveRecord?: unknown }>("team", f.run.id).objectiveRecord, undefined);
       assert.throws(() => teams.objectiveRecord(f.run.id), (error: unknown) =>
         error instanceof TeamError && error.status === 409 && error.code === "objective-record-of-mission");
+    } finally { store.close(); f.close(); }
+  }
+  {
+    const f = schedulerFixture();
+    const store = openStore(f, f.key);
+    try {
+      f.run.handoff = { sourceSessionId: randomUUID(), checkpointHead: "a".repeat(40), deadlineAt: new Date(Date.now() + 3600_000).toISOString(), maxMembers: 4 } as unknown as TeamRun["handoff"];
+      f.writeTeam();
+      const teams = f.openTeam({ events: new EventOutbox(store) });
+      const { stored, member } = reportFrom(teams, f.run.id, planReport({ parallelism: 2 }));
+      internal(teams).consume(stored, member);
+      await waitFor(() => (stored as { pending?: unknown }).pending === undefined && stored.run.status !== "planning", "the handoff plan's operation completes");
+      await teams.idle();
+      assert.equal(stored.run.status, "implementing", "the handoff plan is accepted");
+      await teams.steer(f.run.id, { requestId: randomUUID(), revision: f.run.revision, text: "Keep the handoff narrow" });
+      await teams.idle();
+      assert.equal((stored as { objectiveRecord?: unknown }).objectiveRecord, undefined);
+      assert.equal(f.readRecord<{ objectiveRecord?: unknown }>("team", f.run.id).objectiveRecord, undefined);
+      assert.throws(() => teams.objectiveRecord(f.run.id), (error: unknown) =>
+        error instanceof TeamError && error.status === 409 && error.code === "objective-record-of-handoff");
     } finally { store.close(); f.close(); }
   }
 });

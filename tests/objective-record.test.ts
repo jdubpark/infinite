@@ -184,7 +184,7 @@ test("a rebuild refuses what it cannot undo", () => {
     origin: "derived",
     derivedFrom: "Find ranked",
     statement: "Each source has a date.",
-    check: { kind: "command", command: "npm test" },
+    check: { kind: "command", command: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" },
     producer: "host",
     threshold: { kind: "pass" },
     state: "active",

@@ -89,7 +89,7 @@ test("a criterion's producer and threshold fit its check", () => {
   const goal = validGoalRecord();
   const withCriterion = (criterion: unknown) => withDigest({ ...goal, criteria: [goal.criteria[0], criterion] });
   const fits: unknown[] = [
-    criterionOf({ kind: "command", command: "npm test" }, "host", { kind: "pass" }),
+    criterionOf({ kind: "command", command: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" }, "host", { kind: "pass" }),
     criterionOf({ kind: "receipt", receipt: "merged" }, "host", { kind: "pass" }),
     criterionOf({ kind: "artifact", path: "docs/entries.json", count: "/entries" }, "host", { kind: "count", min: 10, max: 25 }),
     criterionOf({ kind: "artifact", path: "docs/spec.md" }, "host", { kind: "pass" }),
@@ -101,9 +101,11 @@ test("a criterion's producer and threshold fit its check", () => {
 
   const fails: unknown[] = [
     criterionOf({ kind: "judgement", item: "method-applied" }, "host", { kind: "pass" }),
-    criterionOf({ kind: "command", command: "npm test" }, "evaluator", { kind: "pass" }),
-    criterionOf({ kind: "command", command: "npm test" }, "coordinator", { kind: "pass" }),
-    criterionOf({ kind: "command", command: "npm test" }, "host", { kind: "count", min: 1 }),
+    criterionOf({ kind: "command", command: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" }, "evaluator", { kind: "pass" }),
+    criterionOf({ kind: "command", command: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" }, "coordinator", { kind: "pass" }),
+    criterionOf({ kind: "command", command: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" }, "host", { kind: "count", min: 1 }),
+    criterionOf({ kind: "command", command: "npm test" }, "host", { kind: "pass" }),
+    criterionOf({ kind: "command", command: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a0" }, "host", { kind: "pass" }),
     criterionOf({ kind: "artifact", path: "docs/entries.json", count: "/entries" }, "host", { kind: "pass" }),
     criterionOf({ kind: "artifact", path: "docs/entries.json", count: "/entries" }, "host", { kind: "count", min: 5, max: 4 }),
     criterionOf({ kind: "artifact", path: "docs/entries.json", count: "/entries" }, "host", { kind: "count" }),
@@ -140,7 +142,7 @@ test("c0 is the owner's text", () => {
   assert.ok(!parses(runC0({ statement: "x" })), "a run c0 with text must fail");
   assert.ok(!parses(runC0({ statementOf: undefined })), "a run c0 without statementOf must fail");
   const extraStatementOf = structuredClone(goal);
-  extraStatementOf.criteria.push(criterionOf({ kind: "command", command: "npm test" }, "host", { kind: "pass" }, { statementOf: "objective" }));
+  extraStatementOf.criteria.push(criterionOf({ kind: "command", command: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" }, "host", { kind: "pass" }, { statementOf: "objective" }));
   assert.ok(!parses(withDigest(extraStatementOf)), "statementOf on c1 must fail");
 });
 
@@ -148,7 +150,7 @@ test("a derived criterion quotes the statement", () => {
   const goal = validGoalRecord();
   const derived = (derivedFrom: unknown, origin = "derived") => withDigest({
     ...goal,
-    criteria: [goal.criteria[0], { ...criterionOf({ kind: "command", command: "npm test" }, "host", { kind: "pass" }, { origin }), derivedFrom }],
+    criteria: [goal.criteria[0], { ...criterionOf({ kind: "command", command: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" }, "host", { kind: "pass" }, { origin }), derivedFrom }],
   });
   assert.ok(parses(derived("record")), "a substring of the objective passes");
   assert.ok(parses(derived("Keep the record beside")), "a substring of a direction passes");
@@ -161,7 +163,7 @@ test("a derived criterion quotes the statement", () => {
 test("the record's caps hold", () => {
   const goal = validGoalRecord();
   const derivedCriterion = (i: number) => ({
-    ...criterionOf({ kind: "command", command: "npm test" }, "host", { kind: "pass" }, { origin: "derived", derivedFrom: "record" }),
+    ...criterionOf({ kind: "command", command: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" }, "host", { kind: "pass" }, { origin: "derived", derivedFrom: "record" }),
     id: `c${i}`, statement: "A derived check.",
   });
   const withCriteria = (criteria: unknown[]) => withDigest({ ...goal, criteria: [goal.criteria[0], ...criteria] });
@@ -282,7 +284,7 @@ test("assumptions and questions keep their rules", () => {
   assert.ok(!parses(withAssumptions([assumptionOf("a1", { kind: "owner" }, { proposals: Array.from({ length: 9 }, () => proposal) })])), "9 proposals fail");
 
   const tests = [
-    { kind: "command", command: "npm test", refutesOn: "fail" },
+    { kind: "command", command: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", refutesOn: "fail" },
     { kind: "artifact", path: "docs/entries.json", count: "/entries", threshold: { kind: "count", min: 1 } },
     { kind: "citation", source: "docs/spec.md", quote: "a quote", refutesOn: "absent" },
     { kind: "owner", rating: { subject: "quality", below: 3 } },

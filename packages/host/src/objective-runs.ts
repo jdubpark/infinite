@@ -5,7 +5,7 @@ import type { ObjectiveRecord } from "./objective-types.js";
 export type { ObjectiveUnavailable } from "./objective-record.js";
 /** A standalone run and the record beside it in its sealed `Stored`. */
 export type RunHolder = { run: TeamRun; objectiveRecord?: unknown; objectiveNotice?: ObjectiveUnavailable };
-export type RunObjectiveResult = "built" | "synced" | "unchanged" | "goal-owned" | "mission-owned" | ObjectiveUnavailable;
+export type RunObjectiveResult = "built" | "synced" | "unchanged" | "goal-owned" | "mission-owned" | "handoff-owned" | ObjectiveUnavailable;
 
 export const RUN_OBJECTIVE_EVENTS: Record<ObjectiveUnavailable, string> = {
   "source-invalid": "The objective record could not be built from this run's fields. The run works as before, without a record.",
@@ -15,10 +15,11 @@ export const RUN_OBJECTIVE_EVENTS: Record<ObjectiveUnavailable, string> = {
 
 const ownerOf = (run: TeamRun) => ({ kind: "run" as const, runId: run.id });
 
-/** A goal cycle run and a mission subteam never hold a record of their own. */
-function ownership(run: TeamRun): "goal-owned" | "mission-owned" | undefined {
+/** A goal cycle run, a mission subteam, and a handoff run never hold a record of their own. */
+function ownership(run: TeamRun): "goal-owned" | "mission-owned" | "handoff-owned" | undefined {
   if (run.goal) return "goal-owned";
   if (run.missionId) return "mission-owned";
+  if (run.handoff) return "handoff-owned";
   return undefined;
 }
 
@@ -71,10 +72,11 @@ export function runObjectiveNote(holder: RunHolder, result: RunObjectiveResult):
   return noticeFor(holder, result, RUN_OBJECTIVE_EVENTS);
 }
 
-/** 409 objective-record-of-goal or objective-record-of-mission first; then as goalObjectiveView. */
+/** 409 objective-record-of-goal, objective-record-of-mission, or objective-record-of-handoff first; then as goalObjectiveView. */
 export function runObjectiveView(holder: RunHolder, version?: number): ObjectiveRecordView {
   if (holder.run.goal) throw objectiveError("objective-record-of-goal");
   if (holder.run.missionId) throw objectiveError("objective-record-of-mission");
+  if (holder.run.handoff) throw objectiveError("objective-record-of-handoff");
   const state = readStoredRecord(holder.objectiveRecord, ownerOf(holder.run));
   if (state.kind === "absent") {
     throw objectiveError(holder.objectiveNotice === "source-invalid" ? "objective-source-invalid" : "objective-record-absent");

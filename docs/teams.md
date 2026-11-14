@@ -742,7 +742,7 @@ gets one direction for each steering message, in steering order. Each change
 is logged. The owner reads the record, or any past version of it, with
 `infinite goal record ID [--version N] [--json]` or `GET /api/goals/:id/record`.
 A standalone run gets its record at its first accepted plan. Goal cycle runs
-and mission subteams have no record of their own. The record changes no prompt
+mission subteams, and handoff runs have no record of their own. The record changes no prompt
 yet, and the relay does not carry it.
 
 With `extendMinutes` above 0, the host moves the deadline forward when it arrives,
@@ -1798,8 +1798,8 @@ pending operation. Resume requires a paused goal whose deadline has not expired;
 extend the goal first if it has.
 
 The record reads answer `404` with `objective-version-not-found` for a version
-the record does not have, and `409` for a goal cycle run or mission subteam
-(`objective-record-of-goal`, `objective-record-of-mission`), a stored record that
+the record does not have, and `409` for a goal cycle run, mission subteam, or handoff run
+(`objective-record-of-goal`, `objective-record-of-mission`, `objective-record-of-handoff`), a stored record that
 cannot be read (`objective-record-invalid`), one a newer host wrote
 (`objective-record-newer`), and a goal whose fields do not fit the record
 (`objective-source-invalid`). An unknown id answers `404` with

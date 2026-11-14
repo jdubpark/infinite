@@ -23,7 +23,7 @@ export type LiveDirection = { revision: number; handle: string };
 export type ObjectiveRecordView = { owner: ObjectiveOwner; version: number; latestVersion: number; rebuilt: boolean;
   record: Omit<ObjectiveRecord, "log">; log: LogEntry[] };
 export type ObjectiveErrorCode = "objective-record-absent" | "objective-source-invalid" | "objective-record-invalid" | "objective-record-newer"
-  | "objective-record-of-goal" | "objective-record-of-mission" | "objective-version-not-found" | "objective-version-unavailable";
+  | "objective-record-of-goal" | "objective-record-of-mission" | "objective-record-of-handoff" | "objective-version-not-found" | "objective-version-unavailable";
 
 export const OBJECTIVE_ERRORS: Record<ObjectiveErrorCode, { status: 404 | 409; message: string }> = {
   "objective-record-absent": { status: 404, message: "This run has no objective record yet. It gets one at its next accepted plan." },
@@ -32,6 +32,7 @@ export const OBJECTIVE_ERRORS: Record<ObjectiveErrorCode, { status: 404 | 409; m
   "objective-record-newer": { status: 409, message: "A newer host wrote this objective record. Upgrade the host to read it." },
   "objective-record-of-goal": { status: 409, message: "This run belongs to a goal. Read the goal's record." },
   "objective-record-of-mission": { status: 409, message: "A mission subteam has no objective record." },
+  "objective-record-of-handoff": { status: 409, message: "A handoff run has no objective record." },
   "objective-version-not-found": { status: 404, message: "The record has no such version." },
   "objective-version-unavailable": { status: 409, message: "This host cannot rebuild that version of the record." },
 };

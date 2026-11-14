@@ -97,8 +97,10 @@ const threshold = z.union([
   z.strictObject({ kind: z.literal("score"), min: z.number().int().min(1).max(5), of: z.literal(5) }),
 ]);
 
+const commandDigest = z.string().regex(/^[0-9a-f]{64}$/, "A command is a 64-character lower-case hex digest");
+
 const check = z.union([
-  z.strictObject({ kind: z.literal("command"), command: charsBetween(1, L.ruleBytes) }),
+  z.strictObject({ kind: z.literal("command"), command: commandDigest }),
   z.strictObject({ kind: z.literal("receipt"), receipt: z.enum(["checks-passed", "review-approved", "merged", "landed"]) }),
   z.strictObject({ kind: z.literal("artifact"), path: pathSchema, schema: handleSchema.optional(), count: pointer.optional() }),
   z.strictObject({ kind: z.enum(["citations", "citation-form"]), path: pathSchema, entries: pointer, perEntry }),
@@ -125,7 +127,7 @@ const criterion = z.strictObject({
 });
 
 const assumptionTest = z.union([
-  z.strictObject({ kind: z.literal("command"), command: charsBetween(1, L.ruleBytes), refutesOn: z.enum(["fail", "pass"]) }),
+  z.strictObject({ kind: z.literal("command"), command: commandDigest, refutesOn: z.enum(["fail", "pass"]) }),
   z.strictObject({ kind: z.literal("artifact"), path: pathSchema, count: pointer, citedPerEntry: perEntry.optional(), threshold }),
   z.strictObject({ kind: z.literal("citation"), source: bytesBetween(1, L.summaryBytes), quote: bytesBetween(1, L.summaryBytes), refutesOn: z.enum(["absent", "present"]) }),
   z.strictObject({

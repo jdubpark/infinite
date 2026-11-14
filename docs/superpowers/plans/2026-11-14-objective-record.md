@@ -57,6 +57,13 @@ Spec part 1 (the record, creation, storage, the log), part 2 (steering), part 3 
 - The relay refuses both reads, and no mission holds a record, until the owner decides otherwise.
 - Both services load a sealed record without a strict parse. So an older host keeps `objectiveRecord` and `objectiveNotice` in a record it saves, and a rollback loses nothing.
 
+**Rulings after the first review.**
+
+- **A handoff run holds no record.** Its objective is text that the host composes from the user's request, the agent's proposed continuation, and the host's own instructions (`handoffObjective`). A record would mark all of it as the owner's words. `planRunObjective` and `steerRunObjective` answer `handoff-owned`, and a read answers 409 `objective-record-of-handoff`. So only a run without `goal`, `missionId`, and `handoff` holds a record, the same test that `teams.ts` uses for a standalone run.
+- **A `command` check holds a digest.** `command` is 64 lower-case hex characters in a criterion's check and in an assumption's test, as "Formats" says. The record never holds command text.
+- **A continuation never leaves a cleared notice behind.** `continueRun` copies its working record back with `Object.assign`, which cannot remove a key, so it removes `objectiveNotice` itself when the working record has none. This is the eighth and last line this slice adds to `teams.ts`.
+- **The first-plan test steers through the service.** A record built at a steer before the first plan must fail `a run's record starts at its first accepted plan`.
+
 **Where the design and the code disagree.**
 
 - Part 1 says `successCriteria` holds "4,000 characters of up to 4 bytes each". `zod` counts UTF-16 code units, and one unit is at most 3 UTF-8 bytes, so the bound is 12,000 bytes. The 16,000-byte bound of `c0` holds with room. The spec is amended.

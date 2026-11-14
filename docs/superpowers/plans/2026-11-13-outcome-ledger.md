@@ -2521,6 +2521,13 @@ The local reviewer proved two faults in `planLegacyBatch` with probes and named 
 8. The migration test also compares every earlier column of every row before and after.
 9. **After the second local pass** (approve, both blockers closed): the rule of ruling 1 holds for lines with one body per id; of two bodies under one id, the first that the host sees stays (the refuse-edits rule), and the planner's comment and the docs say so. **A line whose outcome id a row of another source holds answers `conflict` wherever it comes, also under a mark.** Before, such a line under a mark completed the mark and applied its `supersedes`, so the refusal depended on the order. No host write makes an id of the form `legacy:` plus a blind index, so this is a guard, not a reachable state. Test `a conflict is refused in either order`. `a superseded line is dropped in either order across batches` also sends an edit of the dropped line through the import and expects `changed`.
 
+## Rulings after the first independent review of roll-ups and the import
+
+The independent reviewer found one blocker and one test that passed for the wrong reason.
+
+10. **The legacy route validates its body itself and answers a fixed 400.** Before, a failed parse reached the host's general handler, which returns each issue's message, and the message for an unknown key names the key. A key name in the operator's file is operator text, so the answer broke the rule that no error body holds it. Now the route answers `{ code: "legacy-invalid", error: "The legacy batch is invalid." }` for every body that does not parse, with no detail. The command's file check runs the same schema before it sends, so the operator has already seen which line and field is wrong; a 400 from the host means that the two clocks or the two versions differ. Test: `the legacy route answers per line` expects exactly that body for an unknown key, a label over the limit, 51 lines, and a missing `dryRun`.
+11. `a legacy row is never a run` gave `landingCandidates` the project id where it takes the project's blind index, so its empty result proved nothing. It now gives the index and has an approved production run of the same project as the one candidate.
+
 ## Not in this slice
 
 - A roll-up per goal cycle, a cache for roll-ups, and any web, phone, or Mac view of a roll-up or of legacy rows.

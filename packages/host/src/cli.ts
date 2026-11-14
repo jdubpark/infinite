@@ -24,6 +24,7 @@ import { workerCall } from "./ipc.js";
 import { Manager } from "./manager.js";
 import { parseDeployment } from "./deployment.js";
 import { planFleet } from "./fleet.js";
+import { egressDoctorLine, installHostEgress } from "./egress.js";
 import type { Config, Provider, Role } from "./types.js";
 
 import { handleClientCommand } from "./client.js";
@@ -262,6 +263,7 @@ infinite team answer ID QUESTION_ID TEXT    Answer a pending question
 infinite routine create --file FILE [--request-id UUID] [--json]
 infinite routine list [--json] | status ID [--json]
 infinite routine pause|resume|cancel ID --revision N [--request-id UUID] [--json]
+infinite egress [--project ID] [--json]    Hosts agents reached through the egress proxy
 
 Ctrl+] detaches. Ctrl+G returns to monitor mode. Flags after a provider
 name belong to that provider and use cloud paths.
@@ -306,6 +308,7 @@ else if (command === "plan-fleet") {
 } else {
   if (dev && !existsSync(configFile)) initialize();
   const { config, key } = readConfig(configFile);
+  installHostEgress(config);
   if (command === "serve" || dev) {
     mkdirSync(config.runDir, { recursive: true, mode: 0o700 });
     const lock = join(config.runDir, "server.lock");
@@ -442,6 +445,7 @@ else if (command === "plan-fleet") {
           `Push: enabled · ${config.push.detail} bodies · token file ${config.push.accessTokenFile ?? "none"} (mode ${mode})`,
         );
       } else console.log("Push: disabled");
+      if (config.autonomy?.boundary?.egress) console.log(await egressDoctorLine(config.autonomy.boundary.egress));
       if ((config.attention?.hooks ?? DEFAULT_HOOKS).codex)
         console.log(
           "Warning: Codex hooks are on. They run with --dangerously-bypass-hook-trust, which also lets hooks defined in a session's working directory run without review. Use them only with repositories you trust.",

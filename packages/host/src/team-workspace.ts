@@ -6,6 +6,7 @@ import { rm as rmAsync } from "node:fs/promises";
 import { basename, dirname, join, resolve, relative, isAbsolute, parse, sep } from "node:path";
 import type { TeamCommand, TeamPublicationCategory, TeamTaskPlan } from "./team-types.js";
 import { fetchCategory } from "./project-source.js";
+import { hostEgressEnvironment } from "./egress.js";
 
 export class TeamError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) { super(message); }
@@ -19,6 +20,8 @@ export function teamCommandEnvironment(): NodeJS.ProcessEnv {
   env.GIT_OPTIONAL_LOCKS = "0";
   env.GIT_CONFIG_NOSYSTEM = "1";
   env.GIT_CONFIG_GLOBAL = "/dev/null";
+  // Empty unless autonomy.boundary.egress is configured: then the egress proxy, under the host identity.
+  Object.assign(env, hostEgressEnvironment());
   return env;
 }
 export function teamGitArgs(cwd: string, args: string[]) {

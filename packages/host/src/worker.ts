@@ -46,6 +46,7 @@ import { TranscriptWatch, closesTurn } from "./transcript-watch.js";
 import { drainLaunch, runFinalDrain } from "./final-drain.js";
 import { buildLaunch } from "./launch.js";
 import { addProjectIdToLaunchEnv } from "./worker-env.js";
+import { workerEgressEnvironment } from "./egress.js";
 import { claudeConfigPath, recordClaudeTrust } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
@@ -1418,6 +1419,10 @@ server.listen(socketPath(runDir, session.id), async () => {
       env.INFINITE_HOOK_URL = hookServer.url;
       env.INFINITE_HOOK_TOKEN = hookToken;
     }
+    // With autonomy.boundary.egress, the session reaches the network through the egress proxy under its own credential.
+    const egress = workerEgressEnvironment(session.projectId, session.id);
+    Object.assign(env, egress.env);
+    if (egress.status === "no-key") journal.append("lifecycle", { egress: "no-credential" });
     const relayPath = fileURLToPath(
       new URL(
         import.meta.url.endsWith(".ts") ? "./hook-relay.ts" : "./hook-relay.js",

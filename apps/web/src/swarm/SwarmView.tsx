@@ -149,26 +149,26 @@ export function SwarmView(props: SwarmViewProps) {
       </div>
       <div className="sw-glass sw-inspector" aria-live="polite">
         {selectedAgent ? <>
-          <span className="sw-inspector-fact"><RoleChip role={selectedAgent.role} /></span>
-          <span className="sw-inspector-fact"><small>{shortModel(selectedAgent.model, selectedAgent.provider)}</small></span>
+          <span className="sw-inspector-fact sw-fixed"><RoleChip role={selectedAgent.role} /></span>
+          <span className="sw-inspector-fact sw-fixed"><small>{shortModel(selectedAgent.model, selectedAgent.provider)}</small></span>
           <span className="sw-inspector-fact" title={agentTitle(selectedAgent)}>
             <StateMark state={selectedAgent.state} size={14} title={stateWords(selectedAgent.state)} />
             {stateWords(selectedAgent.state)}{selectedAgent.since ? ` ${elapsed(selectedAgent.since, now)}` : ""}
           </span>
-          {selectedAgent.tool && <span className="sw-inspector-fact">{selectedAgent.tool}</span>}
-          {selectedAgent.costUsd !== undefined && <span className="sw-inspector-fact sw-num">{usd(selectedAgent.costUsd)}</span>}
-          {selectedAgent.taskId && <span className="sw-inspector-fact"><small>task</small>{selectedAgent.taskId}</span>}
+          {selectedAgent.tool && <span className="sw-inspector-fact sw-fixed">{selectedAgent.tool}</span>}
+          {selectedAgent.costUsd !== undefined && <span className="sw-inspector-fact sw-fixed sw-num">{usd(selectedAgent.costUsd)}</span>}
+          {selectedAgent.taskId && <span className="sw-inspector-fact" title={selectedAgent.taskId}><small>task</small>{selectedAgent.taskId}</span>}
           <span className="sw-inspector-links">
             {selectedAgent.sessionId && <button type="button" className="sw-link" onClick={() => openSession(selectedAgent.sessionId!)}>session</button>}
             {selectedAgent.unitId && <button type="button" className="sw-link" onClick={() => openTeam(selectedAgent.unitId!)}>team</button>}
           </span>
         </> : selectedUnit ? <>
-          <span className="sw-inspector-fact sw-title">{selectedUnit.title}</span>
+          <span className="sw-inspector-fact sw-title" title={selectedUnit.title}>{selectedUnit.title}</span>
           <span className="sw-inspector-fact sw-dim">{selectedUnit.status}</span>
-          <span className="sw-inspector-fact">r{selectedUnit.revision}</span>
-          {selectedUnit.workers && <span className="sw-inspector-fact"><small>slots</small>{selectedUnit.workers.running}/{selectedUnit.workers.limit}</span>}
-          <span className="sw-inspector-fact" title="passed / failed / running"><small>checks</small>{selectedUnit.checks.passed}/{selectedUnit.checks.failed}/{selectedUnit.checks.running}</span>
-          {(selectedUnit.costUsd !== undefined || selectedUnit.unmeasured > 0) && <span className="sw-inspector-fact sw-num" title={unitSpend.title}>{unitSpend.text}</span>}
+          <span className="sw-inspector-fact sw-fixed">r{selectedUnit.revision}</span>
+          {selectedUnit.workers && <span className="sw-inspector-fact sw-fixed"><small>slots</small>{selectedUnit.workers.running}/{selectedUnit.workers.limit}</span>}
+          <span className="sw-inspector-fact sw-fixed" title="passed / failed / running"><small>checks</small>{selectedUnit.checks.passed}/{selectedUnit.checks.failed}/{selectedUnit.checks.running}</span>
+          {(selectedUnit.costUsd !== undefined || selectedUnit.unmeasured > 0) && <span className="sw-inspector-fact sw-fixed sw-num" title={unitSpend.title}>{unitSpend.text}</span>}
           {holdGlyph(selectedUnit.hold)}
           {terminalGlyph(selectedUnit.terminal)}
           <span className="sw-inspector-links"><button type="button" className="sw-link" onClick={() => openTeam(selectedUnit.id)}>team</button></span>
@@ -176,7 +176,7 @@ export function SwarmView(props: SwarmViewProps) {
           // An area's ID is `area:<project>:<directory>`.
           const [, project, ...path] = selection.id.split(":");
           return <>
-            <span className="sw-inspector-fact"><small>area</small>{path.join(":")}</span>
+            <span className="sw-inspector-fact" title={path.join(":")}><small>area</small>{path.join(":")}</span>
             <span className="sw-inspector-fact sw-dim">{project}</span>
           </>;
         })() : <span className="sw-inspector-empty">–</span>}

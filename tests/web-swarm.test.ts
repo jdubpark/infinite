@@ -90,6 +90,34 @@ describe("web swarm view", { skip }, () => {
     } finally { await page.close(); }
   });
 
+  test("the inspector ends a long fact in an ellipsis and keeps short facts whole", async () => {
+    const page = await open();
+    try {
+      await show(page, "wall", ".sw-tile");
+      // A narrow window leaves the inspector too little room for every fact.
+      await page.setViewportSize({ width: 1120, height: 800 });
+      await page.click(".sw-tile:has(.sw-mark-reported)");
+      await page.waitForSelector(".sw-inspector .sw-inspector-fact");
+      const facts = await page.evaluate(() => {
+        const inspector = document.querySelector(".sw-inspector")!.getBoundingClientRect();
+        return [...document.querySelectorAll(".sw-inspector .sw-inspector-fact")].map(node => ({
+          fixed: node.classList.contains("sw-fixed"), display: getComputedStyle(node).display, overflow: getComputedStyle(node).textOverflow,
+          cut: node.scrollWidth > node.clientWidth + 1, inside: node.getBoundingClientRect().right <= inspector.right + 1,
+        }));
+      });
+      const short = facts.filter(fact => fact.fixed), long = facts.filter(fact => !fact.fixed);
+      assert.ok(short.length >= 2 && long.length >= 1, "the role and model are short facts; the state is a long one");
+      assert.ok(short.every(fact => !fact.cut && fact.inside), "a short fact is never cut");
+      // Only a block box draws the ellipsis; a flex box cuts its text mid-word.
+      assert.ok(long.every(fact => fact.display === "block" && fact.overflow === "ellipsis"), "a long fact ends in an ellipsis");
+      const links = await page.evaluate(() => {
+        const inspector = document.querySelector(".sw-inspector")!.getBoundingClientRect();
+        return [...document.querySelectorAll(".sw-inspector-links button")].every(button => button.getBoundingClientRect().right <= inspector.right + 1);
+      });
+      assert.ok(links, "the links to the session and team stay inside the inspector");
+    } finally { await page.close(); }
+  });
+
   test("rows keep their order when a poll changes only updatedAt", async () => {
     const page = await open();
     try {

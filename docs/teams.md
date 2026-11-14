@@ -1752,12 +1752,31 @@ cycle's PM selects capacity for its work. The refusal uses `409` with
 | --- | --- | --- |
 | `GET /api/teams` | None; returns `{teams}` | Any paired device |
 | `GET /api/teams/:id` | None; returns reports and check evidence | Any paired device |
+| `GET /api/teams/:id/context` | None; returns the files each member's recorded tool inputs pointed at | Any paired device |
 | `POST /api/teams` | `requestId`, `projectId`, `provider`, `title`, `objective`, optional `useConfiguredLineup` | Owner |
 | `POST /api/teams/:id/steer` | `requestId`, `revision`, `text` | Owner/controller; standalone teams |
 | `POST /api/teams/:id/continue` | `requestId` (UUID), `revision`, optional trimmed `text` (1–8,000 characters) | Owner; continuable standalone blocked runs |
 | `POST /api/teams/:id/decisions/:decisionId/answer` | `requestId`, `revision`, `text` | Owner/controller |
 | `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams |
 | `POST /api/teams/:id/tasks/:taskId/rating` | `requestId`, `score` (1–5), optional `note` (≤1,000 characters) | Owner |
+
+The context response lists, for each member of the current revision and each
+earlier member still running, its repository-relative `files` with `reads`,
+`edits`, and `lastAt`, a `graphQueries` count, and `observable`, `complete`,
+and `truncated` flags. `GET /api/sessions/:id/context` returns the same shape
+for one session. These are observed tool inputs: they show what an agent's
+tools were pointed at, not that the agent used the content, and an observed
+edit is not a landed change. A session answers `observable: false` until the
+index has read a tool input that a provider hook recorded for it; with
+`complete: false` the index may still find one. That covers a provider whose
+hooks are off, a session started with native arguments or in the native UI,
+and a session before its first tool call. A session also answers
+`observable: false` when its provider is neither Claude Code nor Codex, when
+it has no host journal, and when its journal cannot be read. The index is in
+memory, bounded,
+and rebuilt on demand after a restart. `complete: false` means the index is
+still catching up, or is full of sessions being read and will admit this one
+on a later request. See [Swarm view](swarm.md).
 
 The continue request accepts exactly `requestId`, `revision`, and optional
 `text`; omit `text` when no direction is needed. A supplied direction is trimmed

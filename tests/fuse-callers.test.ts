@@ -154,8 +154,10 @@ test("a mission coordinator waits at check and at admit", async () => {
   const key = randomBytes(32);
   const created: { request: { requestId: string }; assignment: TeamAssignment; profile?: { id: string } }[] = [];
   let limit: string | undefined;
+  let hold: string | undefined;
   const manager = {
     meta: () => { throw Object.assign(new Error("Session metadata is unavailable."), { code: "ENOENT" }); },
+    hostLoad: { held: () => hold },
     createTeamSession: async (request: { requestId: string }, assignment: TeamAssignment, _cwd: string, profile?: { id: string }) => {
       if (limit) throw new Error(limit);
       created.push({ request, assignment, ...(profile ? { profile } : {}) });
@@ -217,5 +219,24 @@ test("a mission coordinator waits at check and at admit", async () => {
     limit = "The configured session limit has been reached.";
     await launch(limited as never);
     assert.deepEqual(gate.releases, [limited.sessionId], "A failed launch releases its admitted slot");
+
+    // The host's load holds a launch before the fuse is charged for it. The launch is admitted once the hold ends.
+    const held = attemptOf();
+    stored.attempts.push(held as never);
+    limit = undefined;
+    hold = "Waiting for host capacity: 5.2 GiB of memory is available, below the 8 GiB floor.";
+    const admits = gate.admits.length, sessions = created.length;
+    await launch(held as never);
+    await launch(held as never);
+    assert.equal(gate.admits.length, admits, "A launch that the host's load holds is not charged to the fuse");
+    assert.equal(created.length, sessions);
+    assert.equal(mission.reason, hold);
+    assert.equal(mission.events.filter(event => event.text.startsWith("The coordinator launch is waiting")).length, 1, "The hold is recorded once");
+    hold = undefined;
+    await launch(held as never);
+    assert.equal(gate.admits.length, admits + 1);
+    assert.equal(gate.admits.at(-1)!.launchId, held.sessionId);
+    assert.equal(created.length, sessions + 1);
+    assert.equal(mission.reason, undefined, "The hold reason clears when the coordinator starts");
   } finally { missions.close(); rmSync(root, { recursive: true, force: true }); }
 });

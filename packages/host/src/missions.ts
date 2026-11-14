@@ -18,6 +18,7 @@ import { resumeFailed } from "./native-continuation.js";
 import { HOST_LOAD_REASON_PREFIX, LaunchHeldError, holdsHostLoadReason } from "./host-load.js";
 import { applyFuseReason, workLaunch } from "./fuse/rules.js";
 import type { FuseAdmission, FuseCheck, FuseGate } from "./fuse/types.js";
+import { HALT_RUNNING_TEAM, KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 
 /** The mission's only view of projects; the project group service implements it. */
 export type ProjectGroupLookup = { get(id: string): ProjectGroup };
@@ -37,12 +38,23 @@ type Attempt = { memberId: string; sessionId: string; revision: number; prompt: 
   /** The journal position read for turn signals, and the latest turn boundary seen there. */
   signalCursor?: number; turnSignal?: { kind: string; at: string } };
 /** A subteam action recorded before it is sent, so a restart replays it under the same request ID. */
-type ChildOp = { kind: "answer" | "steer" | "pause" | "resume" | "cancel" | "parallelism"; subtaskId: string; teamId: string; requestId: string; revision?: number; decisionId?: string; text?: string; parallelism?: number; by?: "owner" | "coordinator" };
+type ChildOp = { kind: "answer" | "steer" | "pause" | "resume" | "cancel" | "parallelism"; subtaskId: string; teamId: string; requestId: string; revision?: number; decisionId?: string; text?: string; parallelism?: number; by?: "owner" | "coordinator";
+  /**
+   * Set on a pause or resume that the owner's halt queued, with the token of the mission's halt and, on a pause, the
+   * reason the paused subteam shows. The subteam decides in its own queue: a pause reaches it only while it is working,
+   * and a resume only while it is still paused under that token.
+   */
+  halt?: { token: string; reason?: string } };
 type Stored = {
   mission: Mission;
   fingerprint: string;
   requestFingerprints?: string[];
   receipts: Record<string, string>;
+  /**
+   * Set when the owner's halt paused this mission, with the mission revision it left; any owner action moves the
+   * revision on. `token` marks the subteams this halt paused, and `children` lists the ones whose pause they confirmed.
+   */
+  ownerHalt?: { haltId: string; revision: number; token: string; children: string[] };
   folder: string;
   repos: MissionPromptRepo[];
   attempts: Attempt[];
@@ -362,6 +374,78 @@ export class MissionService {
       this.save(stored); return this.view(stored);
     });
   }
+  /**
+   * Host-internal: the owner's halt pauses each planning or working mission with any repository in scope, as the
+   * owner's pause does, without an owner request, and marks it with the revision it leaves.
+   */
+  haltPause(mark: HaltMark, covers: HaltCovers) {
+    return this.enqueue(() => {
+      const outcomes: HaltOutcome[] = [];
+      for (const stored of this.records.values()) {
+        const mission = stored.mission;
+        if ((mission.status !== "planning" && mission.status !== "working") || !covers(mission.repoProjectIds, mission.id)) continue;
+        try {
+          // Only a subteam that is working now: one waiting for input, paused, blocked, or ended stays as it is.
+          const working = mission.subtasks.filter(item => {
+            if (!item.teamId || item.status !== "running") return false;
+            try { return HALT_RUNNING_TEAM.has(this.teams.get(item.teamId).status); } catch (error) { if (notFound(error)) return false; throw error; }
+          });
+          mission.revision++; mission.status = "paused"; mission.reason = mark.reason;
+          const token = randomUUID();
+          for (const subtask of working) this.queueOp(stored, { kind: "pause", subtaskId: subtask.id, teamId: subtask.teamId!, halt: { token, reason: mark.reason } });
+          stored.ownerHalt = { haltId: mark.haltId, revision: mission.revision, token, children: [] };
+          this.event(stored, `Mission paused: ${mark.reason}`); this.save(stored);
+          outcomes.push({ kind: "mission", id: mission.id, title: mission.title, result: "paused" });
+        } catch (error) { outcomes.push(pauseFailure("mission", mission.id, mission.title, error)); }
+      }
+      return outcomes;
+    });
+  }
+  /** Host-internal: resumes each mission still paused, unchanged, under this halt's mark, with the owner's resume rules. */
+  haltResume(haltId: string, heldBy: HaltHeldBy, keep: boolean) {
+    return this.enqueue(() => {
+      const outcomes: HaltOutcome[] = [];
+      for (const stored of this.records.values()) {
+        const mission = stored.mission, mark = stored.ownerHalt, base = { kind: "mission" as const, id: mission.id, title: mission.title };
+        if (mark?.haltId !== haltId) continue;
+        try {
+          if (mission.status !== "paused" || mission.revision !== mark.revision) {
+            if (mission.status === "paused" && isHaltReason(mission.reason)) mission.reason = LEFT_PAUSED;
+            stored.ownerHalt = undefined; this.save(stored);
+            outcomes.push({ ...base, result: "left", reason: LEFT_AS_IS }); continue;
+          }
+          if (keep) {
+            stored.ownerHalt = undefined; mission.reason = KEPT_PAUSED; this.save(stored);
+            outcomes.push({ ...base, result: "kept", reason: KEPT_PAUSED }); continue;
+          }
+          const other = heldBy(mission.repoProjectIds);
+          if (other) {
+            stored.ownerHalt = { ...mark, haltId: other.haltId }; mission.reason = other.reason; this.save(stored);
+            outcomes.push({ ...base, result: "held", reason: STILL_HALTED }); continue;
+          }
+          if (Date.now() >= this.deadlineMs(stored, Date.now())) {
+            const reason = "This mission's time limit has expired. Start a new mission to approve more time.";
+            stored.ownerHalt = undefined; mission.reason = releaseRefusal(reason); this.save(stored);
+            outcomes.push({ ...base, result: "refused", reason }); continue;
+          }
+          mission.revision++; mission.status = "working"; mission.reason = undefined;
+          // A halt pause that never reached its subteam is withdrawn. Each subteam the halt paused gets a resume that
+          // its own queue applies only while it is still paused under this halt's token.
+          stored.ops = stored.ops.filter(op => !(op.kind === "pause" && op.halt));
+          for (const teamId of mark.children) {
+            const subtask = mission.subtasks.find(item => item.teamId === teamId && item.status === "running");
+            if (subtask) this.queueOp(stored, { kind: "resume", subtaskId: subtask.id, teamId, halt: { token: mark.token } });
+          }
+          stored.inbox.push({ type: "resumed" });
+          this.settle(stored);
+          stored.ownerHalt = undefined;
+          this.event(stored, "Mission resumed: the owner released the halt."); this.save(stored);
+          outcomes.push({ ...base, result: "resumed" });
+        } catch (error) { outcomes.push({ ...base, result: "refused", reason: error instanceof Error ? error.message : "The mission could not resume." }); }
+      }
+      return outcomes;
+    });
+  }
   steer(id: string, input: Action & { text: string }, source?: MissionInputSource) {
     const body = missionTextSchema.parse(input);
     return this.enqueue(() => {
@@ -491,8 +575,9 @@ export class MissionService {
     mission.reason = undefined;
   }
   private queueOp(stored: Stored, op: Omit<ChildOp, "requestId">) {
-    // A cancel supersedes any earlier action on the same subteam.
+    // A cancel supersedes any earlier action on the same subteam, and a later pause supersedes a halt's resume.
     if (op.kind === "cancel") stored.ops = stored.ops.filter(item => item.teamId !== op.teamId);
+    else if (op.kind === "pause") stored.ops = stored.ops.filter(item => !(item.kind === "resume" && item.halt && item.teamId === op.teamId));
     else if (op.kind === "parallelism") stored.ops = stored.ops.filter(item => item.kind !== "parallelism" || item.teamId !== op.teamId);
     stored.ops.push({ ...op, requestId: randomUUID() });
   }
@@ -666,6 +751,20 @@ export class MissionService {
       let team: TeamView;
       try { team = this.teams.get(op.teamId); } catch (error) { if (notFound(error)) continue; throw error; }
       const settled = teamDone.has(team.status) || team.status === "cancelled";
+      if (op.halt) {
+        // The halt's own pause or resume: the subteam decides in its own queue, against the halt's token.
+        try {
+          const done = op.kind === "pause" ? await this.teams.haltPauseChild(op.teamId, op.halt.token, op.halt.reason ?? stored.mission.reason ?? "") : await this.teams.haltResumeChild(op.teamId, op.halt.token);
+          const mark = stored.ownerHalt;
+          if (op.kind === "pause" && done && mark?.token === op.halt.token && !mark.children.includes(op.teamId)) mark.children.push(op.teamId);
+        } catch (error) {
+          if (this.closed) return;
+          if (!(error instanceof TeamError)) throw error;
+          if (["members-stopping", "team-operation-running"].includes(error.code)) { remaining.push(op); continue; }
+          this.event(stored, `A ${op.kind} for subtask ${op.subtaskId} was not applied: ${error.message}`);
+        }
+        continue;
+      }
       if ((op.kind === "cancel" && settled) || (op.kind === "parallelism" && settled) || (op.kind === "pause" && (settled || ["paused", "blocked"].includes(team.status))) || (op.kind === "resume" && team.status !== "paused")) continue;
       // Steering restarts a paused or blocked subteam, so direction waits until both it and the mission are running again.
       if (op.kind === "steer" && (team.status === "paused" || stored.mission.status === "paused")) { remaining.push(op); continue; }
@@ -766,6 +865,7 @@ export class MissionService {
     try {
       if (!this.launched(attempt)) {
         const projectId = mission.repoProjectIds[0];
+        const halted = this.fuse?.held?.(mission.repoProjectIds); if (halted && this.fuseWait(stored, halted)) return;
         if (this.fuse && this.fuseWait(stored, this.fuse.check({ projectId }))) return;
         // A launch that the host's load holds is not charged to the fuse. The Manager repeats this check as its backstop.
         const hold = this.manager.hostLoad.held();
@@ -775,7 +875,7 @@ export class MissionService {
       }
       const session = await this.manager.createTeamSession({ requestId: attempt.sessionId, provider: mission.lineup.coordinator.provider, projectId: mission.repoProjectIds[0],
         title: `Mission coordinator: ${mission.title}`.slice(0, 100), prompt: attempt.prompt, ...(attempt.continuation ? { continuation: attempt.continuation } : {}) }, this.assignment(stored, attempt), stored.folder, mission.lineup.coordinator,
-      this.config.teams?.workspaceDir, this.config.teams?.trustWorkspaces === true);
+      this.config.teams?.workspaceDir, this.config.teams?.trustWorkspaces === true, { haltScope: mission.repoProjectIds });
       if (this.closed) return;
       attempt.status = "running"; attempt.startedAt ??= now();
       if (mission.reason?.startsWith(HOST_LOAD_REASON_PREFIX)) mission.reason = undefined;
@@ -790,7 +890,7 @@ export class MissionService {
         }
         return;
       }
-      if (error instanceof TeamError && error.code === "fuse-open") return;
+      if (error instanceof TeamError && (error.code === "fuse-open" || error.code === "halted")) return;
       if (error instanceof Error && /configured session limit/.test(error.message)) return;
       throw error;
     }

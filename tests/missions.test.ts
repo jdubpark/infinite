@@ -1720,3 +1720,64 @@ test("the report survives the recent-message window", { timeout: 30000 }, async 
     assert.match(prompt, /"report":\{"kind":"no-change","text":"Three exports failed last week\.\\n- export log: Rows 14, 90 and 212 were empty\."\}/);
   } finally { h.close(); }
 });
+
+const answerDispatchRefusal = "This mission answers a question and cannot start subtasks. Report the answer as a result, ask the owner a question, or report blocked.";
+const answerRequest = (): CreateMission => ({ requestId: randomUUID(), groupId: "shop", objective: "Which route serves exports?", maxSubtasks: 8, maxMinutes: 30, mode: "answer" });
+
+test("an answer mission accepts a result with no subtask", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.missions.create(answerRequest());
+    await h.report(1, { kind: "result", summary: "The answer." });
+    const mission = await until(() => h.get(id), item => item.status === "ready-for-review");
+    assert.equal(mission.mode, "answer");
+    assert.equal(mission.result?.summary, "The answer.");
+    assert.equal(mission.subtasks.length, 0);
+    assert.ok(mission.events.some(event => event.text === "The coordinator reported an answer. The mission started no subteam and changed nothing."));
+  } finally { h.close(); }
+});
+
+test("an answer mission refuses a dispatch", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.missions.create(answerRequest());
+    await h.report(1, { kind: "dispatch", summary: "Fix it", subtasks: [plan("a", "api")] });
+    const refusal = (await h.messages(2)).find((message: { type: string }) => message.type === "refused");
+    assert.equal(refusal.kind, "dispatch");
+    assert.equal(refusal.reason, answerDispatchRefusal);
+    const mission = h.get(id);
+    assert.equal(mission.subtasks.length, 0);
+    assert.equal(h.created.length, 0, "No team run was created");
+  } finally { h.close(); }
+});
+
+test("a mission without a mode still refuses a result before any subtask finished", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "result", summary: "Done" });
+    const refusal = (await h.messages(2)).find((message: { type: string }) => message.type === "refused");
+    assert.match(refusal.reason, /^No subtask has finished/);
+    assert.equal(h.get(id).mode, undefined);
+  } finally { h.close(); }
+});
+
+test("the answer-mode coordinator prompt says it can only read and cannot dispatch", { timeout: 30000 }, async () => {
+  const h = scripted();
+  try {
+    const answer = await h.missions.create(answerRequest());
+    const plain = await h.create();
+    const repos = [{ projectId: "api", name: "API", path: "/srv/infinite-data/api", teamReady: true }];
+    const context = { openChildDecisions: [], waiting: 0 };
+    for (const build of [missionPromptWithMessageCount, missionFollowUpPromptWithMessageCount]) {
+      const prompt = build(answer, repos, [], 1, "claude", lineup.coordinator, context).prompt;
+      assert.match(prompt, /cannot start subtasks/);
+      assert.match(prompt, /other N \| /);
+      assert.doesNotMatch(prompt, /Choose the initial team limit/);
+      assert.doesNotMatch(prompt, /"kind":"dispatch"/);
+    }
+    const initial = missionPromptWithMessageCount(plain, repos, [], 1, "claude", lineup.coordinator, context).prompt;
+    assert.match(initial, /Choose the initial team limit/);
+    assert.doesNotMatch(initial, /cannot start subtasks/);
+  } finally { h.close(); }
+});

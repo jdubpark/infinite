@@ -69,16 +69,16 @@ The owner's direction on 2026-11-14: one separate permission agent, not tied to 
 
 ### Authority: the workspace delegation
 
-The owner records one delegation for each workspace. The record is keyed by the group id. It holds the owner device, the time, the host projects it covers with the repository identity of each, the interrupt classes in force, the policy version, and optional owner direction text.
+The owner records one delegation for each workspace. The record is keyed by the group id. It holds the host projects it covers, each with the owner act that covered it (the owner device and the time), the interrupt classes in force, the policy version, and optional owner direction text.
 
 - Only an owner client can record, change or revoke it: `infinite permissions delegate [--workspace W | --all]`, `infinite permissions revoke`, `infinite permissions status`, and the matching API with the same owner-client check as repository enrollment.
 - A session is covered when its stored project id is in the record. The host resolves the session to a workspace through that project id, never through a path.
-- An opt-out is recorded for one project and always wins over automatic coverage. Only an explicit `permissions delegate` replaces it.
-- A new checkout of a repository that the record already covers, with no opt-out, is admitted when it folds into the workspace. The host adds its project id to the record as an automatic admission, with the repository identity and the time. A checkout with no captured identity is never admitted automatically.
-- A project of another repository that the owner groups into the workspace later is not covered until the owner records the delegation again. `permissions status` shows such a workspace as partly delegated.
-- A project that the owner moves out of the workspace loses its coverage at once. When the host itself folds a covered checkout into its repository's group, the delegation follows the checkout.
+- Only an owner act covers a project: `permissions delegate` for the projects that are in the workspace at that time, or the owner's onboarding of that project. Group membership alone never grants coverage, and repository identity that the host reads from a checkout is not authority.
+- A project that joins a delegated workspace later, by a host fold or by the owner's grouping, is not covered until an owner act covers it. `permissions status` shows such a workspace as partly delegated.
+- An opt-out is recorded for one project. Only an explicit `permissions delegate` replaces it.
+- A project that the owner moves out of the workspace loses its coverage at once. When the host itself folds a covered checkout into its repository's group, that checkout keeps its coverage and no other project gains any.
 - A workspace with no record has no permission agent. Its requests wait for the owner, with today's notifications.
-- Owner-initiated onboarding of a repository records the delegation for its workspace by default. `--permissions off` records an opt-out for that project. This keeps today's product rule.
+- Owner-initiated onboarding of a project covers that project in its workspace by default. `--permissions off` records an opt-out for that project. This keeps today's product rule.
 - A revoke stops new decisions at once. Decisions that are pending for that workspace are retired and never applied. `infinite team revoke-permissions TEAM_ID` still returns one run's requests to the owner.
 - The record pins the interrupt classes. A host release can add a class to existing delegations. It cannot remove one: a shorter list needs a new delegation from the owner.
 - Owner direction text can only narrow what the permission agent allows in that workspace. The interrupt classes and the host rules apply whatever the text says. A change to the text changes the authority: earlier verdicts are not replayed and open rejects are closed.
@@ -105,7 +105,7 @@ Until a slice covers a session kind, requests of that kind are handled as today.
 
 ### Decision pipeline
 
-Each step either ends the request or passes it on.
+Each step either ends the request or passes it on. The order is the precedence: class rules, then the lock, then an eligible replay, and only then the choice of tier for a fresh turn.
 
 1. **Class rules** (host). A host rule that establishes an interrupt class sends the request to the owner. No model turn runs, no verdict can allow it, and no recorded verdict is replayed for it. Class rules run first, on whatever the request shows, so they also catch a request that offers no one-shot choice. Each class has established predicates:
    - Production or staging: an action that the workspace's delivery or deployment configuration, or the host's own release tooling, names as a deploy, promote, roll-out or release command.
@@ -118,7 +118,7 @@ Each step either ends the request or passes it on.
 2. **Qualify** (host). The request must have complete evidence and a one-shot accept and reject choice. This is the structural part of today's check. The destructive flag no longer disqualifies a request. It raises it in step 5. Bounded evidence collection and the guarded display expansion run as today.
 3. **Lock** (host). A request from a locked assignment gets a reject with `locked`. See "Rejected requests and probing".
 4. **Replay** (host). An identical request under the same authority gets the recorded verdict again, with no model turn. The reuse key stays as it is today, without the run's decision limit. The host checks eligibility first. An `allow` is replayed only when the task has no open reject that was recorded after it. A reject is replayed unless the owner reopened it. `unavailable` and `locked` results are never replayed. A strong verdict is replayed only when its reviewer's family also differs from the current requester's.
-5. **Raise** (host). Some requests must go to the strong tier: a request with the destructive flag, a target outside the session root, a publish, deploy, release or promote verb that no class rule matched, privilege elevation, a credential-like or payment-like name, a settings file inside the session root, and any request from an assignment that has a reject in its history. Raise rules are broad on purpose. They only select the tier.
+5. **Raise** (host). Some requests must go to the strong tier: a request with the destructive flag, a target outside the session root, a publish, deploy, release or promote verb that no class rule matched, privilege elevation, a credential-like or payment-like name, a settings file inside the session root, and any request from an assignment that has a reject in its history. Raise rules are broad on purpose. They only select the tier of a fresh turn.
 6. **Light turn**. The light model reports `allow` or `refer`. It cannot reject, and it cannot send a request to the owner.
 7. **Strong turn**. A strong model whose family differs from the requester's reports `allow`, `reject` with a reason code and a note, or `owner` with an interrupt class and a note. An `allow` must state that no interrupt class applies. The strong model can request up to eight source paths for bounded read-only collection, as today.
 8. **No confident verdict**. A strong model that is not sure reports `reject` with `uncertain`. An invalid report, an expired review window, or no qualifying strong profile is a reject with `unavailable`, after the host retried inside the five-minute window.
@@ -139,9 +139,10 @@ The journal keeps each assignment's rejects. They survive a rotated conversation
 - An **evidence reject** has the code `incomplete` or `uncertain`. It is replayed for the identical request. A clearer request gets a fresh review.
 - An `unavailable` or `locked` result is neither. The same request can be reviewed again.
 - Every model turn for a task receives that task's open rejects and the requesting assignment's evidence rejects: for each, the tool, the action as the host extracted it, and the reason code. The policy tells the model to reject a request that has the same effect as an open reject, whatever tool or spelling it uses, and to report which open reject it repeats.
-- An assignment with a reject in its history is always raised to the strong tier.
-- When the strong tier rejects a request as a repeat of an open reject, the host counts the repeat on that open reject. At the second repeat from one assignment, that assignment is **locked**: each later request from it is rejected with `locked` and no model turn. Unrelated rejects and reviewer outages never lock.
-- The lock belongs to the assignment, so a replacement member inherits it. It ends when the owner reopens the repeated reject, when the owner unlocks the assignment with `infinite permissions unlock`, or when the task ends. A locked assignment is shown as blocked on a permission. In a team run the coordinator sees that state through the existing blocked-member path, as a fixed host status.
+- An assignment with a reject in its history gets the strong tier for every fresh turn.
+- A **repeat** is a new request that replays an effect reject, or one that the strong tier rejects as having the same effect as an open reject. The host counts a repeat once for each request, never for a delivery retry, and always against the original open reject, also when the model cites a later repeat. The host accepts a cited reject only when it is open and belongs to the current task, and it takes the assignment from the authenticated request, never from the model's report.
+- At the second repeat of one open reject from one assignment, that assignment is **locked**: each later request from it is rejected with `locked` and no model turn. Unrelated rejects and reviewer outages never lock.
+- The lock belongs to the assignment, so a replacement member inherits it. It ends when the owner reopens the repeated reject, when the owner unlocks the assignment with `infinite permissions unlock`, or when the task ends. Either owner act resets the count. Whether two requests have the same effect is the model's judgment, so the journal keeps the cited reject and the evidence of each repeat for the owner's review. A locked assignment is shown as blocked on a permission. In a team run the coordinator sees that state through the existing blocked-member path, as a fixed host status.
 - The owner reopens a reject with `infinite permissions reopen DECISION_ID`. Reopening allows nothing. It closes the reject, removes it from replay, and lets the same request be reviewed again.
 
 The lock is a targeted stop for one assignment that asked three times for an effect that was rejected. It is not a limit on the permission agent's decisions.
@@ -262,14 +263,14 @@ A strong profile from a second family needs a noninteractive, tool-less reviewer
 
 Focused tests protect the authority rules. Each one fails if the rule is removed:
 
-- No request is allowed for a project with no delegation, after a revoke, under a retired authority, on a host that is not ready, or for a project of another repository grouped into a workspace after its delegation. A new checkout of a covered repository is admitted and recorded. A checkout with an opt-out is not admitted.
+- No request is allowed for a project with no delegation, after a revoke, under a retired authority, on a host that is not ready, or for a project that joined a delegated workspace after its delegation, by a host fold or by the owner's grouping. A project whose scanned identity names a covered repository gains no coverage. Onboarding with an opt-out covers nothing.
 - For each of the five classes, a concrete request that matches its class rule reaches the owner with no model turn, cannot be allowed by a report, and is not replayed. A persistent-only approval and a workspace trust prompt reach the owner although they offer no one-shot choice.
 - The light tier cannot produce a reject or an owner route. A host rule cannot produce an allow.
 - A raised request never gets a light verdict. A request with the destructive flag is not delivered on a light verdict.
 - The strong tier's family differs from the requester's, also on replay. With no such profile, or with a requester family that the host cannot establish, the result is `unavailable`.
 - A notice, a recovery outcome and a run status contain no model text.
 - The owner is pushed only in the situations of the notification table.
-- An open reject reaches the next turn after a conversation rotation, a member replacement and a restart. An assignment with a reject is raised. A second repeat of one open reject locks the assignment with no model turn, also for a replacement member. Three unrelated rejects, or reviewer outages, do not lock. Reopening the reject ends the lock and allows nothing.
+- An open reject reaches the next turn after a conversation rotation, a member replacement and a restart. An assignment with a reject is raised. A second repeat of one open reject locks the assignment with no model turn, also for a replacement member, also when the repeats are replays, and also when the model cites a later repeat. A cited reject that is closed or belongs to another task is not counted. An owner unlock resets the count. Three unrelated rejects, or reviewer outages, do not lock. Reopening the reject ends the lock and allows nothing.
 - An identical reject replays with no model turn. A reopened reject, a changed direction text, and an open reject newer than a recorded allow each stop the replay.
 - An owner grant is used once, only by its session and only for its evidence, and never after an uncertain delivery.
 - A permission agent turn cannot get its own request decided.
@@ -304,12 +305,12 @@ The amended `PRODUCT.md` text is the authority rule, and it is true from slice 3
 
 - "Workspace" is read as a project group as the clients show it. A session whose project has no delegation stays with the owner.
 - Decision 4 is read as: drop both the count limit and the spend fuse. The rate is tracked and shown, and nothing stops on it.
-- A workspace created later gets the delegation by default when the owner onboards a repository into it, and `--permissions off` opts out. A repository that the owner groups into a delegated workspace later needs the delegation recorded again.
+- A project that the owner onboards later is covered by default, and `--permissions off` opts out. A project that joins a delegated workspace any other way needs `permissions delegate`.
 - `permissions delegate` replaces a saved opt-out or custom scope and prints what it replaced.
 - The light tier can only allow or refer. Every reject and every owner route comes from the strong tier or a host rule.
 - The requester receives a fixed notice and a code, never the model's reason. The reason is kept for the owner.
 - An assignment that repeats one rejected request twice is locked until the owner reopens that reject or unlocks it. This is a targeted stop, added as a guardrail under decision 4.
-- An opt-out on a project always wins over automatic coverage.
+- Only an owner act covers a project. Joining a delegated workspace does not, and neither does a repository identity read from the checkout.
 - When the host cannot establish a requester's model family, a request that needs the strong tier is rejected with `unavailable`.
 - The class rules are the host's established predicates for the five classes. A wider match only raises the tier.
 - A request that no qualifying model can review inside five minutes is rejected with `unavailable`. It does not wait for the owner.

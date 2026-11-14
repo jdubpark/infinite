@@ -922,8 +922,14 @@ these events in the project; no signal starts an agent by itself.
   through the same gates and gap.
 - While the goal is paused or stopped it reads nothing and keeps its cursor.
   After a resume it reads the backlog, 50 signals per pass.
-- When the inbox cannot be read, the goal reads no signals and keeps its
-  cadence.
+- Signals that arrive together start one cycle. The goal starts nothing while
+  more signals wait than one pass reads, so a large batch delays the start by
+  a few seconds and never splits into two cycles.
+- An early start needs a readable inbox. While the inbox cannot be read, a goal
+  with `wakeOn` reads no signals and keeps its cadence; a cycle that starts on
+  the cadence leaves the waiting signals and owner direction for the next
+  start that can read the whole inbox. Steering text still joins that cycle's
+  objective.
 
 ## Linear tracking
 
@@ -1561,9 +1567,9 @@ Only the owner can add a signal, and only owner signals carry text. The host
 never copies text from a commit, a pull request, an issue, or an agent into a
 signal. Scan signals hold commit and run IDs only.
 
-A signal starts nothing by itself. A [routine](#scheduled-routines) with
-`wakeOn` reads the inbox on its own scheduler pass and decides within its own
-limits.
+A signal starts nothing by itself. A [routine](#scheduled-routines) or a
+[standing goal](#wake-on-signals) with `wakeOn` reads the inbox on its own
+scheduler pass and decides within its own limits.
 
 The host keeps signals for 30 days, and at most 20,000 across all projects. The
 oldest go first. A reader whose place is older than the oldest kept signal

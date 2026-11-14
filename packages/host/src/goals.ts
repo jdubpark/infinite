@@ -11,7 +11,8 @@ import { addRollups, emptyRollup, type StoredRollup, type UsageRollup } from "./
 import type { LinearService } from "./linear.js";
 import { applyFuseReason } from "./fuse/rules.js";
 import type { FuseGate } from "./fuse/types.js";
-import { addToPendingWake, type PendingWake, type ProjectSignal, type SignalReader } from "./signals/types.js";
+import { readSignals } from "./signals/consume.js";
+import { addToPendingWake, type PendingWake, type SignalReader } from "./signals/types.js";
 import { cadenceDue, classifyCycle, cycleWakeOf, defaultWakeMinGapMinutes, foldedCycles, isReviewed, keptCycles, latestReviewed, maxFailedCycles, maxPreviousWork, restoreWake, runObjectiveLimitBytes, unresolvedOperation, wakeObjective } from "./goal-standing.js";
 
 type Action = { requestId: string; revision: number };
@@ -20,6 +21,8 @@ type PendingControl = { action: "pause" | "resume" | "cancel" | "steer" | "paral
 type GoalExtensionIntent = Action & { minutes: number; fingerprint: string; teamId?: string; targetDeadlineAt?: string; targetCeilingAt?: string; failures?: number };
 /** `wake` is the standing goal's pending wake this launch consumed, returned to the goal if the run is never created. */
 type PendingLaunch = { request: CreateTeam; context: TeamGoalContext; autonomy?: AutonomyMode; wake?: PendingWake };
+/** How much of the signal inbox a pass has folded into a goal's pending wake. */
+type InboxState = "current" | "behind" | "unknown";
 type Stored = {
   goal: ProductGoal;
   fingerprint: string;
@@ -544,7 +547,7 @@ export class GoalService {
       this.block(stored, reason); this.setControl(stored, "cancel"); this.event(stored, reason);
     }
     this.save(stored);
-    if (goal.standing) this.readSignals(stored);
+    const inbox = goal.standing ? this.readWake(stored) : "current";
     const trackingReady = !goal.linear || goal.linear.status === "synced";
     // Mirror first: a paused team's approved extension still protects the goal from its old deadline.
     if (goal.activeTeamId) {
@@ -659,7 +662,7 @@ export class GoalService {
       if (!goal.events.some(event => event.text === cleanupEvent)) { this.event(stored, cleanupEvent); this.save(stored); }
     }
     if (terminal.has(goal.status) || goal.status === "paused") return;
-    if (goal.standing) { await this.startStandingCycle(stored, trackingReady); return; }
+    if (goal.standing) { await this.startStandingCycle(stored, trackingReady, inbox); return; }
     const timeUp = Date.now() >= Date.parse(goal.deadlineAt) && !this.teamExtendable(stored);
     if (timeUp || (!goal.activeTeamId && goal.memberCount >= goal.maxMembers)) {
       goal.status = "limit-reached";
@@ -679,8 +682,11 @@ export class GoalService {
     if (fuse.wait) return;
     await this.prepare(stored, goal.cycles.length + 1, Math.min(60, goal.maxMembers - goal.memberCount));
   }
-  /** Records the next cycle's launch, consuming a standing goal's pending wake in the same write, then starts it. */
-  private async prepare(stored: Stored, cycle: number, maxMembers: number) {
+  /**
+   * Records the next cycle's launch, consuming a standing goal's pending wake in the same write, then starts it.
+   * With `useWake` false the pending wake stays on the goal: it may hold half of a batch.
+   */
+  private async prepare(stored: Stored, cycle: number, maxMembers: number, useWake = true) {
     const goal = stored.goal;
     const parent = latestReviewed(goal.cycles);
     const sourceIssue = goal.linear?.issue;
@@ -690,7 +696,7 @@ export class GoalService {
       previousWork: goal.cycles.filter(isReviewed).slice(-maxPreviousWork).map(value => `${value.brief?.title ?? `Feature ${value.cycle}`}: ${value.brief?.expectedOutcome ?? "Reviewed change"}`.slice(0, 2000)),
       deadlineAt: goal.deadlineAt, maxMembers, ...(parent ? { parentRunId: parent.teamId } : {}),
       extendMinutes: goal.extendMinutes ?? 0, ceilingAt: ceilingOf(goal) };
-    const wake = goal.standing ? goal.pendingWake : undefined;
+    const wake = goal.standing && useWake ? goal.pendingWake : undefined;
     const objective = wakeObjective([goal.objective, ...goal.steering.map(value => `User direction: ${value.text}`)].join("\n\n"), wake);
     // Every cycle of a goal keeps the goal's pinned mode; a goal with no pin is supervised.
     const autonomy = autonomyOf(goal);
@@ -702,8 +708,11 @@ export class GoalService {
   /**
    * The boundary between standing cycles. In order: the mode rule (3.4 rule 3), the lineup block (rule 7), the failure
    * count (rule 5), the cadence or an eligible wake, Linear tracking, and the fuse. Only then do allowances renew.
+   *
+   * `inbox` is what this pass read of the signal inbox. Only a `current` pending wake starts a cycle early or is used
+   * up by a launch, and nothing starts while the goal is `behind`, so the signals of one batch start one cycle.
    */
-  private async startStandingCycle(stored: Stored, trackingReady: boolean) {
+  private async startStandingCycle(stored: Stored, trackingReady: boolean, inbox: InboxState) {
     const goal = stored.goal, standing = goal.standing!;
     if (goal.activeTeamId || stored.launch) return;
     // A project that is no longer enrolled reads as supervised too, so the goal pauses instead of ending.
@@ -714,23 +723,32 @@ export class GoalService {
       this.event(stored, goal.reason); this.save(stored); return;
     }
     if ((goal.failedCycles ?? 0) >= maxFailedCycles) return this.hold(stored, "paused", "repeated-failures", repeatedFailuresReason);
+    // More signals wait than one pass reads. No cycle starts until the pending wake holds them all.
+    if (inbox === "behind") return;
     const last = goal.cycles.at(-1);
+    let early = false;
     if (last) {
       const settled = Date.parse(last.settledAt ?? last.finishedAt ?? now());
-      const woken = goal.pendingWake !== undefined && Date.now() >= settled + this.wakeGapMinutes() * 60000;
-      if (Date.now() < cadenceDue(last, standing.cadenceMinutes, Date.now()) && !woken) return;
+      const woken = inbox === "current" && goal.pendingWake !== undefined && Date.now() >= settled + this.wakeGapMinutes() * 60000;
+      early = Date.now() < cadenceDue(last, standing.cadenceMinutes, Date.now());
+      if (early && !woken) return;
     }
     if (stored.launchRetryAt && Date.now() < Date.parse(stored.launchRetryAt)) return;
     if (!trackingReady) return;
     const fuse = applyFuseReason(goal, this.fuse?.check({ projectId: goal.projectId }));
     if (fuse.changed) { if (fuse.wait) this.event(stored, goal.reason!); this.save(stored); }
     if (fuse.wait) return;
+    // The pass waited since its first read. A signal recorded meanwhile belongs to this cycle, so the inbox is read once
+    // more; nothing below waits before the launch is saved. An early start needs the whole inbox. A cadence start does
+    // not wait for an unreadable inbox, and it leaves the pending wake alone.
+    const latest = this.readWake(stored);
+    if (latest === "behind" || (latest !== "current" && early)) return;
     // Allowances renew for each cycle (3.2), and the cycle takes the host's current lineup (3.5).
     const startedAt = Date.now();
     goal.deadlineAt = new Date(startedAt + goal.maxMinutes * 60000).toISOString();
     goal.ceilingAt = new Date(startedAt + (goal.maxTotalMinutes ?? goal.maxMinutes) * 60000).toISOString();
     goal.lineup = structuredClone(this.config.teams!.lineup!);
-    await this.prepare(stored, foldedCycles(goal) + goal.cycles.length + 1, Math.min(60, goal.maxMembers));
+    await this.prepare(stored, foldedCycles(goal) + goal.cycles.length + 1, Math.min(60, goal.maxMembers), latest === "current");
   }
   /** Whether the team service holds the run of this request; a launch intent without one never created its run. */
   private runCreated(requestId: string) { return this.teams.goalIdOf(requestId) !== undefined; }
@@ -780,28 +798,38 @@ export class GoalService {
     goal.status = "running"; goal.reason = undefined;
     if ((goal.failedCycles ?? 0) >= maxFailedCycles) this.hold(stored, "paused", "repeated-failures", repeatedFailuresReason);
   }
-  /** W2: folds new signals from other runs into the pending wake and advances the cursor, in one write. */
-  private readSignals(stored: Stored) {
+  /**
+   * W2: folds new signals from other runs into the pending wake and advances the cursor, in one write. A paused or
+   * ended goal reads nothing and keeps its place.
+   *
+   * The result says how much of the inbox the pending wake now holds. `current`: every signal recorded so far, also
+   * when the goal watches no signals. `behind`: one pass reads one page, and more signals wait. `unknown`: the inbox
+   * was not read. Nothing more is stored for this: after a restart the saved cursor gives the same answer.
+   */
+  private readWake(stored: Stored): InboxState {
     const goal = stored.goal, kinds = goal.standing?.wakeOn;
-    if (!kinds?.length || !this.signals || goal.status === "paused" || terminal.has(goal.status)) return;
-    if (goal.signalCursor === undefined) {
-      const head = this.signalHead();
-      if (head !== undefined) { goal.signalCursor = head; this.save(stored); }
-      return;
+    if (!kinds?.length || !this.signals) return "current";
+    if (goal.status === "paused" || terminal.has(goal.status)) return "unknown";
+    let pending = goal.pendingWake, read: ReturnType<typeof readSignals>;
+    try {
+      read = readSignals(this.signals, goal.projectId, goal.signalCursor, kinds);
+      if (!read) return "unknown";
+      if (read.signals.length) {
+        const own = new Set(goal.cycles.map(cycle => cycle.teamId));
+        if (stored.launch) own.add(stored.launch.request.requestId);
+        pending = addToPendingWake(pending, read.signals.filter(signal =>
+          !(signal.runId && (own.has(signal.runId) || this.teams.goalIdOf(signal.runId) === goal.id))), now());
+      }
+    } catch {
+      // The reader must not throw. If it does, or the goal's own runs cannot be told, nothing is read on this pass.
+      return "unknown";
     }
-    const cursor = goal.signalCursor;
-    let read: ProjectSignal[];
-    try { read = this.signals.after(goal.projectId, cursor, { kinds, limit: 50 }); }
-    catch { return; }
-    const fresh = read.filter(signal => Number.isInteger(signal.seq) && signal.seq > cursor);
-    if (!fresh.length) return;
-    const own = new Set(goal.cycles.map(cycle => cycle.teamId));
-    if (stored.launch) own.add(stored.launch.request.requestId);
-    const wakes = fresh.filter(signal => signal.projectId === goal.projectId && kinds.includes(signal.kind) &&
-      !(signal.runId && (own.has(signal.runId) || this.teams.goalIdOf(signal.runId) === goal.id)));
-    goal.pendingWake = addToPendingWake(goal.pendingWake, wakes, now());
-    goal.signalCursor = Math.max(...fresh.map(signal => signal.seq));
+    const state = read.more ? "behind" : "current";
+    if (read.cursor === goal.signalCursor && pending === goal.pendingWake) return state;
+    goal.signalCursor = read.cursor;
+    if (pending) goal.pendingWake = pending;
     this.save(stored);
+    return state;
   }
   private cycleEntry(goal: ProductGoal, team: TeamView, pending: PendingLaunch): GoalCycle {
     return { teamId: team.id, cycle: pending.context.cycle, goalRevision: pending.context.revision, status: team.status, startedAt: team.createdAt, memberCount: team.members.length, autonomy: autonomyOf(pending),

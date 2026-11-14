@@ -435,6 +435,8 @@ export function createApp(config: Config, key: Buffer) {
     return goals.understandingRecords().filter(goal => wanted.has(goal.id))
       .flatMap(goal => [...goal.cycles.map(cycle => cycle.teamId), ...(goal.activeTeamId ? [goal.activeTeamId] : [])]);
   });
+  // A standing goal reads the same inbox. It drops signals about its own cycles' runs itself.
+  goals.useSignals(signals.reader());
   fuse.start();
   const desktopResources = new DesktopResources(config, listSessions);
   const changeProjectFiles = async <T>(projectId: string, action: () => Promise<T>) => {

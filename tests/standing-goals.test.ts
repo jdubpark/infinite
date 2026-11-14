@@ -304,6 +304,66 @@ test("a host signal starts the next cycle once before its cadence; the goal's ow
   assert.equal(fourth.context.cycle, 4, "With the inbox unreadable, the cadence still starts cycles");
 });
 
+test("signals that arrive together start one cycle, and a cadence start with the inbox unreadable leaves a half-read batch waiting", async t => {
+  const { teams, goals, advance } = fixture(t);
+  const signals: ProjectSignal[] = [];
+  // The inbox answers this many more head reads, then becomes unreadable.
+  let headReads = Infinity;
+  const reader: SignalReader = {
+    head: () => headReads-- > 0 ? signals.length : undefined,
+    after: (projectId, seq, options) => signals.filter(signal => signal.projectId === projectId && signal.seq > seq && (!options?.kinds || options.kinds.includes(signal.kind))).slice(0, options?.limit ?? 50),
+  };
+  const batch = () => Array.from({ length: 51 }, () => {
+    const signal: ProjectSignal = { seq: signals.length + 1, id: randomUUID(), projectId: "fixture", kind: "external-commit", key: randomUUID(), at: new Date().toISOString() };
+    signals.push(signal);
+    return signal;
+  });
+  goals.useSignals(reader);
+  const created = await goals.create(standing({}, 1440, ["external-commit"]));
+  goals.start();
+  const first = await until(() => teams.launches[0], Boolean);
+  teams.settle(first.request.requestId, "no-change");
+  await until(() => goals.get(created.id), goal => !goal.activeTeamId);
+  advance(10);
+
+  // One more signal than a pass reads, recorded between two passes: the start waits a pass and takes the whole batch.
+  const together = batch();
+  await until(() => teams.launches[1], Boolean);
+  const woken = await until(() => goals.get(created.id), goal => goal.cycles.length === 2);
+  assert.deepEqual(woken.cycles[1]!.wake, { signalIds: together.slice(-20).map(signal => signal.id), dropped: 31 });
+  assert.equal(woken.signalCursor, 51);
+  assert.equal(woken.pendingWake, undefined);
+  teams.settle(woken.cycles[1]!.teamId, "no-change");
+  await until(() => goals.get(created.id), goal => !goal.activeTeamId);
+  advance(10);
+  await sleep(1200);
+  assert.equal(teams.launches.length, 2, "The rest of the batch starts no second cycle");
+
+  // The inbox fails after one pass read half of a new batch. The gap has passed, and nothing starts early.
+  const halfRead = batch();
+  headReads = 2;
+  await until(() => goals.get(created.id), goal => goal.signalCursor === 101);
+  await sleep(1200);
+  assert.equal(teams.launches.length, 2, "A wake that may be half a batch starts nothing");
+  // The cadence still starts a cycle, and it leaves the half-read batch on the goal.
+  advance(1440);
+  await until(() => teams.launches[2], Boolean);
+  const scheduled = await until(() => goals.get(created.id), goal => goal.cycles.length === 3);
+  assert.equal(scheduled.cycles[2]!.wake, undefined);
+  assert.equal(scheduled.pendingWake?.signals.length, 20);
+  assert.doesNotMatch(teams.launches[2]!.request.objective, /Host wake reasons/);
+
+  // With the inbox back, the whole batch starts one cycle.
+  headReads = Infinity;
+  teams.settle(scheduled.cycles[2]!.teamId, "no-change");
+  await until(() => goals.get(created.id), goal => !goal.activeTeamId && goal.signalCursor === 102);
+  advance(10);
+  await until(() => teams.launches[3], Boolean);
+  const whole = await until(() => goals.get(created.id), goal => goal.cycles.length === 4);
+  assert.deepEqual(whole.cycles[3]!.wake, { signalIds: halfRead.slice(-20).map(signal => signal.id), dropped: 31 });
+  assert.equal(whole.pendingWake, undefined);
+});
+
 test("a cycle whose reported merge the host did not validate blocks the goal before another cycle starts", async t => {
   const { teams, goals, advance } = fixture(t);
   const created = await goals.create(standing());

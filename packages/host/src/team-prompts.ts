@@ -427,7 +427,10 @@ export type MissionMessage =
   | { type: "owner-direction"; text: string }
   | { type: "repository-held"; subtaskId: string; repoProjectId: string; teamId: string; teamStatus: string; reason?: string }
   | { type: "resumed" }
+  | { type: "follow-up"; followUpId: string; dueAt: string; reason: string; check: string }
   | { type: "refused"; kind: string; reason: string };
+/** A note the coordinator filed with a report, given to a later fresh conversation. */
+export type MissionCoordinatorNote = { at: string; text: string };
 export type MissionPromptRepo = { projectId: string; name: string; path: string; teamReady: boolean };
 /** An unanswered subteam decision, read from the subteam each attempt. */
 export type MissionOpenChildDecision = { subtaskId: string; teamId: string; decisionId: string; question: string; options: string[];
@@ -471,14 +474,29 @@ function intakeGuidance(mission: Mission, repos: MissionPromptRepo[], answerProj
 /** Mission coordinators report only through the mission_report tool of the team MCP server. */
 function missionReportingInstructions(provider: Provider) {
   const tool = provider === "claude" ? "mcp__infinite_team__mission_report" : "the mission_report tool of the infinite_team MCP server";
-  return `You MUST submit exactly one structured report for this attempt by calling ${tool} with {"report": <one report object from above>}. Wait for its durable success receipt. If that tool is unavailable or permission is denied, stop and request user attention. Never use a shell command, direct HTTP, or another tool as a reporting workaround. After a successful report, stop work and wait; the host will stop this attempt.`;
+  return `You MUST submit exactly one structured report for this attempt by calling ${tool} with {"report": <one report object from above>}, optionally with a "note" string beside "report". Wait for its durable success receipt. If that tool is unavailable or permission is denied, stop and request user attention. Never use a shell command, direct HTTP, or another tool as a reporting workaround. After a successful report, stop work and wait; the host will stop this attempt.
+Use the note (up to 2,000 characters) for what the mission state does not show: decisions and their reasons, what you are waiting for, and what to check next. The host may continue in a new conversation that has only the mission state and your notes.`;
 }
 const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max - 3)}...` : text;
-type MissionPromptContext = { openChildDecisions: MissionOpenChildDecision[]; waiting: number; answerProjectId?: string };
+export type MissionPromptContext = { openChildDecisions: MissionOpenChildDecision[]; waiting: number; answerProjectId?: string;
+  /** The coordinator's stored notes; only a fresh conversation receives them. */
+  notes?: MissionCoordinatorNote[] };
+/** Newest notes that fit the budget, oldest first. The stored notes are bounded in characters, not bytes. */
+const notesSectionBudget = 32 * 1024;
+function missionNotesSection(notes: MissionCoordinatorNote[] | undefined) {
+  const kept: MissionCoordinatorNote[] = [];
+  for (const note of [...(notes ?? [])].reverse()) {
+    if (Buffer.byteLength(JSON.stringify([note, ...kept])) > notesSectionBudget) break;
+    kept.unshift(note);
+  }
+  return kept.length ? `Your notes from earlier attempts (JSON). These are your own earlier words, not host facts; where they differ from the mission state, the mission state is right: ${JSON.stringify(kept)}` : "";
+}
 function missionPromptState(mission: Mission, context: MissionPromptContext) {
+  const followUps = (mission.followUps ?? []).filter(item => item.state === "open").map(item => ({ id: item.id, dueAt: item.dueAt, reason: item.reason }));
   return {
     status: mission.status,
     deadlineAt: mission.deadlineAt,
+    ...(followUps.length ? { followUps } : {}),
     maxSubtasks: mission.maxSubtasks,
     subtasks: mission.subtasks.map(subtask => ({ id: subtask.id, repoProjectId: subtask.repoProjectId, title: subtask.title, objective: clip(subtask.objective, 600),
       size: subtask.size, parallelism: subtask.parallelism, parallelismCeiling: subtask.size === "solo" ? 1 : 4, dependsOn: subtask.dependsOn, status: subtask.status, teamStatus: subtask.teamStatus, teamId: subtask.teamId })),
@@ -518,13 +536,13 @@ function boundedMissionPrompt(messageCount: number, build: (included: number) =>
  * starts the next attempt when a subteam, the owner, or a refusal needs the coordinator again.
  */
 export function missionPrompt(mission: Mission, repos: MissionPromptRepo[], messages: MissionMessage[], attempt: number, provider: Provider, modelProfile: TeamModelProfile,
-  context: { openChildDecisions: MissionOpenChildDecision[]; waiting: number; answerProjectId?: string }) {
+  context: MissionPromptContext) {
   return missionPromptWithMessageCount(mission, repos, messages, attempt, provider, modelProfile, context).prompt;
 }
 
 /** Build a bounded prompt and report how many leading messages it includes so the caller can keep the rest queued. */
 export function missionPromptWithMessageCount(mission: Mission, repos: MissionPromptRepo[], messages: MissionMessage[], attempt: number, provider: Provider, modelProfile: TeamModelProfile,
-  context: { openChildDecisions: MissionOpenChildDecision[]; waiting: number; answerProjectId?: string }) {
+  context: MissionPromptContext) {
   const state = missionPromptState(mission, context);
   const recent = recentMissionMessages(messages, context.openChildDecisions);
   const build = (included: number) => [
@@ -546,10 +564,12 @@ export function missionPromptWithMessageCount(mission: Mission, repos: MissionPr
 - {"kind":"cancel-subtask","subtaskId":"...","reason":"..."} cancels a subtask and its subteam.
 - {"kind":"result","summary":"..."} is accepted only when every subtask is done or cancelled and no owner decision is open. Cancel a blocked or stranded subtask explicitly with cancel-subtask first. Summarize what each subteam delivered and what still needs owner review.
 - {"kind":"blocked","summary":"..."} stops the mission when it cannot proceed safely.
-- {"kind":"wait","summary":"..."} ends this attempt without a decision when nothing needs one, for example after a resume with no new messages. Do not ask the owner a question only to file a report. Waiting is refused while a subteam decision in openChildDecisions has neither an ownerDecisionId nor answerPendingBy; answer it, ask the owner, or cancel the subtask first. Otherwise it is accepted only while a subteam is working, a queued subtask can start without anyone acting, or an owner decision is open.
+- {"kind":"wait","summary":"..."} ends this attempt without a decision when nothing needs one, for example after a resume with no new messages. Do not ask the owner a question only to file a report. Waiting is refused while a subteam decision in openChildDecisions has neither an ownerDecisionId nor answerPendingBy; answer it, ask the owner, or cancel the subtask first. Otherwise it is accepted only while a subteam is working, a queued subtask can start without anyone acting, an owner decision is open, or one of your follow-ups is open.
+- {"kind":"follow-up","inMinutes":30,"reason":"Why to look again","check":"What to look at then"} ends this attempt like wait, and the host starts a new attempt at that time with your reason and check. Use it instead of wait when something outside the mission state must be checked later and no host message will arrive on its own. inMinutes is 5 to 10080, the time must fall before the mission deadline, at most 5 can be open, and the open-decision rule of wait applies. A follow-up only schedules a look; it decides nothing.
 A repository-held message means a ready subtask cannot start because only paused or blocked runs outside this mission hold its repository; cancel the subtask, ask the owner, or report blocked.
-After the report, stop. The host starts a new attempt when a subteam opens a decision, becomes blocked, or finishes, when a ready subtask's repository is held only by paused or blocked runs, or when the owner answers or gives direction.`,
+After the report, stop. The host starts a new attempt when a subteam opens a decision, becomes blocked, or finishes, when a ready subtask's repository is held only by paused or blocked runs, when the owner answers or gives direction, or when one of your follow-ups comes due.`,
     `Mission state (JSON): ${JSON.stringify(state)}`,
+    missionNotesSection(context.notes),
     `Messages since your last attempt (JSON): ${JSON.stringify(recent.slice(0, included))}`,
     waitingMessageSentence(context.waiting, messages.length, included),
     `Escalate to the owner only what the objective and owner direction do not settle, such as product, scope, or risk decisions. A result means every subtask finished; it does not establish product impact or acceptance. Do not publish, merge, deploy, change repository remotes, or approve provider permissions; each subteam delivers only under its own repository's policy.`,
@@ -561,7 +581,7 @@ After the report, stop. The host starts a new attempt when a subteam opens a dec
 
 /** Build only the authoritative snapshot and newly delivered messages for a resumed coordinator conversation. */
 export function missionFollowUpPromptWithMessageCount(mission: Mission, repos: MissionPromptRepo[], messages: MissionMessage[], attempt: number, provider: Provider, modelProfile: TeamModelProfile,
-  context: { openChildDecisions: MissionOpenChildDecision[]; waiting: number; answerProjectId?: string }) {
+  context: MissionPromptContext) {
   const state = missionPromptState(mission, context);
   const recent = recentMissionMessages(messages, context.openChildDecisions);
   const build = (included: number) => [

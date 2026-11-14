@@ -243,6 +243,34 @@ test("a goal with no justified change records evidence without starting implemen
     writeFileSync(clientFile, JSON.stringify({ origin: f.host.origin, token: f.host.tokens.owner, projectId: "rehearsal" }), { mode: 0o600 });
     const printed = execFileSync(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile, "usage", "outcomes", "--goal", stopped.id], { encoding: "utf8" });
     assert.match(printed, /assessment not-achieved/);
+
+    // The goal's objective record: version 1 with the owner's success text as c0, readable by every paired role.
+    const record = await f.host.fetchApi(`/goals/${stopped.id}/record`, "viewer");
+    assert.equal(record.status, 200, JSON.stringify(record.body));
+    assert.equal(record.body.version, 1); assert.equal(record.body.latestVersion, 1); assert.equal(record.body.rebuilt, false);
+    assert.equal(record.body.record.criteria[0].id, "c0");
+    assert.equal(record.body.record.criteria[0].statement, stopped.successCriteria);
+    assert.deepEqual(record.body.log.map((entry: { op: string }) => entry.op), ["record.created"]);
+    const upper = await f.host.fetchApi(`/goals/${stopped.id.toUpperCase()}/record`, "owner");
+    assert.deepEqual(upper.body, record.body);
+    assert.equal((await f.host.fetchApi(`/goals/${stopped.id}/record?version=1`, "controller")).body.rebuilt, false);
+    const missing = await f.host.fetchApi(`/goals/${stopped.id}/record?version=2`, "viewer");
+    assert.equal(missing.status, 404); assert.equal(missing.body.code, "objective-version-not-found");
+    for (const query of ["?version=0", "?version=x", "?other=1"])
+      assert.equal((await f.host.fetchApi(`/goals/${stopped.id}/record${query}`, "viewer")).status, 400);
+    const unknown = await f.host.fetchApi(`/goals/${randomUUID()}/record`, "viewer");
+    assert.equal(unknown.status, 404); assert.equal(unknown.body.code, "goal-not-found");
+    // A goal cycle run has no record of its own.
+    const cycleRecord = await f.host.fetchApi(`/teams/${stopped.cycles[0].teamId}/record`, "viewer");
+    assert.equal(cycleRecord.status, 409); assert.equal(cycleRecord.body.code, "objective-record-of-goal");
+    // The CLI read: the first line, a missing version, and the JSON form.
+    const cli = (...args: string[]) => execFileSync(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile, "goal", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.match(cli("record", stopped.id).split("\n")[0]!, new RegExp(`^Goal ${stopped.id} · record version 1 of 1`));
+    assert.equal(JSON.parse(cli("record", stopped.id, "--json")).version, 1);
+    let failure: { stdout?: string; stderr?: string; status?: number | null } | undefined;
+    try { cli("record", stopped.id, "--version", "2"); } catch (error) { failure = error as typeof failure; }
+    assert.ok(failure && failure.status !== 0, "A missing version exits non-zero");
+    assert.match(`${failure!.stdout}${failure!.stderr}`, /The record has no version 2\./);
   } finally { await f.close(); }
 });
 

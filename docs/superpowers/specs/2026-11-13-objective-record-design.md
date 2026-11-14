@@ -71,14 +71,14 @@ type ObjectiveRecord = {
   schemaVersion: 1;
   owner: { kind: "goal"; goalId: string } | { kind: "run"; runId: string };
   version: number;                 // +1 on every change
-  digest: string;                  // SHA-256 of the canonical record without `log`
+  digest: string;                  // SHA-256 of the canonical record without `log` and `digest`
   statement: { objective: string; directions: { id: string; text: string; source: "steering" | "correction"; at: string }[] };
   definitions: { id: string; term: string; meaning: string }[];        // ≤ 16
   constraints: { allowedPaths: string[]; excludedPaths: string[]; rules: { id: string; text: string }[] };  // rules ≤ 16
   nonGoals: { id: string; text: string }[];                            // ≤ 20
   ownerEvidence: string[];                                             // the goal's `evidence`
   criteria: Criterion[];           // ≤ 8 active, c0 included
-  assumptions: Assumption[];       // ≤ 32 active (Part 3)
+  assumptions: Assumption[];       // ≤ 32 in all, active or not (Part 3)
   questions: { id: string; text: string; assumptions: string[]; waits: boolean; decisionId?: string;
                state: "open" | "answered" | "dismissed" | "default-kept" }[];   // ≤ 8 open
   rubricVersion: number;           // the evaluator rubric
@@ -107,7 +107,7 @@ type Threshold = { kind: "pass" } | { kind: "count"; min?: number; max?: number 
 
 The host validates shape on every write. A `command`, `receipt`, `artifact`, `citations`, or `citation-form` check needs producer `host`. A `judgement` check needs producer `evaluator`. An `owner-rating` check needs producer `owner`. No other producer exists, so no criterion is produced by the worker. The threshold must fit the check: `pass` for a command, a receipt, or a judgement; `count` for an artifact with `count`; `share` for both citation checks; `score` for an owner rating. A `command` digest must match a command in the project's configured checks or the run's accepted verification, so a criterion never adds a command. The host records the blob id of an artifact `schema` and of every `pinned` path when the criterion is written.
 
-**Creation.** `create` builds version 1 from the goal fields. `c0` is the owner's `successCriteria` text, with check `judgement` on rubric item `owner-text`, producer `evaluator`, and threshold `pass`. `createGoalSchema` gains optional `criteria`: owner criteria, validated by the same rules. `c0`'s statement has its own bound of 16,000 bytes, which holds any `successCriteria` that `createGoalSchema` accepts (4,000 characters of up to 4 bytes each), so no valid goal is truncated. A standalone run gets version 1 from its objective when its first plan arrives. Its `c0` refers to `statement.objective` instead of copying it, because a team objective may hold 24,000 characters. An existing goal gets a record on load by the same rule, logged `migrated`. *(My call: `c0` keeps the owner's own words inside every verdict, so derived criteria cannot narrow "done" unnoticed.)*
+**Creation.** `create` builds version 1 from the goal fields. `c0` is the owner's `successCriteria` text, with check `judgement` on rubric item `owner-text`, producer `evaluator`, and threshold `pass`. `c0`'s statement has its own bound of 16,000 bytes. `zod` counts UTF-16 code units, and one unit is at most 3 UTF-8 bytes, so the 4,000 characters that `createGoalSchema` accepts hold at most 12,000 bytes, and every valid `successCriteria` fits with room. *(Amended in step 1: the earlier text counted 4 bytes for each character.)* Owner `criteria` at creation, which `createGoalSchema` would gain here, move to step 2 with the owner ops that check them, so no step-1 record holds a criterion that nothing judges. A standalone run gets version 1 from its objective when its first plan arrives. Its `c0` refers to `statement.objective` with `statementOf` instead of copying it, because a team objective may hold 24,000 characters. An existing goal gets a record on load by the same rule, logged `migrated`. A direction whose log value is above 2 KiB refers to the record's own copy, `{ ref: "record:direction:<id>", digest, bytes }`, because directions are append-only. The evidence store module `objective` moves to step 2 with its first writer. Every step-1 record has at most 21 log entries, far under the 400-entry cap. *(My call: `c0` keeps the owner's own words inside every verdict, so derived criteria cannot narrow "done" unnoticed.)*
 
 **Storage.** The current record and its log live in the sealed goal record (`goals/<id>.sealed`, through `writeSealed`), or in the sealed run record for a standalone run. The record is authority for scope and for the meaning of "done", and contract C1 keeps authority in sealed records. The parts copied from owner input (the objective, steering directions, non-goals, owner evidence, and `c0`) are bounded by the API that accepted them, as today: a goal's creation request is at most 40,000 bytes, and its steering at most 24,000 bytes together with the objective. They do not count against the record cap. The rest of the record's canonical JSON, without the log, is at most 32 KiB, so a goal's record stays under about 96 KiB. A write past the cap is refused with `objective-too-large`. The sealed record keeps the newest 400 log entries, up to 256 KiB. Older entries move to the table `objective_log` of the evidence store module `objective`, encrypted per C1, and are deleted with their goal or run.
 
@@ -141,7 +141,7 @@ Every replaced value is kept in full. A value of at most 2 KiB sits inline. A la
 
 An agent's reading of a term is an assumption, never a definition. The owner can promote an assumption into a definition with one correction.
 
-**Steering.** A steering message keeps today's limits and today's path into the run objective. It also appends a direction with source `steering` and raises the version. It changes no criterion and no assumption. The next intent check reads the direction as part of the statement, and may derive criteria from it by quoting it.
+**Steering.** A steering message keeps today's limits and today's path into the run objective. It also appends a direction with source `steering` and raises the version. It changes no criterion and no assumption. The next intent check reads the direction as part of the statement, and may derive criteria from it by quoting it. In step 1, a controller's steer is logged as the owner's direction, because the log has no controller actor and the prompt already prints it as a user direction. A decision answer writes nothing to the record until step 3, when the intent check's questions take answers.
 
 **Owner correction.** `POST /api/goals/:id/record` (owner only) takes `{ requestId, version, ops }`. An op confirms a derived criterion (its origin becomes `owner`), edits, adds, or retires a criterion, records an owner value, sets or unpins an assumption's status, answers or dismisses a question, promotes an assumption, edits a definition, a rule, a non-goal, or an excluded path, or sets the rubric version. A stale `version` gets 409. All ops apply in one write and raise the version once. A standalone run takes the same body at `POST /api/teams/:id/record`.
 
@@ -328,10 +328,10 @@ The four ledger levels keep their meaning and stay empty on scout rows. A `scout
 
 The record digest goes into `TeamGoalContext` as `record`: criteria (ID, statement, check label, producer), active assumptions with status, and open questions with defaults. It is at most 6 KiB plus `c0`'s statement, so at most 22 KiB. It replaces `successCriteria`, which can already take 16,000 bytes, so a prompt grows by at most 6 KiB, inside the 80 KiB limit. It carries no criterion status, which reaches the coordinator only through the goal digest. The goal context section that member prompts print today shows it in place of `successCriteria`, whose text is `c0`. Non-goals, allowed paths, and evidence print as today. In autonomous mode, the section's sentence "Ask for a user decision if a material scope decision is required" becomes an instruction to propose an assumption. No member reads the log, a verdict row, an agreement rate, a finding measure, or the evaluator's identity.
 
-- `GET /api/goals/:id/record` and `GET /api/teams/:id/record` return the record and its log, for any paired device. `?version=N` rebuilds a past version.
+- `GET /api/goals/:id/record` and `GET /api/teams/:id/record` return the record and its log, for owner, controller, and viewer devices. `?version=N` rebuilds a past version. Step 1 adds these reads with the codes `objective-version-not-found`, `objective-record-of-goal`, `objective-record-of-mission`, `objective-record-invalid`, `objective-record-newer`, `objective-source-invalid`, and `objective-record-absent`. The relay refuses both paths, as it refuses the outcome routes, and no code changes for that.
 - `POST /api/goals/:id/record` and `POST /api/teams/:id/record` apply owner ops.
 - `GET /api/goals/:id/verdicts` returns each cycle's verdict with its receipts.
-- `infinite goal record ID [--version N] [--json]`, with `confirm CID`, `retire CID`, `set-assumption AID STATUS`, and `answer QID TEXT`.
+- `infinite goal record ID [--version N] [--json]` is the first CLI form, in step 1. `confirm CID`, `retire CID`, `set-assumption AID STATUS`, and `answer QID TEXT` follow in step 2 and step 3. `infinite team record` is not planned for this design.
 
 ### Part 9. Worked example
 
@@ -406,7 +406,7 @@ The criteria:
 
 ## Delivery order
 
-1. **The record.** Schema, validation, storage in sealed goal and run records, migration of existing goals, the log, and the read API and CLI. Steering appends directions. Runs do not change.
+1. **The record.** Schema, validation, storage in sealed goal and run records, migration of existing goals, the log, and the read API and CLI. Steering appends directions. A standalone run gets its record at its first accepted plan. Goal cycle runs and mission subteams hold none. Nothing else changes a run.
 2. **Owner ops and prompts.** The correction API, the record digest in prompts and the context file, and the `evaluators` lineup slot.
 3. **The intent check.** The role, the report, item application, the batched question, the corrected-plan attempt, and derived criteria. Until C16 lands, a scout item is converted to `assume` and logged.
 4. **Tests and proposals.** Command, artifact, citation, and owner tests. Proposals need the blackboard member tools (C17).

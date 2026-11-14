@@ -1147,8 +1147,11 @@ test("a legacy row is never a run", () => {
     store.sweep(() => false);
     assert.equal(store.read(db => readOutcome(db, legacy.outcomeId))?.source, "legacy");
 
-    const candidates = store.read(db => landingCandidates(db, legacy.payload.projectId, "1970-01-01T00:00:00.000Z"));
-    assert.deepEqual(candidates, []);
+    // A legacy row has no summary, so it is never a landing candidate. The approved production run of the same
+    // project is the one candidate, which shows that the query read this project.
+    store.write(tx => writeSummary(tx, summaryRow(production.runId, { approvedAt: "2026-11-13T12:00:00.000Z" })));
+    const candidates = store.read(db => landingCandidates(db, db.index("project", legacy.payload.projectId), "1970-01-01T00:00:00.000Z"));
+    assert.deepEqual(candidates.map(candidate => candidate.runId), [production.runId]);
 
     assert.equal(store.write(tx => deleteLegacyOutcome(tx, production.outcomeId)), false);
     assert.equal(store.read(db => readOutcome(db, production.outcomeId))?.source, "production");

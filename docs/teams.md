@@ -2074,8 +2074,10 @@ line recorded longer ago than that is `expired` when it is imported.
 
 `POST /api/outcomes/legacy` is the route behind the command. It is owner only.
 The body holds `dryRun` and 1 to 50 `lines`. The route has no request id,
-because a replay is idempotent by line id. It answers `400` for an invalid
-body, `403` for a caller that is not the owner, `409` with
+because a replay is idempotent by line id. It answers `400` with
+`code: "legacy-invalid"` and no detail for a body that does not parse, so no
+key or value of the operator's file comes back in an error. It answers `403`
+for a caller that is not the owner, `409` with
 `code: "legacy-limit"` when the host would exceed 50,000 legacy lines, and
 `503` when the store is unavailable. The remote relay refuses this route with
 `403` and `code: "remote-endpoint-denied"`.

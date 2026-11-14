@@ -573,12 +573,19 @@ test("the legacy route answers per line", { timeout: 90000 }, async () => {
     const viewer = await host.fetchApi("/outcomes/legacy", "viewer", { dryRun: false, lines: [legacyLine("op-2026-10-01-e")] });
     assert.equal(viewer.status, 403);
 
+    // A body that does not parse gets one fixed answer. A key or a value of the operator's file is never sent back.
+    const invalid = { code: "legacy-invalid", error: "The legacy batch is invalid." };
     const tooMany = Array.from({ length: 51 }, (_, index) => legacyLine(`op-2026-10-02-${index}`));
-    assert.equal((await host.fetchApi("/outcomes/legacy", "owner", { dryRun: false, lines: tooMany })).status, 400);
-    const unknownKey = await host.fetchApi("/outcomes/legacy", "owner", { dryRun: false, lines: [legacyLine("op-2026-10-03-a", { extra: 1 })] });
-    assert.equal(unknownKey.status, 400);
-    const missingDryRun = await host.fetchApi("/outcomes/legacy", "owner", { lines: [legacyLine("op-2026-10-03-b")] });
-    assert.equal(missingDryRun.status, 400);
+    for (const body of [
+      { dryRun: false, lines: tooMany },
+      { dryRun: false, lines: [legacyLine("op-2026-10-03-a", { "private-operator-tag": 1 })] },
+      { dryRun: false, lines: [legacyLine("op-2026-10-03-c", { label: "private operator label ".repeat(3) })] },
+      { lines: [legacyLine("op-2026-10-03-b")] },
+    ]) {
+      const refused = await host.fetchApi("/outcomes/legacy", "owner", body);
+      assert.equal(refused.status, 400);
+      assert.deepEqual(refused.body, invalid);
+    }
     assert.equal(await legacyRows(), 4, "a refused batch stores nothing");
 
     // The host's own retention decides what is expired: 31 days is past this host's 30, and inside the default.

@@ -742,7 +742,11 @@ export function createApp(config: Config, key: Buffer) {
   // The owner's legacy batch. A line is an unauthenticated claim, so the owner key is required. The route takes no request id: a replay is idempotent by line id.
   app.post("/api/outcomes/legacy", requireRole(["owner"]), (req, res) => {
     const now = Date.now();
-    const body = legacyBatchSchema(now).parse(req.body);
+    // The general handler returns each issue's message, and the message for an unknown key names the key. A key or a
+    // value of the operator's file is operator text, so a body that does not parse gets one fixed answer.
+    const parsed = legacyBatchSchema(now).safeParse(req.body);
+    if (!parsed.success) return void res.status(400).json({ code: "legacy-invalid", error: "The legacy batch is invalid." });
+    const body = parsed.data;
     try {
       return void res.json(importLegacy(evidence, body, { now: new Date(now).toISOString(), retentionDays: config.teams?.outcomes?.retentionDays }));
     } catch (error) {

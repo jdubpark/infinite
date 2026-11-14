@@ -724,18 +724,16 @@ export class TeamService {
       // without a read, so it does not hold the others back.
       if (entries.held(id) || entries.unread(id)) { this.entryBacklog.add(id); continue; }
       const run = this.sealedRun(id);
-      // A record file that is gone leaves the backlog: its run was removed.
-      if (run === "missing") continue;
       // A record that cannot be read now keeps its place. A settled run is never saved again, so nothing else would
-      // bring it back before the next start.
-      if (run === "unreadable") { entries.noteUnread(id); this.entryBacklog.add(id); continue; }
+      // bring it back before the next start. A removed run never gets here: `deleteRecord` takes it out of the backlog.
+      if (run === undefined) { entries.noteUnread(id); this.entryBacklog.add(id); continue; }
       if (entries.retry(run) !== "done") this.entryBacklog.add(id);
     }
   }
-  /** The run as its sealed record file holds it. `missing`: the file is gone. `unreadable`: it cannot be read or opened now. */
-  private sealedRun(id: string): TeamRun | "missing" | "unreadable" {
+  /** The run as its sealed record file holds it, or undefined when the file is missing or cannot be read or opened now. */
+  private sealedRun(id: string): TeamRun | undefined {
     try { return unseal<Stored>(this.key, `team:${id}`, readFileSync(join(this.directory, `${id}.sealed`), "utf8")).run; }
-    catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unreadable"; }
+    catch { return undefined; }
   }
   /** Emits run.blocked or run.settled when the run status differs from the status the ledger last saw. */
   private emitStatusEvents(stored: Stored, statusAt: string) {

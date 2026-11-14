@@ -129,6 +129,8 @@ export class Blackboard {
    */
   mirror(run: TeamRun): boolean {
     try {
+      // A save has just written the record, so an earlier failed read of it says nothing now.
+      this.unreadAt.delete(run.id);
       return this.mirrorRun(run) === "done";
     } catch {
       return false;

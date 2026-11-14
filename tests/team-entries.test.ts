@@ -478,21 +478,30 @@ test("a record that cannot be read for a while keeps its run in the backlog", as
     clock += 61_000;
     const stored = () => entries.list(f.run.id, { kinds: ["direction"] }).entries.length;
 
-    // The record cannot be read during one pass, as under a descriptor limit or a disk fault: a folder stands in its place.
     const file = join(f.config.stateDir, "teams", `${f.run.id}.sealed`);
+    const before = recordBytes(f);
+    // The record file is missing during one pass. Nothing of the host removed it: a removal leaves through deleteRecord.
+    renameSync(file, `${file}.aside`);
+    try { internal(teams).drainEntries(); }
+    finally { renameSync(`${file}.aside`, file); }
+    assert.equal(stored(), 0);
+
+    // The record reads again, and the drain leaves it alone for a minute.
+    internal(teams).drainEntries();
+    assert.equal(stored(), 0, "the drain waits before it reads the record again");
+
+    // The next read fails another way, as under a descriptor limit or a disk fault: a folder stands in the file's place.
+    clock += 61_000;
     renameSync(file, `${file}.aside`);
     mkdirSync(file);
     try { internal(teams).drainEntries(); }
     finally { rmdirSync(file); renameSync(`${file}.aside`, file); }
     assert.equal(stored(), 0);
 
-    // The record reads again. The drain leaves it alone for a minute, then stores the entry without a save.
-    const before = recordBytes(f);
-    internal(teams).drainEntries();
-    assert.equal(stored(), 0, "the drain waits before it reads the record again");
+    // After another minute the record reads, and the drain stores the entry without a save.
     clock += 61_000;
     internal(teams).drainEntries();
-    assert.equal(stored(), 1, "the run kept its place in the backlog");
+    assert.equal(stored(), 1, "the run kept its place in the backlog through both failed reads");
     assert.deepEqual(recordBytes(f), before, "the drain saves nothing");
   } finally { store.close(); f.close(); }
 });

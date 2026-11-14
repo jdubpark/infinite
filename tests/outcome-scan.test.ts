@@ -755,7 +755,7 @@ test("fetches that all name the stored head are a check unless the head moved be
     assert.equal((await scanFetch(store, repo, fetchOf(repo, 0))).state, "scanned");
     const unread = [fetchOf(repo, 1), fetchOf(repo, 2)];
 
-    // The same chain is a gap when the first fetch says its previous head stood only since day 2: a fetch after the
+    // The same chain is a gap when the first fetch says its previous head stood only since day 1: a fetch after the
     // ledger's last record, day 0, moved the head there.
     const moved = await scanFetch(store, repo, fetchOf(repo, 3), { earlier: [{ ...unread[0]!, previousSince: day(1) }, unread[1]!] });
     assert.deepEqual({ state: moved.state, gap: moved.gap }, { state: "scanned", gap: "rewrite" });
@@ -763,6 +763,13 @@ test("fetches that all name the stored head are a check unless the head moved be
     const kept = await scanFetch(store, repo, fetchOf(repo, 6), { earlier: [fetchOf(repo, 4), fetchOf(repo, 5)] });
     assert.equal(kept.state, "checked");
     assert.equal(newestScan(store)?.checkedAt, day(6));
+
+    // The rule holds between two unread fetches too. The second says its previous head stood only since its own fetch,
+    // later than the first one's: a fetch between the two moved the head and is missing from the chain.
+    const before = fetchOf(repo, 6.25);
+    const after = { ...fetchOf(repo, 6.5), previousSince: day(6.5) };
+    const missing = await scanFetch(store, repo, fetchOf(repo, 6.75), { earlier: [before, after] });
+    assert.deepEqual({ state: missing.state, gap: missing.gap }, { state: "scanned", gap: "rewrite" });
 
     // A chain in the wrong order does not continue the stored head.
     const first = fetchOf(repo, 7);

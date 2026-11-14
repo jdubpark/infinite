@@ -482,3 +482,60 @@ test("the mirror callback fires after each successful fetch", async () => {
     assert.deepEqual(service.status("example"), status, "the status read back equals the status the refresh returned");
   } finally { g.close(); }
 });
+
+test("the head's start stamp follows the head, and stamps never go back", async () => {
+  const f = fixture();
+  try {
+    const calls: MirrorFetch[] = [];
+    // A session is running, so each refresh fetches the mirror and leaves the working tree alone.
+    const service = new ProjectSourceService(f.config, { running: async () => true, onMirror: fetch => { calls.push(fetch); } });
+    const statusFile = join(f.stateDir, "projects", "example", "source", "status.json");
+    const rewrite = (change: (status: Record<string, unknown>) => void) => {
+      const status = JSON.parse(readFileSync(statusFile, "utf8")) as Record<string, unknown>;
+      change(status);
+      writeFileSync(statusFile, JSON.stringify(status));
+    };
+
+    const commitB = f.push("B\n", "Commit B");
+    const first = await service.refresh("example");
+    assert.equal(first.fetchStamp, first.fetchedAt, "the stamp is the time of the fetch while the clock moves forward");
+    const commitC = f.push("C\n", "Commit C");
+    const second = await service.refresh("example");
+    assert.equal(second.mirrorHeadSince, second.fetchStamp);
+
+    // The head returns to an earlier commit. It stands since the fetch that returned it again, not since the first time.
+    git(f.seed, "reset", "--hard", commitB);
+    git(f.seed, "push", "--force", "origin", "main");
+    const third = await service.refresh("example");
+    assert.equal(third.mirrorHead, commitB);
+    assert.equal(third.mirrorHeadSince, third.fetchStamp);
+    assert.notEqual(third.mirrorHeadSince, first.mirrorHeadSince);
+    assert.deepEqual([calls[2]!.previousHead, calls[2]!.previousSince, calls[2]!.fetchedAt], [commitC, second.fetchStamp, third.fetchStamp]);
+
+    // A status written before the start stamp existed: the head has no provable start, so the notice names none.
+    rewrite(status => { delete status.mirrorHeadSince; });
+    const fourth = await service.refresh("example");
+    assert.equal(calls[3]!.previousHead, commitB);
+    assert.equal("previousSince" in calls[3]!, false);
+    assert.equal(fourth.mirrorHeadSince, fourth.fetchStamp, "the start is this fetch, the first that can vouch for the head");
+
+    // The host clock stepped back: the last stamp is later than the time of the next fetch. Stamps still move forward.
+    const ahead = "2099-01-01T00:00:00.000Z";
+    rewrite(status => { status.fetchStamp = ahead; });
+    const fifth = await service.refresh("example");
+    assert.equal(fifth.fetchStamp, "2099-01-01T00:00:00.001Z");
+    assert.equal(calls[4]!.fetchedAt, "2099-01-01T00:00:00.001Z");
+    assert.ok(Date.parse(fifth.fetchedAt!) < Date.parse(ahead), "the status keeps the time of the fetch");
+    assert.equal(fifth.mirrorHeadSince, fourth.mirrorHeadSince, "an unmoved head keeps its start");
+    const commitD = f.push("D\n", "Commit D");
+    const sixth = await service.refresh("example");
+    assert.equal(sixth.fetchStamp, "2099-01-01T00:00:00.002Z");
+    assert.equal(sixth.mirrorHeadSince, sixth.fetchStamp);
+    assert.deepEqual([calls[5]!.previousHead, calls[5]!.previousSince, calls[5]!.head], [commitB, fourth.mirrorHeadSince, commitD]);
+
+    // A source change starts a new status and keeps the order of the project's fetches.
+    f.config.projects[0]!.source = { mode: "github", repository: "example/product", baseBranch: "release" };
+    const changed = service.status("example");
+    assert.deepEqual([changed.mirrorHead, changed.mirrorHeadSince, changed.fetchStamp], [undefined, undefined, sixth.fetchStamp]);
+  } finally { f.close(); }
+});

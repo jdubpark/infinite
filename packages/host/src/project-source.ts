@@ -45,7 +45,12 @@ export interface ProjectSourceStatus {
   baseBranch?: string;
   /** Base-branch head in the host mirror after the last successful fetch. */
   mirrorHead?: string;
-  /** The `fetchedAt` of the fetch that first returned `mirrorHead`: every successful fetch since then returned the same head. */
+  /**
+   * The order stamp of the last successful fetch: its time, or one millisecond after the previous stamp when the host
+   * clock stepped back. So the stamps of one project never go back, also across a source change.
+   */
+  fetchStamp?: string;
+  /** The stamp of the fetch that first returned `mirrorHead`: every successful fetch since then returned the same head. */
   mirrorHeadSince?: string;
   /** Commit the project working tree was last fast-forwarded to. */
   appliedHead?: string;
@@ -60,8 +65,10 @@ export interface ProjectSourceStatus {
   savedBranches?: string[];
 }
 /**
- * One successful fetch of the base branch into the host mirror. `previousHead` is the head before this fetch, and
- * `previousSince` the `fetchedAt` of the fetch that first returned it; both are absent when the status held neither.
+ * One successful fetch of the base branch into the host mirror. `fetchedAt` is the fetch's order stamp (see
+ * `ProjectSourceStatus.fetchStamp`): the time of the fetch, and never earlier than an earlier fetch of the project.
+ * `previousHead` is the head before this fetch, and `previousSince` the stamp of the fetch that first returned it;
+ * both are absent when the status held neither.
  */
 export type MirrorFetch = { projectId: string; repository: string; baseBranch: string; head: string; previousHead?: string; previousSince?: string; fetchedAt: string };
 export interface ProjectSourceOptions {
@@ -125,6 +132,8 @@ export class ProjectSourceService {
         repository: project.source.repository,
         baseBranch: project.source.baseBranch,
         ...(saved.savedBranches ? { savedBranches: saved.savedBranches } : {}),
+        // The order of the project's fetches does not restart with a new source.
+        ...(saved.fetchStamp ? { fetchStamp: saved.fetchStamp } : {}),
       };
     }
     return { ...saved, mode: "github", repository: project.source.repository, baseBranch: project.source.baseBranch };
@@ -243,13 +252,18 @@ export class ProjectSourceService {
     const fetchedStatus = status.pending?.reason === "fetch-failed" ? withoutPending(status) : status;
     delete fetchedStatus.fetchFailures;
     const now = new Date().toISOString();
+    // The stamp orders this project's fetches for a listener. It is the time of the fetch unless the host clock
+    // stepped back, and then it is one millisecond after the previous stamp.
+    const lastStamp = status.fetchStamp === undefined ? Number.NaN : Date.parse(status.fetchStamp);
+    const stamp = Number.isNaN(lastStamp) || Date.parse(now) > lastStamp ? now : new Date(lastStamp + 1).toISOString();
     const previousHead = status.mirrorHead;
-    // A head the status holds with no start time (a status written before this field) has no provable start.
+    // A head the status holds with no start stamp (a status written before this field) has no provable start.
     const previousSince = previousHead === undefined ? undefined : status.mirrorHeadSince;
     status = {
       ...fetchedStatus,
       mirrorHead: fetchedHead,
-      mirrorHeadSince: previousHead === fetchedHead && previousSince !== undefined ? previousSince : now,
+      mirrorHeadSince: previousHead === fetchedHead && previousSince !== undefined ? previousSince : stamp,
+      fetchStamp: stamp,
       fetchedAt: now,
       attemptedAt: now,
     };
@@ -257,7 +271,7 @@ export class ProjectSourceService {
       try {
         this.options.onMirror?.({
           projectId, repository: source.repository, baseBranch: source.baseBranch, head: fetchedHead,
-          ...(previousHead === undefined ? {} : { previousHead }), ...(previousSince === undefined ? {} : { previousSince }), fetchedAt: now,
+          ...(previousHead === undefined ? {} : { previousHead }), ...(previousSince === undefined ? {} : { previousSince }), fetchedAt: stamp,
         });
       } catch { /* A listener failure must not fail the refresh. */ }
     }

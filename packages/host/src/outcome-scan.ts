@@ -92,25 +92,25 @@ async function isAncestor(git: ScanGit, cwd: string, older: string, newer: strin
 }
 
 /**
- * Whether the unread fetches and the new one continue the ledger's record. The first of them must name the stored
- * head as the head before it, and that head must have stood since a fetch no later than the last one the ledger
- * recorded: a later start means that a fetch the ledger never read moved the head, in this process or before a
- * restart. Each later fetch must name the head of the one before it. A missing value never matches, and a fetch of
- * another repository or branch breaks the chain.
+ * Whether the unread fetches and the new one continue the ledger's record. Each fetch must name, as the head before
+ * it, the head of the one before it in the chain (the stored head, for the first), and that head must have stood
+ * since a fetch no later than that one (the last fetch the ledger recorded, for the first). A later start means that
+ * a fetch between the two moved the head and was never read, in this process or before a restart. The times are the
+ * source's fetch stamps, which never go back. A missing value never matches, and a fetch of another repository or
+ * branch breaks the chain.
  */
 function continues(chain: readonly MirrorFetch[], state: { head: string; checkedAt: string }, fetch: MirrorFetch): boolean {
-  const first = chain[0];
-  if (first === undefined || first.previousSince === undefined) return false;
-  const since = Date.parse(first.previousSince);
-  const recorded = Date.parse(state.checkedAt);
-  if (Number.isNaN(since) || Number.isNaN(recorded) || since > recorded) return false;
-  let previous = state.head;
+  let head = state.head;
+  let stamp = Date.parse(state.checkedAt);
   for (const entry of chain) {
     if (entry.repository !== fetch.repository || entry.baseBranch !== fetch.baseBranch) return false;
-    if (entry.previousHead === undefined || entry.previousHead !== previous) return false;
-    previous = entry.head;
+    if (entry.previousHead === undefined || entry.previousHead !== head || entry.previousSince === undefined) return false;
+    const since = Date.parse(entry.previousSince);
+    if (Number.isNaN(since) || Number.isNaN(stamp) || since > stamp) return false;
+    head = entry.head;
+    stamp = Date.parse(entry.fetchedAt);
   }
-  return true;
+  return chain.length > 0;
 }
 
 /** The unread heads that differ from both the stored head and the new one, distinct, in fetch order. */

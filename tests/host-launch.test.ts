@@ -82,6 +82,8 @@ test("claude gets --settings with relay command hooks before the prompt", () => 
   const i = launch.args.indexOf("--settings");
   assert.ok(i > 0);
   const settings = JSON.parse(launch.args[i + 1]);
+  // A project settings file must not be able to switch the host's hooks off.
+  assert.equal(settings.disableAllHooks, false);
   const events = Object.keys(settings.hooks).sort();
   assert.deepEqual(events, ["Elicitation", "Notification", "PermissionDenied", "PermissionRequest", "PostToolUse", "PostToolUseFailure", "PreToolUse", "SessionEnd", "Stop", "StopFailure", "UserPromptSubmit"]);
   const handler = settings.hooks.PreToolUse[0].hooks[0];

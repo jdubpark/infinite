@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { startHost, waitFor } from "./helpers.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { fixture, mixedLineup } from "./team-fixture.js";
-import { UsageService, type UsageSessionRow, type UsageSummary } from "../packages/host/src/usage-service.js";
+import { LEDGER_KEEP_MS, UsageService, type UsageSessionRow, type UsageSummary } from "../packages/host/src/usage-service.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import type { Config } from "../packages/host/src/types.js";
 import type { Manager } from "../packages/host/src/manager.js";
@@ -44,7 +44,7 @@ test("a tick reads the listing it is given, and skips an exited session whose jo
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("lookups read the store once until the ledger changes, and one row that does not open makes it unavailable", async () => {
+test("lookups read the store once until the ledger changes, and one row that does not open makes it unavailable", async t => {
   const dir = mkdtempSync(join(tmpdir(), "inf-usage-"));
   try {
     const key = randomBytes(32), store = storeFor(dir, key), runId = randomUUID();
@@ -66,6 +66,8 @@ test("lookups read the store once until the ledger changes, and one row that doe
     for (let pass = 0; pass < 4; pass++) await usage.tick(rows);
     usage.recordBriefing("project-0", "briefing-session", new Date().toISOString(),
       { providerId: "deepseek", modelId: "deepseek-flash", tokens: { input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, reportedCost: 0.001 });
+    // The clock stands still from here, so the time the kept read may answer passes only when the test says so.
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
     let reads = 0;
     const read = store.read.bind(store);
     store.read = (fn => { reads++; return read(fn); }) as typeof store.read;
@@ -92,11 +94,19 @@ test("lookups read the store once until the ledger changes, and one row that doe
     assert.equal((usage.session("session-01") as { messages: number }).messages, 1);
     assert.equal(reads, 1);
 
-    // One sealed value that does not open makes the whole ledger unavailable, also for sessions that do not use it.
+    // A sealed value that does not open makes the whole ledger unavailable, also for sessions that do not use it and
+    // also when nothing writes the ledger: the kept read answers for one tick at most.
+    assert.equal(usage.session("session-01").measured, true);
     const raw = new DatabaseSync(evidenceDatabasePath(dir));
-    try { raw.prepare("UPDATE usage_projects SET encrypted_project = ? WHERE project_ref = (SELECT project_ref FROM usage_sessions WHERE session_id = ?)").run("not-sealed", "session-39"); }
+    try { assert.equal(raw.prepare("UPDATE usage_models SET encrypted_model = ?").run("not-sealed").changes, 1); }
     finally { raw.close(); }
-    usage.recordBriefing("project-1", "briefing-session-2", new Date().toISOString(), null);
+    let writes = 0;
+    const write = store.write.bind(store);
+    store.write = (fn => { writes++; return write(fn); }) as typeof store.write;
+    await usage.tick(rows);
+    assert.equal(writes, 0, "This tick writes nothing, so no write drops the kept read");
+    assert.equal(usage.session("session-01").measured, true, "Within the tick period the kept read still answers");
+    t.mock.timers.tick(LEDGER_KEEP_MS);
     assert.deepEqual(usage.session("session-01"), { measured: false, coverage: "none", unavailable: true });
     assert.deepEqual(usage.member(runId, "member-2"), { measured: false, coverage: "none", unavailable: true });
   } finally { rmSync(dir, { recursive: true, force: true }); }

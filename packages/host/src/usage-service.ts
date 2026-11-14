@@ -48,6 +48,11 @@ type Ledger = {
   briefings: Snapshot["briefings"];
 };
 const memberKey = (runId: string, memberId: string) => `${runId}\u0000${memberId}`;
+/**
+ * The kept read answers for at most this long, the period of a tick. Lookups in one list pass share it, and a ledger
+ * that can no longer be read is noticed within a tick even when nothing writes it.
+ */
+export const LEDGER_KEEP_MS = 2_000;
 /** The state a session row holds after a tick. Its coverage is derived from these facts, never kept apart from them. */
 type Row = Pick<LedgerState, "exited" | "cursor" | "seen" | "refused" | "journaled"> & { lastActiveAt?: string };
 
@@ -128,6 +133,8 @@ export class UsageService {
   private readonly exitedAt = new Map<string, number>();
   /** The last whole read of the ledger. Every write of this service drops it; nothing else writes the usage tables. */
   private kept?: Ledger;
+  /** When the kept read was taken. */
+  private keptAt = 0;
   private readonly planFile: string;
   private planOverrides: Record<string, number> = Object.create(null) as Record<string, number>;
   private balances?: { get(id: string): Balance };
@@ -328,12 +335,16 @@ export class UsageService {
 
   /**
    * The whole ledger, from the kept read or from one store read. A failure of the store, a row that does not open, or
-   * an unavailable ledger throws `unavailable`, and a failed read is never kept. What it returns is shared between
-   * calls and frozen: a caller copies before it sorts or adds.
+   * an unavailable ledger throws `unavailable`, and a failed read is never kept. The kept read answers until this
+   * service writes the ledger, and for at most `LEDGER_KEEP_MS`. What it returns is shared between calls and frozen:
+   * a caller copies before it sorts or adds.
    */
   private ledger(): Ledger {
     if (!this.available()) throw new EvidenceError("unavailable", "The usage ledger is unavailable.");
-    if (this.kept) return this.kept;
+    // A clock that stepped back counts as expired.
+    const now = Date.now();
+    if (this.kept && now >= this.keptAt && now - this.keptAt < LEDGER_KEEP_MS) return this.kept;
+    this.kept = undefined;
     let data: { sessions: StoredSession[]; records: { sessionId: string; record: UsageRecord }[]; briefings: Snapshot["briefings"] };
     try {
       data = this.store.read(db => ({ sessions: readSessions(db), records: readRecords(db), briefings: readBriefings(db) }));
@@ -358,6 +369,7 @@ export class UsageService {
     for (const list of members.values()) Object.freeze(list);
     for (const list of bySession.values()) Object.freeze(list);
     this.kept = { sessions: Object.freeze(data.sessions), byId, byMember: members, bySession, order, briefings: Object.freeze(data.briefings) as Snapshot["briefings"] };
+    this.keptAt = now;
     return this.kept;
   }
   /** The ledger as the roll-ups read it. Only `taskUsage` gives a task, whose blind index needs the store. */

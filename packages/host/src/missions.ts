@@ -8,10 +8,11 @@ import type { Config } from "./types.js";
 import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, type CreateTeam, type NativeContinuation, type TeamAssignment, type TeamView } from "./team-types.js";
 import type { ProductGoal } from "./goal-types.js";
 import type { ProjectGroup } from "./project-group-types.js";
-import { createMissionSchema, missionActionSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionInputSource, type MissionOrigin, type MissionReport, type MissionSubtaskPlan } from "./mission-types.js";
-import { missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, subteamReport, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
+import { createMissionSchema, missionActionSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionFollowUp, type MissionInputSource, type MissionOrigin, type MissionReport, type MissionSubtaskPlan } from "./mission-types.js";
+import { missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, subteamReport, type MissionCoordinatorNote, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
 import { addRollups, emptyRollup, teamUsage } from "./team-usage.js";
 import type { UsageService } from "./usage-service.js";
+import { ledgerRecord } from "./usage-store.js";
 import { missionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { ensureDefaultTeamRoot, ensureHostDirectory } from "./team-workspace.js";
 import { resumeFailed } from "./native-continuation.js";
@@ -36,7 +37,16 @@ type Attempt = { memberId: string; sessionId: string; revision: number; prompt: 
   /** The session ended its turn or went quiet without a report; it is stopped and the next attempt is told why. */
   missedReport?: boolean;
   /** The journal position read for turn signals, and the latest turn boundary seen there. */
-  signalCursor?: number; turnSignal?: { kind: string; at: string } };
+  signalCursor?: number; turnSignal?: { kind: string; at: string };
+  /** When the attempt stopped. Absent on attempts stopped before this field existed. */
+  endedAt?: string;
+  /** The note filed with the report, held until the report is consumed. */
+  note?: string;
+  /** The rule that made this attempt start a new conversation instead of resuming. It also marks the boundary that retires every older conversation. */
+  rotated?: RotationRule;
+  /** The journal position read for usage, and the context size of the newest main-conversation model call seen there. */
+  usageCursor?: number; contextTokens?: number };
+type RotationRule = "idle" | "size" | "age";
 /** A subteam action recorded before it is sent, so a restart replays it under the same request ID. */
 type ChildOp = { kind: "answer" | "steer" | "pause" | "resume" | "cancel" | "parallelism"; subtaskId: string; teamId: string; requestId: string; revision?: number; decisionId?: string; text?: string; parallelism?: number; by?: "owner" | "coordinator";
   /**
@@ -76,6 +86,8 @@ type Stored = {
   clockStoppedAt?: string;
   /** When the mission became blocked. Records blocked before this field existed fall back to the mission's last change. */
   blockedAt?: string;
+  /** The newest notes the coordinator filed with its reports. Agent text: never in the mission view, events, Slack, or Linear. */
+  coordinatorNotes?: MissionCoordinatorNote[];
 };
 
 const now = () => new Date().toISOString();
@@ -91,6 +103,34 @@ const turnActivity = new Set(["turn-start", "tool-start", "tool-end", "prompt-op
 const messageLimit = 30;
 const timeLimitReason = "The approved time limit has expired. Active subteams were cancelled; their workspaces remain available.";
 const messageTooLargeReason = "The next coordinator message cannot fit with the mission state. Its evidence remains queued; no empty coordinator attempt was started.";
+/** Follow-ups open at once, and settled ones kept for clients. */
+const followUpLimit = 5, settledFollowUpsKept = 10;
+/** Coordinator notes kept, newest first, and their total length. */
+const noteLimit = 8, noteCharacters = 16000;
+/** Rotation defaults; `autonomy.continuity` overrides each, and 0 turns a rule off. */
+const rotationDefaults = { rotateIdleMinutes: 60, rotateContextTokens: 120000, rotateAttempts: 40 };
+const rotationText: Record<RotationRule, string> = {
+  idle: "the previous conversation was idle too long",
+  size: "the previous conversation grew too large",
+  age: "the previous conversation had too many attempts",
+};
+/** A time to the minute in UTC, for board rows and events. */
+const utcMinute = (iso: string) => `${iso.slice(0, 16).replace("T", " ")} UTC`;
+/** Marks an attempt stopped and records when, once. */
+const endAttempt = (attempt: Attempt) => { attempt.status = "stopped"; attempt.endedAt ??= now(); };
+const openFollowUps = (mission: Mission) => (mission.followUps ?? []).filter(item => item.state === "open");
+/** Settles every open follow-up of an ending mission. */
+function cancelFollowUps(mission: Mission) {
+  const at = now();
+  for (const item of openFollowUps(mission)) Object.assign(item, { state: "cancelled", settledAt: at });
+  trimFollowUps(mission);
+}
+/** Keeps every open follow-up and the most recently settled ones. */
+function trimFollowUps(mission: Mission) {
+  const settled = (mission.followUps ?? []).filter(item => item.state !== "open").sort((a, b) => (a.settledAt ?? "").localeCompare(b.settledAt ?? ""));
+  const dropped = new Set(settled.slice(0, Math.max(0, settled.length - settledFollowUpsKept)));
+  if (dropped.size) mission.followUps = mission.followUps!.filter(item => !dropped.has(item));
+}
 const subtaskStatus = (status: TeamView["status"]) => teamDone.has(status) ? "done" as const : status === "blocked" ? "blocked" as const : status === "cancelled" ? "cancelled" as const : "running" as const;
 const notFound = (error: unknown) => error instanceof TeamError && error.code === "team-not-found";
 
@@ -540,8 +580,24 @@ export class MissionService {
     if (live.has(mission.status)) {
       this.schedule(stored);
       await this.launchSubteams(stored);
+      this.fireFollowUps(stored);
       await this.wake(stored);
     }
+    this.save(stored);
+  }
+  /**
+   * Each due follow-up of a live mission becomes `fired` and adds one host message to the inbox in the same write,
+   * so a restart can neither lose the message nor fire it twice. A paused mission is not live, so its follow-ups wait.
+   */
+  private fireFollowUps(stored: Stored) {
+    const at = Date.now(), due = openFollowUps(stored.mission).filter(item => Date.parse(item.dueAt) <= at);
+    if (!due.length) return;
+    for (const item of due) {
+      Object.assign(item, { state: "fired", settledAt: now() });
+      stored.inbox.push({ type: "follow-up", followUpId: item.id, dueAt: item.dueAt, reason: item.reason, check: item.check });
+      this.event(stored, `The coordinator's follow-up for ${utcMinute(item.dueAt)} came due; the host asked the coordinator to look again: ${item.reason}`);
+    }
+    trimFollowUps(stored.mission);
     this.save(stored);
   }
   /** Stops the mission: queued work is cancelled and active subteams receive a cancel. */
@@ -554,6 +610,8 @@ export class MissionService {
       else if (subtask.teamId && ["running", "blocked"].includes(subtask.status)) this.queueOp(stored, { kind: "cancel", subtaskId: subtask.id, teamId: subtask.teamId });
     }
     stored.inbox = []; stored.notes = [];
+    // A blocked mission cannot resume, so its follow-ups could never fire.
+    cancelFollowUps(mission);
   }
   /**
    * A blocked mission cannot resume, so it waits on the owner only to be read and cancelled. After the retention
@@ -829,6 +887,7 @@ export class MissionService {
         const envelope = parsed.data;
         if (envelope.missionId !== stored.mission.id || envelope.memberId !== attempt.memberId || envelope.revision !== attempt.revision) continue;
         attempt.report = envelope.report; attempt.status = "reported";
+        if (envelope.note !== undefined) attempt.note = envelope.note;
         return;
       }
     } while (page.more);
@@ -901,7 +960,7 @@ export class MissionService {
     if (!attempt || attempt.status === "stopped") return;
     if (attempt.status === "queued") {
       if (live.has(mission.status)) { await this.launch(stored, attempt); return; }
-      if (!this.launched(attempt)) { attempt.status = "stopped"; this.save(stored); return; }
+      if (!this.launched(attempt)) { endAttempt(attempt); this.save(stored); return; }
       attempt.status = "running";
     }
     if (attempt.status === "running") {
@@ -922,7 +981,7 @@ export class MissionService {
             this.failResume(stored, attempt);
             this.save(stored); return;
           }
-          attempt.status = "stopped";
+          endAttempt(attempt);
           this.stop(stored, "blocked", "The mission coordinator exited without a valid structured report. Subteam workspaces remain available.");
           this.event(stored, stored.mission.reason!); this.save(stored); return;
         }
@@ -941,18 +1000,26 @@ export class MissionService {
       this.failResume(stored, attempt);
       this.save(stored); return;
     }
-    attempt.status = "stopped";
+    endAttempt(attempt);
     if (attempt.report) {
-      if (live.has(mission.status)) this.consume(stored, attempt.report, attempt);
+      if (live.has(mission.status)) { this.keepNote(stored, attempt); this.consume(stored, attempt.report, attempt); }
       else this.event(stored, "A coordinator report arrived after the mission stopped; it was not applied.");
+      delete attempt.note;
     } else if (attempt.missedReport && live.has(mission.status))
       this.refuse(stored, "missing", "Your previous attempt ended without a mission report. File exactly one report in every attempt; report wait when nothing needs a decision.");
     this.save(stored);
   }
+  /** Keeps the newest notes within the count and length limits; the oldest go first. A refused report's note is kept too. */
+  private keepNote(stored: Stored, attempt: Attempt) {
+    if (attempt.note === undefined) return;
+    const notes = stored.coordinatorNotes ??= [];
+    notes.push({ at: now(), text: attempt.note });
+    while (notes.length > noteLimit || notes.reduce((total, note) => total + note.text.length, 0) > noteCharacters) notes.shift();
+  }
   private failResume(stored: Stored, attempt: Attempt) {
     attempt.resumeFailed = true;
     attempt.missedReport = false;
-    attempt.status = "stopped";
+    endAttempt(attempt);
     stored.inbox = [...(attempt.consumedInbox ?? []), ...stored.inbox];
     stored.notes = [...(attempt.consumedNotes ?? []), ...stored.notes];
     this.event(stored, "The coordinator's conversation could not be resumed; a fresh attempt starts with the full mission state.");
@@ -966,21 +1033,27 @@ export class MissionService {
       this.event(stored, mission.reason!); this.save(stored); return;
     }
     const revision = stored.attempts.length + 1, profile = mission.lineup.coordinator;
-    let continuation: NativeContinuation | undefined;
+    let continuation: NativeContinuation | undefined, rotated: RotationRule | undefined;
     if (profile.provider === "claude") {
       for (let index = stored.attempts.length - 1; index >= 0; index--) {
         const previous = stored.attempts[index], nativeSessionId = previous.continuation?.nativeSessionId;
-        if (!previous.nativeConfirmed || !nativeSessionId) continue;
-        const failedLater = stored.attempts.slice(index + 1).some(attempt => attempt.resumeFailed && attempt.continuation?.nativeSessionId === nativeSessionId);
-        if (!failedLater) { continuation = { mode: "resume", nativeSessionId }; break; }
+        const failedLater = (id: string) => stored.attempts.slice(index + 1).some(attempt => attempt.resumeFailed && attempt.continuation?.nativeSessionId === id);
+        if (previous.nativeConfirmed && nativeSessionId && !failedLater(nativeSessionId)) { continuation = { mode: "resume", nativeSessionId }; break; }
+        // A rotation retired every older conversation. When nothing from the rotation on can be resumed, the next
+        // attempt starts fresh again rather than selecting, or rotating away from, a retired conversation.
+        if (previous.rotated) break;
       }
+      // A conversation that is idle, large, or long-lived costs more to resume than to restart from the mission state and notes.
+      rotated = continuation && this.rotation(stored, continuation.nativeSessionId);
+      if (rotated) continuation = undefined;
       continuation ??= { mode: "start", nativeSessionId: randomUUID() };
     }
     // Messages that need the coordinator go first; any beyond the limit wait for the next attempt rather than being dropped.
     const inbox = stored.inbox.slice(0, messageLimit), notes = stored.notes.slice(0, messageLimit - inbox.length);
     const waiting = stored.inbox.length + stored.notes.length - inbox.length - notes.length;
     // The prompt keeps a byte budget by leaving trailing messages queued, so inbox messages lead and notes are deferred first.
-    const messages = [...inbox, ...notes], context = { openChildDecisions: this.openChildDecisions(stored), waiting, answerProjectId: this.config.intake?.mission.answerProjectId };
+    const messages = [...inbox, ...notes], context = { openChildDecisions: this.openChildDecisions(stored), waiting, answerProjectId: this.config.intake?.mission.answerProjectId,
+      notes: stored.coordinatorNotes ?? [] };
     const build = (list: MissionMessage[], promptContext: typeof context) => continuation?.mode === "resume"
       ? missionFollowUpPromptWithMessageCount(mission, stored.repos, list, revision, profile.provider, profile, promptContext)
       : missionPromptWithMessageCount(mission, stored.repos, list, revision, profile.provider, profile, promptContext);
@@ -1001,10 +1074,54 @@ export class MissionService {
     if (mission.reason === messageTooLargeReason) mission.reason = undefined;
     const fromInbox = Math.min(built.includedMessageCount, inbox.length), fromNotes = built.includedMessageCount - fromInbox;
     const attempt: Attempt = { memberId: randomUUID(), sessionId: randomUUID(), revision, cursor: 0, stopRequestId: randomUUID(), status: "queued", ownerInputs: stored.ownerInputs ?? 0,
-      prompt: built.prompt, ...(continuation ? { continuation } : {}), consumedInbox: inbox.slice(0, fromInbox), consumedNotes: notes.slice(0, fromNotes) };
+      prompt: built.prompt, ...(continuation ? { continuation } : {}), ...(rotated ? { rotated } : {}), consumedInbox: inbox.slice(0, fromInbox), consumedNotes: notes.slice(0, fromNotes) };
     stored.attempts.push(attempt); stored.inbox = stored.inbox.slice(fromInbox); stored.notes = stored.notes.slice(fromNotes);
+    // A rotation is the host's choice, not a missed report, so it leaves the refusal count alone.
+    if (rotated) this.event(stored, `The coordinator continues in a new conversation (rule: ${rotated}) because ${rotationText[rotated]}. It receives the full mission state and its own earlier notes.`);
     this.save(stored);
     await this.launch(stored, attempt);
+  }
+
+  /**
+   * Whether the next attempt should start a new conversation instead of resuming this one: the first rule that holds,
+   * in the order idle, size, age. A rule set to 0 is off; the size rule needs a usage observation and never fires without one.
+   */
+  private rotation(stored: Stored, nativeSessionId: string): RotationRule | undefined {
+    const configured = this.config.autonomy?.continuity;
+    const idleMinutes = configured?.rotateIdleMinutes ?? rotationDefaults.rotateIdleMinutes;
+    const contextTokens = configured?.rotateContextTokens ?? rotationDefaults.rotateContextTokens;
+    const attempts = configured?.rotateAttempts ?? rotationDefaults.rotateAttempts;
+    const conversation = stored.attempts.filter(attempt => attempt.continuation?.nativeSessionId === nativeSessionId);
+    const ran = conversation.filter(attempt => attempt.startedAt), latest = ran.at(-1);
+    // An attempt stopped before endedAt existed has no end time, so the idle rule cannot judge it.
+    if (idleMinutes && latest?.endedAt && Date.now() - Date.parse(latest.endedAt) >= idleMinutes * 60000) return "idle";
+    if (contextTokens) {
+      if (latest) this.observeContext(latest);
+      const observed = [...ran].reverse().find(attempt => attempt.contextTokens !== undefined)?.contextTokens;
+      if (observed !== undefined && observed >= contextTokens) return "size";
+    }
+    if (attempts && conversation.length >= attempts) return "age";
+    return undefined;
+  }
+  /**
+   * Reads new usage records from the attempt's session journal and keeps the context size of the newest model call in
+   * the main conversation: its input, cache-read, cache-write, and output tokens. Subagent transcripts are skipped. A
+   * journal that cannot be read leaves the observation as it was; it never stops the mission.
+   */
+  private observeContext(attempt: Attempt) {
+    try {
+      for (let pages = 0; pages < 50; pages++) {
+        const page = this.manager.events(attempt.sessionId, attempt.usageCursor ?? 0, 200, new Set(["usage"]));
+        attempt.usageCursor = page.cursor;
+        for (const event of page.events) {
+          const record = event.type === "usage" ? ledgerRecord(event.data) : undefined;
+          if (!record || record.secondary) continue;
+          const { input, cacheRead, cacheWrite, output } = record.tokens;
+          attempt.contextTokens = input + cacheRead + cacheWrite + output;
+        }
+        if (!page.more) return;
+      }
+    } catch { /* no observation */ }
   }
 
   /** Every open subteam decision, read from the subteams rather than from messages, so none is lost between attempts. */
@@ -1030,6 +1147,7 @@ export class MissionService {
   private willWake(stored: Stored) {
     const mission = stored.mission;
     if (mission.decisions.some(item => !item.answer)) return true;
+    if (openFollowUps(mission).length) return true;
     // The subteam's live status, since a resume applied on this tick is not yet mirrored into the subtask.
     const working = (teamId: string) => {
       if (stored.ops.some(op => op.kind === "resume" && op.teamId === teamId)) return true;
@@ -1206,6 +1324,7 @@ export class MissionService {
         if (mission.decisions.some(item => !item.answer)) return this.refuse(stored, report.kind, "An owner decision is still open.", false);
         mission.result = { summary: report.summary, revision: mission.revision, at: now() };
         mission.status = "ready-for-review"; mission.reason = undefined; stored.inbox = []; stored.notes = [];
+        cancelFollowUps(mission);
         this.event(stored, "Every subtask finished and the coordinator reported a result. Ready for owner review; the mission itself published nothing.");
         break;
       }
@@ -1213,9 +1332,24 @@ export class MissionService {
         // A subteam decision wakes the coordinator once; waiting past it would leave the subteam waiting with nothing to wake either.
         const unhandled = this.openChildDecisions(stored).find(item => !item.ownerDecisionId && !item.answerPendingBy);
         if (unhandled) return this.refuse(stored, report.kind, `Decision ${unhandled.decisionId} of subtask ${unhandled.subtaskId} is still open. Answer it with answer-child, ask the owner with question, or cancel the subtask.`);
-        // Waiting is accepted only when a subteam or the owner will start a later attempt.
-        if (!this.willWake(stored)) return this.refuse(stored, report.kind, "Nothing is running or waiting for the owner, so no later attempt would start. Dispatch, cancel, report a result, ask the owner, or report blocked.");
-        this.event(stored, "The coordinator is waiting for subteam progress or owner input.");
+        // Waiting is accepted only when something will start a later attempt: a message that arrived during this attempt
+        // (such as a follow-up that fired while it ran) already waits in the inbox, or a subteam, the owner, or an open follow-up will.
+        if (!stored.inbox.length && !this.willWake(stored)) return this.refuse(stored, report.kind, "Nothing is running or waiting for the owner, and no follow-up is open, so no later attempt would start. Dispatch, cancel, report a result, ask the owner, set a follow-up, or report blocked.");
+        this.event(stored, "The coordinator is waiting for subteam progress, owner input, or a follow-up.");
+        break;
+      }
+      case "follow-up": {
+        const unhandled = this.openChildDecisions(stored).find(item => !item.ownerDecisionId && !item.answerPendingBy);
+        if (unhandled) return this.refuse(stored, report.kind, `Decision ${unhandled.decisionId} of subtask ${unhandled.subtaskId} is still open. Answer it with answer-child, ask the owner with question, or cancel the subtask.`);
+        if (openFollowUps(mission).length >= followUpLimit)
+          return this.refuse(stored, report.kind, `${followUpLimit} follow-ups are already open. Act on what you planned to check, wait for one to come due, or report wait.`);
+        const at = Date.now(), dueAt = at + report.inMinutes * 60000, deadline = this.deadlineMs(stored, at);
+        if (dueAt >= deadline)
+          return this.refuse(stored, report.kind, `That time is at or after the mission deadline, ${utcMinute(new Date(deadline).toISOString())}. Choose an earlier time, decide now, or report blocked.`);
+        // One report per attempt, so the attempt's member ID names its follow-up and a replayed report adds nothing.
+        const followUp: MissionFollowUp = { id: attempt.memberId, dueAt: new Date(dueAt).toISOString(), reason: report.reason, check: report.check, createdAt: new Date(at).toISOString(), state: "open" };
+        if (!(mission.followUps ??= []).some(item => item.id === followUp.id)) mission.followUps.push(followUp);
+        this.event(stored, `The coordinator plans to look again at ${utcMinute(followUp.dueAt)}: ${report.reason}`);
         break;
       }
       case "blocked":
@@ -1297,6 +1431,10 @@ function missionDetail(mission: Mission, teamById: Map<string, TeamView>) {
   if (prompted) return `Subtask ${prompted.id}: ${providerInputReason}`;
   if (mission.status === "blocked" || mission.status === "cancelled" || mission.status === "paused") return mission.reason ?? mission.status;
   if (mission.status === "ready-for-review") return mission.result?.summary ?? "Ready for review";
+  // A coordinator sleeping until its follow-up, with no subteam running, would otherwise look stalled.
+  const next = openFollowUps(mission).sort((a, b) => a.dueAt.localeCompare(b.dueAt))[0];
+  if (next && mission.coordinator?.status === "waiting" && !mission.subtasks.some(item => item.status === "running"))
+    return `Waiting until ${utcMinute(next.dueAt)} to look again: ${next.reason}`;
   if (!mission.subtasks.length) return "Planning subtasks";
   const counts = subtaskCounts(mission), running = mission.subtasks.filter(item => item.status === "running");
   return `${running.length ? `Running: ${running.map(item => item.title).join(", ")}. ` : ""}${counts.done} of ${counts.total} subtasks done`;

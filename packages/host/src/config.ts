@@ -34,9 +34,16 @@ export const fuseConfigSchema = z.object({
   projects: z.record(z.string().min(1), fuseCeilingsSchema).optional(),
 }).strict();
 export type FuseConfig = z.infer<typeof fuseConfigSchema>;
-/** Settings for work that continues on its own. No default here: routines and standing goals apply 5 minutes at read. */
+/**
+ * Settings for work that continues on its own. No defaults here. Routines and standing goals apply a 5-minute wake
+ * gap at read. The mission service applies 60 minutes, 120,000 tokens, and 40 attempts for when a coordinator starts
+ * a new conversation instead of resuming; zero turns that rule off.
+ */
 export const continuityConfigSchema = z.object({
   wakeMinGapMinutes: z.number().int().min(0).max(1440).optional(),
+  rotateIdleMinutes: z.number().int().min(0).max(10080).optional(),
+  rotateContextTokens: z.number().int().min(0).max(10_000_000).optional(),
+  rotateAttempts: z.number().int().min(0).max(1000).optional(),
 }).strict();
 export type ContinuityConfig = z.infer<typeof continuityConfigSchema>;
 /** Outcome measurement settings. No default here: each consumer applies its own default where it reads the value. */

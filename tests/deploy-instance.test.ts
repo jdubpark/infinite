@@ -119,6 +119,7 @@ test("every tracked deploy file that names a first-instance path is rendered for
     ["infinite-backup.service", "runs that one backup job"],
     ["commissioning.md", "the record of commissioning the machine and its first instance"],
     ["github-app.md", "the first instance's GitHub App setup; instances.md gives an instance's own"],
+    ["github-proxy.md", "the first instance's GitHub credential proxy; a second instance needs its own key, account, port, unit, and token directory"],
     ["public-relay.md", "the relay and the first instance's connection to it; instances.md registers an instance"],
     ["instances.md", "names first-instance paths to tell them apart from an instance's"],
     ["jevcode-wrapper.sh", "repository briefings, which an instance runs without until an instance wrapper exists"],

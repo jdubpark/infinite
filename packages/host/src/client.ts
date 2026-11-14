@@ -24,6 +24,7 @@ import { boundTeamProject, forgetBoundTeamProject, handleTeamClientCommand } fro
 import { handleBoardClientCommand, projectsLines } from "./board-cli.js";
 import { handleUnderstandingCommand } from "./understanding-cli.js";
 import { handleRoutineClientCommand } from "./routine-cli.js";
+import { handleAutonomyClientCommand } from "./autonomy-cli.js";
 import type { ProjectGroupList } from "./project-group-types.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
@@ -484,9 +485,9 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   }
 }
 
-const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "evidence", "resources", "close", "sync", "pull", "team", "repo", "routine"]);
+const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "evidence", "resources", "close", "sync", "pull", "team", "repo", "routine", "autonomy"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
-const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role"]);
+const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role", "--autonomy"]);
 const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs"]);
 
 /**
@@ -778,6 +779,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     const config = loadConfig(path), api = connection(config);
     if (command === "understand") return await handleUnderstandingCommand(positional, options, api);
     if (command === "routine") return await handleRoutineClientCommand(positional, options, api);
+    if (command === "autonomy") return await handleAutonomyClientCommand(positional, options, api);
     if (command === "team" || command === "repo") {
       return await handleTeamClientCommand(command, positional, options, config, api, path, argv);
     }

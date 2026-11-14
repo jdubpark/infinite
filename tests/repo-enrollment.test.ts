@@ -158,7 +158,8 @@ test("owner CLI enrolls a mirrored repository, while other roles and browser own
   const external = mkdtempSync(join(tmpdir(), "infinite-enrollment-route-"));
   const homeDir = join(external, "home");
   const teamWorkspace = join(external, "team-workspaces");
-  mkdirSync(homeDir); mkdirSync(teamWorkspace);
+  // The host refuses a group-writable home directory, so the fixture must not depend on the caller's umask.
+  mkdirSync(homeDir, { mode: 0o755 }); mkdirSync(teamWorkspace);
   const host = await startHost({ config: { sync: { homeDir, sharedGroup: true }, teams: { workspaceDir: teamWorkspace } } });
   try {
     const mapped = await host.fetchApi("/projects/resolve", "owner", { path: "Projects/sample" });

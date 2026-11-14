@@ -6,7 +6,7 @@ import { autonomyOf, type AutonomyMode } from "./autonomy.js";
 import { TeamService, TeamError } from "./teams.js";
 import { createGoalSchema, goalActionSchema, goalExtendSchema, goalOutcomeSchema, goalParallelismSchema, goalSteerSchema, type CreateGoal, type ProductGoal } from "./goal-types.js";
 import type { Config } from "./types.js";
-import type { CreateTeam, TeamGoalContext, TeamView } from "./team-types.js";
+import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, type CreateTeam, type TeamGoalContext, type TeamView } from "./team-types.js";
 import { addRollups, emptyRollup, type UsageRollup } from "./team-usage.js";
 import type { LinearService } from "./linear.js";
 import { applyFuseReason } from "./fuse/rules.js";
@@ -99,6 +99,25 @@ export class GoalService {
   private event(stored: Stored, text: string) {
     stored.goal.events.push({ at: now(), text });
     if (stored.goal.events.length > 200) stored.goal.events.splice(0, stored.goal.events.length - 200);
+  }
+  private block(stored: Stored, reason: string) {
+    if (stored.goal.status !== "blocked") stored.goal.blockedAt = now();
+    stored.goal.status = "blocked"; stored.goal.reason = reason;
+  }
+  private closeStaleBlocked(stored: Stored) {
+    const goal = stored.goal;
+    if (goal.status !== "blocked") return;
+    const hours = this.config.teams?.retention?.blockedHours ?? DEFAULT_TEAM_RETENTION.blockedHours;
+    // A record from before this field cannot date its block (a child's block writes no goal event), so its period
+    // starts at its last save: never earlier than the block, hence never an early close.
+    goal.blockedAt ??= goal.updatedAt;
+    const since = Date.parse(goal.blockedAt);
+    if (!Number.isFinite(since) || Date.now() - since < hours * 3600000) return;
+    const reason = hostClosedBlockedReason(hours, goal.reason);
+    this.setControl(stored, "cancel");
+    goal.status = "cancelled"; goal.reason = reason;
+    if (!goal.events.some(event => event.text === reason)) this.event(stored, reason);
+    this.save(stored);
   }
   /** Status rows for owner alerts. Unlike list(), reading them does not refresh tracker state or usage. */
   statuses() { return [...this.records.values()].map(({ goal }) => ({ id: goal.id, title: goal.title, status: goal.status, reason: goal.reason })); }
@@ -373,8 +392,9 @@ export class GoalService {
               if (this.closed) return;
               const reason = error instanceof TeamError ? error.message : "The goal could not advance. Its work and evidence remain available.";
               if (stored.goal.status !== "blocked" || stored.goal.reason !== reason) this.event(stored, reason);
-              if (!["paused", "cancelled", "limit-reached"].includes(stored.goal.status)) stored.goal.status = "blocked";
-              stored.goal.reason = reason; this.save(stored);
+              if (!["paused", "cancelled", "limit-reached"].includes(stored.goal.status)) this.block(stored, reason);
+              else stored.goal.reason = reason;
+              this.save(stored);
             }
           }
         } finally { this.tickQueued = false; }
@@ -438,8 +458,8 @@ export class GoalService {
         this.save(stored); return true;
       }
       stored.control = undefined;
-      if (!["paused", "cancelled", "limit-reached"].includes(stored.goal.status)) stored.goal.status = "blocked";
-      stored.goal.reason = error.message;
+      if (!["paused", "cancelled", "limit-reached"].includes(stored.goal.status)) this.block(stored, error.message);
+      else stored.goal.reason = error.message;
       this.event(stored, `The goal action could not be applied: ${error.message}`); this.save(stored); return false;
     }
     if (this.closed) return false;
@@ -458,10 +478,11 @@ export class GoalService {
     if (this.closed) return;
     await this.recoverExtension(stored);
     const goal = stored.goal;
+    this.closeStaleBlocked(stored);
     goal.linear = this.linear?.updateGoal(goal, goal.linearTracking === true) ?? goal.linear;
     if (goal.linear?.status === "blocked" && !terminal.has(goal.status)) {
-      goal.status = "blocked"; goal.reason = goal.linear.reason ?? "The Linear issue no longer matches this approved goal. Review it before starting another goal.";
-      this.setControl(stored, "cancel"); this.event(stored, goal.reason);
+      const reason = goal.linear.reason ?? "The Linear issue no longer matches this approved goal. Review it before starting another goal.";
+      this.block(stored, reason); this.setControl(stored, "cancel"); this.event(stored, reason);
     }
     this.save(stored);
     const trackingReady = !goal.linear || goal.linear.status === "synced";
@@ -508,8 +529,10 @@ export class GoalService {
           if (["running", "needs-input"].includes(goal.status)) {
             const deadlineStopped = goal.stopReason === "deadline" || goal.deadlineContinuation === true;
             const extendedDeadline = deadlineStopped && goal.deadlineContinuation === true && Date.now() < Date.parse(goal.deadlineAt);
-            goal.status = extendedDeadline ? "running" : goal.stopReason ? "limit-reached" : "blocked";
-            goal.reason = extendedDeadline ? undefined : cycle.reason ?? "The active team stopped before producing a reviewed result.";
+            const reason = cycle.reason ?? "The active team stopped before producing a reviewed result.";
+            if (extendedDeadline) { goal.status = "running"; goal.reason = undefined; }
+            else if (goal.stopReason) { goal.status = "limit-reached"; goal.reason = reason; }
+            else this.block(stored, reason);
             if (extendedDeadline) this.event(stored, "The deadline-stopped team settled after an owner extension; the goal will continue in a new cycle.");
           }
           this.save(stored);
@@ -519,8 +542,8 @@ export class GoalService {
       if (["ready-for-review", "merged", "no-change", "blocked", "cancelled"].includes(team.status)) {
         if (["running", "needs-input"].includes(goal.status) && ["ready-for-review", "merged", "no-change"].includes(team.status) && team.linear && team.linear.status !== "synced") {
           if (team.linear.status === "blocked") {
-            goal.status = "blocked"; goal.reason = team.linear.reason ?? "The feature's Linear issue no longer permits continuation.";
-            this.event(stored, goal.reason);
+            const reason = team.linear.reason ?? "The feature's Linear issue no longer permits continuation.";
+            this.block(stored, reason); this.event(stored, reason);
           } else { this.save(stored); return; }
         }
         if (team.members.every(member => ["stopped", "waiting"].includes(member.status))) goal.activeTeamId = undefined;
@@ -529,8 +552,10 @@ export class GoalService {
             const deadlineStopped = team.stopReason === "deadline" || goal.stopReason === "deadline" || goal.deadlineContinuation === true;
             if (deadlineStopped) { goal.stopReason = "deadline"; goal.deadlineContinuation = true; }
             const extendedDeadline = deadlineStopped && goal.deadlineContinuation === true && Date.now() < Date.parse(goal.deadlineAt);
-            goal.status = extendedDeadline ? "running" : team.stopReason ? "limit-reached" : "blocked";
-            goal.reason = extendedDeadline ? undefined : team.reason ?? "The active team stopped before producing a reviewed result.";
+            const reason = team.reason ?? "The active team stopped before producing a reviewed result.";
+            if (extendedDeadline) { goal.status = "running"; goal.reason = undefined; }
+            else if (team.stopReason) { goal.status = "limit-reached"; goal.reason = reason; }
+            else this.block(stored, reason);
             if (extendedDeadline) this.event(stored, "The deadline-stopped team settled after an owner extension; the goal will continue in a new cycle.");
           } else if (team.status === "no-change") {
             goal.status = goal.cycles.some(cycle => ["ready-for-review", "merged"].includes(cycle.status)) ? "ready-for-review" : "no-opportunity";

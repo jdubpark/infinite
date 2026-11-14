@@ -7,6 +7,7 @@ import { accountOf, periodStart, priceUsage, sumUsage, type Pricing, type UsageR
 import { usagePlanSchema, type AccountView, type Balance, type BriefingUsage, type Money, type TaskUsage, type UsageResolvers } from "./usage-api.js";
 import { EvidenceError } from "./evidence/types.js";
 import type { EvidenceStore } from "./evidence/store.js";
+import type { EvidenceTx } from "./evidence/types.js";
 import type { UsageCoverage } from "./transcript-usage.js";
 import {
   SESSION_PURPOSES, importLedger, importState, ledgerRecord, readBriefings, readRecords, readSessions, usageModule, writeBriefing, writeRecord, writeSession,
@@ -32,6 +33,26 @@ type Snapshot = {
   briefings: { projectId: string; at: string; record?: UsageRecord }[];
   taskKey?: string;
 };
+/**
+ * One whole read of the ledger, with the indexes that lookups use. The service keeps it until it writes the ledger
+ * again, so a list that asks once for each member or session reads the store once, not once for each of them.
+ */
+type Ledger = {
+  sessions: readonly StoredSession[];
+  byId: ReadonlyMap<string, StoredSession>;
+  byMember: ReadonlyMap<string, readonly StoredSession[]>;
+  /** Records of measured sessions only, in the order the store returns them. */
+  bySession: Map<string, UsageRecord[]>;
+  /** A record's place in the store's order, to put a member's records from several sessions back in that order. */
+  order: ReadonlyMap<UsageRecord, number>;
+  briefings: Snapshot["briefings"];
+};
+const memberKey = (runId: string, memberId: string) => `${runId}\u0000${memberId}`;
+/**
+ * The kept read answers for at most this long, the period of a tick. Lookups in one list pass share it, and a ledger
+ * that can no longer be read is noticed within a tick even when nothing writes it.
+ */
+export const LEDGER_KEEP_MS = 2_000;
 /** The state a session row holds after a tick. Its coverage is derived from these facts, never kept apart from them. */
 type Row = Pick<LedgerState, "exited" | "cursor" | "seen" | "refused" | "journaled"> & { lastActiveAt?: string };
 
@@ -110,6 +131,12 @@ export class UsageService {
   private readonly failed = new Set<string>();
   /** When the ledger first saw each covered session listed as exited. Kept in memory only. */
   private readonly exitedAt = new Map<string, number>();
+  /** The last whole read of the ledger. Every write of this service drops it; nothing else writes the usage tables. */
+  private kept?: Ledger;
+  /** When the kept read was taken. */
+  private keptAt = 0;
+  /** When a whole read last failed. For the same time a kept read answers, the ledger answers `unavailable` without another read. */
+  private failedAt?: number;
   private readonly planFile: string;
   private planOverrides: Record<string, number> = Object.create(null) as Record<string, number>;
   private balances?: { get(id: string): Balance };
@@ -150,6 +177,10 @@ export class UsageService {
   readable(): boolean {
     if (!this.available()) return false;
     try { this.store.read(db => importState(db)); return true; } catch { return false; }
+  }
+  /** Every write of the ledger goes through here, so the kept read never outlives a change, also one that failed halfway. */
+  private write<T>(fn: (tx: EvidenceTx) => T): T {
+    try { return this.store.write(fn); } finally { this.kept = undefined; this.failedAt = undefined; }
   }
   /** The store has the usage module and the sealed import is recorded. Ticks run on this, so a failed tick retries. */
   private storeReady(): boolean { return this.imported && this.store.status().modules[usageModule.name] === "ready"; }
@@ -242,7 +273,7 @@ export class UsageService {
               seen: current.seen + seen, refused: current.refused + refused, ...(journaled ? { journaled } : {}) };
             const key = keyed(next);
             if (key !== saved) {
-              const written = this.store.write(tx => {
+              const written = this.write(tx => {
                 if (!writeSession(tx, header, stateOf(next))) return false;
                 for (const record of records) writeRecord(tx, session.id, record);
                 return true;
@@ -259,7 +290,7 @@ export class UsageService {
         }
         const final: Row = { ...current, exited: closes(complete, current.journaled) };
         if (final.exited) this.exitedAt.delete(session.id);
-        if (keyed(final) !== saved) this.store.write(tx => writeSession(tx, header, stateOf(final)));
+        if (keyed(final) !== saved) this.write(tx => writeSession(tx, header, stateOf(final)));
       }
       this.tickFailed = false;
     } catch (error) {
@@ -277,7 +308,7 @@ export class UsageService {
     try {
       if (this.store.read(db => importState(db)) === "done") return true;
       const sealed = this.sealedLedger();
-      this.store.write(tx => importLedger(tx, sealed.ledger, sealed.outcome));
+      this.write(tx => importLedger(tx, sealed.ledger, sealed.outcome));
       return true;
     } catch {
       console.warn("[Infinite] The usage ledger could not be imported and stays unavailable until the next start.");
@@ -305,29 +336,59 @@ export class UsageService {
   }
 
   /**
-   * Reads the ledger inside one store read. A failure of the store, or an unavailable ledger, throws `unavailable`.
-   * Only the store's read is guarded, so an invalid argument still throws its own error.
+   * The whole ledger, from the kept read or from one store read. A failure of the store, a row that does not open, or
+   * an unavailable ledger throws `unavailable`, and a failed read is never kept. The kept read answers until this
+   * service writes the ledger, and for at most `LEDGER_KEEP_MS`; a failure answers for the same time. What it returns
+   * is shared between calls and frozen: a caller copies before it sorts or adds.
    */
-  private snapshot(options: { sessionIds?: string[]; taskId?: string } = {}): Snapshot {
+  private ledger(): Ledger {
     if (!this.available()) throw new EvidenceError("unavailable", "The usage ledger is unavailable.");
-    let data: { sessions: StoredSession[]; records: { sessionId: string; record: UsageRecord }[]; briefings: Snapshot["briefings"]; taskKey?: string };
+    // A clock that stepped back counts as expired.
+    const now = Date.now();
+    if (this.kept && now >= this.keptAt && now - this.keptAt < LEDGER_KEEP_MS) return this.kept;
+    this.kept = undefined;
+    // A failed read is not tried again at once. A list asks once for each member or session, and each try would read
+    // most of the ledger before it fails, so an unreadable ledger would block the host that a readable one no longer blocks.
+    if (this.failedAt !== undefined && now >= this.failedAt && now - this.failedAt < LEDGER_KEEP_MS) throw new EvidenceError("unavailable", "The usage ledger is unavailable.");
+    let data: { sessions: StoredSession[]; records: { sessionId: string; record: UsageRecord }[]; briefings: Snapshot["briefings"] };
     try {
-      data = this.store.read(db => ({
-        sessions: readSessions(db),
-        records: readRecords(db, options.sessionIds ? { sessionIds: options.sessionIds } : {}),
-        briefings: readBriefings(db),
-        taskKey: options.taskId === undefined ? undefined : db.index("task", options.taskId),
-      }));
+      data = this.store.read(db => ({ sessions: readSessions(db), records: readRecords(db), briefings: readBriefings(db) }));
     } catch {
+      this.failedAt = now;
       throw new EvidenceError("unavailable", "The usage ledger is unavailable.");
     }
-    const measuredIds = new Set(data.sessions.filter(measured).map(session => session.sessionId));
-    const bySession = new Map<string, UsageRecord[]>();
-    for (const { sessionId, record } of data.records) {
-      if (!measuredIds.has(sessionId)) continue;
-      (bySession.get(sessionId) ?? bySession.set(sessionId, []).get(sessionId)!).push(record);
+    this.failedAt = undefined;
+    const byId = new Map<string, StoredSession>(), members = new Map<string, StoredSession[]>();
+    for (const session of data.sessions) {
+      Object.freeze(session);
+      byId.set(session.sessionId, session);
+      if (session.runId === undefined || session.memberId === undefined) continue;
+      const key = memberKey(session.runId, session.memberId);
+      (members.get(key) ?? members.set(key, []).get(key)!).push(session);
     }
-    return { sessions: data.sessions, bySession, briefings: data.briefings, ...(data.taskKey === undefined ? {} : { taskKey: data.taskKey }) };
+    const bySession = new Map<string, UsageRecord[]>(), order = new Map<UsageRecord, number>();
+    data.records.forEach(({ sessionId, record }, index) => {
+      const session = byId.get(sessionId);
+      if (!session || !measured(session)) return;
+      order.set(record, index);
+      (bySession.get(sessionId) ?? bySession.set(sessionId, []).get(sessionId)!).push(record);
+    });
+    for (const list of members.values()) Object.freeze(list);
+    for (const list of bySession.values()) Object.freeze(list);
+    this.kept = { sessions: Object.freeze(data.sessions), byId, byMember: members, bySession, order, briefings: Object.freeze(data.briefings) as Snapshot["briefings"] };
+    this.keptAt = now;
+    return this.kept;
+  }
+  /** The ledger as the roll-ups read it. Only `taskUsage` gives a task, whose blind index needs the store. */
+  private snapshot(options: { taskId?: string } = {}): Snapshot {
+    const ledger = this.ledger();
+    let taskKey: string | undefined;
+    if (options.taskId !== undefined) {
+      const taskId = options.taskId;
+      try { taskKey = this.store.read(db => db.index("task", taskId)); }
+      catch { throw new EvidenceError("unavailable", "The usage ledger is unavailable."); }
+    }
+    return { sessions: ledger.sessions as StoredSession[], bySession: ledger.bySession, briefings: ledger.briefings, ...(taskKey === undefined ? {} : { taskKey }) };
   }
   /** A Claude or Codex record is unpriced whatever prices are configured. The account rule that prices a subscription comes in phase 4. */
   private price(record: UsageRecord): { cost: number; pricing: Pricing } {
@@ -396,11 +457,18 @@ export class UsageService {
     const sessions = data.sessions.filter(session => session.projectId === id), briefings = data.briefings.filter(row => row.projectId === id);
     if (!sessions.length && !briefings.length) return undefined;
     const total = this.money(this.projectRows(data, id)), unmeasured = this.projectUnmeasured(data, id), partialCount = this.projectPartial(data, id), grouped = { goals: [] as any[], teams: [] as any[], sessions: [] as any[], briefings: [] as any[] };
+    // A run's goal is resolved once for the request: the resolver builds every goal's view, and a project has many
+    // sessions for each run.
+    const resolved = new Map<string, ReturnType<UsageResolvers["goalOfRun"]>>();
+    const goalOfRun = (runId: string) => {
+      if (!resolved.has(runId)) resolved.set(runId, this.resolvers.goalOfRun(runId));
+      return resolved.get(runId);
+    };
     for (const session of sessions) {
       const records = this.priced(data.bySession.get(session.sessionId) ?? []), sum = this.money(records);
       if (!measured(session)) continue;
       if (session.runId !== undefined) {
-        const goal = this.resolvers.goalOfRun(session.runId), prior = grouped.teams.find(row => row.id === session.runId);
+        const goal = goalOfRun(session.runId), prior = grouped.teams.find(row => row.id === session.runId);
         if (prior) { prior.total.usd = Math.round((prior.total.usd + sum.usd) * 1_000_000) / 1_000_000; prior.total.unpriced += sum.unpriced; }
         else grouped.teams.push({ id: session.runId, title: this.resolvers.runTitle(session.runId) ?? session.runId, total: sum, ...(goal ? { goalId: goal.id } : {}) });
       }
@@ -409,7 +477,7 @@ export class UsageService {
     for (const row of briefings) { const cost = row.record ? this.price(row.record) : undefined; grouped.briefings.push({ row, cost }); }
     const goals = new Map<string, { id: string; title: string; total: Money; tasks: number }>(), goalTasks = new Map<string, Set<string>>();
     for (const row of grouped.teams.filter(item => item.goalId)) {
-      const goal = this.resolvers.goalOfRun(row.id)!; const current = goals.get(goal.id) ?? { id: goal.id, title: goal.title, total: { usd: 0, unpriced: 0 }, tasks: 0 };
+      const goal = goalOfRun(row.id)!; const current = goals.get(goal.id) ?? { id: goal.id, title: goal.title, total: { usd: 0, unpriced: 0 }, tasks: 0 };
       current.total.usd = Math.round((current.total.usd + row.total.usd) * 1_000_000) / 1_000_000; current.total.unpriced += row.total.unpriced; goals.set(goal.id, current);
       const ids = goalTasks.get(goal.id) ?? new Set<string>(); for (const session of data.sessions) { if (!session.runId || session.runId !== row.id || !session.taskKey) continue; ids.add(`${row.id}/${session.taskKey}`); } goalTasks.set(goal.id, ids);
     }
@@ -436,16 +504,16 @@ export class UsageService {
     if (record && !checked) console.warn("[Infinite] A usage briefing record is invalid and is stored without its figures.");
     if (!this.available()) return void console.warn("[Infinite] A usage briefing was lost because the usage ledger is unavailable.");
     try {
-      this.store.write(tx => writeBriefing(tx, `${sessionId}/${at}`, projectId, at, checked));
+      this.write(tx => writeBriefing(tx, `${sessionId}/${at}`, projectId, at, checked));
     } catch {
       console.warn("[Infinite] A usage briefing was lost because the usage ledger could not store it.");
     }
   }
 
   session(sessionId: string): SessionUsage | UnmeasuredUsage {
-    let data: Snapshot;
-    try { data = this.snapshot({ sessionIds: [sessionId] }); } catch { return { measured: false, coverage: "none", unavailable: true }; }
-    const session = data.sessions.find(item => item.sessionId === sessionId);
+    let data: Ledger;
+    try { data = this.ledger(); } catch { return { measured: false, coverage: "none", unavailable: true }; }
+    const session = data.byId.get(sessionId);
     if (!session || !measured(session)) return { measured: false, coverage: "none", ...(session?.reason ? { coverageReason: session.reason } : {}) };
     return { ...sumUsage(this.priced(data.bySession.get(sessionId) ?? [])), measured: true, coverage: session.coverage as "partial" | "complete", ...(session.reason ? { coverageReason: session.reason } : {}) };
   }
@@ -454,29 +522,21 @@ export class UsageService {
    * A failed read is unavailable, like `session`.
    */
   member(runId: string, memberId: string): SessionUsage | UnmeasuredUsage {
-    if (!this.available()) return { measured: false, coverage: "none", unavailable: true };
-    let data: { sessions: StoredSession[]; records: { sessionId: string; record: UsageRecord }[] };
-    try {
-      data = this.store.read(db => {
-        const sessions = readSessions(db).filter(session => session.runId === runId && session.memberId === memberId);
-        return { sessions, records: readRecords(db, { sessionIds: sessions.map(session => session.sessionId) }) };
-      });
-    } catch {
-      return { measured: false, coverage: "none", unavailable: true };
-    }
-    const ordered = [...data.sessions].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.sessionId.localeCompare(b.sessionId));
+    let data: Ledger;
+    try { data = this.ledger(); } catch { return { measured: false, coverage: "none", unavailable: true }; }
+    const sessions = data.byMember.get(memberKey(runId, memberId)) ?? [];
+    const ordered = [...sessions].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.sessionId.localeCompare(b.sessionId));
     const coverage = combineCoverage(ordered.map(session => ({ coverage: session.coverage, coverageReason: session.reason })));
     if (coverage.coverage === "none") return { measured: false, coverage: "none" };
-    const measuredIds = new Set(ordered.filter(measured).map(session => session.sessionId));
-    const rows = data.records.filter(({ sessionId }) => measuredIds.has(sessionId)).map(({ record }) => record);
+    // The member's records in the store's order, whichever of its sessions each belongs to.
+    const rows = sessions.flatMap(session => data.bySession.get(session.sessionId) ?? []).sort((a, b) => data.order.get(a)! - data.order.get(b)!);
     return { ...sumUsage(this.priced(rows)), measured: true, coverage: coverage.coverage as "partial" | "complete", ...(coverage.reason ? { coverageReason: coverage.reason } : {}) };
   }
   /** Sum over the measured sessions among `ids`; unmeasured ones contribute nothing. */
   sessions(ids: string[]): UsageTotals {
-    let data: Snapshot;
-    try { data = this.snapshot({ sessionIds: ids }); } catch { return sumUsage([]); }
-    const measuredIds = new Set(data.sessions.filter(measured).map(session => session.sessionId));
-    return sumUsage(this.priced(ids.filter(id => measuredIds.has(id)).flatMap(id => data.bySession.get(id) ?? [])));
+    let data: Ledger;
+    try { data = this.ledger(); } catch { return sumUsage([]); }
+    return sumUsage(this.priced(ids.flatMap(id => data.bySession.get(id) ?? [])));
   }
 
   summary(now = new Date()): UsageSummary {

@@ -3,6 +3,7 @@ import { isAbsolute } from "node:path";
 import { z } from "zod";
 import type { CreateMission } from "./mission-types.js";
 import { projectGroupIdSchema } from "./project-group-types.js";
+import type { IntakeRoute } from "./intake-route.js";
 
 export const intakeConfigSchema = z.object({
   linear: z.object({
@@ -23,6 +24,10 @@ export const intakeConfigSchema = z.object({
     bindByMention: z.boolean().default(false),
     /** True lets the owner's mention of the bot file a Linear issue and start a mission. */
     directRequests: z.boolean().default(false),
+    /** True lets the owner's mention be a question: it is routed to a read-only answer or to a filed request. Needs directRequests. */
+    answerQuestions: z.boolean().default(false),
+    /** True lets the reading service choose the route when the owner gave no word. Needs answerQuestions and the jev block. */
+    classify: z.boolean().default(false),
     endpoint: z.url().optional(),
   }).strict().optional(),
   mission: z.object({
@@ -52,7 +57,11 @@ export interface IntakeInbound {
   call?: { action: "answer" | "steer" | "pause" | "resume" | "cancel"; decisionId?: string; text?: string; revision: number };
 }
 /** The owner's Slack mention a record was filed from; `filedAt` is set once Linear holds the issue. */
-export interface IntakeDirect { eventId: string; ts: string; text: string; filedAt?: string }
+export interface IntakeDirect {
+  eventId: string; ts: string; text: string; filedAt?: string;
+  /** Where the request went: absent on records made before routing existed or with answerQuestions off, and then it is work. */
+  route?: IntakeRoute & { at: string };
+}
 export interface IntakeComment { id: string; body: string; delivered: boolean; attempts: number; error?: string }
 export interface IntakeRecord {
   issueId: string; identifier: string; url: string; title: string; description: string;
@@ -78,6 +87,8 @@ export interface IntakeRecord {
 export interface IntakeView {
   issueId: string; identifier: string; url: string; title: string; state: IntakeState;
   skipReason?: IntakeSkipReason; holdReason?: string; missionId?: string; threadBound: boolean;
+  /** The route chosen for a direct request and why; never the request's text. */
+  route?: IntakeRoute & { at: string };
   comments: { started?: "pending" | "delivered"; outcome?: "pending" | "delivered" };
   messages: { key: string; kind: IntakeMessageKind; status: IntakeMessage["status"]; ts?: string; error?: string }[];
 }

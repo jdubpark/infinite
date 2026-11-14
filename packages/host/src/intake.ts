@@ -9,6 +9,7 @@ import type { MissionService } from "./missions.js";
 import { TeamError } from "./teams.js";
 import type { CreateMission, Mission, MissionOrigin } from "./mission-types.js";
 import type { Config } from "./types.js";
+import { ROUTE_INPUT_LIMIT, decideRoute, explicitRoute, type RouteReading } from "./intake-route.js";
 
 const objectiveLimit = 24000, descriptionLimit = 12000, threadUnreadableMs = 60 * 60 * 1000;
 const omissionReserve = 40;
@@ -130,7 +131,16 @@ function markedThread(thread: SlackThreadMessage[], mentionTs: string, ownerUser
  * the owner instructs, and the marked thread as it stood at `mentionTs`, bounded. Other people's text appears only there.
  */
 export function directObjective(issue: { identifier: string; title: string }, text: string, thread: SlackThreadMessage[] | undefined, mentionTs: string, ownerUserId: string): string {
-  const parts = [`Request filed from Slack as ${issue.identifier}: ${issue.title}`];
+  return objectiveFrom(`Request filed from Slack as ${issue.identifier}: ${issue.title}`, text, thread, mentionTs, ownerUserId);
+}
+
+/** The objective of an answer mission: the same owner text and marked thread, under a header that names a question and no issue. */
+export function answerObjective(title: string, text: string, thread: SlackThreadMessage[] | undefined, mentionTs: string, ownerUserId: string): string {
+  return objectiveFrom(`Question asked from Slack: ${title}`, text, thread, mentionTs, ownerUserId);
+}
+
+function objectiveFrom(header: string, text: string, thread: SlackThreadMessage[] | undefined, mentionTs: string, ownerUserId: string): string {
+  const parts = [header];
   const owner = text.trim();
   if (owner) parts.push(owner.slice(0, descriptionLimit));
   parts.push(directInstructions);
@@ -209,6 +219,12 @@ export function outboundText(config: Config, value: string): string {
 }
 
 /** A direct request's tracker comment is a fixed receipt: agent text may quote other people's Slack messages. */
+/** The most time the reading service may take before the request goes to work. */
+const ROUTE_WAIT_MS = 6000;
+const ANSWER_RULE = "owner Slack mention of the bot (question)";
+const ANSWER_MAX_MINUTES = 30;
+/** True for a record whose route is an answer: Linear is never involved with it. */
+export const isAnswerRecord = (record: IntakeRecord): boolean => record.direct?.route?.kind === "answer";
 const directReceipts = {
   ready: "Infinite agent report: ready for review. The report is in the Slack thread this request came from.",
   blocked: "Infinite agent report: blocked. The reason is in the Slack thread this request came from.",
@@ -239,7 +255,9 @@ export class IntakeService {
     private readonly store: IntakeStore,
     private readonly missions: MissionService,
     private readonly linear: IntakeLinear,
-    private readonly options: { threads?: IntakeThreadReader; pollMs?: number; create?: (request: CreateMission, origin: MissionOrigin) => Promise<Mission>; log?: (line: string, error: unknown) => void } = {},
+    private readonly options: { threads?: IntakeThreadReader; pollMs?: number; create?: (request: CreateMission, origin: MissionOrigin) => Promise<Mission>; log?: (line: string, error: unknown) => void;
+      /** Reads one owner mention and returns its route reading; absent unless `classify` is on. It may be slow or reject. */
+      router?: (text: string) => Promise<RouteReading | undefined>; routeWaitMs?: number } = {},
   ) {
     this.pollMs = options.pollMs ?? 30000;
     this.log = options.log ?? ((line, error) => console.warn(line, error));
@@ -279,7 +297,11 @@ export class IntakeService {
     if (!this.enabled() || this.closed) return "duplicate";
     if (this.store.list().some(record => record.direct && (record.direct.eventId === input.eventId
       || (record.direct.ts === input.ts && record.thread?.channelId === input.thread.channelId)))) return "duplicate";
-    const firstLine = input.text.replace(lineBreaks, "\n").split("\n").map(line => line.replace(/\s+/g, " ").trim()).find(line => line !== "");
+    const slack = this.config.intake?.slack;
+    const explicit = slack?.answerQuestions ? explicitRoute(input.text) : undefined;
+    // The owner's word is removed from the text; it names the route and is not part of the request.
+    const text = explicit ? explicit.text : input.text;
+    const firstLine = text.replace(lineBreaks, "\n").split("\n").map(line => line.replace(/\s+/g, " ").trim()).find(line => line !== "");
     const now = new Date().toISOString();
     const running = this.inFlight !== undefined;
     const mention = `${input.thread.channelId}|${input.ts}`;
@@ -287,8 +309,9 @@ export class IntakeService {
     this.pendingMentions.set(mention, issueId);
     this.store.create({
       issueId, identifier: "", url: "", title: (firstLine ?? "Request from a Slack thread").slice(0, 120),
-      description: input.text.trim().slice(0, descriptionLimit), issueCreatedAt: now, issueUpdatedAt: now,
-      state: "queued", thread: input.thread, direct: { eventId: input.eventId, ts: input.ts, text: input.text },
+      description: text.trim().slice(0, descriptionLimit), issueCreatedAt: now, issueUpdatedAt: now,
+      state: "queued", thread: input.thread,
+      direct: { eventId: input.eventId, ts: input.ts, text, ...(explicit ? { route: { kind: explicit.route, by: "owner" as const, at: now } } : {}) },
       comments: {}, messages: [], questions: [], inbound: [], createdAt: now, updatedAt: now,
     });
     this.pendingMentions.delete(mention);
@@ -309,6 +332,7 @@ export class IntakeService {
         ...(record.holdReason ? { holdReason: record.holdReason } : {}),
         ...(record.missionId ? { missionId: record.missionId } : {}),
         threadBound: record.thread !== undefined,
+        ...(record.direct?.route ? { route: { ...record.direct.route } } : {}),
         comments: {
           ...(started ? { started: started.delivered ? "delivered" as const : "pending" as const } : {}),
           ...(outcome ? { outcome: outcome.delivered ? "delivered" as const : "pending" as const } : {}),
@@ -323,6 +347,7 @@ export class IntakeService {
 
   private async cycle(): Promise<void> {
     await this.attempt("admit", () => this.admit());
+    await this.attempt("route", () => this.route());
     await this.attempt("file", () => this.file());
     await this.attempt("start", () => this.startQueued());
     for (const record of this.store.list())
@@ -374,15 +399,81 @@ export class IntakeService {
    * `request`, with a hold reason, for the next cycle.
    */
   private async file(): Promise<void> {
-    for (const record of this.store.list().filter(item => item.state === "queued" && item.direct && !item.request)) {
+    const routing = this.config.intake?.slack?.answerQuestions === true;
+    // With routing on, a record waits for its route (the route step stores one every cycle); a record without one is work only with routing off.
+    for (const record of this.store.list().filter(item => item.state === "queued" && item.direct && !item.request
+      && (item.direct.route ? true : !routing))) {
       if (this.closed) return;
-      try { await this.fileRecord(record); }
+      try { await (isAnswerRecord(record) ? this.prepareAnswer(record) : this.fileRecord(record)); }
       catch (error) {
         const summary = error instanceof MissingLabelError || error instanceof OwnerMismatch ? error.message : failureSummary(error);
         this.fail("file", error, undefined, summary);
-        this.attemptSync("file", () => this.hold(record.issueId, `It could not be filed in Linear and will be retried: ${summary}`));
+        this.attemptSync("file", () => this.hold(record.issueId, isAnswerRecord(record)
+          ? `It could not be prepared and will be retried: ${summary}`
+          : `It could not be filed in Linear and will be retried: ${summary}`));
       }
     }
+  }
+
+  /**
+   * Chooses the route of each direct request that has none: the owner's word was stored when the mention arrived, so what
+   * remains is a reading (when `classify` is on) or the default. The reading never blocks past its bound and never throws.
+   * Records made before routing, or with `answerQuestions` off, are work and are left alone.
+   */
+  private async route(): Promise<void> {
+    const slack = this.config.intake?.slack;
+    if (!slack?.answerQuestions) return;
+    const router = slack.classify ? this.options.router : undefined;
+    const pending = this.store.list().filter(item => item.direct && !item.request && !item.direct.route);
+    const decided = await Promise.all(pending.map(async record => {
+      const text = record.direct!.text.trim().slice(0, ROUTE_INPUT_LIMIT);
+      const reading = router && text !== "" ? await this.reading(router, text) : undefined;
+      return { record, route: decideRoute(undefined, reading) };
+    }));
+    for (const { record, route } of decided) {
+      if (this.closed) return;
+      this.attemptSync("route", () => this.store.update(record.issueId, next => {
+        if (next.direct && !next.direct.route && !next.request) next.direct.route = { ...route, at: new Date().toISOString() };
+      }));
+    }
+  }
+
+  /** The router's reading, or undefined when it throws, rejects, or takes longer than the bound. A late result is dropped. */
+  private reading(router: (text: string) => Promise<RouteReading | undefined>, text: string): Promise<RouteReading | undefined> {
+    return new Promise(resolve => {
+      const timer = setTimeout(() => resolve(undefined), this.options.routeWaitMs ?? ROUTE_WAIT_MS);
+      timer.unref();
+      const settle = (value: RouteReading | undefined) => { clearTimeout(timer); resolve(value); };
+      try { router(text).then(settle, () => settle(undefined)); }
+      catch { settle(undefined); }
+    });
+  }
+
+  /**
+   * Builds the mission request of an answer: the same thread section as a filed request, no Linear issue, a read-only
+   * answer mission. The record keeps its empty identifier and URL.
+   */
+  private async prepareAnswer(record: IntakeRecord): Promise<void> {
+    const intake = this.config.intake!;
+    const direct = record.direct!, thread = record.thread!;
+    if (!this.options.threads) throw new Error("No Slack thread reader is configured.");
+    const read = await this.options.threads.thread(thread);
+    const messages = read === "unreadable" ? undefined : read;
+    const request: CreateMission = {
+      requestId: missionRequestId(record.issueId),
+      groupId: intake.mission.groupId,
+      title: `Question: ${record.title}`.slice(0, 100),
+      objective: answerObjective(record.title, direct.text, messages, direct.ts, intake.slack?.ownerUserId ?? ""),
+      mode: "answer",
+      maxSubtasks: 1,
+      maxMinutes: Math.min(intake.mission.maxMinutes, ANSWER_MAX_MINUTES),
+    };
+    this.store.update(record.issueId, next => {
+      next.direct = { ...next.direct!, filedAt: new Date().toISOString() };
+      next.rule = ANSWER_RULE;
+      next.request = request;
+      delete next.holdReason;
+    });
   }
 
   private async fileRecord(record: IntakeRecord): Promise<void> {
@@ -500,19 +591,21 @@ export class IntakeService {
   private async startQueued(): Promise<void> {
     const intake = this.config.intake!;
     const records = this.store.list();
-    let slots = intake.maxActive - records.filter(record => record.state === "started" && this.active(record)).length;
+    // An answer starts no subteam and changes nothing, so it neither counts toward the limit nor waits for it.
+    let slots = intake.maxActive - records.filter(record => record.state === "started" && !isAnswerRecord(record) && this.active(record)).length;
     for (const record of records.filter(item => item.state === "queued" && item.request)) {
       if (this.closed) return;
-      if (slots <= 0) { this.hold(record.issueId, "max-active"); continue; }
+      const answer = isAnswerRecord(record);
+      if (!answer && slots <= 0) { this.hold(record.issueId, "max-active"); continue; }
       const origin: MissionOrigin = { kind: "intake", issueId: record.issueId, identifier: record.identifier, url: record.url, rule: record.rule! };
       try {
         const mission = await this.createMission(record.request!, origin);
-        slots -= 1;
+        if (!answer) slots -= 1;
         this.store.update(record.issueId, next => {
           next.state = "started";
           next.missionId = mission.id;
           delete next.holdReason;
-          if (!this.mirrors(next)) next.comments.started = { id: randomUUID(), body: outboundText(this.config, startedBody), delivered: false, attempts: 0 };
+          if (!answer && !this.mirrors(next)) next.comments.started = { id: randomUUID(), body: outboundText(this.config, startedBody), delivered: false, attempts: 0 };
         });
       } catch (error) {
         // A refusal is the hold reason. Any other failure is kept with its message, and the record stays queued for the next cycle.
@@ -550,7 +643,7 @@ export class IntakeService {
     if (!record || record.state !== "started") return;
     this.attemptSync("observe", () => this.store.update(record.issueId, next => {
       next.state = "finished";
-      if (!this.mirrors(next)) next.comments.outcome = { id: randomUUID(), body: outcomeBody(this.config, mission, Boolean(next.direct)), delivered: false, attempts: 0 };
+      if (!isAnswerRecord(next) && !this.mirrors(next)) next.comments.outcome = { id: randomUUID(), body: outcomeBody(this.config, mission, Boolean(next.direct)), delivered: false, attempts: 0 };
     }), record.identifier);
   }
 
@@ -559,7 +652,7 @@ export class IntakeService {
   }
 
   private async watch(): Promise<void> {
-    const watched = this.store.list().filter(record => record.state === "started" && record.closure === undefined);
+    const watched = this.store.list().filter(record => record.state === "started" && record.closure === undefined && !isAnswerRecord(record));
     if (watched.length === 0) return;
     let states: Map<string, IntakeIssue | "deleted">;
     try { states = await this.linear.states(watched.map(record => record.issueId)); }

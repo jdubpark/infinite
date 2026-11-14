@@ -95,8 +95,9 @@ show that the agent understood or used the content, and an observed edit is
 not a landed change. A provider records tool inputs only when its hooks are on
 in the host configuration. Claude Code hooks are on by default. Codex hooks are
 off by default, so Codex agents are marked `no signal` unless the host turns
-them on. Agents of other providers are always marked `no signal`. A `no signal`
-agent keeps its planned and integrated links.
+them on. A session started with native arguments or in the native UI is also
+marked `no signal`. Agents of other providers are always marked `no signal`. A
+`no signal` agent keeps its planned and integrated links.
 
 The code map comes from the repository graph checkpoints described in
 [repository graphs](repository-graphs.md). The view reads each project's

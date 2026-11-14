@@ -50,6 +50,19 @@ test("a codex agent whose hooks are off is not observable, even when its command
   } finally { await host.stop(); }
 });
 
+test("a session started with native arguments is not observable even when its provider hooks are on", { timeout: 60000 }, async () => {
+  const agent = { command: process.execPath, args: [fileURLToPath(new URL("./fixtures/touch-agent.mjs", import.meta.url))] };
+  const host = await startHost({ agents: { claude: agent }, config: { attention: { idleAfterMs: 3000, hooks: { claude: true, codex: true } } } });
+  try {
+    const sessionId = randomUUID();
+    await host.fetchApi("/sessions", "owner", { requestId: sessionId, provider: "claude", projectId: "rehearsal", title: "Native args", prompt: "touch", nativeArgs: ["initial prompt"] });
+    await waitFor(async () => (await host.fetchApi(`/sessions/${sessionId}`)).status, status => status === 200);
+    const touches = await host.fetchApi(`/sessions/${sessionId}/context`, "viewer");
+    assert.equal(touches.status, 200);
+    assert.deepEqual(touches.body, { sessionId, observable: false, complete: true, graphQueries: 0, files: [], truncated: false });
+  } finally { await host.stop(); }
+});
+
 test("an agent's recorded tool inputs come back as its touched files", { timeout: 60000 }, async () => {
   const agent = { command: process.execPath, args: [fileURLToPath(new URL("./fixtures/touch-agent.mjs", import.meta.url))] };
   const host = await startHost({ agents: { claude: agent }, config: { attention: { idleAfterMs: 3000, hooks: { claude: true, codex: true } } } });

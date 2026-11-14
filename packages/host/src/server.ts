@@ -818,6 +818,11 @@ export function createApp(config: Config, key: Buffer) {
   const sessionTouches = async (source: { sessionId: string; cwd: string; provider: string; projectId: string }) => {
     // A cmux session has no host journal, and an unreadable journal yields no touches.
     if (!existsSync(join(config.stateDir, "sessions", source.sessionId, "meta.sealed"))) return unobservedTouches(source.sessionId);
+    // Mirrors the worker's launch rule in worker.ts: provider hooks are injected only without native arguments or native UI, unless a handoff policy is set.
+    let session: ReturnType<Manager["meta"]>["session"];
+    try { session = manager.meta(source.sessionId).session; }
+    catch { return unobservedTouches(source.sessionId); }
+    if (session.runtime?.nativeUi || (!session.handoff?.policy && session.nativeArgs !== undefined)) return unobservedTouches(source.sessionId);
     try { return await contextTouches.session(source); }
     catch { return unobservedTouches(source.sessionId); }
   };

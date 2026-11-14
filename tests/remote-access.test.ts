@@ -432,6 +432,18 @@ test("the relay refuses signal writes", { timeout: 20000 }, async () => {
   } finally { client.close(); runner.close(); }
 });
 
+test("the relay refuses entry withdrawals", { timeout: 20000 }, async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    // An owner's withdrawal of a member-visible entry reaches the host only over a direct owner connection.
+    await assert.rejects(client.request(`/teams/${randomUUID()}/entries/${randomUUID()}/withdraw`, { method: "POST", body: { requestId: randomUUID() } }),
+      (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    assert.equal(runner.requests.length, 1, "a refused withdrawal does not reach the host");
+  } finally { client.close(); runner.close(); }
+});
+
 test("the relay refuses roll-ups and imports", { timeout: 20000 }, async () => {
   const runner = await httpRunner();
   const client = createRemoteClient({ url: runner.url, token: runner.token });

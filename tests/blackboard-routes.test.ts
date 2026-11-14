@@ -89,10 +89,75 @@ test("an unavailable store answers 503", { timeout: 90000 }, async () => {
     assert.equal(response.status, 503);
     assert.equal(response.body.code, "evidence-unavailable");
     assert.equal((await host.fetchApi(`/teams/${state.runId}/context-usage`)).status, 503);
+    const withdrawn = await host.fetchApi(`/teams/${state.runId}/entries/${randomUUID()}/withdraw`, "owner", { requestId: randomUUID() });
+    assert.equal(withdrawn.status, 503);
+    assert.equal(withdrawn.body.code, "evidence-unavailable");
     // The usage ledger lives in the same store, so the usage routes answer 503 with it. A route outside the store serves.
     assert.equal((await host.fetchApi("/usage")).status, 503);
     assert.equal((await host.fetchApi("/teams")).status, 200, "the rest of the host still serves");
   } finally {
+    await host.stop();
+    rmSync(state.root, { recursive: true, force: true });
+  }
+});
+
+test("the owner withdraws an entry and members no longer see it", { timeout: 90000 }, async () => {
+  const state = sealedState();
+  const host = await startHost({ config: { stateDir: state.stateDir, keyFile: state.keyFile } });
+  const root = mkdtempSync(join(tmpdir(), "inf-blk-withdraw-"));
+  try {
+    const base = `/teams/${state.runId}/entries`;
+    const checkId = (await host.fetchApi(`${base}?kind=check`)).body.entries[0].entryId;
+    const path = `${base}/${checkId}/withdraw`;
+    const requestId = randomUUID();
+    const first = await host.fetchApi(path, "owner", { requestId });
+    assert.equal(first.status, 200);
+    assert.deepEqual(first.body, { entryId: checkId, state: "withdrawn", changed: true });
+    const again = await host.fetchApi(path, "owner", { requestId: randomUUID() });
+    assert.equal(again.status, 200);
+    assert.deepEqual(again.body, { entryId: checkId, state: "withdrawn", changed: false });
+    assert.equal((await host.fetchApi(path, "controller", { requestId: randomUUID() })).status, 403);
+    assert.equal((await host.fetchApi(path, "viewer", { requestId: randomUUID() })).status, 403);
+
+    const unknownEntry = await host.fetchApi(`${base}/${randomUUID()}/withdraw`, "owner", { requestId: randomUUID() });
+    assert.equal(unknownEntry.status, 404);
+    assert.equal(unknownEntry.body.code, "entry-not-found");
+    const unknownTeam = await host.fetchApi(`/teams/${randomUUID()}/entries/${checkId}/withdraw`, "owner", { requestId: randomUUID() });
+    assert.equal(unknownTeam.status, 404);
+    assert.equal(unknownTeam.body.code, "team-not-found");
+
+    const fixed = { code: "entry-withdraw-invalid", error: "The withdrawal request is invalid." };
+    for (const bad of [{}, { requestId: "not-a-uuid" }, { requestId: randomUUID(), extra: "private sentinel" }]) {
+      const refused = await host.fetchApi(path, "owner", bad);
+      assert.equal(refused.status, 400);
+      assert.deepEqual(refused.body, fixed, "the refusal names no key or value");
+    }
+
+    const head = await host.fetchApi(`${base}/${checkId}`);
+    assert.equal(head.body.head.state, "withdrawn", "the owner still reads the entry, withdrawn");
+    assert.equal(head.body.body.output, "\u001b[31mred", "the sealed body stays for the owner");
+
+    // The owner's list still holds the entry, and the state says it is withdrawn.
+    const listed = (await host.fetchApi(`${base}?kind=check`)).body.entries[0];
+    assert.equal(listed.state, "withdrawn");
+
+    // The command reports the state it finds, in text and as JSON.
+    const clientFile = join(root, "client.json");
+    writeFileSync(clientFile, JSON.stringify({ origin: host.origin, token: host.tokens.owner, projectId: "rehearsal" }), { mode: 0o600 });
+    const viewerFile = join(root, "viewer.json");
+    writeFileSync(viewerFile, JSON.stringify({ origin: host.origin, token: host.tokens.viewer, projectId: "rehearsal" }), { mode: 0o600 });
+    const cli = ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/cli.ts")];
+    const exec = promisify(execFile);
+    const text = (await exec(process.execPath, [...cli, "--client-config", clientFile, "team", "entry", state.runId, checkId, "withdraw"])).stdout;
+    assert.match(text, new RegExp(`Entry ${checkId} was already withdrawn\\.`));
+    const json = JSON.parse((await exec(process.execPath, [...cli, "--client-config", clientFile, "team", "entry", state.runId, checkId, "withdraw", "--json"])).stdout);
+    assert.deepEqual(json, { entryId: checkId, state: "withdrawn", changed: false });
+    await assert.rejects(exec(process.execPath, [...cli, "--client-config", clientFile, "team", "entry", state.runId, checkId, "publish"]),
+      (error: { stderr?: unknown }) => String(error.stderr).includes("Usage: infinite team entry ID ENTRY_ID [withdraw] [--json]"));
+    await assert.rejects(exec(process.execPath, [...cli, "--client-config", viewerFile, "team", "entry", state.runId, checkId, "withdraw"]),
+      (error: { stderr?: unknown }) => String(error.stderr).includes("Withdrawing an entry requires an owner device key."));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
     await host.stop();
     rmSync(state.root, { recursive: true, force: true });
   }

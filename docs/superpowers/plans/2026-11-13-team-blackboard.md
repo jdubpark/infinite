@@ -583,6 +583,7 @@ Spec part 4 (posting and reading), the digest and prompt paragraphs of part 5, t
 - Line numbers and "after this line" places in this section were read on main before the cost-coverage fix. Find each place by the quoted code.
 - The four owner decisions above stand as written until the owner changes one.
 - Nothing periodic may cost more as history grows. `ingestEntries` reads at most `ENTRY_INGEST_MEMBERS = 16` journal pages a pass, in member order across runs, and continues with the next members on the next pass; after a restart every member with tools is pending once, and one pass must not read them all. Task 9 adds the constant to `team-entry-ingest.ts` and the test `a pass reads a bounded number of journals` (40 pending members: the first pass makes 16 journal reads, and three passes reach all 40). No list route or tick reads the store once for each member or session.
+- A filtered list that stops at the scan limit says so: `more` is true and `cursor` is the last scanned `seq`, so a member can always page to the end (Task 5).
 - The host adds no `--allowedTools`. A Claude profile whose own arguments set an allow-list must name `mcp__infinite_team__entry_post`, `mcp__infinite_team__entry_list`, and `mcp__infinite_team__entry_get`, or the provider refuses the three tools. Task 10 says so in `docs/teams.md`, beside the switch.
 
 This phase adds no Git command.
@@ -646,7 +647,7 @@ The phase must survive these sequences. Each has a named test.
 | `packages/host/src/team-prompts.ts`, `packages/host/src/config-identity.ts` (modify) | The prompt paragraph; the prompt version |
 | `packages/host/src/team-entry-ingest.ts` (create) | `ingestRunEntries`: journal pages to `Blackboard.ingest` |
 | `packages/host/src/teams.ts` (modify) | The lines listed below |
-| `packages/host/src/server.ts`, `packages/host/src/team-cli.ts` (modify) | The withdrawal route and `--withdraw` |
+| `packages/host/src/server.ts`, `packages/host/src/team-cli.ts` (modify) | The withdrawal route and the `withdraw` verb |
 | `docs/teams.md`, `docs/cli.md`, `docs/architecture.md`, the blackboard spec (modify) | One paragraph each, and the spec amendments |
 | `tests/fixtures/team-scheduler.ts` (modify) | `post(session, type, data)` |
 | `tests/blackboard-config.test.ts`, `tests/member-entry.test.ts`, `tests/evidence-reader.test.ts`, `tests/blackboard-ingest.test.ts`, `tests/entry-reads.test.ts`, `tests/team-entry-route.test.ts`, `tests/team-entry-client.test.ts`, `tests/team-entry-tools.test.ts` (create) | Tests |
@@ -1171,19 +1172,19 @@ post: (session: string, type: "team-entry" | "team-entry-read", data: object) =>
 
 **Files:** `packages/host/src/server.ts`, `packages/host/src/team-cli.ts`, `docs/teams.md`, `docs/cli.md`, `docs/architecture.md`, `docs/superpowers/specs/2026-11-12-team-blackboard-design.md`, `tests/blackboard-routes.test.ts`, `tests/remote-access.test.ts`. Needs Task 4. Runs in parallel with Tasks 5 to 9.
 
-**Interfaces (produces):** `POST /api/teams/:id/entries/:entryId/withdraw` with the strict body `{ requestId: uuid }`, answering `{ entryId, state: "withdrawn", changed: boolean }`. `infinite team entry ID ENTRY_ID --withdraw [--json]`.
+**Interfaces (produces):** `POST /api/teams/:id/entries/:entryId/withdraw` with the strict body `{ requestId: uuid }`, answering `{ entryId, state: "withdrawn", changed: boolean }`. `infinite team entry ID ENTRY_ID withdraw [--json]`. *(Ruling during the build: a positional verb, because `--withdraw` already exists as a string option of `infinite usage outcomes exclude`.)*
 
 **Decisions:**
 
 - **The route** is `requireRole(["owner"])`. It first requires `teams.hasRecordFile(id)`, else 404 `team-not-found`, as the phase 2 routes do. `withdraw` undefined answers 404 `entry-not-found`; `unavailable` answers 503 `evidence-unavailable`. A body that does not parse answers exactly `{ code: "entry-withdraw-invalid", error: "The withdrawal request is invalid." }` with no detail, because a key name in the body is caller text. The answer depends only on the entry's state, so a replay is safe. `requestId` is required, as the spec asks, and is not stored. *(My call: idempotence comes from the state.)* The route is not on the relay allow-list.
 - **The command** prints `Entry ENTRY_ID withdrawn.` or `Entry ENTRY_ID was already withdrawn.`, and `--json` prints the answer. A 403 prints `Withdrawing an entry requires an owner device key.`
-- **Docs.** `docs/teams.md`: the switch and where it lives, what members of each role may post, the caps, the digest, withdrawal, and that a member entry is a claim. `docs/cli.md`: `--withdraw`. `docs/architecture.md`: the worker's read-only connection; the host stays the only writer. The spec: part 4 records that Claude members get no `--allowedTools`, that the worker counts caps in memory, that `entry_get` serves bodies of at most 64 KiB, and the refusal texts; part 5 records that a run pins `tools` only when the store is ready and that the switch holds only `tools` for now; part 3 records the `supersedes` column and that a handoff needs its author's task.
+- **Docs.** `docs/teams.md`: the switch and where it lives, what members of each role may post, the caps, the digest, withdrawal, and that a member entry is a claim. `docs/cli.md`: the `withdraw` verb. `docs/architecture.md`: the worker's read-only connection; the host stays the only writer. The spec: part 4 records that Claude members get no `--allowedTools`, that the worker counts caps in memory, that `entry_get` serves bodies of at most 64 KiB, and the refusal texts; part 5 records that a run pins `tools` only when the store is ready and that the switch holds only `tools` for now; part 3 records the `supersedes` column and that a handoff needs its author's task.
 
 - [ ] **Step 1: Write the failing tests.**
 
 | Test name | Assertions |
 |---|---|
-| `the owner withdraws an entry and members no longer see it` (`tests/blackboard-routes.test.ts`, on the host) | An owner POST answers 200 with `changed` true, then `changed` false. A controller and a viewer get 403. An unknown entry answers 404 `entry-not-found`, and an unknown team 404 `team-not-found`. A body without `requestId`, or with an extra key, answers exactly the fixed 400 body. The entry's head then shows state `withdrawn`. `infinite team entry ID ENTRY_ID --withdraw` prints the already-withdrawn line. |
+| `the owner withdraws an entry and members no longer see it` (`tests/blackboard-routes.test.ts`, on the host) | An owner POST answers 200 with `changed` true, then `changed` false. A controller and a viewer get 403. An unknown entry answers 404 `entry-not-found`, and an unknown team 404 `team-not-found`. A body without `requestId`, or with an extra key, answers exactly the fixed 400 body. The entry's head then shows state `withdrawn`. `infinite team entry ID ENTRY_ID withdraw` prints the already-withdrawn line. |
 | `an unavailable store answers 503` (extended) | The withdrawal answers 503 `evidence-unavailable`. |
 | relay paths (`tests/remote-access.test.ts`) | `["POST", "/teams/<uuid>/entries/<uuid>/withdraw"]` joins the paths that answer 403 `remote-endpoint-denied`. |
 

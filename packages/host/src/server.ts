@@ -1082,6 +1082,17 @@ export function createApp(config: Config, key: Buffer) {
       return found;
     });
   });
+  // The owner's withdrawal of one entry. The answer depends only on the entry's state, so a replay is safe. The body is not stored.
+  const entryWithdrawBody = z.object({ requestId: z.uuid() }).strict();
+  app.post("/api/teams/:id/entries/:entryId/withdraw", requireRole(["owner"]), (req, res) => {
+    const entryId = id.parse(req.params.entryId);
+    return entryRead(req, res, runId => {
+      if (!entryWithdrawBody.safeParse(req.body).success) throw new TeamError(400, "entry-withdraw-invalid", "The withdrawal request is invalid.");
+      const changed = blackboard.withdraw(runId, entryId);
+      if (changed === undefined) throw new TeamError(404, "entry-not-found", "Entry not found.");
+      return { entryId, state: "withdrawn", changed: changed === "withdrawn" };
+    });
+  });
   app.get("/api/teams/:id/context-usage", (req, res) => entryRead(req, res, runId => ({ members: blackboard.contextUsage(runId) })));
   app.delete("/api/teams/:id", requireRole(["owner"]), async (req, res) => {
     const teamId = id.parse(req.params.id);

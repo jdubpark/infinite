@@ -4,6 +4,10 @@ import { setImmediate as yieldMacrotask } from "node:timers/promises";
 export type FileTouch = { path: string; reads: number; edits: number; lastAt: string };
 export type SessionTouches = {
   sessionId: string;
+  /**
+   * False when the host cannot see this session's tool inputs: its provider has no extraction, or its journal
+   * was read to the end and holds no signal from a provider hook or protocol. A gap in sight, not a fact about the agent.
+   */
   observable: boolean;
   complete: boolean;
   graphQueries: number;
@@ -17,8 +21,10 @@ export type TouchPage = {
   more: boolean;
 };
 
-/** Providers whose tool inputs can be extracted. Hooks must also be on for a provider to record any. */
+/** Providers whose tool inputs can be extracted. */
 const EXTRACTABLE_PROVIDERS = new Set(["claude", "codex"]);
+/** Signal sources that carry tool inputs. Terminal and screen readings never do. */
+const TOOL_SOURCES = new Set(["hook", "protocol"]);
 const FILE_TOOLS: Record<string, { field: string; kind: "reads" | "edits" }> = {
   Read: { field: "file_path", kind: "reads" },
   Edit: { field: "file_path", kind: "edits" },
@@ -41,6 +47,11 @@ const TRUNCATED_ANYWHERE = / … \[\+\d+ chars\]/;
 interface FileState { reads: number; edits: number; lastAt: string; seq: number }
 interface SessionState {
   cursor: number;
+  /**
+   * The journal holds a signal from a source that carries tool inputs. This is the evidence that the session was
+   * launched with working hooks; the launch settings can differ from the current configuration.
+   */
+  signalled: boolean;
   files: Map<string, FileState>;
   graphQueries: number;
   complete: boolean;
@@ -174,8 +185,6 @@ export class ContextTouches {
       maxFiles?: number;
       /** Sessions whose journals are read at once, across every request. */
       maxConcurrent?: number;
-      /** Whether a provider records tool inputs in this host. Defaults to true for Claude Code and Codex. */
-      observable?: (provider: string) => boolean;
     },
   ) {
     this.maxConcurrent = options.maxConcurrent ?? 4;
@@ -185,8 +194,7 @@ export class ContextTouches {
   }
 
   async session(source: TouchSource): Promise<SessionTouches> {
-    const observable = EXTRACTABLE_PROVIDERS.has(source.provider) && (this.options.observable?.(source.provider) ?? true);
-    if (!observable) {
+    if (!EXTRACTABLE_PROVIDERS.has(source.provider)) {
       return { sessionId: source.sessionId, observable: false, complete: true, graphQueries: 0, files: [], truncated: false };
     }
     const state = this.stateFor(source.sessionId);
@@ -229,7 +237,7 @@ export class ContextTouches {
       this.sessions.delete(victim[0]);
     }
     const created: SessionState = {
-      cursor: 0, files: new Map(), graphQueries: 0, complete: false, truncated: false, lastUsed: 0,
+      cursor: 0, signalled: false, files: new Map(), graphQueries: 0, complete: false, truncated: false, lastUsed: 0,
     };
     this.sessions.set(sessionId, created);
     return created;
@@ -252,7 +260,9 @@ export class ContextTouches {
   private apply(state: SessionState, page: TouchPage, source: TouchSource, inArea: (directory: string) => boolean): void {
     const from = state.cursor;
     for (const event of page.events) {
-      if (event.seq <= from || event.type !== "signal" || event.data.kind !== "tool-start") continue;
+      if (event.seq <= from || event.type !== "signal") continue;
+      if (typeof event.data.source === "string" && TOOL_SOURCES.has(event.data.source)) state.signalled = true;
+      if (event.data.kind !== "tool-start") continue;
       const { tool, input } = event.data;
       if (typeof tool !== "string") continue;
       const found = extractTouches(tool, isRecord(input) ? input : {}, source.cwd, inArea);
@@ -296,7 +306,8 @@ export class ContextTouches {
       .map(([path, file]) => ({ path, reads: file.reads, edits: file.edits, lastAt: file.lastAt }));
     return {
       sessionId,
-      observable: true,
+      // Until the journal is read to its end the answer is not known, so nothing is called unobserved yet.
+      observable: state.signalled || !state.complete,
       complete: state.complete,
       graphQueries: state.graphQueries,
       files,

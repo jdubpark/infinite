@@ -10,7 +10,7 @@ import { z } from "zod";
 import { existsSync, realpathSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { Manager, publicAttention } from "./manager.js";
-import { DEFAULT_HOOKS, hashToken, validateLinearConfig } from "./config.js";
+import { hashToken, validateLinearConfig } from "./config.js";
 import { runtimeSecurity } from "./deployment.js";
 import { workerCall, type WorkerError } from "./ipc.js";
 import { PushStore, isExpoToken } from "./push.js";
@@ -808,21 +808,11 @@ export function createApp(config: Config, key: Buffer) {
     // Only signals carry tool inputs. The type filter keeps terminal output out of the result, though each read still scans it.
     read: (sessionId, after) => manager.events(sessionId, after, 200, new Set(["signal"])),
     areas: projectId => repositoryGraphs?.areas(projectId),
-    // A provider without hooks records no tool inputs, so its sessions are marked `no signal` rather than observed.
-    observable: provider => {
-      const hooks = config.attention?.hooks ?? DEFAULT_HOOKS;
-      return provider === "claude" ? hooks.claude : provider === "codex" ? hooks.codex : false;
-    },
   });
   const unobservedTouches = (sessionId: string): SessionTouches => ({ sessionId, observable: false, complete: true, graphQueries: 0, files: [], truncated: false });
   const sessionTouches = async (source: { sessionId: string; cwd: string; provider: string; projectId: string }) => {
     // A cmux session has no host journal, and an unreadable journal yields no touches.
     if (!existsSync(join(config.stateDir, "sessions", source.sessionId, "meta.sealed"))) return unobservedTouches(source.sessionId);
-    // Mirrors the worker's launch rule in worker.ts: provider hooks are injected only without native arguments or native UI, unless a handoff policy is set.
-    let session: ReturnType<Manager["meta"]>["session"];
-    try { session = manager.meta(source.sessionId).session; }
-    catch { return unobservedTouches(source.sessionId); }
-    if (session.runtime?.nativeUi || (!session.handoff?.policy && session.nativeArgs !== undefined)) return unobservedTouches(source.sessionId);
     try { return await contextTouches.session(source); }
     catch { return unobservedTouches(source.sessionId); }
   };

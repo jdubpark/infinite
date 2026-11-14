@@ -26,7 +26,8 @@ function toolStart(seq: number, tool: string, input: Record<string, unknown>): E
     seq,
     at: iso(seq),
     type: "signal",
-    data: { kind: "tool-start", tool, toolUseId: `t${seq}`, input, quiet: false },
+    // A tool input reaches the journal through a provider hook, and the signal says so.
+    data: { kind: "tool-start", source: "hook", tool, toolUseId: `t${seq}`, input, quiet: false },
   };
 }
 
@@ -209,24 +210,23 @@ test("unobservable provider is not read", async () => {
   assert.deepEqual(reads, []);
 });
 
-test("a provider whose hooks are off is not read, while an observable one still is", async () => {
-  const { read, reads } = journal([toolStart(1, "Read", { file_path: "src/a.ts" })]);
-  const touches = new ContextTouches({ read, areas: noAreas, observable: provider => provider === "claude" });
-  const codex = await touches.session(source({ sessionId: "codex", provider: "codex" }));
-  assert.deepEqual(codex, {
-    sessionId: "codex",
-    observable: false,
-    complete: true,
-    graphQueries: 0,
-    files: [],
-    truncated: false,
-  });
-  assert.deepEqual(reads, []);
+test("a session is observable only when its journal holds a signal that carries tool inputs", async () => {
+  const signal = (seq: number, data: Record<string, unknown>): Event => ({ seq, at: iso(seq), type: "signal", data });
+  const index = (events: Event[], pageSize?: number) => new ContextTouches({ read: journal(events, pageSize).read, areas: noAreas, maxReads: 1 });
 
-  const claude = await touches.session(source({ sessionId: "claude", provider: "claude" }));
-  assert.equal(claude.observable, true);
-  assert.deepEqual(claude.files.map((file) => file.path), ["src/a.ts"]);
-  assert.deepEqual(reads, [0]);
+  // Codex with its hooks off, or a session started with native arguments: the journal holds no hook signal at all.
+  assert.deepEqual(await index([]).session(source({ provider: "codex" })), {
+    sessionId: "s1", observable: false, complete: true, graphQueries: 0, files: [], truncated: false,
+  });
+  // Terminal and screen readings carry no tool inputs, however many there are.
+  const screen = await index([signal(1, { kind: "turn-start", source: "screen" }), signal(2, { kind: "prompt-open", source: "osc" })]).session(source());
+  assert.deepEqual([screen.observable, screen.complete, screen.files.length], [false, true, 0]);
+  // One hook signal is the evidence, before any tool has run and whatever the host configuration says now.
+  const hooked = await index([signal(1, { kind: "turn-start", source: "hook" })]).session(source({ provider: "codex" }));
+  assert.deepEqual([hooked.observable, hooked.complete, hooked.files.length], [true, true, 0]);
+  // While the journal is still being read the answer is not known, so the session is not called unobserved.
+  const reading = await index([signal(1, { kind: "turn-start", source: "screen" }), signal(2, { kind: "turn-start", source: "screen" })], 1).session(source());
+  assert.deepEqual([reading.observable, reading.complete], [true, false]);
 });
 
 test("incremental cursor", async () => {

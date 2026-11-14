@@ -96,11 +96,14 @@ and never merged.
 
 Observed tool inputs show what an agent's tools were pointed at. They do not
 show that the agent understood or used the content, and an observed edit is
-not a landed change. A provider records tool inputs only when its hooks are on
-in the host configuration. Claude Code hooks are on by default. Codex hooks are
-off by default, so Codex agents are marked `no signal` unless the host turns
-them on. A session started with native arguments or in the native UI is also
-marked `no signal`. Agents of other providers are always marked `no signal`. A
+not a landed change.
+
+An agent is marked `no signal` when the host cannot see its tool inputs. That
+is the case when its session journal holds no signal from a provider hook:
+its provider's hooks are off (Codex hooks are off by default), it was started
+with native arguments, or it has not sent its first hook yet. Agents of
+providers other than Claude Code and Codex are always marked `no signal`. The
+mark describes what the host can see, not what the agent did, and a
 `no signal` agent keeps its planned and integrated links.
 
 The code map comes from the repository graph checkpoints described in

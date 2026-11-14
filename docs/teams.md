@@ -782,6 +782,9 @@ cadence and has no cycle limit. Create it with
 `standing: { shape: "objective", cadenceMinutes, wakeOn }`. The project must be
 autonomous: a supervised project refuses it with `standing-requires-autonomy`.
 A routine cannot start a standing goal, and a standing goal refuses `maxRuns`.
+Every cycle passes the whole objective, so a standing goal's objective must fit
+in 24,000 bytes of UTF-8; a longer one is refused with
+`standing-objective-too-large`. The host never cuts the owner's text.
 
 The first cycle starts when the goal is created. Each later cycle starts at the
 later of two times: the previous cycle's start plus `cadenceMinutes`, and the
@@ -794,6 +797,16 @@ moment and gives the cycle `maxMembers` attempts, at most 60. A cycle that passe
 its time limit is stopped, and the goal goes on. Between cycles the goal has no
 deadline, so the host refuses an extension then; an extension applies to the
 current cycle only. Each cycle takes the host's current lineup and records it.
+
+A cycle's launch is recorded before its run is created. If the run was never
+created, because the host restarted or creation failed, the host withdraws the
+launch, returns its wake to the goal, and the next cycle passes every gate again
+(mode, lineup, failure count, Linear tracking, spend fuse, and owner pause or
+cancel) with a fresh window. Creation failures that pass with time leave the
+goal `running` with the reason and retry a minute later: low or unmeasurable
+storage, a window that lapsed while creation waited, a mission holding the
+repository, and file or process resource exhaustion. Any other creation failure
+blocks the goal, as it does a finite goal.
 
 When a cycle's members have stopped, the host records its `class`:
 
@@ -813,7 +826,9 @@ A standing goal never stops as `ready-for-review`, `no-opportunity`, or
   `standing-requires-autonomy` until the project is autonomous again.
 - A settled cycle left an external operation open: a reported merge without a
   validated baseline, an unfinished delivery attempt or delivery recovery, or a
-  head the host could not confirm on GitHub. The goal becomes `blocked` with
+  head the host could not confirm on GitHub. A delivery member that never
+  launched, for example because it waited behind the spend fuse, is not a
+  delivery attempt. The goal becomes `blocked` with
   `reasonCode: "external-operation"`. Starting from the older parent could
   redo work that already landed.
 - Three cycles in a row fail. The goal becomes `paused` with
@@ -1852,7 +1867,8 @@ Optional `standing` makes the goal a standing objective (see
 `{ shape: "objective", cadenceMinutes, wakeOn }`, with `cadenceMinutes`
 30–10,080 (default 1,440) and `wakeOn` holding one to four distinct signal
 kinds. A standing request must omit `maxRuns`. In a supervised project it
-returns `409` with `code: "standing-requires-autonomy"`. A standing goal record
+returns `409` with `code: "standing-requires-autonomy"`; an objective over
+24,000 bytes returns `400` with `code: "standing-objective-too-large"`. A standing goal record
 adds `reasonCode` (`supervised-mode`, `repeated-failures`, or
 `external-operation`), `failedCycles`, `cycleTotals`, `foldedUsage`,
 `foldedMembers`, `signalCursor`, `pendingWake`, and, between cycles, the

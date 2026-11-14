@@ -36,6 +36,7 @@ import { missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch 
 import { withNativeContinuation } from "./native-continuation.js";
 import { agentBoundary, inventoryRuntimeProcesses, runtimeIdentity, stopRuntimeTree, type RuntimeProcess, type TeamRuntimeInspection, type TeamRuntimeRetirement } from "./team-retirement.js";
 import { TeamError } from "./team-workspace.js";
+import { projectGithubRepository, sessionGithubGrant, sessionGithubScopeFor, type GithubGrantScope, type SessionGithubOrigin } from "./github-grants.js";
 import {
   SESSION_PURPOSES,
   type SessionPurpose,
@@ -394,10 +395,11 @@ export class Manager {
   setContext(projectId: string, text: string, expectedVersion: number) {
     return new ProjectContexts(this.config, this.key).setContext(projectId, text, expectedVersion);
   }
-  create(request: CreateSession): Promise<Session & WorkerState> {
+  /** `startedBy: "owner"` states that the owner started this session; without it the session's GitHub grant is fetch only. */
+  create(request: CreateSession, startedBy?: "owner"): Promise<Session & WorkerState> {
     if (request.continuation !== undefined)
       throw new ContentError("Native continuation is only available for managed coordinator team sessions", 400);
-    const operation = this.serial.then(() => this.createOnce(request));
+    const operation = this.serial.then(() => this.createOnce(request, false, startedBy === "owner" ? "owner-started" : undefined));
     this.serial = operation.catch(() => {});
     return operation;
   }
@@ -407,7 +409,7 @@ export class Manager {
    * over any of them refuses the launch at its final admission.
    */
   createTeamSession(request: CreateSession, team: TeamAssignment, cwd: string, modelProfile?: TeamModelProfile, workspaceRoot?: string, workspaceTrusted = false,
-    header: { purpose?: SessionPurpose; configId?: string; haltScope?: readonly string[] } = {}): Promise<Session & WorkerState> {
+    header: { purpose?: SessionPurpose; configId?: string; haltScope?: readonly string[] } = {}, github?: GithubGrantScope): Promise<Session & WorkerState> {
     if (!this.config.teams || request.nativeArgs !== undefined || request.localUi || request.workspace || request.resumedFrom)
       throw new ContentError("Team sessions require a configured team workspace and managed launch", 400);
     if (header.purpose !== undefined && !SESSION_PURPOSES.includes(header.purpose)) throw new ContentError("The session purpose is not recognized", 400);
@@ -431,7 +433,7 @@ export class Manager {
     const operation = this.serial.then(() => this.createOnce({
       ...request, ...(continuation ? { continuation } : {}), team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}),
       ...(header.purpose !== undefined ? { purpose: header.purpose } : {}), ...(header.configId !== undefined ? { configId: header.configId } : {}),
-    }, workspaceTrusted, header.haltScope));
+    }, workspaceTrusted, { team: github }, header.haltScope));
     this.serial = operation.catch(() => {});
     return operation;
   }
@@ -783,12 +785,12 @@ export class Manager {
       return result.invalidated === true ? "invalidated" : "uncertain";
     } catch { return "uncertain"; }
   }
-  resume(sessionId: string, requestId: string): Promise<Session & WorkerState> {
-    const operation = this.serial.then(() => this.resumeOnce(sessionId, requestId));
+  resume(sessionId: string, requestId: string, startedBy?: "owner"): Promise<Session & WorkerState> {
+    const operation = this.serial.then(() => this.resumeOnce(sessionId, requestId, startedBy === "owner" ? "owner-started" : undefined));
     this.serial = operation.catch(() => {});
     return operation;
   }
-  private async resumeOnce(sessionId: string, requestId: string): Promise<Session & WorkerState> {
+  private async resumeOnce(sessionId: string, requestId: string, github?: SessionGithubOrigin): Promise<Session & WorkerState> {
     if (this.handoffRequest(sessionId)) throw new ContentError("This session yielded to a team; inspect its handoff instead of resuming it");
     if (requestId === sessionId) throw new ContentError("Resumption needs a new request identity", 400);
     const session = this.meta(sessionId).session;
@@ -827,7 +829,7 @@ export class Manager {
     // Creation metadata is durable before spawn. Recover its exact receipt even
     // if the API stopped before it could record the resumption result.
     if (existsSync(join(this.config.stateDir, "sessions", requestId, "meta.sealed")))
-      return remember(await this.createOnce(request));
+      return remember(await this.createOnce(request, false, github));
     const ids = readdirSync(join(this.config.stateDir, "sessions")).filter(id => /^[a-f0-9-]{36}$/.test(id) && id !== sessionId);
     const continuations = await Promise.all(ids.map(async id => {
       let candidate: Session;
@@ -847,21 +849,22 @@ export class Manager {
     if (live.length > 1) throw new ContentError("Multiple continuations are active. Open an existing session before resuming.");
     if (live[0]) return remember(live[0]);
     // Use the same admission queue as create, without re-entering it.
-    return remember(await this.createOnce(request));
+    return remember(await this.createOnce(request, false, github));
   }
   /**
    * Creates the session, or returns the one its request already made. A team launch that fails before its session
    * record exists gives its fuse launch back: the count stays, and a retry with the same id is not counted twice.
    */
-  private async createOnce(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false, haltScope?: readonly string[]) {
-    try { return await this.createRecorded(request, workspaceTrusted, haltScope); }
+  private async createOnce(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false, github?: SessionGithubOrigin, haltScope?: readonly string[]) {
+    try { return await this.createRecorded(request, workspaceTrusted, github, haltScope); }
     catch (error) {
       // A started launch stays started, and a failing fuse never hides the launch error.
       if (request.team) try { this.fuse?.release(request.requestId); } catch { /* the launch error is the one to report */ }
       throw error;
     }
   }
-  private async createRecorded(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false, haltScope?: readonly string[]) {
+  /** `github` says who decided the session's GitHub grant; see SessionGithubOrigin. `haltScope` is every project the work covers. */
+  private async createRecorded(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false, github?: SessionGithubOrigin, haltScope?: readonly string[]) {
     if (!request.resumedFrom && request.nativeArgs) assertFreshNativeContext(request.provider, request.nativeArgs);
     if (request.workspace && (request.provider !== "codex" || !request.localUi))
       throw new Error("Laptop execution requires the Codex native interface");
@@ -1008,6 +1011,9 @@ export class Manager {
     });
     child.on("error", () => {});
     child.stdin.on("error", () => {});
+    // Inert unless autonomy.boundary.github is configured; the grant travels only in the private bootstrap pipe.
+    const githubScope = sessionGithubScopeFor({ team: Boolean(request.team), origin: github, repository: projectGithubRepository(project) });
+    const githubGrant = sessionGithubGrant(this.config, githubScope, { sessionId: id, projectId: request.projectId });
     child.stdin.end(
       JSON.stringify({
         session,
@@ -1019,6 +1025,7 @@ export class Manager {
         key: this.key.toString("base64"),
         prompt,
         ...(request.workspace ? { executorTokenHash: createHash("sha256").update(request.workspace.token).digest("hex") } : {}),
+        ...(githubGrant ? { github: githubGrant } : {}),
         attention: {
           // Native CLI launches keep their exact argv: no hook settings are injected.
           hooks: request.nativeArgs !== undefined

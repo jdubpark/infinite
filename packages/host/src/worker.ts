@@ -1399,6 +1399,11 @@ server.listen(socketPath(runDir, session.id), async () => {
     }
     env.TERM = "xterm-256color";
     addProjectIdToLaunchEnv(env, session.projectId);
+    // Present only with autonomy.boundary.github: Git and gh reach GitHub through the proxy with this grant.
+    if (config.github) {
+      env.INFINITE_GITHUB_GRANT = config.github.grant;
+      env.INFINITE_GITHUB_PROXY = config.github.proxy;
+    }
     if (session.team) {
       if (!hookServer) throw new Error("Team report channel could not start");
       // The verification flag is host policy; the agent's binding stays the stable assignment identity.

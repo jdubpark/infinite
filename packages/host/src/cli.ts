@@ -31,6 +31,7 @@ import type { Config, Provider, Role } from "./types.js";
 import { handleClientCommand } from "./client.js";
 import { handleMachineCommand } from "./machine-cli.js";
 import { handleLocalBehaviorCheckCommand } from "./understanding-cli.js";
+import { githubProxyDoctorLine } from "./github-grants.js";
 
 const argv = process.argv.slice(2);
 if (!await handleLocalBehaviorCheckCommand(argv) && !await handleMachineCommand(argv) && !await handleClientCommand(argv)) {
@@ -399,7 +400,8 @@ else if (command === "plan-fleet") {
         title: values.title?.trim() || `${provider} session`,
         ...(generatedTitle ? { generatedTitle: true as const } : {}),
         prompt: values.prompt ?? "",
-      });
+      // The local CLI runs with the host's own configuration and key: the owner started this session.
+      }, "owner");
       console.log(`${session.id}  ${session.status}`);
     } else if (command === "attach") await attach(manager, positionals[1]);
     else if (command === "doctor") {
@@ -466,6 +468,8 @@ else if (command === "plan-fleet") {
         );
       } else console.log("Push: disabled");
       if (config.autonomy?.boundary?.egress) console.log(await egressDoctorLine(config.autonomy.boundary.egress));
+      const githubProxy = await githubProxyDoctorLine(config);
+      if (githubProxy) console.log(githubProxy);
       if ((config.attention?.hooks ?? DEFAULT_HOOKS).codex)
         console.log(
           "Warning: Codex hooks are on. They run with --dangerously-bypass-hook-trust, which also lets hooks defined in a session's working directory run without review. Use them only with repositories you trust.",

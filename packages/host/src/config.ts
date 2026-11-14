@@ -52,6 +52,20 @@ export const outcomeSettingsSchema = z.object({
   retentionDays: z.number().int().min(30).max(3650).optional(),
 }).strict();
 
+/**
+ * The GitHub credential proxy (deploy/ubuntu/github-proxy.md). `proxyUrl` is the proxy's bare loopback origin;
+ * `keyPath` is the grant key the host shares with the proxy account. Absent means sessions get no grant.
+ */
+export const githubBoundarySchema = z.object({
+  proxyUrl: z.string().refine(value => {
+    try {
+      const url = new URL(value);
+      return ["http:", "https:"].includes(url.protocol) && ["127.0.0.1", "[::1]", "localhost"].includes(url.hostname) && value.replace(/\/$/, "") === url.origin;
+    } catch { return false; }
+  }, "The GitHub proxy URL must be a bare loopback origin"),
+  keyPath: z.string().refine(isAbsolute, "The GitHub grant key path must be absolute"),
+}).strict();
+
 const schema = z
   .object({
     linear: z.object({ apiKeyFile: z.string().refine(isAbsolute), endpoint: z.url().optional() }).strict().optional(),
@@ -59,7 +73,7 @@ const schema = z
     intake: intakeConfigSchema.optional(),
     teams: z.object({ workspaceDir: z.string().refine(isAbsolute), commandPrefix: teamCommandSchema.optional(), lineup: teamLineupSchema.optional(), trustWorkspaces: z.boolean().optional(), publishHeads: z.boolean().default(true), stallMinutes: z.number().int().min(5).max(1440).optional(), checkMinutes: z.number().positive().max(240).optional(), retention: teamRetentionSchema.optional(), storageFloor: storageFloorSchema.optional(), outcomes: outcomeSettingsSchema.optional() }).strict().optional(),
     machine: z.object({ id: z.uuid(), label: machineLabelSchema }).strict().optional(),
-    autonomy: z.object({ defaultMode: autonomyModeSchema.optional(), fuse: fuseConfigSchema.optional(), continuity: continuityConfigSchema.optional(), boundary: z.object({ egress: egressConfigSchema.optional() }).strict().optional() }).strict().optional(),
+    autonomy: z.object({ defaultMode: autonomyModeSchema.optional(), fuse: fuseConfigSchema.optional(), continuity: continuityConfigSchema.optional(), boundary: z.object({ egress: egressConfigSchema.optional(), github: githubBoundarySchema.optional() }).strict().optional() }).strict().optional(),
     cmux: z.object({ enabled: z.boolean(), command: z.string().min(1).optional(), hooksDir: z.string().refine(isAbsolute).optional() }).strict().optional(),
     remote: z.object({ enabled: z.boolean(), relay: z.object({ url: z.url(), tokenFile: z.string().refine(isAbsolute) }).strict().optional() }).strict().optional(),
     deployment: z.unknown().optional(),

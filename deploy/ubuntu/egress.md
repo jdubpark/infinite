@@ -31,7 +31,17 @@ Any step that removes the firewall table leaves the agent account's direct conne
 2. Stop the API so it launches nothing new: `sudo systemctl stop infinite.service`.
 3. Check that the agent account runs nothing: `pgrep -u infinite-agent -a` prints nothing. Stopping the API alone is not enough, because its workers and their agents outlive it (`KillMode=process`). End anything still listed after reading what it is.
 
-Start the API again when the step is done. Changing the firewall variant needs none of this: `systemctl reload infinite-egress-firewall` replaces the table in one transaction, and a file that fails to load leaves the previous table in force.
+When the step is done, load the rule again and check it before any agent starts:
+
+```sh
+sudo systemctl reload-or-restart infinite-egress-firewall.service
+sudo nft list table inet infinite_egress     # must print the table; an error means no rule is in force
+sudo systemctl start infinite.service
+```
+
+Do not start the API or a session while the second command prints an error. The firewall unit reports `active` from its first successful load onward, also after `nftables.service` flushed its table and the reload that follows failed, so `systemctl status` alone does not show that the rule is in force. Read `journalctl -u infinite-egress-firewall` for the failed load, fix `/etc/infinite-egress/firewall.nft`, and run the three commands again.
+
+Changing the firewall variant needs none of this: `systemctl reload infinite-egress-firewall` replaces the table in one transaction, and a file that fails to load leaves the previous table in force.
 
 ## 1. Account, group, and key
 
@@ -141,7 +151,7 @@ sudo systemctl enable --now infinite-egress-firewall.service
 sudo nft list table inet infinite_egress
 ```
 
-The unit replaces only the `inet infinite_egress` table, so Tailscale's and the system's tables stay as they are. Do not add the rule to `/etc/nftables.conf`, whose `flush ruleset` removes other tables. Restarting or reloading `nftables.service` flushes this table too; the unit then restarts or reloads after it, which leaves a moment without a rule (see [Stopping agent work](#stopping-agent-work)).
+The unit replaces only the `inet infinite_egress` table, so Tailscale's and the system's tables stay as they are. Do not add the rule to `/etc/nftables.conf`, whose `flush ruleset` removes other tables. Restarting or reloading `nftables.service` flushes this table too; the unit then restarts or reloads after it, which leaves a moment without a rule, and no rule at all if that reload fails (see [Stopping agent work](#stopping-agent-work)).
 
 Run real work for at least a week, then read what agents reached:
 
@@ -172,10 +182,11 @@ sudo install -o root -g root -m 0644 deploy/ubuntu/egress/infinite-requires-egre
   /etc/systemd/system/infinite.service.d/egress-firewall.conf
 sudo systemctl daemon-reload
 systemctl show infinite.service -p Requires -p After   # both list infinite-egress-firewall.service
+systemctl show infinite.service -p ExecStartPre        # lists the nft command
 sudo -u infinite-agent curl -sS --max-time 5 https://example.com   # refused: no proxy variables
 ```
 
-Reload, never restart, the firewall unit: restart stops it first, which removes the table while agents keep running. The drop-in makes the API start only after the rule has loaded, and not at all when loading fails, so a host with the boundary on never launches agents without it. It also means that stopping or restarting the firewall unit stops or restarts the API, though not the agents already running. If the API does not come up after a reboot, read `systemctl status infinite-egress-firewall`.
+Reload, never restart, the firewall unit: restart stops it first, which removes the table while agents keep running. The drop-in makes the API start only after the rule has loaded, and not at all when loading fails. Each API start also loads the rule again as root, because the firewall unit stays `active` when something else removes its table later. A host with the boundary on therefore never starts its API without the rule. Agents that are already running are not covered by this: they keep running if the table is removed, which is why every step that removes it begins with [stopping agent work](#stopping-agent-work). It also means that stopping or restarting the firewall unit stops or restarts the API, though not the agents already running. If the API does not come up after a reboot, read `systemctl status infinite-egress-firewall` and `journalctl -u infinite.service` for the failed `nft` command.
 
 Then start a session and confirm it reaches its model and a listed registry, and that an unlisted host fails with `403`. The enforce rule also resets direct connections that were open when it loaded.
 

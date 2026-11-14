@@ -410,6 +410,45 @@ test("clients that disconnect at once cannot pile up name lookups outside the se
   await until(() => { const state = fixture.proxy.state(); return state.open === 0 && state.sessions === 0 && state.lookups === 0; }, "all slots and lookups to be released");
 });
 
+test("bytes sent with the CONNECT count toward the limit on what a client may send before the tunnel opens", async t => {
+  const echo = await echoServer();
+  t.after(() => echo.server.close());
+  // Each lookup waits, so the tunnel cannot open while the client sends.
+  const waiting: (() => void)[] = [];
+  const resolve = () => new Promise(done => waiting.push(() => done([{ address: "127.0.0.1", family: 4 }])));
+  const allowPrivate = [`over.test:${echo.port}`, `within.test:${echo.port}`];
+  const fixture = await startProxy({ mode: "observe", ports: [echo.port], allow: [], allowPrivate }, {}, {}, { resolve });
+  t.after(() => { for (const settle of waiting.splice(0)) settle(); return fixture.proxy.close(); });
+  const limit = 64 * 1024;
+  const open = (host: string, extra: number) => {
+    const socket = connect(fixture.port, "127.0.0.1");
+    socket.on("error", () => {});
+    socket.resume();
+    // One write: the first read carries the head and the start of these bytes, and the rest follow it.
+    socket.write(connectRequest(`${host}:${echo.port}`, basic("project-a", SESSION), "x".repeat(extra)));
+    return socket;
+  };
+
+  const over = open("over.test", limit + 1);
+  await until(() => over.destroyed, "the proxy to drop a client that sent more than the limit");
+  for (const settle of waiting.splice(0)) settle();
+  await until(() => fixture.proxy.state().open === 0, "its slot to be released");
+  assert.equal(fixture.records.at(-1)?.reason, "client-closed");
+  assert.equal(echo.state.connections, 0);
+
+  // Exactly the limit is kept and reaches the destination once the tunnel opens.
+  const within = open("within.test", limit);
+  let echoed = 0;
+  within.on("data", chunk => { echoed += chunk.length; });
+  await until(() => waiting.length === 1, "the second lookup to start");
+  await new Promise(done => setTimeout(done, 100));
+  assert.equal(within.destroyed, false);
+  for (const settle of waiting.splice(0)) settle();
+  const reply = "HTTP/1.1 200 Connection established\r\n\r\n".length;
+  await until(() => echoed === reply + limit, "every early byte to come back through the tunnel");
+  within.destroy();
+});
+
 test("a pending upstream connection is cancelled when its client goes away", async t => {
   const attempts: Socket[] = [];
   const fixture = await startProxy({ mode: "observe", ports: [443], allow: [], allowPrivate: ["hang.test:443"] }, { "hang.test": ["192.0.2.10"] },

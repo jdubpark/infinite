@@ -22,7 +22,8 @@ const MAX_CONFIG_BYTES = 64 * 1024;
 const MAX_POLICY_BYTES = 1024 * 1024;
 const MAX_SUMMARY_BYTES = 16 * 1024 * 1024;
 const KEY_BYTES = 32;
-// What a client may send after its CONNECT before the tunnel opens (a TLS client hello fits many times over).
+// What a client may send before the tunnel opens: the bytes that arrive with its CONNECT and those that follow,
+// counted together (a TLS client hello fits many times over).
 const MAX_EARLY_BYTES = 64 * 1024;
 
 export const DEFAULT_LIMITS = Object.freeze({
@@ -592,6 +593,7 @@ function refusalBody(reason, entry) {
     port: `Infinite egress proxy refused ${where}: the port is not allowed.`,
     "not-listed": `Infinite egress proxy refused ${where}: the host is not in the egress allowlist.`,
     "too-many-connections": "Infinite egress proxy: this session has too many open connections.",
+    "early-data-too-large": "Infinite egress proxy: too many bytes arrived with the CONNECT request.",
     "dns-failed": `Infinite egress proxy could not resolve ${where}.`,
     "dns-timeout": `Infinite egress proxy could not resolve ${where} in time.`,
     "connect-failed": `Infinite egress proxy could not connect to ${where}.`,
@@ -605,6 +607,7 @@ function refusalBody(reason, entry) {
 function statusFor(reason, decision) {
   if (decision === "unauthenticated") return 407;
   if (reason === "bad-target" || reason === "host-mismatch" || reason === "bad-framing") return 400;
+  if (reason === "early-data-too-large") return 413;
   if (reason === "too-many-connections") return 429;
   if (reason === "upgrade-unsupported" || reason === "transfer-coding") return 501;
   if (reason === "dns-busy") return 503;
@@ -1030,6 +1033,10 @@ export function createEgressProxy(options) {
     entry.project = auth.project;
     entry.session = auth.session;
     if (!target) return refuseSocket(client, entry, "refused", "bad-target");
+    // Bytes that arrived in the same read as the CONNECT head are held for the tunnel like those that follow, so
+    // they count toward the same limit.
+    let earlyBytes = head?.length ?? 0;
+    if (earlyBytes > MAX_EARLY_BYTES) return refuseSocket(client, entry, "refused", "early-data-too-large");
     const slot = acquire(auth);
     if (!slot) return refuseSocket(client, entry, "refused", "too-many-connections");
     const gone = new AbortController();
@@ -1038,7 +1045,6 @@ export function createEgressProxy(options) {
     // Until the tunnel opens, read what the client sends and keep it for the tunnel, so that a client leaving is seen
     // at once, even as a half-close. Leaving before the tunnel opens ends the request and any pending connection.
     const early = [];
-    let earlyBytes = 0;
     let tunnelled = false;
     const keep = chunk => {
       earlyBytes += chunk.length;

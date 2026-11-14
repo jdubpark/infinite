@@ -29,6 +29,7 @@ import { validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { ContentError } from "./session-content.js";
 import { fuseReason, workLaunch } from "./fuse/rules.js";
 import type { FuseGate } from "./fuse/types.js";
+import { haltReason } from "./halt/rules.js";
 import { isCollapsedPermissionPrompt, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { nativeContinuationSchema, teamModelProfileSchema, type NativeContinuation, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
 import { missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
@@ -187,7 +188,7 @@ export class Manager {
   readonly hostLoad: HostLoadGate;
   private readonly handoffProjects = new Map<string, string>();
   private fuse?: FuseGate;
-  /** The launch-rate fuse. Without one, every session starts as before and nothing is counted. */
+  /** The launch gate: the owner's halt, then the launch-rate fuse. Without one, every session starts as before and nothing is counted. */
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
   reserveHandoff(projectId: string) {
     const project = this.config.projects.find(project => project.id === projectId);
@@ -901,9 +902,11 @@ export class Manager {
     )
       throw new Error("The configured session limit has been reached");
     // The backstop: a team session is charged before any session directory exists. A replay returned above, and a
-    // launch that its caller already admitted is recognised by its id and not charged again.
+    // launch that its caller already admitted is recognised by its id and not charged again. The owner's halt sits in
+    // front of the fuse, so a halted launch is refused with its own code and is never charged.
     if (request.team && this.fuse) {
       const admission = this.fuse.admit(workLaunch({ launchId: id, projectId: request.projectId, provider: request.provider, team: request.team, profile: request.teamModelProfile }));
+      if (!admission.ok && "halted" in admission) throw new TeamError(409, "halted", haltReason(admission.halted));
       if (!admission.ok) throw new TeamError(409, "fuse-open", fuseReason("open" in admission ? admission.open : "write-failed"));
     }
     if (!request.team && [...this.handoffProjects.values()].some(path => handoffPathsOverlap(path, realpathSync(project.path)))) throw new ContentError("This project is capturing an accepted team handoff");

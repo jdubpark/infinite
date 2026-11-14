@@ -69,6 +69,19 @@ describe("web swarm view", { skip }, () => {
       assert.ok(await count(page, "path.sw-g-read") > 0, "observed reads are drawn");
       assert.ok(await count(page, "path.sw-g-integrated") > 0, "integrated changes are drawn");
       assert.ok(await count(page, "path.sw-g-code") > 0, "code links are drawn");
+      // The legend counts the agents without a signal, and each of them says so: in its label, and under its role when it has one.
+      const marked = await page.evaluate(() => {
+        const labelled = [...document.querySelectorAll('[data-node^="agent:"]')].filter(node => (node.getAttribute("aria-label") ?? "").endsWith(", no signal"));
+        return {
+          labelled: labelled.length, withRole: labelled.filter(node => node.querySelector(".sw-g-role")).length,
+          underlined: labelled.filter(node => node.querySelector(".sw-g-nosignal")).length, allUnderlined: document.querySelectorAll(".sw-g-nosignal").length,
+          flag: [...document.querySelectorAll(".sw-graph-flag")].map(node => node.textContent ?? "").find(text => text.endsWith("no signal")),
+        };
+      });
+      assert.ok(marked.labelled >= 1, "the fixture has agents of a provider without tool inputs");
+      assert.equal(marked.flag, `${marked.labelled} no signal`);
+      assert.equal(marked.underlined, marked.withRole);
+      assert.equal(marked.allUnderlined, marked.underlined, "no observed agent is underlined");
       const sent = await requests(page);
       assert.ok(sent.some(path => path === "/projects/shop-api/graph/map"));
       assert.ok(sent.some(path => /^\/teams\/[0-9a-f-]+\/context$/.test(path)));

@@ -216,7 +216,8 @@ export function buildGraph({ model, maps, touches, projectNames }: GraphInput): 
       for (const path of item.changedPaths?.paths ?? []) touch("integrated", agent, path, 1);
     }
     const observed = touches[agent.sessionId ?? agent.id];
-    if (!agent.observable || observed?.observable === false) {
+    // No answer yet is a gap too: only a positive answer makes an agent observed.
+    if (!agent.observable || observed?.observable !== true) {
       unobserved++;
       const node = nodes.get(nodeId.agent(agent.id));
       if (node) node.unobserved = true;

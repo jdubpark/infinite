@@ -5,8 +5,8 @@ export type FileTouch = { path: string; reads: number; edits: number; lastAt: st
 export type SessionTouches = {
   sessionId: string;
   /**
-   * False until the host has read a tool input that a provider hook recorded for this session. With
-   * `complete: false` the index may still find one. A gap in sight, not a fact about the agent.
+   * False until the host has read a tool input that a provider hook recorded for this session, or one that named
+   * a path. With `complete: false` the index may still find one. A gap in sight, not a fact about the agent.
    */
   observable: boolean;
   complete: boolean;

@@ -231,8 +231,15 @@ test("a session is observable only when its journal holds a recorded tool input"
   assert.deepEqual(await facts([signal(1, { kind: "tool-start", source: "protocol", tool: "bash", toolUseId: "t1", input: {}, quiet: false })], "codex"), [false, true, 0]);
   // One tool input recorded by a hook is the evidence, even when its path is outside the workspace and is dropped.
   assert.deepEqual(await facts([toolStart(1, "Read", { file_path: "/etc/hosts" })]), [true, true, 0]);
+  // A tool input that named a path is evidence whatever channel carried it, so found files are never hidden as a gap.
+  assert.deepEqual(await facts([signal(1, { kind: "tool-start", source: "protocol", tool: "Read", toolUseId: "t1", input: { file_path: "src/a.ts" }, quiet: false })]), [true, true, 1]);
   // While the journal is still being read nothing is known yet, and that reads as a gap, not as an agent that touched nothing.
-  assert.deepEqual(await facts([signal(1, { kind: "turn-start", source: "screen" }), toolStart(2, "Read", { file_path: "src/a.ts" })], "claude", 1), [false, false, 0]);
+  const slow = index([signal(1, { kind: "turn-start", source: "screen" }), toolStart(2, "Read", { file_path: "src/a.ts" })], 1);
+  const first = await slow.session(source());
+  assert.deepEqual([first.observable, first.complete, first.files.length], [false, false, 0]);
+  // The next request reads on and finds the input: the gap becomes an observation.
+  const second = await slow.session(source());
+  assert.deepEqual([second.observable, second.complete, second.files.length], [true, true, 1]);
 });
 
 test("incremental cursor", async () => {

@@ -911,6 +911,8 @@ export class TeamService {
   }
   /** Read mission ownership without building a view or updating external tracking. */
   missionIdOf(id: string): string | undefined { return this.record(id).run.missionId; }
+  /** Read goal ownership without building a view or updating external tracking. Undefined for an unknown run. */
+  goalIdOf(id: string): string | undefined { return this.records.get(id)?.run.goal?.id; }
   /** Restores the mission-authored size boundary for subteams persisted before ceilings were stored. */
   ensureMissionCapacityCeiling(id: string, missionId: string, ceiling: number): number | undefined {
     if (!Number.isInteger(ceiling) || ceiling < 1 || ceiling > 4)

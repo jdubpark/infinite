@@ -1386,6 +1386,16 @@ Only the owner can change the mode, from the paired owner CLI. Members, other ro
 
 The host limits how often it starts team sessions: 30 per project and 80 across the host in a rolling hour. A launch that would pass a limit waits. The member or goal shows a reason that starts "Waiting for the spend fuse:", names the project or the host, and gives no figures. The first trip of a UTC day closes by itself when fewer than half the limit remain in the last hour. If the limit is reached again on the same UTC day, the trip stays open until the owner closes it with `infinite fuse close --project PROJECT_ID` or `infinite fuse close --host`. The permission coordinator is never counted or held. The limits can be changed under `autonomy.fuse` in the host configuration (`project`, `host`, and `projects.PROJECT_ID`, each with `launchesPerHour`). A trip opened because the launch record cannot be read closes once the record can be read. Run `infinite fuse` to read every scope, or add `--json` for the full view. The `autonomy-interrupt` push event is on by default and sends the owner one notification per trip and subject per UTC day.
 
+## Halt
+
+The owner can stop autonomous work on the whole host or in one project, and it stays stopped until the owner releases it. `infinite halt on --host` or `infinite halt on --project PROJECT_ID [--reason TEXT]` engages a halt from any owner client, and the phone can send the same request through the API. From that moment no new team, goal, mission, or routine session starts in scope. Every scheduler and the session manager's backstop ask the halt before the launch-rate fuse, so a held launch is not counted by the fuse, is not a failed attempt, and is not a missed coordinator report. No role is exempt, including the permission coordinator that the fuse lets through. A held item shows "Halted by the owner for the whole host." or "Halted by the owner for this project."
+
+Engaging also pauses the running work in scope through each item's own pause path: routines first, so they start nothing, then goals, missions, and the team runs that no goal or mission owns. A goal or mission pauses its own runs. A mission is in scope when any of its repositories is the halted project. Items the owner paused, blocked items, items waiting for input, and ended items are not touched; the members of an item waiting for input keep running, but nothing new starts. Sessions the owner started directly keep running. Each item the halt paused is marked with that halt. An item that could not be paused is listed in the response, and the halt stays engaged.
+
+`infinite halt off --host` or `--project PROJECT_ID` releases it. The gate lifts first. Then each marked item that is still paused, and that the owner did not change during the halt, resumes in reverse order under the same rules as the owner's resume; a team run resumes with a fresh plan. An item that those rules refuse stays paused and says why, for example a team whose members are still stopping, a team that needs workspace reconciliation, or a goal or mission past its deadline. Resume it when it is ready. A host halt and a project halt are independent: an item resumes only when no remaining halt covers it, and otherwise it moves to the remaining halt. `--keep-paused` lifts the gate and resumes nothing; each marked item then says that the owner kept it paused.
+
+Engage and release are idempotent by request ID. Engaging a scope that is already halted, or releasing one that is not, changes nothing and returns the current state. The halt is recorded in `halt.sealed` in the host state directory with its time, reason, and the owner device that engaged it. A restart keeps it, and a restart in the middle of a pause or resume pass finishes that pass without repeating what was done. If the host cannot read the record, it treats the whole host as halted and refuses every change to the halt until the record can be read; it checks again every minute. When the record cannot be restored, removing that file on the host clears every halt at the next check; nothing resumes, so resume each paused item yourself. A halt never infers completion and approves nothing. `infinite halt` lists every halted scope; add `--json` for the full view.
+
 ## Configuration
 
 Each new run gets a folder named from its UTC creation date, a slug of its
@@ -1809,6 +1819,26 @@ on a later request. See [Swarm view](swarm.md).
 The continue request accepts exactly `requestId`, `revision`, and optional
 `text`; omit `text` when no direction is needed. A supplied direction is trimmed
 and must contain 1–8,000 characters.
+
+### Halt
+
+| Method and endpoint | Body | Role |
+| --- | --- | --- |
+| `GET /api/halt` | None; returns `{readable, host?, projects}`. Each halt has `haltId`, `at`, optional `reason`, and `by`, the engaging device's label; a project halt adds `projectId` | Any paired device |
+| `POST /api/halt` | `requestId` (UUID), `scope` (`host` or `project`), `projectId` for a project, optional trimmed `reason` (1–500 characters) | Owner |
+| `POST /api/halt/release` | `requestId` (UUID), `scope`, `projectId` for a project, optional `keepPaused` | Owner |
+
+Engage returns `{halt, engaged, paused, failed}` and release returns
+`{halt, released, resumed, notResumed}`. Each listed item has `kind` (`routine`,
+`goal`, `mission`, or `team`), `id`, `title`, and an optional `reason`. A replay
+of the same request returns the first result. An unknown project answers `404`
+with `code: "project-not-found"`; a project that left the configuration while
+halted can still be released. A request ID reused with a different body answers
+`409` with `code: "request-conflict"`. While the halt record cannot be read, both
+mutations answer `409` with `code: "halt-unreadable"`. A failed write answers
+`503` with `code: "write-failed"` and changes nothing. The session manager
+refuses a launch that a halt holds with `409` and `code: "halted"`. See
+[Halt](#halt).
 
 ## Model scorecard
 

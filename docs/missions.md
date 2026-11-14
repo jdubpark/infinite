@@ -245,6 +245,15 @@ subteam. The deadline stops the coordinator and active subteams like a team
 deadline. Coordinator and subteam sessions are read-only to people; provider
 permission prompts continue to go to the owner or a delegated coordinator.
 
+The owner's [halt](teams.md#halt) pauses a `planning` or `working` mission when
+any of its repositories is in the halted scope, as the owner's pause does, and
+holds every new coordinator and subteam launch in scope. The mission shows the
+halt as its reason, and its active subteams stop through the mission. A release
+resumes it unless the owner acted on it during the halt or its deadline has
+passed; in that case it stays paused and says why. A `needs-input` mission is
+not paused, but no coordinator attempt starts while any of its repositories is
+halted, and no subteam starts in a halted repository.
+
 Status honesty: `ready-for-review` means the coordinator reported a result after
 every subtask finished. It does not establish product impact or acceptance. Each
 subteam delivers only under its repository's own delivery policy; the mission

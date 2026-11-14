@@ -124,6 +124,23 @@ target, Enter to open the selected row or submit a mission, `a` to answer its
 open decision, and `q` or Ctrl+C to exit. Missions open their decision and
 subtask summary; team rows use `infinite team watch`.
 
+## Halt
+
+```sh
+infinite halt [--json]
+infinite halt on --host | --project PROJECT_ID [--reason TEXT]
+infinite halt off --host | --project PROJECT_ID [--keep-paused]
+```
+
+`halt` prints each halted scope with when it was halted, the owner device that
+halted it, and its reason. `on` stops autonomous work in the scope and prints
+each item it paused and any it could not pause. `off` releases the scope and
+prints what resumed and what did not, with the reason; `--keep-paused` resumes
+nothing. Both print their request ID to standard error. To retry a request whose
+answer was lost, run the same command with `--request-id ID`; the host returns
+the first result rather than acting twice. `on` and `off` need an owner device.
+See [Halt](teams.md#halt).
+
 ## Team CLI
 
 Initialize a project from a clean Git checkout, then start and control teams from that directory:

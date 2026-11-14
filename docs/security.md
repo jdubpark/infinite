@@ -259,10 +259,14 @@ thread. See [intake](intake.md) for the flow.
 Only the owner causes work, and the rule holds for both the intake service and the
 Slack surface:
 
-- An issue starts a mission only when its creator is the owner's Linear user ID,
+- Work starts by one of two routes, and each needs the owner. An issue starts a
+  mission only when its creator is the owner's Linear user ID,
   `intake.linear.creatorId`. When a Slack thread is required, the thread must also
   hold a message from the owner's Slack user ID, `intake.slack.ownerUserId`, that
-  mentions Linear's agent and was sent before the issue was filed.
+  mentions Linear's agent and was sent before the issue was filed. A direct
+  request, with `intake.slack.directRequests` on, starts only from an `app_mention`
+  of the bot by that Slack user in the configured workspace, with no bot ID. With
+  `intake.linear.admitIssues` false, the first route is off.
 - The bot acts only on `app_mention` events from the owner's Slack user in a thread
   bound to a record. A mention or reply from anyone else in a bound thread is
   dropped before anything is stored; the surface keeps only a count of dropped
@@ -272,6 +276,16 @@ Slack surface:
   are read at admission to check authorship and are not stored, shown to agents,
   or logged. The Slack surface also reads the bound thread to find its own posts
   after an uncertain send; it stores nothing from that read.
+- For a direct request, other people's messages are read, because the owner's
+  decision of 2026-11-14 is that they reach agents. The messages in the thread
+  at the time of the mention, sent no later than the mention, are put in the
+  mission objective, stored with the mission, and shown to agents. They are not
+  logged, not copied into the Linear issue or any comment, and not posted to
+  Slack. Messages others send later are never read. Every line carries its author
+  (`owner | `, `other N | `, `bot | `), and line-break characters in a message are
+  normalised first, so a forged line inside another person's message keeps that
+  person's marker. The markers are a prompt boundary and not a guarantee: agents
+  are told that lines marked `other` or `bot` are not instructions.
 - A skipped issue's title and description are not stored. Its record keeps the
   issue's IDs, URL, times, and skip reason, and no text from the issue.
 
@@ -307,8 +321,11 @@ places: a mission service refusal (`TeamError`), a Slack request failure
 (`LinearFailure`, whose text is fixed).
 
 Residual risk: the objective carries the Linear title and description, and the
-owner's Slack messages, to the coordinator and subteams. Anyone who can edit the
-issue before it is admitted can put instructions in its title or description. The
+owner's Slack messages, to the coordinator and subteams. For a direct request it
+also carries the other people's text in the thread, so anyone who can post in a
+thread where the owner mentions the bot can put words in front of agents. Anyone
+who can edit the issue before it is admitted can put instructions in its title or
+description. The
 coordinator is told that only the owner's words are instructions and that anything
 read through a connector is information. That is a prompt boundary, not a
 guarantee, and it does not stop an injected request from the owner's own account.

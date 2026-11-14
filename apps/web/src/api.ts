@@ -98,11 +98,13 @@ export type Me = {
   machine?: { id: string; label: string; environment: string };
   backends?: ("infinite" | "cmux")[];
   backendProviders?: { infinite: string[]; cmux?: string[] };
-  capabilities?: { signals: boolean; answer: boolean; push: boolean; dictation?: { model: string } };
+  /** `swarmContext` marks a host that serves the code map and touch endpoints the Swarm graph reads. */
+  capabilities?: { signals: boolean; answer: boolean; push: boolean; dictation?: { model: string }; swarmContext?: 1 };
   providers: string[];
   projects: { id: string; name: string; linear?: { enabled: boolean }; team?: { establishChecks?: true; checks: { command: string; args: string[] }[]; setup?: { command: string; args: string[] } } }[];
   teams?: { enabled: boolean; lineup?: TeamLineup };
   goals?: { enabled: boolean };
+  missions?: { enabled: boolean };
   providerLimits?: ProviderLimit[];
   usage?: { enabled: boolean; budgets: Partial<Record<string, UsageBudget>> };
   terminal?: { stream: boolean; duplex: boolean; raw: boolean; snapshot?: boolean; control?: boolean };

@@ -38,3 +38,11 @@ test("sub-cent costs are never shown as zero", () => {
   assert.deepEqual([0, 0.003, 0.00004, 0.01, 1.234].map(formatUsd), ["0.00", "0.0030", "<0.0001", "0.01", "1.23"]);
   assert.match(opencode(lines({ spent: totals(0.003, 1) })), /spent \$0\.0030 /);
 });
+
+test("a provider without Spent prints its tokens", () => {
+  const claude = { ...idle, unmeasuredSessions: 2, partialSessions: 1, recorded: { tokens: { input: 100, output: 20, reasoning: 5, cacheRead: 1000, cacheWrite: 0 }, messages: 3 } };
+  const line = (entry: unknown) => lines({}, { claude: entry as UsageSummary["providers"]["claude"] }).find(text => text.startsWith("claude"));
+  assert.equal(line(claude), "claude    1125 tokens for month from 2026-10-01 (3 steps, 1 partial, 2 unmeasured sessions)");
+  assert.equal(line({ ...claude, partialSessions: 0 }), "claude    1125 tokens for month from 2026-10-01 (3 steps, 2 unmeasured sessions)");
+  assert.equal(line({ ...claude, recorded: { ...claude.recorded, messages: 0 } }), "claude    unmeasured (2 sessions, no usage is recorded for this provider)");
+});

@@ -42,3 +42,34 @@ Use 1 Gbit/s initially: 125 MB/s is its theoretical line-rate ceiling before ove
 Ubuntu 24.04 LTS, AX102-1-LTD if available, 128 GB RAM, 2 × 1.92 TB NVMe in RAID1, default 1 Gbit/s uplink, and encrypted working storage. Choose Germany or Finland after a latency check from the owner's usual location. RAID1 provides about one drive's capacity and is not backup. Budget separately for encrypted off-host backups, IPv4 if needed, tax, and model plans.
 
 If only the full-price AX102 is available, compare a current Hetzner auction listing and an OVH 128 GB quote before paying. Auction specifications and stock must be verified at purchase time. This document is a selection recommendation, not purchase authorization or a capacity guarantee; no account, final quote, location, or spending limit has been selected.
+
+## Launch gate and a second instance
+
+### Host load gate
+
+The optional `hostLoad` config block holds automatic launches while the host is
+short of memory or CPU. Owner-started sessions never pass through the gate. It
+has two fields, both required when the block is present:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `minAvailableMemoryGiB` | number, 0 to 4096 | Automatic launches wait while available memory is below this many GiB. |
+| `maxLoadPerCpu` | number, above 0 up to 64 | Automatic launches wait while the one-minute load average per CPU is above this. |
+
+With no `hostLoad` block, nothing is gated. The schema sets no default, so the
+values have to be written into the config. The planned values for the first
+instance are `{"minAvailableMemoryGiB": 8, "maxLoadPerCpu": 1.5}`.
+
+On Linux, available memory is `MemAvailable` from `/proc/meminfo`, which counts
+reclaimable cache. Other platforms use free memory. On macOS the gate reads free
+memory, which undercounts available memory, so a floor sized for Linux can hold
+every automatic launch on a Mac host. The reading is refreshed at
+most every 2 seconds. A held launch carries a reason that starts with
+`Waiting for host capacity:` and names the measured value and the limit.
+
+### Second instance
+
+A second instance is a second host process on the same machine, with its own
+names, state, and Slack app. The commissioning steps (names, accounts and
+directories, rendered service templates, the sudoers check, the relay entry, and
+the acceptance checks) are in [`deploy/ubuntu/instances.md`](../deploy/ubuntu/instances.md).

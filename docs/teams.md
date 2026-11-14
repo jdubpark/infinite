@@ -850,7 +850,7 @@ into tracked configuration examples, screenshots, or repository reports.
 
 ## Usage and budgets
 
-The sealed host ledger records measured OpenCode token usage. Configure a `usage` block to expose the Cost view, account mapping, and budgets. The dated built-in catalog prices DeepSeek and Meta models; custom prices can override it. Claude and Codex remain unmeasured per use and appear only as fixed plan fees. The web client, API, and CLI read the same ledger.
+The sealed host ledger records measured OpenCode token usage. Configure a `usage` block to expose the Cost view, account mapping, and budgets. The dated built-in catalog prices DeepSeek and Meta models; custom prices can override it. The ledger records Claude Code and Codex tokens for sessions whose hooks stream a transcript. Each figure states its coverage. Those records are not priced yet, so they count as unpriced steps. The web client, API, and CLI read the same ledger.
 
 ```json
 {
@@ -880,7 +880,7 @@ Every total carries an unpriced count. Clients mark incomplete priced totals wit
 
 Budgets are informational. The host shows spent against budget and marks `over budget`, but it never pauses, refuses, or hides a team, goal, or session because of spend.
 
-Only some work is measured. OpenCode team members and OpenCode sessions started from the local UI report usage. Claude Code, Codex, Grok, and OpenCode in a native terminal do not, so their sessions, and team members that use them, show `Unmeasured`. Unmeasured work is counted separately and is never added to a total as zero.
+OpenCode team members and OpenCode sessions started from the local UI report usage. Grok and OpenCode in a native terminal stay unmeasured, so their sessions, and team members that use them, show `Unmeasured`. Unmeasured work is counted separately and is never added to a total as zero.
 
 Headless team members record the model that was requested for them. If the provider substitutes another model, the ledger still prices the requested one.
 
@@ -1349,6 +1349,43 @@ The first command revokes delegation for a current run. The second disables it
 for future runs. Both require an owner client. Pausing, cancelling or steering a
 run prevents its old pending decisions from being applied.
 
+## Autonomy mode
+
+Each project has an autonomy mode. The mode is `supervised` or `autonomous`.
+
+In this release the host only stores and shows the mode. Nothing reads it yet, so no behaviour changes.
+
+Each new run and each new goal records the project's mode when it starts. A goal's cycles keep the goal's mode. A change applies to the next run and the next goal. A run or a goal already in progress keeps its mode.
+
+An enrolled repository without a saved mode uses the host default. The default is `autonomous` unless the operator sets `autonomy.defaultMode` in the host configuration file. A project that is not enrolled reads as `supervised`.
+
+Read the mode:
+
+```sh
+infinite autonomy mode PROJECT
+```
+
+Change it:
+
+```sh
+infinite autonomy mode PROJECT supervised
+infinite autonomy mode PROJECT autonomous
+```
+
+Set it when enrolling:
+
+```sh
+infinite repo init --autonomy supervised
+```
+
+Omit `--autonomy` on a later `repo init` to keep the saved mode.
+
+Only the owner can change the mode, from the paired owner CLI. Members, other roles, and browser sessions cannot.
+
+## Launch-rate fuse
+
+The host limits how often it starts team sessions: 30 per project and 80 across the host in a rolling hour. A launch that would pass a limit waits. The member or goal shows a reason that starts "Waiting for the spend fuse:", names the project or the host, and gives no figures. The first trip of a UTC day closes by itself when fewer than half the limit remain in the last hour. If the limit is reached again on the same UTC day, the trip stays open until the owner closes it with `infinite fuse close --project PROJECT_ID` or `infinite fuse close --host`. The permission coordinator is never counted or held. The limits can be changed under `autonomy.fuse` in the host configuration (`project`, `host`, and `projects.PROJECT_ID`, each with `launchesPerHour`). A trip opened because the launch record cannot be read closes once the record can be read. Run `infinite fuse` to read every scope, or add `--json` for the full view. The `autonomy-interrupt` push event is on by default and sends the owner one notification per trip and subject per UTC day.
+
 ## Configuration
 
 Each new run gets a folder named from its UTC creation date, a slug of its
@@ -1444,7 +1481,8 @@ run from the team's recovery directory, then runs `remote remove origin`,
 `cat-file -t BASE`,
 `check-ref-format --branch BRANCH`, `checkout -B BRANCH BASE`, and
 `status --porcelain=v1 -z --untracked-files=all` only inside that clone. Only
-the pinned base fetch and `rev-parse` run in the source mirror. Verification
+the pinned base fetch, `rev-parse`, and the five base scan forms listed below run
+in the source mirror. Verification
 copies use `checkout --detach COMMIT` in their destination. Recovery uses
 `checkout -B BRANCH COMMIT` only in its fresh recovery clone. Read-only inspection uses
 `status --porcelain=v1 -z --untracked-files=all` in both team and project
@@ -1457,7 +1495,10 @@ GitHub-tracked sources add these operations. The host runs each through
 
 - in a host mirror: `init --bare` when the mirror is created, `fetch --no-tags` of
   the base branch from the GitHub URL into `refs/heads/BASE`, and `rev-parse` of
-  that ref;
+  that ref before and after the fetch. The read before the fetch finds a head
+  that an earlier fetch left without a record, and the host notes it first;
+- in a host mirror, after each successful fetch: the base scan forms in the
+  table below;
 - in a project source directory: `rev-parse --show-toplevel` (the refresh
   refuses a directory that is not the repository root), `fetch --no-tags` of the
   base branch from the mirror path into `refs/remotes/origin/BASE`,
@@ -1474,6 +1515,28 @@ GitHub-tracked sources add these operations. The host runs each through
 - in a team run's integration checkout: `push` of the exact commit SHA to
   `refs/heads/RUN_BRANCH` on the GitHub URL, with no force, delete or implicit
   refspec. See [Head publication](#head-publication).
+
+The host reads the base branch in the source mirror after each successful fetch.
+It records which approved runs landed on the base and which landings were
+reverted. These five forms run through `teams.commandPrefix` in the host mirror,
+never in a team workspace, with a 30 second limit. Every commit id is checked as
+a 40 or 64 character lower-case hex id before use.
+
+| # | Form | Output |
+|---|---|---|
+| 1 | `merge-base --is-ancestor OLD NEW` | Exit status only |
+| 2 | `rev-list --first-parent --max-count=501 NEW ^OLD` | At most 501 ids, 33 KiB |
+| 3 | `rev-list --first-parent --max-count=500 NEW` | At most 500 ids, 33 KiB |
+| 4 | `log --no-walk=unsorted --no-show-signature --format=%H %T %P ID...` (1 to 50 ids) | One line per id |
+| 5 | `log --no-walk=unsorted --no-show-signature --format=%H --fixed-strings --grep=This reverts commit ID... ID...` (1 to 50 patterns, then 1 to 50 ids) | At most 50 ids |
+
+One scan runs at most 600 Git commands. A scan that needs more fails, writes
+nothing, and is tried again after the next fetch. Each form follows the six
+settings that the host puts before every Git command, and nothing else; the
+launcher should admit a form only in that shape.
+
+The production launcher must admit all five forms. Until it does, every scan
+fails: no landing is recorded, and held stays unknown.
 
 `teams.publishHeads` (boolean, default `true`) controls head publication. Set it
 to `false` to disable it.
@@ -1717,6 +1780,7 @@ cycle's PM selects capacity for its work. The refusal uses `409` with
 | --- | --- | --- |
 | `GET /api/teams` | None; returns `{teams}` | Any paired device |
 | `GET /api/teams/:id` | None; returns reports and check evidence | Any paired device |
+| `GET /api/teams/:id/context` | None; returns the files each member's recorded tool inputs pointed at | Any paired device |
 | `POST /api/teams` | `requestId`, `projectId`, `provider`, `title`, `objective`, optional `useConfiguredLineup` | Owner |
 | `POST /api/teams/:id/steer` | `requestId`, `revision`, `text` | Owner/controller; standalone teams |
 | `POST /api/teams/:id/continue` | `requestId` (UUID), `revision`, optional trimmed `text` (1–8,000 characters) | Owner; continuable standalone blocked runs |
@@ -1724,18 +1788,359 @@ cycle's PM selects capacity for its work. The refusal uses `409` with
 | `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams |
 | `POST /api/teams/:id/tasks/:taskId/rating` | `requestId`, `score` (1–5), optional `note` (≤1,000 characters) | Owner |
 
+The context response lists, for each member of the current revision and each
+earlier member still running, its repository-relative `files` with `reads`,
+`edits`, and `lastAt`, a `graphQueries` count, and `observable`, `complete`,
+and `truncated` flags. `GET /api/sessions/:id/context` returns the same shape
+for one session. These are observed tool inputs: they show what an agent's
+tools were pointed at, not that the agent used the content, and an observed
+edit is not a landed change. A session answers `observable: false` until the
+index has read a tool input that a provider hook recorded for it; with
+`complete: false` the index may still find one. That covers a provider whose
+hooks are off, a session started with native arguments or in the native UI,
+and a session before its first tool call. A session also answers
+`observable: false` when its provider is neither Claude Code nor Codex, when
+it has no host journal, and when its journal cannot be read. The index is in
+memory, bounded,
+and rebuilt on demand after a restart. `complete: false` means the index is
+still catching up, or is full of sessions being read and will admit this one
+on a later request. See [Swarm view](swarm.md).
+
 The continue request accepts exactly `requestId`, `revision`, and optional
 `text`; omit `text` when no direction is needed. A supplied direction is trimmed
 and must contain 1–8,000 characters.
 
 ## Model scorecard
 
-`GET /api/usage/models?role=implementer` returns per-profile task outcomes,
-metered usage, version 1 reviewer rubric means, separate owner ratings, Wilson
-95% integration intervals, and advisory comparisons once both profiles have
-at least ten attempts. Limit-switched attempts are excluded. The host never
-changes the configured model lineup; ratings and rubrics are not sent to
+`GET /api/usage/models?role=implementer` reads the outcome ledger's production
+rows, not run records. It returns per-profile task outcomes, metered usage,
+version 1 reviewer rubric means, separate owner ratings, Wilson 95% integration
+intervals, and advisory comparisons once both profiles have at least ten counted
+attempts. The shape is unchanged, with two additive fields: top-level `sources`
+(`["production"]`) and a per-row `excluded` object with `limit`, `owner`,
+`host`, and `duel` counts. Limit-switched attempts stay excluded. A profile with
+no counted attempt has no row. When the evidence store is unavailable the route
+answers `503` with `code: "evidence-unavailable"`; it neither falls back to run
+records nor shows an empty scorecard.
+
+The numbers changed on purpose in these eight ways:
+
+1. An attempt integrated before a steer, a resume, or a continuation counts.
+2. An attempt of a deleted run counts.
+3. Owner stops and host stops leave the denominator.
+4. A running attempt is left out, because only ended attempts count.
+5. A profile's row shows one identity and one epoch only: the model the configured lineup gives that profile ID now, at the epoch the owner last declared for it (`infinite usage outcomes new-epoch`). Older epochs, and an older model behind the same ID, stay in the ledger cells. After an epoch advance or a model change, the profile has no row until an attempt under the new one has ended, and a profile whose attempts are all still running or excluded has no row either. A lineup that a goal, a mission, or a handoff policy carries can give the same profile ID another model for good; those attempts stay in the ledger cells and never reach this row.
+6. A scout's rate is its completed share.
+7. Review rounds count correction rounds of every cause (`rounds.run`).
+8. Minutes run to the integration event, not to the report.
+
+The first start after an upgrade writes the rows of every retained run that predates the ledger before the host serves, so the scorecard never shows a part of the history as all of it.
+
+Cost is the usage service's measured total for each session. A session it did
+not measure, or one with partly unpriced usage, is left out of every cost figure
+and is never counted as zero. A rate with no counted attempt prints as
+`rate unknown`, never as 0%.
+
+`GET /api/outcomes?project=&role=&by=&sources=&days=` returns display cells to
+every paired device. `by` names up to five dimensions (`project`, `profile`,
+`area`, `kind`, `risk`; default `profile`), `sources` names any of `production`,
+`duel`, `replay`, and `legacy` (default `production`), and `days` is an integer
+from 1 to 3650. Each cell shows its key, attempts, open and excluded counts, and
+the four levels with their intervals. `infinite usage outcomes` prints one line
+per cell, and `--json` prints the response. Rows whose payload cannot be read
+are left out and counted in `unreadable`.
+
+The host never changes the configured model lineup; ratings and rubrics are not sent to
 implementers. The owner rating request is idempotent for a given `requestId`.
+
+### Signals and held
+
+A signal is a fact about a run's outcome rows. Besides `rating`, four kinds
+appear. `landing` and `revert` are host receipts from the base branch scan.
+`linked-fix` and `exclusion` are owner claims. A member cannot write a signal.
+Signals are kept as long as the run's rows are.
+
+The scan matches a new first-parent base commit to an approved run by one of
+three exact rules. It checks the commits oldest first:
+
+1. The commit is the merge commit that the run reported (`merge-commit`).
+2. The commit's second parent is the run's reviewed head (`merge-parent`).
+3. The commit's tree is the run's reviewed tree (`tree-equal`).
+
+A tree can recur, so rule 3 also needs proof that the commit is not older than
+the run. The commit is the reviewed head itself, or the run's base is among the
+scanned commits before it. When the base is not among them, the rule holds only
+in a scan of new commits. A scan that reads history older than the ledger's own
+head (the first scan, or one after a rewrite or a source change) then matches no
+tree. A run that changed nothing never lands.
+
+A run lands once, at its first matching commit. A squash onto a moved base lands
+nothing, so that run's held stays unknown.
+
+A landing starts a hold window of `teams.outcomes.holdDays` days. Held is:
+
+- yes when the row was accepted, and the window closed with scans that covered
+  every base commit in it;
+- no when the row was not accepted, when the landing was reverted inside the
+  window, or when a linked fix applies;
+- unknown otherwise.
+
+A linked fix applies when the run has no landing, or when its time is at or
+before the close of the window. Unknown is never shown as a number. A cell
+counts an unknown held under `unknown`.
+
+Held stays unknown when a gap falls inside the window:
+
+- a jump past 500 commits, where the scan keeps the newest 500 and records the
+  gap `bound`;
+- a rewritten base branch (`rewrite`), or a project that now follows another
+  repository or branch (`source`);
+- a fetch that no scan recorded, when the scanner cannot show that every head
+  the mirror held since the last recorded scan is still a first-parent commit of
+  the base branch (also `rewrite`). A host restart after such a fetch moved the
+  head is one case;
+- a refresh that lapses by more than six hours across the close of the window.
+
+The row carries the `scan-gap` flag when a gap leaves held unknown on an accepted
+row of a run that landed. A revert decides held whatever the gap.
+
+The first scan of a project reads only the newest 500 commits, so it finds no
+older landing. A run is a landing candidate for 90 days after its approval.
+
+An owner exclusion removes the attempt from every rate, and the scorecard counts
+it under `excluded.owner`. Withdrawing the exclusion restores the attempt.
+
+Two settings under `teams.outcomes` control the ledger. Neither needs a new
+routine approval.
+
+- `holdDays`: an integer from 1 to 365. Default 30.
+- `retentionDays`: an integer from 30 to 3650. Default 730, the ledger's
+  retention.
+
+A changed `holdDays` applies to landings recorded afterwards. Each landing keeps
+the window it started with.
+
+`POST /api/outcomes/signals` is owner only. Each body is JSON with one of three
+shapes. A record carries a `requestId` UUID. A withdrawal carries none, because
+it is idempotent by the signal's state.
+
+- `{"action": "record", "kind": "linked-fix", "requestId", "runId", "memberId", "issue", "commit", "at"}`.
+  `memberId` and `at` are optional. The fix names an `issue` or a `commit`. `at`
+  is an ISO time no later than the request.
+- `{"action": "record", "kind": "exclusion", "requestId", "runId", "memberId", "reason"}`.
+  `reason` is `outside-cause`, `invalid-task`, `trial`, or `other`.
+- `{"action": "withdraw", "kind": "linked-fix" or "exclusion", "signalId"}`.
+  `signalId` is 64 hex characters.
+
+The route answers:
+
+- `200` with `{ "signal", "repeated" }`. `repeated` is `true` when the same
+  record was already applied, or when the signal was already withdrawn. The
+  served signal has no `request` field.
+- `400` for an invalid body, or an `at` later than the request.
+- `403` for a caller that is not the owner.
+- `404` with `outcome-not-found` for an unknown run or member, or with
+  `signal-not-found` for an unknown signal.
+- `409` with `request-conflict` when the `requestId` was used for another
+  record, or with `signal-not-withdrawable` when the signal is not an owner
+  signal of the given kind.
+- `503` with `code: "evidence-unavailable"` when the store is unavailable, or
+  when a row of the run cannot be read.
+
+The remote relay refuses this route with `403` and `code:
+"remote-endpoint-denied"`.
+
+`GET /api/outcomes/runs/:runId` lists the run's signals, withdrawn ones included.
+`unreadable` counts the signals of the run that the store could not read. A run
+with such a signal keeps the levels it had: the host does not recompute its rows
+without every signal, and an owner claim on it answers `503`. The ledger's
+projector also waits at the next event of that run, as it does for an outcome row
+it cannot read, so no later event of any run is projected until the store is
+repaired.
+`infinite usage outcomes --run ID` prints one line per signal.
+
+```sh
+infinite usage outcomes link-fix --run ID [--member ID] (--issue KEY | --commit SHA) [--at TIME] [--request-id ID] [--json]
+infinite usage outcomes exclude --run ID --member ID --reason REASON [--request-id ID] [--json]
+```
+
+Either command takes `--withdraw SIGNAL` to withdraw that signal; a withdrawal
+needs no other option. For a record, pass `--request-id` to make a retry safe.
+Otherwise each run of the command is a new request.
+
+A revert is seen only when a first-parent commit's message names the landing
+commit or, for a landing by the second parent, the reviewed head. Work that is
+removed another way is not seen: a revert of one commit of the branch, a revert
+of a second merge of the same head, or a plain edit. Held can then be yes for
+work that is gone.
+
+A landing is a receipt of what the mirror showed at a fetch. The agent identity
+can write the mirror, so a receipt is not proof against a member that alters the
+mirror itself. A `merge-commit` landing also rests on the merge commit that the
+delivery member reported: the scan checks only that it is a first-parent commit
+of the base branch. Each landing stores which rule matched.
+
+Runs that predate the ledger never land, so their held stays unknown. A landing
+commit that the scan read before its run's approval reached the ledger is never
+matched. The scan does not infer a landing from a pull request number, a commit
+subject, or the GitHub API.
+
+### Roll-ups
+
+`GET /api/outcomes/rollup?goal=ID` and `GET /api/outcomes/rollup?mission=ID`
+return one roll-up for a goal or a mission. Pass exactly one of them, and the
+value must be a UUID. Every paired device can read it, as it reads
+`GET /api/outcomes`. `infinite usage outcomes --goal ID` or `--mission ID`
+prints the roll-up, and `--json` prints the response.
+
+A run belongs to a roll-up when its run summary or one of its rows carries the
+goal or mission id. Every row and member result of such a run counts. A row
+copies the goal when it is made, so a row that an event made before
+`run.created` can carry none. The run still belongs through its summary or its
+other rows. A deleted run still rolls up while the ledger keeps its rows.
+
+The response holds these fields:
+
+- `target` and `known`. `known` is true when the host holds a record of the
+  goal or mission.
+- `assessment`: the goal's latest assessment, with `result`, `at`, and
+  `revision`. A mission has none. The assessment text stays with the goal.
+- `runs`: `total`, `withSummary`, `withCounts`, `deleted`, the `status` and
+  `blockCodes` counts, the summed `counts` and `rounds`, and `flagged` with
+  `backfilled` and `gap`.
+- `attempts`: rows by disposition, for both roles.
+- `implementer` and `scout`: the display cells of each role. They count the
+  same way as the cells of `GET /api/outcomes`.
+- `members`: the member results counted.
+- `cost`: `sessions`, `complete`, `noSession`, `tokens`, and `spentUsd`.
+- `unreadable`: the stored records of the runs that the store could not open.
+- `unindexed`: the stored rows and summaries whose goal or mission reference
+  could not be read at migration. It counts across the whole store.
+
+Unknown values stay unknown:
+
+- `counts` and `rounds` are summed over settled runs only. Both are null when
+  no run has settled.
+- A session's cost counts only when its cost is complete. A session left out
+  of the cost is never counted as zero.
+- `tokens` and `spentUsd` are null when nothing was summed, never 0.
+- Only a metered provider adds to `spentUsd`.
+
+The route answers:
+
+- `400` for a bad query, for example both parameters, neither, or a value that
+  is not a UUID.
+- `404` with `code: "rollup-not-found"` when the host holds no record of the
+  goal or mission and the ledger holds no run of it.
+- `503` with `code: "evidence-unavailable"` when the store is unavailable.
+
+A known goal or mission with no run answers `200` with zero runs, null
+`counts`, and empty cells. The remote relay refuses this route with `403` and
+`code: "remote-endpoint-denied"`.
+
+### Legacy import
+
+`infinite usage outcomes import-legacy --file FILE [--dry-run] [--json]`
+imports the operator's own ledger. Only the owner can run it. The operator
+converts the ledger to JSON lines outside this repository. The CLI reads the
+file, and the host never reads a path. Each line is one outcome, and each line
+is an unauthenticated claim.
+
+The fields of a line:
+
+| Field | Rule |
+|---|---|
+| `id` | Required. Letters, digits, `.`, `_`, `:`, and `-`. 1 to 80 characters, starting with a letter or digit. |
+| `projectId` | Required. Lowercase letters, digits, and `-`. 1 to 80 characters. The project need not exist on this host. |
+| `profile` | Required. `provider` and `effort` (optional): lowercase letters, digits, and `-`, starting with a letter, 1 to 40 characters. `model`: letters, digits, `.`, `_`, `:`, `/`, and `-`, 1 to 120 characters. |
+| `label` | Optional. At most 40 characters, with no control character. |
+| `result` | Required. `accepted`, `rejected`, or `excluded`. |
+| `attempts` | Required. An integer from 1 to 100. |
+| `totalTokens` | Optional. An integer from 0 to 10^12. |
+| `elapsedMs` | Optional. An integer from 0 to 31,536,000,000. |
+| `reviewerModel` | Optional. The same form as `model`. |
+| `recordedAt` | Required. An ISO time with an offset, not later than the import. |
+| `supersedes` | Optional. The same form as `id`, and not equal to `id`. |
+
+An unknown key fails the line. One line looks like this:
+
+```json
+{"id":"op-2026-10-01-example","projectId":"alpha","profile":{"provider":"opencode","model":"model-a","effort":"high"},"label":"ABC-12","result":"accepted","attempts":1,"totalTokens":120000,"reviewerModel":"model-b","recordedAt":"2026-10-01T09:00:00Z"}
+```
+
+The limits are:
+
+- 20,000 lines in a file.
+- 1,024 bytes in a line.
+- 50 lines in a batch.
+- 50,000 legacy lines on a host.
+
+The CLI checks the whole file before it sends anything. A file with a wrong
+line, a blank line, or a repeated id with another body is refused, and the
+CLI prints `Line N: <reason>` for each error and `Nothing was sent.`. It then
+exits non-zero. A valid file goes out in batches of 50, in file order, one batch
+at a time. The command then prints `Line N: changed` or `Line N: conflict` for
+each refused line and one summary line, such as
+`Imported 3, repeated 0, superseded 0, expired 0, refused 0, removed 0.` It
+exits non-zero when a line was refused. `removed` counts the stored rows that a
+superseding line replaced. `--json` prints each line's number and outcome.
+
+A line becomes a row with these values:
+
+- Source `legacy`. Its outcome id is `legacy:` followed by a blind index of the
+  line's `id`. The operator's `id`, `label`, `projectId`, `reviewerModel`, and
+  `supersedes` stay in the sealed payload.
+- Profile `(legacy)` at epoch 0, role `implementer`, and a run id of its own.
+  No legacy row shares a cell with a production row.
+- `accepted`: integrated yes, accepted yes, firstPass yes only when `attempts`
+  is 1, and held unknown.
+- `rejected`: integrated unknown, accepted no, firstPass no, and held no. The
+  operator's ledger does not say whether rejected work was integrated.
+- `excluded`: disposition `host-stop`, exclusion `host`, and all four levels
+  unknown.
+
+The host gives each line one of six outcomes:
+
+- `imported`: the line is stored as a new row.
+- `repeated`: the same id came with the same body, so nothing changes.
+- `superseded`: a line that the host holds replaces this id, so the line is not
+  stored.
+- `expired`: `recordedAt` is older than the retention window.
+- `changed`: the id is known with another body. The line is refused. To change
+  an outcome, the operator issues a new id with `supersedes`.
+- `conflict`: the outcome id belongs to a row that the import did not write.
+  The line is refused.
+
+A refused line does not stop the other lines of its batch. A replay changes
+nothing. What the host stores depends on the set of lines, not on their order
+or on where the file is cut into batches. A line that was itself superseded
+still replaces the line it names. So a chain of `supersedes` keeps only its
+last line, and a cycle keeps no line. This holds for one body per id: of two
+bodies under one id, the first that the host sees stays, and the other is
+`changed`.
+
+`--dry-run` writes nothing. It decides each batch against what the host holds,
+so it reports what a real import of that batch would. In a file of more than
+50 lines, a later batch does not see an earlier one: a line that repeats or
+supersedes a line of an earlier batch reads `imported`.
+
+Legacy rows appear only in `display` cells that name the `legacy` source, such
+as `GET /api/outcomes?sources=legacy`. They never enter the Models scorecard,
+a `decision` read, or a roll-up. The host never recomputes a legacy row. A
+legacy row is kept `teams.outcomes.retentionDays` after its `recordedAt`, and a
+line recorded longer ago than that is `expired` when it is imported.
+
+`POST /api/outcomes/legacy` is the route behind the command. It is owner only.
+The body holds `dryRun` and 1 to 50 `lines`. The route has no request id,
+because a replay is idempotent by line id. It answers `400` with
+`code: "legacy-invalid"` and no detail for a body that does not parse, so no
+key or value of the operator's file comes back in an error. It answers `403`
+for a caller that is not the owner, `409` with
+`code: "legacy-limit"` when the host would exceed 50,000 legacy lines, and
+`503` when the store is unavailable. The remote relay refuses this route with
+`403` and `code: "remote-endpoint-denied"`.
+
+### Other route rules
 
 Goal-owned team lifecycle and steering routes return `409` with
 `code: "goal-owned-team"`. Use the owning goal's endpoints. The decision route

@@ -89,7 +89,9 @@ test("an unavailable store answers 503", { timeout: 90000 }, async () => {
     assert.equal(response.status, 503);
     assert.equal(response.body.code, "evidence-unavailable");
     assert.equal((await host.fetchApi(`/teams/${state.runId}/context-usage`)).status, 503);
-    assert.equal((await host.fetchApi("/usage")).status, 200, "the rest of the host still serves");
+    // The usage ledger lives in the same store, so the usage routes answer 503 with it. A route outside the store serves.
+    assert.equal((await host.fetchApi("/usage")).status, 503);
+    assert.equal((await host.fetchApi("/teams")).status, 200, "the rest of the host still serves");
   } finally {
     await host.stop();
     rmSync(state.root, { recursive: true, force: true });

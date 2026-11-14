@@ -23,15 +23,22 @@ import { readEvents, unseal, writeSealed } from "./vault.js";
 import { workerCall } from "./ipc.js";
 import { assertRunnerDeployment } from "./deployment.js";
 import { DEFAULT_HOOKS } from "./config.js";
+import { HostLoadGate, LaunchHeldError, readHostLoad, type HostLoadProbe } from "./host-load.js";
 import { validateNativeCodexArgs } from "./native-codex.js";
 import { validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { ContentError } from "./session-content.js";
+import { fuseReason, workLaunch } from "./fuse/rules.js";
+import type { FuseGate } from "./fuse/types.js";
 import { isCollapsedPermissionPrompt, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { nativeContinuationSchema, teamModelProfileSchema, type NativeContinuation, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
 import { missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { withNativeContinuation } from "./native-continuation.js";
 import { agentBoundary, inventoryRuntimeProcesses, runtimeIdentity, stopRuntimeTree, type RuntimeProcess, type TeamRuntimeInspection, type TeamRuntimeRetirement } from "./team-retirement.js";
 import { TeamError } from "./team-workspace.js";
+import {
+  SESSION_PURPOSES,
+  type SessionPurpose,
+} from "./types.js";
 import type {
   Config,
   Provider,
@@ -176,7 +183,12 @@ const unavailable = (now = new Date().toISOString()): WorkerState => ({
 });
 export class Manager {
   private serial: Promise<unknown> = Promise.resolve();
+  /** Holds sessions the host starts for itself while the host is short of memory or overloaded. */
+  readonly hostLoad: HostLoadGate;
   private readonly handoffProjects = new Map<string, string>();
+  private fuse?: FuseGate;
+  /** The launch-rate fuse. Without one, every session starts as before and nothing is counted. */
+  useFuse(fuse: FuseGate) { this.fuse = fuse; }
   reserveHandoff(projectId: string) {
     const project = this.config.projects.find(project => project.id === projectId);
     if (!project) throw new ContentError("Handoff project is unavailable");
@@ -210,8 +222,10 @@ export class Manager {
   constructor(
     readonly config: Config,
     readonly key: Buffer,
+    hostProbe: HostLoadProbe = readHostLoad,
   ) {
     assertRunnerDeployment(config);
+    this.hostLoad = new HostLoadGate(config.hostLoad, hostProbe);
     mkdirSync(join(config.stateDir, "sessions"), {
       recursive: true,
       mode: 0o700,
@@ -387,9 +401,12 @@ export class Manager {
     return operation;
   }
   /** The team scheduler owns cwd selection, below the root its run was created under. Public create requests never accept this override. */
-  createTeamSession(request: CreateSession, team: TeamAssignment, cwd: string, modelProfile?: TeamModelProfile, workspaceRoot?: string, workspaceTrusted = false): Promise<Session & WorkerState> {
+  createTeamSession(request: CreateSession, team: TeamAssignment, cwd: string, modelProfile?: TeamModelProfile, workspaceRoot?: string, workspaceTrusted = false,
+    header: { purpose?: SessionPurpose; configId?: string } = {}): Promise<Session & WorkerState> {
     if (!this.config.teams || request.nativeArgs !== undefined || request.localUi || request.workspace || request.resumedFrom)
       throw new ContentError("Team sessions require a configured team workspace and managed launch", 400);
+    if (header.purpose !== undefined && !SESSION_PURPOSES.includes(header.purpose)) throw new ContentError("The session purpose is not recognized", 400);
+    if (header.configId !== undefined && !/^[0-9a-f]{64}$/.test(header.configId)) throw new ContentError("The session config ID must be a lowercase SHA-256 digest", 400);
     let continuation: NativeContinuation | undefined;
     if (request.continuation !== undefined) {
       const parsed = nativeContinuationSchema.safeParse(request.continuation);
@@ -406,7 +423,10 @@ export class Manager {
     const rel = relative(root, canonical);
     if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new ContentError("Invalid team working directory", 400);
     // Trust is outside the request fingerprint: a replay returns the session as first created.
-    const operation = this.serial.then(() => this.createOnce({ ...request, ...(continuation ? { continuation } : {}), team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}) }, workspaceTrusted));
+    const operation = this.serial.then(() => this.createOnce({
+      ...request, ...(continuation ? { continuation } : {}), team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}),
+      ...(header.purpose !== undefined ? { purpose: header.purpose } : {}), ...(header.configId !== undefined ? { configId: header.configId } : {}),
+    }, workspaceTrusted));
     this.serial = operation.catch(() => {});
     return operation;
   }
@@ -824,7 +844,19 @@ export class Manager {
     // Use the same admission queue as create, without re-entering it.
     return remember(await this.createOnce(request));
   }
-  private async createOnce(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile }, workspaceTrusted = false) {
+  /**
+   * Creates the session, or returns the one its request already made. A team launch that fails before its session
+   * record exists gives its fuse launch back: the count stays, and a retry with the same id is not counted twice.
+   */
+  private async createOnce(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false) {
+    try { return await this.createRecorded(request, workspaceTrusted); }
+    catch (error) {
+      // A started launch stays started, and a failing fuse never hides the launch error.
+      if (request.team) try { this.fuse?.release(request.requestId); } catch { /* the launch error is the one to report */ }
+      throw error;
+    }
+  }
+  private async createRecorded(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false) {
     if (!request.resumedFrom && request.nativeArgs) assertFreshNativeContext(request.provider, request.nativeArgs);
     if (request.workspace && (request.provider !== "codex" || !request.localUi))
       throw new Error("Laptop execution requires the Codex native interface");
@@ -857,12 +889,23 @@ export class Manager {
     if (!project) throw new Error("Unknown project");
     if (request.provider === "demo" && !this.config.enableDemo)
       throw new Error("Demo is disabled");
+    // Only sessions the host starts for itself wait for capacity; an owner-started session is never held.
+    if (request.team) {
+      const hold = this.hostLoad.held();
+      if (hold) throw new LaunchHeldError(hold);
+    }
     if (
       (await this.list()).filter(
         (s) => s.status === "running" || s.status === "starting",
       ).length >= this.config.maxSessions
     )
       throw new Error("The configured session limit has been reached");
+    // The backstop: a team session is charged before any session directory exists. A replay returned above, and a
+    // launch that its caller already admitted is recognised by its id and not charged again.
+    if (request.team && this.fuse) {
+      const admission = this.fuse.admit(workLaunch({ launchId: id, projectId: request.projectId, provider: request.provider, team: request.team, profile: request.teamModelProfile }));
+      if (!admission.ok) throw new TeamError(409, "fuse-open", fuseReason("open" in admission ? admission.open : "write-failed"));
+    }
     if (!request.team && [...this.handoffProjects.values()].some(path => handoffPathsOverlap(path, realpathSync(project.path)))) throw new ContentError("This project is capturing an accepted team handoff");
     const configuredProfile = this.config.agents[request.provider];
     if (!configuredProfile) throw new Error("Provider is not configured on this host");
@@ -875,6 +918,8 @@ export class Manager {
       id,
       ...(request.team ? { team: request.team } : {}),
       ...(request.teamModelProfile ? { teamModelProfile: request.teamModelProfile } : {}),
+      ...(request.purpose !== undefined ? { purpose: request.purpose } : {}),
+      ...(request.configId !== undefined ? { configId: request.configId } : {}),
       ...(request.team && workspaceTrusted ? { workspaceTrusted: true as const } : {}),
       backend: "infinite",
       machineId: this.config.machine?.id,
@@ -931,6 +976,8 @@ export class Manager {
       session,
       fingerprint,
     });
+    // The session record exists now, so the launch counts as started even if the worker fails to spawn.
+    if (request.team) try { this.fuse?.started(id); } catch { /* fuse bookkeeping never fails a session */ }
     const worker = fileURLToPath(
       new URL(
         import.meta.url.endsWith(".ts") ? "./worker.ts" : "./worker.js",

@@ -43,6 +43,41 @@ test("a tick reads the listing it is given, and skips an exited session whose jo
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("a session or member lookup opens only its own rows, however large the ledger", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-usage-"));
+  try {
+    const key = randomBytes(32), store = storeFor(dir, key), runId = randomUUID();
+    const ids = Array.from({ length: 40 }, (_, index) => `session-${String(index).padStart(2, "0")}`);
+    const manager = {
+      list: () => { throw new Error("The tick must use the listing it was given"); },
+      events: (id: string, after: number) => after > 0 ? { events: [], cursor: after, more: false }
+        : { events: [{ seq: 1, at: new Date().toISOString(), type: "usage", data: { ...step("p1"), messageId: id } }], cursor: 1, more: false },
+    } as unknown as Manager;
+    const usage = new UsageService({ stateDir: dir } as Config, key, manager, store);
+    const rows = ids.map((id, index) => ({ id, provider: "opencode", projectId: `project-${index % 4}`, createdAt: new Date().toISOString(), status: "exited",
+      team: { runId, memberId: `member-${index}`, revision: 1, role: "implementer" }, teamModelProfile: { id: "light", provider: "opencode" } }) as unknown as UsageSessionRow);
+    // A tick reads a bounded number of pages, so a ledger of this size takes more than one.
+    for (let pass = 0; pass < 4; pass++) await usage.tick(rows);
+    assert.ok(ids.every(id => usage.session(id).measured), "Every session is in the ledger");
+    // Every sealed value a read opens is counted. A lookup that reads the whole ledger opens at least one value a session.
+    let opened = 0;
+    const read = store.read.bind(store);
+    store.read = (fn => read(db => fn({ ...db, open: ((...args: Parameters<typeof db.open>) => { opened++; return db.open(...args); }) as typeof db.open }))) as typeof store.read;
+    const one = usage.session("session-07") as { measured: boolean; messages: number };
+    assert.deepEqual([one.measured, one.messages], [true, 1]);
+    assert.ok(opened <= 4, `One session's lookup opened ${opened} sealed values`);
+    opened = 0;
+    const member = usage.member(runId, "member-12") as { measured: boolean; messages: number };
+    assert.deepEqual([member.measured, member.messages], [true, 1]);
+    assert.ok(opened <= 4, `One member's lookup opened ${opened} sealed values`);
+    opened = 0;
+    assert.equal(usage.sessions(["session-01", "session-02", "no-such-session"]).messages, 2);
+    assert.ok(opened <= 6, `A lookup of two sessions opened ${opened} sealed values`);
+    assert.deepEqual(usage.session("no-such-session"), { measured: false, coverage: "none" });
+    assert.deepEqual(usage.member(runId, "no-such-member"), { measured: false, coverage: "none" });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("an unreadable or misshapen ledger is discarded with a warning and the service starts empty", () => {
   const key = randomBytes(32);
   const warn = console.warn, warnings: string[] = [];

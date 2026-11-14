@@ -312,10 +312,13 @@ export class UsageService {
     if (!this.available()) throw new EvidenceError("unavailable", "The usage ledger is unavailable.");
     let data: { sessions: StoredSession[]; records: { sessionId: string; record: UsageRecord }[]; briefings: Snapshot["briefings"]; taskKey?: string };
     try {
+      // A read of named sessions takes only their rows and no briefing: team and session lists ask once for each
+      // member or session, so a read of the whole ledger there would cost the square of its size.
+      const named = options.sessionIds ? { sessionIds: options.sessionIds } : undefined;
       data = this.store.read(db => ({
-        sessions: readSessions(db),
-        records: readRecords(db, options.sessionIds ? { sessionIds: options.sessionIds } : {}),
-        briefings: readBriefings(db),
+        sessions: readSessions(db, named),
+        records: readRecords(db, named),
+        briefings: named ? [] : readBriefings(db),
         taskKey: options.taskId === undefined ? undefined : db.index("task", options.taskId),
       }));
     } catch {
@@ -458,7 +461,7 @@ export class UsageService {
     let data: { sessions: StoredSession[]; records: { sessionId: string; record: UsageRecord }[] };
     try {
       data = this.store.read(db => {
-        const sessions = readSessions(db).filter(session => session.runId === runId && session.memberId === memberId);
+        const sessions = readSessions(db, { member: { runId, memberId } });
         return { sessions, records: readRecords(db, { sessionIds: sessions.map(session => session.sessionId) }) };
       });
     } catch {

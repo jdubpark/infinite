@@ -298,9 +298,25 @@ function modelNames(db: EvidenceDb, ref: number, cache: Map<number, { providerId
 }
 
 /** The sessions the ledger holds. Project ids are opened here, and nothing else is decrypted. */
-export function readSessions(db: EvidenceDb): StoredSession[] {
+/**
+ * Reads session rows: all of them, or only the named sessions, or only the sessions one member ran. A lookup of one
+ * session or one member gives its filter, so its cost does not grow with the ledger.
+ */
+export function readSessions(db: EvidenceDb, filter: { sessionIds?: string[]; member?: { runId: string; memberId: string } } = {}): StoredSession[] {
+  const where: string[] = [];
+  const params: SQLInputValue[] = [];
+  if (filter.sessionIds) {
+    if (filter.sessionIds.length === 0) return [];
+    where.push(`s.session_id IN (${filter.sessionIds.map(() => "?").join(", ")})`);
+    params.push(...filter.sessionIds);
+  }
+  if (filter.member) {
+    where.push("s.run_id = ? AND s.member_id = ?");
+    params.push(filter.member.runId, filter.member.memberId);
+  }
   const rows = db.all<Record<string, unknown> & { encrypted_project: string }>(
-    "SELECT s.*, p.encrypted_project FROM usage_sessions s JOIN usage_projects p ON p.project_ref = s.project_ref ORDER BY s.session_id",
+    `SELECT s.*, p.encrypted_project FROM usage_sessions s JOIN usage_projects p ON p.project_ref = s.project_ref${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY s.session_id`,
+    ...params,
   );
   return rows.map((row) => {
     const projectId = db.open<string>("usage_projects", row.project_ref as string, row.encrypted_project);

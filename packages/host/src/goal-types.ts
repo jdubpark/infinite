@@ -5,7 +5,10 @@ import type { UsageRollup } from "./team-usage.js";
 import type { LinearTrackingView } from "./linear-types.js";
 import type { AutonomyMode } from "./autonomy.js";
 
-const scopedPath = z.string().trim().min(1).max(300).refine(value => value === "." || (!value.startsWith("/") && !value.includes("\\") && !/[\0*?\[\]:]/.test(value) && !value.split("/").some(part => ["", ".", "..", ".git"].includes(part))), "Use a repository-relative file or folder, or . for the whole project");
+export function isScopedPath(value: string): boolean {
+  return value === "." || (!value.startsWith("/") && !value.includes("\\") && !/[\0*?\[\]:]/.test(value) && !value.split("/").some(part => ["", ".", "..", ".git"].includes(part)));
+}
+const scopedPath = z.string().trim().min(1).max(300).refine(isScopedPath, "Use a repository-relative file or folder, or . for the whole project");
 export const createGoalSchema = z.object({
   requestId: z.uuid(),
   projectId: z.string().regex(/^[a-z0-9-]{1,80}$/),

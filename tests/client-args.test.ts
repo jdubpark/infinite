@@ -119,3 +119,16 @@ test("cell lines show unknown beside every rate", () => {
   assert.equal(parsed.options["--sources"], "production,duel");
   assert.equal(parsed.options["--days"], "7");
 });
+
+test("signal options parse", () => {
+  const linked = parseClientArgs(["usage", "outcomes", "link-fix", "--run", "R", "--member", "M", "--issue", "INF-7", "--commit", "c".repeat(40), "--at", "2026-11-13T10:00:00Z", "--request-id", "Q"]);
+  assert.deepEqual(linked.args, ["outcomes", "link-fix"]);
+  assert.equal(linked.options["--member"], "M");
+  assert.equal(linked.options["--issue"], "INF-7");
+  assert.equal(linked.options["--commit"], "c".repeat(40));
+  assert.equal(linked.options["--at"], "2026-11-13T10:00:00Z");
+  assert.equal(linked.options["--request-id"], "Q");
+  const excluded = parseClientArgs(["usage", "outcomes", "exclude", "--run", "R", "--member", "M", "--reason", "trial", "--withdraw", "S"]);
+  assert.equal(excluded.options["--reason"], "trial");
+  assert.equal(excluded.options["--withdraw"], "S");
+});

@@ -488,7 +488,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
 
 const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "evidence", "resources", "close", "sync", "pull", "team", "repo", "routine"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
-const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role", "--profile", "--run", "--by", "--sources", "--days"]);
+const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role", "--profile", "--run", "--by", "--sources", "--days", "--member", "--issue", "--commit", "--at", "--reason", "--withdraw"]);
 const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs"]);
 
 /**
@@ -814,6 +814,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
         type OutcomeView = {
           rows: { memberId: string; role: string; profileId: string; disposition: string; integrated: Level; accepted: Level; firstPass: Level; held: Level }[];
           members: { memberId: string; role: string; profileId: string; disposition: string }[];
+          signals?: { signalId: string; outcomeId: string | null; kind: string; author: string; state: string; at: string }[];
         };
         const level = (value: Level) => value === 1 ? "yes" : value === 0 ? "no" : "unknown";
         let view: OutcomeView;
@@ -831,6 +832,10 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
             console.log(`${clean(row.memberId)} ${clean(row.role)} ${clean(row.profileId)} ${clean(row.disposition)} integrated=${level(row.integrated)} accepted=${level(row.accepted)} firstPass=${level(row.firstPass)} held=${level(row.held)}`);
           for (const member of view.members)
             console.log(`${clean(member.memberId)} ${clean(member.role)} ${clean(member.profileId)} ${clean(member.disposition)}`);
+          for (const signal of view.signals ?? []) {
+            const member = signal.outcomeId?.slice(runId.length + 1);
+            console.log(`signal ${clean(signal.signalId.slice(0, 12))} ${clean(signal.kind)} ${clean(signal.author)} ${clean(signal.state)} ${clean(signal.at)}${member ? ` ${clean(member)}` : ""}`);
+          }
         }
         return true;
       }
@@ -852,9 +857,45 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
         else for (const line of outcomeCellLines(view)) console.log(line);
         return true;
       }
+      if (positional.length === 2 && (positional[1] === "link-fix" || positional[1] === "exclude")) {
+        const signalUsage = "Usage: infinite usage outcomes link-fix --run ID [--member ID] (--issue KEY | --commit SHA) [--at TIME] [--request-id ID] [--json] | infinite usage outcomes exclude --run ID --member ID --reason REASON [--request-id ID] [--json] | either form with --withdraw SIGNAL";
+        const optionValue = (name: string) => { const value = options[name]; return typeof value === "string" && value ? value : undefined; };
+        const signalKind = positional[1] === "link-fix" ? "linked-fix" : "exclusion";
+        const requestId = optionValue("--request-id") ?? randomUUID();
+        const withdraw = optionValue("--withdraw");
+        const signalRun = optionValue("--run");
+        const signalMember = optionValue("--member");
+        let body: Record<string, unknown>;
+        if (withdraw !== undefined) body = { action: "withdraw", kind: signalKind, requestId, signalId: withdraw };
+        else if (positional[1] === "link-fix") {
+          const issue = optionValue("--issue"), commit = optionValue("--commit"), at = optionValue("--at");
+          if (signalRun === undefined || (issue === undefined && commit === undefined)) throw new Error(signalUsage);
+          body = { action: "record", kind: signalKind, requestId, runId: signalRun, ...(signalMember === undefined ? {} : { memberId: signalMember }),
+            ...(issue === undefined ? {} : { issue }), ...(commit === undefined ? {} : { commit }), ...(at === undefined ? {} : { at }) };
+        } else {
+          const reason = optionValue("--reason");
+          if (signalRun === undefined || signalMember === undefined || reason === undefined) throw new Error(signalUsage);
+          body = { action: "record", kind: signalKind, requestId, runId: signalRun, memberId: signalMember, reason };
+        }
+        type Signal = { signalId: string; kind: string; author: string; state: string; at: string };
+        let signalResult: { signal: Signal; repeated: boolean };
+        try {
+          signalResult = await api.json<{ signal: Signal; repeated: boolean }>("/outcomes/signals", body, undefined, undefined, "POST");
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 403) throw new Error("Recording a signal requires an owner device key.");
+          if (error instanceof HttpError && error.status === 404) throw new Error("The run, the member, or the signal was not found.");
+          if (error instanceof HttpError && error.status === 409) throw new Error("The request conflicts with a recorded signal.");
+          if (error instanceof HttpError && error.status === 503) throw new Error("The evidence store is unavailable.");
+          if (error instanceof HttpError && error.status === 400) throw new Error(signalUsage);
+          throw error;
+        }
+        if (options["--json"]) console.log(JSON.stringify(signalResult, null, 2));
+        else console.log(`Signal ${clean(signalResult.signal.signalId)} ${clean(signalResult.signal.state)}${signalResult.repeated ? " (repeated)" : ""}`);
+        return true;
+      }
       const profileId = options["--profile"];
       if (positional.length !== 2 || positional[1] !== "new-epoch" || typeof profileId !== "string" || !profileId)
-        throw new Error("Usage: infinite usage outcomes --run ID [--json] | infinite usage outcomes new-epoch --profile ID [--json] | infinite usage outcomes [--project ID] [--role ROLE] [--by LIST] [--sources LIST] [--days N] [--json]");
+        throw new Error("Usage: infinite usage outcomes --run ID [--json] | infinite usage outcomes new-epoch --profile ID [--json] | infinite usage outcomes link-fix|exclude ... (see --withdraw) | infinite usage outcomes [--project ID] [--role ROLE] [--by LIST] [--sources LIST] [--days N] [--json]");
       type Epoch = { profileId: string; provider: string; model: string | null; effort: string | null; epoch: number; since: string; repeated: boolean };
       let result: Epoch;
       try {

@@ -97,6 +97,36 @@ sudo install -d -o "infinite-$NAME-host" -g "infinite-$NAME-workspace" -m 2750 \
 sudo setfacl -d -m g::rwx,m::rwx "/srv/infinite-data/instances/$NAME/workspaces"
 sudo install -d -o root -g "infinite-$NAME-agent" -m 0750 \
   "/srv/infinite-data/instances/$NAME/github-app-tokens"
+sudo install -d -o "infinite-$NAME-host" -g "infinite-$NAME-workspace" -m 2770 \
+  "/srv/infinite-data/instances/$NAME/source-mirrors"
+sudo setfacl -d -m g::rwx,m::rwx "/srv/infinite-data/instances/$NAME/source-mirrors"
+```
+
+`source-mirrors` sits beside the team workspace root; the host keeps one bare
+mirror there for each GitHub-tracked project.
+
+After a write, the host's blob store syncs every directory from its store up
+to the filesystem root, and it opens each one for reading. Mode `0711` lets the
+host account pass through `/srv/infinite-data/instances` but not open it, so
+every source upload fails and the client reports only `sync-failed`. Grant
+read access on that one directory to this instance's host account, and to no
+other account:
+
+```sh
+sudo setfacl -m "u:infinite-$NAME-host:r-x" /srv/infinite-data/instances
+```
+
+Confirm that the agent account and the other instance's accounts still cannot
+list the directory.
+
+Project directories are owned by the host account, so the agent account must
+trust repositories beneath this instance's workspace directory. Without the
+rule, Git refuses them with "dubious ownership". Run the command from a
+directory the agent account can read, and keep the wildcard quoted:
+
+```sh
+(cd / && sudo -H -u "infinite-$NAME-agent" git config --global --add safe.directory \
+  "/srv/infinite-data/instances/$NAME/workspaces/*")
 ```
 
 The generated paths include the team workspace, control state, agent home,
@@ -194,7 +224,7 @@ sudo install -o root -g root -m 0644 ".local/instance-$NAME/infinite-$NAME-githu
   "/etc/systemd/system/infinite-$NAME-github-refresh.timer"
 sudo install -o root -g root -m 0644 ".local/instance-$NAME/infinite-$NAME-tmpfiles.conf" \
   "/etc/tmpfiles.d/infinite-$NAME.conf"
-sudo install -d -o root -g root -m 0755 "/etc/infinite-$NAME"
+sudo install -d -o root -g "infinite-$NAME-host" -m 0750 "/etc/infinite-$NAME"
 sudo install -o "infinite-$NAME-host" -g "infinite-$NAME-host" -m 0600 \
   ".local/instance-$NAME/config.example.json" "/etc/infinite-$NAME/config.json"
 sudo install -d -o root -g root -m 0755 "/usr/local/libexec/infinite-$NAME/bin"
@@ -217,13 +247,35 @@ before adding secrets or live project paths. Check the port, origin, key path,
 state directory, team workspace, and command prefix. Start the refresh service
 once after configuring it; enable its timer only after it succeeds.
 
+Add a `sync` block before enrolling a repository. Without `homeDir` the host
+maps an enrolled checkout below its own account's home directory, outside the
+shared workspace root, and without `sharedGroup` the agent account cannot
+write there:
+
+```json
+"sync": { "sharedGroup": true, "homeDir": "/srv/infinite-data/instances/NAME/workspaces" }
+```
+
+Only root and the instance's host account can enter `/etc/infinite-NAME`, the
+same shape as the first instance's config directory.
+
+The skeleton's `teams.commandPrefix` names the team command launcher directly.
+A launcher that runs only as the agent account needs the same entry the
+provider wrappers use: set the prefix to `/usr/bin/sudo` with the arguments
+`-n -H -u infinite-NAME-agent -- /usr/local/libexec/infinite-NAME/team-command`.
+The rendered sudoers does not permit that path; the launcher's own sudoers
+entry is installed with the launcher, as described under the private host
+tools.
+
 ## Port, origin, and relay registration
 
 Use a distinct loopback port for the second API. The default is `4781`; the
 first instance continues to use its configured port. Check
 `tailscale serve status` and choose an unused HTTPS listener port for the
-second instance. Publish only through Tailscale Serve, with the HTTPS hostname
-and port equal to `origin`:
+second instance. Tailscale Serve accepts HTTPS listeners only on ports 443,
+8443, and 10000, so a host that already uses two of them has one left.
+Publish only through Tailscale Serve, with the HTTPS hostname and port equal
+to `origin`:
 
 ```sh
 sudo tailscale serve --bg --https=HTTPS_PORT http://127.0.0.1:4781
@@ -264,11 +316,17 @@ sudo node "/opt/infinite-$NAME/packages/host/dist/cli.js" connect-relay http://1
   --config "/etc/infinite-$NAME/config.json"
 sudo chown "infinite-$NAME-host:infinite-$NAME-host" "/etc/infinite-$NAME/config.json"
 sudo chmod 0600 "/etc/infinite-$NAME/config.json"
+sudo systemctl restart infinite-relay.service
 sudo systemctl restart "infinite-$NAME.service"
 ```
 
 `relay-add` writes a new registration key and the relay machine entry. Keep the
 key in the instance control account's private config area, mode `0600`.
+The relay reads its registrations when it starts, so restart it after
+`relay-add`; keep a private copy of `relay.json` first so a relay that does
+not come back can be restored. Machines already connected, the first instance
+included, reconnect on their own. Confirm afterward that both instances hold a
+relay connection.
 Add the new machine in the phone, Mac, and web clients. The laptop CLI can
 select it with `INFINITE_CLIENT_CONFIG` or `--client-config`; no CLI change is
 needed.
@@ -367,6 +425,44 @@ the knowledge service, remote memory, cmux, demo, and contributor models
 disabled until each has a separate reviewed configuration and an owner
 decision.
 
+Give the instance its own provider logins. Do not copy a login whose tokens
+rotate from another instance's agent account: the first refresh on either
+side can sign the other one out.
+
+A headless reply does not prove that an interactive session starts. A new
+agent account stops at Claude Code's first-run screens, and then at the
+folder-trust prompt for each project, before the host can drive the session.
+Complete the first run once as `infinite-$NAME-agent`, start one interactive
+session from each project, and have the owner answer the folder-trust prompt.
+The host never answers it.
+
+If `teams.lineup` was copied from another instance, check every profile and
+fallback it names against the providers authenticated on this instance. Remove
+the entries this instance cannot run, and have the installed release's config
+reader accept the candidate file before it replaces the live config.
+
+## Repository toolchains and checks
+
+A team command launcher that resolves commands from fixed system directories
+does not find a tool installed in an account's home directory. Install each
+toolchain an enrolled repository's setup and check commands need in one of the
+launcher's directories before the first run.
+
+Before relying on a project's checks, run its setup command and each check
+once as `infinite-$NAME-agent`, in a throwaway clone below the instance's
+`tmp/agent` directory, with the launcher's `PATH`. Two failures come from the
+host and not from the repository:
+
+- The repository's own CI runs a check with extra packages or system tools.
+  Give the project the command the CI runs, not the bare tool.
+- A test requires every directory above the checkout to be writable by its
+  owner only. The host creates team workspaces with mode `2770` so the host
+  and agent accounts share them, and such a test cannot pass there. Exclude it
+  from the project's checks and leave it to the repository's CI.
+
+A source upload that fails keeps its lease on the project for five minutes. A
+retry within that time returns `sync-in-progress`; wait for the lease to end.
+
 ## Private host tools to extend
 
 These tools belong to the private deployment and are not shipped here. Extend
@@ -376,12 +472,25 @@ them to support the second instance before activation:
   starts.
 - The team command launcher runs Git, setup, and check commands as the
   instance agent account. Obtain owner approval before installing or enabling
-  it.
+  it. Give it this instance's `workspaces/`, `team-workspaces/`, and
+  `source-mirrors/` roots only, and one sudoers entry that lets
+  `infinite-NAME-host` run exactly that launcher as `infinite-NAME-agent`.
+  Before the service starts, check it through the host account: the
+  enrollment reads from a project are allowed, and a commit from a project, a
+  directory outside the instance, a direct run as the host account, a shell as
+  the agent account, and either instance's host account entering the other's
+  launcher are all refused.
 - Release pruning retains a valid rollback release for both instances and
   never removes the active release of either one.
 - Secrets sync stores the instance's Linear, Slack, GitHub App, and relay
   credentials in a vault of its own and keeps them outside state, run,
-  workspace, and project paths.
+  workspace, and project paths. Give it a service credential of its own that
+  can read and write that vault and no other; a secret store may fix those
+  permissions when the credential is created and default to read only. Keep
+  the credential on the encrypted state volume. Before enabling the sync
+  timer, confirm that the credential lists exactly that vault and that a test
+  write succeeds: a read-only credential otherwise fails on every run, and
+  refused writes can still count against the store's write limit.
 - The activation guard checks the instance-specific config, key, mount,
   launcher, and account boundaries before the service can start.
 

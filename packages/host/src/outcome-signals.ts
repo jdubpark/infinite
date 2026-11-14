@@ -261,7 +261,8 @@ function sha256(text: string): string {
 
 /** What a base branch scan needs from the store before it reads Git. Summaries and landings are read in one pass. */
 export type ScanInputs = {
-  state?: { seq: number; head: string; repository: string; baseBranch: string; lastAt: string };
+  /** `lastAt` is the newest scan's time, and `checkedAt` the time of the last fetch the ledger recorded at its head. */
+  state?: { seq: number; head: string; repository: string; baseBranch: string; lastAt: string; checkedAt: string };
   candidates: LandingCandidate[];
   open: LandedRun[];
 };
@@ -280,6 +281,7 @@ export function scanInputs(db: EvidenceDb, projectId: string, at: string): ScanI
     repository: stored.payload.repository,
     baseBranch: stored.payload.baseBranch,
     lastAt: last.at,
+    checkedAt: last.checkedAt,
   };
   const candidates = landingCandidates(db, ref, daysBefore(at, APPROVAL_DAYS))
     .map(({ runId, payload }) => candidateOf(runId, payload));

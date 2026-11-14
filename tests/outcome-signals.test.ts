@@ -724,7 +724,7 @@ test("scan inputs list candidates and open landings", () => {
 
     const at1 = day(1);
     const inputs: ScanInputs = h.store.read(db => scanInputs(db, PROJECT, at1));
-    assert.deepEqual(inputs.state, { seq: 2, head: SCAN_HEAD, repository: REPO, baseBranch: "main", lastAt: day(0) });
+    assert.deepEqual(inputs.state, { seq: 2, head: SCAN_HEAD, repository: REPO, baseBranch: "main", lastAt: day(0), checkedAt: day(0) });
     assert.deepEqual(inputs.candidates, [
       { runId: "cand-a", reviewedHead: candHead, reviewedTree: TREE, mergeCommit: candMerge, base: candBase },
       { runId: "cand-odd", reviewedHead: candHead, reviewedTree: TREE },

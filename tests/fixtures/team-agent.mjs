@@ -27,14 +27,18 @@ if (process.argv[2] === "--mirror-restricted-prefix") {
       if (dirname(directory) === directory) return false;
     }
   };
-  // The five base-scan forms, after the `-c` pairs only. Every id is a 40 or 64 digit lower-case hex commit id.
+  // The five base-scan forms, after exactly the six settings the host puts before a Git command. Every id is a 40 or
+  // 64 digit lower-case hex commit id.
+  const scanSettings = [/^safe\.directory=\/.+$/, /^core\.hooksPath=\/dev\/null$/, /^core\.fsmonitor=false$/, /^commit\.gpgsign=false$/,
+    /^user\.name=Infinite$/, /^user\.email=agent@example\.invalid$/];
   const isBaseScan = () => {
     const commitIds = (values, min, max) => values.length >= min && values.length <= max
       && values.every(value => /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value));
     const revertGrep = "--grep=This reverts commit ";
-    let index = 0;
-    while (args[index] === "-c") index += 2;
-    const [subcommand, ...tail] = args.slice(index);
+    for (let pair = 0; pair < scanSettings.length; pair += 1) {
+      if (args[pair * 2] !== "-c" || !scanSettings[pair].test(args[pair * 2 + 1] ?? "")) return false;
+    }
+    const [subcommand, ...tail] = args.slice(scanSettings.length * 2);
     if (subcommand === "merge-base") return tail.length === 3 && tail[0] === "--is-ancestor" && commitIds(tail.slice(1), 2, 2);
     if (subcommand === "rev-list") {
       if (tail[0] !== "--first-parent") return false;

@@ -1491,7 +1491,9 @@ a 40 or 64 character lower-case hex id before use.
 | 5 | `log --no-walk=unsorted --no-show-signature --format=%H --fixed-strings --grep=This reverts commit ID... ID...` (1 to 50 patterns, then 1 to 50 ids) | At most 50 ids |
 
 One scan runs at most 600 Git commands. A scan that needs more fails, writes
-nothing, and is tried again after the next fetch.
+nothing, and is tried again after the next fetch. Each form follows the six
+settings that the host puts before every Git command, and nothing else; the
+launcher should admit a form only in that shape.
 
 The production launcher must admit all five forms. Until it does, every scan
 fails: no landing is recorded, and held stays unknown.
@@ -1835,8 +1837,9 @@ Held stays unknown when a gap falls inside the window:
 - a rewritten base branch (`rewrite`), or a project that now follows another
   repository or branch (`source`);
 - a fetch that no scan recorded, when the scanner cannot show that every head
-  the mirror held since the last recorded scan is still in the history (also
-  `rewrite`);
+  the mirror held since the last recorded scan is still a first-parent commit of
+  the base branch (also `rewrite`). A host restart after such a fetch moved the
+  head is one case;
 - a refresh that lapses by more than six hours across the close of the window.
 
 The row carries the `scan-gap` flag when a gap leaves held unknown on an accepted
@@ -1899,6 +1902,12 @@ infinite usage outcomes exclude --run ID --member ID --reason REASON [--request-
 Either command takes `--withdraw SIGNAL` to withdraw that signal; a withdrawal
 needs no other option. For a record, pass `--request-id` to make a retry safe.
 Otherwise each run of the command is a new request.
+
+A landing is a receipt of what the mirror showed at a fetch. The agent identity
+can write the mirror, so a receipt is not proof against a member that alters the
+mirror itself. A `merge-commit` landing also rests on the merge commit that the
+delivery member reported: the scan checks only that it is a first-parent commit
+of the base branch. Each landing stores which rule matched.
 
 Runs that predate the ledger never land, so their held stays unknown. A landing
 commit that the scan read before its run's approval reached the ledger is never

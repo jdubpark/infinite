@@ -185,6 +185,10 @@ test("parsers are strict", () => {
   assert.equal(parseIds(`${hex40("a")}\n${hex40("b")}\n${hex40("c")}\n`, 2), undefined);
   assert.deepEqual(parseIds("", 2), []);
   assert.deepEqual(parseIds(`${hex40("a")}\n`, 2), [hex40("a")]);
+  // Git ends every line with a newline, and one repository has ids of one length.
+  assert.equal(parseIds(hex40("a"), 2), undefined);
+  assert.equal(parseIds(`${hex40("a")}\n${hex64("b")}\n`, 2), undefined);
+  assert.equal(parseIds(`${hex40("a")}\n\n`, 2), undefined);
 
   // parseCommits
   const A = hex40("a");
@@ -199,6 +203,11 @@ test("parsers are strict", () => {
   const D = hex64("d");
   const E = hex64("e");
   assert.deepEqual(parseCommits(`${C} ${D} ${E}\n`, [C]), [{ id: C, tree: D, parents: [E] }]);
+  // Only a root line ends with a space. A missing final newline, or a tree of another length, is not Git's output.
+  assert.equal(parseCommits(`${A} ${T} ${B} \n`, [A]), undefined);
+  assert.equal(parseCommits(`${A} ${T}`, [A]), undefined);
+  assert.equal(parseCommits(`${A} ${D}\n`, [A]), undefined);
+  assert.deepEqual(parseCommits(`${A} ${T} ${B}\n${B} ${T} \n`, [A, B]), [{ id: A, tree: T, parents: [B] }, { id: B, tree: T, parents: [] }]);
 });
 
 test("revert pattern is the literal message text", () => {

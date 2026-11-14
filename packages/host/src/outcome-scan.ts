@@ -41,17 +41,18 @@ export type ScanResult = {
  */
 export const SCAN_COMMAND_LIMIT = 600;
 
-/** The most fetches a project keeps that no recorded scan read. Past it the oldest is dropped and the history is lost. */
+/**
+ * The most fetches a project keeps that no recorded scan read. Past it the oldest is dropped. The first fetch that is
+ * left then says since when its previous head stood, so a dropped fetch that moved the head still breaks the chain.
+ */
 export const UNREAD_LIMIT = 8;
 
 export type ScanOnceInput = {
   store: EvidenceStore; git: ScanGit; mirror: string; fetch: MirrorFetch; holdDays: number;
   /** Defaults to `SCAN_COMMAND_LIMIT`. */
   commandLimit?: number;
-  /** Fetches since the last recorded scan that no recorded scan read, oldest first. */
+  /** Fetches since the last recorded scan that no recorded scan read, oldest first, with none missing between them. */
   earlier?: readonly MirrorFetch[];
-  /** True when earlier fetches were dropped past the limit, so the history between is unknown. */
-  lost?: boolean;
 };
 
 const SKIPPED: ScanResult = { state: "skipped", commits: 0, gap: null, landings: 0, reverts: 0 };
@@ -91,12 +92,19 @@ async function isAncestor(git: ScanGit, cwd: string, older: string, newer: strin
 }
 
 /**
- * Whether the unread fetches and the new one continue the stored head. Each `previousHead` must equal the head before
- * it, and a missing `previousHead` never matches. A dropped fetch, or one from another repository or branch, breaks it.
+ * Whether the unread fetches and the new one continue the ledger's record. The first of them must name the stored
+ * head as the head before it, and that head must have stood since a fetch no later than the last one the ledger
+ * recorded: a later start means that a fetch the ledger never read moved the head, in this process or before a
+ * restart. Each later fetch must name the head of the one before it. A missing value never matches, and a fetch of
+ * another repository or branch breaks the chain.
  */
-function continues(chain: readonly MirrorFetch[], stored: string, lost: boolean, fetch: MirrorFetch): boolean {
-  if (lost) return false;
-  let previous = stored;
+function continues(chain: readonly MirrorFetch[], state: { head: string; checkedAt: string }, fetch: MirrorFetch): boolean {
+  const first = chain[0];
+  if (first === undefined || first.previousSince === undefined) return false;
+  const since = Date.parse(first.previousSince);
+  const recorded = Date.parse(state.checkedAt);
+  if (Number.isNaN(since) || Number.isNaN(recorded) || since > recorded) return false;
+  let previous = state.head;
   for (const entry of chain) {
     if (entry.repository !== fetch.repository || entry.baseBranch !== fetch.baseBranch) return false;
     if (entry.previousHead === undefined || entry.previousHead !== previous) return false;
@@ -108,13 +116,6 @@ function continues(chain: readonly MirrorFetch[], stored: string, lost: boolean,
 /** The unread heads that differ from both the stored head and the new one, distinct, in fetch order. */
 function unreadHeads(earlier: readonly MirrorFetch[], stored: string, newer: string): string[] {
   return [...new Set(earlier.map(entry => entry.head))].filter(id => id !== stored && id !== newer);
-}
-
-async function allAncestors(git: ScanGit, cwd: string, olders: readonly string[], newer: string): Promise<boolean> {
-  for (const older of olders) {
-    if (!(await isAncestor(git, cwd, older, newer))) return false;
-  }
-  return true;
 }
 
 function chunks<T>(items: readonly T[], size: number): T[][] {
@@ -182,39 +183,44 @@ export async function scanOnce(input: ScanOnceInput): Promise<ScanResult> {
     const earlier = input.earlier ?? [];
     const sameSource = state !== undefined && state.repository === fetch.repository && state.baseBranch === fetch.baseBranch;
     // The unread fetches and this one must continue the stored head, or the history between them is unproven.
-    const continuous = state !== undefined && sameSource && continues([...earlier, fetch], state.head, input.lost === true, fetch);
+    const continuous = state !== undefined && sameSource && continues([...earlier, fetch], state, fetch);
     if (state !== undefined && sameSource && continuous && fetch.head === state.head && earlier.every(entry => entry.head === state.head)) {
       const checked = store.write(tx => applyCheck(tx, { projectId: fetch.projectId, head: fetch.head, at: fetch.fetchedAt, expectedSeq: state.seq }));
       return { ...SKIPPED, state: checked.applied ? "checked" : "skipped" };
     }
 
     // Newest first from Git. The scan keeps the gap and the `from` that its range proves.
+    const newest = async (): Promise<string[]> =>
+      listed(await output(git, mirror, ["rev-list", "--first-parent", `--max-count=${SCAN_BOUND}`, commitId(fetch.head)]), SCAN_BOUND);
     let listedIds: string[];
     let gap: ScanGap | null = null;
     let from: string | undefined;
-    const extendsStored = state !== undefined && continuous && fetch.head !== state.head
-      && await isAncestor(git, mirror, state.head, fetch.head)
-      && await allAncestors(git, mirror, unreadHeads(earlier, state.head, fetch.head), fetch.head);
     if (state === undefined) {
       gap = "first";
-      listedIds = listed(await output(git, mirror, ["rev-list", "--first-parent", `--max-count=${SCAN_BOUND}`, commitId(fetch.head)]), SCAN_BOUND);
+      listedIds = await newest();
     } else if (!sameSource) {
       gap = "source";
-      listedIds = listed(await output(git, mirror, ["rev-list", "--first-parent", `--max-count=${SCAN_BOUND}`, commitId(fetch.head)]), SCAN_BOUND);
-    } else if (extendsStored) {
-      listedIds = listed(
+      listedIds = await newest();
+    } else if (continuous && fetch.head !== state.head && await isAncestor(git, mirror, state.head, fetch.head)) {
+      const range = listed(
         await output(git, mirror, ["rev-list", "--first-parent", `--max-count=${SCAN_BOUND + 1}`, commitId(fetch.head), `^${commitId(state.head)}`]),
         SCAN_BOUND + 1,
       );
-      if (listedIds.length > SCAN_BOUND) {
+      if (range.length > SCAN_BOUND) {
         gap = "bound";
-        listedIds = listedIds.slice(0, SCAN_BOUND);
-      } else {
+        listedIds = range.slice(0, SCAN_BOUND);
+      } else if (unreadHeads(earlier, state.head, fetch.head).every(id => range.includes(id))) {
         from = state.head;
+        listedIds = range;
+      } else {
+        // A head that a fetch saw is not a first-parent commit of the range any more, so the commits that stood
+        // under it were never read. An ancestor that came back through a merge's second parent is such a head.
+        gap = "rewrite";
+        listedIds = await newest();
       }
     } else {
       gap = "rewrite";
-      listedIds = listed(await output(git, mirror, ["rev-list", "--first-parent", `--max-count=${SCAN_BOUND}`, commitId(fetch.head)]), SCAN_BOUND);
+      listedIds = await newest();
     }
     // Rule 3 reads older history only when the range does not start at the stored head.
     const older = gap === "first" || gap === "rewrite" || gap === "source";
@@ -288,8 +294,6 @@ export class BaseScanner {
   private readonly gapsLogged = new Set<ScanGap>();
   /** Per project, the fetches that no recorded scan read, oldest first. The fetch of a running scan is the last one a scan may clear. */
   private readonly unread = new Map<string, MirrorFetch[]>();
-  /** Projects whose unread fetches were dropped past `UNREAD_LIMIT`, until a scan is recorded. */
-  private readonly lost = new Set<string>();
   private failureLogged = false;
   private closed = false;
 
@@ -301,7 +305,9 @@ export class BaseScanner {
   /** Returns at once and never throws. */
   notify(fetch: MirrorFetch): void {
     try {
-      if (this.closed) return;
+      // A head that is not a commit id cannot be scanned. The next fetch then names it as its previous head, which
+      // no stored head equals, so that scan is a gap.
+      if (this.closed || !COMMIT_ID.test(fetch.head)) return;
       if (this.running.has(fetch.projectId)) {
         const replaced = this.pending.get(fetch.projectId);
         if (replaced !== undefined) this.remember(replaced);
@@ -326,17 +332,13 @@ export class BaseScanner {
     this.closed = true;
     this.pending.clear();
     this.unread.clear();
-    this.lost.clear();
   }
 
-  /** Keeps a fetch that no recorded scan read. Past `UNREAD_LIMIT` the oldest goes and the project is lost. */
+  /** Keeps a fetch that no recorded scan read. Past `UNREAD_LIMIT` the oldest goes. */
   private remember(fetch: MirrorFetch): void {
     const list = this.unread.get(fetch.projectId) ?? [];
     list.push(fetch);
-    if (list.length > UNREAD_LIMIT) {
-      list.shift();
-      this.lost.add(fetch.projectId);
-    }
+    if (list.length > UNREAD_LIMIT) list.shift();
     this.unread.set(fetch.projectId, list);
   }
 
@@ -344,40 +346,40 @@ export class BaseScanner {
   private recorded(fetch: MirrorFetch): void {
     const list = this.unread.get(fetch.projectId);
     const index = list === undefined ? -1 : list.indexOf(fetch);
-    // The fetch itself was dropped past the limit, and later ones may have gone with it: the project stays lost.
+    // When the fetch itself was dropped past the limit, every fetch that is left came after it and stays unread.
     if (list === undefined || index === -1) return;
     list.splice(0, index + 1);
-    this.lost.delete(fetch.projectId);
     if (list.length === 0) this.unread.delete(fetch.projectId);
   }
 
   private start(first: MirrorFetch): void {
-    const projectId = first.projectId;
-    const done: Promise<void> = this.drain(first).finally(() => {
-      if (this.running.get(projectId) === done) this.running.delete(projectId);
-    });
-    this.running.set(projectId, done);
+    this.running.set(first.projectId, this.drain(first));
   }
 
   private async drain(first: MirrorFetch): Promise<void> {
-    let next: MirrorFetch | undefined = first;
-    while (next !== undefined) {
-      const fetch: MirrorFetch = next;
-      // The scan reads the unread fetches before this one. This fetch joins the list now, so that the list stays in
-      // fetch order: a notice that is replaced while the scan runs was fetched after it.
-      const earlier = [...(this.unread.get(fetch.projectId) ?? [])];
-      const lost = this.lost.has(fetch.projectId);
-      this.remember(fetch);
-      const result = await this.scan(fetch, earlier, lost);
-      if (this.closed) return;
-      if (result.state === "scanned" || result.state === "checked") this.recorded(fetch);
-      this.report(result);
-      next = this.pending.get(fetch.projectId);
-      this.pending.delete(fetch.projectId);
+    const projectId = first.projectId;
+    try {
+      let next: MirrorFetch | undefined = first;
+      while (next !== undefined) {
+        const fetch: MirrorFetch = next;
+        // The scan reads the unread fetches before this one. This fetch joins the list now, so that the list stays in
+        // fetch order: a notice that is replaced while the scan runs was fetched after it.
+        const earlier = [...(this.unread.get(projectId) ?? [])];
+        this.remember(fetch);
+        const result = await this.scan(fetch, earlier);
+        if (this.closed) return;
+        if (result.state === "scanned" || result.state === "checked") this.recorded(fetch);
+        this.report(result);
+        next = this.pending.get(projectId);
+        this.pending.delete(projectId);
+      }
+    } finally {
+      // In the same turn as the last look at `pending`, so no notice can park behind a scan that has ended.
+      this.running.delete(projectId);
     }
   }
 
-  private async scan(fetch: MirrorFetch, earlier: MirrorFetch[], lost: boolean): Promise<ScanResult> {
+  private async scan(fetch: MirrorFetch, earlier: MirrorFetch[]): Promise<ScanResult> {
     try {
       return await scanOnce({
         store: this.options.store,
@@ -386,7 +388,6 @@ export class BaseScanner {
         fetch,
         holdDays: this.options.holdDays(),
         earlier,
-        lost,
       });
     } catch {
       return { ...FAILED };

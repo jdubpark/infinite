@@ -45,6 +45,8 @@ export interface ProjectSourceStatus {
   baseBranch?: string;
   /** Base-branch head in the host mirror after the last successful fetch. */
   mirrorHead?: string;
+  /** The `fetchedAt` of the fetch that first returned `mirrorHead`: every successful fetch since then returned the same head. */
+  mirrorHeadSince?: string;
   /** Commit the project working tree was last fast-forwarded to. */
   appliedHead?: string;
   fetchedAt?: string;
@@ -57,8 +59,11 @@ export interface ProjectSourceStatus {
   /** Local branches holding tracked edits a session left in the working tree before a refresh. */
   savedBranches?: string[];
 }
-/** One successful fetch of the base branch into the host mirror; `previousHead` is absent when the mirror had no head. */
-export type MirrorFetch = { projectId: string; repository: string; baseBranch: string; head: string; previousHead?: string; fetchedAt: string };
+/**
+ * One successful fetch of the base branch into the host mirror. `previousHead` is the head before this fetch, and
+ * `previousSince` the `fetchedAt` of the fetch that first returned it; both are absent when the status held neither.
+ */
+export type MirrorFetch = { projectId: string; repository: string; baseBranch: string; head: string; previousHead?: string; previousSince?: string; fetchedAt: string };
 export interface ProjectSourceOptions {
   /** Whether a cloud session is running or starting in the project directory. Teams, goals and handoffs do not count. */
   running: (projectId: string) => Promise<boolean>;
@@ -239,15 +244,21 @@ export class ProjectSourceService {
     delete fetchedStatus.fetchFailures;
     const now = new Date().toISOString();
     const previousHead = status.mirrorHead;
+    // A head the status holds with no start time (a status written before this field) has no provable start.
+    const previousSince = previousHead === undefined ? undefined : status.mirrorHeadSince;
     status = {
       ...fetchedStatus,
       mirrorHead: fetchedHead,
+      mirrorHeadSince: previousHead === fetchedHead && previousSince !== undefined ? previousSince : now,
       fetchedAt: now,
       attemptedAt: now,
     };
     if (this.writeStatus(projectId, status, source)) {
       try {
-        this.options.onMirror?.({ projectId, repository: source.repository, baseBranch: source.baseBranch, head: fetchedHead, ...(previousHead === undefined ? {} : { previousHead }), fetchedAt: now });
+        this.options.onMirror?.({
+          projectId, repository: source.repository, baseBranch: source.baseBranch, head: fetchedHead,
+          ...(previousHead === undefined ? {} : { previousHead }), ...(previousSince === undefined ? {} : { previousSince }), fetchedAt: now,
+        });
       } catch { /* A listener failure must not fail the refresh. */ }
     }
 

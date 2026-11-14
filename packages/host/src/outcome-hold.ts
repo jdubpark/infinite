@@ -139,34 +139,34 @@ export function windowCoverage(
   return Date.parse(next.at) - Date.parse(last.checkedAt) <= lapseMs ? "covered" : "gap";
 }
 
-/** Splits Git output into lines. Empty output is no lines; otherwise exactly one trailing newline is allowed. */
-function lines(stdout: string): string[] {
+/** Splits Git output into lines. Empty output is no lines; any other output ends with one newline, as Git prints it. */
+function lines(stdout: string): string[] | undefined {
   if (stdout === "") return [];
-  const body = stdout.endsWith("\n") ? stdout.slice(0, -1) : stdout;
-  return body.split("\n");
+  if (!stdout.endsWith("\n")) return undefined;
+  return stdout.slice(0, -1).split("\n");
 }
 
-/** Form 3 and form 5 output: one commit id per line, at most `max` lines. */
+/** Form 2, 3, and 5 output: one commit id per line, all of one length, at most `max` lines. */
 export function parseIds(stdout: string, max: number): string[] | undefined {
   const ids = lines(stdout);
-  if (ids.length > max) return undefined;
-  if (!ids.every((id) => COMMIT_ID.test(id))) return undefined;
+  if (ids === undefined || ids.length > max) return undefined;
+  if (!ids.every((id) => COMMIT_ID.test(id) && id.length === ids[0].length)) return undefined;
   return ids;
 }
 
 /** Form 4 output: `H T` then one ` P` per parent, one line per requested id, in the requested order. */
 export function parseCommits(stdout: string, ids: readonly string[]): ScanCommit[] | undefined {
   const rows = lines(stdout);
-  if (rows.length !== ids.length) return undefined;
+  if (rows === undefined || rows.length !== ids.length) return undefined;
   const commits: ScanCommit[] = [];
   for (let index = 0; index < rows.length; index += 1) {
     const tokens = rows[index].split(" ");
-    // A root commit ends with a trailing space, which splits to one empty token.
-    if (tokens[tokens.length - 1] === "" && tokens.length > 2) tokens.pop();
+    // A root commit has no parent, so its line ends with the space before the parents: one empty third token.
+    if (tokens.length === 3 && tokens[2] === "") tokens.pop();
     if (tokens.length < 2) return undefined;
-    if (!tokens.every((token) => COMMIT_ID.test(token))) return undefined;
     const [id, tree, ...parents] = tokens;
     if (id !== ids[index]) return undefined;
+    if (!tokens.every((token) => COMMIT_ID.test(token) && token.length === id.length)) return undefined;
     commits.push({ id, tree, parents });
   }
   return commits;

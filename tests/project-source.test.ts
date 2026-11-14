@@ -430,6 +430,8 @@ test("the mirror callback fires after each successful fetch", async () => {
     const first = await service.refresh("example");
     assert.equal(calls.length, 1, "the first successful fetch fires once");
     assert.equal("previousHead" in calls[0]!, false, "a mirror with no head before the fetch has no previousHead key");
+    assert.equal("previousSince" in calls[0]!, false);
+    assert.equal(first.mirrorHeadSince, first.fetchedAt, "a new head stands since the fetch that returned it");
     assert.equal(calls[0]!.projectId, "example");
     assert.equal(calls[0]!.repository, "example/product");
     assert.equal(calls[0]!.baseBranch, "main");
@@ -441,6 +443,8 @@ test("the mirror callback fires after each successful fetch", async () => {
     const second = await service.refresh("example");
     assert.equal(calls.length, 2);
     assert.equal(calls[1]!.previousHead, commitB, "the second call names the first call's head as the previous head");
+    assert.equal(calls[1]!.previousSince, first.fetchedAt, "and the fetch that first returned it");
+    assert.equal(second.mirrorHeadSince, second.fetchedAt);
     assert.equal(calls[1]!.head, commitC);
     assert.equal(calls[1]!.head, second.mirrorHead);
     assert.equal(calls[1]!.fetchedAt, second.fetchedAt);
@@ -452,11 +456,17 @@ test("the mirror callback fires after each successful fetch", async () => {
     assert.equal(calls[2]!.previousHead, commitC);
     assert.equal(calls[2]!.head, commitC);
     assert.equal(calls[2]!.fetchedAt, third.fetchedAt);
+    assert.equal(calls[2]!.previousSince, second.fetchedAt);
+    assert.equal(third.mirrorHeadSince, second.fetchedAt, "an unmoved head keeps the time it has stood since");
+    const fourth = await service.refresh("example");
+    assert.equal(calls[3]!.previousSince, second.fetchedAt, "a second fetch with no move still names the same start");
+    assert.equal(fourth.mirrorHeadSince, second.fetchedAt);
 
     f.config.source!.remoteOverrides!.example = join(f.root, "missing.git");
     const failed = await service.refresh("example");
     assert.equal(failed.pending?.reason, "fetch-failed");
-    assert.equal(calls.length, 3, "a failed fetch fires nothing");
+    assert.equal(calls.length, 4, "a failed fetch fires nothing");
+    assert.equal(failed.mirrorHeadSince, second.fetchedAt, "a failed fetch keeps the head and its start");
   } finally { f.close(); }
 
   // A second, independent fixture: a listener that throws must not change the refresh result.

@@ -330,7 +330,9 @@ export const teamTaskRatingSchema = z.object({ requestId: z.uuid(), score: z.num
 export const teamParallelismSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), parallelism: z.number().int().min(1).max(4) }).strict();
 export type TeamParallelism = z.infer<typeof teamParallelismSchema>;
 const taskId = z.string().regex(/^[a-z][a-z0-9-]{0,39}$/);
+export const taskIdSchema = taskId;
 const ownedPath = z.string().min(1).max(300).refine(value => !value.startsWith("/") && !value.includes("\\") && !value.includes("\0") && !value.split("/").some(part => part === ".." || part === ".git" || part === "." || part === ""), "Use a repository-relative file or directory without glob syntax").refine(value => !/[*?\[\]:]/.test(value));
+export const ownedPathSchema = ownedPath;
 export const teamGoalContextSchema = z.object({
   id: z.uuid(), revision: z.number().int().min(1), cycle: z.number().int().min(1),
   successCriteria: z.string().trim().min(1).max(8000),
@@ -395,7 +397,7 @@ export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z
 export type TeamReportEnvelope = z.infer<typeof teamReportEnvelopeSchema>;
 export type TeamRole = "permission-coordinator" | "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
 /** A mission coordinator's assignment carries the mission ID as `runId`; it reports `MissionReport`s. */
-export type TeamAssignment = { runId: string; memberId: string; revision: number; role: TeamRole | "mission-coordinator"; taskId?: string; verificationRefused?: true };
+export type TeamAssignment = { runId: string; memberId: string; revision: number; role: TeamRole | "mission-coordinator"; taskId?: string; verificationRefused?: true; entryTools?: true };
 /** `merged` is set only from an explicit delivery report; it is not host verification. */
 export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
 export interface TeamMember extends TeamAssignment {
@@ -431,6 +433,8 @@ export interface TeamMember extends TeamAssignment {
   stalledAt?: string;
   report?: TeamReport;
   cursor: number;
+  /** The journal seq up to which the host has stored this member's entry events. */
+  entryCursor?: number;
   stopRequestId: string;
   /** Why the host stopped this member without a report, such as a provider usage limit. */
   stoppedReason?: string;
@@ -502,6 +506,8 @@ export interface TeamCheck {
   round?: number;
 }
 export interface TeamRun {
+  /** Set when the run was created with the blackboard tools switch on and a ready store. Absent means today's behaviour. */
+  blackboard?: { tools: true };
   /** The project's autonomy mode, pinned when the run starts. Absent on runs recorded before the mode existed; read with autonomyOf(). */
   autonomy?: AutonomyMode;
   /** Explicit owner delegation pinned at creation. Old runs remain opted out. */

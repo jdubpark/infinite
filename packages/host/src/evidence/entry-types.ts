@@ -43,3 +43,11 @@ export type HostEntry = {
   summary: string;
   body: Record<string, unknown>;
 };
+
+/** The kinds a member may post (spec part 3). Member and host kinds are disjoint. */
+export const MEMBER_ENTRY_KINDS = ["contract", "finding", "blocker", "handoff"] as const;
+export type MemberEntryKind = typeof MEMBER_ENTRY_KINDS[number];
+
+/** What a member sees of a head: no run, revision, scope, author member id, or unread lists. */
+export type MemberHead = Pick<EntryHead, "entryId" | "seq" | "at" | "kind" | "author" | "authority" | "authorRole"
+  | "taskId" | "paths" | "summary" | "bodyBytes" | "supersedes" | "state">;

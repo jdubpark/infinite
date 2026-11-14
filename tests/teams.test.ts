@@ -254,7 +254,8 @@ test("a GitHub mission continuation fetches a new ancestor mirror head without m
     git(f.source, "clone", "--bare", f.source, mirror);
     const parentId = randomUUID(), branch = "infinite/team-parent-test";
     const parentWorkspace = join(f.host.config.teams!.workspaceDir, parentId, "integration");
-    mkdirSync(join(f.host.config.teams!.workspaceDir, parentId), { recursive: true });
+    // The host rejects a group-writable team root, so the fixture must not depend on the caller's umask.
+    mkdirSync(join(f.host.config.teams!.workspaceDir, parentId), { recursive: true, mode: 0o700 });
     git(f.source, "clone", "--no-local", "--no-hardlinks", "--", mirror, parentWorkspace);
     git(parentWorkspace, "remote", "remove", "origin");
     git(parentWorkspace, "checkout", "-b", branch, f.base);
@@ -1766,7 +1767,13 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
     const invalid = await client.rpc("tools/call", { name: "report", arguments: { report: { kind: "plan", summary: "No tasks supplied" } } });
     assert.equal(invalid.result.isError, true);
     assert.equal(requests, 0, "Malformed report input must not reach the worker");
-    const report = { kind: "blocked", summary: "MCP report boundary evidence" };
+    const report = { kind: "blocked", summary: "MCP report boundary evidence", blocker: {
+      cause: { status: "hypothesis", detail: "The provider may not expose the required tool." },
+      issueRefs: ["TASK-123"], sourceRefs: ["packages/host/src/team-prompts.ts@abc123"],
+      attemptedFixes: [{ fix: "Checked the assignment's available tools.", outcome: "The required capability remains unavailable." }],
+      proposedRecovery: "Request an owner-authorized supported capability.", prevention: "Check provider capabilities before dispatch.",
+      validationEvidence: [{ sourceRef: "packages/host/src/team-prompts.ts", observation: "The assignment lists its available tools." }],
+    } };
     const forged = await client.rpc("tools/call", { name: "report", arguments: { report, memberId: randomUUID() } });
     assert.equal(forged.result.isError, true);
     assert.equal(requests, 0, "Tool callers cannot substitute an assignment identity");
@@ -1782,6 +1789,7 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
     assert.equal(recorded[0].data.runId, running.id);
     assert.equal(recorded[0].data.memberId, member.memberId);
     assert.equal(recorded[0].data.revision, running.revision);
+    assert.deepEqual(recorded[0].data.report.blocker, report.blocker, "the durable worker journal retains structured blocker evidence");
     const release = releaseResponse!;
     releaseResponse = undefined;
     release();
@@ -1793,7 +1801,7 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
 
     const restarted = startMcp();
     await restarted.initialize();
-    const repeated = await restarted.rpc("tools/call", { name: "report", arguments: { report: { summary: report.summary, kind: report.kind } } });
+    const repeated = await restarted.rpc("tools/call", { name: "report", arguments: { report: { blocker: report.blocker, summary: report.summary, kind: report.kind } } });
     assert.notEqual(repeated.result.isError, true);
     assert.equal(repeated.result.structuredContent.requestId, delivered.result.structuredContent.requestId, "The same validated report retains its request identity across helper processes");
     const conflict = await restarted.rpc("tools/call", { name: "report", arguments: { report: { ...report, summary: "A conflicting result" } } });

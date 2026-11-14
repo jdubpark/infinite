@@ -27,6 +27,9 @@ import { handleRoutineClientCommand } from "./routine-cli.js";
 import type { ProjectGroupList } from "./project-group-types.js";
 import { MIN_COUNTED_ROWS, type LevelCount } from "./outcome-cells.js";
 import type { CellsResult } from "./outcome-reads.js";
+import type { OutcomeRollup } from "./outcome-rollup.js";
+import { LEGACY_BATCH_MAX, parseLegacyFile, type LegacyLineOutcome } from "./outcome-legacy.js";
+import type { LegacyImportResult } from "./outcome-import.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
 type Me = { role: string; capabilities?: { workspaceMirror?: number; mirrorForget?: number }; machine?: { label?: string }; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
@@ -488,8 +491,8 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
 
 const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "evidence", "resources", "close", "sync", "pull", "team", "repo", "routine"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
-const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role", "--profile", "--run", "--by", "--sources", "--days", "--member", "--issue", "--commit", "--at", "--reason", "--withdraw"]);
-const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs"]);
+const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role", "--profile", "--run", "--by", "--sources", "--days", "--member", "--issue", "--commit", "--at", "--reason", "--withdraw", "--goal", "--mission"]);
+const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs", "--dry-run"]);
 
 /**
  * The provider or client command that `handleClientCommand` dispatches on. A token that directly follows
@@ -734,6 +737,53 @@ export function outcomeCellLines(result: CellsResult): string[] {
   return lines;
 }
 
+/**
+ * The roll-up as lines, in the order of the coordinator's ruling. A null count, rounds, or token sum prints as unknown,
+ * never as zero, and every value from the host passes through `clean`.
+ */
+export function outcomeRollupLines(rollup: OutcomeRollup): string[] {
+  const { runs, cost, unreadable } = rollup;
+  const names = (record: Record<string, number>) => Object.keys(record).sort().map(name => `${clean(name)} ${record[name]}`).join(", ");
+  const held = rollup.known ? "" : " · not held by the host";
+  const head = rollup.target.kind === "goal"
+    ? `Goal ${clean(rollup.target.id)}${rollup.assessment ? ` · assessment ${clean(rollup.assessment.result)} at ${clean(rollup.assessment.at)}` : " · no assessment"}`
+    : `Mission ${clean(rollup.target.id)}`;
+  const blocked = Object.keys(runs.blockCodes).length > 0 ? ` · blocked by ${names(runs.blockCodes)}` : "";
+  const lines = [
+    `${head}${held}`,
+    `Runs ${runs.total} · with a summary ${runs.withSummary} · settled ${runs.withCounts} · deleted ${runs.deleted} · status ${Object.keys(runs.status).length ? names(runs.status) : "none"}${blocked}${runs.flagged.backfilled > 0 ? ` · backfilled ${runs.flagged.backfilled}` : ""}${runs.flagged.gap > 0 ? ` · gap ${runs.flagged.gap}` : ""}`,
+  ];
+  if (runs.counts === null) lines.push("No run has settled, so its counts are unknown.");
+  else {
+    lines.push(`Counts: ${Object.entries(runs.counts).map(([name, value]) => `${clean(name)} ${value}`).join(", ")}`);
+    if (runs.rounds) lines.push(`Rounds: total ${runs.rounds.total}, attributed ${runs.rounds.attributed}, unattributed ${runs.rounds.unattributed}, unknown ${runs.rounds.unknown}`);
+  }
+  const attempts = Object.entries(rollup.attempts).filter((entry): entry is [string, number] => entry[1] !== undefined);
+  lines.push(attempts.length ? `Attempts: ${attempts.map(([name, value]) => `${clean(name)} ${value}`).join(", ")}` : "Attempts: none");
+  lines.push("Implementers:", ...outcomeCellLines({ cells: rollup.implementer, unreadable: 0 }));
+  if (rollup.scout.length > 0) lines.push("Scouts:", ...outcomeCellLines({ cells: rollup.scout, unreadable: 0 }));
+  lines.push(`Members without a task: ${rollup.members}`);
+  const tokens = cost.tokens === null ? "tokens unknown" : `tokens ${cost.tokens}`;
+  lines.push(`Cost: ${tokens} over ${cost.complete} of ${cost.sessions} sessions${cost.spentUsd === null ? "" : ` · spent $${formatUsd(cost.spentUsd)}`}${cost.noSession > 0 ? ` · ${cost.noSession} without a session` : ""}`);
+  if (unreadable.summaries + unreadable.rows + unreadable.members > 0)
+    lines.push(`Unreadable records left out: ${unreadable.summaries} summaries, ${unreadable.rows} rows, ${unreadable.members} member results.`);
+  if (rollup.unindexed > 0) lines.push(`Records with no goal or mission index: ${rollup.unindexed}.`);
+  return lines;
+}
+
+/**
+ * The import result as lines: each refused line in file order, then one summary. A dry run says nothing was written,
+ * and a dry run over several batches says that each batch was checked on its own.
+ */
+export function legacyImportLines(result: { dryRun: boolean; lines: { line: number; outcome: LegacyLineOutcome }[]; removed: number; batches: number }): string[] {
+  const count = (name: LegacyLineOutcome) => result.lines.filter(line => line.outcome === name).length;
+  const refused = result.lines.filter(line => line.outcome === "changed" || line.outcome === "conflict");
+  const summary = `Imported ${count("imported")}, repeated ${count("repeated")}, superseded ${count("superseded")}, expired ${count("expired")}, refused ${refused.length}, removed ${result.removed}.`;
+  const dry = result.dryRun ? "Dry run, nothing was written: " : "";
+  const perBatch = result.dryRun && result.batches > 1 ? ` A dry run checks each batch of ${LEGACY_BATCH_MAX} lines on its own.` : "";
+  return [...refused.map(line => `Line ${line.line}: ${line.outcome}`), `${dry}${summary}${perBatch}`];
+}
+
 export function usageBars(values: number[]): string {
   const levels = "▁▂▃▄▅▆▇█", max = Math.max(0, ...values);
   return values.map(value => levels[max > 0 ? Math.max(0, Math.min(7, Math.floor(value / max * 7))) : 0]).join("");
@@ -809,6 +859,65 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     }
     if (command === "usage" && positional[0] === "outcomes") {
       const runId = options["--run"];
+      const goalId = options["--goal"], missionId = options["--mission"];
+      if (positional.length === 1 && (goalId !== undefined || missionId !== undefined)) {
+        if (goalId !== undefined && missionId !== undefined) throw new Error("Usage: infinite usage outcomes --goal ID | --mission ID [--json]. Give one of --goal or --mission, not both.");
+        const [kind, id] = goalId !== undefined ? ["goal", String(goalId)] : ["mission", String(missionId)];
+        let rollup: OutcomeRollup;
+        try {
+          rollup = await api.json<OutcomeRollup>(`/outcomes/rollup?${kind}=${encodeURIComponent(id)}`);
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 404) throw new Error("No roll-up exists for this goal or mission. Check the ID.");
+          if (error instanceof HttpError && error.status === 400) throw new Error("The host refused the roll-up query.");
+          if (error instanceof HttpError && error.status === 503) throw new Error("The evidence store is unavailable.");
+          throw error;
+        }
+        if (options["--json"]) console.log(JSON.stringify(rollup, null, 2));
+        else for (const line of outcomeRollupLines(rollup)) console.log(line);
+        return true;
+      }
+      if (positional.length === 2 && positional[1] === "import-legacy") {
+        const file = options["--file"];
+        if (typeof file !== "string" || !file) throw new Error("Usage: infinite usage outcomes import-legacy --file FILE [--dry-run] [--json]");
+        let text: string;
+        try { text = readFileSync(file, "utf8"); } catch { throw new Error("The file could not be read."); }
+        const parsed = parseLegacyFile(text, Date.now());
+        if ("errors" in parsed) {
+          for (const error of parsed.errors) console.log(`Line ${error.line}: ${clean(error.reason)}${error.path === undefined ? "" : ` at ${clean(error.path)}`}`);
+          console.log("Nothing was sent.");
+          process.exitCode = 1;
+          return true;
+        }
+        const dryRun = options["--dry-run"] === true;
+        const { lines, numbers } = parsed;
+        const outcomes: { line: number; outcome: LegacyLineOutcome }[] = [];
+        let removed = 0, batches = 0;
+        for (let start = 0; start < lines.length; start += LEGACY_BATCH_MAX) {
+          const batch = lines.slice(start, start + LEGACY_BATCH_MAX);
+          const first = numbers[start]!;
+          const sentThrough = start === 0 ? "" : ` Lines 1 to ${numbers[start - 1]} were sent; run the same command again to continue.`;
+          let answer: LegacyImportResult;
+          try {
+            answer = await api.json<LegacyImportResult>("/outcomes/legacy", { dryRun, lines: batch }, undefined, undefined, "POST");
+          } catch (error) {
+            if (error instanceof HttpError && error.status === 403) throw new Error("Importing legacy outcomes requires an owner device key.");
+            if (error instanceof HttpError && error.status === 409) throw new Error(`The host holds too many legacy lines: the limit is 50,000. The batch that starts at line ${first} was not imported.`);
+            if (error instanceof HttpError && error.status === 400) throw new Error(`The host refused the batch that starts at line ${first} as invalid. Nothing of it was imported.`);
+            if (error instanceof HttpError && error.status === 503) throw new Error(start === 0 ? "The evidence store is unavailable. No line was imported; run the same command again." : `The evidence store is unavailable.${sentThrough}`);
+            throw error;
+          }
+          // One outcome answers one line. Another count means the host and this command disagree about the batch.
+          if (!Array.isArray(answer.outcomes) || answer.outcomes.length !== batch.length)
+            throw new Error(`The host answered the batch that starts at line ${first} with another number of lines. Check that the host and this command are the same version.`);
+          batches++;
+          removed += answer.removed;
+          outcomes.push(...answer.outcomes.map((outcome, index) => ({ line: numbers[start + index]!, outcome })));
+        }
+        if (options["--json"]) console.log(JSON.stringify({ dryRun, lines: outcomes, removed }, null, 2));
+        else for (const line of legacyImportLines({ dryRun, lines: outcomes, removed, batches })) console.log(line);
+        if (outcomes.some(line => line.outcome === "changed" || line.outcome === "conflict")) process.exitCode = 1;
+        return true;
+      }
       if (positional.length === 1 && typeof runId === "string" && runId) {
         type Level = 0 | 1 | null;
         type OutcomeView = {
@@ -895,7 +1004,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       }
       const profileId = options["--profile"];
       if (positional.length !== 2 || positional[1] !== "new-epoch" || typeof profileId !== "string" || !profileId)
-        throw new Error("Usage: infinite usage outcomes --run ID [--json] | infinite usage outcomes new-epoch --profile ID [--json] | infinite usage outcomes link-fix|exclude ... (see --withdraw) | infinite usage outcomes [--project ID] [--role ROLE] [--by LIST] [--sources LIST] [--days N] [--json]");
+        throw new Error("Usage: infinite usage outcomes --run ID [--json] | infinite usage outcomes new-epoch --profile ID [--json] | infinite usage outcomes link-fix|exclude ... (see --withdraw) | infinite usage outcomes [--project ID] [--role ROLE] [--by LIST] [--sources LIST] [--days N] [--json] | infinite usage outcomes --goal ID | --mission ID [--json] | infinite usage outcomes import-legacy --file FILE [--dry-run] [--json]");
       type Epoch = { profileId: string; provider: string; model: string | null; effort: string | null; epoch: number; since: string; repeated: boolean };
       let result: Epoch;
       try {

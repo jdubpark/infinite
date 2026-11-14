@@ -2021,7 +2021,11 @@ The CLI checks the whole file before it sends anything. A file with a wrong
 line, a blank line, or a repeated id with another body is refused, and the
 CLI prints `Line N: <reason>` for each error and `Nothing was sent.`. It then
 exits non-zero. A valid file goes out in batches of 50, in file order, one batch
-at a time.
+at a time. The command then prints `Line N: changed` or `Line N: conflict` for
+each refused line and one summary line, such as
+`Imported 3, repeated 0, superseded 0, expired 0, refused 0, removed 0.` It
+exits non-zero when a line was refused. `removed` counts the stored rows that a
+superseding line replaced. `--json` prints each line's number and outcome.
 
 A line becomes a row with these values:
 

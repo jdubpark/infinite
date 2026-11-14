@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -18,6 +18,15 @@ const lineup = {
   integrator: { ...coordinator, id: "integrator", label: "Integrator" },
   reviewer: { ...coordinator, id: "reviewer", label: "Reviewer" },
 };
+
+const DAY_MS = 86_400_000;
+/** One hour before the test file loaded: a line recorded then is inside every retention. */
+const RECORDED = new Date(Date.now() - 3_600_000).toISOString();
+
+/** One legacy line in the operator's format. The ids and names are examples. */
+function legacyLine(id: string, extra: Record<string, unknown> = {}) {
+  return { id, projectId: "alpha", profile: { provider: "opencode", model: "model-a" }, result: "accepted", attempts: 1, recordedAt: RECORDED, ...extra };
+}
 
 /** Client CLI against a started host, as the client command tests run it. The token is the given role's. */
 function clientCli(host: { origin: string; tokens: Record<string, string> }, root: string, role: "owner" | "viewer" = "owner") {
@@ -120,6 +129,14 @@ test("an unavailable store answers 503 and the status route still reports it", {
     const view = await host.fetchApi(`/outcomes/runs/${randomUUID()}`, "owner");
     assert.equal(view.status, 503);
     assert.equal(view.body.code, "evidence-unavailable");
+
+    const rollup = await host.fetchApi(`/outcomes/rollup?goal=${randomUUID()}`, "owner");
+    assert.equal(rollup.status, 503);
+    assert.equal(rollup.body.code, "evidence-unavailable");
+
+    const legacy = await host.fetchApi("/outcomes/legacy", "owner", { dryRun: false, lines: [legacyLine("op-2026-10-01-a")] });
+    assert.equal(legacy.status, 503);
+    assert.equal(legacy.body.code, "evidence-unavailable");
 
     const status = await host.fetchApi("/evidence/status");
     assert.equal(status.status, 200);
@@ -466,6 +483,196 @@ test("the signal commands", { timeout: 180000 }, async () => {
     });
   } finally {
     await f.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("roll-up queries are checked", { timeout: 60000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "inf-outcome-rollup-"));
+  const host = await startHost({ config: { teams: { workspaceDir: join(root, "teams"), lineup } } });
+  try {
+    const id = randomUUID();
+    for (const query of ["goal=x", `goal=${id}&mission=${id}`, "", `goal=${id}&extra=1`, "mission=x"]) {
+      const refused = await host.fetchApi(`/outcomes/rollup?${query}`, "owner");
+      assert.equal(refused.status, 400, query);
+    }
+
+    const goal = await host.fetchApi(`/outcomes/rollup?goal=${randomUUID()}`, "viewer");
+    assert.equal(goal.status, 404, JSON.stringify(goal.body));
+    assert.equal(goal.body.code, "rollup-not-found");
+    const mission = await host.fetchApi(`/outcomes/rollup?mission=${randomUUID()}`, "controller");
+    assert.equal(mission.status, 404, JSON.stringify(mission.body));
+    assert.equal(mission.body.code, "rollup-not-found");
+
+    // A mission whose record the host holds, with no run in the ledger, is a real state: zero runs, nothing known.
+    const held = randomUUID();
+    mkdirSync(join(host.config.stateDir, "missions"), { recursive: true });
+    writeFileSync(join(host.config.stateDir, "missions", `${held}.sealed`), "", { mode: 0o600 });
+    const empty = await host.fetchApi(`/outcomes/rollup?mission=${held}`, "viewer");
+    assert.equal(empty.status, 200, JSON.stringify(empty.body));
+    assert.deepEqual(empty.body.target, { kind: "mission", id: held });
+    assert.equal(empty.body.known, true);
+    assert.equal(empty.body.assessment, null);
+    assert.equal(empty.body.runs.total, 0);
+    assert.equal(empty.body.runs.counts, null);
+    assert.deepEqual(empty.body.implementer, []);
+    assert.equal(empty.body.cost.tokens, null);
+
+    // The command prints the same roll-up, and says so when the host holds nothing under the id.
+    const viewer = clientCli(host, root, "viewer");
+    const printed = (await viewer("usage", "outcomes", "--mission", held)).stdout;
+    assert.match(printed, new RegExp(`^Mission ${held}$`, "m"), printed);
+    assert.match(printed, /^No run has settled, so its counts are unknown\.$/m, printed);
+    assert.match(printed, /^Cost: tokens unknown over 0 of 0 sessions$/m, printed);
+    assert.equal(JSON.parse((await viewer("usage", "outcomes", "--mission", held, "--json")).stdout).runs.total, 0);
+    await assert.rejects(viewer("usage", "outcomes", "--goal", randomUUID()), (error: { stderr?: string }) => {
+      assert.match(error.stderr ?? "", /No roll-up exists for this goal or mission\. Check the ID\./);
+      return true;
+    });
+    await assert.rejects(viewer("usage", "outcomes", "--goal", randomUUID(), "--mission", held), (error: { stderr?: string }) => {
+      assert.match(error.stderr ?? "", /Give one of --goal or --mission, not both\./);
+      return true;
+    });
+  } finally {
+    await host.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the legacy route answers per line", { timeout: 90000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "inf-outcome-legacy-route-"));
+  const host = await startHost({ config: { teams: { workspaceDir: join(root, "teams"), lineup, outcomes: { retentionDays: 30 } } } });
+  try {
+    const legacyRows = async () => (await host.fetchApi("/evidence/status")).body.counts["outcomes.legacy"];
+    const first = [legacyLine("op-2026-10-01-a"), legacyLine("op-2026-10-01-b"), legacyLine("op-2026-10-01-c")];
+    assert.equal(await legacyRows(), 0);
+
+    const dry = await host.fetchApi("/outcomes/legacy", "owner", { dryRun: true, lines: first });
+    assert.equal(dry.status, 200, JSON.stringify(dry.body));
+    assert.deepEqual(dry.body.outcomes, ["imported", "imported", "imported"]);
+    assert.equal(await legacyRows(), 0, "a dry run stores nothing");
+
+    const imported = await host.fetchApi("/outcomes/legacy", "owner", { dryRun: false, lines: first });
+    assert.deepEqual(imported.body.outcomes, ["imported", "imported", "imported"]);
+    assert.equal(await legacyRows(), 3);
+
+    const replay = await host.fetchApi("/outcomes/legacy", "owner", { dryRun: false, lines: first });
+    assert.deepEqual(replay.body.outcomes, ["repeated", "repeated", "repeated"]);
+    assert.equal(await legacyRows(), 3, "a replay changes nothing");
+
+    const changed = await host.fetchApi("/outcomes/legacy", "owner", { dryRun: false, lines: [{ ...first[0], label: "Changed label" }, legacyLine("op-2026-10-01-d")] });
+    assert.equal(changed.status, 200, JSON.stringify(changed.body));
+    assert.deepEqual(changed.body.outcomes, ["changed", "imported"], "the rest of the batch is written");
+    assert.equal(await legacyRows(), 4);
+
+    const viewer = await host.fetchApi("/outcomes/legacy", "viewer", { dryRun: false, lines: [legacyLine("op-2026-10-01-e")] });
+    assert.equal(viewer.status, 403);
+
+    const tooMany = Array.from({ length: 51 }, (_, index) => legacyLine(`op-2026-10-02-${index}`));
+    assert.equal((await host.fetchApi("/outcomes/legacy", "owner", { dryRun: false, lines: tooMany })).status, 400);
+    const unknownKey = await host.fetchApi("/outcomes/legacy", "owner", { dryRun: false, lines: [legacyLine("op-2026-10-03-a", { extra: 1 })] });
+    assert.equal(unknownKey.status, 400);
+    const missingDryRun = await host.fetchApi("/outcomes/legacy", "owner", { lines: [legacyLine("op-2026-10-03-b")] });
+    assert.equal(missingDryRun.status, 400);
+    assert.equal(await legacyRows(), 4, "a refused batch stores nothing");
+
+    // The host's own retention decides what is expired: 31 days is past this host's 30, and inside the default.
+    const old = await host.fetchApi("/outcomes/legacy", "owner", { dryRun: false, lines: [legacyLine("op-2026-10-04-a", { recordedAt: new Date(Date.now() - 31 * DAY_MS).toISOString() })] });
+    assert.deepEqual(old.body.outcomes, ["expired"], JSON.stringify(old.body));
+    assert.equal(await legacyRows(), 4, "an expired line stores nothing");
+  } finally {
+    await host.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the legacy import is owner-only and idempotent", { timeout: 180000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "inf-outcome-legacy-cli-"));
+  const host = await startHost({ config: { teams: { workspaceDir: join(root, "teams"), lineup } } });
+  try {
+    const legacyRows = async () => (await host.fetchApi("/evidence/status")).body.counts["outcomes.legacy"];
+    const file = join(root, "legacy.jsonl");
+    writeFileSync(file, [legacyLine("op-2026-10-01-a"), legacyLine("op-2026-10-01-b"), legacyLine("op-2026-10-01-c")].map(line => JSON.stringify(line)).join("\n") + "\n");
+    const owner = clientCli(host, root, "owner");
+
+    const dry = (await owner("usage", "outcomes", "import-legacy", "--file", file, "--dry-run")).stdout;
+    assert.match(dry, /^Dry run, nothing was written: Imported 3,/m, dry);
+    assert.equal(await legacyRows(), 0);
+
+    const imported = (await owner("usage", "outcomes", "import-legacy", "--file", file)).stdout;
+    assert.match(imported, /^Imported 3,/m, imported);
+    assert.equal(await legacyRows(), 3);
+
+    const repeated = (await owner("usage", "outcomes", "import-legacy", "--file", file)).stdout;
+    assert.match(repeated, /^Imported 0, repeated 3,/m, repeated);
+
+    const cells = await host.fetchApi("/outcomes?sources=legacy");
+    assert.equal(cells.status, 200, JSON.stringify(cells.body));
+    assert.equal(cells.body.cells.length, 1, JSON.stringify(cells.body));
+    assert.equal(cells.body.cells[0].key.source, "legacy");
+    assert.equal((await host.fetchApi("/outcomes")).body.cells.length, 0, "production cells hold no legacy row");
+    assert.deepEqual((await host.fetchApi("/usage/models")).body.rows, []);
+
+    const viewer = clientCli(host, root, "viewer");
+    await assert.rejects(viewer("usage", "outcomes", "import-legacy", "--file", file), (error: { stderr?: string }) => {
+      assert.match(error.stderr ?? "", /Importing legacy outcomes requires an owner device key\./);
+      return true;
+    });
+
+    // A changed body under a known id is refused: the command names the line, imports the rest, and exits non-zero.
+    const edited = join(root, "edited.jsonl");
+    writeFileSync(edited, [legacyLine("op-2026-10-01-a", { attempts: 2 }), legacyLine("op-2026-10-01-d")].map(line => JSON.stringify(line)).join("\n") + "\n");
+    await assert.rejects(owner("usage", "outcomes", "import-legacy", "--file", edited), (error: { code?: number; stdout?: string }) => {
+      assert.equal(error.code, 1);
+      assert.match(error.stdout ?? "", /^Line 1: changed$/m, error.stdout);
+      assert.match(error.stdout ?? "", /^Imported 1, repeated 0, superseded 0, expired 0, refused 1, removed 0\.$/m, error.stdout);
+      return true;
+    });
+    assert.equal(await legacyRows(), 4);
+
+    // A file of 51 lines goes out as two batches. A dry run says that it checked each batch on its own.
+    const many = join(root, "many.jsonl");
+    writeFileSync(many, Array.from({ length: 51 }, (_, index) => JSON.stringify(legacyLine(`op-2026-10-05-${index}`))).join("\n") + "\n");
+    const manyDry = (await owner("usage", "outcomes", "import-legacy", "--file", many, "--dry-run")).stdout;
+    assert.match(manyDry, /^Dry run, nothing was written: Imported 51, .* A dry run checks each batch of 50 lines on its own\.$/m, manyDry);
+    assert.equal(await legacyRows(), 4);
+    const manyJson = JSON.parse((await owner("usage", "outcomes", "import-legacy", "--file", many, "--json")).stdout);
+    assert.equal(manyJson.dryRun, false);
+    assert.equal(manyJson.lines.length, 51);
+    assert.deepEqual(manyJson.lines[50], { line: 51, outcome: "imported" });
+    assert.equal(await legacyRows(), 55);
+  } finally {
+    await host.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the CLI checks the file before it sends", { timeout: 120000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "inf-outcome-legacy-file-"));
+  const host = await startHost({ config: { teams: { workspaceDir: join(root, "teams"), lineup } } });
+  try {
+    const legacyRows = async () => (await host.fetchApi("/evidence/status")).body.counts["outcomes.legacy"];
+    const owner = clientCli(host, root, "owner");
+
+    const malformed = join(root, "malformed.jsonl");
+    writeFileSync(malformed, [JSON.stringify(legacyLine("op-2026-10-01-a")), "not json", JSON.stringify(legacyLine("op-2026-10-01-b"))].join("\n") + "\n");
+    await assert.rejects(owner("usage", "outcomes", "import-legacy", "--file", malformed), (error: { stdout?: string; stderr?: string }) => {
+      const text = `${error.stdout ?? ""}${error.stderr ?? ""}`;
+      assert.match(text, /Line 2/, text);
+      assert.match(text, /Nothing was sent\./, text);
+      return true;
+    });
+    assert.equal(await legacyRows(), 0, "a file with an error sends nothing");
+
+    const long = join(root, "long.jsonl");
+    writeFileSync(long, "x\n".repeat(20_001));
+    await assert.rejects(owner("usage", "outcomes", "import-legacy", "--file", long), (error: { stdout?: string; stderr?: string }) => {
+      assert.match(`${error.stdout ?? ""}${error.stderr ?? ""}`, /file-too-long/);
+      return true;
+    });
+    assert.equal(await legacyRows(), 0);
+  } finally {
+    await host.stop();
     rmSync(root, { recursive: true, force: true });
   }
 });

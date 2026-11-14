@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { featureMapSchema, TASK_KINDS } from "./task-features.js";
+import { evalProjectSchema } from "./eval-config.js";
 import type { Prompt, AnswerResult } from "@infinite/attention";
 import type { Receipt } from "./types.js";
 import type { Provider } from "./types.js";
@@ -199,6 +200,7 @@ export const teamProjectSchema = z.object({
   handoffMaxTotalMinutes: z.number().int().min(5).max(1440).optional(),
   /** The private feature map. Read at acceptance; never sent to a member. No default, so the authority digest is unchanged when unset. */
   features: featureMapSchema.optional(),
+  eval: evalProjectSchema.optional(),
 }).strict().superRefine((project, context) => {
   if (project.establishChecks ? project.checks.length > 0 : project.checks.length === 0)
     context.addIssue({ code: "custom", path: ["checks"], message: "Configure required checks, or explicitly authorize the team to establish them with an empty checks array." });

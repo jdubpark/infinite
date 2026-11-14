@@ -24,6 +24,7 @@ import {
   insertMarker,
   markApproval,
   readMaterial,
+  reconcileBatch,
   sweepEvalTasks,
   sweepFallbackSql,
   type MaterialResult,
@@ -232,8 +233,10 @@ test("deleting a cancelled run deletes its tasks; another status stamps them", (
     assert.equal(count(f, "eval_tasks", "run_id=?", runD), 0);
     assert.equal(count(f, "eval_material", "task_id LIKE ?", `%${runD}%`), 0);
 
+    // The host never deletes a run that is ready for review, so this status means that later events were lost: delete.
     assert.equal(f.store.deleteRun(runE), true);
-    assert.equal(count(f, "eval_tasks", "run_id=? AND run_deleted_at IS NOT NULL", runE), 2);
+    assert.equal(count(f, "eval_tasks", "run_id=?", runE), 0);
+    assert.equal(count(f, "eval_material", "task_id LIKE ?", `%${runE}%`), 0);
   } finally {
     f.close();
   }
@@ -364,6 +367,34 @@ test("retention removes old tasks per project", () => {
     assert.equal(first, 100);
     assert.equal(second, 50);
     assert.equal(count(f, "eval_tasks", "run_id=?", "run-ret-bulk"), 0);
+  } finally {
+    f.close();
+  }
+});
+
+test("the reconcile pass visits the oldest rows of both states", () => {
+  const f = ready();
+  try {
+    // Two captured tasks and two candidates, with check times that interleave.
+    const ids = ["m-1", "m-2", "m-3", "m-4"].map(member => {
+      f.store.write(tx => insertMarker(tx, captureStart(member, COMMIT), { state: "captured", capsule: capsule() }, NOW));
+      return capturedTaskId(RUN, member);
+    });
+    const at = (second: number) => `2026-11-14T10:00:0${second}.000Z`;
+    f.store.write(tx => {
+      tx.run("UPDATE eval_tasks SET state='captured', checked_at=? WHERE task_id=?", at(3), ids[0]);
+      tx.run("UPDATE eval_tasks SET state='candidate', checked_at=? WHERE task_id=?", at(1), ids[1]);
+      tx.run("UPDATE eval_tasks SET state='captured', checked_at=? WHERE task_id=?", at(2), ids[2]);
+      tx.run("UPDATE eval_tasks SET state='candidate', checked_at=? WHERE task_id=?", at(4), ids[3]);
+    });
+    const visited: string[] = [];
+    const first = f.store.write(tx => reconcileBatch(tx, task => { visited.push(task.taskId); return { kind: "wait" }; }, NOW, 2));
+    assert.deepEqual(visited, [ids[1], ids[2]], "The two oldest checks, one of each state, oldest first");
+    assert.equal(first.visited, 2);
+    // The next pass takes the two that are left, so a candidate is checked again however many captured tasks wait.
+    visited.length = 0;
+    f.store.write(tx => reconcileBatch(tx, task => { visited.push(task.taskId); return { kind: "wait" }; }, "2026-11-14T12:00:01.000Z", 2));
+    assert.deepEqual(visited, [ids[0], ids[3]]);
   } finally {
     f.close();
   }

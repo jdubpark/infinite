@@ -30,8 +30,12 @@ export const SWEEP_BATCH = 100;
 
 const DAY_MS = 86_400_000;
 
-/** The last statuses of a deleted run that keep its tasks. Any other status, or none, takes them. */
-const KEEP_STATUSES: ReadonlySet<string> = new Set(["merged", "no-change", "ready-for-review"]);
+/**
+ * The last statuses of a deleted run that keep its tasks. Any other status, or none, takes them. The host deletes a run
+ * record only when it is cancelled, merged, or no-change, so any other last status belongs to a run whose later events
+ * were lost, and its fate is unknown.
+ */
+const KEEP_STATUSES: ReadonlySet<string> = new Set(["merged", "no-change"]);
 
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS eval_tasks (
@@ -58,7 +62,7 @@ const SCHEMA = [
   "CREATE INDEX IF NOT EXISTS eval_tasks_check ON eval_tasks (state, checked_at, task_id)",
   "CREATE INDEX IF NOT EXISTS eval_tasks_bytes ON eval_tasks (project_ref, material_bytes)",
   "CREATE INDEX IF NOT EXISTS eval_tasks_live_runs ON eval_tasks (run_id) WHERE run_deleted_at IS NULL",
-  "CREATE INDEX IF NOT EXISTS eval_tasks_captured ON eval_tasks (captured_at)",
+  "CREATE INDEX IF NOT EXISTS eval_tasks_captured ON eval_tasks (captured_at, project_ref)",
   `CREATE TABLE IF NOT EXISTS eval_material (
     task_id TEXT NOT NULL,
     part TEXT NOT NULL,

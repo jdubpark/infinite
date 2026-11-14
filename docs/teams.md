@@ -510,7 +510,7 @@ A missing fact stays missing. A refused patch is never stored as empty. A trunca
 
 ### Deletion and retention
 
-- A deleted run keeps its captured tasks only when it merged, needed no change, or was ready for review. Any other deleted run, and a run with no readable status, takes its tasks and their sealed material with it. The status is the run's last `run.deleted` or `run.settled` event.
+- A deleted run keeps its captured tasks only when it merged or needed no change. Any other deleted run, and a run with no readable status, takes its tasks and their sealed material with it. The status is the run's last `run.deleted` or `run.settled` event.
 - A kept task is stamped with the deletion time, and retention removes it later.
 - Retention removes a task once its capture time is older than the project's `retentionDays`. A task whose project is no longer configured keeps the default of 365 days. The sweep removes at most 100 rows a pass.
 - Removing a run's clones does not change a captured task.

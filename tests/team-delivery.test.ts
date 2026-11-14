@@ -10,6 +10,9 @@ import { teamDeliveryReconcileSchema, type TeamDeliveryReconcile, type TeamMembe
 import { unseal } from "../packages/host/src/vault.js";
 import type { ProjectSourceService, ProjectSourceStatus } from "../packages/host/src/project-source.js";
 import { teamPrompt } from "../packages/host/src/team-prompts.js";
+import { EventOutbox } from "../packages/host/src/evidence/outbox.js";
+import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
+import type { RunEvent } from "../packages/host/src/evidence/types.js";
 
 type DeliveryStored = {
   run: TeamRun; fingerprint: string; receipts: Record<string, string>; prepared: boolean; root: string;
@@ -24,12 +27,14 @@ const deliveryInternals = (teams: TeamService) => teams as unknown as {
 };
 
 async function deliveryRecord(mode: "merge" | "pr", onMerged?: (projectId: string) => void,
-  source?: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status"> | ((fixture: Awaited<ReturnType<typeof fixture>>) => Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status">)) {
+  source?: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status"> | ((fixture: Awaited<ReturnType<typeof fixture>>) => Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status">),
+  options: { events?: boolean } = {}) {
   const f = await fixture("delivery-fast", limitLineup, {}, { deliveryMode: mode, noServer: true });
   const id = randomUUID(), memberId = randomUUID(), branch = "infinite/team-delivery-test";
   git(f.source, "checkout", "-b", branch);
   const sourceService = typeof source === "function" ? source(f) : source;
-  const teams = await f.openTeamService({ onMerged, ...(sourceService ? { source: sourceService } : {}), start: false });
+  const store = options.events ? new EvidenceStore({ databasePath: evidenceDatabasePath(f.host.config.stateDir), vaultKey: readFileSync(f.host.config.keyFile) }) : undefined;
+  const teams = await f.openTeamService({ onMerged, ...(sourceService ? { source: sourceService } : {}), ...(store ? { events: new EventOutbox(store) } : {}), start: false });
   const root = join(f.host.config.teams!.workspaceDir, id);
   const workspace = join(root, "integration"), members = join(root, "members"), cwd = join(members, memberId);
   mkdirSync(members, { recursive: true, mode: 0o700 });
@@ -50,7 +55,7 @@ async function deliveryRecord(mode: "merge" | "pr", onMerged?: (projectId: strin
     checkHead: headCommit, deliveryAttempt: { memberId, revision: 1, headCommit } };
   const internals = teams as unknown as { records: Map<string, typeof stored>; consume: (record: typeof stored, member: TeamMember) => void };
   internals.records.set(id, stored);
-  return { f, teams, run, member, stored, headCommit, id, consume(report: TeamReport) { member.report = report; internals.consume(stored, member); } };
+  return { f, teams, run, member, stored, headCommit, id, store, consume(report: TeamReport) { member.report = report; internals.consume(stored, member); } };
 }
 
 async function blockedDeliveryRecord() {
@@ -880,4 +885,61 @@ test("failed checks never launch delivery and a weak lineup cannot opt into merg
     assert.equal(refused.status, 409);
     assert.equal(refused.body.code, "delivery-lineup-required");
   } finally { await weak.close(); }
+});
+
+
+/** Every stored event of one run, read page by page. */
+function allRunEvents(store: EvidenceStore, runId: string): RunEvent[] {
+  const events: RunEvent[] = [];
+  let after = 0;
+  for (;;) {
+    const page = store.events({ runId, after, limit: 500 });
+    events.push(...page.events);
+    if (!page.more) return events;
+    after = page.cursor;
+  }
+}
+
+test("a pull-request report records the delivery without its URL", { timeout: 30000 }, async () => {
+  const h = await deliveryRecord("pr", undefined, undefined, { events: true });
+  try {
+    h.consume({ kind: "pull-request", headCommit: h.headCommit, pullRequestUrl: "https://github.com/example/app/pull/7", summary: "Opened the reviewed head." });
+    await waitFor(() => Promise.resolve(h.teams.get(h.id)), run => ["ready-for-review", "blocked"].includes(run.status), 10000);
+    await h.teams.idle();
+    const events = allRunEvents(h.store!, h.id);
+    const [recorded] = events.filter(event => event.kind === "delivery.recorded");
+    assert.ok(recorded, "delivery.recorded is stored");
+    assert.equal(recorded.memberId, h.member.memberId);
+    assert.equal(recorded.revision, 1);
+    assert.deepEqual(recorded.data, { v: 1, method: "pull-request", headCommit: h.headCommit });
+    assert.equal(JSON.stringify(events).includes("github.com"), false, "a pull request URL is never stored");
+  } finally { h.store?.close(); await h.f.close(); }
+});
+
+test("a reconciled pull request records the delivery", { timeout: 30000 }, async () => {
+  const h = await deliveryRecord("pr", undefined, undefined, { events: true });
+  try {
+    h.consume({ kind: "delivery-reconciliation", headCommit: h.headCommit, repository: "example/app", branch: h.run.branch,
+      baseHeadCommit: h.run.baseCommit, disposition: "pull-request", remoteHeadCommit: h.headCommit,
+      pullRequestUrl: "https://github.com/example/app/pull/8", summary: "Found the open pull request for the reviewed head." });
+    await waitFor(() => Promise.resolve(h.teams.get(h.id)), run => ["ready-for-review", "blocked"].includes(run.status), 10000);
+    await h.teams.idle();
+    const [recorded] = allRunEvents(h.store!, h.id).filter(event => event.kind === "delivery.recorded");
+    assert.ok(recorded, "delivery.recorded is stored");
+    assert.equal(recorded.memberId, h.member.memberId);
+    assert.deepEqual(recorded.data, { v: 1, method: "pull-request", headCommit: h.headCommit });
+  } finally { h.store?.close(); await h.f.close(); }
+});
+
+test("a merge receipt is recorded even when the baseline capture fails", { timeout: 30000 }, async () => {
+  const h = await deliveryRecord("merge", undefined, undefined, { events: true });
+  try {
+    const mergeCommit = "a".repeat(40);
+    h.consume({ kind: "delivery", headCommit: h.headCommit, pullRequestUrl: "https://github.com/example/app/pull/9", mergeCommit, summary: "Merged the reviewed head." });
+    const blocked = await waitFor(() => Promise.resolve(h.teams.get(h.id)), run => run.status === "blocked", 10000);
+    await h.teams.idle();
+    const [recorded] = allRunEvents(h.store!, h.id).filter(event => event.kind === "delivery.recorded");
+    assert.ok(recorded, "delivery.recorded is stored");
+    assert.deepEqual(recorded.data, { v: 1, method: "merge", headCommit: h.headCommit, mergeCommit });
+  } finally { h.store?.close(); await h.f.close(); }
 });

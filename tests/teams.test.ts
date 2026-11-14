@@ -957,6 +957,53 @@ test("a team builds concurrently in isolated copies and produces checked, review
   } finally { owner.close(); viewer.close(); await f.close(); }
 });
 
+test("a full run stores its events in order", { timeout: 120000 }, async () => {
+  const f = await fixture();
+  let store: EvidenceStore | undefined, apiStopped = false;
+  try {
+    const request = f.create();
+    const created = await f.host.fetchApi("/teams", "owner", request);
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    const finished = await f.settled(created.body.id);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    await f.host.stopApi();
+    apiStopped = true;
+    store = new EvidenceStore({ databasePath: evidenceDatabasePath(f.host.config.stateDir), vaultKey: readFileSync(f.host.config.keyFile) });
+    const events: { seq: number; kind: string; memberId?: string; data: Record<string, unknown> }[] = [];
+    for (let after = 0; ;) {
+      const page = store.events({ runId: finished.id, after, limit: 500 });
+      events.push(...page.events);
+      if (!page.more) break;
+      after = page.cursor;
+    }
+    const kinds = (kind: string) => events.filter(event => event.kind === kind);
+    for (const kind of ["run.created", "run.prepared", "plan.accepted", "check.finished", "review.recorded", "run.settled"])
+      assert.equal(kinds(kind).length, 1, kind);
+    assert.equal(kinds("task.planned").length, 2);
+    assert.equal(kinds("task.integrated").length, 2);
+    for (const kind of ["member.stopped", "repair.started", "ledger.gap"]) assert.equal(kinds(kind).length, 0, kind);
+    assert.equal(kinds("check.finished")[0]!.data.passed, true);
+    assert.equal(kinds("review.recorded")[0]!.data.verdict, "approved");
+    assert.equal(kinds("run.settled")[0]!.data.status, "ready-for-review");
+    for (const member of finished.members) {
+      const started = events.filter(event => event.kind === "member.started" && event.memberId === member.memberId);
+      const reported = events.filter(event => event.kind === "member.reported" && event.memberId === member.memberId);
+      assert.equal(started.length, 1, `one member.started for ${member.role}`);
+      assert.equal(reported.length, 1, `one member.reported for ${member.role}`);
+      assert.ok(started[0]!.seq < reported[0]!.seq, `${member.role} starts before it reports`);
+    }
+    // Each stage's events precede the next stage's.
+    const stages = [["run.created"], ["run.prepared"], ["plan.accepted"], ["task.planned"], ["task.integrated"], ["check.finished"], ["review.recorded"], ["run.settled"]];
+    const seqs = stages.map(([kind]) => kinds(kind!).map(event => event.seq));
+    for (let i = 1; i < seqs.length; i++)
+      assert.ok(Math.max(...seqs[i - 1]!) < Math.min(...seqs[i]!), `${stages[i - 1]![0]} precedes ${stages[i]![0]}`);
+  } finally {
+    store?.close();
+    if (apiStopped) await f.host.start();
+    await f.close();
+  }
+});
+
 test("changeIndex parses name-status and numstat -z records with statuses, counts, and binary nulls", () => {
   const nameStatus = ["A", "a.txt", "M", "src/b.ts", "D", "gone.md", "R100", "old/c.ts", "new/c.ts", "", ""].join("\0");
   const numstat = ["1\t0\ta.txt", "3\t2\tsrc/b.ts", "0\t4\tgone.md", "2\t1\t", "old/c.ts", "new/c.ts", "-\t-\tlogo.png", ""].join("\0");

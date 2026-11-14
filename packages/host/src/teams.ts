@@ -9,12 +9,15 @@ import { TeamStopRefused, type Manager } from "./manager.js";
 import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { PROVIDER_NAMES, recoveryTurnEnd, type Prompt, type SignalData } from "@infinite/attention";
+import { autonomyOf, type AutonomyMode } from "./autonomy.js";
 import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamPermissionRecoveryOutcome, type TeamPermissionRecoveryRequest, type TeamPermissionRecoveryStep, type TeamPermissionRecoveryView, type TeamPublication, type TeamPublicationCategory, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, DEFAULT_TEAM_RETENTION } from "./team-types.js";
 import { ownerDirectionLines, permissionFollowUpPrompt, refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { resumeFailed } from "./native-continuation.js";
 import type { UsageService } from "./usage-service.js";
 import { type EvidenceStore, eventProblem } from "./evidence/store.js";
+import { applyFuseReason, workLaunch } from "./fuse/rules.js";
+import type { FuseAdmission, FuseCheck, FuseGate } from "./fuse/types.js";
 import type { EventOutbox, OutboxEvent } from "./evidence/outbox.js";
 import { MAX_OUTBOX_EVENTS, pathField, planDigest, profileIdentity, runEventKey, runSummaryCounts, type MemberStopDetail, type MemberStopReason, type ReplacementCause } from "./run-events.js";
 import { taskFeatures } from "./task-features.js";
@@ -27,6 +30,7 @@ import type { ProjectSourceService } from "./project-source.js";
 import type { RepositoryGraphs, RepositoryGraphResult } from "./repository-graphs.js";
 import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, publishTeamHead, removeMemberWorkspace, removeTeamWorkspace, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
+import { HOST_LOAD_REASON_PREFIX, LaunchHeldError } from "./host-load.js";
 import { isCollapsedPermissionPrompt, oneShotPermissionOption, permissionAuthorityHash, permissionEvidenceHash, permissionReuseKey, refusedBeforeSend } from "./team-permissions.js";
 import { storageShortfall, volumeUsage, type VolumeUsage } from "./storage.js";
 import { collectPermissionEvidence } from "./team-permission-evidence.js";
@@ -65,6 +69,8 @@ function deliveryInspectionHash(report: DeliveryReconciliationReport) {
   return digest({ headCommit: report.headCommit, repository: report.repository, branch: report.branch,
     baseHeadCommit: report.baseHeadCommit, disposition: report.disposition, remoteHeadCommit: report.remoteHeadCommit });
 }
+/** Shown while the session limit holds a team launch; a host-capacity hold may replace it. */
+const SESSION_SLOT_REASON = "Waiting for an available host session slot.";
 type PendingOperation = { id: string; kind: "prepare" | "member" | "result" | "check"; revision: number;
   source?: { memberId: string; role: TeamMember["role"]; cwd: string; baseCommit: string; headCommit: string; workspace: "member" | "integration" };
   failure?: { code?: string; reason: string; at: string };
@@ -119,6 +125,8 @@ const underReview = (run: TeamRun, sessionId: string, promptId?: number) => prom
     ["pending", "reviewing", "approved", "answering"].includes(decision.status)) || promptId !== undefined &&
   (run.permissionRecovery?.requests ?? []).some(request => request.targetSessionId === sessionId && request.promptId === promptId && livePermissionRecoveryStatuses.has(request.status));
 const runtimeUnavailableReason = "An agent runtime is unavailable; the team is waiting for confirmed state.";
+/** Reasons that report a member's state. The scheduler writes them again from each running member on every pass. */
+const memberStateReasons: ReadonlySet<string> = new Set([runtimeUnavailableReason, permissionReviewReason, providerInputReason]);
 const clock = (iso: string) => `${iso.slice(11, 16)} UTC`;
 const runEvent = (run: TeamRun, text: string) => {
   run.events.push({ at: timestamp(), text });
@@ -380,6 +388,7 @@ export class TeamService {
   private readonly directory: string;
   private usage?: UsageService;
   private evidence?: EvidenceStore;
+  private fuse?: FuseGate;
   private missionReservations?: MissionReservationLookup;
   private readonly limits: ProviderLimits;
   private reconciledAt = 0;
@@ -537,6 +546,19 @@ export class TeamService {
   useMissionReservations(lookup: MissionReservationLookup) { this.missionReservations = lookup; }
   /** The evidence store that a deleted run's events leave with its record. */
   useEvidence(store: EvidenceStore) { this.evidence = store; }
+  /** The launch-rate fuse. Without one, every member launches as before and no record gains a fuse reason. */
+  useFuse(fuse: FuseGate) { this.fuse = fuse; }
+  /**
+   * Applies a fuse result to the run's reason. True when the launch must wait. A reason that reports a member's
+   * state stays as it is: the scheduler writes it again on every pass, so a fuse text there would be replaced and
+   * put back each pass, with a save each time. The launch waits either way.
+   */
+  private fuseWait(stored: Stored, result: FuseCheck | FuseAdmission): boolean {
+    const keeps = memberStateReasons.has(stored.run.reason ?? "");
+    const fuse = applyFuseReason(keeps ? {} : stored.run, result);
+    if (!keeps && fuse.changed) this.save(stored);
+    return fuse.wait;
+  }
   /** Whether the run's sealed record file is on disk, so a record that failed to load still counts. Only a missing file is false. */
   hasRecordFile(id: string) {
     if (!/^[a-f0-9-]{36}$/.test(id)) return false;
@@ -1070,14 +1092,14 @@ export class TeamService {
     return this.createRun(parsed);
   }
   /** Goal authority and model snapshots come from the host, never from a public create body. */
-  createForGoal(request: CreateTeam, goal: TeamGoalContext, lineup: TeamLineup, linearTracking = false): Promise<TeamView> {
-    return this.createRun(createTeamSchema.parse(request), { goal: teamGoalContextSchema.parse(goal), lineup: teamLineupSchema.parse(lineup) }, linearTracking);
+  createForGoal(request: CreateTeam, goal: TeamGoalContext, lineup: TeamLineup, linearTracking = false, autonomy: AutonomyMode = "supervised"): Promise<TeamView> {
+    return this.createRun(createTeamSchema.parse(request), { goal: teamGoalContextSchema.parse(goal), lineup: teamLineupSchema.parse(lineup), autonomy }, linearTracking);
   }
   /** A mission subteam is an ordinary run of one repository under that repository's own policies; the mission pins its lineup. */
-  createForMission(request: CreateTeam, missionId: string, lineup: TeamLineup, options: { baseRunId?: string; parallelismCeiling?: number } = {}): Promise<TeamView> {
+  createForMission(request: CreateTeam, missionId: string, lineup: TeamLineup, options: { baseRunId?: string; parallelismCeiling?: number; linearTracking?: boolean } = {}): Promise<TeamView> {
     const parsed = createTeamSchema.parse(request);
     const project = this.config.projects.find(item => item.id === parsed.projectId);
-    return this.createRun(parsed, { missionId, ...(options.baseRunId ? { baseRunId: options.baseRunId } : {}), parallelismCeiling: options.parallelismCeiling ?? 4, lineup: teamLineupSchema.parse(lineup) }, Boolean(project?.linear));
+    return this.createRun(parsed, { missionId, ...(options.baseRunId ? { baseRunId: options.baseRunId } : {}), parallelismCeiling: options.parallelismCeiling ?? 4, lineup: teamLineupSchema.parse(lineup) }, options.linearTracking ?? Boolean(project?.linear));
   }
   assertHandoffPolicy(policy: HandoffPolicy) {
     const project = this.config.projects.find(item => item.id === policy.projectId);
@@ -1096,12 +1118,12 @@ export class TeamService {
     this.assertHandoffPolicy(policy);
     return this.createRun(parsed, { handoff, handoffPolicy: policy, lineup: policy.lineup }, Boolean(policy.linear));
   }
-  private createRun(parsed: CreateTeam, internal?: { goal?: TeamGoalContext; missionId?: string; parallelismCeiling?: number; baseRunId?: string; handoff?: TeamHandoffContext; handoffPolicy?: HandoffPolicy; lineup: TeamLineup }, linearTracking = false): Promise<TeamView> {
+  private createRun(parsed: CreateTeam, internal?: { goal?: TeamGoalContext; missionId?: string; parallelismCeiling?: number; baseRunId?: string; handoff?: TeamHandoffContext; handoffPolicy?: HandoffPolicy; lineup: TeamLineup; autonomy?: AutonomyMode }, linearTracking = false): Promise<TeamView> {
     return this.enqueue(async () => {
       // Preserve the fingerprints written before lineup selection existed.
       const { useConfiguredLineup, ...singleProviderRequest } = parsed;
       // The host derives the ceiling; adding it must not change a pending mission launch's identity.
-      const { parallelismCeiling: _ceiling, ...creationContext } = internal ?? {};
+      const { parallelismCeiling: _ceiling, autonomy: _autonomy, ...creationContext } = internal ?? {};
       const prior = this.records.get(parsed.requestId), fingerprint = digest(internal ? { request: parsed, ...creationContext } : useConfiguredLineup ? parsed : singleProviderRequest);
       if (prior) {
         if (prior.fingerprint !== fingerprint) throw new TeamError(409, "request-conflict", "This request ID belongs to a different team request.");
@@ -1176,6 +1198,8 @@ export class TeamService {
       if (initialParallelism > ceiling)
         throw new TeamError(409, "team-parallelism-limit", "The initial worker limit exceeds this run's capacity ceiling.");
       const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(project.team.permissions ? { permissions: currentPermissions(structuredClone(project.team.permissions)), permissionDecisions: [] } : {}), ...(goal ? { goal } : {}), ...(internal?.missionId ? { missionId: internal.missionId } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), ...(titleSource ? { titleSource } : {}), title: parsed.title, objective: parsed.objective, parallelismCeiling: ceiling, parallelism: initialParallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
+      // A goal run takes the mode its cycle passes; every other run takes the project's current mode.
+      run.autonomy = goal ? autonomyOf(internal) : autonomyOf(project);
       if (project.team.delivery) {
         if (!lineup || lineup.coordinator.tier !== "strong" || lineup.reviewer.tier !== "strong")
           throw new TeamError(409, "delivery-lineup-required", "Automatic delivery requires a configured strong coordinator and independent strong reviewer.");
@@ -2647,7 +2671,12 @@ export class TeamService {
       if (activeCount) return;
       if (run.establishChecks && !run.verification?.checks.length)
         throw new TeamError(409, "verification-required", "Required verification commands have not been established; review cannot start.");
-      if (stored.checkHead !== run.headCommit) { this.check(stored); return; }
+      if (stored.checkHead !== run.headCommit) {
+        const hold = this.manager.hostLoad.held();
+        if (hold) { this.holdForHostLoad(stored, hold); return; }
+        if (run.reason?.startsWith(HOST_LOAD_REASON_PREFIX)) run.reason = undefined;
+        this.check(stored); return;
+      }
       if (!run.review || run.review.revision !== run.revision) {
         this.prepareMember(stored, "reviewer"); return;
       }
@@ -3901,7 +3930,14 @@ export class TeamService {
       if (tracking?.status === "blocked") throw new TeamError(409, "linear-issue-changed", tracking.reason ?? "The Linear issue no longer permits this work.");
       if (tracking && tracking.status !== "synced") return;
     }
-    if (!this.hasLaunch(member) && (await this.manager.list()).filter(session => session.status === "running" || session.status === "starting").length >= this.config.maxSessions) { stored.run.reason = "Waiting for an available host session slot."; this.save(stored); return; }
+    // The fuse is asked before any launch work. It reads memory only, so a queued member costs no write per pass.
+    if (this.fuse && !this.hasLaunch(member) && this.fuseWait(stored, this.fuse.check({ projectId: stored.run.projectId, role: member.role }))) return;
+    // The host's load is asked next, so a launch that it holds is never charged to the fuse.
+    if (!this.hasLaunch(member)) {
+      const hold = this.manager.hostLoad.held();
+      if (hold) { this.holdForHostLoad(stored, hold); return; }
+    }
+    if (!this.hasLaunch(member) && (await this.manager.list()).filter(session => session.status === "running" || session.status === "starting").length >= this.config.maxSessions) { stored.run.reason = SESSION_SLOT_REASON; this.save(stored); return; }
     if (member.role === "delivery") {
       this.assertDelivery(stored);
       const attempt = stored.deliveryAttempt;
@@ -3928,12 +3964,25 @@ export class TeamService {
       const configuredProject = stored.run.handoff?.project ?? this.config.projects.find(project => project.id === stored.run.projectId)?.team;
       await writeTeamContext(member.cwd, { ...teamContext(stored.run, member.contextFeedback, configuredProject, member.role, this.permissionRecoveryHistory(stored.run)), assignment: assignment(member), memberBaseCommit: member.baseCommit, scratchDirectory: member.scratchDirectory }, this.config.teams?.commandPrefix);
     }
+    // The launch is charged once, right before its session starts. A member whose session exists is a replay.
+    if (this.fuse && !this.hasLaunch(member) && this.fuseWait(stored, this.fuse.admit(workLaunch({ launchId: member.sessionId, projectId: stored.run.projectId,
+      provider: member.provider ?? stored.run.provider, team: assignment(member), profile: member.modelProfile })))) return;
     let result;
     const request = { requestId: member.sessionId, provider: member.provider ?? stored.run.provider,
       projectId: stored.run.projectId, title: member.title, prompt: member.prompt,
       ...(member.role === "permission-coordinator" ? { continuation: member.continuation } : {}) };
     try { result = await this.startInProject(stored.run.projectId, () => this.manager.createTeamSession(request, assignment(member), member.cwd, member.modelProfile, stored.root, this.config.teams?.trustWorkspaces === true)); }
-    catch (error) { if (error instanceof Error && /configured session limit/.test(error.message)) { stored.run.reason = "Waiting for an available host session slot."; this.save(stored); return; } throw error; }
+    catch (error) {
+      this.fuse?.release(member.sessionId);
+      if (error instanceof LaunchHeldError) { this.holdForHostLoad(stored, error.reason); return; }
+      if (error instanceof Error && /configured session limit/.test(error.message)) { stored.run.reason = SESSION_SLOT_REASON; this.save(stored); return; }
+      if (error instanceof TeamError && error.code === "fuse-open") {
+        if (stored.run.reason !== error.message) { stored.run.reason = error.message; this.save(stored); }
+        return;
+      }
+      throw error;
+    }
+    if (stored.run.reason?.startsWith(HOST_LOAD_REASON_PREFIX)) stored.run.reason = undefined;
     member.status = result.status === "unavailable" ? "unavailable" : "running";
     member.startedAt ??= timestamp();
     const turn = member.turns?.at(-1);
@@ -3950,6 +3999,13 @@ export class TeamService {
       if (!Object.keys(stored.ledgerReplaces).length) delete stored.ledgerReplaces;
     }
     this.save(stored);
+  }
+  /** Shows a host-load hold on the run. It replaces an empty reason, an earlier host-load hold, or the session-slot wait; any other reason stays. */
+  private holdForHostLoad(stored: Stored, reason: string) {
+    const current = stored.run.reason;
+    const replaceable = current === undefined || current === SESSION_SLOT_REASON || current.startsWith(HOST_LOAD_REASON_PREFIX);
+    if (!replaceable || current === reason) return;
+    stored.run.reason = reason; this.save(stored);
   }
   private applyProjectManagerCapacity(stored: Stored, requested?: number) {
     const run = stored.run, ceiling = capacityCeiling(run), limit = requested ?? ceiling;

@@ -7,6 +7,7 @@ import type { LinearTrackingView } from "./linear-types.js";
 import type { UsageTotals } from "./usage.js";
 import type { UsageRollup } from "./team-usage.js";
 import type { ProviderLimit } from "./provider-limits.js";
+import type { AutonomyMode } from "./autonomy.js";
 
 export const teamCommandSchema = z.object({
   command: z.string().min(1).max(4096).refine(value => !value.includes("\0")),
@@ -501,6 +502,8 @@ export interface TeamCheck {
   round?: number;
 }
 export interface TeamRun {
+  /** The project's autonomy mode, pinned when the run starts. Absent on runs recorded before the mode existed; read with autonomyOf(). */
+  autonomy?: AutonomyMode;
   /** Explicit owner delegation pinned at creation. Old runs remain opted out. */
   permissions?: TeamPermissions;
   permissionsRevokedAt?: string;

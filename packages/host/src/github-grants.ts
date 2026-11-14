@@ -1,5 +1,5 @@
 import { createHmac } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import type { Config, Project } from "./types.js";
 import type { TeamAssignment, TeamDelivery } from "./team-types.js";
 
@@ -20,6 +20,8 @@ const REPOSITORY = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9][
 const LABEL = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/;
 
 export class GithubGrantError extends Error {}
+/** A key-file problem; the message is a short lowercase state such as "unreadable". */
+export class GithubGrantKeyError extends GithubGrantError {}
 
 export function validGrantRepository(value: unknown): value is string {
   return typeof value === "string" && REPOSITORY.test(value) && !value.toLowerCase().endsWith(".git");
@@ -71,14 +73,16 @@ export function mintGithubGrant(key: Buffer, claims: Omit<GithubGrantClaims, "ex
 /** The key file holds 32 to 128 random bytes as hex (`openssl rand -hex 32`). */
 export function parseGithubGrantKey(text: string): Buffer {
   const hex = text.trim();
-  if (!/^(?:[0-9a-fA-F]{2}){32,128}$/.test(hex)) throw new GithubGrantError("The grant key file must hold 32 to 128 bytes as hex.");
+  if (!/^(?:[0-9a-fA-F]{2}){32,128}$/.test(hex)) throw new GithubGrantKeyError("invalid (it must hold 32 to 128 bytes as hex)");
   return Buffer.from(hex, "hex");
 }
 
+/** Refuses a key other users could read: anyone holding it can mint grants. */
 export function readGithubGrantKey(path: string): Buffer {
-  let text: string;
-  try { text = readFileSync(path, "utf8"); }
-  catch { throw new GithubGrantError("The grant key file is unreadable."); }
+  let info: ReturnType<typeof statSync>, text: string;
+  try { info = statSync(path); text = readFileSync(path, "utf8"); }
+  catch { throw new GithubGrantKeyError("unreadable"); }
+  if (!info.isFile() || (info.mode & 0o027) !== 0) throw new GithubGrantKeyError("unsafe (writable by its group or open to other users)");
   return parseGithubGrantKey(text);
 }
 
@@ -129,8 +133,9 @@ export function sessionGithubGrant(config: Pick<Config, "autonomy">, scope: Gith
   if (!boundary || !scope) return undefined;
   try {
     return { proxy: boundary.proxyUrl, grant: mintGithubGrant(readGithubGrantKey(boundary.keyPath), { ...scope, sid: sessionId }, nowMs) };
-  } catch {
-    console.warn("A GitHub grant could not be minted; the session starts without GitHub access through the proxy.");
+  } catch (error) {
+    const reason = error instanceof GithubGrantKeyError ? ` (the grant key file is ${error.message})` : "";
+    console.warn(`A GitHub grant could not be minted${reason}; the session starts without GitHub access through the proxy.`);
     return undefined;
   }
 }
@@ -167,7 +172,7 @@ export async function githubProxyDoctorLine(config: Pick<Config, "autonomy">): P
   const boundary = githubBoundary(config);
   if (!boundary) return undefined;
   let key = "readable";
-  try { readGithubGrantKey(boundary.keyPath); } catch { key = "UNREADABLE"; }
+  try { readGithubGrantKey(boundary.keyPath); } catch (error) { key = error instanceof GithubGrantKeyError ? error.message.replace(/^[a-z]+/, (word) => word.toUpperCase()) : "UNREADABLE"; }
   let reachable = "unreachable", cache = "unknown";
   try {
     const response = await fetch(new URL("/health", boundary.proxyUrl), { redirect: "error", signal: AbortSignal.timeout(3000) });

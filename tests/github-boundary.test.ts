@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hostGithubGrantEnvironment, projectGithubRepository, sessionGithubGrant, sessionGithubScope } from "../packages/host/src/github-grants.js";
@@ -43,7 +43,8 @@ test("with the boundary configured, session and host grants verify in the proxy 
   try {
     const key = randomBytes(32);
     const keyPath = join(root, "grant.key");
-    writeFileSync(keyPath, `${key.toString("hex")}\n`, { mode: 0o640 });
+    writeFileSync(keyPath, `${key.toString("hex")}\n`);
+    chmodSync(keyPath, 0o640);
     const config = { autonomy: { boundary: { github: { proxyUrl: "http://127.0.0.1:8417", keyPath } } } };
     const now = Math.floor(Date.now() / 1000);
 
@@ -62,5 +63,10 @@ test("with the boundary configured, session and host grants verify in the proxy 
     assert.equal(hostEnv.INFINITE_GITHUB_PROXY, "http://127.0.0.1:8417");
     assert.equal(hostEnv.GIT_CONFIG_VALUE_0, "https://github.com/");
     assert.equal(teamCommandEnvironment(hostEnv).INFINITE_GITHUB_GRANT, hostEnv.INFINITE_GITHUB_GRANT);
+
+    // A key other users can read mints nothing: anyone holding it could sign their own grants.
+    chmodSync(keyPath, 0o644);
+    assert.equal(sessionGithubGrant(config, sessionGithubScope({ kind: "owner", repository }), "session-10"), undefined);
+    assert.deepEqual(hostGithubGrantEnvironment(config, { sid: "source:p1", repo: repository, ops: ["fetch"] }), {});
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

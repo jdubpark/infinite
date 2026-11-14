@@ -284,7 +284,8 @@ test("a GitHub mission continuation fetches a new ancestor mirror head without m
     git(f.source, "clone", "--bare", f.source, mirror);
     const parentId = randomUUID(), branch = "infinite/team-parent-test";
     const parentWorkspace = join(f.host.config.teams!.workspaceDir, parentId, "integration");
-    mkdirSync(join(f.host.config.teams!.workspaceDir, parentId), { recursive: true });
+    // The host rejects a group-writable team root, so the fixture must not depend on the caller's umask.
+    mkdirSync(join(f.host.config.teams!.workspaceDir, parentId), { recursive: true, mode: 0o700 });
     git(f.source, "clone", "--no-local", "--no-hardlinks", "--", mirror, parentWorkspace);
     git(parentWorkspace, "remote", "remove", "origin");
     git(parentWorkspace, "checkout", "-b", branch, f.base);

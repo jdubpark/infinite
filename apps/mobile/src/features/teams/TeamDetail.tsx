@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from "react";
 import { ActivityIndicator, Alert, Linking, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
-import { api, connectionKey, type Connection, type Me, type SessionRow } from "../../api/client";
+import { api, connectionKey, type Board as BoardData, type BoardItem, type Connection, type Me, type SessionRow } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { useLive } from "../../api/useLive";
 import { Avatar } from "../../components/Avatar";
@@ -26,6 +26,8 @@ import { orderedMembers } from "./summary";
 import { CostLine, RatingControl, RubricLine } from "../cost/parts";
 import { useTaskRating } from "../cost/useCost";
 import { MissionManagedLine } from "../board/MissionManagedLine";
+import { Attempts } from "../board/Attempts";
+import { attemptLabel, attemptsOf, findBoardItem } from "../board/model";
 
 type Tab = "overview" | "tasks" | "agents" | "activity";
 const CHECK_KIND: Record<TeamCheck["status"], StatusKind> = { running: "progress", passed: "done", failed: "blocked", interrupted: "stopped" };
@@ -51,6 +53,8 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   const { data: me } = usePoll(() => api<Me>(connection, "/me"), 10000, [connection]);
   const sessionsPoll = usePoll(() => api<{ sessions: SessionRow[] }>(connection, "/sessions").then(value => value.sessions), 4000, [connection]);
   const sessions = sessionsPoll.data;
+  // Board data only adds attempt context; a failed read leaves the screen as it was.
+  const boardPoll = usePoll(() => api<BoardData>(connection, "/board").then(value => ({ items: value.items, at: Date.now() })).catch(() => ({ items: [] as BoardItem[], at: Date.now() })), 4000, [connection]);
   // A mutation's result shows at once; a poll that started before it cannot undo it.
   const [recorded, setRecorded] = useState<TeamView | null>(null);
   const team = poll.data ? newer(recorded, poll.data) : recorded;
@@ -87,6 +91,17 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   // Which controls the run offers at all; a stale view disables them in place rather than removing them.
   const offered = teamControls(team, me?.role, true);
   const canContinue = canContinueBlockedTeam(team, me?.role);
+  const board = boardPoll.data?.items ?? [];
+  const boardNow = boardPoll.data?.at ?? 0;
+  const boardItem = findBoardItem(board, "team", id);
+  const attempts = boardItem ? attemptsOf(board, boardItem) : [];
+  const attemptChip = boardItem ? attemptLabel(boardItem) : undefined;
+  // A blocked goal or mission run has no owner controls here, but its owner may still cancel it.
+  const cancelOrphan = !owns && offered.cancel && team.status === "blocked";
+  const cancelAlert = (body: string) => Alert.alert("Cancel this team?", body, [
+    { text: "Keep running", style: "cancel" },
+    { text: "Cancel team", style: "destructive", onPress: () => send("/cancel", "Cancellation") },
+  ]);
   const continuationEligible = team.status === "blocked" && team.continuable === true && !team.goal && !team.missionId && !team.deliveryReceipt && !team.pullRequest;
   const locked = request.busy || Boolean(request.pending);
   const decisions: TeamDecision[] = team.missionId ? [] : openDecisions(team);
@@ -170,6 +185,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
         <Text style={t.title} numberOfLines={3}>{team.title}</Text>
         <View style={s.chips}>
           <Chip kind={kind} fraction={fraction} label={TEAM_LABELS[team.status]} tone={kind === "attention" || kind === "paused" ? "attention" : kind === "blocked" ? "error" : undefined} accessibilityLabel={`State: ${TEAM_LABELS[team.status]}`} />
+          {attemptChip ? <Chip label={attemptChip} /> : null}
                     <Chip icon={<Avatar label={lead?.label ?? providerName(team.provider)} provider={lead?.provider ?? team.provider} size={16} />} label={lead?.label ?? providerName(team.provider)} accessibilityLabel={`Lead: ${lead?.label ?? providerName(team.provider)}`} />
           <LinearChip tracking={team.linear} fresh={fresh} />
         </View>
@@ -208,10 +224,13 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
               { text: "Keep running", style: "cancel" },
               { text: "Cancel team", style: "destructive", onPress: () => send("/cancel", "Cancellation") },
             ])} />
-          </View> : team.goal ? <View style={s.controls}>
-            <Button compact secondary glyph="target" title={`Goal cycle ${team.goal.cycle}`} onPress={() => router.push({ pathname: "/goal/[id]", params: { id: team.goal!.id, machine } })} />
-                      </View> : null}
+          </View> : team.goal || cancelOrphan ? <View style={s.controls}>
+            {team.goal ? <Button compact secondary glyph="target" title={`Goal cycle ${team.goal.cycle}`} onPress={() => router.push({ pathname: "/goal/[id]", params: { id: team.goal!.id, machine } })} /> : null}
+            {cancelOrphan ? <Button compact secondary glyph="close" title="Cancel…" busy={Boolean(request.pending?.label === "Cancellation" && request.busy)} disabled={!controls.cancel || locked}
+              onPress={() => cancelAlert("Stops this blocked run. Work and evidence stay. A run still controlled by a live goal or mission cannot be cancelled here.")} /> : null}
+          </View> : null}
         </Card>
+        {attempts.length ? <View style={s.gapTop}><Attempts attempts={attempts} current={id} machine={machine} now={boardNow} /></View> : null}
         {canContinue ? <Card style={s.gapTop}>
           <Text style={t.strong}>Continue this blocked run</Text>
           <Text style={t.note}>A fresh plan preserves the current work, linked issue, policies, and evidence. Required checks still apply. If delivery is uncertain, retry the same request instead of starting another.</Text>

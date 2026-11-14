@@ -63,6 +63,8 @@ export interface ProductGoal extends Omit<CreateGoal, "requestId"> {
   status: GoalStatus;
   /** Structured budget stop reason; absent on legacy goals until migrated or stopped. */
   stopReason?: "deadline" | "member-limit";
+  /** When the goal entered its current blocked period; a record from before this field takes its last save time. */
+  blockedAt?: string;
   /** A deadline-stopped child should be replaced after an owner extends the goal. */
   deadlineContinuation?: boolean;
   reason?: string;

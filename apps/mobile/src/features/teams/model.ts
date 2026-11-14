@@ -292,12 +292,14 @@ export function teamControls(team: TeamView, role: DeviceRole | undefined, fresh
   const owns = fresh && role === "owner" && !team.goal && !managed && team.status !== "cancelled";
   const deliveryStarted = team.status === "delivering" || team.status === "merged" || Boolean(team.deliveryReceipt);
   const deliveryReported = team.status === "merged" || Boolean(team.deliveryReceipt);
+  // A blocked goal or mission run may be cancelled from here; the host refuses while its owner is live.
+  const orphanBlocked = fresh && role === "owner" && team.status === "blocked" && Boolean(team.goal || managed);
   return {
     answer: acts && !managed && !["paused", "cancelled"].includes(team.status),
     steer: acts && !managed && !team.goal && team.status !== "cancelled" && !deliveryStarted && !canContinueBlockedTeam(team, "owner"),
     pause: owns && !deliveryReported && !["paused", "blocked", "ready-for-review", "no-change", "merged"].includes(team.status),
     resume: owns && (team.status === "paused" || team.resumable === true) && !deliveryReported && !canContinueBlockedTeam(team, "owner"),
-    cancel: owns,
+    cancel: owns || orphanBlocked,
   };
 }
 

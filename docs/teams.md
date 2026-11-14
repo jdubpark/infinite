@@ -385,11 +385,19 @@ directory.
 Removal also waits for head publication; see [Head publication](#head-publication).
 
 The run record, events, reports, and receipts remain after merged, no-change,
-ready-for-review, and blocked workspaces are removed. Cancelled runs are deleted
-whole after their settle window. Started and completed removals are recorded as
-host events, and a failed removal is retried on later scheduler ticks. A blocked run whose workspace
-was removed cannot resume, continue, or be steered; pause and cancel remain
-available. `DELETE /api/teams/:id` and `infinite team delete ID` remove a settled
+ready-for-review, and blocked workspaces are removed. After a blocked run's
+workspace removal completes, the host closes it as `cancelled` with the last
+blocker in its reason; it does not claim the work is complete. Its record then
+uses the normal `cancelledMinutes` retention. The outcome ledger keeps the run
+as blocked: the close writes no second settled event. A blocked run that
+still holds an unresolved operation from an interrupted restart keeps its
+workspaces and is not closed automatically: the host cannot see a process
+orphaned by an earlier API process, so elapsed time does not prove the operation
+ended. The owner cancels or reconciles such a run. Started and completed removals are
+recorded as host events, and a failed removal is retried on later scheduler
+ticks. A blocked run whose workspace is being removed cannot resume, continue,
+or be steered. An owner can cancel a blocked run directly after its goal or
+mission is no longer active. `DELETE /api/teams/:id` and `infinite team delete ID` remove a settled
 cancelled, merged, or no-change run (clones and record) immediately. A live
 goal, mission, or handoff that still uses the run as its source receives
 `team-retained`; `team-in-use` means another run has a pending preparation that
@@ -759,6 +767,15 @@ read the same records. Direct steering and lifecycle actions on a goal-owned
 team are refused; use its goal so the scheduler retains control of the sequence.
 Questions remain answerable while that team is the active cycle of a running
 goal. A paused goal must resume before work or answers can continue.
+
+A blocked goal closes as `cancelled` after `teams.retention.blockedHours` (72
+hours by default) without owner action. The host records the last blocker in its
+reason and does not claim completion. The blocked period is saved independently
+of `updatedAt`, so ordinary saves do not restart the window. A goal that was
+already blocked when the host began recording this starts its period at its last
+save. Paused,
+ready-for-review, no-opportunity, limit-reached, and achieved goals do not expire
+under this rule.
 
 A reviewed cycle supplies the next cycle's source commit. The host checks that
 the earlier workspace still matches that recorded head before cloning it.

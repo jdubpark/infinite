@@ -223,16 +223,25 @@ button.sw-glass { font: inherit; color: inherit; }
 .sw-inspector-empty {
   color: var(--sw-ink-3);
 }
+/* A fact is a block, so a long one ends in an ellipsis. As a flex box it was cut mid-word with none. */
 .sw-inspector-fact {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
+  flex: 0 1 auto;
+  min-width: 3ch;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .sw-inspector-fact small { color: var(--sw-ink-3); }
+.sw-inspector-fact > small,
+.sw-inspector-fact > .sw-mark { margin-right: 6px; }
+.sw-inspector-fact > .sw-mark { display: inline-block; vertical-align: -2px; }
+/* Short facts keep their width; the state, task, title and path give way first. */
+.sw-inspector-fact.sw-fixed {
+  flex: none;
+  min-width: 0;
+  overflow: visible;
+}
 .sw-inspector-links {
+  flex: none;
   margin-left: auto;
   display: inline-flex;
   gap: 4px;

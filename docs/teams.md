@@ -1729,8 +1729,14 @@ earlier member still running, its repository-relative `files` with `reads`,
 and `truncated` flags. `GET /api/sessions/:id/context` returns the same shape
 for one session. These are observed tool inputs: they show what an agent's
 tools were pointed at, not that the agent used the content, and an observed
-edit is not a landed change. Only Claude Code and Codex record tool inputs;
-other providers answer `observable: false`. The index is in memory, bounded,
+edit is not a landed change. A session answers `observable: false` until the
+index has read a tool input that a provider hook recorded for it; with
+`complete: false` the index may still find one. That covers a provider whose
+hooks are off, a session started with native arguments or in the native UI,
+and a session before its first tool call. A session also answers
+`observable: false` when its provider is neither Claude Code nor Codex, when
+it has no host journal, and when its journal cannot be read. The index is in
+memory, bounded,
 and rebuilt on demand after a restart. `complete: false` means the index is
 still catching up, or is full of sessions being read and will admit this one
 on a later request. See [Swarm view](swarm.md).

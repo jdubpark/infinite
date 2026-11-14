@@ -36,6 +36,45 @@ test("swarm context endpoints answer every role and refuse unknown projects, ses
   } finally { await host.stop(); }
 });
 
+/** Waits until the scripted agent has made all its tool calls: it prints "touched" after the last one. */
+async function touched(host: { fetchApi: (path: string, role?: string) => Promise<{ body: unknown }> }, sessionId: string) {
+  await waitFor(async () => {
+    const page = (await host.fetchApi(`/sessions/${sessionId}/events?types=output`)).body as { events?: { data: { text?: string } }[] };
+    return (page.events ?? []).map(event => String(event.data.text ?? "")).join("");
+  }, text => text.includes("touched"), 15000);
+}
+
+test("a codex agent whose hooks are off is not observable, even when its command records reads", { timeout: 60000 }, async () => {
+  // Codex hooks are off by default, so the host records no tool inputs for it and must not answer as observed.
+  const agent = { command: process.execPath, args: [fileURLToPath(new URL("./fixtures/touch-agent.mjs", import.meta.url))] };
+  const host = await startHost({ agents: { codex: agent } });
+  try {
+    const sessionId = randomUUID();
+    await host.fetchApi("/sessions", "owner", { requestId: sessionId, provider: "codex", projectId: "rehearsal", title: "Codex", prompt: "touch" });
+    await waitFor(async () => (await host.fetchApi(`/sessions/${sessionId}`)).status, status => status === 200);
+    // The agent prints this line after its tool calls, whether or not a hook listener took them.
+    await touched(host, sessionId);
+    const touches = await host.fetchApi(`/sessions/${sessionId}/context`, "viewer");
+    assert.equal(touches.status, 200);
+    assert.deepEqual(touches.body, { sessionId, observable: false, complete: true, graphQueries: 0, files: [], truncated: false });
+  } finally { await host.stop(); }
+});
+
+test("a session started with native arguments is not observable even when its provider hooks are on", { timeout: 60000 }, async () => {
+  const agent = { command: process.execPath, args: [fileURLToPath(new URL("./fixtures/touch-agent.mjs", import.meta.url))] };
+  const host = await startHost({ agents: { claude: agent }, config: { attention: { idleAfterMs: 3000, hooks: { claude: true, codex: true } } } });
+  try {
+    const sessionId = randomUUID();
+    await host.fetchApi("/sessions", "owner", { requestId: sessionId, provider: "claude", projectId: "rehearsal", title: "Native args", prompt: "touch", nativeArgs: ["initial prompt"] });
+    await waitFor(async () => (await host.fetchApi(`/sessions/${sessionId}`)).status, status => status === 200);
+    // The agent prints this line after its tool calls, whether or not a hook listener took them.
+    await touched(host, sessionId);
+    const touches = await host.fetchApi(`/sessions/${sessionId}/context`, "viewer");
+    assert.equal(touches.status, 200);
+    assert.deepEqual(touches.body, { sessionId, observable: false, complete: true, graphQueries: 0, files: [], truncated: false });
+  } finally { await host.stop(); }
+});
+
 test("an agent's recorded tool inputs come back as its touched files", { timeout: 60000 }, async () => {
   const agent = { command: process.execPath, args: [fileURLToPath(new URL("./fixtures/touch-agent.mjs", import.meta.url))] };
   const host = await startHost({ agents: { claude: agent }, config: { attention: { idleAfterMs: 3000, hooks: { claude: true, codex: true } } } });

@@ -4,6 +4,10 @@ import { setImmediate as yieldMacrotask } from "node:timers/promises";
 export type FileTouch = { path: string; reads: number; edits: number; lastAt: string };
 export type SessionTouches = {
   sessionId: string;
+  /**
+   * False until the host has read a tool input that a provider hook recorded for this session, or one that named
+   * a path. With `complete: false` the index may still find one. A gap in sight, not a fact about the agent.
+   */
   observable: boolean;
   complete: boolean;
   graphQueries: number;
@@ -17,7 +21,8 @@ export type TouchPage = {
   more: boolean;
 };
 
-const OBSERVABLE_PROVIDERS = new Set(["claude", "codex"]);
+/** Providers whose tool inputs can be extracted. */
+const EXTRACTABLE_PROVIDERS = new Set(["claude", "codex"]);
 const FILE_TOOLS: Record<string, { field: string; kind: "reads" | "edits" }> = {
   Read: { field: "file_path", kind: "reads" },
   Edit: { field: "file_path", kind: "edits" },
@@ -40,6 +45,12 @@ const TRUNCATED_ANYWHERE = / … \[\+\d+ chars\]/;
 interface FileState { reads: number; edits: number; lastAt: string; seq: number }
 interface SessionState {
   cursor: number;
+  /**
+   * The index has read a tool input that a provider hook recorded, or one that named a path. Nothing else proves
+   * the host can see this session's tools: launch settings can differ from the current configuration, the native
+   * protocol and the notify route send turn signals without a tool input, and a headless run line carries an empty one.
+   */
+  signalled: boolean;
   files: Map<string, FileState>;
   graphQueries: number;
   complete: boolean;
@@ -65,6 +76,8 @@ function repoPath(raw: unknown, cwd: string): string | undefined {
   const rel = posix.isAbsolute(raw) ? posix.relative(root, posix.normalize(raw)) : posix.normalize(raw);
   if (rel === "" || rel === "." || rel === ".." || rel.startsWith("../") || posix.isAbsolute(rel)) return undefined;
   if (rel.includes("\0")) return undefined;
+  // A Git directory, including a nested repository's, holds Git state and host files, never repository content.
+  if (rel.split("/").includes(".git")) return undefined;
   return rel;
 }
 
@@ -180,13 +193,14 @@ export class ContextTouches {
   }
 
   async session(source: TouchSource): Promise<SessionTouches> {
-    if (!OBSERVABLE_PROVIDERS.has(source.provider)) {
+    if (!EXTRACTABLE_PROVIDERS.has(source.provider)) {
       return { sessionId: source.sessionId, observable: false, complete: true, graphQueries: 0, files: [], truncated: false };
     }
     const state = this.stateFor(source.sessionId);
     // The index is full of sessions that are still being read. Nothing is allocated for this one;
     // it is told to come back, which keeps both the index and the wait queue within the bound.
-    if (!state) return { sessionId: source.sessionId, observable: true, complete: false, graphQueries: 0, files: [], truncated: false };
+    // Nothing was read, so nothing is known: that is a gap, not an observed agent with no files.
+    if (!state) return { sessionId: source.sessionId, observable: false, complete: false, graphQueries: 0, files: [], truncated: false };
     state.lastUsed = ++this.clock;
     state.inflight ??= this.advanceInTurn(state, source).finally(() => { state.inflight = undefined; });
     await state.inflight;
@@ -223,7 +237,7 @@ export class ContextTouches {
       this.sessions.delete(victim[0]);
     }
     const created: SessionState = {
-      cursor: 0, files: new Map(), graphQueries: 0, complete: false, truncated: false, lastUsed: 0,
+      cursor: 0, signalled: false, files: new Map(), graphQueries: 0, complete: false, truncated: false, lastUsed: 0,
     };
     this.sessions.set(sessionId, created);
     return created;
@@ -250,6 +264,7 @@ export class ContextTouches {
       const { tool, input } = event.data;
       if (typeof tool !== "string") continue;
       const found = extractTouches(tool, isRecord(input) ? input : {}, source.cwd, inArea);
+      if (event.data.source === "hook" || found.graphQuery || found.reads.length > 0 || found.edits.length > 0) state.signalled = true;
       if (found.graphQuery) state.graphQueries++;
       for (const path of found.reads) this.touch(state, path, "reads", event);
       for (const path of found.edits) this.touch(state, path, "edits", event);
@@ -290,7 +305,8 @@ export class ContextTouches {
       .map(([path, file]) => ({ path, reads: file.reads, edits: file.edits, lastAt: file.lastAt }));
     return {
       sessionId,
-      observable: true,
+      // Before the first recorded input is read the answer is not known. The view draws that as a gap.
+      observable: state.signalled,
       complete: state.complete,
       graphQueries: state.graphQueries,
       files,

@@ -2,6 +2,9 @@
 // teams, quiet runs, and two solo sessions. Every name, path, and ID here is a placeholder.
 import type { CodeMap, SessionTouches, SwarmMember, SwarmMission, SwarmSession, SwarmTask, SwarmTeam, TeamStatus, TeamTouches } from "../../apps/web/src/swarm/types";
 
+/** A tool name as a provider reports it: an MCP tool keeps its server and tool names, so it runs long. */
+export const LONG_TOOL = "mcp__repository_documentation__search_architecture_and_implementation_references";
+
 type AttentionState = "working" | "needs-you" | "turn-finished" | "idle" | "exited" | "unavailable" | "recording-error";
 type MemberSpec = { role: string; status: string; attention?: AttentionState; profile?: "opus" | "sonnet" | "haiku" | "luna" | "flash"; tool?: string; task?: string; prompt?: "permission" | "question"; revision?: number; cost?: number };
 

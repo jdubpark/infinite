@@ -19,6 +19,10 @@ One model feeds three views. Switching between them does not refetch.
 | Wall | `#/swarm/wall` | One fixed-size tile per agent: role, model, state, activity, tool in flight, cost. |
 | Graph | `#/swarm/graph` | Every live swarm beside the code areas its agents touched, with links between them. |
 
+Cost counts measured usage only. A cost ends in `+` when some agents of that
+run, mission, or the solo group have no usage data, and a dash replaces it when
+no measured usage gives a figure.
+
 Controls float above the canvas as glass: the vitals strip, the view switch,
 the focus toggle, the legend, and the inspector. The `f` key hides the sidebar
 for wallboard use. Escape clears the selection.
@@ -92,9 +96,19 @@ and never merged.
 
 Observed tool inputs show what an agent's tools were pointed at. They do not
 show that the agent understood or used the content, and an observed edit is
-not a landed change. Only Claude Code and Codex record tool inputs; agents of
-other providers are marked `no signal` and keep their planned and integrated
-links.
+not a landed change.
+
+An agent has `no signal` until the host has read a tool input that a provider
+hook recorded for its session. The legend counts those agents. Each one says
+so on hover, and its role is underlined with dots; a mission coordinator has
+no role label, so it shows this on hover only. That is the case when the
+provider's hooks are off (Codex hooks are off by default), when the session
+was started with native arguments or in the native UI, before the agent's
+first tool call, while the host is still reading a long journal, when the
+session has no host journal or its journal cannot be read, and until the page
+has an answer from the host. Agents of providers other than Claude Code and
+Codex always have no signal. The mark describes what the host has seen, not
+what the agent did, and such an agent keeps its planned and integrated links.
 
 The code map comes from the repository graph checkpoints described in
 [repository graphs](repository-graphs.md). The view reads each project's

@@ -5,14 +5,14 @@ import { createRoot } from "react-dom/client";
 import { ApiContext, ApiError, type Api, type Me } from "../../apps/web/src/api";
 import { SwarmView, type SwarmViewName } from "../../apps/web/src/swarm/SwarmView";
 import type { SwarmSession, SwarmTeam } from "../../apps/web/src/swarm/types";
-import { swarmFixture, type SwarmFixture } from "./web-swarm-data";
+import { LONG_TOOL, swarmFixture, type SwarmFixture } from "./web-swarm-data";
 
-type Variant = { shuffleUpdated: boolean; flipState: boolean; idle: boolean };
+type Variant = { shuffleUpdated: boolean; flipState: boolean; idle: boolean; longTool: boolean };
 const control = {
   requests: [] as string[],
   /** `off` answers the context paths with 404, as a host that predates them does. */
   context: (new URLSearchParams(window.location.search).get("context") === "off" ? "off" : "on") as "on" | "off",
-  variant: { shuffleUpdated: false, flipState: false, idle: false } as Variant,
+  variant: { shuffleUpdated: false, flipState: false, idle: false, longTool: false } as Variant,
   /** Requests whose path matches fail with a server error until this is cleared. */
   failing: null as RegExp | null,
   view: (_view: SwarmViewName) => {},
@@ -38,6 +38,11 @@ function fixture(): SwarmFixture {
     // One working agent finishes its turn: a state change with no change to who exists.
     const working = base.sessions.find(session => session.attention?.state === "working" && session.title.includes("implementer"));
     if (working?.attention) working.attention = { ...working.attention, state: "turn-finished", lastTool: undefined };
+  }
+  if (control.variant.longTool) {
+    // One working agent is in a tool whose name is long, as an MCP tool's is.
+    const working = base.sessions.find(session => session.attention?.state === "working" && session.title.includes("implementer"));
+    if (working?.attention) working.attention = { ...working.attention, lastTool: { tool: LONG_TOOL, summary: LONG_TOOL, at: new Date(NOW - 4_000).toISOString() } };
   }
   return base;
 }

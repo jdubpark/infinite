@@ -1,5 +1,5 @@
 import { RoleChip, StateMark, agentName } from "./marks";
-import { elapsed, shortModel, usd } from "./format";
+import { cost, elapsed, shortModel, usd } from "./format";
 import { allAgents } from "./model";
 import { agentTitle, stateWords } from "./Lanes";
 import { AGENT_STATES, type ActivityStore, type Agent, type Selection, type Swarm, type ViewProps } from "./types";
@@ -55,12 +55,13 @@ function WallSwarm({ swarm, ...props }: ViewProps & { swarm: Swarm }) {
     if (agents.length > 0) sections.push({ key: unit.id, label: swarm.kind === "mission" ? unit.title : "", agents });
   }
   const agentCount = allAgents(swarm).length;
+  const spend = cost(swarm.costUsd, swarm.unmeasured);
   return <section className="sw-wall-swarm" aria-label={swarm.title}>
     <header className="sw-swarm-head">
       <span className="sw-title">{swarm.title}</span>
       <span className="sw-spacer" />
       <span className="sw-count sw-dim">{plural(agentCount, "agent")}</span>
-      <span className="sw-cost sw-num">{usd(swarm.costUsd)}</span>
+      <span className="sw-cost sw-num" title={spend.title}>{spend.text}</span>
     </header>
     <div className="sw-wall-sections">{sections.map(section => <div key={section.key} className="sw-wall-section">
       {swarm.kind === "mission" && <div className="sw-wall-unit sw-dim">{section.label}</div>}

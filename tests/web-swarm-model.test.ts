@@ -324,3 +324,37 @@ test("activity", () => {
   const later = bucketStart + 31 * ACTIVITY_BUCKET_MS;
   assert.deepEqual(activity.buckets("a", later), new Array(ACTIVITY_BUCKETS).fill(0));
 });
+
+test("unmeasured agent counts reach every cost, and costs stay as measured", () => {
+  const rollup = (cost: number, unmeasuredMembers?: number) => ({ total: { cost }, ...(unmeasuredMembers === undefined ? {} : { unmeasuredMembers }) });
+  const model = buildSwarm(input({
+    sessions: [session("s-solo-a", { usage: { cost: 0.4 } }), session("s-solo-b")],
+    teams: [
+      team("zero-run", { members: [member("z", { sessionId: "s-z" })], usage: rollup(0, 6) }),
+      team("mixed-run", { members: [member("x", { sessionId: "s-x" })], usage: rollup(1.5, 2) }),
+      team("mc-1", { missionId: "m-counted", members: [member("mc", { sessionId: "s-mc" })], usage: rollup(0, 1) }),
+      team("ms-1", { missionId: "m-summed", members: [member("ms", { sessionId: "s-ms" })], usage: rollup(0.5, 4) }),
+    ],
+    missions: [
+      mission("m-counted", { subtasks: [{ id: "st-1", repoProjectId: "api", title: "one", dependsOn: [], status: "running", teamId: "mc-1" }], usage: rollup(2, 3) }),
+      mission("m-summed", { subtasks: [{ id: "st-2", repoProjectId: "api", title: "two", dependsOn: [], status: "running", teamId: "ms-1" }] }),
+    ],
+  }));
+  const swarm = (id: string) => model.live.find(item => item.id === id);
+
+  assert.equal(findUnit(model, "zero-run")?.costUsd, 0);
+  assert.equal(findUnit(model, "zero-run")?.unmeasured, 6);
+  assert.equal(swarm("zero-run")?.unmeasured, 6);
+  assert.equal(swarm("mixed-run")?.costUsd, 1.5);
+  assert.equal(swarm("mixed-run")?.unmeasured, 2);
+  // A mission's own count wins; without one it sums its units.
+  assert.equal(swarm("m-counted")?.costUsd, 2);
+  assert.equal(swarm("m-counted")?.unmeasured, 3);
+  assert.equal(swarm("m-summed")?.unmeasured, 4);
+  // The solo group counts the solo sessions that have no usage.
+  assert.equal(swarm("solo")?.costUsd, 0.4);
+  assert.equal(swarm("solo")?.unmeasured, 1);
+  // Totals sum live swarms and leave the cost sum as it was: m-summed has no mission usage, so it adds nothing.
+  assert.equal(model.totals.costUsd, 0 + 1.5 + 2 + 0.4);
+  assert.equal(model.totals.unmeasured, 6 + 2 + 3 + 4 + 1);
+});

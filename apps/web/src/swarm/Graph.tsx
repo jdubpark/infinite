@@ -138,7 +138,7 @@ export function Graph({ model, selection, onSelect, openSession, contextAvailabl
               const dim = focus !== null && !focus.nodes.has(node.id);
               const selected = isSelected(node);
               const agent = node.agentId ? agents.get(node.agentId) : undefined;
-              const label = node.kind === "agent" && agent ? agentName(agent)
+              const label = node.kind === "agent" && agent ? `${agentName(agent)}${node.unobserved ? ", no signal" : ""}`
                 : node.kind === "area" ? (node.touched ? `Code area ${node.path}, touched by ${node.heat ?? 0} agents` : `Neighbouring code area ${node.path}`)
                   : node.kind === "mission" ? `Mission ${node.label}` : `Unit ${node.label}`;
               const state: AgentState = agent?.state ?? "queued";
@@ -160,7 +160,7 @@ export function Graph({ model, selection, onSelect, openSession, contextAvailabl
                   {selected && <circle className="sw-g-halo" r={11} />}
                   {/* A wide hit area, so the small mark is easy to pick. */}
                   <rect x={-34} y={-GRID.rowAgent / 2} width={48} height={GRID.rowAgent} fill="transparent" />
-                  {agent.role !== "MC" && <text className="sw-g-role" x={-13} y={3.5} textAnchor="end">{agent.role}</text>}
+                  {agent.role !== "MC" && <text className={`sw-g-role${node.unobserved ? " sw-g-nosignal" : ""}`} x={-13} y={3.5} textAnchor="end">{agent.role}</text>}
                   <g transform="translate(-7,-7)"><StateMark state={state} size={14} pulse={state === "working"} title={label} /></g>
                 </>}
                 {node.kind === "unit" && <>

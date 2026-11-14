@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { chromium, type Browser, type Page } from "playwright";
+import { LONG_TOOL } from "./fixtures/web-swarm-data";
 
 // Runs the web client's Swarm view in Chromium on a stand-in host: one mission with three subteams in two projects,
 // two standalone teams, quiet runs, and two solo sessions.
@@ -13,7 +14,7 @@ const skip = existsSync(executablePath) ? false : "Chromium for Playwright is no
 const harness = fileURLToPath(new URL("./fixtures/web-swarm-harness.tsx", import.meta.url));
 const ORIGIN = "http://127.0.0.1/swarm";
 
-type Control = { requests: string[]; view(view: "lanes" | "wall" | "graph"): void; poll(variant: { shuffleUpdated?: boolean; flipState?: boolean; idle?: boolean }): void };
+type Control = { requests: string[]; view(view: "lanes" | "wall" | "graph"): void; poll(variant: { shuffleUpdated?: boolean; flipState?: boolean; idle?: boolean; longTool?: boolean }): void };
 // Page-side code reaches the harness through `window.swarm`; functions passed to the page cannot close over test helpers.
 
 describe("web swarm view", { skip }, () => {
@@ -68,6 +69,19 @@ describe("web swarm view", { skip }, () => {
       assert.ok(await count(page, "path.sw-g-read") > 0, "observed reads are drawn");
       assert.ok(await count(page, "path.sw-g-integrated") > 0, "integrated changes are drawn");
       assert.ok(await count(page, "path.sw-g-code") > 0, "code links are drawn");
+      // The legend counts the agents without a signal, and each of them says so: in its label, and under its role when it has one.
+      const marked = await page.evaluate(() => {
+        const labelled = [...document.querySelectorAll('[data-node^="agent:"]')].filter(node => (node.getAttribute("aria-label") ?? "").endsWith(", no signal"));
+        return {
+          labelled: labelled.length, withRole: labelled.filter(node => node.querySelector(".sw-g-role")).length,
+          underlined: labelled.filter(node => node.querySelector(".sw-g-nosignal")).length, allUnderlined: document.querySelectorAll(".sw-g-nosignal").length,
+          flag: [...document.querySelectorAll(".sw-graph-flag")].map(node => node.textContent ?? "").find(text => text.endsWith("no signal")),
+        };
+      });
+      assert.ok(marked.labelled >= 1, "the fixture has agents of a provider without tool inputs");
+      assert.equal(marked.flag, `${marked.labelled} no signal`);
+      assert.equal(marked.underlined, marked.withRole);
+      assert.equal(marked.allUnderlined, marked.underlined, "no observed agent is underlined");
       const sent = await requests(page);
       assert.ok(sent.some(path => path === "/projects/shop-api/graph/map"));
       assert.ok(sent.some(path => /^\/teams\/[0-9a-f-]+\/context$/.test(path)));
@@ -87,6 +101,63 @@ describe("web swarm view", { skip }, () => {
       await show(page, "wall", ".sw-wall .sw-none-live");
       await show(page, "graph", ".sw-graph-empty");
       assert.equal(await count(page, ".sw-graph-flag"), 0, "with no project drawn the legend flags nothing");
+    } finally { await page.close(); }
+  });
+
+  test("the inspector ends a long fact in an ellipsis and keeps short facts whole", async () => {
+    const page = await open();
+    try {
+      await show(page, "wall", ".sw-tile");
+      // A narrow window leaves the inspector too little room for every fact.
+      await page.setViewportSize({ width: 1120, height: 800 });
+      await page.click(".sw-tile:has(.sw-mark-reported)");
+      await page.waitForSelector(".sw-inspector .sw-inspector-fact");
+      const facts = await page.evaluate(() => {
+        const inspector = document.querySelector(".sw-inspector")!.getBoundingClientRect();
+        return [...document.querySelectorAll(".sw-inspector .sw-inspector-fact")].map(node => ({
+          fixed: node.classList.contains("sw-fixed"), display: getComputedStyle(node).display, overflow: getComputedStyle(node).textOverflow,
+          cut: node.scrollWidth > node.clientWidth + 1, inside: node.getBoundingClientRect().right <= inspector.right + 1,
+        }));
+      });
+      const short = facts.filter(fact => fact.fixed), long = facts.filter(fact => !fact.fixed);
+      assert.ok(short.length >= 2 && long.length >= 1, "the role and model are short facts; the state is a long one");
+      assert.ok(short.every(fact => !fact.cut && fact.inside), "a short fact is never cut");
+      // Only a block box draws the ellipsis; a flex box cuts its text mid-word.
+      assert.ok(long.every(fact => fact.display === "block" && fact.overflow === "ellipsis"), "a long fact ends in an ellipsis");
+      const links = await page.evaluate(() => {
+        const inspector = document.querySelector(".sw-inspector")!.getBoundingClientRect();
+        return [...document.querySelectorAll(".sw-inspector-links button")].every(button => button.getBoundingClientRect().right <= inspector.right + 1);
+      });
+      assert.ok(links, "the links to the session and team stay inside the inspector");
+    } finally { await page.close(); }
+  });
+
+  test("a long tool name shrinks in the inspector and the links stay inside it", async () => {
+    const page = await open();
+    try {
+      await page.evaluate(() => (window as unknown as { swarm: Control }).swarm.poll({ longTool: true }));
+      await show(page, "wall", ".sw-tile");
+      await page.locator(".sw-tile", { hasText: LONG_TOOL }).click();
+      await page.waitForSelector(".sw-inspector .sw-inspector-fact");
+      // The compact layout gives the inspector a row of its own; the narrower window leaves it the least room.
+      for (const width of [1000, 720]) {
+        await page.setViewportSize({ width, height: 700 });
+        const measured = await page.evaluate(longTool => {
+          const inspector = document.querySelector<HTMLElement>(".sw-inspector")!;
+          const tool = [...inspector.querySelectorAll<HTMLElement>(".sw-inspector-fact")].find(node => node.textContent === longTool);
+          return {
+            inspectorRight: Math.round(inspector.getBoundingClientRect().right), overflow: inspector.scrollWidth - inspector.clientWidth,
+            toolFound: tool !== undefined, toolFixed: tool?.classList.contains("sw-fixed") ?? null,
+            links: [...inspector.querySelectorAll<HTMLElement>(".sw-inspector-links button")].map(button => ({ text: button.textContent, right: Math.round(button.getBoundingClientRect().right) })),
+          };
+        }, LONG_TOOL);
+        const seen = `at ${width}px: ${JSON.stringify(measured)}`;
+        assert.ok(measured.toolFound, `the tool fact is in the inspector ${seen}`);
+        assert.equal(measured.toolFixed, false, `the tool fact may shrink ${seen}`);
+        assert.ok(measured.links.length >= 1, `the agent has links to show ${seen}`);
+        assert.ok(measured.overflow <= 1, `nothing overflows the inspector ${seen}`);
+        assert.ok(measured.links.every(link => link.right <= measured.inspectorRight + 1), `every link stays inside the inspector ${seen}`);
+      }
     } finally { await page.close(); }
   });
 

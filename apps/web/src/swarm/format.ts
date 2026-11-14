@@ -7,6 +7,16 @@ export function usd(value: number | undefined): string {
   return `$${value.toFixed(2)}`;
 }
 
+/**
+ * A cost with the count of agents it leaves out. Unmeasured agents are never counted as $0: a measured
+ * amount gains a `+`, and no measured amount becomes a dash.
+ */
+export function cost(value: number | undefined, unmeasured: number): { text: string; title?: string } {
+  if (unmeasured <= 0) return { text: usd(value) };
+  if (value) return { text: `${usd(value)}+`, title: `${unmeasured} ${unmeasured === 1 ? "agent" : "agents"} not measured` };
+  return { text: "—", title: "cost not measured" };
+}
+
 /** Elapsed time since an ISO instant: 42s, 3m, 2h, 4d. Empty when the instant is unknown. */
 export function elapsed(iso: string | undefined, now: number): string {
   if (!iso) return "";

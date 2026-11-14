@@ -99,6 +99,11 @@
   font-size: 9.5px;
   letter-spacing: 0.06em;
 }
+/* An agent the host has no tool-input signal for: the legend counts them, and the role says which. */
+.sw-g-nosignal {
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
 .sw-g-heading {
   fill: var(--sw-ink-3);
   font-family: var(--sw-mono);

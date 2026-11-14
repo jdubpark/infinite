@@ -113,6 +113,20 @@ describe("swarm graph model", () => {
     assert.equal(data.links.filter(link => link.kind === "code").length, 0);
   });
 
+  test("an agent the host has not answered for yet is a gap, not an observed agent", () => {
+    const waiting = agent("a1"), answered = agent("a2");
+    const u = unit("unit-1", { agents: [waiting, answered], tasks: [task("t1", "a1", ["packages/host/src/a.ts"])] });
+    const data = build({
+      model: model([team("run-1", [u])]),
+      touches: { "s-a2": touches("s-a2", [{ path: "apps/web/src/b.ts", reads: 1, edits: 0, lastAt: "2026-11-13T09:01:00.000Z" }]) },
+    });
+    assert.equal(data.unobserved, 1);
+    assert.equal(data.nodes.find(node => node.agentId === "a1")?.unobserved, true);
+    assert.equal(data.nodes.find(node => node.agentId === "a2")?.unobserved, undefined);
+    assert.ok(data.links.some(link => link.kind === "planned"), "its planned links stay");
+    assert.equal(data.links.filter(link => link.kind === "read").length, 1);
+  });
+
   test("unobservable agent", () => {
     const member = agent("a1", { observable: false });
     const u = unit("unit-1", { agents: [member], tasks: [task("t1", "a1", ["packages/host/src/a.ts"], ["packages/host/src/a.ts"])] });
@@ -121,6 +135,7 @@ describe("swarm graph model", () => {
       touches: { "s-a1": touches("s-a1", [{ path: "packages/host/src/a.ts", reads: 3, edits: 2, lastAt: "2026-11-13T09:01:00.000Z" }]) },
     });
     assert.equal(data.unobserved, 1);
+    assert.equal(data.nodes.find(node => node.agentId === "a1")?.unobserved, true, "the node says which agent has no signal");
     assert.equal(data.links.filter(link => link.kind === "read" || link.kind === "edit").length, 0);
     assert.ok(data.links.some(link => link.kind === "planned"));
     assert.ok(data.links.some(link => link.kind === "integrated"));

@@ -197,6 +197,7 @@ function buildUnit(args: {
     dependsOn,
     waiting,
     costUsd: team.usage?.total.cost,
+    unmeasured: team.usage?.unmeasuredMembers ?? 0,
     goalCycle: team.goal?.cycle,
     createdAt: team.createdAt,
     lastActivityAt: lastActivity(team),
@@ -260,6 +261,7 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
       live: (coordinator !== undefined && mission.coordinator?.status !== "stopped") || units.some(unit => unit.live),
       coordinator, units, ghosts, loose: [],
       waiting: 0, costUsd: mission.usage?.total.cost, createdAt: mission.createdAt,
+      unmeasured: mission.usage?.unmeasuredMembers ?? units.reduce((sum, unit) => sum + unit.unmeasured, 0),
     };
     const openMissionDecisions = mission.decisions.filter(decision => decision.answer === undefined).length;
     swarm.waiting = waitingOn(swarm, openMissionDecisions);
@@ -272,6 +274,7 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
     const swarm: Swarm = {
       id: team.id, kind: "team", title: team.title, live: unit.live, units: [unit], ghosts: [], loose: [],
       waiting: waitingOn({ units: [unit], loose: [] }, 0), costUsd: team.usage?.total.cost, createdAt: team.createdAt,
+      unmeasured: unit.unmeasured,
     };
     built.push(swarm);
   }
@@ -287,6 +290,7 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
       id: "solo", kind: "solo", title: "solo", live: true, units: [], ghosts: [], loose,
       waiting: loose.filter(agent => agent.state === "needs-you").length,
       costUsd: loose.reduce((sum, agent) => sum + (agent.costUsd ?? 0), 0),
+      unmeasured: loose.filter(agent => agent.costUsd === undefined).length,
       createdAt: new Date(input.now).toISOString(),
     });
   }
@@ -326,6 +330,7 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
         limit: units.reduce((sum, unit) => sum + (unit.workers?.limit ?? 0), 0),
       },
       costUsd: live.reduce((sum, swarm) => sum + (swarm.costUsd ?? 0), 0),
+      unmeasured: live.reduce((sum, swarm) => sum + swarm.unmeasured, 0),
     },
   };
 }

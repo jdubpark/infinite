@@ -122,6 +122,8 @@ export interface Config {
     retention?: import("./team-types.js").TeamRetention;
     /** Free inodes and bytes the workspace volume must keep for a new run to start. */
     storageFloor?: import("./team-types.js").StorageFloor;
+    /** Outcome measurement settings; they never change a routine's work, so routine approvals ignore them. */
+    outcomes?: { holdDays?: number; retentionDays?: number };
   };
   machine?: { id: string; label: string };
   cmux?: { enabled: boolean; command?: string; hooksDir?: string };

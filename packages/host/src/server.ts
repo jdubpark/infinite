@@ -34,7 +34,10 @@ import { EvidenceError } from "./evidence/types.js";
 import { advanceEpoch, configurationModule, configurationProjector, EpochRequestConflict } from "./configuration-store.js";
 import { outcomeBackfill } from "./outcome-backfill.js";
 import { outcomeProjector } from "./outcome-projector.js";
-import { OUTCOMES_MODULE, outcomeModule, runOutcomeView, sweepExpiredOutcomes } from "./outcome-store.js";
+import { EXCLUSION_REASONS, OUTCOMES_MODULE, outcomeModule, runOutcomeView, sweepExpiredOutcomes, type SignalRow } from "./outcome-store.js";
+import { ownerSignal, SignalRequestError, type OwnerSignalInput } from "./outcome-signals.js";
+import { COMMIT_ID, HOLD_DAYS_DEFAULT } from "./outcome-hold.js";
+import { BaseScanner } from "./outcome-scan.js";
 import { profileKeyOf } from "./config-identity.js";
 import { lineupProfiles } from "./team-types.js";
 import { usagePlanSchema } from "./usage-api.js";
@@ -153,7 +156,9 @@ export function createApp(config: Config, key: Buffer) {
   const projectConfigChanges = new Set<string>();
   let sourceChanged: (projectId: string) => void = () => {};
   let sourceAppliedGraph: (projectId: string, head: string) => void = () => {};
-  const projectSource = new ProjectSourceService(config, { running: id => sessionRunningInProject(id), prefix: config.teams?.commandPrefix, onApplied: (id, head) => { sourceChanged(id); sourceAppliedGraph(id, head); } });
+  // The base scanner needs the evidence store, which opens after the project source service; its notices wait for it.
+  let baseScanner: BaseScanner | undefined;
+  const projectSource = new ProjectSourceService(config, { running: id => sessionRunningInProject(id), prefix: config.teams?.commandPrefix, onApplied: (id, head) => { sourceChanged(id); sourceAppliedGraph(id, head); }, onMirror: fetch => baseScanner?.notify(fetch) });
   const repositoryGraphs = config.repositoryGraphs
     ? new RepositoryGraphs(config.repositoryGraphs, config.projects, config.teams?.workspaceDir, config.teams?.commandPrefix)
     : undefined;
@@ -191,6 +196,7 @@ export function createApp(config: Config, key: Buffer) {
   evidence.register(configurationModule());
   outbox.registerProjector(configurationProjector());
   evidence.register(outcomeModule());
+  baseScanner = new BaseScanner({ store: evidence, mirrorPath: id => projectSource.mirrorPath(id), prefix: config.teams?.commandPrefix, holdDays: () => config.teams?.outcomes?.holdDays ?? HOLD_DAYS_DEFAULT });
   outbox.registerProjector(outcomeProjector(evidence));
   const teams = new TeamService(config, key, manager, startInProject, linear, readings, {
     source: projectSource,
@@ -229,7 +235,7 @@ export function createApp(config: Config, key: Buffer) {
   // A run is live while its sealed record file exists, so a record that failed to load keeps its evidence.
   const sweepEvidence = () => {
     evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
-    sweepExpiredOutcomes(evidence, new Date().toISOString());
+    sweepExpiredOutcomes(evidence, new Date().toISOString(), undefined, config.teams?.outcomes?.retentionDays);
   };
   let evidenceSweep: NodeJS.Timeout | undefined;
   // A projector that fell behind catches up without waiting for the next event. Each pass is bounded.
@@ -241,7 +247,7 @@ export function createApp(config: Config, key: Buffer) {
     backfillOutcomes();
   };
   let outboxTimer: NodeJS.Timeout | undefined;
-  const closeEvidence = () => { clearInterval(evidenceSweep); clearInterval(outboxTimer); evidence.close(); };
+  const closeEvidence = () => { baseScanner?.close(); clearInterval(evidenceSweep); clearInterval(outboxTimer); evidence.close(); };
   missions.useUsage(usage);
   usage.useResolvers({
     goalOfRun: runId => { const goal = goals.list().find(value => value.cycles.some(cycle => cycle.teamId === runId)); return goal ? { id: goal.id, title: goal.title } : undefined; },
@@ -713,6 +719,8 @@ export function createApp(config: Config, key: Buffer) {
       throw error;
     }
   });
+  // A signal as the owner sees it. The request hash stays in the store: it only checks that a replayed request matches.
+  const servedSignal = (signal: SignalRow) => ({ ...signal, payload: Object.fromEntries(Object.entries(signal.payload).filter(([name]) => name !== "request")) });
   // The outcome rows of one run, also after the run record is removed. Every paired device may read them, as it may read usage models.
   app.get("/api/outcomes/runs/:runId", (req, res) => {
     const runId = id.parse(req.params.runId);
@@ -722,7 +730,7 @@ export function createApp(config: Config, key: Buffer) {
       if (view === undefined) return void res.status(404).json({ code: "outcomes-not-found", error: "No outcome rows exist for this run." });
       // Blind indexes are store internals. The opened payload already names the project, the task, and the area.
       const served = (row: object) => Object.fromEntries(Object.entries(row).filter(([name]) => !["projectRef", "taskRef", "areaRef"].includes(name)));
-      return void res.json({ ...(view.summary ? { summary: served(view.summary) } : {}), rows: view.rows.map(served), members: view.members.map(served) });
+      return void res.json({ ...(view.summary ? { summary: served(view.summary) } : {}), rows: view.rows.map(served), members: view.members.map(served), signals: view.signals.map(servedSignal), unreadable: view.unreadable });
     } catch (error) {
       if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
       throw error;
@@ -741,6 +749,30 @@ export function createApp(config: Config, key: Buffer) {
         epoch: advanced.epoch, since: advanced.since, repeated: advanced.repeated });
     } catch (error) {
       if (error instanceof EpochRequestConflict) return void res.status(409).json({ code: "request-conflict", error: error.message });
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
+  });
+  // An owner's claim about one run: a linked fix, an exclusion, or the withdrawal of either. A member cannot write one.
+  const signalIssue = z.string().regex(/^[A-Za-z][A-Za-z0-9]{0,9}-[0-9]{1,9}$/);
+  const signalCommit = z.string().regex(COMMIT_ID);
+  const signalTime = z.iso.datetime({ offset: true }).refine(value => Date.parse(value) <= Date.now(), "A signal time cannot be later than the request.").transform(value => new Date(value).toISOString());
+  const ownerSignalSchema = z.union([
+    z.object({ action: z.literal("record"), kind: z.literal("linked-fix"), requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid().optional(),
+      issue: signalIssue.optional(), commit: signalCommit.optional(), at: signalTime.optional() }).strict()
+      .refine(body => body.issue !== undefined || body.commit !== undefined, "A linked fix names an issue, a commit, or both."),
+    z.object({ action: z.literal("record"), kind: z.literal("exclusion"), requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), reason: z.enum(EXCLUSION_REASONS) }).strict(),
+    // A withdrawal is idempotent by the signal's state, so it carries no request id.
+    z.object({ action: z.literal("withdraw"), kind: z.enum(["linked-fix", "exclusion"]), signalId: z.string().regex(/^[0-9a-f]{64}$/) }).strict(),
+  ]);
+  const signalStatus = { "request-conflict": 409, "signal-not-withdrawable": 409, "outcome-not-found": 404, "signal-not-found": 404 } as const;
+  app.post("/api/outcomes/signals", requireRole(["owner"]), (req, res) => {
+    const body = ownerSignalSchema.parse(req.body);
+    try {
+      const result = ownerSignal(evidence, body as OwnerSignalInput, new Date().toISOString());
+      return void res.json({ signal: servedSignal(result.signal), repeated: result.repeated });
+    } catch (error) {
+      if (error instanceof SignalRequestError) return void res.status(signalStatus[error.code]).json({ code: error.code, error: error.message });
       if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
       throw error;
     }

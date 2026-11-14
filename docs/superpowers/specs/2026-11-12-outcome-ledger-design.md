@@ -139,7 +139,7 @@ CREATE TABLE outcomes (
   kind TEXT, risk TEXT NOT NULL, feature_version INTEGER NOT NULL,
   disposition TEXT NOT NULL,
   exclusion TEXT,                        -- limit | owner | host | duel
-  integrated INTEGER, accepted INTEGER, first_pass INTEGER, held INTEGER,  -- 1, 0, NULL = unknown
+  integrated INTEGER, accepted INTEGER, acceptance INTEGER, first_pass INTEGER, held INTEGER,  -- 1, 0, NULL = unknown
   started_at TEXT, ended_at TEXT, frozen_at TEXT, hold_until TEXT, run_deleted_at TEXT,
   payload TEXT NOT NULL                  -- encrypted OutcomePayload
 );
@@ -167,6 +167,8 @@ type OutcomePayload = {
 
 Plaintext columns hold opaque identifiers, enumerations, numbers, and times. Names from the repository or the run stay in the encrypted payload. A row never holds an objective, instructions, a summary, a rubric reason, a rating note, a path, or a URL.
 
+`acceptance` is the review's acceptance, kept as its own fact apart from `accepted`. An owner exclusion empties `accepted`, so a withdrawal could not restore it from that column.
+
 **Cost.** The ledger copies cost from the usage ledger and stores the usage coverage with it. It refreshes both whenever the usage ledger reports new usage for one of the attempt's sessions. That also happens after the row is frozen and after the run record is deleted. A cost spread in a cell uses rows with `complete` coverage only, and it reports how many rows it left out.
 
 Purpose sets the source. An attempt in a replay run or a gate run has source `replay`. A duel contestant whose fate the duel set has source `duel`, as the duels design defines. Every other attempt has source `production`.
@@ -193,12 +195,12 @@ A stall or an escalation counts as a failure and a limit is excluded, as in the 
 
 ### Part 4. Success levels
 
-Each level is yes, no, or unknown. A row with an exclusion has no levels.
+Each level is yes, no, or unknown. A row with an exclusion has no levels. An owner exclusion sets the row's `exclusion` to `owner`, so the row has no level. Withdrawing it restores the levels.
 
 - **integrated** is yes for disposition `integrated` and no for every other counted disposition of an implementer. A `result` with no commit still integrates the task in the run record, so the row is integrated and carries `empty-result`.
 - **accepted** is yes when a `review.recorded` with verdict `approved` follows the attempt's `task.integrated`, in the same run, with the same base commit. Only the moved-base path changes `run.baseCommit`, so an approved head with the same base contains every earlier integration.
 - **firstPass** is yes when accepted is yes and no correction round is attributed to the task. It is no when accepted is no or a round is attributed. Otherwise it is unknown.
-- **held** is defined in Part 5.
+- **held** is defined in Part 5. It is no when accepted is no or a negative signal applies (a revert, or a linked fix that applies), yes when accepted is yes and the landing's window is covered, and unknown otherwise. The flag `scan-gap` marks a held level that a scan gap left unknown.
 
 A scout row has no levels. Its disposition `completed` is its only result, and a scout rate is the share of counted scout rows that completed.
 
@@ -239,6 +241,8 @@ CREATE TABLE outcome_signals (
 );
 ```
 
+Signals are rows of the outcome module, not run events, because run events are deleted with their run, a signal must reach the rows of a deleted run, and a new event kind would change the projector's outbox definition. A scan or an owner claim is not a run transition. The one signal that an event makes is `rating`.
+
 | Kind | Author, authority | Comes from | Effect |
 |---|---|---|---|
 | `rating` | owner, claim | `rating.recorded` | sets `ownerRating`. No level changes |
@@ -249,16 +253,28 @@ CREATE TABLE outcome_signals (
 
 The host never infers a defect. A `revert` records only that a base-branch commit says it reverts a landed commit. A member cannot write a signal. `rateTask` reaches only the current revision's tasks, so an older row cannot be rated yet.
 
-**Base branch scan.** `ProjectSourceService.refreshOne` gets an optional callback that fires when `mirrorHead` changes. The ledger reads the new first-parent commits in the mirror, at most 500 per scan, and records the commit range that each scan covered. It compares the commits with two sets of the project's runs. Rules 1 to 3 use the approved runs that have no landing and were approved at most 90 days ago. Rule 4 uses the landed runs whose hold window is still open.
+**Base branch scan.** `ProjectSourceService.refreshOne` gets an optional callback that fires after every successful fetch of the mirror, whether or not `mirrorHead` changed. *(Otherwise a window on a quiet branch never closes, and a failed scan is never retried.)* A fetch continues the ledger's history only when every fetch since the last recorded scan is accounted for. The source status keeps an order stamp for each fetch, which never goes back, and the stamp since which the mirror's head has stood. The scanner keeps the fetches that no recorded scan read. A head among them that is no longer a first-parent commit of the base branch, or a head that moved at a fetch the ledger never read, makes the scan a `rewrite` gap. The ledger reads the new first-parent commits in the mirror, at most 500 per scan, and records the commit range that each scan covered. A scan that finds more keeps the newest 500 and records a `bound` gap. It compares the commits with two sets of the project's runs. Rules 1 to 3 use the approved runs that have no landing and were approved at most 90 days ago. Rule 4 uses the landed runs whose hold window is still open.
 
 1. A commit whose id is a run's reported merge commit lands that run (`merge-commit`).
 2. A commit whose second parent is a run's reviewed head lands that run (`merge-parent`).
-3. A commit whose tree is a run's reviewed tree lands that run (`tree-equal`).
-4. A commit whose message contains `This reverts commit` followed by a landed commit's id records a `revert`.
+3. A commit whose tree is a run's reviewed tree lands that run (`tree-equal`). A tree can recur, so the commit must also be the reviewed head itself, or come after the run's base in the scanned commits. When the base is not among them, the rule holds only in a scan of new commits, never in one that reads history older than the ledger's own head. A run whose reviewed head is its base never lands.
+4. A commit whose message contains `This reverts commit` followed by a landed commit's id records a `revert`. The landed ids are the landing commit and, for a landing by the second parent, the reviewed head. The reverting commit must come after the landing commit. Work that is removed another way is not seen: a revert of one commit of the branch, a revert of a second merge of the same head, or a plain edit. Held can then be yes for work that is gone; the hindsight measure of surviving lines is the planned answer.
 
 *(My call: exact matches only. A pull request number in a commit subject is text that anyone can write. The cost is that a squash merge onto a moved base stays unobserved.)*
 
-**held.** The hold window starts at landing and lasts `teams.outcomes.holdDays`, default 30. Held is yes when accepted is yes, a landing exists, the window has closed, the scans covered every base-branch commit inside the window, and no active `revert` or `linked-fix` falls inside it. Held is no when accepted is no, or when such a signal exists. Otherwise held is unknown. That covers every project without a GitHub mirror, every landing the scan could not match, and every window with a scan gap, which the row marks with the `scan-gap` flag.
+A run lands once, at its first matching commit. All accepted rows of a run take that one landing, whatever their revision. *(The run summary keeps only the newest reviewed head.)* A signal's time is the time of the fetch that the scan read, never a committer date. *(A committer date is text the committer writes.)*
+
+**held.** The hold window starts at landing and lasts `teams.outcomes.holdDays`, default 30. Held is yes when accepted is yes, a landing exists, the window has closed, the scans covered every base-branch commit inside the window, and no negative signal applies. A negative signal is an active `revert` recorded at or before the close, or an active `linked-fix` that counts. A `linked-fix` counts when the run has no landing, or when its time is at or before the close of the window. One that names a row applies to that row when it is integrated; one that names only the run applies to the run's accepted rows. Held is no when accepted is no, or when a negative signal applies. Otherwise held is unknown. That covers every project without a GitHub mirror, every landing the scan could not match, and every window with a scan gap. An accepted row of a landed run whose held a gap left unknown carries the `scan-gap` flag; a revert decides held whatever the gap.
+
+**Window coverage.** A window's verdict is `open`, `covered`, or `gap`. `last` is the newest scan at or before the close, from the landing's scan on, and `next` is the scan after it. The first rule that applies gives the verdict:
+
+1. A gap scan after the landing's scan, at or before the close, gives `gap`.
+2. `last` was checked at or after the close, so the head did not move through the close: `covered`.
+3. No `next` gives `open`.
+4. A `next` with a gap gives `gap`.
+5. A `next` scanned at most six hours after `last` was checked gives `covered`; a later one gives `gap`.
+
+Six hours is several times the mirror fetch's back-off, which is at most an hour. A verdict other than `open` is stored once on the landing, with the time of the scan that decided it, and is never recomputed. *(So a pruned scan cannot change a decided window.)* A scan decides the windows of landings up to 455 days old, the longest hold plus 90 days. A window that no scan decided in that time stays `open`, and held stays unknown.
 
 ### Part 6. Run summaries, member results, and roll-ups
 
@@ -290,7 +306,7 @@ type Cell = {
   key: Record<string, string>; sources: Source[]; from: string | null; to: string | null;
   attempts: number; open: number; excluded: { limit: number; owner: number; host: number; duel: number };
   withheld: { backfilled: number; gap: number; unfrozen: number };
-  flagged: { backfilled: number; gap: number; "empty-result": number; "same-model-review": number };
+  flagged: { backfilled: number; gap: number; "empty-result": number; "same-model-review": number; "scan-gap": number };
   levels: { integrated: LevelCount; accepted: LevelCount; firstPass: LevelCount; held: LevelCount };
   completed?: LevelCount;                  // role "scout" only
   tokens: Spread | null; spentUsd: Spread | null; listUsd: Spread | null; minutes: Spread | null;
@@ -336,7 +352,8 @@ A legacy row is an unauthenticated claim. It appears only in `display` queries, 
 ## Authority and safety
 
 - The ledger observes. No `TeamService` decision reads it, and a store failure never stops a run.
-- Levels change only on host receipts and owner claims. A host receipt states what the host itself read: a report kind, a commit id, a tree id, a commit message on the base branch.
+- Levels change only on host receipts and owner claims. A host receipt states what the host itself read: a report kind, a commit id, a tree id, and that Git found a base-branch commit whose message names a landed commit. The host reads no commit message itself.
+- A landing or a revert is a receipt of what the host mirror showed at a fetch. The agent identity can write the mirror, so such a receipt is not proof against a member that alters the mirror. A landing by the reported merge commit also rests on the delivery member's report: the scan checks only that the commit is a first-parent commit of the base branch. Each landing stores which rule matched, so a reader can treat the three apart.
 - No score reaches a prompt. `team-prompts.ts` must not import the ledger, and a test asserts it.
 - A rubric is stored only when `consume` kept it. `consume` already drops one when reviewer and implementer share a model.
 - Reads follow the role rules of `GET /api/usage/models`. Signal writes and the import need the owner role.
@@ -349,6 +366,8 @@ A legacy row is an unauthenticated claim. It appears only in `display` queries, 
 - **Crash or restore.** The next start appends the outbox again, and a stored key inserts nothing. A row is never removed because a record lacks it.
 - **A transition forgets to emit.** A test lists every report kind and every `member.stopped` class and fails when one has no emission. At `run.settled` the projector logs any difference between the summary counts and its rows.
 - **Scan gap.** A first scan, a jump of more than 500 commits, or a rewritten base branch scans the newest 500 commits only. A missed landing leaves held unknown, and so does a gap inside an open hold window.
+- **A signal that cannot be read.** A display leaves it out and counts it. A recomputation needs every signal of the run, because the one it cannot read may be the linked fix that makes held no or the exclusion that keeps a row out of the rates. So the write fails: an owner claim answers 503, and a scan leaves the run's rows as they are and goes on with the other runs. A projector write of that run fails too, as it does for a row that cannot be read, and the projector waits at that event: no later event of any run is projected until the store is repaired.
+- **A fetch the host did not record.** A fetch can move the mirror and then fail, or the host can stop before it writes the status. Each refresh first reads the mirror's branch and records a head the status does not name, before the new fetch can replace it.
 - **Late usage.** The ledger refreshes a row's cost and coverage whenever the usage ledger reports new usage for one of its sessions, also after the freeze and after the run record is deleted.
 - **Map change.** A cell never merges two `featureMap` values for one project unless the query leaves `area` out of `by`.
 
@@ -380,7 +399,15 @@ A legacy row is an unauthenticated claim. It appears only in `display` queries, 
 ## Left to the builder
 
 - The projector registry, and use of the store's encryption and blind index helpers. The blackboard design owns the helpers.
-- The key strings, and the Git commands and timeouts for the two new reads and the mirror scan.
+- The key strings, and the Git commands and timeouts for the two new reads.
+- The five Git forms of the base branch scan. Each runs through the team command prefix in the host mirror, never in a team workspace, with a 30 second limit:
+  - `merge-base --is-ancestor OLD NEW`
+  - `rev-list --first-parent --max-count=501 NEW ^OLD`
+  - `rev-list --first-parent --max-count=500 NEW`
+  - `log --no-walk=unsorted --no-show-signature --format=%H %T %P ID...`
+  - `log --no-walk=unsorted --no-show-signature --format=%H --fixed-strings --grep=This reverts commit ID... ID...`
+
+  The launcher audit of these forms under the deployed Unix identities is a release step, outside the pull request.
 - Prompt wording for the optional `kind` and `risk` labels. Keep it to one line, because team prompts have an 80 KiB limit and byte-sensitive tests.
 - Client decoding of `ModelUsage`. This design did not verify that the web, phone, and Mac clients ignore the two new fields.
 - A project removal path for the purge. This design did not find one.

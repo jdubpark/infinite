@@ -17,7 +17,8 @@ export type TouchPage = {
   more: boolean;
 };
 
-const OBSERVABLE_PROVIDERS = new Set(["claude", "codex"]);
+/** Providers whose tool inputs can be extracted. Hooks must also be on for a provider to record any. */
+const EXTRACTABLE_PROVIDERS = new Set(["claude", "codex"]);
 const FILE_TOOLS: Record<string, { field: string; kind: "reads" | "edits" }> = {
   Read: { field: "file_path", kind: "reads" },
   Edit: { field: "file_path", kind: "edits" },
@@ -171,6 +172,8 @@ export class ContextTouches {
       maxFiles?: number;
       /** Sessions whose journals are read at once, across every request. */
       maxConcurrent?: number;
+      /** Whether a provider records tool inputs in this host. Defaults to true for Claude Code and Codex. */
+      observable?: (provider: string) => boolean;
     },
   ) {
     this.maxConcurrent = options.maxConcurrent ?? 4;
@@ -180,7 +183,8 @@ export class ContextTouches {
   }
 
   async session(source: TouchSource): Promise<SessionTouches> {
-    if (!OBSERVABLE_PROVIDERS.has(source.provider)) {
+    const observable = EXTRACTABLE_PROVIDERS.has(source.provider) && (this.options.observable?.(source.provider) ?? true);
+    if (!observable) {
       return { sessionId: source.sessionId, observable: false, complete: true, graphQueries: 0, files: [], truncated: false };
     }
     const state = this.stateFor(source.sessionId);

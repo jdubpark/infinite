@@ -92,9 +92,11 @@ and never merged.
 
 Observed tool inputs show what an agent's tools were pointed at. They do not
 show that the agent understood or used the content, and an observed edit is
-not a landed change. Only Claude Code and Codex record tool inputs; agents of
-other providers are marked `no signal` and keep their planned and integrated
-links.
+not a landed change. A provider records tool inputs only when its hooks are on
+in the host configuration. Claude Code hooks are on by default. Codex hooks are
+off by default, so Codex agents are marked `no signal` unless the host turns
+them on. Agents of other providers are always marked `no signal`. A `no signal`
+agent keeps its planned and integrated links.
 
 The code map comes from the repository graph checkpoints described in
 [repository graphs](repository-graphs.md). The view reads each project's

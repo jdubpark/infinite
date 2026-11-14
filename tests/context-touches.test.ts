@@ -196,6 +196,26 @@ test("unobservable provider is not read", async () => {
   assert.deepEqual(reads, []);
 });
 
+test("a provider whose hooks are off is not read, while an observable one still is", async () => {
+  const { read, reads } = journal([toolStart(1, "Read", { file_path: "src/a.ts" })]);
+  const touches = new ContextTouches({ read, areas: noAreas, observable: provider => provider === "claude" });
+  const codex = await touches.session(source({ sessionId: "codex", provider: "codex" }));
+  assert.deepEqual(codex, {
+    sessionId: "codex",
+    observable: false,
+    complete: true,
+    graphQueries: 0,
+    files: [],
+    truncated: false,
+  });
+  assert.deepEqual(reads, []);
+
+  const claude = await touches.session(source({ sessionId: "claude", provider: "claude" }));
+  assert.equal(claude.observable, true);
+  assert.deepEqual(claude.files.map((file) => file.path), ["src/a.ts"]);
+  assert.deepEqual(reads, [0]);
+});
+
 test("incremental cursor", async () => {
   const events = [toolStart(1, "Read", { file_path: "src/a.ts" }), toolStart(2, "Edit", { file_path: "src/a.ts" })];
   const reader = journal(events);

@@ -204,11 +204,14 @@ export class PermissionJournal {
         if (!cited || !source || cited.task_id !== decision.taskId || source.task_id !== decision.taskId) {
           throw new TypeError("A replay must cite a decision of the same task.");
         }
-        if (source.verdict === "owner" || (HOST_REJECT_CODES as readonly string[]).includes(source.code ?? "")) {
-          throw new TypeError("An owner verdict and a host result are never replayed.");
-        }
         if (source.verdict !== decision.verdict || (source.code ?? undefined) !== decision.code) {
           throw new TypeError("A replay must carry the verdict and code of the decision it replays.");
+        }
+        if (decision.reuseKey === undefined || source.reuse_key !== decision.reuseKey) {
+          throw new TypeError("A replay must answer the identical request: its reuse key must match the cited decision.");
+        }
+        if (!replayAllowed(tx, source, decision.family)) {
+          throw new TypeError("The cited decision cannot be replayed for this request.");
         }
         replaySourceId = source.id;
         // A replayed effect reject is a repeat of that reject, whether or not the caller said so.
@@ -489,7 +492,8 @@ export class PermissionJournal {
    * Whether the host may answer an identical request from `requesterFamily` with this recorded
    * verdict. A replay record is judged as the decision it replays. A verdict that a strong reviewer
    * gave is not replayed to a requester of that reviewer's family, nor to a requester whose family
-   * the host could not establish (`requesterFamily: undefined`).
+   * the host could not establish (`requesterFamily: undefined`). `appendDecision` applies the same
+   * rule, so the journal never holds a replay that this query refuses.
    */
   replayEligible(decisionId: string, options: { taskId: string; requesterFamily: string | undefined }): boolean {
     requiredString(decisionId, "decisionId");
@@ -502,25 +506,9 @@ export class PermissionJournal {
     const requesterFamily = optionalString(options.requesterFamily, "requesterFamily");
     return this.store.read(db => {
       const cited = db.get<DecisionRow>(`SELECT * FROM ${DECISIONS} WHERE id=?`, decisionId);
-      const row = cited && replaySource(db, cited);
-      if (!cited || !row || cited.task_id !== taskId || row.verdict === "owner") return false;
-      const strongFamilies = (JSON.parse(row.tiers_json) as PermissionTier[])
-        .filter(tier => tier.tier === "strong").map(tier => tier.family);
-      if (strongFamilies.length > 0
-        && (requesterFamily === undefined || strongFamilies.some(family => sameFamily(family, requesterFamily)))) {
-        return false;
-      }
-      if (row.verdict === "allow") {
-        return !db.all<DecisionRow>(
-          `SELECT * FROM ${DECISIONS} WHERE task_id=? AND verdict='reject' AND code IN (${placeholders(EFFECT_REJECT_CODES.length)}) `
-          + "AND repeats IS NULL AND seq>?",
-          taskId, ...EFFECT_REJECT_CODES, row.seq,
-        ).some(reject => isOpen(db, reject));
-      }
-      if (row.code === "unavailable" || row.code === "locked" || row.code === "needs-owner") return false;
-      if (isEffectReject(row.code ?? undefined)) return isOpen(db, row);
-      if (isEvidenceReject(row.code ?? undefined)) return !ownerReopened(db, row);
-      return false;
+      const source = cited && replaySource(db, cited);
+      return cited !== undefined && source !== undefined && cited.task_id === taskId
+        && replayAllowed(db, source, requesterFamily);
     });
   }
 
@@ -647,6 +635,7 @@ function normalizeDecision(value: PermissionDecision): PermissionDecision {
   if (repeats !== undefined && (verdict !== "reject" || !isEffectReject(value.code))) {
     throw new TypeError("A repeated request must be rejected with an effect reject code.");
   }
+  if (replayOf !== undefined && tiers.length > 0) throw new TypeError("A replay has no model turn.");
   if (value.note !== undefined && (typeof value.note !== "string" || value.note.length > MAX_TEXT)) {
     throw new TypeError("A permission note must be text of at most 2000 characters.");
   }
@@ -716,6 +705,30 @@ function replaySource(db: EvidenceDb, row: DecisionRow, seen = new Set<string>()
   const source = db.get<DecisionRow>(`SELECT * FROM ${DECISIONS} WHERE id=?`, row.replay_of);
   if (!source || source.task_id !== row.task_id || source.verdict !== row.verdict || source.code !== row.code) return undefined;
   return replaySource(db, source, seen);
+}
+
+/**
+ * Whether the rules let `source`, a decision that is not itself a replay, answer the identical request of a
+ * requester from `requesterFamily` now.
+ */
+function replayAllowed(db: EvidenceDb, source: DecisionRow, requesterFamily: string | undefined): boolean {
+  if (source.verdict === "owner" || (HOST_REJECT_CODES as readonly string[]).includes(source.code ?? "")) return false;
+  const strongFamilies = (JSON.parse(source.tiers_json) as PermissionTier[])
+    .filter(tier => tier.tier === "strong").map(tier => tier.family);
+  if (strongFamilies.length > 0
+    && (requesterFamily === undefined || strongFamilies.some(family => sameFamily(family, requesterFamily)))) {
+    return false;
+  }
+  if (source.verdict === "allow") {
+    return !db.all<DecisionRow>(
+      `SELECT * FROM ${DECISIONS} WHERE task_id=? AND verdict='reject' AND code IN (${placeholders(EFFECT_REJECT_CODES.length)}) `
+      + "AND repeats IS NULL AND seq>?",
+      source.task_id, ...EFFECT_REJECT_CODES, source.seq,
+    ).some(reject => isOpen(db, reject));
+  }
+  if (isEffectReject(source.code ?? undefined)) return isOpen(db, source);
+  if (isEvidenceReject(source.code ?? undefined)) return !ownerReopened(db, source);
+  return false;
 }
 
 function sameFamily(left: string, right: string): boolean {

@@ -582,8 +582,12 @@ test("a checkout removed from the stored project that carries its own id has mov
     assert.equal(service.ownerMoveMark("home-one"), initial.one);
     assert.notEqual(service.ownerMoveMark("home-two"), initial.two, "joining a stored project from an implicit one is a move");
 
-    service.update("home-one", { requestId: randomUUID(), revision: joined.revision, repos: ["home-two"] });
-    assert.notEqual(service.ownerMoveMark("home-one"), initial.one, "removal is a move although the implicit id is the same");
+    const left = service.update("home-one", { requestId: randomUUID(), revision: joined.revision, repos: ["home-two"] });
+    const removed = service.ownerMoveMark("home-one");
+    assert.notEqual(removed, initial.one, "removal is a move although the implicit id is the same");
+
+    service.update("home-one", { requestId: randomUUID(), revision: left.revision, repos: ["home-two", "home-one"] });
+    assert.notEqual(service.ownerMoveMark("home-one"), removed, "joining a stored project that already existed is a move although it carries the checkout's id");
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 

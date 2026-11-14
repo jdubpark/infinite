@@ -285,6 +285,8 @@ test("a strong verdict replays only to a requester of another, known family; a r
     assert.equal(journal.replayEligible(id, { taskId: "task-1", requesterFamily: " Family-B " }), false, id);
     assert.equal(journal.replayEligible(id, { taskId: "task-1", requesterFamily: undefined }), false, id);
   }
+  for (const family of ["family-b", undefined])
+    assert.throws(() => journal.appendDecision(decision({ id: `refused-${family}`, replayOf: "strong-allow", family })), TypeError);
   assert.equal(journal.replayEligible("light-allow", { taskId: "task-1", requesterFamily: undefined }), true);
   assert.equal(journal.replayEligible("light-allow", { taskId: "task-1", requesterFamily: "light-family" }), true);
   assert.throws(() => journal.replayEligible("light-allow", { taskId: "task-1" } as never), TypeError);
@@ -321,8 +323,8 @@ test("a replayed effect reject is a repeat of that reject whether or not the rec
 }));
 
 test("a replay record must stay in its task and carry the outcome it replays", () => withJournal(journal => {
-  journal.appendDecision(decision({ id: "allow" }));
   journal.appendDecision(effectReject("reject"));
+  journal.appendDecision(decision({ id: "allow" }));
   journal.appendDecision(decision({ id: "owner", verdict: "owner", interruptClass: "money" }));
   journal.appendDecision(decision({ id: "outage", verdict: "reject", code: "unavailable" }));
 
@@ -333,6 +335,9 @@ test("a replay record must stay in its task and carry the outcome it replays", (
     { verdict: "reject", code: "unrelated", replayOf: "reject" },
     { verdict: "owner", interruptClass: "money", replayOf: "owner" },
     { verdict: "reject", code: "unavailable", replayOf: "outage" },
+    { replayOf: "allow", reuseKey: "another-request" },
+    { replayOf: "allow", reuseKey: undefined },
+    { replayOf: "allow", tiers: [tier("light", "2026-11-14T10:00:00.000Z", "2026-11-14T10:00:01.000Z")] },
   ];
   for (const [index, overrides] of refused.entries())
     assert.throws(() => journal.appendDecision(decision({ id: `refused-${index}`, ...overrides })), TypeError, JSON.stringify(overrides));
@@ -349,6 +354,7 @@ test("the journal's own order decides, also for equal timestamps and a clock tha
   journal.appendDecision(decision({ id: "allow", at }));
   journal.appendDecision(effectReject("reject-after-allow", { at: earlier }));
   assert.equal(journal.replayEligible("allow", { taskId: "task-1", requesterFamily: "family-a" }), false);
+  assert.throws(() => journal.appendDecision(decision({ id: "stale-allow-replay", at, replayOf: "allow" })), TypeError);
 
   journal.appendDecision(effectReject("repeat-1", { at, repeats: "reject-after-allow" }));
   journal.appendDecision(effectReject("repeat-2", { at, repeats: "reject-after-allow" }));
@@ -461,14 +467,12 @@ test("rates count verdicts, final tiers, replays, median duration, and empty win
   journal.appendDecision(decision({ id: "rate-allow-light", at: "2026-11-14T10:05:00.000Z", tiers: [
     tier("light", "2026-11-14T10:05:00.000Z", "2026-11-14T10:05:01.000Z"),
   ] }));
-  journal.appendDecision(effectReject("rate-reject-strong", { id: "rate-reject-strong", at: "2026-11-14T10:15:00.000Z", tiers: [
+  journal.appendDecision(effectReject("rate-reject-strong", { id: "rate-reject-strong", at: "2026-11-14T10:15:00.000Z", taskId: "task-2", tiers: [
     tier("light", "2026-11-14T10:15:00.000Z", "2026-11-14T10:15:02.000Z"),
     tier("strong", "2026-11-14T10:15:03.000Z", "2026-11-14T10:15:05.000Z"),
   ] }));
   journal.appendDecision(decision({ id: "rate-owner", at: "2026-11-14T10:25:00.000Z", verdict: "owner", interruptClass: "money" }));
-  journal.appendDecision(decision({ id: "rate-allow-strong", at: "2026-11-14T10:35:00.000Z", replayOf: "rate-allow-light", tiers: [
-    tier("strong", "2026-11-14T10:35:00.000Z", "2026-11-14T10:35:02.000Z"),
-  ] }));
+  journal.appendDecision(decision({ id: "rate-allow-replay", at: "2026-11-14T10:35:00.000Z", replayOf: "rate-allow-light" }));
   journal.appendDecision(decision({ id: "rate-reject-light", at: "2026-11-14T10:45:00.000Z", verdict: "reject", code: "uncertain", tiers: [
     tier("light", "2026-11-14T10:45:00.000Z", "2026-11-14T10:45:04.000Z"),
   ] }));
@@ -477,9 +481,9 @@ test("rates count verdicts, final tiers, replays, median duration, and empty win
     decisions: 5,
     perHour: 2.5,
     byVerdict: { allow: 2, reject: 2, owner: 1 },
-    byTier: { none: 1, light: 2, strong: 2 },
+    byTier: { none: 2, light: 2, strong: 1 },
     replays: 1,
-    medianDecisionMs: 3_000,
+    medianDecisionMs: 4_000,
   });
   assert.deepEqual(journal.rates({ scope: "host", since: "2026-11-15T00:00:00.000Z", until: "2026-11-15T01:00:00.000Z" }), {
     decisions: 0,

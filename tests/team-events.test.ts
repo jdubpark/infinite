@@ -104,6 +104,32 @@ test("a blocked status emits run.blocked with its code", () => {
   } finally { store.close(); f.close(); }
 });
 
+test("an operation failure names its member", () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const manager = f.run.members[0]!;
+    manager.status = "stopped";
+    const member = { ...manager, memberId: randomUUID(), sessionId: randomUUID(), role: "implementer" as const, title: "Implementer",
+      report: { kind: "result" as const, summary: "The implementer reports a result." } };
+    f.run.members.push(member);
+    f.run.headCommit = f.run.baseCommit;
+    const source = { memberId: member.memberId, role: member.role, cwd: member.cwd, baseCommit: member.baseCommit, headCommit: f.run.headCommit, workspace: "member" as const };
+    f.run.recovery = { attempts: 2, status: "exhausted", source: { code: "task-scope-violation", memberId: member.memberId, revision: 1,
+      reason: "A change left the assigned scope.", at: new Date().toISOString() } };
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const stored = internal(teams).record(f.run.id) as { pending?: unknown };
+    stored.pending = { id: randomUUID(), kind: "result", revision: 1, source,
+      failure: { code: "task-scope-violation", reason: "A change left the assigned scope.", at: new Date().toISOString() } };
+    internal(teams).block(stored, new TeamError(409, "task-scope-violation", "A change left the assigned scope."));
+    const blocked = eventsOfKind(store, f.run.id, "run.blocked");
+    assert.equal(blocked.length, 1);
+    assert.equal(blocked[0]!.data.code, "task-scope-violation");
+    assert.equal(blocked[0]!.data.sourceMemberId, member.memberId);
+  } finally { store.close(); f.close(); }
+});
+
 test("a legacy record emits only on the next change", async () => {
   const f = schedulerFixture();
   const store = openStore(f, f.key);
@@ -269,7 +295,34 @@ test("a continuation, a resume, and a recovery each name their cause", async () 
       await scheduler.step(scheduler.record(f.run.id));
       const [event] = eventsOfKind(store, f.run.id, "run.revision-advanced");
       assert.equal(event?.revision, 2);
-      assert.deepEqual(event?.data, { v: 1, cause: "automatic-recovery", fromRevision: 1, baseChanged: false });
+      assert.deepEqual(event?.data, { v: 1, cause: "automatic-recovery", fromRevision: 1, baseChanged: false,
+        sourceCode: "agent-blocked", sourceMemberId: member.memberId });
+    } finally { store.close(); f.close(); }
+  }
+});
+
+test("an automatic recovery names its source", async () => {
+  for (const unattributed of [false, true]) {
+    const f = schedulerFixture();
+    const store = openStore(f, f.key);
+    try {
+      const member = f.run.members[0]!;
+      member.status = "stopped";
+      const memberId = unattributed ? "unattributed" : member.memberId;
+      const reason = "A change left the assigned scope.";
+      f.run.recovery = { attempts: 1, status: "stopping", source: { code: "task-scope-violation", memberId, revision: 1, reason, at: new Date().toISOString() } };
+      f.run.status = "planning"; f.run.blockCode = "task-scope-violation"; f.run.reason = reason;
+      f.run.headCommit = f.run.baseCommit;
+      f.writeTeam();
+      const teams = f.openTeam({ events: new EventOutbox(store) });
+      const scheduler = internal(teams);
+      await scheduler.step(scheduler.record(f.run.id));
+      const [event] = eventsOfKind(store, f.run.id, "run.revision-advanced");
+      assert.equal(event?.revision, 2);
+      assert.equal(event?.data.cause, "automatic-recovery");
+      assert.equal(event?.data.sourceCode, "task-scope-violation");
+      if (unattributed) assert.equal(Object.hasOwn(event!.data, "sourceMemberId"), false);
+      else assert.equal(event?.data.sourceMemberId, member.memberId);
     } finally { store.close(); f.close(); }
   }
 });

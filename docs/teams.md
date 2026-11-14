@@ -1347,6 +1347,43 @@ The first command revokes delegation for a current run. The second disables it
 for future runs. Both require an owner client. Pausing, cancelling or steering a
 run prevents its old pending decisions from being applied.
 
+## Autonomy mode
+
+Each project has an autonomy mode. The mode is `supervised` or `autonomous`.
+
+In this release the host only stores and shows the mode. Nothing reads it yet, so no behaviour changes.
+
+Each new run and each new goal records the project's mode when it starts. A goal's cycles keep the goal's mode. A change applies to the next run and the next goal. A run or a goal already in progress keeps its mode.
+
+An enrolled repository without a saved mode uses the host default. The default is `autonomous` unless the operator sets `autonomy.defaultMode` in the host configuration file. A project that is not enrolled reads as `supervised`.
+
+Read the mode:
+
+```sh
+infinite autonomy mode PROJECT
+```
+
+Change it:
+
+```sh
+infinite autonomy mode PROJECT supervised
+infinite autonomy mode PROJECT autonomous
+```
+
+Set it when enrolling:
+
+```sh
+infinite repo init --autonomy supervised
+```
+
+Omit `--autonomy` on a later `repo init` to keep the saved mode.
+
+Only the owner can change the mode, from the paired owner CLI. Members, other roles, and browser sessions cannot.
+
+## Launch-rate fuse
+
+The host limits how often it starts team sessions: 30 per project and 80 across the host in a rolling hour. A launch that would pass a limit waits. The member or goal shows a reason that starts "Waiting for the spend fuse:", names the project or the host, and gives no figures. The first trip of a UTC day closes by itself when fewer than half the limit remain in the last hour. If the limit is reached again on the same UTC day, the trip stays open until the owner closes it with `infinite fuse close --project PROJECT_ID` or `infinite fuse close --host`. The permission coordinator is never counted or held. The limits can be changed under `autonomy.fuse` in the host configuration (`project`, `host`, and `projects.PROJECT_ID`, each with `launchesPerHour`). A trip opened because the launch record cannot be read closes once the record can be read. Run `infinite fuse` to read every scope, or add `--json` for the full view. The `autonomy-interrupt` push event is on by default and sends the owner one notification per trip and subject per UTC day.
+
 ## Configuration
 
 Each new run gets a folder named from its UTC creation date, a slug of its
@@ -1741,12 +1778,31 @@ cycle's PM selects capacity for its work. The refusal uses `409` with
 | --- | --- | --- |
 | `GET /api/teams` | None; returns `{teams}` | Any paired device |
 | `GET /api/teams/:id` | None; returns reports and check evidence | Any paired device |
+| `GET /api/teams/:id/context` | None; returns the files each member's recorded tool inputs pointed at | Any paired device |
 | `POST /api/teams` | `requestId`, `projectId`, `provider`, `title`, `objective`, optional `useConfiguredLineup` | Owner |
 | `POST /api/teams/:id/steer` | `requestId`, `revision`, `text` | Owner/controller; standalone teams |
 | `POST /api/teams/:id/continue` | `requestId` (UUID), `revision`, optional trimmed `text` (1–8,000 characters) | Owner; continuable standalone blocked runs |
 | `POST /api/teams/:id/decisions/:decisionId/answer` | `requestId`, `revision`, `text` | Owner/controller |
 | `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams |
 | `POST /api/teams/:id/tasks/:taskId/rating` | `requestId`, `score` (1–5), optional `note` (≤1,000 characters) | Owner |
+
+The context response lists, for each member of the current revision and each
+earlier member still running, its repository-relative `files` with `reads`,
+`edits`, and `lastAt`, a `graphQueries` count, and `observable`, `complete`,
+and `truncated` flags. `GET /api/sessions/:id/context` returns the same shape
+for one session. These are observed tool inputs: they show what an agent's
+tools were pointed at, not that the agent used the content, and an observed
+edit is not a landed change. A session answers `observable: false` until the
+index has read a tool input that a provider hook recorded for it; with
+`complete: false` the index may still find one. That covers a provider whose
+hooks are off, a session started with native arguments or in the native UI,
+and a session before its first tool call. A session also answers
+`observable: false` when its provider is neither Claude Code nor Codex, when
+it has no host journal, and when its journal cannot be read. The index is in
+memory, bounded,
+and rebuilt on demand after a restart. `complete: false` means the index is
+still catching up, or is full of sessions being read and will admit this one
+on a later request. See [Swarm view](swarm.md).
 
 The continue request accepts exactly `requestId`, `revision`, and optional
 `text`; omit `text` when no direction is needed. A supplied direction is trimmed

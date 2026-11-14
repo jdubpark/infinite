@@ -5,7 +5,9 @@ import { z } from "zod";
 import type { Config } from "./types.js";
 import { assertRunnerDeployment, parseDeployment } from "./deployment.js";
 import { machineIdentity } from "./machine.js";
+import { autonomyModeSchema } from "./autonomy.js";
 import { projectSourceSchema, teamProjectSchema, teamCommandSchema, teamRetentionSchema, storageFloorSchema, teamLineupSchema } from "./team-types.js";
+import { intakeConfigSchema } from "./intake-types.js";
 
 /**
  * Provider hooks injected at launch when the config does not say. Codex hooks stay off: spike S2
@@ -23,6 +25,14 @@ export const usageConfigSchema = z.object({
 export type UsageConfig = z.infer<typeof usageConfigSchema>;
 export const machineLabelSchema = z.string().trim().min(1).max(80);
 
+/** Launches per rolling hour. No default: an absent key stays absent, and the service supplies 30 and 80. */
+const fuseCeilingsSchema = z.object({ launchesPerHour: z.number().int().min(1).max(1000).optional() }).strict();
+export const fuseConfigSchema = z.object({
+  project: fuseCeilingsSchema.optional(),
+  host: fuseCeilingsSchema.optional(),
+  projects: z.record(z.string().min(1), fuseCeilingsSchema).optional(),
+}).strict();
+export type FuseConfig = z.infer<typeof fuseConfigSchema>;
 /** Outcome measurement settings. No default here: each consumer applies its own default where it reads the value. */
 export const outcomeSettingsSchema = z.object({
   holdDays: z.number().int().min(1).max(365).optional(),
@@ -32,8 +42,11 @@ export const outcomeSettingsSchema = z.object({
 const schema = z
   .object({
     linear: z.object({ apiKeyFile: z.string().refine(isAbsolute), endpoint: z.url().optional() }).strict().optional(),
+    hostLoad: z.object({ minAvailableMemoryGiB: z.number().min(0).max(4096), maxLoadPerCpu: z.number().positive().max(64) }).strict().optional(),
+    intake: intakeConfigSchema.optional(),
     teams: z.object({ workspaceDir: z.string().refine(isAbsolute), commandPrefix: teamCommandSchema.optional(), lineup: teamLineupSchema.optional(), trustWorkspaces: z.boolean().optional(), publishHeads: z.boolean().default(true), stallMinutes: z.number().int().min(5).max(1440).optional(), checkMinutes: z.number().positive().max(240).optional(), retention: teamRetentionSchema.optional(), storageFloor: storageFloorSchema.optional(), outcomes: outcomeSettingsSchema.optional() }).strict().optional(),
     machine: z.object({ id: z.uuid(), label: machineLabelSchema }).strict().optional(),
+    autonomy: z.object({ defaultMode: autonomyModeSchema.optional(), fuse: fuseConfigSchema.optional() }).strict().optional(),
     cmux: z.object({ enabled: z.boolean(), command: z.string().min(1).optional(), hooksDir: z.string().refine(isAbsolute).optional() }).strict().optional(),
     remote: z.object({ enabled: z.boolean(), relay: z.object({ url: z.url(), tokenFile: z.string().refine(isAbsolute) }).strict().optional() }).strict().optional(),
     deployment: z.unknown().optional(),
@@ -133,8 +146,8 @@ const schema = z
         endpoint: z.url().default("https://exp.host/--/api/v2/push/send"),
         detail: z.enum(["minimal", "full"]).default("minimal"),
         events: z
-          .array(z.enum(["needs-you", "turn-finished", "exited", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "team-blocked", "host-storage"]))
-          .default(["needs-you", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "host-storage"]),
+          .array(z.enum(["needs-you", "turn-finished", "exited", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "team-blocked", "host-storage", "autonomy-interrupt"]))
+          .default(["needs-you", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "host-storage", "autonomy-interrupt"]),
       })
       .strict()
       .optional(),
@@ -142,16 +155,9 @@ const schema = z
   .strict();
 export const hashToken = (token: string) =>
   createHash("sha256").update(token).digest("hex");
-export function validateLinearConfig(config: Config) {
-  if (config.projects.some(project => project.linear) && !config.linear)
-    throw new Error("Linear projects require a host credential configuration");
-  if (!config.linear) return;
-  const endpoint = new URL(config.linear.endpoint ?? "https://api.linear.app/graphql");
-  const local = config.environment === "local" && endpoint.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname);
-  if ((!local && endpoint.href !== "https://api.linear.app/graphql") || endpoint.username || endpoint.password || endpoint.search || endpoint.hash || endpoint.pathname !== "/graphql")
-    throw new Error("Linear requires its official HTTPS endpoint; loopback HTTP is allowed for local development");
+/** Throws `message` unless `file` is an absolute 0600 regular file outside runtime state, run, team, and project directories. */
+export function assertPrivateCredentialFile(config: Config, file: string, message: string): void {
   try {
-    const file = config.linear.apiKeyFile;
     if (!isAbsolute(file) || (statSync(file).mode & 0o777) !== 0o600 || !statSync(file).isFile()) throw new Error();
     const actual = realpathSync(file);
     for (const directory of [config.stateDir, config.runDir, config.teams?.workspaceDir, ...config.projects.flatMap(project => [project.path, project.teamworkDir])].filter((value): value is string => Boolean(value))) {
@@ -160,14 +166,62 @@ export function validateLinearConfig(config: Config) {
       const rel = relative(base, actual);
       if (rel !== ".." && !rel.startsWith("../") && !isAbsolute(rel)) throw new Error();
     }
-    const credential = readFileSync(file, "utf8").trim();
+  } catch { throw new Error(message); }
+}
+export function validateLinearConfig(config: Config) {
+  if (config.projects.some(project => project.linear) && !config.linear)
+    throw new Error("Linear projects require a host credential configuration");
+  if (!config.linear) return;
+  const endpoint = new URL(config.linear.endpoint ?? "https://api.linear.app/graphql");
+  const local = config.environment === "local" && endpoint.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname);
+  if ((!local && endpoint.href !== "https://api.linear.app/graphql") || endpoint.username || endpoint.password || endpoint.search || endpoint.hash || endpoint.pathname !== "/graphql")
+    throw new Error("Linear requires its official HTTPS endpoint; loopback HTTP is allowed for local development");
+  const message = "Linear API key must be a nonempty private 0600 file outside runtime state and project workspaces";
+  try {
+    assertPrivateCredentialFile(config, config.linear.apiKeyFile, message);
+    const credential = readFileSync(config.linear.apiKeyFile, "utf8").trim();
     if (!credential || credential.length > 4096 || /\s/.test(credential)) throw new Error();
-  } catch { throw new Error("Linear API key must be a nonempty private 0600 file outside runtime state and project workspaces"); }
+  } catch { throw new Error(message); }
+}
+const SLACK_OFFICIAL_ENDPOINT = "https://slack.com/api";
+/** Checks the intake block: Linear credential, authorship gate, Slack tokens and endpoint, and the answer project. */
+export function validateIntakeConfig(config: Config): void {
+  const intake = config.intake;
+  if (!intake) return;
+  if (!config.linear) throw new Error("Intake requires a host Linear credential");
+  if (intake.requireSlackThread && !intake.slack) throw new Error("requireSlackThread needs intake.slack");
+  // Without a Slack block no thread is read or bound, so mirroring would leave the outcome nowhere.
+  if (intake.linear.commentsMirrorToSlack && !intake.slack) throw new Error("commentsMirrorToSlack needs intake.slack");
+  const slack = intake.slack;
+  if (slack) {
+    if (intake.requireSlackThread && !slack.linearAgentUserId) throw new Error("requireSlackThread needs intake.slack.linearAgentUserId");
+    if (slack.bindByMention && intake.requireSlackThread) throw new Error("bindByMention cannot be used with requireSlackThread");
+    const tokenMessage = "Slack token must be a nonempty private 0600 file outside runtime state and project workspaces";
+    for (const file of [slack.appTokenFile, slack.botTokenFile]) {
+      assertPrivateCredentialFile(config, file, tokenMessage);
+      try {
+        const token = readFileSync(file, "utf8").trim();
+        if (!token || token.length > 4096 || /\s/.test(token)) throw new Error();
+      } catch { throw new Error(tokenMessage); }
+    }
+    const endpoint = new URL(slack.endpoint ?? SLACK_OFFICIAL_ENDPOINT);
+    const local = config.environment === "local" && endpoint.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname);
+    if ((!local && endpoint.href !== SLACK_OFFICIAL_ENDPOINT) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash)
+      throw new Error("Slack requires its official HTTPS endpoint; loopback HTTP is allowed for local development");
+  }
+  const answerProjectId = intake.mission.answerProjectId;
+  if (answerProjectId && !config.projects.some(project => project.id === answerProjectId))
+    throw new Error("intake.mission.answerProjectId must name a configured project");
 }
 export function readConfig(file: string): { config: Config; key: Buffer } {
-  const config = schema.parse(JSON.parse(readFileSync(file, "utf8"))) as Config;
+  const parsed = schema.parse(JSON.parse(readFileSync(file, "utf8")));
+  for (const id of Object.keys(parsed.autonomy?.fuse?.projects ?? {})) {
+    if (!parsed.projects.some(project => project.id === id)) throw new Error("Fuse limits name a project that is not configured");
+  }
+  const config = parsed as Config;
   config.deployment = parseDeployment(config.deployment);
   validateLinearConfig(config);
+  validateIntakeConfig(config);
   assertRunnerDeployment(config);
   for (const path of [
     config.stateDir,

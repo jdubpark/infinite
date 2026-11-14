@@ -95,6 +95,8 @@ export interface Project {
   teamworkDir?: string;
   /** Where the host's copy of this project comes from: GitHub (followed by the host) or laptop workspace sync. Absent means laptop. */
   source?: import("./team-types.js").ProjectSource;
+  /** Effective autonomy mode of an applied enrollment. Set only by RepoEnrollmentService; read with autonomyOf(). */
+  autonomy?: import("./autonomy.js").AutonomyMode;
 }
 export interface AgentProfile {
   command: string;
@@ -109,6 +111,10 @@ export interface AgentProfile {
 export interface Config {
   /** Host-only credential; never copied into provider environment variables or prompts. */
   linear?: { apiKeyFile: string; endpoint?: string };
+  /** Launch gate for automatic launches: the host holds them while available memory is below the floor or one-minute load per CPU is above the ceiling. */
+  hostLoad?: { minAvailableMemoryGiB: number; maxLoadPerCpu: number };
+  /** Linear and Slack request intake; the Linear credential above is required when this is set. */
+  intake?: import("./intake-types.js").IntakeConfig;
   /** Separate working copies, writable by the host and selected provider execution account. */
   teams?: {
     workspaceDir: string; commandPrefix?: import("./team-types.js").TeamCommand; lineup?: import("./team-types.js").TeamLineup;
@@ -126,6 +132,8 @@ export interface Config {
     outcomes?: { holdDays?: number; retentionDays?: number };
   };
   machine?: { id: string; label: string };
+  /** Operator default for an enrollment that has no saved mode. Only defaultMode exists in this block so far. */
+  autonomy?: { defaultMode?: import("./autonomy.js").AutonomyMode; fuse?: import("./config.js").FuseConfig };
   cmux?: { enabled: boolean; command?: string; hooksDir?: string };
   remote?: { enabled: boolean; relay?: { url: string; tokenFile: string } };
   /** Token prices (USD per million) and per-provider spend budgets for the usage ledger. */
@@ -166,7 +174,7 @@ export interface Config {
     accessTokenFile?: string;
     endpoint: string;
     detail: "minimal" | "full";
-    events: ("needs-you" | "turn-finished" | "exited" | "recording-error" | "goal-started" | "goal-finished" | "goal-stuck" | "goal-cancelled" | "team-started" | "team-finished" | "team-stuck" | "team-cancelled" | "team-blocked" | "host-storage")[];
+    events: ("needs-you" | "turn-finished" | "exited" | "recording-error" | "goal-started" | "goal-finished" | "goal-stuck" | "goal-cancelled" | "team-started" | "team-finished" | "team-stuck" | "team-cancelled" | "team-blocked" | "host-storage" | "autonomy-interrupt")[];
   };
 }
 export interface Receipt {

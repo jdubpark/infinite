@@ -163,6 +163,16 @@ Dictation appends to the field's latest text and never sends it. When a field lo
 
 The `Notifier` in the API process polls session attention plus goal and team lifecycle state, and sends configured priority push events through Expo on transitions. Goal-owned team runs use goal notifications. `turn-finished` and `exited` remain opt-in; items already present when the API starts are primed silently. Push only happens while the API runs.
 
+## Request intake
+
+Intake is a second way to start a mission, next to `POST /api/missions`. The host
+polls Linear for issues the owner filed with the intake label, checks each one, and
+keeps a record per issue in sealed state. The Slack surface posts into the thread a
+record is bound to and applies the owner's replies to the mission. Intake starts
+missions through the same admission function as `POST /api/missions`, so the group
+and handoff checks apply to both. Only the owner's messages are stored as
+requests or acted on. See [intake](intake.md).
+
 ## Provider boundary
 
 Ordinary sessions use each provider's native interactive CLI in a PTY. This preserves the native interface and conversation history. Model-routed OpenCode team members use headless `run` mode, with the permission limits described in [agent teams](teams.md#model-routing). Local `--help` confirmed launch/resume flags; all four providers have now completed authenticated turns and tool edits on the owner-controlled host; see the [commissioning record](../deploy/ubuntu/commissioning.md).

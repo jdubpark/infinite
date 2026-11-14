@@ -2511,4 +2511,5 @@ export function importLegacy(store: EvidenceStore, input: { dryRun: boolean; lin
 - A `decision` use of legacy rows (umbrella C6), and memory's read of them (INF-141).
 - A withdrawal or edit of a legacy line other than a new id with `supersedes`, and a purge of legacy rows by project.
 - A goal removal path. `goals.ts` has none, so the host test cannot reach a removed goal; Task 5 holds the rule.
+- An exact answer for a superseded line that the host never saw and that outlives its mark. A mark made before its line arrives holds the superseding line's time, and retention removes it at that time. If the superseded line was recorded later than the line that supersedes it, and it arrives only after that mark is gone, it imports. *(Coordinator's call: it needs a line that supersedes a newer one and an import more than the retention apart. A legacy row is a display-only claim, so the cost is one row the operator meant to replace.)*
 - Rates for members that have no task (a spec non-goal). The roll-up counts member results and their cost only.

@@ -37,19 +37,30 @@ function stubTeams() {
   const views = new Map<string, TeamView>();
   const launches: { request: CreateTeam; context: TeamGoalContext; lineup: TeamLineup }[] = [];
   const cancels: string[] = [];
+  /** Runs holding an unresolved delivery attempt. */
+  const deliveryAttempts = new Set<string>();
   const usage = () => ({ total: emptyUsage(), byProfile: {}, byProvider: {}, unmeasuredMembers: 0, partialMembers: 0 });
   const service = {
-    launches, cancels,
+    launches, cancels, deliveryAttempts,
+    /** The next creation fails with this error, or never settles (`hang`), as if the host stopped mid-call. */
+    failNext: undefined as Error | "hang" | undefined,
     get(id: string) {
       const found = views.get(id);
       if (!found) throw new TeamError(404, "team-not-found", "The team was not found.");
       return structuredClone(found);
     },
     goalIdOf: (id: string) => views.get(id)?.goal?.id,
+    hasDeliveryAttempt: (id: string) => deliveryAttempts.has(id),
     async createForGoal(request: CreateTeam, context: TeamGoalContext, selected: TeamLineup) {
       createTeamSchema.parse(request); teamGoalContextSchema.parse(context);
+      const failure = service.failNext;
+      service.failNext = undefined;
+      if (failure === "hang") return new Promise<never>(() => {});
+      if (failure) throw failure;
       const prior = views.get(request.requestId);
       if (prior) return structuredClone(prior);
+      // The team service's budget check refuses a new run whose window has lapsed.
+      if (Date.now() >= Date.parse(context.deadlineAt)) throw new TeamError(409, "goal-deadline", "The goal reached its deadline.");
       launches.push(structuredClone({ request, context, lineup: selected }));
       const at = new Date().toISOString();
       views.set(request.requestId, { id: request.requestId, projectId: request.projectId, status: "planning", revision: 1, createdAt: at, updatedAt: at,
@@ -327,4 +338,126 @@ test("a finite goal keeps today's request fingerprint, record, retention, and cy
     assert.equal(key in stored, false, `A finite goal record has no ${key}`);
   for (const cycle of stored.cycles as Record<string, unknown>[])
     for (const key of ["class", "settledAt", "lineup", "wake", "deadlineStop"]) assert.equal(key in cycle, false, `A finite cycle has no ${key}`);
+});
+
+type SavedLaunch = { launch?: { request: CreateTeam; context: TeamGoalContext; wake?: unknown } };
+
+test("a launch whose run was never created passes the mode gate again after a restart, then starts with a fresh window", async t => {
+  const { f, teams, goals, open, advance } = fixture(t);
+  teams.failNext = "hang";
+  const created = await goals.create(standing());
+  goals.start();
+  const saved = await until(() => f.readRecord<SavedLaunch>("goal", created.id).launch, Boolean);
+  goals.close();
+
+  // The host restarts after the saved window lapsed, and the project became supervised meanwhile.
+  advance(10);
+  f.config.projects[0]!.autonomy = "supervised";
+  const restarted = open();
+  restarted.start();
+  const paused = await until(() => restarted.get(created.id), goal => goal.status === "paused");
+  assert.equal(paused.reasonCode, "supervised-mode");
+  assert.equal(teams.launches.length, 0, "No run starts after the project's authority was withdrawn");
+  assert.equal(f.readRecord<SavedLaunch>("goal", created.id).launch, undefined);
+
+  f.config.projects[0]!.autonomy = "autonomous";
+  await restarted.resume(created.id, action(paused));
+  const first = await until(() => teams.launches[0], Boolean);
+  assert.ok(Date.parse(saved.context.deadlineAt) < Date.now());
+  assert.equal(first.context.deadlineAt, new Date(Date.now() + 5 * minute).toISOString(), "The unstarted cycle gets a fresh window");
+  assert.equal(first.context.cycle, 1);
+});
+
+test("a restart past an unstarted cycle's window and creation failures that pass with time do not end a standing goal", async t => {
+  const { f, teams, goals, open, advance } = fixture(t);
+  teams.failNext = "hang";
+  const created = await goals.create(standing());
+  goals.start();
+  await until(() => f.readRecord<SavedLaunch>("goal", created.id).launch, Boolean);
+  goals.close();
+  advance(10);
+  const restarted = open();
+  restarted.start();
+  const first = await until(() => teams.launches[0], Boolean);
+  assert.equal(first.context.deadlineAt, new Date(Date.now() + 5 * minute).toISOString());
+  teams.settle(first.request.requestId, "ready-for-review");
+  await until(() => restarted.get(created.id), goal => goal.cycles[0]!.class === "reviewed");
+
+  teams.failNext = new TeamError(507, "host-storage-low", "The team workspace volume is low on space.");
+  advance(30);
+  const waiting = await until(() => restarted.get(created.id), goal => /could not be created/.test(goal.reason ?? ""));
+  assert.equal(waiting.status, "running");
+  await sleep(1200);
+  assert.equal(teams.launches.length, 1, "The retry waits a minute");
+  advance(1);
+  const second = await until(() => teams.launches[1], Boolean);
+  assert.equal(second.context.cycle, 2);
+  const started = await until(() => restarted.get(created.id), goal => goal.activeTeamId === second.request.requestId);
+  assert.equal(started.reason, undefined);
+
+  teams.settle(second.request.requestId, "ready-for-review");
+  await until(() => restarted.get(created.id), goal => !goal.activeTeamId);
+  teams.failNext = new TeamError(409, "provider-not-configured", "Every selected team provider must be configured and available on this host.");
+  advance(30);
+  await until(() => restarted.get(created.id), goal => goal.status === "blocked");
+});
+
+test("pausing a launch whose run was never created keeps its wake for the resume", async t => {
+  const { f, teams, goals, open, advance } = fixture(t);
+  const signals: ProjectSignal[] = [];
+  const reader: SignalReader = { head: () => signals.length, after: (projectId, seq) => signals.filter(signal => signal.projectId === projectId && signal.seq > seq) };
+  goals.useSignals(reader);
+  const created = await goals.create(standing({}, 1440, ["external-commit"]));
+  goals.start();
+  const first = await until(() => teams.launches[0], Boolean);
+  teams.settle(first.request.requestId, "no-change");
+  await until(() => goals.get(created.id), goal => !goal.activeTeamId);
+  advance(10);
+  teams.failNext = "hang";
+  signals.push({ seq: 1, id: randomUUID(), projectId: "fixture", kind: "external-commit", key: "commit", at: new Date().toISOString(), commit: "abc1234def5678" });
+  await until(() => f.readRecord<SavedLaunch>("goal", created.id).launch?.wake, Boolean);
+  goals.close();
+
+  // After the restart the owner pauses before the scheduler reconciles the launch.
+  const restarted = open();
+  restarted.useSignals(reader);
+  await restarted.pause(created.id, action(restarted.get(created.id)));
+  restarted.start();
+  const held = await until(() => restarted.get(created.id), goal => goal.pendingWake !== undefined);
+  assert.equal(held.status, "paused");
+  assert.equal(held.signalCursor, 1);
+  assert.deepEqual(held.pendingWake?.signals.map(signal => signal.id), [signals[0]!.id]);
+  assert.equal(f.readRecord<SavedLaunch>("goal", created.id).launch, undefined);
+
+  await restarted.resume(created.id, action(held));
+  const woken = await until(() => teams.launches[1], Boolean);
+  assert.match(woken.request.objective, /- commit abc1234def56 landed on the base branch outside this host's runs/, "The resume acts on the saved signal, a day before the cadence");
+});
+
+test("a delivery member that never launched leaves no open operation; a recorded delivery attempt blocks the goal", async t => {
+  const { teams, goals, advance } = fixture(t);
+  const created = await goals.create(standing());
+  goals.start();
+  const delivery = () => [{ memberId: randomUUID(), role: "delivery", revision: 1, status: "stopped" }] as TeamView["members"];
+  const first = await until(() => teams.launches[0], Boolean);
+  teams.settle(first.request.requestId, "blocked", { reason: "The cycle reached its time limit.", members: delivery() });
+  const settled = await until(() => goals.get(created.id), goal => goal.cycles[0]!.class !== undefined);
+  assert.equal(settled.status, "running", "A queued delivery member is not a delivery attempt");
+  advance(30);
+
+  const second = await until(() => teams.launches[1], Boolean);
+  teams.deliveryAttempts.add(second.request.requestId);
+  teams.settle(second.request.requestId, "blocked", { reason: "The delivery agent stopped.", members: delivery() });
+  const blocked = await until(() => goals.get(created.id), goal => goal.status === "blocked");
+  assert.equal(blocked.reasonCode, "external-operation");
+});
+
+test("a standing goal refuses an objective over 24,000 bytes; a finite goal keeps its character limit", async t => {
+  const { goals } = fixture(t);
+  // 9,000 Hangul syllables are 27,000 bytes of UTF-8 and pass the 12,000-character schema limit.
+  await assert.rejects(goals.create(standing({ objective: "\uAC00".repeat(9000) })),
+    (error: unknown) => error instanceof TeamError && error.code === "standing-objective-too-large");
+  await goals.create(standing({ objective: "\uAC00".repeat(8000) }));
+  const { standing: _standing, ...finite } = standing({ objective: "\uAC00".repeat(9000) });
+  await goals.create(finite as CreateGoal);
 });

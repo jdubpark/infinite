@@ -1,6 +1,6 @@
-import type { CycleClass, GoalCycle, ProductGoal } from "./goal-types.js";
+import type { CycleClass, CycleWake, GoalCycle, ProductGoal } from "./goal-types.js";
 import type { TeamView } from "./team-types.js";
-import type { PendingWake } from "./signals/types.js";
+import { maxPendingWakeSignals, type PendingWake } from "./signals/types.js";
 
 /** Pure rules of a standing objective (design Part 3). GoalService owns every state change. */
 export const keptCycles = 50;
@@ -40,17 +40,16 @@ export function classifyCycle(input: {
 }
 
 /**
- * Rule 4 of 3.4: an external operation a settled cycle left unresolved. The run view exposes the delivery
- * receipt, delivery recovery, a pending operation's source role, the delivery members, and the publication
- * state. It does not expose the stored delivery attempt or a head push still in flight.
+ * Rule 4 of 3.4: an external operation a settled cycle left unresolved. `deliveryAttempt` is the run's stored
+ * delivery attempt, which the team service records just before a delivery member launches and clears when the
+ * delivery resolves; a delivery member that never launched leaves none. A head push still in flight is not visible.
  */
-export function unresolvedOperation(team: Pick<TeamView, "status" | "revision" | "headCommit" | "deliveryReceipt" | "deliveryRecovery" | "pullRequest" | "pendingOperation" | "publication" | "members">): string | undefined {
+export function unresolvedOperation(team: Pick<TeamView, "status" | "headCommit" | "deliveryReceipt" | "deliveryRecovery" | "pendingOperation" | "publication">, deliveryAttempt: boolean): string | undefined {
   if (team.deliveryReceipt && team.status !== "merged")
     return "A cycle reported a merge that the host has not validated as a baseline. Inspect its delivery before more work starts.";
   if (team.deliveryRecovery && team.deliveryRecovery.status !== "complete")
     return "A cycle stopped during delivery recovery. Inspect its remote branch and pull request before more work starts.";
-  if (team.pendingOperation?.sourceRole === "delivery" ||
-      (team.status !== "merged" && !team.pullRequest && team.members.some(member => member.role === "delivery" && member.revision === team.revision)))
+  if (team.pendingOperation?.sourceRole === "delivery" || deliveryAttempt)
     return "A cycle stopped with an unresolved delivery attempt. Inspect its remote branch and pull request before more work starts.";
   const failure = team.publication?.failure;
   if (team.headCommit && failure?.commit === team.headCommit && team.publication?.commit !== team.headCommit)
@@ -99,4 +98,20 @@ export function wakeObjective(base: string, pending: PendingWake | undefined, li
   const omitted = lines.length - kept + pending.dropped;
   const withCount = omitted > 0 ? `${block}\n- ${omitted} more ${omitted === 1 ? "signal" : "signals"} not listed` : block;
   return `${text}\n\n${fits(`${text}\n\n${withCount}`) ? withCount : block}`;
+}
+
+/** What a cycle records of the wake it consumed. */
+export const cycleWakeOf = (wake: PendingWake): CycleWake =>
+  ({ signalIds: wake.signals.map(signal => signal.id), dropped: wake.dropped, ...(wake.owner ? { owner: true as const } : {}) });
+
+/**
+ * Returns a withdrawn launch's wake to the goal ahead of the signals read since, keeping the newest
+ * `maxPendingWakeSignals`. Nothing the withdrawn launch consumed is lost except by that bound, which counts it.
+ */
+export function restoreWake(withdrawn: PendingWake | undefined, later: PendingWake | undefined): PendingWake | undefined {
+  if (!withdrawn || !later) return withdrawn ?? later;
+  const signals = [...withdrawn.signals, ...later.signals.filter(signal => !withdrawn.signals.some(value => value.id === signal.id))];
+  const overflow = Math.max(0, signals.length - maxPendingWakeSignals);
+  return { signals: signals.slice(overflow), dropped: withdrawn.dropped + later.dropped + overflow, since: withdrawn.since,
+    ...(withdrawn.owner || later.owner ? { owner: true } : {}) };
 }

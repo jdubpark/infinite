@@ -4,21 +4,22 @@ import { join } from "node:path";
 import { writeSealed, unseal } from "./vault.js";
 import { autonomyOf, type AutonomyMode } from "./autonomy.js";
 import { TeamService, TeamError } from "./teams.js";
-import { goalActionSchema, goalExtendSchema, goalOutcomeSchema, goalParallelismSchema, goalSteerSchema, parseCreateGoal, type CreateGoal, type CycleClass, type CycleWake, type GoalCycle, type GoalReasonCode, type ProductGoal } from "./goal-types.js";
+import { goalActionSchema, goalExtendSchema, goalOutcomeSchema, goalParallelismSchema, goalSteerSchema, parseCreateGoal, type CreateGoal, type CycleClass, type GoalCycle, type GoalReasonCode, type ProductGoal } from "./goal-types.js";
 import type { Config } from "./types.js";
 import type { CreateTeam, TeamGoalContext, TeamView } from "./team-types.js";
 import { addRollups, emptyRollup, type StoredRollup, type UsageRollup } from "./team-usage.js";
 import type { LinearService } from "./linear.js";
 import { applyFuseReason } from "./fuse/rules.js";
 import type { FuseGate } from "./fuse/types.js";
-import { addToPendingWake, type ProjectSignal, type SignalReader } from "./signals/types.js";
-import { cadenceDue, classifyCycle, defaultWakeMinGapMinutes, foldedCycles, isReviewed, keptCycles, latestReviewed, maxFailedCycles, maxPreviousWork, unresolvedOperation, wakeObjective } from "./goal-standing.js";
+import { addToPendingWake, type PendingWake, type ProjectSignal, type SignalReader } from "./signals/types.js";
+import { cadenceDue, classifyCycle, cycleWakeOf, defaultWakeMinGapMinutes, foldedCycles, isReviewed, keptCycles, latestReviewed, maxFailedCycles, maxPreviousWork, restoreWake, runObjectiveLimitBytes, unresolvedOperation, wakeObjective } from "./goal-standing.js";
 
 type Action = { requestId: string; revision: number };
 /** `parallelism` remains readable only so a pre-migration queued owner control can be discarded safely. */
 type PendingControl = { action: "pause" | "resume" | "cancel" | "steer" | "parallelism"; requestId: string; teamId: string; revision: number; text?: string; parallelism?: number };
 type GoalExtensionIntent = Action & { minutes: number; fingerprint: string; teamId?: string; targetDeadlineAt?: string; targetCeilingAt?: string; failures?: number };
-type PendingLaunch = { request: CreateTeam; context: TeamGoalContext; autonomy?: AutonomyMode; wake?: CycleWake };
+/** `wake` is the standing goal's pending wake this launch consumed, returned to the goal if the run is never created. */
+type PendingLaunch = { request: CreateTeam; context: TeamGoalContext; autonomy?: AutonomyMode; wake?: PendingWake };
 type Stored = {
   goal: ProductGoal;
   fingerprint: string;
@@ -26,6 +27,8 @@ type Stored = {
   launch?: PendingLaunch;
   control?: PendingControl;
   extensionIntent?: GoalExtensionIntent;
+  /** Standing goals: after a retryable failure to create a cycle's run, no cycle starts before this time. */
+  launchRetryAt?: string;
 };
 const now = () => new Date().toISOString();
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -33,6 +36,17 @@ const terminal = new Set(["blocked", "ready-for-review", "no-opportunity", "limi
 const timeLimitReason = "The approved time limit has expired.";
 const repeatedFailuresReason = "Three cycles in a row failed, so this standing goal paused. Review the failed cycles, then resume it to reset the count.";
 const maxExtensionFailures = 3;
+const launchRetryMs = 60_000;
+/**
+ * Failures to create a standing cycle's run that leave no run and pass with time: storage the host could not measure
+ * or found low, a window that lapsed while creation waited (the retry gets a fresh one), a mission's hold on the
+ * repository, and file or process resource exhaustion. Everything else (configuration, lineup, parent, schema) blocks.
+ */
+const retryableCreation = new Set(["host-storage-low", "host-storage-unavailable", "goal-deadline", "mission-repository-reserved", "ENOSPC", "EDQUOT", "EMFILE", "ENFILE", "EAGAIN", "EBUSY"]);
+function errorCode(error: unknown) {
+  const code: unknown = error instanceof Error ? (error as Error & { code?: unknown }).code : undefined;
+  return typeof code === "string" ? code : undefined;
+}
 /** Goals created before ceilings existed use their original creation-time budget. */
 const ceilingOf = (goal: ProductGoal) => goal.ceilingAt ?? new Date(Date.parse(goal.createdAt) + (goal.maxTotalMinutes ?? goal.maxMinutes) * 60000).toISOString();
 /** Flatten totals for existing cycle displays while retaining the complete rollup for parent aggregation. */
@@ -187,6 +201,9 @@ export class GoalService {
       if (request.linearIssueId && !project.linear) throw new TeamError(409, "linear-not-configured", "Configure Linear for this project before linking an issue.");
       if (request.standing && autonomyOf(project) !== "autonomous")
         throw new TeamError(409, "standing-requires-autonomy", "A standing goal needs an autonomous project. Start a finite goal, or make the project autonomous first.");
+      // Every cycle passes the whole objective; the host never cuts the owner's text to fit its wake reasons.
+      if (request.standing && Buffer.byteLength(request.objective) > runObjectiveLimitBytes)
+        throw new TeamError(400, "standing-objective-too-large", `A standing goal's objective must fit in ${runObjectiveLimitBytes.toLocaleString("en-US")} bytes of UTF-8. Shorten it and start the goal again.`);
       const { requestId, parallelism: _legacyParallelism, ...fields } = request;
       const createdAt = now();
       const cursor = request.standing?.wakeOn ? this.signalHead() : undefined;
@@ -472,8 +489,22 @@ export class GoalService {
   }
   private async launch(stored: Stored) {
     const pending = stored.launch!;
-    const team = await this.teams.createForGoal(pending.request, pending.context, stored.goal.lineup, stored.goal.linearTracking === true, autonomyOf(pending));
+    let team: TeamView;
+    try { team = await this.teams.createForGoal(pending.request, pending.context, stored.goal.lineup, stored.goal.linearTracking === true, autonomyOf(pending)); }
+    catch (error) {
+      // A standing goal outlives a creation failure that passes with time. With no run created, the cycle goes back
+      // through every gate a minute later and gets a fresh window. A created run, or any other failure, still blocks.
+      const code = errorCode(error);
+      if (this.closed || !stored.goal.standing || !code || !retryableCreation.has(code) || this.runCreated(pending.request.requestId)) throw error;
+      const reason = `The next cycle's run could not be created: ${(error as Error).message} The goal retries in a minute.`;
+      if (stored.goal.reason !== reason) this.event(stored, reason);
+      stored.goal.reason = reason;
+      stored.launchRetryAt = new Date(Date.now() + launchRetryMs).toISOString();
+      this.withdrawLaunch(stored);
+      return;
+    }
     if (this.closed) return;
+    if (stored.launchRetryAt) { stored.launchRetryAt = undefined; stored.goal.reason = undefined; }
     if (!stored.goal.cycles.some(cycle => cycle.teamId === team.id)) {
       stored.goal.cycles.push(this.cycleEntry(stored.goal, team, pending));
       if (stored.goal.standing) this.fold(stored.goal);
@@ -517,7 +548,10 @@ export class GoalService {
       this.setControl(stored, "cancel"); this.event(stored, goal.reason); this.save(stored);
     }
     if (stored.launch) {
-      if (goal.status === "paused" || terminal.has(goal.status)) {
+      // A standing launch whose run was never created (a restart, or a failed creation) is withdrawn: its wake returns
+      // to the goal and the next cycle passes every gate again, with a fresh window, before any run is created.
+      if (goal.standing && !this.runCreated(stored.launch.request.requestId)) this.withdrawLaunch(stored);
+      else if (goal.status === "paused" || terminal.has(goal.status)) {
         try {
           const team = this.teams.get(stored.launch.request.requestId);
           if (!goal.cycles.some(cycle => cycle.teamId === team.id)) goal.cycles.push(this.cycleEntry(goal, team, stored.launch));
@@ -636,7 +670,7 @@ export class GoalService {
     // Every cycle of a goal keeps the goal's pinned mode; a goal with no pin is supervised.
     const autonomy = autonomyOf(goal);
     stored.launch = { context, autonomy, request: { requestId: randomUUID(), projectId: goal.projectId, provider: goal.lineup.coordinator.provider, useConfiguredLineup: true, title: `${goal.title} · ${cycle}`.slice(0, 100), objective, parallelism: goal.parallelism },
-      ...(wake ? { wake: { signalIds: wake.signals.map(signal => signal.id), dropped: wake.dropped, ...(wake.owner ? { owner: true as const } : {}) } } : {}) };
+      ...(wake ? { wake } : {}) };
     if (wake) goal.pendingWake = undefined;
     this.save(stored); await this.launch(stored);
   }
@@ -661,6 +695,7 @@ export class GoalService {
       const woken = goal.pendingWake !== undefined && Date.now() >= settled + this.wakeGapMinutes() * 60000;
       if (Date.now() < cadenceDue(last, standing.cadenceMinutes, Date.now()) && !woken) return;
     }
+    if (stored.launchRetryAt && Date.now() < Date.parse(stored.launchRetryAt)) return;
     if (!trackingReady) return;
     const fuse = applyFuseReason(goal, this.fuse?.check({ projectId: goal.projectId }));
     if (fuse.changed) { if (fuse.wait) this.event(stored, goal.reason!); this.save(stored); }
@@ -671,6 +706,14 @@ export class GoalService {
     goal.ceilingAt = new Date(startedAt + (goal.maxTotalMinutes ?? goal.maxMinutes) * 60000).toISOString();
     goal.lineup = structuredClone(this.config.teams!.lineup!);
     await this.prepare(stored, foldedCycles(goal) + goal.cycles.length + 1, Math.min(60, goal.maxMembers));
+  }
+  /** Whether the team service holds the run of this request; a launch intent without one never created its run. */
+  private runCreated(requestId: string) { return this.teams.goalIdOf(requestId) !== undefined; }
+  /** Clears a standing launch whose run was never created and returns its wake to the goal, in one write. */
+  private withdrawLaunch(stored: Stored) {
+    stored.goal.pendingWake = restoreWake(stored.launch?.wake, stored.goal.pendingWake);
+    stored.launch = undefined;
+    this.save(stored);
   }
   private hold(stored: Stored, status: "paused" | "blocked", code: GoalReasonCode, reason: string) {
     const goal = stored.goal;
@@ -699,7 +742,7 @@ export class GoalService {
       fuseOpen: !ownerStop && this.fuse?.check({ projectId: goal.projectId }).state === "open" });
     cycle.settledAt = now();
     this.event(stored, `Cycle ${cycle.cycle} settled as ${cycle.class}.`);
-    const unresolved = team && unresolvedOperation(team);
+    const unresolved = team && unresolvedOperation(team, this.teams.hasDeliveryAttempt(team.id));
     if (unresolved) {
       // A goal that already stopped keeps its own reason; the event still names the open operation.
       if (terminal.has(goal.status)) this.event(stored, unresolved);
@@ -737,7 +780,7 @@ export class GoalService {
   }
   private cycleEntry(goal: ProductGoal, team: TeamView, pending: PendingLaunch): GoalCycle {
     return { teamId: team.id, cycle: pending.context.cycle, goalRevision: pending.context.revision, status: team.status, startedAt: team.createdAt, memberCount: team.members.length, autonomy: autonomyOf(pending),
-      ...(goal.standing ? { lineup: structuredClone(goal.lineup) } : {}), ...(pending.wake ? { wake: pending.wake } : {}) };
+      ...(goal.standing ? { lineup: structuredClone(goal.lineup) } : {}), ...(pending.wake ? { wake: cycleWakeOf(pending.wake) } : {}) };
   }
   /** Keeps the newest `keptCycles` cycles, the active one, and the parent of the next cycle; older ones fold into totals. */
   private fold(goal: ProductGoal) {

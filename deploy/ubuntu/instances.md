@@ -529,6 +529,15 @@ Until that attribution check has passed, set `intake.linear.admitIssues` to
 `false`, so that only the owner's direct requests start work and no issue filed
 through Linear's Slack agent is admitted.
 
+Questions need no new scope either. Set `intake.slack.answerQuestions` to `true`
+(it needs `directRequests`) to let a mention that asks a question, or starts with
+`ask:`, be answered read-only in the thread with no Linear issue; a mention that
+starts with `work:` always files a request. Set `intake.slack.classify` to `true`
+(it needs `answerQuestions` and the top-level `jev` block) to let the reading
+service choose when the mention has neither word; the owner's mention text, cut to
+1,000 characters, is sent to it. Both default to `false`. See
+[intake](../../docs/intake.md#questions).
+
 Configure external connectors as MCP servers in the instance agent account,
 with read scopes only. A delegated permission request may add read-only
 connector calls within the owner's approved task; it does not authorize a

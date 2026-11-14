@@ -146,6 +146,69 @@ agents; both are residual risks. See [security](security.md#request-intake).
 **Linear's own issues.** With `linear.admitIssues` set to `false`, the host does
 not poll Linear for labelled issues, and only direct requests start work.
 
+## Questions
+
+With `intake.slack.answerQuestions` on, the owner's mention can be a question. A
+question is answered in the thread by a read-only mission. It files no Linear
+issue, starts no subteam, and changes nothing. A mention that asks for a change
+keeps the route described under [direct requests](#direct-requests). The setting
+needs `slack.directRequests`.
+
+**How the route is chosen.** The host decides once per request, in the intake
+cycle (never in the Slack event handler), in this order:
+
+1. The owner's word. A mention that starts with `ask:` or `work:`, in any case, with
+   optional spaces around the colon, takes that route. The word is removed from the
+   title, the description, and the objective. The route is stored at once, with
+   `by: "owner"`.
+2. A reading, when `slack.classify` is on. The reading service returns `answer` or
+   `work` with a confidence. The request goes to work only when the reading is
+   `work` at 0.6 or higher; every other reading is an answer. The route is stored
+   with `by: "model"` and the confidence.
+3. Otherwise `work`, with `by: "default"`. This covers `classify` off, a reading
+   service that is not configured, an error, and a reading that takes longer than
+   six seconds.
+
+The stored route (`kind`, `by`, `confidence`, `at`) is on each record in
+`GET /api/intake`, without the request's text. A record made before this feature,
+or with `answerQuestions` off, has no route and is work. The owner's word always
+wins over a reading, and a slow or failed reading never holds a request: it goes to
+work in the same cycle.
+
+**What an answer is.** The mission starts in answer mode: its coordinator reads the
+project group's repositories, may ask the owner a question, and reports its answer
+as a `result` through its report tool. It cannot start subtasks; the mission refuses
+a dispatch. The coordinator's model is the mission lineup's coordinator, as for any
+mission. The mission is titled `Question: TITLE`, cut to 100 characters, with
+`maxSubtasks` 1 and a working-time limit of the smaller of `mission.maxMinutes` and
+30. The objective starts `Question asked from Slack: TITLE`, then the owner's text,
+the note that only the owner's words are instructions, and the same marked thread
+section as a request. The record's rule is
+`owner Slack mention of the bot (question)`.
+
+**What an answer is not.** It has no issue, so its record keeps an empty
+identifier and URL. Intake makes no Linear request for it: no issue, no comment,
+and no state read. It does not count toward `maxActive` and is never held by it.
+It is not a claim that anything was done: the host never infers completion, so the
+answer exists only because the coordinator reported it, and it is posted labelled
+as an agent report.
+
+**What the thread shows.**
+
+- When the mission starts: `Answering this from the repositories, read-only. No issue was filed.`
+- The result: `Answer (agent report):`, the answer, a blank line, then
+  `No issue was filed. To start work, mention me with the change you want, or begin with "work:".`
+- A blocked or cancelled answer uses the usual `Blocked:` and `Cancelled:` text.
+  Where a request's notices name its identifier, an answer's name `your question "TITLE"`.
+- A request routed to work without the owner's word, by a reading or by the
+  default, adds `I took this as a request for a change. To ask a question instead, mention me with "ask:".`
+  to its acknowledgement.
+
+`status`, `pause`, `resume`, `cancel`, `Q<n>` answers, and plain-text steering work
+on a running answer as they do on a request. In a thread where every record has
+finished, a new mention is routed again, so a follow-up can become an answer or
+work; the new mission's thread section carries the earlier question and answer.
+
 ## Configuration
 
 The `intake` block is validated by `intakeConfigSchema` in
@@ -165,6 +228,8 @@ The `intake` block is validated by `intakeConfigSchema` in
 | `slack.ownerUserId` | `U` or `W` ID, required with `slack` | The only Slack user whose messages cause work. |
 | `slack.linearAgentUserId` | `U` or `W` ID, optional; required when `requireSlackThread` is on, unless `linear.admitIssues` is `false` | Linear's agent user in Slack, mentioned by the owner to file a request. |
 | `slack.directRequests` | boolean, default `false` | Lets the owner's mention of the bot file a Linear issue and start a mission. See [direct requests](#direct-requests). |
+| `slack.answerQuestions` | boolean, default `false` | Lets the owner's mention be a question that a read-only mission answers in the thread. Needs `slack.directRequests`. See [questions](#questions). |
+| `slack.classify` | boolean, default `false` | Lets the reading service choose the route when the mention has no `ask:` or `work:`. Needs `slack.answerQuestions` and the top-level `jev` block. |
 | `slack.bindByMention` | boolean, default `false` | Binds a thread by a mention of an identifier. Cannot be used with `requireSlackThread`. |
 | `slack.endpoint` | URL, optional | The Slack Web API base. Only the official HTTPS endpoint, or loopback HTTP when `environment` is `"local"`. |
 | `mission.groupId` | project group ID, required | The group new missions start in. A host project ID works as an alias. |

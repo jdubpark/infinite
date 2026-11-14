@@ -24,13 +24,18 @@ export const teamRetentionSchema = z.object({
   cancelledMinutes: z.number().int().min(0).max(10080).default(60),
   /** Hours a ready-for-review run keeps its clones; the reviewed branch is already published for review. */
   reviewHours: z.number().int().min(1).max(720).default(24),
-  /** Hours a blocked run keeps its clones; after removal the run stays blocked and cannot resume. */
+  /** Hours a blocked run keeps its clones before the host closes it as cancelled after their removal completes. */
   blockedHours: z.number().int().min(1).max(720).default(72),
   /** Minutes a stopped member whose result was integrated keeps its clone while the run continues; recovery briefs list these clones for read-only inspection. */
   memberMinutes: z.number().int().min(0).max(10080).default(60),
 }).strict();
 export type TeamRetention = z.infer<typeof teamRetentionSchema>;
 export const DEFAULT_TEAM_RETENTION: TeamRetention = teamRetentionSchema.parse({});
+/** The reason recorded when the host closes a run, goal or mission that stayed blocked for `blockedHours`. It names who closed the work and why, and never claims completion. */
+export function hostClosedBlockedReason(hours: number, lastBlocker?: string) {
+  const blocker = lastBlocker?.trim();
+  return `Closed by the host after ${hours} ${hours === 1 ? "hour" : "hours"} blocked without owner action.${blocker ? ` Last blocker: ${blocker.length > 500 ? `${blocker.slice(0, 500)}…` : blocker}` : ""}`;
+}
 
 /** Free space the workspace volume must keep for a new run to start. */
 export const storageFloorSchema = z.object({

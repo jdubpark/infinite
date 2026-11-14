@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { readdirSync } from "node:fs";
+import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
 // These integration files are sensitive to PTY contention, filesystem events, or short lease and provider-flush windows.
@@ -18,17 +20,27 @@ if (!Number.isInteger(concurrency) || concurrency < 1) {
 
 const tsx = fileURLToPath(import.meta.resolve("tsx/cli"));
 
-function run(files, fileConcurrency) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [tsx, "--test", `--test-concurrency=${fileConcurrency}`, ...files.map((file) => `tests/${file}`)], {
-      stdio: "inherit",
-    });
-    child.once("error", reject);
-    child.once("exit", (code, signal) => {
-      if (code === 0) resolve();
-      else reject(new Error(`Test process failed (${signal ?? code})`));
-    });
+// A caller that keeps only the tail of this output (a host check, a CI log) loses a failure reported early in a long run,
+// so the failed tests are named again after each phase. An interactive terminal keeps the runner's own report.
+async function run(files, fileConcurrency) {
+  const report = !process.stdout.isTTY;
+  const child = spawn(process.execPath, [tsx, "--test", `--test-concurrency=${fileConcurrency}`, ...files.map((file) => `tests/${file}`)], {
+    stdio: ["inherit", report ? "pipe" : "inherit", "inherit"],
   });
+  const failed = [];
+  const finished = [once(child, "close")];
+  if (report) {
+    const lines = createInterface({ input: child.stdout });
+    lines.on("line", (line) => {
+      process.stdout.write(`${line}\n`);
+      const name = /^\s*not ok \d+ - (.*)$/.exec(line)?.[1];
+      if (name !== undefined && !/ # (?:SKIP|TODO)\b/i.test(name)) failed.push(name);
+    });
+    finished.push(once(lines, "close"));
+  }
+  const [[code, signal]] = await Promise.all(finished);
+  if (failed.length) process.stdout.write(`# failed tests (${failed.length}):\n${failed.map((name) => `#   ${name}`).join("\n")}\n`);
+  if (code !== 0) throw new Error(`Test process failed (${signal ?? code})`);
 }
 
 await run(parallelFiles, concurrency);

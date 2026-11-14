@@ -10,7 +10,7 @@ import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { PROVIDER_NAMES, recoveryTurnEnd, type Prompt, type SignalData } from "@infinite/attention";
 import { autonomyOf, type AutonomyMode } from "./autonomy.js";
-import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamPermissionRecoveryOutcome, type TeamPermissionRecoveryRequest, type TeamPermissionRecoveryStep, type TeamPermissionRecoveryView, type TeamPublication, type TeamPublicationCategory, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, DEFAULT_TEAM_RETENTION } from "./team-types.js";
+import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamPermissionRecoveryOutcome, type TeamPermissionRecoveryRequest, type TeamPermissionRecoveryStep, type TeamPermissionRecoveryView, type TeamPublication, type TeamPublicationCategory, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, DEFAULT_TEAM_RETENTION, hostClosedBlockedReason } from "./team-types.js";
 import { memberConfiguration, type MemberConfiguration } from "./config-identity.js";
 import { ownerDirectionLines, permissionFollowUpPrompt, refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
@@ -1803,6 +1803,27 @@ export class TeamService {
     Object.assign(stored, next);
     return this.view(stored);
   }
+  /**
+   * A blocked run whose clones are gone can never resume, so it would wait on the owner for good. The host closes it
+   * and says so: the reason keeps the last blocker and claims nothing about the work. Mirrors the owner's cancel.
+   */
+  private async closeStaleBlockedRun(stored: Stored, hours: number) {
+    const { run } = stored;
+    if (run.status !== "blocked" || !run.workspaceRemovedAt || filesystemEntryExists(teamRunDirectory(run.workspace))) return;
+    const reason = hostClosedBlockedReason(hours, run.reason);
+    if (run.recovery && run.recovery.status !== "exhausted") {
+      run.recovery.status = "exhausted";
+      run.recovery.source = { ...run.recovery.source, code: "host-closed-blocked", reason };
+    }
+    run.status = "cancelled"; stored.halt = "cancel"; run.reason = reason;
+    // The outcome ledger already holds this run as settled blocked. A host close is bookkeeping, not a new outcome, so it
+    // writes no second settled event and the block stays counted.
+    stored.ledgerStatus = "cancelled";
+    // One save carries the status, reason and event: a cancelled run is never swept again, so a restart must not find it half closed.
+    this.event(stored, reason); this.save(stored);
+    this.commands.get(run.id)?.abort();
+    await this.invalidatePermissionDecisions(stored, "The host closed the blocked team before the permission request could be answered.");
+  }
   private action(id: string, action: "pause" | "resume" | "cancel", body: Action) {
     return this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
@@ -2356,7 +2377,9 @@ export class TeamService {
   private async retire(stored: Stored) {
     try {
       const { run } = stored, retention = this.retentionState(stored), policy = this.config.teams?.retention ?? DEFAULT_TEAM_RETENTION;
+      // A run a live goal, mission or handoff still retains is left alone, so it is never closed underneath its owner.
       if (this.removingRuns.has(run.id) || this.ownerPreventsRemoval(run) || this.hasPendingPreparationFrom(stored)) return;
+      const statusAtStart = run.status;
       const runDirectory = teamRunDirectory(run.workspace);
       const now = this.options?.now?.() ?? Date.now();
       const elapsed = Math.max(0, now - Date.parse(retention.statusAt));
@@ -2445,7 +2468,8 @@ export class TeamService {
           completionChanged = true;
         }
         if (completionChanged) try { this.save(stored); } catch (error) { console.warn("Could not persist a completed team workspace removal.", error); }
-        if (run.status === "cancelled" && !run.goal && !run.missionId && retentionMs !== undefined && elapsed >= retentionMs && await this.membersSettled(stored)) {
+        if (run.status === "blocked") await this.closeStaleBlockedRun(stored, policy.blockedHours);
+        if (statusAtStart === "cancelled" && run.status === "cancelled" && !run.goal && !run.missionId && retentionMs !== undefined && elapsed >= retentionMs && await this.membersSettled(stored)) {
           try { await this.deleteRecord(stored, true); }
           catch (error) { await this.reportRemovalFailure(stored, "record", error); }
         }

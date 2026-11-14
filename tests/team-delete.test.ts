@@ -203,6 +203,12 @@ test("DELETE /api/teams/:id enforces ownership and removes only settled runs", {
       const response = await fetch(`http://127.0.0.1:${config.port}/api/teams/${run.id}`, { method: "DELETE", headers: { Authorization: `Bearer ${bearer}` } });
       return { status: response.status, body: await response.json() as any };
     };
+    const cancel = async (bearer = token) => {
+      const response = await fetch(`http://127.0.0.1:${config.port}/api/teams/${run.id}/cancel`, { method: "POST",
+        headers: { Authorization: `Bearer ${bearer}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ requestId: randomUUID(), revision: run.revision }) });
+      return { status: response.status, body: await response.json() as any };
+    };
 
     const forbidden = await call(controllerToken);
     assert.equal(forbidden.status, 403);
@@ -214,11 +220,22 @@ test("DELETE /api/teams/:id enforces ownership and removes only settled runs", {
     const goalId = randomUUID();
     const goalRecord = { goal: { id: goalId, status: "running", activeTeamId: run.id, cycles: [] } };
     (host.goals as unknown as { records: Map<string, unknown> }).records.set(goalId, goalRecord);
+    run.goal = {};
     const owned = await call();
     assert.equal(owned.status, 409);
     assert.equal(owned.body.code, "goal-owned-team");
 
+    run.status = "blocked"; run.reason = "The child stopped with a blocker."; run.members = [];
+    const forbiddenCancel = await cancel(controllerToken);
+    assert.equal(forbiddenCancel.status, 403);
+    const liveBlockedCancel = await cancel();
+    assert.equal(liveBlockedCancel.status, 409);
+    assert.equal(liveBlockedCancel.body.code, "goal-owned-team");
     goalRecord.goal.status = "achieved";
+    const orphanedCancel = await cancel();
+    assert.equal(orphanedCancel.status, 200);
+    assert.equal(orphanedCancel.body.status, "cancelled");
+
     const missionId = randomUUID();
     const missionRecord = { mission: { id: missionId, status: "working", subtasks: [{ id: "active-subtask", status: "running", teamId: run.id }] } };
     (host.missions as unknown as { records: Map<string, unknown> }).records.set(missionId, missionRecord);

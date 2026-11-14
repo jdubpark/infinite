@@ -33,7 +33,7 @@ export const fuseConfigSchema = z.object({
   projects: z.record(z.string().min(1), fuseCeilingsSchema).optional(),
 }).strict();
 export type FuseConfig = z.infer<typeof fuseConfigSchema>;
-/** Settings for work that continues on its own. No default here: the routine service applies 5 minutes at read. */
+/** Settings for work that continues on its own. No default here: routines and standing goals apply 5 minutes at read. */
 export const continuityConfigSchema = z.object({
   wakeMinGapMinutes: z.number().int().min(0).max(1440).optional(),
 }).strict();

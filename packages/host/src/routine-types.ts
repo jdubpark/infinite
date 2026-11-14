@@ -4,7 +4,7 @@ import { signalKinds, type PendingWake, type SignalKind } from "./signals/types.
 
 const explicitAllowedPaths = createGoalSchema.shape.allowedPaths.unwrap();
 const explicitBudget = z.number().int();
-const { requestId: _requestId, ...goalFields } = createGoalSchema.shape;
+const { requestId: _requestId, standing: _standing, ...goalFields } = createGoalSchema.shape; // A routine never starts a standing goal; `strict` refuses the key.
 const routineGoalSchema = z.object(goalFields).extend({
   allowedPaths: explicitAllowedPaths,
   maxRuns: explicitBudget.min(1).max(10),

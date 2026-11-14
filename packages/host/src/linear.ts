@@ -154,7 +154,7 @@ export class LinearService {
   }
   updateGoal(goal: ProductGoal, optedInAtCreation = false): LinearTrackingView | undefined {
     const description = [goal.objective, `Success criteria:\n${goal.successCriteria}`, `Non-goals:\n${goal.nonGoals.join("\n") || "None specified"}`,
-      `Approved paths: ${goal.allowedPaths.join(", ")}`, `Limits: ${goal.maxRuns} feature runs; ${goal.maxMinutes} minutes; ${goal.maxMembers} agent attempts; ${goal.parallelism} parallel members.`,
+      `Approved paths: ${goal.allowedPaths.join(", ")}`, `Limits: ${goal.standing ? `standing objective, a cycle every ${goal.standing.cadenceMinutes} minutes; per cycle` : `${goal.maxRuns} feature runs`}; ${goal.maxMinutes} minutes; ${goal.maxMembers} agent attempts; ${goal.parallelism} parallel members.`,
       ...(goal.evidence.length ? [`Provided evidence:\n${goal.evidence.join("\n")}`] : [])].join("\n\n");
     const stored = this.register("goal", goal, description, optedInAtCreation, goal.linearIssueId);
     if (!stored) return goal.linearIssueId ? { status: "blocked", reason: "Configure Linear for this project before linking an existing issue." } : undefined;

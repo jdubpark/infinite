@@ -139,7 +139,7 @@ export interface Config {
     outcomes?: { holdDays?: number; retentionDays?: number };
   };
   machine?: { id: string; label: string };
-  /** Operator default for an enrollment that has no saved mode. Only defaultMode exists in this block so far. */
+  /** Owner autonomy settings: the default mode for an enrollment with no saved mode, the fuse, and continuity. */
   autonomy?: { defaultMode?: import("./autonomy.js").AutonomyMode; fuse?: import("./config.js").FuseConfig; continuity?: import("./config.js").ContinuityConfig };
   cmux?: { enabled: boolean; command?: string; hooksDir?: string };
   remote?: { enabled: boolean; relay?: { url: string; tokenFile: string } };

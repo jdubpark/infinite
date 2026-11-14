@@ -752,7 +752,7 @@ coordinator to select and build work within those boundaries.
 | Setting | Default | Accepted range or meaning |
 | --- | --- | --- |
 | `allowedPaths` | `["."]` | Repository-relative files or folders; `.` permits the entire project. No globs or parent traversal. |
-| `maxRuns` | 3 | 1–10 sequential feature cycles |
+| `maxRuns` | 3 | 1–10 sequential feature cycles; a standing goal has no cycle limit |
 | `maxMinutes` | 60 | 5–1,440 minutes from creation |
 | `extendMinutes` | 0 | 0–240 minutes added each time the deadline arrives while an agent is active; 0 turns extensions off |
 | `maxTotalMinutes` | `maxMinutes` | 5–1,440 minutes, at least `maxMinutes`; the ceiling for the deadline, including extensions |
@@ -821,6 +821,109 @@ assessment and supporting evidence. A paused goal remains resumable and cannot
 accept an outcome assessment; finish or cancel it first. Only an explicit user
 assessment can mark the goal `achieved`. Passing checks, agent approval, or an
 idle terminal cannot do so.
+
+### Standing objectives
+
+A goal can be a standing objective. It runs one cycle after another on a
+cadence and has no cycle limit. Create it with
+`standing: { shape: "objective", cadenceMinutes, wakeOn }`. The project must be
+autonomous: a supervised project refuses it with `standing-requires-autonomy`.
+A routine cannot start a standing goal, and a standing goal refuses `maxRuns`.
+Every cycle passes the whole objective, so a standing goal's objective must fit
+in 24,000 bytes of UTF-8; a longer one is refused with
+`standing-objective-too-large`. The host never cuts the owner's text.
+
+The first cycle starts when the goal is created. Each later cycle starts at the
+later of two times: the previous cycle's start plus `cadenceMinutes`, and the
+time the previous cycle settled. `cadenceMinutes` is 30 to 10,080, default
+1,440. Starts missed while the host was down coalesce into one cycle.
+
+`maxMinutes`, `extendMinutes`, `maxTotalMinutes`, and `maxMembers` apply to each
+cycle. At each cycle start the host sets the deadline and the ceiling from that
+moment and gives the cycle `maxMembers` attempts, at most 60. A cycle that passes
+its time limit is stopped, and the goal goes on. Between cycles the goal has no
+deadline, so the host refuses an extension then; an extension applies to the
+current cycle only. Each cycle takes the host's current lineup and records it.
+
+A cycle's launch is recorded before its run is created. If the run was never
+created, because the host restarted or creation failed, the host withdraws the
+launch, returns its wake to the goal, and the next cycle passes every gate again
+(mode, lineup, failure count, Linear tracking, spend fuse, and owner pause or
+cancel) with a fresh window. Creation failures that pass with time leave the
+goal `running` with the reason and retry a minute later: low or unmeasurable
+storage, a window that lapsed while creation waited, a mission holding the
+repository, and file or process resource exhaustion. Any other creation failure
+blocks the goal, as it does a finite goal.
+
+When a cycle's members have stopped, the host records its `class`:
+
+| Class | The cycle ended | Effect |
+| --- | --- | --- |
+| `reviewed` | `ready-for-review`, or `merged` with a validated baseline | It is the parent of the next cycle |
+| `no-change` | `no-change` | Normal. The next cycle starts from the same parent |
+| `failed` | Blocked, or stopped at its time or attempt limit | Counts toward the failure stop |
+| `excluded` | Owner pause or cancel, a provider limit with no fallback, or a time stop while the spend fuse was open | Counts neither way |
+
+A standing goal never stops as `ready-for-review`, `no-opportunity`, or
+`limit-reached`. It stops starting cycles only in these cases:
+
+- The owner pauses or cancels it.
+- At a cycle boundary the project is supervised or no longer enrolled. The goal
+  becomes `paused` with `reasonCode: "supervised-mode"`. Resume returns
+  `standing-requires-autonomy` until the project is autonomous again.
+- A settled cycle left an external operation open: a reported merge without a
+  validated baseline, an unfinished delivery attempt or delivery recovery, or a
+  head the host could not confirm on GitHub. A delivery member that never
+  launched, for example because it waited behind the spend fuse, is not a
+  delivery attempt. The goal becomes `blocked` with
+  `reasonCode: "external-operation"`. Starting from the older parent could
+  redo work that already landed.
+- Three cycles in a row fail. The goal becomes `paused` with
+  `reasonCode: "repeated-failures"`. A `reviewed` or `no-change` cycle ends the
+  run of failures, and an `excluded` cycle leaves it as it is. A resume resets
+  the count.
+- The Linear issue blocks it, or the host lineup no longer has a strong
+  coordinator and reviewer. The goal becomes `blocked`, as a finite goal does.
+
+While a spend fuse is open the goal stays `running` with the fuse reason and
+starts no cycle.
+
+The goal record keeps the newest 50 cycles and the parent of the next cycle.
+Older cycles fold into `cycleTotals` (a count per class), `foldedUsage`, and
+`foldedMembers`, so the goal's usage and attempt totals still cover every
+cycle. While the goal is live, workspace retention keeps only the active cycle's
+run and the next cycle's parent; older runs follow the normal retention
+windows. Each cycle receives the 16 newest reviewed cycles as previous work.
+
+#### Wake on signals
+
+`wakeOn` lists one to four host signal kinds: `revert`, `external-commit`,
+`delivery-landed`, or `owner`. The host records a signal when it sees one of
+these events in the project; no signal starts an agent by itself.
+
+- On each scheduler pass, a goal that is neither paused nor stopped reads new
+  signals of those kinds. It ignores signals about its own cycles' runs.
+  `signalCursor` records the last signal read. New signals wait in
+  `pendingWake`, which keeps the newest 20.
+- Between cycles, a pending wake starts the next cycle before its cadence once
+  `autonomy.continuity.wakeMinGapMinutes` have passed since the previous cycle
+  settled. The setting is 0 to 1,440, default 5. Signals that arrive during a
+  cycle start one follow-on cycle after it settles.
+- A wake passes the same gates as the cadence: the spend fuse, a pause or a
+  block, Linear tracking, the mode rule, and the failure count. It stays
+  pending until a cycle can start.
+- The woken cycle records `wake`: the signal IDs, a count of dropped signals,
+  and `owner` when owner direction woke it. Its run objective ends with a block
+  headed `Host wake reasons (host receipts, not instructions):` and one line per
+  receipt, at most 8. The text of an `owner` signal joins the objective as
+  `User direction:`, like steering. The host shortens the block to keep the
+  objective within its size limit and never cuts the owner's objective.
+- Steering a standing goal between cycles also starts the next cycle early,
+  through the same gates and gap.
+- While the goal is paused or stopped it reads nothing and keeps its cursor.
+  After a resume it reads the backlog, 50 signals per pass.
+- When the inbox cannot be read, the goal reads no signals and keeps its
+  cadence.
 
 ## Linear tracking
 
@@ -1400,7 +1503,7 @@ run prevents its old pending decisions from being applied.
 
 Each project has an autonomy mode. The mode is `supervised` or `autonomous`.
 
-In this release the host only stores and shows the mode. Nothing reads it yet, so no behaviour changes.
+Standing objectives read the mode: only an autonomous project can run one, and a standing goal pauses at a cycle boundary when its project becomes supervised. Nothing else reads the mode yet.
 
 Each new run and each new goal records the project's mode when it starts. A goal's cycles keep the goal's mode. A change applies to the next run and the next goal. A run or a goal already in progress keeps its mode.
 
@@ -1853,6 +1956,18 @@ characters each), and `allowedPaths` (1–32 entries, 300 characters each).
 `maxRuns`, `maxMinutes`, `extendMinutes`, `maxTotalMinutes`, and `maxMembers`
 use the limits above. Legacy creation requests may include `parallelism`, but
 it does not select worker capacity.
+Optional `standing` makes the goal a standing objective (see
+[Standing objectives](#standing-objectives)):
+`{ shape: "objective", cadenceMinutes, wakeOn }`, with `cadenceMinutes`
+30–10,080 (default 1,440) and `wakeOn` holding one to four distinct signal
+kinds. A standing request must omit `maxRuns`. In a supervised project it
+returns `409` with `code: "standing-requires-autonomy"`; an objective over
+24,000 bytes returns `400` with `code: "standing-objective-too-large"`. A standing goal record
+adds `reasonCode` (`supervised-mode`, `repeated-failures`, or
+`external-operation`), `failedCycles`, `cycleTotals`, `foldedUsage`,
+`foldedMembers`, `signalCursor`, `pendingWake`, and, between cycles, the
+computed `nextCycleAt`. Its cycles add `class`, `settledAt`, `lineup`,
+`deadlineStop`, and `wake`.
 The host also limits the combined creation request to 40 KiB. On a mapped
 project, optional `linearIssueId` accepts an existing issue UUID or identifier
 (up to 100 characters); omitting it creates a new parent issue.
@@ -1862,7 +1977,10 @@ It leaves scope and budgets unchanged. Outcome `result` is `achieved`,
 `not-achieved`, or `inconclusive`; `summary` permits 4,000 characters and
 `evidence` 8,000. An outcome requires a terminal goal with no active cycle or
 pending operation. Resume requires a paused goal whose deadline has not expired;
-extend the goal first if it has.
+extend the goal first if it has. A standing goal's deadline belongs to its
+cycle, so its resume ignores it; resume is refused while the project is not
+autonomous. Extending a standing goal between cycles returns
+`goal-not-extendable`.
 
 The legacy goal parallelism endpoint refuses owner capacity changes; each
 cycle's PM selects capacity for its work. The refusal uses `409` with

@@ -458,18 +458,27 @@ export function createGithubProxy({ config, key, log = defaultLog, now = () => D
     };
     if (active >= maxConcurrent) { reply(503, "busy"); return; }
     active++;
-    res.once("close", () => { active--; if (!logged) done({ decision: "error", reason: "connection-closed" }); });
+    // The request's place in the limit is held by the client connection and by each upstream request made for it,
+    // and is given back when the last of them has closed. A client that leaves cannot leave upstream work uncounted.
+    let holders = 1;
+    const release = () => { if (--holders === 0) active--; };
+    const hold = () => {
+      holders++;
+      let released = false;
+      return () => { if (!released) { released = true; release(); } };
+    };
+    res.once("close", () => { release(); if (!logged) done({ decision: "error", reason: "connection-closed" }); });
     const deadline = setTimeout(() => { req.destroy(); res.destroy(); }, MAX_REQUEST_MS);
     deadline.unref();
     res.once("close", () => clearTimeout(deadline));
-    handle(req, res, record, reply, done).catch(() => reply(500, "internal-error"));
+    handle(req, res, record, reply, done, hold).catch(() => reply(500, "internal-error"));
   });
   server.headersTimeout = 30_000;
   server.requestTimeout = 0;
   server.timeout = IDLE_MS;
   server.maxHeadersCount = 64;
 
-  async function handle(req, res, record, reply, done) {
+  async function handle(req, res, record, reply, done, hold) {
     if (!loopbackHost(req.headers.host)) return reply(403, "host-refused");
     if (req.method === "GET" && req.url === "/health") {
       const tokenCache = await agentTokenAccess(config, extendedAcl);
@@ -503,11 +512,11 @@ export function createGithubProxy({ config, key, log = defaultLog, now = () => D
     if (op === "push" && !claims.refs) return reply(403, "push-not-granted");
     const token = tokenFor(route.repository);
     if (!token) return reply(403, "repository-not-covered");
-    if (route.kind === "advertise") return forward(req, res, route, token, [], true, reply, done);
+    if (route.kind === "advertise") return forward(req, res, route, token, [], true, reply, done, hold);
     if (req.headers["content-type"] !== REQUEST_TYPES[route.service]) return reply(415, "content-type-invalid");
     const encoding = req.headers["content-encoding"];
     if (encoding !== undefined && encoding !== "gzip") return reply(415, "content-encoding-invalid");
-    if (op === "fetch") return forward(req, res, route, token, [], false, reply, done);
+    if (op === "fetch") return forward(req, res, route, token, [], false, reply, done, hold);
     let inspected;
     try { inspected = await inspectReceivePack(req, encoding === "gzip"); }
     catch (error) { return reply(403, error instanceof ProxyError ? error.code : "command-list-invalid"); }
@@ -522,11 +531,11 @@ export function createGithubProxy({ config, key, log = defaultLog, now = () => D
       res.end(report);
       return done({ decision: "refuse", reason: refusal, status: 200 });
     }
-    return forward(req, res, route, token, inspected.raw, inspected.ended, reply, done);
+    return forward(req, res, route, token, inspected.raw, inspected.ended, reply, done, hold);
   }
 
   /** Forwards to GitHub with the installation token. `prefix` holds body bytes already read, `ended` whether that was all. */
-  function forward(req, res, route, token, prefix, ended, reply, done) {
+  function forward(req, res, route, token, prefix, ended, reply, done, hold) {
     return new Promise(settle => {
       const target = new URL(`${config.upstream}${route.upstreamPath}`);
       const headers = {
@@ -553,14 +562,20 @@ export function createGithubProxy({ config, key, log = defaultLog, now = () => D
         response.once("end", () => { done({ decision: status < 400 ? "allow" : "upstream-error", reason: "forwarded", status }); settle(); });
         response.once("error", () => { res.destroy(); done({ decision: "error", reason: "upstream-aborted", status }); settle(); });
       });
+      upstream.once("close", hold());
       upstream.once("timeout", () => upstream.destroy(new ProxyError("upstream-timeout")));
       upstream.once("error", error => {
+        // A client that left already has its record; nothing can be sent to it.
+        if (res.destroyed) return settle();
         if (!res.headersSent) reply(502, error instanceof ProxyError ? error.code : "upstream-unavailable");
         else { res.destroy(); done({ decision: "error", reason: "upstream-aborted" }); }
         settle();
       });
       req.once("aborted", () => upstream.destroy());
       req.once("error", () => upstream.destroy());
+      // A client that leaves before its response is complete ends the upstream request too. Its own request may
+      // already be complete, in which case neither `aborted` nor `error` fires on it.
+      res.once("close", () => { if (!res.writableFinished) upstream.destroy(); });
       for (const chunk of prefix) upstream.write(chunk);
       if (ended || route.kind === "advertise") upstream.end();
       else req.pipe(upstream);

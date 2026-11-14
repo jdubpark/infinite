@@ -223,6 +223,61 @@ test("the decoded prefix of a gzip body is bounded, so a small upload cannot exp
   await assert.rejects(inspectReceivePack(bufferedRequest(gzipSync(Buffer.alloc(32 * 1024 * 1024, "0")), 64 * 1024), true), /command-list-empty|command-list-too-large/);
 });
 
+test("a client that leaves after sending its whole request ends the upstream request, and its place in the limit is held until then", async () => {
+  // An upstream that answers the head of a fetch and then keeps the response open.
+  const held: { closed: boolean; finish: () => void }[] = [];
+  const slow = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      if (held.length > 0) { res.writeHead(200, { "content-type": "application/x-git-upload-pack-result" }); res.end("result"); return; }
+      const entry = { closed: false, finish: () => res.end() };
+      res.once("close", () => { entry.closed = true; });
+      held.push(entry);
+      res.writeHead(200, { "content-type": "application/x-git-upload-pack-result" });
+      res.write("0008NAK\n");
+    });
+  });
+  await new Promise<void>(done => slow.listen(0, "127.0.0.1", done));
+  const config = validateProxyConfig({
+    listen: { host: "127.0.0.1", port: 0 }, grantKeyFile: join(root, "grant.key"), tokenDirectory, githubCli: join(root, "gh"),
+    upstream: `http://127.0.0.1:${(slow.address() as { port: number }).port}`,
+  });
+  const narrow = createGithubProxy({ config, key, log: (record: Record<string, unknown>) => logs.push(record), maxConcurrent: 1 });
+  await new Promise<void>(done => narrow.listen(0, "127.0.0.1", done));
+  const narrowPort = (narrow.address() as { port: number }).port;
+  const fetchOnce = () => new Promise<{ status: number; req: http.ClientRequest; res: http.IncomingMessage }>((done, fail) => {
+    const req = http.request({ host: "127.0.0.1", port: narrowPort, method: "POST", path: "/example/product/git-upload-pack", agent: false,
+      headers: { authorization: basic(fetchGrant), "content-type": "application/x-git-upload-pack-request" } }, res => { res.on("error", () => {}); done({ status: res.statusCode!, req, res }); });
+    req.on("error", fail);
+    req.end(Buffer.from("0011command=fetch0000"));
+  });
+  const waitFor = async (check: () => boolean, label: string) => {
+    for (let attempt = 0; attempt < 200 && !check(); attempt++) await new Promise(done => setTimeout(done, 10));
+    assert.ok(check(), label);
+  };
+  try {
+    // The request is complete and the response has begun when the client leaves.
+    const first = await fetchOnce();
+    assert.equal(first.status, 200);
+    assert.equal(held.length, 1);
+    first.res.resume();
+    const busy = await fetchOnce();
+    assert.equal(busy.status, 503, "the open request holds the only place");
+    busy.res.resume();
+    first.req.destroy();
+    await waitFor(() => held[0]!.closed, "the proxy closed its upstream request when the client left");
+    // The place is free again once the upstream request has closed.
+    let next = await fetchOnce();
+    for (let attempt = 0; attempt < 100 && next.status === 503; attempt++) { next.res.resume(); await new Promise(done => setTimeout(done, 10)); next = await fetchOnce(); }
+    assert.equal(next.status, 200);
+    next.res.resume();
+  } finally {
+    for (const entry of held) if (!entry.closed) entry.finish();
+    await new Promise(done => narrow.close(done));
+    await new Promise(done => slow.close(done));
+  }
+});
+
 test("the token cache is reported proxy-only only when mode bits deny the agent and no extended ACL can grant it", async () => {
   // `nobody` exists on Linux and macOS and is neither the owner nor in the group of these fixtures.
   const cacheRoot = mkdtempSync(join(tmpdir(), "github-proxy-acl-"));

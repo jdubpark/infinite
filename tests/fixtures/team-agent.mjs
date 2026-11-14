@@ -27,7 +27,31 @@ if (process.argv[2] === "--mirror-restricted-prefix") {
       if (dirname(directory) === directory) return false;
     }
   };
-  if (command === "git" && inBareRepository() && !["fetch", "rev-parse"].includes(gitSubcommand())) {
+  // The five base-scan forms, after the `-c` pairs only. Every id is a 40 or 64 digit lower-case hex commit id.
+  const isBaseScan = () => {
+    const commitIds = (values, min, max) => values.length >= min && values.length <= max
+      && values.every(value => /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value));
+    const revertGrep = "--grep=This reverts commit ";
+    let index = 0;
+    while (args[index] === "-c") index += 2;
+    const [subcommand, ...tail] = args.slice(index);
+    if (subcommand === "merge-base") return tail.length === 3 && tail[0] === "--is-ancestor" && commitIds(tail.slice(1), 2, 2);
+    if (subcommand === "rev-list") {
+      if (tail[0] !== "--first-parent") return false;
+      if (tail[1] === "--max-count=501") return tail.length === 4 && tail[3].startsWith("^") && commitIds([tail[2], tail[3].slice(1)], 2, 2);
+      return tail[1] === "--max-count=500" && tail.length === 3 && commitIds([tail[2]], 1, 1);
+    }
+    if (subcommand !== "log" || tail[0] !== "--no-walk=unsorted" || tail[1] !== "--no-show-signature") return false;
+    if (tail[2] === "--format=%H %T %P") return commitIds(tail.slice(3), 1, 50);
+    if (tail[2] !== "--format=%H" || tail[3] !== "--fixed-strings") return false;
+    let next = 4;
+    while (tail[next]?.startsWith("--grep=")) {
+      if (!tail[next].startsWith(revertGrep) || !commitIds([tail[next].slice(revertGrep.length)], 1, 1)) return false;
+      next += 1;
+    }
+    return next - 4 >= 1 && next - 4 <= 50 && commitIds(tail.slice(next), 1, 50);
+  };
+  if (command === "git" && inBareRepository() && !["fetch", "rev-parse"].includes(gitSubcommand()) && !isBaseScan()) {
     appendFileSync(join(receiptDir, "mirror-commands.jsonl"), JSON.stringify({ cwd: process.cwd(), args, refused: true }) + "\n", { mode: 0o600 });
     process.stderr.write("team-command: only the pinned base-branch fetch and rev-parse are permitted in a source mirror\n");
     process.exit(126);

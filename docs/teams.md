@@ -1490,6 +1490,9 @@ a 40 or 64 character lower-case hex id before use.
 | 4 | `log --no-walk=unsorted --no-show-signature --format=%H %T %P ID...` (1 to 50 ids) | One line per id |
 | 5 | `log --no-walk=unsorted --no-show-signature --format=%H --fixed-strings --grep=This reverts commit ID... ID...` (1 to 50 patterns, then 1 to 50 ids) | At most 50 ids |
 
+One scan runs at most 600 Git commands. A scan that needs more fails, writes
+nothing, and is tried again after the next fetch.
+
 The production launcher must admit all five forms. Until it does, every scan
 fails: no landing is recorded, and held stays unknown.
 

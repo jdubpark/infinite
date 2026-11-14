@@ -203,9 +203,9 @@ export class RoutineService {
    * saves the cursor and the wake in one write. A signal about a team run of a goal this routine started is dropped.
    *
    * The result says how much of the inbox the pending wake now holds. `current`: every signal recorded so far.
-   * `behind`: one pass reads one page, and more signals wait. `unknown`: the inbox could not be read. A launch waits
-   * while the routine is behind, so the signals of one batch start one occurrence. Nothing more is stored for this:
-   * after a restart the saved cursor gives the same answer.
+   * `behind`: one pass reads one page, and more signals wait. `unknown`: the inbox could not be read. Only a `current`
+   * pending wake starts an occurrence early or is used up by a launch, so the signals of one batch start one
+   * occurrence. Nothing more is stored for this: after a restart the saved cursor gives the same answer.
    */
   private readWake(stored: Stored): "current" | "behind" | "unknown" {
     const routine = stored.routine;
@@ -320,12 +320,18 @@ export class RoutineService {
     if (!this.assertAuthority(stored)) return;
     // The checks above waited. A signal recorded meanwhile belongs to this occurrence, so the inbox is read once more;
     // nothing below waits before the launch intent is saved.
-    if (this.readWake(stored) === "behind") return;
+    const latest = this.readWake(stored);
+    if (latest === "behind") return;
+    // An early start needs the whole inbox. A scheduled start does not wait for an unreadable inbox, and it leaves
+    // the pending wake alone: a wake that may be half a batch is never used up.
+    if (latest !== "current" && current < Date.parse(routine.nextRunAt)) return;
+    const pending = latest === "current" ? routine.pendingWake : undefined;
     const request = createGoalSchema.parse({ requestId: randomUUID(), ...routine.goal });
     // The goal template is unchanged by a wake. The signals are recorded on the occurrence, and the wake is cleared.
-    const wake = routine.pendingWake ? { signalIds: routine.pendingWake.signals.map(signal => signal.id), dropped: routine.pendingWake.dropped } : undefined;
+    const wake = pending ? { signalIds: pending.signals.map(signal => signal.id), dropped: pending.dropped } : undefined;
     stored.launch = { request, createdAt: now(), ...(wake ? { wake } : {}) };
-    delete routine.pendingWake; delete routine.wakeDeferred;
+    if (pending) delete routine.pendingWake;
+    delete routine.wakeDeferred;
     routine.status = "running"; routine.reason = undefined; routine.revision++;
     this.save(stored); // The exact request is durable before GoalService can accept it.
     await this.replayLaunch(stored);

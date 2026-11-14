@@ -117,13 +117,18 @@ test("an inbox that remembers its maximum number of keys refuses new signals and
   try {
     const first = f.signals.record({ projectId: "alpha", kind: "owner", key: "first", text: "Direction" });
     assert.equal(first.recorded, true);
-    // The oldest remembered key is MAX_SIGNAL_KEYS signals back.
-    f.store.write(tx => { tx.run("INSERT INTO project_signal_keys (dedup, seq, at) VALUES (?, ?, ?)", "oldest", 2 - MAX_SIGNAL_KEYS, new Date(f.clock.now).toISOString()); });
-    assert.deepEqual(f.signals.record({ projectId: "alpha", kind: "owner", key: "second", text: "More direction" }), { recorded: false, failure: "full" });
+    const at = new Date(f.clock.now).toISOString();
+    // Two keys far apart in seq are not a full record. Only the number of keys kept refuses a signal.
+    f.store.write(tx => { tx.run("INSERT INTO project_signal_keys (dedup, seq, at) VALUES (?, ?, ?)", "far", -MAX_SIGNAL_KEYS, at); });
+    assert.equal(f.signals.record({ projectId: "alpha", kind: "owner", key: "second", text: "More direction" }).recorded, true);
+    f.store.write(tx => {
+      tx.run("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?) INSERT INTO project_signal_keys (dedup, seq, at) SELECT 'filler-' || i, -i, ? FROM n", MAX_SIGNAL_KEYS - 3, at);
+    });
+    assert.deepEqual(f.signals.record({ projectId: "alpha", kind: "owner", key: "third", text: "Even more" }), { recorded: false, failure: "full" });
     assert.deepEqual(f.signals.record({ projectId: "alpha", kind: "owner", key: "first", text: "Direction" }), { recorded: false, signal: "signal" in first ? first.signal : undefined });
     f.clock.now += 31 * DAY_MS;
     f.signals.sweep();
-    assert.equal(f.signals.record({ projectId: "alpha", kind: "owner", key: "second", text: "More direction" }).recorded, true);
+    assert.equal(f.signals.record({ projectId: "alpha", kind: "owner", key: "third", text: "Even more" }).recorded, true);
   } finally { f.close(); }
 });
 

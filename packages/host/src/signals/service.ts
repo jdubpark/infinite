@@ -307,10 +307,12 @@ function insert(tx: EvidenceTx, input: Sealed, at: string): RecordResult {
     const signal = openSignal(tx, prior, input.projectId);
     return signal ? { recorded: false, signal } : { recorded: false, failure: "unavailable" };
   }
-  // Each key has its own seq, so the span from the oldest key's seq to the newest bounds how many keys are kept.
-  // Two scalar reads, so each one is a single index step.
+  // Each key has its own seq, so the span from the oldest key's seq to the newest is at least the number of keys kept.
+  // Two scalar reads, each a single index step. The keys are counted only when the span reaches the limit: retention
+  // deletes by time, so after a clock correction a wide span can hold few keys.
   const span = tx.get<{ low: number | null; high: number | null }>(`SELECT (SELECT min(seq) FROM ${KEYS}) AS low, (SELECT max(seq) FROM ${KEYS}) AS high`);
-  if (span && span.low !== null && span.high !== null && span.high - span.low + 1 >= MAX_SIGNAL_KEYS) return { recorded: false, failure: "full" };
+  if (span && span.low !== null && span.high !== null && span.high - span.low + 1 >= MAX_SIGNAL_KEYS
+    && (tx.get<{ n: number }>(`SELECT count(*) AS n FROM ${KEYS}`)?.n ?? 0) >= MAX_SIGNAL_KEYS) return { recorded: false, failure: "full" };
   const id = randomUUID();
   const result = tx.run(
     "INSERT INTO project_signals (signal_id, project_ref, kind, at, sealed) VALUES (?, ?, ?, ?, ?)",

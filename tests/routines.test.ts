@@ -262,10 +262,11 @@ test("a settled no-opportunity recurs on cadence and completes at the approved o
 /** An in-memory inbox for project "demo" that counts its reads. */
 function inbox() {
   const signals: ProjectSignal[] = [];
-  let reads = 0;
+  let reads = 0, unreadable = false;
   const reader: SignalReader = {
-    head: () => signals.at(-1)?.seq ?? 0,
+    head: () => unreadable ? undefined : signals.at(-1)?.seq ?? 0,
     after: (projectId, seq, options) => {
+      if (unreadable) return [];
       reads++;
       return signals.filter(signal => signal.projectId === projectId && signal.seq > seq && (!options?.kinds || options.kinds.includes(signal.kind))).slice(0, options?.limit ?? 50);
     },
@@ -275,7 +276,7 @@ function inbox() {
     signals.push(signal);
     return signal;
   };
-  return { reader, add, reads: () => reads };
+  return { reader, add, reads: () => reads, down: (value: boolean) => { unreadable = value; } };
 }
 const settle = (f: ReturnType<typeof setup>, goalId: string, cycles: ProductGoal["cycles"] = []) =>
   f.goals.set(goalId, { ...f.goals.get(goalId)!, status: cycles.length ? "achieved" : "no-opportunity", cycles });
@@ -338,6 +339,52 @@ test("signals that arrive together start one occurrence, however many there are"
     settle(f, routine.activeGoalId!); await service.tick();
     at(20); await service.tick();
     assert.equal(f.launched.length, 2, "the rest of the batch starts no second occurrence");
+  } finally { Date.now = realNow; service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("an unreadable inbox starts nothing early and never uses up a waiting batch", async () => {
+  let duringBusyCheck = () => {};
+  const f = setup({ busy: async () => { duringBusyCheck(); return false; } }); const service = f.createService(); const signals = inbox(); const realNow = Date.now;
+  service.useSignals(signals.reader, () => []);
+  const at = (minutes: number) => { Date.now = () => realNow() + minutes * 60_000; };
+  try {
+    const created = await service.create(f.create({ intervalMinutes: 60, maxOccurrences: 4, wakeOn: ["owner"], expiresAt: new Date(realNow() + 5 * 3_600_000).toISOString() }));
+    at(1); await service.tick();
+    settle(f, service.get(created.id).activeGoalId!); await service.tick();
+
+    // The inbox fails between the first read and the launch: the early start waits for a readable inbox.
+    at(10);
+    const early = signals.add("owner");
+    duringBusyCheck = () => signals.down(true);
+    await service.tick();
+    assert.equal(f.launched.length, 1);
+    duringBusyCheck = () => {};
+    signals.down(false);
+    await service.tick();
+    assert.equal(f.launched.length, 2);
+    assert.deepEqual(service.get(created.id).occurrences[1]!.wake, { signalIds: [early.id], dropped: 0 });
+    settle(f, service.get(created.id).activeGoalId!); await service.tick();
+
+    // A batch is half read when the inbox fails and the scheduled time comes. The schedule runs without the batch.
+    at(69);
+    const batch = Array.from({ length: 51 }, () => signals.add("owner"));
+    await service.tick();
+    assert.equal(f.launched.length, 2);
+    signals.down(true);
+    at(71); await service.tick();
+    let routine = service.get(created.id);
+    assert.equal(f.launched.length, 3, "the schedule does not wait for the inbox");
+    assert.equal(routine.occurrences[2]!.wake, undefined);
+    assert.equal(routine.pendingWake?.signals.length, 20, "the half-read batch still waits");
+
+    // With the inbox back, the whole batch starts one occurrence.
+    signals.down(false);
+    settle(f, routine.activeGoalId!); await service.tick();
+    at(77); await service.tick();
+    routine = service.get(created.id);
+    assert.equal(f.launched.length, 4);
+    assert.deepEqual(routine.occurrences[3]!.wake, { signalIds: batch.slice(-20).map(signal => signal.id), dropped: 31 });
+    assert.equal(routine.pendingWake, undefined);
   } finally { Date.now = realNow; service.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 

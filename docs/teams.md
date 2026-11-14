@@ -227,6 +227,9 @@ starts its next occurrence early instead of waiting for its next due time:
 - Signals that arrive together start one occurrence. The routine reads 50
   signals a pass and starts nothing while more wait, so a large batch delays
   the start by a few seconds and never splits into two occurrences.
+- An early start needs a readable inbox. While the inbox cannot be read, the
+  routine runs on its schedule only, and the waiting signals keep waiting for
+  the next start that can read all of them.
 - The occurrence lists the signal IDs it started on under `wake`. It submits
   the same goal as any other occurrence.
 

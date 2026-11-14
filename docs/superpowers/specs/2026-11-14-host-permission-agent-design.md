@@ -69,7 +69,7 @@ The owner's direction on 2026-11-14: one separate permission agent, not tied to 
 
 ### Authority: the workspace delegation
 
-The owner records one delegation for each workspace. The record is keyed by the group id. It holds the host projects it covers, each with the owner act that covered it (the owner device and the time), the interrupt classes in force, the policy version, and optional owner direction text.
+The owner records one delegation for each workspace. The host stores it as one coverage entry for each project that the owner act covers. An entry holds the owner act (the owner device, the time and the workspace it named), the interrupt classes in force, the policy version, and optional owner direction text. A project's authority comes only from its own entry, so a host fold changes nothing about it. Together the entries of a workspace are its record.
 
 - Only an owner client can record, change or revoke it: `infinite permissions delegate [--workspace W | --all]`, `infinite permissions revoke`, `infinite permissions status`, and the matching API with the same owner-client check as repository enrollment.
 - A session is covered when its stored project id is in the record. The host resolves the session to a workspace through that project id, never through a path.

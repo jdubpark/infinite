@@ -66,11 +66,12 @@ const scopeHash = (issue: Issue, linearProjectId?: string) => hash({ title: issu
 
 // Only deliberately selected requirements and user directions leave the host.
 // Machine paths sometimes appear in those fields; never publish them as evidence.
-function sharedText(value: string) {
+export function sharedText(value: string) {
   return value.replace(/(?:\/(?:Users|home|tmp|private\/tmp|private\/var|var\/folders)\/|~\/|[A-Za-z]:\\)[^\s<>"'`]+/g, "[local path omitted]");
 }
 
-class LinearFailure extends Error {
+/** Linear's own failure. Its text is fixed, so it may be shown or stored. */
+export class LinearFailure extends Error {
   constructor(readonly retryAfterMs = 0) { super("Linear could not confirm synchronization. Check the connection and host credential; execution is waiting."); }
 }
 
@@ -478,6 +479,10 @@ export class LinearService {
     if (this.closed) return;
     const result = z.object({ success: z.literal(true), comment: commentSchema }).parse(data.commentCreate);
     verify(result.comment);
+  }
+  /** The same transport, key file, timeout, and rate-limit handling as the bridge's own requests; for intake reads and comments. */
+  request(operationName: string, query: string, variables: unknown): Promise<Record<string, unknown>> {
+    return this.graphql(operationName, query, variables);
   }
   /** `shared` rate limits pause every request; an optional request reports its delay to its caller instead. */
   private async graphql(operationName: string, query: string, variables: unknown, shared = true, delivery?: { sent: boolean; answered: boolean }): Promise<Record<string, unknown>> {

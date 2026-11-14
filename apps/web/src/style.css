@@ -1205,7 +1205,9 @@ small,
 
 /* Agent teams share the journal frame while keeping their work and evidence distinct. */
 .workspace-navigation { display: flex; gap: 4px; padding: 14px 8px 0; }
-.workspace-navigation button { display: flex; align-items: center; justify-content: center; gap: 5px; flex: 1; min-width: 0; min-height: 44px; padding: 8px 4px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); font-size: 12px; }
+/* Icon above label, sized to the label: five views fit the sidebar without squeezing the icons out. */
+.workspace-navigation button { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; flex: 1 1 auto; min-width: 0; min-height: 44px; padding: 6px 2px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); font-size: 11px; }
+.workspace-navigation button svg { flex: none; }
 .workspace-navigation button[aria-current="page"] { background: #dce3d5; color: var(--green); font-weight: 600; }
 .team-page { width: 100%; max-width: 1120px; margin: 0 auto; padding: 46px 42px; overflow: auto; min-height: 0; }
 .team-page-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 28px; margin-bottom: 30px; }

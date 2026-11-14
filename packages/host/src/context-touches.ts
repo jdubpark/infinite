@@ -5,8 +5,8 @@ export type FileTouch = { path: string; reads: number; edits: number; lastAt: st
 export type SessionTouches = {
   sessionId: string;
   /**
-   * False when the host cannot see this session's tool inputs: its provider has no extraction, or its journal
-   * was read to the end and holds no signal from a provider hook or protocol. A gap in sight, not a fact about the agent.
+   * False when the host has no tool input from this session: its provider has no extraction, or its journal was
+   * read to the end and holds no recorded tool input. A gap in sight, not a fact about the agent.
    */
   observable: boolean;
   complete: boolean;
@@ -23,8 +23,6 @@ export type TouchPage = {
 
 /** Providers whose tool inputs can be extracted. */
 const EXTRACTABLE_PROVIDERS = new Set(["claude", "codex"]);
-/** Signal sources that carry tool inputs. Terminal and screen readings never do. */
-const TOOL_SOURCES = new Set(["hook", "protocol"]);
 const FILE_TOOLS: Record<string, { field: string; kind: "reads" | "edits" }> = {
   Read: { field: "file_path", kind: "reads" },
   Edit: { field: "file_path", kind: "edits" },
@@ -48,8 +46,9 @@ interface FileState { reads: number; edits: number; lastAt: string; seq: number 
 interface SessionState {
   cursor: number;
   /**
-   * The journal holds a signal from a source that carries tool inputs. This is the evidence that the session was
-   * launched with working hooks; the launch settings can differ from the current configuration.
+   * The journal holds a recorded tool input. Nothing else proves the host can see this session's tools: launch
+   * settings can differ from the current configuration, and the native protocol and the notify route send
+   * turn signals that carry no tool input.
    */
   signalled: boolean;
   files: Map<string, FileState>;
@@ -260,11 +259,10 @@ export class ContextTouches {
   private apply(state: SessionState, page: TouchPage, source: TouchSource, inArea: (directory: string) => boolean): void {
     const from = state.cursor;
     for (const event of page.events) {
-      if (event.seq <= from || event.type !== "signal") continue;
-      if (typeof event.data.source === "string" && TOOL_SOURCES.has(event.data.source)) state.signalled = true;
-      if (event.data.kind !== "tool-start") continue;
+      if (event.seq <= from || event.type !== "signal" || event.data.kind !== "tool-start") continue;
       const { tool, input } = event.data;
       if (typeof tool !== "string") continue;
+      state.signalled = true;
       const found = extractTouches(tool, isRecord(input) ? input : {}, source.cwd, inArea);
       if (found.graphQuery) state.graphQueries++;
       for (const path of found.reads) this.touch(state, path, "reads", event);

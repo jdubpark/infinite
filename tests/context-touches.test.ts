@@ -26,7 +26,6 @@ function toolStart(seq: number, tool: string, input: Record<string, unknown>): E
     seq,
     at: iso(seq),
     type: "signal",
-    // A tool input reaches the journal through a provider hook, and the signal says so.
     data: { kind: "tool-start", source: "hook", tool, toolUseId: `t${seq}`, input, quiet: false },
   };
 }
@@ -210,23 +209,28 @@ test("unobservable provider is not read", async () => {
   assert.deepEqual(reads, []);
 });
 
-test("a session is observable only when its journal holds a signal that carries tool inputs", async () => {
+test("a session is observable only when its journal holds a recorded tool input", async () => {
   const signal = (seq: number, data: Record<string, unknown>): Event => ({ seq, at: iso(seq), type: "signal", data });
   const index = (events: Event[], pageSize?: number) => new ContextTouches({ read: journal(events, pageSize).read, areas: noAreas, maxReads: 1 });
+  const facts = async (events: Event[], provider = "claude", pageSize?: number) => {
+    const result = await index(events, pageSize).session(source({ provider }));
+    return [result.observable, result.complete, result.files.length];
+  };
 
-  // Codex with its hooks off, or a session started with native arguments: the journal holds no hook signal at all.
+  // Codex with its hooks off, or a session started with native arguments: the journal holds no signal at all.
   assert.deepEqual(await index([]).session(source({ provider: "codex" })), {
     sessionId: "s1", observable: false, complete: true, graphQueries: 0, files: [], truncated: false,
   });
   // Terminal and screen readings carry no tool inputs, however many there are.
-  const screen = await index([signal(1, { kind: "turn-start", source: "screen" }), signal(2, { kind: "prompt-open", source: "osc" })]).session(source());
-  assert.deepEqual([screen.observable, screen.complete, screen.files.length], [false, true, 0]);
-  // One hook signal is the evidence, before any tool has run and whatever the host configuration says now.
-  const hooked = await index([signal(1, { kind: "turn-start", source: "hook" })]).session(source({ provider: "codex" }));
-  assert.deepEqual([hooked.observable, hooked.complete, hooked.files.length], [true, true, 0]);
+  assert.deepEqual(await facts([signal(1, { kind: "turn-start", source: "screen" }), signal(2, { kind: "prompt-open", source: "osc" })]), [false, true, 0]);
+  // A native Codex session sends turn signals over its protocol and never a tool input.
+  assert.deepEqual(await facts([signal(1, { kind: "turn-start", source: "protocol" }), signal(2, { kind: "turn-end", source: "protocol" })], "codex"), [false, true, 0]);
+  // A hook signal without a tool input is not evidence either: the notify route sends those.
+  assert.deepEqual(await facts([signal(1, { kind: "turn-start", source: "hook" }), signal(2, { kind: "turn-end", source: "hook" })], "codex"), [false, true, 0]);
+  // One recorded tool input is the evidence, even when its path is outside the workspace and is dropped.
+  assert.deepEqual(await facts([toolStart(1, "Read", { file_path: "/etc/hosts" })]), [true, true, 0]);
   // While the journal is still being read the answer is not known, so the session is not called unobserved.
-  const reading = await index([signal(1, { kind: "turn-start", source: "screen" }), signal(2, { kind: "turn-start", source: "screen" })], 1).session(source());
-  assert.deepEqual([reading.observable, reading.complete], [true, false]);
+  assert.deepEqual(await facts([signal(1, { kind: "turn-start", source: "screen" }), signal(2, { kind: "turn-start", source: "screen" })], "claude", 1), [true, false, 0]);
 });
 
 test("incremental cursor", async () => {

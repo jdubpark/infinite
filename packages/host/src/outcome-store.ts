@@ -59,6 +59,8 @@ export type OutcomePayload = {
   rubric?: { version: 1; correctness: number; cleanliness: number; extensibility: number; docs: number; reviewerProfileId: string };
   ownerRating?: { score: number; at: string };
   landing?: { at: string; method: LandingMethod };
+  /** Set only on a row of source `legacy`: what the operator's line said. */
+  legacy?: LegacyPayload;
   diff?: TeamTask["diffStat"];
   wallMs?: number;
   limitEvents: number;
@@ -129,6 +131,20 @@ export type OutcomeRow = {
   runDeletedAt: string | null;
   payload: OutcomePayload;
 };
+
+/** The operator's own facts of one imported line (spec part 8). All of it is operator text or claims, so it is sealed. */
+export type LegacyPayload = {
+  id: string;
+  label?: string;
+  result: "accepted" | "rejected" | "excluded";
+  attempts: number;
+  totalTokens?: number;
+  reviewerModel?: string;
+  supersedes?: string;
+};
+
+/** One legacy id's state. `state` and `recordedAt` are plain columns; `lineHash` is sealed. */
+export type LegacyLineState = { state: "imported" | "superseded"; lineHash: string | null; recordedAt: string };
 
 export type SignalKind = "rating" | "landing" | "revert" | "linked-fix" | "exclusion";
 export type ExclusionReason = "outside-cause" | "invalid-task" | "trial" | "other";
@@ -220,6 +236,20 @@ export type MemberResultRow = {
   endedAt: string | null;
   runDeletedAt: string | null;
   payload: MemberResultPayload;
+};
+
+/**
+ * What the ledger holds for the runs of one goal or one mission. `unreadable` counts the records of those runs whose
+ * payload did not open; they are left out. `unindexed` counts rows and summaries, store-wide, that the version 3
+ * migration could not open and so could not index by goal or mission.
+ */
+export type RollupRecords = {
+  runIds: string[];
+  summaries: RunSummaryRow[];
+  rows: OutcomeRow[];
+  members: MemberResultRow[];
+  unreadable: { summaries: number; rows: number; members: number };
+  unindexed: number;
 };
 
 const OUTCOME_COLUMNS = [

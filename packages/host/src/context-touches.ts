@@ -66,6 +66,8 @@ function repoPath(raw: unknown, cwd: string): string | undefined {
   const rel = posix.isAbsolute(raw) ? posix.relative(root, posix.normalize(raw)) : posix.normalize(raw);
   if (rel === "" || rel === "." || rel === ".." || rel.startsWith("../") || posix.isAbsolute(rel)) return undefined;
   if (rel.includes("\0")) return undefined;
+  // A Git directory, including a nested repository's, holds Git state and host files, never repository content.
+  if (rel.split("/").includes(".git")) return undefined;
   return rel;
 }
 

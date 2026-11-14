@@ -104,6 +104,19 @@ test("apply_patch headers", () => {
   assert.deepEqual(bare.edits, []);
 });
 
+test("paths inside a Git directory are never touches", () => {
+  const everything = () => true;
+  assert.deepEqual(extractTouches("Read", { file_path: ".git/infinite-team-context.json" }, CWD, everything).reads, []);
+  assert.deepEqual(extractTouches("Read", { file_path: "sub/.git/config" }, CWD, everything).reads, []);
+  assert.deepEqual(extractTouches("Bash", { command: "cat .git/HEAD" }, CWD, everything).reads, []);
+
+  // Names that only start with a dot-git prefix are repository content.
+  assert.deepEqual(extractTouches("Read", { file_path: ".github/workflows/ci.yml" }, CWD, everything).reads, [
+    ".github/workflows/ci.yml",
+  ]);
+  assert.deepEqual(extractTouches("Read", { file_path: ".gitignore" }, CWD, everything).reads, [".gitignore"]);
+});
+
 test("shell tokens need a code area", () => {
   const command = 'cat "packages/host/src/teams.ts" && sed -n 1p docs/a.md; cat ../secret/x.ts';
   assert.deepEqual(extractTouches("Bash", { command }, CWD, never).reads, []);

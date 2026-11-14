@@ -124,22 +124,27 @@ describe("web swarm view", { skip }, () => {
     try {
       await page.evaluate(() => (window as unknown as { swarm: Control }).swarm.poll({ longTool: true }));
       await show(page, "wall", ".sw-tile");
-      await page.setViewportSize({ width: 1000, height: 700 });
       await page.locator(".sw-tile", { hasText: LONG_TOOL }).click();
       await page.waitForSelector(".sw-inspector .sw-inspector-fact");
-      const measured = await page.evaluate(longTool => {
-        const inspector = document.querySelector(".sw-inspector")!.getBoundingClientRect();
-        const tool = [...document.querySelectorAll<HTMLElement>(".sw-inspector .sw-inspector-fact")].find(node => node.textContent === longTool);
-        return {
-          inspectorRight: Math.round(inspector.right), toolFound: tool !== undefined, toolFixed: tool?.classList.contains("sw-fixed") ?? null,
-          toolWidth: tool ? Math.round(tool.getBoundingClientRect().width) : null,
-          links: [...document.querySelectorAll<HTMLElement>(".sw-inspector-links button")].map(button => ({ text: button.textContent, right: Math.round(button.getBoundingClientRect().right) })),
-        };
-      }, LONG_TOOL);
-      assert.ok(measured.toolFound, `the tool fact is in the inspector: ${JSON.stringify(measured)}`);
-      assert.equal(measured.toolFixed, false, `the tool fact may shrink: ${JSON.stringify(measured)}`);
-      assert.ok(measured.links.length >= 1, `the agent has links to show: ${JSON.stringify(measured)}`);
-      assert.ok(measured.links.every(link => link.right <= measured.inspectorRight + 1), `every link stays inside the inspector: ${JSON.stringify(measured)}`);
+      // The compact layout gives the inspector a row of its own; the narrower window leaves it the least room.
+      for (const width of [1000, 720]) {
+        await page.setViewportSize({ width, height: 700 });
+        const measured = await page.evaluate(longTool => {
+          const inspector = document.querySelector<HTMLElement>(".sw-inspector")!;
+          const tool = [...inspector.querySelectorAll<HTMLElement>(".sw-inspector-fact")].find(node => node.textContent === longTool);
+          return {
+            inspectorRight: Math.round(inspector.getBoundingClientRect().right), overflow: inspector.scrollWidth - inspector.clientWidth,
+            toolFound: tool !== undefined, toolFixed: tool?.classList.contains("sw-fixed") ?? null,
+            links: [...inspector.querySelectorAll<HTMLElement>(".sw-inspector-links button")].map(button => ({ text: button.textContent, right: Math.round(button.getBoundingClientRect().right) })),
+          };
+        }, LONG_TOOL);
+        const seen = `at ${width}px: ${JSON.stringify(measured)}`;
+        assert.ok(measured.toolFound, `the tool fact is in the inspector ${seen}`);
+        assert.equal(measured.toolFixed, false, `the tool fact may shrink ${seen}`);
+        assert.ok(measured.links.length >= 1, `the agent has links to show ${seen}`);
+        assert.ok(measured.overflow <= 1, `nothing overflows the inspector ${seen}`);
+        assert.ok(measured.links.every(link => link.right <= measured.inspectorRight + 1), `every link stays inside the inspector ${seen}`);
+      }
     } finally { await page.close(); }
   });
 

@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { chromium, type Browser, type Page } from "playwright";
+import { LONG_TOOL } from "./fixtures/web-swarm-data";
 
 // Runs the web client's Swarm view in Chromium on a stand-in host: one mission with three subteams in two projects,
 // two standalone teams, quiet runs, and two solo sessions.
@@ -13,7 +14,7 @@ const skip = existsSync(executablePath) ? false : "Chromium for Playwright is no
 const harness = fileURLToPath(new URL("./fixtures/web-swarm-harness.tsx", import.meta.url));
 const ORIGIN = "http://127.0.0.1/swarm";
 
-type Control = { requests: string[]; view(view: "lanes" | "wall" | "graph"): void; poll(variant: { shuffleUpdated?: boolean; flipState?: boolean; idle?: boolean }): void };
+type Control = { requests: string[]; view(view: "lanes" | "wall" | "graph"): void; poll(variant: { shuffleUpdated?: boolean; flipState?: boolean; idle?: boolean; longTool?: boolean }): void };
 // Page-side code reaches the harness through `window.swarm`; functions passed to the page cannot close over test helpers.
 
 describe("web swarm view", { skip }, () => {
@@ -115,6 +116,30 @@ describe("web swarm view", { skip }, () => {
         return [...document.querySelectorAll(".sw-inspector-links button")].every(button => button.getBoundingClientRect().right <= inspector.right + 1);
       });
       assert.ok(links, "the links to the session and team stay inside the inspector");
+    } finally { await page.close(); }
+  });
+
+  test("a long tool name shrinks in the inspector and the links stay inside it", async () => {
+    const page = await open();
+    try {
+      await page.evaluate(() => (window as unknown as { swarm: Control }).swarm.poll({ longTool: true }));
+      await show(page, "wall", ".sw-tile");
+      await page.setViewportSize({ width: 1000, height: 700 });
+      await page.locator(".sw-tile", { hasText: LONG_TOOL }).click();
+      await page.waitForSelector(".sw-inspector .sw-inspector-fact");
+      const measured = await page.evaluate(longTool => {
+        const inspector = document.querySelector(".sw-inspector")!.getBoundingClientRect();
+        const tool = [...document.querySelectorAll<HTMLElement>(".sw-inspector .sw-inspector-fact")].find(node => node.textContent === longTool);
+        return {
+          inspectorRight: Math.round(inspector.right), toolFound: tool !== undefined, toolFixed: tool?.classList.contains("sw-fixed") ?? null,
+          toolWidth: tool ? Math.round(tool.getBoundingClientRect().width) : null,
+          links: [...document.querySelectorAll<HTMLElement>(".sw-inspector-links button")].map(button => ({ text: button.textContent, right: Math.round(button.getBoundingClientRect().right) })),
+        };
+      }, LONG_TOOL);
+      assert.ok(measured.toolFound, `the tool fact is in the inspector: ${JSON.stringify(measured)}`);
+      assert.equal(measured.toolFixed, false, `the tool fact may shrink: ${JSON.stringify(measured)}`);
+      assert.ok(measured.links.length >= 1, `the agent has links to show: ${JSON.stringify(measured)}`);
+      assert.ok(measured.links.every(link => link.right <= measured.inspectorRight + 1), `every link stays inside the inspector: ${JSON.stringify(measured)}`);
     } finally { await page.close(); }
   });
 

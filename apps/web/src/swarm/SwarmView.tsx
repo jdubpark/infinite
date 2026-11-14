@@ -155,7 +155,7 @@ export function SwarmView(props: SwarmViewProps) {
             <StateMark state={selectedAgent.state} size={14} title={stateWords(selectedAgent.state)} />
             {stateWords(selectedAgent.state)}{selectedAgent.since ? ` ${elapsed(selectedAgent.since, now)}` : ""}
           </span>
-          {selectedAgent.tool && <span className="sw-inspector-fact sw-fixed">{selectedAgent.tool}</span>}
+          {selectedAgent.tool && <span className="sw-inspector-fact" title={selectedAgent.tool}>{selectedAgent.tool}</span>}
           {selectedAgent.costUsd !== undefined && <span className="sw-inspector-fact sw-fixed sw-num">{usd(selectedAgent.costUsd)}</span>}
           {selectedAgent.taskId && <span className="sw-inspector-fact" title={selectedAgent.taskId}><small>task</small>{selectedAgent.taskId}</span>}
           <span className="sw-inspector-links">

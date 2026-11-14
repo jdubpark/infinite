@@ -24,7 +24,7 @@ Source: the Claude Code managed-settings and permissions documentation.
 
 | Key | What it stops | What it does not stop |
 | --- | --- | --- |
-| `permissions.disableBypassPermissionsMode: "disable"` | Entering `bypassPermissions` mode, including `--dangerously-skip-permissions`. The provider rejects the flag. | Any other mode that the host passes with `--permission-mode`. |
+| `permissions.disableBypassPermissionsMode: "disable"` | Entering `bypassPermissions` mode, including `--dangerously-skip-permissions`. The provider does not refuse to start: it runs the session in `default` mode instead. | Any other mode that the host passes with `--permission-mode`. |
 | `permissions.disableAutoMode: "disable"` | Auto mode, where the provider approves its own tool calls. | The host's own permission flow, which stays in charge. |
 | `permissions.deny` `Read(//etc/infinite-github/**)` | Provider file reads under the GitHub App issuer directory, which holds the App configuration. | A shell command that reads the same file. Bash is not covered by a `Read` rule. |
 | `permissions.deny` `Read(//srv/infinite-data/github-app/**)` | Provider file reads of the GitHub App private key directory. | A shell command that reads the same file. |
@@ -33,7 +33,12 @@ Source: the Claude Code managed-settings and permissions documentation.
 
 A `Read` deny rule is a policy rule for the provider's file tool. It does not stop a shell command from reading a file that the agent account can read. The real controls are file modes and the credential helper. The issuer configuration is root-only (`0600`). The token cache is readable by the agent group on purpose, so a shell command can read a cached token. Only short-lived tokens belong in that directory. Keep the modes in `github-app.md` correct, and check them with `ls -l` after install.
 
-The `Read(//...)` rule syntax is not confirmed by the vendor documentation this template was checked against. Run `claude doctor` after install. It reports settings-file validation errors and dropped entries. Adjust the rule text if it reports one.
+Two of these keys were checked against Claude Code 2.1.325 on 2026-11-14, passed through `--settings` on a development machine, not through the managed file:
+
+- A `Read(//ABSOLUTE/DIR/**)` deny rule refused the file tool with "File is in a directory that is denied by your permission settings".
+- With `permissions.disableBypassPermissionsMode` set to `"disable"`, a session started with `--dangerously-skip-permissions` reported the permission mode `default`. Without the key it reported `bypassPermissions`.
+
+Run `claude doctor` after install all the same. It reports settings-file validation errors and dropped entries. Adjust the rule text if it reports one.
 
 ### Keys deliberately not set
 
@@ -132,4 +137,5 @@ Removing a ceiling removes the protection. Doctor then reports `missing`. Do thi
 - A `Read` deny rule does not block shell commands. See the note in the Claude Code table.
 - Doctor reads the installed files as the account that runs it. A file the account cannot read is reported as `changed`.
 - The Claude Code `disableAutoMode` key has two spellings in the vendor documentation. This template uses the one from the permissions page. Confirm it with `claude doctor` after install.
-- No check in this repository has run against a real server. Installing the files is the first step. The tests listed above still need to run on the host.
+- Nothing here has run against a real server or through the managed file path. Installing the files is the first step. The tests listed above still need to run on the host.
+- A session that the ceiling moves from bypass mode to `default` mode starts to raise permission requests. Check the `profile` line of `infinite doctor` before installing, and remove a forbidden flag from the launch profile first.

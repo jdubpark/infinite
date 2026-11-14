@@ -10,6 +10,7 @@ import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/eviden
 import { EventOutbox } from "../packages/host/src/evidence/outbox.js";
 import { backfillRun, backfillTick, outcomeBackfill } from "../packages/host/src/outcome-backfill.js";
 import { type OutcomeRow, type RunSummaryRow, outcomeModule, readOutcome, readSummary, writeOutcome, writeSummary } from "../packages/host/src/outcome-store.js";
+import { ownerSignal } from "../packages/host/src/outcome-signals.js";
 import { runEventKey } from "../packages/host/src/run-events.js";
 import type { TeamContinuation, TeamMember, TeamRun, TeamTask } from "../packages/host/src/team-types.js";
 
@@ -437,5 +438,33 @@ test("active runs come first, and a module that is not ready ends the tick", () 
     assert.equal(called, false, "runs() is not called while the configurations module is not ready");
   } finally {
     unready.close();
+  }
+});
+
+test("a backfilled run takes the signals it already has", () => {
+  const { store, close } = openStore();
+  try {
+    // Events made both summaries first, with no project yet. Only one run gets an owner claim before its backfill.
+    const eventMade = (runId: string): RunSummaryRow => ({
+      runId, source: "production", projectRef: "", revision: 1, status: "ready-for-review", blockCode: null,
+      flags: ["gap"], createdAt: null, settledAt: AT, approvedAt: null, runDeletedAt: null,
+      payload: { projectId: "unknown", attempts: {}, rounds: { total: 0, attributed: 0, unattributed: 0, unknown: 0 } },
+    });
+    store.write(tx => {
+      writeSummary(tx, eventMade("run-signal"));
+      writeSummary(tx, eventMade("run-plain"));
+    });
+    ownerSignal(store, { action: "record", kind: "linked-fix", requestId: "fix-1", runId: "run-signal" }, AT);
+
+    const options = { mapOf: () => undefined, now: () => AT };
+    const runs = () => [approvedRun("run-signal"), approvedRun("run-plain")];
+    assert.deepEqual(backfillTick(store, runs, options), { written: 2, remaining: 0 });
+
+    // The run-wide fix is an owner claim on an accepted row, so the row the backfill wrote is not held.
+    assert.equal(store.read(db => readOutcome(db, "run-signal:m1"))?.held, 0);
+    // Control: the run with no signal keeps its unknown hold, as before.
+    assert.equal(store.read(db => readOutcome(db, "run-plain:m1"))?.held, null);
+  } finally {
+    close();
   }
 });

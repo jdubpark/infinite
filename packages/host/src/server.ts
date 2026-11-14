@@ -762,7 +762,8 @@ export function createApp(config: Config, key: Buffer) {
       issue: signalIssue.optional(), commit: signalCommit.optional(), at: signalTime.optional() }).strict()
       .refine(body => body.issue !== undefined || body.commit !== undefined, "A linked fix names an issue, a commit, or both."),
     z.object({ action: z.literal("record"), kind: z.literal("exclusion"), requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), reason: z.enum(EXCLUSION_REASONS) }).strict(),
-    z.object({ action: z.literal("withdraw"), kind: z.enum(["linked-fix", "exclusion"]), requestId: z.uuid(), signalId: z.string().regex(/^[0-9a-f]{64}$/) }).strict(),
+    // A withdrawal is idempotent by the signal's state, so it carries no request id.
+    z.object({ action: z.literal("withdraw"), kind: z.enum(["linked-fix", "exclusion"]), signalId: z.string().regex(/^[0-9a-f]{64}$/) }).strict(),
   ]);
   const signalStatus = { "request-conflict": 409, "signal-not-withdrawable": 409, "outcome-not-found": 404, "signal-not-found": 404 } as const;
   app.post("/api/outcomes/signals", requireRole(["owner"]), (req, res) => {

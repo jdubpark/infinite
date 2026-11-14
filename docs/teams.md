@@ -1806,6 +1806,13 @@ three exact rules. It checks the commits oldest first:
 2. The commit's second parent is the run's reviewed head (`merge-parent`).
 3. The commit's tree is the run's reviewed tree (`tree-equal`).
 
+A tree can recur, so rule 3 also needs proof that the commit is not older than
+the run. The commit is the reviewed head itself, or the run's base is among the
+scanned commits before it. When the base is not among them, the rule holds only
+in a scan of new commits. A scan that reads history older than the ledger's own
+head (the first scan, or one after a rewrite or a source change) then matches no
+tree. A run that changed nothing never lands.
+
 A run lands once, at its first matching commit. A squash onto a moved base lands
 nothing, so that run's held stays unknown.
 
@@ -1827,6 +1834,9 @@ Held stays unknown when a gap falls inside the window:
   gap `bound`;
 - a rewritten base branch (`rewrite`), or a project that now follows another
   repository or branch (`source`);
+- a fetch that no scan recorded, when the scanner cannot show that every head
+  the mirror held since the last recorded scan is still in the history (also
+  `rewrite`);
 - a refresh that lapses by more than six hours across the close of the window.
 
 The row carries the `scan-gap` flag when a gap leaves held unknown on an accepted
@@ -1848,13 +1858,14 @@ routine approval.
 A changed `holdDays` applies to landings recorded afterwards. Each landing keeps
 the window it started with.
 
-`POST /api/outcomes/signals` is owner only. Each body is JSON with a `requestId`
-UUID and one of three shapes:
+`POST /api/outcomes/signals` is owner only. Each body is JSON with one of three
+shapes. A record carries a `requestId` UUID. A withdrawal carries none, because
+it is idempotent by the signal's state.
 
-- `{"action": "record", "kind": "linked-fix", "runId", "memberId", "issue", "commit", "at"}`.
+- `{"action": "record", "kind": "linked-fix", "requestId", "runId", "memberId", "issue", "commit", "at"}`.
   `memberId` and `at` are optional. The fix names an `issue` or a `commit`. `at`
   is an ISO time no later than the request.
-- `{"action": "record", "kind": "exclusion", "runId", "memberId", "reason"}`.
+- `{"action": "record", "kind": "exclusion", "requestId", "runId", "memberId", "reason"}`.
   `reason` is `outside-cause`, `invalid-task`, `trial`, or `other`.
 - `{"action": "withdraw", "kind": "linked-fix" or "exclusion", "signalId"}`.
   `signalId` is 64 hex characters.
@@ -1862,15 +1873,17 @@ UUID and one of three shapes:
 The route answers:
 
 - `200` with `{ "signal", "repeated" }`. `repeated` is `true` when the same
-  request was already applied. The served signal has no `request` field.
+  record was already applied, or when the signal was already withdrawn. The
+  served signal has no `request` field.
 - `400` for an invalid body, or an `at` later than the request.
 - `403` for a caller that is not the owner.
 - `404` with `outcome-not-found` for an unknown run or member, or with
   `signal-not-found` for an unknown signal.
-- `409` with `request-conflict` when the `requestId` was used for another body,
-  or with `signal-not-withdrawable` when the signal is not an owner signal of the
-  given kind.
-- `503` with `code: "evidence-unavailable"` when the store is unavailable.
+- `409` with `request-conflict` when the `requestId` was used for another
+  record, or with `signal-not-withdrawable` when the signal is not an owner
+  signal of the given kind.
+- `503` with `code: "evidence-unavailable"` when the store is unavailable, or
+  when a row of the run cannot be read.
 
 The remote relay refuses this route with `403` and `code:
 "remote-endpoint-denied"`.
@@ -1883,9 +1896,9 @@ infinite usage outcomes link-fix --run ID [--member ID] (--issue KEY | --commit 
 infinite usage outcomes exclude --run ID --member ID --reason REASON [--request-id ID] [--json]
 ```
 
-Either command takes `--withdraw SIGNAL` to withdraw that signal. Pass
-`--request-id` to make a retry safe. Otherwise each run of the command is a new
-request.
+Either command takes `--withdraw SIGNAL` to withdraw that signal; a withdrawal
+needs no other option. For a record, pass `--request-id` to make a retry safe.
+Otherwise each run of the command is a new request.
 
 Runs that predate the ledger never land, so their held stays unknown. A landing
 commit that the scan read before its run's approval reached the ledger is never

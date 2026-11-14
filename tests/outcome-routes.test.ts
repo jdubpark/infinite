@@ -398,16 +398,23 @@ test("owner signals are owner-only and idempotent", { timeout: 180000 }, async (
     const ahead = await f.host.fetchApi("/outcomes/signals", "owner", { action: "record", kind: "linked-fix", requestId: randomUUID(), runId: run.id, issue: "ABC-7", at: new Date(Date.now() + 3600_000).toISOString() });
     assert.equal(ahead.status, 400);
 
-    const withdrawn = await f.host.fetchApi("/outcomes/signals", "owner", { action: "withdraw", kind: "exclusion", requestId: randomUUID(), signalId: first.body.signal.signalId });
+    const withdrawn = await f.host.fetchApi("/outcomes/signals", "owner", { action: "withdraw", kind: "exclusion", signalId: first.body.signal.signalId });
     assert.equal(withdrawn.status, 200, JSON.stringify(withdrawn.body));
     assert.equal(withdrawn.body.signal.state, "withdrawn");
     assert.equal("request" in withdrawn.body.signal.payload, false);
 
-    const wrongKind = await f.host.fetchApi("/outcomes/signals", "owner", { action: "withdraw", kind: "linked-fix", requestId: randomUUID(), signalId: first.body.signal.signalId });
+    // A withdrawal is idempotent by state: a second one repeats, and a request id is refused.
+    const again = await f.host.fetchApi("/outcomes/signals", "owner", { action: "withdraw", kind: "exclusion", signalId: first.body.signal.signalId });
+    assert.equal(again.status, 200, JSON.stringify(again.body));
+    assert.equal(again.body.repeated, true);
+    const withId = await f.host.fetchApi("/outcomes/signals", "owner", { action: "withdraw", kind: "exclusion", requestId: randomUUID(), signalId: first.body.signal.signalId });
+    assert.equal(withId.status, 400);
+
+    const wrongKind = await f.host.fetchApi("/outcomes/signals", "owner", { action: "withdraw", kind: "linked-fix", signalId: first.body.signal.signalId });
     assert.equal(wrongKind.status, 409);
     assert.equal(wrongKind.body.code, "signal-not-withdrawable");
 
-    const missing = await f.host.fetchApi("/outcomes/signals", "owner", { action: "withdraw", kind: "exclusion", requestId: randomUUID(), signalId: "a".repeat(64) });
+    const missing = await f.host.fetchApi("/outcomes/signals", "owner", { action: "withdraw", kind: "exclusion", signalId: "a".repeat(64) });
     assert.equal(missing.status, 404);
     assert.equal(missing.body.code, "signal-not-found");
 

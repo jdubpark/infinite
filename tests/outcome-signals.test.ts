@@ -243,8 +243,13 @@ function land(h: Harness, runId: string, landedAt: string, method: LandingMethod
 function decide(h: Harness, runId: string, state: "covered" | "gap", decidedAt: string): void {
   const signal = h.store.read(db => readSignal(db, landingSignalId(runId)));
   if (!signal || signal.payload.kind !== "landing") throw new Error("the run has no landing");
-  if (state === "gap") assert.equal(scanOf(h, { at: day(5), gap: "bound", commits: 0 }).applied, true);
+  if (state === "gap") gapScan(h, day(5));
   assert.equal(checkAt(h, decidedAt).applied, true);
+}
+
+/** A scan that read a gap and no commits: the window of any landing it falls in has a gap. */
+function gapScan(h: Harness, at: string): void {
+  assert.equal(scanOf(h, { at, gap: "bound", commits: 0 }).applied, true);
 }
 
 /** A revert of the run's landing, recorded by a scan at `revertedAt`. */
@@ -369,15 +374,20 @@ test("a quiet window holds and a reverted one does not", () => {
 test("a gap in the window flags the row", () => {
   const h = harness();
   try {
-    h.flush(standardRun(RUN));
+    h.flush([...standardRun(RUN), ...standardRun(RUN_B)]);
+    // One timeline: both landings on day 0, a gap on day 5, RUN_B reverted on day 20, and the check on day 31. A scan
+    // may not come after a check that decided a window, so the revert is scanned before the check.
     land(h, RUN, day(0));
-    decide(h, RUN, "gap", day(31));
+    land(h, RUN_B, day(0));
+    gapScan(h, day(5));
+    revert(h, RUN_B, day(20));
+    assert.equal(checkAt(h, day(31)).applied, true);
+
     const gapped = rowOf(h.store, RUN, "m1");
     assert.equal(gapped?.held, null);
     assert.ok(gapped?.flags.includes("scan-gap"));
 
-    revert(h, RUN, day(20));
-    const reverted = rowOf(h.store, RUN, "m1");
+    const reverted = rowOf(h.store, RUN_B, "m1");
     assert.equal(reverted?.held, 0);
     assert.equal(reverted?.flags.includes("scan-gap"), false);
   } finally {
@@ -431,17 +441,18 @@ test("a replayed page keeps the signals", () => {
   const h = harness();
   try {
     h.flush([...standardRun(RUN), ...standardRun(RUN_2)]);
+    // Reordered for ruling 3: the landings and the gap scan come before the check, since a scan may not precede a check.
     land(h, RUN, day(0));
-    decide(h, RUN, "covered", day(31));
-    ownerSignal(h.store, { action: "record", kind: "exclusion", requestId: "excl-1", runId: RUN, memberId: "m1", reason: "trial" }, at(12));
     land(h, RUN_2, day(0));
-    decide(h, RUN_2, "gap", day(31));
+    gapScan(h, day(5));
+    assert.equal(checkAt(h, day(31)).applied, true);
+    ownerSignal(h.store, { action: "record", kind: "exclusion", requestId: "excl-1", runId: RUN, memberId: "m1", reason: "trial" }, at(12));
 
     const before = snapshot(h, [RUN, RUN_2]);
     replay(h);
     assert.deepEqual(snapshot(h, [RUN, RUN_2]), before);
 
-    // The exclusion is still in force, the landed row keeps its window, and the gap flag stays.
+    // The exclusion is still in force, the landed row keeps its hold, and the gap flag stays.
     const excluded = rowOf(h.store, RUN, "m1");
     assert.equal(excluded?.exclusion, "owner");
     assert.equal(excluded?.held, null);
@@ -473,7 +484,7 @@ test("an owner exclusion and its withdrawal", () => {
     assert.equal(excluded?.holdUntil, day(30));
     assert.deepEqual(summaryOf(h.store, RUN)?.payload.attempts, attemptsBefore);
 
-    const withdrawn = ownerSignal(h.store, { action: "withdraw", kind: "exclusion", requestId: "excl-2", signalId: ownerSignalId("excl-1") }, at(13));
+    const withdrawn = ownerSignal(h.store, { action: "withdraw", kind: "exclusion", signalId: ownerSignalId("excl-1") }, at(13));
     assert.equal(withdrawn.repeated, false);
     assert.equal(withdrawn.signal.state, "withdrawn");
     const restored = rowOf(h.store, RUN, "m1");
@@ -481,7 +492,7 @@ test("an owner exclusion and its withdrawal", () => {
     assert.deepEqual(levelsOf(restored), [1, 1, 1, 1]);
     assert.equal(restored?.accepted, 1);
 
-    const again = ownerSignal(h.store, { action: "withdraw", kind: "exclusion", requestId: "excl-3", signalId: ownerSignalId("excl-1") }, at(14));
+    const again = ownerSignal(h.store, { action: "withdraw", kind: "exclusion", signalId: ownerSignalId("excl-1") }, at(14));
     assert.equal(again.repeated, true);
   } finally {
     h.close();
@@ -552,9 +563,9 @@ test("owner requests are idempotent and checked", () => {
     assertRequestError(() => ownerSignal(h.store, { ...input, requestId: "excl-9", memberId: "nobody" }, at(12)), "outcome-not-found");
 
     land(h, RUN, day(0));
-    assertRequestError(() => ownerSignal(h.store, { action: "withdraw", kind: "linked-fix", requestId: "w-1", signalId: landingSignalId(RUN) }, at(12)), "signal-not-withdrawable");
-    assertRequestError(() => ownerSignal(h.store, { action: "withdraw", kind: "linked-fix", requestId: "w-2", signalId: first.signal.signalId }, at(12)), "signal-not-withdrawable");
-    assertRequestError(() => ownerSignal(h.store, { action: "withdraw", kind: "exclusion", requestId: "w-3", signalId: "0".repeat(64) }, at(12)), "signal-not-found");
+    assertRequestError(() => ownerSignal(h.store, { action: "withdraw", kind: "linked-fix", signalId: landingSignalId(RUN) }, at(12)), "signal-not-withdrawable");
+    assertRequestError(() => ownerSignal(h.store, { action: "withdraw", kind: "linked-fix", signalId: first.signal.signalId }, at(12)), "signal-not-withdrawable");
+    assertRequestError(() => ownerSignal(h.store, { action: "withdraw", kind: "exclusion", signalId: "0".repeat(64) }, at(12)), "signal-not-found");
 
     assert.throws(
       () => ownerSignal(bare.store, { action: "record", kind: "exclusion", requestId: "excl-1", runId: RUN, memberId: "m1", reason: "trial" }, at(12)),
@@ -693,27 +704,29 @@ test("scan inputs list candidates and open landings", () => {
     // The commit ids of the candidates must be lower-case hex, so these differ from the non-hex constants above.
     const candHead = "1".repeat(40);
     const candMerge = "2".repeat(40);
+    const candBase = "3".repeat(40);
     // Summaries of runs with no outcome rows. A candidate's approval must fall within the last APPROVAL_DAYS of `at`.
-    const summary = (runId: string, approvedAt: string, mergeCommit: string | undefined): RunSummaryRow => ({
+    const summary = (runId: string, approvedAt: string, mergeCommit: string | undefined, currentBase?: string): RunSummaryRow => ({
       runId, source: "test", projectRef: "", revision: 1, status: "approved", blockCode: null, flags: [], createdAt: null,
       settledAt: null, approvedAt, runDeletedAt: null,
       payload: {
         projectId: PROJECT, attempts: {}, rounds: { total: 0, attributed: 0, unattributed: 0, unknown: 0 },
         reviewedHead: candHead, reviewedTree: TREE, ...(mergeCommit === undefined ? {} : { mergeCommit }),
+        ...(currentBase === undefined ? {} : { currentBase }),
       },
     });
     h.store.write(tx => {
-      writeSummary(tx, summary("cand-a", day(-9), candMerge));
+      writeSummary(tx, summary("cand-a", day(-9), candMerge, candBase));
       writeSummary(tx, summary("cand-old", day(-90), candMerge));
       // An uppercase merge commit is not a commit id, so the candidate keeps no mergeCommit.
-      writeSummary(tx, summary("cand-odd", day(-9), "A".repeat(40)));
+      writeSummary(tx, summary("cand-odd", day(-9), "A".repeat(40), "C".repeat(40)));
     });
 
     const at1 = day(1);
     const inputs: ScanInputs = h.store.read(db => scanInputs(db, PROJECT, at1));
     assert.deepEqual(inputs.state, { seq: 2, head: SCAN_HEAD, repository: REPO, baseBranch: "main", lastAt: day(0) });
     assert.deepEqual(inputs.candidates, [
-      { runId: "cand-a", reviewedHead: candHead, reviewedTree: TREE, mergeCommit: candMerge },
+      { runId: "cand-a", reviewedHead: candHead, reviewedTree: TREE, mergeCommit: candMerge, base: candBase },
       { runId: "cand-odd", reviewedHead: candHead, reviewedTree: TREE },
     ] satisfies LandingCandidate[]);
     // RUN has an active landing, so it is not a candidate though its approval is in range.
@@ -735,6 +748,86 @@ test("a window of the longest hold is decided", () => {
     const landed = h.store.read(db => readSignal(db, landingSignalId(RUN)));
     assert.equal(landed?.payload.kind === "landing" ? landed.payload.window?.state : undefined, "covered");
     assert.equal(rowOf(h.store, RUN, "m1")?.held, 1);
+  } finally {
+    h.close();
+  }
+});
+
+test("a scan older than the last check is refused", () => {
+  const h = harness();
+  try {
+    h.flush(standardRun(RUN));
+    land(h, RUN, day(0));
+    assert.equal(checkAt(h, day(31)).applied, true);
+    assert.equal(rowOf(h.store, RUN, "m1")?.held, 1);
+
+    // A scan at day 20 would add a revert inside a window the day 31 check decided. It is refused and writes nothing.
+    const match: RevertMatch = { runId: RUN, signalId: landingSignalId(RUN), commit: REVERT, reverts: MERGE };
+    assert.deepEqual(scanOf(h, { at: day(20), reverts: [match] }), { applied: false, seq: 1 });
+    assert.equal(rowOf(h.store, RUN, "m1")?.held, 1);
+    assert.equal(signalsOf(h.store, RUN).some(signal => signal.kind === "revert"), false);
+
+    // A check older than the last check is refused too.
+    assert.equal(checkAt(h, day(30)).applied, false);
+  } finally {
+    h.close();
+  }
+});
+
+test("a revert is stored under its landing's run", () => {
+  const h = harness();
+  try {
+    h.flush([...standardRun(RUN), ...standardRun(RUN_B)]);
+    land(h, RUN, day(0));
+    // The match names RUN_B, but its signal is RUN's landing: the revert belongs to RUN.
+    const match: RevertMatch = { runId: RUN_B, signalId: landingSignalId(RUN), commit: REVERT, reverts: MERGE };
+    assert.equal(scanOf(h, { at: day(10), reverts: [match] }).applied, true);
+
+    const revertSignal = h.store.read(db => readSignal(db, revertSignalId(landingSignalId(RUN), REVERT)));
+    assert.equal(revertSignal?.runId, RUN);
+    assert.equal(signalsOf(h.store, RUN_B).some(signal => signal.kind === "revert"), false);
+    assert.equal(rowOf(h.store, RUN, "m1")?.held, 0);
+  } finally {
+    h.close();
+  }
+});
+
+/** Replaces a stored payload with text that does not open, as a row written by another build could hold. */
+function corruptPayload(h: Harness, table: "outcome_signals" | "outcomes", key: string, column: "signal_id" | "outcome_id"): void {
+  const garbage = JSON.stringify({ v: 1, n: "AAAAAAAAAAAAAAAA", c: "AA==", t: "AAAAAAAAAAAAAAAAAAAAAA==" });
+  h.store.write(tx => tx.run(`UPDATE ${table} SET payload=? WHERE ${column}=?`, garbage, key));
+}
+
+test("an unreadable signal is never overwritten", () => {
+  const h = harness();
+  try {
+    h.flush(standardRun(RUN));
+    const input: OwnerSignalInput = { action: "record", kind: "exclusion", requestId: "excl-1", runId: RUN, memberId: "m1", reason: "trial" };
+    ownerSignal(h.store, input, at(12));
+    const signalId = ownerSignalId("excl-1");
+    corruptPayload(h, "outcome_signals", signalId, "signal_id");
+    const raw = (): unknown => h.store.read(db => db.get("SELECT payload FROM outcome_signals WHERE signal_id=?", signalId));
+    const before = raw();
+
+    assertRequestError(() => ownerSignal(h.store, input, at(13)), "request-conflict");
+    assertRequestError(() => ownerSignal(h.store, { action: "withdraw", kind: "exclusion", signalId }, at(13)), "signal-not-withdrawable");
+    assert.deepEqual(raw(), before);
+  } finally {
+    h.close();
+  }
+});
+
+test("an unreadable row makes an owner claim unavailable", () => {
+  const h = harness();
+  try {
+    h.flush(standardRun(RUN));
+    corruptPayload(h, "outcomes", `${RUN}:m1`, "outcome_id");
+    const claim: OwnerSignalInput = { action: "record", kind: "linked-fix", requestId: "req-9", runId: RUN, issue: "ABC-1" };
+    assert.throws(
+      () => ownerSignal(h.store, claim, at(20)),
+      error => error instanceof EvidenceError && error.code === "unavailable",
+    );
+    assert.equal(h.store.read(db => db.get("SELECT COUNT(*) AS n FROM outcome_signals"))?.n, 0);
   } finally {
     h.close();
   }

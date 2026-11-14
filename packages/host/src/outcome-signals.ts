@@ -57,7 +57,7 @@ export type RowSignalFacts = { signals: RowSignals; landing?: { at: string; meth
 export type OwnerSignalInput =
   | { action: "record"; kind: "linked-fix"; requestId: string; runId: string; memberId?: string; issue?: string; commit?: string; at?: string }
   | { action: "record"; kind: "exclusion"; requestId: string; runId: string; memberId: string; reason: ExclusionReason }
-  | { action: "withdraw"; kind: "linked-fix" | "exclusion"; requestId: string; signalId: string };
+  | { action: "withdraw"; kind: "linked-fix" | "exclusion"; signalId: string };
 
 export type SignalRequestCode = "request-conflict" | "outcome-not-found" | "signal-not-found" | "signal-not-withdrawable";
 
@@ -161,10 +161,16 @@ export function recomputeRun(tx: EvidenceTx, runId: string): void {
 /** The owner's claim with one request id. It is recorded or withdrawn in one write, and repeats are idempotent. */
 export function ownerSignal(store: EvidenceStore, input: OwnerSignalInput, now: string): { signal: SignalRow; repeated: boolean } {
   if (store.status().modules[OUTCOMES_MODULE] !== "ready") throw new EvidenceError("unavailable", UNAVAILABLE);
-  return store.write(tx => {
-    if (input.action === "withdraw") return withdrawSignal(tx, input, now);
-    return recordSignal(tx, input, now);
-  });
+  try {
+    return store.write(tx => {
+      if (input.action === "withdraw") return withdrawSignal(tx, input, now);
+      return recordSignal(tx, input, now);
+    });
+  } catch (error) {
+    // A summary or a row of the run that does not open is unavailable evidence, not a server fault. The write rolls back.
+    if (error instanceof SignalRequestError || error instanceof EvidenceError) throw error;
+    throw new EvidenceError("unavailable", UNAVAILABLE);
+  }
 }
 
 function recordSignal(
@@ -179,6 +185,8 @@ function recordSignal(
     if ("request" in stored.payload && stored.payload.request === request) return { signal: stored, repeated: true };
     throw new SignalRequestError("request-conflict", "The request id names another request.");
   }
+  // A stored row whose payload does not open is never overwritten.
+  if (hasSignal(tx, signalId)) throw new SignalRequestError("request-conflict", "The stored signal does not open.");
   const summary = readSummary(tx, input.runId);
   const rows = runOutcomes(tx, input.runId);
   if (summary === undefined && rows.length === 0) {
@@ -221,6 +229,9 @@ function withdrawSignal(
   now: string,
 ): { signal: SignalRow; repeated: boolean } {
   const stored = readSignal(tx, input.signalId);
+  if (stored === undefined && hasSignal(tx, input.signalId)) {
+    throw new SignalRequestError("signal-not-withdrawable", "The stored signal does not open.");
+  }
   if (stored === undefined) throw new SignalRequestError("signal-not-found", "The signal does not exist.");
   const payload = stored.payload;
   if (stored.author !== "owner" || stored.kind !== input.kind || (payload.kind !== "linked-fix" && payload.kind !== "exclusion")) {
@@ -284,12 +295,13 @@ export function scanInputs(db: EvidenceDb, projectId: string, at: string): ScanI
 }
 
 function candidateOf(runId: string, payload: RunSummaryPayload): LandingCandidate {
-  const { reviewedHead, reviewedTree, mergeCommit } = payload;
+  const { reviewedHead, reviewedTree, mergeCommit, currentBase } = payload;
   return {
     runId,
     ...(reviewedHead !== undefined && COMMIT_ID.test(reviewedHead) ? { reviewedHead } : {}),
     ...(reviewedTree !== undefined && COMMIT_ID.test(reviewedTree) ? { reviewedTree } : {}),
     ...(mergeCommit !== undefined && COMMIT_ID.test(mergeCommit) ? { mergeCommit } : {}),
+    ...(currentBase !== undefined && COMMIT_ID.test(currentBase) ? { base: currentBase } : {}),
   };
 }
 
@@ -319,10 +331,12 @@ export function applyScan(tx: EvidenceTx, scan: ScanWrite): { applied: boolean; 
   const current = readScanState(tx, ref)?.seq ?? 0;
   const last = lastScan(tx, ref);
   const time = Date.parse(scan.at);
-  if (scan.expectedSeq !== current || Number.isNaN(time) || (last !== undefined && time < Date.parse(last.at))) {
+  const refused = last !== undefined && (time < Date.parse(last.at) || time < Date.parse(last.checkedAt));
+  if (scan.expectedSeq !== current || Number.isNaN(time) || refused) {
     return { applied: false, seq: current };
   }
   const seq = current + 1;
+  const at = new Date(time).toISOString();
   const payload: ScanRow["payload"] = {
     ...(scan.from === undefined ? {} : { from: scan.from }),
     to: scan.head,
@@ -330,7 +344,7 @@ export function applyScan(tx: EvidenceTx, scan: ScanWrite): { applied: boolean; 
   };
   writeScan(
     tx,
-    { projectRef: ref, seq, at: scan.at, checkedAt: scan.at, commits: scan.commits, gap: scan.gap, payload },
+    { projectRef: ref, seq, at, checkedAt: at, commits: scan.commits, gap: scan.gap, payload },
     { projectRef: ref, seq, payload: { head: scan.head, repository: scan.repository, baseBranch: scan.baseBranch } },
   );
   const touched = new Set<string>();
@@ -345,14 +359,14 @@ export function applyScan(tx: EvidenceTx, scan: ScanWrite): { applied: boolean; 
       author: "host",
       authority: "receipt",
       state: "active",
-      at: scan.at,
+      at,
       payload: {
         kind: "landing",
         commit: landing.commit,
         method: landing.method,
         scanSeq: seq,
         holdDays: scan.holdDays,
-        holdUntil: holdUntil(scan.at, scan.holdDays),
+        holdUntil: holdUntil(at, scan.holdDays),
         ...(landing.reviewedHead === undefined ? {} : { reviewedHead: landing.reviewedHead }),
       },
     });
@@ -366,13 +380,13 @@ export function applyScan(tx: EvidenceTx, scan: ScanWrite): { applied: boolean; 
     if (hasSignal(tx, signalId)) continue;
     writeSignal(tx, {
       signalId,
-      runId: match.runId,
+      runId: landing.runId,
       outcomeId: null,
       kind: "revert",
       author: "host",
       authority: "receipt",
       state: "active",
-      at: scan.at,
+      at,
       payload: {
         kind: "revert",
         commit: match.commit,
@@ -381,9 +395,9 @@ export function applyScan(tx: EvidenceTx, scan: ScanWrite): { applied: boolean; 
         scanSeq: seq,
       },
     });
-    touched.add(match.runId);
+    touched.add(landing.runId);
   }
-  for (const runId of decideWindows(tx, ref, scan.at)) touched.add(runId);
+  for (const runId of decideWindows(tx, ref, at)) touched.add(runId);
   for (const runId of touched) recomputeRun(tx, runId);
   return { applied: true, seq };
 }
@@ -396,9 +410,13 @@ export function applyCheck(tx: EvidenceTx, check: { projectId: string; head: str
   const ref = tx.index("project", check.projectId);
   const state = readScanState(tx, ref);
   if (state === undefined || state.seq !== check.expectedSeq || state.payload.head !== check.head) return { applied: false };
-  if (Number.isNaN(Date.parse(check.at))) return { applied: false };
-  checkScan(tx, ref, state.seq, check.at);
-  for (const runId of decideWindows(tx, ref, check.at)) recomputeRun(tx, runId);
+  const time = Date.parse(check.at);
+  if (Number.isNaN(time)) return { applied: false };
+  const last = lastScan(tx, ref);
+  if (last !== undefined && time < Date.parse(last.checkedAt)) return { applied: false };
+  const at = new Date(time).toISOString();
+  checkScan(tx, ref, state.seq, at);
+  for (const runId of decideWindows(tx, ref, at)) recomputeRun(tx, runId);
   return { applied: true };
 }
 

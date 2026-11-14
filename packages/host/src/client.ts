@@ -866,7 +866,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
         const signalRun = optionValue("--run");
         const signalMember = optionValue("--member");
         let body: Record<string, unknown>;
-        if (withdraw !== undefined) body = { action: "withdraw", kind: signalKind, requestId, signalId: withdraw };
+        if (withdraw !== undefined) body = { action: "withdraw", kind: signalKind, signalId: withdraw };
         else if (positional[1] === "link-fix") {
           const issue = optionValue("--issue"), commit = optionValue("--commit"), at = optionValue("--at");
           if (signalRun === undefined || (issue === undefined && commit === undefined)) throw new Error(signalUsage);

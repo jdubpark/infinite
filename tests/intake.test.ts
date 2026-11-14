@@ -1079,6 +1079,16 @@ test("a long root message cannot push out the newest message or the cut notice",
   assert.match(text, /\nowner \| \[… message cut\]\nother 1 \| newest$/);
 });
 
+test("a marked line of exactly the per-message cap stays whole with no cut notice", () => {
+  const line = `owner | ${"x".repeat(4000 - "owner | ".length)}`;
+  assert.equal(line.length, 4000);
+  const text = directObjective({ identifier: "TEST-1", title: "t" }, "do it", [
+    { ts: "1700000000.000001", user: OWNER_SLACK, text: line.slice("owner | ".length) },
+  ], "1700000000.000001", OWNER_SLACK);
+  assert.ok(text.includes(line));
+  assert.ok(!text.includes("[… message cut]"));
+});
+
 test("a label that shares its name with dozens of other teams' labels still resolves", { timeout: 60000 }, async () => {
   const ctx = await setup({ requireSlackThread: false });
   try {

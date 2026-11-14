@@ -13,7 +13,8 @@ const IDENTITY_RETRY_MS = 30_000;
 const RETRY_DELAYS_MS = [5_000, 30_000, 120_000];
 const RETRY_EVERY_MS = 600_000;
 const GIVE_UP_MS = 24 * 60 * 60 * 1000;
-const FINISHED = "This request has finished. File a follow-up with Linear's agent in this thread.";
+const FOLLOW_UP_LINEAR = "File a follow-up with Linear's agent in this thread.";
+const FOLLOW_UP_DIRECT = "Mention me in this thread to file a follow-up.";
 const ALREADY_ANSWERED = "That question was already answered.";
 const NOT_STARTED = "This request has not started yet.";
 const NO_REASON = "No reason was recorded.";
@@ -22,6 +23,8 @@ const ACTIONS = new Set(["status", "pause", "resume", "cancel"]);
 /** Identity failures a retry cannot fix: the surface stops with a reason, as it does for another workspace's token. */
 const PERMANENT_IDENTITY = new Set(["invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired", "credential_unavailable"]);
 const QUESTION = /^Q(\d+)(?!\w)\s*/i;
+
+export type DirectRequest = (input: { thread: IntakeThread; ts: string; eventId: string; text: string }) => "accepted" | "duplicate";
 
 interface Outcome { outcome: string; reply?: string }
 type SavedCall = NonNullable<IntakeInbound["call"]>;
@@ -82,11 +85,13 @@ export class IntakeSlackSurface {
   private unsubscribers: (() => void)[] = [];
 
   private readonly log: (line: string, error: unknown) => void;
+  private readonly direct?: DirectRequest;
 
   constructor(private readonly config: Config, private readonly store: IntakeStore, private readonly missions: MissionService,
     private readonly teams: Pick<TeamService, "get">, private readonly client: SlackClient,
-    options: { log?: (line: string, error: unknown) => void } = {}) {
+    options: { log?: (line: string, error: unknown) => void; direct?: DirectRequest } = {}) {
     this.slack = config.intake?.slack;
+    this.direct = options.direct;
     this.log = options.log ?? ((line, error) => console.warn(line, error));
   }
 
@@ -153,6 +158,15 @@ export class IntakeSlackSurface {
       this.reconcile(record.issueId);
       if (record.inbound.some(item => !item.handledAt)) void this.drain(record.issueId);
     }
+  }
+
+  /** True only when the host can file a request and the configuration turns direct requests on. */
+  private directOn(): boolean {
+    return this.direct !== undefined && this.slack?.directRequests === true;
+  }
+
+  private followUp(): string {
+    return this.directOn() ? FOLLOW_UP_DIRECT : FOLLOW_UP_LINEAR;
   }
 
   // Outbound
@@ -223,7 +237,10 @@ export class IntakeSlackSurface {
     const add = (key: string, kind: IntakeMessageKind, text: string) => {
       if (!has(key)) addParts(this.config, draft, key, kind, text, at);
     };
-    const title = `${draft.identifier} "${draft.title}"`;
+    const followUp = this.followUp();
+    // A direct request carries its issue link; before it is filed there is no identifier to name.
+    const title = !draft.direct ? `${draft.identifier} "${draft.title}"`
+      : draft.identifier ? `${draft.identifier} "${draft.title}" (${draft.url})` : `your request "${draft.title}"`;
     if (draft.state === "started") {
       add("ack", "ack", `Started on ${title}. I'll post questions and the result here.\nReply with a mention to answer or steer.`);
     } else if (draft.state === "queued" && draft.holdReason === "max-active") {
@@ -235,7 +252,7 @@ export class IntakeSlackSurface {
     // A split acknowledgement is decided by its first part.
     const ack = draft.messages.find(message => message.key === "ack" || message.key === "ack#1");
     if (draft.state === "started" && ack && !ack.text.startsWith("Started on ")) {
-      add("started", "started", `Started on ${draft.identifier}.`);
+      add("started", "started", draft.direct ? `Started on ${draft.identifier} (${draft.url}).` : `Started on ${draft.identifier}.`);
     }
     if (mission) {
       for (const decision of mission.decisions) {
@@ -247,10 +264,10 @@ export class IntakeSlackSurface {
         add(`result:${mission.result.revision}`, "result", this.resultText(mission));
       }
       if (mission.status === "blocked") {
-        add(`status:blocked:${mission.revision}`, "status", `Blocked: ${mission.reason ?? NO_REASON}\nFile a follow-up with Linear's agent in this thread.`);
+        add(`status:blocked:${mission.revision}`, "status", `Blocked: ${mission.reason ?? NO_REASON}\n${followUp}`);
       }
       if (mission.status === "cancelled") {
-        add(`status:cancelled:${mission.revision}`, "status", `Cancelled: ${mission.reason ?? NO_REASON}\nFile a follow-up with Linear's agent in this thread.`);
+        add(`status:cancelled:${mission.revision}`, "status", `Cancelled: ${mission.reason ?? NO_REASON}\n${followUp}`);
       }
       if (mission.status === "paused" && draft.closure) {
         add(`status:paused:${mission.revision}`, "status", `Paused: ${draft.closure.reason}\nReply with a mention and "resume" or "cancel".`);
@@ -397,12 +414,21 @@ export class IntakeSlackSurface {
     const text = this.commandText(event.text ?? "");
     const eventId = envelope.eventId ?? envelope.envelopeId;
     const bound = this.store.boundTo(thread);
+    const ts = event.ts;
+    // A second event for a mention that already filed a request is dropped before any reply routing.
+    if (bound.some(record => record.direct && (record.direct.eventId === eventId || record.direct.ts === ts))) return;
+    const inThread = event.threadTs !== undefined && event.threadTs !== event.ts;
     if (bound.length === 0) {
       if (slack.bindByMention && this.bind(thread, text)) return;
+      // A bare top-level mention has nothing to file.
+      if (this.directOn() && (text !== "" || inThread)) { this.fileDirect(thread, ts, eventId, text); return; }
       this.droppedCount += 1;
       return;
     }
-    const ts = event.ts;
+    if (this.directOn() && bound.every(record => record.state === "finished") && !this.routesToRecord(bound, text)) {
+      this.fileDirect(thread, ts, eventId, text);
+      return;
+    }
     const duplicate = (record: IntakeRecord) => record.inbound.some(item => item.eventId === eventId || item.ts === ts);
     // A redelivered event, or a second event for the same message, is dropped with no write and no reply. An entry a
     // failed store write left unhandled on the record that holds it is applied now.
@@ -424,6 +450,23 @@ export class IntakeSlackSurface {
       draft.inbound.push(accepted);
     });
     void this.drain(target.record.issueId);
+  }
+
+  /** Files the owner's mention as a request. A refusal is logged and counted; nothing is posted and nothing is rethrown. */
+  private fileDirect(thread: IntakeThread, ts: string, eventId: string, text: string): void {
+    try {
+      this.direct!({ thread, ts, eventId, text });
+    } catch (error) {
+      this.log("Intake Slack direct request failed.", error);
+      this.droppedCount += 1;
+    }
+  }
+
+  /** In a thread whose records have all finished, whether the text keeps today's routing: a question number, an identifier, or a command. */
+  private routesToRecord(bound: IntakeRecord[], text: string): boolean {
+    if (QUESTION.test(text) || ACTIONS.has(text.toLowerCase())) return true;
+    return bound.some(record => record.identifier !== ""
+      && new RegExp(`^${escapeRegExp(record.identifier)}(?=$|[\\s:,])`, "i").test(text));
   }
 
   /**
@@ -499,7 +542,7 @@ export class IntakeSlackSurface {
   /** An entry with a saved call performs exactly that call; any other entry is routed once, and the chosen call is saved first. */
   private async act(record: IntakeRecord, entry: IntakeInbound): Promise<Outcome> {
     if (entry.call) return this.perform(record, entry, entry.call);
-    if (record.state === "finished") return { outcome: "finished", reply: FINISHED };
+    if (record.state === "finished") return { outcome: "finished", reply: `This request has finished. ${this.followUp()}` };
     const mission = record.missionId ? this.missions.peek(record.missionId) : undefined;
     if (!mission) return { outcome: "not-started", reply: NOT_STARTED };
     const routed = this.route(record, mission, entry.text);

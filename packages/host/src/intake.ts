@@ -110,13 +110,14 @@ function markedThread(thread: SlackThreadMessage[], mentionTs: string, ownerUser
     const kept: string[] = [];
     let used = 0, cut = false;
     for (const line of lines) {
-      if (used + line.length + 1 > entryCap) {
+      const need = used + (kept.length > 0 ? 1 : 0) + line.length;
+      if (need > entryCap) {
         cut = true;
         if (kept.length === 0) kept.push(line.slice(0, entryCap));
         break;
       }
       kept.push(line);
-      used += line.length + 1;
+      used = need;
     }
     if (cut) kept.push(`${author} | [… message cut]`);
     entries.push(kept.join("\n"));

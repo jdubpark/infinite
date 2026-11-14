@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { splitSlackText } from "../packages/host/src/slack-text.js";
-import { IntakeSlackSurface } from "../packages/host/src/intake-slack.js";
+import { IntakeSlackSurface, type DirectRequest } from "../packages/host/src/intake-slack.js";
 import { IntakeStore } from "../packages/host/src/intake-store.js";
 import { SlackClient, SlackError } from "../packages/host/src/slack-client.js";
 import { deterministicUuid, type IntakeRecord, type IntakeThread } from "../packages/host/src/intake-types.js";
@@ -94,7 +94,8 @@ function intakeRecord(issueId: string, state: IntakeRecord["state"], extra: Part
 type LogLine = { line: string; error: unknown };
 const collector = () => { const calls: LogLine[] = []; return { calls, log: (line: string, error: unknown) => { calls.push({ line, error }); } }; };
 
-async function surfaceFor(services: Services, stateRoot: string, options: { bindByMention?: boolean; serverTeamId?: string; wrapClient?: (client: SlackClient) => SlackClient; log?: (line: string, error: unknown) => void } = {}) {
+async function surfaceFor(services: Services, stateRoot: string, options: { bindByMention?: boolean; serverTeamId?: string; wrapClient?: (client: SlackClient) => SlackClient; log?: (line: string, error: unknown) => void;
+  directRequests?: boolean; direct?: (store: IntakeStore) => DirectRequest } = {}) {
   const slack = await startSlackServer({ teamId: options.serverTeamId });
   // Every bound thread has its root, as in Slack; the fake stores posts only into a thread it knows.
   for (const thread of [BINDING, OTHER]) slack.seedThread(thread, [{ user: OWNER, text: "Export fails on empty rows" }]);
@@ -103,11 +104,12 @@ async function surfaceFor(services: Services, stateRoot: string, options: { bind
   const config = { stateDir: join(stateRoot, "intake"), runDir: join(stateRoot, "run"), projects: [{ id: "api", name: "API", path: PROJECT_PATH }], intake: {
     linear: { teamIds: [randomUUID()], creatorId: randomUUID(), label: "infinite", commentsMirrorToSlack: false },
     slack: { appTokenFile: slack.appTokenFile, botTokenFile: slack.botTokenFile, teamId: "T00000000", ownerUserId: OWNER,
-      bindByMention: options.bindByMention ?? false, endpoint: slack.endpoint },
+      bindByMention: options.bindByMention ?? false, endpoint: slack.endpoint, ...(options.directRequests !== undefined ? { directRequests: options.directRequests } : {}) },
     mission: { groupId: "shop", maxSubtasks: 8, maxMinutes: 30 }, maxActive: 3, requireSlackThread: true,
   } } as unknown as Config;
   const store = new IntakeStore({ stateDir: join(stateRoot, "intake") } as Config, randomBytes(32));
-  const surface = new IntakeSlackSurface(config, store, services.missions, services.teams, client, { log: options.log ?? collector().log });
+  const surface = new IntakeSlackSurface(config, store, services.missions, services.teams, client,
+    { log: options.log ?? collector().log, ...(options.direct ? { direct: options.direct(store) } : {}) });
   return {
     slack, store, surface, client, realClient, config,
     texts: (binding: IntakeThread = BINDING) => slack.posts(binding).map(post => post.text),
@@ -1084,4 +1086,157 @@ test("a permanent Slack identity failure sets a reason that names Slack's code, 
     sh.close();
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   }
+});
+
+// Direct requests
+
+const URL1 = "https://linear.example.invalid/issue/TEST-1";
+const FINISHED_DIRECT = "This request has finished. Mention me in this thread to file a follow-up.";
+
+/** A stand-in for the service: it records each call and creates the unfiled record, as `requestFromSlack` does. */
+function directStub(store: IntakeStore) {
+  const calls: Parameters<DirectRequest>[0][] = [];
+  const direct: DirectRequest = input => {
+    calls.push(input);
+    store.create(intakeRecord(randomUUID(), "queued", { identifier: "", url: "", thread: input.thread, direct: { eventId: input.eventId, ts: input.ts, text: input.text } }));
+    return "accepted";
+  };
+  return { calls, direct };
+}
+
+async function directSurface(options: { directRequests?: boolean } = {}) {
+  const h = harness(); const services = h.open();
+  const stub: { calls: Parameters<DirectRequest>[0][] } = { calls: [] };
+  const s = await surfaceFor(services, h.root, { directRequests: options.directRequests ?? true,
+    direct: store => { const made = directStub(store); stub.calls = made.calls; return made.direct; } });
+  return { s, calls: () => stub.calls, close: async () => { await s.close(); await h.close(); } };
+}
+const inOther = (text: string, overrides: Record<string, unknown> = {}) => mention(text, { channel: OTHER.channelId, thread_ts: OTHER.threadTs, ...overrides });
+
+test("an owner mention in an unbound thread files one request, and a mention by anyone else does not", { timeout: 60000 }, async () => {
+  const { s, calls, close } = await directSurface();
+  try {
+    await s.surface.start(); await s.connected();
+    await s.slack.emit(inOther("fix the export", { user: TEAMMATE }));
+    await waitFor(() => Promise.resolve(s.surface.status().dropped), dropped => dropped === 1);
+    assert.equal(calls().length, 0);
+    const event = inOther("fix the export");
+    await s.slack.emit(event, { eventId: "EvDirect1" });
+    await waitFor(async () => calls(), list => list.length === 1);
+    assert.deepEqual(calls()[0], { thread: OTHER, ts: event.ts, eventId: "EvDirect1", text: "fix the export" });
+    assert.equal(s.surface.status().dropped, 1, "The accepted mention is not counted as dropped");
+  } finally { await close(); }
+});
+
+test("a redelivered triggering event makes no second call, no inbound entry and no reply", { timeout: 60000 }, async () => {
+  const { s, calls, close } = await directSurface();
+  try {
+    await s.surface.start(); await s.connected();
+    const envelope = await s.slack.emit(inOther("fix the export"));
+    await waitFor(async () => calls(), list => list.length === 1);
+    await s.slack.redeliver(envelope);
+    // The same message under a new event ID is the same request.
+    await s.slack.emit(inOther("fix the export", { ts: calls()[0].ts }), { eventId: "EvOther" });
+    await delay(500);
+    assert.equal(calls().length, 1);
+    const records = s.store.boundTo(OTHER);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].inbound.length, 0);
+    assert.deepEqual(s.texts(OTHER).slice(1), [], "Nothing is posted beyond the thread's root");
+  } finally { await close(); }
+});
+
+test("a bare top-level mention is dropped, and a bare mention inside a thread files", { timeout: 60000 }, async () => {
+  const { s, calls, close } = await directSurface();
+  try {
+    await s.surface.start(); await s.connected();
+    await s.slack.emit(inOther("", { thread_ts: undefined }));
+    await waitFor(() => Promise.resolve(s.surface.status().dropped), dropped => dropped === 1);
+    assert.equal(calls().length, 0);
+    await s.slack.emit(inOther(""));
+    await waitFor(async () => calls(), list => list.length === 1);
+    assert.equal(calls()[0].text, "");
+  } finally { await close(); }
+});
+
+test("in a thread whose request has finished, a plain mention files a follow-up while Q, identifier and command prefixes keep the old routing", { timeout: 60000 }, async () => {
+  const { s, calls, close } = await directSurface();
+  try {
+    s.store.create(intakeRecord(ISSUE, "finished", { thread: BINDING }));
+    await s.surface.start(); await s.connected();
+    await s.slack.emit(mention("Q1 which one"));
+    await s.slack.emit(mention("TEST-1 also the CSV"));
+    await s.slack.emit(mention("Status"));
+    await waitFor(async () => s.texts(), list => list.length === 3);
+    assert.equal(calls().length, 0);
+    assert.deepEqual(s.texts().sort(), ["There is no question Q1.", FINISHED_DIRECT, FINISHED_DIRECT].sort());
+    const event = mention("also cover the CSV export");
+    await s.slack.emit(event);
+    await waitFor(async () => calls(), list => list.length === 1);
+    assert.deepEqual(calls()[0], { thread: BINDING, ts: event.ts, eventId: calls()[0].eventId, text: "also cover the CSV export" });
+  } finally { await close(); }
+});
+
+test("a thread with an unfinished record keeps today's routing for a plain mention", { timeout: 60000 }, async () => {
+  const { s, calls, close } = await directSurface();
+  try {
+    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING }));
+    await s.surface.start(); await s.connected();
+    await s.slack.emit(mention("also cover the CSV export"));
+    await waitFor(async () => s.store.get(ISSUE)!.inbound.length, count => count === 1);
+    assert.equal(calls().length, 0);
+  } finally { await close(); }
+});
+
+test("a direct record's acknowledgement carries the issue link, and an unfiled one is told as your request", { timeout: 60000 }, async () => {
+  const h = harness(); const services = h.open(); const s = await surfaceFor(services, h.root, { directRequests: true, direct: () => () => "accepted" });
+  try {
+    const direct = { eventId: "EvA", ts: "1700000000.000100", text: "Export fails on empty rows" };
+    s.store.create(intakeRecord(ISSUE, "queued", { identifier: "", url: "", thread: BINDING, direct, holdReason: "It could not be filed in Linear and will be retried: timeout" }));
+    await s.surface.start();
+    await waitFor(async () => s.texts(), list => list.length === 1);
+    assert.equal(s.texts()[0], 'Received your request "Export fails on empty rows". It has not started: It could not be filed in Linear and will be retried: timeout\nI\'ll post questions and the result here once it starts.');
+    const { id } = await services.missions.create(h.create(), undefined, origin(ISSUE));
+    s.store.update(ISSUE, record => { Object.assign(record, { identifier: "TEST-1", url: URL1, state: "started", missionId: id }); delete record.holdReason; });
+    await waitFor(async () => s.texts(), list => list.length === 2);
+    assert.equal(s.texts()[1], `Started on TEST-1 (${URL1}).`);
+  } finally { await s.close(); await h.close(); }
+});
+
+test("a filed direct record is acknowledged with its issue link", { timeout: 60000 }, async () => {
+  const h = harness(); const services = h.open(); const s = await surfaceFor(services, h.root, { directRequests: true, direct: () => () => "accepted" });
+  try {
+    const { id } = await services.missions.create(h.create(), undefined, origin(ISSUE));
+    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: id, direct: { eventId: "EvA", ts: "1700000000.000100", text: "x", filedAt: NOW } }));
+    await s.surface.start();
+    await waitFor(async () => s.texts(), list => list.length >= 1);
+    await delay(300);
+    assert.deepEqual(s.texts(), [`Started on TEST-1 "Export fails on empty rows" (${URL1}). I'll post questions and the result here.\nReply with a mention to answer or steer.`]);
+  } finally { await s.close(); await h.close(); }
+});
+
+test("a direct request that cannot be recorded is logged and counted, with nothing posted", { timeout: 60000 }, async () => {
+  const h = harness(); const services = h.open(); const logs = collector();
+  const s = await surfaceFor(services, h.root, { directRequests: true, log: logs.log, direct: () => () => { throw new Error("store write failed"); } });
+  try {
+    await s.surface.start(); await s.connected();
+    await s.slack.emit(inOther("fix the export"));
+    await waitFor(() => Promise.resolve(s.surface.status().dropped), dropped => dropped === 1);
+    assert.equal(logs.calls.length, 1);
+    assert.deepEqual(s.texts(OTHER).slice(1), []);
+  } finally { await s.close(); await h.close(); }
+});
+
+test("with direct requests off, mentions behave as before", { timeout: 60000 }, async () => {
+  const { s, calls, close } = await directSurface({ directRequests: false });
+  try {
+    s.store.create(intakeRecord(ISSUE, "finished", { thread: BINDING }));
+    await s.surface.start(); await s.connected();
+    await s.slack.emit(inOther("fix the export"));
+    await waitFor(() => Promise.resolve(s.surface.status().dropped), dropped => dropped === 1);
+    await s.slack.emit(mention("also cover the CSV export"));
+    await waitFor(async () => s.texts(), list => list.length === 1);
+    assert.equal(s.texts()[0], FINISHED);
+    assert.equal(calls().length, 0);
+  } finally { await close(); }
 });

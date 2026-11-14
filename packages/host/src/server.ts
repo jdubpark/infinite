@@ -35,6 +35,7 @@ import { EvidenceError } from "./evidence/types.js";
 import { advanceEpoch, configurationModule, configurationProjector, EpochRequestConflict } from "./configuration-store.js";
 import { outcomeBackfill } from "./outcome-backfill.js";
 import { outcomeProjector } from "./outcome-projector.js";
+import { TaskCapture } from "./eval-capture.js";
 import { EXCLUSION_REASONS, OUTCOMES_MODULE, outcomeModule, runOutcomeView, sweepExpiredOutcomes, type SignalRow } from "./outcome-store.js";
 import { ownerSignal, SignalRequestError, type OwnerSignalInput } from "./outcome-signals.js";
 import { COMMIT_ID, HOLD_DAYS_DEFAULT } from "./outcome-hold.js";
@@ -211,6 +212,7 @@ export function createApp(config: Config, key: Buffer) {
   evidence.register(outcomeModule());
   baseScanner = new BaseScanner({ store: evidence, mirrorPath: id => projectSource.mirrorPath(id), prefix: config.teams?.commandPrefix, holdDays: () => config.teams?.outcomes?.holdDays ?? HOLD_DAYS_DEFAULT });
   outbox.registerProjector(outcomeProjector(evidence));
+  const capture = new TaskCapture({ config, store: evidence, source: projectSource });
   // The launch-rate fuse is built before any service that receives it starts. It stops before the store closes.
   const fuse = new FuseService({ config, key, store: evidence, sessionExists: id => {
     try { manager.meta(id); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
@@ -220,6 +222,7 @@ export function createApp(config: Config, key: Buffer) {
     source: projectSource,
     graphs: repositoryGraphs,
     events: outbox,
+    capture,
     entries: blackboard,
     onMerged: id => void projectSource.refresh(id).then(status => {
       sourceChanged(id);
@@ -255,6 +258,7 @@ export function createApp(config: Config, key: Buffer) {
   const sweepEvidence = () => {
     evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
     sweepExpiredOutcomes(evidence, new Date().toISOString(), undefined, config.teams?.outcomes?.retentionDays);
+    capture.sweep();
   };
   let evidenceSweep: NodeJS.Timeout | undefined;
   // A projector that fell behind catches up without waiting for the next event. Each pass is bounded.
@@ -264,9 +268,10 @@ export function createApp(config: Config, key: Buffer) {
       if (!result.pending || result.blocked.length > 0) break;
     }
     backfillOutcomes();
+    capture.reconcile();
   };
   let outboxTimer: NodeJS.Timeout | undefined;
-  const closeEvidence = () => { baseScanner?.close(); clearInterval(evidenceSweep); clearInterval(outboxTimer); fuse.stop(); evidence.close(); };
+  const closeEvidence = () => { baseScanner?.close(); clearInterval(evidenceSweep); clearInterval(outboxTimer); fuse.stop(); capture.close(); evidence.close(); };
   missions.useUsage(usage);
   usage.useResolvers({
     goalOfRun: runId => { const goal = goals.list().find(value => value.cycles.some(cycle => cycle.teamId === runId)); return goal ? { id: goal.id, title: goal.title } : undefined; },

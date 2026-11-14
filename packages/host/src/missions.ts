@@ -1213,8 +1213,9 @@ export class MissionService {
         // A subteam decision wakes the coordinator once; waiting past it would leave the subteam waiting with nothing to wake either.
         const unhandled = this.openChildDecisions(stored).find(item => !item.ownerDecisionId && !item.answerPendingBy);
         if (unhandled) return this.refuse(stored, report.kind, `Decision ${unhandled.decisionId} of subtask ${unhandled.subtaskId} is still open. Answer it with answer-child, ask the owner with question, or cancel the subtask.`);
-        // Waiting is accepted only when a subteam, the owner, or an open follow-up will start a later attempt.
-        if (!this.willWake(stored)) return this.refuse(stored, report.kind, "Nothing is running or waiting for the owner, and no follow-up is open, so no later attempt would start. Dispatch, cancel, report a result, ask the owner, set a follow-up, or report blocked.");
+        // Waiting is accepted only when something will start a later attempt: a message that arrived during this attempt
+        // (such as a follow-up that fired while it ran) already waits in the inbox, or a subteam, the owner, or an open follow-up will.
+        if (!stored.inbox.length && !this.willWake(stored)) return this.refuse(stored, report.kind, "Nothing is running or waiting for the owner, and no follow-up is open, so no later attempt would start. Dispatch, cancel, report a result, ask the owner, set a follow-up, or report blocked.");
         this.event(stored, "The coordinator is waiting for subteam progress, owner input, or a follow-up.");
         break;
       }

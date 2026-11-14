@@ -1840,3 +1840,30 @@ test("an idle gap starts a fresh conversation with the coordinator's notes and o
     assert.doesNotMatch(JSON.stringify(mission), /Chose JSON responses/, "Notes stay out of the mission view and its events");
   } finally { h.close(); mock.timers.reset(); }
 });
+
+test("a follow-up that fires while an attempt runs lets that attempt wait, even after two refused reports", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(240));
+    await h.report(1, followUp(10));
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 1);
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Report when the API is done" });
+    // Two refused reports in a row: no subtask has finished.
+    await h.report(2, { kind: "result", summary: "Done" });
+    await h.report(3, { kind: "result", summary: "Done" });
+    await h.attempt(4);
+    assert.equal(h.refusals(id), 2);
+
+    mock.timers.tick(10 * 60000);
+    await until(() => h.get(id), mission => mission.followUps![0].state === "fired");
+    assert.equal(h.attempts(), 4, "The fired follow-up waits for the running attempt to end");
+    // Nothing else will wake the coordinator, but the fired follow-up already waits for the next attempt.
+    await h.report(4, { kind: "wait", summary: "Nothing to decide yet" });
+    const messages = (await h.messages(5)) as PromptMessage[];
+    assert.deepEqual(messages.filter(message => message.type === "follow-up").map(message => message.reason), ["The API subteam's CI run may have finished"]);
+    assert.ok(!messages.some(message => message.type === "refused"));
+    assert.notEqual(h.get(id).status, "blocked");
+    assert.equal(h.refusals(id), 0);
+  } finally { h.close(); mock.timers.reset(); }
+});

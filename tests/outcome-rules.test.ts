@@ -94,10 +94,18 @@ test("round counts", () => {
 });
 
 test("team prompts never import the ledger", () => {
-  const source = readFileSync(new URL("../packages/host/src/team-prompts.ts", import.meta.url), "utf8");
-  const specifiers = [...source.matchAll(/\b(?:from|import)\s*\(?\s*["']([^"']+)["']/g)].map(match => match[1]);
-  assert.ok(specifiers.length > 0);
-  const forbidden = ["outcome-", "configuration-store", "config-identity", "evidence/"];
-  for (const specifier of specifiers)
-    for (const name of forbidden) assert.ok(!specifier.includes(name), `team-prompts imports ${specifier}`);
+  const importsOf = (file: string) => {
+    const source = readFileSync(new URL(`../packages/host/src/${file}`, import.meta.url), "utf8");
+    return [...source.matchAll(/\b(?:from|import)\s*\(?\s*["']([^"']+)["']/g)].map(match => match[1]);
+  };
+  const promptSpecifiers = importsOf("team-prompts.ts");
+  assert.ok(promptSpecifiers.length > 0);
+  const promptForbidden = ["outcome-", "configuration-store", "config-identity", "evidence/", "scorecard"];
+  for (const specifier of promptSpecifiers)
+    for (const name of promptForbidden) assert.ok(!specifier.includes(name), `team-prompts imports ${specifier}`);
+
+  const mcpSpecifiers = importsOf("team-mcp.ts");
+  assert.ok(mcpSpecifiers.length > 0);
+  for (const specifier of mcpSpecifiers)
+    for (const name of ["outcome-", "scorecard"]) assert.ok(!specifier.includes(name), `team-mcp imports ${specifier}`);
 });

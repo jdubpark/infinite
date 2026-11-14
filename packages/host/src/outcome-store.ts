@@ -361,6 +361,37 @@ export function runOutcomes(db: EvidenceDb, runId: string): OutcomeRow[] {
     .map(row => toOutcome(db, row));
 }
 
+export type OutcomeFilter = { sources: readonly string[]; role: "implementer" | "scout"; projectRef?: string; since?: string };
+
+/**
+ * Rows in `outcome_id` order. A row whose payload does not open is counted and left out. `since` compares the end
+ * time, or the start time of an open row, and a row with neither time is outside every window.
+ */
+export function selectOutcomes(db: EvidenceDb, filter: OutcomeFilter): { rows: OutcomeRow[]; unreadable: number } {
+  if (filter.sources.length === 0) return { rows: [], unreadable: 0 };
+  const params: string[] = [...filter.sources, filter.role];
+  const clauses = [`source IN (${filter.sources.map(() => "?").join(", ")})`, "role = ?"];
+  if (filter.projectRef !== undefined) {
+    clauses.push("project_ref = ?");
+    params.push(filter.projectRef);
+  }
+  if (filter.since !== undefined) {
+    clauses.push("COALESCE(ended_at, started_at) >= ?");
+    params.push(filter.since);
+  }
+  const sql = `SELECT * FROM outcomes WHERE ${clauses.join(" AND ")} ORDER BY outcome_id`;
+  const rows: OutcomeRow[] = [];
+  let unreadable = 0;
+  for (const row of db.all<OutcomeSql>(sql, ...params)) {
+    try {
+      rows.push(toOutcome(db, row));
+    } catch {
+      unreadable += 1;
+    }
+  }
+  return { rows, unreadable };
+}
+
 /** Writes the whole row. The three blind-index fields are derived from `payload`, never taken from the caller. */
 export function writeOutcome(tx: EvidenceTx, row: OutcomeRow): void {
   const payload = row.payload;

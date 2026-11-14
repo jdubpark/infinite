@@ -151,3 +151,27 @@ test("a host with an unusable evidence location still serves and reports the sto
     await host.stop();
   }
 });
+
+test("the ledger reads answer 503 when the store is unavailable", { timeout: 90000 }, async () => {
+  const host = await startHost();
+  try {
+    await host.stopApi();
+    const location = join(host.config.stateDir, "evidence");
+    rmSync(location, { recursive: true, force: true });
+    writeFileSync(location, "not a directory");
+    await host.start();
+
+    const models = await host.fetchApi("/usage/models");
+    assert.equal(models.status, 503, JSON.stringify(models.body));
+    assert.equal(models.body.code, "evidence-unavailable");
+
+    const cells = await host.fetchApi("/outcomes");
+    assert.equal(cells.status, 503, JSON.stringify(cells.body));
+    assert.equal(cells.body.code, "evidence-unavailable");
+
+    assert.equal((await host.fetchApi("/usage")).status, 200);
+    const otherRole = await host.fetchApi("/usage/models?role=reviewer");
+    assert.equal(otherRole.status, 200);
+    assert.deepEqual(otherRole.body.rows, []);
+  } finally { await host.stop(); }
+});

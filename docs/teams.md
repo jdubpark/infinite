@@ -224,6 +224,9 @@ starts its next occurrence early instead of waiting for its next due time:
   time.
 - Signals that arrive while an occurrence runs start at most one follow-on
   occurrence.
+- Signals that arrive together start one occurrence. The routine reads 50
+  signals a pass and starts nothing while more wait, so a large batch delays
+  the start by a few seconds and never splits into two occurrences.
 - The occurrence lists the signal IDs it started on under `wake`. It submits
   the same goal as any other occurrence.
 
@@ -1424,9 +1427,11 @@ kinds:
   is neither a landing nor a revert that the scan attributed to a team run of
   the project. The signal names the new base head. The host records it only
   when the scan read exactly the new commits, so never on a project's first
-  scan or after a rewritten history. A commit before a squash, rebase, or
-  fast-forward landing in the same fetch may belong to that run, so it does not
-  count.
+  scan or after a rewritten history. A run can land as several commits, and
+  the scan names only the last one, so a commit before a landing in the same
+  fetch may belong to that run and does not count. The one exception is a
+  landing by a merge commit whose second parent is the run's reviewed head: the
+  run's commits sit behind that parent, so a commit before it counts.
 - `owner`: direction the owner added with `infinite signal add`.
 
 Only the owner can add a signal, and only owner signals carry text. The host
@@ -1434,13 +1439,21 @@ never copies text from a commit, a pull request, an issue, or an agent into a
 signal. Scan signals hold commit and run IDs only.
 
 A signal starts nothing by itself. A [routine](#scheduled-routines) with
-`wakeOn`, or a standing goal, reads the inbox on its own scheduler pass and
-decides within its own limits.
+`wakeOn` reads the inbox on its own scheduler pass and decides within its own
+limits.
 
 The host keeps signals for 30 days, and at most 20,000 across all projects. The
 oldest go first. A reader whose place is older than the oldest kept signal
 continues from that signal. Signals live in the evidence store. While the
 store is unavailable, nothing is recorded and readers wait.
+
+Each signal has a key from its source: a request ID, a ledger ID, or a commit.
+The host records one key once per project and kind, and remembers the key for
+the full 30 days, also after the 20,000 limit removed the signal itself. A
+repeat within 30 days records nothing. After 30 days the same key is a new
+signal, so a source uses a key once. The host remembers at most 200,000 keys.
+At that number it refuses new signals until old keys expire; it never forgets
+a key early to make room.
 
 ```sh
 infinite signal add --project PROJECT_ID "Check the release notes before the next run"
@@ -1880,8 +1893,11 @@ and must contain 1–8,000 characters.
 
 `head` is the highest signal number on the host, across all projects. A repeated
 `requestId` records nothing and returns the signal stored first, with
-`recorded: false`. An unknown project is `404`. An unavailable evidence store is
-`503` with `code: "evidence-unavailable"`. See [Project signals](#project-signals).
+`recorded: false`. A repeated `requestId` whose signal the row limit already
+removed is `410` with `code: "signal-gone"`; nothing new is recorded. An unknown
+project is `404`. An unavailable evidence store is `503` with
+`code: "evidence-unavailable"`, and a full key record is `503` with
+`code: "signal-inbox-full"`. See [Project signals](#project-signals).
 
 ## Model scorecard
 

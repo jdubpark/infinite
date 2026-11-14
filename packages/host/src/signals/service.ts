@@ -7,12 +7,15 @@ import { type ProjectSignal, type SignalKind, type SignalReader, signalKinds } f
 export const SIGNALS_MODULE = "signals";
 export const SIGNAL_RETENTION_DAYS = 30;
 export const MAX_SIGNAL_ROWS = 20_000;
+/** The keys remembered at once. At this many, a new signal is refused until old keys expire. */
+export const MAX_SIGNAL_KEYS = 200_000;
 export const MAX_SIGNAL_KEY_LENGTH = 200;
 export const MAX_SIGNAL_TEXT_LENGTH = 2_000;
 export const DEFAULT_SIGNAL_PAGE = 50;
 export const MAX_SIGNAL_PAGE = 200;
 
 const TABLE = "project_signals";
+const KEYS = "project_signal_keys";
 const DAY_MS = 86_400_000;
 /** After a failed read, `head()` reports the inbox unreadable for this long, then the next read tries again. */
 const RETRY_MS = 5_000;
@@ -25,8 +28,11 @@ const PROJECT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 /**
  * One row per signal. `seq` never repeats, also after retention deletes rows, because the table uses AUTOINCREMENT.
- * The project is a blind index, and the dedup value is a blind index of (project, kind, key). Everything a consumer
- * reads besides the kind and the time is sealed.
+ * The project is a blind index. Everything a consumer reads besides the kind and the time is sealed.
+ *
+ * A key row remembers that a (project, kind, key) was recorded, as a blind index. It lives for the retention period
+ * whether or not the signal's row is still kept: the row cap deletes signals, never keys. So a repeat inside the
+ * retention period records nothing, however many other signals arrived in between.
  */
 const SCHEMA = `
 CREATE TABLE project_signals (
@@ -34,15 +40,20 @@ CREATE TABLE project_signals (
   signal_id   TEXT NOT NULL UNIQUE,
   project_ref TEXT NOT NULL,
   kind        TEXT NOT NULL,
-  dedup       TEXT NOT NULL UNIQUE,
   at          TEXT NOT NULL,
   sealed      TEXT NOT NULL
 );
 CREATE INDEX project_signals_by_project ON project_signals (project_ref, seq);
 CREATE INDEX project_signals_by_at ON project_signals (at);
+CREATE TABLE project_signal_keys (
+  dedup TEXT PRIMARY KEY,
+  seq   INTEGER NOT NULL UNIQUE,
+  at    TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX project_signal_keys_by_at ON project_signal_keys (at);
 `;
 
-/** Deletes every row older than the newest MAX_SIGNAL_ROWS. */
+/** Deletes every signal older than the newest MAX_SIGNAL_ROWS. Keys stay. */
 const CAP_SQL = `DELETE FROM project_signals WHERE seq <= (SELECT seq FROM project_signals ORDER BY seq DESC LIMIT 1 OFFSET ${MAX_SIGNAL_ROWS})`;
 
 const HEAD_SQL = "SELECT max(coalesce((SELECT seq FROM sqlite_sequence WHERE name='project_signals'), 0), "
@@ -56,7 +67,10 @@ const SIGNALS_EVIDENCE_MODULE: EvidenceModule = {
     tx.exec(SCHEMA);
   },
   counts(db) {
-    return { rows: db.get<{ n: number }>("SELECT count(*) AS n FROM project_signals")?.n ?? 0 };
+    return {
+      rows: db.get<{ n: number }>("SELECT count(*) AS n FROM project_signals")?.n ?? 0,
+      keys: db.get<{ n: number }>("SELECT count(*) AS n FROM project_signal_keys")?.n ?? 0,
+    };
   },
 };
 
@@ -68,12 +82,21 @@ export type SignalInput = { projectId: string; kind: SignalKind; key: string; ru
 
 /**
  * `recorded: false` with a signal is a repeat of (project, kind, key), and the signal is the one stored first.
- * Without a signal, `failure` says why nothing was recorded.
+ * Without a signal, `failure` says why nothing was recorded:
+ * - `invalid`: the input is not a signal.
+ * - `unavailable`: the store cannot be written or the stored signal cannot be opened.
+ * - `gone`: a repeat of a key recorded in the last SIGNAL_RETENTION_DAYS days whose signal is no longer kept.
+ * - `full`: MAX_SIGNAL_KEYS keys are remembered. Refusing keeps every remembered key, so no repeat turns into new work.
+ *
+ * A source uses one key once. The host remembers a key for SIGNAL_RETENTION_DAYS days; the same key after that is a
+ * new signal. The host's own sources cannot repeat one that late: the outcome ledger records a landing, a revert, and
+ * a base head once, and an owner request ID belongs to one request.
  */
+export type SignalFailure = "invalid" | "unavailable" | "gone" | "full";
 export type RecordResult =
   | { recorded: true; signal: ProjectSignal }
   | { recorded: false; signal: ProjectSignal }
-  | { recorded: false; failure: "invalid" | "unavailable" };
+  | { recorded: false; failure: SignalFailure };
 
 export type SignalPage = { signals: ProjectSignal[]; head: number };
 
@@ -123,6 +146,7 @@ export class SignalService {
     if (!written) return failed("unavailable");
     for (const result of results) {
       if (result.recorded) this.headSeq = Math.max(this.headSeq ?? 0, result.signal.seq);
+      else if ("failure" in result && result.failure === "full") this.warnOnce("The project signal inbox remembers its maximum number of keys. New signals are refused until old keys expire.");
     }
     return results;
   }
@@ -172,12 +196,13 @@ export class SignalService {
     };
   }
 
-  /** Deletes signals older than the retention and rows past the row cap. Runs on the hourly evidence sweep. */
+  /** Deletes signals and keys older than the retention, and signals past the row cap. Runs on the hourly evidence sweep. */
   sweep(): void {
     if (!this.ready()) return;
     const cutoff = new Date(this.now() - SIGNAL_RETENTION_DAYS * DAY_MS).toISOString();
     this.store.tryWrite(tx => {
       tx.run("DELETE FROM project_signals WHERE at < ?", cutoff);
+      tx.run(`DELETE FROM ${KEYS} WHERE at < ?`, cutoff);
       tx.run(CAP_SQL);
     });
   }
@@ -233,17 +258,21 @@ export function scanSignals(scan: AppliedScan): SignalInput[] {
 
 /**
  * Whether the scan proves a new base commit that is neither a landing nor a revert it attributed to a team run of the
- * project. Only a continuous scan knows which commits are new. A landing commit with fewer than two parents (a squash, a
- * rebase, or a fast-forward) may be the last of several commits of the same run, so only commits after the last such
- * landing count. A merge's own commits sit behind its second parent and are not in the list.
+ * project. Only a continuous scan knows which commits are new.
+ *
+ * A run can land as several first-parent commits, and the ledger names only the last one: a squash, a rebase, a
+ * fast-forward, and also a fast-forward to a head that is itself a merge. So only commits after the last landing count.
+ * The one exception is a `merge-parent` landing: its second parent is the run's reviewed head, so the run's own commits
+ * sit behind that parent and are not in the list, and a commit before it is somebody else's. The parent count of a
+ * landing commit proves nothing. The cost is a missed signal for an outside commit that arrives in the same scan before
+ * a landing; a consumer that woke on its own delivery would cost more.
  */
 export function outsideCommit(scan: Pick<AppliedScan, "continuous" | "commits" | "landings" | "reverts">): boolean {
   if (!scan.continuous || scan.commits.length === 0) return false;
   const attributed = new Set<string>([...scan.landings.map(landing => landing.commit), ...scan.reverts.map(revert => revert.commit)]);
   let from = 0;
   for (const landing of scan.landings) {
-    const commit = scan.commits[landing.position];
-    if (commit === undefined || commit.id !== landing.commit || commit.parents.length < 2) from = Math.max(from, landing.position + 1);
+    if (landing.method !== "merge-parent") from = Math.max(from, landing.position + 1);
   }
   return scan.commits.slice(from).some(commit => !attributed.has(commit.id));
 }
@@ -271,17 +300,25 @@ function checkInput(input: SignalInput): Sealed | undefined {
 
 function insert(tx: EvidenceTx, input: Sealed, at: string): RecordResult {
   const dedup = tx.index("signal", `${input.projectId}\u0000${input.kind}\u0000${input.key}`);
-  const prior = tx.get<Row>("SELECT seq, signal_id, kind, at, sealed FROM project_signals WHERE dedup=?", dedup);
-  if (prior !== undefined) {
+  const known = tx.get<{ seq: number }>(`SELECT seq FROM ${KEYS} WHERE dedup=?`, dedup);
+  if (known !== undefined) {
+    const prior = tx.get<Row>("SELECT seq, signal_id, kind, at, sealed FROM project_signals WHERE seq=?", known.seq);
+    if (prior === undefined) return { recorded: false, failure: "gone" };
     const signal = openSignal(tx, prior, input.projectId);
     return signal ? { recorded: false, signal } : { recorded: false, failure: "unavailable" };
   }
+  // Each key has its own seq, so the span from the oldest key's seq to the newest bounds how many keys are kept.
+  // Two scalar reads, so each one is a single index step.
+  const span = tx.get<{ low: number | null; high: number | null }>(`SELECT (SELECT min(seq) FROM ${KEYS}) AS low, (SELECT max(seq) FROM ${KEYS}) AS high`);
+  if (span && span.low !== null && span.high !== null && span.high - span.low + 1 >= MAX_SIGNAL_KEYS) return { recorded: false, failure: "full" };
   const id = randomUUID();
   const result = tx.run(
-    "INSERT INTO project_signals (signal_id, project_ref, kind, dedup, at, sealed) VALUES (?, ?, ?, ?, ?, ?)",
-    id, tx.index("project", input.projectId), input.kind, dedup, at, tx.seal(TABLE, id, input),
+    "INSERT INTO project_signals (signal_id, project_ref, kind, at, sealed) VALUES (?, ?, ?, ?, ?)",
+    id, tx.index("project", input.projectId), input.kind, at, tx.seal(TABLE, id, input),
   );
-  return { recorded: true, signal: toSignal(result.lastInsertRowid, id, at, input) };
+  const seq = Number(result.lastInsertRowid);
+  tx.run(`INSERT INTO ${KEYS} (dedup, seq, at) VALUES (?, ?, ?)`, dedup, seq, at);
+  return { recorded: true, signal: toSignal(seq, id, at, input) };
 }
 
 function readPage(

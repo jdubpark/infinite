@@ -201,12 +201,17 @@ export class RoutineService {
   /**
    * Reads the inbox for a scheduled or running routine with `wakeOn`, folds new signals into its pending wake, and
    * saves the cursor and the wake in one write. A signal about a team run of a goal this routine started is dropped.
+   *
+   * The result says how much of the inbox the pending wake now holds. `current`: every signal recorded so far.
+   * `behind`: one pass reads one page, and more signals wait. `unknown`: the inbox could not be read. A launch waits
+   * while the routine is behind, so the signals of one batch start one occurrence. Nothing more is stored for this:
+   * after a restart the saved cursor gives the same answer.
    */
-  private readWake(stored: Stored) {
+  private readWake(stored: Stored): "current" | "behind" | "unknown" {
     const routine = stored.routine;
-    if (!this.signals || !routine.wakeOn?.length) return;
+    if (!this.signals || !routine.wakeOn?.length) return "current";
     const read = readSignals(this.signals.reader, routine.goal.projectId, routine.signalCursor, routine.wakeOn);
-    if (!read) return;
+    if (!read) return "unknown";
     let pending = routine.pendingWake;
     if (read.signals.length) {
       // The goals this routine started, including one whose launch is not yet receipted (its ID is the request ID).
@@ -220,14 +225,16 @@ export class RoutineService {
         own = read.signals.some(signal => signal.runId !== undefined) ? new Set(this.signals.runsOfGoals([...goalIds])) : new Set();
       } catch {
         // Which runs are this routine's own is unknown, so nothing is read: the next pass tries again.
-        return;
+        return "unknown";
       }
       pending = addToPendingWake(pending, read.signals.filter(signal => signal.runId === undefined || !own.has(signal.runId)), now());
     }
-    if (read.cursor === routine.signalCursor && pending === routine.pendingWake) return;
+    const state = read.more ? "behind" : "current";
+    if (read.cursor === routine.signalCursor && pending === routine.pendingWake) return state;
     routine.signalCursor = read.cursor;
     if (pending) routine.pendingWake = pending;
     this.save(stored);
+    return state;
   }
   /** Whether a pending wake may start the next occurrence now: not after a busy refusal, and not inside the gap. */
   private wakeDue(routine: Routine, current: number) {
@@ -255,7 +262,7 @@ export class RoutineService {
       routine.status = "expired"; routine.revision++; routine.reason = "The routine approval expired; no further goals will start."; this.save(stored); return;
     }
     if (!this.assertAuthority(stored)) return;
-    this.readWake(stored);
+    const inbox = this.readWake(stored);
     if (routine.activeGoalId) {
       let goal: ProductGoal;
       try { goal = this.goals.get(routine.activeGoalId); }
@@ -284,8 +291,10 @@ export class RoutineService {
       await this.replayLaunch(stored); return;
     }
     if (routine.occurrences.length >= routine.maxOccurrences) { routine.status = "completed"; routine.revision++; routine.reason = undefined; this.save(stored); return; }
-    // A pending wake may start the next occurrence before its time. Every gate below still applies.
-    if (current < Date.parse(routine.nextRunAt) && !this.wakeDue(routine, current)) return;
+    // More signals wait than one pass reads. No occurrence starts until the pending wake holds them all.
+    if (inbox === "behind") return;
+    // A pending wake may start the next occurrence before its time, when the inbox was read. Every gate below still applies.
+    if (current < Date.parse(routine.nextRunAt) && !(inbox === "current" && this.wakeDue(routine, current))) return;
     if (current < Date.parse(routine.startsAt)) return;
     const budgetMinutes = routine.goal.maxTotalMinutes ?? routine.goal.maxMinutes;
     if (current + budgetMinutes * minute > Date.parse(routine.expiresAt)) {
@@ -309,6 +318,9 @@ export class RoutineService {
       routine.status = "expired"; routine.revision++; routine.reason = "The remaining approval window cannot fit the full goal time budget."; this.save(stored); return;
     }
     if (!this.assertAuthority(stored)) return;
+    // The checks above waited. A signal recorded meanwhile belongs to this occurrence, so the inbox is read once more;
+    // nothing below waits before the launch intent is saved.
+    if (this.readWake(stored) === "behind") return;
     const request = createGoalSchema.parse({ requestId: randomUUID(), ...routine.goal });
     // The goal template is unchanged by a wake. The signals are recorded on the occurrence, and the wake is cleared.
     const wake = routine.pendingWake ? { signalIds: routine.pendingWake.signals.map(signal => signal.id), dropped: routine.pendingWake.dropped } : undefined;

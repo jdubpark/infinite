@@ -316,6 +316,31 @@ test("a waiting signal starts one early occurrence after the gap, and signals du
   } finally { Date.now = realNow; service.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test("signals that arrive together start one occurrence, however many there are", async () => {
+  const f = setup(); const service = f.createService(); const signals = inbox(); const realNow = Date.now;
+  service.useSignals(signals.reader, () => []);
+  const at = (minutes: number) => { Date.now = () => realNow() + minutes * 60_000; };
+  try {
+    const created = await service.create(f.create({ intervalMinutes: 60, maxOccurrences: 3, wakeOn: ["owner"], expiresAt: new Date(realNow() + 3 * 3_600_000).toISOString() }));
+    at(1); await service.tick();
+    settle(f, service.get(created.id).activeGoalId!); await service.tick();
+    // One more signal than a pass reads, all recorded before the next pass and after the gap.
+    at(10);
+    const batch = Array.from({ length: 51 }, () => signals.add("owner"));
+    await service.tick();
+    assert.equal(f.launched.length, 1, "more signals wait than the pass read, so nothing starts yet");
+    await service.tick();
+    const routine = service.get(created.id);
+    assert.equal(f.launched.length, 2);
+    assert.deepEqual(routine.occurrences[1]!.wake, { signalIds: batch.slice(-20).map(signal => signal.id), dropped: 31 });
+    assert.equal(routine.signalCursor, 51);
+    assert.equal(routine.pendingWake, undefined);
+    settle(f, routine.activeGoalId!); await service.tick();
+    at(20); await service.tick();
+    assert.equal(f.launched.length, 2, "the rest of the batch starts no second occurrence");
+  } finally { Date.now = realNow; service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test("a routine ignores signals about its own goals' runs", async () => {
   const f = setup(); const service = f.createService(); const signals = inbox(); const realNow = Date.now;
   const ownRun = randomUUID();

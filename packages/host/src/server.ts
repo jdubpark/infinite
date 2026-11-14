@@ -1763,7 +1763,11 @@ export function createApp(config: Config, key: Buffer) {
     // The request ID is the key, so a replay records nothing and returns the signal stored first.
     const result = signals.record({ projectId, kind: "owner", key: body.requestId, text: body.text });
     if ("failure" in result) {
-      return void res.status(result.failure === "invalid" ? 400 : 503).json(result.failure === "invalid" ? { error: "Invalid signal" } : signalsUnavailable);
+      if (result.failure === "invalid") return void res.status(400).json({ error: "Invalid signal" });
+      // The request was recorded before, and its signal is past the inbox's row limit. Nothing new is recorded.
+      if (result.failure === "gone") return void res.status(410).json({ code: "signal-gone", error: "This request was recorded before. Its signal is no longer kept." });
+      if (result.failure === "full") return void res.status(503).json({ code: "signal-inbox-full", error: "The signal inbox is full. Try again after old signals expire." });
+      return void res.status(503).json(signalsUnavailable);
     }
     res.json({ recorded: result.recorded, signal: result.signal });
   });

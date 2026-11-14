@@ -39,7 +39,7 @@ export async function handleSignalClientCommand(positional: string[], options: O
     const result = await api.json<{ recorded: boolean; signal: ProjectSignal }>(path, { requestId: requestId.data, text });
     if (json) { console.log(JSON.stringify(result, null, 2)); return true; }
     console.log(`${result.recorded ? "Recorded" : "Already recorded"} signal ${result.signal.seq} for ${clean(project)}.`);
-    console.log("A signal starts nothing by itself. Routines and standing goals that watch owner signals read it on their next pass.");
+    console.log("A signal starts nothing by itself. Routines that watch owner signals read it on their next pass.");
     return true;
   }
   if (rest.length) throw new Error(usage);

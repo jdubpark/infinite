@@ -11,7 +11,7 @@ import { type OutcomeRow, outcomeModule, type RunSummaryRow, writeOutcome, write
 import { scanGit, scanOnce } from "../packages/host/src/outcome-scan.js";
 import { landingSignalId, revertSignalId } from "../packages/host/src/outcome-signals.js";
 import { readSignals } from "../packages/host/src/signals/consume.js";
-import { MAX_SIGNAL_ROWS, SignalService } from "../packages/host/src/signals/service.js";
+import { MAX_SIGNAL_KEYS, MAX_SIGNAL_ROWS, SignalService } from "../packages/host/src/signals/service.js";
 import { inProcessHost } from "./helpers.js";
 
 const DAY_MS = 86_400_000;
@@ -55,12 +55,15 @@ test("the inbox records each project, kind, and key once and reads oldest first 
 
     // A short page moves a consumer's cursor to the head, past other projects' and other kinds' signals.
     assert.deepEqual(readSignals(reader, "alpha", 0, ["owner"])?.cursor, 3);
-    assert.deepEqual(readSignals(reader, "alpha", undefined), { cursor: 3, signals: [] }, "a new consumer starts at the head");
+    assert.deepEqual(readSignals(reader, "alpha", undefined), { cursor: 3, signals: [], more: false }, "a new consumer starts at the head");
     let reads = 0;
     const read = f.store.read.bind(f.store);
     (f.store as { read: unknown }).read = (fn: Parameters<EvidenceStore["read"]>[0]) => { reads++; return read(fn); };
-    assert.deepEqual(readSignals(reader, "alpha", 3, ["owner"]), { cursor: 3, signals: [] });
+    assert.deepEqual(readSignals(reader, "alpha", 3, ["owner"]), { cursor: 3, signals: [], more: false });
     assert.equal(reads, 0, "a cursor at the head reads no database");
+    // A full page stops at its last signal and reports that more wait.
+    const full = readSignals(reader, "alpha", 0, undefined, 1);
+    assert.deepEqual([full?.cursor, full?.more], [1, true]);
     // A read that fails never moves the cursor: the inbox reports itself unreadable instead of empty.
     (f.store as { read: unknown }).read = () => { throw new Error("locked"); };
     assert.equal(readSignals(reader, "alpha", 0, ["owner"]), undefined);
@@ -85,7 +88,8 @@ test("retention drops signals after 30 days and keeps at most 20,000 rows", () =
     const reader = f.signals.reader();
     f.signals.record({ projectId: "alpha", kind: "owner", key: randomUUID(), text: "Old direction" });
     f.clock.now += 31 * DAY_MS;
-    const kept = f.signals.record({ projectId: "alpha", kind: "owner", key: randomUUID(), text: "New direction" });
+    const keptKey = randomUUID();
+    const kept = f.signals.record({ projectId: "alpha", kind: "owner", key: keptKey, text: "New direction" });
     f.signals.sweep();
     assert.deepEqual(reader.after("alpha", 0).map(signal => signal.seq), [2]);
     // A cursor older than the oldest kept row continues from that row.
@@ -97,6 +101,29 @@ test("retention drops signals after 30 days and keeps at most 20,000 rows", () =
     assert.deepEqual(reader.after("alpha", 0), [], "the oldest rows went first");
     assert.equal(reader.after("bulk", 0, { limit: 1 })[0]!.key, "landing-1");
     assert.equal(reader.head(), MAX_SIGNAL_ROWS + 3, "seq never goes back");
+
+    // The row cap removed the signal, and its key is still remembered: a repeat records nothing.
+    assert.deepEqual(f.signals.record({ projectId: "alpha", kind: "owner", key: keptKey, text: "New direction" }), { recorded: false, failure: "gone" });
+    assert.equal(reader.head(), MAX_SIGNAL_ROWS + 3);
+    // A key is remembered for 30 days. After that the same key is a new signal.
+    f.clock.now += 31 * DAY_MS;
+    f.signals.sweep();
+    assert.equal(f.signals.record({ projectId: "alpha", kind: "owner", key: keptKey, text: "New direction" }).recorded, true);
+  } finally { f.close(); }
+});
+
+test("an inbox that remembers its maximum number of keys refuses new signals and forgets no key", () => {
+  const f = fixture();
+  try {
+    const first = f.signals.record({ projectId: "alpha", kind: "owner", key: "first", text: "Direction" });
+    assert.equal(first.recorded, true);
+    // The oldest remembered key is MAX_SIGNAL_KEYS signals back.
+    f.store.write(tx => { tx.run("INSERT INTO project_signal_keys (dedup, seq, at) VALUES (?, ?, ?)", "oldest", 2 - MAX_SIGNAL_KEYS, new Date(f.clock.now).toISOString()); });
+    assert.deepEqual(f.signals.record({ projectId: "alpha", kind: "owner", key: "second", text: "More direction" }), { recorded: false, failure: "full" });
+    assert.deepEqual(f.signals.record({ projectId: "alpha", kind: "owner", key: "first", text: "Direction" }), { recorded: false, signal: "signal" in first ? first.signal : undefined });
+    f.clock.now += 31 * DAY_MS;
+    f.signals.sweep();
+    assert.equal(f.signals.record({ projectId: "alpha", kind: "owner", key: "second", text: "More direction" }).recorded, true);
   } finally { f.close(); }
 });
 
@@ -212,11 +239,33 @@ test("base scans record landings, reverts, and outside commits with the run they
     await scan(3);
     assert.deepEqual(kinds().slice(3), [["delivery-landed", "run-b", tipB]]);
 
+    // Run C merges the moved base into its branch and lands as a fast-forward to that merge. The landing commit has
+    // two parents, and the commit before it is still the run's own, so it is not an outside commit.
+    git(seed, "checkout", "-q", "-b", "run-c", "main");
+    commitFile(seed, "c1.txt", "first part of run-c");
+    git(seed, "checkout", "-q", "main");
+    const moved = commitFile(seed, "moved.txt", "base moved under run-c");
+    git(seed, "push", "-q", "origin", "main");
+    await scan(4);
+    assert.deepEqual(kinds().slice(4), [["external-commit", null, moved]]);
+    git(seed, "checkout", "-q", "run-c");
+    git(seed, "merge", "-q", "--no-ff", "-m", "Merge main into run-c", "main");
+    const tipC = git(seed, "rev-parse", "HEAD");
+    git(seed, "checkout", "-q", "main");
+    git(seed, "merge", "-q", "--ff-only", "run-c");
+    git(seed, "push", "-q", "origin", "main");
+    recordRun(store, "run-c", { reviewedHead: tipC, reviewedTree: git(seed, "rev-parse", `${tipC}^{tree}`) });
+    let applied: Parameters<SignalService["recordScan"]>[0] | undefined;
+    await scan(5, value => { applied = value; signals.recordScan(value); });
+    assert.equal(applied?.continuous, true);
+    assert.deepEqual(applied?.commits.map(commit => commit.parents.length), [1, 2], "the scan read the run's first commit and its merge");
+    assert.deepEqual(kinds().slice(5), [["delivery-landed", "run-c", tipC]]);
+
     // A listener that throws never fails the scan.
     commitFile(seed, "later.txt", "later outside change");
     git(seed, "push", "-q", "origin", "main");
-    assert.equal((await scan(4, () => { throw new Error("listener failed"); })).state, "scanned");
-    assert.equal(kinds().length, 4);
+    assert.equal((await scan(6, () => { throw new Error("listener failed"); })).state, "scanned");
+    assert.equal(kinds().length, 6);
   } finally {
     store.close();
     rmSync(root, { recursive: true, force: true });

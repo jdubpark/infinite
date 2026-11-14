@@ -86,6 +86,8 @@ const notFound = (error: unknown) => error instanceof TeamError && error.code ==
  * A mission splits one owner task across a project's repositories. Its coordinator only plans and
  * decides; every change runs as an ordinary single-repository team run that owns its agents and Git work.
  */
+const answerDispatchRefusal = "This mission answers a question and cannot start subtasks. Report the answer as a result, ask the owner a question, or report blocked.";
+
 export class MissionService {
   private readonly records = new Map<string, Stored>();
   private readonly saved = new Map<string, string>();
@@ -288,12 +290,13 @@ export class MissionService {
       const createdAt = now();
       const stored: Stored = { fingerprint, ...(originalFingerprint && originalFingerprint !== fingerprint ? { requestFingerprints: [originalFingerprint] } : {}),
         receipts: {}, folder, repos, attempts: [], inbox: [{ type: "start" }], notes: [], notified: [], launches: {}, ops: [], refusals: 0, mission: {
-        id: request.requestId, ...(origin ? { origin: structuredClone(origin) } : {}), groupId: group.id, groupName: group.name, repoProjectIds: repos.map(repo => repo.projectId),
+        id: request.requestId, ...(origin ? { origin: structuredClone(origin) } : {}), ...(request.mode ? { mode: request.mode } : {}), groupId: group.id, groupName: group.name, repoProjectIds: repos.map(repo => repo.projectId),
         title: request.title ?? request.objective.split("\n")[0].trim().slice(0, 100), objective: request.objective,
         maxSubtasks: request.maxSubtasks, maxMinutes: request.maxMinutes, deadlineAt: new Date(Date.parse(createdAt) + request.maxMinutes * 60000).toISOString(),
         revision: 1, status: "planning", createdAt, updatedAt: createdAt, lineup, subtasks: [], decisions: [], steering: [], events: [],
       } };
-      this.event(stored, origin
+      if (request.mode === "answer") this.event(stored, "Question received. The coordinator will read the repositories and report an answer; it cannot start subtasks.");
+      else this.event(stored, origin
         ? `Mission started by intake from ${origin.identifier}: ${origin.rule}. The coordinator will inspect the repositories and dispatch subtasks.`
         : "Mission approved. The coordinator will inspect the repositories and dispatch subtasks.");
       for (const text of checkoutEvents) this.event(stored, text);
@@ -1015,6 +1018,7 @@ export class MissionService {
         return team.decisions.some(item => item.id === decisionId && item.revision === team.revision && !item.answer);
       } catch (error) { if (notFound(error)) return false; throw error; }
     };
+    if (mission.mode === "answer" && ["dispatch", "resize-subtask", "cancel-subtask", "steer-subtask", "answer-child"].includes(report.kind)) return this.refuse(stored, report.kind, answerDispatchRefusal);
     switch (report.kind) {
       case "dispatch": {
         const { plans, generated } = this.chainDispatch(stored, report.subtasks);
@@ -1096,6 +1100,13 @@ export class MissionService {
           this.event(stored, "The coordinator's result was not applied: the owner sent direction or an answer after that attempt started. A new attempt will consider it.");
           stored.inbox.push({ type: "refused", kind: report.kind, reason: "The owner sent direction or an answer after your previous attempt started. Account for it before reporting a result." });
           return;
+        }
+        if (mission.mode === "answer") {
+          if (mission.decisions.some(item => !item.answer)) return this.refuse(stored, report.kind, "An owner decision is still open.", false);
+          mission.result = { summary: report.summary, revision: mission.revision, at: now() };
+          mission.status = "ready-for-review"; mission.reason = undefined; stored.inbox = []; stored.notes = [];
+          this.event(stored, "The coordinator reported an answer. The mission started no subteam and changed nothing.");
+          break;
         }
         if (!mission.subtasks.some(item => item.status === "done")) return this.refuse(stored, report.kind, "No subtask has finished. Dispatch a subtask before reporting a result, or report blocked.");
         const stalled = stalledSubtasks(mission);

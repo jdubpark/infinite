@@ -105,6 +105,20 @@ sudo setfacl -d -m g::rwx,m::rwx "/srv/infinite-data/instances/$NAME/source-mirr
 `source-mirrors` sits beside the team workspace root; the host keeps one bare
 mirror there for each GitHub-tracked project.
 
+After a write, the host's blob store syncs every directory from its store up
+to the filesystem root, and it opens each one for reading. Mode `0711` lets the
+host account pass through `/srv/infinite-data/instances` but not open it, so
+every source upload fails and the client reports only `sync-failed`. Grant
+read access on that one directory to this instance's host account, and to no
+other account:
+
+```sh
+sudo setfacl -m "u:infinite-$NAME-host:r-x" /srv/infinite-data/instances
+```
+
+Confirm that the agent account and the other instance's accounts still cannot
+list the directory.
+
 Project directories are owned by the host account, so the agent account must
 trust repositories beneath this instance's workspace directory. Without the
 rule, Git refuses them with "dubious ownership". Run the command from a
@@ -232,6 +246,15 @@ Copy the instance-specific `config.example.json` to its private config path
 before adding secrets or live project paths. Check the port, origin, key path,
 state directory, team workspace, and command prefix. Start the refresh service
 once after configuring it; enable its timer only after it succeeds.
+
+Add a `sync` block before enrolling a repository. Without `homeDir` the host
+maps an enrolled checkout below its own account's home directory, outside the
+shared workspace root, and without `sharedGroup` the agent account cannot
+write there:
+
+```json
+"sync": { "sharedGroup": true, "homeDir": "/srv/infinite-data/instances/NAME/workspaces" }
+```
 
 Only root and the instance's host account can enter `/etc/infinite-NAME`, the
 same shape as the first instance's config directory.
@@ -417,6 +440,28 @@ If `teams.lineup` was copied from another instance, check every profile and
 fallback it names against the providers authenticated on this instance. Remove
 the entries this instance cannot run, and have the installed release's config
 reader accept the candidate file before it replaces the live config.
+
+## Repository toolchains and checks
+
+A team command launcher that resolves commands from fixed system directories
+does not find a tool installed in an account's home directory. Install each
+toolchain an enrolled repository's setup and check commands need in one of the
+launcher's directories before the first run.
+
+Before relying on a project's checks, run its setup command and each check
+once as `infinite-$NAME-agent`, in a throwaway clone below the instance's
+`tmp/agent` directory, with the launcher's `PATH`. Two failures come from the
+host and not from the repository:
+
+- The repository's own CI runs a check with extra packages or system tools.
+  Give the project the command the CI runs, not the bare tool.
+- A test requires every directory above the checkout to be writable by its
+  owner only. The host creates team workspaces with mode `2770` so the host
+  and agent accounts share them, and such a test cannot pass there. Exclude it
+  from the project's checks and leave it to the repository's CI.
+
+A source upload that fails keeps its lease on the project for five minutes. A
+retry within that time returns `sync-in-progress`; wait for the lease to end.
 
 ## Private host tools to extend
 

@@ -73,7 +73,8 @@ Another design may add event kinds under its own prefix and register a projector
 | `plan.accepted` | `consume` (`plan`) | task count, plan digest |
 | `task.planned` | `consume` (`plan`), once per task | profile, owned paths, features |
 | `discovery.accepted` | `consume` (`explore`) | per scout task: profile |
-| `member.started` | `launch` | role, purpose, profile identity, profile epoch, `configId`, replaced member and cause |
+| `member.started` | `launch` | role, purpose, session, profile identity, replaced member and cause |
+| `member.configured` | `launch`, a read after the session starts | `configId` and its six components. Absent when the read fails |
 | `member.reported` | `readMemberJournal` | report kind |
 | `member.stopped` | `replaceStalledMember`, `switchLimitedMember`, `retireMember`, `step` (halt loop, exit branch) | reason class |
 | `task.integrated` | `consume` (implementer `result`) | commit, head, base commit, diff counts |
@@ -170,7 +171,7 @@ Plaintext columns hold opaque identifiers, enumerations, numbers, and times. Nam
 
 Purpose sets the source. An attempt in a replay run or a gate run has source `replay`. A duel contestant whose fate the duel set has source `duel`, as the duels design defines. Every other attempt has source `production`.
 
-**Configurations and profile epochs.** `launch` computes `configId` as umbrella C7 defines and puts it on `member.started`. A `configurations` table keeps one row per `configId` with its six components, so a reader can tell which component changed between two attempts. A `profile_epochs` table keeps the current epoch per profile identity. `infinite usage outcomes new-epoch --profile ID`, owner only, advances it after a known backend change behind an unchanged model name. Each outcome row stores the epoch its attempt started in, and no cell merges two epochs of one profile.
+**Configurations and profile epochs.** After a member's session starts, an enrichment in `launch` computes `configId` as umbrella C7 defines and emits it as `member.configured`. It runs after the launch and never delays it, and a read that fails emits nothing. A `configurations` table keeps one row per `configId` with its six components, so a reader can tell which component changed between two attempts. A `profile_epochs` table keeps each epoch of a profile identity with the time it began, so a reader takes the epoch in effect at a member's start time, and an epoch advanced later does not change an earlier attempt. `infinite usage outcomes new-epoch --profile ID`, owner only, advances the profile's epoch after a known backend change behind an unchanged model name. Each outcome row stores the epoch its attempt started in, and no cell merges two epochs of one profile.
 
 | Disposition | Set by | Counted |
 |---|---|---|

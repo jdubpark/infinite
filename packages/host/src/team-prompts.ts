@@ -210,7 +210,8 @@ function fitDerivedSections(base: string, sections: string[], limit: number) {
   }
   return result;
 }
-function reportCommand() {
+/** The reporter command a provider without a report tool is given. It holds this installation's own paths. */
+export function reportCommand() {
   const reporter = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "./team-report.ts" : "./team-report.js", import.meta.url));
   return [process.execPath, ...(reporter.endsWith(".ts") ? ["--import", import.meta.resolve("tsx")] : []), reporter].map(quote).join(" ");
 }

@@ -293,7 +293,8 @@ input when the pause reaches them. A subteam that waits for input, with nothing
 else in flight, is paused where it waits: it keeps its question, and an answer
 given during the halt is kept until it resumes. A release resumes the mission
 unless the owner acted on it during the halt or its deadline has passed, in
-which case it stays paused and says why. Each subteam the halt paused then shows
+which case it stays paused and says why. An answer or an extension during the
+halt does not count as such an action. Each subteam the halt paused then shows
 the mission's new reason, not the halt's; so does each one after a release that
 keeps the mission paused. When the mission resumes, it resumes only the
 subteams that the halt paused and that nobody has acted on since; a subteam
@@ -310,6 +311,16 @@ that the halt holds, but nothing starts. The release resumes the mission with
 the answer applied, and the mission waits again while another question is open.
 No coordinator attempt starts while any of its repositories is halted, and no
 subteam starts in a halted repository.
+
+The halt does not stop a mission's time limit, except as a pause does: an intake
+mission's clock stops while it is paused, and any other mission keeps its
+deadline. When the deadline passes during the halt, the mission is blocked at
+its time limit and nothing is unpaused. The release leaves it blocked and
+resumes none of its subteams; each subteam the halt paused shows the time limit
+instead of the halt. The owner can extend the time limit during the halt. The
+deadline moves at once, but the subteams stay paused: a mission the halt paused
+resumes them on release, and the resumes that an extension of a blocked mission
+queues wait until no halt covers any of its repositories.
 
 Status honesty: `ready-for-review` means the coordinator reported a result after
 every subtask finished. It does not establish product impact or acceptance. Each

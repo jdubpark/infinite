@@ -627,6 +627,23 @@ export async function captureMemberResult(cwd: string, base: string, paths?: str
   await git(cwd, ["update-ref", "refs/heads/infinite-result", commit], prefix, 30000, signal);
   return commit;
 }
+/** Preserve a member clone's current tree in a local WIP ref before retention removes the clone. */
+export async function snapshotMemberWork(cwd: string, base: string, options: { skipIfResultTree?: boolean }, prefix?: TeamCommand, signal?: AbortSignal): Promise<{ commit: string; tree: string } | undefined> {
+  await git(cwd, ["add", "-A", "--", "."], prefix, 30000, signal);
+  const tree = await git(cwd, ["write-tree"], prefix, 30000, signal);
+  const baseTree = await git(cwd, ["rev-parse", `${base}^{tree}`], prefix, 30000, signal);
+  if (tree === baseTree) return undefined;
+  if (options.skipIfResultTree) {
+    const resultRefs = lines(await git(cwd, ["for-each-ref", "--format=%(refname)", "refs/heads/infinite-result"], prefix, 30000, signal));
+    if (resultRefs.includes("refs/heads/infinite-result") && tree === await git(cwd, ["rev-parse", "refs/heads/infinite-result^{tree}"], prefix, 30000, signal))
+      return undefined;
+  }
+  const headTree = await git(cwd, ["rev-parse", "HEAD^{tree}"], prefix, 30000, signal);
+  const commit = tree === headTree ? await git(cwd, ["rev-parse", "HEAD"], prefix, 30000, signal)
+    : await git(cwd, ["commit-tree", tree, "-p", "HEAD", "-m", `Unfinished work of team member ${basename(cwd)}, saved before workspace removal`], prefix, 30000, signal);
+  await git(cwd, ["update-ref", "refs/heads/infinite-wip", commit], prefix, 30000, signal);
+  return { commit, tree };
+}
 export async function integrateMemberResult(workspace: string, memberCwd: string, commit: string, prefix?: TeamCommand, signal?: AbortSignal) {
   if (!/^[a-f0-9]{40,64}$/.test(commit)) throw new TeamError(409, "invalid-commit", "The task commit is invalid.");
   await git(workspace, ["fetch", "--no-tags", "--", memberCwd, commit], prefix, 30000, signal);

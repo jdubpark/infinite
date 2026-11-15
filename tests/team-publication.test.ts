@@ -2,13 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { performance } from "node:perf_hooks";
 import { dirname, join } from "node:path";
 import type { Manager } from "../packages/host/src/manager.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
-import { DEFAULT_TEAM_RETENTION } from "../packages/host/src/team-types.js";
+import { DEFAULT_TEAM_RETENTION, type TeamMember } from "../packages/host/src/team-types.js";
 import { publishTeamHead } from "../packages/host/src/team-workspace.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 import { fixture, git, limitLineup } from "./team-fixture.js";
@@ -80,6 +80,8 @@ function directFixture(status: "implementing" | "cancelled", retention: Partial<
   workspaceGit("branch", "-M", "infinite/team-fixture-1234abcd");
   const head = workspaceGit("rev-parse", "HEAD"), at = new Date().toISOString();
   const remote = join(dirname(f.config.teams!.workspaceDir), "publication-remote.git");
+  const receipts = join(dirname(f.config.stateDir), "receipts");
+  mkdirSync(receipts, { recursive: true, mode: 0o700 });
   Object.assign(f.run, { status, headCommit: head, branch: "infinite/team-fixture-1234abcd", updatedAt: at });
   f.run.tasks = [{ id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [], revision: 1, reviewRounds: 0, status: "integrated" }];
   f.run.members.forEach(member => { member.status = "stopped"; });
@@ -90,9 +92,60 @@ function directFixture(status: "implementing" | "cancelled", retention: Partial<
   Object.assign(f.config.teams!, { publishHeads: true, retention: { ...DEFAULT_TEAM_RETENTION, ...retention } });
   let now = Date.parse(at);
   const clock = { advance: (ms: number) => { now += ms; } };
-  const open = () => new TeamService(f.config, f.key, f.manager as unknown as Manager, (_project, start) => start(), undefined, undefined, { now: () => now });
+  const open = () => new TeamService(f.config, f.key, f.manager as unknown as Manager, (_project, start) => start(), undefined, undefined, { now: () => now, ownerActive: () => false });
   const remoteHead = () => existsSync(remote) ? execFileSync("git", ["--git-dir", remote, "for-each-ref", "--format=%(objectname)", `refs/heads/${f.run.branch}`], { encoding: "utf8" }).trim() : "";
-  return { f, head, remote, clock, open, remoteHead, createRemote: () => execFileSync("git", ["init", "--bare", "--quiet", remote]) };
+  return { f, head, remote, receipts, clock, open, remoteHead, createRemote: () => execFileSync("git", ["init", "--bare", "--quiet", remote]) };
+}
+
+function addMemberClone(d: ReturnType<typeof directFixture>, options: { edit?: boolean; integrated?: boolean } = {}) {
+  const memberId = randomUUID(), cwd = join(dirname(d.f.run.workspace), "members", memberId);
+  mkdirSync(dirname(cwd), { recursive: true });
+  git(dirname(cwd), "clone", "--no-hardlinks", "--", d.f.run.workspace, cwd);
+  git(cwd, "checkout", "--detach", d.head);
+  const member: TeamMember = { runId: d.f.run.id, memberId, revision: 1, role: "implementer", taskId: `task-${memberId}`,
+    sessionId: randomUUID(), title: "Implementer", status: "stopped", cwd, baseCommit: d.head, prompt: "", cursor: 0, stopRequestId: randomUUID() };
+  d.f.run.members.push(member);
+  if (options.edit !== false) {
+    writeFileSync(join(cwd, "unfinished.txt"), "Unfinished member edit.\n");
+    git(cwd, "add", "unfinished.txt");
+    if (options.integrated) {
+      git(cwd, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "commit", "-m", "Integrated member result");
+      git(cwd, "branch", "infinite-result");
+      member.report = { kind: "result" } as never;
+      d.f.run.tasks.push({ id: member.taskId!, title: "Implement unfinished edit", instructions: "Edit the member file", paths: ["unfinished.txt"],
+        dependsOn: [], revision: 1, reviewRounds: 0, status: "integrated", memberId });
+    }
+  }
+  return { member, cwd };
+}
+
+function remoteRef(remote: string, branch: string) {
+  try { return execFileSync("git", ["--git-dir", remote, "rev-parse", `refs/heads/${branch}`], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); }
+  catch { return ""; }
+}
+
+function wipPushes(receipts: string) {
+  const path = join(receipts, "wip-pushes.jsonl");
+  return existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean).length : 0;
+}
+
+function recordMemberWorkPushes(d: ReturnType<typeof directFixture>, fail = false) {
+  const script = `
+const { appendFileSync } = require("node:fs");
+const { join } = require("node:path");
+const { spawnSync } = require("node:child_process");
+const receipts = process.argv[1];
+const mode = process.argv[2];
+const [command, ...args] = process.argv.slice(3);
+const refspec = args.at(-1) ?? "";
+if (command === "git" && refspec.includes(":refs/heads/") && refspec.includes("-wip-")) {
+  appendFileSync(join(receipts, "wip-pushes.jsonl"), JSON.stringify({ refspec }) + "\\n");
+  if (mode === "fail") process.exit(73);
+}
+const child = spawnSync(command, args, { cwd: process.cwd(), stdio: "inherit" });
+process.exit(child.status ?? 128);
+`;
+  d.f.config.teams!.commandPrefix = { command: process.execPath, args: ["-e", script, d.receipts, fail ? "fail" : "pass"] };
 }
 
 async function closeDirect(f: ReturnType<typeof schedulerFixture>, teams: TeamService) {
@@ -100,6 +153,156 @@ async function closeDirect(f: ReturnType<typeof schedulerFixture>, teams: TeamSe
   await teams.idle();
   f.close();
 }
+
+test("cancelled retention publishes an uncommitted member clone before removing the workspace", { timeout: 30000 }, async () => {
+  const d = directFixture("cancelled", { cancelledMinutes: 0 });
+  d.createRemote();
+  const { member } = addMemberClone(d);
+  d.f.run.missionId = randomUUID();
+  d.f.writeTeam();
+  const teams = d.open(), id = d.f.run.id, branch = `${d.f.run.branch}-wip-${member.memberId}`;
+  try {
+    teams.start();
+    const saved = await until(() => teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork,
+      value => value?.state === "published", 10000, "retention did not publish unfinished member work");
+    assert.equal(remoteRef(d.remote, branch), saved!.commit);
+    assert.equal(execFileSync("git", ["--git-dir", d.remote, "show", `${branch}:unfinished.txt`], { encoding: "utf8" }), "Unfinished member edit.\n");
+    const event = `Saved unfinished work of member ${member.memberId} as ${saved!.commit!.slice(0, 12)} to GitHub example/app ${branch} before its workspace is removed.`;
+    assert.equal(teams.get(id).events.filter(item => item.text === event).length, 1);
+    await until(() => existsSync(dirname(d.f.run.workspace)), present => !present, 10000, "retention did not remove the saved workspace");
+    assert.equal(teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork?.state, "published");
+  } finally { await closeDirect(d.f, teams); }
+});
+
+test("a member clone with no changes records nothing-to-save and retention removes it", { timeout: 30000 }, async () => {
+  const d = directFixture("cancelled", { cancelledMinutes: 0 });
+  d.createRemote();
+  const { member } = addMemberClone(d, { edit: false });
+  d.f.run.missionId = randomUUID();
+  d.f.writeTeam();
+  const teams = d.open(), id = d.f.run.id, branch = `${d.f.run.branch}-wip-${member.memberId}`;
+  try {
+    teams.start();
+    const saved = await until(() => teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork,
+      value => value?.state === "nothing-to-save", 10000, "retention did not record an unchanged member clone");
+    assert.equal(remoteRef(d.remote, branch), "");
+    assert.equal(teams.get(id).events.some(item => item.text.includes(`Saved unfinished work of member ${member.memberId}`)), false);
+    await until(() => existsSync(dirname(d.f.run.workspace)), present => !present, 10000, "retention held an unchanged member clone");
+    assert.equal(saved?.revision, d.f.run.revision);
+  } finally { await closeDirect(d.f, teams); }
+});
+
+test("an integrated result tree is not published again as unfinished member work", { timeout: 30000 }, async () => {
+  const d = directFixture("cancelled", { cancelledMinutes: 0 });
+  d.createRemote();
+  const { member } = addMemberClone(d, { integrated: true });
+  d.f.run.missionId = randomUUID();
+  d.f.writeTeam();
+  const teams = d.open(), id = d.f.run.id, branch = `${d.f.run.branch}-wip-${member.memberId}`;
+  try {
+    teams.start();
+    const saved = await until(() => teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork,
+      value => value?.state === "nothing-to-save", 10000, "the integrated result tree was not recognized");
+    assert.equal(remoteRef(d.remote, branch), "");
+    await until(() => existsSync(dirname(d.f.run.workspace)), present => !present, 10000, "retention held an already integrated result");
+    assert.equal(saved?.revision, d.f.run.revision);
+  } finally { await closeDirect(d.f, teams); }
+});
+
+test("member work save retries with exponential backoff and gives up on attempt five", { timeout: 30000 }, async () => {
+  const d = directFixture("cancelled", { cancelledMinutes: 0 });
+  d.createRemote();
+  const { member } = addMemberClone(d);
+  d.f.run.missionId = randomUUID();
+  recordMemberWorkPushes(d, true);
+  d.f.writeTeam();
+  const teams = d.open(), id = d.f.run.id;
+  const savedWork = () => teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork;
+  try {
+    teams.start();
+    let saved = await until(savedWork, value => value?.failure?.attempts === 1, 10000, "the first member work push failure was not recorded");
+    assert.equal(saved?.state, "retrying");
+    assert.equal(Date.parse(saved!.failure!.retryAt) - Date.parse(saved!.failure!.at), 60_000);
+    assert.equal(existsSync(dirname(d.f.run.workspace)), true, "retention is held while the member save can still retry");
+    await delay(600);
+    assert.equal(wipPushes(d.receipts), 1, "the first retry waited for its backoff");
+
+    for (const [advance, attempt, backoff] of [[60_001, 2, 120_000], [120_001, 3, 240_000], [240_001, 4, 480_000]] as const) {
+      d.clock.advance(advance);
+      saved = await until(savedWork, value => value?.failure?.attempts === attempt, 10000, `member work attempt ${attempt} did not run`);
+      assert.equal(saved?.state, "retrying");
+      assert.equal(Date.parse(saved!.failure!.retryAt) - Date.parse(saved!.failure!.at), backoff);
+      assert.equal(wipPushes(d.receipts), attempt);
+    }
+    d.clock.advance(480_001);
+    saved = await until(savedWork, value => value?.failure?.attempts === 5, 10000, "member work attempt five did not run");
+    assert.equal(saved?.state, "gave-up");
+    assert.equal(wipPushes(d.receipts), 5);
+    const memberEvent = `Could not save unfinished work of member ${member.memberId} to GitHub (other); the host retries before removing the workspace.`;
+    const gaveUpEvent = `Could not save unfinished work of member ${member.memberId} to GitHub after 5 attempts (other); its workspace is removed with the run.`;
+    assert.equal(teams.get(id).events.filter(item => item.text === memberEvent).length, 1);
+    assert.equal(teams.get(id).events.filter(item => item.text === gaveUpEvent).length, 1);
+    await until(() => existsSync(dirname(d.f.run.workspace)), present => !present, 10000, "retention did not proceed after the fifth failed attempt");
+  } finally { await closeDirect(d.f, teams); }
+});
+
+test("removeRun returns member-work-not-saved until the background save completes", { timeout: 30000 }, async () => {
+  const d = directFixture("cancelled", { cancelledMinutes: 60 });
+  d.createRemote();
+  const { member } = addMemberClone(d);
+  d.f.writeTeam();
+  const teams = d.open(), id = d.f.run.id, branch = `${d.f.run.branch}-wip-${member.memberId}`;
+  try {
+    teams.start();
+    await until(() => teams.get(id).publication?.commit, commit => commit === d.head, 10000, "the integration head was not published first");
+    await assert.rejects(teams.removeRun(id), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "member-work-not-saved");
+    await until(() => teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork?.state,
+      state => state === "published", 10000, "removeRun did not start the member work save");
+    const removed = await teams.removeRun(id);
+    assert.equal(removed.members.find(item => item.memberId === member.memberId)?.savedWork?.state, "published");
+    assert.equal(remoteRef(d.remote, branch), removed.members.find(item => item.memberId === member.memberId)?.savedWork?.commit);
+    assert.equal(existsSync(dirname(d.f.run.workspace)), false);
+  } finally { await closeDirect(d.f, teams); }
+});
+
+test("publishHeads false does not snapshot member work or hold retention", { timeout: 30000 }, async () => {
+  const d = directFixture("cancelled", { cancelledMinutes: 0 });
+  d.createRemote();
+  const { member } = addMemberClone(d);
+  d.f.run.missionId = randomUUID();
+  d.f.config.teams!.publishHeads = false;
+  d.f.writeTeam();
+  const teams = d.open(), id = d.f.run.id, branch = `${d.f.run.branch}-wip-${member.memberId}`;
+  try {
+    teams.start();
+    await until(() => existsSync(dirname(d.f.run.workspace)), present => !present, 10000, "disabled publication held cancelled retention");
+    assert.equal(teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork, undefined);
+    assert.equal(remoteRef(d.remote, branch), "");
+  } finally { await closeDirect(d.f, teams); }
+});
+
+test("a later retention pass at the same revision does not push saved member work again", { timeout: 30000 }, async () => {
+  const d = directFixture("cancelled", { cancelledMinutes: 0 });
+  d.createRemote();
+  const { member } = addMemberClone(d);
+  d.f.run.missionId = randomUUID();
+  recordMemberWorkPushes(d);
+  d.f.writeTeam();
+  const teams = d.open(), id = d.f.run.id, branch = `${d.f.run.branch}-wip-${member.memberId}`;
+  try {
+    teams.start();
+    await until(() => teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork?.state,
+      state => state === "published", 10000, "the first retention pass did not save member work");
+    await until(() => existsSync(dirname(d.f.run.workspace)), present => !present, 10000, "the first retention pass did not remove the workspace");
+    assert.equal(wipPushes(d.receipts), 1);
+    const firstCommit = remoteRef(d.remote, branch);
+    d.clock.advance(60_000);
+    await delay(700);
+    assert.equal(wipPushes(d.receipts), 1);
+    assert.equal(remoteRef(d.remote, branch), firstCommit);
+    assert.equal(teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork?.revision, d.f.run.revision);
+  } finally { await closeDirect(d.f, teams); }
+});
 
 test("the integration head is published before reviewer and delivery members start", { timeout: 120000 }, async () => {
   const h = await trackedFixture("delivery-hold", {}, "hold-first");

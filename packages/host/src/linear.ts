@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
+import { DEFAULT_REPORT_NAME, reportName } from "./config.js";
 import type { Config } from "./types.js";
 import type { ProductGoal } from "./goal-types.js";
 import type { TeamRun, TeamView } from "./team-types.js";
@@ -142,8 +143,9 @@ export class LinearService {
     if (parentKey) { const parent = this.records.get(parentKey); if (parent) this.force(parent); }
     return stored;
   }
-  private comment(stored: Stored, event: string, text: string) {
-    const body = sharedText(text), eventKey = hash({ event, body });
+  private comment(stored: Stored, event: string, text: string, keyText = text) {
+    // The key uses the default report name, so renaming the host never reposts a status comment already sent.
+    const body = sharedText(text), eventKey = hash({ event, body: sharedText(keyText) });
     if (stored.comments[eventKey]) return;
     if (Object.keys(stored.comments).length >= 256 || Buffer.byteLength(body) > 64000) {
       stored.blocked ??= "Linear evidence exceeded its bounded outbox. Review the saved execution before starting another run.";
@@ -160,7 +162,7 @@ export class LinearService {
     if (!stored) return goal.linearIssueId ? { status: "blocked", reason: "Configure Linear for this project before linking an existing issue." } : undefined;
     for (const direction of goal.steering) this.comment(stored, `direction:${direction.revision}`, `User direction for goal revision ${direction.revision}:\n\n${direction.text}\n\nThe approved scope and execution limits remain in force.`);
     for (const outcome of goal.outcomes) this.comment(stored, `outcome:${outcome.revision}`, `User-recorded product outcome: ${outcome.result}\n\n${outcome.summary}\n\nEvidence:\n${outcome.evidence}`);
-    if (evidenceStatuses.has(goal.status)) this.comment(stored, `status:${goal.revision}:${goal.status}`, `Infinite goal execution\n\nStatus: ${goal.status}\nFeature runs: ${goal.cycles.length}\nAgent attempts: ${goal.memberCount}\n\nThis is local execution evidence. Linear's workflow status has not been changed.`);
+    if (evidenceStatuses.has(goal.status)) { const status = (name: string) => `${name} goal execution\n\nStatus: ${goal.status}\nFeature runs: ${goal.cycles.length}\nAgent attempts: ${goal.memberCount}\n\nThis is local execution evidence. Linear's workflow status has not been changed.`; this.comment(stored, `status:${goal.revision}:${goal.status}`, status(reportName(this.config)), status(DEFAULT_REPORT_NAME)); }
     this.save(stored); return this.view(stored);
   }
   /** `resumable` is the host's current answer for a blocked run; the blocked evidence waits for it. */
@@ -210,7 +212,8 @@ export class LinearService {
       // A goal's runs are resumed from the goal; the team resume route refuses them.
       const flag = run.status === "blocked" ? `Reason: ${sharedText(run.reason ?? "not recorded")}\nNext step: ${run.goal ? "inspect the goal that owns this run, then approve new work for it if it should continue."
         : resumable ? `run \`infinite team resume ${run.id}\` to replan from the integrated work.` : "inspect the run's evidence, then start a new run to continue."}\n` : "";
-      this.comment(stored, `status:${run.revision}:${run.status}`, `Infinite feature execution\n\nStatus: ${run.status}\n${flag}Agent attempts: ${run.members.length}\nChecks passed: ${checks.filter(check => check.status === "passed").length}/${checks.length}\nIndependent review: ${run.review?.verdict ?? "not recorded"}\n\nChecks and review describe code readiness. They do not establish a product outcome or change Linear's workflow status.`);
+      const status = (name: string) => `${name} feature execution\n\nStatus: ${run.status}\n${flag}Agent attempts: ${run.members.length}\nChecks passed: ${checks.filter(check => check.status === "passed").length}/${checks.length}\nIndependent review: ${run.review?.verdict ?? "not recorded"}\n\nChecks and review describe code readiness. They do not establish a product outcome or change Linear's workflow status.`;
+      this.comment(stored, `status:${run.revision}:${run.status}`, status(reportName(this.config)), status(DEFAULT_REPORT_NAME));
     }
     // Flag a blocked run on its issue; the label follows the host's status, never the reverse.
     if (!run.missionId && run.status === "blocked" && stored.label !== "added" && stored.label !== "add") { stored.label = "add"; stored.labelFailures = 0; stored.labelRetryAt = 0; }

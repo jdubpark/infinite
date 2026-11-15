@@ -48,7 +48,7 @@ class FakeThreads implements IntakeThreadReader {
   }
 }
 
-async function setup(options: { groupId?: string; maxActive?: number; requireSlackThread?: boolean; mirror?: boolean; scripted?: boolean; admitIssues?: boolean; answerQuestions?: boolean; classify?: boolean; router?: (text: string) => Promise<RouteReading | undefined>; routeWaitMs?: number } = {}) {
+async function setup(options: { groupId?: string; maxActive?: number; requireSlackThread?: boolean; mirror?: boolean; scripted?: boolean; admitIssues?: boolean; answerQuestions?: boolean; classify?: boolean; router?: (text: string) => Promise<RouteReading | undefined>; routeWaitMs?: number; reportName?: string } = {}) {
   const linearServer = await startIntakeLinearServer();
   const threads = new FakeThreads();
   /** While `blocked` is set, a start is refused with it, as the route's admission refuses a mid-handoff project. */
@@ -56,7 +56,7 @@ async function setup(options: { groupId?: string; maxActive?: number; requireSla
   let config!: Config;
   const configure = (target: Config) => {
     config = target;
-    target.linear = { apiKeyFile: linearServer.apiKeyFile, endpoint: linearServer.endpoint };
+    target.linear = { apiKeyFile: linearServer.apiKeyFile, endpoint: linearServer.endpoint, ...(options.reportName ? { reportName: options.reportName } : {}) };
     target.intake = {
       linear: { teamIds: [linearServer.teamId], creatorId: linearServer.ownerId, label: "infinite", commentsMirrorToSlack: options.mirror ?? false, admitIssues: options.admitIssues ?? true },
       slack: { appTokenFile: "/srv/infinite-data/slack-app-token", botTokenFile: "/srv/infinite-data/slack-bot-token", teamId: "T00000000",
@@ -386,6 +386,37 @@ test("the started and cancelled comments are delivered once each, even after a l
       "Infinite agent report: a mission started on this issue. Questions and the result will follow.",
       "Infinite agent report: cancelled.",
     ]);
+  } finally { await ctx.close(); }
+});
+
+test("the started comment and the outcome receipts use the configured report name", { timeout: 120000 }, async () => {
+  const ctx = await setup({ reportName: "Northwind" });
+  try {
+    const issue = ctx.issue();
+    await ctx.intake.poll();
+    const id = missionRequestId(issue.id);
+    await ctx.missions.cancel(id, { requestId: randomUUID(), revision: ctx.missions.peek(id)!.revision });
+    await ctx.intake.poll();
+    const bodies = ctx.linearServer.comments(issue.id).map(comment => comment.body);
+    assert.equal(bodies.length, 2);
+    assert.match(bodies[0], /^Northwind agent report: a mission started on this issue\./);
+    assert.match(bodies[1], /^Northwind agent report: cancelled\./);
+    assert.ok(bodies.every(body => !body.includes("Infinite")), "No posted comment names the product");
+  } finally { await ctx.close(); }
+});
+
+test("a direct request's fixed receipt uses the configured report name", { timeout: 120000 }, async () => {
+  const ctx = await setup({ requireSlackThread: false, reportName: "Northwind" });
+  try {
+    ctx.intake.requestFromSlack(direct(ctx));
+    await ctx.intake.poll();
+    const [issue] = ctx.linearServer.allIssues();
+    const id = missionRequestId(issue.id);
+    await ctx.missions.cancel(id, { requestId: randomUUID(), revision: ctx.missions.peek(id)!.revision });
+    await ctx.intake.poll();
+    const bodies = ctx.linearServer.comments(issue.id).map(comment => comment.body);
+    assert.match(bodies.at(-1)!, /^Northwind agent report: cancelled\. The reason is in the Slack thread/);
+    assert.ok(bodies.every(body => !body.includes("Infinite")));
   } finally { await ctx.close(); }
 });
 
@@ -963,6 +994,80 @@ test("a direct request files one issue and starts a mission whose objective mark
     assert.equal(ctx.missions.list().length, 1);
     await ctx.intake.poll();
     assert.equal(ctx.linearServer.allIssues().length, 1, "A later cycle files nothing more");
+  } finally { await ctx.close(); }
+});
+
+const markdownLink = (url: string) => `[${url}](<${url}>)`;
+
+test("a direct request whose tracker rewrites the link is not reported as edited", { timeout: 60000 }, async () => {
+  const ctx = await setup({ requireSlackThread: false });
+  try {
+    ctx.linearServer.rewriteLinks(true);
+    const request = direct(ctx);
+    assert.equal(ctx.intake.requestFromSlack(request), "accepted");
+    await ctx.intake.poll();
+    await ctx.intake.poll();
+    const [issue] = ctx.linearServer.allIssues();
+    const url = `https://example.slack.com/archives/C0000000000/p${request.ts.replace(".", "")}`;
+    const record = ctx.store.get(issue.id)!;
+    assert.equal(record.state, "started");
+    assert.ok(record.description.endsWith(`Filed from Slack by the owner: ${url}`), "The record keeps the host's own text");
+    assert.equal(record.editNotedAt, undefined, "The tracker's reformatting is not an edit");
+    assert.ok(record.tracked?.description.endsWith(markdownLink(url)));
+  } finally { await ctx.close(); }
+});
+
+test("a direct request edited in the tracker after it started is still reported once", { timeout: 60000 }, async () => {
+  const ctx = await setup({ requireSlackThread: false });
+  try {
+    ctx.linearServer.rewriteLinks(true);
+    assert.equal(ctx.intake.requestFromSlack(direct(ctx)), "accepted");
+    await ctx.intake.poll();
+    const [issue] = ctx.linearServer.allIssues();
+    assert.equal(ctx.store.get(issue.id)!.editNotedAt, undefined);
+    ctx.linearServer.edit(issue.id, { description: "A teammate rewrote this" });
+    await ctx.intake.poll();
+    const noted = ctx.store.get(issue.id)!.editNotedAt;
+    assert.ok(noted, "The edit is noted");
+    ctx.linearServer.edit(issue.id, { description: "A second rewrite" });
+    await ctx.intake.poll();
+    assert.equal(ctx.store.get(issue.id)!.editNotedAt, noted, "The note is set once");
+  } finally { await ctx.close(); }
+});
+
+test("a direct record saved without the tracked text adopts the tracker's text instead of reporting an edit", { timeout: 60000 }, async () => {
+  const ctx = await setup({ requireSlackThread: false });
+  try {
+    ctx.linearServer.rewriteLinks(true);
+    assert.equal(ctx.intake.requestFromSlack(direct(ctx)), "accepted");
+    await ctx.intake.poll();
+    const [issue] = ctx.linearServer.allIssues();
+    // As an older host stored it: the host's own text and no tracked text.
+    ctx.store.update(issue.id, next => { delete next.tracked; });
+    await ctx.intake.poll();
+    const adopted = ctx.store.get(issue.id)!;
+    assert.equal(adopted.editNotedAt, undefined);
+    const url = `https://example.slack.com/archives/C0000000000/p${adopted.direct!.ts.replace(".", "")}`;
+    assert.deepEqual(adopted.tracked, { title: issue.title, description: `${adopted.description.replace(url, markdownLink(url))}` });
+    ctx.linearServer.edit(issue.id, { description: "A teammate rewrote this" });
+    await ctx.intake.poll();
+    assert.ok(ctx.store.get(issue.id)!.editNotedAt, "A later edit is noted");
+  } finally { await ctx.close(); }
+});
+
+test("an issue filed through the tracker's own agent keeps the existing edit check", { timeout: 60000 }, async () => {
+  const ctx = await setup();
+  try {
+    ctx.linearServer.rewriteLinks(true);
+    const issue = ctx.issue({ description: "See https://example.com/a for details" });
+    await ctx.intake.poll();
+    await ctx.intake.poll();
+    const record = ctx.store.get(issue.id)!;
+    assert.equal(record.tracked, undefined, "Only a request the host files itself carries tracked text");
+    assert.equal(record.editNotedAt, undefined, "Unchanged text gives no note");
+    ctx.linearServer.edit(issue.id, { description: "A changed description" });
+    await ctx.intake.poll();
+    assert.ok(ctx.store.get(issue.id)!.editNotedAt, "Changed text gives a note");
   } finally { await ctx.close(); }
 });
 

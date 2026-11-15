@@ -139,7 +139,9 @@ function LaneSwarm({ swarm, ...props }: ViewProps & { swarm: Swarm }) {
   return <section className="sw-lane-swarm" aria-label={swarm.title}>
     <header className="sw-swarm-head">
       {swarm.kind !== "solo" && <span className="sw-swarm-kind sw-dim">{swarm.kind}</span>}
-      <span className="sw-title">{swarm.title}</span>
+      {swarm.kind === "mission"
+        ? <button type="button" className="sw-title sw-mission-title" aria-label={"Open mission: " + swarm.title} onClick={() => props.openMission(swarm.id)}>{swarm.title}</button>
+        : <span className="sw-title">{swarm.title}</span>}
       {swarm.coordinator && <AgentMark agent={swarm.coordinator} selected={selection?.kind === "agent" && selection.id === swarm.coordinator.id} onSelect={onSelect} openSession={openSession} />}
       <span className="sw-spacer" />
       {swarm.kind === "mission" && <span className="sw-count sw-dim">{plural(swarm.units.length, "unit")}</span>}

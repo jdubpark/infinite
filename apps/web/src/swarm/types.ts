@@ -189,6 +189,7 @@ export interface ViewProps {
   onSelect(selection: Selection): void;
   openSession(sessionId: string): void;
   openTeam(teamId: string): void;
+  openMission(missionId: string): void;
   activity: ActivityStore;
   now: number;
 }

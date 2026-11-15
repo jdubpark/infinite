@@ -1436,6 +1436,30 @@ small,
   .is-refreshing { animation: none; }
 }
 
+/* Mission details and links from the Swarm lanes. */
+.sw-mission-title { min-width: 0; padding: 0; border: 0; background: transparent; color: var(--sw-ink); font: inherit; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+.sw-mission-title:hover, .sw-mission-title:focus-visible { text-decoration: underline; text-underline-offset: 3px; }
+.mission-stop-time { margin: 10px 0 0; font-size: 12px; }
+.mission-subtasks { list-style: none; margin: 0; padding: 0; }
+.mission-subtasks li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 0; border-top: 1px solid var(--rule); }
+.mission-subtasks li > div { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.mission-subtasks li strong { overflow-wrap: anywhere; font-size: 13px; }
+.mission-subtasks li span { color: var(--muted); font-size: 11px; }
+.mission-subtasks li > button { flex: 0 0 auto; }
+.mission-extend { margin-top: 10px; }
+.mission-extend > summary { min-height: 44px; padding: 10px 0; cursor: pointer; color: var(--green); font-size: 14px; }
+.mission-extend h3 { margin-bottom: 12px; }
+.mission-extend-choices { display: flex; flex-wrap: wrap; gap: 8px; }
+.mission-extend-choices button { min-height: 44px; padding: 10px 14px; border: 1px solid var(--rule); border-radius: 8px; background: #fff; font-size: 12px; }
+.mission-custom-extend { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+.mission-custom-extend fieldset { display: flex; flex-direction: column; gap: 6px; min-width: 160px; margin: 0; padding: 0; border: 0; }
+.mission-custom-extend label { font-size: 12px; }
+.mission-custom-extend input { width: 160px; }
+.mission-action-buttons { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 16px; margin-top: 18px; }
+.mission-request-notice { padding: 12px 14px; border-radius: 8px; background: #f7e8ce; color: #724314; font-size: 12px; }
+.mission-request-notice p { margin: 0 0 8px; }
+.mission-request-notice .team-pending { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+
 /* Goals keep the approved scope and human assessment alongside each work cycle. */
 .team-profile-tier { display: inline-block; margin-left: 8px; padding: 1px 5px; border: 1px solid var(--rule); border-radius: 4px; color: var(--muted); font-size: 10px; font-weight: 400; vertical-align: middle; }
 .team-model-profile > .team-data-use { color: #724314; }

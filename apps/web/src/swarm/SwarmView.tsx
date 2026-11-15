@@ -26,6 +26,7 @@ export type SwarmViewProps = {
   setView(view: SwarmViewName): void;
   openSession(sessionId: string): void;
   openTeam(teamId: string): void;
+  openMission(missionId: string): void;
   /** Starts a session; shown to owners when the host has no sessions at all. */
   onCreate?: () => void;
   focus: boolean;
@@ -42,7 +43,7 @@ const isEditable = (target: EventTarget | null) =>
 
 /** The Swarm route: floating glass controls over the Lanes, Wall, or Graph canvas. */
 export function SwarmView(props: SwarmViewProps) {
-  const { me, sessions, teams, stale, seen, view, setView, openSession, openTeam, onCreate, focus, setFocus } = props;
+  const { me, sessions, teams, stale, seen, view, setView, openSession, openTeam, openMission, onCreate, focus, setFocus } = props;
   const api = useApi();
   const root = useRef<HTMLDivElement>(null);
   const [missions, setMissions] = useState<SwarmMission[]>([]);
@@ -94,7 +95,7 @@ export function SwarmView(props: SwarmViewProps) {
   const cpuPercent = resources?.cpu?.usagePercent ?? null;
   const limits = (me.providerLimits ?? []).filter(limit => Date.parse(limit.expiresAt) > now);
 
-  const viewProps: ViewProps = { model, selection, onSelect: setSelection, openSession, openTeam, activity, now };
+  const viewProps: ViewProps = { model, selection, onSelect: setSelection, openSession, openTeam, openMission, activity, now };
 
   return <div ref={root} className={`swarm${stale ? " sw-stale" : ""}`}>
     <div className="sw-canvas">

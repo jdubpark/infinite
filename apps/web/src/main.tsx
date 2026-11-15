@@ -41,6 +41,7 @@ import { foreground, useLiveRefresh } from "./live-refresh";
 import { useSessionControl } from "./session-control";
 import { TeamCreate, TeamDetail, TeamList, TeamPicker, clearTeamRequests, type TeamView } from "./teams";
 import { GoalCreate, GoalDetail, GoalList, GoalPicker, clearGoalRequests, type ProductGoal } from "./goals";
+import { MissionPage, clearMissionRequests } from "./missions";
 import { CostPage, CostPicker } from "./cost";
 import { SwarmView } from "./swarm/SwarmView";
 import "./style.css";
@@ -176,11 +177,11 @@ function App() {
     );
   const active = sessions.filter((s) => s.status === "running").length;
   // The Swarm view is the landing page: it fills the main area at the root route and at #/swarm.
-  const swarmShown = route.swarm || !(selected || creating || route.teams || route.goals || route.cost);
+  const swarmShown = route.swarm || !(selected || creating || route.teams || route.goals || route.missionId || route.cost);
   const swarm = <SwarmView me={me} sessions={sessions} teams={teams} fresh={host.fresh && (!me.teams || teamFeed.fresh)} stale={host.stale || Boolean(me.teams && teamFeed.stale)} seen={host.seen}
-    view={route.swarmView} setView={route.navigateSwarm} openSession={route.navigate} openTeam={route.navigateTeam} onCreate={me.role === "owner" ? route.create : undefined} focus={swarmFocus} setFocus={setSwarmFocus} />;
+    view={route.swarmView} setView={route.navigateSwarm} openSession={route.navigate} openTeam={route.navigateTeam} openMission={route.navigateMission} onCreate={me.role === "owner" ? route.create : undefined} focus={swarmFocus} setFocus={setSwarmFocus} />;
   return (
-    <div className={`app ${selected || creating || route.teams || route.goals || route.cost || route.swarm ? "has-detail" : ""}${swarmShown ? " swarm-shown" : ""}${swarmShown && swarmFocus ? " swarm-focus" : ""}`}>
+    <div className={`app ${selected || creating || route.teams || route.goals || route.missionId || route.cost || route.swarm ? "has-detail" : ""}${swarmShown ? " swarm-shown" : ""}${swarmShown && swarmFocus ? " swarm-focus" : ""}`}>
       <aside className="sidebar">
         <Mark />
         <MachinePicker />
@@ -246,6 +247,7 @@ function App() {
             setTeams([]);
             setGoals([]);
             clearGoalRequests(machines.active.id);
+            clearMissionRequests(machines.active.id);
             clearTeamRequests(machines.active.id);
             creations.clear(machines.active.id);
             lifecycles.clearMachine(machines.active.id);
@@ -261,15 +263,15 @@ function App() {
           <div className="breadcrumb">
             <button
               className="back icon-button"
-              onClick={() => route.costProjectId ? route.navigateCost("projects") : route.goalId || route.creatingGoal ? route.navigateGoal(null) : route.teamId || route.creatingTeam ? route.navigateTeam(null) : route.navigate(null)}
-              aria-label={route.costProjectId ? "Back to projects" : route.goalId || route.creatingGoal ? "Back to goals" : route.teamId || route.creatingTeam ? "Back to teams" : "Back to sessions"}
+              onClick={() => route.missionId ? route.navigateSwarm() : route.costProjectId ? route.navigateCost("projects") : route.goalId || route.creatingGoal ? route.navigateGoal(null) : route.teamId || route.creatingTeam ? route.navigateTeam(null) : route.navigate(null)}
+              aria-label={route.missionId ? "Back to Swarm" : route.costProjectId ? "Back to projects" : route.goalId || route.creatingGoal ? "Back to goals" : route.teamId || route.creatingTeam ? "Back to teams" : "Back to sessions"}
             >
               <ArrowLeft size={20} />
             </button>
             <span>Workspace</span>
             <ChevronRight size={13} />
             <strong>
-              {route.cost ? (route.costProjectId ? "Project cost" : route.costView === "models" ? "Models" : "Cost") : route.creatingGoal ? "New goal" : route.goalId ? "Goal" : route.goals ? "Goals" : route.creatingTeam ? "New team" : route.teamId ? "Team" : route.teams ? "Teams" : creating ? "New session" : selected ? "Session" : "Swarm"}
+              {route.missionId ? "Mission" : route.cost ? (route.costProjectId ? "Project cost" : route.costView === "models" ? "Models" : "Cost") : route.creatingGoal ? "New goal" : route.goalId ? "Goal" : route.goals ? "Goals" : route.creatingTeam ? "New team" : route.teamId ? "Team" : route.teams ? "Teams" : creating ? "New session" : selected ? "Session" : "Swarm"}
             </strong>
           </div>
           <div className="refresh-status">
@@ -287,7 +289,7 @@ function App() {
             {host.seen ? "This device is offline or the host is unreachable. Showing the last received state. Work may still be running; controls are disabled until a fresh connection arrives." : "Can’t reach the host. Sessions haven’t loaded; controls are disabled until a fresh connection arrives."}
           </div>
         )}
-        {route.swarm ? swarm : route.cost ? <CostPage me={me} view={route.costView} projectId={route.costProjectId} navigate={route.navigateCost} /> : route.creatingGoal ? <GoalCreate me={me} connected={connected} done={id => { goalFeed.refresh(); route.navigateGoal(id); }} /> : route.goalId ? <GoalDetail key={route.goalId} id={route.goalId} me={me} connected={connected} teams={teams} teamsStale={teamFeed.stale} refreshGoals={goalFeed.refresh} openTeam={route.navigateTeam} /> : route.goals ? <GoalList goals={goals} me={me} fresh={goalFeed.fresh} stale={goalFeed.stale} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} failed={goalFeed.failed} seen={goalFeed.seen} onCreate={route.createGoal} onSelect={route.navigateGoal} /> : route.creatingTeam ? <TeamCreate me={me} connected={connected} done={id => { teamFeed.refresh(); route.navigateTeam(id); }} /> : route.teamId ? <TeamDetail key={route.teamId} id={route.teamId} me={me} connected={connected} sessions={sessions} refreshTeams={teamFeed.refresh} openSession={route.navigate} /> : route.teams ? <TeamList teams={teams} me={me} fresh={teamFeed.fresh} stale={teamFeed.stale} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} failed={teamFeed.failed} seen={teamFeed.seen} onCreate={route.createTeam} onSelect={route.navigateTeam} refresh={teamFeed.refresh} openCost={() => route.navigateCost()} /> : creating ? (
+        {route.missionId ? <MissionPage key={route.missionId} id={route.missionId} me={me} connected={connected} openTeam={route.navigateTeam} /> : route.swarm ? swarm : route.cost ? <CostPage me={me} view={route.costView} projectId={route.costProjectId} navigate={route.navigateCost} /> : route.creatingGoal ? <GoalCreate me={me} connected={connected} done={id => { goalFeed.refresh(); route.navigateGoal(id); }} /> : route.goalId ? <GoalDetail key={route.goalId} id={route.goalId} me={me} connected={connected} teams={teams} teamsStale={teamFeed.stale} refreshGoals={goalFeed.refresh} openTeam={route.navigateTeam} /> : route.goals ? <GoalList goals={goals} me={me} fresh={goalFeed.fresh} stale={goalFeed.stale} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} failed={goalFeed.failed} seen={goalFeed.seen} onCreate={route.createGoal} onSelect={route.navigateGoal} /> : route.creatingTeam ? <TeamCreate me={me} connected={connected} done={id => { teamFeed.refresh(); route.navigateTeam(id); }} /> : route.teamId ? <TeamDetail key={route.teamId} id={route.teamId} me={me} connected={connected} sessions={sessions} refreshTeams={teamFeed.refresh} openSession={route.navigate} /> : route.teams ? <TeamList teams={teams} me={me} fresh={teamFeed.fresh} stale={teamFeed.stale} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} failed={teamFeed.failed} seen={teamFeed.seen} onCreate={route.createTeam} onSelect={route.navigateTeam} refresh={teamFeed.refresh} openCost={() => route.navigateCost()} /> : creating ? (
           <Create
             me={me}
             done={route.navigate}

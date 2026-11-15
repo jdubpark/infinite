@@ -476,22 +476,35 @@ test("a run behaves the same with an unavailable store as with no ledger", async
   assert.ok(Array.isArray(unavailable.sealed.outbox) && unavailable.sealed.outbox.length > 0, "the events wait in the sealed record");
 });
 
-test("a deleted run's last event is projected before its events are removed", async () => {
+for (const removal of ["owner", "retention"] as const) test(`${removal} deletion projects a cancelled member's stop before removing its events`, async () => {
   const f = schedulerFixture();
   const store = openStore(f, f.key);
   const projected: string[] = [];
   try {
     store.register({ name: "probe", version: 1, readVersion: 1, migrate() {}, runIds: () => [] });
     const outbox = new EventOutbox(store);
-    outbox.registerProjector({ name: "probe", module: "probe", kinds: ["run.deleted"], project: (_tx, event) => { projected.push(event.key); } });
-    f.run.status = "cancelled";
-    f.run.members.forEach(member => { member.status = "stopped"; });
+    outbox.registerProjector({ name: "probe", module: "probe", kinds: ["member.stopped", "run.deleted"], project: (_tx, event) => { projected.push(event.key); } });
+    if (removal === "retention") f.config.teams!.retention = { ...DEFAULT_TEAM_RETENTION, cancelledMinutes: 0 };
     f.writeTeam();
     const teams = f.openTeam({ events: outbox });
     // server.ts attaches the store this way; removeRun must then do the whole deletion itself.
     teams.useEvidence(store);
-    await teams.removeRun(f.run.id);
-    assert.deepEqual(projected, [`run.deleted:${f.run.id}`], "the probe saw run.deleted exactly once");
+    await teams.cancel(f.run.id, { requestId: randomUUID(), revision: 1 });
+    // The process can exit between scheduler passes, while its recorded member is still running.
+    f.state.status = "exited";
+    const scheduler = internal(teams), stored = scheduler.record(f.run.id);
+    if (removal === "owner")
+      await assert.rejects(teams.removeRun(f.run.id), (error: unknown) => error instanceof TeamError && error.code === "team-active");
+    else {
+      await scheduler.retire(stored);
+      await teams.idle();
+      assert.equal(teams.get(f.run.id).members[0]!.status, "running", "retention waits for cancellation reconciliation");
+    }
+    await scheduler.step(stored);
+    if (removal === "owner") await teams.removeRun(f.run.id);
+    else { await scheduler.step(stored); await teams.idle(); }
+    assert.deepEqual(projected, [`member.stopped:${f.run.id}:${f.run.members[0]!.memberId}`, `run.deleted:${f.run.id}`], "the stop and deletion each project once, in order");
+    assert.equal(teams.list().some(run => run.id === f.run.id), false);
     assert.deepEqual(store.events({ runId: f.run.id, limit: 100 }).events, [], "no event for the run remains in the store");
     assert.equal(store.describe().counts["event-outbox.lost"], 0);
   } finally { store.close(); f.close(); }

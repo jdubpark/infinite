@@ -2723,6 +2723,8 @@ export class TeamService {
       catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; }
       try { if ((await this.manager.state(member.sessionId)).status !== "exited") return false; }
       catch { continue; }
+      // An exited process can precede the halt pass that records its owner stop. Keep that event's record alive.
+      if (stored.halt === "cancel" && activeMember(member)) return false;
     }
     return true;
   }

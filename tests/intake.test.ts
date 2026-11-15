@@ -297,8 +297,9 @@ test("a fourth request queues behind three and starts when one waits on the owne
     const last = () => viewOf(ctx, issues[3].id)!;
     assert.equal(last().holdReason, "max-active");
     ctx.h.release("release-dispatch");
-    const firstMission = missionRequestId(issues[0].id);
-    await waitFor(async () => ctx.missions.peek(firstMission)?.status, status => status === "needs-input", 240000);
+    // The three missions race for one repository, so any of them may be the one whose subteam asks the owner first.
+    const started = issues.slice(0, 3).map(issue => missionRequestId(issue.id));
+    await waitFor(async () => started.map(id => ctx.missions.peek(id)?.status), statuses => statuses.includes("needs-input"), 240000);
     await ctx.intake.poll();
     assert.equal(last().state, "started", "The fourth request starts once a slot frees");
     assert.equal(last().holdReason, undefined);

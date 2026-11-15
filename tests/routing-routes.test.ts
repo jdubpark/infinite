@@ -146,6 +146,32 @@ test("the routing command prints status and explain", { timeout: 90000 }, async 
   }
 });
 
+test("the status route reads the objective digest version only when owner criteria are on", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-routing-objective-"));
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: Buffer.alloc(32, 6) });
+  try {
+    store.register(configurationModule()); store.register(outcomeModule({ now: () => NOW })); store.register(routingModule());
+    // The route's flags: publishHeads on (no setting is false), entry tools off.
+    store.write(tx => {
+      tx.run("INSERT INTO configurations (config_id, provider, model, effort, prompt_version, guidance, knowledge, routing, shape, first_seen_at) VALUES ('record', 'codex', ?, 'xhigh', ?, 'g', 'k', 'off', 's', ?)",
+        ASTRA.model, promptVersion("implementer", "codex", ASTRA, true, false, true), NOW);
+      for (let index = 0; index < 2; index++) writeOutcome(tx, countedRow(`record-${index}`, "record"));
+    });
+    const astraRows = (status: RoutingStatus) => status.cells.find(cell => cell.cell.scope === "new-task")!.profiles.find(profile => profile.profileId === ASTRA.id)!.rows.production;
+    const cases = [[{ objective: { prompts: "on" } }, 2], [{ objective: { prompts: "off" } }, 0], [{}, 0]] as const;
+    for (const [team, expected] of cases) {
+      const served = await serve(store, { projects: [{ id: "rehearsal", autonomy: "autonomous", team }], teams: { lineup: mixedLineup } } as unknown as Config);
+      try {
+        const status = await (await served.get("/api/routing/projects/rehearsal")).json() as RoutingStatus;
+        assert.equal(astraRows(status), expected, JSON.stringify(team));
+      } finally { await served.close(); }
+    }
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("the routes pass the saved policy, the lineup, and the flags a new run pins, and take any UUID case", async () => {
   const root = mkdtempSync(join(tmpdir(), "infinite-routing-routes-"));
   const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: Buffer.alloc(32, 5) });

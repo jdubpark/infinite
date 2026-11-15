@@ -39,6 +39,8 @@ export type RoutingStatusInput = {
   lineup: TeamLineup | undefined;
   publishHeads: boolean;
   entryTools: boolean;
+  /** Owner criteria are on: the evidence is read with the record digest, as a goal cycle's start would be. */
+  objectiveDigest: boolean;
   now: string;
 };
 
@@ -65,7 +67,7 @@ function identityOf(profile: TeamModelProfile): Identity {
  */
 type Evidence = { representative: Map<string, TeamModelProfile>; rows: Map<string, RoutingEvidenceRow[]>; current: Map<string, CurrentConfig> };
 
-function readEvidence(db: EvidenceDb, screened: readonly Screened[], publishHeads: boolean, entryTools: boolean, now: string): Evidence {
+function readEvidence(db: EvidenceDb, screened: readonly Screened[], publishHeads: boolean, entryTools: boolean, objectiveDigest: boolean, now: string): Evidence {
   const since = daysBefore(now, MAX_AGE_DAYS);
   const representative = new Map<string, TeamModelProfile>();
   for (const item of [...screened.filter(item => item.removed === undefined), ...screened.filter(item => item.removed !== undefined)]) {
@@ -76,7 +78,7 @@ function readEvidence(db: EvidenceDb, screened: readonly Screened[], publishHead
   for (const [identity, profile] of representative) {
     current.set(identity, {
       epoch: epochAt(db, identity, now),
-      promptVersion: promptVersion("implementer", profile.provider, profile, publishHeads, entryTools),
+      promptVersion: promptVersion("implementer", profile.provider, profile, publishHeads, entryTools, objectiveDigest),
     });
     rows.set(identity, selectRoutingEvidence(db, identityOf(profile), "start", since));
   }
@@ -146,7 +148,7 @@ export function routingStatus(store: EvidenceStore, input: RoutingStatusInput): 
     let cells: { cell: StatusCell; profiles: StatusProfile[] }[] = [];
     let cellsCapped = false, unreadableCells = 0;
     if (knobs && reason === null && input.lineup) {
-      const evidence = readEvidence(db, screened, input.publishHeads, input.entryTools, input.now);
+      const evidence = readEvidence(db, screened, input.publishHeads, input.entryTools, input.objectiveDigest, input.now);
       const projectRef = db.index("project", input.projectId);
       const recorded = projectCells(db, input.projectId, since, STATUS_CELL_LIMIT);
       cellsCapped = recorded.capped;

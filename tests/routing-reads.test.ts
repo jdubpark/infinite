@@ -77,7 +77,7 @@ function counting(store: EvidenceStore): { store: Store; opens: () => number } {
 function statusInput(overrides: Partial<Parameters<typeof routingStatus>[1]> = {}): Parameters<typeof routingStatus>[1] {
   return {
     projectId: "rehearsal", saved: undefined, autonomy: "supervised", lineup: mixedLineup, publishHeads: false, entryTools: false,
-    now: NOW, ...overrides,
+    objectiveDigest: false, now: NOW, ...overrides,
   };
 }
 
@@ -400,6 +400,27 @@ test("a recorded cell counts its own rows, and the new-task line counts the proj
     for (const profile of status.cells.flatMap(line => line.profiles)) assert.ok(profile.interval[0] >= 0 && profile.interval[1] <= 1, `interval ${profile.interval}`);
     // Beta(16, 1) has an upper bound above 1 before the clip.
     assert.equal(cell.interval[1], 1);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("the objective digest flag reads the version a goal cycle's start carries, and counts only with the flag", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    const astra = mixedLineup.implementers[1]!;
+    seed(store, { area: "host" });
+    store.write(tx => {
+      configRow(tx, "record", astra, promptVersion("implementer", "codex", astra, false, false, true));
+      for (let index = 0; index < 30; index++) writeOutcome(tx, integratedRow({ id: `record-${index}`, profile: astra, configId: "record" }));
+    });
+    const withFlag = cellProfile(routingStatus(store, statusInput({ saved: { mode: "shadow" }, objectiveDigest: true })), "astra-xhigh");
+    const withoutFlag = cellProfile(routingStatus(store, statusInput({ saved: { mode: "shadow" }, objectiveDigest: false })), "astra-xhigh");
+    assert.deepEqual([withFlag.rows.production, withFlag.earlier.rows], [30, 0]);
+    assert.deepEqual([withoutFlag.rows.production, withoutFlag.earlier.rows], [0, 30]);
   } finally {
     store?.close();
     f.close();

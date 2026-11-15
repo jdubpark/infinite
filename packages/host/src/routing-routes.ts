@@ -3,6 +3,7 @@ import { z } from "zod";
 import { autonomyOf } from "./autonomy.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import { EvidenceError } from "./evidence/types.js";
+import { objectivePromptsOn } from "./objective-digest.js";
 import { routingExplain, routingStatus } from "./routing-reads.js";
 import type { Config } from "./types.js";
 
@@ -34,6 +35,8 @@ export function routingRoutes(app: express.Express, deps: { evidence: EvidenceSt
         // The values a new run pins, so the status shows the prompt versions a new decision would use.
         publishHeads: (config.teams as { publishHeads?: boolean } | undefined)?.publishHeads !== false,
         entryTools: config.teams?.blackboard?.tools === true,
+        // Owner criteria on: a goal cycle start carries the record digest, so the status reads that version.
+        objectiveDigest: objectivePromptsOn(project),
         now: new Date().toISOString(),
       }));
     } catch (error) {

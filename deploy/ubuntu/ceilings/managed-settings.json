@@ -4,9 +4,16 @@
     "disableAutoMode": "disable",
     "deny": [
       "Read(//etc/infinite-github/**)",
+      "Read(//etc/infinite-*-github/**)",
       "Read(//srv/infinite-data/github-app/**)",
+      "Read(//srv/infinite-data/instances/*/github-app/**)",
       "Read(//srv/infinite-data/github-app-tokens/**)",
-      "Read(//run/infinite-key/**)"
+      "Read(//srv/infinite-data/instances/*/github-app-tokens/**)",
+      "Read(//srv/infinite-data/github-grant/**)",
+      "Read(//srv/infinite-data/instances/*/vault.key)",
+      "Read(//run/infinite-key/**)",
+      "Read(//run/infinite-*-key/**)",
+      "Read(//etc/infinite-egress/key)"
     ]
   }
 }

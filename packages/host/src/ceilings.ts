@@ -156,14 +156,18 @@ function tomlString(value: string): string {
 
 // Codex accepts exactly these two sandbox modes under the ceiling.
 const CODEX_SANDBOX_ALLOWED = new Set(["read-only", "workspace-write"]);
+// The built-in permission profiles that map to those two modes. `:danger-full-access` and any custom profile are
+// reported: the ceiling clamps a profile with full-disk write to read-only, and Codex refuses to start when it also
+// runs with approval_policy "never" (codex-cli 0.169.0, INF-257 rehearsal).
+const CODEX_PROFILE_ALLOWED = new Set([":read-only", ":workspace"]);
 
-// The value of `sandbox_mode` in a Codex `key=value` override, or undefined for any other key.
-function sandboxModeOverride(text: string): string | undefined {
+// The key and value of a Codex `key=value` override, for the two keys that select a sandbox; undefined otherwise.
+function sandboxOverride(text: string): { key: "sandbox_mode" | "default_permissions"; value: string } | undefined {
   const equals = text.indexOf("=");
   if (equals < 0) return undefined;
   const key = text.slice(0, equals).trim().replace(/^(["'])(.*)\1$/, "$2");
-  if (key !== "sandbox_mode") return undefined;
-  return tomlString(text.slice(equals + 1).trim());
+  if (key !== "sandbox_mode" && key !== "default_permissions") return undefined;
+  return { key, value: tomlString(text.slice(equals + 1).trim()) };
 }
 
 // Claude Code: a flag, a flag with its value as the next argument, or the flag joined to its value with "=".
@@ -184,7 +188,8 @@ function claudeHits(args: string[]): string[] {
 // (codex-cli 0.167.2 reads `-s=bogus` as the value `bogus`, parse-level probe).
 const attachedValue = (arg: string) => arg.slice(arg[2] === "=" ? 3 : 2);
 
-// Codex: an override, --sandbox, or -s is reported unless its value reads as exactly one of the allowed modes.
+// Codex: --sandbox, -s, or a sandbox_mode or default_permissions override is reported unless its value reads as exactly
+// one of the allowed modes or built-in profiles.
 // This is inverted on purpose. A hand-written reader cannot cover every TOML spelling, so an unusual but valid
 // spelling of an allowed mode can be reported too. That costs one warning line.
 function codexHits(args: string[]): string[] {
@@ -203,8 +208,9 @@ function codexHits(args: string[]): string[] {
     if (arg === "-c" || arg === "--config") override = args[index + 1];
     else if (arg.startsWith("--config=")) override = arg.slice("--config=".length);
     else if (arg.startsWith("-c") && !arg.startsWith("--")) override = attachedValue(arg);
-    const value = override === undefined ? undefined : sandboxModeOverride(override);
-    if (value !== undefined && !CODEX_SANDBOX_ALLOWED.has(value)) hits.push(`-c sandbox_mode=${JSON.stringify(value)}`);
+    const selected = override === undefined ? undefined : sandboxOverride(override);
+    const allowed = selected?.key === "default_permissions" ? CODEX_PROFILE_ALLOWED : CODEX_SANDBOX_ALLOWED;
+    if (selected && !allowed.has(selected.value)) hits.push(`-c ${selected.key}=${JSON.stringify(selected.value)}`);
   });
   return hits;
 }
@@ -249,7 +255,7 @@ export function checkCeiling(input: CeilingCheckInput): CeilingLine[] {
   }
 
   const forbidden = forbiddenLaunchFlags(provider, input.launchArgs);
-  const note = provider === "codex" ? "; a sandbox_mode value is reported unless it reads as exactly read-only or workspace-write, so a valid but unusual spelling can be a false positive" : "";
+  const note = provider === "codex" ? "; a sandbox_mode value is reported unless it reads as exactly read-only or workspace-write, and a default_permissions value unless it is :read-only or :workspace, so a valid but unusual spelling or a custom profile can be a false positive" : "";
   if (forbidden.length > 0)
     line("profile", "conflict", `configured launch profile uses ${forbidden.join(", ")}, which this ceiling forbids${note}`);
   else line("profile", "ok", "no configured launch flag that this ceiling forbids");

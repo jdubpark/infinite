@@ -122,8 +122,8 @@ test("the instance census wrapper runs the instance's census, and the instance s
 test("every tracked deploy file that names a first-instance path is rendered for an instance or kept for the first instance only", () => {
   const firstInstanceOnly = new Map([
     ["README.md", "the first instance's install guide; a second instance follows instances.md"],
-    ["ceilings.md", "the machine's one set of provider ceilings; its deny rules name the first instance's secret paths"],
-    ["ceilings/managed-settings.json", "one file for the whole machine; an instance's secret paths are not in its deny rules, as ceilings.md says"],
+    ["ceilings.md", "the machine's one set of provider ceilings; its deny rules cover every instance's secret paths by pattern"],
+    ["ceilings/managed-settings.json", "one file for the whole machine; its deny rules cover every instance's secret paths by pattern"],
     ["backup.py", "the machine's one backup job, which reads the whole data volume"],
     ["backups.md", "documents that one backup job"],
     ["infinite-backup.service", "runs that one backup job"],
@@ -141,6 +141,35 @@ test("every tracked deploy file that names a first-instance path is rendered for
   const templated = new Set(readdirSync(render()));
   const unlisted = tracked.filter(name => firstPath.test(readFileSync(join("deploy/ubuntu", name), "utf8")) && !templated.has(name) && !firstInstanceOnly.has(name));
   assert.deepEqual(unlisted, []);
+});
+
+// Claude Code reads Read rules as gitignore patterns: `*` stays inside one path segment, a trailing `/**` covers
+// everything below. Checked against Claude Code 2.1.325 with mid-path and in-segment wildcards (INF-257).
+function readRuleMatches(rule: string, path: string) {
+  const pattern = /^Read\(\/\/(.+)\)$/.exec(rule)?.[1];
+  if (!pattern) return false;
+  const source = `/${pattern}`.split(/(\/\*\*$|\*)/).map(part =>
+    part === "/**" ? "(?:/.*)?" : part === "*" ? "[^/]*" : part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join("");
+  return new RegExp(`^${source}$`).test(path);
+}
+
+test("the machine's one Claude ceiling denies reads of every instance's secret paths without naming an instance", () => {
+  const deny = (JSON.parse(readFileSync("deploy/ubuntu/ceilings/managed-settings.json", "utf8")) as { permissions: { deny: string[] } }).permissions.deny;
+  const denied = (path: string) => deny.some(rule => readRuleMatches(rule, path));
+  for (const name of [undefined, "alpha", "a-2"]) {
+    const args = name ? ["--instance", name] : [];
+    const refresh = file(name ? `infinite-${name}-github-refresh.service` : "infinite-github-refresh.service", args);
+    const issuer = /^ConditionPathExists=(\S+)$/m.exec(refresh)?.[1];
+    const tokens = /^ReadWritePaths=(\S+)$/m.exec(refresh)?.[1];
+    const vault = (JSON.parse(file("config.example.json", args)) as { keyFile: string }).keyFile;
+    const root = name ? `/srv/infinite-data/instances/${name}` : "/srv/infinite-data";
+    // The App key directory and the retained vault key are named by instances.md, not by a rendered file.
+    const paths = [issuer, `${tokens}/0123abcd.json`, vault, `${root}/github-app/app-key`, ...(name ? [`${root}/vault.key`] : [])];
+    for (const path of paths) assert.ok(path && denied(path), `${path} is not covered by a Read deny rule`);
+    assert.equal(denied(`${root}/workspaces/project-a/README.md`), false);
+  }
+  assert.equal(denied("/etc/infinite/config.example.json"), false);
+  assert.deepEqual(deny.filter(rule => /instances\/(?!\*\/)/.test(rule)), []);
 });
 
 test("the disk listing of a copy of the tracked deploy files matches the Git listing", t => {

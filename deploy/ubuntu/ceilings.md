@@ -13,7 +13,7 @@ Nothing here is installed on any machine by the repository. The steps below are 
 
 ## What the ceilings do
 
-- Claude Code: bypass-permissions mode and auto mode are turned off. Read rules deny the provider's read access to the GitHub App credential paths and the vault key.
+- Claude Code: bypass-permissions mode and auto mode are turned off. Read rules deny the provider's read access to the GitHub App credential paths, the GitHub grant key, the egress proxy key, and the vault key, for the first instance and for every [second instance](instances.md).
 - Codex: only the `read-only` and `workspace-write` sandbox modes are allowed.
 
 The ceilings bound what a provider may do on its own. The host still decides approvals. The ceiling does not approve anything.
@@ -26,17 +26,22 @@ Source: the Claude Code managed-settings and permissions documentation.
 | --- | --- | --- |
 | `permissions.disableBypassPermissionsMode: "disable"` | Entering `bypassPermissions` mode, including `--dangerously-skip-permissions`. The provider does not refuse to start: it runs the session in `default` mode instead. | Any other mode that the host passes with `--permission-mode`. |
 | `permissions.disableAutoMode: "disable"` | Auto mode, where the provider approves its own tool calls. | The host's own permission flow, which stays in charge. |
-| `permissions.deny` `Read(//etc/infinite-github/**)` | Provider file reads under the GitHub App issuer directory, which holds the App configuration. | A shell command that reads the same file. Bash is not covered by a `Read` rule. |
-| `permissions.deny` `Read(//srv/infinite-data/github-app/**)` | Provider file reads of the GitHub App private key directory. | A shell command that reads the same file. |
-| `permissions.deny` `Read(//srv/infinite-data/github-app-tokens/**)` | Provider file reads of the short-lived token cache. | A shell command that reads the same file. |
-| `permissions.deny` `Read(//run/infinite-key/**)` | Provider file reads of the vault key directory. | A shell command that reads the same file. |
+| `permissions.deny` `Read(//etc/infinite-github/**)`, `Read(//etc/infinite-*-github/**)` | Provider file reads under the GitHub App issuer directory, which holds the App configuration. | A shell command that reads the same file. Bash is not covered by a `Read` rule. |
+| `permissions.deny` `Read(//srv/infinite-data/github-app/**)`, `Read(//srv/infinite-data/instances/*/github-app/**)` | Provider file reads of the GitHub App private key directory. | A shell command that reads the same file. |
+| `permissions.deny` `Read(//srv/infinite-data/github-app-tokens/**)`, `Read(//srv/infinite-data/instances/*/github-app-tokens/**)` | Provider file reads of the short-lived token cache. | A shell command that reads the same file. |
+| `permissions.deny` `Read(//srv/infinite-data/github-grant/**)` | Provider file reads of the [GitHub grant key](github-proxy.md), which signs grants. | A shell command that reads the same file. |
+| `permissions.deny` `Read(//run/infinite-key/**)`, `Read(//run/infinite-*-key/**)`, `Read(//srv/infinite-data/instances/*/vault.key)` | Provider file reads of the vault key directory, and of a second instance's retained key copy. | A shell command that reads the same file. |
+| `permissions.deny` `Read(//etc/infinite-egress/key)` | Provider file reads of the [egress proxy key](egress.md). | A shell command that reads the same file. |
+
+Each pair is the first instance's path and the same path for every second instance, written as a pattern from the [instance layout](instances.md#names). Claude Code reads `Read` rules as gitignore patterns: `*` matches within one path segment, so `instances/*/github-app/**` covers `instances/NAME/github-app/` and `infinite-*-key` covers `infinite-NAME-key`. One file covers every instance on the machine, names no instance, and needs no change when an instance is added, so the hash check stays meaningful. A pattern also matches a directory of that shape that no instance uses; a deny rule there costs nothing. `tests/deploy-instance.test.ts` checks the patterns against the paths the instance renderer writes.
 
 A `Read` deny rule is a policy rule for the provider's file tool. It does not stop a shell command from reading a file that the agent account can read. The real controls are file modes and the credential helper. The issuer configuration is root-only (`0600`). The token cache is readable by the agent group on purpose, so a shell command can read a cached token. Only short-lived tokens belong in that directory. Keep the modes in `github-app.md` correct, and check them with `ls -l` after install.
 
-Two of these keys were checked against Claude Code 2.1.325 on 2026-11-14, passed through `--settings` on a development machine, not through the managed file:
+Checked against Claude Code 2.1.325:
 
-- A `Read(//ABSOLUTE/DIR/**)` deny rule refused the file tool with "File is in a directory that is denied by your permission settings".
-- With `permissions.disableBypassPermissionsMode` set to `"disable"`, a session started with `--dangerously-skip-permissions` reported the permission mode `default`. Without the key it reported `bypassPermissions`.
+- On 2026-11-14, through `--settings` on a development machine: a `Read(//ABSOLUTE/DIR/**)` deny rule refused the file tool with "File is in a directory that is denied by your permission settings".
+- On 2026-11-15, through `--settings` on a development machine: `Read(//ABSOLUTE/instances/*/github-app/**)`, `Read(//ABSOLUTE/run/infinite-*-key/**)`, and `Read(//ABSOLUTE/etc/infinite-*-github/**)` refused reads of `instances/NAME/github-app/FILE`, `run/infinite-NAME-key/FILE`, and `etc/infinite-NAME-github/FILE`, for a sample `NAME`, with the same message. Reads of `instances/NAME/notes.txt` and `run/infinite-key-notes/FILE` succeeded.
+- On 2026-11-15, through the installed managed file on Ubuntu 24.04 (arm64 container, systemd 255), as an agent account with no login: a session started with `--dangerously-skip-permissions`, `--permission-mode bypassPermissions`, or `--permission-mode auto` reported the permission mode `default` in its `stream-json` start event, then stopped with "Not logged in". With the managed file moved aside, the same flags reported `bypassPermissions`, `bypassPermissions`, and `auto`. So the file loads without a login, and both mode keys, `disableAutoMode` in this spelling included, take effect.
 
 Run `claude doctor` after install all the same. It reports settings-file validation errors and dropped entries. Adjust the rule text if it reports one.
 
@@ -61,7 +66,15 @@ Source: the Codex managed-configuration and config documentation.
 | --- | --- | --- |
 | `allowed_sandbox_modes = ["read-only", "workspace-write"]` | A session that runs with `danger-full-access`. The client falls back to a compatible value and notifies the user. | Approval policy. The host still passes its own approval settings. |
 
-This key is the legacy form. It limits `sandbox_mode`. The docs prefer permission profiles for Codex 0.138.0 or later. The host does not set `sandbox_mode` itself in its launch code. The key clamps whatever mode the CLI resolves, including a `-c` override. The docs do not say which Codex versions read `/etc/codex/requirements.toml` together with this key. Check the installed version on the host and run one session that tries `-c sandbox_mode="danger-full-access"`. The session should fall back. If it does not, the key is not in effect.
+This key is the legacy form. It limits `sandbox_mode`. The docs prefer permission profiles for Codex 0.138.0 or later. The host does not set `sandbox_mode` itself in its launch code. The key clamps whatever mode the CLI resolves, including a `-c` override, and also a permission profile: Codex maps the selected profile to a sandbox mode and checks that mode against this list.
+
+Checked against `codex-cli` 0.169.0 on 2026-11-15, through the installed file on Ubuntu 24.04 (arm64 container), as an agent account with no login:
+
+- `codex app-server` answered `configRequirements/read` with `allowedSandboxModes: ["read-only", "workspace-write"]`, so the file loads without a login.
+- An app-server `thread/start` with `sandbox: "danger-full-access"` and `approvalPolicy: "on-request"`, and one with `config: { default_permissions: ":danger-full-access" }`, both started with a `readOnly` sandbox and the warning "Configured value for `permission_profile` is disallowed by requirements; falling back to required value ... (set by /etc/codex/requirements.toml)". `sandbox: "workspace-write"` started as `workspaceWrite`.
+- `codex exec`, which runs with approval policy `never`, refused to start for `-c sandbox_mode="danger-full-access"`, `--sandbox danger-full-access`, `-c default_permissions=":danger-full-access"`, `--dangerously-bypass-approvals-and-sandbox`, and `--yolo`: "`approval_policy = "never"` cannot be used because requirements do not allow `sandbox_mode = "danger-full-access"`". With the file moved aside, each of these started with `sandbox: danger-full-access`.
+
+The fallback is `read-only`, not `workspace-write`. A launch profile that asks for full access therefore gets a session that cannot write, or no session at all with approval policy `never`.
 
 ### Keys deliberately not set
 
@@ -71,6 +84,7 @@ This key is the legacy form. It limits `sandbox_mode`. The docs prefer permissio
 - `mcp_servers` allowlist. An empty table disables every MCP server. The host passes `-c mcp_servers.*` overrides. Test first with each host server pinned by identity.
 - `[network_proxy]`. The managed proxy does not cover model traffic, MCP connections, or web search. It adds nothing for the team members' network-off sandbox. Egress control must be done at the host or container firewall.
 - `allowed_web_search_modes`. Not set. The host's own settings decide this.
+- `allowed_permission_profiles` and a managed `default_permissions`. Codex 0.138.0 and later read them. `allowed_sandbox_modes` already clamps every profile with full-disk write, as checked above, so the template does not set them. Setting a profile allowlist would also refuse the custom profiles that a project's config may define.
 
 ## Install and check
 
@@ -109,11 +123,11 @@ A `missing`, `changed`, `writable`, or `conflict` word prints as a warning. Doct
 Forbidden flags:
 
 - Claude Code: `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`, `--enable-auto-mode`, and `--permission-mode` with `bypassPermissions` or `auto`, each as a separate argument or joined with `=`. `--enable-auto-mode` is not in the installed help. It is checked anyway, because a flag can be accepted while hidden from help; a check for a flag that does not exist never matches.
-- Codex: `--dangerously-bypass-approvals-and-sandbox`, `--yolo` (a hidden alias: absent from `codex --help`, accepted by `codex-cli` 0.167.2 as shown by a parse-level probe), and any `--sandbox` or `-s` value, and any `sandbox_mode` in a `-c` or `--config` override, that is not exactly `read-only` or `workspace-write`.
+- Codex: `--dangerously-bypass-approvals-and-sandbox`, `--yolo` (a hidden alias: absent from `codex --help`, accepted by `codex-cli` 0.167.2 as shown by a parse-level probe), any `--sandbox` or `-s` value, and any `sandbox_mode` in a `-c` or `--config` override, that is not exactly `read-only` or `workspace-write`; and any `default_permissions` in a `-c` or `--config` override that is not exactly `:read-only` or `:workspace`.
 
-The Codex rule is an allow-list, so it reports a value it does not read as exactly one of the two allowed modes. Doctor reads a TOML string value only in its basic, literal, and multi-line forms, and it does not parse comments. A valid but unusual spelling of an allowed mode, such as a value with a trailing comment, is therefore reported. That costs one warning line.
+The Codex rule is an allow-list, so it reports a value it does not read as exactly one of the two allowed modes or the two built-in profiles. A custom permission profile is reported too, because doctor cannot see what it grants. Doctor reads a TOML string value only in its basic, literal, and multi-line forms, and it does not parse comments. A valid but unusual spelling of an allowed mode, such as a value with a trailing comment, is therefore reported. That costs one warning line.
 
-A flag may take its value as the next argument, after `=` (`--sandbox=VALUE`, `-s=VALUE`, `-c=KEY=VALUE`), or attached (`-sVALUE`, `-cKEY=VALUE`). The forms were checked against `codex-cli 0.167.2` and `claude` 2.1.325 help output and parse errors. Codex validates the `--sandbox` value at parse time. It does not validate the `-c` key, and whether it accepts a quoted key was not checked. The check reads the configured arguments only. It does not read a Codex profile or a configuration file that an argument names. It is a warning for the owner. The ceiling file is what clamps the mode.
+A flag may take its value as the next argument, after `=` (`--sandbox=VALUE`, `-s=VALUE`, `-c=KEY=VALUE`), or attached (`-sVALUE`, `-cKEY=VALUE`). The forms were checked against `codex-cli 0.167.2` and `claude` 2.1.325 help output and parse errors. Codex validates the `--sandbox` value at parse time. It does not validate the `-c` key, and whether it accepts a quoted key was not checked. The check reads the configured arguments only. It does not read a `config.toml`, a `--profile` layer, or a `[permissions.NAME]` table that a configuration file defines. It is a warning for the owner. The ceiling file is what clamps the mode.
 
 ## How the hash check works
 
@@ -140,10 +154,12 @@ Removing a ceiling removes the protection. Doctor then reports `missing`. Do thi
 ## Limits
 
 - The ceilings are machine-wide. Every account on this server that runs the provider CLI reads them. They do not apply to other machines.
-- The four `Read` deny rules name the first instance's paths. A second instance's agents read the same file, so the two mode keys apply to them, but its own issuer directory, key directory, token cache, and vault key directory are not named. File modes still protect those. Doctor compares the installed file with the shipped template, so adding an instance's paths by hand makes the hash check report `changed`.
-- The install script has not been run. It needs root on Linux, and no test in this repository covers it.
+- The `Read` deny rules cover the paths of the [instance layout](instances.md#names). An instance whose secrets live elsewhere is not covered. Doctor compares the installed file with the shipped template, so adding a path by hand makes the hash check report `changed`.
+- The install script, its check mode, and doctor's ceiling lines ran on Ubuntu 24.04 with systemd 255 (arm64 container, 2026-11-15): a second run changed nothing, a removed file and an edited file were reported, and a group-writable `/etc/codex` stopped the check and was secured by the next install. It has not run on the server, and no test in this repository runs it.
+- Claude Code also merges `/etc/claude-code/managed-settings.d/*.json` after this file, in name order; for a single value, the later file wins. Doctor and `--check` do not read that directory. The install script keeps `/etc/claude-code` root-only, so only root can add a file there. Keep the directory absent.
+- A Claude login with server-managed settings (a Team or Enterprise organization that delivers them) ranks above this file, and by default Claude Code then ignores the file. The agent account owns its own login. Keep it on an account whose organization delivers no server-managed settings, or one whose remote policy sets the same keys. `/status` shows the source in use.
 - A `Read` deny rule does not block shell commands. See the note in the Claude Code table.
 - Doctor reads the installed files as the account that runs it. A file the account cannot read is reported as `changed`.
-- The Claude Code `disableAutoMode` key has two spellings in the vendor documentation. This template uses the one from the permissions page. Confirm it with `claude doctor` after install.
-- Nothing here has run against a real server or through the managed file path. Installing the files is the first step. The tests listed above still need to run on the host.
+- The Claude Code `disableAutoMode` key has two spellings in the vendor documentation. This template uses the one from the permissions page, and Claude Code 2.1.325 honored it in the rehearsal (`--permission-mode auto` ran as `default`). Confirm it with `claude doctor` after an upgrade.
+- The managed file path has run only in the rehearsal container, without a login. Run one logged-in session of each provider on the server after install, and read the Claude `/status` source line.
 - A session that the ceiling moves from bypass mode to `default` mode starts to raise permission requests. Check the `profile` line of `infinite doctor` before installing, and remove a forbidden flag from the launch profile first.

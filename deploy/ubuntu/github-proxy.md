@@ -354,14 +354,14 @@ Verify by reading, not by listing. Each of these must print nothing:
 ```sh
 sudo getfacl -R -s -p "$TOKENS"
 sudo -u infinite-agent test -x "$TOKENS" && echo "AGENT CAN ENTER $TOKENS"
-sudo find "$TOKENS" -mindepth 1 -maxdepth 1 -type f -print0 |
-  while IFS= read -r -d '' file; do
-    sudo -u infinite-agent head -c 1 "$file" >/dev/null 2>&1 && echo "AGENT CAN READ $file"
-  done
+sudo find "$TOKENS" -mindepth 1 -maxdepth 1 -type f -exec sh -c '
+  for file; do sudo -u infinite-agent head -c 1 "$file" >/dev/null 2>&1 && echo "AGENT CAN READ $file"; done' sh {} +
 ```
 
-The last loop tries to read one byte of every token file by its full name as the
-agent account and discards it. Then:
+The last command tries to read one byte of every token file by its full name as
+the agent account and discards it. It runs in any POSIX shell; a loop over
+`read -d ''` fails in `dash`, which `sh` is on Ubuntu, and then prints nothing
+for a readable file. Then:
 
 ```sh
 curl -s http://127.0.0.1:8417/health
@@ -454,3 +454,13 @@ on, restore them with `sudo setfacl --restore=/root/github-token-acl-before.txt`
 - `/health` rules out ACLs only on the token directory and its entries, and reads
   group membership from `/etc/passwd` and `/etc/group`; groups from another
   directory service are not seen.
+- Rehearsed, not deployed. On 2026-11-15, the steps of
+  [github-app.md](github-app.md) and then steps 1 to 5 and 7 here ran as written on
+  Ubuntu 24.04 (an arm64 container, gh 2.45), against a stand-in GitHub API with a
+  throwaway certificate authority. These passed: the clone, a push to the
+  session's own branch, the refusal to push a tag or delete a branch, the
+  delivery and member grants, the refusal without a grant, `gh pr list` through
+  the broker, the refusal of `gh api` and `gh run`, host Git with a `host` grant,
+  `"tokenCache":"proxy-only"` after step 7, and a timer-started refresh.
+  Step 6, the team launcher, did not run. Read `/health` and `doctor` on the
+  server.

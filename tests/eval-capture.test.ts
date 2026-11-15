@@ -42,6 +42,12 @@ class FakeGit implements CaptureGit {
   private readonly gates = new Map<string, { promise: Promise<void>; open: () => void }>();
   /** When true, every call never settles, as a hung Git process would. */
   silent = false;
+  /** How often the capture closed this Git. */
+  closes = 0;
+
+  close(): void {
+    this.closes += 1;
+  }
 
   hold(id: string): void {
     if (this.gates.has(id)) return;
@@ -433,6 +439,13 @@ test("a stalled read refuses new work, never the run", async () => {
     assert.equal(refused?.state, "rejected");
     assert.equal(refused?.reason, "capture-failed");
     assert.equal(held.git.calls.includes(`names:${COMMIT}`), false, "the sixth job starts no read");
+    // The held reads end late. Every stall is counted off again, so capture takes new work.
+    held.git.releaseAll();
+    await SETTLE();
+    await SETTLE();
+    held.capture.integrated(start({ memberId: "c7" }));
+    await held.capture.idle();
+    assert.equal(taskRow(held.store, "c7")?.state, "captured", "after the stalled reads ended, a new task is captured");
   } finally {
     await finish(held);
   }
@@ -441,19 +454,24 @@ test("a stalled read refuses new work, never the run", async () => {
 test("closing stops the read chain", async () => {
   const w = world({ capture: true, deadlineMs: 60_000 });
   try {
-    w.git.hold(COMMIT);
+    // The name read answers, and the job waits on its next read: the patch from the run's base to the member's base.
+    w.git.hold(MEMBER_BASE);
     w.capture.integrated(start());
     await SETTLE();
+    await SETTLE();
+    assert.deepEqual(w.git.calls, [`names:${COMMIT}`, `patch:${MEMBER_BASE}`]);
     w.capture.close();
+    assert.equal(w.git.closes, 1, "close stops the Git reads in flight");
     let timer: NodeJS.Timeout | undefined;
     const waiting = new Promise<string>(resolve => { timer = setTimeout(() => resolve("waiting"), 500); });
     const outcome = await Promise.race([w.capture.idle().then(() => "idle"), waiting]);
     clearTimeout(timer);
     assert.equal(outcome, "idle");
-    w.git.release(COMMIT);
+    w.git.release(MEMBER_BASE);
     await SETTLE();
     await SETTLE();
-    assert.deepEqual(w.git.calls, [`names:${COMMIT}`]);
+    // The job went on after close settled its wait, and it started no further read.
+    assert.deepEqual(w.git.calls, [`names:${COMMIT}`, `patch:${MEMBER_BASE}`]);
   } finally {
     await finish(w);
   }

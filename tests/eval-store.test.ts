@@ -388,6 +388,13 @@ test("a sweep pass visits a bounded number of projects, and the next pass goes o
     const pass = () => f.store.write(tx => sweepEvalTasks(tx, NOW, [], 365, SWEEP_BATCH, cursor));
     assert.equal(pass(), 64);
     assert.equal(pass(), 6);
+    // The walk reached its end, so the next pass starts over: a second old row in every project is found the same way.
+    for (let i = 0; i < 70; i++) {
+      const projectId = `project-${String(i).padStart(3, "0")}`;
+      f.store.write(tx => insertMarker(tx, captureStart("m-old-2", COMMIT, { runId: `run-walk-${i}`, projectId, at: at(400) }), { state: "captured", capsule: capsule() }, NOW));
+    }
+    assert.equal(pass(), 64);
+    assert.equal(pass(), 6);
     assert.equal(pass(), 0);
     assert.equal(count(f, "eval_tasks"), 70);
     assert.equal(count(f, "eval_tasks", "member_id=?", "m-young"), 70);

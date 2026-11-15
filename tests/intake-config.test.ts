@@ -97,6 +97,11 @@ test("answering questions needs direct requests, and classifying needs both answ
   const defaults = parsed({}).intake!.slack!;
   assert.deepEqual([defaults.answerQuestions, defaults.classify], [false, false]);
 });
+test("jev.sessionReadings defaults to true and accepts false", () => {
+  const apiKeyFile = privateFile("jev-key");
+  assert.equal(parsed({}, { jev: { apiKeyFile } }).jev!.sessionReadings, true);
+  assert.equal(parsed({}, { jev: { apiKeyFile, sessionReadings: false } }).jev!.sessionReadings, false);
+});
 test("intake refuses a configuration without the owner's creator ID when a thread is required", () =>
   assert.throws(() => validate({ linear: { ...base.linear, creatorId: undefined }, requireSlackThread: true }), /creatorId/));
 test("intake refuses a configuration without the owner's creator ID when no thread is required", () =>

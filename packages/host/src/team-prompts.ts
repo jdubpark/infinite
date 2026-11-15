@@ -57,10 +57,11 @@ export type TeamContextSnapshot = {
   memberReports: Pick<TeamMember, "memberId" | "revision" | "role" | "taskId" | "status" | "baseCommit" | "report" | "stoppedReason">[];
   feedback: string | null;
 };
-/** A project copy without its private feature map. A member reads the labels it may set, never the map. */
-function withoutFeatures<T extends object>(project: T): T {
+/** A project copy without its private settings. A member reads the labels it may set, never the feature map or the eval block. */
+function withoutPrivateSettings<T extends object>(project: T): T {
   const copy = { ...project } as Record<string, unknown>;
   delete copy.features;
+  delete copy.eval;
   return copy as T;
 }
 /** Full prompt evidence saved outside the checkout's tracked and untracked project files. */
@@ -81,13 +82,13 @@ export function teamContext(run: TeamRun, feedback?: string, configuredProject?:
       permissions: run.permissions,
       permissionsRevokedAt: run.permissionsRevokedAt,
       goal: run.goal,
-      handoff: run.handoff && { ...run.handoff, project: withoutFeatures(run.handoff.project) },
+      handoff: run.handoff && { ...run.handoff, project: withoutPrivateSettings(run.handoff.project) },
       verification: run.verification,
       establishChecks: run.establishChecks,
       delivery: run.delivery,
       lineup: run.lineup,
     },
-    ...(configuredProject ? { configuredProject: withoutFeatures(configuredProject) } : {}),
+    ...(configuredProject ? { configuredProject: withoutPrivateSettings(configuredProject) } : {}),
     ...(run.linear ? { linear: run.linear } : {}),
     ...(run.brief ? { brief: run.brief } : {}),
     ...(run.discovery ? { discovery: run.discovery } : {}),

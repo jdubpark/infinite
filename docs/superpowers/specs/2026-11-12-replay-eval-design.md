@@ -1,6 +1,6 @@
 # Replay eval (INF-185)
 
-Date: 2026-11-12. Status: design for review. Part of `2026-11-12-self-improving-teams-design.md`.
+Date: 2026-11-12. Status: design for review. Part of `2026-11-12-self-improving-teams-design.md`. Amended 2026-11-14: part 1, the captured tasks of part 2, and owner decision 5, for the capture slice (delivery step 1).
 
 ## Intent
 
@@ -73,12 +73,14 @@ The first version supports projects in `github` source mode, because only they h
 
 ```ts
 type EvalProjectConfig = {
-  testPaths: { prefixes: string[], suffixes: string[] }
+  capture?: boolean                       // amended 2026-11-14: turns capture on
+  testPaths?: { prefixes: string[], suffixes: string[] }  // amended: optional at this stage
+  retentionDays?: number                  // amended 2026-11-14: 30 to 3650, default 365
   gradingPaths: string[]                  // runner configuration, package scripts, test helpers
   focusedTest: TeamCommand                // argv with {files} and {report} placeholders
   reportFormat: "junit" | "tap"           // what focusedTest writes to {report}
   guardChecks?: TeamCommand[]             // default: the configured checks
-  excludeAreas: string[]                  // interface areas (contract C4)
+  excludeAreas?: string[]                 // interface areas (contract C4); amended: optional at this stage
   candidateProfiles?: TeamModelProfile[]  // approved for replay only
   memberProfile?: string                  // launch profile of the eval identity
   graderProfile?: string                  // launch profile of the grader identity
@@ -87,6 +89,8 @@ type EvalProjectConfig = {
 ```
 
 The harness replaces `{files}` with the hidden test paths and `{report}` with a file outside the checkout. A job may test a profile only from the project's lineup pools or from `candidateProfiles`, which no prompt shows. *(My call: the owner can measure a new model before it receives real work.)*
+
+*Amended 2026-11-14 (capture slice).* The first slice parses four fields, all optional: `capture`, `testPaths`, `excludeAreas`, and `retentionDays`. `capture` turns capture on, and the host reads it only for a `github` project. `retentionDays` is the number of days a captured task is kept. Without `testPaths`, the host's test-path rule applies. The other fields above are parsed as optional in delivery step 2, and a job that needs one refuses to start until it is set. *(My call: a block written for this slice stays valid when step 2 adds fields.)*
 
 ### Part 2. The corpus
 
@@ -119,16 +123,18 @@ The replay base is the tree a trial starts from: the anchor commit with `baseDel
 
 A capsule stores prompt inputs, so a trial renders them with the prompt builder under test (`teamPrompt`). A patch stores a tree change, so no eval task depends on a commit that retention deletes. Both are rows in the evidence store, limited to 64 KiB and 1 MiB. A private ref in the mirror would expose the reference to agents.
 
-**Captured tasks.** In the host step that records `TeamTask.commit`, the host also reads two binary patches from the integration checkout. One runs from the run's `baseCommit` to the member's `baseCommit`. The other runs from there to the task commit. The host reads them with a streaming reader, because `teamCommand` truncates output. A failed read records `capture-failed` and never blocks integration. The capsule keeps only the steering entries and owner answers dated before the member started.
+**Captured tasks.** *Amended 2026-11-14 (capture slice):* At integration the host writes a marker row and returns. Two binary patches and their name lists are read in the background, from the integration checkout: one from the run's `baseCommit` to the member's `baseCommit`, and one from there to the task commit. The reads start at integration and finish in the background, so no read delays, takes a slot from the enrichment limit, or fails the integration. The host reads the patches with a streaming reader, because `teamCommand` truncates output. A failed or refused patch leaves that part missing, and the task is rejected `patch-missing`. *Amended 2026-11-14 (capture slice, after the first review):* an empty reference read counts as missing too, because a captured task has at least two files; an empty base delta stays stored. A failed name read records `capture-failed`. The capsule keeps only the steering entries and owner answers dated before the member started. A capsule over 64 KiB is refused, never cut.
 
 A captured task becomes a `candidate` when four conditions hold:
 
 1. The outcome ledger marks its attempt `accepted`.
-2. The run's `baseCommit` is on the mirror's base branch.
-3. No later commit of the run changed the files in the task's `changedPaths`.
+2. The run's `baseCommit` is on the mirror's base branch. *Amended 2026-11-14: the host runs form 1 of the base scan, `git merge-base --is-ancestor`, in the mirror against the mirror's head. Only exit 0 proves it. Any other result is `base-not-proven`.*
+3. No later commit of the run changed a file in the task's reference. *Amended 2026-11-14: the check uses the capture's own name read of the reference, up to 500 names. It does not use `changedPaths`, which the code caps at 200 paths and marks `truncated`.*
 4. The reference changes at least one test file and one other file.
 
-Otherwise it is `rejected` with a code such as `reference-ambiguous` or `no-hidden-tests`. When `deleteRecord` removes a run whose status is `cancelled`, the host deletes that run's captured tasks in the same step. *(My call: a deleted cancelled run leaves no data.)* Every other eval task stays until the owner-set eval retention removes it (contract C1).
+Otherwise it is `rejected` with one reason code. *Amended 2026-11-14:* the start codes are `ui-changes`, `start-unknown`, `capsule-too-large`, `excluded-area-unknown`, and `capture-busy`. The material codes are `capture-failed`, `reference-too-wide`, `excluded-area`, `no-hidden-tests`, `patch-too-large`, and `corpus-full`. The promotion codes are `ledger-missing`, `ledger-withheld`, `excluded`, `same-model-review`, `not-accepted`, `acceptance-unknown`, `patch-missing`, `reference-unknown`, `reference-ambiguous`, `base-not-proven`, `features-unknown`, and `unreadable`. The reason table is in `docs/teams.md`, under Eval capture.
+
+When `deleteRecord` removes a run whose status is `cancelled`, the host deletes that run's captured tasks in the same step. *(My call: a deleted cancelled run leaves no data.)* *Amended 2026-11-14:* the store's `deleteRun` hook makes the decision. A run with no readable status counts as cancelled, because keeping text for a run whose fate is unknown is the riskier error. Any other status stamps the tasks with a deletion time, and the eval retention removes them later (contract C1). *Amended 2026-11-14 (capture slice, after the first review):* the rule is a keep list, not a delete list. A deleted run keeps its tasks only when its last `run.deleted` or `run.settled` status is `merged` or `no-change`. Any other status (`cancelled`, `blocked`, `ready-for-review`, or anything else), no status event, or an event that does not open deletes the tasks and their sealed material. The host deletes a run record only when the run is cancelled, merged, or no-change, so another last status means that later events were lost. A `blocked` run keeps no tasks, because a run that stayed blocked may never reach its `run.deleted` event.
 
 **Mined tasks.** A scanner walks the first-parent history of the base branch in the mirror, newest first. A commit yields a `candidate` task when its diff against its first parent changes at least one test file and one other file. The diff must stay under 30 files and 1,500 changed lines, must not be a revert, and must touch no excluded area. The first parent is the anchor.
 
@@ -381,6 +387,7 @@ A later version needs a runnable interface on the host, which INF-110 tracks. It
 3. When replay may spend subscription limits. **Decided 2026-11-13:** the cap is the replay share, 50% of a standing budget of a quarter of the weekly fuse. Still open: the windows and the fallback estimate.
 4. Whether tasks with a `commit-message` prompt may feed router priors. The export keeps them apart either way.
 5. How long eval material stays in host state, and whether a captured task may outlive the deleted record of a cancelled run. The default for the second is no.
+   *Amended 2026-11-14: the defaults that the capture slice ships. The owner has not decided them, and they stand until the owner changes them.* Eval material stays 365 days, set per project by `retentionDays` (30 to 3650). A captured task does not outlive a deleted run that did not merge, need no change, or reach review (*amended 2026-11-14, after the first review*). Caps: a capsule is 64 KiB, a patch is 1 MiB, a project holds 20,000 tasks and 128 MiB of material, and the host holds 512 MiB of material.
 
 ## Left to the builder
 

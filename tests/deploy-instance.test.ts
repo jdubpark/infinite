@@ -122,11 +122,14 @@ test("the instance census wrapper runs the instance's census, and the instance s
 test("every tracked deploy file that names a first-instance path is rendered for an instance or kept for the first instance only", () => {
   const firstInstanceOnly = new Map([
     ["README.md", "the first instance's install guide; a second instance follows instances.md"],
+    ["ceilings.md", "the machine's one set of provider ceilings; its deny rules name the first instance's secret paths"],
+    ["ceilings/managed-settings.json", "one file for the whole machine; an instance's secret paths are not in its deny rules, as ceilings.md says"],
     ["backup.py", "the machine's one backup job, which reads the whole data volume"],
     ["backups.md", "documents that one backup job"],
     ["infinite-backup.service", "runs that one backup job"],
     ["commissioning.md", "the record of commissioning the machine and its first instance"],
     ["github-app.md", "the first instance's GitHub App setup; instances.md gives an instance's own"],
+    ["github-proxy.md", "the first instance's GitHub credential proxy; a second instance needs its own key, account, port, unit, and token directory"],
     ["public-relay.md", "the relay and the first instance's connection to it; instances.md registers an instance"],
     ["instances.md", "names first-instance paths to tell them apart from an instance's"],
     ["jevcode-wrapper.sh", "repository briefings, which an instance runs without until an instance wrapper exists"],

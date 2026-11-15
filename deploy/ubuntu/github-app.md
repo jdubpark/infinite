@@ -196,3 +196,8 @@ GitHub stops discovery-based renewal. If the repository is also listed in
 part of that owner operation. Agent accounts sharing a Unix identity can read
 that identity's token files; this is repository-scoped GitHub authority, not
 filesystem isolation between agents or projects.
+
+To take the token cache away from the agent account, install the
+[GitHub credential proxy](github-proxy.md). Sessions then receive host-signed
+grants limited to one repository, named operations, and named branches, and the
+proxy adds the token only after checking each request.

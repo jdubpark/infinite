@@ -49,9 +49,16 @@ export const missionReportSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("blocked"), summary: z.string().trim().min(1).max(4000), blocker: blockerEvidenceSchema.optional() }).strict(),
   /** Ends the attempt without a decision; the next subteam event or owner input starts another. */
   z.object({ kind: z.literal("wait"), summary: z.string().trim().min(1).max(2000) }).strict(),
+  /** Ends the attempt and asks the host to start another at a time; it schedules a look and decides nothing. */
+  z.object({ kind: z.literal("follow-up"), inMinutes: z.number().int().min(5).max(10080), reason: z.string().trim().min(1).max(500), check: z.string().trim().min(1).max(1000) }).strict(),
 ]);
 export type MissionReport = z.infer<typeof missionReportSchema>;
-export const missionReportEnvelopeSchema = z.object({ requestId: z.uuid(), missionId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: missionReportSchema }).strict();
+/** The coordinator's own words for a later conversation. Kept in the stored record only; never host fact. */
+export const missionNoteSchema = z.string().trim().min(1).max(2000)
+  .describe("Optional. What the mission state does not show: decisions and their reasons, what you are waiting for, and what to check next.");
+/** The mission_report tool input. */
+export const missionReportArgumentsSchema = z.object({ report: missionReportSchema, note: missionNoteSchema.optional() }).strict();
+export const missionReportEnvelopeSchema = z.object({ requestId: z.uuid(), missionId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: missionReportSchema, note: missionNoteSchema.optional() }).strict();
 
 export type MissionStatus = "planning" | "working" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "cancelled";
 export interface MissionSubtask extends MissionSubtaskPlan {
@@ -74,6 +81,16 @@ export interface MissionDecision {
   answer?: string;
   answeredAt?: string;
   answeredBy?: "owner" | "coordinator";
+}
+/** A time the coordinator asked to look again. `fired` means the host woke the coordinator; it records no outcome. */
+export interface MissionFollowUp {
+  id: string;
+  dueAt: string;
+  reason: string;
+  check: string;
+  createdAt: string;
+  state: "open" | "fired" | "cancelled";
+  settledAt?: string;
 }
 export type MissionOrigin = { kind: "intake"; issueId: string; identifier: string; url: string; rule: string };
 export type MissionInputSource = "slack";
@@ -105,6 +122,8 @@ export interface Mission {
   steering: { text: string; revision: number; at: string }[];
   events: { at: string; text: string }[];
   result?: { summary: string; revision: number; at: string };
+  /** Open follow-ups and the 10 most recently settled. Absent on missions that never set one. */
+  followUps?: MissionFollowUp[];
   /** Computed on read from the coordinator and subteams; never stored. */
   usage?: UsageRollup;
 }

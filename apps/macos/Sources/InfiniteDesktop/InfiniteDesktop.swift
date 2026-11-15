@@ -285,6 +285,7 @@ struct DesktopView: View {
         VStack(spacing: 0) {
             // Session panes stay mounted underneath Home, Cost, missions, and team dashboards, so switching back is instant.
             let covered = app.active == nil || app.showingHome || app.showingCost || app.showingUnderstanding || missionModel != nil || teamModel != nil
+            if app.active != nil { haltBanners }
             ZStack {
                 Group {
                     if app.mounted.isEmpty {
@@ -309,6 +310,15 @@ struct DesktopView: View {
                 else if let teamModel { TeamDetailView(app: app, model: teamModel).id(teamModel.id) }
             }
         }.frame(maxWidth: .infinity, maxHeight: .infinity).background(Palette.background)
+    }
+    /// A host halt shows on every page; a project halt on the pages of the host projects it holds, and as one line on the overview.
+    @ViewBuilder private var haltBanners: some View {
+        if app.showingUnderstanding { HaltBanners(app: app, page: .projects(app.haltRepoIDs(group: app.understandingWorkspaceID))) }
+        else if app.showingHome { HaltBanners(app: app, page: app.projectFilter.map { .projects(app.haltRepoIDs(group: $0)) } ?? .overview) }
+        else if app.showingCost { HaltBanners(app: app, page: .projects([])) }
+        else if let missionModel { MissionHaltBanners(app: app, model: missionModel) }
+        else if let teamModel { TeamHaltBanners(app: app, model: teamModel) }
+        else { HaltBanners(app: app, page: .projects(app.visibleIDs.compactMap { id in app.sessions.first { $0.id == id }?.project })) }
     }
     private var welcome: some View {
         VStack(spacing: 14) {

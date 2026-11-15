@@ -151,7 +151,7 @@ export function PermissionOverview({ onSelect }: { onSelect: (id: string) => voi
   return <div className="team-page permission-page">
     <div className="team-page-heading"><div><p className="team-eyebrow">Permission decisions</p><h1>What the permission agent decided.</h1>
       <p className="quiet">Every request it decides is recorded with its evidence, its reviewers and its delivery. Select a decision to read its record. Marking a decision wrong records your judgment; it changes no decision.</p></div></div>
-    {status?.agent === "inactive" && <p className="team-notice" role="status">The permission agent is not active on this host yet. Requests are handled as before.</p>}
+    {status?.agent === "inactive" && <p className="team-notice" role="status">The permission agent is not ready on this host, so it serves no request. Requests are handled as before.</p>}
     <section className="team-section"><div className="team-section-heading"><h2>Decision rate</h2><span className="quiet" role="status">{view.stale ? "Showing last received figures" : view.fresh ? "Up to date" : view.failed ? "Figures unavailable" : "Loading…"}</span></div>
       <dl className="goal-budget">{figure("Last hour", status?.rates?.lastHour)}{figure("Last 24 hours", status?.rates?.lastDay)}</dl></section>
     <section className="team-section"><h2>Above the usual rate</h2>

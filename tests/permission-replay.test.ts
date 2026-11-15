@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 import { demoProfile, startHost, type Host } from "./helpers.js";
 
 const exec = promisify(execFile);
-const INACTIVE = "The permission agent is not active on this host yet. Requests are handled as before; this record takes effect when the agent is activated.";
+const INACTIVE = "The permission agent is not ready on this host, so it serves no request. Run infinite permissions status to see why. Requests are handled as before; this record takes effect when the host is ready.";
 const SET_FILE = resolve("tests/fixtures/permission-replay-set.json");
 const FIXTURE = resolve("tests/fixtures/permission-reviewer.mjs");
 
@@ -72,7 +72,8 @@ test("an owner replay measures the tiers, makes the host ready, delivers nothing
     }
 
     const status = JSON.parse((await permissions("status", "--json")).stdout);
-    assert.equal(status.agent, "inactive");
+    // A current result under the threshold is the last thing readiness needs: the agent now serves delegated workspaces.
+    assert.equal(status.agent, "active");
     assert.deepEqual(status.readiness, { ready: true, reasons: [] });
     assert.equal(status.replay.latest.id, result.id);
     assert.equal(status.replay.latest.cases, 20);
@@ -89,7 +90,7 @@ test("an owner replay measures the tiers, makes the host ready, delivers nothing
     const after = await permissions("status");
     assert.match(after.stdout, /^Permission agent: ready$/m);
     assert.match(after.stdout, /^Replay: 20 cases on \S+, miss rate 6\.7% \(1 of 15, 95% interval /m);
-    assert.equal(after.stdout.trimEnd().split("\n").at(-1), INACTIVE);
+    assert.ok(!after.stdout.includes(INACTIVE));
   } finally {
     if (host) await host.stop();
     rmSync(bin, { recursive: true, force: true });

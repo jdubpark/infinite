@@ -40,7 +40,7 @@ type ReopenResult = { decisionId: string; reject: string; code: string; assignme
 type UnlockResult = { assignment: string; wasLocked: boolean; locked: boolean };
 
 const clean = (value: unknown, limit = 500) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, limit);
-const INACTIVE_NOTICE = "The permission agent is not active on this host yet. Requests are handled as before; this record takes effect when the agent is activated.";
+const INACTIVE_NOTICE = "The permission agent is not ready on this host, so it serves no request. Run infinite permissions status to see why. Requests are handled as before; this record takes effect when the host is ready.";
 const STATUS_USAGE = "Usage: infinite permissions status [--json]";
 const DELEGATE_USAGE = "Usage: infinite permissions delegate (--workspace W | --all) [--direction TEXT | --clear-direction] [--request-id UUID]";
 const REVOKE_USAGE = "Usage: infinite permissions revoke --workspace W [--request-id UUID]";

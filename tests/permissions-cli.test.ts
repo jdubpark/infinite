@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { startHost, type Host } from "./helpers.js";
 
 const exec = promisify(execFile);
-const INACTIVE = "The permission agent is not active on this host yet. Requests are handled as before; this record takes effect when the agent is activated.";
+const INACTIVE = "The permission agent is not ready on this host, so it serves no request. Run infinite permissions status to see why. Requests are handled as before; this record takes effect when the host is ready.";
 
 test("infinite permissions delegates, reports, and revokes workspaces through the owner CLI", { timeout: 120000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "permissions-cli-"));

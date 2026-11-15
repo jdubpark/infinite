@@ -10,6 +10,7 @@
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceModule, EvidenceTx } from "./evidence/types.js";
 import type { PermissionDeliveryService, PermissionHandled, PermissionInteractiveTarget, PermissionPipeline } from "./permission-agent-types.js";
+import type { InterruptClass } from "./permission-policy.js";
 
 /** The last recorded delivery state of one raised request. */
 export type DeliveryLedgerState = "intent" | "receipt" | "refusal" | "uncertain" | "stale";
@@ -86,8 +87,8 @@ const holderOf = (handled: PermissionHandled): Holder =>
 export class InteractivePermissionDelivery implements PermissionDeliveryService {
   private readonly inFlight = new Map<string, Promise<PermissionHandled>>();
   private readonly finished = new Map<string, Finished>();
-  /** The holder of each pending dialog by `sessionId:promptId`, for the notifier. */
-  private readonly prompts = new Map<string, Holder>();
+  /** The holder of each pending dialog by `sessionId:promptId`, for the notifier, with the class an owner result named. */
+  private readonly prompts = new Map<string, { holder: Holder; interruptClass?: InterruptClass }>();
   /** Requests whose delivery result is unknown in this process, kept even when the ledger write failed. */
   private readonly unknown = new Set<string>();
   private readonly sources = new Set<PermissionDeliverySource>();
@@ -122,7 +123,7 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
   holder(sessionId: string, promptId: number): "agent" | "owner" | "undecided" {
     if (!this.active()) return "owner";
     const known = this.prompts.get(`${sessionId}:${promptId}`);
-    if (known) return known;
+    if (known) return known.holder;
     for (const source of this.sources) {
       try { if (source.claims(sessionId, promptId)) return "undecided"; }
       catch { /* An adapter that cannot answer claims nothing. */ }
@@ -130,20 +131,28 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
     return "owner";
   }
 
+  /** The host's class identifier for a dialog that a class rule or an `owner` verdict left to the owner. Never model text. */
+  ownerClass(sessionId: string, promptId: number): InterruptClass | undefined {
+    if (!this.active()) return undefined;
+    const known = this.prompts.get(`${sessionId}:${promptId}`);
+    return known?.holder === "owner" ? known.interruptClass : undefined;
+  }
+
   private promptKey(target: PermissionInteractiveTarget) {
     return target.request.prompt ? `${target.request.requester.sessionId}:${target.request.prompt.id}` : undefined;
   }
 
-  private setHolder(target: PermissionInteractiveTarget, holder: Holder) {
+  private setHolder(target: PermissionInteractiveTarget, holder: Holder, interruptClass?: InterruptClass) {
     const key = this.promptKey(target);
     if (!key) return;
     this.prompts.delete(key);
-    this.prompts.set(key, holder);
+    this.prompts.set(key, interruptClass ? { holder, interruptClass } : { holder });
     while (this.prompts.size > MEMORY_LIMIT) this.prompts.delete(this.prompts.keys().next().value!);
   }
 
   private remember(target: PermissionInteractiveTarget, handled: PermissionHandled): PermissionHandled {
-    this.setHolder(target, holderOf(handled));
+    // Only an owner result names a class. An undeliverable request is a host limit and carries none.
+    this.setHolder(target, holderOf(handled), handled.handled && handled.result === "owner" ? handled.interruptClass : undefined);
     this.finished.delete(target.request.id);
     this.finished.set(target.request.id, { handled: structuredClone(handled), at: this.now() });
     while (this.finished.size > MEMORY_LIMIT) this.finished.delete(this.finished.keys().next().value!);

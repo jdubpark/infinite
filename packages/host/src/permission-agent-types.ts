@@ -278,6 +278,11 @@ export interface PermissionDeliveryService {
    * still decide it, the owner otherwise.
    */
   holder(sessionId: string, promptId: number): "agent" | "owner" | "undecided";
+  /**
+   * The interrupt class for which a pending request was left to the owner: a class rule or an `owner` verdict.
+   * Undefined for any other request, including an undeliverable one, whose cause is a host limit and not a class.
+   */
+  ownerClass?(sessionId: string, promptId: number): InterruptClass | undefined;
 }
 
 /* ---------------------------------------------------------------- headless channel */

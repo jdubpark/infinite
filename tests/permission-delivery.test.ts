@@ -125,6 +125,7 @@ test("a reject is delivered only through a recognised one-shot reject option, wi
   assert.equal(refused.handled && refused.result, "undeliverable");
   assert.equal(noReject.answers.length, 0, "the accept option is never used for a reject");
   assert.equal(service.holder("session-1", 8), "owner");
+  assert.equal(service.ownerClass("session-1", 8), undefined, "an undeliverable request is a host limit and names no class");
 });
 
 test("the target's evidence collection reaches the decision, and an owner halt leaves the request to be handed again", async () => {
@@ -185,6 +186,7 @@ test("an owner verdict leaves the dialog pending and makes it the owner's", asyn
   assert.deepEqual(await service.handle(target), { handled: true, result: "owner", decisionId: "decision-3", interruptClass: "credentials" });
   assert.equal(answers.length, 0);
   assert.equal(service.holder("session-1", 7), "owner");
+  assert.equal(service.ownerClass("session-1", 7), "credentials", "the owner push names the class");
   // The same pending request is not decided again on the next scheduler pass.
   await service.handle(target);
   assert.equal(answers.length, 0);

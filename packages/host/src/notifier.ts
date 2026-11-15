@@ -3,6 +3,7 @@ import type { Manager } from "./manager.js";
 import type { PushSender, PushStore } from "./push.js";
 import type { FuseService, FuseInterrupt } from "./fuse/service.js";
 import type { PermissionDeliveryService } from "./permission-agent-types.js";
+import { INTERRUPT_CLASSES, type InterruptClass } from "./permission-policy.js";
 import { createHash } from "node:crypto";
 
 /** The subject part of a fuse collapse id. A push service limits the id's length, and a project id has no limit, so a long one is replaced by a digest. */
@@ -74,8 +75,11 @@ export class Notifier {
     private readonly goals?: { statuses(): GoalRow[] },
     private readonly storage?: { sample(): Promise<StorageVolume[]> },
     private readonly fuse?: Pick<FuseService, "interrupts" | "markAnnounced">,
-    /** Who holds an open dialog for the permission agent. Asked first; a dialog it leaves to the owner falls back to the run's coordinator review. */
-    private readonly permissions?: Pick<PermissionDeliveryService, "holder">,
+    /**
+     * Who holds an open dialog for the permission agent. Asked first; a dialog it leaves to the owner falls back to the run's coordinator review.
+     * `ownerClass` names the interrupt class for which it left a dialog to the owner, and the push names it.
+     */
+    private readonly permissions?: Pick<PermissionDeliveryService, "holder" | "ownerClass">,
   ) {}
   /** After a fuse push that reached no device, the time of the next attempt, on a clock that never steps back. */
   private fuseRetryAt = 0;
@@ -225,6 +229,14 @@ export class Notifier {
     if (!this.permissions) return "owner";
     try { return this.permissions.holder(sessionId, promptId); } catch { return "owner"; }
   }
+  /** The class a permission dialog was left to the owner for. Only one of the host's own class identifiers is ever named. */
+  private ownerClass(row: Row): InterruptClass | undefined {
+    const prompt = row.attention.prompt;
+    if (row.attention.state !== "needs-you" || !prompt || !this.permissions?.ownerClass) return undefined;
+    let named: unknown;
+    try { named = this.permissions.ownerClass(row.id, prompt.id); } catch { return undefined; }
+    return (INTERRUPT_CLASSES as readonly unknown[]).includes(named) ? named as InterruptClass : undefined;
+  }
   private teamEvents(): Lifecycle[] {
     if (!this.teams) return [];
     let teams: TeamRow[];
@@ -330,8 +342,11 @@ export class Notifier {
         : row.attention.state === "turn-finished" ? ["Turn finished", `${row.title} finished a turn`]
         : row.attention.state === "exited" ? ["Session exited", `${row.title} exited`]
         : ["Recording stopped", `${row.title} stopped recording`];
+    const body = this.options.detail === "full" ? (row.attention.state === "turn-finished" ? row.reading?.now?.text : undefined) || row.attention.now || minimal : minimal;
+    // A dialog the permission agent left to the owner for an interrupt class names that class, as a headless call does.
+    const interrupt = this.ownerClass(row);
     return {
-      to, title, body: this.options.detail === "full" ? (row.attention.state === "turn-finished" ? row.reading?.now?.text : undefined) || row.attention.now || minimal : minimal,
+      to, title, body: interrupt ? `${body} (${interrupt})` : body,
       data: { url: `/session/${row.id}`, ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
       priority: row.attention.state === "needs-you" ? ("high" as const) : ("default" as const), collapseId: row.id,
     };

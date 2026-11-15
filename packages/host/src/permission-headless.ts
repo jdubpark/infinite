@@ -232,6 +232,8 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
     let root: string | undefined;
     try { root = realpathSync(session.cwd); } catch { root = undefined; }
     if (root !== request.sessionRoot) return { result: "withheld", reason: "stale" };
+    // A team member's run must still be live: stopped, paused, halted or revoked runs get no allow from here.
+    if (!this.teamServed(session)) return { result: "withheld", reason: "stale" };
     // A halt that cannot be read counts as a halt.
     let halted: boolean;
     try { halted = pipeline.halted?.(session.projectId) === true; } catch { halted = true; }

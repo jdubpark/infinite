@@ -501,6 +501,18 @@ test("a reject is returned only while it still applies, and a halt recorded whil
   } finally { g.done(); }
 });
 
+test("the resume check withholds an owner's allow from a team member whose run is no longer live", async () => {
+  let live = true;
+  const h = hostRig(fakePipeline().pipeline, { channel: true },
+    { team: { runId: "run-1", memberId: "m-1", revision: 1, role: "implementer", taskId: "task-a" }, teamLive: () => live });
+  try {
+    const resume = () => h.ask({ op: "resume", sessionRoot: h.session.cwd });
+    assert.deepEqual(await resume(), { result: "ok" });
+    live = false;
+    assert.deepEqual(await resume(), { result: "withheld", reason: "stale" });
+  } finally { h.done(); }
+});
+
 test("the resume check confirms an owner's allow only without a halt, while its decision applies, for the session it was issued to", async () => {
   let halted: () => boolean = () => false;
   let applies = true;

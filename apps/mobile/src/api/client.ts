@@ -233,7 +233,7 @@ export type MissionSubtask = {
 };
 export type MissionDecision = {
   id: string; question: string; options: string[]; createdAt: string; subtaskId?: string; childDecisionId?: string;
-  answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator";
+  answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator" | "connector"; source?: { kind: "connector"; id: string; name: string };
 };
 export type MissionUsageTotals = {
   cost: number; tokens: { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number };
@@ -249,7 +249,7 @@ export type Mission = {
   reason?: string; createdAt: string; updatedAt: string; lineup: TeamLineup;
   coordinator?: { memberId: string; sessionId: string; status: "running" | "waiting" | "stopped" };
   dispatchSummary?: string; subtasks: MissionSubtask[]; decisions: MissionDecision[];
-  steering: { text: string; revision: number; at: string }[]; events: { at: string; text: string }[];
+  steering: { text: string; revision: number; at: string; source?: { kind: "connector"; id: string; name: string } | "coordinator" | "slack" }[]; events: { at: string; text: string }[];
   result?: { summary: string; revision: number; at: string };
   usage?: MissionUsage;
 };

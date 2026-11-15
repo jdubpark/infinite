@@ -2,13 +2,21 @@ import { PROVIDER_NAMES, type Attention, type Prompt, type Provider } from "@inf
 import type { Manager } from "./manager.js";
 import type { PushSender, PushStore } from "./push.js";
 import type { FuseService, FuseInterrupt } from "./fuse/service.js";
+import type { PermissionDeliveryService } from "./permission-agent-types.js";
+import { INTERRUPT_CLASSES, type InterruptClass } from "./permission-policy.js";
 import { createHash } from "node:crypto";
 
 /** The subject part of a fuse collapse id. A push service limits the id's length, and a project id has no limit, so a long one is replaced by a digest. */
 const fuseSubject = (projectId: string | undefined) =>
   projectId === undefined ? "host" : projectId.length <= 40 ? projectId : createHash("sha256").update(projectId, "utf8").digest("hex").slice(0, 32);
 
-type Row = { id: string; title: string; provider: Provider; attention: Attention; reading?: { now?: { text: string } } };
+type Row = {
+  id: string; title: string; provider: Provider; attention: Attention; reading?: { now?: { text: string } };
+  /** A headless session's permission channel: the call that waits for the owner, and the latest call it could not hold. */
+  permissionChannel?: { waiting?: { interruptClass: string }; notice?: { id: string; interruptClass?: string } };
+  /** Set by the notifier on the copy of a row that announces a permission notice. */
+  permissionNotice?: true;
+};
 type TeamRow = { id: string; title: string; status: string; reason?: string; resumable?: boolean; goal?: boolean; mission?: boolean };
 /** Who a team member's open prompt waits on: the run's delegated coordinator, the owner, or a review the run has not started yet. */
 export type PromptOwner = "coordinator" | "user" | "undecided";
@@ -44,6 +52,9 @@ const TEAM_EVENTS: Record<string, { event: string; title: string; body: string; 
 
 export class Notifier {
   private seen = new Map<string, string>();
+  /** The last headless permission notice announced for each session. */
+  private notices = new Map<string, string>();
+  private noticesPrimed = false;
   /** Needs-you prompts held back because the run's coordinator may answer them, by session id. */
   private deferred = new Map<string, { key: string; since: number }>();
   private teamStatus = new Map<string, string>();
@@ -64,6 +75,11 @@ export class Notifier {
     private readonly goals?: { statuses(): GoalRow[] },
     private readonly storage?: { sample(): Promise<StorageVolume[]> },
     private readonly fuse?: Pick<FuseService, "interrupts" | "markAnnounced">,
+    /**
+     * Who holds an open dialog for the permission agent. Asked first; a dialog it leaves to the owner falls back to the run's coordinator review.
+     * `ownerClass` names the interrupt class for which it left a dialog to the owner, and the push names it.
+     */
+    private readonly permissions?: Pick<PermissionDeliveryService, "holder" | "ownerClass">,
   ) {}
   /** After a fuse push that reached no device, the time of the next attempt, on a clock that never steps back. */
   private fuseRetryAt = 0;
@@ -97,6 +113,7 @@ export class Notifier {
           }
         }
       }
+      due.push(...this.channelNotices(rows));
       this.prune("session", this.seen, new Set(rows.map(row => row.id)));
       // A session missing from one listing keeps its hold, so a prompt that comes back unchanged
       // can still reach the owner; the hold limit bounds how long an absent session is remembered.
@@ -198,11 +215,27 @@ export class Notifier {
       channelId: "attention" as const, priority: item.critical ? "high" as const : "default" as const, collapseId: `storage:${item.label}`,
     };
   }
-  /** A team member's open permission prompt is the owner's unless its run can still decide it. Everything else is always the owner's. */
+  /** An open permission prompt is the owner's unless the permission agent or the member's run can still decide it. */
   private promptOwner(row: Row): PromptOwner {
     const prompt = row.attention.prompt;
-    if (row.attention.state !== "needs-you" || !prompt || !this.teams?.promptOwner) return "user";
+    if (row.attention.state !== "needs-you" || !prompt) return "user";
+    // The permission agent holds the push only while it can still decide the dialog; "undecided" gets the review grace.
+    const holder = this.permissionHolder(row.id, prompt.id);
+    if (holder !== "owner") return holder === "agent" ? "coordinator" : "undecided";
+    if (!this.teams?.promptOwner) return "user";
     try { return this.teams.promptOwner(row.id, prompt); } catch { return "user"; }
+  }
+  private permissionHolder(sessionId: string, promptId: number): "agent" | "owner" | "undecided" {
+    if (!this.permissions) return "owner";
+    try { return this.permissions.holder(sessionId, promptId); } catch { return "owner"; }
+  }
+  /** The class a permission dialog was left to the owner for. Only one of the host's own class identifiers is ever named. */
+  private ownerClass(row: Row): InterruptClass | undefined {
+    const prompt = row.attention.prompt;
+    if (row.attention.state !== "needs-you" || !prompt || !this.permissions?.ownerClass) return undefined;
+    let named: unknown;
+    try { named = this.permissions.ownerClass(row.id, prompt.id); } catch { return undefined; }
+    return (INTERRUPT_CLASSES as readonly unknown[]).includes(named) ? named as InterruptClass : undefined;
   }
   private teamEvents(): Lifecycle[] {
     if (!this.teams) return [];
@@ -267,16 +300,53 @@ export class Notifier {
       data: { url: `/${item.kind}/${item.id}`, ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
       priority: item.priority, collapseId: `${item.kind}:${item.id}` };
   }
+  /**
+   * A headless call that needed the owner and could not wait was denied: the owner hears of it once, with its class.
+   * Notices present at startup are taken as already announced.
+   */
+  private channelNotices(rows: Row[]): Row[] {
+    const due: Row[] = [];
+    for (const row of rows) {
+      const notice = row.permissionChannel?.notice;
+      if (!notice || this.notices.get(row.id) === notice.id) continue;
+      this.notices.set(row.id, notice.id);
+      if (this.noticesPrimed && this.options.events.includes("needs-you")) due.push({ ...row, permissionNotice: true });
+    }
+    const listed = new Set(rows.map(row => row.id));
+    for (const id of this.notices.keys()) if (!listed.has(id)) this.notices.delete(id);
+    this.noticesPrimed = true;
+    return due;
+  }
   private message(row: Row, to: string) {
     const name = PROVIDER_NAMES[row.provider] ?? row.provider;
+    const channel = row.permissionChannel;
+    if (row.permissionNotice) {
+      const named = channel?.notice?.interruptClass ? ` (${channel.notice.interruptClass})` : "";
+      return {
+        to, title: "Call denied: needs you", body: `${name} in ${row.title} made a call${named} that needs your own answer. It was denied and can be asked again.`,
+        data: { url: `/session/${row.id}`, ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
+        priority: "high" as const, collapseId: `${row.id}:permission`,
+      };
+    }
+    if (row.attention.state === "needs-you" && channel?.waiting) {
+      const minimal = `${name} waits for your answer in ${row.title} (${channel.waiting.interruptClass})`;
+      return {
+        to, title: "Needs your answer", body: minimal,
+        data: { url: `/session/${row.id}`, ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
+        priority: "high" as const, collapseId: row.id,
+      };
+    }
     const [title, minimal] =
       row.attention.state === "needs-you"
         ? row.attention.prompt?.kind === "question" ? ["Question for you", `${name} asked a question in ${row.title}`] : ["Needs your approval", `${name} needs your approval in ${row.title}`]
         : row.attention.state === "turn-finished" ? ["Turn finished", `${row.title} finished a turn`]
         : row.attention.state === "exited" ? ["Session exited", `${row.title} exited`]
         : ["Recording stopped", `${row.title} stopped recording`];
+    const body = this.options.detail === "full" ? (row.attention.state === "turn-finished" ? row.reading?.now?.text : undefined) || row.attention.now || minimal : minimal;
+    // A dialog the permission agent left to the owner for an interrupt class names that class, as a headless call does.
+    const interrupt = this.ownerClass(row);
     return {
-      to, title, body: this.options.detail === "full" ? (row.attention.state === "turn-finished" ? row.reading?.now?.text : undefined) || row.attention.now || minimal : minimal,
+      to, title, body: interrupt ? `${body} (${interrupt})` : body,
       data: { url: `/session/${row.id}`, ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
       priority: row.attention.state === "needs-you" ? ("high" as const) : ("default" as const), collapseId: row.id,
     };

@@ -393,6 +393,14 @@ async function main() {
       summary: "The request is limited to reading the assigned project file for the stated objective." });
   } else if (assignment.role === "implementer") {
     if (scenario !== "live-limit" && scenario !== "mixed" && scenario !== "result-operation-fails-once") await waitForPeer();
+    if (scenario === "host-load-check") {
+      writeFileSync(join(receiptDir, `${assignment.memberId}.check-held`), "ready", { mode: 0o600 });
+      const until = Date.now() + 30000;
+      while (!existsSync(join(receiptDir, `${assignment.runId}.check-release`))) {
+        if (Date.now() >= until) throw new Error("The test did not release the implementers before checking host capacity");
+        await new Promise(resolve => setTimeout(resolve, 40));
+      }
+    }
     const shouldBlock = scenario === "agent-blocked-once" && assignment.revision === 1 || scenario === "agent-blocked-twice" && assignment.revision <= 3;
     if (shouldBlock && assignment.taskId === "a") {
       if (scenario === "agent-blocked-once") {
@@ -560,6 +568,30 @@ async function main() {
           tool_input: { command: scenario === "permissions-yesno" ? "Run this command? [Y/n]" : "cat original.txt" } }),
       });
       if (response.status !== 204) throw new Error(`Provider permission hook was refused with status ${response.status}`);
+      if (scenario === "permissions-off-navigate") {
+        // Like the real TUI: arrows move the marker, Enter picks the option, and the feedback option then takes one line of text.
+        const labels = ["1. Yes", "2. Yes, and don't ask again for Bash commands", "3. No, and tell Claude what to do differently (esc)"];
+        let marker = 0;
+        const draw = () => process.stdout.write(`\u001b[2J\u001b[H\nBash command\ncat original.txt\nDo you want to proceed?\n${labels.map((label, index) => `${index === marker ? "❯" : " "} ${label}`).join("\n")}\n`);
+        process.stdin.setRawMode(true);
+        for (;;) {
+          const input = String(await new Promise(resolve => process.stdin.once("data", resolve)));
+          if (input.includes("\r")) break;
+          marker = Math.min(labels.length - 1, Math.max(0, marker + (input.match(/\u001b[[O]B/g)?.length ?? 0) - (input.match(/\u001b[[O]A/g)?.length ?? 0)));
+          draw();
+        }
+        let text = "";
+        if (marker === 2) {
+          process.stdout.write("\u001b[2J\u001b[HTell Claude what to do differently\n> ");
+          for (;;) {
+            const input = String(await new Promise(resolve => process.stdin.once("data", resolve)));
+            text += input;
+            if (text.includes("\r")) break;
+          }
+        }
+        writeFileSync(join(receiptDir, `${assignment.runId}.agent-answer.json`), JSON.stringify({ option: marker, text: text.replace(/\r$/, "") }), { mode: 0o600 });
+        process.stdout.write("\u001b[2J\u001b[HPermission request closed.\n");
+      }
       if (scenario === "permissions-stale") {
         writeFileSync(join(receiptDir, `${assignment.runId}.target-ready`), "ready", { mode: 0o600 });
         const until = Date.now() + 30000;
@@ -576,7 +608,7 @@ async function main() {
         });
         if (closed.status !== 204) throw new Error(`Provider prompt change was refused with status ${closed.status}`);
       }
-      await new Promise(resolve => process.stdin.once("data", resolve));
+      if (scenario !== "permissions-off-navigate") await new Promise(resolve => process.stdin.once("data", resolve));
       if (scenario === "permissions-restart") await new Promise(resolve => setTimeout(resolve, 5000));
       process.stdout.write("\u001b[2J\u001b[HPermission request closed.\n");
     }

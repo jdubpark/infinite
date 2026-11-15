@@ -1,9 +1,75 @@
 import { createHash } from "node:crypto";
-import type { Prompt } from "@infinite/attention";
+import { dialogCommand, oneShotPermissionOption, type Prompt } from "@infinite/attention";
 import type { WorkerError } from "./ipc.js";
+import type { PermissionRequestShape } from "./permission-agent-types.js";
 import { ContentError } from "./session-content.js";
 
 export { oneShotPermissionOption } from "@infinite/attention";
+
+/** An option label that would grant more than this one request. */
+const PERSISTENT_LABEL = /always|trust|workspace|project|folder|remember|future|session|don't ask|do not ask|never ask/i;
+
+/**
+ * The one-shot accept a permission agent may choose for this prompt, or undefined. It is today's
+ * qualification with complete evidence, except that the destructive flag does not disqualify: the
+ * delivery service delivers an accept for a destructive request only on a strong verdict.
+ */
+export function agentAcceptOption(prompt: Prompt): number | undefined {
+  return oneShotPermissionOption({ ...prompt, destructive: undefined });
+}
+
+/**
+ * The one-shot reject option of a permission dialog, or undefined when the dialog has none that the
+ * host recognises. Exactly one reject option must offer no persistent effect. A reject needs no
+ * complete evidence: rejecting what the host cannot read is a valid answer.
+ */
+export function oneShotRejectOption(prompt: Prompt): number | undefined {
+  if (prompt.kind !== "permission" || !["screen", "hook"].includes(prompt.source) || !prompt.hash || prompt.multiSelect ||
+      prompt.options.length < 2) return undefined;
+  const rejects = prompt.options.filter(option => (option.role === "reject" || option.role === "reject-with-feedback") &&
+    !PERSISTENT_LABEL.test(option.label));
+  return rejects.length === 1 ? rejects[0].index : undefined;
+}
+
+const TRUST_TITLE = /\btrust\b.*\b(?:folder|files|workspace|project|directory)\b|\b(?:folder|files|workspace|project|directory)\b.*\btrust\b/i;
+
+/** Structural facts about a dialog for the permission agent's qualify step and class rules. */
+export function permissionRequestShape(prompt: Prompt): PermissionRequestShape {
+  const accept = agentAcceptOption(prompt);
+  const oneShotAccept = prompt.options.filter(option => option.role === "accept" && !PERSISTENT_LABEL.test(option.label)).length === 1;
+  const persistent = prompt.options.some(option => option.role === "accept-always" || option.role === "accept" && PERSISTENT_LABEL.test(option.label));
+  const trustPrompt = TRUST_TITLE.test(prompt.title) || prompt.options.some(option => /\btrust\b/i.test(option.label));
+  return {
+    completeEvidence: accept !== undefined || completeDialogEvidence(prompt),
+    oneShotAccept: !trustPrompt && oneShotAccept,
+    oneShotReject: oneShotRejectOption(prompt) !== undefined,
+    persistentOnly: !oneShotAccept && persistent,
+    trustPrompt,
+  };
+}
+
+/** The host holds the whole action: complete hook tool input, or a pinned command dialog that shows its whole command. */
+function completeDialogEvidence(prompt: Prompt): boolean {
+  if (prompt.kind !== "permission" || !prompt.hash || truncated(prompt.detail)) return false;
+  if (prompt.tool) return Boolean(prompt.tool.name) && prompt.tool.inputComplete === true &&
+    Object.keys(prompt.tool.input).length > 0 && !truncated(prompt.tool.input);
+  return prompt.source === "screen" && prompt.pinned === true && dialogCommand(prompt) !== undefined;
+}
+
+/** The same truncation markers that today's qualification refuses. */
+function truncated(value: unknown): boolean {
+  if (typeof value === "string") return /(?:…|\.\.\.)\s*\[\+\d+ chars\]$/.test(value) || value === "[truncated]";
+  if (Array.isArray(value)) return value.length >= 50 || value.some(truncated);
+  if (value && typeof value === "object") return Object.values(value).some(truncated);
+  return false;
+}
+
+/** The action as the host extracted it, bounded to 2,000 characters: the dialog's command, the hook command, or the title. */
+export function permissionAction(prompt: Prompt): string {
+  const command = typeof prompt.tool?.input.command === "string" ? prompt.tool.input.command : undefined;
+  const text = dialogCommand(prompt) ?? command ?? [prompt.title, prompt.detail].filter(Boolean).join("\n");
+  return [...text].slice(0, 2000).join("");
+}
 
 const COLLAPSED_LINES = /^\[?\s*(?:…|\.\.\.)\s*\+?\d+\s+lines?\s*\]?$/i;
 const CODEX_COMMAND_PROMPT = /^would you like to run the following command\?$/i;

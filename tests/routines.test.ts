@@ -10,6 +10,7 @@ import type { CreateGoal, ProductGoal } from "../packages/host/src/goal-types.js
 import type { ProjectSignal, SignalKind, SignalReader } from "../packages/host/src/signals/types.js";
 import type { Config } from "../packages/host/src/types.js";
 import { TeamError } from "../packages/host/src/teams.js";
+import { teamProjectSchema } from "../packages/host/src/team-types.js";
 import { unseal } from "../packages/host/src/vault.js";
 
 const lineup = {
@@ -132,6 +133,22 @@ test("routing settings change the approval digest, and their absence keeps it", 
     await service.tick();
     assert.equal(service.list()[0]!.status, "running");
     f.config.projects[0]!.team!.routing = { mode: "shadow" };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "blocked");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("the objective switch is inside the routine approval digest", async () => {
+  const f = setup(); let service = f.createService();
+  try {
+    const team = teamProjectSchema.parse(f.config.projects[0]!.team);
+    assert.equal(Object.hasOwn(team, "objective"), false, "the schema adds no objective key by default");
+    f.config.projects[0]!.team = team;
+    await service.create(f.create()); await wait(30); await service.tick();
+    assert.equal(service.list()[0]!.status, "running");
+    service.close(); service = f.createService(); await service.tick();
+    assert.equal(service.list()[0]!.status, "running");
+    f.config.projects[0]!.team = teamProjectSchema.parse({ ...team, objective: { prompts: "off" } });
     await service.tick();
     assert.equal(service.list()[0]!.status, "blocked");
   } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }

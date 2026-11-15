@@ -199,3 +199,6 @@ An actual Android debug build was installed on the Pixel 9 emulator. Pairing, st
 `scripts/browser-smoke.py` checks desktop/phone browser reconnect and steering against the local rehearsal server using Python Playwright. It reads `.local/devices.json` without printing keys.
 
 See [architecture and protocol](docs/architecture.md), [server comparison](docs/hosting.md), and [Ubuntu commissioning](deploy/ubuntu/README.md). The commissioning record separates authenticated provider results, client/API continuity, tested data restoration, and cold-boot recovery work still required.
+
+The optional [MCP request connector](docs/mcp.md) lets an external assistant such
+as Grok Bot submit and follow tracked work through a dedicated, scoped endpoint.

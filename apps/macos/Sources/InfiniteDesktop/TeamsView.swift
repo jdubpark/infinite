@@ -277,10 +277,10 @@ struct TeamDetailView: View {
     @ViewBuilder private var history: some View {
         let answered = team.answeredDecisions
         if !team.steering.isEmpty || !answered.isEmpty {
-            section("Your directions and decisions") {
+            section("Directions and decisions") {
                 ForEach(Array(team.steering.enumerated()), id: \.offset) { _, entry in
                     VStack(alignment: .leading, spacing: 3) {
-                        Text("Direction · revision \(entry["revision"].int) · \(teamDate(entry["at"].string))").font(.caption).foregroundStyle(.secondary)
+                        Text("\(entry["source"]["kind"].string == "connector" ? (entry["source"]["name"].string.isEmpty ? "Connector" : entry["source"]["name"].string) : entry["source"].string == "coordinator" ? "Mission coordinator" : "You") · direction · revision \(entry["revision"].int) · \(teamDate(entry["at"].string))").font(.caption).foregroundStyle(.secondary)
                         Text(entry["text"].string).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     }
                 }
@@ -288,7 +288,7 @@ struct TeamDetailView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Decision · revision \(decision["revision"].int)").font(.caption).foregroundStyle(.secondary)
                         Text(decision["question"].string).font(.callout).fixedSize(horizontal: false, vertical: true)
-                        Text("\(decision["answeredBy"].string == "coordinator" ? "Mission coordinator" : "Your answer"): \(decision["answer"].string)").font(.callout.weight(.medium)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        Text("\(decision["answeredBy"].string == "connector" ? (decision["source"]["name"].string.isEmpty ? "Connector" : decision["source"]["name"].string) : decision["answeredBy"].string == "coordinator" ? "Mission coordinator" : "Your answer"): \(decision["answer"].string)").font(.callout.weight(.medium)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }

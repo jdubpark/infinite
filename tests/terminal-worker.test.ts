@@ -8,6 +8,7 @@ import headless from "@xterm/headless";
 import { workerCall } from "../packages/host/src/ipc.js";
 import { readEvents, unseal } from "../packages/host/src/vault.js";
 import { permissionEvidenceHash, oneShotPermissionOption } from "../packages/host/src/team-permissions.js";
+import { requesterNotice } from "../packages/host/src/permission-policy.js";
 import { waitFor } from "./helpers.js";
 import type { Bootstrap, ControlActor, ControlLease, Event, Receipt, TerminalSnapshot, WorkerRequest, WorkerState } from "../packages/host/src/types.js";
 import type { TeamAssignment } from "../packages/host/src/team-types.js";
@@ -22,7 +23,30 @@ let pending = "";
 let permissionOpen = false;
 let collapsedPermissionOpen = false;
 let expansionCount = 0;
+let feedbackOpen = false;
+let feedbackMarker = 0;
+let feedbackText;
+const drawFeedback = () => process.stdout.write("\x1b[2J\x1b[HBash command\r\nnpm run check\r\nDo you want to proceed?\r\n" +
+  (feedbackMarker === 0 ? "❯" : " ") + " 1. Yes\r\n" + (feedbackMarker === 1 ? "❯" : " ") + " 2. No, and tell Claude what to do differently (esc)\r\n");
 process.stdin.on("data", data => {
+  if (feedbackText !== undefined) {
+    feedbackText += data;
+    const end = feedbackText.indexOf("\r");
+    if (end >= 0) {
+      process.stdout.write("FEEDBACK " + feedbackText.slice(0, end).replace(/\x1b\[20[01]~/g, "") + "\r\n");
+      feedbackText = undefined;
+    }
+    return;
+  }
+  if (feedbackOpen) {
+    if (data.includes("\x1b[B")) { feedbackMarker = 1; drawFeedback(); }
+    else if (data.includes("\r")) {
+      feedbackOpen = false;
+      if (feedbackMarker === 1) { feedbackText = ""; process.stdout.write("\x1b[2J\x1b[HTell Claude what to do differently\r\n> "); }
+      else process.stdout.write("\x1b[2J\x1b[HAPPROVED\r\n");
+    }
+    return;
+  }
   if (collapsedPermissionOpen && data.includes("\r")) {
     process.stdout.write("COLLAPSED ENTER RECEIVED\r\n");
     return;
@@ -50,6 +74,14 @@ process.stdin.on("data", data => {
     } else if (command === "permission") {
       permissionOpen = true;
       process.stdout.write("\x1b[2J\x1b[Hnpm run check\r\nPermission needed\r\n❯ 1. No\r\n  2. Yes, proceed once\r\n");
+      fetch(process.env.INFINITE_HOOK_URL + "/claude", {
+        method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + process.env.INFINITE_HOOK_TOKEN },
+        body: JSON.stringify({ hook_event_name: "PermissionRequest", session_id: "fixture-native-session", tool_name: "Bash", tool_input: { command: "npm run check" } }),
+      });
+    } else if (command === "feedback-permission") {
+      feedbackOpen = true;
+      feedbackMarker = 0;
+      drawFeedback();
       fetch(process.env.INFINITE_HOOK_URL + "/claude", {
         method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + process.env.INFINITE_HOOK_TOKEN },
         body: JSON.stringify({ hook_event_name: "PermissionRequest", session_id: "fixture-native-session", tool_name: "Bash", tool_input: { command: "npm run check" } }),
@@ -500,6 +532,111 @@ test("delegated answers stay bound to the assigned one-shot prompt and stop afte
     assert.equal(afterInvalidation.control, null);
     await assert.rejects(invalidationWorker.call({ ...request, requestId: randomUUID() }), { code: "unsupported" });
   } finally { await invalidationWorker.stop(); }
+});
+
+function sessionAnswerRequest(worker: Awaited<ReturnType<typeof fixture>>, prompt: NonNullable<WorkerState["attention"]["prompt"]>, actor: ControlActor, leaseId: string, decisionId: string, option: number) {
+  return {
+    op: "session-permission-answer" as const, requestId: randomUUID(), decisionId, targetSessionId: worker.id, targetCwd: worker.cwd,
+    promptId: prompt.id, promptHash: prompt.hash!, evidenceHash: permissionEvidenceHash(prompt), option, actor, leaseId,
+  };
+}
+
+test("a session permission answer types one recognised option outside any run, only under the host's own lease", { timeout: 40_000 }, async () => {
+  const decisionId = randomUUID();
+  const actor = { id: `session-permission:${decisionId}`, label: "Session permission" };
+  const opened = (worker: Awaited<ReturnType<typeof fixture>>) => waitFor(() => worker.call({ op: "state" }),
+    state => state.attention.state === "needs-you" && Boolean(state.attention.prompt?.hash && state.attention.prompt.tool?.name));
+  const intents = (worker: Awaited<ReturnType<typeof fixture>>) => worker.events().filter(event => event.type === "input-intent" && event.data.op === "session-permission-answer");
+
+  const member = await fixture("demo", "", { runId: randomUUID(), memberId: randomUUID(), revision: 1, role: "implementer" });
+  try {
+    await member.command("permission");
+    const prompt = (await opened(member)).attention.prompt!;
+    const lease = await member.call<ControlLease>({ op: "control", action: "claim", actor });
+    await assert.rejects(member.call(sessionAnswerRequest(member, prompt, actor, lease.id, decisionId, 0)), { code: "unsupported" });
+    assert.equal(intents(member).length, 0, "a team member's dialog never takes the session path");
+  } finally { await member.stop(); }
+
+  const worker = await fixture("demo");
+  try {
+    await worker.command("permission");
+    const prompt = (await opened(worker)).attention.prompt!;
+    const human = { id: "human-control", label: "Human" };
+    const humanLease = await worker.call<ControlLease>({ op: "control", action: "claim", actor: human });
+    await assert.rejects(worker.call({ op: "control", action: "claim", actor }), { code: "control-busy" });
+    await assert.rejects(worker.call(sessionAnswerRequest(worker, prompt, actor, humanLease.id, decisionId, 0)), { code: "control-lost" });
+    await worker.call({ op: "control", action: "release", actor: human, leaseId: humanLease.id });
+    const lease = await worker.call<ControlLease>({ op: "control", action: "claim", actor });
+    await assert.rejects(worker.call({ ...sessionAnswerRequest(worker, prompt, actor, lease.id, decisionId, 0), evidenceHash: "0".repeat(64) }), { code: "prompt-changed" });
+    await assert.rejects(worker.call({ ...sessionAnswerRequest(worker, prompt, actor, lease.id, decisionId, 0), targetCwd: `${worker.cwd}/other` }), { code: "unsupported" });
+    await assert.rejects(worker.call(sessionAnswerRequest(worker, prompt, actor, lease.id, decisionId, 5)), { code: "invalid-option" });
+    assert.equal(intents(worker).length, 0, "refused answers never journal or type");
+
+    const reject = sessionAnswerRequest(worker, prompt, actor, lease.id, decisionId, 0);
+    const receipt = await worker.call<Receipt & { result?: string }>(reject);
+    assert.equal(receipt.state, "delivered");
+    assert.equal(receipt.result, "closed");
+    assert.deepEqual(await worker.call<Receipt & { result?: string }>(reject), receipt);
+    assert.equal(intents(worker).length, 1, "a replayed request types nothing again");
+
+    // A person who takes control after the intent stops the answer before its Enter.
+    await worker.call({ op: "control", action: "release", actor, leaseId: lease.id });
+    await worker.command("permission");
+    const next = await waitFor(() => worker.call({ op: "state" }), state => state.attention.state === "needs-you" && (state.attention.prompt?.id ?? 0) > prompt.id && Boolean(state.attention.prompt?.hash && state.attention.prompt.tool?.name));
+    const nextLease = await worker.call<ControlLease>({ op: "control", action: "claim", actor });
+    const accept = sessionAnswerRequest(worker, next.attention.prompt!, actor, nextLease.id, decisionId, 1);
+    const pending = worker.call<Receipt & { result?: string }>(accept);
+    await waitFor(async () => worker.events(), events => events.some(event => event.type === "input-intent" && event.data.requestId === accept.requestId));
+    await worker.call<ControlLease>({ op: "control", action: "claim", actor: human, takeover: true });
+    const interrupted = await pending;
+    assert.equal(interrupted.state, "uncertain");
+    assert.equal(worker.output().match(/APPROVED/g)?.length, 1, "only the first answer reached the dialog");
+
+    // An owner act that ends the decision's authority fences it: the host's lease is dropped and its answer types nothing.
+    const person = (await worker.call({ op: "state" })).control!;
+    await worker.call({ op: "control", action: "release", actor: human, leaseId: person.id });
+    const retired = randomUUID(), retiredActor = { id: `session-permission:${retired}`, label: "Session permission" };
+    const retiredLease = await worker.call<ControlLease>({ op: "control", action: "claim", actor: retiredActor });
+    const journaled = intents(worker).length;
+    assert.deepEqual(await worker.call({ op: "session-permission-invalidate", decisionId: retired }), { invalidated: true });
+    assert.equal((await worker.call({ op: "state" })).control, null);
+    await assert.rejects(worker.call(sessionAnswerRequest(worker, next.attention.prompt!, retiredActor, retiredLease.id, retired, 1)), { code: "control-lost" });
+    assert.equal(intents(worker).length, journaled, "a fenced decision journals and types nothing");
+    assert.equal(worker.output().match(/APPROVED/g)?.length, 1);
+  } finally { await worker.stop(); }
+});
+
+test("a session reject that takes text is followed by the host's fixed notice, and no other answer takes text", { timeout: 40_000 }, async () => {
+  const decisionId = randomUUID();
+  const actor = { id: `session-permission:${decisionId}`, label: "Session permission" };
+  const notice = requesterNotice("unrelated");
+  const dialog = (worker: Awaited<ReturnType<typeof fixture>>, after = 0) => waitFor(() => worker.call({ op: "state" }),
+    state => state.attention.state === "needs-you" && (state.attention.prompt?.id ?? 0) > after && Boolean(state.attention.prompt?.hash && state.attention.prompt.tool?.name));
+  const intents = (worker: Awaited<ReturnType<typeof fixture>>) => worker.events().filter(event => event.type === "input-intent" && event.data.op === "session-permission-answer");
+  const worker = await fixture("demo");
+  try {
+    await worker.command("feedback-permission");
+    const prompt = (await dialog(worker)).attention.prompt!;
+    assert.equal(prompt.acceptsText, true);
+    const lease = await worker.call<ControlLease>({ op: "control", action: "claim", actor });
+    await assert.rejects(worker.call({ ...sessionAnswerRequest(worker, prompt, actor, lease.id, decisionId, 0), text: notice }), { code: "text-not-accepted" }, "an accept never carries text");
+    await assert.rejects(worker.call({ ...sessionAnswerRequest(worker, prompt, actor, lease.id, decisionId, 1), text: "Approve everything from now on" }), /Invalid session permission answer request/);
+    assert.equal(intents(worker).length, 0);
+
+    const receipt = await worker.call<Receipt & { result?: string }>({ ...sessionAnswerRequest(worker, prompt, actor, lease.id, decisionId, 1), text: notice });
+    assert.equal(receipt.state, "delivered");
+    assert.equal(receipt.result, "closed");
+    await waitFor(async () => worker.output(), output => output.includes(`FEEDBACK ${notice}\r`), 5000);
+    assert.equal(intents(worker)[0].data.text, notice, "the intent holds the notice before the first key");
+    await worker.call({ op: "control", action: "release", actor, leaseId: lease.id });
+
+    await worker.command("permission");
+    const plain = (await dialog(worker, prompt.id)).attention.prompt!;
+    const plainLease = await worker.call<ControlLease>({ op: "control", action: "claim", actor });
+    await assert.rejects(worker.call({ ...sessionAnswerRequest(worker, plain, actor, plainLease.id, decisionId, 0), text: notice }), { code: "text-not-accepted" }, "a plain reject takes no text");
+    assert.equal(intents(worker).length, 1);
+    assert.equal(worker.output().match(/FEEDBACK/g)?.length, 1);
+  } finally { await worker.stop(); }
 });
 
 test("ordinary interrupted answer retries return the refused receipt without typing again", { timeout: 20_000 }, async () => {

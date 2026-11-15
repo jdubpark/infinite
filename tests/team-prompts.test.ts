@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ENTRY_PARAGRAPH_LIMIT_BYTES, entryCommand, entryInstructions, refreshReportingInstructions, retargetPrompt, teamContext, teamPrompt } from "../packages/host/src/team-prompts.js";
+import { createHash } from "node:crypto";
+import { ENTRY_PARAGRAPH_LIMIT_BYTES, entryCommand, entryInstructions, refreshReportingInstructions, reportCommand, retargetPrompt, teamContext, teamPrompt } from "../packages/host/src/team-prompts.js";
 import { teamReportSchema, type TeamModelProfile, type TeamRun, type TeamTask } from "../packages/host/src/team-types.js";
 
 const PROMPT_LIMIT_BYTES = 80 * 1024;
@@ -290,16 +291,18 @@ test("a member context never carries the feature map or the eval block", () => {
   const eval_ = { capture: true, excludeAreas: ["web"] };
   const checks = [{ command: "npm", args: ["test"] }];
   const base = largeRun();
+  const objective = { prompts: "on" as const };
   const run = { ...base, handoff: {
     sourceSessionId: "session", checkpointHead: base.baseCommit, deadlineAt: "2026-11-13T12:00:00.000Z", maxMembers: 1,
-    project: { checks, features, eval: eval_ },
+    project: { checks, features, eval: eval_, objective },
   } } as unknown as TeamRun;
-  const snapshot = teamContext(run, undefined, { checks, features, eval: eval_ } as Parameters<typeof teamContext>[2], "implementer");
+  const snapshot = teamContext(run, undefined, { checks, features, eval: eval_, objective } as Parameters<typeof teamContext>[2], "implementer");
   const serialized = JSON.stringify(snapshot);
   assert.doesNotMatch(serialized, /"features"/);
   assert.doesNotMatch(serialized, /"elevatedTokens"/);
   assert.doesNotMatch(serialized, /"eval"/);
   assert.doesNotMatch(serialized, /"excludeAreas"/);
+  assert.doesNotMatch(serialized, /"prompts"/, "the objective switch is private settings too");
   assert.match(serialized, /"checks"/, "the configured checks are still present");
   assert.ok((snapshot.authority.handoff as { project?: unknown } | undefined)?.project, "the handoff project is still present");
 });
@@ -386,4 +389,57 @@ test("a member context never carries the feature map, the eval block, or routing
     const prompt = teamPrompt(withRouting, role, role === "implementer" ? withRouting.tasks[0] : undefined, undefined, "demo", undefined, configuredWith);
     assert.equal(prompt, teamPrompt(plain, role, role === "implementer" ? plain.tasks[0] : undefined, undefined, "demo", undefined, configuredPlain), `${role} prompt changes with routing`);
   }
+});
+
+// Byte pins: the prompts and contexts of a goal run, with the switch off, equal the output at the base commit.
+const PIN_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"] as const;
+const PIN_CHECKS = [{ command: "npm", args: ["test"] }];
+const PIN_GOAL = { id: "00000000-0000-4000-8000-000000000012", revision: 1, cycle: 1, successCriteria: "Owner success text.", nonGoals: ["Do not change billing."], allowedPaths: ["src"], evidence: [], previousWork: [], deadlineAt: "2026-12-01T00:00:00.000Z", maxMembers: 2 } as NonNullable<TeamRun["goal"]>;
+const PIN_LINEUP = { coordinator: ENTRY_PROFILE, integrator: ENTRY_PROFILE, reviewer: ENTRY_PROFILE, implementers: [ENTRY_PROFILE] } as TeamRun["lineup"];
+const goalRun = (extra: Partial<TeamRun> = {}) => smallRun({ status: "discovering", goal: PIN_GOAL, lineup: PIN_LINEUP, ...extra });
+const sha256 = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+const placeholdered = (text: string) => text.split(reportCommand()).join("<report-command>").split(entryCommand()).join("<entry-command>");
+function pinnedPrompts() {
+  const run = goalRun();
+  const entryRun = { ...run, blackboard: { tools: true } } as TeamRun;
+  return [run, entryRun].flatMap(item => PIN_ROLES.flatMap(role => ENTRY_PROVIDERS.map(provider =>
+    placeholdered(teamPrompt(item, role, undefined, undefined, provider, ENTRY_PROFILE, { checks: PIN_CHECKS }, [], true)))));
+}
+function pinnedContexts() {
+  const run = goalRun();
+  return PIN_ROLES.map(role => JSON.stringify(teamContext(run, "Owner feedback excerpt.", { checks: PIN_CHECKS }, role), null, 2));
+}
+const PIN_PROMPTS_SHA256 = "33b74673ca9c9cc14cca3935de8c62083c270badba7b4ebc45c2224053733f3c";
+const PIN_CONTEXTS_SHA256 = "9ee8fe8ac898e2d70ddbb012ba398387d526294ea61739fb7aad4385b7a7412b";
+
+test("the switch off keeps every prompt and context byte", () => {
+  assert.equal(sha256(pinnedPrompts()), PIN_PROMPTS_SHA256, "every role and provider, with and without entry tools");
+  assert.equal(sha256(pinnedContexts()), PIN_CONTEXTS_SHA256, "the full context file of every role");
+});
+
+// The owner's record digest: the same record criteria, c0 carrying the success text in the prompt only.
+const PIN_RECORD = { version: 2, criteria: [
+  { id: "c0", statement: "", check: "judgement:owner-text", producer: "evaluator" as const },
+  { id: "c1", statement: "The billing page shows the new total.", check: "command:npm test", producer: "host" as const },
+] };
+
+test("the record digest replaces the success text and nothing else", () => {
+  const { successCriteria, ...goalWithoutText } = PIN_GOAL;
+  const withRecord = goalRun({ goal: { ...PIN_GOAL, record: PIN_RECORD } as TeamRun["goal"] });
+  const without = goalRun();
+  const criteria = PIN_RECORD.criteria.map(item => item.id === "c0" ? { ...item, statement: successCriteria } : item);
+  const oldSection = `Approved goal context (immutable for this run):\n${JSON.stringify(PIN_GOAL)}\n`;
+  const newSection = `Approved goal context (immutable for this run):\n${JSON.stringify(goalWithoutText)}\nSuccess criteria from the owner's objective record, version 2. Each names how it is checked; c0 is the owner's success text:\n${JSON.stringify(criteria)}\n`;
+  for (const role of PIN_ROLES) {
+    for (const provider of ENTRY_PROVIDERS) {
+      const base = teamPrompt(without, role, undefined, undefined, provider, ENTRY_PROFILE, { checks: PIN_CHECKS }, [], true);
+      const next = teamPrompt(withRecord, role, undefined, undefined, provider, ENTRY_PROFILE, { checks: PIN_CHECKS }, [], true);
+      assert.equal(base.split(oldSection).length, 2, `${role} ${provider}: the goal section appears once without a record`);
+      assert.equal(next, base.replace(oldSection, newSection), `${role} ${provider}: only the goal section changes`);
+      assert.equal(next.split(successCriteria).length, 2, `${role} ${provider}: c0's text appears once`);
+    }
+  }
+  const context = teamContext(withRecord, undefined, { checks: PIN_CHECKS }, "implementer");
+  const plain = teamContext(without, undefined, { checks: PIN_CHECKS }, "implementer");
+  assert.deepEqual(context, { ...plain, authority: { ...plain.authority, goal: { ...PIN_GOAL, record: PIN_RECORD } } });
 });

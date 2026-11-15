@@ -60,6 +60,11 @@ async function coordinator() {
       ] });
     return;
   }
+  const connectorDirection = messages.find(message => message.type === "connector-direction" && message.text.startsWith("CONNECTOR-STEER:"));
+  if (connectorDirection && state.subtasks.some(subtask => subtask.id === "held" && subtask.teamId)) {
+    await report({ kind: "steer-subtask", subtaskId: "held", text: connectorDirection.text });
+    return;
+  }
   if (held) return hold();
   const decision = messages.find(message => message.type === "child-decision");
   const openDecision = decision && state.openChildDecisions.find(item => item.decisionId === decision.decisionId);
@@ -84,13 +89,13 @@ async function subteam() {
       return;
     }
     if (!api) await until(() => existsSync(join(receipts, "release-web-question")));
-    if (!/(?:User|Mission coordinator) answered:/.test(prompt)) {
+    if (!/(?:User|Mission coordinator|Connector(?: \([^\n]*\))?) answered(?: "[^\n]*")?:/.test(prompt)) {
       await report({ kind: "question", question: api ? "Which response format should the endpoint use?" : "Should the button be primary?", options: api ? ["JSON", "Text"] : ["Primary", "Secondary"] });
       return;
     }
     await report({ kind: "plan", summary: `Write ${file}`, tasks: [{ id: "write", title: `Write ${file}`, instructions: `Create ${file}`, agentProfileId: "light", paths: [file], dependsOn: [] }] });
   } else if (assignment.role === "implementer") {
-    writeFileSync(file, `${prompt.match(/(?:User|Mission coordinator) answered: (.*)/)?.[1] ?? "ready"}\n`);
+    writeFileSync(file, `${prompt.match(/(?:User|Mission coordinator|Connector(?: \([^\n]*\))?) answered(?: "[^\n]*")?: (.*)/)?.[1] ?? "ready"}\n`);
     await report({ kind: "result", summary: `Wrote ${file}` });
   } else if (assignment.role === "reviewer") {
     await report({ kind: "review", verdict: "approved", summary: `Inspected ${file} and the passing check` });

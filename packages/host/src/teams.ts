@@ -2485,6 +2485,11 @@ export class TeamService {
   }
   private async startAutomaticDeliveryRecovery(stored: Stored, trackingReady: boolean) {
     const { run } = stored, recovery = run.recovery, delivery = run.deliveryRecovery;
+    // Preparing the reconciliation member is itself an asynchronous workspace operation.
+    // Leave it running when the next scheduler tick sees its pending record; otherwise
+    // this recovery would block and abort the preparation it just started.
+    if (recovery?.status === "stopping" && delivery?.status === "stopping" && stored.pending?.kind === "member" &&
+        !stored.pending.failure && this.commands.has(run.id)) return true;
     if (this.publicationGate(stored, "delivery")) return true;
     const attempt = stored.deliveryAttempt;
     const previous = attempt && run.members.find(member => member.memberId === attempt.memberId);

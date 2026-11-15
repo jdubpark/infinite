@@ -517,6 +517,93 @@ test("sealed project groups, identities, and request receipts survive a service 
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test("an owner regrouping changes the moved checkout's mark in the same write; a fold, a rename and a restart do not", () => {
+  const f = fixture(), other = fixture();
+  try {
+    let groupWrites = 0, failing = false, identified = false;
+    const writer = (file: string, key: Buffer, scope: string, value: unknown) => {
+      if (failing) throw new Error("write failed");
+      if (scope === "project-groups") groupWrites++;
+      writeSealed(file, key, scope, value);
+    };
+    const service = f.service(writer, { git: (cwd, args) => identified ? f.git(cwd, args) : undefined });
+    const mark = (id: string) => service.ownerMoveMark(id);
+    const initial = { rehearsal: mark("rehearsal"), codex: mark("alpha-codex"), beta: mark("beta") };
+    assert.notEqual(other.service().ownerMoveMark("beta"), initial.beta, "another host's record never matches");
+
+    assert.equal(service.containing("rehearsal")?.id, "rehearsal");
+    identified = true;
+    f.clock += 61_000;
+    assert.deepEqual(["rehearsal", "alpha-codex"].map(id => service.containing(id)?.id), ["alpha", "alpha"], "the host folded both checkouts");
+    assert.deepEqual([mark("rehearsal"), mark("alpha-codex")], [initial.rehearsal, initial.codex], "a host fold moves nothing");
+
+    const alpha = service.get("alpha");
+    service.update("alpha", { requestId: randomUUID(), revision: alpha.revision, name: "Alpha Renamed", hidden: true });
+    assert.deepEqual([mark("rehearsal"), mark("alpha-codex")], [initial.rehearsal, initial.codex], "a rename moves nothing");
+
+    const writesBefore = groupWrites;
+    failing = true;
+    const request = { requestId: randomUUID(), name: "Client", repos: ["beta", "rehearsal"] };
+    assert.throws(() => service.create(request), /write failed/);
+    failing = false;
+    const created = service.create(request);
+    assert.equal(groupWrites, writesBefore + 1, "the regrouping and its marks are one write");
+    const moved = { beta: mark("beta"), rehearsal: mark("rehearsal") };
+    assert.notEqual(moved.beta, initial.beta);
+    assert.notEqual(moved.rehearsal, initial.rehearsal);
+    assert.equal(mark("alpha-codex"), initial.codex);
+    service.create(request);
+    assert.deepEqual([mark("beta"), mark("rehearsal")], [moved.beta, moved.rehearsal], "a replayed request moves nothing again");
+
+    const restarted = f.service();
+    assert.deepEqual(["beta", "rehearsal"].map(id => restarted.containing(id)?.id), [created.id, created.id]);
+    assert.deepEqual([restarted.ownerMoveMark("beta"), restarted.ownerMoveMark("rehearsal")], [moved.beta, moved.rehearsal]);
+    assert.equal(restarted.ownerMoveMark("alpha-codex"), initial.codex);
+    restarted.remove(created.id, { requestId: randomUUID(), revision: created.revision });
+    assert.notEqual(restarted.ownerMoveMark("beta"), moved.beta, "deleting a project moves its checkouts out");
+    assert.equal(restarted.ownerMoveMark("alpha-codex"), initial.codex);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+    rmSync(other.root, { recursive: true, force: true });
+  }
+});
+
+test("a checkout removed from the stored project that carries its own id has moved; storing that project moved nothing", () => {
+  const f = fixture();
+  try {
+    const service = f.service();
+    const initial = { one: service.ownerMoveMark("home-one"), two: service.ownerMoveMark("home-two") };
+
+    const stored = service.update("home-one", { requestId: randomUUID(), revision: 1, name: "Home Space" });
+    assert.equal(stored.id, "home-one");
+    assert.equal(service.ownerMoveMark("home-one"), initial.one, "an implicit project that gets a stored record keeps its checkout");
+
+    const joined = service.update("home-one", { requestId: randomUUID(), revision: stored.revision, repos: ["home-one", "home-two"] });
+    assert.equal(service.ownerMoveMark("home-one"), initial.one);
+    assert.notEqual(service.ownerMoveMark("home-two"), initial.two, "joining a stored project from an implicit one is a move");
+
+    const left = service.update("home-one", { requestId: randomUUID(), revision: joined.revision, repos: ["home-two"] });
+    const removed = service.ownerMoveMark("home-one");
+    assert.notEqual(removed, initial.one, "removal is a move although the implicit id is the same");
+
+    service.update("home-one", { requestId: randomUUID(), revision: left.revision, repos: ["home-two", "home-one"] });
+    assert.notEqual(service.ownerMoveMark("home-one"), removed, "joining a stored project that already existed is a move although it carries the checkout's id");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a stored state from before owner moves were recorded gets one record that survives a restart", () => {
+  const f = fixture();
+  try {
+    writeSealed(join(f.config.stateDir, "project-groups", "state.sealed"), f.key, "project-groups", { groups: {}, receipts: {}, tombstones: [] });
+    const first = f.service().ownerMoveMark("beta");
+    assert.equal(f.service().ownerMoveMark("beta"), first);
+    writeSealed(join(f.config.stateDir, "project-groups", "state.sealed"), f.key, "project-groups", {
+      groups: {}, receipts: {}, tombstones: [], ownerMoves: { id: "not-a-record", counts: {} },
+    });
+    assert.throws(() => f.service(), /Invalid project-group owner moves/);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test("project group API exposes reads to paired roles and restricts all mutations to owners", async () => {
   const f = fixture();
   let host: Host | undefined;

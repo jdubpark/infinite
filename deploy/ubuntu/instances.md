@@ -540,7 +540,7 @@ Questions need no new scope either. Set `intake.slack.answerQuestions` to `true`
 starts with `work:` always files a request. Set `intake.slack.classify` to `true`
 (it needs `answerQuestions` and the top-level `jev` block) to let the reading
 service choose when the mention has neither word; the owner's mention text, cut to
-1,000 characters, is sent to it. Both default to `false`. See
+1,000 characters, is sent to it. To use the reading service for this route only, set `jev.sessionReadings` to `false`. Both default to `false`. See
 [intake](../../docs/intake.md#questions).
 
 Configure external connectors as MCP servers in the instance agent account,

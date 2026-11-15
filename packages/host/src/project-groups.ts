@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { mkdirSync, readFileSync } from "node:fs";
@@ -40,8 +40,15 @@ type LegacyGroup = Omit<StoredGroup, "kind" | "hidden" | "members" | "detached" 
   primary?: Record<string, string>;
   repos?: Array<{ projectId: string }>;
 };
-type Stored = { groups: Record<string, LegacyGroup>; receipts: Record<string, GroupReceipt>; tombstones?: string[] };
-type CurrentStored = { groups: Record<string, StoredGroup>; receipts: Record<string, GroupReceipt>; tombstones: string[] };
+/**
+ * How often an owner regrouping moved each checkout to another project. `id` is random and written once, so a
+ * state file that lost this record never matches a mark taken before the loss. An older copy of the file carries
+ * its older counts under the same `id`: a procedure that restores one must replace `id`, or marks taken before a
+ * later move match again.
+ */
+type OwnerMoves = { id: string; counts: Record<string, number> };
+type Stored = { groups: Record<string, LegacyGroup>; receipts: Record<string, GroupReceipt>; tombstones?: string[]; ownerMoves?: OwnerMoves };
+type CurrentStored = { groups: Record<string, StoredGroup>; receipts: Record<string, GroupReceipt>; tombstones: string[]; ownerMoves: OwnerMoves };
 type StateWriter = (file: string, key: Buffer, scope: string, value: unknown) => void;
 type ProjectGroupServiceOptions = {
   git?: GitReader;
@@ -55,6 +62,12 @@ const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(va
 const notFound = () => new TeamError(404, "project-group-not-found", "This project group does not exist.");
 const repoConflict = (projectId: string) => new TeamError(409, "project-group-repo-conflict", `Repository ${projectId} already belongs to an owner-created group.`);
 const primaryInvalid = () => new TeamError(400, "project-group-primary-invalid", "Choose one primary checkout per repository from this project.");
+const validOwnerMoves = (value: unknown): value is OwnerMoves => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const { id, counts } = value as Partial<OwnerMoves>;
+  return typeof id === "string" && /^[a-f0-9-]{36}$/.test(id) && Boolean(counts) && typeof counts === "object" && !Array.isArray(counts)
+    && Object.values(counts as Record<string, unknown>).every(count => Number.isSafeInteger(count) && (count as number) > 0);
+};
 
 /** Owner-managed project groups. Groups organize checkout identity without changing repository policy or context. */
 export class ProjectGroupService {
@@ -70,6 +83,8 @@ export class ProjectGroupService {
   private pending?: CurrentStored;
   private pendingIdentities?: Record<string, CheckoutIdentity>;
   private needsMigration = false;
+  /** The owner-move record exists only in memory until the next write. */
+  private ownerMovesUnsaved = false;
   private readonly failedCaptureAt = new Map<string, number>();
 
   constructor(
@@ -126,10 +141,14 @@ export class ProjectGroupService {
         : stored.tombstones;
       if (!Array.isArray(tombstones) || tombstones.some(id => typeof id !== "string" || !projectGroupIdSchema.safeParse(id).success))
         throw new Error("Invalid project-group tombstones");
-      this.state = { groups, receipts: stored.receipts, tombstones: [...new Set(tombstones)] };
+      if (stored.ownerMoves !== undefined && !validOwnerMoves(stored.ownerMoves)) throw new Error("Invalid project-group owner moves");
+      this.ownerMovesUnsaved = stored.ownerMoves === undefined;
+      this.state = { groups, receipts: stored.receipts, tombstones: [...new Set(tombstones)], ownerMoves: stored.ownerMoves ?? { id: randomUUID(), counts: {} } };
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") this.state = { groups: {}, receipts: {}, tombstones: [] };
-      else throw error;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        this.state = { groups: {}, receipts: {}, tombstones: [], ownerMoves: { id: randomUUID(), counts: {} } };
+        this.ownerMovesUnsaved = true;
+      } else throw error;
     }
 
     try {
@@ -162,6 +181,7 @@ export class ProjectGroupService {
     this.state = candidate;
     this.pending = undefined;
     this.needsMigration = false;
+    this.ownerMovesUnsaved = false;
   }
 
   private persistIdentities(candidate: Record<string, CheckoutIdentity>) {
@@ -384,10 +404,45 @@ export class ProjectGroupService {
     return structuredClone(receipt.result);
   }
 
+  /**
+   * Every owner mutation persists through here, so a move and its count are one write. A host fold never passes.
+   * A checkout moved when it left the stored project that held it, by removal, by transfer or because the owner
+   * deleted that project, or when it joined a stored project from its own implicit one. An ungrouped checkout is
+   * held by the implicit project that carries its id, and a stored project can carry that id too, so ids alone do
+   * not tell the two apart. Giving an implicit project its own stored record in one act moves nothing.
+   */
   private record(candidate: CurrentStored, requestId: string, fingerprint: string, result: ProjectGroup) {
+    // A stored member that is not enrolled now is counted too, so a checkout that returns does not skip a move made meanwhile.
+    const ids = new Set([
+      ...this.config.projects.map(project => project.id),
+      ...[this.state, candidate].flatMap(state => Object.values(state.groups).flatMap(group => group.members)),
+    ]);
+    for (const id of ids) {
+      const before = this.findContaining(this.state, id), after = this.findContaining(candidate, id);
+      const moved = before !== undefined
+        ? after?.id !== before.id
+        : after !== undefined && (after.id !== id || own(this.state.groups, after.id) !== undefined);
+      if (moved) candidate.ownerMoves.counts[id] = (own(candidate.ownerMoves.counts, id) ?? 0) + 1;
+    }
     candidate.receipts[requestId] = { fingerprint, result: structuredClone(result) };
     this.persist(candidate);
     return structuredClone(result);
+  }
+
+  /**
+   * A value that changes whenever an owner regrouping moves this checkout to another project, and never when the
+   * host folds it. A record that must not outlive such a move pins this mark and compares it later.
+   */
+  ownerMoveMark(projectId: string): string {
+    this.reconcile();
+    if (this.ownerMovesUnsaved) this.persist(structuredClone(this.state));
+    return `${this.state.ownerMoves.id}:${own(this.state.ownerMoves.counts, projectId) ?? 0}`;
+  }
+
+  /** The id of the stored project that holds this checkout, whether or not the checkout is enrolled on the host now. */
+  storedHolder(projectId: string): string | undefined {
+    this.reconcile();
+    return this.findContaining(this.state, projectId)?.id;
   }
 
   private findContaining(candidate: CurrentStored, projectId: string) {

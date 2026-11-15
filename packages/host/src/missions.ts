@@ -86,6 +86,8 @@ const notFound = (error: unknown) => error instanceof TeamError && error.code ==
  * A mission splits one owner task across a project's repositories. Its coordinator only plans and
  * decides; every change runs as an ordinary single-repository team run that owns its agents and Git work.
  */
+const answerDispatchRefusal = "This mission answers a question and cannot start subtasks. Report the answer as a result, ask the owner a question, or report blocked.";
+
 export class MissionService {
   private readonly records = new Map<string, Stored>();
   private readonly saved = new Map<string, string>();
@@ -288,12 +290,13 @@ export class MissionService {
       const createdAt = now();
       const stored: Stored = { fingerprint, ...(originalFingerprint && originalFingerprint !== fingerprint ? { requestFingerprints: [originalFingerprint] } : {}),
         receipts: {}, folder, repos, attempts: [], inbox: [{ type: "start" }], notes: [], notified: [], launches: {}, ops: [], refusals: 0, mission: {
-        id: request.requestId, ...(origin ? { origin: structuredClone(origin) } : {}), groupId: group.id, groupName: group.name, repoProjectIds: repos.map(repo => repo.projectId),
+        id: request.requestId, ...(origin ? { origin: structuredClone(origin) } : {}), ...(request.mode ? { mode: request.mode } : {}), groupId: group.id, groupName: group.name, repoProjectIds: repos.map(repo => repo.projectId),
         title: request.title ?? request.objective.split("\n")[0].trim().slice(0, 100), objective: request.objective,
         maxSubtasks: request.maxSubtasks, maxMinutes: request.maxMinutes, deadlineAt: new Date(Date.parse(createdAt) + request.maxMinutes * 60000).toISOString(),
         revision: 1, status: "planning", createdAt, updatedAt: createdAt, lineup, subtasks: [], decisions: [], steering: [], events: [],
       } };
-      this.event(stored, origin
+      if (request.mode === "answer") this.event(stored, "Question received. The coordinator will read the repositories and report an answer; it cannot start subtasks.");
+      else this.event(stored, origin
         ? `Mission started by intake from ${origin.identifier}: ${origin.rule}. The coordinator will inspect the repositories and dispatch subtasks.`
         : "Mission approved. The coordinator will inspect the repositories and dispatch subtasks.");
       for (const text of checkoutEvents) this.event(stored, text);
@@ -1006,6 +1009,7 @@ export class MissionService {
   }
   private consume(stored: Stored, report: MissionReport, attempt: Attempt) {
     const mission = stored.mission;
+    if (mission.mode === "answer" && ["dispatch", "resize-subtask", "cancel-subtask", "steer-subtask", "answer-child"].includes(report.kind)) return this.refuse(stored, report.kind, answerDispatchRefusal);
     const subtask = "subtaskId" in report && report.subtaskId ? mission.subtasks.find(item => item.id === report.subtaskId) : undefined;
     if ("subtaskId" in report && report.subtaskId && !subtask) return this.refuse(stored, report.kind, `Subtask ${report.subtaskId} does not exist.`);
     const openChildDecision = (decisionId: string) => {
@@ -1097,16 +1101,19 @@ export class MissionService {
           stored.inbox.push({ type: "refused", kind: report.kind, reason: "The owner sent direction or an answer after your previous attempt started. Account for it before reporting a result." });
           return;
         }
-        if (!mission.subtasks.some(item => item.status === "done")) return this.refuse(stored, report.kind, "No subtask has finished. Dispatch a subtask before reporting a result, or report blocked.");
-        const stalled = stalledSubtasks(mission);
-        const pending = mission.subtasks.filter(item => item.status === "running" || (item.status === "queued" && !stalled.has(item.id))).length;
-        if (pending) return this.refuse(stored, report.kind, `${pending} subtask${pending === 1 ? " is" : "s are"} still queued or running. Wait for them to finish or cancel them first.`, false);
-        const unfinished = mission.subtasks.filter(item => item.status === "blocked" || stalled.has(item.id)).map(item => item.id);
-        if (unfinished.length) return this.refuse(stored, report.kind, `Subtask${unfinished.length === 1 ? "" : "s"} ${unfinished.join(", ")} did not finish. Cancel each with cancel-subtask, dispatch a replacement, or report blocked.`);
+        const answering = mission.mode === "answer";
+        if (!answering) {
+          if (!mission.subtasks.some(item => item.status === "done")) return this.refuse(stored, report.kind, "No subtask has finished. Dispatch a subtask before reporting a result, or report blocked.");
+          const stalled = stalledSubtasks(mission);
+          const pending = mission.subtasks.filter(item => item.status === "running" || (item.status === "queued" && !stalled.has(item.id))).length;
+          if (pending) return this.refuse(stored, report.kind, `${pending} subtask${pending === 1 ? " is" : "s are"} still queued or running. Wait for them to finish or cancel them first.`, false);
+          const unfinished = mission.subtasks.filter(item => item.status === "blocked" || stalled.has(item.id)).map(item => item.id);
+          if (unfinished.length) return this.refuse(stored, report.kind, `Subtask${unfinished.length === 1 ? "" : "s"} ${unfinished.join(", ")} did not finish. Cancel each with cancel-subtask, dispatch a replacement, or report blocked.`);
+        }
         if (mission.decisions.some(item => !item.answer)) return this.refuse(stored, report.kind, "An owner decision is still open.", false);
         mission.result = { summary: report.summary, revision: mission.revision, at: now() };
         mission.status = "ready-for-review"; mission.reason = undefined; stored.inbox = []; stored.notes = [];
-        this.event(stored, "Every subtask finished and the coordinator reported a result. Ready for owner review; the mission itself published nothing.");
+        this.event(stored, answering ? "The coordinator reported an answer. The mission started no subteam and changed nothing." : "Every subtask finished and the coordinator reported a result. Ready for owner review; the mission itself published nothing.");
         break;
       }
       case "wait": {

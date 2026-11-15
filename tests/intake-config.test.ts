@@ -86,6 +86,17 @@ test("not admitting Linear issues needs direct requests, which need no Linear ag
   assert.equal(parsed({}).intake!.linear.admitIssues, true);
   assert.equal(parsed({}).intake!.slack!.directRequests, false);
 });
+test("answering questions needs direct requests, and classifying needs both answering and the jev block", () => {
+  const direct = { ...slack, directRequests: true };
+  const jev = { apiKeyFile: privateFile("jev-key") };
+  assert.throws(() => validate({ slack: { ...slack, answerQuestions: true } }), /answerQuestions needs intake\.slack\.directRequests/);
+  assert.throws(() => validate({ slack: { ...direct, classify: true } }), /classify needs intake\.slack\.answerQuestions/);
+  assert.throws(() => validate({ slack: { ...direct, answerQuestions: true, classify: true } }), /classify needs the jev block/);
+  assert.doesNotThrow(() => validate({ slack: { ...direct, answerQuestions: true } }));
+  assert.doesNotThrow(() => validate({ slack: { ...direct, answerQuestions: true, classify: true } }, { jev }));
+  const defaults = parsed({}).intake!.slack!;
+  assert.deepEqual([defaults.answerQuestions, defaults.classify], [false, false]);
+});
 test("intake refuses a configuration without the owner's creator ID when a thread is required", () =>
   assert.throws(() => validate({ linear: { ...base.linear, creatorId: undefined }, requireSlackThread: true }), /creatorId/));
 test("intake refuses a configuration without the owner's creator ID when no thread is required", () =>

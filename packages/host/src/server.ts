@@ -310,7 +310,7 @@ export function createApp(config: Config, key: Buffer) {
   // One store serves the service and the Slack surface, so a record the service admits is the record the surface posts.
   const intakeStore = config.intake ? new IntakeStore(config, key) : undefined;
   const intakeSlackClient = config.intake?.slack ? new SlackClient({ botTokenFile: config.intake.slack.botTokenFile, appTokenFile: config.intake.slack.appTokenFile, endpoint: config.intake.slack.endpoint }) : undefined;
-  const intake = config.intake && intakeStore ? new IntakeService(config, intakeStore, missions, new IntakeLinear(linear), { create: createMission, threads: intakeSlackClient }) : undefined;
+  const intake = config.intake && intakeStore ? new IntakeService(config, intakeStore, missions, new IntakeLinear(linear), { create: createMission, threads: intakeSlackClient, ...(config.intake.slack?.classify ? { router: text => readings.requestRoute(text) } : {}) }) : undefined;
   // The Slack surface exists only with an intake Slack block; without one, intake runs on Linear alone.
   const intakeSlack = intakeStore && intakeSlackClient ? new IntakeSlackSurface(config, intakeStore, missions, teams, intakeSlackClient, intake ? { direct: input => intake.requestFromSlack(input) } : {}) : undefined;
   const resumable = (session: { status: string; provider: string; workspace?: unknown; team?: unknown; nativeSession?: unknown; resumeNativeSession?: unknown }) =>

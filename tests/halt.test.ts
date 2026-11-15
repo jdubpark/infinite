@@ -1,7 +1,7 @@
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
@@ -9,7 +9,7 @@ import { BASELINE_FILE, readBaseline } from "../packages/host/src/fuse/baseline.
 import { FuseService } from "../packages/host/src/fuse/service.js";
 import type { FuseGate } from "../packages/host/src/fuse/types.js";
 import { GoalService } from "../packages/host/src/goals.js";
-import { HALT_FILE, MAX_RECEIPTS, haltChain, writeHaltRecord } from "../packages/host/src/halt/record.js";
+import { HALT_COUNT_FILE, HALT_FILE, MAX_RECEIPTS, haltChain, writeHaltRecord } from "../packages/host/src/halt/record.js";
 import { KEPT_PAUSED, type HaltTargets } from "../packages/host/src/halt/rules.js";
 import { RoutineService } from "../packages/host/src/routines.js";
 import { HaltService } from "../packages/host/src/halt/service.js";
@@ -264,12 +264,14 @@ test("a halt survives a restart, finishes an interrupted pass, and fails closed 
   } finally { f.close(); }
 });
 
-test("the halt count and chain keep every engaged halt after its release and after its receipt is dropped, and a restart reads them", async () => {
+test("the halt count lives apart from the halt record: releases, dropped receipts, and a restored or removed record keep it", async () => {
   const f = schedulerFixture();
   const halt = new HaltService({ config: f.config, key: f.key });
+  const recordFile = join(f.config.stateDir, HALT_FILE), countFile = join(f.config.stateDir, HALT_COUNT_FILE);
   try {
     assert.deepEqual(halt.engagements(), { count: 0, chain: "", halts: [] });
     const project = await halt.engage(fixtureScope, { requestId: randomUUID() }, owner);
+    const copy = readFileSync(recordFile, "utf8");
     const host = await halt.engage(hostScope, { requestId: randomUUID() }, owner);
     await halt.engage(hostScope, { requestId: randomUUID() }, owner);
     const projectId = project.halt.projects[0]!.haltId, hostId = host.halt.host!.haltId;
@@ -282,14 +284,22 @@ test("the halt count and chain keep every engaged halt after its release and aft
     for (let index = 0; index < MAX_RECEIPTS; index++) await halt.release(hostScope, { requestId: randomUUID() }, owner);
     assert.deepEqual(halt.engagements(), { count: 2, chain, halts: [] });
     halt.stop();
-    assert.deepEqual(new HaltService({ config: f.config, key: f.key }).engagements(), { count: 2, chain, halts: [] });
-    // A removed record starts again from none.
-    rmSync(join(f.config.stateDir, HALT_FILE));
-    const fresh = new HaltService({ config: f.config, key: f.key });
-    assert.deepEqual(fresh.engagements(), { count: 0, chain: "", halts: [] });
-    const again = await fresh.engage(fixtureScope, { requestId: randomUUID() }, owner);
-    assert.deepEqual(fresh.engagements(), { count: 1, chain: haltChain("", again.halt.projects[0]!.haltId), halts: [{ haltId: again.halt.projects[0]!.haltId, projectId: "fixture", serial: 1 }] });
-    fresh.stop();
+    // An older copy of the record is restored: its halt is back in force, and the count still holds the halt since.
+    writeFileSync(recordFile, copy, { mode: 0o600 });
+    assert.deepEqual(new HaltService({ config: f.config, key: f.key }).engagements(), { count: 2, chain, halts: [{ haltId: projectId, projectId: "fixture", serial: 1 }] });
+    rmSync(recordFile);
+    assert.deepEqual(new HaltService({ config: f.config, key: f.key }).engagements(), { count: 2, chain, halts: [] }, "a removed record keeps the count");
+    // A removed count starts again from none; one that cannot be read leaves the count unknown until a halt writes a new chain.
+    rmSync(countFile);
+    assert.deepEqual(new HaltService({ config: f.config, key: f.key }).engagements(), { count: 0, chain: "", halts: [] });
+    writeFileSync(countFile, "not a sealed count", { mode: 0o600 });
+    const reset = new HaltService({ config: f.config, key: f.key });
+    assert.equal(reset.engagements(), undefined);
+    const again = await reset.engage(fixtureScope, { requestId: randomUUID() }, owner);
+    const counted = reset.engagements()!;
+    assert.equal(counted.count, 1);
+    assert.notEqual(counted.chain, haltChain("", again.halt.projects[0]!.haltId), "a new chain never continues an unknown one");
+    reset.stop();
   } finally { halt.stop(); f.close(); }
 });
 

@@ -19,8 +19,6 @@ export type HaltEntry = {
   by: HaltActor;
   /** False until the stop pass has finished. A restart finishes an unsettled pass. */
   settled: boolean;
-  /** Its place in the record's count of engaged halts. Absent on a halt engaged before the count was kept. */
-  serial?: number;
 };
 export type HaltReceipt = {
   requestId: string;
@@ -37,24 +35,7 @@ export type HaltReceipt = {
   settled: boolean;
   outcomes: HaltOutcome[];
 };
-export type HaltRecord = {
-  version: 1; halts: HaltEntry[]; receipts: HaltReceipt[];
-  /**
-   * How many halts this record has engaged. It is never lowered and is kept apart from the receipts, so a released
-   * halt is still counted after its receipt is dropped. Absent on a record written before it was kept.
-   */
-  engaged?: number;
-  /**
-   * A hash over the id of every halt this record has engaged, in order (see `haltChain`). Two histories that reach
-   * the same count, such as a restored older copy that engaged other halts since, never share it. Absent with the count.
-   */
-  chain?: string;
-};
-
-/** The chain after one more engaged halt. The empty chain stands for a record that has engaged none. */
-export function haltChain(previous: string, haltId: string): string {
-  return createHash("sha256").update(`infinite-halt-chain\n${previous}\n${haltId}`).digest("hex");
-}
+export type HaltRecord = { version: 1; halts: HaltEntry[]; receipts: HaltReceipt[] };
 
 /** Requests remembered for replay. The oldest is dropped first. */
 export const MAX_RECEIPTS = 100;
@@ -72,7 +53,6 @@ const entrySchema = z.object({
   requestId: uuid,
   by: actorSchema,
   settled: z.boolean(),
-  serial: z.number().int().positive().optional(),
 }).strict();
 const outcomeSchema = z.object({
   kind: z.enum(HALT_ITEM_KINDS),
@@ -97,8 +77,6 @@ const recordSchema: z.ZodType<HaltRecord> = z.object({
   version: z.literal(1),
   halts: z.array(entrySchema).max(10000),
   receipts: z.array(receiptSchema).max(MAX_RECEIPTS),
-  engaged: z.number().int().nonnegative().optional(),
-  chain: z.string().regex(/^[0-9a-f]{64}$/).optional(),
 }).strict();
 
 export type HaltRead = { state: "missing" } | { state: "readable"; record: HaltRecord } | { state: "unreadable" };
@@ -121,6 +99,55 @@ export function writeHaltRecord(file: string, key: Buffer, record: HaltRecord): 
   try {
     if (!recordSchema.safeParse(record).success) return false;
     writeSealed(file, key, HALT_SEAL_SCOPE, record);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The count of engaged halts, kept apart from the halt record so that restoring or removing that record keeps it. */
+export const HALT_COUNT_FILE = "halt-count.sealed";
+const HALT_COUNT_SEAL_SCOPE = "halt-count";
+/** Engaged halts remembered by id, newest last, so that a halt in force has its place in the count. */
+export const MAX_RECENT_HALTS = 1000;
+/**
+ * How many halts the host has engaged, a hash chain over their ids in order (see `haltChain`; empty for none), and
+ * the latest ids. Neither a release, a dropped receipt, nor a restored or removed halt record changes it.
+ */
+export type HaltCount = { version: 1; engaged: number; chain: string; recent: string[] };
+
+/** The chain after one more engaged halt. The empty chain stands for a count of none. */
+export function haltChain(previous: string, haltId: string): string {
+  return createHash("sha256").update(`infinite-halt-chain\n${previous}\n${haltId}`).digest("hex");
+}
+
+const countSchema: z.ZodType<HaltCount> = z.object({
+  version: z.literal(1),
+  engaged: z.number().int().nonnegative(),
+  chain: z.string().regex(/^(?:[0-9a-f]{64})?$/),
+  recent: z.array(z.string().min(1).max(200)).max(MAX_RECENT_HALTS),
+}).strict();
+
+export type HaltCountRead = { state: "missing" } | { state: "readable"; count: HaltCount } | { state: "unreadable" };
+
+/** A missing file is a count of none. Any other failure is unreadable. Never throws. */
+export function readHaltCount(file: string, key: Buffer): HaltCountRead {
+  let raw: string;
+  try { raw = readFileSync(file, "utf8"); }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? { state: "missing" } : { state: "unreadable" }; }
+  try {
+    const parsed = countSchema.safeParse(unseal<unknown>(key, HALT_COUNT_SEAL_SCOPE, raw));
+    return parsed.success ? { state: "readable", count: parsed.data } : { state: "unreadable" };
+  } catch {
+    return { state: "unreadable" };
+  }
+}
+
+/** False on any failure. Never throws. */
+export function writeHaltCount(file: string, key: Buffer, count: HaltCount): boolean {
+  try {
+    if (!countSchema.safeParse(count).success) return false;
+    writeSealed(file, key, HALT_COUNT_SEAL_SCOPE, count);
     return true;
   } catch {
     return false;

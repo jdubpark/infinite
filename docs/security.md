@@ -478,14 +478,18 @@ delivered, also after the release and after a restart, and the same request
 is decided again from current evidence. A halt that the pipeline cannot record
 is kept, also after its release, and the agent serves nothing until it is
 recorded; the halt's acknowledgement then carries `deliveryFence: "uncertain"`.
-The halt record counts every halt it engages, and neither a release nor a
-dropped request receipt lowers that count. The pipeline records how much of the
-count it has accounted for, with a hash chain over the ids of the halts it
-counted. A counted halt it did not record, whether it was released between two
-reads or before a restart, a count that went down, and a chain that does not
-follow from the recorded one (a record that was replaced, removed, or restored
-from an older copy, even one brought back to the same count) are recorded as a
-halt of every project. One seen and not yet recorded is kept until it is. A dialog that was
+The host counts every halt it engages in `halt-count.sealed`, a file apart from
+the halt record, with a hash chain over their ids. It writes the count before
+the record, and neither a release, a dropped request receipt, nor a restored or
+removed halt record changes it. The pipeline records how much of the count and
+chain it has accounted for. A counted halt it did not record, whether it was
+released between two reads or before a restart, a count that went down, and a
+chain that does not follow from the recorded one (a count file that was
+replaced, removed, or restored from an older copy) are recorded as a halt of
+every project; one seen and not yet recorded is kept until it is. While the
+count file cannot be read, the agent serves nothing. Restoring both halt files
+from the same older copy while the evidence store cannot be written, and then
+restarting, loses the halts engaged since that copy; this is not detected. A dialog that was
 pending is handed to the agent again after the release and decided from the
 evidence of that time. A host halt, or a halt record that the host cannot
 read, also holds every reviewer launch of a replay. A headless call that

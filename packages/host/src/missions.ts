@@ -301,6 +301,7 @@ export class MissionService {
       catch (error) { if (notFound(error)) return [subtask.finalEvidence?.usage ?? emptyRollup()]; throw error; }
     });
     mission.usage = addRollups([coordinator, ...subteams]);
+    if (stored.clockStoppedAt) mission.clockStoppedAt = stored.clockStoppedAt;
     return mission;
   }
   list() { return [...this.records.values()].map(stored => this.view(stored)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }

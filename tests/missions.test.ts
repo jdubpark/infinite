@@ -1766,12 +1766,14 @@ test("an intake mission waiting on the owner past its original deadline still re
     const { id } = await h.missions.create(missionRequest(5), undefined, intakeOrigin);
     await h.report(1, { kind: "question", question: "Which response format?", options: ["JSON", "Text"] });
     const asked = await until(() => h.get(id), mission => mission.status === "needs-input");
+    assert.ok(asked.clockStoppedAt, "The view says the clock is stopped while the mission waits on the owner");
     // Ten minutes pass while the owner is away, which is more than the five-minute limit.
     mock.timers.tick(10 * 60000);
     await new Promise(done => setTimeout(done, 1200));
     assert.equal(h.missions.peek(id)!.status, "needs-input", "The stopped clock does not block the mission");
     const answered = await h.missions.answer(id, asked.decisions[0].id, { requestId: randomUUID(), revision: asked.revision, text: "JSON" });
     assert.ok(["planning", "working"].includes(answered.status), `The answered mission resumes work, not ${answered.status}`);
+    assert.equal(answered.clockStoppedAt, undefined, "The clock runs again once the owner answers");
     assert.ok(Date.parse(h.missions.peek(id)!.deadlineAt) - Date.now() > 4 * 60000, "The owner's wait is added back to the deadline");
   } finally { h.close(); mock.timers.reset(); }
 });
@@ -2027,6 +2029,7 @@ test("a mission started from the apps keeps the wall-clock deadline", { timeout:
     const created = await h.missions.create(missionRequest(5));
     await h.attempt(1);
     const paused = await h.missions.pause(created.id, { requestId: randomUUID(), revision: created.revision });
+    assert.equal(paused.clockStoppedAt, undefined, "A mission started from the apps never stops its clock");
     // Stop the tick, so no step can block the paused mission between the clock move and the resume.
     h.missions.close();
     mock.timers.tick(10 * 60000);

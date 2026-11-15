@@ -395,6 +395,10 @@ For a running or paused mission, the extension adds to its current deadline.
 An intake mission stops its working-time clock while it is `needs-input` or
 `paused`, and the deadline moves forward by the time it was stopped. Waiting for
 an owner answer does not use up the limit. Other missions keep a fixed deadline.
+While the clock is stopped, the mission view carries `clockStoppedAt`, and its
+`deadlineAt` does not yet include the stopped time. The time left is `deadlineAt`
+minus `clockStoppedAt`. Clients show that instead of a stop time, and they offer
+Resume while any time is left.
 
 ### Stale blocked missions
 

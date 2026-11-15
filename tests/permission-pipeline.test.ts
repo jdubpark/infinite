@@ -154,6 +154,8 @@ class Halts extends Set<string> {
   replace() { this.restore({ count: 0, chain: "" }); }
   snapshot() { return { count: this.count, chain: this.chain }; }
   restore(copy: { count: number; chain: string }) { this.clear(); this.count = copy.count; this.chain = copy.chain; }
+  /** A halt in force again under its old id, as an older copy of the halt record brings it back; the count is kept apart. */
+  reinstate(projectId: string, mark: { haltId: string; serial: number }) { this.ids.set(projectId, mark); super.add(projectId); }
   override add(projectId: string) {
     if (!this.has(projectId)) {
       const haltId = randomUUID();
@@ -439,6 +441,29 @@ test("an older copy of the halt record, restored and brought back to the counted
   f.restart();
   assert.equal(f.pipeline.observeHalts(), true);
   assert.equal(f.pipeline.applicable(after.decisionId), false, "the same count with another history does not agree");
+}));
+
+test("a halt in force again under the same id, from a restored older halt record, retires the decisions made since its release", () => withFixture(async f => {
+  f.delegate();
+  f.halted.add("alpha-app");
+  assert.equal(f.pipeline.observeHalts(), true);
+  const halt = f.halted.ids.get("alpha-app")!;
+  f.halted.clear();
+  assert.equal(f.pipeline.observeHalts(), true);
+  const since = decided(await f.pipeline.decide(request({ action: "npm test" })), "allow");
+  // The halt record is restored from a copy taken while the halt was in force, and the host restarts.
+  f.halted.reinstate("alpha-app", halt);
+  f.restart();
+  assert.equal(f.pipeline.observeHalts(), true);
+  f.halted.clear();
+  assert.equal(f.pipeline.observeHalts(), true);
+  assert.equal(f.pipeline.applicable(since.decisionId), false, "the period in force again is a halt epoch of its own");
+  // The same within one process.
+  const again = decided(await f.pipeline.decide(request({ action: "npm test" })), "allow");
+  f.halted.reinstate("alpha-app", halt);
+  assert.equal(f.pipeline.observeHalts(), true);
+  f.halted.clear();
+  assert.equal(f.pipeline.applicable(again.decisionId), false);
 }));
 
 test("a halt record seen to differ from the count is kept until it is recorded, also when the record returns to the counted state", () => withFixture(async f => {

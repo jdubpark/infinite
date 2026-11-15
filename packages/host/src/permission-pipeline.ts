@@ -146,10 +146,10 @@ export class PermissionPipelineState {
     return row && { fingerprint: row.fingerprint, result: JSON.parse(row.result_json) as unknown };
   }
 
-  /** Records an owner halt once. `projectId` is absent for a host halt. */
-  noteHalt(haltId: string, projectId: string | undefined, at: string): void {
+  /** Records one period of an owner halt in force, under an epoch id of its own. `projectId` is absent for a host halt. */
+  noteHalt(epochId: string, projectId: string | undefined, at: string): void {
     this.store.write(tx => {
-      tx.run(`INSERT OR IGNORE INTO ${HALTS} (halt_id,project_id,at) VALUES (?,?,?)`, haltId, projectId ?? null, at);
+      tx.run(`INSERT OR IGNORE INTO ${HALTS} (halt_id,project_id,at) VALUES (?,?,?)`, epochId, projectId ?? null, at);
     });
   }
 
@@ -238,8 +238,13 @@ export class HostPermissionPipeline implements PermissionPipeline {
   private readonly haltedOf: ((projectId: string) => boolean) | undefined;
   private readonly haltsOf: (() => readonly PermissionHaltMark[] | undefined) | undefined;
   private readonly haltCountOf: (() => { count: number; chain: string } | undefined) | undefined;
-  /** Halts already recorded, and each project's latest one. Both are rebuilt from the state after a restart. */
-  private readonly noted = new Set<string>();
+  /**
+   * The halts in force at the last read whose period is recorded, and each project's latest halt epoch. A halt that
+   * comes into force, also again under the same id (an older copy of the halt record restored), and every halt in
+   * force at the first read after a restart, start a new period. A halt's own scope decides nothing while it lasts,
+   * so a new period of a halt that never ended retires nothing more.
+   */
+  private readonly inForce = new Set<string>();
   private readonly epochs = new Map<string, string | undefined>();
   /** Halts seen but not yet recorded. Kept after the release, and nothing is served until each is recorded. */
   private readonly unrecorded = new Map<string, PermissionHaltMark>();
@@ -276,11 +281,12 @@ export class HostPermissionPipeline implements PermissionPipeline {
     try { count = this.haltCountOf?.(); } catch { count = undefined; }
     let active: readonly PermissionHaltMark[] | undefined;
     try { active = this.haltsOf?.(); } catch { active = undefined; }
-    for (const mark of active ?? []) if (!this.noted.has(mark.haltId) && !this.unrecorded.has(mark.haltId)) this.unrecorded.set(mark.haltId, mark);
+    if (active) for (const haltId of [...this.inForce]) if (!active.some(mark => mark.haltId === haltId)) this.inForce.delete(haltId);
+    for (const mark of active ?? []) if (!this.inForce.has(mark.haltId) && !this.unrecorded.has(mark.haltId)) this.unrecorded.set(mark.haltId, mark);
     for (const [haltId, mark] of [...this.unrecorded]) {
       try {
-        this.state.noteHalt(haltId, mark.projectId, this.timestamp());
-        this.noted.add(haltId);
+        this.state.noteHalt(`${haltId}:${randomUUID()}`, mark.projectId, this.timestamp());
+        if (active?.some(item => item.haltId === haltId)) this.inForce.add(haltId);
         if (mark.serial !== undefined) this.countedSerials.set(mark.serial, haltId);
         this.unrecorded.delete(haltId);
         this.epochs.clear();
@@ -321,7 +327,7 @@ export class HostPermissionPipeline implements PermissionPipeline {
       this.counted = current;
       this.missedPending = false;
       this.countedSerials.clear();
-      if (haltId !== undefined) { this.noted.add(haltId); this.epochs.clear(); }
+      if (haltId !== undefined) this.epochs.clear();
       return true;
     } catch {
       this.counted = undefined;

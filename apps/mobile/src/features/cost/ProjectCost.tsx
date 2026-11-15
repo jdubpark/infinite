@@ -21,7 +21,7 @@ export function ProjectCost({ connection, id }: { connection: Connection; id: st
   const colors = accountColors(accounts);
   const top = <TopBar backLabel="Cost" onBack={() => { if (router.canGoBack()) router.back(); else router.replace({ pathname: "/cost", params: { machine } }); }}
     right={<LiveStatus online={project.online} loading={project.loading} seen={project.seen} />} />;
-  if (!project.data) return <View style={s.fill}>{top}<View style={s.empty}>
+  if (!project.data) return <View style={s.fill}>{top}<HaltBanner connection={connection} place={{ projectIds: [id] }} style={s.halt} /><View style={s.empty}>
     {project.loading ? <ActivityIndicator color={theme.colors.forest} /> : <Text style={t.note}>Could not load this project’s cost.</Text>}
   </View></View>;
   const cost = project.data;
@@ -75,6 +75,7 @@ function CostRow({ label, detail, total, onPress }: { label: string; detail?: st
 const s = StyleSheet.create({
   fill: { flex: 1 },
   empty: { padding: 30, alignItems: "center" },
+  halt: { marginHorizontal: 16, marginTop: 2 },
   body: { paddingHorizontal: 16, paddingTop: 2, gap: 10, paddingBottom: 28 },
   head: { flexDirection: "row", alignItems: "baseline", gap: 8 },
   total: { fontSize: 34, lineHeight: 40, fontWeight: "600", letterSpacing: -0.8, color: theme.colors.ink },

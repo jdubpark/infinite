@@ -13,8 +13,7 @@ import { SystemOverview } from "./SystemOverview";
 import { clearUnderstandingSummary, readUnderstandingSummary, saveUnderstandingSummary } from "./offline-cache";
 
 type ViewMode = "work" | "system";
-/** `checkouts` are the workspace's, for the halt banner; a cached overview keeps those of the last read. */
-type ReadResult = { scope: string; state: "ready" | "missing" | "upgrade" | "denied"; groupName: string; checkouts?: Checkout[]; data?: WorkspaceUnderstanding; error?: string; cachedAt?: string };
+type ReadResult = { scope: string; state: "ready" | "missing" | "upgrade" | "denied"; groupName: string; data?: WorkspaceUnderstanding; error?: string; cachedAt?: string };
 
 type Checkout = { projectId: string; name: string };
 
@@ -35,14 +34,18 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
   const stopped = useRef("");
   const last = useRef<ReadResult | null>(null);
   const [view, setView] = useState<ViewMode>(params.view === "system" ? "system" : "work");
+  // The checkouts from the last successful workspace list, for the halt banner. They are kept apart from the brief,
+  // so a project halt still shows when the brief read fails after the list succeeded.
+  const [membership, setMembership] = useState<{ scope: string; checkouts: Checkout[] }>();
 
   const poll = usePoll(async () => {
     if (stopped.current === scope && last.current?.scope === scope) return last.current;
-    let confirmedGroupName = "", checkouts: Checkout[] | undefined;
+    let confirmedGroupName = "";
     try {
       const groups = await api<ProjectGroupList>(connection, "/project-groups");
       const group = groups.groups.find(candidate => candidate.id === workspaceId);
       if (!group) {
+        setMembership({ scope, checkouts: [] });
         await clearUnderstandingSummary(connection, workspaceId);
         const result: ReadResult = { scope, state: "missing", groupName: "", error: "This workspace is no longer available on this machine." };
         last.current = result;
@@ -50,15 +53,15 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
         return result;
       }
       confirmedGroupName = group.name;
-      checkouts = group.repos.flatMap(repo => repo.checkouts.map(({ projectId, name }) => ({ projectId, name })));
+      setMembership({ scope, checkouts: group.repos.flatMap(repo => repo.checkouts.map(({ projectId, name }) => ({ projectId, name }))) });
       const data = await api<WorkspaceUnderstanding>(connection, `/project-groups/${encodeURIComponent(workspaceId)}/understanding`);
       if (data.schemaVersion !== 1 || data.workspace.id !== workspaceId) {
-        const result: ReadResult = { scope, state: "upgrade", groupName: group.name, checkouts, error: "This host returned an unsupported Understanding version." };
+        const result: ReadResult = { scope, state: "upgrade", groupName: group.name, error: "This host returned an unsupported Understanding version." };
         last.current = result;
         stopped.current = scope;
         return result;
       }
-      const result: ReadResult = { scope, state: "ready", groupName: group.name, checkouts, data };
+      const result: ReadResult = { scope, state: "ready", groupName: group.name, data };
       last.current = result;
       void saveUnderstandingSummary(connection, data);
       return result;
@@ -66,7 +69,7 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
       if (error instanceof ApiError && [401, 403, 404].includes(error.status)) {
         await clearUnderstandingSummary(connection, workspaceId).catch(() => {});
         const result: ReadResult = error.status === 404 && confirmedGroupName
-          ? { scope, state: "upgrade", groupName: confirmedGroupName, checkouts, error: "Update this host to use Workspace Understanding." }
+          ? { scope, state: "upgrade", groupName: confirmedGroupName, error: "Update this host to use Workspace Understanding." }
           : error.status === 404
             ? { scope, state: "missing", groupName: "", error: "This workspace is no longer available on this machine." }
             : { scope, state: "denied", groupName: confirmedGroupName, error: "This device no longer has access to this workspace." };
@@ -76,7 +79,7 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
       }
       const cached = await readUnderstandingSummary(connection, workspaceId);
       if (cached) {
-        const result: ReadResult = { scope, state: "ready", groupName: cached.data.workspace.name, checkouts: last.current?.scope === scope ? last.current.checkouts : undefined, data: cached.data, cachedAt: cached.cachedAt };
+        const result: ReadResult = { scope, state: "ready", groupName: cached.data.workspace.name, data: cached.data, cachedAt: cached.cachedAt };
         last.current = result;
         return result;
       }
@@ -95,6 +98,7 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
   const data = result?.state === "ready" ? result.data : undefined;
   const repoById = new Map(data?.repositories.map(repo => [repo.id, repo]) ?? []);
   const groupName = result?.groupName || data?.workspace.name || "Workspace";
+  const checkouts = membership?.scope === scope ? membership.checkouts : [];
   const back = () => router.canGoBack() ? router.back() : router.replace({ pathname: "/(tabs)/understanding", params: { ...(params.machine ? { machine: params.machine } : {}) } });
   const revealKnowledge = (anchor: View | null) => {
     requestAnimationFrame(() => {
@@ -107,7 +111,7 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
   return <View style={s.fill}>
     <TopBar backLabel="Understand" onBack={back} title={groupName} right={<LiveStatus online={poll.online && result?.state === "ready" && !result.cachedAt} loading={poll.loading} seen={poll.seen} stale={poll.stale} />} />
     <Segmented options={views} value={view} onChange={setView} style={s.segment} />
-    <HaltBanner connection={connection} place={{ projectIds: result?.checkouts?.map(checkout => checkout.projectId) ?? [] }} names={id => result?.checkouts?.find(checkout => checkout.projectId === id)?.name} style={s.halt} />
+    <HaltBanner connection={connection} place={{ projectIds: checkouts.map(checkout => checkout.projectId) }} names={id => checkouts.find(checkout => checkout.projectId === id)?.name} style={s.halt} />
     <ScrollView ref={scroll} contentContainerStyle={s.content} keyboardShouldPersistTaps="handled"
       refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={() => { stopped.current = ""; poll.refresh(); }} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <View ref={content}>

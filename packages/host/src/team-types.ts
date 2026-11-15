@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { featureMapSchema, TASK_KINDS } from "./task-features.js";
 import { evalProjectSchema } from "./eval-config.js";
+import { teamRoutingSchema } from "./routing-policy.js";
+import type { TeamRunRouting } from "./routing-types.js";
 import type { Prompt, AnswerResult } from "@infinite/attention";
 import type { Receipt } from "./types.js";
 import type { Provider } from "./types.js";
@@ -206,6 +208,8 @@ export const teamProjectSchema = z.object({
   /** The private feature map. Read at acceptance; never sent to a member. No default, so the authority digest is unchanged when unset. */
   features: featureMapSchema.optional(),
   eval: evalProjectSchema.optional(),
+  /** The routing policy (owner-set). No default, so an unset policy leaves the authority digest unchanged. */
+  routing: teamRoutingSchema.optional(),
 }).strict().superRefine((project, context) => {
   if (project.establishChecks ? project.checks.length > 0 : project.checks.length === 0)
     context.addIssue({ code: "custom", path: ["checks"], message: "Configure required checks, or explicitly authorize the team to establish them with an empty checks array." });
@@ -534,6 +538,8 @@ export interface TeamCheck {
 export interface TeamRun {
   /** Set when the run was created with the blackboard tools switch on and a ready store. Absent means today's behaviour. */
   blackboard?: { tools: true };
+  /** The routing policy pinned when the run starts. Absent on runs without a recording policy. */
+  routing?: TeamRunRouting;
   /** The project's autonomy mode, pinned when the run starts. Absent on runs recorded before the mode existed; read with autonomyOf(). */
   autonomy?: AutonomyMode;
   /** Explicit owner delegation pinned at creation. Old runs remain opted out. */

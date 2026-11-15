@@ -246,6 +246,8 @@ infinite permissions reopen DECISION_ID [--request-id UUID]
 infinite permissions unlock ASSIGNMENT [--request-id UUID]
 infinite permissions log [--rejected] [--raised] [--workspace W] [--since T] [--limit N] [--before CURSOR] [--json]
 infinite permissions mark DECISION_ID --wrong --note TEXT [--request-id UUID]
+infinite permissions replay --set FILE [--json] [--request-id UUID]
+                                          Measure the permission agent on a labelled set
 infinite projects [--json]                 List projects and suggested groups
 infinite understand [--workspace ID] [--json] Read workspace Understanding
 infinite understand catalog|components|component ID|policy|refresh --workspace ID

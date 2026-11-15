@@ -74,6 +74,12 @@ import { PermissionJournal, permissionJournalModule } from "./evidence/permissio
 import { HostPermissionPipeline, PermissionOwnerControls, closeRejectsOnDirectionChange, openPermissionPipelineState } from "./permission-pipeline.js";
 import { registerPermissionControlRoutes } from "./permission-control-routes.js";
 import { permissionRateFlags, registerPermissionReviewRoutes } from "./permission-review-routes.js";
+import { PermissionMeasurements, permissionMeasurementsModule } from "./evidence/permission-measurements.js";
+import { hostProtectedPaths, permissionAgentSettings } from "./permission-agent-config.js";
+import { createPermissionAgentCore } from "./permission-core.js";
+import { createCliTurnLauncher, type PermissionTurnGate } from "./permission-reviewer.js";
+import { PermissionReplayJobs } from "./permission-replay.js";
+import { PERMISSION_REPLAY_PATH, permissionAgentStatus, registerPermissionAgentRoutes } from "./permission-agent-routes.js";
 import { LinearService } from "./linear.js";
 import { createGoalSchema, goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema, goalParallelismSchema } from "./goal-types.js";
 import { createProjectGroupSchema, projectGroupIdSchema, updateProjectGroupSchema } from "./project-group-types.js";
@@ -286,7 +292,25 @@ export function createApp(config: Config, key: Buffer) {
   catch { console.warn("[Infinite] Permission delegation is unavailable on this host."); }
   // The permission agent's parts. A part that is absent leaves the requests it would serve with the owner.
   const permissionAgent: PermissionAgentServices = {};
-  void permissionAgent;
+  // The decision core. The pipeline calls its review; replays measure it, and status reports its readiness.
+  let permissionMeasurements: PermissionMeasurements | undefined;
+  try {
+    evidence.register(permissionMeasurementsModule);
+    permissionMeasurements = new PermissionMeasurements(evidence);
+  } catch { permissionMeasurements = undefined; }
+  // Every reviewer launch passes this gate. An owner halt sets `hold` to hold launches.
+  const permissionTurnGate: { hold?: PermissionTurnGate } = {};
+  const permissionCoreOptions = {
+    settings: () => permissionAgentSettings(config),
+    launcher: createCliTurnLauncher({ agents: config.agents, gate: turn => permissionTurnGate.hold?.(turn) ?? true, onUsage: usage => permissionMeasurements?.recordUsage(usage) }),
+    results: permissionMeasurements,
+    facts: { protectedPaths: hostProtectedPaths(config, fileURLToPath(new URL("../../../", import.meta.url))) },
+  };
+  const permissionCore = createPermissionAgentCore(permissionCoreOptions);
+  permissionAgent.core = permissionCore;
+  const permissionReplays = permissionMeasurements
+    ? new PermissionReplayJobs({ core: () => createPermissionAgentCore({ ...permissionCoreOptions, purpose: "replay" }), measurements: permissionMeasurements })
+    : undefined;
   // The pipeline decides and records; it is built only when a decision core exists. The owner controls need only the journal.
   const permissionState = permissionJournal ? openPermissionPipelineState(evidence) : undefined;
   const permissionControls = permissionJournal && permissionState ? new PermissionOwnerControls(permissionJournal, permissionState) : undefined;
@@ -543,8 +567,8 @@ export function createApp(config: Config, key: Buffer) {
       return res.status(403).json({ error: "Host is not allowed" });
     next();
   });
-  // The sync commit manifest is parsed by its own route, after authentication.
-  app.use((req, res, next) => /^\/api\/projects\/[^/]+\/sync\/commit$/.test(req.path) ? next()
+  // The sync commit manifest and a permission replay set are parsed by their own routes, after authentication.
+  app.use((req, res, next) => /^\/api\/projects\/[^/]+\/sync\/commit$/.test(req.path) || PERMISSION_REPLAY_PATH.test(req.path) ? next()
     : express.json({ limit: /^\/api\/sessions\/[^/]+\/opencode(?:\/|$)/.test(req.path) ? "8mb" : "96kb" })(req, res, next));
   function authenticate(token: string) {
     const digest = Buffer.from(hashToken(token), "hex");
@@ -1069,8 +1093,10 @@ export function createApp(config: Config, key: Buffer) {
       workspaces: permissionDelegation.status(),
       rates,
       rateFlags: permissionRateFlags(journal, now),
+      ...permissionAgentStatus(permissionCore, permissionMeasurements, permissionReplays),
     });
   });
+  registerPermissionAgentRoutes(app, { requireRole, requireOwnerCli, jobs: permissionReplays });
   // Decision figures for one session, task or workspace, or for the host, over the last `hours` (one hour to seven days).
   app.get("/api/permissions/rates", requireRole(["owner", "controller"]), (req, res) => {
     if (!permissionJournal) return res.status(503).json({ error: "The permission journal is unavailable on this host." });

@@ -1,0 +1,474 @@
+/**
+ * The permission agent's host rules: the class rules that send a request to the owner, the qualify
+ * step, and the raise rules that select the strong tier. A host rule never allows a request. The host's
+ * lists are data in one place (`PERMISSION_CLASS_LISTS`), so a change to a list is visible in review and
+ * makes every replay result stale (it is part of `classRulesDigest`).
+ */
+import { createHash } from "node:crypto";
+import { posix } from "node:path";
+import { matchDestructive } from "@infinite/attention";
+import type { PermissionClassMatch, PermissionQualification, PermissionRequest } from "./permission-agent-types.js";
+import type { InterruptClass } from "./permission-policy.js";
+import { canonicalJson } from "./evidence/crypto.js";
+import { inlineShellScript, quoteWord, readShell, resolveWord, type SimpleCommand } from "./permission-shell.js";
+
+/** Bumped by any change to the rule code below that is not a change to the lists. */
+export const CLASS_RULES_VERSION = 1;
+
+/**
+ * The host's lists. Commands are word prefixes after wrappers (sudo, env, timeout) are removed. Paths
+ * are segment sequences that match anywhere in a resolved path, so they do not depend on whose home
+ * directory a session uses.
+ */
+export const PERMISSION_CLASS_LISTS = {
+  /** Production or staging: the host's own release tooling. Workspace delivery commands come with the request. */
+  hostReleaseCommands: [
+    ["systemctl", "restart", "infinite*"], ["systemctl", "start", "infinite*"], ["systemctl", "stop", "infinite*"],
+    ["systemctl", "reload", "infinite*"], ["systemctl", "enable", "infinite*"], ["systemctl", "disable", "infinite*"],
+    ["systemctl", "link", "infinite*"], ["systemctl", "mask", "infinite*"], ["systemctl", "unmask", "infinite*"],
+    ["systemctl", "edit", "infinite*"], ["systemctl", "kill", "infinite*"],
+  ],
+  /** New or external credentials: login, token creation and key import. */
+  credentialCommands: [
+    ["gh", "auth", "login"], ["gh", "auth", "refresh"], ["gh", "auth", "token"], ["gh", "auth", "setup-git"],
+    ["gh", "ssh-key", "add"], ["gh", "gpg-key", "add"], ["gh", "secret", "set"], ["gh", "variable", "set"],
+    ["npm", "login"], ["npm", "adduser"], ["npm", "token", "create"], ["pnpm", "login"], ["yarn", "npm", "login"],
+    ["docker", "login"], ["podman", "login"], ["helm", "registry", "login"],
+    ["aws", "configure"], ["aws", "sso", "login"], ["aws", "iam", "create-access-key"], ["aws", "sts", "get-session-token"],
+    ["gcloud", "auth"], ["gcloud", "iam", "service-accounts", "keys", "create"], ["az", "login"], ["az", "ad", "sp", "create-for-rbac"],
+    ["firebase", "login"], ["vercel", "login"], ["netlify", "login"], ["heroku", "login"], ["heroku", "auth:token"],
+    ["eas", "login"], ["expo", "login"], ["wrangler", "login"], ["fly", "auth"], ["flyctl", "auth"], ["railway", "login"],
+    ["op", "signin"], ["op", "item", "create"], ["vault", "login"], ["vault", "token", "create"], ["bw", "login"], ["bw", "unlock"],
+    ["ssh-keygen"], ["ssh-add"], ["ssh-copy-id"], ["gpg", "--import"], ["gpg", "--gen-key"], ["gpg", "--full-generate-key"],
+    ["gpg", "--quick-generate-key"], ["gpg", "--export-secret-keys"], ["security", "import"], ["security", "add-generic-password"],
+    ["security", "add-internet-password"], ["security", "find-generic-password"], ["security", "find-internet-password"],
+    ["security", "dump-keychain"], ["git", "credential"], ["git", "credential-store"], ["git", "credential-cache"],
+    ["codex", "login"], ["claude", "setup-token"], ["claude", "login"], ["opencode", "auth"], ["opencode", "providers", "login"],
+    ["cargo", "login"], ["gem", "signin"], ["poetry", "config", "pypi-token*"], ["twine", "register"],
+    ["kubectl", "config", "set-credentials"], ["pass", "insert"], ["pass", "generate"], ["keyring", "set"],
+  ],
+  /** Credential store locations. A read or write of one outside the session root is the credentials class. */
+  credentialPaths: [
+    ".ssh", ".aws", ".azure", ".config/gcloud", ".config/gh", ".config/hub", ".docker/config.json", ".npmrc", ".netrc",
+    ".git-credentials", ".gnupg", ".kube", ".pypirc", ".gem/credentials", ".cargo/credentials", ".cargo/credentials.toml",
+    ".password-store", "Library/Keychains", ".codex/auth.json", ".claude/.credentials.json", ".local/share/opencode/auth.json",
+    ".config/op", ".terraform.d/credentials.tfrc.json", ".vault-token", ".config/infinite", "etc/ssl/private", "etc/shadow",
+  ],
+  /** Money: payment, billing and purchase commands. */
+  paymentCommands: [
+    ["stripe"], ["gcloud", "billing"], ["gcloud", "beta", "billing"], ["gcloud", "alpha", "billing"],
+    ["gcloud", "domains", "registrations", "register"], ["aws", "route53domains", "register-domain"],
+    ["aws", "route53domains", "transfer-domain-in"], ["aws", "route53domains", "renew-domain"], ["aws", "budgets"],
+    ["aws", "billing"], ["aws", "marketplace-catalog"], ["az", "billing"], ["vercel", "domains", "buy"], ["vercel", "billing"],
+    ["doctl", "billing-history"], ["mas", "purchase"], ["mas", "install"],
+  ],
+  /** Money: MCP servers whose tools are payment or billing tools. */
+  paymentToolServers: ["stripe", "paypal", "square", "braintree", "adyen", "paddle", "lemonsqueezy", "chargebee", "recurly", "gocardless", "mollie", "razorpay"],
+  /** Money: payment and billing endpoints. A leading dot matches every subdomain. */
+  paymentHosts: [
+    "api.stripe.com", "checkout.stripe.com", "billing.stripe.com", "connect.stripe.com", "api.paypal.com", "api-m.paypal.com",
+    "connect.squareup.com", "api.squareup.com", "payments.braintree-api.com", "api.braintreegateway.com", "api.paddle.com",
+    "vendors.paddle.com", "api.lemonsqueezy.com", ".chargebee.com", ".recurly.com", "api.gocardless.com", "api.mollie.com",
+    "api.razorpay.com", "cloudbilling.googleapis.com", "billingbudgets.googleapis.com", "budgets.amazonaws.com",
+  ],
+  /** Global or account settings: host and system locations whose change is a change to host configuration. */
+  hostProtectedPaths: [
+    "/etc", "/opt/infinite", "/opt/infinite-releases", "/opt/infinite-agents", "/usr/local/libexec/infinite",
+    "/Library/LaunchDaemons", "/Library/LaunchAgents", "/Library/Preferences",
+  ],
+  /** Global or account settings: provider and tool settings outside the session root. */
+  settingsPaths: [
+    ".claude", ".claude.json", ".codex", ".config", ".local/share/opencode", ".opencode", ".gitconfig", ".yarnrc", ".yarnrc.yml",
+    ".bashrc", ".bash_profile", ".profile", ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".vimrc", ".tmux.conf", ".cursor",
+    ".vscode", ".gemini", "Library/Preferences", "Library/LaunchAgents", "Library/Application Support",
+  ],
+  /** Global or account settings: a provider settings file, a hook or an MCP configuration inside the session root. */
+  providerSettingsInRoot: [
+    ".claude/settings.json", ".claude/settings.local.json", ".claude/hooks", ".claude/agents", ".mcp.json", ".codex",
+    "opencode.json", "opencode.jsonc", ".opencode", ".cursor/mcp.json", ".vscode/mcp.json", ".gemini/settings.json",
+    ".git/hooks", ".git/config",
+  ],
+  /** Raise only: any other settings file inside the session root. Dot-rc and dot-env files are added by pattern. */
+  settingsInRoot: [
+    ".claude", ".npmrc", ".yarnrc.yml", ".vscode", ".idea", ".husky", ".pre-commit-config.yaml", "lefthook.yml",
+    ".github/workflows", ".devcontainer", ".envrc", ".tool-versions", ".git",
+  ],
+} as const;
+
+/** Paths that are never a target. */
+const DEVICE_PATHS = /^\/dev\/(?:null|zero|random|urandom|stdin|stdout|stderr|tty|fd\/\d+)$/;
+const READ_COMMANDS = new Set(["cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ag", "base64", "xxd", "od", "hexdump", "strings", "wc", "diff", "cmp", "file", "stat", "ls", "find", "jq", "yq", "sort", "uniq", "cut", "nl", "bat", "tac", "md5sum", "sha256sum", "shasum", "readlink", "realpath", "du", "tree"]);
+const WRITE_COMMANDS = new Set(["rm", "rmdir", "unlink", "shred", "truncate", "touch", "mkdir", "chmod", "chown", "chgrp", "tee", "dd", "chattr", "setfacl"]);
+const COPY_COMMANDS = new Set(["cp", "mv", "install", "rsync", "ln", "scp"]);
+/** Commands whose every operand is a path. For other commands only words that look like paths count. */
+const PATH_COMMANDS = new Set([...READ_COMMANDS, ...WRITE_COMMANDS, ...COPY_COMMANDS, "sed", "awk", "source", "."]);
+const SHELL_TOOLS = new Set(["bash", "shell", "exec_command", "local_shell", "unified_exec", "dialog", "exec", "run_command", "terminal"]);
+const READ_TOOL = /^(?:read|view|glob|grep|ls|list|search|find|notebookread|webfetch)$/i;
+const WRITE_TOOL = /(?:write|edit|patch|create|delete|remove|move|rename|notebookedit)/i;
+
+type Access = "read" | "write" | "unknown";
+interface Target { path: string; access: Access; word: string }
+
+/** What the host establishes about one request. It is computed once for the class and raise rules. */
+export interface RequestReading {
+  commands: SimpleCommand[];
+  targets: Target[];
+  urls: URL[];
+  opaque: boolean;
+  opaqueReasons: string[];
+  shell: boolean;
+  tool: string;
+  /** Path words the host could not resolve (a variable or another user's home). */
+  unresolved: string[];
+}
+
+export interface HostRuleFacts {
+  /** Absolute host paths a write to which changes host configuration: config, state, run and install directories, launchers. */
+  protectedPaths?: readonly string[];
+  /** Further host release commands, as words. */
+  releaseCommands?: readonly (readonly string[])[];
+}
+
+/** A digest of everything the class rules depend on. A change makes every replay result stale. */
+export function classRulesDigest(facts: HostRuleFacts = {}): string {
+  return createHash("sha256").update(canonicalJson({
+    version: CLASS_RULES_VERSION,
+    lists: PERMISSION_CLASS_LISTS,
+    protectedPaths: [...(facts.protectedPaths ?? [])].sort(),
+    releaseCommands: (facts.releaseCommands ?? []).map(words => [...words]),
+  })).digest("hex");
+}
+
+export function qualify(request: PermissionRequest): PermissionQualification {
+  if (!request.shape.completeEvidence) return { qualified: false, reason: "incomplete-evidence" };
+  if (!request.shape.oneShotAccept) return { qualified: false, reason: "no-one-shot-accept" };
+  if (!request.shape.oneShotReject) return { qualified: false, reason: "no-one-shot-reject" };
+  return { qualified: true };
+}
+
+export function readRequest(request: PermissionRequest): RequestReading {
+  const tool = request.tool;
+  const input = request.input ?? {};
+  const root = request.requester.sessionRoot;
+  const cwdInput = typeof input.workdir === "string" ? input.workdir : typeof input.cwd === "string" ? input.cwd : undefined;
+  const cwd = cwdInput ? resolveWord(cwdInput, root) ?? root : root;
+  const targets: Target[] = [];
+  const unresolved: string[] = [];
+  const reasons = new Set<string>();
+  const commands: SimpleCommand[] = [];
+  const add = (word: string, access: Access, base: string | undefined) => {
+    const path = resolveWord(word, base);
+    if (path === undefined) { unresolved.push(word); return; }
+    if (!DEVICE_PATHS.test(path)) targets.push({ path, access, word });
+  };
+  if (cwdInput) add(cwdInput, "unknown", root);
+
+  const shell = SHELL_TOOLS.has(tool.toLowerCase()) || typeof input.command === "string" || Array.isArray(input.command);
+  if (shell) {
+    let source: string;
+    if (Array.isArray(input.command) && input.command.every(word => typeof word === "string")) {
+      const argv = input.command as string[];
+      source = inlineShellScript(argv) ?? argv.map(quoteWord).join(" ");
+    } else source = typeof input.command === "string" ? input.command : request.action;
+    const reading = readShell(source, cwd);
+    for (const reason of reading.opaqueReasons) reasons.add(reason);
+    for (const command of reading.commands) {
+      // One level of `sh -c 'literal'` is read as the script it runs.
+      const script = inlineShellScript(command.argv);
+      if (script !== undefined && !command.scriptExpands) {
+        const inner = readShell(script, command.cwd ?? cwd);
+        for (const reason of inner.opaqueReasons) reasons.add(reason);
+        for (const nested of inner.commands) commands.push({ ...nested, privileged: nested.privileged || command.privileged });
+        for (const redirect of command.redirects) add(redirect.target, redirect.op.includes(">") ? "write" : "read", command.cwd ?? cwd);
+        continue;
+      }
+      commands.push(command);
+    }
+    for (const command of commands) {
+      const base = command.cwd ?? cwd;
+      for (const redirect of command.redirects) add(redirect.target, redirect.op === "<" ? "read" : "write", base);
+      operandTargets(command, base, add);
+    }
+  }
+  for (const [key, value] of Object.entries(input)) {
+    if (typeof value !== "string" || !["file_path", "filePath", "path", "notebook_path", "notebookPath", "target", "destination", "source"].includes(key)) continue;
+    const access: Access = WRITE_TOOL.test(tool) ? "write" : READ_TOOL.test(tool) ? "read" : "unknown";
+    add(value, access, cwd);
+  }
+  if (Array.isArray(input.paths)) for (const value of input.paths) if (typeof value === "string") add(value, WRITE_TOOL.test(tool) ? "write" : "unknown", cwd);
+  const patch = typeof input.patch === "string" ? input.patch : /apply_patch/i.test(tool) && typeof input.input === "string" ? input.input : undefined;
+  if (patch) for (const match of patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$|^\*\*\* Move to: (.+)$/gm)) add((match[1] ?? match[2]).trim(), "write", cwd);
+
+  const urls: URL[] = [];
+  const text = `${request.action}\n${safeJson(input)}`;
+  for (const match of text.matchAll(/\bhttps?:\/\/[^\s'"<>\\]+/gi)) {
+    try { urls.push(new URL(match[0])); } catch { /* not a URL */ }
+  }
+  if (!request.shape.completeEvidence) reasons.add("incomplete-evidence");
+  return { commands, targets, urls, opaque: reasons.size > 0, opaqueReasons: [...reasons], shell, tool, unresolved };
+}
+
+function operandTargets(command: SimpleCommand, cwd: string, add: (word: string, access: Access, base: string | undefined) => void) {
+  const { name, argv } = command;
+  if (name === "cd" || name === "pushd") return;
+  let base = cwd;
+  if (name === "git") {
+    for (let index = 1; index < argv.length; index++) {
+      if (argv[index] === "-C" && argv[index + 1]) { add(argv[index + 1], "unknown", base); base = resolveWord(argv[index + 1], base) ?? base; index++; }
+      else if (argv[index].startsWith("--git-dir=") || argv[index].startsWith("--work-tree=")) add(argv[index].slice(argv[index].indexOf("=") + 1), "unknown", base);
+    }
+  }
+  const operands: string[] = [];
+  let afterDoubleDash = false;
+  for (let index = 1; index < argv.length; index++) {
+    const word = argv[index];
+    if (!afterDoubleDash && word === "--") { afterDoubleDash = true; continue; }
+    if (!afterDoubleDash && word.startsWith("-")) {
+      const equals = word.indexOf("=");
+      if (equals > 0 && looksLikePath(word.slice(equals + 1))) add(word.slice(equals + 1), "unknown", base);
+      continue;
+    }
+    operands.push(word);
+  }
+  // sed and awk take a program first; it is not a path.
+  if ((name === "sed" || name === "awk" || name === "gawk") && !argv.some(arg => arg === "-e" || arg === "-f")) operands.shift();
+  const inPlace = name === "sed" && argv.some(arg => /^-[a-zA-Z]*i/.test(arg) || arg.startsWith("--in-place"));
+  const every = PATH_COMMANDS.has(name);
+  operands.forEach((word, index) => {
+    if (!every && !looksLikePath(word)) return;
+    let access: Access = "unknown";
+    if (READ_COMMANDS.has(name)) access = "read";
+    if (WRITE_COMMANDS.has(name) || inPlace) access = "write";
+    if (COPY_COMMANDS.has(name)) access = index === operands.length - 1 || name === "mv" ? "write" : "read";
+    add(word, access, base);
+  });
+}
+
+function looksLikePath(word: string): boolean {
+  if (!word || /^[a-z][a-z0-9+.-]*:\/\//i.test(word)) return false;
+  return word.startsWith("/") || word.startsWith("~") || word.startsWith("$HOME") || word.startsWith("${HOME}")
+    || word.startsWith("./") || word.startsWith("../") || word === "." || word === ".." || /^\.[^.\s]/.test(word) || word.includes("/");
+}
+
+const safeJson = (value: unknown) => { try { return JSON.stringify(value) ?? ""; } catch { return ""; } };
+
+/** Whether `path` is the session root, a scratch root, or inside one. A `~` path is never inside. */
+export function insideSession(request: PermissionRequest, path: string): boolean {
+  if (path.startsWith("~")) return false;
+  return [request.requester.sessionRoot, ...request.requester.scratchRoots].some(root => within(root, path));
+}
+
+function within(root: string, path: string): boolean {
+  const base = posix.normalize(root).replace(/\/+$/, "") || "/";
+  return path === base || path.startsWith(base === "/" ? "/" : `${base}/`);
+}
+
+/** Whether `path` contains `sequence` as consecutive segments (at its end for a file, or followed by more for a directory). */
+function hasSegments(path: string, sequence: string): boolean {
+  const segments = path.split("/").filter(Boolean);
+  const wanted = sequence.split("/").filter(Boolean);
+  for (let start = 0; start + wanted.length <= segments.length; start++)
+    if (wanted.every((segment, offset) => segments[start + offset] === segment)) return true;
+  return false;
+}
+
+/** The path relative to the session root or scratch root that holds it. */
+function relativeToSession(request: PermissionRequest, path: string): string | undefined {
+  for (const root of [request.requester.sessionRoot, ...request.requester.scratchRoots])
+    if (within(root, path)) return posix.relative(posix.normalize(root), path);
+  return undefined;
+}
+
+function wordsMatch(argv: readonly string[], pattern: readonly string[]): boolean {
+  if (argv.length < pattern.length) return false;
+  return pattern.every((want, index) => {
+    const have = index === 0 ? posix.basename(argv[0]) : argv[index];
+    return want.endsWith("*") ? have.startsWith(want.slice(0, -1)) : have === want;
+  });
+}
+
+/** The command's words with options between the subcommands removed, for prefix matching (`git -C x config` reads as `git config`). */
+function commandWords(command: SimpleCommand): string[] {
+  const [head, ...rest] = command.argv;
+  if (command.name === "git") {
+    const words = [head];
+    for (let index = 0; index < rest.length; index++) {
+      if (["-C", "-c", "--git-dir", "--work-tree", "--namespace"].includes(rest[index])) { index++; continue; }
+      if (rest[index].startsWith("-") && words.length === 1) continue;
+      words.push(rest[index]);
+    }
+    return words;
+  }
+  return command.argv;
+}
+
+const hostOf = (url: URL) => url.hostname.toLowerCase().replace(/\.$/, "");
+const hostListed = (host: string, list: readonly string[]) =>
+  list.some(entry => entry.startsWith(".") ? host.endsWith(entry) || host === entry.slice(1) : host === entry);
+
+function isGlobalSettingsCommand(command: SimpleCommand, request: PermissionRequest): boolean {
+  const words = commandWords(command);
+  const [name, sub, third] = [posix.basename(words[0] ?? ""), words[1], words[2]];
+  const has = (...flags: string[]) => command.argv.some(arg => flags.some(flag => arg === flag || arg.startsWith(`${flag}=`)));
+  if (name === "git" && sub === "config") {
+    const read = has("--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l", "--get-color", "--get-colorbool") || third === "get" || third === "list";
+    if (read) return false;
+    if (has("--global", "--system")) return true;
+    if (has("--file", "-f")) {
+      const index = command.argv.findIndex(arg => arg === "--file" || arg === "-f");
+      const file = command.argv[index + 1];
+      const path = file && resolveWord(file, command.cwd ?? request.requester.sessionRoot);
+      if (!path || !insideSession(request, path)) return true;
+    }
+    // A hook path or fsmonitor in the repository's own config runs code on later git commands.
+    return command.argv.some(arg => /^(?:core\.hookspath|core\.fsmonitor|core\.sshcommand|core\.pager|include\.path|includeif\.)/i.test(arg));
+  }
+  if (["npm", "pnpm", "yarn"].includes(name) && sub === "config" && ["set", "delete", "edit", "rm"].includes(third ?? ""))
+    return !command.argv.some((arg, index) => (arg === "--location" && command.argv[index + 1] === "project") || arg === "--location=project");
+  if (name === "gh" && ((sub === "config" && third === "set") || (sub === "extension" && ["install", "upgrade", "remove"].includes(third ?? "")) || (sub === "alias" && third === "set"))) return true;
+  if (name === "defaults" && ["write", "delete", "import", "rename"].includes(sub ?? "")) return true;
+  if (name === "claude" && (sub === "mcp" || sub === "plugin" || sub === "plugins" || (sub === "config" && ["set", "add", "remove"].includes(third ?? "")))) return !["list", "get"].includes(third ?? "");
+  if (name === "codex" && (sub === "mcp" || sub === "plugin" || (sub === "features" && ["enable", "disable"].includes(third ?? "")))) return !["list", "get"].includes(third ?? "");
+  if (name === "opencode" && ["mcp", "plugin", "plug", "agent"].includes(sub ?? "")) return !["list", "ls"].includes(third ?? "");
+  if (name === "launchctl" && ["load", "unload", "bootstrap", "bootout", "enable", "disable", "setenv", "submit"].includes(sub ?? "")) return true;
+  if (name === "systemctl" && command.argv.slice(1).some(arg => ["enable", "disable", "mask", "unmask", "edit", "set-property", "link", "set-environment"].includes(arg))) return true;
+  if (name === "crontab") return !has("-l");
+  if (["chsh", "scutil", "networksetup", "update-alternatives", "visudo", "usermod", "useradd", "passwd"].includes(name)) return true;
+  if (name === "sysctl" && has("-w")) return true;
+  return false;
+}
+
+type ClassRule = { name: string; interruptClass: InterruptClass; test: (request: PermissionRequest, reading: RequestReading, facts: HostRuleFacts) => boolean };
+
+const CLASS_RULES: readonly ClassRule[] = [
+  { name: "class:trust-prompt", interruptClass: "global-or-account-settings", test: request => request.shape.trustPrompt },
+  { name: "class:persistent-only", interruptClass: "global-or-account-settings", test: request => request.shape.persistentOnly },
+  {
+    name: "class:delivery-command", interruptClass: "production-or-staging",
+    test: (request, reading) => {
+      const configured = (request.deliveryCommands ?? []).map(command => readShell(command).commands[0]?.argv).filter((argv): argv is string[] => Boolean(argv?.length));
+      return reading.commands.some(command => configured.some(pattern => wordsMatch(command.argv, pattern)));
+    },
+  },
+  {
+    name: "class:host-release", interruptClass: "production-or-staging",
+    test: (_request, reading, facts) => reading.commands.some(command =>
+      [...PERMISSION_CLASS_LISTS.hostReleaseCommands, ...(facts.releaseCommands ?? [])].some(pattern => wordsMatch(command.argv.filter(arg => !arg.startsWith("-") || arg === command.argv[0]), pattern))),
+  },
+  {
+    name: "class:credential-command", interruptClass: "credentials",
+    test: (_request, reading) => reading.commands.some(command => PERMISSION_CLASS_LISTS.credentialCommands.some(pattern => wordsMatch(commandWords(command), pattern))),
+  },
+  {
+    name: "class:credential-store", interruptClass: "credentials",
+    test: (request, reading) => reading.targets.some(target => !insideSession(request, target.path)
+      && PERMISSION_CLASS_LISTS.credentialPaths.some(sequence => hasSegments(target.path, sequence))),
+  },
+  {
+    name: "class:payment-tool", interruptClass: "money",
+    test: request => {
+      const tool = request.tool.toLowerCase();
+      const server = tool.startsWith("mcp__") ? tool.slice(5).split("__")[0] : tool.includes("_") ? tool.split("_")[0] : undefined;
+      return server !== undefined && (PERMISSION_CLASS_LISTS.paymentToolServers as readonly string[]).includes(server);
+    },
+  },
+  {
+    name: "class:payment-command", interruptClass: "money",
+    test: (_request, reading) => reading.commands.some(command => PERMISSION_CLASS_LISTS.paymentCommands.some(pattern => wordsMatch(command.argv, pattern))),
+  },
+  {
+    name: "class:payment-endpoint", interruptClass: "money",
+    test: (_request, reading) => reading.urls.some(url => hostListed(hostOf(url), PERMISSION_CLASS_LISTS.paymentHosts)),
+  },
+  {
+    name: "class:destructive-outside", interruptClass: "destructive-outside-workspace",
+    test: (request, reading) => {
+      if (!request.destructive) return false;
+      const destructive = reading.commands.filter(command => matchDestructive(command.words.map(quoteWord).join(" ")) !== null);
+      const scope = destructive.length ? destructive : reading.commands;
+      const paths: string[] = [];
+      for (const command of scope) {
+        const base = command.cwd ?? request.requester.sessionRoot;
+        for (const target of reading.targets) if (command.words.includes(target.word) || command.redirects.some(redirect => redirect.target === target.word)) paths.push(target.path);
+        // A git command with no path operand acts on its working directory.
+        if (command.name === "git") paths.push(command.argv.includes("-C") ? resolveWord(command.argv[command.argv.indexOf("-C") + 1] ?? "", base) ?? base : base);
+      }
+      return paths.some(path => !insideSession(request, path));
+    },
+  },
+  {
+    name: "class:host-configuration", interruptClass: "global-or-account-settings",
+    test: (request, reading, facts) => reading.targets.some(target => target.access === "write" && !insideSession(request, target.path)
+      && [...PERMISSION_CLASS_LISTS.hostProtectedPaths, ...(facts.protectedPaths ?? [])].some(root => within(root, target.path))),
+  },
+  {
+    name: "class:settings-outside-root", interruptClass: "global-or-account-settings",
+    test: (request, reading) => reading.targets.some(target => target.access === "write" && !insideSession(request, target.path)
+      && PERMISSION_CLASS_LISTS.settingsPaths.some(sequence => hasSegments(target.path, sequence))),
+  },
+  {
+    name: "class:provider-settings-in-root", interruptClass: "global-or-account-settings",
+    test: (request, reading) => reading.targets.some(target => {
+      if (target.access !== "write") return false;
+      const relative = relativeToSession(request, target.path);
+      return relative !== undefined && PERMISSION_CLASS_LISTS.providerSettingsInRoot.some(sequence => hasSegments(relative, sequence));
+    }),
+  },
+  {
+    name: "class:global-settings-command", interruptClass: "global-or-account-settings",
+    test: (request, reading) => reading.commands.some(command => isGlobalSettingsCommand(command, request)),
+  },
+];
+
+/** The first class rule that matches, among the classes in force. It never allows anything. */
+export function classify(request: PermissionRequest, interruptClasses: readonly string[], facts: HostRuleFacts = {}, reading = readRequest(request)): PermissionClassMatch | undefined {
+  for (const rule of CLASS_RULES) {
+    if (!interruptClasses.includes(rule.interruptClass)) continue;
+    if (rule.test(request, reading, facts)) return { interruptClass: rule.interruptClass, rule: rule.name };
+  }
+  return undefined;
+}
+
+const RELEASE_WORD = /(?:^|[^a-z])(?:publish|deploy|deployment|release|promote|rollout|roll-out|ship)(?:[^a-z]|$)/i;
+const CREDENTIAL_WORD = /token|secret|passw(?:or)?d|credential|api[_-]?key|private[_-]?key|\bauth\b|oauth|\.pem\b|\.key\b|\.p12\b|\.pfx\b|id_rsa|id_ed25519|id_ecdsa|keychain|\.netrc|(?:^|[^a-z])\.env\b|ssh-agent|\bgpg\b|\bkms\b/i;
+// "checkout" is left out: `git checkout` is routine, and payment checkouts are caught by the provider name and endpoint lists.
+const PAYMENT_WORD = /payment|billing|invoice|purchase|refund|subscription|payout|\bcharges?\b|stripe|paypal|credit[_-]?card|\bwallet\b/i;
+const GLOBAL_INSTALL: ReadonlyArray<(command: SimpleCommand) => boolean> = [
+  command => ["npm", "pnpm", "bun"].includes(command.name) && ["install", "i", "add", "link"].includes(command.argv[1] ?? "") && command.argv.some(arg => arg === "-g" || arg === "--global" || arg === "--location=global"),
+  command => command.name === "yarn" && command.argv[1] === "global",
+  command => ["brew", "port", "apt", "apt-get", "dnf", "yum", "pacman", "apk", "snap", "pipx", "gem"].includes(command.name) && ["install", "upgrade", "reinstall", "add", "tap"].includes(command.argv[1] ?? ""),
+  command => ["cargo", "go"].includes(command.name) && command.argv[1] === "install",
+  command => command.name === "uv" && command.argv[1] === "tool",
+  command => /^pip\d*(?:\.\d+)?$/.test(command.name) && command.argv[1] === "install" && command.argv.some(arg => arg === "--user" || arg === "--break-system-packages"),
+];
+
+/** The raise rules that match. They only select the strong tier for a fresh turn. */
+export function raise(request: PermissionRequest, context: { rejectHistory: boolean }, reading = readRequest(request)): string[] {
+  const raised: string[] = [];
+  const words = reading.commands.flatMap(command => command.words);
+  const text = `${request.tool}\n${request.action}\n${safeJson(request.input ?? {})}`;
+  if (request.destructive) raised.push("raise:destructive");
+  if (reading.targets.some(target => !insideSession(request, target.path))) raised.push("raise:outside-root");
+  if (words.some(word => RELEASE_WORD.test(word)) || reading.commands.some(command => commandWords(command).slice(1, 3).includes("push")) || RELEASE_WORD.test(request.tool))
+    raised.push("raise:release-verb");
+  if (reading.commands.some(command => command.privileged || ["setcap", "chroot", "nsenter", "unshare", "capsh"].includes(command.name)
+    || (command.name === "chmod" && command.argv.some(arg => /^(?:[ugoa]*\+[rwxXt]*s|[2-7][0-7]{3})$/.test(arg)))
+    || (["chown", "chgrp"].includes(command.name) && command.argv.some(arg => /^root(?::|$)|^0(?::|$)/.test(arg)))))
+    raised.push("raise:privilege");
+  if (CREDENTIAL_WORD.test(text)) raised.push("raise:credential-name");
+  if (PAYMENT_WORD.test(text)) raised.push("raise:payment-name");
+  if (reading.targets.some(target => {
+    const relative = relativeToSession(request, target.path);
+    if (relative === undefined) return false;
+    const base = posix.basename(relative);
+    return [...PERMISSION_CLASS_LISTS.providerSettingsInRoot, ...PERMISSION_CLASS_LISTS.settingsInRoot].some(sequence => hasSegments(relative, sequence))
+      || /^\.[\w.-]*rc(?:\.[\w-]+)?$/.test(base) || /^\.env(?:\..+)?$/.test(base);
+  })) raised.push("raise:settings-in-root");
+  if (reading.commands.some(command => GLOBAL_INSTALL.some(test => test(command)))) raised.push("raise:global-install");
+  if (reading.opaque || reading.unresolved.length > 0 || (!reading.shell && !KNOWN_TOOLS.test(request.tool))) raised.push("raise:opaque");
+  if (context.rejectHistory) raised.push("raise:reject-history");
+  return raised;
+}
+
+/** Tools whose effect the host reads from their input. Any other tool is raised as opaque. */
+const KNOWN_TOOLS = /^(?:read|write|edit|multiedit|notebookedit|notebookread|glob|grep|ls|list|apply_patch|webfetch|websearch|todowrite|todoread)$/i;

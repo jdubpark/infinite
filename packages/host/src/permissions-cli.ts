@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync, statSync } from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import type { WorkspaceDelegationView } from "./permission-delegation-types.js";
+import { REPLAY_SET_BYTES, replaySetSchema } from "./permission-replay.js";
 
 type PermissionsApi = { json<T = unknown>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<T> };
 type Options = Record<string, string | boolean>;
 type RateFlag = { sessionId: string; workspaceId: string; lastHour: number; baselineMedian: number; threshold: number };
-type PermissionStatus = { agent: string; policyVersion: number; interruptClasses: string[]; workspaces: WorkspaceDelegationView[]; rates: { lastHour: { decisions: number }; lastDay: { decisions: number } } | null; rateFlags?: RateFlag[] | null };
 type Mark = { requestId: string; decisionId: string; at: string; label: string; note: string };
 type LogEntry = {
   id: string; at: string; workspaceId: string; workspaceName?: string; projectId: string; projectName?: string; taskId: string; assignment: string;
@@ -16,6 +18,20 @@ type LogEntry = {
   controls: Array<{ kind: string; at: string; reason?: string }>;
 };
 type LogPage = { entries: LogEntry[]; next?: string; rateFlags: RateFlag[] | null };
+type RateFigure = { count: number; relevant: number; rate: number | null; lower: number; upper: number };
+type ReplaySummary = { id: string; finishedAt: string; cases: number; missRate: RateFigure };
+type PermissionStatus = {
+  agent: string; policyVersion: number; interruptClasses: string[]; workspaces: WorkspaceDelegationView[];
+  rates: { lastHour: { decisions: number }; lastDay: { decisions: number } } | null;
+  rateFlags?: RateFlag[] | null;
+  readiness?: { ready: boolean; reasons: string[] };
+  replay?: { latest: ReplaySummary | null; running: { id: string; done: number; total: number } | null };
+};
+type ReplayFigures = { cases: number; outcomes: Record<string, number>; missRate: RateFigure; wrongfulRejectRate: RateFigure };
+type ReplayJob = {
+  id: string; state: "running" | "finished" | "failed"; done: number; total: number; error?: string;
+  result?: { id: string; cases: number; finishedAt: string; set: ReplayFigures; byClass: Record<string, ReplayFigures>; byTier: Record<string, ReplayFigures> };
+};
 type DelegationResult = { agent: string; views: WorkspaceDelegationView[]; replacedOptOuts: string[] };
 type RevocationResult = { agent: string; view: WorkspaceDelegationView };
 type ReopenResult = { decisionId: string; reject: string; code: string; assignment: string; locked: boolean };
@@ -74,6 +90,8 @@ function printEntry(entry: LogEntry) {
   if (entry.note) console.log(`  Note (owner only): ${clean(entry.note, 2000)}`);
   for (const mark of entry.marks) console.log(`  Marked ${clean(mark.label)}: ${when(mark.at)}: ${clean(mark.note, 2000)}`);
 }
+const REPLAY_USAGE = "Usage: infinite permissions replay --set FILE [--json] [--request-id UUID]";
+const REPLAY_POLL_MS = 2_000;
 
 const stringOption = (options: Options, name: string) => {
   const value = options[name];
@@ -107,6 +125,30 @@ function printNotice(agent: string) {
   if (agent === "inactive") console.log(INACTIVE_NOTICE);
 }
 
+const percent = (value: number | null) => value === null ? "n/a" : `${(value * 100).toFixed(1)}%`;
+const rateLine = (figure: RateFigure) => `${percent(figure.rate)} (${Number(figure.count)} of ${Number(figure.relevant)}, 95% interval ${percent(figure.lower)} to ${percent(figure.upper)})`;
+
+function printReadiness(status: PermissionStatus) {
+  if (!status.readiness) return;
+  console.log(`Permission agent: ${status.readiness.ready ? "ready" : "not ready"}`);
+  for (const reason of status.readiness.reasons) console.log(`  ${clean(reason, 1000)}`);
+  const latest = status.replay?.latest;
+  if (latest) console.log(`Replay: ${Number(latest.cases)} cases on ${clean(latest.finishedAt, 40)}, miss rate ${rateLine(latest.missRate)}`);
+  const running = status.replay?.running;
+  if (running) console.log(`Replay running: ${Number(running.done)} of ${Number(running.total)} cases`);
+}
+
+function printReplay(job: ReplayJob) {
+  const result = job.result!;
+  console.log(`Replay ${clean(result.id)}: ${Number(result.cases)} cases`);
+  console.log(`  Miss rate: ${rateLine(result.set.missRate)}`);
+  console.log(`  Wrongful reject rate: ${rateLine(result.set.wrongfulRejectRate)}`);
+  for (const [title, groups] of [["Class", result.byClass], ["Tier", result.byTier]] as const) {
+    for (const [name, figures] of Object.entries(groups))
+      console.log(`  ${title} ${clean(name, 60)}: ${Number(figures.cases)} cases, miss rate ${rateLine(figures.missRate)}, wrongful reject rate ${rateLine(figures.wrongfulRejectRate)}`);
+  }
+}
+
 export async function handlePermissionsClientCommand(positional: string[], options: Options, api: PermissionsApi): Promise<boolean> {
   const [verb] = positional;
   if (verb === "status") {
@@ -118,6 +160,7 @@ export async function handlePermissionsClientCommand(positional: string[], optio
       for (const view of result.workspaces) printView(view);
       if (result.rates) console.log(`Decisions: ${Number(result.rates.lastHour.decisions)} in the last hour, ${Number(result.rates.lastDay.decisions)} in the last day`);
       printRateFlags(result.rateFlags);
+      printReadiness(result);
       printNotice(result.agent);
     }
     return true;
@@ -236,5 +279,36 @@ export async function handlePermissionsClientCommand(positional: string[], optio
     }
     return true;
   }
-  throw new Error("Usage: infinite permissions status|delegate|revoke|reopen|unlock|log|mark ...");
+  if (verb === "replay") {
+    const file = stringOption(options, "--set");
+    if (positional.length !== 1 || file === undefined) throw new Error(REPLAY_USAGE);
+    const requestId = requestIdOption(options);
+    let set: unknown;
+    try {
+      if (statSync(file).size > REPLAY_SET_BYTES) throw new Error("size");
+      set = JSON.parse(readFileSync(file, "utf8"));
+    } catch { throw new Error(`The replay set must be a readable JSON file of at most ${REPLAY_SET_BYTES / (1024 * 1024)} MB.`); }
+    const parsed = replaySetSchema.safeParse(set);
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      throw new Error(`The replay set is invalid at ${clean(issue.path.join(".") || "the top level", 200)}: ${clean(issue.message, 300)}`);
+    }
+    // A host without the decision core reports no readiness.
+    const status = await api.json<PermissionStatus>("/permissions/status");
+    if (!status.readiness) throw new Error("This host does not support permission replays. Upgrade the host.");
+    console.error(`[Infinite] Replaying ${parsed.data.cases.length} cases · request ${requestId}`);
+    let { job } = await api.json<{ job: ReplayJob }>("/permissions/replays", { requestId, set });
+    let shown = -1;
+    // A replay can take many model turns. The host runs it as a job; the CLI polls until it ends.
+    while (job.state === "running") {
+      if (job.done !== shown) { console.error(`[Infinite] ${Number(job.done)} of ${Number(job.total)} cases`); shown = job.done; }
+      await delay(REPLAY_POLL_MS);
+      job = (await api.json<{ job: ReplayJob }>(`/permissions/replays/${encodeURIComponent(job.id)}`)).job;
+    }
+    if (job.state !== "finished" || !job.result) throw new Error(clean(job.error ?? "The replay did not finish.", 500));
+    if (options["--json"]) console.log(JSON.stringify(job.result, null, 2));
+    else printReplay(job);
+    return true;
+  }
+  throw new Error("Usage: infinite permissions status|delegate|revoke|reopen|unlock|log|mark|replay ...");
 }

@@ -151,6 +151,17 @@ export interface PermissionReadiness {
   reasons: string[];
 }
 
+/**
+ * Thrown by `review` when the reviewer launch gate holds a turn (an owner halt). No verdict exists: the
+ * caller records nothing and evaluates the request again after the release.
+ */
+export class PermissionReviewHeld extends Error {
+  constructor() {
+    super("A permission review turn is held by the launch gate.");
+    this.name = "PermissionReviewHeld";
+  }
+}
+
 /** Class rules, qualification, raise rules and model turns. It records nothing and delivers nothing. */
 export interface PermissionAgentCore {
   /** Whether the permission agent may serve any workspace on this host now. */

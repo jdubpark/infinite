@@ -28,7 +28,7 @@ const EXTEND_WORD = /^extend(?=\s|$)/i;
 /** The whole reply as a command: bare `extend`, or a number with an optional space and a unit (hours when none). */
 const EXTEND_FORM = /^extend(?:\s+(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours)?)?$/i;
 /** An `extend` followed by a number that is not one of the forms is a malformed command, not steering. */
-const EXTEND_ATTEMPT = /^extend\s+\d/i;
+const EXTEND_ATTEMPT = /^extend\s+[-+.\d]/i;
 const MINUTE_UNITS = new Set(["m", "min", "mins", "minute", "minutes"]);
 /** Identity failures a retry cannot fix: the surface stops with a reason, as it does for another workspace's token. */
 const PERMANENT_IDENTITY = new Set(["invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired", "credential_unavailable"]);

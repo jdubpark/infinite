@@ -407,6 +407,8 @@ A stop at the time limit is not an end. A record whose comments go to Linear, no
 to Slack, gets one
 `Infinite agent report: blocked.` comment for each stop, and a stop after an
 extension posts one more. The record stays started until the mission really ends.
+If an earlier stop's comment is not delivered yet when a later stop or the finish
+is recorded, the newer comment replaces it, so Linear shows the latest state.
 
 Each comment's ID is saved with the record before the write, and a retry reuses
 it, so a lost response does not post a second comment. With

@@ -729,15 +729,16 @@ export class IntakeService {
         } catch (error) {
           const message = error instanceof TeamError ? error.message : failureSummary(error);
           this.fail("deliver", error, record.identifier);
+          // A newer comment may have replaced this one while the send was open; only the sent comment's state changes.
           this.attemptSync("deliver", () => this.store.update(record.issueId, next => {
             const comment = next.comments[kind];
-            if (comment) { comment.attempts += 1; comment.error = message; }
+            if (comment?.id === pending.id) { comment.attempts += 1; comment.error = message; }
           }), record.identifier);
           break;
         }
         this.attemptSync("deliver", () => this.store.update(record.issueId, next => {
           const comment = next.comments[kind];
-          if (comment) { comment.delivered = true; comment.attempts += 1; delete comment.error; }
+          if (comment?.id === pending.id) { comment.delivered = true; comment.attempts += 1; delete comment.error; }
         }), record.identifier);
       }
     }

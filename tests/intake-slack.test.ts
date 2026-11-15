@@ -1479,7 +1479,7 @@ test("extend commands parse to minutes: bare extend uses the mission's maxMinute
   try {
     const cases: [string, number][] = [["extend", 30], ["EXTEND", 30], ["extend 6", 360], ["extend 6h", 360], ["extend 6 hours", 360],
       ["extend 1 hour", 60], ["extend 2hr", 120], ["extend 2 hrs", 120], ["extend 90m", 90], ["extend 90 min", 90],
-      ["extend 90 minutes", 90], ["extend 5m", 5], ["extend 24", 1440], ["extend 1440m", 1440]];
+      ["extend 90 minutes", 90], ["extend 45mins", 45], ["extend 30 minute", 30], ["extend 5m", 5], ["extend 24", 1440], ["extend 1440m", 1440]];
     for (const [index, [text, minutes]] of cases.entries()) {
       await s.slack.emit(mention(text));
       await handledOutcomes(s, index + 1);
@@ -1502,7 +1502,8 @@ test("a bare extend is capped at 1440 minutes when the mission's maxMinutes is l
 test("out-of-range and malformed extend commands get the help reply and make no call", { timeout: 120000 }, async () => {
   const { s, deadline, posts, close } = await deadlineSurface();
   try {
-    const bad = ["extend 4m", "extend 25", "extend 0", "extend 6x", "extend 1.5h", "extend 6 days", "extend 6h please", "extend 1440"];
+    const bad = ["extend 4m", "extend 25", "extend 0", "extend 6x", "extend 1.5h", "extend 6 days", "extend 6h please", "extend 1440",
+      "extend -1h", "extend .5h", "extend +2h"];
     for (const [index, text] of bad.entries()) {
       await s.slack.emit(mention(text));
       await handledOutcomes(s, index + 1);

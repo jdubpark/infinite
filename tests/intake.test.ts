@@ -1632,3 +1632,42 @@ test("an issue closed during a time-limit stop is paused once the owner extends,
     assert.equal(ctx.store.get(issue.id)!.closure?.reason, "The Linear issue was closed.");
   } finally { await ctx.close(); }
 });
+
+test("a newer outcome that replaces an outcome whose send is still open is not marked delivered by that send", { timeout: 120000 }, async () => {
+  const stage: { current?: Partial<Mission> } = {};
+  const ctx = await setup({ wrapMissions: staged(stage) });
+  try {
+    const issue = ctx.issue();
+    await ctx.intake.poll();
+    const id = missionRequestId(issue.id);
+    // A Linear client whose next comment send is held open until the test releases it. The fixture server cannot hold a send.
+    const base = new IntakeLinear(ctx.linear);
+    const send = base.comment.bind(base);
+    let hold: { started: () => void; release: Promise<void> } | undefined;
+    base.comment = async (issueId, input) => {
+      if (hold) { const current = hold; hold = undefined; current.started(); await current.release; }
+      return send(issueId, input);
+    };
+    let releaseSend!: () => void;
+    const release = new Promise<void>(done => { releaseSend = done; });
+    const sendStarted = new Promise<void>(done => { hold = { started: done, release }; });
+    stage.current = { status: "blocked", stopReason: "deadline", reason: "Approved time ran out after 30 minutes.", deadlineAt: ctx.iso(10 * MINUTE) };
+    const gated = ctx.service(base);
+    const pending = gated.poll();
+    await sendStarted;
+    // While the first outcome's send is open, a later stop replaces it with a newer comment.
+    stage.current = { ...stage.current, deadlineAt: ctx.iso(20 * MINUTE) };
+    // observe() is private; calling it stands in for the mission change that a later stop would deliver.
+    (gated as unknown as { observe(mission: Mission): void }).observe(ctx.missions.peek(id)!);
+    const replacement = ctx.store.get(issue.id)!.comments.outcome!;
+    releaseSend();
+    await pending;
+    const held = ctx.store.get(issue.id)!.comments.outcome!;
+    assert.equal(held.id, replacement.id);
+    assert.equal(held.delivered, false, "The send of the replaced comment does not mark the newer one delivered");
+    await ctx.intake.poll();
+    assert.equal(ctx.store.get(issue.id)!.comments.outcome!.delivered, true);
+    assert.ok(ctx.linearServer.comments(issue.id).some(comment => comment.id === replacement.id), "The newer comment reached Linear");
+    assert.equal(ctx.linearServer.comments(issue.id).length, 3, "The started comment, the replaced comment, and the newer one");
+  } finally { await ctx.close(); }
+});

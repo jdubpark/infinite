@@ -342,12 +342,9 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       // An owner halt stops the permission agent too: while it covers the project no reviewer turn starts and no recorded verdict is delivered.
       halted: projectId => halt.check({ projectId }).state === "halted",
       // Each halt is recorded: it retires the verdicts reached before it, and the release brings a fresh evaluation.
-      halts: () => {
-        const view = halt.view();
-        if (!view.readable) return undefined;
-        return [...(view.host ? [{ haltId: view.host.haltId }] : []), ...view.projects.map(entry => ({ haltId: entry.haltId, projectId: entry.projectId }))];
-      },
-      haltHistory: () => halt.history(),
+      // The count of engaged halts catches one the pipeline never recorded, also when it was released before a restart.
+      halts: () => halt.engagements()?.halts,
+      haltsEngaged: () => halt.engagements()?.count,
     });
   // Sessions outside team runs: every session listing is read for their permission dialogs, which go to the delivery service.
   const sessionPermissions = new SessionPermissionRequests(config, manager, {

@@ -89,17 +89,18 @@ export class HaltService {
   }
 
   /**
-   * Every halt the record still knows of: the halts in force, then the ones its last receipts engaged. A released
-   * halt's project is not kept, so it is given without one. Undefined while the record cannot be read.
+   * The halts in force, each with its place in the count, and how many halts the record has engaged in all. The count
+   * is never lowered by a release or a dropped receipt. Undefined while the record cannot be read.
    */
-  history(): { haltId: string; projectId?: string }[] | undefined {
+  engagements(): { count: number; halts: { haltId: string; projectId?: string; serial?: number }[] } | undefined {
     if (!this.readable) return undefined;
-    const marks = new Map<string, { haltId: string; projectId?: string }>();
-    for (const entry of this.record.halts)
-      marks.set(entry.haltId, { haltId: entry.haltId, ...(entry.scope === "project" && entry.projectId ? { projectId: entry.projectId } : {}) });
-    for (const receipt of this.record.receipts)
-      if (receipt.action === "engage" && receipt.changed && receipt.haltId && !marks.has(receipt.haltId)) marks.set(receipt.haltId, { haltId: receipt.haltId });
-    return [...marks.values()];
+    return {
+      count: this.record.engaged ?? 0,
+      halts: this.record.halts.map(entry => ({
+        haltId: entry.haltId, ...(entry.scope === "project" && entry.projectId ? { projectId: entry.projectId } : {}),
+        ...(entry.serial === undefined ? {} : { serial: entry.serial }),
+      })),
+    };
   }
 
   view(): HaltView {
@@ -131,13 +132,14 @@ export class HaltService {
         if (!this.persist({ ...this.record, receipts: this.withReceipt(receipt) })) throw writeError();
         return this.engageResult(receipt);
       }
+      const serial = (this.record.engaged ?? 0) + 1;
       const entry: HaltEntry = {
         haltId: randomUUID(), scope: target.scope, ...(target.scope === "project" ? { projectId: target.projectId } : {}), at,
-        ...(body.reason === undefined ? {} : { reason: body.reason }), requestId: body.requestId, by, settled: false,
+        ...(body.reason === undefined ? {} : { reason: body.reason }), requestId: body.requestId, by, settled: false, serial,
       };
       const receipt: HaltReceipt = { requestId: body.requestId, action: "engage", fingerprint, haltId: entry.haltId, changed: true, at, by, settled: false, outcomes: [] };
       // The gate holds every new launch in scope from this write on, before any running item is paused.
-      if (!this.persist({ ...this.record, halts: [...this.record.halts, entry], receipts: this.withReceipt(receipt) })) throw writeError();
+      if (!this.persist({ ...this.record, engaged: serial, halts: [...this.record.halts, entry], receipts: this.withReceipt(receipt) })) throw writeError();
       await this.finishEngage(receipt);
       return this.engageResult(this.record.receipts.find(value => value.requestId === receipt.requestId) ?? receipt);
     });

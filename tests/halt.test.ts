@@ -9,7 +9,7 @@ import { BASELINE_FILE, readBaseline } from "../packages/host/src/fuse/baseline.
 import { FuseService } from "../packages/host/src/fuse/service.js";
 import type { FuseGate } from "../packages/host/src/fuse/types.js";
 import { GoalService } from "../packages/host/src/goals.js";
-import { HALT_FILE, writeHaltRecord } from "../packages/host/src/halt/record.js";
+import { HALT_FILE, MAX_RECEIPTS, writeHaltRecord } from "../packages/host/src/halt/record.js";
 import { KEPT_PAUSED, type HaltTargets } from "../packages/host/src/halt/rules.js";
 import { RoutineService } from "../packages/host/src/routines.js";
 import { HaltService } from "../packages/host/src/halt/service.js";
@@ -264,20 +264,24 @@ test("a halt survives a restart, finishes an interrupted pass, and fails closed 
   } finally { f.close(); }
 });
 
-test("the halt history keeps a released halt, without its project, and a restart reads it back", async () => {
+test("the halt count keeps every engaged halt after its release and after its receipt is dropped, and a restart reads it", async () => {
   const f = schedulerFixture();
   const halt = new HaltService({ config: f.config, key: f.key });
   try {
+    assert.deepEqual(halt.engagements(), { count: 0, halts: [] });
     const project = await halt.engage(fixtureScope, { requestId: randomUUID() }, owner);
     const host = await halt.engage(hostScope, { requestId: randomUUID() }, owner);
+    await halt.engage(hostScope, { requestId: randomUUID() }, owner);
     const projectId = project.halt.projects[0]!.haltId, hostId = host.halt.host!.haltId;
-    assert.deepEqual(halt.history(), [{ haltId: projectId, projectId: "fixture" }, { haltId: hostId }]);
+    assert.deepEqual(halt.engagements(), { count: 2, halts: [{ haltId: projectId, projectId: "fixture", serial: 1 }, { haltId: hostId, serial: 2 }] },
+      "an engage that found the scope halted counts nothing");
     await halt.release(fixtureScope, { requestId: randomUUID() }, owner);
     await halt.release(hostScope, { requestId: randomUUID() }, owner);
-    // Released halts stay in the history; the project of a released one is not kept, so it counts for every project.
-    assert.deepEqual(halt.history(), [{ haltId: projectId }, { haltId: hostId }]);
+    // Accepted requests that change nothing push the engaging receipts out of the record; the count stays.
+    for (let index = 0; index < MAX_RECEIPTS; index++) await halt.release(hostScope, { requestId: randomUUID() }, owner);
+    assert.deepEqual(halt.engagements(), { count: 2, halts: [] });
     halt.stop();
-    assert.deepEqual(new HaltService({ config: f.config, key: f.key }).history(), [{ haltId: projectId }, { haltId: hostId }]);
+    assert.deepEqual(new HaltService({ config: f.config, key: f.key }).engagements(), { count: 2, halts: [] });
   } finally { halt.stop(); f.close(); }
 });
 

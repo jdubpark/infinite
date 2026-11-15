@@ -18,6 +18,8 @@ export type HaltEntry = {
   by: HaltActor;
   /** False until the stop pass has finished. A restart finishes an unsettled pass. */
   settled: boolean;
+  /** Its place in the record's count of engaged halts. Absent on a halt engaged before the count was kept. */
+  serial?: number;
 };
 export type HaltReceipt = {
   requestId: string;
@@ -34,7 +36,14 @@ export type HaltReceipt = {
   settled: boolean;
   outcomes: HaltOutcome[];
 };
-export type HaltRecord = { version: 1; halts: HaltEntry[]; receipts: HaltReceipt[] };
+export type HaltRecord = {
+  version: 1; halts: HaltEntry[]; receipts: HaltReceipt[];
+  /**
+   * How many halts this record has engaged. It is never lowered and is kept apart from the receipts, so a released
+   * halt is still counted after its receipt is dropped. Absent on a record written before it was kept.
+   */
+  engaged?: number;
+};
 
 /** Requests remembered for replay. The oldest is dropped first. */
 export const MAX_RECEIPTS = 100;
@@ -52,6 +61,7 @@ const entrySchema = z.object({
   requestId: uuid,
   by: actorSchema,
   settled: z.boolean(),
+  serial: z.number().int().positive().optional(),
 }).strict();
 const outcomeSchema = z.object({
   kind: z.enum(HALT_ITEM_KINDS),
@@ -76,6 +86,7 @@ const recordSchema: z.ZodType<HaltRecord> = z.object({
   version: z.literal(1),
   halts: z.array(entrySchema).max(10000),
   receipts: z.array(receiptSchema).max(MAX_RECEIPTS),
+  engaged: z.number().int().nonnegative().optional(),
 }).strict();
 
 export type HaltRead = { state: "missing" } | { state: "readable"; record: HaltRecord } | { state: "unreadable" };

@@ -11,6 +11,7 @@ import type { PermissionOutcome, PermissionPipeline, PermissionRequest } from ".
 import { InteractivePermissionDelivery, type DeliveryLedgerState, type PermissionDeliveryLedger } from "../packages/host/src/permission-delivery.js";
 import { requesterNotice } from "../packages/host/src/permission-policy.js";
 import { teamPrompt } from "../packages/host/src/team-prompts.js";
+import type { Manager } from "../packages/host/src/manager.js";
 
 const lineup: TeamLineup = {
   ...limitLineup,
@@ -225,18 +226,29 @@ test("an owner act that makes the permission agent serve a run retires its coord
     await waitFor(() => f.get(runId), run => run.permissionDecisions?.some(decision => decision.status === "reviewing") === true &&
       existsSync(join(f.receipts, `${runId}.judge-ready`)), 60000);
     // The service is not started, so no scheduler pass runs: only the authority change can retire the review.
-    const service = await f.openTeamService({ start: false });
+    let manager!: Manager;
+    const service = await f.openTeamService({ start: false, manager: value => { manager = value; } });
     let served = false;
     const { pipeline } = fakePipeline(() => ({ kind: "owner", decisionId: randomUUID(), interruptClass: "credentials" }));
     pipeline.serves = () => served ? { served: true } : { served: false, reason: "not-covered" };
     service.usePermissionAgent({ pipeline, delivery: new InteractivePermissionDelivery({ pipeline: () => pipeline, ledger: memoryLedger() }) });
     await service.permissionAuthorityChanged();
     assert.equal(service.get(runId).permissionDecisions![0]!.status, "reviewing", "a run the agent does not serve keeps its review");
+    const member = service.get(runId).members.find(item => item.taskId === "a")!;
+    const session = manager.meta(member.sessionId).session;
     served = true;
+    // Activation is a fenced switch: the agent does not serve the run while a coordinator review of it is live.
+    assert.equal(service.permissionAgentLive(session), false, "the agent waits for the switch");
     await service.permissionAuthorityChanged();
     const view = service.get(runId);
     assert.equal(view.permissionDecisions![0]!.status, "stale", JSON.stringify(view.permissionDecisions));
     assert.ok(view.events.some(event => event.text === "The permission agent now decides this run's provider requests; its coordinator reviews were retired."));
+    assert.equal(service.permissionAgentLive(session), true, "after the switch the agent serves the run");
+    // A revoke of the coverage ends it; the coordinator path may run again, so a return to the agent switches again.
+    served = false;
+    assert.equal(service.permissionAgentLive(session), false);
+    served = true;
+    assert.equal(service.permissionAgentLive(session), false);
   } finally { await f.close(); }
 });
 

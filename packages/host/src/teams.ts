@@ -483,6 +483,8 @@ const assignment = (member: TeamMember): TeamAssignment => ({ runId: member.runI
 function deliveryBranchMatches(run: TeamRun, branch: string) { return branch === run.branch || branch === teamDeliveryBranch(run); }
 export class TeamService {
   private readonly records = new Map<string, Stored>();
+  /** Runs whose switch to the permission agent is complete. In memory: after a restart each run is switched again. */
+  private readonly agentSwitched = new Set<string>();
   private readonly retiredRunIds = new Set<string>();
   private serial: Promise<unknown> = Promise.resolve();
   private timer?: NodeJS.Timeout;
@@ -1031,7 +1033,7 @@ export class TeamService {
         (!prompt.hash || item.promptHash === prompt.hash)).at(-1);
       if (decision) return ["pending", "reviewing", "approved", "answering"].includes(decision.status) ? "coordinator" : "user";
       // The permission agent's holder answers for a served run; whatever it leaves is the owner's.
-      if (this.agentServes(stored)) return "user";
+      if (this.agentEligible(stored)) return "user";
       if (!run.permissions || run.permissionsRevokedAt || stored.halt || ["paused", "cancelled", "blocked"].includes(run.status) ||
           !activeMember(member) || member.role === "permission-coordinator" || !run.lineup ||
           !run.lineup.permissionReviewer && run.lineup.coordinator.tier !== "strong" ||
@@ -1815,7 +1817,7 @@ export class TeamService {
     const body = teamActionSchema.parse(input);
     return this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
-      if (!run.permissions && !this.agentServes(stored) && !run.permissionAgentDecisions?.length)
+      if (!run.permissions && !this.agentEligible(stored) && !run.permissionAgentDecisions?.length)
         throw new TeamError(409, "permissions-not-enabled", "This team has no delegated permission policy to revoke.");
       if (this.replay(stored, "revoke-permissions", body)) return this.view(stored);
       if (!this.mutation(stored, "revoke-permissions", body)) return this.view(stored);
@@ -3103,10 +3105,14 @@ export class TeamService {
             // A member back from an outage may come back straight into a prompt; it is running again.
             if (state.status === "running" && member.status === "unavailable" && member.role !== "permission-coordinator") member.status = "running";
             // A served run's dialogs go to the permission agent; the coordinator review path runs only for the others.
-            if (this.agentServes(stored)) {
+            if (this.agentEligible(stored)) {
               await this.retireCoordinatorReviews(stored);
-              this.handOffPermission(stored, member, state);
-            } else if (!this.agentBusy(run.id) && await this.maybeStartPermissionReview(stored, member, state)) return;
+              if (this.agentServes(stored)) this.handOffPermission(stored, member, state);
+            } else {
+              // A coordinator review may start below, so a later return to the agent must switch the run again.
+              this.agentSwitched.delete(run.id);
+              if (!this.agentBusy(run.id) && await this.maybeStartPermissionReview(stored, member, state)) return;
+            }
             if (["unavailable", "recording-error"].includes(state.status)) { member.status = "unavailable"; run.reason = runtimeUnavailableReason; }
             // A prompt that waits on a person outranks one under review.
             else if (state.attention.state === "needs-you") {
@@ -3319,7 +3325,7 @@ export class TeamService {
     const run = stored.run;
     if (!run.permissions || run.permissionsRevokedAt || stored.halt || ["paused", "cancelled", "blocked"].includes(run.status))
       return "The run is paused, stopped, blocked, or its permission policy was revoked.";
-    if (this.agentServes(stored)) return coordinatorRetiredReason;
+    if (this.agentEligible(stored)) return coordinatorRetiredReason;
     if (request.revision !== run.revision || request.targetMemberId !== target.memberId || request.targetSessionId !== target.sessionId ||
         target.revision !== run.revision || target.role === "permission-coordinator" || !activeMember(target))
       return "The target member assignment is no longer current.";
@@ -3442,11 +3448,11 @@ export class TeamService {
     this.removeAgentSource = delivery?.addSource?.({ claims: (sessionId, promptId) => this.agentClaims(sessionId, promptId) });
   }
   /**
-   * Whether the permission agent decides this run's member dialogs now: its parts are wired, the run's project
-   * is covered and the host is ready, and the owner has not revoked the run's delegation. Otherwise the run's
-   * dialogs are handled as before.
+   * Whether the permission agent may decide this run's member dialogs: its parts are wired, the run's project is
+   * covered and the host is ready, and the owner has not revoked the run's delegation. From that moment the
+   * coordinator review answers nothing more. The agent itself starts only after the switch (`agentServes`).
    */
-  private agentServes(stored: Stored): boolean {
+  private agentEligible(stored: Stored): boolean {
     const services = this.permissionAgent, run = stored.run;
     if (!services?.delivery || !services.pipeline || run.permissionsRevokedAt) return false;
     try { return services.pipeline.serves(run.projectId).served; } catch { return false; }
@@ -3457,9 +3463,21 @@ export class TeamService {
    * answer in flight is fenced at the worker.
    */
   private async retireCoordinatorReviews(stored: Stored) {
-    if (!this.coordinatorReviewsLive(stored)) return;
-    this.event(stored, coordinatorRetiredEvent);
-    await this.invalidatePermissionDecisions(stored, coordinatorRetiredReason, false);
+    if (this.coordinatorReviewsLive(stored)) {
+      this.event(stored, coordinatorRetiredEvent);
+      await this.invalidatePermissionDecisions(stored, coordinatorRetiredReason, false);
+    }
+    // Every coordinator answer of the run is retired and fenced at its worker now, so the agent may start.
+    if (this.agentEligible(stored)) this.agentSwitched.add(stored.run.id);
+  }
+  /**
+   * Whether the permission agent decides this run's dialogs now. Activation is a fenced switch: once the run is
+   * eligible no coordinator answer starts, its coordinator answers in flight are fenced, and only then does the
+   * agent serve the run. A run that stops being eligible must be switched again.
+   */
+  private agentServes(stored: Stored): boolean {
+    if (!this.agentEligible(stored)) { this.agentSwitched.delete(stored.run.id); return false; }
+    return this.agentSwitched.has(stored.run.id);
   }
   private coordinatorReviewsLive(stored: Stored) {
     return (stored.run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering"].includes(decision.status));
@@ -3471,7 +3489,8 @@ export class TeamService {
    * has a live coordinator review, so a caller can run it on every write.
    */
   permissionAuthorityChanged(): Promise<void> {
-    const affected = () => [...this.records.values()].filter(stored => this.coordinatorReviewsLive(stored) && this.agentServes(stored));
+    const affected = () => [...this.records.values()].filter(stored => this.agentEligible(stored) &&
+      (this.coordinatorReviewsLive(stored) || !this.agentSwitched.has(stored.run.id)));
     if (this.closed || affected().length === 0) return Promise.resolve();
     return this.enqueue(async () => {
       if (this.closed) return;
@@ -3504,7 +3523,7 @@ export class TeamService {
       const member = run.members.find(item => item.sessionId === sessionId && item.revision === run.revision);
       if (!member) continue;
       if (!activeMember(member) || member.role === "permission-coordinator" || stored.halt ||
-          ["paused", "cancelled", "blocked"].includes(run.status) || !this.agentServes(stored)) return false;
+          ["paused", "cancelled", "blocked"].includes(run.status) || !this.agentEligible(stored)) return false;
       if (this.agentHolds(sessionId, promptId)) return true;
       const prefix = `${sessionId}:${promptId}:`;
       const observed = this.agentObserved.get(sessionId);
@@ -3717,7 +3736,7 @@ export class TeamService {
   private async maybeStartPermissionReview(stored: Stored, target: TeamMember, observedState?: Awaited<ReturnType<Manager["state"]>>) {
     const run = stored.run;
     if (!run.permissions || run.permissionsRevokedAt || target.status !== "running" || stored.halt ||
-        ["paused", "cancelled", "blocked"].includes(run.status) || target.revision !== run.revision || this.agentServes(stored)) return false;
+        ["paused", "cancelled", "blocked"].includes(run.status) || target.revision !== run.revision || this.agentEligible(stored)) return false;
     if (run.members.some(member => {
       if (member.memberId === target.memberId || member.revision !== run.revision || member.role !== "permission-coordinator" || !activeMember(member)) return false;
       const decision = permissionCoordinatorDecision(run, member);
@@ -3867,7 +3886,7 @@ export class TeamService {
     const reviewer = this.reviewerProfile(run);
     if (!run.permissions || run.permissionsRevokedAt || stored.halt || ["paused", "cancelled", "blocked"].includes(run.status) ||
         target.status !== "running" || target.revision !== run.revision || !run.lineup || !reviewer ||
-        !run.lineup.permissionReviewer && run.lineup.coordinator.tier !== "strong" || this.agentServes(stored))
+        !run.lineup.permissionReviewer && run.lineup.coordinator.tier !== "strong" || this.agentEligible(stored))
       return stopRecovery("The current run authority no longer permits a fresh permission review.");
     if (recovery && (recovery.policyHash !== digest(run.permissions) || !Number.isFinite(Date.parse(recovery.expiresAt)) || Date.now() >= Date.parse(recovery.expiresAt)))
       return stopRecovery("The original permission policy or recovery deadline is no longer current.");
@@ -4261,7 +4280,7 @@ export class TeamService {
   private async permissionAnswerInvalidReason(stored: Stored, decision: TeamPermissionDecision, coordinator?: TeamMember) {
     const run = stored.run;
     if (!run.permissions || run.permissionsRevokedAt || stored.halt || ["paused", "cancelled", "blocked"].includes(run.status)) return "The team is paused, stopped, blocked, or its permission policy was revoked.";
-    if (this.agentServes(stored)) return coordinatorRetiredReason;
+    if (this.agentEligible(stored)) return coordinatorRetiredReason;
     if (decision.purpose === "diagnose" || decision.option < 0) return "A diagnostic permission review has no authority to answer a provider prompt.";
     if (decision.status !== "approved" || decision.revision !== run.revision || coordinator &&
         (coordinator.revision !== run.revision || decision.coordinatorMemberId !== coordinator.memberId || decision.targetMemberId === coordinator.memberId))
@@ -4388,7 +4407,7 @@ export class TeamService {
       // The owner may have answered during the asynchronous checks above; nothing reviewed before that answer may deliver.
       if (decision.authorityHash !== ownerAuthorityHash(run))
         return { status: "escalated" as const, reason: "The owner's steering or answers changed while the target session was being checked." };
-      if (decision.status !== "approved" || !run.permissions || run.permissionsRevokedAt || stored.halt || this.agentServes(stored) ||
+      if (decision.status !== "approved" || !run.permissions || run.permissionsRevokedAt || stored.halt || this.agentEligible(stored) ||
           ["paused", "cancelled", "blocked"].includes(run.status) || decision.revision !== run.revision ||
           (coordinator && decision.coordinatorMemberId !== coordinator.memberId) || decision.policyHash !== digest(run.permissions) ||
           Date.now() >= Date.parse(decision.expiresAt))
@@ -4410,7 +4429,7 @@ export class TeamService {
         if (!deliveryDecision) return { status: "escalated" as const, reason: "The recorded reviewer assignment for this reused approval is unavailable. The request remains with the user." };
         // The permission agent can start to serve the run while this answer is under way; the manager reads this under its lease.
         const receipt = await this.manager.answerTeamPermission(decision.targetSessionId, decision.answerRequestId,
-          assignment(target), deliveryDecision, () => !this.agentServes(stored));
+          assignment(target), deliveryDecision, () => !this.agentEligible(stored));
         return receipt.state === "delivered" && receipt.result === "closed"
           ? { status: "answered" as const, receipt }
           : receipt.state === "uncertain" ? { status: "uncertain" as const, receipt, reason: "The host could not confirm whether the target prompt closed. Inspect the target session before acting." }

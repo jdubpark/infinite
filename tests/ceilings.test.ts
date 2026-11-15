@@ -1,9 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { spawnSync, execFileSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
-import { checkCeiling, forbiddenLaunchFlags, type CeilingFileKind, type CeilingFs, type CeilingCheckInput, type CeilingLine } from "../packages/host/src/ceilings.js";
+import { checkCeiling, forbiddenLaunchFlags, nodeCeilingFs, type CeilingFileKind, type CeilingFs, type CeilingCheckInput, type CeilingLine } from "../packages/host/src/ceilings.js";
 
 const SYSTEM = "/etc/claude-code/managed-settings.json";
 const TEMPLATE = "/repo/deploy/ubuntu/ceilings/managed-settings.json";
@@ -95,7 +98,8 @@ test("a world-writable parent directory reports writable even when the file is s
   const writable = byCheck(lines, "writable");
   assert.equal(writable.status, "writable");
   assert.match(writable.detail, /\/etc\/claude-code is group- or world-writable/);
-  assert.equal(byCheck(lines, "hash").status, "ok");
+  // The ceiling is not read while its placement is unsafe, so its hash is not computed.
+  assert.equal(byCheck(lines, "hash").status, "writable");
 });
 
 test("a ceiling that is a symbolic link reports writable, even when its target matches the template", () => {
@@ -112,8 +116,52 @@ test("an entry that is not a regular file is reported without being opened", () 
   const fs: CeilingFs = { stat: base.stat, read: (path) => { assert.notEqual(path, SYSTEM, "the ceiling path must not be read"); return base.read(path); } };
   const lines = run({ fs });
   assert.equal(byCheck(lines, "writable").status, "writable");
-  assert.equal(byCheck(lines, "hash").status, "changed");
+  assert.equal(byCheck(lines, "hash").status, "writable");
+  assert.match(byCheck(lines, "hash").detail, /not read/);
   assert.equal(byCheck(lines, "profile").status, "ok");
+});
+
+test("the ceiling is not read while any placement check fails, even when the file itself is safe", () => {
+  // Whoever controls the directory can swap the file after a read, so an unsafe placement stops the read.
+  const base = healthy({ "/etc/claude-code": { mode: 0o777 } });
+  const reads: string[] = [];
+  const fs: CeilingFs = { stat: base.stat, read: (path) => { reads.push(path); return base.read(path); } };
+  const lines = run({ fs });
+  assert.equal(reads.includes(SYSTEM), false, "the ceiling path was read");
+  assert.equal(byCheck(lines, "hash").status, "writable");
+  assert.match(byCheck(lines, "hash").detail, /not read/);
+});
+
+test("the real reader does not follow a symbolic link and returns only regular files", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ceilings-read-"));
+  try {
+    const target = join(dir, "target");
+    writeFileSync(target, "ceiling");
+    symlinkSync(target, join(dir, "link"));
+    assert.equal(nodeCeilingFs.read(join(dir, "link")), undefined, "a link was followed");
+    assert.equal(new TextDecoder().decode(nodeCeilingFs.read(target)), "ceiling");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the real reader returns for a named pipe instead of waiting for a writer", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ceilings-fifo-"));
+  try {
+    const pipe = join(dir, "pipe");
+    execFileSync("mkfifo", [pipe]);
+    // Run in a child so a blocked read cannot hang the test runner: the child is killed after the timeout.
+    const probe = "import(process.env.CEILINGS_MODULE).then((m) => process.stdout.write(String(m.nodeCeilingFs.read(process.env.CEILINGS_PIPE) === undefined)))";
+    const result = spawnSync(process.execPath, ["--import", "tsx", "-e", probe], {
+      env: { ...process.env, CEILINGS_MODULE: pathToFileURL(resolve("packages/host/src/ceilings.ts")).href, CEILINGS_PIPE: pipe },
+      encoding: "utf8",
+      timeout: 20000,
+    });
+    assert.equal(result.error, undefined, "the reader blocked on the pipe");
+    assert.equal(result.stdout, "true");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("a directory higher up that another account can change reports writable", () => {
@@ -127,11 +175,34 @@ test("launch flags the ceilings turn off are found in each spelling, and look-al
   // Codex reads an override value as TOML, so every string form of the same value counts.
   for (const value of ['"""danger-full-access"""', "'''danger-full-access'''", '"\\u0064anger-full-access"', '"danger\\u002Dfull-access"'])
     assert.equal(forbiddenLaunchFlags("codex", ["--config", `sandbox_mode=${value}`]).length, 1, value);
-  for (const args of [["--yolo"], ["-c", "sandbox_mode='danger-full-access'"], ["--config", "sandbox_mode = \"danger-full-access\""], ["--config=sandbox_mode=danger-full-access"], ["--sandbox=danger-full-access"], ["-s", "danger-full-access"]])
+  for (const args of [["-c", "sandbox_mode='danger-full-access'"], ["--config", "sandbox_mode = \"danger-full-access\""], ["--config=sandbox_mode=danger-full-access"], ["--sandbox=danger-full-access"], ["-s", "danger-full-access"]])
     assert.equal(forbiddenLaunchFlags("codex", args).length, 1, args.join(" "));
   // Another key whose value only mentions the mode, and a prompt that mentions the flag text.
   assert.deepEqual(forbiddenLaunchFlags("codex", ["-c", 'notes="sandbox_mode=danger-full-access"', "--sandbox", "workspace-write"]), []);
   assert.deepEqual(forbiddenLaunchFlags("claude", ["--permission-mode", "dontAsk", "--append-system-prompt", "never use --permission-mode auto"]), []);
+});
+
+test("the hidden Codex alias --yolo is checked, as the CLI accepts it", () => {
+  // Hidden from codex --help, but accepted by codex-cli 0.167.2 (parse-level probe).
+  assert.deepEqual(forbiddenLaunchFlags("codex", ["--yolo"]), ["--yolo"]);
+});
+
+test("the Claude flag --enable-auto-mode is checked", () => {
+  assert.deepEqual(forbiddenLaunchFlags("claude", ["--enable-auto-mode"]), ["--enable-auto-mode"]);
+});
+
+test("codex sandbox values are reported unless they read as exactly read-only or workspace-write", () => {
+  // A line-ending backslash in a multi-line TOML string joins the lines into danger-full-access.
+  assert.equal(forbiddenLaunchFlags("codex", ["-c", 'sandbox_mode="""danger-\\\n full-access"""']).length, 1);
+  // Attached short and long forms that codex-cli 0.167.2 accepts.
+  assert.equal(forbiddenLaunchFlags("codex", ["-sdanger-full-access"]).length, 1);
+  assert.equal(forbiddenLaunchFlags("codex", ['-csandbox_mode="danger-full-access"']).length, 1);
+  assert.equal(forbiddenLaunchFlags("codex", ["--sandbox=bogus"]).length, 1);
+  // A quoted key and a trailing comment are reported rather than missed.
+  assert.equal(forbiddenLaunchFlags("codex", ["-c", '"sandbox_mode"="danger-full-access"']).length, 1);
+  assert.equal(forbiddenLaunchFlags("codex", ["-c", 'sandbox_mode="read-only" # note']).length, 1);
+  // Allowed values in each form stay clean.
+  assert.deepEqual(forbiddenLaunchFlags("codex", ["-sworkspace-write", "-c", "sandbox_mode='read-only'", '--config=sandbox_mode="workspace-write"']), []);
 });
 
 test("a configured bypass-permissions profile conflicts with the ceiling", () => {

@@ -80,6 +80,19 @@ safe_above() {
   done
 }
 
+# dir_problem DIR: succeeds when DIR is a real directory that only root can write. Prints the reason otherwise.
+dir_problem() {
+  if [ -L "$1" ] || [ ! -d "$1" ]; then
+    printf '%s is not a real directory' "$1"
+    return 1
+  fi
+  if [ "$(stat -c '%u' "$1")" != 0 ] || [ $(( 0$(stat -c '%a' "$1") & 022 )) -ne 0 ]; then
+    printf '%s is not root-owned or is group- or world-writable' "$1"
+    return 1
+  fi
+  return 0
+}
+
 # process TEMPLATE TARGET: install TEMPLATE at TARGET, or report a difference.
 process() {
   template=$1
@@ -94,8 +107,14 @@ process() {
   fi
 
   if [ "$mode" = check ]; then
-    if [ -L "$dir" ] || { [ -e "$dir" ] && [ ! -d "$dir" ]; }; then
-      printf 'differs: %s is not a real directory\n' "$dir"
+    if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
+      printf 'missing: %s (directory %s does not exist)\n' "$target" "$dir"
+      differs=1
+      return
+    fi
+    # The directory is checked before the target is touched: a name inside an unsafe directory can be a planted link.
+    if ! problem=$(dir_problem "$dir"); then
+      printf 'differs: %s; target not read\n' "$problem"
       differs=1
       return
     fi

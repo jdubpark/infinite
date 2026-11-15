@@ -147,16 +147,16 @@ struct MissionDetailView: View {
     @ViewBuilder private var history: some View {
         let answered = mission.answeredDecisions
         if !mission.steering.isEmpty || !answered.isEmpty {
-            section("Your directions and decisions") {
+            section("Directions and decisions") {
                 ForEach(Array(mission.steering.enumerated()), id: \.offset) { _, entry in
                     VStack(alignment: .leading, spacing: 3) {
-                        Text("Direction · revision \(entry["revision"].int) · \(teamDate(entry["at"].string))").font(.caption).foregroundStyle(.secondary)
+                        Text("\(entry["source"]["kind"].string == "connector" ? (entry["source"]["name"].string.isEmpty ? "Connector" : entry["source"]["name"].string) : entry["source"].string == "coordinator" ? "Mission coordinator" : "You") · direction · revision \(entry["revision"].int) · \(teamDate(entry["at"].string))").font(.caption).foregroundStyle(.secondary)
                         Text(entry["text"].string).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     }
                 }
                 ForEach(Array(answered.enumerated()), id: \.offset) { _, decision in
                     VStack(alignment: .leading, spacing: 3) {
-                        Text("Decision · answered by \(decision["answeredBy"].string == "coordinator" ? "the coordinator" : "you")").font(.caption).foregroundStyle(.secondary)
+                        Text("Decision · answered by \(decision["answeredBy"].string == "connector" ? (decision["source"]["name"].string.isEmpty ? "Connector" : decision["source"]["name"].string) : decision["answeredBy"].string == "coordinator" ? "the coordinator" : "you")").font(.caption).foregroundStyle(.secondary)
                         Text(decision["question"].string).font(.callout).fixedSize(horizontal: false, vertical: true)
                         Text("Answer: \(decision["answer"].string)").font(.callout.weight(.medium)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     }

@@ -6,6 +6,14 @@ An unattended agent's execution environment must read the files, credentials, an
 
 ## Implemented protection
 
+The optional [MCP request connector](mcp.md) uses a dedicated bearer credential
+and explicit project allowlist on a separate loopback listener. Expose only its
+`/mcp` path through a dedicated HTTPS proxy. It grants no paired-device or owner
+API access, checks request ownership and current scope, and retains connector
+provenance in mission instructions and answers. A Grok Bot name does not isolate
+an account-wide App connection. Provider permission approvals remain outside
+the connector tools.
+
 Goal and team requirements, decisions, reports, outcomes, and receipts use the
 encrypted state and journal. A Goal records approved paths, execution limits,
 and requested model profiles. The host validates task ownership and integrated

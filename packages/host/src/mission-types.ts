@@ -1,3 +1,4 @@
+import type { ConnectorSource } from "./mcp-types.js";
 import { z } from "zod";
 import { blockerEvidenceSchema, type TeamLineup, type TeamStatus } from "./team-types.js";
 import type { UsageRollup } from "./team-usage.js";
@@ -21,6 +22,9 @@ export const createMissionSchema = z.object({
 export type CreateMission = z.infer<typeof createMissionSchema>;
 export const missionActionSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict();
 export const missionTextSchema = missionActionSchema.extend({ text: z.string().trim().min(1).max(8000) }).strict();
+/** The owner approves more working time: up to 24 hours per extension. */
+export const missionExtendSchema = missionActionSchema.extend({ minutes: z.number().int().min(5).max(1440) }).strict();
+export type MissionExtend = z.infer<typeof missionExtendSchema>;
 
 /** One unit of work the main coordinator hands to a single-repository subteam. */
 export const missionSubtaskPlanSchema = z.object({
@@ -87,7 +91,8 @@ export interface MissionDecision {
   childDecisionId?: string;
   answer?: string;
   answeredAt?: string;
-  answeredBy?: "owner" | "coordinator";
+  answeredBy?: "owner" | "coordinator" | "connector";
+  source?: ConnectorSource;
 }
 /** A time the coordinator asked to look again. `fired` means the host woke the coordinator; it records no outcome. */
 export interface MissionFollowUp {
@@ -99,8 +104,8 @@ export interface MissionFollowUp {
   state: "open" | "fired" | "cancelled";
   settledAt?: string;
 }
-export type MissionOrigin = { kind: "intake"; issueId: string; identifier: string; url: string; rule: string };
-export type MissionInputSource = "slack";
+export type MissionOrigin = { kind: "intake"; issueId: string; identifier: string; url: string; rule: string; source?: ConnectorSource };
+export type MissionInputSource = "slack" | ConnectorSource;
 export interface Mission {
   id: string;
   groupId: string;
@@ -119,6 +124,9 @@ export interface Mission {
   revision: number;
   status: MissionStatus;
   reason?: string;
+  /** `deadline` while the mission is blocked because its approved time ran out: its subteams are paused, their
+   * workspaces are kept, and the owner may extend it. Absent for every other status or reason. */
+  stopReason?: "deadline";
   createdAt: string;
   updatedAt: string;
   lineup: TeamLineup;
@@ -126,7 +134,7 @@ export interface Mission {
   dispatchSummary?: string;
   subtasks: MissionSubtask[];
   decisions: MissionDecision[];
-  steering: { text: string; revision: number; at: string }[];
+  steering: { text: string; revision: number; at: string; source?: MissionInputSource }[];
   events: { at: string; text: string }[];
   result?: { summary: string; revision: number; at: string };
   /** Open follow-ups and the 10 most recently settled. Absent on missions that never set one. */

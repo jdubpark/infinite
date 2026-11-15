@@ -386,7 +386,11 @@ Set the rules in host config under `autonomy.continuity`:
 
 Every mission has a deadline `maxMinutes` after it is created. The default is 240
 minutes; an intake mission takes `intake.mission.maxMinutes`. When it passes, the
-coordinator and active subteams stop like a team deadline.
+mission is blocked. Active subteams pause, queued subtasks stay queued, and their
+workspaces and mission evidence are kept. The owner can extend the time limit or
+cancel the mission. `POST /api/missions/:id/extend` adds 5 to 1440 minutes. For a
+deadline-blocked mission, the new deadline is measured from the extension time.
+For a running or paused mission, the extension adds to its current deadline.
 
 An intake mission stops its working-time clock while it is `needs-input` or
 `paused`, and the deadline moves forward by the time it was stopped. Waiting for
@@ -394,9 +398,11 @@ an owner answer does not use up the limit. Other missions keep a fixed deadline.
 
 ### Stale blocked missions
 
-A `blocked` mission cannot resume; it stays under `needs-input` so the owner
-reads the reason. When it has been blocked for `teams.retention.blockedHours`
-(default 72), the host closes it as `cancelled`. The reason and one event read
+A blocked mission stays under `needs-input` so the owner reads the reason. A
+mission blocked by its time limit can be extended; this resumes its paused
+subteams and starts a fresh coordinator attempt. Other blocked missions cannot
+resume. When a mission has been blocked for `teams.retention.blockedHours`
+(default 72), the host closes it as `cancelled` and cancels its subteams. The reason and one event read
 "Closed by the host after 72 hours blocked without owner action", followed by
 the last blocker. The host closed it; nothing about the work is claimed. Team
 runs and goals close the same way; see [teams](teams.md).

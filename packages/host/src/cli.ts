@@ -339,12 +339,31 @@ else if (command === "plan-fleet") {
     const fd = openSync(lock, "wx", 0o600);
     writeFileSync(fd, String(process.pid));
     closeSync(fd);
-    const { sessions, teams, goals, pushStore, server, closeConnections, fuse, permissions } = createApp(config, key, { configFile });
-    server.listen(config.port, "127.0.0.1", () =>
-      console.log(
-        `Infinite: ${config.origin}\nExecution host: ${config.environment}\nClosing this API does not stop agent workers.`,
-      ),
-    );
+    const unlock = () => { try { unlinkSync(lock); } catch {} };
+    let host: ReturnType<typeof createApp>;
+    try { host = createApp(config, key, { configFile }); }
+    catch (error) { unlock(); throw error; }
+    const { sessions, teams, goals, pushStore, server, mcpServer, closeConnections, fuse, permissions } = host;
+    let stopping: Promise<void> | undefined;
+    const stop = () => stopping ??= (async () => {
+      const closing = closeConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      await closing;
+      unlock();
+    })();
+    const bind = (listener: typeof server, port: number) => new Promise<void>((resolve, reject) => {
+      const failed = (error: Error) => { listener.off("listening", ready); reject(error); };
+      const ready = () => { listener.off("error", failed); resolve(); };
+      listener.once("error", failed);
+      listener.once("listening", ready);
+      listener.listen(port, "127.0.0.1");
+    });
+    try {
+      // Bind the connector first so a conflict never starts host background services.
+      if (mcpServer) await bind(mcpServer, config.mcp!.port);
+      await bind(server, config.port);
+    } catch (error) { await stop(); throw error; }
+    console.log(`Infinite: ${config.origin}\nExecution host: ${config.environment}\nClosing this API does not stop agent workers.`);
     if (config.push?.enabled) {
       const accessToken = config.push.accessTokenFile
         ? readFileSync(config.push.accessTokenFile, "utf8").trim()
@@ -373,24 +392,11 @@ else if (command === "plan-fleet") {
       console.log(`Push notifications: enabled (${config.push.detail} bodies)`);
       if (!config.push.events.includes("autonomy-interrupt")) console.warn("Push is on, but push.events has no autonomy-interrupt: an open spend fuse will send no notification.");
     }
-    const unlock = () => {
-      try {
-        unlinkSync(lock);
-      } catch {}
-    };
-    server.on("error", (error) => {
-      unlock();
-      throw error;
-    });
+    const failed = (error: Error) => { void stop().then(() => { throw error; }); };
+    server.on("error", failed);
+    mcpServer?.on("error", failed);
     for (const signal of ["SIGTERM", "SIGINT"] as const)
-      process.once(signal, () => {
-        const closing = closeConnections();
-        server.close(async () => {
-          await closing;
-          unlock();
-          process.exit(0);
-        });
-      });
+      process.once(signal, () => { void stop().then(() => process.exit(0)); });
   } else {
     const manager = new Manager(config, key);
     if (command === "list")

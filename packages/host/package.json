@@ -13,6 +13,8 @@
   "dependencies": {
     "@infinite/attention": "0.1.0",
     "@infinite/remote": "0.1.0",
+    "@modelcontextprotocol/node": "2.1.2",
+    "@modelcontextprotocol/server": "2.4.0",
     "@typesafe-ai/sdk": "0.6.0",
     "@xterm/addon-serialize": "^0.13.0",
     "@xterm/headless": "^5.5.0",
@@ -22,6 +24,7 @@
     "zod": "^4.1.0"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "2.4.0",
     "@types/express": "^5.0.0",
     "@types/ws": "^8.18.2"
   }

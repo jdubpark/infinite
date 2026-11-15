@@ -12,6 +12,7 @@ import { LinearFailure, LinearService } from "../packages/host/src/linear.js";
 import { SlackError } from "../packages/host/src/slack-client.js";
 import type { Config } from "../packages/host/src/types.js";
 import type { MissionService } from "../packages/host/src/missions.js";
+import type { Mission } from "../packages/host/src/mission-types.js";
 import { TeamError } from "../packages/host/src/teams.js";
 import type { IntakeView } from "../packages/host/src/intake-types.js";
 import type { RouteReading } from "../packages/host/src/intake-route.js";
@@ -48,7 +49,8 @@ class FakeThreads implements IntakeThreadReader {
   }
 }
 
-async function setup(options: { groupId?: string; maxActive?: number; requireSlackThread?: boolean; mirror?: boolean; scripted?: boolean; admitIssues?: boolean; answerQuestions?: boolean; classify?: boolean; router?: (text: string) => Promise<RouteReading | undefined>; routeWaitMs?: number; reportName?: string } = {}) {
+async function setup(options: { groupId?: string; maxActive?: number; requireSlackThread?: boolean; mirror?: boolean; scripted?: boolean; admitIssues?: boolean; answerQuestions?: boolean; classify?: boolean; router?: (text: string) => Promise<RouteReading | undefined>; routeWaitMs?: number; reportName?: string;
+  wrapMissions?: (missions: MissionService) => MissionService } = {}) {
   const linearServer = await startIntakeLinearServer();
   const threads = new FakeThreads();
   /** While `blocked` is set, a start is refused with it, as the route's admission refuses a mid-handoff project. */
@@ -71,6 +73,7 @@ async function setup(options: { groupId?: string; maxActive?: number; requireSla
   let missions: MissionService;
   if ("open" in built) { built.open(); missions = built.services().missions; }
   else missions = built.missions;
+  if (options.wrapMissions) missions = options.wrapMissions(missions);
   const storeKey = randomBytes(32);
   const store = new IntakeStore(config, storeKey);
   const enabled = Date.parse(store.enabledAt());
@@ -1548,5 +1551,123 @@ test("a marked request whose route was not stored when routing was turned off go
     assert.deepEqual([record.direct?.route?.kind, record.direct?.route?.by, record.state, record.identifier !== ""], ["work", "default", "started", true]);
     assert.deepEqual(calls, []);
     assert.equal(ctx.linearServer.allIssues().length, 1);
+  } finally { await ctx.close(); }
+});
+
+/**
+ * Stages the mission's reported state without Task 1's stop: while `current` is set, `peek` returns the real mission with
+ * it laid over, so a time-limit stop or a finish can be applied to a poll. Unset, the real mission is reported.
+ */
+function staged(stage: { current?: Partial<Mission> }) {
+  return (missions: MissionService): MissionService => new Proxy(missions, {
+    get: (target, property) => {
+      if (property === "peek") return (id: string) => {
+        const mission = target.peek(id);
+        return mission && stage.current ? { ...mission, ...stage.current } as Mission : mission;
+      };
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+test("a mission stopped at its time limit keeps its record started, and each stop posts one Linear outcome comment", { timeout: 120000 }, async () => {
+  const stage: { current?: Partial<Mission> } = {};
+  const ctx = await setup({ wrapMissions: staged(stage) });
+  try {
+    const issue = ctx.issue();
+    await ctx.intake.poll();
+    const firstStop = ctx.iso(10 * MINUTE), secondStop = ctx.iso(20 * MINUTE);
+    stage.current = { status: "blocked", stopReason: "deadline", reason: "Approved time ran out after 30 minutes.", deadlineAt: firstStop };
+    await ctx.intake.poll();
+    assert.equal(viewOf(ctx, issue.id)!.state, "started", "The stop does not finish the record");
+    assert.equal(ctx.store.get(issue.id)!.deadlineNoticeFor, firstStop);
+    assert.match(ctx.store.get(issue.id)!.comments.outcome!.body, /^Infinite agent report: blocked\.\n\nApproved time ran out after 30 minutes\.$/);
+    await ctx.intake.poll();
+    await ctx.intake.poll();
+    assert.equal(ctx.linearServer.comments(issue.id).length, 2, "The started comment and one stop comment; repeated saves post nothing");
+    // The owner extends and the mission stops again at a later time: that stop posts once more.
+    stage.current = { ...stage.current, deadlineAt: secondStop };
+    await ctx.intake.poll();
+    assert.equal(ctx.store.get(issue.id)!.deadlineNoticeFor, secondStop);
+    assert.equal(ctx.linearServer.comments(issue.id).length, 3);
+    assert.equal(viewOf(ctx, issue.id)!.state, "started");
+  } finally { await ctx.close(); }
+});
+
+test("a later real finish of a deadline-stopped record marks it finished and posts a new outcome comment", { timeout: 120000 }, async () => {
+  const stage: { current?: Partial<Mission> } = {};
+  const ctx = await setup({ wrapMissions: staged(stage) });
+  try {
+    const issue = ctx.issue();
+    await ctx.intake.poll();
+    stage.current = { status: "blocked", stopReason: "deadline", reason: "Approved time ran out after 30 minutes.", deadlineAt: ctx.iso(10 * MINUTE) };
+    await ctx.intake.poll();
+    const stopComment = ctx.store.get(issue.id)!.comments.outcome!.id;
+    stage.current = { status: "ready-for-review", reason: undefined, result: { summary: "The export handles empty rows.", revision: 1, at: ctx.iso(30 * MINUTE) } as Mission["result"] };
+    await ctx.intake.poll();
+    const record = ctx.store.get(issue.id)!;
+    assert.equal(record.state, "finished");
+    assert.notEqual(record.comments.outcome!.id, stopComment, "The finish queues a comment of its own");
+    assert.equal(viewOf(ctx, issue.id)!.comments.outcome, "delivered");
+    assert.match(ctx.linearServer.comments(issue.id).at(-1)!.body, /^Infinite agent report: ready for review\.\n\nThe export handles empty rows\.$/);
+  } finally { await ctx.close(); }
+});
+
+test("an issue closed during a time-limit stop is paused once the owner extends, not while the mission is stopped", { timeout: 120000 }, async () => {
+  const stage: { current?: Partial<Mission> } = {};
+  const ctx = await setup({ wrapMissions: staged(stage) });
+  try {
+    const issue = ctx.issue();
+    await ctx.intake.poll();
+    const id = missionRequestId(issue.id);
+    stage.current = { status: "blocked", stopReason: "deadline", reason: "Approved time ran out after 30 minutes.", deadlineAt: ctx.iso(10 * MINUTE) };
+    ctx.linearServer.edit(issue.id, { stateType: "completed" });
+    await ctx.intake.poll();
+    assert.equal(ctx.store.get(issue.id)!.closure, undefined, "A stopped mission is not paused, so the closure waits");
+    // The owner extends: the mission is running again, and the next watch pauses it.
+    stage.current = undefined;
+    await ctx.intake.poll();
+    assert.equal(ctx.missions.peek(id)!.status, "paused");
+    assert.equal(ctx.store.get(issue.id)!.closure?.reason, "The Linear issue was closed.");
+  } finally { await ctx.close(); }
+});
+
+test("a newer outcome that replaces an outcome whose send is still open is not marked delivered by that send", { timeout: 120000 }, async () => {
+  const stage: { current?: Partial<Mission> } = {};
+  const ctx = await setup({ wrapMissions: staged(stage) });
+  try {
+    const issue = ctx.issue();
+    await ctx.intake.poll();
+    const id = missionRequestId(issue.id);
+    // A Linear client whose next comment send is held open until the test releases it. The fixture server cannot hold a send.
+    const base = new IntakeLinear(ctx.linear);
+    const send = base.comment.bind(base);
+    let hold: { started: () => void; release: Promise<void> } | undefined;
+    base.comment = async (issueId, input) => {
+      if (hold) { const current = hold; hold = undefined; current.started(); await current.release; }
+      return send(issueId, input);
+    };
+    let releaseSend!: () => void;
+    const release = new Promise<void>(done => { releaseSend = done; });
+    const sendStarted = new Promise<void>(done => { hold = { started: done, release }; });
+    stage.current = { status: "blocked", stopReason: "deadline", reason: "Approved time ran out after 30 minutes.", deadlineAt: ctx.iso(10 * MINUTE) };
+    const gated = ctx.service(base);
+    const pending = gated.poll();
+    await sendStarted;
+    // While the first outcome's send is open, a later stop replaces it with a newer comment.
+    stage.current = { ...stage.current, deadlineAt: ctx.iso(20 * MINUTE) };
+    // observe() is private; calling it stands in for the mission change that a later stop would deliver.
+    (gated as unknown as { observe(mission: Mission): void }).observe(ctx.missions.peek(id)!);
+    const replacement = ctx.store.get(issue.id)!.comments.outcome!;
+    releaseSend();
+    await pending;
+    const held = ctx.store.get(issue.id)!.comments.outcome!;
+    assert.equal(held.id, replacement.id);
+    assert.equal(held.delivered, false, "The send of the replaced comment does not mark the newer one delivered");
+    await ctx.intake.poll();
+    assert.equal(ctx.store.get(issue.id)!.comments.outcome!.delivered, true);
+    assert.ok(ctx.linearServer.comments(issue.id).some(comment => comment.id === replacement.id), "The newer comment reached Linear");
+    assert.equal(ctx.linearServer.comments(issue.id).length, 3, "The started comment, the replaced comment, and the newer one");
   } finally { await ctx.close(); }
 });

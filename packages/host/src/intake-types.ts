@@ -56,7 +56,7 @@ export interface IntakeMessage {
 export interface IntakeInbound {
   eventId: string; ts: string; text: string; receivedAt: string; handledAt?: string; outcome?: string;
   /** The mission call chosen for this event, saved before the call; a replay performs exactly this call. */
-  call?: { action: "answer" | "steer" | "pause" | "resume" | "cancel"; decisionId?: string; text?: string; revision: number };
+  call?: { action: "answer" | "steer" | "pause" | "resume" | "cancel" | "extend"; decisionId?: string; text?: string; minutes?: number; revision: number };
   /** Interactive Slack action identity, stable across envelope redelivery. */
   interactionId?: string;
 }
@@ -69,6 +69,19 @@ export interface IntakeDirect {
   routable?: true;
 }
 export interface IntakeComment { id: string; body: string; delivered: boolean; attempts: number; error?: string }
+/** Frozen execution membership, kept sealed and never exposed through the connector API. */
+export interface IntakeExternalScope {
+  groupId: string;
+  repositories: { projectId: string; key?: string; checkouts: { projectId: string; path: string; primary: boolean }[] }[];
+  selectedCheckouts: string[];
+}
+export interface IntakeExternal {
+  connectorId: string;
+  requestId: string;
+  fingerprint: string;
+  scope: IntakeExternalScope;
+  filedAt?: string;
+}
 export interface IntakeRecord {
   issueId: string; identifier: string; url: string; title: string; description: string;
   issueCreatedAt: string; issueUpdatedAt: string;
@@ -79,11 +92,15 @@ export interface IntakeRecord {
   thread?: IntakeThread;
   /** Present on a record the host filed itself from the owner's Slack mention. */
   direct?: IntakeDirect;
+  /** An authenticated connector request; its pinned mission request exists even before tracking is confirmed. */
+  external?: IntakeExternal;
   /** Saved before the mission is created and reused verbatim on every retry. */
   request?: CreateMission;
   missionId?: string;
   closure?: { reason: string; at: string };
   editNotedAt?: string;
+  /** The `deadlineAt` of the last time-limit stop whose outcome comment was queued, so each stop posts once. */
+  deadlineNoticeFor?: string;
   /** The issue's title and description as the tracker returned them when the host filed it; edits are detected against this. */
   tracked?: { title: string; description: string };
   comments: { started?: IntakeComment; outcome?: IntakeComment };

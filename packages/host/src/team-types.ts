@@ -1,3 +1,4 @@
+import type { ConnectorSource } from "./mcp-types.js";
 import { z } from "zod";
 import { featureMapSchema, TASK_KINDS } from "./task-features.js";
 import { evalProjectSchema } from "./eval-config.js";
@@ -544,7 +545,8 @@ export interface TeamDecision {
   answerMode?: "approval" | "single" | "multiple";
   createdAt: string;
   answer?: string;
-  answeredBy?: "owner" | "coordinator";
+  answeredBy?: "owner" | "coordinator" | "connector";
+  source?: ConnectorSource;
   answeredAt?: string;
 }
 export interface TeamCheck {
@@ -630,6 +632,8 @@ export interface TeamRun {
   goal?: TeamGoalContext;
   /** Set when a mission started this run as one of its subteams; the board shows it only inside that mission. */
   missionId?: string;
+  /** Connector provenance pinned when a mission creates this subteam. */
+  requestSource?: ConnectorSource;
   /** The integration and member clones were removed under the retention policy; the record, events and evidence remain. */
   workspaceRemovedAt?: string;
   handoff?: import("./handoff-types.js").TeamHandoffContext;
@@ -655,7 +659,7 @@ export interface TeamRun {
   members: TeamMember[];
   decisions: TeamDecision[];
   checks: TeamCheck[];
-  steering: { text: string; revision: number; at: string }[];
+  steering: { text: string; revision: number; at: string; source?: ConnectorSource | "coordinator" }[];
   events: { at: string; text: string }[];
   reason?: string;
   /** TeamError.code for the current blocked state; absent on legacy records. */
@@ -682,3 +686,9 @@ export type TeamView = Omit<TeamRun, "members" | "permissionDecisions" | "permis
   resumable: boolean;
   continuable: boolean;
 };
+
+/** Display provenance without treating delegated agent content as owner authority. */
+export const inputSourceLabel = (source?: ConnectorSource | "coordinator" | "slack") =>
+  typeof source === "object" ? `Connector (${source.name})` : source === "coordinator" ? "Mission coordinator" : "Owner";
+export const decisionAnswerLabel = (decision: Pick<TeamDecision, "answeredBy" | "source">) =>
+  decision.answeredBy === "connector" ? (decision.source ? inputSourceLabel(decision.source) : "Connector") : decision.answeredBy === "coordinator" ? "Mission coordinator" : "User";

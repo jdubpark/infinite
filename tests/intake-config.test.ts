@@ -100,8 +100,8 @@ test("answering questions needs direct requests, and classifying needs both answ
 test("linear.reportName defaults to Infinite, accepts a plain name, and rejects Markdown, link text, newlines, and long values", () => {
   assert.equal(reportName(parsed({})), "Infinite");
   assert.equal(Object.hasOwn(parsed({}).linear!, "reportName"), false, "display defaults leave persisted configuration digests unchanged");
-  assert.equal(parsed({}, { linear: { apiKeyFile: privateFile("linear-key"), reportName: "Northwind" } }).linear!.reportName, "Northwind");
-  assert.equal(parsed({}, { linear: { apiKeyFile: privateFile("linear-key"), reportName: "Northwind East - 2" } }).linear!.reportName, "Northwind East - 2");
+  assert.equal(reportName(parsed({}, { linear: { apiKeyFile: privateFile("linear-key"), reportName: "Northwind" } })), "Northwind");
+  assert.equal(reportName(parsed({}, { linear: { apiKeyFile: privateFile("linear-key"), reportName: "Northwind East - 2" } })), "Northwind East - 2");
   for (const reportName of ["[x](y)", "North\nwind", "", "a".repeat(41), "North _wind_", "1. Northwind", "_Northwind", "9Lives", "www.example.com", "Northwind Co."])
     assert.throws(() => parsed({}, { linear: { apiKeyFile: privateFile("linear-key"), reportName } }), undefined, JSON.stringify(reportName));
 });
@@ -146,4 +146,23 @@ test("deterministicUuid is stable, namespaced, and a valid UUID", () => {
   assert.equal(missionRequestId(ISSUE), missionRequestId(ISSUE));
   assert.notEqual(deterministicUuid("a", ISSUE), deterministicUuid("b", ISSUE));
   assert.doesNotThrow(() => uuid.parse(missionRequestId(ISSUE)));
+});
+
+test("MCP is disabled by default and supports intake without a Slack producer", () => {
+  assert.equal(parsed({}).mcp, undefined);
+  const mcp = { port: 2, origin: "https://connector.example", connectors: [{ id: "assistant", name: "Assistant", tokenHash: "b".repeat(64), projectIds: ["work-repo"] }] };
+  assert.deepEqual(parsed({ slack: undefined, requireSlackThread: false, linear: { ...base.linear, admitIssues: false } }, { mcp }).mcp, mcp);
+  for (const patch of [
+    { port: 1 },
+    { origin: "https://connector.example/mcp" },
+    { origin: "http://connector.example" },
+    { connectors: [{ ...mcp.connectors[0], projectIds: ["missing"] }] },
+    { connectors: [{ ...mcp.connectors[0], tokenHash: "a".repeat(64) }] },
+    { connectors: [mcp.connectors[0], mcp.connectors[0]] },
+    { unexpected: true },
+  ]) assert.throws(() => parsed({}, { mcp: { ...mcp, ...patch } }));
+  assert.throws(() => parsed({}, { mcp, linear: undefined }), /Linear/);
+  const file = join(root, `config-${++counter}.json`);
+  writeFileSync(file, JSON.stringify({ ...baseHost, mcp }));
+  assert.throws(() => readConfig(file), /MCP requires/);
 });

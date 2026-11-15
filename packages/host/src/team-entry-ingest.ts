@@ -76,3 +76,79 @@ export function ingestRunEntries(run: TeamRun, deps: IngestDeps): { advanced: bo
   }
   return result;
 }
+
+/** The members whose journals may still hold entry events, in the order they will be read. */
+export class EntryIngestQueue {
+  private readonly pending = new Map<string, { runId: string; memberId: string }>();
+
+  /** Adds a member once. A member that is already queued keeps its place. */
+  add(runId: string, memberId: string): void {
+    if (!this.pending.has(memberId)) this.pending.set(memberId, { runId, memberId });
+  }
+
+  remove(memberId: string): void {
+    this.pending.delete(memberId);
+  }
+
+  /** The next members to read, at most `max`. Each one moves to the end of the order. */
+  take(max: number): { runId: string; memberId: string }[] {
+    // Only the first `max` entries are read: the queue is never copied whole.
+    const taken: { runId: string; memberId: string }[] = [];
+    for (const entry of this.pending.values()) {
+      if (taken.length >= max) break;
+      taken.push({ ...entry });
+    }
+    for (const entry of taken) {
+      this.pending.delete(entry.memberId);
+      this.pending.set(entry.memberId, entry);
+    }
+    return taken;
+  }
+
+  get size(): number {
+    return this.pending.size;
+  }
+}
+
+/**
+ * One ingest pass: at most ENTRY_INGEST_MEMBERS members from the queue. It looks up only the runs of those members,
+ * through `run`. Returns, for each run it read, what the caller must save.
+ */
+export function ingestPass(
+  queue: EntryIngestQueue,
+  run: (runId: string) => TeamRun | undefined,
+  deps: Pick<IngestDeps, "events" | "entries">,
+): { run: TeamRun; advanced: boolean; dropped: number }[] {
+  const groups = new Map<string, string[]>();
+  for (const { runId, memberId } of queue.take(ENTRY_INGEST_MEMBERS)) groups.set(runId, [...(groups.get(runId) ?? []), memberId]);
+  const results: { run: TeamRun; advanced: boolean; dropped: number }[] = [];
+  for (const [runId, memberIds] of groups) {
+    try {
+      const theRun = run(runId);
+      if (theRun === undefined || theRun.blackboard?.tools !== true) {
+        for (const memberId of memberIds) queue.remove(memberId);
+        continue;
+      }
+      const members: TeamMember[] = [];
+      for (const memberId of memberIds) {
+        const member = theRun.members.find(item => item.memberId === memberId);
+        if (member === undefined || member.entryTools !== true) {
+          queue.remove(memberId);
+          continue;
+        }
+        members.push(member);
+      }
+      const done = new Set<string>();
+      const { advanced, dropped } = ingestRunEntries(theRun, { ...deps, done, members });
+      for (const member of members) {
+        const settled = done.has(member.memberId) ||
+          (member.startedAt !== undefined ? !entryIngestPending(member, done) : !ACTIVE_MEMBER_STATUSES.includes(member.status));
+        if (settled) queue.remove(member.memberId);
+      }
+      results.push({ run: theRun, advanced, dropped });
+    } catch {
+      // A run that fails keeps its members queued, and the pass goes on with the next run.
+    }
+  }
+  return results;
+}

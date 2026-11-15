@@ -296,6 +296,7 @@ test("the run holds at most 400 member entries", () => {
     const implA = memberOf(run, hostEntryIds.implA);
     const implB = memberOf(run, hostEntryIds.implB);
     assert.equal(board.mirror(run), true);
+    insertHostRows(store, run.id, 50);
 
     const first = Array.from({ length: 200 }, (_, index) => post(implA, contract(`first-${index}`)));
     const second = Array.from({ length: 199 }, (_, index) => post(implA, contract(`second-${index}`)));
@@ -305,9 +306,29 @@ test("the run holds at most 400 member entries", () => {
     const third = [0, 1, 2].map(index => post(implB, contract(`third-${index}`)));
     assert.deepEqual(board.ingest(run, implB, third, []), { result: "stored", stored: 1, dropped: 2, invalid: 0 });
     assert.equal(store.describe().counts["blackboard.dropped"], 2);
-    assert.equal(rowCount(store, run.id), 8 + 400);
+    assert.equal(rowCount(store, run.id), 8 + 50 + 400);
+    assert.deepEqual(board.ingest(run, implB, [post(implB, contract("fourth"))], []), { result: "stored", stored: 0, dropped: 1, invalid: 0 });
   });
 });
+
+/** Inserts `count` sealed host report rows into the run, the rows a member count must not read as members. */
+function insertHostRows(store: EvidenceStore, runId: string, count: number): void {
+  store.write(tx => {
+    for (let index = 0; index < count; index += 1) {
+      const id = randomUUID();
+      tx.run(
+        "INSERT INTO entries (entry_id, scope, run_id, mission_id, revision, at, kind, author, authority, author_member_id, "
+        + "task_key, state, body_bytes, encrypted_head, encrypted_body) "
+        + "VALUES (?, 'run', ?, NULL, 1, ?, 'report', 'host', 'receipt', NULL, NULL, 'active', 12, ?, ?)",
+        id,
+        runId,
+        at(0),
+        tx.seal("entries", `${id}:head`, { paths: [], summary: `host row ${index}` }),
+        tx.seal("entries", `${id}:body`, { text: "host row" }),
+      );
+    }
+  });
+}
 
 test("handoffs keep the latest for each task in every order", () => {
   const run = entryRun();

@@ -106,7 +106,7 @@ export async function runTeamMcp() {
       if (entryCall) {
         const answer = await submitEntryCall(entryCallFor(params.name, params.arguments));
         if (params.name === "entry_post") {
-          await result(id, { content: [{ type: "text", text: `Entry recorded as ${String(answer.entryId)}. Other members can read it within a few seconds.` }], structuredContent: answer, isError: false });
+          await result(id, { content: [{ type: "text", text: `Entry ${String(answer.entryId)} is written to this session's journal and waits for the host to store it. Other members can read it after that. The host can still refuse it, for example at the run's limit of member entries.` }], structuredContent: answer, isError: false });
           return;
         }
         await result(id, { content: [{ type: "text", text: JSON.stringify(answer) }], structuredContent: answer, isError: false });

@@ -77,6 +77,8 @@ type ScopeRow = {
 
 /** The member kinds as SQL text. A report is a member's entry too, but it is a host kind, so the cap counts by kind. */
 const MEMBER_KIND_SQL = MEMBER_ENTRY_KINDS.map(kind => `'${kind}'`).join(", ");
+/** The member count of a run, through `entries_member_kinds`. Its `kind IN` text is the index's text. */
+export const MEMBER_COUNT_SQL = `SELECT count(*) AS n FROM entries WHERE run_id=? AND kind IN (${MEMBER_KIND_SQL})`;
 
 const HEAD_COLUMNS ="seq, entry_id, scope, run_id, revision, at, kind, author, authority, state, body_bytes, supersedes, encrypted_head";
 
@@ -123,6 +125,8 @@ const SCHEMA_V2 = [
   "ALTER TABLE entries ADD COLUMN supersedes TEXT",
   "CREATE INDEX entries_by_supersedes ON entries (supersedes) WHERE supersedes IS NOT NULL",
   "ALTER TABLE member_scopes ADD COLUMN read_seq INTEGER NOT NULL DEFAULT 0",
+  `CREATE INDEX entries_member_kinds ON entries (run_id) WHERE kind IN (${MEMBER_KIND_SQL})`,
+  "CREATE INDEX entries_active_by_run ON entries (run_id, seq) WHERE scope='run' AND state='active'",
 ];
 
 /**
@@ -307,10 +311,8 @@ export class Blackboard {
         counts.stored = 0;
         counts.dropped = 0;
         counts.invalid = 0;
-        let members = tx.get<{ n: number }>(
-          `SELECT count(*) AS n FROM entries WHERE run_id=? AND kind IN (${MEMBER_KIND_SQL})`,
-          run.id,
-        )?.n ?? 0;
+        // A page of receipts only records reads, so it needs no count.
+        let members = posts.length === 0 ? 0 : (tx.get<{ n: number }>(MEMBER_COUNT_SQL, run.id)?.n ?? 0);
         for (const record of posts) {
           const entry = checkedPost(run, member, record);
           if (entry === undefined) {

@@ -89,6 +89,10 @@ test("a member posts, lists, and reads through the MCP tools", { timeout: 60000 
     assert.notEqual(first.result.isError, true);
     const entryId = answerOf(first).entryId as string;
     assert.match(entryId, UUID);
+    const receipt = String(first.result.content[0].text);
+    assert.ok(receipt.includes(entryId), "the receipt names the entry id");
+    assert.ok(receipt.includes("waits for the host to store it"), "the receipt says the host has not stored the entry yet");
+    assert.equal(receipt.includes("within a few seconds"), false, "the receipt promises no delay the host cannot keep");
     const second = await child.rpc("tools/call", { name: "entry_post", arguments: { entry } });
     assert.equal(answerOf(second).entryId, entryId, "the identical post gets the same id");
 

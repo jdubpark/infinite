@@ -197,6 +197,13 @@ test("supersede follows the rule", () => {
       { status: 403, text: ENTRY_REFUSALS["entry-supersede-forbidden"] });
     assert.deepEqual(refused(h, postRequest(implA, contract("W route", { supersedes: randomUUID() }))),
       { status: 404, text: ENTRY_REFUSALS["entry-not-found"] });
+    const launchB = w.board.launchMark(w.run.id);
+    if (launchB === undefined) throw new Error("no launch mark");
+    assert.equal(w.board.recordLaunch(w.run, implB, { ...SIZES, launchSeq: launchB }), true);
+    const hB = w.harness(implB);
+    assert.deepEqual(refused(hB, postRequest(implB, contract("V route", { taskId: "b", supersedes: x }))),
+      { status: 403, text: ENTRY_REFUSALS["entry-supersede-forbidden"] }, "a contract of another member and task is not superseded");
+    assert.equal(hB.appended.length, 0, "the refused supersede appends no journal event");
   } finally {
     w.close();
   }

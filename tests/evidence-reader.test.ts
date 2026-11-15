@@ -91,6 +91,18 @@ test("a reader refuses what it does not know", () => {
   try {
     assert.throws(() => count(reader(f, { toy: 2 })), unavailable);
     assert.throws(() => count(new EvidenceReader({ databasePath: f.path, vaultKey: randomBytes(32), modules: { toy: 3 } })), unavailable);
+    const open = reader(f);
+    try {
+      assert.equal(count(open), 2);
+      const version = new DatabaseSync(f.path);
+      version.exec("UPDATE schema_modules SET read_version=2 WHERE name='toy'");
+      version.close();
+      let calls = 0;
+      assert.throws(() => open.read(db => { calls++; return db.get("SELECT count(*) AS n FROM toy"); }), unavailable);
+      assert.equal(calls, 0, "an open reader runs no callback after the read version changed");
+    } finally {
+      open.close();
+    }
     const raw = new DatabaseSync(f.path);
     raw.exec("UPDATE schema_modules SET version=2 WHERE name='store'");
     raw.close();

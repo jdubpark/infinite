@@ -24,7 +24,7 @@ import type { EventOutbox, OutboxEvent } from "./evidence/outbox.js";
 import type { Blackboard } from "./evidence/blackboard.js";
 import { canonicalJson } from "./evidence/crypto.js";
 import { entryToolsFor } from "./entry-roles.js";
-import { ENTRY_DROP_TEXT, ENTRY_INGEST_MEMBERS, ENTRY_INGEST_MS, entryIngestPending, ingestRunEntries } from "./team-entry-ingest.js";
+import { ENTRY_DROP_TEXT, ENTRY_INGEST_MS, EntryIngestQueue, ingestPass } from "./team-entry-ingest.js";
 import { MAX_OUTBOX_EVENTS, pathField, planDigest, profileIdentity, runEventKey, runSummaryCounts, type MemberStopDetail, type MemberStopReason, type ReplacementCause } from "./run-events.js";
 import { taskFeatures } from "./task-features.js";
 import { teamUsage } from "./team-usage.js";
@@ -434,11 +434,9 @@ export class TeamService {
   private enrichments = 0;
   /** Runs whose blackboard entries are not all stored yet. In memory only: the drain retries them without a save. */
   private readonly entryBacklog = new Set<string>();
-  /** Members whose entry journals are settled for good in this process. In memory only. */
-  private readonly entryDone = new Set<string>();
+  /** Members whose entry journals may still hold events the host has not stored. In memory only; seeded at load. */
+  private readonly entryQueue = new EntryIngestQueue();
   private entryIngestAt = 0;
-  /** The member position where the next ingest pass starts, so every member is read in turn. */
-  private entryTurn = 0;
   private readonly commands = new Map<string, AbortController>();
   /**
    * The operation each run last started in this API process. An intent without an entry was loaded from an earlier
@@ -483,6 +481,7 @@ export class TeamService {
       const stored = unseal<Stored>(key, `team:${id}`, readFileSync(join(this.directory, file), "utf8"));
       if (stored.run.id !== id) throw new TeamError(409, "invalid-team-record", "A team record cannot be authenticated.");
       this.records.set(id, stored);
+      if (stored.run.blackboard?.tools === true) for (const member of stored.run.members) if (member.entryTools === true) this.entryQueue.add(stored.run.id, member.memberId);
       if (this.options?.events && stored.ledgerStatus === undefined) stored.ledgerStatus = stored.run.status;
       for (const request of stored.run.permissionRecovery?.requests ?? []) if (request.status === "expanding" &&
           (request.expansion?.status === "intent" || request.expansion?.status === "uncertain")) {
@@ -817,27 +816,20 @@ export class TeamService {
     }
   }
   /**
-   * One ingest pass over the runs with the tools pinned: at most ENTRY_INGEST_MEMBERS journals, from a start that moves
-   * on each pass, so every pending member is read in turn. A run is saved only when a cursor moved or a drop is new.
+   * One ingest pass over the queued members: at most ENTRY_INGEST_MEMBERS journals. A run is saved only when a cursor
+   * moved or a drop is new.
    */
   private ingestEntries() {
     const entries = this.options?.entries;
     if (!entries) return;
-    const pending = [...this.records.values()].filter(stored => stored.run.blackboard?.tools === true)
-      .flatMap(stored => stored.run.members.filter(member => entryIngestPending(member, this.entryDone)).map(member => ({ stored, member })));
-    if (pending.length === 0) return;
-    const start = this.entryTurn % pending.length, count = Math.min(ENTRY_INGEST_MEMBERS, pending.length);
-    this.entryTurn = (start + count) % pending.length;
-    const runs = new Map<string, { stored: Stored; members: TeamMember[] }>();
-    for (const { stored, member } of [...pending.slice(start), ...pending].slice(0, count)) {
-      const group = runs.get(stored.run.id) ?? { stored, members: [] };
-      group.members.push(member); runs.set(stored.run.id, group);
-    }
-    for (const { stored, members } of runs.values()) {
-      const { advanced, dropped } = ingestRunEntries(stored.run, { events: (id, after, limit, types) => this.manager.events(id, after, limit, types), entries, done: this.entryDone, members });
-      const newDrop = dropped > 0 && !stored.run.events.some(event => event.text === ENTRY_DROP_TEXT);
+    if (this.entryQueue.size === 0) return;
+    for (const result of ingestPass(this.entryQueue, id => this.records.get(id)?.run,
+      { events: (id, after, limit, types) => this.manager.events(id, after, limit, types), entries })) {
+      const stored = this.records.get(result.run.id);
+      if (stored === undefined) continue;
+      const newDrop = result.dropped > 0 && !stored.run.events.some(event => event.text === ENTRY_DROP_TEXT);
       if (newDrop) this.event(stored, ENTRY_DROP_TEXT);
-      if (newDrop || advanced) this.save(stored);
+      if (newDrop || result.advanced) this.save(stored);
     }
   }
   /** The run as its sealed record file holds it, or undefined when the file is missing or cannot be read or opened now. */
@@ -4230,6 +4222,7 @@ export class TeamService {
     this.save(stored);
   }
   private async launch(stored: Stored, member: TeamMember) {
+    if (member.entryTools === true) this.entryQueue.add(stored.run.id, member.memberId);
     if (this.publicationGate(stored, member.role)) return;
     // A delivery member queued before the head was published lacks the host-publication instructions. Rebuild it only
     // before its launch request exists, so a replayed launch keeps the request it was created with.

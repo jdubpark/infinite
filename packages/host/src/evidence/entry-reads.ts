@@ -21,9 +21,17 @@ export type EntryDigest =
 const COLUMNS = "seq, entry_id, at, kind, author, authority, author_member_id, state, body_bytes, supersedes, encrypted_head";
 /** A row of the run that a member may see: run scope, and not withdrawn. Its first parameter is the run id. */
 const VISIBLE = "run_id=? AND scope='run' AND state!='withdrawn'";
+/** The default order's read: the newest active run entries, through `entries_active_by_run`. */
+export const ACTIVE_SCAN_SQL = `SELECT ${COLUMNS} FROM entries WHERE run_id=? AND scope='run' AND state='active' ORDER BY seq DESC LIMIT ?`;
+/** A filtered list's scan of a run in seq order, through `entries_by_run`. Every row it reads counts toward the limit. */
+export const RUN_SCAN_SQL = `SELECT ${COLUMNS}, scope FROM entries WHERE run_id=? AND seq > ? ORDER BY seq LIMIT ?`;
+/** The same scan for one task, through `entries_by_task`. */
+export const TASK_SCAN_SQL = `SELECT ${COLUMNS}, scope FROM entries WHERE run_id=? AND task_key=? AND seq > ? ORDER BY seq LIMIT ?`;
 /** The kinds the default order reads. Report and check entries reach a member through filtered lists only. */
 const ADDRESSED_KINDS: ReadonlySet<string> = new Set(["direction", "contract", "blocker", "handoff", "integration", "finding"]);
 
+/** A scanned row: the plain columns, and the scope the filtered scan reads for the host to check. */
+type ScannedRow = EntryRow & { scope: string };
 type EntryRow = {
   seq: number;
   entry_id: string;
@@ -100,11 +108,7 @@ export function pathsOverlap(a: readonly string[], b: readonly string[]): boolea
  * active rows of the run and leaves out the member's own. A head that does not open is left out and counted.
  */
 export function addressedHeads(db: EvidenceDb, scope: MemberScope): { heads: MemberHead[]; unreadable: number; capped: boolean } {
-  const rows = db.all<EntryRow>(
-    `SELECT ${COLUMNS} FROM entries WHERE run_id=? AND scope='run' AND state='active' ORDER BY seq DESC LIMIT ?`,
-    scope.runId,
-    MEMBER_SCAN_ROWS,
-  );
+  const rows = db.all<EntryRow>(ACTIVE_SCAN_SQL, scope.runId, MEMBER_SCAN_ROWS);
   let unreadable = 0;
   const opened: MemberHead[] = [];
   for (const row of rows) {
@@ -182,25 +186,17 @@ export function listForMember(
     }));
   }
   const since = query.since ?? 0;
-  const where = [VISIBLE, "state IN ('active', 'superseded')", "seq > ?"];
-  const params: (string | number)[] = [scope.runId, since];
-  if (query.kinds !== undefined) {
-    where.push(`kind IN (${query.kinds.map(() => "?").join(", ")})`);
-    params.push(...query.kinds);
-  }
-  if (query.taskId !== undefined) {
-    where.push("task_key=?");
-    params.push(db.index("task", query.taskId));
-  }
+  // Only the indexed terms are in SQL, so every row read counts toward the cap. The host keeps the rest below.
   // One row past the cap tells whether rows with a higher seq exist.
-  const fetched = db.all<EntryRow>(
-    `SELECT ${COLUMNS} FROM entries WHERE ${where.join(" AND ")} ORDER BY seq LIMIT ?`,
-    ...params,
-    scanRows + 1,
-  );
+  const fetched = query.taskId === undefined
+    ? db.all<ScannedRow>(RUN_SCAN_SQL, scope.runId, since, scanRows + 1)
+    : db.all<ScannedRow>(TASK_SCAN_SQL, scope.runId, db.index("task", query.taskId), since, scanRows + 1);
   const capped = fetched.length > scanRows;
-  const rows = capped ? fetched.slice(0, scanRows) : fetched;
-  const scannedSeq = rows.length > 0 ? rows[rows.length - 1].seq : since;
+  const scanned = capped ? fetched.slice(0, scanRows) : fetched;
+  const scannedSeq = scanned.length > 0 ? scanned[scanned.length - 1].seq : since;
+  const rows = scanned.filter(row => row.scope === "run"
+    && (row.state === "active" || row.state === "superseded")
+    && (query.kinds === undefined || query.kinds.includes(row.kind as EntryKind)));
   let unreadable = 0;
   // In seq order. A head over the list limit alone is counted and kept as a slot without a head, so the cursor moves past it.
   const slots: { seq: number; head?: MemberHead }[] = [];

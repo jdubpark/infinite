@@ -4,9 +4,18 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Blackboard, type MemberPostRecord } from "../packages/host/src/evidence/blackboard.js";
+import { Blackboard, MEMBER_COUNT_SQL, type MemberPostRecord } from "../packages/host/src/evidence/blackboard.js";
 import { canonicalJson } from "../packages/host/src/evidence/crypto.js";
-import { ENTRY_NOTICE, listForMember, getForMember, readMemberScope, type MemberList } from "../packages/host/src/evidence/entry-reads.js";
+import {
+  ACTIVE_SCAN_SQL,
+  ENTRY_NOTICE,
+  RUN_SCAN_SQL,
+  TASK_SCAN_SQL,
+  listForMember,
+  getForMember,
+  readMemberScope,
+  type MemberList,
+} from "../packages/host/src/evidence/entry-reads.js";
 import { memberEntryId, memberEntryPostSchema, memberScopeOf, type MemberEntryPost, type MemberScope } from "../packages/host/src/evidence/member-entry.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import type { TeamMember, TeamRun, TeamTask } from "../packages/host/src/team-types.js";
@@ -454,4 +463,111 @@ test("the digest fits 4,096 bytes and keeps the order", () => {
   } finally {
     f.close();
   }
+});
+
+/** Inserts `count` sealed run-scope rows straight into the store. Only the plain columns the reads use matter. */
+function insertRows(
+  store: EvidenceStore,
+  runId: string,
+  row: { kind: string; state: string; author: string; authority: string; authorMemberId?: string },
+  count: number,
+): void {
+  store.write(tx => {
+    for (let index = 0; index < count; index += 1) {
+      const id = randomUUID();
+      tx.run(
+        "INSERT INTO entries (entry_id, scope, run_id, mission_id, revision, at, kind, author, authority, author_member_id, "
+        + "task_key, state, body_bytes, encrypted_head, encrypted_body) "
+        + "VALUES (?, 'run', ?, NULL, 1, ?, ?, ?, ?, ?, NULL, ?, 20, ?, ?)",
+        id,
+        runId,
+        at(0),
+        row.kind,
+        row.author,
+        row.authority,
+        row.authorMemberId ?? null,
+        row.state,
+        tx.seal("entries", `${id}:head`, { paths: [], summary: `row ${index}` }),
+        tx.seal("entries", `${id}:body`, { text: "row" }),
+      );
+    }
+  });
+}
+
+/** The seq of the row at `position` (1-based) in the run's seq order. */
+function seqAt(store: EvidenceStore, runId: string, position: number): number | undefined {
+  return store.read(db => db.get<{ seq: number }>(
+    "SELECT seq FROM entries WHERE run_id=? ORDER BY seq LIMIT 1 OFFSET ?",
+    runId,
+    position - 1,
+  )?.seq);
+}
+
+/** A filtered list with an explicit scan cap, as the bounded-read tests need. */
+function scan(store: EvidenceStore, scope: MemberScope, query: Parameters<typeof listForMember>[2], scanRows: number): MemberList {
+  return store.read(db => listForMember(db, scope, query, scanRows));
+}
+
+test("a filtered list reads a bounded number of rows", () => {
+  withStore((_f, store, board) => {
+    const run = entryRun();
+    const implA = memberOf(run, hostEntryIds.implA);
+    const implB = memberOf(run, hostEntryIds.implB);
+    const scope = memberScopeOf(run, implA, 0);
+    insertRows(store, run.id, { kind: "report", state: "active", author: "host", authority: "receipt" }, 120);
+    const contracts = [0, 1, 2].map(index => ingestOne(board, run, implB, contract(`bounded-${index}`)));
+
+    const first = scan(store, scope, { kinds: ["contract"] }, 50);
+    assert.deepEqual(first.heads, []);
+    assert.equal(first.more, true);
+    assert.equal(first.cursor, seqAt(store, run.id, 50));
+
+    const second = scan(store, scope, { kinds: ["contract"], since: first.cursor }, 50);
+    assert.deepEqual(second.heads, []);
+    assert.equal(second.more, true);
+    assert.equal(second.cursor, seqAt(store, run.id, 100));
+
+    const third = scan(store, scope, { kinds: ["contract"], since: second.cursor }, 50);
+    assert.deepEqual(third.heads.map(head => head.entryId), contracts);
+    assert.equal(third.more, false);
+  });
+});
+
+test("a filtered list over a withdrawn history reads a bounded number of rows", () => {
+  withStore((_f, store, board) => {
+    const run = entryRun();
+    const implA = memberOf(run, hostEntryIds.implA);
+    const implB = memberOf(run, hostEntryIds.implB);
+    const scope = memberScopeOf(run, implA, 0);
+    insertRows(store, run.id, { kind: "contract", state: "withdrawn", author: "member", authority: "claim", authorMemberId: randomUUID() }, 60);
+    const live = [0, 1].map(index => ingestOne(board, run, implB, contract(`live-${index}`)));
+
+    const first = scan(store, scope, { since: 0, limit: 5 }, 50);
+    assert.deepEqual(first.heads, []);
+    assert.equal(first.more, true);
+    assert.equal(first.cursor, seqAt(store, run.id, 50));
+
+    const second = scan(store, scope, { since: first.cursor, limit: 5 }, 50);
+    assert.deepEqual(second.heads.map(head => head.entryId), live);
+    assert.equal(second.more, false);
+  });
+});
+
+test("member reads and the member count read through an index", () => {
+  withStore((_f, store) => {
+    const runId = randomUUID();
+    const statements: [string, string, (string | number)[]][] = [
+      [MEMBER_COUNT_SQL, "entries_member_kinds", [runId]],
+      [ACTIVE_SCAN_SQL, "entries_active_by_run", [runId, 50]],
+      [RUN_SCAN_SQL, "entries_by_run", [runId, 0, 51]],
+      [TASK_SCAN_SQL, "entries_by_task", [runId, "task-key", 0, 51]],
+    ];
+    for (const [sql, index, params] of statements) {
+      const lines = store.read(db => db.all<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, ...params)).map(row => row.detail);
+      const plan = lines.join(" | ");
+      assert.ok(lines.some(line => line.includes(index)), `${index} missing from: ${plan}`);
+      assert.equal(lines.some(line => /^SCAN entries(?! USING)/.test(line)), false, `bare scan in: ${plan}`);
+      assert.equal(lines.some(line => line.includes("USE TEMP B-TREE")), false, `temp b-tree in: ${plan}`);
+    }
+  });
 });

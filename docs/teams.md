@@ -112,6 +112,8 @@ Enrolling a `github` project still uploads a one-time snapshot so the project
 directory exists at once. The first refresh then fast-forwards it to the base
 branch. See [GitHub-tracked sources](#github-tracked-sources).
 
+A rerun keeps every team setting that the command does not set itself: the handoff time limits, the feature map, and eval capture.
+
 A new empty repository can enroll immediately after `git init`. Its cloud source
 gets an empty baseline commit; local Git history and files stay unchanged. When
 no checks exist, enrollment records `checks: []` and `establishChecks: true`.
@@ -502,7 +504,8 @@ The schema is strict, so an unknown key refuses the write. At this stage every f
 - A prefix is repository-relative. It cannot start with `/`, contain `..`, `.git`, `.`, an empty segment, or glob characters.
 - Without `testPaths`, the host rule applies. It counts a file as a test when a path segment is `test`, `tests`, or `__tests__`, or when the name contains `.test.` or `.spec.`. When `testPaths` is set, it replaces that rule and needs at least one prefix or suffix.
 - An area ID is lowercase letters, digits, and hyphens, up to 40 characters. An ID that the feature map does not know refuses every task with `excluded-area-unknown`.
-- A client that does not know `eval` replaces the whole team block and drops the setting, which turns capture off. That fails safe.
+- `infinite repo init` keeps every team setting it does not own, `eval` included, when it runs again.
+- A client from before that change, and any client that sends a whole team block without `eval`, replaces the block and turns capture off. That fails safe, and nothing reports it.
 
 ### What a captured task keeps
 

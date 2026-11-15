@@ -39,6 +39,7 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
   const threads = new Map<string, StoredMessage[]>();
   const hidden = new Set<string>();
   const posts: StoredMessage[] = [];
+  const postPayloads: Record<string, any>[] = [];
   const calls: { method: string; token: string }[] = [];
   const acked: string[] = [];
   const sent = new Map<string, string>();
@@ -92,6 +93,7 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
           reply(200, { ok: true, channel: body.channel, permalink: `https://example.slack.com/archives/${body.channel}/p${body.message_ts.replace(".", "")}` }); return;
         }
         case "chat.postMessage": {
+          postPayloads.push(body);
           const message: StoredMessage = {
             channel: body.channel, threadTs: body.thread_ts, ts: nextTs(), text: body.text,
             user: botUserId, botId, metadata: body.metadata,
@@ -165,6 +167,9 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
       return posts.filter(post => post.channel === binding.channelId && post.threadTs === binding.threadTs)
         .map(post => ({ text: post.text, key: post.metadata?.event_payload.key ?? "", ts: post.ts }));
     },
+    postPayloads(binding: IntakeThread) {
+      return postPayloads.filter(payload => payload.channel === binding.channelId && payload.thread_ts === binding.threadTs);
+    },
     /** Sends an events_api envelope on the open Socket Mode connection and resolves with its envelope ID once sent. */
     async emit(event: Record<string, unknown>, emitOptions: { teamId?: string; eventId?: string } = {}) {
       const envelopeId = randomUUID();
@@ -177,6 +182,11 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
     async emitRaw(type: string, payload: Record<string, unknown> = {}) {
       const envelopeId = randomUUID();
       return sendFrame(envelopeId, JSON.stringify({ envelope_id: envelopeId, type, accepts_response_payload: false, payload }));
+    },
+    /** Sends a real Socket Mode interactive envelope containing the supplied interactive payload. */
+    async emitInteraction(payload: Record<string, unknown>) {
+      const envelopeId = randomUUID();
+      return sendFrame(envelopeId, JSON.stringify({ envelope_id: envelopeId, type: "interactive", accepts_response_payload: true, payload }));
     },
     acks() { return [...acked]; },
     /** Sends the same envelope again, as Slack does for an envelope that was not acknowledged. */

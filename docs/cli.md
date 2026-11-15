@@ -489,7 +489,10 @@ projects. A workspace is `delegated`, `partly-delegated`, or `not-delegated`.
 workspace with `--all`. It replaces a project's saved opt-out and prints each
 one that it replaced. `--direction` sets the direction text, which can only
 narrow what the permission agent allows in that workspace, and
-`--clear-direction` removes it. `revoke` removes a workspace's delegation. A
+`--clear-direction` removes it. `revoke` removes a workspace's delegation. Both
+commands reply after answers that were already with a session under the
+earlier authority are fenced, and print a line when one could not be stopped
+for certain. A
 missing `--request-id` is generated, so pass one to retry a request safely.
 `W` is a workspace id as `status` prints it. Only when no workspace has that
 id is `W` read as a project id, and it then names the workspace that holds that

@@ -415,6 +415,16 @@ the authority that earlier decisions were made under. A decision that was made
 under an ended authority is never applied and never replayed. On a host that
 is not ready the agent serves no request.
 
+The host reads a decision's authority again once it holds the session's input
+lease, immediately before the first key. A revoke, a changed delegation, an
+onboarding opt-out and an owner regrouping are acknowledged only after every
+answer that is already with a session under the ended authority is fenced at
+that session's worker: the worker drops the host's lease and sends nothing
+more for that decision. A key that the worker sent before the fence arrived
+stays sent. When a fence cannot be confirmed, the reply carries
+`deliveryFence: "uncertain"` and the CLI prints a line; the decision log shows
+what was delivered.
+
 What can decide:
 
 - A host rule can send a request to the owner or raise it to the strong tier.

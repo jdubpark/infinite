@@ -818,6 +818,9 @@ export class Manager {
       const controlled = await this.state(sessionId);
       if (controlled.status !== "running" || controlled.control?.id !== lease.id)
         throw new ContentError("The session or its control lease changed before the answer", 409);
+      // The owner may have revoked or replaced the delegation while the lease was claimed.
+      if (input.current && !input.current())
+        throw new ContentError("The permission answer was invalidated before the answer", 409);
       try {
         return await workerCall(this.config.runDir, sessionId, {
           op: "session-permission-answer", requestId, decisionId: input.decisionId, targetSessionId: sessionId, targetCwd: cwd,
@@ -904,6 +907,16 @@ export class Manager {
         catch { /* a lost worker or lease is reported by the next state read */ }
       }
     }
+  }
+  /** Fences one permission-agent answer that is with a session outside a team run, after an owner act ended its authority. */
+  async invalidateSessionPermission(sessionId: string, decisionId: string): Promise<"invalidated" | "uncertain"> {
+    try {
+      if (this.meta(sessionId).session.team || !/^[A-Za-z0-9._:-]{1,100}$/.test(decisionId)) return "uncertain";
+      const result = await workerCall<{ invalidated: boolean }>(this.config.runDir, sessionId, {
+        op: "session-permission-invalidate", decisionId,
+      }, 4000);
+      return result.invalidated === true ? "invalidated" : "uncertain";
+    } catch { return "uncertain"; }
   }
   /** Fence one persisted delegated decision before its owner revokes or pauses it. */
   async invalidateTeamPermission(sessionId: string, decisionId: string): Promise<"invalidated" | "uncertain"> {

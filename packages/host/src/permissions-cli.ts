@@ -34,8 +34,9 @@ type ReplayJob = {
   id: string; state: "running" | "finished" | "failed"; done: number; total: number; error?: string;
   result?: { id: string; cases: number; finishedAt: string; set: ReplayFigures; byClass: Record<string, ReplayFigures>; byTier: Record<string, ReplayFigures> };
 };
-type DelegationResult = { agent: string; views: WorkspaceDelegationView[]; replacedOptOuts: string[] };
-type RevocationResult = { agent: string; view: WorkspaceDelegationView };
+type DelegationResult = { agent: string; views: WorkspaceDelegationView[]; replacedOptOuts: string[]; deliveryFence?: "uncertain" };
+type RevocationResult = { agent: string; view: WorkspaceDelegationView; deliveryFence?: "uncertain" };
+const UNFENCED = "An answer that was already with a session could not be stopped for certain. Run infinite permissions log to see what was delivered.";
 type ReopenResult = { decisionId: string; reject: string; code: string; assignment: string; locked: boolean };
 type UnlockResult = { assignment: string; wasLocked: boolean; locked: boolean };
 
@@ -202,6 +203,7 @@ export async function handlePermissionsClientCommand(positional: string[], optio
     else {
       for (const view of result.views) printView(view);
       if (result.replacedOptOuts.length) console.log(`Replaced opt-outs: ${result.replacedOptOuts.map(projectId => clean(projectId)).join(", ")}`);
+      if (result.deliveryFence === "uncertain") console.log(UNFENCED);
       printNotice(result.agent);
     }
     return true;
@@ -217,6 +219,7 @@ export async function handlePermissionsClientCommand(positional: string[], optio
     if (options["--json"]) console.log(JSON.stringify(result, null, 2));
     else {
       printView(result.view);
+      if (result.deliveryFence === "uncertain") console.log(UNFENCED);
       printNotice(result.agent);
     }
     return true;

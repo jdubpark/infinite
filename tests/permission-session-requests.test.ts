@@ -414,6 +414,11 @@ test("the manager answers only a host session outside a run, under its own lease
     await manager.answerSessionPermission(sessions.plain, { ...input, decisionId: "decision-11", notice: requesterNotice("unrelated") });
     const withNotice = requests.filter(request => request.op === "session-permission-answer").at(-1) as Extract<WorkerRequest, { op: "session-permission-answer" }>;
     assert.equal(withNotice.text, requesterNotice("unrelated"), "the worker receives the notice as the answer's text");
+    // A delegation that the owner revoked while the lease was claimed: nothing reaches the worker, and the lease is released.
+    const answersBefore = requests.filter(request => request.op === "session-permission-answer").length;
+    await assert.rejects(manager.answerSessionPermission(sessions.plain, { ...input, decisionId: "decision-12", current: () => false }), /invalidated before the answer/);
+    assert.equal(requests.filter(request => request.op === "session-permission-answer").length, answersBefore);
+    assert.equal(control, null);
   } finally {
     await new Promise<void>(resolve => server.close(() => resolve()));
     rmSync(root, { recursive: true, force: true });

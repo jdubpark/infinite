@@ -4,7 +4,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSy
 import { rm as rmAsync } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep, basename } from "node:path";
-import type { Config, Provider } from "./types.js";
+import type { Config, Provider, Session } from "./types.js";
 import { TeamStopRefused, type Manager } from "./manager.js";
 import { bootId, extendWitness, hostProcesses, newWitness, recordCommand, type CensusResult, type HostProcesses, type ProcessWitness } from "./process-census.js";
 import type { WorkerError } from "./ipc.js";
@@ -3550,6 +3550,15 @@ export class TeamService {
     if (!member || member.revision !== run.revision || member.status !== "running" || member.role === "permission-coordinator")
       return { stale: true, reason: "The member assignment is no longer active." };
     return undefined;
+  }
+  /**
+   * For the headless channel: whether the permission agent may decide for this member's session now. The same
+   * live run and member checks as an interactive hand-off, so a run-level revoke, a pause, a halt and a
+   * replaced member each end it.
+   */
+  permissionAgentLive(session: Pick<Session, "id" | "team">): boolean {
+    const team = session.team;
+    return Boolean(team) && this.agentRunCheck(team!.runId, team!.memberId, session.id) === undefined;
   }
   /**
    * Hands a served member's open permission dialog to the permission agent. It never waits for the decision: the

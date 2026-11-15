@@ -101,6 +101,8 @@ type DeliveryRequest = Extract<WorkerRequest, { op: "input" | "raw" | "key" | "s
 type StoredReceipt = Receipt & { digest: string; result?: AnswerResult };
 const receipts = new Map<string, StoredReceipt>();
 const invalidatedTeamPermissionDecisions = new Set<string>();
+/** Permission-agent decisions for this session whose authority the owner ended. A decision id is never reused under a new authority. */
+const invalidatedSessionPermissionDecisions = new Set<string>();
 /** The receipt a client sees: the request digest stays inside the worker. */
 const publicReceipt = ({ digest: _digest, ...receipt }: StoredReceipt) =>
   receipt;
@@ -1215,6 +1217,7 @@ async function answerSessionPermission(request: SessionPermissionAnswerRequest):
     if (session.team || request.targetSessionId !== session.id || handoffReceipt ||
         session.runtime?.nativeUi || session.runtime?.transport !== "pty")
       throw new Refusal("unsupported");
+    if (invalidatedSessionPermissionDecisions.has(request.decisionId)) throw new Refusal("control-lost");
     let cwd: string;
     try { cwd = realpathSync(session.cwd); }
     catch { throw new Refusal("unsupported"); }
@@ -1425,6 +1428,18 @@ const server = createServer((socket) => {
         if (!/^[a-f0-9-]{36}$/i.test(request.decisionId)) throw new Error("Invalid delegated decision identity");
         invalidatedTeamPermissionDecisions.add(request.decisionId);
         if (controller?.actorId === `team-permission:${request.decisionId}`) {
+          controller = null;
+          controlChangeGeneration++;
+          state = { ...state, control: null };
+          persist();
+        }
+        result = { invalidated: true };
+      } else if (request.op === "session-permission-invalidate") {
+        // Like a control change, this must be able to fence an answer between its awaited terminal writes.
+        if (typeof request.decisionId !== "string" || !/^[A-Za-z0-9._:-]{1,100}$/.test(request.decisionId)) throw new Error("Invalid permission decision identity");
+        invalidatedSessionPermissionDecisions.add(request.decisionId);
+        if (invalidatedSessionPermissionDecisions.size > 512) invalidatedSessionPermissionDecisions.delete(invalidatedSessionPermissionDecisions.values().next().value!);
+        if (controller?.actorId === `session-permission:${request.decisionId}`) {
           controller = null;
           controlChangeGeneration++;
           state = { ...state, control: null };

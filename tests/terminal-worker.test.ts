@@ -591,6 +591,18 @@ test("a session permission answer types one recognised option outside any run, o
     const interrupted = await pending;
     assert.equal(interrupted.state, "uncertain");
     assert.equal(worker.output().match(/APPROVED/g)?.length, 1, "only the first answer reached the dialog");
+
+    // An owner act that ends the decision's authority fences it: the host's lease is dropped and its answer types nothing.
+    const person = (await worker.call({ op: "state" })).control!;
+    await worker.call({ op: "control", action: "release", actor: human, leaseId: person.id });
+    const retired = randomUUID(), retiredActor = { id: `session-permission:${retired}`, label: "Session permission" };
+    const retiredLease = await worker.call<ControlLease>({ op: "control", action: "claim", actor: retiredActor });
+    const journaled = intents(worker).length;
+    assert.deepEqual(await worker.call({ op: "session-permission-invalidate", decisionId: retired }), { invalidated: true });
+    assert.equal((await worker.call({ op: "state" })).control, null);
+    await assert.rejects(worker.call(sessionAnswerRequest(worker, next.attention.prompt!, retiredActor, retiredLease.id, retired, 1)), { code: "control-lost" });
+    assert.equal(intents(worker).length, journaled, "a fenced decision journals and types nothing");
+    assert.equal(worker.output().match(/APPROVED/g)?.length, 1);
   } finally { await worker.stop(); }
 });
 

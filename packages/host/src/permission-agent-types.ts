@@ -245,8 +245,15 @@ export interface PermissionInteractiveTarget {
   /**
    * Sends one option under a control lease. `refused` means nothing was sent. `uncertain` is never retried.
    * `notice` is the host's fixed reject notice. A target sends it only after a reject option that accepts text.
+   * `current` is the service's live authority check: the target reads it again once the control lease is
+   * held, immediately before the first key, and sends nothing when it is false.
    */
-  answer(option: number, decisionId: string, notice?: string): Promise<"delivered" | "refused" | "uncertain">;
+  answer(option: number, decisionId: string, notice?: string, current?: () => boolean): Promise<"delivered" | "refused" | "uncertain">;
+  /**
+   * Fences this target's delivery in flight after an owner act ended its authority. True when no delivery is
+   * in flight, or the session's worker confirmed that it sends nothing more for it.
+   */
+  fence?(): Promise<boolean>;
   /** Aborted when the requester's authority ends while the decision runs, for example a revoke or a halt. */
   signal?: AbortSignal;
   /** The adapter's bounded read-only collection inside the session root, for source paths the strong turn asks for. */
@@ -278,6 +285,11 @@ export interface PermissionDeliveryService {
    * still decide it, the owner otherwise.
    */
   holder(sessionId: string, promptId: number): "agent" | "owner" | "undecided";
+  /**
+   * After an owner act that changed or ended an authority, and before that act is acknowledged: fences every
+   * delivery in flight whose decision no longer applies. False when a fence could not be confirmed.
+   */
+  fenceRetired?(): Promise<boolean>;
   /**
    * The interrupt class for which a pending request was left to the owner: a class rule or an `owner` verdict.
    * Undefined for any other request, including an undeliverable one, whose cause is a host limit and not a class.

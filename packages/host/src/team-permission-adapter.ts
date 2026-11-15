@@ -84,7 +84,7 @@ export function teamPermissionRequest(input: {
 export type TeamCheckFailure = { stale: boolean; reason: string };
 
 export type TeamTargetDeps = {
-  manager: Pick<Manager, "meta" | "state" | "answerAgentPermission">;
+  manager: Pick<Manager, "meta" | "state" | "answerAgentPermission"> & Partial<Pick<Manager, "invalidateTeamPermission">>;
   assignment: TeamAssignment;
   /** The run and member as the host holds them now: authority, halt, run status, member status and revision. */
   runCheck(): TeamCheckFailure | undefined;
@@ -123,6 +123,8 @@ export function teamPermissionTarget(request: PermissionRequest, deps: TeamTarge
   const current = () => deps.runCheck() === undefined && !deps.signal?.aborted;
   /** The source paths the decision read on request, and what they held. */
   let requested: { paths: string[]; digest: string } | undefined;
+  /** The delivery that is with the manager or the worker now. */
+  let delivering: string | undefined;
 
   const target: PermissionInteractiveTarget = {
     request,
@@ -167,7 +169,12 @@ export function teamPermissionTarget(request: PermissionRequest, deps: TeamTarge
         return { ok: true as const, ...(accept === undefined ? {} : { accept }), ...(reject === undefined ? {} : { reject }) };
       } catch { return fail(true, "The member session could not be verified."); }
     },
-    async answer(option, decisionId, notice) {
+    async fence() {
+      if (delivering === undefined) return true;
+      if (!deps.manager.invalidateTeamPermission) return false;
+      return await deps.manager.invalidateTeamPermission(request.requester.sessionId, delivering) === "invalidated";
+    },
+    async answer(option, decisionId, notice, live) {
       const accept = agentAcceptOption(prompt), reject = oneShotRejectOption(prompt);
       const choice = notice === undefined && option === accept ? "accept" as const : notice !== undefined && option === reject ? "reject" as const : undefined;
       if (!choice) return "refused";
@@ -176,12 +183,14 @@ export function teamPermissionTarget(request: PermissionRequest, deps: TeamTarge
       const withNotice = choice === "reject" && rejectOption?.role === "reject-with-feedback" && prompt.acceptsText;
       const deliveryId = randomUUID();
       deps.delivering?.(deliveryId, true);
+      delivering = deliveryId;
       try {
         const receipt = await deps.manager.answerAgentPermission(request.requester.sessionId, deps.assignment, {
           deliveryId, requestId: randomUUID(), choice, option, ...(withNotice ? { notice } : {}),
           prompt, evidenceHash: permissionEvidenceHash(prompt), targetCwd: request.requester.sessionRoot,
           expiresAt: new Date(now() + DELIVERY_WINDOW_MS).toISOString(), authorityHash: digest({ decisionId, requestId: request.id }),
-          current,
+          // The run's authority and the workspace delegation, both read again under the lease.
+          current: () => current() && (live?.() ?? true),
         });
         return receipt.state === "delivered" && receipt.result === "closed" ? "delivered" : "uncertain";
       } catch (error) {
@@ -189,7 +198,7 @@ export function teamPermissionTarget(request: PermissionRequest, deps: TeamTarge
         // Host text only: the refusal is the manager's or the worker's own reason.
         console.warn(`[Infinite] A permission agent delivery was refused before any key was sent: ${error instanceof Error ? error.message : "unknown reason"}`);
         return "refused";
-      } finally { deps.delivering?.(deliveryId, false); }
+      } finally { delivering = undefined; deps.delivering?.(deliveryId, false); }
     },
   };
   return target;

@@ -224,6 +224,8 @@ export interface SessionPermissionAnswer {
   targetCwd: string;
   /** The host's fixed reject notice. Set only for a recognised one-shot reject that takes text; it is typed after that option. */
   notice?: string;
+  /** The decision's live authority check. The manager reads it once the control lease is held and sends nothing when it is false. */
+  current?: () => boolean;
 }
 
 /** The host operations this module uses. `Manager` provides them. */
@@ -232,6 +234,8 @@ export interface SessionPermissionHost {
   state(id: string): Promise<WorkerState>;
   events(id: string, after: number, limit: number, types?: Set<string>): { events: Event[]; cursor: number; more: boolean };
   answerSessionPermission(sessionId: string, input: SessionPermissionAnswer): Promise<Receipt & { result?: AnswerResult }>;
+  /** Fences one answer that is with the session's worker. Without it an answer in flight cannot be fenced. */
+  invalidateSessionPermission?(sessionId: string, decisionId: string): Promise<"invalidated" | "uncertain">;
 }
 
 /** The parts of the permission agent this module reads. Each is read on every use, so a part registered later is seen. */
@@ -343,10 +347,17 @@ export class SessionPermissionRequests {
       const again = await this.collect(sessionId, prompt, sessionRoot, cwd, collected.paths);
       return again.digest === collected.digest ? live : { ok: false, stale: true, reason: "A source file that the review read changed." };
     };
+    /** The decision whose answer is with the manager or the worker now. */
+    let delivering: string | undefined;
     return {
       request,
       check,
-      answer: (option, decisionId, notice) => {
+      fence: async () => {
+        if (delivering === undefined) return true;
+        if (!this.host.invalidateSessionPermission) return false;
+        return await this.host.invalidateSessionPermission(sessionId, delivering) === "invalidated";
+      },
+      answer: (option, decisionId, notice, current) => {
         // One decision is answered once. A second call returns the first result and sends nothing.
         const previous = answers.get(decisionId);
         if (previous) return previous;
@@ -358,7 +369,9 @@ export class SessionPermissionRequests {
           if (!live.ok || !(option === live.reject || option === live.accept && notice === undefined)) return "refused" as const;
           // The notice is typed only after a reject option that takes text; any other reject sends none.
           const typed = notice !== undefined && rejectTakesText(prompt, option) ? notice : undefined;
-          return this.answer(sessionId, prompt, request.evidenceHash, cwd, option, decisionId, typed);
+          delivering = decisionId;
+          try { return await this.answer(sessionId, prompt, request.evidenceHash, cwd, option, decisionId, typed, current); }
+          finally { delivering = undefined; }
         })();
         answers.set(decisionId, result);
         return result;
@@ -433,10 +446,12 @@ export class SessionPermissionRequests {
     return { ok: true, ...(accept !== undefined ? { accept } : {}), ...(reject !== undefined ? { reject } : {}) };
   }
 
-  private async answer(sessionId: string, prompt: Prompt, evidenceHash: string, cwd: string, option: number, decisionId: string, notice?: string) {
+  private async answer(sessionId: string, prompt: Prompt, evidenceHash: string, cwd: string, option: number, decisionId: string, notice?: string,
+    current?: () => boolean) {
     try {
       const receipt = await this.host.answerSessionPermission(sessionId, {
         decisionId, option, promptId: prompt.id, promptHash: prompt.hash!, evidenceHash, targetCwd: cwd, ...(notice !== undefined ? { notice } : {}),
+        ...(current ? { current } : {}),
       });
       // A dialog that stayed open, or a marker that never reached the option, may have taken keys: never retried.
       return receipt.state === "delivered" && receipt.result === "closed" ? "delivered" as const : "uncertain" as const;

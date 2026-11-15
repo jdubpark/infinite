@@ -91,6 +91,8 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
   private readonly prompts = new Map<string, { holder: Holder; interruptClass?: InterruptClass }>();
   /** Requests whose delivery result is unknown in this process, kept even when the ledger write failed. */
   private readonly unknown = new Set<string>();
+  /** Deliveries between their recorded intent and their result, by request id, so an owner act can fence them. */
+  private readonly delivering = new Map<string, { decisionId: string; target: PermissionInteractiveTarget }>();
   private readonly sources = new Set<PermissionDeliverySource>();
   private readonly now: () => number;
 
@@ -129,6 +131,18 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
       catch { /* An adapter that cannot answer claims nothing. */ }
     }
     return "owner";
+  }
+
+  async fenceRetired(): Promise<boolean> {
+    const pipeline = this.options.pipeline();
+    let fenced = true;
+    await Promise.all([...this.delivering.values()].map(async ({ decisionId, target }) => {
+      let applicable = false;
+      try { applicable = pipeline?.applicable(decisionId) === true; } catch { applicable = false; }
+      if (applicable) return;
+      try { if (!target.fence || !await target.fence()) fenced = false; } catch { fenced = false; }
+    }));
+    return fenced;
   }
 
   /** The host's class identifier for a dialog that a class rule or an `owner` verdict left to the owner. Never model text. */
@@ -241,9 +255,14 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
       return { handled: true, result: "undeliverable", decisionId, delivery: "refusal" };
     }
     this.unknown.add(request.id);
+    // No await lies between the authority check above and this entry, so an owner act either fails that check
+    // or finds the delivery here. The target reads `current` again under its lease, before the first key.
+    const current = () => { try { return pipeline.applicable(decisionId); } catch { return false; } };
+    this.delivering.set(request.id, { decisionId, target });
     let answered: "delivered" | "refused" | "uncertain";
-    try { answered = await target.answer(option, decisionId, choice === "reject" ? notice : undefined); }
+    try { answered = await target.answer(option, decisionId, choice === "reject" ? notice : undefined, current); }
     catch { answered = "uncertain"; }
+    finally { this.delivering.delete(request.id); }
     const kind: DeliveryLedgerState = answered === "delivered" ? "receipt" : answered === "refused" ? "refusal" : "uncertain";
     let stored = true;
     try { ledger.set(request.id, { sessionId, decisionId, state: kind }); } catch { stored = false; }

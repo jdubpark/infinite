@@ -179,6 +179,45 @@ test("a decision whose authority was retired before delivery sends nothing", asy
   assert.equal(answers.length, 0);
 });
 
+test("an owner act that retires the authority fences an answer in flight before the act is acknowledged", async () => {
+  let applicable = true;
+  const { pipeline } = fakePipeline(allow());
+  pipeline.applicable = () => applicable;
+  const service = new InteractivePermissionDelivery({ pipeline: () => pipeline, ledger: memoryLedger() });
+  // The answer is with the session: it ends only when the fence stops it.
+  let current: (() => boolean) | undefined, stop!: (result: "refused") => void, fences = 0;
+  const { target } = fakeTarget();
+  const started = new Promise<void>(resolve => {
+    target.answer = (_option, _decisionId, _notice, live) => { current = live; resolve(); return new Promise(done => { stop = done; }); };
+  });
+  target.fence = async () => { fences++; stop("refused"); return true; };
+  const handled = service.handle(target);
+  await started;
+  assert.equal(current!(), true, "the target reads the decision's authority again under its lease");
+  assert.equal(await service.fenceRetired(), true);
+  assert.equal(fences, 0, "a delivery whose authority still applies is left alone");
+
+  applicable = false; // The owner's revoke is recorded.
+  assert.equal(current!(), false, "after the revoke the target sends no key");
+  assert.equal(await service.fenceRetired(), true);
+  assert.equal(fences, 1, "the answer in flight is fenced at its session");
+  const result = await handled;
+  assert.deepEqual([result.handled, result.handled && result.result, result.handled && result.delivery], [true, "undeliverable", "refusal"]);
+  assert.equal(await service.fenceRetired(), true, "nothing is in flight afterwards");
+
+  // A target that cannot fence its delivery makes the fence unconfirmed, and the owner is told so.
+  const blind = fakeTarget({ request: request({ id: "session-2:8:abcd" }) });
+  let release!: (result: "uncertain") => void;
+  const blindStarted = new Promise<void>(resolve => { blind.target.answer = () => { resolve(); return new Promise(done => { release = done; }); }; });
+  applicable = true;
+  const second = service.handle(blind.target);
+  await blindStarted;
+  applicable = false;
+  assert.equal(await service.fenceRetired(), false);
+  release("uncertain");
+  await second;
+});
+
 test("an owner verdict leaves the dialog pending and makes it the owner's", async () => {
   const { pipeline } = fakePipeline({ kind: "owner", decisionId: "decision-3", interruptClass: "credentials" });
   const service = new InteractivePermissionDelivery({ pipeline: () => pipeline, ledger: memoryLedger() });

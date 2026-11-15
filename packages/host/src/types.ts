@@ -321,6 +321,7 @@ export type WorkerRequest =
       leaseId: string;
     })
   | { op: "team-answer-invalidate"; decisionId: string }
+  | { op: "session-permission-invalidate"; decisionId: string }
   | ({ op: "resize"; cols: number; rows: number } & InputControl)
   | ({ op: "stop"; requestId: string } & InputControl);
 export interface Bootstrap {

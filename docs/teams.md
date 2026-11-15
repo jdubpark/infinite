@@ -1661,7 +1661,8 @@ delivery events; see the [decision log](cli.md#permission-decision-log).
 
 `infinite team revoke-permissions TEAM_ID` returns one run's requests to the
 owner. `infinite permissions revoke` ends a workspace's delegation: its
-pending decisions are retired and never applied. The owner's halt stops the
+pending decisions are retired and never applied, and an answer that is already
+with a member's session is fenced before the revoke is acknowledged. The owner's halt stops the
 permission agent for the projects it covers: no reviewer turn starts and no
 recorded verdict is delivered until the release.
 
@@ -1688,7 +1689,10 @@ other providers are not served.
 This is the earlier repository-level delegation. It decides only for a team
 run that the permission agent does not serve, and it is kept until the
 permission agent has replaced it on the host. A run uses one path or the
-other, never both for the same request.
+other, never both for the same request. When the permission agent starts to
+serve a run in flight, the run's coordinator reviews are retired without an
+answer, an answer in flight is fenced, and the coordinator review decides
+nothing more for that run.
 
 The first repository enrollment enables this delegation by default:
 

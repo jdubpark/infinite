@@ -10,7 +10,7 @@ import { EventOutbox, type OutboxEvent } from "../packages/host/src/evidence/out
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import type { RunEvent } from "../packages/host/src/evidence/types.js";
 import { MAX_OUTBOX_EVENTS } from "../packages/host/src/run-events.js";
-import { DEFAULT_TEAM_RETENTION, type TeamRun } from "../packages/host/src/team-types.js";
+import { DEFAULT_TEAM_RETENTION, type TeamRun, teamGoalContextSchema } from "../packages/host/src/team-types.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { prepareMemberWorkspace } from "../packages/host/src/team-workspace.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
@@ -706,6 +706,35 @@ test("a launched member records its configuration", async () => {
     assert.equal(event!.revision, 1);
     assert.deepEqual(event!.data, { v: 1, configId: configId(components), provider: "opencode", model: profile.model, effort: "high",
       promptVersion: version, guidance, knowledge: "none", routing: "off", shape: "team" });
+  } finally { store.close(); f.close(); }
+});
+
+test("a goal run with a pinned record digest records the digest's prompt version", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const memberId = queueImplementer(f);
+    // The goal context the host writes when the objective switch is on: the record digest rides along, c0 empty.
+    f.run.goal = teamGoalContextSchema.parse({
+      id: randomUUID(), revision: 1, cycle: 1, successCriteria: "Owner success text.", nonGoals: [], allowedPaths: ["."], evidence: [],
+      previousWork: [], deadlineAt: "2100-01-01T00:00:00.000Z", maxMembers: 2,
+      record: { version: 1, criteria: [
+        { id: "c0", statement: "", check: "judgement:owner-text", producer: "evaluator" },
+        { id: "c1", statement: "Owner criterion text.", check: "command:npm test", producer: "host" },
+      ] },
+    });
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    await scheduler.step(scheduler.record(f.run.id));
+    await waitFor(() => eventsOfKind(store, f.run.id, "member.configured").length === 1, "member.configured is stored");
+    await teams.idle();
+    const [event] = eventsOfKind(store, f.run.id, "member.configured");
+    const profile = mixedLineup.implementers[0]!;
+    const withDigest = promptVersion("implementer", "opencode", profile, true, false, true);
+    assert.notEqual(withDigest, promptVersion("implementer", "opencode", profile, true, false, false), "the digest changes the version");
+    assert.equal(event!.memberId, memberId);
+    assert.equal((event!.data as { promptVersion: string }).promptVersion, withDigest);
   } finally { store.close(); f.close(); }
 });
 

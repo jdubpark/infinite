@@ -1243,10 +1243,10 @@ paths, non-goals, or limits.
 
 A goal starts no new cycle while its tracking is not `synced`, for example
 during a Linear outage or a rate limit. The goal stays `running`, and its
-reason is `New work waits for Linear tracking: ` followed by the tracking
-reason. When the tracking view gives `retryAt`, the reason adds the minute, in
-UTC, when Linear requests resume. The reason clears once tracking is `synced`
-again. A tracking `blocked` status blocks the goal instead.
+reason is the tracking reason as written; during a rate limit that reason names
+when tracking retries, and the goal's `linear` view carries the same time as
+`retryAt`. The reason clears once tracking is `synced` again. A tracking
+`blocked` status blocks the goal instead.
 
 Goal and Team pages show the issue link, title, workflow state, tracking status,
 and last check time. A cached issue record is not proof that Linear is currently

@@ -617,10 +617,11 @@ test("a cancelled goal's reason says it was cancelled once no team is stopping",
   assert.equal(settled.reason, cancelled);
 });
 
-test("while Linear tracking holds new work, the goal shows the tracking reason and when Linear requests resume", async t => {
+test("while Linear tracking holds new work, the goal shows the tracking reason as written and keeps the retry time on its tracking view", async t => {
   const { f, teams } = fixture(t);
   type View = LinearTrackingView & { retryAt?: string };
-  let view: View = { status: "error", reason: "Linear rate limited requests.", retryAt: "2026-11-14T00:20:00.000Z" };
+  const rateLimited = "Linear is rate-limiting this host's requests. Tracking retries at 2026-11-14T00:20:00Z; execution waits until Linear confirms current requirements.";
+  let view: View = { status: "pending", reason: rateLimited, retryAt: "2026-11-14T00:20:00Z" };
   const linear = { updateGoal: () => structuredClone(view), getGoal: () => undefined } as unknown as LinearService;
   const goals = new GoalService(f.config, f.key, teams as unknown as TeamService, linear);
   t.after(() => goals.close());
@@ -631,12 +632,13 @@ test("while Linear tracking holds new work, the goal shows the tracking reason a
   const held = await until(() => [goals.get(created.id), goals.get(finite.id)], all => all.every(goal => goal.reason !== undefined));
   for (const goal of held) {
     assert.equal(goal.status, "running");
-    assert.equal(goal.reason, "New work waits for Linear tracking: Linear rate limited requests. Linear requests resume at 2026-11-14 00:20 UTC.");
+    assert.equal(goal.reason, rateLimited, "The reason already names the retry time; it is not added again");
+    assert.equal((goal.linear as View).retryAt, "2026-11-14T00:20:00Z");
   }
   assert.equal(teams.launches.length, 0);
 
-  view = { status: "pending", reason: "Waiting for Linear to confirm current requirements and execution evidence." };
-  await until(() => goals.get(created.id), goal => goal.reason === "New work waits for Linear tracking: Waiting for Linear to confirm current requirements and execution evidence.");
+  view = { status: "error", reason: "Linear could not be reached." };
+  await until(() => goals.get(created.id), goal => goal.reason === "Linear could not be reached.");
 
   view = { status: "synced" };
   await until(() => teams.launches.length, count => count === 2);

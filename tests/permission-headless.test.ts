@@ -10,7 +10,8 @@ import { Manager } from "../packages/host/src/manager.js";
 import { workerCall } from "../packages/host/src/ipc.js";
 import {
   HeadlessPermissionChannel, channelToken, deferredCallOpen, deliveryKey, type ChannelReply,
-} from "../packages/host/src/permission-headless.js";import {
+} from "../packages/host/src/permission-headless.js";
+import {
   DEFERRAL_RETENTION_MS, HeadlessChannelWorker, OWNER_DENIED, PENDING_NOTICE, type ChannelWorkerHost,
 } from "../packages/host/src/permission-headless-worker.js";
 import { hookOutput } from "../packages/host/src/permission-hook.js";
@@ -47,7 +48,7 @@ function fakePipeline(overrides: Partial<PermissionPipeline> = {}) {
 }
 
 /** An in-process Manager and channel with a real worker per session, under a short /tmp path for Unix sockets. */
-async function rig(options: { args?: string[]; pipeline?: PermissionPipeline } = {}) {
+async function rig(options: { args?: string[]; pipeline?: PermissionPipeline; overrides?: Partial<PermissionPipeline> } = {}) {
   const root = realpathSync(mkdtempSync("/tmp/inf-headless-"));
   const workspace = join(root, "workspace");
   mkdirSync(workspace);
@@ -63,7 +64,7 @@ async function rig(options: { args?: string[]; pipeline?: PermissionPipeline } =
     attention: { hooks: { claude: true, codex: false }, idleAfterMs: 3000, limitConfirmMs: 30000 },
   } as Config;
   const manager = new Manager(config, key);
-  const fake = fakePipeline();
+  const fake = fakePipeline(options.overrides);
   const services: PermissionAgentServices = { pipeline: options.pipeline ?? fake.pipeline };
   const channel = new HeadlessPermissionChannel({ key, runDir: config.runDir, sessions: manager, services });
   manager.useHeadlessChannel(channel);
@@ -163,6 +164,32 @@ test("an API restart between the owner's answer and the resume runs the call onc
   } finally { restarted?.close(); await r.stop(); }
 });
 
+test("an owner halt engaged after the owner's allow and before the resumed call withholds the allow, and the call never runs", { timeout: 90_000 }, async () => {
+  let halt = false;
+  const r = await rig({ overrides: { halted: () => halt, applicable: () => !halt } });
+  try {
+    const id = randomUUID();
+    await r.manager.create({ requestId: id, provider: "claude", projectId: "rehearsal", title: "Headless", prompt: "allowlisted" });
+    const waiting = await waitFor(() => live(r, id), s => s.attention.state === "needs-you" && Boolean(s.permissionChannel?.waiting), 40_000);
+    // The resumed provider holds before it asks for the call again, so the halt lands between the answer and the call.
+    writeFileSync(join(r.workspace, "hold-resume"), "");
+    await workerCall(r.config.runDir, id, { op: "answer", requestId: randomUUID(), promptId: waiting.attention.prompt!.id, option: 0 });
+    await waitFor(async () => r.deliveries, list => list.some(d => /owner allowed/.test(d.detail ?? "")), 10_000);
+    halt = true;
+    rmSync(join(r.workspace, "hold-resume"));
+    await waitFor(() => live(r, id), s => s.status === "exited", 30_000);
+    assert.equal(r.log("ran.log"), "");
+    assert.equal(r.log("denied.log"), `deploy production: ${requesterNotice("unavailable")}\n`);
+    const delivered = r.channelEvents(id).filter(event => event.event === "delivered");
+    assert.deepEqual(delivered.map(event => event.decision), ["withheld"]);
+    // The answer was used once: no call is left open, and the decision records the withheld allow, never a receipt.
+    assert.equal(deferredCallOpen((after, limit) => r.manager.events(id, after, limit)), false);
+    const decisionId = r.deliveries.find(d => /deferred/.test(d.detail ?? ""))!.decisionId;
+    await waitFor(async () => r.deliveries, list => list.some(d => d.decisionId === decisionId && d.kind === "stale"), 10_000);
+    assert.equal(r.deliveries.some(d => d.decisionId === decisionId && d.kind === "receipt"), false);
+  } finally { await r.stop(); }
+});
+
 test("an owner's refusal reaches the call with the host's notice and the owner's direction, and the call never runs", { timeout: 90_000 }, async () => {
   const r = await rig({ args: ["--allowedTools", "Bash(deploy production)"] });
   try {
@@ -216,6 +243,8 @@ function workerRig(replies: Array<ChannelReply | Error>) {
   const closed: Array<[number, string]> = [];
   let now = Date.parse("2026-11-14T10:00:00.000Z");
   let ended = 0, resumed = 0, resumeFails = false;
+  // The host's answer to the resume check before an owner's allow is returned.
+  let resumeReply: ChannelReply | Error = { result: "ok" };
   const host: ChannelWorkerHost = {
     sessionId: randomUUID(), token: "0".repeat(64), socket: "/nonexistent",
     record: data => { records.push(data); return records.length; },
@@ -227,7 +256,8 @@ function workerRig(replies: Array<ChannelReply | Error>) {
     refusal: code => Object.assign(new Error(code), { code }),
     call: async (_socket, request) => {
       requests.push(request);
-      const reply = replies.shift() ?? { result: "none" };
+      if (request.op === "delivery") return { result: "recorded" };
+      const reply = request.op === "resume" ? resumeReply : replies.shift() ?? { result: "none" };
       if (reply instanceof Error) throw reply;
       return reply;
     },
@@ -240,9 +270,10 @@ function workerRig(replies: Array<ChannelReply | Error>) {
     channel, records, requests, prompts, closed, pre,
     get ended() { return ended; }, get resumed() { return resumed; },
     failResume() { resumeFails = true; }, advance(ms: number) { now += ms; },
+    answerResume(reply: ChannelReply | Error) { resumeReply = reply; },
   };
 }
-const owner: ChannelReply = { result: "owner", interruptClass: "production-or-staging", rule: "production-deploy", decisionId: randomUUID() };
+const owner: ChannelReply = { result: "owner", interruptClass: "production-or-staging", rule: "production-deploy", sessionRoot: "/workspace", decisionId: randomUUID(), deliveryKey: "d".repeat(64) };
 
 test("while a call waits, every other call of the session is denied as pending", async () => {
   const w = workerRig([owner]);
@@ -273,6 +304,33 @@ test("the owner's answer is returned once, only to the call it was given for", a
   assert.deepEqual(await w.pre("deploy production", "toolu_1"), { decision: "allow" });
   // The same call again, once the answer was used, is the owner's again.
   assert.deepEqual(await w.pre("deploy production", "toolu_1"), { decision: "deny", reason: requesterNotice("needs-owner") });
+});
+
+test("an owner's allow is withheld, and still used once, when the host refuses it at the resume or cannot be reached", async () => {
+  for (const reply of [{ result: "withheld", reason: "halted" } as ChannelReply, new Error("ECONNREFUSED")]) {
+    const w = workerRig([owner]);
+    w.answerResume(reply);
+    await w.pre("deploy production", "toolu_1");
+    w.channel.exited(0);
+    w.channel.answer({ requestId: "a1", promptId: w.prompts[0], option: 0 });
+    assert.deepEqual(await w.pre("deploy production", "toolu_1"), { decision: "deny", reason: requesterNotice("unavailable") });
+    assert.deepEqual([w.records.at(-1)?.event, w.records.at(-1)?.decision], ["delivered", "withheld"]);
+    // The check named the deferral's root and decision; the withheld allow is recorded as stale for that decision.
+    const ops = w.requests as Array<{ op: string; sessionRoot?: string; decisionId?: string; deliveryKey?: string; kind?: string }>;
+    const resume = ops.find(request => request.op === "resume")!;
+    assert.deepEqual([resume.sessionRoot, resume.decisionId, resume.deliveryKey], ["/workspace", (owner as { decisionId: string }).decisionId, "d".repeat(64)]);
+    assert.equal(ops.filter(request => request.op === "delivery").at(-1)?.kind, "stale");
+    // The answer was used: the same call again is the owner's again.
+    assert.deepEqual(await w.pre("deploy production", "toolu_1"), { decision: "deny", reason: requesterNotice("needs-owner") });
+  }
+  // An owner's refusal is returned without asking the host.
+  const refused = workerRig([owner]);
+  refused.answerResume(new Error("ECONNREFUSED"));
+  await refused.pre("deploy production", "toolu_1");
+  refused.channel.exited(0);
+  refused.channel.answer({ requestId: "a1", promptId: refused.prompts[0], option: 1 });
+  assert.deepEqual(await refused.pre("deploy production", "toolu_1"), { decision: "deny", reason: OWNER_DENIED });
+  assert.equal((refused.requests as Array<{ op: string }>).some(request => request.op === "resume"), false);
 });
 
 test("a resumed call that differs from the answered one is denied", async () => {
@@ -402,7 +460,7 @@ test("a team member's headless seat is the interactive team adapter's, so their 
 test("a class rule sends the call to the owner whatever else the pipeline returns", async () => {
   const h = hostRig(fakePipeline({ decide: async () => ({ kind: "allow", decisionId: randomUUID(), strongTier: true }) }).pipeline);
   try {
-    assert.deepEqual(await h.ask({ op: "class", call: bash("deploy production") }), { result: "owner", interruptClass: "production-or-staging", rule: "production-deploy" });
+    assert.deepEqual(await h.ask({ op: "class", call: bash("deploy production") }), { result: "owner", interruptClass: "production-or-staging", rule: "production-deploy", sessionRoot: h.session.cwd });
   } finally { h.done(); }
 });
 
@@ -441,6 +499,34 @@ test("a reject is returned only while it still applies, and a halt recorded whil
     assert.deepEqual(reply, { result: "deny", code: "unavailable", notice: requesterNotice("unavailable") });
     assert.deepEqual(halting.deliveries.map(entry => entry.kind), ["stale"]);
   } finally { g.done(); }
+});
+
+test("the resume check confirms an owner's allow only without a halt, while its decision applies, for the session it was issued to", async () => {
+  let halted: () => boolean = () => false;
+  let applies = true;
+  const h = hostRig(fakePipeline({ halted: projectId => halted() && projectId === "rehearsal", applicable: () => applies }).pipeline);
+  try {
+    const decisionId = randomUUID();
+    const resume = (extra: Record<string, unknown> = {}) =>
+      h.ask({ op: "resume", sessionRoot: h.session.cwd, decisionId, deliveryKey: deliveryKey(h.key, h.session.id, decisionId), ...extra });
+    assert.deepEqual(await resume(), { result: "ok" });
+    // A deferral that was issued no decision is checked for the halt and the root only.
+    assert.deepEqual(await resume({ decisionId: undefined, deliveryKey: undefined }), { result: "ok" });
+    halted = () => true;
+    assert.deepEqual(await resume(), { result: "withheld", reason: "halted" });
+    assert.deepEqual(await resume({ decisionId: undefined, deliveryKey: undefined }), { result: "withheld", reason: "halted" });
+    halted = () => { throw new Error("halt unreadable"); };
+    assert.deepEqual(await resume(), { result: "withheld", reason: "halted" });
+    halted = () => false;
+    applies = false;
+    assert.deepEqual(await resume(), { result: "withheld", reason: "stale" });
+    applies = true;
+    assert.deepEqual(await resume({ sessionRoot: "/elsewhere" }), { result: "withheld", reason: "stale" });
+    // A decision is confirmed only with the key issued to this session.
+    await assert.rejects(resume({ deliveryKey: undefined }), /unbound/);
+    await assert.rejects(resume({ deliveryKey: deliveryKey(h.key, randomUUID(), decisionId) }), /unbound/);
+    await assert.rejects(resume({ sessionRoot: undefined }), /invalid/);
+  } finally { h.done(); }
 });
 
 test("a session admitted without the channel is not served even when the pipeline serves its project", async () => {

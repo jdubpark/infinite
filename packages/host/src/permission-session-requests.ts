@@ -80,17 +80,26 @@ export function permissionAction(prompt: Prompt): string {
 
 /** A row of a session listing: the session record without its prompts, plus the worker state. */
 export type ListedSession = Pick<Session, "id" | "projectId"> &
-  Partial<Pick<Session, "team" | "workspace" | "executionLocation" | "runtime">> &
+  Partial<Pick<Session, "team" | "workspace" | "executionLocation" | "runtime" | "headless">> &
   Pick<WorkerState, "status" | "attention"> & Partial<Pick<WorkerState, "control">>;
 
 /**
  * A host session outside any team run whose tools run on the host and whose dialogs the host answers on
- * its own terminal. A mission coordinator carries a team assignment, so it is excluded here too.
+ * its own terminal. A mission coordinator carries a team assignment, so it is excluded here too. A session
+ * that the headless channel serves is excluded: its calls are decided through its hooks, and the prompt
+ * it shows is the owner's own.
  */
-export function outsideRun(session: Partial<Pick<Session, "team" | "workspace" | "executionLocation" | "runtime">>): boolean {
-  return !session.team && !session.workspace && session.executionLocation !== "laptop" &&
+export function outsideRun(session: Partial<Pick<Session, "team" | "workspace" | "executionLocation" | "runtime" | "headless">>): boolean {
+  return !session.team && !session.workspace && session.executionLocation !== "laptop" && !session.headless?.channel &&
     session.runtime?.transport === "pty" && !session.runtime.nativeUi;
 }
+
+/**
+ * A permission dialog this path can answer: one the provider shows on the session's screen. A prompt
+ * from another source, such as the headless channel's owner prompt, is never handed to the permission agent.
+ */
+export const answerableDialog = (prompt: Prompt | null | undefined): prompt is Prompt =>
+  Boolean(prompt && prompt.kind === "permission" && prompt.hash && (prompt.source === "screen" || prompt.source === "hook"));
 
 /** A control lease held by a person. The host's own answer lease is not one. */
 const personHolds = (control: WorkerState["control"]) => Boolean(control && control.label !== SESSION_PERMISSION_ACTOR_LABEL);
@@ -241,7 +250,7 @@ export class SessionPermissionRequests {
       this.followTask(row);
       const prompt = row.attention?.prompt;
       const tracked = this.prompts.get(row.id);
-      if (row.status !== "running" || row.attention?.state !== "needs-you" || !prompt || prompt.kind !== "permission" || !prompt.hash) {
+      if (row.status !== "running" || row.attention?.state !== "needs-you" || !answerableDialog(prompt)) {
         if (tracked && !tracked.inFlight) this.prompts.delete(row.id);
         continue;
       }
@@ -286,7 +295,7 @@ export class SessionPermissionRequests {
     const state = await this.host.state(sessionId);
     const prompt = state.attention?.prompt;
     if (state.status !== "running" || personHolds(state.control ?? null) || state.attention.state !== "needs-you" ||
-        !prompt || prompt.kind !== "permission" || !prompt.hash || expectedKey !== undefined && `${prompt.id}:${prompt.hash}` !== expectedKey)
+        !answerableDialog(prompt) || expectedKey !== undefined && `${prompt.id}:${prompt.hash}` !== expectedKey)
       return undefined;
     const request = sessionPermissionRequest({
       session, sessionRoot, prompt, task: this.task(session), model: launchModel(session, this.config.agents[session.provider]),
@@ -341,7 +350,7 @@ export class SessionPermissionRequests {
     catch { return { ok: false, stale: false, reason: "The session state cannot be read." }; }
     if (state.status !== "running") return { ok: false, stale: true, reason: "The session is no longer running." };
     const prompt = state.attention?.prompt;
-    if (state.attention?.state !== "needs-you" || !prompt || prompt.id !== reviewed.id || prompt.hash !== reviewed.hash ||
+    if (state.attention?.state !== "needs-you" || !answerableDialog(prompt) || prompt.id !== reviewed.id || prompt.hash !== reviewed.hash ||
         permissionEvidenceHash(prompt) !== request.evidenceHash)
       return { ok: false, stale: true, reason: "The request changed or closed." };
     if (sessionRootOf(session, this.project(session.projectId)) !== sessionRoot || canonical(session.cwd) !== cwd)

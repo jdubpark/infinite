@@ -144,6 +144,9 @@ test("a team member, a mission coordinator and a laptop session never take this 
     h.add("mission", "covered", { team: { runId: "mission", memberId: "c", revision: 1, role: "mission-coordinator" } });
     h.add("laptop", "covered", { executionLocation: "laptop", workspace: { cwd: "/home/dev/projects/infinite", roots: [] } });
     h.add("native", "covered", { runtime: { id: "n", location: "cloud", transport: "pty", nativeUi: "codex" } });
+    // The headless channel decides a served session's calls through its hooks, and its owner prompt is the owner's own.
+    h.add("headless", "covered", { headless: { channel: true } });
+    h.add("owner-prompt", "covered", {}, { ...permissionPrompt(1), source: "protocol" });
     // A listing row that lost its assignment still meets the session record, which keeps it.
     h.add("disguised", "covered", { team: { runId: "r", memberId: "d", revision: 1, role: "reviewer" } });
     const rows = h.rows().map(row => row.id === "disguised" ? { ...row, team: undefined } : row);
@@ -151,6 +154,9 @@ test("a team member, a mission coordinator and a laptop session never take this 
     await h.settle();
     assert.equal((h.delivery as FakeDelivery).targets.length, 0);
     assert.equal(await h.service.target("member"), undefined);
+    assert.equal(await h.service.target("headless"), undefined);
+    assert.equal(await h.service.target("owner-prompt"), undefined);
+    assert.equal(h.service.holder("owner-prompt", 1), "owner");
     assert.equal(h.service.holder("laptop", 1), "owner", "a dialog this path never handed is the owner's, whatever the delivery service says");
     assert.equal(h.service.holder("member", 1), "agent", "a team member's dialog is the delivery service's to place");
   } finally { h.close(); }

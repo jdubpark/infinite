@@ -21,7 +21,7 @@ import { resumeFailed } from "./native-continuation.js";
 import { HOST_LOAD_REASON_PREFIX, LaunchHeldError, holdsHostLoadReason } from "./host-load.js";
 import { applyFuseReason, workLaunch } from "./fuse/rules.js";
 import type { FuseAdmission, FuseCheck, FuseGate } from "./fuse/types.js";
-import { HALT_RUNNING_TEAM, KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
+import { HALT_PAUSED_TEAM, KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 
 /** The mission's only view of projects; the project group service implements it. */
 export type ProjectGroupLookup = { get(id: string): ProjectGroup };
@@ -487,10 +487,10 @@ export class MissionService {
         const mission = stored.mission;
         if ((mission.status !== "planning" && mission.status !== "working") || !covers(mission.repoProjectIds, mission.id)) continue;
         try {
-          // Only a subteam that is working now: one waiting for input, paused, blocked, or ended stays as it is.
+          // Only a subteam that is working or waiting for input now: one paused, blocked, or ended stays as it is.
           const working = mission.subtasks.filter(item => {
             if (!item.teamId || item.status !== "running") return false;
-            try { return HALT_RUNNING_TEAM.has(this.teams.get(item.teamId).status); } catch (error) { if (notFound(error)) return false; throw error; }
+            try { return HALT_PAUSED_TEAM.has(this.teams.get(item.teamId).status); } catch (error) { if (notFound(error)) return false; throw error; }
           });
           mission.revision++; mission.status = "paused"; mission.reason = mark.reason;
           const token = randomUUID();
@@ -503,9 +503,13 @@ export class MissionService {
       return outcomes;
     });
   }
-  /** Host-internal: resumes each mission still paused, unchanged, under this halt's mark, with the owner's resume rules. */
+  /**
+   * Host-internal: resumes each mission still paused, unchanged, under this halt's mark, with the owner's resume rules.
+   * A mission that stays paused hands its reason to each subteam its halt paused before the mark ends, so a restart
+   * in between repeats that step and no subteam keeps a halt's reason once the halt is off.
+   */
   haltResume(haltId: string, heldBy: HaltHeldBy, keep: boolean) {
-    return this.enqueue(() => {
+    return this.enqueue(async () => {
       const outcomes: HaltOutcome[] = [];
       for (const stored of this.records.values()) {
         const mission = stored.mission, mark = stored.ownerHalt, base = { kind: "mission" as const, id: mission.id, title: mission.title };
@@ -513,10 +517,12 @@ export class MissionService {
         try {
           if (mission.status !== "paused" || mission.revision !== mark.revision) {
             if (mission.status === "paused" && isHaltReason(mission.reason)) mission.reason = LEFT_PAUSED;
+            if (mission.status === "paused") await this.settleHaltChildren(stored, mark, mission.reason ?? LEFT_PAUSED);
             this.endHaltMark(stored, mark, mission.status === "paused"); this.save(stored);
             outcomes.push({ ...base, result: "left", reason: LEFT_AS_IS }); continue;
           }
           if (keep) {
+            await this.settleHaltChildren(stored, mark, KEPT_PAUSED);
             this.endHaltMark(stored, mark, true); mission.reason = KEPT_PAUSED; this.save(stored);
             outcomes.push({ ...base, result: "kept", reason: KEPT_PAUSED }); continue;
           }
@@ -527,6 +533,7 @@ export class MissionService {
           }
           if (Date.now() >= this.deadlineMs(stored, Date.now())) {
             const reason = "This mission's time limit has expired. Start a new mission to approve more time.";
+            await this.settleHaltChildren(stored, mark, releaseRefusal(reason));
             this.endHaltMark(stored, mark, true); mission.reason = releaseRefusal(reason); this.save(stored);
             outcomes.push({ ...base, result: "refused", reason }); continue;
           }
@@ -702,6 +709,22 @@ export class MissionService {
     if (!live.has(mission.status)) return;
     mission.status = mission.decisions.some(decision => !decision.answer) ? "needs-input" : mission.subtasks.length ? "working" : "planning";
     mission.reason = undefined;
+  }
+  /**
+   * A release that leaves the mission paused: each subteam that its halt paused, and each one a withdrawn halt pause may
+   * already have reached, keeps its pause and shows `reason` instead of the halt's. Each subteam decides in its own
+   * queue, against the halt's token; one the pause never reached is not touched. A failure is recorded and the next
+   * subteam goes on.
+   */
+  private async settleHaltChildren(stored: Stored, mark: NonNullable<Stored["ownerHalt"]>, reason: string) {
+    const undelivered = stored.ops.filter(op => op.kind === "pause" && op.halt?.token === mark.token).map(op => op.teamId);
+    for (const teamId of new Set([...mark.children, ...undelivered])) {
+      try { await this.teams.haltSettleChild(teamId, mark.token, reason); }
+      catch (error) {
+        if (notFound(error)) continue;
+        this.event(stored, `The halt's reason on subteam ${teamId} could not be updated: ${error instanceof Error ? error.message : "the subteam could not be reached."}`);
+      }
+    }
   }
   /**
    * Ends the mission's halt mark. Every halt pause under its token that has not reached its subteam is withdrawn, so

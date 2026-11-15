@@ -209,8 +209,8 @@ The owner approved the direction on 2026-11-14 and, the same day, told the build
 
 Known limits at the first release, recorded so nobody reads them as covered:
 
-- A subteam that was waiting for input when a halt engaged is not paused. Its existing work continues.
-- A subteam the halt paused keeps the halt reason as its label after a release that keeps it paused.
+- A subteam that was waiting for input when a halt engaged is not paused. Its existing work continues. Closed by INF-259: a run that waits for input is paused where it waits and keeps its question.
+- A subteam the halt paused keeps the halt reason as its label after a release that keeps it paused. Closed by INF-259: it shows the kept-paused text.
 - A follow-up that fired just before a pause is delivered again after the resume. Delivery is at least once, never zero.
 - Notes take only the prompt room left beside the leading pending message. When that message has to be shortened to fit, every note is left out of that prompt, without a count.
 

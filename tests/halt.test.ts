@@ -88,6 +88,28 @@ function writeRun(f: Fixture, extra: Partial<TeamRun>) {
   return run.id;
 }
 
+/** A run whose coordinator asked the owner a question and stopped to wait for the answer. */
+function waitingRun(f: Fixture, extra: Partial<TeamRun> = {}) {
+  const memberId = randomUUID();
+  const member = { ...f.run.members[0]!, memberId, sessionId: randomUUID(), status: "waiting" as const };
+  const decision = { id: randomUUID(), memberId, revision: 1, question: "Which file should change?", options: ["a.txt", "b.txt"], createdAt: new Date().toISOString() };
+  return { id: writeRun(f, { status: "needs-input", members: [member], decisions: [decision], ...extra }), decisionId: decision.id };
+}
+
+/** A running goal whose active cycle is this team run. */
+function writeGoal(f: Fixture, teamId: string, status: "running" | "needs-input" = "running", id = randomUUID()) {
+  const at = new Date().toISOString();
+  const goal = {
+    id, projectId: "fixture", title: `Goal over ${teamId}`, objective: "Choose scoped work", successCriteria: "Evidence",
+    nonGoals: [], allowedPaths: ["."], evidence: [], maxRuns: 2, maxMinutes: 60, maxMembers: 4, parallelism: 1, revision: 1, status,
+    createdAt: at, updatedAt: at, deadlineAt: new Date(Date.now() + 60 * 60000).toISOString(), lineup: mixedLineup, memberCount: 0,
+    activeTeamId: teamId, cycles: [{ teamId, cycle: 1, goalRevision: 1, status: "implementing", startedAt: at, memberCount: 0 }],
+    steering: [], events: [], outcomes: [],
+  } as unknown as ProductGoal;
+  f.writeRecord("goal", goal.id, { goal, receipts: {}, fingerprint: "fixture" });
+  return goal.id;
+}
+
 function writeMission(f: Fixture, projectId: string, subtasks: unknown[] = [], id = randomUUID()) {
   const at = new Date().toISOString();
   const mission = {
@@ -423,13 +445,14 @@ test("a record that becomes readable again finishes the pass it left unsettled",
   } finally { f.close(); }
 });
 
-test("a mission halt pauses only working subteams and resumes only the ones it paused", async () => {
+test("a mission halt pauses its working and waiting subteams, and its release resumes each as it was paused", async () => {
   const f = schedulerFixture();
   const missionId = randomUUID();
   const child = (status: TeamRun["status"]) => writeRun(f, { status, missionId, title: `Subteam ${status}` } as Partial<TeamRun>);
-  const working = child("implementing"), waiting = child("needs-input"), turning = child("implementing");
+  const working = child("implementing"), turning = child("implementing");
+  const waiting = waitingRun(f, { missionId, title: "Subteam needs-input" } as Partial<TeamRun>);
   const subtask = (id: string, teamId: string) => ({ id, title: id, instructions: id, repoProjectId: "fixture", dependsOn: [], size: "team", status: "running", teamId });
-  writeMission(f, "fixture", [subtask("a", working), subtask("b", waiting), subtask("c", turning)], missionId);
+  writeMission(f, "fixture", [subtask("a", working), subtask("b", waiting.id), subtask("c", turning)], missionId);
   const teams = f.openTeam();
   const manager = { meta: () => { throw Object.assign(new Error("No session."), { code: "ENOENT" }); }, hostLoad: { held: () => undefined } } as unknown as Manager;
   const missions = new MissionService(f.config, f.key, manager, teams, { get: () => { throw new Error("Not queried in this test"); } });
@@ -441,27 +464,186 @@ test("a mission halt pauses only working subteams and resumes only the ones it p
   try {
     const engaged = await halt.engage(fixtureScope, { requestId: randomUUID() }, owner);
     assert.deepEqual(engaged.paused.map(item => item.kind), ["mission"], "the mission pauses its own subteams");
-    assert.deepEqual(stored.ops.map(op => `${op.kind}:${op.teamId}`), [`pause:${working}`, `pause:${turning}`], "no pause for a subteam waiting for input");
+    assert.deepEqual(stored.ops.map(op => `${op.kind}:${op.teamId}`), [`pause:${working}`, `pause:${waiting.id}`, `pause:${turning}`],
+      "a subteam waiting for input is paused too");
 
     // One subteam starts waiting for input before the mission delivers its pause.
     (teams as unknown as { record(id: string): { run: TeamRun } }).record(turning).run.status = "needs-input";
     await applyOps();
-    assert.equal(teams.get(working).status, "paused");
-    assert.equal(teams.get(waiting).status, "needs-input");
-    assert.equal(teams.get(turning).status, "needs-input", "a pause never reaches a subteam that now waits for input");
-    assert.deepEqual(stored.ownerHalt?.children, [working]);
+    for (const id of [working, waiting.id, turning]) {
+      assert.equal(teams.get(id).status, "paused");
+      assert.equal(teams.get(id).reason, PROJECT_TEXT);
+    }
+    assert.deepEqual(stored.ownerHalt?.children, [working, waiting.id, turning]);
     await step(teams, working);
 
-    const revisions = { waiting: teams.get(waiting).revision, turning: teams.get(turning).revision };
+    const revisions = { waiting: teams.get(waiting.id).revision, turning: teams.get(turning).revision };
     const released = await halt.release(fixtureScope, { requestId: randomUUID() }, owner);
     assert.deepEqual(released.resumed.map(item => item.kind), ["mission"]);
-    assert.deepEqual(stored.ops.map(op => `${op.kind}:${op.teamId}`), [`resume:${working}`], "only the subteam the halt paused resumes");
+    assert.deepEqual(stored.ops.map(op => `${op.kind}:${op.teamId}`), [`resume:${working}`, `resume:${waiting.id}`, `resume:${turning}`]);
     await applyOps();
-    assert.equal(teams.get(working).status, "planning");
-    assert.equal(teams.get(waiting).status, "needs-input");
+    assert.equal(teams.get(working).status, "planning", "a working subteam resumes with a fresh plan");
+    assert.equal(teams.get(waiting.id).status, "needs-input", "a waiting subteam resumes where it waited");
     assert.equal(teams.get(turning).status, "needs-input");
-    assert.deepEqual({ waiting: teams.get(waiting).revision, turning: teams.get(turning).revision }, revisions, "neither waiting subteam replans");
+    assert.deepEqual({ waiting: teams.get(waiting.id).revision, turning: teams.get(turning).revision }, revisions, "neither waiting subteam replans");
+    assert.equal(teams.get(waiting.id).decisions[0]!.answer, undefined, "its question is still open");
   } finally { halt.stop(); missions.close(); f.close(); }
+});
+
+test("a halt pauses a run that waits for input where it stands: an answer during the halt starts nothing, and the release keeps the question", async () => {
+  const f = schedulerFixture();
+  const answered = waitingRun(f), open = waitingRun(f);
+  const teams = f.openTeam();
+  const halt = new HaltService({ config: f.config, key: f.key });
+  halt.useServices({ routines: noRoutines, goals: noRoutines, missions: noRoutines, teams }, () => false);
+  const both = [answered.id, open.id].sort();
+  try {
+    const engaged = await halt.engage(fixtureScope, { requestId: randomUUID() }, owner);
+    assert.deepEqual(engaged.paused.map(item => item.id).sort(), both, "a run waiting for input is paused");
+    for (const id of both) {
+      assert.equal(teams.get(id).status, "paused");
+      assert.equal(teams.get(id).reason, PROJECT_TEXT);
+      assert.equal(teams.get(id).revision, 1);
+    }
+
+    // The owner answers one question during the halt: the answer is kept, and nothing starts.
+    await teams.answer(answered.id, answered.decisionId, { requestId: randomUUID(), revision: 1, text: "Change a.txt" });
+    for (let pass = 0; pass < 2; pass++) await step(teams, answered.id);
+    assert.equal(f.launches.length, 0, "an answer given during the halt starts nothing");
+    assert.equal(teams.get(answered.id).members.length, 1, "no replacement is queued");
+    assert.equal(teams.get(answered.id).status, "paused");
+    assert.equal(teams.get(answered.id).reason, PROJECT_TEXT);
+
+    const released = await halt.release(fixtureScope, { requestId: randomUUID() }, owner);
+    assert.deepEqual(released.resumed.map(item => item.id).sort(), both);
+    for (const id of both) {
+      assert.equal(teams.get(id).status, "needs-input", "the release resumes the run where it waited");
+      assert.equal(teams.get(id).revision, 1, "without a fresh plan");
+      assert.equal(teams.get(id).reason, undefined);
+    }
+    assert.equal(teams.get(answered.id).decisions[0]!.answer, "Change a.txt", "the answer given during the halt is kept");
+    assert.equal(teams.get(open.id).decisions[0]!.answer, undefined, "the open question is still there");
+
+    await step(teams, answered.id); await step(teams, answered.id);
+    assert.equal(f.launches.length, 1, "after the release the answer starts the requesting member's next attempt");
+    assert.match(f.launches[0]!.prompt, /User answered: Change a\.txt/);
+    await teams.answer(open.id, open.decisionId, { requestId: randomUUID(), revision: 1, text: "Change b.txt" });
+    assert.equal(teams.get(open.id).decisions[0]!.answer, "Change b.txt", "the kept question can be answered after the release");
+  } finally { halt.stop(); f.close(); }
+});
+
+test("a goal whose team waits for input is paused by the halt, and the release resumes the team with its question", async () => {
+  const f = schedulerFixture();
+  const goalId = randomUUID();
+  const context = { id: goalId, revision: 1, cycle: 1, successCriteria: "Evidence", nonGoals: [], allowedPaths: ["."], evidence: [], previousWork: [],
+    deadlineAt: new Date(Date.now() + 60 * 60000).toISOString(), maxMembers: 4 };
+  const team = waitingRun(f, { title: "Goal cycle", goal: context });
+  const goal = writeGoal(f, team.id, "needs-input", goalId);
+  const teams = f.openTeam();
+  const goals = new GoalService(f.config, f.key, teams);
+  const halt = new HaltService({ config: f.config, key: f.key });
+  halt.useServices({ routines: noRoutines, goals, missions: noRoutines, teams }, id => goals.ownsActiveTeam(id));
+  try {
+    const engaged = await halt.engage(fixtureScope, { requestId: randomUUID() }, owner);
+    assert.deepEqual(engaged.paused.map(item => `${item.kind}:${item.id}`), [`goal:${goal}`], "the goal pauses its own waiting team");
+    assert.equal(goals.get(goal).status, "paused");
+    await goalStep(goals, goal);
+    assert.equal(teams.get(team.id).status, "paused");
+    assert.equal(teams.get(team.id).reason, PROJECT_TEXT);
+    assert.equal(teams.get(team.id).revision, 1);
+
+    // The owner answers through the goal during the halt: the answer is kept, and nothing starts.
+    await goals.answer(team.id, team.decisionId, { requestId: randomUUID(), revision: 1, text: "Change a.txt" });
+    await step(teams, team.id); await step(teams, team.id);
+    assert.equal(f.launches.length, 0, "an answer given during the halt starts nothing");
+    assert.equal(teams.get(team.id).status, "paused");
+
+    const released = await halt.release(fixtureScope, { requestId: randomUUID() }, owner);
+    assert.deepEqual(released.resumed.map(item => `${item.kind}:${item.id}`), [`goal:${goal}`]);
+    await goalStep(goals, goal);
+    assert.equal(teams.get(team.id).status, "needs-input", "the goal's team resumes where it waited");
+    assert.equal(teams.get(team.id).revision, 1);
+    assert.equal(teams.get(team.id).decisions[0]!.answer, "Change a.txt", "the answer given during the halt is kept");
+  } finally { halt.stop(); goals.close(); f.close(); }
+});
+
+/**
+ * One standalone run, one goal's run, and one mission's subteam, each working or each waiting for input, with the halt,
+ * goal, and mission services over them. `settle` delivers the goal's and the mission's pauses and lets every run stop.
+ */
+function keepScenario(f: Fixture, waiting: boolean) {
+  const run = (extra: Partial<TeamRun>) => waiting ? waitingRun(f, extra).id : writeRun(f, { status: "implementing", ...extra });
+  const standalone = run({ title: "Standalone" }), goalTeam = run({ title: "Goal cycle" });
+  const goal = writeGoal(f, goalTeam, waiting ? "needs-input" : "running");
+  const missionId = randomUUID(), subteam = run({ missionId, title: "Subteam" } as Partial<TeamRun>);
+  writeMission(f, "fixture", [{ id: "a", title: "a", instructions: "a", repoProjectId: "fixture", dependsOn: [], size: "team", status: "running", teamId: subteam }], missionId);
+  const teams = f.openTeam();
+  const goals = new GoalService(f.config, f.key, teams);
+  const manager = { meta: () => { throw Object.assign(new Error("No session."), { code: "ENOENT" }); }, hostLoad: { held: () => undefined } } as unknown as Manager;
+  const missions = new MissionService(f.config, f.key, manager, teams, { get: () => { throw new Error("Not queried in this test"); } });
+  const stored = (missions as unknown as { records: Map<string, { mission: Mission }> }).records.get(missionId)!;
+  const applyOps = () => (missions as unknown as { applyOps(stored: unknown): Promise<void> }).applyOps(stored);
+  const halt = new HaltService({ config: f.config, key: f.key });
+  halt.useServices({ routines: noRoutines, goals, missions, teams }, id => goals.ownsActiveTeam(id) || missions.ownsActiveSubteam(id));
+  const runs = [standalone, goalTeam, subteam];
+  const settle = async () => { await goalStep(goals, goal); await applyOps(); for (const id of runs) await step(teams, id); };
+  return { teams, goals, missions, halt, stored, applyOps, settle, runs, standalone, goalTeam, goal, subteam, missionId,
+    close: () => { halt.stop(); goals.close(); missions.close(); } };
+}
+
+test("a keep-paused release leaves the kept-paused text, not the halt reason, on every item the halt paused", async () => {
+  const f = schedulerFixture();
+  const s = keepScenario(f, false);
+  try {
+    const engaged = await s.halt.engage(fixtureScope, { requestId: randomUUID() }, owner);
+    assert.deepEqual(engaged.paused.map(item => item.kind), ["goal", "mission", "team"]);
+    await s.settle();
+    for (const id of s.runs) assert.equal(s.teams.get(id).status, "paused");
+    assert.equal(s.teams.get(s.subteam).reason, PROJECT_TEXT);
+
+    const kept = await s.halt.release(fixtureScope, { requestId: randomUUID(), keepPaused: true }, owner);
+    assert.deepEqual(kept.resumed, []);
+    assert.deepEqual(kept.notResumed.map(item => [item.kind, item.reason]), [["team", KEPT_PAUSED], ["mission", KEPT_PAUSED], ["goal", KEPT_PAUSED]]);
+    assert.equal(s.teams.get(s.subteam).reason, KEPT_PAUSED, "the mission's subteam no longer shows the halt's reason");
+    for (const id of s.runs) {
+      assert.equal(s.teams.get(id).status, "paused");
+      assert.equal(s.teams.get(id).reason, KEPT_PAUSED, `${s.teams.get(id).title} says the owner kept it paused`);
+    }
+    assert.equal(s.goals.get(s.goal).reason, KEPT_PAUSED);
+    assert.equal(s.stored.mission.reason, KEPT_PAUSED);
+  } finally { s.close(); f.close(); }
+});
+
+test("a keep-paused release keeps a waiting run where it waits, and the owner's later resume continues it with its question", async () => {
+  const f = schedulerFixture();
+  const s = keepScenario(f, true);
+  try {
+    const engaged = await s.halt.engage(fixtureScope, { requestId: randomUUID() }, owner);
+    assert.deepEqual(engaged.paused.map(item => item.kind), ["goal", "mission", "team"], "waiting work is paused too");
+    await s.settle();
+    for (const id of s.runs) assert.equal(s.teams.get(id).status, "paused");
+
+    await s.halt.release(fixtureScope, { requestId: randomUUID(), keepPaused: true }, owner);
+    for (const id of s.runs) {
+      assert.equal(s.teams.get(id).status, "paused");
+      assert.equal(s.teams.get(id).reason, KEPT_PAUSED, `${s.teams.get(id).title} says the owner kept it paused`);
+    }
+    assert.equal(s.goals.get(s.goal).reason, KEPT_PAUSED);
+    assert.equal(s.stored.mission.reason, KEPT_PAUSED);
+
+    // The owner resumes each later: the run, the goal, and the mission.
+    await s.teams.resume(s.standalone, { requestId: randomUUID(), revision: 1 });
+    await s.goals.resume(s.goal, { requestId: randomUUID(), revision: s.goals.get(s.goal).revision });
+    await goalStep(s.goals, s.goal);
+    await s.missions.resume(s.missionId, { requestId: randomUUID(), revision: s.stored.mission.revision });
+    await s.applyOps();
+    for (const id of s.runs) {
+      const run = s.teams.get(id);
+      assert.equal(run.status, "needs-input", `${run.title} continues where it waited`);
+      assert.equal(run.revision, 1, `${run.title} does not replan`);
+      assert.equal(run.decisions[0]!.answer, undefined, `${run.title} still has its question`);
+    }
+  } finally { s.close(); f.close(); }
 });
 
 test("a routine pauses and resumes under a halt, and host and project halts overlap in either order", async () => {
@@ -515,6 +697,13 @@ test("a routine pauses and resumes under a halt, and host and project halts over
     assert.deepEqual((await release(demo)).resumed.map(item => item.id), [routine.id]);
     await routines.tick();
     assert.equal(started.length, 1, "the routine starts its goal once no halt covers it");
+
+    // A keep-paused release leaves the routine paused with the kept-paused text.
+    await engage(demo);
+    const kept = await halt.release(demo, { requestId: randomUUID(), keepPaused: true }, owner);
+    assert.deepEqual(kept.notResumed.map(item => [item.id, item.reason]), [[routine.id, KEPT_PAUSED]]);
+    assert.equal(routines.get(routine.id).status, "paused");
+    assert.equal(routines.get(routine.id).reason, KEPT_PAUSED);
   } finally { halt.stop(); routines.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -547,15 +736,16 @@ test("a subteam's halt pause and resume are decided in its own queue, and the ow
     await new Promise(resolve => setTimeout(resolve, 20));
     open();
     await tick; await delivered;
-    assert.equal(teams.get(turning).status, "needs-input", "a subteam waiting for input is not paused");
-    assert.deepEqual(stored.ownerHalt?.children, [ownerPaused, ownerCycled], "and is not recorded");
+    assert.equal(teams.get(turning).status, "paused", "a subteam that now waits for input is held where it waits");
+    assert.equal(teams.get(turning).revision, turningRevision);
+    assert.deepEqual(stored.ownerHalt?.children, [ownerPaused, ownerCycled, turning], "and is recorded");
     await step(teams, ownerPaused); await step(teams, ownerCycled);
 
     // (a) The owner pauses a subteam the halt paused.
     await ownerAction(ownerPaused, "pause");
     await step(teams, ownerPaused);
     await halt.release(fixtureScope, { requestId: randomUUID() }, owner);
-    assert.deepEqual(stored.ops.map(op => `${op.kind}:${op.teamId}`), [`resume:${ownerPaused}`, `resume:${ownerCycled}`]);
+    assert.deepEqual(stored.ops.map(op => `${op.kind}:${op.teamId}`), [`resume:${ownerPaused}`, `resume:${ownerCycled}`, `resume:${turning}`]);
 
     // (b) Before the queued resumes are delivered, the owner resumes one subteam and pauses it again.
     await ownerAction(ownerCycled, "resume");

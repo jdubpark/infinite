@@ -21,8 +21,14 @@ import { correctionSchema, type CriterionInput } from "./objective-input.js";
 import { objectiveError, recordView, type ObjectiveRecordView } from "./objective-record.js";
 
 type Action = { requestId: string; revision: number };
-/** `parallelism` remains readable only so a pre-migration queued owner control can be discarded safely. */
-type PendingControl = { action: "pause" | "resume" | "cancel" | "steer" | "parallelism"; requestId: string; teamId: string; revision: number; text?: string; parallelism?: number };
+/**
+ * `parallelism` remains readable only so a pre-migration queued owner control can be discarded safely. `halt` is set on
+ * the owner's halt pause: the run decides in its own queue under the token and shows the reason. A release that read
+ * the control without it applies the owner's pause instead.
+ */
+type PendingControl = { action: "pause" | "resume" | "cancel" | "steer" | "parallelism"; requestId: string; teamId: string; revision: number; text?: string; parallelism?: number; halt?: HaltRunMark };
+/** The run a goal's halt pause was sent to, and the token that pause marks it with. */
+type HaltRunMark = { token: string; reason: string };
 type GoalExtensionIntent = Action & { minutes: number; fingerprint: string; teamId?: string; targetDeadlineAt?: string; targetCeilingAt?: string; failures?: number };
 /** `wake` is the standing goal's pending wake this launch consumed, returned to the goal if the run is never created. */
 type PendingLaunch = { request: CreateTeam; context: TeamGoalContext; autonomy?: AutonomyMode; wake?: PendingWake };
@@ -37,8 +43,11 @@ type Stored = {
   extensionIntent?: GoalExtensionIntent;
   /** Standing goals: after a retryable failure to create a cycle's run, no cycle starts before this time. */
   launchRetryAt?: string;
-  /** Set when the owner's halt paused this goal, with the goal revision it left. Any owner action moves the revision on. */
-  ownerHalt?: { haltId: string; revision: number };
+  /**
+   * Set when the owner's halt paused this goal, with the goal revision it left. Any owner action moves the revision on.
+   * `run` names the active run the halt's pause was sent to, so a release that leaves the goal paused updates that run.
+   */
+  ownerHalt?: { haltId: string; revision: number; run?: { teamId: string; token: string } };
   /** The objective record (objective-goals.ts). Outside `goal`, so no view or digest reads it. */
   objectiveRecord?: unknown;
   objectiveNotice?: ObjectiveUnavailable;
@@ -211,9 +220,11 @@ export class GoalService {
     return this.enqueue(async () => {
       const team = this.teams.get(teamId);
       if (!team.goal) throw new TeamError(409, "not-a-goal-team", "This team does not belong to a goal.");
-      return this.teams.answer(teamId, decisionId, body, () => {
+      // A goal the halt paused still takes the answer for its run held where it waits; the run starts nothing until it resumes.
+      return this.teams.answer(teamId, decisionId, body, held => {
         const { goal } = this.record(team.goal!.id);
-        if (goal.activeTeamId !== teamId || !["running", "needs-input"].includes(goal.status) || Date.now() >= Date.parse(goal.deadlineAt))
+        const live = ["running", "needs-input"].includes(goal.status) || held && goal.status === "paused";
+        if (goal.activeTeamId !== teamId || !live || Date.now() >= Date.parse(goal.deadlineAt))
           throw new TeamError(409, "goal-not-running", "Only the active team of a running goal can receive a decision.");
       });
     });
@@ -280,7 +291,7 @@ export class GoalService {
     stored.receipts[body.requestId] = digest({ action, ...body });
     stored.goal.revision++;
   }
-  private setControl(stored: Stored, action: PendingControl["action"], options: { text?: string; parallelism?: number } = {}) {
+  private setControl(stored: Stored, action: PendingControl["action"], options: { text?: string; parallelism?: number; halt?: HaltRunMark } = {}) {
     if (!stored.goal.activeTeamId) return;
     let team: TeamView;
     try { team = this.teams.get(stored.goal.activeTeamId); }
@@ -321,21 +332,26 @@ export class GoalService {
     });
   }
   /**
-   * Host-internal: the owner's halt pauses each running goal in scope as the owner's pause does, without an owner
-   * request, and marks it with the revision it leaves. A pending steer is delivered first, never dropped.
+   * Host-internal: the owner's halt pauses each running goal in scope, and each goal whose run waits for input, as the
+   * owner's pause does, without an owner request, and marks it with the revision it leaves. A pending steer is delivered
+   * first, never dropped. The goal's run gets the halt's own pause: a working run stops, and one that waits for input is
+   * held where it waits, so its question survives the halt.
    */
   haltPause(mark: HaltMark, covers: HaltCovers) {
+    const pausable = (goal: ProductGoal) => goal.status === "running" || goal.status === "needs-input";
     return this.enqueue(async () => {
       const outcomes: HaltOutcome[] = [];
       for (const stored of this.records.values()) {
         const goal = stored.goal;
-        if (goal.status !== "running" || !covers([goal.projectId], goal.id)) continue;
+        if (!pausable(goal) || !covers([goal.projectId], goal.id)) continue;
         try {
           if (stored.control?.action === "steer" && !await this.applyControl(stored)) throw new TeamError(409, "goal-control-pending", "The previous goal action is still being applied.");
-          if (goal.status !== "running") continue;
+          if (!pausable(goal)) continue;
           goal.revision++; goal.status = "paused"; goal.reason = mark.reason;
-          this.setControl(stored, "pause");
-          stored.ownerHalt = { haltId: mark.haltId, revision: goal.revision };
+          const token = randomUUID();
+          this.setControl(stored, "pause", { halt: { token, reason: mark.reason } });
+          const sent = stored.control?.halt?.token === token ? { run: { teamId: stored.control.teamId, token } } : {};
+          stored.ownerHalt = { haltId: mark.haltId, revision: goal.revision, ...sent };
           this.event(stored, `Goal paused: ${mark.reason}`); this.save(stored);
           outcomes.push({ kind: "goal", id: goal.id, title: goal.title, result: "paused" });
         } catch (error) { outcomes.push(pauseFailure("goal", goal.id, goal.title, error)); }
@@ -343,46 +359,68 @@ export class GoalService {
       return outcomes;
     });
   }
-  /** Host-internal: resumes each goal still paused, unchanged, under this halt's mark, with the owner's resume rules. */
+  /**
+   * Host-internal: resumes each goal still paused, unchanged, under this halt's mark, with the owner's resume rules. A
+   * goal that stays paused hands its reason to the run its halt paused before the mark ends, so a restart in between
+   * repeats that step and the run never keeps a halt's reason once the halt is off.
+   */
   haltResume(haltId: string, heldBy: HaltHeldBy, keep: boolean) {
     return this.enqueue(async () => {
       const outcomes: HaltOutcome[] = [];
       for (const stored of this.records.values()) {
         const goal = stored.goal, mark = stored.ownerHalt, base = { kind: "goal" as const, id: goal.id, title: goal.title };
         if (mark?.haltId !== haltId) continue;
-        const refuse = (reason: string) => {
+        const refuse = async (reason: string) => {
+          await this.settleHaltRun(stored, mark, releaseRefusal(reason));
           stored.ownerHalt = undefined; goal.reason = releaseRefusal(reason); this.save(stored);
           outcomes.push({ ...base, result: "refused", reason });
         };
         try {
           if (goal.status !== "paused" || goal.revision !== mark.revision) {
             if (goal.status === "paused" && isHaltReason(goal.reason)) goal.reason = LEFT_PAUSED;
+            if (goal.status === "paused") await this.settleHaltRun(stored, mark, goal.reason ?? LEFT_PAUSED);
             stored.ownerHalt = undefined; this.save(stored);
             outcomes.push({ ...base, result: "left", reason: LEFT_AS_IS }); continue;
           }
           if (keep) {
+            await this.settleHaltRun(stored, mark, KEPT_PAUSED);
             stored.ownerHalt = undefined; goal.reason = KEPT_PAUSED; this.save(stored);
             outcomes.push({ ...base, result: "kept", reason: KEPT_PAUSED }); continue;
           }
-          if (stored.control && !await this.applyControl(stored)) { refuse("The previous goal action is still being applied."); continue; }
+          if (stored.control && !await this.applyControl(stored)) { await refuse("The previous goal action is still being applied."); continue; }
           const other = heldBy([goal.projectId]);
           if (other) {
-            stored.ownerHalt = { haltId: other.haltId, revision: goal.revision }; goal.reason = other.reason; this.save(stored);
+            stored.ownerHalt = { ...mark, haltId: other.haltId, revision: goal.revision }; goal.reason = other.reason; this.save(stored);
             outcomes.push({ ...base, result: "held", reason: STILL_HALTED }); continue;
           }
           // The owner's resume rules. A standing goal's time limit belongs to its cycle, so a halt that outlasts the
           // cycle's window does not end the goal; it resumes only while its project is still autonomous.
-          if (goal.standing && autonomyOf(this.config.projects.find(value => value.id === goal.projectId)) !== "autonomous") { refuse("This standing goal can resume only after its project is autonomous again."); continue; }
-          if (!goal.standing && Date.now() >= Date.parse(goal.deadlineAt)) { refuse("This goal's time limit has expired. Extend it or start a new goal to approve more time."); continue; }
+          if (goal.standing && autonomyOf(this.config.projects.find(value => value.id === goal.projectId)) !== "autonomous") { await refuse("This standing goal can resume only after its project is autonomous again."); continue; }
+          if (!goal.standing && Date.now() >= Date.parse(goal.deadlineAt)) { await refuse("This goal's time limit has expired. Extend it or start a new goal to approve more time."); continue; }
           goal.revision++; goal.status = "running"; goal.reason = undefined;
           this.setControl(stored, "resume");
           stored.ownerHalt = undefined;
           this.event(stored, "Goal resumed: the owner released the halt."); this.save(stored);
           outcomes.push({ ...base, result: "resumed" });
-        } catch (error) { refuse(error instanceof Error ? error.message : "The goal could not resume."); }
+        } catch (error) { await refuse(error instanceof Error ? error.message : "The goal could not resume."); }
       }
       return outcomes;
     });
+  }
+  /**
+   * A release that leaves the goal paused: the run its halt paused keeps its pause and shows `reason` instead of the
+   * halt's. A halt pause not yet delivered is delivered with that reason; one already delivered is updated in the run's
+   * own queue, against the token. Never throws: a failure is recorded on the goal and the release goes on.
+   */
+  private async settleHaltRun(stored: Stored, mark: NonNullable<Stored["ownerHalt"]>, reason: string) {
+    const run = mark.run;
+    if (!run) return;
+    if (stored.control?.halt?.token === run.token) { stored.control = { ...stored.control, halt: { token: run.token, reason } }; return; }
+    try { await this.teams.haltSettleChild(run.teamId, run.token, reason); }
+    catch (error) {
+      if (error instanceof TeamError && error.code === "team-not-found") return;
+      this.event(stored, `The halt's reason on the goal's run could not be updated: ${error instanceof Error ? error.message : "the run could not be reached."}`);
+    }
   }
   private async finishExtension(stored: Stored, intent: GoalExtensionIntent) {
     try {
@@ -585,6 +623,7 @@ export class GoalService {
     const body = { requestId: control.requestId, revision: control.revision };
     try {
       if (control.action === "steer") await this.teams.steer(control.teamId, { ...body, text: control.text! });
+      else if (control.action === "pause" && control.halt) await this.teams.haltPauseChild(control.teamId, control.halt.token, control.halt.reason);
       else await this.teams[control.action](control.teamId, body);
     } catch (error) {
       if (this.closed) return false;

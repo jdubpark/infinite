@@ -13,10 +13,11 @@ import { canonicalJson } from "./evidence/crypto.js";
 import { MAX_SHELL_DEPTH, quoteWord, readShell, remoteOperand, resolveWord, type PathResolver, type SimpleCommand } from "./permission-shell.js";
 
 /** Bumped by any change to the rule code below, or to the shell reading it uses, that is not a change to the lists. */
-export const CLASS_RULES_VERSION = 4;
+export const CLASS_RULES_VERSION = 5;
 
 /**
- * The host's lists. Commands are word prefixes after wrappers (sudo, env, timeout) are removed. Paths
+ * The host's lists. Commands are word prefixes after wrappers (sudo, env, timeout) are removed; option
+ * words between a program and its subcommand words do not hide them (`runsPattern`). Paths
  * are segment sequences that match anywhere in a resolved path, so they do not depend on whose home
  * directory a session uses.
  */
@@ -47,6 +48,43 @@ export const PERMISSION_CLASS_LISTS = {
     ["cargo", "login"], ["gem", "signin"], ["poetry", "config", "pypi-token*"], ["twine", "register"],
     ["kubectl", "config", "set-credentials"], ["pass", "insert"], ["pass", "generate"], ["keyring", "set"],
   ],
+  /**
+   * Options of the programs these lists name that take the next word as their value, so the value is not
+   * read as a subcommand (`aws --profile p configure`). A word after any other option written without `=`
+   * may also be a value: a subcommand behind one is raised, not classed.
+   */
+  valuedGlobalOptions: {
+    git: ["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix"],
+    npm: ["-C", "--prefix", "--registry", "--userconfig", "--globalconfig", "--cache", "--loglevel", "-w", "--workspace", "--scope", "--otp", "--auth-type", "--tag", "--access", "--location"],
+    pnpm: ["-C", "--dir", "-F", "--filter", "--registry", "--loglevel", "--reporter", "--workspace-dir"],
+    yarn: ["--cwd", "--registry"],
+    gh: ["-R", "--repo", "--hostname"],
+    docker: ["--config", "-c", "--context", "-H", "--host", "-l", "--log-level", "--tlscacert", "--tlscert", "--tlskey"],
+    podman: ["-c", "--connection", "--url", "--identity", "--root", "--runroot", "--log-level", "--storage-driver", "--runtime", "--tmpdir"],
+    helm: ["--kube-context", "--kubeconfig", "-n", "--namespace", "--registry-config", "--repository-config", "--repository-cache", "--kube-apiserver", "--kube-token"],
+    aws: ["--profile", "--region", "--output", "--endpoint-url", "--query", "--ca-bundle", "--cli-read-timeout", "--cli-connect-timeout", "--color", "--cli-binary-format"],
+    gcloud: ["--project", "--account", "--configuration", "--verbosity", "--impersonate-service-account", "--billing-project", "--format", "--flags-file", "--trace-token"],
+    az: ["--subscription", "-o", "--output", "--query"],
+    firebase: ["-P", "--project", "--token", "-c", "--config", "--account"],
+    vercel: ["-t", "--token", "-S", "--scope", "--cwd", "-Q", "--global-config", "-A", "--local-config", "-T", "--team"],
+    netlify: ["--auth", "--filter"],
+    heroku: ["-a", "--app", "-r", "--remote"],
+    wrangler: ["-c", "--config", "-e", "--env", "--cwd"],
+    fly: ["-a", "--app", "-c", "--config", "-t", "--access-token"],
+    flyctl: ["-a", "--app", "-c", "--config", "-t", "--access-token"],
+    op: ["--account", "--config", "--session", "--encoding", "--format"],
+    bw: ["--session"],
+    gpg: ["--homedir", "--keyring", "--default-key", "-u", "--local-user", "-r", "--recipient", "-o", "--output", "--passphrase", "--passphrase-file", "--pinentry-mode", "--keyserver"],
+    codex: ["-c", "--config", "-m", "--model", "-p", "--profile", "-C", "--cd", "-s", "--sandbox", "-a", "--ask-for-approval"],
+    claude: ["--model", "--settings", "--add-dir", "--mcp-config", "--permission-mode", "--output-format", "--input-format", "--setting-sources", "--session-id", "--fallback-model", "--append-system-prompt"],
+    opencode: ["--log-level", "-m", "--model"],
+    cargo: ["--config", "-Z", "--color"],
+    poetry: ["-C", "--directory", "-P", "--project"],
+    kubectl: ["--kubeconfig", "--context", "--cluster", "--user", "-n", "--namespace", "-s", "--server", "--token", "--as", "--as-group", "--request-timeout"],
+    doctl: ["-t", "--access-token", "--context", "-c", "--config", "-o", "--output", "-u", "--api-url"],
+    systemctl: ["-H", "--host", "-M", "--machine", "--root", "-t", "--type", "-p", "--property", "-s", "--signal", "--state", "--kill-whom", "-n", "--lines", "-o", "--output", "--job-mode"],
+    defaults: ["-host"],
+  },
   /** Credential store locations. A read or write of one outside the session root is the credentials class. */
   credentialPaths: [
     ".ssh", ".aws", ".azure", ".config/gcloud", ".config/gh", ".config/hub", ".docker/config.json", ".npmrc", ".netrc",
@@ -301,35 +339,90 @@ function relativeToSession(request: PermissionRequest, path: string): string | u
   return undefined;
 }
 
-function wordsMatch(argv: readonly string[], pattern: readonly string[]): boolean {
-  if (argv.length < pattern.length) return false;
-  return pattern.every((want, index) => {
-    const have = index === 0 ? posix.basename(argv[0]) : argv[index];
-    return want.endsWith("*") ? have.startsWith(want.slice(0, -1)) : have === want;
-  });
+const optionWord = (word: string | undefined) => word !== undefined && word.length > 1 && word.startsWith("-");
+/** An option that may take the next word as its value: one written without `=`. */
+const mayTakeValue = (word: string | undefined) => optionWord(word) && !word!.includes("=");
+const wordMatches = (have: string, want: string) => want.endsWith("*") ? have.startsWith(want.slice(0, -1)) : have === want;
+const valuedOptions = (program: string): readonly string[] =>
+  (PERMISSION_CLASS_LISTS.valuedGlobalOptions as Record<string, readonly string[] | undefined>)[program] ?? [];
+
+/**
+ * Whether `argv` runs `pattern`: the program by basename, then each further pattern word in order. An
+ * option word between them does not hide a subcommand (`npm --silent login`), and neither does the value
+ * of an option the program is known to take one for (`aws --profile p configure`). With `loose`, a word
+ * right after any option written without `=` may also be its value (`npm --otp 123456 login`); a pattern
+ * that matches only so is a raise, never a class. A pattern word ending in `*` matches a prefix.
+ */
+function runsPattern(argv: readonly string[], pattern: readonly string[], loose = false): boolean {
+  if (!argv.length || !pattern.length || !wordMatches(posix.basename(argv[0]), pattern[0])) return false;
+  const valued = valuedOptions(posix.basename(argv[0]));
+  const from = (skipAnyValue: boolean) => {
+    let index = 1;
+    for (const want of pattern.slice(1)) {
+      for (;; index++) {
+        const word = argv[index];
+        if (word === undefined) return false;
+        if (wordMatches(word, want)) break;
+        if (optionWord(word)) { if (!skipAnyValue && mayTakeValue(word) && valued.includes(word)) index++; continue; }
+        if (skipAnyValue && mayTakeValue(argv[index - 1])) continue;
+        return false;
+      }
+      index++;
+    }
+    return true;
+  };
+  return from(false) || (loose && from(true));
 }
 
-/** The command's words with options between the subcommands removed, for prefix matching (`git -C x config` reads as `git config`). */
-function commandWords(command: SimpleCommand): string[] {
+/** The command with the options between the program and its first subcommand removed, as commandWords skips them. */
+function leadingOptionsRemoved(command: SimpleCommand, loose: boolean): string[] {
   const [head, ...rest] = command.argv;
-  if (command.name === "git") {
-    const words = [head];
-    for (let index = 0; index < rest.length; index++) {
-      if (["-C", "-c", "--git-dir", "--work-tree", "--namespace"].includes(rest[index])) { index++; continue; }
-      if (rest[index].startsWith("-") && words.length === 1) continue;
-      words.push(rest[index]);
-    }
-    return words;
+  if (head === undefined) return [];
+  const valued = valuedOptions(command.name);
+  let index = 0;
+  for (; index < rest.length && optionWord(rest[index]); index++)
+    if (mayTakeValue(rest[index]) && (loose || valued.includes(rest[index]))) index++;
+  return [head, ...rest.slice(index)];
+}
+
+/**
+ * Whether the host's destructive detector matches the command: as written, or with the options between
+ * its program and subcommand removed (`git -C dir clean -fdx`, `kubectl -n prod delete pod x`), whose
+ * patterns are a program followed by its subcommand.
+ */
+function destructiveCommand(command: SimpleCommand, loose: boolean): boolean {
+  return [command.words, leadingOptionsRemoved(command, false), ...(loose ? [leadingOptionsRemoved(command, true)] : [])]
+    .some(words => words.length > 0 && matchDestructive(words.map(quoteWord).join(" ")) !== null);
+}
+
+/**
+ * The command's words for subcommand matching: the program, then its words with options removed, and
+ * with the value of an option the program is known to take one for (`git -C x config` reads as `git
+ * config`). With `loose`, the word after any option written without `=` is removed too.
+ */
+function commandWords(command: SimpleCommand, loose = false): string[] {
+  const [head, ...rest] = command.argv;
+  if (head === undefined) return [];
+  const valued = valuedOptions(command.name);
+  const words = [head];
+  for (let index = 0; index < rest.length; index++) {
+    const word = rest[index];
+    if (!optionWord(word)) words.push(word);
+    else if (mayTakeValue(word) && (loose || valued.includes(word))) index++;
   }
-  return command.argv;
+  return words;
 }
 
 const hostOf = (url: URL) => url.hostname.toLowerCase().replace(/\.$/, "");
 const hostListed = (host: string, list: readonly string[]) =>
   list.some(entry => entry.startsWith(".") ? host.endsWith(entry) || host === entry.slice(1) : host === entry);
 
-function isGlobalSettingsCommand(command: SimpleCommand, request: PermissionRequest, real?: PathResolver): boolean {
-  const words = commandWords(command);
+function isGlobalSettingsCommand(command: SimpleCommand, request: PermissionRequest, real?: PathResolver, loose = false): boolean {
+  return globalSettingsWords(command, commandWords(command), request, real)
+    || (loose && globalSettingsWords(command, commandWords(command, true), request, real));
+}
+
+function globalSettingsWords(command: SimpleCommand, words: readonly string[], request: PermissionRequest, real?: PathResolver): boolean {
   const [name, sub, third] = [posix.basename(words[0] ?? ""), words[1], words[2]];
   const has = (...flags: string[]) => command.argv.some(arg => flags.some(flag => arg === flag || arg.startsWith(`${flag}=`)));
   if (name === "git" && sub === "config") {
@@ -360,26 +453,33 @@ function isGlobalSettingsCommand(command: SimpleCommand, request: PermissionRequ
   return false;
 }
 
-type ClassRule = { name: string; interruptClass: InterruptClass; test: (request: PermissionRequest, reading: RequestReading, facts: HostRuleFacts) => boolean };
+/**
+ * One class rule. `loose` is set only by the raise rules: a rule that matches a program and its
+ * subcommand words (`command: true`) then also accepts a word after an unknown option as its value.
+ */
+type ClassRule = {
+  name: string; interruptClass: InterruptClass; command?: true;
+  test: (request: PermissionRequest, reading: RequestReading, facts: HostRuleFacts, loose: boolean) => boolean;
+};
 
 const CLASS_RULES: readonly ClassRule[] = [
   { name: "class:trust-prompt", interruptClass: "global-or-account-settings", test: request => request.shape.trustPrompt },
   { name: "class:persistent-only", interruptClass: "global-or-account-settings", test: request => request.shape.persistentOnly },
   {
-    name: "class:delivery-command", interruptClass: "production-or-staging",
-    test: (request, reading) => {
+    name: "class:delivery-command", interruptClass: "production-or-staging", command: true,
+    test: (request, reading, _facts, loose) => {
       const configured = (request.deliveryCommands ?? []).map(command => readShell(command).commands[0]?.argv).filter((argv): argv is string[] => Boolean(argv?.length));
-      return reading.commands.some(command => configured.some(pattern => wordsMatch(command.argv, pattern)));
+      return reading.commands.some(command => configured.some(pattern => runsPattern(command.argv, pattern, loose)));
     },
   },
   {
-    name: "class:host-release", interruptClass: "production-or-staging",
-    test: (_request, reading, facts) => reading.commands.some(command =>
-      [...PERMISSION_CLASS_LISTS.hostReleaseCommands, ...(facts.releaseCommands ?? [])].some(pattern => wordsMatch(command.argv.filter(arg => !arg.startsWith("-") || arg === command.argv[0]), pattern))),
+    name: "class:host-release", interruptClass: "production-or-staging", command: true,
+    test: (_request, reading, facts, loose) => reading.commands.some(command =>
+      [...PERMISSION_CLASS_LISTS.hostReleaseCommands, ...(facts.releaseCommands ?? [])].some(pattern => runsPattern(command.argv, pattern, loose))),
   },
   {
-    name: "class:credential-command", interruptClass: "credentials",
-    test: (_request, reading) => reading.commands.some(command => PERMISSION_CLASS_LISTS.credentialCommands.some(pattern => wordsMatch(commandWords(command), pattern))),
+    name: "class:credential-command", interruptClass: "credentials", command: true,
+    test: (_request, reading, _facts, loose) => reading.commands.some(command => PERMISSION_CLASS_LISTS.credentialCommands.some(pattern => runsPattern(command.argv, pattern, loose))),
   },
   {
     name: "class:credential-store", interruptClass: "credentials",
@@ -395,18 +495,18 @@ const CLASS_RULES: readonly ClassRule[] = [
     },
   },
   {
-    name: "class:payment-command", interruptClass: "money",
-    test: (_request, reading) => reading.commands.some(command => PERMISSION_CLASS_LISTS.paymentCommands.some(pattern => wordsMatch(command.argv, pattern))),
+    name: "class:payment-command", interruptClass: "money", command: true,
+    test: (_request, reading, _facts, loose) => reading.commands.some(command => PERMISSION_CLASS_LISTS.paymentCommands.some(pattern => runsPattern(command.argv, pattern, loose))),
   },
   {
     name: "class:payment-endpoint", interruptClass: "money",
     test: (_request, reading) => reading.urls.some(url => hostListed(hostOf(url), PERMISSION_CLASS_LISTS.paymentHosts)),
   },
   {
-    name: "class:destructive-outside", interruptClass: "destructive-outside-workspace",
-    test: (request, reading) => {
-      if (!request.destructive) return false;
-      const destructive = reading.commands.filter(command => matchDestructive(command.words.map(quoteWord).join(" ")) !== null);
+    name: "class:destructive-outside", interruptClass: "destructive-outside-workspace", command: true,
+    test: (request, reading, _facts, loose) => {
+      const destructive = reading.commands.filter(command => destructiveCommand(command, loose));
+      if (!request.destructive && !destructive.length) return false;
       const scope = destructive.length ? destructive : reading.commands;
       const paths: string[] = [];
       for (const command of scope) {
@@ -439,8 +539,8 @@ const CLASS_RULES: readonly ClassRule[] = [
     }),
   },
   {
-    name: "class:global-settings-command", interruptClass: "global-or-account-settings",
-    test: (request, reading) => reading.commands.some(command => isGlobalSettingsCommand(command, request, reading.resolve)),
+    name: "class:global-settings-command", interruptClass: "global-or-account-settings", command: true,
+    test: (request, reading, _facts, loose) => reading.commands.some(command => isGlobalSettingsCommand(command, request, reading.resolve, loose)),
   },
 ];
 
@@ -448,7 +548,7 @@ const CLASS_RULES: readonly ClassRule[] = [
 export function classify(request: PermissionRequest, interruptClasses: readonly string[], facts: HostRuleFacts = {}, reading = readRequest(request)): PermissionClassMatch | undefined {
   for (const rule of CLASS_RULES) {
     if (!interruptClasses.includes(rule.interruptClass)) continue;
-    if (rule.test(request, reading, facts)) return { interruptClass: rule.interruptClass, rule: rule.name };
+    if (rule.test(request, reading, facts, false)) return { interruptClass: rule.interruptClass, rule: rule.name };
   }
   return undefined;
 }
@@ -457,13 +557,15 @@ const RELEASE_WORD = /(?:^|[^a-z])(?:publish|deploy|deployment|release|promote|r
 const CREDENTIAL_WORD = /token|secret|passw(?:or)?d|credential|api[_-]?key|private[_-]?key|\bauth\b|oauth|\.pem\b|\.key\b|\.p12\b|\.pfx\b|id_rsa|id_ed25519|id_ecdsa|keychain|\.netrc|(?:^|[^a-z])\.env\b|ssh-agent|\bgpg\b|\bkms\b/i;
 // "checkout" is left out: `git checkout` is routine, and payment checkouts are caught by the provider name and endpoint lists.
 const PAYMENT_WORD = /payment|billing|invoice|purchase|refund|subscription|payout|\bcharges?\b|stripe|paypal|credit[_-]?card|\bwallet\b/i;
+/** The first subcommand word, with options before it removed (`npm --silent install -g x`). */
+const subcommand = (command: SimpleCommand) => commandWords(command)[1] ?? "";
 const GLOBAL_INSTALL: ReadonlyArray<(command: SimpleCommand) => boolean> = [
-  command => ["npm", "pnpm", "bun"].includes(command.name) && ["install", "i", "add", "link"].includes(command.argv[1] ?? "") && command.argv.some(arg => arg === "-g" || arg === "--global" || arg === "--location=global"),
-  command => command.name === "yarn" && command.argv[1] === "global",
-  command => ["brew", "port", "apt", "apt-get", "dnf", "yum", "pacman", "apk", "snap", "pipx", "gem"].includes(command.name) && ["install", "upgrade", "reinstall", "add", "tap"].includes(command.argv[1] ?? ""),
-  command => ["cargo", "go"].includes(command.name) && command.argv[1] === "install",
-  command => command.name === "uv" && command.argv[1] === "tool",
-  command => /^pip\d*(?:\.\d+)?$/.test(command.name) && command.argv[1] === "install" && command.argv.some(arg => arg === "--user" || arg === "--break-system-packages"),
+  command => ["npm", "pnpm", "bun"].includes(command.name) && ["install", "i", "add", "link"].includes(subcommand(command)) && command.argv.some(arg => arg === "-g" || arg === "--global" || arg === "--location=global"),
+  command => command.name === "yarn" && subcommand(command) === "global",
+  command => ["brew", "port", "apt", "apt-get", "dnf", "yum", "pacman", "apk", "snap", "pipx", "gem"].includes(command.name) && ["install", "upgrade", "reinstall", "add", "tap"].includes(subcommand(command)),
+  command => ["cargo", "go"].includes(command.name) && subcommand(command) === "install",
+  command => command.name === "uv" && subcommand(command) === "tool",
+  command => /^pip\d*(?:\.\d+)?$/.test(command.name) && subcommand(command) === "install" && command.argv.some(arg => arg === "--user" || arg === "--break-system-packages"),
 ];
 
 /**
@@ -522,7 +624,7 @@ function embeddedCommand(request: PermissionRequest, reading: RequestReading, fa
         ...(pattern ? { destructive: { pattern } } : {}),
       };
       const candidateReading = readRequest(candidate, resolve, depth);
-      if (CLASS_RULES.some(rule => rule.test(candidate, candidateReading, facts))) return "found";
+      if (CLASS_RULES.some(rule => rule.test(candidate, candidateReading, facts, false))) return "found";
       if (layer + 1 < limits.layers) for (const inner of candidateReading.commands) queue.push({ command: inner, layer: layer + 1 });
     }
   }
@@ -537,7 +639,8 @@ export function raise(request: PermissionRequest, context: { rejectHistory: bool
   const raised: string[] = [];
   const words = reading.commands.flatMap(command => command.words);
   const text = `${request.tool}\n${request.action}\n${safeJson(request.input ?? {})}`;
-  if (request.destructive) raised.push("raise:destructive");
+  // A raise may read loosely: an unknown option's value does not hide `git --x v reset --hard`.
+  if (request.destructive || reading.commands.some(command => destructiveCommand(command, true))) raised.push("raise:destructive");
   if (reading.targets.some(target => !insideSession(request, target.path))) raised.push("raise:outside-root");
   if (words.some(word => RELEASE_WORD.test(word)) || reading.commands.some(command => commandWords(command).slice(1, 3).includes("push")) || RELEASE_WORD.test(request.tool))
     raised.push("raise:release-verb");
@@ -555,6 +658,9 @@ export function raise(request: PermissionRequest, context: { rejectHistory: bool
       || /^\.[\w.-]*rc(?:\.[\w-]+)?$/.test(base) || /^\.env(?:\..+)?$/.test(base);
   })) raised.push("raise:settings-in-root");
   if (reading.commands.some(command => GLOBAL_INSTALL.some(test => test(command)))) raised.push("raise:global-install");
+  // A subcommand that a class rule names, behind an option the host does not know to take a value, may be that subcommand.
+  if (CLASS_RULES.some(rule => rule.command && !rule.test(request, reading, facts, false) && rule.test(request, reading, facts, true)))
+    raised.push("raise:option-subcommand");
   const embedded = reading.shell ? embeddedCommand(request, reading, facts) : undefined;
   if (embedded === "found") raised.push("raise:embedded-command");
   if (reading.opaque || embedded === "bounded" || reading.unresolved.length > 0 || (!reading.shell && !KNOWN_TOOLS.test(request.tool))) raised.push("raise:opaque");

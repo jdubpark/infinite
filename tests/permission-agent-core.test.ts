@@ -206,6 +206,29 @@ test("literal shell bodies are read to three layers, a command behind a wrapper 
   const releasing = createPermissionAgentCore({ settings: settings(), launcher: fakeLauncher(() => "unavailable").launcher, facts: { releaseCommands: [["golive"]] } });
   assert.deepEqual(raised("firejail golive"), []);
   assert.deepEqual(releasing.raise(request("firejail golive"), { rejectHistory: false }), ["raise:embedded-command"]);
+
+  // Options between a program and its subcommand words do not hide them, and neither does the value of an option the program is known to take.
+  for (const [command, expected] of [
+    ["npm --silent login", "class:credential-command"], ["npm --registry=https://r.example login", "class:credential-command"],
+    ["npm --registry https://r.example login", "class:credential-command"], ["gh --repo o/r auth login", "class:credential-command"],
+    ["docker --config d login", "class:credential-command"], ["aws --profile p configure", "class:credential-command"],
+    ["gpg --homedir /tmp/g --import key.asc", "class:credential-command"],
+    ["git -c a=b config --global user.name x", "class:global-settings-command"], ["npm --silent config set save-exact true", "class:global-settings-command"],
+    ["gcloud --project p billing accounts list", "class:payment-command"], ["systemctl -H box restart infinite", "class:host-release"],
+    ["git --no-pager -C /home/dev/projects/other-app clean -fdx", "class:destructive-outside"],
+  ]) assert.equal(rule(command), expected, command);
+  assert.equal(classify({ ...request("npm --prefix app run deploy"), deliveryCommands: ["npm run deploy"] }, CLASSES)?.rule, "class:delivery-command");
+  // Behind an option the host does not know to take a value, the subcommand is raised, never classed.
+  for (const command of ["npm --foo bar login", "npm --foo bar config set k v", "eas --unknown v login"]) {
+    assert.equal(rule(command), undefined, command);
+    assert.ok(raised(command).includes("raise:option-subcommand"), command);
+  }
+  assert.ok(raised("git --unknown v reset --hard").includes("raise:destructive"));
+  // A subcommand-shaped word elsewhere in a routine command is not a subcommand.
+  for (const command of ["npm test -- --grep login", "npm run login-page-test", `git log --grep "config --global"`, "gh pr view --json author", "docker build -t login-service ."]) {
+    assert.equal(rule(command), undefined, command);
+    assert.deepEqual(raised(command), [], command);
+  }
 });
 
 test("a write to the configuration file the host was started with needs the owner", () => {

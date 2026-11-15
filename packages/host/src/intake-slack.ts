@@ -7,7 +7,7 @@ import type { TeamService } from "./teams.js";
 import { TeamError } from "./teams.js";
 import { SlackError, type SlackClient, type SlackEnvelope } from "./slack-client.js";
 import { splitSlackText } from "./slack-text.js";
-import { failureSummary, outboundText } from "./intake.js";
+import { failureSummary, isAnswerRecord, outboundText } from "./intake.js";
 
 const IDENTITY_RETRY_MS = 30_000;
 const RETRY_DELAYS_MS = [5_000, 30_000, 120_000];
@@ -22,6 +22,10 @@ const UNEXPECTED = "The request could not be applied.";
 const ACTIONS = new Set(["status", "pause", "resume", "cancel"]);
 /** Identity failures a retry cannot fix: the surface stops with a reason, as it does for another workspace's token. */
 const PERMANENT_IDENTITY = new Set(["invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired", "credential_unavailable"]);
+const ANSWER_START = "Answering this from the repositories, read-only. No issue was filed.";
+const ANSWER_FOOTER = "No issue was filed. To start work, mention me with the change you want, or begin with \"work:\".";
+const WORK_HINT = "I took this as a request for a change. If you only wanted an answer, reply with a mention and \"cancel\", then mention me again starting with \"ask:\".";
+const WORK_HINT_QUEUED = "I took this as a request for a change. If you only wanted an answer, reply with a mention and \"cancel\" once it starts, then mention me again starting with \"ask:\".";
 const QUESTION = /^Q(\d+)(?!\w)\s*/i;
 
 export type DirectRequest = (input: { thread: IntakeThread; ts: string; eventId: string; text: string }) => "accepted" | "duplicate";
@@ -239,19 +243,30 @@ export class IntakeSlackSurface {
     };
     const followUp = this.followUp();
     // A direct request carries its issue link; before it is filed there is no identifier to name.
+    const answer = isAnswerRecord(draft);
     const title = !draft.direct ? `${draft.identifier} "${draft.title}"`
+      : answer ? `your question "${draft.title}"`
       : draft.identifier ? `${draft.identifier} "${draft.title}" (${draft.url})` : `your request "${draft.title}"`;
-    if (draft.state === "started") {
-      add("ack", "ack", `Started on ${title}. I'll post questions and the result here.\nReply with a mention to answer or steer.`);
+    // A routed request that was not asked for by word says how to take the other route.
+    const routed = draft.direct?.route?.kind === "work" && draft.direct.route.by !== "owner";
+    const hint = routed ? `\n${WORK_HINT}` : "";
+    // Before the mission exists a reply has nothing to cancel, so the owner is told to cancel once it starts.
+    const queuedHint = routed ? `\n${WORK_HINT_QUEUED}` : "";
+    if (draft.state === "started" && answer) {
+      add("ack", "ack", ANSWER_START);
+    } else if (draft.state === "started") {
+      add("ack", "ack", `Started on ${title}. I'll post questions and the result here.\nReply with a mention to answer or steer.${hint}`);
     } else if (draft.state === "queued" && draft.holdReason === "max-active") {
-      add("ack", "ack", `Queued ${title}. It starts when a running request finishes. I'll post questions and the result here.`);
+      add("ack", "ack", `Queued ${title}. It starts when a running request finishes. I'll post questions and the result here.${queuedHint}`);
     } else if (draft.state === "queued" && draft.holdReason) {
       // Posted once: the key exists after the first hold, so a later hold reason posts nothing.
-      add("ack", "ack", `Received ${title}. It has not started: ${draft.holdReason}\nI'll post questions and the result here once it starts.`);
+      add("ack", "ack", `Received ${title}. It has not started: ${draft.holdReason}\nI'll post questions and the result here once it starts.${queuedHint}`);
     }
     // A split acknowledgement is decided by its first part.
     const ack = draft.messages.find(message => message.key === "ack" || message.key === "ack#1");
-    if (draft.state === "started" && ack && !ack.text.startsWith("Started on ")) {
+    // A held answer's first message was the hold notice, so its start is announced under its own key.
+    if (draft.state === "started" && answer && ack && ack.text !== ANSWER_START) add("started", "started", ANSWER_START);
+    if (draft.state === "started" && !answer && ack && !ack.text.startsWith("Started on ")) {
       add("started", "started", draft.direct ? `Started on ${draft.identifier} (${draft.url}).` : `Started on ${draft.identifier}.`);
     }
     if (mission) {
@@ -261,7 +276,7 @@ export class IntakeSlackSurface {
         addParts(this.config, draft, `q:${decision.id}`, "question", questionText(decision)(n), at);
       }
       if (mission.status === "ready-for-review" && mission.result) {
-        add(`result:${mission.result.revision}`, "result", this.resultText(mission));
+        add(`result:${mission.result.revision}`, "result", this.resultText(mission, answer));
       }
       if (mission.status === "blocked") {
         add(`status:blocked:${mission.revision}`, "status", `Blocked: ${mission.reason ?? NO_REASON}\n${followUp}`);
@@ -273,7 +288,7 @@ export class IntakeSlackSurface {
         add(`status:paused:${mission.revision}`, "status", `Paused: ${draft.closure.reason}\nReply with a mention and "resume" or "cancel".`);
       }
     }
-    if (draft.editNotedAt) {
+    if (draft.editNotedAt && !answer) {
       add("edit-note", "edit-note", `${draft.identifier} was edited after the run started. The run keeps the original text; reply with a mention to steer it.`);
     }
   }
@@ -289,7 +304,8 @@ export class IntakeSlackSurface {
     return n;
   }
 
-  private resultText(mission: Mission): string {
+  private resultText(mission: Mission, answer = false): string {
+    if (answer) return ["Answer (agent report):", mission.result!.summary, "", ANSWER_FOOTER].join("\n");
     const done = mission.subtasks.filter(subtask => subtask.status === "done");
     const noChange = done.length > 0 && done.every(subtask => subtask.teamStatus === "no-change");
     const views = mission.subtasks.flatMap(subtask => {
@@ -487,14 +503,19 @@ export class IntakeSlackSurface {
       const holder = bound.find(record => record.questions.some(question => question.n === n));
       return holder ? { record: holder, text } : { record: fallback, text, outcome: "unknown-question", reply: `There is no question Q${n}.` };
     }
-    for (const record of bound) {
+    for (const record of bound.filter(item => item.identifier !== "")) {
       const named = new RegExp(`^${escapeRegExp(record.identifier)}(?=$|[\\s:,])`, "i").exec(text);
       if (named) return { record, text: text.slice(named[0].length).replace(/^\s*[:,]?\s*/, "") };
     }
+    // An answer has no identifier, so with other unfinished records the word "answer" names it.
+    const answerRecord = unfinished.length > 1 ? unfinished.find(isAnswerRecord) : undefined;
+    const selected = answerRecord ? /^answer(?=$|[\s:,])/i.exec(text) : null;
+    if (answerRecord && selected) return { record: answerRecord, text: text.slice(selected[0].length).replace(/^\s*[:,]?\s*/, "") };
     if (unfinished.length > 1) {
-      const open = unfinished.map(record => record.identifier).join(", ");
+      const open = unfinished.map(record => record.identifier || `answer (your question "${record.title}")`).join(", ");
+      const selector = unfinished.some(isAnswerRecord) ? 'an identifier, "answer", or a question number' : "an identifier or a question number";
       return { record: fallback, text, outcome: "ambiguous",
-        reply: `More than one request is open in this thread: ${open}. Start your reply with an identifier or a question number.` };
+        reply: `More than one request is open in this thread: ${open}. Start your reply with ${selector}.` };
     }
     return { record: fallback, text };
   }

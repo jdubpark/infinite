@@ -367,3 +367,29 @@ test("weak rule-line gate admits weak presentation and rejects clear rule-based 
   assert.equal(isWeakRuleLine(`Changes made.\n${clear}`), true, "a filler summary lead-in has a weak rule line");
   assert.equal(isWeakRuleLine(clipped), true, "a first sentence longer than the display cap has a weak rule line");
 });
+
+test("requestRoute returns the chosen route with its confidence and sends only the clipped text", async () => {
+  const calls: any[] = [];
+  const transport = { systemOne: async (request: any) => { calls.push(request); return { model: "jev-latest", answers: { route: { type: "choice", choice: "work", confidence: 0.8, probabilities: {} } } }; } } as unknown as JevTransport;
+  const f = setup({ transport });
+  try {
+    assert.deepEqual(await f.readings.requestRoute("x".repeat(1500)), { route: "work", confidence: 0.8 });
+    assert.deepEqual(calls[0].state, { request: "x".repeat(1000) });
+    assert.deepEqual(Object.keys(calls[0].questions.route.criteria), ["answer", "work"]);
+  } finally { f.dispose(); }
+});
+
+test("requestRoute is undefined without jev, on a transport error, and on an unknown choice", async () => {
+  const failing = { systemOne: async () => { throw new Error("down"); } } as unknown as JevTransport;
+  const odd = { systemOne: async () => ({ model: "m", answers: { route: { type: "choice", choice: "other", confidence: 0.9, probabilities: {} } } }) } as unknown as JevTransport;
+  let calls = 0;
+  const working = { systemOne: async () => { calls++; return { model: "m", answers: { route: { type: "choice", choice: "work", confidence: 0.9, probabilities: {} } } }; } } as unknown as JevTransport;
+  const a = setup({ transport: failing }), b = setup({ transport: odd }), c = setup({ transport: working });
+  try {
+    assert.equal(await a.readings.requestRoute("what is this?"), undefined);
+    assert.equal(await b.readings.requestRoute("what is this?"), undefined);
+    delete (c.config as any).jev;
+    assert.equal(await c.readings.requestRoute("what is this?"), undefined);
+    assert.equal(calls, 0);
+  } finally { a.dispose(); b.dispose(); c.dispose(); }
+});

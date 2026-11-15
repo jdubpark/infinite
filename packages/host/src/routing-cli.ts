@@ -6,18 +6,18 @@ type Me = { teams?: { routing?: number } };
 
 const USAGE = "Usage: infinite routing status PROJECT [--json] | infinite routing explain RUN_ID TASK_ID [--json]";
 /** The newest decisions the status reads; routing-store.ts caps its project read at this many. */
-const DECISION_LIMIT = 500;
+export const DECISION_LIMIT = 500;
 const clean = (value: string) => value.replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 const money = (value: number) => `$${value.toFixed(2)}`;
-/** A value the host did not compute is printed as unknown, never as zero. */
-const known = (value: number | undefined) => value === undefined ? "unknown" : String(value);
+/** Three decimals, as status prints them. A value the host did not compute is printed as unknown, never as zero. */
+const decimal = (value: number | undefined) => value === undefined ? "unknown" : String(Math.round(value * 1000) / 1000);
 
 function profileLine(profile: StatusProfile): string {
   const name = clean(profile.profileId);
-  if (profile.removed) return `  ${name}  removed: ${profile.removed}`;
+  if (profile.removed) return `  ${name}  removed: ${clean(profile.removed)}`;
   const { mass, appliedMass, rows } = profile.earlier;
   const earlier = mass === appliedMass ? `earlier mass ${mass} (${rows} rows)` : `earlier mass ${appliedMass} of ${mass} applied (${rows} rows)`;
-  return `  ${name}  mean ${profile.mean} [${profile.interval[0]}, ${profile.interval[1]}] · rescue ${profile.rescue} · rows production ${profile.rows.production}, duel ${profile.rows.duel} · ${earlier} · level ${profile.level} · ${money(profile.costUsd)}${profile.greedy ? " · greedy" : ""}`;
+  return `  ${name}  mean ${profile.mean} [${profile.interval[0]}, ${profile.interval[1]}] · rescue ${profile.rescue} · rows production ${profile.rows.production}, duel ${profile.rows.duel} · ${earlier} · level ${clean(profile.level)} · ${money(profile.costUsd)}${profile.greedy ? " · greedy" : ""}`;
 }
 
 /** The status of one project, in the order the plan fixes. Every text value passes through `clean`. */
@@ -35,7 +35,7 @@ export function routingStatusLines(status: RoutingStatus): string[] {
     const knobs = status.knobs;
     lines.push(`Value $${knobs.successValueUsd} per success${tag("successValueUsd")} · list weight ${knobs.listWeight}${tag("listWeight")} · contributor profiles ${knobs.allowContributor ? "allowed" : "not allowed"}${tag("allowContributor")}`);
   }
-  lines.push(status.covers.start ? "Start: covered" : `Start: not covered (${status.covers.reason})`);
+  lines.push(status.covers.start ? "Start: covered" : `Start: not covered (${clean(String(status.covers.reason))})`);
   const shadow = status.shadow;
   const capped = shadow.capped ? ` (newest ${DECISION_LIMIT})` : "";
   lines.push(shadow.withCoordinator === 0
@@ -64,10 +64,10 @@ export function routingStatusLines(status: RoutingStatus): string[] {
 
 function candidateLine(candidate: CandidateRecord): string {
   const name = clean(candidate.profileId);
-  if (candidate.removed) return `  ${name}  removed: ${candidate.removed}`;
+  if (candidate.removed) return `  ${name}  removed: ${clean(candidate.removed)}`;
   const cost = candidate.costUsd === undefined ? "unknown" : money(candidate.costUsd);
   const fallback = candidate.samplerFallback ? " · sampler fallback" : "";
-  return `  ${name}  mean ${known(candidate.thetaMean)} · deviation ${known(candidate.thetaSd)} · rescue ${known(candidate.phiMean)} · cost ${cost} · greedy utility ${known(candidate.greedyUtility)} · sample ${known(candidate.sample)} · sampled utility ${known(candidate.sampledUtility)}${fallback}`;
+  return `  ${name}  mean ${decimal(candidate.thetaMean)} · deviation ${decimal(candidate.thetaSd)} · rescue ${decimal(candidate.phiMean)} · cost ${cost} · greedy utility ${decimal(candidate.greedyUtility)} · sample ${decimal(candidate.sample)} · sampled utility ${decimal(candidate.sampledUtility)}${fallback}`;
 }
 
 /** The start decisions of one task, per decision: its header, its choice, its seed, and one line per candidate. */

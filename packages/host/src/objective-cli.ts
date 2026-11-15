@@ -27,16 +27,23 @@ function faultOf(error: unknown): { status?: unknown; code?: unknown } {
   return typeof error === "object" && error !== null ? error as { status?: unknown; code?: unknown } : {};
 }
 
+// The goal's sentences for the four record-state codes. Reads and corrections both use them, so they are written once.
+function recordStateFailure(status: unknown, code: unknown): Error | undefined {
+  if (status === 409 && code === "objective-source-invalid") return new Error("This goal's fields do not fit an objective record. The goal works as before, without one.");
+  if (status === 409 && code === "objective-record-invalid") return new Error("The stored objective record cannot be read. The host keeps it unchanged.");
+  if (status === 409 && code === "objective-record-newer") return new Error("A newer host wrote this objective record. Upgrade the host to read it.");
+  if (status === 404 && code === "objective-record-absent") return new Error("This goal has no objective record yet.");
+  return undefined;
+}
+
 // The client's HttpError carries the status and the code, never the host's message, so each reason has a fixed sentence.
 function readFailure(error: unknown, version: string | undefined): Error | undefined {
   const { status, code } = faultOf(error);
   if (status === 404 && code === "goal-not-found") return new Error("No goal has this ID.");
   if (status === 404 && code === "objective-version-not-found") return new Error(`The record has no version ${version}.`);
   if (status === 409 && code === "objective-version-unavailable") return new Error(`This host cannot rebuild version ${version} of the record.`);
-  if (status === 409 && code === "objective-source-invalid") return new Error("This goal's fields do not fit an objective record. The goal works as before, without one.");
-  if (status === 409 && code === "objective-record-invalid") return new Error("The stored objective record cannot be read. The host keeps it unchanged.");
-  if (status === 409 && code === "objective-record-newer") return new Error("A newer host wrote this objective record. Upgrade the host to read it.");
-  if (status === 404 && code === "objective-record-absent") return new Error("This goal has no objective record yet.");
+  const state = recordStateFailure(status, code);
+  if (state) return state;
   if (status === 400) return new Error("The host refused the record query.");
   if (status === 404) return new Error("This host has no objective records. Upgrade the host.");
   return undefined;
@@ -53,6 +60,8 @@ function correctionFailure(error: unknown, retry: string): Error {
   }
   if (status === 403) return new Error("Corrections need an owner device key.");
   if (status === 409 && code === "request-conflict") return new Error("This request ID was used for another correction. Leave out --request-id to send a new one.");
+  const state = recordStateFailure(status, code);
+  if (state) return state;
   if (typeof code === "string" && Object.hasOwn(OBJECTIVE_ERRORS, code)) return new Error(OBJECTIVE_ERRORS[code as ObjectiveErrorCode].message);
   if (status === 404 && code === "goal-not-found") return new Error("No goal has this ID.");
   // An older host has no correction route, so its answer carries no code.

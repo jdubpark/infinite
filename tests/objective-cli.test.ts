@@ -227,6 +227,11 @@ const CORRECTION_SENTENCES: { code: string; status: number; message: string }[] 
   { code: "objective-too-large", status: 409, message: "The corrected record would be over its size limit." },
   { code: "objective-log-full", status: 409, message: "The record's log is full. Start a new goal with consolidated criteria." },
   { code: "objective-digest-too-large", status: 409, message: "The active criteria would be over the 6 KiB prompt digest." },
+  { code: "goal-not-found", status: 404, message: "No goal has this ID." },
+  { code: "objective-record-absent", status: 404, message: "This goal has no objective record yet." },
+  { code: "objective-source-invalid", status: 409, message: "This goal's fields do not fit an objective record. The goal works as before, without one." },
+  { code: "objective-record-invalid", status: 409, message: "The stored objective record cannot be read. The host keeps it unchanged." },
+  { code: "objective-record-newer", status: 409, message: "A newer host wrote this objective record. Upgrade the host to read it." },
 ];
 
 test("correction errors map to sentences", async () => {

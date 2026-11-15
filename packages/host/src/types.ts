@@ -117,7 +117,8 @@ export interface AgentProfile {
 }
 export interface Config {
   /** Host-only credential; never copied into provider environment variables or prompts. */
-  linear?: { apiKeyFile: string; endpoint?: string };
+  /** `reportName` is the name that starts the host's tracker comments, as in "NAME agent report: ready for review.". */
+  linear?: { apiKeyFile: string; endpoint?: string; reportName?: string };
   /** Launch gate for automatic launches: the host holds them while available memory is below the floor or one-minute load per CPU is above the ceiling. */
   hostLoad?: { minAvailableMemoryGiB: number; maxLoadPerCpu: number };
   /** Linear and Slack request intake; the Linear credential above is required when this is set. */

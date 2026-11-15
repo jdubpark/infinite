@@ -16,6 +16,10 @@ import { egressConfigSchema } from "./egress.js";
  * also lets hooks defined in the working directory run without review.
  */
 export const DEFAULT_HOOKS = { claude: true, codex: false } as const;
+/** The name that starts the host's tracker comments when `linear.reportName` is not set. */
+export const DEFAULT_REPORT_NAME = "Infinite";
+/** The name that starts the host's tracker comments, as in "NAME agent report: ready for review.". */
+export const reportName = (config: Config): string => config.linear?.reportName ?? DEFAULT_REPORT_NAME;
 const nonNegative = z.number().min(0).finite();
 export const usageConfigSchema = z.object({
   /** USD per million tokens, keyed `provider/model`. */
@@ -68,7 +72,7 @@ export const githubBoundarySchema = z.object({
 
 const schema = z
   .object({
-    linear: z.object({ apiKeyFile: z.string().refine(isAbsolute), endpoint: z.url().optional() }).strict().optional(),
+    linear: z.object({ apiKeyFile: z.string().refine(isAbsolute), endpoint: z.url().optional(), reportName: z.string().trim().min(1).max(40).regex(/^[A-Za-z][A-Za-z0-9 -]*$/).default(DEFAULT_REPORT_NAME) }).strict().optional(),
     hostLoad: z.object({ minAvailableMemoryGiB: z.number().min(0).max(4096), maxLoadPerCpu: z.number().positive().max(64) }).strict().optional(),
     intake: intakeConfigSchema.optional(),
     teams: z.object({ workspaceDir: z.string().refine(isAbsolute), commandPrefix: teamCommandSchema.optional(), lineup: teamLineupSchema.optional(), trustWorkspaces: z.boolean().optional(), publishHeads: z.boolean().default(true), stallMinutes: z.number().int().min(5).max(1440).optional(), checkMinutes: z.number().positive().max(240).optional(), retention: teamRetentionSchema.optional(), storageFloor: storageFloorSchema.optional(), outcomes: outcomeSettingsSchema.optional(), blackboard: z.object({ tools: z.boolean().optional() }).strict().optional() }).strict().optional(),

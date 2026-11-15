@@ -33,11 +33,14 @@ export async function startIntakeLinearServer(options: { clock?: () => number } 
   /** Who Linear reports as the creator of an issue the host files; the owner unless a test changes it. */
   let creatorOfCreated: string | null = ownerId;
   const malformed = new Set<string>(), malformedCreator = new Set<string>();
+  /** While set, every description is returned with bare URLs rewritten as Markdown links, as the tracker does. */
+  let rewriteLinksValue = false;
+  const linked = (text: string) => rewriteLinksValue ? text.replace(/https?:\/\/[^\s<>()]+/g, url => `[${url}](<${url}>)`) : text;
   const now = options.clock ?? (() => Date.now());
   const stamp = () => new Date(now()).toISOString();
 
   const node = (issue: IntakeFixtureIssue) => malformed.has(issue.id) ? { id: issue.id, unexpected: true } : ({
-    id: issue.id, identifier: issue.identifier, url: issue.url, title: issue.title, description: issue.description,
+    id: issue.id, identifier: issue.identifier, url: issue.url, title: issue.title, description: linked(issue.description),
     createdAt: issue.createdAt, updatedAt: issue.updatedAt, archivedAt: issue.archivedAt,
     team: { id: issue.teamId }, state: { type: issue.stateType },
     labels: { nodes: issue.labels.map(name => ({ name })) },
@@ -146,6 +149,8 @@ export async function startIntakeLinearServer(options: { clock?: () => number } 
       if (!issue) throw new Error("Fixture has no such issue");
       Object.assign(issue, change, { updatedAt: stamp() });
     },
+    /** Returns descriptions with bare URLs rewritten as Markdown links from now on, from creates and later reads alike. */
+    rewriteLinks(on: boolean) { rewriteLinksValue = on; },
     /** Returns the issue's node in a shape that intake cannot read; the issue still exists. */
     corrupt(id: string) { malformed.add(id); },
     /** Gives the issue a creator field that is not a Linear user ID. */

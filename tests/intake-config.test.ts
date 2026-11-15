@@ -98,9 +98,8 @@ test("answering questions needs direct requests, and classifying needs both answ
   assert.deepEqual([defaults.answerQuestions, defaults.classify], [false, false]);
 });
 test("linear.reportName defaults to Infinite, accepts a plain name, and rejects Markdown, link text, newlines, and long values", () => {
-  const unset = parsed({});
-  assert.equal(Object.hasOwn(unset.linear!, "reportName"), false, "parsing adds no key: the routine authority digest hashes config.linear");
-  assert.equal(reportName(unset), "Infinite");
+  assert.equal(reportName(parsed({})), "Infinite");
+  assert.equal(Object.hasOwn(parsed({}).linear!, "reportName"), false, "display defaults leave persisted configuration digests unchanged");
   assert.equal(parsed({}, { linear: { apiKeyFile: privateFile("linear-key"), reportName: "Northwind" } }).linear!.reportName, "Northwind");
   assert.equal(parsed({}, { linear: { apiKeyFile: privateFile("linear-key"), reportName: "Northwind East - 2" } }).linear!.reportName, "Northwind East - 2");
   for (const reportName of ["[x](y)", "North\nwind", "", "a".repeat(41), "North _wind_", "1. Northwind", "_Northwind", "9Lives", "www.example.com", "Northwind Co."])

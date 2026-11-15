@@ -1322,6 +1322,26 @@ test("mixed plans reject absent, unknown, and fixed-role model selections before
   } finally { await f.close(); }
 });
 
+test("a selected team decision mode is persisted by the service across API restart", { timeout: 60000 }, async () => {
+  const f = await fixture("mcp");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const running = await waitFor(() => f.get(created.body.id), run => run.members.some(member => member.status === "running") && existsSync(join(f.receipts, "mcp-capability.json")), 30000);
+    const capability = JSON.parse(readFileSync(join(f.receipts, "mcp-capability.json"), "utf8"));
+    const report = { requestId: randomUUID(), runId: capability.assignment.runId, memberId: capability.assignment.memberId, revision: capability.assignment.revision,
+      report: { kind: "question", question: "May this operation proceed?", options: ["Approve once", "Deny"], answerMode: "approval" } };
+    const submitted = await fetch(`${capability.url}/team-report`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${capability.token}` }, body: JSON.stringify(report) });
+    assert.equal(submitted.status, 204);
+    const waiting = await waitFor(() => f.get(running.id), run => run.decisions.length === 1 && run.status === "needs-input", 30000);
+    assert.equal(waiting.decisions[0].answerMode, "approval");
+
+    await f.host.stopApi(); await f.host.start();
+    const recovered = await f.get(waiting.id);
+    assert.equal(recovered.decisions[0].answerMode, "approval", "The selected mode is part of the durable decision record");
+  } finally { await f.close(); }
+});
+
 test("questions and steering survive API restart with durable retries and stale revision refusals", { timeout: 120000 }, async () => {
   const f = await fixture("question");
   let controller: RemoteClient | undefined;
@@ -1331,10 +1351,12 @@ test("questions and steering survive API restart with durable retries and stale 
     assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
     const waiting = await waitFor(() => f.get(created.body.id), run => run.decisions.length === 1 && run.status === "needs-input", 30000);
     const decision = waiting.decisions[0];
+    assert.equal(decision.answerMode, undefined, "Legacy two-option questions remain ordinary choices after service persistence");
     await f.host.stopApi(); await f.host.start();
     const recovered = await f.get(waiting.id);
     assert.equal(recovered.decisions[0].id, decision.id);
     assert.equal(recovered.decisions[0].question, decision.question);
+    assert.equal(recovered.decisions[0].answerMode, undefined, "Absent mode remains absent after restart");
     assert.equal(recovered.decisions[0].answer, undefined);
     assert.equal(recovered.members.length, waiting.members.length, "Restart must not duplicate the waiting child");
     const answer = { requestId: randomUUID(), revision: recovered.revision, text: "Compact" };
@@ -1873,8 +1895,12 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
     assert.equal(listing.result.tools.length, 1);
     assert.equal(listing.result.tools[0].name, "report");
     assert.ok(listing.result.tools[0].inputSchema.properties.report);
+    const questionSchema = listing.result.tools[0].inputSchema.properties.report.oneOf.find((branch: any) => branch.properties?.kind?.const === "question");
+    assert.deepEqual(questionSchema.properties.answerMode.enum, ["approval", "single", "multiple"], "The MCP schema exposes selectable answer modes");
     const invalid = await client.rpc("tools/call", { name: "report", arguments: { report: { kind: "plan", summary: "No tasks supplied" } } });
     assert.equal(invalid.result.isError, true);
+    const invalidApproval = await client.rpc("tools/call", { name: "report", arguments: { report: { kind: "question", question: "Proceed?", options: ["Approve"], answerMode: "approval" } } });
+    assert.equal(invalidApproval.result.isError, true, "The MCP boundary enforces approval option cardinality from the refined schema");
     assert.equal(requests, 0, "Malformed report input must not reach the worker");
     const report = { kind: "blocked", summary: "MCP report boundary evidence", blocker: {
       cause: { status: "hypothesis", detail: "The provider may not expose the required tool." },

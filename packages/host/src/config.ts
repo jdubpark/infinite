@@ -72,8 +72,6 @@ export const githubBoundarySchema = z.object({
 
 const schema = z
   .object({
-    // No parse default for `reportName`: the routine authority digest hashes this block, so an added key would block every
-    // approved routine after an upgrade. `reportName(config)` applies the default instead.
     linear: z.object({ apiKeyFile: z.string().refine(isAbsolute), endpoint: z.url().optional(), reportName: z.string().trim().min(1).max(40).regex(/^[A-Za-z][A-Za-z0-9 -]*$/).optional() }).strict().optional(),
     hostLoad: z.object({ minAvailableMemoryGiB: z.number().min(0).max(4096), maxLoadPerCpu: z.number().positive().max(64) }).strict().optional(),
     intake: intakeConfigSchema.optional(),

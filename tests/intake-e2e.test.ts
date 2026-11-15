@@ -23,7 +23,7 @@ const slackLink = (thread: IntakeThread) => `https://example.slack.com/archives/
  * A real host through createApp, with Linear and (optionally) Slack fakes and two repository projects the mission
  * fixture agent can work in. Intake polls Linear every 30 seconds, so each issue is filed after the host starts.
  */
-async function intakeHost(withSlack: boolean, direct = false) {
+async function intakeHost(withSlack: boolean, direct = false, answerQuestions = false) {
   const root = realpathSync(mkdtempSync("/tmp/inf-intake-e2e-"));
   const receipts = join(root, "receipts");
   mkdirSync(receipts, { mode: 0o700 });
@@ -48,7 +48,7 @@ async function intakeHost(withSlack: boolean, direct = false) {
     config.intake = {
       linear: { teamIds: [linear.teamId], creatorId: linear.ownerId, label: "infinite", commentsMirrorToSlack: false, ...(direct ? { admitIssues: false } : {}) },
       ...(slack ? { slack: { appTokenFile: slack.appTokenFile, botTokenFile: slack.botTokenFile, teamId: "T00000000", ownerUserId: OWNER,
-        linearAgentUserId: AGENT, bindByMention: false, endpoint: slack.endpoint, ...(direct ? { directRequests: true } : {}) } } : {}),
+        linearAgentUserId: AGENT, bindByMention: false, endpoint: slack.endpoint, ...(direct ? { directRequests: true } : {}), ...(answerQuestions ? { answerQuestions: true } : {}) } } : {}),
       mission: { groupId: "api", maxSubtasks: 8, maxMinutes: 30 },
       maxActive: 3,
       requireSlackThread: slack !== undefined,
@@ -185,6 +185,60 @@ test("the owner's mention files one issue, starts the mission, and is acknowledg
     assert.equal(texts().filter(text => text.startsWith("Started on TEST-1")).length, 1, "One acknowledgement");
     const postCalls = slack!.calls.filter(call => call.method === "chat.postMessage").length;
     assert.equal(postCalls, texts().length, "Each post the bot sent landed in the thread");
+  } finally {
+    await world.close();
+  }
+});
+
+test("an \"ask:\" mention is answered read-only in the thread, and Linear receives nothing", { timeout: 150 * 1000 }, async () => {
+  const world = await intakeHost(true, true, true);
+  const { host, linear, slack } = world;
+  try {
+    slack!.seedThread(BINDING, [{ user: OWNER, text: "ask: ANSWER-DIRECT which exports failed?" }]);
+    const texts = () => slack!.posts(BINDING).map(post => post.text);
+    const event = { type: "app_mention", user: OWNER, channel: BINDING.channelId, ts: "1700000900.000100", thread_ts: BINDING.threadTs, text: `<@${slack!.botUserId}> ask: ANSWER-DIRECT which exports failed?` };
+    await waitFor(async () => (await host.fetchApi("/intake")).body, body => body.slack?.connected === true, 30000);
+    await slack!.emit(event);
+
+    await waitFor(async () => texts(), list => list.length >= 2, 120000);
+    const { body } = await waitFor(async () => (await host.fetchApi("/intake")), response => response.body.records[0]?.state === "finished", 60000);
+    assert.deepEqual(texts(), [
+      "Answering this from the repositories, read-only. No issue was filed.",
+      'Answer (agent report):\nRows 14, 90 and 212 were empty.\n\nNo issue was filed. To start work, mention me with the change you want, or begin with "work:".',
+    ]);
+    assert.deepEqual(linear.calls, [], "Linear received no request of any kind");
+    assert.equal(linear.allIssues().length, 0);
+    assert.equal(body.records.length, 1);
+    assert.deepEqual([body.records[0].identifier, body.records[0].route.kind, body.records[0].route.by], ["", "answer", "owner"]);
+    assert.ok(body.records[0].missionId);
+  } finally {
+    await world.close();
+  }
+});
+
+test("the correction the bot advertises works: cancel the mistaken request, then ask in the same thread", { timeout: 240 * 1000 }, async () => {
+  const world = await intakeHost(true, true, true);
+  const { host, linear, slack } = world;
+  try {
+    slack!.seedThread(BINDING, [{ user: OWNER, text: "HOLD-SUBTEAM which exports failed?" }]);
+    const texts = () => slack!.posts(BINDING).map(post => post.text);
+    const mention = (ts: string, text: string) => ({ type: "app_mention", user: OWNER, channel: BINDING.channelId, ts, thread_ts: BINDING.threadTs, text: `<@${slack!.botUserId}> ${text}` });
+    await waitFor(async () => (await host.fetchApi("/intake")).body, body => body.slack?.connected === true, 30000);
+    await slack!.emit(mention("1700000900.000100", "HOLD-SUBTEAM which exports failed?"));
+    const started = await waitFor(async () => texts(), list => list.some(text => text.startsWith("Started on TEST-1")), 90000);
+    assert.ok(started.some(text => text.endsWith('I took this as a request for a change. If you only wanted an answer, reply with a mention and "cancel", then mention me again starting with "ask:".')));
+
+    await slack!.emit(mention("1700000900.000200", "cancel"));
+    const finished = await waitFor(async () => (await host.fetchApi("/intake")).body, body => body.records[0]?.state === "finished", 90000);
+    assert.equal(finished.records.length, 1);
+
+    await slack!.emit(mention("1700000900.000300", "ask: ANSWER-DIRECT which exports failed?"));
+    await waitFor(async () => texts(), list => list.some(text => text.startsWith("Answer (agent report):")), 120000);
+    const { records } = (await host.fetchApi("/intake")).body;
+    assert.equal(records.length, 2);
+    assert.deepEqual([records[1].route.kind, records[1].route.by, records[1].identifier], ["answer", "owner", ""]);
+    assert.equal(linear.allIssues().length, 1, "Only the first request has an issue");
+    assert.ok(texts().includes("Answering this from the repositories, read-only. No issue was filed."));
   } finally {
     await world.close();
   }

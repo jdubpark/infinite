@@ -19,7 +19,7 @@ import { createInterface } from "node:readline";
 import { git, lineup, missionHarness as harness, scriptedMissionHarness as scripted } from "./mission-harness.js";
 import type { Config, Session } from "../packages/host/src/types.js";
 import type { CreateTeam, TeamAssignment, TeamView } from "../packages/host/src/team-types.js";
-import type { CreateMission, Mission, MissionOrigin } from "../packages/host/src/mission-types.js";
+import type { CreateMission, Mission, MissionOrigin, MissionReport } from "../packages/host/src/mission-types.js";
 import { initialAttention } from "@infinite/attention";
 import { emptyUsage, type UsageRollup } from "../packages/host/src/team-usage.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
@@ -2034,4 +2034,96 @@ test("a pause that stops a launched attempt before its report returns the fired 
     assert.equal(h.refusals(id), 0, "A paused stop is not a missed report");
     assert.ok(!h.get(id).events.some(event => /could not be resumed/.test(event.text)), "The resumed conversation was confirmed, so this is not a failed resume");
   } finally { h.close(); mock.timers.reset(); }
+});
+
+const answerDispatchRefusal = "This mission answers a question and cannot start subtasks. Report the answer as a result, ask the owner a question, or report blocked.";
+const answerRequest = (): CreateMission => ({ requestId: randomUUID(), groupId: "shop", objective: "Which route serves exports?", maxSubtasks: 8, maxMinutes: 30, mode: "answer" });
+
+test("an answer mission accepts a result with no subtask", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.missions.create(answerRequest());
+    await h.report(1, { kind: "result", summary: "The answer." });
+    const mission = await until(() => h.get(id), item => item.status === "ready-for-review");
+    assert.equal(mission.mode, "answer");
+    assert.equal(mission.result?.summary, "The answer.");
+    assert.equal(mission.subtasks.length, 0);
+    assert.ok(mission.events.some(event => event.text === "The coordinator reported an answer. The mission started no subteam and changed nothing."));
+  } finally { h.close(); }
+});
+
+const answerForbiddenReports: MissionReport[] = [
+  { kind: "dispatch", summary: "Fix it", subtasks: [plan("a", "api")] },
+  { kind: "resize-subtask", subtaskId: "a", parallelism: 2, summary: "More workers" },
+  { kind: "cancel-subtask", subtaskId: "a", reason: "Not needed" },
+  { kind: "steer-subtask", subtaskId: "a", text: "Change it" },
+  { kind: "answer-child", subtaskId: "a", decisionId: randomUUID(), text: "Yes" },
+];
+for (const forbidden of answerForbiddenReports) {
+  test(`an answer mission refuses a ${forbidden.kind} report with the answer-mode reason`, { timeout: 60000 }, async () => {
+    const h = scripted();
+    try {
+      const { id } = await h.missions.create(answerRequest());
+      await h.report(1, forbidden);
+      const refusal = (await h.messages(2)).find((message: { type: string }) => message.type === "refused");
+      assert.equal(refusal.kind, forbidden.kind);
+      assert.equal(refusal.reason, answerDispatchRefusal);
+      assert.equal(h.get(id).subtasks.length, 0);
+      assert.equal(h.created.length, 0, "No team run was created");
+    } finally { h.close(); }
+  });
+}
+
+test("three refused reports in a row block an answer mission", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.missions.create(answerRequest());
+    for (const [index, report] of answerForbiddenReports.slice(0, 3).entries()) await h.report(index + 1, report);
+    const blocked = await until(() => h.get(id), mission => mission.status === "blocked", 20000);
+    assert.match(blocked.reason ?? "", /refused three times in a row/);
+    assert.ok(blocked.reason?.endsWith(answerDispatchRefusal));
+  } finally { h.close(); }
+});
+
+test("a mission without a mode still refuses a result before any subtask finished", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "result", summary: "Done" });
+    const refusal = (await h.messages(2)).find((message: { type: string }) => message.type === "refused");
+    assert.match(refusal.reason, /^No subtask has finished/);
+    assert.equal(h.get(id).mode, undefined);
+  } finally { h.close(); }
+});
+
+test("the answer-mode coordinator prompt says it can only read and cannot dispatch", { timeout: 30000 }, async () => {
+  const h = scripted();
+  try {
+    const answer = await h.missions.create(answerRequest());
+    const plain = await h.create();
+    const repos = [{ projectId: "api", name: "API", path: "/srv/infinite-data/api", teamReady: true }];
+    const context = { openChildDecisions: [], waiting: 0 };
+    for (const build of [missionPromptWithMessageCount, missionFollowUpPromptWithMessageCount]) {
+      const prompt = build(answer, repos, [], 1, "claude", lineup.coordinator, context).prompt;
+      assert.match(prompt, /cannot start subtasks/);
+      assert.match(prompt, /other N \| /);
+      assert.doesNotMatch(prompt, /Choose the initial team limit/);
+      assert.doesNotMatch(prompt, /"kind":"dispatch"/);
+    }
+    const initial = missionPromptWithMessageCount(plain, repos, [], 1, "claude", lineup.coordinator, context).prompt;
+    assert.match(initial, /Choose the initial team limit/);
+    assert.doesNotMatch(initial, /cannot start subtasks/);
+  } finally { h.close(); }
+});
+
+test("an answer mission refuses a follow-up report", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.missions.create(answerRequest());
+    await h.report(1, followUp(30));
+    const refusal = (await h.messages(2)).find((message: { type: string }) => message.type === "refused");
+    assert.equal(refusal.kind, "follow-up");
+    assert.equal(refusal.reason, "This mission answers a question and cannot set a follow-up. Report the answer as a result, ask the owner a question, or report blocked.");
+    assert.equal(openFollowUpCount(h.get(id)), 0);
+  } finally { h.close(); }
 });

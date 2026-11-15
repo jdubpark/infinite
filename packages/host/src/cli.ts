@@ -332,7 +332,7 @@ else if (command === "plan-fleet") {
     const fd = openSync(lock, "wx", 0o600);
     writeFileSync(fd, String(process.pid));
     closeSync(fd);
-    const { sessions, teams, goals, pushStore, server, closeConnections, fuse, permissions } = createApp(config, key);
+    const { sessions, teams, goals, pushStore, server, closeConnections, fuse, permissions } = createApp(config, key, { configFile });
     server.listen(config.port, "127.0.0.1", () =>
       console.log(
         `Infinite: ${config.origin}\nExecution host: ${config.environment}\nClosing this API does not stop agent workers.`,

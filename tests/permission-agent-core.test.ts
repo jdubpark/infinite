@@ -27,7 +27,7 @@ import {
   type PermissionTurnLauncher,
   type ReportOptions,
 } from "../packages/host/src/permission-reviewer.js";
-import type { PermissionAgentSettings } from "../packages/host/src/permission-agent-config.js";
+import { hostProtectedPaths, type PermissionAgentSettings } from "../packages/host/src/permission-agent-config.js";
 import type { PermissionRequest, PermissionReviewContext } from "../packages/host/src/permission-agent-types.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 
@@ -106,6 +106,14 @@ test("each interrupt class routes a concrete request through a class rule, and n
   assert.ok(raise(opaque, { rejectHistory: false }).includes("raise:opaque"));
   // A class that is not in force is not matched.
   assert.equal(classify(bash("gh auth login"), CLASSES.filter(name => name !== "credentials")), undefined);
+});
+
+test("a write to the configuration file the host was started with needs the owner", () => {
+  const config = { stateDir: "/srv/host/state", runDir: "/srv/host/run", keyFile: "/srv/host/vault.key", agents: {} };
+  const facts = { protectedPaths: hostProtectedPaths(config, "/opt/host", ["/srv/custom/host.json"]) };
+  const write = tool("Write", { file_path: "/srv/custom/host.json", content: "{}" });
+  assert.equal(classify(write, CLASSES, facts)?.rule, "class:host-configuration");
+  assert.equal(classify(write, CLASSES, { protectedPaths: hostProtectedPaths(config, "/opt/host") }), undefined);
 });
 
 test("a live core judges real paths, so a link inside the session root cannot hide a target outside it", () => {

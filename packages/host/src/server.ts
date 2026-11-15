@@ -182,7 +182,7 @@ const inputSchema = z
     force: z.boolean().optional(),
   })
   .strict();
-export function createApp(config: Config, key: Buffer) {
+export function createApp(config: Config, key: Buffer, options: { /** The configuration file the host was started with. */ configFile?: string } = {}) {
   config.machine = machineIdentity(config, key);
   if ((config.cmux?.enabled || config.remote?.enabled) && runtimeSecurity(config.deployment).tenancy !== "single-tenant")
     throw new Error("Machine access and cmux require a single-tenant host");
@@ -305,7 +305,7 @@ export function createApp(config: Config, key: Buffer) {
     settings: () => permissionAgentSettings(config),
     launcher: createCliTurnLauncher({ agents: config.agents, gate: turn => permissionTurnGate.hold?.(turn) ?? true, onUsage: usage => permissionMeasurements?.recordUsage(usage) }),
     results: permissionMeasurements,
-    facts: { protectedPaths: hostProtectedPaths(config, fileURLToPath(new URL("../../../", import.meta.url))) },
+    facts: { protectedPaths: hostProtectedPaths(config, fileURLToPath(new URL("../../../", import.meta.url)), options.configFile ? [options.configFile] : []) },
   };
   // The live core judges real paths. A replay core gets no resolver: it reads nothing from disk.
   const permissionCore = createPermissionAgentCore({ ...permissionCoreOptions, resolvePath: realHostPath });

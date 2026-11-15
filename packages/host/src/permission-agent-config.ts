@@ -53,15 +53,16 @@ export function permissionAgentSettings(config: {
 /**
  * Host paths a write to which changes host configuration, the delegation records, the permission policy
  * or journal, or a provider launcher: the state, run and install directories, the vault key, and every
- * absolute launcher command. A class rule sends such a write to the owner.
+ * absolute launcher command, and the `extra` paths the caller names (the configuration file the host was
+ * started with). A class rule sends such a write to the owner.
  */
 export function hostProtectedPaths(config: {
   stateDir: string; runDir: string; keyFile: string;
   agents: Partial<Record<string, { command: string; args: string[]; appServerCommand?: string }>>;
   teams?: { commandPrefix?: { command: string } };
   cmux?: { hooksDir?: string };
-}, installRoot: string): string[] {
-  const paths = [config.stateDir, config.runDir, config.keyFile, installRoot, config.cmux?.hooksDir, config.teams?.commandPrefix?.command];
+}, installRoot: string, extra: readonly string[] = []): string[] {
+  const paths = [config.stateDir, config.runDir, config.keyFile, installRoot, config.cmux?.hooksDir, config.teams?.commandPrefix?.command, ...extra];
   for (const profile of Object.values(config.agents)) {
     if (!profile) continue;
     paths.push(profile.command, profile.appServerCommand);

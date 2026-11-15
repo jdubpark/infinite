@@ -303,7 +303,7 @@ export class HostPermissionPipeline implements PermissionPipeline {
     // 1. Class rules: the owner answers, no model turn runs, and nothing is replayed for it.
     const match = this.core.classify(request, coverage.interruptClasses);
     if (match) {
-      return this.record({ ...base, at: this.timestamp(), rules: [`class:${match.rule}`], tiers: [], verdict: "owner", interruptClass: match.interruptClass }, coverage, false);
+      return this.record({ ...base, at: this.timestamp(), rules: [match.rule.startsWith("class:") ? match.rule : `class:${match.rule}`], tiers: [], verdict: "owner", interruptClass: match.interruptClass }, coverage, false);
     }
 
     // 2. Qualify. A request that cannot be allowed is still reviewed when it offers a one-shot reject.

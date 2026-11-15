@@ -18,9 +18,10 @@ const DELIVERY_WINDOW_MS = 60_000;
 
 /**
  * The seat a member works in: the run and the member's task, or the run and its role when the member
- * has no task of its own. A replacement member and a new run revision keep it.
+ * has no task of its own. A replacement member and a new run revision keep it. Every requester adapter
+ * of a team member uses this one value, so a reject lock holds across the interactive and headless paths.
  */
-export function teamPermissionAssignment(run: Pick<TeamRun, "id">, member: Pick<TeamMember, "role" | "taskId">): string {
+export function teamPermissionAssignment(run: Pick<TeamRun, "id">, member: { role: TeamMember["role"] | TeamAssignment["role"]; taskId?: string }): string {
   return member.taskId ? `team:${run.id}:${member.role}:task:${member.taskId}` : `team:${run.id}:${member.role}`;
 }
 

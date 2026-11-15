@@ -24,7 +24,8 @@ const ACTIONS = new Set(["status", "pause", "resume", "cancel"]);
 const PERMANENT_IDENTITY = new Set(["invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired", "credential_unavailable"]);
 const ANSWER_START = "Answering this from the repositories, read-only. No issue was filed.";
 const ANSWER_FOOTER = "No issue was filed. To start work, mention me with the change you want, or begin with \"work:\".";
-const WORK_HINT = "I took this as a request for a change. To ask a question instead, mention me with \"ask:\".";
+const WORK_HINT = "I took this as a request for a change. If you only wanted an answer, reply with a mention and \"cancel\", then mention me again starting with \"ask:\".";
+const WORK_HINT_QUEUED = "I took this as a request for a change. If you only wanted an answer, reply with a mention and \"cancel\" once it starts, then mention me again starting with \"ask:\".";
 const QUESTION = /^Q(\d+)(?!\w)\s*/i;
 
 export type DirectRequest = (input: { thread: IntakeThread; ts: string; eventId: string; text: string }) => "accepted" | "duplicate";
@@ -247,16 +248,19 @@ export class IntakeSlackSurface {
       : answer ? `your question "${draft.title}"`
       : draft.identifier ? `${draft.identifier} "${draft.title}" (${draft.url})` : `your request "${draft.title}"`;
     // A routed request that was not asked for by word says how to take the other route.
-    const hint = draft.direct?.route?.kind === "work" && draft.direct.route.by !== "owner" ? `\n${WORK_HINT}` : "";
+    const routed = draft.direct?.route?.kind === "work" && draft.direct.route.by !== "owner";
+    const hint = routed ? `\n${WORK_HINT}` : "";
+    // Before the mission exists a reply has nothing to cancel, so the owner is told to cancel once it starts.
+    const queuedHint = routed ? `\n${WORK_HINT_QUEUED}` : "";
     if (draft.state === "started" && answer) {
       add("ack", "ack", ANSWER_START);
     } else if (draft.state === "started") {
       add("ack", "ack", `Started on ${title}. I'll post questions and the result here.\nReply with a mention to answer or steer.${hint}`);
     } else if (draft.state === "queued" && draft.holdReason === "max-active") {
-      add("ack", "ack", `Queued ${title}. It starts when a running request finishes. I'll post questions and the result here.${hint}`);
+      add("ack", "ack", `Queued ${title}. It starts when a running request finishes. I'll post questions and the result here.${queuedHint}`);
     } else if (draft.state === "queued" && draft.holdReason) {
       // Posted once: the key exists after the first hold, so a later hold reason posts nothing.
-      add("ack", "ack", `Received ${title}. It has not started: ${draft.holdReason}\nI'll post questions and the result here once it starts.${hint}`);
+      add("ack", "ack", `Received ${title}. It has not started: ${draft.holdReason}\nI'll post questions and the result here once it starts.${queuedHint}`);
     }
     // A split acknowledgement is decided by its first part.
     const ack = draft.messages.find(message => message.key === "ack" || message.key === "ack#1");
@@ -503,10 +507,15 @@ export class IntakeSlackSurface {
       const named = new RegExp(`^${escapeRegExp(record.identifier)}(?=$|[\\s:,])`, "i").exec(text);
       if (named) return { record, text: text.slice(named[0].length).replace(/^\s*[:,]?\s*/, "") };
     }
+    // An answer has no identifier, so with other unfinished records the word "answer" names it.
+    const answerRecord = unfinished.length > 1 ? unfinished.find(isAnswerRecord) : undefined;
+    const selected = answerRecord ? /^answer(?=$|[\s:,])/i.exec(text) : null;
+    if (answerRecord && selected) return { record: answerRecord, text: text.slice(selected[0].length).replace(/^\s*[:,]?\s*/, "") };
     if (unfinished.length > 1) {
-      const open = unfinished.map(record => record.identifier || `your question "${record.title}"`).join(", ");
+      const open = unfinished.map(record => record.identifier || `answer (your question "${record.title}")`).join(", ");
+      const selector = unfinished.some(isAnswerRecord) ? 'an identifier, "answer", or a question number' : "an identifier or a question number";
       return { record: fallback, text, outcome: "ambiguous",
-        reply: `More than one request is open in this thread: ${open}. Start your reply with an identifier or a question number.` };
+        reply: `More than one request is open in this thread: ${open}. Start your reply with ${selector}.` };
     }
     return { record: fallback, text };
   }

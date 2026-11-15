@@ -1343,7 +1343,7 @@ test("a queued answer that could not start is acknowledged as your question, and
     await waitFor(async () => s.texts(), list => list.length === 1);
     assert.equal(s.texts()[0], 'Received your question "which exports failed?". It has not started: The project is busy.\nI\'ll post questions and the result here once it starts.');
     await waitFor(async () => s.texts(OTHER), list => list.length === 1);
-    assert.match(s.texts(OTHER)[0], /^Started on TEST-1 [\s\S]*\nI took this as a request for a change\. To ask a question instead, mention me with "ask:"\.$/);
+    assert.match(s.texts(OTHER)[0], /^Started on TEST-1 [\s\S]*\nI took this as a request for a change\. If you only wanted an answer, reply with a mention and "cancel", then mention me again starting with "ask:"\.$/);
   } finally { await s.close(); await h.close(); }
 });
 
@@ -1363,18 +1363,25 @@ test("a mention in a thread whose answer has finished is routed again, and a col
 });
 
 test("with two open records one of them an answer, the ambiguity reply names the question instead of an empty identifier", { timeout: 90000 }, async () => {
-  const { sh, s, close } = await answerSurface();
+  const { sh, s, close, id: answerId } = await answerSurface();
   try {
     const other = randomUUID();
     const { id } = await sh.missions.create({ requestId: randomUUID(), groupId: "shop", objective: "Change the API and the web client", maxSubtasks: 8, maxMinutes: 30 }, undefined, origin(other));
+    const otherMissionId = id;
     s.store.create(intakeRecord(other, "started", { thread: BINDING, missionId: id }));
     await s.surface.start(); await s.connected();
     await waitFor(async () => s.texts(), list => list.length === 2);
     await s.slack.emit(mention("go on"));
     await waitFor(async () => s.texts(), list => list.length === 3);
-    assert.match(s.texts()[2], /^More than one request is open in this thread: .*\. Start your reply with an identifier or a question number\.$/);
-    assert.ok(s.texts()[2].includes('your question "which exports failed?"') && s.texts()[2].includes("TEST-1"));
+    assert.match(s.texts()[2], /^More than one request is open in this thread: .*\. Start your reply with an identifier, "answer", or a question number\.$/);
+    assert.ok(s.texts()[2].includes('answer (your question "which exports failed?")') && s.texts()[2].includes("TEST-1"));
     assert.ok(!s.texts()[2].includes(", ,") && !s.texts()[2].includes(": ,"), "No empty identifier is listed");
+    await s.slack.emit(mention("answer status"));
+    await waitFor(async () => s.texts(), list => list.length === 4);
+    assert.match(s.texts()[3], /^(planning|working)$/);
+    await s.slack.emit(mention("Answer: cancel"));
+    await waitFor(async () => sh.missions.peek(answerId)?.status, status => status === "cancelled", 60000);
+    assert.notEqual(sh.missions.peek(otherMissionId)?.status, "cancelled", "The other request's mission is untouched");
   } finally { await close(); }
 });
 
@@ -1397,9 +1404,21 @@ test("a held answer announces its start once, and queued work keeps the ask hint
     await delay(400);
     assert.deepEqual(s.texts().map(text => text === ANSWER_START), [false, true]);
     assert.equal(s.texts().filter(text => text === ANSWER_START).length, 1);
-    const hint = 'To ask a question instead, mention me with "ask:".';
+    const hint = 'If you only wanted an answer, reply with a mention and "cancel" once it starts, then mention me again starting with "ask:".';
     assert.equal(s.texts(OTHER).length, 2);
     assert.equal(s.texts(OTHER).filter(text => text.includes(hint)).length, 1, "The hint reaches the owner exactly once");
     assert.ok(s.texts(OTHER)[0].startsWith("Queued ") && s.texts(OTHER)[0].includes(hint));
   } finally { await s.close(); await h.close(); }
+});
+
+test("with a single unfinished record the word answer is ordinary text, not a selector", { timeout: 90000 }, async () => {
+  const { s, close } = await answerSurface();
+  try {
+    await s.surface.start(); await s.connected();
+    await waitFor(async () => s.texts(), list => list.length === 1);
+    await s.slack.emit(mention("answer status"));
+    await waitFor(async () => s.store.get(ISSUE)!.inbound[0]?.outcome, outcome => outcome !== undefined, 30000);
+    assert.equal(s.store.get(ISSUE)!.inbound[0].outcome, "steered");
+    assert.equal(s.texts().length, 1, "It was steering text, so it drew no status reply");
+  } finally { await close(); }
 });

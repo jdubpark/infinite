@@ -1227,6 +1227,7 @@ test('an "ask:" mention becomes an answer mission and never calls Linear', { tim
     assert.deepEqual([record.state, record.identifier, record.url, record.rule, record.direct?.route?.kind, record.direct?.route?.by],
       ["started", "", "", "owner Slack mention of the bot (question)", "answer", "owner"]);
     assert.ok(record.direct?.filedAt);
+    assert.equal(record.direct?.routable, true, "Eligibility is fixed when the mention is saved");
     assert.equal(record.request?.mode, "answer");
     assert.deepEqual([record.request?.title, record.request?.maxSubtasks, record.request?.maxMinutes],
       ["Question: which exports failed on Monday?", 1, 30]);
@@ -1394,5 +1395,33 @@ test("an answer mission's result leaves the record finished with no Linear comme
     const finished = ctx.store.list()[0];
     assert.deepEqual([finished.state, finished.comments], ["finished", {}]);
     assert.deepEqual(linearWrites(ctx), []);
+  } finally { await ctx.close(); }
+});
+
+test("a request saved before routing existed, or while answerQuestions was off, stays work and is never read by the router", { timeout: 60000 }, async () => {
+  const calls: string[] = [];
+  const ctx = await setup({ requireSlackThread: false, admitIssues: false, router: async text => { calls.push(text); return { route: "answer", confidence: 1 }; } });
+  try {
+    // Saved while the setting was off: no route and no marker, as a record made before this feature.
+    ctx.intake.requestFromSlack(direct(ctx, "which exports failed?", () => [], 2000));
+    // A pending record written by older code: the same shape, saved directly, with a held filing.
+    const root = slackTs(ctx.enabled + 4000);
+    ctx.threads.threads.set(root, [{ ts: root, user: OWNER_SLACK, text: "update the exporter" }]);
+    const now = new Date().toISOString();
+    ctx.store.create({ issueId: randomUUID(), identifier: "", url: "", title: "update the exporter", description: "update the exporter", issueCreatedAt: now, issueUpdatedAt: now,
+      state: "queued", thread: { channelId: "C0000000000", threadTs: root }, direct: { eventId: "EvOld", ts: root, text: "update the exporter" },
+      holdReason: "It could not be filed in Linear and will be retried: timeout", comments: {}, messages: [], questions: [], inbound: [], createdAt: now, updatedAt: now });
+    const slack = ctx.config.intake!.slack!;
+    slack.answerQuestions = true; slack.classify = true;
+    const later = ctx.service();
+    await later.poll();
+    later.close();
+    assert.deepEqual(calls, [], "Neither record's text reaches the reading service");
+    const records = ctx.store.list();
+    assert.equal(records.length, 2);
+    for (const record of records) {
+      assert.deepEqual([record.direct?.route, record.direct?.routable, record.request?.mode, record.identifier !== "", record.state], [undefined, undefined, undefined, true, "started"], record.title);
+    }
+    assert.equal(ctx.linearServer.allIssues().length, 2);
   } finally { await ctx.close(); }
 });

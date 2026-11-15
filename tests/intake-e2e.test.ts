@@ -215,3 +215,31 @@ test("an \"ask:\" mention is answered read-only in the thread, and Linear receiv
     await world.close();
   }
 });
+
+test("the correction the bot advertises works: cancel the mistaken request, then ask in the same thread", { timeout: 240 * 1000 }, async () => {
+  const world = await intakeHost(true, true, true);
+  const { host, linear, slack } = world;
+  try {
+    slack!.seedThread(BINDING, [{ user: OWNER, text: "HOLD-SUBTEAM which exports failed?" }]);
+    const texts = () => slack!.posts(BINDING).map(post => post.text);
+    const mention = (ts: string, text: string) => ({ type: "app_mention", user: OWNER, channel: BINDING.channelId, ts, thread_ts: BINDING.threadTs, text: `<@${slack!.botUserId}> ${text}` });
+    await waitFor(async () => (await host.fetchApi("/intake")).body, body => body.slack?.connected === true, 30000);
+    await slack!.emit(mention("1700000900.000100", "HOLD-SUBTEAM which exports failed?"));
+    const started = await waitFor(async () => texts(), list => list.some(text => text.startsWith("Started on TEST-1")), 90000);
+    assert.ok(started.some(text => text.endsWith('I took this as a request for a change. If you only wanted an answer, reply with a mention and "cancel", then mention me again starting with "ask:".')));
+
+    await slack!.emit(mention("1700000900.000200", "cancel"));
+    const finished = await waitFor(async () => (await host.fetchApi("/intake")).body, body => body.records[0]?.state === "finished", 90000);
+    assert.equal(finished.records.length, 1);
+
+    await slack!.emit(mention("1700000900.000300", "ask: ANSWER-DIRECT which exports failed?"));
+    await waitFor(async () => texts(), list => list.some(text => text.startsWith("Answer (agent report):")), 120000);
+    const { records } = (await host.fetchApi("/intake")).body;
+    assert.equal(records.length, 2);
+    assert.deepEqual([records[1].route.kind, records[1].route.by, records[1].identifier], ["answer", "owner", ""]);
+    assert.equal(linear.allIssues().length, 1, "Only the first request has an issue");
+    assert.ok(texts().includes("Answering this from the repositories, read-only. No issue was filed."));
+  } finally {
+    await world.close();
+  }
+});

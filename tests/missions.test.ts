@@ -1549,6 +1549,41 @@ test("messages beyond one attempt's limit wait for the next, and open subteam de
   } finally { h.close(); }
 });
 
+test("a full prompt lists only the new owner direction whose message it delivers; one queued past the message limit waits for its message", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const teamId = teamOf(await until(() => h.get(id), mission => Boolean(teamOf(mission, "a"))), "a")!;
+    const decision = (n: number) => ({ id: randomUUID(), memberId: randomUUID(), revision: 1, question: `Question ${n}?`, options: [], createdAt: new Date().toISOString() });
+    const decisions = [decision(1)];
+    h.set(teamId, { status: "needs-input", decisions });
+    await h.attempt(2);
+    // While attempt 2 runs, 16 subteam questions queue first, then 20 owner directions: 36 messages, past one attempt's 30.
+    for (let n = 2; n <= 17; n++) decisions.push(decision(n));
+    h.set(teamId, { decisions });
+    await new Promise(done => setTimeout(done, 1500));
+    const directions = Array.from({ length: 20 }, (_, index) => `Direction ${index + 1}`);
+    for (const text of directions) await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text });
+    await h.report(2, { kind: "answer-child", subtaskId: "a", decisionId: decisions[0].id, text: "Yes" });
+
+    const sent = (messages: PromptMessage[]) => messages.filter(message => message.type === "owner-direction").map(message => message.text!);
+    const listed = (prompt: string, text: string) => new RegExp(`${text}(?!\\d)`).test(prompt);
+    const third = await h.attempt(3), now = sent((await h.messages(3)) as PromptMessage[]);
+    assert.ok(now.length > 0 && now.length < 20, "Some directions wait behind the message limit");
+    for (const text of directions) assert.equal(listed(third.prompt, text), now.includes(text), `${text} is listed only with its message`);
+
+    // The next fresh prompt marks what attempt 3 received and lists the rest as new, now that their messages arrive.
+    await h.report(3, { kind: "answer-child", subtaskId: "a", decisionId: decisions[1].id, text: "No" });
+    const fourth = (await h.attempt(4)).prompt, later = sent((await h.messages(4)) as PromptMessage[]);
+    assert.deepEqual(later, directions.filter(text => !now.includes(text)));
+    const earlierAt = fourth.indexOf("Owner direction that earlier coordinator attempts already received"), newAt = fourth.indexOf("Owner direction that no earlier attempt received:");
+    assert.ok(earlierAt >= 0 && newAt > earlierAt);
+    for (const text of now) assert.ok(fourth.search(new RegExp(`${text}(?!\\d)`)) > earlierAt && fourth.search(new RegExp(`${text}(?!\\d)`)) < newAt, `${text} is under the received heading`);
+    for (const text of later) assert.ok(fourth.search(new RegExp(`${text}(?!\\d)`)) > newAt, `${text} is under the new heading`);
+  } finally { h.close(); }
+});
+
 test("a coordinator forwards owner direction to a running subteam, held while it is paused and refused for queued work", { timeout: 60000 }, async () => {
   const h = scripted();
   try {
@@ -2314,9 +2349,8 @@ test("after a rotation, owner direction that earlier attempts received is marked
     await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Mention the release in the summary" });
     const third = await h.attempt(3);
     assert.equal(third.request.continuation?.mode, "start", "The idle rule starts a new conversation");
-    const delivered = "Owner direction that earlier coordinator attempts already received, in an earlier conversation.";
-    assert.ok(third.prompt.includes(`${delivered} It still applies to the mission, but a one-time request in it was for that attempt: do not carry it out again. Your notes and the mission state show what was done:\nFor this attempt only, file one follow-up in 90 minutes\n\nOwner direction that no earlier attempt received:\nMention the release in the summary`),
-      "The delivered direction is marked, and only the new one arrives as new");
+    // The earlier direction sits under a received-not-fulfilled heading; only the new one is under the new heading.
+    assert.match(third.prompt, /Owner direction that earlier coordinator attempts already received[^\n]*Receiving it does not mean it was carried out[^\n]*\nFor this attempt only, file one follow-up in 90 minutes\n\nOwner direction that no earlier attempt received:\nMention the release in the summary/);
     assert.doesNotMatch(third.prompt, /\nOwner direction:\n/, "No direction is listed without its delivery label");
     assert.deepEqual(((await h.messages(3)) as PromptMessage[]).filter(message => message.type === "owner-direction").map(message => message.text), ["Mention the release in the summary"]);
   } finally { h.close(); mock.timers.reset(); }

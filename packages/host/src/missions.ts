@@ -11,7 +11,7 @@ import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, type BlockerEvidence, 
 import type { ProductGoal } from "./goal-types.js";
 import type { ProjectGroup } from "./project-group-types.js";
 import { createMissionSchema, missionActionSchema, missionExtendSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionFollowUp, type MissionInputSource, type MissionOrigin, type MissionReport, type MissionSubtaskPlan } from "./mission-types.js";
-import { missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, subteamReport, type MissionCoordinatorNote, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
+import { isDirectionMessage, missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, subteamReport, type MissionCoordinatorNote, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
 import { addRollups, emptyRollup, teamUsage } from "./team-usage.js";
 import type { UsageService } from "./usage-service.js";
 import { ledgerRecord } from "./usage-store.js";
@@ -1206,9 +1206,10 @@ export class MissionService {
     const inbox = stored.inbox.slice(0, messageLimit), notes = stored.notes.slice(0, messageLimit - inbox.length);
     const waiting = stored.inbox.length + stored.notes.length - inbox.length - notes.length;
     // The prompt keeps a byte budget by leaving trailing messages queued, so inbox messages lead and notes are deferred first.
-    // Each direction queues one owner-direction message, delivered in order, and only an ending mission drops the inbox.
-    // So the directions whose message no attempt has taken are the newest ones; every older one reached an attempt.
-    const undelivered = stored.inbox.filter(message => message.type === "owner-direction").length;
+    // Each direction, the owner's or a connector's, queues one direction message, delivered in order, and only an ending
+    // mission drops the inbox. So the directions whose message no attempt has taken are the newest ones; every older one
+    // reached an attempt.
+    const undelivered = stored.inbox.filter(isDirectionMessage).length;
     const messages = [...inbox, ...notes], context = { openChildDecisions: this.openChildDecisions(stored), waiting, answerProjectId: this.config.intake?.mission.answerProjectId,
       notes: stored.coordinatorNotes ?? [], deliveredDirections: Math.max(0, mission.steering.length - undelivered) };
     const build = (list: MissionMessage[], promptContext: typeof context) => continuation?.mode === "resume"

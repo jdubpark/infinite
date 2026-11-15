@@ -1013,7 +1013,9 @@ goal. A paused goal must resume before work or answers can continue.
 After a pause or cancel with an active team, the goal's reason says it is
 stopping its active team. Once no team is stopping, or when there was none, for
 example between standing cycles, the reason says that the owner paused or
-cancelled the goal.
+cancelled the goal. A paused goal keeps its paused team attached for the
+resume; the reason changes once that team is paused and its members have
+stopped.
 
 A blocked goal closes as `cancelled` after `teams.retention.blockedHours` (72
 hours by default) without owner action. The host records the last blocker in its
@@ -1243,10 +1245,10 @@ paths, non-goals, or limits.
 
 A goal starts no new cycle while its tracking is not `synced`, for example
 during a Linear outage or a rate limit. The goal stays `running`, and its
-reason is the tracking reason as written; during a rate limit that reason names
-when tracking retries, and the goal's `linear` view carries the same time as
-`retryAt`. The reason clears once tracking is `synced` again. A tracking
-`blocked` status blocks the goal instead.
+reason is `New work waits for Linear tracking: ` followed by the tracking
+reason, which during a rate limit names when tracking retries. The reason
+clears once tracking is `synced` again. A tracking `blocked` status blocks the
+goal instead.
 
 Goal and Team pages show the issue link, title, workflow state, tracking status,
 and last check time. A cached issue record is not proof that Linear is currently

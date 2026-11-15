@@ -75,6 +75,8 @@ function stubTeams() {
       Object.assign(view, { status, members: Array.from({ length: members }, () => ({ memberId: randomUUID(), role: "implementer", revision: 1, status: "stopped" })) }, extra);
     },
     async cancel(id: string) { cancels.push(id); service.settle(id, "cancelled"); return service.get(id); },
+    async pause(id: string) { service.settle(id, "paused"); return service.get(id); },
+    async resume(id: string) { service.settle(id, "planning"); return service.get(id); },
     async removeRun() {},
   };
   return service;
@@ -617,7 +619,21 @@ test("a cancelled goal's reason says it was cancelled once no team is stopping",
   assert.equal(settled.reason, cancelled);
 });
 
-test("while Linear tracking holds new work, the goal shows the tracking reason as written and keeps the retry time on its tracking view", async t => {
+test("pausing a goal with an active team says the owner paused it once the team has paused, and keeps the team for the resume", async t => {
+  const { teams, goals } = fixture(t);
+  const created = await goals.create(standing());
+  goals.start();
+  const run = await until(() => teams.launches[0], Boolean);
+  const active = await until(() => goals.get(created.id), goal => goal.activeTeamId === run.request.requestId);
+  assert.equal((await goals.pause(created.id, action(active))).reason, "The goal is stopping its active team. Existing work will remain available.");
+  const paused = await until(() => goals.get(created.id), goal => goal.reason === "The owner paused this goal. No new work starts until it resumes.");
+  assert.equal(paused.status, "paused");
+  assert.equal(paused.activeTeamId, run.request.requestId, "The paused team stays attached for the resume");
+  assert.equal((await goals.resume(created.id, action(paused))).status, "running");
+  await until(() => goals.get(created.id), goal => goal.reason === undefined && goal.activeTeamId === run.request.requestId);
+});
+
+test("while Linear tracking holds new work, the goal shows the tracking reason after its prefix and adds nothing to it", async t => {
   const { f, teams } = fixture(t);
   type View = LinearTrackingView & { retryAt?: string };
   const rateLimited = "Linear is rate-limiting this host's requests. Tracking retries at 2026-11-14T00:20:00Z; execution waits until Linear confirms current requirements.";
@@ -632,13 +648,12 @@ test("while Linear tracking holds new work, the goal shows the tracking reason a
   const held = await until(() => [goals.get(created.id), goals.get(finite.id)], all => all.every(goal => goal.reason !== undefined));
   for (const goal of held) {
     assert.equal(goal.status, "running");
-    assert.equal(goal.reason, rateLimited, "The reason already names the retry time; it is not added again");
-    assert.equal((goal.linear as View).retryAt, "2026-11-14T00:20:00Z");
+    assert.equal(goal.reason, `New work waits for Linear tracking: ${rateLimited}`, "The tracking reason already names the retry time; nothing is added");
   }
   assert.equal(teams.launches.length, 0);
 
   view = { status: "error", reason: "Linear could not be reached." };
-  await until(() => goals.get(created.id), goal => goal.reason === "Linear could not be reached.");
+  await until(() => goals.get(created.id), goal => goal.reason === "New work waits for Linear tracking: Linear could not be reached.");
 
   view = { status: "synced" };
   await until(() => teams.launches.length, count => count === 2);

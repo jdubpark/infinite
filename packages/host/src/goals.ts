@@ -60,11 +60,10 @@ const timeLimitReason = "The approved time limit has expired.";
 /** An owner pause or cancel that has an active team to stop says so; once no team is stopping, the reason names the action. */
 const stoppingReason = "The goal is stopping its active team. Existing work will remain available.";
 const ownerStopReason = { pause: "The owner paused this goal. No new work starts until it resumes.", cancel: "The owner cancelled this goal. Existing work remains available." };
-/**
- * The goal's reason while Linear tracking holds new work: the tracking view's own reason, shown as written. During a
- * rate limit it already names the retry time, which the view also carries as `retryAt`.
- */
-const trackingReason = (view: LinearTrackingView | undefined) => view?.reason ?? "Waiting for Linear to confirm this goal's issue.";
+/** While Linear tracking holds new work, the goal shows the tracking reason after this prefix; the prefix lets a later pass clear it. */
+const trackingHoldPrefix = "New work waits for Linear tracking: ";
+/** The view's reason already names the retry time during a rate limit, so nothing is added to it. */
+const trackingHoldReason = (view: LinearTrackingView | undefined) => `${trackingHoldPrefix}${view?.reason ?? "Linear has not confirmed this goal's issue."}`;
 const repeatedFailuresReason = "Three cycles in a row failed, so this standing goal paused. Review the failed cycles, then resume it to reset the count.";
 const maxExtensionFailures = 3;
 const correctionEvent = (version: number) => `The owner corrected the objective record to version ${version}.`;
@@ -701,8 +700,6 @@ export class GoalService {
     await this.recoverExtension(stored);
     const goal = stored.goal;
     this.closeStaleBlocked(stored);
-    // A hold copies the tracking reason of the view saved with it, so that view says which reason a hold left.
-    const held = goal.linear && goal.linear.status !== "synced" ? trackingReason(goal.linear) : undefined;
     goal.linear = this.linear?.updateGoal(goal, goal.linearTracking === true) ?? goal.linear;
     if (goal.linear?.status === "blocked" && !terminal.has(goal.status)) {
       const reason = goal.linear.reason ?? "The Linear issue no longer matches this approved goal. Review it before starting another goal.";
@@ -711,7 +708,7 @@ export class GoalService {
     this.save(stored);
     const inbox = goal.standing ? this.readWake(stored) : "current";
     const trackingReady = !goal.linear || goal.linear.status === "synced";
-    if (trackingReady && held !== undefined && goal.reason === held && goal.status === "running" && !goal.activeTeamId) { goal.reason = undefined; this.save(stored); }
+    if (trackingReady && goal.reason?.startsWith(trackingHoldPrefix)) { goal.reason = undefined; this.save(stored); }
     // Mirror first: a paused team's approved extension still protects the goal from its old deadline.
     if (goal.activeTeamId) {
       let team: TeamView | undefined;
@@ -802,6 +799,10 @@ export class GoalService {
       } else if (["running", "needs-input"].includes(goal.status)) {
         if (team.status === "paused") { goal.status = "paused"; goal.reason = "The active team was paused."; }
         else { goal.status = team.status === "needs-input" ? "needs-input" : "running"; goal.reason = team.reason; }
+      } else if (goal.status === "paused" && goal.reason === stoppingReason && !stored.control && team.status === "paused"
+        && team.members.every(member => ["stopped", "waiting"].includes(member.status))) {
+        // The owner's pause reached the team and its members have stopped. The team stays attached for the resume.
+        goal.reason = ownerStopReason.pause;
       }
       this.save(stored);
       }
@@ -923,11 +924,11 @@ export class GoalService {
     await this.prepare(stored, foldedCycles(goal) + goal.cycles.length + 1, Math.min(60, goal.maxMembers), latest === "current");
   }
   /**
-   * New work waits while Linear tracking is not synced. The goal stays `running` and shows the tracking reason; the
-   * view's `retryAt` stays on `goal.linear`. No event is recorded: tracking goes briefly unsynced on every refresh.
+   * New work waits while Linear tracking is not synced. The goal stays `running` and shows the tracking reason. No
+   * event is recorded: tracking goes briefly unsynced on every refresh.
    */
   private holdForTracking(stored: Stored) {
-    const reason = trackingReason(stored.goal.linear);
+    const reason = trackingHoldReason(stored.goal.linear);
     if (stored.goal.reason === reason) return;
     stored.goal.reason = reason; this.save(stored);
   }

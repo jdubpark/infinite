@@ -1,34 +1,53 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import type { ProductGoal } from "../packages/host/src/goal-types.js";
 import type { Project } from "../packages/host/src/types.js";
-import type { Criterion, ObjectiveRecord } from "../packages/host/src/objective-types.js";
+import type { Check, Criterion, ObjectiveRecord } from "../packages/host/src/objective-types.js";
+import { objectiveRecordSchema, recordDigest } from "../packages/host/src/objective-types.js";
+import { goalRecord } from "../packages/host/src/objective-record.js";
 import { checkLabel, objectivePromptsOn, recordDigestFor } from "../packages/host/src/objective-digest.js";
 import { commandDigest } from "../packages/host/src/objective-input.js";
 import { RECORD_DIGEST_BYTES, RECORD_LABEL_BYTES, recordDigestBytes, recordDigestSchema } from "../packages/host/src/team-types.js";
 import type { TeamCommand } from "../packages/host/src/team-types.js";
 
+const GOAL_ID = "6f1c2a3e-8b4d-4c5e-9f60-718293a4b5c6";
+const AT = "2026-11-15T10:00:00.000Z";
 const judgement = { kind: "judgement", item: "owner-text" } as const;
 const test1 = { command: "npm", args: ["test"] } as TeamCommand;
+/** A criterion whose producer fits its check: a judgement is the evaluator's, as objectiveRecordSchema requires. */
 const criterion = (id: string, overrides: Record<string, unknown> = {}): Criterion => ({
-  id, origin: "owner", statement: `Statement ${id}.`, check: judgement, producer: "owner", threshold: { kind: "pass" }, state: "active", ...overrides,
+  id, origin: "owner", statement: `Statement ${id}.`, check: judgement, producer: "evaluator", threshold: { kind: "pass" }, state: "active", ...overrides,
 }) as Criterion;
-const recordOf = (criteria: Criterion[], version = 2): ObjectiveRecord => ({ version, criteria }) as unknown as ObjectiveRecord;
 const projectWith = (objective: unknown) => ({ team: { checks: [], establishChecks: true, objective } }) as unknown as Pick<Project, "team">;
 
+/** The record the host writes for a goal, with criteria appended and c0 moved last, so the digest must put c0 first. */
+function hostRecord(): ObjectiveRecord {
+  const goal = {
+    id: GOAL_ID, objective: "Find ranked sources for the research brief.", successCriteria: "A ranked shortlist with reasons and sources",
+    nonGoals: [], allowedPaths: ["research"], evidence: [], steering: [],
+  } as unknown as ProductGoal;
+  const built = goalRecord(goal, AT, "created");
+  if (built === "source-invalid") throw new Error("the fixture goal must build a record");
+  const c0 = built.criteria[0] as Criterion;
+  const criteria = [
+    criterion("c1", { statement: "Tests pass.", check: { kind: "command", command: commandDigest(test1) }, producer: "host" }),
+    criterion("c2", { statement: "The summary is clear." }),
+    criterion("c3", { statement: "Retired.", state: "retired" }),
+    c0,
+  ];
+  return objectiveRecordSchema.parse({ ...built, criteria, digest: recordDigest({ ...built, criteria }) });
+}
+
 test("the digest lists active criteria with c0 first and empty", () => {
-  const record = recordOf([
-    criterion("c0", { statement: "The goal is done.", check: judgement }),
-    criterion("c1", { statement: "Tests pass.", check: { kind: "command", command: commandDigest(test1) }, producer: "host", threshold: { kind: "pass" } }),
-    criterion("c2", { statement: "Retired.", state: "retired" }),
-    criterion("c3", { statement: "The spec exists.", check: { kind: "artifact", path: "docs/x.md", count: "/n" }, producer: "host", threshold: { kind: "count", min: 1 } }),
-  ]);
+  const record = hostRecord();
+  assert.deepEqual(record.criteria.map(item => item.id), ["c1", "c2", "c3", "c0"], "the record puts c0 last");
   const digest = recordDigestFor(record, [test1]);
-  assert.deepEqual(digest.criteria.map(item => item.id), ["c0", "c1", "c3"]);
-  assert.deepEqual(digest.criteria[0], { id: "c0", statement: "", check: "judgement:owner-text", producer: "owner" });
+  assert.deepEqual(digest.criteria.map(item => item.id), ["c0", "c1", "c2"], "the digest puts c0 first and drops the retired criterion");
+  assert.deepEqual(digest.criteria.map(item => item.producer), ["evaluator", "host", "evaluator"]);
+  assert.deepEqual(digest.criteria[0], { id: "c0", statement: "", check: "judgement:owner-text", producer: "evaluator" });
   assert.equal(digest.criteria[1]?.check, "command:npm test");
   assert.equal(digest.criteria[1]?.statement, "Tests pass.");
-  assert.equal(digest.criteria[2]?.check, "artifact:docs/x.md");
-  assert.equal(digest.version, 2);
+  assert.equal(digest.version, record.version);
   assert.ok(recordDigestSchema.safeParse(digest).success, "the digest parses with the digest schema");
   assert.equal(recordDigestBytes(digest), Buffer.byteLength(JSON.stringify(digest)));
 });
@@ -45,6 +64,11 @@ test("labels are bounded and plain", () => {
   assert.equal(checkLabel({ kind: "judgement", item: "owner-text" }, []), "judgement:owner-text");
   assert.equal(checkLabel({ kind: "owner-rating", subject: "tone" }, []), "owner-rating:tone");
 
+  const c1Path = checkLabel({ kind: "artifact", path: "docs/a\u0085b\u009bc.md" }, []);
+  assert.equal(c1Path, "artifact:docs/a b c.md", "C1 controls become spaces");
+  const separators = checkLabel({ kind: "citations", path: "docs/a b c.md", entries: "/entries", perEntry: 1 }, []);
+  assert.equal(separators, "citations:docs/a b c.md", "line and paragraph separators become spaces");
+
   const exact = { command: "x".repeat(112), args: [] } as TeamCommand;
   const exactLabel = checkLabel({ kind: "command", command: commandDigest(exact) }, [exact]);
   assert.equal(Buffer.byteLength(exactLabel), RECORD_LABEL_BYTES, "a label of exactly 120 bytes is kept");
@@ -59,6 +83,11 @@ test("labels are bounded and plain", () => {
   const wideLabel = checkLabel({ kind: "command", command: commandDigest(wide) }, [wide]);
   assert.equal(wideLabel, `command:${"é".repeat(54)}...`, "the cut keeps each two-byte character whole");
   assert.ok(Buffer.byteLength(wideLabel) <= RECORD_LABEL_BYTES);
+
+  const threeByte = { command: "ab" + "€".repeat(100), args: [] } as TeamCommand;
+  const threeByteLabel = checkLabel({ kind: "command", command: commandDigest(threeByte) }, [threeByte]);
+  assert.equal(threeByteLabel, `command:ab${"€".repeat(35)}...`, "the cut keeps each three-byte character whole");
+  assert.equal(Buffer.byteLength(threeByteLabel), 118);
 });
 
 test("the digest schema refuses what the rule refuses", () => {

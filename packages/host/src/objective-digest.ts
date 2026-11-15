@@ -47,8 +47,12 @@ function labelOf(check: Check, configured: readonly TeamCommand[]): string {
   }
 }
 
+/**
+ * Replaces each C0 and C1 control character, and the line and paragraph separators, with a space, so a label stays
+ * one line. The set matches the CLI's `clean` (objective-cli.ts).
+ */
 function plain(text: string): string {
-  return [...text].map(char => (char.charCodeAt(0) < 0x20 || char.charCodeAt(0) === 0x7f ? " " : char)).join("");
+  return text.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ");
 }
 
 /** Cuts at a character boundary so that the label, with its three dots, fits RECORD_LABEL_BYTES. */

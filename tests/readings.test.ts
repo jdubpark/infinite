@@ -196,6 +196,30 @@ test("background polling retains compact session snapshots instead of full promp
   } finally { f.dispose(); }
 });
 
+test("polling reads a session record once unless a title reading may follow", async () => {
+  const f = setup({ title: "Fix the login flow" });
+  const sessions: Record<string, Session> = {
+    O: { ...f.session, id: "O", title: "Fix the login flow", generatedTitle: undefined, initialPrompt: "Fix the login flow" },
+    S: { ...f.session, id: "S", title: "", generatedTitle: true, initialPrompt: "Short prompt" },
+    C: { ...f.session, id: "C", title: "", generatedTitle: true, initialPrompt: longLine },
+  };
+  const reads: Record<string, number> = { O: 0, S: 0, C: 0 };
+  const rows: ReadingRow[] = (["O", "S", "C"] as const).map(id => ({ id, title: sessions[id].title, provider: "claude", attention: { ...now("Working."), state: "working" } }));
+  f.manager.list = async () => rows;
+  f.manager.meta = (id: string) => { reads[id]!++; return { session: sessions[id] }; };
+  try {
+    await f.readings.tick();
+    await f.readings.tick();
+    assert.deepEqual(reads, { O: 1, S: 1, C: 2 });
+    const merged = f.readings.merge([rows[1]!]);
+    assert.deepEqual(merged[0]!.reading?.title, { text: "Short prompt", source: "first-line" });
+    assert.equal(reads.S, 1, "a short first line is answered from the remembered snapshot");
+    rows[0]!.title = "Renamed login flow";
+    await f.readings.tick();
+    assert.equal(reads.O, 2, "a renamed row is read again");
+  } finally { f.dispose(); }
+});
+
 test("failures are held briefly, list merging stays synchronous, stale hashes drop, and cache survives restart", async () => {
   let calls = 0;
   const failing = { systemOne: async () => { calls++; throw new Error("timeout"); } } as unknown as JevTransport;

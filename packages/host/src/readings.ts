@@ -101,6 +101,8 @@ export class Readings {
   private readonly active = new Map<string, string>();
   private readonly latestRows = new Map<string, LatestRow>();
   private readonly latestSessions = new Map<string, LatestSession>();
+  /** Sessions that can never need a title reading: their latest snapshot, valid while the row's title is the same. */
+  private readonly settledSessions = new Map<string, { title: string; latest: LatestSession }>();
   private observationRevision = 0;
   private timer?: ReturnType<typeof setInterval>;
   private readonly apiKey?: string;
@@ -182,20 +184,26 @@ export class Readings {
       this.latestRows.clear();
       this.latestSessions.clear();
       for (const [id, row] of retainedExternal) this.latestRows.set(id, row);
+      for (const id of this.settledSessions.keys()) if (!incoming.has(id)) this.settledSessions.delete(id);
     }
     for (const row of rows) {
       const lastMessage = row.attention.lastMessage ?? "";
       this.latestRows.set(row.id, { backend: row.backend, state: row.attention.state,
         lastMessageHash: "", lastMessageLength: lastMessage.length });
+      const settled = this.settledSessions.get(row.id);
+      if (settled?.title === row.title) { this.latestSessions.set(row.id, settled.latest); continue; }
       let session: Session;
       try { session = this.manager.meta(row.id).session; }
-      catch { this.latestSessions.delete(row.id); continue; }
+      catch { this.latestSessions.delete(row.id); this.settledSessions.delete(row.id); continue; }
       const prompt = session.initialPrompt ?? "";
       const titleIsDefault = defaultTitle(session.title, session.provider, session.generatedTitle);
       const line = titleIsDefault && prompt ? firstLine(prompt) : "";
-      this.latestSessions.set(row.id, { defaultTitle: titleIsDefault,
+      const latest: LatestSession = { defaultTitle: titleIsDefault,
         promptLine: line.length <= 60 ? line : clipTitle(line), promptLineLength: line.length,
-        ...(titleIsDefault && prompt ? { promptHash: messageHash(prompt) } : {}) });
+        ...(titleIsDefault && prompt ? { promptHash: messageHash(prompt) } : {}) };
+      this.latestSessions.set(row.id, latest);
+      if (latest.promptLineLength <= 60) this.settledSessions.set(row.id, { title: row.title, latest });
+      else this.settledSessions.delete(row.id);
       onSession?.(row, session);
     }
     if (source === "partial") return;

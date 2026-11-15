@@ -329,3 +329,32 @@ test("the status reports an earlier mass under the cap as its applied mass", () 
     f.close();
   }
 });
+
+test("the applied earlier mass sums each level's capped mass", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    const astra = mixedLineup.implementers[1]!;
+    // A recorded cell: area host, kind feature, feature version 1, feature map default.
+    seed(store, { area: "host" });
+    // Forty earlier rows under another project (tenant level): raw mass 20 at half weight, capped to 10 (scale 0.5).
+    // Four earlier rows in the cell: raw mass 2, under the cap (scale 1), so applied 2.
+    const inCell = (id: string, projectId: string): OutcomeRow => ({
+      ...earlierRow(id, astra, projectId), kind: "feature",
+      payload: { ...PAYLOAD_BASE, projectId, area: "host", featureMap: "default" },
+    });
+    store.write(tx => {
+      for (let index = 0; index < 40; index++) writeOutcome(tx, inCell(`tenant-${index}`, "elsewhere"));
+      for (let index = 0; index < 4; index++) writeOutcome(tx, inCell(`cell-${index}`, "rehearsal"));
+    });
+    const status = routingStatus(store, statusInput({ saved: { mode: "shadow" } }));
+    const cell = status.cells.find(line => line.cell.scope === "cell")!;
+    const profile = cell.profiles.find(item => item.profileId === "astra-xhigh")!;
+    // Tenant and cell each take their own scale: 20 raw becomes 10, 2 stays 2, so 22 raw and 12 applied over 44 rows.
+    assert.deepEqual(profile.earlier, { rows: 44, mass: 22, appliedMass: 12 });
+  } finally {
+    store?.close();
+    f.close();
+  }
+});

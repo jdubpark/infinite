@@ -79,6 +79,13 @@ test("a required Slack thread needs the Slack block and Linear's agent ID", () =
   assert.throws(() => validate({ slack: undefined, requireSlackThread: true }), /requireSlackThread needs intake\.slack/);
   assert.throws(() => validate({ slack: { ...slack, linearAgentUserId: undefined } }), /linearAgentUserId/);
 });
+test("not admitting Linear issues needs direct requests, which need no Linear agent ID", () => {
+  const linear = { ...base.linear, admitIssues: false };
+  assert.throws(() => validate({ linear }), /admitIssues/);
+  assert.doesNotThrow(() => validate({ linear, slack: { ...slack, directRequests: true, linearAgentUserId: undefined } }));
+  assert.equal(parsed({}).intake!.linear.admitIssues, true);
+  assert.equal(parsed({}).intake!.slack!.directRequests, false);
+});
 test("intake refuses a configuration without the owner's creator ID when a thread is required", () =>
   assert.throws(() => validate({ linear: { ...base.linear, creatorId: undefined }, requireSlackThread: true }), /creatorId/));
 test("intake refuses a configuration without the owner's creator ID when no thread is required", () =>

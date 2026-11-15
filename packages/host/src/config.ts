@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { Config } from "./types.js";
 import { assertRunnerDeployment, parseDeployment } from "./deployment.js";
 import { machineIdentity } from "./machine.js";
+import { autonomyModeSchema } from "./autonomy.js";
 import { projectSourceSchema, teamProjectSchema, teamCommandSchema, teamRetentionSchema, storageFloorSchema, teamLineupSchema } from "./team-types.js";
 import { intakeConfigSchema } from "./intake-types.js";
 
@@ -24,13 +25,28 @@ export const usageConfigSchema = z.object({
 export type UsageConfig = z.infer<typeof usageConfigSchema>;
 export const machineLabelSchema = z.string().trim().min(1).max(80);
 
+/** Launches per rolling hour. No default: an absent key stays absent, and the service supplies 30 and 80. */
+const fuseCeilingsSchema = z.object({ launchesPerHour: z.number().int().min(1).max(1000).optional() }).strict();
+export const fuseConfigSchema = z.object({
+  project: fuseCeilingsSchema.optional(),
+  host: fuseCeilingsSchema.optional(),
+  projects: z.record(z.string().min(1), fuseCeilingsSchema).optional(),
+}).strict();
+export type FuseConfig = z.infer<typeof fuseConfigSchema>;
+/** Outcome measurement settings. No default here: each consumer applies its own default where it reads the value. */
+export const outcomeSettingsSchema = z.object({
+  holdDays: z.number().int().min(1).max(365).optional(),
+  retentionDays: z.number().int().min(30).max(3650).optional(),
+}).strict();
+
 const schema = z
   .object({
     linear: z.object({ apiKeyFile: z.string().refine(isAbsolute), endpoint: z.url().optional() }).strict().optional(),
     hostLoad: z.object({ minAvailableMemoryGiB: z.number().min(0).max(4096), maxLoadPerCpu: z.number().positive().max(64) }).strict().optional(),
     intake: intakeConfigSchema.optional(),
-    teams: z.object({ workspaceDir: z.string().refine(isAbsolute), commandPrefix: teamCommandSchema.optional(), lineup: teamLineupSchema.optional(), trustWorkspaces: z.boolean().optional(), publishHeads: z.boolean().default(true), stallMinutes: z.number().int().min(5).max(1440).optional(), checkMinutes: z.number().positive().max(240).optional(), retention: teamRetentionSchema.optional(), storageFloor: storageFloorSchema.optional() }).strict().optional(),
+    teams: z.object({ workspaceDir: z.string().refine(isAbsolute), commandPrefix: teamCommandSchema.optional(), lineup: teamLineupSchema.optional(), trustWorkspaces: z.boolean().optional(), publishHeads: z.boolean().default(true), stallMinutes: z.number().int().min(5).max(1440).optional(), checkMinutes: z.number().positive().max(240).optional(), retention: teamRetentionSchema.optional(), storageFloor: storageFloorSchema.optional(), outcomes: outcomeSettingsSchema.optional() }).strict().optional(),
     machine: z.object({ id: z.uuid(), label: machineLabelSchema }).strict().optional(),
+    autonomy: z.object({ defaultMode: autonomyModeSchema.optional(), fuse: fuseConfigSchema.optional() }).strict().optional(),
     cmux: z.object({ enabled: z.boolean(), command: z.string().min(1).optional(), hooksDir: z.string().refine(isAbsolute).optional() }).strict().optional(),
     remote: z.object({ enabled: z.boolean(), relay: z.object({ url: z.url(), tokenFile: z.string().refine(isAbsolute) }).strict().optional() }).strict().optional(),
     deployment: z.unknown().optional(),
@@ -130,8 +146,8 @@ const schema = z
         endpoint: z.url().default("https://exp.host/--/api/v2/push/send"),
         detail: z.enum(["minimal", "full"]).default("minimal"),
         events: z
-          .array(z.enum(["needs-you", "turn-finished", "exited", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "team-blocked", "host-storage"]))
-          .default(["needs-you", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "host-storage"]),
+          .array(z.enum(["needs-you", "turn-finished", "exited", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "team-blocked", "host-storage", "autonomy-interrupt"]))
+          .default(["needs-you", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "host-storage", "autonomy-interrupt"]),
       })
       .strict()
       .optional(),
@@ -177,8 +193,10 @@ export function validateIntakeConfig(config: Config): void {
   // Without a Slack block no thread is read or bound, so mirroring would leave the outcome nowhere.
   if (intake.linear.commentsMirrorToSlack && !intake.slack) throw new Error("commentsMirrorToSlack needs intake.slack");
   const slack = intake.slack;
+  // Without admission and without direct requests nothing could ever start a mission.
+  if (intake.linear.admitIssues === false && !slack?.directRequests) throw new Error("admitIssues false needs intake.slack.directRequests");
   if (slack) {
-    if (intake.requireSlackThread && !slack.linearAgentUserId) throw new Error("requireSlackThread needs intake.slack.linearAgentUserId");
+    if (intake.requireSlackThread && intake.linear.admitIssues !== false && !slack.linearAgentUserId) throw new Error("requireSlackThread needs intake.slack.linearAgentUserId");
     if (slack.bindByMention && intake.requireSlackThread) throw new Error("bindByMention cannot be used with requireSlackThread");
     const tokenMessage = "Slack token must be a nonempty private 0600 file outside runtime state and project workspaces";
     for (const file of [slack.appTokenFile, slack.botTokenFile]) {
@@ -198,7 +216,11 @@ export function validateIntakeConfig(config: Config): void {
     throw new Error("intake.mission.answerProjectId must name a configured project");
 }
 export function readConfig(file: string): { config: Config; key: Buffer } {
-  const config = schema.parse(JSON.parse(readFileSync(file, "utf8"))) as Config;
+  const parsed = schema.parse(JSON.parse(readFileSync(file, "utf8")));
+  for (const id of Object.keys(parsed.autonomy?.fuse?.projects ?? {})) {
+    if (!parsed.projects.some(project => project.id === id)) throw new Error("Fuse limits name a project that is not configured");
+  }
+  const config = parsed as Config;
   config.deployment = parseDeployment(config.deployment);
   validateLinearConfig(config);
   validateIntakeConfig(config);

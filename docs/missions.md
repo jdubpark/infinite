@@ -260,6 +260,15 @@ An intake mission stops its working-time clock while it is `needs-input` or
 `paused`, and the deadline moves forward by the time it was stopped. Waiting for
 an owner answer does not use up the limit. Other missions keep a fixed deadline.
 
+### Stale blocked missions
+
+A `blocked` mission cannot resume; it stays under `needs-input` so the owner
+reads the reason. When it has been blocked for `teams.retention.blockedHours`
+(default 72), the host closes it as `cancelled`. The reason and one event read
+"Closed by the host after 72 hours blocked without owner action", followed by
+the last blocker. The host closed it; nothing about the work is claimed. Team
+runs and goals close the same way; see [teams](teams.md).
+
 ### Origin
 
 A mission started by intake records `origin`: `kind: "intake"`, the Linear issue
@@ -283,7 +292,29 @@ were not started by a mission. Subteams appear only inside their mission.
 Every item carries `groupId` and `projectName` for the project that contains its
 host project, including teams and goals, so a project filter keeps every run of
 that project. Rows are newest-updated first within a column. `detail` shows the
-open question, the block reason, or the current step.
+open question, the block reason, or the current step. `createdAt` is the time the
+mission, run, or goal was created.
+
+### Attempts
+
+Missions of one project with the same objective are attempts of one work item:
+the owner sent the same request again after an earlier one stopped. The same
+holds for standalone team runs of one host project with the same objective.
+Objectives are compared after trimming and collapsing whitespace. Goals repeat
+by design and are never attempts.
+
+When the host holds more than one attempt, each item carries `attempt`:
+
+| Field | Meaning |
+|---|---|
+| `workId` | The same for every attempt of the work. |
+| `number`, `of` | Position among the attempts the host still holds, oldest first, and how many there are. A deleted run no longer counts. |
+| `superseded` | A newer attempt exists and this one is `blocked` or `cancelled`. |
+
+The board still lists every attempt. A client may fold superseded attempts
+behind the newest one; an older attempt that is under way or awaiting review is
+never superseded, so folding does not hide work that can still change. The phone
+folds them and shows "Attempt N of M"; the other clients list every item.
 
 ## Clients
 

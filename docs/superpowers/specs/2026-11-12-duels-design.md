@@ -61,16 +61,16 @@ The design picks A and delivers it through B, as two modes of one mechanism. C s
 The duel policy sits in the project team configuration, beside `permissions` and the router's `routing`:
 
 ```ts
-const teamDuelsSchema = z.object({
-  mode: z.enum(["off", "shadow", "live"]).default("off"),
-  share: z.number().min(0).max(0.25).default(0.1),
-  graceMinutes: z.number().int().min(1).max(60).default(10),
-  judgeMinutes: z.number().int().min(2).max(30).default(10),
-  gateChecks: z.array(teamCommandSchema).max(4).default([]),
+const teamDuelsSchema = z.object({                          // read default:
+  mode: z.enum(["off", "shadow", "live"]).optional(),         // "off"
+  share: z.number().min(0).max(0.25).optional(),              // 0.1
+  graceMinutes: z.number().int().min(1).max(60).optional(),   // 10
+  judgeMinutes: z.number().int().min(2).max(30).optional(),   // 10
+  gateChecks: z.array(teamCommandSchema).max(4).optional(),   // []
 }).strict();
 ```
 
-The owner saves it through the route that saves `routing`. `createRun` pins a copy as `run.duels`.
+The routine digest hashes the project team configuration, so no key has a schema default, and the code applies each default at read (umbrella C11). The owner saves it through the route that saves `routing`. `createRun` pins a copy as `run.duels`. In an `autonomous` project (C12) without a saved policy, the mode is `live` at the default share once the eval and grader identities exist, and `off` before (decided 2026-11-13).
 
 The host starts a duel for a task only when all of these hold:
 
@@ -78,8 +78,8 @@ The host starts a duel for a task only when all of these hold:
 2. The task is an implementer task with `normal` risk, on the first attempt of its assignment.
 3. Its `start` routing decision is not exploratory. *(My call: one experiment per task keeps attribution clean.)*
 4. Part 2 yields a challenger.
-5. The judge profile, `lineup.reviewer`, differs in model from both contestants, and its calibration is `ok` (Part 9).
-6. No provider limit is active for a contestant or the judge.
+5. The judge profile, `lineup.judge`, exists, differs in model from both contestants, and has an `ok` calibration (Part 9). `judge` is a new optional lineup profile, separate from the reviewer (decided 2026-11-13). It goes after the lineup's last key, because lineup fingerprints follow key order.
+6. No provider limit is active for a contestant or the judge. The challenger's and the judge's providers are at or above the learning floor (delegated adoption design, Part 9).
 7. Free worker slots exceed the tasks that are ready to start, and three host session slots are free.
 8. The run has no open duel and has had fewer than two. If the run has a deadline, the duel's allowance fits before it (Part 8).
 9. The duel cap has room (Part 8), and duels are not paused for the project.
@@ -217,7 +217,7 @@ Every other contestant row keeps its own disposition and source `production`: a 
 
 ### Part 8: Budget, slots, and time
 
-**Budget.** The challenger's session, the judge's session, and every calibration session have purpose `duel` (contract C8). Before a duel starts, the host reserves an estimate against the project's duel cap, through the learning budget that the replay eval design owns. The reservation has two amounts, `listUsd` and `spentUsd`. Each is the challenger profile's measured median for one implementer attempt in the project, plus the judge profile's measured median for one judgement. A profile that is not metered adds nothing to `spentUsd`. A profile with no measured history uses the learning budget's owner-set fallback, and with no fallback the reservation is refused and no duel starts. The reservation settles as the learning budget defines. The cap governs admission: an overrun never stops a running duel, and it blocks the next one.
+**Budget.** The challenger's session, the judge's session, and every calibration session have purpose `duel` (contract C8). Before a duel starts, the host reserves an estimate against the project's duel cap, through the learning budget that the replay eval design owns. The reservation has the three amounts of the learning budget: tokens, `listUsd`, and `spentUsd`. Each is the challenger profile's measured median for one implementer attempt in the project, plus the judge profile's measured median for one judgement. A profile that is not metered adds nothing to `spentUsd`. A profile with no measured history uses the learning budget's owner-set fallback, and with no fallback the reservation is refused and no duel starts. The reservation settles as the learning budget defines. The cap governs admission: an overrun never stops a running duel, and it blocks the next one.
 
 **Worker slots.** A challenger holds a normal worker slot, and condition 7 starts a duel only when no ready task needs that slot. When a task becomes ready later and no slot is free, the host abandons the duel and stops the challenger. *(My call: a slot outside `run.parallelism` would break the approved ceiling, and a slot taken from ready work would slow the run.)*
 
@@ -274,7 +274,7 @@ The host also watches counted, judge-decided duels per judge identity:
 
 Each phase is its own pull request and is useful alone.
 
-1. **Judge and calibration.** The `judge` role, the package, the `judgement` report, and the calibration job. It tells the owner how well the reviewer model picks the better diff.
+1. **Judge and calibration.** The `judge` role and lineup profile, the package, the `judgement` report, and the calibration job. It tells the owner how well the judge model picks the better diff.
 2. **Shadow duels.** The policy and pin, eligibility, the challenger, the budget reservation, the gate, the `duels` table, the ledger fields, and `infinite duels status`.
 3. **Live duels.** Hold and choose, winner integration, and clone retention.
 4. **Router use and monitors.**
@@ -295,13 +295,13 @@ Each phase is its own pull request and is useful alone.
 
 ## Owner decisions
 
-1. The mode per project and the share. `live` authorizes a delay of up to two allowances per run. The proposed share is 10%.
-2. The duel cap inside the learning budget.
-3. Whether the judge is the reviewer profile, as designed, or a separate lineup profile. A separate judge weakens the pull toward what the reviewer model likes.
+1. **Decided 2026-11-13:** `live` at a 10% share once the two accounts exist. `live` authorizes a delay of up to two allowances per run.
+2. **Decided 2026-11-13:** the duel cap is 20% of the standing learning budget, which is a quarter of the weekly fuse.
+3. **Decided 2026-11-13:** the judge is a separate lineup profile, `lineup.judge`, not the reviewer.
 4. `gateChecks` per project. The default is none.
 5. Whether a challenger may use the run's delegated permission reviewer under its own cap. As designed it leaves at its first permission prompt.
 6. The calibration threshold (30 pairs and a lower bound of 0.60 are proposed), whether a calibration must come from one project's pairs alone, and whether a judge may share a model vendor with one contestant. As designed pairs pool across the tenant's projects, and it may.
-7. The two accounts of the replay eval design. Calibration and the judge need them, and no duel runs without them.
+7. **Decided 2026-11-13:** add the two accounts of the replay eval design. Calibration and the judge need them, and no duel runs without them.
 
 ## Left to the builder
 

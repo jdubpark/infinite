@@ -91,6 +91,17 @@ test("a rehearsal turn journals its usage, and its exit journals the coverage of
     assert.equal(coverage.data.reason, undefined);
     assert.equal(coverage.data.provider, "demo");
     assert.equal(coverage.data.finalDrain, "complete");
+    // The usage ledger folds the journal: the session reads as measured and complete, with the journal's token sums.
+    const sum = (field: "input" | "output") => usage.reduce((total: number, event: any) => total + event.data.tokens[field], 0);
+    const listed = await waitFor(() => host.fetchApi("/sessions"), (r) => {
+      const row = r.body.sessions.find((session: any) => session.id === id);
+      return row?.usage?.measured === true && row.usage.coverage === "complete";
+    }, 20000);
+    const ledger = listed.body.sessions.find((session: any) => session.id === id).usage;
+    assert.equal(ledger.tokens.input, sum("input"));
+    assert.equal(ledger.tokens.output, sum("output"));
+    // A rehearsal record is a Claude record: it is recorded and not priced, so nothing is spent.
+    assert.equal((await host.fetchApi("/usage")).body.month.spent.usd, 0);
   } finally {
     await host.stop();
   }

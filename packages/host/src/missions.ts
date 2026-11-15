@@ -5,7 +5,7 @@ import { writeSealed, unseal } from "./vault.js";
 import { TeamService, TeamError, providerInputReason } from "./teams.js";
 import type { Manager } from "./manager.js";
 import type { Config } from "./types.js";
-import type { CreateTeam, NativeContinuation, TeamAssignment, TeamView } from "./team-types.js";
+import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, type CreateTeam, type NativeContinuation, type TeamAssignment, type TeamView } from "./team-types.js";
 import type { ProductGoal } from "./goal-types.js";
 import type { ProjectGroup } from "./project-group-types.js";
 import { createMissionSchema, missionActionSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionInputSource, type MissionOrigin, type MissionReport, type MissionSubtaskPlan } from "./mission-types.js";
@@ -16,6 +16,8 @@ import { missionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { ensureDefaultTeamRoot, ensureHostDirectory } from "./team-workspace.js";
 import { resumeFailed } from "./native-continuation.js";
 import { HOST_LOAD_REASON_PREFIX, LaunchHeldError, holdsHostLoadReason } from "./host-load.js";
+import { applyFuseReason, workLaunch } from "./fuse/rules.js";
+import type { FuseAdmission, FuseCheck, FuseGate } from "./fuse/types.js";
 
 /** The mission's only view of projects; the project group service implements it. */
 export type ProjectGroupLookup = { get(id: string): ProjectGroup };
@@ -60,6 +62,8 @@ type Stored = {
   bases?: Record<string, string>;
   /** When an intake mission's clock stopped (waiting on the owner or paused); the stopped span is added to its deadline on resume. */
   clockStoppedAt?: string;
+  /** When the mission became blocked. Records blocked before this field existed fall back to the mission's last change. */
+  blockedAt?: string;
 };
 
 const now = () => new Date().toISOString();
@@ -92,6 +96,7 @@ export class MissionService {
   private tickQueued = false;
   private usage?: UsageService;
   private readonly listeners = new Set<(mission: Mission) => void>();
+  private fuse?: FuseGate;
 
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly teams: TeamService, private readonly groups: ProjectGroupLookup) {
     this.directory = join(config.stateDir, "missions");
@@ -129,6 +134,8 @@ export class MissionService {
   }
   /** The usage ledger that prices coordinator sessions; subteam usage comes from their runs. */
   useUsage(service: UsageService) { this.usage = service; }
+  /** The launch-rate fuse. A service without one launches every coordinator attempt it would have launched before. */
+  useFuse(fuse: FuseGate) { this.fuse = fuse; }
   /** Whether the mission's sealed record file is on disk, so a record that failed to load still counts. Only a missing file is false. */
   hasRecordFile(id: string) {
     if (!/^[a-f0-9-]{36}$/.test(id)) return false;
@@ -431,6 +438,7 @@ export class MissionService {
   private async step(stored: Stored) {
     if (this.closed) return;
     const mission = stored.mission;
+    this.closeStaleBlocked(stored);
     // A stopped mission with nothing left to stop or observe needs no further ticks.
     if (["blocked", "ready-for-review", "cancelled"].includes(mission.status) && !stored.ops.length && !Object.keys(stored.launches).length &&
         (stored.attempts.at(-1)?.status ?? "stopped") === "stopped" &&
@@ -456,11 +464,25 @@ export class MissionService {
   private stop(stored: Stored, status: "blocked" | "cancelled", reason: string) {
     const mission = stored.mission;
     mission.status = status; mission.reason = reason;
+    stored.blockedAt = status === "blocked" ? stored.blockedAt ?? now() : undefined;
     for (const subtask of mission.subtasks) {
       if (subtask.status === "queued" && !stored.launches[subtask.id]) subtask.status = "cancelled";
       else if (subtask.teamId && ["running", "blocked"].includes(subtask.status)) this.queueOp(stored, { kind: "cancel", subtaskId: subtask.id, teamId: subtask.teamId });
     }
     stored.inbox = []; stored.notes = [];
+  }
+  /**
+   * A blocked mission cannot resume, so it waits on the owner only to be read and cancelled. After the retention
+   * period for blocked work the host closes it, saying so, instead of leaving it under "needs input" for good.
+   */
+  private closeStaleBlocked(stored: Stored) {
+    const mission = stored.mission;
+    if (mission.status !== "blocked") return;
+    const hours = (this.config.teams?.retention ?? DEFAULT_TEAM_RETENTION).blockedHours;
+    const since = Date.parse(stored.blockedAt ?? mission.updatedAt);
+    if (!(Date.now() - since >= hours * 3600000)) return;
+    const reason = hostClosedBlockedReason(hours, mission.reason);
+    this.stop(stored, "cancelled", reason); this.event(stored, reason); this.save(stored);
   }
   private settle(stored: Stored) {
     const mission = stored.mission;
@@ -732,9 +754,25 @@ export class MissionService {
     try { this.manager.meta(attempt.sessionId); return true; }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
   }
+  /** Applies a fuse result to the mission reason. True when the launch must wait. */
+  private fuseWait(stored: Stored, result: FuseCheck | FuseAdmission) {
+    const { wait, changed } = applyFuseReason(stored.mission, result);
+    if (changed && wait) this.event(stored, stored.mission.reason!);
+    if (changed) this.save(stored);
+    return wait;
+  }
   private async launch(stored: Stored, attempt: Attempt) {
     const mission = stored.mission;
     try {
+      if (!this.launched(attempt)) {
+        const projectId = mission.repoProjectIds[0];
+        if (this.fuse && this.fuseWait(stored, this.fuse.check({ projectId }))) return;
+        // A launch that the host's load holds is not charged to the fuse. The Manager repeats this check as its backstop.
+        const hold = this.manager.hostLoad.held();
+        if (hold) throw new LaunchHeldError(hold);
+        if (this.fuse && this.fuseWait(stored, this.fuse.admit(workLaunch({ launchId: attempt.sessionId, projectId, provider: mission.lineup.coordinator.provider,
+          team: this.assignment(stored, attempt), profile: mission.lineup.coordinator })))) return;
+      }
       const session = await this.manager.createTeamSession({ requestId: attempt.sessionId, provider: mission.lineup.coordinator.provider, projectId: mission.repoProjectIds[0],
         title: `Mission coordinator: ${mission.title}`.slice(0, 100), prompt: attempt.prompt, ...(attempt.continuation ? { continuation: attempt.continuation } : {}) }, this.assignment(stored, attempt), stored.folder, mission.lineup.coordinator,
       this.config.teams?.workspaceDir, this.config.teams?.trustWorkspaces === true);
@@ -743,6 +781,7 @@ export class MissionService {
       if (mission.reason?.startsWith(HOST_LOAD_REASON_PREFIX)) mission.reason = undefined;
       if (session.status === "unavailable") this.event(stored, "The coordinator runtime is unavailable; the mission is waiting for confirmed state.");
     } catch (error) {
+      this.fuse?.release(attempt.sessionId);
       if (error instanceof LaunchHeldError) {
         // Only an empty reason or an earlier host-load hold is replaced; the event records the first hold, not each tick.
         if (holdsHostLoadReason(mission.reason)) {
@@ -751,6 +790,7 @@ export class MissionService {
         }
         return;
       }
+      if (error instanceof TeamError && error.code === "fuse-open") return;
       if (error instanceof Error && /configured session limit/.test(error.message)) return;
       throw error;
     }
@@ -1162,6 +1202,28 @@ function missionDetail(mission: Mission, teamById: Map<string, TeamView>) {
   return `${running.length ? `Running: ${running.map(item => item.title).join(", ")}. ` : ""}${counts.done} of ${counts.total} subtasks done`;
 }
 
+/**
+ * Marks repeated starts of the same work. Missions, or standalone runs, of one project with the same objective are
+ * attempts of one work item: the owner sent it again after an earlier one stopped. Numbers count the attempts the
+ * host still holds, oldest first. An older attempt that is blocked or cancelled is superseded; one still under way
+ * or awaiting review is not, so a client that folds superseded attempts never hides work that can still change.
+ */
+function markAttempts(entries: { item: BoardItem; scope: string; objective: string | undefined }[]) {
+  const works = new Map<string, BoardItem[]>();
+  for (const { item, scope, objective } of entries) {
+    const text = objective?.trim().replace(/\s+/g, " ");
+    if (!text) continue;
+    const workId = `${item.kind}-${createHash("sha256").update(`${item.kind}\n${scope}\n${text}`).digest("hex").slice(0, 16)}`;
+    works.set(workId, [...works.get(workId) ?? [], item]);
+  }
+  for (const [workId, attempts] of works) {
+    if (attempts.length < 2) continue;
+    attempts.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+    attempts.forEach((item, index) => {
+      item.attempt = { workId, number: index + 1, of: attempts.length, superseded: index < attempts.length - 1 && ["blocked", "cancelled"].includes(item.status) };
+    });
+  }
+}
 /** The owner's board: missions, plus team runs and goals that no mission started. Goal cycles appear through their goal. */
 export function missionBoard(
   missions: Mission[], teams: TeamView[], goals: ProductGoal[], projects: Config["projects"],
@@ -1169,28 +1231,31 @@ export function missionBoard(
 ): Board {
   const projectName = (id: string) => projects.find(project => project.id === id)?.name ?? id;
   const teamById = new Map(teams.map(team => [team.id, team]));
-  const items: BoardItem[] = [];
+  const items: BoardItem[] = [], attempts: Parameters<typeof markAttempts>[0] = [];
   for (const mission of missions) {
     const column: BoardColumn = ["needs-input", "blocked"].includes(mission.status) || promptedSubtask(mission, teamById) ? "needs-input" : mission.status === "ready-for-review" ? "review" : mission.status === "cancelled" ? "ended" : "working";
     // A mission started before its checkout folded keeps its pinned record; the row follows the project that holds that checkout now.
     const owner = mission.repoProjectIds.map(id => containing(id)).find(Boolean);
     items.push({ kind: "mission", id: mission.id, title: mission.title, groupId: owner?.id ?? mission.groupId, projectName: owner?.name ?? mission.groupName, column, status: mission.status,
-      detail: oneLine(missionDetail(mission, teamById)), updatedAt: mission.updatedAt,
+      detail: oneLine(missionDetail(mission, teamById)), createdAt: mission.createdAt, updatedAt: mission.updatedAt,
       subtasks: subtaskCounts(mission) });
+    attempts.push({ item: items.at(-1)!, scope: owner?.id ?? mission.groupId, objective: mission.objective });
   }
   for (const team of teams) {
     if (team.missionId || team.goal) continue;
     const owner = containing(team.projectId);
     const column: BoardColumn = ["needs-input", "blocked"].includes(team.status) || waitsOnProvider(team) ? "needs-input" : team.status === "ready-for-review" ? "review" : ["merged", "no-change", "cancelled"].includes(team.status) ? "ended" : "working";
-    items.push({ kind: "team", id: team.id, title: team.title, ...(owner ? { groupId: owner.id } : {}), projectName: owner?.name ?? projectName(team.projectId), column, status: team.status, detail: oneLine(teamDetail(team)), updatedAt: team.updatedAt });
+    items.push({ kind: "team", id: team.id, title: team.title, ...(owner ? { groupId: owner.id } : {}), projectName: owner?.name ?? projectName(team.projectId), column, status: team.status, detail: oneLine(teamDetail(team)), createdAt: team.createdAt, updatedAt: team.updatedAt });
+    attempts.push({ item: items.at(-1)!, scope: team.projectId, objective: team.objective });
   }
   for (const goal of goals) {
     const owner = containing(goal.projectId);
     const column: BoardColumn = ["needs-input", "blocked"].includes(goal.status) || (["running", "paused"].includes(goal.status) && goal.activeTeamId && waitsOnProvider(teamById.get(goal.activeTeamId))) ? "needs-input" : ["running", "paused"].includes(goal.status) ? "working" : goal.status === "ready-for-review" ? "review" : "ended";
     const active = goal.activeTeamId ? teamById.get(goal.activeTeamId) : undefined;
     const detail = openTeamQuestion(active) ?? (goal.status === "running" && active ? `Feature ${goal.cycles.length}: ${teamDetail(active)}` : goal.reason ?? goal.status);
-    items.push({ kind: "goal", id: goal.id, title: goal.title, ...(owner ? { groupId: owner.id } : {}), projectName: owner?.name ?? projectName(goal.projectId), column, status: goal.status, detail: oneLine(detail), updatedAt: goal.updatedAt });
+    items.push({ kind: "goal", id: goal.id, title: goal.title, ...(owner ? { groupId: owner.id } : {}), projectName: owner?.name ?? projectName(goal.projectId), column, status: goal.status, detail: oneLine(detail), createdAt: goal.createdAt, updatedAt: goal.updatedAt });
   }
+  markAttempts(attempts);
   const order: BoardColumn[] = ["needs-input", "working", "review", "ended"];
   items.sort((a, b) => order.indexOf(a.column) - order.indexOf(b.column) || b.updatedAt.localeCompare(a.updatedAt));
   return { items };

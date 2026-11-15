@@ -10,6 +10,8 @@ export const intakeConfigSchema = z.object({
     creatorId: z.uuid(),
     label: z.string().trim().min(1).max(80),
     commentsMirrorToSlack: z.boolean().default(false),
+    /** False leaves Linear's labelled issues alone: only the host's own direct requests start work. */
+    admitIssues: z.boolean().default(true),
   }).strict(),
   slack: z.object({
     appTokenFile: z.string().refine(isAbsolute),
@@ -19,6 +21,8 @@ export const intakeConfigSchema = z.object({
     // Mention markup names users only (`<@U…>` or `<@W…>`), so a bot ID would never match.
     linearAgentUserId: z.string().regex(/^[UW][A-Z0-9]{2,20}$/).optional(),
     bindByMention: z.boolean().default(false),
+    /** True lets the owner's mention of the bot file a Linear issue and start a mission. */
+    directRequests: z.boolean().default(false),
     endpoint: z.url().optional(),
   }).strict().optional(),
   mission: z.object({
@@ -47,6 +51,8 @@ export interface IntakeInbound {
   /** The mission call chosen for this event, saved before the call; a replay performs exactly this call. */
   call?: { action: "answer" | "steer" | "pause" | "resume" | "cancel"; decisionId?: string; text?: string; revision: number };
 }
+/** The owner's Slack mention a record was filed from; `filedAt` is set once Linear holds the issue. */
+export interface IntakeDirect { eventId: string; ts: string; text: string; filedAt?: string }
 export interface IntakeComment { id: string; body: string; delivered: boolean; attempts: number; error?: string }
 export interface IntakeRecord {
   issueId: string; identifier: string; url: string; title: string; description: string;
@@ -56,6 +62,8 @@ export interface IntakeRecord {
   holdReason?: string;
   /** Absent on skipped records, so a skipped issue never binds a thread. */
   thread?: IntakeThread;
+  /** Present on a record the host filed itself from the owner's Slack mention. */
+  direct?: IntakeDirect;
   /** Saved before the mission is created and reused verbatim on every retry. */
   request?: CreateMission;
   missionId?: string;
@@ -75,7 +83,11 @@ export interface IntakeView {
 }
 export interface SlackThreadMessage { ts: string; user?: string; botId?: string; text: string; key?: string }
 /** `unreadable` is Slack's refusal (not in channel, no such thread); a thrown error is an outage. */
-export interface IntakeThreadReader { thread(binding: IntakeThread): Promise<SlackThreadMessage[] | "unreadable"> }
+export interface IntakeThreadReader {
+  thread(binding: IntakeThread): Promise<SlackThreadMessage[] | "unreadable">;
+  /** The message's permanent link. */
+  permalink?(binding: IntakeThread, ts: string): Promise<string>;
+}
 /** A stable RFC 9562 UUID: SHA-256 of `${namespace}:${value}`, first 16 bytes, version nibble 5, variant 10. */
 export function deterministicUuid(namespace: string, value: string): string {
   const bytes = createHash("sha256").update(`${namespace}:${value}`).digest().subarray(0, 16);

@@ -149,7 +149,11 @@ infinite team pause TEAM_ID
 infinite team resume TEAM_ID
 infinite team cancel TEAM_ID
 infinite team delete TEAM_ID [--json]
+infinite team entries TEAM_ID [--kind KIND] [--task TASK_ID] [--since SEQ] [--json]
+infinite team entry TEAM_ID ENTRY_ID [--json]
 ```
+
+`team entries` lists a team's stored entries, one line each, with the next `--since` value when more remain. `team entry` prints one entry's head and its body as indented JSON. Entry text is data: the output escapes control characters, and nothing in it runs.
 
 `infinite team status` without an ID lists each team. `infinite team status TEAM_ID`
 prints that team's open decisions and Jevcode summary. `infinite team watch

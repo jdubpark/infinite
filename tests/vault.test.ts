@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Journal, readEvents } from "../packages/host/src/vault.js";
+import { Journal, readEvents, unseal, writeSealed } from "../packages/host/src/vault.js";
 
 test("encrypted replay crosses segment boundaries and rejects wrong keys and record substitution", () => {
   const directory = mkdtempSync(join(tmpdir(), "inf-vault-"));
@@ -79,5 +79,24 @@ test("readEvents filters by type while advancing the cursor past skipped records
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a failed sealed write leaves no temporary file", () => {
+  const directory = mkdtempSync(join(tmpdir(), "inf-vault-"));
+  const key = randomBytes(32);
+  try {
+    // The target is a directory, so the final rename fails after the temporary file was written.
+    const target = join(directory, "record.sealed");
+    mkdirSync(target);
+    for (let index = 0; index < 3; index++) assert.throws(() => writeSealed(target, key, "scope", { index }));
+    assert.deepEqual(readdirSync(directory), ["record.sealed"]);
+    // A write that succeeds is unchanged.
+    const file = join(directory, "other.sealed");
+    writeSealed(file, key, "scope", { ok: true });
+    assert.deepEqual(unseal(key, "scope", readFileSync(file, "utf8")), { ok: true });
+    assert.deepEqual(readdirSync(directory).sort(), ["other.sealed", "record.sealed"]);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });

@@ -61,6 +61,8 @@ The host keeps run evidence in one SQLite database, `evidence/evidence.sqlite3` 
 
 The host process is the only writer. A new file is built under a temporary name and linked into place when complete, so a crash never leaves a half-built store. The file runs in WAL mode, so another process can read it while the host writes. The host's own reads use a separate read-only connection. Removing a run deletes its events. An hourly sweep deletes the events of every run whose sealed record file is gone, which covers a crash between the two steps.
 
+The host also mirrors four entry kinds from each saved run record into the store: `report`, `integration`, `check`, and `direction`. The owner reads them through `GET /api/teams/:id/entries` and `infinite team entries`. Entries hold their text sealed, and the host never reads them into a prompt or a context file. An entry that a crash or a failing store kept from being written is written later without a save: after a restart every retained run is checked, a few runs per scheduler tick. Each member's launch sizes sit beside them, in `member_scopes`, and `GET /api/teams/:id/context-usage` reports those sizes.
+
 The sealed run record stays the authority for run state. The store never decides a status. When the store cannot open, for example after a key mismatch or on a full disk, it reports `unavailable` with a fixed reason. The host still starts, runs continue, and run removal still works. A module whose stored schema is newer than the host is unavailable on its own, and the other modules keep working. `GET /api/evidence/status` and `infinite evidence status` report the state, each module's state, the file and WAL sizes, and the event count.
 
 ## Delivery contract

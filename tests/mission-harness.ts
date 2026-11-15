@@ -55,9 +55,10 @@ export function missionHarness(options?: { configure?: (config: Config) => void;
       ] };
   } };
   let services: { teams: TeamService; missions: MissionService } | undefined;
-  const open = () => {
+  /** `teamOptions` reach the team service as they do in the host, for a test that gives it an event outbox. */
+  const open = (teamOptions?: ConstructorParameters<typeof TeamService>[6]) => {
     const manager = new Manager(config, key, options?.hostProbe);
-    const teams = new TeamService(config, key, manager, (_project, start) => start());
+    const teams = new TeamService(config, key, manager, (_project, start) => start(), undefined, undefined, teamOptions);
     const missions = new MissionService(config, key, manager, teams, groups);
     teams.start(); missions.start();
     services = { teams, missions };
@@ -69,7 +70,7 @@ export function missionHarness(options?: { configure?: (config: Config) => void;
   const create = (objective = "Add an endpoint to the API and call it from the web client"): CreateMission =>
     ({ requestId: randomUUID(), groupId: "shop", objective, maxSubtasks: 8, maxMinutes: 30 });
   const release = (name: string) => writeFileSync(join(receipts, name), "go", { mode: 0o600 });
-  const close = async () => {
+  const close = async (beforeRemove?: () => void) => {
     const closing = services;
     shut();
     // A tick already under way can still launch a coordinator attempt or subteam member after close().
@@ -80,9 +81,11 @@ export function missionHarness(options?: { configure?: (config: Config) => void;
       await new Promise(done => setTimeout(done, 500));
     }
     await new Promise(done => setTimeout(done, 1700));
+    // A test that opened a store under the root closes it here: after the services stopped, before the folder goes.
+    beforeRemove?.();
     rmSync(root, { recursive: true, force: true });
   };
-  return { root, api, web, open, shut, close, create, release, coordinatorReceipts, services: () => services! };
+  return { root, state: config.stateDir, key, api, web, open, shut, close, create, release, coordinatorReceipts, services: () => services! };
 }
 
 type FakeRun = { id: string; projectId: string; missionId: string; status: TeamView["status"]; revision: number; updatedAt: string; parallelism?: number; parallelismCeiling?: number;

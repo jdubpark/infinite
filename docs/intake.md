@@ -1,6 +1,7 @@
 # Request intake
 
-Intake starts a mission from a Linear issue the owner files. It runs only when the
+Intake starts a mission from a Linear issue the owner files, or from the owner's
+mention of the instance's Slack bot (see [direct requests](#direct-requests)). It runs only when the
 host config has an `intake` block. Without one, no records are kept and
 `GET /api/intake` returns `{ "records": [] }`, with no `lastError` or `slack` member.
 
@@ -56,6 +57,95 @@ Starts are limited by `intake.maxActive`. A record over the limit stays `queued`
 with the hold reason `max-active`. A refusal from the mission service is kept as
 the hold reason too. A failed start is retried on a later cycle.
 
+## Direct requests
+
+With `intake.slack.directRequests` on, the owner can start work by mentioning the
+instance's own Slack bot. The host files the Linear issue itself and starts the
+mission. The owner does not file anything through Linear's Slack agent.
+
+What starts one: an `app_mention` from `slack.ownerUserId` in the workspace
+`slack.teamId`, with no bot ID. The same gate as every other event applies first;
+anything else is dropped and counted. After the gate:
+
+- In a thread with no record, `bindByMention` is tried first, as before. If it
+  binds nothing, the mention files a request.
+- A mention in a top-level message with no text after the bot mention is dropped
+  and counted. The same mention as a reply inside a thread files a request, because
+  the thread supplies the context.
+- In a thread where every record has finished, a mention files a follow-up request,
+  unless it starts with `Q<n>`, with a record's identifier, or is only `status`,
+  `pause`, `resume`, or `cancel`. Those keep the routing described under
+  [a thread with more than one request](#a-thread-with-more-than-one-request).
+- In a thread with an unfinished record, the mention is a reply, as before.
+- A second event for a mention that already filed a request, by event ID or
+  message timestamp, is dropped with no write and no reply.
+
+The thread is bound when the record is created, by the owner's mention, so every
+message the bot posts still goes to `record.thread`.
+
+**Title and description.** The title is the first non-empty line of the owner's
+text with whitespace collapsed, cut to 120 characters. With no text it is
+`Request from a Slack thread`. The description is the owner's text, trimmed, up to
+12,000 characters, followed by `Filed from Slack by the owner: LINK` when Slack
+returns a permalink. The issue gets the label `intake.linear.label`. Only the
+owner's words go into the issue.
+
+**Team.** The issue is filed in the first entry of `linear.teamIds`. The host
+checks that the issue's creator is `linear.creatorId` and that its team is the one
+requested. A mismatch stops the request with the hold reason below.
+
+**Exactly one issue.** The record is saved before Linear is called, and the issue
+is created under the record's own ID. A retry after a failure, a lost response, a
+restart, or a redelivered Slack event reaches the same issue and the same mission.
+
+**The thread section.** The objective starts with `Request filed from Slack as ID:
+TITLE`, the owner's text, and the note that only the owner's words are
+instructions. It ends with the Slack thread up to the owner's mention, oldest
+first, under `Slack thread, oldest first, as it stood when the owner asked:`. The
+host reads the thread when it files the request, and again if filing is retried, so
+a message edited before the read appears with its edited text.
+The host keeps messages whose timestamp is at or before the mention and discards
+later ones before anything is stored, passed to an agent, shown, or logged. Every line of
+every message carries its author:
+
+| Marker | Author |
+|---|---|
+| `owner \| ` | `slack.ownerUserId` |
+| `other N \| ` | Anyone else. `N` counts distinct people from 1, in order of first appearance. |
+| `bot \| ` | A bot, or a message with no user. |
+
+Before marking, every line-break character in a message (`\r\n`, `\r`, U+000B,
+U+000C, U+0085, U+2028, U+2029) becomes `\n`, and empty lines are dropped. A line
+forged inside another person's message therefore still starts with that person's
+marker. Each message is cut at 4,000 characters, and a marked cut line,
+`[… message cut]`, follows a message that was cut; the notice is in addition to
+the 4,000. The section is bounded by the 24,000-character objective limit
+in the way the linked-thread section is. An unreadable thread files the request
+without a thread section. See [security](security.md#request-intake).
+
+**If filing fails.** The record stays `queued` with no mission and the hold reason
+`It could not be filed in Linear and will be retried: SUMMARY`. The next cycle
+tries again. The bot posts `Received your request "TITLE". It has not started:
+REASON`, then `I'll post questions and the result here once it starts.` Once it is
+filed and started, the acknowledgement is `Started on ID "TITLE" (URL). I'll post
+questions and the result here.` and a `Started on ID (URL).` line follows when the
+first message was a notice.
+
+**No acknowledgement without a save.** A request whose first save fails is not
+acknowledged to Slack, so Slack redelivers it. The failure is logged and counted as
+dropped, and nothing is posted.
+
+**What the tracker receives.** For a direct request the Linear issue holds only the
+owner's text and the Slack link, and the outcome comment is a fixed receipt:
+`Infinite agent report: ready for review. The report is in the Slack thread this request came from.`,
+or the same with `blocked. The reason is` or `cancelled. The reason is`. Agent
+reports and questions go to the Slack thread only. Reports posted in the thread may
+restate thread content, and pull requests the agents open are written by the
+agents; both are residual risks. See [security](security.md#request-intake).
+
+**Linear's own issues.** With `linear.admitIssues` set to `false`, the host does
+not poll Linear for labelled issues, and only direct requests start work.
+
 ## Configuration
 
 The `intake` block is validated by `intakeConfigSchema` in
@@ -66,13 +156,15 @@ The `intake` block is validated by `intakeConfigSchema` in
 | `linear.teamIds` | UUIDs, 1 to 20, required | Linear teams whose issues qualify. |
 | `linear.creatorId` | UUID, required | The owner's Linear user ID. Issues from any other creator are skipped. |
 | `linear.label` | text, 1 to 80 characters, required | The label that marks an issue for intake. |
+| `linear.admitIssues` | boolean, default `true` | When `false`, labelled issues in Linear start nothing and only direct requests start work. Needs `slack.directRequests`. |
 | `linear.commentsMirrorToSlack` | boolean, default `false` | When `true` and a thread is bound, the two Linear comments are not posted; the Slack thread carries the same messages. Refused without `slack`. |
 | `slack` | object, optional | The Slack surface. Without it, the bot posts nothing, receives no replies, and no thread is read or bound. |
 | `slack.appTokenFile` | absolute path, required with `slack` | The Socket Mode app token. A nonempty regular `0600` file outside `stateDir`, `runDir`, `teams.workspaceDir`, and every project path. |
 | `slack.botTokenFile` | absolute path, required with `slack` | The bot token. The same file rules as `appTokenFile`. |
 | `slack.teamId` | `T` followed by 2 to 20 uppercase letters or digits, required with `slack` | The workspace. A token for another workspace, or a token Slack refuses, stops the surface with a reason. |
 | `slack.ownerUserId` | `U` or `W` ID, required with `slack` | The only Slack user whose messages cause work. |
-| `slack.linearAgentUserId` | `U` or `W` ID, optional; required when `requireSlackThread` is on | Linear's agent user in Slack, mentioned by the owner to file a request. |
+| `slack.linearAgentUserId` | `U` or `W` ID, optional; required when `requireSlackThread` is on, unless `linear.admitIssues` is `false` | Linear's agent user in Slack, mentioned by the owner to file a request. |
+| `slack.directRequests` | boolean, default `false` | Lets the owner's mention of the bot file a Linear issue and start a mission. See [direct requests](#direct-requests). |
 | `slack.bindByMention` | boolean, default `false` | Binds a thread by a mention of an identifier. Cannot be used with `requireSlackThread`. |
 | `slack.endpoint` | URL, optional | The Slack Web API base. Only the official HTTPS endpoint, or loopback HTTP when `environment` is `"local"`. |
 | `mission.groupId` | project group ID, required | The group new missions start in. A host project ID works as an alias. |
@@ -80,7 +172,7 @@ The `intake` block is validated by `intakeConfigSchema` in
 | `mission.maxMinutes` | integer 5 to 1440, default `240` | The working-time limit for each mission. See [missions](missions.md#working-time-limit). |
 | `mission.answerProjectId` | project ID, optional | A configured project. When the mission's repositories include it, the coordinator is told to answer from it. Must name a configured project. |
 | `maxActive` | integer 1 to 12, default `3` | Missions intake may have running at once. |
-| `requireSlackThread` | boolean, default `true` | Requires a Slack thread and an owner mention before admission. Needs `slack` and `slack.linearAgentUserId`. |
+| `requireSlackThread` | boolean, default `true` | Requires a Slack thread and an owner mention before admission. Needs `slack`, and `slack.linearAgentUserId` unless `linear.admitIssues` is `false`. |
 
 Linear credentials are a separate block, `linear.apiKeyFile`, a `0600` file with
 the same location rules. Linear's endpoint must be its official HTTPS endpoint,
@@ -119,7 +211,9 @@ order as the mission moves:
   `Ready for review (agent report):` otherwise, followed by pull request and
   branch lines when a subteam published one;
 - `Blocked: REASON` or `Cancelled: REASON` when the mission ends that way, then
-  `File a follow-up with Linear's agent in this thread.`;
+  `File a follow-up with Linear's agent in this thread.` With direct requests on,
+  this line and the reply to a finished request say
+  `Mention me in this thread to file a follow-up.` instead;
 - an edit note when the Linear issue changes after the run started. The run keeps
   the original text.
 
@@ -170,7 +264,10 @@ in order:
    or nothing, goes to that request, with the identifier removed. Any request in
    the thread can be named, finished or not.
 4. Otherwise, with one unfinished request in the thread, the reply goes to it. With
-   none, it goes to the newest finished request.
+   none, it goes to the newest finished request, except that with direct requests
+   on, a mention that starts with neither `Q<n>` nor an identifier, and is not
+   exactly `status`, `pause`, `resume`, or `cancel`, files a follow-up request
+   instead.
 5. With more than one unfinished request, nothing is applied to any mission, and
    the bot replies:
    `More than one request is open in this thread: ID1, ID2. Start your reply with an identifier or a question number.`

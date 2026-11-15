@@ -22,6 +22,12 @@ import type { CreateTeam, TeamAssignment, TeamView } from "../packages/host/src/
 import type { CreateMission, Mission, MissionOrigin } from "../packages/host/src/mission-types.js";
 import { initialAttention } from "@infinite/attention";
 import { emptyUsage, type UsageRollup } from "../packages/host/src/team-usage.js";
+import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
+import { EventOutbox } from "../packages/host/src/evidence/outbox.js";
+import { configurationModule, configurationProjector } from "../packages/host/src/configuration-store.js";
+import { outcomeProjector } from "../packages/host/src/outcome-projector.js";
+import { outcomeModule, runOutcomes } from "../packages/host/src/outcome-store.js";
+import { queryRollup } from "../packages/host/src/outcome-reads.js";
 
 const until = (read: () => Mission, accepts: (mission: Mission) => boolean, timeout = 60000) => waitFor(async () => read(), accepts, timeout);
 const standaloneRequest = (projectId: string): CreateTeam => ({
@@ -411,8 +417,16 @@ test("mission create replays the original host-project group alias after canonic
 
 test("a mission dispatches dependent subteams across two repositories, routes their questions, and reports only after every subtask finishes", { timeout: 240000 }, async () => {
   const h = harness();
+  // The subteams write their run events to an evidence store, so the mission's roll-up can be read at service level.
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(h.state), vaultKey: h.key });
+  store.register(configurationModule());
+  store.register(outcomeModule());
+  const outbox = new EventOutbox(store);
+  outbox.registerProjector(configurationProjector());
+  outbox.registerProjector(outcomeProjector(store));
+  const open = () => h.open({ events: outbox });
   try {
-    let { missions, teams } = h.open();
+    let { missions, teams } = open();
     const request = h.create();
     await assert.rejects(missions.create({ ...request, groupId: "unknown" }), (error: TeamError) => error.code === "project-group-not-found");
     const created = await missions.create(request);
@@ -429,7 +443,7 @@ test("a mission dispatches dependent subteams across two repositories, routes th
     const first = missions.get(created.id).coordinator!;
     assert.equal(first.status, "running");
     assert.ok(realpathSync(h.coordinatorReceipts()[0].cwd).startsWith(join(h.root, "teams", "missions")), "The coordinator runs in a mission folder under the team workspace root");
-    h.shut(); ({ missions, teams } = h.open());
+    h.shut(); ({ missions, teams } = open());
     h.release("release-dispatch");
     const asked = await until(() => missions.get(created.id), mission => mission.status === "needs-input");
     assert.equal(h.coordinatorReceipts().filter(receipt => receipt.memberId === first.memberId).length, 1);
@@ -446,7 +460,7 @@ test("a mission dispatches dependent subteams across two repositories, routes th
     assert.equal(teams.list().length, 1, "The dependent web subtask waits for the API subtask");
 
     // Restart while the owner question is open: nothing is duplicated, and the answer reaches the subteam.
-    h.shut(); ({ missions, teams } = h.open());
+    h.shut(); ({ missions, teams } = open());
     const answer = { requestId: randomUUID(), revision: asked.revision, text: "JSON" };
     const answered = await missions.answer(created.id, decision.id, answer);
     assert.equal(answered.decisions[0].answeredBy, "owner");
@@ -481,7 +495,17 @@ test("a mission dispatches dependent subteams across two repositories, routes th
     assert.equal(git(h.api, "status", "--porcelain"), "", "Subteams work in isolated copies; the source repositories are unchanged");
     assert.equal(existsSync(join(h.web, "web.txt")), false);
     assert.equal(h.coordinatorReceipts().length, 5, "Dispatch, escalate, early result, answer, and final result each used one attempt");
-  } finally { await h.close(); }
+
+    // The roll-up of the mission counts the implementer rows of its two subteams, and no other.
+    const rollup = queryRollup(store, { kind: "mission", id: created.id }, { known: true, assessment: null });
+    assert.equal(rollup.runs.total, 2);
+    const subteamRows = ready.subtasks.flatMap(subtask => store.read(db => runOutcomes(db, subtask.teamId!)));
+    const implementerRows = subteamRows.filter(row => row.role === "implementer");
+    assert.ok(implementerRows.length > 0, "The subteams wrote implementer rows");
+    const counted = rollup.implementer.reduce((sum, cell) => sum + cell.attempts + cell.open + cell.excluded.limit + cell.excluded.owner + cell.excluded.host + cell.excluded.duel, 0);
+    assert.equal(counted, implementerRows.length);
+    assert.equal(queryRollup(store, { kind: "mission", id: randomUUID() }, { known: false, assessment: null }).runs.total, 0);
+  } finally { await h.close(() => store.close()); }
 });
 
 test("standalone team creation is reserved only while a mission subteam holds that repository", { timeout: 180000 }, async () => {
@@ -1546,6 +1570,27 @@ test("an intake mission still expires on working time", { timeout: 60000 }, asyn
     const blocked = await until(() => h.get(id), mission => mission.status === "blocked");
     assert.equal(blocked.reason, timeLimitText);
     assert.ok(blocked.events.some(event => event.text === timeLimitText));
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("the host closes a mission that stays blocked for the blocked-work retention period, and says so", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(5));
+    await h.attempt(1);
+    mock.timers.tick(6 * 60000);
+    const blocked = await until(() => h.get(id), mission => mission.status === "blocked");
+    assert.equal(blocked.reason, timeLimitText);
+    // One hour short of the default 72 hours: the mission still waits on the owner.
+    mock.timers.tick(71 * 3600000);
+    await new Promise(done => setTimeout(done, 1200));
+    assert.equal(h.missions.peek(id)!.status, "blocked");
+    mock.timers.tick(2 * 3600000);
+    const closed = await until(() => h.get(id), mission => mission.status === "cancelled");
+    const reason = `Closed by the host after 72 hours blocked without owner action. Last blocker: ${timeLimitText}`;
+    assert.equal(closed.reason, reason);
+    assert.equal(closed.events.filter(event => event.text === reason).length, 1, "The closing event is recorded once");
   } finally { h.close(); mock.timers.reset(); }
 });
 

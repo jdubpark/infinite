@@ -9,6 +9,9 @@ import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import { createTeamSchema, gitBranchSchema, githubRepositorySchema, teamDeliverySchema, teamDeliveryReconcileSchema, teamPermissionsSchema, type ProjectSource, type TeamDelivery, DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE} from "./team-types.js";
 import { describeSource } from "./client.js";
+import { autonomyModeSchema } from "./autonomy.js";
+import type { EntryPage } from "./evidence/blackboard.js";
+import type { EntryHead } from "./evidence/entry-types.js";
 import type { ProjectSourceStatus } from "./project-source.js";
 import { captureWorkspace } from "./workspace-checkpoint.js";
 import { uploadMissingChunks } from "./chunk-upload.js";
@@ -410,6 +413,15 @@ async function askForBrief(api: Api, team: any, rows: BriefRow[], signal: AbortS
   }
 }
 
+/** One line per entry head. Host text is cleaned before it reaches the terminal. */
+function entryLine(head: EntryHead) {
+  const parts = [String(head.seq), head.kind, `${head.author}/${head.authority}`, ...(head.taskId ? [`task ${head.taskId}`] : []), head.summary];
+  return parts.map(part => clean(part)).join("  ");
+}
+/** Indented JSON with C1 control characters escaped, so a host body cannot move the terminal. */
+function terminalJson(value: unknown) {
+  return JSON.stringify(value, null, 2).replace(/[\u007f-\u009f\u2028\u2029]/g, character => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
 function outputTeam(team: any, json: boolean) {
   if (json) { console.log(JSON.stringify(team, null, 2)); return; }
   console.log(`${clean(team.id)}  ${clean(team.status)}  ${clean(team.title)}`);
@@ -584,7 +596,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       console.log(JSON.stringify(result, null, 2));
       return true;
     }
-    if (positional[0] !== "init" || positional.length > 2) throw new Error("Usage: infinite repo init [DIRECTORY] [--project ID] [--source github|laptop] [--teamwork PATH|none] [--setup-json JSON] [--check-json JSON] [--delivery merge|pr|review] [--repository OWNER/REPO] [--base-branch BRANCH] [--merge-method squash|merge|rebase] [--linear-team UUID] [--linear-project UUID]");
+    if (positional[0] !== "init" || positional.length > 2) throw new Error("Usage: infinite repo init [DIRECTORY] [--project ID] [--source github|laptop] [--teamwork PATH|none] [--setup-json JSON] [--check-json JSON] [--delivery merge|pr|review] [--repository OWNER/REPO] [--base-branch BRANCH] [--merge-method squash|merge|rebase] [--linear-team UUID] [--linear-project UUID] [--autonomy supervised|autonomous]");
     const requestedDirectory = canonicalDirectory(positional[1] ?? process.cwd());
     const gitResult = gitRootOrNonGit(requestedDirectory);
     const defaultsPath = join(stateDir, "directory-defaults.json");
@@ -593,7 +605,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const explicitLinearTeam = options["--linear-team"] === undefined ? undefined : z.uuid().parse(String(options["--linear-team"]));
     const explicitLinearProject = options["--linear-project"] === undefined ? undefined : z.uuid().parse(String(options["--linear-project"]));
     if ("nonGit" in gitResult) {
-      const unsupported = ["--project", "--source", "--teamwork", "--setup-json", "--check-json", "--handoff", "--request-id", "--delivery", "--repository", "--base-branch", "--merge-method", "--permissions", "--permission-scope", "--permission-limit"].filter(flag => options[flag] !== undefined);
+      const unsupported = ["--project", "--source", "--teamwork", "--setup-json", "--check-json", "--handoff", "--request-id", "--delivery", "--repository", "--base-branch", "--merge-method", "--permissions", "--permission-scope", "--permission-limit", "--autonomy"].filter(flag => options[flag] !== undefined);
       if (unsupported.length) throw new Error(`This directory is not a Git repository, so ${unsupported.join(", ")} cannot be used here. Run repo init in a Git repository for enrollment, or use only --linear-team and --linear-project to save directory defaults.`);
       if (!explicitLinearTeam && explicitLinearProject && !inheritedDefault?.teamId)
         throw new Error("--linear-project requires --linear-team or an inherited directory Linear team.");
@@ -622,8 +634,12 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const linearProject = explicitLinearProject;
     const handoff = String(options["--handoff"] ?? "auto");
     if (handoff !== "auto" && handoff !== "off") throw new Error("--handoff must be auto or off.");
+    const autonomyOption = options["--autonomy"] === undefined ? undefined : autonomyModeSchema.safeParse(String(options["--autonomy"]));
+    if (autonomyOption && !autonomyOption.success) throw new Error("--autonomy must be supervised or autonomous.");
+    const autonomy = autonomyOption?.data;
     const me = await api.json<any>("/me");
     if (me.teams?.repoEnrollment !== 1) throw new Error("This host does not support repository enrollment. Upgrade the host before running repo init.");
+    if (autonomy && me.teams?.autonomyMode !== 1) throw new Error("This host does not support autonomy modes. Upgrade the host before using --autonomy.");
     const mappings = readPrivateJson(mappingsPath, {}) as Record<string, unknown>;
     const key = `${config.origin}\n${root}`;
     const stored = mappings[key];
@@ -705,13 +721,13 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const sendLinear = Boolean(linearTeam || linearProject || (!targetLinear && rootDefault));
     const sourceSupported = me.teams?.projectSource === 1;
     const enrolledSource: ProjectSource = sourceSupported ? projectSource : { mode: "laptop" };
-    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...projectConfig, handoff, ...(delivery ? { delivery } : {}), ...(permissions ? { permissions } : {}) }, ...(sourceSupported ? { source: projectSource } : {}), ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}), ...(teamwork !== undefined ? { teamwork } : {}) };
+    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...projectConfig, handoff, ...(delivery ? { delivery } : {}), ...(permissions ? { permissions } : {}) }, ...(sourceSupported ? { source: projectSource } : {}), ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}), ...(teamwork !== undefined ? { teamwork } : {}), ...(autonomy ? { autonomy } : {}) };
     // After a lost reply, inherited settings may already be the host's mapping.
     // An omitted mapping preserves that value; compare that intent while replay
     // still sends the original receipt body and request ID unchanged.
     const linearIntent = (request: Record<string, any>) => request.linear === undefined ? targetLinear ?? null : request.linear;
     const teamworkIntent = (request: Record<string, any>) => request.teamwork === undefined ? target.teamwork ?? null : request.teamwork;
-    requestId = body.requestId = resumePendingIntent(receiptsPath, `${key}:repo-init:`, `/projects/${selected}/team`, prior => JSON.stringify(prior.team) === JSON.stringify(body.team) && JSON.stringify(prior.source) === JSON.stringify(body.source) && JSON.stringify(linearIntent(prior)) === JSON.stringify(linearIntent(body)) && JSON.stringify(teamworkIntent(prior)) === JSON.stringify(teamworkIntent(body)), requestId, options["--request-id"] !== undefined, rawArgs);
+    requestId = body.requestId = resumePendingIntent(receiptsPath, `${key}:repo-init:`, `/projects/${selected}/team`, prior => JSON.stringify(prior.team) === JSON.stringify(body.team) && JSON.stringify(prior.source) === JSON.stringify(body.source) && JSON.stringify(linearIntent(prior)) === JSON.stringify(linearIntent(body)) && JSON.stringify(teamworkIntent(prior)) === JSON.stringify(teamworkIntent(body)) && prior.autonomy === body.autonomy, requestId, options["--request-id"] !== undefined, rawArgs);
     if (uploadSource) {
       assertSourceUnchanged();
       process.stderr.write(`[Infinite] Request ${requestId}\n`);
@@ -769,7 +785,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     }
     if (explicitProject || uploadSource) { config.projectId = selected; privateJson(configPath, config); }
     const sourceSnapshot = uploadSource && !head.commit ? "empty cloud baseline" : uploadSource ? `local commit ${head.commit}` : detail.sync?.appliedManifest ? "existing cloud checkout retained" : "configured project checkout";
-    console.log(JSON.stringify({ kind: "repository", id: selected, name: clean(output.name), path: clean(output.path), team: output.team, linear: output.linear, teamwork: output.teamwork, revision: output.revision, execution: output.execution, projectSource: enrolledSource, ...(linearDefaultsFrom ? { linearDefaultsFrom } : {}), source: sourceSnapshot }, null, 2));
+    console.log(JSON.stringify({ kind: "repository", id: selected, name: clean(output.name), path: clean(output.path), team: output.team, linear: output.linear, teamwork: output.teamwork, revision: output.revision, execution: output.execution, autonomy: output.autonomy, autonomySource: output.autonomySource, projectSource: enrolledSource, ...(linearDefaultsFrom ? { linearDefaultsFrom } : {}), source: sourceSnapshot }, null, 2));
     return true;
   }
   const [subcommand, id, ...rest] = positional;
@@ -817,6 +833,41 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       if ((error as { status?: number })?.status !== 404) throw error;
       if (options["--json"]) console.log(JSON.stringify({ id, status: "already-removed" }));
       else console.log(`${id} already removed`);
+    }
+    return true;
+  }
+  if (subcommand === "entries" || subcommand === "entry") {
+    const json = Boolean(options["--json"]);
+    const flag = (name: string) => {
+      const value = options[name];
+      if (value === undefined) return undefined;
+      if (typeof value !== "string") throw new Error(`${name} needs a value.`);
+      return value;
+    };
+    if (subcommand === "entries") {
+      if (!id || rest.length) throw new Error("Usage: infinite team entries ID [--kind K] [--task T] [--since N] [--json]");
+      z.uuid().parse(id);
+      const params = new URLSearchParams();
+      for (const [name, key] of [["--kind", "kind"], ["--task", "task"], ["--since", "since"]] as const) {
+        const value = flag(name);
+        if (value !== undefined) params.set(key, value);
+      }
+      const page = await api.json<EntryPage>(`/teams/${id}/entries${params.size ? `?${params}` : ""}`);
+      if (json) console.log(terminalJson(page));
+      else {
+        for (const head of page.entries) console.log(entryLine(head));
+        if (page.more) console.log(`More entries: --since ${page.cursor}`);
+      }
+      return true;
+    }
+    if (!id || rest.length !== 1) throw new Error("Usage: infinite team entry ID ENTRY_ID [--json]");
+    z.uuid().parse(id);
+    z.uuid().parse(rest[0]);
+    const found = await api.json<{ head: EntryHead; body: unknown }>(`/teams/${id}/entries/${rest[0]}`);
+    if (json) console.log(terminalJson(found));
+    else {
+      console.log(entryLine(found.head));
+      console.log(terminalJson(found.body));
     }
     return true;
   }
@@ -1136,5 +1187,5 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     }
     return true;
   }
-  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|continue|delete|reconcile-delivery|reconcile-verification|retire-member|cancel|revoke-permissions ...");
+  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|continue|delete|entries|entry|reconcile-delivery|reconcile-verification|retire-member|cancel|revoke-permissions ...");
 }

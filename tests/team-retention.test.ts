@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { Manager } from "../packages/host/src/manager.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
-import { DEFAULT_TEAM_RETENTION, type TeamMember, type TeamRun } from "../packages/host/src/team-types.js";
+import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, type TeamMember, type TeamRun } from "../packages/host/src/team-types.js";
 import type { VolumeUsage } from "../packages/host/src/storage.js";
 import { removeMemberWorkspace, removeTeamWorkspace } from "../packages/host/src/team-workspace.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
@@ -82,36 +82,81 @@ test("cancelled runs lose their workspaces and sealed record after cancelledMinu
   } finally { await close(f, teams); }
 });
 
-test("blocked workspaces remain until blockedHours and removed runs reject resume while pause and cancel still work", async () => {
+test("stale blocked runs close after workspace removal and keep one host-closed event across restart", async () => {
   const f = schedulerFixture();
   const at = new Date().toISOString();
+  const blocker = "A worker reported a blocker.";
   f.run.status = "blocked";
   f.run.updatedAt = at;
-  f.run.reason = "A worker reported a blocker.";
+  f.run.reason = blocker;
   f.run.members.forEach(member => { member.status = "stopped"; });
-  f.run.events.push({ at, text: f.run.reason });
-  retention(f, { blockedHours: 1 });
+  f.run.events.push({ at, text: blocker });
+  retention(f, { blockedHours: 1, cancelledMinutes: 1 });
   let now = Date.parse(at);
   f.writeTeam();
-  const teams = openTeam(f, { now: () => now });
+  let teams = openTeam(f, { now: () => now });
   try {
     teams.start();
     await teams.idle();
     assert.ok(existsSync(runDirectory(f.run)), "blocked workspaces stay available before the configured window");
+    assert.equal(teams.get(f.run.id).status, "blocked");
     now += 3_600_001;
     await waitFor(() => !existsSync(runDirectory(f.run)), "blocked workspace should be removed after blockedHours");
     await teams.idle();
-    assert.ok(teams.get(f.run.id).workspaceRemovedAt);
     assert.equal(existsSync(runDirectory(f.run)), false);
-    const action = () => ({ requestId: randomUUID(), revision: 1 });
-    assert.equal(teams.get(f.run.id).resumable, false);
-    assert.equal(teams.get(f.run.id).continuable, false);
-    await assert.rejects(teams.resume(f.run.id, action()), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "team-workspace-removed");
-    await assert.rejects(teams.continueRun(f.run.id, action()), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "team-workspace-removed");
-    await assert.rejects(teams.steer(f.run.id, { ...action(), text: "Try a new direction" }), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "team-workspace-removed");
-    assert.equal((await teams.pause(f.run.id, action())).status, "paused");
-    await assert.rejects(teams.resume(f.run.id, action()), (error: unknown) => error instanceof TeamError && error.code === "team-workspace-removed");
-    assert.equal((await teams.cancel(f.run.id, action())).status, "cancelled");
+    const closedReason = hostClosedBlockedReason(1, blocker);
+    await waitFor(() => teams.get(f.run.id).status === "cancelled", "removed blocked run should be closed by the host");
+    const closed = teams.get(f.run.id);
+    assert.ok(closed.workspaceRemovedAt);
+    assert.equal(closed.reason, closedReason);
+    assert.equal(closed.events.filter(event => event.text === closedReason).length, 1);
+    assert.equal(closed.resumable, false);
+
+    teams.close(); await teams.idle();
+    teams = openTeam(f, { now: () => now });
+    teams.start(); await teams.idle();
+    await waitFor(() => teams.get(f.run.id).status === "cancelled", "the closed run should survive restart");
+    assert.equal(teams.get(f.run.id).events.filter(event => event.text === closedReason).length, 1);
+    now += 60_001;
+    await waitFor(() => !teams.statuses().some(row => row.id === f.run.id), "the closed run should use cancelledMinutes before deleting its record");
+    assert.equal(existsSync(join(f.config.stateDir, "teams", `${f.run.id}.sealed`)), false);
+  } finally { await close(f, teams); }
+});
+
+test("a blocked run with an unresolved operation keeps its workspace and stays blocked past blockedHours", async () => {
+  const f = schedulerFixture();
+  const at = new Date().toISOString();
+  f.run.status = "blocked"; f.run.updatedAt = at; f.run.reason = "A worker reported a blocker.";
+  f.run.members.forEach(member => { member.status = "stopped"; });
+  retention(f, { blockedHours: 1 }); f.writeTeam();
+  const teams = openTeam(f, { now: () => Date.parse(at) + 3_600_001 });
+  try {
+    // The host cannot see a process orphaned by an earlier restart, so elapsed time never proves the operation ended.
+    (teams as unknown as { records: Map<string, { pending?: unknown }> }).records.get(f.run.id)!.pending = { id: randomUUID(), kind: "check", revision: 1 };
+    teams.start(); await teams.idle();
+    assert.equal(existsSync(runDirectory(f.run)), true);
+    assert.equal(teams.get(f.run.id).status, "blocked");
+  } finally { await close(f, teams); }
+});
+
+test("a blocked run of an ended goal, with its workspace already removed, closes on the first sweep", async () => {
+  const f = schedulerFixture();
+  const at = new Date(Date.now() - 3_600_001).toISOString();
+  const blocker = "A worker reported a blocker.";
+  f.run.status = "blocked"; f.run.updatedAt = at; f.run.reason = blocker; f.run.workspaceRemovedAt = at; f.run.goal = {};
+  f.run.members.forEach(member => { member.status = "stopped"; });
+  f.run.events.push({ at, text: blocker });
+  rmSync(runDirectory(f.run), { recursive: true, force: true });
+  retention(f, { blockedHours: 1 }); f.writeTeam();
+  // The goal has ended, so nothing retains the run.
+  const teams = openTeam(f, { ownerActive: () => false });
+  try {
+    teams.start(); await teams.idle();
+    const closed = teams.get(f.run.id);
+    const reason = hostClosedBlockedReason(1, blocker);
+    assert.equal(closed.status, "cancelled");
+    assert.equal(closed.reason, reason);
+    assert.equal(closed.events.filter(event => event.text === reason).length, 1);
   } finally { await close(f, teams); }
 });
 

@@ -41,7 +41,14 @@ export interface ExecutionState {
   reason?: string;
   reconciliation?: "available";
 }
+/** Why a team session exists. Only the host sets it, through createTeamSession. */
+export type SessionPurpose = "work" | "duel" | "replay" | "gate";
+export const SESSION_PURPOSES: readonly SessionPurpose[] = ["work", "duel", "replay", "gate"];
 export interface Session {
+  /** Host-owned (contract C8). Set only through createTeamSession, and never changed. */
+  purpose?: SessionPurpose;
+  /** Host-owned (contract C7). A lowercase SHA-256 hex digest. */
+  configId?: string;
   handoff?: { policy?: import("./handoff-types.js").HandoffPolicy; reason?: string };
   id: string;
   managedBy?: { kind: "mission"; missionId: string; teamId?: string };
@@ -95,6 +102,8 @@ export interface Project {
   teamworkDir?: string;
   /** Where the host's copy of this project comes from: GitHub (followed by the host) or laptop workspace sync. Absent means laptop. */
   source?: import("./team-types.js").ProjectSource;
+  /** Effective autonomy mode of an applied enrollment. Set only by RepoEnrollmentService; read with autonomyOf(). */
+  autonomy?: import("./autonomy.js").AutonomyMode;
 }
 export interface AgentProfile {
   command: string;
@@ -126,8 +135,12 @@ export interface Config {
     retention?: import("./team-types.js").TeamRetention;
     /** Free inodes and bytes the workspace volume must keep for a new run to start. */
     storageFloor?: import("./team-types.js").StorageFloor;
+    /** Outcome measurement settings; they never change a routine's work, so routine approvals ignore them. */
+    outcomes?: { holdDays?: number; retentionDays?: number };
   };
   machine?: { id: string; label: string };
+  /** Operator default for an enrollment that has no saved mode. Only defaultMode exists in this block so far. */
+  autonomy?: { defaultMode?: import("./autonomy.js").AutonomyMode; fuse?: import("./config.js").FuseConfig };
   cmux?: { enabled: boolean; command?: string; hooksDir?: string };
   remote?: { enabled: boolean; relay?: { url: string; tokenFile: string } };
   /** Token prices (USD per million) and per-provider spend budgets for the usage ledger. */
@@ -168,7 +181,7 @@ export interface Config {
     accessTokenFile?: string;
     endpoint: string;
     detail: "minimal" | "full";
-    events: ("needs-you" | "turn-finished" | "exited" | "recording-error" | "goal-started" | "goal-finished" | "goal-stuck" | "goal-cancelled" | "team-started" | "team-finished" | "team-stuck" | "team-cancelled" | "team-blocked" | "host-storage")[];
+    events: ("needs-you" | "turn-finished" | "exited" | "recording-error" | "goal-started" | "goal-finished" | "goal-stuck" | "goal-cancelled" | "team-started" | "team-finished" | "team-stuck" | "team-cancelled" | "team-blocked" | "host-storage" | "autonomy-interrupt")[];
   };
 }
 export interface Receipt {

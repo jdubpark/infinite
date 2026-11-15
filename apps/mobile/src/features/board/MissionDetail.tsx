@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { ActivityIndicator, Alert, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
-import { api, connectionKey, type Connection, type Me, type Mission, type ProjectGroupList } from "../../api/client";
+import { api, connectionKey, type Board as BoardData, type Connection, type Me, type Mission, type ProjectGroupList } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { FloatingNotice } from "../../components/FloatingNotice";
 import { useKeyboardPadding } from "../../components/keyboard";
@@ -13,17 +13,20 @@ import { theme } from "../../theme";
 import { newer } from "../teams/model";
 import { RequestStatus, Section, SteerBox, t } from "../teams/parts";
 import { useRunRequest } from "../teams/useRunRequest";
-import { missionControls, missionStatusLabel, missionSubtaskLabel, openMissionDecisions } from "./model";
+import { attemptLabel, attemptsOf, findBoardItem, missionControls, missionStatusLabel, missionSubtaskLabel, openMissionDecisions } from "./model";
+import { Attempts } from "./Attempts";
 
 export function MissionDetail({ connection, id }: { connection: Connection; id: string }) {
   const router = useRouter();
   const keyboardPadding = useKeyboardPadding();
   const machine = connectionKey(connection);
   const poll = usePoll(async () => {
-    const [mission, me, projects] = await Promise.all([
+    const [mission, me, projects, board] = await Promise.all([
       api<Mission>(connection, `/missions/${id}`), api<Me>(connection, "/me"), api<ProjectGroupList>(connection, "/project-groups"),
+      // The board only adds attempt context; the screen renders without it.
+      api<BoardData>(connection, "/board").catch(() => null),
     ]);
-    return { mission, me, projects, at: Date.now() };
+    return { mission, me, projects, board: board?.items ?? [], at: Date.now() };
   }, 2500, [connection, id]);
   const [recorded, setRecorded] = useState<Mission | null>(null);
   const [direction, setDirection] = useState("");
@@ -40,6 +43,10 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
 
   const me = poll.data?.me;
   const now = poll.data?.at ?? 0;
+  const board = poll.data?.board ?? [];
+  const boardItem = findBoardItem(board, "mission", id);
+  const attempts = boardItem ? attemptsOf(board, boardItem) : [];
+  const attemptChip = boardItem ? attemptLabel(boardItem) : undefined;
   const controls = missionControls(mission, me?.role, fresh, now);
   const locked = request.busy || Boolean(request.pending);
   const decisions = openMissionDecisions(mission);
@@ -66,6 +73,7 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
         <Text style={t.note}>{projectName} · {age(mission.createdAt, now)}</Text>
         <Text style={t.title}>{mission.title}</Text>
         <View style={s.chips}><Chip kind={statusIcon} label={missionStatusLabel(mission.status)} tone={mission.status === "needs-input" || mission.status === "paused" ? "attention" : mission.status === "blocked" ? "error" : undefined} />
+          {attemptChip ? <Chip label={attemptChip} /> : null}
           <Chip label={`Updated ${age(mission.updatedAt, now)}`} /><Chip label={`Rev ${mission.revision}`} /></View>
         {mission.reason ? <Text style={mission.status === "blocked" ? t.error : t.warning}>{mission.reason}</Text> : null}
       </View>
@@ -74,6 +82,8 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
         {decisions.map(decision => <Decision key={decision.id} question={decision.question} options={decision.options}
           enabled={controls.answer && !locked} onAnswer={value => answer(decision.id, value)} />)}
       </Section> : null}
+
+      {attempts.length ? <Attempts attempts={attempts} current={id} machine={machine} now={now} /> : null}
 
       <Section title="Subtasks" count={mission.subtasks.length}>
         {mission.subtasks.length ? mission.subtasks.map(subtask => {

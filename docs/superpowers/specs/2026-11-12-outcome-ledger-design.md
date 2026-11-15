@@ -69,10 +69,12 @@ Another design may add event kinds under its own prefix and register a projector
 | Kind | Emitted in | Data |
 |---|---|---|
 | `run.created` | `createRun` | project, base commit, purpose, goal, mission |
+| `run.prepared` | `createRun` (prepare completion) | base commit |
 | `plan.accepted` | `consume` (`plan`) | task count, plan digest |
 | `task.planned` | `consume` (`plan`), once per task | profile, owned paths, features |
 | `discovery.accepted` | `consume` (`explore`) | per scout task: profile |
-| `member.started` | `launch` | role, purpose, profile identity, profile epoch, `configId`, replaced member and cause |
+| `member.started` | `launch` | role, purpose, session, profile identity, replaced member and cause |
+| `member.configured` | `launch`, a read after the session starts | `configId` and its six components. Absent when the read fails |
 | `member.reported` | `readMemberJournal` | report kind |
 | `member.stopped` | `replaceStalledMember`, `switchLimitedMember`, `retireMember`, `step` (halt loop, exit branch) | reason class |
 | `task.integrated` | `consume` (implementer `result`) | commit, head, base commit, diff counts |
@@ -80,15 +82,18 @@ Another design may add event kinds under its own prefix and register a projector
 | `task.escalated` | `consume` (`escalate`) | from and to profile |
 | `task.limit-switched` | `switchLimitedMember` | from and to profile |
 | `check.finished` | `check` | round, head, result per command |
-| `review.recorded` | `consume` (`review`) | verdict, head, base commit, reviewed tree, reviewer profile identity, rubric scores |
+| `review.recorded` | `consume` (`review`) | verdict, head, base commit, reviewer profile identity, rubric scores |
+| `review.tree` | `consume` (`review`), a read after the review operation | head, reviewed tree; absent when the read fails |
 | `repair.started` | `repair` | round, cause: `check`, `review`, `delivery` |
-| `repair.integrated` | `consume` (integrator `result`) | commit, head, changed paths |
+| `repair.integrated` | `consume` (integrator `result`) | round, commit, head, base commit |
+| `repair.paths` | `consume` (integrator `result`), a read after the operation | round, commit, changed paths or `pathsOmitted` |
 | `delivery.recorded` | `consume` (delivery reports) | `merge` or `pull-request`, head, merge commit |
 | `rating.recorded` | `rateTask` | task, score |
 | `run.blocked` | `block` | block code, source member |
-| `run.revision-advanced` | `steer`, `action`, `continueRun`, `startAutomaticRecovery`, `resumeVerificationRecovery`, `consume` (moved base) | cause, base commit changed |
+| `run.revision-advanced` | `steer`, `action`, `continueRun`, `startAutomaticRecovery`, `resumeVerificationRecovery`, `consume` (moved base) | cause, base commit changed, recovery source |
 | `run.settled` | `save`, `retire` | status, run summary counts |
 | `run.deleted` | `deleteRecord` | |
+| `ledger.gap` | `flushOutbox`, after a stored flush | dropped count |
 
 `save` already detects every status change for retention. It emits `run.settled` when the status becomes `ready-for-review`, `merged`, `no-change`, or `cancelled`, and `retire` emits it when it removes a blocked run's workspace. The reason classes of `member.stopped` are `stall`, `limit`, `no-report`, `owner` (pause, cancel, steer), and `host` (a halt for another member's block or an automatic recovery, a deadline, the attempt limit, a runtime retirement). Two events need a new best-effort Git read: the integrator commit's changed paths, and the reviewed head's tree id.
 
@@ -134,7 +139,7 @@ CREATE TABLE outcomes (
   kind TEXT, risk TEXT NOT NULL, feature_version INTEGER NOT NULL,
   disposition TEXT NOT NULL,
   exclusion TEXT,                        -- limit | owner | host | duel
-  integrated INTEGER, accepted INTEGER, first_pass INTEGER, held INTEGER,  -- 1, 0, NULL = unknown
+  integrated INTEGER, accepted INTEGER, acceptance INTEGER, first_pass INTEGER, held INTEGER,  -- 1, 0, NULL = unknown
   started_at TEXT, ended_at TEXT, frozen_at TEXT, hold_until TEXT, run_deleted_at TEXT,
   payload TEXT NOT NULL                  -- encrypted OutcomePayload
 );
@@ -162,11 +167,13 @@ type OutcomePayload = {
 
 Plaintext columns hold opaque identifiers, enumerations, numbers, and times. Names from the repository or the run stay in the encrypted payload. A row never holds an objective, instructions, a summary, a rubric reason, a rating note, a path, or a URL.
 
+`acceptance` is the review's acceptance, kept as its own fact apart from `accepted`. An owner exclusion empties `accepted`, so a withdrawal could not restore it from that column.
+
 **Cost.** The ledger copies cost from the usage ledger and stores the usage coverage with it. It refreshes both whenever the usage ledger reports new usage for one of the attempt's sessions. That also happens after the row is frozen and after the run record is deleted. A cost spread in a cell uses rows with `complete` coverage only, and it reports how many rows it left out.
 
 Purpose sets the source. An attempt in a replay run or a gate run has source `replay`. A duel contestant whose fate the duel set has source `duel`, as the duels design defines. Every other attempt has source `production`.
 
-**Configurations and profile epochs.** `launch` computes `configId` as umbrella C7 defines and puts it on `member.started`. A `configurations` table keeps one row per `configId` with its six components, so a reader can tell which component changed between two attempts. A `profile_epochs` table keeps the current epoch per profile identity. `infinite usage outcomes new-epoch --profile ID`, owner only, advances it after a known backend change behind an unchanged model name. Each outcome row stores the epoch its attempt started in, and no cell merges two epochs of one profile.
+**Configurations and profile epochs.** After a member's session starts, an enrichment in `launch` computes `configId` as umbrella C7 defines and emits it as `member.configured`. It runs after the launch and never delays it, and a read that fails emits nothing. A `configurations` table keeps one row per `configId` with its six components, so a reader can tell which component changed between two attempts. A `profile_epochs` table keeps each epoch of a profile identity with the time it began, so a reader takes the epoch in effect at a member's start time, and an epoch advanced later does not change an earlier attempt. `infinite usage outcomes new-epoch --profile ID`, owner only, advances the profile's epoch after a known backend change behind an unchanged model name. Each outcome row stores the epoch its attempt started in, and no cell merges two epochs of one profile.
 
 | Disposition | Set by | Counted |
 |---|---|---|
@@ -188,12 +195,12 @@ A stall or an escalation counts as a failure and a limit is excluded, as in the 
 
 ### Part 4. Success levels
 
-Each level is yes, no, or unknown. A row with an exclusion has no levels.
+Each level is yes, no, or unknown. A row with an exclusion has no levels. An owner exclusion sets the row's `exclusion` to `owner`, so the row has no level. Withdrawing it restores the levels.
 
 - **integrated** is yes for disposition `integrated` and no for every other counted disposition of an implementer. A `result` with no commit still integrates the task in the run record, so the row is integrated and carries `empty-result`.
 - **accepted** is yes when a `review.recorded` with verdict `approved` follows the attempt's `task.integrated`, in the same run, with the same base commit. Only the moved-base path changes `run.baseCommit`, so an approved head with the same base contains every earlier integration.
 - **firstPass** is yes when accepted is yes and no correction round is attributed to the task. It is no when accepted is no or a round is attributed. Otherwise it is unknown.
-- **held** is defined in Part 5.
+- **held** is defined in Part 5. It is no when accepted is no or a negative signal applies (a revert, or a linked fix that applies), yes when accepted is yes and the landing's window is covered, and unknown otherwise. The flag `scan-gap` marks a held level that a scan gap left unknown.
 
 A scout row has no levels. Its disposition `completed` is its only result, and a scout rate is the share of counted scout rows that completed.
 
@@ -234,6 +241,8 @@ CREATE TABLE outcome_signals (
 );
 ```
 
+Signals are rows of the outcome module, not run events, because run events are deleted with their run, a signal must reach the rows of a deleted run, and a new event kind would change the projector's outbox definition. A scan or an owner claim is not a run transition. The one signal that an event makes is `rating`.
+
 | Kind | Author, authority | Comes from | Effect |
 |---|---|---|---|
 | `rating` | owner, claim | `rating.recorded` | sets `ownerRating`. No level changes |
@@ -244,16 +253,28 @@ CREATE TABLE outcome_signals (
 
 The host never infers a defect. A `revert` records only that a base-branch commit says it reverts a landed commit. A member cannot write a signal. `rateTask` reaches only the current revision's tasks, so an older row cannot be rated yet.
 
-**Base branch scan.** `ProjectSourceService.refreshOne` gets an optional callback that fires when `mirrorHead` changes. The ledger reads the new first-parent commits in the mirror, at most 500 per scan, and records the commit range that each scan covered. It compares the commits with two sets of the project's runs. Rules 1 to 3 use the approved runs that have no landing and were approved at most 90 days ago. Rule 4 uses the landed runs whose hold window is still open.
+**Base branch scan.** `ProjectSourceService.refreshOne` gets an optional callback that fires after every successful fetch of the mirror, whether or not `mirrorHead` changed. *(Otherwise a window on a quiet branch never closes, and a failed scan is never retried.)* A fetch continues the ledger's history only when every fetch since the last recorded scan is accounted for. The source status keeps an order stamp for each fetch, which never goes back, and the stamp since which the mirror's head has stood. The scanner keeps the fetches that no recorded scan read. A head among them that is no longer a first-parent commit of the base branch, or a head that moved at a fetch the ledger never read, makes the scan a `rewrite` gap. The ledger reads the new first-parent commits in the mirror, at most 500 per scan, and records the commit range that each scan covered. A scan that finds more keeps the newest 500 and records a `bound` gap. It compares the commits with two sets of the project's runs. Rules 1 to 3 use the approved runs that have no landing and were approved at most 90 days ago. Rule 4 uses the landed runs whose hold window is still open.
 
 1. A commit whose id is a run's reported merge commit lands that run (`merge-commit`).
 2. A commit whose second parent is a run's reviewed head lands that run (`merge-parent`).
-3. A commit whose tree is a run's reviewed tree lands that run (`tree-equal`).
-4. A commit whose message contains `This reverts commit` followed by a landed commit's id records a `revert`.
+3. A commit whose tree is a run's reviewed tree lands that run (`tree-equal`). A tree can recur, so the commit must also be the reviewed head itself, or come after the run's base in the scanned commits. When the base is not among them, the rule holds only in a scan of new commits, never in one that reads history older than the ledger's own head. A run whose reviewed head is its base never lands.
+4. A commit whose message contains `This reverts commit` followed by a landed commit's id records a `revert`. The landed ids are the landing commit and, for a landing by the second parent, the reviewed head. The reverting commit must come after the landing commit. Work that is removed another way is not seen: a revert of one commit of the branch, a revert of a second merge of the same head, or a plain edit. Held can then be yes for work that is gone; the hindsight measure of surviving lines is the planned answer.
 
 *(My call: exact matches only. A pull request number in a commit subject is text that anyone can write. The cost is that a squash merge onto a moved base stays unobserved.)*
 
-**held.** The hold window starts at landing and lasts `teams.outcomes.holdDays`, default 30. Held is yes when accepted is yes, a landing exists, the window has closed, the scans covered every base-branch commit inside the window, and no active `revert` or `linked-fix` falls inside it. Held is no when accepted is no, or when such a signal exists. Otherwise held is unknown. That covers every project without a GitHub mirror, every landing the scan could not match, and every window with a scan gap, which the row marks with the `scan-gap` flag.
+A run lands once, at its first matching commit. All accepted rows of a run take that one landing, whatever their revision. *(The run summary keeps only the newest reviewed head.)* A signal's time is the time of the fetch that the scan read, never a committer date. *(A committer date is text the committer writes.)*
+
+**held.** The hold window starts at landing and lasts `teams.outcomes.holdDays`, default 30. Held is yes when accepted is yes, a landing exists, the window has closed, the scans covered every base-branch commit inside the window, and no negative signal applies. A negative signal is an active `revert` recorded at or before the close, or an active `linked-fix` that counts. A `linked-fix` counts when the run has no landing, or when its time is at or before the close of the window. One that names a row applies to that row when it is integrated; one that names only the run applies to the run's accepted rows. Held is no when accepted is no, or when a negative signal applies. Otherwise held is unknown. That covers every project without a GitHub mirror, every landing the scan could not match, and every window with a scan gap. An accepted row of a landed run whose held a gap left unknown carries the `scan-gap` flag; a revert decides held whatever the gap.
+
+**Window coverage.** A window's verdict is `open`, `covered`, or `gap`. `last` is the newest scan at or before the close, from the landing's scan on, and `next` is the scan after it. The first rule that applies gives the verdict:
+
+1. A gap scan after the landing's scan, at or before the close, gives `gap`.
+2. `last` was checked at or after the close, so the head did not move through the close: `covered`.
+3. No `next` gives `open`.
+4. A `next` with a gap gives `gap`.
+5. A `next` scanned at most six hours after `last` was checked gives `covered`; a later one gives `gap`.
+
+Six hours is several times the mirror fetch's back-off, which is at most an hour. A verdict other than `open` is stored once on the landing, with the time of the scan that decided it, and is never recomputed. *(So a pruned scan cannot change a decided window.)* A scan decides the windows of landings up to 455 days old, the longest hold plus 90 days. A window that no scan decided in that time stays `open`, and held stays unknown.
 
 ### Part 6. Run summaries, member results, and roll-ups
 
@@ -261,13 +282,15 @@ The host never infers a defect. A `revert` records only that a base-branch commi
 
 `member_results` keeps the same facts for a member that has no task (project manager, integrator, reviewer, delivery): role, profile identity, `configId`, disposition, times, and cost. *(My call: capture these now, because this evidence cannot be backfilled. The permission coordinator has its own decision records and is left out.)*
 
-A goal roll-up sums the run summaries and rows that carry the goal id. A mission roll-up does the same for the mission id. A goal roll-up also shows the owner's latest verdict from `ProductGoal.outcomes`. This design calls that verdict a **goal assessment**, so that outcome keeps one meaning.
+A goal roll-up sums the rows and member results of the runs whose run summary or one of whose rows carries the goal id. A row copies the goal when it is made, so a row that an event made before `run.created` carries none. The goal is a fact of the run. A mission roll-up does the same for the mission id. Counts and rounds are summed over settled runs only. A goal roll-up also shows the owner's latest verdict from `ProductGoal.outcomes`. This design calls that verdict a **goal assessment**, so that outcome keeps one meaning.
+
+The objective record design adds a `finding_measures` table joined to scout rows by `outcome_id`, so a scout cell gains `findings`, and its verdict rows keep this design's 730-day retention. A goal roll-up shows the latest agent assessment, labelled provisional, beside the goal assessment and never merged with it (C14).
 
 ### Part 7. Reads
 
-**Scorecard.** `GET /api/usage/models` returns the same `ModelUsage` shape, built from rows with source `production`. `attempts` is the ended rows with no exclusion, `integrated` is the rows with integrated yes, and `meanReviewRounds` uses `rounds.run`. The other fields read the payload. The response gains two additive fields, `sources` and `excluded`. `infinite usage models` needs no change.
+**Scorecard.** `GET /api/usage/models` returns the same `ModelUsage` shape, built from rows with source `production`. `attempts` is the counted rows, `integrated` is the rows with integrated yes, and `meanReviewRounds` uses `rounds.run`. The other fields read the payload. The response gains two additive fields: `sources` at the top (`["production"]`), and `excluded` on each row (`limit`, `owner`, `host`, `duel` counts). `infinite usage models` needs no change. When the store is unavailable the route answers 503 with `code: "evidence-unavailable"`; it does not fall back to run records.
 
-The numbers change in three ways, on purpose. An attempt integrated before a steer, a resume, or a continuation now counts. An attempt from a deleted run stays. Owner stops and host stops leave the denominator.
+The numbers change on purpose. Three changes are named here: an attempt integrated before a steer, a resume, or a continuation now counts; an attempt from a deleted run stays; owner stops and host stops leave the denominator. Five more are listed in `docs/teams.md`, "Model scorecard".
 
 **Cells.** Other designs call one in-process query:
 
@@ -282,28 +305,31 @@ type CellQuery = {
 type LevelCount = { yes: number; no: number; unknown: number; rate: number | null; interval: [number, number] | null };
 type Spread = { n: number; median: number; iqr: [number, number] };
 type Cell = {
-  key: Record<string, string>; sources: Source[]; from: string; to: string;
+  key: Record<string, string>; sources: Source[]; from: string | null; to: string | null;
   attempts: number; open: number; excluded: { limit: number; owner: number; host: number; duel: number };
+  withheld: { backfilled: number; gap: number; unfrozen: number };
+  flagged: { backfilled: number; gap: number; "empty-result": number; "same-model-review": number; "scan-gap": number };
   levels: { integrated: LevelCount; accepted: LevelCount; firstPass: LevelCount; held: LevelCount };
+  completed?: LevelCount;                  // role "scout" only
   tokens: Spread | null; spentUsd: Spread | null; listUsd: Spread | null; minutes: Spread | null;
-  ownerRating: { mean: number; n: number } | null;
-  enough: boolean;
+  ownerRating: { mean: number; n: number } | null; enough: boolean;
 };
 ```
 
-For role `scout`, a cell leaves the four levels empty and reports a fifth count, `completed`.
+For role `scout`, a cell leaves the four levels empty and reports a fifth count, `completed`. `withheld` counts the rows a `decision` cannot use, and `flagged` counts the rows a `display` reports with a flag, so no left-out row is silent. `from` and `to` are null when no row has a time. The query result is `{ cells, unreadable }`, where `unreadable` counts rows whose payload did not open.
 
-A `decision` query refuses the `legacy` source. It leaves out an integrated row that is not frozen, and it includes a row that ended without integration as soon as the attempt ends.
+A `decision` query refuses the `legacy` source, and a `decision` without `profile` in `by` (`decision-without-profile`), because a cell that pools profiles pools their epochs. It leaves out an integrated row that is not frozen, and it includes a row that ended without integration as soon as the attempt ends.
 
-A second query groups rows by assignment and returns the first profile, the final profile, the attempt count, and the total cost. A third query returns the rows themselves for a `decision` use: identifiers, source, features, profile identity and epoch, `configId`, disposition, exclusion, the four levels, the owner rating, cost, the end and freeze times, and `experiment_ref`. The router design computes its reward from these rows. Memory's `routing-outcome` source (INF-132) reads cells.
+Deferred from the switch-over slice: the assignment query and the rows query below. Nothing reads them yet, and the assignment query needs the usage ledger. A second query groups rows by assignment and returns the first profile, the final profile, the attempt count, and the total cost. A third query returns the rows themselves for a `decision` use: identifiers, source, features, profile identity and epoch, `configId`, disposition, exclusion, the four levels, the owner rating, cost, the end and freeze times, and `experiment_ref`. The router design computes its reward from these rows. Memory's `routing-outcome` source (INF-132) reads cells.
 
 **API and CLI.**
 
-- `GET /api/outcomes` returns cells for a `display` query. `infinite usage outcomes [--project ID] [--role ROLE] [--by LIST] [--sources LIST] [--days N] [--json]`.
+- `GET /api/outcomes?project=&role=&by=&sources=&days=` returns `{ use: "display", query, cells, unreadable }`, for every paired device. `by` defaults to `profile` and `sources` to `production`; `days` is an integer from 1 to 3650. A refused query answers 400 with its code, and an unavailable store answers 503. `infinite usage outcomes [--project ID] [--role ROLE] [--by LIST] [--sources LIST] [--days N] [--json]`.
 - `GET /api/outcomes/runs/:runId` returns a run's summary, rows, and signals, also after the run record is deleted. `infinite usage outcomes --run ID`.
-- `GET /api/outcomes/rollup` takes `goal=ID` or `mission=ID`. `infinite usage outcomes --goal ID` or `--mission ID`.
+- `GET /api/outcomes/rollup` takes exactly one of `goal=ID` or `mission=ID`. `infinite usage outcomes --goal ID` or `--mission ID`. The response reuses the display cells of `GET /api/outcomes`. It answers 404 `rollup-not-found` when the host holds no record of the goal or mission and the ledger holds no run of it, so a mistyped id does not read as an empty goal, and 503 when the store is unavailable.
 - `POST /api/outcomes/signals`, owner only, records or withdraws a `linked-fix` or an `exclusion`. `infinite usage outcomes link-fix` and `exclude`.
 - `POST /api/outcomes/epochs`, owner only, advances a profile epoch. `infinite usage outcomes new-epoch --profile ID`.
+- `POST /api/outcomes/legacy`, owner only, imports a batch of legacy lines. `infinite usage outcomes import-legacy --file FILE` (Part 8).
 
 There is no MCP surface. A member never reads the ledger.
 
@@ -322,14 +348,19 @@ type LegacyOutcome = {
 };
 ```
 
-Each line becomes a row with source `legacy` and id `legacy:<id>`. `accepted` sets integrated and accepted to yes, and firstPass to yes only when `attempts` is 1. `rejected` sets accepted to no. `excluded` sets exclusion `host`. Held is unknown. The import is idempotent by id, drops a superseded line, and refuses a changed line under a known id.
+Each line becomes a row with source `legacy` and id `legacy:` followed by a blind index of the line's `id`, not the literal id. The id is operator text and the outcome id is a plain column, so the line's id stays in the sealed payload. `accepted` sets integrated and accepted to yes, and firstPass to yes only when `attempts` is 1, so a higher count gives firstPass no. Held is unknown for an accepted line. `rejected` sets accepted to no, and firstPass and held to no by their definitions. Integrated is unknown, because the operator's ledger does not say whether rejected work was integrated. `excluded` sets disposition `host-stop` and exclusion `host`, and its levels are unknown. Every other column is fixed: profile `(legacy)`, epoch 0, role `implementer`, and a run id of the row's own, so no legacy row shares a cell with a production row.
 
-A legacy row is an unauthenticated claim. It appears only in `display` queries, under its own source label. Memory's import of the same evidence (INF-141) reads these rows and does not import the operator's ledger a second time.
+The import decides each line on its own and writes each batch in one store write. A line gets one of six outcomes: `imported`; `repeated`, for the same id with the same body; `superseded`, when a line the host holds replaces it, so it is not stored; `expired`, when `recordedAt` is older than the retention window; `changed`, for a known id with another body; and `conflict`, when its row id belongs to a row the import did not write. A refused line does not stop the other lines of its batch. A changed line under a known id is refused, and the operator issues a new id with `supersedes`. A superseded line is dropped in either order: when it arrives after the line that supersedes it, it is not stored, and its mark takes its own hash and time. A line that is itself superseded still supersedes the line it names, so a chain keeps only its last line and a cycle keeps no line. A mark for a line the host has not seen holds the latest time among the lines that name it. So the stored result depends on the set of lines, never on their order or on where the file is cut into batches. A replay changes nothing.
+
+Retention counts from `recordedAt`, not from the import, so a line recorded longer ago than `teams.outcomes.retentionDays` is `expired` when it arrives. The limits are 20,000 lines a file, 1,024 bytes a line, 50 lines a batch, and 50,000 legacy lines on a host. The CLI checks the whole file before it sends anything.
+
+A legacy row is an unauthenticated claim. It appears only in `display` queries, under its own source label. No scorecard, `decision` read, or roll-up counts it, and the host never recomputes it. Memory's import of the same evidence (INF-141) reads these rows and does not import the operator's ledger a second time.
 
 ## Authority and safety
 
 - The ledger observes. No `TeamService` decision reads it, and a store failure never stops a run.
-- Levels change only on host receipts and owner claims. A host receipt states what the host itself read: a report kind, a commit id, a tree id, a commit message on the base branch.
+- Levels change only on host receipts and owner claims. A host receipt states what the host itself read: a report kind, a commit id, a tree id, and that Git found a base-branch commit whose message names a landed commit. The host reads no commit message itself.
+- A landing or a revert is a receipt of what the host mirror showed at a fetch. The agent identity can write the mirror, so such a receipt is not proof against a member that alters the mirror. A landing by the reported merge commit also rests on the delivery member's report: the scan checks only that the commit is a first-parent commit of the base branch. Each landing stores which rule matched, so a reader can treat the three apart.
 - No score reaches a prompt. `team-prompts.ts` must not import the ledger, and a test asserts it.
 - A rubric is stored only when `consume` kept it. `consume` already drops one when reviewer and implementer share a model.
 - Reads follow the role rules of `GET /api/usage/models`. Signal writes and the import need the owner role.
@@ -342,6 +373,8 @@ A legacy row is an unauthenticated claim. It appears only in `display` queries, 
 - **Crash or restore.** The next start appends the outbox again, and a stored key inserts nothing. A row is never removed because a record lacks it.
 - **A transition forgets to emit.** A test lists every report kind and every `member.stopped` class and fails when one has no emission. At `run.settled` the projector logs any difference between the summary counts and its rows.
 - **Scan gap.** A first scan, a jump of more than 500 commits, or a rewritten base branch scans the newest 500 commits only. A missed landing leaves held unknown, and so does a gap inside an open hold window.
+- **A signal that cannot be read.** A display leaves it out and counts it. A recomputation needs every signal of the run, because the one it cannot read may be the linked fix that makes held no or the exclusion that keeps a row out of the rates. So the write fails: an owner claim answers 503, and a scan leaves the run's rows as they are and goes on with the other runs. A projector write of that run fails too, as it does for a row that cannot be read, and the projector waits at that event: no later event of any run is projected until the store is repaired.
+- **A fetch the host did not record.** A fetch can move the mirror and then fail, or the host can stop before it writes the status. Each refresh first reads the mirror's branch and records a head the status does not name, before the new fetch can replace it.
 - **Late usage.** The ledger refreshes a row's cost and coverage whenever the usage ledger reports new usage for one of its sessions, also after the freeze and after the run record is deleted.
 - **Map change.** A cell never merges two `featureMap` values for one project unless the query leaves `area` out of `by`.
 
@@ -365,15 +398,23 @@ A legacy row is an unauthenticated claim. It appears only in `display` queries, 
 
 ## Owner decisions
 
-1. Outcome rows hold no run text. May they outlive a deleted run, and is 730 days the right retention?
-2. Is 30 days the right hold window?
+1. **Decided 2026-11-13:** outcome rows outlive a deleted run, for 730 days.
+2. **Decided 2026-11-13:** the hold window stays 30 days.
 3. A revert undoes a whole run. Should it set held to no for every accepted attempt in that run, as designed, or only mark the run summary?
 4. An attempt that ends with a question counts as a failure today, and this design keeps that. Should a question be excluded like an owner stop?
 
 ## Left to the builder
 
 - The projector registry, and use of the store's encryption and blind index helpers. The blackboard design owns the helpers.
-- The key strings, and the Git commands and timeouts for the two new reads and the mirror scan.
+- The key strings, and the Git commands and timeouts for the two new reads.
+- The five Git forms of the base branch scan. Each runs through the team command prefix in the host mirror, never in a team workspace, with a 30 second limit:
+  - `merge-base --is-ancestor OLD NEW`
+  - `rev-list --first-parent --max-count=501 NEW ^OLD`
+  - `rev-list --first-parent --max-count=500 NEW`
+  - `log --no-walk=unsorted --no-show-signature --format=%H %T %P ID...`
+  - `log --no-walk=unsorted --no-show-signature --format=%H --fixed-strings --grep=This reverts commit ID... ID...`
+
+  The launcher audit of these forms under the deployed Unix identities is a release step, outside the pull request.
 - Prompt wording for the optional `kind` and `risk` labels. Keep it to one line, because team prompts have an 80 KiB limit and byte-sensitive tests.
 - Client decoding of `ModelUsage`. This design did not verify that the web, phone, and Mac clients ignore the two new fields.
 - A project removal path for the purge. This design did not find one.

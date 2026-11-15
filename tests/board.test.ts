@@ -15,13 +15,13 @@ const projects: Config["projects"] = [{ id: "api", name: "API", path: "/srv/repo
 const at = (minute: number) => new Date(Date.UTC(2026, 0, 1, 0, minute)).toISOString();
 const mission = (status: Mission["status"], minute: number, extra: Partial<Mission> = {}) => ({
   id: randomUUID(), groupId: "shop", groupName: "Shop", repoProjectIds: ["api", "web"], title: `Mission ${status}`, objective: "Ship it", status,
-  updatedAt: at(minute), subtasks: [], decisions: [], ...extra,
+  createdAt: at(minute), updatedAt: at(minute), subtasks: [], decisions: [], ...extra,
 }) as unknown as Mission;
 const team = (status: TeamView["status"], minute: number, extra: Partial<TeamView> = {}) => ({
-  id: randomUUID(), projectId: "api", title: `Team ${status}`, status, revision: 1, updatedAt: at(minute), decisions: [], tasks: [], ...extra,
+  id: randomUUID(), projectId: "api", title: `Team ${status}`, status, revision: 1, createdAt: at(minute), updatedAt: at(minute), decisions: [], tasks: [], ...extra,
 }) as unknown as TeamView;
 const goal = (status: ProductGoal["status"], minute: number, extra: Partial<ProductGoal> = {}) => ({
-  id: randomUUID(), projectId: "web", title: `Goal ${status}`, status, updatedAt: at(minute), cycles: [], ...extra,
+  id: randomUUID(), projectId: "web", title: `Goal ${status}`, status, createdAt: at(minute), updatedAt: at(minute), cycles: [], ...extra,
 }) as unknown as ProductGoal;
 
 test("the board maps missions, standalone teams, and goals to columns and hides subteams and goal cycles", () => {
@@ -83,6 +83,31 @@ test("the board maps missions, standalone teams, and goals to columns and hides 
   assert.equal(find("Goal running").groupId, "shop");
   assert.equal(find("Unmapped team").projectName, "Docs");
   assert.ok(!Object.hasOwn(find("Unmapped team"), "groupId"));
+});
+
+test("the board numbers repeated attempts of the same work and marks stopped older ones superseded", () => {
+  const containing = () => undefined;
+  const objective = "Rework the project page";
+  // The owner sent the same mission three times; the second copy differs only in whitespace.
+  const first = mission("cancelled", 1, { objective }), second = mission("blocked", 2, { objective: `  Rework the\n project page ` }), third = mission("blocked", 3, { objective });
+  const other = mission("working", 4, { objective: "A different mission" });
+  const elsewhere = mission("blocked", 5, { objective, groupId: "docs", groupName: "Docs", repoProjectIds: ["docs"] });
+  // An older attempt that is still under way must stay visible, so it is not superseded.
+  const running = team("implementing", 6, { objective }), rerun = team("blocked", 7, { objective });
+  const goals = [goal("blocked", 8, { objective } as Partial<ProductGoal>), goal("blocked", 9, { objective } as Partial<ProductGoal>)];
+  const { items } = missionBoard([third, other, first, elsewhere, second], [rerun, running], goals, projects, containing);
+  const attempt = (id: string) => items.find(item => item.id === id)!.attempt;
+
+  assert.deepEqual([first, second, third].map(item => { const { workId: _workId, ...rest } = attempt(item.id)!; return rest; }),
+    [{ number: 1, of: 3, superseded: true }, { number: 2, of: 3, superseded: true }, { number: 3, of: 3, superseded: false }]);
+  assert.equal(new Set([first, second, third].map(item => attempt(item.id)!.workId)).size, 1);
+  assert.equal(attempt(other.id), undefined, "A single start is not an attempt");
+  assert.equal(attempt(elsewhere.id), undefined, "The same objective in another project is separate work");
+  assert.deepEqual([running, rerun].map(item => { const { workId: _workId, ...rest } = attempt(item.id)!; return rest; }),
+    [{ number: 1, of: 2, superseded: false }, { number: 2, of: 2, superseded: false }]);
+  assert.notEqual(attempt(running.id)!.workId, attempt(third.id)!.workId, "A run and a mission with one objective are separate work");
+  assert.ok(goals.every(item => attempt(item.id) === undefined), "Goals repeat by design and are not attempts");
+  assert.equal(items.find(item => item.id === third.id)!.createdAt, at(3));
 });
 
 test("a member stopped on a provider prompt moves its run, mission, or goal to needs-input, and an ended mission drops its open question", () => {

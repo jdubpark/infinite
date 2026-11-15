@@ -389,7 +389,7 @@ process.stdin.on("end", () => {
 });
 `;
 /** Store complete agent context in ignored Git metadata, atomically replacing only a regular prior snapshot. */
-export async function writeTeamContext(cwd: string, context: unknown, prefix?: TeamCommand, signal?: AbortSignal): Promise<void> {
+export async function writeTeamContext(cwd: string, context: unknown, prefix?: TeamCommand, signal?: AbortSignal): Promise<number> {
   let serialized: string | undefined;
   try { serialized = JSON.stringify(context, null, 2); } catch { throw new TeamError(409, "team-context-invalid", "The team context could not be serialized safely."); }
   if (serialized === undefined) throw new TeamError(409, "team-context-invalid", "The team context must be a JSON value.");
@@ -400,10 +400,12 @@ export async function writeTeamContext(cwd: string, context: unknown, prefix?: T
     throw new TeamError(409, "invalid-workspace", "The member workspace must be a real directory without a symlink path.");
   if (await git(canonical, ["rev-parse", "--show-toplevel"], prefix, 30000, signal) !== canonical)
     throw new TeamError(409, "invalid-workspace", "The member workspace must be a Git repository root.");
+  const text = `${serialized}\n`;
   const nonce = randomUUID();
-  const result = await teamCommand({ command: process.execPath, args: ["-e", writeTeamContextScript, nonce] }, canonical, signal, 30000, prefix, `${serialized}\n`);
+  const result = await teamCommand({ command: process.execPath, args: ["-e", writeTeamContextScript, nonce] }, canonical, signal, 30000, prefix, text);
   if (result.exitCode !== 0 || result.interrupted || result.truncated || !result.stdout.includes(`INFINITE_TEAM_CONTEXT_WRITTEN:${nonce}`))
     throw new TeamError(409, "team-context-write-failed", "The complete team context could not be stored safely in Git metadata; do not launch this member.");
+  return Buffer.byteLength(text, "utf8");
 }
 /** Retain the reported merge object without changing the reviewed working tree. */
 export async function captureDeliveryBaseline(workspace: string, memberCwd: string, reviewedHead: string, mergeCommit: string, prefix?: TeamCommand, signal?: AbortSignal) {

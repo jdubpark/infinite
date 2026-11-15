@@ -67,6 +67,7 @@ import { SlackClient } from "./slack-client.js";
 import { createMissionSchema, missionActionSchema, missionTextSchema, type CreateMission, type Mission, type MissionOrigin } from "./mission-types.js";
 import { ProjectGroupService } from "./project-groups.js";
 import { PermissionDelegationService } from "./permission-delegation.js";
+import type { PermissionAgentServices } from "./permission-agent-types.js";
 import { INTERRUPT_CLASSES, PERMISSION_POLICY_VERSION } from "./permission-policy.js";
 import { PermissionJournal, permissionJournalModule } from "./evidence/permission-journal.js";
 import { LinearService } from "./linear.js";
@@ -279,6 +280,9 @@ export function createApp(config: Config, key: Buffer) {
   let permissionDelegation: PermissionDelegationService | undefined;
   try { permissionDelegation = new PermissionDelegationService(config, key, projectGroups); }
   catch { console.warn("[Infinite] Permission delegation is unavailable on this host."); }
+  // The permission agent's parts. A part that is absent leaves the requests it would serve with the owner.
+  const permissionAgent: PermissionAgentServices = {};
+  void permissionAgent;
   const missions = new MissionService(config, key, manager, teams, projectGroups);
   ownerServices.missions = missions;
   // A run is live while its sealed record file exists, so a record that failed to load keeps its evidence.

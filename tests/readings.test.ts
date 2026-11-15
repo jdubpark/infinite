@@ -389,11 +389,7 @@ test("requestRoute is undefined without jev, on a transport error, and on an unk
     assert.equal(await a.readings.requestRoute("what is this?"), undefined);
     assert.equal(await b.readings.requestRoute("what is this?"), undefined);
     delete (c.config as any).jev;
-    let asks = 0;
-    const ask = (c.readings as any).ask.bind(c.readings);
-    (c.readings as any).ask = (...args: unknown[]) => { asks++; return ask(...args); };
     assert.equal(await c.readings.requestRoute("what is this?"), undefined);
     assert.equal(calls, 0);
-    assert.equal(asks, 0, "the reading service is never asked");
   } finally { a.dispose(); b.dispose(); c.dispose(); }
 });

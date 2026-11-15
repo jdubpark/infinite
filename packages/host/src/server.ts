@@ -40,6 +40,8 @@ import { outcomeBackfill } from "./outcome-backfill.js";
 import { outcomeProjector } from "./outcome-projector.js";
 import { TaskCapture } from "./eval-capture.js";
 import { EXCLUSION_REASONS, OUTCOMES_MODULE, outcomeModule, runOutcomeView, sweepExpiredOutcomes, type SignalRow } from "./outcome-store.js";
+import { RoutingRecorder } from "./routing-recorder.js";
+import { routingModule, sweepExpiredDecisions } from "./routing-store.js";
 import { ownerSignal, SignalRequestError, type OwnerSignalInput } from "./outcome-signals.js";
 import { COMMIT_ID, HOLD_DAYS_DEFAULT } from "./outcome-hold.js";
 import { BaseScanner } from "./outcome-scan.js";
@@ -236,6 +238,7 @@ export function createApp(config: Config, key: Buffer) {
   evidence.register(configurationModule());
   outbox.registerProjector(configurationProjector());
   evidence.register(outcomeModule());
+  evidence.register(routingModule());
   // The project signal inbox. Sources record facts into it; only consumers' own scheduler passes act on them.
   const signals = new SignalService({ store: evidence });
   baseScanner = new BaseScanner({
@@ -265,6 +268,7 @@ export function createApp(config: Config, key: Buffer) {
     },
   });
   teams.useEvidence(evidence);
+  teams.useRouter(new RoutingRecorder({ store: evidence }));
   // The one-time outcome backfill. Its first tick runs here, before any timer can fire, so no member event of a run
   // that predates emission is projected before that run's rows. (The constructor above can already have emitted a
   // `run.blocked` for a record that the restart blocked; it makes only a summary, which the backfill completes.)
@@ -298,6 +302,7 @@ export function createApp(config: Config, key: Buffer) {
   const sweepEvidence = () => {
     evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
     sweepExpiredOutcomes(evidence, new Date().toISOString(), undefined, config.teams?.outcomes?.retentionDays);
+    sweepExpiredDecisions(evidence, new Date().toISOString());
     capture.sweep();
     signals.sweep();
   };
@@ -721,7 +726,7 @@ export function createApp(config: Config, key: Buffer) {
       providers: Object.keys(config.agents).filter(
         (p) => p !== "demo" || config.enableDemo,
       ),
-      teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, projectSource: 1, autonomyMode: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
+      teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, projectSource: 1, autonomyMode: 1, routing: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
       permissions: { workspaceDelegation: 1 },
       goals: { enabled: goals.enabled() },
       missions: { enabled: missions.enabled() },

@@ -62,6 +62,7 @@ function withoutPrivateSettings<T extends object>(project: T): T {
   const copy = { ...project } as Record<string, unknown>;
   delete copy.features;
   delete copy.eval;
+  delete copy.routing;
   return copy as T;
 }
 /** Full prompt evidence saved outside the checkout's tracked and untracked project files. */

@@ -366,3 +366,22 @@ test("a retarget swaps the entry paragraph", () => {
   assert.equal(refreshReportingInstructions(plain, "codex").includes(entryInstructions("codex")), false);
   assert.equal(refreshReportingInstructions(plain, "codex").includes(entryInstructions("claude")), false);
 });
+
+test("a member context never carries the feature map, the eval block, or routing", () => {
+  const routing = { mode: "shadow", successValueUsd: 8 };
+  const base = largeRun();
+  const checks = [{ command: "npm", args: ["test"] }];
+  const project = { checks, features: { areas: [{ id: "host", paths: ["packages/host"] }] }, eval: { capture: true } };
+  const plain = { ...base, handoff: { sourceSessionId: "session", checkpointHead: base.baseCommit, deadlineAt: "2026-11-13T12:00:00.000Z", maxMembers: 1, project } } as unknown as TeamRun;
+  const withRouting = { ...base, handoff: { sourceSessionId: "session", checkpointHead: base.baseCommit, deadlineAt: "2026-11-13T12:00:00.000Z", maxMembers: 1, project: { ...project, routing } } } as unknown as TeamRun;
+  const configuredPlain = project as Parameters<typeof teamContext>[2];
+  const configuredWith = { ...project, routing } as unknown as Parameters<typeof teamContext>[2];
+  const roles = ["project-manager", "scout", "implementer", "integrator", "reviewer"] as const;
+  for (const role of roles) {
+    const snapshot = teamContext(withRouting, undefined, configuredWith, role);
+    assert.deepEqual(snapshot, teamContext(plain, undefined, configuredPlain, role), `${role} context changes with routing`);
+    assert.doesNotMatch(JSON.stringify(snapshot), /"routing":/);
+    const prompt = teamPrompt(withRouting, role, role === "implementer" ? withRouting.tasks[0] : undefined, undefined, "demo", undefined, configuredWith);
+    assert.equal(prompt, teamPrompt(plain, role, role === "implementer" ? plain.tasks[0] : undefined, undefined, "demo", undefined, configuredPlain), `${role} prompt changes with routing`);
+  }
+});

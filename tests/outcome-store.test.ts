@@ -5,6 +5,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  ROUTING_EVIDENCE_SQL,
+  ROUTING_ROWS_PER_SOURCE,
+  selectRoutingEvidence,
   type LegacyLineState,
   type MemberResultRow,
   type OutcomeRow,
@@ -42,6 +45,7 @@ import {
 } from "../packages/host/src/outcome-store.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { EvidenceError, type EvidenceDb, type EvidenceModule, type EvidenceTx } from "../packages/host/src/evidence/types.js";
+import { configurationModule } from "../packages/host/src/configuration-store.js";
 
 type Fixture = { root: string; path: string; key: Buffer; close: () => void };
 
@@ -598,7 +602,7 @@ test("a version 1 store migrates in place", () => {
       .map(table => table.name);
     for (const table of ["outcome_signals", "base_scans", "base_scan_state"]) assert.ok(tables.includes(table), table);
     const stored = store.read(db => db.get<{ version: number }>("SELECT version FROM schema_modules WHERE name='outcomes'"));
-    assert.equal(stored?.version, 3);
+    assert.equal(stored?.version, 4);
     const columns = store.read(db => db.all<{ name: string }>("SELECT name FROM pragma_table_info('outcomes')"))
       .map(column => column.name);
     const summaryColumns = store.read(db => db.all<{ name: string }>("SELECT name FROM pragma_table_info('run_summaries')"))
@@ -938,7 +942,7 @@ test("a version 2 store migrates to version 3 and indexes goals and missions", (
     }));
     // Rows of node:sqlite have no prototype; both sides are copied to plain objects before the comparison.
     const withoutRefs = (row: Record<string, unknown>) => {
-      const { goal_ref: _goal, mission_ref: _mission, ...rest } = row;
+      const { goal_ref: _goal, mission_ref: _mission, point: _point, feature_map_ref: _featureMap, owner_score: _score, ...rest } = row;
       return { ...rest };
     };
     assert.equal(later.outcomes.length, earlier.outcomes.length);
@@ -948,7 +952,7 @@ test("a version 2 store migrates to version 3 and indexes goals and missions", (
     const stored = store.read(db => db.get<{ version: number; read_version: number }>(
       "SELECT version, read_version FROM schema_modules WHERE name='outcomes'",
     ));
-    assert.deepEqual({ ...stored }, { version: 3, read_version: 2 });
+    assert.deepEqual({ ...stored }, { version: 4, read_version: 2 });
 
     const refs = store.read(db => ({
       goal: db.index("goal", GOAL),
@@ -1222,6 +1226,310 @@ test("the module reports legacy counts", () => {
     // One row of the three is a production row; the module's outcomes count leaves the legacy rows out.
     assert.equal(counts["outcomes.outcomes"], 1);
     assert.equal(counts["outcomes.legacyLines"], 3);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+const T_IN = "2026-11-13T11:00:00.000Z";
+const T_OLD = "2026-10-01T00:00:00.000Z";
+const ROUTE_SINCE = "2026-11-12T00:00:00.000Z";
+
+/** A row without a rating unless one is given, and with no replacement unless one is given. */
+function plainPayload(overrides: Partial<OutcomePayload> = {}): OutcomePayload {
+  const payload: OutcomePayload = { ...outcomeRow().payload, ...overrides };
+  if (!("ownerRating" in overrides)) delete payload.ownerRating;
+  return payload;
+}
+
+/** Version 3 as it shipped: the version 2 statements, the goal and mission refs, and the legacy lines. */
+function outcomesVersion3(): EvidenceModule {
+  const version2 = outcomesVersion2();
+  return {
+    name: "outcomes",
+    version: 3,
+    readVersion: 2,
+    migrate(tx, from) {
+      version2.migrate(tx, from);
+      tx.exec("ALTER TABLE outcomes ADD COLUMN goal_ref TEXT");
+      tx.exec("ALTER TABLE outcomes ADD COLUMN mission_ref TEXT");
+      tx.exec("ALTER TABLE run_summaries ADD COLUMN goal_ref TEXT");
+      tx.exec("ALTER TABLE run_summaries ADD COLUMN mission_ref TEXT");
+      tx.exec(
+        "CREATE TABLE IF NOT EXISTS legacy_lines (line_ref TEXT PRIMARY KEY, state TEXT NOT NULL, "
+        + "recorded_at TEXT NOT NULL, payload TEXT NOT NULL)",
+      );
+      tx.exec("CREATE INDEX IF NOT EXISTS outcomes_by_goal ON outcomes (goal_ref)");
+      tx.exec("CREATE INDEX IF NOT EXISTS outcomes_by_mission ON outcomes (mission_ref)");
+      tx.exec("CREATE INDEX IF NOT EXISTS run_summaries_by_goal ON run_summaries (goal_ref)");
+      tx.exec("CREATE INDEX IF NOT EXISTS run_summaries_by_mission ON run_summaries (mission_ref)");
+      tx.exec("CREATE INDEX IF NOT EXISTS legacy_lines_by_recorded ON legacy_lines (recorded_at)");
+    },
+  };
+}
+
+/** Inserts an outcome row the way a version 3 host did, with no routing columns. `sealed` is the stored payload text. */
+function insertOutcomeAtVersion3(
+  tx: EvidenceTx,
+  row: { outcomeId: string; runId: string; memberId: string; source: string; role: string; sealed: string },
+): void {
+  tx.run(
+    "INSERT INTO outcomes (outcome_id, source, project_ref, task_ref, run_id, revision, member_id, attempt_index, "
+    + "inherited, role, profile_id, provider, model, profile_epoch, area_ref, risk, feature_version, disposition, "
+    + "flags, integrated, accepted, acceptance, first_pass, payload) "
+    + "VALUES (?, ?, ?, ?, ?, 1, ?, 1, 0, ?, 'profile-a', 'opencode', 'model-one', 1, ?, 'low', 1, 'completed', '', 1, 1, 1, 1, ?)",
+    row.outcomeId,
+    row.source,
+    tx.index("project", "example"),
+    tx.index("task", "task-a"),
+    row.runId,
+    row.memberId,
+    row.role,
+    tx.index("area", "packages/host"),
+    row.sealed,
+  );
+}
+
+type Replaces = OutcomePayload["replaces"];
+
+/** A row of member `m1`-style ids: `run-…:memberId`, with an optional replacement and rating. */
+function routingRow(runId: string, memberId: string, replaces?: Replaces, score?: number): OutcomeRow {
+  const overrides: Partial<OutcomePayload> = {};
+  if (replaces !== undefined) overrides.replaces = replaces;
+  if (score !== undefined) overrides.ownerRating = { score, at: T_EARLY };
+  return outcomeRow({ outcomeId: `${runId}:${memberId}`, runId, memberId, payload: plainPayload(overrides) });
+}
+
+/** The routing columns of every outcome row, by outcome id. */
+function routingOf(store: EvidenceStore): Record<string, { point: string | null; owner_score: number | null }> {
+  const rows = store.read(db => db.all<{ outcome_id: string; point: string | null; owner_score: number | null }>(
+    "SELECT outcome_id, point, owner_score FROM outcomes ORDER BY outcome_id",
+  ));
+  return Object.fromEntries(rows.map(row => [row.outcome_id, { point: row.point, owner_score: row.owner_score }]));
+}
+
+test("a version 3 store migrates to version 4 and fills the routing columns", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    store.register(outcomesVersion3());
+    const seeded: { runId: string; memberId: string; source: string; role: string; payload: OutcomePayload | "x" }[] = [
+      { runId: "run-1", memberId: "m1", source: "production", role: "implementer", payload: plainPayload() },
+      { runId: "run-1", memberId: "m2", source: "production", role: "implementer", payload: plainPayload({ replaces: { memberId: "m1", cause: "stall" } }) },
+      { runId: "run-1", memberId: "m3", source: "production", role: "implementer", payload: plainPayload({ replaces: { memberId: "m2", cause: "escalation" } }) },
+      { runId: "run-1", memberId: "m4", source: "production", role: "implementer", payload: plainPayload({ replaces: { memberId: "m3", cause: "stall" } }) },
+      { runId: "run-2", memberId: "m1", source: "production", role: "implementer", payload: plainPayload({ replaces: { memberId: "ghost", cause: "stall" } }) },
+      { runId: "run-3", memberId: "m1", source: "production", role: "scout", payload: plainPayload() },
+      { runId: "run-4", memberId: "m1", source: "legacy", role: "implementer", payload: plainPayload({ legacy: { id: "old-1", result: "accepted", attempts: 1 } }) },
+      { runId: "run-5", memberId: "m1", source: "production", role: "implementer", payload: plainPayload({ ownerRating: { score: 4, at: T_EARLY } }) },
+      { runId: "run-6", memberId: "m1", source: "production", role: "implementer", payload: "x" },
+    ];
+    // Replacements are inserted before their predecessors, so a one-pass fill in insertion order would miss every chain.
+    store.write(tx => {
+      for (const row of [...seeded].reverse()) {
+        const outcomeId = `${row.runId}:${row.memberId}`;
+        insertOutcomeAtVersion3(tx, {
+          outcomeId,
+          runId: row.runId,
+          memberId: row.memberId,
+          source: row.source,
+          role: row.role,
+          sealed: row.payload === "x" ? "x" : tx.seal("outcomes", outcomeId, row.payload),
+        });
+      }
+    });
+    const earlier = store.read(db => db.all("SELECT * FROM outcomes ORDER BY outcome_id"));
+    store.close();
+
+    store = open(f);
+    store.register(outcomeModule({ now: () => NOW }));
+    assert.equal(store.status().modules.outcomes, "ready");
+    const later = store.read(db => db.all("SELECT * FROM outcomes ORDER BY outcome_id"));
+    // Version 4 only adds the three routing columns: every earlier column of every row keeps its value.
+    const withoutRouting = (row: Record<string, unknown>) => {
+      const { point: _point, feature_map_ref: _featureMap, owner_score: _score, ...rest } = row;
+      return { ...rest };
+    };
+    assert.equal(later.length, earlier.length);
+    earlier.forEach((row, index) => assert.deepEqual(withoutRouting(later[index]!), { ...row }));
+    const stored = store.read(db => db.get<{ version: number; read_version: number }>(
+      "SELECT version, read_version FROM schema_modules WHERE name='outcomes'",
+    ));
+    assert.deepEqual({ ...stored }, { version: 4, read_version: 2 });
+
+    const migrated = store.read(db => ({
+      featureMap: db.index("feature-map", "map-1"),
+      rows: db.all<{ outcome_id: string; point: string | null; feature_map_ref: string | null; owner_score: number | null }>(
+        "SELECT outcome_id, point, feature_map_ref, owner_score FROM outcomes ORDER BY outcome_id",
+      ),
+    }));
+    assert.deepEqual(Object.fromEntries(migrated.rows.map(row => [row.outcome_id, row.point])), {
+      "run-1:m1": "start",
+      "run-1:m2": "start",
+      "run-1:m3": "escalation",
+      "run-1:m4": "escalation",
+      "run-2:m1": null,
+      "run-3:m1": null,
+      "run-4:m1": null,
+      "run-5:m1": "start",
+      "run-6:m1": null,
+    });
+    assert.deepEqual(Object.fromEntries(migrated.rows.map(row => [row.outcome_id, row.owner_score])), {
+      "run-1:m1": null,
+      "run-1:m2": null,
+      "run-1:m3": null,
+      "run-1:m4": null,
+      "run-2:m1": null,
+      "run-3:m1": null,
+      "run-4:m1": null,
+      "run-5:m1": 4,
+      "run-6:m1": null,
+    });
+    for (const row of migrated.rows) {
+      assert.equal(row.feature_map_ref, row.outcome_id === "run-6:m1" ? "unreadable" : migrated.featureMap);
+    }
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("writes keep the routing columns", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    store.register(outcomeModule({ now: () => NOW }));
+    store.write(tx => {
+      writeOutcome(tx, routingRow("run-1", "m1"));
+      writeOutcome(tx, routingRow("run-1", "m2", { memberId: "m1", cause: "escalation" }));
+      writeOutcome(tx, routingRow("run-1", "m3", { memberId: "m2", cause: "stall" }));
+      // A caller's point is ignored: this row has no predecessor, so it is a start.
+      writeOutcome(tx, { ...routingRow("run-2", "m1"), point: "escalation" } as OutcomeRow);
+    });
+    assert.deepEqual(routingOf(store), {
+      "run-1:m1": { point: "start", owner_score: null },
+      "run-1:m2": { point: "escalation", owner_score: null },
+      "run-1:m3": { point: "escalation", owner_score: null },
+      "run-2:m1": { point: "start", owner_score: null },
+    });
+
+    store.write(tx => writeOutcome(tx, routingRow("run-1", "m1", undefined, 2)));
+    assert.deepEqual(routingOf(store)["run-1:m1"], { point: "start", owner_score: 2 });
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+/** One outcome row for the route reads. An escalation row replaces a member named `m0`. */
+type EvidenceSpec = { runId: string; source?: string; model?: string; effort?: string | null; escalation?: boolean; endedAt: string; configId?: string | null };
+function evidenceRow(spec: EvidenceSpec): OutcomeRow {
+  return outcomeRow({
+    outcomeId: `${spec.runId}:m1`,
+    runId: spec.runId,
+    memberId: "m1",
+    source: spec.source ?? "production",
+    model: spec.model ?? "model-one",
+    effort: spec.effort === undefined ? "high" : spec.effort,
+    configId: spec.configId ?? null,
+    endedAt: spec.endedAt,
+    payload: plainPayload(spec.escalation ? { replaces: { memberId: "m0", cause: "escalation" } } : {}),
+  });
+}
+
+const IDENTITY_A = { provider: "opencode", model: "model-one", effort: "high" };
+const IDENTITY_C = { provider: "opencode", model: "model-one", effort: null };
+const IDENTITY_BIG = { provider: "opencode", model: "model-big", effort: "high" };
+
+test("routing evidence reads one identity and point, newest first, within its limit", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    store.register(configurationModule());
+    store.register(outcomeModule({ now: () => NOW }));
+    store.write(tx => {
+      tx.run(
+        "INSERT INTO configurations (config_id, provider, model, effort, prompt_version, guidance, knowledge, routing, shape, first_seen_at) "
+        + "VALUES ('cfg-1', 'opencode', 'model-one', 'high', 'pv-1', 'g', 'k', 'r', 's', ?)",
+        NOW,
+      );
+      const specs: EvidenceSpec[] = [
+        { runId: "run-a1", endedAt: T_IN, configId: "cfg-1" },
+        { runId: "run-a2", source: "duel", endedAt: T_IN },
+        { runId: "run-a3", endedAt: T_OLD },
+        { runId: "run-a4", source: "replay", endedAt: T_IN },
+        { runId: "run-a5", source: "legacy", endedAt: T_IN },
+        { runId: "run-a6", escalation: true, endedAt: T_IN, configId: "cfg-missing" },
+        { runId: "run-b1", model: "model-two", endedAt: T_IN },
+        { runId: "run-c1", effort: null, endedAt: T_IN, configId: "cfg-missing" },
+      ];
+      for (const spec of specs) writeOutcome(tx, evidenceRow(spec));
+      for (let index = 0; index <= ROUTING_ROWS_PER_SOURCE; index++) {
+        writeOutcome(tx, outcomeRow({
+          outcomeId: `run-big-${index}:m1`,
+          runId: `run-big-${index}`,
+          memberId: "m1",
+          model: "model-big",
+          endedAt: new Date(Date.parse(T_IN) + index * 1000).toISOString(),
+          payload: plainPayload(),
+        }));
+      }
+    });
+
+    const reads = store.read(db => ({
+      start: selectRoutingEvidence(db, IDENTITY_A, "start", ROUTE_SINCE),
+      escalation: selectRoutingEvidence(db, IDENTITY_A, "escalation", ROUTE_SINCE),
+      nullEffort: selectRoutingEvidence(db, IDENTITY_C, "start", ROUTE_SINCE),
+      otherModel: selectRoutingEvidence(db, { ...IDENTITY_A, model: "model-two" }, "start", ROUTE_SINCE),
+      big: selectRoutingEvidence(db, IDENTITY_BIG, "start", ROUTE_SINCE),
+    }));
+    const summary = (rows: { outcomeId: string; source: string; promptVersion: string | null }[]) =>
+      rows.map(row => ({ id: row.outcomeId, source: row.source, promptVersion: row.promptVersion }));
+    // Production and duel rows only, in the identity's point, ended at or after `since`, in outcome id order.
+    assert.deepEqual(summary(reads.start), [
+      { id: "run-a1:m1", source: "production", promptVersion: "pv-1" },
+      { id: "run-a2:m1", source: "duel", promptVersion: null },
+    ]);
+    assert.deepEqual(summary(reads.escalation), [{ id: "run-a6:m1", source: "production", promptVersion: null }]);
+    // An identity with a NULL effort matches only rows with a NULL effort.
+    assert.deepEqual(summary(reads.nullEffort), [{ id: "run-c1:m1", source: "production", promptVersion: null }]);
+    assert.deepEqual(summary(reads.otherModel), [{ id: "run-b1:m1", source: "production", promptVersion: null }]);
+    // Flags leave the read as tokens, never as the stored text: a row's flags are an array.
+    for (const row of [...reads.start, ...reads.escalation]) assert.ok(Array.isArray(row.flags), row.outcomeId);
+    // The newest ROUTING_ROWS_PER_SOURCE of 1,001 production rows: the oldest one is left out.
+    const bigIds = reads.big.map(row => row.outcomeId);
+    assert.equal(bigIds.length, ROUTING_ROWS_PER_SOURCE);
+    assert.ok(bigIds.includes("run-big-1000:m1"));
+    assert.ok(!bigIds.includes("run-big-0:m1"));
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("routing evidence reads seek the route index", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    store.register(configurationModule());
+    store.register(outcomeModule({ now: () => NOW }));
+    const plan = (params: (string | number | null)[]) => store!.read(db => db.all<{ detail: string }>(
+      `EXPLAIN QUERY PLAN ${ROUTING_EVIDENCE_SQL}`,
+      ...params,
+    ).map(row => row.detail));
+    const withEffort = plan(["production", "start", "opencode", "model-one", "high", ROUTE_SINCE, ROUTING_ROWS_PER_SOURCE]);
+    const withoutEffort = plan(["production", "start", "opencode", "model-one", null, ROUTE_SINCE, ROUTING_ROWS_PER_SOURCE]);
+    for (const details of [withEffort, withoutEffort]) {
+      assert.ok(details.some(line => line.includes("SEARCH o USING INDEX outcomes_by_route")), details.join("\n"));
+      assert.ok(details.some(line => /SEARCH c USING .*INDEX/.test(line)), details.join("\n"));
+      assert.ok(!details.some(line => line.startsWith("SCAN o")), details.join("\n"));
+      assert.ok(!details.some(line => line.includes("USE TEMP B-TREE")), details.join("\n"));
+    }
   } finally {
     store?.close();
     f.close();

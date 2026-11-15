@@ -66,7 +66,7 @@ test("labels are bounded and plain", () => {
 
   const c1Path = checkLabel({ kind: "artifact", path: "docs/a\u0085b\u009bc.md" }, []);
   assert.equal(c1Path, "artifact:docs/a b c.md", "C1 controls become spaces");
-  const separators = checkLabel({ kind: "citations", path: "docs/a b c.md", entries: "/entries", perEntry: 1 }, []);
+  const separators = checkLabel({ kind: "citations", path: "docs/a\u2028b\u2029c.md", entries: "/entries", perEntry: 1 }, []);
   assert.equal(separators, "citations:docs/a b c.md", "line and paragraph separators become spaces");
 
   const exact = { command: "x".repeat(112), args: [] } as TeamCommand;

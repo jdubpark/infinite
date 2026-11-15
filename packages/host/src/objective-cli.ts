@@ -21,7 +21,7 @@ const UUID = z.uuid();
 // The body of a file is checked with this ID and version, which only the request body later fills in.
 const PLACEHOLDER_REQUEST_ID = "00000000-0000-4000-8000-000000000000";
 // Every printed text passes through this one function. The record bounds each text; nothing is cut here.
-const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ");
 
 function faultOf(error: unknown): { status?: unknown; code?: unknown } {
   return typeof error === "object" && error !== null ? error as { status?: unknown; code?: unknown } : {};

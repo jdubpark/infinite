@@ -102,6 +102,9 @@ test("record lines show the record and its log", () => {
   const escaped = objectiveRecordLines(view({ direction: "\u001b[31mPrefer seed stage" }), G);
   assert.ok(escaped.includes(`  s2 steering at ${AT}:  [31mPrefer seed stage`));
   assert.ok(escaped.every(line => !/[\x00-\x1f\x7f-\x9f]/.test(line)));
+  const separated = objectiveRecordLines(view({ direction: "Prefer\u2028seed\u2029stage" }), G);
+  assert.ok(separated.includes(`  s2 steering at ${AT}: Prefer seed stage`));
+  assert.ok(separated.every(line => !/[\u2028\u2029]/.test(line)));
 });
 
 test("the command reads a version and maps each error", async () => {

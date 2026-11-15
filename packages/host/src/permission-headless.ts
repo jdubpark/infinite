@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { matchDestructive } from "@infinite/attention";
 import { headlessLaunch } from "./launch.js";
 import { REJECT_CODES, requesterNotice, type InterruptClass, type RejectCode } from "./permission-policy.js";
+import { teamPermissionAssignment } from "./team-permission-adapter.js";
 import type {
   HeadlessChannelStatus, HeadlessSessionStatus, HeadlessShadowedRule, PermissionAgentServices, PermissionHeadlessChannel,
   PermissionPipeline, PermissionRequest,
@@ -33,6 +34,14 @@ export function channelToken(key: Buffer, sessionId: string): string {
   return createHmac("sha256", key).update(`infinite-permission-channel:${sessionId}`).digest("hex");
 }
 
+/**
+ * Binds one decision to the session it was issued to. The channel returns it with the decision id, and a delivery
+ * event must carry it. It holds no state, so a delivery after an API restart is still recorded for that session only.
+ */
+export function deliveryKey(key: Buffer, sessionId: string, decisionId: string): string {
+  return createHmac("sha256", key).update(`infinite-permission-delivery:${sessionId}:${decisionId}`).digest("hex");
+}
+
 /** One tool call as the provider's hook reported it to the session's own worker. */
 export interface ChannelCall {
   toolName: string;
@@ -45,7 +54,10 @@ export interface ChannelCall {
 export type ChannelRequest =
   | { v: 1; op: "class"; sessionId: string; token: string; call: ChannelCall }
   | { v: 1; op: "decide"; sessionId: string; token: string; call: ChannelCall; requestId: string }
-  | { v: 1; op: "delivery"; sessionId: string; token: string; decisionId: string; kind: PermissionDelivery["kind"]; detail?: string };
+  | { v: 1; op: "delivery"; sessionId: string; token: string; decisionId: string; deliveryKey: string; kind: PermissionDelivery["kind"]; detail?: string };
+
+/** A decision the channel returned, with the key that lets this session's worker record its delivery. */
+export type IssuedDecision = { decisionId: string; deliveryKey: string };
 
 export type ChannelReply =
   /** The pipeline does not serve this session now. The call is handled as before. */
@@ -53,10 +65,10 @@ export type ChannelReply =
   /** No class rule matched. The provider's own rules apply. */
   | { result: "none" }
   /** A class rule matched: the call needs the owner's own answer. */
-  | { result: "owner"; interruptClass: InterruptClass; rule: string; decisionId?: string }
-  | { result: "allow"; decisionId: string }
+  | ({ result: "owner"; interruptClass: InterruptClass; rule: string } & Partial<IssuedDecision>)
+  | ({ result: "allow" } & IssuedDecision)
   /** `notice` is the host's fixed text for the code. `interruptClass` is set when the owner must be told. */
-  | { result: "deny"; code: RejectCode; notice: string; decisionId?: string; interruptClass?: InterruptClass | "undeliverable" }
+  | ({ result: "deny"; code: RejectCode; notice: string; interruptClass?: InterruptClass | "undeliverable" } & Partial<IssuedDecision>)
   | { result: "recorded" };
 
 /** One request over the channel socket. Rejects on a timeout or a refused connection, so the caller can deny. */
@@ -95,12 +107,13 @@ export function headlessAction(tool: string, input: Record<string, unknown>): st
 }
 
 /**
- * The seat a headless session works in. A team member keeps its run and task (or role) across replacements and
- * revisions; a session outside a run is its own seat. The other requester adapters must produce the same value.
+ * The seat a headless session works in. A team member's seat is the one the interactive team adapter gives it, so
+ * the journal's rejects and locks are shared by both paths. A session outside a run is its own seat, as in the
+ * session adapter.
  */
 export function headlessAssignment(session: Pick<Session, "id" | "team">): string {
   const team = session.team;
-  return team ? `${team.runId}:${team.taskId !== undefined ? `task:${team.taskId}` : `role:${team.role}`}` : session.id;
+  return team ? teamPermissionAssignment({ id: team.runId }, { role: team.role, ...(team.taskId ? { taskId: team.taskId } : {}) }) : session.id;
 }
 
 /** Builds the request from the host's records of the session. Only the tool call itself comes from the hook. */
@@ -163,16 +176,31 @@ type Sessions = {
  */
 export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
   private server?: Server;
-  /** Decisions the pipeline returned to each session, so one session cannot record delivery for another's. */
-  private issued = new Map<string, string>();
   constructor(private readonly options: {
     key: Buffer;
     runDir: string;
     sessions: Sessions;
     services: PermissionAgentServices;
+    /**
+     * Whether the run of a team member's session is live now: not stopped, paused, halted, or with its permissions
+     * revoked. A session with `team` is served only when this is given and returns true. A throw counts as false.
+     */
+    teamLive?: (session: Session) => boolean;
   }) {}
 
   private pipeline(): PermissionPipeline | undefined { return this.options.services.pipeline; }
+
+  /** A session outside a run is not limited here. A team member's session is served only while its run is live. */
+  private teamServed(session: Session): boolean {
+    if (!session.team) return true;
+    const live = this.options.teamLive;
+    if (!live) return false;
+    try { return live(session) === true; } catch { return false; }
+  }
+
+  private issued(decisionId: string, sessionId: string): IssuedDecision {
+    return { decisionId, deliveryKey: deliveryKey(this.options.key, sessionId, decisionId) };
+  }
 
   /**
    * Decides at launch whether a session gets the channel. Undefined for a launch that is not headless. A headless
@@ -238,7 +266,10 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
     if (!timingSafeEqual(Buffer.from(request.token), expected)) throw new Error("unbound");
     const session = this.options.sessions.meta(request.sessionId).session;
     if (request.op === "delivery") {
-      if (this.issued.get(request.decisionId) !== session.id || !["intent", "receipt", "refusal", "uncertain", "stale"].includes(request.kind))
+      if (typeof request.decisionId !== "string" || request.decisionId.length < 1 || request.decisionId.length > 200 ||
+          typeof request.deliveryKey !== "string" || !/^[a-f0-9]{64}$/.test(request.deliveryKey) ||
+          !timingSafeEqual(Buffer.from(request.deliveryKey), Buffer.from(deliveryKey(this.options.key, session.id, request.decisionId))) ||
+          !["intent", "receipt", "refusal", "uncertain", "stale"].includes(request.kind))
         throw new Error("unbound");
       this.pipeline()?.recordDelivery(request.decisionId, request.kind, request.detail === undefined ? undefined : bounded(request.detail, 500));
       return { result: "recorded" };
@@ -247,7 +278,7 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
     if (!call || (request.op !== "class" && request.op !== "decide")) throw new Error("invalid");
     const pipeline = this.pipeline();
     if (!session.headless?.channel || !pipeline) return { result: "not-served" };
-    if (!pipeline.serves(session.projectId).served) return { result: "not-served" };
+    if (!pipeline.serves(session.projectId).served || !this.teamServed(session)) return { result: "not-served" };
     if (request.op === "class") {
       const built = headlessRequest(session, call, `headless:${session.id}:${call.toolUseId ?? createHash("sha256").update(JSON.stringify(call)).digest("hex")}`);
       const match = pipeline.classOf(built);
@@ -256,10 +287,8 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
       let outcome;
       try { outcome = await pipeline.decide(built); } catch { outcome = undefined; }
       if (outcome?.kind === "not-served") return { result: "not-served" };
-      if (outcome?.kind === "owner") {
-        this.issue(outcome.decisionId, session.id);
-        return { result: "owner", interruptClass: outcome.interruptClass, rule: match.rule, decisionId: outcome.decisionId };
-      }
+      if (outcome?.kind === "owner")
+        return { result: "owner", interruptClass: outcome.interruptClass, rule: match.rule, ...this.issued(outcome.decisionId, session.id) };
       // A class rule matched, so the owner answers whatever else the pipeline returned.
       return { result: "owner", interruptClass: match.interruptClass, rule: match.rule };
     }
@@ -273,22 +302,24 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
     if (outcome.kind === "held") return { result: "deny", code: "unavailable", notice: requesterNotice("unavailable") };
     if (outcome.kind === "undeliverable")
       return { result: "deny", code: "needs-owner", notice: requesterNotice("needs-owner"), interruptClass: "undeliverable" };
-    this.issue(outcome.decisionId, session.id);
+    const issued = this.issued(outcome.decisionId, session.id);
     if (outcome.kind === "owner") {
       // A PermissionRequest hook cannot defer a call: it is denied, recorded, and the owner is told with the class.
       pipeline.recordDelivery(outcome.decisionId, "refusal", "Headless: a call that the rules left open cannot wait for the owner; it was denied with needs-owner.");
-      return { result: "deny", code: "needs-owner", notice: requesterNotice("needs-owner"), decisionId: outcome.decisionId, interruptClass: outcome.interruptClass };
+      return { result: "deny", code: "needs-owner", notice: requesterNotice("needs-owner"), ...issued, interruptClass: outcome.interruptClass };
     }
     if (outcome.kind === "reject") {
       // The notice is rebuilt from the code, so no other text can reach the agent.
       const code = (REJECT_CODES as readonly string[]).includes(outcome.code) ? outcome.code : "unavailable";
       pipeline.recordDelivery(outcome.decisionId, "intent", "Headless deny returned to the session's hook.");
-      return { result: "deny", code, notice: requesterNotice(code), decisionId: outcome.decisionId };
+      return { result: "deny", code, notice: requesterNotice(code), ...issued };
     }
-    // An allow: the live checks before it is returned.
+    // An allow: the live checks before it is returned. A team member's run is read again here.
     const live = (() => {
-      try { return realpathSync(this.options.sessions.meta(session.id).session.cwd) === built.requester.sessionRoot && pipeline.applicable(outcome.decisionId); }
-      catch { return false; }
+      try {
+        return realpathSync(this.options.sessions.meta(session.id).session.cwd) === built.requester.sessionRoot &&
+          this.teamServed(session) && pipeline.applicable(outcome.decisionId);
+      } catch { return false; }
     })();
     if (!live) {
       pipeline.recordDelivery(outcome.decisionId, "stale", "Headless: the decision no longer applies; the call was left to the provider, which denies it.");
@@ -296,16 +327,10 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
     }
     if (built.destructive && !outcome.strongTier) {
       pipeline.recordDelivery(outcome.decisionId, "refusal", "Headless: a destructive call needs a strong verdict; it was denied.");
-      return { result: "deny", code: "uncertain", notice: requesterNotice("uncertain"), decisionId: outcome.decisionId };
+      return { result: "deny", code: "uncertain", notice: requesterNotice("uncertain"), ...issued };
     }
     pipeline.recordDelivery(outcome.decisionId, "intent", "Headless allow returned to the session's hook.");
-    return { result: "allow", decisionId: outcome.decisionId };
-  }
-
-  private issue(decisionId: string, sessionId: string) {
-    this.issued.set(decisionId, sessionId);
-    // Bounded: a delivery event for a decision older than this is not recorded.
-    if (this.issued.size > 4096) this.issued.delete(this.issued.keys().next().value!);
+    return { result: "allow", ...issued };
   }
 
   /** Headless sessions that are live now, served or not and why, and the allow rules that a class rule outranks. */

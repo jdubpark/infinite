@@ -9,7 +9,7 @@
  */
 import { createHash } from "node:crypto";
 import type { Prompt } from "@infinite/attention";
-import { channelCall, CLASS_CHECK_MS, DECIDE_MS, type ChannelCall, type ChannelReply, type ChannelRequest } from "./permission-headless.js";
+import { channelCall, CLASS_CHECK_MS, DECIDE_MS, type ChannelCall, type ChannelReply, type ChannelRequest, type IssuedDecision } from "./permission-headless.js";
 import { requesterNotice, type RejectCode } from "./permission-policy.js";
 import type { ChannelAnswer } from "./permission-hook.js";
 import type { PermissionDelivery } from "./evidence/permission-journal.js";
@@ -57,7 +57,8 @@ interface Deferred {
   inputHash: string;
   interruptClass: string;
   rule: string;
-  decisionId?: string;
+  /** The decision and its delivery key, when the host recorded one. */
+  issued?: IssuedDecision;
   since: number;
   expiresAt: number;
   /** `deferring`: the provider is ending its run. `waiting`: the owner prompt is open. `resuming`: the owner answered. */
@@ -109,9 +110,9 @@ export class HeadlessChannelWorker {
   }
 
   /** Best effort: a delivery record that cannot be written leaves the decision recorded, and the answer stands. */
-  private delivery(decisionId: string | undefined, kind: PermissionDelivery["kind"], detail: string) {
-    if (!decisionId) return;
-    void this.ask({ op: "delivery", decisionId, kind, detail }, CLASS_CHECK_MS).catch(() => {});
+  private delivery(issued: Partial<IssuedDecision> | undefined, kind: PermissionDelivery["kind"], detail: string) {
+    if (!issued?.decisionId || !issued.deliveryKey) return;
+    void this.ask({ op: "delivery", decisionId: issued.decisionId, deliveryKey: issued.deliveryKey, kind, detail }, CLASS_CHECK_MS).catch(() => {});
   }
 
   private deny(code: RejectCode): ChannelAnswer { return { decision: "deny", reason: requesterNotice(code) }; }
@@ -151,7 +152,7 @@ export class HeadlessChannelWorker {
       const answer: ChannelAnswer = changed ? this.deny("needs-owner")
         : deferred.answer.decision === "allow" ? { decision: "allow" } : { decision: "deny", reason: deferred.answer.reason ?? OWNER_DENIED };
       this.host.record({ event: "delivered", callId: deferred.callId, decision: changed ? "changed" : deferred.answer.decision });
-      this.delivery(deferred.decisionId, changed ? "stale" : "receipt", changed
+      this.delivery(deferred.issued, changed ? "stale" : "receipt", changed
         ? "Headless: the resumed call differs from the call the owner answered; it was denied."
         : `Headless: the owner's ${deferred.answer.decision === "allow" ? "allow" : "refusal"} was returned to the resumed call.`);
       this.host.publish(this.view());
@@ -171,20 +172,21 @@ export class HeadlessChannelWorker {
     // deferred call does not end the run, so it is denied and the owner is told.
     if (call.agentId || !call.toolUseId || !this.nativeSessionId || this.deferred) {
       this.host.record({ event: "owner-denied", tool: call.toolName, interruptClass: reply.interruptClass, reason: call.agentId ? "subagent" : "no-call-id" });
-      this.delivery(reply.decisionId, "refusal", "Headless: this call cannot wait for the owner; it was denied with needs-owner.");
+      this.delivery(reply, "refusal", "Headless: this call cannot wait for the owner; it was denied with needs-owner.");
       this.tell(reply.interruptClass, reply.decisionId);
       return this.deny("needs-owner");
     }
     const since = this.now();
     this.deferred = {
       callId: call.toolUseId, tool: call.toolName, inputHash, interruptClass: reply.interruptClass, rule: reply.rule,
-      ...(reply.decisionId ? { decisionId: reply.decisionId } : {}), since, expiresAt: since + DEFERRAL_RETENTION_MS, phase: "deferring",
+      ...(reply.decisionId && reply.deliveryKey ? { issued: { decisionId: reply.decisionId, deliveryKey: reply.deliveryKey } } : {}),
+      since, expiresAt: since + DEFERRAL_RETENTION_MS, phase: "deferring",
     };
     this.host.record({
       event: "deferred", callId: call.toolUseId, tool: call.toolName, interruptClass: reply.interruptClass, rule: reply.rule,
       ...(reply.decisionId ? { decisionId: reply.decisionId } : {}), expiresAt: new Date(since + DEFERRAL_RETENTION_MS).toISOString(),
     });
-    this.delivery(reply.decisionId, "intent", "Headless: the call was deferred; it waits for the owner's answer.");
+    this.delivery(reply, "intent", "Headless: the call was deferred; it waits for the owner's answer.");
     return { decision: "defer", reason: DEFERRED_REASON };
   }
 
@@ -268,7 +270,7 @@ export class HeadlessChannelWorker {
     const receipt = { requestId: request.requestId, state: "delivered" as const, seq, result: "closed" as const };
     this.answers.set(request.requestId, { digest, receipt });
     this.host.closePrompt(deferred.promptId!, [OWNER_ALLOW, OWNER_DENY, OWNER_DENY_TEXT][option]);
-    this.delivery(deferred.decisionId, "intent", `Headless: the owner ${decision === "allow" ? "allowed the call once" : "refused the call"}; the session resumes.`);
+    this.delivery(deferred.issued, "intent", `Headless: the owner ${decision === "allow" ? "allowed the call once" : "refused the call"}; the session resumes.`);
     this.host.publish(this.view());
     try { this.host.resume(this.nativeSessionId!); }
     catch {
@@ -292,7 +294,7 @@ export class HeadlessChannelWorker {
     this.deferred = undefined;
     if (deferred.promptId !== undefined && deferred.phase === "waiting") this.host.closePrompt(deferred.promptId, OWNER_DENY);
     this.host.record({ event: "retired", callId: deferred.callId, reason });
-    this.delivery(deferred.decisionId, "refusal", `Headless: the deferred call was retired unanswered (${reason}).`);
+    this.delivery(deferred.issued, "refusal", `Headless: the deferred call was retired unanswered (${reason}).`);
     this.host.publish(this.view());
   }
 

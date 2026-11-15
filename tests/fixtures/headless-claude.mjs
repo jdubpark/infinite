@@ -1,7 +1,8 @@
 // A scripted stand-in for `claude --print`, for tests/permission-headless.test.ts. It reads the hooks from
 // `--settings`, runs each hook command with the hook payload on stdin, and combines their decisions the way the
 // provider does for this test: deny over defer over allow. A deferred call ends the run with the call recorded under
-// `.fake-claude/` in the working directory; `--resume ID` asks PreToolUse again for that call, once.
+// `.fake-claude/` in the working directory; `--resume ID` asks PreToolUse again for that call, once, after any
+// `hold-resume` file in the working directory is gone.
 // Tool calls "run" by appending a line to `ran.log`; a denied call's reason goes to `denied.log`.
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -65,6 +66,8 @@ function run(tool, input) { appendFileSync(join(process.cwd(), "ran.log"), `${in
 function deny(tool, input, reason) { appendFileSync(join(process.cwd(), "denied.log"), `${input.command ?? tool}: ${reason}\n`); return "denied"; }
 
 if (resume) {
+  // A test can hold the resumed run before it asks for the call again, to restart the host's API in between.
+  while (existsSync(join(process.cwd(), "hold-resume"))) await new Promise((done) => setTimeout(done, 50));
   if (!existsSync(marker)) {
     console.error("Error: No deferred tool marker found in the resumed session.");
     process.exit(1);

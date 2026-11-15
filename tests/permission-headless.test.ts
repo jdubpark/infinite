@@ -9,9 +9,8 @@ import { join, resolve } from "node:path";
 import { Manager } from "../packages/host/src/manager.js";
 import { workerCall } from "../packages/host/src/ipc.js";
 import {
-  HeadlessPermissionChannel, channelToken, deferredCallOpen, type ChannelReply,
-} from "../packages/host/src/permission-headless.js";
-import {
+  HeadlessPermissionChannel, channelToken, deferredCallOpen, deliveryKey, type ChannelReply,
+} from "../packages/host/src/permission-headless.js";import {
   DEFERRAL_RETENTION_MS, HeadlessChannelWorker, OWNER_DENIED, PENDING_NOTICE, type ChannelWorkerHost,
 } from "../packages/host/src/permission-headless-worker.js";
 import { hookOutput } from "../packages/host/src/permission-hook.js";
@@ -127,6 +126,41 @@ test("a class call waits for the owner, and the owner's allow runs that one call
     // The conversation has no call left open, so an ordinary resume is not refused for it.
     assert.equal(deferredCallOpen((after, limit) => r.manager.events(id, after, limit)), false);
   } finally { await r.stop(); }
+});
+
+test("an API restart between the owner's answer and the resume runs the call once, and its receipt reaches the restarted API", { timeout: 90_000 }, async () => {
+  const r = await rig();
+  let restarted: HeadlessPermissionChannel | undefined;
+  try {
+    const id = randomUUID();
+    await r.manager.create({ requestId: id, provider: "claude", projectId: "rehearsal", title: "Headless", prompt: "allowlisted" });
+    const waiting = await waitFor(() => live(r, id), s => s.attention.state === "needs-you" && Boolean(s.permissionChannel?.waiting), 40_000);
+    // The resumed provider holds before it asks for the call again, so the API restarts between the answer and the resume.
+    writeFileSync(join(r.workspace, "hold-resume"), "");
+    const promptId = waiting.attention.prompt!.id;
+    const requestId = randomUUID();
+    const receipt = await workerCall(r.config.runDir, id, { op: "answer", requestId, promptId, option: 0 });
+    await waitFor(async () => r.deliveries, list => list.some(d => /owner allowed/.test(d.detail ?? "")), 10_000);
+    // The restart: a new Manager and channel over the same state and socket, with no memory of the decision. The worker stays.
+    r.channel.close();
+    const manager = new Manager(r.config, r.key);
+    const after = fakePipeline();
+    restarted = new HeadlessPermissionChannel({ key: r.key, runDir: r.config.runDir, sessions: manager, services: { pipeline: after.pipeline } });
+    manager.useHeadlessChannel(restarted);
+    await restarted.listen();
+    const now = { ...r, manager };
+    // The answer was consumed before the restart: a retry gets its receipt, and another answer finds no prompt.
+    assert.deepEqual(await workerCall(r.config.runDir, id, { op: "answer", requestId, promptId, option: 0 }), receipt);
+    await assert.rejects(workerCall(r.config.runDir, id, { op: "answer", requestId: randomUUID(), promptId, option: 0 }), /prompt-changed/);
+    rmSync(join(r.workspace, "hold-resume"));
+    await waitFor(() => live(now, id), s => s.status === "exited", 30_000);
+    assert.equal(r.log("ran.log"), "deploy production\n");
+    assert.deepEqual(now.channelEvents(id).map(event => event.event).filter(event => event !== "pending"), ["deferred", "waiting", "answer", "resumed", "delivered"]);
+    // The receipt is linked to the decision made before the restart, and only this session could record it.
+    const decisionId = r.deliveries.find(d => /deferred/.test(d.detail ?? ""))!.decisionId;
+    await waitFor(async () => after.deliveries, list => list.length > 0, 10_000);
+    assert.deepEqual(after.deliveries.map(d => [d.decisionId, d.kind]), [[decisionId, "receipt"]]);
+  } finally { restarted?.close(); await r.stop(); }
 });
 
 test("an owner's refusal reaches the call with the host's notice and the owner's direction, and the call never runs", { timeout: 90_000 }, async () => {
@@ -296,13 +330,15 @@ test("a PermissionRequest carries the call id of its PreToolUse and only host te
 
 /* ------------------------------------------------------------------ the host half */
 
-function hostRig(pipeline: PermissionPipeline, headless: Session["headless"] = { channel: true }) {
+function hostRig(pipeline: PermissionPipeline, headless: Session["headless"] = { channel: true },
+  extra: { team?: Session["team"]; teamLive?: (session: Session) => boolean } = {}) {
   const root = realpathSync(mkdtempSync("/tmp/inf-headless-host-"));
   const key = randomBytes(32);
-  const session = { id: randomUUID(), projectId: "rehearsal", provider: "claude", cwd: root, title: "T", initialPrompt: "do it", headless } as Session;
+  const session = { id: randomUUID(), projectId: "rehearsal", provider: "claude", cwd: root, title: "T", initialPrompt: "do it", headless, ...(extra.team ? { team: extra.team } : {}) } as Session;
   const channel = new HeadlessPermissionChannel({
     key, runDir: root, services: { pipeline },
     sessions: { meta: () => ({ session }), list: async () => [{ id: session.id, status: "running", headless }] },
+    ...(extra.teamLive ? { teamLive: extra.teamLive } : {}),
   });
   const ask = (request: Record<string, unknown>) => channel.handle({ v: 1, sessionId: session.id, token: channelToken(key, session.id), ...request });
   return { channel, session, key, ask, done: () => rmSync(root, { recursive: true, force: true }) };
@@ -310,11 +346,57 @@ function hostRig(pipeline: PermissionPipeline, headless: Session["headless"] = {
 const bash = (command: string, toolUseId = "toolu_1") => ({ toolName: "Bash", toolInput: { command }, toolUseId });
 
 test("the channel answers only the session its key was made for", async () => {
-  const h = hostRig(fakePipeline().pipeline);
+  const fake = fakePipeline();
+  const h = hostRig(fake.pipeline);
   try {
     await assert.rejects(h.channel.handle({ v: 1, sessionId: h.session.id, token: channelToken(randomBytes(32), h.session.id), op: "class", call: bash("ls") }), /unbound/);
-    await assert.rejects(h.ask({ op: "delivery", decisionId: randomUUID(), kind: "receipt" }), /unbound/);
+    // A delivery is recorded only with the key of a decision issued to this session.
+    const decisionId = randomUUID();
+    await assert.rejects(h.ask({ op: "delivery", decisionId, kind: "receipt" }), /unbound/);
+    await assert.rejects(h.ask({ op: "delivery", decisionId, deliveryKey: deliveryKey(h.key, randomUUID(), decisionId), kind: "receipt" }), /unbound/);
+    assert.deepEqual(await h.ask({ op: "delivery", decisionId, deliveryKey: deliveryKey(h.key, h.session.id, decisionId), kind: "receipt" }), { result: "recorded" });
+    assert.deepEqual(fake.deliveries.map(d => d.decisionId), [decisionId]);
   } finally { h.done(); }
+});
+
+const member = { runId: "run-1", memberId: "member-1", revision: 1, role: "implementer", taskId: "task-a" } as NonNullable<Session["team"]>;
+
+test("a team member's call is decided only while its run is live, checked again before an allow", async () => {
+  // Without the run check, and when it is false or throws, nothing is decided.
+  for (const teamLive of [undefined, () => false, () => { throw new Error("no run"); }]) {
+    const fake = fakePipeline();
+    const h = hostRig(fake.pipeline, { channel: true }, { team: member, ...(teamLive ? { teamLive } : {}) });
+    try {
+      assert.deepEqual(await h.ask({ op: "class", call: bash("deploy production") }), { result: "not-served" });
+      assert.deepEqual(await h.ask({ op: "decide", call: bash("make safe-build"), requestId: `headless:${h.session.id}:toolu_1` }), { result: "not-served" });
+      assert.equal(fake.decided.length, 0);
+    } finally { h.done(); }
+  }
+  // A live run is served.
+  const served = hostRig(fakePipeline().pipeline, { channel: true }, { team: member, teamLive: () => true });
+  try {
+    assert.equal((await served.ask({ op: "class", call: bash("deploy production") })).result, "owner");
+    assert.equal((await served.ask({ op: "decide", call: bash("make safe-build"), requestId: `headless:${served.session.id}:toolu_1` })).result, "allow");
+  } finally { served.done(); }
+  // The run stops being live while the decision runs: the allow is withheld and recorded as stale.
+  let checks = 0;
+  const stopped = fakePipeline();
+  const h = hostRig(stopped.pipeline, { channel: true }, { team: member, teamLive: () => ++checks === 1 });
+  try {
+    assert.deepEqual(await h.ask({ op: "decide", call: bash("make safe-build"), requestId: `headless:${h.session.id}:toolu_1` }), { result: "not-served" });
+    assert.deepEqual([checks, stopped.deliveries.map(d => d.kind)], [2, ["stale"]]);
+  } finally { h.done(); }
+});
+
+test("a team member's headless seat is the interactive team adapter's, so their rejects and locks are shared", async () => {
+  const fake = fakePipeline();
+  for (const team of [member, { ...member, taskId: undefined }]) {
+    const h = hostRig(fake.pipeline, { channel: true }, { team, teamLive: () => true });
+    try { await h.ask({ op: "decide", call: bash("make safe-build"), requestId: `headless:${h.session.id}:toolu_1` }); }
+    finally { h.done(); }
+  }
+  // The interactive adapter's value for the same run, role and task (team-permission-adapter.ts).
+  assert.deepEqual(fake.decided.map(request => request.requester.assignment), ["team:run-1:implementer:task:task-a", "team:run-1:implementer"]);
 });
 
 test("a class rule sends the call to the owner whatever else the pipeline returns", async () => {

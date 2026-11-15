@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep, basename } from "node:path";
 import type { Config, Provider } from "./types.js";
 import { TeamStopRefused, type Manager } from "./manager.js";
+import { bootId, extendWitness, hostProcesses, newWitness, recordCommand, type CensusResult, type HostProcesses, type ProcessWitness } from "./process-census.js";
 import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { PROVIDER_NAMES, recoveryTurnEnd, type Prompt, type SignalData } from "@infinite/attention";
@@ -32,7 +33,7 @@ import type { Readings } from "./readings.js";
 import { mirrorRemoteUrl } from "./project-source.js";
 import type { ProjectSourceService } from "./project-source.js";
 import type { RepositoryGraphs, RepositoryGraphResult } from "./repository-graphs.js";
-import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, publishTeamHead, removeMemberWorkspace, removeTeamWorkspace, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
+import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, publishTeamHead, removeMemberWorkspace, removeTeamWorkspace, commandScope, type CommandScope, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
 import { HOST_LOAD_REASON_PREFIX, LaunchHeldError } from "./host-load.js";
 import { isCollapsedPermissionPrompt, oneShotPermissionOption, permissionAuthorityHash, permissionEvidenceHash, permissionReuseKey, refusedBeforeSend } from "./team-permissions.js";
@@ -48,6 +49,8 @@ type StartInProject = <T>(projectId: string, start: () => Promise<T>) => Promise
 type MissionReservationLookup = (projectId: string, exceptMissionId?: string) => string | undefined;
 type DeliveryReconciliationReport = Extract<TeamReport, { kind: "delivery-reconciliation" }>;
 type TeamServiceOptions = {
+  /** The process census; tests replace it. */
+  processes?: HostProcesses;
   source?: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status">;
   graphs?: Pick<RepositoryGraphs, "refresh">;
   onMerged?: (projectId: string) => void;
@@ -87,10 +90,43 @@ const SESSION_SLOT_REASON = "Waiting for an available host session slot.";
 type PendingOperation = { id: string; kind: "prepare" | "member" | "result" | "check"; revision: number;
   source?: { memberId: string; role: TeamMember["role"]; cwd: string; baseCommit: string; headCommit: string; workspace: "member" | "integration" };
   failure?: { code?: string; reason: string; at: string };
+  /** The processes this operation's commands started. An intent without one was written by an older host. */
+  witness?: ProcessWitness;
+  /**
+   * True while a command may have started that the saved witness does not hold. It is saved before such a command
+   * starts and removed by the save that holds every started command, so an intent an earlier API process left with
+   * it has a witness that may be incomplete.
+   */
+  recording?: true;
 };
+/**
+ * The host's latest look for processes an interrupted operation left; it states only what the host observed. It is
+ * kept beside the intent it names, so the intent stays as the operation wrote it.
+ * `running`: processes that match the host's record of the operation. `in-use`: none of those, but processes that use
+ * the run directory. `ended`: the host looked and found neither. `unknown`: the host could not tell.
+ */
+type OperationCensus = { pendingId: string; at: string; state: "running" | "in-use" | "ended" | "unknown"; recorded?: number; using?: number; detail?: string };
+/** How long a census stays fresh before a retention pass looks again. */
+const CENSUS_TTL_MS = 10 * 60_000;
+/** Commands of one operation come in bursts; the witness is saved once, this long after the last one was recorded. */
+const WITNESS_SAVE_MS = 200;
+/** `inFlight` counts commands that are starting or not yet recorded; `save` is the pending trailing witness save. */
+type OperationRecorder = { pendingId: string; inFlight: number; sampling?: true; save?: NodeJS.Timeout };
+function workspaceRemovedError() {
+  return new TeamError(409, "team-workspace-removed", "This run's workspaces were removed under the retention policy; start a new run.");
+}
+/** The event for a look. It keeps apart processes that match the operation's record and processes that only use the run directory. */
+function operationCensusEvent(kind: PendingOperation["kind"], census: Omit<OperationCensus, "at" | "pendingId">) {
+  if (census.state === "running") return `The host still sees ${census.recorded} process(es) that match its record of the interrupted ${kind} operation${census.using ? `, and ${census.using} more using this run's directory` : ""}.`;
+  if (census.state === "in-use") return `The host sees ${census.using} process(es) using this run's directory. None matches its record of the interrupted ${kind} operation.`;
+  if (census.state === "ended") return `The host sees no process that matches its record of the interrupted ${kind} operation, and none using this run's directory. The intent stays recorded and is not replayed.`;
+  return `The host cannot tell whether the interrupted ${kind} operation left processes: ${census.detail}.`;
+}
 type Stored = {
   run: TeamRun; fingerprint: string; receipts: Record<string, string>; prepared: boolean; root?: string; anchor?: string;
   retention?: RetentionState;
+  /** See OperationCensus. Ignored once its intent is gone. */
+  census?: OperationCensus;
   /** Events waiting for the evidence store. Sealed with the record, so a crash loses none. */
   outbox?: OutboxEvent[];
   /** The run status that the last status event was emitted for. */
@@ -400,6 +436,13 @@ export class TeamService {
   /** Runs whose blackboard entries are not all stored yet. In memory only: the drain retries them without a save. */
   private readonly entryBacklog = new Set<string>();
   private readonly commands = new Map<string, AbortController>();
+  /**
+   * The operation each run last started in this API process. An intent without an entry was loaded from an earlier
+   * process. Entries go by run and intent id: some actions replace a record's contents with a copy, so the intent
+   * object a command started under may no longer be the one the record holds.
+   */
+  private readonly recorders = new Map<string, OperationRecorder>();
+  private readonly sampleTimers = new Set<NodeJS.Timeout>();
   private readonly removingRuns = new Set<string>();
   private readonly removalTasks = new Set<Promise<void>>();
   private readonly publishingRuns = new Set<string>();
@@ -717,7 +760,7 @@ export class TeamService {
     const ready = run.tasks.filter(task => task.status === "pending" && task.dependsOn.every(id => run.tasks.find(item => item.id === id)?.status === "integrated")).length +
       (run.discovery && run.discovery.revision === run.revision && !run.discovery.completedAt ? run.discovery.tasks.filter(task => task.status === "pending").length : 0);
     const workers = { limit: run.parallelism, max, running: members.filter(member => holdsWorkerSlot(member, run.revision)).length, ready };
-    return { ...safeRun, ...(stored.pending ? { pendingOperation: { id: stored.pending.id, kind: stored.pending.kind, revision: stored.pending.revision, failed: Boolean(stored.pending.failure), ...(stored.pending.failure?.code ? { failureCode: stored.pending.failure.code } : {}), ...(stored.pending.source ? { sourceMemberId: stored.pending.source.memberId, sourceRole: stored.pending.source.role } : {}) } } : {}), tasks: safeRun.tasks.map(task => { // Older records predate task.revision; steering clears the task list, so the retained run revision identifies their plan.
+    return { ...safeRun, ...(stored.pending ? { pendingOperation: { id: stored.pending.id, kind: stored.pending.kind, revision: stored.pending.revision, failed: Boolean(stored.pending.failure), ...(stored.pending.failure?.code ? { failureCode: stored.pending.failure.code } : {}), ...(stored.pending.source ? { sourceMemberId: stored.pending.source.memberId, sourceRole: stored.pending.source.role } : {}), ...(stored.census?.pendingId === stored.pending.id ? { processes: stored.census.state, processesCheckedAt: stored.census.at } : {}) } } : {}), tasks: safeRun.tasks.map(task => { // Older records predate task.revision; steering clears the task list, so the retained run revision identifies their plan.
       const revision = task.revision ?? safeRun.revision;
       const attempts = withUsage.members.filter(member => member.taskId === task.id && member.revision === revision);
       const usage = attempts.flatMap(member => member.usage?.messages ? [member.usage] : []);
@@ -1109,6 +1152,7 @@ export class TeamService {
     this.commands.get(stored.run.id)?.abort();
     this.commands.delete(stored.run.id);
     this.records.delete(stored.run.id);
+    this.recorders.delete(stored.run.id);
     this.entryBacklog.delete(stored.run.id);
     // deleteRun never throws. A failed delete is repeated by the hourly sweep, so the removal does not wait on it.
     this.evidence?.deleteRun(stored.run.id);
@@ -1416,6 +1460,7 @@ export class TeamService {
       if (this.replay(stored, "reconcile-delivery", body)) return this.view(stored);
       if (body.revision !== run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before reconciling delivery.");
       if (run.status === "cancelled") throw new TeamError(409, "team-cancelled", "This team has been cancelled.");
+      if (run.workspaceRemovedAt || this.removingRuns.has(id)) throw workspaceRemovedError();
       if (this.needsPublication(stored)) {
         this.startPublication(stored);
         throw new TeamError(409, "head-not-published", "The reviewed head is still being published to GitHub. Retry reconciliation after it is published.");
@@ -1545,6 +1590,7 @@ export class TeamService {
       if (this.replay(stored, "reconcile-verification", body)) return this.view(stored);
       if (body.revision !== run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before reconciling verification.");
       if (run.status === "cancelled") throw new TeamError(409, "team-cancelled", "This team has been cancelled.");
+      if (run.workspaceRemovedAt || this.removingRuns.has(id)) throw workspaceRemovedError();
       if (run.linearTracking || run.linear) {
         const refreshed = this.linear?.updateTeam(run, run.linearTracking === true) ?? run.linear;
         const tracking = this.linear?.getTeam(run.id) ?? refreshed;
@@ -1562,6 +1608,12 @@ export class TeamService {
           run.members.some(member => member.status !== "stopped") ||
           (run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering", "uncertain"].includes(decision.status)))
         throw unavailable("Members, permission decisions, delivery state, or the operation are not fully quiescent for verification reconciliation.");
+      if (pending.witness) {
+        // The host's own look comes before the operator's attestation: it refuses what it can see, and proves nothing more.
+        const seen = await this.refreshOperationCensus(stored, true);
+        if (seen === "running") throw new TeamError(409, "team-operation-running", `The host still sees ${stored.census?.recorded} process(es) that match its record of the interrupted check. Reconcile verification after they have exited.`);
+        if (seen === "in-use") throw new TeamError(409, "team-directory-in-use", `The host sees ${stored.census?.using} process(es) using this run's directory. Reconcile verification after they have exited or left it.`);
+      }
       const head = run.headCommit;
       if (!head || !commitId.test(head) || body.headCommit !== head || stored.checkHead === head)
         throw new TeamError(409, "verification-reconciliation-head-changed", "The requested head is not the current unchecked integration commit.");
@@ -1906,7 +1958,7 @@ export class TeamService {
     };
     this.timer = setInterval(tick, 500); this.timer.unref(); tick();
   }
-  close() { this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const controller of this.commands.values()) controller.abort(); for (const controller of this.publicationControllers.values()) controller.abort(); }
+  close() { this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const timer of this.sampleTimers) clearTimeout(timer); this.sampleTimers.clear(); for (const controller of this.commands.values()) controller.abort(); for (const controller of this.publicationControllers.values()) controller.abort(); }
   /** Settles once work queued before now has finished, so a caller can stop sessions it may still launch. */
   async idle() {
     await this.serial;
@@ -1983,16 +2035,142 @@ export class TeamService {
       throw new TeamError(409, "team-attempt-limit", `The team reached its limit of ${limit} agent attempts. Review its evidence before continuing.`);
     }
   }
+  /**
+   * Records the commands an operation starts. The saved intent carries `recording` from before a command starts until
+   * a save holds every started command, so a host that stops in between leaves a witness that says it may be incomplete.
+   */
+  private commandRecorder(stored: Stored, id: string): CommandScope {
+    const recorder: OperationRecorder = { pendingId: id, inFlight: 0 };
+    this.recorders.set(stored.run.id, recorder);
+    const settle = () => { recorder.inFlight--; this.saveWitnessSoon(stored, recorder); };
+    // An operation that starts no command at once closes its record too.
+    this.saveWitnessSoon(stored, recorder);
+    return {
+      starting: () => {
+        recorder.inFlight++;
+        if (this.intent(stored, id)?.recording) return undefined;
+        // The saved intent says every started command is recorded. Say otherwise durably before the next one starts;
+        // a command the host cannot announce does not start.
+        return this.enqueue(() => {
+          if (this.closed) throw new TeamError(409, "command-unavailable", "The host is stopping; the command was not started.");
+          const pending = this.intent(stored, id);
+          if (!pending || pending.recording) return;
+          pending.recording = true;
+          try { this.save(stored); } catch (error) { delete pending.recording; throw error; }
+        }).catch(error => { recorder.inFlight--; throw error; });
+      },
+      started: pid => {
+        const witness = this.intent(stored, id)?.witness;
+        if (pid === undefined || !witness) { settle(); return; }
+        // The command leads its own session and group, so both are known now, without a read that could come too late.
+        if (process.platform !== "win32") recordCommand(witness, pid);
+        if (!recorder.sampling) {
+          recorder.sampling = true;
+          this.sampleWitness(stored, id, [250, 1000, 5000]);
+        }
+        const processes = this.options?.processes ?? hostProcesses;
+        void Promise.resolve().then(() => processes.start(pid)).then(start => this.enqueue(() => {
+          const current = this.intent(stored, id)?.witness;
+          if (start && current) recordCommand(current, pid, start);
+        })).catch(() => {}).finally(settle);
+      },
+    };
+  }
+  /** The run's unresolved intent with this id, as the record holds it now. */
+  private intent(stored: Stored, id: string) { return stored.pending?.id === id ? stored.pending : undefined; }
+  /** This API process's recorder for the intent, when this process started its operation. */
+  private recorderOf(stored: Stored, pending: PendingOperation) {
+    const recorder = this.recorders.get(stored.run.id);
+    return recorder?.pendingId === pending.id ? recorder : undefined;
+  }
+  /**
+   * One save, this long after the last recorded command, covers a burst of commands instead of one sealed write each.
+   * It closes the record when no command is in between. Until then the saved intent keeps saying it may be incomplete.
+   */
+  private saveWitnessSoon(stored: Stored, recorder: OperationRecorder) {
+    if (recorder.save) { clearTimeout(recorder.save); this.sampleTimers.delete(recorder.save); }
+    const timer = setTimeout(() => {
+      this.sampleTimers.delete(timer);
+      if (recorder.save === timer) recorder.save = undefined;
+      void this.enqueue(() => {
+        const pending = this.intent(stored, recorder.pendingId);
+        if (this.closed || !pending) return;
+        const open = pending.recording;
+        if (recorder.inFlight === 0) delete pending.recording;
+        try { this.save(stored); } catch (error) { if (open) pending.recording = open; throw error; }
+      }).catch(() => {});
+    }, WITNESS_SAVE_MS);
+    timer.unref();
+    this.sampleTimers.add(timer);
+    recorder.save = timer;
+  }
+  private sampleWitness(stored: Stored, id: string, delays: number[]) {
+    const delay = delays[0] ?? 15000;
+    const timer = setTimeout(() => {
+      this.sampleTimers.delete(timer);
+      if (this.closed || !this.intent(stored, id) || !this.commands.has(stored.run.id)) return;
+      const processes = this.options?.processes ?? hostProcesses;
+      void Promise.resolve().then(() => processes.table()).then(table => this.enqueue(() => {
+        const witness = this.intent(stored, id)?.witness;
+        if (this.closed || !witness) return;
+        if (extendWitness(witness, table)) this.save(stored);
+      })).catch(() => {}).finally(() => this.sampleWitness(stored, id, delays.slice(1)));
+    }, delay);
+    timer.unref();
+    this.sampleTimers.add(timer);
+  }
+  /**
+   * Looks for processes an interrupted operation left in the run directory and in its recorded witness. Returns the
+   * state stored, or undefined when there is nothing to look at. Only the census decides a state; elapsed time never does.
+   * Callers run inside the mutation queue.
+   */
+  private async refreshOperationCensus(stored: Stored, force = false): Promise<OperationCensus["state"] | undefined> {
+    const { run } = stored, pending = stored.pending;
+    if (!pending?.witness || this.commands.has(run.id)) return undefined;
+    const now = this.options?.now?.() ?? Date.now();
+    const previous = stored.census?.pendingId === pending.id ? stored.census : undefined;
+    if (!force && previous && now - Date.parse(previous.at) < CENSUS_TTL_MS) return previous.state;
+    const processes = this.options?.processes ?? hostProcesses;
+    let result: CensusResult;
+    try { result = await processes.census(pending.witness, teamRunDirectory(run.workspace), this.config.teams?.commandPrefix); }
+    catch (error) { result = { ok: false, problem: error instanceof Error ? error.message : "The census failed." }; }
+    // The intent may have changed while the census ran; a result for another intent or a live command is dropped.
+    if (this.records.get(run.id) !== stored || stored.pending?.id !== pending.id || this.commands.has(run.id)) return undefined;
+    const count = (reasons: string[]) => result.ok ? result.findings.filter(finding => reasons.includes(finding.reason)).length : 0;
+    const recorded = count(["recorded-process", "recorded-session", "recorded-group"]), using = count(["working-directory", "open-file", "command-line"]);
+    const unreadable = count(["unreadable"]);
+    // An earlier API process stopped while this intent still said a command might be unrecorded. Within the same boot
+    // such a command can still run where no look finds it, so finding nothing proves nothing.
+    const recorder = this.recorderOf(stored, pending);
+    const incomplete = pending.recording && !recorder && pending.witness.boot === bootId();
+    const census: Omit<OperationCensus, "at" | "pendingId"> = !result.ok ? { state: "unknown", detail: result.problem.slice(0, 200) }
+      : recorded > 0 ? { state: "running", recorded, ...(using ? { using } : {}) }
+        : using > 0 ? { state: "in-use", using }
+          // A process the census could not inspect is not shown to use the directory; the host then says it cannot tell.
+          : unreadable > 0 ? { state: "unknown", detail: `${unreadable} process(es) of the accounts it inspects could not be inspected` }
+            : incomplete ? { state: "unknown", detail: "the host stopped while the operation was starting a command, so its record of the operation's processes may be incomplete" }
+              // This API process started the operation, and one of its commands is between its announcement and its record.
+              : recorder && recorder.inFlight > 0 ? { state: "unknown", detail: "a command of the operation is still starting" }
+                : { state: "ended" };
+    stored.census = { pendingId: pending.id, at: new Date(now).toISOString(), ...census };
+    // Only a change in what the host saw is an event and a save. The time of an unchanged look stays in memory, so a
+    // waiting run is not rewritten on every look; after a restart the host simply looks again.
+    if (previous?.state !== census.state || previous.recorded !== census.recorded || previous.using !== census.using || previous.detail !== census.detail) {
+      this.event(stored, operationCensusEvent(pending.kind, census));
+      this.save(stored);
+    }
+    return census.state;
+  }
   /** Persist an intent before external work. A restart keeps the unresolved intent blocked. */
   private operation<T>(stored: Stored, kind: NonNullable<Stored["pending"]>["kind"], perform: (signal: AbortSignal) => Promise<T>, complete: (value: T) => void,
     sourceMember?: TeamMember, sourceWorkspace: "member" | "integration" = "member") {
     if (stored.pending) throw new TeamError(409, "team-operation-running", "A team workspace operation is already running.");
-    const pending: PendingOperation = { id: randomUUID(), kind, revision: stored.run.revision,
+    const pending: PendingOperation = { id: randomUUID(), kind, revision: stored.run.revision, witness: newWitness(), recording: true,
       ...(sourceMember ? { source: { memberId: sourceMember.memberId, role: sourceMember.role, cwd: sourceMember.cwd, baseCommit: sourceMember.baseCommit,
         headCommit: stored.run.headCommit ?? sourceMember.baseCommit, workspace: sourceWorkspace } } : {}) };
     const controller = new AbortController(); this.commands.set(stored.run.id, controller);
     stored.pending = pending; this.save(stored);
-    void perform(controller.signal).then(value => this.enqueue(() => {
+    void commandScope.run(this.commandRecorder(stored, pending.id), () => perform(controller.signal)).then(value => this.enqueue(() => {
       if (this.closed || stored.pending?.id !== pending.id) return;
       this.commands.delete(stored.run.id);
       try { this.assertBudget(stored.run); } catch (error) { this.block(stored, error); return; }
@@ -2006,7 +2184,10 @@ export class TeamService {
       if (this.closed || stored.pending?.id !== pending.id) return;
       this.commands.delete(stored.run.id);
       // Failed side effects retain their intent; a pause must not make them replayable.
-      pending.failure = { code: error instanceof TeamError ? error.code : "workspace-operation-failed",
+      // Every command the operation started is recorded by now unless one is still starting, so this save closes the record.
+      const failed = stored.pending;
+      if (this.recorderOf(stored, failed)?.inFlight === 0) delete failed.recording;
+      failed.failure = { code: error instanceof TeamError ? error.code : "workspace-operation-failed",
         reason: error instanceof Error ? error.message : "A team workspace operation failed.", at: timestamp() };
       this.save(stored);
       this.block(stored, error);
@@ -2340,11 +2521,12 @@ export class TeamService {
       this.save(stored);
     }
   }
-  private async membersSettled(stored: Stored) {
+  /** `operationEnded` lifts the fence of an interrupted operation. Only the retention gate passes it, and it then closes the run only after a look taken in the same pass found none of the operation's processes. */
+  private async membersSettled(stored: Stored, operationEnded = false) {
     const { run } = stored;
     if (this.commands.has(run.id)) return false;
     // A terminal run's interrupted operation is never replayed, so it does not keep the run's clones alive.
-    if (stored.pending && !["cancelled", "merged", "no-change"].includes(run.status)) return false;
+    if (stored.pending && !["cancelled", "merged", "no-change"].includes(run.status) && !operationEnded) return false;
     for (const member of run.members) {
       if (member.status === "stopped") continue;
       // Whatever the recorded member status, a session that has exited or no longer exists has nothing left to stop.
@@ -2393,6 +2575,7 @@ export class TeamService {
   private async retire(stored: Stored) {
     try {
       const { run } = stored, retention = this.retentionState(stored), policy = this.config.teams?.retention ?? DEFAULT_TEAM_RETENTION;
+      if (run.status === "blocked" || run.status === "paused") await this.refreshOperationCensus(stored);
       // A run a live goal, mission or handoff still retains is left alone, so it is never closed underneath its owner.
       if (this.removingRuns.has(run.id) || this.ownerPreventsRemoval(run) || this.hasPendingPreparationFrom(stored)) return;
       const statusAtStart = run.status;
@@ -2491,8 +2674,19 @@ export class TeamService {
         }
         return;
       }
-      if (retentionMs === undefined || elapsed < retentionMs || !(await this.membersSettled(stored))) return;
+      if (retentionMs === undefined || elapsed < retentionMs) return;
+      // An interrupted operation keeps its fence unless the host looks now and finds none of its processes. Without a
+      // witness the fence stays. This pass runs on every tick, so the look comes last and only confirms: a look that
+      // found a process, or could not finish, stands until the next scheduled one above.
+      const witnessed = run.status === "blocked" && Boolean(stored.pending?.witness);
+      if (!(await this.membersSettled(stored, witnessed))) return;
       if (this.needsPublication(stored)) { this.startPublication(stored); return; }
+      if (witnessed && stored.pending) {
+        const last = stored.census?.pendingId === stored.pending.id ? stored.census : undefined;
+        if (last && last.state !== "ended") return;
+        if (await this.refreshOperationCensus(stored, true) !== "ended") return;
+        if (run.status !== "blocked" || this.commands.has(run.id) || this.removingRuns.has(run.id)) return;
+      }
 
       run.workspaceRemovedAt = this.retentionNow();
       // The key names the fact, not the time, so a retried removal stores the same event once.

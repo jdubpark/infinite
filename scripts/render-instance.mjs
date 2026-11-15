@@ -17,6 +17,7 @@ const templates = [
   ["infinite-github-refresh.timer", name => name ? `infinite-${name}-github-refresh.timer` : "infinite-github-refresh.timer"],
   ["github-app-gh.sh", () => "github-app-gh.sh"],
   ["transcript-drain.sh", () => "transcript-drain.sh"],
+  ["process-census.sh", () => "process-census.sh"],
   ["config.example.json", () => "config.example.json"],
 ];
 

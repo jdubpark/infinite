@@ -610,7 +610,13 @@ export interface TeamRun {
 /** `providerLimits` is the host's active limit memory at read time, shared by every run. */
 export type TeamView = Omit<TeamRun, "members" | "permissionDecisions" | "permissionRecovery"> & {
   pendingOperation?: { id: string; kind: "prepare" | "member" | "result" | "check"; revision: number; failed: boolean;
-    failureCode?: string; sourceMemberId?: string; sourceRole?: TeamMember["role"] };
+    failureCode?: string; sourceMemberId?: string; sourceRole?: TeamMember["role"];
+    /**
+     * What the host last observed of processes the interrupted operation may have left: `running` (processes that match
+     * its record of the operation), `in-use` (only processes that use the run directory), `ended` (it looked and found
+     * neither), or `unknown` (it could not tell). No process ids.
+     */
+    processes?: "running" | "in-use" | "ended" | "unknown"; processesCheckedAt?: string };
   members: Omit<TeamMember, "prompt" | "contextFeedback" | "nativeSessionId" | "continuation" | "turns" | "pendingFeedback">[];
   permissionDecisions?: Omit<TeamPermissionDecision, "prompt" | "coordinatorSessionId">[];
   permissionRecovery?: { outcomes: TeamPermissionRecoveryView[] };

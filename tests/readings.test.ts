@@ -223,6 +223,11 @@ test("polling reads a session record once unless a title job is due", async () =
     assert.equal(reads.S, 2, "a single-session read follows no listing and reads that record again");
     await f.readings.tick();
     assert.equal(reads.S, 2, "a tick after a single-session read answers from the remembered snapshot");
+    // A session's detail is built from the stored record, which carries `backend`. It is still no listing, and the caller says so.
+    f.readings.merge([rows[1]!], false);
+    assert.equal(reads.S, 3, "a detail read follows no listing and reads that record again");
+    await f.readings.tick();
+    assert.deepEqual(reads, { O: 1, S: 3, C: 1 }, "a detail read keeps what the last listing learned about every other session");
     rows[0]!.title = "Renamed login flow";
     await f.readings.tick();
     assert.equal(reads.O, 2, "a renamed row is read again");

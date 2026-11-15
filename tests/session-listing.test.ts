@@ -447,7 +447,8 @@ test("a warm session list reads no session record", { timeout: 60_000 }, async t
     const ids = Array.from({ length: 30 }, () => ID());
     for (const id of ids) {
       mkdirSync(dir(id), { recursive: true });
-      writeSealed(join(dir(id), "meta.sealed"), key, `${id}:meta`, { session: sessionOf(id), fingerprint: "fixture" });
+      // A record as the host writes it: the stored session carries `backend`.
+      writeSealed(join(dir(id), "meta.sealed"), key, `${id}:meta`, { session: sessionOf(id, { backend: "infinite" }), fingerprint: "fixture" });
       writeSealed(join(dir(id), "status.sealed"), key, `${id}:status`, exitedState(1));
     }
     // The files settle, and the handoff poller runs twice; then the listing is warm.
@@ -455,6 +456,9 @@ test("a warm session list reads no session record", { timeout: 60_000 }, async t
     await host.sessions.list();
     await new Promise(resolve => setTimeout(resolve, 1_000));
     await host.sessions.list();
+    // A client with one session open reads its detail again and again. That read is no listing: it must leave the
+    // other 29 sessions as the last listing left them.
+    assert.equal((await host.fetchApi(`/sessions/${ids[0]}`)).status, 200);
 
     spied = spy();
     const rows = await host.sessions.list();

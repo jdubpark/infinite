@@ -133,10 +133,14 @@ export class Readings {
   }
   stop() { clearInterval(this.timer); }
 
-  /** Synchronous cache merge; stale message hashes and owner titles are omitted. */
-  merge<T extends ReadingRow>(rows: T[]): T[] {
-    const completeSnapshot = rows.length === 0 || rows.every(row => row.backend !== undefined);
-    this.observeRows(rows, completeSnapshot ? "snapshot" : "partial", (row, session) => this.queueTitleReading(row, session));
+  /**
+   * Synchronous cache merge; stale message hashes and owner titles are omitted.
+   * `complete` says whether the rows are a whole listing. A whole listing replaces what the last one left. Any other
+   * read, such as one session's detail, adds its rows and forgets nothing. A stored session carries `backend`, so a
+   * caller that builds a row from a record passes `false`.
+   */
+  merge<T extends ReadingRow>(rows: T[], complete = rows.length === 0 || rows.every(row => row.backend !== undefined)): T[] {
+    this.observeRows(rows, complete ? "snapshot" : "partial", (row, session) => this.queueTitleReading(row, session));
     const merged = rows.map(row => {
       const reading: SessionReading = {};
       const message = row.attention.lastMessage ?? "";

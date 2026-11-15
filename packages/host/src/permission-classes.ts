@@ -10,10 +10,10 @@ import { matchDestructive } from "@infinite/attention";
 import type { PermissionClassMatch, PermissionQualification, PermissionRequest } from "./permission-agent-types.js";
 import type { InterruptClass } from "./permission-policy.js";
 import { canonicalJson } from "./evidence/crypto.js";
-import { MAX_SHELL_DEPTH, quoteWord, readShell, resolveWord, type PathResolver, type SimpleCommand } from "./permission-shell.js";
+import { MAX_SHELL_DEPTH, quoteWord, readShell, remoteOperand, resolveWord, type PathResolver, type SimpleCommand } from "./permission-shell.js";
 
 /** Bumped by any change to the rule code below, or to the shell reading it uses, that is not a change to the lists. */
-export const CLASS_RULES_VERSION = 3;
+export const CLASS_RULES_VERSION = 4;
 
 /**
  * The host's lists. Commands are word prefixes after wrappers (sudo, env, timeout) are removed. Paths
@@ -255,6 +255,8 @@ function operandTargets(command: SimpleCommand, cwd: string | undefined, add: (w
   const inPlace = name === "sed" && argv.some(arg => /^-[a-zA-Z]*i/.test(arg) || arg.startsWith("--in-place"));
   const every = PATH_COMMANDS.has(name);
   operands.forEach((word, index) => {
+    // A path on another host is not a path here. The reading is opaque (`remote-target`).
+    if (remoteOperand(name, word)) return;
     if (!every && !looksLikePath(word)) return;
     let access: Access = "unknown";
     if (READ_COMMANDS.has(name)) access = "read";

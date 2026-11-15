@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProjectGroup, ProjectGroupList } from "../packages/host/src/project-group-types.js";
@@ -632,9 +632,17 @@ test("with the real group service, an owner act on a workspace ends the entry of
     const leave = (id: string) => config.projects.splice(config.projects.findIndex(project => project.id === id), 1)[0]!;
     const notCovered = (id: string) => ({ covered: false, projectId: id, reason: "not-covered" });
 
+    // Delegated while gamma, which has no record, is away: the act ends nothing of gamma and adds no history,
+    // so gamma's first onboarding still covers it.
+    let away = leave("gamma");
+    service.delegate(workspace, request(), actor);
+    service.revoke(workspace, request(), actor);
+    config.projects.push(away);
+    assert.equal(service.coverProject("gamma", request(), actor).covered, true);
+
     // Revoked while alpha is away: alpha returns to the same id and path and is not covered.
     service.delegate(workspace, { ...request(), direction: "Wide." }, actor);
-    let away = leave("alpha");
+    away = leave("alpha");
     assert.equal(service.revoke(workspace, request(), actor).state, "not-delegated");
     config.projects.push(away);
     assert.deepEqual(service.coverage("alpha"), notCovered("alpha"));
@@ -676,6 +684,80 @@ test("with the real group service, the id of a project that left the host still 
     config.projects.push(away);
     assert.deepEqual(service.coverage("alpha"), { covered: false, projectId: "alpha", reason: "not-covered" });
     assert.deepEqual(service.coverProject("alpha", request(), actor), { covered: false, projectId: "alpha", reason: "not-covered" });
+  } finally { f.cleanup(); }
+});
+
+test("with the real group service, an owner act by an id also ends the entry of the absent project that carries that id", () => {
+  const f = fixture();
+  try {
+    const { config, groups, service } = realGroups(f);
+    const leave = () => config.projects.splice(config.projects.findIndex(project => project.id === "alpha"), 1)[0]!;
+    const notCovered = { covered: false, projectId: "alpha", reason: "not-covered" };
+    // The stored workspace alpha holds beta, and project alpha is ungrouped under the same id.
+    groups.update("alpha", { requestId: randomUUID(), revision: 1, repos: ["beta"] });
+
+    service.delegateAll({ ...request(), direction: "Wide." }, actor);
+    let away = leave();
+    assert.equal(service.revoke("alpha", request(), actor).state, "not-delegated");
+    config.projects.push(away);
+    const restarted = new PermissionDelegationService(config, f.key, new ProjectGroupService(config, f.key, undefined, { git: () => undefined }));
+    assert.deepEqual(restarted.coverage("alpha"), notCovered);
+    assert.equal(restarted.coverage("beta").covered, false);
+
+    service.delegateAll({ ...request(), direction: "Wide." }, actor);
+    away = leave();
+    assert.equal(service.delegate("alpha", { ...request(), direction: "Narrow." }, actor).view.direction, "Narrow.");
+    config.projects.push(away);
+    assert.deepEqual(service.coverage("alpha"), notCovered);
+    const beta = service.coverage("beta");
+    assert.equal(beta.covered && beta.coverage.direction, "Narrow.");
+  } finally { f.cleanup(); }
+});
+
+test("after a failed write the stored state is read again, so a published change holds and an unpublished one does not", () => {
+  const f = fixture();
+  try {
+    let fail: "never" | "before" | "after" = "never";
+    const writeState = (file: string, stateKey: Buffer, scope: string, value: unknown) => {
+      if (fail === "before") throw new Error("write failed");
+      writeSealed(file, stateKey, scope, value);
+      if (fail === "after") throw new Error("sync failed");
+    };
+    const service = new PermissionDelegationService(f.config, f.key, f.groups, { writeState });
+    const notCovered = (id: string) => ({ covered: false, projectId: id, reason: "not-covered" });
+    service.delegate("workspace-one", request(), actor);
+
+    // The revocation reached the disk before the write failed. No answer and no later write uses the older snapshot.
+    const revocation = request();
+    fail = "after";
+    assert.throws(() => service.revoke("workspace-one", revocation, actor), /sync failed/);
+    fail = "never";
+    assert.deepEqual(service.coverage("alpha"), notCovered("alpha"));
+    service.optOut("beta", request(), actor);
+    assert.deepEqual(f.service().coverage("alpha"), notCovered("alpha"));
+    assert.equal(service.revoke("workspace-one", revocation, actor).state, "not-delegated", "the retried request finds its receipt");
+
+    // A change that never reached the disk did not happen.
+    service.delegate("workspace-one", request(), actor);
+    fail = "before";
+    assert.throws(() => service.revoke("workspace-one", request(), actor), /write failed/);
+    fail = "never";
+    assert.equal(service.coverage("alpha").covered, true);
+    assert.equal(f.service().coverage("alpha").covered, true);
+
+    // While the stored state cannot be read after a failed write, every call fails.
+    fail = "before";
+    assert.throws(() => service.revoke("workspace-one", request(), actor), /write failed/);
+    fail = "never";
+    const stored = readFileSync(f.file);
+    writeFileSync(f.file, "not a sealed state\n");
+    for (let attempt = 0; attempt < 2; attempt++) {
+      assert.throws(() => service.coverage("alpha"), /Invalid permission-delegation state/);
+      assert.throws(() => service.status(), /Invalid permission-delegation state/);
+      assert.throws(() => service.delegateAll(request(), actor), /Invalid permission-delegation state/);
+    }
+    writeFileSync(f.file, stored);
+    assert.equal(service.coverage("alpha").covered, true);
   } finally { f.cleanup(); }
 });
 

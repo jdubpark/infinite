@@ -42,7 +42,9 @@ type LegacyGroup = Omit<StoredGroup, "kind" | "hidden" | "members" | "detached" 
 };
 /**
  * How often an owner regrouping moved each checkout to another project. `id` is random and written once, so a
- * state file that lost this record never matches a mark taken before the loss.
+ * state file that lost this record never matches a mark taken before the loss. An older copy of the file carries
+ * its older counts under the same `id`: a procedure that restores one must replace `id`, or marks taken before a
+ * later move match again.
  */
 type OwnerMoves = { id: string; counts: Record<string, number> };
 type Stored = { groups: Record<string, LegacyGroup>; receipts: Record<string, GroupReceipt>; tombstones?: string[]; ownerMoves?: OwnerMoves };

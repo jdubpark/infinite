@@ -61,6 +61,8 @@ export class PermissionDelegationService {
   private readonly clock: () => number;
   private readonly policyVersion: number;
   private state: Stored;
+  /** A write failed. It may have reached the disk or not, so the snapshot in memory is not known to be the stored state. */
+  private uncertain = false;
 
   constructor(
     private readonly config: Pick<Config, "stateDir" | "projects">,
@@ -74,23 +76,23 @@ export class PermissionDelegationService {
     this.clock = options.now ?? Date.now;
     this.policyVersion = options.policyVersion ?? PERMISSION_POLICY_VERSION;
     mkdirSync(directory, { recursive: true, mode: 0o700 });
+    this.state = this.load();
+  }
 
+  private load(): Stored {
     let raw: string;
     try {
       raw = readFileSync(this.file, "utf8");
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        this.state = emptyState();
-        return;
-      }
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyState();
       throw error;
     }
 
     let parsed;
-    try { parsed = permissionDelegationStoredStateSchema.safeParse(unseal<unknown>(key, SCOPE, raw)); }
+    try { parsed = permissionDelegationStoredStateSchema.safeParse(unseal<unknown>(this.key, SCOPE, raw)); }
     catch { throw new Error("Invalid permission-delegation state"); }
     if (!parsed.success) throw new Error("Invalid permission-delegation state");
-    this.state = parsed.data;
+    return parsed.data;
   }
 
   private timestamp() { return new Date(this.clock()).toISOString(); }
@@ -127,8 +129,23 @@ export class PermissionDelegationService {
   }
 
   private persist(candidate: Stored) {
-    this.writeState(this.file, this.key, SCOPE, candidate);
+    try {
+      this.writeState(this.file, this.key, SCOPE, candidate);
+    } catch (error) {
+      this.uncertain = true;
+      throw error;
+    }
     this.state = candidate;
+  }
+
+  /**
+   * After a failed write, the stored state is read again before any answer or change, so neither comes from a
+   * snapshot that the disk may have left behind. While the state cannot be read, every call fails.
+   */
+  private settle() {
+    if (!this.uncertain) return;
+    this.state = this.load();
+    this.uncertain = false;
   }
 
   private replay<T>(requestId: string, fingerprint: string): T | undefined {
@@ -160,13 +177,17 @@ export class PermissionDelegationService {
     return listed.filter(group => projectIds(group).includes(id) || this.groups.storedMembers(group.id).includes(id));
   }
 
-  /** Checkouts stored in these workspaces that are not enrolled now. */
-  private absentMembers(found: PermissionDelegationGroup[]): string[] {
-    return [...new Set(found.flatMap(group => this.groups.storedMembers(group.id)))].filter(id => !this.enrolled(id));
+  /**
+   * Projects that are not enrolled now, that still have an entry, and that an owner act by `id` on these workspaces
+   * reaches: every checkout stored in the workspaces, and the project with that id itself, whose own implicit
+   * workspace would be listed under the id if it were enrolled. Ending an entry adds no onboarding history.
+   */
+  private absentEntries(state: Stored, id: string, found: PermissionDelegationGroup[]): string[] {
+    return [...new Set([id, ...found.flatMap(group => this.groups.storedMembers(group.id))])]
+      .filter(projectId => !this.enrolled(projectId) && own(state.entries, projectId) !== undefined);
   }
 
-  private endCoverage(candidate: Stored, ids: string[]) {
-    this.remember(candidate, ids);
+  private endEntries(candidate: Stored, ids: string[]) {
     for (const projectId of ids) delete candidate.entries[projectId];
   }
 
@@ -261,6 +282,7 @@ export class PermissionDelegationService {
     input: { requestId: string; direction?: string | null },
     actorInput: { deviceId: string },
   ): { view: WorkspaceDelegationView; replacedOptOuts: string[] } {
+    this.settle();
     const request = permissionDelegationRequestSchema.parse(input);
     const actor = permissionDelegationActorSchema.parse(actorInput);
     const fingerprint = this.fingerprint("delegate", workspaceId, request, actor);
@@ -275,7 +297,7 @@ export class PermissionDelegationService {
     const group = found[0]!;
     const candidate = structuredClone(this.state);
     const replacedOptOuts = this.applyDelegate(candidate, group, request.direction, actor, this.timestamp());
-    this.endCoverage(candidate, this.absentMembers(found));
+    this.endEntries(candidate, this.absentEntries(candidate, workspaceId, found));
     return this.record(candidate, request.requestId, fingerprint, {
       view: this.view(group, candidate),
       replacedOptOuts: replacedOptOuts.sort(),
@@ -286,6 +308,7 @@ export class PermissionDelegationService {
     input: { requestId: string; direction?: string | null },
     actorInput: { deviceId: string },
   ): { views: WorkspaceDelegationView[]; replacedOptOuts: string[] } {
+    this.settle();
     const request = permissionDelegationRequestSchema.parse(input);
     const actor = permissionDelegationActorSchema.parse(actorInput);
     const fingerprint = this.fingerprint("delegateAll", undefined, request, actor);
@@ -299,7 +322,7 @@ export class PermissionDelegationService {
     for (const group of groups)
       replacedOptOuts.push(...this.applyDelegate(candidate, group, request.direction, actor, at));
     // The owner decided for every workspace, so no entry of a project that is not enrolled now outlives the decision.
-    this.endCoverage(candidate, Object.keys(candidate.entries).filter(projectId => !this.enrolled(projectId)));
+    this.endEntries(candidate, Object.keys(candidate.entries).filter(projectId => !this.enrolled(projectId)));
     return this.record(candidate, request.requestId, fingerprint, {
       views: groups.map(group => this.view(group, candidate)),
       replacedOptOuts: [...new Set(replacedOptOuts)].sort(),
@@ -316,6 +339,7 @@ export class PermissionDelegationService {
     input: { requestId: string },
     actorInput: { deviceId: string },
   ): CoverageResult {
+    this.settle();
     const request = permissionDelegationMutationRequestSchema.parse(input);
     const actor = permissionDelegationActorSchema.parse(actorInput);
     const fingerprint = this.fingerprint("coverProject", projectId, request, actor);
@@ -335,6 +359,7 @@ export class PermissionDelegationService {
   }
 
   optOut(projectId: string, input: { requestId: string }, actorInput: { deviceId: string }): CoverageResult {
+    this.settle();
     const request = permissionDelegationMutationRequestSchema.parse(input);
     const actor = permissionDelegationActorSchema.parse(actorInput);
     const fingerprint = this.fingerprint("optOut", projectId, request, actor);
@@ -350,6 +375,7 @@ export class PermissionDelegationService {
   }
 
   revoke(workspaceId: string, input: { requestId: string }, actorInput: { deviceId: string }): WorkspaceDelegationView {
+    this.settle();
     const request = permissionDelegationMutationRequestSchema.parse(input);
     const actor = permissionDelegationActorSchema.parse(actorInput);
     const fingerprint = this.fingerprint("revoke", workspaceId, request, actor);
@@ -359,23 +385,28 @@ export class PermissionDelegationService {
     // Every workspace under this id is revoked, so no project that the id can name stays covered.
     const found = this.workspaces(workspaceId);
     const candidate = structuredClone(this.state);
+    const absent = this.absentEntries(candidate, workspaceId, found);
+    this.endEntries(candidate, absent);
     if (found.length === 0) {
       // A project that left the host is in no listed workspace. Its own id still ends its entry.
-      if (!own(candidate.entries, workspaceId)) throw notFound();
-      this.endCoverage(candidate, [workspaceId]);
+      if (absent.length === 0) throw notFound();
       return this.record<WorkspaceDelegationView>(candidate, request.requestId, fingerprint,
         { workspaceId, name: workspaceId, state: "not-delegated", projects: [] });
     }
     const group = { ...found[0]!, repos: found.flatMap(workspace => workspace.repos) };
-    this.endCoverage(candidate, [...this.members(group), ...this.absentMembers(found)]);
+    const memberIds = this.members(group);
+    this.remember(candidate, memberIds);
+    this.endEntries(candidate, memberIds);
     return this.record(candidate, request.requestId, fingerprint, this.view(group, candidate));
   }
 
   coverage(projectId: string): CoverageResult {
+    this.settle();
     return this.coverageFrom(projectId, this.state);
   }
 
   status(): WorkspaceDelegationView[] {
+    this.settle();
     return (this.groups.list().groups as PermissionDelegationGroup[]).map(group => this.view(group, this.state));
   }
 }

@@ -28,6 +28,8 @@ import { configurationModule, configurationProjector } from "../packages/host/sr
 import { outcomeProjector } from "../packages/host/src/outcome-projector.js";
 import { outcomeModule, runOutcomes } from "../packages/host/src/outcome-store.js";
 import { queryRollup } from "../packages/host/src/outcome-reads.js";
+import { teamReportSchema } from "../packages/host/src/team-types.js";
+import { missionReportSchema } from "../packages/host/src/mission-types.js";
 
 const until = (read: () => Mission, accepts: (mission: Mission) => boolean, timeout = 60000) => waitFor(async () => read(), accepts, timeout);
 const standaloneRequest = (projectId: string): CreateTeam => ({
@@ -352,6 +354,73 @@ test("mission prompt keeps 21 open child questions under the byte limit without 
   assert.match(bounded.prompt, new RegExp(`${oversizedMessages.length - bounded.includedMessageCount} more messages are waiting`));
 });
 
+test("mission prompt shortens and counts a leading message before deferring later messages", () => {
+  const mission = {
+    id: "mission", groupName: "Example", status: "working", deadlineAt: "", maxSubtasks: 8,
+    subtasks: [], decisions: [], dispatchSummary: "", steering: [], objective: "界".repeat(23000),
+  } as unknown as Mission;
+  const result = missionPromptWithMessageCount(mission, [], [
+    { type: "owner-direction", text: "界".repeat(8000) },
+    { type: "owner-direction", text: "Keep the existing check." },
+  ], 2, "claude", lineup.coordinator, { openChildDecisions: [], waiting: 0 });
+  assert.ok(Buffer.byteLength(result.prompt, "utf8") <= 80 * 1024);
+  assert.equal(result.includedMessageCount, 1);
+  const label = "Messages since your last attempt (JSON): ";
+  const messages = JSON.parse(result.prompt.split("\n").find(line => line.startsWith(label))!.slice(label.length));
+  assert.ok(messages[0].text.length > 0 && messages[0].text.length < 8000);
+  assert.match(messages[0].truncated, /Shortened by the host to fit the prompt budget/);
+  assert.match(result.prompt, /1 more message is waiting/);
+  assert.match(result.prompt, /optional blocker follows the report tool schema/);
+  assert.match(result.prompt, /You cannot query shared knowledge/);
+});
+
+test("mission prompt cuts blocker evidence to the remaining budget, not to the shortest top-level field", () => {
+  const mission = {
+    id: "mission", groupName: "Example", status: "working", deadlineAt: "", maxSubtasks: 8,
+    subtasks: [], decisions: [], dispatchSummary: "", steering: [], objective: "界".repeat(23000),
+  } as unknown as Mission;
+  const teamId = "6f1d6a1e-2b3c-4d5e-8f90-123456789abc";
+  const result = missionPromptWithMessageCount(mission, [], [{
+    type: "subtask-finished", subtaskId: "api", teamId, status: "blocked", teamStatus: "blocked", reason: "The API route is absent.",
+    blocker: { cause: { status: "observed", detail: "界".repeat(1200) }, proposedRecovery: "界".repeat(1200),
+      prevention: "Confirm the upstream interface first.", validationEvidence: [{ sourceRef: "packages/host/src/server.ts", observation: "Route absent." }] },
+  }] as MissionMessage[], 2, "claude", lineup.coordinator, { openChildDecisions: [], waiting: 0 });
+  assert.ok(Buffer.byteLength(result.prompt, "utf8") <= 80 * 1024);
+  assert.equal(result.includedMessageCount, 1);
+  const label = "Messages since your last attempt (JSON): ";
+  const [delivered] = JSON.parse(result.prompt.split("\n").find(line => line.startsWith(label))!.slice(label.length));
+  assert.equal(delivered.blocker.cause.status, "observed");
+  for (const [shortened, original] of [[delivered.blocker.cause.detail, "界".repeat(1200)], [delivered.blocker.proposedRecovery, "界".repeat(1200)]]) {
+    assert.ok(shortened.length > 300 && shortened.length < original.length && original.startsWith(shortened), "each long field keeps a prefix of its text");
+  }
+  assert.equal("prevention" in delivered.blocker, false);
+  assert.equal("validationEvidence" in delivered.blocker, false);
+  assert.match(delivered.truncated, new RegExp(`subteam ${teamId}`));
+});
+
+test("a shortened leading message keeps its follow-up identifiers, and the coordinator's notes are left out with their count", () => {
+  const mission = {
+    id: "mission", groupName: "Example", status: "working", deadlineAt: "", maxSubtasks: 8,
+    subtasks: [], decisions: [], dispatchSummary: "", steering: [], objective: "界".repeat(20000),
+  } as unknown as Mission;
+  const followUpId = "0b0e7c1e-5a2f-4d53-9c1b-6f2a4e8d9b10", dueAt = "2026-11-14T10:00:00.000Z";
+  const result = missionPromptWithMessageCount(mission, [], [
+    { type: "follow-up", followUpId, dueAt, reason: "Look at the staging check again.", check: "界".repeat(12000) },
+  ], 2, "claude", lineup.coordinator, { openChildDecisions: [], waiting: 0,
+    notes: [{ at: "2026-11-14T09:00:00.000Z", text: `First note ${"界".repeat(600)}` }, { at: "2026-11-14T09:10:00.000Z", text: "Second note" }] });
+  assert.ok(Buffer.byteLength(result.prompt, "utf8") <= 80 * 1024);
+  assert.equal(result.includedMessageCount, 1);
+  assert.equal(result.shortened, true);
+  const label = "Messages since your last attempt (JSON): ";
+  const [delivered] = JSON.parse(result.prompt.split("\n").find(line => line.startsWith(label))!.slice(label.length));
+  assert.equal(delivered.followUpId, followUpId);
+  assert.equal(delivered.dueAt, dueAt);
+  assert.ok(delivered.check.length > 0 && delivered.check.length < 12000, "the long field keeps a prefix of its text");
+  assert.match(delivered.truncated, /Shortened by the host to fit the prompt budget/);
+  assert.match(result.prompt, /2 notes from your earlier attempts did not fit in this prompt and were left out\./);
+  assert.doesNotMatch(result.prompt, /First note|Second note/);
+});
+
 test("mission follow-up prompt defers trailing messages when they exceed the byte limit", () => {
   const mission = {
     id: "mission", groupName: "Example", status: "working", deadlineAt: "", maxSubtasks: 8,
@@ -370,6 +439,141 @@ test("mission follow-up prompt defers trailing messages when they exceed the byt
   assert.match(result.prompt, /coordinator attempt 3, continuing the same mission conversation/);
   assert.doesNotMatch(result.prompt, /Repositories in this project|Requested runtime profile/);
   assert.match(result.prompt, new RegExp(String(messages.length - result.includedMessageCount + 2) + " more messages are waiting"));
+});
+
+test("mission blocked reports accept summary-only legacy and bounded structured evidence", () => {
+  const legacy = { kind: "blocked", summary: "The remaining subtask cannot proceed safely." };
+  assert.deepEqual(missionReportSchema.parse(legacy), legacy, "summary-only legacy blocked reports remain valid");
+  const blocker = {
+    cause: { status: "observed", detail: "The required service endpoint is not present." },
+    issueRefs: ["TASK-123"],
+    sourceRefs: ["packages/host/src/server.ts@abc123"],
+    attemptedFixes: [{ fix: "Inspected the current route registration.", outcome: "No matching endpoint exists." }],
+    proposedRecovery: "Dispatch a scoped API subtask before the dependent client work.",
+    prevention: "Verify the upstream interface before dispatching its consumer.",
+    validationEvidence: [{ sourceRef: "packages/host/src/server.ts", observation: "The expected route is absent at the inspected revision." }],
+  };
+  assert.deepEqual(missionReportSchema.parse({ ...legacy, blocker }), { ...legacy, blocker });
+  assert.equal(missionReportSchema.safeParse({ ...legacy, blocker: { ...blocker, issueRefs: Array(9).fill("TASK-123") } }).success, false, "issue references stay bounded");
+  assert.equal(missionReportSchema.safeParse({ ...legacy, blocker: { ...blocker, unexpected: true } }).success, false, "evidence objects are strict");
+});
+
+test("a later mission coordinator attempt receives and durably records blocked subteam evidence", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const mission = await h.create("Repair the API, then update its client.");
+    await h.report(1, { kind: "dispatch", summary: "Start the API work first.", subtasks: [plan("api", "api")] });
+    const started = await until(() => h.get(mission.id), value => Boolean(teamOf(value, "api")));
+    const teamId = teamOf(started, "api")!;
+    const blocker = {
+      cause: { status: "observed", detail: "The required API route is absent." },
+      issueRefs: ["TASK-123"],
+      sourceRefs: ["packages/host/src/server.ts@abc123"],
+      attemptedFixes: [{ fix: "Inspected route registration.", outcome: "No matching route exists." }],
+      proposedRecovery: "Implement the route, then recheck its caller.",
+      prevention: "Confirm the upstream interface before dispatching dependent work.",
+      validationEvidence: [
+        { sourceRef: "packages/host/src/server.ts", observation: "界".repeat(1000) },
+        { sourceRef: "packages/host/src/server.ts", observation: "界".repeat(1000) },
+        { sourceRef: "packages/host/src/server.ts", observation: "界".repeat(1000) },
+      ],
+    };
+    const bytes = Buffer.byteLength(JSON.stringify(blocker), "utf8");
+    assert.ok(bytes > 9 * 1024 && bytes < 12 * 1024, "the fixture is a near-limit blocker that the schema accepts");
+    assert.equal(teamReportSchema.safeParse({ kind: "blocked", summary: "The API route is absent.", blocker }).success, true);
+    h.set(teamId, { status: "blocked", blockCode: "agent-blocked", reason: "The API route is absent.",
+      members: [{ memberId: "blocked-member", revision: 1, role: "implementer", status: "stopped", report: { kind: "blocked", summary: "The API route is absent.", blocker } }] as unknown as TeamView["members"] });
+    const messages = await h.messages(2);
+    assert.ok(messages.some((message: MissionMessage) => message.type === "subtask-finished" && JSON.stringify(message.blocker) === JSON.stringify(blocker)),
+      "the subteam-finished message carries the structured evidence to the next coordinator attempt");
+    const stored = await waitFor(async () => h.stored(mission.id), record => record.attempts.length >= 2, 5000);
+    const prompt = stored.attempts.at(-1)!.prompt;
+    assert.ok(prompt.includes("Messages since your last attempt"), "the evidence arrives through the normal inbox");
+    assert.ok(prompt.includes(JSON.stringify(blocker)), "the durable attempt prompt retains the blocker evidence");
+  } finally { h.close(); }
+});
+
+test("a large mission consumes a shortened blocked subteam message exactly once", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const mission = await h.create("界".repeat(23000));
+    await h.report(1, { kind: "dispatch", summary: "Start the API work first.", subtasks: [plan("api", "api")] });
+    const started = await until(() => h.get(mission.id), value => Boolean(teamOf(value, "api")));
+    const teamId = teamOf(started, "api")!;
+    const blocker = {
+      cause: { status: "observed", detail: "The required API route is absent." },
+      issueRefs: ["TASK-123"],
+      sourceRefs: ["packages/host/src/server.ts@abc123"],
+      attemptedFixes: [{ fix: "Inspected route registration.", outcome: "No matching route exists." }],
+      proposedRecovery: "Implement the route, then recheck its caller.",
+      prevention: "Confirm the upstream interface before dispatching dependent work.",
+      validationEvidence: [
+        { sourceRef: "packages/host/src/server.ts", observation: "界".repeat(1000) },
+        { sourceRef: "packages/host/src/server.ts", observation: "界".repeat(1000) },
+        { sourceRef: "packages/host/src/server.ts", observation: "界".repeat(1000) },
+      ],
+    };
+    const bytes = Buffer.byteLength(JSON.stringify(blocker), "utf8");
+    assert.ok(bytes > 9 * 1024 && bytes < 12 * 1024, "the fixture is a near-limit blocker that the schema accepts");
+    assert.equal(teamReportSchema.safeParse({ kind: "blocked", summary: "The API route is absent.", blocker }).success, true);
+    h.set(teamId, { status: "blocked", blockCode: "agent-blocked", reason: "The API route is absent.",
+      members: [{ memberId: "blocked-member", revision: 1, role: "implementer", status: "stopped", report: { kind: "blocked", summary: "The API route is absent.", blocker } }] as unknown as TeamView["members"] });
+    const messages = await h.messages(2);
+    const attempt = await h.attempt(2);
+    assert.ok(Buffer.byteLength(attempt.prompt, "utf8") <= 80 * 1024);
+    assert.equal(messages.length, 1);
+    const delivered = messages[0] as MissionMessage;
+    assert.equal(delivered.type, "subtask-finished");
+    assert.match(delivered.truncated ?? "", new RegExp(`subteam ${teamId}.*\\.git/infinite-team-context\\.json`));
+    assert.deepEqual(delivered.blocker?.cause, blocker.cause);
+    assert.equal(delivered.blocker?.proposedRecovery, blocker.proposedRecovery);
+    assert.equal(delivered.blocker && "validationEvidence" in delivered.blocker, false);
+    const stored = await waitFor(async () => h.stored(mission.id), record => record.attempts.length >= 2, 5000);
+    assert.equal(stored.attempts.at(-1)!.consumedInbox.length, 1);
+    assert.deepEqual(stored.attempts.at(-1)!.consumedInbox[0].blocker, blocker, "the prompt projection does not replace the full stored message");
+    assert.equal(stored.inbox.length, 0, "the shortened message is consumed from the inbox");
+    await h.report(2, { kind: "steer-subtask", subtaskId: "api", text: "Continue after reviewing the blocker." });
+    await waitFor(async () => h.steers.length, count => count === 1, 10000);
+    h.set(teamId, { status: "ready-for-review" });
+    assert.equal((await h.messages(3)).filter((message: MissionMessage) => message.type === "subtask-finished" && message.blocker).length, 0,
+      "the consumed blocked evidence is not delivered again");
+  } finally { h.close(); }
+});
+
+test("mission blocker handoff attaches evidence only to the one current agent block that explains the team", { timeout: 60000 }, async () => {
+  const evidence = {
+    cause: { status: "observed", detail: "An older API failure." }, issueRefs: ["TASK-123"], sourceRefs: ["src/api.ts"],
+    proposedRecovery: "Recheck the current API state.", prevention: "Verify the current report revision.",
+    validationEvidence: [{ sourceRef: "src/api.ts", observation: "The old route was absent." }],
+  };
+  const cases = [
+    { name: "a later summary-only blocker", revision: 2, blockCode: "agent-blocked", reason: "The current API route is absent.", members: [
+      { memberId: "old", revision: 1, role: "implementer", status: "stopped", report: { kind: "blocked", summary: "The old API route is absent.", blocker: evidence } },
+      { memberId: "current", revision: 2, role: "implementer", status: "stopped", report: { kind: "blocked", summary: "The current API route is absent." } },
+    ] },
+    { name: "ambiguous current blocked reports", revision: 2, blockCode: "agent-blocked", reason: "The current API route is absent.", members: [
+      { memberId: "current-with-evidence", revision: 2, role: "implementer", status: "stopped", report: { kind: "blocked", summary: "The current API route is absent.", blocker: evidence } },
+      { memberId: "current-legacy", revision: 2, role: "implementer", status: "stopped", report: { kind: "blocked", summary: "The current API route is absent." } },
+    ] },
+    { name: "a host-generated block", revision: 2, blockCode: "team-decision-limit", reason: "The team reached its decision limit.", members: [
+      { memberId: "old", revision: 1, role: "implementer", status: "stopped", report: { kind: "blocked", summary: "The old API route is absent.", blocker: evidence } },
+    ] },
+  ];
+  for (const scenario of cases) {
+    const h = scripted();
+    try {
+      const mission = await h.create("Repair the API.");
+      await h.report(1, { kind: "dispatch", summary: "Start API work.", subtasks: [plan("api", "api")] });
+      const started = await until(() => h.get(mission.id), value => Boolean(teamOf(value, "api")));
+      h.set(teamOf(started, "api")!, { revision: scenario.revision, status: "blocked", blockCode: scenario.blockCode, reason: scenario.reason,
+        members: scenario.members as unknown as TeamView["members"] });
+      const messages = await h.messages(2);
+      const finished = messages.find((message: MissionMessage) => message.type === "subtask-finished");
+      assert.ok(finished, `${scenario.name} still wakes the coordinator`);
+      assert.equal(finished.blocker, undefined, `${scenario.name} carries no structured evidence`);
+      assert.equal(JSON.stringify(messages).includes(JSON.stringify(evidence)), false, `${scenario.name} does not carry stale structured evidence`);
+    } finally { h.close(); }
+  }
 });
 
 test("a mission pins a team-ready alternate checkout when its primary checkout is not configured", async () => {
@@ -689,9 +893,9 @@ test("permission recovery wakes the mission once with bounded observations and p
 });
 
 for (const scenario of [
-  { name: "a large mission delivers a compact recovery outcome", objectiveLength: 23800, summary: "One API change", held: false },
-  // The summary sets the base prompt between the compact message's size and the waiting sentence's below 80 KiB; retune it when coordinator instructions grow.
-  { name: "a full mission holds recovery evidence without empty attempts or child cancellation", objectiveLength: 24000, summary: "S".repeat(50), held: true },
+  // The objective sets the base prompt so that the whole recovery message does not fit under 80 KiB and its compact form does; retune it when coordinator instructions grow.
+  { name: "a large mission delivers a compact recovery outcome", objectiveLength: 23400, summary: "One API change", held: false },
+  { name: "a full mission blocks and cancels its subteam when recovery evidence cannot fit", objectiveLength: 24000, summary: "S".repeat(900), held: true },
 ]) test(scenario.name, { timeout: 30000 }, async () => {
   const h = scripted();
   try {
@@ -703,19 +907,19 @@ for (const scenario of [
       status: "exhausted", cause: "界".repeat(400), action: "界".repeat(400), decision: "界".repeat(400),
       consequence: "界".repeat(400), execution: "unknown", at: new Date().toISOString() }] } });
     if (scenario.held) {
-      await until(() => h.get(id), mission => /evidence remains queued/.test(mission.reason ?? ""), 10000);
-      await new Promise(resolve => setTimeout(resolve, 1100));
-      assert.equal(h.get(id).status, "working");
+      const blocked = await until(() => h.get(id), mission => mission.status === "blocked", 10000);
+      assert.equal(blocked.reason, "The next coordinator message cannot fit with the mission state, even shortened. No empty coordinator attempt was started; start a new mission with a consolidated objective.");
       assert.equal(h.attempts(), 1, "An undeliverable notification must not spend coordinator attempts");
-      assert.equal(h.get(id).events.filter(event => /evidence remains queued/.test(event.text)).length, 1);
+      assert.equal(blocked.events.filter(event => event.text === blocked.reason).length, 1);
+      await waitFor(async () => h.runs.get(teamId)!.status, status => status === "cancelled", 10000);
     } else {
       const messages = await h.messages(2);
       assert.equal(messages.length, 1);
       assert.equal(messages[0].outcomeId, outcomeId);
       assert.equal(messages[0].cause, "See the subteam permissionRecovery outcome.");
       assert.equal(h.attempts(), 2);
+      assert.equal(h.runs.get(teamId)!.status, "implementing");
     }
-    assert.equal(h.runs.get(teamId)!.status, "implementing");
   } finally { h.close(); }
 });
 

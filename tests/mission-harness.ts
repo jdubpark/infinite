@@ -11,6 +11,7 @@ import { MissionService, type ProjectGroupLookup } from "../packages/host/src/mi
 import type { Config } from "../packages/host/src/types.js";
 import type { CreateTeam, NativeContinuation, TeamAssignment, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
 import type { CreateMission, MissionReport } from "../packages/host/src/mission-types.js";
+import type { MissionMessage } from "../packages/host/src/team-prompts.js";
 import { emptyRollup, type UsageRollup } from "../packages/host/src/team-usage.js";
 import { applySignal, initialAttention, screenDecision, type Attention, type Signal, type SignalEvent } from "@infinite/attention";
 
@@ -89,6 +90,7 @@ export function missionHarness(options?: { configure?: (config: Config) => void;
 }
 
 type FakeRun = { id: string; projectId: string; missionId: string; status: TeamView["status"]; revision: number; updatedAt: string; parallelism?: number; parallelismCeiling?: number;
+  blockCode?: string; reason?: string; members?: TeamView["members"];
   usage?: UsageRollup; workspaceRemovedAt?: string;
   recovery?: { attempts: number; status: "stopping" | "planning" | "exhausted"; source: { code: string; memberId: string; revision: number; reportKind?: string; reason: string; at: string } };
   decisions: { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string }[] };
@@ -288,6 +290,7 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
         modelSource: "requested", completedAt: at, tokens: { input: contextTokens, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, reportedCost: 0, ...(secondary ? { secondary: true } : {}) } });
       usage.set(sessionId, journal);
     },
+    stored: (id: string) => unseal<{ attempts: { prompt: string; consumedInbox: MissionMessage[] }[]; inbox: MissionMessage[]; refusals: number }>(key, "mission:" + id, readFileSync(join(config.stateDir, "missions", id + ".sealed"), "utf8")),
     messages: async (n: number) => parse((await attempt(n)).prompt, "Messages since your last attempt (JSON): "),
     state: async (n: number) => parse((await attempt(n)).prompt, "Mission state (JSON): "),
     /** The attempt files this report, with the optional note beside it as the mission report tool sends it. */

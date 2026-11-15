@@ -152,7 +152,7 @@ The coordinator reports through its mission report tool:
 | `resize-subtask` | Selects worker capacity with `subtaskId`, `parallelism` (1–4), and `summary`. Updates a queued subtask or durably forwards the change to its active subteam. A solo subtask permits only one worker. Lowering capacity lets running workers finish and holds new starts. |
 | `cancel-subtask` | Cancels that subtask's subteam. A subtask that never started is cancelled at once, and the coordinator is told in its next attempt. A cancelled subteam is deleted with its workspace after every member settles; the mission keeps the cancelled status and final reason, and the coordinator is asked to decide whether a replacement subtask is needed. |
 | `result` | Accepted only when every subtask is `done` or `cancelled`, at least one is `done`, and no owner decision is open. A `blocked` subtask, or a queued one whose dependency ended `blocked` or `cancelled`, must be cancelled explicitly first. Moves the mission to `ready-for-review`. |
-| `blocked` | Moves the mission to `blocked` with the summary as its reason. |
+| `blocked` | Moves the mission to `blocked` with the summary as its reason. It may carry an optional `blocker` object, stored as agent-reported evidence. A summary-only block stays valid. |
 | `wait` | Ends the attempt without a decision. Refused while a subteam decision is open that the coordinator has neither answered nor escalated. Otherwise accepted only while something else will start a later attempt: a message that arrived during the attempt and already waits for the next one (such as a follow-up that fired while the attempt ran), an open owner decision, a subteam that is not paused, a queued subtask that can start without anyone acting, or an open follow-up. A queued subtask whose repository any paused or blocked run holds does not count, since that run keeps the repository reserved after the others finish. |
 | `follow-up` | Ends the attempt like `wait` and asks the host to start another at a set time, with `inMinutes` (5–10,080), `reason` (up to 500 characters), and `check` (up to 1,000 characters). Accepted even when nothing else would start an attempt. Refused when five follow-ups are already open, when the time falls at or after the mission deadline, or under the same open subteam decision rule as `wait`. |
 
@@ -173,6 +173,14 @@ files before it confirms its exit, including across a host restart, is applied
 as usual and is not counted as missing. The next attempt starts with a
 refusal that says so, together with every message that arrived meanwhile.
 Three missed or refused reports in a row block the mission.
+
+Shared knowledge: the mission coordinator cannot query shared knowledge itself.
+It asks a subteam to search that repository's configured knowledge scope with
+the task and blocker keywords, and treats what comes back as a candidate
+lesson. A candidate lesson needs source or check evidence and review by a
+different strong reviewer through the configured single-writer workflow. Lessons
+stay advisory: they never grant permissions, mark work resolved, weaken checks,
+or publish themselves.
 
 After the first attempt, the coordinator resumes its confirmed conversation
 and receives only the current mission state and new messages. The first attempt
@@ -229,11 +237,34 @@ they are not reported as agent completion.
 
 Escalation: when a subteam opens a decision or becomes blocked, the host sends
 the coordinator a message naming the subtask, the decision ID, and the question
-or reason. Each coordinator attempt receives at most 30 messages; the rest wait
-for the next attempt. Every open subteam decision is also listed in each
-attempt's mission state, read from the subteams, so none depends on a message. Only the coordinator's `question` report reaches the owner. Provider
-permission prompts are unaffected and keep their existing owner or delegated
-coordinator path per repository.
+or reason. A blocked subteam's `subtask-finished` message carries its `blocker`
+only when exactly one `agent-blocked` member report of the current revision has
+a summary equal to the subteam's blocking reason. Summary-only, ambiguous,
+superseded, and host-generated blocks carry none. A blocker object is limited
+to 12 KiB of UTF-8 JSON and rejects unknown fields. It is agent-reported
+evidence: the host does not verify the cause, resolve the blocker, or publish a
+lesson. Each coordinator attempt receives at most 30 messages; the rest wait for
+the next attempt. Every open subteam decision is also listed in each attempt's
+mission state, read from the subteams, so none depends on a message. Only the
+coordinator's `question` report reaches the owner. Provider permission prompts
+are unaffected and keep their existing owner or delegated coordinator path per
+repository.
+
+Prompt budget: each coordinator attempt includes the longest run of waiting
+messages that fits the 80 KiB prompt and the 30-message cap. If even the first
+message does not fit, the host shortens it for that prompt only, in this order:
+permission-recovery outcomes use their compact form, blocker evidence keeps
+only `cause` and `proposedRecovery`, long text is cut, and finally only
+identifiers remain. A follow-up message keeps its `followUpId` and `dueAt` in
+every form. A shortened message carries a `truncated` marker saying
+where the full record stays: the subteam's run, which its members read in
+`.git/infinite-team-context.json`, or the mission's attempt history. It is
+delivered once and counted as consumed. The host never starts an attempt with
+zero messages while messages wait. If even the identifiers-only form cannot
+fit, the mission becomes `blocked` with the reason "The next coordinator
+message cannot fit with the mission state, even shortened. No empty
+coordinator attempt was started; start a new mission with a consolidated
+objective." Like any mission block, this cancels its subteams.
 
 A run outside the mission that holds a repository changes state without
 reaching the mission. When a ready subtask's repository is held only by paused
@@ -336,8 +367,11 @@ that names the rule.
 Notes take only the prompt room left after the full prompt and its leading
 pending message, within the 80 KiB prompt limit. The host keeps the newest
 notes that fit and says how many older ones it left out; with no room, it
-leaves every note out. Notes therefore never hold a message back or make the
-prompt too large.
+leaves every note out. When the leading message has to be shortened, the
+message takes the room: every note is left out and the prompt states only
+their count, and it drops that sentence too if the shortened message would
+not fit beside it. Notes therefore never hold a message back, cost it its
+text, or make the prompt too large.
 
 A rotation retires every older conversation. The host resumes only a
 conversation from the rotation on that a confirmed native session ID names. If

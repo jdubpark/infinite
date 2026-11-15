@@ -63,6 +63,7 @@ const schema = z
       apiKeyFile: z.string().refine(isAbsolute, "Jev key file must be absolute"),
       model: z.string().min(1).max(100).default("jev-latest"),
       baseUrl: z.url().default("https://api.typesafe.ai"),
+      sessionReadings: z.boolean().default(true),
     }).strict().optional(),
     // Optional cleanup for platform-generated speech transcripts. The key is read once at startup.
     dictation: z.object({
@@ -195,6 +196,9 @@ export function validateIntakeConfig(config: Config): void {
   const slack = intake.slack;
   // Without admission and without direct requests nothing could ever start a mission.
   if (intake.linear.admitIssues === false && !slack?.directRequests) throw new Error("admitIssues false needs intake.slack.directRequests");
+  if (slack?.answerQuestions && !slack.directRequests) throw new Error("answerQuestions needs intake.slack.directRequests");
+  if (slack?.classify && !slack.answerQuestions) throw new Error("classify needs intake.slack.answerQuestions");
+  if (slack?.classify && !config.jev) throw new Error("classify needs the jev block");
   if (slack) {
     if (intake.requireSlackThread && intake.linear.admitIssues !== false && !slack.linearAgentUserId) throw new Error("requireSlackThread needs intake.slack.linearAgentUserId");
     if (slack.bindByMention && intake.requireSlackThread) throw new Error("bindByMention cannot be used with requireSlackThread");

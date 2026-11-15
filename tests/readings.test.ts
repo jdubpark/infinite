@@ -367,3 +367,74 @@ test("weak rule-line gate admits weak presentation and rejects clear rule-based 
   assert.equal(isWeakRuleLine(`Changes made.\n${clear}`), true, "a filler summary lead-in has a weak rule line");
   assert.equal(isWeakRuleLine(clipped), true, "a first sentence longer than the display cap has a weak rule line");
 });
+
+test("requestRoute returns the chosen route with its confidence and sends only the clipped text", async () => {
+  const calls: any[] = [];
+  const transport = { systemOne: async (request: any) => { calls.push(request); return { model: "jev-latest", answers: { route: { type: "choice", choice: "work", confidence: 0.8, probabilities: {} } } }; } } as unknown as JevTransport;
+  const f = setup({ transport });
+  try {
+    assert.deepEqual(await f.readings.requestRoute("x".repeat(1500)), { route: "work", confidence: 0.8 });
+    assert.deepEqual(calls[0].state, { request: "x".repeat(1000) });
+    assert.deepEqual(Object.keys(calls[0].questions.route.criteria), ["answer", "work"]);
+  } finally { f.dispose(); }
+});
+
+test("requestRoute is undefined without jev, on a transport error, and on an unknown choice", async () => {
+  const failing = { systemOne: async () => { throw new Error("down"); } } as unknown as JevTransport;
+  const odd = { systemOne: async () => ({ model: "m", answers: { route: { type: "choice", choice: "other", confidence: 0.9, probabilities: {} } } }) } as unknown as JevTransport;
+  let calls = 0;
+  const working = { systemOne: async () => { calls++; return { model: "m", answers: { route: { type: "choice", choice: "work", confidence: 0.9, probabilities: {} } } }; } } as unknown as JevTransport;
+  const a = setup({ transport: failing }), b = setup({ transport: odd }), c = setup({ transport: working });
+  try {
+    assert.equal(await a.readings.requestRoute("what is this?"), undefined);
+    assert.equal(await b.readings.requestRoute("what is this?"), undefined);
+    delete (c.config as any).jev;
+    assert.equal(await c.readings.requestRoute("what is this?"), undefined);
+    assert.equal(calls, 0);
+  } finally { a.dispose(); b.dispose(); c.dispose(); }
+});
+
+test("sessionReadings false sends no session text to the reading service", async () => {
+  const fake = responding({});
+  const f = setup({ title: "", generatedTitle: true, prompt: longLine, transport: fake.transport });
+  try {
+    (f.config.jev as any).sessionReadings = false;
+    const readings = new Readings(f.config, f.key, f.manager, { titleFromPrompt: async () => ({ text: "Importer branch", model: "m" }) } as any, fake.transport);
+    await readings.tick();
+    const merged = readings.merge([f.row]);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const again = readings.merge([f.row]);
+    assert.equal(fake.calls.length, 0);
+    assert.equal(merged[0].reading?.now, undefined);
+    assert.equal(again[0].reading?.now, undefined);
+    assert.equal((await readings.requestTitle(longLine))?.text, "Importer branch");
+    assert.equal(fake.calls.length, 0, "requestTitle goes straight to the writer");
+  } finally { f.dispose(); }
+});
+
+test("sessionReadings false still reads the intake route", async () => {
+  const calls: any[] = [];
+  const transport = { systemOne: async (request: any) => { calls.push(request); return { model: "jev-latest", answers: { route: { type: "choice", choice: "answer", confidence: 0.9, probabilities: {} } } }; } } as unknown as JevTransport;
+  const f = setup({ transport });
+  try {
+    (f.config.jev as any).sessionReadings = false;
+    assert.deepEqual(await f.readings.requestRoute("How does the importer pick a branch?"), { route: "answer", confidence: 0.9 });
+    assert.equal(calls.length, 1);
+    assert.deepEqual(Object.keys(calls[0].state), ["request"]);
+  } finally { f.dispose(); }
+});
+
+test("sessionReadings false starts no timer", async () => {
+  const f = setup({ transport: responding({}).transport });
+  try {
+    (f.config.jev as any).sessionReadings = false;
+    let listCalls = 0, intervalCalls = 0;
+    f.manager.list = async () => { listCalls++; return [f.row]; };
+    const original = globalThis.setInterval;
+    globalThis.setInterval = ((...args: Parameters<typeof setInterval>) => { intervalCalls++; return original(...args); }) as typeof setInterval;
+    try { f.readings.start(); await new Promise(resolve => setTimeout(resolve, 30)); }
+    finally { globalThis.setInterval = original; f.readings.stop(); }
+    assert.equal(intervalCalls, 0);
+    assert.equal(listCalls, 0);
+  } finally { f.dispose(); }
+});

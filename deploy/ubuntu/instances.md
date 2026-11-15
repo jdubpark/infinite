@@ -178,7 +178,10 @@ Install the rendered `transcript-drain.sh` as
 `/usr/local/libexec/infinite-NAME/transcript-drain`, owned `root:root` with
 mode `0755`, beside the provider wrappers; it is the path the rendered sudoers
 permits, and without it the instance's sudo sessions report
-`finalDrain: "skipped"`.
+`finalDrain: "skipped"`. Install the rendered `process-census.sh` the same way as
+`/usr/local/libexec/infinite-NAME/process-census`, owned `root:root` with mode
+`0755`; the rendered sudoers permits it, and without it the instance cannot
+check for processes left by an earlier API process.
 
 The rendered sudoers permits no `jevcode` or `repository-graph` wrapper,
 because the tracked ones name the first instance's paths. The instance runs
@@ -207,6 +210,8 @@ for provider in claude codex grok opencode; do
 done
 sudo install -o root -g root -m 0755 ".local/instance-$NAME/transcript-drain.sh" \
   "/usr/local/libexec/infinite-$NAME/transcript-drain"
+sudo install -o root -g root -m 0755 ".local/instance-$NAME/process-census.sh" \
+  "/usr/local/libexec/infinite-$NAME/process-census"
 sudo sh ".local/instance-$NAME/install-agent-env.sh"
 sudo systemctl daemon-reload
 sudo systemd-tmpfiles --create "/etc/tmpfiles.d/infinite-$NAME.conf"
@@ -528,6 +533,15 @@ Linear's Slack agent (pre-build check 1) is then optional for direct requests.
 Until that attribution check has passed, set `intake.linear.admitIssues` to
 `false`, so that only the owner's direct requests start work and no issue filed
 through Linear's Slack agent is admitted.
+
+Questions need no new scope either. Set `intake.slack.answerQuestions` to `true`
+(it needs `directRequests`) to let a mention that asks a question, or starts with
+`ask:`, be answered read-only in the thread with no Linear issue; a mention that
+starts with `work:` always files a request. Set `intake.slack.classify` to `true`
+(it needs `answerQuestions` and the top-level `jev` block) to let the reading
+service choose when the mention has neither word; the owner's mention text, cut to
+1,000 characters, is sent to it. To use the reading service for this route only, set `jev.sessionReadings` to `false`. Both default to `false`. See
+[intake](../../docs/intake.md#questions).
 
 Configure external connectors as MCP servers in the instance agent account,
 with read scopes only. A delegated permission request may add read-only

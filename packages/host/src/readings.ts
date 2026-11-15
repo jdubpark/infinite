@@ -5,6 +5,7 @@ import { choice, noul } from "@typesafe-ai/sdk";
 import type { Questions, RequestOptions, SystemOneRequest, SystemOneResult, TypeSafeClient } from "@typesafe-ai/sdk";
 import { firstSentence } from "@infinite/attention";
 import type { Attention, Provider } from "@infinite/attention";
+import { ROUTE_INPUT_LIMIT, type RouteReading } from "./intake-route.js";
 import type { Summarizer } from "./summary.js";
 import type { Manager } from "./manager.js";
 import type { Config, Session } from "./types.js";
@@ -120,8 +121,10 @@ export class Readings {
     }
     this.restore();
   }
+  /** True when the reading service may see session text; false leaves it to the intake route reading. */
+  private get sessionJev(): boolean { return Boolean(this.config.jev && this.config.jev.sessionReadings !== false); }
   start() {
-    if (!this.config.jev) return;
+    if (!this.sessionJev) return;
     void this.tick();
     this.timer = setInterval(() => void this.tick(), 2000);
     this.timer.unref();
@@ -151,16 +154,16 @@ export class Readings {
           reading.title = value?.title ?? fallback;
         }
       } catch { /* Native cmux rows have no Infinite metadata. */ }
-      if (this.config.jev) this.queueTurnReading(row);
+      if (this.sessionJev) this.queueTurnReading(row);
       return Object.keys(reading).length ? { ...row, reading } : row;
     });
-    if (this.config.jev) this.drain();
+    if (this.sessionJev) this.drain();
     return merged;
   }
 
   /** Captures session inputs and queues gated work. Repeated polls deduplicate pending calls. */
   async tick() {
-    if (!this.config.jev) return;
+    if (!this.sessionJev) return;
     const revision = this.observationRevision;
     let rows: ReadingRow[];
     try { rows = await this.manager.list({ includeFullMessage: true }) as ReadingRow[]; } catch { return; }
@@ -216,7 +219,7 @@ export class Readings {
   }
 
   private queueTitleReading(row: ReadingRow, session: Session) {
-    if (!this.config.jev || !this.writer || !defaultTitle(session.title, session.provider, session.generatedTitle)) return;
+    if (!this.sessionJev || !this.writer || !defaultTitle(session.title, session.provider, session.generatedTitle)) return;
     const prompt = session.initialPrompt ?? "";
     if (!prompt) return;
     const line = firstLine(prompt);
@@ -269,7 +272,7 @@ export class Readings {
       return row.lastMessageHash === job.hash && row.state === "turn-finished" && row.lastMessageLength > 200;
     }
     const session = this.latestSessions.get(job.sessionId);
-    return Boolean(this.writer && this.config.jev && session?.defaultTitle && row.backend !== "cmux" &&
+    return Boolean(this.writer && this.sessionJev && session?.defaultTitle && row.backend !== "cmux" &&
       session.promptLineLength > 60 && session.promptHash === job.hash);
   }
 
@@ -321,7 +324,7 @@ export class Readings {
   async requestTitle(prompt: string): Promise<{ text: string; model?: string } | undefined> {
     if (!this.writer || firstLine(prompt).length <= 60) return undefined;
     const input = titleInput(prompt), clipped = clipTitle(firstLine(input));
-    if (this.config.jev) {
+    if (this.sessionJev) {
       const result = await this.ask({
         state: { clipped },
         questions: { clear: noul("Is `clipped` a clear title for the requested work?", { true: "The clipped first line clearly identifies the requested work.", false: "The clipped first line is not a clear title." }) },
@@ -333,6 +336,27 @@ export class Readings {
     const title = await this.writer.titleFromPrompt(input);
     const text = title.text.trim().slice(0, 100);
     return text ? { text, model: title.model } : undefined;
+  }
+  /**
+   * Whether an owner's request asks a question (answer) or for a change (work), with the reading's confidence in
+   * that choice. Sends only the request text, cut to ROUTE_INPUT_LIMIT. Never throws: any failure is undefined.
+   */
+  async requestRoute(text: string): Promise<RouteReading | undefined> {
+    if (!this.config.jev) return undefined;
+    try {
+      const result = await this.ask({
+        state: { request: text.slice(0, ROUTE_INPUT_LIMIT) },
+        questions: { route: choice("Choose what `request` asks for.", {
+          answer: "A question, explanation, investigation, review or status request that reading code and documents can satisfy. Nothing needs to change.",
+          work: "A request to change, fix, add, remove, build, write, update, migrate or deploy something. It needs a tracked issue.",
+        }) },
+      }, () => true);
+      const answer = result?.answers.route;
+      if (answer?.type !== "choice" || (answer.choice !== "answer" && answer.choice !== "work")) return undefined;
+      const confidence = Number(answer.confidence);
+      if (!Number.isFinite(confidence)) return undefined;
+      return { route: answer.choice, confidence: Math.min(1, Math.max(0, confidence)) };
+    } catch { return undefined; }
   }
   private async ask(request: Omit<SystemOneRequest<Questions>, "model">, stillCurrent: () => boolean) {
     const client = this.transport ?? await this.createTransport();

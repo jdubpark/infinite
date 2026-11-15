@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { TeamLineup, TeamStatus } from "./team-types.js";
+import { blockerEvidenceSchema, type TeamLineup, type TeamStatus } from "./team-types.js";
 import type { UsageRollup } from "./team-usage.js";
 import { projectGroupIdSchema } from "./project-group-types.js";
 
@@ -15,6 +15,8 @@ export const createMissionSchema = z.object({
   maxMinutes: z.number().int().min(5).max(1440).default(240),
   /** Host project ids that override the primary checkout of their repository for this mission. */
   checkouts: z.array(z.string().regex(/^[a-z0-9-]{1,80}$/)).max(64).optional(),
+  /** `answer` makes the mission read-only: the coordinator reports an answer and starts no subtasks. Absent means a work mission. */
+  mode: z.literal("answer").optional(),
 }).strict();
 export type CreateMission = z.infer<typeof createMissionSchema>;
 export const missionActionSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict();
@@ -44,7 +46,7 @@ export const missionReportSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("steer-subtask"), subtaskId, text: z.string().trim().min(1).max(8000) }).strict(),
   z.object({ kind: z.literal("question"), question: z.string().trim().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]), subtaskId: subtaskId.optional(), childDecisionId: z.uuid().optional() }).strict(),
   z.object({ kind: z.literal("result"), summary: z.string().trim().min(1).max(8000) }).strict(),
-  z.object({ kind: z.literal("blocked"), summary: z.string().trim().min(1).max(4000) }).strict(),
+  z.object({ kind: z.literal("blocked"), summary: z.string().trim().min(1).max(4000), blocker: blockerEvidenceSchema.optional() }).strict(),
   /** Ends the attempt without a decision; the next subteam event or owner input starts another. */
   z.object({ kind: z.literal("wait"), summary: z.string().trim().min(1).max(2000) }).strict(),
 ]);
@@ -80,6 +82,8 @@ export interface Mission {
   groupId: string;
   /** Set when an intake rule created the mission from a Linear issue. */
   origin?: MissionOrigin;
+  /** `answer` when the coordinator may only read and report an answer; absent for a work mission. */
+  mode?: "answer";
   /** Group name and repositories pinned at creation; later group edits do not change a running mission. */
   groupName: string;
   repoProjectIds: string[];

@@ -9,7 +9,7 @@ import { BASELINE_FILE, readBaseline } from "../packages/host/src/fuse/baseline.
 import { FuseService } from "../packages/host/src/fuse/service.js";
 import type { FuseGate } from "../packages/host/src/fuse/types.js";
 import { GoalService } from "../packages/host/src/goals.js";
-import { HALT_FILE, MAX_RECEIPTS, writeHaltRecord } from "../packages/host/src/halt/record.js";
+import { HALT_FILE, MAX_RECEIPTS, haltChain, writeHaltRecord } from "../packages/host/src/halt/record.js";
 import { KEPT_PAUSED, type HaltTargets } from "../packages/host/src/halt/rules.js";
 import { RoutineService } from "../packages/host/src/routines.js";
 import { HaltService } from "../packages/host/src/halt/service.js";
@@ -264,33 +264,31 @@ test("a halt survives a restart, finishes an interrupted pass, and fails closed 
   } finally { f.close(); }
 });
 
-test("the halt count keeps every engaged halt after its release and after its receipt is dropped, and a restart reads it", async () => {
+test("the halt count and chain keep every engaged halt after its release and after its receipt is dropped, and a restart reads them", async () => {
   const f = schedulerFixture();
   const halt = new HaltService({ config: f.config, key: f.key });
   try {
-    assert.deepEqual(halt.engagements(), { count: 0, halts: [] });
+    assert.deepEqual(halt.engagements(), { count: 0, chain: "", halts: [] });
     const project = await halt.engage(fixtureScope, { requestId: randomUUID() }, owner);
     const host = await halt.engage(hostScope, { requestId: randomUUID() }, owner);
     await halt.engage(hostScope, { requestId: randomUUID() }, owner);
     const projectId = project.halt.projects[0]!.haltId, hostId = host.halt.host!.haltId;
-    const generation = halt.engagements()!.generation!;
-    assert.match(generation, /^[0-9a-f-]{36}$/, "the record's first write gives it its generation");
-    assert.deepEqual(halt.engagements(), { generation, count: 2, halts: [{ haltId: projectId, projectId: "fixture", serial: 1 }, { haltId: hostId, serial: 2 }] },
+    const chain = haltChain(haltChain("", projectId), hostId);
+    assert.deepEqual(halt.engagements(), { count: 2, chain, halts: [{ haltId: projectId, projectId: "fixture", serial: 1 }, { haltId: hostId, serial: 2 }] },
       "an engage that found the scope halted counts nothing");
     await halt.release(fixtureScope, { requestId: randomUUID() }, owner);
     await halt.release(hostScope, { requestId: randomUUID() }, owner);
     // Accepted requests that change nothing push the engaging receipts out of the record; the count stays.
     for (let index = 0; index < MAX_RECEIPTS; index++) await halt.release(hostScope, { requestId: randomUUID() }, owner);
-    assert.deepEqual(halt.engagements(), { generation, count: 2, halts: [] });
+    assert.deepEqual(halt.engagements(), { count: 2, chain, halts: [] });
     halt.stop();
-    assert.deepEqual(new HaltService({ config: f.config, key: f.key }).engagements(), { generation, count: 2, halts: [] });
-    // A removed record starts again from zero under a new generation.
+    assert.deepEqual(new HaltService({ config: f.config, key: f.key }).engagements(), { count: 2, chain, halts: [] });
+    // A removed record starts again from none.
     rmSync(join(f.config.stateDir, HALT_FILE));
     const fresh = new HaltService({ config: f.config, key: f.key });
-    assert.deepEqual(fresh.engagements(), { count: 0, halts: [] });
-    await fresh.engage(fixtureScope, { requestId: randomUUID() }, owner);
-    assert.equal(fresh.engagements()!.count, 1);
-    assert.notEqual(fresh.engagements()!.generation, generation);
+    assert.deepEqual(fresh.engagements(), { count: 0, chain: "", halts: [] });
+    const again = await fresh.engage(fixtureScope, { requestId: randomUUID() }, owner);
+    assert.deepEqual(fresh.engagements(), { count: 1, chain: haltChain("", again.halt.projects[0]!.haltId), halts: [{ haltId: again.halt.projects[0]!.haltId, projectId: "fixture", serial: 1 }] });
     fresh.stop();
   } finally { halt.stop(); f.close(); }
 });

@@ -16,6 +16,19 @@ export function missionLeftLabel(milliseconds: number): string {
   return minutes + " min";
 }
 
+export function missionStopLine(
+  mission: MissionState & { deadlineAt: string; clockStoppedAt?: string },
+  now: number,
+  formatDate: (deadlineAt: string) => string,
+): string | undefined {
+  if (missionStoppedAtLimit(mission)) return "Stopped at its time limit. Its work is kept. Extend to continue, or cancel.";
+  if (mission.status === "cancelled" || mission.status === "ready-for-review" || mission.status === "blocked") return undefined;
+  const timeLeft = missionTimeLeftMs(mission, now);
+  if (timeLeft <= 0) return "Its time limit has passed. Extend to continue.";
+  if (mission.clockStoppedAt !== undefined) return "Clock stopped while it waits · " + missionLeftLabel(timeLeft) + " left";
+  return "Stops " + formatDate(mission.deadlineAt);
+}
+
 export function missionStoppedAtLimit(mission: MissionState): boolean {
   return mission.status === "blocked" && mission.stopReason === "deadline";
 }

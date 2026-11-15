@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { missionControls, missionExtendChoices, missionLeftLabel, missionStateLabel, missionTimeLeftMs } from "../apps/web/src/mission-model";
+import { missionControls, missionExtendChoices, missionLeftLabel, missionStateLabel, missionStopLine, missionTimeLeftMs } from "../apps/web/src/mission-model";
 import type { MissionStatus } from "../apps/web/src/mission-model";
 
 const NOW = Date.parse("2026-11-15T12:00:00.000Z");
@@ -87,4 +87,25 @@ test("mission time-left labels use hours and minutes", () => {
   assert.equal(missionLeftLabel(60_000), "1 min");
   assert.equal(missionLeftLabel(59_999), "less than a minute");
   assert.equal(missionLeftLabel(30_000), "less than a minute");
+});
+
+test("mission stop-time lines match live, stopped, and terminal states", () => {
+  const formatDate = (value: string) => "formatted " + value;
+  const deadlineAt = new Date(NOW + 30 * 60_000).toISOString();
+  assert.equal(missionStopLine({ status: "blocked", stopReason: "deadline", deadlineAt }, NOW, formatDate),
+    "Stopped at its time limit. Its work is kept. Extend to continue, or cancel.");
+  assert.equal(missionStopLine({ status: "working", deadlineAt }, NOW, formatDate), "Stops formatted " + deadlineAt);
+  assert.equal(missionStopLine({ status: "needs-input", deadlineAt, clockStoppedAt: new Date(NOW - 10 * 60_000).toISOString() }, NOW, formatDate),
+    "Clock stopped while it waits · 40 min left");
+  assert.equal(missionStopLine({ status: "planning", deadlineAt: past }, NOW, formatDate),
+    "Its time limit has passed. Extend to continue.");
+  const stoppedAfterDeadline = new Date(Date.parse(past) + 1_000).toISOString();
+  assert.equal(missionStopLine({ status: "paused", deadlineAt: past, clockStoppedAt: stoppedAfterDeadline }, NOW, formatDate),
+    "Its time limit has passed. Extend to continue.", "a stopped clock after the deadline leaves no time to resume");
+  assert.equal(missionTimeLeftMs({ deadlineAt: past, clockStoppedAt: stoppedAfterDeadline }, NOW), -1_000);
+  for (const status of ["cancelled", "ready-for-review"] as const) {
+    assert.equal(missionStopLine({ status, deadlineAt: past }, NOW, formatDate), undefined, status);
+  }
+  assert.equal(missionStopLine({ status: "blocked", deadlineAt: past }, NOW, formatDate), undefined,
+    "a non-deadline blocked mission cannot be extended");
 });

@@ -4,7 +4,7 @@ import { ApiError, useApi, type Me } from "./api";
 import { useLiveRefresh } from "./live-refresh";
 import { useMachines } from "./machines";
 import { requestStore } from "./requests";
-import { missionControls, missionExtendChoices, missionLeftLabel, missionStateLabel, missionStoppedAtLimit, missionTimeLeftMs, type MissionStatus } from "./mission-model";
+import { missionControls, missionExtendChoices, missionStateLabel, missionStopLine, missionStoppedAtLimit, type MissionStatus } from "./mission-model";
 
 type MissionView = {
   id: string;
@@ -29,8 +29,6 @@ const inFlight = new Set<string>();
 export function clearMissionRequests(machine: string) { mutations.clearMachine(machine); }
 const rejected = (error: unknown) => error instanceof ApiError && error.status >= 400 && error.status < 500;
 const date = (value: string) => new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
-const liveStatuses: MissionStatus[] = ["planning", "working", "needs-input", "paused"];
-
 export function MissionPage({ id, me, connected, openTeam }: { id: string; me: Me; connected: boolean; openTeam: (id: string) => void }) {
   const api = useApi(), machine = useMachines().active.id, key = machine + "/" + id;
   const [mission, setMission] = useState<MissionView | null>(null);
@@ -88,14 +86,7 @@ export function MissionPage({ id, me, connected, openTeam }: { id: string; me: M
   if (!mission) return <div className="team-page"><h1>Mission</h1><p role="status">{loadError || "Loading mission…"}</p>{loadError && <button type="button" className="text-button" onClick={view.refresh}><RefreshCw size={15} />Try again</button>}</div>;
 
   const stoppedAtLimit = missionStoppedAtLimit(mission);
-  const timeLeft = missionTimeLeftMs(mission, Date.now());
-  const stopLine = mission.clockStoppedAt !== undefined
-    ? "Clock stopped while it waits · " + missionLeftLabel(timeLeft) + " left"
-    : stoppedAtLimit
-      ? "Stopped at its time limit. Its work is kept. Extend to continue, or cancel."
-      : liveStatuses.includes(mission.status) && timeLeft <= 0
-        ? "Its time limit has passed. Extend to continue."
-        : "Stops " + date(mission.deadlineAt);
+  const stopLine = missionStopLine(mission, Date.now(), date);
   const events = mission.events.slice().sort((a, b) => b.at.localeCompare(a.at)).slice(0, 30);
 
   return <div className="team-detail mission-detail">
@@ -108,7 +99,7 @@ export function MissionPage({ id, me, connected, openTeam }: { id: string; me: M
           <span>Revision {mission.revision}</span>
           <span className="team-freshness" role="status">{view.stale ? "Showing last received state; controls are disabled." : ""}</span>
         </div>
-        <p className="quiet mission-stop-time" role="status">{stopLine}</p>
+        {stopLine && <p className="quiet mission-stop-time" role="status">{stopLine}</p>}
       </div>
       <button type="button" className="text-button" disabled={view.refreshing} onClick={view.refresh} aria-busy={view.refreshing}><RefreshCw className={view.refreshing ? "is-refreshing" : ""} size={14} />Refresh mission</button>
     </header>

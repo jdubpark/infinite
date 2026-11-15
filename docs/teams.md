@@ -1800,7 +1800,7 @@ infinite routing explain RUN_ID TASK_ID [--json]
 
 `status` shows the mode and its source, the value and the contributor setting, whether start is covered, how often the router matched the coordinator over the last 30 days, the shadow period (it ends after 14 days and 50 decisions, whichever is later), and each profile's posterior at each recorded area and at the new-task line. Intervals are 90% normal approximations. A count of zero is shown as "no decision had a coordinator pick", never as a rate. A cost that is a tier default is labelled as one. `explain` lists one task's start decisions, with the candidates each one considered.
 
-Status reads at most the newest 500 decisions of the last 30 days and at most 50 cells. Older cells are not shown.
+Status reads at most the newest 500 decisions of the last 30 days and shows at most 50 cells that have a decision in those 30 days. A cell's evidence still counts for 180 days, and a cell with no decision in the last 30 days is not shown.
 
 ### Retention
 

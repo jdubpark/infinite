@@ -24,7 +24,10 @@ const Z_90 = 1.645;
 const DAY_MS = 86_400_000;
 /** The area of the new-task line. It holds no blind index in any row, so its target is the project level. */
 const NEW_TASK_AREA = "(new task)";
-/** The status reads profiles at normal risk: a cell's risk is not stored in its row. */
+/**
+ * The status reads every cell at normal risk. Risk is a plain column of a decision row, but it is not part of the cell
+ * key (area, kind, feature version, feature map), so a cell has no one risk to read.
+ */
 const STATUS_RISK = "normal" as const;
 const HIDDEN_FIELDS = ["projectRef", "areaRef", "taskKey", "featureMapRef"] as const;
 const REQUIRED_MODULES = [OUTCOMES_MODULE, CONFIGURATIONS_MODULE, ROUTING_MODULE] as const;

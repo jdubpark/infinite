@@ -5,13 +5,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promptVersion } from "../packages/host/src/config-identity.js";
-import { configurationModule } from "../packages/host/src/configuration-store.js";
+import { advanceEpoch, configurationModule } from "../packages/host/src/configuration-store.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { outcomeModule, writeOutcome, type OutcomePayload, type OutcomeRow } from "../packages/host/src/outcome-store.js";
 import { ROUTING_DEFAULTS } from "../packages/host/src/routing-policy.js";
 import { routingExplain, routingStatus } from "../packages/host/src/routing-reads.js";
 import { decisionKey, insertDecision, routingModule } from "../packages/host/src/routing-store.js";
-import type { DecisionRow, RoutingPayload } from "../packages/host/src/routing-types.js";
+import type { EvidenceTx } from "../packages/host/src/evidence/types.js";
+import type { DecisionRow, RoutingPayload, RoutingStatus } from "../packages/host/src/routing-types.js";
 import type { TeamModelProfile, TeamLineup } from "../packages/host/src/team-types.js";
 import type { EvidenceStore as Store } from "../packages/host/src/evidence/store.js";
 import { mixedLineup } from "./team-fixture.js";
@@ -290,26 +291,6 @@ function earlierRow(id: string, profile: TeamModelProfile, projectId: string): O
   return { ...outcome(id, profile, "cfg-none"), payload: { ...PAYLOAD_BASE, projectId, area: "other" }, profileEpoch: 2, held: 1, firstPass: 1 };
 }
 
-test("the status reports the applied earlier mass", () => {
-  const f = fixture();
-  let store: EvidenceStore | undefined;
-  try {
-    store = open(f);
-    const astra = mixedLineup.implementers[1]!;
-    // Forty rows at the project level, each of weight 0.5 (coordinator-chosen): the raw mass is 20. The posterior caps
-    // the level at 10, so the scale is 0.5 and the applied mass is 10.
-    store.write(tx => {
-      for (let index = 0; index < 40; index++) writeOutcome(tx, earlierRow(`many-${index}`, astra, "rehearsal"));
-    });
-    const many = routingStatus(store, statusInput({ saved: { mode: "shadow" } }));
-    const manyAstra = many.cells[many.cells.length - 1]!.profiles.find(profile => profile.profileId === "astra-xhigh")!;
-    assert.deepEqual(manyAstra.earlier, { rows: 40, mass: 20, appliedMass: 10 });
-
-  } finally {
-    store?.close();
-    f.close();
-  }
-});
 
 test("the status reports an earlier mass under the cap as its applied mass", () => {
   const f = fixture();
@@ -356,5 +337,188 @@ test("the applied earlier mass sums each level's capped mass", () => {
   } finally {
     store?.close();
     f.close();
+  }
+});
+
+/** A counted implementer row under a stored configuration. The default is the recorded cell: area host, kind feature. */
+function integratedRow(spec: { id: string; profile: TeamModelProfile; configId: string; area?: string; kind?: string | null;
+  endedAt?: string; firstPass?: 0 | 1 }): OutcomeRow {
+  const base = outcome(spec.id, spec.profile, spec.configId);
+  const endedAt = spec.endedAt ?? NOW;
+  return {
+    ...base, kind: spec.kind === undefined ? "feature" : spec.kind, disposition: "integrated", held: 1, firstPass: spec.firstPass ?? 1, startedAt: null,
+    endedAt, frozenAt: endedAt,
+    payload: { ...base.payload, area: spec.area ?? "host", featureMap: "default" },
+  };
+}
+
+function configRow(tx: EvidenceTx, configId: string, profile: TeamModelProfile, version: string): void {
+  tx.run("INSERT INTO configurations (config_id, provider, model, effort, prompt_version, guidance, knowledge, routing, shape, first_seen_at) "
+    + "VALUES (?, ?, ?, ?, ?, 'g', 'k', 'off', 's', ?)", configId, profile.provider, profile.model,
+  profile.provider === "opencode" ? profile.variant ?? null : profile.effort ?? null, version, NOW);
+}
+
+const cellProfile = (status: RoutingStatus, id: string) => status.cells.find(line => line.cell.scope === "cell")!.profiles.find(profile => profile.profileId === id)!;
+const newTaskProfile = (status: RoutingStatus, id: string) => status.cells.find(line => line.cell.scope === "new-task")!.profiles.find(profile => profile.profileId === id)!;
+
+test("the earlier mass is the mass the posterior adds, at most 10 per level", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    const astra = mixedLineup.implementers[1]!;
+    seed(store, { area: "host" });
+    store.write(tx => {
+      configRow(tx, "old", astra, "an-earlier-version");
+      // Forty rows in the cell and forty in the project, each of weight 0.5: a raw mass of 20 per level. The posterior
+      // caps each level at 10, so the raw mass is 40 and the applied mass is 20.
+      for (let index = 0; index < 40; index++) writeOutcome(tx, integratedRow({ id: `cell-${index}`, profile: astra, configId: "old" }));
+      for (let index = 0; index < 40; index++) writeOutcome(tx, integratedRow({ id: `project-${index}`, profile: astra, configId: "old", area: "elsewhere/" }));
+    });
+    const status = routingStatus(store, statusInput({ saved: { mode: "shadow" } }));
+    assert.deepEqual(cellProfile(status, "astra-xhigh").earlier, { rows: 80, mass: 40, appliedMass: 20 });
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("a recorded cell counts its own rows, and the new-task line counts the project level", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    const astra = mixedLineup.implementers[1]!;
+    seed(store, { area: "host" });
+    store.write(tx => {
+      configRow(tx, "now", astra, promptVersion("implementer", "codex", astra, false, false));
+      for (let index = 0; index < 30; index++) writeOutcome(tx, integratedRow({ id: `cell-${index}`, profile: astra, configId: "now" }));
+    });
+    const status = routingStatus(store, statusInput({ saved: { mode: "shadow" } }));
+    const cell = cellProfile(status, "astra-xhigh");
+    assert.deepEqual([cell.level, cell.rows.production, newTaskProfile(status, "astra-xhigh").level], ["cell", 30, "project"]);
+    for (const profile of status.cells.flatMap(line => line.profiles)) assert.ok(profile.interval[0] >= 0 && profile.interval[1] <= 1, `interval ${profile.interval}`);
+    // Beta(16, 1) has an upper bound above 1 before the clip.
+    assert.equal(cell.interval[1], 1);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("a cell whose newest payload does not open is left out and counted", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    seed(store, { taskId: "t1" });
+    store.write(tx => tx.run("UPDATE routing_decisions SET encrypted_payload='not-sealed'"));
+    const status = routingStatus(store, statusInput({ saved: { mode: "shadow" } }));
+    assert.deepEqual([status.cells.map(line => line.cell.scope), status.unreadableCells], [["new-task"], 1]);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("greedy agreements count the greedy pick, and explore counts the exploratory starts", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    seed(store, { taskId: "t1", chosen: "a", greedy: "b", coordinator: "a", explore: true });
+    seed(store, { taskId: "t2", chosen: "a", greedy: "a", coordinator: "a" });
+    seed(store, { taskId: "t3", chosen: "b", greedy: "b", coordinator: "c" });
+    const status = routingStatus(store, statusInput({ saved: { mode: "shadow" } }));
+    assert.deepEqual([status.shadow.withCoordinator, status.shadow.agreements, status.shadow.greedyAgreements], [3, 2, 1]);
+    assert.deepEqual(status.explore, { exploratory: 1, of: 3, guards: "risk-only" });
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("the greedy mark is the choice's greedy pick, removed profiles are marked, and cost and rescue are the profile's own", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    const a: TeamModelProfile = { id: "codex-a", label: "Codex A", provider: "codex", model: "gpt-a-1", effort: "high" };
+    const b: TeamModelProfile = { id: "codex-b", label: "Codex B", provider: "codex", model: "gpt-b-1", effort: "high", tier: "strong" };
+    const lineup: TeamLineup = { ...mixedLineup, implementers: [mixedLineup.implementers[0]!, a, { ...b, tier: undefined }] };
+    seed(store, { taskId: "t1" });
+    // With equal priors and costs the greedy pick is codex-a, the first eligible profile.
+    const marks = routingStatus(store, statusInput({ lineup, saved: { mode: "shadow" } })).cells[0]!.profiles.map(profile => [profile.profileId, profile.removed ?? null, profile.greedy]);
+    assert.deepEqual(marks, [["spark-high", "contributor", false], ["codex-a", null, true], ["codex-b", null, false]]);
+    store.write(tx => {
+      configRow(tx, "b", b, promptVersion("implementer", "codex", b, false, false));
+      for (let index = 0; index < 4; index++) writeOutcome(tx, integratedRow({ id: `b-${index}`, profile: b, configId: "b", firstPass: 0 }));
+    });
+    const strong = cellProfile(routingStatus(store, statusInput({ lineup: { ...mixedLineup, implementers: [b] }, saved: { mode: "shadow" } })), "codex-b");
+    assert.equal(strong.costUsd, 2.2);
+    // Integrated but not first pass: the reward keeps the mean at 0.5, and the rescue falls.
+    assert.ok(strong.rescue < strong.mean, `rescue ${strong.rescue}, mean ${strong.mean}`);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("status uses the run flags' prompt version, the current epoch, and 180 days of rows", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    const astra = mixedLineup.implementers[1]!;
+    seed(store, { taskId: "t1" });
+    store.write(tx => {
+      configRow(tx, "heads", astra, promptVersion("implementer", "codex", astra, true, true));
+      for (let index = 0; index < 3; index++) writeOutcome(tx, integratedRow({ id: `old-${index}`, profile: astra, configId: "heads", endedAt: daysBefore(30) }));
+    });
+    const flags = { publishHeads: true, entryTools: true };
+    assert.equal(cellProfile(routingStatus(store, statusInput({ ...flags, saved: { mode: "shadow" } })), "astra-xhigh").rows.production, 3);
+    advanceEpoch(store, { profile: { provider: "codex", model: astra.model, effort: "xhigh" }, requestId: "0b4c3b52-6c43-4f0a-9d4c-8e2f9a6b1c07", now: daysBefore(1) });
+    const demoted = cellProfile(routingStatus(store, statusInput({ ...flags, saved: { mode: "shadow" } })), "astra-xhigh");
+    assert.deepEqual([demoted.rows.production, demoted.earlier.rows], [0, 3]);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("the status reports the requested mode, the source, the defaults, the start point, and the explain cap", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    const auto = routingStatus(store, statusInput({ saved: { mode: "auto", successValueUsd: 8 } }));
+    assert.deepEqual([auto.mode, auto.requested, auto.source, auto.defaults.includes("successValueUsd"), auto.defaults.includes("points")], ["shadow", "auto", "saved", false, true]);
+    const escalationOnly = routingStatus(store, statusInput({ saved: { mode: "shadow", points: ["escalation"] } }));
+    assert.deepEqual([escalationOnly.covers, escalationOnly.cells], [{ start: false, reason: "no-start-point" }, []]);
+    for (let ordinal = 1; ordinal <= 21; ordinal++) seed(store, { taskId: "t1", ordinal });
+    assert.equal(routingExplain(store, "run-1", "t1")?.capped, true);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("status needs the outcomes and configurations modules, and explain needs only routing", () => {
+  const sets: [string, (store: EvidenceStore) => void][] = [
+    ["no outcomes", store => { store.register(configurationModule()); store.register(routingModule()); }],
+    ["no configurations", store => { store.register(outcomeModule({ now: () => NOW })); store.register(routingModule()); }],
+  ];
+  for (const [name, register] of sets) {
+    const f = fixture();
+    let store: EvidenceStore | undefined;
+    try {
+      store = new EvidenceStore({ databasePath: f.path, vaultKey: f.key });
+      register(store);
+      assert.throws(() => routingStatus(store!, statusInput({ saved: { mode: "shadow" } })), { name: "EvidenceError", code: "unavailable" }, name);
+      assert.equal(routingExplain(store, "run-1", "t1"), undefined, name);
+    } finally {
+      store?.close();
+      f.close();
+    }
   }
 });

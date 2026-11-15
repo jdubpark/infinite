@@ -2,15 +2,46 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import type { AddressInfo } from "node:net";
+import express from "express";
+import { promptVersion } from "../packages/host/src/config-identity.js";
 import { configurationModule } from "../packages/host/src/configuration-store.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
-import { outcomeModule } from "../packages/host/src/outcome-store.js";
-import { ROUTING_DEFAULTS } from "../packages/host/src/routing-policy.js";
+import { outcomeModule, writeOutcome, type OutcomeRow } from "../packages/host/src/outcome-store.js";
+import { pinRouting, ROUTING_DEFAULTS } from "../packages/host/src/routing-policy.js";
+import { RoutingRecorder } from "../packages/host/src/routing-recorder.js";
+import { routingRoutes } from "../packages/host/src/routing-routes.js";
 import { decisionKey, insertDecision, routingModule } from "../packages/host/src/routing-store.js";
-import type { DecisionRow, RoutingPayload } from "../packages/host/src/routing-types.js";
+import type { DecisionRow, RoutingPayload, RoutingStatus } from "../packages/host/src/routing-types.js";
+import type { TeamRun, TeamTask } from "../packages/host/src/team-types.js";
+import type { Config } from "../packages/host/src/types.js";
+import { mixedLineup } from "./team-fixture.js";
 import { startHost, type Host } from "./helpers.js";
+
+const NOW = new Date().toISOString();
+const ASTRA = mixedLineup.implementers[1]!;
+
+/** Serves the routes from an in-process app whose guard passes everyone, so the config function is the test's own. */
+async function serve(store: EvidenceStore, config: Config): Promise<{ get: (path: string) => Promise<Response>; close: () => Promise<void> }> {
+  const app = express();
+  routingRoutes(app, { evidence: store, config: () => config }, (_req, _res, next) => next());
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise<void>(resolve => server.once("listening", () => resolve()));
+  const { port } = server.address() as AddressInfo;
+  return { get: path => fetch(`http://127.0.0.1:${port}${path}`), close: () => new Promise<void>(resolve => server.close(() => resolve())) };
+}
+
+/** A counted astra implementer row of the default point, under a stored configuration. */
+function countedRow(id: string, configId: string): OutcomeRow {
+  return { outcomeId: `${id}:m1`, source: "production", projectRef: "", taskRef: "", areaRef: "", runId: id, revision: 1, memberId: "m1", sessionId: null, attemptIndex: 1,
+    inherited: false, role: "implementer", profileId: ASTRA.id, provider: "codex", model: ASTRA.model, effort: "xhigh", profileEpoch: 1, configId, experimentRef: null, kind: null,
+    risk: "normal", featureVersion: 1, disposition: "integrated", exclusion: null, flags: [], integrated: 1, accepted: 1, acceptance: 1, firstPass: 1, held: 1,
+    startedAt: NOW, endedAt: NOW, frozenAt: NOW, holdUntil: null, runDeletedAt: null,
+    payload: { projectId: "rehearsal", taskId: "task-x", area: "other/", featureMap: "default", rounds: { run: 1, attributed: 1, unknown: 0 }, limitEvents: 0, costCoverage: "none" } };
+}
 
 /** One stored start decision of a run's task, written while the host's API is stopped. */
 function seedDecision(host: Host, runId: string, taskId: string, projectId = "rehearsal"): void {
@@ -112,5 +143,42 @@ test("the routing command prints status and explain", { timeout: 90000 }, async 
       error.status !== 0 && String(error.stderr).includes("No project has this ID."));
   } finally {
     await host.stop();
+  }
+});
+
+test("the routes pass the saved policy, the lineup, and the flags a new run pins, and take any UUID case", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-routing-routes-"));
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: Buffer.alloc(32, 5) });
+  try {
+    store.register(configurationModule()); store.register(outcomeModule({ now: () => NOW })); store.register(routingModule());
+    const runId = randomUUID();
+    const run = { id: runId, revision: 1, projectId: "rehearsal", lineup: mixedLineup, routing: pinRouting(undefined, "autonomous", mixedLineup) } as unknown as TeamRun;
+    const task = { id: "task-one", title: "t", instructions: "do it", paths: ["packages/host/src/a.ts"], dependsOn: [], revision: 1, status: "pending" } as unknown as TeamTask;
+    new RoutingRecorder({ store, log: () => {} }).recordStart({ run, task, publishHeads: true, entryTools: false, featureMap: undefined, limited: new Set() });
+    // Two rows under the version a new run pins by default (entry tools off), one under entry tools on. publishHeads changes only the delivery prompt.
+    store.write(tx => {
+      for (const [id, entryTools] of [["plain", false], ["tools", true]] as const) {
+        tx.run("INSERT INTO configurations (config_id, provider, model, effort, prompt_version, guidance, knowledge, routing, shape, first_seen_at) VALUES (?, 'codex', ?, 'xhigh', ?, 'g', 'k', 'off', 's', ?)",
+          id, ASTRA.model, promptVersion("implementer", "codex", ASTRA, true, entryTools), NOW);
+      }
+      writeOutcome(tx, countedRow("plain-1", "plain")); writeOutcome(tx, countedRow("plain-2", "plain")); writeOutcome(tx, countedRow("tools-1", "tools"));
+    });
+    const astraRows = (status: RoutingStatus) => status.cells.find(cell => cell.cell.scope === "new-task")!.profiles.find(profile => profile.profileId === ASTRA.id)!.rows.production;
+    const project = (team: object) => ({ id: "rehearsal", autonomy: "autonomous", team });
+    for (const [teams, expected] of [[{ lineup: mixedLineup }, 2], [{ lineup: mixedLineup, blackboard: { tools: true } }, 1]] as const) {
+      const served = await serve(store, { projects: [project({})], teams } as unknown as Config);
+      try {
+        const status = await (await served.get("/api/routing/projects/rehearsal")).json() as RoutingStatus;
+        assert.deepEqual([status.covers.start, astraRows(status)], [true, expected], JSON.stringify(teams));
+        assert.equal((await served.get(`/api/teams/${runId.toUpperCase()}/routing/task-one`)).status, 200);
+      } finally { await served.close(); }
+    }
+    const off = await serve(store, { projects: [project({ routing: { mode: "off" } })], teams: { lineup: mixedLineup } } as unknown as Config);
+    try {
+      assert.equal((await (await off.get("/api/routing/projects/rehearsal")).json() as RoutingStatus).mode, "off");
+    } finally { await off.close(); }
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
   }
 });

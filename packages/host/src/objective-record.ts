@@ -211,15 +211,18 @@ const CRITERION_OPS = new Set(["criterion.added", "criterion.edited", "criterion
 
 /** Undoes one criterion entry: the criterion its `after` names goes back to its `before`, or is removed for an add. */
 function undoCriterion(criteria: Criterion[], entry: LogEntry): Criterion[] {
+  const unavailable = () => objectiveError("objective-version-unavailable");
+  const canonical = (value: unknown) => canonicalJson(JSON.parse(JSON.stringify(value) ?? "null"));
   const after = entry.after;
-  if (after === undefined || !("inline" in after)) throw objectiveError("objective-version-unavailable");
-  const wanted = canonicalJson(JSON.parse(JSON.stringify(after.inline)));
-  const index = criteria.findIndex(item => canonicalJson(JSON.parse(JSON.stringify(item))) === wanted);
-  if (index === -1) throw objectiveError("objective-version-unavailable");
+  if (after === undefined || !("inline" in after)) throw unavailable();
+  const index = criteria.findIndex(item => item.id === entry.target);
+  if (index === -1 || canonical(criteria[index]) !== canonical(after.inline)) throw unavailable();
   if (entry.op === "criterion.added") return criteria.filter((_, position) => position !== index);
   const before = entry.before;
-  if (before === undefined || !("inline" in before)) throw objectiveError("objective-version-unavailable");
-  return criteria.map((item, position) => (position === index ? (before.inline as Criterion) : item));
+  if (before === undefined || !("inline" in before)) throw unavailable();
+  const restored = before.inline;
+  if (typeof restored !== "object" || restored === null || (restored as Criterion).id !== entry.target) throw unavailable();
+  return criteria.map((item, position) => (position === index ? (restored as Criterion) : item));
 }
 
 /** Rebuilds the record as it was at `version` by undoing each later entry in descending seq. Throws objectiveError. */

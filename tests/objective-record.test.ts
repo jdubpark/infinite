@@ -208,6 +208,20 @@ test("a rebuild refuses what it cannot undo", () => {
   assert.throws(() => rebuildVersion(late, 2), { status: 409, code: "objective-version-unavailable" });
 });
 
+/** Request ids of the corrections that wrote the log, one per version after the first, as the host writes them. */
+const REQUEST_IDS = [
+  "2b7e1c90-4d3a-4f6b-8a21-5c9d0e7f1a34",
+  "6a0f3d52-9e1b-4c7d-b8e4-2f5a6c7d8e90",
+  "c4d8e6f1-0a2b-4e3c-9d5f-7a8b9c0d1e2f",
+  "e9f1a3b5-6c7d-4e8f-a0b1-c2d3e4f5a6b7",
+] as const;
+
+function withEntry(record: ObjectiveRecord, seq: number, extra: Partial<LogEntry>): ObjectiveRecord {
+  const changed = { ...record, log: record.log.map(item => (item.seq === seq ? { ...item, ...extra } : item)) } as ObjectiveRecord;
+  changed.digest = recordDigest(changed);
+  return changed;
+}
+
 test("a rebuild undoes owner corrections", () => {
   const base = goalRecord(goalFixture(), AT, "created") as ObjectiveRecord;
   const c0 = base.criteria[0];
@@ -222,15 +236,15 @@ test("a rebuild undoes owner corrections", () => {
   const c1Edited: Criterion = { ...c1, statement: "Each source has a date and a URL." };
   const c2Retired: Criterion = { ...c2, state: "retired" };
   const direction: Direction = { id: "s2", text: "Use primary sources.", source: "steering", at: at(2) };
-  const entry = (seq: number, version: number, op: string, target: string, extra: Partial<LogEntry>): LogEntry =>
-    ({ seq, at: AT, version, actor: "owner", authority: "direction", op, target, ...extra });
+  const entry = (seq: number, version: number, op: string, target: string, handle: string, extra: Partial<LogEntry>): LogEntry =>
+    ({ seq, at: AT, version, actor: "owner", authority: "direction", op, target, handle, ...extra });
   const log: LogEntry[] = [
     base.log[0],
-    entry(2, 1, "criterion.added", "c2", { after: { inline: c2 } }),
-    entry(3, 2, "criterion.added", "c1", { after: { inline: c1 } }),
-    entry(4, 3, "direction.appended", "s2", { after: logValue(direction, "record:direction:s2"), handle: "owner-device" }),
-    entry(5, 4, "criterion.edited", "c1", { before: { inline: c1 }, after: { inline: c1Edited } }),
-    entry(6, 4, "criterion.retired", "c2", { before: { inline: c2 }, after: { inline: c2Retired } }),
+    entry(2, 1, "criterion.added", "c2", REQUEST_IDS[1], { after: { inline: c2 } }),
+    entry(3, 2, "criterion.added", "c1", REQUEST_IDS[2], { after: { inline: c1 } }),
+    entry(4, 3, "direction.appended", "s2", REQUEST_IDS[3], { after: logValue(direction, "record:direction:s2") }),
+    entry(5, 4, "criterion.retired", "c2", REQUEST_IDS[4], { before: { inline: c2 }, after: { inline: c2Retired } }),
+    entry(6, 4, "criterion.edited", "c1", REQUEST_IDS[4], { before: { inline: c1 }, after: { inline: c1Edited } }),
   ];
   const record = {
     ...base, version: 4, criteria: [c0, c2Retired, c1Edited], statement: { ...base.statement, directions: [direction] }, log, digest: "",
@@ -251,9 +265,19 @@ test("a rebuild undoes owner corrections", () => {
 
   const drifted = {
     ...record,
-    log: record.log.map(item => (item.seq === 5 ? { ...item, after: { inline: { ...c1Edited, statement: "Each source has a date and a URL!" } } } : item)),
+    log: record.log.map(item => (item.seq === 6 ? { ...item, after: { inline: { ...c1Edited, statement: "Each source has a date and a URL!" } } } : item)),
   } as ObjectiveRecord;
   assert.throws(() => rebuildVersion(drifted, 3), { status: 409, code: "objective-version-unavailable" });
+
+  // An edit whose logged `before` names another criterion would restore a version that never existed.
+  const renamed = withEntry(record, 6, { before: { inline: { ...c1, id: "c9" } }, after: { inline: c1Edited } });
+  assert.equal(objectiveRecordSchema.safeParse(renamed).success, true);
+  assert.throws(() => rebuildVersion(renamed, 3), { status: 409, code: "objective-version-unavailable" });
+
+  // An edit whose logged `before` breaks the producer rule: the restored record would not parse.
+  const misfit = withEntry(record, 6, { before: { inline: { ...c1, producer: "host" } }, after: { inline: c1Edited } });
+  assert.equal(objectiveRecordSchema.safeParse(misfit).success, true);
+  assert.throws(() => rebuildVersion(misfit, 3), { status: 409, code: "objective-version-unavailable" });
 });
 
 test("a stored record is read strictly", () => {

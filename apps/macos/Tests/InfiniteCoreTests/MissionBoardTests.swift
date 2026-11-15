@@ -33,6 +33,21 @@ final class MissionBoardTests: XCTestCase {
         XCTAssertEqual(ProjectGroupList.empty.groups, [])
     }
 
+    /// Halts and other per-checkout state match any checkout of a repository, not only its primary one.
+    func testRepositoriesListEveryCheckoutPrimaryFirstAndOlderHostsFallBackToThePrimary() throws {
+        let list = ProjectGroupList(try parse("""
+        {"groups":[
+          {"id":"storefront","name":"Storefront","repos":[
+            {"projectId":"storefront-api","name":"storefront-api","path":"/srv/work/api","checkouts":[
+              {"projectId":"storefront-api","primary":true},{"projectId":"storefront-api-review","primary":false}]},
+            {"projectId":"storefront-web","name":"storefront-web","path":"/srv/work/web"}]}
+        ],"suggestions":[]}
+        """))
+        let group = try XCTUnwrap(list.group("storefront"))
+        XCTAssertEqual(group.repos.map(\.checkoutIDs), [["storefront-api", "storefront-api-review"], ["storefront-web"]])
+        XCTAssertEqual(group.projectIDs, ["storefront-api", "storefront-api-review", "storefront-web"])
+    }
+
     func testBoardColumnsFollowBoardOrderNewestFirstAndHideEmptyOnes() {
         let board = Board(.object(["items": .array([
             item("old-work", column: "working", updatedAt: "2026-10-18T01:00:00.000Z"),

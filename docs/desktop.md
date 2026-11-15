@@ -145,9 +145,9 @@ The owner's [halt](teams.md#halt) shows above the page. `GET /api/halt` is
 polled with the session list. A host halt shows on every page: what it holds,
 when it was engaged, the owner device that engaged it, and the owner's reason
 when one was given. A project halt shows the same way on the pages of the
-project that lists the halted repository, and on its missions, team runs, and
-sessions; Home for every project shows one line naming each halted repository,
-which opens its project. A host that cannot read its halt record shows a host
+project that lists the halted repository or any of its checkouts, and on its
+missions, team runs, sessions, and cost page; Home for every project shows one
+line naming each halted repository, which opens its project. A host that cannot read its halt record shows a host
 halt that says so and holds every launch until it can. An owner device also sees
 the `infinite halt off` command that releases a halt; the app itself engages and
 releases nothing. A failed read keeps the last report. A host that does not

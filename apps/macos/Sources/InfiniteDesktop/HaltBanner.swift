@@ -9,12 +9,12 @@ enum HaltPage: Equatable {
 }
 
 extension AppModel {
-    /// The host projects a desktop project (a group of repositories) covers.
-    func haltRepoIDs(group id: String?) -> [String] { id.flatMap(projectGroups.group)?.repos.map(\.projectID) ?? [] }
+    /// The host projects a desktop project (a group of repositories) covers, every checkout included.
+    func haltRepoIDs(group id: String?) -> [String] { id.flatMap(projectGroups.group)?.projectIDs ?? [] }
     /// A halted host project's name, from whichever project lists it, else its ID.
     func haltName(_ projectID: String) -> String { projectGroups.repoName(projectID) ?? projectName(projectID) }
     /// The desktop project that lists a halted host project, so the overview line can open it.
-    func haltGroup(_ projectID: String) -> ProjectGroup? { projectGroups.groups.first { $0.repos.contains { $0.projectID == projectID } } }
+    func haltGroup(_ projectID: String) -> ProjectGroup? { projectGroups.groups.first { $0.projectIDs.contains(projectID) } }
 }
 
 /// The owner's halt above the page. Informational only: the owner releases a halt with the host CLI.
@@ -160,10 +160,10 @@ struct HaltOverviewLine: View {
         .background(Palette.paused.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Palette.paused.opacity(0.25)))
     }
-    /// A repository inside a multi-repository project names that project too.
+    /// A halt on one of several repositories or checkouts in a project names that project too.
     private func name(_ state: HaltState) -> String {
         let id = state.projectID ?? ""
-        return app.haltGroup(id).map { $0.repos.count > 1 ? "\(app.haltName(id)) in \($0.name)" : $0.name } ?? app.haltName(id)
+        return app.haltGroup(id).map { $0.projectIDs.count > 1 ? "\(app.haltName(id)) in \($0.name)" : $0.name } ?? app.haltName(id)
     }
     private func detail(_ state: HaltState) -> String {
         [name(state), HaltSince.text(state), state.reason.map { "“\($0)”" }].compactMap { $0 }.joined(separator: " · ")
@@ -177,6 +177,15 @@ struct MissionHaltBanners: View {
     var body: some View {
         let ids = model.mission.repoProjectIDs
         HaltBanners(app: app, page: .projects(ids.isEmpty ? app.haltRepoIDs(group: model.mission.groupID) : ids))
+    }
+}
+
+/// The cost page of one project shows that project's halts; the all-projects cost view shows only a host halt.
+struct CostHaltBanners: View {
+    @ObservedObject var app: AppModel
+    @ObservedObject var model: CostModel
+    var body: some View {
+        HaltBanners(app: app, page: .projects(model.tab == .projects ? [model.projectID].compactMap { $0 } : []))
     }
 }
 

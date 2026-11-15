@@ -315,7 +315,7 @@ struct DesktopView: View {
     @ViewBuilder private var haltBanners: some View {
         if app.showingUnderstanding { HaltBanners(app: app, page: .projects(app.haltRepoIDs(group: app.understandingWorkspaceID))) }
         else if app.showingHome { HaltBanners(app: app, page: app.projectFilter.map { .projects(app.haltRepoIDs(group: $0)) } ?? .overview) }
-        else if app.showingCost { HaltBanners(app: app, page: .projects([])) }
+        else if app.showingCost { if let cost = app.costModel() { CostHaltBanners(app: app, model: cost) } else { HaltBanners(app: app, page: .projects([])) } }
         else if let missionModel { MissionHaltBanners(app: app, model: missionModel) }
         else if let teamModel { TeamHaltBanners(app: app, model: teamModel) }
         else { HaltBanners(app: app, page: .projects(app.visibleIDs.compactMap { id in app.sessions.first { $0.id == id }?.project })) }

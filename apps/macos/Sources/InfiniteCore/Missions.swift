@@ -5,9 +5,12 @@ import Foundation
 /// project whose ID is its host project ID.
 public struct ProjectGroup: Identifiable, Equatable, Sendable {
     public struct Repo: Equatable, Sendable {
+        /// The host project of the repository's primary checkout.
         public let projectID: String
         public let name: String
         public let path: String
+        /// Every checkout's host project, primary first. Hosts that do not fold checkouts list only the primary.
+        public let checkoutIDs: [String]
     }
     public let value: JSON
     public init(_ value: JSON) { self.value = value }
@@ -16,8 +19,15 @@ public struct ProjectGroup: Identifiable, Equatable, Sendable {
     public var implicit: Bool { value["implicit"].bool }
     public var revision: Int { value["revision"].int }
     public var repos: [Repo] {
-        value["repos"].array.map { Repo(projectID: $0["projectId"].string, name: $0["name"].string.isEmpty ? $0["projectId"].string : $0["name"].string, path: $0["path"].string) }
+        value["repos"].array.map { repo in
+            let primary = repo["projectId"].string
+            let checkouts = repo["checkouts"].array.map { $0["projectId"].string }.filter { !$0.isEmpty }
+            return Repo(projectID: primary, name: repo["name"].string.isEmpty ? primary : repo["name"].string, path: repo["path"].string,
+                        checkoutIDs: checkouts.contains(primary) ? checkouts : [primary] + checkouts)
+        }
     }
+    /// Every host project this project covers: each checkout of each repository.
+    public var projectIDs: [String] { repos.flatMap(\.checkoutIDs) }
     /// "2 repos" for a multi-repository project; a single repository needs no count.
     public var repoCountLabel: String? { repos.count > 1 ? "\(repos.count) repos" : nil }
     /// Owner-created projects first, then the implicit single-repository ones; each set by name.

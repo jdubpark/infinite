@@ -367,7 +367,7 @@ export function createApp(config: Config, key: Buffer) {
   const usageRow = (id: string) => { const row = usage.session(id); return row.measured ? { usage: row } : {}; };
   const listSessions = async () => {
     const native = (await manager.list({ includeFullMessage: Boolean(config.jev && config.jev.sessionReadings !== false) })).map(session => {
-      const handoff = handoffs.view(session.id);
+      const handoff = handoffs.listedView(session.id);
       const managed = managedBy(session);
       return { ...session, ...(managed ? { managedBy: managed } : {}), handoff, ...usageRow(session.id), executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id,
         resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };
@@ -388,7 +388,8 @@ export function createApp(config: Config, key: Buffer) {
     const session = { ...manager.meta(sessionId).session, ...(await manager.state(sessionId, true)) };
     const handoff = handoffs.view(sessionId);
     const managed = managedBy(session);
-    const { generatedTitle: _generatedTitle, ...publicSession } = readings.merge([session])[0];
+    // One session's detail is no listing: it must not replace what the last listing left for every other session.
+    const { generatedTitle: _generatedTitle, ...publicSession } = readings.merge([session], false)[0];
     return { ...publicSession, ...(managed ? { managedBy: managed } : {}), handoff, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id,
       resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };
   };

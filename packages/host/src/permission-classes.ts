@@ -10,10 +10,10 @@ import { matchDestructive } from "@infinite/attention";
 import type { PermissionClassMatch, PermissionQualification, PermissionRequest } from "./permission-agent-types.js";
 import type { InterruptClass } from "./permission-policy.js";
 import { canonicalJson } from "./evidence/crypto.js";
-import { inlineShellScript, quoteWord, readShell, resolveWord, type PathResolver, type SimpleCommand } from "./permission-shell.js";
+import { MAX_SHELL_DEPTH, quoteWord, readShell, resolveWord, type PathResolver, type SimpleCommand } from "./permission-shell.js";
 
-/** Bumped by any change to the rule code below that is not a change to the lists. */
-export const CLASS_RULES_VERSION = 1;
+/** Bumped by any change to the rule code below, or to the shell reading it uses, that is not a change to the lists. */
+export const CLASS_RULES_VERSION = 3;
 
 /**
  * The host's lists. Commands are word prefixes after wrappers (sudo, env, timeout) are removed. Paths
@@ -159,9 +159,10 @@ export function withRealRoots(request: PermissionRequest, real: PathResolver): P
 
 /**
  * `resolvePath` makes every path a real host path (see `realHostPath`); the caller passes the request
- * from `withRealRoots`. Without it paths are read as written, which is what a replay does.
+ * from `withRealRoots`. Without it paths are read as written, which is what a replay does. `depth` is
+ * the shell layer the command line is at, for a line the embedded-command rule found inside another.
  */
-export function readRequest(request: PermissionRequest, resolvePath?: PathResolver): RequestReading {
+export function readRequest(request: PermissionRequest, resolvePath?: PathResolver, depth = 0): RequestReading {
   const tool = request.tool;
   const input = request.input ?? {};
   const root = request.requester.sessionRoot;
@@ -188,28 +189,24 @@ export function readRequest(request: PermissionRequest, resolvePath?: PathResolv
 
   const shell = SHELL_TOOLS.has(tool.toLowerCase()) || typeof input.command === "string" || Array.isArray(input.command);
   if (shell) {
-    let source: string;
-    if (Array.isArray(input.command) && input.command.every(word => typeof word === "string")) {
-      const argv = input.command as string[];
-      source = inlineShellScript(argv) ?? argv.map(quoteWord).join(" ");
-    } else source = typeof input.command === "string" ? input.command : request.action;
-    const reading = readShell(source, cwd, real);
+    // An argv is one command: its words are literal. A literal shell body inside it is read by readShell, layer by layer.
+    const source = Array.isArray(input.command) && input.command.every(word => typeof word === "string")
+      ? (input.command as string[]).map(quoteWord).join(" ")
+      : typeof input.command === "string" ? input.command : request.action;
+    const reading = readShell(source, cwd, real, depth);
     for (const reason of reading.opaqueReasons) reasons.add(reason);
-    for (const command of reading.commands) {
-      // One level of `sh -c 'literal'` is read as the script it runs.
-      const script = inlineShellScript(command.argv);
-      if (script !== undefined && !command.scriptExpands) {
-        const inner = readShell(script, command.cwd ?? cwd, real);
-        for (const reason of inner.opaqueReasons) reasons.add(reason);
-        for (const nested of inner.commands) commands.push({ ...nested, privileged: nested.privileged || command.privileged });
-        for (const redirect of command.redirects) add(redirect.target, redirect.op.includes(">") ? "write" : "read", command.cwd ?? cwd);
-        continue;
-      }
-      commands.push(command);
-    }
+    commands.push(...reading.commands);
+    const entered = new Set<string>();
     for (const command of commands) {
-      const base = command.cwd ?? cwd;
+      // A directory the command runs in is a target of its own, so a command run elsewhere is judged there.
+      if (command.cwd !== undefined && command.cwd !== cwd && !entered.has(command.cwd)) {
+        entered.add(command.cwd);
+        targets.push({ path: command.cwd, access: "unknown", word: command.cwd });
+      }
+      // In a directory the text does not establish, a relative path is unresolved.
+      const base = command.cwdUnknown ? undefined : command.cwd ?? cwd;
       for (const redirect of command.redirects) add(redirect.target, redirect.op === "<" ? "read" : "write", base);
+      for (const file of command.writes ?? []) add(file, "write", base);
       operandTargets(command, base, add, real);
     }
   }
@@ -231,7 +228,7 @@ export function readRequest(request: PermissionRequest, resolvePath?: PathResolv
   return { commands, targets, urls, opaque: reasons.size > 0, opaqueReasons: [...reasons], shell, tool, unresolved, ...(real ? { resolve: real } : {}) };
 }
 
-function operandTargets(command: SimpleCommand, cwd: string, add: (word: string, access: Access, base: string | undefined) => void, real?: PathResolver) {
+function operandTargets(command: SimpleCommand, cwd: string | undefined, add: (word: string, access: Access, base: string | undefined) => void, real?: PathResolver) {
   const { name, argv } = command;
   if (name === "cd" || name === "pushd") return;
   let base = cwd;
@@ -340,7 +337,7 @@ function isGlobalSettingsCommand(command: SimpleCommand, request: PermissionRequ
     if (has("--file", "-f")) {
       const index = command.argv.findIndex(arg => arg === "--file" || arg === "-f");
       const file = command.argv[index + 1];
-      const path = file && resolveWord(file, command.cwd ?? request.requester.sessionRoot, real);
+      const path = file && resolveWord(file, command.cwdUnknown ? undefined : command.cwd ?? request.requester.sessionRoot, real);
       if (!path || !insideSession(request, path)) return true;
     }
     // A hook path or fsmonitor in the repository's own config runs code on later git commands.
@@ -411,10 +408,12 @@ const CLASS_RULES: readonly ClassRule[] = [
       const scope = destructive.length ? destructive : reading.commands;
       const paths: string[] = [];
       for (const command of scope) {
-        const base = command.cwd ?? request.requester.sessionRoot;
+        const base = command.cwdUnknown ? undefined : command.cwd ?? request.requester.sessionRoot;
         for (const target of reading.targets) if (command.words.includes(target.word) || command.redirects.some(redirect => redirect.target === target.word)) paths.push(target.path);
-        // A git command with no path operand acts on its working directory.
-        if (command.name === "git") paths.push(command.argv.includes("-C") ? resolveWord(command.argv[command.argv.indexOf("-C") + 1] ?? "", base, reading.resolve) ?? base : base);
+        // A git command with no path operand acts on its working directory. An unknown one is not established: the reading is opaque.
+        const gitDirectory = command.name !== "git" ? undefined
+          : command.argv.includes("-C") ? resolveWord(command.argv[command.argv.indexOf("-C") + 1] ?? "", base, reading.resolve) ?? base : base;
+        if (gitDirectory !== undefined) paths.push(gitDirectory);
       }
       return paths.some(path => !insideSession(request, path));
     },
@@ -465,8 +464,74 @@ const GLOBAL_INSTALL: ReadonlyArray<(command: SimpleCommand) => boolean> = [
   command => /^pip\d*(?:\.\d+)?$/.test(command.name) && command.argv[1] === "install" && command.argv.some(arg => arg === "--user" || arg === "--break-system-packages"),
 ];
 
-/** The raise rules that match. They only select the strong tier for a fresh turn. */
-export function raise(request: PermissionRequest, context: { rejectHistory: boolean }, reading = readRequest(request)): string[] {
+/**
+ * Bounds of the embedded-command search for one request. A command with more than `words` words is not
+ * searched, a candidate longer than `length` characters is not read, at most `readings` candidates are
+ * read, and commands found inside candidates are searched to `layers` levels. A request the search did
+ * not cover is raised as opaque.
+ */
+export const EMBEDDED_COMMAND_LIMITS = { words: 64, length: 4_000, readings: 256, layers: 2 } as const;
+/** Commands that never run an argument. Their arguments are not searched. */
+const NEVER_RUN = new Set(["echo", "printf", "grep", "egrep", "fgrep", "cat", "head", "tail", "wc"]);
+
+/**
+ * Whether a command hides one that a class rule matches: a tail of its words, which a wrapper the shell
+ * reader does not know would run (`setsid npm login`), or one of its words read as a shell body (`watch
+ * 'npm login'`, `ssh host 'npm login'`). Each candidate is read as its own command line in the command's
+ * directory, and every class rule is tried on it. A match is a guess, so it only raises; it never sends a
+ * request to the owner. "bounded" when the search did not cover the request.
+ */
+function embeddedCommand(request: PermissionRequest, reading: RequestReading, facts: HostRuleFacts): "found" | "bounded" | undefined {
+  const limits = EMBEDDED_COMMAND_LIMITS;
+  const { destructive: _destructive, ...plain } = request;
+  // Candidates share most of their paths: each is resolved once.
+  const known = new Map<string, string | undefined>();
+  const resolve: PathResolver | undefined = reading.resolve && (path => {
+    if (!known.has(path)) known.set(path, reading.resolve!(path));
+    return known.get(path);
+  });
+  const seen = new Set<string>();
+  let readings = 0;
+  let bounded = false;
+  const queue = reading.commands.map(command => ({ command, layer: 0 }));
+  for (let item = queue.shift(); item; item = queue.shift()) {
+    const { command, layer } = item;
+    // A command in a directory the text does not establish is already opaque.
+    if (command.cwdUnknown || NEVER_RUN.has(command.name) || command.argv.length < 2) continue;
+    if (command.argv.length > limits.words) { bounded = true; continue; }
+    const candidates: Array<{ source: string; depth: number }> = [];
+    command.argv.forEach((word, index) => {
+      if (index === 0) return;
+      // A tail that starts with an option names no command.
+      if (!word.startsWith("-")) candidates.push({ source: command.argv.slice(index).map(quoteWord).join(" "), depth: command.depth });
+      if (/\s/.test(word) && command.depth < MAX_SHELL_DEPTH) candidates.push({ source: word, depth: command.depth + 1 });
+    });
+    for (const { source, depth } of candidates) {
+      const key = `${command.cwd ?? ""}\n${depth}\n${source}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (source.length > limits.length) { bounded = true; continue; }
+      if (++readings > limits.readings) return "bounded";
+      const pattern = matchDestructive(source);
+      const candidate: PermissionRequest = {
+        ...plain, tool: "Bash", action: source,
+        input: { command: source, ...(command.cwd !== undefined ? { workdir: command.cwd } : {}) },
+        shape: { ...request.shape, trustPrompt: false, persistentOnly: false },
+        ...(pattern ? { destructive: { pattern } } : {}),
+      };
+      const candidateReading = readRequest(candidate, resolve, depth);
+      if (CLASS_RULES.some(rule => rule.test(candidate, candidateReading, facts))) return "found";
+      if (layer + 1 < limits.layers) for (const inner of candidateReading.commands) queue.push({ command: inner, layer: layer + 1 });
+    }
+  }
+  return bounded ? "bounded" : undefined;
+}
+
+/**
+ * The raise rules that match. They only select the strong tier for a fresh turn. `facts` are the host
+ * facts the class rules use, for the embedded-command rule.
+ */
+export function raise(request: PermissionRequest, context: { rejectHistory: boolean }, reading = readRequest(request), facts: HostRuleFacts = {}): string[] {
   const raised: string[] = [];
   const words = reading.commands.flatMap(command => command.words);
   const text = `${request.tool}\n${request.action}\n${safeJson(request.input ?? {})}`;
@@ -488,7 +553,9 @@ export function raise(request: PermissionRequest, context: { rejectHistory: bool
       || /^\.[\w.-]*rc(?:\.[\w-]+)?$/.test(base) || /^\.env(?:\..+)?$/.test(base);
   })) raised.push("raise:settings-in-root");
   if (reading.commands.some(command => GLOBAL_INSTALL.some(test => test(command)))) raised.push("raise:global-install");
-  if (reading.opaque || reading.unresolved.length > 0 || (!reading.shell && !KNOWN_TOOLS.test(request.tool))) raised.push("raise:opaque");
+  const embedded = reading.shell ? embeddedCommand(request, reading, facts) : undefined;
+  if (embedded === "found") raised.push("raise:embedded-command");
+  if (reading.opaque || embedded === "bounded" || reading.unresolved.length > 0 || (!reading.shell && !KNOWN_TOOLS.test(request.tool))) raised.push("raise:opaque");
   if (context.rejectHistory) raised.push("raise:reject-history");
   return raised;
 }

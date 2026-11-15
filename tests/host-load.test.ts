@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { waitFor } from "./helpers.js";
 import { missionHarness } from "./mission-harness.js";
 import { fixture } from "./team-fixture.js";
@@ -77,17 +78,21 @@ test("a held team member waits with the reason and launches after recovery", { t
 
 test("a held check run does not start until the host recovers", { timeout: 120000 }, async () => {
   const host = flippable(healthy);
-  const f = await fixture("success", undefined, { hostLoad: limits }, { noServer: true });
+  const f = await fixture("host-load-check", undefined, { hostLoad: limits }, { noServer: true });
   const key = readFileSync(f.host.config.keyFile);
   const manager = new Manager(f.host.config, key, host.probe);
   const teams = new TeamService(f.host.config, key, manager, (_projectId, start) => start());
   teams.start();
   try {
     const created = await teams.create(f.create());
-    // Hold once both implementers are running. Their integration takes seconds, and the next gated launch is the reviewer, which waits for the check.
-    await waitFor(async () => teams.get(created.id), run => run.members.filter(member => member.role === "implementer" && Boolean(member.startedAt)).length === 2, 90000);
+    // Keep both implementers behind a barrier until the real gate has refreshed its cached healthy reading.
+    await waitFor(async () => teams.get(created.id), run => run.members.filter(member => member.role === "implementer"
+      && member.startedAt && existsSync(join(f.receipts, `${member.memberId}.check-held`))).length === 2, 90000);
     host.set(starved);
-    await waitFor(async () => teams.get(created.id), run => Boolean(run.reason?.startsWith(HOST_LOAD_REASON_PREFIX)), 90000);
+    await waitFor(async () => manager.hostLoad.held(), Boolean, 20000);
+    writeFileSync(join(f.receipts, `${created.id}.check-release`), "release", { mode: 0o600 });
+    await waitFor(async () => teams.get(created.id), run => run.tasks.length === 2 && run.tasks.every(task => task.status === "integrated")
+      && Boolean(run.reason?.startsWith(HOST_LOAD_REASON_PREFIX)), 90000);
     await new Promise(done => setTimeout(done, 1200));
     const held = teams.get(created.id);
     assert.notEqual(held.status, "verifying", "the check does not start while the host is held");

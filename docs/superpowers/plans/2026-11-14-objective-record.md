@@ -27,7 +27,7 @@ This plan grows one section per slice. Each slice is one pull request.
 | Slice | Content | Needs |
 |---|---|---|
 | The record | Schema, validation, storage in sealed goal and run records, migration, the log, the reads and the CLI read. This section | main |
-| Owner ops and prompts | `POST …/record`, creation `criteria`, the record digest in prompts and the context file, the `evaluators` lineup slot, the store module `objective` | The record |
+| Owner ops and prompts | `POST …/record` for criteria, creation `criteria`, the record digest in prompts and the context file behind a project switch. Its section moves the `evaluators` lineup slot to the intent check and leaves the store module out | The record |
 | The intent check | The role, the report, item application, the batched question, the corrected plan, derived criteria | Owner ops and prompts; autonomy mode (C12) |
 | Tests and proposals | Command, artifact, citation, and owner tests; member proposals | The intent check; blackboard member tools (C17) |
 | Verdicts | The evaluator, composition, `provisional-met`, `objective_verdicts` | Tests and proposals; C19 |
@@ -502,3 +502,429 @@ export function objectiveRoutes(app: express.Express,
 - A record for a run that settled before this change. It gets one only if a continuation brings a new plan.
 - A goal removal path. `goals.ts` has none.
 - Steps 3 to 7.
+
+---
+
+# Slice: owner corrections and the record digest
+
+Spec `2026-11-13-objective-record-design.md` part 2 (owner correction), part 8 (the record digest, `POST /api/goals/:id/record`, and the CLI forms), delivery order 2, and acceptance 2 for owner ops. The owner can add, edit, retire, and confirm a goal's criteria, and can give criteria when the goal is created. When a project turns the new switch on, the member prompts and the context file of each goal cycle show the record's criteria in place of the success text. It builds on step 1 (`2026-11-14-objective-record.md`), which is on `main`.
+
+**One switch per project, off by default, inside the routine approval digest.** `project.team.objective = { prompts: "on" | "off" }`, with no default. When the key is absent or `"off"`, no prompt byte, context key, run fingerprint, or prompt version changes, and creation `criteria` and every correction answer 409 `objective-prompts-off`. *(My call. The switch changes what every member of a cycle reads, so it belongs inside `RoutineService.authority`: `digestedProjectTeam` strips only `eval`, so writing an `objective` key changes the digest and blocks that project's active routines until the owner approves them again. An absent key leaves every stored digest valid. Corrections are refused while the switch is off because a correction that no member reads would look applied. The spec names the family `objective.intentCheck` and `objective.evaluator` (part 4, "Authority and safety"); steps 3 and 5 add them beside `prompts`. `config.teams` gains nothing.)*
+
+**The digest is pinned per cycle run, in the goal context.** `GoalService.prepare` builds `TeamGoalContext.record` once per cycle, from the latest record version, when the switch is on. Every member of that run reads the pinned digest, including members started after a pause, a replan, or a host restart. The next cycle reads the latest version. *(My call, against part 2's "other changes apply from the next member start". Part 8 puts the digest in `TeamGoalContext`, which is the run's immutable goal context and part of its creation fingerprint (`createRun` digests `{ request: parsed, ...creationContext }`). A per-member version needs `TeamService` to read the goal's record, which lives in `GoalService`'s sealed record, or a mutable run field that every launch path must refresh. A pending launch persisted before this change has no `record` and replays unchanged.)*
+
+**Step 2 corrects criteria only.** Four ops: `criterion.add`, `criterion.edit`, `criterion.retire`, and `criterion.confirm`. `c0` can be neither edited nor retired (409 `objective-op-c0`): it is the goal's `successCriteria`, which the goal view, the goal digest, and the outcome assessment still read. Owner values, assumption and question ops, promotions, definitions, rules, non-goals, excluded paths, and the rubric version move to step 3, where the intent check creates the things they change. *(My call: the record holds no assumption or question before step 3, and part 8 gives definitions, rules, and non-goals no place in a non-coordinator prompt.)*
+
+**Corrections write no direction, so step 1's history rule stands.** Rule 9 (`objective-history-invalid`) matches `direction.appended` and `direction.copied` entries against steering directions only. A correction writes `criterion.*` entries. `rebuildVersion` learns to undo the four criterion ops, so every earlier version still rebuilds.
+
+**No `evaluators` slot, no `objective` evidence store module, and no standalone-run corrections here.** Each is argued in "Not in this slice".
+
+**Coordinator rulings (2026-11-15).** They settle the calls marked above and replace any line of this section that says otherwise.
+
+- **The switch, the per-cycle pin, criteria-only corrections, owner-only access, goals only, no `evaluators` slot, and no store module are accepted as written.** The design's part 2 and part 8 and its delivery order are amended in Task 9 to say so. A correction reaches members from the next cycle; steering stays the way to reach a running cycle.
+- **`repo init` keeps the `objective` key without a task here.** The command carries every team key it does not own (`carriedTeamSettings`, a separate change that lands first). If that change is not on `main` when Task 9 starts, Task 9 stops and reports.
+- **Another slice adds a key beside this one.** The router's shadow recorder adds `routing` to `teamProjectSchema`, one line to `withoutPrivateSettings`, and tests to `tests/routines.test.ts` and `tests/team-prompts.test.ts`. Whichever lands second merges `main` and keeps both; neither slice edits the other's lines.
+- **Release.** The rollback row above goes into the release notes of the release that carries this slice: remove the `objective` key from every project before a rollback, and expect a goal with a pinned digest in a pending launch to block on an older host.
+
+## Trust boundary, and what a review checks
+
+These inputs originate outside the host:
+
+- **Owner corrections and creation criteria** arrive with an owner device key. Statements are owner text: sealed in the goal's record file, and never in a log line, an event text, or an error body. They reach the prompt of every member of the goal's later cycles and the context file. The host refuses a secret-shaped statement with 400 `objective-secret` and never echoes it: `findSecret(ops, { token: "", url: "" })` checks private keys and the access-token shapes, which include the GitHub grant and egress proxy password shapes since `7cdfbb9`. An owner device holds no session credential, so no by-value list applies. A body that fails its schema gets the fixed 400 `objective-op-invalid` with no detail, because a zod message for an unknown key names the key.
+- **Configured check commands** come from the operator's config (`project.team.checks`). A command criterion must name one of them (400 `objective-command-unknown` otherwise); the record stores only its digest. The digest's check label prints the command and its arguments, which every member already reads through `configuredProject.checks`, so no new text reaches a prompt.
+- **Members** write nothing in this slice, so no member text reaches the record or the digest. The digest's type and byte rule live in `team-types.ts`, so the step 1 test `team prompts never import the record` keeps holding.
+- **Roles.** Only the owner corrects. *(My call: goal steering admits a controller, but a correction redefines "done", like pause, cancel, and extend, which are owner only; the log also has no controller actor.)* The relay refuses `POST /api/goals/:id/record`, because `allowedPath` in `remote-access.ts` admits only `steer|pause|resume|cancel|outcome` after a goal id. No code change; one test row.
+
+What can reach prompt and context text: owner criterion statements (at most 1,000 bytes each), check labels (at most 120 bytes each, built from enumerations, scoped paths, ids, and configured commands), the record version, and producers. No credential the host issues, no member text, no verdict, and no outcome row.
+
+**Sizes.** The digest is at most 6,144 bytes of JSON with `c0`'s statement empty; the prompt prints `c0`'s text once, in place of `successCriteria`. A prompt grows by at most 6,144 bytes plus one fixed lead line; the context file grows by at most 6,144 bytes beside the blackboard digest (`DIGEST_BYTES` 4,096) and the entry paragraph (`ENTRY_PARAGRAPH_LIMIT_BYTES` 700), which do not change. The digest is authority text, so `fitDerivedSections` never cuts it; a prompt whose authority exceeds 80 KiB fails with 409 `team-prompt-too-large`, as today.
+
+**Cost.** Nothing here reads a session, an outcome row, or the evidence store, so 1,000 sessions and 10,000 outcome rows change nothing. A goal list, a goal read, and an idle tick parse no record and read no sealed file. `prepare` parses the record once per cycle. A correction parses twice (the stored record and the result) and writes the goal's sealed file once. A member launch reads `run.goal` and parses nothing. No store statement or index is added.
+
+The slice must survive these sequences. Each has a named test.
+
+| Sequence | Expected | Test |
+|---|---|---|
+| Switch absent or `"off"` | Every role's prompt and context equal today's; creation `criteria` and corrections answer 409 `objective-prompts-off`; `prepare` writes no `record` | Task 7 `the record digest replaces the success text and nothing else`; Task 6 `corrections and creation criteria need the switch` |
+| The `objective` key written, then a routine's next check | The authority digest differs, so the routine blocks as for any authority change; an absent key keeps the stored digest | Task 2 `the objective switch is inside the routine approval digest` |
+| A correction, then the same request again | The second answers the same view and writes nothing | Task 6 `a correction applies once` |
+| The same `requestId` with another body | 409 `request-conflict`, nothing written | Task 6 `a correction applies once` |
+| Two corrections from one version | The second answers 409 `objective-version-stale` | Task 6 `a correction applies once` |
+| A correction whose goal write fails | The in-memory record and receipts are unchanged; the same request then applies once | Task 6 `a failed correction write changes nothing` |
+| A correction with one refused op among several | Nothing applied, the input record unchanged, no owner text in the error | Task 5 `refusals change nothing and echo nothing` |
+| A correction during a cycle, then a restart | The running run keeps its pinned digest; after the restart it still does; the next cycle reads the new version | Task 6 `a cycle pins the digest it launched with` |
+| A pending launch stored by an older host (no `record`) | It replays unchanged; the run has no `record` | Task 6 `a cycle pins the digest it launched with` |
+| A stored record that cannot be read when a cycle starts | The cycle launches without `record`, with one fixed event | Task 6 `an unreadable record launches without a digest` |
+| Three corrections of distinct criteria in every order | The same criteria, version, and digest | Task 5 `three corrections of distinct criteria give one record in every order` |
+| Random steering and corrections with a reload between steps | Every version rebuilds to what it was, and parses | Task 5 `every version rebuilds after random corrections and steering` |
+| A correction that would leave the log less than 20 entries or 46 KiB of room | 409 `objective-log-full`; 20 maximal steers still fit afterwards | Task 5 `a correction keeps room for steering` |
+| A digest over 6 KiB, 9 active criteria, 65 criteria | 409 `objective-digest-too-large`, `objective-criteria-limit` | Task 5 `limits refuse before anything changes` |
+| A failed migration write, then a pending control | The control reaches its team, and the record is saved with that change | Task 6 `a pending control reaches its team after a failed migration write` |
+| A controller, a viewer, the relay | 403 | Task 8 `owner corrections through the host`; `the relay refuses corrections` |
+| A rollback to a host without this slice | A stored record still parses (the schema does not change), but a version before a correction is 409 `objective-version-unavailable`; a pending launch with `record` fails the old strict `teamGoalContextSchema` and the old tick blocks that goal; a config with the `objective` key fails the old strict `teamProjectSchema` | No test. `docs/teams.md` says to remove the key before a rollback; the release's rollback rehearsal covers the rest |
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `packages/host/src/objective-types.ts` (modify) | Export the check and threshold schemas and the producer and threshold rules that `recordProblems` already applies |
+| `packages/host/src/objective-input.ts` (create) | Pure: the input and correction schemas, their limits, the goal create body split, `commandDigest` |
+| `packages/host/src/team-types.ts` (modify) | `RecordDigest` and its byte rule; `TeamGoalContext.record`; `project.team.objective` |
+| `packages/host/src/objective-digest.ts` (create) | Pure: the switch, check labels, the digest of a record |
+| `packages/host/src/objective-record.ts` (modify) | The new error codes; `rebuildVersion` undoes criterion ops |
+| `packages/host/src/objective-ops.ts` (create) | Pure: owner ops, creation criteria, ids, log room |
+| `packages/host/src/objective-goals.ts`, `goals.ts` (modify) | `correctObjective`, creation criteria, the digest in `prepare` |
+| `packages/host/src/team-prompts.ts`, `config-identity.ts`, `teams.ts` (modify) | The goal section prints the digest; the prompt version knows it; one capture line |
+| `packages/host/src/objective-routes.ts`, `server.ts` (modify) | `POST /api/goals/:id/record`; the goal create body |
+| `packages/host/src/objective-cli.ts` (modify) | `retire`, `confirm`, and `apply --file` |
+| `docs/teams.md`, the spec (modify) | The switch, corrections, the digest, and the amendments of part 2, part 8, and the delivery order |
+| `tests/objective-{input,digest,ops}.test.ts` (create); `tests/{objective-types,objective-record,objective-goals,objective-cli,team-prompts,config-identity,routines,goals,remote-access}.test.ts` (modify) | Pure rules, the goal service with a real team service, the host |
+
+**Order and owners.** Tasks 1, 2, and 4 run first, in parallel. Then Tasks 3 and 7 run in parallel (3 needs 1 and 2; 7 needs 2). Then Task 5 (needs 1, 3, and 4), then Task 6. Tasks 8 and 9 run last, in parallel: the route contract and its texts are fixed below, so the CLI is written without the route. Each file has one writer. Every worker in a worktree is told never to use `git stash`; it compares with `git show HEAD:<path>` and sets work aside with a WIP commit. The host typecheck does not cover `tests/`, so each task runs its test files, and a task reports any cancelled test as a failure.
+
+## Review Focus
+
+1. A byte change while the switch is off: a prompt, a context file, a run fingerprint, a prompt version, or a routine digest with the key absent. Expect none (Task 7 `the record digest replaces the success text and nothing else`; Task 6 `corrections and creation criteria need the switch`; Task 2 `the objective switch is inside the routine approval digest`).
+2. A correction that is not exactly once or not all or nothing: a replay, a conflict, a stale version, a failed write, one refused op among several. Expect one application or none (Task 6 `a correction applies once`, `a failed correction write changes nothing`; Task 5 `refusals change nothing and echo nothing`).
+3. A history that no longer rebuilds, or a record that step 1's schema refuses, which a rollback would then hide. Expect every version to rebuild and parse (Task 5 `every version rebuilds after random corrections and steering`, `three corrections of distinct criteria give one record in every order`; Task 4 `a rebuild undoes owner corrections`).
+4. Owner text where it must not be: an error body, an event, a log line, a plain column; or a secret-shaped statement that reaches a prompt. Expect none (Task 5 `refusals change nothing and echo nothing`, `a secret-shaped statement is refused`; Task 8 `owner corrections through the host`).
+5. A digest that changes inside a run, a cycle that reads a stale one, or a read path that starts to parse. Expect a pin per run and zero parses on lists, reads, and idle ticks (Task 6 `a cycle pins the digest it launched with`, `lists, single reads, and an idle tick parse no record and read no sealed file`).
+
+### Task 1: the input schemas
+
+**Files:** `packages/host/src/objective-types.ts`, `packages/host/src/objective-input.ts` (create), `tests/objective-input.test.ts` (create), `tests/objective-types.test.ts`. Runs first, in parallel with Tasks 2 and 4.
+
+**Interfaces (produces):**
+```ts
+// objective-types.ts: today's private schemas, exported unchanged.
+export const thresholdSchema: z.ZodType<Threshold>;
+export const checkSchema: z.ZodType<Check>;
+/** host for command, receipt, artifact, citations, citation-form; evaluator for judgement; owner for owner-rating. */
+export function producerOf(check: Check): Criterion["producer"];
+/** artifact: count iff a count threshold, else pass; citations and citation-form: share; owner-rating: score; others: pass. */
+export function thresholdFits(check: Check, threshold: Threshold): boolean;
+
+// objective-input.ts
+export const CORRECTION_LIMITS = { ops: 16, creationCriteria: 7, version: 1_000_000, criterionCanonicalBytes: 2_048 } as const;
+export type CheckInput =
+  | Exclude<Check, { kind: "command" } | { kind: "artifact" }>
+  | { kind: "command"; run: TeamCommand }
+  | { kind: "artifact"; path: string; count?: string };
+export type CriterionInput = { statement: string; check: CheckInput; threshold: Threshold; producer?: Criterion["producer"] };
+export type CorrectionOp =
+  | { op: "criterion.add"; criterion: CriterionInput }
+  | { op: "criterion.edit"; id: string; statement?: string; check?: CheckInput; threshold?: Threshold }
+  | { op: "criterion.retire"; id: string }
+  | { op: "criterion.confirm"; id: string };
+export type Correction = { requestId: string; version: number; ops: CorrectionOp[] };
+export const criterionInputSchema: z.ZodType<CriterionInput>;
+export const correctionSchema: z.ZodType<Correction>;
+/** SHA-256 hex of canonical JSON `{ command, args }` of a parsed command (args defaulted). */
+export function commandDigest(command: TeamCommand): string;
+/** Splits a goal create body: `criteria` (1 to 7) is parsed here, the rest by `createGoalSchema`. Throws `objectiveError("objective-op-invalid")` for bad criteria. */
+export function parseGoalCreateBody(input: unknown): { goal: CreateGoal; criteria?: CriterionInput[] };
+```
+
+**Decisions:**
+
+- `recordProblems` calls `producerOf` and `thresholdFits`, so one rule serves the stored record and the input. *(My call: an input check needs the rule before a whole record exists, to answer a specific code.)*
+- Statements are 1 to 1,000 UTF-8 bytes (`OBJECTIVE_LIMITS.criterionBytes`). `producer` is optional; when present it must be one of the three enumerated values, so `"coordinator"` fails the schema (acceptance 2). A fit check against `producerOf` happens in Task 5, which answers 400 `objective-criterion-misfit`.
+- An artifact input has no `schema` and a criterion has no `pinned`: both need a blob read at a fixed commit, a new Git form, and no reader exists before step 4.
+- `correctionSchema` is strict: `requestId` a UUID, `version` 1 to 1,000,000, `ops` 1 to 16, no two ops naming the same id, and an edit with at least one field. *(My call: with one op per id, the order of ops inside a correction matters only for the ids that adds receive.)*
+- `parseGoalCreateBody` exists so that `goal-types.ts` does not change. *(My call: `routineGoalSchema` spreads `createGoalSchema.shape`, and `ProductGoal` spreads every request field, so a `criteria` field there would reach routines and every goal view. `createGoalSchema` also has refinements, which `extend` does not accept in zod 4.)*
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `inputs are checked strictly` (objective-input) | A statement of 1,001 bytes, an unknown key, an artifact `schema`, a `pinned` field, producer `"coordinator"`, 17 ops, two ops on `c1`, an empty edit, version 0, and version 1,000,001 are refused; a command input with no `args` parses with `args: []`. |
+| `a command digest is stable and bound to its arguments` (objective-input) | Equal for `{ command: "npm", args: ["test"] }` parsed twice; different for `args: ["test", "--x"]`; 64 lower-case hex. |
+| `the goal create body keeps criteria apart` (objective-input) | A body with `criteria` gives `goal` equal to `createGoalSchema.parse` of the body without it; 8 criteria or a bad criterion throw status 400 code `objective-op-invalid` whose message holds no input text; a body without `criteria` gives `criteria` undefined. |
+| `producer and threshold rules are shared` (objective-types) | `producerOf` and `thresholdFits` over every check kind; a record whose judgement criterion has producer `host` still fails `objectiveRecordSchema` with the same message. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/objective-input.test.ts tests/objective-types.test.ts tests/objective-record.test.ts` and the host typecheck, then commit.
+
+### Task 2: the digest type and the switch
+
+**Files:** `packages/host/src/team-types.ts`, `tests/routines.test.ts`. Runs first, in parallel with Tasks 1 and 4.
+
+**Interfaces (produces):**
+```ts
+export const RECORD_DIGEST_BYTES = 6 * 1024;
+export const RECORD_LABEL_BYTES = 120;
+/** Part 8's record digest. `c0` is first and its statement is empty: its text is the context's `successCriteria`. */
+export const recordDigestSchema = z.strictObject({
+  version: z.number().int().min(1).max(1_000_000),
+  criteria: z.array(z.strictObject({
+    id: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/),          // the record's ID_RE, copied: importing objective-types here would close an import cycle
+    statement: z.string(),                                   // "" for c0; 1 to 1,000 bytes otherwise
+    check: z.string(),                                       // 1 to RECORD_LABEL_BYTES bytes
+    producer: z.enum(["host", "evaluator", "owner"]),
+  })).min(1).max(8),
+}).superRefine(/* c0 first with "", others non-empty, byte bounds, recordDigestBytes(value) <= RECORD_DIGEST_BYTES */);
+export type RecordDigest = z.infer<typeof recordDigestSchema>;
+export function recordDigestBytes(digest: RecordDigest): number;   // Buffer.byteLength(JSON.stringify(digest))
+// teamGoalContextSchema gains, as its last key:
+//   record: recordDigestSchema.optional(),
+// teamProjectSchema gains, after `eval`:
+//   objective: z.strictObject({ prompts: z.enum(["on", "off"]) }).optional(),
+```
+
+**Decisions:**
+
+- `record` is the last key of the goal context, so a context without it serializes as today, and `JSON.stringify(run.goal)` of an older run is unchanged.
+- The switch has no default, so a parsed config without it has no `objective` key and every routine digest stays valid. Writing the key, even as `"off"`, changes the digest; `docs/teams.md` says to leave it absent for off.
+- Steps 3 and 5 add assumptions, open questions, and `objective.intentCheck` and `objective.evaluator` after these fields.
+
+- [ ] **Step 1: Write the failing test** `the objective switch is inside the routine approval digest` in `tests/routines.test.ts`, beside `eval settings stay out of the routine approval digest` and in its pattern: a routine created without the key keeps its stored authority after a reload with the key still absent; the same routine blocks at its next check after the project gains `objective: { prompts: "on" }`. **Step 2: Run it and confirm it fails.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/routines.test.ts tests/autonomy-mode.test.ts` and the host typecheck.
+
+### Task 3: the digest of a record
+
+**Files:** `packages/host/src/objective-digest.ts` (create), `tests/objective-digest.test.ts` (create). Needs Tasks 1 and 2. Runs in parallel with Task 7.
+
+**Interfaces (produces):** pure, no I/O, no clock.
+```ts
+/** True only when `team.objective.prompts` is "on". */
+export function objectivePromptsOn(project: Pick<Project, "team"> | undefined): boolean;
+/** `kind:detail`, at most RECORD_LABEL_BYTES bytes, with each control character replaced by a space. */
+export function checkLabel(check: Check, configured: readonly TeamCommand[]): string;
+/** The active criteria in record order, c0 first with an empty statement. The result passes recordDigestSchema except for the byte cap, which callers check. */
+export function recordDigestFor(record: ObjectiveRecord, configured: readonly TeamCommand[]): RecordDigest;
+```
+
+**Decisions:**
+
+- Labels: `command:` and the configured command joined with its arguments by spaces, found by `commandDigest`; `command:` and the first 12 hex digits and ` (not configured)` when the configuration no longer holds it; `receipt:checks-passed`; `artifact:PATH`; `citations:PATH` and `citation-form:PATH`; `judgement:ITEM` (so `c0` reads `judgement:owner-text`); `owner-rating:SUBJECT`. A label over 120 bytes ends at a character boundary with `...` inside the 120 bytes. *(My call: a label names how the criterion is checked; the threshold, the pointer, and the digest itself stay out, as part 8 lists.)*
+- `recordDigestFor` never throws on a valid record. The cap is checked by the writer (Task 5) and by `prepare` (Task 6).
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `the digest lists active criteria with c0 first and empty` | A record with `c0`, `c1` (configured command), `c2` (retired), and `c3` (artifact with a count): criteria `[c0, c1, c3]`, `c0` statement `""`, labels and producers as listed; the result parses with `recordDigestSchema`; `recordDigestBytes` equals the JSON byte length. |
+| `labels are bounded and plain` | Arguments with a newline and a tab give spaces; a 300-byte command gives 120 bytes ending in `...` with a three-byte character at the cut kept whole; a command digest no longer configured gives `command:` + 12 hex + ` (not configured)`; one label per other kind. |
+| `the digest schema refuses what the rule refuses` | `c0` not first, `c0` with text, 9 criteria, a 121-byte label, a 1,001-byte statement, and a digest of 6,145 bytes are refused. |
+| `the switch reads only on` | An undefined project, no `team`, no `objective`, and `"off"` give false; `"on"` gives true. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/objective-digest.test.ts` and the host typecheck.
+
+### Task 4: error codes and the rebuild
+
+**Files:** `packages/host/src/objective-record.ts`, `tests/objective-record.test.ts`. Runs first, in parallel with Tasks 1 and 2.
+
+**Interfaces (produces):**
+```ts
+export type ObjectiveErrorCode = /* the nine of step 1 */
+  | "objective-prompts-off" | "objective-op-invalid" | "objective-op-target" | "objective-op-c0" | "objective-op-refused"
+  | "objective-version-stale" | "objective-criterion-misfit" | "objective-criterion-too-large" | "objective-command-unknown"
+  | "objective-secret" | "objective-criteria-limit" | "objective-too-large" | "objective-log-full" | "objective-digest-too-large";
+export const OBJECTIVE_ERRORS: Record<ObjectiveErrorCode, { status: 400 | 404 | 409; message: string }>;
+export function rebuildVersion(record: ObjectiveRecord, version: number): ObjectiveRecord;   // signature unchanged
+```
+
+**Decisions:**
+
+- Status 400: `op-invalid`, `criterion-misfit`, `criterion-too-large`, `command-unknown`, `secret`. Status 409: the others. Each message is fixed and names no input. These texts are the contract Task 9 maps:
+  - `objective-prompts-off`: `Turn on objective prompts for this goal's project before changing its criteria.`
+  - `objective-op-invalid`: `The correction is invalid.`
+  - `objective-op-target`: `A correction names a criterion that is missing or in another state.`
+  - `objective-op-c0`: `Criterion c0 is the goal's success text and cannot be edited or retired.`
+  - `objective-op-refused`: `The corrected record would be invalid, so nothing was changed.`
+  - `objective-version-stale`: `The record changed since it was read. Read it again and resend the correction.`
+  - `objective-criterion-misfit`: `A criterion's producer or threshold does not fit its check.`
+  - `objective-criterion-too-large`: `A criterion is over 2,048 bytes.`
+  - `objective-command-unknown`: `A command criterion must name one of the project's configured checks.`
+  - `objective-secret`: `A criterion looks like it holds a secret, so nothing was changed.`
+  - `objective-criteria-limit`: `A record holds at most 8 active criteria and 64 in all.`
+  - `objective-too-large`: `The corrected record would be over its size limit.`
+  - `objective-log-full`: `The record's log is full. Start a new goal with consolidated criteria.`
+  - `objective-digest-too-large`: `The active criteria would be over the 6 KiB prompt digest.`
+- **The rebuild undoes criterion ops from their logged values.** Each `criterion.added|edited|retired|confirmed` entry holds the whole criterion inline: `after` always, `before` for all but an add. Undoing an entry finds the criterion whose canonical value equals `after.inline`; an add removes it, and the others replace it with `before.inline` in place. A missing match is 409 `objective-version-unavailable`. The rebuilt record is parsed with `objectiveRecordSchema`; a failure is the same 409. Any other op stays unknown, so `criterion.derived` still answers 409. *(My call: the parse costs one call on a versioned read only, and it turns a damaged log into a refusal instead of a version that never existed.)*
+
+- [ ] **Step 1: Write the failing test** `a rebuild undoes owner corrections`: a hand-built record of version 4 (created at 1; `criterion.added` c1 at 2; a steered direction at 3; `criterion.edited` c1 and `criterion.retired` c2 at 4, with c2 added at creation) rebuilds versions 1 to 3 equal to hand-built snapshots; an `after.inline` that differs by one byte answers 409; the existing `a rebuild refuses what it cannot undo` still passes unchanged. **Step 2: Run and confirm it fails.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/objective-record.test.ts tests/objective-goals.test.ts tests/objective-runs.test.ts` and the host typecheck.
+
+### Task 5: owner ops
+
+**Files:** `packages/host/src/objective-ops.ts` (create), `tests/objective-ops.test.ts` (create). Needs Tasks 1, 3, and 4.
+
+**Interfaces (produces):** pure, no I/O; the clock comes from `context.at`.
+```ts
+/** Corrections leave this much of OBJECTIVE_LIMITS' log for steering: 20 entries and 46 KiB. */
+export const CORRECTION_LOG = { entries: 380, bytes: 210 * 1024 } as const;
+export type OwnerOpContext = { configured: readonly TeamCommand[]; requestId: string; at: string };
+/** Every op or none, one version up. Throws objectiveError with a fixed code; the input record is never changed. */
+export function applyOwnerOps(record: ObjectiveRecord, correction: Pick<Correction, "version" | "ops">, context: OwnerOpContext): ObjectiveRecord;
+/** Owner criteria of version 1: ids c1 onward, each logged `criterion.added` at version 1. */
+export function addCreationCriteria(record: ObjectiveRecord, inputs: readonly CriterionInput[], context: OwnerOpContext): ObjectiveRecord;
+export function criterionFromInput(input: CriterionInput, id: string, configured: readonly TeamCommand[]): Criterion;
+/** `c` and one more than the highest number among every criterion id, retired ones included. Ids are never reused. */
+export function nextCriterionId(record: ObjectiveRecord): string;
+```
+
+**Decisions:**
+
+- **The order of checks is fixed**, so a test can name the first refusal: the version (409 `objective-version-stale`), the secret scan over the whole op list (400 `objective-secret`), then each op in order: its target (a missing id, a retired criterion for edit or retire, an owner criterion for confirm: 409 `objective-op-target`; `c0`: 409 `objective-op-c0`), its check (400 `objective-command-unknown`), its fit (400 `objective-criterion-misfit`), and its size (canonical over 2,048 bytes: 400 `objective-criterion-too-large`). Then the whole result: active and total counts (409 `objective-criteria-limit`), log room (409 `objective-log-full`), `cappedBytes` (409 `objective-too-large`), the digest bytes (409 `objective-digest-too-large`), and last `objectiveRecordSchema.safeParse` (409 `objective-op-refused`).
+- **What each op does.** Add appends an owner criterion with state `active`. Edit replaces the given fields; the producer follows the check; a derived criterion that the owner edits becomes `origin: "owner"` without `derivedFrom`, because its words are now the owner's. Retire sets state `retired`. Confirm sets a derived criterion's origin to `owner` and drops `derivedFrom`. *(My call for edit; part 2 names confirm only.)* No step 2 writer makes a derived criterion, so confirm applies only to records that step 3 writes; the test builds one by hand.
+- **The log.** One entry per op, all at the new version: `actor: "owner"`, `authority: "direction"`, `handle: requestId`, `target` the criterion id, `after` the whole criterion inline, and `before` for all but an add. The 2,048-byte criterion cap keeps both inline (`OBJECTIVE_LIMITS.inlineValueBytes`). The record's `version` rises by one and its `digest` is recomputed.
+- **Log room.** Refused when `log.length + ops.length > 380`, or when the log's canonical bytes after the correction exceed 210 KiB. Steering keeps the last 20 entries and 46 KiB: a goal has at most 20 steering entries (`goal-steering-limit`), and one direction entry is at most about 2.3 KiB, since a longer one is logged by reference. A goal whose log is full for corrections can still be steered to its own limit; the owner starts a new goal for more corrections.
+- **Creation criteria** use the same path: version 1, no stale check, and `addCreationCriteria` throws the same codes, so a refused criterion aborts the goal's creation.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `owner ops add, edit, retire, and confirm criteria` | From a record of version 1 with a hand-built derived `c1`: one correction adds `c2` (a configured command: its digest stored, producer `host`) and edits `c1`'s statement; the next retires `c2`. Versions 2 and 3, with log entries as listed; `c1` is now an owner criterion without `derivedFrom`; after the retire, `nextCriterionId` gives `c3`. On a second record, a confirm turns a derived `c1` into an owner criterion. |
+| `acceptance 2: misfits and unknown commands are refused` | A judgement check with producer `host` and an artifact with a count under a `pass` threshold give 400 `objective-criterion-misfit`; a command not in `configured` gives 400 `objective-command-unknown`. |
+| `refusals change nothing and echo nothing` | For each code of the fixed order, with the refused op second of three: the thrown error has that code; `JSON.stringify` of the error and its message hold no statement text; the input record deep-equals a copy taken before. |
+| `c0 stays` | Edit and retire of `c0` give 409 `objective-op-c0`. |
+| `a secret-shaped statement is refused` | A private key header, a GitHub token shape, and an egress proxy password shape, each built as `tests/member-entry.test.ts` builds them, give 400 `objective-secret`. |
+| `limits refuse before anything changes` | An add that makes 9 active criteria, a 65th criterion, and statements whose digest reaches 6,145 bytes give `objective-criteria-limit` and `objective-digest-too-large`; 7 added criteria of 700 bytes each fit. |
+| `a correction keeps room for steering` | A record with 380 log entries refuses a one-op correction with `objective-log-full`; then 20 steering entries of 8,000 characters, synced with `syncDirections`, give a record that parses. The same with a log at 210 KiB. |
+| `three corrections of distinct criteria give one record in every order` | From `c1`, `c2`, `c3`: an edit of `c1`, a retire of `c2`, and a threshold edit of `c3`, applied in all six orders, give equal `criteria`, `version`, and `digest`. |
+| `every version rebuilds after random corrections and steering` | Seeded (200 seeds, the seed printed on failure): random steering and random valid corrections, with a JSON round trip between steps as a restart; for each version, `rebuildVersion(final, v)` deep-equals the snapshot taken at `v`, and every snapshot parses with `objectiveRecordSchema`. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/objective-ops.test.ts tests/objective-record.test.ts` and the host typecheck.
+
+### Task 6: the goal service
+
+**Files:** `packages/host/src/objective-goals.ts`, `packages/host/src/goals.ts`, `tests/objective-goals.test.ts`. Needs Task 5.
+
+**Interfaces (produces):**
+```ts
+// objective-goals.ts
+export type GoalDigestResult = { digest: RecordDigest } | { skipped: "record-unavailable" | "digest-too-large" };
+export const GOAL_DIGEST_EVENTS: Record<"record-unavailable" | "digest-too-large", string>;
+/** One parse of the holder's record; never stores it. Throws objectiveError. */
+export function correctGoalObjective(holder: GoalHolder, correction: Correction, context: OwnerOpContext): ObjectiveRecord;
+/** Step 1's function with creation criteria; a refused criterion throws, any other failure keeps step 1's result. */
+export function createGoalObjective(holder: GoalHolder, at: string, criteria?: { inputs: readonly CriterionInput[]; context: OwnerOpContext }): GoalObjectiveResult;
+/** One parse of the latest record. */
+export function goalRecordDigest(holder: GoalHolder, configured: readonly TeamCommand[]): GoalDigestResult;
+
+// goals.ts
+correctObjective(id: string, input: unknown): Promise<ObjectiveRecordView>;
+create(input: CreateGoal, admit?: () => void, criteria?: CriterionInput[]): Promise<ProductGoal>;
+```
+
+**Decisions:**
+
+- **`correctObjective`** parses with `correctionSchema` before it queues (a failure is `objectiveError("objective-op-invalid")`), then runs in `this.enqueue`, as `steer` does. In order: the goal (404 as today); the replay through `stored.receipts` with `digest({ action: "record", ...body })`, answering the latest view on a match and 409 `request-conflict` on a mismatch (`replay` widens its body type from `Action` to `{ requestId: string }`); the switch (409 `objective-prompts-off`); `correctGoalObjective`; then one fixed event, `The owner corrected the objective record to version N.`, and the save. It returns `goalObjectiveView(stored)`. A replay is answered even after the switch turns off.
+- **The write is all or nothing.** The service saves a copy of the stored record with the new record, receipt, and event, and puts it in `this.records` only after `save` returns. *(My call: steering mutates in place before its save, and a failed save would leave the in-memory record ahead of the file.)*
+- **A correction does not raise the goal's revision and is allowed in every goal state.** The record has its own version, and goal actions keep their revision check. A correction while a launch is pending applies to the next cycle; the pending launch already holds its digest.
+- **Creation.** With `criteria` and the switch off: 409 `objective-prompts-off`. The fingerprint is `digest(criteria ? { ...request, criteria } : request)`, and the 40,000-byte cap measures the same value, so a goal without criteria keeps today's fingerprint. `createGoalObjective` runs before `records.set`, so a refused criterion stores nothing. `ProductGoal` gains no field.
+- **`prepare`.** When `objectivePromptsOn(project)`, it calls `goalRecordDigest(stored, project.team.checks)`. A digest sets `context.record` as the last key; a skip adds the fixed event and launches without `record`. The digest is built before `stored.launch` is saved, so a replayed launch carries it. Texts: `The objective record could not be read, so this cycle's members read the success text without its criteria.` and `The active criteria exceed the prompt digest, so this cycle's members read the success text without them.`
+
+- [ ] **Step 1: Write the failing tests** in `tests/objective-goals.test.ts`. The fixture's project gets `objective: { prompts: "on" }` unless a row says otherwise.
+
+| Test name | Assertions |
+|---|---|
+| `creation criteria join version 1` | A goal created with a configured command criterion and an artifact criterion has record version 1 with `c0`, `c1`, `c2` and two `criterion.added` entries; `goals.get(id)` has no `criteria` key; the same request again returns the same goal; the same `requestId` with other criteria gives 409 `request-conflict`; a criterion with an unknown command gives 400 and leaves no goal in `list()` and no sealed file. |
+| `corrections and creation criteria need the switch` | With the key absent and with `"off"`: create with criteria and a correction each give 409 `objective-prompts-off`; a goal without criteria is created, its record holds `c0` only, and after a tick its run's `goal` has no `record` key. |
+| `a correction applies once` | A correction from version 1 returns version 2; the same request again returns the same view, the sealed file bytes unchanged, and one correction event in all; the same `requestId` with other ops gives 409 `request-conflict`; a new request at version 1 gives 409 `objective-version-stale`; the goal's `revision` is unchanged. |
+| `a failed correction write changes nothing` | With `f.blockRecordWrites("goal", id)` the correction throws; the view is still version 1 and `receipts` lacks the id; after the restore the same request applies and returns version 2. |
+| `a cycle pins the digest it launched with` | A correction to version 2 before the first tick; after the tick, `teams.get(goal.activeTeamId).goal.record.version` is 2. A correction to version 3; the run still shows 2. Both services reopened from disk: the run still shows 2 and the goal's record is version 3. A goal record holding a stored `launch` whose context has no `record`, written as an older host wrote it, launches a run without `record`. |
+| `an unreadable record launches without a digest` | A stored record that fails the schema: the tick launches a run without `record`, adds the fixed event once, and the goal keeps running. |
+| `a pending control reaches its team after a failed migration write` | `f.writeTeam()`; a legacy goal with `activeTeamId` of that run and a stored pending `pause` control; the goals folder read-only while the service opens (the migration write fails); the folder writable again; after one tick the team's view shows the pause, the stored goal has no `control`, and its file holds record version 1. Skipped as root, as the step 1 test is. |
+| `lists, single reads, and an idle tick parse no record and read no sealed file` | Extends step 1's test. A counter over `fs.readFileSync` for paths that end in `.sealed`, installed with `syncBuiltinESMExports` (the technique of `tests/project-sync.test.ts`): list, two reads, and an idle tick give 0 parses and 0 sealed reads; one correction gives 2 parses and 0 sealed reads; one `prepare` (the next tick of a goal with no active run) gives 1 parse. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/objective-goals.test.ts tests/standing-goals.test.ts tests/autonomy-pins.test.ts tests/halt.test.ts` and the host typecheck.
+
+### Task 7: prompts and the prompt version
+
+**Files:** `packages/host/src/team-prompts.ts`, `packages/host/src/config-identity.ts`, `packages/host/src/teams.ts` (one line), `tests/team-prompts.test.ts`, `tests/config-identity.test.ts`. Needs Task 2. Runs in parallel with Task 3.
+
+**Interfaces (produces):**
+```ts
+// config-identity.ts
+export function renderedPrompts(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean, entryTools = false, objectiveDigest = false): string[];
+export function promptVersion(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean, entryTools = false, objectiveDigest = false): string;
+// memberConfiguration's input gains `objectiveDigest?: boolean`.
+// teams.ts, the capture at the member launch:
+//   entryTools: Boolean(member.entryTools), objectiveDigest: Boolean(stored.run.goal?.record) };
+```
+
+**Decisions:**
+
+- **The goal section with a digest.** Today's section is `Approved goal context (immutable for this run):\n${JSON.stringify(run.goal)}\n` and the fixed tail. With `run.goal.record` it is the same first line; then `JSON.stringify` of the goal without `successCriteria` and `record`; then the lead line `Success criteria from the owner's objective record, version N. Each names how it is checked; c0 is the owner's success text:`; then the JSON array of the digest's criteria with `c0`'s statement set to `successCriteria`; then today's tail unchanged. Without `record`, the code path is today's.
+- **The context file** gets the digest through `authority.goal`, with `c0`'s statement empty, so `c0`'s text appears once.
+- `withoutPrivateSettings` also deletes `objective`, so a handoff run's copy of its project never shows the switch. *(Found while planning: the handoff context copies `run.handoff.project` whole.)*
+- **The prompt version** renders the goal fixture with a fixed digest (`c0` and one command criterion) when `objectiveDigest` is true, so it changes for roles that print the goal section and only for them. The cache key gains the flag.
+- The autonomous-mode sentence of part 8 ("propose an assumption") waits for step 3, which adds assumptions.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `the record digest replaces the success text and nothing else` (team-prompts) | For every `TeamRole` and each of `ENTRY_PROVIDERS`, a goal run with and without `record`: the prompt with it equals the prompt without it with the expected section text replaced, built in the test from the format above; roles whose prompt has no goal section are equal. `teamContext` with it equals the one without it plus `authority.goal.record`. A run without `record` prints `JSON.stringify(run.goal)` verbatim. |
+| `a member context never carries the feature map or the eval block` (team-prompts, extended) | A handoff project with `objective: { prompts: "on" }` shows no `objective` key in the context. |
+| `the record digest changes the prompt version only for goal roles` (config-identity) | `promptVersion(role, "claude", undefined, false, false, true)` differs from the default for each role that prints the goal section and equals it for the others; each rendered text holds the lead line. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/team-prompts.test.ts tests/config-identity.test.ts tests/host-launch.test.ts` and the host typecheck. Also, once and not as a test: print `promptVersion` for every role and provider with the default arguments on the base commit and on the task's head, and put both lists, which must be equal, in the task report.
+
+### Task 8: the route and the host
+
+**Files:** `packages/host/src/objective-routes.ts`, `packages/host/src/server.ts`, `tests/goals.test.ts`, `tests/remote-access.test.ts`. Needs Task 6. Runs in parallel with Task 9.
+
+**Interfaces (produces):**
+```ts
+export function objectiveRoutes(app: express.Express,
+  services: { goals: Pick<GoalService, "objectiveRecord" | "correctObjective">; teams: Pick<TeamService, "objectiveRecord"> },
+  read: express.RequestHandler, owner: express.RequestHandler): void;
+// adds POST /api/goals/:id/record, owner only; the id lower-cased as the reads do; the body goes to correctObjective unparsed.
+// server.ts: objectiveRoutes(app, { goals, teams }, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
+// server.ts, POST /api/goals: const { goal: body, criteria } = parseGoalCreateBody(req.body); ... goals.create(body, undefined, criteria)
+```
+
+**Decisions:** the route contract that Task 9 builds against. Request `{ requestId, version, ops }`; answer 200 with the latest `ObjectiveRecordView`. Errors are the host's TeamError body with the codes and texts of Task 4, plus 403 for a non-owner and 409 `request-conflict`. Routine goals keep `goals.create(request, admit)` and never pass criteria. `POST /api/teams/:id/record` does not exist.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `owner corrections through the host` (goals, host) | A project with the switch on. A goal created with one criterion answers 200, and `/goals/:id/record` shows `c1`. An owner correction answers 200 with version 2; a controller and a viewer get 403; an unknown key, 17 ops, and a statement of 1,001 bytes each get 400 with exactly `{ code: "objective-op-invalid", error: "The correction is invalid." }`; a replay answers 200 with the same version. |
+| `the relay refuses corrections` (remote-access) | `["POST", "/goals/<uuid>/record"]` joins the paths that answer 403 `remote-endpoint-denied`. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `tests/remote-access.test.ts`, then `tests/goals.test.ts` on the host, then the host typecheck.
+
+### Task 9: the CLI and the docs
+
+**Files:** `packages/host/src/objective-cli.ts`, `tests/objective-cli.test.ts`, `docs/teams.md`, the spec. Needs Task 1. Runs in parallel with Task 8.
+
+**Interfaces (produces):**
+```ts
+export const GOAL_RECORD_USAGE: string;   // the three forms below
+export const CORRECTION_FILE_BYTES = 64 * 1024;
+/** `{ "ops": [...] }`, checked with correctionSchema before any request. Throws an Error that names the op's index, never its text. */
+export function readCorrectionFile(path: string): CorrectionOp[];
+```
+Forms: `infinite goal record ID [--version N] [--json]` (step 1); `infinite goal record ID retire CID|confirm CID [--version N] [--request-id ID] [--json]`; `infinite goal record ID apply --file PATH [--version N] [--request-id ID] [--json]`.
+
+**Decisions:**
+
+- **A correction reads the version, then posts once.** Without `--version`, the command reads `/goals/ID/record` for the latest version. It posts `{ requestId, version, ops }` with `--request-id` or a new UUID, then prints `Record version N.` and the step 1 record lines (or the view with `--json`). With `--version` it does not read first. On a correction form, `--version` names the version the correction applies to.
+- **A retry is safe only with the same body**, because the replay digest covers the version. When the post fails without an answer, the command prints `The correction may have been applied. Retry it safely with: infinite goal record ID FORM --version N --request-id RID`, with the values it used, and exits non-zero.
+- **Error sentences**: the host's fixed `error` text for each Task 4 code, printed as is; 403: `Corrections need an owner device key.`; 409 `request-conflict`: `This request ID was used for another correction. Leave out --request-id to send a new one.` A file over 64 KiB, not JSON, or failing the schema is an error before any request, naming the op's index.
+- **Docs.** `docs/teams.md`, the goal record section: the switch, its place in the routine approval digest, and that writing the key at all changes it; creation criteria; the four ops and their limits; the digest's shape, its 6 KiB cap, and its pin per cycle; the three CLI forms; and before a rollback to a host without this slice, remove `project.team.objective`, which the older strict project schema refuses. The spec: part 2, the pin per cycle run in place of "from the next member start" and the step 2 op list; part 8, the digest's shape, the cap measured with `c0`'s statement empty, and the CLI forms; the delivery order, the `evaluators` slot and standalone-run corrections moved to step 3, and the evidence store module left out.
+
+- [ ] **Step 1: Write the failing tests** in `tests/objective-cli.test.ts`, with the stub API of step 1's tests.
+
+| Test name | Assertions |
+|---|---|
+| `a correction reads the version, then posts once` | `retire c1` gives the paths `[GET /goals/G/record, POST /goals/G/record]` and the body `{ requestId: <uuid>, version: 3, ops: [{ op: "criterion.retire", id: "c1" }] }`; with `--version 3 --request-id R` only the POST, with R. `confirm c2` posts its op. |
+| `a correction file is checked before anything is sent` | A file over 64 KiB, a file that is not JSON, and a file whose op 2 has an unknown key each fail with no request; the third names `op 2` and not the key. |
+| `correction errors map to sentences` | Each Task 4 code prints its fixed text; 403 and `request-conflict` print their sentences; a failed post prints the retry command with the version and request id used. |
+| `goal options parse` (extended) | The `retire`, `confirm`, and `apply` forms parse; a fourth positional is a usage error. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement**, and amend the docs and the spec. **Step 4: Run** `node --import tsx --test tests/objective-cli.test.ts tests/client-args.test.ts` and the host typecheck.
+- [ ] **Step 5: The coordinator runs `npm run check` once on the integrated branch, requests the independent review, and commits.**
+
+## Not in this slice
+
+- **The `evaluators` lineup slot.** It moves to step 3, which adds its first reader (the intent checker's profile, part 4 "Who"). *(My call. Nothing reads it before then, and adding it now costs more than waiting: `teamLineupSchema` is strict, so a rolled-back host refuses a config that names it; every goal pins `lineup` at creation; the context file prints the whole `authority.lineup`, so every member's context changes even with the switch off; and `config.teams` is in the routine approval digest, so every active routine blocks.)*
+- **An `objective` evidence store module.** The log stays in the goal's sealed record, inside step 1's caps of 400 entries and 256 KiB, and corrections refuse at their share of it. A module adds tables, `deleteRun`, `runIds`, `counts`, and retention, with no reader in this step. *(My call. Step 1's "left for later" names it for step 2; it belongs with the first writer that needs more log than the record holds, the intent check of step 3.)*
+- **Corrections of a standalone run** (`POST /api/teams/:id/record`) and a digest in standalone runs. A run's record starts at its first accepted plan, after the members that would read a digest have started, and the intent check of step 3 is the first writer that runs before them.
+- Owner values, assumption, question, definition, rule, non-goal, excluded-path, and rubric ops, and the part 8 sentence for autonomous mode. They change parts that only step 3 creates or prints.
+- The full record in the coordinator's context file (part 8). `TeamService` cannot read the goal's record; it needs a pinned copy in the launch, which step 3 can add beside the intent check's inputs.
+- `pinned` criteria and artifact `schema` handles, which need a blob read through `teams.commandPrefix`.
+- A web, phone, or Mac form for corrections or creation criteria.
+- A controller's correction, and relay access to the route.

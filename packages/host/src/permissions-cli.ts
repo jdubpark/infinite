@@ -4,7 +4,18 @@ import type { WorkspaceDelegationView } from "./permission-delegation-types.js";
 
 type PermissionsApi = { json<T = unknown>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<T> };
 type Options = Record<string, string | boolean>;
-type PermissionStatus = { agent: string; policyVersion: number; interruptClasses: string[]; workspaces: WorkspaceDelegationView[]; rates: { lastHour: { decisions: number }; lastDay: { decisions: number } } | null };
+type RateFlag = { sessionId: string; workspaceId: string; lastHour: number; baselineMedian: number; threshold: number };
+type PermissionStatus = { agent: string; policyVersion: number; interruptClasses: string[]; workspaces: WorkspaceDelegationView[]; rates: { lastHour: { decisions: number }; lastDay: { decisions: number } } | null; rateFlags?: RateFlag[] | null };
+type Mark = { requestId: string; decisionId: string; at: string; label: string; note: string };
+type LogEntry = {
+  id: string; at: string; workspaceId: string; workspaceName?: string; projectId: string; projectName?: string; taskId: string; assignment: string;
+  sessionId: string; role?: string; provider: string; family?: string; action: { tool: string; summary: string }; rules: string[];
+  tiers: Array<{ tier: string; profileId: string; family: string; startedAt: string; endedAt: string }>;
+  verdict: string; code?: string; interruptClass?: string; note?: string; replayOf?: string; repeats?: string; durationMs: number | null;
+  rejectState?: string; rateFlagged?: boolean; deliveries: Array<{ at: string; kind: string; detail?: string }>; marks: Mark[];
+  controls: Array<{ kind: string; at: string; reason?: string }>;
+};
+type LogPage = { entries: LogEntry[]; next?: string; rateFlags: RateFlag[] | null };
 type DelegationResult = { agent: string; views: WorkspaceDelegationView[]; replacedOptOuts: string[] };
 type RevocationResult = { agent: string; view: WorkspaceDelegationView };
 
@@ -13,6 +24,52 @@ const INACTIVE_NOTICE = "The permission agent is not active on this host yet. Re
 const STATUS_USAGE = "Usage: infinite permissions status [--json]";
 const DELEGATE_USAGE = "Usage: infinite permissions delegate (--workspace W | --all) [--direction TEXT | --clear-direction] [--request-id UUID]";
 const REVOKE_USAGE = "Usage: infinite permissions revoke --workspace W [--request-id UUID]";
+const LOG_USAGE = "Usage: infinite permissions log [--rejected] [--raised] [--workspace W] [--since T] [--limit N] [--before CURSOR] [--json]";
+const MARK_USAGE = "Usage: infinite permissions mark DECISION_ID --wrong --note TEXT [--request-id UUID]";
+const MARK_NOTICE = "A mark is a record only and changes no decision. To change later decisions, reopen the reject or change the workspace's direction.";
+
+/** An ISO timestamp with a zone, or a span back from now such as 30m, 24h or 7d. */
+export function sinceOption(value: string, now = Date.now()): string {
+  const span = /^(\d{1,4})([mhd])$/.exec(value);
+  if (span) return new Date(now - Number(span[1]) * { m: 60_000, h: 3_600_000, d: 86_400_000 }[span[2] as "m" | "h" | "d"]).toISOString();
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/.test(value) && Number.isFinite(Date.parse(value)))
+    return new Date(Date.parse(value)).toISOString();
+  throw new Error("--since needs a time with a zone, such as 2026-11-14T09:00Z, or a span such as 30m, 24h or 7d");
+}
+
+const when = (value: string) => clean(value).replace(/:\d{2}(?:\.\d+)?Z$/, "Z").replace("T", " ");
+const seconds = (ms: number) => `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)} s`;
+
+function verdictLine(entry: LogEntry) {
+  const outcome = entry.verdict === "reject" ? `reject ${clean(entry.code)}` : entry.verdict === "owner" ? `owner ${clean(entry.interruptClass)}` : "allow";
+  return [outcome, entry.rejectState && clean(entry.rejectState), entry.replayOf && "replay", entry.rateFlagged && "above usual rate"].filter(Boolean).join(" · ");
+}
+
+function printRateFlags(flags: RateFlag[] | null | undefined) {
+  for (const flag of flags ?? [])
+    console.log(`Above usual rate: session ${clean(flag.sessionId)} in ${clean(flag.workspaceId)}, ${Number(flag.lastHour)} decisions in the last hour (flagged above ${Number(flag.threshold)})`);
+}
+
+function printEntry(entry: LogEntry) {
+  const place = [entry.workspaceName ?? entry.workspaceId, entry.projectName ?? entry.projectId].map(value => clean(value)).join(" / ");
+  console.log(`${when(entry.at)}  ${verdictLine(entry)}  ${place}`);
+  console.log(`  Id: ${clean(entry.id)}`);
+  console.log(`  Action: ${clean(entry.action.tool)}: ${clean(entry.action.summary, 2000)}`);
+  const requester = [`session ${clean(entry.sessionId)}`, entry.role && clean(entry.role), clean(entry.provider), entry.family && `family ${clean(entry.family)}`].filter(Boolean).join(" · ");
+  console.log(`  Requester: ${requester}`);
+  console.log(`  Task: ${clean(entry.taskId)} · assignment ${clean(entry.assignment)}`);
+  if (entry.rules.length) console.log(`  Host rules: ${entry.rules.map(rule => clean(rule)).join(", ")}`);
+  if (entry.tiers.length) {
+    const tiers = entry.tiers.map(tier => `${clean(tier.tier)} ${clean(tier.profileId)} (${clean(tier.family)}) ${seconds(Date.parse(tier.endedAt) - Date.parse(tier.startedAt))}`);
+    console.log(`  Tiers: ${tiers.join(", then ")}${entry.durationMs === null ? "" : ` · ${seconds(entry.durationMs)} in all`}`);
+  } else console.log("  Tiers: none");
+  if (entry.replayOf) console.log(`  Replay of: ${clean(entry.replayOf)}`);
+  if (entry.repeats) console.log(`  Repeats: ${clean(entry.repeats)}`);
+  if (entry.deliveries.length) console.log(`  Delivery: ${entry.deliveries.map(event => `${clean(event.kind)} ${when(event.at)}${event.detail ? ` (${clean(event.detail, 200)})` : ""}`).join(", ")}`);
+  for (const control of entry.controls) console.log(`  ${control.kind === "reopen" ? "Reopened" : "Closed"}: ${when(control.at)}${control.reason ? ` (${clean(control.reason)})` : ""}`);
+  if (entry.note) console.log(`  Note (owner only): ${clean(entry.note, 2000)}`);
+  for (const mark of entry.marks) console.log(`  Marked ${clean(mark.label)}: ${when(mark.at)}: ${clean(mark.note, 2000)}`);
+}
 
 const stringOption = (options: Options, name: string) => {
   const value = options[name];
@@ -29,6 +86,11 @@ function requestIdOption(options: Options): string {
 async function requireDelegationHost(api: PermissionsApi) {
   const me = await api.json<{ permissions?: { workspaceDelegation?: number } }>("/me");
   if (me.permissions?.workspaceDelegation !== 1) throw new Error("This host does not support workspace permission delegation. Upgrade the host.");
+}
+
+async function requireDecisionLogHost(api: PermissionsApi) {
+  const me = await api.json<{ permissions?: { decisionLog?: number } }>("/me");
+  if (me.permissions?.decisionLog !== 1) throw new Error("This host does not have the permission decision log. Upgrade the host.");
 }
 
 function printView(view: WorkspaceDelegationView) {
@@ -51,6 +113,7 @@ export async function handlePermissionsClientCommand(positional: string[], optio
       if (!result.workspaces.length) console.log("No projects are enrolled on this host.");
       for (const view of result.workspaces) printView(view);
       if (result.rates) console.log(`Decisions: ${Number(result.rates.lastHour.decisions)} in the last hour, ${Number(result.rates.lastDay.decisions)} in the last day`);
+      printRateFlags(result.rateFlags);
       printNotice(result.agent);
     }
     return true;
@@ -96,5 +159,53 @@ export async function handlePermissionsClientCommand(positional: string[], optio
     }
     return true;
   }
-  throw new Error("Usage: infinite permissions status|delegate|revoke ...");
+  if (verb === "log") {
+    if (positional.length !== 1) throw new Error(LOG_USAGE);
+    const params = new URLSearchParams();
+    if (options["--rejected"]) params.set("rejected", "1");
+    if (options["--raised"]) params.set("raised", "1");
+    const workspace = stringOption(options, "--workspace");
+    if (workspace !== undefined) params.set("workspace", workspace);
+    const since = stringOption(options, "--since");
+    if (since !== undefined) params.set("since", sinceOption(since));
+    const limit = stringOption(options, "--limit");
+    if (limit !== undefined) {
+      if (!/^\d{1,3}$/.test(limit) || Number(limit) < 1 || Number(limit) > 200) throw new Error("--limit must be a number from 1 to 200");
+      params.set("limit", limit);
+    }
+    const before = stringOption(options, "--before");
+    if (before !== undefined) {
+      if (!/^\d{1,15}\.\d{1,15}$/.test(before)) throw new Error("--before must be the cursor that a previous page printed");
+      params.set("before", before);
+    }
+    await requireDecisionLogHost(api);
+    const query = params.toString();
+    const page = await api.json<LogPage>(`/permissions/log${query ? `?${query}` : ""}`);
+    if (options["--json"]) console.log(JSON.stringify(page, null, 2));
+    else {
+      printRateFlags(page.rateFlags);
+      if (!page.entries.length) console.log("No permission decisions match.");
+      for (const entry of page.entries) printEntry(entry);
+      if (page.next) console.log(`More decisions: add --before ${clean(page.next)}`);
+    }
+    return true;
+  }
+  if (verb === "mark") {
+    const decisionId = positional[1];
+    const note = stringOption(options, "--note");
+    if (positional.length !== 2 || !decisionId || options["--wrong"] !== true || note === undefined) throw new Error(MARK_USAGE);
+    if (!note.trim()) throw new Error("--note needs text that says why the decision was wrong");
+    if (note.length > 2000) throw new Error("--note can hold at most 2000 characters");
+    const requestId = requestIdOption(options);
+    await requireDecisionLogHost(api);
+    console.error(`[Infinite] Marking decision ${clean(decisionId)} wrong · request ${requestId}`);
+    const result = await api.json<{ mark: Mark }>("/permissions/marks", { requestId, decisionId, label: "wrong", note });
+    if (options["--json"]) console.log(JSON.stringify(result, null, 2));
+    else {
+      console.log(`Marked ${clean(result.mark.decisionId)} ${clean(result.mark.label)} at ${when(result.mark.at)}`);
+      console.log(MARK_NOTICE);
+    }
+    return true;
+  }
+  throw new Error("Usage: infinite permissions status|delegate|revoke|log|mark ...");
 }

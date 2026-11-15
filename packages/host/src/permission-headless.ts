@@ -221,7 +221,8 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
   /**
    * Whether the owner's allow of a deferred call may still be returned to the resumed call: the session keeps the
    * root the deferral was decided under, no owner halt covers its project, and the decision the deferral was issued
-   * still applies. The owner's answer may be days old, so it is read now, at the moment the call would run.
+   * still applies. A deferral issued no decision gets no allow. The owner's answer may be days old, so it is read
+   * now, at the moment the call would run.
    */
   private resumable(session: Session, request: Extract<ChannelRequest, { op: "resume" }>): ChannelReply {
     if (typeof request.sessionRoot !== "string" || request.sessionRoot.length < 1 || request.sessionRoot.length > 4096) throw new Error("invalid");
@@ -238,11 +239,12 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
     let halted: boolean;
     try { halted = pipeline.halted?.(session.projectId) === true; } catch { halted = true; }
     if (halted) return { result: "withheld", reason: "halted" };
-    if (issued) {
-      let applies: boolean;
-      try { applies = pipeline.applicable(request.decisionId!) === true; } catch { applies = false; }
-      if (!applies) return { result: "withheld", reason: "stale" };
-    }
+    // The allow is bound to the decision its deferral was issued, whose authority holds every recorded halt. A deferral
+    // without one is bound to no authority, so no allow is returned for it.
+    if (!issued) return { result: "withheld", reason: "stale" };
+    let applies: boolean;
+    try { applies = pipeline.applicable(request.decisionId!) === true; } catch { applies = false; }
+    if (!applies) return { result: "withheld", reason: "stale" };
     return { result: "ok" };
   }
 
@@ -329,11 +331,15 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
       let outcome;
       try { outcome = await pipeline.decide(built); } catch { outcome = undefined; }
       if (outcome?.kind === "not-served") return { result: "not-served" };
-      const sessionRoot = built.requester.sessionRoot;
+      // An owner halt: nothing is decided or recorded, and no answer may wait for the release, so the call is denied.
+      if (outcome?.kind === "held") return { result: "deny", code: "unavailable", notice: requesterNotice("unavailable") };
       if (outcome?.kind === "owner")
-        return { result: "owner", interruptClass: outcome.interruptClass, rule: match.rule, sessionRoot, ...this.issued(outcome.decisionId, session.id) };
-      // A class rule matched, so the owner answers whatever else the pipeline returned.
-      return { result: "owner", interruptClass: match.interruptClass, rule: match.rule, sessionRoot };
+        return { result: "owner", interruptClass: outcome.interruptClass, rule: match.rule, sessionRoot: built.requester.sessionRoot, ...this.issued(outcome.decisionId, session.id) };
+      // Any other outcome, or none, gives no owner decision that an answer could be bound to, so the call cannot wait
+      // for the owner. It is denied with needs-owner, and the owner is told with the class rule's class.
+      const decided = outcome && "decisionId" in outcome && typeof outcome.decisionId === "string" ? this.issued(outcome.decisionId, session.id) : undefined;
+      if (decided) pipeline.recordDelivery(decided.decisionId, "refusal", "Headless: a class call got no owner decision; it was denied with needs-owner.");
+      return { result: "deny", code: "needs-owner", notice: requesterNotice("needs-owner"), interruptClass: match.interruptClass, ...(decided ?? {}) };
     }
     if (typeof request.requestId !== "string" || !/^headless:[a-f0-9-]{36}:[A-Za-z0-9_:-]{1,200}$/.test(request.requestId)) throw new Error("invalid");
     const built = headlessRequest(session, call, request.requestId);

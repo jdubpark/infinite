@@ -190,6 +190,20 @@ test("an owner halt engaged after the owner's allow and before the resumed call 
   } finally { await r.stop(); }
 });
 
+test("a class call that arrives during an owner halt is denied as unavailable and never waits for an answer", { timeout: 90_000 }, async () => {
+  const r = await rig({ overrides: { halted: () => true, decide: async () => ({ kind: "held" }) } });
+  try {
+    const id = randomUUID();
+    await r.manager.create({ requestId: id, provider: "claude", projectId: "rehearsal", title: "Headless", prompt: "allowlisted" });
+    const ended = await waitFor(() => live(r, id), s => s.status === "exited", 30_000);
+    assert.equal(r.log("ran.log"), "");
+    assert.equal(r.log("denied.log"), `deploy production: ${requesterNotice("unavailable")}\n`);
+    // No deferral was made, so no owner answer exists that could run the call after the release.
+    assert.equal(ended.permissionChannel?.waiting, undefined);
+    assert.deepEqual(r.channelEvents(id).filter(event => event.event === "deferred"), []);
+  } finally { await r.stop(); }
+});
+
 test("an owner's refusal reaches the call with the host's notice and the owner's direction, and the call never runs", { timeout: 90_000 }, async () => {
   const r = await rig({ args: ["--allowedTools", "Bash(deploy production)"] });
   try {
@@ -304,6 +318,15 @@ test("the owner's answer is returned once, only to the call it was given for", a
   assert.deepEqual(await w.pre("deploy production", "toolu_1"), { decision: "allow" });
   // The same call again, once the answer was used, is the owner's again.
   assert.deepEqual(await w.pre("deploy production", "toolu_1"), { decision: "deny", reason: requesterNotice("needs-owner") });
+});
+
+test("a class call the host denies is never deferred, and the owner is told with its class unless a halt denied it", async () => {
+  const w = workerRig([{ result: "deny", code: "needs-owner", notice: "MODEL TEXT", interruptClass: "production-or-staging" }]);
+  assert.deepEqual(await w.pre("deploy production", "toolu_1"), { decision: "deny", reason: requesterNotice("needs-owner") });
+  assert.deepEqual([w.channel.view().notice?.interruptClass, w.channel.view().waiting, w.channel.exited(0)], ["production-or-staging", undefined, false]);
+  const halted = workerRig([{ result: "deny", code: "unavailable", notice: requesterNotice("unavailable") }]);
+  assert.deepEqual(await halted.pre("deploy production", "toolu_1"), { decision: "deny", reason: requesterNotice("unavailable") });
+  assert.deepEqual([halted.channel.view().notice, halted.channel.exited(0)], [undefined, false]);
 });
 
 test("an owner's allow is withheld, and still used once, when the host refuses it at the resume or cannot be reached", async () => {
@@ -457,11 +480,29 @@ test("a team member's headless seat is the interactive team adapter's, so their 
   assert.deepEqual(fake.decided.map(request => request.requester.assignment), ["team:run-1:implementer:task:task-a", "team:run-1:implementer"]);
 });
 
-test("a class rule sends the call to the owner whatever else the pipeline returns", async () => {
-  const h = hostRig(fakePipeline({ decide: async () => ({ kind: "allow", decisionId: randomUUID(), strongTier: true }) }).pipeline);
+test("a class call waits only on a recorded owner decision: a halt denies it as unavailable, any other outcome needs the owner", async () => {
+  // Under a halt nothing is decided or recorded, and nothing waits for the release.
+  const held = fakePipeline({ decide: async () => ({ kind: "held" }) });
+  const h = hostRig(held.pipeline);
   try {
-    assert.deepEqual(await h.ask({ op: "class", call: bash("deploy production") }), { result: "owner", interruptClass: "production-or-staging", rule: "production-deploy", sessionRoot: h.session.cwd });
+    assert.deepEqual(await h.ask({ op: "class", call: bash("deploy production") }), { result: "deny", code: "unavailable", notice: requesterNotice("unavailable") });
+    assert.equal(held.deliveries.length, 0);
   } finally { h.done(); }
+  // No owner decision to bind an answer to: denied with needs-owner, and the owner is told with the class rule's class.
+  const needsOwner = { result: "deny", code: "needs-owner", notice: requesterNotice("needs-owner"), interruptClass: "production-or-staging" };
+  for (const decide of [async () => ({ kind: "undeliverable", reason: "no ledger" }), async () => { throw new Error("journal down"); }]) {
+    const other = hostRig(fakePipeline({ decide: decide as PermissionPipeline["decide"] }).pipeline);
+    try { assert.deepEqual(await other.ask({ op: "class", call: bash("deploy production") }), needsOwner); }
+    finally { other.done(); }
+  }
+  // A verdict other than the owner's, for a class call: the same, and its decision records the refusal.
+  const decisionId = randomUUID();
+  const allowed = fakePipeline({ decide: async () => ({ kind: "allow", decisionId, strongTier: true }) });
+  const a = hostRig(allowed.pipeline);
+  try {
+    assert.deepEqual(await a.ask({ op: "class", call: bash("deploy production") }), { ...needsOwner, decisionId, deliveryKey: deliveryKey(a.key, a.session.id, decisionId) });
+    assert.deepEqual(allowed.deliveries.map(d => [d.decisionId, d.kind]), [[decisionId, "refusal"]]);
+  } finally { a.done(); }
 });
 
 test("an allow is returned only while it still applies, and a destructive one only from the strong tier", async () => {
@@ -506,7 +547,8 @@ test("the resume check withholds an owner's allow from a team member whose run i
   const h = hostRig(fakePipeline().pipeline, { channel: true },
     { team: { runId: "run-1", memberId: "m-1", revision: 1, role: "implementer", taskId: "task-a" }, teamLive: () => live });
   try {
-    const resume = () => h.ask({ op: "resume", sessionRoot: h.session.cwd });
+    const decisionId = randomUUID();
+    const resume = () => h.ask({ op: "resume", sessionRoot: h.session.cwd, decisionId, deliveryKey: deliveryKey(h.key, h.session.id, decisionId) });
     assert.deepEqual(await resume(), { result: "ok" });
     live = false;
     assert.deepEqual(await resume(), { result: "withheld", reason: "stale" });
@@ -522,8 +564,8 @@ test("the resume check confirms an owner's allow only without a halt, while its 
     const resume = (extra: Record<string, unknown> = {}) =>
       h.ask({ op: "resume", sessionRoot: h.session.cwd, decisionId, deliveryKey: deliveryKey(h.key, h.session.id, decisionId), ...extra });
     assert.deepEqual(await resume(), { result: "ok" });
-    // A deferral that was issued no decision is checked for the halt and the root only.
-    assert.deepEqual(await resume({ decisionId: undefined, deliveryKey: undefined }), { result: "ok" });
+    // A deferral that was issued no decision is bound to no authority: its allow is withheld, also with no halt now.
+    assert.deepEqual(await resume({ decisionId: undefined, deliveryKey: undefined }), { result: "withheld", reason: "stale" });
     halted = () => true;
     assert.deepEqual(await resume(), { result: "withheld", reason: "halted" });
     assert.deepEqual(await resume({ decisionId: undefined, deliveryKey: undefined }), { result: "withheld", reason: "halted" });

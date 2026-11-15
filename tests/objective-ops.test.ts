@@ -359,6 +359,96 @@ test("every version rebuilds after random corrections and steering", () => {
   }
 });
 
+/** A statement that makes the retired form of a criterion exactly `bytes` canonical bytes. Each quote adds two bytes, each letter one. */
+function statementForRetired(check: CheckInput, threshold: Threshold, bytes: number): string {
+  const base = canonicalBytes({ id: "c1", origin: "owner", statement: "", check, producer: "host", threshold, state: "retired" });
+  const extra = bytes - base;
+  for (let quotes = 0; quotes <= 1000; quotes += 1) {
+    const plain = extra - 2 * quotes;
+    if (plain >= 1 && quotes + plain <= 1000) return '"'.repeat(quotes) + "s".repeat(plain);
+  }
+  throw new Error("no statement of the requested size");
+}
+
+const LONG_CHECK: CheckInput = { kind: "artifact", path: "research/" + "p".repeat(280) + ".md", count: "/" + "q".repeat(60) + "/" + "r".repeat(60) };
+const LONG_THRESHOLD: Threshold = { kind: "count", min: 1 };
+
+test("a retired criterion of 2,048 bytes stays inline, and one byte more is refused at add", () => {
+  const inputAt = (bytes: number): CriterionInput => ({ statement: statementForRetired(LONG_CHECK, LONG_THRESHOLD, bytes), check: LONG_CHECK, threshold: LONG_THRESHOLD });
+  const start = v1();
+  const added = applyOwnerOps(start, correction(1, [{ op: "criterion.add", criterion: inputAt(2048) }]), context);
+  const criterion = added.criteria.find(item => item.id === "c1")!;
+  assert.equal(canonicalBytes({ ...criterion, state: "retired" }), 2048, "the retired form is 2,048 bytes");
+  assert.equal(canonicalBytes(criterion), 2047, "the active form is one byte shorter");
+
+  const retired = applyOwnerOps(added, correction(2, [{ op: "criterion.retire", id: "c1" }]), context);
+  assert.ok(objectiveRecordSchema.safeParse(retired).success, "the retired record parses");
+  const entry = retired.log.at(-1)!;
+  assert.ok(entry.before !== undefined && "inline" in entry.before && entry.after !== undefined && "inline" in entry.after, "the retire logs both values inline");
+  assert.deepEqual(normal(rebuildVersion(retired, 2)), normal(added), "version 2 rebuilds");
+  assert.deepEqual(normal(rebuildVersion(retired, 1)), normal(start), "version 1 rebuilds");
+
+  const over = refusal(() => applyOwnerOps(start, correction(1, [{ op: "criterion.add", criterion: inputAt(2049) }]), context));
+  assert.equal(over.code, "objective-criterion-too-large", "a criterion whose retired form is 2,049 bytes is refused at add");
+  assert.equal(over.status, 400);
+});
+
+test("the whole-record refusals change nothing and echo nothing", () => {
+  const ECHO = "QUARTZ-REFUSED-TEXT";
+  const base = v1();
+  const sizedOp = (text: string, index: number): CorrectionOp => add(text + "a".repeat(1000 - Buffer.byteLength(text) - 2) + String(index).padStart(2, "0"));
+  const retiredHeavy = Array.from({ length: 22 }, (_, index): Criterion => ({
+    id: `c${index + 1}`, origin: "owner", statement: statementForRetired(LONG_CHECK, LONG_THRESHOLD, 1460),
+    check: LONG_CHECK, producer: "host", threshold: LONG_THRESHOLD, state: "retired",
+  }));
+  const heavy = withCriteria(base, [base.criteria[0]!, ...retiredHeavy]);
+  assert.ok(objectiveRecordSchema.safeParse(heavy).success, "22 retired criteria of about 1.46 KB parse");
+  const four = applyOwnerOps(base, correction(1, Array.from({ length: 4 }, (_, index) => sizedOp("b", index))), context);
+  const crowded = { ...base, log: [...base.log, ...Array.from({ length: 377 }, (_, index) => note(index + 2))] };
+  assert.equal(crowded.log.length, 378);
+
+  const cases: { name: string; record: ObjectiveRecord; ops: CorrectionOp[]; code: ObjectiveErrorCode }[] = [
+    // 378 entries and three adds make 381.
+    { name: "log-full", record: crowded, ops: [add("First ok."), add(ECHO), add("Last ok.")], code: "objective-log-full" },
+    // Retired criteria of 1.46 KB and three adds of 1,000 bytes pass 32 KiB.
+    { name: "too-large", record: heavy, ops: [sizedOp("", 1), sizedOp(ECHO, 2), sizedOp("", 3)], code: "objective-too-large" },
+    // Five active statements of 1,000 bytes plus two more make a digest over 6 KiB.
+    { name: "digest-too-large", record: four, ops: [sizedOp("", 7), sizedOp(ECHO, 8)], code: "objective-digest-too-large" },
+    // A 1,500-byte statement passes the size check, and the record's own rule refuses it.
+    { name: "op-refused", record: base, ops: [add("First ok."), add(ECHO + "a".repeat(1500 - ECHO.length)), add("Last ok.")], code: "objective-op-refused" },
+  ];
+  for (const item of cases) {
+    const before = structuredClone(item.record);
+    const error = refusal(() => applyOwnerOps(item.record, correction(item.record.version, item.ops), context));
+    assert.equal(error.code, item.code, item.name);
+    assert.equal(error.status, OBJECTIVE_ERRORS[item.code].status, item.name);
+    assert.ok(!(JSON.stringify(error) + error.message).includes(ECHO), `${item.name}: the refusal holds no input text`);
+    assert.deepEqual(item.record, before, `${item.name}: the input record is unchanged`);
+  }
+});
+
+test("the secret scan covers every op before the per-op checks", () => {
+  const token = "gh" + "p_" + "a".repeat(36);
+  const secretInPath: CorrectionOp = {
+    op: "criterion.add",
+    criterion: { statement: "An artifact check.", check: { kind: "artifact", path: `docs/${token}.md`, count: "/items" }, threshold: { kind: "count", min: 1 } },
+  };
+  const error = refusal(() => applyOwnerOps(v1(), correction(1, [{ op: "criterion.edit", id: "c9", statement: "Unknown." }, secretInPath]), context));
+  assert.equal(error.code, "objective-secret", "the secret wins over the missing target");
+  assert.equal(error.status, 400);
+  assert.ok(!(JSON.stringify(error) + error.message).includes(token), "the refusal holds no secret text");
+});
+
+test("targets resolve against the input record, in either order", () => {
+  const addFirst = add("Added first.");
+  const editNew: CorrectionOp = { op: "criterion.edit", id: "c1", statement: "Edited." };
+  const addThenEdit = refusal(() => applyOwnerOps(v1(), correction(1, [addFirst, editNew]), context));
+  assert.equal(addThenEdit.code, "objective-op-target");
+  assert.equal(addThenEdit.status, 409);
+  const editThenAdd = refusal(() => applyOwnerOps(v1(), correction(1, [editNew, addFirst]), context));
+  assert.equal(editThenAdd.code, "objective-op-target");
+});
+
 // The ops file's own helpers are exercised above; these two keep the creation path and the digest in view.
 test("creation criteria are version 1 and never stale", () => {
   const inputs: CriterionInput[] = [

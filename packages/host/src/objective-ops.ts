@@ -58,10 +58,14 @@ function checkOf(input: CheckInput, configured: readonly TeamCommand[]): Check {
   return { kind: "command", command: digest };
 }
 
-/** A criterion's threshold must fit its check, and its canonical value must fit one log value. */
+/**
+ * A criterion's threshold must fit its check, and it must fit one log value in its retired form too: a retire logs the
+ * active criterion as `before`, and the retired one as `after`, so the retired form is the larger one (`retired` is a
+ * byte longer than `active`). A criterion that passes here can always be retired inline.
+ */
 function verified(criterion: Criterion): Criterion {
   if (!thresholdFits(criterion.check, criterion.threshold)) fail("objective-criterion-misfit");
-  if (canonicalBytes(criterion) > CORRECTION_LIMITS.criterionCanonicalBytes) fail("objective-criterion-too-large");
+  if (canonicalBytes({ ...criterion, state: "retired" }) > CORRECTION_LIMITS.criterionCanonicalBytes) fail("objective-criterion-too-large");
   return criterion;
 }
 
@@ -105,9 +109,10 @@ function applyOps(record: ObjectiveRecord, ops: readonly CorrectionOp[], version
       log("criterion.added", created.id, undefined, created);
       continue;
     }
-    const index = criteria.findIndex(item => item.id === op.id);
-    const current = criteria[index];
+    // Targets resolve against the input record, so an op cannot act on a criterion that an earlier op of the same correction adds.
+    const current = record.criteria.find(item => item.id === op.id);
     if (current === undefined || current.state !== "active") fail("objective-op-target");
+    const index = criteria.findIndex(item => item.id === op.id);
     if (op.op === "criterion.confirm") {
       if (current.origin !== "derived") fail("objective-op-target");
       const confirmed: Criterion = { ...current, origin: "owner" };

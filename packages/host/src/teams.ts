@@ -653,12 +653,15 @@ export class TeamService {
         this.save(stored); this.trackBlocked(stored);
       }
       // A record from before every dispatched answer was marked: its uncertain answers may still be typed, so each
-      // is fenced again before the run switches to the permission agent.
+      // is fenced again before the run switches to the permission agent. A record with none is not rewritten; the
+      // mark goes out with its next save.
       if (!stored.answersMarked) {
         const uncertain = (stored.run.permissionDecisions ?? []).filter(decision => decision.status === "uncertain").map(decision => decision.id);
-        if (uncertain.length) stored.unfencedAnswers = [...new Set([...(stored.unfencedAnswers ?? []), ...uncertain])];
         stored.answersMarked = true;
-        this.save(stored);
+        if (uncertain.length) {
+          stored.unfencedAnswers = [...new Set([...(stored.unfencedAnswers ?? []), ...uncertain])];
+          this.save(stored);
+        }
       }
       for (const decision of stored.run.permissionDecisions ?? []) if (decision.status === "answering") {
         decision.status = "uncertain";

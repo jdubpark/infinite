@@ -29,7 +29,7 @@ type Stored = {
   receipts: Record<string, Receipt>;
 };
 type StateWriter = (file: string, key: Buffer, scope: string, value: unknown) => void;
-type Groups = Pick<ProjectGroupService, "list" | "containing" | "ownerMoveMark" | "storedMembers">;
+type Groups = Pick<ProjectGroupService, "list" | "containing" | "ownerMoveMark" | "storedHolder">;
 type Options = { now?: () => number; writeState?: StateWriter; policyVersion?: number };
 
 const SCOPE = "permission-delegations";
@@ -52,8 +52,11 @@ const projectIds = (group: PermissionDelegationGroup): string[] =>
  * project that leaves the host and returns.
  *
  * A project that is not enrolled is covered by nothing, and its entry waits. An owner act on a
- * workspace cannot see such a project, so the act ends the entry of every checkout stored in that
- * workspace that is not enrolled at that time: an older entry never outlives a newer decision.
+ * workspace reaches every project that the workspace holds, and it ends the entry of each one that
+ * is not enrolled at that time: the act cannot see that project, and an older entry never outlives
+ * a newer decision. It reaches no project that another workspace holds.
+ *
+ * One instance writes this state. A second live writer would overwrite it from its own snapshot.
  */
 export class PermissionDelegationService {
   private readonly file: string;
@@ -166,25 +169,27 @@ export class PermissionDelegationService {
   }
 
   /**
-   * Every workspace the host lists under this id, or else the workspace that holds the project with this id.
-   * More than one can match: a stored project keeps its id when the owner removes the checkout that the id came
-   * from, and that checkout's own implicit project is then listed under the same id.
+   * What an owner act by `id` reaches: the listed workspaces, and the entries of projects that those workspaces
+   * hold and that are not enrolled now.
+   *
+   * A workspace holds the checkouts stored in it. A project in no stored workspace is held by its own implicit
+   * workspace, which carries the project's id and is listed only while the project is enrolled. So the id can name
+   * a stored workspace, an implicit one, or both: a stored workspace keeps its id when the owner removes the
+   * checkout that the id came from. Only when the id names no workspace is it read as a project id, and it then
+   * names the workspace that holds that project.
    */
-  private workspaces(id: string): PermissionDelegationGroup[] {
+  private target(id: string, state: Stored): { found: PermissionDelegationGroup[]; absent: string[] } {
     const listed = this.groups.list().groups as PermissionDelegationGroup[];
-    const named = listed.filter(group => group.id === id);
-    if (named.length > 0) return named;
-    return listed.filter(group => projectIds(group).includes(id) || this.groups.storedMembers(group.id).includes(id));
-  }
-
-  /**
-   * Projects that are not enrolled now, that still have an entry, and that an owner act by `id` on these workspaces
-   * reaches: every checkout stored in the workspaces, and the project with that id itself, whose own implicit
-   * workspace would be listed under the id if it were enrolled. Ending an entry adds no onboarding history.
-   */
-  private absentEntries(state: Stored, id: string, found: PermissionDelegationGroup[]): string[] {
-    return [...new Set([id, ...found.flatMap(group => this.groups.storedMembers(group.id))])]
-      .filter(projectId => !this.enrolled(projectId) && own(state.entries, projectId) !== undefined);
+    const away = Object.keys(state.entries).filter(projectId => !this.enrolled(projectId));
+    const namesake = away.filter(projectId => projectId === id && this.groups.storedHolder(projectId) === undefined);
+    let found = listed.filter(group => group.id === id);
+    if (found.length === 0 && namesake.length === 0) {
+      const holder = this.enrolled(id) ? undefined : this.groups.storedHolder(id);
+      found = listed.filter(group => projectIds(group).includes(id) || (!group.implicit && group.id === holder));
+    }
+    const stored = new Set(found.filter(group => !group.implicit).map(group => group.id));
+    const held = away.filter(projectId => stored.has(this.groups.storedHolder(projectId) ?? ""));
+    return { found, absent: [...namesake, ...held] };
   }
 
   private endEntries(candidate: Stored, ids: string[]) {
@@ -289,15 +294,15 @@ export class PermissionDelegationService {
     const replay = this.replay<{ view: WorkspaceDelegationView; replacedOptOuts: string[] }>(request.requestId, fingerprint);
     if (replay) return replay;
 
-    const found = this.workspaces(workspaceId);
+    const candidate = structuredClone(this.state);
+    const { found, absent } = this.target(workspaceId, candidate);
     if (found.length === 0) throw notFound();
     // A grant must name one workspace. A revocation below takes every match instead.
     if (found.length > 1)
       throw new TeamError(409, "permission-workspace-ambiguous", "Two workspaces share this id. Regroup so that the id names one workspace, or delegate every workspace.");
     const group = found[0]!;
-    const candidate = structuredClone(this.state);
     const replacedOptOuts = this.applyDelegate(candidate, group, request.direction, actor, this.timestamp());
-    this.endEntries(candidate, this.absentEntries(candidate, workspaceId, found));
+    this.endEntries(candidate, absent);
     return this.record(candidate, request.requestId, fingerprint, {
       view: this.view(group, candidate),
       replacedOptOuts: replacedOptOuts.sort(),
@@ -383,9 +388,8 @@ export class PermissionDelegationService {
     if (replay) return replay;
 
     // Every workspace under this id is revoked, so no project that the id can name stays covered.
-    const found = this.workspaces(workspaceId);
     const candidate = structuredClone(this.state);
-    const absent = this.absentEntries(candidate, workspaceId, found);
+    const { found, absent } = this.target(workspaceId, candidate);
     this.endEntries(candidate, absent);
     if (found.length === 0) {
       // A project that left the host is in no listed workspace. Its own id still ends its entry.

@@ -123,5 +123,7 @@ export interface WorkspaceDelegationView {
 export type PermissionDelegationGroup = {
   id: string;
   name: string;
+  /** True for the unstored workspace of one ungrouped project. It carries that project's id. */
+  implicit?: boolean;
   repos: Array<{ checkouts: Array<{ projectId: string; name?: string }> }>;
 };

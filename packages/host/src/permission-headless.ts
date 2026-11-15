@@ -54,7 +54,12 @@ export interface ChannelCall {
 export type ChannelRequest =
   | { v: 1; op: "class"; sessionId: string; token: string; call: ChannelCall }
   | { v: 1; op: "decide"; sessionId: string; token: string; call: ChannelCall; requestId: string }
-  | { v: 1; op: "delivery"; sessionId: string; token: string; decisionId: string; deliveryKey: string; kind: PermissionDelivery["kind"]; detail?: string };
+  | { v: 1; op: "delivery"; sessionId: string; token: string; decisionId: string; deliveryKey: string; kind: PermissionDelivery["kind"]; detail?: string }
+  /**
+   * Asked before the owner's allow of a deferred call is returned to the resumed call. `sessionRoot` is the root the
+   * deferral was decided under; `decisionId` and `deliveryKey` are set when the deferral was issued a decision.
+   */
+  | { v: 1; op: "resume"; sessionId: string; token: string; sessionRoot: string; decisionId?: string; deliveryKey?: string };
 
 /** A decision the channel returned, with the key that lets this session's worker record its delivery. */
 export type IssuedDecision = { decisionId: string; deliveryKey: string };
@@ -64,12 +69,16 @@ export type ChannelReply =
   | { result: "not-served" }
   /** No class rule matched. The provider's own rules apply. */
   | { result: "none" }
-  /** A class rule matched: the call needs the owner's own answer. */
-  | ({ result: "owner"; interruptClass: InterruptClass; rule: string } & Partial<IssuedDecision>)
+  /** A class rule matched: the call needs the owner's own answer. `sessionRoot` is the root it was decided under. */
+  | ({ result: "owner"; interruptClass: InterruptClass; rule: string; sessionRoot?: string } & Partial<IssuedDecision>)
   | ({ result: "allow" } & IssuedDecision)
   /** `notice` is the host's fixed text for the code. `interruptClass` is set when the owner must be told. */
   | ({ result: "deny"; code: RejectCode; notice: string; interruptClass?: InterruptClass | "undeliverable" } & Partial<IssuedDecision>)
-  | { result: "recorded" };
+  | { result: "recorded" }
+  /** The owner's allow of a deferred call may be returned to the resumed call now. */
+  | { result: "ok" }
+  /** The owner's allow is withheld: an owner halt covers the project, or the session or decision no longer applies. */
+  | { result: "withheld"; reason: "halted" | "stale" };
 
 /** One request over the channel socket. Rejects on a timeout or a refused connection, so the caller can deny. */
 export function channelCall(socket: string, request: ChannelRequest, timeoutMs: number): Promise<ChannelReply> {
@@ -202,6 +211,41 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
     return { decisionId, deliveryKey: deliveryKey(this.options.key, sessionId, decisionId) };
   }
 
+  /** Whether a decision id and its key were issued to this session. */
+  private bound(sessionId: string, decisionId: unknown, key: unknown): decisionId is string {
+    return typeof decisionId === "string" && decisionId.length >= 1 && decisionId.length <= 200 &&
+      typeof key === "string" && /^[a-f0-9]{64}$/.test(key) &&
+      timingSafeEqual(Buffer.from(key), Buffer.from(deliveryKey(this.options.key, sessionId, decisionId)));
+  }
+
+  /**
+   * Whether the owner's allow of a deferred call may still be returned to the resumed call: the session keeps the
+   * root the deferral was decided under, no owner halt covers its project, and the decision the deferral was issued
+   * still applies. The owner's answer may be days old, so it is read now, at the moment the call would run.
+   */
+  private resumable(session: Session, request: Extract<ChannelRequest, { op: "resume" }>): ChannelReply {
+    if (typeof request.sessionRoot !== "string" || request.sessionRoot.length < 1 || request.sessionRoot.length > 4096) throw new Error("invalid");
+    const issued = request.decisionId !== undefined || request.deliveryKey !== undefined;
+    if (issued && !this.bound(session.id, request.decisionId, request.deliveryKey)) throw new Error("unbound");
+    const pipeline = this.pipeline();
+    if (!session.headless?.channel || !pipeline) return { result: "withheld", reason: "stale" };
+    let root: string | undefined;
+    try { root = realpathSync(session.cwd); } catch { root = undefined; }
+    if (root !== request.sessionRoot) return { result: "withheld", reason: "stale" };
+    // A team member's run must still be live: stopped, paused, halted or revoked runs get no allow from here.
+    if (!this.teamServed(session)) return { result: "withheld", reason: "stale" };
+    // A halt that cannot be read counts as a halt.
+    let halted: boolean;
+    try { halted = pipeline.halted?.(session.projectId) === true; } catch { halted = true; }
+    if (halted) return { result: "withheld", reason: "halted" };
+    if (issued) {
+      let applies: boolean;
+      try { applies = pipeline.applicable(request.decisionId!) === true; } catch { applies = false; }
+      if (!applies) return { result: "withheld", reason: "stale" };
+    }
+    return { result: "ok" };
+  }
+
   /**
    * Decides at launch whether a session gets the channel. Undefined for a launch that is not headless. A headless
    * launch the channel cannot serve gets a record with the reason, and launches exactly as before.
@@ -266,14 +310,12 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
     if (!timingSafeEqual(Buffer.from(request.token), expected)) throw new Error("unbound");
     const session = this.options.sessions.meta(request.sessionId).session;
     if (request.op === "delivery") {
-      if (typeof request.decisionId !== "string" || request.decisionId.length < 1 || request.decisionId.length > 200 ||
-          typeof request.deliveryKey !== "string" || !/^[a-f0-9]{64}$/.test(request.deliveryKey) ||
-          !timingSafeEqual(Buffer.from(request.deliveryKey), Buffer.from(deliveryKey(this.options.key, session.id, request.decisionId))) ||
-          !["intent", "receipt", "refusal", "uncertain", "stale"].includes(request.kind))
+      if (!this.bound(session.id, request.decisionId, request.deliveryKey) || !["intent", "receipt", "refusal", "uncertain", "stale"].includes(request.kind))
         throw new Error("unbound");
       this.pipeline()?.recordDelivery(request.decisionId, request.kind, request.detail === undefined ? undefined : bounded(request.detail, 500));
       return { result: "recorded" };
     }
+    if (request.op === "resume") return this.resumable(session, request);
     const call = validCall((request as { call?: unknown }).call);
     if (!call || (request.op !== "class" && request.op !== "decide")) throw new Error("invalid");
     const pipeline = this.pipeline();
@@ -287,10 +329,11 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
       let outcome;
       try { outcome = await pipeline.decide(built); } catch { outcome = undefined; }
       if (outcome?.kind === "not-served") return { result: "not-served" };
+      const sessionRoot = built.requester.sessionRoot;
       if (outcome?.kind === "owner")
-        return { result: "owner", interruptClass: outcome.interruptClass, rule: match.rule, ...this.issued(outcome.decisionId, session.id) };
+        return { result: "owner", interruptClass: outcome.interruptClass, rule: match.rule, sessionRoot, ...this.issued(outcome.decisionId, session.id) };
       // A class rule matched, so the owner answers whatever else the pipeline returned.
-      return { result: "owner", interruptClass: match.interruptClass, rule: match.rule };
+      return { result: "owner", interruptClass: match.interruptClass, rule: match.rule, sessionRoot };
     }
     if (typeof request.requestId !== "string" || !/^headless:[a-f0-9-]{36}:[A-Za-z0-9_:-]{1,200}$/.test(request.requestId)) throw new Error("invalid");
     const built = headlessRequest(session, call, request.requestId);

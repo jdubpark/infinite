@@ -4,7 +4,8 @@
  *
  * A call that a class rule sends to the owner is deferred: the provider ends its run, the worker keeps the session
  * open with one owner prompt, and the owner's answer resumes the same conversation in place. The answer is returned
- * to that one call at most once. While a call waits, every other call of the session is denied as `pending`.
+ * to that one call at most once, and an allow only after the host confirms at that moment that no owner halt covers
+ * the project and the decision still applies. While a call waits, every other call of the session is denied as `pending`.
  * Nothing here allows a call on its own: an allow comes from the pipeline or from the owner's answer.
  */
 import { createHash } from "node:crypto";
@@ -59,6 +60,8 @@ interface Deferred {
   rule: string;
   /** The decision and its delivery key, when the host recorded one. */
   issued?: IssuedDecision;
+  /** The session root the class check was decided under. The host checks it again before an allow is returned. */
+  sessionRoot?: string;
   since: number;
   expiresAt: number;
   /** `deferring`: the provider is ending its run. `waiting`: the owner prompt is open. `resuming`: the owner answered. */
@@ -145,18 +148,32 @@ export class HeadlessChannelWorker {
     if (call.toolUseId && this.consumed.has(call.toolUseId)) return this.deny("needs-owner");
     if (deferred && call.toolUseId === deferred.callId) {
       if (deferred.phase !== "resuming" || !deferred.answer) return this.pending(call.toolName);
-      // The owner's answer is returned once, to the call it was given for.
+      // The owner's answer is consumed here, before anything is asked, so it is returned once at most.
       this.consumed.add(deferred.callId);
       this.deferred = undefined;
       const changed = deferred.tool !== call.toolName || deferred.inputHash !== inputHash;
-      const answer: ChannelAnswer = changed ? this.deny("needs-owner")
-        : deferred.answer.decision === "allow" ? { decision: "allow" } : { decision: "deny", reason: deferred.answer.reason ?? OWNER_DENIED };
-      this.host.record({ event: "delivered", callId: deferred.callId, decision: changed ? "changed" : deferred.answer.decision });
-      this.delivery(deferred.issued, changed ? "stale" : "receipt", changed
-        ? "Headless: the resumed call differs from the call the owner answered; it was denied."
-        : `Headless: the owner's ${deferred.answer.decision === "allow" ? "allow" : "refusal"} was returned to the resumed call.`);
-      this.host.publish(this.view());
-      return answer;
+      const settle = (decision: string, kind: PermissionDelivery["kind"], detail: string, answer: ChannelAnswer) => {
+        this.host.record({ event: "delivered", callId: deferred.callId, decision });
+        this.delivery(deferred.issued, kind, detail);
+        this.host.publish(this.view());
+        return answer;
+      };
+      if (changed) return settle("changed", "stale", "Headless: the resumed call differs from the call the owner answered; it was denied.", this.deny("needs-owner"));
+      // A refusal is always safe to return.
+      if (deferred.answer.decision === "deny")
+        return settle("deny", "receipt", "Headless: the owner's refusal was returned to the resumed call.", { decision: "deny", reason: deferred.answer.reason ?? OWNER_DENIED });
+      // An allow is returned only while the host stands behind it now: no owner halt, the same root, and the decision
+      // still applies. A host that refuses, cannot be reached or does not answer in time withholds it.
+      let reply: ChannelReply | undefined;
+      if (deferred.sessionRoot) {
+        try { reply = await this.ask({ op: "resume", sessionRoot: deferred.sessionRoot, ...(deferred.issued ?? {}) }, CLASS_CHECK_MS); }
+        catch { reply = undefined; }
+      }
+      if (reply?.result !== "ok") {
+        const reason = reply?.result === "withheld" ? reply.reason : "unavailable";
+        return settle("withheld", "stale", `Headless: the owner's allow was withheld at the resume (${reason}); the call was denied as unavailable.`, this.deny("unavailable"));
+      }
+      return settle("allow", "receipt", "Headless: the owner's allow was returned to the resumed call.", { decision: "allow" });
     }
     if (deferred) return this.pending(call.toolName);
     if (call.toolUseId) {
@@ -180,6 +197,7 @@ export class HeadlessChannelWorker {
     this.deferred = {
       callId: call.toolUseId, tool: call.toolName, inputHash, interruptClass: reply.interruptClass, rule: reply.rule,
       ...(reply.decisionId && reply.deliveryKey ? { issued: { decisionId: reply.decisionId, deliveryKey: reply.deliveryKey } } : {}),
+      ...(reply.sessionRoot ? { sessionRoot: reply.sessionRoot } : {}),
       since, expiresAt: since + DEFERRAL_RETENTION_MS, phase: "deferring",
     };
     this.host.record({

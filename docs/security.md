@@ -552,9 +552,18 @@ returned.
 A class call from the primary agent is deferred: the provider ends its run,
 the session waits, and only the owner's answer on that session's prompt
 resumes it. The answer applies once, to that call id, and a resumed call whose
-input differs is denied. The session's worker holds the answer, so an API
-restart between the answer and the resume still runs the call once; a host
-restart that ends the worker loses the answer, and the call does not run. A class call from a subagent cannot be deferred. It
+input differs is denied. Before an owner's allow is returned to the resumed
+call, the worker asks the host again: an owner halt that covers the project,
+a changed session root, a team run that is no longer live, or a decision that
+no longer applies withholds the allow, and so does a host that cannot be
+reached at that moment. A withheld allow is denied with `unavailable`, and the
+answer is used all the same. An owner's refusal is returned without that
+check. A resume that the host confirmed just before a halt was recorded can
+still run its call after the halt is acknowledged; nothing recalls an allow
+that has reached the provider's hook. The session's worker holds the answer,
+so after an API restart between the answer and the resume the call runs once
+if the restarted API confirms it; a host restart that ends the worker loses
+the answer, and the call does not run. A class call from a subagent cannot be deferred. It
 is denied with `needs-owner`, and the owner gets a notice. While one call
 waits, every other call of the session is denied. A call is denied with
 `unavailable` when the host cannot be reached. An unanswered call is retired

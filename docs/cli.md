@@ -444,7 +444,8 @@ A project that is not on the host is covered by nothing. If it returns under
 the same id and path, it keeps the coverage it had, unless the owner delegated
 or revoked its workspace while it was away: either act ends that project's
 coverage, so delegate again after it returns. `revoke --workspace` with the id
-of a project that left the host ends that project's coverage too.
+of a project that left the host ends that project's coverage too, unless a
+workspace has that id: the workspace is then the one revoked.
 
 The record has no effect yet. The permission agent is not active on this host,
 so requests are handled as before. Until the agent is activated,

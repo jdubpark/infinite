@@ -8,6 +8,7 @@ import type { UsageTotals } from "./usage.js";
 import type { UsageRollup } from "./team-usage.js";
 import type { ProviderLimit } from "./provider-limits.js";
 import type { AutonomyMode } from "./autonomy.js";
+import type { InterruptClass, RejectCode } from "./permission-policy.js";
 
 export const teamCommandSchema = z.object({
   command: z.string().min(1).max(4096).refine(value => !value.includes("\0")),
@@ -104,6 +105,25 @@ export type TeamPermissions = z.infer<typeof teamPermissionsSchema>;
 export function currentPermissions(saved: TeamPermissions): TeamPermissions {
   if (!LEGACY_DEFAULT_PERMISSION_SCOPES.includes(saved.scope)) return saved;
   return { ...saved, scope: DEFAULT_PERMISSION_SCOPE, maxDecisions: saved.maxDecisions === 10 ? DEFAULT_PERMISSION_LIMIT : saved.maxDecisions };
+}
+/**
+ * One permission-agent result for a member's dialog, as run status shows it. Host fields only: the
+ * model's note stays in the permission journal and never reaches a run, an agent or a client.
+ */
+export interface TeamPermissionAgentDecision {
+  /** The journal decision. Absent for a request that went stale before a decision was recorded. */
+  decisionId?: string;
+  requestId: string;
+  memberId: string;
+  sessionId: string;
+  role: TeamRole;
+  taskId?: string;
+  promptId: number;
+  result: "allowed" | "rejected" | "owner" | "undeliverable" | "stale";
+  code?: RejectCode;
+  interruptClass?: InterruptClass;
+  delivery?: "receipt" | "refusal" | "uncertain";
+  at: string;
 }
 export interface TeamPermissionDecision {
   id: string;
@@ -456,6 +476,8 @@ export interface TeamMember extends TeamAssignment {
   stopRequestId: string;
   /** Why the host stopped this member without a report, such as a provider usage limit. */
   stoppedReason?: string;
+  /** The permission agent locked this member's assignment: it repeated a rejected request. A fixed host status. */
+  permissionBlocked?: { code: "locked"; at: string };
   /** The member clone was removed under the retention policy after its result was integrated or its run settled. */
   workspaceRemovedAt?: string;
   /** Confirmed process retirement for a recording-failed reviewer; its original journal remains sealed. */
@@ -532,6 +554,8 @@ export interface TeamRun {
   permissionDecisions?: TeamPermissionDecision[];
   /** Bounded diagnostic recovery records. These never confer permission authority. */
   permissionRecovery?: TeamPermissionRecoveryState;
+  /** The permission agent's results for this run's member dialogs, newest last, bounded. */
+  permissionAgentDecisions?: TeamPermissionAgentDecision[];
   /** Owner opt-in is pinned at creation; accepted commands cannot change within this run. */
   establishChecks?: true;
   verification?: TeamVerification;

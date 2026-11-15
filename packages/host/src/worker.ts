@@ -40,7 +40,7 @@ import { socketPath } from "./ipc.js";
 import { startHookServer, HookPayloadError, type HookReply, type HookRoute } from "./hooks.js";
 import { teamReportEnvelopeSchema, type TeamAssignment } from "./team-types.js";
 import { missionReportEnvelopeSchema } from "./mission-types.js";
-import { isCollapsedPermissionPrompt, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
+import { agentAcceptOption, isCollapsedPermissionPrompt, oneShotRejectOption, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { SESSION_PERMISSION_ACTOR_LABEL, permissionChoices } from "./permission-session-requests.js";
 import type { TranscriptMessage } from "./transcript.js";
 import { TranscriptWatch, closesTurn } from "./transcript-watch.js";
@@ -832,7 +832,8 @@ async function answer(
   request: AnswerRequest | TeamAnswerRequest,
 ): Promise<Receipt & { result?: AnswerResult }> {
   const teamRequest = request.op === "team-answer" ? request : undefined;
-  const answerText = request.op === "answer" ? request.text : undefined;
+  // A permission-agent reject types only the host's fixed notice, and only after a reject option that takes text.
+  const answerText = request.op === "answer" ? request.text : teamRequest?.choice === "reject" ? teamRequest.text : undefined;
   const digest = requestDigest(request);
   const previous = receipts.get(request.requestId);
   if (previous) {
@@ -855,7 +856,7 @@ async function answer(
       throw new Refusal("unsupported");
     if (teamRequest.actor.id !== `team-permission:${teamRequest.decisionId}` ||
         teamRequest.actor.label !== "Team permission" || !/^[a-f0-9-]{36}$/i.test(teamRequest.decisionId) ||
-        !/^[a-f0-9-]{36}$/i.test(teamRequest.coordinatorMemberId) ||
+        teamRequest.choice === undefined && !/^[a-f0-9-]{36}$/i.test(teamRequest.coordinatorMemberId ?? "") ||
         !/^[a-f0-9]{64}$/i.test(teamRequest.policyHash) ||
         !Number.isFinite(Date.parse(teamRequest.expiresAt)) || Date.parse(teamRequest.expiresAt) <= Date.now())
       throw new Refusal("prompt-changed");
@@ -879,12 +880,18 @@ async function answer(
   // The hash ignores spacing inside lines, so a team answer also needs the reviewed text exactly,
   // and screen-only evidence needs the dialog still pinned to the bottom of the screen. Each
   // delegated key write checks this again, since the dialog can redraw between keys.
+  // A reject goes only through the dialog's one recognised one-shot reject option, with the same exact-screen check
+  // as an accept. A permission-agent accept no longer refuses the destructive flag: the host delivers that accept
+  // only on a strong verdict. A run reviewer's accept keeps today's qualification.
+  const delegatedRoles = teamRequest?.choice === "reject" ? ["reject", "reject-with-feedback"] : ["accept"];
+  const delegatedOption = !teamRequest ? undefined : teamRequest.choice === "reject" ? oneShotRejectOption(prompt)
+    : teamRequest.choice === "accept" ? agentAcceptOption(prompt) : oneShotPermissionOption(prompt);
   const showsReviewed = (now: ReturnType<typeof screenPrompt>) => Boolean(teamRequest && now &&
     hashOf(now.fingerprint) === prompt.hash && now.title === prompt.title && now.detail === prompt.detail &&
-    (prompt.tool || now.pinned) && now.options.some(option => option.index === teamRequest.option && option.role === "accept"));
+    (prompt.tool || now.pinned) && now.options.some(option => option.index === teamRequest.option && delegatedRoles.includes(option.role)));
   if (teamRequest && (teamRequest.promptId !== prompt.id || teamRequest.promptHash !== prompt.hash ||
       teamRequest.evidenceHash !== permissionEvidenceHash(prompt) ||
-      oneShotPermissionOption(prompt) !== teamRequest.option || !showsReviewed(current)))
+      delegatedOption !== teamRequest.option || !showsReviewed(current)))
     throw new Refusal("prompt-changed");
   if (prompt.multiSelect || current.multiSelect)
     throw new Refusal("unsupported");
@@ -931,7 +938,8 @@ async function answer(
     ...(answerText !== undefined ? { text: answerText } : {}),
     ...(teamRequest ? { delegation: {
       decisionId: teamRequest.decisionId,
-      coordinatorMemberId: teamRequest.coordinatorMemberId,
+      ...(teamRequest.coordinatorMemberId ? { coordinatorMemberId: teamRequest.coordinatorMemberId } : {}),
+      ...(teamRequest.choice ? { choice: teamRequest.choice } : {}),
       targetSessionId: teamRequest.targetSessionId,
       assignment: teamRequest.assignment,
       targetCwd: teamRequest.targetCwd,
@@ -955,7 +963,7 @@ async function answer(
     const now = screenPrompt();
     return now && hashOf(now.fingerprint) === prompt.hash ? now : null;
   };
-  const beforeWrite = () => {
+  const beforeWrite = (reviewedScreen = true) => {
     if (teamRequest && invalidatedTeamPermissionDecisions.has(teamRequest.decisionId)) throw new Refusal("control-lost");
     if (teamRequest && Date.parse(teamRequest.expiresAt) <= Date.now()) throw new Refusal("prompt-changed");
     if (teamRequest) checkControl(teamRequest);
@@ -965,7 +973,9 @@ async function answer(
         session.team.memberId !== teamRequest.assignment.memberId || session.team.revision !== teamRequest.assignment.revision ||
         session.team.role !== teamRequest.assignment.role || session.team.taskId !== teamRequest.assignment.taskId))
       throw new Refusal("unsupported");
-    if (teamRequest && !showsReviewed(screenPrompt())) throw new Refusal("prompt-changed");
+    if (teamRequest && reviewedScreen && !showsReviewed(screenPrompt())) throw new Refusal("prompt-changed");
+    // The notice follows a dialog that has closed. It is typed only while no other dialog shows, since its Enter would answer one.
+    if (teamRequest && !reviewedScreen && screenPrompt()) throw new Refusal("prompt-changed");
   };
   answering = prompt.id;
   try {
@@ -1020,13 +1030,13 @@ async function answer(
         );
       if (answerText !== undefined) {
         await sleep(150);
-        beforeWrite();
+        beforeWrite(false);
         pty.write(
           terminal.modes.bracketedPasteMode
             ? `\x1b[200~${answerText}\x1b[201~`
             : answerText,
         );
-        beforeWrite();
+        beforeWrite(false);
         pty.write("\r");
       }
     }
@@ -1298,9 +1308,15 @@ function validTeamAnswer(request: TeamAnswerRequest) {
   const rawAssignment: unknown = request.assignment;
   if (!rawAssignment || typeof rawAssignment !== "object" || Array.isArray(rawAssignment)) return false;
   const assignment = rawAssignment as TeamAssignment;
+  // A run reviewer's answer names its member and never a choice. A permission-agent delivery names its choice and
+  // no member; only its reject carries text, the host's fixed notice.
+  const agentChoice = request.choice === "accept" || request.choice === "reject";
+  if (request.choice !== undefined && !agentChoice) return false;
+  if (agentChoice ? request.coordinatorMemberId !== undefined : !/^[a-f0-9-]{36}$/i.test(request.coordinatorMemberId ?? "")) return false;
+  if (request.text !== undefined && (request.choice !== "reject" || typeof request.text !== "string" || !request.text ||
+      request.text.length > 2000 || /[\x00-\x1f\x7f]/.test(request.text))) return false;
   return typeof request.requestId === "string" && request.requestId.length <= 80 &&
     /^[a-f0-9-]{36}$/i.test(request.decisionId) &&
-    /^[a-f0-9-]{36}$/i.test(request.coordinatorMemberId) &&
     request.targetSessionId === session.id &&
     /^[a-f0-9-]{36}$/i.test(assignment.runId) &&
     /^[a-f0-9-]{36}$/i.test(assignment.memberId) &&

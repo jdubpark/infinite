@@ -264,7 +264,11 @@ export type WorkerRequest =
       op: "team-answer";
       requestId: string;
       decisionId: string;
-      coordinatorMemberId: string;
+      /** The run reviewer's member. Absent only for a permission-agent delivery, which names its `choice`. */
+      coordinatorMemberId?: string;
+      /** A permission-agent delivery: the one-shot accept, or the one-shot reject with the host's fixed notice as `text`. */
+      choice?: "accept" | "reject";
+      text?: string;
       targetSessionId: string;
       assignment: import("./team-types.js").TeamAssignment;
       targetCwd: string;

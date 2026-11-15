@@ -29,7 +29,7 @@ import { validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { ContentError } from "./session-content.js";
 import { fuseReason, workLaunch } from "./fuse/rules.js";
 import type { FuseGate } from "./fuse/types.js";
-import { isCollapsedPermissionPrompt, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
+import { agentAcceptOption, isCollapsedPermissionPrompt, oneShotRejectOption, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { nativeContinuationSchema, teamModelProfileSchema, type NativeContinuation, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
 import { missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { withNativeContinuation } from "./native-continuation.js";
@@ -815,6 +815,74 @@ export class Manager {
         if ((error as { code?: unknown }).code) throw error;
         // The worker may have typed before its acknowledgement was lost. Never replay here.
         return { requestId, state: "uncertain", seq: controlled.seq };
+      }
+    } finally {
+      if (lease) {
+        try { await workerCall(this.config.runDir, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
+        catch { /* a lost worker or lease is reported by the next state read */ }
+      }
+    }
+  }
+  /**
+   * Deliver one permission-agent decision to this exact assigned member's dialog: its one-shot accept, or its
+   * one-shot reject with the host's fixed notice. `current` is the caller's live fence; it is read again after
+   * the control lease is held and before the worker sends a key. The worker repeats the exact-screen check
+   * before each key.
+   */
+  async answerAgentPermission(
+    sessionId: string,
+    team: TeamAssignment,
+    delivery: {
+      deliveryId: string; requestId: string; choice: "accept" | "reject"; option: number; notice?: string;
+      prompt: import("@infinite/attention").Prompt; evidenceHash: string; targetCwd: string; expiresAt: string; authorityHash: string;
+      current: () => boolean;
+    },
+  ): Promise<import("./types.js").Receipt & { result?: import("@infinite/attention").AnswerResult }> {
+    const session = this.meta(sessionId).session;
+    const stored = session.team;
+    const sameAssignment = Boolean(stored && stored.runId === team.runId && stored.memberId === team.memberId &&
+      stored.revision === team.revision && stored.role === team.role && stored.taskId === team.taskId);
+    if (!sameAssignment || !/^[a-f0-9-]{36}$/i.test(delivery.deliveryId) || !/^[a-f0-9-]{36}$/i.test(delivery.requestId) ||
+        team.role === "permission-coordinator")
+      throw new ContentError("This permission delivery does not match the assigned team member", 403);
+    const prompt = delivery.prompt;
+    const option = delivery.choice === "accept" ? agentAcceptOption(prompt) : oneShotRejectOption(prompt);
+    if (!prompt.hash || permissionEvidenceHash(prompt) !== delivery.evidenceHash || option === undefined || option !== delivery.option ||
+        !/^[a-f0-9]{64}$/i.test(delivery.authorityHash) || !Number.isFinite(Date.parse(delivery.expiresAt)) || Date.parse(delivery.expiresAt) <= Date.now())
+      throw new ContentError("The permission delivery is incomplete, expired, or not a one-shot option");
+    let canonicalCwd: string;
+    try { canonicalCwd = realpathSync(session.cwd); }
+    catch { throw new ContentError("The assigned team working directory is unavailable"); }
+    if (delivery.targetCwd !== canonicalCwd)
+      throw new ContentError("The permission delivery targets a different working directory", 403);
+    const state = await this.state(sessionId);
+    if (state.status !== "running" || session.runtime?.nativeUi || state.runtime?.nativeUi)
+      throw new ContentError("The assigned team member has no running managed terminal");
+    if (state.control) throw new ContentError("A person currently controls this session", 409);
+
+    const actor = { id: `team-permission:${delivery.deliveryId}`, label: "Team permission" };
+    let lease: { id: string } | undefined;
+    try {
+      const acquired = await workerCall<{ id: string }>(this.config.runDir, sessionId, { op: "control", action: "claim", actor });
+      lease = acquired;
+      const controlled = await this.state(sessionId);
+      if (controlled.status !== "running" || controlled.control?.id !== acquired.id || controlled.runtime?.nativeUi || session.runtime?.nativeUi)
+        throw new ContentError("The team member or its control lease changed before the answer");
+      if (!delivery.current() || Date.parse(delivery.expiresAt) <= Date.now())
+        throw new ContentError("The permission delivery was invalidated before the answer");
+      try {
+        return await workerCall(this.config.runDir, sessionId, {
+          op: "team-answer", requestId: delivery.requestId, decisionId: delivery.deliveryId, choice: delivery.choice,
+          ...(delivery.choice === "reject" && delivery.notice ? { text: delivery.notice } : {}),
+          targetSessionId: sessionId, assignment: stored!, targetCwd: canonicalCwd,
+          expiresAt: delivery.expiresAt, policyHash: delivery.authorityHash,
+          promptId: prompt.id, promptHash: prompt.hash, evidenceHash: delivery.evidenceHash, option: delivery.option,
+          actor, leaseId: acquired.id,
+        }, 12000);
+      } catch (error) {
+        if ((error as { code?: unknown }).code) throw error;
+        // The worker may have written keys before its acknowledgement was lost. Never replay here.
+        return { requestId: delivery.requestId, state: "uncertain", seq: controlled.seq };
       }
     } finally {
       if (lease) {

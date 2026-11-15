@@ -2,6 +2,7 @@ import { PROVIDER_NAMES, type Attention, type Prompt, type Provider } from "@inf
 import type { Manager } from "./manager.js";
 import type { PushSender, PushStore } from "./push.js";
 import type { FuseService, FuseInterrupt } from "./fuse/service.js";
+import type { PermissionDeliveryService } from "./permission-agent-types.js";
 import { createHash } from "node:crypto";
 
 /** The subject part of a fuse collapse id. A push service limits the id's length, and a project id has no limit, so a long one is replaced by a digest. */
@@ -64,8 +65,8 @@ export class Notifier {
     private readonly goals?: { statuses(): GoalRow[] },
     private readonly storage?: { sample(): Promise<StorageVolume[]> },
     private readonly fuse?: Pick<FuseService, "interrupts" | "markAnnounced">,
-    /** The permission agent's answer to whose a pending dialog is. Absent: every dialog is handled as before. */
-    private readonly permissions?: { holder(sessionId: string, promptId: number): "agent" | "owner" | "undecided" },
+    /** Who holds an open dialog for the permission agent. Asked first; a dialog it leaves to the owner falls back to the run's coordinator review. */
+    private readonly permissions?: Pick<PermissionDeliveryService, "holder">,
   ) {}
   /** After a fuse push that reached no device, the time of the next attempt, on a clock that never steps back. */
   private fuseRetryAt = 0;

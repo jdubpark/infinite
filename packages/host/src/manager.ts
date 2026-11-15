@@ -20,7 +20,8 @@ import {
   type Attention,
 } from "@infinite/attention";
 import { readEvents, unseal, writeSealed } from "./vault.js";
-import { workerCall } from "./ipc.js";
+import { socketPath, workerCall } from "./ipc.js";
+import { SealedFileCache, listedSession, type ListedSession } from "./session-listing.js";
 import { assertRunnerDeployment } from "./deployment.js";
 import { DEFAULT_HOOKS } from "./config.js";
 import { HostLoadGate, LaunchHeldError, readHostLoad, type HostLoadProbe } from "./host-load.js";
@@ -181,12 +182,24 @@ const unavailable = (now = new Date().toISOString()): WorkerState => ({
   screen: "",
   attention: applyLifecycle(initialAttention(now, false), "unavailable", now),
 });
+/** The state a saved status gives when no worker answers: `exited` stays, anything else is `unavailable`. */
+function savedState(saved: WorkerState, now = new Date().toISOString()): WorkerState {
+  const status = saved.status === "exited" ? "exited" : "unavailable";
+  return {
+    ...saved,
+    status,
+    screen: "",
+    attention: applyLifecycle(saved.attention ?? initialAttention(now, false), status, now),
+  };
+}
 export class Manager {
   private serial: Promise<unknown> = Promise.resolve();
   /** Holds sessions the host starts for itself while the host is short of memory or overloaded. */
   readonly hostLoad: HostLoadGate;
   private readonly handoffProjects = new Map<string, string>();
   private fuse?: FuseGate;
+  private readonly listedMeta = new SealedFileCache<ListedSession>((id, raw) => listedSession(unseal<StoredSession>(this.key, `${id}:meta`, raw).session));
+  private readonly savedStatus = new SealedFileCache<WorkerState>((id, raw) => unseal<WorkerState>(this.key, `${id}:status`, raw));
   /** The launch-rate fuse. Without one, every session starts as before and nothing is counted. */
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
   reserveHandoff(projectId: string) {
@@ -339,21 +352,26 @@ export class Manager {
           `${id}:status`,
           readFileSync(file, "utf8"),
         );
-        const status = saved.status === "exited" ? "exited" : "unavailable";
-        const now = new Date().toISOString();
-        return {
-          ...saved,
-          status,
-          screen: "",
-          attention: applyLifecycle(
-            saved.attention ?? initialAttention(now, false),
-            status,
-            now,
-          ),
-        };
+        return savedState(saved);
       }
       return unavailable();
     }
+  }
+  /**
+   * `state(id)` for a listing. A worker is asked only when its socket file exists, since a
+   * connect to a missing socket fails the same way; a failed ask falls through to the saved status.
+   */
+  private async listedState(id: string): Promise<WorkerState> {
+    if (existsSync(socketPath(this.config.runDir, id))) {
+      try {
+        return withDefaultAttention(await workerCall(this.config.runDir, id, { op: "state", screen: false }));
+      } catch {
+        // Fall through to the saved status, as state() does.
+      }
+    }
+    const saved = this.savedStatus.read(id, join(this.config.stateDir, "sessions", id, "status.sealed"), Date.now());
+    if (saved === undefined) return unavailable();
+    return savedState(saved);
   }
   /**
    * Every session whose metadata can be read. One session's unreadable status (or a worker
@@ -361,23 +379,21 @@ export class Manager {
    * a session without readable metadata has no title or provider to show and is left out.
    */
   async list(options: { includeFullMessage?: boolean } = {}) {
+    const now = Date.now();
     const ids = readdirSync(join(this.config.stateDir, "sessions")).filter(
       (n) => /^[a-f0-9-]{36}$/.test(n) && !existsSync(this.deletedReceiptPath(n)),
     );
+    this.listedMeta.retain(new Set(ids), now);
+    this.savedStatus.retain(new Set(ids), now);
     const rows = await Promise.allSettled(
       ids.map(async (id) => {
-        const { session } = this.meta(id);
-        const { screen: _screen, ...state } = await this.state(id).catch(
+        // meta() refuses a session whose deletion receipt exists, as it did before the cache.
+        if (existsSync(this.deletedReceiptPath(id))) throw new Error("Session not found");
+        const summary = this.listedMeta.read(id, join(this.config.stateDir, "sessions", id, "meta.sealed"), now);
+        if (summary === undefined) throw new Error("Session not found");
+        const { screen: _screen, ...state } = await this.listedState(id).catch(
           () => unavailable(),
         );
-        const {
-          context: _context,
-          initialPrompt: _prompt,
-          generatedTitle: _generatedTitle,
-          nativeArgs: _nativeArgs,
-          handoff: _handoff,
-          ...summary
-        } = session;
         return {
           ...summary,
           ...state,

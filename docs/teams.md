@@ -957,8 +957,8 @@ gets one direction for each steering message, in steering order. Each change
 is logged. The owner reads the record, or any past version of it, with
 `infinite goal record ID [--version N] [--json]` or `GET /api/goals/:id/record`.
 A standalone run gets its record at its first accepted plan. Goal cycle runs,
-mission subteams, and handoff runs have no record of their own. The record changes no prompt
-yet, and the relay does not carry it.
+mission subteams, and handoff runs have no record of their own. The relay does not
+carry the record or its corrections.
 
 With `extendMinutes` above 0, the host moves the deadline forward when it arrives,
 if the active team has a member with attention activity within the stall window
@@ -1015,6 +1015,66 @@ assessment and supporting evidence. A paused goal remains resumable and cannot
 accept an outcome assessment; finish or cancel it first. Only an explicit user
 assessment can mark the goal `achieved`. Passing checks, agent approval, or an
 idle terminal cannot do so.
+
+### Owner criteria
+
+An owner can give a goal criteria and correct them. Both need the project's objective switch. Without it, creation `criteria` and every correction answer `409` with `objective-prompts-off`. No prompt, context file, run fingerprint, or routine digest changes.
+
+Turn the switch on in the project's team block:
+
+```json
+"objective": { "prompts": "on" }
+```
+
+The key has no default. Writing it at all, even as `"off"`, changes the routine approval digest of that project, so its active routines wait for owner approval again. An absent key keeps every stored digest valid. A rerun of `repo init` keeps the key.
+
+With the switch on, each goal cycle's member prompts and context file show the record's criteria in place of the success text. The digest lists the active criteria with each statement, check label, producer, and threshold. It is at most 6,144 bytes of JSON with `c0`'s statement left out, because the prompt prints `c0`'s text once. A criterion whose correction would push the digest over that cap answers `409` with `objective-digest-too-large`.
+
+A cycle pins the digest it launched with. Every member of that run reads the same digest, including members started after a pause, a replan, or a host restart. The next cycle reads the latest version. A correction therefore reaches members from the next cycle. To reach a running cycle, steer it.
+
+The sealed eval capsule of a run copies the goal context. Once a cycle pins the digest, the eval capture holds the owner's criteria text.
+
+Owner text lives in the sealed goal record, the pinned digest, and the prompts and context files of later cycles. The host never writes it to a log line, an event, or an error body. A statement that looks like a secret is refused with `400` and `objective-secret`, and the refusal does not repeat it.
+
+Creation criteria go in `criteria` on `POST /api/goals`: one to seven criteria, each with a statement, a check, and a threshold. Routine goals never take criteria.
+
+`POST /api/goals/:id/record` takes `{ requestId, version, ops }` from an owner device. A controller or viewer gets `403`. Four ops are available:
+
+- `criterion.add` takes a `criterion` with a statement, a check, a threshold, and an optional producer.
+- `criterion.edit` takes an `id` and at least one of `statement`, `check`, or `threshold`.
+- `criterion.retire` takes an `id`.
+- `criterion.confirm` takes an `id`.
+
+Limits:
+
+- A correction holds at most 16 ops.
+- A statement is 1 to 1,000 bytes. A criterion is at most 2,048 bytes.
+- A command check must name one of the project's configured checks. Otherwise the op answers `400` with `objective-command-unknown`.
+- A record holds at most 8 active criteria and 64 in all.
+- `c0` cannot be edited or retired. The op answers `409` with `objective-op-c0`.
+- Every op names a criterion of the record the correction applies to, so op order does not change the result. A new criterion has no ID that the same correction can name.
+- A correction must leave room in the log for steering: at least 20 entries and 46 KiB. Otherwise it answers `409` with `objective-log-full`.
+
+A correction applies once or not at all:
+
+- The same `requestId` with the same body answers the same view and writes nothing.
+- The same `requestId` with another body answers `409` with `request-conflict`.
+- A `version` that is no longer the latest answers `409` with `objective-version-stale`.
+- A refused op refuses the whole correction. The error does not repeat any owner text.
+
+Corrections write `criterion.*` log entries. Rebuilding any earlier version undoes them, so every version still reads back.
+
+The record commands take three forms:
+
+```
+infinite goal record ID [--version N] [--json]
+infinite goal record ID retire CID | confirm CID [--version N] [--request-id ID] [--json]
+infinite goal record ID apply --file PATH [--version N] [--request-id ID] [--json]
+```
+
+Without `--version`, a correction reads the latest version first and then posts once. `apply` reads `{ "ops": [...] }` from a file of at most 64 KiB. The command checks the file before it sends anything, and an error names the op's index, not its text. When the post gets no answer, the command prints the retry with the version and request ID it used. Retry with the same body, version, and request ID only.
+
+Before a rollback to a host without this slice, remove `project.team.objective` from every project. The older host refuses the project schema with that key. A pending goal launch that carries a pinned digest also blocks on an older host.
 
 ### Standing objectives
 

@@ -1,12 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { GOAL_RECORD_USAGE, handleGoalClientCommand, objectiveRecordLines } from "../packages/host/src/objective-cli.js";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { CORRECTION_FILE_BYTES, GOAL_RECORD_USAGE, handleGoalClientCommand, objectiveRecordLines, readCorrectionFile } from "../packages/host/src/objective-cli.js";
 import { clientCommandCandidate, parseClientArgs } from "../packages/host/src/client.js";
-import type { ObjectiveRecordView } from "../packages/host/src/objective-record.js";
+import { OBJECTIVE_ERRORS } from "../packages/host/src/objective-record.js";
+import type { ObjectiveErrorCode, ObjectiveRecordView } from "../packages/host/src/objective-record.js";
 
 const G = "5f0c2a6e-1b7d-4c3a-9e8f-2d4b6a8c0e12";
+const R = "9b1f6c0e-2d4a-4e8b-8f3a-6c5d7e9f0a1b";
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const AT = "2026-11-14T00:00:00.000Z";
 type Api = Parameters<typeof handleGoalClientCommand>[2];
+type Fault = { status: number; code?: string };
+type Call = { method: string; path: string; body?: unknown };
 
 function view(overrides: { direction?: string } = {}): ObjectiveRecordView {
   return {
@@ -42,16 +50,22 @@ function view(overrides: { direction?: string } = {}): ObjectiveRecordView {
   };
 }
 
-function fakeApi(fault?: { status: number; code?: string }) {
+/** A stub API. `fault` applies to every call, or only to POST when `onlyPost` is set. */
+function fakeApi(fault?: Fault | Error, onlyPost = false) {
   const paths: string[] = [];
+  const calls: Call[] = [];
   const api: Api = {
-    async json<T = unknown>(path: string): Promise<T> {
+    async json<T = unknown>(path: string, body?: unknown, _signal?: unknown, _headers?: unknown, method?: string): Promise<T> {
+      const verb = method ?? (body === undefined ? "GET" : "POST");
       paths.push(path);
-      if (fault) throw Object.assign(new Error("host message, never shown"), fault);
+      calls.push({ method: verb, path, body });
+      if (fault !== undefined && (!onlyPost || verb === "POST")) {
+        throw fault instanceof Error ? fault : Object.assign(new Error("host message, never shown"), fault);
+      }
       return view() as T;
     },
   };
-  return { api, paths };
+  return { api, paths, calls };
 }
 
 async function captureLogs(run: () => Promise<unknown>): Promise<string[]> {
@@ -60,6 +74,11 @@ async function captureLogs(run: () => Promise<unknown>): Promise<string[]> {
   console.log = (...args: unknown[]) => { logs.push(args.map(String).join(" ")); };
   try { await run(); } finally { console.log = original; }
   return logs;
+}
+
+async function withTempDir(run: (dir: string) => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), "objective-cli-"));
+  try { await run(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
 test("record lines show the record and its log", () => {
@@ -98,7 +117,7 @@ test("the command reads a version and maps each error", async () => {
   const jsonLogs = await captureLogs(() => handleGoalClientCommand(["record", G], { "--json": true }, json.api));
   assert.equal(JSON.parse(jsonLogs.join("\n")).version, 2);
 
-  const cases: { fault: { status: number; code?: string }; text: string }[] = [
+  const cases: { fault: Fault; text: string }[] = [
     { fault: { status: 404, code: "goal-not-found" }, text: "No goal has this ID." },
     { fault: { status: 404, code: "objective-version-not-found" }, text: "The record has no version 2." },
     { fault: { status: 409, code: "objective-version-unavailable" }, text: "This host cannot rebuild version 2 of the record." },
@@ -130,10 +149,113 @@ test("the command reads a version and maps each error", async () => {
   }
 });
 
-test("goal options parse", () => {
+test("a correction reads the version, then posts once", () => withTempDir(async dir => {
+  const retire = fakeApi();
+  const logs = await captureLogs(() => handleGoalClientCommand(["record", G, "retire", "c1"], {}, retire.api));
+  assert.deepEqual(retire.paths, [`/goals/${G}/record`, `/goals/${G}/record`]);
+  assert.deepEqual(retire.calls.map(call => call.method), ["GET", "POST"]);
+  const body = retire.calls[1].body as { requestId: string; version: number; ops: unknown };
+  assert.match(body.requestId, UUID);
+  assert.deepEqual({ ...body, requestId: undefined }, { requestId: undefined, version: 3, ops: [{ op: "criterion.retire", id: "c1" }] });
+  assert.equal(logs[0], `Record version 3.`);
+  assert.equal(logs[1], `Goal ${G} · record version 2 of 3 · rebuilt · digest abcdef012345`);
+
+  const pinned = fakeApi();
+  await handleGoalClientCommand(["record", G, "retire", "c1"], { "--version": "3", "--request-id": R }, pinned.api);
+  assert.deepEqual(pinned.calls.map(call => call.method), ["POST"]);
+  assert.deepEqual(pinned.calls[0].body, { requestId: R, version: 3, ops: [{ op: "criterion.retire", id: "c1" }] });
+
+  const confirm = fakeApi();
+  await handleGoalClientCommand(["record", G, "confirm", "c2"], { "--version": "3", "--request-id": R }, confirm.api);
+  assert.deepEqual(confirm.calls[0].body, { requestId: R, version: 3, ops: [{ op: "criterion.confirm", id: "c2" }] });
+
+  const json = fakeApi();
+  const jsonLogs = await captureLogs(() => handleGoalClientCommand(["record", G, "confirm", "c2"], { "--version": "3", "--json": true }, json.api));
+  assert.equal(JSON.parse(jsonLogs.join("\n")).version, 2);
+
+  const file = join(dir, "ops.json");
+  writeFileSync(file, JSON.stringify({ ops: [{ op: "criterion.confirm", id: "c2" }, { op: "criterion.retire", id: "c3" }] }));
+  const fromFile = fakeApi();
+  await handleGoalClientCommand(["record", G, "apply"], { "--version": "3", "--request-id": R, "--file": file }, fromFile.api);
+  assert.deepEqual(fromFile.calls.map(call => call.method), ["POST"]);
+  assert.deepEqual(fromFile.calls[0].body, { requestId: R, version: 3, ops: [{ op: "criterion.confirm", id: "c2" }, { op: "criterion.retire", id: "c3" }] });
+}));
+
+test("a correction file is checked before anything is sent", () => withTempDir(async dir => {
+  const large = join(dir, "large.json");
+  writeFileSync(large, " ".repeat(CORRECTION_FILE_BYTES + 1));
+  const notJson = join(dir, "not-json.json");
+  writeFileSync(notJson, "{ ops: ");
+  const unknownKey = join(dir, "unknown-key.json");
+  writeFileSync(unknownKey, JSON.stringify({ ops: [
+    { op: "criterion.confirm", id: "c1" },
+    { op: "criterion.retire", id: "c2" },
+    { op: "criterion.retire", id: "c3", secretNote: "x" },
+  ] }));
+  const cases: { file: string; message: string }[] = [
+    { file: large, message: "The correction file is over 64 KiB. Nothing was sent." },
+    { file: notJson, message: "The correction file is not JSON. Nothing was sent." },
+    { file: unknownKey, message: "Correction op 2 is invalid. Nothing was sent." },
+  ];
+  for (const { file, message } of cases) {
+    const { api, paths } = fakeApi();
+    await assert.rejects(handleGoalClientCommand(["record", G, "apply"], { "--version": "3", "--request-id": R, "--file": file }, api), { message });
+    assert.deepEqual(paths, []);
+  }
+  assert.throws(() => readCorrectionFile(unknownKey), { message: "Correction op 2 is invalid. Nothing was sent." });
+
+  const { api, paths } = fakeApi();
+  await assert.rejects(handleGoalClientCommand(["record", G, "apply"], { "--version": "3", "--request-id": R }, api), { message: GOAL_RECORD_USAGE });
+  assert.deepEqual(paths, []);
+}));
+
+test("correction errors map to sentences", async () => {
+  for (const code of Object.keys(OBJECTIVE_ERRORS) as ObjectiveErrorCode[]) {
+    const { api, paths } = fakeApi({ status: OBJECTIVE_ERRORS[code].status, code }, true);
+    await assert.rejects(handleGoalClientCommand(["record", G, "retire", "c1"], { "--version": "3", "--request-id": R }, api), { message: OBJECTIVE_ERRORS[code].message });
+    assert.deepEqual(paths, [`/goals/${G}/record`]);
+  }
+
+  const forbidden = fakeApi({ status: 403 }, true);
+  await assert.rejects(handleGoalClientCommand(["record", G, "retire", "c1"], { "--version": "3", "--request-id": R }, forbidden.api), { message: "Corrections need an owner device key." });
+
+  const conflict = fakeApi({ status: 409, code: "request-conflict" }, true);
+  await assert.rejects(handleGoalClientCommand(["record", G, "retire", "c1"], { "--version": "3", "--request-id": R }, conflict.api), { message: "This request ID was used for another correction. Leave out --request-id to send a new one." });
+
+  const retry = `The correction may have been applied. Retry it safely with: infinite goal record ${G} retire c1 --version 3 --request-id ${R}`;
+  for (const failure of [new Error("fetch failed"), { status: 500 }]) {
+    const { api } = fakeApi(failure, true);
+    await assert.rejects(handleGoalClientCommand(["record", G, "retire", "c1"], { "--version": "3", "--request-id": R }, api), { message: retry });
+  }
+
+  const unknown = fakeApi({ status: 400 }, true);
+  await assert.rejects(handleGoalClientCommand(["record", G, "retire", "c1"], { "--version": "3", "--request-id": R }, unknown.api), { message: "The host refused the correction." });
+
+  const badId = fakeApi();
+  await assert.rejects(handleGoalClientCommand(["record", G, "retire", "c1"], { "--version": "3", "--request-id": "not-a-uuid" }, badId.api), { message: "Give --request-id as a UUID." });
+  assert.deepEqual(badId.paths, []);
+});
+
+test("goal options parse", async () => {
   const parsed = parseClientArgs(["goal", "record", G, "--version", "2", "--json"]);
   assert.equal(parsed.command, "goal");
   assert.deepEqual(parsed.args, ["record", G]);
   assert.equal(parsed.options["--version"], "2");
   assert.equal(clientCommandCandidate(["--version", "2", "goal"]), "goal");
+
+  const retire = parseClientArgs(["goal", "record", G, "retire", "c1", "--version", "3", "--request-id", R]);
+  assert.deepEqual(retire.args, ["record", G, "retire", "c1"]);
+  assert.equal(retire.options["--request-id"], R);
+  const applied = parseClientArgs(["goal", "record", G, "apply", "--file", "ops.json"]);
+  assert.deepEqual(applied.args, ["record", G, "apply"]);
+  assert.equal(applied.options["--file"], "ops.json");
+
+  for (const positional of [["record", G, "retire", "c1", "x"], ["record", G, "retire"], ["record", G, "apply", "c1"]]) {
+    const { api, paths } = fakeApi();
+    await assert.rejects(handleGoalClientCommand(positional, { "--version": "3", "--request-id": R, "--file": "ops.json" }, api), { message: GOAL_RECORD_USAGE });
+    assert.deepEqual(paths, []);
+  }
+  const readWithFlag = fakeApi();
+  await assert.rejects(handleGoalClientCommand(["record", G], { "--request-id": R }, readWithFlag.api), { message: GOAL_RECORD_USAGE });
+  assert.deepEqual(readWithFlag.paths, []);
 });

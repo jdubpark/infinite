@@ -242,6 +242,8 @@ infinite team revoke-permissions TEAM_ID    Revoke delegation for an active run
 infinite permissions status [--json]        Show workspace permission delegation
 infinite permissions delegate (--workspace W | --all) [--direction TEXT | --clear-direction] [--request-id UUID]
 infinite permissions revoke --workspace W [--request-id UUID]
+infinite permissions reopen DECISION_ID [--request-id UUID]
+infinite permissions unlock ASSIGNMENT [--request-id UUID]
 infinite projects [--json]                 List projects and suggested groups
 infinite understand [--workspace ID] [--json] Read workspace Understanding
 infinite understand catalog|components|component ID|policy|refresh --workspace ID

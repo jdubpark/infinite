@@ -420,6 +420,8 @@ trust and unsupported prompts remain visible for owner handling. See
 infinite permissions status [--json]
 infinite permissions delegate (--workspace W | --all) [--direction TEXT | --clear-direction] [--request-id UUID]
 infinite permissions revoke --workspace W [--request-id UUID]
+infinite permissions reopen DECISION_ID [--request-id UUID] [--json]
+infinite permissions unlock ASSIGNMENT [--request-id UUID] [--json]
 ```
 
 `delegate` and `revoke` need an owner CLI. An owner or a controller can read
@@ -450,6 +452,16 @@ or revoked its workspace while it was away: either act ends that project's
 coverage, so delegate again after it returns. `revoke --workspace` with the id
 of a project that left the host ends that project's coverage too, unless a
 workspace has that id: the workspace is then the one revoked.
+
+`reopen` and `unlock` need an owner CLI, and neither allows anything. `reopen`
+takes the id of a reviewer's reject. It closes that reject, so the same request
+is not answered with it again and gets a fresh review, and it resets the count
+of requests that repeated it. Reopening a repeat or a replay reopens the reject
+it repeats. A `locked` or `unavailable` result is a host result, not a reject
+to reopen. `unlock` ends an assignment's lock and resets its repeat count; an
+assignment is locked after it repeats one open reject twice. A retried
+`--request-id` prints the recorded result and changes nothing. A changed
+direction text closes the open rejects of the projects it covers.
 
 The record has no effect yet. The permission agent is not active on this host,
 so requests are handled as before. Until the agent is activated,

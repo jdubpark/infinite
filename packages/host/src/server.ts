@@ -70,6 +70,8 @@ import { PermissionDelegationService } from "./permission-delegation.js";
 import type { PermissionAgentServices } from "./permission-agent-types.js";
 import { INTERRUPT_CLASSES, PERMISSION_POLICY_VERSION } from "./permission-policy.js";
 import { PermissionJournal, permissionJournalModule } from "./evidence/permission-journal.js";
+import { HostPermissionPipeline, PermissionOwnerControls, closeRejectsOnDirectionChange, openPermissionPipelineState } from "./permission-pipeline.js";
+import { registerPermissionControlRoutes } from "./permission-control-routes.js";
 import { LinearService } from "./linear.js";
 import { createGoalSchema, goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema, goalParallelismSchema } from "./goal-types.js";
 import { createProjectGroupSchema, projectGroupIdSchema, updateProjectGroupSchema } from "./project-group-types.js";
@@ -283,6 +285,11 @@ export function createApp(config: Config, key: Buffer) {
   // The permission agent's parts. A part that is absent leaves the requests it would serve with the owner.
   const permissionAgent: PermissionAgentServices = {};
   void permissionAgent;
+  // The pipeline decides and records; it is built only when a decision core exists. The owner controls need only the journal.
+  const permissionState = permissionJournal ? openPermissionPipelineState(evidence) : undefined;
+  const permissionControls = permissionJournal && permissionState ? new PermissionOwnerControls(permissionJournal, permissionState) : undefined;
+  if (permissionAgent.core && permissionJournal && permissionDelegation && permissionState)
+    permissionAgent.pipeline = new HostPermissionPipeline({ core: permissionAgent.core, journal: permissionJournal, delegation: permissionDelegation, state: permissionState });
   const missions = new MissionService(config, key, manager, teams, projectGroups);
   ownerServices.missions = missions;
   // A run is live while its sealed record file exists, so a record that failed to load keeps its evidence.
@@ -1075,11 +1082,14 @@ export function createApp(config: Config, key: Buffer) {
     const body = permissionDelegationBodySchema.parse(req.body);
     const actor = { deviceId: String(res.locals.deviceId) };
     const request = { requestId: body.requestId, direction: body.direction };
+    // A changed direction text closes the open rejects of the projects it covers.
+    const delegation = permissionDelegation;
+    const recorded = <T>(act: () => T) => closeRejectsOnDirectionChange(delegation, permissionJournal, config.projects.map(project => project.id), act);
     if (body.all) {
-      const result = permissionDelegation.delegateAll(request, actor);
+      const result = recorded(() => delegation.delegateAll(request, actor));
       return res.json({ agent: PERMISSION_AGENT_STATE, views: result.views, replacedOptOuts: result.replacedOptOuts });
     }
-    const result = permissionDelegation.delegate(body.workspaceId!, request, actor);
+    const result = recorded(() => delegation.delegate(body.workspaceId!, request, actor));
     return res.json({ agent: PERMISSION_AGENT_STATE, views: [result.view], replacedOptOuts: result.replacedOptOuts });
   });
   app.post("/api/permissions/revocations", requireRole(["owner"]), requireOwnerCli, (req, res) => {
@@ -1088,6 +1098,7 @@ export function createApp(config: Config, key: Buffer) {
     const view = permissionDelegation.revoke(body.workspaceId, { requestId: body.requestId }, { deviceId: String(res.locals.deviceId) });
     return res.json({ agent: PERMISSION_AGENT_STATE, view });
   });
+  registerPermissionControlRoutes(app, { guards: [requireRole(["owner"]), requireOwnerCli], controls: permissionControls });
   app.post("/api/goals", requireRole(["owner"]), async (req, res) => {
     const body = createGoalSchema.parse(req.body);
     assertNoHandoff(body.projectId);

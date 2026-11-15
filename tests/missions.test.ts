@@ -1984,3 +1984,33 @@ test("a pause withdraws a held coordinator launch and returns its fired follow-u
     assert.equal(h.attempts(), 2, "The withdrawn attempt never launched");
   } finally { h.close(); mock.timers.reset(); }
 });
+
+test("a pause that stops a launched attempt before its report returns the fired follow-up to the next conversation", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(240));
+    await h.confirmNative(1);
+    await h.report(1, followUp(10));
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 1);
+    mock.timers.tick(10 * 60000);
+    // The second attempt launches with the fired follow-up; the owner pauses before it reports.
+    const second = await h.attempt(2);
+    await h.confirmNative(2);
+    assert.equal(((await h.messages(2)) as PromptMessage[]).filter(message => message.type === "follow-up").length, 1);
+    const running = await until(() => h.get(id), mission => mission.coordinator?.sessionId === second.sessionId && mission.coordinator.status === "running");
+    await h.missions.pause(id, { requestId: randomUUID(), revision: running.revision });
+    await until(() => h.get(id), mission => mission.coordinator?.status === "stopped");
+    // A long pause, such as an owner halt, makes the next attempt start a new conversation.
+    mock.timers.tick(61 * 60000);
+    await h.missions.resume(id, { requestId: randomUUID(), revision: h.get(id).revision });
+    const third = await h.attempt(3);
+    assert.equal(third.request.continuation?.mode, "start");
+    const messages = (await h.messages(3)) as PromptMessage[];
+    assert.deepEqual(messages.filter(message => message.type === "follow-up").map(message => [message.reason, message.check]),
+      [["The API subteam's CI run may have finished", "Read the API subtask's team status and checks"]]);
+    assert.equal(messages.filter(message => message.type === "resumed").length, 1);
+    assert.equal(h.refusals(id), 0, "A paused stop is not a missed report");
+    assert.ok(!h.get(id).events.some(event => /could not be resumed/.test(event.text)), "The resumed conversation was confirmed, so this is not a failed resume");
+  } finally { h.close(); mock.timers.reset(); }
+});

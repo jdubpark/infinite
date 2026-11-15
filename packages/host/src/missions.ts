@@ -896,12 +896,16 @@ export class MissionService {
       this.save(stored); return;
     }
     endAttempt(attempt);
+    const applied = Boolean(attempt.report) && live.has(mission.status);
     if (attempt.report) {
-      if (live.has(mission.status)) { this.keepNote(stored, attempt); this.consume(stored, attempt.report, attempt); }
+      if (applied) { this.keepNote(stored, attempt); this.consume(stored, attempt.report!, attempt); }
       else this.event(stored, "A coordinator report arrived after the mission stopped; it was not applied.");
       delete attempt.note;
     } else if (attempt.missedReport && live.has(mission.status))
       this.refuse(stored, "missing", "Your previous attempt ended without a mission report. File exactly one report in every attempt; report wait when nothing needs a decision.");
+    // A consumed message is settled only by an applied report. A pause that stopped this attempt first returns its
+    // messages for the attempt after resume; a conversation resumed inside the idle window may see them twice.
+    if (!applied && mission.status === "paused") returnConsumed(stored, attempt);
     this.save(stored);
   }
   /** Keeps the newest notes within the count and length limits; the oldest go first. A refused report's note is kept too. */

@@ -275,10 +275,13 @@ restart can neither lose the message nor fire it twice. Follow-ups due in the
 same pass reach the same attempt.
 
 A paused mission fires nothing; a follow-up that came due during the pause
-fires once after resume. When a pause withdraws a coordinator attempt whose
-launch was still waiting, for example on host load, the messages that attempt
-held, including a fired follow-up, return to the front of the queue and reach
-the first attempt after resume, once. A mission in `needs-input` is still live, so its
+fires once after resume. A message the coordinator received is settled only
+when a report from that attempt is applied. When a pause withdraws an attempt
+whose launch was still waiting, for example on host load, or stops one before a
+report from it was applied, the messages that attempt held, including a fired
+follow-up, return to the front of the queue and reach the first attempt after
+resume. A conversation resumed after the pause can therefore see such a message
+twice. A mission in `needs-input` is still live, so its
 follow-ups fire. When a mission is cancelled, blocked (including by its
 deadline), or reaches `ready-for-review`, its open follow-ups become
 `cancelled`; a blocked mission cannot resume, so they could never fire.

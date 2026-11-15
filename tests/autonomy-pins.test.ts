@@ -14,6 +14,7 @@ import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { createTeamSchema, teamGoalContextSchema, teamLineupSchema } from "../packages/host/src/team-types.js";
 import { waitFor } from "./helpers.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
+import { unseal } from "../packages/host/src/vault.js";
 
 const lineup: TeamLineup = {
   coordinator: { id: "coordinator", label: "Coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
@@ -110,18 +111,23 @@ test("a run recorded before this slice reads as supervised and is not rewritten"
   } finally { teams.close(); f.close(); }
 });
 
-test("a goal recorded before this slice is not rewritten at load", async () => {
+test("a goal recorded before this slice keeps its fields at load", async () => {
   const f = teamFixture();
   f.config.projects[0]!.autonomy = "autonomous";
   const goal = goalRecord(f);
   f.writeRecord("goal", goal.id, { goal, receipts: {}, fingerprint: "fixture" });
-  const file = join(f.config.stateDir, "goals", `${goal.id}.sealed`), before = readFileSync(file);
+  const file = join(f.config.stateDir, "goals", `${goal.id}.sealed`);
   const teams = stubTeams();
   let goals: GoalService | undefined;
   try {
     goals = new GoalService(f.config, f.key, teams as unknown as TeamService);
     assert.equal(autonomyOf((await goals.get(goal.id)).goal ?? {}), "supervised");
-    assert.deepEqual(readFileSync(file), before, "Loading a pre-slice goal must not rewrite its sealed bytes");
+    // The migration writes the record once at load, so the bytes change; the goal's fields must not.
+    const sealed = unseal<{ goal: ProductGoal; receipts: unknown; fingerprint: unknown }>(f.key, `goal:${goal.id}`, readFileSync(file, "utf8"));
+    assert.deepEqual(sealed.goal, goal, "the goal keeps its fields at load");
+    assert.deepEqual(sealed.receipts, {});
+    assert.equal(sealed.fingerprint, "fixture");
+    assert.equal("autonomy" in sealed.goal, false, "the goal holds no autonomy key");
   } finally { goals?.close(); f.close(); }
 });
 

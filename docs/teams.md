@@ -774,6 +774,15 @@ host session capacity still applies.
 Pausing does not extend the deadline or restore consumed attempts. Steering can
 change the direction, but cannot expand the approved paths, deadline, or limits.
 
+Each goal holds an objective record. It states the objective, the success
+criteria as `c0`, the non-goals, the evidence, and the allowed paths, and it
+gets one direction for each steering message, in steering order. Each change
+is logged. The owner reads the record, or any past version of it, with
+`infinite goal record ID [--version N] [--json]` or `GET /api/goals/:id/record`.
+A standalone run gets its record at its first accepted plan. Goal cycle runs,
+mission subteams, and handoff runs have no record of their own. The record changes no prompt
+yet, and the relay does not carry it.
+
 With `extendMinutes` above 0, the host moves the deadline forward when it arrives,
 if the active team has a member with attention activity within the stall window
 (`teams.stallMinutes`, default 30). The new deadline is the later of now or the
@@ -1831,6 +1840,7 @@ mutation returns the current Goal or Team record.
 | --- | --- | --- |
 | `GET /api/goals` | None; returns `{goals}` | Any paired device |
 | `GET /api/goals/:id` | None; returns the goal, cycles, limits, and assessments | Any paired device |
+| `GET /api/goals/:id/record[?version=N]` | Optional `version` (a positive integer); returns the objective record at that version, with its log | Owner, controller, or viewer |
 | `POST /api/goals` | Creation fields below | Owner |
 | `POST /api/goals/:id/steer` | `requestId`, `revision`, `text` | Owner/controller |
 | `POST /api/goals/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner |
@@ -1855,6 +1865,16 @@ It leaves scope and budgets unchanged. Outcome `result` is `achieved`,
 pending operation. Resume requires a paused goal whose deadline has not expired;
 extend the goal first if it has.
 
+The record reads answer `404` with `objective-version-not-found` for a version
+the record does not have, and `409` for a goal cycle run, mission subteam, or handoff run
+(`objective-record-of-goal`, `objective-record-of-mission`, `objective-record-of-handoff`), a stored record that
+cannot be read (`objective-record-invalid`), one a newer host wrote
+(`objective-record-newer`), and a goal whose fields do not fit the record
+(`objective-source-invalid`). An unknown id answers `404` with
+`goal-not-found` or `team-not-found`. A standalone run with no plan yet answers
+`404` with `objective-record-absent`. A `version` that is not a positive integer
+answers `400`. Error bodies carry a code and a fixed sentence, never record text.
+
 The legacy goal parallelism endpoint refuses owner capacity changes; each
 cycle's PM selects capacity for its work. The refusal uses `409` with
 `code: "agent-managed-capacity"`.
@@ -1866,6 +1886,7 @@ cycle's PM selects capacity for its work. The refusal uses `409` with
 | `GET /api/teams` | None; returns `{teams}` | Any paired device |
 | `GET /api/teams/:id` | None; returns reports and check evidence | Any paired device |
 | `GET /api/teams/:id/context` | None; returns the files each member's recorded tool inputs pointed at | Any paired device |
+| `GET /api/teams/:id/record[?version=N]` | Optional `version` (a positive integer); returns the objective record of a standalone run at that version | Owner, controller, or viewer |
 | `POST /api/teams` | `requestId`, `projectId`, `provider`, `title`, `objective`, optional `useConfiguredLineup` | Owner |
 | `POST /api/teams/:id/steer` | `requestId`, `revision`, `text` | Owner/controller; standalone teams |
 | `POST /api/teams/:id/continue` | `requestId` (UUID), `revision`, optional trimmed `text` (1–8,000 characters) | Owner; continuable standalone blocked runs |

@@ -385,9 +385,9 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
             {continuation.brief ? <Disclosure title="Preserved opportunity brief"><Text style={t.strong}>{continuation.brief.title}</Text><Clamp text={continuation.brief.problem} lines={4} />{continuation.brief.evidence.map((item, index) => <Text key={index} style={t.note}>{item.source}: {item.observation}</Text>)}</Disclosure> : null}
           </View>)}
         </Section> : null}
-        {team.steering.length || answered.length ? <Section title="Your directions and decisions" count={team.steering.length + answered.length}>
-          {team.steering.map((entry, index) => <View key={`${entry.at}/${index}`} style={s.record}><Text style={t.note}>Direction · rev {entry.revision} · {shortDate(entry.at)}</Text><Clamp text={entry.text} lines={3} /></View>)}
-          {answered.map(decision => <View key={decision.id} style={s.record}><Text style={t.note}>Decision · rev {decision.revision}</Text><Text style={t.body}>{decision.question}</Text><Text style={t.strong}>{decision.answeredBy === "coordinator" ? "Mission coordinator" : "You"}: {decision.answer}</Text></View>)}
+        {team.steering.length || answered.length ? <Section title="Directions and decisions" count={team.steering.length + answered.length}>
+          {team.steering.map((entry, index) => <View key={`${entry.at}/${index}`} style={s.record}><Text style={t.note}>{typeof entry.source === "object" ? entry.source.name : entry.source === "coordinator" ? "Mission coordinator" : "You"} · direction · rev {entry.revision} · {shortDate(entry.at)}</Text><Clamp text={entry.text} lines={3} /></View>)}
+          {answered.map(decision => <View key={decision.id} style={s.record}><Text style={t.note}>Decision · rev {decision.revision}</Text><Text style={t.body}>{decision.question}</Text><Text style={t.strong}>{decision.answeredBy === "connector" ? decision.source?.name ?? "Connector" : decision.answeredBy === "coordinator" ? "Mission coordinator" : "You"}: {decision.answer}</Text></View>)}
         </Section> : null}
         {team.events.length ? <Section title="History" count={team.events.length}>
           {[...team.events].reverse().slice(0, 6).map((event, index) => <HistoryRow key={`${event.at}/${index}`} at={event.at} day={team.updatedAt} text={event.text} />)}

@@ -1,3 +1,4 @@
+import type { ConnectorSource } from "./mcp-types.js";
 import { z } from "zod";
 import { blockerEvidenceSchema, type TeamLineup, type TeamStatus } from "./team-types.js";
 import type { UsageRollup } from "./team-usage.js";
@@ -90,7 +91,8 @@ export interface MissionDecision {
   childDecisionId?: string;
   answer?: string;
   answeredAt?: string;
-  answeredBy?: "owner" | "coordinator";
+  answeredBy?: "owner" | "coordinator" | "connector";
+  source?: ConnectorSource;
 }
 /** A time the coordinator asked to look again. `fired` means the host woke the coordinator; it records no outcome. */
 export interface MissionFollowUp {
@@ -102,8 +104,8 @@ export interface MissionFollowUp {
   state: "open" | "fired" | "cancelled";
   settledAt?: string;
 }
-export type MissionOrigin = { kind: "intake"; issueId: string; identifier: string; url: string; rule: string };
-export type MissionInputSource = "slack";
+export type MissionOrigin = { kind: "intake"; issueId: string; identifier: string; url: string; rule: string; source?: ConnectorSource };
+export type MissionInputSource = "slack" | ConnectorSource;
 export interface Mission {
   id: string;
   groupId: string;
@@ -132,7 +134,7 @@ export interface Mission {
   dispatchSummary?: string;
   subtasks: MissionSubtask[];
   decisions: MissionDecision[];
-  steering: { text: string; revision: number; at: string }[];
+  steering: { text: string; revision: number; at: string; source?: MissionInputSource }[];
   events: { at: string; text: string }[];
   result?: { summary: string; revision: number; at: string };
   /** Open follow-ups and the 10 most recently settled. Absent on missions that never set one. */

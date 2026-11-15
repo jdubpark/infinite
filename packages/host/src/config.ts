@@ -8,6 +8,7 @@ import { machineIdentity } from "./machine.js";
 import { autonomyModeSchema } from "./autonomy.js";
 import { projectSourceSchema, teamProjectSchema, teamCommandSchema, teamRetentionSchema, storageFloorSchema, teamLineupSchema } from "./team-types.js";
 import { intakeConfigSchema } from "./intake-types.js";
+import { mcpConfigSchema } from "./mcp-types.js";
 import { egressConfigSchema } from "./egress.js";
 
 /**
@@ -72,9 +73,11 @@ export const githubBoundarySchema = z.object({
 
 const schema = z
   .object({
+    // Keep absent report names absent in routine authority digests; reportName() supplies the display default.
     linear: z.object({ apiKeyFile: z.string().refine(isAbsolute), endpoint: z.url().optional(), reportName: z.string().trim().min(1).max(40).regex(/^[A-Za-z][A-Za-z0-9 -]*$/).optional() }).strict().optional(),
     hostLoad: z.object({ minAvailableMemoryGiB: z.number().min(0).max(4096), maxLoadPerCpu: z.number().positive().max(64) }).strict().optional(),
     intake: intakeConfigSchema.optional(),
+    mcp: mcpConfigSchema.optional(),
     teams: z.object({ workspaceDir: z.string().refine(isAbsolute), commandPrefix: teamCommandSchema.optional(), lineup: teamLineupSchema.optional(), trustWorkspaces: z.boolean().optional(), publishHeads: z.boolean().default(true), stallMinutes: z.number().int().min(5).max(1440).optional(), checkMinutes: z.number().positive().max(240).optional(), retention: teamRetentionSchema.optional(), storageFloor: storageFloorSchema.optional(), outcomes: outcomeSettingsSchema.optional(), blackboard: z.object({ tools: z.boolean().optional() }).strict().optional() }).strict().optional(),
     machine: z.object({ id: z.uuid(), label: machineLabelSchema }).strict().optional(),
     autonomy: z.object({ defaultMode: autonomyModeSchema.optional(), fuse: fuseConfigSchema.optional(), continuity: continuityConfigSchema.optional(), boundary: z.object({ egress: egressConfigSchema.optional(), github: githubBoundarySchema.optional() }).strict().optional() }).strict().optional(),
@@ -226,7 +229,7 @@ export function validateIntakeConfig(config: Config): void {
   if (intake.linear.commentsMirrorToSlack && !intake.slack) throw new Error("commentsMirrorToSlack needs intake.slack");
   const slack = intake.slack;
   // Without admission and without direct requests nothing could ever start a mission.
-  if (intake.linear.admitIssues === false && !slack?.directRequests) throw new Error("admitIssues false needs intake.slack.directRequests");
+  if (intake.linear.admitIssues === false && !slack?.directRequests && !config.mcp) throw new Error("admitIssues false needs intake.slack.directRequests or mcp");
   if (slack?.answerQuestions && !slack.directRequests) throw new Error("answerQuestions needs intake.slack.directRequests");
   if (slack?.classify && !slack.answerQuestions) throw new Error("classify needs intake.slack.answerQuestions");
   if (slack?.classify && !config.jev) throw new Error("classify needs the jev block");
@@ -250,6 +253,17 @@ export function validateIntakeConfig(config: Config): void {
   if (answerProjectId && !config.projects.some(project => project.id === answerProjectId))
     throw new Error("intake.mission.answerProjectId must name a configured project");
 }
+/** MCP credentials and project grants are independent of paired-device authority. */
+export function validateMcpConfig(config: Config): void {
+  if (!config.mcp) return;
+  mcpConfigSchema.parse(config.mcp);
+  if (!config.linear || !config.intake) throw new Error("MCP requires host Linear and intake configuration");
+  if (config.mcp.port !== 0 && config.mcp.port === config.port) throw new Error("MCP requires a separate port");
+  for (const connector of config.mcp.connectors) {
+    if (config.tokens.some(token => token.hash === connector.tokenHash)) throw new Error("MCP credentials must differ from device credentials");
+    if (connector.projectIds.some(id => !config.projects.some(project => project.id === id))) throw new Error("MCP grants must name configured projects");
+  }
+}
 export function readConfig(file: string): { config: Config; key: Buffer } {
   const parsed = schema.parse(JSON.parse(readFileSync(file, "utf8")));
   for (const id of Object.keys(parsed.autonomy?.fuse?.projects ?? {})) {
@@ -258,6 +272,7 @@ export function readConfig(file: string): { config: Config; key: Buffer } {
   const config = parsed as Config;
   config.deployment = parseDeployment(config.deployment);
   validateLinearConfig(config);
+  validateMcpConfig(config);
   validateIntakeConfig(config);
   assertRunnerDeployment(config);
   for (const path of [

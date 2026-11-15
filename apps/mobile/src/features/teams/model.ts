@@ -17,7 +17,7 @@ export type TeamBrief = { title: string; problem: string; evidence: TeamEvidence
 export type TeamTask = { id: string; title: string; instructions: string; paths: string[]; dependsOn: string[]; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; memberId?: string; commit?: string; summary?: string; agentProfileId?: string; escalation?: { toProfileId: string; reason: string }; usage?: TaskUsage; ownerRating?: OwnerRating; rubric?: Rubric };
 export type TeamContinuation = { revision: number; requestId: string; at: string; reason: string; headCommit: string; tasks: TeamTask[]; review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string }; brief?: TeamBrief };
 export type TeamMember = { memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string; taskId?: string; provider?: string; modelProfile?: ModelProfile; stoppedReason?: string };
-export type TeamDecision = { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator" };
+export type TeamDecision = { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator" | "connector"; source?: { kind: "connector"; id: string; name: string } };
 export type TeamWorkers = { limit: number; max: number; running: number; ready: number };
 /** The coordinator's recorded decision about one member's open provider prompt; the prompt itself stays host-private. */
 export type PermissionDecision = { id: string; revision: number; targetMemberId: string; targetSessionId: string; promptId: number; expiresAt: string; status: "pending" | "reviewing" | "approved" | "answering" | "answered" | "escalated" | "stale" | "uncertain"; reason?: string };
@@ -27,7 +27,7 @@ export type TeamView = {
   workers?: TeamWorkers;
   revision: number; status: TeamStatus; createdAt: string; updatedAt: string; workspace: string;
   branch: string; baseCommit: string; headCommit?: string; tasks: TeamTask[]; members: TeamMember[];
-  decisions: TeamDecision[]; checks: TeamCheck[]; steering: { text: string; revision: number; at: string }[];
+  decisions: TeamDecision[]; checks: TeamCheck[]; steering: { text: string; revision: number; at: string; source?: { kind: "connector"; id: string; name: string } | "coordinator" | "slack" }[];
   events: { at: string; text: string }[]; reason?: string; round: number;
   review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string };
   /** Agent-reported merge evidence; it is not independently verified by the host. */

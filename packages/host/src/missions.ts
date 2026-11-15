@@ -614,7 +614,10 @@ export class MissionService {
     // A stopped intake clock is not checked; its deadline moves when the owner or the pause releases it.
     if ((live.has(mission.status) || mission.status === "paused") && !stored.clockStoppedAt && Date.now() >= Date.parse(mission.deadlineAt)) {
       mission.status = "blocked"; mission.stopReason = "deadline"; mission.reason = timeLimitReason; stored.blockedAt = stored.blockedAt ?? now();
-      for (const subtask of mission.subtasks.filter(item => item.teamId && item.status === "running")) this.queueOp(stored, { kind: "pause", subtaskId: subtask.id, teamId: subtask.teamId! });
+      for (const subtask of mission.subtasks.filter(item => item.teamId && item.status === "running")) {
+        stored.ops = stored.ops.filter(op => op.teamId !== subtask.teamId || op.kind !== "resume");
+        this.queueOp(stored, { kind: "pause", subtaskId: subtask.id, teamId: subtask.teamId! });
+      }
       mission.coordinator = mission.coordinator ? { ...mission.coordinator, status: "stopped" } : undefined;
       this.event(stored, timeLimitReason); this.save(stored);
     }
@@ -888,8 +891,10 @@ export class MissionService {
         continue;
       }
       if ((op.kind === "cancel" && settled) || (op.kind === "parallelism" && settled) || (op.kind === "pause" && (settled || ["paused", "blocked"].includes(team.status))) || (op.kind === "resume" && team.status !== "paused")) continue;
-      // Steering restarts a paused or blocked subteam, so direction waits until both it and the mission are running again.
-      if (op.kind === "steer" && (team.status === "paused" || stored.mission.status === "paused")) { remaining.push(op); continue; }
+      const deadlineBlocked = stored.mission.status === "blocked" && stored.mission.stopReason === "deadline";
+      if (op.kind === "resume" && deadlineBlocked) { remaining.push(op); continue; }
+      // Steering restarts a paused or blocked subteam, so direction waits until both it and its owning mission are running again.
+      if (op.kind === "steer" && (team.status === "paused" || stored.mission.status === "paused" || deadlineBlocked)) { remaining.push(op); continue; }
       if (op.kind === "steer" && settled) { steered.push(`Subtask ${op.subtaskId} finished before the direction reached it.`); continue; }
       // A delivered steer raises the team revision, so a steer already bound to a revision replays its request
       // and is rebound only after the team refuses that revision as stale.

@@ -1872,6 +1872,48 @@ test("deadline blocking pauses a running subteam, keeps queued work, then resume
   } finally { h.close(); mock.timers.reset(); }
 });
 
+test("a pending subteam resume stays withheld after deadline until the owner extends", { timeout: 60000 }, async () => {
+  const h = scripted(); mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const created = await h.missions.create(missionRequest(5)); await h.attempt(1);
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const teamId = teamOf(await until(() => h.get(created.id), mission => Boolean(teamOf(mission, "a"))), "a")!;
+    const paused = await h.missions.pause(created.id, { requestId: randomUUID(), revision: h.get(created.id).revision });
+    await until(() => h.get(created.id), mission => mission.subtasks[0]?.teamStatus === "paused");
+    h.holdResume();
+    await h.missions.resume(created.id, { requestId: randomUUID(), revision: paused.revision });
+    mock.timers.tick(6 * 60000);
+    const blocked = await until(() => h.get(created.id), mission => mission.status === "blocked");
+    h.releaseResume();
+    await new Promise(done => setTimeout(done, 1200));
+    assert.equal(h.runs.get(teamId)?.status, "paused", "A pending resume cannot restart the subteam while the mission is deadline-blocked");
+    const extended = await h.missions.extend(created.id, { requestId: randomUUID(), revision: blocked.revision, minutes: 20 });
+    await until(() => h.runs.get(teamId)?.status, status => status === "implementing");
+    assert.equal(extended.stopReason, undefined);
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("a queued steer for a blocked subteam waits until its deadline-blocked mission is extended", { timeout: 60000 }, async () => {
+  const h = scripted(); mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const created = await h.missions.create(missionRequest(5)); await h.attempt(1);
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const teamId = teamOf(await until(() => h.get(created.id), mission => Boolean(teamOf(mission, "a"))), "a")!;
+    h.set(teamId, { status: "blocked" }); h.holdSteers(true);
+    await h.missions.steer(created.id, { requestId: randomUUID(), revision: h.get(created.id).revision, text: "Use the cached client" });
+    await h.report(2, { kind: "steer-subtask", subtaskId: "a", text: "Use the cached client" });
+    await until(() => h.get(created.id), mission => mission.events.some(event => /sent direction to subtask a/.test(event.text)));
+    mock.timers.tick(6 * 60000);
+    const blocked = await until(() => h.get(created.id), mission => mission.status === "blocked");
+    h.holdSteers(false);
+    await new Promise(done => setTimeout(done, 1200));
+    assert.deepEqual(h.steers, [], "A blocked subteam is not restarted while its mission is deadline-blocked");
+    await h.missions.extend(created.id, { requestId: randomUUID(), revision: blocked.revision, minutes: 20 });
+    await until(() => h.steers, steers => steers.length === 1);
+    assert.deepEqual(h.steers, [{ teamId, text: "Use the cached client" }]);
+  } finally { h.close(); mock.timers.reset(); }
+});
+
 test("extending a mission blocked for a coordinator reason is refused", { timeout: 30000 }, async () => {
   const h = scripted();
   try {

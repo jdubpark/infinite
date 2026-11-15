@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { fixture, mixedLineup } from "./team-fixture.js";
 import { waitFor } from "./helpers.js";
@@ -80,13 +80,13 @@ async function mixedRun(autonomy: "autonomous" | "supervised", blockDatabase = f
   const logs: string[] = [];
   // The `limited` set each start receives. An opencode limit is observed when task b first starts: task b's coordinator
   // profile is codex, and the contributor profile of task a is removed before the limit is read, so no choice changes.
-  const limitedSeen: { taskId: string; limited: Set<string> }[] = [];
+  const limitedSeen: { taskId: string; limited: Set<string>; objectiveDigest: boolean }[] = [];
   const teams = await f.openTeamService({ entries });
   const limits = (teams as unknown as { limits: { observe(limit: object): void } }).limits;
   const recorder = new RoutingRecorder({ store, log: line => logs.push(line) });
   teams.useRouter({ recordStart: input => {
     if (input.task.id === "b") limits.observe({ provider: "opencode", detectedAt: new Date().toISOString(), sessionId: "routing-run-test", confidence: "corroborated" });
-    limitedSeen.push({ taskId: input.task.id, limited: input.limited as Set<string> });
+    limitedSeen.push({ taskId: input.task.id, limited: input.limited as Set<string>, objectiveDigest: input.objectiveDigest });
     recorder.recordStart(input);
   } } as unknown as RoutingRecorder);
   return { f, store, teams, logs, limitedSeen };
@@ -163,14 +163,19 @@ const goalWithRecord = (): TeamGoalContext => teamGoalContextSchema.parse({ id: 
   ] } });
 
 test("a goal cycle with owner criteria records the digest prompt version, with the blackboard tools off", { timeout: 240000 }, async () => {
-  const { f, store, teams } = await mixedRun("autonomous");
+  const { f, store, teams, limitedSeen } = await mixedRun("autonomous");
   try {
+    // A goal plan must carry a brief; the fake agent attaches one when this flag file is present.
+    writeFileSync(join(f.receipts, "plan-brief"), "1");
     const created = await teams.createForGoal(f.create(), goalWithRecord(), mixedLineup, false, "autonomous");
     const settled = await settleAnswering(teams, created.id);
     await membersClosed(teams, created.id);
     assert.equal(settled.status, "ready-for-review", JSON.stringify(settled.events.slice(-5)));
     const run = storedRun(teams, created.id);
     assert.ok(run.goal?.record, "the run pins the record digest");
+    // The router spy receives the objective digest flag for every first implementer start.
+    assert.ok(limitedSeen.length >= 2, "the router saw both first implementer starts");
+    for (const seen of limitedSeen) assert.equal(seen.objectiveDigest, true, `task ${seen.taskId}'s start carries the digest flag`);
     // The entry tools are the question here, so the blackboard tools stay off: the run's prompt version takes entryTools false.
     assert.notEqual(run.blackboard?.tools, true, "the run's blackboard tools are off");
     const publishHeads = f.host.config.teams?.publishHeads !== false;

@@ -341,7 +341,8 @@ async function main() {
     if (scenario === "bootstrap-change" && assignment.revision > 2)
       verification.checks[0].args.push("--different");
     const plan = { kind: "plan", summary: "Build two independent files and verify their integrated contents", tasks,
-      ...(scenario === "permissions-routine" || scenario === "mixed" ? { brief: {
+      // A test that starts a goal run writes plan-brief, because a goal plan must carry a brief.
+      ...(scenario === "permissions-routine" || existsSync(join(receiptDir, "plan-brief")) ? { brief: {
         title: "Add matching output files", problem: "The project has no matching output files.",
         evidence: [{ source: "original.txt", observation: "The source describes the fixture project." }],
         dataShape: "Two text files containing the same revision line", acceptance: ["The configured check validates both output files."],

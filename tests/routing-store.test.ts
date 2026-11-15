@@ -275,6 +275,12 @@ test("decision reads seek their indexes", () => {
   }
 });
 
+test("the decision key is the sha256 of the plan's formula, revision included", () => {
+  // Golden: sha256 of "run-1|2|tref|start|1", computed with shasum -a 256.
+  assert.equal(decisionKey("run-1", 2, "tref", "start", 1), "680d338d30412343f58997852609c82ff8f6e9ea6aa07dccaffe29fa364c6c82");
+  assert.notEqual(decisionKey("run-1", 2, "tref", "start", 1), decisionKey("run-1", 1, "tref", "start", 1));
+});
+
 test("the module is version 1 with no run hooks", () => {
   const module = routingModule();
   assert.deepEqual([module.name, module.version, module.readVersion], ["routing", 1, 1]);

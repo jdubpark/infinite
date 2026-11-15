@@ -414,13 +414,31 @@ test("a row ended 30 days ago counts at the half-life weight times the chosen we
 
 test("two profiles of one identity share the first one's prompt version", () => withStore(store => {
   const astra = mixedLineup.implementers[1]!;
-  const twin: TeamModelProfile = { ...astra, id: "astra-twin", label: "Astra twin" };
+  const twin: TeamModelProfile = { ...astra, id: "astra-twin", label: "Astra twin", tier: "strong" };
   const lineup: TeamLineup = { ...mixedLineup, implementers: [astra, twin] };
   const run = runOf(lineup, pinRouting(undefined, "autonomous", lineup), "run-twin");
   recorder(store).recordStart(startOf(run, taskOf("task-a")));
   const payload = rowsOf(store, run.id, "task-a")[0]!.payload!;
   assert.notEqual(versionOf(astra), versionOf(twin));
   assert.deepEqual(payload.current, [{ identity: identityOf(astra), epoch: 1, promptVersion: versionOf(astra) }]);
+  // One identity has one cost: the first profile's tier, whichever profile comes last.
+  assert.deepEqual(payload.candidates.map(candidate => candidate.costUsd), [TIER_COSTS.light, TIER_COSTS.light]);
+}));
+
+test("the same run and task at revision 2 writes a second row, and each row keeps its own revision", () => withStore(store => {
+  const routing = pinRouting({ allowContributor: true }, "autonomous", mixedLineup);
+  const run1 = runOf(mixedLineup, routing, "run-replan");
+  const run2 = { ...run1, revision: 2 } as unknown as TeamRun;
+  const task = taskOf("task-a", { agentProfileId: "spark-high" });
+  const rec = recorder(store);
+  rec.recordStart(startOf(run1, task));
+  rec.recordStart(startOf(run2, task));
+  const rows = store.read(db => taskDecisions(db, "run-replan", "task-a")).rows;
+  assert.deepEqual(rows.map(row => row.revision), [1, 2]);
+  assert.equal(rows[0]!.key, decisionKey("run-replan", 1, rows[0]!.taskKey, "start", 1));
+  assert.equal(rows[1]!.key, decisionKey("run-replan", 2, rows[1]!.taskKey, "start", 1));
+  assert.notEqual(rows[0]!.key, rows[1]!.key);
+  assert.equal(countRows(store), 2);
 }));
 
 test("a strong profile is costed at the strong tier default", () => withStore(store => {
@@ -445,7 +463,6 @@ test("eight candidates with integrated rows at all three levels stay within the 
   store.write(tx => {
     for (const [index, profile] of implementers.entries()) {
       config(tx, `cfg-${index}`, profile, versionOf(profile));
-      config(tx, `old-${index}`, profile, "an-earlier-version");
       // Three levels: the task's cell, another area of the project, and another project.
       const levels = [["cell", {}], ["project", { area: "elsewhere/" }], ["tenant", { projectId: "other" }]] as const;
       for (const [level, where] of levels) {

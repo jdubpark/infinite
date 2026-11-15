@@ -13,6 +13,7 @@ import type {
 } from "./outcome-rules.js";
 import type { ReplacementCause, RunSummaryCounts } from "./run-events.js";
 import type { TeamTask } from "./team-types.js";
+import type { Identity, RoutingEvidenceRow } from "./routing-types.js";
 
 export const OUTCOMES_MODULE = "outcomes";
 export const OUTCOME_RETENTION_DAYS = 730;
@@ -36,6 +37,10 @@ const IN_CHUNK = 500;
 const LAST_SEQ = "last_seq";
 /** The four tables with a `run_deleted_at` column. The deletion stamp and the retention sweep both use them. */
 const RUN_TABLES = [OUTCOMES, OUTCOME_ROUNDS, RUN_SUMMARIES, MEMBER_RESULTS] as const;
+/** The longest replacement chain the migration follows. A deeper chain, or a cycle, gives a NULL point. */
+const POINT_CHAIN_LIMIT = 64;
+/** Rows per source that a routing read returns: the newest ones of the identity and point. */
+export const ROUTING_ROWS_PER_SOURCE = 1000;
 
 /** The kinds the projector reads. A run with an unseen event of one of these gains `gap`. */
 export const OUTCOME_KINDS: readonly string[] = [
@@ -262,7 +267,7 @@ const OUTCOME_COLUMNS = [
   "attempt_index", "inherited", "role", "profile_id", "provider", "model", "effort", "profile_epoch", "config_id",
   "experiment_ref", "area_ref", "kind", "risk", "feature_version", "disposition", "exclusion", "flags",
   "integrated", "accepted", "acceptance", "first_pass", "held", "started_at", "ended_at", "frozen_at", "hold_until",
-  "run_deleted_at", "payload", "goal_ref", "mission_ref",
+  "run_deleted_at", "payload", "goal_ref", "mission_ref", "point", "feature_map_ref", "owner_score",
 ] as const;
 const SUMMARY_COLUMNS = [
   "run_id", "source", "project_ref", "revision", "status", "block_code", "flags", "created_at", "settled_at",
@@ -318,6 +323,9 @@ type OutcomeSql = {
   payload: string;
   goal_ref: string | null;
   mission_ref: string | null;
+  point: RoutingPointValue | null;
+  feature_map_ref: string | null;
+  owner_score: number | null;
 };
 
 type SummarySql = {
@@ -369,12 +377,13 @@ export function outcomeModule(options?: { now?: () => string }): EvidenceModule 
   const now = options?.now ?? (() => new Date().toISOString());
   return {
     name: OUTCOMES_MODULE,
-    version: 3,
+    version: 4,
     readVersion: 2,
     migrate(tx, from) {
       if (from < 1) migrateVersion1(tx);
       if (from < 2) migrateVersion2(tx);
       if (from < 3) migrateVersion3(tx);
+      if (from < 4) migrateVersion4(tx);
     },
     deleteRun(tx, runId) {
       const stamp = now();
@@ -519,6 +528,75 @@ function migrateVersion3(tx: EvidenceTx): void {
   }
 }
 
+/**
+ * Version 4 adds the decision point, the feature-map blind index, and the owner's score, and the route index the
+ * routing reads seek. The three columns are filled once from each stored payload. The point of a row follows its
+ * replacement chain in memory, because table order is not attempt order. A payload that does not open gets a NULL point
+ * and `UNREADABLE_REF`, so the migration never fails on it.
+ */
+function migrateVersion4(tx: EvidenceTx): void {
+  tx.exec("ALTER TABLE outcomes ADD COLUMN point TEXT");
+  tx.exec("ALTER TABLE outcomes ADD COLUMN feature_map_ref TEXT");
+  tx.exec("ALTER TABLE outcomes ADD COLUMN owner_score INTEGER");
+  tx.exec(
+    "CREATE INDEX IF NOT EXISTS outcomes_by_route ON outcomes (source, role, point, provider, model, effort, ended_at, outcome_id)",
+  );
+  const bases = new Map<string, PointBase>();
+  const stored: { outcomeId: string; featureMapRef: string; ownerScore: number | null }[] = [];
+  for (const row of tx.all<{ outcome_id: string; run_id: string; source: string; role: string; attempt_index: number; payload: string }>(
+    "SELECT outcome_id, run_id, source, role, attempt_index, payload FROM outcomes",
+  )) {
+    try {
+      const payload = tx.open<OutcomePayload>(OUTCOMES, row.outcome_id, row.payload);
+      bases.set(row.outcome_id, {
+        runId: row.run_id,
+        source: row.source,
+        role: row.role,
+        attemptIndex: row.attempt_index,
+        replaces: payload.replaces,
+      });
+      stored.push({
+        outcomeId: row.outcome_id,
+        featureMapRef: tx.index("feature-map", payload.featureMap),
+        ownerScore: payload.ownerRating?.score ?? null,
+      });
+    } catch {
+      stored.push({ outcomeId: row.outcome_id, featureMapRef: UNREADABLE_REF, ownerScore: null });
+    }
+  }
+  const pointOfOutcome = (outcomeId: string, depth: number): RoutingPointValue | null => {
+    const base = bases.get(outcomeId);
+    if (base === undefined || depth > POINT_CHAIN_LIMIT) return null;
+    return pointOf(base, predecessor => pointOfOutcome(predecessor, depth + 1));
+  };
+  for (const row of stored) {
+    tx.run(
+      "UPDATE outcomes SET point=?, feature_map_ref=?, owner_score=? WHERE outcome_id=?",
+      pointOfOutcome(row.outcomeId, 0),
+      row.featureMapRef,
+      row.ownerScore,
+      row.outcomeId,
+    );
+  }
+}
+
+/** The routing point of a row, derived from its replacement. `point` is set only on an implementer row that is not legacy. */
+type RoutingPointValue = "start" | "escalation";
+type PointBase = { runId: string; source: string; role: string; attemptIndex: number; replaces: Replaces };
+type Replaces = OutcomePayload["replaces"];
+
+/**
+ * A row's point: `start` with no replacement, `escalation` for an escalation's replacement, and otherwise the point of
+ * the replaced member's row, which `predecessorPoint` gives. A legacy row, a scout row, or a row with no point gives null.
+ * Attempt 0 is the blank row of a member whose start was never seen: its point is unknown, so it is never `start`.
+ */
+function pointOf(base: PointBase, predecessorPoint: (outcomeId: string) => RoutingPointValue | null): RoutingPointValue | null {
+  if (base.source === "legacy" || base.role !== "implementer" || base.attemptIndex === 0) return null;
+  if (base.replaces === undefined) return "start";
+  if (base.replaces.cause === "escalation") return "escalation";
+  return predecessorPoint(`${base.runId}:${base.replaces.memberId}`);
+}
+
 /** The refs of one stored payload. Both are `UNREADABLE_REF` when the payload does not open or does not read. */
 function migrationRefs(tx: EvidenceTx, table: string, rowId: string, sealed: string): GoalMissionRefs {
   try {
@@ -582,10 +660,86 @@ export function selectOutcomes(db: EvidenceDb, filter: OutcomeFilter): { rows: O
   return { rows, unreadable };
 }
 
-/** Writes the whole row. The three blind-index fields are derived from `payload`, never taken from the caller. */
+/** The route read's statement. Its parameters are the source, the point, the provider, the model, the effort (NULL matches NULL), `since`, and the limit. */
+export const ROUTING_EVIDENCE_SQL = "SELECT o.outcome_id, o.source, o.project_ref, o.area_ref, o.provider, o.model, o.effort, "
+  + "o.profile_epoch, o.kind, o.feature_version, o.disposition, o.exclusion, o.flags, o.integrated, o.accepted, "
+  + "o.first_pass, o.held, o.ended_at, o.frozen_at, o.point, o.feature_map_ref, o.owner_score, c.prompt_version "
+  + "FROM outcomes o LEFT JOIN configurations c ON c.config_id = o.config_id "
+  + "WHERE o.source = ? AND o.role = 'implementer' AND o.point = ? AND o.provider = ? AND o.model = ? AND o.effort IS ? "
+  + "AND o.ended_at >= ? ORDER BY o.ended_at DESC, o.outcome_id DESC LIMIT ?";
+
+/** The sources a routing read counts. `replay` and `legacy` rows never inform a choice. */
+const ROUTING_SOURCES = ["production", "duel"] as const;
+
+/**
+ * Rows of one identity and point from `production` and `duel`, ended at or after `since`, each source its newest
+ * ROUTING_ROWS_PER_SOURCE, returned in `outcome_id` order. Opens no payload. The caller checks that the `outcomes` and
+ * `configurations` modules are ready.
+ */
+export function selectRoutingEvidence(
+  db: EvidenceDb,
+  identity: Identity,
+  point: RoutingPointValue,
+  since: string,
+): RoutingEvidenceRow[] {
+  const rows: RoutingEvidenceRow[] = [];
+  for (const source of ROUTING_SOURCES) {
+    const found = db.all<RoutingSql>(
+      ROUTING_EVIDENCE_SQL,
+      source,
+      point,
+      identity.provider,
+      identity.model,
+      identity.effort,
+      since,
+      ROUTING_ROWS_PER_SOURCE,
+    );
+    for (const row of found) rows.push(toRoutingEvidence(row));
+  }
+  return rows.sort((a, b) => compareKeys(a.outcomeId, b.outcomeId));
+}
+
+/** The plain columns of one route-read row. */
+type RoutingSql = Pick<OutcomeSql, "outcome_id" | "source" | "project_ref" | "area_ref" | "provider" | "model" | "effort"
+  | "profile_epoch" | "kind" | "feature_version" | "disposition" | "exclusion" | "integrated" | "accepted" | "first_pass" | "held"
+  | "ended_at" | "frozen_at"> & { flags: string; point: RoutingPointValue; feature_map_ref: string | null; owner_score: number | null; prompt_version: string | null };
+
+function toRoutingEvidence(row: RoutingSql): RoutingEvidenceRow {
+  return {
+    outcomeId: row.outcome_id,
+    source: row.source,
+    projectRef: row.project_ref,
+    areaRef: row.area_ref,
+    provider: row.provider,
+    model: row.model,
+    effort: row.effort,
+    profileEpoch: row.profile_epoch,
+    kind: row.kind,
+    featureVersion: row.feature_version,
+    disposition: row.disposition,
+    exclusion: row.exclusion,
+    flags: splitFlags(row.flags),
+    integrated: row.integrated,
+    accepted: row.accepted,
+    firstPass: row.first_pass,
+    held: row.held,
+    endedAt: row.ended_at,
+    frozenAt: row.frozen_at,
+    point: row.point,
+    featureMapRef: row.feature_map_ref,
+    ownerScore: row.owner_score,
+    promptVersion: row.prompt_version,
+  };
+}
+
+/**
+ * Writes the whole row. The three blind-index fields and the routing columns are derived from `payload` and the
+ * predecessor's stored point, never taken from the caller.
+ */
 export function writeOutcome(tx: EvidenceTx, row: OutcomeRow): void {
   const payload = row.payload;
   const refs = refsOf(tx, payload);
+  const routing = routingColumns(tx, row);
   tx.run(
     OUTCOME_UPSERT,
     row.outcomeId,
@@ -626,7 +780,23 @@ export function writeOutcome(tx: EvidenceTx, row: OutcomeRow): void {
     tx.seal(OUTCOMES, row.outcomeId, payload),
     refs.goalRef,
     refs.missionRef,
+    routing.point,
+    routing.featureMapRef,
+    routing.ownerScore,
   );
+}
+
+/** The routing columns of a row. The predecessor is read only when the row replaces another member for a cause but escalation. */
+function routingColumns(tx: EvidenceTx, row: OutcomeRow): { point: RoutingPointValue | null; featureMapRef: string; ownerScore: number | null } {
+  const payload = row.payload;
+  return {
+    point: pointOf(
+      { runId: row.runId, source: row.source, role: row.role, attemptIndex: row.attemptIndex, replaces: payload.replaces },
+      outcomeId => tx.get<{ point: RoutingPointValue | null }>("SELECT point FROM outcomes WHERE outcome_id=?", outcomeId)?.point ?? null,
+    ),
+    featureMapRef: tx.index("feature-map", payload.featureMap),
+    ownerScore: payload.ownerRating?.score ?? null,
+  };
 }
 
 export function readSummary(db: EvidenceDb, runId: string): RunSummaryRow | undefined {

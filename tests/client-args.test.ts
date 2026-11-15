@@ -4,6 +4,10 @@ import { clientCommandCandidate, handleClientCommand, legacyImportLines, legacyR
 import type { OutcomeRollup } from "../packages/host/src/outcome-rollup.js";
 import type { LegacyLineOutcome } from "../packages/host/src/outcome-legacy.js";
 import type { CellsResult } from "../packages/host/src/outcome-reads.js";
+import { DECISION_LIMIT, handleRoutingClientCommand, routingExplainLines, routingStatusLines } from "../packages/host/src/routing-cli.js";
+import { ROUTING_DEFAULTS } from "../packages/host/src/routing-policy.js";
+import { PROJECT_DECISION_LIMIT } from "../packages/host/src/routing-store.js";
+import type { CandidateRecord, ExplainedDecision, RoutingExplain, RoutingPayload, RoutingStatus } from "../packages/host/src/routing-types.js";
 
 test("codex defaults to cloud execution; --laptop is the explicit opt-in", () => {
   const cloud = parseClientArgs(["codex", "--model", "m", "Inspect"]);
@@ -245,4 +249,228 @@ test("refused lines are named on their own", () => {
   const outcome = (line: number, value: LegacyLineOutcome) => ({ line, outcome: value });
   assert.deepEqual(legacyRefusedLines([outcome(1, "imported"), outcome(2, "changed"), outcome(3, "repeated"), outcome(5, "conflict")]), ["Line 2: changed", "Line 5: conflict"]);
   assert.deepEqual(legacyRefusedLines([outcome(1, "imported"), outcome(2, "repeated")]), []);
+});
+
+const routingProfile = { profileId: "ops-light", rows: { production: 0, duel: 0 }, earlier: { mass: 0, rows: 0, appliedMass: 0 }, mean: 0.5, interval: [0.3, 0.7], rescue: 0.5, level: "none", costUsd: 0.4, greedy: true };
+const routingRemoved = { profileId: "review-strong", removed: "contributor", rows: { production: 0, duel: 0 }, earlier: { mass: 0, rows: 0, appliedMass: 0 }, mean: 0, interval: [0, 0], rescue: 0, level: "none", costUsd: 2.2, greedy: false };
+const routingStatusFixture = (overrides: Partial<RoutingStatus> = {}): RoutingStatus => ({
+  projectId: "alpha", mode: "shadow", requested: "shadow", source: "saved",
+  knobs: { points: ["start"], cascade: false, successValueUsd: 2, maxExploreShare: 0.2, exploreWindow: 50, minSpareAttempts: 4, allowContributor: false, listWeight: 0.25, headroomWeight: 1 },
+  defaults: ["successValueUsd", "listWeight"],
+  covers: { start: true, reason: null },
+  costs: { lightUsd: 0.4, strongUsd: 2.2, rescueUsd: 1.5, basis: "tier-default" },
+  headroom: "not-modelled", interval: "normal-approx-90", chosenWeight: 0.5, limits: "not-applied",
+  shadow: { windowDays: 30, decisions: 3, withCoordinator: 0, agreements: 0, greedyAgreements: 0, capped: false },
+  explore: { exploratory: 1, of: 3, guards: "risk-only" },
+  period: { decisions: 3, capped: false, firstAt: "2026-11-14T10:00:00.000Z", targetDays: 14, targetDecisions: 50 },
+  cells: [
+    { cell: { scope: "cell", area: "api\x07x", taskKind: null, featureVersion: 1, featureMap: "default" }, profiles: [routingProfile, routingRemoved] as never },
+    { cell: { scope: "new-task" }, profiles: [routingProfile] as never },
+  ],
+  cellsCapped: false, unreadableCells: 0,
+  ...overrides,
+} as RoutingStatus);
+
+test("routing lines show unknown, never zero", () => {
+  assert.deepEqual(routingStatusLines(routingStatusFixture()), [
+    "alpha · routing shadow (saved)",
+    "Value $2 per success (default) · list weight 0.25 (default) · contributor profiles not allowed",
+    "Start: covered",
+    "Shadow, last 30 days: 3 decisions; no decision had a coordinator pick",
+    "Shadow period: 3 of 50 decisions since 2026-11-14T10:00:00.000Z; it ends after 14 days and 50 decisions, whichever is later.",
+    "Would explore: 1 of 3, before the share, budget, and headroom guards.",
+    "Costs are tier defaults: light $0.40, strong $2.20, rescue $1.50. Limit headroom is not modelled. Intervals are 90% normal approximations. Coordinator-chosen history counts at half weight.",
+    "Cell api x · no kind · features v1 default",
+    "  ops-light  mean 0.5 [0.3, 0.7] · rescue 0.5 · rows production 0, duel 0 · earlier mass 0 (0 rows) · level none · $0.40 · greedy",
+    "  review-strong  removed: contributor",
+    "New task (project level)",
+    "  ops-light  mean 0.5 [0.3, 0.7] · rescue 0.5 · rows production 0, duel 0 · earlier mass 0 (0 rows) · level none · $0.40 · greedy",
+  ]);
+  // A raw mass above the applied mass prints both: the cap is 10 of a raw 20.
+  const capped = routingStatusLines(routingStatusFixture({
+    cells: [{ cell: { scope: "new-task" }, profiles: [{ ...routingProfile, earlier: { rows: 40, mass: 20, appliedMass: 10 } }] as never }],
+  } as Partial<RoutingStatus>));
+  assert.ok(capped.includes("  ops-light  mean 0.5 [0.3, 0.7] · rescue 0.5 · rows production 0, duel 0 · earlier mass 10 of 20 applied (40 rows) · level none · $0.40 · greedy"));
+  const withCoordinator = routingStatusLines(routingStatusFixture({
+    requested: "auto", shadow: { windowDays: 30, decisions: 3, withCoordinator: 3, agreements: 2, greedyAgreements: 1, capped: true },
+    period: { decisions: 0, capped: false, firstAt: null, targetDays: 14, targetDecisions: 50 }, cellsCapped: true, unreadableCells: 2,
+  } as Partial<RoutingStatus>));
+  assert.equal(withCoordinator[0], "alpha · routing shadow (saved) · requested auto: this host records shadow decisions only");
+  assert.equal(withCoordinator[3], "Shadow, last 30 days: 3 decisions; the router matched the coordinator in 2 of 3 (newest 500)");
+  assert.equal(withCoordinator[4], "Shadow period: no decision yet.");
+  const off = routingStatusLines(routingStatusFixture({ mode: "off", requested: null, source: null, knobs: null, defaults: [], covers: { start: false, reason: "off" }, cells: [] } as Partial<RoutingStatus>));
+  assert.equal(off[0], "alpha · routing off");
+  assert.equal(off[1], "Start: not covered (off)");
+  // With no cell lines the costs line is last; the cell tail lines follow the cells when capped or unreadable.
+  assert.equal(routingStatusLines(routingStatusFixture({ cells: [] } as Partial<RoutingStatus>)).at(-1), "Costs are tier defaults: light $0.40, strong $2.20, rescue $1.50. Limit headroom is not modelled. Intervals are 90% normal approximations. Coordinator-chosen history counts at half weight.");
+  assert.deepEqual(routingStatusLines(routingStatusFixture({ cells: [], unreadableCells: 2, cellsCapped: true } as Partial<RoutingStatus>)).slice(-2), ["Older cells are not shown.", "Cells with unreadable details: 2."]);
+});
+
+/** One decision as the host answers it: the row without its four blind indexes, with its opened payload. */
+const explainDecision = (overrides: Partial<ExplainedDecision> = {}): ExplainedDecision => ({
+  key: "k", runId: "11111111-1111-4111-8111-111111111111", revision: 1, point: "start", ordinal: 1, role: "implementer",
+  kind: null, risk: "normal", featureVersion: 1, mode: "shadow", algorithmVersion: 1, rewardVersion: 1,
+  policyDigest: "abcdef0123456789abcd", seed: "0123456789abcdef", basis: "sampled", chosenProfileId: "ops-light", chosenIdentity: "codex/gpt/high",
+  greedyProfileId: "ops-light", coordinatorProfileId: null, explore: false, state: "recorded", memberId: null, decidedAt: "2026-11-14T10:00:00.000Z",
+  payload: null, ...overrides,
+});
+const explainPayload = (candidates: CandidateRecord[]): RoutingPayload => ({
+  projectId: "alpha", taskId: "t1", area: "api", featureMap: "default", coordinatorProfileId: null, knobs: ROUTING_DEFAULTS,
+  costs: { lightUsd: 0.4, strongUsd: 2.2, rescueUsd: 1.5, basis: "tier-default" }, headroom: "not-modelled", chosenWeight: 0.5, current: [], candidates, elapsedMs: 3,
+});
+const explainAnswer = (decisions: ExplainedDecision[]): RoutingExplain => ({ runId: "11111111-1111-4111-8111-111111111111", taskId: "t1", decisions, capped: false });
+
+test("routing explain lines show the decision, its payload, and an unreadable payload", () => {
+  const payload = explainPayload([
+    { profileId: "ops-light", identity: "codex/gpt/high", tier: "light", thetaMean: 0.5, thetaSd: 0.1, phiMean: 0.5, costUsd: 0.4, greedyUtility: 0.9, sample: 0.7, sampledUtility: 0.8 },
+    { profileId: "review-strong", identity: "codex/gpt/max", tier: null, removed: "contributor" },
+    { profileId: "third", identity: "opencode/x/y", tier: null },
+  ]);
+  assert.deepEqual(routingExplainLines(explainAnswer([explainDecision({ payload })])), [
+    "Revision 1 · start 1 · shadow · recorded · basis sampled · decided 2026-11-14T10:00:00.000Z",
+    "Chosen ops-light · greedy ops-light · coordinator none · explore no",
+    "Policy abcdef012345 · seed 0123456789ab · algorithm 1 · reward 1",
+    "  ops-light  mean 0.5 · deviation 0.1 · rescue 0.5 · cost $0.40 · greedy utility 0.9 · sample 0.7 · sampled utility 0.8",
+    "  review-strong  removed: contributor",
+    "  third  mean unknown · deviation unknown · rescue unknown · cost unknown · greedy utility unknown · sample unknown · sampled utility unknown",
+  ]);
+  assert.deepEqual(routingExplainLines(explainAnswer([explainDecision({ explore: true, coordinatorProfileId: "ops-light" })])), [
+    "Revision 1 · start 1 · shadow · recorded · basis sampled · decided 2026-11-14T10:00:00.000Z",
+    "Chosen ops-light · greedy ops-light · coordinator ops-light · explore yes",
+    "Policy abcdef012345 · seed 0123456789ab · algorithm 1 · reward 1",
+    "The decision's details are unreadable.",
+  ]);
+});
+
+test("routing explain rounds its floats to three decimals, as status does", () => {
+  const lines = routingExplainLines(explainAnswer([explainDecision({ payload: explainPayload([
+    { profileId: "ops-light", identity: "codex/gpt/high", tier: "light", thetaMean: 0.123456, thetaSd: 0.0987654, phiMean: 0.55551, costUsd: 0.4, greedyUtility: 0.91234, sample: 0.7777, sampledUtility: 0.80001 },
+  ]) })]));
+  assert.equal(lines[3], "  ops-light  mean 0.123 · deviation 0.099 · rescue 0.556 · cost $0.40 · greedy utility 0.912 · sample 0.778 · sampled utility 0.8");
+});
+
+test("routing lines clean every host text they print: the reason, the removal, the level, and the explain fields", () => {
+  const status = routingStatusLines(routingStatusFixture({
+    covers: { start: false, reason: "no-lineup\x07" } as never,
+    source: "saved",
+    cells: [{ cell: { scope: "new-task" }, profiles: [
+      { ...routingProfile, level: "cell\x9b" },
+      { ...routingRemoved, profileId: "review\x1bstrong", removed: "contributor\x07" },
+    ] as never }],
+  } as Partial<RoutingStatus>));
+  assert.equal(status[2], "Start: not covered (no-lineup )");
+  assert.equal(status[status.length - 2], "  ops-light  mean 0.5 [0.3, 0.7] · rescue 0.5 · rows production 0, duel 0 · earlier mass 0 (0 rows) · level cell  · $0.40 · greedy");
+  assert.equal(status[status.length - 1], "  review strong  removed: contributor ");
+  const explain = routingExplainLines(explainAnswer([explainDecision({
+    mode: "shadow\x1b", state: "recorded\x9b", basis: "sampled\x07",
+    payload: explainPayload([{ profileId: "x", identity: "i", tier: null, removed: "limited\x07" }]),
+  })]));
+  assert.equal(explain[0], "Revision 1 · start 1 · shadow  · recorded  · basis sampled  · decided 2026-11-14T10:00:00.000Z");
+  assert.equal(explain[3], "  x  removed: limited ");
+  const period = routingStatusLines(routingStatusFixture({
+    period: { ...routingStatusFixture().period, firstAt: "2026-11-14T10:00:00.000Z\x07" },
+  } as Partial<RoutingStatus>)).find(line => line.startsWith("Shadow period:"));
+  assert.ok(period?.includes("since 2026-11-14T10:00:00.000Z ;"), period);
+  assert.ok(!period?.includes("\x07"), "the period's first decision time is cleaned");
+});
+
+test("the newest-decisions cap is the store's limit", () => {
+  assert.equal(DECISION_LIMIT, PROJECT_DECISION_LIMIT);
+});
+
+test("routing lines: the other branch of each line, and clean on every id", () => {
+  const knobs = routingStatusFixture().knobs!;
+  const lines = routingStatusLines(routingStatusFixture({
+    source: "autonomous-default", defaults: ["allowContributor"], knobs: { ...knobs, allowContributor: true },
+    shadow: { windowDays: 30, decisions: 500, withCoordinator: 0, agreements: 0, greedyAgreements: 0, capped: true },
+    cells: [{ cell: { scope: "cell", area: "api", taskKind: "feature", featureVersion: 2, featureMap: "0123456789abcdef".repeat(4) },
+      profiles: [{ ...routingProfile, profileId: "ops\x1blight\x9b", greedy: false }, routingProfile] as never }],
+  } as Partial<RoutingStatus>));
+  assert.equal(lines[0], "alpha · routing shadow (autonomous default)");
+  assert.equal(lines[1], "Value $2 per success · list weight 0.25 · contributor profiles allowed (default)");
+  assert.equal(lines[3], "Shadow, last 30 days: 500 decisions; no decision had a coordinator pick (newest 500)");
+  assert.deepEqual(lines.slice(7), [
+    "Cell api · feature · features v2 0123456789ab",
+    "  ops light   mean 0.5 [0.3, 0.7] · rescue 0.5 · rows production 0, duel 0 · earlier mass 0 (0 rows) · level none · $0.40",
+    "  ops-light  mean 0.5 [0.3, 0.7] · rescue 0.5 · rows production 0, duel 0 · earlier mass 0 (0 rows) · level none · $0.40 · greedy",
+  ]);
+});
+
+test("routing explain lines: the shape the host answers, a sampler fallback, and clean on the chosen and candidate ids", () => {
+  const run = "11111111-1111-4111-8111-111111111111";
+  // What GET /api/teams/:id/routing/:taskId answers: the row without its four blind-index fields, and the opened payload.
+  const explain: RoutingExplain = { runId: run, taskId: "t1", capped: false, decisions: [{
+    key: "a".repeat(64), runId: run, revision: 2, point: "start", ordinal: 1, role: "implementer", kind: "feature", risk: "normal", featureVersion: 1,
+    mode: "shadow", algorithmVersion: 1, rewardVersion: 1, policyDigest: "d".repeat(64), seed: "e".repeat(64), basis: "sampled",
+    chosenProfileId: "ops\x07light", chosenIdentity: "b".repeat(64), greedyProfileId: "ops\x07light", coordinatorProfileId: null, explore: false,
+    state: "recorded", memberId: null, decidedAt: "2026-11-14T10:00:00.000Z",
+    payload: { projectId: "alpha", taskId: "t1", area: "api", featureMap: "default", coordinatorProfileId: null, knobs: ROUTING_DEFAULTS,
+      costs: { lightUsd: 0.4, strongUsd: 2.2, rescueUsd: 1.5, basis: "tier-default" }, headroom: "not-modelled", chosenWeight: 0.5, current: [], elapsedMs: 3,
+      candidates: [{ profileId: "ops\x9blight", identity: "b".repeat(64), tier: "light", costUsd: 0.4, thetaMean: 0.5, thetaSd: 0.1, phiMean: 0.5,
+        greedyUtility: 0.9, sample: 0.7, sampledUtility: 0.8, samplerFallback: true }] },
+  }] };
+  const lines = routingExplainLines(explain);
+  assert.equal(lines[0], "Revision 2 · start 1 · shadow · recorded · basis sampled · decided 2026-11-14T10:00:00.000Z");
+  assert.equal(lines[1], "Chosen ops light · greedy ops light · coordinator none · explore no");
+  assert.equal(lines[3], "  ops light  mean 0.5 · deviation 0.1 · rescue 0.5 · cost $0.40 · greedy utility 0.9 · sample 0.7 · sampled utility 0.8 · sampler fallback");
+});
+
+test("the routing command refuses bad usage before any request, and maps or passes the other host errors", async () => {
+  const usage = "Usage: infinite routing status PROJECT [--json] | infinite routing explain RUN_ID TASK_ID [--json]";
+  const run = "11111111-1111-4111-8111-111111111111";
+  const calls: string[] = [];
+  const fake = (routes: Record<string, unknown>) => ({
+    json: async (path: string) => { calls.push(path); const value = routes[path]; if (value instanceof Error) throw value; return value; },
+  }) as unknown as Parameters<typeof handleRoutingClientCommand>[2];
+  for (const args of [[], ["status"], ["status", "alpha", "beta"], ["explain", run], ["explain", run, "t1", "t2"], ["show", "alpha"]]) {
+    await assert.rejects(handleRoutingClientCommand(args, {}, fake({})), { message: usage }, args.join(" "));
+  }
+  assert.deepEqual(calls, []);
+  const withFlag = { teams: { routing: 1 } };
+  const hostError = (status: number, code?: string) => Object.assign(new Error(`Host returned HTTP ${status}.`), { status, code });
+  await assert.rejects(handleRoutingClientCommand(["explain", "not-a-uuid", "t1"], {}, fake({ "/me": withFlag, "/teams/not-a-uuid/routing/t1": hostError(400, "invalid-routing-request") })),
+    { message: "The host refused the routing request as invalid." });
+  // Any other failure passes through unchanged; the project ID is one encoded path segment.
+  const other = hostError(500);
+  await assert.rejects(handleRoutingClientCommand(["status", "a/b"], {}, fake({ "/me": withFlag, "/routing/projects/a%2Fb": other })), error => error === other);
+});
+
+test("routing options parse", () => {
+  const parsed = parseClientArgs(["repo", "init", "--routing", "shadow", "--routing-value", "quality", "--routing-contributor", "deny"]);
+  assert.equal(parsed.options["--routing"], "shadow");
+  assert.equal(parsed.options["--routing-value"], "quality");
+  assert.equal(parsed.options["--routing-contributor"], "deny");
+  assert.equal(clientCommandCandidate(["--json", "routing"]), "routing");
+});
+
+test("the routing command checks the host flag and prints the fixed sentences for host errors", async () => {
+  const hostError = (status: number, code: string) => Object.assign(new Error(`Host returned HTTP ${status} (${code}).`), { status, code });
+  const run = "11111111-1111-4111-8111-111111111111";
+  const fake = (routes: Record<string, unknown>, calls: string[] = []) => ({
+    json: async (path: string) => {
+      calls.push(path);
+      const value = routes[path];
+      if (value instanceof Error) throw value;
+      return value;
+    },
+  }) as unknown as Parameters<typeof handleRoutingClientCommand>[2];
+  const withFlag = { teams: { routing: 1 }, projects: [] };
+  const logged: string[] = [];
+  const log = console.log;
+  console.log = (...values: unknown[]) => { logged.push(values.map(String).join(" ")); };
+  try {
+    const calls: string[] = [];
+    await assert.rejects(handleRoutingClientCommand(["status", "alpha"], {}, fake({ "/me": { teams: {} } }, calls)), { message: "This host does not record routing decisions. Upgrade the host first." });
+    assert.deepEqual(calls, ["/me"]);
+    await assert.rejects(handleRoutingClientCommand(["status", "alpha"], {}, fake({ "/me": withFlag, "/routing/projects/alpha": hostError(404, "unknown-project") })), { message: "No project has this ID." });
+    await assert.rejects(handleRoutingClientCommand(["status", "alpha"], {}, fake({ "/me": withFlag, "/routing/projects/alpha": hostError(503, "evidence-unavailable") })), { message: "The evidence store is unavailable." });
+    await assert.rejects(handleRoutingClientCommand(["explain", run, "t1"], {}, fake({ "/me": withFlag, [`/teams/${run}/routing/t1`]: hostError(404, "routing-decision-not-found") })), { message: "No routing decision exists for this run and task." });
+    await handleRoutingClientCommand(["status", "alpha"], { "--json": true }, fake({ "/me": withFlag, "/routing/projects/alpha": routingStatusFixture({ cells: [] } as Partial<RoutingStatus>) }));
+    assert.equal(logged.at(-1), JSON.stringify(routingStatusFixture({ cells: [] } as Partial<RoutingStatus>), null, 2));
+    logged.length = 0;
+    await handleRoutingClientCommand(["status", "alpha"], {}, fake({ "/me": withFlag, "/routing/projects/alpha": routingStatusFixture() }));
+    assert.equal(logged[0], "alpha · routing shadow (saved)");
+  } finally {
+    console.log = log;
+  }
 });

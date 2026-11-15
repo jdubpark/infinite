@@ -21,8 +21,17 @@ export const repoEnrollmentRequestSchema = z.object({
   teamwork: z.union([z.string().refine(homeRelativePath), z.null()]).optional(),
   source: projectSourceSchema.optional(),
   autonomy: autonomyModeSchema.optional(),
-}).strict();
+  /**
+   * The owner's explicit `--permissions off`. The host records a permission-agent opt-out for the project before
+   * it writes the enrollment. It is not stored with the enrollment, and it cannot carry a coordinator policy.
+   */
+  permissionOptOut: z.literal(true).optional(),
+}).strict().refine(request => !(request.permissionOptOut && request.team.permissions), {
+  path: ["permissionOptOut"], message: "An opt-out cannot carry a permission policy.",
+});
 export type RepoEnrollmentRequest = z.infer<typeof repoEnrollmentRequestSchema>;
+/** Runs inside the enrollment's own serialized write, after every check and before the record is written. A throw writes nothing. */
+export type RepoEnrollmentHooks = { beforeWrite?: () => void };
 
 export const autonomyChangeSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), mode: autonomyModeSchema }).strict();
 export type AutonomyChange = z.infer<typeof autonomyChangeSchema>;
@@ -54,7 +63,8 @@ interface StoredEnrollment {
   autonomy?: AutonomyMode;
   revision: number;
 }
-interface Receipt { fingerprint: string; projectId: string; path: string; response: RepoEnrollmentView }
+/** `created` marks the request that created the enrollment. Receipts saved before onboarding coverage existed have none. */
+interface Receipt { fingerprint: string; projectId: string; path: string; response: RepoEnrollmentView; created?: true }
 interface EnrollmentStore { version: 1; projects: Record<string, StoredEnrollment>; requests: Record<string, Receipt> }
 interface Options { isBusy?: (projectId: string) => boolean | Promise<boolean> }
 
@@ -122,7 +132,16 @@ export class RepoEnrollmentService {
   }
 
   async put(projectId: string, input: RepoEnrollmentRequest): Promise<RepoEnrollmentView> {
-    return this.serialized(() => this.putLocked(projectId, input));
+    return (await this.enroll(projectId, input)).view;
+  }
+
+  /**
+   * The owner's onboarding of one project. `first` is true only for the request that created the project's
+   * enrollment, also when that request is replayed. A replay runs no hook. A creating request that a host saved
+   * before it marked them is never first, so replaying it cannot treat a project enrolled then as new.
+   */
+  async enroll(projectId: string, input: RepoEnrollmentRequest, hooks: RepoEnrollmentHooks = {}): Promise<{ view: RepoEnrollmentView; first: boolean }> {
+    return this.serialized(() => this.putLocked(projectId, input, hooks));
   }
 
   /** Owner-only mode change. It writes one revision and runs no Git command. */
@@ -173,7 +192,7 @@ export class RepoEnrollmentService {
     return structuredClone(response);
   }
 
-  private async putLocked(projectId: string, input: RepoEnrollmentRequest): Promise<RepoEnrollmentView> {
+  private async putLocked(projectId: string, input: RepoEnrollmentRequest, hooks: RepoEnrollmentHooks): Promise<{ view: RepoEnrollmentView; first: boolean }> {
     const request = repoEnrollmentRequestSchema.parse(input);
     const project = this.project(projectId);
     const path = this.projectPath(project);
@@ -183,7 +202,7 @@ export class RepoEnrollmentService {
       if (prior.fingerprint !== requestFingerprint || prior.projectId !== projectId)
         throw new TeamError(409, "request-conflict", "This request ID belongs to a different repository enrollment request.");
       if (prior.path !== path) throw this.pathMismatch();
-      return structuredClone(prior.response);
+      return { view: structuredClone(prior.response), first: prior.created === true };
     }
 
     const current = this.store.projects[projectId];
@@ -231,8 +250,9 @@ export class RepoEnrollmentService {
     const next: EnrollmentStore = {
       version: 1,
       projects: { ...this.store.projects, [projectId]: entry },
-      requests: { ...this.store.requests, [request.requestId]: { fingerprint: requestFingerprint, projectId, path, response } },
+      requests: { ...this.store.requests, [request.requestId]: { fingerprint: requestFingerprint, projectId, path, response, ...(nextRevision === 1 ? { created: true as const } : {}) } },
     };
+    hooks.beforeWrite?.();
     writeSealed(this.file, this.key, "repo-enrollments", next);
     this.store = next;
     Object.assign(project, { team: entry.team });
@@ -242,7 +262,7 @@ export class RepoEnrollmentService {
     else delete project.teamworkDir;
     if (entry.linear === null) delete project.linear;
     else if (entry.linear) project.linear = entry.linear;
-    return structuredClone(response);
+    return { view: structuredClone(response), first: nextRevision === 1 };
   }
 
   private project(projectId: string): Project {

@@ -10,8 +10,9 @@ import { startHost, type Host } from "./helpers.js";
 import { INTERRUPT_CLASSES, PERMISSION_POLICY_VERSION } from "../packages/host/src/permission-policy.js";
 import { PermissionJournal, permissionJournalModule, type PermissionDecision } from "../packages/host/src/evidence/permission-journal.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
+import { unseal, writeSealed } from "../packages/host/src/vault.js";
 
-type Projection = { projectId: string; state: string };
+type Projection = { projectId: string; state: string; act?: string };
 type View = { workspaceId: string; name: string; state: string; direction?: string; projects: Projection[] };
 const viewOf = (views: View[], workspaceId: string) => views.find(view => view.workspaceId === workspaceId);
 const projectStates = (view: View | undefined) => view?.projects.map(project => project.state);
@@ -121,7 +122,7 @@ test("owner delegation covers one workspace or all, ends on an owner regroup als
     assert.equal(settled.body.rates.lastHour.decisions, 0);
     assert.equal(settled.body.rates.lastDay.decisions, 0);
     assert.equal(settled.body.rates.lastDay.perHour, 0);
-    assert.deepEqual((await host.fetchApi("/me", "owner")).body.permissions, { workspaceDelegation: 1, decisionLog: 1 });
+    assert.deepEqual((await host.fetchApi("/me", "owner")).body.permissions, { workspaceDelegation: 1, decisionLog: 1, onboardingCoverage: 1 });
 
     // Scoped figures: a workspace, a session and a task need an id, the host takes none, and the window is bounded.
     const scoped = await host.fetchApi(`/permissions/rates?scope=workspace&id=${webWorkspace}&hours=24`, "controller");
@@ -289,4 +290,131 @@ test("the owner reads the decision log and marks a decision; no other role reads
     if (host) await host.stop();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+/** A host whose projects are committed Git roots that `repo init` can enroll, with helpers for the owner's onboarding. */
+async function onboardingHost(prefix: string, projectIds: string[]) {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  const projects = projectIds.map(id => {
+    const path = join(root, id);
+    mkdirSync(path, { mode: 0o700 });
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: path, stdio: "ignore" });
+    git("init", "--initial-branch=main");
+    // Its own remote and content, so the host never folds two fixtures into one repository's workspace.
+    git("remote", "add", "origin", `https://github.com/example/${id}.git`);
+    writeFileSync(join(path, "tracked.txt"), `${id}\n`);
+    git("add", "tracked.txt");
+    git("-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "-m", "Initial fixture");
+    return { id, name: id, path };
+  });
+  const host = await startHost({ config: { projects, teams: { workspaceDir: join(root, "team-workspaces") } } });
+  /** The body `repo init` sends: `policy` is the coordinator policy, `optOut` an explicit `--permissions off`. */
+  const body = (revision: number, options: { policy?: boolean; optOut?: boolean } = {}) => ({
+    requestId: randomUUID(), revision,
+    team: { checks: [{ command: "git", args: ["status", "--short"] }], handoff: "auto",
+      ...(options.policy ? { permissions: { mode: "coordinator", scope: "Run the repository's checks.", maxDecisions: 5 } } : {}) },
+    ...(options.optOut ? { permissionOptOut: true } : {}),
+  });
+  const onboard = (projectId: string, request: ReturnType<typeof body>) => host.fetchApi(`/projects/${projectId}/team`, "owner", request, {}, "PUT");
+  const entry = async (projectId: string) => {
+    const status = await host.fetchApi("/permissions/status", "owner");
+    assert.equal(status.status, 200, JSON.stringify(status.body));
+    const found = (status.body.workspaces as View[]).flatMap(view => view.projects).find(project => project.projectId === projectId);
+    return found && { state: found.state, ...(found.act ? { act: found.act } : {}) };
+  };
+  const workspace = async (projectId: string) => (await host.fetchApi(`/project-groups/${projectId}`, "owner")).body.id as string;
+  const close = async () => { await host.stop(); rmSync(root, { recursive: true, force: true }); };
+  return { host, body, onboard, entry, workspace, close };
+}
+
+test("owner onboarding covers a project the first time only, and an off records an opt-out that only a delegation replaces", { timeout: 120000 }, async () => {
+  const f = await onboardingHost("permissions-onboarding-", ["first", "older-client", "explicit-off"]);
+  try {
+    assert.equal((await f.host.fetchApi("/me", "owner")).body.permissions.onboardingCoverage, 1);
+
+    // A first onboarding with a policy covers the project in its workspace. Its replay answers the same; a repeat changes nothing.
+    const firstRequest = f.body(0, { policy: true });
+    const covered = await f.onboard("first", firstRequest);
+    assert.equal(covered.status, 200, JSON.stringify(covered.body));
+    assert.equal(covered.body.revision, 1);
+    assert.deepEqual(covered.body.permissionAgent, { coverage: "covered", workspaceId: await f.workspace("first") });
+    assert.deepEqual(await f.entry("first"), { state: "covered", act: "onboarding" });
+    assert.deepEqual((await f.onboard("first", firstRequest)).body.permissionAgent, covered.body.permissionAgent);
+    assert.deepEqual((await f.onboard("first", f.body(1, { policy: true }))).body.permissionAgent, { coverage: "unchanged" });
+    assert.deepEqual(await f.entry("first"), { state: "covered", act: "onboarding" });
+
+    // An older client's `--permissions off` sends a first onboarding with no policy: it records an opt-out.
+    const older = await f.onboard("older-client", f.body(0));
+    assert.equal(older.status, 200, JSON.stringify(older.body));
+    assert.deepEqual(older.body.permissionAgent, { coverage: "opt-out" });
+    assert.deepEqual(await f.entry("older-client"), { state: "opt-out" });
+    // Only the owner's delegation replaces it. An explicit off on a repeat onboarding then removes that coverage.
+    const delegated = await f.host.fetchApi("/permissions/delegations", "owner", { requestId: randomUUID(), workspaceId: await f.workspace("older-client") });
+    assert.equal(delegated.status, 200, JSON.stringify(delegated.body));
+    assert.deepEqual(delegated.body.replacedOptOuts, ["older-client"]);
+    assert.deepEqual(await f.entry("older-client"), { state: "covered", act: "delegate" });
+    const repeatOff = await f.onboard("older-client", f.body(1, { optOut: true }));
+    assert.equal(repeatOff.status, 200, JSON.stringify(repeatOff.body));
+    assert.equal(repeatOff.body.revision, 2);
+    assert.deepEqual(repeatOff.body.permissionAgent, { coverage: "opt-out" });
+    assert.deepEqual(await f.entry("older-client"), { state: "opt-out" });
+
+    // An explicit off on a first onboarding covers nothing, and an off that carries a policy is refused before anything is written.
+    assert.equal((await f.onboard("explicit-off", f.body(0, { optOut: true, policy: true }))).status, 400);
+    assert.deepEqual(await f.entry("explicit-off"), { state: "not-covered" });
+    const off = await f.onboard("explicit-off", f.body(0, { optOut: true }));
+    assert.equal(off.status, 200, JSON.stringify(off.body));
+    assert.equal(off.body.revision, 1);
+    assert.deepEqual(off.body.permissionAgent, { coverage: "opt-out" });
+    assert.deepEqual(await f.entry("explicit-off"), { state: "opt-out" });
+  } finally { await f.close(); }
+});
+
+test("onboarding never covers a project that was enrolled without a delegation record, and an unopened record fails only an explicit off", { timeout: 120000 }, async () => {
+  const f = await onboardingHost("permissions-onboarding-legacy-", ["legacy", "recovered", "refused"]);
+  try {
+    const delegationFile = join(f.host.config.stateDir, "permission-delegations", "state.sealed");
+    await f.host.stopApi();
+    writeFileSync(delegationFile, "not a sealed state\n", { mode: 0o600 });
+    await f.host.start();
+
+    // The delegation record will not open. A first onboarding is still saved, and says that coverage was not recorded.
+    const legacyFirst = f.body(0, { policy: true });
+    const recoveredFirst = f.body(0, { policy: true });
+    for (const [projectId, request] of [["legacy", legacyFirst], ["recovered", recoveredFirst]] as const) {
+      const saved = await f.onboard(projectId, request);
+      assert.equal(saved.status, 200, JSON.stringify(saved.body));
+      assert.equal(saved.body.revision, 1);
+      assert.deepEqual(saved.body.permissionAgent, { coverage: "unavailable", reason: "Permission delegation is unavailable on this host." });
+    }
+    // An explicit off that cannot be recorded writes no enrollment.
+    assert.equal((await f.onboard("refused", f.body(0, { optOut: true }))).status, 503);
+    assert.equal((await f.host.fetchApi("/projects/refused/team", "owner")).body.revision, 0);
+
+    // The record opens again, empty. `legacy` now has a saved policy and no delegation record, like a project enrolled
+    // before this release, whose host saved the creating request without its mark.
+    await f.host.stopApi();
+    rmSync(delegationFile);
+    const key = readFileSync(f.host.config.keyFile);
+    const enrollments = join(f.host.config.stateDir, "repo-enrollments.sealed");
+    const stored = unseal<{ requests: Record<string, { created?: true }> }>(key, "repo-enrollments", readFileSync(enrollments, "utf8"));
+    assert.equal(stored.requests[legacyFirst.requestId]?.created, true);
+    delete stored.requests[legacyFirst.requestId]!.created;
+    writeSealed(enrollments, key, "repo-enrollments", stored);
+    await f.host.start();
+
+    // A replay of the marked first request records the coverage that its first attempt could not.
+    const recovered = await f.onboard("recovered", recoveredFirst);
+    assert.equal(recovered.body.revision, 1);
+    assert.deepEqual(recovered.body.permissionAgent, { coverage: "covered", workspaceId: await f.workspace("recovered") });
+    // The unmarked one, and a repeat onboarding with the saved policy, leave the project uncovered.
+    const replayed = await f.onboard("legacy", legacyFirst);
+    assert.equal(replayed.body.revision, 1);
+    assert.deepEqual(replayed.body.permissionAgent, { coverage: "unchanged" });
+    const repeat = await f.onboard("legacy", f.body(1, { policy: true }));
+    assert.equal(repeat.status, 200, JSON.stringify(repeat.body));
+    assert.equal(repeat.body.revision, 2);
+    assert.deepEqual(repeat.body.permissionAgent, { coverage: "unchanged" });
+    assert.deepEqual(await f.entry("legacy"), { state: "not-covered" });
+  } finally { await f.close(); }
 });

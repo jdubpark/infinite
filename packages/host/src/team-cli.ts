@@ -509,6 +509,22 @@ async function postMutation(api: Api, receiptPath: string, key: string, endpoint
   return result;
 }
 
+/** One line for what repo init left in the permission-delegation record. An older host sends nothing, and nothing is printed. */
+function onboardingPermissionLine(agent: unknown): string | undefined {
+  const value = agent as { coverage?: unknown; workspaceId?: unknown; reason?: unknown } | undefined;
+  switch (value?.coverage) {
+    case "covered": {
+      const workspace = clean(value.workspaceId);
+      return `Permission agent: this project is covered in workspace ${workspace}. infinite permissions revoke --workspace ${workspace} returns its requests to you.`;
+    }
+    case "opt-out": return "Permission agent: this project is opted out. Only infinite permissions delegate covers it.";
+    case "not-covered": return "Permission agent: an earlier owner decision keeps this project uncovered. infinite permissions delegate covers it.";
+    case "unchanged": return "Permission agent: a repeat onboarding leaves this project's delegation unchanged. See infinite permissions status.";
+    case "unavailable": return `Warning: the enrollment is saved, but its permission delegation was not recorded: ${clean(value.reason)} See infinite permissions status.`;
+    default: return undefined;
+  }
+}
+
 const BATCH_TIMEOUT = 120000, CHUNK_TIMEOUT = 60000;
 /** A host without an endpoint answers its catch-all 404, which carries no code. */
 const olderHost = (error: unknown) => (error as { status?: unknown; code?: unknown })?.status === 404 && (error as { code?: unknown }).code === undefined;
@@ -725,13 +741,15 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const sendLinear = Boolean(linearTeam || linearProject || (!targetLinear && rootDefault));
     const sourceSupported = me.teams?.projectSource === 1;
     const enrolledSource: ProjectSource = sourceSupported ? projectSource : { mode: "laptop" };
-    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...projectConfig, handoff, ...(delivery ? { delivery } : {}), ...(permissions ? { permissions } : {}) }, ...(sourceSupported ? { source: projectSource } : {}), ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}), ...(teamwork !== undefined ? { teamwork } : {}), ...(autonomy ? { autonomy } : {}) };
+    // Only an explicit off records a permission-agent opt-out; the host cannot tell it from a repeat that keeps no policy.
+    const permissionOptOut = permissionMode === "off" && me.permissions?.onboardingCoverage === 1;
+    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...projectConfig, handoff, ...(delivery ? { delivery } : {}), ...(permissions ? { permissions } : {}) }, ...(sourceSupported ? { source: projectSource } : {}), ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}), ...(teamwork !== undefined ? { teamwork } : {}), ...(autonomy ? { autonomy } : {}), ...(permissionOptOut ? { permissionOptOut: true } : {}) };
     // After a lost reply, inherited settings may already be the host's mapping.
     // An omitted mapping preserves that value; compare that intent while replay
     // still sends the original receipt body and request ID unchanged.
     const linearIntent = (request: Record<string, any>) => request.linear === undefined ? targetLinear ?? null : request.linear;
     const teamworkIntent = (request: Record<string, any>) => request.teamwork === undefined ? target.teamwork ?? null : request.teamwork;
-    requestId = body.requestId = resumePendingIntent(receiptsPath, `${key}:repo-init:`, `/projects/${selected}/team`, prior => JSON.stringify(prior.team) === JSON.stringify(body.team) && JSON.stringify(prior.source) === JSON.stringify(body.source) && JSON.stringify(linearIntent(prior)) === JSON.stringify(linearIntent(body)) && JSON.stringify(teamworkIntent(prior)) === JSON.stringify(teamworkIntent(body)) && prior.autonomy === body.autonomy, requestId, options["--request-id"] !== undefined, rawArgs);
+    requestId = body.requestId = resumePendingIntent(receiptsPath, `${key}:repo-init:`, `/projects/${selected}/team`, prior => JSON.stringify(prior.team) === JSON.stringify(body.team) && JSON.stringify(prior.source) === JSON.stringify(body.source) && JSON.stringify(linearIntent(prior)) === JSON.stringify(linearIntent(body)) && JSON.stringify(teamworkIntent(prior)) === JSON.stringify(teamworkIntent(body)) && prior.autonomy === body.autonomy && prior.permissionOptOut === body.permissionOptOut, requestId, options["--request-id"] !== undefined, rawArgs);
     if (uploadSource) {
       assertSourceUnchanged();
       process.stderr.write(`[Infinite] Request ${requestId}\n`);
@@ -767,7 +785,9 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       } finally { rmSync(temp, { recursive: true, force: true }); }
     }
     assertSourceUnchanged();
-    await postMutation(api, receiptsPath, `${key}:repo-init:${requestId}`, `/projects/${selected}/team`, body, "PUT", !uploadSource);
+    const saved = await postMutation(api, receiptsPath, `${key}:repo-init:${requestId}`, `/projects/${selected}/team`, body, "PUT", !uploadSource);
+    const agentLine = onboardingPermissionLine(saved?.permissionAgent);
+    if (agentLine) process.stderr.write(`[Infinite] ${agentLine}\n`);
     if (sourceSupported && projectSource.mode === "github") {
       // A project that follows GitHub refuses laptop uploads, so a service still running for it would only report errors.
       const syncStateFile = join(dirname(configPath), "sync", `${selected}.json`);

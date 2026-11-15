@@ -24,6 +24,7 @@ import { ProjectSync, ProjectSyncError, syncFailure } from "./project-sync.js";
 import { ProjectSourceError, ProjectSourceService } from "./project-source.js";
 import { MirroredProjects } from "./mirrored-projects.js";
 import { RepoEnrollmentService, autonomyChangeSchema, repoEnrollmentRequestSchema } from "./repo-enrollment.js";
+import { onboardingPermissions } from "./permission-onboarding.js";
 import { HandoffService } from "./handoffs.js";
 import { handoffPathsOverlap } from "./handoff-types.js";
 import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
@@ -757,7 +758,8 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
         (p) => p !== "demo" || config.enableDemo,
       ),
       teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, projectSource: 1, autonomyMode: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
-      permissions: { workspaceDelegation: 1, decisionLog: 1 },
+      // onboardingCoverage: repo init's PUT takes permissionOptOut and answers what onboarding left in the delegation record.
+      permissions: { workspaceDelegation: 1, decisionLog: 1, onboardingCoverage: 1 },
       goals: { enabled: goals.enabled() },
       missions: { enabled: missions.enabled() },
       usage: { enabled: Boolean(config.usage), budgets: config.usage?.budgets ?? {} },
@@ -1361,9 +1363,14 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       throw new TeamError(403, "single-tenant-required", "Repository enrollment requires a single-tenant host.");
     if (projectConfigChanges.has(projectId) || projectFileChanges.has(projectId))
       throw new TeamError(409, "project-busy", "Repository setup or files are being updated. Retry after the operation finishes.");
+    // The owner's explicit off is recorded before the enrollment is written, or nothing is written.
+    if (body.permissionOptOut && !permissionDelegation) return permissionsUnavailable(res);
+    const onboarding = onboardingPermissions(permissionDelegation, projectId, body, { deviceId: String(res.locals.deviceId) });
     projectConfigChanges.add(projectId);
-    try { res.json(await enrollment.put(projectId, body)); }
-    finally { projectConfigChanges.delete(projectId); }
+    try {
+      const { view, first } = await enrollment.enroll(projectId, body, { beforeWrite: onboarding.beforeWrite });
+      res.json({ ...view, permissionAgent: onboarding.after(first) });
+    } finally { projectConfigChanges.delete(projectId); }
   });
   app.put("/api/projects/:id/autonomy", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);

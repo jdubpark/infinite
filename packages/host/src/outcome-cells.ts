@@ -47,8 +47,11 @@ export function checkCellQuery(query: CellQuery): void {
   if (query.use === "decision" && !query.by.includes("profile")) throw new CellQueryRefused("decision-without-profile");
 }
 
-/** The first matching rule decides the bucket of a row. */
-export function rowUse(row: OutcomeRow, use: CellUse): RowUse {
+/** The first matching rule decides the bucket of a row. It reads only the fields below, so the router can pass its rows. */
+export function rowUse(
+  row: Pick<OutcomeRow, "flags" | "disposition" | "exclusion" | "frozenAt" | "integrated" | "accepted" | "firstPass" | "held">,
+  use: CellUse,
+): RowUse {
   const decision = use === "decision";
   if (decision && row.flags.includes("backfilled")) return { kind: "withheld", reason: "backfilled" };
   if (decision && row.flags.includes("gap")) return { kind: "withheld", reason: "gap" };

@@ -10,6 +10,8 @@ import { ENTRY_NOTICE } from "../packages/host/src/evidence/entry-reads.js";
 import { EvidenceReader } from "../packages/host/src/evidence/reader.js";
 import { memberEntryEnvelopeSchema, memberEntryId, memberEntryPostSchema, type MemberEntryPost } from "../packages/host/src/evidence/member-entry.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
+import { egressCredential } from "../packages/host/src/egress.js";
+import { mintGithubGrant } from "../packages/host/src/github-grants.js";
 import { HookPayloadError, type HookReply } from "../packages/host/src/hooks.js";
 import { ENTRY_REFUSALS, MAX_ATTEMPT_POSTS, createEntryRoute } from "../packages/host/src/team-entry-route.js";
 import type { TeamAssignment, TeamMember, TeamRun, TeamTask } from "../packages/host/src/team-types.js";
@@ -18,6 +20,8 @@ import { hostEntryIds, hostEntryRun } from "./fixtures/host-entry-run.js";
 const MARKER = "entry-marker-7f3a";
 const TOKEN = `hook-${randomBytes(16).toString("hex")}`;
 const URL_OWN = "http://127.0.0.1:41234/hook";
+/** A credential the host issued to the session, with no known shape. */
+const ISSUED = randomBytes(32).toString("hex");
 const SIZES = { launchSeq: 0, promptBytes: 1200, contextBytes: 4000 };
 const at = (minute: number) => `2026-11-13T10:${String(minute).padStart(2, "0")}:00.000Z`;
 
@@ -134,7 +138,7 @@ function world(options: { checkOutput?: string } = {}): World {
     };
     const entry = createEntryRoute({
       team: assignment,
-      own: () => ({ token: TOKEN, url: URL_OWN }),
+      own: () => ({ token: TOKEN, url: URL_OWN, credentials: [ISSUED] }),
       reader: () => reader,
       running: () => flags.running,
       reported: () => flags.reported,
@@ -238,6 +242,13 @@ test("refusals are fixed and carry no member text", () => {
     check(refused(h, postRequest(implA, contract(MARKER, { taskId: "b" }))), 403, ENTRY_REFUSALS["entry-task-forbidden"]);
     const token = `gh${"p_"}${"a".repeat(36)}`;
     check(refused(h, postRequest(implA, contract(`${MARKER} ${token}`))), 422, "entry-secret at entry.summary: this field looks like an access token. Remove it and post again.");
+    // What the host issues to a session: its own credential by value, and a GitHub grant or an egress password by shape.
+    const grant = mintGithubGrant(randomBytes(32), { sub: "session", sid: "session-1", project: "project-1", repo: "owner/repository", ops: ["fetch"] });
+    const proxy = egressCredential(randomBytes(32), "project-1", "session-1", Math.floor(Date.now() / 1000) + 3600);
+    const inChange = (value: string) => postRequest(implA, memberEntryPostSchema.parse({ kind: "contract", summary: "ok", paths: [], body: { interface: "Shared route", change: `${MARKER} ${value}` } }));
+    check(refused(h, inChange(ISSUED)), 422, "entry-secret at entry.body.change: this field looks like a credential the host gave this session. Remove it and post again.");
+    check(refused(h, inChange(grant)), 422, "entry-secret at entry.body.change: this field looks like an access token. Remove it and post again.");
+    check(refused(h, inChange(`HTTPS_PROXY=http://${proxy.username}:${proxy.password}@127.0.0.1:9`)), 422, "entry-secret at entry.body.change: this field looks like an access token. Remove it and post again.");
     check(refused(h, postRequest(implA, contract(MARKER, { supersedes: randomUUID() }))), 404, ENTRY_REFUSALS["entry-not-found"]);
     const other = ingestPost(w.board, w.run, memberOf(w.run, hostEntryIds.implB), finding(MARKER));
     check(refused(h, postRequest(implA, contract(MARKER, { supersedes: other }))), 403, ENTRY_REFUSALS["entry-supersede-forbidden"]);

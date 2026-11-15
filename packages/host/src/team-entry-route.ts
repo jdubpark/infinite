@@ -42,11 +42,13 @@ const SECRET_CLASSES: Readonly<Record<SecretClass, string>> = {
   "access-token": "an access token",
   "hook-token": "this member's hook token",
   "hook-url": "this member's hook address",
+  "session-credential": "a credential the host gave this session",
 };
 
 export type EntryRouteOptions = {
   team: TeamAssignment;
-  own: () => { token: string; url: string };
+  /** The hook token and address, and every credential the host issued to this session. */
+  own: () => { token: string; url: string; credentials?: readonly string[] };
   reader: () => Pick<EvidenceReader, "read">;
   running: () => boolean;
   reported: () => boolean;

@@ -622,6 +622,12 @@ This phase adds no Git command.
 - **A member that is launched joins the ingest queue, and a test shows it.** `with the tools on, a launch carries the digest, the flag, and the paragraph` posts from the launched member and expects the row after one pass. The join is at the top of `launch()`, the one place a queued member starts; a new member object reaches `run.members` only after an `await` in some callers, so its creation is not the place.
 - **Known and accepted.** The handoff update reads the rows of one task. The kind lists of the two partial indexes are fixed when a store migrates to version 2, so a later change of a kind list needs a migration that rebuilds its index.
 
+**Rulings after the merge with always-on agents.** That change gives a session two new credentials, a GitHub grant and an egress proxy password, in the provider's environment. The scan of Task 2 knew neither.
+
+- **Two more `access-token` shapes**, for a credential of any session: a GitHub grant (`v`, digits, a dot, base64url claims that start `eyJ`, a dot, 43 or more base64url characters) and an egress proxy password (`v`, digits, a dot, 9 to 12 digits, a dot, 43 or more base64url characters). The tests mint both with the host's own functions, so a changed format fails them.
+- **A fifth class, `session-credential`**, by value: `findSecret` takes `own.credentials`, and a text that holds one is refused before the shapes are tried. Values shorter than 16 characters are ignored, because every text holds the empty string. The refusal says "a credential the host gave this session".
+- **One source for those values.** `sessionCredentials(env)` reads the environment the provider is started with: `INFINITE_GITHUB_GRANT`, `INFINITE_NATIVE_TOKEN`, `OPENCODE_SERVER_PASSWORD`, and the password of every address (the egress credential travels in the proxy addresses). The worker calls it once, right before it starts the provider. No test starts a worker with a boundary configured; the call site is one line.
+
 ## Trust boundary, and what a review checks
 
 These inputs originate outside the host:

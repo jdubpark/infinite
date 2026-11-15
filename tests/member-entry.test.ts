@@ -16,7 +16,9 @@ import {
   refusalPath,
 } from "../packages/host/src/evidence/member-entry.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
-import { findSecret } from "../packages/host/src/evidence/secret-scan.js";
+import { findSecret, sessionCredentials } from "../packages/host/src/evidence/secret-scan.js";
+import { egressCredential, egressProxyEnvironment, egressUncredentialedEnvironment } from "../packages/host/src/egress.js";
+import { mintGithubGrant } from "../packages/host/src/github-grants.js";
 import type { TeamMember, TeamRun } from "../packages/host/src/team-types.js";
 import { hostEntryIds, hostEntryRun } from "./fixtures/host-entry-run.js";
 
@@ -223,7 +225,12 @@ test("roles post only their kinds and their own task", () => {
 test("the scan finds secrets and never returns them", () => {
   const port = 4780;
   const token = `h${randomBytes(24).toString("hex")}`;
-  const own = { token, url: `http://127.0.0.1:${port}/hook` };
+  // What the host issues to a session: a GitHub grant, an egress proxy password, and a token with no known shape.
+  const grant = mintGithubGrant(randomBytes(32), { sub: "session", sid: "session-1", project: "project-1", repo: "owner/repository", ops: ["fetch"] });
+  const proxy = egressCredential(randomBytes(32), "project-1", "session-1", Math.floor(Date.now() / 1000) + 3600);
+  const issued = randomBytes(32).toString("hex");
+  // An empty or short issued value must refuse nothing: every text holds the empty string.
+  const own = { token, url: `http://127.0.0.1:${port}/hook`, credentials: [issued, "", "short"] };
   const privateKey = "-----BEGIN " + "OPENSSH PRIVATE" + " KEY-----";
   const cases: [string, string][] = [
     [privateKey, "private-key"],
@@ -231,6 +238,9 @@ test("the scan finds secrets and never returns them", () => {
     ["AKIA" + "A".repeat(16), "access-token"],
     ["xox" + "b-" + "1".repeat(12), "access-token"],
     ["eyJ" + "x".repeat(9) + "." + "y".repeat(12) + "." + "z".repeat(12), "access-token"],
+    [`INFINITE_GITHUB_GRANT=${grant}`, "access-token"],
+    [`http://${proxy.username}:${proxy.password}@127.0.0.1:9`, "access-token"],
+    [`token ${issued} here`, "session-credential"],
     [token, "hook-token"],
     ["http://127.0.0.1:" + port + "/hook", "hook-url"],
   ];
@@ -247,14 +257,42 @@ test("the scan finds secrets and never returns them", () => {
     if (cls === "hook-token") assert.equal(text.includes(token), false);
   }
 
+  // A credential the host issued to this session is named as that, whatever its shape.
+  assert.deepEqual(findSecret({ body: { change: grant } }, { ...own, credentials: [grant] }), { path: "body.change", cls: "session-credential" });
+  assert.deepEqual(findSecret({ body: { change: proxy.password } }, { ...own, credentials: [proxy.password] }), { path: "body.change", cls: "session-credential" });
+
   const near = [
     "sk-" + "1".repeat(19),
     "AKIA" + "A".repeat(15),
     "3f2b7c1e-9a4d-4e8f-8b2a-6c5d4e3f2a1b",
+    "v2.eyJ" + "x".repeat(20) + "." + "y".repeat(42),
+    "v1.1700000000." + "y".repeat(42),
+    "release v1.2.3, then v2.10.1700000000",
+    "a short word",
   ];
   for (const value of near) {
     assert.equal(findSecret({ body: { items: [{ source: "s", observation: value }] } }, own), undefined, value);
   }
+});
+
+test("a session's credentials are read from the environment its provider is started with", () => {
+  const key = randomBytes(32), nowMs = Date.now();
+  const grant = mintGithubGrant(randomBytes(32), { sub: "session", sid: "session-1", project: "project-1", repo: "owner/repository", ops: ["fetch"] });
+  const observer = randomBytes(32).toString("hex"), opencode = randomBytes(32).toString("hex");
+  const proxy = egressCredential(key, "project-1", "session-1", Math.floor(nowMs / 1000) + 3600);
+  const env = {
+    PATH: "/usr/bin:/bin", TERM: "xterm-256color",
+    INFINITE_HOOK_URL: "http://127.0.0.1:4780/hook", INFINITE_HOOK_TOKEN: "the hook token has its own class",
+    INFINITE_GITHUB_GRANT: grant, INFINITE_GITHUB_PROXY: "http://127.0.0.1:4790",
+    INFINITE_NATIVE_TOKEN: observer, OPENCODE_SERVER_PASSWORD: opencode,
+    ...egressProxyEnvironment("http://127.0.0.1:4791", key, { project: "project-1", session: "session-1" }, 3600, nowMs),
+  };
+  assert.deepEqual(new Set(sessionCredentials(env)), new Set([grant, observer, opencode, proxy.password]));
+  // Each one is then refused by value.
+  for (const credential of sessionCredentials(env))
+    assert.equal(findSecret({ body: { change: `x ${credential} y` } }, { token: "t".repeat(24), url: "http://127.0.0.1:4780/hook", credentials: sessionCredentials(env) })?.cls, "session-credential");
+  // A proxy address without a credential, the no-proxy list, and an unset variable hold none.
+  assert.deepEqual(sessionCredentials({ ...egressUncredentialedEnvironment("http://127.0.0.1:4791"), PATH: "/usr/bin:/bin", INFINITE_GITHUB_GRANT: undefined }), []);
 });
 
 test("refusal paths hold no member text", () => {

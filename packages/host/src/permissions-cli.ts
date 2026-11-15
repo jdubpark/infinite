@@ -7,12 +7,16 @@ type Options = Record<string, string | boolean>;
 type PermissionStatus = { agent: string; policyVersion: number; interruptClasses: string[]; workspaces: WorkspaceDelegationView[]; rates: { lastHour: { decisions: number }; lastDay: { decisions: number } } | null };
 type DelegationResult = { agent: string; views: WorkspaceDelegationView[]; replacedOptOuts: string[] };
 type RevocationResult = { agent: string; view: WorkspaceDelegationView };
+type ReopenResult = { decisionId: string; reject: string; code: string; assignment: string; locked: boolean };
+type UnlockResult = { assignment: string; wasLocked: boolean; locked: boolean };
 
 const clean = (value: unknown, limit = 500) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, limit);
 const INACTIVE_NOTICE = "The permission agent is not active on this host yet. Requests are handled as before; this record takes effect when the agent is activated.";
 const STATUS_USAGE = "Usage: infinite permissions status [--json]";
 const DELEGATE_USAGE = "Usage: infinite permissions delegate (--workspace W | --all) [--direction TEXT | --clear-direction] [--request-id UUID]";
 const REVOKE_USAGE = "Usage: infinite permissions revoke --workspace W [--request-id UUID]";
+const REOPEN_USAGE = "Usage: infinite permissions reopen DECISION_ID [--request-id UUID] [--json]";
+const UNLOCK_USAGE = "Usage: infinite permissions unlock ASSIGNMENT [--request-id UUID] [--json]";
 
 const stringOption = (options: Options, name: string) => {
   const value = options[name];
@@ -96,5 +100,30 @@ export async function handlePermissionsClientCommand(positional: string[], optio
     }
     return true;
   }
-  throw new Error("Usage: infinite permissions status|delegate|revoke ...");
+  if (verb === "reopen") {
+    const [, decisionId] = positional;
+    if (positional.length !== 2 || !decisionId) throw new Error(REOPEN_USAGE);
+    const requestId = requestIdOption(options);
+    await requireDelegationHost(api);
+    console.error(`[Infinite] Reopening permission decision ${clean(decisionId)} · request ${requestId}`);
+    const result = await api.json<ReopenResult>("/permissions/reopenings", { requestId, decisionId });
+    if (options["--json"]) console.log(JSON.stringify(result, null, 2));
+    else {
+      console.log(`Reopened reject ${clean(result.reject)} (${clean(result.code)}). It is closed, it is not replayed, and the same request gets a fresh review. Nothing was allowed.`);
+      if (result.locked) console.log(`Assignment ${clean(result.assignment)} is still locked by another reject. Use infinite permissions unlock to release it.`);
+    }
+    return true;
+  }
+  if (verb === "unlock") {
+    const [, assignment] = positional;
+    if (positional.length !== 2 || !assignment) throw new Error(UNLOCK_USAGE);
+    const requestId = requestIdOption(options);
+    await requireDelegationHost(api);
+    console.error(`[Infinite] Unlocking permission assignment ${clean(assignment)} · request ${requestId}`);
+    const result = await api.json<UnlockResult>("/permissions/unlocks", { requestId, assignment });
+    if (options["--json"]) console.log(JSON.stringify(result, null, 2));
+    else console.log(`${result.wasLocked ? "Unlocked" : "Was not locked:"} ${clean(result.assignment)}. Its repeat count is reset. Nothing was allowed.`);
+    return true;
+  }
+  throw new Error("Usage: infinite permissions status|delegate|revoke|reopen|unlock ...");
 }

@@ -14,11 +14,11 @@ import { intakeConfigSchema } from "./intake-types.js";
  * (2026-11-13) showed that `--dangerously-bypass-hook-trust`, which the injected `-c hooks.*` need,
  * also lets hooks defined in the working directory run without review.
  */
+export const DEFAULT_HOOKS = { claude: true, codex: false } as const;
 /** The name that starts the host's tracker comments when `linear.reportName` is not set. */
 export const DEFAULT_REPORT_NAME = "Infinite";
 /** The name that starts the host's tracker comments, as in "NAME agent report: ready for review.". */
 export const reportName = (config: Config): string => config.linear?.reportName ?? DEFAULT_REPORT_NAME;
-export const DEFAULT_HOOKS = { claude: true, codex: false } as const;
 const nonNegative = z.number().min(0).finite();
 export const usageConfigSchema = z.object({
   /** USD per million tokens, keyed `provider/model`. */

@@ -72,6 +72,7 @@ import { INTERRUPT_CLASSES, PERMISSION_POLICY_VERSION } from "./permission-polic
 import { PermissionJournal, permissionJournalModule } from "./evidence/permission-journal.js";
 import { HostPermissionPipeline, PermissionOwnerControls, closeRejectsOnDirectionChange, openPermissionPipelineState } from "./permission-pipeline.js";
 import { registerPermissionControlRoutes } from "./permission-control-routes.js";
+import { permissionRateFlags, registerPermissionReviewRoutes } from "./permission-review-routes.js";
 import { LinearService } from "./linear.js";
 import { createGoalSchema, goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema, goalParallelismSchema } from "./goal-types.js";
 import { createProjectGroupSchema, projectGroupIdSchema, updateProjectGroupSchema } from "./project-group-types.js";
@@ -703,7 +704,7 @@ export function createApp(config: Config, key: Buffer) {
         (p) => p !== "demo" || config.enableDemo,
       ),
       teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, projectSource: 1, autonomyMode: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
-      permissions: { workspaceDelegation: 1 },
+      permissions: { workspaceDelegation: 1, decisionLog: 1 },
       goals: { enabled: goals.enabled() },
       missions: { enabled: missions.enabled() },
       usage: { enabled: Boolean(config.usage), budgets: config.usage?.budgets ?? {} },
@@ -1058,6 +1059,7 @@ export function createApp(config: Config, key: Buffer) {
       interruptClasses: [...INTERRUPT_CLASSES],
       workspaces: permissionDelegation.status(),
       rates,
+      rateFlags: permissionRateFlags(journal, now),
     });
   });
   // Decision figures for one session, task or workspace, or for the host, over the last `hours` (one hour to seven days).
@@ -1099,6 +1101,7 @@ export function createApp(config: Config, key: Buffer) {
     return res.json({ agent: PERMISSION_AGENT_STATE, view });
   });
   registerPermissionControlRoutes(app, { guards: [requireRole(["owner"]), requireOwnerCli], controls: permissionControls });
+  registerPermissionReviewRoutes(app, { journal: permissionJournal, requireRole, requireOwnerCli, workspaces: projectGroups, projects: () => config.projects });
   app.post("/api/goals", requireRole(["owner"]), async (req, res) => {
     const body = createGoalSchema.parse(req.body);
     assertNoHandoff(body.projectId);

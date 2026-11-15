@@ -1,12 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { execFile, execFileSync } from "node:child_process";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { promisify } from "node:util";
 import { startHost, type Host } from "./helpers.js";
 import { INTERRUPT_CLASSES, PERMISSION_POLICY_VERSION } from "../packages/host/src/permission-policy.js";
+import { PermissionJournal, permissionJournalModule, type PermissionDecision } from "../packages/host/src/evidence/permission-journal.js";
+import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 
 type Projection = { projectId: string; state: string };
 type View = { workspaceId: string; name: string; state: string; direction?: string; projects: Projection[] };
@@ -116,7 +119,7 @@ test("owner delegation covers one workspace or all, ends on an owner regroup als
     assert.equal(settled.body.rates.lastHour.decisions, 0);
     assert.equal(settled.body.rates.lastDay.decisions, 0);
     assert.equal(settled.body.rates.lastDay.perHour, 0);
-    assert.deepEqual((await host.fetchApi("/me", "owner")).body.permissions, { workspaceDelegation: 1 });
+    assert.deepEqual((await host.fetchApi("/me", "owner")).body.permissions, { workspaceDelegation: 1, decisionLog: 1 });
 
     // Scoped figures: a workspace, a session and a task need an id, the host takes none, and the window is bounded.
     const scoped = await host.fetchApi(`/permissions/rates?scope=workspace&id=${webWorkspace}&hours=24`, "controller");
@@ -149,6 +152,137 @@ test("owner delegation covers one workspace or all, ends on an owner regroup als
     assert.equal(recovered.status, 200, JSON.stringify(recovered.body));
     assert.equal(viewOf(recovered.body.workspaces, grouped.body.id)?.state, "not-delegated");
     assert.deepEqual(projectStates(viewOf(recovered.body.workspaces, grouped.body.id)), ["not-covered"]);
+  } finally {
+    if (host) await host.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the owner reads the decision log and marks a decision; no other role reads a note, and a mark changes nothing", { timeout: 120000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "permissions-review-"));
+  const stateDir = join(root, "state");
+  mkdirSync(stateDir, { recursive: true });
+  const keyFile = join(root, "key");
+  const key = randomBytes(32);
+  writeFileSync(keyFile, key, { mode: 0o600 });
+  const shop = join(root, "shop-api");
+  mkdirSync(shop, { mode: 0o700 });
+  const modelNote = "Reasoning that only the owner reads.";
+  const now = Date.now();
+  const ago = (ms: number) => new Date(now - ms).toISOString();
+  const base = (id: string, at: string, overrides: Partial<PermissionDecision> = {}): PermissionDecision => ({
+    id, at, workspaceId: "shop-api", projectId: "shop-api", taskId: "run-1", assignment: "run-1/implementer", sessionId: "member-session",
+    role: "implementer", provider: "claude", family: "claude", evidenceHash: `evidence-${id}`, action: { tool: "Bash", summary: "npm test" },
+    rules: [], tiers: [], verdict: "allow", ...overrides,
+  });
+  // The journal is written before the host starts, as the decision pipeline would have written it.
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(stateDir), vaultKey: key });
+  store.register(permissionJournalModule);
+  const seed = new PermissionJournal(store);
+  seed.appendDecision(base("allowed", ago(50 * 60_000), { note: modelNote }));
+  seed.appendDecision(base("rejected", ago(40 * 60_000), {
+    verdict: "reject", code: "unsafe", rules: ["raise:destructive"], note: modelNote, action: { tool: "Bash", summary: "rm -rf build" },
+    tiers: [{ tier: "strong", profileId: "strong-1", family: "gpt", startedAt: ago(40 * 60_000 + 3_000), endedAt: ago(40 * 60_000) }],
+  }));
+  seed.appendDelivery({ decisionId: "rejected", at: ago(39 * 60_000), kind: "intent" });
+  // A busy session: 21 decisions in the last hour in a workspace with no history is above the floor of twenty.
+  for (let index = 0; index < 21; index++)
+    seed.appendDecision(base(`busy-${index}`, ago(30 * 60_000 - index * 1_000), { sessionId: "busy-session", taskId: "busy-session", assignment: "busy-session" }));
+  store.close();
+
+  let host: Host | undefined;
+  try {
+    host = await startHost({ config: { stateDir, keyFile, projects: [{ id: "shop-api", name: "Shop API", path: shop }] } });
+    // The log, one decision and the candidates carry the owner's material: a controller, a viewer and an anonymous caller are refused.
+    for (const path of ["/permissions/log", "/permissions/decisions/rejected", "/permissions/candidates"]) {
+      assert.equal((await host.fetchApi(path, "controller")).status, 403, path);
+      assert.equal((await host.fetchApi(path, "viewer")).status, 403, path);
+      assert.equal((await host.fetchApi(path, null)).status, 401, path);
+    }
+    // A controller reads the status, with the rate flag and without any note.
+    const status = await host.fetchApi("/permissions/status", "controller");
+    assert.equal(status.status, 200, JSON.stringify(status.body));
+    assert.deepEqual(status.body.rateFlags.map((flag: { sessionId: string; lastHour: number; threshold: number }) => [flag.sessionId, flag.lastHour, flag.threshold]),
+      [["busy-session", 21, 20]]);
+    assert.doesNotMatch(JSON.stringify(status.body), /only the owner reads/);
+
+    // The owner's log: filters, names, linked events, the note, and the rate flag on the busy session's entries.
+    const rejected = await host.fetchApi("/permissions/log?rejected=1", "owner");
+    assert.equal(rejected.status, 200, JSON.stringify(rejected.body));
+    assert.deepEqual(rejected.body.entries.map((entry: { id: string }) => entry.id), ["rejected"]);
+    const entry = rejected.body.entries[0];
+    assert.deepEqual([entry.note, entry.workspaceName, entry.projectName, entry.rejectState, entry.durationMs], [modelNote, "Shop API", "Shop API", "open", 3_000]);
+    assert.deepEqual(entry.deliveries.map((event: { kind: string }) => event.kind), ["intent"]);
+    assert.deepEqual((await host.fetchApi("/permissions/log?raised=1", "owner")).body.entries.map((row: { id: string }) => row.id), ["rejected"]);
+    assert.deepEqual((await host.fetchApi(`/permissions/log?since=${encodeURIComponent(ago(45 * 60_000))}&workspace=other`, "owner")).body.entries, []);
+    const ids: string[] = [];
+    let next: string | undefined;
+    do {
+      const page = await host.fetchApi(`/permissions/log?limit=10${next ? `&before=${next}` : ""}`, "owner");
+      assert.equal(page.status, 200, JSON.stringify(page.body));
+      ids.push(...page.body.entries.map((row: { id: string; sessionId: string; rateFlagged?: boolean }) => {
+        assert.equal(row.rateFlagged === true, row.sessionId === "busy-session", row.id);
+        return row.id;
+      }));
+      next = page.body.next;
+    } while (next);
+    assert.equal(ids.length, 23);
+    assert.equal(new Set(ids).size, 23);
+    for (const query of ["limit=0", "limit=201", "rejected=yes", "since=yesterday", "before=1", "extra=1"])
+      assert.equal((await host.fetchApi(`/permissions/log?${query}`, "owner")).status, 400, query);
+
+    // A mark needs the owner CLI. Controllers, viewers and an owner browser session are refused.
+    const mark = { requestId: randomUUID(), decisionId: "rejected", label: "wrong", note: "The build directory is the session's own." };
+    assert.equal((await host.fetchApi("/permissions/marks", "controller", mark)).status, 403);
+    assert.equal((await host.fetchApi("/permissions/marks", "viewer", mark)).status, 403);
+    const login = await fetch(`${host.origin}/api/login`, {
+      method: "POST", headers: { "Content-Type": "application/json", Origin: host.origin }, body: JSON.stringify({ token: host.tokens.owner }),
+    });
+    const cookie = login.headers.get("set-cookie")!.split(";")[0];
+    const browser = await fetch(`${host.origin}/api/permissions/marks`, {
+      method: "POST", headers: { "Content-Type": "application/json", Cookie: cookie, Origin: host.origin }, body: JSON.stringify(mark),
+    });
+    assert.equal(browser.status, 403, "an owner browser session without the CLI bearer cannot mark");
+    const browserLog = await fetch(`${host.origin}/api/permissions/log`, { headers: { Cookie: cookie } });
+    assert.equal(browserLog.status, 200, "the owner's browser session reads the log");
+
+    const first = await host.fetchApi("/permissions/marks", "owner", mark);
+    assert.equal(first.status, 200, JSON.stringify(first.body));
+    assert.deepEqual([first.body.mark.decisionId, first.body.mark.label, first.body.mark.note], ["rejected", "wrong", mark.note]);
+    assert.deepEqual((await host.fetchApi("/permissions/marks", "owner", mark)).body, first.body, "a replayed request id returns the first result");
+    assert.equal((await host.fetchApi("/permissions/marks", "owner", { ...mark, note: "Another note." })).status, 409);
+    assert.equal((await host.fetchApi("/permissions/marks", "owner", { ...mark, requestId: randomUUID(), decisionId: "missing" })).status, 404);
+    assert.equal((await host.fetchApi("/permissions/marks", "owner", { ...mark, requestId: randomUUID(), note: " " })).status, 400);
+    const second = await host.fetchApi("/permissions/marks", "owner", { ...mark, requestId: randomUUID(), note: "Still wrong." });
+    assert.equal(second.status, 200, JSON.stringify(second.body));
+
+    // The marks are on the decision, which is unchanged: still a reject, still open.
+    const marked = await host.fetchApi("/permissions/decisions/rejected", "owner");
+    assert.deepEqual([marked.body.entry.verdict, marked.body.entry.code, marked.body.entry.rejectState], ["reject", "unsafe", "open"]);
+    assert.deepEqual(marked.body.entry.marks.map((row: { note: string }) => row.note), [mark.note, "Still wrong."]);
+    assert.equal((await host.fetchApi("/permissions/decisions/missing", "owner")).status, 404);
+    const candidates = await host.fetchApi("/permissions/candidates", "owner");
+    assert.deepEqual(candidates.body.candidates.map((candidate: { decisionId: string; label: string; sources: string[] }) => [candidate.decisionId, candidate.label, candidate.sources]),
+      [["rejected", "should-allow", ["marked-wrong"]]]);
+    assert.doesNotMatch(JSON.stringify(candidates.body), /only the owner reads/, "a candidate carries no model note");
+
+    // The CLI prints the log and records a mark.
+    const clientFile = join(root, "client.json");
+    writeFileSync(clientFile, JSON.stringify({ origin: host.origin, token: host.tokens.owner }), { mode: 0o600 });
+    const cli = [import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
+    const permissions = (...args: string[]) => promisify(execFile)(process.execPath, ["--import", ...cli, "permissions", ...args]);
+    const log = await permissions("log", "--rejected", "--since", "2h");
+    assert.match(log.stdout, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}Z {2}reject unsafe · open {2}Shop API \/ Shop API$/m);
+    assert.match(log.stdout, /^ {2}Note \(owner only\): Reasoning that only the owner reads\.$/m);
+    assert.match(log.stdout, /^ {2}Marked wrong: .*: Still wrong\.$/m);
+    assert.match(log.stdout, /^Above usual rate: session busy-session in shop-api, 21 decisions in the last hour \(flagged above 20\)$/m);
+    const marking = await permissions("mark", "allowed", "--wrong", "--note", "Should not have run.");
+    assert.match(marking.stdout, /^Marked allowed wrong at /m);
+    assert.match(marking.stdout, /A mark is a record only and changes no decision\./);
+    await assert.rejects(permissions("mark", "allowed", "--note", "No label."), (error: { stderr: string }) => /Usage: infinite permissions mark/.test(error.stderr));
+    await assert.rejects(permissions("log", "--since", "yesterday"), (error: { stderr: string }) => /--since needs a time/.test(error.stderr));
+    assert.deepEqual((await host.fetchApi("/permissions/candidates", "owner")).body.candidates.map((candidate: { decisionId: string; label: string }) => [candidate.decisionId, candidate.label]),
+      [["allowed", "should-reject"], ["rejected", "should-allow"]]);
   } finally {
     if (host) await host.stop();
     rmSync(root, { recursive: true, force: true });

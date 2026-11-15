@@ -20,6 +20,7 @@ import { age, SESSION_KIND, SESSION_LABELS, type StatusKind } from "../../status
 import { theme } from "../../theme";
 import { goalGroup, pendingApprovals, ROLE_NAMES, teamGroup, type ProductGoal, type TeamView } from "../teams/model";
 import { GoalList, listStyles, TeamList } from "../teams/RunLists";
+import { decisionLogAvailable } from "../permissions/model";
 
 export type InboxView = "sessions" | "teams" | "goals";
 
@@ -119,6 +120,7 @@ export function Inbox({
           <View style={s.toggle}><Glyph name={machineSheet ? "up" : "down"} size={11} color={theme.colors.secondaryInk} /></View>
         </Pressable>
         <View style={s.headerRight}>
+          {data && decisionLogAvailable(data.me) ? <GlassButton glyph="check" label="Permission decisions" size={36} onPress={() => router.push({ pathname: "/permissions", params: { machine: connectionKey(connection) } })} /> : null}
           {data?.me.usage?.enabled ? <GlassButton glyph="chart" label="Cost" size={36} onPress={() => router.push({ pathname: "/cost", params: { machine: connectionKey(connection) } })} /> : null}
           <LiveStatus online={online} loading={loading} seen={seen} stale={stale} />
         </View>

@@ -20,7 +20,20 @@ const CONTROLS = "permission_journal_controls";
 const ORDER = "permission_journal_order";
 const NOTE_SEAL_TABLE = "permission_decision_notes";
 const INPUT_SEAL_TABLE = "permission_decision_inputs";
+const MARKS = "permission_decision_marks";
+const MARK_NOTE_SEAL_TABLE = "permission_decision_mark_notes";
 const MAX_TEXT = 2_000;
+const LOG_PAGE_DEFAULT = 50;
+const LOG_PAGE_MAX = 200;
+const CANDIDATE_PAGE_DEFAULT = 100;
+const CANDIDATE_PAGE_MAX = 500;
+const HOUR_MS = 3_600_000;
+/** A session is flagged when its last hour exceeds this many times its workspace's median active session-hour. */
+export const RATE_FLAG_FACTOR = 3;
+/** No session is flagged at or below this many decisions in the last hour. */
+export const RATE_FLAG_FLOOR = 20;
+/** The baseline window before the last hour, in days. */
+export const RATE_FLAG_BASELINE_DAYS = 7;
 
 export type PermissionTier = {
   tier: "light" | "strong";
@@ -92,6 +105,91 @@ export type PermissionRates = {
   medianDecisionMs: number | null;
 };
 
+/** The owner's later judgment of one decision. A record only: it changes no decision, replay or lock. */
+export type PermissionMark = {
+  /** The owner request that recorded it. A retry with the same id returns this mark. */
+  requestId: string;
+  decisionId: string;
+  at: string;
+  /** The owner device that recorded it. */
+  by: string;
+  label: "wrong";
+  /** The owner's own text. */
+  note: string;
+};
+
+export type PermissionLogQuery = {
+  workspaceId?: string;
+  rejectedOnly?: boolean;
+  raisedOnly?: boolean;
+  since?: string;
+  /** The `next` cursor of the previous page. */
+  before?: string;
+  limit?: number;
+};
+
+/** An owner control recorded against one decision. */
+export type PermissionDecisionControl = {
+  kind: "reopen" | "close";
+  at: string;
+  reason?: string;
+};
+
+/** One decision as the owner reads it, with everything linked to it. The note is the model's, for the owner only. */
+export type PermissionLogEntry = PermissionDecision & {
+  raised: boolean;
+  /** From the first tier's start to the last tier's end. Null when no model turn ran. */
+  durationMs: number | null;
+  /** For a reject: whether it is still open for its task, was reopened by the owner, or closed with its task or direction. */
+  rejectState?: "open" | "reopened" | "closed";
+  deliveries: PermissionDelivery[];
+  marks: PermissionMark[];
+  controls: PermissionDecisionControl[];
+};
+
+export type PermissionLogPage = { entries: PermissionLogEntry[]; next?: string };
+
+/** The labels of the replay set. A candidate carries the one its owner act implies; the owner confirms or drops it. */
+export type PermissionCaseLabel = "should-allow" | "should-reject" | "should-reach-owner";
+
+/**
+ * A decision that the owner marked wrong or a reject that the owner reopened, offered as a labelled replay case.
+ * It holds the decision without the model's note: a replay case is request evidence, and no model text belongs in it.
+ */
+export type PermissionReplayCandidate = {
+  decisionId: string;
+  label: PermissionCaseLabel;
+  sources: Array<"marked-wrong" | "reopened">;
+  decision: Omit<PermissionDecision, "note">;
+  marks: PermissionMark[];
+  reopenedAt?: string;
+  /** The time of the latest owner act that offered it. */
+  offeredAt: string;
+};
+
+export type PermissionReplayCandidatePage = { candidates: PermissionReplayCandidate[]; next?: string };
+
+/** A session whose decisions in the last hour exceed its workspace's usual rate. Nothing stops on it. */
+export type PermissionRateFlag = {
+  sessionId: string;
+  workspaceId: string;
+  lastHour: number;
+  /** The median decisions per active session-hour in the workspace over the baseline window. 0 with no history. */
+  baselineMedian: number;
+  /** max(RATE_FLAG_FLOOR, RATE_FLAG_FACTOR * baselineMedian). The session is flagged above it. */
+  threshold: number;
+};
+
+type MarkRow = {
+  seq: number;
+  request_id: string;
+  decision_id: string;
+  at: string;
+  by: string;
+  label: "wrong";
+  note_sealed: string;
+};
+
 type DecisionRow = {
   seq: number;
   id: string;
@@ -134,44 +232,58 @@ type ControlRow = {
 /** The permission journal owns its tables and deliberately has no run-deletion hook. */
 export const permissionJournalModule: EvidenceModule = {
   name: MODULE,
-  version: 1,
+  version: 2,
   readVersion: 1,
-  migrate(tx: EvidenceTx) {
-    tx.exec(
-      `CREATE TABLE IF NOT EXISTS ${ORDER} (seq INTEGER PRIMARY KEY AUTOINCREMENT)`,
-    );
-    tx.exec(
-      `CREATE TABLE IF NOT EXISTS ${DECISIONS} (`
-      + "seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, at TEXT NOT NULL, at_ms INTEGER NOT NULL, workspace_id TEXT NOT NULL, "
-      + "project_id TEXT NOT NULL, task_id TEXT NOT NULL, assignment TEXT NOT NULL, session_id TEXT NOT NULL, "
-      + "role TEXT, provider TEXT NOT NULL, family TEXT, evidence_hash TEXT NOT NULL, reuse_key TEXT, "
-      + "action_tool TEXT NOT NULL, action_summary TEXT NOT NULL, rules_json TEXT NOT NULL, tiers_json TEXT NOT NULL, "
-      + "verdict TEXT NOT NULL, code TEXT, interrupt_class TEXT, note_sealed TEXT, input_sealed TEXT NOT NULL, "
-      + "replay_of TEXT, repeats TEXT, raised INTEGER NOT NULL, last_tier TEXT NOT NULL, duration_ms INTEGER)",
-    );
-    tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_at_ms ON ${DECISIONS}(at_ms DESC, seq DESC)`);
-    tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_workspace_at_ms ON ${DECISIONS}(workspace_id, at_ms DESC, seq DESC)`);
-    tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_project_at_ms ON ${DECISIONS}(project_id, at_ms DESC, seq DESC)`);
-    tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_task_at_ms ON ${DECISIONS}(task_id, at_ms DESC, seq DESC)`);
-    tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_session_at_ms ON ${DECISIONS}(session_id, at_ms DESC, seq DESC)`);
-    tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_assignment_at_ms ON ${DECISIONS}(assignment, at_ms DESC, seq DESC)`);
-    tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_task_rejects ON ${DECISIONS}(task_id, verdict, code, repeats, at_ms, seq)`);
-    tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_assignment_repeats ON ${DECISIONS}(assignment, repeats, at_ms, seq)`);
-    tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_raised ON ${DECISIONS}(raised, at_ms DESC, seq DESC)`);
-    tx.exec(
-      `CREATE TABLE IF NOT EXISTS ${DELIVERIES} (`
-      + "seq INTEGER PRIMARY KEY, decision_id TEXT NOT NULL, at TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT)",
-    );
-    tx.exec(`CREATE INDEX IF NOT EXISTS permission_deliveries_decision ON ${DELIVERIES}(decision_id, seq)`);
-    tx.exec(
-      `CREATE TABLE IF NOT EXISTS ${CONTROLS} (`
-      + "seq INTEGER PRIMARY KEY, kind TEXT NOT NULL, at TEXT NOT NULL, by TEXT, decision_id TEXT, "
-      + "assignment TEXT, task_id TEXT, project_id TEXT, reason TEXT)",
-    );
-    tx.exec(`CREATE INDEX IF NOT EXISTS permission_controls_decision ON ${CONTROLS}(decision_id, seq)`);
-    tx.exec(`CREATE INDEX IF NOT EXISTS permission_controls_assignment ON ${CONTROLS}(assignment, seq)`);
+  migrate(tx: EvidenceTx, from: number) {
+    if (from < 1) migrateDecisions(tx);
+    // Version 2: the owner's marks. Each mark is a row of its own; nothing updates or deletes one.
+    if (from < 2) {
+      tx.exec(
+        `CREATE TABLE IF NOT EXISTS ${MARKS} (`
+        + "seq INTEGER PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, decision_id TEXT NOT NULL, at TEXT NOT NULL, "
+        + "by TEXT NOT NULL, label TEXT NOT NULL, note_sealed TEXT NOT NULL)",
+      );
+      tx.exec(`CREATE INDEX IF NOT EXISTS permission_marks_decision ON ${MARKS}(decision_id, seq)`);
+    }
   },
 };
+
+/** Version 1: decisions, delivery events, owner controls and the journal's own order. */
+function migrateDecisions(tx: EvidenceTx): void {
+  tx.exec(
+    `CREATE TABLE IF NOT EXISTS ${ORDER} (seq INTEGER PRIMARY KEY AUTOINCREMENT)`,
+  );
+  tx.exec(
+    `CREATE TABLE IF NOT EXISTS ${DECISIONS} (`
+    + "seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, at TEXT NOT NULL, at_ms INTEGER NOT NULL, workspace_id TEXT NOT NULL, "
+    + "project_id TEXT NOT NULL, task_id TEXT NOT NULL, assignment TEXT NOT NULL, session_id TEXT NOT NULL, "
+    + "role TEXT, provider TEXT NOT NULL, family TEXT, evidence_hash TEXT NOT NULL, reuse_key TEXT, "
+    + "action_tool TEXT NOT NULL, action_summary TEXT NOT NULL, rules_json TEXT NOT NULL, tiers_json TEXT NOT NULL, "
+    + "verdict TEXT NOT NULL, code TEXT, interrupt_class TEXT, note_sealed TEXT, input_sealed TEXT NOT NULL, "
+    + "replay_of TEXT, repeats TEXT, raised INTEGER NOT NULL, last_tier TEXT NOT NULL, duration_ms INTEGER)",
+  );
+  tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_at_ms ON ${DECISIONS}(at_ms DESC, seq DESC)`);
+  tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_workspace_at_ms ON ${DECISIONS}(workspace_id, at_ms DESC, seq DESC)`);
+  tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_project_at_ms ON ${DECISIONS}(project_id, at_ms DESC, seq DESC)`);
+  tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_task_at_ms ON ${DECISIONS}(task_id, at_ms DESC, seq DESC)`);
+  tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_session_at_ms ON ${DECISIONS}(session_id, at_ms DESC, seq DESC)`);
+  tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_assignment_at_ms ON ${DECISIONS}(assignment, at_ms DESC, seq DESC)`);
+  tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_task_rejects ON ${DECISIONS}(task_id, verdict, code, repeats, at_ms, seq)`);
+  tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_assignment_repeats ON ${DECISIONS}(assignment, repeats, at_ms, seq)`);
+  tx.exec(`CREATE INDEX IF NOT EXISTS permission_decisions_raised ON ${DECISIONS}(raised, at_ms DESC, seq DESC)`);
+  tx.exec(
+    `CREATE TABLE IF NOT EXISTS ${DELIVERIES} (`
+    + "seq INTEGER PRIMARY KEY, decision_id TEXT NOT NULL, at TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT)",
+  );
+  tx.exec(`CREATE INDEX IF NOT EXISTS permission_deliveries_decision ON ${DELIVERIES}(decision_id, seq)`);
+  tx.exec(
+    `CREATE TABLE IF NOT EXISTS ${CONTROLS} (`
+    + "seq INTEGER PRIMARY KEY, kind TEXT NOT NULL, at TEXT NOT NULL, by TEXT, decision_id TEXT, "
+    + "assignment TEXT, task_id TEXT, project_id TEXT, reason TEXT)",
+  );
+  tx.exec(`CREATE INDEX IF NOT EXISTS permission_controls_decision ON ${CONTROLS}(decision_id, seq)`);
+  tx.exec(`CREATE INDEX IF NOT EXISTS permission_controls_assignment ON ${CONTROLS}(assignment, seq)`);
+}
 
 /** Append-only permission decisions and their delivery/owner-control history. */
 export class PermissionJournal {
@@ -576,6 +688,210 @@ export class PermissionJournal {
       };
     });
   }
+
+  /**
+   * Records the owner's mark on one decision as a new row. It changes no decision, no replay and no lock, and a
+   * later mark never rewrites an earlier one. A retry with the same request id returns the recorded mark; the same
+   * id with other content is refused with `PermissionMarkConflict`.
+   */
+  mark(input: { requestId: string; decisionId: string; at: string; by: string; label: "wrong"; note: string }): PermissionMark {
+    assertPlainObject(input, "A mark is required.");
+    assertOnlyKeys(input, ["requestId", "decisionId", "at", "by", "label", "note"]);
+    const requestId = requiredString(input.requestId, "requestId");
+    const decisionId = requiredString(input.decisionId, "decisionId");
+    const at = requiredTimestamp(input.at, "at");
+    const by = requiredString(input.by, "by");
+    if (input.label !== "wrong") throw new TypeError("A mark label is invalid.");
+    if (typeof input.note !== "string" || input.note.trim().length === 0 || input.note.length > MAX_TEXT) {
+      throw new TypeError("A mark note must be text of 1 to 2000 characters.");
+    }
+    const note = input.note;
+    return this.store.write(tx => {
+      const prior = tx.get<MarkRow>(`SELECT * FROM ${MARKS} WHERE request_id=?`, requestId);
+      if (prior !== undefined) {
+        const recorded = hydrateMark(tx, prior);
+        if (recorded.decisionId !== decisionId || recorded.by !== by || recorded.label !== input.label || recorded.note !== note) {
+          throw new PermissionMarkConflict();
+        }
+        return recorded;
+      }
+      if (!tx.get(`SELECT id FROM ${DECISIONS} WHERE id=?`, decisionId)) {
+        throw new TypeError("A mark must link to a stored decision.");
+      }
+      const seq = nextSequence(tx);
+      tx.run(
+        `INSERT INTO ${MARKS} (seq,request_id,decision_id,at,by,label,note_sealed) VALUES (?,?,?,?,?,?,?)`,
+        seq, requestId, decisionId, at, by, input.label, tx.seal(MARK_NOTE_SEAL_TABLE, requestId, note),
+      );
+      return { requestId, decisionId, at, by, label: input.label, note };
+    });
+  }
+
+  marks(decisionId: string): PermissionMark[] {
+    requiredString(decisionId, "decisionId");
+    return this.store.read(db => db.all<MarkRow>(`SELECT * FROM ${MARKS} WHERE decision_id=? ORDER BY seq`, decisionId)
+      .map(row => hydrateMark(db, row)));
+  }
+
+  /**
+   * The owner's decision log, newest first, one bounded page at a time. Each entry carries its delivery events,
+   * its marks, its owner controls and the model's note: a caller serves it to the owner only.
+   */
+  log(query: PermissionLogQuery = {}): PermissionLogPage {
+    assertPlainObject(query, "A log query must be an object.");
+    assertOnlyKeys(query, ["workspaceId", "rejectedOnly", "raisedOnly", "since", "before", "limit"]);
+    const workspaceId = optionalString(query.workspaceId, "workspaceId");
+    for (const key of ["rejectedOnly", "raisedOnly"] as const) {
+      if (query[key] !== undefined && typeof query[key] !== "boolean") throw new TypeError(`${key} must be a boolean.`);
+    }
+    const since = query.since === undefined ? undefined : requiredTimestamp(query.since, "since");
+    const before = query.before === undefined ? undefined : logCursor(query.before);
+    const limit = query.limit ?? LOG_PAGE_DEFAULT;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > LOG_PAGE_MAX) {
+      throw new TypeError(`A log page holds 1 to ${LOG_PAGE_MAX} decisions.`);
+    }
+    return this.store.read(db => {
+      const clauses: string[] = [];
+      const params: (string | number)[] = [];
+      if (workspaceId !== undefined) {
+        clauses.push("workspace_id=?");
+        params.push(workspaceId);
+      }
+      if (query.rejectedOnly === true) clauses.push("verdict='reject'");
+      if (query.raisedOnly === true) clauses.push("raised=1");
+      if (since !== undefined) {
+        clauses.push("at_ms>=?");
+        params.push(Date.parse(since));
+      }
+      if (before !== undefined) {
+        clauses.push("(at_ms<? OR (at_ms=? AND seq<?))");
+        params.push(before.atMs, before.atMs, before.seq);
+      }
+      const where = clauses.length === 0 ? "" : ` WHERE ${clauses.join(" AND ")}`;
+      const rows = db.all<DecisionRow>(
+        `SELECT * FROM ${DECISIONS}${where} ORDER BY at_ms DESC, seq DESC LIMIT ?`, ...params, limit + 1,
+      );
+      const page = rows.slice(0, limit);
+      const last = page.at(-1);
+      return {
+        entries: logEntries(db, page),
+        ...(rows.length > limit && last !== undefined ? { next: `${last.at_ms}.${last.seq}` } : {}),
+      };
+    });
+  }
+
+  logEntry(id: string): PermissionLogEntry | undefined {
+    requiredString(id, "id");
+    return this.store.read(db => {
+      const row = db.get<DecisionRow>(`SELECT * FROM ${DECISIONS} WHERE id=?`, id);
+      return row === undefined ? undefined : logEntries(db, [row])[0];
+    });
+  }
+
+  /**
+   * The decisions the owner marked wrong and the rejects the owner reopened, newest owner act first, each with
+   * the label it implies. This is the read side only: the owner accepts or drops a candidate in the replay set.
+   */
+  replayCandidates(query: { before?: string; limit?: number } = {}): PermissionReplayCandidatePage {
+    assertPlainObject(query, "A candidate query must be an object.");
+    assertOnlyKeys(query, ["before", "limit"]);
+    let before: number | undefined;
+    if (query.before !== undefined) {
+      if (typeof query.before !== "string" || !/^\d{1,15}$/.test(query.before)) throw new TypeError("A candidate cursor is invalid.");
+      before = Number(query.before);
+    }
+    const limit = query.limit ?? CANDIDATE_PAGE_DEFAULT;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > CANDIDATE_PAGE_MAX) {
+      throw new TypeError(`A candidate page holds 1 to ${CANDIDATE_PAGE_MAX} candidates.`);
+    }
+    return this.store.read(db => {
+      const offers = new Map<string, { latest: number; offeredAt: string; marks: PermissionMark[]; reopenedAt?: string }>();
+      const offer = (decisionId: string, seq: number, at: string) => {
+        const current = offers.get(decisionId) ?? { latest: 0, offeredAt: at, marks: [] };
+        if (seq > current.latest) Object.assign(current, { latest: seq, offeredAt: at });
+        offers.set(decisionId, current);
+        return current;
+      };
+      for (const row of db.all<MarkRow>(`SELECT * FROM ${MARKS} WHERE label='wrong' ORDER BY seq`)) {
+        offer(row.decision_id, row.seq, row.at).marks.push(hydrateMark(db, row));
+      }
+      for (const row of db.all<{ seq: number; at: string; decision_id: string }>(
+        `SELECT seq,at,decision_id FROM ${CONTROLS} WHERE kind='reopen' AND decision_id IS NOT NULL ORDER BY seq`,
+      )) {
+        offer(row.decision_id, row.seq, row.at).reopenedAt = row.at;
+      }
+      const ordered = [...offers.entries()]
+        .filter(([, value]) => before === undefined || value.latest < before)
+        .sort((left, right) => right[1].latest - left[1].latest);
+      const page = ordered.slice(0, limit);
+      const candidates: PermissionReplayCandidate[] = [];
+      for (const [decisionId, value] of page) {
+        const row = db.get<DecisionRow>(`SELECT * FROM ${DECISIONS} WHERE id=?`, decisionId);
+        if (row === undefined) continue;
+        const sources: PermissionReplayCandidate["sources"] = [];
+        if (value.marks.length > 0) sources.push("marked-wrong");
+        if (value.reopenedAt !== undefined) sources.push("reopened");
+        candidates.push({
+          decisionId,
+          label: impliedLabel(row.verdict),
+          sources,
+          decision: hydrateDecision(db, row, { note: false }),
+          marks: value.marks,
+          ...(value.reopenedAt === undefined ? {} : { reopenedAt: value.reopenedAt }),
+          offeredAt: value.offeredAt,
+        });
+      }
+      const last = page.at(-1);
+      return { candidates, ...(ordered.length > limit && last !== undefined ? { next: String(last[1].latest) } : {}) };
+    });
+  }
+
+  /**
+   * Sessions whose decisions in the hour before `now` exceed RATE_FLAG_FACTOR times their workspace's median
+   * decisions per active session-hour over the RATE_FLAG_BASELINE_DAYS before that hour, and RATE_FLAG_FLOOR.
+   * A session-hour is one session's decisions in one clock hour; hours with no decision do not count.
+   */
+  rateFlags(input: { now: string }): PermissionRateFlag[] {
+    assertPlainObject(input, "A rate flag query is required.");
+    assertOnlyKeys(input, ["now"]);
+    const nowMs = Date.parse(requiredTimestamp(input.now, "now"));
+    const hourStart = nowMs - HOUR_MS;
+    const baselineStart = hourStart - RATE_FLAG_BASELINE_DAYS * 24 * HOUR_MS;
+    return this.store.read(db => {
+      const recent = db.all<{ workspace_id: string; session_id: string; n: number }>(
+        `SELECT workspace_id, session_id, COUNT(*) AS n FROM ${DECISIONS} WHERE at_ms>? AND at_ms<=? `
+        + "GROUP BY workspace_id, session_id HAVING COUNT(*)>?",
+        hourStart, nowMs, RATE_FLAG_FLOOR,
+      );
+      const baselines = new Map<string, number>();
+      const flags: PermissionRateFlag[] = [];
+      for (const row of recent) {
+        let baselineMedian = baselines.get(row.workspace_id);
+        if (baselineMedian === undefined) {
+          const hours = db.all<{ n: number }>(
+            `SELECT COUNT(*) AS n FROM ${DECISIONS} WHERE workspace_id=? AND at_ms>? AND at_ms<=? `
+            + `GROUP BY session_id, at_ms/${HOUR_MS} ORDER BY n`,
+            row.workspace_id, baselineStart, hourStart,
+          ).map(hour => hour.n);
+          baselineMedian = median(hours) ?? 0;
+          baselines.set(row.workspace_id, baselineMedian);
+        }
+        const threshold = Math.max(RATE_FLAG_FLOOR, RATE_FLAG_FACTOR * baselineMedian);
+        if (row.n > threshold) {
+          flags.push({ sessionId: row.session_id, workspaceId: row.workspace_id, lastHour: row.n, baselineMedian, threshold });
+        }
+      }
+      return flags.sort((left, right) => right.lastHour - left.lastHour || left.sessionId.localeCompare(right.sessionId));
+    });
+  }
+}
+
+/** The same mark request id was used for different content. */
+export class PermissionMarkConflict extends Error {
+  constructor() {
+    super("This request ID already recorded a different mark.");
+    this.name = "PermissionMarkConflict";
+  }
 }
 
 function normalizeDecision(value: PermissionDecision): PermissionDecision {
@@ -667,8 +983,8 @@ function normalizeTier(value: PermissionTier, index: number): PermissionTier {
   };
 }
 
-function hydrateDecision(db: EvidenceDb, row: DecisionRow): PermissionDecision {
-  const note = row.note_sealed === null ? undefined : db.open<string>(NOTE_SEAL_TABLE, row.id, row.note_sealed);
+function hydrateDecision(db: EvidenceDb, row: DecisionRow, options: { note: boolean } = { note: true }): PermissionDecision {
+  const note = row.note_sealed === null || !options.note ? undefined : db.open<string>(NOTE_SEAL_TABLE, row.id, row.note_sealed);
   return {
     id: row.id,
     at: row.at,
@@ -815,6 +1131,79 @@ function compareOrder(_leftAt: string, leftSeq: number, _rightAt: string, rightS
 
 function compareAt(left: string, right: string): number {
   return Date.parse(left) - Date.parse(right);
+}
+
+function hydrateMark(db: EvidenceDb, row: MarkRow): PermissionMark {
+  return {
+    requestId: row.request_id,
+    decisionId: row.decision_id,
+    at: row.at,
+    by: row.by,
+    label: row.label,
+    note: db.open<string>(MARK_NOTE_SEAL_TABLE, row.request_id, row.note_sealed),
+  };
+}
+
+/** The decisions of one log page with their delivery events, marks and owner controls, read in one pass each. */
+function logEntries(db: EvidenceDb, rows: DecisionRow[]): PermissionLogEntry[] {
+  if (rows.length === 0) return [];
+  const ids = rows.map(row => row.id);
+  const linked = <T extends { decision_id: string }>(table: string, extra = "") => {
+    const byDecision = new Map<string, T[]>();
+    for (const row of db.all<T>(
+      `SELECT * FROM ${table} WHERE decision_id IN (${placeholders(ids.length)})${extra} ORDER BY seq`, ...ids,
+    )) {
+      byDecision.set(row.decision_id, [...byDecision.get(row.decision_id) ?? [], row]);
+    }
+    return byDecision;
+  };
+  const deliveries = linked<{ seq: number; decision_id: string; at: string; kind: PermissionDelivery["kind"]; detail: string | null }>(DELIVERIES);
+  const marks = linked<MarkRow>(MARKS);
+  const controls = linked<{ decision_id: string; kind: "reopen" | "close"; at: string; reason: string | null }>(
+    CONTROLS, " AND kind IN ('reopen','close')",
+  );
+  return rows.map(row => {
+    const rejectState = row.verdict !== "reject"
+      ? undefined
+      : isEffectReject(row.code ?? undefined)
+        ? isOpen(db, row) ? "open" : ownerReopened(db, row) ? "reopened" : "closed"
+        : isEvidenceReject(row.code ?? undefined) && ownerReopened(db, row) ? "reopened" : undefined;
+    return {
+      ...hydrateDecision(db, row),
+      raised: row.raised === 1,
+      durationMs: row.duration_ms,
+      ...(rejectState === undefined ? {} : { rejectState }),
+      deliveries: (deliveries.get(row.id) ?? []).map(event => ({
+        seq: event.seq,
+        decisionId: event.decision_id,
+        at: event.at,
+        kind: event.kind,
+        ...(event.detail === null ? {} : { detail: event.detail }),
+      })),
+      marks: (marks.get(row.id) ?? []).map(mark => hydrateMark(db, mark)),
+      controls: (controls.get(row.id) ?? []).map(control => ({
+        kind: control.kind,
+        at: control.at,
+        ...(control.reason === null ? {} : { reason: control.reason }),
+      })),
+    };
+  });
+}
+
+function logCursor(value: unknown): { atMs: number; seq: number } {
+  if (typeof value !== "string") throw new TypeError("A log cursor is invalid.");
+  const match = /^(\d{1,15})\.(\d{1,15})$/.exec(value);
+  if (!match) throw new TypeError("A log cursor is invalid.");
+  return { atMs: Number(match[1]), seq: Number(match[2]) };
+}
+
+/**
+ * The replay label an owner act implies for a decision. A wrong allow should not have been allowed; a wrong
+ * reject, a reopened reject and a needless owner route should have been allowed. The owner confirms or changes it
+ * when accepting the case.
+ */
+function impliedLabel(verdict: PermissionVerdict): PermissionCaseLabel {
+  return verdict === "allow" ? "should-reject" : "should-allow";
 }
 
 function median(values: number[]): number | null {

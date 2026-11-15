@@ -466,3 +466,47 @@ direction text closes the open rejects of the projects it covers.
 The record has no effect yet. The permission agent is not active on this host,
 so requests are handled as before. Until the agent is activated,
 `infinite repo init --permissions` still governs team runs.
+
+### Permission decision log
+
+```sh
+infinite permissions log [--rejected] [--raised] [--workspace W] [--since T] [--limit N] [--before CURSOR] [--json]
+infinite permissions mark DECISION_ID --wrong --note TEXT [--request-id UUID]
+```
+
+`log` lists the permission agent's recorded decisions, newest first. Each
+entry shows the time, the workspace and project, the requesting session with
+its role, provider and model family, the task and assignment, the action, the
+host rules that matched, the tiers and profiles that ran with their timings,
+the verdict with its reject code or interrupt class, the decision it replays,
+its delivery events, the owner's reopen or closure, the owner's marks, and the
+model's note. `--rejected` keeps rejects, `--raised` keeps requests that a
+raise rule sent to the strong tier, `--workspace W` keeps decisions recorded
+under that workspace id, and `--since T` takes a time with a zone, such as
+`2026-11-14T09:00Z`, or a span back from now, such as `30m`, `24h` or `7d`. A
+page holds 50 decisions by default and at most 200 (`--limit`); when more
+exist, the output ends with the `--before CURSOR` that prints the next page.
+
+The model's note is for the owner only. Only an owner device reads the log;
+a controller or a viewer is refused, and `status` never carries a note.
+
+`mark` records that the owner judges a decision `wrong`, with a note. It needs
+a paired owner device, such as the CLI or the phone app; a browser signed in
+with the host's cookie is refused and shows the command to run instead. The web
+and phone apps read the same log under Permission decisions. A mark is a record
+only: it changes no decision, no replay and no
+lock, and a later mark is added beside the earlier ones. To change later
+decisions, reopen the reject or change the workspace's direction. A retried
+`--request-id` returns the recorded mark.
+
+Each decision marked wrong and each reject the owner reopened is offered as a
+labelled case for the permission agent's replay set: a wrong allow as
+`should-reject`, and a wrong reject, a reopened reject or a needless owner
+route as `should-allow`. The owner accepts or drops each one; nothing is added
+without the owner. `GET /api/permissions/candidates` lists them for an owner
+device.
+
+`status` flags a session whose decisions in the last hour exceed three times
+its workspace's median decisions per active session-hour over the seven days
+before that hour, and twenty. A session-hour is one session's decisions in one
+clock hour. Nothing stops on the flag. The log marks that session's entries.

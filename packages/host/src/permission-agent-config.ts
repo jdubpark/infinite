@@ -19,6 +19,12 @@ export const permissionAgentConfigSchema = z.object({
   maxMissRate: z.number().min(0).max(1).default(DEFAULT_MAX_MISS_RATE),
   /** The least number of labelled cases a replay result needs before the host can be ready. */
   minCases: z.number().int().min(1).max(100_000).default(DEFAULT_MIN_CASES),
+  /**
+   * Commands that deploy, promote, roll out or release on this host, as words. A request that runs one
+   * is a production-or-staging request and needs the owner's own answer. The first word is the command's
+   * file name; a word that ends in `*` matches by prefix; options between the words are ignored.
+   */
+  releaseCommands: z.array(z.array(z.string().min(1).max(200)).min(1).max(8)).max(64).optional(),
 }).strict().superRefine((block, context) => {
   const ids = new Set<string>();
   for (const [index, profile] of (block.strong ?? []).entries()) {

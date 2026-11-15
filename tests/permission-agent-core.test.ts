@@ -27,7 +27,7 @@ import {
   type PermissionTurnLauncher,
   type ReportOptions,
 } from "../packages/host/src/permission-reviewer.js";
-import { hostProtectedPaths, type PermissionAgentSettings } from "../packages/host/src/permission-agent-config.js";
+import { hostProtectedPaths, permissionAgentConfigSchema, type PermissionAgentSettings } from "../packages/host/src/permission-agent-config.js";
 import type { PermissionRequest, PermissionReviewContext } from "../packages/host/src/permission-agent-types.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 
@@ -95,6 +95,14 @@ test("each interrupt class routes a concrete request through a class rule, and n
   const state = tool("Write", { file_path: "/srv/agent-host/state/policy.json", content: "{}" });
   assert.equal(classify(state, CLASSES), undefined);
   owner(state, "class:host-configuration", { protectedPaths: ["/srv/agent-host/state"] });
+
+  // A deploy command that the owner names in the host configuration is a production-or-staging request.
+  const deploy = bash("npm run --silent deploy -- --env staging");
+  assert.equal(classify(deploy, CLASSES), undefined);
+  assert.ok(raise(deploy, { rejectHistory: false }).includes("raise:release-verb"));
+  const { releaseCommands } = permissionAgentConfigSchema.parse({ releaseCommands: [["npm", "run", "deploy"]] });
+  assert.deepEqual(classify(deploy, CLASSES, { releaseCommands }), { interruptClass: "production-or-staging", rule: "class:host-release" });
+  assert.equal(classify(bash("npm run build"), CLASSES, { releaseCommands }), undefined);
 
   // Another settings file inside the session root only raises.
   const npmrc = tool("Write", { file_path: `${ROOT}/.npmrc`, content: "save-exact=true" });

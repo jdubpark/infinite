@@ -305,7 +305,10 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     settings: () => permissionAgentSettings(config),
     launcher: createCliTurnLauncher({ agents: config.agents, gate: turn => permissionTurnGate.hold?.(turn) ?? true, onUsage: usage => permissionMeasurements?.recordUsage(usage) }),
     results: permissionMeasurements,
-    facts: { protectedPaths: hostProtectedPaths(config, fileURLToPath(new URL("../../../", import.meta.url)), options.configFile ? [options.configFile] : []) },
+    facts: {
+      protectedPaths: hostProtectedPaths(config, fileURLToPath(new URL("../../../", import.meta.url)), options.configFile ? [options.configFile] : []),
+      releaseCommands: config.permissionAgent?.releaseCommands ?? [],
+    },
   };
   // The live core judges real paths. A replay core gets no resolver: it reads nothing from disk.
   const permissionCore = createPermissionAgentCore({ ...permissionCoreOptions, resolvePath: realHostPath });

@@ -10,6 +10,7 @@ import { Button } from "../../components/Button";
 import { Card, Chip, GlassButton, GroupHeader, LiveStatus, ProgressBar, Segmented, TopBar } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
 import { FloatingNotice } from "../../components/FloatingNotice";
+import { HaltBanner } from "../halt/HaltBanner";
 import type { StatusKind } from "../../status";
 import { theme } from "../../theme";
 import { DictationNotice } from "../../dictation/DictationControls";
@@ -189,6 +190,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
                     <Chip icon={<Avatar label={lead?.label ?? providerName(team.provider)} provider={lead?.provider ?? team.provider} size={16} />} label={lead?.label ?? providerName(team.provider)} accessibilityLabel={`Lead: ${lead?.label ?? providerName(team.provider)}`} />
           <LinearChip tracking={team.linear} fresh={fresh} />
         </View>
+        <HaltBanner connection={connection} place={{ projectIds: [team.projectId] }} />
         <Text style={s.workerStatus} numberOfLines={2}>{workerStatus(team)}</Text>
         <Text style={t.note}>The PM and coordinator adjust workers as work changes.</Text>
         {team.linear?.reason ? <Text style={t.warning}>{team.linear.reason}</Text> : null}

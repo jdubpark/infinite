@@ -4,6 +4,7 @@ import { useRouter } from "expo-router";
 import { api, connectionKey, type Board as BoardData, type Connection, type Me, type Mission, type ProjectGroupList } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { FloatingNotice } from "../../components/FloatingNotice";
+import { HaltBanner } from "../halt/HaltBanner";
 import { useKeyboardPadding } from "../../components/keyboard";
 import { Button } from "../../components/Button";
 import { Card, Chip, TopBar } from "../../components/Glass";
@@ -85,6 +86,7 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
           <Chip label={`Updated ${age(mission.updatedAt, now)}`} /><Chip label={`Rev ${mission.revision}`} /></View>
         {stopLine ? <Text style={stoppedAtLimit || timeLeft <= 0 ? t.warning : t.note}>{stopLine}</Text> : null}
         {missionShowsReason(mission) ? <Text style={mission.status === "blocked" ? t.error : t.warning}>{mission.reason}</Text> : null}
+        <HaltBanner connection={connection} place={{ projectIds: mission.repoProjectIds }} names={repoName} />
       </View>
 
       {decisions.length ? <Section title="Needs your input" count={decisions.length}>

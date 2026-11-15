@@ -5,6 +5,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { api, connectionKey, type ProjectGroup, type ProjectGroupList } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Glyph } from "../../components/Icon";
+import { HaltBanner } from "../../features/halt/HaltBanner";
 import { useSharedMachine } from "../../store/machines";
 import { theme } from "../../theme";
 
@@ -27,6 +28,7 @@ export default function UnderstandingIndex() {
       <Text style={s.subtitle}>{connection?.label || "Selected machine"} · work and system briefs.</Text>
     </View>
     <ScrollView contentContainerStyle={s.content} refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={poll.refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
+      {connection ? <HaltBanner key={key} connection={connection} place="screen" style={s.halt} /> : null}
       {!loaded || !connection || (poll.loading && !result) ? <ActivityIndicator style={s.loading} color={theme.colors.forest} /> : null}
       {visible.map(group => <Pressable key={group.id} accessibilityRole="button" accessibilityLabel={`Open brief for ${group.name}`} onPress={() => open(group)} style={({ pressed }) => [s.row, pressed && s.pressed]}>
         <View style={s.rowMain}>
@@ -69,4 +71,5 @@ const s = StyleSheet.create({
   hiddenHead: { minHeight: 44, flexDirection: "row", alignItems: "center", justifyContent: "space-between", borderBottomWidth: StyleSheet.hairlineWidth, borderColor: theme.colors.rule },
   hiddenTitle: { fontSize: 13, fontWeight: "600", color: theme.colors.secondaryInk },
   loading: { marginTop: 48 },
+  halt: { marginBottom: 6 },
 });

@@ -16,6 +16,7 @@ import { Button } from "../../components/Button";
 import { GlassButton, GroupHeader, LiveStatus, Segmented, Sheet, SheetRow } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
 import { FloatingNotice } from "../../components/FloatingNotice";
+import { HaltBanner } from "../halt/HaltBanner";
 import { age, SESSION_KIND, SESSION_LABELS, type StatusKind } from "../../status";
 import { theme } from "../../theme";
 import { goalGroup, pendingApprovals, ROLE_NAMES, teamGroup, type ProductGoal, type TeamView } from "../teams/model";
@@ -131,6 +132,7 @@ export function Inbox({
       <ScrollView contentContainerStyle={s.list} keyboardShouldPersistTaps="handled"
         refreshControl={<RefreshControl refreshing={refreshing || runs.refreshing} onRefresh={refreshAll} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
         <Text style={s.title} accessibilityRole="header">{shown === "teams" ? "Teams" : shown === "goals" ? "Goals" : "Sessions"}</Text>
+        <HaltBanner connection={connection} place="screen" names={id => data?.me.projects?.find(project => project.id === id)?.name} style={s.halt} />
         {shown === "teams" && data ? <TeamList connection={connection} me={data.me} teams={teams} sessions={all} now={now} />
           : shown === "goals" && data ? <GoalList connection={connection} me={data.me} goals={goals} now={now} /> : <>
             {all.length > 4 || query ? <View style={s.search}>
@@ -225,6 +227,7 @@ const s = StyleSheet.create({
   list: { paddingHorizontal: 16, paddingBottom: 120 },
   title: { fontSize: 28, lineHeight: 34, fontWeight: "700", color: theme.colors.ink, letterSpacing: -0.6, marginTop: 4 },
   summary: { fontSize: 13, color: theme.colors.mutedInk, marginTop: 2, marginBottom: 4 },
+  halt: { marginTop: 10 },
   search: { flexDirection: "row", alignItems: "center", gap: 8, height: 40, marginTop: 10, paddingHorizontal: 12, borderRadius: theme.radius.capsule, backgroundColor: theme.colors.secondarySurface },
   searchInput: { flex: 1, fontSize: 15, color: theme.colors.ink, paddingVertical: 0 },
   now: { flex: 1, fontSize: 13, lineHeight: 18, color: theme.colors.mutedInk },

@@ -52,6 +52,7 @@ import { ENTRY_KINDS } from "./evidence/entry-types.js";
 import { usagePlanSchema } from "./usage-api.js";
 import { TeamService, TeamError } from "./teams.js";
 import { objectiveRoutes } from "./objective-routes.js";
+import { routingRoutes } from "./routing-routes.js";
 import { spawnTeamBundle } from "./team-workspace.js";
 import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
 import { scorecardFromRows, type ProfileIdentityOf } from "./scorecard.js";
@@ -989,6 +990,7 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
   objectiveRoutes(app, { goals, teams }, requireRole(["owner", "controller", "viewer"]));
+  routingRoutes(app, { evidence, config: () => config }, requireRole(["owner", "controller", "viewer"]));
   app.get("/api/routines", (_req, res) => res.json({ routines: routines.list() }));
   app.get("/api/routines/:id", (req, res) => res.json(routines.get(id.parse(req.params.id))));
   app.post("/api/routines", requireRole(["owner"]), async (req, res) => res.json(await routines.create(createRoutineSchema.parse(req.body))));

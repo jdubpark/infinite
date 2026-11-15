@@ -180,6 +180,10 @@ function claudeHits(args: string[]): string[] {
   return hits;
 }
 
+// The value joined to a short option: `-sVALUE` or `-s=VALUE`. The Codex CLI drops one "=" after the option letter
+// (codex-cli 0.167.2 reads `-s=bogus` as the value `bogus`, parse-level probe).
+const attachedValue = (arg: string) => arg.slice(arg[2] === "=" ? 3 : 2);
+
 // Codex: an override, --sandbox, or -s is reported unless its value reads as exactly one of the allowed modes.
 // This is inverted on purpose. A hand-written reader cannot cover every TOML spelling, so an unusual but valid
 // spelling of an allowed mode can be reported too. That costs one warning line.
@@ -188,17 +192,17 @@ function codexHits(args: string[]): string[] {
   args.forEach((arg, index) => {
     // Hidden aliases are kept on purpose: --yolo is absent from codex --help but accepted by codex-cli 0.167.2 (parse-level probe).
     if (["--dangerously-bypass-approvals-and-sandbox", "--yolo"].includes(arg)) hits.push(arg);
-    // --sandbox MODE, --sandbox=MODE, -s MODE, -sMODE
+    // --sandbox MODE, --sandbox=MODE, -s MODE, -sMODE, -s=MODE
     let mode: string | undefined;
     if (arg === "--sandbox" || arg === "-s") mode = args[index + 1];
     else if (arg.startsWith("--sandbox=")) mode = arg.slice("--sandbox=".length);
-    else if (arg.startsWith("-s") && !arg.startsWith("--")) mode = arg.slice(2);
+    else if (arg.startsWith("-s") && !arg.startsWith("--")) mode = attachedValue(arg);
     if (mode !== undefined && !CODEX_SANDBOX_ALLOWED.has(mode)) hits.push(`--sandbox ${mode}`);
-    // -c KEY=VALUE, --config KEY=VALUE, --config=KEY=VALUE, -cKEY=VALUE
+    // -c KEY=VALUE, --config KEY=VALUE, --config=KEY=VALUE, -cKEY=VALUE, -c=KEY=VALUE
     let override: string | undefined;
     if (arg === "-c" || arg === "--config") override = args[index + 1];
     else if (arg.startsWith("--config=")) override = arg.slice("--config=".length);
-    else if (arg.startsWith("-c") && !arg.startsWith("--")) override = arg.slice(2);
+    else if (arg.startsWith("-c") && !arg.startsWith("--")) override = attachedValue(arg);
     const value = override === undefined ? undefined : sandboxModeOverride(override);
     if (value !== undefined && !CODEX_SANDBOX_ALLOWED.has(value)) hits.push(`-c sandbox_mode=${JSON.stringify(value)}`);
   });

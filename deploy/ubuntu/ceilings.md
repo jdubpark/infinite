@@ -113,7 +113,7 @@ Forbidden flags:
 
 The Codex rule is an allow-list, so it reports a value it does not read as exactly one of the two allowed modes. Doctor reads a TOML string value only in its basic, literal, and multi-line forms, and it does not parse comments. A valid but unusual spelling of an allowed mode, such as a value with a trailing comment, is therefore reported. That costs one warning line.
 
-A flag may take its value as the next argument, after `=`, or attached (`-sVALUE`, `-cKEY=VALUE`). The forms were checked against `codex-cli 0.167.2` and `claude` 2.1.325 help output and parse errors. Codex validates the `--sandbox` value at parse time. It does not validate the `-c` key, and whether it accepts a quoted key was not checked. The check reads the configured arguments only. It does not read a Codex profile or a configuration file that an argument names. It is a warning for the owner. The ceiling file is what clamps the mode.
+A flag may take its value as the next argument, after `=` (`--sandbox=VALUE`, `-s=VALUE`, `-c=KEY=VALUE`), or attached (`-sVALUE`, `-cKEY=VALUE`). The forms were checked against `codex-cli 0.167.2` and `claude` 2.1.325 help output and parse errors. Codex validates the `--sandbox` value at parse time. It does not validate the `-c` key, and whether it accepts a quoted key was not checked. The check reads the configured arguments only. It does not read a Codex profile or a configuration file that an argument names. It is a warning for the owner. The ceiling file is what clamps the mode.
 
 ## How the hash check works
 

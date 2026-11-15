@@ -198,11 +198,15 @@ test("codex sandbox values are reported unless they read as exactly read-only or
   assert.equal(forbiddenLaunchFlags("codex", ["-sdanger-full-access"]).length, 1);
   assert.equal(forbiddenLaunchFlags("codex", ['-csandbox_mode="danger-full-access"']).length, 1);
   assert.equal(forbiddenLaunchFlags("codex", ["--sandbox=bogus"]).length, 1);
+  // A short option joined to its value with "=": the CLI drops the "=".
+  assert.equal(forbiddenLaunchFlags("codex", ['-c=sandbox_mode="danger-full-access"']).length, 1);
+  assert.equal(forbiddenLaunchFlags("codex", ["-s=danger-full-access"]).length, 1);
   // A quoted key and a trailing comment are reported rather than missed.
   assert.equal(forbiddenLaunchFlags("codex", ["-c", '"sandbox_mode"="danger-full-access"']).length, 1);
   assert.equal(forbiddenLaunchFlags("codex", ["-c", 'sandbox_mode="read-only" # note']).length, 1);
   // Allowed values in each form stay clean.
   assert.deepEqual(forbiddenLaunchFlags("codex", ["-sworkspace-write", "-c", "sandbox_mode='read-only'", '--config=sandbox_mode="workspace-write"']), []);
+  assert.deepEqual(forbiddenLaunchFlags("codex", ["-s=workspace-write", "-c=sandbox_mode=read-only", "-c=model=gpt"]), []);
 });
 
 test("a configured bypass-permissions profile conflicts with the ceiling", () => {

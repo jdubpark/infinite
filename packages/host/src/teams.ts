@@ -770,6 +770,15 @@ export class TeamService {
   }
   /** Active host-level provider limits; new members of a limited provider launch on their fallback. */
   providerLimits() { return this.limits.active(); }
+  /**
+   * An owner action that can start work from this run first gives Linear a moment to confirm the run's issue, outside
+   * the queue: a finished run's passive view may carry an older confirmation than the action accepts.
+   */
+  private confirmed(id: string): Promise<void> {
+    const run = this.records.get(id)?.run;
+    if (!this.linear || !run || !(run.linearTracking || run.linear)) return Promise.resolve();
+    return this.linear.confirmTeam(id).then(() => undefined, () => undefined);
+  }
   private enqueue<T>(task: () => T | Promise<T>): Promise<T> {
     const next = this.serial.then(task); this.serial = next.catch(() => {}); return next;
   }
@@ -1754,7 +1763,7 @@ export class TeamService {
   }
   reconcileDelivery(id: string, input: TeamDeliveryReconcile) {
     const body: TeamDeliveryReconcile = teamDeliveryReconcileSchema.parse(input);
-    return this.enqueue(async () => {
+    return this.confirmed(id).then(() => this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
       if (this.replay(stored, "reconcile-delivery", body)) return this.view(stored);
       if (body.revision !== run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before reconciling delivery.");
@@ -1766,7 +1775,7 @@ export class TeamService {
       }
       if (run.linearTracking || run.linear) {
         const refreshed = this.linear?.updateTeam(run, run.linearTracking === true) ?? run.linear;
-        const tracking = this.linear?.getTeam(run.id) ?? refreshed;
+        const tracking = this.linear?.getTeam(run.id, true) ?? refreshed;
         if (tracking && run.linear !== tracking) { run.linear = tracking; this.save(stored); }
         if (!this.linear || tracking?.status !== "synced")
           throw new TeamError(409, "linear-reconciliation-required", "Linear has not confirmed the current issue and requirements. Refresh tracking before delivery reconciliation.");
@@ -1880,11 +1889,11 @@ export class TeamService {
         throw error;
       }
       return this.view(stored);
-    });
+    }));
   }
   reconcileVerification(id: string, input: VerificationMutation) {
     const body = teamVerificationReconcileSchema.parse(input);
-    return this.enqueue(async () => {
+    return this.confirmed(id).then(() => this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
       if (this.replay(stored, "reconcile-verification", body)) return this.view(stored);
       if (body.revision !== run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before reconciling verification.");
@@ -1892,7 +1901,7 @@ export class TeamService {
       if (run.workspaceRemovedAt || this.removingRuns.has(id)) throw workspaceRemovedError();
       if (run.linearTracking || run.linear) {
         const refreshed = this.linear?.updateTeam(run, run.linearTracking === true) ?? run.linear;
-        const tracking = this.linear?.getTeam(run.id) ?? refreshed;
+        const tracking = this.linear?.getTeam(run.id, true) ?? refreshed;
         if (tracking && run.linear !== tracking) { run.linear = tracking; this.save(stored); }
         if (!this.linear || tracking?.status !== "synced") throw new TeamError(409, "linear-reconciliation-required", "Linear has not confirmed the current issue and requirements. Refresh tracking before reconciling verification.");
       }
@@ -1939,7 +1948,7 @@ export class TeamService {
       this.event(stored, `An operator attested that processes for the interrupted check had stopped. The ${head} integration and earlier evidence are retained; fresh verification will use a new disposable workspace. Operator claim, not host-verified: ${JSON.stringify(body.attestation.text.slice(0, 500))}`);
       this.save(stored);
       return this.view(stored);
-    });
+    }));
   }
   inspectMemberRuntime(id: string, memberId: string) {
     const stored = this.record(id), run = stored.run;
@@ -2106,11 +2115,11 @@ export class TeamService {
     if (left.length) stored.unfencedAnswers = left; else delete stored.unfencedAnswers;
   }
   pause(id: string, input: Action, source?: ConnectorSource) { return this.action(id, "pause", { ...teamActionSchema.parse(input), ...(source ? { source } : {}) }); }
-  resume(id: string, input: Action, source?: ConnectorSource) { return this.action(id, "resume", { ...teamActionSchema.parse(input), ...(source ? { source } : {}) }); }
+  resume(id: string, input: Action, source?: ConnectorSource) { const body = { ...teamActionSchema.parse(input), ...(source ? { source } : {}) }; return this.confirmed(id).then(() => this.action(id, "resume", body)); }
   cancel(id: string, input: Action, source?: ConnectorSource) { return this.action(id, "cancel", { ...teamActionSchema.parse(input), ...(source ? { source } : {}) }); }
   continueRun(id: string, input: TeamContinue) {
     const body = teamContinueSchema.parse(input);
-    return this.enqueue(async () => {
+    return this.confirmed(id).then(() => this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
       if (this.replay(stored, "continue", body)) return this.view(stored);
       if (body.revision !== run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before sending this action.");
@@ -2118,7 +2127,7 @@ export class TeamService {
 
       if (run.linearTracking || run.linear) {
         const refreshed = this.linear?.updateTeam(run, run.linearTracking === true) ?? run.linear;
-        const tracking = this.linear?.getTeam(run.id) ?? refreshed;
+        const tracking = this.linear?.getTeam(run.id, true) ?? refreshed;
         if (tracking && run.linear !== tracking) { run.linear = tracking; this.save(stored); }
         if (!this.linear || tracking?.status !== "synced")
           throw new TeamError(409, "linear-reconciliation-required", "Linear has not confirmed the current issue and requirements. Refresh tracking before continuing this run.");
@@ -2173,7 +2182,7 @@ export class TeamService {
       Object.assign(stored, next);
       if (!("objectiveNotice" in next)) delete stored.objectiveNotice;
       return this.view(stored);
-    });
+    }));
   }
   private async resumeVerificationRecovery(stored: Stored, body: Action & { source?: ConnectorSource }, recovery: NonNullable<Stored["verificationRecovery"]>) {
     const run = stored.run;
@@ -2241,6 +2250,10 @@ export class TeamService {
     return this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
       if (this.replay(stored, action, body)) return this.view(stored);
+      if (action === "resume" && (run.linearTracking || run.linear)) {
+        const tracking = this.linear?.getTeam(run.id, true) ?? run.linear;
+        if (tracking && JSON.stringify(run.linear) !== JSON.stringify(tracking)) { run.linear = tracking; this.save(stored); }
+      }
       if (action === "pause" && (["ready-for-review", "merged", "no-change"].includes(run.status) || run.status === "blocked" && !run.workspaceRemovedAt)) throw new TeamError(409, "team-not-running", "This team is not running and cannot be paused.");
       const verificationRecovery = action === "resume" && validVerificationRecovery(stored) ? stored.verificationRecovery : undefined;
       if (action === "resume") { const refusal = this.resumeRefusal(stored, verificationRecovery); if (refusal) throw refusal; }

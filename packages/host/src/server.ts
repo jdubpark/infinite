@@ -863,6 +863,8 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   app.use("/api/usage", (_req, res, next) => usage.available() ? next() : void res.status(503).json(usageUnavailable));
   app.get("/api/usage", (_req, res) => res.json(usage.summary()));
   app.get("/api/evidence/status", (_req, res) => res.json(evidence.describe()));
+  // Linear's last rate-limit headers and this host's request count: numbers and operation names only.
+  app.get("/api/linear/status", (_req, res) => res.json(linear.status()));
   app.get("/api/fuse", (_req, res) => res.json(fuse.view()));
   app.get("/api/egress", requireRole(["owner"]), (req, res) => {
     const project = req.query.project;

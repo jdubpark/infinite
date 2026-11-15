@@ -1239,6 +1239,27 @@ reachable. The issue's workflow state stays separate from local execution state,
 agent review, and product outcome assessments. Infinite does not automatically
 change that state or mark an issue Done when checks pass.
 
+A live run or goal, and a finished run its live goal still names as active,
+must be confirmed within 30 seconds, and the host re-reads them on that cadence.
+A finished item only informs the pages, so a page view accepts a confirmation up
+to 10 minutes old before it asks for a new read. Continue, Resume, and delivery
+or verification reconciliation still require a confirmation under 30 seconds
+old before they act. A blocked run keeps the 30-second rule for page views,
+because the host can restart it by itself. Each read asks Linear for only the
+issues it names, and a read that is due also refreshes issues past half their
+window, so records expire together.
+
+Linear limits each user's requests and query complexity per hour. When Linear
+answers with a rate limit, the host pauses every Linear request until Linear's
+`Retry-After` time, or else until the reset of the limit Linear reports as
+spent. After five minutes at most, one request tries again. While the pause
+lasts, each waiting run and goal shows the reason with the retry time, and its
+tracking view carries `retryAt`. The service journal records one line with the
+remaining requests and complexity that Linear reported. `GET /api/linear/status`
+reports the last rate-limit headers, any current pause, and the requests and
+complexity this host sent in the last hour. It carries no credential and no
+issue content.
+
 When a tracked run becomes blocked, its status comment records the reason and
 the next step, and the issue gets a `Blocked` label. The host uses the team's
 own `Blocked` label, or a workspace label of that name, and creates one in the

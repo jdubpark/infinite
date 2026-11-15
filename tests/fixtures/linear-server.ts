@@ -16,6 +16,7 @@ export async function startLinearServer() {
   const issues = new Map<string, FixtureIssue>(), comments = new Map<string, FixtureComment>();
   const labels = new Map<string, { id: string; name: string; team: { id: string } | null }>(), issueLabels = new Map<string, Set<string>>();
   let failLabels = false, rateLimitLabels = false, rateLimitLabelChanges = false;
+  let extraHeaders: Record<string, string> = {}, limitedReads: Record<string, string> | undefined;
   const calls: { operation: string; variables: Record<string, any> }[] = [];
   const lostResponses: { operation: WriteOperation; id: string }[] = [];
   const violations: string[] = [];
@@ -34,7 +35,7 @@ export async function startLinearServer() {
   };
   const server = createServer(async (request, response) => {
     const reply = (status: number, data: unknown) => {
-      response.writeHead(status, { "Content-Type": "application/json" }).end(JSON.stringify(data));
+      response.writeHead(status, { ...extraHeaders, "Content-Type": "application/json" }).end(JSON.stringify(data));
     };
     if (request.method !== "POST" || request.url !== "/graphql") { reply(404, {}); return; }
     if (request.headers.authorization !== apiKey) { violations.push("Invalid API key header"); reply(401, {}); return; }
@@ -54,6 +55,7 @@ export async function startLinearServer() {
         case "InfiniteLinearIssues": {
           const ids = variables.filter?.id?.in;
           if (!Array.isArray(ids)) throw new Error("Issue reconciliation requires canonical IDs");
+          if (limitedReads) { response.writeHead(429, { ...limitedReads, "Content-Type": "application/json" }).end(JSON.stringify({ errors: [{ message: "Rate limited", extensions: { code: "RATELIMITED" } }] })); return; }
           data = { issues: { nodes: ids.flatMap(id => issues.has(id) ? [issues.get(id)] : []),
             pageInfo: { hasNextPage: false, endCursor: null } } };
           break;
@@ -134,6 +136,10 @@ export async function startLinearServer() {
     failLabelLookups(value: boolean) { failLabels = value; },
     rateLimitLabelLookups(value: boolean) { rateLimitLabels = value; },
     rateLimitLabelChanges(value: boolean) { rateLimitLabelChanges = value; },
+    /** Headers sent with every answer, such as Linear's rate-limit headers. */
+    responseHeaders(headers: Record<string, string>) { extraHeaders = headers; },
+    /** Answers issue reads with a 429 carrying these headers until called with undefined. */
+    rateLimitReads(headers: Record<string, string> | undefined) { limitedReads = headers; },
     dropNextResponse(operation: WriteOperation, bodyIncludes?: string) { drop = { operation, bodyIncludes }; },
     restore() { unavailable = false; },
     editIssue(id: string, changes: IssueEdit) {

@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { initialAttention } from "@infinite/attention";
 import type { Blackboard } from "../../packages/host/src/evidence/blackboard.js";
 import type { EventOutbox } from "../../packages/host/src/evidence/outbox.js";
+import type { LinearService } from "../../packages/host/src/linear.js";
 import type { Manager } from "../../packages/host/src/manager.js";
 import type { Config, WorkerState } from "../../packages/host/src/types.js";
 import type { TeamAssignment, TeamModelProfile, TeamReportEnvelope, TeamRun } from "../../packages/host/src/team-types.js";
@@ -121,8 +122,9 @@ export function schedulerFixture() {
       return () => { rmdirSync(file); renameSync(backup, file); };
     },
     writeTeam: (extra: object = {}) => writeRecord("team", id, { run, prepared: true, fingerprint: "fixture", receipts: {}, ...extra }),
-    openTeam: (options?: { events?: EventOutbox; entries?: Blackboard }) => {
-      const service = new TeamService(config, key, manager as unknown as Manager, (_project, start) => start(), undefined, undefined, options);
+    openTeam: (options?: { events?: EventOutbox; entries?: Blackboard; linear?: LinearService }) => {
+      const { linear, ...serviceOptions } = options ?? {};
+      const service = new TeamService(config, key, manager as unknown as Manager, (_project, start) => start(), linear, undefined, options ? serviceOptions : undefined);
       services.push(service); return service;
     },
     close: () => { for (const service of services) service.close(); rmSync(root, { recursive: true, force: true }); },

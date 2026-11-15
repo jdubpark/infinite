@@ -344,6 +344,10 @@ test("remote access rejects wrong keys, revoked keys, privileged paths and exces
     // The phone extends a mission's time limit over this channel. It is a POST only.
     assert.deepEqual(await client.request(`/missions/${missionId}/extend`, { body: {} }), { count: 20, method: "POST", path: `/api/missions/${missionId}/extend` });
     await assert.rejects(client.request(`/missions/${missionId}/extend`, { method: "GET" }), (error: RemoteError) => error.status === 403);
+    // The clients' halt banner reads the halt over this channel; engaging and releasing do not travel it.
+    assert.deepEqual(await client.request("/halt"), { count: 21, method: "GET", path: "/api/halt" });
+    for (const [method, path] of [["POST", "/halt"], ["POST", "/halt/release"], ["GET", "/halt/release"]] as const)
+      await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
     runner.oversized();
     await assert.rejects(client.request("/me"), (error: RemoteError) => error.status === 413 && error.code === "response-too-large");
     const beforeRevoke = runner.requests.length;

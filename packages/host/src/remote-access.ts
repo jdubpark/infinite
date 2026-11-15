@@ -34,6 +34,8 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   if (method === "GET" && ["/api/permissions/log", "/api/permissions/candidates"].includes(url.pathname)) return true;
   if (method === "GET" && /^\/api\/permissions\/decisions\/[A-Za-z0-9_.:-]{1,200}$/.test(url.pathname)) return true;
   if (method === "POST" && url.pathname === "/api/permissions/marks") return true;
+  // The owner's halt banner. Reading is open to every paired role; engaging and releasing stay off this channel.
+  if (method === "GET" && url.pathname === "/api/halt") return true;
   // The phone's cost screen; the host still enforces each route's role.
   if (method === "GET" && ["/api/usage", "/api/usage/daily", "/api/usage/models", "/api/usage/projects"].includes(url.pathname)) return true;
   if (method === "GET" && /^\/api\/usage\/projects\/[a-z0-9-]{1,80}$/.test(url.pathname)) return true;

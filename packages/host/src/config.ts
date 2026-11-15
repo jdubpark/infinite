@@ -195,6 +195,9 @@ export function validateIntakeConfig(config: Config): void {
   const slack = intake.slack;
   // Without admission and without direct requests nothing could ever start a mission.
   if (intake.linear.admitIssues === false && !slack?.directRequests) throw new Error("admitIssues false needs intake.slack.directRequests");
+  if (slack?.answerQuestions && !slack.directRequests) throw new Error("answerQuestions needs intake.slack.directRequests");
+  if (slack?.classify && !slack.answerQuestions) throw new Error("classify needs intake.slack.answerQuestions");
+  if (slack?.classify && !config.jev) throw new Error("classify needs the jev block");
   if (slack) {
     if (intake.requireSlackThread && intake.linear.admitIssues !== false && !slack.linearAgentUserId) throw new Error("requireSlackThread needs intake.slack.linearAgentUserId");
     if (slack.bindByMention && intake.requireSlackThread) throw new Error("bindByMention cannot be used with requireSlackThread");

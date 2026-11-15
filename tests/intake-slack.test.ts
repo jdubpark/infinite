@@ -1276,3 +1276,149 @@ test("a redelivered earlier reply never files a follow-up once its record has fi
     assert.deepEqual(s.texts(), before, "Nothing is posted");
   } finally { await close(); }
 });
+
+// Answer records (INF-238)
+
+const ANSWER_START = "Answering this from the repositories, read-only. No issue was filed.";
+const ANSWER_FOOTER = 'No issue was filed. To start work, mention me with the change you want, or begin with "work:".';
+const answerOrigin = (issueId: string): MissionOrigin => ({ kind: "intake", issueId, identifier: "", url: "", rule: "owner Slack mention of the bot (question)" });
+const answerDirect = { eventId: "EvAsk", ts: "1700000000.000100", text: "which exports failed?", filedAt: NOW, route: { kind: "answer" as const, by: "owner" as const, at: NOW } };
+
+/** A scripted surface with one running answer mission whose record is bound to the thread; direct requests are stubbed. */
+async function answerSurface(state: IntakeRecord["state"] = "started") {
+  const sh = scripted();
+  const stateRoot = mkdtempSync(join(tmpdir(), "intake-answer-"));
+  const calls: Parameters<DirectRequest>[0][] = [];
+  const s = await surfaceFor({ missions: sh.missions as unknown as MissionService, teams: sh.teams as unknown as TeamService }, stateRoot,
+    { directRequests: true, direct: () => input => { calls.push(input); return "accepted"; } });
+  const mission = await sh.missions.create({ requestId: randomUUID(), groupId: "shop", objective: "Question asked from Slack: which exports failed?", mode: "answer", maxSubtasks: 1, maxMinutes: 30 }, undefined, answerOrigin(ISSUE));
+  s.store.create(intakeRecord(ISSUE, state, { identifier: "", url: "", title: "which exports failed?", thread: BINDING, missionId: mission.id, direct: answerDirect }));
+  return { sh, s, calls, id: mission.id, close: async () => { s.surface.close(); await s.slack.close(); sh.close(); rmSync(stateRoot, { recursive: true, force: true }); } };
+}
+const noIssueTraces = (texts: string[]) => {
+  for (const text of texts) {
+    assert.ok(!text.includes("()") && !/linear\.|https?:\/\/\S*issue/i.test(text) && !text.includes("TEST-") && !text.includes('""'), text);
+  }
+};
+
+test("an answer's start message and footer are the exact texts, with no issue identifier or link", { timeout: 90000 }, async () => {
+  const { sh, s, id, close } = await answerSurface();
+  try {
+    await s.surface.start();
+    await waitFor(async () => s.texts(), list => list.length >= 1);
+    await delay(300);
+    assert.deepEqual(s.texts(), [ANSWER_START]);
+    await sh.report(1, { kind: "result", summary: "Rows 14 and 90 were empty." });
+    await waitFor(async () => sh.missions.peek(id)?.status, status => status === "ready-for-review", 60000);
+    await waitFor(async () => s.texts(), list => list.length === 2, 30000);
+    assert.equal(s.texts()[1], `Answer (agent report):\nRows 14 and 90 were empty.\n\n${ANSWER_FOOTER}`);
+    noIssueTraces(s.texts());
+  } finally { await close(); }
+});
+
+test("status and cancel work on a running answer, and a held answer names the question", { timeout: 90000 }, async () => {
+  const { sh, s, id, close } = await answerSurface();
+  try {
+    await s.surface.start(); await s.connected();
+    await waitFor(async () => s.texts(), list => list.length === 1);
+    await s.slack.emit(mention("status"));
+    await waitFor(async () => s.texts(), list => list.length === 2);
+    assert.match(s.texts()[1], /^(planning|working)$/);
+    await s.slack.emit(mention("cancel"));
+    await waitFor(async () => sh.missions.peek(id)?.status, status => status === "cancelled", 60000);
+    await waitFor(async () => s.texts(), list => list.some(text => text.startsWith("Cancelled: ")), 30000);
+    assert.ok(s.texts().includes(`Cancelled: ${CANCEL_REASON}\nMention me in this thread to file a follow-up.`));
+    noIssueTraces(s.texts());
+  } finally { await close(); }
+});
+
+test("a queued answer that could not start is acknowledged as your question, and a work route chosen by a reading says how to ask", { timeout: 60000 }, async () => {
+  const h = harness(); const services = h.open(); const s = await surfaceFor(services, h.root, { directRequests: true, direct: () => () => "accepted" });
+  try {
+    s.store.create(intakeRecord(ISSUE, "queued", { identifier: "", url: "", title: "which exports failed?", thread: BINDING, direct: answerDirect, holdReason: "The project is busy." }));
+    const other = randomUUID();
+    const { id } = await services.missions.create(h.create(), undefined, origin(other));
+    s.store.create(intakeRecord(other, "started", { thread: OTHER, missionId: id, direct: { eventId: "EvW", ts: "1700000000.000200", text: "x", filedAt: NOW, route: { kind: "work", by: "model", confidence: 0.7, at: NOW } } }));
+    await s.surface.start();
+    await waitFor(async () => s.texts(), list => list.length === 1);
+    assert.equal(s.texts()[0], 'Received your question "which exports failed?". It has not started: The project is busy.\nI\'ll post questions and the result here once it starts.');
+    await waitFor(async () => s.texts(OTHER), list => list.length === 1);
+    assert.match(s.texts(OTHER)[0], /^Started on TEST-1 [\s\S]*\nI took this as a request for a change\. If you only wanted an answer, reply with a mention and "cancel", then mention me again starting with "ask:"\.$/);
+  } finally { await s.close(); await h.close(); }
+});
+
+test("a mention in a thread whose answer has finished is routed again, and a colon or comma alone does not name the answer", { timeout: 90000 }, async () => {
+  const { sh, s, calls, id, close } = await answerSurface();
+  try {
+    await s.surface.start(); await s.connected();
+    await sh.report(1, { kind: "result", summary: "Rows 14 and 90 were empty." });
+    await waitFor(async () => sh.missions.peek(id)?.status, status => status === "ready-for-review", 60000);
+    s.store.update(ISSUE, record => { record.state = "finished"; });
+    const event = mention("ask: and what about Tuesday?");
+    await s.slack.emit(event, { eventId: "EvAgain" });
+    await waitFor(async () => calls, list => list.length === 1);
+    assert.deepEqual(calls[0], { thread: BINDING, ts: event.ts, eventId: "EvAgain", text: "ask: and what about Tuesday?" });
+    assert.equal(s.store.get(ISSUE)!.inbound.length, 0, "The new question is a new record, not an inbound entry of the old one");
+  } finally { await close(); }
+});
+
+test("with two open records one of them an answer, the ambiguity reply names the question instead of an empty identifier", { timeout: 90000 }, async () => {
+  const { sh, s, close, id: answerId } = await answerSurface();
+  try {
+    const other = randomUUID();
+    const { id } = await sh.missions.create({ requestId: randomUUID(), groupId: "shop", objective: "Change the API and the web client", maxSubtasks: 8, maxMinutes: 30 }, undefined, origin(other));
+    const otherMissionId = id;
+    s.store.create(intakeRecord(other, "started", { thread: BINDING, missionId: id }));
+    await s.surface.start(); await s.connected();
+    await waitFor(async () => s.texts(), list => list.length === 2);
+    await s.slack.emit(mention("go on"));
+    await waitFor(async () => s.texts(), list => list.length === 3);
+    assert.match(s.texts()[2], /^More than one request is open in this thread: .*\. Start your reply with an identifier, "answer", or a question number\.$/);
+    assert.ok(s.texts()[2].includes('answer (your question "which exports failed?")') && s.texts()[2].includes("TEST-1"));
+    assert.ok(!s.texts()[2].includes(", ,") && !s.texts()[2].includes(": ,"), "No empty identifier is listed");
+    await s.slack.emit(mention("answer status"));
+    await waitFor(async () => s.texts(), list => list.length === 4);
+    assert.match(s.texts()[3], /^(planning|working)$/);
+    await s.slack.emit(mention("Answer: cancel"));
+    await waitFor(async () => sh.missions.peek(answerId)?.status, status => status === "cancelled", 60000);
+    assert.notEqual(sh.missions.peek(otherMissionId)?.status, "cancelled", "The other request's mission is untouched");
+  } finally { await close(); }
+});
+
+test("a held answer announces its start once, and queued work keeps the ask hint through its start", { timeout: 90000 }, async () => {
+  const h = harness(); const services = h.open(); const s = await surfaceFor(services, h.root, { directRequests: true, direct: () => () => "accepted" });
+  try {
+    s.store.create(intakeRecord(ISSUE, "queued", { identifier: "", url: "", title: "which exports failed?", thread: BINDING, direct: answerDirect, holdReason: "The project is busy." }));
+    const work = randomUUID();
+    s.store.create(intakeRecord(work, "queued", { thread: OTHER, holdReason: "max-active", direct: { eventId: "EvW", ts: "1700000000.000200", text: "x", filedAt: NOW, route: { kind: "work", by: "default", at: NOW } } }));
+    await s.surface.start();
+    await waitFor(async () => [s.texts().length, s.texts(OTHER).length], counts => counts[0] === 1 && counts[1] === 1);
+    const { id } = await services.missions.create({ requestId: randomUUID(), groupId: "shop", objective: "Question asked from Slack: q", mode: "answer", maxSubtasks: 1, maxMinutes: 30 }, undefined, answerOrigin(ISSUE));
+    s.store.update(ISSUE, record => { record.state = "started"; record.missionId = id; delete record.holdReason; });
+    const other = await services.missions.create(h.create(), undefined, origin(work));
+    s.store.update(work, record => { record.state = "started"; record.missionId = other.id; delete record.holdReason; });
+    await waitFor(async () => [s.texts().length, s.texts(OTHER).length], counts => counts[0] === 2 && counts[1] === 2);
+    // A further change to each record composes again and must add nothing.
+    s.store.update(ISSUE, record => { record.updatedAt = new Date().toISOString(); });
+    s.store.update(work, record => { record.updatedAt = new Date().toISOString(); });
+    await delay(400);
+    assert.deepEqual(s.texts().map(text => text === ANSWER_START), [false, true]);
+    assert.equal(s.texts().filter(text => text === ANSWER_START).length, 1);
+    const hint = 'If you only wanted an answer, reply with a mention and "cancel" once it starts, then mention me again starting with "ask:".';
+    assert.equal(s.texts(OTHER).length, 2);
+    assert.equal(s.texts(OTHER).filter(text => text.includes(hint)).length, 1, "The hint reaches the owner exactly once");
+    assert.ok(s.texts(OTHER)[0].startsWith("Queued ") && s.texts(OTHER)[0].includes(hint));
+  } finally { await s.close(); await h.close(); }
+});
+
+test("with a single unfinished record the word answer is ordinary text, not a selector", { timeout: 90000 }, async () => {
+  const { s, close } = await answerSurface();
+  try {
+    await s.surface.start(); await s.connected();
+    await waitFor(async () => s.texts(), list => list.length === 1);
+    await s.slack.emit(mention("answer status"));
+    await waitFor(async () => s.store.get(ISSUE)!.inbound[0]?.outcome, outcome => outcome !== undefined, 30000);
+    assert.equal(s.store.get(ISSUE)!.inbound[0].outcome, "steered");
+    assert.equal(s.texts().length, 1, "It was steering text, so it drew no status reply");
+  } finally { await close(); }
+});

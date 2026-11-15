@@ -228,7 +228,7 @@ Use encrypted off-host backups with restore testing. Keep the backup decryption 
 - Signal payloads can contain commands and file contents. They are journaled encrypted like the rest of the recording and shown only to paired roles.
 - Transcript bytes reach the worker only through the authenticated hook relay, which runs as the agent and reads only a regular `.jsonl` file the provider's own hook named, and for Claude Code the subagent transcript files in that session's `subagents` folder, for their usage only. After a provider exits, the same relay runs once more in drain mode; on the Ubuntu deployment that runs through the root-owned `transcript-drain` wrapper, which takes no arguments, and the worker's authenticated reply names the file. The path checks do not change for the drain. These path checks prevent accidental reads. They are not a boundary against the agent's own account, which can read the same files. The worker records them as `message` events in the encrypted journal, so chat carries the same plaintext the provider already stores in its home. On the Linux deployment the hook variables must be in sudo's `env_keep`, or hooks and transcripts never leave the agent account.
 - The process census looks for processes left by an earlier API process after a restart. The host reads the process table itself and inspects processes of its own account. On the Ubuntu deployment it inspects the agent account through the root-owned `process-census` wrapper, which takes no arguments, takes its directory on standard input, and reads the working directories, open files and command lines of that account's processes. It reports only process ids and a reason, and it never signals, stops or changes a process. Its output crosses an account boundary and is validated before use. A process that refuses inspection is reported as such, and the host then says it cannot tell. The census is evidence about left-over processes; it is not a defense against a process of the agent account that hides on purpose or interferes with the census.
-- Chat summaries send recorded messages to the configured external model (`summaries`). With `jev` configured, the host can also send candidate sentences from an agent's last message and the clipped first line of a long default-titled prompt to TypeSafe; the summary writer's provider receives that prompt only when Jev finds its clipped first line unclear. A team run's long untitled request is handled the same way, except that local paths and file URLs are removed before either model sees it and, with no `jev` configured, the request goes to the summary writer directly. Configure `jev` with an absolute `apiKeyFile` to a private 0600 file outside the state directory, and optional `model` (default `jev-latest`) and `baseUrl` (default TypeSafe API URL). The summary writer's key file follows the same private-file rule. Provider retention policies remain separate boundaries. With no `jev` key configured, no TypeSafe calls occur.
+- Chat summaries send recorded messages to the configured external model (`summaries`). With `jev` configured, the host can also send candidate sentences from an agent's last message and the clipped first line of a long default-titled prompt to TypeSafe; the summary writer's provider receives that prompt only when Jev finds its clipped first line unclear. A team run's long untitled request is handled the same way, except that local paths and file URLs are removed before either model sees it and, with no `jev` configured, the request goes to the summary writer directly. Configure `jev` with an absolute `apiKeyFile` to a private 0600 file outside the state directory, and optional `model` (default `jev-latest`) and `baseUrl` (default TypeSafe API URL). The summary writer's key file follows the same private-file rule. Provider retention policies remain separate boundaries. With no `jev` key configured, no TypeSafe calls occur. With `intake.slack.classify` on, the host also sends the owner's own Slack mention text, cut to 1,000 characters, to TypeSafe so the reading can choose between an answer and a request; nothing else from the thread, and no text from anyone else, is sent.
 - Speech recognition runs in the platform's recognizer (Apple, Google, or the browser vendor), which may process audio on its own servers. With `dictation` configured, the transcript text goes to that model with `store: false`. Leave the block unset to send no transcripts to a model; clients then insert raw transcripts.
 - Confidential VMs can narrow provider/hypervisor threats, but they do not protect against compromised software inside the trusted guest. Attestation and external key release would be a separate security project, not a box to check on this service. [Confidential VM model](https://docs.cloud.google.com/confidential-computing/confidential-vm/docs/about-cvm).
 
@@ -339,6 +339,47 @@ description. The
 coordinator is told that only the owner's words are instructions and that anything
 read through a connector is information. That is a prompt boundary, not a
 guarantee, and it does not stop an injected request from the owner's own account.
+
+### Answers and the route
+
+With `intake.slack.answerQuestions` on, the first host action for an owner's mention
+can be chosen by a model reading. The bounds:
+
+- The owner's word wins. A mention that starts with `ask:` or `work:` takes that route
+  and the reading is never asked.
+- Eligibility is fixed when the mention is saved. Only a record saved with
+  `answerQuestions` on is routed or read by the reading service; a request saved
+  before the setting was on stays work, including one whose Linear filing is
+  pending, so reconciliation of an issue Linear may already hold is never
+  replaced by an answer.
+- The default is work. A reading counts as `work` only at confidence 0.6 or higher,
+  and a missing, failed, or slow (over six seconds) reading routes to work, which is
+  the route that already existed. A reading can send a request to the answer route
+  only when it is confident of an answer or unsure.
+- The only text sent to the reading service is the owner's own mention text, cut to
+  1,000 characters, and only with `intake.slack.classify` on. Thread messages, other
+  people's text, and bot text are never sent. The call is made in the intake cycle,
+  not in the Slack event handler.
+- The host never infers completion. An answer exists only because the coordinator
+  reported a `result` through its report tool; it is posted in the thread labelled as
+  an agent report.
+
+The answer coordinator's read-only limit is its provider tool flags and the
+mission's refusal of a dispatch, not a sandbox. It runs as the agent account and can
+read every repository of the project group, including files an unrelated question
+did not need. Its answer goes only to the Slack thread; the host makes no Linear
+request for it, and it opens no branch or pull request because it cannot start a
+subteam. Anyone who can post in the thread can put words in front of it, as for a
+request, and the prompt boundary is the same: only the owner's words are
+instructions.
+
+A wrong route costs differently in each direction. A change request routed to an
+answer gets an answer and no change, and its reply says how to ask again (`work:`).
+A question routed to work files a Linear issue and starts a mission that may open a
+pull request, and its acknowledgement says how to ask instead (`ask:`); the owner can
+cancel it. That asymmetry is why an unsure reading goes to the answer route, which changes
+nothing, and why an explicit word always wins. With no reading at all the route is
+work, because that is the behavior the owner already had.
 
 ## Dependency audit
 

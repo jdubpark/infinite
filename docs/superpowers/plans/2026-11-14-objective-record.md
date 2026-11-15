@@ -495,6 +495,7 @@ export function objectiveRoutes(app: express.Express,
 - Owner corrections (`POST /api/goals/:id/record`, `POST /api/teams/:id/record`), owner `criteria` at creation, the command-membership and blob-recording rules, and the CLI verbs `confirm`, `retire`, `set-assumption`, and `answer`: step 2.
 - The record digest in `TeamGoalContext`, in prompts, and in the context file, and the `evaluators` lineup slot: step 2.
 - The evidence store module `objective`, with `objective_log` and `objective_values`, and the outbox that feeds them: with the first write that can pass 400 entries or log a value above 2 KiB that the record does not hold.
+- A log that keeps only its newest entries. Record rule 9 needs a log entry for every steering direction, so the slice that first truncates the log must relax that rule to the directions the log still covers. Otherwise this host cannot read a truncated record after a rollback.
 - Decision answers as record changes: step 3, for the intent check's questions.
 - `infinite team record`, every web, phone, and Mac screen, and relay access.
 - Records for mission subteams and for missions (left open by the design).

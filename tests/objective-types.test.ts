@@ -337,4 +337,6 @@ test("a record's direction history agrees with its directions", () => {
     [r.log[1], r.log[2]] = [{ ...r.log[2], seq: r.log[1].seq, version: r.log[1].version }, { ...r.log[1], seq: r.log[2].seq, version: r.log[2].version }];
   })), "swapped entries fail");
   assert.ok(!parses(history(r => { r.log[1].after.digest = "0".repeat(64); }, large)), "a reference with a wrong digest fails");
+  assert.ok(!parses(history(r => { r.log[2].version = r.log[1].version; r.version = r.log[1].version; })), "two direction entries at one version fail");
+  assert.ok(!parses(history(r => { r.log[1].version = 1; })), "a direction entry at version 1 fails");
 });

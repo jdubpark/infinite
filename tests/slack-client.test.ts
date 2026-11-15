@@ -189,3 +189,9 @@ test("tokens are read from their files on every call", async t => {
   assert.equal(first?.startsWith("xoxb-"), true);
   assert.equal(slack.calls.at(-1)?.token, "xoxb-rotated-token");
 });
+
+test("permalink returns the message's link and sends the channel and message timestamp", async t => {
+  const { slack, client } = await setup();
+  t.after(() => slack.close());
+  assert.equal(await client.permalink(binding, "1700000100.000001"), "https://example.slack.com/archives/C0000000000/p1700000100000001");
+});

@@ -367,8 +367,8 @@ Delivery never gates a mission. An outage of Slack or Linear pauses nothing.
 ## Linear comments
 
 Intake writes two comments on the Linear issue, both labelled as agent reports.
-They begin with `Infinite` by default; set `linear.reportName` (1 to 40 letters,
-digits, spaces, dots, underscores, or hyphens) to use another name:
+They begin with `Infinite` by default; set `linear.reportName` (1 to 40 characters: a letter first, then letters,
+digits, spaces, dots, or hyphens) to use another name:
 
 1. When the mission starts: `Infinite agent report: a mission started on this issue. Questions and the result will follow.`
 2. When the mission ends: `Infinite agent report: ready for review.` with the

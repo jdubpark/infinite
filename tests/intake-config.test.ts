@@ -100,7 +100,8 @@ test("answering questions needs direct requests, and classifying needs both answ
 test("linear.reportName defaults to Infinite, accepts a plain name, and rejects Markdown, newlines, and long values", () => {
   assert.equal(parsed({}).linear!.reportName, "Infinite");
   assert.equal(parsed({}, { linear: { apiKeyFile: privateFile("linear-key"), reportName: "Northwind" } }).linear!.reportName, "Northwind");
-  for (const reportName of ["[x](y)", "North\nwind", "", "a".repeat(41)])
+  assert.equal(parsed({}, { linear: { apiKeyFile: privateFile("linear-key"), reportName: "Northwind Co. - East" } }).linear!.reportName, "Northwind Co. - East");
+  for (const reportName of ["[x](y)", "North\nwind", "", "a".repeat(41), "North _wind_", "1. Northwind", "_Northwind", "9Lives"])
     assert.throws(() => parsed({}, { linear: { apiKeyFile: privateFile("linear-key"), reportName } }), undefined, JSON.stringify(reportName));
 });
 test("jev.sessionReadings defaults to true and accepts false", () => {

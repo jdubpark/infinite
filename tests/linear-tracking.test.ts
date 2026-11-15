@@ -227,8 +227,7 @@ test("goal and feature comments begin with the configured report name", { timeou
   try {
     const created = await host.fetchApi("/goals", "owner", { requestId: randomUUID(), projectId: "rehearsal", title: "Review progress", objective: "Review the progress fixture", successCriteria: "Record whether more work is justified", allowedPaths: ["features"], maxMinutes: 5 });
     assert.equal(created.status, 200, JSON.stringify(created.body));
-    const comment = await waitFor(async () => [...linear.comments.values()].find(item => /execution\n/.test(item.body)), Boolean, 60000);
-    assert.match(comment.body, /^Northwind (goal|feature) execution\n/);
+    await waitFor(async () => [...linear.comments.values()].map(item => item.body), bodies => bodies.some(body => body.startsWith("Northwind goal execution\n")) && bodies.some(body => body.startsWith("Northwind feature execution\n")), 60000);
     assert.ok([...linear.comments.values()].every(item => !/^Infinite (goal|feature) execution/.test(item.body)));
   } finally {
     await host.stop(); await linear.close(); rmSync(root, { recursive: true, force: true });

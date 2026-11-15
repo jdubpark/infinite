@@ -13,7 +13,7 @@ import { canonicalJson } from "./evidence/crypto.js";
 import { MAX_SHELL_DEPTH, quoteWord, readShell, remoteOperand, resolveWord, type PathResolver, type SimpleCommand } from "./permission-shell.js";
 
 /** Bumped by any change to the rule code below, or to the shell reading it uses, that is not a change to the lists. */
-export const CLASS_RULES_VERSION = 5;
+export const CLASS_RULES_VERSION = 6;
 
 /**
  * The host's lists. Commands are word prefixes after wrappers (sudo, env, timeout) are removed; option
@@ -577,15 +577,18 @@ const GLOBAL_INSTALL: ReadonlyArray<(command: SimpleCommand) => boolean> = [
 export const EMBEDDED_COMMAND_LIMITS = { words: 64, length: 4_000, readings: 256, layers: 2 } as const;
 /** Commands that never run an argument. Their arguments are not searched. */
 const NEVER_RUN = new Set(["echo", "printf", "grep", "egrep", "fgrep", "cat", "head", "tail", "wc"]);
+/** Opaque reasons that mean a candidate runs code the host does not read. */
+const RUNS_UNREAD_CODE = new Set(["inline-code", "inline-shell", "code-from-input"]);
 
 /**
  * Whether a command hides one that a class rule matches: a tail of its words, which a wrapper the shell
  * reader does not know would run (`setsid npm login`), or one of its words read as a shell body (`watch
  * 'npm login'`, `ssh host 'npm login'`). Each candidate is read as its own command line in the command's
  * directory, and every class rule is tried on it. A match is a guess, so it only raises; it never sends a
- * request to the owner. "bounded" when the search did not cover the request.
+ * request to the owner. "unread" when the search did not cover the request: it reached a bound, or a
+ * candidate runs code the host does not read (`npx tsx -e …`, `uv run python -c …`).
  */
-function embeddedCommand(request: PermissionRequest, reading: RequestReading, facts: HostRuleFacts): "found" | "bounded" | undefined {
+function embeddedCommand(request: PermissionRequest, reading: RequestReading, facts: HostRuleFacts): "found" | "unread" | undefined {
   const limits = EMBEDDED_COMMAND_LIMITS;
   const { destructive: _destructive, ...plain } = request;
   // Candidates share most of their paths: each is resolved once.
@@ -596,13 +599,13 @@ function embeddedCommand(request: PermissionRequest, reading: RequestReading, fa
   });
   const seen = new Set<string>();
   let readings = 0;
-  let bounded = false;
+  let unread = false;
   const queue = reading.commands.map(command => ({ command, layer: 0 }));
   for (let item = queue.shift(); item; item = queue.shift()) {
     const { command, layer } = item;
     // A command in a directory the text does not establish is already opaque.
     if (command.cwdUnknown || NEVER_RUN.has(command.name) || command.argv.length < 2) continue;
-    if (command.argv.length > limits.words) { bounded = true; continue; }
+    if (command.argv.length > limits.words) { unread = true; continue; }
     const candidates: Array<{ source: string; depth: number }> = [];
     command.argv.forEach((word, index) => {
       if (index === 0) return;
@@ -614,8 +617,8 @@ function embeddedCommand(request: PermissionRequest, reading: RequestReading, fa
       const key = `${command.cwd ?? ""}\n${depth}\n${source}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      if (source.length > limits.length) { bounded = true; continue; }
-      if (++readings > limits.readings) return "bounded";
+      if (source.length > limits.length) { unread = true; continue; }
+      if (++readings > limits.readings) return "unread";
       const pattern = matchDestructive(source);
       const candidate: PermissionRequest = {
         ...plain, tool: "Bash", action: source,
@@ -625,10 +628,11 @@ function embeddedCommand(request: PermissionRequest, reading: RequestReading, fa
       };
       const candidateReading = readRequest(candidate, resolve, depth);
       if (CLASS_RULES.some(rule => rule.test(candidate, candidateReading, facts, false))) return "found";
+      if (candidateReading.opaqueReasons.some(reason => RUNS_UNREAD_CODE.has(reason))) unread = true;
       if (layer + 1 < limits.layers) for (const inner of candidateReading.commands) queue.push({ command: inner, layer: layer + 1 });
     }
   }
-  return bounded ? "bounded" : undefined;
+  return unread ? "unread" : undefined;
 }
 
 /**
@@ -663,7 +667,7 @@ export function raise(request: PermissionRequest, context: { rejectHistory: bool
     raised.push("raise:option-subcommand");
   const embedded = reading.shell ? embeddedCommand(request, reading, facts) : undefined;
   if (embedded === "found") raised.push("raise:embedded-command");
-  if (reading.opaque || embedded === "bounded" || reading.unresolved.length > 0 || (!reading.shell && !KNOWN_TOOLS.test(request.tool))) raised.push("raise:opaque");
+  if (reading.opaque || embedded === "unread" || reading.unresolved.length > 0 || (!reading.shell && !KNOWN_TOOLS.test(request.tool))) raised.push("raise:opaque");
   if (context.rejectHistory) raised.push("raise:reject-history");
   return raised;
 }

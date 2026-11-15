@@ -8,7 +8,7 @@ import type { Config } from "./types.js";
 import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, type BlockerEvidence, type CreateTeam, type NativeContinuation, type TeamAssignment, type TeamView } from "./team-types.js";
 import type { ProductGoal } from "./goal-types.js";
 import type { ProjectGroup } from "./project-group-types.js";
-import { createMissionSchema, missionActionSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionFollowUp, type MissionInputSource, type MissionOrigin, type MissionReport, type MissionSubtaskPlan } from "./mission-types.js";
+import { createMissionSchema, missionActionSchema, missionExtendSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionFollowUp, type MissionInputSource, type MissionOrigin, type MissionReport, type MissionSubtaskPlan } from "./mission-types.js";
 import { missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, subteamReport, type MissionCoordinatorNote, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
 import { addRollups, emptyRollup, teamUsage } from "./team-usage.js";
 import type { UsageService } from "./usage-service.js";
@@ -396,6 +396,15 @@ export class MissionService {
   }
   resume(id: string, input: Action) { return this.action(id, "resume", missionActionSchema.parse(input)); }
   cancel(id: string, input: Action) { return this.action(id, "cancel", missionActionSchema.parse(input)); }
+  /**
+   * The owner approves `minutes` more working time. A running or paused mission keeps going with a later deadline;
+   * a mission blocked by its time limit (`stopReason: "deadline"`) resumes its paused subteams. Any other mission is
+   * refused. Idempotent by `requestId`.
+   */
+  extend(id: string, input: { requestId: string; revision: number; minutes: number }): ReturnType<MissionService["resume"]> {
+    const body = missionExtendSchema.parse(input);
+    return Promise.reject(new TeamError(501, "not-implemented", `Extending mission ${id} by ${body.minutes} minutes is not implemented yet.`));
+  }
   private action(id: string, action: "pause" | "resume" | "cancel", body: Action & { reason?: string }) {
     const reason = body.reason;
     return this.enqueue(() => {

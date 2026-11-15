@@ -377,14 +377,19 @@ test("mission prompt shortens and counts a leading message before deferring late
 test("mission prompt cuts blocker evidence to the remaining budget, not to the shortest top-level field", () => {
   const mission = {
     id: "mission", groupName: "Example", status: "working", deadlineAt: "", maxSubtasks: 8,
-    subtasks: [], decisions: [], dispatchSummary: "", steering: [], objective: "界".repeat(23000),
+    subtasks: [], decisions: [], dispatchSummary: "", steering: [], objective: "",
   } as unknown as Mission;
+  const build = (messages: MissionMessage[]) => missionPromptWithMessageCount(mission, [], messages, 2, "claude", lineup.coordinator,
+    { openChildDecisions: [], waiting: 0 });
+  // Keep 4 KiB for evidence even when coordinator instructions grow; both long fields must still be shortened.
+  const emptyPromptBytes = Buffer.byteLength(build([]).prompt, "utf8");
+  mission.objective = "界".repeat(Math.floor((80 * 1024 - emptyPromptBytes - 4 * 1024) / Buffer.byteLength("界", "utf8")));
   const teamId = "6f1d6a1e-2b3c-4d5e-8f90-123456789abc";
-  const result = missionPromptWithMessageCount(mission, [], [{
+  const result = build([{
     type: "subtask-finished", subtaskId: "api", teamId, status: "blocked", teamStatus: "blocked", reason: "The API route is absent.",
     blocker: { cause: { status: "observed", detail: "界".repeat(1200) }, proposedRecovery: "界".repeat(1200),
       prevention: "Confirm the upstream interface first.", validationEvidence: [{ sourceRef: "packages/host/src/server.ts", observation: "Route absent." }] },
-  }] as MissionMessage[], 2, "claude", lineup.coordinator, { openChildDecisions: [], waiting: 0 });
+  }] as MissionMessage[]);
   assert.ok(Buffer.byteLength(result.prompt, "utf8") <= 80 * 1024);
   assert.equal(result.includedMessageCount, 1);
   const label = "Messages since your last attempt (JSON): ";

@@ -364,4 +364,5 @@ Each phase is its own pull request and is useful alone.
 - **Posterior.** Computed on read from the rows of the identity, with no cache (`routing-posterior.ts`).
 - **Interval.** Normal approximation to the Beta at 90%, z = 1.645, labelled `normal-approx-90` in the status view.
 - **Tier defaults.** Light $0.40, strong $2.20, rescue $1.50 (`TIER_COSTS`, `RESCUE_USD`). Every status and explain line that uses one says so.
-- **Payload limit.** 32 KiB of JSON per decision (`PAYLOAD_LIMIT_BYTES` in `routing-store.ts`).- **Retention.** Decisions decided more than 180 days before the sweep are removed by the host's sweep (`sweepExpiredDecisions`, called from `server.ts`).
+- **Payload limit.** 32 KiB of JSON per decision (`PAYLOAD_LIMIT_BYTES` in `routing-store.ts`).
+- **Retention.** Decisions decided more than 180 days before the sweep are removed by the host's sweep (`sweepExpiredDecisions`, called from `server.ts`).

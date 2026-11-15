@@ -291,6 +291,9 @@ test("repo init saves routing and keeps it when omitted", { timeout: 90000 }, as
   try {
     invoke(["--routing", "shadow", "--routing-value", "quality"]);
     assert.deepEqual(await savedRouting(), { mode: "shadow", successValueUsd: 8 });
+    // The policy saved after startup reaches the status read without a restart.
+    const status = (await host.fetchApi("/routing/projects/sample")).body;
+    assert.deepEqual([status.mode, status.source, status.knobs.successValueUsd], ["shadow", "saved", 8]);
 
     const before = JSON.stringify(await savedRouting());
     invoke([]);

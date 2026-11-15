@@ -37,15 +37,25 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
   // The checkouts from the last successful workspace list, for the halt banner. They are kept apart from the brief,
   // so a project halt still shows when the brief read fails after the list succeeded.
   const [membership, setMembership] = useState<{ scope: string; checkouts: Checkout[] }>();
+  // Each list read takes a ticket before it starts; an answer may replace only an older read's membership, so a
+  // request that outlived a refocus or a pairing change cannot restore checkouts a newer read replaced.
+  const membershipIssued = useRef(0);
+  const membershipApplied = useRef(0);
 
   const poll = usePoll(async () => {
     if (stopped.current === scope && last.current?.scope === scope) return last.current;
+    const ticket = ++membershipIssued.current;
+    const keepMembership = (checkouts: Checkout[]) => {
+      if (ticket < membershipApplied.current) return;
+      membershipApplied.current = ticket;
+      setMembership({ scope, checkouts });
+    };
     let confirmedGroupName = "";
     try {
       const groups = await api<ProjectGroupList>(connection, "/project-groups");
       const group = groups.groups.find(candidate => candidate.id === workspaceId);
       if (!group) {
-        setMembership({ scope, checkouts: [] });
+        keepMembership([]);
         await clearUnderstandingSummary(connection, workspaceId);
         const result: ReadResult = { scope, state: "missing", groupName: "", error: "This workspace is no longer available on this machine." };
         last.current = result;
@@ -53,7 +63,7 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
         return result;
       }
       confirmedGroupName = group.name;
-      setMembership({ scope, checkouts: group.repos.flatMap(repo => repo.checkouts.map(({ projectId, name }) => ({ projectId, name }))) });
+      keepMembership(group.repos.flatMap(repo => repo.checkouts.map(({ projectId, name }) => ({ projectId, name }))));
       const data = await api<WorkspaceUnderstanding>(connection, `/project-groups/${encodeURIComponent(workspaceId)}/understanding`);
       if (data.schemaVersion !== 1 || data.workspace.id !== workspaceId) {
         const result: ReadResult = { scope, state: "upgrade", groupName: group.name, error: "This host returned an unsupported Understanding version." };

@@ -234,9 +234,10 @@ test("a copy's diff settings change no patch", async () => {
   try {
     run(dir, "config", "diff.context", "1000");
     run(dir, "config", "diff.interHunkContext", "1000");
-    const lines = (changed?: number) => Array.from({ length: 400 }, (_, index) => (index + 1 === changed ? "changed\n" : `line ${index + 1}\n`)).join("");
+    const lines = (changed: number[] = []) => Array.from({ length: 400 }, (_, index) => (changed.includes(index + 1) ? "changed\n" : `line ${index + 1}\n`)).join("");
     const from = commit(dir, writeFiles({ "long.txt": lines() }), "from");
-    const to = commit(dir, writeFiles({ "long.txt": lines(200) }), "to");
+    // Two changes ten lines apart: two hunks with three lines of context, or one hunk when a setting joins them.
+    const to = commit(dir, writeFiles({ "long.txt": lines([200, 210]) }), "to");
 
     run(clone, "fetch", "-q", dir, "HEAD");
     const inCopy = await captureGit(() => undefined).patch(dir, from, to);

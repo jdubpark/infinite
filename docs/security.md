@@ -18,7 +18,7 @@ possible provider tool effect.
 Each member report is bound to its run, member, and revision and is acknowledged
 after durable recording. Separate Git copies isolate edits without sandboxing
 providers. Git, setup, and check commands must run under the intended agent
-identity. Git commands that the host runs ignore replace refs (`GIT_NO_REPLACE_OBJECTS=1`), so a ref that a member plants in a team copy cannot change what a read returns. Workspace files remain plaintext runtime data. Provider permissions
+identity. Git commands that the host runs in team copies ignore replace refs (`GIT_NO_REPLACE_OBJECTS=1`), so a ref that a member plants in a team copy cannot change what a read returns. Workspace files remain plaintext runtime data. Provider permissions
 remain with the owner unless an explicit repository policy delegates bounded
 one-shot requests to the strong coordinator. Guarded delivery checks the current
 assignment, workspace, prompt, policy, expiry and human input control. Workspace

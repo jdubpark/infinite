@@ -73,7 +73,8 @@ export const githubBoundarySchema = z.object({
 
 const schema = z
   .object({
-    linear: z.object({ apiKeyFile: z.string().refine(isAbsolute), endpoint: z.url().optional(), reportName: z.string().trim().min(1).max(40).regex(/^[A-Za-z][A-Za-z0-9 -]*$/).default(DEFAULT_REPORT_NAME) }).strict().optional(),
+    // Keep absent report names absent in routine authority digests; reportName() supplies the display default.
+    linear: z.object({ apiKeyFile: z.string().refine(isAbsolute), endpoint: z.url().optional(), reportName: z.string().trim().min(1).max(40).regex(/^[A-Za-z][A-Za-z0-9 -]*$/).optional() }).strict().optional(),
     hostLoad: z.object({ minAvailableMemoryGiB: z.number().min(0).max(4096), maxLoadPerCpu: z.number().positive().max(64) }).strict().optional(),
     intake: intakeConfigSchema.optional(),
     mcp: mcpConfigSchema.optional(),

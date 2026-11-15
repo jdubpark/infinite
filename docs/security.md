@@ -489,7 +489,10 @@ replaced, removed, or restored from an older copy) are recorded as a halt of
 every project; one seen and not yet recorded is kept until it is. While the
 count file cannot be read, the agent serves nothing. Restoring both halt files
 from the same older copy while the evidence store cannot be written, and then
-restarting, loses the halts engaged since that copy; this is not detected. A dialog that was
+restarting, loses the halts engaged since that copy; this is not detected.
+Each period in which a halt is in force is a halt epoch of its own, so a halt
+that a restored copy of the record brings back under its old id retires the
+verdicts reached since its release, as a new halt does. A dialog that was
 pending is handed to the agent again after the release and decided from the
 evidence of that time. A host halt, or a halt record that the host cannot
 read, also holds every reviewer launch of a replay. A headless call that

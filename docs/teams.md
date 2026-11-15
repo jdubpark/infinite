@@ -1663,7 +1663,121 @@ the failure and the configured provider policy; retries do not grant permission.
 
 ## Delegating permission decisions
 
-The first repository enrollment enables delegation by default:
+In a workspace that the owner delegated, a separate permission agent answers
+the tool permission requests of agent sessions: team members, sessions outside
+a team run, and headless Claude Code sessions. It allows a request once, or
+rejects it with a recorded reason. Five classes of request always wait for the
+owner's own answer: production or staging actions, new or external
+credentials, money, destructive operations outside the workspace, and global
+or account settings.
+
+The permission agent serves a project when both conditions hold:
+
+- An owner act covers the project: `infinite permissions delegate`, or the
+  owner's first `infinite repo init` of that project without
+  `--permissions off`. See
+  [workspace permission delegation](cli.md#workspace-permission-delegation).
+- The host is ready: a light profile, strong profiles from at least two model
+  families, and a current replay result under the owner's miss-rate threshold.
+  See [readiness and replay](cli.md#permission-agent-readiness-and-replay).
+
+`infinite permissions status` shows both. A project that is not served is
+handled as before; for a team run that means the coordinator review in
+[the next section](#coordinator-review-for-runs-the-permission-agent-does-not-serve).
+
+Each request passes these steps in order:
+
+1. **Class rules.** A host rule that establishes one of the five classes sends
+   the request to the owner. No model turn runs, and the push names the class.
+   The rules read the command's words and its targets as real paths. They also
+   cover a workspace trust prompt and a request that can be granted only as a
+   persistent approval. `permissionAgent.releaseCommands` in the host
+   configuration names this host's deploy commands for the production or
+   staging class.
+2. **Qualify.** The host must hold the whole action, and the dialog must offer
+   a one-shot accept and a one-shot reject. A request that does not qualify
+   can be rejected or sent to the owner. It is never allowed.
+3. **Lock and replay.** An assignment that repeated one rejected request twice
+   is locked and gets no model turn until the owner unlocks it. An identical
+   request under the same authority is answered from its recorded verdict.
+4. **Tier.** A routine request goes to the light model, which can allow it or
+   refer it. A request is raised to the strong model when it is destructive,
+   reaches outside the session's directory, uses a release verb or a push,
+   needs privilege, names a credential or a payment, changes a settings file,
+   installs globally, cannot be read by the host, or follows a reject in the
+   same assignment. The strong model comes from a model family other than the
+   requester's. It allows the request, rejects it with a reason code, or names
+   the owner with a class.
+5. **Delivery.** The host records the decision. It then checks that the
+   session still runs, that the dialog and its evidence are unchanged, that
+   the owner's authority still holds, and that no person holds input control.
+   Then it sends one option. A reject goes through the dialog's one-shot
+   reject option, followed by a fixed host notice that carries the reason
+   code. No model text reaches the requesting agent. A destructive request is
+   delivered only on an allow from the strong model. A delivery whose result
+   is unknown is never repeated.
+
+A reject is final for that request, and members are told not to reach the same
+effect by another route. The reason codes are `outside-workspace`, `unrelated`,
+`unsafe`, `incomplete`, `uncertain`, `unavailable`, `locked` and `needs-owner`.
+Run status shows the code, and a locked assignment shows as blocked on a
+permission. `infinite permissions unlock` ends a lock and `infinite permissions
+reopen` closes a reject so that the request gets a fresh review; neither
+allows anything.
+
+The owner is pushed for a class request, for a request that the host can
+answer in neither direction, and for a request of a project that the agent
+does not serve. An allowed, rejected or stale request pushes nothing.
+`infinite permissions log` lists every decision with its tier, rules and
+delivery events; see the [decision log](cli.md#permission-decision-log).
+
+`infinite team revoke-permissions TEAM_ID` returns one run's requests to the
+owner. `infinite permissions revoke` ends a workspace's delegation: its
+pending decisions are retired and never applied, and an answer that is already
+with a member's session is fenced before the revoke is acknowledged. The owner's halt stops the
+permission agent for the projects it covers: no reviewer turn starts and no
+recorded verdict is delivered until the release.
+
+A session outside a team run is served when the host owns its terminal. A
+laptop-execution session, a cmux session and a native-UI session stay with the
+owner, and so does a dialog that first appears while a person holds input
+control. The task evidence for such a session is its title and the prompts
+that the owner submitted through the host, never agent output. A reject
+reaches the session through the dialog's one reject option, and the fixed
+notice follows when that option takes text. A dialog that offers two reject
+options has no recognised one-shot reject, so a reject for it goes to the
+owner.
+
+A headless Claude Code session (`--print` in the default permission mode) is
+served through a hook channel. A class call ends the provider's run and waits
+for the owner's answer on the session's prompt. The owner's allow resumes the
+same conversation and runs that call once. A served headless launch loads no
+user, project or local settings file, so the allow rules, environment values
+and model defaults of those files do not apply to it. Headless sessions of
+other providers are not served.
+
+### Coordinator review for runs the permission agent does not serve
+
+This is the earlier repository-level delegation. It decides only for a team
+run that the permission agent does not serve, and it is kept until the
+permission agent has replaced it on the host. A run uses one path or the
+other, never both for the same request. When the permission agent starts to
+serve a run in flight, the run's coordinator reviews are retired without an
+answer, an answer in flight is fenced, and the coordinator review decides
+nothing more for that run. The switch is fenced: from the moment the run can
+be served no coordinator answer starts, the run's coordinator answers already
+with a worker are fenced there, and only then does the permission agent serve
+the run. Each coordinator answer is recorded as one a worker may still type in
+the same save that dispatches it, and stays so until its result is conclusive,
+the worker confirms its fence, or its session has exited. An answer in that
+state, including one whose result was never confirmed or that was in flight
+when the host restarted, keeps the run from switching; meanwhile the run's dialogs stay
+with the owner. The switch runs at the owner act or the replay that made the host
+ready, not only at the next scheduler pass, and the coordinator's authority is
+read once more under the session's input lease immediately before its answer
+is typed.
+
+The first repository enrollment enables this delegation by default:
 
 ```sh
 infinite repo init
@@ -1790,8 +1904,9 @@ infinite team revoke-permissions TEAM_ID
 infinite repo init --permissions off
 ```
 
-The first command revokes delegation for a current run. The second disables it
-for future runs. Both require an owner client. Pausing, cancelling or steering a
+The first command revokes delegation for a current run, on either path. The
+second disables the coordinator review for future runs and records an opt-out
+from the permission agent for that project. Both require an owner client. Pausing, cancelling or steering a
 run prevents its old pending decisions from being applied.
 
 ## Autonomy mode
@@ -1886,7 +2001,7 @@ Engaging also pauses the running work in scope through each item's own pause pat
 
 `infinite halt off --host` or `--project PROJECT_ID` releases it. The gate lifts first. Then each marked item that is still paused, and that the owner did not change during the halt, resumes in reverse order under the same rules as the owner's resume; a team run resumes with a fresh plan. An item that those rules refuse stays paused and says why, for example a team whose members are still stopping, a team that needs workspace reconciliation, a goal or mission past its deadline, or a standing goal whose project is no longer autonomous. A standing goal has no deadline of its own, so a halt that outlasts its last cycle's time window does not end it: on release it returns to its cadence. Resume it when it is ready. A host halt and a project halt are independent: an item resumes only when no remaining halt covers it, and otherwise it moves to the remaining halt. `--keep-paused` lifts the gate and resumes nothing; each marked item then says that the owner kept it paused.
 
-Engage and release are idempotent by request ID. Engaging a scope that is already halted, or releasing one that is not, changes nothing and returns the current state. The halt is recorded in `halt.sealed` in the host state directory with its time, reason, and the owner device that engaged it. A restart keeps it, and a restart in the middle of a pause or resume pass finishes that pass without repeating what was done. If the host cannot read the record, it treats the whole host as halted and refuses every change to the halt until the record can be read; it checks again every minute. Once the record can be read again, any pause or resume pass it holds as unfinished runs before the next change to the halt. When the record cannot be restored, removing that file on the host clears every halt at the next check; nothing resumes, so resume each paused item yourself. A halt never infers completion and approves nothing. `infinite halt` lists every halted scope; add `--json` for the full view.
+Engage and release are idempotent by request ID. Engaging a scope that is already halted, or releasing one that is not, changes nothing and returns the current state. The halt is recorded in `halt.sealed` in the host state directory with its time, reason, and the owner device that engaged it. A restart keeps it, and a restart in the middle of a pause or resume pass finishes that pass without repeating what was done. If the host cannot read the record, it treats the whole host as halted and refuses every change to the halt until the record can be read; it checks again every minute. Once the record can be read again, any pause or resume pass it holds as unfinished runs before the next change to the halt. When the record cannot be restored, removing that file on the host clears every halt at the next check; nothing resumes, so resume each paused item yourself. A second file, `halt-epochs.sealed`, holds the halt epochs that the permission agent reads: every engage and release renews the epoch of its scope, so a verdict reached before a halt or its release is never delivered after it. Restoring or removing `halt.sealed` leaves it as it is. Do not restore it from a copy; removing it makes the permission agent retire every verdict not yet delivered. A halt never infers completion and approves nothing. `infinite halt` lists every halted scope; add `--json` for the full view.
 
 ## Configuration
 

@@ -119,7 +119,7 @@ process.exit(child.status ?? 1);
   const hostConfig: Partial<Config> = {
     remote: { enabled: true },
     projects: [{ id: "rehearsal", name: "Rehearsal", path: source,
-      team: { ...(scenario.startsWith("delivery") ? { delivery: options.deliveryMode === "pr" ? { mode: "pr" as const, repository: "example/app", baseBranch: "main" } : { mode: "merge" as const, repository: "example/app", baseBranch: "main", mergeMethod: "squash" as const } } : {}), ...(scenario.startsWith("permissions") || scenario === "check-mutates" ? { setup: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--permission-setup", receipts] } } : {}), ...(scenario.startsWith("permissions") && scenario !== "permissions-off" ? { permissions: { mode: "coordinator" as const, scope: "Approve only read access needed to inspect this project for the stated objective.", maxDecisions: 2 } } : {}), checks: [], ...(scenario !== "bootstrap-override" && bootstrap ? { establishChecks: true } : {}), ...(bootstrap && scenario !== "bootstrap-override" ? {} : { checks: [
+      team: { ...(scenario.startsWith("delivery") ? { delivery: options.deliveryMode === "pr" ? { mode: "pr" as const, repository: "example/app", baseBranch: "main" } : { mode: "merge" as const, repository: "example/app", baseBranch: "main", mergeMethod: "squash" as const } } : {}), ...(scenario.startsWith("permissions") || scenario === "check-mutates" ? { setup: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--permission-setup", receipts] } } : {}), ...(scenario.startsWith("permissions") && !scenario.startsWith("permissions-off") ? { permissions: { mode: "coordinator" as const, scope: "Approve only read access needed to inspect this project for the stated objective.", maxDecisions: 2 } } : {}), checks: [], ...(scenario !== "bootstrap-override" && bootstrap ? { establishChecks: true } : {}), ...(bootstrap && scenario !== "bootstrap-override" ? {} : { checks: [
         { command: process.execPath, args: ["check.mjs", ...(scenario.endsWith("failed-check") ? ["--fail"] : []), ...(scenario === "success" ? ["--prefix"] : [])] },
         ...(scenario === "lifecycle" ? [{ command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--hold-check", receipts] }] : []),
       ] }) } }],
@@ -161,11 +161,12 @@ process.exit(child.status ?? 1);
   };
   const settled = (id: string) => waitFor(() => get(id), run => ["ready-for-review", "merged", "blocked"].includes(run.status), 90000);
   const directServices: TeamService[] = [];
-  const openTeamService = async (serviceOptions: { source?: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status">; graphs?: Pick<RepositoryGraphs, "refresh">; onMerged?: (projectId: string) => void; start?: boolean; events?: EventOutbox; capture?: CaptureSink } = {}) => {
+  const openTeamService = async (serviceOptions: { source?: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status">; graphs?: Pick<RepositoryGraphs, "refresh">; onMerged?: (projectId: string) => void; start?: boolean; events?: EventOutbox; capture?: CaptureSink; manager?: (manager: Manager) => void } = {}) => {
     await host.stopApi();
     if (serviceOptions.source) host.config.projects.find(project => project.id === "rehearsal")!.source = { mode: "github", repository: "example/app", baseBranch: "main" };
     const key = readFileSync(host.config.keyFile);
     const manager = new Manager(host.config, key);
+    serviceOptions.manager?.(manager);
     const service = new TeamService(host.config, key, manager, (_projectId, start) => start(), undefined, undefined,
       { ...(serviceOptions.source ? { source: serviceOptions.source } : {}), ...(serviceOptions.graphs ? { graphs: serviceOptions.graphs } : {}), ...(serviceOptions.onMerged ? { onMerged: serviceOptions.onMerged } : {}), ...(serviceOptions.events ? { events: serviceOptions.events } : {}), ...(serviceOptions.capture ? { capture: serviceOptions.capture } : {}) });
     if (serviceOptions.start !== false) service.start();

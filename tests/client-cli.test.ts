@@ -1276,8 +1276,10 @@ test("repository CLI pins, preserves and removes owner permission delegation", {
   const enroll = (...extra: string[]) => exec(process.execPath, [...args, ...extra], { cwd: checkout });
   try {
     await exec("git", ["clone", "--no-hardlinks", run.source, checkout]);
-    const first = JSON.parse((await enroll()).stdout);
+    const firstRun = await enroll();
+    const first = JSON.parse(firstRun.stdout);
     assert.deepEqual(first.team.permissions, { mode: "coordinator", scope: DEFAULT_PERMISSION_SCOPE, maxDecisions: DEFAULT_PERMISSION_LIMIT });
+    assert.match(firstRun.stderr, /Permission agent: this project is covered in workspace \S+\./, "the first onboarding covers the project");
     const delegated = JSON.parse((await enroll("--permissions", "coordinator", "--permission-scope", "Read files and run the configured check only.", "--permission-limit", "3")).stdout);
     assert.deepEqual(delegated.team.permissions, { mode: "coordinator", scope: "Read files and run the configured check only.", maxDecisions: 3 });
     const retained = JSON.parse((await enroll()).stdout);
@@ -1288,10 +1290,16 @@ test("repository CLI pins, preserves and removes owner permission delegation", {
       requestId: randomUUID(), revision: retained.revision, team: { ...retained.team, permissions: { ...delegated.team.permissions, scope: "Broaden scope" } },
     }, undefined, "PUT");
     assert.equal(forbidden.status, 403);
-    const removed = JSON.parse((await enroll("--permissions", "off")).stdout);
+    const removedRun = await enroll("--permissions", "off");
+    const removed = JSON.parse(removedRun.stdout);
     assert.equal(removed.team.permissions, undefined);
-    const retainedOff = JSON.parse((await enroll()).stdout);
+    assert.match(removedRun.stderr, /Permission agent: this project is opted out\./, "an explicit off on a repeat onboarding records an opt-out");
+    const retainedOffRun = await enroll();
+    const retainedOff = JSON.parse(retainedOffRun.stdout);
     assert.equal(retainedOff.team.permissions, undefined, "plain repo init preserves an explicitly saved off policy");
+    assert.match(retainedOffRun.stderr, /Permission agent: a repeat onboarding leaves this project's delegation unchanged\./);
+    assert.equal((await run.host.fetchApi("/permissions/status", "owner")).body.workspaces
+      .flatMap((view: { projects: { projectId: string; state: string }[] }) => view.projects).find((project: { projectId: string }) => project.projectId === "rehearsal")?.state, "opt-out");
   } finally { await run.close(); rmSync(localRoot, { recursive: true, force: true }); }
 });
 

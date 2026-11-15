@@ -11,7 +11,7 @@ import type { RoutingEvidenceRow } from "../packages/host/src/routing-types.js";
 const NOW = "2026-11-15T00:00:00.000Z";
 const DAY = 86_400_000;
 const TARGET: RoutingTarget = { projectRef: "p", areaRef: "a", kind: null, featureVersion: 1, featureMapRef: "fm", point: "start" };
-const CURRENT: CurrentConfig = { epoch: 0, promptVersion: "pv" };
+const CURRENT: CurrentConfig = { epoch: 1, promptVersion: "pv" };
 
 function ago(days: number): string {
   return new Date(Date.parse(NOW) - days * DAY).toISOString();
@@ -30,7 +30,7 @@ function row(overrides: Partial<RoutingEvidenceRow> = {}): RoutingEvidenceRow {
     provider: "provider",
     model: "model",
     effort: null,
-    profileEpoch: 0,
+    profileEpoch: 1,
     kind: null,
     featureVersion: 1,
     disposition: "integrated",
@@ -176,8 +176,8 @@ test("levels hold their own rows", () => {
 
 test("earlier evidence is capped at a mass of 10", () => {
   const earlier = (count: number, overrides: Partial<RoutingEvidenceRow> = {}) =>
-    Array.from({ length: count }, () => row({ projectRef: "other", profileEpoch: 0, ...overrides }));
-  const current: CurrentConfig = { epoch: 1, promptVersion: "pv" };
+    Array.from({ length: count }, () => row({ projectRef: "other", profileEpoch: 1, ...overrides }));
+  const current: CurrentConfig = { epoch: 2, promptVersion: "pv" };
 
   const forty = posterior(earlier(40), TARGET, current, NOW, 1);
   assert.deepEqual(forty.reward[0]!.posterior, { a: 11, b: 1 });
@@ -191,7 +191,7 @@ test("earlier evidence is capped at a mass of 10", () => {
   // A null prompt version is earlier, and a current row beside the earlier rows counts in observed.
   const mixed = posterior([
     ...earlier(40, { promptVersion: null }),
-    row({ projectRef: "other", profileEpoch: 1 }),
+    row({ projectRef: "other", profileEpoch: 2 }),
   ], TARGET, current, NOW, 1);
   assert.deepEqual(mixed.reward[0]!.posterior, { a: 12, b: 1 });
   assert.equal(mixed.reward[0]!.observed.rows, 1);
@@ -217,7 +217,7 @@ test("the posterior does not depend on row order", () => {
     featureVersion: pick([1, 2]),
     featureMapRef: pick(["fm", "x"]),
     point: pick(["start", "escalation"]),
-    profileEpoch: pick([0, 1]),
+    profileEpoch: pick([1, 2]),
     promptVersion: pick(["pv", null]),
     disposition: pick(["integrated", "stalled"]),
     accepted: pick([0, 1, null] as const),
@@ -242,4 +242,30 @@ test("legacy rows change nothing", () => {
   const rows = [row(), row({ accepted: 0 }), row({ projectRef: "other", firstPass: 0, held: 1 })];
   const legacy = Array.from({ length: 20 }, () => row({ source: "legacy", areaRef: "a", kind: null }));
   assert.deepStrictEqual(posterior([...rows, ...legacy], TARGET, CURRENT, NOW, 1), posterior(rows, TARGET, CURRENT, NOW, 1));
+});
+
+test("a failure's rescue counts zero, the owner rating maps 1 to 0 and 5 to 1, a row 180 days old has weight 0.5^6, and only counted rows are untimed", () => {
+  assert.deepEqual(observe(row({ disposition: "stalled", integrated: 0, accepted: 0, firstPass: 0, held: 0 }), NOW, 1)?.rescue, { x: 0, w: 1 });
+  assert.deepEqual(observe(row({ ownerScore: 5, held: 1 }), NOW, 1)?.reward, { r: 1, w: 1 });
+  assert.deepEqual(observe(row({ ownerScore: 1, held: 1 }), NOW, 1)?.reward, { r: 0, w: 1 });
+  assert.deepEqual(observe(row({ ownerScore: 5, held: 0 }), NOW, 1)?.reward, { r: 0, w: 1 });
+  assert.equal(observe(row({ endedAt: ago(180) }), NOW, 1)?.reward?.w, 0.5 ** 6);
+  assert.equal(posterior([row({ flags: ["gap"], endedAt: null })], TARGET, CURRENT, NOW, 1).untimed, 0);
+});
+
+test("earlier evidence is capped at 10 below tenant, a row of another or no prompt version is earlier, phi has its own cap, and rows and level count rewards only", () => {
+  const current: CurrentConfig = { epoch: 1, promptVersion: "pv" };
+  // 40 cell rows under another prompt version, held unknown: theta's earlier mass is 20 and phi's is 40; each is capped at 10.
+  const cellEarlier = posterior(Array.from({ length: 40 }, () => row({ profileEpoch: 1, promptVersion: "old", held: null })), TARGET, current, NOW, 1);
+  assert.deepEqual(cellEarlier.reward[2]!.earlier, { success: 20, failure: 0, rows: 40, scale: 0.5 });
+  assert.deepEqual(cellEarlier.theta, { a: 11, b: 1 });
+  assert.deepEqual(cellEarlier.rescue[2]!.earlier, { success: 40, failure: 0, rows: 40, scale: 0.25 });
+  assert.deepEqual(cellEarlier.phi, { a: 11, b: 1 });
+  assert.deepEqual([cellEarlier.level, cellEarlier.earlierRows, cellEarlier.rows], ["none", 40, { production: 0, duel: 0 }]);
+  assert.equal(posterior([row({ profileEpoch: 1, promptVersion: null })], TARGET, current, NOW, 1).earlierRows, 1);
+  assert.equal(posterior([row({ projectRef: "other" })], TARGET, CURRENT, NOW, 1).level, "tenant");
+  // A reward without a rescue counts; a duel row counts as duel.
+  const rewardOnly = posterior([row({ accepted: 1, firstPass: null, held: 1 })], TARGET, CURRENT, NOW, 1);
+  assert.deepEqual([rewardOnly.level, rewardOnly.rows, rewardOnly.phi], ["cell", { production: 1, duel: 0 }, { a: 1, b: 1 }]);
+  assert.deepEqual(posterior([row({ source: "duel" })], TARGET, CURRENT, NOW, 1).rows, { production: 0, duel: 1 });
 });

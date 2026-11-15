@@ -10,7 +10,7 @@ import { z } from "zod";
 import { existsSync, realpathSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { Manager, publicAttention } from "./manager.js";
-import { hashToken, validateLinearConfig } from "./config.js";
+import { hashToken, validateLinearConfig, validateMcpConfig } from "./config.js";
 import { runtimeSecurity } from "./deployment.js";
 import { workerCall, type WorkerError } from "./ipc.js";
 import { PushStore, isExpoToken } from "./push.js";
@@ -202,6 +202,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   const enrollment = new RepoEnrollmentService(config, key, { isBusy: async projectId =>
     projectSync.applying(projectId) || projectSource.refreshing(projectId) || await projectRunning(projectId, true) });
   validateLinearConfig(config);
+  validateMcpConfig(config);
   const manager = new Manager(config, key);
   const projectSync = new ProjectSync(config, key);
   const desktopFiles = new DesktopFiles(config);

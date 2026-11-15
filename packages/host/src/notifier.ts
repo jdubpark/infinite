@@ -64,6 +64,8 @@ export class Notifier {
     private readonly goals?: { statuses(): GoalRow[] },
     private readonly storage?: { sample(): Promise<StorageVolume[]> },
     private readonly fuse?: Pick<FuseService, "interrupts" | "markAnnounced">,
+    /** The permission agent's answer to whose a pending dialog is. Absent: every dialog is handled as before. */
+    private readonly permissions?: { holder(sessionId: string, promptId: number): "agent" | "owner" | "undecided" },
   ) {}
   /** After a fuse push that reached no device, the time of the next attempt, on a clock that never steps back. */
   private fuseRetryAt = 0;
@@ -198,11 +200,19 @@ export class Notifier {
       channelId: "attention" as const, priority: item.critical ? "high" as const : "default" as const, collapseId: `storage:${item.label}`,
     };
   }
-  /** A team member's open permission prompt is the owner's unless its run can still decide it. Everything else is always the owner's. */
+  /** An open permission prompt is the owner's unless the permission agent or the member's run can still decide it. */
   private promptOwner(row: Row): PromptOwner {
     const prompt = row.attention.prompt;
-    if (row.attention.state !== "needs-you" || !prompt || !this.teams?.promptOwner) return "user";
+    if (row.attention.state !== "needs-you" || !prompt) return "user";
+    // The permission agent holds the push only while it can still decide the dialog; "undecided" gets the review grace.
+    const holder = this.permissionHolder(row.id, prompt.id);
+    if (holder !== "owner") return holder === "agent" ? "coordinator" : "undecided";
+    if (!this.teams?.promptOwner) return "user";
     try { return this.teams.promptOwner(row.id, prompt); } catch { return "user"; }
+  }
+  private permissionHolder(sessionId: string, promptId: number): "agent" | "owner" | "undecided" {
+    if (!this.permissions) return "owner";
+    try { return this.permissions.holder(sessionId, promptId); } catch { return "owner"; }
   }
   private teamEvents(): Lifecycle[] {
     if (!this.teams) return [];

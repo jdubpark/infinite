@@ -41,6 +41,7 @@ import { startHookServer, HookPayloadError, type HookReply, type HookRoute } fro
 import { teamReportEnvelopeSchema, type TeamAssignment } from "./team-types.js";
 import { missionReportEnvelopeSchema } from "./mission-types.js";
 import { isCollapsedPermissionPrompt, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
+import { SESSION_PERMISSION_ACTOR_LABEL, permissionChoices } from "./permission-session-requests.js";
 import type { TranscriptMessage } from "./transcript.js";
 import { TranscriptWatch, closesTurn } from "./transcript-watch.js";
 import { drainLaunch, runFinalDrain } from "./final-drain.js";
@@ -92,6 +93,7 @@ const snapshots = new TerminalSnapshots(terminal);
 type AnswerRequest = Extract<WorkerRequest, { op: "answer" }>;
 type TeamAnswerRequest = Extract<WorkerRequest, { op: "team-answer" }>;
 type TeamPermissionExpansionRequest = Extract<WorkerRequest, { op: "team-permission-expand" }>;
+type SessionPermissionAnswerRequest = Extract<WorkerRequest, { op: "session-permission-answer" }>;
 type DeliveryRequest = Extract<WorkerRequest, { op: "input" | "raw" | "key" | "stop" }>;
 type StoredReceipt = Receipt & { digest: string; result?: AnswerResult };
 const receipts = new Map<string, StoredReceipt>();
@@ -1156,6 +1158,126 @@ function expandTeamPermission(request: TeamPermissionExpansionRequest): Receipt 
   }
 }
 
+function validSessionPermissionAnswer(request: SessionPermissionAnswerRequest) {
+  return typeof request.requestId === "string" && request.requestId.length >= 1 && request.requestId.length <= 80 &&
+    typeof request.decisionId === "string" && /^[A-Za-z0-9._:-]{1,100}$/.test(request.decisionId) &&
+    request.targetSessionId === session.id &&
+    typeof request.targetCwd === "string" && request.targetCwd.length > 0 && request.targetCwd.length <= 4096 &&
+    Number.isInteger(request.promptId) && request.promptId >= 1 &&
+    typeof request.promptHash === "string" && /^[a-f0-9]{64}$/i.test(request.promptHash) &&
+    typeof request.evidenceHash === "string" && /^[a-f0-9]{64}$/i.test(request.evidenceHash) &&
+    Number.isInteger(request.option) && request.option >= 0 && validActor(request.actor) &&
+    typeof request.leaseId === "string" && request.leaseId.length > 0 && request.leaseId.length <= 80;
+}
+
+/**
+ * Types one permission-agent decision into a session outside any team run: one recognised one-shot
+ * accept or reject, under the host's control lease, while the exact reviewed dialog is still pinned on
+ * screen. A team member's session never takes this path. Once the intent is journaled the answer is
+ * never typed again: a failure after it leaves the receipt uncertain.
+ */
+async function answerSessionPermission(request: SessionPermissionAnswerRequest): Promise<Receipt & { result?: AnswerResult }> {
+  const { actor: _actor, leaseId: _leaseId, ...input } = request;
+  const digest = createHash("sha256").update(JSON.stringify(input)).digest("hex");
+  const previous = receipts.get(request.requestId);
+  if (previous) {
+    if (previous.digest !== digest) throw new Error("Request ID already belongs to different input");
+    return publicReceipt(previous);
+  }
+  const pty = child;
+  const assertTarget = () => {
+    if (session.team || request.targetSessionId !== session.id || handoffReceipt ||
+        session.runtime?.nativeUi || session.runtime?.transport !== "pty")
+      throw new Refusal("unsupported");
+    let cwd: string;
+    try { cwd = realpathSync(session.cwd); }
+    catch { throw new Refusal("unsupported"); }
+    if (cwd !== request.targetCwd ||
+        request.actor.id !== `session-permission:${request.decisionId}` || request.actor.label !== SESSION_PERMISSION_ACTOR_LABEL)
+      throw new Refusal("unsupported");
+    checkControl(request);
+    if (state.status !== "running" || !pty || child !== pty) throw new Refusal("prompt-changed");
+  };
+  assertTarget();
+  const prompt = attention.prompt;
+  if (attention.state !== "needs-you" || !prompt || prompt.id !== request.promptId || prompt.hash !== request.promptHash ||
+      permissionEvidenceHash(prompt) !== request.evidenceHash)
+    throw new Refusal("prompt-changed");
+  if (prompt.multiSelect) throw new Refusal("unsupported");
+  const choices = permissionChoices(prompt);
+  const role = request.option === choices.accept ? "accept" : request.option === choices.reject ? "reject" : undefined;
+  if (!role) throw new Refusal("invalid-option");
+  // The hash ignores spacing inside lines, so the reviewed text must match exactly, and screen-only
+  // evidence needs the dialog pinned to the bottom of the screen. Each key write checks this again.
+  const showsReviewed = (now: ReturnType<typeof screenPrompt>) => Boolean(now &&
+    hashOf(now.fingerprint) === prompt.hash && now.title === prompt.title && now.detail === prompt.detail &&
+    (prompt.tool || now.pinned) && !now.multiSelect && now.options.some(option => option.index === request.option &&
+      (role === "accept" ? option.role === "accept" : option.role === "reject" || option.role === "reject-with-feedback")));
+  const current = screenPrompt();
+  if (!current || !showsReviewed(current)) throw new Refusal("prompt-changed");
+  // A typed `y` changes the yes-no line before its Enter, so that Enter could not be checked against the reviewed screen.
+  if (current.kind === "yes-no") throw new Refusal("unsupported");
+  const chosen = current.options.find(option => option.index === request.option)!;
+  const from = current.highlighted ?? 0;
+  const keys = [...Array<string>(Math.abs(chosen.index - from)).fill(chosen.index > from ? "down" : "up"), "enter"];
+  flush();
+  const intent = append("input-intent", {
+    op: "session-permission-answer", requestId: request.requestId, promptId: prompt.id, option: chosen.index, keys,
+    delegation: { decisionId: request.decisionId, targetSessionId: request.targetSessionId, targetCwd: request.targetCwd,
+      promptHash: request.promptHash, evidenceHash: request.evidenceHash },
+  });
+  const receipt: StoredReceipt = { requestId: request.requestId, state: "uncertain", seq: intent.seq, digest };
+  receipts.set(request.requestId, receipt);
+  const unchanged = () => {
+    const now = screenPrompt();
+    return now && hashOf(now.fingerprint) === prompt.hash ? now : null;
+  };
+  const beforeWrite = () => {
+    assertTarget();
+    if (!showsReviewed(screenPrompt())) throw new Refusal("prompt-changed");
+  };
+  answering = prompt.id;
+  try {
+    let result: AnswerResult = "still-open";
+    for (const key of keys.slice(0, -1)) {
+      beforeWrite();
+      pty!.write(arrow(key as "up" | "down"));
+      await sleep(40);
+    }
+    // Enter goes only once the marker sits on the chosen option of the same dialog.
+    let onTarget = false;
+    for (const until = Date.now() + 500; ; ) {
+      await sleep(40);
+      beforeWrite();
+      const now = unchanged();
+      if (!now) break;
+      if (now.highlighted === undefined || now.highlighted === chosen.index) { onTarget = true; break; }
+      if (Date.now() >= until) break;
+    }
+    if (onTarget) { beforeWrite(); pty!.write("\r"); }
+    else result = "changed";
+    if (result !== "changed")
+      for (const until = Date.now() + 1500; Date.now() < until; ) {
+        await sleep(100);
+        if (!unchanged()) { result = "closed"; break; }
+      }
+    if (result === "closed" && attention.prompt?.id === prompt.id)
+      record({ kind: "prompt-closed", promptId: prompt.id, reason: "answered-here", label: chosen.label }, "host");
+    record({ kind: "answer", promptId: prompt.id, requestId: request.requestId, option: { index: chosen.index, label: chosen.label }, text: false, result }, "host");
+    const done = append("input-result", { requestId: request.requestId, state: "delivered", result });
+    receipt.state = "delivered";
+    receipt.seq = done.seq;
+    receipt.result = result;
+    refreshControl(request);
+    return publicReceipt(receipt);
+  } catch {
+    // The intent is durable. A control takeover or a changed screen mid-answer leaves the receipt uncertain.
+    return publicReceipt(receipt);
+  } finally {
+    answering = undefined;
+  }
+}
+
 function validAnswer(request: AnswerRequest) {
   return (
     typeof request.requestId === "string" &&
@@ -1288,6 +1410,9 @@ const server = createServer((socket) => {
       } else if (request.op === "team-permission-expand") {
         if (!validTeamPermissionExpansion(request)) throw new Error("Invalid collapsed permission expansion request");
         result = await serialize(() => expandTeamPermission(request));
+      } else if (request.op === "session-permission-answer") {
+        if (!validSessionPermissionAnswer(request)) throw new Error("Invalid session permission answer request");
+        result = await serialize(() => answerSessionPermission(request));
       } else {
         if (
           !["input", "raw", "key", "stop"].includes(request.op) ||

@@ -33,6 +33,7 @@ import { isCollapsedPermissionPrompt, permissionEvidenceHash, oneShotPermissionO
 import { nativeContinuationSchema, teamModelProfileSchema, type NativeContinuation, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
 import { missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { withNativeContinuation } from "./native-continuation.js";
+import { SESSION_PERMISSION_ACTOR_LABEL, sessionPermissionRequestId, type SessionPermissionAnswer } from "./permission-session-requests.js";
 import { agentBoundary, inventoryRuntimeProcesses, runtimeIdentity, stopRuntimeTree, type RuntimeProcess, type TeamRuntimeInspection, type TeamRuntimeRetirement } from "./team-retirement.js";
 import { TeamError } from "./team-workspace.js";
 import {
@@ -385,9 +386,17 @@ export class Manager {
         };
       }),
     );
-    return rows.flatMap((row) =>
+    const listed = rows.flatMap((row) =>
       row.status === "fulfilled" ? [row.value] : [],
     );
+    for (const observer of this.listingObservers) try { observer(listed); } catch { /* an observer never fails a listing */ }
+    return listed;
+  }
+  private readonly listingObservers = new Set<(rows: Awaited<ReturnType<Manager["list"]>>) => void>();
+  /** Calls `observer` with every session listing, so a consumer that follows dialogs needs no listing of its own. */
+  observeListings(observer: (rows: Awaited<ReturnType<Manager["list"]>>) => void): () => void {
+    this.listingObservers.add(observer);
+    return () => { this.listingObservers.delete(observer); };
   }
   context(projectId: string) { return new ProjectContexts(this.config, this.key).context(projectId); }
   setContext(projectId: string, text: string, expectedVersion: number) {
@@ -759,6 +768,52 @@ export class Manager {
       } catch (error) {
         if ((error as { code?: unknown }).code) throw error;
         // The worker may have written keys before its acknowledgement was lost. Never replay here.
+        return { requestId, state: "uncertain", seq: controlled.seq };
+      }
+    } finally {
+      if (lease) {
+        try { await workerCall(this.config.runDir, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
+        catch { /* a lost worker or lease is reported by the next state read */ }
+      }
+    }
+  }
+  /**
+   * Types one permission-agent decision into a session outside any team run: the exact one-shot option,
+   * under a host control lease, after the session, its directory and its control are checked again. A
+   * team member's session is refused. An error with a code, or a ContentError, means nothing was typed.
+   */
+  async answerSessionPermission(sessionId: string, input: SessionPermissionAnswer): Promise<Receipt & { result?: import("@infinite/attention").AnswerResult }> {
+    const session = this.meta(sessionId).session;
+    if (session.team || session.workspace || session.executionLocation === "laptop" || session.runtime?.transport !== "pty" || session.runtime.nativeUi)
+      throw new ContentError("Only an interactive host session outside a team run takes a permission-agent answer", 403);
+    if (!input || typeof input.decisionId !== "string" || !/^[A-Za-z0-9._:-]{1,100}$/.test(input.decisionId) ||
+        !Number.isInteger(input.promptId) || input.promptId < 1 || !Number.isInteger(input.option) || input.option < 0 ||
+        !/^[a-f0-9]{64}$/i.test(input.promptHash) || !/^[a-f0-9]{64}$/i.test(input.evidenceHash) || typeof input.targetCwd !== "string")
+      throw new ContentError("The permission answer is incomplete");
+    let cwd: string;
+    try { cwd = realpathSync(session.cwd); }
+    catch { throw new ContentError("The session directory is unavailable"); }
+    if (cwd !== input.targetCwd) throw new ContentError("The permission answer targets a different directory", 403);
+    const state = await this.state(sessionId);
+    if (state.status !== "running" || state.runtime?.nativeUi) throw new ContentError("The session has no running managed terminal");
+    if (state.control) throw new ContentError("A person currently controls this session", 409);
+    const requestId = sessionPermissionRequestId(sessionId, input.decisionId);
+    const actor = { id: `session-permission:${input.decisionId}`, label: SESSION_PERMISSION_ACTOR_LABEL };
+    let lease: ControlLease | undefined;
+    try {
+      lease = await workerCall<ControlLease>(this.config.runDir, sessionId, { op: "control", action: "claim", actor });
+      const controlled = await this.state(sessionId);
+      if (controlled.status !== "running" || controlled.control?.id !== lease.id)
+        throw new ContentError("The session or its control lease changed before the answer", 409);
+      try {
+        return await workerCall(this.config.runDir, sessionId, {
+          op: "session-permission-answer", requestId, decisionId: input.decisionId, targetSessionId: sessionId, targetCwd: cwd,
+          promptId: input.promptId, promptHash: input.promptHash, evidenceHash: input.evidenceHash, option: input.option,
+          actor, leaseId: lease.id,
+        }, 12000);
+      } catch (error) {
+        if ((error as { code?: unknown }).code) throw error;
+        // The worker may have typed before its acknowledgement was lost. Never replay here.
         return { requestId, state: "uncertain", seq: controlled.seq };
       }
     } finally {

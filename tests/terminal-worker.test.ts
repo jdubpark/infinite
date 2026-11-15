@@ -502,6 +502,66 @@ test("delegated answers stay bound to the assigned one-shot prompt and stop afte
   } finally { await invalidationWorker.stop(); }
 });
 
+function sessionAnswerRequest(worker: Awaited<ReturnType<typeof fixture>>, prompt: NonNullable<WorkerState["attention"]["prompt"]>, actor: ControlActor, leaseId: string, decisionId: string, option: number) {
+  return {
+    op: "session-permission-answer" as const, requestId: randomUUID(), decisionId, targetSessionId: worker.id, targetCwd: worker.cwd,
+    promptId: prompt.id, promptHash: prompt.hash!, evidenceHash: permissionEvidenceHash(prompt), option, actor, leaseId,
+  };
+}
+
+test("a session permission answer types one recognised option outside any run, only under the host's own lease", { timeout: 40_000 }, async () => {
+  const decisionId = randomUUID();
+  const actor = { id: `session-permission:${decisionId}`, label: "Session permission" };
+  const opened = (worker: Awaited<ReturnType<typeof fixture>>) => waitFor(() => worker.call({ op: "state" }),
+    state => state.attention.state === "needs-you" && Boolean(state.attention.prompt?.hash && state.attention.prompt.tool?.name));
+  const intents = (worker: Awaited<ReturnType<typeof fixture>>) => worker.events().filter(event => event.type === "input-intent" && event.data.op === "session-permission-answer");
+
+  const member = await fixture("demo", "", { runId: randomUUID(), memberId: randomUUID(), revision: 1, role: "implementer" });
+  try {
+    await member.command("permission");
+    const prompt = (await opened(member)).attention.prompt!;
+    const lease = await member.call<ControlLease>({ op: "control", action: "claim", actor });
+    await assert.rejects(member.call(sessionAnswerRequest(member, prompt, actor, lease.id, decisionId, 0)), { code: "unsupported" });
+    assert.equal(intents(member).length, 0, "a team member's dialog never takes the session path");
+  } finally { await member.stop(); }
+
+  const worker = await fixture("demo");
+  try {
+    await worker.command("permission");
+    const prompt = (await opened(worker)).attention.prompt!;
+    const human = { id: "human-control", label: "Human" };
+    const humanLease = await worker.call<ControlLease>({ op: "control", action: "claim", actor: human });
+    await assert.rejects(worker.call({ op: "control", action: "claim", actor }), { code: "control-busy" });
+    await assert.rejects(worker.call(sessionAnswerRequest(worker, prompt, actor, humanLease.id, decisionId, 0)), { code: "control-lost" });
+    await worker.call({ op: "control", action: "release", actor: human, leaseId: humanLease.id });
+    const lease = await worker.call<ControlLease>({ op: "control", action: "claim", actor });
+    await assert.rejects(worker.call({ ...sessionAnswerRequest(worker, prompt, actor, lease.id, decisionId, 0), evidenceHash: "0".repeat(64) }), { code: "prompt-changed" });
+    await assert.rejects(worker.call({ ...sessionAnswerRequest(worker, prompt, actor, lease.id, decisionId, 0), targetCwd: `${worker.cwd}/other` }), { code: "unsupported" });
+    await assert.rejects(worker.call(sessionAnswerRequest(worker, prompt, actor, lease.id, decisionId, 5)), { code: "invalid-option" });
+    assert.equal(intents(worker).length, 0, "refused answers never journal or type");
+
+    const reject = sessionAnswerRequest(worker, prompt, actor, lease.id, decisionId, 0);
+    const receipt = await worker.call<Receipt & { result?: string }>(reject);
+    assert.equal(receipt.state, "delivered");
+    assert.equal(receipt.result, "closed");
+    assert.deepEqual(await worker.call<Receipt & { result?: string }>(reject), receipt);
+    assert.equal(intents(worker).length, 1, "a replayed request types nothing again");
+
+    // A person who takes control after the intent stops the answer before its Enter.
+    await worker.call({ op: "control", action: "release", actor, leaseId: lease.id });
+    await worker.command("permission");
+    const next = await waitFor(() => worker.call({ op: "state" }), state => state.attention.state === "needs-you" && (state.attention.prompt?.id ?? 0) > prompt.id && Boolean(state.attention.prompt?.hash && state.attention.prompt.tool?.name));
+    const nextLease = await worker.call<ControlLease>({ op: "control", action: "claim", actor });
+    const accept = sessionAnswerRequest(worker, next.attention.prompt!, actor, nextLease.id, decisionId, 1);
+    const pending = worker.call<Receipt & { result?: string }>(accept);
+    await waitFor(async () => worker.events(), events => events.some(event => event.type === "input-intent" && event.data.requestId === accept.requestId));
+    await worker.call<ControlLease>({ op: "control", action: "claim", actor: human, takeover: true });
+    const interrupted = await pending;
+    assert.equal(interrupted.state, "uncertain");
+    assert.equal(worker.output().match(/APPROVED/g)?.length, 1, "only the first answer reached the dialog");
+  } finally { await worker.stop(); }
+});
+
 test("ordinary interrupted answer retries return the refused receipt without typing again", { timeout: 20_000 }, async () => {
   const worker = await fixture("demo");
   try {

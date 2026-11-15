@@ -543,12 +543,18 @@ function migrateVersion4(tx: EvidenceTx): void {
   );
   const bases = new Map<string, PointBase>();
   const stored: { outcomeId: string; featureMapRef: string; ownerScore: number | null }[] = [];
-  for (const row of tx.all<{ outcome_id: string; run_id: string; source: string; role: string; payload: string }>(
-    "SELECT outcome_id, run_id, source, role, payload FROM outcomes",
+  for (const row of tx.all<{ outcome_id: string; run_id: string; source: string; role: string; attempt_index: number; payload: string }>(
+    "SELECT outcome_id, run_id, source, role, attempt_index, payload FROM outcomes",
   )) {
     try {
       const payload = tx.open<OutcomePayload>(OUTCOMES, row.outcome_id, row.payload);
-      bases.set(row.outcome_id, { runId: row.run_id, source: row.source, role: row.role, replaces: payload.replaces });
+      bases.set(row.outcome_id, {
+        runId: row.run_id,
+        source: row.source,
+        role: row.role,
+        attemptIndex: row.attempt_index,
+        replaces: payload.replaces,
+      });
       stored.push({
         outcomeId: row.outcome_id,
         featureMapRef: tx.index("feature-map", payload.featureMap),
@@ -576,15 +582,16 @@ function migrateVersion4(tx: EvidenceTx): void {
 
 /** The routing point of a row, derived from its replacement. `point` is set only on an implementer row that is not legacy. */
 type RoutingPointValue = "start" | "escalation";
-type PointBase = { runId: string; source: string; role: string; replaces: Replaces };
+type PointBase = { runId: string; source: string; role: string; attemptIndex: number; replaces: Replaces };
 type Replaces = OutcomePayload["replaces"];
 
 /**
  * A row's point: `start` with no replacement, `escalation` for an escalation's replacement, and otherwise the point of
  * the replaced member's row, which `predecessorPoint` gives. A legacy row, a scout row, or a row with no point gives null.
+ * Attempt 0 is the blank row of a task integrated with no member start seen: its point is unknown, so it is never `start`.
  */
 function pointOf(base: PointBase, predecessorPoint: (outcomeId: string) => RoutingPointValue | null): RoutingPointValue | null {
-  if (base.source === "legacy" || base.role !== "implementer") return null;
+  if (base.source === "legacy" || base.role !== "implementer" || base.attemptIndex === 0) return null;
   if (base.replaces === undefined) return "start";
   if (base.replaces.cause === "escalation") return "escalation";
   return predecessorPoint(`${base.runId}:${base.replaces.memberId}`);
@@ -784,7 +791,7 @@ function routingColumns(tx: EvidenceTx, row: OutcomeRow): { point: RoutingPointV
   const payload = row.payload;
   return {
     point: pointOf(
-      { runId: row.runId, source: row.source, role: row.role, replaces: payload.replaces },
+      { runId: row.runId, source: row.source, role: row.role, attemptIndex: row.attemptIndex, replaces: payload.replaces },
       outcomeId => tx.get<{ point: RoutingPointValue | null }>("SELECT point FROM outcomes WHERE outcome_id=?", outcomeId)?.point ?? null,
     ),
     featureMapRef: tx.index("feature-map", payload.featureMap),

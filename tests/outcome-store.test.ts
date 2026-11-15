@@ -1272,19 +1272,20 @@ function outcomesVersion3(): EvidenceModule {
 /** Inserts an outcome row the way a version 3 host did, with no routing columns. `sealed` is the stored payload text. */
 function insertOutcomeAtVersion3(
   tx: EvidenceTx,
-  row: { outcomeId: string; runId: string; memberId: string; source: string; role: string; sealed: string },
+  row: { outcomeId: string; runId: string; memberId: string; source: string; role: string; sealed: string; attemptIndex?: number },
 ): void {
   tx.run(
     "INSERT INTO outcomes (outcome_id, source, project_ref, task_ref, run_id, revision, member_id, attempt_index, "
     + "inherited, role, profile_id, provider, model, profile_epoch, area_ref, risk, feature_version, disposition, "
     + "flags, integrated, accepted, acceptance, first_pass, payload) "
-    + "VALUES (?, ?, ?, ?, ?, 1, ?, 1, 0, ?, 'profile-a', 'opencode', 'model-one', 1, ?, 'low', 1, 'completed', '', 1, 1, 1, 1, ?)",
+    + "VALUES (?, ?, ?, ?, ?, 1, ?, ?, 0, ?, 'profile-a', 'opencode', 'model-one', 1, ?, 'low', 1, 'completed', '', 1, 1, 1, 1, ?)",
     row.outcomeId,
     row.source,
     tx.index("project", "example"),
     tx.index("task", "task-a"),
     row.runId,
     row.memberId,
+    row.attemptIndex ?? 1,
     row.role,
     tx.index("area", "packages/host"),
     row.sealed,
@@ -1315,7 +1316,10 @@ test("a version 3 store migrates to version 4 and fills the routing columns", ()
   try {
     store = open(f);
     store.register(outcomesVersion3());
-    const seeded: { runId: string; memberId: string; source: string; role: string; payload: OutcomePayload | "x" }[] = [
+    const seeded: { runId: string; memberId: string; source: string; role: string; payload: OutcomePayload | "x"; attemptIndex?: number }[] = [
+      // An integrated task with no start seen: attempt 0 has no point, and its replacement inherits none.
+      { runId: "run-10", memberId: "s1", source: "production", role: "implementer", payload: plainPayload(), attemptIndex: 0 },
+      { runId: "run-10", memberId: "r1", source: "production", role: "implementer", payload: plainPayload({ replaces: { memberId: "s1", cause: "stall" } }) },
       { runId: "run-1", memberId: "m1", source: "production", role: "implementer", payload: plainPayload() },
       { runId: "run-1", memberId: "m2", source: "production", role: "implementer", payload: plainPayload({ replaces: { memberId: "m1", cause: "stall" } }) },
       { runId: "run-1", memberId: "m3", source: "production", role: "implementer", payload: plainPayload({ replaces: { memberId: "m2", cause: "escalation" } }) },
@@ -1337,6 +1341,7 @@ test("a version 3 store migrates to version 4 and fills the routing columns", ()
           source: row.source,
           role: row.role,
           sealed: row.payload === "x" ? "x" : tx.seal("outcomes", outcomeId, row.payload),
+          attemptIndex: row.attemptIndex,
         });
       }
     });
@@ -1375,6 +1380,8 @@ test("a version 3 store migrates to version 4 and fills the routing columns", ()
       "run-4:m1": null,
       "run-5:m1": "start",
       "run-6:m1": null,
+      "run-10:s1": null,
+      "run-10:r1": null,
     });
     assert.deepEqual(Object.fromEntries(migrated.rows.map(row => [row.outcome_id, row.owner_score])), {
       "run-1:m1": null,
@@ -1386,6 +1393,8 @@ test("a version 3 store migrates to version 4 and fills the routing columns", ()
       "run-4:m1": null,
       "run-5:m1": 4,
       "run-6:m1": null,
+      "run-10:s1": null,
+      "run-10:r1": null,
     });
     for (const row of migrated.rows) {
       assert.equal(row.feature_map_ref, row.outcome_id === "run-6:m1" ? "unreadable" : migrated.featureMap);
@@ -1418,6 +1427,26 @@ test("writes keep the routing columns", () => {
 
     store.write(tx => writeOutcome(tx, routingRow("run-1", "m1", undefined, 2)));
     assert.deepEqual(routingOf(store)["run-1:m1"], { point: "start", owner_score: 2 });
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("a row at attempt zero has no point, and its replacement inherits none", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    store.register(outcomeModule({ now: () => NOW }));
+    store.write(tx => {
+      writeOutcome(tx, { ...routingRow("run-1", "s1"), attemptIndex: 0 });
+      writeOutcome(tx, { ...routingRow("run-1", "r1", { memberId: "s1", cause: "stall" }), attemptIndex: 2 });
+    });
+    assert.deepEqual(routingOf(store), {
+      "run-1:r1": { point: null, owner_score: null },
+      "run-1:s1": { point: null, owner_score: null },
+    });
   } finally {
     store?.close();
     f.close();
@@ -1530,6 +1559,89 @@ test("routing evidence reads seek the route index", () => {
       assert.ok(!details.some(line => line.startsWith("SCAN o")), details.join("\n"));
       assert.ok(!details.some(line => line.includes("USE TEMP B-TREE")), details.join("\n"));
     }
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("migration gives no point to a replacement cycle or to a chain past 64 hops, and an older host leaves the module unavailable", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    store.register(outcomesVersion3());
+    const seeded: { runId: string; memberId: string; payload: OutcomePayload | "x" }[] = [
+      { runId: "run-7", memberId: "m1", payload: plainPayload({ replaces: { memberId: "m2", cause: "stall" } }) },
+      { runId: "run-7", memberId: "m2", payload: plainPayload({ replaces: { memberId: "m1", cause: "stall" } }) },
+      { runId: "run-9", memberId: "m1", payload: "x" },
+      { runId: "run-9", memberId: "m2", payload: plainPayload({ replaces: { memberId: "m1", cause: "stall" } }) },
+      { runId: "run-9", memberId: "m3", payload: plainPayload({ replaces: { memberId: "m1", cause: "escalation" } }) },
+      { runId: "run-8", memberId: "c0", payload: plainPayload() },
+    ];
+    for (let k = 1; k <= 65; k++) seeded.push({ runId: "run-8", memberId: `c${k}`, payload: plainPayload({ replaces: { memberId: `c${k - 1}`, cause: "stall" } }) });
+    store.write(tx => {
+      for (const row of seeded) {
+        const outcomeId = `${row.runId}:${row.memberId}`;
+        insertOutcomeAtVersion3(tx, { outcomeId, runId: row.runId, memberId: row.memberId, source: "production", role: "implementer",
+          sealed: row.payload === "x" ? "x" : tx.seal("outcomes", outcomeId, row.payload) });
+      }
+    });
+    store.close();
+    store = open(f);
+    store.register(outcomeModule({ now: () => NOW }));
+    assert.equal(store.status().modules.outcomes, "ready");
+    const points = routingOf(store);
+    assert.deepEqual([points["run-7:m1"]!.point, points["run-7:m2"]!.point], [null, null]);
+    assert.deepEqual([points["run-9:m2"]!.point, points["run-9:m3"]!.point], [null, "escalation"]);
+    assert.equal(points["run-8:c64"]!.point, "start");
+    assert.equal(points["run-8:c65"]!.point, null);
+    store.write(tx => writeOutcome(tx, routingRow("run-9", "m4", { memberId: "m1", cause: "stall" })));
+    assert.equal(routingOf(store)["run-9:m4"]!.point, null);
+    store.write(tx => {
+      tx.run("UPDATE outcomes SET payload='x' WHERE outcome_id='run-8:c0'");
+      writeOutcome(tx, routingRow("run-8", "d1", { memberId: "c0", cause: "answer" }));
+    });
+    assert.equal(routingOf(store)["run-8:d1"]!.point, "start");
+    store.close();
+    store = open(f);
+    store.register(outcomesVersion3());
+    assert.equal(store.status().modules.outcomes, "unavailable");
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("a route read maps every column, includes rows ended at since, and sorts by outcome id", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    store.register(configurationModule());
+    store.register(outcomeModule({ now: () => NOW }));
+    assert.equal(ROUTING_ROWS_PER_SOURCE, 1000);
+    store.write(tx => {
+      tx.run(
+        "INSERT INTO configurations (config_id, provider, model, effort, prompt_version, guidance, knowledge, routing, shape, first_seen_at) "
+        + "VALUES ('cfg-1', 'opencode', 'model-one', 'high', 'pv-1', 'g', 'k', 'r', 's', ?)", NOW);
+      writeOutcome(tx, outcomeRow({
+        outcomeId: "run-z:m1", runId: "run-z", memberId: "m1", kind: "bugfix", featureVersion: 3,
+        disposition: "integrated", integrated: 1, accepted: 0, firstPass: 0, held: 1, profileEpoch: 2, configId: "cfg-1",
+        flags: ["same-model-review"], endedAt: ROUTE_SINCE, frozenAt: T_IN,
+        payload: plainPayload({ featureMap: "map-2", ownerRating: { score: 5, at: T_EARLY } }),
+      }));
+      writeOutcome(tx, outcomeRow({ outcomeId: "run-a:m1", runId: "run-a", memberId: "m1", source: "duel", endedAt: T_IN, payload: plainPayload() }));
+    });
+    const read = store.read(db => ({ rows: selectRoutingEvidence(db, IDENTITY_A, "start", ROUTE_SINCE), map2: db.index("feature-map", "map-2"), map1: db.index("feature-map", "map-1"), project: db.index("project", "example"), area: db.index("area", "packages/host") }));
+    assert.deepEqual(read.rows.map(row => row.outcomeId), ["run-a:m1", "run-z:m1"]);
+    assert.deepEqual({ ...read.rows[1] }, {
+      outcomeId: "run-z:m1", source: "production", projectRef: read.project, areaRef: read.area, provider: "opencode", model: "model-one",
+      effort: "high", profileEpoch: 2, kind: "bugfix", featureVersion: 3, disposition: "integrated", exclusion: null,
+      flags: ["same-model-review"], integrated: 1, accepted: 0, firstPass: 0, held: 1, endedAt: ROUTE_SINCE, frozenAt: T_IN,
+      point: "start", featureMapRef: read.map2, ownerScore: 5, promptVersion: "pv-1",
+    });
+    assert.equal(read.rows[0]!.featureMapRef, read.map1);
   } finally {
     store?.close();
     f.close();

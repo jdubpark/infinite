@@ -558,13 +558,15 @@ calls are handled as before the permission agent, by the launch profile's own
 allowlist, and an allow is withheld when the run stops being live before it is
 returned.
 
-A class call from the primary agent is deferred: the provider ends its run,
+A class call from the primary agent is deferred only when the host records an
+owner decision for it: the provider ends its run,
 the session waits, and only the owner's answer on that session's prompt
 resumes it. The answer applies once, to that call id, and a resumed call whose
 input differs is denied. Before an owner's allow is returned to the resumed
 call, the worker asks the host again: an owner halt that covers the project,
-a changed session root, a team run that is no longer live, or a decision that
-no longer applies withholds the allow, and so does a host that cannot be
+a changed session root, a team run that is no longer live, a deferral that was
+issued no decision, or a decision that no longer applies, including one reached
+before or during an owner halt, withholds the allow, and so does a host that cannot be
 reached at that moment. A withheld allow is denied with `unavailable`, and the
 answer is used all the same. An owner's refusal is returned without that
 check. A resume that the host confirmed just before a halt was recorded can
@@ -572,8 +574,11 @@ still run its call after the halt is acknowledged; nothing recalls an allow
 that has reached the provider's hook. The session's worker holds the answer,
 so after an API restart between the answer and the resume the call runs once
 if the restarted API confirms it; a host restart that ends the worker loses
-the answer, and the call does not run. A class call from a subagent cannot be deferred. It
-is denied with `needs-owner`, and the owner gets a notice. While one call
+the answer, and the call does not run. A class call from a subagent cannot be
+deferred. It is denied with `needs-owner`, and the owner gets a notice. So is a
+class call for which the host could record no owner decision. A class call
+that arrives during an owner halt is denied with `unavailable`, and nothing
+waits for the release. While one call
 waits, every other call of the session is denied. A call is denied with
 `unavailable` when the host cannot be reached. An unanswered call is retired
 after 29 days. A session cannot be resumed after its worker ended while a call

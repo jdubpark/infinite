@@ -506,3 +506,59 @@ test("a subteam's halt pause and resume are decided in its own queue, and the ow
     assert.equal(teams.get(turning).revision, turningRevision, "the waiting subteam does not replan on release");
   } finally { halt.stop(); missions.close(); f.close(); }
 });
+
+/** A mission with one working subteam, and the halt and mission services over it, opened from the records on disk. */
+function missionWithSubteam(f: Fixture, missionId: string) {
+  const teams = f.openTeam();
+  const manager = { meta: () => { throw Object.assign(new Error("No session."), { code: "ENOENT" }); }, hostLoad: { held: () => undefined } } as unknown as Manager;
+  const missions = new MissionService(f.config, f.key, manager, teams, { get: () => { throw new Error("Not queried in this test"); } });
+  const stored = (missions as unknown as { records: Map<string, { ops: { kind: string; teamId: string; halt?: unknown }[]; ownerHalt?: { token: string; children: string[] } }> }).records.get(missionId)!;
+  const halt = new HaltService({ config: f.config, key: f.key });
+  halt.useServices({ routines: noRoutines, goals: noRoutines, missions, teams }, id => missions.ownsActiveSubteam(id));
+  return { teams, missions, halt, stored, applyOps: () => (missions as unknown as { applyOps(stored: unknown): Promise<void> }).applyOps(stored), close: () => { halt.stop(); missions.close(); } };
+}
+
+test("a subteam's first paused record carries the halt's mark, so a restart keeps it and the release resumes it", async () => {
+  const f = schedulerFixture();
+  const missionId = randomUUID(), teamId = writeRun(f, { status: "implementing", missionId, title: "Subteam" } as Partial<TeamRun>);
+  writeMission(f, "fixture", [{ id: "a", title: "a", instructions: "a", repoProjectId: "fixture", dependsOn: [], size: "team", status: "running", teamId }], missionId);
+  const first = missionWithSubteam(f, missionId);
+  let second: ReturnType<typeof missionWithSubteam> | undefined;
+  try {
+    await first.halt.engage(fixtureScope, { requestId: randomUUID() }, owner);
+    // The host stops right after the pause path writes the subteam's first paused record.
+    const internal = first.teams as unknown as { save(stored: { run: TeamRun }): void };
+    const save = internal.save.bind(first.teams);
+    internal.save = stored => { save(stored); if (stored.run.id === teamId && stored.run.status === "paused") throw new Error("The host stopped."); };
+    await assert.rejects(first.applyOps(), /The host stopped/);
+    const durable = f.readRecord<{ run: TeamRun; ownerHalt?: { haltId?: string } }>("team", teamId);
+    assert.equal(durable.run.status, "paused");
+    assert.equal(durable.ownerHalt?.haltId, first.stored.ownerHalt?.token, "the first paused record already carries the halt's mark");
+    first.close();
+
+    second = missionWithSubteam(f, missionId);
+    await second.applyOps();
+    assert.deepEqual(second.stored.ownerHalt?.children, [teamId], "the replayed pause finds its mark and is recorded");
+    await step(second.teams, teamId);
+    await second.halt.release(fixtureScope, { requestId: randomUUID() }, owner);
+    await second.applyOps();
+    assert.equal(second.teams.get(teamId).status, "planning", "the release resumes the subteam");
+  } finally { first.close(); second?.close(); f.close(); }
+});
+
+test("a release that ends a mission's halt mark retires the halt's undelivered pauses", async () => {
+  const f = schedulerFixture();
+  const missionId = randomUUID(), teamId = writeRun(f, { status: "implementing", missionId, title: "Subteam" } as Partial<TeamRun>);
+  writeMission(f, "fixture", [{ id: "a", title: "a", instructions: "a", repoProjectId: "fixture", dependsOn: [], size: "team", status: "running", teamId }], missionId);
+  const { teams, halt, applyOps, close } = missionWithSubteam(f, missionId);
+  const ownerAction = (action: "pause" | "resume") => teams[action](teamId, { requestId: randomUUID(), revision: teams.get(teamId).revision });
+  try {
+    await halt.engage(fixtureScope, { requestId: randomUUID() }, owner);
+    // The owner releases and keeps the mission paused before its pause reaches the subteam, then pauses and resumes the subteam.
+    await halt.release(fixtureScope, { requestId: randomUUID(), keepPaused: true }, owner);
+    await ownerAction("pause"); await step(teams, teamId); await ownerAction("resume");
+    await applyOps(); await step(teams, teamId);
+    assert.equal(teams.get(teamId).status, "paused", "the kept mission pauses its subteam the way the owner's pause of a mission does");
+    assert.equal(teams.get(teamId).reason, undefined, "no halt claims the pause once the halt is off");
+  } finally { close(); f.close(); }
+});

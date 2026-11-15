@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { Blackboard, IngestOutcome, MemberPostRecord, MemberReadRecord } from "./evidence/blackboard.js";
 import { memberEntryEnvelopeSchema } from "./evidence/member-entry.js";
 import type { Event } from "./types.js";
-import type { TeamMember, TeamRun } from "./team-types.js";
+import { ACTIVE_MEMBER_STATUSES, type TeamMember, type TeamRun } from "./team-types.js";
 
 /** Journal events of a member's entry calls: the worker's posts and read receipts. */
 export const ENTRY_EVENT_TYPES = new Set<string>(["team-entry", "team-entry-read"]);
@@ -15,8 +15,6 @@ export const ENTRY_INGEST_MS = 1_000;
 /** The run event that says posts were dropped at the run limit. It is added once per run. */
 export const ENTRY_DROP_TEXT = "Member entries over the run limit of 400 were dropped.";
 
-/** The member states the team service counts as active. Same list as `activeMember` in teams.ts. */
-const ACTIVE_MEMBER_STATUSES = new Set<TeamMember["status"]>(["queued", "running", "reported", "unavailable"]);
 const readSchema = z.object({ op: z.enum(["list", "get"]), servedBytes: z.number().int().min(0) }).strict();
 
 export type IngestDeps = {
@@ -60,7 +58,7 @@ export function ingestRunEntries(run: TeamRun, deps: IngestDeps): { advanced: bo
         // A page with no post and no receipt moves the cursor in memory only: no store write, and no advance to save.
         if (posts.length === 0 && reads.length === 0) {
           member.entryCursor = page.cursor;
-          if (!page.more && !ACTIVE_MEMBER_STATUSES.has(member.status)) deps.done.add(member.memberId);
+          if (!page.more && !ACTIVE_MEMBER_STATUSES.includes(member.status)) deps.done.add(member.memberId);
           continue;
         }
         const outcome: IngestOutcome = deps.entries.ingest(run, member, posts, reads);
@@ -68,7 +66,7 @@ export function ingestRunEntries(run: TeamRun, deps: IngestDeps): { advanced: bo
         result.dropped += outcome.dropped;
         if (page.cursor !== (member.entryCursor ?? 0)) { member.entryCursor = page.cursor; result.advanced = true; }
         // A stopped member whose journal was read to its end sends no more entry calls, so it is settled for good.
-        if (!page.more && !ACTIVE_MEMBER_STATUSES.has(member.status)) deps.done.add(member.memberId);
+        if (!page.more && !ACTIVE_MEMBER_STATUSES.includes(member.status)) deps.done.add(member.memberId);
       } catch {
         // A member whose page cannot be read keeps its cursor and waits for a later pass.
       }

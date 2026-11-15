@@ -452,6 +452,8 @@ export interface TeamMember extends TeamAssignment {
   /** Computed on read for members whose provider reports usage; never stored. */
   usage?: UsageTotals;
 }
+/** The member states the team service counts as active. */
+export const ACTIVE_MEMBER_STATUSES: readonly TeamMember["status"][] = ["queued", "running", "reported", "unavailable"];
 export interface TeamTask extends TeamTaskPlan {
   /** Run revision whose plan created this task. */
   revision: number;

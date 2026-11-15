@@ -598,6 +598,14 @@ Spec part 4 (posting and reading), the digest and prompt paragraphs of part 5, t
 
 This phase adds no Git command.
 
+
+**Rulings after the second review.** The repair's code stands. Three rules had no test that fails without them, and one list existed twice.
+
+- **A running member's later posts are stored in the same process.** `ingestRunEntries` settles a member only when its status is not active. New test `a running member is read again on every pass` in `tests/team-entry-ingest.test.ts`, with fake `events` and `entries`: one post, a pass, a second post, a second pass with the same `done` set: both posts reach `entries.ingest`.
+- **A stopped member is settled only at the end of its journal.** A page can be silent and still say `more` (the journal reader stops after 512 KiB of other lines). New test `a stopped member with more to read is not settled` in the same file: the first page is `{ events: [], more: true }`, the second holds a post: the post reaches `entries.ingest`, and the member is settled only after the page that says no more.
+- **A withdrawn handoff stays withdrawn.** A later handoff of the same task supersedes only an `active` handoff. `withdraw hides nothing from the owner and changes state once` (in `tests/blackboard-ingest.test.ts`) gains a block: withdraw a handoff, ingest a later handoff for its task: the first is still `withdrawn`, and a member's list and read of it give nothing.
+- **One list of active member states.** `ACTIVE_MEMBER_STATUSES` is exported from `team-types.ts`. `activeMember` in `teams.ts` and the two checks in `team-entry-ingest.ts` use it, so the ingest pass and the team service cannot drift apart.
+
 ## Trust boundary, and what a review checks
 
 These inputs originate outside the host:

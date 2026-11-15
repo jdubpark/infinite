@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Blackboard, type MemberPostRecord } from "../packages/host/src/evidence/blackboard.js";
+import { getForMember, listForMember, readMemberScope } from "../packages/host/src/evidence/entry-reads.js";
 import { MEMBER_ENTRY_KINDS } from "../packages/host/src/evidence/entry-types.js";
 import { memberEntryId, memberEntryPostSchema, type MemberEntryPost } from "../packages/host/src/evidence/member-entry.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
@@ -451,6 +452,30 @@ test("withdraw hides nothing from the owner and changes state once", () => {
     // The later post comes from the entry's own author, so the supersede rule would apply to an active entry.
     assert.equal(board.ingest(run, implA, [post(implA, contract("later", { supersedes: id }))], []).stored, 1);
     assert.equal(board.get(run.id, id)?.head.state, "withdrawn");
+
+    // A later handoff of the same task supersedes only an active handoff, so the withdrawn one stays withdrawn.
+    const first = post(implA, handoff("withdrawn-handoff", "a"));
+    const firstId = first.envelope.requestId;
+    assert.equal(board.ingest(run, implA, [first], []).stored, 1);
+    assert.equal(board.withdraw(run.id, firstId), "withdrawn");
+    const later = post(implA, handoff("later-handoff", "a"), { at: at(20) });
+    const laterId = later.envelope.requestId;
+    assert.equal(board.ingest(run, implA, [later], []).stored, 1);
+    assert.equal(board.get(run.id, firstId)?.head.state, "withdrawn");
+    assert.equal(board.get(run.id, laterId)?.head.state, "active");
+
+    // A reader of the same task sees the later handoff, never the withdrawn one. The author's own posts are not listed to it.
+    const reader = sibling(implA);
+    assert.equal(board.mirror(run), true);
+    const launchSeq = board.launchMark(run.id);
+    if (launchSeq === undefined) throw new Error("no launch mark");
+    assert.equal(board.recordLaunch(run, reader, { launchSeq, promptBytes: 1200, contextBytes: 4000 }), true);
+    const scope = store.read(db => readMemberScope(db, reader.memberId));
+    if (scope === undefined) throw new Error("member scope missing");
+    const listed = store.read(db => listForMember(db, scope, undefined)).heads.map(head => head.entryId);
+    assert.ok(listed.includes(laterId));
+    assert.equal(listed.includes(firstId), false);
+    assert.equal(store.read(db => getForMember(db, scope, firstId)), undefined);
     store.close();
 
     const wrong = open(f, { key: randomBytes(32) });

@@ -415,14 +415,14 @@ export class IntakeService {
   }
 
   /**
-   * Chooses the route of each direct request that has none: the owner's word was stored when the mention arrived, so what
-   * remains is a reading (when `classify` is on) or the default. The reading never blocks past its bound and never throws.
-   * Records made before routing, or with `answerQuestions` off, are work and are left alone.
+   * Chooses the route of each marked (`routable`) direct request that has none: the owner's word was stored when the mention
+   * arrived, so what remains is a reading (only with `answerQuestions` and `classify` both on) or the default, which is work.
+   * It runs whatever the settings are now, so a marked request cannot be stranded by turning routing off before its route is
+   * stored. The reading never blocks past its bound and never throws. Unmarked records are work and are left alone.
    */
   private async route(): Promise<void> {
     const slack = this.config.intake?.slack;
-    if (!slack?.answerQuestions) return;
-    const router = slack.classify ? this.options.router : undefined;
+    const router = slack?.answerQuestions && slack.classify ? this.options.router : undefined;
     const pending = this.store.list().filter(item => item.direct?.routable === true && !item.request && !item.direct.route);
     const decided = await Promise.all(pending.map(async record => {
       const text = record.direct!.text.trim().slice(0, ROUTE_INPUT_LIMIT);

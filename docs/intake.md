@@ -173,7 +173,8 @@ Routing eligibility is fixed when the mention is saved: a record saved with
 `answerQuestions` on carries `routable`, and only such a record is routed or read
 by the reading service. A request saved before the setting was on, including one
 whose Linear filing was still pending, stays work and follows the original filing
-and reconciliation path.
+and reconciliation path. A marked request whose route was not yet stored when the setting is turned
+off goes to work in the next cycle and is filed; a route already stored is kept.
 
 The stored route (`kind`, `by`, `confidence`, `at`) is on each record in
 `GET /api/intake`, without the request's text. A record made before this feature,

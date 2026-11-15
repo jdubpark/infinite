@@ -1425,3 +1425,22 @@ test("a request saved before routing existed, or while answerQuestions was off, 
     assert.equal(ctx.linearServer.allIssues().length, 2);
   } finally { await ctx.close(); }
 });
+
+test("a marked request whose route was not stored when routing was turned off goes to work and is filed", { timeout: 60000 }, async () => {
+  const calls: string[] = [];
+  const ctx = await setup({ requireSlackThread: false, admitIssues: false, router: async text => { calls.push(text); return { route: "answer", confidence: 1 }; } });
+  try {
+    const root = slackTs(ctx.enabled + 2000);
+    ctx.threads.threads.set(root, [{ ts: root, user: OWNER_SLACK, text: "update the exporter" }]);
+    const now = new Date().toISOString();
+    ctx.store.create({ issueId: randomUUID(), identifier: "", url: "", title: "update the exporter", description: "update the exporter", issueCreatedAt: now, issueUpdatedAt: now,
+      state: "queued", thread: { channelId: "C0000000000", threadTs: root }, direct: { eventId: "EvMarked", ts: root, text: "update the exporter", routable: true },
+      comments: {}, messages: [], questions: [], inbound: [], createdAt: now, updatedAt: now });
+    assert.equal(ctx.config.intake!.slack!.answerQuestions, false);
+    await ctx.intake.poll();
+    const [record] = ctx.store.list();
+    assert.deepEqual([record.direct?.route?.kind, record.direct?.route?.by, record.state, record.identifier !== ""], ["work", "default", "started", true]);
+    assert.deepEqual(calls, []);
+    assert.equal(ctx.linearServer.allIssues().length, 1);
+  } finally { await ctx.close(); }
+});

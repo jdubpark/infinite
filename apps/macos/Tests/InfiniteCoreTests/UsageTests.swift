@@ -92,6 +92,12 @@ final class UsageTests: XCTestCase {
     }
 
     /// Nothing measured is "—", a partly measured figure is a floor, and only a fully priced figure is exact.
+    /// The remote channel refuses any `%` in a path, so a hyphenated project ID must reach it unencoded.
+    func testProjectCostPathKeepsHyphensAndStillEscapesOtherCharacters() {
+        XCTAssertEqual(RemoteClient.usageProjectPath("storefront-api", tz: "UTC"), "/usage/projects/storefront-api?tz=UTC")
+        XCTAssertEqual(RemoteClient.usageProjectPath("a/b", tz: "UTC"), "/usage/projects/a%2Fb?tz=UTC")
+    }
+
     func testUnmeasuredWorkNeverShowsAsZero() {
         XCTAssertEqual(Money(usd: 0, unpriced: 0).display(unmeasured: 3), .absent)
         XCTAssertEqual(Money(usd: 0, unpriced: 2).display(), .absent)

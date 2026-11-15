@@ -72,7 +72,9 @@ export const githubBoundarySchema = z.object({
 
 const schema = z
   .object({
-    linear: z.object({ apiKeyFile: z.string().refine(isAbsolute), endpoint: z.url().optional(), reportName: z.string().trim().min(1).max(40).regex(/^[A-Za-z][A-Za-z0-9 -]*$/).default(DEFAULT_REPORT_NAME) }).strict().optional(),
+    // No parse default for `reportName`: the routine authority digest hashes this block, so an added key would block every
+    // approved routine after an upgrade. `reportName(config)` applies the default instead.
+    linear: z.object({ apiKeyFile: z.string().refine(isAbsolute), endpoint: z.url().optional(), reportName: z.string().trim().min(1).max(40).regex(/^[A-Za-z][A-Za-z0-9 -]*$/).optional() }).strict().optional(),
     hostLoad: z.object({ minAvailableMemoryGiB: z.number().min(0).max(4096), maxLoadPerCpu: z.number().positive().max(64) }).strict().optional(),
     intake: intakeConfigSchema.optional(),
     teams: z.object({ workspaceDir: z.string().refine(isAbsolute), commandPrefix: teamCommandSchema.optional(), lineup: teamLineupSchema.optional(), trustWorkspaces: z.boolean().optional(), publishHeads: z.boolean().default(true), stallMinutes: z.number().int().min(5).max(1440).optional(), checkMinutes: z.number().positive().max(240).optional(), retention: teamRetentionSchema.optional(), storageFloor: storageFloorSchema.optional(), outcomes: outcomeSettingsSchema.optional(), blackboard: z.object({ tools: z.boolean().optional() }).strict().optional() }).strict().optional(),

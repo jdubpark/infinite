@@ -10,10 +10,10 @@ import { Card, Chip, TopBar } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
 import { age } from "../../status";
 import { theme } from "../../theme";
-import { newer, shortDate } from "../teams/model";
+import { newer } from "../teams/model";
 import { RequestStatus, Section, SteerBox, t } from "../teams/parts";
 import { useRunRequest } from "../teams/useRunRequest";
-import { attemptLabel, attemptsOf, findBoardItem, missionControls, missionExtendChoices, missionLeftLabel, missionStatusLabel, missionStoppedAtLimit, missionSubtaskLabel, missionTimeLeftMs, openMissionDecisions } from "./model";
+import { attemptLabel, attemptsOf, findBoardItem, missionControls, missionExtendChoices, missionStatusLabel, missionStopLine, missionStoppedAtLimit, missionSubtaskLabel, missionTimeLeftMs, openMissionDecisions } from "./model";
 import { Attempts } from "./Attempts";
 
 export function MissionDetail({ connection, id }: { connection: Connection; id: string }) {
@@ -51,8 +51,8 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
   const controls = missionControls(mission, me?.role, fresh, now);
   const locked = request.busy || Boolean(request.pending);
   const stoppedAtLimit = missionStoppedAtLimit(mission);
-  const live = !["cancelled", "ready-for-review"].includes(mission.status);
   const timeLeft = missionTimeLeftMs(mission, now);
+  const stopLine = missionStopLine(mission, now);
   const decisions = openMissionDecisions(mission);
   const answered = mission.decisions.filter(decision => decision.answer != null);
   const titleOf = (subtaskId: string) => mission.subtasks.find(subtask => subtask.id === subtaskId)?.title ?? subtaskId;
@@ -83,10 +83,7 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
         <View style={s.chips}><Chip kind={statusIcon} label={missionStatusLabel(mission.status, mission.stopReason)} tone={mission.status === "needs-input" || mission.status === "paused" ? "attention" : mission.status === "blocked" ? "error" : undefined} />
           {attemptChip ? <Chip label={attemptChip} /> : null}
           <Chip label={`Updated ${age(mission.updatedAt, now)}`} /><Chip label={`Rev ${mission.revision}`} /></View>
-        {stoppedAtLimit ? <Text style={t.warning}>Stopped at its time limit. Its work is kept. Extend to continue, or cancel.</Text>
-          : mission.clockStoppedAt ? <Text style={t.note}>{`Clock stopped while it waits · ${missionLeftLabel(timeLeft)} left`}</Text>
-            : live && timeLeft > 0 ? <Text style={t.note}>{`Stops ${shortDate(mission.deadlineAt)}`}</Text>
-              : live ? <Text style={t.warning}>Its time limit has passed. Extend to continue.</Text> : null}
+        {stopLine ? <Text style={stoppedAtLimit || timeLeft <= 0 ? t.warning : t.note}>{stopLine}</Text> : null}
         {mission.reason ? <Text style={mission.status === "blocked" ? t.error : t.warning}>{mission.reason}</Text> : null}
       </View>
 

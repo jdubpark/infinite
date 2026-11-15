@@ -1,5 +1,6 @@
 import type { BoardColumn, BoardItem, Mission, Me, MissionDecision, MissionStatus, MissionSubtask } from "../../api/client";
 import type { StatusKind } from "../../status";
+import { shortDate } from "../teams/model";
 
 export type BoardSection = "needs-input" | "working" | "review" | "ended";
 export const BOARD_SECTIONS: { id: BoardSection; title: string; subtitle: string; column: BoardColumn }[] = [
@@ -94,6 +95,19 @@ export function missionLeftLabel(ms: number): string {
   const hours = Math.floor(minutes / 60), rest = minutes % 60;
   if (hours === 0) return `${rest} min`;
   return rest === 0 ? `${hours} h` : `${hours} h ${rest} min`;
+}
+
+/**
+ * The line under the status chips. Only a mission that can still run or be extended speaks about
+ * its time: a blocked mission without a deadline stop has its reason shown instead, so it gets none.
+ */
+export function missionStopLine(mission: Pick<Mission, "status" | "stopReason" | "deadlineAt" | "clockStoppedAt">, now: number): string | undefined {
+  if (missionStoppedAtLimit(mission)) return "Stopped at its time limit. Its work is kept. Extend to continue, or cancel.";
+  if (!["planning", "working", "needs-input", "paused"].includes(mission.status)) return undefined;
+  const left = missionTimeLeftMs(mission, now);
+  if (left <= 0) return "Its time limit has passed. Extend to continue.";
+  if (mission.clockStoppedAt) return `Clock stopped while it waits · ${missionLeftLabel(left)} left`;
+  return `Stops ${shortDate(mission.deadlineAt)}`;
 }
 
 /**

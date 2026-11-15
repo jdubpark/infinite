@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { attemptLabel, attemptsOf, foldAttempts, groupBoard, filterBoard, missionControls, missionExtendChoices, missionLeftLabel, missionStatusLabel, missionStoppedAtLimit, missionTimeLeftMs, openMissionDecisions } from "../apps/mobile/src/features/board/model.ts";
+import { attemptLabel, attemptsOf, foldAttempts, groupBoard, filterBoard, missionControls, missionExtendChoices, missionLeftLabel, missionStatusLabel, missionStopLine, missionStoppedAtLimit, missionTimeLeftMs, openMissionDecisions } from "../apps/mobile/src/features/board/model.ts";
+import { shortDate } from "../apps/mobile/src/features/teams/model.ts";
 import type { BoardItem, Mission } from "../apps/mobile/src/api/client.ts";
 
 const item = (overrides: Partial<BoardItem> = {}): BoardItem => ({
@@ -127,4 +128,38 @@ test("time left reads in hours and minutes, rounded down", () => {
 test("each extend choice has a spoken label that marks the mission's own limit", () => {
   assert.deepEqual(missionExtendChoices(240).map(choice => choice.spoken), ["Extend by 1 hour", "Extend by 4 hours, its limit", "Extend by 6 hours", "Extend by 24 hours"]);
   assert.deepEqual(missionExtendChoices(60).map(choice => choice.spoken), ["Extend by 1 hour, its limit", "Extend by 6 hours", "Extend by 24 hours"]);
+});
+
+test("a stopped clock that ran past the deadline reads as expired, not as time left", () => {
+  // settleClock can record a stop time a second after the deadline, before the next host tick expires the mission.
+  const late = controlMission("paused", { deadlineAt: "2026-10-01T00:00:00.000Z", clockStoppedAt: "2026-10-01T00:00:01.000Z" });
+  assert.equal(missionTimeLeftMs(late, now), -1000);
+  assert.equal(missionStopLine(late, now), "Its time limit has passed. Extend to continue.");
+});
+
+test("a blocked mission without a deadline stop has no time line, because its reason already says why", () => {
+  assert.equal(missionStopLine(controlMission("blocked", { deadlineAt: "2026-09-30T23:00:00.000Z" }), now), undefined);
+});
+
+test("a mission stopped at its time limit gets the stopped note", () => {
+  assert.equal(missionStopLine(controlMission("blocked", { stopReason: "deadline" }), now), "Stopped at its time limit. Its work is kept. Extend to continue, or cancel.");
+});
+
+test("a mission whose clock is stopped while it waits shows the time left on that clock", () => {
+  const waiting = controlMission("needs-input", { deadlineAt: "2026-10-01T02:00:00.000Z", clockStoppedAt: "2026-10-01T00:30:00.000Z" });
+  assert.equal(missionStopLine(waiting, now), "Clock stopped while it waits · 1 h 30 min left");
+});
+
+test("a running mission with time left shows its stop time", () => {
+  const running = controlMission("working", { deadlineAt: "2026-10-01T02:00:00.000Z" });
+  assert.equal(missionStopLine(running, now), `Stops ${shortDate(running.deadlineAt)}`);
+});
+
+test("a running mission past its deadline, with no stopped clock, reads as expired", () => {
+  assert.equal(missionStopLine(controlMission("working", { deadlineAt: "2026-09-30T23:00:00.000Z" }), now), "Its time limit has passed. Extend to continue.");
+});
+
+test("a cancelled or ready-for-review mission has no time line", () => {
+  assert.equal(missionStopLine(controlMission("cancelled", { deadlineAt: "2026-10-02T00:00:00.000Z" }), now), undefined);
+  assert.equal(missionStopLine(controlMission("ready-for-review", { deadlineAt: "2026-10-02T00:00:00.000Z" }), now), undefined);
 });

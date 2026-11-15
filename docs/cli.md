@@ -479,7 +479,10 @@ The model's note is for the owner only. Only an owner device reads the log;
 a controller or a viewer is refused, and `status` never carries a note.
 
 `mark` records that the owner judges a decision `wrong`, with a note. It needs
-an owner CLI. A mark is a record only: it changes no decision, no replay and no
+a paired owner device, such as the CLI or the phone app; a browser signed in
+with the host's cookie is refused and shows the command to run instead. The web
+and phone apps read the same log under Permission decisions. A mark is a record
+only: it changes no decision, no replay and no
 lock, and a later mark is added beside the earlier ones. To change later
 decisions, reopen the reject or change the workspace's direction. A retried
 `--request-id` returns the recorded mark.

@@ -219,7 +219,7 @@ function MarkForm({ entry, marked }: { entry: DecisionEntry; marked: () => void 
   const api = useApi(), machines = useMachines(), key = machines.active.id + "/" + entry.id;
   const request = markRequests.use(key), pending = request.pending;
   const [note, setNote] = useState(pending?.note ?? "");
-  // A browser session signed in on the host's own origin is not an owner CLI, so the host refuses its marks with 403.
+  // A browser signed in with the host's cookie is not a paired device, so the host refuses its marks with 403.
   const [cliOnly, setCliOnly] = useState(cliOnlyMachines.has(machines.active.id));
   const [busy, setBusy] = useState(false), [copied, setCopied] = useState(false), [open, setOpen] = useState(Boolean(pending));
   const mounted = useRef(true);
@@ -250,7 +250,7 @@ function MarkForm({ entry, marked }: { entry: DecisionEntry; marked: () => void 
       <textarea id="permission-mark-note" rows={3} maxLength={2000} required value={pending?.note ?? note} onChange={event => setNote(event.target.value)} placeholder="What the decision should have been, and why…" />
     </fieldset>
       <p className="form-note">A mark is a record only. It changes no decision, no replay and no lock. To change later decisions, reopen the reject or change the workspace’s direction. The decision is offered as a replay case that you accept or drop.</p>
-      {cliOnly ? <div className="permission-cli"><p className="form-note">The host records marks only from the paired owner CLI, and this browser session is not one. Run this command on a paired machine:</p>
+      {cliOnly ? <div className="permission-cli"><p className="form-note">The host records marks only from a paired owner device, such as the CLI or the phone app, and this browser sign-in is not one. Run this command on a paired machine:</p>
         <pre className="permission-command"><code>{command}</code></pre>
         <button type="button" className="text-button" onClick={() => void copy()}><Copy size={14} />{copied ? "Copied" : "Copy command"}</button></div>
         : <button className="primary stable-action" aria-busy={busy} disabled={busy || (!pending && !note.trim())}>{busy && <RefreshCw className="is-refreshing" size={16} />}{pending ? "Retry same request" : "Mark wrong"}<ArrowUpRight size={18} /></button>}

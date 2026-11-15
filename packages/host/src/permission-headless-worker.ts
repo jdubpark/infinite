@@ -184,6 +184,15 @@ export class HeadlessChannelWorker {
     try { reply = await this.ask({ op: "class", call }, CLASS_CHECK_MS); }
     catch { return this.deny("unavailable"); }
     if (reply.result === "not-served" || reply.result === "none") return { decision: "none" };
+    if (reply.result === "deny") {
+      // The host recorded no owner decision this call could wait on: under a halt it is denied as unavailable;
+      // otherwise it is denied with needs-owner and the owner is told with the class.
+      if (reply.interruptClass && reply.interruptClass !== "undeliverable") {
+        this.host.record({ event: "owner-denied", tool: call.toolName, interruptClass: reply.interruptClass, reason: "no-decision" });
+        this.tell(reply.interruptClass, reply.decisionId);
+      }
+      return this.deny(reply.code);
+    }
     if (reply.result !== "owner") return this.deny("unavailable");
     // A call that waits must be one the provider can return to: the primary agent's, with its call id. A subagent's
     // deferred call does not end the run, so it is denied and the owner is told.

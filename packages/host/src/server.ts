@@ -71,7 +71,7 @@ import { IntakeLinear } from "./intake-linear.js";
 import { IntakeService } from "./intake.js";
 import { IntakeSlackSurface } from "./intake-slack.js";
 import { SlackClient } from "./slack-client.js";
-import { createMissionSchema, missionActionSchema, missionTextSchema, type CreateMission, type Mission, type MissionOrigin } from "./mission-types.js";
+import { createMissionSchema, missionActionSchema, missionExtendSchema, missionTextSchema, type CreateMission, type Mission, type MissionOrigin } from "./mission-types.js";
 import { ProjectGroupService } from "./project-groups.js";
 import { PermissionDelegationService } from "./permission-delegation.js";
 import { INTERRUPT_CLASSES, PERMISSION_POLICY_VERSION } from "./permission-policy.js";
@@ -1173,6 +1173,7 @@ export function createApp(config: Config, key: Buffer) {
     res.json(await missions.answer(id.parse(req.params.id), id.parse(req.params.decisionId), missionTextSchema.parse(req.body))));
   for (const action of ["pause", "resume", "cancel"] as const)
     app.post(`/api/missions/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await missions[action](id.parse(req.params.id), missionActionSchema.parse(req.body))));
+  app.post("/api/missions/:id/extend", requireRole(["owner"]), async (req, res) => res.json(await missions.extend(id.parse(req.params.id), missionExtendSchema.parse(req.body))));
   app.get("/api/board", (_req, res) => {
     const memberships = projectGroups.membershipSnapshot();
     return res.json(missionBoard(missions.list(), teams.list(), goals.list(), config.projects, id => memberships.get(id)));

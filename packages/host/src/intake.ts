@@ -17,6 +17,8 @@ const omissionReserve = 40;
 const liveStatuses = new Set<Mission["status"]>(["planning", "working", "needs-input"]);
 const activeStatuses = new Set<Mission["status"]>(["planning", "working"]);
 const finishedStatuses = new Set<Mission["status"]>(["ready-for-review", "blocked", "cancelled"]);
+/** A time-limit stop is blocked but not finished: the owner may extend the mission, so its record stays started. */
+const deadlineStopped = (mission: Mission) => mission.status === "blocked" && mission.stopReason === "deadline";
 const closedReasons = {
   deleted: "The Linear issue was deleted.",
   archived: "The Linear issue was archived.",
@@ -642,12 +644,32 @@ export class IntakeService {
 
   /** Runs on every mission save, so an outcome is recorded without waiting for the next cycle. Synchronous by design. */
   private observe(mission: Mission): void {
-    if (this.closed || !finishedStatuses.has(mission.status)) return;
+    if (this.closed) return;
+    const stopped = deadlineStopped(mission);
+    if (!stopped && !finishedStatuses.has(mission.status)) return;
     const record = this.store.forMission(mission.id);
     if (!record || record.state !== "started") return;
+    if (stopped) {
+      this.observeDeadline(record, mission);
+      return;
+    }
     this.attemptSync("observe", () => this.store.update(record.issueId, next => {
       next.state = "finished";
       if (!isAnswerRecord(next) && !this.mirrors(next)) next.comments.outcome = { id: randomUUID(), body: outcomeBody(this.config, mission, Boolean(next.direct)), delivered: false, attempts: 0 };
+    }), record.identifier);
+  }
+
+  /**
+   * A stop at the time limit keeps the record started, so Slack replies still reach the mission. A Linear-only record hears
+   * about each stop once: the stop's `deadlineAt` is the key, so a stop after an extension has a new key and posts again.
+   */
+  private observeDeadline(record: IntakeRecord, mission: Mission): void {
+    const key = mission.deadlineAt;
+    if (isAnswerRecord(record) || this.mirrors(record) || record.deadlineNoticeFor === key) return;
+    this.attemptSync("observe", () => this.store.update(record.issueId, next => {
+      if (next.deadlineNoticeFor === key) return;
+      next.deadlineNoticeFor = key;
+      next.comments.outcome = { id: randomUUID(), body: outcomeBody(this.config, mission, Boolean(next.direct)), delivered: false, attempts: 0 };
     }), record.identifier);
   }
 
@@ -688,6 +710,8 @@ export class IntakeService {
     if (!reason || record.missionId === undefined) return;
     const mission = this.missions.peek(record.missionId);
     if (!mission) return;
+    // A time-limit stop is not running, and nothing is paused. The closure waits for an extension, so the next watch pauses it then.
+    if (deadlineStopped(mission)) return;
     if (liveStatuses.has(mission.status))
       await this.missions.pause(mission.id, { requestId: deterministicUuid("intake-closure", record.issueId), revision: mission.revision }, reason);
     this.store.update(record.issueId, next => { next.closure = { reason, at: new Date().toISOString() }; });
@@ -705,15 +729,16 @@ export class IntakeService {
         } catch (error) {
           const message = error instanceof TeamError ? error.message : failureSummary(error);
           this.fail("deliver", error, record.identifier);
+          // A newer comment may have replaced this one while the send was open; only the sent comment's state changes.
           this.attemptSync("deliver", () => this.store.update(record.issueId, next => {
             const comment = next.comments[kind];
-            if (comment) { comment.attempts += 1; comment.error = message; }
+            if (comment?.id === pending.id) { comment.attempts += 1; comment.error = message; }
           }), record.identifier);
           break;
         }
         this.attemptSync("deliver", () => this.store.update(record.issueId, next => {
           const comment = next.comments[kind];
-          if (comment) { comment.delivered = true; comment.attempts += 1; delete comment.error; }
+          if (comment?.id === pending.id) { comment.delivered = true; comment.attempts += 1; delete comment.error; }
         }), record.identifier);
       }
     }

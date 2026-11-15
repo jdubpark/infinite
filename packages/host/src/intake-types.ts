@@ -56,7 +56,7 @@ export interface IntakeMessage {
 export interface IntakeInbound {
   eventId: string; ts: string; text: string; receivedAt: string; handledAt?: string; outcome?: string;
   /** The mission call chosen for this event, saved before the call; a replay performs exactly this call. */
-  call?: { action: "answer" | "steer" | "pause" | "resume" | "cancel"; decisionId?: string; text?: string; revision: number };
+  call?: { action: "answer" | "steer" | "pause" | "resume" | "cancel" | "extend"; decisionId?: string; text?: string; minutes?: number; revision: number };
   /** Interactive Slack action identity, stable across envelope redelivery. */
   interactionId?: string;
 }
@@ -84,6 +84,8 @@ export interface IntakeRecord {
   missionId?: string;
   closure?: { reason: string; at: string };
   editNotedAt?: string;
+  /** The `deadlineAt` of the last time-limit stop whose outcome comment was queued, so each stop posts once. */
+  deadlineNoticeFor?: string;
   /** The issue's title and description as the tracker returned them when the host filed it; edits are detected against this. */
   tracked?: { title: string; description: string };
   comments: { started?: IntakeComment; outcome?: IntakeComment };

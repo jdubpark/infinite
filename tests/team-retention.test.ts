@@ -7,10 +7,23 @@ import type { Manager } from "../packages/host/src/manager.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, type TeamMember, type TeamRun } from "../packages/host/src/team-types.js";
 import type { VolumeUsage } from "../packages/host/src/storage.js";
-import { removeMemberWorkspace, removeTeamWorkspace } from "../packages/host/src/team-workspace.js";
+import { commandScope, removeMemberWorkspace, removeTeamWorkspace, teamCommand } from "../packages/host/src/team-workspace.js";
+import { newWitness, type CensusResult, type HostProcesses } from "../packages/host/src/process-census.js";
+import { unseal } from "../packages/host/src/vault.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
-type ServiceOptions = { now?: () => number; volumeUsage?: (path: string) => Promise<VolumeUsage> };
+type ServiceOptions = { now?: () => number; volumeUsage?: (path: string) => Promise<VolumeUsage>; processes?: HostProcesses };
+
+/** A census that returns whatever the test scripts next. The table and start token are fixed; the witness samples are not checked here. */
+function scriptedProcesses(census: () => CensusResult): HostProcesses {
+  return { table: async () => ({ boot: "test-boot", rows: [] }), start: async () => "test-start", census: async () => census() };
+}
+
+/** The run record as the last save left it on disk. */
+function savedRecord(f: ReturnType<typeof schedulerFixture>) {
+  return unseal<{ pending?: { recording?: true; witness?: { processes: { pid: number; start: string }[]; sessions: number[]; groups: number[] } } }>(
+    f.key, `team:${f.run.id}`, readFileSync(join(f.config.stateDir, "teams", `${f.run.id}.sealed`), "utf8"));
+}
 
 function openTeam(f: ReturnType<typeof schedulerFixture>, options: ServiceOptions = {}) {
   return new TeamService(f.config, f.key, f.manager as unknown as Manager, (_project, start) => start(), undefined, undefined, options);
@@ -136,6 +149,172 @@ test("a blocked run with an unresolved operation keeps its workspace and stays b
     teams.start(); await teams.idle();
     assert.equal(existsSync(runDirectory(f.run)), true);
     assert.equal(teams.get(f.run.id).status, "blocked");
+  } finally { await close(f, teams); }
+});
+
+test("a blocked run keeps its workspace while the host sees a process of the interrupted check or a process using the run directory, and closes once it sees neither", async () => {
+  const f = schedulerFixture();
+  const at = new Date().toISOString();
+  const blocker = "A worker reported a blocker.";
+  f.run.status = "blocked"; f.run.updatedAt = at; f.run.reason = blocker;
+  f.run.members.forEach(member => { member.status = "stopped"; });
+  f.run.events.push({ at, text: blocker });
+  retention(f, { blockedHours: 1 }); f.writeTeam();
+  let result: CensusResult = { ok: true, findings: [{ pid: 4242, reason: "recorded-session" }] };
+  let now = Date.parse(at) + 3_600_001, looks = 0;
+  const teams = openTeam(f, { now: () => now, processes: scriptedProcesses(() => { looks++; return result; }) });
+  const eventCount = (text: string) => teams.get(f.run.id).events.filter(event => event.text === text).length;
+  const sees = "The host still sees 1 process(es) that match its record of the interrupted check operation.";
+  const inUse = "The host sees 1 process(es) using this run's directory. None matches its record of the interrupted check operation.";
+  try {
+    (teams as unknown as { records: Map<string, { pending?: unknown }> }).records.get(f.run.id)!.pending = { id: randomUUID(), kind: "check", revision: 1, witness: newWitness() };
+    teams.start(); await teams.idle();
+    await waitFor(() => eventCount(sees) === 1, "the host should report the process it still sees");
+    await new Promise(resolve => setTimeout(resolve, 1200)); await teams.idle();
+    assert.equal(eventCount(sees), 1, "an unchanged census adds no second event");
+    assert.equal(looks, 1, "a look that found a process stands until the next scheduled look, though the pass runs on every tick");
+    assert.equal(teams.get(f.run.id).pendingOperation?.processes, "running");
+
+    // A process that only uses the directory is not called the check's process, and still keeps the workspace.
+    result = { ok: true, findings: [{ pid: 4243, reason: "working-directory" }] }; now += 10 * 60_000;
+    await waitFor(() => eventCount(inUse) === 1, "the host should report a process that uses the run directory as such");
+    assert.equal(teams.get(f.run.id).pendingOperation?.processes, "in-use");
+    assert.equal(existsSync(runDirectory(f.run)), true);
+    assert.equal(teams.get(f.run.id).status, "blocked");
+
+    result = { ok: true, findings: [] }; now += 10 * 60_000;
+    await waitFor(() => teams.get(f.run.id).status === "cancelled", "a blocked run should close once the host sees no process");
+    assert.equal(existsSync(runDirectory(f.run)), false);
+    assert.equal(teams.get(f.run.id).reason, hostClosedBlockedReason(1, blocker));
+    assert.equal(eventCount("The host sees no process that matches its record of the interrupted check operation, and none using this run's directory. The intent stays recorded and is not replayed."), 1);
+  } finally { await close(f, teams); }
+});
+
+test("a blocked run whose census cannot finish keeps its workspace and says the host cannot tell", async () => {
+  const f = schedulerFixture();
+  const at = new Date().toISOString();
+  f.run.status = "blocked"; f.run.updatedAt = at; f.run.reason = "A worker reported a blocker.";
+  f.run.members.forEach(member => { member.status = "stopped"; });
+  retention(f, { blockedHours: 1 }); f.writeTeam();
+  const teams = openTeam(f, { now: () => Date.parse(at) + 3_600_001, processes: scriptedProcesses(() => ({ ok: false, problem: "The process table is unreadable" })) });
+  const cannotTell = "The host cannot tell whether the interrupted check operation left processes: The process table is unreadable.";
+  try {
+    (teams as unknown as { records: Map<string, { pending?: unknown }> }).records.get(f.run.id)!.pending = { id: randomUUID(), kind: "check", revision: 1, witness: newWitness() };
+    teams.start(); await teams.idle();
+    await waitFor(() => teams.get(f.run.id).events.some(event => event.text === cannotTell), "the host should say when it cannot finish its census");
+    await new Promise(resolve => setTimeout(resolve, 1200)); await teams.idle();
+    assert.equal(teams.get(f.run.id).events.filter(event => event.text === cannotTell).length, 1);
+    assert.equal(existsSync(runDirectory(f.run)), true);
+    assert.equal(teams.get(f.run.id).status, "blocked");
+  } finally { await close(f, teams); }
+});
+
+test("a blocked run stays blocked when the census finds only a process it cannot inspect, and the host does not call it the check's process", async () => {
+  const f = schedulerFixture();
+  const at = new Date().toISOString();
+  f.run.status = "blocked"; f.run.updatedAt = at; f.run.reason = "A worker reported a blocker.";
+  f.run.members.forEach(member => { member.status = "stopped"; });
+  retention(f, { blockedHours: 1 }); f.writeTeam();
+  const teams = openTeam(f, { now: () => Date.parse(at) + 3_600_001, processes: scriptedProcesses(() => ({ ok: true, findings: [{ pid: 4242, reason: "unreadable" }] })) });
+  const cannotTell = "The host cannot tell whether the interrupted check operation left processes: 1 process(es) of the accounts it inspects could not be inspected.";
+  try {
+    (teams as unknown as { records: Map<string, { pending?: unknown }> }).records.get(f.run.id)!.pending = { id: randomUUID(), kind: "check", revision: 1, witness: newWitness() };
+    teams.start(); await teams.idle();
+    await waitFor(() => teams.get(f.run.id).events.some(event => event.text === cannotTell), "the host should say when it cannot finish its census");
+    await new Promise(resolve => setTimeout(resolve, 1200)); await teams.idle();
+    assert.equal(teams.get(f.run.id).events.filter(event => event.text === cannotTell).length, 1);
+    assert.equal(existsSync(runDirectory(f.run)), true);
+    assert.equal(teams.get(f.run.id).status, "blocked");
+  } finally { await close(f, teams); }
+});
+
+test("a command inside a command scope waits for the scope before it starts and reports its process id; outside one nothing is reported", async () => {
+  const seen: (string | number | undefined)[] = [];
+  const scope = { starting: () => new Promise<void>(resolve => setTimeout(() => { seen.push("announced"); resolve(); }, 30)), started: (pid: number | undefined) => { seen.push(pid); } };
+  const scoped = await commandScope.run(scope, () => teamCommand({ command: process.execPath, args: ["-e", ""] }, process.cwd()));
+  assert.equal(scoped.exitCode, 0);
+  assert.equal(seen.length, 2);
+  assert.equal(seen[0], "announced", "the command starts only after the scope has announced it");
+  assert.ok(typeof seen[1] === "number" && seen[1] > 0);
+  const refused = { starting: () => Promise.reject(new Error("not announced")), started: () => { seen.push("started"); } };
+  await assert.rejects(commandScope.run(refused, () => teamCommand({ command: process.execPath, args: ["-e", ""] }, process.cwd())), /not announced/);
+  const unscoped = await teamCommand({ command: process.execPath, args: ["-e", ""] }, process.cwd());
+  assert.equal(unscoped.exitCode, 0);
+  assert.equal(seen.length, 2, "a command that could not be announced does not start, and one outside a scope reports nothing");
+});
+
+test("verification reconciliation is refused while the host sees the interrupted check, and once workspace removal has started", async () => {
+  const f = schedulerFixture();
+  const at = new Date().toISOString();
+  const interrupted = "The host restarted during a workspace or verification operation. Inspect the isolated workspace before starting a new team; the operation will not be replayed.";
+  f.run.status = "blocked"; f.run.updatedAt = at; f.run.reason = interrupted; f.run.headCommit = f.run.baseCommit;
+  f.run.members.forEach(member => { member.status = "stopped"; });
+  f.writeTeam();
+  let result: CensusResult = { ok: true, findings: [{ pid: 4242, reason: "recorded-process" }, { pid: 4243, reason: "open-file" }] };
+  const teams = openTeam(f, { processes: scriptedProcesses(() => result) });
+  const pendingId = randomUUID();
+  const body = () => ({ requestId: randomUUID(), revision: 1, pendingId, headCommit: f.run.baseCommit,
+    attestation: { boundary: "check-only", processesStopped: true, text: "Confirmed the interrupted check is quiescent." } });
+  try {
+    const stored = (teams as unknown as { records: Map<string, { run: TeamRun; pending?: unknown; workspaceRemovedAt?: string }> }).records.get(f.run.id)!;
+    stored.pending = { id: pendingId, kind: "check", revision: 1, witness: newWitness() };
+    await assert.rejects(teams.reconcileVerification(f.run.id, body()), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "team-operation-running" &&
+      error.message === "The host still sees 1 process(es) that match its record of the interrupted check. Reconcile verification after they have exited.");
+    assert.ok(stored.pending, "a refused reconciliation keeps the pending check");
+
+    result = { ok: true, findings: [{ pid: 4243, reason: "open-file" }, { pid: 4244, reason: "working-directory" }] };
+    await assert.rejects(teams.reconcileVerification(f.run.id, body()), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "team-directory-in-use" &&
+      error.message === "The host sees 2 process(es) using this run's directory. Reconcile verification after they have exited or left it.");
+
+    stored.run.workspaceRemovedAt = at;
+    await assert.rejects(teams.reconcileVerification(f.run.id, body()), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "team-workspace-removed");
+  } finally { await close(f, teams); }
+});
+
+test("an operation's intent says its record may be incomplete until a save holds the command it started", async () => {
+  const f = schedulerFixture();
+  f.writeTeam();
+  const teams = openTeam(f, { processes: scriptedProcesses(() => ({ ok: true, findings: [] })) });
+  try {
+    const internals = teams as unknown as { records: Map<string, { pending?: { recording?: true; witness?: { processes: { pid: number; start: string }[]; sessions: number[]; groups: number[] } } }>;
+      operation: (stored: unknown, kind: string, perform: () => Promise<unknown>, complete: () => void) => void };
+    const stored = internals.records.get(f.run.id)!;
+    internals.operation(stored, "check", () => teamCommand({ command: process.execPath, args: ["-e", "setTimeout(() => {}, 1500)"] }, process.cwd()), () => {});
+    // The command has started. What a host that stopped now would find on disk: the intent, still marked as recording, without the command.
+    const pid = stored.pending!.witness!.sessions[0]!;
+    assert.ok(pid > 0, "the command's session and group are recorded as it starts");
+    assert.deepEqual(stored.pending!.witness!.groups, [pid]);
+    assert.equal(savedRecord(f).pending?.recording, true);
+    assert.deepEqual(savedRecord(f).pending?.witness?.sessions, []);
+    await waitFor(() => savedRecord(f).pending !== undefined && savedRecord(f).pending!.recording === undefined, "the save that holds the command should close the record");
+    assert.deepEqual(savedRecord(f).pending?.witness?.sessions, [pid]);
+    assert.deepEqual(savedRecord(f).pending?.witness?.processes, [{ pid, start: "test-start" }]);
+    await waitFor(() => stored.pending === undefined, "the operation should finish and clear its intent");
+  } finally { await close(f, teams); }
+});
+
+test("a blocked run whose intent was still recording when the host stopped stays blocked though the host finds no process, unless the host has rebooted since", async () => {
+  const f = schedulerFixture();
+  const at = new Date().toISOString();
+  f.run.status = "blocked"; f.run.updatedAt = at; f.run.reason = "A worker reported a blocker.";
+  f.run.members.forEach(member => { member.status = "stopped"; });
+  retention(f, { blockedHours: 1 }); f.writeTeam();
+  let now = Date.parse(at) + 3_600_001;
+  const teams = openTeam(f, { now: () => now, processes: scriptedProcesses(() => ({ ok: true, findings: [] })) });
+  const cannotTell = "The host cannot tell whether the interrupted check operation left processes: the host stopped while the operation was starting a command, so its record of the operation's processes may be incomplete.";
+  try {
+    const witness = newWitness();
+    (teams as unknown as { records: Map<string, { pending?: unknown }> }).records.get(f.run.id)!.pending = { id: randomUUID(), kind: "check", revision: 1, witness, recording: true };
+    teams.start(); await teams.idle();
+    await waitFor(() => teams.get(f.run.id).events.some(event => event.text === cannotTell), "the host should say that its record may be incomplete");
+    await new Promise(resolve => setTimeout(resolve, 1200)); await teams.idle();
+    assert.equal(existsSync(runDirectory(f.run)), true);
+    assert.equal(teams.get(f.run.id).status, "blocked");
+
+    // No process outlives a boot, so a record from an earlier boot has nothing left to miss.
+    witness.boot = "an-earlier-boot"; now += 10 * 60_000;
+    await waitFor(() => teams.get(f.run.id).status === "cancelled", "after a reboot the run should close once the host sees no process");
+    assert.equal(existsSync(runDirectory(f.run)), false);
   } finally { await close(f, teams); }
 });
 

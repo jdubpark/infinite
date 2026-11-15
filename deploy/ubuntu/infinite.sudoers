@@ -14,3 +14,5 @@ infinite-host ALL=(infinite-agent) NOPASSWD: /usr/local/libexec/infinite/claude 
 infinite-host ALL=(infinite-agent) NOPASSWD: /usr/local/libexec/infinite/repository-graph *
 # The final transcript drain after a provider exits. No arguments: the worker's reply names the file.
 infinite-host ALL=(infinite-agent) NOPASSWD: /usr/local/libexec/infinite/transcript-drain ""
+# The process census: read-only; it takes its directory on standard input and reports process ids only.
+infinite-host ALL=(infinite-agent) NOPASSWD: /usr/local/libexec/infinite/process-census ""

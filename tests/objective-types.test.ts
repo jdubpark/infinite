@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { cappedBytes, logValueOf, objectiveRecordSchema, producerOf, recordDigest, thresholdFits } from "../packages/host/src/objective-types.js";
+import { recordDigestSchema } from "../packages/host/src/team-types.js";
 
 const GOAL_ID = "6f1c2a3e-8b4d-4c5e-9f60-718293a4b5c6";
 const RUN_ID = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
@@ -364,10 +365,25 @@ test("producer and threshold rules are shared", () => {
   assert.equal(thresholdFits(owner, { kind: "share", min: 1 }), false);
   assert.equal(thresholdFits(command, { kind: "pass" }), true);
   assert.equal(thresholdFits(judgement, { kind: "count", min: 1 }), false);
+  const receipt = { kind: "receipt", receipt: "merged" } as const;
+  const citationForm = { kind: "citation-form", path: "docs/spec.md", entries: "/entries", perEntry: 1 } as const;
+  assert.equal(thresholdFits(receipt, { kind: "pass" }), true);
+  assert.equal(thresholdFits(receipt, { kind: "count", min: 1 }), false, "a receipt takes a pass threshold only");
+  assert.equal(thresholdFits(citationForm, { kind: "share", min: 1 }), true);
+  assert.equal(thresholdFits(citationForm, { kind: "pass" }), false, "a citation form takes a share threshold only");
+  assert.equal(thresholdFits(citationForm, { kind: "count", min: 1 }), false);
 
   const record: any = validGoalRecord();
   record.criteria[0].producer = "host";
   const result = objectiveRecordSchema.safeParse(withDigest(record));
   assert.equal(result.success, false, "a judgement criterion with producer host fails the record");
   assert.ok(result.error?.issues.some(issue => issue.message === "A criterion's producer must fit its check"), "with the shared message");
+});
+
+test("the record digest schema holds c0 exactly once, first", () => {
+  const criterion = (id: string) => ({ id, statement: "Ship it", check: "receipt:checks-passed", producer: "host" });
+  const c0 = { id: "c0", statement: "", check: "judgement:owner-text", producer: "evaluator" };
+  assert.equal(recordDigestSchema.safeParse({ version: 2, criteria: [c0, criterion("c1")] }).success, true);
+  assert.equal(recordDigestSchema.safeParse({ version: 2, criteria: [criterion("c1"), c0] }).success, false, "c0 is not first");
+  assert.equal(recordDigestSchema.safeParse({ version: 2, criteria: [c0, criterion("c0")] }).success, false, "a second c0 is refused");
 });

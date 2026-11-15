@@ -355,7 +355,7 @@ export const recordDigestSchema = z.strictObject({
   })).min(1).max(8),
 }).superRefine((digest, context) => {
   const [first, ...rest] = digest.criteria;
-  if (first?.id !== "c0") context.addIssue({ code: "custom", path: ["criteria"], message: "The record digest must start with c0." });
+  if (first?.id !== "c0" || rest.some(criterion => criterion.id === "c0")) context.addIssue({ code: "custom", path: ["criteria"], message: "The record digest must start with c0 and hold it once." });
   if (first && first.statement !== "") context.addIssue({ code: "custom", path: ["criteria", 0, "statement"], message: "c0 carries its text in the goal context, so its statement is empty." });
   rest.forEach((criterion, index) => {
     const bytes = Buffer.byteLength(criterion.statement);

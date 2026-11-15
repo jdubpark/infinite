@@ -95,23 +95,25 @@ What the install script does:
 - Prints the SHA-256 of each installed file.
 - Changes no file when the installed file already matches the template and has the right owner and mode.
 
-`--check` changes nothing. It exits non-zero if a file is missing, is not a regular file, has a different hash, or has the wrong owner or mode, or if its directory or a directory above it is not a real root-only directory. It also runs as root.
+`--check` changes nothing and runs as root. It checks the directories before it reads the file. A directory above `/etc/claude-code` or `/etc/codex` that is not root-owned or is writable by others stops the check. So does the ceiling's own directory: if it is a symbolic link, not a directory, owned by another account, or group- or world-writable, the check reports `differs` and does not hash the file. Otherwise it reports `differs` when the file is missing, is not a regular file, has a different hash, or has the wrong owner or mode. It exits non-zero on any difference.
 
 `infinite doctor` adds one line per check for each configured provider with a ceiling. The lines are:
 
 - `present`: the system file exists.
 - `writable`: the file is a regular root-owned file that is not group- or world-writable, and every directory above it up to the root is a real root-owned directory that is not group- or world-writable. A symbolic link at the file's path or above it is reported, even when its target matches the template.
-- `hash`: the installed file matches the template shipped in the running release. An entry that is not a regular file is reported as `changed` and is not opened.
+- `hash`: the installed file matches the template shipped in the running release. Doctor does not read the file while any `writable` check fails. Whoever controls an unsafe path could swap in other bytes after a read, so the line says `not read` and gives no hash. The file is also opened without following links and without waiting on a named pipe. Only a regular file is read; any other entry is reported and not opened.
 - `profile`: the configured launch arguments and app-server arguments contain no flag that the ceiling forbids.
 
 A `missing`, `changed`, `writable`, or `conflict` word prints as a warning. Doctor does not stop on a warning.
 
 Forbidden flags:
 
-- Claude Code: `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`, `--enable-auto-mode`, and `--permission-mode` with `bypassPermissions` or `auto`.
-- Codex: `--dangerously-bypass-approvals-and-sandbox`, `--yolo`, `--sandbox` or `-s` with `danger-full-access`, and a `-c` or `--config` override that sets `sandbox_mode` to `danger-full-access`, written bare or as any TOML string.
+- Claude Code: `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`, and `--permission-mode` with `bypassPermissions` or `auto`, each as a separate argument or joined with `=`. `--enable-auto-mode` is not in the installed help, so it is not checked.
+- Codex: `--dangerously-bypass-approvals-and-sandbox`, and any `--sandbox` or `-s` value, and any `sandbox_mode` in a `-c` or `--config` override, that is not exactly `read-only` or `workspace-write`.
 
-A value may follow its flag as the next argument or after `=`. The check reads the configured arguments only. It does not read a Codex profile or a configuration file that an argument names. It is a warning for the owner. The ceiling file is what clamps the mode.
+The Codex rule is an allow-list, so it reports a value it does not read as exactly one of the two allowed modes. Doctor reads a TOML string value only in its basic, literal, and multi-line forms, and it does not parse comments. A valid but unusual spelling of an allowed mode, such as a value with a trailing comment, is therefore reported. That costs one warning line.
+
+A flag may take its value as the next argument, after `=`, or attached (`-sVALUE`, `-cKEY=VALUE`). The forms were checked against `codex-cli 0.167.2` and `claude` 2.1.325 help output and parse errors. Codex validates the `--sandbox` value at parse time. It does not validate the `-c` key, and whether it accepts a quoted key was not checked. The check reads the configured arguments only. It does not read a Codex profile or a configuration file that an argument names. It is a warning for the owner. The ceiling file is what clamps the mode.
 
 ## How the hash check works
 

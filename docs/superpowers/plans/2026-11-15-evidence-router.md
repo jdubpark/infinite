@@ -416,7 +416,7 @@ CREATE INDEX IF NOT EXISTS routing_by_time ON routing_decisions (decided_at, key
 ```ts
 // routing-store.ts
 export const ROUTING_MODULE = "routing";
-export const ROUTING_RETENTION_DAYS = 180, TASK_DECISION_LIMIT = 20, PROJECT_DECISION_LIMIT = 500, PAYLOAD_LIMIT_BYTES = 16 * 1024;
+export const ROUTING_RETENTION_DAYS = 180, TASK_DECISION_LIMIT = 20, PROJECT_DECISION_LIMIT = 500, PAYLOAD_LIMIT_BYTES = 32 * 1024;
 export function routingModule(): EvidenceModule;                     // counts: { decisions }
 /** SHA-256 hex of `${runId}|${revision}|${taskKey}|${point}|${ordinal}`. */
 export function decisionKey(runId: string, revision: number, taskKey: string, point: RoutingPoint, ordinal: number): string;

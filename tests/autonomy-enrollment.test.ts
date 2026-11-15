@@ -302,5 +302,19 @@ test("repo init saves routing and keeps it when omitted", { timeout: 90000 }, as
     assert.throws(() => invoke(["--routing", "auto"]), (error: { stderr?: string }) =>
       String(error.stderr).includes("This host records shadow decisions only. Use --routing shadow; auto routing comes with a later release."));
     assert.deepEqual(await savedRouting(), { mode: "shadow", successValueUsd: 8, allowContributor: true }, "a refused auto stores nothing new");
+
+    // Off replaces only the mode; the given deny and cost merge over the saved policy and keep nothing else.
+    invoke(["--routing", "off"]);
+    assert.deepEqual(await savedRouting(), { mode: "off", successValueUsd: 8, allowContributor: true }, "off replaces only the mode");
+    invoke(["--routing-contributor", "deny", "--routing-value", "cost"]);
+    assert.deepEqual(await savedRouting(), { mode: "off", successValueUsd: 0.5, allowContributor: false }, "deny and cost merge over the saved policy");
+
+    // A value outside the presets or the 0 to 100 range is refused, and the saved policy stays as it was.
+    const kept = JSON.stringify(await savedRouting());
+    for (const value of ["100.5", "-1", "abc"]) {
+      assert.throws(() => invoke(["--routing-value", value]), (error: { stderr?: string }) =>
+        String(error.stderr).includes("--routing-value must be cost, balanced, quality, or a dollar value from 0 to 100."), `--routing-value ${value}`);
+      assert.equal(JSON.stringify(await savedRouting()), kept, `--routing-value ${value} leaves the saved policy unchanged`);
+    }
   } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
 });

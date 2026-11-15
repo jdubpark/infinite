@@ -1,7 +1,8 @@
 import { profileIdentityKey } from "./config-identity.js";
 import { profileIdentity } from "./run-events.js";
+import { betaMean, betaSd } from "./routing-posterior.js";
 import { betaSample, candidateSeed } from "./routing-sample.js";
-import type { Basis, Beta, CandidateRecord, ProfilePosterior, RoutingKnobs, RuleRemoval } from "./routing-types.js";
+import type { Basis, CandidateRecord, ProfilePosterior, RoutingKnobs, RuleRemoval } from "./routing-types.js";
 import type { TeamLineup, TeamModelProfile } from "./team-types.js";
 import type { Provider } from "./types.js";
 
@@ -22,15 +23,6 @@ export type Choice = { basis: Basis; chosen: string; greedy: string; explore: bo
 function identityOf(profile: TeamModelProfile): string {
   const { provider, model, effort } = profileIdentity(profile, profile.provider);
   return profileIdentityKey({ provider, model: model ?? null, effort: effort ?? null });
-}
-
-function betaMean(beta: Beta): number {
-  return beta.a / (beta.a + beta.b);
-}
-
-function betaSd(beta: Beta): number {
-  const total = beta.a + beta.b;
-  return Math.sqrt((beta.a * beta.b) / (total * total * (total + 1)));
 }
 
 /**

@@ -486,6 +486,23 @@ test("status uses the run flags' prompt version, the current epoch, and 180 days
   }
 });
 
+test("status cells read only the last 30 days of decisions", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    seed(store, { taskId: "t-old", area: "legacy", decidedAt: daysBefore(40) });
+    seed(store, { taskId: "t-new", area: "current", decidedAt: daysBefore(2) });
+    const status = routingStatus(store, statusInput({ saved: { mode: "shadow" } }));
+    const areas = status.cells.map(entry => entry.cell.scope === "cell" ? entry.cell.area : entry.cell.scope);
+    assert.ok(areas.includes("current"), "the in-window cell is shown");
+    assert.ok(!areas.includes("legacy"), "a cell with no decision in 30 days is not shown");
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
 test("the status reports the requested mode, the source, the defaults, the start point, and the explain cap", () => {
   const f = fixture();
   let store: EvidenceStore | undefined;
@@ -495,7 +512,7 @@ test("the status reports the requested mode, the source, the defaults, the start
     assert.deepEqual([auto.mode, auto.requested, auto.source, auto.defaults.includes("successValueUsd"), auto.defaults.includes("points")], ["shadow", "auto", "saved", false, true]);
     const escalationOnly = routingStatus(store, statusInput({ saved: { mode: "shadow", points: ["escalation"] } }));
     assert.deepEqual([escalationOnly.covers, escalationOnly.cells], [{ start: false, reason: "no-start-point" }, []]);
-    for (let ordinal = 1; ordinal <= 21; ordinal++) seed(store, { taskId: "t1", ordinal });
+    for (let revision = 1; revision <= 21; revision++) seed(store, { taskId: "t1", revision });
     assert.equal(routingExplain(store, "run-1", "t1")?.capped, true);
   } finally {
     store?.close();

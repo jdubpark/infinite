@@ -367,6 +367,11 @@ test("routing lines clean every host text they print: the reason, the removal, t
   })]));
   assert.equal(explain[0], "Revision 1 · start 1 · shadow  · recorded  · basis sampled  · decided 2026-11-14T10:00:00.000Z");
   assert.equal(explain[3], "  x  removed: limited ");
+  const period = routingStatusLines(routingStatusFixture({
+    period: { ...routingStatusFixture().period, firstAt: "2026-11-14T10:00:00.000Z\x07" },
+  } as Partial<RoutingStatus>)).find(line => line.startsWith("Shadow period:"));
+  assert.ok(period?.includes("since 2026-11-14T10:00:00.000Z ;"), period);
+  assert.ok(!period?.includes("\x07"), "the period's first decision time is cleaned");
 });
 
 test("the newest-decisions cap is the store's limit", () => {

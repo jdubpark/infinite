@@ -31,6 +31,9 @@ import { UsageService } from "./usage-service.js";
 import { EvidenceStore, evidenceDatabasePath } from "./evidence/store.js";
 import { EventOutbox } from "./evidence/outbox.js";
 import { FuseService } from "./fuse/service.js";
+import { MAX_SIGNAL_PAGE, MAX_SIGNAL_TEXT_LENGTH, SignalService } from "./signals/service.js";
+import { HaltService } from "./halt/service.js";
+import type { HaltTarget } from "./halt/rules.js";
 import { EvidenceError } from "./evidence/types.js";
 import { advanceEpoch, configurationModule, configurationProjector, EpochRequestConflict } from "./configuration-store.js";
 import { outcomeBackfill } from "./outcome-backfill.js";
@@ -91,6 +94,7 @@ import { BalanceService } from "./balances.js";
 import { LiveFeed, type LiveTopic } from "./live.js";
 import { MAX_EVENTS_BUFFERED_BYTES, MAX_EVENTS_STREAMS } from "@infinite/remote/protocol";
 import { Readings } from "./readings.js";
+import { EGRESS_PROJECT, egressView } from "./egress.js";
 
 const id = z.uuid();
 // The permission agent does not run yet, so no delegation is read for a decision. The slice that activates the agent changes this constant.
@@ -231,7 +235,12 @@ export function createApp(config: Config, key: Buffer) {
   evidence.register(configurationModule());
   outbox.registerProjector(configurationProjector());
   evidence.register(outcomeModule());
-  baseScanner = new BaseScanner({ store: evidence, mirrorPath: id => projectSource.mirrorPath(id), prefix: config.teams?.commandPrefix, holdDays: () => config.teams?.outcomes?.holdDays ?? HOLD_DAYS_DEFAULT });
+  // The project signal inbox. Sources record facts into it; only consumers' own scheduler passes act on them.
+  const signals = new SignalService({ store: evidence });
+  baseScanner = new BaseScanner({
+    store: evidence, mirrorPath: id => projectSource.mirrorPath(id), prefix: config.teams?.commandPrefix, holdDays: () => config.teams?.outcomes?.holdDays ?? HOLD_DAYS_DEFAULT,
+    onApplied: scan => { signals.recordScan(scan); },
+  });
   outbox.registerProjector(outcomeProjector(evidence));
   // The launch-rate fuse is built before any service that receives it starts. It stops before the store closes.
   const fuse = new FuseService({ config, key, store: evidence, sessionExists: id => {
@@ -286,6 +295,7 @@ export function createApp(config: Config, key: Buffer) {
   const sweepEvidence = () => {
     evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
     sweepExpiredOutcomes(evidence, new Date().toISOString(), undefined, config.teams?.outcomes?.retentionDays);
+    signals.sweep();
   };
   let evidenceSweep: NodeJS.Timeout | undefined;
   // A projector that fell behind catches up without waiting for the next event. Each pass is bounded.
@@ -448,11 +458,24 @@ export function createApp(config: Config, key: Buffer) {
       } finally { routineStarts.delete(request.projectId); }
     },
   });
-  manager.useFuse(fuse);
-  teams.useFuse(fuse);
-  goals.useFuse(fuse);
-  missions.useFuse(fuse);
-  routines.useFuse(fuse);
+  // The owner's halt sits in front of the fuse: every scheduler and the Manager backstop ask it first, so a halted
+  // launch is never charged. A team that a live goal or mission owns is paused through its owner.
+  const halt = new HaltService({ config, key });
+  halt.useServices({ routines, goals, missions, teams }, teamId => goals.ownsActiveTeam(teamId) || missions.ownsActiveSubteam(teamId));
+  const gate = halt.gate(fuse);
+  manager.useFuse(gate);
+  teams.useFuse(gate);
+  goals.useFuse(gate);
+  missions.useFuse(gate);
+  routines.useFuse(gate);
+  // A routine drops signals about the team runs of goals it started, so it never wakes on its own delivery.
+  routines.useSignals(signals.reader(), goalIds => {
+    const wanted = new Set(goalIds);
+    return goals.understandingRecords().filter(goal => wanted.has(goal.id))
+      .flatMap(goal => [...goal.cycles.map(cycle => cycle.teamId), ...(goal.activeTeamId ? [goal.activeTeamId] : [])]);
+  });
+  // A standing goal reads the same inbox. It drops signals about its own cycles' runs itself.
+  goals.useSignals(signals.reader());
   fuse.start();
   const desktopResources = new DesktopResources(config, listSessions);
   const changeProjectFiles = async <T>(projectId: string, action: () => Promise<T>) => {
@@ -724,6 +747,11 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/usage", (_req, res) => res.json(usage.summary()));
   app.get("/api/evidence/status", (_req, res) => res.json(evidence.describe()));
   app.get("/api/fuse", (_req, res) => res.json(fuse.view()));
+  app.get("/api/egress", requireRole(["owner"]), (req, res) => {
+    const project = req.query.project;
+    if (project !== undefined && (typeof project !== "string" || !EGRESS_PROJECT.test(project))) return void res.status(400).json({ error: "Invalid project" });
+    res.json(egressView(config, project));
+  });
   const fuseCloseSchema = z.discriminatedUnion("scope", [
     z.object({ scope: z.literal("host") }).strict(),
     z.object({ scope: z.literal("project"), projectId: z.string().min(1) }).strict(),
@@ -738,6 +766,33 @@ export function createApp(config: Config, key: Buffer) {
     if (result === "unmeasurable") return void res.status(409).json({ error: "The fuse cannot close until its launch record can be read", code: "unmeasurable" });
     if (result === "write-failed") return void res.status(503).json({ error: "The fuse could not record the close", code: "write-failed" });
     return void res.json({ result, view: fuse.view() });
+  });
+  // The owner's halt. Any paired device reads it; only the owner engages or releases it, from any owner client.
+  app.get("/api/halt", (_req, res) => res.json(halt.view()));
+  const haltNote = z.string().trim().min(1).max(500);
+  const haltEngageSchema = z.discriminatedUnion("scope", [
+    z.object({ requestId: z.uuid(), scope: z.literal("host"), reason: haltNote.optional() }).strict(),
+    z.object({ requestId: z.uuid(), scope: z.literal("project"), projectId: z.string().min(1), reason: haltNote.optional() }).strict(),
+  ]);
+  const haltReleaseSchema = z.discriminatedUnion("scope", [
+    z.object({ requestId: z.uuid(), scope: z.literal("host"), keepPaused: z.boolean().optional() }).strict(),
+    z.object({ requestId: z.uuid(), scope: z.literal("project"), projectId: z.string().min(1), keepPaused: z.boolean().optional() }).strict(),
+  ]);
+  const haltTarget = (body: { scope: "host" } | { scope: "project"; projectId: string }): HaltTarget =>
+    body.scope === "host" ? { scope: "host" } : { scope: "project", projectId: body.projectId };
+  const haltActor = (res: express.Response) => ({ deviceId: String(res.locals.deviceId), label: String(res.locals.actor?.label ?? "Paired device") });
+  const projectMissing = () => new TeamError(404, "project-not-found", "Project not found");
+  app.post("/api/halt", requireRole(["owner"]), async (req, res) => {
+    const body = haltEngageSchema.parse(req.body), target = haltTarget(body);
+    if (target.scope === "project" && !config.projects.some(project => project.id === target.projectId)) throw projectMissing();
+    res.json(await halt.engage(target, { requestId: body.requestId, ...(body.reason === undefined ? {} : { reason: body.reason }) }, haltActor(res)));
+  });
+  app.post("/api/halt/release", requireRole(["owner"]), async (req, res) => {
+    const body = haltReleaseSchema.parse(req.body), target = haltTarget(body);
+    // A project that left the configuration while halted can still be released.
+    if (target.scope === "project" && !config.projects.some(project => project.id === target.projectId) &&
+        !halt.view().projects.some(project => project.projectId === target.projectId)) throw projectMissing();
+    res.json(await halt.release(target, { requestId: body.requestId, ...(body.keepPaused === undefined ? {} : { keepPaused: body.keepPaused }) }, haltActor(res)));
   });
   // The cost of a session as the usage ledger measured it. The rules are in `sessionCostOf`.
   const sessionCost: CostLookup = sessionId => sessionCostOf(usage.session(sessionId));
@@ -1450,7 +1505,8 @@ export function createApp(config: Config, key: Buffer) {
     }
     const { backend: _backend, ...nativeRequest } = request;
     scheduleGraphForSession(request.projectId);
-    res.status(201).json(await startInProject(request.projectId, () => manager.create(nativeRequest)));
+    // Owner-only route: the owner started this session, which decides its GitHub grant under autonomy.boundary.github.
+    res.status(201).json(await startInProject(request.projectId, () => manager.create(nativeRequest, "owner")));
   });
   // Imported sessions keep their own transport and journal. Authorization is the same
   // as the managed-worker routes; raw native gateways remain worker-only.
@@ -1600,7 +1656,7 @@ export function createApp(config: Config, key: Buffer) {
     const { requestId } = z.object({ requestId: id }).strict().parse(req.body);
     const projectId = manager.meta(sessionId).session.projectId;
     scheduleGraphForSession(projectId);
-    res.json(await startInProject(projectId, () => manager.resume(sessionId, requestId)));
+    res.json(await startInProject(projectId, () => manager.resume(sessionId, requestId, "owner")));
   });
   app.get("/api/sessions/:id/native", refuseMissionManaged, requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer) return res.status(403).json({ error: "Pair an owner CLI to use the native frontend" });
@@ -1834,6 +1890,36 @@ export function createApp(config: Config, key: Buffer) {
     const enabled = Boolean(repositoryGraphs && (!config.repositoryGraphs?.projectIds || config.repositoryGraphs.projectIds.includes(projectId)));
     res.json({ enabled, state: enabled ? "enabled" : "disabled", receipts: enabled ? repositoryGraphs!.status(projectId) : [] });
   });
+  // The project signal inbox. The owner adds direction here; host sources add facts. A signal starts nothing by itself.
+  const signalsUnavailable = { code: "evidence-unavailable", error: "The evidence store is unavailable." };
+  const ownerSignalBody = z.object({ requestId: z.uuid(), text: z.string().trim().min(1).max(MAX_SIGNAL_TEXT_LENGTH) }).strict();
+  const signalPageQuery = z.object({
+    after: z.coerce.number().int().min(0).default(0),
+    limit: z.coerce.number().int().min(1).max(MAX_SIGNAL_PAGE).default(50),
+  });
+  app.post("/api/projects/:id/signals", requireRole(["owner"]), (req, res) => {
+    const projectId = projectSchema.parse(req.params.id);
+    if (!config.projects.some(project => project.id === projectId)) return void res.status(404).json({ error: "Unknown project" });
+    const body = ownerSignalBody.parse(req.body);
+    // The request ID is the key, so a replay records nothing and returns the signal stored first.
+    const result = signals.record({ projectId, kind: "owner", key: body.requestId, text: body.text });
+    if ("failure" in result) {
+      if (result.failure === "invalid") return void res.status(400).json({ error: "Invalid signal" });
+      // The request was recorded before, and its signal is past the inbox's row limit. Nothing new is recorded.
+      if (result.failure === "gone") return void res.status(410).json({ code: "signal-gone", error: "This request was recorded before. Its signal is no longer kept." });
+      if (result.failure === "full") return void res.status(503).json({ code: "signal-inbox-full", error: "The signal inbox is full. Try again after old signals expire." });
+      return void res.status(503).json(signalsUnavailable);
+    }
+    res.json({ recorded: result.recorded, signal: result.signal });
+  });
+  app.get("/api/projects/:id/signals", requireRole(["owner", "controller", "viewer"]), (req, res) => {
+    const projectId = projectSchema.parse(req.params.id);
+    if (!config.projects.some(project => project.id === projectId)) return void res.status(404).json({ error: "Unknown project" });
+    const query = signalPageQuery.parse(req.query);
+    const page = signals.page(projectId, query.after, { limit: query.limit });
+    if (!page) return void res.status(503).json(signalsUnavailable);
+    res.json(page);
+  });
   app.post("/api/projects/:id/source/refresh", requireRole(["owner"]), async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
     if (!projectSource.isGithub(projectId)) throw new ProjectSourceError("This project follows the laptop, not GitHub.", "not-github");
@@ -2017,6 +2103,8 @@ export function createApp(config: Config, key: Buffer) {
     advanceOutbox();
     outboxTimer = setInterval(advanceOutbox, 60 * 1000);
     outboxTimer.unref();
+    // A stop or resume pass that the previous process left unfinished is finished now.
+    void halt.start().catch(() => {});
   });
   server.once("close", () => {
     teams.close();
@@ -2036,11 +2124,12 @@ export function createApp(config: Config, key: Buffer) {
     handoffs.close();
     readings.stop();
     projectSource.stop();
+    halt.stop();
     closeEvidence();
   });
   const closeTerminals = connectTerminals(server, manager, authenticate, missionManagedSession);
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); intakeSlack?.close(); readings.stop(); goals.close(); teams.close(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
-  return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, closeConnections, fuse };
+  const closeConnections = () => { routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); intakeSlack?.close(); readings.stop(); goals.close(); teams.close(); halt.stop(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, closeConnections, fuse, halt };
 }

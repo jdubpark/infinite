@@ -1,0 +1,35 @@
+{
+  "mode": "observe",
+  "ports": [443, 80],
+  "allow": [
+    "api.anthropic.com",
+    "console.anthropic.com",
+    "statsig.anthropic.com",
+    "claude.ai",
+    "api.openai.com",
+    "auth.openai.com",
+    "chatgpt.com",
+    "api.deepseek.com",
+    "api.x.ai",
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "crates.io",
+    "index.crates.io",
+    "static.crates.io",
+    "proxy.golang.org",
+    "sum.golang.org",
+    "github.com",
+    "api.github.com",
+    "codeload.github.com",
+    "uploads.github.com",
+    "*.githubusercontent.com",
+    "api.linear.app",
+    "mcp.linear.app"
+  ],
+  "projects": {
+    "project-a": { "allow": ["registry.example.test"] }
+  },
+  "allowPrivate": []
+}

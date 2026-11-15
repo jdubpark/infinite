@@ -25,6 +25,9 @@ import { handleBoardClientCommand, projectsLines } from "./board-cli.js";
 import { handleUnderstandingCommand } from "./understanding-cli.js";
 import { handleRoutineClientCommand } from "./routine-cli.js";
 import { handleAutonomyClientCommand } from "./autonomy-cli.js";
+import { handleSignalClientCommand } from "./signal-cli.js";
+import { handleHaltClientCommand } from "./halt-cli.js";
+import { handleEgressClientCommand } from "./egress.js";
 import { handleGoalClientCommand } from "./objective-cli.js";
 import { handlePermissionsClientCommand } from "./permissions-cli.js";
 import type { ProjectGroupList } from "./project-group-types.js";
@@ -492,10 +495,10 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   }
 }
 
-const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "evidence", "fuse", "resources", "close", "sync", "pull", "team", "repo", "routine", "autonomy", "goal", "permissions"]);
+const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "evidence", "fuse", "resources", "close", "sync", "pull", "team", "repo", "routine", "autonomy", "signal", "halt", "egress", "permissions", "goal"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
-const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role", "--autonomy", "--profile", "--run", "--by", "--sources", "--days", "--member", "--issue", "--commit", "--at", "--reason", "--withdraw", "--goal", "--mission", "--kind", "--task", "--since", "--direction", "--version"]);
-const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--host", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs", "--dry-run", "--all", "--clear-direction"]);
+const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role", "--autonomy", "--profile", "--run", "--by", "--sources", "--days", "--member", "--issue", "--commit", "--at", "--reason", "--withdraw", "--goal", "--mission", "--kind", "--task", "--since", "--after", "--direction", "--version"]);
+const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--host", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs", "--dry-run", "--keep-paused", "--all", "--clear-direction"]);
 
 /**
  * The provider or client command that `handleClientCommand` dispatches on. A token that directly follows
@@ -891,6 +894,9 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     if (command === "understand") return await handleUnderstandingCommand(positional, options, api);
     if (command === "routine") return await handleRoutineClientCommand(positional, options, api);
     if (command === "autonomy") return await handleAutonomyClientCommand(positional, options, api);
+    if (command === "signal") return await handleSignalClientCommand(positional, options, api);
+    if (command === "halt") return await handleHaltClientCommand(positional, options, api);
+    if (command === "egress") return await handleEgressClientCommand(positional, options, api);
     if (command === "goal") return await handleGoalClientCommand(positional, options, api);
     if (command === "permissions") return await handlePermissionsClientCommand(positional, options, api);
     if (command === "team" || command === "repo") {

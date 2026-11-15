@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { teamReportSchema } from "./team-types.js";
 import { missionAssignment, reportErrorMessage, submitMissionReport, submitTeamReport } from "./team-report-client.js";
-import { missionReportSchema } from "./mission-types.js";
+import { missionReportArgumentsSchema } from "./mission-types.js";
 import { ENTRY_TOOLS_ENV, entryErrorMessage, submitEntryCall, type EntryCall } from "./team-entry-client.js";
 import { memberEntryPostSchema, memberListQuerySchema } from "./evidence/member-entry.js";
 
@@ -20,7 +20,7 @@ const tool = {
   inputSchema: z.toJSONSchema(argumentsSchema, { target: "draft-7" }),
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 };
-const missionArgumentsSchema = z.object({ report: missionReportSchema }).strict();
+const missionArgumentsSchema = missionReportArgumentsSchema;
 const ENTRY_ARGUMENTS = z.object({ entry: memberEntryPostSchema }).strict();
 const ENTRY_GET_ARGUMENTS = z.object({ entryId: z.uuid() }).strict();
 const ENTRY_TOOL_NAMES: ReadonlySet<string> = new Set(["entry_post", "entry_list", "entry_get"]);
@@ -39,7 +39,7 @@ function entryCallFor(name: string, args: Record<string, unknown>): EntryCall {
   if (name === "entry_list") return { op: "list", query: memberListQuerySchema.parse(args) };
   return { op: "get", entryId: ENTRY_GET_ARGUMENTS.parse(args).entryId };
 }
-const MISSION_INSTRUCTIONS ="Use the mission_report tool for this coordinator attempt only. Report once, wait for the durable receipt, then stop; the host starts a new attempt when the mission needs you. Never edit a repository, approve a permission, or bypass a refusal through a shell command.";
+const MISSION_INSTRUCTIONS = "Use the mission_report tool for this coordinator attempt only. Report once, wait for the durable receipt, then stop; the host starts a new attempt when the mission needs you. Never edit a repository, approve a permission, or bypass a refusal through a shell command.";
 type RequestId = string | number;
 const isObject = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 const isId = (value: unknown): value is RequestId => typeof value === "string" ? value.length <= 200 : typeof value === "number" && Number.isSafeInteger(value);
@@ -118,7 +118,7 @@ export async function runTeamMcp() {
         return;
       }
       if (mission) {
-        const envelope = await submitMissionReport(missionArgumentsSchema.parse(params.arguments).report);
+        const envelope = await submitMissionReport(missionArgumentsSchema.parse(params.arguments));
         await result(id, { content: [{ type: "text", text: "Mission report recorded. Stop work on this attempt." }],
           structuredContent: { requestId: envelope.requestId, missionId: envelope.missionId, memberId: envelope.memberId, revision: envelope.revision }, isError: false });
         return;

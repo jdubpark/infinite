@@ -1,0 +1,14 @@
+# Optional. With this socket enabled, systemd holds the listening port, so connections
+# wait in the queue while the proxy restarts instead of being refused. The proxy checks
+# that the socket it receives is on loopback and exits otherwise. Keep ListenStream equal
+# to "listen" in /etc/infinite-egress/proxy.json and to the host's proxyUrl.
+[Unit]
+Description=Infinite agent egress proxy socket (see deploy/ubuntu/egress.md)
+
+[Socket]
+ListenStream=127.0.0.1:4785
+NoDelay=true
+Service=infinite-egress-proxy.service
+
+[Install]
+WantedBy=sockets.target

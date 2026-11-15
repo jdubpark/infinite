@@ -206,6 +206,36 @@ merge or infer that the goal was achieved.
 Missed schedule ticks are coalesced, so downtime does not produce a burst of
 catch-up goals.
 
+A routine can also wake on [project signals](#project-signals). Add `wakeOn`
+to the file with up to four signal kinds, for example
+`"wakeOn": ["revert", "owner"]`. When a matching signal arrives, the routine
+starts its next occurrence early instead of waiting for its next due time:
+
+- It reads signals only while it is scheduled or running. A paused, blocked,
+  or ended routine reads nothing and keeps its place in the inbox.
+- Signals recorded before the approval never wake it.
+- It ignores signals about the team runs of goals it started, so its own
+  delivery never wakes it.
+- An early start waits until `autonomy.continuity.wakeMinGapMinutes` (0 to
+  1,440, default 5) have passed since the previous occurrence ended.
+- Every other rule still applies: the start time, the expiry,
+  `maxOccurrences`, the time budget, the launch-rate fuse, and the busy-project
+  rule. When the project is busy, the waiting signals wait for the next due
+  time.
+- Signals that arrive while an occurrence runs start at most one follow-on
+  occurrence.
+- Signals that arrive together start one occurrence. The routine reads 50
+  signals a pass and starts nothing while more wait, so a large batch delays
+  the start by a few seconds and never splits into two occurrences.
+- An early start needs a readable inbox. While the inbox cannot be read, the
+  routine runs on its schedule only, and the waiting signals keep waiting for
+  the next start that can read all of them.
+- The occurrence lists the signal IDs it started on under `wake`. It submits
+  the same goal as any other occurrence.
+
+`wakeOn` is part of the approval and cannot change later. A routine without it
+runs on its schedule only.
+
 ### Navigating large repositories
 
 For large codebases, agents can use [Graphify](https://github.com/Graphify-Labs/graphify)
@@ -764,7 +794,7 @@ coordinator to select and build work within those boundaries.
 | Setting | Default | Accepted range or meaning |
 | --- | --- | --- |
 | `allowedPaths` | `["."]` | Repository-relative files or folders; `.` permits the entire project. No globs or parent traversal. |
-| `maxRuns` | 3 | 1–10 sequential feature cycles |
+| `maxRuns` | 3 | 1–10 sequential feature cycles; a standing goal has no cycle limit |
 | `maxMinutes` | 60 | 5–1,440 minutes from creation |
 | `extendMinutes` | 0 | 0–240 minutes added each time the deadline arrives while an agent is active; 0 turns extensions off |
 | `maxTotalMinutes` | `maxMinutes` | 5–1,440 minutes, at least `maxMinutes`; the ceiling for the deadline, including extensions |
@@ -842,6 +872,115 @@ assessment and supporting evidence. A paused goal remains resumable and cannot
 accept an outcome assessment; finish or cancel it first. Only an explicit user
 assessment can mark the goal `achieved`. Passing checks, agent approval, or an
 idle terminal cannot do so.
+
+### Standing objectives
+
+A goal can be a standing objective. It runs one cycle after another on a
+cadence and has no cycle limit. Create it with
+`standing: { shape: "objective", cadenceMinutes, wakeOn }`. The project must be
+autonomous: a supervised project refuses it with `standing-requires-autonomy`.
+A routine cannot start a standing goal, and a standing goal refuses `maxRuns`.
+Every cycle passes the whole objective, so a standing goal's objective must fit
+in 24,000 bytes of UTF-8; a longer one is refused with
+`standing-objective-too-large`. The host never cuts the owner's text.
+
+The first cycle starts when the goal is created. Each later cycle starts at the
+later of two times: the previous cycle's start plus `cadenceMinutes`, and the
+time the previous cycle settled. `cadenceMinutes` is 30 to 10,080, default
+1,440. Starts missed while the host was down coalesce into one cycle.
+
+`maxMinutes`, `extendMinutes`, `maxTotalMinutes`, and `maxMembers` apply to each
+cycle. At each cycle start the host sets the deadline and the ceiling from that
+moment and gives the cycle `maxMembers` attempts, at most 60. A cycle that passes
+its time limit is stopped, and the goal goes on. Between cycles the goal has no
+deadline, so the host refuses an extension then; an extension applies to the
+current cycle only. Each cycle takes the host's current lineup and records it.
+
+A cycle's launch is recorded before its run is created. If the run was never
+created, because the host restarted or creation failed, the host withdraws the
+launch, returns its wake to the goal, and the next cycle passes every gate again
+(mode, lineup, failure count, Linear tracking, spend fuse, and owner pause or
+cancel) with a fresh window. Creation failures that pass with time leave the
+goal `running` with the reason and retry a minute later: low or unmeasurable
+storage, a window that lapsed while creation waited, a mission holding the
+repository, and file or process resource exhaustion. Any other creation failure
+blocks the goal, as it does a finite goal.
+
+When a cycle's members have stopped, the host records its `class`:
+
+| Class | The cycle ended | Effect |
+| --- | --- | --- |
+| `reviewed` | `ready-for-review`, or `merged` with a validated baseline | It is the parent of the next cycle |
+| `no-change` | `no-change` | Normal. The next cycle starts from the same parent |
+| `failed` | Blocked, or stopped at its time or attempt limit | Counts toward the failure stop |
+| `excluded` | Owner pause or cancel, a provider limit with no fallback, or a time stop while the spend fuse was open | Counts neither way |
+
+A standing goal never stops as `ready-for-review`, `no-opportunity`, or
+`limit-reached`. It stops starting cycles only in these cases:
+
+- The owner pauses or cancels it.
+- At a cycle boundary the project is supervised or no longer enrolled. The goal
+  becomes `paused` with `reasonCode: "supervised-mode"`. Resume returns
+  `standing-requires-autonomy` until the project is autonomous again.
+- A settled cycle left an external operation open: a reported merge without a
+  validated baseline, an unfinished delivery attempt or delivery recovery, or a
+  head the host could not confirm on GitHub. A delivery member that never
+  launched, for example because it waited behind the spend fuse, is not a
+  delivery attempt. The goal becomes `blocked` with
+  `reasonCode: "external-operation"`. Starting from the older parent could
+  redo work that already landed.
+- Three cycles in a row fail. The goal becomes `paused` with
+  `reasonCode: "repeated-failures"`. A `reviewed` or `no-change` cycle ends the
+  run of failures, and an `excluded` cycle leaves it as it is. A resume resets
+  the count.
+- The Linear issue blocks it, or the host lineup no longer has a strong
+  coordinator and reviewer. The goal becomes `blocked`, as a finite goal does.
+
+While a spend fuse is open the goal stays `running` with the fuse reason and
+starts no cycle.
+
+The goal record keeps the newest 50 cycles and the parent of the next cycle.
+Older cycles fold into `cycleTotals` (a count per class), `foldedUsage`, and
+`foldedMembers`, so the goal's usage and attempt totals still cover every
+cycle. While the goal is live, workspace retention keeps only the active cycle's
+run and the next cycle's parent; older runs follow the normal retention
+windows. Each cycle receives the 16 newest reviewed cycles as previous work.
+
+#### Wake on signals
+
+`wakeOn` lists one to four host signal kinds: `revert`, `external-commit`,
+`delivery-landed`, or `owner`. The host records a signal when it sees one of
+these events in the project; no signal starts an agent by itself.
+
+- On each scheduler pass, a goal that is neither paused nor stopped reads new
+  signals of those kinds. It ignores signals about its own cycles' runs.
+  `signalCursor` records the last signal read. New signals wait in
+  `pendingWake`, which keeps the newest 20.
+- Between cycles, a pending wake starts the next cycle before its cadence once
+  `autonomy.continuity.wakeMinGapMinutes` have passed since the previous cycle
+  settled. The setting is 0 to 1,440, default 5. Signals that arrive during a
+  cycle start one follow-on cycle after it settles.
+- A wake passes the same gates as the cadence: the spend fuse, a pause or a
+  block, Linear tracking, the mode rule, and the failure count. It stays
+  pending until a cycle can start.
+- The woken cycle records `wake`: the signal IDs, a count of dropped signals,
+  and `owner` when owner direction woke it. Its run objective ends with a block
+  headed `Host wake reasons (host receipts, not instructions):` and one line per
+  receipt, at most 8. The text of an `owner` signal joins the objective as
+  `User direction:`, like steering. The host shortens the block to keep the
+  objective within its size limit and never cuts the owner's objective.
+- Steering a standing goal between cycles also starts the next cycle early,
+  through the same gates and gap.
+- While the goal is paused or stopped it reads nothing and keeps its cursor.
+  After a resume it reads the backlog, 50 signals per pass.
+- Signals that arrive together start one cycle. The goal starts nothing while
+  more signals wait than one pass reads, so a large batch delays the start by
+  a few seconds and never splits into two cycles.
+- An early start needs a readable inbox. While the inbox cannot be read, a goal
+  with `wakeOn` reads no signals and keeps its cadence; a cycle that starts on
+  the cadence leaves the waiting signals and owner direction for the next
+  start that can read the whole inbox. Steering text still joins that cycle's
+  objective.
 
 ## Linear tracking
 
@@ -1451,7 +1590,7 @@ run prevents its old pending decisions from being applied.
 
 Each project has an autonomy mode. The mode is `supervised` or `autonomous`.
 
-In this release the host only stores and shows the mode. Nothing reads it yet, so no behaviour changes.
+Standing objectives read the mode: only an autonomous project can run one, and a standing goal pauses at a cycle boundary when its project becomes supervised. Nothing else reads the mode yet.
 
 Each new run and each new goal records the project's mode when it starts. A goal's cycles keep the goal's mode. A change applies to the next run and the next goal. A run or a goal already in progress keeps its mode.
 
@@ -1483,6 +1622,63 @@ Only the owner can change the mode, from the paired owner CLI. Members, other ro
 ## Launch-rate fuse
 
 The host limits how often it starts team sessions: 30 per project and 80 across the host in a rolling hour. A launch that would pass a limit waits. The member or goal shows a reason that starts "Waiting for the spend fuse:", names the project or the host, and gives no figures. The first trip of a UTC day closes by itself when fewer than half the limit remain in the last hour. If the limit is reached again on the same UTC day, the trip stays open until the owner closes it with `infinite fuse close --project PROJECT_ID` or `infinite fuse close --host`. The permission coordinator is never counted or held. The limits can be changed under `autonomy.fuse` in the host configuration (`project`, `host`, and `projects.PROJECT_ID`, each with `launchesPerHour`). A trip opened because the launch record cannot be read closes once the record can be read. Run `infinite fuse` to read every scope, or add `--json` for the full view. The `autonomy-interrupt` push event is on by default and sends the owner one notification per trip and subject per UTC day.
+
+## Project signals
+
+A project signal is a fact the host recorded about a project, or an item the
+owner added. Each project has an inbox of signals, oldest first. There are four
+kinds:
+
+- `delivery-landed`: the base branch scan saw a team run's delivered change on
+  the base branch. The signal names the run and the landed commit.
+- `revert`: the base branch scan saw a revert of a landed run's change. The
+  signal names the reverted run and the revert commit.
+- `external-commit`: a fetch moved the base branch, and at least one new commit
+  is neither a landing nor a revert that the scan attributed to a team run of
+  the project. The signal names the new base head. The host records it only
+  when the scan read exactly the new commits, so never on a project's first
+  scan or after a rewritten history. A run can land as several commits, and
+  the scan names only the last one, so a commit before a landing in the same
+  fetch may belong to that run and does not count. The one exception is a
+  landing by a merge commit whose second parent is the run's reviewed head: the
+  run's commits sit behind that parent, so a commit before it counts.
+- `owner`: direction the owner added with `infinite signal add`.
+
+Only the owner can add a signal, and only owner signals carry text. The host
+never copies text from a commit, a pull request, an issue, or an agent into a
+signal. Scan signals hold commit and run IDs only.
+
+A signal starts nothing by itself. A [routine](#scheduled-routines) or a
+[standing goal](#wake-on-signals) with `wakeOn` reads the inbox on its own
+scheduler pass and decides within its own limits.
+
+The host keeps signals for 30 days, and at most 20,000 across all projects. The
+oldest go first. A reader whose place is older than the oldest kept signal
+continues from that signal. Signals live in the evidence store. While the
+store is unavailable, nothing is recorded and readers wait.
+
+Each signal has a key from its source: a request ID, a ledger ID, or a commit.
+The host records one key once per project and kind, and remembers the key for
+the full 30 days, also after the 20,000 limit removed the signal itself. A
+repeat within 30 days records nothing. After 30 days the same key is a new
+signal, so a source uses a key once. The host remembers at most 200,000 keys.
+At that number it refuses new signals until old keys expire; it never forgets
+a key early to make room.
+
+```sh
+infinite signal add --project PROJECT_ID "Check the release notes before the next run"
+infinite signal list --project PROJECT_ID [--after SEQ] [--json]
+```
+
+## Halt
+
+The owner can stop autonomous work on the whole host or in one project, and it stays stopped until the owner releases it. `infinite halt on --host` or `infinite halt on --project PROJECT_ID [--reason TEXT]` engages a halt from any owner client, and the phone can send the same request through the API. From that moment no new team, goal, mission, or routine session starts in scope. Every scheduler and the session manager's backstop ask the halt before the launch-rate fuse, so a held launch is not counted by the fuse, is not a failed attempt, and is not a missed coordinator report. No role is exempt, including the permission coordinator that the fuse lets through. The session manager checks the halt once more right before it writes the session record, after every wait, and over every project the work covers; a mission coordinator covers all of the mission's repositories. When the halt refuses a launch there that a scheduler had already admitted, the fuse gives that admission back: the launch is not counted, and a trip that only it opened is removed. An admission made before a host restart is settled by the fuse as usual and keeps its count. A held item shows "Halted by the owner for the whole host." or "Halted by the owner for this project."
+
+Engaging also pauses the running work in scope through each item's own pause path: routines first, so they start nothing, then goals, missions, and the team runs that no goal or mission owns. A goal or mission pauses its own runs. A mission is in scope when any of its repositories is the halted project, and it pauses only the subteams that are working when the pause reaches them; each subteam decides that in its own queue, so one that has started to wait for input is left as it is. A subteam the halt paused carries the halt's mark from its first saved paused state, and any accepted owner action on it clears the mark. On release the mission resumes a subteam only if it is still paused and still carries that mark, so an owner action after the pause reached the subteam always wins. While the halt is engaged, a halt pause that has not reached a subteam yet, or that the mission repeats after a restart, still pauses the subteam if it is working when the pause arrives, even if the owner paused and resumed it in the meantime; the subteam then resumes on release. The release withdraws every halt pause that has not been delivered. If the mission stays paused, each of those subteams gets the mission's ordinary pause instead, the one the owner's pause of a mission sends: it carries no halt mark and resumes with the mission. Items the owner paused, blocked items, items waiting for input, and ended items are not touched; the members of an item waiting for input keep running, but nothing new starts. Sessions the owner started directly keep running. Each item the halt paused is marked with that halt. An item that could not be paused is listed in the response, and the halt stays engaged.
+
+`infinite halt off --host` or `--project PROJECT_ID` releases it. The gate lifts first. Then each marked item that is still paused, and that the owner did not change during the halt, resumes in reverse order under the same rules as the owner's resume; a team run resumes with a fresh plan. An item that those rules refuse stays paused and says why, for example a team whose members are still stopping, a team that needs workspace reconciliation, a goal or mission past its deadline, or a standing goal whose project is no longer autonomous. A standing goal has no deadline of its own, so a halt that outlasts its last cycle's time window does not end it: on release it returns to its cadence. Resume it when it is ready. A host halt and a project halt are independent: an item resumes only when no remaining halt covers it, and otherwise it moves to the remaining halt. `--keep-paused` lifts the gate and resumes nothing; each marked item then says that the owner kept it paused.
+
+Engage and release are idempotent by request ID. Engaging a scope that is already halted, or releasing one that is not, changes nothing and returns the current state. The halt is recorded in `halt.sealed` in the host state directory with its time, reason, and the owner device that engaged it. A restart keeps it, and a restart in the middle of a pause or resume pass finishes that pass without repeating what was done. If the host cannot read the record, it treats the whole host as halted and refuses every change to the halt until the record can be read; it checks again every minute. Once the record can be read again, any pause or resume pass it holds as unfinished runs before the next change to the halt. When the record cannot be restored, removing that file on the host clears every halt at the next check; nothing resumes, so resume each paused item yourself. A halt never infers completion and approves nothing. `infinite halt` lists every halted scope; add `--json` for the full view.
 
 ## Configuration
 
@@ -1858,6 +2054,18 @@ characters each), and `allowedPaths` (1–32 entries, 300 characters each).
 `maxRuns`, `maxMinutes`, `extendMinutes`, `maxTotalMinutes`, and `maxMembers`
 use the limits above. Legacy creation requests may include `parallelism`, but
 it does not select worker capacity.
+Optional `standing` makes the goal a standing objective (see
+[Standing objectives](#standing-objectives)):
+`{ shape: "objective", cadenceMinutes, wakeOn }`, with `cadenceMinutes`
+30–10,080 (default 1,440) and `wakeOn` holding one to four distinct signal
+kinds. A standing request must omit `maxRuns`. In a supervised project it
+returns `409` with `code: "standing-requires-autonomy"`; an objective over
+24,000 bytes returns `400` with `code: "standing-objective-too-large"`. A standing goal record
+adds `reasonCode` (`supervised-mode`, `repeated-failures`, or
+`external-operation`), `failedCycles`, `cycleTotals`, `foldedUsage`,
+`foldedMembers`, `signalCursor`, `pendingWake`, and, between cycles, the
+computed `nextCycleAt`. Its cycles add `class`, `settledAt`, `lineup`,
+`deadlineStop`, and `wake`.
 The host also limits the combined creation request to 40 KiB. On a mapped
 project, optional `linearIssueId` accepts an existing issue UUID or identifier
 (up to 100 characters); omitting it creates a new parent issue.
@@ -1867,7 +2075,10 @@ It leaves scope and budgets unchanged. Outcome `result` is `achieved`,
 `not-achieved`, or `inconclusive`; `summary` permits 4,000 characters and
 `evidence` 8,000. An outcome requires a terminal goal with no active cycle or
 pending operation. Resume requires a paused goal whose deadline has not expired;
-extend the goal first if it has.
+extend the goal first if it has. A standing goal's deadline belongs to its
+cycle, so its resume ignores it; resume is refused while the project is not
+autonomous. Extending a standing goal between cycles returns
+`goal-not-extendable`.
 
 The record reads answer `404` with `objective-version-not-found` for a version
 the record does not have, and `409` for a goal cycle run, mission subteam, or handoff run
@@ -1919,6 +2130,41 @@ on a later request. See [Swarm view](swarm.md).
 The continue request accepts exactly `requestId`, `revision`, and optional
 `text`; omit `text` when no direction is needed. A supplied direction is trimmed
 and must contain 1–8,000 characters.
+
+### Project signals
+
+| Method and endpoint | Body | Role |
+| --- | --- | --- |
+| `GET /api/projects/:id/signals?after=SEQ&limit=N` | None; returns `{signals, head}`, oldest first. `after` defaults to 0; `limit` is 1–200, default 50 | Any paired device |
+| `POST /api/projects/:id/signals` | `requestId` (UUID), `text` (trimmed, 1–2,000 characters); returns `{recorded, signal}` | Owner |
+
+`head` is the highest signal number on the host, across all projects. A repeated
+`requestId` records nothing and returns the signal stored first, with
+`recorded: false`. A repeated `requestId` whose signal the row limit already
+removed is `410` with `code: "signal-gone"`; nothing new is recorded. An unknown
+project is `404`. An unavailable evidence store is `503` with
+`code: "evidence-unavailable"`, and a full key record is `503` with
+`code: "signal-inbox-full"`. See [Project signals](#project-signals).
+
+### Halt
+
+| Method and endpoint | Body | Role |
+| --- | --- | --- |
+| `GET /api/halt` | None; returns `{readable, host?, projects}`. Each halt has `haltId`, `at`, optional `reason`, and `by`, the engaging device's label; a project halt adds `projectId` | Any paired device, including viewers, who see the owner's free-form reason and the device label |
+| `POST /api/halt` | `requestId` (UUID), `scope` (`host` or `project`), `projectId` for a project, optional trimmed `reason` (1–500 characters) | Owner |
+| `POST /api/halt/release` | `requestId` (UUID), `scope`, `projectId` for a project, optional `keepPaused` | Owner |
+
+Engage returns `{halt, engaged, paused, failed}` and release returns
+`{halt, released, resumed, notResumed}`. Each listed item has `kind` (`routine`,
+`goal`, `mission`, or `team`), `id`, `title`, and an optional `reason`. A replay
+of the same request returns the first result. An unknown project answers `404`
+with `code: "project-not-found"`; a project that left the configuration while
+halted can still be released. A request ID reused with a different body answers
+`409` with `code: "request-conflict"`. While the halt record cannot be read, both
+mutations answer `409` with `code: "halt-unreadable"`. A failed write answers
+`503` with `code: "write-failed"` and changes nothing. The session manager
+refuses a launch that a halt holds with `409` and `code: "halted"`. See
+[Halt](#halt).
 
 ## Model scorecard
 

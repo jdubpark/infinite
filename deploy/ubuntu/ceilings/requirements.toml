@@ -1,0 +1,3 @@
+# Codex provider ceiling. Installed root-owned at /etc/codex/requirements.toml.
+# Clamps the sandbox mode: full access is not allowed. See ceilings.md.
+allowed_sandbox_modes = ["read-only", "workspace-write"]

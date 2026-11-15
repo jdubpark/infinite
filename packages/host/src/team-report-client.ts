@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { teamReportEnvelopeSchema, teamReportSchema, type TeamReportEnvelope } from "./team-types.js";
-import { missionReportEnvelopeSchema, missionReportSchema } from "./mission-types.js";
+import { missionReportArgumentsSchema, missionReportEnvelopeSchema, missionReportSchema } from "./mission-types.js";
 
 export class ReportError extends Error {}
 export const MAX_TEAM_REPORT_BYTES = 64 * 1024;
@@ -108,14 +108,19 @@ export function missionAssignment(env: NodeJS.ProcessEnv = process.env) {
   try { return missionAssignmentSchema.parse(JSON.parse(env.INFINITE_MISSION_ASSIGNMENT ?? "")); }
   catch { return undefined; }
 }
-/** Accept a raw mission report or an explicit retry envelope, always bound to this coordinator's assignment. */
+/**
+ * Accept a raw mission report, the tool's `{ report, note }` arguments, or an explicit retry envelope, always bound to
+ * this coordinator's assignment. A note joins the request identity; a report without one keeps its earlier identity.
+ */
 export function createMissionReportEnvelope(input: unknown, env: NodeJS.ProcessEnv = process.env): MissionReportEnvelope {
   const { binding } = missionReportEnvironment(env);
+  const object = input !== null && typeof input === "object" && !Array.isArray(input);
   let envelope: MissionReportEnvelope;
-  if (input !== null && typeof input === "object" && !Array.isArray(input) && "report" in input) envelope = missionReportEnvelopeSchema.parse(input);
+  if (object && "report" in input && "requestId" in input) envelope = missionReportEnvelopeSchema.parse(input);
   else {
-    const report = missionReportSchema.parse(input);
-    envelope = missionReportEnvelopeSchema.parse({ ...binding, report, requestId: reportIdentity({ ...binding, report }) });
+    const { report, note } = object && "report" in input ? missionReportArgumentsSchema.parse(input) : { report: missionReportSchema.parse(input), note: undefined };
+    const content = { report, ...(note === undefined ? {} : { note }) };
+    envelope = missionReportEnvelopeSchema.parse({ ...binding, ...content, requestId: reportIdentity({ ...binding, ...content }) });
   }
   if (envelope.missionId !== binding.missionId || envelope.memberId !== binding.memberId || envelope.revision !== binding.revision)
     throw new ReportError("The report does not match this coordinator's assigned mission and attempt.");

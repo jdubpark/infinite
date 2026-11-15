@@ -19,7 +19,7 @@ export type HaltPlace = "overview" | "screen" | { projectIds: readonly string[] 
 
 export type HaltNotice =
   | { kind: "unreadable" }
-  /** `projects` are the project halts that stay engaged when the host halt is released. */
+  /** `projects` are the project halts that stay engaged when the host halt is released; a project screen lists only its own. */
   | { kind: "host"; halt: HaltState; projects: ProjectHalt[] }
   | { kind: "project"; halts: ProjectHalt[] }
   | { kind: "overview"; halts: ProjectHalt[] };
@@ -29,11 +29,41 @@ export function haltNotice(view: HaltView | null | undefined, place: HaltPlace):
   if (!view) return null;
   if (!view.readable) return { kind: "unreadable" };
   const projects = view.projects ?? [];
-  if (view.host) return { kind: "host", halt: view.host, projects };
+  const own = typeof place === "object" ? projects.filter(halt => place.projectIds.includes(halt.projectId)) : projects;
+  if (view.host) return { kind: "host", halt: view.host, projects: own };
   if (place === "screen") return null;
   if (place === "overview") return projects.length ? { kind: "overview", halts: projects } : null;
-  const halts = projects.filter(halt => place.projectIds.includes(halt.projectId));
-  return halts.length ? { kind: "project", halts } : null;
+  return own.length ? { kind: "project", halts: own } : null;
+}
+
+/**
+ * One halt snapshot per machine, shared by every screen. A read takes a ticket before it starts, and only a read that
+ * started after the stored one may replace it, so a late answer to an earlier read, or a screen's own retained copy,
+ * never brings back a halt the owner has released. A failed read leaves the snapshot as it was.
+ */
+export function createHaltStore() {
+  let tickets = 0;
+  const latest = new Map<string, { ticket: number; view: HaltView }>();
+  const listeners = new Set<() => void>();
+  return {
+    begin: () => ++tickets,
+    record(key: string, ticket: number, view: HaltView) {
+      const current = latest.get(key);
+      if (current && current.ticket > ticket) return;
+      // Keep the stored object when nothing changed, so subscribed screens do not redraw on every poll.
+      if (current && JSON.stringify(current.view) === JSON.stringify(view)) {
+        latest.set(key, { ticket, view: current.view });
+        return;
+      }
+      latest.set(key, { ticket, view });
+      for (const listener of listeners) listener();
+    },
+    get: (key: string): HaltView | null => latest.get(key)?.view ?? null,
+    subscribe(listener: () => void) {
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    },
+  };
 }
 
 export const haltSince = (at: string) => new Date(at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });

@@ -5,6 +5,7 @@ import { connectionKey, type Connection } from "../../api/client";
 import { LiveStatus, TopBar } from "../../components/Glass";
 import { Glyph } from "../../components/Icon";
 import { theme } from "../../theme";
+import { HaltBanner } from "../halt/HaltBanner";
 import { Section, t } from "../teams/parts";
 import { StackedBars } from "./charts";
 import { accountColors, accountName, usd, type Money } from "./model";
@@ -34,6 +35,7 @@ export function ProjectCost({ connection, id }: { connection: Connection; id: st
     <ScrollView style={s.fill} contentContainerStyle={s.body}
       refreshControl={<RefreshControl refreshing={project.refreshing || daily.refreshing} onRefresh={() => { project.refresh(); daily.refresh(); }} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <Text style={t.title} accessibilityRole="header">{cost.name}</Text>
+      <HaltBanner connection={connection} place={{ projectIds: [id] }} />
       <View style={s.head}>
         <MoneyText value={{ ...cost.total, unmeasured }} style={s.total} prefixStyle={s.totalPrefix} />
         <Text style={t.note}>accrued{unmeasured ? ` · ${unmeasured} unmeasured` : ""}</Text>

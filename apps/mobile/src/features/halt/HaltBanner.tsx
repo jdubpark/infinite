@@ -1,22 +1,22 @@
+import { useCallback, useSyncExternalStore } from "react";
 import { StyleSheet, Text, View, type StyleProp, type ViewStyle } from "react-native";
 import { api, connectionKey, type Connection } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Glyph } from "../../components/Icon";
 import { theme } from "../../theme";
-import { haltNotice, haltSince, type HaltPlace, type HaltState, type HaltView } from "./model";
+import { createHaltStore, haltNotice, haltSince, type HaltPlace, type HaltState, type HaltView } from "./model";
 
-// The last halt each machine reported: a screen opened during a halt shows it at once, and a failed poll keeps it.
-const lastHalt = new Map<string, HaltView>();
+// Every screen reads the same snapshot per machine; a screen opened during a halt shows it at once.
+const halts = createHaltStore();
 
-/** Reads `GET /api/halt` on the board's cadence while the screen is focused. */
+/** Reads `GET /api/halt` every four seconds while the screen is focused, and shows the newest read of any screen. */
 function useHalt(connection: Connection): HaltView | null {
   const key = connectionKey(connection);
-  const poll = usePoll(async () => {
-    const view = await api<HaltView>(connection, "/halt");
-    lastHalt.set(key, view);
-    return { key, view };
+  usePoll(async () => {
+    const ticket = halts.begin();
+    halts.record(key, ticket, await api<HaltView>(connection, "/halt"));
   }, 4000, [connection]);
-  return (poll.data?.key === key ? poll.data.view : undefined) ?? lastHalt.get(key) ?? null;
+  return useSyncExternalStore(halts.subscribe, useCallback(() => halts.get(key), [key]));
 }
 
 const HELD = "No new team, goal, mission, or routine work starts";
@@ -47,7 +47,7 @@ export function HaltBanner({ connection, place, names, style }: {
   } else if (notice.kind === "project") {
     const single = typeof place === "object" && place.projectIds.length === 1;
     title = single ? "Halted by the owner for this project" : `Halted by the owner for ${notice.halts.map(halt => name(halt.projectId)).join(", ")}`;
-    detail = `${HELD} here; running goals and missions stay paused.`;
+    detail = `${HELD} here; running goals and missions stay paused. Direct sessions keep running.`;
     lines = notice.halts.flatMap(facts);
   } else {
     title = notice.halts.length === 1 ? "1 project halted by the owner" : `${notice.halts.length} projects halted by the owner`;

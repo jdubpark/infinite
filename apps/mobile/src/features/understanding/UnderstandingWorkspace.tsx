@@ -7,12 +7,16 @@ import { Chip, LiveStatus, Segmented, type SegmentOption, TopBar } from "../../c
 import { Glyph } from "../../components/Icon";
 import type { UnderstandingRepository, UnderstandingWork, WorkspaceUnderstanding } from "@infinite/remote";
 import { theme } from "../../theme";
+import { HaltBanner } from "../halt/HaltBanner";
 import { KnowledgePanel } from "./KnowledgePanel";
 import { SystemOverview } from "./SystemOverview";
 import { clearUnderstandingSummary, readUnderstandingSummary, saveUnderstandingSummary } from "./offline-cache";
 
 type ViewMode = "work" | "system";
-type ReadResult = { scope: string; state: "ready" | "missing" | "upgrade" | "denied"; groupName: string; data?: WorkspaceUnderstanding; error?: string; cachedAt?: string };
+/** `checkouts` are the workspace's, for the halt banner; a cached overview keeps those of the last read. */
+type ReadResult = { scope: string; state: "ready" | "missing" | "upgrade" | "denied"; groupName: string; checkouts?: Checkout[]; data?: WorkspaceUnderstanding; error?: string; cachedAt?: string };
+
+type Checkout = { projectId: string; name: string };
 
 const views: SegmentOption<ViewMode>[] = [
   { value: "work", label: "Work", glyph: "stack" },
@@ -34,7 +38,7 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
 
   const poll = usePoll(async () => {
     if (stopped.current === scope && last.current?.scope === scope) return last.current;
-    let confirmedGroupName = "";
+    let confirmedGroupName = "", checkouts: Checkout[] | undefined;
     try {
       const groups = await api<ProjectGroupList>(connection, "/project-groups");
       const group = groups.groups.find(candidate => candidate.id === workspaceId);
@@ -46,14 +50,15 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
         return result;
       }
       confirmedGroupName = group.name;
+      checkouts = group.repos.flatMap(repo => repo.checkouts.map(({ projectId, name }) => ({ projectId, name })));
       const data = await api<WorkspaceUnderstanding>(connection, `/project-groups/${encodeURIComponent(workspaceId)}/understanding`);
       if (data.schemaVersion !== 1 || data.workspace.id !== workspaceId) {
-        const result: ReadResult = { scope, state: "upgrade", groupName: group.name, error: "This host returned an unsupported Understanding version." };
+        const result: ReadResult = { scope, state: "upgrade", groupName: group.name, checkouts, error: "This host returned an unsupported Understanding version." };
         last.current = result;
         stopped.current = scope;
         return result;
       }
-      const result: ReadResult = { scope, state: "ready", groupName: group.name, data };
+      const result: ReadResult = { scope, state: "ready", groupName: group.name, checkouts, data };
       last.current = result;
       void saveUnderstandingSummary(connection, data);
       return result;
@@ -61,7 +66,7 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
       if (error instanceof ApiError && [401, 403, 404].includes(error.status)) {
         await clearUnderstandingSummary(connection, workspaceId).catch(() => {});
         const result: ReadResult = error.status === 404 && confirmedGroupName
-          ? { scope, state: "upgrade", groupName: confirmedGroupName, error: "Update this host to use Workspace Understanding." }
+          ? { scope, state: "upgrade", groupName: confirmedGroupName, checkouts, error: "Update this host to use Workspace Understanding." }
           : error.status === 404
             ? { scope, state: "missing", groupName: "", error: "This workspace is no longer available on this machine." }
             : { scope, state: "denied", groupName: confirmedGroupName, error: "This device no longer has access to this workspace." };
@@ -71,7 +76,7 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
       }
       const cached = await readUnderstandingSummary(connection, workspaceId);
       if (cached) {
-        const result: ReadResult = { scope, state: "ready", groupName: cached.data.workspace.name, data: cached.data, cachedAt: cached.cachedAt };
+        const result: ReadResult = { scope, state: "ready", groupName: cached.data.workspace.name, checkouts: last.current?.scope === scope ? last.current.checkouts : undefined, data: cached.data, cachedAt: cached.cachedAt };
         last.current = result;
         return result;
       }
@@ -102,6 +107,7 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
   return <View style={s.fill}>
     <TopBar backLabel="Understand" onBack={back} title={groupName} right={<LiveStatus online={poll.online && result?.state === "ready" && !result.cachedAt} loading={poll.loading} seen={poll.seen} stale={poll.stale} />} />
     <Segmented options={views} value={view} onChange={setView} style={s.segment} />
+    <HaltBanner connection={connection} place={{ projectIds: result?.checkouts?.map(checkout => checkout.projectId) ?? [] }} names={id => result?.checkouts?.find(checkout => checkout.projectId === id)?.name} style={s.halt} />
     <ScrollView ref={scroll} contentContainerStyle={s.content} keyboardShouldPersistTaps="handled"
       refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={() => { stopped.current = ""; poll.refresh(); }} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <View ref={content}>
@@ -209,6 +215,7 @@ function date(value: string) { const parsed = new Date(value); return Number.isN
 const s = StyleSheet.create({
   fill: { flex: 1, backgroundColor: theme.colors.paper },
   segment: { marginHorizontal: 16, marginBottom: 6 },
+  halt: { marginHorizontal: 16, marginBottom: 4 },
   content: { paddingHorizontal: 16, paddingTop: 10, paddingBottom: 36 },
   stack: { gap: 12 },
   intro: { fontSize: 13, lineHeight: 19, color: theme.colors.secondaryInk },

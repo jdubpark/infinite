@@ -1,0 +1,37 @@
+#!/usr/sbin/nft -f
+# Infinite agent egress firewall: OBSERVE variant. See deploy/ubuntu/egress.md.
+#
+# Only packets from sockets owned by the agent account are examined. Those that do not
+# leave through loopback did not go through the egress proxy. This variant LOGS them,
+# rate-limited, and LETS THEM THROUGH, except link-local destinations, which hold cloud
+# metadata services and are refused in both variants.
+#
+# nft resolves the account name when the file loads. A file that fails to load changes
+# nothing: the table stays as it was, or absent at boot. Check the unit after each change.
+
+define agent_user = "infinite-agent"
+
+# Replace this table, and only this table.
+table inet infinite_egress
+delete table inet infinite_egress
+
+table inet infinite_egress {
+	chain output {
+		type filter hook output priority filter; policy accept;
+		meta skuid $agent_user jump agent
+	}
+
+	chain agent {
+		oifname "lo" return
+		ip daddr 169.254.0.0/16 jump refuse
+		ip6 daddr { fe80::/10, fd00:ec2::254 } jump refuse
+		ct state new limit rate 10/minute burst 20 packets log prefix "infinite-egress bypass: " level info
+		# OBSERVE: no verdict here. The packet returns to the output chain and is accepted.
+	}
+
+	chain refuse {
+		ct state new limit rate 10/minute burst 20 packets log prefix "infinite-egress refused: " level info
+		meta l4proto tcp reject with tcp reset
+		reject with icmpx admin-prohibited
+	}
+}

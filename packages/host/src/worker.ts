@@ -46,6 +46,7 @@ import { TranscriptWatch, closesTurn } from "./transcript-watch.js";
 import { drainLaunch, runFinalDrain } from "./final-drain.js";
 import { buildLaunch } from "./launch.js";
 import { addProjectIdToLaunchEnv } from "./worker-env.js";
+import { workerEgressEnvironment } from "./egress.js";
 import { claudeConfigPath, recordClaudeTrust } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
@@ -1398,6 +1399,11 @@ server.listen(socketPath(runDir, session.id), async () => {
     }
     env.TERM = "xterm-256color";
     addProjectIdToLaunchEnv(env, session.projectId);
+    // Present only with autonomy.boundary.github: Git and gh reach GitHub through the proxy with this grant.
+    if (config.github) {
+      env.INFINITE_GITHUB_GRANT = config.github.grant;
+      env.INFINITE_GITHUB_PROXY = config.github.proxy;
+    }
     if (session.team) {
       if (!hookServer) throw new Error("Team report channel could not start");
       // The verification flag is host policy; the agent's binding stays the stable assignment identity.
@@ -1418,6 +1424,12 @@ server.listen(socketPath(runDir, session.id), async () => {
       env.INFINITE_HOOK_URL = hookServer.url;
       env.INFINITE_HOOK_TOKEN = hookToken;
     }
+    // With autonomy.boundary.egress, the session reaches the network through the egress proxy under its own credential.
+    // Without the key it gets the proxy with no credential, so its requests are refused rather than sent direct.
+    const egress = workerEgressEnvironment(session.projectId, session.id);
+    if (egress.status === "invalid") throw new Error("The egress proxy address this worker inherited is unusable, so the session was not started");
+    Object.assign(env, egress.env);
+    if (egress.status === "no-key") journal.append("lifecycle", { egress: "no-credential" });
     const relayPath = fileURLToPath(
       new URL(
         import.meta.url.endsWith(".ts") ? "./hook-relay.ts" : "./hook-relay.js",

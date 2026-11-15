@@ -1,0 +1,6 @@
+{
+  "listen": { "host": "127.0.0.1", "port": 4785 },
+  "keyFile": "/etc/infinite-egress/key",
+  "policyFile": "/etc/infinite-egress/policy.json",
+  "summaryFile": "/var/lib/infinite-egress/summary.json"
+}

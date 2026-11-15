@@ -1,7 +1,9 @@
 import type { TeamAssignment, TeamModelProfile } from "../team-types.js";
+import { haltReason, isHaltReason } from "../halt/rules.js";
 import type {
   FuseAdmission,
   FuseCheck,
+  FuseState,
   FuseLaunch,
   FuseLaunchRecord,
   FuseLimits,
@@ -72,7 +74,7 @@ export function scopeState(
   projectId: string | undefined,
   limit: number,
   now: number,
-): FuseCheck {
+): FuseState {
   const open = trips.filter(
     (trip) => trip.closedAt === undefined && (scope === "host" ? trip.scope === "host" : trip.scope === "project" && trip.projectId === projectId),
   );
@@ -106,7 +108,7 @@ export function fuseCheck(
   projectId: string,
   limits: FuseLimits,
   now: number,
-): FuseCheck {
+): FuseState {
   const host = scopeState(launches, trips, "host", undefined, limits.host, now);
   if (host.state === "open") return host;
   return scopeState(launches, trips, "project", projectId, projectLimit(limits, projectId), now);
@@ -147,18 +149,25 @@ export function isFuseReason(text: string | undefined): boolean {
 }
 
 /**
- * Sets or clears only a fuse reason on the holder. `changed` is true only when the value changed.
+ * Sets or clears only a fuse or halt reason on the holder. `changed` is true only when the value changed.
  * A closed check clears a fuse reason, except the write failure, which only `admit` can judge: an accepted
  * admission clears that one. So a failing baseline write gives one steady reason, not one that flips each pass.
+ * The owner's halt sits in front of the fuse: a halted result sets the halt reason, and any other result clears it.
  */
 export function applyFuseReason(
   holder: { reason?: string },
   result: FuseCheck | FuseAdmission | undefined,
 ): { wait: boolean; changed: boolean } {
   if (result === undefined) return { wait: false, changed: false };
-  if ("exempt" in result && result.exempt === true) return { wait: false, changed: false };
-
   const before = holder.reason;
+  const halted = "state" in result ? (result.state === "halted" ? result : undefined) : "halted" in result ? result.halted : undefined;
+  if (halted) {
+    holder.reason = haltReason(halted);
+    return { wait: true, changed: holder.reason !== before };
+  }
+  if (isHaltReason(holder.reason)) holder.reason = undefined;
+  if ("exempt" in result && result.exempt === true) return { wait: false, changed: holder.reason !== before };
+
   let wait: boolean;
   if ("state" in result) {
     if (result.state === "open") {

@@ -63,6 +63,10 @@ What the code shows, and how this plan rules on it:
 - **The memory holds no prompt, and it is pruned.** `background polling retains compact session snapshots instead of full prompts and messages` also measures `settledSessions`, and a complete snapshot without a session drops its entry.
 - In `manager.ts` this adds one method, `metaRevision`. Nothing else changes there.
 
+**Ruling after the third local review.**
+
+- **A detail read is no listing.** `sessionDetail` builds its one row from the stored session, and a stored session carries `backend`. `Readings.merge` took a row with `backend` for a whole listing, so each detail read dropped the memory of every other session, and the next list read every record again. The live feed reads a session's detail every 750 ms while a client has it open. The same read also dropped the other sessions' evaluations and queued jobs; that part was on `main` before this change. `merge(rows, complete)` now takes the caller's word, with today's rule as the default, and `sessionDetail` passes `false`. `a warm session list reads no session record` writes its records as the host does, with `backend`, and reads one session's detail before the measured list. `polling reads a session record once unless a title job is due` shows that a detail read reads its own record again and leaves the others.
+
 ## Trust boundary, and what a review checks
 
 The sealed files are written by the host and its workers with one key, and `unseal` authenticates each read with its scope. A file that fails to open leaves its row out (metadata) or shows it `unavailable` (status), as today, and a failure is never kept. Socket files live in the run directory (mode 0700); any process of the service user that creates one is connected to, as today. The cache adds no file, column, log line, or error text. The wall clock is the one new input: a step back clears the cache.

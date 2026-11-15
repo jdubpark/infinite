@@ -82,7 +82,9 @@ The routine digest hashes the project team configuration, so no key has a schema
 
 **Autonomous default (decided 2026-11-13).** An `autonomous` project (C12) without a saved policy uses `shadow` until its shadow period ends, then `auto` with points `["start"]`, `cascade` on, and `maxExploreShare` 0.2. *(My call: the shadow period ends after 14 days and 50 recorded `start` decisions, whichever is later.)* The end of the period is a host-held fact in the evidence store, like an exploration pause, so it leaves a routine's approval digest unchanged. Leaving the project `autonomous` is the owner's delegation.
 
-`infinite repo init` saves the policy through that owner-only route. `createRun` pins a copy as `run.routing`, as it pins `permissions`, so a later change affects new runs only. It refuses with `routing-no-eligible-profile` when `start` is listed and no candidate passes the fixed rules of Part 5.
+`infinite repo init` saves the policy through that owner-only route. `createRun` pins a copy as `run.routing`, as it pins `permissions`, so a later change affects new runs only. In `auto` it refuses with `routing-no-eligible-profile` when `start` is listed and no candidate passes the fixed rules of Part 5. In `shadow` it never refuses (Part 5).
+
+*Shadow slice (INF-260, amended 2026-11-15).* A policy without `mode` takes the project's default mode: `shadow` in an `autonomous` project, `off` in a `supervised` one (`effectiveRouting` in `routing-policy.ts`). A policy that names `mode: shadow` is shadow in either mode. The `--routing auto` option is refused by `repo init` until a later release.
 
 `revokeRouting` sets `run.routingRevokedAt`. After that, the run uses the coordinator's `agentProfileId` where the plan has one, and the default profile otherwise. The fixed rules still bind it. The **default profile** of a decision point is its first candidate in lineup order that passes the fixed rules.
 
@@ -159,6 +161,8 @@ cell:    Beta(k_c·μ_p + P_c + S_c,  k_c·(1 − μ_p) + Q_c + F_c)    k_c = mi
 
 ### Part 5: The choice
 
+*Shadow slice (INF-260, amended 2026-11-15).* In `shadow` the choice is recorded and never applied. The member runs on the coordinator's profile, and a shadow run is never refused, blocked, or failed by the router or by the evidence store. A store module that is unavailable makes the recorder write nothing, and the run continues.
+
 **Eligibility.** Two fixed rules follow from the pinned lineup and policy. A candidate fails when:
 
 1. it has `dataUse: "contributor"` and the policy does not set `allowContributor`, or
@@ -217,7 +221,7 @@ CREATE TABLE routing_decisions (
   run_id TEXT NOT NULL, revision INTEGER NOT NULL, task_key TEXT NOT NULL,
   point TEXT NOT NULL, ordinal INTEGER NOT NULL,
   project_ref TEXT NOT NULL, role TEXT NOT NULL,
-  area_ref TEXT, kind TEXT, risk TEXT NOT NULL, feature_version INTEGER NOT NULL,
+  area_ref TEXT, kind TEXT, risk TEXT NOT NULL, feature_version INTEGER NOT NULL, feature_map_ref TEXT NOT NULL,
   mode TEXT NOT NULL,     -- shadow | auto
   algorithm_version INTEGER NOT NULL, reward_version INTEGER NOT NULL,
   policy_digest TEXT NOT NULL, seed TEXT NOT NULL, basis TEXT NOT NULL,
@@ -236,7 +240,7 @@ CREATE TABLE routing_decisions (
 
 **Routing policy version.** `policy_digest` is the digest of `algorithm_version` and the pinned `run.routing`. It is the routing policy version of contract C7, so one changed parameter gives a new version. The improvement gate does not test routing parameters, because a replay trial fixes its profile. The owner compares two policies in `shadow` mode.
 
-**Writes.** In `auto` mode the host writes the row as `pending` before it creates the member. It becomes `applied`, with `member_id`, when `member.started` arrives for that attempt with the same profile. It becomes `released` when the launch fails: preparation fails, the run halts first, or the member starts on a limit fallback. A startup pass releases a `pending` row of a settled run. A `shadow` row is `recorded` and never changes. The exploration share counts `pending` and `applied` rows, and the who-chose weight uses `applied` rows. A row holds no run text, so it outlives the run record.
+**Writes.** In `auto` mode the host writes the row as `pending` before it creates the member. It becomes `applied`, with `member_id`, when `member.started` arrives for that attempt with the same profile. It becomes `released` when the launch fails: preparation fails, the run halts first, or the member starts on a limit fallback. A startup pass releases a `pending` row of a settled run. A `shadow` row is `recorded` and never changes, and its `member_id` is NULL. *(Shadow slice, INF-260.)* `feature_map_ref` is the blind index of the feature map's name, so a row of one map never counts for another. The exploration share counts `pending` and `applied` rows, and the who-chose weight uses `applied` rows. A row holds no run text, so it outlives the run record.
 
 The run record gains `task.routing = { decisionKey, profileId, mode }`. The host passes the chosen profile to `newMember` through its existing `pinnedProfile` parameter. `agentProfileId` keeps the coordinator's value.
 
@@ -302,6 +306,7 @@ Cascade check against light-b: `2.00 · 0.15 + 1.50 · 0.20 = 0.60`, below the p
 | The evidence store is unavailable, or a decision takes longer than 250 ms | The host starts the default profile, writes no row, and adds a line to the run's events. The run is not blocked. |
 | Every candidate's provider is limited | The router returns the default profile with basis `default-all-limited`. `newMember` then applies the limit fallback under the fixed rules. |
 | A limit fallback has no target that passes the fixed rules | Today's code decides. At launch, `newMember` starts the selected profile, because the limit may have lifted. At a limit during work, `switchLimitedMember` blocks the run with `provider-limit`. |
+| In `shadow`, the evidence store or one of its modules is unavailable, or the recorder throws | Nothing is written and the run continues on the coordinator's profile. No run event line is added (INF-260). |
 | The launch fails, or the member starts on a limit fallback | The row is released and counts nowhere. |
 | A provider changes a model behind an unchanged name | Time decay limits the damage, and the owner can declare a new profile epoch. |
 
@@ -351,3 +356,13 @@ Each phase is its own pull request and is useful alone.
 - Per-tier default costs and the default rescue cost, until the ledger has measured values.
 - The exact field names the router reads from outcome rows and duel records. Those designs own them.
 - CLI text layout and the client status views.
+
+### Filled in by the shadow slice (INF-260, 2026-11-15)
+
+- **Sampler.** Computed on read, never stored. Each candidate draws its theta from a stream seeded by the decision seed and its identity: SHA-256 blocks of `seed:counter`, read as 53-bit uniforms, then Beta through two gamma draws (`routing-sample.ts`). A fallback is labelled in the payload as `samplerFallback`.
+- **Indexes.** `routing_by_task (run_id, task_key, revision, point, ordinal)`, `routing_by_project (project_ref, point, decided_at, key)`, `routing_by_time (decided_at, key)` (`routing-store.ts`). Every launch-path read seeks one of them and has a row limit.
+- **Posterior.** Computed on read from the rows of the identity, with no cache (`routing-posterior.ts`).
+- **Interval.** Normal approximation to the Beta at 90%, z = 1.645, labelled `normal-approx-90` in the status view.
+- **Tier defaults.** Light $0.40, strong $2.20, rescue $1.50 (`TIER_COSTS`, `RESCUE_USD`). Every status and explain line that uses one says so.
+- **Payload limit.** 32 KiB of JSON per decision (`PAYLOAD_LIMIT_BYTES` in `routing-store.ts`). The comment on the payload type in `routing-types.ts` still says 16 KiB; the code is the value.
+- **Retention.** Decisions decided more than 180 days before the sweep are removed by the host's sweep (`sweepExpiredDecisions`, called from `server.ts`).

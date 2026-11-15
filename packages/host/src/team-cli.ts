@@ -34,6 +34,30 @@ export function carriedTeamSettings(team: unknown): Record<string, unknown> {
   if (typeof team !== "object" || team === null || Array.isArray(team)) return {};
   return Object.fromEntries(Object.entries(team).filter(([key]) => !REPO_INIT_TEAM_KEYS.has(key)));
 }
+const ROUTING_VALUE_PRESETS = new Map<string, number>([["cost", 0.5], ["balanced", 2], ["quality", 8]]);
+/** The settings the three --routing options name, checked before any request. Undefined when none is given. */
+function requestedRouting(options: Options): Record<string, unknown> | undefined {
+  if (["--routing", "--routing-value", "--routing-contributor"].every(name => options[name] === undefined)) return undefined;
+  const choice: Record<string, unknown> = {};
+  if (options["--routing"] !== undefined) {
+    const mode = String(options["--routing"]);
+    if (mode === "auto") throw new Error("This host records shadow decisions only. Use --routing shadow; auto routing comes with a later release.");
+    if (mode !== "off" && mode !== "shadow") throw new Error("--routing must be off or shadow.");
+    choice.mode = mode;
+  }
+  if (options["--routing-value"] !== undefined) {
+    const value = String(options["--routing-value"]);
+    const dollars = ROUTING_VALUE_PRESETS.get(value) ?? (/^\d+(\.\d+)?$/.test(value) ? Number(value) : NaN);
+    if (!Number.isFinite(dollars) || dollars > 100) throw new Error("--routing-value must be cost, balanced, quality, or a dollar value from 0 to 100.");
+    choice.successValueUsd = dollars;
+  }
+  if (options["--routing-contributor"] !== undefined) {
+    const answer = String(options["--routing-contributor"]);
+    if (answer !== "allow" && answer !== "deny") throw new Error("--routing-contributor must be allow or deny.");
+    choice.allowContributor = answer === "allow";
+  }
+  return choice;
+}
 const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 const projectIdPattern = /^[a-z0-9-]{1,80}$/;
 const directoryDefaultsSchema = z.object({
@@ -612,7 +636,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const explicitLinearTeam = options["--linear-team"] === undefined ? undefined : z.uuid().parse(String(options["--linear-team"]));
     const explicitLinearProject = options["--linear-project"] === undefined ? undefined : z.uuid().parse(String(options["--linear-project"]));
     if ("nonGit" in gitResult) {
-      const unsupported = ["--project", "--source", "--teamwork", "--setup-json", "--check-json", "--handoff", "--request-id", "--delivery", "--repository", "--base-branch", "--merge-method", "--permissions", "--permission-scope", "--permission-limit", "--autonomy"].filter(flag => options[flag] !== undefined);
+      const unsupported = ["--project", "--source", "--teamwork", "--setup-json", "--check-json", "--handoff", "--request-id", "--delivery", "--repository", "--base-branch", "--merge-method", "--permissions", "--permission-scope", "--permission-limit", "--autonomy", "--routing", "--routing-value", "--routing-contributor"].filter(flag => options[flag] !== undefined);
       if (unsupported.length) throw new Error(`This directory is not a Git repository, so ${unsupported.join(", ")} cannot be used here. Run repo init in a Git repository for enrollment, or use only --linear-team and --linear-project to save directory defaults.`);
       if (!explicitLinearTeam && explicitLinearProject && !inheritedDefault?.teamId)
         throw new Error("--linear-project requires --linear-team or an inherited directory Linear team.");
@@ -644,9 +668,11 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const autonomyOption = options["--autonomy"] === undefined ? undefined : autonomyModeSchema.safeParse(String(options["--autonomy"]));
     if (autonomyOption && !autonomyOption.success) throw new Error("--autonomy must be supervised or autonomous.");
     const autonomy = autonomyOption?.data;
+    const routingChoice = requestedRouting(options);
     const me = await api.json<any>("/me");
     if (me.teams?.repoEnrollment !== 1) throw new Error("This host does not support repository enrollment. Upgrade the host before running repo init.");
     if (autonomy && me.teams?.autonomyMode !== 1) throw new Error("This host does not support autonomy modes. Upgrade the host before using --autonomy.");
+    if (routingChoice && me.teams?.routing !== 1) throw new Error("This host does not support routing settings. Upgrade the host before using --routing.");
     const mappings = readPrivateJson(mappingsPath, {}) as Record<string, unknown>;
     const key = `${config.origin}\n${root}`;
     const stored = mappings[key];
@@ -728,7 +754,9 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const sendLinear = Boolean(linearTeam || linearProject || (!targetLinear && rootDefault));
     const sourceSupported = me.teams?.projectSource === 1;
     const enrolledSource: ProjectSource = sourceSupported ? projectSource : { mode: "laptop" };
-    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...carriedTeamSettings(target.team), ...projectConfig, handoff, ...(delivery ? { delivery } : {}), ...(permissions ? { permissions } : {}) }, ...(sourceSupported ? { source: projectSource } : {}), ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}), ...(teamwork !== undefined ? { teamwork } : {}), ...(autonomy ? { autonomy } : {}) };
+    // The saved routing is carried above; the given options merge over it, and an omitted routing passes through unchanged.
+    const routing = routingChoice ? { ...(target.team?.routing ?? {}), ...routingChoice } : undefined;
+    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...carriedTeamSettings(target.team), ...projectConfig, handoff, ...(delivery ? { delivery } : {}), ...(permissions ? { permissions } : {}), ...(routing ? { routing } : {}) }, ...(sourceSupported ? { source: projectSource } : {}), ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}), ...(teamwork !== undefined ? { teamwork } : {}), ...(autonomy ? { autonomy } : {}) };
     // After a lost reply, inherited settings may already be the host's mapping.
     // An omitted mapping preserves that value; compare that intent while replay
     // still sends the original receipt body and request ID unchanged.

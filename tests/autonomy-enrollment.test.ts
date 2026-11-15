@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import type { Config } from "../packages/host/src/types.js";
 import { RepoEnrollmentService } from "../packages/host/src/repo-enrollment.js";
@@ -268,4 +268,39 @@ test("only the owner CLI changes the mode over the API", { timeout: 45000 }, asy
     assert.equal(afterRestart.body.revision, 2);
     assert.equal(statSync(projectPath).isDirectory(), true);
   } finally { await host.stop(); rmSync(external, { recursive: true, force: true }); }
+});
+
+test("repo init saves routing and keeps it when omitted", { timeout: 90000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-routing-init-"));
+  const repoPath = join(root, "sample");
+  mkdirSync(repoPath);
+  git(repoPath, "init", "--initial-branch=main");
+  writeFileSync(join(repoPath, "tracked.txt"), "committed\n");
+  git(repoPath, "add", "tracked.txt");
+  git(repoPath, "-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial fixture");
+  const checks = JSON.stringify([{ command: "git", args: ["status", "--short"] }]);
+  const host = await startHost({ config: {
+    projects: [{ id: "sample", name: "Sample", path: repoPath, team: { checks: [{ command: "git", args: ["status", "--short"] }] } }],
+    teams: { workspaceDir: join(root, "team-workspaces") },
+  } });
+  const clientFile = join(host.root, "routing-client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: host.origin, token: host.tokens.owner }), { mode: 0o600 });
+  const cli = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
+  const invoke = (args: string[]) => execFileSync(cli[0]!, [...cli.slice(1), "repo", "init", repoPath, "--project", "sample", "--check-json", checks, ...args, "--json"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const savedRouting = async () => (await host.fetchApi("/projects/sample/team")).body.team.routing;
+  try {
+    invoke(["--routing", "shadow", "--routing-value", "quality"]);
+    assert.deepEqual(await savedRouting(), { mode: "shadow", successValueUsd: 8 });
+
+    const before = JSON.stringify(await savedRouting());
+    invoke([]);
+    assert.equal(JSON.stringify(await savedRouting()), before, "a rerun without the options keeps the saved policy byte for byte");
+
+    invoke(["--routing-contributor", "allow"]);
+    assert.deepEqual(await savedRouting(), { mode: "shadow", successValueUsd: 8, allowContributor: true }, "one option merges over the saved policy and keeps the rest");
+
+    assert.throws(() => invoke(["--routing", "auto"]), (error: { stderr?: string }) =>
+      String(error.stderr).includes("This host records shadow decisions only. Use --routing shadow; auto routing comes with a later release."));
+    assert.deepEqual(await savedRouting(), { mode: "shadow", successValueUsd: 8, allowContributor: true }, "a refused auto stores nothing new");
+  } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
 });

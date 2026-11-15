@@ -15,7 +15,10 @@ import { readSignals } from "./signals/consume.js";
 import { addToPendingWake, type PendingWake, type SignalReader } from "./signals/types.js";
 import { cadenceDue, classifyCycle, cycleWakeOf, defaultWakeMinGapMinutes, foldedCycles, isReviewed, keptCycles, latestReviewed, maxFailedCycles, maxPreviousWork, restoreWake, runObjectiveLimitBytes, unresolvedOperation, wakeObjective } from "./goal-standing.js";
 import { KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
-import { createGoalObjective, goalObjectiveNote, goalObjectiveView, loadGoalObjective, steerGoalObjective, type ObjectiveUnavailable } from "./objective-goals.js";
+import { digestEvent, correctGoalObjective, createGoalObjective, goalObjectiveNote, goalObjectiveView, goalRecordDigest, loadGoalObjective, steerGoalObjective, type ObjectiveUnavailable } from "./objective-goals.js";
+import { objectivePromptsOn } from "./objective-digest.js";
+import { correctionSchema, type CriterionInput } from "./objective-input.js";
+import { objectiveError, recordView, type ObjectiveRecordView } from "./objective-record.js";
 
 type Action = { requestId: string; revision: number };
 /** `parallelism` remains readable only so a pre-migration queued owner control can be discarded safely. */
@@ -46,6 +49,7 @@ const terminal = new Set(["blocked", "ready-for-review", "no-opportunity", "limi
 const timeLimitReason = "The approved time limit has expired.";
 const repeatedFailuresReason = "Three cycles in a row failed, so this standing goal paused. Review the failed cycles, then resume it to reset the count.";
 const maxExtensionFailures = 3;
+const correctionEvent = (version: number) => `The owner corrected the objective record to version ${version}.`;
 const launchRetryMs = 60_000;
 /**
  * Failures to create a standing cycle's run that leave no run and pass with time: storage the host could not measure
@@ -217,10 +221,12 @@ export class GoalService {
   activeForProject(projectId: string) {
     return [...this.records.values()].some(({ goal, launch, control }) => goal.projectId === projectId && (Boolean(launch || control || goal.activeTeamId) || ["running", "needs-input", "paused"].includes(goal.status)));
   }
-  create(input: CreateGoal, admit?: () => void) {
+  create(input: CreateGoal, admit?: () => void, criteria?: CriterionInput[]) {
     const request = parseCreateGoal(input);
+    // Creation criteria are part of the request: a goal without them keeps today's fingerprint and size.
+    const payload = criteria ? { ...request, criteria } : request;
     return this.enqueue(() => {
-      const fingerprint = digest(request), prior = this.records.get(request.requestId);
+      const fingerprint = digest(payload), prior = this.records.get(request.requestId);
       if (prior) {
         if (prior.fingerprint !== fingerprint) throw new TeamError(409, "request-conflict", "This request ID belongs to a different goal.");
         return structuredClone(prior.goal);
@@ -230,7 +236,7 @@ export class GoalService {
       // new goal receives its execution window. Existing receipts remain replayable.
       admit?.();
       if (!this.enabled()) throw new TeamError(409, "goals-not-configured", "Configure a team lineup with a strong coordinator and reviewer before starting a goal.");
-      if (Buffer.byteLength(JSON.stringify(request)) > 40000) throw new TeamError(409, "goal-too-large", "Keep the goal and evidence below 40 KiB. Link to longer source material.");
+      if (Buffer.byteLength(JSON.stringify(payload)) > 40000) throw new TeamError(409, "goal-too-large", "Keep the goal and evidence below 40 KiB. Link to longer source material.");
       const project = this.config.projects.find(value => value.id === request.projectId);
       if (!project?.team || (!project.team.checks.length && !project.team.establishChecks)) throw new TeamError(409, "goal-project-not-configured", "Configure required checks or authorize the team to establish them before a goal can start.");
       if (request.linearIssueId && !project.linear) throw new TeamError(409, "linear-not-configured", "Configure Linear for this project before linking an issue.");
@@ -239,6 +245,7 @@ export class GoalService {
       // Every cycle passes the whole objective; the host never cuts the owner's text to fit its wake reasons.
       if (request.standing && Buffer.byteLength(request.objective) > runObjectiveLimitBytes)
         throw new TeamError(400, "standing-objective-too-large", `A standing goal's objective must fit in ${runObjectiveLimitBytes.toLocaleString("en-US")} bytes of UTF-8. Shorten it and start the goal again.`);
+      if (criteria !== undefined && !objectivePromptsOn(project)) throw objectiveError("objective-prompts-off");
       const { requestId, parallelism: _legacyParallelism, ...fields } = request;
       const createdAt = now();
       const cursor = request.standing?.wakeOn ? this.signalHead() : undefined;
@@ -249,7 +256,7 @@ export class GoalService {
         lineup: structuredClone(this.config.teams!.lineup!), autonomy: autonomyOf(project), cycles: [], memberCount: 0, steering: [], events: [], outcomes: [],
         ...(cursor !== undefined ? { signalCursor: cursor } : {}),
       } };
-      { const note = goalObjectiveNote(stored, createGoalObjective(stored, createdAt)); if (note) this.event(stored, note); }
+      { const note = goalObjectiveNote(stored, createGoalObjective(stored, createdAt, criteria && { inputs: criteria, context: { configured: project.team!.checks, requestId, at: createdAt } })); if (note) this.event(stored, note); }
       this.event(stored, request.standing
         ? `Standing goal approved. A cycle starts now and then every ${request.standing.cadenceMinutes} minutes, each within its own time and attempt limits.`
         : "Goal approved. The coordinator can select and build work within its scope and limits.");
@@ -258,7 +265,7 @@ export class GoalService {
       return structuredClone(stored.goal);
     });
   }
-  private replay(stored: Stored, action: string, body: Action & object) {
+  private replay(stored: Stored, action: string, body: { requestId: string }) {
     const prior = stored.receipts[body.requestId];
     if (!prior) return false;
     if (prior !== digest({ action, ...body })) throw new TeamError(409, "request-conflict", "This request ID belongs to a different goal action.");
@@ -484,6 +491,28 @@ export class GoalService {
     });
   }
   objectiveRecord(id: string, version?: number) { return goalObjectiveView(this.record(id), version); }
+  /**
+   * The owner's correction of the criteria, applied exactly once. It writes the goal's sealed file once and answers the
+   * corrected record. A replay answers the latest view and writes nothing. Refused while objective prompts are off.
+   */
+  correctObjective(id: string, input: unknown): Promise<ObjectiveRecordView> {
+    const parsed = correctionSchema.safeParse(input);
+    if (!parsed.success) return Promise.reject(objectiveError("objective-op-invalid"));
+    const body = parsed.data;
+    return this.enqueue(() => {
+      const stored = this.record(id), goal = stored.goal;
+      if (this.replay(stored, "record", body)) return goalObjectiveView(stored);
+      const project = this.config.projects.find(value => value.id === goal.projectId);
+      if (!objectivePromptsOn(project)) throw objectiveError("objective-prompts-off");
+      const next = correctGoalObjective(stored, body, { configured: project?.team?.checks ?? [], requestId: body.requestId, at: now() });
+      // The write works on a copy, so a failed write leaves the record, the receipts, the events, and updatedAt as they were.
+      const draft: Stored = { ...stored, goal: { ...goal, events: [...goal.events] }, receipts: { ...stored.receipts, [body.requestId]: digest({ action: "record", ...body }) }, objectiveRecord: next };
+      this.event(draft, correctionEvent(next.version));
+      this.save(draft);
+      this.records.set(id, draft);
+      return recordView(next);
+    });
+  }
   setParallelism(id: string, input: Action & { parallelism: number }) {
     goalParallelismSchema.parse(input);
     this.record(id);
@@ -768,6 +797,11 @@ export class GoalService {
    */
   private async prepare(stored: Stored, cycle: number, maxMembers: number, useWake = true) {
     const goal = stored.goal;
+    // The digest is built before the launch is saved, so a replay of that launch carries the same digest.
+    const project = this.config.projects.find(value => value.id === goal.projectId);
+    const pinned = objectivePromptsOn(project) ? goalRecordDigest(stored, project?.team?.checks ?? []) : undefined;
+    const note = digestEvent(goal.events, pinned);
+    if (note) this.event(stored, note);
     const parent = latestReviewed(goal.cycles);
     const sourceIssue = goal.linear?.issue;
     const context: TeamGoalContext = { id: goal.id, revision: goal.revision, cycle, successCriteria: goal.successCriteria, nonGoals: goal.nonGoals, allowedPaths: goal.allowedPaths, evidence: goal.evidence,
@@ -775,7 +809,7 @@ export class GoalService {
       // The team context accepts 16 entries, so a long-running goal passes its newest reviewed cycles.
       previousWork: goal.cycles.filter(isReviewed).slice(-maxPreviousWork).map(value => `${value.brief?.title ?? `Feature ${value.cycle}`}: ${value.brief?.expectedOutcome ?? "Reviewed change"}`.slice(0, 2000)),
       deadlineAt: goal.deadlineAt, maxMembers, ...(parent ? { parentRunId: parent.teamId } : {}),
-      extendMinutes: goal.extendMinutes ?? 0, ceilingAt: ceilingOf(goal) };
+      extendMinutes: goal.extendMinutes ?? 0, ceilingAt: ceilingOf(goal), ...(pinned && "digest" in pinned ? { record: pinned.digest } : {}) };
     const wake = goal.standing && useWake ? goal.pendingWake : undefined;
     const objective = wakeObjective([goal.objective, ...goal.steering.map(value => `User direction: ${value.text}`)].join("\n\n"), wake);
     // Every cycle of a goal keeps the goal's pinned mode; a goal with no pin is supervised.

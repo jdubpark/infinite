@@ -457,6 +457,23 @@ test("the relay refuses roll-ups and imports", { timeout: 20000 }, async () => {
   } finally { client.close(); runner.close(); }
 });
 
+test("the relay carries the permission decision log and a mark, and refuses the owner's delegation acts", { timeout: 20000 }, async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    await client.request("/permissions/log?rejected=1&limit=50");
+    await client.request("/permissions/candidates");
+    await client.request("/permissions/decisions/pd-0123456789abcdef0123456789abcdef");
+    await client.request("/permissions/marks", { method: "POST", body: { requestId: randomUUID(), decisionId: "pd-0123456789abcdef0123456789abcdef", label: "wrong", note: "Should have asked." } });
+    assert.equal(runner.requests.length, 5, "the phone's review reads and its mark reach the host");
+    for (const [method, path] of [["POST", "/permissions/delegations"], ["POST", "/permissions/revocations"], ["POST", "/permissions/reopenings"],
+      ["POST", "/permissions/unlocks"], ["GET", "/permissions/status"], ["GET", "/permissions/decisions/pd-1/../../me"], ["POST", "/permissions/log"]] as const)
+      await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403);
+    assert.equal(runner.requests.length, 5, "an act that changes what the permission agent may decide never passes the relay");
+  } finally { client.close(); runner.close(); }
+});
+
 test("the relay refuses objective records", async () => {
   const runner = await httpRunner();
   const client = createRemoteClient({ url: runner.url, token: runner.token });
@@ -466,5 +483,16 @@ test("the relay refuses objective records", async () => {
     for (const path of [`/goals/${randomUUID()}/record`, `/goals/${randomUUID()}/record?version=1`, `/teams/${randomUUID()}/record`])
       await assert.rejects(client.request(path), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
     assert.equal(runner.requests.length, 1, "a refused record read does not reach the host");
+  } finally { client.close(); runner.close(); }
+});
+
+test("the relay refuses corrections", async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    // An owner correction is written over a direct owner connection only.
+    await assert.rejects(client.request(`/goals/${randomUUID()}/record`, { method: "POST", body: {} }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    assert.equal(runner.requests.length, 1, "a refused correction does not reach the host");
   } finally { client.close(); runner.close(); }
 });

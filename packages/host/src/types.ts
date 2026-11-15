@@ -85,6 +85,17 @@ export interface Session {
   nativeArgs?: string[];
   runtime?: SessionRuntime;
   workspace?: LaptopWorkspace;
+  /** Host-owned: a headless launch, whether the permission channel serves it, and why not. */
+  headless?: { channel: boolean; reason?: string; allowlist?: string[] };
+}
+/** The permission channel's live view of a headless session. */
+export interface PermissionChannelView {
+  /** The session was launched with the channel and its first hook call arrived. */
+  served: boolean;
+  /** The one deferred call that waits for the owner. */
+  waiting?: { interruptClass: string; tool: string; since: string; expiresAt: string };
+  /** The latest request of this session that needed the owner and could not wait. The notifier pushes it once. */
+  notice?: { id: string; interruptClass?: string; at: string };
 }
 export interface Event {
   seq: number;
@@ -144,6 +155,8 @@ export interface Config {
     blackboard?: { tools?: boolean };
   };
   machine?: { id: string; label: string };
+  /** The permission agent's light and strong tiers, its miss-rate threshold and the least replay set size. */
+  permissionAgent?: import("./permission-agent-config.js").PermissionAgentConfig;
   /** Owner autonomy settings: the default mode for an enrollment with no saved mode, the fuse, continuity (wake gap and mission conversation rotation), and the agent boundary. */
   autonomy?: { defaultMode?: import("./autonomy.js").AutonomyMode; fuse?: import("./config.js").FuseConfig; continuity?: import("./config.js").ContinuityConfig; boundary?: { egress?: import("./egress.js").EgressConfig; github?: import("./github-grants.js").GithubBoundary } };
   cmux?: { enabled: boolean; command?: string; hooksDir?: string };
@@ -211,6 +224,7 @@ export interface WorkerState {
   runtime?: SessionRuntime;
   nativeSession?: { id: string; source: "hook" | "protocol" };
   execution?: ExecutionState;
+  permissionChannel?: PermissionChannelView;
 }
 export interface InputControl {
   actor?: ControlActor;
@@ -267,7 +281,11 @@ export type WorkerRequest =
       op: "team-answer";
       requestId: string;
       decisionId: string;
-      coordinatorMemberId: string;
+      /** The run reviewer's member. Absent only for a permission-agent delivery, which names its `choice`. */
+      coordinatorMemberId?: string;
+      /** A permission-agent delivery: the one-shot accept, or the one-shot reject with the host's fixed notice as `text`. */
+      choice?: "accept" | "reject";
+      text?: string;
       targetSessionId: string;
       assignment: import("./team-types.js").TeamAssignment;
       targetCwd: string;
@@ -290,7 +308,24 @@ export type WorkerRequest =
       actor: ControlActor;
       leaseId: string;
     })
+  | ({
+      /** Host-only permission-agent answer for a session outside any team run: one recognised one-shot option. */
+      op: "session-permission-answer";
+      requestId: string;
+      decisionId: string;
+      targetSessionId: string;
+      targetCwd: string;
+      promptId: number;
+      promptHash: string;
+      evidenceHash: string;
+      option: number;
+      /** The host's fixed reject notice, typed after the recognised one-shot reject only when that option takes text. */
+      text?: string;
+      actor: ControlActor;
+      leaseId: string;
+    })
   | { op: "team-answer-invalidate"; decisionId: string }
+  | { op: "session-permission-invalidate"; decisionId: string }
   | ({ op: "resize"; cols: number; rows: number } & InputControl)
   | ({ op: "stop"; requestId: string } & InputControl);
 export interface Bootstrap {
@@ -301,6 +336,8 @@ export interface Bootstrap {
   key: string;
   prompt: string;
   executorTokenHash?: string;
+  /** Set only when the host admitted this headless session to the permission channel. */
+  permissionChannel?: { socket: string };
   /** This session's GitHub grant and proxy origin, set only when `autonomy.boundary.github` is configured. */
   github?: { proxy: string; grant: string };
   attention: {

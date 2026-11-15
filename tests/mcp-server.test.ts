@@ -166,6 +166,41 @@ test("credential replacement and disabling immediately revoke authentication", a
   } finally { await host.close(); }
 });
 
+test("host startup rechecks a mirror grant forgotten after configuration validation", async () => {
+  const { mkdtempSync, writeFileSync, existsSync, rmSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { readConfig } = await import("../packages/host/src/config.js");
+  const { createApp } = await import("../packages/host/src/server.js");
+  const { MirroredProjects } = await import("../packages/host/src/mirrored-projects.js");
+  const root = mkdtempSync("/tmp/inf-mcp-grant-");
+  let active: ReturnType<typeof createApp> | undefined;
+  try {
+    const file = join(root, "config.json");
+    const raw = {
+      port: 0, origin: "http://127.0.0.1", environment: "local",
+      stateDir: join(root, "state"), runDir: join(root, "run"), keyFile: join(root, "key"),
+      sync: { homeDir: join(root, "home") },
+      tokens: [{ id: "owner", label: "Owner", role: "owner", hash: "a".repeat(64) }],
+      projects: [{ id: "work", name: "Work", path: join(root, "workspace") }],
+      linear: { apiKeyFile: join(root, "linear-key") },
+      intake: { linear: { teamIds: [randomUUID()], creatorId: randomUUID(), label: "infinite", admitIssues: true }, mission: { groupId: "work" }, requireSlackThread: false },
+    };
+    writeFileSync(raw.keyFile, randomBytes(32), { mode: 0o600 });
+    writeFileSync(raw.linear.apiKeyFile, "fixture-credential", { mode: 0o600 });
+    writeFileSync(file, JSON.stringify(raw));
+    const initial = readConfig(file);
+    const mirrors = new MirroredProjects(initial.config, initial.key);
+    const project = mirrors.resolve("Projects/sample");
+    const mcp = { port: 0, origin: "https://connector.example", connectors: [{ id: "assistant", name: "Assistant", tokenHash: "b".repeat(64), projectIds: [project.id] }] };
+    writeFileSync(file, JSON.stringify({ ...raw, mcp }));
+    const loaded = readConfig(file);
+    mirrors.forget(project.id);
+    assert.throws(() => { active = createApp(loaded.config, loaded.key); }, /MCP grants must name configured projects/);
+    assert.equal(existsSync(join(raw.stateDir, "sessions")), false, "rejected grants must not start host services");
+    assert.equal(existsSync(raw.runDir), false);
+  } finally { await active?.closeConnections(); rmSync(root, { recursive: true, force: true }); }
+});
+
 test("CLI releases both listeners on startup failure and graceful shutdown", { timeout: 20000 }, async () => {
   const { spawn } = await import("node:child_process");
   const { createServer } = await import("node:net");

@@ -38,6 +38,11 @@ export interface CollectPermissionEvidenceInput {
   approvedScratchRoots?: string[];
   /** Additional exact paths requested by the coordinator for read-only evidence collection. */
   requestedPaths?: string[];
+  /**
+   * The exact canonical directory to read inside, with `cwd` inside it. Without it the root is the nearest
+   * repository root at or above `cwd`, which can be an ancestor of a requester's own directory.
+   */
+  root?: string;
 }
 
 /**
@@ -49,9 +54,15 @@ export function collectPermissionEvidence(input: CollectPermissionEvidenceInput)
   const limitations: string[] = [];
   const files = new Map<string, PermissionEvidenceFile>();
   let root: string;
-  try { root = findRepositoryRoot(input.cwd); }
-  catch { return snapshot(files, ["Could not identify a real repository root for the target workspace."]); }
+  if (input.root !== undefined) {
+    try { root = exactRoot(input.root); }
+    catch { return snapshot(files, ["The session root is not a canonical directory."]); }
+  } else {
+    try { root = findRepositoryRoot(input.cwd); }
+    catch { return snapshot(files, ["Could not identify a real repository root for the target workspace."]); }
+  }
   const cwd = realpathSync(input.cwd);
+  if (input.root !== undefined && !within(root, cwd)) return snapshot(files, ["The working directory is outside the session root."]);
   const scratchRoots = approvedScratchRoots(input.approvedScratchRoots ?? [], cwd, limitations);
 
   const command = completeCommand(input.prompt, limitations);
@@ -528,6 +539,12 @@ function findRepositoryRoot(cwd: string): string {
     if (parent === current) throw new Error("repository root not found");
     current = parent;
   }
+}
+
+/** A given root is used as it is: no upward search, and it must already be a canonical directory. */
+function exactRoot(path: string): string {
+  if (!isAbsolute(path) || realpathSync(path) !== path || !statSync(path).isDirectory()) throw new Error("The root is not a canonical directory.");
+  return path;
 }
 
 function existsRegular(path: string): boolean { try { return lstatSync(path).isFile(); } catch { return false; } }

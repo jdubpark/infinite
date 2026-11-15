@@ -255,3 +255,77 @@ test("status and explain throw an unavailable error when the store has no routin
   }
 });
 
+
+test("the status scores a shared identity at its eligible profile's cost", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    // A contributor and B share one identity; B is the eligible profile, so the identity costs what B's tier costs.
+    const shared = { provider: "codex", model: "gpt-6-astra", effort: "xhigh" } as const;
+    const contributor: TeamModelProfile = { id: "a-light", label: "A", ...shared, tier: "light", dataUse: "contributor" };
+    const strong: TeamModelProfile = { id: "b-strong", label: "B", ...shared, tier: "strong", dataUse: "standard" };
+    const light: TeamModelProfile = { id: "c-light", label: "C", provider: "codex", model: "gpt-6-astra", effort: "medium", tier: "light", dataUse: "standard" };
+    const lineup: TeamLineup = { ...mixedLineup, implementers: [contributor, strong, light] };
+    seed(store, { taskId: "t1", area: "host" });
+
+    const status = routingStatus(store, statusInput({ lineup, saved: { mode: "shadow" } }));
+    assert.equal(status.cells.length, 2, "one recorded cell and the new-task line");
+    for (const line of status.cells) {
+      const byId = Object.fromEntries(line.profiles.map(profile => [profile.profileId, profile]));
+      assert.equal(byId["a-light"]!.removed, "contributor");
+      assert.equal(byId["a-light"]!.costUsd, 2.2, "a removed profile shows its identity's cost");
+      assert.equal(byId["b-strong"]!.costUsd, 2.2);
+      assert.equal(byId["c-light"]!.costUsd, 0.4);
+      assert.deepEqual(line.profiles.filter(profile => profile.greedy).map(profile => profile.profileId), ["c-light"]);
+    }
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+/** A row of an earlier epoch: held, first pass, coordinator-chosen (half weight), ended now, in `projectId`. */
+function earlierRow(id: string, profile: TeamModelProfile, projectId: string): OutcomeRow {
+  return { ...outcome(id, profile, "cfg-none"), payload: { ...PAYLOAD_BASE, projectId, area: "other" }, profileEpoch: 2, held: 1, firstPass: 1 };
+}
+
+test("the status reports the applied earlier mass", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    const astra = mixedLineup.implementers[1]!;
+    // Forty rows at the project level, each of weight 0.5 (coordinator-chosen): the raw mass is 20. The posterior caps
+    // the level at 10, so the scale is 0.5 and the applied mass is 10.
+    store.write(tx => {
+      for (let index = 0; index < 40; index++) writeOutcome(tx, earlierRow(`many-${index}`, astra, "rehearsal"));
+    });
+    const many = routingStatus(store, statusInput({ saved: { mode: "shadow" } }));
+    const manyAstra = many.cells[many.cells.length - 1]!.profiles.find(profile => profile.profileId === "astra-xhigh")!;
+    assert.deepEqual(manyAstra.earlier, { rows: 40, mass: 20, appliedMass: 10 });
+
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("the status reports an earlier mass under the cap as its applied mass", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    const astra = mixedLineup.implementers[1]!;
+    store.write(tx => {
+      for (let index = 0; index < 4; index++) writeOutcome(tx, earlierRow(`few-${index}`, astra, "rehearsal"));
+    });
+    // Four rows stay below the cap: the applied mass is the raw mass, 2.
+    const status = routingStatus(store, statusInput({ saved: { mode: "shadow" } }));
+    const profile = status.cells[status.cells.length - 1]!.profiles.find(item => item.profileId === "astra-xhigh")!;
+    assert.deepEqual(profile.earlier, { rows: 4, mass: 2, appliedMass: 2 });
+  } finally {
+    store?.close();
+    f.close();
+  }
+});

@@ -55,57 +55,66 @@ function identityOf(profile: TeamModelProfile): Identity {
   return { provider: identity.provider, model: identity.model ?? profile.model, effort: identity.effort ?? null };
 }
 
-/** Each identity's rows and current configuration, read once for the whole status. Keyed by the screened identity. */
-type Evidence = { rows: Map<string, RoutingEvidenceRow[]>; current: Map<string, CurrentConfig> };
+/**
+ * Each identity's representative profile, rows, and current configuration, read once for the whole status. The
+ * representative is the first eligible profile of the identity in lineup order, or its first removed profile when no
+ * eligible one exists, as the recorder picks it. Keyed by the screened identity.
+ */
+type Evidence = { representative: Map<string, TeamModelProfile>; rows: Map<string, RoutingEvidenceRow[]>; current: Map<string, CurrentConfig> };
 
 function readEvidence(db: EvidenceDb, screened: readonly Screened[], publishHeads: boolean, entryTools: boolean, now: string): Evidence {
   const since = daysBefore(now, MAX_AGE_DAYS);
-  const versions = new Map<string, TeamModelProfile>();
-  // The first kept profile of each identity, then the removed ones, pick the prompt version.
+  const representative = new Map<string, TeamModelProfile>();
   for (const item of [...screened.filter(item => item.removed === undefined), ...screened.filter(item => item.removed !== undefined)]) {
-    if (!versions.has(item.identity)) versions.set(item.identity, item.profile);
+    if (!representative.has(item.identity)) representative.set(item.identity, item.profile);
   }
   const rows = new Map<string, RoutingEvidenceRow[]>();
   const current = new Map<string, CurrentConfig>();
-  for (const [identity, profile] of versions) {
+  for (const [identity, profile] of representative) {
     current.set(identity, {
       epoch: epochAt(db, identity, now),
       promptVersion: promptVersion("implementer", profile.provider, profile, publishHeads, entryTools),
     });
     rows.set(identity, selectRoutingEvidence(db, identityOf(profile), "start", since));
   }
-  return { rows, current };
+  return { representative, rows, current };
 }
 
-/** The posterior of every candidate at one target, and the greedy pick of `choose`. Removed profiles are scored too. */
-function scoreAt(screened: readonly Screened[], evidence: Evidence, target: RoutingTarget, knobs: RoutingKnobs, now: string) {
+/**
+ * The posterior of every identity at one target, and the greedy pick of `choose`. Each identity is scored at its
+ * representative profile's cost, so every profile of one identity shows the same cost. Removed profiles are scored too.
+ */
+function scoreAt(screened: readonly Screened[], evidence: Evidence, target: RoutingTarget, knobs: RoutingKnobs, now: string): StatusProfile[] {
   const posteriors = new Map<string, ProfilePosterior>();
   const scored = new Map<string, Scored>();
-  for (const item of screened) {
-    if (scored.has(item.identity)) continue;
-    const found = posterior(evidence.rows.get(item.identity) ?? [], target, evidence.current.get(item.identity)!, now, CHOSEN_WEIGHT);
-    posteriors.set(item.identity, found);
-    scored.set(item.identity, { profile: item.profile, identity: item.identity, posterior: found, costUsd: tierCost(item.profile) });
+  for (const [identity, profile] of evidence.representative) {
+    const found = posterior(evidence.rows.get(identity) ?? [], target, evidence.current.get(identity)!, now, CHOSEN_WEIGHT);
+    posteriors.set(identity, found);
+    scored.set(identity, { profile, identity, posterior: found, costUsd: tierCost(profile) });
   }
   const choice = choose(screened, scored, knobs, STATUS_RISK, "status");
-  const profiles: StatusProfile[] = screened.map(item => {
+  return screened.map(item => {
     const found = posteriors.get(item.identity)!;
+    const cost = scored.get(item.identity)!.costUsd;
     const theta = found.theta, mean = betaMean(theta), sd = betaSd(theta);
-    const earlier = found.reward.reduce((sum, level) => ({ mass: sum.mass + level.earlier.success + level.earlier.failure, rows: sum.rows + level.earlier.rows }), { mass: 0, rows: 0 });
+    // The raw earlier mass, and the mass the posterior applied after each level's cap (scale times the raw mass).
+    const earlier = found.reward.reduce((sum, level) => {
+      const raw = level.earlier.success + level.earlier.failure;
+      return { rows: sum.rows + level.earlier.rows, mass: sum.mass + raw, appliedMass: sum.appliedMass + level.earlier.scale * raw };
+    }, { rows: 0, mass: 0, appliedMass: 0 });
     return {
       profileId: item.profile.id,
       ...(item.removed === "contributor" || item.removed === "reviewer-model" ? { removed: item.removed } : {}),
       rows: found.rows,
-      earlier: { mass: round3(earlier.mass), rows: earlier.rows },
+      earlier: { rows: earlier.rows, mass: round3(earlier.mass), appliedMass: round3(earlier.appliedMass) },
       mean: round3(mean),
       interval: [round3(clip(mean - Z_90 * sd)), round3(clip(mean + Z_90 * sd))],
       rescue: round3(betaMean(found.phi)),
       level: found.level,
-      costUsd: tierCost(item.profile),
+      costUsd: cost,
       greedy: choice?.greedy === item.profile.id,
     };
   });
-  return profiles;
 }
 
 /**

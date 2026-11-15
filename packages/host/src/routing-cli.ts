@@ -15,7 +15,9 @@ const known = (value: number | undefined) => value === undefined ? "unknown" : S
 function profileLine(profile: StatusProfile): string {
   const name = clean(profile.profileId);
   if (profile.removed) return `  ${name}  removed: ${profile.removed}`;
-  return `  ${name}  mean ${profile.mean} [${profile.interval[0]}, ${profile.interval[1]}] · rescue ${profile.rescue} · rows production ${profile.rows.production}, duel ${profile.rows.duel} · earlier mass ${profile.earlier.mass} (${profile.earlier.rows} rows) · level ${profile.level} · ${money(profile.costUsd)}${profile.greedy ? " · greedy" : ""}`;
+  const { mass, appliedMass, rows } = profile.earlier;
+  const earlier = mass === appliedMass ? `earlier mass ${mass} (${rows} rows)` : `earlier mass ${appliedMass} of ${mass} applied (${rows} rows)`;
+  return `  ${name}  mean ${profile.mean} [${profile.interval[0]}, ${profile.interval[1]}] · rescue ${profile.rescue} · rows production ${profile.rows.production}, duel ${profile.rows.duel} · ${earlier} · level ${profile.level} · ${money(profile.costUsd)}${profile.greedy ? " · greedy" : ""}`;
 }
 
 /** The status of one project, in the order the plan fixes. Every text value passes through `clean`. */

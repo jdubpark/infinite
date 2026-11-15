@@ -249,8 +249,8 @@ test("refused lines are named on their own", () => {
   assert.deepEqual(legacyRefusedLines([outcome(1, "imported"), outcome(2, "repeated")]), []);
 });
 
-const routingProfile = { profileId: "ops-light", rows: { production: 0, duel: 0 }, earlier: { mass: 0, rows: 0 }, mean: 0.5, interval: [0.3, 0.7], rescue: 0.5, level: "none", costUsd: 0.4, greedy: true };
-const routingRemoved = { profileId: "review-strong", removed: "contributor", rows: { production: 0, duel: 0 }, earlier: { mass: 0, rows: 0 }, mean: 0, interval: [0, 0], rescue: 0, level: "none", costUsd: 2.2, greedy: false };
+const routingProfile = { profileId: "ops-light", rows: { production: 0, duel: 0 }, earlier: { mass: 0, rows: 0, appliedMass: 0 }, mean: 0.5, interval: [0.3, 0.7], rescue: 0.5, level: "none", costUsd: 0.4, greedy: true };
+const routingRemoved = { profileId: "review-strong", removed: "contributor", rows: { production: 0, duel: 0 }, earlier: { mass: 0, rows: 0, appliedMass: 0 }, mean: 0, interval: [0, 0], rescue: 0, level: "none", costUsd: 2.2, greedy: false };
 const routingStatusFixture = (overrides: Partial<RoutingStatus> = {}): RoutingStatus => ({
   projectId: "alpha", mode: "shadow", requested: "shadow", source: "saved",
   knobs: { points: ["start"], cascade: false, successValueUsd: 2, maxExploreShare: 0.2, exploreWindow: 50, minSpareAttempts: 4, allowContributor: false, listWeight: 0.25, headroomWeight: 1 },
@@ -284,6 +284,11 @@ test("routing lines show unknown, never zero", () => {
     "New task (project level)",
     "  ops-light  mean 0.5 [0.3, 0.7] · rescue 0.5 · rows production 0, duel 0 · earlier mass 0 (0 rows) · level none · $0.40 · greedy",
   ]);
+  // A raw mass above the applied mass prints both: the cap is 10 of a raw 20.
+  const capped = routingStatusLines(routingStatusFixture({
+    cells: [{ cell: { scope: "new-task" }, profiles: [{ ...routingProfile, earlier: { rows: 40, mass: 20, appliedMass: 10 } }] as never }],
+  } as Partial<RoutingStatus>));
+  assert.ok(capped.includes("  ops-light  mean 0.5 [0.3, 0.7] · rescue 0.5 · rows production 0, duel 0 · earlier mass 10 of 20 applied (40 rows) · level none · $0.40 · greedy"));
   const withCoordinator = routingStatusLines(routingStatusFixture({
     requested: "auto", shadow: { windowDays: 30, decisions: 3, withCoordinator: 3, agreements: 2, greedyAgreements: 1, capped: true },
     period: { decisions: 0, capped: false, firstAt: null, targetDays: 14, targetDecisions: 50 }, cellsCapped: true, unreadableCells: 2,

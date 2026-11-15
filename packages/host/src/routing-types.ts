@@ -35,7 +35,7 @@ export type DecisionRow = { key: string; runId: string; revision: number; taskKe
   coordinatorProfileId: string | null; explore: boolean; state: "pending" | "applied" | "released" | "recorded";
   memberId: string | null; decidedAt: string };
 export type StatusProfile = { profileId: string; removed?: "contributor" | "reviewer-model"; rows: { production: number; duel: number };
-  earlier: { mass: number; rows: number }; mean: number; interval: [number, number]; rescue: number;
+  earlier: { rows: number; mass: number; appliedMass: number }; mean: number; interval: [number, number]; rescue: number;
   level: LevelName | "none"; costUsd: number; greedy: boolean };
 export type StatusCell = { scope: "cell"; area: string; taskKind: string | null; featureVersion: number; featureMap: string } | { scope: "new-task" };
 export type RoutingStatus = {

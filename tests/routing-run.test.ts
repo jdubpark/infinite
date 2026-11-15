@@ -10,6 +10,7 @@ import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/eviden
 import { outcomeModule } from "../packages/host/src/outcome-store.js";
 import { RoutingRecorder } from "../packages/host/src/routing-recorder.js";
 import { routingModule, taskDecisions } from "../packages/host/src/routing-store.js";
+import { Blackboard } from "../packages/host/src/evidence/blackboard.js";
 import { promptVersion } from "../packages/host/src/config-identity.js";
 import { entryToolsFor } from "../packages/host/src/entry-roles.js";
 import { featureMapDigest, type FeatureMap } from "../packages/host/src/task-features.js";
@@ -62,14 +63,17 @@ async function settleAnswering(teams: { get(id: string): TeamView; answer(id: st
   }, view => TERMINAL.includes(view.status), 180000);
 }
 
-/** A mixed lineup run in the given mode, with a recorder attached to the team service. */
-async function mixedRun(autonomy: "autonomous" | "supervised", blockDatabase = false, features?: FeatureMap) {
+/** A mixed lineup run in the given mode, with a recorder attached to the team service. `blackboardTools` turns the blackboard tools on. */
+async function mixedRun(autonomy: "autonomous" | "supervised", blockDatabase = false, features?: FeatureMap, blackboardTools = false) {
   const f = await fixture("mixed", mixedLineup, {}, { noServer: true });
   const key = readFileSync(f.host.config.keyFile);
   const databasePath = evidenceDatabasePath(f.host.config.stateDir);
   // A regular file where the database should be: the store cannot open, and its modules read unavailable.
   if (blockDatabase) { mkdirSync(dirname(databasePath), { recursive: true }); writeFileSync(databasePath, "not a database"); }
   const store = openStore(databasePath, key);
+  // The blackboard pins `run.blackboard` at create, so the tools flag and the entries service are both set before it.
+  const entries = blackboardTools ? new Blackboard(store) : undefined;
+  if (blackboardTools) f.host.config.teams!.blackboard = { tools: true };
   const project = f.host.config.projects.find(item => item.id === "rehearsal")!;
   project.autonomy = autonomy;
   if (features) project.team = { ...project.team!, features };
@@ -77,7 +81,7 @@ async function mixedRun(autonomy: "autonomous" | "supervised", blockDatabase = f
   // The `limited` set each start receives. An opencode limit is observed when task b first starts: task b's coordinator
   // profile is codex, and the contributor profile of task a is removed before the limit is read, so no choice changes.
   const limitedSeen: { taskId: string; limited: Set<string> }[] = [];
-  const teams = await f.openTeamService();
+  const teams = await f.openTeamService({ entries });
   const limits = (teams as unknown as { limits: { observe(limit: object): void } }).limits;
   const recorder = new RoutingRecorder({ store, log: line => logs.push(line) });
   teams.useRouter({ recordStart: input => {
@@ -90,7 +94,7 @@ async function mixedRun(autonomy: "autonomous" | "supervised", blockDatabase = f
 
 test("a shadow run records each first implementer and runs the coordinator's profiles", { timeout: 240000 }, async () => {
   const features: FeatureMap = { areas: [{ id: "host", paths: ["packages/host"] }] };
-  const { f, store, teams, limitedSeen } = await mixedRun("autonomous", false, features);
+  const { f, store, teams, limitedSeen } = await mixedRun("autonomous", false, features, true);
   try {
     const created = await teams.create(f.create());
     const settled = await settleAnswering(teams, created.id);
@@ -111,6 +115,8 @@ test("a shadow run records each first implementer and runs the coordinator's pro
     // No routing value reaches a member's prompt. The team view strips prompts, so read each stored member's prompt.
     const run = storedRun(teams, created.id);
     assert.ok(run.routing?.digest, "the run pins a policy digest");
+    // The version check below is only meaningful with the blackboard tools on: a run without them fails here.
+    assert.equal(run.blackboard?.tools, true, "the run pins the blackboard tools");
     const knobNames = ["successValueUsd", "maxExploreShare", "exploreWindow", "minSpareAttempts", "listWeight", "headroomWeight", "allowContributor"];
     const implementers = run.members.filter(member => member.role === "implementer");
     assert.ok(implementers.length >= 2, "both tasks' implementers are stored");

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { cappedBytes, logValueOf, objectiveRecordSchema, recordDigest } from "../packages/host/src/objective-types.js";
+import { cappedBytes, logValueOf, objectiveRecordSchema, producerOf, recordDigest, thresholdFits } from "../packages/host/src/objective-types.js";
 
 const GOAL_ID = "6f1c2a3e-8b4d-4c5e-9f60-718293a4b5c6";
 const RUN_ID = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
@@ -339,4 +339,35 @@ test("a record's direction history agrees with its directions", () => {
   assert.ok(!parses(history(r => { r.log[1].after.digest = "0".repeat(64); }, large)), "a reference with a wrong digest fails");
   assert.ok(!parses(history(r => { r.log[2].version = r.log[1].version; r.version = r.log[1].version; })), "two direction entries at one version fail");
   assert.ok(!parses(history(r => { r.log[1].version = 1; })), "a direction entry at version 1 fails");
+});
+
+test("producer and threshold rules are shared", () => {
+  const command = { kind: "command", command: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" } as const;
+  const judgement = { kind: "judgement", item: "method-applied" } as const;
+  const owner = { kind: "owner-rating", subject: "quality" } as const;
+  const artifact = { kind: "artifact", path: "docs/entries.json", count: "/entries" } as const;
+  const citations = { kind: "citations", path: "docs/spec.md", entries: "/entries", perEntry: 1 } as const;
+  assert.equal(producerOf(command), "host");
+  assert.equal(producerOf({ kind: "receipt", receipt: "merged" }), "host");
+  assert.equal(producerOf(artifact), "host");
+  assert.equal(producerOf(citations), "host");
+  assert.equal(producerOf(judgement), "evaluator");
+  assert.equal(producerOf(owner), "owner");
+
+  assert.equal(thresholdFits(artifact, { kind: "count", min: 1 }), true);
+  assert.equal(thresholdFits(artifact, { kind: "pass" }), false, "an artifact with a count takes a count threshold only");
+  assert.equal(thresholdFits({ kind: "artifact", path: "docs/spec.md" }, { kind: "pass" }), true);
+  assert.equal(thresholdFits({ kind: "artifact", path: "docs/spec.md" }, { kind: "count", min: 1 }), false);
+  assert.equal(thresholdFits(citations, { kind: "share", min: 1 }), true);
+  assert.equal(thresholdFits(citations, { kind: "pass" }), false);
+  assert.equal(thresholdFits(owner, { kind: "score", min: 4, of: 5 }), true);
+  assert.equal(thresholdFits(owner, { kind: "share", min: 1 }), false);
+  assert.equal(thresholdFits(command, { kind: "pass" }), true);
+  assert.equal(thresholdFits(judgement, { kind: "count", min: 1 }), false);
+
+  const record: any = validGoalRecord();
+  record.criteria[0].producer = "host";
+  const result = objectiveRecordSchema.safeParse(withDigest(record));
+  assert.equal(result.success, false, "a judgement criterion with producer host fails the record");
+  assert.ok(result.error?.issues.some(issue => issue.message === "A criterion's producer must fit its check"), "with the shared message");
 });

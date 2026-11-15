@@ -31,10 +31,12 @@ import { ContentError } from "./session-content.js";
 import { fuseReason, workLaunch } from "./fuse/rules.js";
 import type { FuseGate } from "./fuse/types.js";
 import { haltReason } from "./halt/rules.js";
-import { isCollapsedPermissionPrompt, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
+import { agentAcceptOption, isCollapsedPermissionPrompt, oneShotRejectOption, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { nativeContinuationSchema, teamModelProfileSchema, type NativeContinuation, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
 import { missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { withNativeContinuation } from "./native-continuation.js";
+import { SESSION_PERMISSION_ACTOR_LABEL, isRequesterNotice, sessionPermissionRequestId, type SessionPermissionAnswer } from "./permission-session-requests.js";
+import { deferredCallOpen, type HeadlessPermissionChannel } from "./permission-headless.js";
 import { agentBoundary, inventoryRuntimeProcesses, runtimeIdentity, stopRuntimeTree, type RuntimeProcess, type TeamRuntimeInspection, type TeamRuntimeRetirement } from "./team-retirement.js";
 import { TeamError } from "./team-workspace.js";
 import { projectGithubRepository, sessionGithubGrant, sessionGithubScopeFor, type GithubGrantScope, type SessionGithubOrigin } from "./github-grants.js";
@@ -204,6 +206,9 @@ export class Manager {
   private readonly savedStatus = new SealedFileCache<WorkerState>((id, raw) => unseal<WorkerState>(this.key, `${id}:status`, raw));
   /** The launch gate: the owner's halt, then the launch-rate fuse. Without one, every session starts as before and nothing is counted. */
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
+  private headlessChannel?: Pick<HeadlessPermissionChannel, "admit">;
+  /** The headless permission channel. Without one, every headless launch starts as before. */
+  useHeadlessChannel(channel: Pick<HeadlessPermissionChannel, "admit">) { this.headlessChannel = channel; }
   reserveHandoff(projectId: string) {
     const project = this.config.projects.find(project => project.id === projectId);
     if (!project) throw new ContentError("Handoff project is unavailable");
@@ -403,9 +408,17 @@ export class Manager {
         };
       }),
     );
-    return rows.flatMap((row) =>
+    const listed = rows.flatMap((row) =>
       row.status === "fulfilled" ? [row.value] : [],
     );
+    for (const observer of this.listingObservers) try { observer(listed); } catch { /* an observer never fails a listing */ }
+    return listed;
+  }
+  private readonly listingObservers = new Set<(rows: Awaited<ReturnType<Manager["list"]>>) => void>();
+  /** Calls `observer` with every session listing, so a consumer that follows dialogs needs no listing of its own. */
+  observeListings(observer: (rows: Awaited<ReturnType<Manager["list"]>>) => void): () => void {
+    this.listingObservers.add(observer);
+    return () => { this.listingObservers.delete(observer); };
   }
 
   /**
@@ -726,6 +739,8 @@ export class Manager {
     requestId: string,
     team: TeamAssignment,
     decision: TeamPermissionDecision,
+    /** Whether the coordinator's authority to answer still stands. It is read under the control lease, before the key is sent. */
+    current?: () => boolean,
   ): Promise<import("./types.js").Receipt & { result?: import("@infinite/attention").AnswerResult }> {
     const session = this.meta(sessionId).session;
     const stored = session.team;
@@ -775,7 +790,7 @@ export class Manager {
       if (controlled.status !== "running" || controlled.control?.id !== acquired.id ||
           controlled.runtime?.nativeUi || session.runtime?.nativeUi)
         throw new ContentError("The team member or its control lease changed before the answer");
-      if (decision.status !== "answering" || Date.parse(decision.expiresAt) <= Date.now())
+      if (decision.status !== "answering" || Date.parse(decision.expiresAt) <= Date.now() || (current && !current()))
         throw new ContentError("The permission decision was invalidated before the answer");
       try {
         return await workerCall(this.config.runDir, sessionId, {
@@ -798,6 +813,136 @@ export class Manager {
         catch { /* a lost worker or lease is reported by the next state read */ }
       }
     }
+  }
+  /**
+   * Types one permission-agent decision into a session outside any team run: the exact one-shot option,
+   * under a host control lease, after the session, its directory and its control are checked again. A
+   * team member's session is refused. An error with a code, or a ContentError, means nothing was typed.
+   */
+  async answerSessionPermission(sessionId: string, input: SessionPermissionAnswer): Promise<Receipt & { result?: import("@infinite/attention").AnswerResult }> {
+    const session = this.meta(sessionId).session;
+    if (session.team || session.workspace || session.executionLocation === "laptop" || session.runtime?.transport !== "pty" || session.runtime.nativeUi)
+      throw new ContentError("Only an interactive host session outside a team run takes a permission-agent answer", 403);
+    if (!input || typeof input.decisionId !== "string" || !/^[A-Za-z0-9._:-]{1,100}$/.test(input.decisionId) ||
+        !Number.isInteger(input.promptId) || input.promptId < 1 || !Number.isInteger(input.option) || input.option < 0 ||
+        !/^[a-f0-9]{64}$/i.test(input.promptHash) || !/^[a-f0-9]{64}$/i.test(input.evidenceHash) || typeof input.targetCwd !== "string")
+      throw new ContentError("The permission answer is incomplete");
+    if (input.notice !== undefined && !isRequesterNotice(input.notice))
+      throw new ContentError("The permission answer's notice is not the host's fixed reject notice");
+    let cwd: string;
+    try { cwd = realpathSync(session.cwd); }
+    catch { throw new ContentError("The session directory is unavailable"); }
+    if (cwd !== input.targetCwd) throw new ContentError("The permission answer targets a different directory", 403);
+    const state = await this.state(sessionId);
+    if (state.status !== "running" || state.runtime?.nativeUi) throw new ContentError("The session has no running managed terminal");
+    if (state.control) throw new ContentError("A person currently controls this session", 409);
+    const requestId = sessionPermissionRequestId(sessionId, input.decisionId);
+    const actor = { id: `session-permission:${input.decisionId}`, label: SESSION_PERMISSION_ACTOR_LABEL };
+    let lease: ControlLease | undefined;
+    try {
+      lease = await workerCall<ControlLease>(this.config.runDir, sessionId, { op: "control", action: "claim", actor });
+      const controlled = await this.state(sessionId);
+      if (controlled.status !== "running" || controlled.control?.id !== lease.id)
+        throw new ContentError("The session or its control lease changed before the answer", 409);
+      // The owner may have revoked or replaced the delegation while the lease was claimed.
+      if (input.current && !input.current())
+        throw new ContentError("The permission answer was invalidated before the answer", 409);
+      try {
+        return await workerCall(this.config.runDir, sessionId, {
+          op: "session-permission-answer", requestId, decisionId: input.decisionId, targetSessionId: sessionId, targetCwd: cwd,
+          promptId: input.promptId, promptHash: input.promptHash, evidenceHash: input.evidenceHash, option: input.option,
+          ...(input.notice !== undefined ? { text: input.notice } : {}),
+          actor, leaseId: lease.id,
+        }, 12000);
+      } catch (error) {
+        if ((error as { code?: unknown }).code) throw error;
+        // The worker may have typed before its acknowledgement was lost. Never replay here.
+        return { requestId, state: "uncertain", seq: controlled.seq };
+      }
+    } finally {
+      if (lease) {
+        try { await workerCall(this.config.runDir, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
+        catch { /* a lost worker or lease is reported by the next state read */ }
+      }
+    }
+  }
+  /**
+   * Deliver one permission-agent decision to this exact assigned member's dialog: its one-shot accept, or its
+   * one-shot reject with the host's fixed notice. `current` is the caller's live fence; it is read again after
+   * the control lease is held and before the worker sends a key. The worker repeats the exact-screen check
+   * before each key.
+   */
+  async answerAgentPermission(
+    sessionId: string,
+    team: TeamAssignment,
+    delivery: {
+      deliveryId: string; requestId: string; choice: "accept" | "reject"; option: number; notice?: string;
+      prompt: import("@infinite/attention").Prompt; evidenceHash: string; targetCwd: string; expiresAt: string; authorityHash: string;
+      current: () => boolean;
+    },
+  ): Promise<import("./types.js").Receipt & { result?: import("@infinite/attention").AnswerResult }> {
+    const session = this.meta(sessionId).session;
+    const stored = session.team;
+    const sameAssignment = Boolean(stored && stored.runId === team.runId && stored.memberId === team.memberId &&
+      stored.revision === team.revision && stored.role === team.role && stored.taskId === team.taskId);
+    if (!sameAssignment || !/^[a-f0-9-]{36}$/i.test(delivery.deliveryId) || !/^[a-f0-9-]{36}$/i.test(delivery.requestId) ||
+        team.role === "permission-coordinator")
+      throw new ContentError("This permission delivery does not match the assigned team member", 403);
+    const prompt = delivery.prompt;
+    const option = delivery.choice === "accept" ? agentAcceptOption(prompt) : oneShotRejectOption(prompt);
+    if (!prompt.hash || permissionEvidenceHash(prompt) !== delivery.evidenceHash || option === undefined || option !== delivery.option ||
+        !/^[a-f0-9]{64}$/i.test(delivery.authorityHash) || !Number.isFinite(Date.parse(delivery.expiresAt)) || Date.parse(delivery.expiresAt) <= Date.now())
+      throw new ContentError("The permission delivery is incomplete, expired, or not a one-shot option");
+    let canonicalCwd: string;
+    try { canonicalCwd = realpathSync(session.cwd); }
+    catch { throw new ContentError("The assigned team working directory is unavailable"); }
+    if (delivery.targetCwd !== canonicalCwd)
+      throw new ContentError("The permission delivery targets a different working directory", 403);
+    const state = await this.state(sessionId);
+    if (state.status !== "running" || session.runtime?.nativeUi || state.runtime?.nativeUi)
+      throw new ContentError("The assigned team member has no running managed terminal");
+    if (state.control) throw new ContentError("A person currently controls this session", 409);
+
+    const actor = { id: `team-permission:${delivery.deliveryId}`, label: "Team permission" };
+    let lease: { id: string } | undefined;
+    try {
+      const acquired = await workerCall<{ id: string }>(this.config.runDir, sessionId, { op: "control", action: "claim", actor });
+      lease = acquired;
+      const controlled = await this.state(sessionId);
+      if (controlled.status !== "running" || controlled.control?.id !== acquired.id || controlled.runtime?.nativeUi || session.runtime?.nativeUi)
+        throw new ContentError("The team member or its control lease changed before the answer");
+      if (!delivery.current() || Date.parse(delivery.expiresAt) <= Date.now())
+        throw new ContentError("The permission delivery was invalidated before the answer");
+      try {
+        return await workerCall(this.config.runDir, sessionId, {
+          op: "team-answer", requestId: delivery.requestId, decisionId: delivery.deliveryId, choice: delivery.choice,
+          ...(delivery.choice === "reject" && delivery.notice ? { text: delivery.notice } : {}),
+          targetSessionId: sessionId, assignment: stored!, targetCwd: canonicalCwd,
+          expiresAt: delivery.expiresAt, policyHash: delivery.authorityHash,
+          promptId: prompt.id, promptHash: prompt.hash, evidenceHash: delivery.evidenceHash, option: delivery.option,
+          actor, leaseId: acquired.id,
+        }, 12000);
+      } catch (error) {
+        if ((error as { code?: unknown }).code) throw error;
+        // The worker may have written keys before its acknowledgement was lost. Never replay here.
+        return { requestId: delivery.requestId, state: "uncertain", seq: controlled.seq };
+      }
+    } finally {
+      if (lease) {
+        try { await workerCall(this.config.runDir, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
+        catch { /* a lost worker or lease is reported by the next state read */ }
+      }
+    }
+  }
+  /** Fences one permission-agent answer that is with a session outside a team run, after an owner act ended its authority. */
+  async invalidateSessionPermission(sessionId: string, decisionId: string): Promise<"invalidated" | "uncertain"> {
+    try {
+      if (this.meta(sessionId).session.team || !/^[A-Za-z0-9._:-]{1,100}$/.test(decisionId)) return "uncertain";
+      const result = await workerCall<{ invalidated: boolean }>(this.config.runDir, sessionId, {
+        op: "session-permission-invalidate", decisionId,
+      }, 4000);
+      return result.invalidated === true ? "invalidated" : "uncertain";
+    } catch { return "uncertain"; }
   }
   /** Fence one persisted delegated decision before its owner revokes or pauses it. */
   async invalidateTeamPermission(sessionId: string, decisionId: string): Promise<"invalidated" | "uncertain"> {
@@ -835,6 +980,9 @@ export class Manager {
       return result;
     };
     if (session.team) throw new ContentError("Resume this member from its team so its assignment stays consistent");
+    // An ordinary resume has no permission channel, so the provider's own rules would decide the call the owner was asked about.
+    if (session.headless?.channel && deferredCallOpen((after, limit) => this.events(sessionId, after, limit, new Set(["lifecycle"]))))
+      throw new ContentError("This session ended while a call waited for the owner's answer. Start a new session instead of resuming it.", 409);
     const state = await this.state(sessionId);
     if (state.status === "running" || state.status === "starting") return remember({ ...session, ...state });
     const native = state.nativeSession ?? session.resumeNativeSession;
@@ -1002,6 +1150,10 @@ export class Manager {
       }
       session.handoff ??= { reason };
     }
+    const launchProfile = request.nativeArgs === undefined || request.localUi ? profile : { ...profile, args: [...profile.args, ...request.nativeArgs] };
+    // Recorded with the session: a headless launch, whether the permission channel serves it, and why not.
+    const headless = this.headlessChannel?.admit({ provider: request.provider, profile: launchProfile, session, hooks: request.nativeArgs === undefined && !request.localUi });
+    if (headless) session.headless = headless.record;
     // Keep the native prompt exact. Only opted-in, qualified sessions receive the
     // separate handoff MCP capability; the context snapshot stays in the record.
     const prompt = request.nativeArgs !== undefined ? "" : [
@@ -1041,14 +1193,13 @@ export class Manager {
     child.stdin.end(
       JSON.stringify({
         session,
-        profile: request.nativeArgs === undefined || request.localUi ? profile : {
-          ...profile, args: [...profile.args, ...request.nativeArgs],
-        },
+        profile: launchProfile,
         stateDir: this.config.stateDir,
         runDir: this.config.runDir,
         key: this.key.toString("base64"),
         prompt,
         ...(request.workspace ? { executorTokenHash: createHash("sha256").update(request.workspace.token).digest("hex") } : {}),
+        ...(headless?.bootstrap ? { permissionChannel: headless.bootstrap } : {}),
         ...(githubGrant ? { github: githubGrant } : {}),
         attention: {
           // Native CLI launches keep their exact argv: no hook settings are injected.

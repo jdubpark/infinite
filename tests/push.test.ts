@@ -415,6 +415,124 @@ test("notifier holds a team member's prompt while its coordinator can decide and
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("notifier holds a session's dialog only while the permission agent holds it", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("owner", "ExponentPushToken[a]", "android");
+  const sent: unknown[][] = [];
+  const sender = async (messages: unknown[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  const solo = { id: "s1", title: "Retry logic", provider: "claude", status: "running", attention: att("working") };
+  let holder: "agent" | "owner" | "undecided" = "agent";
+  const asked: [string, number][] = [];
+  const notifier = new Notifier({ list: async () => [solo] } as never, store, sender,
+    { detail: "minimal", events: ["needs-you"], intervalMs: 100000, reviewGraceMs: 0, reviewHoldLimitMs: 100000 },
+    undefined, undefined, undefined, undefined, { holder: (sessionId, promptId) => { asked.push([sessionId, promptId]); return holder; } });
+  try {
+    await notifier.tick();
+    solo.attention = att("needs-you", 1);
+    await notifier.tick();
+    await notifier.tick();
+    assert.equal(sent.length, 0, "a dialog the permission agent can still decide is not pushed");
+    assert.deepEqual(asked.at(-1), ["s1", 1]);
+    solo.attention = att("working");
+    await notifier.tick();
+    assert.equal(sent.length, 0, "an answered dialog never reaches the owner");
+
+    solo.attention = att("needs-you", 2);
+    await notifier.tick();
+    holder = "owner";
+    await notifier.tick();
+    assert.equal(sent.length, 1, "the dialog reaches the owner once it is theirs");
+
+    solo.attention = att("needs-you", 3);
+    await notifier.tick();
+    assert.equal(sent.length, 2, "a dialog that is the owner's from the start is pushed at once");
+
+    holder = "undecided";
+    solo.attention = att("needs-you", 4);
+    await notifier.tick();
+    assert.equal(sent.length, 2, "an undecided dialog gets the review grace");
+    await notifier.tick();
+    assert.equal(sent.length, 3);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("the permission agent's holder decides the push: an agent-held dialog never reaches the owner, one it leaves does", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("owner", "ExponentPushToken[a]", "android");
+  const sent: { title: string; body: string }[][] = [];
+  const sender = async (messages: { title: string; body: string }[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  const member = { id: "m1", title: "implementer: retire-member", provider: "claude", status: "running", attention: att("working") };
+  let holder: "agent" | "owner" | "undecided" = "owner";
+  const asked: number[] = [];
+  const notifier = new Notifier(
+    { list: async () => [member] } as never, store, sender,
+    { detail: "minimal", events: ["needs-you"], intervalMs: 100000, reviewGraceMs: 0, reviewHoldLimitMs: 100000 },
+    // A served run's own answer is "user": whatever the permission agent leaves is the owner's.
+    { statuses: () => [], promptOwner: () => "user" }, undefined, undefined, undefined,
+    { holder: (_sessionId, promptId) => { asked.push(promptId); return holder; } },
+  );
+  try {
+    await notifier.tick();
+    // An allow, a reject or a stale request: the agent held it until it closed. Nobody is pushed.
+    holder = "agent";
+    member.attention = att("needs-you", 1);
+    await notifier.tick();
+    await notifier.tick();
+    member.attention = att("working");
+    await notifier.tick();
+    assert.equal(sent.length, 0, "a dialog the permission agent answered never reaches the owner");
+    assert.ok(asked.includes(1), "the notifier asks the holder for the open dialog");
+
+    // A class rule, an owner verdict or an undeliverable request: the holder turns to the owner, who is pushed once.
+    holder = "agent";
+    member.attention = att("needs-you", 2);
+    await notifier.tick();
+    holder = "owner";
+    await notifier.tick();
+    await notifier.tick();
+    assert.equal(sent.length, 1, "a dialog the permission agent leaves to the owner is pushed once");
+
+    // A dialog the scheduler has not handed off yet is held for the grace period only.
+    holder = "undecided";
+    member.attention = att("needs-you", 3);
+    await notifier.tick();
+    assert.equal(sent.length, 1);
+    await notifier.tick();
+    assert.equal(sent.length, 2, "an undecided dialog reaches the owner after the grace period");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a dialog the permission agent leaves to the owner for a class names the class, and only a host class identifier", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("owner", "ExponentPushToken[a]", "android");
+  const sent: { title: string; body: string }[][] = [];
+  const sender = async (messages: { title: string; body: string }[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  const member = { id: "m1", title: "implementer: deploy", provider: "claude", status: "running", attention: att("working") };
+  // Prompt 1: a class rule or an owner verdict. 2: undeliverable, a host limit with no class. 3: a value that is not a host class.
+  const classes: Record<number, string | undefined> = { 1: "production-or-staging", 2: undefined, 3: "The model's note: deploy now" };
+  const notifier = new Notifier(
+    { list: async () => [member] } as never, store, sender,
+    { detail: "minimal", events: ["needs-you"], intervalMs: 100000 },
+    { statuses: () => [], promptOwner: () => "user" }, undefined, undefined, undefined,
+    { holder: () => "owner", ownerClass: (_sessionId, promptId) => classes[promptId] as never },
+  );
+  try {
+    await notifier.tick();
+    for (const promptId of [1, 2, 3]) {
+      member.attention = att("needs-you", promptId);
+      await notifier.tick();
+    }
+    assert.deepEqual(sent.map(batch => [batch[0].title, batch[0].body]), [
+      ["Needs your approval", "Claude Code needs your approval in implementer: deploy (production-or-staging)"],
+      ["Needs your approval", "Claude Code needs your approval in implementer: deploy"],
+      ["Needs your approval", "Claude Code needs your approval in implementer: deploy"],
+    ]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("a held prompt survives a session missing from one listing and still reaches the owner", async () => {
   const dir = mkdtempSync("/tmp/inf-push-");
   const store = new PushStore(dir, randomBytes(32));
@@ -593,5 +711,32 @@ test("the notifier pushes one fuse interrupt and marks it announced", async () =
   await off.tick();
   assert.equal(sent.length, 1, "without the autonomy-interrupt event nothing is sent");
   assert.deepEqual(marked, [["trip-1"]], "and nothing is marked");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a headless call that waits names its class, and a call that could not wait is announced once", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("controller", "ExponentPushToken[a]", "android");
+  const sent: Array<Array<{ title: string; body: string; collapseId: string }>> = [];
+  const session: Record<string, unknown> = { id: "s1", title: "Deploy", provider: "claude", status: "running", attention: att("working") };
+  const notifier = new Notifier({ list: async () => [session] } as never, store,
+    async (messages) => { sent.push(messages as never); return messages.map(() => ({ status: "ok" as const, id: "x" })); },
+    { detail: "minimal", events: ["needs-you"], intervalMs: 100000 });
+  // A notice present at startup was already announced.
+  session.permissionChannel = { served: true, notice: { id: "n0", interruptClass: "credentials" } };
+  await notifier.tick();
+  session.attention = att("needs-you", 9);
+  session.permissionChannel = { served: true, waiting: { interruptClass: "production-or-staging" }, notice: { id: "n0" } };
+  await notifier.tick();
+  assert.deepEqual(sent.map(batch => [batch[0].title, batch[0].body]), [["Needs your answer", "Claude Code waits for your answer in Deploy (production-or-staging)"]]);
+  session.attention = att("working");
+  session.permissionChannel = { served: true, notice: { id: "n1", interruptClass: "money" } };
+  await notifier.tick();
+  await notifier.tick();
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1][0].title, "Call denied: needs you");
+  assert.match(sent[1][0].body, /\(money\) that needs your own answer/);
+  assert.equal(sent[1][0].collapseId, "s1:permission");
   rmSync(dir, { recursive: true, force: true });
 });

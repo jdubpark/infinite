@@ -7,10 +7,12 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
   PermissionJournal,
+  PermissionMarkConflict,
   permissionJournalModule,
   type PermissionDecision,
   type PermissionTier,
 } from "../packages/host/src/evidence/permission-journal.js";
+import type { EvidenceModule } from "../packages/host/src/evidence/types.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 
 type Fixture = { root: string; path: string; key: Buffer; close: () => void };
@@ -495,3 +497,236 @@ test("rates count verdicts, final tiers, replays, median duration, and empty win
     medianDecisionMs: null,
   });
 }));
+
+test("the owner log returns exactly the decisions each filter names, in pages that neither skip nor repeat", () => withJournal(journal => {
+  const at = (minute: number) => `2026-11-14T10:${String(minute).padStart(2, "0")}:00.000Z`;
+  journal.appendDecision(decision({ id: "w1-allow", at: at(0) }));
+  journal.appendDecision(effectReject("w1-reject-raised", { at: at(1), taskId: "task-r", rules: ["raise:destructive"] }));
+  journal.appendDecision(decision({ id: "w1-owner-raised", at: at(2), verdict: "owner", interruptClass: "money", rules: ["class:money", "raise:payment"] }));
+  journal.appendDecision(decision({ id: "w2-reject", at: at(3), workspaceId: "workspace-2", taskId: "task-2", verdict: "reject", code: "uncertain" }));
+  journal.appendDecision(decision({ id: "w2-allow-raised", at: at(4), workspaceId: "workspace-2", taskId: "task-3", rules: ["raise:outside-root"] }));
+  // An equal timestamp: the journal's own order puts the later record first.
+  journal.appendDecision(decision({ id: "w1-allow-tie", at: at(4), taskId: "task-4" }));
+  const ids = (query: Parameters<PermissionJournal["log"]>[0]) => journal.log(query).entries.map(entry => entry.id);
+
+  const everything = ["w1-allow-tie", "w2-allow-raised", "w2-reject", "w1-owner-raised", "w1-reject-raised", "w1-allow"];
+  assert.deepEqual(ids({}), everything);
+  assert.deepEqual(ids({ rejectedOnly: true }), ["w2-reject", "w1-reject-raised"]);
+  assert.deepEqual(ids({ raisedOnly: true }), ["w2-allow-raised", "w1-owner-raised", "w1-reject-raised"]);
+  assert.deepEqual(ids({ workspaceId: "workspace-2" }), ["w2-allow-raised", "w2-reject"]);
+  assert.deepEqual(ids({ since: at(2) }), ["w1-allow-tie", "w2-allow-raised", "w2-reject", "w1-owner-raised"]);
+  assert.deepEqual(ids({ workspaceId: "workspace-1", rejectedOnly: true, raisedOnly: true, since: at(1) }), ["w1-reject-raised"]);
+  assert.deepEqual(ids({ workspaceId: "workspace-3" }), []);
+
+  const paged: string[] = [];
+  let before: string | undefined;
+  do {
+    const page = journal.log({ limit: 2, raisedOnly: false, ...(before === undefined ? {} : { before }) });
+    assert.ok(page.entries.length <= 2);
+    paged.push(...page.entries.map(entry => entry.id));
+    before = page.next;
+  } while (before !== undefined);
+  assert.deepEqual(paged, everything, "pages follow the journal order with no gap and no repeat");
+  assert.throws(() => journal.log({ limit: 201 }), TypeError);
+  assert.throws(() => journal.log({ before: "not-a-cursor" }), TypeError);
+}));
+
+test("a log entry carries its timings, delivery events, owner controls and the model's note", () => withJournal(journal => {
+  journal.appendDecision(effectReject("timed", {
+    rules: ["raise:destructive"], note: "the model's reason",
+    tiers: [tier("light", "2026-11-14T10:00:00.000Z", "2026-11-14T10:00:01.000Z"), tier("strong", "2026-11-14T10:00:02.000Z", "2026-11-14T10:00:05.000Z")],
+  }));
+  journal.appendDelivery({ decisionId: "timed", at: "2026-11-14T10:00:06.000Z", kind: "intent" });
+  journal.appendDelivery({ decisionId: "timed", at: "2026-11-14T10:00:07.000Z", kind: "receipt" });
+  journal.appendDecision(effectReject("still-open", { taskId: "task-open" }));
+  journal.appendDecision(effectReject("task-closed", { taskId: "task-closed" }));
+  journal.closeOpenRejects({ taskId: "task-closed", at: "2026-11-14T10:01:00.000Z", reason: "task-ended" });
+  journal.reopen({ decisionId: "timed", at: "2026-11-14T10:02:00.000Z", by: "owner-device" });
+
+  const timed = journal.logEntry("timed")!;
+  assert.equal(timed.note, "the model's reason");
+  assert.equal(timed.raised, true);
+  assert.equal(timed.durationMs, 5_000);
+  assert.deepEqual(timed.deliveries.map(event => event.kind), ["intent", "receipt"]);
+  assert.deepEqual(timed.controls, [{ kind: "reopen", at: "2026-11-14T10:02:00.000Z" }]);
+  assert.equal(timed.rejectState, "reopened");
+  assert.equal(journal.logEntry("still-open")!.rejectState, "open");
+  assert.deepEqual(journal.logEntry("task-closed")!.controls, [{ kind: "close", at: "2026-11-14T10:01:00.000Z", reason: "task-ended" }]);
+  assert.equal(journal.logEntry("task-closed")!.rejectState, "closed");
+  assert.equal(journal.logEntry("missing"), undefined);
+}));
+
+test("a mark changes no decision, replay or lock, and a later mark never rewrites an earlier one", () => withJournal(journal => {
+  journal.appendDecision(decision({ id: "allowed", taskId: "task-a", note: "model note" }));
+  journal.appendDecision(effectReject("rejected", { taskId: "task-r", assignment: "seat" }));
+  journal.appendDecision(effectReject("repeat-1", { taskId: "task-r", assignment: "seat", at: "2026-11-14T10:01:00.000Z", repeats: "rejected" }));
+  journal.appendDecision(effectReject("repeat-2", { taskId: "task-r", assignment: "seat", at: "2026-11-14T10:02:00.000Z", repeats: "rejected" }));
+  const snapshot = () => ({
+    allowed: journal.decision("allowed"),
+    rejected: journal.decision("rejected"),
+    allowReplays: journal.replayEligible("allowed", { taskId: "task-a", requesterFamily: "family-a" }),
+    rejectReplays: journal.replayEligible("rejected", { taskId: "task-r", requesterFamily: "family-a" }),
+    locked: journal.isLocked("seat"),
+    repeats: journal.repeatCount("seat", "rejected"),
+    open: journal.openRejects("task-r").map(row => row.id),
+    history: journal.hasRejectHistory("seat"),
+    decisions: journal.decisions({ limit: 500 }),
+  });
+  const before = snapshot();
+  assert.deepEqual([before.allowReplays, before.rejectReplays, before.locked, before.open], [true, true, true, ["rejected"]]);
+
+  const firstInput = {
+    requestId: "8d0f7f1e-4d8e-4b2a-9d55-0d3c9f6a1b01", decisionId: "rejected", at: "2026-11-14T11:00:00.000Z",
+    by: "owner-device", label: "wrong" as const, note: "The build directory belongs to the session.",
+  };
+  const first = journal.mark(firstInput);
+  const second = journal.mark({ ...firstInput, requestId: "8d0f7f1e-4d8e-4b2a-9d55-0d3c9f6a1b02", at: "2026-11-14T11:05:00.000Z", note: "Still wrong." });
+  journal.mark({ ...firstInput, requestId: "8d0f7f1e-4d8e-4b2a-9d55-0d3c9f6a1b03", decisionId: "allowed", note: "Should not have run." });
+  assert.deepEqual(snapshot(), before, "a mark is a record only");
+  assert.deepEqual(journal.marks("rejected"), [first, second], "the second mark is a row of its own");
+
+  assert.deepEqual(journal.mark(firstInput), first, "a retried request id returns the recorded mark");
+  assert.equal(journal.marks("rejected").length, 2);
+  assert.throws(() => journal.mark({ ...firstInput, note: "Another text." }), PermissionMarkConflict);
+  assert.throws(() => journal.mark({ ...firstInput, requestId: "8d0f7f1e-4d8e-4b2a-9d55-0d3c9f6a1b04", decisionId: "missing" }), TypeError);
+  assert.throws(() => journal.mark({ ...firstInput, requestId: "8d0f7f1e-4d8e-4b2a-9d55-0d3c9f6a1b05", note: "   " }), TypeError);
+  assert.deepEqual(journal.marks("rejected").map(mark => mark.note), [first.note, second.note]);
+  assert.deepEqual(journal.logEntry("rejected")!.marks, [first, second]);
+}));
+
+test("replay candidates are exactly the marked-wrong decisions and the reopened rejects, with the label each implies", () => withJournal(journal => {
+  journal.appendDecision(decision({ id: "wrong-allow", taskId: "task-1", note: "model note" }));
+  journal.appendDecision(effectReject("reopened-reject", { taskId: "task-2" }));
+  journal.appendDecision(effectReject("wrong-reject", { taskId: "task-3" }));
+  journal.appendDecision(decision({ id: "wrong-owner", taskId: "task-4", verdict: "owner", interruptClass: "money" }));
+  journal.appendDecision(effectReject("closed-reject", { taskId: "task-5" }));
+  journal.appendDecision(decision({ id: "plain-allow", taskId: "task-6" }));
+  journal.appendDecision(effectReject("reopened-and-marked", { taskId: "task-7", note: "another model note" }));
+  let n = 0;
+  const mark = (decisionId: string) => journal.mark({
+    requestId: `6f1c2b7a-0000-4000-8000-${String(++n).padStart(12, "0")}`, decisionId,
+    at: `2026-11-14T11:${String(n).padStart(2, "0")}:00.000Z`, by: "owner-device", label: "wrong", note: `mark ${n}`,
+  });
+  mark("wrong-allow");
+  journal.reopen({ decisionId: "reopened-reject", at: "2026-11-14T11:10:00.000Z", by: "owner-device" });
+  mark("wrong-reject");
+  mark("wrong-reject");
+  mark("wrong-owner");
+  journal.closeOpenRejects({ taskId: "task-5", at: "2026-11-14T11:20:00.000Z", reason: "task-ended" });
+  journal.unlock({ assignment: "assignment-1", at: "2026-11-14T11:21:00.000Z", by: "owner-device" });
+  journal.reopen({ decisionId: "reopened-and-marked", at: "2026-11-14T11:22:00.000Z", by: "owner-device" });
+  mark("reopened-and-marked");
+
+  const page = journal.replayCandidates();
+  assert.deepEqual(page.candidates.map(candidate => [candidate.decisionId, candidate.label, candidate.sources]), [
+    ["reopened-and-marked", "should-allow", ["marked-wrong", "reopened"]],
+    ["wrong-owner", "should-allow", ["marked-wrong"]],
+    ["wrong-reject", "should-allow", ["marked-wrong"]],
+    ["reopened-reject", "should-allow", ["reopened"]],
+    ["wrong-allow", "should-reject", ["marked-wrong"]],
+  ], "newest owner act first; closed, unlocked and unmarked decisions are not candidates");
+  assert.equal(page.next, undefined);
+  assert.deepEqual(page.candidates.find(candidate => candidate.decisionId === "wrong-reject")!.marks.map(entry => entry.note), ["mark 2", "mark 3"]);
+  assert.ok(page.candidates.every(candidate => !("note" in candidate.decision)), "no model note is offered as case evidence");
+  assert.doesNotMatch(JSON.stringify(page), /model note/);
+
+  const firstTwo = journal.replayCandidates({ limit: 2 });
+  assert.deepEqual(firstTwo.candidates.map(candidate => candidate.decisionId), ["reopened-and-marked", "wrong-owner"]);
+  assert.deepEqual(journal.replayCandidates({ limit: 2, before: firstTwo.next }).candidates.map(candidate => candidate.decisionId),
+    ["wrong-reject", "reopened-reject"]);
+}));
+
+test("a session is flagged above three times its workspace's median session-hour, and never at or below twenty", () => withJournal(journal => {
+  let n = 0;
+  const burst = (sessionId: string, workspaceId: string, count: number, start: string) => {
+    for (let index = 0; index < count; index++) {
+      journal.appendDecision(decision({
+        id: `rate-${++n}`, sessionId, workspaceId, taskId: `task-${sessionId}`, assignment: sessionId,
+        at: new Date(Date.parse(start) + index * 1_000).toISOString(),
+      }));
+    }
+  };
+  // workspace-1 session-hours: 4, 6 and 10, so the median is 6 and the floor of 20 sets the threshold.
+  burst("base-a", "workspace-1", 4, "2026-11-13T09:00:00.000Z");
+  burst("base-b", "workspace-1", 6, "2026-11-13T10:00:00.000Z");
+  burst("base-c", "workspace-1", 10, "2026-11-12T10:00:00.000Z");
+  // Eight days back is outside the baseline. Counted, these hours would lift the median to 25.
+  for (const hour of ["06", "07", "08"]) burst("old", "workspace-1", 40, `2026-11-06T${hour}:10:00.000Z`);
+  // workspace-2 session-hours: three of 10, so three times the median, 30, is the threshold.
+  for (const hour of ["06", "07", "08"]) burst("busy-base", "workspace-2", 10, `2026-11-13T${hour}:00:00.000Z`);
+  // The last hour.
+  burst("fast", "workspace-1", 21, "2026-11-14T11:30:00.000Z");
+  burst("at-floor", "workspace-1", 20, "2026-11-14T11:20:00.000Z");
+  burst("busy-normal", "workspace-2", 25, "2026-11-14T11:10:00.000Z");
+  burst("busy-at-threshold", "workspace-2", 30, "2026-11-14T11:15:00.000Z");
+  burst("busy-fast", "workspace-2", 31, "2026-11-14T11:05:00.000Z");
+
+  assert.deepEqual(journal.rateFlags({ now: "2026-11-14T12:00:00.000Z" }), [
+    { sessionId: "busy-fast", workspaceId: "workspace-2", lastHour: 31, baselineMedian: 10, threshold: 30 },
+    { sessionId: "fast", workspaceId: "workspace-1", lastHour: 21, baselineMedian: 6, threshold: 20 },
+  ]);
+  assert.deepEqual(journal.rateFlags({ now: "2026-11-14T14:00:00.000Z" }), [], "the flag looks at the last hour only");
+}));
+
+/** The journal schema as hosts before owner marks created it. Frozen here on purpose: it is what is on disk. */
+const journalVersion1: EvidenceModule = {
+  name: "permission-journal",
+  version: 1,
+  readVersion: 1,
+  migrate(tx) {
+    tx.exec("CREATE TABLE IF NOT EXISTS permission_journal_order (seq INTEGER PRIMARY KEY AUTOINCREMENT)");
+    tx.exec(
+      "CREATE TABLE IF NOT EXISTS permission_decisions ("
+      + "seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, at TEXT NOT NULL, at_ms INTEGER NOT NULL, workspace_id TEXT NOT NULL, "
+      + "project_id TEXT NOT NULL, task_id TEXT NOT NULL, assignment TEXT NOT NULL, session_id TEXT NOT NULL, "
+      + "role TEXT, provider TEXT NOT NULL, family TEXT, evidence_hash TEXT NOT NULL, reuse_key TEXT, "
+      + "action_tool TEXT NOT NULL, action_summary TEXT NOT NULL, rules_json TEXT NOT NULL, tiers_json TEXT NOT NULL, "
+      + "verdict TEXT NOT NULL, code TEXT, interrupt_class TEXT, note_sealed TEXT, input_sealed TEXT NOT NULL, "
+      + "replay_of TEXT, repeats TEXT, raised INTEGER NOT NULL, last_tier TEXT NOT NULL, duration_ms INTEGER)",
+    );
+    tx.exec("CREATE TABLE IF NOT EXISTS permission_deliveries (seq INTEGER PRIMARY KEY, decision_id TEXT NOT NULL, at TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT)");
+    tx.exec(
+      "CREATE TABLE IF NOT EXISTS permission_journal_controls (seq INTEGER PRIMARY KEY, kind TEXT NOT NULL, at TEXT NOT NULL, by TEXT, "
+      + "decision_id TEXT, assignment TEXT, task_id TEXT, project_id TEXT, reason TEXT)",
+    );
+  },
+};
+
+test("the journal opens a store that a host before owner marks created, and keeps its records", () => {
+  const f = fixture();
+  try {
+    const earlier = new EvidenceStore({ databasePath: f.path, vaultKey: f.key });
+    earlier.register(journalVersion1);
+    const old = new PermissionJournal(earlier);
+    old.appendDecision(effectReject("before-upgrade", { note: "sealed before the upgrade" }));
+    old.appendDelivery({ decisionId: "before-upgrade", at: "2026-11-14T10:00:01.000Z", kind: "intent" });
+    old.reopen({ decisionId: "before-upgrade", at: "2026-11-14T10:01:00.000Z", by: "owner-device" });
+    earlier.close();
+
+    const store = open(f);
+    try {
+      assert.equal(store.status().modules["permission-journal"], "ready");
+      const journal = new PermissionJournal(store);
+      assert.equal(journal.decision("before-upgrade")?.note, "sealed before the upgrade");
+      assert.equal(journal.replayEligible("before-upgrade", { taskId: "task-1", requesterFamily: "family-a" }), false, "the reopen survived");
+      const mark = journal.mark({
+        requestId: "2b8e6f0c-1a3d-4c5e-8f7a-9b0c1d2e3f40", decisionId: "before-upgrade", at: "2026-11-14T11:00:00.000Z",
+        by: "owner-device", label: "wrong", note: "Marked after the upgrade.",
+      });
+      const entry = journal.logEntry("before-upgrade")!;
+      assert.deepEqual(entry.marks, [mark]);
+      assert.deepEqual(entry.deliveries.map(event => event.kind), ["intent"]);
+      assert.equal(entry.rejectState, "reopened");
+    } finally {
+      store.close();
+    }
+    const database = new DatabaseSync(f.path, { readOnly: true });
+    try {
+      assert.deepEqual({ ...database.prepare("SELECT version FROM schema_modules WHERE name='permission-journal'").get() }, { version: 2 });
+    } finally {
+      database.close();
+    }
+  } finally {
+    f.close();
+  }
+});

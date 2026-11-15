@@ -1,7 +1,7 @@
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
@@ -9,7 +9,7 @@ import { BASELINE_FILE, readBaseline } from "../packages/host/src/fuse/baseline.
 import { FuseService } from "../packages/host/src/fuse/service.js";
 import type { FuseGate } from "../packages/host/src/fuse/types.js";
 import { GoalService } from "../packages/host/src/goals.js";
-import { HALT_FILE, writeHaltRecord } from "../packages/host/src/halt/record.js";
+import { HALT_EPOCHS_FILE, HALT_FILE, MAX_RECEIPTS, writeHaltRecord } from "../packages/host/src/halt/record.js";
 import { KEPT_PAUSED, type HaltTargets } from "../packages/host/src/halt/rules.js";
 import { RoutineService } from "../packages/host/src/routines.js";
 import { HaltService } from "../packages/host/src/halt/service.js";
@@ -262,6 +262,70 @@ test("a halt survives a restart, finishes an interrupted pass, and fails closed 
     await assert.rejects(unreadable.release(hostScope, { requestId: randomUUID() }, owner),
       (error: unknown) => error instanceof TeamError && error.code === "halt-unreadable");
   } finally { f.close(); }
+});
+
+test("halt epochs live apart from the halt record: each engage and release renews its scope's, and a restored or removed record keeps them", async () => {
+  const f = schedulerFixture();
+  const halt = new HaltService({ config: f.config, key: f.key });
+  const recordFile = join(f.config.stateDir, HALT_FILE), epochsFile = join(f.config.stateDir, HALT_EPOCHS_FILE);
+  const open = () => new HaltService({ config: f.config, key: f.key });
+  const request = () => ({ requestId: randomUUID() });
+  try {
+    const start = halt.epoch("fixture"), other = halt.epoch("other");
+    assert.ok(start && other);
+    await halt.engage(fixtureScope, request(), owner);
+    const engaged = halt.epoch("fixture");
+    assert.notEqual(engaged, start);
+    assert.equal(halt.epoch("other"), other, "a project halt leaves other projects' epochs");
+    const copy = readFileSync(recordFile, "utf8");
+    await halt.engage(fixtureScope, request(), owner);
+    assert.equal(halt.epoch("fixture"), engaged, "an engage that found the scope halted changes nothing");
+    await halt.release(fixtureScope, request(), owner);
+    const released = halt.epoch("fixture");
+    assert.notEqual(released, engaged);
+    await halt.release(fixtureScope, request(), owner);
+    assert.equal(halt.epoch("fixture"), released, "a release that found no halt changes nothing");
+    await halt.engage(hostScope, request(), owner);
+    assert.notEqual(halt.epoch("other"), other, "a host halt covers every project");
+    assert.notEqual(halt.epoch("fixture"), released);
+    await halt.release(hostScope, request(), owner);
+    const current = halt.epoch("fixture");
+    // Accepted requests that change nothing push the engaging receipts out of the record; the epochs stay.
+    for (let index = 0; index < MAX_RECEIPTS; index++) await halt.release(hostScope, request(), owner);
+    assert.equal(halt.epoch("fixture"), current);
+    halt.stop();
+    const restarted = open();
+    assert.equal(restarted.epoch("fixture"), current, "a restart keeps the epochs");
+    restarted.stop();
+    // An older copy of the record is restored: its halt is in force again, and its release renews the epoch.
+    writeFileSync(recordFile, copy, { mode: 0o600 });
+    const restored = open();
+    assert.equal(restored.epoch("fixture"), current);
+    assert.equal(restored.check({ projectId: "fixture" }).state, "halted");
+    await restored.release(fixtureScope, request(), owner);
+    const afterRestore = restored.epoch("fixture");
+    assert.notEqual(afterRestore, current);
+    restored.stop();
+    rmSync(recordFile);
+    const removed = open();
+    assert.equal(removed.epoch("fixture"), afterRestore, "a removed record keeps the epochs");
+    removed.stop();
+    // A removed epochs file gets a new host epoch: no earlier epoch comes back.
+    rmSync(epochsFile);
+    const renewed = open().epoch("fixture");
+    assert.ok(renewed);
+    assert.ok(![start, engaged, released, current, afterRestore].includes(renewed));
+    // Epochs that cannot be read leave every epoch unknown until a halt change writes new ones; so does an unreadable record.
+    writeFileSync(epochsFile, "not sealed epochs", { mode: 0o600 });
+    const reset = open();
+    assert.equal(reset.epoch("fixture"), undefined);
+    await reset.engage(fixtureScope, request(), owner);
+    const rewritten = reset.epoch("fixture");
+    assert.ok(rewritten && rewritten !== renewed);
+    reset.stop();
+    writeFileSync(recordFile, "not a sealed record");
+    assert.equal(open().epoch("fixture"), undefined);
+  } finally { halt.stop(); f.close(); }
 });
 
 test("any device reads the halt; only the owner engages or releases it", async () => {

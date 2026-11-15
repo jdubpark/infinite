@@ -8,6 +8,7 @@ import { machineIdentity } from "./machine.js";
 import { autonomyModeSchema } from "./autonomy.js";
 import { projectSourceSchema, teamProjectSchema, teamCommandSchema, teamRetentionSchema, storageFloorSchema, teamLineupSchema } from "./team-types.js";
 import { intakeConfigSchema } from "./intake-types.js";
+import { permissionAgentConfigSchema } from "./permission-agent-config.js";
 import { mcpConfigSchema } from "./mcp-types.js";
 import { egressConfigSchema } from "./egress.js";
 
@@ -80,6 +81,8 @@ const schema = z
     mcp: mcpConfigSchema.optional(),
     teams: z.object({ workspaceDir: z.string().refine(isAbsolute), commandPrefix: teamCommandSchema.optional(), lineup: teamLineupSchema.optional(), trustWorkspaces: z.boolean().optional(), publishHeads: z.boolean().default(true), stallMinutes: z.number().int().min(5).max(1440).optional(), checkMinutes: z.number().positive().max(240).optional(), retention: teamRetentionSchema.optional(), storageFloor: storageFloorSchema.optional(), outcomes: outcomeSettingsSchema.optional(), blackboard: z.object({ tools: z.boolean().optional() }).strict().optional() }).strict().optional(),
     machine: z.object({ id: z.uuid(), label: machineLabelSchema }).strict().optional(),
+    // The permission agent's tiers, the miss-rate threshold and this host's release commands.
+    permissionAgent: permissionAgentConfigSchema.optional(),
     autonomy: z.object({ defaultMode: autonomyModeSchema.optional(), fuse: fuseConfigSchema.optional(), continuity: continuityConfigSchema.optional(), boundary: z.object({ egress: egressConfigSchema.optional(), github: githubBoundarySchema.optional() }).strict().optional() }).strict().optional(),
     cmux: z.object({ enabled: z.boolean(), command: z.string().min(1).optional(), hooksDir: z.string().refine(isAbsolute).optional() }).strict().optional(),
     remote: z.object({ enabled: z.boolean(), relay: z.object({ url: z.url(), tokenFile: z.string().refine(isAbsolute) }).strict().optional() }).strict().optional(),

@@ -245,6 +245,12 @@ infinite team revoke-permissions TEAM_ID    Revoke delegation for an active run
 infinite permissions status [--json]        Show workspace permission delegation
 infinite permissions delegate (--workspace W | --all) [--direction TEXT | --clear-direction] [--request-id UUID]
 infinite permissions revoke --workspace W [--request-id UUID]
+infinite permissions reopen DECISION_ID [--request-id UUID]
+infinite permissions unlock ASSIGNMENT [--request-id UUID]
+infinite permissions log [--rejected] [--raised] [--workspace W] [--since T] [--limit N] [--before CURSOR] [--json]
+infinite permissions mark DECISION_ID --wrong --note TEXT [--request-id UUID]
+infinite permissions replay --set FILE [--json] [--request-id UUID]
+                                          Measure the permission agent on a labelled set
 infinite projects [--json]                 List projects and suggested groups
 infinite understand [--workspace ID] [--json] Read workspace Understanding
 infinite understand catalog|components|component ID|policy|refresh --workspace ID
@@ -335,9 +341,9 @@ else if (command === "plan-fleet") {
     closeSync(fd);
     const unlock = () => { try { unlinkSync(lock); } catch {} };
     let host: ReturnType<typeof createApp>;
-    try { host = createApp(config, key); }
+    try { host = createApp(config, key, { configFile }); }
     catch (error) { unlock(); throw error; }
-    const { sessions, teams, goals, pushStore, server, mcpServer, closeConnections, fuse } = host;
+    const { sessions, teams, goals, pushStore, server, mcpServer, closeConnections, fuse, permissions } = host;
     let stopping: Promise<void> | undefined;
     const stop = () => stopping ??= (async () => {
       const closing = closeConnections();
@@ -381,6 +387,7 @@ else if (command === "plan-fleet") {
               : [{ label: volume.label, path: volume.path, fullness: volume.fullness, availableBytes: volume.availableBytes, availableInodes: volume.availableInodes, fullnessBy: volume.fullnessBy }]),
         },
         fuse,
+        permissions,
       ).start();
       console.log(`Push notifications: enabled (${config.push.detail} bodies)`);
       if (!config.push.events.includes("autonomy-interrupt")) console.warn("Push is on, but push.events has no autonomy-interrupt: an open spend fuse will send no notification.");

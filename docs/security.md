@@ -411,7 +411,199 @@ work, because that is the behavior the owner already had.
 
 The current lockfile's production host dependency audit reports zero known advisories. The full workspace audit reports 29 findings (19 high, 10 moderate), propagated from four transitive packages in the Expo 57 dependency tree: `braces`, `node-forge`, `uuid`, and `decode-uri-component`. Most are in build tooling; the Router URI decoder also requires review before native release. At the time of the check, the registry's latest `braces` and `node-forge` versions remained affected. A forced audit fix proposed incompatible SDK changes, so it was not applied. These findings remain open; the mobile debug build is not a security-reviewed release.
 
+## Permission agent
+
+The permission agent's authority is the owner's recorded act and nothing else.
+Coverage is one entry for each project, written only by an owner client:
+`permissions delegate` for the projects that are in the workspace at that
+time, or the owner's first onboarding of the project. Group membership, a host
+fold and a repository identity that the host reads from a checkout grant
+nothing. A revoke, a regrouping by the owner and a changed direction text end
+the authority that earlier decisions were made under. A decision that was made
+under an ended authority is never applied and never replayed. On a host that
+is not ready the agent serves no request.
+
+The host reads a decision's authority again once it holds the session's input
+lease, immediately before the first key. Every API write is acknowledged only
+after the host has fenced each answer that is already with a session under an
+authority that no longer applies, so a revoke, a changed delegation, an
+onboarding opt-out, an owner regrouping or removal of a workspace, and an owner
+halt cannot be acknowledged while such an answer can still be typed. The fence
+is applied once for all writes, not route by route. At the fence the session's
+worker drops the host's lease and sends nothing more for that decision. A key that the worker sent before the fence arrived
+stays sent. When a fence cannot be confirmed, the reply carries
+`deliveryFence: "uncertain"` and the CLI prints a line; the decision log shows
+what was delivered.
+
+What can decide:
+
+- A host rule can send a request to the owner or raise it to the strong tier.
+  No host rule allows a request.
+- The light model can allow a request or refer it. It cannot reject a request
+  or name the owner, and it never gets a raised request.
+- The strong model runs on a profile from a model family other than the
+  requester's, also when a recorded verdict is replayed. With no such profile,
+  or with a requester whose family the host cannot establish, the result is a
+  reject with `unavailable`.
+- A report outside the closed schema is no verdict.
+
+A reviewer turn runs through Claude Code or OpenCode with no tools, no MCP
+servers, no hooks and no project settings, in an empty directory. The task
+text, the request and the collected source are passed as marked untrusted
+evidence. The strong model can ask once for at most eight source paths. The
+host collects them read-only with the root, secret-path, symlink and size
+limits of the team evidence collector, and an answer is sent only if a second
+collection gives the same content. For a session outside a team run the
+collector reads only inside the session's own directory and does not search
+upward for a repository root.
+
+The requesting agent receives one option key and, for a reject, a notice that
+the host builds from the reason code. The model's note goes to the journal for
+the owner. The permission agent cannot start work, message another session,
+grant a persistent approval, or change the delegation, the policy or its own
+configuration: a write to the host's state, run or install directory, its
+configuration file, the vault key or a provider launcher is in the
+global-or-account-settings class, and so is a workspace trust prompt.
+
+Delivery records an intent before the first key, and a receipt, a refusal or
+an uncertain result after it. Before a key is sent, the host checks the
+session, the session root, the dialog's identity and evidence, the owner's
+authority, and that no person holds input control. An uncertain delivery is
+not repeated, also after a restart. A dialog that the host can answer in
+neither direction goes to the owner.
+
+The owner's halt stops the permission agent as it stops every other launch.
+While a halt covers a request's project, no reviewer turn starts, and a
+verdict that was recorded before the halt is not delivered. The halt is read
+before each turn of a review and again immediately before the reviewer
+process starts, so a halt that is recorded after the light turn holds the
+strong turn, and a verdict reached while the halt was recorded is withheld,
+also from a headless session. Each project has a halt epoch, kept in
+`halt-epochs.sealed`, a file apart from the halt record. Every engage and every
+release that covers a project gives its scope a new epoch, written before the
+halt record, and the epoch is part of the authority of each decision: a halt
+ends the authority that earlier decisions were made under, as a new owner act
+does, and so does its release. A verdict reached before or during the halt and
+not yet delivered is never delivered, also after the release and after a
+restart, and the same request is decided again from current evidence. Neither
+a restart, a dropped request receipt, nor a restored or removed halt record
+changes the epochs, so a halt that an older copy of the record brings back
+retires, at its release, the verdicts reached since the real release. A removed
+epochs file is replaced with a new host epoch, which retires every verdict not
+yet delivered. While the epochs or the halt record cannot be read, the agent
+serves nothing. The host does not detect a replayed older copy of its sealed
+state: restoring `halt-epochs.sealed` from an older copy, alone or together with
+`halt.sealed`, can make a verdict reached before a later halt applicable again,
+as restoring an older `halt.sealed` lifts a halt. A dialog that was
+pending is handed to the agent again after the release and decided from the
+evidence of that time. A host halt, or a halt record that the host cannot
+read, also holds every reviewer launch of a replay. A headless call that
+arrives under a halt is denied with `unavailable`.
+
+A request that waits for the owner because of a class rule or an `owner`
+verdict is pushed with the host's class identifier in parentheses, for example
+`(production-or-staging)`. The notifier shows only an identifier from the
+host's own class list, so no model text appears in a push. A request that the
+host cannot answer is pushed without a class: it is a host limit and not an
+interrupt class.
+
+Limits that remain:
+
+- A class rule establishes a class only from what the host can read: the
+  command's words, its path targets, the tool name, and the lists in
+  `packages/host/src/permission-classes.ts`. A deploy command is a host rule
+  only when `permissionAgent.releaseCommands` names it or when it controls the
+  host's own service. Every other production or staging action depends on the
+  raise rules and the strong model's verdict, and so on the measured miss
+  rate. Name each workspace's deploy commands in the host configuration.
+- A command whose effect the host cannot read (a script file, a remote shell,
+  a command substitution) matches no class rule. It is raised to the strong
+  tier. The host reads a literal shell body (`sh -c '...'`) to three layers
+  and applies a wrapper's working directory (`env -C`, `sudo -D`, `cd`). A
+  deeper body, a body that the outer shell expands, and a directory that the
+  text does not establish are raised. A wrapper that the host does not know
+  is raised when its words contain a command that a class rule names; that
+  search is bounded, and a request past its bounds is raised too. Options
+  between a program and its subcommand do not hide the subcommand. Interpreter
+  code is not read: code in an option, attached or combined
+  (`python3 -c'...'`, `perl -ne`, `node --eval=...`), a program piped into an
+  interpreter, and interpreter code behind a wrapper the host does not know are
+  raised. The search
+  also raises some routine commands, for example a commit message that reads
+  as a credential command. Those cost a strong turn and never an owner
+  interrupt.
+- Paths are resolved through symbolic links when the request is read. A link
+  that changes between the review and the command's own execution is not
+  seen. A path that the host cannot read is raised. The evidence collector
+  checks each directory of a path and then opens the file, so a directory that
+  is replaced by a symbolic link between the two steps could make one read
+  land outside the root.
+- The replay set that ships with the host has twenty synthetic cases. A host
+  becomes ready only after the owner runs a replay with at least `minCases`
+  labelled cases (default 100).
+- These requests are not served and are handled as before: headless Codex and
+  OpenCode sessions, a session whose root-owned launcher adds `--print`
+  itself, and, for sessions outside team runs, yes-no dialogs and collapsed
+  Codex dialogs.
+- The permission journal's evidence module is at version 2. An older host
+  binary that opens the same database treats the journal as unavailable, so a
+  rollback across this release turns the permission agent off until the newer
+  binary returns.
+
+### Headless permission channel
+
+A served headless Claude Code session is launched with `--setting-sources ""`
+and one settings layer that the host writes. No user, project or local
+settings file can then switch its hooks off or answer a call before the
+channel. The cost is that the allow rules, environment values, `apiKeyHelper`
+and model defaults of those files do not apply to a served session. The launch
+profile's own allowlist still applies, and `permissions status` lists each of
+its allow rules that a class rule outranks.
+
+The hook reaches the session's worker, and the worker reaches the API through
+a socket in the run directory with mode 0600. Each request carries an HMAC of
+the session id under the host key. The worker already holds that key, and the
+key never enters the agent's environment. A request with another session's
+key is refused, and so is a delivery for a decision that was issued to another
+session. The agent holds the hook token, so it can call the channel itself:
+that can start a review or get its own call denied, and it cannot make a call
+run. A team member's session is served only while its run is live. For a run
+that is stopped, paused or halted, or whose permissions the owner revoked, its
+calls are handled as before the permission agent, by the launch profile's own
+allowlist, and an allow is withheld when the run stops being live before it is
+returned.
+
+A class call from the primary agent is deferred only when the host records an
+owner decision for it: the provider ends its run,
+the session waits, and only the owner's answer on that session's prompt
+resumes it. The answer applies once, to that call id, and a resumed call whose
+input differs is denied. Before an owner's allow is returned to the resumed
+call, the worker asks the host again: an owner halt that covers the project,
+a changed session root, a team run that is no longer live, a deferral that was
+issued no decision, or a decision that no longer applies, including one reached
+before or during an owner halt, withholds the allow, and so does a host that cannot be
+reached at that moment. A withheld allow is denied with `unavailable`, and the
+answer is used all the same. An owner's refusal is returned without that
+check. A resume that the host confirmed just before a halt was recorded can
+still run its call after the halt is acknowledged; nothing recalls an allow
+that has reached the provider's hook. The session's worker holds the answer,
+so after an API restart between the answer and the resume the call runs once
+if the restarted API confirms it; a host restart that ends the worker loses
+the answer, and the call does not run. A class call from a subagent cannot be
+deferred. It is denied with `needs-owner`, and the owner gets a notice. So is a
+class call for which the host could record no owner decision. A class call
+that arrives during an owner halt is denied with `unavailable`, and nothing
+waits for the release. While one call
+waits, every other call of the session is denied. A call is denied with
+`unavailable` when the host cannot be reached. An unanswered call is retired
+after 29 days. A session cannot be resumed after its worker ended while a call
+waited.
+
 ## Delegated team permission decisions
+
+This section describes the earlier repository-level delegation to a run's
+coordinator. It applies only to a team run that the permission agent does not
+serve.
 
 Delegation is an explicit repository enrollment policy, pinned when a run starts.
 Only the run's strong Claude coordinator profile can report a permission decision. The

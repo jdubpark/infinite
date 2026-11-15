@@ -24,6 +24,7 @@ import { ProjectSync, ProjectSyncError, syncFailure } from "./project-sync.js";
 import { ProjectSourceError, ProjectSourceService } from "./project-source.js";
 import { MirroredProjects } from "./mirrored-projects.js";
 import { RepoEnrollmentService, autonomyChangeSchema, repoEnrollmentRequestSchema } from "./repo-enrollment.js";
+import { onboardingPermissions } from "./permission-onboarding.js";
 import { HandoffService } from "./handoffs.js";
 import { handoffPathsOverlap } from "./handoff-types.js";
 import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
@@ -74,8 +75,23 @@ import { SlackClient } from "./slack-client.js";
 import { createMissionSchema, missionActionSchema, missionExtendSchema, missionTextSchema, type CreateMission, type Mission, type MissionOrigin } from "./mission-types.js";
 import { ProjectGroupService } from "./project-groups.js";
 import { PermissionDelegationService } from "./permission-delegation.js";
+import type { PermissionAgentServices } from "./permission-agent-types.js";
+import { SessionPermissionRequests } from "./permission-session-requests.js";
+import { EvidenceDeliveryLedger, InteractivePermissionDelivery, permissionDeliveryModule } from "./permission-delivery.js";
+import { HeadlessPermissionChannel } from "./permission-headless.js";
 import { INTERRUPT_CLASSES, PERMISSION_POLICY_VERSION } from "./permission-policy.js";
 import { PermissionJournal, permissionJournalModule } from "./evidence/permission-journal.js";
+import { HostPermissionPipeline, PermissionOwnerControls, closeRejectsOnDirectionChange, openPermissionPipelineState } from "./permission-pipeline.js";
+import { registerPermissionControlRoutes } from "./permission-control-routes.js";
+import { permissionRateFlags, registerPermissionReviewRoutes } from "./permission-review-routes.js";
+import { PermissionMeasurements, permissionMeasurementsModule } from "./evidence/permission-measurements.js";
+import { hostProtectedPaths, permissionAgentSettings } from "./permission-agent-config.js";
+import { createPermissionAgentCore } from "./permission-core.js";
+import { realHostPath } from "./permission-shell.js";
+import { createCliTurnLauncher, type PermissionTurnGate } from "./permission-reviewer.js";
+import { PermissionReplayJobs } from "./permission-replay.js";
+import { permissionWriteFence, type PermissionFence } from "./permission-write-fence.js";
+import { PERMISSION_REPLAY_PATH, permissionAgentStatus, registerPermissionAgentRoutes } from "./permission-agent-routes.js";
 import { LinearService } from "./linear.js";
 import { createGoalSchema, goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema, goalParallelismSchema } from "./goal-types.js";
 import { createProjectGroupSchema, projectGroupIdSchema, updateProjectGroupSchema } from "./project-group-types.js";
@@ -100,8 +116,6 @@ import { Readings } from "./readings.js";
 import { EGRESS_PROJECT, egressView } from "./egress.js";
 
 const id = z.uuid();
-// The permission agent does not run yet, so no delegation is read for a decision. The slice that activates the agent changes this constant.
-const PERMISSION_AGENT_STATE = "inactive";
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 const permissionDelegationBodySchema = z.object({
@@ -178,7 +192,7 @@ const inputSchema = z
     force: z.boolean().optional(),
   })
   .strict();
-export function createApp(config: Config, key: Buffer) {
+export function createApp(config: Config, key: Buffer, options: { /** The configuration file the host was started with. */ configFile?: string } = {}) {
   config.machine = machineIdentity(config, key);
   if ((config.cmux?.enabled || config.remote?.enabled) && runtimeSecurity(config.deployment).tenancy !== "single-tenant")
     throw new Error("Machine access and cmux require a single-tenant host");
@@ -294,6 +308,85 @@ export function createApp(config: Config, key: Buffer) {
   let permissionDelegation: PermissionDelegationService | undefined;
   try { permissionDelegation = new PermissionDelegationService(config, key, projectGroups); }
   catch { console.warn("[Infinite] Permission delegation is unavailable on this host."); }
+  // The permission agent's parts. A part that is absent leaves the requests it would serve with the owner.
+  const permissionAgent: PermissionAgentServices = {};
+  // The decision core. The pipeline calls its review; replays measure it, and status reports its readiness.
+  let permissionMeasurements: PermissionMeasurements | undefined;
+  try {
+    evidence.register(permissionMeasurementsModule);
+    permissionMeasurements = new PermissionMeasurements(evidence);
+  } catch { permissionMeasurements = undefined; }
+  // Every reviewer launch passes this gate. It is set to the owner's halt once the halt service exists.
+  const permissionTurnGate: { hold?: PermissionTurnGate } = {};
+  const permissionCoreOptions = {
+    settings: () => permissionAgentSettings(config),
+    launcher: createCliTurnLauncher({ agents: config.agents, gate: turn => permissionTurnGate.hold?.(turn) ?? true, onUsage: usage => permissionMeasurements?.recordUsage(usage) }),
+    results: permissionMeasurements,
+    facts: {
+      protectedPaths: hostProtectedPaths(config, fileURLToPath(new URL("../../../", import.meta.url)), options.configFile ? [options.configFile] : []),
+      releaseCommands: config.permissionAgent?.releaseCommands ?? [],
+    },
+  };
+  // The live core judges real paths. A replay core gets no resolver: it reads nothing from disk.
+  const permissionCore = createPermissionAgentCore({ ...permissionCoreOptions, resolvePath: realHostPath });
+  permissionAgent.core = permissionCore;
+  const permissionReplays = permissionMeasurements
+    ? new PermissionReplayJobs({ core: () => createPermissionAgentCore({ ...permissionCoreOptions, purpose: "replay" }), measurements: permissionMeasurements,
+      // A passing replay can make the host ready: coordinator reviews of the runs it now serves are retired at once.
+      onSettled: () => { void teams.permissionAuthorityChanged().catch(() => {}); } })
+    : undefined;
+  // The pipeline decides and records; it is built only when a decision core exists. The owner controls need only the journal.
+  const permissionState = permissionJournal ? openPermissionPipelineState(evidence) : undefined;
+  const permissionControls = permissionJournal && permissionState ? new PermissionOwnerControls(permissionJournal, permissionState) : undefined;
+  if (permissionAgent.core && permissionJournal && permissionDelegation && permissionState)
+    permissionAgent.pipeline = new HostPermissionPipeline({
+      core: permissionAgent.core, journal: permissionJournal, delegation: permissionDelegation, state: permissionState,
+      // An owner halt stops the permission agent too: while it covers the project no reviewer turn starts and no recorded verdict is delivered.
+      halted: projectId => halt.check({ projectId }).state === "halted",
+      // The halt service renews a project's epoch durably at every engage and release that covers it, before either takes
+      // effect: a verdict reached before a halt or its release no longer applies, and the request is decided again.
+      haltEpoch: projectId => halt.epoch(projectId),
+    });
+  // Sessions outside team runs: every session listing is read for their permission dialogs, which go to the delivery service.
+  const sessionPermissions = new SessionPermissionRequests(config, manager, {
+    delivery: () => permissionAgent.delivery,
+    serves: projectId => permissionAgent.pipeline ? permissionAgent.pipeline.serves(projectId).served : true,
+    authority: projectId => { const found = permissionDelegation?.coverage(projectId); return found?.covered ? found.authorityHash : undefined; },
+    taskEnded: taskId => permissionAgent.pipeline?.taskEnded(taskId),
+  });
+  manager.observeListings(rows => sessionPermissions.observe(rows));
+  // Interactive delivery needs its ledger: without it nothing is delivered, so an unknown result can never repeat.
+  let permissionDeliveryLedger: EvidenceDeliveryLedger | undefined;
+  try {
+    evidence.register(permissionDeliveryModule);
+    permissionDeliveryLedger = new EvidenceDeliveryLedger(evidence);
+  } catch { permissionDeliveryLedger = undefined; }
+  const permissionDelivery = new InteractivePermissionDelivery({ pipeline: () => permissionAgent.pipeline, ledger: permissionDeliveryLedger });
+  permissionAgent.delivery = permissionDelivery;
+  teams.usePermissionAgent(permissionAgent);
+  /**
+   * After a write that may have changed or ended an authority, and before that write is acknowledged. Coordinator
+   * reviews of runs that the permission agent now serves are retired, and permission-agent answers in flight
+   * under an authority that no longer applies (a revoke, a changed delegation, an opt-out, a regrouping, an owner
+   * halt) are fenced at their sessions. `uncertain` when a fence was not confirmed.
+   */
+  const settlePermissionAuthority = async (): Promise<PermissionFence> => {
+    let confirmed = true;
+    try { await teams.permissionAuthorityChanged(); } catch { confirmed = false; }
+    try { if (!await permissionDelivery.fenceRetired()) confirmed = false; } catch { confirmed = false; }
+    return confirmed ? {} : { deliveryFence: "uncertain" };
+  };
+  // Active only when a pipeline decides, interactive delivery can record what it sends, and the host is ready.
+  const permissionAgentState = () => {
+    try { return permissionAgent.pipeline && permissionDelivery.active() && permissionCore.readiness().ready ? "active" as const : "inactive" as const; }
+    catch { return "inactive" as const; }
+  };
+  // The headless channel reads the pipeline from this registry on every call: until one is added it serves nothing.
+  // A team member's headless calls are decided only while its run is live: the same run and member checks as a dialog hand-off.
+  const headlessChannel = new HeadlessPermissionChannel({ key, runDir: config.runDir, sessions: manager, services: permissionAgent,
+    teamLive: session => teams.permissionAgentLive(session) });
+  permissionAgent.headless = headlessChannel;
+  manager.useHeadlessChannel(headlessChannel);
   const missions = new MissionService(config, key, manager, teams, projectGroups);
   ownerServices.missions = missions;
   // A run is live while its sealed record file exists, so a record that failed to load keeps its evidence.
@@ -471,6 +564,8 @@ export function createApp(config: Config, key: Buffer) {
   // The owner's halt sits in front of the fuse: every scheduler and the Manager backstop ask it first, so a halted
   // launch is never charged. A team that a live goal or mission owns is paused through its owner.
   const halt = new HaltService({ config, key });
+  // A reviewer launch names no project, so the host halt (or a halt record the host cannot read) holds every one, replays included.
+  permissionTurnGate.hold = () => { const view = halt.view(); return view.readable && !view.host; };
   halt.useServices({ routines, goals, missions, teams }, teamId => goals.ownsActiveTeam(teamId) || missions.ownsActiveSubteam(teamId));
   const gate = halt.gate(fuse);
   manager.useFuse(gate);
@@ -556,8 +651,8 @@ export function createApp(config: Config, key: Buffer) {
       return res.status(403).json({ error: "Host is not allowed" });
     next();
   });
-  // The sync commit manifest is parsed by its own route, after authentication.
-  app.use((req, res, next) => /^\/api\/projects\/[^/]+\/sync\/commit$/.test(req.path) ? next()
+  // The sync commit manifest and a permission replay set are parsed by their own routes, after authentication.
+  app.use((req, res, next) => /^\/api\/projects\/[^/]+\/sync\/commit$/.test(req.path) || PERMISSION_REPLAY_PATH.test(req.path) ? next()
     : express.json({ limit: /^\/api\/sessions\/[^/]+\/opencode(?:\/|$)/.test(req.path) ? "8mb" : "96kb" })(req, res, next));
   function authenticate(token: string) {
     const digest = Buffer.from(hashToken(token), "hex");
@@ -639,6 +734,9 @@ export function createApp(config: Config, key: Buffer) {
     res.locals.leaseId = id.optional().parse(req.get("X-Infinite-Control"));
     next();
   });
+  // No route is trusted to remember the permission fence: every write settles it before its JSON reply is sent.
+  // Both steps are in-memory reads unless an answer is in flight under an authority that the write ended.
+  app.use("/api", permissionWriteFence(settlePermissionAuthority));
   const requireRole =
     (roles: Role[]): express.RequestHandler =>
     (_req, res, next) =>
@@ -726,7 +824,8 @@ export function createApp(config: Config, key: Buffer) {
         (p) => p !== "demo" || config.enableDemo,
       ),
       teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, projectSource: 1, autonomyMode: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
-      permissions: { workspaceDelegation: 1 },
+      // onboardingCoverage: repo init's PUT takes permissionOptOut and answers what onboarding left in the delegation record.
+      permissions: { workspaceDelegation: 1, decisionLog: 1, onboardingCoverage: 1 },
       goals: { enabled: goals.enabled() },
       missions: { enabled: missions.enabled() },
       usage: { enabled: Boolean(config.usage), budgets: config.usage?.budgets ?? {} },
@@ -1096,11 +1195,12 @@ export function createApp(config: Config, key: Buffer) {
     }));
   });
   app.get("/api/project-groups/:id", requireRole(["owner", "controller", "viewer"]), (req, res) => res.json(projectGroups.get(projectGroupIdSchema.parse(req.params.id))));
+  // An owner regrouping can end a delegation's coverage of a project. The write middleware fences answers in flight under it before the reply.
   app.post("/api/project-groups", requireRole(["owner"]), (req, res) => res.json(projectGroups.create(createProjectGroupSchema.parse(req.body))));
   app.put("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.update(projectGroupIdSchema.parse(req.params.id), updateProjectGroupSchema.parse(req.body))));
   app.delete("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.remove(projectGroupIdSchema.parse(req.params.id), z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict().parse(req.body))));
   const permissionsUnavailable = (res: express.Response) => res.status(503).json({ error: "Permission delegation is unavailable on this host." });
-  app.get("/api/permissions/status", requireRole(["owner", "controller"]), (_req, res) => {
+  app.get("/api/permissions/status", requireRole(["owner", "controller"]), async (_req, res) => {
     if (!permissionDelegation) return permissionsUnavailable(res);
     const journal = permissionJournal;
     const now = Date.now();
@@ -1109,13 +1209,18 @@ export function createApp(config: Config, key: Buffer) {
     let rates: { lastHour: ReturnType<PermissionJournal["rates"]>; lastDay: ReturnType<PermissionJournal["rates"]> } | null = null;
     if (journal) { try { rates = { lastHour: rateWindow(HOUR_MS), lastDay: rateWindow(DAY_MS) }; } catch { rates = null; } }
     res.json({
-      agent: PERMISSION_AGENT_STATE,
+      agent: permissionAgentState(),
       policyVersion: PERMISSION_POLICY_VERSION,
       interruptClasses: [...INTERRUPT_CLASSES],
       workspaces: permissionDelegation.status(),
       rates,
+      rateFlags: permissionRateFlags(journal, now),
+      ...permissionAgentStatus(permissionCore, permissionMeasurements, permissionReplays),
+      // Informational as well: a listing that fails reports null.
+      headless: await headlessChannel.status().catch(() => null),
     });
   });
+  registerPermissionAgentRoutes(app, { requireRole, requireOwnerCli, jobs: permissionReplays });
   // Decision figures for one session, task or workspace, or for the host, over the last `hours` (one hour to seven days).
   app.get("/api/permissions/rates", requireRole(["owner", "controller"]), (req, res) => {
     if (!permissionJournal) return res.status(503).json({ error: "The permission journal is unavailable on this host." });
@@ -1133,24 +1238,31 @@ export function createApp(config: Config, key: Buffer) {
       }),
     });
   });
-  app.post("/api/permissions/delegations", requireRole(["owner"]), requireOwnerCli, (req, res) => {
+  app.post("/api/permissions/delegations", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     if (!permissionDelegation) return permissionsUnavailable(res);
     const body = permissionDelegationBodySchema.parse(req.body);
     const actor = { deviceId: String(res.locals.deviceId) };
     const request = { requestId: body.requestId, direction: body.direction };
+    // A changed direction text closes the open rejects of the projects it covers.
+    const delegation = permissionDelegation;
+    const recorded = <T>(act: () => T) => closeRejectsOnDirectionChange(delegation, permissionJournal, config.projects.map(project => project.id), act);
     if (body.all) {
-      const result = permissionDelegation.delegateAll(request, actor);
-      return res.json({ agent: PERMISSION_AGENT_STATE, views: result.views, replacedOptOuts: result.replacedOptOuts });
+      const result = recorded(() => delegation.delegateAll(request, actor));
+      return res.json({ agent: permissionAgentState(), views: result.views, replacedOptOuts: result.replacedOptOuts });
     }
-    const result = permissionDelegation.delegate(body.workspaceId!, request, actor);
-    return res.json({ agent: PERMISSION_AGENT_STATE, views: [result.view], replacedOptOuts: result.replacedOptOuts });
+    const result = recorded(() => delegation.delegate(body.workspaceId!, request, actor));
+    // A new owner act or direction text replaces the authority. The write middleware fences answers in flight under the earlier one first.
+    return res.json({ agent: permissionAgentState(), views: [result.view], replacedOptOuts: result.replacedOptOuts });
   });
-  app.post("/api/permissions/revocations", requireRole(["owner"]), requireOwnerCli, (req, res) => {
+  app.post("/api/permissions/revocations", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     if (!permissionDelegation) return permissionsUnavailable(res);
     const body = permissionRevocationBodySchema.parse(req.body);
     const view = permissionDelegation.revoke(body.workspaceId, { requestId: body.requestId }, { deviceId: String(res.locals.deviceId) });
-    return res.json({ agent: PERMISSION_AGENT_STATE, view });
+    // The revoke is recorded, so no new decision applies. The write middleware fences an answer already with a session before the reply.
+    return res.json({ agent: permissionAgentState(), view });
   });
+  registerPermissionControlRoutes(app, { guards: [requireRole(["owner"]), requireOwnerCli], controls: permissionControls });
+  registerPermissionReviewRoutes(app, { journal: permissionJournal, requireRole, requireOwnerCli, workspaces: projectGroups, projects: () => config.projects });
   app.post("/api/goals", requireRole(["owner"]), async (req, res) => {
     const body = createGoalSchema.parse(req.body);
     assertNoHandoff(body.projectId);
@@ -1365,9 +1477,16 @@ export function createApp(config: Config, key: Buffer) {
       throw new TeamError(403, "single-tenant-required", "Repository enrollment requires a single-tenant host.");
     if (projectConfigChanges.has(projectId) || projectFileChanges.has(projectId))
       throw new TeamError(409, "project-busy", "Repository setup or files are being updated. Retry after the operation finishes.");
+    // The owner's explicit off is recorded before the enrollment is written, or nothing is written.
+    if (body.permissionOptOut && !permissionDelegation) return permissionsUnavailable(res);
+    const onboarding = onboardingPermissions(permissionDelegation, projectId, body, { deviceId: String(res.locals.deviceId) });
     projectConfigChanges.add(projectId);
-    try { res.json(await enrollment.put(projectId, body)); }
-    finally { projectConfigChanges.delete(projectId); }
+    try {
+      const { view, first } = await enrollment.enroll(projectId, body, { beforeWrite: onboarding.beforeWrite });
+      const coverage = onboarding.after(first);
+      // An opt-out ends the project's coverage. The write middleware fences answers in flight under it before the reply.
+      res.json({ ...view, permissionAgent: coverage });
+    } finally { projectConfigChanges.delete(projectId); }
   });
   app.put("/api/projects/:id/autonomy", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
@@ -2108,6 +2227,7 @@ export function createApp(config: Config, key: Buffer) {
     void repositoryBriefings?.start().catch(() => {});
     understandingRuntime.start();
     balances.start();
+    void headlessChannel.listen().catch(() => console.warn("[Infinite] The headless permission channel could not start."));
     sweepEvidence();
     evidenceSweep = setInterval(sweepEvidence, 60 * 60 * 1000);
     evidenceSweep.unref();
@@ -2118,6 +2238,7 @@ export function createApp(config: Config, key: Buffer) {
     void halt.start().catch(() => {});
   });
   server.once("close", () => {
+    headlessChannel.close();
     void mcp?.close();
     teams.close();
     usage.close();
@@ -2143,5 +2264,8 @@ export function createApp(config: Config, key: Buffer) {
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
   const closeConnections = () => { routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); intakeSlack?.close(); readings.stop(); goals.close(); teams.close(); halt.stop(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([mcp?.close(), repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
-  return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, mcpServer: mcp?.server, closeConnections, fuse, halt };
+  return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, mcpServer: mcp?.server, closeConnections, fuse, halt,
+    // ownerClass is read only for a dialog the delivery service handled and left to the owner, so no session wrapper is needed.
+    permissions: { holder: (sessionId: string, promptId: number) => sessionPermissions.holder(sessionId, promptId),
+      ownerClass: (sessionId: string, promptId: number) => permissionDelivery.ownerClass(sessionId, promptId) }, permissionAgent };
 }

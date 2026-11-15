@@ -108,6 +108,8 @@ export type Me = {
   providerLimits?: ProviderLimit[];
   usage?: { enabled: boolean; budgets: Partial<Record<string, UsageBudget>> };
   terminal?: { stream: boolean; duplex: boolean; raw: boolean; snapshot?: boolean; control?: boolean };
+  /** `decisionLog` marks a host that serves the owner's permission decision log. */
+  permissions?: { workspaceDelegation?: number; decisionLog?: number };
 };
 // One identity per running browser tab, independent of its shared login cookie.
 const clientId = crypto.randomUUID();

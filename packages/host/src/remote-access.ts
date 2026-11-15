@@ -29,6 +29,11 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   if (url.pathname !== path.split("?")[0] || /%/i.test(url.pathname)) return false;
   if (method === "GET" && url.pathname === "/api/me") return true;
   if (method === "GET" && url.pathname === "/api/machine/resources") return true;
+  // The phone's permission decision log: reads, and a mark, which is a record only. Delegating, revoking,
+  // reopening and unlocking stay on a direct owner connection.
+  if (method === "GET" && ["/api/permissions/log", "/api/permissions/candidates"].includes(url.pathname)) return true;
+  if (method === "GET" && /^\/api\/permissions\/decisions\/[A-Za-z0-9_.:-]{1,200}$/.test(url.pathname)) return true;
+  if (method === "POST" && url.pathname === "/api/permissions/marks") return true;
   // The phone's cost screen; the host still enforces each route's role.
   if (method === "GET" && ["/api/usage", "/api/usage/daily", "/api/usage/models", "/api/usage/projects"].includes(url.pathname)) return true;
   if (method === "GET" && /^\/api\/usage\/projects\/[a-z0-9-]{1,80}$/.test(url.pathname)) return true;

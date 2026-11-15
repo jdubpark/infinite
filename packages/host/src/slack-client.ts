@@ -10,6 +10,26 @@ export class SlackError extends Error {
 export interface SlackEnvelope {
   envelopeId: string; teamId?: string; eventId?: string;
   event?: { type: string; user?: string; botId?: string; channel?: string; ts?: string; threadTs?: string; text?: string };
+  interaction?: SlackInteraction;
+}
+
+export interface SlackAction {
+  actionId: string;
+  blockId: string;
+  actionTs: string;
+  value?: string;
+  selectedValues?: string[];
+}
+
+export interface SlackInteraction {
+  type: "block_actions";
+  userId: string;
+  teamId: string;
+  channelId: string;
+  messageTs: string;
+  threadTs?: string;
+  actions: SlackAction[];
+  state?: Record<string, Record<string, { type: string; selectedValues?: string[]; value?: string }>>;
 }
 
 const DEFAULT_ENDPOINT = "https://slack.com/api";
@@ -71,9 +91,10 @@ export class SlackClient implements IntakeThreadReader {
   }
 
   /** Posts into the bound thread. The key travels as message metadata so a lost response can be found later. */
-  async post(binding: IntakeThread, text: string, key: string): Promise<{ ts: string }> {
+  async post(binding: IntakeThread, text: string, key: string, blocks?: Record<string, unknown>[]): Promise<{ ts: string }> {
     const data = await this.call("chat.postMessage", "bot", {
-      channel: binding.channelId, thread_ts: binding.threadTs, text,
+      channel: binding.channelId, thread_ts: binding.threadTs, text, mrkdwn: false, parse: "none",
+      blocks: blocks ?? [{ type: "markdown", text }],
       metadata: { event_type: "infinite_intake", event_payload: { key } },
     });
     if (typeof data.ts !== "string") throw new SlackError("invalid_response", false);
@@ -221,8 +242,12 @@ function threadMessage(raw: Record<string, any>): SlackThreadMessage {
   });
 }
 
-/** Only an events_api envelope carries an event; any other envelope type is delivered with its ID alone. */
+/** Only supported envelope payloads are projected; unknown or malformed payloads are delivered with their ID alone. */
 function toEnvelope(envelopeId: string, type: unknown, payload: Record<string, any> | undefined): SlackEnvelope {
+  if (type === "interactive") {
+    const interaction = blockActions(payload);
+    return interaction ? { envelopeId, interaction } : { envelopeId };
+  }
   if (type !== "events_api") return { envelopeId };
   const event = payload?.event;
   return defined({
@@ -234,6 +259,91 @@ function toEnvelope(envelopeId: string, type: unknown, payload: Record<string, a
       ts: event.ts, threadTs: event.thread_ts, text: event.text,
     }) : undefined,
   });
+}
+
+function blockActions(payload: Record<string, any> | undefined): SlackInteraction | undefined {
+  if (!payload || payload.type !== "block_actions") return undefined;
+  const userId = payload.user?.id;
+  const teamId = payload.team?.id;
+  const channelId = payload.channel?.id;
+  const messageTs = payload.message?.ts ?? payload.container?.message_ts;
+  if (![userId, teamId, channelId, messageTs].every(isString)) return undefined;
+  if (!Array.isArray(payload.actions)) return undefined;
+
+  const actions: SlackAction[] = [];
+  for (const raw of payload.actions) {
+    if (!raw || typeof raw !== "object" || !isString(raw.action_id) || !isString(raw.block_id) || !isString(raw.action_ts)) return undefined;
+    const selectedValues = raw.selected_options === undefined
+      ? undefined
+      : selectedOptions(raw.selected_options);
+    const selectedOption = raw.selected_option;
+    if (selectedValues === INVALID || (selectedOption !== undefined && selectedOption !== null && (!isRecord(selectedOption) || !isString(selectedOption.value))) ||
+      (raw.value !== undefined && !isString(raw.value))) return undefined;
+    actions.push(defined({
+      actionId: raw.action_id,
+      blockId: raw.block_id,
+      actionTs: raw.action_ts,
+      value: raw.value ?? selectedOption?.value,
+      selectedValues: selectedValues === undefined ? undefined : selectedValues,
+    }));
+  }
+
+  const state = interactionState(payload.state);
+  if (state === INVALID) return undefined;
+  return defined({
+    type: "block_actions" as const,
+    userId,
+    teamId,
+    channelId,
+    messageTs,
+    threadTs: isString(payload.message?.thread_ts) ? payload.message.thread_ts : undefined,
+    actions,
+    state: state === undefined ? undefined : state,
+  });
+}
+
+const INVALID = Symbol("invalid Slack interaction field");
+
+function selectedOptions(value: unknown): string[] | undefined | typeof INVALID {
+  if (value === null) return [];
+  if (!Array.isArray(value)) return INVALID;
+  const values: string[] = [];
+  for (const option of value) {
+    if (!option || typeof option !== "object" || !isString(option.value)) return INVALID;
+    values.push(option.value);
+  }
+  return values;
+}
+
+function interactionState(raw: unknown): SlackInteraction["state"] | undefined | typeof INVALID {
+  if (raw === undefined) return undefined;
+  if (!isRecord(raw) || !isRecord(raw.values)) return INVALID;
+  const stateEntries: [string, NonNullable<SlackInteraction["state"]>[string]][] = [];
+  for (const [blockId, block] of Object.entries(raw.values)) {
+    if (!isRecord(block)) return INVALID;
+    const elementEntries: [string, NonNullable<SlackInteraction["state"]>[string][string]][] = [];
+    for (const [actionId, element] of Object.entries(block)) {
+      if (!isRecord(element) || !isString(element.type)) return INVALID;
+      const selectedValues = element.selected_options === undefined
+        ? undefined
+        : selectedOptions(element.selected_options);
+      const selectedOption = element.selected_option;
+      if (selectedValues === INVALID || (element.value !== undefined && !isString(element.value)) ||
+        (selectedOption !== undefined && selectedOption !== null && (!isRecord(selectedOption) || !isString(selectedOption.value)))) return INVALID;
+      elementEntries.push([actionId, defined({
+        type: element.type,
+        selectedValues: selectedValues === undefined ? undefined : selectedValues,
+        value: element.value ?? selectedOption?.value,
+      })]);
+    }
+    stateEntries.push([blockId, Object.fromEntries(elementEntries)]);
+  }
+  return Object.fromEntries(stateEntries);
+}
+
+function isString(value: unknown): value is string { return typeof value === "string"; }
+function isRecord(value: unknown): value is Record<string, any> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 /** Drops absent fields so optional properties are missing rather than undefined. */

@@ -101,7 +101,7 @@ const turnEndSettleMs = 5000;
 const turnActivity = new Set(["turn-start", "tool-start", "tool-end", "prompt-open", "prompt-closed", "answer"]);
 /** Messages delivered per coordinator attempt; the rest wait for the next attempt. */
 const messageLimit = 30;
-const timeLimitReason = "The approved time limit has expired. Active subteams were cancelled; their workspaces remain available.";
+const timeLimitReason = "The approved time limit has expired. Subteams are paused and their workspaces are kept. Extend the time limit to continue, or cancel the mission.";
 const messageTooLargeReason = "The next coordinator message cannot fit with the mission state. Its evidence remains queued; no empty coordinator attempt was started.";
 /** Follow-ups open at once, and settled ones kept for clients. */
 const followUpLimit = 5, settledFollowUpsKept = 10;
@@ -213,13 +213,13 @@ export class MissionService {
   }
   ownsActiveSubteam(teamId: string) {
     return [...this.records.values()].some(({ mission }) =>
-      !["blocked", "ready-for-review", "cancelled"].includes(mission.status) &&
+      (mission.status !== "blocked" || mission.stopReason === "deadline") && !["ready-for-review", "cancelled"].includes(mission.status) &&
       mission.subtasks.some(subtask => subtask.teamId === teamId && ["running", "blocked"].includes(subtask.status)));
   }
   /** A live mission retains integration state while it still references a source subteam. */
   retainsSubteamRun(teamId: string) {
     return [...this.records.values()].some(({ mission }) =>
-      !["blocked", "ready-for-review", "cancelled"].includes(mission.status) &&
+      (mission.status !== "blocked" || mission.stopReason === "deadline") && !["ready-for-review", "cancelled"].includes(mission.status) &&
       mission.subtasks.some(subtask => subtask.teamId === teamId));
   }
   enabled() {
@@ -403,7 +403,28 @@ export class MissionService {
    */
   extend(id: string, input: { requestId: string; revision: number; minutes: number }): ReturnType<MissionService["resume"]> {
     const body = missionExtendSchema.parse(input);
-    return Promise.reject(new TeamError(501, "not-implemented", `Extending mission ${id} by ${body.minutes} minutes is not implemented yet.`));
+    return this.enqueue(() => {
+      const stored = this.record(id), mission = stored.mission;
+      if (this.replay(stored, "extend", body)) return this.view(stored);
+      const deadlineBlocked = mission.status === "blocked" && mission.stopReason === "deadline";
+      if (!(live.has(mission.status) || mission.status === "paused" || deadlineBlocked))
+        throw new TeamError(409, "mission-not-extendable", "Only a running mission, or one stopped by its time limit, can be extended.");
+      this.admit(stored, "extend", body);
+      const at = Date.now();
+      const deadline = deadlineBlocked ? at + body.minutes * 60000 : Date.parse(mission.deadlineAt) + body.minutes * 60000;
+      mission.deadlineAt = new Date(deadline).toISOString();
+      if (deadlineBlocked) {
+        mission.status = "working"; mission.stopReason = undefined; mission.reason = undefined; stored.blockedAt = undefined;
+        for (const subtask of mission.subtasks.filter(item => item.teamId && item.status === "running")) {
+          const pending = stored.ops.findIndex(op => op.teamId === subtask.teamId && op.kind === "pause");
+          if (pending >= 0) stored.ops.splice(pending, 1);
+          else this.queueOp(stored, { kind: "resume", subtaskId: subtask.id, teamId: subtask.teamId! });
+        }
+        stored.inbox.push({ type: "resumed" }); this.settle(stored);
+      }
+      this.event(stored, `The owner extended the time limit by ${body.minutes} minutes; the mission now stops at ${utcMinute(mission.deadlineAt)}.`);
+      this.save(stored); return this.view(stored);
+    });
   }
   private action(id: string, action: "pause" | "resume" | "cancel", body: Action & { reason?: string }) {
     const reason = body.reason;
@@ -413,7 +434,7 @@ export class MissionService {
       if (action === "pause" && !live.has(mission.status)) throw new TeamError(409, "mission-not-running", "Only a running mission can be paused.");
       if (action === "resume" && mission.status !== "paused") throw new TeamError(409, "mission-not-paused", "Only a paused mission can resume.");
       // The paused status still holds here, so the stopped clock is added to the deadline without writing it yet.
-      if (action === "resume" && Date.now() >= this.deadlineMs(stored, Date.now())) throw new TeamError(409, "mission-deadline", "This mission's time limit has expired. Start a new mission to approve more time.");
+      if (action === "resume" && Date.now() >= this.deadlineMs(stored, Date.now())) throw new TeamError(409, "mission-deadline", "This mission's time limit has expired. Extend the time limit to continue.");
       if (action === "cancel" && mission.status === "cancelled") throw new TeamError(409, "mission-cancelled", "This mission has already been cancelled.");
       this.admit(stored, action, body);
       if (action === "cancel") this.stop(stored, "cancelled", "Cancelled by the owner. Subteam workspaces remain available for inspection.");
@@ -422,6 +443,7 @@ export class MissionService {
         for (const subtask of mission.subtasks.filter(item => item.teamId && item.status === "running")) this.queueOp(stored, { kind: "pause", subtaskId: subtask.id, teamId: subtask.teamId! });
       } else {
         mission.status = "working"; mission.reason = undefined;
+        mission.stopReason = undefined;
         for (const subtask of mission.subtasks.filter(item => item.teamId && item.status === "running")) {
           // A pause that never reached the subteam is withdrawn rather than followed by a resume.
           const pending = stored.ops.findIndex(op => op.teamId === subtask.teamId && op.kind === "pause");
@@ -591,7 +613,10 @@ export class MissionService {
     this.settleClock(stored);
     // A stopped intake clock is not checked; its deadline moves when the owner or the pause releases it.
     if ((live.has(mission.status) || mission.status === "paused") && !stored.clockStoppedAt && Date.now() >= Date.parse(mission.deadlineAt)) {
-      this.stop(stored, "blocked", timeLimitReason); this.event(stored, timeLimitReason); this.save(stored);
+      mission.status = "blocked"; mission.stopReason = "deadline"; mission.reason = timeLimitReason; stored.blockedAt = stored.blockedAt ?? now();
+      for (const subtask of mission.subtasks.filter(item => item.teamId && item.status === "running")) this.queueOp(stored, { kind: "pause", subtaskId: subtask.id, teamId: subtask.teamId! });
+      mission.coordinator = mission.coordinator ? { ...mission.coordinator, status: "stopped" } : undefined;
+      this.event(stored, timeLimitReason); this.save(stored);
     }
     await this.launchSubteams(stored);
     await this.applyOps(stored);
@@ -624,6 +649,7 @@ export class MissionService {
   /** Stops the mission: queued work is cancelled and active subteams receive a cancel. */
   private stop(stored: Stored, status: "blocked" | "cancelled", reason: string) {
     const mission = stored.mission;
+    mission.stopReason = undefined;
     mission.status = status; mission.reason = reason;
     stored.blockedAt = status === "blocked" ? stored.blockedAt ?? now() : undefined;
     for (const subtask of mission.subtasks) {
@@ -692,10 +718,11 @@ export class MissionService {
         try {
           const team = this.teams.get(request.requestId);
           Object.assign(subtask, { teamId: team.id, status: "running", teamStatus: team.status });
-          this.queueOp(stored, { kind: mission.status === "paused" ? "pause" : "cancel", subtaskId, teamId: team.id });
+          const keepPaused = mission.status === "paused" || mission.status === "blocked" && mission.stopReason === "deadline";
+          this.queueOp(stored, { kind: keepPaused ? "pause" : "cancel", subtaskId, teamId: team.id });
         } catch (error) {
           if (!notFound(error)) throw error;
-          if (mission.status !== "paused") subtask.status = "cancelled";
+          if (mission.status !== "paused" && !(mission.status === "blocked" && mission.stopReason === "deadline")) subtask.status = "cancelled";
         }
         delete stored.launches[subtaskId]; delete stored.bases?.[subtaskId]; this.save(stored); continue;
       }
@@ -1001,7 +1028,7 @@ export class MissionService {
         // A pause withdraws an attempt that never launched; its messages, such as a fired follow-up, wait for the
         // attempt after resume. A blocked or cancelled mission emptied its queues when it stopped, so nothing returns.
         endAttempt(attempt);
-        if (mission.status === "paused") returnConsumed(stored, attempt);
+        if (mission.status === "paused" || mission.status === "blocked" && mission.stopReason === "deadline") returnConsumed(stored, attempt);
         this.save(stored); return;
       }
       attempt.status = "running";
@@ -1053,7 +1080,7 @@ export class MissionService {
       this.refuse(stored, "missing", "Your previous attempt ended without a mission report. File exactly one report in every attempt; report wait when nothing needs a decision.");
     // A consumed message is settled only by an applied report. A pause that stopped this attempt first returns its
     // messages for the attempt after resume; a conversation resumed inside the idle window may see them twice.
-    if (!applied && mission.status === "paused") returnConsumed(stored, attempt);
+    if (!applied && (mission.status === "paused" || mission.status === "blocked" && mission.stopReason === "deadline")) returnConsumed(stored, attempt);
     this.save(stored);
   }
   /** Keeps the newest notes within the count and length limits; the oldest go first. A refused report's note is kept too. */

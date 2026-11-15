@@ -264,6 +264,23 @@ test("a halt survives a restart, finishes an interrupted pass, and fails closed 
   } finally { f.close(); }
 });
 
+test("the halt history keeps a released halt, without its project, and a restart reads it back", async () => {
+  const f = schedulerFixture();
+  const halt = new HaltService({ config: f.config, key: f.key });
+  try {
+    const project = await halt.engage(fixtureScope, { requestId: randomUUID() }, owner);
+    const host = await halt.engage(hostScope, { requestId: randomUUID() }, owner);
+    const projectId = project.halt.projects[0]!.haltId, hostId = host.halt.host!.haltId;
+    assert.deepEqual(halt.history(), [{ haltId: projectId, projectId: "fixture" }, { haltId: hostId }]);
+    await halt.release(fixtureScope, { requestId: randomUUID() }, owner);
+    await halt.release(hostScope, { requestId: randomUUID() }, owner);
+    // Released halts stay in the history; the project of a released one is not kept, so it counts for every project.
+    assert.deepEqual(halt.history(), [{ haltId: projectId }, { haltId: hostId }]);
+    halt.stop();
+    assert.deepEqual(new HaltService({ config: f.config, key: f.key }).history(), [{ haltId: projectId }, { haltId: hostId }]);
+  } finally { halt.stop(); f.close(); }
+});
+
 test("any device reads the halt; only the owner engages or releases it", async () => {
   const host = await inProcessHost();
   try {

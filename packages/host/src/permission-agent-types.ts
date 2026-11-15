@@ -229,8 +229,11 @@ export interface PermissionPipeline {
   applicable(decisionId: string): boolean;
   /** Whether an owner halt covers the project now. A pipeline without a halt source leaves it out. */
   halted?(projectId: string): boolean;
-  /** Records the owner halts in force, so that a halt retires the decisions made before it. Called before a halt is acknowledged. */
-  observeHalts?(): void;
+  /**
+   * Records the owner halts in force, so that a halt retires the decisions made before it. Called before a halt is
+   * acknowledged. False while a halt is not recorded: nothing is served until it is.
+   */
+  observeHalts?(): boolean;
   /** Linked delivery events. The decision is in the journal before the first one. */
   recordDelivery(decisionId: string, kind: PermissionDelivery["kind"], detail?: string): void;
   /** A task ended: its open rejects close and its locks end. */

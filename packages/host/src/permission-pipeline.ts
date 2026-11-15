@@ -187,6 +187,11 @@ export interface HostPermissionPipelineOptions {
   halted?: (projectId: string) => boolean;
   /** The owner halts in force now, or undefined when the halt record cannot be read. */
   halts?: () => readonly PermissionHaltMark[] | undefined;
+  /**
+   * Every halt the halt record still knows of, released ones included. Read once, so that a halt the pipeline could
+   * not record before a restart is recorded after it. A released halt without its project counts for every project.
+   */
+  haltHistory?: () => readonly PermissionHaltMark[] | undefined;
   now?: () => number;
 }
 
@@ -200,10 +205,13 @@ export class HostPermissionPipeline implements PermissionPipeline {
   private readonly state: PermissionPipelineState;
   private readonly haltedOf: ((projectId: string) => boolean) | undefined;
   private readonly haltsOf: (() => readonly PermissionHaltMark[] | undefined) | undefined;
+  private readonly haltHistoryOf: (() => readonly PermissionHaltMark[] | undefined) | undefined;
   /** Halts already recorded, and each project's latest one. Both are rebuilt from the state after a restart. */
   private readonly noted = new Set<string>();
   private readonly epochs = new Map<string, string | undefined>();
-  private haltUnrecorded = false;
+  /** Halts seen but not yet recorded. Kept after the release, and nothing is served until each is recorded. */
+  private readonly unrecorded = new Map<string, PermissionHaltMark>();
+  private historyRead = false;
   private readonly clock: () => number;
   /** One decision per request: a delivery retry while a review runs joins it instead of starting another. */
   private readonly inFlight = new Map<string, Promise<PermissionOutcome>>();
@@ -215,6 +223,8 @@ export class HostPermissionPipeline implements PermissionPipeline {
     this.state = options.state;
     this.haltedOf = options.halted;
     this.haltsOf = options.halts;
+    this.haltHistoryOf = options.haltHistory;
+    this.historyRead = options.haltHistory === undefined;
     this.clock = options.now ?? Date.now;
   }
 
@@ -222,21 +232,29 @@ export class HostPermissionPipeline implements PermissionPipeline {
    * Records the owner halts in force. A halt ends the authority that earlier decisions were made under, as a
    * new owner act does: a verdict reached before or during it is never delivered, and after the release the
    * same request is decided again from current evidence. The host calls this before it acknowledges a halt;
-   * every coverage read calls it too. A halt that cannot be recorded serves nothing until it is.
+   * every coverage read calls it too. A halt that cannot be recorded is kept, also after its release, and nothing
+   * is served until it is recorded. False while one is unrecorded or the halt history has not been read.
    */
-  observeHalts(): void {
-    let marks: readonly PermissionHaltMark[] | undefined;
-    try { marks = this.haltsOf?.(); } catch { marks = undefined; }
-    let failed = false;
-    for (const mark of marks ?? []) {
-      if (this.noted.has(mark.haltId)) continue;
-      try {
-        this.state.noteHalt(mark.haltId, mark.projectId, this.timestamp());
-        this.noted.add(mark.haltId);
-        this.epochs.clear();
-      } catch { failed = true; }
+  observeHalts(): boolean {
+    const seen: PermissionHaltMark[] = [];
+    if (!this.historyRead) {
+      let history: readonly PermissionHaltMark[] | undefined;
+      try { history = this.haltHistoryOf?.(); } catch { history = undefined; }
+      if (history) { this.historyRead = true; seen.push(...history); }
     }
-    this.haltUnrecorded = failed;
+    let active: readonly PermissionHaltMark[] | undefined;
+    try { active = this.haltsOf?.(); } catch { active = undefined; }
+    seen.push(...(active ?? []));
+    for (const mark of seen) if (!this.noted.has(mark.haltId) && !this.unrecorded.has(mark.haltId)) this.unrecorded.set(mark.haltId, mark);
+    for (const [haltId, mark] of [...this.unrecorded]) {
+      try {
+        this.state.noteHalt(haltId, mark.projectId, this.timestamp());
+        this.noted.add(haltId);
+        this.unrecorded.delete(haltId);
+        this.epochs.clear();
+      } catch { /* Kept until it is recorded. */ }
+    }
+    return this.unrecorded.size === 0 && this.historyRead;
   }
 
   /** The coverage with its authority narrowed to the latest halt recorded for the project. */
@@ -265,8 +283,7 @@ export class HostPermissionPipeline implements PermissionPipeline {
     catch { return { served: false, reason: "not-covered" }; }
     if (!coverage.covered) return { served: false, reason: "not-covered" };
     if (!this.ready()) return { served: false, reason: "not-ready" };
-    this.observeHalts();
-    if (this.haltUnrecorded) return { served: false, reason: "not-ready" };
+    if (!this.observeHalts()) return { served: false, reason: "not-ready" };
     try { return { served: true, coverage: this.underHalts(coverage) }; }
     catch { return { served: false, reason: "not-ready" }; }
   }

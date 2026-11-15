@@ -347,6 +347,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
         if (!view.readable) return undefined;
         return [...(view.host ? [{ haltId: view.host.haltId }] : []), ...view.projects.map(entry => ({ haltId: entry.haltId, projectId: entry.projectId }))];
       },
+      haltHistory: () => halt.history(),
     });
   // Sessions outside team runs: every session listing is read for their permission dialogs, which go to the delivery service.
   const sessionPermissions = new SessionPermissionRequests(config, manager, {
@@ -374,7 +375,8 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   const settlePermissionAuthority = async (): Promise<PermissionFence> => {
     let confirmed = true;
     // A halt that this write engaged is recorded first, so the fence below sees the decisions it retired.
-    try { permissionAgent.pipeline?.observeHalts?.(); } catch { confirmed = false; }
+    // A halt that could not be recorded is reported: nothing is served until it is.
+    try { if (permissionAgent.pipeline?.observeHalts?.() === false) confirmed = false; } catch { confirmed = false; }
     try { await teams.permissionAuthorityChanged(); } catch { confirmed = false; }
     try { if (!await permissionDelivery.fenceRetired()) confirmed = false; } catch { confirmed = false; }
     return confirmed ? {} : { deliveryFence: "uncertain" };

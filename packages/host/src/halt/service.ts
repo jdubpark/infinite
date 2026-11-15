@@ -88,6 +88,20 @@ export class HaltService {
     };
   }
 
+  /**
+   * Every halt the record still knows of: the halts in force, then the ones its last receipts engaged. A released
+   * halt's project is not kept, so it is given without one. Undefined while the record cannot be read.
+   */
+  history(): { haltId: string; projectId?: string }[] | undefined {
+    if (!this.readable) return undefined;
+    const marks = new Map<string, { haltId: string; projectId?: string }>();
+    for (const entry of this.record.halts)
+      marks.set(entry.haltId, { haltId: entry.haltId, ...(entry.scope === "project" && entry.projectId ? { projectId: entry.projectId } : {}) });
+    for (const receipt of this.record.receipts)
+      if (receipt.action === "engage" && receipt.changed && receipt.haltId && !marks.has(receipt.haltId)) marks.set(receipt.haltId, { haltId: receipt.haltId });
+    return [...marks.values()];
+  }
+
   view(): HaltView {
     if (!this.readable) return { readable: false, projects: [] };
     const state = (entry: HaltEntry): HaltState => ({

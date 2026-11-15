@@ -8,7 +8,8 @@
  * A literal shell body (`sh -c 'script'`, `env -S 'string'`, `watch 'command'`, `script -c`, `flock -c`)
  * is read as the commands it runs, to `MAX_SHELL_DEPTH` layers; a deeper body is opaque. Wrappers in
  * `WRAPPERS` are removed. A command behind a wrapper this table does not know stays in argv; the class
- * module's embedded-command rule reads it there. A remote command (`ssh`) is opaque.
+ * module's embedded-command rule reads it there. A remote command (`ssh`), a copy to or from another host
+ * (`scp`, `rsync`, `sftp`) and an attach to a running process (`strace -p`) are opaque.
  */
 import { lstatSync, readlinkSync, realpathSync } from "node:fs";
 import { posix } from "node:path";
@@ -65,7 +66,8 @@ const INLINE_CODE: Record<string, readonly string[]> = {
  * operands (`flock FILE -c 'command'`); with `bodyOnly` the wrapper runs nothing else, and its other
  * operands are files it writes. `joined` runs the rest of the line, joined with spaces, as a shell body
  * unless an `exec` option is given. With a `noCommand` option the wrapper runs no command, and it is read
- * as itself, as is a wrapper that no command follows.
+ * as itself, as is a wrapper that no command follows. An `attach` option attaches to a running process,
+ * whose effect the text does not show.
  */
 interface Wrapper {
   valued: ReadonlySet<string>;
@@ -82,6 +84,7 @@ interface Wrapper {
   joined?: boolean;
   exec?: ReadonlySet<string>;
   noCommand?: ReadonlySet<string>;
+  attach?: ReadonlySet<string>;
 }
 const options = (...names: string[]): ReadonlySet<string> => new Set(names);
 const WRAPPERS: Record<string, Wrapper> = {
@@ -107,9 +110,12 @@ const WRAPPERS: Record<string, Wrapper> = {
   strace: {
     valued: options("-a", "-b", "-e", "-E", "-I", "-o", "-O", "-p", "-P", "-s", "-S", "-u", "-U", "-X", "--output", "--attach", "--user", "--env",
       "--trace", "--trace-path", "--signal", "--status", "--string-limit", "--summary-sort-by", "--columns"),
-    writes: options("-o", "--output"), noCommand: options("-p", "--attach"),
+    writes: options("-o", "--output"), noCommand: options("-p", "--attach"), attach: options("-p", "--attach"),
   },
-  ltrace: { valued: options("-a", "-A", "-D", "-e", "-F", "-l", "-n", "-o", "-p", "-s", "-u", "-w", "-x", "--output", "--library"), writes: options("-o", "--output"), noCommand: options("-p") },
+  ltrace: {
+    valued: options("-a", "-A", "-D", "-e", "-F", "-l", "-n", "-o", "-p", "-s", "-u", "-w", "-x", "--output", "--library"),
+    writes: options("-o", "--output"), noCommand: options("-p"), attach: options("-p"),
+  },
   taskset: { valued: options(), operands: 1, noCommand: options("-p", "--pid") },
   chrt: { valued: options("-T", "--sched-runtime", "-P", "--sched-period", "-D", "--sched-deadline"), operands: 1, noCommand: options("-p", "--pid", "-m", "--max") },
   script: {
@@ -335,6 +341,7 @@ function build(tokens: Token[], reasons: Set<string>, directory: Directory, real
       }
     }
     if (body !== undefined) break;
+    if (has(wrapper.attach)) reasons.add("process-attach");
     if (has(wrapper.noCommand)) { shellWithoutCommand = false; start = words.length; break; }
     if (!hasBody) {
       const count = Math.min(wrapper.operands ?? 0, words.length - start);
@@ -371,6 +378,10 @@ function build(tokens: Token[], reasons: Set<string>, directory: Directory, real
   if (nameWord?.expands) reasons.add("variable-command");
   // A remote command runs on another host, which the host rules cannot read.
   if (name === "ssh") reasons.add("remote-command");
+  // So does a copy to or from another host, or one over a remote shell. sftp only ever talks to another host.
+  if (name === "sftp" || argv.slice(1).some(word => remoteOperand(name, word))
+    || (name === "rsync" && argv.some(word => word === "--rsh" || word.startsWith("--rsh=") || /^-[A-Za-z0-9]*e/.test(word))))
+    reasons.add("remote-target");
   if (name === "eval" || name === "source" || name === ".") reasons.add("eval");
   if (name === "xargs" || (name === "find" && argv.some(arg => ["-exec", "-execdir", "-ok", "-okdir", "-delete"].includes(arg)))) reasons.add("indirect-command");
   if (SHELLS.has(name)) {
@@ -400,6 +411,17 @@ function build(tokens: Token[], reasons: Set<string>, directory: Directory, real
 export function inlineShellScript(argv: readonly string[]): string | undefined {
   if (argv.length !== 3 || !SHELLS.has(posix.basename(argv[0])) || !/^-[a-z]*c[a-z]*$/.test(argv[1])) return undefined;
   return argv[2];
+}
+
+const REMOTE_COPY = new Set(["scp", "rsync", "sftp"]);
+
+/**
+ * Whether an operand of scp, rsync or sftp names a path on another host: `[user@]host:path`,
+ * `host::module`, or an `rsync://` or `sftp://` URL. A colon after a slash is part of a local file name
+ * (`./a:b`, `dir/a:b`), as scp reads it. A remote operand is never a local path.
+ */
+export function remoteOperand(name: string, word: string): boolean {
+  return REMOTE_COPY.has(name) && !word.startsWith("-") && /^[^/]*:/.test(word);
 }
 
 /** Quotes one word for display and for a second reading. */

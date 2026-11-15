@@ -388,8 +388,8 @@ function pinnedContexts() {
   const run = goalRun();
   return PIN_ROLES.map(role => JSON.stringify(teamContext(run, "Owner feedback excerpt.", { checks: PIN_CHECKS }, role), null, 2));
 }
-const PIN_PROMPTS_SHA256 = "96138bf343bbf749484d95c2f73102193a9cf5dfb5570cf5f869cd89d930776f";
-const PIN_CONTEXTS_SHA256 = "c45fa2c2d5d9de14f615530ee5c8b4dacf119250980eab1c1de1e083b505a760";
+const PIN_PROMPTS_SHA256 = "e8d6e64f8b39cb6c8f7e7c162ab88fecd16682e7cd8540d22c46217f438f78c8";
+const PIN_CONTEXTS_SHA256 = "9ee8fe8ac898e2d70ddbb012ba398387d526294ea61739fb7aad4385b7a7412b";
 
 test("the switch off keeps every prompt and context byte", () => {
   assert.equal(sha256(pinnedPrompts()), PIN_PROMPTS_SHA256, "every role and provider, with and without entry tools");

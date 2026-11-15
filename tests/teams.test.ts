@@ -975,6 +975,15 @@ test("a team builds concurrently in isolated copies and produces checked, review
     assert.ok(workers.every(worker => worker.cwd !== f.source && worker.finishedAt));
     assert.ok(Math.max(...workers.map(worker => worker.startedAt)) < Math.min(...workers.map(worker => worker.finishedAt)), "The implementers must actually overlap");
     assert.equal((await viewer.request<{ teams: TeamView[] }>("/teams")).teams.filter(run => run.id === id).length, 1);
+    // A standalone run's record starts at its first accepted plan and holds the objective as its text.
+    const record = await f.host.fetchApi(`/teams/${id}/record`, "viewer");
+    assert.equal(record.status, 200, JSON.stringify(record.body));
+    assert.equal(record.body.owner.kind, "run");
+    assert.equal(record.body.record.criteria[0].statementOf, "objective");
+    assert.equal(record.body.record.statement.objective, request.objective);
+    assert.equal(record.body.log[0].op, "record.created"); assert.equal(record.body.log[0].actor, "host");
+    const missing = await f.host.fetchApi(`/teams/${randomUUID()}/record`, "viewer");
+    assert.equal(missing.status, 404); assert.equal(missing.body.code, "team-not-found");
     const commands = readFileSync(join(f.receipts, "commands.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     assert.ok(commands.some(command => command.cwd === f.source && command.command === "git"), "Source Git inspection must use the configured execution identity");
     for (const worker of workers)

@@ -6,7 +6,10 @@ import type { LinearTrackingView } from "./linear-types.js";
 import type { AutonomyMode } from "./autonomy.js";
 import { signalKinds, type PendingWake } from "./signals/types.js";
 
-const scopedPath = z.string().trim().min(1).max(300).refine(value => value === "." || (!value.startsWith("/") && !value.includes("\\") && !/[\0*?\[\]:]/.test(value) && !value.split("/").some(part => ["", ".", "..", ".git"].includes(part))), "Use a repository-relative file or folder, or . for the whole project");
+export function isScopedPath(value: string): boolean {
+  return value === "." || (!value.startsWith("/") && !value.includes("\\") && !/[\0*?\[\]:]/.test(value) && !value.split("/").some(part => ["", ".", "..", ".git"].includes(part)));
+}
+const scopedPath = z.string().trim().min(1).max(300).refine(isScopedPath, "Use a repository-relative file or folder, or . for the whole project");
 /** A finite goal that omits `maxRuns` gets this many cycles. Applied in code so a standing goal can refuse an explicit value. */
 export const defaultMaxRuns = 3;
 /** A standing objective: a cycle every `cadenceMinutes`, no cycle limit, allowances renewed per cycle. */

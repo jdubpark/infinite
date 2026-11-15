@@ -15,6 +15,7 @@ import { readSignals } from "./signals/consume.js";
 import { addToPendingWake, type PendingWake, type SignalReader } from "./signals/types.js";
 import { cadenceDue, classifyCycle, cycleWakeOf, defaultWakeMinGapMinutes, foldedCycles, isReviewed, keptCycles, latestReviewed, maxFailedCycles, maxPreviousWork, restoreWake, runObjectiveLimitBytes, unresolvedOperation, wakeObjective } from "./goal-standing.js";
 import { KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
+import { createGoalObjective, goalObjectiveNote, goalObjectiveView, loadGoalObjective, steerGoalObjective, type ObjectiveUnavailable } from "./objective-goals.js";
 
 type Action = { requestId: string; revision: number };
 /** `parallelism` remains readable only so a pre-migration queued owner control can be discarded safely. */
@@ -35,6 +36,9 @@ type Stored = {
   launchRetryAt?: string;
   /** Set when the owner's halt paused this goal, with the goal revision it left. Any owner action moves the revision on. */
   ownerHalt?: { haltId: string; revision: number };
+  /** The objective record (objective-goals.ts). Outside `goal`, so no view or digest reads it. */
+  objectiveRecord?: unknown;
+  objectiveNotice?: ObjectiveUnavailable;
 };
 const now = () => new Date().toISOString();
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -82,6 +86,7 @@ export class GoalService {
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly teams: TeamService, private readonly linear?: LinearService) {
     this.directory = join(config.stateDir, "goals");
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
+    let unsaved = 0;
     for (const file of readdirSync(this.directory).filter(name => /^[a-f0-9-]{36}\.sealed$/.test(name))) {
       const id = file.slice(0, -7);
       const stored = unseal<Stored>(key, `goal:${id}`, readFileSync(join(this.directory, file), "utf8"));
@@ -96,9 +101,14 @@ export class GoalService {
           } catch (error) { if (!(error instanceof TeamError) || error.code !== "team-not-found") throw error; }
         }
       }
+      const before = digest(stored), note = goalObjectiveNote(stored, loadGoalObjective(stored, now()));
+      if (note) this.event(stored, note);
       this.records.set(id, stored);
-      this.saved.set(id, digest(stored));
+      if (digest(stored) === before) { this.saved.set(id, before); continue; }
+      try { writeSealed(join(this.directory, file), key, `goal:${id}`, stored); this.saved.set(id, digest(stored)); }
+      catch { this.saved.set(id, digest(stored)); unsaved++; }
     }
+    if (unsaved) console.warn(`Objective records of ${unsaved} goals could not be saved at startup. Each is saved with its goal's next change.`);
   }
   /** The launch-rate fuse. A service without one starts every cycle it would have started before. */
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
@@ -239,6 +249,7 @@ export class GoalService {
         lineup: structuredClone(this.config.teams!.lineup!), autonomy: autonomyOf(project), cycles: [], memberCount: 0, steering: [], events: [], outcomes: [],
         ...(cursor !== undefined ? { signalCursor: cursor } : {}),
       } };
+      { const note = goalObjectiveNote(stored, createGoalObjective(stored, createdAt)); if (note) this.event(stored, note); }
       this.event(stored, request.standing
         ? `Standing goal approved. A cycle starts now and then every ${request.standing.cadenceMinutes} minutes, each within its own time and attempt limits.`
         : "Goal approved. The coordinator can select and build work within its scope and limits.");
@@ -464,6 +475,7 @@ export class GoalService {
         throw new TeamError(409, "goal-steering-limit", "Start a new goal with consolidated directions.");
       this.admit(stored, "steer", body);
       goal.steering.push({ text: body.text, revision: goal.revision, at: now() });
+      { const note = goalObjectiveNote(stored, steerGoalObjective(stored, body.requestId, now())); if (note) this.event(stored, note); }
       // Between cycles, direction starts the next cycle early, subject to every gate and the wake gap.
       if (goal.standing && !goal.activeTeamId) goal.pendingWake = { ...(goal.pendingWake ?? { signals: [], dropped: 0, since: now() }), owner: true };
       this.setControl(stored, "steer", { text: body.text });
@@ -471,6 +483,7 @@ export class GoalService {
       this.save(stored); return structuredClone(goal);
     });
   }
+  objectiveRecord(id: string, version?: number) { return goalObjectiveView(this.record(id), version); }
   setParallelism(id: string, input: Action & { parallelism: number }) {
     goalParallelismSchema.parse(input);
     this.record(id);

@@ -39,6 +39,7 @@ import { HOST_LOAD_REASON_PREFIX, LaunchHeldError } from "./host-load.js";
 import { isCollapsedPermissionPrompt, oneShotPermissionOption, permissionAuthorityHash, permissionEvidenceHash, permissionReuseKey, refusedBeforeSend } from "./team-permissions.js";
 import { storageShortfall, volumeUsage, type VolumeUsage } from "./storage.js";
 import { collectPermissionEvidence } from "./team-permission-evidence.js";
+import { planRunObjective, runObjectiveNote, runObjectiveView, steerRunObjective, type ObjectiveUnavailable } from "./objective-runs.js";
 export { TeamError } from "./team-workspace.js";
 
 type Mutation = { requestId: string; revision: number; text: string };
@@ -151,6 +152,8 @@ type Stored = {
   ratings?: Record<string, { fingerprint: string; result: TeamTask["ownerRating"] }>;
   /** The member each queued replacement continues, until it starts. Written only with `options.events`. */
   ledgerReplaces?: Record<string, { memberId: string; cause: ReplacementCause }>;
+  /** The objective record of a standalone run (objective-runs.ts). Outside `run`, so no view, prompt, or digest reads it. */
+  objectiveRecord?: unknown; objectiveNotice?: ObjectiveUnavailable;
 };
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const timestamp = () => new Date().toISOString();
@@ -983,6 +986,7 @@ export class TeamService {
     return run.parallelism;
   }
   get(id: string): TeamView { return this.view(this.record(id)); }
+  objectiveRecord(id: string, version?: number) { return runObjectiveView(this.record(id), version); }
   private teamRoot(stored: Stored) {
     const root = stored.root ?? this.config.teams?.workspaceDir;
     if (!root) throw new TeamError(409, "invalid-workspace", "The team workspace is outside its configured root.");
@@ -1444,6 +1448,7 @@ export class TeamService {
         this.event(stored, "User steering superseded automatic recovery; its original report remains recorded as evidence.");
       }
       stored.run.revision++; stored.run.steering.push({ text: body.text, revision: stored.run.revision, at: timestamp() });
+      const objectiveNote = runObjectiveNote(stored, steerRunObjective(stored, body.requestId, timestamp())); if (objectiveNote) this.event(stored, objectiveNote);
       this.emit(stored, "run.revision-advanced", [stored.run.revision], {}, { cause: "steer", fromRevision: stored.run.revision - 1, baseChanged: false });
       stored.run.status = "planning"; stored.halt = "steer"; stored.run.reason = "Stopping earlier members before planning the updated request."; stored.run.blockCode = undefined;
       stored.run.tasks = []; stored.run.review = undefined; stored.run.round = 0; stored.checkHead = undefined;
@@ -1821,12 +1826,14 @@ export class TeamService {
       next.run.reason = undefined;
       if (next.run.discovery && !next.run.discovery.completedAt) next.run.discovery.completedAt = timestamp();
       if (body.text) next.run.steering.push({ text: body.text, revision: nextRevision, at: timestamp() });
+      if (body.text) { const objectiveNote = runObjectiveNote(next, steerRunObjective(next, body.requestId, timestamp())); if (objectiveNote) this.event(next, objectiveNote); }
       next.run.status = "planning";
       next.halt = undefined;
       next.continuationHead = { revision: nextRevision, headCommit: head };
       this.event(next, `Owner continued the run from its clean integration commit at revision ${nextRevision}. Prior tasks, checks, member records, permissions, and review evidence remain available in the run history.`);
       this.save(next);
       Object.assign(stored, next);
+      if (!("objectiveNotice" in next)) delete stored.objectiveNotice;
       return this.view(stored);
     });
   }
@@ -4576,6 +4583,7 @@ export class TeamService {
           this.event(stored, "The coordinator established verification commands under the owner's project opt-in.");
         }
         run.status = "implementing";
+        const objectiveNote = runObjectiveNote(stored, planRunObjective(stored, member.memberId, timestamp())); if (objectiveNote) this.event(stored, objectiveNote);
         this.event(stored, `Project manager planned ${run.tasks.length} tasks.`);
         const map = (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features;
         this.emitWith(stored, "plan.accepted", [member.revision], { memberId: member.memberId, revision: member.revision }, () => ({

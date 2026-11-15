@@ -480,9 +480,11 @@ is kept, also after its release, and the agent serves nothing until it is
 recorded; the halt's acknowledgement then carries `deliveryFence: "uncertain"`.
 The halt record counts every halt it engages, and neither a release nor a
 dropped request receipt lowers that count. The pipeline records how much of the
-count it has accounted for. A counted halt it did not record, whether it was
-released between two reads or before a restart, and a count that went down,
-are recorded as a halt of every project. A dialog that was
+count it has accounted for, and of which record: each halt record gets its own
+generation at its first write. A counted halt it did not record, whether it was
+released between two reads or before a restart, a count that went down, and a
+record of another generation (one that was replaced or removed) are recorded
+as a halt of every project. A dialog that was
 pending is handed to the agent again after the release and decided from the
 evidence of that time. A host halt, or a halt record that the host cannot
 read, also holds every reviewer launch of a replay. A headless call that

@@ -43,6 +43,11 @@ export type HaltRecord = {
    * halt is still counted after its receipt is dropped. Absent on a record written before it was kept.
    */
   engaged?: number;
+  /**
+   * This record's identity, given at its first write. A record that is replaced or removed and written again gets a
+   * new one, so its count is never read as a continuation of the old record's.
+   */
+  generation?: string;
 };
 
 /** Requests remembered for replay. The oldest is dropped first. */
@@ -87,6 +92,7 @@ const recordSchema: z.ZodType<HaltRecord> = z.object({
   halts: z.array(entrySchema).max(10000),
   receipts: z.array(receiptSchema).max(MAX_RECEIPTS),
   engaged: z.number().int().nonnegative().optional(),
+  generation: uuid.optional(),
 }).strict();
 
 export type HaltRead = { state: "missing" } | { state: "readable"; record: HaltRecord } | { state: "unreadable" };

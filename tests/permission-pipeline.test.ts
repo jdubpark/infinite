@@ -142,11 +142,14 @@ type Opened = {
 
 /**
  * The projects under an owner halt. Each engagement gets its own halt id and its place in the count of engaged
- * halts, as the host's halt record gives them; a release does not lower the count.
+ * halts, as the host's halt record gives them; a release does not lower the count. A replaced record starts again
+ * from zero under a new generation.
  */
 class Halts extends Set<string> {
   readonly ids = new Map<string, { haltId: string; serial: number }>();
   count = 0;
+  generation = randomUUID();
+  replace() { this.clear(); this.count = 0; this.generation = randomUUID(); }
   override add(projectId: string) {
     if (!this.has(projectId)) this.ids.set(projectId, { haltId: randomUUID(), serial: ++this.count });
     return super.add(projectId);
@@ -178,7 +181,7 @@ function fixture() {
     opened = {
       state, store, journal, delegation,
       pipeline: new HostPermissionPipeline({
-        core, journal, delegation, state, halted: projectId => halted.has(projectId), halts: () => halted.marks(), haltsEngaged: () => halted.count, now: clock,
+        core, journal, delegation, state, halted: projectId => halted.has(projectId), halts: () => halted.marks(), haltCount: () => ({ generation: halted.generation, count: halted.count }), now: clock,
       }),
       controls: new PermissionOwnerControls(journal, state, { now: clock }),
     };
@@ -383,6 +386,27 @@ test("a halt engaged and released between two reads, or a halt record that was r
   f.halted.count = 0;
   assert.equal(f.pipeline.observeHalts(), true);
   assert.equal(f.pipeline.applicable(again.decisionId), false);
+}));
+
+test("a replaced halt record that reaches the old count again, while nothing could be recorded, still retires every earlier decision", () => withFixture(async f => {
+  f.delegate();
+  // One halt is engaged, recorded and released; an allow decided after it stays undelivered.
+  f.halted.add("alpha-app");
+  assert.equal(f.pipeline.observeHalts(), true);
+  f.halted.clear();
+  const after = decided(await f.pipeline.decide(request({ action: "npm test" })), "allow");
+  // The halt record is replaced, and the evidence store refuses every write while the new record engages and
+  // releases one halt, so its count equals the old one.
+  f.halted.replace();
+  f.state.noteHalt = () => { throw new Error("disk full"); };
+  f.state.countHalts = () => { throw new Error("disk full"); };
+  assert.equal(f.pipeline.observeHalts(), false);
+  f.halted.add("beta-app");
+  assert.equal(f.pipeline.observeHalts(), false);
+  f.halted.clear();
+  f.restart();
+  assert.equal(f.pipeline.observeHalts(), true);
+  assert.equal(f.pipeline.applicable(after.decisionId), false, "another record's count is not a continuation of the old one");
 }));
 
 test("the adapter's evidence collection reaches the review, and no collection exists without it", () => withFixture(async f => {

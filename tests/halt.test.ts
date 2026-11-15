@@ -273,15 +273,25 @@ test("the halt count keeps every engaged halt after its release and after its re
     const host = await halt.engage(hostScope, { requestId: randomUUID() }, owner);
     await halt.engage(hostScope, { requestId: randomUUID() }, owner);
     const projectId = project.halt.projects[0]!.haltId, hostId = host.halt.host!.haltId;
-    assert.deepEqual(halt.engagements(), { count: 2, halts: [{ haltId: projectId, projectId: "fixture", serial: 1 }, { haltId: hostId, serial: 2 }] },
+    const generation = halt.engagements()!.generation!;
+    assert.match(generation, /^[0-9a-f-]{36}$/, "the record's first write gives it its generation");
+    assert.deepEqual(halt.engagements(), { generation, count: 2, halts: [{ haltId: projectId, projectId: "fixture", serial: 1 }, { haltId: hostId, serial: 2 }] },
       "an engage that found the scope halted counts nothing");
     await halt.release(fixtureScope, { requestId: randomUUID() }, owner);
     await halt.release(hostScope, { requestId: randomUUID() }, owner);
     // Accepted requests that change nothing push the engaging receipts out of the record; the count stays.
     for (let index = 0; index < MAX_RECEIPTS; index++) await halt.release(hostScope, { requestId: randomUUID() }, owner);
-    assert.deepEqual(halt.engagements(), { count: 2, halts: [] });
+    assert.deepEqual(halt.engagements(), { generation, count: 2, halts: [] });
     halt.stop();
-    assert.deepEqual(new HaltService({ config: f.config, key: f.key }).engagements(), { count: 2, halts: [] });
+    assert.deepEqual(new HaltService({ config: f.config, key: f.key }).engagements(), { generation, count: 2, halts: [] });
+    // A removed record starts again from zero under a new generation.
+    rmSync(join(f.config.stateDir, HALT_FILE));
+    const fresh = new HaltService({ config: f.config, key: f.key });
+    assert.deepEqual(fresh.engagements(), { count: 0, halts: [] });
+    await fresh.engage(fixtureScope, { requestId: randomUUID() }, owner);
+    assert.equal(fresh.engagements()!.count, 1);
+    assert.notEqual(fresh.engagements()!.generation, generation);
+    fresh.stop();
   } finally { halt.stop(); f.close(); }
 });
 

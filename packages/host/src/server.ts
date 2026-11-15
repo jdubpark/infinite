@@ -344,7 +344,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       // Each halt is recorded: it retires the verdicts reached before it, and the release brings a fresh evaluation.
       // The count of engaged halts catches one the pipeline never recorded, also when it was released before a restart.
       halts: () => halt.engagements()?.halts,
-      haltsEngaged: () => halt.engagements()?.count,
+      haltCount: () => halt.engagements(),
     });
   // Sessions outside team runs: every session listing is read for their permission dialogs, which go to the delivery service.
   const sessionPermissions = new SessionPermissionRequests(config, manager, {

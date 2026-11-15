@@ -89,12 +89,14 @@ export class HaltService {
   }
 
   /**
-   * The halts in force, each with its place in the count, and how many halts the record has engaged in all. The count
-   * is never lowered by a release or a dropped receipt. Undefined while the record cannot be read.
+   * The halts in force, each with its place in the count, how many halts the record has engaged in all, and the
+   * record's generation (absent until its first write). The count is never lowered by a release or a dropped receipt.
+   * Undefined while the record cannot be read.
    */
-  engagements(): { count: number; halts: { haltId: string; projectId?: string; serial?: number }[] } | undefined {
+  engagements(): { generation?: string; count: number; halts: { haltId: string; projectId?: string; serial?: number }[] } | undefined {
     if (!this.readable) return undefined;
     return {
+      ...(this.record.generation === undefined ? {} : { generation: this.record.generation }),
       count: this.record.engaged ?? 0,
       halts: this.record.halts.map(entry => ({
         haltId: entry.haltId, ...(entry.scope === "project" && entry.projectId ? { projectId: entry.projectId } : {}),
@@ -306,10 +308,11 @@ export class HaltService {
     }
   }
 
-  /** Writes the file, then memory. False when the write failed; memory is unchanged then. */
+  /** Writes the file, then memory. False when the write failed; memory is unchanged then. A record's first write gives it its generation. */
   private persist(next: HaltRecord): boolean {
-    if (!writeHaltRecord(this.file, this.key, next)) return false;
-    this.record = next;
+    const record = next.generation === undefined ? { ...next, generation: randomUUID() } : next;
+    if (!writeHaltRecord(this.file, this.key, record)) return false;
+    this.record = record;
     return true;
   }
 

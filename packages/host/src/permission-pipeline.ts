@@ -54,6 +54,7 @@ const MAX_TEXT = 2_000;
 const sha256 = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const bounded = (text: string) => text.length > MAX_TEXT ? text.slice(0, MAX_TEXT) : text;
 const sameFamily = (left: string, right: string) => left.trim().toLowerCase() === right.trim().toLowerCase();
+const serialKey = (generation: string | null, serial: number) => `${generation ?? ""}:${serial}`;
 const isHostCode = (code: string | undefined) => (HOST_REJECT_CODES as readonly string[]).includes(code ?? "");
 
 /**
@@ -82,13 +83,16 @@ export const permissionPipelineModule: EvidenceModule = {
       `CREATE TABLE IF NOT EXISTS ${HALTS} (`
       + "seq INTEGER PRIMARY KEY AUTOINCREMENT, halt_id TEXT NOT NULL UNIQUE, project_id TEXT, at TEXT NOT NULL)",
     );
-    // Version 3: how many of the halt record's engaged halts the pipeline has accounted for.
-    tx.exec(`CREATE TABLE IF NOT EXISTS ${HALT_COUNT} (id INTEGER PRIMARY KEY CHECK (id = 1), engaged INTEGER NOT NULL)`);
+    // Version 3: how many of the halt record's engaged halts the pipeline has accounted for, and of which record.
+    tx.exec(`CREATE TABLE IF NOT EXISTS ${HALT_COUNT} (id INTEGER PRIMARY KEY CHECK (id = 1), generation TEXT, engaged INTEGER NOT NULL)`);
     // Decisions stored before the count was kept may predate a halt that was never recorded: they lose their authority.
     if (from > 0 && from < 3)
       tx.run(`INSERT OR IGNORE INTO ${HALTS} (halt_id,project_id,at) VALUES (?,?,?)`, "upgrade:3", null, new Date().toISOString());
   },
 };
+
+/** A halt record's generation (null before its first write) and how many halts it has engaged. */
+type HaltCounted = { generation: string | null; engaged: number };
 
 type DecisionRow = { decision_id: string; project_id: string; task_id: string; authority_hash: string };
 
@@ -147,16 +151,20 @@ export class PermissionPipelineState {
     });
   }
 
-  /** How many of the halt record's engaged halts are accounted for, or undefined before the first count. */
-  haltsCounted(): number | undefined {
-    return this.store.read(db => db.get<{ engaged: number }>(`SELECT engaged FROM ${HALT_COUNT} WHERE id=1`))?.engaged;
+  /** Which halt record's engaged halts are accounted for, and how many; undefined before the first count. */
+  haltsCounted(): HaltCounted | undefined {
+    const row = this.store.read(db => db.get<{ generation: string | null; engaged: number }>(`SELECT generation,engaged FROM ${HALT_COUNT} WHERE id=1`));
+    return row && { generation: row.generation, engaged: row.engaged };
   }
 
   /** Records the count, with a halt of every project in the same write when some engaged halt went unrecorded. */
-  countHalts(engaged: number, missed?: { haltId: string; at: string }): void {
+  countHalts(counted: HaltCounted, missed?: { haltId: string; at: string }): void {
     this.store.write(tx => {
       if (missed) tx.run(`INSERT OR IGNORE INTO ${HALTS} (halt_id,project_id,at) VALUES (?,?,?)`, missed.haltId, null, missed.at);
-      tx.run(`INSERT INTO ${HALT_COUNT} (id,engaged) VALUES (1,?) ON CONFLICT(id) DO UPDATE SET engaged=excluded.engaged`, engaged);
+      tx.run(
+        `INSERT INTO ${HALT_COUNT} (id,generation,engaged) VALUES (1,?,?) ON CONFLICT(id) DO UPDATE SET generation=excluded.generation, engaged=excluded.engaged`,
+        counted.generation, counted.engaged,
+      );
     });
   }
 
@@ -209,10 +217,11 @@ export interface HostPermissionPipelineOptions {
   /** The owner halts in force now, or undefined when the halt record cannot be read. */
   halts?: () => readonly PermissionHaltMark[] | undefined;
   /**
-   * How many halts the halt record has engaged in all, or undefined when it cannot be read. A halt it counts that the
-   * pipeline did not record, also one released before a restart, counts for every project.
+   * The halt record's generation (absent before its first write) and how many halts it has engaged in all, or
+   * undefined when it cannot be read. A halt it counts that the pipeline did not record, also one released before a
+   * restart, and a record replaced by another, count for every project.
    */
-  haltsEngaged?: () => number | undefined;
+  haltCount?: () => { generation?: string; count: number } | undefined;
   now?: () => number;
 }
 
@@ -226,15 +235,15 @@ export class HostPermissionPipeline implements PermissionPipeline {
   private readonly state: PermissionPipelineState;
   private readonly haltedOf: ((projectId: string) => boolean) | undefined;
   private readonly haltsOf: (() => readonly PermissionHaltMark[] | undefined) | undefined;
-  private readonly haltsEngagedOf: (() => number | undefined) | undefined;
+  private readonly haltCountOf: (() => { generation?: string; count: number } | undefined) | undefined;
   /** Halts already recorded, and each project's latest one. Both are rebuilt from the state after a restart. */
   private readonly noted = new Set<string>();
   private readonly epochs = new Map<string, string | undefined>();
   /** Halts seen but not yet recorded. Kept after the release, and nothing is served until each is recorded. */
-  private readonly unrecorded = new Map<string, PermissionHaltMark>();
-  /** The recorded count, read once (null before the first count), and the places of the halts recorded since. */
-  private counted: number | null | undefined;
-  private readonly countedSerials = new Set<number>();
+  private readonly unrecorded = new Map<string, PermissionHaltMark & { generation: string | null }>();
+  /** The recorded count, read once (null before the first count), and the places of the halts recorded since, by record. */
+  private counted: HaltCounted | null | undefined;
+  private readonly countedSerials = new Set<string>();
   private readonly clock: () => number;
   /** One decision per request: a delivery retry while a review runs joins it instead of starting another. */
   private readonly inFlight = new Map<string, Promise<PermissionOutcome>>();
@@ -246,7 +255,7 @@ export class HostPermissionPipeline implements PermissionPipeline {
     this.state = options.state;
     this.haltedOf = options.halted;
     this.haltsOf = options.halts;
-    this.haltsEngagedOf = options.haltsEngaged;
+    this.haltCountOf = options.haltCount;
     this.clock = options.now ?? Date.now;
   }
 
@@ -258,43 +267,52 @@ export class HostPermissionPipeline implements PermissionPipeline {
    * is served until it is recorded. False while one is unrecorded or the halt count does not agree.
    */
   observeHalts(): boolean {
+    // The count and the halts in force are read together, so each halt's place belongs to the record that was read.
+    let count: { generation?: string; count: number } | undefined;
+    try { count = this.haltCountOf?.(); } catch { count = undefined; }
+    const generation = count?.generation ?? null;
     let active: readonly PermissionHaltMark[] | undefined;
     try { active = this.haltsOf?.(); } catch { active = undefined; }
-    for (const mark of active ?? []) if (!this.noted.has(mark.haltId) && !this.unrecorded.has(mark.haltId)) this.unrecorded.set(mark.haltId, mark);
+    for (const mark of active ?? [])
+      if (!this.noted.has(mark.haltId) && !this.unrecorded.has(mark.haltId)) this.unrecorded.set(mark.haltId, { ...mark, generation });
     for (const [haltId, mark] of [...this.unrecorded]) {
       try {
         this.state.noteHalt(haltId, mark.projectId, this.timestamp());
         this.noted.add(haltId);
-        if (mark.serial !== undefined) this.countedSerials.add(mark.serial);
+        if (mark.serial !== undefined) this.countedSerials.add(serialKey(mark.generation, mark.serial));
         this.unrecorded.delete(haltId);
         this.epochs.clear();
       } catch { /* Kept until it is recorded. */ }
     }
-    return this.unrecorded.size === 0 && this.countHalts();
+    if (this.unrecorded.size > 0) return false;
+    if (!this.haltCountOf) return true;
+    return count !== undefined && this.countHalts({ generation, engaged: count.count });
   }
 
   /**
    * Brings the recorded halt count up to the halt record's. Every halt counted since the recorded count must be one
-   * this process recorded. One it did not record (engaged and released between two reads, or before a restart), or a
-   * count that went down (a halt record that was reset), is recorded as a halt of every project. True when they agree.
+   * this process recorded from the same record. One it did not record (engaged and released between two reads, or
+   * before a restart), a count that went down, and a record with another generation (one replaced or removed) are
+   * recorded as a halt of every project. The first record after none with no halt continues the count. True when
+   * the counts agree.
    */
-  private countHalts(): boolean {
-    if (!this.haltsEngagedOf) return true;
-    let engaged: number | undefined;
-    try { engaged = this.haltsEngagedOf(); } catch { engaged = undefined; }
-    if (engaged === undefined || !Number.isSafeInteger(engaged) || engaged < 0) return false;
+  private countHalts(current: HaltCounted): boolean {
+    if (!Number.isSafeInteger(current.engaged) || current.engaged < 0) return false;
     try {
       if (this.counted === undefined) this.counted = this.state.haltsCounted() ?? null;
-      if (this.counted === engaged) return true;
+      const prior = this.counted;
+      if (prior && prior.generation === current.generation && prior.engaged === current.engaged) return true;
       let missed = false;
-      if (this.counted !== null) {
-        if (engaged < this.counted || engaged - this.counted > MAX_UNCOUNTED) missed = true;
-        else for (let serial = this.counted + 1; serial <= engaged && !missed; serial++) missed = !this.countedSerials.has(serial);
+      if (prior !== null) {
+        const continues = prior.generation === current.generation || (prior.generation === null && prior.engaged === 0);
+        if (!continues || current.engaged < prior.engaged || current.engaged - prior.engaged > MAX_UNCOUNTED) missed = true;
+        else for (let serial = prior.engaged + 1; serial <= current.engaged && !missed; serial++)
+          missed = !this.countedSerials.has(serialKey(current.generation, serial));
       }
       const haltId = missed ? `unrecorded:${randomUUID()}` : undefined;
-      this.state.countHalts(engaged, haltId === undefined ? undefined : { haltId, at: this.timestamp() });
-      this.counted = engaged;
-      for (const serial of [...this.countedSerials]) if (serial <= engaged) this.countedSerials.delete(serial);
+      this.state.countHalts(current, haltId === undefined ? undefined : { haltId, at: this.timestamp() });
+      this.counted = current;
+      this.countedSerials.clear();
       if (haltId !== undefined) { this.noted.add(haltId); this.epochs.clear(); }
       return true;
     } catch {

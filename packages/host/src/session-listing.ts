@@ -3,7 +3,8 @@ import type { Session } from "./types.js";
 
 /**
  * A parse of a file younger than this may be followed by another write in the same timestamp
- * tick, with the same size and the same identity, so it is read again instead of kept.
+ * tick, with the same size and the same identity, so it is read again instead of kept. The rule
+ * reads the newer of mtime and ctime, because a writer that keeps an old mtime still gives the file a new ctime.
  */
 export const SETTLED_MS = 2000;
 
@@ -50,7 +51,7 @@ export class SealedFileCache<T> {
     if (hit && hit.key === key) return structuredClone(hit.value);
     this.entries.delete(id);
     const value = this.parse(id, readFileSync(file, "utf8"));
-    if (now - info.mtimeMs >= SETTLED_MS) this.entries.set(id, { key, value });
+    if (now - Math.max(info.mtimeMs, info.ctimeMs) >= SETTLED_MS) this.entries.set(id, { key, value });
     return structuredClone(value);
   }
 

@@ -12,7 +12,7 @@ import { writeSealed } from "../packages/host/src/vault.js";
 import type { Config, Session, WorkerState } from "../packages/host/src/types.js";
 
 const ID = () => randomUUID();
-const SETTLED_AGO_MS = 10_000;
+const SETTLED_AGO_MS = 60_000;
 
 /** A root with a relative path: a Unix socket path must stay under 100 bytes for the Manager. */
 async function fixture() {
@@ -39,22 +39,20 @@ const exitedState = (seq: number, extra: Record<string, unknown> = {}) =>
   ({ status: "exited", seq, screen: "", attention: initialAttention(now(), false), ...extra });
 
 const recordDir = (f: Fixture, id: string) => join(f.stateDir, "sessions", id);
-/** Sets a file 10 s into the past, so a read of it is settled. */
-function settle(file: string) {
-  const past = new Date(Date.now() - SETTLED_AGO_MS);
-  utimesSync(file, past, past);
+/** Moves the mocked clock on, so every file written so far is settled: its newer time is old. */
+function settle() {
+  mock.timers.setTime(Date.now() + SETTLED_AGO_MS);
 }
 function writeMeta(f: Fixture, id: string, session: Session) {
   mkdirSync(recordDir(f, id), { recursive: true });
-  const file = join(recordDir(f, id), "meta.sealed");
-  writeSealed(file, f.key, `${id}:meta`, { session, fingerprint: "fixture" });
-  settle(file);
+  writeSealed(join(recordDir(f, id), "meta.sealed"), f.key, `${id}:meta`, { session, fingerprint: "fixture" });
+  settle();
 }
 function writeStatus(f: Fixture, id: string, state: unknown, settled = true) {
   mkdirSync(recordDir(f, id), { recursive: true });
   const file = join(recordDir(f, id), "status.sealed");
   writeSealed(file, f.key, `${id}:status`, state);
-  if (settled) settle(file);
+  if (settled) settle();
   return file;
 }
 
@@ -187,6 +185,24 @@ test("every change shows in the next listing", { timeout: 30_000 }, async () => 
     assertRows(await manager.list(), await oracle(manager), "warm before the changes");
     assertRows(await manager.list(), await oracle(manager), "warm");
 
+    // Rewrite the status of E in place: the same byte length, the same mtime (whole milliseconds, so
+    // that utimesSync restores it exactly), a new ctime. The listing before the rewrite keeps its parse.
+    const eStatus = join(recordDir(f, E), "status.sealed");
+    const eStatusMtime = new Date(Math.floor(statSync(eStatus).mtimeMs));
+    utimesSync(eStatus, eStatusMtime, eStatusMtime);
+    const eStatusNs = statSync(eStatus, { bigint: true }).mtimeNs;
+    assertRows(await manager.list(), await oracle(manager), "warm, after the status mtime was set");
+    const otherStatus = join(f.root, "status-other.sealed");
+    writeSealed(otherStatus, f.key, `${E}:status`, exitedState(2));
+    const otherText = fs.readFileSync(otherStatus, "utf8");
+    assert.equal(Buffer.byteLength(otherText), statSync(eStatus).size, "the rewrite has the same byte length");
+    writeFileSync(eStatus, otherText);
+    utimesSync(eStatus, eStatusMtime, eStatusMtime);
+    assert.equal(statSync(eStatus, { bigint: true }).mtimeNs, eStatusNs, "the mtime is back to its value");
+    const reseq = await manager.list();
+    assertRows(reseq, await oracle(manager), "after an in-place rewrite with the same size and the old mtime");
+    assert.equal(reseq.find(row => row.id === E)!.seq, 2, "the new status shows");
+
     await manager.setArchived(E, true);
     const archived = await manager.list();
     assertRows(archived, await oracle(manager), "after archive");
@@ -232,6 +248,10 @@ test("every change shows in the next listing", { timeout: 30_000 }, async () => 
       spied.restore();
     }
     assertRows(await manager.list(), await oracle(manager), "after the worker closed");
+
+    // E's status is kept now. Make its read fail: the kept state is not served.
+    writeFileSync(eStatus, "x");
+    assertRows(await manager.list(), await oracle(manager), "after an unreadable status");
   } finally {
     mock.timers.reset();
     for (const worker of workers) await worker.close();
@@ -241,31 +261,53 @@ test("every change shows in the next listing", { timeout: 30_000 }, async () => 
 
 test("a second listing of exited records reads no sealed file and connects to no worker", { timeout: 60_000 }, async t => {
   const f = await fixture();
-  mock.timers.enable({ apis: ["Date"], now: Date.now() });
-  const frozen = Date.now();
   const spied = spy();
+  // This test runs on the real clock until its last step: it needs files that are really fresh and files that are
+  // really settled, in turn. `age` waits until every file written so far is older than the settle rule asks.
+  const age = () => new Promise<void>(resolve => setTimeout(resolve, 2_200));
+  const write = (id: string, name: "meta" | "status", value: unknown) => {
+    mkdirSync(recordDir(f, id), { recursive: true });
+    const file = join(recordDir(f, id), `${name}.sealed`);
+    writeSealed(file, f.key, `${id}:${name}`, value);
+    return file;
+  };
   try {
     const ids = Array.from({ length: 200 }, () => ID());
     for (const id of ids) {
-      writeMeta(f, id, sessionOf(id));
-      writeStatus(f, id, exitedState(1));
+      write(id, "meta", { session: sessionOf(id), fingerprint: "fixture" });
+      write(id, "status", exitedState(1));
     }
+    // One more record. Its meta file gets an old mtime and a new ctime below, as a restore that keeps times leaves it.
+    const probeId = ID();
+    const probeMeta = write(probeId, "meta", { session: sessionOf(probeId), fingerprint: "fixture" });
+    write(probeId, "status", exitedState(1));
+    await age();
+    utimesSync(probeMeta, new Date(Date.now() - 3_600_000), new Date(Date.now() - 3_600_000));
     const manager = new Manager(f.config, f.key);
 
     let started = performance.now();
     await manager.list();
     const coldMs = performance.now() - started;
-    assert.equal(spied.reads.length, 400, "cold: meta and status of each record");
+    assert.equal(spied.reads.length, 402, "cold: meta and status of each record");
     assert.equal(spied.connects.length, 0, "cold: no socket file, no connect");
+    spied.reads.length = 0;
+
+    await manager.list();
+    assert.deepEqual(spied.reads, [probeMeta], "an old mtime with a new ctime is not kept; every settled file is");
+    spied.reads.length = 0;
+
+    await age();
+    await manager.list();
+    assert.deepEqual(spied.reads, [probeMeta], "once its ctime is old too, the file is read once more");
     spied.reads.length = 0;
 
     started = performance.now();
     const warm = await manager.list();
     const warmMs = performance.now() - started;
-    assert.equal(warm.length, 200);
+    assert.equal(warm.length, 201);
     assert.equal(spied.reads.length, 0, "warm: no sealed read");
     assert.equal(spied.connects.length, 0, "warm: no connect");
-    t.diagnostic(`200 exited records: cold ${coldMs.toFixed(1)} ms, warm ${warmMs.toFixed(1)} ms`);
+    t.diagnostic(`201 exited records: cold ${coldMs.toFixed(1)} ms, warm ${warmMs.toFixed(1)} ms`);
 
     const socketFile = socketPath(f.runDir, ids[0]);
     writeFileSync(socketFile, "");
@@ -275,7 +317,7 @@ test("a second listing of exited records reads no sealed file and connects to no
     rmSync(socketFile);
     spied.connects.length = 0;
 
-    const freshFile = writeStatus(f, ids[1], exitedState(2), false);
+    const freshFile = write(ids[1], "status", exitedState(2));
     await manager.list();
     assert.equal(spied.reads.filter(path => path === freshFile).length, 1, "a fresh status is read");
     spied.reads.length = 0;
@@ -283,17 +325,18 @@ test("a second listing of exited records reads no sealed file and connects to no
     assert.equal(spied.reads.filter(path => path === freshFile).length, 1, "a fresh status is not kept");
     spied.reads.length = 0;
 
-    settle(freshFile);
+    await age();
     await manager.list();
     assert.equal(spied.reads.filter(path => path === freshFile).length, 1, "a changed file is read once");
     spied.reads.length = 0;
     await manager.list();
     assert.equal(spied.reads.length, 0, "a settled file is kept");
 
-    mock.timers.setTime(frozen - 60_000);
+    // Only now the clock is mocked: it starts a minute in the past, as a clock that stepped back.
+    mock.timers.enable({ apis: ["Date"], now: Date.now() - 60_000 });
     spied.reads.length = 0;
     await manager.list();
-    assert.equal(spied.reads.length, 400, "a clock that stepped back reads every record again");
+    assert.equal(spied.reads.length, 402, "a clock that stepped back reads every record again");
   } finally {
     spied.restore();
     mock.timers.reset();
@@ -310,17 +353,25 @@ test("a caller that changes its rows changes no later listing", { timeout: 30_00
     writeStatus(f, E, exitedState(3, { capabilities: { transcript: 1 }, attention: { ...initialAttention(now(), false), lastMessage: "kept" } }));
     const manager = new Manager(f.config, f.key);
 
+    const spoil = (row: Record<string, any>) => {
+      row.title = "changed";
+      row.attention.lastMessage = "changed";
+      row.runtime.id = "changed";
+      (row.contextSources as unknown[]).push("changed");
+      row.capabilities.transcript = 9;
+    };
+
     const first = await manager.list();
-    const row = first.find(item => item.id === E)! as Record<string, any>;
-    row.title = "changed";
-    row.attention.lastMessage = "changed";
-    row.runtime.id = "changed";
-    (row.contextSources as unknown[]).push("changed");
-    row.capabilities.transcript = 9;
+    spoil(first.find(item => item.id === E)! as Record<string, any>);
 
     const second = await manager.list();
     assertRows(second, await oracle(manager), "after the caller changed its rows");
     assert.notEqual(second.find(item => item.id === E)!.title, "changed");
+    spoil(second.find(item => item.id === E)! as Record<string, any>);
+
+    const third = await manager.list();
+    assertRows(third, await oracle(manager), "after the caller changed a warm listing");
+    assert.notEqual(third.find(item => item.id === E)!.title, "changed");
   } finally {
     mock.timers.reset();
     f.close();

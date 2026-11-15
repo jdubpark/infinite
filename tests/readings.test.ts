@@ -196,7 +196,7 @@ test("background polling retains compact session snapshots instead of full promp
   } finally { f.dispose(); }
 });
 
-test("polling reads a session record once unless a title reading may follow", async () => {
+test("polling reads a session record once unless a title job is due", async () => {
   const f = setup({ title: "Fix the login flow" });
   const sessions: Record<string, Session> = {
     O: { ...f.session, id: "O", title: "Fix the login flow", generatedTitle: undefined, initialPrompt: "Fix the login flow" },
@@ -208,9 +208,10 @@ test("polling reads a session record once unless a title reading may follow", as
   f.manager.list = async () => rows;
   f.manager.meta = (id: string) => { reads[id]!++; return { session: sessions[id] }; };
   try {
+    // Part 1: no writer, so no title job is ever due.
     await f.readings.tick();
     await f.readings.tick();
-    assert.deepEqual(reads, { O: 1, S: 1, C: 2 });
+    assert.deepEqual(reads, { O: 1, S: 1, C: 1 });
     const merged = f.readings.merge([rows[1]!]);
     assert.deepEqual(merged[0]!.reading?.title, { text: "Short prompt", source: "first-line" });
     assert.equal(reads.S, 1, "a short first line is answered from the remembered snapshot");
@@ -218,6 +219,56 @@ test("polling reads a session record once unless a title reading may follow", as
     await f.readings.tick();
     assert.equal(reads.O, 2, "a renamed row is read again");
   } finally { f.dispose(); }
+
+  const writer = { titleFromPrompt: async () => ({ text: "Database read consistency", model: "writer-model" }) };
+
+  // Part 2: a failed title job is not retried, and its record is read again only after the failure expires.
+  let failedCalls = 0;
+  const failing = { systemOne: async () => { failedCalls++; throw new Error("timeout"); } } as unknown as JevTransport;
+  const failure = setup({ title: "", generatedTitle: true, prompt: longLine, lastMessage: "Short.", transport: failing, writer });
+  let failureReads = 0;
+  failure.manager.meta = () => { failureReads++; return { session: failure.session }; };
+  try {
+    await failure.readings.tick();
+    await eventually(() => failedCalls === 1);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    await failure.readings.tick();
+    await failure.readings.tick();
+    assert.equal(failureReads, 1, "a failed title job is not read again while its failure holds");
+    assert.equal(failedCalls, 1);
+    const real = Date.now;
+    Date.now = () => real() + 11 * 60_000;
+    try { await failure.readings.tick(); } finally { Date.now = real; }
+    assert.equal(failureReads, 2, "an expired failure makes the record due again");
+    await eventually(() => failedCalls === 2);
+  } finally { failure.dispose(); }
+
+  // Part 3: a title reading that is done is never read again.
+  const clear = responding({ clear: 0.9 });
+  const answered = setup({ title: "", generatedTitle: true, prompt: longLine, lastMessage: "Short.", transport: clear.transport, writer });
+  let answeredReads = 0;
+  answered.manager.meta = () => { answeredReads++; return { session: answered.session }; };
+  try {
+    await answered.readings.tick();
+    await eventually(() => answered.readings.merge([answered.row])[0].reading?.title?.source === "jev-first-line");
+    await answered.readings.tick();
+    await answered.readings.tick();
+    assert.equal(answeredReads, 1, "a finished title reading is not read again");
+  } finally { answered.dispose(); }
+
+  // Part 4: a title job that never answers is pending, so its record is not read again.
+  let pendingCalls = 0;
+  const pending = { systemOne: async () => { pendingCalls++; return new Promise<never>(() => {}); } } as unknown as JevTransport;
+  const waiting = setup({ title: "", generatedTitle: true, prompt: longLine, lastMessage: "Short.", transport: pending, writer });
+  let waitingReads = 0;
+  waiting.manager.meta = () => { waitingReads++; return { session: waiting.session }; };
+  try {
+    await waiting.readings.tick();
+    await waiting.readings.tick();
+    await waiting.readings.tick();
+    assert.equal(waitingReads, 1, "a pending title job is not read again");
+    assert.equal(pendingCalls, 1);
+  } finally { waiting.readings.stop(); waiting.dispose(); }
 });
 
 test("failures are held briefly, list merging stays synchronous, stale hashes drop, and cache survives restart", async () => {

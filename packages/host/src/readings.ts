@@ -101,7 +101,7 @@ export class Readings {
   private readonly active = new Map<string, string>();
   private readonly latestRows = new Map<string, LatestRow>();
   private readonly latestSessions = new Map<string, LatestSession>();
-  /** Sessions that can never need a title reading: their latest snapshot, valid while the row's title is the same. */
+  /** Every listed session's latest snapshot, valid while the row's title is the same. It never holds a prompt. */
   private readonly settledSessions = new Map<string, { title: string; latest: LatestSession }>();
   private observationRevision = 0;
   private timer?: ReturnType<typeof setInterval>;
@@ -174,6 +174,18 @@ export class Readings {
     this.drain();
   }
 
+  /** True when a title job for this session would be queued now. It is the only reason to read a known session's record again. */
+  private titleDue(sessionId: string, latest: LatestSession): boolean {
+    const hash = latest.promptHash;
+    if (!this.config.jev || !this.writer || !latest.defaultTitle || latest.promptLineLength <= 60 || !hash) return false;
+    if (this.cached(sessionId, "title", hash)) return false;
+    const evaluation = this.evaluations.get(sessionId)?.title;
+    if (evaluation?.hash === hash && evaluation.outcome.kind === "failure" && evaluation.outcome.failedUntil > Date.now()) return false;
+    const pair = pairOf(sessionId, "title");
+    if (this.active.get(pair) === hash || this.queue.get(pair)?.hash === hash) return false;
+    return this.queue.size < MAX_PENDING;
+  }
+
   private observeRows(rows: ReadingRow[], source: "partial" | "snapshot" | "tick", onSession?: (row: ReadingRow, session: Session) => void) {
     this.observationRevision++;
     const incoming = new Set(rows.map(row => row.id));
@@ -191,7 +203,7 @@ export class Readings {
       this.latestRows.set(row.id, { backend: row.backend, state: row.attention.state,
         lastMessageHash: "", lastMessageLength: lastMessage.length });
       const settled = this.settledSessions.get(row.id);
-      if (settled?.title === row.title) { this.latestSessions.set(row.id, settled.latest); continue; }
+      if (settled?.title === row.title && !this.titleDue(row.id, settled.latest)) { this.latestSessions.set(row.id, settled.latest); continue; }
       let session: Session;
       try { session = this.manager.meta(row.id).session; }
       catch { this.latestSessions.delete(row.id); this.settledSessions.delete(row.id); continue; }
@@ -202,8 +214,7 @@ export class Readings {
         promptLine: line.length <= 60 ? line : clipTitle(line), promptLineLength: line.length,
         ...(titleIsDefault && prompt ? { promptHash: messageHash(prompt) } : {}) };
       this.latestSessions.set(row.id, latest);
-      if (latest.promptLineLength <= 60) this.settledSessions.set(row.id, { title: row.title, latest });
-      else this.settledSessions.delete(row.id);
+      this.settledSessions.set(row.id, { title: row.title, latest });
       onSession?.(row, session);
     }
     if (source === "partial") return;

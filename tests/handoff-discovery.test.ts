@@ -13,6 +13,7 @@ test("discovery reads a record once when its answer cannot change", async () => 
   const requests: Record<string, number> = { a: 0, b: 0, c: 0 };
   let metaFails = false;
   let listCalls = 0;
+  let listOmitsA = false;
   const policy = (id: string) => ({ sourceSessionId: id, projectId: "p", path: join(stateDir, id), commandPrefix: [] });
   const sessions: Record<string, Record<string, unknown>> = {
     a: { id: "a", projectId: "p", handoff: { reason: "No handoff capability for a." } },
@@ -22,7 +23,8 @@ test("discovery reads a record once when its answer cannot change", async () => 
   const manager = {
     async list() {
       listCalls += 1;
-      return [{ id: "a", status: "running" }, { id: "b", status: "exited" }, { id: "c", status: "running" }];
+      const rows = [{ id: "a", status: "running" }, { id: "b", status: "exited" }, { id: "c", status: "running" }];
+      return listOmitsA ? rows.slice(1) : rows;
     },
     meta(id: string) {
       reads[id] += 1;
@@ -49,11 +51,41 @@ test("discovery reads a record once when its answer cannot change", async () => 
     assert.deepEqual(reads, { a: 1, b: 1, c: 2 });
     assert.deepEqual(requests, { a: 0, b: 1, c: 2 });
 
-    assert.deepEqual(service.view("a"), { status: "unavailable", reason: "No handoff capability for a." });
+    // A listing row reads no record for a source whose answer it remembers.
+    const reasonA = "No handoff capability for a.";
+    assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: reasonA });
+    assert.deepEqual(service.listedView("b"), { status: "available" });
+    assert.deepEqual(reads, { a: 1, b: 1, c: 2 });
+    // A running source is never answered from memory.
+    const listedC = service.listedView("c");
+    assert.equal(reads.c, 4);
+    assert.deepEqual(listedC, service.view("c"));
+    // Each call returns a new object, so a caller cannot change a later answer.
+    const first = service.listedView("a");
+    Object.assign(first, { reason: "changed" });
+    assert.notEqual(first, service.listedView("a"));
+    assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: reasonA });
+
+    assert.deepEqual(service.view("a"), { status: "unavailable", reason: reasonA });
     assert.deepEqual(service.view("b"), { status: "available" });
 
     metaFails = true;
     assert.throws(() => service.view("a"), { code: "ENOENT", message: "record gone" });
+    assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: reasonA });
+
+    // A listing that no longer holds A makes the memory forget it, so the next row reads the record again.
+    listOmitsA = true;
+    const listsBefore = listCalls;
+    service.start();
+    const forgetDeadline = Date.now() + 5000;
+    while (listCalls < listsBefore + 2) {
+      if (Date.now() > forgetDeadline) throw new Error("the handoff poller did not list again");
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    service.close();
+    const readsA = reads.a;
+    assert.throws(() => service.listedView("a"), { code: "ENOENT", message: "record gone" });
+    assert.equal(reads.a, readsA + 1);
   } finally {
     service.close();
     rmSync(stateDir, { recursive: true, force: true });

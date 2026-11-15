@@ -321,7 +321,7 @@ export function createApp(config: Config, key: Buffer) {
   const usageRow = (id: string) => { const row = usage.session(id); return row.measured ? { usage: row } : {}; };
   const listSessions = async () => {
     const native = (await manager.list({ includeFullMessage: Boolean(config.jev) })).map(session => {
-      const handoff = handoffs.view(session.id);
+      const handoff = handoffs.listedView(session.id);
       const managed = managedBy(session);
       return { ...session, ...(managed ? { managedBy: managed } : {}), handoff, ...usageRow(session.id), executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id,
         resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };

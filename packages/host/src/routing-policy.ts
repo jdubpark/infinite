@@ -15,7 +15,7 @@ export const ROUTING_DEFAULTS: RoutingKnobs = {
   minSpareAttempts: 4, allowContributor: false, listWeight: 0.25, headroomWeight: 1,
 };
 /** An autonomous project without a saved policy: the read defaults with the cascade on. */
-export const AUTONOMOUS_DEFAULTS: RoutingKnobs = { ...ROUTING_DEFAULTS, cascade: true };
+export const AUTONOMOUS_DEFAULTS: RoutingKnobs = { ...ROUTING_DEFAULTS, points: [...ROUTING_DEFAULTS.points], cascade: true };
 
 const KNOB_KEYS = ["points", "cascade", "successValueUsd", "maxExploreShare", "exploreWindow", "minSpareAttempts",
   "allowContributor", "listWeight", "headroomWeight"] as const satisfies readonly (keyof RoutingKnobs)[];

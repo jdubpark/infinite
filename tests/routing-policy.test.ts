@@ -4,9 +4,9 @@ import { createHash } from "node:crypto";
 import { canonicalJson } from "../packages/host/src/evidence/crypto.js";
 import { AUTONOMOUS_DEFAULTS, ROUTING_DEFAULTS, effectiveRouting, pinRouting, policyDigest, teamRoutingSchema } from "../packages/host/src/routing-policy.js";
 import type { RoutingKnobs } from "../packages/host/src/routing-types.js";
-import type { TeamLineup } from "../packages/host/src/team-types.js";
+import { mixedLineup } from "./team-fixture.js";
 
-const lineup = {} as unknown as TeamLineup;
+const lineup = mixedLineup;
 const allKnobs = ["points", "cascade", "successValueUsd", "maxExploreShare", "exploreWindow", "minSpareAttempts", "allowContributor", "listWeight", "headroomWeight"] as const;
 
 test("the policy schema takes each knob and refuses the rest", () => {
@@ -15,9 +15,13 @@ test("the policy schema takes each knob and refuses the rest", () => {
     exploreWindow: 500, minSpareAttempts: 20, allowContributor: true, listWeight: 1, headroomWeight: 4,
   };
   assert.deepEqual(teamRoutingSchema.parse(atBounds), atBounds);
+  const atLowerBounds = { successValueUsd: 0, maxExploreShare: 0, exploreWindow: 10, minSpareAttempts: 0, listWeight: 0, headroomWeight: 0 };
+  assert.deepEqual(teamRoutingSchema.parse(atLowerBounds), atLowerBounds);
   for (const bad of [
     { successValueUsd: 100.01 }, { maxExploreShare: 0.51 }, { exploreWindow: 9 }, { minSpareAttempts: 21 },
     { listWeight: 1.1 }, { headroomWeight: 4.1 }, { points: [] }, { unknown: true }, { mode: "on" },
+    { successValueUsd: -0.01 }, { maxExploreShare: -0.01 }, { minSpareAttempts: -0.01 }, { listWeight: -0.01 },
+    { headroomWeight: -0.01 }, { exploreWindow: 10.5 }, { minSpareAttempts: 1.5 },
   ]) assert.equal(teamRoutingSchema.safeParse(bad).success, false, JSON.stringify(bad));
   assert.deepEqual(teamRoutingSchema.parse({}), {});
   assert.deepEqual(teamRoutingSchema.parse({ mode: "shadow" }), { mode: "shadow" });
@@ -33,12 +37,14 @@ test("the effective mode follows the saved mode and the project's autonomy", () 
   assert.ok(auto.mode === "shadow" && auto.requested === "auto" && auto.source === "saved");
   const defaulted = effectiveRouting(undefined, "autonomous");
   assert.ok(defaulted.mode === "shadow" && defaulted.requested === "shadow" && defaulted.source === "autonomous-default");
-  assert.equal(defaulted.mode === "shadow" && defaulted.knobs.cascade, true);
+  assert.deepEqual(defaulted, { mode: "shadow", requested: "shadow", source: "autonomous-default", knobs: AUTONOMOUS_DEFAULTS, defaults: allKnobs });
   assert.deepEqual(effectiveRouting(undefined, "supervised"), { mode: "off" });
   const valued = effectiveRouting({ successValueUsd: 8 }, "autonomous");
   assert.ok(valued.mode === "shadow" && valued.source === "saved");
-  assert.ok(valued.mode === "shadow" && valued.knobs.successValueUsd === 8);
-  assert.ok(valued.mode === "shadow" && !valued.defaults.includes("successValueUsd"));
+  assert.deepEqual(valued, {
+    mode: "shadow", requested: "shadow", source: "saved", knobs: { ...ROUTING_DEFAULTS, successValueUsd: 8 },
+    defaults: allKnobs.filter(knob => knob !== "successValueUsd"),
+  });
   assert.deepEqual(effectiveRouting({ successValueUsd: 8 }, "supervised"), { mode: "off" });
 });
 
@@ -49,6 +55,12 @@ test("a pin needs shadow, the start point, and a lineup", () => {
   const pin = pinRouting({ mode: "shadow" }, "supervised", lineup);
   assert.ok(pin);
   assert.equal(pin.mode, "shadow");
+  assert.equal(pin.requested, "shadow");
+  const autoPin = pinRouting({ mode: "auto" }, "supervised", lineup);
+  assert.ok(autoPin);
+  assert.equal(autoPin.mode, "shadow");
+  assert.equal(autoPin.requested, "auto");
+  assert.equal(autoPin.source, "saved");
   assert.equal(pin.algorithmVersion, 1);
   assert.equal(pin.rewardVersion, 1);
   assert.equal(Object.keys(pin.knobs).length, 9);

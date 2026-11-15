@@ -123,7 +123,7 @@ test("eval settings stay out of the routine approval digest", async () => {
   } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 
-test("routing settings change the routine approval digest, and their absence keeps it", async () => {
+test("routing settings change the approval digest, and their absence keeps it", async () => {
   const f = setup(); const service = f.createService();
   try {
     await service.create(f.create()); await wait(30); await service.tick();

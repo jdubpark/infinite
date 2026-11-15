@@ -504,7 +504,12 @@ Limits that remain:
   deeper body, a body that the outer shell expands, and a directory that the
   text does not establish are raised. A wrapper that the host does not know
   is raised when its words contain a command that a class rule names; that
-  search is bounded, and a request past its bounds is raised too. The search
+  search is bounded, and a request past its bounds is raised too. Options
+  between a program and its subcommand do not hide the subcommand. Interpreter
+  code is not read: code in an option, attached or combined
+  (`python3 -c'...'`, `perl -ne`, `node --eval=...`), a program piped into an
+  interpreter, and interpreter code behind a wrapper the host does not know are
+  raised. The search
   also raises some routine commands, for example a commit message that reads
   as a credential command. Those cost a strong turn and never an owner
   interrupt.

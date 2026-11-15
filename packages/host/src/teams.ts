@@ -2314,12 +2314,15 @@ export class TeamService {
   /**
    * Whether the halt can hold this run where it waits for input: it waits, and nothing is in flight that a pause would
    * have to stop (no member at work, no workspace operation, no earlier stop still draining). A permission reviewer may
-   * still run; its open reviews are invalidated and the paused run's own pass stops it.
+   * still run; its open reviews are invalidated and the paused run's own pass stops it. A member queued but never
+   * launched, such as the replacement an answer queues while the run still shows needs-input, is not in flight: it
+   * stays queued while the run is held and launches, with the answer, once the run resumes.
    */
   private waitsWithNothingInFlight(stored: Stored) {
     const run = stored.run;
+    const unlaunched = (member: TeamMember) => { try { return member.status === "queued" && !this.hasLaunch(member); } catch { return false; } };
     return run.status === "needs-input" && !stored.halt && !stored.pending && !this.commands.has(run.id) &&
-      !run.members.some(member => activeMember(member) && member.role !== "permission-coordinator");
+      !run.members.some(member => activeMember(member) && member.role !== "permission-coordinator" && !unlaunched(member));
   }
   /**
    * The owner's halt pauses one run and marks it. A working run stops through the owner's pause path. A run that waits
@@ -2417,12 +2420,19 @@ export class TeamService {
    * Host-internal: a goal's or mission's halt pauses one of its runs. Decided in this team's queue, so it sees the state
    * that every earlier operation left: only a working or waiting run is paused, and the pause and the token are saved
    * together. True when the run is paused under this token, including a replay after the owner lost its record of the
-   * first call.
+   * first call. A replay shows the reason it carries, which a release that left the owner paused may have changed.
    */
   haltPauseChild(id: string, token: string, reason: string): Promise<boolean> {
     return this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
-      if (stored.ownerHalt?.haltId === token) return run.status === "paused";
+      if (stored.ownerHalt?.haltId === token) {
+        if (run.status === "paused" && stored.ownerHalt.reason !== reason) {
+          stored.ownerHalt = { ...stored.ownerHalt, reason };
+          if (!stored.halt) run.reason = reason;
+          this.save(stored);
+        }
+        return run.status === "paused";
+      }
       if (!HALT_PAUSED_TEAM.has(run.status)) return false;
       await this.haltStop(stored, { haltId: token, reason });
       return true;

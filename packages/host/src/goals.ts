@@ -409,13 +409,15 @@ export class GoalService {
   }
   /**
    * A release that leaves the goal paused: the run its halt paused keeps its pause and shows `reason` instead of the
-   * halt's. A halt pause not yet delivered is delivered with that reason; one already delivered is updated in the run's
-   * own queue, against the token. Never throws: a failure is recorded on the goal and the release goes on.
+   * halt's. A halt pause still pending is delivered with that reason. The run is also settled in its own queue, against
+   * the token, every time: a pending pause may already be saved on the run, when a restart came between that save and
+   * the goal's acknowledgement, and its replay then finds no token and changes nothing. Never throws: a failure is
+   * recorded on the goal and the release goes on.
    */
   private async settleHaltRun(stored: Stored, mark: NonNullable<Stored["ownerHalt"]>, reason: string) {
     const run = mark.run;
     if (!run) return;
-    if (stored.control?.halt?.token === run.token) { stored.control = { ...stored.control, halt: { token: run.token, reason } }; return; }
+    if (stored.control?.halt?.token === run.token) stored.control = { ...stored.control, halt: { token: run.token, reason } };
     try { await this.teams.haltSettleChild(run.teamId, run.token, reason); }
     catch (error) {
       if (error instanceof TeamError && error.code === "team-not-found") return;

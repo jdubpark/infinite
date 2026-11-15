@@ -477,15 +477,16 @@ export class MissionService {
     });
   }
   /**
-   * Host-internal: the owner's halt pauses each planning or working mission with any repository in scope, as the
-   * owner's pause does, without an owner request, and marks it with the revision it leaves.
+   * Host-internal: the owner's halt pauses each planning, working, or waiting mission with any repository in scope, as
+   * the owner's pause does, without an owner request, and marks it with the revision it leaves. A waiting mission keeps
+   * its questions; the release settles it back to waiting while any of them is open.
    */
   haltPause(mark: HaltMark, covers: HaltCovers) {
     return this.enqueue(() => {
       const outcomes: HaltOutcome[] = [];
       for (const stored of this.records.values()) {
         const mission = stored.mission;
-        if ((mission.status !== "planning" && mission.status !== "working") || !covers(mission.repoProjectIds, mission.id)) continue;
+        if (!live.has(mission.status) || !covers(mission.repoProjectIds, mission.id)) continue;
         try {
           // Only a subteam that is working or waiting for input now: one paused, blocked, or ended stays as it is.
           const working = mission.subtasks.filter(item => {
@@ -583,21 +584,27 @@ export class MissionService {
       const decision = mission.decisions.find(item => item.id === decisionId);
       if (!decision) throw new TeamError(404, "decision-not-found", "This decision does not exist.");
       if (decision.answer) throw new TeamError(409, "decision-answered", "This decision already has an answer.");
-      if (!live.has(mission.status)) throw new TeamError(409, "mission-not-running", "Resume the mission before answering its decision.");
+      // A mission the halt paused, unchanged since, takes the answer and starts nothing: a forwarded answer reaches a
+      // subteam the halt holds, and one for the coordinator waits in its inbox, until the release resumes the mission.
+      const halted = mission.status === "paused" && stored.ownerHalt?.revision === mission.revision;
+      if (!live.has(mission.status) && !halted) throw new TeamError(409, "mission-not-running", "Resume the mission before answering its decision.");
       this.admit(stored, `answer:${decisionId}`, body);
+      // An answer is input, not a change to the halt's pause, so the release still resumes the mission.
+      if (halted) stored.ownerHalt!.revision = mission.revision;
       Object.assign(decision, { answer: body.text, answeredAt: now(), answeredBy: typeof source === "object" ? "connector" : "owner", ...(typeof source === "object" ? { source } : {}) });
       stored.ownerInputs = (stored.ownerInputs ?? 0) + 1;
       const subtask = decision.subtaskId ? mission.subtasks.find(item => item.id === decision.subtaskId) : undefined;
       const message = { ...(typeof source === "object" ? { type: "connector-answer" as const, source } : { type: "owner-answer" as const }), decisionId, question: decision.question, answer: body.text };
+      const later = halted ? " It takes effect when the mission resumes." : "";
       if (decision.childDecisionId && subtask?.teamId) {
         this.queueOp(stored, { kind: "answer", subtaskId: subtask.id, teamId: subtask.teamId, decisionId: decision.childDecisionId, text: body.text, by: typeof source === "object" ? "connector" : "owner", ...(typeof source === "object" ? { source } : {}) });
         stored.notes.push({ ...message, forwardedTo: { subtaskId: subtask.id, childDecisionId: decision.childDecisionId } });
-        this.event(stored, typeof source === "object" ? `${inputSourceLabel(source)} answered a question; the delegated answer is being forwarded to subtask ${subtask.id}.` : source === "slack"
+        this.event(stored, (typeof source === "object" ? `${inputSourceLabel(source)} answered a question; the delegated answer is being forwarded to subtask ${subtask.id}.` : source === "slack"
           ? `The owner answered a question from Slack; the answer is being forwarded to subtask ${subtask.id}.`
-          : `The owner answered a question; the answer is being forwarded to subtask ${subtask.id}.`);
+          : `The owner answered a question; the answer is being forwarded to subtask ${subtask.id}.`) + later);
       } else {
         stored.inbox.push(message);
-        this.event(stored, typeof source === "object" ? `${inputSourceLabel(source)} answered the coordinator question; this is delegated agent input.` : source === "slack" ? "The owner answered the coordinator's question from Slack." : "The owner answered the coordinator's question.");
+        this.event(stored, (typeof source === "object" ? `${inputSourceLabel(source)} answered the coordinator question; this is delegated agent input.` : source === "slack" ? "The owner answered the coordinator's question from Slack." : "The owner answered the coordinator's question.") + later);
       }
       this.settle(stored);
       this.save(stored); return this.view(stored);

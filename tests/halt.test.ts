@@ -532,6 +532,36 @@ test("a halt pauses a run that waits for input where it stands: an answer during
   } finally { halt.stop(); f.close(); }
 });
 
+test("a halt holds a run whose answer queued a replacement that has not launched, and the release launches it with the answer", async () => {
+  const f = schedulerFixture();
+  const waiting = waitingRun(f);
+  const teams = f.openTeam();
+  const halt = new HaltService({ config: f.config, key: f.key });
+  halt.useServices({ routines: noRoutines, goals: noRoutines, missions: noRoutines, teams }, () => false);
+  try {
+    // The owner answers before the halt; the next pass queues the replacement while the run still shows needs-input.
+    await teams.answer(waiting.id, waiting.decisionId, { requestId: randomUUID(), revision: 1, text: "Change a.txt" });
+    await step(teams, waiting.id);
+    assert.equal(teams.get(waiting.id).status, "needs-input");
+    assert.deepEqual(teams.get(waiting.id).members.map(member => member.status), ["stopped", "queued"]);
+    assert.equal(f.launches.length, 0);
+
+    await halt.engage(fixtureScope, { requestId: randomUUID() }, owner);
+    await step(teams, waiting.id); await step(teams, waiting.id);
+    assert.equal(teams.get(waiting.id).status, "paused");
+    assert.equal(teams.get(waiting.id).reason, PROJECT_TEXT);
+    assert.equal(teams.get(waiting.id).members[1]!.status, "queued", "the queued replacement is held, not stopped");
+    assert.equal(f.launches.length, 0, "and does not launch during the halt");
+
+    await halt.release(fixtureScope, { requestId: randomUUID() }, owner);
+    assert.equal(teams.get(waiting.id).status, "needs-input", "the release resumes the run where it waited");
+    assert.equal(teams.get(waiting.id).revision, 1, "without a fresh plan");
+    await step(teams, waiting.id);
+    assert.equal(f.launches.length, 1, "the replacement launches after the release");
+    assert.match(f.launches[0]!.prompt, /User answered: Change a\.txt/, "with the answer");
+  } finally { halt.stop(); f.close(); }
+});
+
 test("a goal whose team waits for input is paused by the halt, and the release resumes the team with its question", async () => {
   const f = schedulerFixture();
   const goalId = randomUUID();
@@ -565,6 +595,43 @@ test("a goal whose team waits for input is paused by the halt, and the release r
     assert.equal(teams.get(team.id).revision, 1);
     assert.equal(teams.get(team.id).decisions[0]!.answer, "Change a.txt", "the answer given during the halt is kept");
   } finally { halt.stop(); goals.close(); f.close(); }
+});
+
+test("a keep-paused release settles a goal's run that saved the halt's pause just before a restart lost the goal's acknowledgement", async () => {
+  const f = schedulerFixture();
+  const teamId = writeRun(f, { status: "implementing", title: "Goal cycle" });
+  const goal = writeGoal(f, teamId);
+  const open = () => {
+    const teams = f.openTeam(), goals = new GoalService(f.config, f.key, teams);
+    const halt = new HaltService({ config: f.config, key: f.key });
+    halt.useServices({ routines: noRoutines, goals, missions: noRoutines, teams }, id => goals.ownsActiveTeam(id));
+    return { teams, goals, halt, close: () => { halt.stop(); goals.close(); } };
+  };
+  const first = open();
+  let second: ReturnType<typeof open> | undefined;
+  try {
+    await first.halt.engage(fixtureScope, { requestId: randomUUID() }, owner);
+    // The host stops right after the run saves the goal's halt pause, before the goal records that the pause arrived.
+    const internal = first.teams as unknown as { haltPauseChild(id: string, token: string, reason: string): Promise<boolean> };
+    const deliver = internal.haltPauseChild.bind(first.teams);
+    internal.haltPauseChild = async (id, token, reason) => { await deliver(id, token, reason); throw new Error("The host stopped."); };
+    await assert.rejects(goalStep(first.goals, goal), /The host stopped/);
+    assert.equal(f.readRecord<{ run: TeamRun }>("team", teamId).run.status, "paused");
+    assert.ok(f.readRecord<{ control?: unknown }>("goal", goal).control, "the goal still holds its pause as pending");
+    first.close();
+
+    second = open();
+    await step(second.teams, teamId);
+    assert.equal(second.teams.get(teamId).reason, PROJECT_TEXT, "the run's members have stopped under the halt");
+    await second.halt.release(fixtureScope, { requestId: randomUUID(), keepPaused: true }, owner);
+    assert.equal(second.goals.get(goal).reason, KEPT_PAUSED);
+    assert.equal(second.teams.get(teamId).reason, KEPT_PAUSED, "the release settles the run that already holds the pause");
+    assert.ok(f.readRecord<{ control?: unknown }>("goal", goal).control, "the pending pause is kept until the run acknowledges it");
+    await goalStep(second.goals, goal);
+    assert.equal(f.readRecord<{ control?: unknown }>("goal", goal).control, undefined);
+    assert.equal(second.teams.get(teamId).status, "paused");
+    assert.equal(second.teams.get(teamId).reason, KEPT_PAUSED, "and the replayed pause leaves the kept-paused text");
+  } finally { first.close(); second?.close(); f.close(); }
 });
 
 /**
@@ -766,7 +833,7 @@ function missionWithSubteam(f: Fixture, missionId: string) {
   const teams = f.openTeam();
   const manager = { meta: () => { throw Object.assign(new Error("No session."), { code: "ENOENT" }); }, hostLoad: { held: () => undefined } } as unknown as Manager;
   const missions = new MissionService(f.config, f.key, manager, teams, { get: () => { throw new Error("Not queried in this test"); } });
-  const stored = (missions as unknown as { records: Map<string, { ops: { kind: string; teamId: string; halt?: unknown }[]; ownerHalt?: { token: string; children: string[] } }> }).records.get(missionId)!;
+  const stored = (missions as unknown as { records: Map<string, { mission: Mission; ops: { kind: string; teamId: string; halt?: unknown }[]; ownerHalt?: { token: string; children: string[] } }> }).records.get(missionId)!;
   const halt = new HaltService({ config: f.config, key: f.key });
   halt.useServices({ routines: noRoutines, goals: noRoutines, missions, teams }, id => missions.ownsActiveSubteam(id));
   return { teams, missions, halt, stored, applyOps: () => (missions as unknown as { applyOps(stored: unknown): Promise<void> }).applyOps(stored), close: () => { halt.stop(); missions.close(); } };
@@ -814,5 +881,48 @@ test("a release that ends a mission's halt mark retires the halt's undelivered p
     await applyOps(); await step(teams, teamId);
     assert.equal(teams.get(teamId).status, "paused", "the kept mission pauses its subteam the way the owner's pause of a mission does");
     assert.equal(teams.get(teamId).reason, undefined, "no halt claims the pause once the halt is off");
+  } finally { close(); f.close(); }
+});
+
+test("a mission that waits for the owner is paused by the halt; an owner answer during the halt starts nothing, and the release applies it", async () => {
+  const f = schedulerFixture();
+  const missionId = randomUUID(), child = waitingRun(f, { missionId, title: "Subteam" } as Partial<TeamRun>);
+  writeMission(f, "fixture", [{ id: "a", title: "a", instructions: "a", repoProjectId: "fixture", dependsOn: [], size: "team", status: "running", teamId: child.id }], missionId);
+  const { teams, missions, halt, stored, applyOps, close } = missionWithSubteam(f, missionId);
+  try {
+    // The coordinator forwards the subteam's question to the owner and asks one of its own, through its question reports.
+    const coordinator = missions as unknown as { consume(stored: unknown, report: unknown, attempt: unknown): void };
+    coordinator.consume(stored, { kind: "question", question: "Which file should change?", options: ["a.txt", "b.txt"], subtaskId: "a", childDecisionId: child.decisionId }, {});
+    coordinator.consume(stored, { kind: "question", question: "Ship it this week?", options: [] }, {});
+    const asked = missions.get(missionId);
+    assert.equal(asked.status, "needs-input");
+    const [forwarded, own] = asked.decisions;
+    assert.equal(forwarded!.childDecisionId, child.decisionId);
+
+    const engaged = await halt.engage(fixtureScope, { requestId: randomUUID() }, owner);
+    assert.deepEqual(engaged.paused.map(item => item.kind), ["mission"], "a mission that waits for the owner is paused");
+    await applyOps();
+    assert.equal(teams.get(child.id).status, "paused", "and pauses its waiting subteam");
+
+    // The owner answers the forwarded question during the halt: the answer reaches the held subteam, and nothing starts.
+    const answered = await missions.answer(missionId, forwarded!.id, { requestId: randomUUID(), revision: missions.get(missionId).revision, text: "Change a.txt" });
+    assert.equal(answered.status, "paused");
+    assert.equal(answered.decisions[0]!.answeredBy, "owner");
+    await applyOps();
+    await step(teams, child.id); await step(teams, child.id);
+    assert.equal(teams.get(child.id).decisions[0]!.answer, "Change a.txt");
+    assert.equal(teams.get(child.id).status, "paused");
+    assert.equal(f.launches.length, 0, "an answer given during the halt starts nothing");
+
+    const released = await halt.release(fixtureScope, { requestId: randomUUID() }, owner);
+    assert.deepEqual(released.resumed.map(item => item.kind), ["mission"], "an answer does not keep the mission paused");
+    assert.equal(missions.get(missionId).status, "needs-input", "the mission waits again on its open question");
+    assert.equal(missions.get(missionId).decisions.find(item => item.id === own!.id)!.answer, undefined);
+    await applyOps();
+    assert.equal(teams.get(child.id).status, "needs-input", "the subteam resumes where it waited");
+    assert.equal(teams.get(child.id).revision, 1);
+    await step(teams, child.id); await step(teams, child.id);
+    assert.equal(f.launches.length, 1, "after the release the answer starts the subteam member's next attempt");
+    assert.match(f.launches[0]!.prompt, /User answered: Change a\.txt/);
   } finally { close(); f.close(); }
 });

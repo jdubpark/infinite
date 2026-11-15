@@ -296,7 +296,9 @@ order as the mission moves:
   this line and the reply to a finished request say
   `Mention me in this thread to file a follow-up.` instead;
 - an edit note when the Linear issue changes after the run started. The run keeps
-  the original text.
+  the original text. For a request the host files itself, an edit is detected
+  against the text the tracker returned at filing, because the tracker may
+  reformat links.
 
 Text leaves the host only after a filter. A `file://` URL, and a path that starts
 with a configured directory (`stateDir`, `runDir`, `teams.workspaceDir`, or a

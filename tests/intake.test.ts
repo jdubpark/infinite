@@ -965,6 +965,80 @@ test("a direct request files one issue and starts a mission whose objective mark
   } finally { await ctx.close(); }
 });
 
+const markdownLink = (url: string) => `[${url}](<${url}>)`;
+
+test("a direct request whose tracker rewrites the link is not reported as edited", { timeout: 60000 }, async () => {
+  const ctx = await setup({ requireSlackThread: false });
+  try {
+    ctx.linearServer.rewriteLinks(true);
+    const request = direct(ctx);
+    assert.equal(ctx.intake.requestFromSlack(request), "accepted");
+    await ctx.intake.poll();
+    await ctx.intake.poll();
+    const [issue] = ctx.linearServer.allIssues();
+    const url = `https://example.slack.com/archives/C0000000000/p${request.ts.replace(".", "")}`;
+    const record = ctx.store.get(issue.id)!;
+    assert.equal(record.state, "started");
+    assert.ok(record.description.endsWith(`Filed from Slack by the owner: ${url}`), "The record keeps the host's own text");
+    assert.equal(record.editNotedAt, undefined, "The tracker's reformatting is not an edit");
+    assert.ok(record.tracked?.description.endsWith(markdownLink(url)));
+  } finally { await ctx.close(); }
+});
+
+test("a direct request edited in the tracker after it started is still reported once", { timeout: 60000 }, async () => {
+  const ctx = await setup({ requireSlackThread: false });
+  try {
+    ctx.linearServer.rewriteLinks(true);
+    assert.equal(ctx.intake.requestFromSlack(direct(ctx)), "accepted");
+    await ctx.intake.poll();
+    const [issue] = ctx.linearServer.allIssues();
+    assert.equal(ctx.store.get(issue.id)!.editNotedAt, undefined);
+    ctx.linearServer.edit(issue.id, { description: "A teammate rewrote this" });
+    await ctx.intake.poll();
+    const noted = ctx.store.get(issue.id)!.editNotedAt;
+    assert.ok(noted, "The edit is noted");
+    ctx.linearServer.edit(issue.id, { description: "A second rewrite" });
+    await ctx.intake.poll();
+    assert.equal(ctx.store.get(issue.id)!.editNotedAt, noted, "The note is set once");
+  } finally { await ctx.close(); }
+});
+
+test("a direct record saved without the tracked text adopts the tracker's text instead of reporting an edit", { timeout: 60000 }, async () => {
+  const ctx = await setup({ requireSlackThread: false });
+  try {
+    ctx.linearServer.rewriteLinks(true);
+    assert.equal(ctx.intake.requestFromSlack(direct(ctx)), "accepted");
+    await ctx.intake.poll();
+    const [issue] = ctx.linearServer.allIssues();
+    // As an older host stored it: the host's own text and no tracked text.
+    ctx.store.update(issue.id, next => { delete next.tracked; });
+    await ctx.intake.poll();
+    const adopted = ctx.store.get(issue.id)!;
+    assert.equal(adopted.editNotedAt, undefined);
+    const url = `https://example.slack.com/archives/C0000000000/p${adopted.direct!.ts.replace(".", "")}`;
+    assert.deepEqual(adopted.tracked, { title: issue.title, description: `${adopted.description.replace(url, markdownLink(url))}` });
+    ctx.linearServer.edit(issue.id, { description: "A teammate rewrote this" });
+    await ctx.intake.poll();
+    assert.ok(ctx.store.get(issue.id)!.editNotedAt, "A later edit is noted");
+  } finally { await ctx.close(); }
+});
+
+test("an issue filed through the tracker's own agent keeps the existing edit check", { timeout: 60000 }, async () => {
+  const ctx = await setup();
+  try {
+    ctx.linearServer.rewriteLinks(true);
+    const issue = ctx.issue({ description: "See https://example.com/a for details" });
+    await ctx.intake.poll();
+    await ctx.intake.poll();
+    const record = ctx.store.get(issue.id)!;
+    assert.equal(record.tracked, undefined, "Only a request the host files itself carries tracked text");
+    assert.equal(record.editNotedAt, undefined, "Unchanged text gives no note");
+    ctx.linearServer.edit(issue.id, { description: "A changed description" });
+    await ctx.intake.poll();
+    assert.ok(ctx.store.get(issue.id)!.editNotedAt, "Changed text gives a note");
+  } finally { await ctx.close(); }
+});
+
 test("directObjective keeps a forged marker after every line-break character inside another person's message", () => {
   const breaks = ["\r\n", "\r", "\u000B", "\u000C", "\u0085", "\u2028", "\u2029", "\n"];
   for (const lineBreak of breaks) {

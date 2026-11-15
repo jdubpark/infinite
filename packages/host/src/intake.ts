@@ -501,6 +501,7 @@ export class IntakeService {
     this.store.update(record.issueId, next => {
       // The owner's own text, not what the tracker returns: a teammate may have edited the issue since it was created.
       Object.assign(next, this.facts(issue), { title: record.title, description });
+      next.tracked = { title: issue.title, description: issue.description };
       next.direct = { ...direct, filedAt: new Date().toISOString() };
       next.rule = "owner Slack mention of the bot";
       next.request = request;
@@ -664,8 +665,16 @@ export class IntakeService {
 
   private async watchRecord(record: IntakeRecord, current: IntakeIssue | "deleted" | undefined): Promise<void> {
     if (current === undefined) return;
-    if (current !== "deleted" && (current.title !== record.title || current.description !== record.description)) {
-      this.store.update(record.issueId, next => { next.editNotedAt ??= new Date().toISOString(); });
+    if (current !== "deleted") {
+      if (record.tracked === undefined && record.direct && !record.editNotedAt) {
+        // A direct record an older host saved: the tracker's current text is the baseline, since the host's own text may differ in form.
+        const baseline = { title: current.title, description: current.description };
+        this.store.update(record.issueId, next => { next.tracked ??= baseline; });
+      } else {
+        const seen = record.tracked ?? { title: record.title, description: record.description };
+        if (current.title !== seen.title || current.description !== seen.description)
+          this.store.update(record.issueId, next => { next.editNotedAt ??= new Date().toISOString(); });
+      }
     }
     const reason = current === "deleted" ? closedReasons.deleted
       : current.archivedAt !== null ? closedReasons.archived

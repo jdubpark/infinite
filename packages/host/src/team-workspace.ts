@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { closeSync, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, realpathSync } from "node:fs";
@@ -24,11 +25,31 @@ export function teamCommandEnvironment(): NodeJS.ProcessEnv {
 export function teamGitArgs(cwd: string, args: string[]) {
   return ["-c", `safe.directory=${cwd}`, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", "-c", "user.name=Infinite", "-c", "user.email=agent@example.invalid", ...args];
 }
+/** What an operation learns about the commands started inside its scope. Outside a scope nothing is reported. */
+export interface CommandScope {
+  /** Before a command starts. The command waits for a returned promise and does not start when it rejects. */
+  starting(): Promise<void> | undefined;
+  /** Right after the start, once for each `starting`: the child's pid, or undefined when no process was started. The child leads its own session and process group. */
+  started(pid: number | undefined): void;
+}
+export const commandScope = new AsyncLocalStorage<CommandScope>();
 /** Commands are argv arrays, from owner configuration or an explicitly authorized plan. */
 export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand, input?: string): Promise<CommandResult> {
+  const scope = commandScope.getStore(), ready = scope?.starting();
+  const run = () => runTeamCommand(scope, command, cwd, signal, timeoutMs, prefix, input);
+  return ready ? ready.then(run) : run();
+}
+function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, cwd: string, signal: AbortSignal | undefined, timeoutMs: number, prefix: TeamCommand | undefined, input: string | undefined): Promise<CommandResult> {
   return new Promise((resolveResult, reject) => {
     const env = teamCommandEnvironment();
-    const child = spawn(prefix?.command ?? command.command, prefix ? [...prefix.args, command.command, ...command.args] : command.args, { cwd, env, stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(prefix?.command ?? command.command, prefix ? [...prefix.args, command.command, ...command.args] : command.args, { cwd, env, stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
+    } catch (error) {
+      scope?.started(undefined);
+      throw error;
+    }
+    scope?.started(child.pid);
     let output = "", stdout = "", interrupted = false, settled = false, truncated = false;
     const stop = () => {
       interrupted = true;

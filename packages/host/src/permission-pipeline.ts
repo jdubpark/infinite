@@ -6,7 +6,7 @@
  * locked assignment, replay a recorded verdict or force the strong tier. No host rule allows: an
  * allow is recorded only from a model turn that the host validated, or replayed from one.
  */
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { PermissionReviewHeld } from "./permission-agent-types.js";
 import type {
   PermissionAgentCore,
@@ -40,16 +40,11 @@ import {
   type RejectCode,
 } from "./permission-policy.js";
 import { TeamError } from "./team-workspace.js";
-import { haltChain } from "./halt/record.js";
 
 const MODULE = "permission-pipeline";
 const JOURNAL_MODULE = "permission-journal";
 const DECISIONS = "permission_pipeline_decisions";
 const RECEIPTS = "permission_pipeline_receipts";
-const HALTS = "permission_pipeline_halts";
-const HALT_COUNT = "permission_pipeline_halt_count";
-/** More halts than this counted at once, without a recorded count between, are not checked one by one. */
-const MAX_UNCOUNTED = 10_000;
 const MAX_TEXT = 2_000;
 
 const sha256 = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -64,9 +59,9 @@ const isHostCode = (code: string | undefined) => (HOST_REJECT_CODES as readonly 
  */
 export const permissionPipelineModule: EvidenceModule = {
   name: MODULE,
-  version: 4,
-  readVersion: 4,
-  migrate(tx: EvidenceTx, from: number) {
+  version: 1,
+  readVersion: 1,
+  migrate(tx: EvidenceTx) {
     tx.exec(
       `CREATE TABLE IF NOT EXISTS ${DECISIONS} (`
       + "seq INTEGER PRIMARY KEY AUTOINCREMENT, decision_id TEXT NOT NULL UNIQUE, at TEXT NOT NULL, "
@@ -78,23 +73,8 @@ export const permissionPipelineModule: EvidenceModule = {
       `CREATE TABLE IF NOT EXISTS ${RECEIPTS} (`
       + "request_id TEXT PRIMARY KEY, at TEXT NOT NULL, fingerprint TEXT NOT NULL, result_json TEXT NOT NULL)",
     );
-    // Version 2: every owner halt the pipeline has seen. A halt ends the authority of the decisions made before it.
-    tx.exec(
-      `CREATE TABLE IF NOT EXISTS ${HALTS} (`
-      + "seq INTEGER PRIMARY KEY AUTOINCREMENT, halt_id TEXT NOT NULL UNIQUE, project_id TEXT, at TEXT NOT NULL)",
-    );
-    // Version 4: how many of the halt record's engaged halts the pipeline has accounted for, and the chain over
-    // their ids. A version-3 count had no chain, so it is dropped and counted again.
-    if (from === 3) tx.exec(`DROP TABLE IF EXISTS ${HALT_COUNT}`);
-    tx.exec(`CREATE TABLE IF NOT EXISTS ${HALT_COUNT} (id INTEGER PRIMARY KEY CHECK (id = 1), chain TEXT NOT NULL, engaged INTEGER NOT NULL)`);
-    // Decisions stored before this count was kept may predate a halt that was never recorded: they lose their authority.
-    if (from > 0 && from < 4)
-      tx.run(`INSERT OR IGNORE INTO ${HALTS} (halt_id,project_id,at) VALUES (?,?,?)`, "upgrade:4", null, new Date().toISOString());
   },
 };
-
-/** How many halts a halt record has engaged, and the chain over their ids (empty for none). */
-type HaltCounted = { chain: string; engaged: number };
 
 type DecisionRow = { decision_id: string; project_id: string; task_id: string; authority_hash: string };
 
@@ -146,37 +126,6 @@ export class PermissionPipelineState {
     return row && { fingerprint: row.fingerprint, result: JSON.parse(row.result_json) as unknown };
   }
 
-  /** Records one period of an owner halt in force, under an epoch id of its own. `projectId` is absent for a host halt. */
-  noteHalt(epochId: string, projectId: string | undefined, at: string): void {
-    this.store.write(tx => {
-      tx.run(`INSERT OR IGNORE INTO ${HALTS} (halt_id,project_id,at) VALUES (?,?,?)`, epochId, projectId ?? null, at);
-    });
-  }
-
-  /** How many of the halt record's engaged halts are accounted for, and their chain; undefined before the first count. */
-  haltsCounted(): HaltCounted | undefined {
-    const row = this.store.read(db => db.get<{ chain: string; engaged: number }>(`SELECT chain,engaged FROM ${HALT_COUNT} WHERE id=1`));
-    return row && { chain: row.chain, engaged: row.engaged };
-  }
-
-  /** Records the count, with a halt of every project in the same write when some engaged halt went unrecorded. */
-  countHalts(counted: HaltCounted, missed?: { haltId: string; at: string }): void {
-    this.store.write(tx => {
-      if (missed) tx.run(`INSERT OR IGNORE INTO ${HALTS} (halt_id,project_id,at) VALUES (?,?,?)`, missed.haltId, null, missed.at);
-      tx.run(
-        `INSERT INTO ${HALT_COUNT} (id,chain,engaged) VALUES (1,?,?) ON CONFLICT(id) DO UPDATE SET chain=excluded.chain, engaged=excluded.engaged`,
-        counted.chain, counted.engaged,
-      );
-    });
-  }
-
-  /** The latest recorded halt that covered the project, a host halt included. */
-  haltEpoch(projectId: string): string | undefined {
-    return this.store.read(db => db.get<{ halt_id: string }>(
-      `SELECT halt_id FROM ${HALTS} WHERE project_id IS NULL OR project_id=? ORDER BY seq DESC LIMIT 1`, projectId,
-    ))?.halt_id;
-  }
-
   saveReceipt(requestId: string, at: string, fingerprint: string, result: unknown): void {
     this.store.write(tx => {
       tx.run(
@@ -216,19 +165,14 @@ export interface HostPermissionPipelineOptions {
   state: PermissionPipelineState;
   /** Whether an owner halt covers the project now. Under a halt nothing is decided and nothing is delivered. */
   halted?: (projectId: string) => boolean;
-  /** The owner halts in force now, or undefined when the halt record cannot be read. */
-  halts?: () => readonly PermissionHaltMark[] | undefined;
   /**
-   * How many halts the halt record has engaged in all and the chain over their ids, or undefined when it cannot be
-   * read. A halt it counts that the pipeline did not record, also one released before a restart, and a record whose
-   * history differs from the one counted (replaced, removed or restored from an older copy) count for every project.
+   * The project's halt epoch: it changes at every engage and every release of a halt that covers the project, and is
+   * undefined while the halt record cannot be read. It is part of each decision's authority, so a verdict reached
+   * before a halt or its release no longer applies after it.
    */
-  haltCount?: () => { count: number; chain: string } | undefined;
+  haltEpoch?: (projectId: string) => string | undefined;
   now?: () => number;
 }
-
-/** An owner halt in force: its id, the project it covers (absent for a host halt), and its place in the halt count. */
-export interface PermissionHaltMark { haltId: string; projectId?: string; serial?: number }
 
 export class HostPermissionPipeline implements PermissionPipeline {
   private readonly core: PermissionAgentCore;
@@ -236,23 +180,7 @@ export class HostPermissionPipeline implements PermissionPipeline {
   private readonly delegation: Coverage;
   private readonly state: PermissionPipelineState;
   private readonly haltedOf: ((projectId: string) => boolean) | undefined;
-  private readonly haltsOf: (() => readonly PermissionHaltMark[] | undefined) | undefined;
-  private readonly haltCountOf: (() => { count: number; chain: string } | undefined) | undefined;
-  /**
-   * The halts in force at the last read whose period is recorded, and each project's latest halt epoch. A halt that
-   * comes into force, also again under the same id (an older copy of the halt record restored), and every halt in
-   * force at the first read after a restart, start a new period. A halt's own scope decides nothing while it lasts,
-   * so a new period of a halt that never ended retires nothing more.
-   */
-  private readonly inForce = new Set<string>();
-  private readonly epochs = new Map<string, string | undefined>();
-  /** Halts seen but not yet recorded. Kept after the release, and nothing is served until each is recorded. */
-  private readonly unrecorded = new Map<string, PermissionHaltMark>();
-  /** The recorded count, read once (null before the first count), and the id at each place recorded since. */
-  private counted: HaltCounted | null | undefined;
-  private readonly countedSerials = new Map<number, string>();
-  /** A halt record seen to differ from the count, not yet recorded as a halt of every project. Kept until it is. */
-  private missedPending = false;
+  private readonly haltEpochOf: ((projectId: string) => string | undefined) | undefined;
   private readonly clock: () => number;
   /** One decision per request: a delivery retry while a review runs joins it instead of starting another. */
   private readonly inFlight = new Map<string, Promise<PermissionOutcome>>();
@@ -263,83 +191,20 @@ export class HostPermissionPipeline implements PermissionPipeline {
     this.delegation = options.delegation;
     this.state = options.state;
     this.haltedOf = options.halted;
-    this.haltsOf = options.halts;
-    this.haltCountOf = options.haltCount;
+    this.haltEpochOf = options.haltEpoch;
     this.clock = options.now ?? Date.now;
   }
 
   /**
-   * Records the owner halts in force. A halt ends the authority that earlier decisions were made under, as a
-   * new owner act does: a verdict reached before or during it is never delivered, and after the release the
-   * same request is decided again from current evidence. The host calls this before it acknowledges a halt;
-   * every coverage read calls it too. A halt that cannot be recorded is kept, also after its release, and nothing
-   * is served until it is recorded. False while one is unrecorded or the halt count does not agree.
+   * The coverage with the project's halt epoch in its authority. A halt ends the authority that earlier decisions
+   * were made under, as a new owner act does, and so does its release: a verdict reached before or during a halt is
+   * never delivered, and after the release the same request is decided again from current evidence. Undefined while
+   * the epoch cannot be read.
    */
-  observeHalts(): boolean {
-    // The count and the halts in force are read together, so each halt's place belongs to the record that was read.
-    let count: { count: number; chain: string } | undefined;
-    try { count = this.haltCountOf?.(); } catch { count = undefined; }
-    let active: readonly PermissionHaltMark[] | undefined;
-    try { active = this.haltsOf?.(); } catch { active = undefined; }
-    if (active) for (const haltId of [...this.inForce]) if (!active.some(mark => mark.haltId === haltId)) this.inForce.delete(haltId);
-    for (const mark of active ?? []) if (!this.inForce.has(mark.haltId) && !this.unrecorded.has(mark.haltId)) this.unrecorded.set(mark.haltId, mark);
-    for (const [haltId, mark] of [...this.unrecorded]) {
-      try {
-        this.state.noteHalt(`${haltId}:${randomUUID()}`, mark.projectId, this.timestamp());
-        if (active?.some(item => item.haltId === haltId)) this.inForce.add(haltId);
-        if (mark.serial !== undefined) this.countedSerials.set(mark.serial, haltId);
-        this.unrecorded.delete(haltId);
-        this.epochs.clear();
-      } catch { /* Kept until it is recorded. */ }
-    }
-    if (this.unrecorded.size > 0) return false;
-    if (!this.haltCountOf) return true;
-    return count !== undefined && this.countHalts({ chain: count.chain, engaged: count.count });
-  }
-
-  /**
-   * Brings the recorded halt count up to the halt record's. Every halt counted since the recorded count must be one
-   * this process recorded, and the chain over their ids must lead from the recorded chain to the record's. A halt it
-   * did not record (engaged and released between two reads, or before a restart), a count that went down, and a
-   * chain that does not follow (a record replaced, removed, or restored from an older copy) are recorded as a halt
-   * of every project; one seen and not yet recorded is kept until it is. True when the counts agree.
-   */
-  private countHalts(current: HaltCounted): boolean {
-    if (!Number.isSafeInteger(current.engaged) || current.engaged < 0) return false;
-    try {
-      if (this.counted === undefined) this.counted = this.state.haltsCounted() ?? null;
-      const prior = this.counted;
-      if (!this.missedPending && prior && prior.engaged === current.engaged && prior.chain === current.chain) return true;
-      if (!this.missedPending && prior) {
-        if (current.engaged < prior.engaged || current.engaged - prior.engaged > MAX_UNCOUNTED) this.missedPending = true;
-        else {
-          let chain = prior.chain;
-          for (let serial = prior.engaged + 1; serial <= current.engaged && !this.missedPending; serial++) {
-            const haltId = this.countedSerials.get(serial);
-            if (haltId === undefined) this.missedPending = true;
-            else chain = haltChain(chain, haltId);
-          }
-          if (chain !== current.chain) this.missedPending = true;
-        }
-      }
-      const haltId = this.missedPending ? `unrecorded:${randomUUID()}` : undefined;
-      this.state.countHalts(current, haltId === undefined ? undefined : { haltId, at: this.timestamp() });
-      this.counted = current;
-      this.missedPending = false;
-      this.countedSerials.clear();
-      if (haltId !== undefined) this.epochs.clear();
-      return true;
-    } catch {
-      this.counted = undefined;
-      return false;
-    }
-  }
-
-  /** The coverage with its authority narrowed to the latest halt recorded for the project. */
-  private underHalts(coverage: Covered): Covered {
-    if (!this.epochs.has(coverage.projectId)) this.epochs.set(coverage.projectId, this.state.haltEpoch(coverage.projectId));
-    const epoch = this.epochs.get(coverage.projectId);
-    return epoch === undefined ? coverage : { ...coverage, authorityHash: sha256(["permission-authority", coverage.authorityHash, epoch]) };
+  private underHalts(coverage: Covered): Covered | undefined {
+    if (!this.haltEpochOf) return coverage;
+    const epoch = this.haltEpochOf(coverage.projectId);
+    return epoch === undefined ? undefined : { ...coverage, authorityHash: sha256(["permission-authority", coverage.authorityHash, epoch]) };
   }
 
   /** A halt that cannot be read counts as a halt. */
@@ -361,9 +226,9 @@ export class HostPermissionPipeline implements PermissionPipeline {
     catch { return { served: false, reason: "not-covered" }; }
     if (!coverage.covered) return { served: false, reason: "not-covered" };
     if (!this.ready()) return { served: false, reason: "not-ready" };
-    if (!this.observeHalts()) return { served: false, reason: "not-ready" };
-    try { return { served: true, coverage: this.underHalts(coverage) }; }
-    catch { return { served: false, reason: "not-ready" }; }
+    let halted: Covered | undefined;
+    try { halted = this.underHalts(coverage); } catch { halted = undefined; }
+    return halted ? { served: true, coverage: halted } : { served: false, reason: "not-ready" };
   }
 
   serves(projectId: string): PermissionServed {

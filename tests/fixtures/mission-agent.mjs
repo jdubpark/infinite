@@ -31,6 +31,8 @@ async function coordinator() {
   const state = json("Mission state (JSON): "), messages = json("Messages since your last attempt (JSON): ");
   const held = prompt.includes("HOLD-SUBTEAM"), refusal = messages.find(message => message.type === "refused")?.reason ?? "";
   const step = (id, repoProjectId, dependsOn) => ({ id, repoProjectId, title: id, objective: "HOLD-SUBTEAM", size: "solo", dependsOn });
+  // An answer-mode mission has no subteam: the coordinator reports the answer itself.
+  if (prompt.includes("ANSWER-DIRECT") && messages.some(message => message.type === "start")) { await report({ kind: "result", summary: "Rows 14, 90 and 212 were empty." }); return; }
   // Answer-only missions: the resumed attempt's prompt omits the objective, so the state's subtask objective marks it too.
   if (prompt.includes("ANSWER-ONLY") || state.subtasks.some(subtask => subtask.objective === "NO-CHANGE-ANSWER")) {
     const answered = messages.find(message => message.type === "subtask-finished" && message.report);

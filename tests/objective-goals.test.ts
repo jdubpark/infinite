@@ -495,6 +495,24 @@ test("the digest skips with its reason and never throws", () => {
   assert.deepEqual(goalRecordDigest({ goal, objectiveRecord: commanded }, [{ command: process.execPath } as TeamCommand]), { skipped: "record-unavailable" });
 });
 
+test("a create with criteria is refused when its record cannot be built", async () => {
+  const f = fixture(), teams = f.openTeam();
+  try {
+    const goals = new GoalService(f.config, f.key, teams);
+    // Each path is 300 control characters: valid by the path schema, but the record's JSON is over its 32 KiB cap.
+    const control = String.fromCharCode(1).repeat(300);
+    const request = createInput({ allowedPaths: Array.from({ length: 20 }, () => control) });
+    await assert.rejects(goals.create(request, undefined, [commandCriterion("The checks pass")]), refused("objective-source-invalid"));
+    assert.equal(goals.list().some(goal => goal.id === request.requestId), false);
+    assert.equal(existsSync(goalFile(f, request.requestId)), false);
+
+    const plain = await goals.create(request);
+    assert.equal(plain.id, request.requestId);
+    assert.ok(eventTexts(goals.get(plain.id)).includes(GOAL_OBJECTIVE_EVENTS["source-invalid"]));
+    assert.throws(() => goals.objectiveRecord(plain.id), refused("objective-source-invalid"));
+  } finally { f.close(); }
+});
+
 test("the digest event tells a skip once and its restoration", () => {
   const large = GOAL_DIGEST_EVENTS["digest-too-large"], unavailable = GOAL_DIGEST_EVENTS["record-unavailable"];
   const skip: GoalDigestResult = { skipped: "digest-too-large" }, other: GoalDigestResult = { skipped: "record-unavailable" };

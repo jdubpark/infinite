@@ -46,6 +46,7 @@ function store(holder: GoalHolder, built: ObjectiveRecord | "source-invalid", re
  */
 export function createGoalObjective(holder: GoalHolder, at: string, criteria?: { inputs: readonly CriterionInput[]; context: OwnerOpContext }): GoalObjectiveResult {
   const built = goalRecord(holder.goal, at, "created");
+  if (criteria !== undefined && built === "source-invalid") throw objectiveError("objective-source-invalid");
   if (criteria === undefined || built === "source-invalid") return store(holder, built, "built");
   let record: ObjectiveRecord;
   try { record = addCreationCriteria(built, criteria.inputs, criteria.context); }
@@ -120,6 +121,8 @@ const DIGEST_TEXTS = new Set<string>([...Object.values(GOAL_DIGEST_EVENTS), GOAL
  * The event a cycle adds for its digest, or undefined. The newest digest event of `events` decides: a skip is added
  * unless it is the newest, and a digest is announced as restored only when it follows a skip. No persisted field.
  * With the switch off (`pinned` undefined) nothing is added.
+ * It compares with the visible event list, which keeps its newest 200 events. Once the newest digest event has left that
+ * list, the next skip is told again and a recovery is not announced, which keeps the visible list truthful.
  */
 export function digestEvent(events: readonly { text: string }[], pinned: GoalDigestResult | undefined): string | undefined {
   if (pinned === undefined) return undefined;

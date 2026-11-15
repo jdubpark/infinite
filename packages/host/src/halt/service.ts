@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { TeamError } from "../team-workspace.js";
 import type { FuseGate } from "../fuse/types.js";
 import type { Config } from "../types.js";
-import { HALT_FILE, MAX_RECEIPTS, readHaltRecord, writeHaltRecord, type HaltActor, type HaltEntry, type HaltReceipt, type HaltRecord } from "./record.js";
+import { HALT_FILE, MAX_RECEIPTS, haltChain, readHaltRecord, writeHaltRecord, type HaltActor, type HaltEntry, type HaltReceipt, type HaltRecord } from "./record.js";
 import { haltReason, STILL_HALTED, type HaltCheck, type HaltCovers, type HaltHeldBy, type HaltItemKind, type HaltOutcome, type HaltTarget, type HaltTargets, type LaunchHalted } from "./rules.js";
 
 export type HaltServiceOptions = { config: Config; key: Buffer; now?: () => number; /** How often an unreadable record is read again. */ retryMs?: number };
@@ -89,15 +89,15 @@ export class HaltService {
   }
 
   /**
-   * The halts in force, each with its place in the count, how many halts the record has engaged in all, and the
-   * record's generation (absent until its first write). The count is never lowered by a release or a dropped receipt.
-   * Undefined while the record cannot be read.
+   * The halts in force, each with its place in the count, how many halts the record has engaged in all, and the chain
+   * over their ids. Neither a release nor a dropped receipt changes the count or the chain. Undefined while the record
+   * cannot be read.
    */
-  engagements(): { generation?: string; count: number; halts: { haltId: string; projectId?: string; serial?: number }[] } | undefined {
+  engagements(): { count: number; chain: string; halts: { haltId: string; projectId?: string; serial?: number }[] } | undefined {
     if (!this.readable) return undefined;
     return {
-      ...(this.record.generation === undefined ? {} : { generation: this.record.generation }),
       count: this.record.engaged ?? 0,
+      chain: this.record.chain ?? "",
       halts: this.record.halts.map(entry => ({
         haltId: entry.haltId, ...(entry.scope === "project" && entry.projectId ? { projectId: entry.projectId } : {}),
         ...(entry.serial === undefined ? {} : { serial: entry.serial }),
@@ -141,7 +141,8 @@ export class HaltService {
       };
       const receipt: HaltReceipt = { requestId: body.requestId, action: "engage", fingerprint, haltId: entry.haltId, changed: true, at, by, settled: false, outcomes: [] };
       // The gate holds every new launch in scope from this write on, before any running item is paused.
-      if (!this.persist({ ...this.record, engaged: serial, halts: [...this.record.halts, entry], receipts: this.withReceipt(receipt) })) throw writeError();
+      const chain = haltChain(this.record.chain ?? "", entry.haltId);
+      if (!this.persist({ ...this.record, engaged: serial, chain, halts: [...this.record.halts, entry], receipts: this.withReceipt(receipt) })) throw writeError();
       await this.finishEngage(receipt);
       return this.engageResult(this.record.receipts.find(value => value.requestId === receipt.requestId) ?? receipt);
     });
@@ -308,11 +309,10 @@ export class HaltService {
     }
   }
 
-  /** Writes the file, then memory. False when the write failed; memory is unchanged then. A record's first write gives it its generation. */
+  /** Writes the file, then memory. False when the write failed; memory is unchanged then. */
   private persist(next: HaltRecord): boolean {
-    const record = next.generation === undefined ? { ...next, generation: randomUUID() } : next;
-    if (!writeHaltRecord(this.file, this.key, record)) return false;
-    this.record = record;
+    if (!writeHaltRecord(this.file, this.key, next)) return false;
+    this.record = next;
     return true;
   }
 

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { z } from "zod";
 import { unseal, writeSealed } from "../vault.js";
@@ -44,11 +45,16 @@ export type HaltRecord = {
    */
   engaged?: number;
   /**
-   * This record's identity, given at its first write. A record that is replaced or removed and written again gets a
-   * new one, so its count is never read as a continuation of the old record's.
+   * A hash over the id of every halt this record has engaged, in order (see `haltChain`). Two histories that reach
+   * the same count, such as a restored older copy that engaged other halts since, never share it. Absent with the count.
    */
-  generation?: string;
+  chain?: string;
 };
+
+/** The chain after one more engaged halt. The empty chain stands for a record that has engaged none. */
+export function haltChain(previous: string, haltId: string): string {
+  return createHash("sha256").update(`infinite-halt-chain\n${previous}\n${haltId}`).digest("hex");
+}
 
 /** Requests remembered for replay. The oldest is dropped first. */
 export const MAX_RECEIPTS = 100;
@@ -92,7 +98,7 @@ const recordSchema: z.ZodType<HaltRecord> = z.object({
   halts: z.array(entrySchema).max(10000),
   receipts: z.array(receiptSchema).max(MAX_RECEIPTS),
   engaged: z.number().int().nonnegative().optional(),
-  generation: uuid.optional(),
+  chain: z.string().regex(/^[0-9a-f]{64}$/).optional(),
 }).strict();
 
 export type HaltRead = { state: "missing" } | { state: "readable"; record: HaltRecord } | { state: "unreadable" };

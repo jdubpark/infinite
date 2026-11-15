@@ -453,3 +453,44 @@ that explicit command to change the scope or ten-decision limit (maximum twenty)
 `infinite repo init --permissions off` disables it for future runs. Workspace
 trust and unsupported prompts remain visible for owner handling. See
 [delegated permission behavior](teams.md#delegating-permission-decisions).
+
+### Workspace permission delegation
+
+```sh
+infinite permissions status [--json]
+infinite permissions delegate (--workspace W | --all) [--direction TEXT | --clear-direction] [--request-id UUID]
+infinite permissions revoke --workspace W [--request-id UUID]
+```
+
+`delegate` and `revoke` need an owner CLI. An owner or a controller can read
+`status`. `status` lists each workspace, which is a project group, with its
+projects. A workspace is `delegated`, `partly-delegated`, or `not-delegated`.
+`delegate` records the owner's delegation for one workspace, or for every
+workspace with `--all`. It replaces a project's saved opt-out and prints each
+one that it replaced. `--direction` sets the direction text, which can only
+narrow what the permission agent allows in that workspace, and
+`--clear-direction` removes it. `revoke` removes a workspace's delegation. A
+missing `--request-id` is generated, so pass one to retry a request safely.
+`W` is a workspace id as `status` prints it. Only when no workspace has that
+id is `W` read as a project id, and it then names the workspace that holds that
+project. When two workspaces show the same id, `revoke` clears both, and
+`delegate --workspace` is refused: use `--all`, or regroup so that the id names
+one workspace.
+
+An owner act covers only the projects that sit in the workspace at that time.
+A project that joins a workspace later is not covered until the owner delegates
+again. When the owner moves a project to another workspace or deletes its
+workspace, that project's coverage ends, and moving it back restores nothing:
+delegate again. A retried `--request-id` prints the recorded result and changes
+nothing.
+
+A project that is not on the host is covered by nothing. If it returns under
+the same id and path, it keeps the coverage it had, unless the owner delegated
+or revoked its workspace while it was away: either act ends that project's
+coverage, so delegate again after it returns. `revoke --workspace` with the id
+of a project that left the host ends that project's coverage too, unless a
+workspace has that id: the workspace is then the one revoked.
+
+The record has no effect yet. The permission agent is not active on this host,
+so requests are handled as before. Until the agent is activated,
+`infinite repo init --permissions` still governs team runs.

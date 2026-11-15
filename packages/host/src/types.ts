@@ -153,7 +153,8 @@ export interface Config {
   /** Chat digests written by a hosted model through an OpenAI-compatible Responses API. */
   summaries?: { model: string; apiKeyFile: string; baseUrl: string };
   /** Optional Jev readings for turn-finished lines and generated session titles. */
-  jev?: { apiKeyFile: string; model: string; baseUrl: string };
+  /** sessionReadings false keeps the reading service for the intake route only; no session text is sent. */
+  jev?: { apiKeyFile: string; model: string; baseUrl: string; sessionReadings?: boolean };
   /** Optional cleanup for dictated text through an OpenAI-compatible Responses API. */
   dictation?: { model: string; apiKeyFile: string; baseUrl: string };
   /** Read-only repository briefs produced by an administrator-configured host wrapper. */

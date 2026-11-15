@@ -191,9 +191,10 @@ infinite team cancel TEAM_ID
 infinite team delete TEAM_ID [--json]
 infinite team entries TEAM_ID [--kind KIND] [--task TASK_ID] [--since SEQ] [--json]
 infinite team entry TEAM_ID ENTRY_ID [--json]
+infinite team entry TEAM_ID ENTRY_ID withdraw [--json]
 ```
 
-`team entries` lists a team's stored entries, one line each, with the next `--since` value when more remain. `team entry` prints one entry's head and its body as indented JSON. Entry text is data: the output escapes control characters, and nothing in it runs.
+`team entries` lists a team's stored entries, one line each, with the next `--since` value when more remain. `team entry` prints one entry's head and its body as indented JSON. Entry text is data: the output escapes control characters, and nothing in it runs. `team entry ... withdraw` needs an owner device key. It withdraws one entry, so members stop listing and getting it while the owner still reads its body. The command says whether the entry changed, or was already withdrawn.
 
 `infinite team status` without an ID lists each team. `infinite team status TEAM_ID`
 prints that team's open decisions and Jevcode summary. `infinite team watch

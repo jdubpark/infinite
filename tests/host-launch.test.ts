@@ -402,3 +402,75 @@ test("codex hooks stay off unless the config turns them on", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+const entryMember = { runId: randomUUID(), memberId: randomUUID(), revision: 1 };
+const entryAssignment = JSON.stringify(entryMember);
+const teamMcpServer = resolve("packages/host/src/team-mcp.ts");
+const teamMcpFrames = (...messages: unknown[]) => messages.map(message => JSON.stringify(message) + "\n").join("");
+
+function teamMcpSession(env: Record<string, string>, requests: unknown[]) {
+  const base = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("INFINITE_")));
+  const initialize = { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test", version: "1" } } };
+  const run = spawnSync(process.execPath, ["--import", import.meta.resolve("tsx"), teamMcpServer], {
+    input: teamMcpFrames(initialize, ...requests), encoding: "utf8", env: { ...base, ...env },
+  });
+  assert.equal(run.status, 0, run.stderr);
+  return run.stdout.trim().split("\n").map(line => JSON.parse(line)).slice(1) as Array<{ id: number; result?: any; error?: { message: string } }>;
+}
+
+test("entry tools join the team launch only when on", () => {
+  const profile = { command: "claude", args: ["--model", "opus"] };
+  const plain = buildLaunch("claude", profile, "Implement this task", hooks, relay, enabled, true);
+  const on = buildLaunch("claude", profile, "Implement this task", hooks, relay, enabled, true, undefined, undefined, undefined, true);
+  const config = JSON.parse(on.args[on.args.indexOf("--mcp-config") + 1]);
+  assert.deepEqual(config.mcpServers.infinite_team.env, {
+    INFINITE_HOOK_URL: "${INFINITE_HOOK_URL}",
+    INFINITE_HOOK_TOKEN: "${INFINITE_HOOK_TOKEN}",
+    INFINITE_TEAM_ASSIGNMENT: "${INFINITE_TEAM_ASSIGNMENT}",
+    INFINITE_MISSION_ASSIGNMENT: "${INFINITE_MISSION_ASSIGNMENT:-}",
+    INFINITE_TEAM_ENTRY_TOOLS: "1",
+  });
+  assert.ok(!on.args.some(arg => /allowedtools|permission-mode|skip-permissions|dangerously|autoallow/i.test(arg)), "Entry tools must not grant provider permissions");
+  assert.deepEqual(on.args.filter(arg => !arg.startsWith("{")), plain.args.filter(arg => !arg.startsWith("{")));
+
+  const codex = { command: "codex", args: [] };
+  const codexOn = buildLaunch("codex", codex, "task", hooks, relay, enabled, true, undefined, undefined, undefined, true);
+  const settings = new Map<string, unknown>();
+  for (let index = 0; index < codexOn.args.length - 1; index++) {
+    if (codexOn.args[index] === "-c" && codexOn.args[index + 1].startsWith("mcp_servers.infinite_team.")) {
+      const override = codexOn.args[++index].slice("mcp_servers.infinite_team.".length);
+      const equals = override.indexOf("=");
+      settings.set(override.slice(0, equals), JSON.parse(override.slice(equals + 1)));
+    }
+  }
+  assert.equal(settings.size, 9);
+  assert.equal(settings.get("env.INFINITE_TEAM_ENTRY_TOOLS"), "1");
+  assert.equal(settings.get("tools.entry_post.approval_mode"), "approve");
+  assert.equal(settings.get("tools.entry_list.approval_mode"), "approve");
+  assert.equal(settings.get("tools.entry_get.approval_mode"), "approve");
+
+  // A handoff launch, or a launch that is not a team member, gets nothing new.
+  assert.deepEqual(buildLaunch("claude", profile, "task", hooks, relay, enabled, false, undefined, undefined, undefined, true),
+    buildLaunch("claude", profile, "task", hooks, relay, enabled, false));
+  assert.deepEqual(buildLaunch("codex", codex, "task", hooks, relay, enabled, false, undefined, undefined, undefined, true),
+    buildLaunch("codex", codex, "task", hooks, relay, enabled, false));
+  assert.deepEqual(buildLaunch("claude", profile, "task", hooks, relay, enabled, true, undefined, "session-1", undefined, true),
+    buildLaunch("claude", profile, "task", hooks, relay, enabled, true, undefined, "session-1"));
+});
+
+test("the MCP server lists entry tools only when the capability says so", () => {
+  const assignment = { INFINITE_HOOK_URL: "http://127.0.0.1:9/hook", INFINITE_HOOK_TOKEN: "placeholder", INFINITE_TEAM_ASSIGNMENT: entryAssignment };
+  const list = { jsonrpc: "2.0", id: 2, method: "tools/list" };
+  const names = (env: Record<string, string>) => teamMcpSession(env, [list])[0].result.tools.map((tool: { name: string }) => tool.name);
+
+  assert.deepEqual(names({ ...assignment, INFINITE_TEAM_ENTRY_TOOLS: "1" }), ["report", "entry_post", "entry_list", "entry_get"]);
+  assert.deepEqual(names({ ...assignment }), ["report"]);
+  assert.deepEqual(names({ ...assignment, INFINITE_TEAM_ENTRY_TOOLS: "0" }), ["report"]);
+  assert.deepEqual(names({ ...assignment, INFINITE_TEAM_ENTRY_TOOLS: "1", INFINITE_HANDOFF_SESSION: "session-1" }), ["handoff"]);
+  assert.deepEqual(names({ ...assignment, INFINITE_TEAM_ENTRY_TOOLS: "1", INFINITE_MISSION_ASSIGNMENT: JSON.stringify({ missionId: randomUUID(), memberId: randomUUID(), revision: 1 }) }), ["mission_report"]);
+
+  const [answer] = teamMcpSession({ ...assignment }, [{ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "entry_list", arguments: {} } }]);
+  assert.equal(answer.error?.message, "Unknown tool. Only report is available.");
+  const [withEntries] = teamMcpSession({ ...assignment, INFINITE_TEAM_ENTRY_TOOLS: "1" }, [{ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "entry_get", arguments: {} } }]);
+  assert.equal(withEntries.result.isError, true, "an entry call with a bad argument fails inside the tool result");
+});

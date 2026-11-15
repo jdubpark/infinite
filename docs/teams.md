@@ -1966,6 +1966,8 @@ One row per task and revision, written at the task's first implementer start, wi
 
 Nothing about the routing reaches a member: no prompt, context file, or tool carries the policy, a seed, a posterior, or a utility. A shadow run writes no line to the run's events.
 
+A run's team view shows the policy the run pinned: the mode, the requested mode, the source, the knobs and which are defaults, the algorithm and reward versions, and the digest. The relay carries team views, and a handoff run's view also shows the project's saved policy. No view shows a seed, a posterior, or a utility. Status and explain are not served over the relay.
+
 ### Status and explain
 
 ```sh
@@ -1985,7 +1987,7 @@ The host removes decisions decided more than 180 days ago. A decision holds no r
 
 ### Rolling back
 
-Before rolling back past this release, remove `routing` from every project's team block. This release provides no command that removes the key, so this step is still open.
+Before rolling back past this release, remove `routing` from every project's team block. This release provides no command that removes the key, so this step is still open. A rollback also leaves the outcome ledger unavailable until a host of this release or later runs again, because an older host cannot read its version 4.
 
 ## Launch-rate fuse
 

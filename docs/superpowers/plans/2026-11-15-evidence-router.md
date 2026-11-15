@@ -609,7 +609,7 @@ export function routingExplainLines(explain: RoutingExplain): string[];
 - Measured costs and the rescue cost from the ledger, limit headroom and pressure, model families (C19), and the duel tie-break: they need code that other designs own.
 - Status in the web, phone, and Mac clients (step 6), and status for all projects at once.
 - A secret scan of the payload, and a `deleteRun` for decision rows.
-- Carrying `features` and `eval` through `repo init`, which drops them today.
+- Carrying `features` and `eval` through `repo init`: done on main by INF-256 (#157), which carries every team key that `repo init` does not own, `routing` included.
 
 ## Owner decisions this slice needs, with the defaults it builds
 

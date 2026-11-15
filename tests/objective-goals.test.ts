@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 import { GoalService } from "../packages/host/src/goals.js";
-import { GOAL_DIGEST_EVENTS, GOAL_OBJECTIVE_EVENTS, goalRecordDigest } from "../packages/host/src/objective-goals.js";
+import { GOAL_DIGEST_EVENTS, GOAL_DIGEST_RESTORED, GOAL_OBJECTIVE_EVENTS, digestEvent, goalRecordDigest, type GoalDigestResult } from "../packages/host/src/objective-goals.js";
 import { goalRecord } from "../packages/host/src/objective-record.js";
 import { objectiveRecordSchema, recordDigest, type ObjectiveRecord, type Criterion } from "../packages/host/src/objective-types.js";
 import { commandDigest } from "../packages/host/src/objective-input.js";
@@ -493,6 +493,22 @@ test("the digest skips with its reason and never throws", () => {
   const commanded = recordWith(goal, [{ id: "c1", origin: "owner", statement: "The checks pass", check: { kind: "command", command: commandDigest(full) }, producer: "host", threshold: { kind: "pass" }, state: "active" }]);
   assert.ok("digest" in goalRecordDigest({ goal, objectiveRecord: commanded }, [full]));
   assert.deepEqual(goalRecordDigest({ goal, objectiveRecord: commanded }, [{ command: process.execPath } as TeamCommand]), { skipped: "record-unavailable" });
+});
+
+test("the digest event tells a skip once and its restoration", () => {
+  const large = GOAL_DIGEST_EVENTS["digest-too-large"], unavailable = GOAL_DIGEST_EVENTS["record-unavailable"];
+  const skip: GoalDigestResult = { skipped: "digest-too-large" }, other: GoalDigestResult = { skipped: "record-unavailable" };
+  const digest = { digest: { version: 1, criteria: [{ id: "c0", statement: "", check: "judgement:owner-text", producer: "evaluator" }] } } as GoalDigestResult;
+  const at = (...texts: string[]) => texts.map(text => ({ text }));
+  assert.equal(digestEvent([], skip), large);
+  assert.equal(digestEvent(at(large), skip), undefined, "the same skip again adds nothing");
+  assert.equal(digestEvent(at(large), other), unavailable, "another reason adds its text");
+  assert.equal(digestEvent(at(large), digest), GOAL_DIGEST_RESTORED, "a digest after a skip is restored");
+  assert.equal(digestEvent(at("Goal approved."), digest), undefined, "a digest with no digest event adds nothing");
+  assert.equal(digestEvent(at(large, GOAL_DIGEST_RESTORED), digest), undefined, "a digest after the restoration adds nothing");
+  assert.equal(digestEvent(at(large, GOAL_DIGEST_RESTORED), skip), large, "a skip after the restoration is added");
+  assert.equal(digestEvent(at(large, GOAL_DIGEST_RESTORED), undefined), undefined, "the switch off adds nothing");
+  for (const events of [[], at(large), at(large, GOAL_DIGEST_RESTORED)]) assert.equal(digestEvent(events, undefined), undefined);
 });
 
 test("a skipped digest is logged once while its reason holds", async () => {

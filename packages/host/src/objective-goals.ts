@@ -112,6 +112,21 @@ export const GOAL_DIGEST_EVENTS: Record<"record-unavailable" | "digest-too-large
   "record-unavailable": "The objective record could not be read, so this cycle's members read the success text without its criteria.",
   "digest-too-large": "The active criteria exceed the prompt digest, so this cycle's members read the success text without them.",
 };
+export const GOAL_DIGEST_RESTORED = "The active criteria reach this cycle's members again.";
+
+const DIGEST_TEXTS = new Set<string>([...Object.values(GOAL_DIGEST_EVENTS), GOAL_DIGEST_RESTORED]);
+
+/**
+ * The event a cycle adds for its digest, or undefined. The newest digest event of `events` decides: a skip is added
+ * unless it is the newest, and a digest is announced as restored only when it follows a skip. No persisted field.
+ * With the switch off (`pinned` undefined) nothing is added.
+ */
+export function digestEvent(events: readonly { text: string }[], pinned: GoalDigestResult | undefined): string | undefined {
+  if (pinned === undefined) return undefined;
+  const newest = [...events].reverse().find(event => DIGEST_TEXTS.has(event.text))?.text;
+  if ("skipped" in pinned) return newest === GOAL_DIGEST_EVENTS[pinned.skipped] ? undefined : GOAL_DIGEST_EVENTS[pinned.skipped];
+  return newest !== undefined && Object.values(GOAL_DIGEST_EVENTS).includes(newest) ? GOAL_DIGEST_RESTORED : undefined;
+}
 
 /**
  * The digest of the holder's latest record, for one cycle's goal context. One parse of the record. A digest that is

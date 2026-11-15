@@ -145,7 +145,7 @@ export function createPermissionAgentCore(options: PermissionCoreOptions): Permi
     familyOf,
     classify: (request, interruptClasses) => { const { judged, reading } = read(request); return classify(judged, interruptClasses, facts, reading); },
     qualify,
-    raise: (request, context) => { const { judged, reading } = read(request); return raise(judged, context, reading); },
+    raise: (request, context) => { const { judged, reading } = read(request); return raise(judged, context, reading, facts); },
 
     readiness(): PermissionReadiness {
       const settings = settingsOf();

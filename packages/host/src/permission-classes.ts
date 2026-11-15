@@ -10,10 +10,10 @@ import { matchDestructive } from "@infinite/attention";
 import type { PermissionClassMatch, PermissionQualification, PermissionRequest } from "./permission-agent-types.js";
 import type { InterruptClass } from "./permission-policy.js";
 import { canonicalJson } from "./evidence/crypto.js";
-import { quoteWord, readShell, resolveWord, type PathResolver, type SimpleCommand } from "./permission-shell.js";
+import { MAX_SHELL_DEPTH, quoteWord, readShell, resolveWord, type PathResolver, type SimpleCommand } from "./permission-shell.js";
 
 /** Bumped by any change to the rule code below, or to the shell reading it uses, that is not a change to the lists. */
-export const CLASS_RULES_VERSION = 2;
+export const CLASS_RULES_VERSION = 3;
 
 /**
  * The host's lists. Commands are word prefixes after wrappers (sudo, env, timeout) are removed. Paths
@@ -159,9 +159,10 @@ export function withRealRoots(request: PermissionRequest, real: PathResolver): P
 
 /**
  * `resolvePath` makes every path a real host path (see `realHostPath`); the caller passes the request
- * from `withRealRoots`. Without it paths are read as written, which is what a replay does.
+ * from `withRealRoots`. Without it paths are read as written, which is what a replay does. `depth` is
+ * the shell layer the command line is at, for a line the embedded-command rule found inside another.
  */
-export function readRequest(request: PermissionRequest, resolvePath?: PathResolver): RequestReading {
+export function readRequest(request: PermissionRequest, resolvePath?: PathResolver, depth = 0): RequestReading {
   const tool = request.tool;
   const input = request.input ?? {};
   const root = request.requester.sessionRoot;
@@ -192,7 +193,7 @@ export function readRequest(request: PermissionRequest, resolvePath?: PathResolv
     const source = Array.isArray(input.command) && input.command.every(word => typeof word === "string")
       ? (input.command as string[]).map(quoteWord).join(" ")
       : typeof input.command === "string" ? input.command : request.action;
-    const reading = readShell(source, cwd, real);
+    const reading = readShell(source, cwd, real, depth);
     for (const reason of reading.opaqueReasons) reasons.add(reason);
     commands.push(...reading.commands);
     const entered = new Set<string>();
@@ -205,6 +206,7 @@ export function readRequest(request: PermissionRequest, resolvePath?: PathResolv
       // In a directory the text does not establish, a relative path is unresolved.
       const base = command.cwdUnknown ? undefined : command.cwd ?? cwd;
       for (const redirect of command.redirects) add(redirect.target, redirect.op === "<" ? "read" : "write", base);
+      for (const file of command.writes ?? []) add(file, "write", base);
       operandTargets(command, base, add, real);
     }
   }
@@ -462,8 +464,74 @@ const GLOBAL_INSTALL: ReadonlyArray<(command: SimpleCommand) => boolean> = [
   command => /^pip\d*(?:\.\d+)?$/.test(command.name) && command.argv[1] === "install" && command.argv.some(arg => arg === "--user" || arg === "--break-system-packages"),
 ];
 
-/** The raise rules that match. They only select the strong tier for a fresh turn. */
-export function raise(request: PermissionRequest, context: { rejectHistory: boolean }, reading = readRequest(request)): string[] {
+/**
+ * Bounds of the embedded-command search for one request. A command with more than `words` words is not
+ * searched, a candidate longer than `length` characters is not read, at most `readings` candidates are
+ * read, and commands found inside candidates are searched to `layers` levels. A request the search did
+ * not cover is raised as opaque.
+ */
+export const EMBEDDED_COMMAND_LIMITS = { words: 64, length: 4_000, readings: 256, layers: 2 } as const;
+/** Commands that never run an argument. Their arguments are not searched. */
+const NEVER_RUN = new Set(["echo", "printf", "grep", "egrep", "fgrep", "cat", "head", "tail", "wc"]);
+
+/**
+ * Whether a command hides one that a class rule matches: a tail of its words, which a wrapper the shell
+ * reader does not know would run (`setsid npm login`), or one of its words read as a shell body (`watch
+ * 'npm login'`, `ssh host 'npm login'`). Each candidate is read as its own command line in the command's
+ * directory, and every class rule is tried on it. A match is a guess, so it only raises; it never sends a
+ * request to the owner. "bounded" when the search did not cover the request.
+ */
+function embeddedCommand(request: PermissionRequest, reading: RequestReading, facts: HostRuleFacts): "found" | "bounded" | undefined {
+  const limits = EMBEDDED_COMMAND_LIMITS;
+  const { destructive: _destructive, ...plain } = request;
+  // Candidates share most of their paths: each is resolved once.
+  const known = new Map<string, string | undefined>();
+  const resolve: PathResolver | undefined = reading.resolve && (path => {
+    if (!known.has(path)) known.set(path, reading.resolve!(path));
+    return known.get(path);
+  });
+  const seen = new Set<string>();
+  let readings = 0;
+  let bounded = false;
+  const queue = reading.commands.map(command => ({ command, layer: 0 }));
+  for (let item = queue.shift(); item; item = queue.shift()) {
+    const { command, layer } = item;
+    // A command in a directory the text does not establish is already opaque.
+    if (command.cwdUnknown || NEVER_RUN.has(command.name) || command.argv.length < 2) continue;
+    if (command.argv.length > limits.words) { bounded = true; continue; }
+    const candidates: Array<{ source: string; depth: number }> = [];
+    command.argv.forEach((word, index) => {
+      if (index === 0) return;
+      // A tail that starts with an option names no command.
+      if (!word.startsWith("-")) candidates.push({ source: command.argv.slice(index).map(quoteWord).join(" "), depth: command.depth });
+      if (/\s/.test(word) && command.depth < MAX_SHELL_DEPTH) candidates.push({ source: word, depth: command.depth + 1 });
+    });
+    for (const { source, depth } of candidates) {
+      const key = `${command.cwd ?? ""}\n${depth}\n${source}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (source.length > limits.length) { bounded = true; continue; }
+      if (++readings > limits.readings) return "bounded";
+      const pattern = matchDestructive(source);
+      const candidate: PermissionRequest = {
+        ...plain, tool: "Bash", action: source,
+        input: { command: source, ...(command.cwd !== undefined ? { workdir: command.cwd } : {}) },
+        shape: { ...request.shape, trustPrompt: false, persistentOnly: false },
+        ...(pattern ? { destructive: { pattern } } : {}),
+      };
+      const candidateReading = readRequest(candidate, resolve, depth);
+      if (CLASS_RULES.some(rule => rule.test(candidate, candidateReading, facts))) return "found";
+      if (layer + 1 < limits.layers) for (const inner of candidateReading.commands) queue.push({ command: inner, layer: layer + 1 });
+    }
+  }
+  return bounded ? "bounded" : undefined;
+}
+
+/**
+ * The raise rules that match. They only select the strong tier for a fresh turn. `facts` are the host
+ * facts the class rules use, for the embedded-command rule.
+ */
+export function raise(request: PermissionRequest, context: { rejectHistory: boolean }, reading = readRequest(request), facts: HostRuleFacts = {}): string[] {
   const raised: string[] = [];
   const words = reading.commands.flatMap(command => command.words);
   const text = `${request.tool}\n${request.action}\n${safeJson(request.input ?? {})}`;
@@ -485,7 +553,9 @@ export function raise(request: PermissionRequest, context: { rejectHistory: bool
       || /^\.[\w.-]*rc(?:\.[\w-]+)?$/.test(base) || /^\.env(?:\..+)?$/.test(base);
   })) raised.push("raise:settings-in-root");
   if (reading.commands.some(command => GLOBAL_INSTALL.some(test => test(command)))) raised.push("raise:global-install");
-  if (reading.opaque || reading.unresolved.length > 0 || (!reading.shell && !KNOWN_TOOLS.test(request.tool))) raised.push("raise:opaque");
+  const embedded = reading.shell ? embeddedCommand(request, reading, facts) : undefined;
+  if (embedded === "found") raised.push("raise:embedded-command");
+  if (reading.opaque || embedded === "bounded" || reading.unresolved.length > 0 || (!reading.shell && !KNOWN_TOOLS.test(request.tool))) raised.push("raise:opaque");
   if (context.rejectHistory) raised.push("raise:reject-history");
   return raised;
 }

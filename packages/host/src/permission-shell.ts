@@ -5,8 +5,10 @@
  * inline interpreter code, here-documents, process substitution, a variable in command position, a
  * shell whose body is not literal text, or a working directory the text does not establish.
  *
- * A literal shell body (`sh -c 'script'`, `env -S 'string'`) is read as the commands it runs, to
- * `MAX_SHELL_DEPTH` layers; a deeper body is opaque.
+ * A literal shell body (`sh -c 'script'`, `env -S 'string'`, `watch 'command'`, `script -c`, `flock -c`)
+ * is read as the commands it runs, to `MAX_SHELL_DEPTH` layers; a deeper body is opaque. Wrappers in
+ * `WRAPPERS` are removed. A command behind a wrapper this table does not know stays in argv; the class
+ * module's embedded-command rule reads it there. A remote command (`ssh`) is opaque.
  */
 import { lstatSync, readlinkSync, realpathSync } from "node:fs";
 import { posix } from "node:path";
@@ -25,6 +27,10 @@ export interface SimpleCommand {
   cwd?: string;
   /** The text changes the working directory in a way the host cannot establish; relative paths are then unknown. */
   cwdUnknown?: boolean;
+  /** The shell layers above the command: 0 for the line the host was given, 1 inside one literal shell body. */
+  depth: number;
+  /** Files a removed wrapper writes, as written: an strace or time output file, flock's lock file, script's log. */
+  writes?: string[];
 }
 
 export interface ShellReading {
@@ -52,6 +58,14 @@ const INLINE_CODE: Record<string, readonly string[]> = {
  * value. `chdir` options run the command in another directory, `root` options in another root
  * directory, and `split` options run a string as the command line. `shell` options, or `alwaysShell`,
  * start a shell that reads its commands from input when no command follows.
+ *
+ * `operands` words follow the options before the command (a duration, a lock file, a CPU mask, a
+ * priority); `operandWrites` says the first is a file the wrapper creates. `writes` options name a file
+ * the wrapper writes. `body` options give a shell body as their value, or as the word after the
+ * operands (`flock FILE -c 'command'`); with `bodyOnly` the wrapper runs nothing else, and its other
+ * operands are files it writes. `joined` runs the rest of the line, joined with spaces, as a shell body
+ * unless an `exec` option is given. With a `noCommand` option the wrapper runs no command, and it is read
+ * as itself, as is a wrapper that no command follows.
  */
 interface Wrapper {
   valued: ReadonlySet<string>;
@@ -60,6 +74,14 @@ interface Wrapper {
   split?: ReadonlySet<string>;
   shell?: ReadonlySet<string>;
   alwaysShell?: boolean;
+  operands?: number;
+  operandWrites?: boolean;
+  writes?: ReadonlySet<string>;
+  body?: ReadonlySet<string>;
+  bodyOnly?: boolean;
+  joined?: boolean;
+  exec?: ReadonlySet<string>;
+  noCommand?: ReadonlySet<string>;
 }
 const options = (...names: string[]): ReadonlySet<string> => new Set(names);
 const WRAPPERS: Record<string, Wrapper> = {
@@ -73,19 +95,40 @@ const WRAPPERS: Record<string, Wrapper> = {
   run0: { valued: options("-u", "--user", "-g", "--group", "-D", "--chdir", "--setenv", "--property", "--slice", "--unit", "--description", "--nice", "--machine"),
     chdir: options("-D", "--chdir"), alwaysShell: true },
   env: { valued: options("-u", "--unset", "-C", "--chdir", "-S", "--split-string", "-P"), chdir: options("-C", "--chdir"), split: options("-S", "--split-string") },
-  nohup: { valued: options() }, time: { valued: options() }, command: { valued: options() }, builtin: { valued: options() }, exec: { valued: options("-a") },
-  nice: { valued: options("-n", "--adjustment") }, ionice: { valued: options("-c", "-n", "-p") }, stdbuf: { valued: options("-i", "-o", "-e") },
+  nohup: { valued: options() }, builtin: { valued: options() }, exec: { valued: options("-a") },
+  command: { valued: options(), noCommand: options("-v", "-V") },
+  time: { valued: options("-f", "--format", "-o", "--output"), writes: options("-o", "--output") },
+  nice: { valued: options("-n", "--adjustment") }, stdbuf: { valued: options("-i", "-o", "-e") },
+  ionice: { valued: options("-c", "--class", "-n", "--classdata", "-p", "--pid", "-P", "--pgid", "-u", "--uid"), noCommand: options("-p", "--pid", "-P", "--pgid", "-u", "--uid") },
   caffeinate: { valued: options("-t", "-w") }, chronic: { valued: options() }, unbuffer: { valued: options() },
-  timeout: { valued: options("-s", "--signal", "-k", "--kill-after") },
+  timeout: { valued: options("-s", "--signal", "-k", "--kill-after"), operands: 1 },
+  setsid: { valued: options() }, busybox: { valued: options(), noCommand: options("--install", "--list", "--list-full", "--show", "--help") },
+  flock: { valued: options("-w", "--timeout", "--wait", "-E", "--conflict-exit-code"), operands: 1, operandWrites: true, body: options("-c", "--command") },
+  strace: {
+    valued: options("-a", "-b", "-e", "-E", "-I", "-o", "-O", "-p", "-P", "-s", "-S", "-u", "-U", "-X", "--output", "--attach", "--user", "--env",
+      "--trace", "--trace-path", "--signal", "--status", "--string-limit", "--summary-sort-by", "--columns"),
+    writes: options("-o", "--output"), noCommand: options("-p", "--attach"),
+  },
+  ltrace: { valued: options("-a", "-A", "-D", "-e", "-F", "-l", "-n", "-o", "-p", "-s", "-u", "-w", "-x", "--output", "--library"), writes: options("-o", "--output"), noCommand: options("-p") },
+  taskset: { valued: options(), operands: 1, noCommand: options("-p", "--pid") },
+  chrt: { valued: options("-T", "--sched-runtime", "-P", "--sched-period", "-D", "--sched-deadline"), operands: 1, noCommand: options("-p", "--pid", "-m", "--max") },
+  script: {
+    valued: options("-c", "--command", "-E", "--echo", "-I", "--log-in", "-O", "--log-out", "-B", "--log-io", "-T", "--log-timing", "-m", "--logging-format", "-o", "--output-limit"),
+    body: options("-c", "--command"), bodyOnly: true, writes: options("-I", "--log-in", "-O", "--log-out", "-B", "--log-io", "-T", "--log-timing"),
+  },
+  watch: { valued: options("-n", "--interval", "-q", "--equexit"), joined: true, exec: options("-x", "--exec") },
 };
 
 /** The working directory a reading has established: a path, none (the caller gave none), or unknown. */
 type Directory = { path?: string; unknown: boolean };
 
-/** Reads one command line. `cwd` is the directory the host assigned; a literal `cd` moves it for later commands. */
-export function readShell(source: string, cwd?: string, real?: PathResolver): ShellReading {
+/**
+ * Reads one command line. `cwd` is the directory the host assigned; a literal `cd` moves it for later
+ * commands. `depth` is the shell layer the line itself is at, for a line found inside another.
+ */
+export function readShell(source: string, cwd?: string, real?: PathResolver, depth = 0): ShellReading {
   const reasons = new Set<string>();
-  const commands = readLine(source, { path: cwd, unknown: false }, real, 0, reasons);
+  const commands = readLine(source, { path: cwd, unknown: false }, real, depth, reasons);
   return { commands, opaque: reasons.size > 0, opaqueReasons: [...reasons] };
 }
 
@@ -99,13 +142,15 @@ function readLine(source: string, start: Directory, real: PathResolver | undefin
     const built = build(current, reasons, directory, real);
     current = [];
     if (!built) return;
-    const { body, ...command } = built;
+    const { body, ...rest } = built;
+    const command: SimpleCommand = { ...rest, depth };
     if (body !== undefined) {
       if (depth >= MAX_SHELL_DEPTH) { reasons.add("shell-depth"); commands.push(command); return; }
       // The body runs in its own shell: its commands inherit this one's directory and privilege, and a `cd` in it ends with it.
       const inner = readLine(body, { path: command.cwd, unknown: Boolean(command.cwdUnknown) }, real, depth + 1, reasons);
       for (const nested of inner) commands.push(command.privileged ? { ...nested, privileged: true } : nested);
-      if (command.redirects.length) commands.push({ ...command, argv: [], name: "", words: [] });
+      // The outer command's redirections and its wrappers' files stay its own.
+      if (command.redirects.length || command.writes?.length) commands.push({ ...command, argv: [], name: "", words: [] });
       return;
     }
     if (command.name === "cd" || command.name === "pushd" || command.name === "popd") directory = changeDirectory(command, directory, real, reasons);
@@ -227,7 +272,7 @@ function operatorAt(source: string, index: number): string | undefined {
   return undefined;
 }
 
-type Built = SimpleCommand & { body?: string };
+type Built = Omit<SimpleCommand, "depth"> & { body?: string };
 
 function build(tokens: Token[], reasons: Set<string>, directory: Directory, real: PathResolver | undefined): Built | undefined {
   const words: Array<{ text: string; expands: boolean }> = [];
@@ -254,18 +299,24 @@ function build(tokens: Token[], reasons: Set<string>, directory: Directory, real
   let cwd = directory;
   let body: string | undefined;
   let shellWithoutCommand = false;
+  /** Where the last removed wrapper starts. A wrapper that runs no command is read as itself from there. */
+  let wrapperAt: number | undefined;
+  const writes: string[] = [];
   for (;;) {
     const head = words[start];
     if (!head) break;
     const name = posix.basename(head.text);
-    if (name === "su") { privileged = true; reasons.add("inline-shell"); start = words.length; break; }
+    if (name === "su") { privileged = true; reasons.add("inline-shell"); wrapperAt = start; start = words.length; break; }
     const wrapper = WRAPPERS[name];
     if (!wrapper) break;
     if (PRIVILEGE.has(name)) privileged = true;
+    wrapperAt = start;
     const { next, found } = wrapperOptions(words, start + 1, wrapper, name === "env");
+    const has = (set: ReadonlySet<string> | undefined) => found.some(({ option }) => set?.has(option));
     start = next;
-    if (name === "timeout") start++; // the duration
-    shellWithoutCommand = Boolean(wrapper.alwaysShell) || found.some(({ option }) => wrapper.shell?.has(option));
+    shellWithoutCommand = Boolean(wrapper.alwaysShell) || has(wrapper.shell);
+    let shellBody: { text: string; expands: boolean } | undefined;
+    let hasBody = false;
     for (const { option, value } of found) {
       if (wrapper.root?.has(option)) reasons.add("changed-root");
       if (wrapper.chdir?.has(option)) {
@@ -274,6 +325,8 @@ function build(tokens: Token[], reasons: Set<string>, directory: Directory, real
         if (path === undefined) reasons.add("unresolved-directory");
         cwd = path === undefined ? { unknown: true } : { path, unknown: false };
       }
+      if (wrapper.writes?.has(option) && value) writes.push(value.text);
+      if (wrapper.body?.has(option)) { hasBody = true; shellBody = value; }
       if (wrapper.split?.has(option)) {
         // `env -S STRING ARGS` runs STRING split into words, followed by ARGS. The string has its own escapes.
         reasons.add("split-string");
@@ -282,13 +335,42 @@ function build(tokens: Token[], reasons: Set<string>, directory: Directory, real
       }
     }
     if (body !== undefined) break;
+    if (has(wrapper.noCommand)) { shellWithoutCommand = false; start = words.length; break; }
+    if (!hasBody) {
+      const count = Math.min(wrapper.operands ?? 0, words.length - start);
+      if (wrapper.operandWrites && count > 0) writes.push(words[start].text);
+      start += count;
+      // `flock FILE -c 'command'`
+      if (wrapper.body?.has(words[start]?.text ?? "")) { hasBody = true; shellBody = words[start + 1]; start += 2; }
+    }
+    if (hasBody) {
+      // The rest of `script -c 'command' FILE` is its log file.
+      if (wrapper.bodyOnly) writes.push(...words.slice(start).map(word => word.text));
+      start = words.length;
+      // A body the outer shell expands first is not literal text.
+      if (shellBody && !shellBody.expands) body = shellBody.text;
+      else reasons.add("inline-shell");
+    } else if (wrapper.bodyOnly) start = words.length;
+    else if (wrapper.joined && !has(wrapper.exec) && start < words.length) {
+      // `watch` joins its words with spaces and runs them with `sh -c`.
+      const rest = words.slice(start);
+      start = words.length;
+      if (rest.some(word => word.expands)) reasons.add("inline-shell");
+      else body = rest.map(word => word.text).join(" ");
+    }
+    if (body !== undefined) break;
+  }
+  if (start >= words.length && body === undefined && wrapperAt !== undefined) {
+    if (shellWithoutCommand) reasons.add("shell-from-input");
+    start = wrapperAt;
   }
   const argv = words.slice(start).map(word => word.text);
-  if (!argv.length && shellWithoutCommand) reasons.add("shell-from-input");
   if (!argv.length && !redirects.length && body === undefined) return undefined;
   const nameWord = words[start];
   const name = nameWord ? posix.basename(nameWord.text) : "";
   if (nameWord?.expands) reasons.add("variable-command");
+  // A remote command runs on another host, which the host rules cannot read.
+  if (name === "ssh") reasons.add("remote-command");
   if (name === "eval" || name === "source" || name === ".") reasons.add("eval");
   if (name === "xargs" || (name === "find" && argv.some(arg => ["-exec", "-execdir", "-ok", "-okdir", "-delete"].includes(arg)))) reasons.add("indirect-command");
   if (SHELLS.has(name)) {
@@ -307,7 +389,7 @@ function build(tokens: Token[], reasons: Set<string>, directory: Directory, real
   return {
     argv, name, words: words.map(word => word.text), redirects, privileged,
     ...(cwd.path !== undefined && !cwd.unknown ? { cwd: cwd.path } : {}), ...(cwd.unknown ? { cwdUnknown: true } : {}),
-    ...(body !== undefined ? { body } : {}),
+    ...(writes.length ? { writes } : {}), ...(body !== undefined ? { body } : {}),
   };
 }
 

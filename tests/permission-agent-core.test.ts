@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { classify, classRulesDigest, raise } from "../packages/host/src/permission-classes.js";
+import { classify, classRulesDigest, EMBEDDED_COMMAND_LIMITS, raise } from "../packages/host/src/permission-classes.js";
 import { familyOf } from "../packages/host/src/permission-families.js";
 import { realHostPath } from "../packages/host/src/permission-shell.js";
 import { INTERRUPT_CLASSES, PERMISSION_POLICY_TEXT } from "../packages/host/src/permission-policy.js";
@@ -116,7 +116,7 @@ test("each interrupt class routes a concrete request through a class rule, and n
   assert.equal(classify(bash("gh auth login"), CLASSES.filter(name => name !== "credentials")), undefined);
 });
 
-test("literal shell bodies are read to three layers, and a shell or working directory the host cannot read is raised", async () => {
+test("literal shell bodies are read to three layers, a command behind a wrapper is found, and what the host cannot read is raised", async () => {
   const request = (command: string | string[]) => typeof command === "string" ? bash(command) : tool("Bash", { command });
   const rule = (command: string | string[]) => classify(request(command), CLASSES)?.rule;
   const raised = (command: string | string[]) => raise(request(command), { rejectHistory: false });
@@ -163,6 +163,40 @@ test("literal shell bodies are read to three layers, and a shell or working dire
   for (const command of ["env -C $DIR tee profile", "cd $DIR && rm -rf build", "cd - && rm -rf build", "sudo -R /srv/jail tee profile"])
     assert.ok(raised(command).includes("raise:opaque"), command);
   assert.equal(rule("cd && rm -rf build"), "class:destructive-outside", "cd alone goes to the home directory");
+
+  // A wrapper the reader knows is removed, so the command behind it meets the class rules.
+  for (const command of [
+    "setsid npm login", "setsid -f npm login", "flock /tmp/l npm login", "flock -w 5 /tmp/l -c 'npm login'", "busybox sh -c 'npm login'",
+    "watch 'npm login'", "watch -n 5 npm login", "watch -x npm login", "script -qc 'npm login' /dev/null", "strace -f -o /tmp/trace npm login",
+    "ltrace -o /tmp/t npm login", "taskset -c 0 npm login", "chrt -f 10 npm login", "/usr/bin/time -o /tmp/t npm login", "command npm login",
+    "exec npm login", "stdbuf -oL npm login", "ionice -c 3 npm login",
+  ]) assert.equal(rule(command), "class:credential-command", command);
+  // A file the wrapper writes is a target of its own.
+  for (const command of ["strace -o /etc/profile true", "flock /etc/profile true", "script -c true /etc/profile"])
+    assert.equal(rule(command), "class:host-configuration", command);
+  assert.ok(raised("flock /tmp/build.lock npm run build").includes("raise:outside-root"));
+  assert.ok(raised(`watch "$NEXT"`).includes("raise:opaque"), "a body the outer shell expands is not literal");
+
+  // Behind a wrapper the reader does not know, a word tail or a shell-body word that a class rule matches raises the request.
+  // It is a guess, so it never sends the request to the owner.
+  for (const command of ["systemd-run --user npm login", "firejail npm login", "tmux new-session -d 'npm login'", "screen -dm sh -c 'npm login'",
+    "npx vercel login", `git commit -m "npm login"`, "ssh build-host 'npm login'"]) {
+    assert.equal(rule(command), undefined, command);
+    assert.ok(raised(command).includes("raise:embedded-command"), command);
+  }
+  // A remote command is opaque, with or without a command.
+  for (const command of ["ssh build-host", "ssh build-host 'npm login'"]) assert.ok(raised(command).includes("raise:opaque"), command);
+  // Routine commands raise nothing. A command that never runs its arguments is not searched.
+  for (const command of ["npm test", `git commit -m "fix login"`, "grep -rn login src", "echo done", "grep -rn 'npm login' docs",
+    "watch -n 2 'git status'", "setsid npm run dev", "script -q -c 'npm test' /dev/null"]) assert.deepEqual(raised(command), [], command);
+  // A command too long to search is opaque: `git add` and its files, at the bound and one word past it.
+  const files = Array.from({ length: EMBEDDED_COMMAND_LIMITS.words - 1 }, (_, index) => `src/file-${index}.ts`);
+  assert.deepEqual(raised(`git add ${files.slice(1).join(" ")}`), []);
+  assert.ok(raised(`git add ${files.join(" ")}`).includes("raise:opaque"));
+  // The search uses the host's facts: a release command the configuration names is found behind an unknown wrapper.
+  const releasing = createPermissionAgentCore({ settings: settings(), launcher: fakeLauncher(() => "unavailable").launcher, facts: { releaseCommands: [["golive"]] } });
+  assert.deepEqual(raised("firejail golive"), []);
+  assert.deepEqual(releasing.raise(request("firejail golive"), { rejectHistory: false }), ["raise:embedded-command"]);
 });
 
 test("a write to the configuration file the host was started with needs the owner", () => {

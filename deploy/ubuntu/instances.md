@@ -514,7 +514,10 @@ without recording credentials.
 
 ## Slack app and read-only connectors
 
-Use a dedicated Slack app for the instance. Turn on Socket Mode. Give the bot
+Use a dedicated Slack app for the instance. Turn on Socket Mode and enable
+Interactivity under **Interactivity & Shortcuts**. Socket Mode carries button
+and select-menu actions over the existing connection; no public Request URL is
+needed. Give the bot
 only `app_mentions:read`, `chat:write`, `channels:history`, and `groups:history`;
 give the app-level token `connections:write`. Subscribe to the `app_mention`
 event only. Obtain the owner's approval before installing the app. Store each

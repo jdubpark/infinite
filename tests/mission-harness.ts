@@ -93,7 +93,7 @@ type FakeRun = { id: string; projectId: string; missionId: string; status: TeamV
   blockCode?: string; reason?: string; members?: TeamView["members"];
   usage?: UsageRollup; workspaceRemovedAt?: string;
   recovery?: { attempts: number; status: "stopping" | "planning" | "exhausted"; source: { code: string; memberId: string; revision: number; reportKind?: string; reason: string; at: string } };
-  decisions: { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string }[] };
+  decisions: { id: string; memberId: string; revision: number; question: string; options: string[]; answerMode?: "approval" | "single" | "multiple"; createdAt: string; answer?: string }[] };
 
 /**
  * The real mission service over scripted coordinator sessions and subteams: each coordinator attempt
@@ -290,7 +290,7 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
         modelSource: "requested", completedAt: at, tokens: { input: contextTokens, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, reportedCost: 0, ...(secondary ? { secondary: true } : {}) } });
       usage.set(sessionId, journal);
     },
-    stored: (id: string) => unseal<{ attempts: { prompt: string; consumedInbox: MissionMessage[] }[]; inbox: MissionMessage[]; refusals: number }>(key, "mission:" + id, readFileSync(join(config.stateDir, "missions", id + ".sealed"), "utf8")),
+    stored: (id: string) => unseal<{ mission: Mission; attempts: { prompt: string; consumedInbox: MissionMessage[] }[]; inbox: MissionMessage[]; refusals: number }>(key, "mission:" + id, readFileSync(join(config.stateDir, "missions", id + ".sealed"), "utf8")),
     messages: async (n: number) => parse((await attempt(n)).prompt, "Messages since your last attempt (JSON): "),
     state: async (n: number) => parse((await attempt(n)).prompt, "Mission state (JSON): "),
     /** The attempt files this report, with the optional note beside it as the mission report tool sends it. */

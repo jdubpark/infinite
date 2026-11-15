@@ -4521,7 +4521,8 @@ export class TeamService {
     if (report.kind === "question") {
       if (run.decisions.length >= 40) { this.block(stored, new TeamError(409, "team-decision-limit", "The team reached its limit of 40 decisions. Review its evidence before starting another team.")); return; }
       member.status = "waiting";
-      run.decisions.push({ id: randomUUID(), memberId: member.memberId, revision: run.revision, question: report.question, options: report.options, createdAt: timestamp() });
+      run.decisions.push({ id: randomUUID(), memberId: member.memberId, revision: run.revision, question: report.question, options: report.options,
+        ...(report.answerMode ? { answerMode: report.answerMode } : {}), createdAt: timestamp() });
       const task = member.role === "scout" ? run.discovery?.tasks.find(item => item.id === member.taskId) : run.tasks.find(item => item.id === member.taskId); if (task) task.status = "waiting";
       run.status = "needs-input"; this.event(stored, `${member.title} requested a user decision.`); this.save(stored); return;
     }

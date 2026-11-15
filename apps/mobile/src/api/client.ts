@@ -246,7 +246,10 @@ export type MissionUsage = {
 export type Mission = {
   id: string; groupId: string; groupName: string; repoProjectIds: string[]; title: string; objective: string;
   maxSubtasks: number; maxMinutes: number; deadlineAt: string; revision: number; status: MissionStatus;
-  reason?: string; createdAt: string; updatedAt: string; lineup: TeamLineup;
+  reason?: string;
+  /** Set while the mission is blocked because its approved time ran out; its work is kept and the owner can extend it. */
+  stopReason?: "deadline";
+  createdAt: string; updatedAt: string; lineup: TeamLineup;
   coordinator?: { memberId: string; sessionId: string; status: "running" | "waiting" | "stopped" };
   dispatchSummary?: string; subtasks: MissionSubtask[]; decisions: MissionDecision[];
   steering: { text: string; revision: number; at: string; source?: { kind: "connector"; id: string; name: string } | "coordinator" | "slack" }[]; events: { at: string; text: string }[];

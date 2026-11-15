@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { attemptLabel, attemptsOf, foldAttempts, groupBoard, filterBoard, openMissionDecisions } from "../apps/mobile/src/features/board/model.ts";
+import { attemptLabel, attemptsOf, foldAttempts, groupBoard, filterBoard, missionControls, missionExtendChoices, missionStatusLabel, missionStoppedAtLimit, openMissionDecisions } from "../apps/mobile/src/features/board/model.ts";
 import type { BoardItem, Mission } from "../apps/mobile/src/api/client.ts";
 
 const item = (overrides: Partial<BoardItem> = {}): BoardItem => ({
@@ -54,4 +54,46 @@ test("mission decisions remain open until an answer is recorded", () => {
     ],
   } as Mission;
   assert.deepEqual(openMissionDecisions(mission).map(decision => decision.id), ["open"]);
+});
+
+const now = Date.parse("2026-10-01T00:00:00.000Z");
+const controlMission = (status: Mission["status"], overrides: Partial<Mission> = {}) =>
+  ({ status, deadlineAt: "2026-10-02T00:00:00.000Z", maxMinutes: 240, ...overrides }) as Mission;
+
+test("the owner of a fresh mission can extend it while it runs, waits, or is paused", () => {
+  for (const status of ["planning", "working", "needs-input", "paused"] as const) {
+    assert.equal(missionControls(controlMission(status), "owner", true, now).extend, true, status);
+  }
+  assert.equal(missionControls(controlMission("blocked", { stopReason: "deadline" }), "owner", true, now).extend, true);
+});
+
+test("extend is withheld from blocked missions without a stop reason, ended missions, non-owners, and stale views", () => {
+  assert.equal(missionControls(controlMission("blocked"), "owner", true, now).extend, false);
+  assert.equal(missionControls(controlMission("cancelled"), "owner", true, now).extend, false);
+  assert.equal(missionControls(controlMission("ready-for-review"), "owner", true, now).extend, false);
+  assert.equal(missionControls(controlMission("working"), "controller", true, now).extend, false);
+  assert.equal(missionControls(controlMission("blocked", { stopReason: "deadline" }), "viewer", true, now).extend, false);
+  assert.equal(missionControls(controlMission("working"), "owner", false, now).extend, false);
+  assert.equal(missionControls(controlMission("blocked", { stopReason: "deadline" }), "owner", false, now).extend, false);
+});
+
+test("a deadline stop is recognised only while the mission is blocked", () => {
+  assert.equal(missionStoppedAtLimit(controlMission("blocked", { stopReason: "deadline" })), true);
+  assert.equal(missionStoppedAtLimit(controlMission("blocked")), false);
+  assert.equal(missionStoppedAtLimit(controlMission("paused", { stopReason: "deadline" })), false);
+});
+
+test("extend choices add the mission's own limit in ascending order and mark it", () => {
+  const labels = (maxMinutes: number) => missionExtendChoices(maxMinutes).map(choice => choice.label);
+  assert.deepEqual(labels(240), ["+1 h", "+4 h (its limit)", "+6 h", "+24 h"]);
+  assert.deepEqual(labels(1440), ["+1 h", "+6 h", "+24 h (its limit)"]);
+  assert.deepEqual(labels(90), ["+1 h", "+90 min (its limit)", "+6 h", "+24 h"]);
+  assert.deepEqual(labels(60), ["+1 h (its limit)", "+6 h", "+24 h"]);
+  assert.deepEqual(missionExtendChoices(90).map(choice => choice.minutes), [60, 90, 360, 1440]);
+  assert.deepEqual(missionExtendChoices(90).map(choice => choice.ownLimit), [false, true, false, false]);
+});
+
+test("a deadline stop reads as stopped at the time limit, and other blocked missions stay blocked", () => {
+  assert.equal(missionStatusLabel("blocked", "deadline"), "Stopped at time limit");
+  assert.equal(missionStatusLabel("blocked"), "Blocked");
 });

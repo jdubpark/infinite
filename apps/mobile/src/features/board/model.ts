@@ -65,12 +65,32 @@ export function openMissionDecisions(mission: Mission): MissionDecision[] {
   return mission.decisions.filter(decision => decision.answer == null);
 }
 
-export function missionStatusLabel(status: MissionStatus) {
+export function missionStatusLabel(status: MissionStatus, stopReason?: Mission["stopReason"]) {
+  if (status === "blocked" && stopReason === "deadline") return "Stopped at time limit";
   const labels: Record<MissionStatus, string> = {
     planning: "Planning", working: "Working", "needs-input": "Needs your input", paused: "Paused",
     blocked: "Blocked", "ready-for-review": "Ready for review", cancelled: "Cancelled",
   };
   return labels[status];
+}
+
+/** Blocked because its approved time ran out; its work is kept and the owner can extend it. */
+export function missionStoppedAtLimit(mission: Pick<Mission, "status" | "stopReason">): boolean {
+  return mission.status === "blocked" && mission.stopReason === "deadline";
+}
+
+/**
+ * Extension amounts for the owner: one hour, six hours and a day, plus the mission's own limit
+ * when it is a whole number of minutes from 5 to 1440 that the list does not already hold.
+ */
+export function missionExtendChoices(maxMinutes: number): { minutes: number; label: string; ownLimit: boolean }[] {
+  const minutes = [60, 360, 1440];
+  if (Number.isInteger(maxMinutes) && maxMinutes >= 5 && maxMinutes <= 1440 && !minutes.includes(maxMinutes)) minutes.push(maxMinutes);
+  return minutes.sort((a, b) => a - b).map(value => {
+    const ownLimit = value === maxMinutes;
+    const span = value % 60 === 0 ? `+${value / 60} h` : `+${value} min`;
+    return { minutes: value, label: ownLimit ? `${span} (its limit)` : span, ownLimit };
+  });
 }
 
 export function missionSubtaskLabel(status: MissionSubtask["status"]) {
@@ -89,6 +109,7 @@ export function missionControls(mission: Mission, role: Me["role"] | undefined, 
     steer: owner && live && mission.status !== "paused",
     pause: owner && ["planning", "working", "needs-input"].includes(mission.status),
     resume: owner && mission.status === "paused" && Date.parse(mission.deadlineAt) > now,
+    extend: owner && (["planning", "working", "needs-input", "paused"].includes(mission.status) || missionStoppedAtLimit(mission)),
     cancel: owner && live,
   };
 }

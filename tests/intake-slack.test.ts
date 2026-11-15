@@ -159,15 +159,146 @@ test("a question is posted with its number and options, and an option number ans
     const { id, decision } = await questionFlow(h, services.missions);
     s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: id }));
     await s.surface.start(); await s.connected();
-    const question = `Q1: ${decision.question}\n1. JSON   2. Text\nReply with a mention and your answer.`;
+    const question = `**Q1: ${decision.question}**\n\n1. JSON\n2. Text\n\nChoose below, or reply with a mention and your answer.`;
     await waitFor(async () => s.texts(), list => list.includes(question));
-    await s.slack.emit(mention("1"));
+    const questionPost = s.slack.posts(BINDING).find(post => post.text === question)!;
+    const posted = s.slack.postPayloads(BINDING).find(post => post.text === question)!;
+    const choice = (posted.blocks as Record<string, any>[]).flatMap(block => block.elements ?? [])
+      .find((element: Record<string, any>) => element.type === "button" && element.value === "0");
+    assert.ok(choice, "The posted question includes the first persisted choice as a Slack button");
+    await s.slack.emitInteraction({ type: "block_actions", team: { id: "T00000000" }, user: { id: OWNER }, channel: { id: BINDING.channelId },
+      message: { ts: questionPost.ts, thread_ts: BINDING.threadTs }, container: { channel_id: BINDING.channelId, message_ts: questionPost.ts, thread_ts: BINDING.threadTs },
+      actions: [{ action_id: choice.action_id, block_id: choice.block_id ?? (posted.blocks as Record<string, any>[]).find(block => block.elements?.includes(choice))?.block_id,
+        action_ts: stamp(), value: choice.value }] });
     const answered = await waitFor(async () => services.missions.peek(id)!, mission => Boolean(mission.decisions[0].answer), 30000);
     assert.equal(answered.decisions[0].answer, "JSON");
     assert.equal(answered.decisions[0].answeredBy, "owner");
     assert.ok(answered.events.some(event => /^The owner answered a question from Slack; the answer is being forwarded to subtask /.test(event.text)));
-    assert.equal(s.texts().at(-1), question, "Answering posts nothing further");
+    await waitFor(async () => s.texts(), texts => texts.includes("Received your answer to Q1."));
+    assert.equal(s.texts().at(-1), "Received your answer to Q1.", "A successful answer gets an in-thread receipt");
   } finally { await s.close(); await h.close(); }
+});
+
+test("decision controls commit only on valid submit and denial keeps the question open", { timeout: 60000 }, async () => {
+  const h = harness();
+  const makeDecisionServices = (mode: "approval" | "single" | "single-alt" | "multiple") => {
+    const isSingle = mode === "single" || mode === "single-alt";
+    const options = isSingle ? [`Preserve ${"shared ".repeat(12)}alpha`, `Preserve ${"shared ".repeat(12)}beta`] : ["Skip", "Write blanks"];
+    const decision = { id: randomUUID(), memberId: randomUUID(), revision: 1, question: "Choose the export behavior?", options, answerMode: isSingle ? "single" : mode, createdAt: NOW };
+    const mission = { id: randomUUID(), revision: 1, status: "needs-input", decisions: [decision], subtasks: [], events: [] } as unknown as Mission;
+    const listeners = new Set<(value: Mission) => void>();
+    const missions = {
+      peek: (id: string) => id === mission.id ? structuredClone(mission) : undefined,
+      onChange: (listener: (value: Mission) => void) => { listeners.add(listener); return () => listeners.delete(listener); },
+      answer: async (_id: string, decisionId: string, input: { text: string }) => {
+        Object.assign(decision, { answer: input.text });
+        mission.revision += 1;
+        for (const listener of listeners) listener(mission);
+      },
+      pause: async () => undefined, resume: async () => undefined, cancel: async () => undefined, steer: async () => undefined,
+    } as unknown as MissionService;
+    return { missions, mission, decision };
+  };
+  const run = async (mode: "approval" | "single" | "single-alt" | "multiple") => {
+    const services = makeDecisionServices(mode);
+    const slack = await startSlackServer();
+    const config = { stateDir: join(h.root, `state-${mode}`), runDir: join(h.root, `run-${mode}`), projects: [{ id: "api", name: "API", path: PROJECT_PATH }], intake: {
+      linear: { teamIds: [randomUUID()], creatorId: randomUUID(), label: "infinite", commentsMirrorToSlack: false },
+      slack: { appTokenFile: slack.appTokenFile, botTokenFile: slack.botTokenFile, teamId: "T00000000", ownerUserId: OWNER, endpoint: slack.endpoint },
+      mission: { groupId: "shop", maxSubtasks: 8, maxMinutes: 30 }, maxActive: 3, requireSlackThread: true,
+    } } as unknown as Config;
+    const stateKey = randomBytes(32);
+    const store = new IntakeStore(config, stateKey);
+    store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: services.mission.id }));
+    const client = new SlackClient({ botTokenFile: slack.botTokenFile, appTokenFile: slack.appTokenFile, endpoint: slack.endpoint, timeoutMs: 2000 });
+    let restartedSurface: IntakeSlackSurface | undefined;
+    const surface = new IntakeSlackSurface(config, store, services.missions, { get: () => { throw new Error("unused"); } } as unknown as TeamService, client);
+    await surface.start(); await waitFor(async () => surface.status().connected, Boolean, 10000);
+    await waitFor(async () => slack.posts(BINDING), posts => posts.some(post => post.text.includes("Choose the export behavior?")));
+    const question = slack.posts(BINDING).find(post => post.text.includes("Choose the export behavior?"))!;
+    const blockId = `infinite-decision:${ISSUE}:${services.decision.id}`;
+    const payload = slack.postPayloads(BINDING).find(post => post.text.includes("Choose the export behavior?"))!;
+    assert.ok(payload.text.includes(services.decision.options.map((option, index) => `${index + 1}. ${option}`).join("\n")), "The complete choices remain readable in Markdown");
+    const blocks = payload.blocks as Record<string, any>[];
+    assert.deepEqual(blocks[0], { type: "markdown", text: payload.text }, "The question remains visible with interactive controls");
+    const interactiveBlocks = blocks.filter(block => Array.isArray(block.elements) || block.accessory);
+    assert.equal(new Set(interactiveBlocks.map(block => block.block_id)).size, interactiveBlocks.length, "Slack block IDs are unique per message");
+    const elements = interactiveBlocks.flatMap(block => [...(block.elements ?? []), ...(block.accessory ? [block.accessory] : [])] as Record<string, any>[]);
+    for (const block of interactiveBlocks) {
+      const blockElements = [...(block.elements ?? []), ...(block.accessory ? [block.accessory] : [])] as Record<string, any>[];
+      assert.equal(new Set(blockElements.map(element => element.action_id)).size, blockElements.length, "Slack action IDs are unique within each block");
+      for (const element of blockElements) for (const option of element.options ?? []) assert.ok(Array.from(option.text.text).length <= 75);
+    }
+    const action = async (actionId: string, value: string, extra: Record<string, unknown> = {}, state?: Record<string, unknown>, override: Record<string, unknown> = {}) => slack.emitInteraction({
+      type: "block_actions", team: { id: "T00000000" }, user: { id: OWNER }, channel: { id: BINDING.channelId }, message: { ts: question.ts, thread_ts: BINDING.threadTs },
+      container: { channel_id: BINDING.channelId, message_ts: question.ts, thread_ts: BINDING.threadTs },
+      actions: [{ action_id: actionId, block_id: typeof extra.block_id === "string" ? extra.block_id : blockId, action_ts: stamp(), value, ...extra }],
+      ...(state ? { state } : {}),
+      ...override,
+    });
+    try {
+      if (mode === "approval") {
+        const denyEnvelope = await action("infinite_decision_deny", "1");
+        await waitFor(async () => slack.posts(BINDING), posts => posts.some(post => post.text.includes("What would you prefer instead?")));
+        assert.equal(services.decision.answer, undefined);
+        await slack.redeliver(denyEnvelope);
+        await delay(100);
+        assert.equal(slack.posts(BINDING).filter(post => post.text.includes("What would you prefer instead?")).length, 1);
+        await slack.emit(mention("Q1 Use CSV"));
+        await waitFor(async () => services.decision.answer, Boolean);
+        assert.equal(services.decision.answer, "Use CSV", "The alternative follows the ordinary tagged-answer path");
+      } else if (mode === "single" || mode === "single-alt") {
+        const choice = elements.find(element => element.type === "static_select")!;
+        assert.ok(choice && choice.options.every((option: Record<string, any>) => Array.from(option.text.text).length <= 75));
+        assert.match(choice.options[0].text.text, /^1\. /);
+        assert.match(choice.options[1].text.text, /^2\. /);
+        if (mode === "single-alt") {
+          const none = elements.find(element => element.action_id === "infinite_decision_other")!;
+          const noneBlock = interactiveBlocks.find(block => block.elements?.includes(none))!;
+          const prompt = await action(none.action_id, none.value, { block_id: noneBlock.block_id });
+          await waitFor(async () => slack.posts(BINDING), posts => posts.some(post => post.text.includes("What would you prefer instead? Reply with a mention and Q1 followed by your alternative.")));
+          await slack.redeliver(prompt);
+          await delay(100);
+          assert.equal(services.decision.answer, undefined, "None of these keeps a single-choice decision open");
+          assert.equal(slack.posts(BINDING).filter(post => post.text.includes("Q1 followed by your alternative.")).length, 1);
+          await slack.emit(mention("Q1 Use CSV"));
+          await waitFor(async () => services.decision.answer, Boolean);
+          assert.equal(services.decision.answer, "Use CSV");
+          return;
+        }
+        await action(choice.action_id, "0");
+        await waitFor(async () => services.decision.answer, Boolean);
+        assert.equal(services.decision.answer, services.decision.options[0]);
+      } else {
+        const before = services.mission.revision;
+        await action("infinite_decision_submit", "submit", { block_id: `${blockId}:submit` }, { values: { [blockId]: { infinite_decision_multi: { type: "multi_static_select", selected_options: [{ value: "0" }] } } } }, { user: { id: TEAMMATE } });
+        await action("infinite_decision_multi", "", { selected_options: [{ value: "0" }] });
+        await delay(150);
+        assert.equal(services.mission.revision, before, "Unauthorized users and selection changes cannot answer the decision");
+        await action("infinite_decision_submit", "submit", { block_id: `${blockId}:submit` }, { values: { [blockId]: { infinite_decision_multi: { type: "multi_static_select", selected_options: [{ value: "9" }] } } } });
+        await action("infinite_decision_submit", "submit", { block_id: `${blockId}:submit` }, { values: { [blockId]: { infinite_decision_multi: { type: "multi_static_select", selected_options: [{ value: "0" }] } } } }, { message: { ts: stamp(), thread_ts: BINDING.threadTs } });
+        await delay(150);
+        assert.equal(services.mission.revision, before, "Out-of-range and cross-message actions are rejected");
+        const submitted = await action("infinite_decision_submit", "submit", { block_id: `${blockId}:submit` }, { values: { [blockId]: { infinite_decision_multi: { type: "multi_static_select", selected_options: [{ value: "0" }, { value: "1" }] } } } });
+        await waitFor(async () => services.decision.answer, Boolean);
+        assert.equal(services.decision.answer, "1. Skip\n2. Write blanks");
+        assert.ok(store.get(ISSUE)!.messages.some(item => item.kind === "question" && item.ts === question.ts && item.blocks?.length), "Question controls survive in the durable message record");
+        await waitFor(async () => slack.posts(BINDING), posts => posts.some(post => post.text === "Received your answer to Q1."));
+        const answeredRevision = services.mission.revision;
+        surface.close();
+        const restoredStore = new IntakeStore(config, stateKey);
+        restartedSurface = new IntakeSlackSurface(config, restoredStore, services.missions, { get: () => { throw new Error("unused"); } } as unknown as TeamService,
+          new SlackClient({ botTokenFile: slack.botTokenFile, appTokenFile: slack.appTokenFile, endpoint: slack.endpoint, timeoutMs: 2000 }));
+        await restartedSurface.start(); await waitFor(async () => restartedSurface!.status().connected, Boolean, 10000);
+        await slack.redeliver(submitted);
+        await delay(200);
+        assert.equal(services.mission.revision, answeredRevision, "A persisted interactive answer redelivery after restart does not answer twice");
+        assert.equal(slack.posts(BINDING).filter(post => post.text === "Received your answer to Q1.").length, 1);
+      }
+    } finally { surface.close(); restartedSurface?.close(); await slack.close(); }
+  };
+  try { await run("approval"); await run("single"); await run("single-alt"); await run("multiple"); }
+  finally { await h.close(); }
 });
 
 test("plain text answers the open question verbatim", { timeout: 150000 }, async () => {
@@ -176,7 +307,7 @@ test("plain text answers the open question verbatim", { timeout: 150000 }, async
     const { id, decision } = await questionFlow(h, services.missions);
     s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: id }));
     await s.surface.start(); await s.connected();
-    await waitFor(async () => s.texts(), list => list.some(text => text.startsWith(`Q1: ${decision.question}`)));
+    await waitFor(async () => s.texts(), list => list.some(text => text.startsWith(`**Q1: ${decision.question}**`)));
     await s.slack.emit(mention("Text"));
     const answered = await waitFor(async () => services.missions.peek(id)!, mission => Boolean(mission.decisions[0].answer), 30000);
     assert.equal(answered.decisions[0].answer, "Text");
@@ -189,7 +320,7 @@ test("a question answered in the apps closes it for Slack", { timeout: 150000 },
     const { id, decision } = await questionFlow(h, services.missions);
     s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: id }));
     await s.surface.start(); await s.connected();
-    await waitFor(async () => s.texts(), list => list.some(text => text.startsWith(`Q1: ${decision.question}`)));
+    await waitFor(async () => s.texts(), list => list.some(text => text.startsWith(`**Q1: ${decision.question}**`)));
     const asked = services.missions.peek(id)!;
     await services.missions.answer(id, decision.id, { requestId: randomUUID(), revision: asked.revision, text: "Text" });
     await s.slack.emit(mention("Q1 2"));
@@ -218,7 +349,7 @@ test("status, pause, resume, and cancel are mission actions, in any case", { tim
     await until(() => sh.get(id), mission => mission.status === "needs-input");
     s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: id }));
     await s.surface.start(); await s.connected();
-    await waitFor(async () => s.texts(), list => list.some(text => text.startsWith("Q1: Skip empty rows?")));
+    await waitFor(async () => s.texts(), list => list.some(text => text.startsWith("**Q1: Skip empty rows?**")));
     await s.slack.emit(mention("STATUS"));
     await waitFor(async () => s.texts(), list => list.at(-1) === "needs-input\nQ1: Skip empty rows?");
     await s.slack.emit(mention("Pause"));
@@ -287,13 +418,29 @@ test("a redelivered envelope yields one answer", { timeout: 90000 }, async () =>
     await s.surface.start(); await s.connected();
     await waitFor(async () => s.texts(), list => list.length === 2);
     const before = sh.get(id).revision;
+    const update = s.store.update.bind(s.store);
+    let failHandledWrite = true;
+    s.store.update = (issueId, change) => update(issueId, draft => {
+      const handled = draft.inbound.filter(item => item.handledAt).length;
+      change(draft);
+      if (failHandledWrite && draft.inbound.filter(item => item.handledAt).length > handled) {
+        failHandledWrite = false;
+        throw new Error("The disk is full.");
+      }
+    });
     const envelope = await s.slack.emit(mention("1"));
     await until(() => sh.get(id), mission => Boolean(mission.decisions[0].answer));
+    await until(() => failHandledWrite, failed => !failed);
+    await delay(300);
+    assert.equal(s.store.get(ISSUE)!.inbound[0].handledAt, undefined, "The failed write leaves the answer replayable");
+    assert.ok(!s.texts().includes("Received your answer to Q1."), "No receipt is posted before the handled entry is saved");
     await s.slack.redeliver(envelope);
+    await waitFor(async () => s.texts(), texts => texts.includes("Received your answer to Q1."));
     await delay(500);
     assert.equal(s.store.get(ISSUE)!.inbound.length, 1, "The redelivered envelope adds no entry");
     assert.equal(sh.get(id).decisions[0].answer, "Skip", "The question is answered once");
     assert.equal(sh.get(id).revision, before + 1, "The answer advanced the revision once");
+    assert.equal(s.texts().filter(text => text === "Received your answer to Q1.").length, 1, "The durable answer receipt is posted once");
   } finally { await close(); }
 });
 
@@ -494,9 +641,9 @@ test("a Slack outage blocks no mission, and messages arrive when it ends", { tim
     assert.equal(sh.get(id).decisions[0].answer, "Skip", "The owner answers through the apps during the outage");
     assert.notEqual(sh.get(id).status, "blocked", "The outage blocks no mission");
     s.slack.unavailable(false);
-    await waitFor(async () => s.texts(), list => list.some(text => text.startsWith("Q1: Skip empty rows?")), 20000);
+    await waitFor(async () => s.texts(), list => list.some(text => text.startsWith("**Q1: Skip empty rows?**")), 20000);
     assert.deepEqual(s.texts(), [ACK, s.texts()[1]]);
-    assert.equal(s.texts()[1], "Q1: Skip empty rows?\n1. Skip   2. Write blanks\nReply with a mention and your answer.");
+    assert.equal(s.texts()[1], "**Q1: Skip empty rows?**\n\n1. Skip\n2. Write blanks\n\nChoose below, or reply with a mention and your answer.");
   } finally { await close(); }
 });
 
@@ -599,7 +746,7 @@ test("a question with no options takes the owner's text literally", { timeout: 9
     s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: id }));
     await s.surface.start();
     await waitFor(async () => s.texts(), list => list.length === 2, 30000);
-    assert.equal(s.texts()[1], "Q1: How many rows should the export keep?\nReply with a mention and your answer.");
+    assert.equal(s.texts()[1], "**Q1: How many rows should the export keep?**\n\nReply with a mention and your answer.");
     await s.slack.emit(mention("2"));
     const answered = await until(() => sh.get(id), mission => Boolean(mission.decisions[0].answer));
     assert.equal(answered.decisions[0].answer, "2");
@@ -623,11 +770,11 @@ test("with two questions open, Qn addresses one and plain text answers the oldes
     await until(() => sh.get(id), mission => mission.status === "needs-input");
     s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: id }));
     await s.surface.start();
-    await waitFor(async () => s.texts(), list => list.some(text => text.startsWith("Q1: Skip empty rows?")), 30000);
+    await waitFor(async () => s.texts(), list => list.some(text => text.startsWith("**Q1: Skip empty rows?**")), 30000);
     sh.set(webTeam, { status: "needs-input", decisions: [{ id: second, memberId: randomUUID(), revision: 1, question: "Keep the header row?", options: [], createdAt: now }] });
     await sh.report(3, { kind: "question", question: "Keep the header row?", options: [], subtaskId: "b", childDecisionId: second });
     await until(() => sh.get(id), mission => mission.decisions.length === 2);
-    await waitFor(async () => s.texts(), list => list.some(text => text.startsWith("Q2: Keep the header row?")), 30000);
+    await waitFor(async () => s.texts(), list => list.some(text => text.startsWith("**Q2: Keep the header row?**")), 30000);
     await s.slack.emit(mention("Q2 yes"));
     await until(() => sh.get(id), mission => mission.decisions[1].answer === "yes");
     assert.equal(sh.get(id).decisions[0].answer, undefined, "Qn leaves the oldest question open");
@@ -830,7 +977,7 @@ test("questions, results, and blocked reasons reach Slack without host paths or 
     const stored = [ISSUE, second, third].flatMap(id => s.store.get(id)!.messages.map(message => message.text));
     const posted = [BINDING, OTHER, THIRD].flatMap(thread => s.texts(thread));
     for (const text of [...stored, ...posted]) assert.deepEqual(leaks(text), [], text);
-    assert.equal(s.texts(BINDING)[1], "Q1: Keep [local path omitted], [local path omitted] and [address omitted]?\n1. Keep   2. Move it from [local path omitted], [local path omitted] and [address omitted]\nReply with a mention and your answer.");
+    assert.equal(s.texts(BINDING)[1], "**Q1: Keep [local path omitted], [local path omitted] and [address omitted]?**\n\n1. Keep\n2. Move it from [local path omitted], [local path omitted] and [address omitted]\n\nChoose below, or reply with a mention and your answer.");
     assert.equal(s.texts(OTHER)[1], "Ready for review (agent report):\nChanged [local path omitted], [local path omitted] and [address omitted]. Docs: https://example.com/opt/x\nPull request: https://github.com/example/api/pull/1");
     assert.match(s.texts(THIRD)[1], /^Blocked: Cannot reach \[local path omitted\]/);
   } finally { await s.close(); rmSync(stateRoot, { recursive: true, force: true }); }

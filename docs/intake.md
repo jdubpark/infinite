@@ -283,7 +283,10 @@ order as the mission moves:
   `I'll post questions and the result here once it starts.` A later change of the
   hold reason posts nothing. When a queued or held request starts, `Started on ID.`
   follows;
-- a numbered question for each mission decision, with its options;
+- a numbered question for each mission decision, with each option on its own line. New questions also include controls
+  when the decision has choices: approvals have Approve and Deny, single-choice decisions use buttons or a menu, and
+  multiple-choice decisions use a multi-select with an explicit Submit button. The choices remain readable in the
+  message text. Multi-select changes do not answer the question until Submit is pressed;
 - a status note when the mission is paused, but only when the record has a
   `closure`, which is set when the Linear issue is deleted, archived, cancelled,
   or closed. The note says why and asks for `resume` or `cancel`. A pause with no
@@ -312,6 +315,8 @@ and a trailing run of `) ] , ; : . ! ?` stays in the text. Then every IPv4 liter
 becomes `[address omitted]`, which also hides four-part version numbers. The filter
 applies to every Slack message and every Linear comment.
 
+Messages use Slack's Markdown blocks to render paragraphs, lists, emphasis,
+links, and code, with a text fallback for notifications and accessibility.
 Text longer than 3,000 characters is split across messages. Code fences are kept
 whole where the split allows it. Each message has a key, and a message whose
 last send may have reached Slack is looked up in the thread before it is sent
@@ -334,6 +339,18 @@ counted as dropped. In a reply:
   accepted as the answer;
 - an unnumbered reply answers the oldest open question;
 - with no open question, any other text is a steer to the coordinator.
+
+After an answer is saved by the mission, the bot posts `Received your answer to
+Q<n>.` in the same thread. This confirms receipt, not completed work or a resumed
+mission. The receipt uses the same durable delivery and duplicate protection as
+other bot replies, including after a restart or a lost Slack response.
+
+Deny and `None of these` leave the decision open and ask `What would you prefer
+instead? Reply with a mention and Q<n> followed by your alternative.` The
+alternative is then handled as the owner's ordinary tagged reply. Controls are
+bound to the recorded question message, owner, workspace, channel, thread, and
+current open decision; stale or mismatched callbacks are ignored. Existing
+questions are not edited when controls are introduced.
 
 ### Time limit stop
 

@@ -37,6 +37,7 @@ const ANSWER_FOOTER = "No issue was filed. To start work, mention me with the ch
 const WORK_HINT = "I took this as a request for a change. If you only wanted an answer, reply with a mention and \"cancel\", then mention me again starting with \"ask:\".";
 const WORK_HINT_QUEUED = "I took this as a request for a change. If you only wanted an answer, reply with a mention and \"cancel\" once it starts, then mention me again starting with \"ask:\".";
 const QUESTION = /^Q(\d+)(?!\w)\s*/i;
+const alternativePrompt = (n: number) => `What would you prefer instead? Reply with a mention and Q${n} followed by your alternative.`;
 
 export type DirectRequest = (input: { thread: IntakeThread; ts: string; eventId: string; text: string }) => "accepted" | "duplicate";
 
@@ -80,19 +81,44 @@ const mentionsIdentifier = (text: string, identifier: string) =>
  * Adds the text as one pending message, or as numbered parts when it is longer than one Slack message. Every part of
  * every kind is made here, after the outbound filter has removed host paths and addresses.
  */
-function addParts(config: Config, draft: IntakeRecord, key: string, kind: IntakeMessageKind, text: string, createdAt: string) {
+function addParts(config: Config, draft: IntakeRecord, key: string, kind: IntakeMessageKind, text: string, createdAt: string,
+  blocks?: Record<string, unknown>[]) {
   const parts = splitSlackText(outboundText(config, text));
   parts.forEach((part, index) => {
     const partKey = parts.length > 1 ? `${key}#${index + 1}` : key;
     if (draft.messages.some(message => message.key === partKey)) return;
-    const message: IntakeMessage = { key: partKey, kind, text: part, createdAt, status: "pending", attempts: 0 };
+    const message: IntakeMessage = { key: partKey, kind, text: part, createdAt, status: "pending", attempts: 0,
+      ...(index === parts.length - 1 && blocks ? { blocks } : {}) };
     draft.messages.push(message);
   });
 }
 
 const questionText = (decision: MissionDecision) => (n: number) => {
-  const options = decision.options.length ? [decision.options.map((option, index) => `${index + 1}. ${option}`).join("   ")] : [];
-  return [`Q${n}: ${decision.question}`, ...options, "Reply with a mention and your answer."].join("\n");
+  const options = decision.options.map((option, index) => `${index + 1}. ${option}`);
+  const footer = decision.answerMode === "multiple" ? "Choose one or more options, then Submit. You can also reply with a mention and your answer."
+    : options.length ? "Choose below, or reply with a mention and your answer." : "Reply with a mention and your answer.";
+  return [`**Q${n}: ${decision.question}**`, ...(options.length ? ["", ...options] : []), "", footer].join("\n");
+};
+
+const safeLabel = (config: Config, label: string) => Array.from(outboundText(config, label)).slice(0, 75).join("");
+const choiceBlocks = (config: Config, issueId: string, decision: MissionDecision): Record<string, unknown>[] => {
+  const blockId = `infinite-decision:${issueId}:${decision.id}`;
+  const button = (text: string, actionId: string, value: string, style?: string) => ({ type: "button", text: { type: "plain_text", text: safeLabel(config, text) }, action_id: actionId, value, ...(style ? { style } : {}) });
+  if (decision.answerMode === "approval") return [{ type: "actions", block_id: blockId, elements: [
+    button("Approve", "infinite_decision_choice", "0", "primary"), button("Deny", "infinite_decision_deny", "1", "danger"),
+  ] }];
+  if (decision.answerMode === "multiple") return [
+    { type: "section", block_id: blockId, text: { type: "plain_text", text: "Choose one or more options" }, accessory: { type: "multi_static_select", action_id: "infinite_decision_multi", placeholder: { type: "plain_text", text: "Choose one or more" }, options: decision.options.map((label, index) => ({ text: { type: "plain_text", text: safeLabel(config, `${index + 1}. ${label}`) }, value: String(index) })) } },
+    { type: "actions", block_id: `${blockId}:submit`, elements: [button("Submit", "infinite_decision_submit", "submit")] },
+    { type: "actions", block_id: `${blockId}:other`, elements: [button("None of these", "infinite_decision_other", "other")] },
+  ];
+  const options = decision.options.length > 0 && decision.options.every(option => Array.from(outboundText(config, option)).length <= 75);
+  const selection: Record<string, unknown>[] = options ? [{ type: "actions", block_id: blockId,
+      elements: decision.options.map((label, index) => button(`${index + 1}. ${label}`, `infinite_decision_choice_${index}`, String(index))) }]
+    : decision.options.length > 0 ? [{ type: "actions", block_id: blockId, elements: [{ type: "static_select", action_id: "infinite_decision_choice",
+      placeholder: { type: "plain_text", text: "Choose an option" }, options: decision.options.map((label, index) => ({ text: { type: "plain_text", text: safeLabel(config, `${index + 1}. ${label}`) }, value: String(index) })) }] }] : [];
+  if (decision.options.length > 0) selection.push({ type: "actions", block_id: `${blockId}:other`, elements: [button("None of these", "infinite_decision_other", "other")] });
+  return selection;
 };
 
 /**
@@ -302,7 +328,7 @@ export class IntakeSlackSurface {
       for (const decision of mission.decisions) {
         if (decision.answer || has(`q:${decision.id}`)) continue;
         const n = this.questionNumber(draft, decision.id);
-        addParts(this.config, draft, `q:${decision.id}`, "question", questionText(decision)(n), at);
+        addParts(this.config, draft, `q:${decision.id}`, "question", questionText(decision)(n), at, choiceBlocks(this.config, draft.issueId, decision));
       }
       if (mission.status === "ready-for-review" && mission.result) {
         add(`result:${mission.result.revision}`, "result", this.resultText(mission, answer));
@@ -412,7 +438,8 @@ export class IntakeSlackSurface {
     }
     this.patch(issueId, key, item => { item.uncertain = true; item.attempts += 1; });
     try {
-      const { ts } = await this.client.post(thread, message.text, transport);
+      const blocks = message.blocks ? [{ type: "markdown", text: message.text }, ...message.blocks] : undefined;
+      const { ts } = await this.client.post(thread, message.text, transport, blocks);
       this.patch(issueId, key, item => {
         item.status = "sent"; item.ts = ts;
         delete item.uncertain; delete item.nextAttemptAt; delete item.error;
@@ -451,6 +478,7 @@ export class IntakeSlackSurface {
   // Inbound
 
   private async receive(envelope: SlackEnvelope): Promise<void> {
+    if (envelope.interaction) { await this.receiveInteraction(envelope); return; }
     const slack = this.slack;
     const event = envelope.event;
     if (!slack || !event || envelope.teamId !== slack.teamId || event.type !== "app_mention" || event.user !== slack.ownerUserId
@@ -499,6 +527,82 @@ export class IntakeSlackSurface {
       draft.inbound.push(accepted);
     });
     void this.drain(target.record.issueId);
+  }
+
+  /** Validate an interactive callback against the configured owner, the persisted question, and the exact Slack post. */
+  private async receiveInteraction(envelope: SlackEnvelope): Promise<void> {
+    const slack = this.slack, interaction = envelope.interaction;
+    if (!slack || !interaction || interaction.type !== "block_actions" || interaction.teamId !== slack.teamId || interaction.userId !== slack.ownerUserId
+      || interaction.actions.length !== 1) { this.droppedCount += 1; return; }
+    const action = interaction.actions[0]!;
+    const match = /^(infinite-decision:([0-9a-f-]{36}):([^:]{1,128}))(?:\:(?:submit|other))?$/.exec(action.blockId);
+    if (!match || !action.actionTs || !action.actionId.startsWith("infinite_decision_")) { this.droppedCount += 1; return; }
+    const [, baseBlockId, issueId, decisionId] = match;
+    const record = this.store.get(issueId);
+    if (!record?.thread || record.state === "skipped" || record.thread.channelId !== interaction.channelId
+      || (interaction.threadTs !== undefined && interaction.threadTs !== record.thread.threadTs)) { this.droppedCount += 1; return; }
+    const message = record.messages.find(item => item.kind === "question" && item.blocks?.some(block => block.block_id === action.blockId));
+    if (!message) { this.droppedCount += 1; return; }
+    const controlBlock = message.blocks?.find(block => block.block_id === action.blockId);
+    const control = controlBlock?.elements;
+    const candidates = [...(Array.isArray(control) ? control : []), ...(controlBlock?.accessory ? [controlBlock.accessory] : [])];
+    const element = candidates.find((item): item is Record<string, unknown> => Boolean(item && typeof item === "object" && (item as Record<string, unknown>).action_id === action.actionId));
+    if (!element) { this.droppedCount += 1; return; }
+    const optionValues = Array.isArray(element.options) ? element.options.flatMap(option => option && typeof option === "object"
+      && typeof (option as Record<string, unknown>).value === "string" ? [(option as Record<string, unknown>).value as string] : []) : [];
+    if ((element.type === "button" && action.value !== element.value)
+      || (element.type === "static_select" && action.value !== undefined && !optionValues.includes(action.value))
+      || (element.type === "multi_static_select" && action.selectedValues?.some(value => !optionValues.includes(value)))) { this.droppedCount += 1; return; }
+    if (!message.ts && message.uncertain) {
+      const messages = await this.client.thread(record.thread);
+      const found = Array.isArray(messages) ? messages.find(item => item.key === `${issueId}:${message.key}` && item.ts === interaction.messageTs) : undefined;
+      if (found) this.patch(issueId, message.key, item => { item.status = "sent"; item.ts = found.ts; delete item.uncertain; delete item.nextAttemptAt; });
+    }
+    const persisted = this.store.get(issueId)!;
+    const sent = persisted.messages.find(item => item.key === message.key);
+    if (!sent || sent.ts !== interaction.messageTs) { this.droppedCount += 1; return; }
+    const identity = `${interaction.channelId}:${interaction.messageTs}:${action.actionTs}:${action.actionId}`;
+    const entryId = `interactive:${identity}`;
+    const duplicate = persisted.inbound.find(item => item.interactionId === identity || item.eventId === entryId);
+    if (duplicate) { if (!duplicate.handledAt) void this.drain(issueId); return; }
+    const mission = persisted.missionId ? this.missions.peek(persisted.missionId) : undefined;
+    const decision = mission?.decisions.find(item => item.id === decisionId);
+    const question = persisted.questions.find(item => item.decisionId === decisionId);
+    if (!mission || !decision || decision.answer || !question) { this.droppedCount += 1; return; }
+    const mode = decision.answerMode ?? "single";
+    const blockRoot = baseBlockId;
+    const values = action.selectedValues ?? (action.value === undefined ? [] : [action.value]);
+    const validIndexes = (items: string[]) => items.every(value => /^(0|[1-9]\d*)$/.test(value) && Number(value) < decision.options.length)
+      && new Set(items).size === items.length;
+    if (action.actionId === "infinite_decision_multi" && mode === "multiple") {
+      if (!validIndexes(values)) { this.droppedCount += 1; return; }
+      return; // A selection change is acknowledged; only Submit commits it.
+    }
+    let answerText: string | undefined;
+    let reply: string | undefined;
+    if (action.actionId === "infinite_decision_other" && (mode === "single" || mode === "multiple") && action.value === "other") reply = alternativePrompt(question.n);
+    else if (action.actionId === "infinite_decision_deny" && mode === "approval" && action.value === "1") reply = alternativePrompt(question.n);
+    else if ((action.actionId === "infinite_decision_choice" || /^infinite_decision_choice_\d+$/.test(action.actionId))
+      && (mode === "single" || mode === "approval") && validIndexes(values) && values.length === 1
+      && (!action.actionId.endsWith("choice") || action.value === values[0])
+      && (!action.actionId.startsWith("infinite_decision_choice_") || action.actionId === `infinite_decision_choice_${values[0]}`)
+      && (mode !== "approval" || values[0] === "0")) {
+      answerText = decision.options[Number(values[0])];
+    } else if (action.actionId === "infinite_decision_submit" && mode === "multiple" && action.value === "submit") {
+      const selection = interaction.state?.[blockRoot]?.infinite_decision_multi;
+      const selected = selection?.selectedValues ?? [];
+      if (selection?.type !== "multi_static_select" || !validIndexes(selected) || selected.length === 0) { this.droppedCount += 1; return; }
+      answerText = selected.map((value, index) => `${index + 1}. ${decision.options[Number(value)]}`).join("\n");
+    } else { this.droppedCount += 1; return; }
+    const text = reply ?? `Q${question.n} ${answerText}`;
+    this.store.update(issueId, draft => {
+      if (draft.inbound.some(item => item.interactionId === identity)) return;
+      const entry: IntakeInbound = { eventId: entryId, interactionId: identity, ts: interaction.messageTs, text, receivedAt: now(),
+        ...(answerText !== undefined ? { call: { action: "answer", decisionId, text: answerText, revision: mission.revision } } : {}) };
+      if (reply) { entry.handledAt = now(); entry.outcome = "alternative-requested"; addParts(this.config, draft, `reply:${entryId}`, "reply", reply, now()); }
+      draft.inbound.push(entry);
+    });
+    if (!reply) void this.drain(issueId);
   }
 
   /** Files the owner's mention as a request. A failure is logged, counted and rethrown; nothing is posted. */
@@ -672,6 +776,10 @@ export class IntakeSlackSurface {
         }
       }
       if (saved.action === "extend") return { outcome: OUTCOMES.extend, reply: this.extendedText(missionId, saved.minutes!) };
+      if (saved.action === "answer") {
+        const question = record.questions.find(item => item.decisionId === saved.decisionId);
+        return { outcome: OUTCOMES[saved.action], reply: question ? `Received your answer to Q${question.n}.` : "Received your answer." };
+      }
       return { outcome: OUTCOMES[saved.action] };
     } catch (error) {
       if (error instanceof TeamError) return { outcome: "refused", reply: error.message };

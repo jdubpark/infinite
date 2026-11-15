@@ -2117,5 +2117,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   const closeRemote = connectRemoteAccess(server, config);
   const closeConnections = () => { routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); intakeSlack?.close(); readings.stop(); goals.close(); teams.close(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
   return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, closeConnections, fuse,
-    permissions: { holder: (sessionId: string, promptId: number) => sessionPermissions.holder(sessionId, promptId) }, permissionAgent };
+    // ownerClass is read only for a dialog the delivery service handled and left to the owner, so no session wrapper is needed.
+    permissions: { holder: (sessionId: string, promptId: number) => sessionPermissions.holder(sessionId, promptId),
+      ownerClass: (sessionId: string, promptId: number) => permissionDelivery.ownerClass(sessionId, promptId) }, permissionAgent };
 }

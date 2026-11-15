@@ -504,6 +504,35 @@ test("the permission agent's holder decides the push: an agent-held dialog never
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("a dialog the permission agent leaves to the owner for a class names the class, and only a host class identifier", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("owner", "ExponentPushToken[a]", "android");
+  const sent: { title: string; body: string }[][] = [];
+  const sender = async (messages: { title: string; body: string }[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  const member = { id: "m1", title: "implementer: deploy", provider: "claude", status: "running", attention: att("working") };
+  // Prompt 1: a class rule or an owner verdict. 2: undeliverable, a host limit with no class. 3: a value that is not a host class.
+  const classes: Record<number, string | undefined> = { 1: "production-or-staging", 2: undefined, 3: "The model's note: deploy now" };
+  const notifier = new Notifier(
+    { list: async () => [member] } as never, store, sender,
+    { detail: "minimal", events: ["needs-you"], intervalMs: 100000 },
+    { statuses: () => [], promptOwner: () => "user" }, undefined, undefined, undefined,
+    { holder: () => "owner", ownerClass: (_sessionId, promptId) => classes[promptId] as never },
+  );
+  try {
+    await notifier.tick();
+    for (const promptId of [1, 2, 3]) {
+      member.attention = att("needs-you", promptId);
+      await notifier.tick();
+    }
+    assert.deepEqual(sent.map(batch => [batch[0].title, batch[0].body]), [
+      ["Needs your approval", "Claude Code needs your approval in implementer: deploy (production-or-staging)"],
+      ["Needs your approval", "Claude Code needs your approval in implementer: deploy"],
+      ["Needs your approval", "Claude Code needs your approval in implementer: deploy"],
+    ]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("a held prompt survives a session missing from one listing and still reaches the owner", async () => {
   const dir = mkdtempSync("/tmp/inf-push-");
   const store = new PushStore(dir, randomBytes(32));

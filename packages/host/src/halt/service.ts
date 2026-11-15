@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { TeamError } from "../team-workspace.js";
 import type { FuseGate } from "../fuse/types.js";
 import type { Config } from "../types.js";
-import { HALT_FILE, MAX_RECEIPTS, haltChain, readHaltRecord, writeHaltRecord, type HaltActor, type HaltEntry, type HaltReceipt, type HaltRecord } from "./record.js";
+import { HALT_COUNT_FILE, HALT_FILE, MAX_RECEIPTS, MAX_RECENT_HALTS, haltChain, readHaltCount, readHaltRecord, writeHaltCount, writeHaltRecord, type HaltActor, type HaltCount, type HaltEntry, type HaltReceipt, type HaltRecord } from "./record.js";
 import { haltReason, STILL_HALTED, type HaltCheck, type HaltCovers, type HaltHeldBy, type HaltItemKind, type HaltOutcome, type HaltTarget, type HaltTargets, type LaunchHalted } from "./rules.js";
 
 export type HaltServiceOptions = { config: Config; key: Buffer; now?: () => number; /** How often an unreadable record is read again. */ retryMs?: number };
@@ -46,6 +46,9 @@ export class HaltService {
   private readonly retryMs: number;
   private record: HaltRecord = { version: 1, halts: [], receipts: [] };
   private readable = true;
+  private readonly countFile: string;
+  private count: HaltCount = { version: 1, engaged: 0, chain: "", recent: [] };
+  private countReadable = true;
   private services?: HaltServices;
   private ownedTeam: (teamId: string) => boolean = () => false;
   private serial: Promise<unknown> = Promise.resolve();
@@ -56,6 +59,7 @@ export class HaltService {
     this.now = options.now ?? Date.now;
     this.retryMs = options.retryMs ?? RETRY_MS;
     this.file = join(options.config.stateDir, HALT_FILE);
+    this.countFile = join(options.config.stateDir, HALT_COUNT_FILE);
     this.load();
   }
 
@@ -89,19 +93,24 @@ export class HaltService {
   }
 
   /**
-   * The halts in force, each with its place in the count, how many halts the record has engaged in all, and the chain
-   * over their ids. Neither a release nor a dropped receipt changes the count or the chain. Undefined while the record
-   * cannot be read.
+   * The halts in force, each with its place in the count when it is among the latest ids, how many halts the host has
+   * engaged in all, and the chain over their ids. The count is kept in its own file: neither a release, a dropped
+   * receipt, nor a restored or removed halt record changes it. Undefined while either file cannot be read.
    */
   engagements(): { count: number; chain: string; halts: { haltId: string; projectId?: string; serial?: number }[] } | undefined {
-    if (!this.readable) return undefined;
+    if (!this.readable || !this.countReadable) return undefined;
+    const { engaged, chain, recent } = this.count;
+    const first = engaged - recent.length + 1;
     return {
-      count: this.record.engaged ?? 0,
-      chain: this.record.chain ?? "",
-      halts: this.record.halts.map(entry => ({
-        haltId: entry.haltId, ...(entry.scope === "project" && entry.projectId ? { projectId: entry.projectId } : {}),
-        ...(entry.serial === undefined ? {} : { serial: entry.serial }),
-      })),
+      count: engaged,
+      chain,
+      halts: this.record.halts.map(entry => {
+        const place = recent.indexOf(entry.haltId);
+        return {
+          haltId: entry.haltId, ...(entry.scope === "project" && entry.projectId ? { projectId: entry.projectId } : {}),
+          ...(place < 0 ? {} : { serial: first + place }),
+        };
+      }),
     };
   }
 
@@ -134,15 +143,22 @@ export class HaltService {
         if (!this.persist({ ...this.record, receipts: this.withReceipt(receipt) })) throw writeError();
         return this.engageResult(receipt);
       }
-      const serial = (this.record.engaged ?? 0) + 1;
       const entry: HaltEntry = {
         haltId: randomUUID(), scope: target.scope, ...(target.scope === "project" ? { projectId: target.projectId } : {}), at,
-        ...(body.reason === undefined ? {} : { reason: body.reason }), requestId: body.requestId, by, settled: false, serial,
+        ...(body.reason === undefined ? {} : { reason: body.reason }), requestId: body.requestId, by, settled: false,
       };
       const receipt: HaltReceipt = { requestId: body.requestId, action: "engage", fingerprint, haltId: entry.haltId, changed: true, at, by, settled: false, outcomes: [] };
       // The gate holds every new launch in scope from this write on, before any running item is paused.
-      const chain = haltChain(this.record.chain ?? "", entry.haltId);
-      if (!this.persist({ ...this.record, engaged: serial, chain, halts: [...this.record.halts, entry], receipts: this.withReceipt(receipt) })) throw writeError();
+      // The count is written first, so it never lacks a halt the record holds. A count that cannot be read starts a
+      // chain of its own, which never continues the one the permission agent recorded.
+      const base = this.countReadable ? this.count : { version: 1 as const, engaged: 0, chain: haltChain("", `reset:${randomUUID()}`), recent: [] };
+      const count: HaltCount = {
+        version: 1, engaged: base.engaged + 1, chain: haltChain(base.chain, entry.haltId), recent: [...base.recent, entry.haltId].slice(-MAX_RECENT_HALTS),
+      };
+      if (!writeHaltCount(this.countFile, this.key, count)) throw writeError();
+      this.count = count;
+      this.countReadable = true;
+      if (!this.persist({ ...this.record, halts: [...this.record.halts, entry], receipts: this.withReceipt(receipt) })) throw writeError();
       await this.finishEngage(receipt);
       return this.engageResult(this.record.receipts.find(value => value.requestId === receipt.requestId) ?? receipt);
     });
@@ -178,7 +194,10 @@ export class HaltService {
    */
   start(): Promise<void> {
     if (this.timer === undefined) {
-      this.timer = setInterval(() => { if (!this.readable) void this.enqueue(() => this.recover()).catch(() => {}); }, this.retryMs);
+      this.timer = setInterval(() => {
+        if (!this.readable) void this.enqueue(() => this.recover()).catch(() => {});
+        else if (!this.countReadable) void this.enqueue(() => this.reloadCount()).catch(() => {});
+      }, this.retryMs);
       this.timer.unref();
     }
     return this.enqueue(async () => { if (this.readable) await this.finishUnsettled(); });
@@ -316,7 +335,15 @@ export class HaltService {
     return true;
   }
 
+  /** A count that cannot be read leaves the permission agent unready until it can, or until the next halt writes a new one. */
+  private reloadCount() {
+    const counted = readHaltCount(this.countFile, this.key);
+    this.countReadable = counted.state !== "unreadable";
+    this.count = counted.state === "readable" ? counted.count : { version: 1, engaged: 0, chain: "", recent: [] };
+  }
+
   private load() {
+    this.reloadCount();
     const read = readHaltRecord(this.file, this.key);
     if (read.state === "unreadable") { this.readable = false; return; }
     this.readable = true;

@@ -383,7 +383,122 @@ work, because that is the behavior the owner already had.
 
 The current lockfile's production host dependency audit reports zero known advisories. The full workspace audit reports 29 findings (19 high, 10 moderate), propagated from four transitive packages in the Expo 57 dependency tree: `braces`, `node-forge`, `uuid`, and `decode-uri-component`. Most are in build tooling; the Router URI decoder also requires review before native release. At the time of the check, the registry's latest `braces` and `node-forge` versions remained affected. A forced audit fix proposed incompatible SDK changes, so it was not applied. These findings remain open; the mobile debug build is not a security-reviewed release.
 
+## Permission agent
+
+The permission agent's authority is the owner's recorded act and nothing else.
+Coverage is one entry for each project, written only by an owner client:
+`permissions delegate` for the projects that are in the workspace at that
+time, or the owner's first onboarding of the project. Group membership, a host
+fold and a repository identity that the host reads from a checkout grant
+nothing. A revoke, a regrouping by the owner and a changed direction text end
+the authority that earlier decisions were made under. A decision that was made
+under an ended authority is never applied and never replayed. On a host that
+is not ready the agent serves no request.
+
+What can decide:
+
+- A host rule can send a request to the owner or raise it to the strong tier.
+  No host rule allows a request.
+- The light model can allow a request or refer it. It cannot reject a request
+  or name the owner, and it never gets a raised request.
+- The strong model runs on a profile from a model family other than the
+  requester's, also when a recorded verdict is replayed. With no such profile,
+  or with a requester whose family the host cannot establish, the result is a
+  reject with `unavailable`.
+- A report outside the closed schema is no verdict.
+
+A reviewer turn runs through Claude Code or OpenCode with no tools, no MCP
+servers, no hooks and no project settings, in an empty directory. The task
+text, the request and the collected source are passed as marked untrusted
+evidence. The strong model can ask once for at most eight source paths. The
+host collects them read-only with the root, secret-path, symlink and size
+limits of the team evidence collector, and an answer is sent only if a second
+collection gives the same content. For a session outside a team run the
+collector reads only inside the session's own directory and does not search
+upward for a repository root.
+
+The requesting agent receives one option key and, for a reject, a notice that
+the host builds from the reason code. The model's note goes to the journal for
+the owner. The permission agent cannot start work, message another session,
+grant a persistent approval, or change the delegation, the policy or its own
+configuration: a write to the host's state, run or install directory, its
+configuration file, the vault key or a provider launcher is in the
+global-or-account-settings class, and so is a workspace trust prompt.
+
+Delivery records an intent before the first key, and a receipt, a refusal or
+an uncertain result after it. Before a key is sent, the host checks the
+session, the session root, the dialog's identity and evidence, the owner's
+authority, and that no person holds input control. An uncertain delivery is
+not repeated, also after a restart. A dialog that the host can answer in
+neither direction goes to the owner.
+
+Limits that remain:
+
+- A class rule establishes a class only from what the host can read: the
+  command's words, its path targets, the tool name, and the lists in
+  `packages/host/src/permission-classes.ts`. A deploy command is a host rule
+  only when `permissionAgent.releaseCommands` names it or when it controls the
+  host's own service. Every other production or staging action depends on the
+  raise rules and the strong model's verdict, and so on the measured miss
+  rate. Name each workspace's deploy commands in the host configuration.
+- A command whose effect the host cannot read (a script file, a remote shell,
+  a command substitution) matches no class rule. It is raised to the strong
+  tier.
+- Paths are resolved through symbolic links when the request is read. A link
+  that changes between the review and the command's own execution is not
+  seen. A path that the host cannot read is raised. The evidence collector
+  checks each directory of a path and then opens the file, so a directory that
+  is replaced by a symbolic link between the two steps could make one read
+  land outside the root.
+- The replay set that ships with the host has twenty synthetic cases. A host
+  becomes ready only after the owner runs a replay with at least `minCases`
+  labelled cases (default 100).
+- A host-wide owner halt does not exist yet. The pipeline and the reviewer
+  launch gate each have a hold input, and nothing sets it. A team run's own
+  halt, `team revoke-permissions` and `permissions revoke` work.
+- These requests are not served and are handled as before: headless Codex and
+  OpenCode sessions, a session whose root-owned launcher adds `--print`
+  itself, and, for sessions outside team runs, yes-no dialogs and collapsed
+  Codex dialogs.
+- The permission journal's evidence module is at version 2. An older host
+  binary that opens the same database treats the journal as unavailable, so a
+  rollback across this release turns the permission agent off until the newer
+  binary returns.
+
+### Headless permission channel
+
+A served headless Claude Code session is launched with `--setting-sources ""`
+and one settings layer that the host writes. No user, project or local
+settings file can then switch its hooks off or answer a call before the
+channel. The cost is that the allow rules, environment values, `apiKeyHelper`
+and model defaults of those files do not apply to a served session. The launch
+profile's own allowlist still applies, and `permissions status` lists each of
+its allow rules that a class rule outranks.
+
+The hook reaches the session's worker, and the worker reaches the API through
+a socket in the run directory with mode 0600. Each request carries an HMAC of
+the session id under the host key. The worker already holds that key, and the
+key never enters the agent's environment. A request with another session's
+key is refused, and so is a delivery for a decision that was issued to another
+session. The agent holds the hook token, so it can call the channel itself:
+that can start a review or get its own call denied, and it cannot make a call
+run.
+
+A class call from the primary agent is deferred: the provider ends its run,
+the session waits, and only the owner's answer on that session's prompt
+resumes it. The answer applies once, to that call id, and a resumed call whose
+input differs is denied. A class call from a subagent cannot be deferred. It
+is denied with `needs-owner`, and the owner gets a notice. While one call
+waits, every other call of the session is denied. A call is denied with
+`unavailable` when the host cannot be reached. An unanswered call is retired
+after 29 days. A session cannot be resumed after its worker ended while a call
+waited.
+
 ## Delegated team permission decisions
+
+This section describes the earlier repository-level delegation to a run's
+coordinator. It applies only to a team run that the permission agent does not
+serve.
 
 Delegation is an explicit repository enrollment policy, pinned when a run starts.
 Only the run's strong Claude coordinator profile can report a permission decision. The

@@ -401,17 +401,27 @@ This client currently connects directly to a trusted single-tenant runner. TLS p
 
 ### Delegated team permissions
 
-The first `infinite repo init` enables coordinator delegation by default. Supported
-one-shot tool prompts go to the strong Claude coordinator for future runs. The
-scope covers the accepted task and assigned workspace; delivery still needs its
-separate repository policy. Later enrollments preserve the saved policy,
-including an opt-out. Use `--permissions coordinator` to enable delegation on an
-existing enrollment. Add `--permission-scope TEXT` or `--permission-limit N` to
-that explicit command to change the scope or ten-decision limit (maximum twenty).
+The first `infinite repo init` of a project does two things by default. It
+covers the project in its workspace's permission delegation, so the permission
+agent serves the project's sessions once the host is ready. It also saves the
+earlier coordinator delegation, which decides only for a team run that the
+permission agent does not serve: supported one-shot tool prompts go to the
+strong Claude coordinator, the scope covers the accepted task and assigned
+workspace, and delivery still needs its separate repository policy.
 
-`infinite team revoke-permissions TEAM_ID` revokes an active run's delegation.
-`infinite repo init --permissions off` disables it for future runs. Workspace
-trust and unsupported prompts remain visible for owner handling. See
+A later `repo init` changes neither: it preserves the saved coordinator
+policy, including an opt-out, and it never covers a project again after a
+revoke or an opt-out. Use `infinite permissions delegate` to cover an existing
+project. Use `--permissions coordinator` to enable the coordinator delegation
+on an existing enrollment, with `--permission-scope TEXT` or
+`--permission-limit N` to change its scope or its limit of twenty-five
+decisions (maximum fifty).
+
+`infinite team revoke-permissions TEAM_ID` returns an active run's requests to
+the owner. `infinite repo init --permissions off` disables the coordinator
+delegation for future runs and records the project's opt-out from the
+permission agent; only `infinite permissions delegate` replaces that opt-out.
+Workspace trust and unsupported prompts remain visible for owner handling. See
 [delegated permission behavior](teams.md#delegating-permission-decisions).
 
 ### Workspace permission delegation
@@ -475,9 +485,13 @@ assignment is locked after it repeats one open reject twice. A retried
 `--request-id` prints the recorded result and changes nothing. A changed
 direction text closes the open rejects of the projects it covers.
 
-The record has no effect yet. The permission agent is not active on this host,
-so requests are handled as before. Until the agent is activated,
-`infinite repo init --permissions` still governs team runs.
+The record takes effect when the host is ready. There is no separate switch:
+the first replay result under the threshold makes the host ready, and every
+delegated workspace is served from then on. `status` prints whether the
+permission agent is ready, and each reason when it is not. On a host that is
+not ready, a delegated workspace behaves as a workspace with no record:
+requests are handled as before, and the coordinator delegation of
+`infinite repo init --permissions` still decides for team runs.
 
 #### Permission agent readiness and replay
 
@@ -493,10 +507,18 @@ profiles. Profiles use the same fields as a team lineup profile:
       { "id": "strong-deepseek", "label": "Strong DeepSeek", "provider": "opencode", "model": "deepseek/deepseek-pro" }
     ],
     "maxMissRate": 0.05,
-    "minCases": 100
+    "minCases": 100,
+    "releaseCommands": [["npm", "run", "deploy"], ["release.sh"]]
   }
 }
 ```
+
+`releaseCommands` names the commands that deploy, promote, roll out or release
+from this host. A request that runs one is a production or staging request and
+waits for the owner. Each entry is a list of words: the first word is the
+command's file name, a word that ends in `*` matches by prefix, and options
+between the words are ignored. A change to the list makes the stored replay
+result stale.
 
 Without `light`, the host uses `teams.lineup.permissionReviewer`. The light
 tier can allow a request or refer it to the strong tier; it never rejects one.

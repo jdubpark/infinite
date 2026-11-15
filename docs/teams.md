@@ -1303,7 +1303,104 @@ the failure and the configured provider policy; retries do not grant permission.
 
 ## Delegating permission decisions
 
-The first repository enrollment enables delegation by default:
+In a workspace that the owner delegated, a separate permission agent answers
+the tool permission requests of agent sessions: team members, sessions outside
+a team run, and headless Claude Code sessions. It allows a request once, or
+rejects it with a recorded reason. Five classes of request always wait for the
+owner's own answer: production or staging actions, new or external
+credentials, money, destructive operations outside the workspace, and global
+or account settings.
+
+The permission agent serves a project when both conditions hold:
+
+- An owner act covers the project: `infinite permissions delegate`, or the
+  owner's first `infinite repo init` of that project without
+  `--permissions off`. See
+  [workspace permission delegation](cli.md#workspace-permission-delegation).
+- The host is ready: a light profile, strong profiles from at least two model
+  families, and a current replay result under the owner's miss-rate threshold.
+  See [readiness and replay](cli.md#permission-agent-readiness-and-replay).
+
+`infinite permissions status` shows both. A project that is not served is
+handled as before; for a team run that means the coordinator review in
+[the next section](#coordinator-review-for-runs-the-permission-agent-does-not-serve).
+
+Each request passes these steps in order:
+
+1. **Class rules.** A host rule that establishes one of the five classes sends
+   the request to the owner. No model turn runs, and the push names the class.
+   The rules read the command's words and its targets as real paths. They also
+   cover a workspace trust prompt and a request that can be granted only as a
+   persistent approval. `permissionAgent.releaseCommands` in the host
+   configuration names this host's deploy commands for the production or
+   staging class.
+2. **Qualify.** The host must hold the whole action, and the dialog must offer
+   a one-shot accept and a one-shot reject. A request that does not qualify
+   can be rejected or sent to the owner. It is never allowed.
+3. **Lock and replay.** An assignment that repeated one rejected request twice
+   is locked and gets no model turn until the owner unlocks it. An identical
+   request under the same authority is answered from its recorded verdict.
+4. **Tier.** A routine request goes to the light model, which can allow it or
+   refer it. A request is raised to the strong model when it is destructive,
+   reaches outside the session's directory, uses a release verb or a push,
+   needs privilege, names a credential or a payment, changes a settings file,
+   installs globally, cannot be read by the host, or follows a reject in the
+   same assignment. The strong model comes from a model family other than the
+   requester's. It allows the request, rejects it with a reason code, or names
+   the owner with a class.
+5. **Delivery.** The host records the decision. It then checks that the
+   session still runs, that the dialog and its evidence are unchanged, that
+   the owner's authority still holds, and that no person holds input control.
+   Then it sends one option. A reject goes through the dialog's one-shot
+   reject option, followed by a fixed host notice that carries the reason
+   code. No model text reaches the requesting agent. A destructive request is
+   delivered only on an allow from the strong model. A delivery whose result
+   is unknown is never repeated.
+
+A reject is final for that request, and members are told not to reach the same
+effect by another route. The reason codes are `outside-workspace`, `unrelated`,
+`unsafe`, `incomplete`, `uncertain`, `unavailable`, `locked` and `needs-owner`.
+Run status shows the code, and a locked assignment shows as blocked on a
+permission. `infinite permissions unlock` ends a lock and `infinite permissions
+reopen` closes a reject so that the request gets a fresh review; neither
+allows anything.
+
+The owner is pushed for a class request, for a request that the host can
+answer in neither direction, and for a request of a project that the agent
+does not serve. An allowed, rejected or stale request pushes nothing.
+`infinite permissions log` lists every decision with its tier, rules and
+delivery events; see the [decision log](cli.md#permission-decision-log).
+
+`infinite team revoke-permissions TEAM_ID` returns one run's requests to the
+owner. `infinite permissions revoke` ends a workspace's delegation: its
+pending decisions are retired and never applied.
+
+A session outside a team run is served when the host owns its terminal. A
+laptop-execution session, a cmux session and a native-UI session stay with the
+owner, and so does a dialog that first appears while a person holds input
+control. The task evidence for such a session is its title and the prompts
+that the owner submitted through the host, never agent output. A reject
+reaches the session through the dialog's one reject option, and the fixed
+notice follows when that option takes text. A dialog that offers two reject
+options has no recognised one-shot reject, so a reject for it goes to the
+owner.
+
+A headless Claude Code session (`--print` in the default permission mode) is
+served through a hook channel. A class call ends the provider's run and waits
+for the owner's answer on the session's prompt. The owner's allow resumes the
+same conversation and runs that call once. A served headless launch loads no
+user, project or local settings file, so the allow rules, environment values
+and model defaults of those files do not apply to it. Headless sessions of
+other providers are not served.
+
+### Coordinator review for runs the permission agent does not serve
+
+This is the earlier repository-level delegation. It decides only for a team
+run that the permission agent does not serve, and it is kept until the
+permission agent has replaced it on the host. A run uses one path or the
+other, never both for the same request.
+
+The first repository enrollment enables this delegation by default:
 
 ```sh
 infinite repo init
@@ -1430,8 +1527,9 @@ infinite team revoke-permissions TEAM_ID
 infinite repo init --permissions off
 ```
 
-The first command revokes delegation for a current run. The second disables it
-for future runs. Both require an owner client. Pausing, cancelling or steering a
+The first command revokes delegation for a current run, on either path. The
+second disables the coordinator review for future runs and records an opt-out
+from the permission agent for that project. Both require an owner client. Pausing, cancelling or steering a
 run prevents its old pending decisions from being applied.
 
 ## Autonomy mode

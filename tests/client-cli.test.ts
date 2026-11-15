@@ -1314,8 +1314,11 @@ test("repo init keeps the team settings it does not own when it runs again", { t
       requestId: randomUUID(), revision: enrolled.revision, team: { ...enrolled.team, handoffMinutes: 30, features, eval: { capture: true } },
     }, undefined, "PUT");
     assert.equal(saved.status, 200);
+    const before = (await run.host.fetchApi("/projects/rehearsal/team")).body.team;
     await enroll(firstChecks);
     const rerun = (await run.host.fetchApi("/projects/rehearsal/team")).body.team;
+    // The routine approval digest hashes this block as JSON, so a rerun with no change must leave it byte-identical.
+    assert.equal(JSON.stringify(rerun), JSON.stringify(before));
     assert.equal(rerun.handoffMinutes, 30);
     assert.deepEqual(rerun.eval, { capture: true });
     assert.deepEqual(rerun.features, features);

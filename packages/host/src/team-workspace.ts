@@ -21,13 +21,15 @@ export function teamCommandEnvironment(): NodeJS.ProcessEnv {
   env.GIT_CONFIG_GLOBAL = "/dev/null";
   return env;
 }
+/** The environment of a Git command the host runs: replace refs are ignored, so a ref planted in a copy cannot change what a read prints. */
+export function teamGitEnvironment(): NodeJS.ProcessEnv { return { ...teamCommandEnvironment(), GIT_NO_REPLACE_OBJECTS: "1" }; }
 export function teamGitArgs(cwd: string, args: string[]) {
   return ["-c", `safe.directory=${cwd}`, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", "-c", "user.name=Infinite", "-c", "user.email=agent@example.invalid", ...args];
 }
 /** Commands are argv arrays, from owner configuration or an explicitly authorized plan. */
 export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand, input?: string): Promise<CommandResult> {
   return new Promise((resolveResult, reject) => {
-    const env = teamCommandEnvironment();
+    const env = command.command === "git" ? teamGitEnvironment() : teamCommandEnvironment();
     const child = spawn(prefix?.command ?? command.command, prefix ? [...prefix.args, command.command, ...command.args] : command.args, { cwd, env, stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
     let output = "", stdout = "", interrupted = false, settled = false, truncated = false;
     const stop = () => {
@@ -72,7 +74,7 @@ export async function publishTeamHead(workspace: string, remoteUrl: string, comm
 /** Streams a full bundle of one branch on stdout, with the same restricted Git invocation as other team operations. */
 export function spawnTeamBundle(workspace: string, branch: string, prefix?: TeamCommand) {
   const args = teamGitArgs(workspace, ["bundle", "create", "-", `refs/heads/${branch}`]);
-  return spawn(prefix?.command ?? "git", prefix ? [...prefix.args, "git", ...args] : args, { cwd: workspace, env: teamCommandEnvironment(), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
+  return spawn(prefix?.command ?? "git", prefix ? [...prefix.args, "git", ...args] : args, { cwd: workspace, env: teamGitEnvironment(), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
 }
 async function git(cwd: string, args: string[], prefix?: TeamCommand, timeoutMs = 30000, signal?: AbortSignal) {
   const result = await teamCommand({ command: "git", args: teamGitArgs(cwd, args) }, cwd, signal, timeoutMs, prefix);

@@ -2,14 +2,14 @@ import { spawn, type ChildProcess } from "node:child_process";
 import type { BaseRead, CaptureGit, NameRead, PatchRead } from "./eval-types.js";
 import { COMMIT_ID } from "./outcome-hold.js";
 import type { TeamCommand } from "./team-types.js";
-import { teamCommand, teamCommandEnvironment, teamGitArgs } from "./team-workspace.js";
+import { teamCommand, teamGitArgs, teamGitEnvironment } from "./team-workspace.js";
 
 export const PATCH_MAX_BYTES = 1_048_576, CAPTURE_READ_MS = 30_000;
 
 /** The new form (see "Git commands"). Throws TypeError when an id fails COMMIT_ID. */
 export function patchArgs(from: string, to: string): string[] {
   if (!COMMIT_ID.test(from) || !COMMIT_ID.test(to)) throw new TypeError("A capture patch needs two full commit ids.");
-  return ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--binary", "--default-prefix", "--no-renames", "--submodule=short", "--ignore-submodules=none", from, to, "--"];
+  return ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--binary", "--default-prefix", "--no-renames", "--submodule=short", "--ignore-submodules=none", "--unified=3", "--inter-hunk-context=0", from, to, "--"];
 }
 
 function namesArgs(from: string, to: string) {
@@ -37,7 +37,7 @@ function readPatch(cwd: string, from: string, to: string, prefix: TeamCommand | 
   return new Promise(resolveRead => {
     let child: ChildProcess;
     try {
-      child = spawn(prefix?.command ?? "git", prefix ? [...prefix.args, "git", ...args] : args, { cwd, env: teamCommandEnvironment(), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
+      child = spawn(prefix?.command ?? "git", prefix ? [...prefix.args, "git", ...args] : args, { cwd, env: teamGitEnvironment(), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
     } catch {
       resolveRead({ state: "failed" });
       return;

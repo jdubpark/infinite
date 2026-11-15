@@ -71,7 +71,7 @@ test("the patch form is exact and checked", async () => {
     assert.equal((await git.patch(dir, from, to)).state, "read");
     assert.deepEqual(
       readFileSync(record, "utf8").split("\n").filter(Boolean),
-      ["git", ...teamGitArgs(dir, ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--binary", "--default-prefix", "--no-renames", "--submodule=short", "--ignore-submodules=none", from, to, "--"])],
+      ["git", ...teamGitArgs(dir, ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--binary", "--default-prefix", "--no-renames", "--submodule=short", "--ignore-submodules=none", "--unified=3", "--inter-hunk-context=0", from, to, "--"])],
     );
 
     for (const bad of ["HEAD", "-x", FAKE_HEX]) {
@@ -196,5 +196,58 @@ test("a read that cannot end", async () => {
     assert.equal(existsSync(marker), true);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a replace ref changes no capture read", async () => {
+  const dir = makeRepo();
+  const clone = makeRepo();
+  try {
+    const base = commit(dir, writeFiles({ "a.txt": "one\n", "b.txt": "one\n" }), "base");
+    const to = commit(dir, writeFiles({ "a.txt": "two\n" }), "to");
+    run(dir, "checkout", "-q", "--detach", base);
+    const other = commit(dir, writeFiles({ "b.txt": "two\n" }), "other");
+    run(dir, "checkout", "-q", "--detach", to);
+    run(dir, "replace", to, other);
+    const git = captureGit(() => undefined);
+
+    assert.deepEqual(await git.names(dir, base, to, 500), { state: "read", names: ["a.txt"] });
+
+    run(clone, "fetch", "-q", dir, "HEAD");
+    run(clone, "checkout", "-q", "--detach", base);
+    const read = await git.patch(dir, base, to);
+    assert.equal(read.state, "read");
+    if (read.state !== "read") return;
+    const patchFile = join(clone, "change.patch");
+    writeFileSync(patchFile, read.bytes);
+    run(clone, "apply", "--index", patchFile);
+    assert.equal(run(clone, "write-tree"), run(dir, "--no-replace-objects", "rev-parse", `${to}^{tree}`));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(clone, { recursive: true, force: true });
+  }
+});
+
+test("a copy's diff settings change no patch", async () => {
+  const dir = makeRepo();
+  const clone = makeRepo();
+  try {
+    run(dir, "config", "diff.context", "1000");
+    run(dir, "config", "diff.interHunkContext", "1000");
+    const lines = (changed?: number) => Array.from({ length: 400 }, (_, index) => (index + 1 === changed ? "changed\n" : `line ${index + 1}\n`)).join("");
+    const from = commit(dir, writeFiles({ "long.txt": lines() }), "from");
+    const to = commit(dir, writeFiles({ "long.txt": lines(200) }), "to");
+
+    run(clone, "fetch", "-q", dir, "HEAD");
+    const inCopy = await captureGit(() => undefined).patch(dir, from, to);
+    const plain = await captureGit(() => undefined).patch(clone, from, to);
+    assert.equal(inCopy.state, "read");
+    assert.equal(plain.state, "read");
+    if (inCopy.state !== "read" || plain.state !== "read") return;
+    assert.ok(inCopy.bytes.length < 1000);
+    assert.deepEqual(inCopy.bytes, plain.bytes);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(clone, { recursive: true, force: true });
   }
 });

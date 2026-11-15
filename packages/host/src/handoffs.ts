@@ -13,6 +13,8 @@ type StartInProject = <T>(projectId: string, action: () => Promise<T>) => Promis
 /** One durable transfer per source. Creation retries reuse the persisted team identity. */
 export class HandoffService {
   private readonly records = new Map<string, Stored>();
+  /** Sources that will never request a handoff: no policy (fixed at creation), or exited with no request in the journal. */
+  private readonly settled = new Set<string>();
   private readonly directory: string;
   private timer?: NodeJS.Timeout;
   private running = false;
@@ -31,13 +33,15 @@ export class HandoffService {
     }
   }
   private save(record: Stored) { writeSealed(join(this.directory, `${record.sessionId}.sealed`), this.key, `handoff:${record.sessionId}`, record); }
-  private discover(sessionId: string): Stored | undefined {
+  private discover(sessionId: string, exited = false): Stored | undefined {
     const previous = this.records.get(sessionId);
     if (previous) return previous;
+    if (this.settled.has(sessionId)) return;
     const source = this.manager.meta(sessionId).session;
-    if (!source.handoff?.policy) return;
+    if (!source.handoff?.policy) { this.settled.add(sessionId); return; }
     const event = this.manager.handoffRequest(sessionId);
-    if (!event) return;
+    // A worker appends a request only while running, and an exited session gets no new events.
+    if (!event) { if (exited) this.settled.add(sessionId); return; }
     const envelope = handoffEnvelopeSchema.parse(event.data);
     if (envelope.sessionId !== sessionId) throw new Error("Invalid handoff source");
     const policy = source.handoff.policy;
@@ -74,7 +78,7 @@ export class HandoffService {
     if (this.busy || !this.running) return;
     this.busy = true;
     try {
-      for (const source of await this.manager.list()) this.discover(source.id);
+      const listed = await this.manager.list(); const ids = new Set(listed.map(source => source.id)); for (const id of this.settled) if (!ids.has(id)) this.settled.delete(id); for (const source of listed) this.discover(source.id, source.status === "exited");
       for (const record of this.records.values()) {
         if (["started", "blocked"].includes(record.status)) continue;
         try { await this.step(record); }

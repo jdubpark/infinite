@@ -1,4 +1,5 @@
 import type { TeamAssignment } from "../team-types.js";
+import type { LaunchHalted } from "../halt/rules.js";
 
 export type FuseScope = "project" | "host";
 export type FuseWindow = "hour" | "day" | "week";
@@ -25,12 +26,16 @@ export type FuseOpen = {
   ownerClose: boolean;
 };
 
-export type FuseCheck = { state: "closed"; exempt?: true } | FuseOpen;
+/** The fuse's own judgement of a scope. */
+export type FuseState = { state: "closed"; exempt?: true } | FuseOpen;
+/** What a gate answers. `halted` comes only from the owner's halt, which the host puts in front of the fuse. */
+export type FuseCheck = FuseState | LaunchHalted;
 
 export type FuseAdmission =
   | { ok: true; launchId: string; repeat?: true; exempt?: true }
   | { ok: false; launchId: string; open: FuseOpen }
-  | { ok: false; launchId: string; failure: "write-failed" };
+  | { ok: false; launchId: string; failure: "write-failed" }
+  | { ok: false; launchId: string; halted: LaunchHalted };
 
 export type LaunchState = "admitted" | "started" | "released";
 
@@ -59,4 +64,8 @@ export interface FuseGate {
   admit(launch: FuseLaunch): FuseAdmission;
   release(launchId: string): void;
   started(launchId: string): void;
+  /** The owner's halt over any of these projects, for work that spans several. Only the halt's gate has it. */
+  held?(projectIds: readonly string[]): LaunchHalted | undefined;
+  /** Gives back this process's admission of a launch that the owner's halt refused before its session existed. */
+  refund?(launchId: string): void;
 }

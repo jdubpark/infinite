@@ -261,7 +261,10 @@ export function buildLaunch(
     // A command hook, not an HTTP hook: the relay runs in the agent's account and is the only
     // process that can read the transcript the worker asks for in its reply.
     const handler = { type: "command", command: [...relay, "claude"].join(" "), timeout: 10 };
+    // Stated outright because a project settings file that sets `disableAllHooks` would otherwise switch these
+    // hooks off in a running session. This layer outranks project and local settings.
     const settings = {
+      disableAllHooks: false,
       hooks: Object.fromEntries(
         CLAUDE_EVENTS.map((e) => [e, [{ hooks: [handler] }]]),
       ),

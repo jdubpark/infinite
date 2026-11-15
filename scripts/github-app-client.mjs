@@ -95,7 +95,8 @@ function loadConfig(path) {
   if (typeof path !== "string" || !path) fail("Usage: --config FILE <gh|credential|status>.");
   const value = readJsonFile(path, "Client config");
   assertObject(value, "client config");
-  if (Object.keys(value).some(key => !["tokenDirectory", "githubCli", "repositories"].includes(key)) || typeof value.tokenDirectory !== "string" || !value.tokenDirectory.startsWith("/") || typeof value.githubCli !== "string" || !value.githubCli.startsWith("/") || value.repositories !== undefined && !Array.isArray(value.repositories)) fail("Client config must contain absolute tokenDirectory/githubCli paths and an optional repositories list.");
+  if (Object.keys(value).some(key => !["tokenDirectory", "githubCli", "repositories", "proxyUrl"].includes(key)) || typeof value.tokenDirectory !== "string" || !value.tokenDirectory.startsWith("/") || typeof value.githubCli !== "string" || !value.githubCli.startsWith("/") || value.repositories !== undefined && !Array.isArray(value.repositories)) fail("Client config must contain absolute tokenDirectory/githubCli paths, an optional repositories list, and an optional proxyUrl.");
+  if (value.proxyUrl !== undefined && !proxyOrigin(value.proxyUrl)) fail("Client config proxyUrl must be a bare loopback HTTP origin.");
   const repositories = value.repositories?.map(canonicalSlug);
   const seen = new Set();
   for (const repository of repositories ?? []) {
@@ -110,7 +111,66 @@ function loadConfig(path) {
     if (error instanceof ClientError) throw error;
     if (error?.code !== "ENOENT") fail("Token directory is unavailable.");
   }
-  return { tokenDirectory: value.tokenDirectory, githubCli: value.githubCli, repositories };
+  return { tokenDirectory: value.tokenDirectory, githubCli: value.githubCli, repositories, ...(value.proxyUrl ? { proxyUrl: proxyOrigin(value.proxyUrl) } : {}) };
+}
+
+/** A bare loopback origin such as http://127.0.0.1:8417, or undefined. */
+function proxyOrigin(value) {
+  if (typeof value !== "string") return undefined;
+  let url;
+  try { url = new URL(value); } catch { return undefined; }
+  if (!["http:", "https:"].includes(url.protocol) || !["127.0.0.1", "[::1]", "localhost"].includes(url.hostname)) return undefined;
+  if (url.username || url.password || url.search || url.hash || url.pathname !== "/" || value.replace(/\/$/u, "") !== url.origin) return undefined;
+  return url.origin;
+}
+
+/**
+ * The GitHub credential proxy and this session's grant, when both are present. The owner's client config names the
+ * proxy; without it the host-provided INFINITE_GITHUB_PROXY is used. The grant only ever comes from the environment,
+ * and only its shape is checked here; the proxy verifies it.
+ */
+function proxyTarget(config, env) {
+  const origin = config.proxyUrl ?? proxyOrigin(env.INFINITE_GITHUB_PROXY);
+  if (!origin) return undefined;
+  const grant = typeof env.INFINITE_GITHUB_GRANT === "string" && /^v[0-9]{1,3}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u.test(env.INFINITE_GITHUB_GRANT) && env.INFINITE_GITHUB_GRANT.length <= 4096
+    ? env.INFINITE_GITHUB_GRANT : undefined;
+  return { origin, grant };
+}
+
+function currentBranch(cwd) {
+  const result = spawnSync("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  const branch = result.status === 0 ? result.stdout.trim() : "";
+  return branch && !branch.startsWith("-") && !/[\s\u0000-\u001f\u007f]/u.test(branch) ? branch : undefined;
+}
+
+/** Sends a gh command to the proxy's broker, which runs it with the installation token the agent never sees. */
+async function brokerGh(target, ghArgs) {
+  const argv = [...ghArgs];
+  if (argv[0] === "pr" && argv[1] === "create" && !argv.some(arg => arg === "--head" || arg === "-H" || arg.startsWith("--head="))) {
+    const branch = currentBranch(process.cwd());
+    if (branch) argv.push(`--head=${branch}`);
+  }
+  let stdin;
+  if (argv.some((arg, index) => arg === "--body-file=-" || ((arg === "--body-file" || arg === "-F") && argv[index + 1] === "-"))) {
+    stdin = readFileSync(0, "utf8");
+    if (Buffer.byteLength(stdin, "utf8") > 65536) fail("The pull request body on standard input is larger than 64 KiB.");
+  }
+  let response;
+  try {
+    response = await fetch(`${target.origin}/gh`, {
+      method: "POST", redirect: "error", signal: AbortSignal.timeout(120_000),
+      headers: { authorization: `Bearer ${target.grant}`, "content-type": "application/json" },
+      body: JSON.stringify({ argv, ...(stdin !== undefined ? { stdin } : {}) }),
+    });
+  } catch { fail("The GitHub proxy is unavailable."); }
+  if (!response.ok) fail(`The GitHub proxy refused this gh command: ${(await response.text().catch(() => "")).trim().slice(0, 500) || response.status}`);
+  let result;
+  try { result = await response.json(); } catch { fail("The GitHub proxy returned an invalid result."); }
+  if (!result || typeof result.stdout !== "string" || typeof result.stderr !== "string" || !Number.isInteger(result.code)) fail("The GitHub proxy returned an invalid result.");
+  process.stdout.write(result.stdout);
+  process.stderr.write(result.stderr);
+  if (result.truncated) process.stderr.write("The GitHub proxy truncated this command's output.\n");
+  process.exitCode = result.code;
 }
 
 function configured(config, repository) {
@@ -289,6 +349,8 @@ async function gh(config, args) {
   if (args[0] !== "--" || args.length < 2) fail("Usage: gh -- <gh-args>.");
   const ghArgs = args.slice(1);
   const env = process.env;
+  const proxy = proxyTarget(config, env);
+  if (proxy?.grant) return brokerGh(proxy, ghArgs);
   const target = ghTarget(ghArgs, env, process.cwd());
   const repository = target.repository;
   if (target.externalHost && repository && configured(config, repository)) fail("A configured GitHub token cannot be used with a non-GitHub API URL.");
@@ -340,6 +402,15 @@ async function credential(config, args) {
   const input = readFileSync(0, "utf8");
   if (Buffer.byteLength(input, "utf8") > 32768) fail("Git credential request is too large.");
   const values = parseCredential(input);
+  // The proxy origin gets this session's grant, never an installation token; with no grant there is no answer.
+  const proxy = proxyTarget(config, process.env);
+  if (proxy) {
+    const origin = proxyOrigin(`${values.get("protocol") ?? ""}://${values.get("host") ?? ""}`);
+    if (origin && origin === proxy.origin) {
+      if (operation === "get" && proxy.grant) process.stdout.write(`username=x-infinite-grant\npassword=${proxy.grant}\n\n`);
+      return;
+    }
+  }
   const repository = credentialRepository(values);
   const bound = repository ? configured(config, repository) : undefined;
   if (operation !== "get" || !bound) return;

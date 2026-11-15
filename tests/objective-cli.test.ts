@@ -5,8 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CORRECTION_FILE_BYTES, GOAL_RECORD_USAGE, handleGoalClientCommand, objectiveRecordLines, readCorrectionFile } from "../packages/host/src/objective-cli.js";
 import { clientCommandCandidate, parseClientArgs } from "../packages/host/src/client.js";
-import { OBJECTIVE_ERRORS } from "../packages/host/src/objective-record.js";
-import type { ObjectiveErrorCode, ObjectiveRecordView } from "../packages/host/src/objective-record.js";
+import type { ObjectiveRecordView } from "../packages/host/src/objective-record.js";
 
 const G = "5f0c2a6e-1b7d-4c3a-9e8f-2d4b6a8c0e12";
 const R = "9b1f6c0e-2d4a-4e8b-8f3a-6c5d7e9f0a1b";
@@ -212,12 +211,37 @@ test("a correction file is checked before anything is sent", () => withTempDir(a
   assert.deepEqual(paths, []);
 }));
 
+// The sentences of the correction codes, written out here so that a change to the host's text fails a test.
+const CORRECTION_SENTENCES: { code: string; status: number; message: string }[] = [
+  { code: "objective-prompts-off", status: 409, message: "Turn on objective prompts for this goal's project before changing its criteria." },
+  { code: "objective-op-invalid", status: 400, message: "The correction is invalid." },
+  { code: "objective-op-target", status: 409, message: "A correction names a criterion that is missing or in another state." },
+  { code: "objective-op-c0", status: 409, message: "Criterion c0 is the goal's success text and cannot be edited or retired." },
+  { code: "objective-op-refused", status: 409, message: "The corrected record would be invalid, so nothing was changed." },
+  { code: "objective-version-stale", status: 409, message: "The record changed since it was read. Read it again and resend the correction." },
+  { code: "objective-criterion-misfit", status: 400, message: "A criterion's producer or threshold does not fit its check." },
+  { code: "objective-criterion-too-large", status: 400, message: "A criterion is over 2,048 bytes." },
+  { code: "objective-command-unknown", status: 400, message: "A command criterion must name one of the project's configured checks." },
+  { code: "objective-secret", status: 400, message: "A criterion looks like it holds a secret, so nothing was changed." },
+  { code: "objective-criteria-limit", status: 409, message: "A record holds at most 8 active criteria and 64 in all." },
+  { code: "objective-too-large", status: 409, message: "The corrected record would be over its size limit." },
+  { code: "objective-log-full", status: 409, message: "The record's log is full. Start a new goal with consolidated criteria." },
+  { code: "objective-digest-too-large", status: 409, message: "The active criteria would be over the 6 KiB prompt digest." },
+];
+
 test("correction errors map to sentences", async () => {
-  for (const code of Object.keys(OBJECTIVE_ERRORS) as ObjectiveErrorCode[]) {
-    const { api, paths } = fakeApi({ status: OBJECTIVE_ERRORS[code].status, code }, true);
-    await assert.rejects(handleGoalClientCommand(["record", G, "retire", "c1"], { "--version": "3", "--request-id": R }, api), { message: OBJECTIVE_ERRORS[code].message });
+  for (const { code, status, message } of CORRECTION_SENTENCES) {
+    const { api, paths } = fakeApi({ status, code }, true);
+    await assert.rejects(handleGoalClientCommand(["record", G, "retire", "c1"], { "--version": "3", "--request-id": R }, api), { message });
     assert.deepEqual(paths, [`/goals/${G}/record`]);
   }
+
+  const older = fakeApi({ status: 404 }, true);
+  await assert.rejects(handleGoalClientCommand(["record", G, "retire", "c1"], { "--version": "3", "--request-id": R }, older.api), { message: "This host does not accept corrections. Upgrade the host." });
+
+  const invalidId = fakeApi();
+  await assert.rejects(handleGoalClientCommand(["record", G, "retire", "C1"], { "--version": "3", "--request-id": R }, invalidId.api), { message: "The correction is invalid." });
+  assert.deepEqual(invalidId.paths, []);
 
   const forbidden = fakeApi({ status: 403 }, true);
   await assert.rejects(handleGoalClientCommand(["record", G, "retire", "c1"], { "--version": "3", "--request-id": R }, forbidden.api), { message: "Corrections need an owner device key." });

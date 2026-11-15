@@ -1033,7 +1033,7 @@ Turn the switch on in the project's team block:
 
 The key has no default. Writing it at all, even as `"off"`, changes the routine approval digest of that project, so its active routines wait for owner approval again. An absent key keeps every stored digest valid. A rerun of `repo init` keeps the key.
 
-With the switch on, each goal cycle's member prompts and context file show the record's criteria in place of the success text. The digest lists the active criteria with each statement, check label, producer, and threshold. It is at most 6,144 bytes of JSON with `c0`'s statement left out, because the prompt prints `c0`'s text once. A criterion whose correction would push the digest over that cap answers `409` with `objective-digest-too-large`.
+With the switch on, each goal cycle's member prompts and context file show the record's criteria in place of the success text. The digest lists the active criteria with each statement, check label, and producer. It is at most 6,144 bytes of JSON with `c0`'s statement left out, because the prompt prints `c0`'s text once. A criterion whose correction would push the digest over that cap answers `409` with `objective-digest-too-large`.
 
 A cycle pins the digest it launched with. Every member of that run reads the same digest, including members started after a pause, a replan, or a host restart. The next cycle reads the latest version. A correction therefore reaches members from the next cycle. To reach a running cycle, steer it.
 
@@ -1041,14 +1041,14 @@ The sealed eval capsule of a run copies the goal context. Once a cycle pins the 
 
 Owner text lives in the sealed goal record, the pinned digest, and the prompts and context files of later cycles. The host never writes it to a log line, an event, or an error body. A statement that looks like a secret is refused with `400` and `objective-secret`, and the refusal does not repeat it.
 
-Creation criteria go in `criteria` on `POST /api/goals`: one to seven criteria, each with a statement, a check, and a threshold. Routine goals never take criteria. A goal created over the relay can carry criteria, as it already carries the success text and steering, because the create route is owner-only; the record reads and corrections stay off the relay.
+Creation criteria go in `criteria` on `POST /api/goals`: one to seven criteria, each with a statement, a check, and a threshold. Routine goals never take criteria. A create that carries criteria is refused with `409` and `objective-source-invalid` when its goal fields cannot build a record, and nothing is stored. A create without criteria still works without a record, as before. A goal created over the relay can carry criteria, as it already carries the success text and steering, because the create route is owner-only; the record reads and corrections stay off the relay.
 
 `POST /api/goals/:id/record` takes `{ requestId, version, ops }` from an owner device. A controller or viewer gets `403`. Four ops are available:
 
 - `criterion.add` takes a `criterion` with a statement, a check, a threshold, and an optional producer.
 - `criterion.edit` takes an `id` and at least one of `statement`, `check`, or `threshold`.
 - `criterion.retire` takes an `id`.
-- `criterion.confirm` takes an `id`.
+- `criterion.confirm` takes an `id`. Only a derived criterion can be confirmed. No criterion is derived yet, so every confirm answers `409` with `objective-op-target` for now.
 
 Limits:
 
@@ -1062,7 +1062,7 @@ Limits:
 
 A correction applies once or not at all:
 
-- The same `requestId` with the same body answers the same view and writes nothing.
+- The same `requestId` with the same body answers the record's latest view and writes nothing.
 - The same `requestId` with another body answers `409` with `request-conflict`.
 - A `version` that is no longer the latest answers `409` with `objective-version-stale`.
 - A refused op refuses the whole correction. The error does not repeat any owner text.

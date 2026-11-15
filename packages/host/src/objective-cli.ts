@@ -55,6 +55,8 @@ function correctionFailure(error: unknown, retry: string): Error {
   if (status === 409 && code === "request-conflict") return new Error("This request ID was used for another correction. Leave out --request-id to send a new one.");
   if (typeof code === "string" && Object.hasOwn(OBJECTIVE_ERRORS, code)) return new Error(OBJECTIVE_ERRORS[code as ObjectiveErrorCode].message);
   if (status === 404 && code === "goal-not-found") return new Error("No goal has this ID.");
+  // An older host has no correction route, so its answer carries no code.
+  if (status === 404 && code === undefined) return new Error("This host does not accept corrections. Upgrade the host.");
   return new Error("The host refused the correction.");
 }
 

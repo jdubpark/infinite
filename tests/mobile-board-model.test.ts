@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { attemptLabel, attemptsOf, foldAttempts, groupBoard, filterBoard, missionControls, missionExtendChoices, missionLeftLabel, missionStatusLabel, missionStopLine, missionStoppedAtLimit, missionTimeLeftMs, openMissionDecisions } from "../apps/mobile/src/features/board/model.ts";
+import { attemptLabel, attemptsOf, boardStatusLabel, foldAttempts, groupBoard, filterBoard, missionControls, missionExtendChoices, missionLeftLabel, missionShowsReason, missionStatusLabel, missionStopLine, missionStoppedAtLimit, missionTimeLeftMs, openMissionDecisions } from "../apps/mobile/src/features/board/model.ts";
 import { shortDate } from "../apps/mobile/src/features/teams/model.ts";
 import type { BoardItem, Mission } from "../apps/mobile/src/api/client.ts";
 
@@ -97,6 +97,13 @@ test("extend choices add the mission's own limit in ascending order and mark it"
 test("a deadline stop reads as stopped at the time limit, and other blocked missions stay blocked", () => {
   assert.equal(missionStatusLabel("blocked", "deadline"), "Stopped at time limit");
   assert.equal(missionStatusLabel("blocked"), "Blocked");
+});
+
+test("board deadline stop uses the time-limit label and reason suppression is specific", () => {
+  assert.equal(boardStatusLabel(item({ status: "blocked", stopReason: "deadline" })), "Stopped at time limit");
+  assert.equal(missionShowsReason({ status: "blocked", stopReason: "deadline", reason: "Deadline reached" }), false);
+  assert.equal(missionShowsReason({ status: "blocked", reason: "Waiting on a dependency" }), true);
+  assert.equal(missionShowsReason({ status: "paused", reason: "Owner requested pause" }), true);
 });
 
 test("resume follows the time left, which an intake mission's stopped clock keeps", () => {

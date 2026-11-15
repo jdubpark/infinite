@@ -48,7 +48,7 @@ export function findBoardItem(items: BoardItem[], kind: BoardItem["kind"], id: s
 }
 
 export function boardStatusLabel(item: BoardItem) {
-  if (item.kind === "mission") return missionStatusLabel(item.status as MissionStatus);
+  if (item.kind === "mission") return missionStatusLabel(item.status as MissionStatus, item.stopReason);
   const words = item.status.replace(/-/g, " ");
   return words.charAt(0).toUpperCase() + words.slice(1);
 }
@@ -73,6 +73,10 @@ export function missionStatusLabel(status: MissionStatus, stopReason?: Mission["
     blocked: "Blocked", "ready-for-review": "Ready for review", cancelled: "Cancelled",
   };
   return labels[status];
+}
+
+export function missionShowsReason(mission: Pick<Mission, "status" | "stopReason" | "reason">): boolean {
+  return Boolean(mission.reason) && !(mission.status === "blocked" && mission.stopReason === "deadline");
 }
 
 /** Blocked because its approved time ran out; its work is kept and the owner can extend it. */

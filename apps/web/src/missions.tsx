@@ -4,7 +4,7 @@ import { ApiError, useApi, type Me } from "./api";
 import { useLiveRefresh } from "./live-refresh";
 import { useMachines } from "./machines";
 import { requestStore } from "./requests";
-import { missionControls, missionExtendChoices, missionStateLabel, missionStopLine, missionStoppedAtLimit, type MissionStatus } from "./mission-model";
+import { missionControls, missionExtendChoices, missionExtensionConfirmation, missionShowsReason, missionStateLabel, missionStopLine, missionStoppedAtLimit, type MissionStatus } from "./mission-model";
 
 type MissionView = {
   id: string;
@@ -29,6 +29,7 @@ const inFlight = new Set<string>();
 export function clearMissionRequests(machine: string) { mutations.clearMachine(machine); }
 const rejected = (error: unknown) => error instanceof ApiError && error.status >= 400 && error.status < 500;
 const date = (value: string) => new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+const missionStatusClass = (status: MissionStatus) => status === "working" ? "" : ["needs-input", "blocked", "paused"].includes(status) ? "waiting" : ["cancelled", "ready-for-review"].includes(status) ? "inactive" : "";
 export function MissionPage({ id, me, connected, openTeam }: { id: string; me: Me; connected: boolean; openTeam: (id: string) => void }) {
   const api = useApi(), machine = useMachines().active.id, key = machine + "/" + id;
   const [mission, setMission] = useState<MissionView | null>(null);
@@ -68,7 +69,7 @@ export function MissionPage({ id, me, connected, openTeam }: { id: string; me: M
       const { action: endpoint, ...payload } = body;
       const result = await api<MissionView>("/missions/" + id + "/" + endpoint, payload);
       const message = endpoint === "extend"
-        ? "Time extension recorded. The mission now stops " + date(result.deadlineAt) + "."
+        ? missionExtensionConfirmation(result, Date.now(), date)
         : endpoint[0].toUpperCase() + endpoint.slice(1) + " recorded. Revision " + result.revision + ".";
       mutations.complete(key, body.requestId, { id: result.id }, message);
       if (mounted.current) { receive(result); view.refresh(); }
@@ -95,7 +96,7 @@ export function MissionPage({ id, me, connected, openTeam }: { id: string; me: M
         <p className="team-eyebrow">Mission</p>
         <h1>{mission.title}</h1>
         <div className="team-detail-meta">
-          <span className="team-status"><span className="dot" />{missionStateLabel(mission)}</span>
+          <span className={"team-status " + missionStatusClass(mission.status)}><span className="dot" />{missionStateLabel(mission)}</span>
           <span>Revision {mission.revision}</span>
           <span className="team-freshness" role="status">{view.stale ? "Showing last received state; controls are disabled." : ""}</span>
         </div>
@@ -104,7 +105,7 @@ export function MissionPage({ id, me, connected, openTeam }: { id: string; me: M
       <button type="button" className="text-button" disabled={view.refreshing} onClick={view.refresh} aria-busy={view.refreshing}><RefreshCw className={view.refreshing ? "is-refreshing" : ""} size={14} />Refresh mission</button>
     </header>
     <div className="team-detail-body">
-      {mission.reason && <p className="team-notice" role="status">{mission.reason}</p>}
+      {missionShowsReason(mission) && <p className="team-notice" role="status">{mission.reason}</p>}
       <section className="team-section">
         <h2>Subtasks</h2>
         {mission.subtasks.length ? <ul className="mission-subtasks">{mission.subtasks.map(subtask => <li key={subtask.id}>

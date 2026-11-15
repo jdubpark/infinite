@@ -263,7 +263,7 @@ export type BoardColumn = "needs-input" | "working" | "review" | "ended";
 export type BoardAttempt = { workId: string; number: number; of: number; superseded: boolean };
 export type BoardItem = {
   kind: "mission" | "team" | "goal"; id: string; title: string; groupId?: string; projectName: string;
-  column: BoardColumn; status: string; detail: string; createdAt?: string; updatedAt: string;
+  column: BoardColumn; status: string; detail: string; stopReason?: "deadline"; createdAt?: string; updatedAt: string;
   subtasks?: { total: number; running: number; done: number };
   attempt?: BoardAttempt;
 };

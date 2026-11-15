@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { missionControls, missionExtendChoices, missionLeftLabel, missionStateLabel, missionStopLine, missionTimeLeftMs } from "../apps/web/src/mission-model";
+import { missionControls, missionExtendChoices, missionExtensionConfirmation, missionLeftLabel, missionShowsReason, missionStateLabel, missionStopLine, missionTimeLeftMs } from "../apps/web/src/mission-model";
 import type { MissionStatus } from "../apps/web/src/mission-model";
 
 const NOW = Date.parse("2026-11-15T12:00:00.000Z");
@@ -87,6 +87,20 @@ test("mission time-left labels use hours and minutes", () => {
   assert.equal(missionLeftLabel(60_000), "1 min");
   assert.equal(missionLeftLabel(59_999), "less than a minute");
   assert.equal(missionLeftLabel(30_000), "less than a minute");
+});
+
+test("extension confirmation uses remaining time for a stopped clock and stop time otherwise", () => {
+  const deadlineAt = "2026-11-15T12:30:00.000Z";
+  assert.equal(missionExtensionConfirmation({ deadlineAt, clockStoppedAt: "2026-11-15T12:10:00.000Z" }, NOW, () => "formatted"),
+    "Time extension recorded. The clock is stopped with 20 min left.");
+  assert.equal(missionExtensionConfirmation({ deadlineAt }, NOW, () => "formatted " + deadlineAt),
+    "Time extension recorded. The mission now stops formatted " + deadlineAt + ".");
+});
+
+test("deadline stop reason is omitted while other mission reasons remain visible", () => {
+  assert.equal(missionShowsReason({ status: "blocked", stopReason: "deadline", reason: "Deadline reached" }), false);
+  assert.equal(missionShowsReason({ status: "blocked", reason: "Waiting on a dependency" }), true);
+  assert.equal(missionShowsReason({ status: "paused", reason: "Owner requested pause" }), true);
 });
 
 test("mission stop-time lines match live, stopped, and terminal states", () => {

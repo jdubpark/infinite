@@ -104,7 +104,7 @@ export function SwarmView(props: SwarmViewProps) {
         <div className="sw-group-label sw-dim" role="heading" aria-level={2}>Missions waiting on you</div>
         {model.held.map(mission => <div className="sw-held-row" key={mission.id}>
           <span className="sw-unit-sub" title={mission.title}>{mission.title}</span>
-          <div className="sw-held-row-meta"><span className="sw-dim">{missionStateLabel(mission)}</span><button type="button" className="sw-link" onClick={() => openMission(mission.id)}>Open mission</button></div>
+          <div className="sw-held-row-meta"><span className="sw-dim">{missionStateLabel(mission)}</span><button type="button" className="sw-link" aria-label={"Open mission: " + mission.title} onClick={() => openMission(mission.id)}>Open mission</button></div>
         </div>)}
       </section>}
       {empty ? <div className={`sw-empty${model.held.length > 0 ? " sw-held-empty" : ""}`}>

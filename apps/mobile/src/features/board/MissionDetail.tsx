@@ -13,7 +13,7 @@ import { theme } from "../../theme";
 import { newer } from "../teams/model";
 import { RequestStatus, Section, SteerBox, t } from "../teams/parts";
 import { useRunRequest } from "../teams/useRunRequest";
-import { attemptLabel, attemptsOf, findBoardItem, missionControls, missionExtendChoices, missionStatusLabel, missionStopLine, missionStoppedAtLimit, missionSubtaskLabel, missionTimeLeftMs, openMissionDecisions } from "./model";
+import { attemptLabel, attemptsOf, findBoardItem, missionControls, missionExtendChoices, missionShowsReason, missionStatusLabel, missionStopLine, missionStoppedAtLimit, missionSubtaskLabel, missionTimeLeftMs, openMissionDecisions } from "./model";
 import { Attempts } from "./Attempts";
 
 export function MissionDetail({ connection, id }: { connection: Connection; id: string }) {
@@ -84,7 +84,7 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
           {attemptChip ? <Chip label={attemptChip} /> : null}
           <Chip label={`Updated ${age(mission.updatedAt, now)}`} /><Chip label={`Rev ${mission.revision}`} /></View>
         {stopLine ? <Text style={stoppedAtLimit || timeLeft <= 0 ? t.warning : t.note}>{stopLine}</Text> : null}
-        {mission.reason ? <Text style={mission.status === "blocked" ? t.error : t.warning}>{mission.reason}</Text> : null}
+        {missionShowsReason(mission) ? <Text style={mission.status === "blocked" ? t.error : t.warning}>{mission.reason}</Text> : null}
       </View>
 
       {decisions.length ? <Section title="Needs your input" count={decisions.length}>

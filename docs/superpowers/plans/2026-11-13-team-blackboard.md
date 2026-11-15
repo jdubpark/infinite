@@ -586,6 +586,16 @@ Spec part 4 (posting and reading), the digest and prompt paragraphs of part 5, t
 - A filtered list that stops at the scan limit says so: `more` is true and `cursor` is the last scanned `seq`, so a member can always page to the end (Task 5).
 - The host adds no `--allowedTools`. A Claude profile whose own arguments set an allow-list must name `mcp__infinite_team__entry_post`, `mcp__infinite_team__entry_list`, and `mcp__infinite_team__entry_get`, or the provider refuses the three tools. Task 10 says so in `docs/teams.md`, beside the switch.
 
+**Rulings after the first review.**
+
+- **The size limits count the bytes a head takes in JSON.** A member path holds no control character (U+0000 to U+001F, U+007F). The paths together are at most 1,024 bytes as a JSON array (`Buffer.byteLength(JSON.stringify(paths))`), and a summary is at most 240 bytes as JSON string content (after escaping). The first version counted UTF-8 bytes: four paths of control characters and a summary of quotation marks passed it and made a head of about 6.6 KiB, which no list or digest could hold.
+- **A head that cannot fit never stops a list.** `listForMember` and `entryDigest` skip a head whose JSON alone is over the answer's byte limit, count it in `unreadable`, and go on; a filtered list's cursor moves past it. With the limits above no such head can be stored; the rule keeps "a member can always page to the end" true whatever is stored.
+- **A journal page without entry events moves the cursor and nothing else.** `ingestRunEntries` sets the member's `entryCursor` to the page's cursor in memory, calls no `ingest`, and reports no advance, also when the store is not ready or the run's write is held. The run's next save keeps the cursor. So a member that never posts costs no store write and no record save, and a member that launched during a store outage is not read from the start again on every pass. A page WITH entry events still waits for a store that takes it.
+- **A stopped member whose journal was read to its end is done**, whatever the run's status. A worker takes no entry call after its member stopped, so nothing can follow. Stopped members of a blocked, paused, or waiting run leave the 16-page budget.
+- **Only an implementer or an integrator names a task in an entry.** A scout's assignment id is a discovery id, which may equal an implementation task's id. A post with `taskId` from a project manager, a scout, or a reviewer answers `entry-task-forbidden`.
+- **`getForMember` checks the stored body size before it opens the body**, so a refused read of a large body costs no decryption.
+- **Three more rules get a test**: a call from a member that is not running answers 409; a withdrawn entry stays withdrawn when its own author posts an entry that names it; the default list and a filtered list never show a head of another run.
+
 This phase adds no Git command.
 
 ## Trust boundary, and what a review checks

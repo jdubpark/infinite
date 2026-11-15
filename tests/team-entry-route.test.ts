@@ -288,13 +288,22 @@ test("reads follow the member's scope", () => {
     const h = w.harness(implA);
     const implB = memberOf(w.run, hostEntryIds.implB);
     const addressed = ingestPost(w.board, w.run, implB, contract("C route", { paths: ["src/a/api.ts"] }));
-    const list = h.handle(listRequest(implA)).entry as { notice: string; heads: Array<{ entryId: string }> };
-    assert.equal(list.notice, ENTRY_NOTICE);
-    assert.ok(list.heads.some(head => head.entryId === addressed), "a contract on implA's path reaches implA");
 
+    // A second run with its own entries, in the same store, before any list is read.
     const otherRun = { ...entryRun(), id: randomUUID() };
     otherRun.members = otherRun.members.map(member => ({ ...member, runId: otherRun.id }));
     assert.equal(w.board.mirror(otherRun), true);
+    const foreignIds = new Set(w.board.list(otherRun.id).entries.map(head => head.entryId));
+    assert.ok(foreignIds.size > 0);
+
+    const list = h.handle(listRequest(implA)).entry as { notice: string; heads: Array<{ entryId: string }> };
+    assert.equal(list.notice, ENTRY_NOTICE);
+    assert.ok(list.heads.some(head => head.entryId === addressed), "a contract on implA's path reaches implA");
+    assert.equal(list.heads.some(head => foreignIds.has(head.entryId)), false, "the default list holds no head of another run");
+    const directions = h.handle(listRequest(implA, { kinds: ["direction"] })).entry as { heads: Array<{ entryId: string }> };
+    assert.ok(directions.heads.length > 0);
+    assert.equal(directions.heads.some(head => foreignIds.has(head.entryId)), false, "a filtered list holds no head of another run");
+
     const foreign = w.board.list(otherRun.id, { kinds: ["direction"] }).entries[0];
     const foreignText = refused(h, getRequest(implA, foreign.entryId));
     const randomText = refused(h, getRequest(implA, randomUUID()));
@@ -338,6 +347,13 @@ test("a forged or replaced binding is refused", () => {
     assert.deepEqual(refused(off, postRequest(implA, entry)), { status: 403, text: ENTRY_REFUSALS["entry-tools-off"] });
     assert.deepEqual(refused(off, listRequest(implA)), { status: 403, text: ENTRY_REFUSALS["entry-tools-off"] });
     assert.deepEqual(refused(off, getRequest(implA, randomUUID())), { status: 403, text: ENTRY_REFUSALS["entry-tools-off"] });
+
+    // A member that is not running, and one that has reported, both get the closed answer on every entry call.
+    h.flags.running = false;
+    assert.deepEqual(refused(h, postRequest(implA, entry)), { status: 409, text: ENTRY_REFUSALS["entry-closed"] });
+    assert.deepEqual(refused(h, listRequest(implA)), { status: 409, text: ENTRY_REFUSALS["entry-closed"] });
+    assert.deepEqual(refused(h, getRequest(implA, randomUUID())), { status: 409, text: ENTRY_REFUSALS["entry-closed"] });
+    h.flags.running = true;
 
     h.flags.reported = true;
     assert.deepEqual(refused(h, postRequest(implA, entry)), { status: 409, text: ENTRY_REFUSALS["entry-closed"] });

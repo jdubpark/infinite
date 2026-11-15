@@ -29,14 +29,16 @@ const text = (max: number) => z.string().trim().min(1).max(max);
 const idString = z.string().min(1).max(200);
 const uuid = z.uuid();
 
-/** A summary: no control character, trimmed, 1 to 240 UTF-8 bytes. */
+/** A summary: no control character, trimmed, at most 240 bytes as JSON string content (escapes count). */
 const summarySchema = z.string()
   .refine(value => !CONTROL.test(value), "Use no control character")
   .transform(value => value.trim())
-  .pipe(z.string().min(1).refine(value => Buffer.byteLength(value, "utf8") <= MAX_ENTRY_SUMMARY_BYTES, "Use at most 240 bytes"));
+  .pipe(z.string().min(1).refine(value => Buffer.byteLength(JSON.stringify(value), "utf8") - 2 <= MAX_ENTRY_SUMMARY_BYTES, "Use at most 240 bytes"));
 
+/** The paths: no control character, and at most 1,024 bytes as a JSON array (escapes count). */
 const pathsSchema = z.array(ownedPathSchema).max(MAX_ENTRY_PATHS).default([])
-  .refine(paths => paths.reduce((total, path) => total + Buffer.byteLength(path, "utf8"), 0) <= MAX_ENTRY_PATH_BYTES, "Use at most 1024 path bytes");
+  .refine(paths => paths.every(path => !CONTROL.test(path)), "Use no control character")
+  .refine(paths => Buffer.byteLength(JSON.stringify(paths), "utf8") <= MAX_ENTRY_PATH_BYTES, "Use at most 1024 path bytes");
 
 const contractBody = z.object({
   interface: text(2000),
@@ -120,7 +122,9 @@ export function postAllowed(
 ): "ok" | "entry-kind-forbidden" | "entry-task-forbidden" {
   const kinds: readonly MemberEntryKind[] = (ROLE_KINDS as Readonly<Record<string, readonly MemberEntryKind[]>>)[assignment.role] ?? [];
   if (!kinds.includes(entry.kind)) return "entry-kind-forbidden";
-  if (entry.taskId !== undefined && entry.taskId !== assignment.taskId) return "entry-task-forbidden";
+  // Only an implementer or an integrator names a task. A scout's assignment id is a discovery id, not a task.
+  const namesTask = assignment.role === "implementer" || assignment.role === "integrator";
+  if (entry.taskId !== undefined && (!namesTask || entry.taskId !== assignment.taskId)) return "entry-task-forbidden";
   if (entry.kind === "handoff" && assignment.taskId === undefined) return "entry-task-forbidden";
   return "ok";
 }

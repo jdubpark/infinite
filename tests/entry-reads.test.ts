@@ -373,6 +373,52 @@ test("an unreadable head is counted and left out", () => {
   });
 });
 
+test("an oversized head is skipped and paging goes on", () => {
+  withStore((_f, store, board) => {
+    const w = seed(store, board);
+    // The write path refuses a head this large, so the row is written directly. Its paths overlap implA's path src/a.
+    const bigId = randomUUID();
+    const bigPaths = Array.from({ length: 40 }, (_, index) => `src/a/${String(index).padStart(3, "0")}${"x".repeat(190)}`);
+    store.write(tx => {
+      tx.run(
+        "INSERT INTO entries (entry_id, scope, run_id, mission_id, revision, at, kind, author, authority, author_member_id, "
+        + "task_key, state, body_bytes, encrypted_head, encrypted_body) "
+        + "VALUES (?, 'run', ?, NULL, 1, ?, 'contract', 'member', 'claim', ?, NULL, 'active', 20, ?, ?)",
+        bigId,
+        w.run.id,
+        at(30),
+        w.implB.memberId,
+        tx.seal("entries", `${bigId}:head`, { authorRole: "implementer", paths: bigPaths, summary: "Oversized" }),
+        tx.seal("entries", `${bigId}:body`, { interface: "x", change: "y", sources: [] }),
+      );
+    });
+    const normal = ingestOne(board, w.run, w.implB, contract("N after the oversized head"));
+    const bigSeq = store.read(db => db.get<{ seq: number }>("SELECT seq FROM entries WHERE entry_id=?", bigId))?.seq;
+    const normalSeq = board.get(w.run.id, normal)?.head.seq;
+    if (bigSeq === undefined || normalSeq === undefined) throw new Error("rows missing");
+    assert.ok(bigSeq < normalSeq);
+
+    const scope = scopeOf(store, w.implA);
+    const defaults = listOf(store, scope);
+    assert.ok(defaults.heads.some(head => head.entryId === normal));
+    assert.equal(defaults.heads.some(head => head.entryId === bigId), false);
+    assert.equal(defaults.unreadable, 1);
+
+    const filtered = listOf(store, scope, { kinds: ["contract"] });
+    assert.ok(filtered.heads.some(head => head.entryId === normal));
+    assert.equal(filtered.heads.some(head => head.entryId === bigId), false);
+    assert.equal(filtered.unreadable, 1);
+    assert.equal(filtered.cursor, normalSeq, "the cursor is past both");
+    assert.equal(filtered.more, false);
+
+    const digest = board.memberDigest(w.run, w.implA, w.launchSeq);
+    assert.ok(digest !== undefined && "heads" in digest);
+    assert.ok(digest.heads.some(head => head.entryId === normal));
+    assert.equal(digest.heads.some(head => head.entryId === bigId), false);
+    assert.equal(digest.unreadable, 1);
+  });
+});
+
 test("the digest fits 4,096 bytes and keeps the order", () => {
   const f = fixture();
   try {

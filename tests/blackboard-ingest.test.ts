@@ -435,7 +435,6 @@ test("withdraw hides nothing from the owner and changes state once", () => {
     const board = new Blackboard(store);
     const run = entryRun();
     const implA = memberOf(run, hostEntryIds.implA);
-    const implB = memberOf(run, hostEntryIds.implB);
     const record = post(implA, contract("withdraw-marker"));
     const id = record.envelope.requestId;
     assert.equal(board.ingest(run, implA, [record], []).stored, 1);
@@ -449,7 +448,8 @@ test("withdraw hides nothing from the owner and changes state once", () => {
     assert.equal(got?.head.state, "withdrawn");
     assert.equal((got?.body as { change: string }).change, "withdraw-marker");
 
-    assert.equal(board.ingest(run, implB, [post(implB, contract("later", { supersedes: id }))], []).stored, 1);
+    // The later post comes from the entry's own author, so the supersede rule would apply to an active entry.
+    assert.equal(board.ingest(run, implA, [post(implA, contract("later", { supersedes: id }))], []).stored, 1);
     assert.equal(board.get(run.id, id)?.head.state, "withdrawn");
     store.close();
 

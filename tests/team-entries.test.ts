@@ -816,18 +816,56 @@ test("a service without tools reads no extra journal page", async () => {
   } finally { store.close(); f.close(); }
 });
 
+test("a silent member costs no store write and no save", async () => {
+  const f = schedulerFixture(), store = openStore(f, f.key);
+  try {
+    toolsOn(f);
+    // The coordinator's journal holds one event that is not an entry event, so its end is past zero.
+    f.post(f.run.members[0]!.sessionId, "team-usage" as never, {});
+    f.writeTeam();
+    const entries = new Blackboard(store);
+    let ingests = 0;
+    const ingest = entries.ingest.bind(entries);
+    entries.ingest = (...args: Parameters<Blackboard["ingest"]>) => { ingests++; return ingest(...args); };
+    const teams = f.openTeam({ entries });
+    const bytes = recordBytes(f);
+    const scheduler = internal(teams);
+    scheduler.ingestEntries();
+    scheduler.ingestEntries();
+    const member = (scheduler.record(f.run.id) as { run: TeamRun }).run.members[0]!;
+    assert.equal(member.entryCursor, f.journal.seq, "the in-memory cursor is at the journal's end");
+    assert.equal(ingests, 0, "Blackboard.ingest was not called");
+    assert.deepEqual(recordBytes(f), bytes, "the run was not saved");
+  } finally { store.close(); f.close(); }
+});
+
 test("an unavailable store keeps posts waiting", async () => {
   const f = schedulerFixture();
   openStore(f, f.key).close();
   const bad = openStore(f, randomBytes(32));
   try {
     toolsOn(f);
-    f.writeTeam();
     const pm = f.run.members[0]!;
+    // A second member, stopped in a blocked run, whose journal holds one non-entry event and no entry event.
+    const quietId = randomUUID(), quietSession = randomUUID();
+    await f.manager.createTeamSession({ requestId: quietSession, provider: "demo", title: "Quiet", prompt: "Wait" } as never,
+      { runId: f.run.id, memberId: quietId, revision: 1, role: "reviewer" }, pm.cwd);
+    f.post(quietSession, "team-usage" as never, {});
+    f.run.members.push({ ...structuredClone(pm), memberId: quietId, sessionId: quietSession, role: "reviewer", status: "stopped", entryTools: true, cursor: 0 });
+    f.run.status = "blocked";
+    f.writeTeam();
     f.post(pm.sessionId, "team-entry", postEnvelope(f, pm.memberId, contract("waiting")));
     const teams = f.openTeam({ entries: new Blackboard(bad) });
-    internal(teams).ingestEntries();
+    const scheduler = internal(teams);
+    const before = f.reads();
+    scheduler.ingestEntries();
+    assert.equal(f.reads() - before, 2, "both members are read on the first pass");
     assert.equal(f.readRecord<{ run: TeamRun }>("team", f.run.id).run.members[0]!.entryCursor ?? 0, 0);
+    const quiet = (scheduler.record(f.run.id) as { run: TeamRun }).run.members.find(member => member.memberId === quietId)!;
+    assert.equal(quiet.entryCursor, 1, "the silent member's cursor moves although the store is unavailable");
+    const second = f.reads();
+    scheduler.ingestEntries();
+    assert.equal(f.reads() - second, 1, "a stopped member of a blocked run leaves the pending set; only the poster is read");
     bad.close();
 
     const good = openStore(f, f.key);

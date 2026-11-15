@@ -153,6 +153,15 @@ function fitHeads<T>(
 }
 
 /**
+ * The heads whose own JSON fits `bytes`, and how many were left out. A head that cannot fit an answer alone is never
+ * served, so it must not stop a list.
+ */
+function withoutOversized(heads: readonly MemberHead[], bytes: number, measure: (head: MemberHead) => string): { heads: MemberHead[]; skipped: number } {
+  const fitting = heads.filter(head => Buffer.byteLength(measure(head), "utf8") <= bytes);
+  return { heads: fitting, skipped: heads.length - fitting.length };
+}
+
+/**
  * A list with no query is the default order. A query with any field is a filtered list in seq order. `scanRows` is
  * the scan cap of a filtered list; only tests lower it.
  */
@@ -164,11 +173,12 @@ export function listForMember(
 ): MemberList {
   if (query === undefined || Object.keys(query).length === 0) {
     const addressed = addressedHeads(db, scope);
-    return fitHeads(addressed.heads, MEMBER_LIST_LIMIT, MEMBER_LIST_BYTES, value => JSON.stringify(value), (taken, more) => ({
+    const usable = withoutOversized(addressed.heads, MEMBER_LIST_BYTES, head => JSON.stringify(head));
+    return fitHeads(usable.heads, MEMBER_LIST_LIMIT, MEMBER_LIST_BYTES, value => JSON.stringify(value), (taken, more) => ({
       notice: ENTRY_NOTICE,
       heads: taken,
       more: more || addressed.capped,
-      unreadable: addressed.unreadable,
+      unreadable: addressed.unreadable + usable.skipped,
     }));
   }
   const since = query.since ?? 0;
@@ -192,7 +202,8 @@ export function listForMember(
   const rows = capped ? fetched.slice(0, scanRows) : fetched;
   const scannedSeq = rows.length > 0 ? rows[rows.length - 1].seq : since;
   let unreadable = 0;
-  const matched: MemberHead[] = [];
+  // In seq order. A head over the list limit alone is counted and kept as a slot without a head, so the cursor moves past it.
+  const slots: { seq: number; head?: MemberHead }[] = [];
   for (const row of rows) {
     const head = openHead(db, row);
     if (head === undefined) {
@@ -201,21 +212,41 @@ export function listForMember(
     }
     // A head without paths does not match a path filter.
     if (query.path !== undefined && !(head.paths.length > 0 && pathsOverlap([query.path], head.paths))) continue;
-    matched.push(head);
+    if (Buffer.byteLength(JSON.stringify(head), "utf8") > MEMBER_LIST_BYTES) {
+      unreadable += 1;
+      slots.push({ seq: row.seq });
+      continue;
+    }
+    slots.push({ seq: row.seq, head });
   }
+  const headCount = slots.filter(slot => slot.head !== undefined).length;
   const limit = Math.min(query.limit ?? MEMBER_LIST_LIMIT, MEMBER_LIST_LIMIT);
-  return fitHeads(matched, limit, MEMBER_LIST_BYTES, value => JSON.stringify(value), (taken, more) => {
-    // When every match fits and the scan stopped at the cap, the cursor moves past the scanned rows, so the member
-    // can page to the end. Otherwise it is the last returned seq, or `since` when none was returned.
-    const resume = capped && taken.length === matched.length;
+  // When every match fits and the scan stopped at the cap, the cursor moves past the scanned rows, so the member
+  // can page to the end. Otherwise it is the last consumed slot, or `since` when none was consumed.
+  const answer = (taken: MemberHead[], cursor: number): MemberList => {
+    const resume = capped && taken.length === headCount;
     return {
       notice: ENTRY_NOTICE,
       heads: taken,
-      more: more || resume,
-      cursor: resume ? scannedSeq : taken.length > 0 ? taken[taken.length - 1].seq : since,
+      more: taken.length < headCount || resume,
+      cursor: resume ? scannedSeq : cursor,
       unreadable,
     };
-  });
+  };
+  let taken: MemberHead[] = [];
+  let cursor = since;
+  for (const slot of slots) {
+    if (slot.head === undefined) {
+      cursor = slot.seq;
+      continue;
+    }
+    if (taken.length >= limit) break;
+    const trial = [...taken, slot.head];
+    if (Buffer.byteLength(JSON.stringify(answer(trial, slot.seq)), "utf8") > MEMBER_LIST_BYTES) break;
+    taken = trial;
+    cursor = slot.seq;
+  }
+  return answer(taken, cursor);
 }
 
 /** One visible entry with its body, `too-large` when the canonical body is over 64 KiB, or undefined. */
@@ -226,6 +257,8 @@ export function getForMember(db: EvidenceDb, scope: MemberScope, entryId: string
     entryId,
   );
   if (row === undefined || row.encrypted_body === null) return undefined;
+  // The stored size is the canonical body's size, so a large body is refused before any decryption.
+  if (row.body_bytes > MAX_SERVED_BODY_BYTES) return "too-large";
   const body = db.open<unknown>("entries", `${row.entry_id}:body`, row.encrypted_body);
   if (Buffer.byteLength(canonicalJson(body), "utf8") > MAX_SERVED_BODY_BYTES) return "too-large";
   return { notice: ENTRY_NOTICE, head: memberHeadOf(db, row), body };
@@ -250,14 +283,15 @@ export function supersedeTarget(db: EvidenceDb, scope: MemberScope, entryId: str
  * at most DIGEST_HEADS and the canonical JSON is within DIGEST_BYTES. `cursor` is the launch seq.
  */
 export function entryDigest(addressed: { heads: MemberHead[]; unreadable: number; capped: boolean }, cursor: number): EntryDigest {
+  const usable = withoutOversized(addressed.heads, DIGEST_BYTES, head => canonicalJson(head));
   const counts: Partial<Record<EntryKind, number>> = {};
-  for (const head of addressed.heads) counts[head.kind] = (counts[head.kind] ?? 0) + 1;
-  return fitHeads<EntryDigest>(addressed.heads, DIGEST_HEADS, DIGEST_BYTES, value => canonicalJson(value), (taken, more) => ({
+  for (const head of usable.heads) counts[head.kind] = (counts[head.kind] ?? 0) + 1;
+  return fitHeads<EntryDigest>(usable.heads, DIGEST_HEADS, DIGEST_BYTES, value => canonicalJson(value), (taken, more) => ({
     notice: ENTRY_NOTICE,
     cursor,
     counts,
     heads: taken,
     more: more || addressed.capped,
-    unreadable: addressed.unreadable,
+    unreadable: addressed.unreadable + usable.skipped,
   }));
 }

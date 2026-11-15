@@ -367,11 +367,10 @@ that names the rule.
 Notes take only the prompt room left after the full prompt and its leading
 pending message, within the 80 KiB prompt limit. The host keeps the newest
 notes that fit and says how many older ones it left out; with no room, it
-leaves every note out. When the leading message has to be shortened, the
-message takes the room: every note is left out and the prompt states only
-their count, and it drops that sentence too if the shortened message would
-not fit beside it. Notes therefore never hold a message back, cost it its
-text, or make the prompt too large.
+leaves every note out. When the leading message has to be shortened, that
+message takes the whole room: every note is left out, without a count, and
+the prompt is the one a mission without notes would get. Notes therefore
+never hold a message back, cost it its text, or make the prompt too large.
 
 A rotation retires every older conversation. The host resumes only a
 conversation from the rotation on that a confirmed native session ID names. If

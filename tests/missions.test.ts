@@ -398,27 +398,50 @@ test("mission prompt cuts blocker evidence to the remaining budget, not to the s
   assert.match(delivered.truncated, new RegExp(`subteam ${teamId}`));
 });
 
-test("a shortened leading message keeps its follow-up identifiers, and the coordinator's notes are left out with their count", () => {
-  const mission = {
-    id: "mission", groupName: "Example", status: "working", deadlineAt: "", maxSubtasks: 8,
-    subtasks: [], decisions: [], dispatchSummary: "", steering: [], objective: "界".repeat(20000),
-  } as unknown as Mission;
+test("a shortened leading message takes the whole prompt: no coordinator note is added, and a follow-up keeps its identifiers in every form", () => {
   const followUpId = "0b0e7c1e-5a2f-4d53-9c1b-6f2a4e8d9b10", dueAt = "2026-11-14T10:00:00.000Z";
-  const result = missionPromptWithMessageCount(mission, [], [
-    { type: "follow-up", followUpId, dueAt, reason: "Look at the staging check again.", check: "界".repeat(12000) },
-  ], 2, "claude", lineup.coordinator, { openChildDecisions: [], waiting: 0,
-    notes: [{ at: "2026-11-14T09:00:00.000Z", text: `First note ${"界".repeat(600)}` }, { at: "2026-11-14T09:10:00.000Z", text: "Second note" }] });
-  assert.ok(Buffer.byteLength(result.prompt, "utf8") <= 80 * 1024);
-  assert.equal(result.includedMessageCount, 1);
-  assert.equal(result.shortened, true);
+  const message: MissionMessage = { type: "follow-up", followUpId, dueAt, reason: "Look at the staging check again.", check: "界".repeat(12000) };
+  const notes = [{ at: "2026-11-14T09:00:00.000Z", text: "First note" }, { at: "2026-11-14T09:10:00.000Z", text: "Second note" }];
+  const build = (objectiveLength: number, withNotes = true) => missionPromptWithMessageCount({
+    id: "mission", groupName: "Example", status: "working", deadlineAt: "", maxSubtasks: 8,
+    subtasks: [], decisions: [], dispatchSummary: "", steering: [], objective: "界".repeat(objectiveLength),
+  } as unknown as Mission, [], [message], 2, "claude", lineup.coordinator, { openChildDecisions: [], waiting: 0, ...(withNotes ? { notes } : {}) });
   const label = "Messages since your last attempt (JSON): ";
-  const [delivered] = JSON.parse(result.prompt.split("\n").find(line => line.startsWith(label))!.slice(label.length));
-  assert.equal(delivered.followUpId, followUpId);
-  assert.equal(delivered.dueAt, dueAt);
-  assert.ok(delivered.check.length > 0 && delivered.check.length < 12000, "the long field keeps a prefix of its text");
-  assert.match(delivered.truncated, /Shortened by the host to fit the prompt budget/);
-  assert.match(result.prompt, /2 notes from your earlier attempts did not fit in this prompt and were left out\./);
-  assert.doesNotMatch(result.prompt, /First note|Second note/);
+  const delivered = (prompt: string) => JSON.parse(prompt.split("\n").find(line => line.startsWith(label))!.slice(label.length))[0];
+
+  // Room to spare: the long field is cut, and the notes cost the message nothing, not even a sentence about them.
+  const roomy = build(20000);
+  assert.equal(roomy.shortened, true);
+  assert.ok(delivered(roomy.prompt).check.length > 0 && delivered(roomy.prompt).check.length < 12000, "the long field keeps a prefix of its text");
+  assert.equal(roomy.prompt, build(20000, false).prompt, "the prompt is the one a mission without notes gets");
+
+  // The largest objective that leaves room for any form of the message: only the identifiers fit.
+  let fits = 20000, tooLarge = 27500;
+  assert.throws(() => build(tooLarge), /exceeds the coordinator prompt limit/);
+  while (tooLarge - fits > 1) {
+    const middle = Math.floor((fits + tooLarge) / 2);
+    try { build(middle); fits = middle; } catch { tooLarge = middle; }
+  }
+  const tight = build(fits);
+  assert.ok(Buffer.byteLength(tight.prompt, "utf8") <= 80 * 1024);
+  assert.equal(tight.shortened, true);
+  assert.equal(tight.prompt, build(fits, false).prompt, "notes never keep a message that fits without them from being delivered");
+  const least = delivered(tight.prompt);
+  assert.equal(least.followUpId, followUpId);
+  assert.equal(least.dueAt, dueAt);
+  assert.ok(!least.check && !least.reason, "nothing but identifiers fits at the limit");
+  assert.match(least.truncated, /Shortened by the host to fit the prompt budget/);
+
+  // A little more room: text is cut to fewer bytes than an identifier holds, and the identifiers stay whole.
+  let narrow: ReturnType<typeof delivered> | undefined;
+  for (let less = 1; less <= 60 && !narrow; less++) {
+    const candidate = delivered(build(fits - less).prompt);
+    if (typeof candidate.reason === "string") narrow = candidate;
+  }
+  assert.ok(narrow, "a slightly smaller objective leaves room for cut text");
+  assert.ok(Buffer.byteLength(narrow.reason, "utf8") < dueAt.length && Buffer.byteLength(narrow.check, "utf8") < dueAt.length, "the cut is shorter than either identifier");
+  assert.equal(narrow.followUpId, followUpId);
+  assert.equal(narrow.dueAt, dueAt);
 });
 
 test("mission follow-up prompt defers trailing messages when they exceed the byte limit", () => {

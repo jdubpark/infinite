@@ -665,16 +665,13 @@ export function missionPromptWithMessageCount(mission: Mission, repos: MissionPr
     `Write summaries and questions in plain English. Lead with concrete facts. Do not invent evidence or claim checks or outcomes you did not observe.`,
     missionReportingInstructions(provider),
   ].filter(Boolean).join("\n\n");
-  const bounded = (notes: string) => boundedMissionPrompt(recent, included => build(included, notes));
-  if (!context.notes?.length) return bounded("");
   // Notes get only the room left once the leading message fits whole. Trailing messages may then wait for a later
-  // attempt, but notes never hold the leading one or overflow.
+  // attempt, but notes never hold the leading one or overflow. A leading message that does not fit whole is shortened
+  // to fill the prompt, so it leaves no room: the notes section is then empty, not even a count, and the message
+  // keeps every byte it would have had without notes.
   const room = MISSION_PROMPT_LIMIT_BYTES - Buffer.byteLength(build(recent.slice(0, 1)), "utf8") - 2;
-  if (room >= 0) return bounded(missionNotesSection(context.notes, room));
-  // The leading message does not fit whole, so the host shortens it to fill the prompt. The notes are left out and
-  // only their count is stated, and that sentence yields too when it would keep the shortened message from fitting.
-  try { return bounded(missionNotesText([], context.notes.length)); }
-  catch (error) { if (!(error instanceof TeamError)) throw error; return bounded(""); }
+  const notes = context.notes?.length && room >= 0 ? missionNotesSection(context.notes, room) : "";
+  return boundedMissionPrompt(recent, included => build(included, notes));
 }
 
 /** Build only the authoritative snapshot and newly delivered messages for a resumed coordinator conversation. */

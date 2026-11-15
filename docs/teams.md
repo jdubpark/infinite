@@ -1041,7 +1041,7 @@ The sealed eval capsule of a run copies the goal context. Once a cycle pins the 
 
 Owner text lives in the sealed goal record, the pinned digest, and the prompts and context files of later cycles. The host never writes it to a log line, an event, or an error body. A statement that looks like a secret is refused with `400` and `objective-secret`, and the refusal does not repeat it.
 
-Creation criteria go in `criteria` on `POST /api/goals`: one to seven criteria, each with a statement, a check, and a threshold. Routine goals never take criteria.
+Creation criteria go in `criteria` on `POST /api/goals`: one to seven criteria, each with a statement, a check, and a threshold. Routine goals never take criteria. A goal created over the relay can carry criteria, as it already carries the success text and steering, because the create route is owner-only; the record reads and corrections stay off the relay.
 
 `POST /api/goals/:id/record` takes `{ requestId, version, ops }` from an owner device. A controller or viewer gets `403`. Four ops are available:
 

@@ -303,11 +303,15 @@ test("owner corrections through the host", { timeout: 60000 }, async () => {
     const replay = await f.host.fetchApi(`/goals/${created.body.id}/record`, "owner", body);
     assert.equal(replay.status, 200, JSON.stringify(replay.body));
     assert.deepEqual(replay.body, corrected.body);
+    // The id is case-insensitive: the upper-case path reaches the same goal and the same receipt.
+    const upperReplay = await f.host.fetchApi(`/goals/${created.body.id.toUpperCase()}/record`, "owner", body);
+    assert.equal(upperReplay.status, 200, JSON.stringify(upperReplay.body));
+    assert.deepEqual(upperReplay.body, corrected.body);
     assert.equal((await f.host.fetchApi(`/goals/${created.body.id}/record`, "viewer")).body.latestVersion, 2);
   } finally { await f.close(); }
 });
 
-test("a recoverable child report keeps its goal active through the bounded PM repair",{ timeout: 120000 }, async () => {
+test("a recoverable child report keeps its goal active through the bounded PM repair", { timeout: 120000 }, async () => {
   const f = await fixture("recoverable-blocker");
   try {
     const created = await f.host.fetchApi("/goals", "owner", f.create());

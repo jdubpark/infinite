@@ -311,7 +311,7 @@ export class IntakeService {
       issueId, identifier: "", url: "", title: (firstLine ?? "Request from a Slack thread").slice(0, 120),
       description: text.trim().slice(0, descriptionLimit), issueCreatedAt: now, issueUpdatedAt: now,
       state: "queued", thread: input.thread,
-      direct: { eventId: input.eventId, ts: input.ts, text, ...(explicit ? { route: { kind: explicit.route, by: "owner" as const, at: now } } : {}) },
+      direct: { eventId: input.eventId, ts: input.ts, text, ...(slack?.answerQuestions ? { routable: true as const } : {}), ...(explicit ? { route: { kind: explicit.route, by: "owner" as const, at: now } } : {}) },
       comments: {}, messages: [], questions: [], inbound: [], createdAt: now, updatedAt: now,
     });
     this.pendingMentions.delete(mention);
@@ -399,10 +399,9 @@ export class IntakeService {
    * `request`, with a hold reason, for the next cycle.
    */
   private async file(): Promise<void> {
-    const routing = this.config.intake?.slack?.answerQuestions === true;
-    // With routing on, a record waits for its route (the route step stores one every cycle); a record without one is work only with routing off.
+    // A record saved for routing waits for its route (the route step stores one every cycle). Any other direct record is work, as it was before routing.
     for (const record of this.store.list().filter(item => item.state === "queued" && item.direct && !item.request
-      && (item.direct.route ? true : !routing))) {
+      && (item.direct.route !== undefined || !item.direct.routable))) {
       if (this.closed) return;
       try { await (isAnswerRecord(record) ? this.prepareAnswer(record) : this.fileRecord(record)); }
       catch (error) {
@@ -424,7 +423,7 @@ export class IntakeService {
     const slack = this.config.intake?.slack;
     if (!slack?.answerQuestions) return;
     const router = slack.classify ? this.options.router : undefined;
-    const pending = this.store.list().filter(item => item.direct && !item.request && !item.direct.route);
+    const pending = this.store.list().filter(item => item.direct?.routable === true && !item.request && !item.direct.route);
     const decided = await Promise.all(pending.map(async record => {
       const text = record.direct!.text.trim().slice(0, ROUTE_INPUT_LIMIT);
       const reading = router && text !== "" ? await this.reading(router, text) : undefined;

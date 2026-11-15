@@ -61,6 +61,8 @@ export interface IntakeDirect {
   eventId: string; ts: string; text: string; filedAt?: string;
   /** Where the request went: absent on records made before routing existed or with answerQuestions off, and then it is work. */
   route?: IntakeRoute & { at: string };
+  /** Set when the mention was saved with `answerQuestions` on: only such a record is routed. Any other direct record is work. */
+  routable?: true;
 }
 export interface IntakeComment { id: string; body: string; delivered: boolean; attempts: number; error?: string }
 export interface IntakeRecord {

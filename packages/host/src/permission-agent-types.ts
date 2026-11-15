@@ -217,8 +217,13 @@ export interface PermissionInteractiveTarget {
     | { ok: true; accept?: number; reject?: number }
     | { ok: false; stale: boolean; reason: string }
   >;
-  /** Sends one option under a control lease. `refused` means nothing was sent. `uncertain` is never retried. */
-  answer(option: number, decisionId: string): Promise<"delivered" | "refused" | "uncertain">;
+  /**
+   * Sends one option under a control lease. `refused` means nothing was sent. `uncertain` is never retried.
+   * `notice` is the host's fixed reject notice. A target sends it only after a reject option that accepts text.
+   */
+  answer(option: number, decisionId: string, notice?: string): Promise<"delivered" | "refused" | "uncertain">;
+  /** Aborted when the requester's authority ends while the decision runs, for example a revoke or a halt. */
+  signal?: AbortSignal;
 }
 
 export type PermissionHandled =
@@ -229,6 +234,10 @@ export type PermissionHandled =
     result: "allowed" | "rejected" | "owner" | "undeliverable" | "stale";
     decisionId?: string;
     interruptClass?: InterruptClass;
+    /** The reject code, for a reject. The run status shows it; the model's note is never here. */
+    code?: RejectCode;
+    /** The last delivery event the service recorded, when it reached delivery. `uncertain` is never repeated. */
+    delivery?: "receipt" | "refusal" | "uncertain";
   };
 
 /** Decides an interactive request through the pipeline and delivers the result with the live checks. */

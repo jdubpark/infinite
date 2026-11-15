@@ -415,6 +415,53 @@ test("notifier holds a team member's prompt while its coordinator can decide and
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("the permission agent's holder decides the push: an agent-held dialog never reaches the owner, one it leaves does", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("owner", "ExponentPushToken[a]", "android");
+  const sent: { title: string; body: string }[][] = [];
+  const sender = async (messages: { title: string; body: string }[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  const member = { id: "m1", title: "implementer: retire-member", provider: "claude", status: "running", attention: att("working") };
+  let holder: "agent" | "owner" | "undecided" = "owner";
+  const asked: number[] = [];
+  const notifier = new Notifier(
+    { list: async () => [member] } as never, store, sender,
+    { detail: "minimal", events: ["needs-you"], intervalMs: 100000, reviewGraceMs: 0, reviewHoldLimitMs: 100000 },
+    // A served run's own answer is "user": whatever the permission agent leaves is the owner's.
+    { statuses: () => [], promptOwner: () => "user" }, undefined, undefined, undefined,
+    { holder: (_sessionId, promptId) => { asked.push(promptId); return holder; } },
+  );
+  try {
+    await notifier.tick();
+    // An allow, a reject or a stale request: the agent held it until it closed. Nobody is pushed.
+    holder = "agent";
+    member.attention = att("needs-you", 1);
+    await notifier.tick();
+    await notifier.tick();
+    member.attention = att("working");
+    await notifier.tick();
+    assert.equal(sent.length, 0, "a dialog the permission agent answered never reaches the owner");
+    assert.ok(asked.includes(1), "the notifier asks the holder for the open dialog");
+
+    // A class rule, an owner verdict or an undeliverable request: the holder turns to the owner, who is pushed once.
+    holder = "agent";
+    member.attention = att("needs-you", 2);
+    await notifier.tick();
+    holder = "owner";
+    await notifier.tick();
+    await notifier.tick();
+    assert.equal(sent.length, 1, "a dialog the permission agent leaves to the owner is pushed once");
+
+    // A dialog the scheduler has not handed off yet is held for the grace period only.
+    holder = "undecided";
+    member.attention = att("needs-you", 3);
+    await notifier.tick();
+    assert.equal(sent.length, 1);
+    await notifier.tick();
+    assert.equal(sent.length, 2, "an undecided dialog reaches the owner after the grace period");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("a held prompt survives a session missing from one listing and still reaches the owner", async () => {
   const dir = mkdtempSync("/tmp/inf-push-");
   const store = new PushStore(dir, randomBytes(32));

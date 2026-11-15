@@ -432,6 +432,10 @@ function outputTeam(team: any, json: boolean) {
   if (team.permissions) console.log(`Permissions: ${team.permissionsRevokedAt ? "revoked" : "delegated to coordinator"} · ${(team.permissionDecisions ?? []).length}/${team.permissions.maxDecisions} decisions`);
   for (const decision of (team.permissionDecisions ?? []).slice(-5))
     console.log(`Permission ${clean(decision.id)}: ${clean(decision.status)} · member ${clean(decision.targetMemberId)}${decision.receipt ? ` · ${clean(decision.receipt.state)}/${clean(decision.receipt.result ?? "unconfirmed")}` : ""}`);
+  for (const decision of (team.permissionAgentDecisions ?? []).slice(-5))
+    console.log(`Permission agent: ${clean(decision.result)}${decision.code ? ` (${clean(decision.code)})` : ""}${decision.interruptClass ? ` · class ${clean(decision.interruptClass)}` : ""} · member ${clean(decision.memberId)} (${clean(decision.role)})${decision.delivery ? ` · ${clean(decision.delivery)}` : ""}`);
+  for (const member of team.members ?? []) if (member.permissionBlocked)
+    console.log(`Member ${clean(member.memberId)} (${clean(member.role)}): blocked on a permission (${clean(member.permissionBlocked.code)})`);
   for (const question of team.decisions ?? []) if (!question.answer) console.log(`Question ${clean(question.id)}: ${clean(question.question)}`);
 }
 function receipt(path: string, key: string, body: unknown) {

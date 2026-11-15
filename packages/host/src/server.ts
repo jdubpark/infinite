@@ -68,6 +68,7 @@ import { createMissionSchema, missionActionSchema, missionTextSchema, type Creat
 import { ProjectGroupService } from "./project-groups.js";
 import { PermissionDelegationService } from "./permission-delegation.js";
 import type { PermissionAgentServices } from "./permission-agent-types.js";
+import { EvidenceDeliveryLedger, InteractivePermissionDelivery, permissionDeliveryModule } from "./permission-delivery.js";
 import { INTERRUPT_CLASSES, PERMISSION_POLICY_VERSION } from "./permission-policy.js";
 import { PermissionJournal, permissionJournalModule } from "./evidence/permission-journal.js";
 import { LinearService } from "./linear.js";
@@ -93,8 +94,6 @@ import { MAX_EVENTS_BUFFERED_BYTES, MAX_EVENTS_STREAMS } from "@infinite/remote/
 import { Readings } from "./readings.js";
 
 const id = z.uuid();
-// The permission agent does not run yet, so no delegation is read for a decision. The slice that activates the agent changes this constant.
-const PERMISSION_AGENT_STATE = "inactive";
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 const permissionDelegationBodySchema = z.object({
@@ -282,7 +281,17 @@ export function createApp(config: Config, key: Buffer) {
   catch { console.warn("[Infinite] Permission delegation is unavailable on this host."); }
   // The permission agent's parts. A part that is absent leaves the requests it would serve with the owner.
   const permissionAgent: PermissionAgentServices = {};
-  void permissionAgent;
+  // Interactive delivery needs its ledger: without it nothing is delivered, so an unknown result can never repeat.
+  let permissionDeliveryLedger: EvidenceDeliveryLedger | undefined;
+  try {
+    evidence.register(permissionDeliveryModule);
+    permissionDeliveryLedger = new EvidenceDeliveryLedger(evidence);
+  } catch { permissionDeliveryLedger = undefined; }
+  const permissionDelivery = new InteractivePermissionDelivery({ pipeline: () => permissionAgent.pipeline, ledger: permissionDeliveryLedger });
+  permissionAgent.delivery = permissionDelivery;
+  teams.usePermissionAgent(permissionAgent);
+  // Active only when a pipeline decides and interactive delivery can record what it sends.
+  const permissionAgentState = () => permissionAgent.pipeline && permissionDelivery.active() ? "active" as const : "inactive" as const;
   const missions = new MissionService(config, key, manager, teams, projectGroups);
   ownerServices.missions = missions;
   // A run is live while its sealed record file exists, so a record that failed to load keeps its evidence.
@@ -1046,7 +1055,7 @@ export function createApp(config: Config, key: Buffer) {
     let rates: { lastHour: ReturnType<PermissionJournal["rates"]>; lastDay: ReturnType<PermissionJournal["rates"]> } | null = null;
     if (journal) { try { rates = { lastHour: rateWindow(HOUR_MS), lastDay: rateWindow(DAY_MS) }; } catch { rates = null; } }
     res.json({
-      agent: PERMISSION_AGENT_STATE,
+      agent: permissionAgentState(),
       policyVersion: PERMISSION_POLICY_VERSION,
       interruptClasses: [...INTERRUPT_CLASSES],
       workspaces: permissionDelegation.status(),
@@ -1077,16 +1086,16 @@ export function createApp(config: Config, key: Buffer) {
     const request = { requestId: body.requestId, direction: body.direction };
     if (body.all) {
       const result = permissionDelegation.delegateAll(request, actor);
-      return res.json({ agent: PERMISSION_AGENT_STATE, views: result.views, replacedOptOuts: result.replacedOptOuts });
+      return res.json({ agent: permissionAgentState(), views: result.views, replacedOptOuts: result.replacedOptOuts });
     }
     const result = permissionDelegation.delegate(body.workspaceId!, request, actor);
-    return res.json({ agent: PERMISSION_AGENT_STATE, views: [result.view], replacedOptOuts: result.replacedOptOuts });
+    return res.json({ agent: permissionAgentState(), views: [result.view], replacedOptOuts: result.replacedOptOuts });
   });
   app.post("/api/permissions/revocations", requireRole(["owner"]), requireOwnerCli, (req, res) => {
     if (!permissionDelegation) return permissionsUnavailable(res);
     const body = permissionRevocationBodySchema.parse(req.body);
     const view = permissionDelegation.revoke(body.workspaceId, { requestId: body.requestId }, { deviceId: String(res.locals.deviceId) });
-    return res.json({ agent: PERMISSION_AGENT_STATE, view });
+    return res.json({ agent: permissionAgentState(), view });
   });
   app.post("/api/goals", requireRole(["owner"]), async (req, res) => {
     const body = createGoalSchema.parse(req.body);
@@ -2033,5 +2042,5 @@ export function createApp(config: Config, key: Buffer) {
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
   const closeConnections = () => { routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); intakeSlack?.close(); readings.stop(); goals.close(); teams.close(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
-  return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, closeConnections, fuse };
+  return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, closeConnections, fuse, permissionAgent };
 }

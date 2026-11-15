@@ -2,6 +2,7 @@ import { PROVIDER_NAMES, type Attention, type Prompt, type Provider } from "@inf
 import type { Manager } from "./manager.js";
 import type { PushSender, PushStore } from "./push.js";
 import type { FuseService, FuseInterrupt } from "./fuse/service.js";
+import type { PermissionDeliveryService } from "./permission-agent-types.js";
 import { createHash } from "node:crypto";
 
 /** The subject part of a fuse collapse id. A push service limits the id's length, and a project id has no limit, so a long one is replaced by a digest. */
@@ -64,6 +65,8 @@ export class Notifier {
     private readonly goals?: { statuses(): GoalRow[] },
     private readonly storage?: { sample(): Promise<StorageVolume[]> },
     private readonly fuse?: Pick<FuseService, "interrupts" | "markAnnounced">,
+    /** Who holds an open dialog for the permission agent. Asked first; a dialog it leaves to the owner falls back to the run's coordinator review. */
+    private readonly permissions?: Pick<PermissionDeliveryService, "holder">,
   ) {}
   /** After a fuse push that reached no device, the time of the next attempt, on a clock that never steps back. */
   private fuseRetryAt = 0;
@@ -201,7 +204,13 @@ export class Notifier {
   /** A team member's open permission prompt is the owner's unless its run can still decide it. Everything else is always the owner's. */
   private promptOwner(row: Row): PromptOwner {
     const prompt = row.attention.prompt;
-    if (row.attention.state !== "needs-you" || !prompt || !this.teams?.promptOwner) return "user";
+    if (row.attention.state !== "needs-you" || !prompt) return "user";
+    let holder: "agent" | "owner" | "undecided" = "owner";
+    try { holder = this.permissions?.holder(row.id, prompt.id) ?? "owner"; } catch { holder = "owner"; }
+    // The permission agent decides it or may still take it: the owner is not pushed. An allow, a reject or a stale request never reaches them.
+    if (holder === "agent") return "coordinator";
+    if (holder === "undecided") return "undecided";
+    if (!this.teams?.promptOwner) return "user";
     try { return this.teams.promptOwner(row.id, prompt); } catch { return "user"; }
   }
   private teamEvents(): Lifecycle[] {

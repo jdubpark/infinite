@@ -69,7 +69,8 @@ interface Entry {
  * first of them; when exactly one candidate passes all three, `single-candidate`; elevated risk gives `greedy-risk`;
  * otherwise `sampled`, one draw of theta per candidate from its own seed, ties to lineup order. Greedy uses theta at
  * its mean (one deviation below it for elevated risk) and phi at its mean. `scored` must hold every candidate that
- * passes rules 1 and 2; a missing one throws.
+ * passes rules 1 and 2; a missing one throws. `scored` is keyed by identity: two profiles with one identity share the
+ * first one's posterior and cost.
  */
 export function choose(screened: readonly Screened[], scored: ReadonlyMap<string, Scored>, knobs: RoutingKnobs,
   risk: "normal" | "elevated", seed: string): Choice | undefined {

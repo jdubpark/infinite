@@ -102,7 +102,10 @@ test("a class call waits for the owner, and the owner's allow runs that one call
     assert.equal(waiting.permissionChannel?.waiting?.interruptClass, "production-or-staging");
     const prompt = waiting.attention.prompt!;
     assert.equal(prompt.source, "protocol");
-    assert.equal("hash" in prompt, false);
+    // The clients offer options for a prompt with a hash; no delegated review takes a `protocol` prompt.
+    assert.match((prompt as { hash?: string }).hash ?? "", /^[a-f0-9]{64}$/);
+    const row = (await r.manager.list()).find(item => item.id === id) as unknown as { attention: { prompt: { delegable?: boolean } } };
+    assert.equal(row.attention.prompt.delegable, undefined);
     assert.deepEqual(prompt.options.map(option => option.label), ["Yes, allow once", "No", "No, and tell Claude what to do differently"]);
     // Input cannot reach a provider that is not running: it is refused, not lost.
     await assert.rejects(workerCall(r.config.runDir, id, { op: "input", requestId: randomUUID(), text: "hello", submit: true }), /prompt-open/);

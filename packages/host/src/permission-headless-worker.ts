@@ -219,7 +219,9 @@ export class HeadlessChannelWorker {
     if (deferred.phase === "deferring" && exitCode === 0 && this.nativeSessionId) {
       deferred.phase = "waiting";
       deferred.promptId = this.host.openPrompt({
-        id: 0, kind: "permission", source: "protocol", acceptsText: true,
+        // The hash lets the web and phone offer the options. The `protocol` source keeps the prompt out of every
+        // delegated review: those read only screen and hook prompts.
+        id: 0, kind: "permission", source: "protocol", acceptsText: true, hash: hash({ v: 1, callId: deferred.callId, tool: deferred.tool, input: deferred.inputHash }),
         title: `Owner answer needed (${deferred.interruptClass})`.slice(0, 200),
         detail: `${deferred.tool}: the permission agent's class rule ${deferred.rule} reserves this call for you. The session resumes with your answer.`.slice(0, 500),
         options: [

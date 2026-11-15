@@ -425,7 +425,10 @@ export class MissionService {
         throw new TeamError(409, "mission-not-extendable", "Only a running mission, or one stopped by its time limit, can be extended.");
       this.admit(stored, "extend", body);
       const at = Date.now();
-      const deadline = deadlineBlocked ? at + body.minutes * 60000 : Date.parse(mission.deadlineAt) + body.minutes * 60000;
+      // The extension adds working time to whatever is left, never to a deadline already passed. A stopped intake
+      // clock measures what is left from the moment it stopped; the stopped span is added back when it restarts.
+      const from = deadlineBlocked ? at : Math.max(Date.parse(mission.deadlineAt), stored.clockStoppedAt ? Date.parse(stored.clockStoppedAt) : at);
+      const deadline = from + body.minutes * 60000;
       mission.deadlineAt = new Date(deadline).toISOString();
       if (deadlineBlocked) {
         mission.status = "working"; mission.stopReason = undefined; mission.reason = undefined; stored.blockedAt = undefined;

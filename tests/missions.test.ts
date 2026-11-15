@@ -2034,6 +2034,11 @@ test("a mission started from the apps keeps the wall-clock deadline", { timeout:
     h.missions.close();
     mock.timers.tick(10 * 60000);
     await assert.rejects(h.missions.resume(created.id, { requestId: randomUUID(), revision: paused.revision }), (error: TeamError) => error.code === "mission-deadline");
+    // Extending a paused mission whose deadline already passed counts the extension from now, so it can resume.
+    const extended = await h.missions.extend(created.id, { requestId: randomUUID(), revision: paused.revision, minutes: 60 });
+    assert.equal(Date.parse(extended.deadlineAt), Date.now() + 60 * 60000);
+    const resumed = await h.missions.resume(created.id, { requestId: randomUUID(), revision: extended.revision });
+    assert.ok(["planning", "working"].includes(resumed.status), `The extended mission resumes, not ${resumed.status}`);
   } finally { h.close(); mock.timers.reset(); }
 });
 

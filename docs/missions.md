@@ -390,7 +390,9 @@ mission is blocked. Active subteams pause, queued subtasks stay queued, and thei
 workspaces and mission evidence are kept. The owner can extend the time limit or
 cancel the mission. `POST /api/missions/:id/extend` adds 5 to 1440 minutes. For a
 deadline-blocked mission, the new deadline is measured from the extension time.
-For a running or paused mission, the extension adds to its current deadline.
+For a running or paused mission, the extension adds to its current deadline, or
+counts from now when that deadline has already passed. On a stopped intake clock,
+it adds to the time that was left when the clock stopped.
 
 An intake mission stops its working-time clock while it is `needs-input` or
 `paused`, and the deadline moves forward by the time it was stopped. Waiting for

@@ -460,6 +460,10 @@ export class MissionService {
       if (this.replay(stored, action, body)) return this.view(stored);
       if (action === "pause" && !live.has(mission.status)) throw new TeamError(409, "mission-not-running", "Only a running mission can be paused.");
       if (action === "resume" && mission.status !== "paused") throw new TeamError(409, "mission-not-paused", "Only a paused mission can resume.");
+      // The halt is the owner's stop: delegated agent input cannot undo it, so a connector cannot resume a mission the
+      // halt paused or one a halt now covers. The owner's own resume keeps its rules.
+      if (action === "resume" && typeof body.source === "object" && (stored.ownerHalt || this.fuse?.held?.(mission.repoProjectIds)))
+        throw new TeamError(409, "mission-halted", "The owner's halt holds this mission. Only the owner can resume it while the halt holds.");
       // The paused status still holds here, so the stopped clock is added to the deadline without writing it yet.
       if (action === "resume" && Date.now() >= this.deadlineMs(stored, Date.now())) throw new TeamError(409, "mission-deadline", "This mission's time limit has expired. Extend the time limit to continue.");
       if (action === "cancel" && mission.status === "cancelled") throw new TeamError(409, "mission-cancelled", "This mission has already been cancelled.");

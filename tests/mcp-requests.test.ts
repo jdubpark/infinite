@@ -263,6 +263,23 @@ test("replies address current decision IDs when several structured questions are
 });
 
 
+test("a connector cannot resume a mission the owner's halt paused, and a keep-paused release keeps it paused", { timeout: 20000 }, async () => {
+  const ctx = await setup();
+  try {
+    const started = ctx.api.startRequest("bot", request());
+    await ctx.intake.poll();
+    await ctx.h.attempt(1);
+    const mark = { haltId: randomUUID(), reason: "Halted by the owner for this project." };
+    await ctx.h.missions.haltPause(mark, () => true);
+    const held = await waitFor(async () => ctx.api.getRequest("bot", started.runId), view => view.status === "paused");
+    assert.deepEqual(held.availableActions, ["cancel"], "A halt cannot be resumed by a connector");
+    await assert.rejects(ctx.api.controlRequest("bot", { runId: held.runId, requestId: randomUUID(), revision: held.revision!, action: "resume" }), code("mission-halted"));
+    assert.equal(ctx.h.missions.get(held.runId).revision, held.revision, "A refused resume changes nothing");
+    await ctx.h.missions.haltResume(mark.haltId, () => undefined, true);
+    assert.equal(ctx.h.missions.get(held.runId).status, "paused", "The owner's keep-paused release keeps the mission paused");
+  } finally { await ctx.close(); }
+});
+
 test("a connector deadline hold requires owner extension before replies or resume", { timeout: 20000 }, async () => {
   const ctx = await setup();
   mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });

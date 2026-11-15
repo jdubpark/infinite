@@ -310,7 +310,9 @@ halt: the answer is recorded and, for a forwarded question, reaches the subteam
 that the halt holds, but nothing starts. The release resumes the mission with
 the answer applied, and the mission waits again while another question is open.
 No coordinator attempt starts while any of its repositories is halted, and no
-subteam starts in a halted repository.
+subteam starts in a halted repository. A connector cannot resume a mission the
+halt paused, or one a halt covers: the halt is the owner's stop, and delegated
+agent input cannot undo it. A connector can still cancel such a mission.
 
 The halt does not stop a mission's time limit, except as a pause does: an intake
 mission's clock stops while it is paused, and any other mission keeps its

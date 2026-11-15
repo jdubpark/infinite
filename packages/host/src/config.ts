@@ -63,6 +63,7 @@ const schema = z
       apiKeyFile: z.string().refine(isAbsolute, "Jev key file must be absolute"),
       model: z.string().min(1).max(100).default("jev-latest"),
       baseUrl: z.url().default("https://api.typesafe.ai"),
+      sessionReadings: z.boolean().default(true),
     }).strict().optional(),
     // Optional cleanup for platform-generated speech transcripts. The key is read once at startup.
     dictation: z.object({

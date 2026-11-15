@@ -245,7 +245,7 @@ The `intake` block is validated by `intakeConfigSchema` in
 | `slack.linearAgentUserId` | `U` or `W` ID, optional; required when `requireSlackThread` is on, unless `linear.admitIssues` is `false` | Linear's agent user in Slack, mentioned by the owner to file a request. |
 | `slack.directRequests` | boolean, default `false` | Lets the owner's mention of the bot file a Linear issue and start a mission. See [direct requests](#direct-requests). |
 | `slack.answerQuestions` | boolean, default `false` | Lets the owner's mention be a question that a read-only mission answers in the thread. Needs `slack.directRequests`. See [questions](#questions). |
-| `slack.classify` | boolean, default `false` | Lets the reading service choose the route when the mention has no `ask:` or `work:`. Needs `slack.answerQuestions` and the top-level `jev` block. |
+| `slack.classify` | boolean, default `false` | Lets the reading service choose the route when the mention has no `ask:` or `work:`. Needs `slack.answerQuestions` and the top-level `jev` block. An instance that wants only the route reading sets `jev.sessionReadings` to `false`. |
 | `slack.bindByMention` | boolean, default `false` | Binds a thread by a mention of an identifier. Cannot be used with `requireSlackThread`. |
 | `slack.endpoint` | URL, optional | The Slack Web API base. Only the official HTTPS endpoint, or loopback HTTP when `environment` is `"local"`. |
 | `mission.groupId` | project group ID, required | The group new missions start in. A host project ID works as an alias. |

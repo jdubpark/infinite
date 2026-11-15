@@ -344,6 +344,11 @@ can be chosen by a model reading. The bounds:
 
 - The owner's word wins. A mention that starts with `ask:` or `work:` takes that route
   and the reading is never asked.
+- Eligibility is fixed when the mention is saved. Only a record saved with
+  `answerQuestions` on is routed or read by the reading service; a request saved
+  before the setting was on stays work, including one whose Linear filing is
+  pending, so reconciliation of an issue Linear may already hold is never
+  replaced by an answer.
 - The default is work. A reading counts as `work` only at confidence 0.6 or higher,
   and a missing, failed, or slow (over six seconds) reading routes to work, which is
   the route that already existed. A reading can send a request to the answer route

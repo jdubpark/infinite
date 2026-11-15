@@ -169,6 +169,12 @@ cycle (never in the Slack event handler), in this order:
    service that is not configured, an error, and a reading that takes longer than
    six seconds.
 
+Routing eligibility is fixed when the mention is saved: a record saved with
+`answerQuestions` on carries `routable`, and only such a record is routed or read
+by the reading service. A request saved before the setting was on, including one
+whose Linear filing was still pending, stays work and follows the original filing
+and reconciliation path.
+
 The stored route (`kind`, `by`, `confidence`, `at`) is on each record in
 `GET /api/intake`, without the request's text. A record made before this feature,
 or with `answerQuestions` off, has no route and is work. The owner's word always
@@ -201,11 +207,20 @@ as an agent report.
 - A blocked or cancelled answer uses the usual `Blocked:` and `Cancelled:` text.
   Where a request's notices name its identifier, an answer's name `your question "TITLE"`.
 - A request routed to work without the owner's word, by a reading or by the
-  default, adds `I took this as a request for a change. To ask a question instead, mention me with "ask:".`
-  to its acknowledgement.
+  default, adds a correction line to its acknowledgement. Once started:
+  `I took this as a request for a change. If you only wanted an answer, reply with a mention and "cancel", then mention me again starting with "ask:".`
+  While it waits for a slot, or for any other reason has no mission yet, the
+  line says `"cancel" once it starts` instead, because `cancel` on a request with
+  no mission answers `This request has not started yet.` A mention that starts
+  with `ask:` in a thread with an unfinished request is a reply to that request,
+  not a new question; the cancel step is what lets the new mention route again.
+  A request the owner sent with `work:` gets no such line.
 
 `status`, `pause`, `resume`, `cancel`, `Q<n>` answers, and plain-text steering work
-on a running answer as they do on a request. In a thread where every record has
+on a running answer as they do on a request. When another unfinished
+request shares the thread, the answer has no identifier, so start the reply with
+`answer` (for example `answer cancel`); the ambiguity reply lists it as
+`answer (your question "TITLE")`. In a thread where every record has
 finished, a new mention is routed again, so a follow-up can become an answer or
 work; the new mission's thread section carries the earlier question and answer.
 

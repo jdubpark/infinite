@@ -488,7 +488,15 @@ Limits that remain:
   rate. Name each workspace's deploy commands in the host configuration.
 - A command whose effect the host cannot read (a script file, a remote shell,
   a command substitution) matches no class rule. It is raised to the strong
-  tier.
+  tier. The host reads a literal shell body (`sh -c '...'`) to three layers
+  and applies a wrapper's working directory (`env -C`, `sudo -D`, `cd`). A
+  deeper body, a body that the outer shell expands, and a directory that the
+  text does not establish are raised. A wrapper that the host does not know
+  is raised when its words contain a command that a class rule names; that
+  search is bounded, and a request past its bounds is raised too. The search
+  also raises some routine commands, for example a commit message that reads
+  as a credential command. Those cost a strong turn and never an owner
+  interrupt.
 - Paths are resolved through symbolic links when the request is read. A link
   that changes between the review and the command's own execution is not
   seen. A path that the host cannot read is raised. The evidence collector

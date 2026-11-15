@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -385,5 +386,30 @@ test("entry tools change the prompt version only for entry roles", () => {
   for (const text of renders) {
     assert.ok(text.includes("<entry-command>"));
     assert.ok(!text.includes("team-entry"));
+  }
+});
+
+// Base pin: with the switch off, every role and provider keeps the prompt version it had at the base commit.
+const PIN_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"] as const;
+const PIN_PROVIDERS = ["claude", "codex", "opencode"] as const;
+const PIN_VERSIONS_SHA256 = "b6b35c402f708d7fe768a63c2239362dce8160a643ad767c46754d6961386e9e";
+
+test("the switch off keeps every prompt version", () => {
+  const versions = PIN_ROLES.flatMap(role => PIN_PROVIDERS.map(provider => promptVersion(role, provider, undefined, true)));
+  assert.equal(createHash("sha256").update(JSON.stringify(versions)).digest("hex"), PIN_VERSIONS_SHA256);
+  for (const role of PIN_ROLES) for (const provider of PIN_PROVIDERS) {
+    assert.equal(promptVersion(role, provider, undefined, true, false, false), promptVersion(role, provider, undefined, true));
+  }
+});
+
+test("the record digest changes the prompt version only for goal roles", () => {
+  // Every role prints the goal section, so the fixture's goal run changes for each role; the run without a goal does not.
+  for (const role of PIN_ROLES) {
+    const off = renderedPrompts(role, "claude", undefined, false);
+    const on = renderedPrompts(role, "claude", undefined, false, false, true);
+    assert.notEqual(promptVersion(role, "claude", undefined, false, false, true), promptVersion(role, "claude", undefined, false));
+    assert.equal(on[0], off[0], "the run without a goal is unchanged");
+    assert.notEqual(on[1], off[1], "the goal run is changed");
+    assert.match(on[1]!, /Success criteria from the owner's objective record, version 1\. Each names how it is checked; c0 is the owner's success text:/);
   }
 });

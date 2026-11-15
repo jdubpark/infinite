@@ -179,14 +179,25 @@ test("an unreadable record is kept and never rewritten", async () => {
     const invalid = { schemaVersion: 1, junk: true }, newer = { schemaVersion: 2, future: "x" };
     f.writeRecord("goal", invalidId, { goal: legacyGoal({ id: invalidId }), receipts: {}, fingerprint: "fixture", objectiveRecord: invalid });
     f.writeRecord("goal", newerId, { goal: legacyGoal({ id: newerId }), receipts: {}, fingerprint: "fixture", objectiveRecord: newer });
+    // A record that parses apart from rule 9: its second direction entry names the first direction.
+    const damagedId = randomUUID();
+    const built = goalRecord(legacyGoal({ id: damagedId, steering: [
+      { text: "Prefer seed stage", revision: 2, at: "2026-01-02T00:00:00.000Z" },
+      { text: "Exclude current holdings", revision: 3, at: "2026-01-03T00:00:00.000Z" },
+    ] }), "2026-11-14T10:00:00.000Z", "created") as Exclude<ReturnType<typeof goalRecord>, string>;
+    const damaged = { ...built, log: built.log.map(entry => (entry.target === "s3" ? { ...entry, target: "s2" } : entry)) };
+    f.writeRecord("goal", damagedId, { goal: legacyGoal({ id: damagedId }), receipts: {}, fingerprint: "fixture", objectiveRecord: damaged });
     const goals = new GoalService(f.config, f.key, teams);
     await goals.steer(invalidId, { requestId: randomUUID(), revision: 1, text: "Prefer seed stage" });
     await goals.steer(newerId, { requestId: randomUUID(), revision: 1, text: "Prefer seed stage" });
+    await goals.steer(damagedId, { requestId: randomUUID(), revision: 1, text: "Prefer seed stage" });
     new GoalService(f.config, f.key, teams);
 
     const storedInvalid = f.readRecord<StoredShape>("goal", invalidId), storedNewer = f.readRecord<StoredShape>("goal", newerId);
     assert.deepEqual(storedInvalid.objectiveRecord, invalid);
     assert.deepEqual(storedNewer.objectiveRecord, newer);
+    assert.deepEqual(f.readRecord<StoredShape>("goal", damagedId).objectiveRecord, damaged);
+    assert.throws(() => goals.objectiveRecord(damagedId), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "objective-record-invalid");
     assert.equal(storedInvalid.goal.events.filter(event => event.text === GOAL_OBJECTIVE_EVENTS["record-invalid"]).length, 1);
     assert.equal(storedNewer.goal.events.filter(event => event.text === GOAL_OBJECTIVE_EVENTS["record-newer"]).length, 1);
     assert.throws(() => goals.objectiveRecord(invalidId), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "objective-record-invalid");
@@ -201,7 +212,7 @@ test("a failed migration write never stops the host", { skip: process.getuid?.()
   const warn = console.warn;
   try {
     const id = randomUUID();
-    f.writeRecord("goal", id, { goal: legacyGoal({ id }), receipts: {}, fingerprint: "fixture" });
+    f.writeRecord("goal", id, { goal: legacyGoal({ id, activeTeamId: randomUUID() }), receipts: {}, fingerprint: "fixture" });
     chmodSync(goalsDirectory, 0o500);
     console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); };
     let goals: GoalService | undefined;
@@ -211,6 +222,16 @@ test("a failed migration write never stops the host", { skip: process.getuid?.()
     assert.equal(warnings.length, 1);
     assert.match(warnings[0]!, /1 goals/);
     assert.equal(warnings[0]!.includes("Find ranked sources"), false);
+
+    // One goal tick with the folder still read-only. The goal names a team that does not exist, so the tick has nothing to write (a new cycle would need a write and block the goal): it keeps running, gains no event, and its file is unchanged.
+    const fileBefore = readFileSync(goalFile(f, id), "utf8"), eventsBefore = goals!.get(id).events.length;
+    goals!.start();
+    // A steer with a stale revision queues behind the tick and fails without a change, so it marks the tick's end.
+    await goals!.steer(id, { requestId: randomUUID(), revision: 999, text: "Barrier" }).catch(() => undefined);
+    goals!.close();
+    assert.equal(goals!.get(id).status, "running");
+    assert.equal(goals!.get(id).events.length, eventsBefore);
+    assert.equal(readFileSync(goalFile(f, id), "utf8"), fileBefore);
 
     console.warn = warn;
     chmodSync(goalsDirectory, 0o700);
@@ -237,5 +258,33 @@ test("only steering writes the record", async () => {
     assert.deepEqual(f.readRecord<StoredShape>("goal", created.id).objectiveRecord, snapshot);
     await goals.outcome(created.id, { requestId: randomUUID(), revision: current.revision, result: "not-achieved", summary: "Fixture outcome", evidence: "fixture" });
     assert.deepEqual(f.readRecord<StoredShape>("goal", created.id).objectiveRecord, snapshot);
+  } finally { f.close(); }
+});
+
+test("lists, single reads, and an idle tick parse no record", async () => {
+  const f = fixture(), teams = f.openTeam();
+  try {
+    const goals = new GoalService(f.config, f.key, teams);
+    const first = await goals.create(createInput());
+    const second = await goals.create(createInput({ title: "Second goal" }));
+    let parses = 0;
+    const { safeParse, parse } = objectiveRecordSchema;
+    objectiveRecordSchema.safeParse = (...args: Parameters<typeof safeParse>) => { parses += 1; return safeParse.apply(objectiveRecordSchema, args); };
+    objectiveRecordSchema.parse = (...args: Parameters<typeof parse>) => { parses += 1; return parse.apply(objectiveRecordSchema, args); };
+    try {
+      goals.list();
+      goals.get(first.id);
+      goals.get(second.id);
+      // An idle tick: the steer with a stale revision queues behind the tick and fails without a change.
+      goals.start();
+      await goals.steer(first.id, { requestId: randomUUID(), revision: 999, text: "Barrier" }).catch(() => undefined);
+      goals.close();
+      assert.equal(parses, 0, "lists, single reads, and an idle tick parse no record");
+      goals.objectiveRecord(first.id);
+      assert.ok(parses > 0, "the count sees a record read");
+    } finally {
+      objectiveRecordSchema.safeParse = safeParse;
+      objectiveRecordSchema.parse = parse;
+    }
   } finally { f.close(); }
 });

@@ -1,6 +1,4 @@
-import { createHash } from "node:crypto";
 import { z } from "zod";
-import { canonicalJson } from "./evidence/crypto.js";
 import type { ProductGoal } from "./goal-types.js";
 import type { TeamRun } from "./team-types.js";
 import { TeamError } from "./team-workspace.js";
@@ -8,7 +6,7 @@ import {
   OBJECTIVE_LIMITS,
   OBJECTIVE_SCHEMA_VERSION,
   RUBRIC_VERSION_DEFAULT,
-  canonicalBytes,
+  logValueOf,
   objectiveRecordSchema,
   recordDigest,
 } from "./objective-types.js";
@@ -170,10 +168,7 @@ export function syncDirections(record: ObjectiveRecord, steering: readonly Steer
 
 /** Inline when the canonical value fits 2 KiB; otherwise a reference with the digest and size. */
 export function logValue(value: unknown, ref: string): LogValue {
-  const json = JSON.parse(JSON.stringify(value));
-  const bytes = canonicalBytes(json);
-  if (bytes <= L.inlineValueBytes) return { inline: json };
-  return { ref, digest: createHash("sha256").update(canonicalJson(json)).digest("hex"), bytes };
+  return logValueOf(value, ref);
 }
 
 /** Reads a sealed record strictly. Never repairs: a damaged or newer value is reported, not changed. */
@@ -203,6 +198,7 @@ export function rebuildVersion(record: ObjectiveRecord, version: number): Object
   let directions = record.statement.directions;
   for (const entry of undone) {
     if (entry.op !== "direction.appended" && entry.op !== "direction.copied") throw objectiveError("objective-version-unavailable");
+    if (!record.statement.directions.some(item => item.id === entry.target)) throw objectiveError("objective-version-unavailable");
     directions = directions.filter(item => item.id !== entry.target);
   }
   return seal({

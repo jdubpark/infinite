@@ -294,6 +294,21 @@ function recordProblems(record: ObjectiveRecord): string[] {
     }
   }
 
+  // Rule 9: the direction log agrees with the steering directions, in order, with their own values.
+  const directionOps = record.log.filter(entry => entry.op === "direction.appended" || entry.op === "direction.copied");
+  const steered = record.statement.directions.filter(item => item.source === "steering");
+  let historyOk = directionOps.length === steered.length;
+  let previousVersion = 1;
+  directionOps.forEach((entry, index) => {
+    if (!historyOk) return;
+    const direction = steered[index]!;
+    const expected = logValueOf(direction, `record:direction:${direction.id}`);
+    if (entry.target !== direction.id || entry.after === undefined || canonicalJson(JSON.parse(JSON.stringify(entry.after))) !== canonicalJson(expected)) historyOk = false;
+    if (entry.version <= previousVersion) historyOk = false;
+    previousVersion = entry.version;
+  });
+  if (!historyOk) fail("objective-history-invalid");
+
   if (recordDigest(record) !== record.digest) fail("The digest must match the record");
   if (cappedBytes(record) > L.cappedBytes) fail("objective-too-large");
   return problems;
@@ -328,6 +343,14 @@ export const objectiveRecordSchema: z.ZodType<ObjectiveRecord> = z.strictObject(
 /** UTF-8 bytes of canonicalJson after a JSON round trip, which drops undefined values. */
 export function canonicalBytes(value: unknown): number {
   return byteLength(canonicalJson(JSON.parse(JSON.stringify(value))));
+}
+
+/** Inline when the canonical value fits 2 KiB; otherwise a reference with the digest and size. */
+export function logValueOf(value: unknown, ref: string): LogValue {
+  const json = JSON.parse(JSON.stringify(value));
+  const bytes = canonicalBytes(json);
+  if (bytes <= L.inlineValueBytes) return { inline: json };
+  return { ref, digest: createHash("sha256").update(canonicalJson(json)).digest("hex"), bytes };
 }
 
 /** SHA-256 hex of the canonical record without `log` and `digest`. */

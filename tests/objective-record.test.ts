@@ -177,8 +177,8 @@ test("every version rebuilds to what it was", () => {
 });
 
 test("a rebuild refuses what it cannot undo", () => {
-  const synced = goalRecord(goalFixture({ steering: [steer(2, "Use primary sources."), steer(3, "Cite dates.")] }), AT, "created") as ObjectiveRecord;
-  assert.equal(synced.version, 3);
+  const synced = goalRecord(goalFixture({ steering: [steer(2, "Use primary sources.")] }), AT, "created") as ObjectiveRecord;
+  assert.equal(synced.version, 2);
   const derived: Criterion = {
     id: "c1",
     origin: "derived",
@@ -193,12 +193,14 @@ test("a rebuild refuses what it cannot undo", () => {
     ...synced.log.slice(0, 2),
     { seq: 3, at: AT, version: 3, actor: "host" as const, authority: "receipt" as const, op: "criterion.derived", target: "c1" },
   ];
-  const record: ObjectiveRecord = { ...synced, criteria: [...synced.criteria, derived], log, digest: "" };
+  const record: ObjectiveRecord = { ...synced, version: 3, criteria: [...synced.criteria, derived], log, digest: "" };
   record.digest = recordDigest(record);
   assert.equal(objectiveRecordSchema.safeParse(record).success, true);
 
   assert.equal(rebuildVersion(record, 3).version, 3);
   assert.throws(() => rebuildVersion(record, 2), { status: 409, code: "objective-version-unavailable" });
+  const missing = { ...record, log: [...record.log.slice(0, 2), { ...record.log[2], op: "direction.appended", authority: "direction" as const, actor: "owner" as const, target: "s9" }] } as ObjectiveRecord;
+  assert.throws(() => rebuildVersion(missing, 2), { status: 409, code: "objective-version-unavailable" }, "an undo of a direction the record does not hold");
   assert.throws(() => rebuildVersion(record, 0), { status: 404, code: "objective-version-not-found" });
   assert.throws(() => rebuildVersion(record, 4), { status: 404, code: "objective-version-not-found" });
 
@@ -213,7 +215,10 @@ test("a stored record is read strictly", () => {
   assert.deepEqual(readStoredRecord(record, owner), { kind: "ready", record });
 
   const invalid = { kind: "unavailable", reason: "record-invalid" };
+  const threeSteer = goalRecord(goalFixture({ steering: [steer(2, "Use primary sources."), steer(3, "Cite dates.")] }), AT, "created") as ObjectiveRecord;
+  const historyOff = { ...threeSteer, log: threeSteer.log.map(entry => (entry.target === "s3" && entry.op.startsWith("direction.") ? { ...entry, target: "s2" } : entry)) };
   const damaged: unknown[] = [
+    historyOff,
     { ...record, future: true },
     { ...record, digest: "0".repeat(64) },
     "a string",

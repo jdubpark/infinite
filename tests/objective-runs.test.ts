@@ -7,6 +7,7 @@ import { EventOutbox } from "../packages/host/src/evidence/outbox.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import type { RunEvent } from "../packages/host/src/evidence/types.js";
 import { runRecord } from "../packages/host/src/objective-record.js";
+import { objectiveRecordSchema } from "../packages/host/src/objective-types.js";
 import { RUN_OBJECTIVE_EVENTS } from "../packages/host/src/objective-runs.js";
 import { type TeamBrief, type TeamGoalContext, type TeamRun, teamGoalContextSchema } from "../packages/host/src/team-types.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
@@ -303,5 +304,33 @@ test("the run view carries no record", async () => {
     assert.equal("objectiveRecord" in view, false);
     assert.equal("objectiveNotice" in view, false);
     assert.equal(JSON.stringify(view).includes("record.created"), false);
+  } finally { store.close(); f.close(); }
+});
+
+test("listing runs parses no record", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const { stored, member } = reportFrom(teams, f.run.id, planReport());
+    internal(teams).consume(stored, member);
+    await waitFor(() => (stored as { pending?: unknown }).pending === undefined && stored.run.status !== "planning", "the plan's operation completes");
+    await teams.idle();
+
+    let parses = 0;
+    const { safeParse, parse } = objectiveRecordSchema;
+    objectiveRecordSchema.safeParse = (...args: Parameters<typeof safeParse>) => { parses += 1; return safeParse.apply(objectiveRecordSchema, args); };
+    objectiveRecordSchema.parse = (...args: Parameters<typeof parse>) => { parses += 1; return parse.apply(objectiveRecordSchema, args); };
+    try {
+      teams.list();
+      teams.get(f.run.id);
+      assert.equal(parses, 0, "listing and reading a run parse no record");
+      teams.objectiveRecord(f.run.id);
+      assert.ok(parses > 0, "the count sees a record read");
+    } finally {
+      objectiveRecordSchema.safeParse = safeParse;
+      objectiveRecordSchema.parse = parse;
+    }
   } finally { store.close(); f.close(); }
 });

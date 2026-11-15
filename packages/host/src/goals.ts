@@ -72,7 +72,7 @@ export class GoalService {
       this.records.set(id, stored);
       if (digest(stored) === before) { this.saved.set(id, before); continue; }
       try { writeSealed(join(this.directory, file), key, `goal:${id}`, stored); this.saved.set(id, digest(stored)); }
-      catch { this.saved.set(id, before); unsaved++; }
+      catch { this.saved.set(id, digest(stored)); unsaved++; }
     }
     if (unsaved) console.warn(`Objective records of ${unsaved} goals could not be saved at startup. Each is saved with its goal's next change.`);
   }

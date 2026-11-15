@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { cappedBytes, objectiveRecordSchema, recordDigest } from "../packages/host/src/objective-types.js";
+import { cappedBytes, logValueOf, objectiveRecordSchema, recordDigest } from "../packages/host/src/objective-types.js";
 
 const GOAL_ID = "6f1c2a3e-8b4d-4c5e-9f60-718293a4b5c6";
 const RUN_ID = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
@@ -10,6 +10,16 @@ const VERDICT_ID = "2b7e1c90-5d3a-4f8e-a1b2-c3d4e5f60718";
 
 const parses = (value: unknown) => objectiveRecordSchema.safeParse(value).success;
 const withDigest = (record: any) => ({ ...record, digest: recordDigest(record) });
+/** Gives a record the direction history its steering directions need: one appended entry each, at versions 2, 3, and so on. */
+function withHistory(record: any): any {
+  const steered = record.statement.directions.filter((item: any) => item.source === "steering");
+  record.log = [record.log[0], ...steered.map((item: any, index: number) => ({
+    seq: index + 2, at: AT, version: index + 2, actor: "owner", authority: "direction", op: "direction.appended", target: item.id,
+    after: logValueOf(item, `record:direction:${item.id}`),
+  }))];
+  record.version = record.log[record.log.length - 1].version;
+  return record;
+}
 
 function validGoalRecord(): any {
   return withDigest({
@@ -33,7 +43,8 @@ function validGoalRecord(): any {
     rubricVersion: 1,
     log: [
       { seq: 1, at: AT, version: 1, actor: "host", authority: "receipt", op: "record.created", target: "c0" },
-      { seq: 2, at: AT, version: 2, actor: "owner", authority: "direction", op: "direction.appended", target: "s1" },
+      { seq: 2, at: AT, version: 2, actor: "owner", authority: "direction", op: "direction.appended", target: "s1",
+        after: { inline: { id: "s1", text: "Keep the record beside the goal.", source: "steering", at: AT } } },
     ],
   });
 }
@@ -222,7 +233,7 @@ test("owner text does not count against the cap", () => {
   goal.nonGoals = Array.from({ length: 20 }, (_, i) => ({ id: `n${i + 1}`, text: "n".repeat(1000) }));
   goal.ownerEvidence = Array.from({ length: 20 }, () => "e".repeat(2000));
   goal.criteria[0].statement = "é".repeat(8000);
-  const big = withDigest(goal);
+  const big = withDigest(withHistory(goal));
   assert.ok(parses(big), "a goal with the largest owner text parses");
   assert.ok(cappedBytes(big) < 2048, `cappedBytes was ${cappedBytes(big)}`);
 
@@ -237,6 +248,7 @@ test("the log is ordered and ends at the record's version", () => {
   });
   const withLog = (log: unknown[], version = 2) => {
     const record: any = validGoalRecord();
+    record.statement.directions = [];
     record.version = version;
     record.log = log;
     return withDigest(record);
@@ -302,4 +314,27 @@ test("team prompts never import the record", () => {
     assert.ok(specifiers.length > 0, `${file} has imports`);
     for (const specifier of specifiers) assert.ok(!specifier.includes("objective"), `${file} imports ${specifier}`);
   }
+});
+
+test("a record's direction history agrees with its directions", () => {
+  const history = (mutate?: (record: any) => void, texts = ["Prefer seed stage.", "Exclude current holdings."]) => {
+    const record: any = validGoalRecord();
+    record.statement.directions = texts.map((text, index) => ({ id: `s${index + 2}`, text, source: "steering", at: AT }));
+    withHistory(record);
+    mutate?.(record);
+    return withDigest(record);
+  };
+  const large = ["é".repeat(2000), "Exclude current holdings."];
+
+  assert.ok(parses(history()), "the unchanged record passes");
+  assert.ok(parses(history(undefined, large)), "a direction of 2,000 é logged by reference passes");
+  assert.ok("ref" in history(undefined, large).log[1].after, "that direction is logged by reference");
+  assert.ok(!parses(history(r => { r.log[2].target = "s2"; })), "a version-3 entry that targets s2 fails");
+  assert.ok(!parses(history(r => { r.log[1].after.inline.text = "Changed."; })), "a changed inline text fails");
+  assert.ok(!parses(history(r => { r.log.splice(2, 1); r.version = 2; })), "a steering direction with no entry fails");
+  assert.ok(!parses(history(r => { r.log.push({ ...r.log[2], seq: 4 }); })), "a doubled entry fails");
+  assert.ok(!parses(history(r => {
+    [r.log[1], r.log[2]] = [{ ...r.log[2], seq: r.log[1].seq, version: r.log[1].version }, { ...r.log[1], seq: r.log[2].seq, version: r.log[2].version }];
+  })), "swapped entries fail");
+  assert.ok(!parses(history(r => { r.log[1].after.digest = "0".repeat(64); }, large)), "a reference with a wrong digest fails");
 });

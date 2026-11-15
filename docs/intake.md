@@ -5,6 +5,10 @@ mention of the instance's Slack bot (see [direct requests](#direct-requests)). I
 host config has an `intake` block. Without one, no records are kept and
 `GET /api/intake` returns `{ "records": [] }`, with no `lastError` or `slack` member.
 
+An authenticated external assistant can also submit requests through the
+[MCP connector](mcp.md). It reuses this queue and Linear tracking with explicit
+connector provenance and a separate project allowlist.
+
 ## What starts a mission
 
 The host polls Linear every 30 seconds. An issue qualifies when it:

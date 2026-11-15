@@ -124,7 +124,8 @@ export interface DecisionSummary {
   question: string;
   options: string[];
   answer: string | null;
-  answeredBy: "owner" | "coordinator" | null;
+  answeredBy: "owner" | "coordinator" | "connector" | null;
+  source?: { kind: "connector"; id: string; name: string };
   answeredAt: string | null;
   createdAt: string;
 }

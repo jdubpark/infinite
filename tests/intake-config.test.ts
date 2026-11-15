@@ -139,3 +139,22 @@ test("deterministicUuid is stable, namespaced, and a valid UUID", () => {
   assert.notEqual(deterministicUuid("a", ISSUE), deterministicUuid("b", ISSUE));
   assert.doesNotThrow(() => uuid.parse(missionRequestId(ISSUE)));
 });
+
+test("MCP is disabled by default and supports intake without a Slack producer", () => {
+  assert.equal(parsed({}).mcp, undefined);
+  const mcp = { port: 2, origin: "https://connector.example", connectors: [{ id: "assistant", name: "Assistant", tokenHash: "b".repeat(64), projectIds: ["work-repo"] }] };
+  assert.deepEqual(parsed({ slack: undefined, requireSlackThread: false, linear: { ...base.linear, admitIssues: false } }, { mcp }).mcp, mcp);
+  for (const patch of [
+    { port: 1 },
+    { origin: "https://connector.example/mcp" },
+    { origin: "http://connector.example" },
+    { connectors: [{ ...mcp.connectors[0], projectIds: ["missing"] }] },
+    { connectors: [{ ...mcp.connectors[0], tokenHash: "a".repeat(64) }] },
+    { connectors: [mcp.connectors[0], mcp.connectors[0]] },
+    { unexpected: true },
+  ]) assert.throws(() => parsed({}, { mcp: { ...mcp, ...patch } }));
+  assert.throws(() => parsed({}, { mcp, linear: undefined }), /Linear/);
+  const file = join(root, `config-${++counter}.json`);
+  writeFileSync(file, JSON.stringify({ ...baseHost, mcp }));
+  assert.throws(() => readConfig(file), /MCP requires/);
+});

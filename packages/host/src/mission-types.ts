@@ -1,3 +1,4 @@
+import type { ConnectorSource } from "./mcp-types.js";
 import { z } from "zod";
 import { blockerEvidenceSchema, type TeamLineup, type TeamStatus } from "./team-types.js";
 import type { UsageRollup } from "./team-usage.js";
@@ -73,10 +74,11 @@ export interface MissionDecision {
   childDecisionId?: string;
   answer?: string;
   answeredAt?: string;
-  answeredBy?: "owner" | "coordinator";
+  answeredBy?: "owner" | "coordinator" | "connector";
+  source?: ConnectorSource;
 }
-export type MissionOrigin = { kind: "intake"; issueId: string; identifier: string; url: string; rule: string };
-export type MissionInputSource = "slack";
+export type MissionOrigin = { kind: "intake"; issueId: string; identifier: string; url: string; rule: string; source?: ConnectorSource };
+export type MissionInputSource = "slack" | ConnectorSource;
 export interface Mission {
   id: string;
   groupId: string;
@@ -102,7 +104,7 @@ export interface Mission {
   dispatchSummary?: string;
   subtasks: MissionSubtask[];
   decisions: MissionDecision[];
-  steering: { text: string; revision: number; at: string }[];
+  steering: { text: string; revision: number; at: string; source?: MissionInputSource }[];
   events: { at: string; text: string }[];
   result?: { summary: string; revision: number; at: string };
   /** Computed on read from the coordinator and subteams; never stored. */

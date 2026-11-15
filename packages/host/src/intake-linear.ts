@@ -125,7 +125,7 @@ export class IntakeLinear {
    * label. A missing label is an error with a fixed text. A create that fails or is not confirmed is checked by reading the
    * ID back, so a lost response that still committed resolves and a retry never files a second issue.
    */
-  async createIssue(input: { id: string; teamId: string; title: string; description: string; label: string }): Promise<IntakeIssue> {
+  async createIssue(input: { id: string; teamId: string; title: string; description: string; label: string }, authorize?: () => void): Promise<IntakeIssue> {
     // Only this team's labels and workspace labels can be used, so another team's same-name labels never fill the page.
     const labelData = await this.linear.request("InfiniteIntakeLabel",
       "query InfiniteIntakeLabel($filter: IssueLabelFilter!, $first: Int!) { issueLabels(filter: $filter, first: $first) { nodes { id team { id } } } }",
@@ -133,6 +133,7 @@ export class IntakeLinear {
     const labels = z.object({ issueLabels: z.object({ nodes: z.array(z.object({ id: z.uuid(), team: z.object({ id: z.uuid() }).nullable().optional() })).max(50) }) }).parse(labelData).issueLabels.nodes;
     const label = labels.find(item => item.team?.id === input.teamId) ?? labels.find(item => !item.team);
     if (!label) throw new MissingLabelError();
+    authorize?.();
     let failure: unknown;
     try {
       const data = await this.linear.request("InfiniteIntakeIssueCreate",

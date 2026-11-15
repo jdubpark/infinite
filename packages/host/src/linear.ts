@@ -1,3 +1,4 @@
+import { inputSourceLabel, decisionAnswerLabel } from "./team-types.js";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -189,10 +190,10 @@ export class LinearService {
       clock.queued.add(member.memberId); this.force(stored);
       if (parentKey) { const parent = this.records.get(parentKey); if (parent) this.force(parent); }
     }
-    for (const direction of run.steering) this.comment(stored, `direction:${direction.revision}`, `User direction for feature revision ${direction.revision}:\n\n${direction.text}\n\nThe approved scope and execution limits remain in force.`);
+    for (const direction of run.steering) this.comment(stored, `direction:${direction.revision}`, `${direction.source ? inputSourceLabel(direction.source) : "User"} direction for feature revision ${direction.revision}:\n\n${direction.text}\n\nThe approved scope and execution limits remain in force.`);
     if (!run.missionId) for (const decision of run.decisions) {
       this.comment(stored, `question:${decision.id}`, `Agent question for feature revision ${decision.revision}:\n\n${decision.question}`);
-      if (decision.answer) this.comment(stored, `answer:${decision.id}`, `${decision.answeredBy === "coordinator" ? "Coordinator" : "User"} answer for feature revision ${decision.revision}:\n\n${decision.answer}`);
+      if (decision.answer) this.comment(stored, `answer:${decision.id}`, `${decision.answeredBy === "connector" ? decisionAnswerLabel(decision) : decision.answeredBy === "coordinator" ? "Coordinator" : "User"} answer for feature revision ${decision.revision}:\n\n${decision.answer}`);
     }
     if (run.brief) this.comment(stored, `brief:${run.revision}`, [`Proposed feature: ${run.brief.title}`, run.brief.problem,
       `Acceptance criteria:\n${run.brief.acceptance.join("\n")}`, `Expected outcome:\n${run.brief.expectedOutcome}`].join("\n\n"));

@@ -8,6 +8,7 @@ import type { IntakeStore } from "./intake-store.js";
 import type { MissionService } from "./missions.js";
 import { TeamError } from "./teams.js";
 import type { CreateMission, Mission, MissionOrigin } from "./mission-types.js";
+import type { ConnectorSource } from "./mcp-types.js";
 import type { Config } from "./types.js";
 import { ROUTE_INPUT_LIMIT, decideRoute, explicitRoute, type RouteReading } from "./intake-route.js";
 
@@ -232,6 +233,7 @@ const directReceipts = {
 };
 
 function outcomeBody(config: Config, mission: Mission, direct = false): string {
+  if (mission.origin?.source) return `Infinite agent report: ${mission.status === "ready-for-review" ? "ready for review" : mission.status === "blocked" ? "blocked" : "cancelled"}. Read the report through the connector.`;
   if (direct) return mission.status === "ready-for-review" ? directReceipts.ready : mission.status === "blocked" ? directReceipts.blocked : directReceipts.cancelled;
   if (mission.status === "ready-for-review")
     return outboundText(config, `Infinite agent report: ready for review.${mission.result?.summary ? `\n\n${mission.result.summary}` : ""}`);
@@ -249,13 +251,14 @@ export class IntakeService {
   private readonly pollMs: number;
   /** The issue ID chosen for a mention (channel and timestamp) until its record is saved, so a retry rewrites the same file. */
   private readonly pendingMentions = new Map<string, string>();
+  private externalAdmission?: (record: IntakeRecord) => ConnectorSource;
 
   constructor(
     private readonly config: Config,
     private readonly store: IntakeStore,
     private readonly missions: MissionService,
     private readonly linear: IntakeLinear,
-    private readonly options: { threads?: IntakeThreadReader; pollMs?: number; create?: (request: CreateMission, origin: MissionOrigin) => Promise<Mission>; log?: (line: string, error: unknown) => void;
+    private readonly options: { threads?: IntakeThreadReader; pollMs?: number; create?: (request: CreateMission, origin: MissionOrigin, authorize?: () => void) => Promise<Mission>; log?: (line: string, error: unknown) => void;
       /** Reads one owner mention and returns its route reading; absent unless `classify` is on. It may be slow or reject. */
       router?: (text: string) => Promise<RouteReading | undefined>; routeWaitMs?: number } = {},
   ) {
@@ -264,6 +267,14 @@ export class IntakeService {
   }
 
   enabled(): boolean { return this.config.intake !== undefined; }
+
+  /** Connector admission is mandatory, including after restart; without a live service external work stays held. */
+  useExternalAdmission(admit: (record: IntakeRecord) => ConnectorSource): void { this.externalAdmission = admit; }
+
+  private admitExternal(record: IntakeRecord): ConnectorSource {
+    if (!this.externalAdmission) throw new Error("External admission is unavailable.");
+    return this.externalAdmission(record);
+  }
 
   start(): void {
     if (!this.enabled() || this.timer || this.closed) return;
@@ -399,6 +410,14 @@ export class IntakeService {
    * `request`, with a hold reason, for the next cycle.
    */
   private async file(): Promise<void> {
+    for (const record of this.store.list().filter(item => item.state === "queued" && item.external && !item.external.filedAt)) {
+      if (this.closed) return;
+      try { await this.fileExternal(record); }
+      catch (error) {
+        this.fail("file", error);
+        this.hold(record.issueId, "External tracking or scope is unavailable.");
+      }
+    }
     // A record saved for routing waits for its route (the route step stores one every cycle). Any other direct record is work, as it was before routing.
     for (const record of this.store.list().filter(item => item.state === "queued" && item.direct && !item.request
       && (item.direct.route !== undefined || !item.direct.routable))) {
@@ -471,6 +490,22 @@ export class IntakeService {
       next.direct = { ...next.direct!, filedAt: new Date().toISOString() };
       next.rule = ANSWER_RULE;
       next.request = request;
+      delete next.holdReason;
+    });
+  }
+
+  private async fileExternal(record: IntakeRecord): Promise<void> {
+    this.admitExternal(record);
+    const intake = this.config.intake!;
+    const teamId = intake.linear.teamIds[0];
+    // The objective stays sealed in the request. Tracking receives only a safe title and a fixed receipt.
+    const issue = await this.linear.createIssue({ id: record.issueId, teamId,
+      title: outboundText(this.config, record.title), description: "Delegated request received through an authenticated connector.", label: intake.linear.label },
+      () => { this.admitExternal(this.store.get(record.issueId)!); });
+    if (issue.creatorId !== intake.linear.creatorId || issue.teamId !== teamId) throw new OwnerMismatch();
+    this.store.update(record.issueId, next => {
+      Object.assign(next, this.facts(issue), { title: record.title });
+      next.external!.filedAt = new Date().toISOString();
       delete next.holdReason;
     });
   }
@@ -592,13 +627,14 @@ export class IntakeService {
     const records = this.store.list();
     // An answer starts no subteam and changes nothing, so it neither counts toward the limit nor waits for it.
     let slots = intake.maxActive - records.filter(record => record.state === "started" && !isAnswerRecord(record) && this.active(record)).length;
-    for (const record of records.filter(item => item.state === "queued" && item.request)) {
+    for (const record of records.filter(item => item.state === "queued" && item.request && (!item.external || item.external.filedAt))) {
       if (this.closed) return;
       const answer = isAnswerRecord(record);
       if (!answer && slots <= 0) { this.hold(record.issueId, "max-active"); continue; }
-      const origin: MissionOrigin = { kind: "intake", issueId: record.issueId, identifier: record.identifier, url: record.url, rule: record.rule! };
       try {
-        const mission = await this.createMission(record.request!, origin);
+        const source = record.external ? this.admitExternal(record) : undefined;
+        const origin: MissionOrigin = { kind: "intake", issueId: record.issueId, identifier: record.identifier, url: record.url, rule: record.rule!, ...(source ? { source } : {}) };
+        const mission = await this.createMission(record.request!, origin, record.external ? () => { this.admitExternal(this.store.get(record.issueId)!); } : undefined);
         if (!answer) slots -= 1;
         this.store.update(record.issueId, next => {
           next.state = "started";
@@ -608,7 +644,8 @@ export class IntakeService {
         });
       } catch (error) {
         // A refusal is the hold reason. Any other failure is kept with its message, and the record stays queued for the next cycle.
-        if (error instanceof TeamError) this.hold(record.issueId, error.message);
+        if (record.external) this.hold(record.issueId, "External execution is unavailable or its scope changed.");
+        else if (error instanceof TeamError) this.hold(record.issueId, error.message);
         else {
           this.fail("start", error, record.identifier);
           this.hold(record.issueId, `The start failed and will be retried: ${failureSummary(error)}`);
@@ -618,8 +655,8 @@ export class IntakeService {
   }
 
   /** The server passes its route admission here; without it the mission service is called directly. */
-  private createMission(request: CreateMission, origin: MissionOrigin): Promise<Mission> {
-    return this.options.create ? this.options.create(request, origin) : this.missions.create(request, undefined, origin);
+  private createMission(request: CreateMission, origin: MissionOrigin, authorize?: () => void): Promise<Mission> {
+    return this.options.create ? this.options.create(request, origin, authorize) : this.missions.create(request, undefined, origin, authorize);
   }
 
   private active(record: IntakeRecord): boolean {
@@ -642,7 +679,7 @@ export class IntakeService {
     if (!record || record.state !== "started") return;
     this.attemptSync("observe", () => this.store.update(record.issueId, next => {
       next.state = "finished";
-      if (!isAnswerRecord(next) && !this.mirrors(next)) next.comments.outcome = { id: randomUUID(), body: outcomeBody(this.config, mission, Boolean(next.direct)), delivered: false, attempts: 0 };
+      if (!isAnswerRecord(next) && !this.mirrors(next)) next.comments.outcome = { id: randomUUID(), body: outcomeBody(this.config, mission, Boolean(next.direct || next.external)), delivered: false, attempts: 0 };
     }), record.identifier);
   }
 

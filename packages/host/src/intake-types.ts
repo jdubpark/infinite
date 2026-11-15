@@ -65,6 +65,19 @@ export interface IntakeDirect {
   routable?: true;
 }
 export interface IntakeComment { id: string; body: string; delivered: boolean; attempts: number; error?: string }
+/** Frozen execution membership, kept sealed and never exposed through the connector API. */
+export interface IntakeExternalScope {
+  groupId: string;
+  repositories: { projectId: string; key?: string; checkouts: { projectId: string; path: string; primary: boolean }[] }[];
+  selectedCheckouts: string[];
+}
+export interface IntakeExternal {
+  connectorId: string;
+  requestId: string;
+  fingerprint: string;
+  scope: IntakeExternalScope;
+  filedAt?: string;
+}
 export interface IntakeRecord {
   issueId: string; identifier: string; url: string; title: string; description: string;
   issueCreatedAt: string; issueUpdatedAt: string;
@@ -75,6 +88,8 @@ export interface IntakeRecord {
   thread?: IntakeThread;
   /** Present on a record the host filed itself from the owner's Slack mention. */
   direct?: IntakeDirect;
+  /** An authenticated connector request; its pinned mission request exists even before tracking is confirmed. */
+  external?: IntakeExternal;
   /** Saved before the mission is created and reused verbatim on every retry. */
   request?: CreateMission;
   missionId?: string;

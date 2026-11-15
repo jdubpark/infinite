@@ -104,6 +104,12 @@ const rotationText: Record<RotationRule, string> = {
 const utcMinute = (iso: string) => `${iso.slice(0, 16).replace("T", " ")} UTC`;
 /** Marks an attempt stopped and records when, once. */
 const endAttempt = (attempt: Attempt) => { attempt.status = "stopped"; attempt.endedAt ??= now(); };
+/** Puts an attempt's consumed messages back at the front of the queues and clears them on the attempt, so they return once. */
+function returnConsumed(stored: Stored, attempt: Attempt) {
+  stored.inbox = [...(attempt.consumedInbox ?? []), ...stored.inbox];
+  stored.notes = [...(attempt.consumedNotes ?? []), ...stored.notes];
+  delete attempt.consumedInbox; delete attempt.consumedNotes;
+}
 const openFollowUps = (mission: Mission) => (mission.followUps ?? []).filter(item => item.state === "open");
 /** Settles every open follow-up of an ending mission. */
 function cancelFollowUps(mission: Mission) {
@@ -843,7 +849,13 @@ export class MissionService {
     if (!attempt || attempt.status === "stopped") return;
     if (attempt.status === "queued") {
       if (live.has(mission.status)) { await this.launch(stored, attempt); return; }
-      if (!this.launched(attempt)) { endAttempt(attempt); this.save(stored); return; }
+      if (!this.launched(attempt)) {
+        // A pause withdraws an attempt that never launched; its messages, such as a fired follow-up, wait for the
+        // attempt after resume. A blocked or cancelled mission emptied its queues when it stopped, so nothing returns.
+        endAttempt(attempt);
+        if (mission.status === "paused") returnConsumed(stored, attempt);
+        this.save(stored); return;
+      }
       attempt.status = "running";
     }
     if (attempt.status === "running") {
@@ -903,8 +915,7 @@ export class MissionService {
     attempt.resumeFailed = true;
     attempt.missedReport = false;
     endAttempt(attempt);
-    stored.inbox = [...(attempt.consumedInbox ?? []), ...stored.inbox];
-    stored.notes = [...(attempt.consumedNotes ?? []), ...stored.notes];
+    returnConsumed(stored, attempt);
     this.event(stored, "The coordinator's conversation could not be resumed; a fresh attempt starts with the full mission state.");
   }
   /** Starts the next coordinator attempt once the previous one stopped and a message needs it. */

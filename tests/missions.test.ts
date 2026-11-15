@@ -1960,3 +1960,27 @@ test("a main conversation at the size limit starts fresh; subagent usage does no
     assert.equal(h.get(id).events.filter(event => event.text.startsWith("The coordinator continues in a new conversation (rule: size)")).length, 1);
   } finally { h.close(); }
 });
+
+test("a pause withdraws a held coordinator launch and returns its fired follow-up once after resume", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(240));
+    await h.report(1, followUp(10));
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 1);
+    h.holdLaunches("Waiting for host capacity: memory is low");
+    mock.timers.tick(10 * 60000);
+    // The follow-up fires into an attempt whose launch the host's load holds.
+    const held = await until(() => h.get(id), mission => mission.followUps![0].state === "fired" && mission.coordinator?.status === "running" && mission.reason === "Waiting for host capacity: memory is low");
+    await h.missions.pause(id, { requestId: randomUUID(), revision: held.revision });
+    await until(() => h.get(id), mission => mission.coordinator?.status === "stopped");
+    await h.restart();
+    h.holdLaunches();
+    await h.missions.resume(id, { requestId: randomUUID(), revision: h.get(id).revision });
+    const messages = (await h.messages(2)) as PromptMessage[];
+    assert.deepEqual(messages.filter(message => message.type === "follow-up").map(message => [message.reason, message.check]),
+      [["The API subteam's CI run may have finished", "Read the API subtask's team status and checks"]]);
+    assert.equal(messages.filter(message => message.type === "resumed").length, 1);
+    assert.equal(h.attempts(), 2, "The withdrawn attempt never launched");
+  } finally { h.close(); mock.timers.reset(); }
+});

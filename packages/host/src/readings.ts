@@ -5,6 +5,7 @@ import { choice, noul } from "@typesafe-ai/sdk";
 import type { Questions, RequestOptions, SystemOneRequest, SystemOneResult, TypeSafeClient } from "@typesafe-ai/sdk";
 import { firstSentence } from "@infinite/attention";
 import type { Attention, Provider } from "@infinite/attention";
+import { ROUTE_INPUT_LIMIT, type RouteReading } from "./intake-route.js";
 import type { Summarizer } from "./summary.js";
 import type { Manager } from "./manager.js";
 import type { Config, Session } from "./types.js";
@@ -352,6 +353,27 @@ export class Readings {
     const title = await this.writer.titleFromPrompt(input);
     const text = title.text.trim().slice(0, 100);
     return text ? { text, model: title.model } : undefined;
+  }
+  /**
+   * Whether an owner's request asks a question (answer) or for a change (work), with the reading's confidence in
+   * that choice. Sends only the request text, cut to ROUTE_INPUT_LIMIT. Never throws: any failure is undefined.
+   */
+  async requestRoute(text: string): Promise<RouteReading | undefined> {
+    if (!this.config.jev) return undefined;
+    try {
+      const result = await this.ask({
+        state: { request: text.slice(0, ROUTE_INPUT_LIMIT) },
+        questions: { route: choice("Choose what `request` asks for.", {
+          answer: "A question, explanation, investigation, review or status request that reading code and documents can satisfy. Nothing needs to change.",
+          work: "A request to change, fix, add, remove, build, write, update, migrate or deploy something. It needs a tracked issue.",
+        }) },
+      }, () => true);
+      const answer = result?.answers.route;
+      if (answer?.type !== "choice" || (answer.choice !== "answer" && answer.choice !== "work")) return undefined;
+      const confidence = Number(answer.confidence);
+      if (!Number.isFinite(confidence)) return undefined;
+      return { route: answer.choice, confidence: Math.min(1, Math.max(0, confidence)) };
+    } catch { return undefined; }
   }
   private async ask(request: Omit<SystemOneRequest<Questions>, "model">, stillCurrent: () => boolean) {
     const client = this.transport ?? await this.createTransport();

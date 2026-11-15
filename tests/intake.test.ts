@@ -14,6 +14,7 @@ import type { Config } from "../packages/host/src/types.js";
 import type { MissionService } from "../packages/host/src/missions.js";
 import { TeamError } from "../packages/host/src/teams.js";
 import type { IntakeView } from "../packages/host/src/intake-types.js";
+import type { RouteReading } from "../packages/host/src/intake-route.js";
 
 const OWNER_SLACK = "U00000000", TEAMMATE_SLACK = "U22222222", AGENT_SLACK = "U11111111";
 const MINUTE = 60000;
@@ -47,7 +48,7 @@ class FakeThreads implements IntakeThreadReader {
   }
 }
 
-async function setup(options: { groupId?: string; maxActive?: number; requireSlackThread?: boolean; mirror?: boolean; scripted?: boolean; admitIssues?: boolean } = {}) {
+async function setup(options: { groupId?: string; maxActive?: number; requireSlackThread?: boolean; mirror?: boolean; scripted?: boolean; admitIssues?: boolean; answerQuestions?: boolean; classify?: boolean; router?: (text: string) => Promise<RouteReading | undefined>; routeWaitMs?: number } = {}) {
   const linearServer = await startIntakeLinearServer();
   const threads = new FakeThreads();
   /** While `blocked` is set, a start is refused with it, as the route's admission refuses a mid-handoff project. */
@@ -59,7 +60,8 @@ async function setup(options: { groupId?: string; maxActive?: number; requireSla
     target.intake = {
       linear: { teamIds: [linearServer.teamId], creatorId: linearServer.ownerId, label: "infinite", commentsMirrorToSlack: options.mirror ?? false, admitIssues: options.admitIssues ?? true },
       slack: { appTokenFile: "/srv/infinite-data/slack-app-token", botTokenFile: "/srv/infinite-data/slack-bot-token", teamId: "T00000000",
-        ownerUserId: OWNER_SLACK, linearAgentUserId: AGENT_SLACK, bindByMention: false, directRequests: true },
+        ownerUserId: OWNER_SLACK, linearAgentUserId: AGENT_SLACK, bindByMention: false, directRequests: true,
+        answerQuestions: options.answerQuestions ?? false, classify: options.classify ?? false },
       mission: { groupId: options.groupId ?? "shop", maxSubtasks: 8, maxMinutes: 30 },
       maxActive: options.maxActive ?? 3,
       requireSlackThread: options.requireSlackThread ?? true,
@@ -75,7 +77,7 @@ async function setup(options: { groupId?: string; maxActive?: number; requireSla
   const linearService = new LinearService(config, randomBytes(32));
   /** Unexpected failures go here instead of the console, so tests can assert what was logged. */
   const logged: { line: string; error: unknown }[] = [];
-  const service = (linear = new IntakeLinear(linearService)) => new IntakeService(config, store, missions, linear, { threads, pollMs: 3600000,
+  const service = (linear = new IntakeLinear(linearService)) => new IntakeService(config, store, missions, linear, { threads, pollMs: 3600000, ...(options.router ? { router: options.router } : {}), ...(options.routeWaitMs ? { routeWaitMs: options.routeWaitMs } : {}),
     log: (line, error) => logged.push({ line, error }),
     create: async (request, origin) => {
       if (control.blocked) throw control.blocked;
@@ -1201,5 +1203,244 @@ test("a failed read-back keeps the creation error", { timeout: 60000 }, async ()
       throw new Error(operation === "InfiniteIntakeIssueCreate" ? "creation failed" : "read-back failed");
     } });
     await assert.rejects(failing.createIssue({ id: randomUUID(), teamId: randomUUID(), title: "t", description: "", label: "infinite" }), /creation failed/);
+  } finally { await ctx.close(); }
+});
+
+// Routing between an answer and a request (INF-238)
+
+/** Every Linear operation but the candidate read the admit step makes; none belongs to an answer. */
+const linearWrites = (ctx: Ctx) => ctx.linearServer.calls.map(call => call.operation);
+const askOptions = { requireSlackThread: false, admitIssues: false, answerQuestions: true } as const;
+
+test('an "ask:" mention becomes an answer mission and never calls Linear', { timeout: 60000 }, async () => {
+  const ctx = await setup(askOptions);
+  try {
+    const request = direct(ctx, "Ask: which exports failed on Monday?\nThe owner's second line", () => [
+      { ts: slackTs(ctx.enabled + 2500), user: TEAMMATE_SLACK, text: "teammate words" },
+    ], 3000);
+    assert.equal(ctx.intake.requestFromSlack(request), "accepted");
+    await ctx.intake.poll();
+    await ctx.intake.poll();
+    assert.deepEqual(linearWrites(ctx), [], "An answer makes no Linear request of any kind");
+    assert.equal(ctx.linearServer.allIssues().length, 0);
+    const [record] = ctx.store.list();
+    assert.deepEqual([record.state, record.identifier, record.url, record.rule, record.direct?.route?.kind, record.direct?.route?.by],
+      ["started", "", "", "owner Slack mention of the bot (question)", "answer", "owner"]);
+    assert.ok(record.direct?.filedAt);
+    assert.equal(record.direct?.routable, true, "Eligibility is fixed when the mention is saved");
+    assert.equal(record.request?.mode, "answer");
+    assert.deepEqual([record.request?.title, record.request?.maxSubtasks, record.request?.maxMinutes],
+      ["Question: which exports failed on Monday?", 1, 30]);
+    const objective = ctx.missions.peek(record.missionId!)!.objective;
+    assert.match(objective, /^Question asked from Slack: which exports failed on Monday\?\n\nwhich exports failed on Monday\?\nThe owner's second line\n\nOnly the owner's words/);
+    assert.ok(!/ask:/i.test(objective.split("\n\n")[1]), "The owner's word is not part of the question");
+    assert.match(objective, /other 1 \| teammate words/);
+    assert.equal(ctx.missions.list().length, 1);
+    const [view] = ctx.list();
+    assert.deepEqual([view.route?.kind, view.route?.by, typeof view.route?.at], ["answer", "owner", "string"]);
+    assert.ok(!JSON.stringify(view).includes("second line") && !("direct" in view) && !("objective" in view), "The API view carries the route and not the request text");
+    assert.equal(ctx.missions.peek(record.missionId!)!.origin?.rule, "owner Slack mention of the bot (question)");
+  } finally { await ctx.close(); }
+});
+
+test('a "work:" mention files an issue even when the reading says answer', { timeout: 60000 }, async () => {
+  const calls: string[] = [];
+  const ctx = await setup({ requireSlackThread: false, answerQuestions: true, classify: true, router: async text => { calls.push(text); return { route: "answer", confidence: 0.99 }; } });
+  try {
+    ctx.intake.requestFromSlack(direct(ctx, "work: change the exporter"));
+    await ctx.intake.poll();
+    assert.deepEqual(calls, [], "The owner's word is final, so the reading is not asked");
+    const [issue] = ctx.linearServer.allIssues();
+    assert.equal(issue.title, "change the exporter");
+    const record = ctx.store.get(issue.id)!;
+    assert.deepEqual([record.state, record.direct?.route?.kind, record.direct?.route?.by, record.request?.mode], ["started", "work", "owner", undefined]);
+  } finally { await ctx.close(); }
+});
+
+test("a reading of work at 0.6 files an issue, and at 0.59 answers", { timeout: 60000 }, async () => {
+  const ctx = await setup({ requireSlackThread: false, admitIssues: false, answerQuestions: true, classify: true,
+    router: async text => ({ route: "work", confidence: text.includes("edge") ? 0.6 : 0.59 }) });
+  try {
+    ctx.intake.requestFromSlack(direct(ctx, "edge: update the exporter", () => [], 2000));
+    ctx.intake.requestFromSlack(direct(ctx, "below: update the exporter", () => [], 4000));
+    await ctx.intake.poll();
+    const byTitle = (title: string) => ctx.store.list().find(record => record.title === title)!;
+    const work = byTitle("edge: update the exporter"), answer = byTitle("below: update the exporter");
+    assert.deepEqual([work.direct?.route?.kind, work.direct?.route?.by, work.direct?.route?.confidence, work.identifier !== ""], ["work", "model", 0.6, true]);
+    assert.deepEqual([answer.direct?.route?.kind, answer.direct?.route?.by, answer.direct?.route?.confidence, answer.identifier, answer.request?.mode], ["answer", "model", 0.59, "", "answer"]);
+    assert.equal(ctx.linearServer.allIssues().length, 1);
+  } finally { await ctx.close(); }
+});
+
+test("a router that throws or never resolves routes to work in the same cycle", { timeout: 60000 }, async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  const ctx = await setup({ requireSlackThread: false, admitIssues: false, answerQuestions: true, classify: true, routeWaitMs: 100, maxActive: 12,
+    router: text => {
+      if (text.startsWith("sync")) throw new Error("router crashed");
+      if (text.startsWith("reject")) return Promise.reject(new Error("router failed"));
+      if (text.startsWith("late")) return new Promise((_, reject) => setTimeout(() => reject(new Error("late failure")), 300));
+      return new Promise<never>(() => {});
+    } });
+  try {
+    for (const [index, word] of ["sync", "reject", "late", "never"].entries())
+      ctx.intake.requestFromSlack(direct(ctx, `${word} the exporter`, () => [], 2000 + index * 1000));
+    await ctx.intake.poll();
+    const records = ctx.store.list();
+    assert.equal(records.length, 4);
+    for (const record of records) {
+      assert.deepEqual([record.direct?.route?.kind, record.direct?.route?.by, record.state, record.identifier !== ""], ["work", "default", "started", true], record.title);
+    }
+    await new Promise(resolve => setTimeout(resolve, 400));
+    assert.deepEqual(unhandled, [], "A late failure is not an unhandled rejection");
+  } finally { process.off("unhandledRejection", onUnhandled); await ctx.close(); }
+});
+
+test("with answerQuestions off no router call happens and the request is filed", { timeout: 60000 }, async () => {
+  const calls: string[] = [];
+  const ctx = await setup({ requireSlackThread: false, admitIssues: false, router: async text => { calls.push(text); return { route: "answer", confidence: 1 }; } });
+  try {
+    ctx.intake.requestFromSlack(direct(ctx, "ask: which exports failed?"));
+    await ctx.intake.poll();
+    assert.deepEqual(calls, []);
+    const [issue] = ctx.linearServer.allIssues();
+    assert.equal(issue.title, "ask: which exports failed?", "The word stays in the text when routing is off");
+    const record = ctx.store.get(issue.id)!;
+    assert.deepEqual([record.direct?.route, record.request?.mode, record.rule], [undefined, undefined, "owner Slack mention of the bot"]);
+    assert.equal(ctx.list()[0].route, undefined);
+  } finally { await ctx.close(); }
+});
+
+test("the router receives only the owner's mention text, cut to 1,000 characters", { timeout: 60000 }, async () => {
+  const calls: string[] = [];
+  const ctx = await setup({ requireSlackThread: false, admitIssues: false, answerQuestions: true, classify: true, router: async text => { calls.push(text); return undefined; } });
+  try {
+    const text = `Where is the exporter? ${"x".repeat(1500)}`;
+    ctx.intake.requestFromSlack(direct(ctx, text, () => [
+      { ts: slackTs(ctx.enabled + 2500), user: TEAMMATE_SLACK, text: "teammate secret words" },
+      { ts: slackTs(ctx.enabled + 2600), botId: "B1", text: "bot words" },
+      { ts: slackTs(ctx.enabled + 2700), user: OWNER_SLACK, text: "an earlier owner line" },
+    ]));
+    await ctx.intake.poll();
+    assert.deepEqual(calls, [text.slice(0, 1000)]);
+    assert.equal(ctx.store.list()[0].direct?.route?.by, "default", "No reading is routed to work");
+  } finally { await ctx.close(); }
+});
+
+test("an answer record is not held by maxActive and does not count toward it", { timeout: 60000 }, async () => {
+  const ctx = await setup({ ...askOptions, maxActive: 1 });
+  try {
+    ctx.intake.requestFromSlack(direct(ctx, "ask: first question", () => [], 2000));
+    ctx.intake.requestFromSlack(direct(ctx, "ask: second question", () => [], 3000));
+    await ctx.intake.poll();
+    assert.deepEqual(ctx.list().map(view => view.state), ["started", "started"], "Two answers run beside a limit of one");
+    ctx.intake.requestFromSlack(direct(ctx, "work: change one thing", () => [], 4000));
+    ctx.intake.requestFromSlack(direct(ctx, "work: change another", () => [], 5000));
+    await ctx.intake.poll();
+    const views = ctx.list();
+    assert.deepEqual(views.map(view => view.state), ["started", "started", "started", "queued"], "The first work request takes the one slot; the answers took none");
+    assert.equal(views[3].holdReason, "max-active");
+    assert.equal(views[0].holdReason, undefined);
+  } finally { await ctx.close(); }
+});
+
+test("a restart between routing and the mission start yields one mission and one route", { timeout: 60000 }, async () => {
+  const first: string[] = [], second: string[] = [];
+  const ctx = await setup({ requireSlackThread: false, admitIssues: false, answerQuestions: true, classify: true, router: async text => { first.push(text); return { route: "answer", confidence: 0.9 }; } });
+  try {
+    ctx.control.blocked = new TeamError(409, "project-busy", "The project is busy.");
+    ctx.intake.requestFromSlack(direct(ctx, "which exports failed?"));
+    await ctx.intake.poll();
+    const [held] = ctx.store.list();
+    assert.deepEqual([held.state, held.direct?.route?.kind, held.direct?.route?.by, held.holdReason, ctx.missions.list().length], ["queued", "answer", "model", "The project is busy.", 0]);
+    const routedAt = held.direct!.route!.at;
+    ctx.intake.close();
+    // A new service on the same store, as after a restart; its router would answer differently if it were asked.
+    const restarted = new IntakeService(ctx.config, ctx.store, ctx.missions, new IntakeLinear(ctx.linear), { threads: ctx.threads, pollMs: 3600000,
+      router: async text => { second.push(text); return { route: "work", confidence: 1 }; },
+      create: (request, origin) => ctx.missions.create(request, undefined, origin) });
+    ctx.control.blocked = undefined;
+    await restarted.poll();
+    await restarted.poll();
+    const [record] = ctx.store.list();
+    assert.deepEqual([record.state, record.direct?.route?.kind, record.direct?.route?.at, ctx.missions.list().length, second], ["started", "answer", routedAt, 1, []]);
+    assert.deepEqual(first, ["which exports failed?"]);
+    assert.deepEqual(linearWrites(ctx), []);
+    restarted.close();
+  } finally { await ctx.close(); }
+});
+
+test("an answer record is skipped by the Linear watch", { timeout: 60000 }, async () => {
+  const ctx = await setup(askOptions);
+  try {
+    ctx.intake.requestFromSlack(direct(ctx, "ask: which exports failed?"));
+    await ctx.intake.poll();
+    await ctx.intake.poll();
+    assert.equal(ctx.store.list()[0].state, "started");
+    assert.ok(!linearWrites(ctx).includes("InfiniteIntakeIssueStates"), "The watch reads no issue state for an answer");
+    assert.deepEqual(linearWrites(ctx), []);
+  } finally { await ctx.close(); }
+});
+
+test("an answer mission's result leaves the record finished with no Linear comment and no Linear request", { timeout: 90000 }, async () => {
+  const ctx = await setup({ ...askOptions, scripted: true });
+  try {
+    ctx.intake.requestFromSlack(direct(ctx, "ask: which exports failed?"));
+    await ctx.intake.poll();
+    await ctx.scripted.report(1, { kind: "result", summary: "Rows 14 and 90 were empty." });
+    const record = ctx.store.list()[0];
+    await waitFor(async () => ctx.missions.peek(record.missionId!)?.status, status => status === "ready-for-review", 60000);
+    await ctx.intake.poll();
+    const finished = ctx.store.list()[0];
+    assert.deepEqual([finished.state, finished.comments], ["finished", {}]);
+    assert.deepEqual(linearWrites(ctx), []);
+  } finally { await ctx.close(); }
+});
+
+test("a request saved before routing existed, or while answerQuestions was off, stays work and is never read by the router", { timeout: 60000 }, async () => {
+  const calls: string[] = [];
+  const ctx = await setup({ requireSlackThread: false, admitIssues: false, router: async text => { calls.push(text); return { route: "answer", confidence: 1 }; } });
+  try {
+    // Saved while the setting was off: no route and no marker, as a record made before this feature.
+    ctx.intake.requestFromSlack(direct(ctx, "which exports failed?", () => [], 2000));
+    // A pending record written by older code: the same shape, saved directly, with a held filing.
+    const root = slackTs(ctx.enabled + 4000);
+    ctx.threads.threads.set(root, [{ ts: root, user: OWNER_SLACK, text: "update the exporter" }]);
+    const now = new Date().toISOString();
+    ctx.store.create({ issueId: randomUUID(), identifier: "", url: "", title: "update the exporter", description: "update the exporter", issueCreatedAt: now, issueUpdatedAt: now,
+      state: "queued", thread: { channelId: "C0000000000", threadTs: root }, direct: { eventId: "EvOld", ts: root, text: "update the exporter" },
+      holdReason: "It could not be filed in Linear and will be retried: timeout", comments: {}, messages: [], questions: [], inbound: [], createdAt: now, updatedAt: now });
+    const slack = ctx.config.intake!.slack!;
+    slack.answerQuestions = true; slack.classify = true;
+    const later = ctx.service();
+    await later.poll();
+    later.close();
+    assert.deepEqual(calls, [], "Neither record's text reaches the reading service");
+    const records = ctx.store.list();
+    assert.equal(records.length, 2);
+    for (const record of records) {
+      assert.deepEqual([record.direct?.route, record.direct?.routable, record.request?.mode, record.identifier !== "", record.state], [undefined, undefined, undefined, true, "started"], record.title);
+    }
+    assert.equal(ctx.linearServer.allIssues().length, 2);
+  } finally { await ctx.close(); }
+});
+
+test("a marked request whose route was not stored when routing was turned off goes to work and is filed", { timeout: 60000 }, async () => {
+  const calls: string[] = [];
+  const ctx = await setup({ requireSlackThread: false, admitIssues: false, router: async text => { calls.push(text); return { route: "answer", confidence: 1 }; } });
+  try {
+    const root = slackTs(ctx.enabled + 2000);
+    ctx.threads.threads.set(root, [{ ts: root, user: OWNER_SLACK, text: "update the exporter" }]);
+    const now = new Date().toISOString();
+    ctx.store.create({ issueId: randomUUID(), identifier: "", url: "", title: "update the exporter", description: "update the exporter", issueCreatedAt: now, issueUpdatedAt: now,
+      state: "queued", thread: { channelId: "C0000000000", threadTs: root }, direct: { eventId: "EvMarked", ts: root, text: "update the exporter", routable: true },
+      comments: {}, messages: [], questions: [], inbound: [], createdAt: now, updatedAt: now });
+    assert.equal(ctx.config.intake!.slack!.answerQuestions, false);
+    await ctx.intake.poll();
+    const [record] = ctx.store.list();
+    assert.deepEqual([record.direct?.route?.kind, record.direct?.route?.by, record.state, record.identifier !== ""], ["work", "default", "started", true]);
+    assert.deepEqual(calls, []);
+    assert.equal(ctx.linearServer.allIssues().length, 1);
   } finally { await ctx.close(); }
 });

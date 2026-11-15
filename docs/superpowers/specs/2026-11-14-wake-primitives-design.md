@@ -1,6 +1,6 @@
 # Wake primitives: the signal inbox, follow-ups, conversation rotation, and the halt (INF-235)
 
-Date: 2026-11-14. Status: design for review, built in parallel on five branches. It amends Part 3 of `2026-11-13-continuous-autonomy-design.md` (standing goals) and the mission contract in `docs/missions.md`. It carries the halt of INF-234 and the standing-objective slice of INF-198.
+Date: 2026-11-14. Status: built and merged as #144 (`main` `65d7311`), with the decisions and limits recorded at the end. No client screen exists yet. It amends Part 3 of `2026-11-13-continuous-autonomy-design.md` (standing goals) and the mission contract in `docs/missions.md`. It carries the halt of INF-234 and the standing-objective slice of INF-198.
 
 ## Intent
 
@@ -212,6 +212,7 @@ Known limits at the first release, recorded so nobody reads them as covered:
 - A subteam that was waiting for input when a halt engaged is not paused. Its existing work continues.
 - A subteam the halt paused keeps the halt reason as its label after a release that keeps it paused.
 - A follow-up that fired just before a pause is delivered again after the resume. Delivery is at least once, never zero.
+- Notes take only the prompt room left beside the leading pending message. When that message has to be shortened to fit, every note is left out of that prompt, without a count.
 
 ## Left to the builder
 

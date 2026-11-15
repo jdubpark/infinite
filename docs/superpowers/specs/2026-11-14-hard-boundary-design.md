@@ -1,6 +1,6 @@
 # The hard boundary: provider ceilings, agent egress, and the GitHub credential proxy (INF-231, INF-232, INF-233)
 
-Date: 2026-11-14. Status: design for review, built in parallel on three branches. It complements `2026-11-14-host-permission-agent-design.md` (INF-226), which lists provider sandboxes as a non-goal.
+Date: 2026-11-14. Status: code built and merged as #144 (`main` `65d7311`); none of the three controls is installed on a host, and no deploy file of theirs has run on Linux. The decisions and limits are recorded at the end. It complements `2026-11-14-host-permission-agent-design.md` (INF-226), which lists provider sandboxes as a non-goal.
 
 ## Intent
 

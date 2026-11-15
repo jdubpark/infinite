@@ -661,8 +661,10 @@ workspace. If that branch is rejected, it tries `RUN_BRANCH-wip-MEMBER_ID-SHA8`;
 it never deletes or force-updates either branch. Failed snapshots or pushes retry
 after 1 minute, doubling each time. Once a save has been requested, the host
 retries when its backoff expires even if the normal retention period has not
-arrived; an owner does not need to request removal again. After five failed
-attempts, the host records the give-up and removes the workspace. This does not
+arrived. Only the retries are automatic: after an early owner request, the
+workspace is removed when the owner requests removal again or when retention
+comes due. After five failed attempts, the host records the give-up, and the
+workspace can then be removed the same way. This does not
 cover the integration workspace, runs without a GitHub publication target, or
 ready-for-review, merged and no-change runs.
 

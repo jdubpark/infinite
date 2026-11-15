@@ -2,13 +2,16 @@
  * A small, conservative reading of a shell command for the permission agent's host rules. It never runs
  * anything. It establishes the simple commands, their operands and redirections where the text shows
  * them literally, and marks the command opaque where an effect is hidden: command substitution, eval,
- * inline interpreter code, here-documents, process substitution, a variable in command position, a
- * shell whose body is not literal text, or a working directory the text does not establish.
+ * interpreter code in an option (`python3 -c'…'`, `perl -ne`, `node --eval=…`, `awk` that runs commands,
+ * `sed`'s `e`, a git command setting) or from a pipe or here-string, here-documents, process substitution,
+ * a variable in command position, a shell whose body is not literal text, or a working directory the text
+ * does not establish.
  *
  * A literal shell body (`sh -c 'script'`, `env -S 'string'`, `watch 'command'`, `script -c`, `flock -c`)
  * is read as the commands it runs, to `MAX_SHELL_DEPTH` layers; a deeper body is opaque. Wrappers in
  * `WRAPPERS` are removed. A command behind a wrapper this table does not know stays in argv; the class
- * module's embedded-command rule reads it there. A remote command (`ssh`), a copy to or from another host
+ * module's embedded-command rule reads it there, and raises it when it runs code the host does not read
+ * (`npx tsx -e …`). A remote command (`ssh`), a copy to or from another host
  * (`scp`, `rsync`, `sftp`) and an attach to a running process (`strace -p`) are opaque.
  */
 import { lstatSync, readlinkSync, realpathSync } from "node:fs";
@@ -49,11 +52,112 @@ export const MAX_SHELL_DEPTH = 3;
 const SEPARATORS = new Set([";", "&&", "||", "|", "|&", "&", "\n", "(", ")"]);
 const REDIRECTS = new Set([">", ">>", "<", ">|", "&>", "&>>", "<>", ">&", "<&", "<<<"]);
 const PRIVILEGE = new Set(["sudo", "doas", "su", "pkexec", "run0"]);
-const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish"]);
-const INLINE_CODE: Record<string, readonly string[]> = {
-  python: ["-c"], node: ["-e", "-p", "--eval", "--print"], deno: ["eval"], bun: ["-e", "--eval"],
-  perl: ["-e", "-E"], ruby: ["-e"], php: ["-r"], osascript: ["-e"], lua: ["-e"],
+const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "fish"]);
+/**
+ * Interpreters whose options can carry code, read getopt style so that attached and combined forms
+ * count (`python3 -c'…'`, `python -Ic …`, `perl -ne …`, `node --eval=…`). `code` letters take code,
+ * attached or as the next word. `valued` letters take the rest of the word or the next word, `attached`
+ * letters only the rest of the word, and `digits` letters only the octal digits after them (`perl -l0`,
+ * `-0x0a`). `long` options take code; `longValued` options take the next word. A `stop` letter ends the
+ * interpreter's own options (`python -m pytest -c conf`). `words` start code (`deno eval`). With
+ * `fromInput`, an interpreter given no script reads its program from a pipe or here-string, unless a
+ * `modes` option runs something else (`python -m`, `node --test`).
+ */
+interface Interpreter {
+  code: string; valued?: string; attached?: string; digits?: string; stop?: string;
+  long?: readonly string[]; longValued?: readonly string[]; words?: readonly string[]; modes?: readonly string[]; fromInput?: boolean;
+}
+const INTERPRETERS: Record<string, Interpreter> = {
+  python: { code: "c", valued: "mWXQ", stop: "m", longValued: ["--check-hash-based-pycs"], modes: ["-m", "-V", "--version", "-h", "--help"], fromInput: true },
+  node: {
+    code: "ep", valued: "rC", long: ["--eval", "--print"], fromInput: true,
+    longValued: ["--require", "--import", "--loader", "--experimental-loader", "--conditions", "--input-type", "--env-file", "--title"],
+    modes: ["--test", "--run", "-v", "--version", "-h", "--help", "-c", "--check"],
+  },
+  deno: { code: "", long: ["--eval"], words: ["eval"] },
+  bun: { code: "e", long: ["--eval", "--print"] },
+  perl: { code: "eE", attached: "iIMmFxdDCV", digits: "l0", modes: ["-v", "-V", "-h"], fromInput: true },
+  ruby: { code: "e", valued: "IrCE", attached: "FixKTW", digits: "0", modes: ["-v", "--version", "-h", "--help"], fromInput: true },
+  php: { code: "rRBE", valued: "dcfztSF", modes: ["-v", "-h", "-m", "-i", "-S", "-l"], fromInput: true },
+  lua: { code: "e", valued: "l", modes: ["-v"], fromInput: true },
+  osascript: { code: "e", valued: "ls", fromInput: true },
+  Rscript: { code: "e", modes: ["--version"] },
+  R: { code: "e", valued: "fd" },
+  julia: { code: "eE", valued: "tpCJL", attached: "Og", long: ["--eval", "--print"] },
+  elixir: { code: "e", valued: "r", long: ["--eval"] },
+  expect: { code: "c", valued: "fbD" },
 };
+/** Paths an interpreter reads as its standard input, as it reads `-`. */
+const STDIN_PATHS = new Set(["/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"]);
+/** The interpreter an executable name runs: `python3.12` is python, `nodejs`, `tsx` and `ts-node` are node, `luajit` is lua. */
+function interpreterOf(name: string): string | undefined {
+  if (/^(?:python|pypy)[\d.]*$/.test(name)) return "python";
+  if (["nodejs", "tsx", "ts-node", "ts-node-esm"].includes(name)) return "node";
+  if (/^lua(?:jit|[\d.]+)?$/.test(name)) return "lua";
+  const versioned = /^(perl|php|ruby)[\d.]*$/.exec(name);
+  if (versioned) return versioned[1];
+  return Object.hasOwn(INTERPRETERS, name) ? name : undefined;
+}
+
+/** What an interpreter's words establish: code in an option, a script operand, `-` (the program from input), or a mode that runs no program. */
+function interpreterWords(spec: Interpreter, argv: readonly string[]): { code: boolean; script: boolean; dash: boolean; mode: boolean } {
+  const found = { code: false, script: false, dash: false, mode: false };
+  for (let index = 1; index < argv.length; index++) {
+    const word = argv[index];
+    if (spec.words?.includes(word)) { found.code = true; break; }
+    if (word === "-" || STDIN_PATHS.has(word)) { found.dash = true; continue; }
+    if (word === "--") { found.script ||= index + 1 < argv.length; break; }
+    // Options are read wherever they stand: a value the table does not know may look like the script.
+    if (!word.startsWith("-")) { found.script = true; continue; }
+    if (spec.modes?.includes(word)) found.mode = true;
+    if (word.startsWith("--")) {
+      const option = word.includes("=") ? word.slice(0, word.indexOf("=")) : word;
+      if (spec.long?.includes(option)) { found.code = true; break; }
+      if (!word.includes("=") && spec.longValued?.includes(option)) index++;
+      continue;
+    }
+    let stop = false;
+    for (let at = 1; at < word.length; at++) {
+      const letter = word[at];
+      if (spec.code.includes(letter)) { found.code = true; break; }
+      if (spec.digits?.includes(letter)) {
+        if (letter === "0" && word[at + 1] === "x") for (at++; /[0-9a-fA-F]/.test(word[at + 1] ?? ""); at++);
+        else for (; /[0-7]/.test(word[at + 1] ?? ""); at++);
+        continue;
+      }
+      if (spec.attached?.includes(letter)) break;
+      if (spec.valued?.includes(letter)) {
+        if (at + 1 === word.length) index++;
+        stop = Boolean(spec.stop?.includes(letter));
+        break;
+      }
+    }
+    if (found.code || stop) break;
+  }
+  return found;
+}
+
+/** For a shell: whether it runs a command string (`-c`, combined as in `-lc` or `-ec`), and where that string stands. */
+function shellCommandString(argv: readonly string[]): { command: boolean; index: number; literal: boolean } {
+  let command = false;
+  let index = 1;
+  for (; index < argv.length; index++) {
+    const word = argv[index];
+    if (word === "--" || word === "-") { index++; break; }
+    if (word.startsWith("--")) {
+      // fish's `--command=string` is a command string the reader does not take apart.
+      if (word.startsWith("--command=")) return { command: true, index, literal: false };
+      if (word === "--command") command = true;
+      else if (["--rcfile", "--init-file", "--init-command"].includes(word)) index++;
+      continue;
+    }
+    if (!/^[-+][A-Za-z]+$/.test(word)) break;
+    if (word[0] === "-" && word.includes("c")) command = true;
+    // `-o name` and `-O name` take the next word, once for each.
+    index += (word.match(/[oO]/g) ?? []).length;
+  }
+  return { command, index, literal: true };
+}
 /**
  * Wrappers whose own options come before the command they run. `valued` are the options that take a
  * value. `chdir` options run the command in another directory, `root` options in another root
@@ -143,9 +247,11 @@ function readLine(source: string, start: Directory, real: PathResolver | undefin
   const commands: SimpleCommand[] = [];
   let current: Token[] = [];
   let directory = start;
+  /** The command being collected reads the previous command's output. */
+  let piped = false;
   const flush = () => {
     if (!current.length) return;
-    const built = build(current, reasons, directory, real);
+    const built = build(current, reasons, directory, real, piped);
     current = [];
     if (!built) return;
     const { body, ...rest } = built;
@@ -163,7 +269,7 @@ function readLine(source: string, start: Directory, real: PathResolver | undefin
     commands.push(command);
   };
   for (const token of tokens) {
-    if (token.kind === "op" && SEPARATORS.has(token.text)) flush();
+    if (token.kind === "op" && SEPARATORS.has(token.text)) { flush(); piped = token.text === "|" || token.text === "|&"; }
     else current.push(token);
   }
   flush();
@@ -280,12 +386,14 @@ function operatorAt(source: string, index: number): string | undefined {
 
 type Built = Omit<SimpleCommand, "depth"> & { body?: string };
 
-function build(tokens: Token[], reasons: Set<string>, directory: Directory, real: PathResolver | undefined): Built | undefined {
+function build(tokens: Token[], reasons: Set<string>, directory: Directory, real: PathResolver | undefined, piped: boolean): Built | undefined {
   const words: Array<{ text: string; expands: boolean }> = [];
   const redirects: SimpleCommand["redirects"] = [];
+  let hereString = false;
   for (let index = 0; index < tokens.length; index++) {
     const token = tokens[index];
     if (token.kind === "op") {
+      if (token.text === "<<<") hereString = true;
       if (REDIRECTS.has(token.text) || token.text === "<<" || token.text === "<<-") {
         const target = tokens[index + 1];
         if (target?.kind === "word") {
@@ -385,18 +493,30 @@ function build(tokens: Token[], reasons: Set<string>, directory: Directory, real
   if (name === "eval" || name === "source" || name === ".") reasons.add("eval");
   if (name === "xargs" || (name === "find" && argv.some(arg => ["-exec", "-execdir", "-ok", "-okdir", "-delete"].includes(arg)))) reasons.add("indirect-command");
   if (SHELLS.has(name)) {
-    // A shell with one literal script runs that script: it is read as a body. Any other shell's body is not literal.
-    const script = inlineShellScript(argv);
-    if (script !== undefined && !words[start + 2]?.expands) body = script;
-    else if (argv.some(arg => /^-[a-z]*c[a-z]*$/.test(arg))) reasons.add("inline-shell");
+    // A shell's literal command string is read as a body; the words after it are its $0 and arguments. Any other command string is not literal.
+    const string = shellCommandString(argv);
+    if (string.command && string.literal && string.index < argv.length && !words[start + string.index]?.expands) body = argv[string.index];
+    else if (string.command) reasons.add("inline-shell");
     else if (!argv.slice(1).some(arg => arg === "--version" || arg === "--help")) {
       const operands = argv.slice(1).filter(arg => !arg.startsWith("-") && !arg.startsWith("+"));
       reasons.add(operands.length === 0 || argv.includes("-s") ? "shell-from-input" : "shell-script");
     }
   }
-  const inline = INLINE_CODE[/^python\d*(?:\.\d+)*$/.test(name) ? "python" : name];
-  if (inline?.some(flag => argv.includes(flag))) reasons.add("inline-code");
-  if ((name === "awk" || name === "gawk") && argv.some(arg => /\bsystem\s*\(|\|\s*getline|print[^;]*>/.test(arg))) reasons.add("inline-code");
+  const interpreter = interpreterOf(name);
+  if (interpreter) {
+    const found = interpreterWords(INTERPRETERS[interpreter], argv);
+    if (found.code) reasons.add("inline-code");
+    // `curl … | python3`, `python3 - <<< '…'`: the program comes from input.
+    else if (INTERPRETERS[interpreter].fromInput && (piped || hereString) && (found.dash || !found.script) && !found.mode) reasons.add("code-from-input");
+  }
+  // PowerShell takes -Command, -EncodedCommand and any unique prefix of them, in any case.
+  if ((name === "pwsh" || name === "powershell") && argv.slice(1).some(arg => {
+    const option = arg.toLowerCase().split(":")[0];
+    return option.length >= 2 && (["-command", "-encodedcommand", "-commandwithargs"].some(full => full.startsWith(option)) || ["-ec", "-cwa"].includes(option));
+  })) reasons.add("inline-code");
+  if (/^[gmn]?awk$/.test(name) && argv.some(arg => /\bsystem\s*\(|\|\s*getline|\bprintf?\b[^;]*[>|]/.test(arg))) reasons.add("inline-code");
+  if ((name === "sed" || name === "gsed") && sedScripts(argv).some(script => SED_EXECUTES.some(pattern => pattern.test(script)))) reasons.add("inline-code");
+  if (name === "git" && gitCommandConfig(argv)) reasons.add("inline-code");
   return {
     argv, name, words: words.map(word => word.text), redirects, privileged,
     ...(cwd.path !== undefined && !cwd.unknown ? { cwd: cwd.path } : {}), ...(cwd.unknown ? { cwdUnknown: true } : {}),
@@ -405,12 +525,65 @@ function build(tokens: Token[], reasons: Set<string>, directory: Directory, real
 }
 
 /**
- * The shell script of `sh -c 'script'` when the command is exactly a shell with one literal script, as
- * Codex sends `["bash", "-lc", "..."]`. Undefined otherwise.
+ * The scripts a sed command runs: each `-e`/`--expression` value, or the first operand when neither an
+ * expression nor a script file is given.
  */
-export function inlineShellScript(argv: readonly string[]): string | undefined {
-  if (argv.length !== 3 || !SHELLS.has(posix.basename(argv[0])) || !/^-[a-z]*c[a-z]*$/.test(argv[1])) return undefined;
-  return argv[2];
+function sedScripts(argv: readonly string[]): string[] {
+  const scripts: string[] = [];
+  let file = false;
+  let operand: string | undefined;
+  for (let index = 1; index < argv.length; index++) {
+    const word = argv[index];
+    if (word === "--") { operand ??= argv[index + 1]; break; }
+    if (word.startsWith("--expression=")) scripts.push(word.slice(13));
+    else if (word === "--expression") scripts.push(argv[++index] ?? "");
+    else if (word === "--file" || word.startsWith("--file=")) { file = true; if (word === "--file") index++; }
+    else if (word === "-l" || word === "--line-length") index++;
+    else if (/^-[a-zA-Z]/.test(word) && !word.startsWith("--")) {
+      // `-ne 's/x/y/'`, `-e's/x/y/'`, `-i.bak`: -e and -f take the rest of the word or the next word; -i and -l the rest.
+      for (let at = 1; at < word.length; at++) {
+        const letter = word[at];
+        if (letter === "e" || letter === "f") {
+          const value = word.slice(at + 1) || argv[++index] || "";
+          if (letter === "e") scripts.push(value); else file = true;
+          break;
+        }
+        if (letter === "i" || letter === "l") break;
+      }
+    } else if (!word.startsWith("-")) operand ??= word;
+  }
+  if (!scripts.length && !file && operand !== undefined) scripts.push(operand);
+  return scripts;
+}
+
+const SED_ADDRESS = String.raw`(?:\d+(?:~\d+)?|\$|/(?:[^/\\\n]|\\.)*/[IM]*)`;
+const SED_COMMAND_START = String.raw`(?:^|[;\n{}])\s*(?:${SED_ADDRESS}(?:\s*,\s*(?:${SED_ADDRESS}|[+~]\d+))?)?\s*!?\s*`;
+/** GNU sed runs a command with the `e` command, and runs the pattern space with the `e` flag of `s`. */
+const SED_EXECUTES: readonly RegExp[] = [
+  new RegExp(`${SED_COMMAND_START}e(?=\\s|;|}|$)`),
+  new RegExp(String.raw`${SED_COMMAND_START}s([^\s\\\n])(?:(?!\1)[^\\\n]|\\.)*\1(?:(?!\1)[^\\\n]|\\.)*\1[gpiImM0-9]*e`),
+];
+
+/** Git configuration keys whose value is a command that git runs. */
+const GIT_COMMAND_KEYS = /^(?:core\.(?:sshcommand|pager|editor|fsmonitor|hookspath|askpass)|credential\.helper|sequence\.editor|diff\.external|gpg\.program|pager\.[^=]+|include\.path)$/i;
+/** A harmless value of such a key: it turns the command off, or runs one that does nothing. */
+const GIT_INERT = new Set(["", "true", "false", ":", "cat", "less", "/dev/null"]);
+
+/** Whether `git -c key=value` sets a command git runs: a `!` alias, or a command-valued key. */
+function gitCommandConfig(argv: readonly string[]): boolean {
+  for (let index = 1; index < argv.length; index++) {
+    const word = argv[index];
+    if (!word.startsWith("-")) break;
+    if (word !== "-c" && word !== "-C" && word !== "--config-env" && word !== "--git-dir" && word !== "--work-tree" && word !== "--namespace") continue;
+    const value = argv[++index] ?? "";
+    if (word !== "-c") continue;
+    const equals = value.indexOf("=");
+    const key = equals < 0 ? value : value.slice(0, equals);
+    const setting = equals < 0 ? "true" : value.slice(equals + 1).trim();
+    if (/^alias\./i.test(key) && setting.startsWith("!")) return true;
+    if (GIT_COMMAND_KEYS.test(key) && !GIT_INERT.has(setting)) return true;
+  }
+  return false;
 }
 
 const REMOTE_COPY = new Set(["scp", "rsync", "sftp"]);

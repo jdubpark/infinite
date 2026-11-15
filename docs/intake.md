@@ -328,10 +328,38 @@ counted as dropped. In a reply:
 
 - `status` lists the mission status and its open questions;
 - `pause`, `resume`, and `cancel` act on the mission;
+- `extend`, `extend 6h`, or `extend 90m` gives a mission stopped at its time limit
+  more working time. See [time limit stop](#time-limit-stop);
 - `Q<n>` followed by an answer answers that question; an option number is
   accepted as the answer;
 - an unnumbered reply answers the oldest open question;
 - with no open question, any other text is a steer to the coordinator.
+
+### Time limit stop
+
+When a mission reaches its approved time limit, it stops. It is not finished: its
+subteams are paused, their work is kept, and the record stays started, so replies
+still reach the mission. The thread gets:
+
+```text
+Stopped at its time limit: REASON
+Reply with a mention and `extend` (or `extend 6h`) to give it more time, or `cancel`.
+```
+
+A reply of `extend` alone adds the mission's `maxMinutes`, up to 1440 minutes.
+`extend N` adds N hours. `extend N` with a unit adds N minutes (`m`, `min`, `mins`,
+`minute`, `minutes`) or N hours (`h`, `hr`, `hrs`, `hour`, `hours`). The amount
+must be from 5 to 1440 minutes. Any other `extend` followed by a number gets the
+help line, `Extend by 5 minutes to 24 hours, for example `extend 6h` or `extend 90m`.`,
+and changes nothing. A reply that starts with `extend` and then a word, such as
+"extend the API to cover CSV exports", is steering.
+
+After an extension, the thread gets `Extended by 6 hours. The mission now stops at
+2026-11-15 12:00 UTC.`, with the new stop time in UTC. A refusal is posted as its
+message. A later stop, after an extension, is announced again.
+
+If the mission is cancelled or finishes while it is stopped, the record finishes as
+usual and the thread gets the matching result or cancellation line.
 
 ### A thread with more than one request
 
@@ -349,12 +377,12 @@ in order:
 4. Otherwise, with one unfinished request in the thread, the reply goes to it. With
    none, it goes to the newest finished request, except that with direct requests
    on, a mention that starts with neither `Q<n>` nor an identifier, and is not
-   exactly `status`, `pause`, `resume`, or `cancel`, files a follow-up request
-   instead.
+   exactly `status`, `pause`, `resume`, `cancel`, or an `extend` command, files a
+   follow-up request instead.
 5. With more than one unfinished request, nothing is applied to any mission, and
    the bot replies:
    `More than one request is open in this thread: ID1, ID2. Start your reply with an identifier or a question number.`
-   This holds for `status`, `pause`, `resume`, `cancel`, and any other text.
+   This holds for `status`, `pause`, `resume`, `cancel`, `extend`, and any other text.
 
 The bot never approves a provider permission, never infers completion, and never
 changes a Linear issue's state, assignee, or labels. Replies are applied once,
@@ -374,6 +402,11 @@ ASCII letters, digits, spaces, or hyphens) to use another name:
 2. When the mission ends: `Infinite agent report: ready for review.` with the
    coordinator's result summary, or `Infinite agent report: blocked.` or
    `Infinite agent report: cancelled.` with the reason.
+
+A stop at the time limit is not an end. A record whose comments go to Linear, not
+to Slack, gets one
+`Infinite agent report: blocked.` comment for each stop, and a stop after an
+extension posts one more. The record stays started until the mission really ends.
 
 Each comment's ID is saved with the record before the write, and a retry reuses
 it, so a lost response does not post a second comment. With

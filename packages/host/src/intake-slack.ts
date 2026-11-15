@@ -20,6 +20,16 @@ const NOT_STARTED = "This request has not started yet.";
 const NO_REASON = "No reason was recorded.";
 const UNEXPECTED = "The request could not be applied.";
 const ACTIONS = new Set(["status", "pause", "resume", "cancel"]);
+const EXTEND_HELP = "Extend by 5 minutes to 24 hours, for example `extend 6h` or `extend 90m`.";
+const EXTEND_PROMPT = "Reply with a mention and `extend` (or `extend 6h`) to give it more time, or `cancel`.";
+const EXTEND_MIN = 5, EXTEND_CAP = 1440;
+/** `extend` as the first word of the reply; a sentence such as "extend the API" is not a command. */
+const EXTEND_WORD = /^extend(?=\s|$)/i;
+/** The whole reply as a command: bare `extend`, or a number with an optional space and a unit (hours when none). */
+const EXTEND_FORM = /^extend(?:\s+(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours)?)?$/i;
+/** An `extend` followed by a number that is not one of the forms is a malformed command, not steering. */
+const EXTEND_ATTEMPT = /^extend\s+\d/i;
+const MINUTE_UNITS = new Set(["m", "min", "mins", "minute", "minutes"]);
 /** Identity failures a retry cannot fix: the surface stops with a reason, as it does for another workspace's token. */
 const PERMANENT_IDENTITY = new Set(["invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired", "credential_unavailable"]);
 const ANSWER_START = "Answering this from the repositories, read-only. No issue was filed.";
@@ -33,7 +43,26 @@ export type DirectRequest = (input: { thread: IntakeThread; ts: string; eventId:
 interface Outcome { outcome: string; reply?: string }
 type SavedCall = NonNullable<IntakeInbound["call"]>;
 type Routed = { outcome: string; reply?: string; call?: Omit<SavedCall, "revision"> };
-const OUTCOMES: Record<SavedCall["action"], string> = { answer: "answered", steer: "steered", pause: "pause", resume: "resume", cancel: "cancel" };
+const OUTCOMES: Record<SavedCall["action"], string> = { answer: "answered", steer: "steered", pause: "pause", resume: "resume", cancel: "cancel", extend: "extended" };
+
+/** The extend command the whole reply is: `minutes` is undefined for a bare `extend`; "invalid" for a malformed or out-of-range one. */
+function extendCommand(text: string): { minutes: number | undefined } | "invalid" | undefined {
+  if (!EXTEND_WORD.test(text)) return undefined;
+  const form = EXTEND_FORM.exec(text);
+  if (form) {
+    if (form[1] === undefined) return { minutes: undefined };
+    const unit = form[2]?.toLowerCase();
+    const minutes = Number(form[1]) * (unit !== undefined && MINUTE_UNITS.has(unit) ? 1 : 60);
+    return minutes >= EXTEND_MIN && minutes <= EXTEND_CAP ? { minutes } : "invalid";
+  }
+  return EXTEND_ATTEMPT.test(text) ? "invalid" : undefined;
+}
+/** A time to the minute in UTC, as `missions.ts` writes it. */
+const utcMinute = (iso: string) => `${iso.slice(0, 16).replace("T", " ")} UTC`;
+const extendedAmount = (minutes: number) => {
+  const plural = (value: number, unit: string) => `${value} ${unit}${value === 1 ? "" : "s"}`;
+  return minutes % 60 === 0 ? plural(minutes / 60, "hour") : plural(minutes, "minute");
+};
 
 const now = () => new Date().toISOString();
 /**
@@ -279,7 +308,10 @@ export class IntakeSlackSurface {
         add(`result:${mission.result.revision}`, "result", this.resultText(mission, answer));
       }
       if (mission.status === "blocked") {
-        add(`status:blocked:${mission.revision}`, "status", `Blocked: ${mission.reason ?? NO_REASON}\n${followUp}`);
+        const text = mission.stopReason === "deadline"
+          ? `Stopped at its time limit: ${mission.reason ?? NO_REASON}\n${EXTEND_PROMPT}`
+          : `Blocked: ${mission.reason ?? NO_REASON}\n${followUp}`;
+        add(`status:blocked:${mission.revision}`, "status", text);
       }
       if (mission.status === "cancelled") {
         add(`status:cancelled:${mission.revision}`, "status", `Cancelled: ${mission.reason ?? NO_REASON}\n${followUp}`);
@@ -483,7 +515,7 @@ export class IntakeSlackSurface {
 
   /** In a thread whose records have all finished, whether the text keeps today's routing: a question number, an identifier, or a command. */
   private routesToRecord(bound: IntakeRecord[], text: string): boolean {
-    if (QUESTION.test(text) || ACTIONS.has(text.toLowerCase())) return true;
+    if (QUESTION.test(text) || ACTIONS.has(text.toLowerCase()) || extendCommand(text) !== undefined) return true;
     return bound.some(record => record.identifier !== ""
       && new RegExp(`^${escapeRegExp(record.identifier)}(?=$|[\\s:,])`, "i").test(text));
   }
@@ -587,6 +619,10 @@ export class IntakeSlackSurface {
       return { outcome: "status", reply: [mission.status, ...open].join("\n") };
     }
     if (ACTIONS.has(lower)) return { outcome: lower, call: { action: lower as "pause" | "resume" | "cancel" } };
+    // Before the open-question check, so "extend" is never taken as an answer to a question.
+    const extend = extendCommand(text);
+    if (extend === "invalid") return { outcome: "invalid-extend", reply: EXTEND_HELP };
+    if (extend) return { outcome: "extend", call: { action: "extend", minutes: extend.minutes ?? Math.min(mission.maxMinutes, EXTEND_CAP) } };
     const open = mission.decisions.filter(decision => !decision.answer);
     const leading = QUESTION.exec(text);
     if (open.length === 0) {
@@ -635,6 +671,7 @@ export class IntakeSlackSurface {
           throw error;
         }
       }
+      if (saved.action === "extend") return { outcome: OUTCOMES.extend, reply: this.extendedText(missionId, saved.minutes!) };
       return { outcome: OUTCOMES[saved.action] };
     } catch (error) {
       if (error instanceof TeamError) return { outcome: "refused", reply: error.message };
@@ -649,7 +686,15 @@ export class IntakeSlackSurface {
     if (call.action === "answer") return this.missions.answer(missionId, call.decisionId!, { requestId, revision, text: call.text! }, "slack");
     if (call.action === "pause") return this.missions.pause(missionId, { requestId, revision });
     if (call.action === "resume") return this.missions.resume(missionId, { requestId, revision });
+    if (call.action === "extend") return this.missions.extend(missionId, { requestId, revision, minutes: call.minutes! });
     return this.missions.cancel(missionId, { requestId, revision });
+  }
+
+  /** The reply to an extension: the amount added and the stop time the mission now has, read after the call. */
+  private extendedText(missionId: string, minutes: number): string {
+    const amount = extendedAmount(minutes);
+    const mission = this.missions.peek(missionId);
+    return mission ? `Extended by ${amount}. The mission now stops at ${utcMinute(mission.deadlineAt)}.` : `Extended by ${amount}.`;
   }
 
   private currentRevision(missionId: string): number {

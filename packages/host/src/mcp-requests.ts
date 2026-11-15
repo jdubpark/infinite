@@ -180,7 +180,8 @@ export class McpRequestService implements McpRequestApi {
       questions: mission?.decisions.filter(decision => !decision.answer).map(decision => ({ id: decision.id,
         question: outboundText(this.config, decision.question), options: decision.options.map(option => outboundText(this.config, option)) })) ?? [],
       ...(mission?.result ? { result: { kind: "agent-report" as const, summary: outboundText(this.config, mission.result.summary) } } : {}),
-      ...(!mission ? { message: record.holdReason ? "This request is queued and waiting for tracking or execution admission." : "This request is queued." } : {}),
+      ...(!mission ? { message: record.holdReason ? "This request is queued and waiting for tracking or execution admission." : "This request is queued." }
+        : mission.status === "blocked" && mission.stopReason === "deadline" ? { message: "This request's time limit has expired. The owner must extend it in Infinite before work can continue." } : {}),
       availableActions: !mission ? [] : live ? ["reply", "pause", "cancel"] : mission.status === "paused" ? ["resume", "cancel"] : mission.status === "cancelled" ? [] : ["cancel"],
     };
   }

@@ -1689,7 +1689,7 @@ test("a direction delivered between refused ones resets the refusal count in del
 
 const intakeOrigin: MissionOrigin = { kind: "intake", issueId: "issue-1", identifier: "TEST-1", url: "https://linear.example.invalid/issue/TEST-1", rule: 'label "infinite", owner creator' };
 const missionRequest = (maxMinutes = 30): CreateMission => ({ requestId: randomUUID(), groupId: "shop", objective: "Change the API", maxSubtasks: 8, maxMinutes });
-const timeLimitText = "The approved time limit has expired. Active subteams were cancelled; their workspaces remain available.";
+const timeLimitText = "The approved time limit has expired. Subteams are paused and their workspaces are kept. Extend the time limit to continue, or cancel the mission.";
 
 test("a saved mission notifies listeners, and peek returns it without usage", { timeout: 30000 }, async () => {
   const h = scripted();
@@ -1859,6 +1859,7 @@ test("the host closes a mission that stays blocked for the blocked-work retentio
     await h.attempt(1);
     mock.timers.tick(6 * 60000);
     const blocked = await until(() => h.get(id), mission => mission.status === "blocked");
+    assert.equal(blocked.stopReason, "deadline");
     assert.equal(blocked.reason, timeLimitText);
     // One hour short of the default 72 hours: the mission still waits on the owner.
     mock.timers.tick(71 * 3600000);
@@ -1870,6 +1871,153 @@ test("the host closes a mission that stays blocked for the blocked-work retentio
     assert.equal(closed.reason, reason);
     assert.equal(closed.events.filter(event => event.text === reason).length, 1, "The closing event is recorded once");
   } finally { h.close(); mock.timers.reset(); }
+});
+
+test("extending a deadline-blocked mission resumes it with a fresh deadline", { timeout: 60000 }, async () => {
+  const h = scripted(); mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const created = await h.missions.create(missionRequest(5)); await h.attempt(1);
+    mock.timers.tick(6 * 60000);
+    const blocked = await until(() => h.get(created.id), mission => mission.status === "blocked");
+    const resumed = await h.missions.extend(created.id, { requestId: randomUUID(), revision: blocked.revision, minutes: 20 });
+    assert.equal(resumed.status, "planning", "With no decisions or subtasks, settle returns the mission to planning"); assert.equal(resumed.stopReason, undefined); assert.equal(resumed.reason, undefined);
+    assert.equal(Date.parse(resumed.deadlineAt), Date.now() + 20 * 60000);
+    assert.equal(resumed.events.at(-1)?.text, `The owner extended the time limit by 20 minutes; the mission now stops at ${resumed.deadlineAt.slice(0,16).replace("T", " ")} UTC.`);
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("extending a deadline-blocked mission with an open decision keeps it in needs-input", { timeout: 60000 }, async () => {
+  const h = scripted(); mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const created = await h.missions.create(missionRequest(5)); await h.attempt(1);
+    await h.report(1, { kind: "question", question: "Which response format should we use?", options: ["JSON", "Text"] });
+    const waiting = await until(() => h.get(created.id), mission => mission.status === "needs-input");
+    mock.timers.tick(6 * 60000);
+    const blocked = await until(() => h.get(created.id), mission => mission.status === "blocked");
+    const extended = await h.missions.extend(created.id, { requestId: randomUUID(), revision: blocked.revision, minutes: 20 });
+    assert.equal(extended.status, "needs-input");
+    assert.equal(extended.decisions[0]?.id, waiting.decisions[0]?.id);
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("deadline blocking pauses a running subteam, keeps queued work, then resumes the subteam on extension", { timeout: 60000 }, async () => {
+  const h = scripted(); mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const { id } = await h.create(); await h.attempt(1);
+    await h.report(1, { kind: "dispatch", summary: "Two sequential API tasks", subtasks: [plan("a", "api"), plan("b", "api", ["a"])] });
+    const running = await until(() => h.get(id), mission => mission.subtasks.some(item => item.id === "a" && item.status === "running"));
+    const teamId = teamOf(running, "a")!;
+    mock.timers.tick(31 * 60000);
+    const blocked = await until(() => h.get(id), mission => mission.status === "blocked");
+    assert.equal(h.runs.get(teamId)?.status, "paused", "The active subteam receives pause, not cancel");
+    assert.notEqual(h.runs.get(teamId)?.status, "cancelled");
+    assert.equal(blocked.subtasks.find(item => item.id === "b")?.status, "queued");
+    assert.equal(h.missions.retainsSubteamRun(teamId), true);
+    const resumed = await h.missions.extend(id, { requestId: randomUUID(), revision: blocked.revision, minutes: 20 });
+    assert.equal(resumed.subtasks.find(item => item.id === "b")?.status, "queued");
+    await until(() => h.runs.get(teamId)?.status, status => status === "implementing");
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("a pending subteam resume stays withheld after deadline until the owner extends", { timeout: 60000 }, async () => {
+  const h = scripted(); mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const created = await h.missions.create(missionRequest(5)); await h.attempt(1);
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const teamId = teamOf(await until(() => h.get(created.id), mission => Boolean(teamOf(mission, "a"))), "a")!;
+    const paused = await h.missions.pause(created.id, { requestId: randomUUID(), revision: h.get(created.id).revision });
+    await until(() => h.get(created.id), mission => mission.subtasks[0]?.teamStatus === "paused");
+    h.holdResume();
+    await h.missions.resume(created.id, { requestId: randomUUID(), revision: paused.revision });
+    mock.timers.tick(6 * 60000);
+    const blocked = await until(() => h.get(created.id), mission => mission.status === "blocked");
+    h.releaseResume();
+    await new Promise(done => setTimeout(done, 1200));
+    assert.equal(h.runs.get(teamId)?.status, "paused", "A pending resume cannot restart the subteam while the mission is deadline-blocked");
+    const extended = await h.missions.extend(created.id, { requestId: randomUUID(), revision: blocked.revision, minutes: 20 });
+    await until(() => h.runs.get(teamId)?.status, status => status === "implementing");
+    assert.equal(extended.stopReason, undefined);
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("an extension while the coordinator's stop is still in flight keeps the preserved work and starts a fresh attempt", { timeout: 60000 }, async () => {
+  const h = scripted(); mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const created = await h.missions.create(missionRequest(5)); await h.attempt(1);
+    await h.holdStop(1);
+    mock.timers.tick(6 * 60000);
+    await waitFor(() => h.stops(1), count => count > 0);
+    const blocked = await until(() => h.get(created.id), mission => mission.status === "blocked");
+    const extended = await h.missions.extend(created.id, { requestId: randomUUID(), revision: blocked.revision, minutes: 20 });
+    await h.releaseStop(1);
+    await until(() => h.attempts(), count => count >= 2);
+    const resumed = h.get(created.id);
+    assert.notEqual(resumed.status, "blocked");
+    assert.ok(!resumed.events.some(event => event.text.includes("coordinator exited without a valid structured report")));
+    assert.equal(extended.stopReason, undefined);
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("resuming a mission while the coordinator's pause stop is still in flight starts a fresh attempt", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const created = await h.missions.create(missionRequest()); await h.attempt(1); await h.holdStop(1);
+    const paused = await h.missions.pause(created.id, { requestId: randomUUID(), revision: created.revision });
+    await waitFor(() => h.stops(1), count => count > 0);
+    await h.missions.resume(created.id, { requestId: randomUUID(), revision: paused.revision });
+    await h.releaseStop(1);
+    await waitFor(() => Promise.resolve(h.attempts()), count => count >= 2);
+    const resumed = h.get(created.id);
+    assert.notEqual(resumed.status, "blocked");
+    assert.ok(!resumed.events.some(event => event.text.includes("coordinator exited without a valid structured report")));
+  } finally { h.close(); }
+});
+
+test("a queued steer for a blocked subteam waits until its deadline-blocked mission is extended", { timeout: 60000 }, async () => {
+  const h = scripted(); mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const created = await h.missions.create(missionRequest(5)); await h.attempt(1);
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const teamId = teamOf(await until(() => h.get(created.id), mission => Boolean(teamOf(mission, "a"))), "a")!;
+    h.set(teamId, { status: "blocked" }); h.holdSteers(true);
+    await h.missions.steer(created.id, { requestId: randomUUID(), revision: h.get(created.id).revision, text: "Use the cached client" });
+    await h.report(2, { kind: "steer-subtask", subtaskId: "a", text: "Use the cached client" });
+    await until(() => h.get(created.id), mission => mission.events.some(event => /sent direction to subtask a/.test(event.text)));
+    mock.timers.tick(6 * 60000);
+    const blocked = await until(() => h.get(created.id), mission => mission.status === "blocked");
+    h.holdSteers(false);
+    await new Promise(done => setTimeout(done, 1200));
+    assert.deepEqual(h.steers, [], "A blocked subteam is not restarted while its mission is deadline-blocked");
+    await h.missions.extend(created.id, { requestId: randomUUID(), revision: blocked.revision, minutes: 20 });
+    await until(() => h.steers, steers => steers.length === 1);
+    assert.deepEqual(h.steers, [{ teamId, text: "Use the cached client" }]);
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("extending a mission blocked for a coordinator reason is refused", { timeout: 30000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create(); await h.attempt(1);
+    await h.report(1, { kind: "blocked", summary: "The API work cannot proceed." });
+    const blocked = await until(() => h.get(id), mission => mission.status === "blocked");
+    assert.equal(blocked.stopReason, undefined);
+    await assert.rejects(h.missions.extend(id, { requestId: randomUUID(), revision: blocked.revision, minutes: 10 }), (error: TeamError) => error.code === "mission-not-extendable");
+  } finally { h.close(); }
+});
+
+test("extending a running mission adds time once and refuses ended or ordinarily blocked missions", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const created = await h.missions.create(missionRequest()); await h.attempt(1);
+    const requestId = randomUUID();
+    const extended = await h.missions.extend(created.id, { requestId, revision: created.revision, minutes: 10 });
+    const replay = await h.missions.extend(created.id, { requestId, revision: created.revision, minutes: 10 });
+    assert.equal(Date.parse(extended.deadlineAt), Date.parse(created.deadlineAt) + 10 * 60000);
+    assert.equal(replay.deadlineAt, extended.deadlineAt);
+    assert.match(extended.events.at(-1)!.text, /The owner extended the time limit by 10 minutes;/);
+    const cancelled = await h.missions.cancel(created.id, { requestId: randomUUID(), revision: extended.revision });
+    await assert.rejects(h.missions.extend(created.id, { requestId: randomUUID(), revision: cancelled.revision, minutes: 5 }), (error: TeamError) => error.code === "mission-not-extendable");
+  } finally { h.close(); }
 });
 
 test("a mission started from the apps keeps the wall-clock deadline", { timeout: 60000 }, async () => {

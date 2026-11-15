@@ -221,7 +221,10 @@ restart. Identical successful reply/control retries reuse their durable receipt.
 A changed payload under the same key conflicts. A stale revision requires a
 fresh read. Queued or tracking-pending requests reject mutation with
 `request-not-started` and remain queued. Tracker outages keep work waiting;
-they do not authorize a local execution fallback.
+they do not authorize a local execution fallback. A request held at its time
+limit offers only cancellation through MCP. The owner must extend the time
+limit in Infinite before replies and further work can continue; connector
+replies and resume actions cannot approve more time.
 
 Connector objectives, follow-up replies and child-team answers retain connector
 provenance rather than being represented as direct human input. Linear receives

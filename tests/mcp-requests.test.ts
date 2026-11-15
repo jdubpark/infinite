@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { mock } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { scriptedMissionHarness } from "./mission-harness.js";
@@ -260,4 +260,35 @@ test("replies address current decision IDs when several structured questions are
     assert.deepEqual(final.questions, []);
     assert.equal(ctx.h.missions.get(current.runId).decisions[0].answeredBy, "connector", "An approval-shaped question does not turn a connector answer into owner authority");
   } finally { await ctx.close(); }
+});
+
+
+test("a connector deadline hold requires owner extension before replies or resume", { timeout: 20000 }, async () => {
+  const ctx = await setup();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const started = ctx.api.startRequest("bot", request());
+    await ctx.intake.poll();
+    await ctx.h.attempt(1);
+    mock.timers.tick(31 * 60000);
+    const held = await waitFor(async () => ctx.api.getRequest("bot", started.runId), view => view.status === "blocked");
+    assert.equal(ctx.h.missions.get(held.runId).stopReason, "deadline");
+    assert.deepEqual(held.availableActions, ["cancel"], "A time hold cannot be resumed by a connector");
+    assert.equal(held.message, "This request's time limit has expired. The owner must extend it in Infinite before work can continue.");
+    const action = { runId: held.runId, revision: held.revision!, requestId: randomUUID() };
+    await assert.rejects(ctx.api.controlRequest("bot", { ...action, action: "resume" }), code("mission-not-paused"));
+    await assert.rejects(ctx.api.replyToRequest("bot", { ...action, requestId: randomUUID(), text: "Continue for another hour" }), code("mission-not-running"));
+    assert.equal(ctx.h.missions.get(held.runId).revision, held.revision, "Rejected input cannot approve more work");
+    await ctx.h.restart();
+    ctx.restart();
+    assert.deepEqual(ctx.api.getRequest("bot", held.runId), held, "The sealed hold survives a host restart");
+    const extended = await ctx.h.missions.extend(held.runId, { requestId: randomUUID(), revision: held.revision!, minutes: 10 });
+    const ready = ctx.api.getRequest("bot", held.runId);
+    assert.deepEqual(ready.availableActions, ["reply", "pause", "cancel"]);
+    assert.equal(ready.message, undefined);
+    await ctx.api.replyToRequest("bot", { runId: held.runId, requestId: randomUUID(), revision: extended.revision, text: "Keep the original scope" });
+    const mission = ctx.h.missions.get(held.runId);
+    assert.deepEqual(mission.steering.at(-1)?.source, { kind: "connector", id: "bot", name: "Delegated Bot" });
+    assert.deepEqual(mission.origin?.source, { kind: "connector", id: "bot", name: "Delegated Bot" });
+  } finally { await ctx.close(); mock.timers.reset(); }
 });

@@ -1136,6 +1136,7 @@ export class TeamService {
     this.commands.get(stored.run.id)?.abort();
     this.commands.delete(stored.run.id);
     this.records.delete(stored.run.id);
+    this.recorders.delete(stored.run.id);
     this.entryBacklog.delete(stored.run.id);
     // deleteRun never throws. A failed delete is repeated by the hourly sweep, so the removal does not wait on it.
     this.evidence?.deleteRun(stored.run.id);

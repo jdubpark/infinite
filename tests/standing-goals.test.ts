@@ -9,6 +9,8 @@ import { emptyUsage } from "../packages/host/src/team-usage.js";
 import { createTeamSchema, teamGoalContextSchema, type CreateTeam, type TeamGoalContext, type TeamLineup, type TeamView } from "../packages/host/src/team-types.js";
 import type { ProjectSignal, SignalKind, SignalReader } from "../packages/host/src/signals/types.js";
 import type { Project } from "../packages/host/src/types.js";
+import type { LinearService } from "../packages/host/src/linear.js";
+import type { LinearTrackingView } from "../packages/host/src/linear-types.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
 const lineup: TeamLineup = {
@@ -548,6 +550,98 @@ test("a delivery member that never launched leaves no open operation; a recorded
   teams.settle(second.request.requestId, "blocked", { reason: "The delivery agent stopped.", members: delivery() });
   const blocked = await until(() => goals.get(created.id), goal => goal.status === "blocked");
   assert.equal(blocked.reasonCode, "external-operation");
+});
+
+test("a cycle woken by an owner signal records owner, as steering does", async t => {
+  const { teams, goals, advance } = fixture(t);
+  const signals: ProjectSignal[] = [];
+  const reader: SignalReader = { head: () => signals.length, after: (projectId, seq) => signals.filter(signal => signal.projectId === projectId && signal.seq > seq) };
+  goals.useSignals(reader);
+  const created = await goals.create(standing({}, 1440, ["owner"]));
+  goals.start();
+  const first = await until(() => teams.launches[0], Boolean);
+  teams.settle(first.request.requestId, "no-change");
+  await until(() => goals.get(created.id), goal => !goal.activeTeamId);
+  advance(10);
+
+  signals.push({ seq: 1, id: randomUUID(), projectId: "fixture", kind: "owner", key: randomUUID(), at: new Date().toISOString(), text: "Check the login page" });
+  const second = await until(() => teams.launches[1], Boolean);
+  assert.match(second.request.objective, /User direction: Check the login page$/);
+  const woken = await until(() => goals.get(created.id), goal => goal.cycles.length === 2);
+  assert.deepEqual(woken.cycles[1]!.wake, { signalIds: [signals[0]!.id], dropped: 0, owner: true });
+});
+
+test("a paused or halted standing goal shows no next cycle time, and shows one again after it resumes", async t => {
+  const { teams, goals } = fixture(t);
+  const created = await goals.create(standing());
+  goals.start();
+  const first = await until(() => teams.launches[0], Boolean);
+  teams.settle(first.request.requestId, "no-change");
+  const between = await until(() => goals.get(created.id), goal => !goal.activeTeamId && goal.cycles[0]!.class !== undefined);
+  const due = new Date(Date.now() + 30 * minute).toISOString();
+  assert.equal(between.nextCycleAt, due);
+
+  const paused = await goals.pause(created.id, action(between));
+  assert.equal(goals.get(created.id).nextCycleAt, undefined, "A paused goal starts no cycle");
+  await goals.resume(created.id, action(paused));
+  assert.equal(goals.get(created.id).nextCycleAt, due);
+
+  const halt = { haltId: randomUUID(), reason: "Halted by the owner for the whole host." };
+  await goals.haltPause(halt, () => true);
+  assert.equal(goals.get(created.id).status, "paused");
+  assert.equal(goals.get(created.id).nextCycleAt, undefined, "A halted goal starts no cycle");
+  await goals.haltResume(halt.haltId, () => undefined, false);
+  assert.equal(goals.get(created.id).nextCycleAt, due);
+});
+
+test("a cancelled goal's reason says it was cancelled once no team is stopping", async t => {
+  const { teams, goals } = fixture(t);
+  const stopping = "The goal is stopping its active team. Existing work will remain available.";
+  const cancelled = "The owner cancelled this goal. Existing work remains available.";
+  // Between cycles there is no team to stop.
+  const idle = await goals.create(standing());
+  goals.start();
+  const first = await until(() => teams.launches[0], Boolean);
+  teams.settle(first.request.requestId, "no-change");
+  const between = await until(() => goals.get(idle.id), goal => !goal.activeTeamId && goal.cycles[0]!.class !== undefined);
+  const stopped = await goals.cancel(idle.id, action(between));
+  assert.equal(stopped.status, "cancelled");
+  assert.equal(stopped.reason, cancelled);
+
+  // With a cycle running, the reason says the team is stopping until it has stopped.
+  const busy = await goals.create(standing());
+  const run = await until(() => teams.launches[1], Boolean);
+  const active = await until(() => goals.get(busy.id), goal => goal.activeTeamId === run.request.requestId);
+  assert.equal((await goals.cancel(busy.id, action(active))).reason, stopping);
+  const settled = await until(() => goals.get(busy.id), goal => !goal.activeTeamId);
+  assert.equal(settled.reason, cancelled);
+});
+
+test("while Linear tracking holds new work, the goal shows the tracking reason and when Linear requests resume", async t => {
+  const { f, teams } = fixture(t);
+  type View = LinearTrackingView & { retryAt?: string };
+  let view: View = { status: "error", reason: "Linear rate limited requests.", retryAt: "2026-11-14T00:20:00.000Z" };
+  const linear = { updateGoal: () => structuredClone(view), getGoal: () => undefined } as unknown as LinearService;
+  const goals = new GoalService(f.config, f.key, teams as unknown as TeamService, linear);
+  t.after(() => goals.close());
+  const created = await goals.create(standing());
+  const { standing: _standing, ...template } = standing();
+  const finite = await goals.create({ ...template, requestId: randomUUID(), maxRuns: 2 } as CreateGoal);
+  goals.start();
+  const held = await until(() => [goals.get(created.id), goals.get(finite.id)], all => all.every(goal => goal.reason !== undefined));
+  for (const goal of held) {
+    assert.equal(goal.status, "running");
+    assert.equal(goal.reason, "New work waits for Linear tracking: Linear rate limited requests. Linear requests resume at 2026-11-14 00:20 UTC.");
+  }
+  assert.equal(teams.launches.length, 0);
+
+  view = { status: "pending", reason: "Waiting for Linear to confirm current requirements and execution evidence." };
+  await until(() => goals.get(created.id), goal => goal.reason === "New work waits for Linear tracking: Waiting for Linear to confirm current requirements and execution evidence.");
+
+  view = { status: "synced" };
+  await until(() => teams.launches.length, count => count === 2);
+  const started = await until(() => [goals.get(created.id), goals.get(finite.id)], all => all.every(goal => goal.activeTeamId !== undefined));
+  for (const goal of started) assert.equal(goal.reason, undefined, "The tracking reason clears once work starts");
 });
 
 test("a standing goal refuses an objective over 24,000 bytes; a finite goal keeps its character limit", async t => {

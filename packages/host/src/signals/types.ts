@@ -52,19 +52,20 @@ export interface PendingWake {
   dropped: number;
   /** When the first signal of this batch was read. */
   since: string;
-  /** The owner sent direction while the consumer was between runs. */
+  /** Owner direction is part of this wake: steering sent between runs, or an `owner` signal. */
   owner?: boolean;
 }
 
 export const maxPendingWakeSignals = 20;
 
-/** Folds newly read signals into a pending wake, keeping the newest `maxPendingWakeSignals`. */
+/** Folds newly read signals into a pending wake, keeping the newest `maxPendingWakeSignals`. An `owner` signal sets `owner`. */
 export function addToPendingWake(pending: PendingWake | undefined, signals: readonly ProjectSignal[], now: string): PendingWake | undefined {
   if (!signals.length) return pending;
   const next: PendingWake = pending ? { ...pending, signals: [...pending.signals] } : { signals: [], dropped: 0, since: now };
   for (const signal of signals) {
     if (next.signals.some(value => value.id === signal.id)) continue;
     next.signals.push({ id: signal.id, kind: signal.kind, key: signal.key, at: signal.at, ...(signal.commit ? { commit: signal.commit } : {}), ...(signal.text ? { text: signal.text } : {}) });
+    if (signal.kind === "owner") next.owner = true;
   }
   const overflow = next.signals.length - maxPendingWakeSignals;
   if (overflow > 0) { next.signals.splice(0, overflow); next.dropped += overflow; }

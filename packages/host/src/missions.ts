@@ -1206,8 +1206,11 @@ export class MissionService {
     const inbox = stored.inbox.slice(0, messageLimit), notes = stored.notes.slice(0, messageLimit - inbox.length);
     const waiting = stored.inbox.length + stored.notes.length - inbox.length - notes.length;
     // The prompt keeps a byte budget by leaving trailing messages queued, so inbox messages lead and notes are deferred first.
+    // Each direction queues one owner-direction message, delivered in order, and only an ending mission drops the inbox.
+    // So the directions whose message no attempt has taken are the newest ones; every older one reached an attempt.
+    const undelivered = stored.inbox.filter(message => message.type === "owner-direction").length;
     const messages = [...inbox, ...notes], context = { openChildDecisions: this.openChildDecisions(stored), waiting, answerProjectId: this.config.intake?.mission.answerProjectId,
-      notes: stored.coordinatorNotes ?? [] };
+      notes: stored.coordinatorNotes ?? [], deliveredDirections: Math.max(0, mission.steering.length - undelivered) };
     const build = (list: MissionMessage[], promptContext: typeof context) => continuation?.mode === "resume"
       ? missionFollowUpPromptWithMessageCount(mission, stored.repos, list, revision, profile.provider, profile, promptContext)
       : missionPromptWithMessageCount(mission, stored.repos, list, revision, profile.provider, profile, promptContext);

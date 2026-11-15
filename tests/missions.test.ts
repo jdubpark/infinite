@@ -2293,6 +2293,35 @@ test("an idle gap starts a fresh conversation with the coordinator's notes and o
   } finally { h.close(); mock.timers.reset(); }
 });
 
+test("after a rotation, owner direction that earlier attempts received is marked as delivered, and direction no attempt received arrives as new", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(240));
+    await h.attempt(1);
+    await h.confirmNative(1);
+    await h.report(1, followUp(120, "The release page may be published"));
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 1);
+
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "For this attempt only, file one follow-up in 90 minutes" });
+    const second = await h.attempt(2);
+    assert.equal(second.request.continuation?.mode, "resume");
+    await h.confirmNative(2);
+    await h.report(2, followUp(90, "The owner asked for one more look"));
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 2);
+
+    mock.timers.tick(61 * 60000);
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Mention the release in the summary" });
+    const third = await h.attempt(3);
+    assert.equal(third.request.continuation?.mode, "start", "The idle rule starts a new conversation");
+    const delivered = "Owner direction that earlier coordinator attempts already received, in an earlier conversation.";
+    assert.ok(third.prompt.includes(`${delivered} It still applies to the mission, but a one-time request in it was for that attempt: do not carry it out again. Your notes and the mission state show what was done:\nFor this attempt only, file one follow-up in 90 minutes\n\nOwner direction that no earlier attempt received:\nMention the release in the summary`),
+      "The delivered direction is marked, and only the new one arrives as new");
+    assert.doesNotMatch(third.prompt, /\nOwner direction:\n/, "No direction is listed without its delivery label");
+    assert.deepEqual(((await h.messages(3)) as PromptMessage[]).filter(message => message.type === "owner-direction").map(message => message.text), ["Mention the release in the summary"]);
+  } finally { h.close(); mock.timers.reset(); }
+});
+
 test("a follow-up that fires while an attempt runs lets that attempt wait, even after two refused reports", { timeout: 60000 }, async () => {
   const h = scripted();
   mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T09:00:00Z") });

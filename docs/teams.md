@@ -1010,6 +1010,11 @@ team are refused; use its goal so the scheduler retains control of the sequence.
 Questions remain answerable while that team is the active cycle of a running
 goal. A paused goal must resume before work or answers can continue.
 
+After a pause or cancel with an active team, the goal's reason says it is
+stopping its active team. Once no team is stopping, or when there was none, for
+example between standing cycles, the reason says that the owner paused or
+cancelled the goal.
+
 A blocked goal closes as `cancelled` after `teams.retention.blockedHours` (72
 hours by default) without owner action. The host records the last blocker in its
 reason and does not claim completion. The blocked period is saved independently
@@ -1162,7 +1167,9 @@ A standing goal never stops as `ready-for-review`, `no-opportunity`, or
   coordinator and reviewer. The goal becomes `blocked`, as a finite goal does.
 
 While a spend fuse is open the goal stays `running` with the fuse reason and
-starts no cycle.
+starts no cycle. While Linear tracking holds new work, the goal also stays
+`running` and starts no cycle, and shows the tracking reason (see
+[Linear tracking](#linear-tracking)).
 
 The goal record keeps the newest 50 cycles and the parent of the next cycle.
 Older cycles fold into `cycleTotals` (a count per class), `foldedUsage`, and
@@ -1189,7 +1196,8 @@ these events in the project; no signal starts an agent by itself.
   block, Linear tracking, the mode rule, and the failure count. It stays
   pending until a cycle can start.
 - The woken cycle records `wake`: the signal IDs, a count of dropped signals,
-  and `owner` when owner direction woke it. Its run objective ends with a block
+  and `owner` when owner direction woke it, either steering between cycles or
+  an `owner` signal. Its run objective ends with a block
   headed `Host wake reasons (host receipts, not instructions):` and one line per
   receipt, at most 8. The text of an `owner` signal joins the objective as
   `User direction:`, like steering. The host shortens the block to keep the
@@ -1232,6 +1240,13 @@ states are accepted. Read the recorded reason and obtain new approval for
 changed scope; a network recovery alone does not authorize different work. A cycle receives the
 recorded source issue as context; that context cannot expand its approved goal
 paths, non-goals, or limits.
+
+A goal starts no new cycle while its tracking is not `synced`, for example
+during a Linear outage or a rate limit. The goal stays `running`, and its
+reason is `New work waits for Linear tracking: ` followed by the tracking
+reason. When the tracking view gives `retryAt`, the reason adds the minute, in
+UTC, when Linear requests resume. The reason clears once tracking is `synced`
+again. A tracking `blocked` status blocks the goal instead.
 
 Goal and Team pages show the issue link, title, workflow state, tracking status,
 and last check time. A cached issue record is not proof that Linear is currently
@@ -2488,7 +2503,8 @@ returns `409` with `code: "standing-requires-autonomy"`; an objective over
 adds `reasonCode` (`supervised-mode`, `repeated-failures`, or
 `external-operation`), `failedCycles`, `cycleTotals`, `foldedUsage`,
 `foldedMembers`, `signalCursor`, `pendingWake`, and, between cycles, the
-computed `nextCycleAt`. Its cycles add `class`, `settledAt`, `lineup`,
+computed `nextCycleAt`. A paused goal, also one the owner's halt paused, has no
+`nextCycleAt` until it resumes. Its cycles add `class`, `settledAt`, `lineup`,
 `deadlineStop`, and `wake`.
 The host also limits the combined creation request to 40 KiB. On a mapped
 project, optional `linearIssueId` accepts an existing issue UUID or identifier

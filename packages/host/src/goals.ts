@@ -9,6 +9,7 @@ import type { Config } from "./types.js";
 import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, type CreateTeam, type TeamGoalContext, type TeamView } from "./team-types.js";
 import { addRollups, emptyRollup, type StoredRollup, type UsageRollup } from "./team-usage.js";
 import type { LinearService } from "./linear.js";
+import type { LinearTrackingView } from "./linear-types.js";
 import { applyFuseReason } from "./fuse/rules.js";
 import type { FuseGate } from "./fuse/types.js";
 import { readSignals } from "./signals/consume.js";
@@ -56,6 +57,21 @@ const now = () => new Date().toISOString();
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const terminal = new Set(["blocked", "ready-for-review", "no-opportunity", "limit-reached", "cancelled", "achieved"]);
 const timeLimitReason = "The approved time limit has expired.";
+/** An owner pause or cancel that has an active team to stop says so; once no team is stopping, the reason names the action. */
+const stoppingReason = "The goal is stopping its active team. Existing work will remain available.";
+const ownerStopReason = { pause: "The owner paused this goal. No new work starts until it resumes.", cancel: "The owner cancelled this goal. Existing work remains available." };
+/** While Linear tracking holds new work, the goal shows the tracking reason after this prefix; the prefix lets a later pass clear it. */
+const trackingHoldPrefix = "New work waits for Linear tracking: ";
+/**
+ * The tracking reason, and when Linear requests resume if the tracking view says so. `retryAt` is optional in the
+ * view (an older release has none), and a time already past says nothing.
+ */
+function trackingHoldReason(view: LinearTrackingView | undefined) {
+  const retryAt = (view as (LinearTrackingView & { retryAt?: unknown }) | undefined)?.retryAt;
+  const at = typeof retryAt === "string" ? Date.parse(retryAt) : NaN;
+  const resumes = at > Date.now() ? ` Linear requests resume at ${new Date(at).toISOString().slice(0, 16).replace("T", " ")} UTC.` : "";
+  return `${trackingHoldPrefix}${view?.reason ?? "Linear has not confirmed this goal's issue."}${resumes}`;
+}
 const repeatedFailuresReason = "Three cycles in a row failed, so this standing goal paused. Review the failed cycles, then resume it to reset the count.";
 const maxExtensionFailures = 3;
 const correctionEvent = (version: number) => `The owner corrected the objective record to version ${version}.`;
@@ -212,7 +228,8 @@ export class GoalService {
     });
     goal.usage = addRollups(goal.foldedUsage ? [...rollups, goal.foldedUsage] : rollups);
     const last = goal.cycles.at(-1);
-    if (goal.standing && last && !goal.activeTeamId && !terminal.has(goal.status))
+    // A paused goal, the owner's halt included, starts no cycle, so it has no next cycle time until it resumes.
+    if (goal.standing && last && !goal.activeTeamId && !terminal.has(goal.status) && goal.status !== "paused")
       goal.nextCycleAt = new Date(cadenceDue(last, goal.standing.cadenceMinutes, Date.now())).toISOString();
     return { ...goal, tasks };
   }
@@ -321,12 +338,12 @@ export class GoalService {
       if (action === "resume" && !goal.standing && Date.now() >= Date.parse(goal.deadlineAt)) throw new TeamError(409, "goal-deadline", "This goal's time limit has expired. Extend it or start a new goal to approve more time.");
       this.admit(stored, action, body);
       goal.status = action === "pause" ? "paused" : action === "cancel" ? "cancelled" : "running";
-      goal.reason = action === "resume" ? undefined : "The goal is stopping its active team. Existing work will remain available.";
       if (goal.standing) {
         goal.reasonCode = undefined;
         if (action === "resume") goal.failedCycles = 0;
       }
       this.setControl(stored, action);
+      goal.reason = action === "resume" ? undefined : stored.control ? stoppingReason : ownerStopReason[action];
       this.event(stored, `Goal ${action === "pause" ? "paused" : action === "resume" ? "resumed" : "cancelled"}.`);
       this.save(stored); return structuredClone(goal);
     });
@@ -699,6 +716,7 @@ export class GoalService {
     this.save(stored);
     const inbox = goal.standing ? this.readWake(stored) : "current";
     const trackingReady = !goal.linear || goal.linear.status === "synced";
+    if (trackingReady && goal.reason?.startsWith(trackingHoldPrefix)) { goal.reason = undefined; this.save(stored); }
     // Mirror first: a paused team's approved extension still protects the goal from its old deadline.
     if (goal.activeTeamId) {
       let team: TeamView | undefined;
@@ -733,6 +751,7 @@ export class GoalService {
         } catch (error) { if (!(error instanceof TeamError) || error.code !== "team-not-found") throw error; }
         stored.launch = undefined; this.save(stored);
       } else if (trackingReady) await this.launch(stored);
+      else this.holdForTracking(stored);
     }
     if (!await this.applyControl(stored) || this.closed) return;
     if (goal.activeTeamId) {
@@ -811,6 +830,9 @@ export class GoalService {
       const cleanupEvent = `The host removed cancelled goal cycle ${cycle.cycle}'s settled run record after its workspace was removed.`;
       if (!goal.events.some(event => event.text === cleanupEvent)) { this.event(stored, cleanupEvent); this.save(stored); }
     }
+    if ((goal.status === "cancelled" || goal.status === "paused") && goal.reason === stoppingReason && !goal.activeTeamId && !stored.control && !stored.launch) {
+      goal.reason = ownerStopReason[goal.status === "paused" ? "pause" : "cancel"]; this.save(stored);
+    }
     if (terminal.has(goal.status) || goal.status === "paused") return;
     if (goal.standing) { await this.startStandingCycle(stored, trackingReady, inbox); return; }
     const timeUp = Date.now() >= Date.parse(goal.deadlineAt) && !this.teamExtendable(stored);
@@ -826,7 +848,7 @@ export class GoalService {
       goal.status = "ready-for-review"; goal.reason = "The approved feature-run limit has been reached. Review the accumulated changes; product impact has not been inferred.";
       this.event(stored, goal.reason); this.save(stored); return;
     }
-    if (!trackingReady) return;
+    if (!trackingReady) { this.holdForTracking(stored); return; }
     const fuse = applyFuseReason(goal, this.fuse?.check({ projectId: goal.projectId }));
     if (fuse.changed) { if (fuse.wait) this.event(stored, goal.reason!); this.save(stored); }
     if (fuse.wait) return;
@@ -889,7 +911,7 @@ export class GoalService {
       if (early && !woken) return;
     }
     if (stored.launchRetryAt && Date.now() < Date.parse(stored.launchRetryAt)) return;
-    if (!trackingReady) return;
+    if (!trackingReady) { this.holdForTracking(stored); return; }
     const fuse = applyFuseReason(goal, this.fuse?.check({ projectId: goal.projectId }));
     if (fuse.changed) { if (fuse.wait) this.event(stored, goal.reason!); this.save(stored); }
     if (fuse.wait) return;
@@ -904,6 +926,15 @@ export class GoalService {
     goal.ceilingAt = new Date(startedAt + (goal.maxTotalMinutes ?? goal.maxMinutes) * 60000).toISOString();
     goal.lineup = structuredClone(this.config.teams!.lineup!);
     await this.prepare(stored, foldedCycles(goal) + goal.cycles.length + 1, Math.min(60, goal.maxMembers), latest === "current");
+  }
+  /**
+   * New work waits while Linear tracking is not synced. The goal stays `running` and shows the tracking reason, and
+   * when Linear requests resume if known. No event is recorded: tracking goes briefly unsynced on every refresh.
+   */
+  private holdForTracking(stored: Stored) {
+    const reason = trackingHoldReason(stored.goal.linear);
+    if (stored.goal.reason === reason) return;
+    stored.goal.reason = reason; this.save(stored);
   }
   /** Whether the team service holds the run of this request; a launch intent without one never created its run. */
   private runCreated(requestId: string) { return this.teams.goalIdOf(requestId) !== undefined; }

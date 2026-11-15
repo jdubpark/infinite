@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstatSync, readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
 import { posix } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -54,10 +54,17 @@ export const nodeCeilingFs: CeilingFs = {
     }
   },
   read(path) {
+    // O_NOFOLLOW makes a symbolic link fail instead of being followed. O_NONBLOCK keeps a named pipe from
+    // waiting for a writer. Only a regular file is returned.
+    let fd: number | undefined;
     try {
-      return readFileSync(path);
+      fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      if (!fstatSync(fd).isFile()) return undefined;
+      return readFileSync(fd);
     } catch {
       return undefined;
+    } finally {
+      if (fd !== undefined) closeSync(fd);
     }
   },
 };
@@ -127,8 +134,8 @@ function replaceable(systemPath: string, installed: CeilingFileStat, fs: Ceiling
 
 const TOML_ESCAPES: Record<string, string> = { b: "\b", t: "\t", n: "\n", f: "\f", r: "\r", e: "\u001b", '"': '"', "\\": "\\" };
 
-// What a TOML string literal means: basic and literal strings, one-line and multi-line. Text that is not a
-// string literal is returned as written, which is how Codex reads an override value that is not valid TOML.
+// Reads a TOML string literal: basic and literal strings, one line or several. Anything else comes back as written,
+// so a value this reader does not understand is compared as text and reported rather than assumed safe.
 function tomlString(value: string): string {
   const unescape = (text: string) =>
     text.replace(/\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|([\s\S]))/g, (whole, short?: string, long?: string, char?: string) => {
@@ -147,38 +154,58 @@ function tomlString(value: string): string {
   return value;
 }
 
-// The value of a Codex `key=value` override, read as Codex reads it.
-function overrideValue(text: string, key: string): string | undefined {
+// Codex accepts exactly these two sandbox modes under the ceiling.
+const CODEX_SANDBOX_ALLOWED = new Set(["read-only", "workspace-write"]);
+
+// The value of `sandbox_mode` in a Codex `key=value` override, or undefined for any other key.
+function sandboxModeOverride(text: string): string | undefined {
   const equals = text.indexOf("=");
-  if (equals < 0 || text.slice(0, equals).trim() !== key) return undefined;
+  if (equals < 0) return undefined;
+  const key = text.slice(0, equals).trim().replace(/^(["'])(.*)\1$/, "$2");
+  if (key !== "sandbox_mode") return undefined;
   return tomlString(text.slice(equals + 1).trim());
 }
 
-// Launch arguments the ceiling forbids. Matching is on argument boundaries: a flag, a flag with its value as the
-// next argument, or a flag joined to its value with "=".
-export function forbiddenLaunchFlags(provider: CeilingProvider, args: string[]): string[] {
-  const hits = new Set<string>();
-  const valued = (index: number, flags: string[]): string | undefined => {
-    const arg = args[index];
-    for (const flag of flags) {
-      if (arg === flag) return args[index + 1];
-      if (arg.startsWith(`${flag}=`)) return arg.slice(flag.length + 1);
-    }
-    return undefined;
-  };
+// Claude Code: a flag, a flag with its value as the next argument, or the flag joined to its value with "=".
+function claudeHits(args: string[]): string[] {
+  const hits: string[] = [];
   args.forEach((arg, index) => {
-    if (provider === "claude") {
-      if (["--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--enable-auto-mode"].includes(arg)) hits.add(arg);
-      const mode = valued(index, ["--permission-mode"]);
-      if (mode === "bypassPermissions" || mode === "auto") hits.add(`--permission-mode ${mode}`);
-      return;
-    }
-    if (["--dangerously-bypass-approvals-and-sandbox", "--yolo"].includes(arg)) hits.add(arg);
-    if (valued(index, ["--sandbox", "-s"]) === "danger-full-access") hits.add("--sandbox danger-full-access");
-    const override = valued(index, ["-c", "--config"]);
-    if (override !== undefined && overrideValue(override, "sandbox_mode") === "danger-full-access") hits.add(`-c sandbox_mode="danger-full-access"`);
+    if (["--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"].includes(arg)) hits.push(arg);
+    let mode: string | undefined;
+    if (arg === "--permission-mode") mode = args[index + 1];
+    else if (arg.startsWith("--permission-mode=")) mode = arg.slice("--permission-mode=".length);
+    if (mode === "bypassPermissions" || mode === "auto") hits.push(`--permission-mode ${mode}`);
   });
-  return [...hits];
+  return hits;
+}
+
+// Codex: an override, --sandbox, or -s is reported unless its value reads as exactly one of the allowed modes.
+// This is inverted on purpose. A hand-written reader cannot cover every TOML spelling, so an unusual but valid
+// spelling of an allowed mode can be reported too. That costs one warning line.
+function codexHits(args: string[]): string[] {
+  const hits: string[] = [];
+  args.forEach((arg, index) => {
+    if (arg === "--dangerously-bypass-approvals-and-sandbox") hits.push(arg);
+    // --sandbox MODE, --sandbox=MODE, -s MODE, -sMODE
+    let mode: string | undefined;
+    if (arg === "--sandbox" || arg === "-s") mode = args[index + 1];
+    else if (arg.startsWith("--sandbox=")) mode = arg.slice("--sandbox=".length);
+    else if (arg.startsWith("-s") && !arg.startsWith("--")) mode = arg.slice(2);
+    if (mode !== undefined && !CODEX_SANDBOX_ALLOWED.has(mode)) hits.push(`--sandbox ${mode}`);
+    // -c KEY=VALUE, --config KEY=VALUE, --config=KEY=VALUE, -cKEY=VALUE
+    let override: string | undefined;
+    if (arg === "-c" || arg === "--config") override = args[index + 1];
+    else if (arg.startsWith("--config=")) override = arg.slice("--config=".length);
+    else if (arg.startsWith("-c") && !arg.startsWith("--")) override = arg.slice(2);
+    const value = override === undefined ? undefined : sandboxModeOverride(override);
+    if (value !== undefined && !CODEX_SANDBOX_ALLOWED.has(value)) hits.push(`-c sandbox_mode=${JSON.stringify(value)}`);
+  });
+  return hits;
+}
+
+// Launch arguments the ceiling conflicts with. See claudeHits and codexHits for the rules.
+export function forbiddenLaunchFlags(provider: CeilingProvider, args: string[]): string[] {
+  return [...new Set(provider === "claude" ? claudeHits(args) : codexHits(args))];
 }
 
 export function checkCeiling(input: CeilingCheckInput): CeilingLine[] {
@@ -198,9 +225,9 @@ export function checkCeiling(input: CeilingCheckInput): CeilingLine[] {
     else line("writable", "ok", "a regular root-owned file, not group- or world-writable, under root-owned directories");
 
     const template = fs.read(templatePath);
-    // Only a regular file is read. Opening a pipe or a device here would block, and the warning above would never print.
-    if (installed.kind !== "file") {
-      line("hash", "changed", `${systemPath} was not read: it is not a regular file`);
+    // The ceiling is not read while any placement check fails. Whoever controls the path could swap in other bytes.
+    if (problems.length > 0) {
+      line("hash", "writable", `not read: ${systemPath} is not in a safe place (see the writable line), so its hash is not computed`);
     } else if (!template) {
       line("hash", "missing", `shipped template not found at ${templatePath}; this release cannot verify the ceiling`);
     } else {
@@ -216,8 +243,9 @@ export function checkCeiling(input: CeilingCheckInput): CeilingLine[] {
   }
 
   const forbidden = forbiddenLaunchFlags(provider, input.launchArgs);
+  const note = provider === "codex" ? "; a sandbox_mode value is reported unless it reads as exactly read-only or workspace-write, so a valid but unusual spelling can be a false positive" : "";
   if (forbidden.length > 0)
-    line("profile", "conflict", `configured launch profile uses ${forbidden.join(", ")}, which this ceiling forbids`);
+    line("profile", "conflict", `configured launch profile uses ${forbidden.join(", ")}, which this ceiling forbids${note}`);
   else line("profile", "ok", "no configured launch flag that this ceiling forbids");
 
   return lines;

@@ -588,7 +588,7 @@ type Replaces = OutcomePayload["replaces"];
 /**
  * A row's point: `start` with no replacement, `escalation` for an escalation's replacement, and otherwise the point of
  * the replaced member's row, which `predecessorPoint` gives. A legacy row, a scout row, or a row with no point gives null.
- * Attempt 0 is the blank row of a task integrated with no member start seen: its point is unknown, so it is never `start`.
+ * Attempt 0 is the blank row of a member whose start was never seen: its point is unknown, so it is never `start`.
  */
 function pointOf(base: PointBase, predecessorPoint: (outcomeId: string) => RoutingPointValue | null): RoutingPointValue | null {
   if (base.source === "legacy" || base.role !== "implementer" || base.attemptIndex === 0) return null;

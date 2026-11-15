@@ -1853,14 +1853,19 @@ export class TeamService {
     await this.invalidatePermissionDecisions(stored, "The team resumed under a new revision.");
     run.status = "planning"; run.reason = undefined; run.blockCode = undefined;
   }
-  /** Pause or cancel: active members stop on the next pass. The owner's action and the owner's halt both use it. */
-  private async stopRun(stored: Stored, action: "pause" | "cancel") {
+  /**
+   * Pause or cancel: active members stop on the next pass. The owner's action and the owner's halt both use it. A halt
+   * passes its mark, which is set together with the paused status, before the first save on this path: no record is
+   * ever paused by the halt without the mark, and no record carries the mark without the pause.
+   */
+  private async stopRun(stored: Stored, action: "pause" | "cancel", ownerHalt?: Stored["ownerHalt"]) {
     const run = stored.run;
     if (run.recovery && run.recovery.status !== "exhausted") {
       run.recovery.status = "exhausted";
       run.recovery.source = { ...run.recovery.source, code: `owner-${action}`, reason: `The owner ${action} the team before automatic recovery finished.` };
     }
     run.status = action === "pause" ? "paused" : "cancelled"; stored.halt = action;
+    if (ownerHalt) stored.ownerHalt = ownerHalt;
     await this.invalidatePermissionDecisions(stored, `The team was ${action} before the permission request could be answered.`);
     run.reason = "Stopping active team members; any human input lease remains authoritative.";
     this.commands.get(run.id)?.abort();
@@ -1877,9 +1882,8 @@ export class TeamService {
         const run = stored.run;
         if (!HALT_RUNNING_TEAM.has(run.status) || !covers([run.projectId], run.id)) continue;
         try {
-          await this.stopRun(stored, "pause");
+          await this.stopRun(stored, "pause", { haltId: mark.haltId, reason: mark.reason });
           run.reason = mark.reason;
-          stored.ownerHalt = { haltId: mark.haltId, reason: mark.reason };
           this.event(stored, `Team paused: ${mark.reason}`); this.save(stored);
           outcomes.push({ kind: "team", id: run.id, title: run.title, result: "paused" });
         } catch (error) { outcomes.push(pauseFailure("team", run.id, run.title, error)); }
@@ -1942,9 +1946,8 @@ export class TeamService {
       const stored = this.record(id), run = stored.run;
       if (stored.ownerHalt?.haltId === token) return run.status === "paused";
       if (!HALT_RUNNING_TEAM.has(run.status)) return false;
-      await this.stopRun(stored, "pause");
+      await this.stopRun(stored, "pause", { haltId: token, reason });
       run.reason = reason;
-      stored.ownerHalt = { haltId: token, reason };
       this.event(stored, `Team paused: ${reason}`); this.save(stored);
       return true;
     });

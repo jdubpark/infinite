@@ -252,8 +252,12 @@ halt as its reason. It pauses only the subteams that are working when the pause
 reaches them; a subteam that waits for input stays as it is. A release resumes the
 mission unless the owner acted on it during the halt or its deadline has passed,
 in which case it stays paused and says why. The mission then resumes only the
-subteams that the halt paused and that nobody has acted on since; any owner
-action on a subteam takes precedence. A `needs-input` mission is
+subteams that the halt paused and that nobody has acted on since. An owner
+action on a subteam takes precedence once the halt's pause has reached it; a
+pause still on its way, or repeated after a restart, pauses a working subteam
+even if the owner acted on it in the meantime. The release withdraws every halt
+pause not yet delivered, and a mission that stays paused sends its ordinary
+pause in its place, as the owner's pause of a mission does. A `needs-input` mission is
 not paused, but no coordinator attempt starts while any of its repositories is
 halted, and no subteam starts in a halted repository.
 

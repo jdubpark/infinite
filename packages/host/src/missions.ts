@@ -409,11 +409,11 @@ export class MissionService {
         try {
           if (mission.status !== "paused" || mission.revision !== mark.revision) {
             if (mission.status === "paused" && isHaltReason(mission.reason)) mission.reason = LEFT_PAUSED;
-            stored.ownerHalt = undefined; this.save(stored);
+            this.endHaltMark(stored, mark, mission.status === "paused"); this.save(stored);
             outcomes.push({ ...base, result: "left", reason: LEFT_AS_IS }); continue;
           }
           if (keep) {
-            stored.ownerHalt = undefined; mission.reason = KEPT_PAUSED; this.save(stored);
+            this.endHaltMark(stored, mark, true); mission.reason = KEPT_PAUSED; this.save(stored);
             outcomes.push({ ...base, result: "kept", reason: KEPT_PAUSED }); continue;
           }
           const other = heldBy(mission.repoProjectIds);
@@ -423,20 +423,20 @@ export class MissionService {
           }
           if (Date.now() >= this.deadlineMs(stored, Date.now())) {
             const reason = "This mission's time limit has expired. Start a new mission to approve more time.";
-            stored.ownerHalt = undefined; mission.reason = releaseRefusal(reason); this.save(stored);
+            this.endHaltMark(stored, mark, true); mission.reason = releaseRefusal(reason); this.save(stored);
             outcomes.push({ ...base, result: "refused", reason }); continue;
           }
           mission.revision++; mission.status = "working"; mission.reason = undefined;
-          // A halt pause that never reached its subteam is withdrawn. Each subteam the halt paused gets a resume that
-          // its own queue applies only while it is still paused under this halt's token.
-          stored.ops = stored.ops.filter(op => !(op.kind === "pause" && op.halt));
-          for (const teamId of mark.children) {
+          // Each subteam the halt paused gets a resume that its own queue applies only while it is still paused under
+          // this halt's token. So does each subteam of a withdrawn pause, which a restart may have left unrecorded
+          // after the pause reached it; one the pause never reached does not carry the token and is not touched.
+          const withdrawn = this.endHaltMark(stored, mark, false);
+          for (const teamId of new Set([...mark.children, ...withdrawn])) {
             const subtask = mission.subtasks.find(item => item.teamId === teamId && item.status === "running");
             if (subtask) this.queueOp(stored, { kind: "resume", subtaskId: subtask.id, teamId, halt: { token: mark.token } });
           }
           stored.inbox.push({ type: "resumed" });
           this.settle(stored);
-          stored.ownerHalt = undefined;
           this.event(stored, "Mission resumed: the owner released the halt."); this.save(stored);
           outcomes.push({ ...base, result: "resumed" });
         } catch (error) { outcomes.push({ ...base, result: "refused", reason: error instanceof Error ? error.message : "The mission could not resume." }); }
@@ -556,6 +556,21 @@ export class MissionService {
     if (!live.has(mission.status)) return;
     mission.status = mission.decisions.some(decision => !decision.answer) ? "needs-input" : mission.subtasks.length ? "working" : "planning";
     mission.reason = undefined;
+  }
+  /**
+   * Ends the mission's halt mark. Every halt pause under its token that has not reached its subteam is withdrawn, so
+   * none arrives once no release owns the token. While the mission stays paused, each of those subteams gets the
+   * mission's ordinary pause instead, the one the owner's pause of a mission queues: it carries no halt token, it
+   * skips a subteam that is already paused, blocked, or finished, and the owner's resume of the mission resumes it.
+   * Returns the subteams whose halt pause was withdrawn.
+   */
+  private endHaltMark(stored: Stored, mark: NonNullable<Stored["ownerHalt"]>, staysPaused: boolean) {
+    const withdrawn = stored.ops.filter(op => op.kind === "pause" && op.halt?.token === mark.token);
+    stored.ops = stored.ops.filter(op => !withdrawn.includes(op));
+    if (staysPaused) for (const op of withdrawn)
+      if (!stored.ops.some(item => item.kind === "pause" && item.teamId === op.teamId)) this.queueOp(stored, { kind: "pause", subtaskId: op.subtaskId, teamId: op.teamId });
+    stored.ownerHalt = undefined;
+    return withdrawn.map(op => op.teamId);
   }
   private queueOp(stored: Stored, op: Omit<ChildOp, "requestId">) {
     // A cancel supersedes any earlier action on the same subteam, and a later pause supersedes a halt's resume.

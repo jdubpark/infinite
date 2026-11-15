@@ -315,6 +315,7 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
     releaseStop: async (n: number) => { held.delete((await attempt(n)).sessionId); },
     /** Subteam resumes are refused as busy and retried until released. */
     holdResume: () => { resumeBusy = true; },
+    releaseResume: () => { resumeBusy = false; },
     /** Releases the held stop and resume together, so one tick applies the resume and then consumes the report. */
     releaseStopAndResume: async (n: number) => { const sessionId = (await attempt(n)).sessionId; held.delete(sessionId); resumeBusy = false; },
     stops: async (n: number) => { const sessionId = (await attempt(n)).sessionId; return stops.filter(item => item === sessionId).length; },

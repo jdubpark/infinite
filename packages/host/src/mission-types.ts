@@ -21,6 +21,9 @@ export const createMissionSchema = z.object({
 export type CreateMission = z.infer<typeof createMissionSchema>;
 export const missionActionSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict();
 export const missionTextSchema = missionActionSchema.extend({ text: z.string().trim().min(1).max(8000) }).strict();
+/** The owner approves more working time: up to 24 hours per extension. */
+export const missionExtendSchema = missionActionSchema.extend({ minutes: z.number().int().min(5).max(1440) }).strict();
+export type MissionExtend = z.infer<typeof missionExtendSchema>;
 
 /** One unit of work the main coordinator hands to a single-repository subteam. */
 export const missionSubtaskPlanSchema = z.object({
@@ -119,6 +122,9 @@ export interface Mission {
   revision: number;
   status: MissionStatus;
   reason?: string;
+  /** `deadline` while the mission is blocked because its approved time ran out: its subteams are paused, their
+   * workspaces are kept, and the owner may extend it. Absent for every other status or reason. */
+  stopReason?: "deadline";
   createdAt: string;
   updatedAt: string;
   lineup: TeamLineup;

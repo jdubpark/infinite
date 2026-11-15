@@ -144,6 +144,10 @@ test("the board and mission routes enforce roles and report an unconfigured host
     assert.deepEqual(board.body, { items: [] });
     const request = { requestId: randomUUID(), groupId: "rehearsal", objective: "Add a feature" };
     assert.equal((await host.fetchApi("/missions", "controller", request)).status, 403);
+    const extension = { requestId: randomUUID(), revision: 1, minutes: 10 };
+    const missionId = randomUUID();
+    assert.equal((await host.fetchApi(`/missions/${missionId}/extend`, "controller", extension)).status, 403);
+    assert.notEqual((await host.fetchApi(`/missions/${missionId}/extend`, "owner", extension)).status, 403, "The extension route is available only after owner authorization");
     const refused = await host.fetchApi("/missions", "owner", request);
     assert.equal(refused.status, 409);
     assert.equal(refused.body.code, "missions-not-configured");

@@ -204,6 +204,75 @@ test("new goal and child issues use the configured Linear project and reject mis
   }
 });
 
+test("goal and feature comments begin with the configured report name", { timeout: 90000 }, async () => {
+  const linear = await startLinearServer();
+  const root = mkdtempSync(join(tmpdir(), "infinite-linear-name-"));
+  const source = join(root, "source"), receipts = join(root, "receipts");
+  mkdirSync(join(source, "features"), { recursive: true }); mkdirSync(receipts, { mode: 0o700 });
+  writeFileSync(join(source, "features/progress.json"), '{"completed":0}\n');
+  writeFileSync(join(source, "check.mjs"), 'import assert from "node:assert/strict";\nassert.ok(true);\n');
+  git(source, "init", "--initial-branch=main"); git(source, "add", "features", "check.mjs");
+  git(source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial fixture");
+  const apiKeyFile = join(root, "linear-key"); writeFileSync(apiKeyFile, linear.apiKey, { mode: 0o600 });
+  const host = await startHost({ agents: {
+    claude: { command: process.execPath, args: [resolve("tests/fixtures/goal-agent.mjs"), "no-change", receipts, "claude"] },
+    codex: { command: process.execPath, args: [resolve("tests/fixtures/goal-agent.mjs"), "no-change", receipts, "codex"] },
+  }, config: {
+    teams: { workspaceDir: join(root, "teams"), lineup },
+    linear: { apiKeyFile, endpoint: linear.endpoint, reportName: "Northwind" },
+    projects: [{ id: "rehearsal", name: "Rehearsal", path: source,
+      team: { checks: [{ command: process.execPath, args: ["check.mjs"] }] },
+      linear: { teamId: linear.teamId } }],
+  } });
+  try {
+    const created = await host.fetchApi("/goals", "owner", { requestId: randomUUID(), projectId: "rehearsal", title: "Review progress", objective: "Review the progress fixture", successCriteria: "Record whether more work is justified", allowedPaths: ["features"], maxMinutes: 5 });
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    await waitFor(async () => [...linear.comments.values()].map(item => item.body), bodies => bodies.some(body => body.startsWith("Northwind goal execution\n")) && bodies.some(body => body.startsWith("Northwind feature execution\n")), 60000);
+    assert.ok([...linear.comments.values()].every(item => !/^Infinite (goal|feature) execution/.test(item.body)));
+  } finally {
+    await host.stop(); await linear.close(); rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a status comment already sent under the default name is not posted again after the name is set", { timeout: 90000 }, async () => {
+  const linear = await startLinearServer();
+  const root = mkdtempSync(join(tmpdir(), "infinite-linear-name-"));
+  const source = join(root, "source"), receipts = join(root, "receipts");
+  mkdirSync(join(source, "features"), { recursive: true }); mkdirSync(receipts, { mode: 0o700 });
+  writeFileSync(join(source, "features/progress.json"), '{"completed":0}\n');
+  writeFileSync(join(source, "check.mjs"), 'import assert from "node:assert/strict";\nassert.ok(true);\n');
+  git(source, "init", "--initial-branch=main"); git(source, "add", "features", "check.mjs");
+  git(source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial fixture");
+  const apiKeyFile = join(root, "linear-key"); writeFileSync(apiKeyFile, linear.apiKey, { mode: 0o600 });
+  const host = await startHost({ agents: {
+    claude: { command: process.execPath, args: [resolve("tests/fixtures/goal-agent.mjs"), "no-change", receipts, "claude"] },
+    codex: { command: process.execPath, args: [resolve("tests/fixtures/goal-agent.mjs"), "no-change", receipts, "codex"] },
+  }, config: {
+    teams: { workspaceDir: join(root, "teams"), lineup },
+    linear: { apiKeyFile, endpoint: linear.endpoint },
+    projects: [{ id: "rehearsal", name: "Rehearsal", path: source,
+      team: { checks: [{ command: process.execPath, args: ["check.mjs"] }] },
+      linear: { teamId: linear.teamId } }],
+  } });
+  try {
+    const created = await host.fetchApi("/goals", "owner", { requestId: randomUUID(), projectId: "rehearsal", title: "Review progress", objective: "Review the progress fixture", successCriteria: "Record whether more work is justified", allowedPaths: ["features"], maxMinutes: 5 });
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    await waitFor(async () => [...linear.comments.values()].filter(item => item.body.startsWith("Infinite goal execution\n")), list => list.length > 0, 60000);
+    await host.stopApi();
+    host.config.linear = { apiKeyFile, endpoint: linear.endpoint, reportName: "Northwind" };
+    writeFileSync(join(host.root, "config.json"), JSON.stringify(host.config));
+    await host.start();
+    await waitFor(async () => (await host.fetchApi("/goals")).body, body => body.goals.length > 0, 15000);
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    // The feature comment legitimately changes text across the restart, so only the goal comment, whose text is stable, is compared.
+    const all = [...linear.comments.values()].map(item => item.body);
+    assert.ok(all.some(body => body.startsWith("Infinite goal execution\n")), "The goal comment was sent under the default name");
+    assert.ok(!all.some(body => body.startsWith("Northwind goal execution\n")), "The renamed host does not post the same goal status again");
+  } finally {
+    await host.stop(); await linear.close(); rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("legacy tracking baselines survive restart while changed requirements still block", { timeout: 90000 }, async () => {
   const linear = await startLinearServer();
   const root = mkdtempSync(join(tmpdir(), "infinite-linear-baseline-"));

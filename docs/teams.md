@@ -1661,7 +1661,9 @@ delivery events; see the [decision log](cli.md#permission-decision-log).
 
 `infinite team revoke-permissions TEAM_ID` returns one run's requests to the
 owner. `infinite permissions revoke` ends a workspace's delegation: its
-pending decisions are retired and never applied.
+pending decisions are retired and never applied. The owner's halt stops the
+permission agent for the projects it covers: no reviewer turn starts and no
+recorded verdict is delivered until the release.
 
 A session outside a team run is served when the host owns its terminal. A
 laptop-execution session, a cmux session and a native-UI session stay with the

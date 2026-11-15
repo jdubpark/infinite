@@ -452,6 +452,14 @@ authority, and that no person holds input control. An uncertain delivery is
 not repeated, also after a restart. A dialog that the host can answer in
 neither direction goes to the owner.
 
+The owner's halt stops the permission agent as it stops every other launch.
+While a halt covers a request's project, no reviewer turn starts, and a
+verdict that was recorded before the halt is not delivered. A dialog that was
+pending is handed to the agent again after the release and decided from the
+evidence of that time. A host halt, or a halt record that the host cannot
+read, also holds every reviewer launch of a replay. A headless call that
+arrives under a halt is denied with `unavailable`.
+
 A request that waits for the owner because of a class rule or an `owner`
 verdict is pushed with the host's class identifier in parentheses, for example
 `(production-or-staging)`. The notifier shows only an identifier from the
@@ -480,9 +488,6 @@ Limits that remain:
 - The replay set that ships with the host has twenty synthetic cases. A host
   becomes ready only after the owner runs a replay with at least `minCases`
   labelled cases (default 100).
-- A host-wide owner halt does not exist yet. The pipeline and the reviewer
-  launch gate each have a hold input, and nothing sets it. A team run's own
-  halt, `team revoke-permissions` and `permissions revoke` work.
 - These requests are not served and are handled as before: headless Codex and
   OpenCode sessions, a session whose root-owned launcher adds `--print`
   itself, and, for sessions outside team runs, yes-no dialogs and collapsed

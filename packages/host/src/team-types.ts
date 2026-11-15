@@ -10,6 +10,7 @@ import type { UsageTotals } from "./usage.js";
 import type { UsageRollup } from "./team-usage.js";
 import type { ProviderLimit } from "./provider-limits.js";
 import type { AutonomyMode } from "./autonomy.js";
+import type { InterruptClass, RejectCode } from "./permission-policy.js";
 
 export const teamCommandSchema = z.object({
   command: z.string().min(1).max(4096).refine(value => !value.includes("\0")),
@@ -106,6 +107,25 @@ export type TeamPermissions = z.infer<typeof teamPermissionsSchema>;
 export function currentPermissions(saved: TeamPermissions): TeamPermissions {
   if (!LEGACY_DEFAULT_PERMISSION_SCOPES.includes(saved.scope)) return saved;
   return { ...saved, scope: DEFAULT_PERMISSION_SCOPE, maxDecisions: saved.maxDecisions === 10 ? DEFAULT_PERMISSION_LIMIT : saved.maxDecisions };
+}
+/**
+ * One permission-agent result for a member's dialog, as run status shows it. Host fields only: the
+ * model's note stays in the permission journal and never reaches a run, an agent or a client.
+ */
+export interface TeamPermissionAgentDecision {
+  /** The journal decision. Absent for a request that went stale before a decision was recorded. */
+  decisionId?: string;
+  requestId: string;
+  memberId: string;
+  sessionId: string;
+  role: TeamRole;
+  taskId?: string;
+  promptId: number;
+  result: "allowed" | "rejected" | "owner" | "undeliverable" | "stale";
+  code?: RejectCode;
+  interruptClass?: InterruptClass;
+  delivery?: "receipt" | "refusal" | "uncertain";
+  at: string;
 }
 export interface TeamPermissionDecision {
   id: string;
@@ -207,6 +227,8 @@ export const teamProjectSchema = z.object({
   /** The private feature map. Read at acceptance; never sent to a member. No default, so the authority digest is unchanged when unset. */
   features: featureMapSchema.optional(),
   eval: evalProjectSchema.optional(),
+  /** The objective switch. No default: an absent key leaves every routine digest and prompt unchanged. */
+  objective: z.strictObject({ prompts: z.enum(["on", "off"]) }).optional(),
 }).strict().superRefine((project, context) => {
   if (project.establishChecks ? project.checks.length > 0 : project.checks.length === 0)
     context.addIssue({ code: "custom", path: ["checks"], message: "Configure required checks, or explicitly authorize the team to establish them with an empty checks array." });
@@ -341,6 +363,33 @@ const taskId = z.string().regex(/^[a-z][a-z0-9-]{0,39}$/);
 export const taskIdSchema = taskId;
 const ownedPath = z.string().min(1).max(300).refine(value => !value.startsWith("/") && !value.includes("\\") && !value.includes("\0") && !value.split("/").some(part => part === ".." || part === ".git" || part === "." || part === ""), "Use a repository-relative file or directory without glob syntax").refine(value => !/[*?\[\]:]/.test(value));
 export const ownedPathSchema = ownedPath;
+export const RECORD_DIGEST_BYTES = 6 * 1024;
+export const RECORD_LABEL_BYTES = 120;
+/** Part 8's record digest. `c0` is first and its statement is empty: its text is the context's `successCriteria`. */
+export const recordDigestSchema = z.strictObject({
+  version: z.number().int().min(1).max(1_000_000),
+  criteria: z.array(z.strictObject({
+    id: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/), // the record's ID_RE, copied: importing objective-types here would close an import cycle
+    statement: z.string(), // "" for c0; 1 to 1,000 bytes otherwise
+    check: z.string(), // 1 to RECORD_LABEL_BYTES bytes
+    producer: z.enum(["host", "evaluator", "owner"]),
+  })).min(1).max(8),
+}).superRefine((digest, context) => {
+  const [first, ...rest] = digest.criteria;
+  if (first?.id !== "c0" || rest.some(criterion => criterion.id === "c0")) context.addIssue({ code: "custom", path: ["criteria"], message: "The record digest must start with c0 and hold it once." });
+  if (first && first.statement !== "") context.addIssue({ code: "custom", path: ["criteria", 0, "statement"], message: "c0 carries its text in the goal context, so its statement is empty." });
+  rest.forEach((criterion, index) => {
+    const bytes = Buffer.byteLength(criterion.statement);
+    if (bytes < 1 || bytes > 1000) context.addIssue({ code: "custom", path: ["criteria", index + 1, "statement"], message: "A criterion statement is 1 to 1,000 bytes." });
+  });
+  digest.criteria.forEach((criterion, index) => {
+    const bytes = Buffer.byteLength(criterion.check);
+    if (bytes < 1 || bytes > RECORD_LABEL_BYTES) context.addIssue({ code: "custom", path: ["criteria", index, "check"], message: "A check label is 1 to 120 bytes." });
+  });
+  if (recordDigestBytes(digest) > RECORD_DIGEST_BYTES) context.addIssue({ code: "custom", path: ["criteria"], message: "The record digest is over 6 KiB." });
+});
+export type RecordDigest = z.infer<typeof recordDigestSchema>;
+export function recordDigestBytes(digest: RecordDigest): number { return Buffer.byteLength(JSON.stringify(digest)); }
 export const teamGoalContextSchema = z.object({
   id: z.uuid(), revision: z.number().int().min(1), cycle: z.number().int().min(1),
   successCriteria: z.string().trim().min(1).max(8000),
@@ -354,6 +403,8 @@ export const teamGoalContextSchema = z.object({
   extendMinutes: z.number().int().min(0).max(240).optional(), ceilingAt: z.iso.datetime().optional(),
   /** Set only after an explicit owner extension to distinguish it from an unapproved deadline mismatch. */
   ownerExtendedDeadlineAt: z.iso.datetime().optional(),
+  /** The record digest pinned for this run; absent when the objective switch is off or the record was unreadable. */
+  record: recordDigestSchema.optional(),
 }).strict();
 export type TeamGoalContext = z.infer<typeof teamGoalContextSchema>;
 export const teamEvidenceSchema = z.object({ source: z.string().trim().min(1).max(1000), observation: z.string().trim().min(1).max(2000) }).strict();
@@ -468,6 +519,8 @@ export interface TeamMember extends TeamAssignment {
   stopRequestId: string;
   /** Why the host stopped this member without a report, such as a provider usage limit. */
   stoppedReason?: string;
+  /** The permission agent locked this member's assignment: it repeated a rejected request. A fixed host status. */
+  permissionBlocked?: { code: "locked"; at: string };
   /** The member clone was removed under the retention policy after its result was integrated or its run settled. */
   workspaceRemovedAt?: string;
   /** Confirmed process retirement for a recording-failed reviewer; its original journal remains sealed. */
@@ -551,6 +604,8 @@ export interface TeamRun {
   permissionDecisions?: TeamPermissionDecision[];
   /** Bounded diagnostic recovery records. These never confer permission authority. */
   permissionRecovery?: TeamPermissionRecoveryState;
+  /** The permission agent's results for this run's member dialogs, newest last, bounded. */
+  permissionAgentDecisions?: TeamPermissionAgentDecision[];
   /** Owner opt-in is pinned at creation; accepted commands cannot change within this run. */
   establishChecks?: true;
   verification?: TeamVerification;

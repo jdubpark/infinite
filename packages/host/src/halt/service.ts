@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { TeamError } from "../team-workspace.js";
 import type { FuseGate } from "../fuse/types.js";
 import type { Config } from "../types.js";
-import { HALT_FILE, MAX_RECEIPTS, readHaltRecord, writeHaltRecord, type HaltActor, type HaltEntry, type HaltReceipt, type HaltRecord } from "./record.js";
+import { HALT_EPOCHS_FILE, HALT_FILE, MAX_RECEIPTS, readHaltEpochs, readHaltRecord, writeHaltEpochs, writeHaltRecord, type HaltActor, type HaltEntry, type HaltEpochs, type HaltReceipt, type HaltRecord } from "./record.js";
 import { haltReason, STILL_HALTED, type HaltCheck, type HaltCovers, type HaltHeldBy, type HaltItemKind, type HaltOutcome, type HaltTarget, type HaltTargets, type LaunchHalted } from "./rules.js";
 
 export type HaltServiceOptions = { config: Config; key: Buffer; now?: () => number; /** How often an unreadable record is read again. */ retryMs?: number };
@@ -46,6 +46,9 @@ export class HaltService {
   private readonly retryMs: number;
   private record: HaltRecord = { version: 1, halts: [], receipts: [] };
   private readable = true;
+  private readonly epochsFile: string;
+  private epochs: HaltEpochs = { version: 1, host: "", projects: {} };
+  private epochsReadable = true;
   private services?: HaltServices;
   private ownedTeam: (teamId: string) => boolean = () => false;
   private serial: Promise<unknown> = Promise.resolve();
@@ -56,6 +59,7 @@ export class HaltService {
     this.now = options.now ?? Date.now;
     this.retryMs = options.retryMs ?? RETRY_MS;
     this.file = join(options.config.stateDir, HALT_FILE);
+    this.epochsFile = join(options.config.stateDir, HALT_EPOCHS_FILE);
     this.load();
   }
 
@@ -86,6 +90,16 @@ export class HaltService {
       held: projectIds => this.hold(projectIds),
       refund: launchId => fuse.refund?.(launchId),
     };
+  }
+
+  /**
+   * The halt epoch of a project: the host scope's epoch and the project's. It changes at every engage and every
+   * release that changes either scope, and neither a restart, a dropped receipt, nor a restored or removed halt record
+   * changes it. Undefined while the halt record or the epochs cannot be read.
+   */
+  epoch(projectId: string): string | undefined {
+    if (!this.readable || !this.epochsReadable) return undefined;
+    return `${this.epochs.host}:${this.epochs.projects[projectId] ?? ""}`;
   }
 
   view(): HaltView {
@@ -122,6 +136,8 @@ export class HaltService {
         ...(body.reason === undefined ? {} : { reason: body.reason }), requestId: body.requestId, by, settled: false,
       };
       const receipt: HaltReceipt = { requestId: body.requestId, action: "engage", fingerprint, haltId: entry.haltId, changed: true, at, by, settled: false, outcomes: [] };
+      // The scope's epoch is renewed first, so a verdict reached before the halt never applies after it.
+      if (!this.renewEpoch(target)) throw writeError();
       // The gate holds every new launch in scope from this write on, before any running item is paused.
       if (!this.persist({ ...this.record, halts: [...this.record.halts, entry], receipts: this.withReceipt(receipt) })) throw writeError();
       await this.finishEngage(receipt);
@@ -145,6 +161,8 @@ export class HaltService {
         requestId: body.requestId, action: "release", fingerprint, ...(existing ? { haltId: existing.haltId } : {}), changed: Boolean(existing),
         keepPaused, at, by, settled: !existing, outcomes: [],
       };
+      // A release ends a halt period: the scope's epoch is renewed first, so nothing decided before it applies after.
+      if (existing && !this.renewEpoch(target)) throw writeError();
       // The gate lifts with this write. Marked items resume after it, so nothing resumes into a closed gate.
       const halts = existing ? this.record.halts.filter(entry => entry !== existing) : this.record.halts;
       if (!this.persist({ ...this.record, halts, receipts: this.withReceipt(receipt) })) throw writeError();
@@ -159,7 +177,10 @@ export class HaltService {
    */
   start(): Promise<void> {
     if (this.timer === undefined) {
-      this.timer = setInterval(() => { if (!this.readable) void this.enqueue(() => this.recover()).catch(() => {}); }, this.retryMs);
+      this.timer = setInterval(() => {
+        if (!this.readable) void this.enqueue(() => this.recover()).catch(() => {});
+        else if (!this.epochsReadable) void this.enqueue(() => this.reloadEpochs()).catch(() => {});
+      }, this.retryMs);
       this.timer.unref();
     }
     return this.enqueue(async () => { if (this.readable) await this.finishUnsettled(); });
@@ -297,7 +318,40 @@ export class HaltService {
     return true;
   }
 
+  /**
+   * Gives the scope a new epoch and writes the epochs, before the halt record. Epochs that cannot be read are replaced
+   * with a new host epoch, which every project's epoch includes, so no earlier epoch is continued. False when the
+   * write failed; memory is unchanged then.
+   */
+  private renewEpoch(target: HaltTarget): boolean {
+    const base: HaltEpochs = this.epochsReadable ? this.epochs : { version: 1, host: randomUUID(), projects: {} };
+    const next: HaltEpochs = target.scope === "host"
+      ? { ...base, host: randomUUID() }
+      : { ...base, projects: { ...base.projects, [target.projectId]: randomUUID() } };
+    if (!writeHaltEpochs(this.epochsFile, this.key, next)) return false;
+    this.epochs = next;
+    this.epochsReadable = true;
+    return true;
+  }
+
+  /**
+   * Epochs that cannot be read leave the permission agent unready until they can, or until a halt change replaces them.
+   * Missing epochs (a new host, or a removed file) get a new host epoch, so a removed file never brings back an earlier
+   * epoch; they stay unready until it is written.
+   */
+  private reloadEpochs() {
+    const read = readHaltEpochs(this.epochsFile, this.key);
+    if (read.state === "readable") { this.epochs = read.epochs; this.epochsReadable = true; return; }
+    this.epochs = { version: 1, host: "", projects: {} };
+    this.epochsReadable = false;
+    if (read.state === "missing") {
+      const fresh: HaltEpochs = { version: 1, host: randomUUID(), projects: {} };
+      if (writeHaltEpochs(this.epochsFile, this.key, fresh)) { this.epochs = fresh; this.epochsReadable = true; }
+    }
+  }
+
   private load() {
+    this.reloadEpochs();
     const read = readHaltRecord(this.file, this.key);
     if (read.state === "unreadable") { this.readable = false; return; }
     this.readable = true;

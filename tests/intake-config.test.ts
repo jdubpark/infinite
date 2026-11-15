@@ -1,10 +1,12 @@
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readConfig, reportName, validateIntakeConfig } from "../packages/host/src/config.js";
 import { deterministicUuid, intakeConfigSchema, missionRequestId } from "../packages/host/src/intake-types.js";
+import { MirroredProjects } from "../packages/host/src/mirrored-projects.js";
+import { writeSealed } from "../packages/host/src/vault.js";
 
 // The host package pins zod 4; the root zod 3 has no z.uuid(), so reuse the host's UUID schema.
 const uuid = intakeConfigSchema.shape.linear.shape.teamIds.element;
@@ -165,4 +167,44 @@ test("MCP is disabled by default and supports intake without a Slack producer", 
   const file = join(root, `config-${++counter}.json`);
   writeFileSync(file, JSON.stringify({ ...baseHost, mcp }));
   assert.throws(() => readConfig(file), /MCP requires/);
+});
+
+test("MCP grants accept persisted mirrors without serializing runtime projects or writing files", () => {
+  const fixture = join(root, "mcp-mirrors");
+  mkdirSync(fixture);
+  const file = join(fixture, "config.json");
+  const raw = { ...baseHost, stateDir: join(fixture, "state"), runDir: join(fixture, "run"), sync: { homeDir: join(fixture, "home") }, intake: base };
+  writeFileSync(file, JSON.stringify(raw));
+  const { config, key } = readConfig(file);
+  const mirrors = new MirroredProjects(config, key);
+  const project = mirrors.resolve("Projects/sample");
+  const mcp = { port: 2, origin: "https://connector.example", connectors: [{ id: "assistant", name: "Assistant", tokenHash: "b".repeat(64), projectIds: [project.id] }] };
+  const writeConfig = (patch = {}) => writeFileSync(file, JSON.stringify({ ...raw, mcp, ...patch }));
+  writeConfig();
+  const snapshot = () => readdirSync(fixture, { recursive: true }).map(String).sort().map(path => {
+    const absolute = join(fixture, path), info = statSync(absolute);
+    return { path, mode: info.mode, mtimeMs: info.mtimeMs, bytes: info.isFile() ? readFileSync(absolute).toString("hex") : undefined };
+  });
+  const before = snapshot();
+  const loaded = readConfig(file).config;
+  assert.deepEqual(loaded.projects, raw.projects, "CLI config edits must not persist vault-owned projects");
+  assert.deepEqual(loaded.mcp, mcp);
+  assert.deepEqual(snapshot(), before, "validation must not change the config, vault, or project tree");
+
+  writeConfig({ mcp: { ...mcp, connectors: [{ ...mcp.connectors[0], projectIds: ["missing"] }] } });
+  assert.throws(() => readConfig(file), /MCP grants must name configured projects/);
+  writeConfig();
+  mirrors.forget(project.id);
+  assert.throws(() => readConfig(file), /MCP grants must name configured projects/);
+
+  const vault = join(raw.stateDir, "mirrored-projects.sealed");
+  writeSealed(vault, key, "mirrored-projects", { version: 2, entries: [{ id: project.id, path: "../escape" }] });
+  assert.throws(() => readConfig(file), /Choose a project below the home directory/);
+  writeFileSync(vault, "invalid sealed data");
+  assert.throws(() => readConfig(file), SyntaxError);
+  writeSealed(vault, Buffer.alloc(32, 2), "mirrored-projects", { version: 2, entries: [{ id: project.id, path: "Projects/sample" }] });
+  assert.throws(() => readConfig(file), /authenticate/);
+  writeSealed(vault, key, "mirrored-projects", { version: 2, entries: [{ id: project.id, path: "Projects/sample" }] });
+  writeConfig({ deployment: { mode: "tenant-development", tenantId: TEAM }, enableDemo: true });
+  assert.throws(() => readConfig(file), /MCP grants must name configured projects/, "multi-tenant hosts do not hydrate mirrors");
 });

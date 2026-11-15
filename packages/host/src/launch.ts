@@ -199,6 +199,116 @@ const CODEX_EVENTS = [
   "Interrupt",
 ];
 
+/** The class check answers quickly; its relay denies at 15 seconds, before this timeout could let the call through. */
+export const PERMISSION_CHECK_TIMEOUT_S = 30;
+/** Above the five-minute review bound. A timeout falls to the provider's normal flow, which denies a headless call. */
+export const PERMISSION_REQUEST_TIMEOUT_S = 360;
+
+/**
+ * The settings of a served headless Claude session. `disableAllHooks: false` in this layer outranks a project or local
+ * settings file, `--setting-sources ""` loads none of those files, and every hook command starts this host's own
+ * interpreter by absolute path. The channel hooks are separate commands from the signal relay, whose reply never
+ * becomes a provider decision.
+ */
+export function headlessChannelArgs(relayPath: string, signalHooks: boolean): string[] {
+  const development = relayPath.endsWith(".ts");
+  const run = (script: string, route: string) =>
+    [process.execPath, ...(development ? ["--import", import.meta.resolve("tsx")] : []), script, route].join(" ");
+  const channel = join(dirname(relayPath), development ? "permission-hook.ts" : "permission-hook.js");
+  const signal = { type: "command", command: run(relayPath, "claude"), timeout: 10 };
+  const check = { type: "command", command: run(channel, "check"), timeout: PERMISSION_CHECK_TIMEOUT_S };
+  const decide = { type: "command", command: run(channel, "request"), timeout: PERMISSION_REQUEST_TIMEOUT_S };
+  const hooks: Record<string, { hooks: object[] }[]> = {};
+  for (const event of CLAUDE_EVENTS) {
+    // The signal relay would open a hook-only prompt for each PermissionRequest and push the owner while the
+    // permission agent decides it. The channel's own hook handles that event; the worker shows what waits.
+    const relayed = signalHooks && event !== "PermissionRequest";
+    const handlers = [...(relayed ? [signal] : []), ...(event === "PreToolUse" ? [check] : event === "PermissionRequest" ? [decide] : [])];
+    if (handlers.length) hooks[event] = [{ hooks: handlers }];
+  }
+  return ["--setting-sources", "", "--settings", JSON.stringify({ disableAllHooks: false, hooks })];
+}
+
+/** What the host can tell about a launch from the arguments it passes the provider. */
+export interface HeadlessLaunch {
+  /** The provider runs without a dialog: Claude Code `--print`, OpenCode `run`, Codex `exec`. */
+  headless: boolean;
+  /** Why the permission channel cannot serve this headless launch. Absent when it can. */
+  unservable?: string;
+  /** The launch profile's allow rules, as given. They stay in force. */
+  allowlist: string[];
+}
+
+/**
+ * Reads a launch profile. Only a Claude Code `--print` launch in the default permission mode can be served: the
+ * `PermissionRequest` hook was observed to fire there, and not under `dontAsk`. A flag that would replace the host's
+ * settings, bypass permissions, or start from another conversation makes the launch unservable.
+ */
+export function headlessLaunch(provider: Provider, profile: AgentProfile): HeadlessLaunch {
+  let args = profile.args;
+  if (/(^|\/)sudo$/.test(profile.command)) {
+    const shape = sudoShape(profile.args);
+    if (!shape.ok) return { headless: false, allowlist: [] };
+    args = shape.providerArgs;
+  }
+  if (provider === "opencode" || provider === "codex") {
+    const headless = provider === "opencode" ? args.includes("run") : args.includes("exec");
+    return headless ? { headless, allowlist: [], unservable: `${provider === "opencode" ? "OpenCode" : "Codex"} has no verified headless permission channel.` } : { headless: false, allowlist: [] };
+  }
+  if (provider !== "claude") return { headless: false, allowlist: [] };
+  const allowlist: string[] = [];
+  let headless = false, mode: string | undefined, conflict: string | undefined;
+  // A continuation flag is servable: the resumed conversation's calls reach the channel like any other. A forked or
+  // unpersisted conversation cannot be resumed in place, so a deferred call could never be returned to it.
+  const conflicts = new Set(["--settings", "--setting-sources", "--permission-prompt-tool", "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions", "--fork-session", "--no-session-persistence", "--bare", "--safe-mode"]);
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index], equals = arg.indexOf("=");
+    const flag = equals < 0 ? arg : arg.slice(0, equals);
+    if (flag === "-p" || flag === "--print") headless ||= equals < 0 || arg.slice(equals + 1) === "true";
+    else if (flag === "--permission-mode") mode = equals < 0 ? args[++index] : arg.slice(equals + 1);
+    else if (flag === "--allowedTools" || flag === "--allowed-tools") {
+      // A rule such as `Bash(git status)` keeps its spaces; only separators outside parentheses split rules.
+      if (equals >= 0) allowlist.push(...(arg.slice(equals + 1).match(/(?:[^\s,(]+(?:\([^)]*\))?)+/g) ?? []));
+      else while (index + 1 < args.length && !args[index + 1].startsWith("-")) allowlist.push(args[++index]);
+    } else if (conflicts.has(flag)) conflict ??= flag;
+  }
+  if (!headless) return { headless: false, allowlist };
+  if (conflict) return { headless, allowlist, unservable: `The launch profile sets ${conflict}, which the permission channel cannot combine with its own settings.` };
+  if (mode !== undefined && mode !== "default")
+    return { headless, allowlist, unservable: mode === "dontAsk"
+      ? "Permission mode dontAsk refuses an open call before the PermissionRequest hook fires."
+      : `Permission mode ${mode} was not verified with the permission channel.` };
+  return { headless, allowlist };
+}
+
+/**
+ * The profile that resumes a served headless conversation in place after the owner answered its deferred call: the
+ * same provider arguments without a continuation flag of their own, then `--resume` with the conversation's id.
+ */
+export function headlessResumeProfile(profile: AgentProfile, nativeSessionId: string): AgentProfile {
+  if (!/^[A-Za-z0-9_-]{1,200}$/.test(nativeSessionId)) throw new Error("Invalid native conversation id");
+  let prefix = 0;
+  if (/(^|\/)sudo$/.test(profile.command)) {
+    const shape = sudoShape(profile.args);
+    if (!shape.ok) throw new Error("The sudo provider profile cannot be resumed in place");
+    prefix = shape.options.length + 2;
+  }
+  const kept: string[] = [];
+  const rest = profile.args.slice(prefix);
+  for (let index = 0; index < rest.length; index++) {
+    const arg = rest[index], equals = arg.indexOf("=");
+    const flag = equals < 0 ? arg : arg.slice(0, equals);
+    if (flag === "--continue" || flag === "-c") continue;
+    if (flag === "--resume" || flag === "-r" || flag === "--session-id") {
+      if (equals < 0 && index + 1 < rest.length && !rest[index + 1].startsWith("-")) index++;
+      continue;
+    }
+    kept.push(arg);
+  }
+  return { ...profile, args: [...profile.args.slice(0, prefix), ...kept, "--resume", nativeSessionId] };
+}
+
 export function buildLaunch(
   provider: Provider,
   profile: AgentProfile,
@@ -211,6 +321,8 @@ export function buildLaunch(
   handoffSessionId?: string,
   trustedCwd?: string,
   entryTools?: boolean,
+  /** The host admitted this headless Claude session to the permission channel. */
+  channel = false,
 ): AgentProfile {
   const args = [...profile.args];
   // Entry tools ride the team report channel. They add no provider permission, so the profile's own decisions still apply.
@@ -267,7 +379,7 @@ export function buildLaunch(
   const relay = relayPath.endsWith(".ts")
     ? ["node", "--import", import.meta.resolve("tsx"), relayPath]
     : ["node", relayPath];
-  if (hooks && provider === "claude" && enabled.claude) {
+  if (hooks && provider === "claude" && enabled.claude && !channel) {
     // A command hook, not an HTTP hook: the relay runs in the agent's account and is the only
     // process that can read the transcript the worker asks for in its reply.
     const handler = { type: "command", command: [...relay, "claude"].join(" "), timeout: 10 };
@@ -281,6 +393,9 @@ export function buildLaunch(
     };
     args.push("--settings", JSON.stringify(settings));
   }
+  // A served headless session: the permission channel's hooks and the signal hooks in one settings layer, with no
+  // user, project or local settings loaded, so no settings file can switch them off or answer before them.
+  if (hooks && provider === "claude" && channel) args.push(...headlessChannelArgs(relayPath, enabled.claude));
   if (hooks && provider === "codex" && enabled.codex) {
     const command = [...relay, "codex"].join(" ");
     for (const event of CODEX_EVENTS)

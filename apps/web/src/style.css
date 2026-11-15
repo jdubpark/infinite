@@ -391,6 +391,8 @@ small,
   padding-left: 26px;
   font-size: 10px;
 }
+.host-status .host-permissions { min-height: 36px; margin: 8px 0 -8px 18px; padding: 4px 8px; }
+.host-status .host-permissions[aria-current="page"] { font-weight: 600; }
 .logout {
   border: 0;
   background: transparent;
@@ -1710,4 +1712,41 @@ small,
   .cost-thin { text-align: right; }
   .cost-markers { gap: 8px 16px; }
   .cost-rating { margin-left: 0; }
+}
+
+/* Permission decisions: the owner's read of the permission journal. */
+.permission-verdict { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+.permission-verdict .dot, .permission-dot { background: #8f968e; }
+.permission-verdict.allow .dot, .permission-dot.allow { background: #307d54; }
+.permission-verdict.reject { color: #9d382a; }
+.permission-verdict.reject .dot, .permission-dot.reject { background: #9d382a; }
+.permission-verdict.owner { color: #724314; }
+.permission-verdict.owner .dot, .permission-dot.owner { background: #9c761b; }
+.permission-action { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.row-top strong.permission-action { font-size: 13px; }
+.permission-detail h1.permission-action { font-size: 22px; line-height: 1.4; letter-spacing: 0; font-weight: 500; overflow-wrap: anywhere; }
+.team-run-row .permission-action { font-size: 13px; font-weight: 500; overflow-wrap: anywhere; }
+.permission-filter-fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; margin: 0 8px 10px; }
+.permission-filter-fields select { min-height: 40px; padding: 8px 10px; font-size: 12px; }
+.permission-older { margin: 0 6px 12px; }
+.permission-code { overflow-wrap: anywhere; white-space: pre-wrap; }
+.permission-control { display: contents; }
+.permission-rule { display: inline-block; margin: 0 8px 4px 0; background: #edf0e7; padding: 2px 6px; border-radius: 4px; }
+.permission-tiers, .permission-deliveries { margin: 0; padding-left: 18px; }
+.permission-tiers li, .permission-deliveries li { margin-bottom: 6px; }
+.permission-deliveries { font-size: 13px; }
+.permission-deliveries time { color: var(--muted); margin-right: 10px; font-variant-numeric: tabular-nums; }
+.permission-flags { list-style: none; margin: 0 0 12px; padding: 0; }
+.permission-flags li { display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 12px 0; border-top: 1px solid var(--rule); font-size: 13px; }
+.permission-flags li span { color: var(--muted); }
+.text-button.permission-inline { min-height: 32px; padding: 2px 4px; margin: -6px -4px; }
+.permission-cli .form-note { margin-top: 16px; }
+.permission-command { margin: 10px 0 4px; padding: 14px 16px; border-radius: 12px; background: #eef1e9; color: #334431; font: 12px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.permission-mark .error, .permission-mark [role="status"] { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 14px; }
+/* A wide screen shows the overview beside the log, so the link is for the phone, where one pane shows at a time. */
+.permission-overview-link { display: none; }
+@media (max-width: 700px) {
+  .permission-detail h1.permission-action { font-size: 18px; }
+  .permission-filter-fields select { min-height: 44px; }
+  .text-button.permission-overview-link { display: inline-flex; min-height: 44px; margin: 0 6px 4px; }
 }

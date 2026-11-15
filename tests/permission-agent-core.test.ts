@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { classify, classRulesDigest, raise } from "../packages/host/src/permission-classes.js";
 import { familyOf } from "../packages/host/src/permission-families.js";
+import { realHostPath } from "../packages/host/src/permission-shell.js";
 import { INTERRUPT_CLASSES, PERMISSION_POLICY_TEXT } from "../packages/host/src/permission-policy.js";
 import { caseRequest, replaySetSchema, type ReplayCase } from "../packages/host/src/permission-replay.js";
 import {
@@ -105,6 +106,36 @@ test("each interrupt class routes a concrete request through a class rule, and n
   assert.ok(raise(opaque, { rejectHistory: false }).includes("raise:opaque"));
   // A class that is not in force is not matched.
   assert.equal(classify(bash("gh auth login"), CLASSES.filter(name => name !== "credentials")), undefined);
+});
+
+test("a live core judges real paths, so a link inside the session root cannot hide a target outside it", () => {
+  const base = mkdtempSync(join(tmpdir(), "permission-links-"));
+  try {
+    const root = join(base, "root"), outside = join(base, "outside");
+    mkdirSync(join(root, "src"), { recursive: true });
+    mkdirSync(join(outside, "data"), { recursive: true });
+    symlinkSync(outside, join(root, "link"));
+    symlinkSync(join(outside, "new.txt"), join(root, "dangling"));
+    symlinkSync(root, join(base, "alias"));
+    const launcher = fakeLauncher(() => "no-report").launcher;
+    const live = createPermissionAgentCore({ settings: settings(), launcher, resolvePath: realHostPath });
+    const replay = createPermissionAgentCore({ settings: settings(), launcher, resolvePath: realHostPath, purpose: "replay" });
+    // The session root is given through a link: paths inside it still count as inside.
+    const at = (command: string) => bash(command, { requester: { provider: "codex", sessionRoot: join(base, "alias"), task: { title: "Tidy", text: "Remove the build output." } } });
+    const raised = (command: string) => live.raise(at(command), { rejectHistory: false });
+
+    assert.equal(live.classify(at("rm -rf link/data"), CLASSES)?.interruptClass, "destructive-outside-workspace");
+    assert.equal(live.classify(at("rm -rf src/../link/data"), CLASSES)?.interruptClass, "destructive-outside-workspace");
+    assert.equal(live.classify(at("cd link && rm -rf data"), CLASSES)?.interruptClass, "destructive-outside-workspace");
+    assert.equal(live.classify(at("rm -rf src"), CLASSES), undefined);
+    assert.ok(raised("echo done > dangling").includes("raise:outside-root"), "a dangling link names where the write lands");
+    assert.ok(raised("cat link/../data/notes.txt").includes("raise:outside-root"), "a step up from a link starts at the link's target");
+    assert.ok(!raised("cat src/index.ts").includes("raise:outside-root"));
+    assert.ok(!raised("echo done > /dev/null").includes("raise:outside-root"));
+    // A replay reads nothing from disk, so it judges the path as written.
+    assert.equal(replay.classify(at("rm -rf link/data"), CLASSES), undefined);
+    assert.equal(realHostPath(join(root, "missing", "file.txt")), join(realpathSync(root), "missing", "file.txt"));
+  } finally { rmSync(base, { recursive: true, force: true }); }
 });
 
 test("the light tier can only allow or refer, and never sees a raised request or one that cannot be allowed", async () => {

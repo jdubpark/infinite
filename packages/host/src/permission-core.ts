@@ -14,7 +14,8 @@ import {
 } from "./permission-agent-types.js";
 import type { PermissionTier } from "./evidence/permission-journal.js";
 import { profileIdentity, type PermissionAgentSettings } from "./permission-agent-config.js";
-import { classify, classRulesDigest, qualify, raise, readRequest, type HostRuleFacts } from "./permission-classes.js";
+import { classify, classRulesDigest, qualify, raise, readRequest, withRealRoots, type HostRuleFacts } from "./permission-classes.js";
+import type { PathResolver } from "./permission-shell.js";
 import { familyOf } from "./permission-families.js";
 import { INTERRUPT_CLASSES, PERMISSION_POLICY_TEXT, type InterruptClass } from "./permission-policy.js";
 import { canonicalJson } from "./evidence/crypto.js";
@@ -58,6 +59,11 @@ export interface PermissionCoreOptions {
   launcher: PermissionTurnLauncher;
   results?: ReplayResults;
   facts?: HostRuleFacts;
+  /**
+   * The host's real-path resolver. With it the class and raise rules judge real paths, so a link inside
+   * the session root cannot hide a target outside it. A replay never uses it: it reads nothing from disk.
+   */
+  resolvePath?: PathResolver;
   /** "replay" marks turn usage as a measurement. */
   purpose?: "review" | "replay";
   windowMs?: number;
@@ -105,6 +111,12 @@ export function createPermissionAgentCore(options: PermissionCoreOptions): Permi
   const purpose = options.purpose ?? "review";
   const facts = options.facts ?? {};
   const launcher = options.launcher;
+  const real = purpose === "replay" ? undefined : options.resolvePath;
+  /** The request and its reading as the host rules judge them. */
+  const read = (request: PermissionRequest) => {
+    const judged = real ? withRealRoots(request, real) : request;
+    return { judged, reading: readRequest(judged, real) };
+  };
 
   const tierRecord = (tier: PermissionTierName, profile: TeamModelProfile, startedAt: string, endedAt: string): PermissionTier =>
     ({ tier, profileId: profile.id, family: familyOf(profile) ?? "unknown", startedAt, endedAt });
@@ -131,9 +143,9 @@ export function createPermissionAgentCore(options: PermissionCoreOptions): Permi
     settings: settingsOf,
     binding: () => permissionBinding(settingsOf(), facts),
     familyOf,
-    classify: (request, interruptClasses) => classify(request, interruptClasses, facts),
+    classify: (request, interruptClasses) => { const { judged, reading } = read(request); return classify(judged, interruptClasses, facts, reading); },
     qualify,
-    raise: (request, context) => raise(request, context, readRequest(request)),
+    raise: (request, context) => { const { judged, reading } = read(request); return raise(judged, context, reading); },
 
     readiness(): PermissionReadiness {
       const settings = settingsOf();

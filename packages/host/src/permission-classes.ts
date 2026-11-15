@@ -10,7 +10,7 @@ import { matchDestructive } from "@infinite/attention";
 import type { PermissionClassMatch, PermissionQualification, PermissionRequest } from "./permission-agent-types.js";
 import type { InterruptClass } from "./permission-policy.js";
 import { canonicalJson } from "./evidence/crypto.js";
-import { inlineShellScript, quoteWord, readShell, resolveWord, type SimpleCommand } from "./permission-shell.js";
+import { inlineShellScript, quoteWord, readShell, resolveWord, type PathResolver, type SimpleCommand } from "./permission-shell.js";
 
 /** Bumped by any change to the rule code below that is not a change to the lists. */
 export const CLASS_RULES_VERSION = 1;
@@ -120,6 +120,8 @@ export interface RequestReading {
   tool: string;
   /** Path words the host could not resolve (a variable or another user's home). */
   unresolved: string[];
+  /** The resolver the targets were read through. The rules read every further path through it. */
+  resolve?: PathResolver;
 }
 
 export interface HostRuleFacts {
@@ -146,20 +148,41 @@ export function qualify(request: PermissionRequest): PermissionQualification {
   return { qualified: true };
 }
 
-export function readRequest(request: PermissionRequest): RequestReading {
+/**
+ * The request as the host rules read it under a resolver: the session and scratch roots as real paths.
+ * A root the host cannot read stays as written, so its real targets count as outside it.
+ */
+export function withRealRoots(request: PermissionRequest, real: PathResolver): PermissionRequest {
+  const requester = request.requester;
+  return { ...request, requester: { ...requester, sessionRoot: real(requester.sessionRoot) ?? requester.sessionRoot, scratchRoots: requester.scratchRoots.map(root => real(root) ?? root) } };
+}
+
+/**
+ * `resolvePath` makes every path a real host path (see `realHostPath`); the caller passes the request
+ * from `withRealRoots`. Without it paths are read as written, which is what a replay does.
+ */
+export function readRequest(request: PermissionRequest, resolvePath?: PathResolver): RequestReading {
   const tool = request.tool;
   const input = request.input ?? {};
   const root = request.requester.sessionRoot;
-  const cwdInput = typeof input.workdir === "string" ? input.workdir : typeof input.cwd === "string" ? input.cwd : undefined;
-  const cwd = cwdInput ? resolveWord(cwdInput, root) ?? root : root;
   const targets: Target[] = [];
   const unresolved: string[] = [];
   const reasons = new Set<string>();
+  // A path the host cannot read keeps its written form, and the request is opaque: the strong tier decides.
+  const real: PathResolver | undefined = resolvePath && (path => {
+    const found = resolvePath(path);
+    if (found === undefined) reasons.add("unreadable-path");
+    return found;
+  });
+  const cwdInput = typeof input.workdir === "string" ? input.workdir : typeof input.cwd === "string" ? input.cwd : undefined;
+  const cwd = cwdInput ? resolveWord(cwdInput, root, real) ?? root : root;
   const commands: SimpleCommand[] = [];
   const add = (word: string, access: Access, base: string | undefined) => {
-    const path = resolveWord(word, base);
-    if (path === undefined) { unresolved.push(word); return; }
-    if (!DEVICE_PATHS.test(path)) targets.push({ path, access, word });
+    const written = resolveWord(word, base);
+    if (written === undefined) { unresolved.push(word); return; }
+    // A device is judged as written: its real path belongs to the host process, not to the requester.
+    if (DEVICE_PATHS.test(written)) return;
+    targets.push({ path: resolveWord(word, base, real) ?? written, access, word });
   };
   if (cwdInput) add(cwdInput, "unknown", root);
 
@@ -170,13 +193,13 @@ export function readRequest(request: PermissionRequest): RequestReading {
       const argv = input.command as string[];
       source = inlineShellScript(argv) ?? argv.map(quoteWord).join(" ");
     } else source = typeof input.command === "string" ? input.command : request.action;
-    const reading = readShell(source, cwd);
+    const reading = readShell(source, cwd, real);
     for (const reason of reading.opaqueReasons) reasons.add(reason);
     for (const command of reading.commands) {
       // One level of `sh -c 'literal'` is read as the script it runs.
       const script = inlineShellScript(command.argv);
       if (script !== undefined && !command.scriptExpands) {
-        const inner = readShell(script, command.cwd ?? cwd);
+        const inner = readShell(script, command.cwd ?? cwd, real);
         for (const reason of inner.opaqueReasons) reasons.add(reason);
         for (const nested of inner.commands) commands.push({ ...nested, privileged: nested.privileged || command.privileged });
         for (const redirect of command.redirects) add(redirect.target, redirect.op.includes(">") ? "write" : "read", command.cwd ?? cwd);
@@ -187,7 +210,7 @@ export function readRequest(request: PermissionRequest): RequestReading {
     for (const command of commands) {
       const base = command.cwd ?? cwd;
       for (const redirect of command.redirects) add(redirect.target, redirect.op === "<" ? "read" : "write", base);
-      operandTargets(command, base, add);
+      operandTargets(command, base, add, real);
     }
   }
   for (const [key, value] of Object.entries(input)) {
@@ -205,16 +228,16 @@ export function readRequest(request: PermissionRequest): RequestReading {
     try { urls.push(new URL(match[0])); } catch { /* not a URL */ }
   }
   if (!request.shape.completeEvidence) reasons.add("incomplete-evidence");
-  return { commands, targets, urls, opaque: reasons.size > 0, opaqueReasons: [...reasons], shell, tool, unresolved };
+  return { commands, targets, urls, opaque: reasons.size > 0, opaqueReasons: [...reasons], shell, tool, unresolved, ...(real ? { resolve: real } : {}) };
 }
 
-function operandTargets(command: SimpleCommand, cwd: string, add: (word: string, access: Access, base: string | undefined) => void) {
+function operandTargets(command: SimpleCommand, cwd: string, add: (word: string, access: Access, base: string | undefined) => void, real?: PathResolver) {
   const { name, argv } = command;
   if (name === "cd" || name === "pushd") return;
   let base = cwd;
   if (name === "git") {
     for (let index = 1; index < argv.length; index++) {
-      if (argv[index] === "-C" && argv[index + 1]) { add(argv[index + 1], "unknown", base); base = resolveWord(argv[index + 1], base) ?? base; index++; }
+      if (argv[index] === "-C" && argv[index + 1]) { add(argv[index + 1], "unknown", base); base = resolveWord(argv[index + 1], base, real) ?? base; index++; }
       else if (argv[index].startsWith("--git-dir=") || argv[index].startsWith("--work-tree=")) add(argv[index].slice(argv[index].indexOf("=") + 1), "unknown", base);
     }
   }
@@ -306,7 +329,7 @@ const hostOf = (url: URL) => url.hostname.toLowerCase().replace(/\.$/, "");
 const hostListed = (host: string, list: readonly string[]) =>
   list.some(entry => entry.startsWith(".") ? host.endsWith(entry) || host === entry.slice(1) : host === entry);
 
-function isGlobalSettingsCommand(command: SimpleCommand, request: PermissionRequest): boolean {
+function isGlobalSettingsCommand(command: SimpleCommand, request: PermissionRequest, real?: PathResolver): boolean {
   const words = commandWords(command);
   const [name, sub, third] = [posix.basename(words[0] ?? ""), words[1], words[2]];
   const has = (...flags: string[]) => command.argv.some(arg => flags.some(flag => arg === flag || arg.startsWith(`${flag}=`)));
@@ -317,7 +340,7 @@ function isGlobalSettingsCommand(command: SimpleCommand, request: PermissionRequ
     if (has("--file", "-f")) {
       const index = command.argv.findIndex(arg => arg === "--file" || arg === "-f");
       const file = command.argv[index + 1];
-      const path = file && resolveWord(file, command.cwd ?? request.requester.sessionRoot);
+      const path = file && resolveWord(file, command.cwd ?? request.requester.sessionRoot, real);
       if (!path || !insideSession(request, path)) return true;
     }
     // A hook path or fsmonitor in the repository's own config runs code on later git commands.
@@ -391,7 +414,7 @@ const CLASS_RULES: readonly ClassRule[] = [
         const base = command.cwd ?? request.requester.sessionRoot;
         for (const target of reading.targets) if (command.words.includes(target.word) || command.redirects.some(redirect => redirect.target === target.word)) paths.push(target.path);
         // A git command with no path operand acts on its working directory.
-        if (command.name === "git") paths.push(command.argv.includes("-C") ? resolveWord(command.argv[command.argv.indexOf("-C") + 1] ?? "", base) ?? base : base);
+        if (command.name === "git") paths.push(command.argv.includes("-C") ? resolveWord(command.argv[command.argv.indexOf("-C") + 1] ?? "", base, reading.resolve) ?? base : base);
       }
       return paths.some(path => !insideSession(request, path));
     },
@@ -416,7 +439,7 @@ const CLASS_RULES: readonly ClassRule[] = [
   },
   {
     name: "class:global-settings-command", interruptClass: "global-or-account-settings",
-    test: (request, reading) => reading.commands.some(command => isGlobalSettingsCommand(command, request)),
+    test: (request, reading) => reading.commands.some(command => isGlobalSettingsCommand(command, request, reading.resolve)),
   },
 ];
 

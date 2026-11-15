@@ -4,6 +4,7 @@
  * them literally, and marks the command opaque where an effect is hidden: command substitution, eval,
  * inline interpreter code, here-documents, process substitution, or a variable in command position.
  */
+import { lstatSync, readlinkSync, realpathSync } from "node:fs";
 import { posix } from "node:path";
 
 export interface SimpleCommand {
@@ -53,7 +54,7 @@ const WRAPPERS: Record<string, ReadonlySet<string>> = {
 };
 
 /** Reads one command line. `cwd` is the directory the host assigned; a literal `cd` moves it for later commands. */
-export function readShell(source: string, cwd?: string): ShellReading {
+export function readShell(source: string, cwd?: string, real?: PathResolver): ShellReading {
   const reasons = new Set<string>();
   const tokens = lex(source, reasons);
   const commands: SimpleCommand[] = [];
@@ -66,7 +67,7 @@ export function readShell(source: string, cwd?: string): ShellReading {
     if (!command) return;
     if ((command.name === "cd" || command.name === "pushd") && command.argv.length <= 2) {
       const target = command.argv[1];
-      directory = target === undefined ? undefined : resolveWord(target, directory);
+      directory = target === undefined ? undefined : resolveWord(target, directory, real);
     }
     commands.push(command);
   };
@@ -228,7 +229,7 @@ export function quoteWord(word: string): string {
  * A literal path word resolved against `cwd`. `~` and `$HOME` stay symbolic (`~/...`) because the
  * requester's home is not the host's fact. Undefined when the word has another expansion or no base.
  */
-export function resolveWord(word: string, cwd: string | undefined): string | undefined {
+export function resolveWord(word: string, cwd: string | undefined, real?: PathResolver): string | undefined {
   const home = /^(?:~|\$HOME|\$\{HOME\})(?=\/|$)/.exec(word);
   if (home) {
     const rest = word.slice(home[0].length);
@@ -237,6 +238,45 @@ export function resolveWord(word: string, cwd: string | undefined): string | und
   }
   if (word.includes("$") || word.includes("`")) return undefined;
   if (word.startsWith("~")) return undefined; // another user's home
-  if (posix.isAbsolute(word)) return posix.normalize(word);
-  return cwd ? posix.resolve(cwd, word) : undefined;
+  if (!posix.isAbsolute(word) && !cwd) return undefined;
+  if (!posix.isAbsolute(word) && cwd!.startsWith("~")) return `~${posix.normalize(`/${cwd!.slice(1)}/${word}`).replace(/\/$/, "")}`;
+  // The raw path keeps its `..` words, so a resolver follows a link before it steps up from it.
+  const raw = posix.isAbsolute(word) ? word : `${cwd}/${word}`;
+  return real?.(raw) ?? posix.resolve(raw);
+}
+
+/**
+ * Maps a raw absolute path, with its `..` words, to the path the host rules judge. Undefined when the
+ * host cannot establish it.
+ */
+export type PathResolver = (path: string) => string | undefined;
+
+const missing = (error: unknown) => ["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "");
+
+/**
+ * The real path of an absolute host path. Symbolic links are followed through the deepest part that
+ * exists, a dangling link is followed to where a write through it lands, and the part that does not
+ * exist is appended as written. A live decision core reads targets and session roots through it, so a
+ * link inside the session root cannot hide a target outside it. Undefined when a part cannot be read.
+ */
+export function realHostPath(path: string, depth = 0): string | undefined {
+  if (!posix.isAbsolute(path) || depth > 8) return undefined;
+  let current = path;
+  const rest: string[] = [];
+  for (let step = 0; step < 256; step++) {
+    try {
+      // The native call follows a link before it steps up from it; Node's own version removes `..` first.
+      const real = realpathSync.native(current);
+      return rest.length ? posix.join(real, ...rest) : real;
+    } catch (error) { if (!missing(error)) return undefined; }
+    let link: string | undefined;
+    try { if (lstatSync(current).isSymbolicLink()) link = readlinkSync(current); }
+    catch (error) { if (!missing(error)) return undefined; }
+    if (link !== undefined) return realHostPath([posix.isAbsolute(link) ? link : `${posix.dirname(current)}/${link}`, ...rest].join("/"), depth + 1);
+    const parent = posix.dirname(current);
+    if (parent === current) return undefined;
+    rest.unshift(posix.basename(current));
+    current = parent;
+  }
+  return undefined;
 }

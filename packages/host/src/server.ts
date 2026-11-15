@@ -77,6 +77,7 @@ import { permissionRateFlags, registerPermissionReviewRoutes } from "./permissio
 import { PermissionMeasurements, permissionMeasurementsModule } from "./evidence/permission-measurements.js";
 import { hostProtectedPaths, permissionAgentSettings } from "./permission-agent-config.js";
 import { createPermissionAgentCore } from "./permission-core.js";
+import { realHostPath } from "./permission-shell.js";
 import { createCliTurnLauncher, type PermissionTurnGate } from "./permission-reviewer.js";
 import { PermissionReplayJobs } from "./permission-replay.js";
 import { PERMISSION_REPLAY_PATH, permissionAgentStatus, registerPermissionAgentRoutes } from "./permission-agent-routes.js";
@@ -306,7 +307,8 @@ export function createApp(config: Config, key: Buffer) {
     results: permissionMeasurements,
     facts: { protectedPaths: hostProtectedPaths(config, fileURLToPath(new URL("../../../", import.meta.url))) },
   };
-  const permissionCore = createPermissionAgentCore(permissionCoreOptions);
+  // The live core judges real paths. A replay core gets no resolver: it reads nothing from disk.
+  const permissionCore = createPermissionAgentCore({ ...permissionCoreOptions, resolvePath: realHostPath });
   permissionAgent.core = permissionCore;
   const permissionReplays = permissionMeasurements
     ? new PermissionReplayJobs({ core: () => createPermissionAgentCore({ ...permissionCoreOptions, purpose: "replay" }), measurements: permissionMeasurements })

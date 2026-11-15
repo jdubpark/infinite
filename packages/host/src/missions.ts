@@ -118,6 +118,12 @@ const rotationText: Record<RotationRule, string> = {
 const utcMinute = (iso: string) => `${iso.slice(0, 16).replace("T", " ")} UTC`;
 /** Marks an attempt stopped and records when, once. */
 const endAttempt = (attempt: Attempt) => { attempt.status = "stopped"; attempt.endedAt ??= now(); };
+/** Puts an attempt's consumed messages back at the front of the queues and clears them on the attempt, so they return once. */
+function returnConsumed(stored: Stored, attempt: Attempt) {
+  stored.inbox = [...(attempt.consumedInbox ?? []), ...stored.inbox];
+  stored.notes = [...(attempt.consumedNotes ?? []), ...stored.notes];
+  delete attempt.consumedInbox; delete attempt.consumedNotes;
+}
 const openFollowUps = (mission: Mission) => (mission.followUps ?? []).filter(item => item.state === "open");
 /** Settles every open follow-up of an ending mission. */
 function cancelFollowUps(mission: Mission) {
@@ -975,7 +981,13 @@ export class MissionService {
     if (!attempt || attempt.status === "stopped") return;
     if (attempt.status === "queued") {
       if (live.has(mission.status)) { await this.launch(stored, attempt); return; }
-      if (!this.launched(attempt)) { endAttempt(attempt); this.save(stored); return; }
+      if (!this.launched(attempt)) {
+        // A pause withdraws an attempt that never launched; its messages, such as a fired follow-up, wait for the
+        // attempt after resume. A blocked or cancelled mission emptied its queues when it stopped, so nothing returns.
+        endAttempt(attempt);
+        if (mission.status === "paused") returnConsumed(stored, attempt);
+        this.save(stored); return;
+      }
       attempt.status = "running";
     }
     if (attempt.status === "running") {
@@ -1016,12 +1028,16 @@ export class MissionService {
       this.save(stored); return;
     }
     endAttempt(attempt);
+    const applied = Boolean(attempt.report) && live.has(mission.status);
     if (attempt.report) {
-      if (live.has(mission.status)) { this.keepNote(stored, attempt); this.consume(stored, attempt.report, attempt); }
+      if (applied) { this.keepNote(stored, attempt); this.consume(stored, attempt.report!, attempt); }
       else this.event(stored, "A coordinator report arrived after the mission stopped; it was not applied.");
       delete attempt.note;
     } else if (attempt.missedReport && live.has(mission.status))
       this.refuse(stored, "missing", "Your previous attempt ended without a mission report. File exactly one report in every attempt; report wait when nothing needs a decision.");
+    // A consumed message is settled only by an applied report. A pause that stopped this attempt first returns its
+    // messages for the attempt after resume; a conversation resumed inside the idle window may see them twice.
+    if (!applied && mission.status === "paused") returnConsumed(stored, attempt);
     this.save(stored);
   }
   /** Keeps the newest notes within the count and length limits; the oldest go first. A refused report's note is kept too. */
@@ -1035,8 +1051,7 @@ export class MissionService {
     attempt.resumeFailed = true;
     attempt.missedReport = false;
     endAttempt(attempt);
-    stored.inbox = [...(attempt.consumedInbox ?? []), ...stored.inbox];
-    stored.notes = [...(attempt.consumedNotes ?? []), ...stored.notes];
+    returnConsumed(stored, attempt);
     this.event(stored, "The coordinator's conversation could not be resumed; a fresh attempt starts with the full mission state.");
   }
   /** Starts the next coordinator attempt once the previous one stopped and a message needs it. */

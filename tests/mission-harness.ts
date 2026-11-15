@@ -114,6 +114,8 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
   const stateReads = new Map<string, number>(), sessionStatuses = new Map<string, "running" | "exited">();
   const nativeSessions = new Map<string, { id: string; source: "hook" }>();
   const held = new Set<string>(), stops: string[] = [];
+  // While set, coordinator launches wait for host capacity with this reason, and a session not yet created does not exist.
+  let launchHold: string | undefined;
   // Each coordinator session's journaled usage records, as the provider usage readers append them.
   const usage = new Map<string, { seq: number; at: string; type: "usage"; data: unknown }[]>();
   const signal = (sessionId: string, data: Signal, at = new Date()) => {
@@ -140,7 +142,11 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
       const { runId, memberId, revision } = attempt.assignment;
       return { events: [{ data: { requestId: randomUUID(), missionId: runId, memberId, revision, ...filed } }], cursor: 1, more: false };
     },
-    meta() { return {}; },
+    meta(sessionId: string) {
+      if (launchHold !== undefined && !attempts.some(item => item.sessionId === sessionId)) throw Object.assign(new Error("No such session"), { code: "ENOENT" });
+      return {};
+    },
+    hostLoad: { held: () => launchHold },
     async state(sessionId: string) {
       stateReads.set(sessionId, (stateReads.get(sessionId) ?? 0) + 1);
       return { status: sessionStatuses.get(sessionId) ?? "running", attention: attention.get(sessionId), nativeSession: nativeSessions.get(sessionId) };
@@ -257,6 +263,8 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
     loseNextCapacityReply: () => { loseCapacityReply = true; },
     bumpNextCapacityRevision: () => { bumpCapacityRevision = true; },
     remove: () => { removed = true; },
+    /** Coordinator launches wait for host capacity with this reason until called without one. */
+    holdLaunches: (reason?: string) => { launchHold = reason; },
     attempts: () => attempts.length,
     attempt,
     confirmNative: async (n: number) => {

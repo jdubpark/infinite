@@ -659,6 +659,11 @@ test("with the tools on, a launch carries the digest, the flag, and the paragrap
     assert.equal(usage.digestBytes, Buffer.byteLength(canonicalJson(context.entries), "utf8"));
     const prompt = f.launches.find(launch => launch.requestId === implementer.sessionId)!.prompt;
     assert.ok(prompt.includes(entryInstructions("demo")), "the launch prompt carries the entry paragraph");
+
+    // The member was created after the service loaded, so only its launch can have put it in the ingest queue.
+    f.post(implementer.sessionId, "team-entry", postEnvelope(f, implementer.memberId, contract("after the launch")));
+    scheduler.ingestEntries();
+    assert.equal(entries.list(f.run.id, { kinds: ["contract"] }).entries.length, 1, "a member launched in this process is read without a restart");
   } finally { store.close(); f.close(); }
 });
 

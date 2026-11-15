@@ -1,6 +1,6 @@
 import type { TeamMember, TeamRole, TeamRun } from "../team-types.js";
 import { canonicalJson } from "./crypto.js";
-import { ENTRY_KINDS, MEMBER_ENTRY_KINDS, type EntryHead, type EntryKind, type HostEntry, type HostEntryKind } from "./entry-types.js";
+import { ADDRESSED_KIND_SQL, ENTRY_KINDS, MEMBER_ENTRY_KINDS, type EntryHead, type EntryKind, type HostEntry, type HostEntryKind } from "./entry-types.js";
 import { ENTRY_NOTICE, addressedHeads, entryDigest, type EntryDigest } from "./entry-reads.js";
 import { hostEntry, hostEntryId, hostEntrySources } from "./host-entries.js";
 import { memberEntryId, memberScopeOf, postAllowed, type MemberEntryEnvelope, type MemberEntryPost } from "./member-entry.js";
@@ -126,7 +126,7 @@ const SCHEMA_V2 = [
   "CREATE INDEX entries_by_supersedes ON entries (supersedes) WHERE supersedes IS NOT NULL",
   "ALTER TABLE member_scopes ADD COLUMN read_seq INTEGER NOT NULL DEFAULT 0",
   `CREATE INDEX entries_member_kinds ON entries (run_id) WHERE kind IN (${MEMBER_KIND_SQL})`,
-  "CREATE INDEX entries_active_by_run ON entries (run_id, seq) WHERE scope='run' AND state='active'",
+  `CREATE INDEX entries_active_by_run ON entries (run_id, seq) WHERE scope='run' AND state='active' AND kind IN (${ADDRESSED_KIND_SQL})`,
 ];
 
 /**

@@ -46,6 +46,10 @@ export type HostEntry = {
 
 /** The kinds a member may post (spec part 3). Member and host kinds are disjoint. */
 export const MEMBER_ENTRY_KINDS = ["contract", "finding", "blocker", "handoff"] as const;
+/** The kinds the default order shows a member. Report and check entries reach a member through filtered lists only. */
+export const ADDRESSED_ENTRY_KINDS = ["direction", "contract", "blocker", "handoff", "integration", "finding"] as const;
+/** The same kinds as SQL text. The default order's statement and its partial index use this one text, so SQLite matches them. */
+export const ADDRESSED_KIND_SQL = ADDRESSED_ENTRY_KINDS.map(kind => `'${kind}'`).join(", ");
 export type MemberEntryKind = typeof MEMBER_ENTRY_KINDS[number];
 
 /** What a member sees of a head: no run, revision, scope, author member id, or unread lists. */

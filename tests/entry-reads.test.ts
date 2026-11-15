@@ -11,6 +11,8 @@ import {
   ENTRY_NOTICE,
   RUN_SCAN_SQL,
   TASK_SCAN_SQL,
+  addressedHeads,
+  entryDigest,
   listForMember,
   getForMember,
   readMemberScope,
@@ -550,6 +552,24 @@ test("a filtered list over a withdrawn history reads a bounded number of rows", 
     const second = scan(store, scope, { since: first.cursor, limit: 5 }, 50);
     assert.deepEqual(second.heads.map(head => head.entryId), live);
     assert.equal(second.more, false);
+  });
+});
+
+test("the default list keeps an older member post behind many reports", () => {
+  withStore((_f, store, board) => {
+    const run = entryRun();
+    const implA = memberOf(run, hostEntryIds.implA);
+    const implB = memberOf(run, hostEntryIds.implB);
+    const scope = memberScopeOf(run, implA, 0);
+    const older = ingestOne(board, run, implB, contract("before the reports"));
+    // A long run: more host reports after the post than the default window holds.
+    insertRows(store, run.id, { kind: "report", state: "active", author: "host", authority: "receipt" }, 1_001);
+
+    const list = listOf(store, scope);
+    assert.deepEqual(list.heads.map(head => head.entryId), [older], "the post is still in the default list");
+    assert.equal(list.more, false, "the window is not full: reports are not in it");
+    const digest = store.read(db => entryDigest(addressedHeads(db, scope), 0));
+    assert.ok("counts" in digest && digest.counts.contract === 1, "the launch digest counts it");
   });
 });
 

@@ -615,6 +615,13 @@ This phase adds no Git command.
 - **A supersede of another member's entry of the same kind is refused at the route**, and a test shows it (a contract that names another task's contract: 403, no journal event). The earlier refused cases crossed kinds, so the kind check alone refused them.
 - **A reader that is already open refuses after the store's read version changes.** The check runs inside each read, and a test now reads once, changes the version through the writer, and reads again with the same reader.
 
+
+**Rulings after the fourth local review.**
+
+- **The default order keeps to the kinds it shows.** `ACTIVE_SCAN_SQL` and the index `entries_active_by_run` both carry `AND kind IN (<the six addressed kinds>)`, from one shared text (`ADDRESSED_KIND_SQL`). Host reports and checks are never superseded, so in a long run they filled the window of the 1,000 newest active rows and pushed member posts out of the default list and out of the launch digest. Test: `the default list keeps an older member post behind many reports`.
+- **A member that is launched joins the ingest queue, and a test shows it.** `with the tools on, a launch carries the digest, the flag, and the paragraph` posts from the launched member and expects the row after one pass. The join is at the top of `launch()`, the one place a queued member starts; a new member object reaches `run.members` only after an `await` in some callers, so its creation is not the place.
+- **Known and accepted.** The handoff update reads the rows of one task. The kind lists of the two partial indexes are fixed when a store migrates to version 2, so a later change of a kind list needs a migration that rebuilds its index.
+
 ## Trust boundary, and what a review checks
 
 These inputs originate outside the host:

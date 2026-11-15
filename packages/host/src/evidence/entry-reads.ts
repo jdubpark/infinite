@@ -1,6 +1,6 @@
 import type { TeamRole } from "../team-types.js";
 import { canonicalJson } from "./crypto.js";
-import type { EntryHead, EntryKind, MemberHead } from "./entry-types.js";
+import { ADDRESSED_ENTRY_KINDS, ADDRESSED_KIND_SQL, type EntryHead, type EntryKind, type MemberHead } from "./entry-types.js";
 import type { MemberListQuery, MemberScope } from "./member-entry.js";
 import type { EvidenceDb } from "./types.js";
 
@@ -21,14 +21,17 @@ export type EntryDigest =
 const COLUMNS = "seq, entry_id, at, kind, author, authority, author_member_id, state, body_bytes, supersedes, encrypted_head";
 /** A row of the run that a member may see: run scope, and not withdrawn. Its first parameter is the run id. */
 const VISIBLE = "run_id=? AND scope='run' AND state!='withdrawn'";
-/** The default order's read: the newest active run entries, through `entries_active_by_run`. */
-export const ACTIVE_SCAN_SQL = `SELECT ${COLUMNS} FROM entries WHERE run_id=? AND scope='run' AND state='active' ORDER BY seq DESC LIMIT ?`;
+/**
+ * The default order's read: the newest active run entries of the kinds it shows, through `entries_active_by_run`.
+ * Reports and checks are not in that index, so a long run's host entries cannot push member posts out of the window.
+ */
+export const ACTIVE_SCAN_SQL = `SELECT ${COLUMNS} FROM entries WHERE run_id=? AND scope='run' AND state='active' AND kind IN (${ADDRESSED_KIND_SQL}) ORDER BY seq DESC LIMIT ?`;
 /** A filtered list's scan of a run in seq order, through `entries_by_run`. Every row it reads counts toward the limit. */
 export const RUN_SCAN_SQL = `SELECT ${COLUMNS}, scope FROM entries WHERE run_id=? AND seq > ? ORDER BY seq LIMIT ?`;
 /** The same scan for one task, through `entries_by_task`. */
 export const TASK_SCAN_SQL = `SELECT ${COLUMNS}, scope FROM entries WHERE run_id=? AND task_key=? AND seq > ? ORDER BY seq LIMIT ?`;
-/** The kinds the default order reads. Report and check entries reach a member through filtered lists only. */
-const ADDRESSED_KINDS: ReadonlySet<string> = new Set(["direction", "contract", "blocker", "handoff", "integration", "finding"]);
+/** The kinds the default order reads, as a set. The statement already keeps to them; the check below stays as a guard. */
+const ADDRESSED_KINDS: ReadonlySet<string> = new Set(ADDRESSED_ENTRY_KINDS);
 
 /** A scanned row: the plain columns, and the scope the filtered scan reads for the host to check. */
 type ScannedRow = EntryRow & { scope: string };
@@ -105,7 +108,7 @@ export function pathsOverlap(a: readonly string[], b: readonly string[]): boolea
 
 /**
  * The heads addressed to a member by the default order, in six groups, each newest first. Reads the 1,000 newest
- * active rows of the run and leaves out the member's own. A head that does not open is left out and counted.
+ * active rows of the six kinds in the run and leaves out the member's own. A head that does not open is left out and counted.
  */
 export function addressedHeads(db: EvidenceDb, scope: MemberScope): { heads: MemberHead[]; unreadable: number; capped: boolean } {
   const rows = db.all<EntryRow>(ACTIVE_SCAN_SQL, scope.runId, MEMBER_SCAN_ROWS);

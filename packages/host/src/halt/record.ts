@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { z } from "zod";
 import { unseal, writeSealed } from "../vault.js";
@@ -105,49 +104,43 @@ export function writeHaltRecord(file: string, key: Buffer, record: HaltRecord): 
   }
 }
 
-/** The count of engaged halts, kept apart from the halt record so that restoring or removing that record keeps it. */
-export const HALT_COUNT_FILE = "halt-count.sealed";
-const HALT_COUNT_SEAL_SCOPE = "halt-count";
-/** Engaged halts remembered by id, newest last, so that a halt in force has its place in the count. */
-export const MAX_RECENT_HALTS = 1000;
 /**
- * How many halts the host has engaged, a hash chain over their ids in order (see `haltChain`; empty for none), and
- * the latest ids. Neither a release, a dropped receipt, nor a restored or removed halt record changes it.
+ * The halt epochs, kept apart from the halt record so that restoring or removing that record keeps them. Every engage
+ * or release that changes a scope gives that scope a new epoch, written before the record. The permission agent reads
+ * a project's epochs into the authority of each decision, so a decision reached before a halt or its release no longer
+ * applies after it.
  */
-export type HaltCount = { version: 1; engaged: number; chain: string; recent: string[] };
+export const HALT_EPOCHS_FILE = "halt-epochs.sealed";
+const HALT_EPOCHS_SEAL_SCOPE = "halt-epochs";
+/** The host scope's epoch and each project's. A project without one has never been halted on its own. */
+export type HaltEpochs = { version: 1; host: string; projects: Record<string, string> };
 
-/** The chain after one more engaged halt. The empty chain stands for a count of none. */
-export function haltChain(previous: string, haltId: string): string {
-  return createHash("sha256").update(`infinite-halt-chain\n${previous}\n${haltId}`).digest("hex");
-}
-
-const countSchema: z.ZodType<HaltCount> = z.object({
+const epochsSchema: z.ZodType<HaltEpochs> = z.object({
   version: z.literal(1),
-  engaged: z.number().int().nonnegative(),
-  chain: z.string().regex(/^(?:[0-9a-f]{64})?$/),
-  recent: z.array(z.string().min(1).max(200)).max(MAX_RECENT_HALTS),
+  host: z.string().min(1).max(100),
+  projects: z.record(z.string().min(1).max(200), z.string().min(1).max(100)),
 }).strict();
 
-export type HaltCountRead = { state: "missing" } | { state: "readable"; count: HaltCount } | { state: "unreadable" };
+export type HaltEpochsRead = { state: "missing" } | { state: "readable"; epochs: HaltEpochs } | { state: "unreadable" };
 
-/** A missing file is a count of none. Any other failure is unreadable. Never throws. */
-export function readHaltCount(file: string, key: Buffer): HaltCountRead {
+/** A missing file is a host that was never halted. Any other failure is unreadable. Never throws. */
+export function readHaltEpochs(file: string, key: Buffer): HaltEpochsRead {
   let raw: string;
   try { raw = readFileSync(file, "utf8"); }
   catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? { state: "missing" } : { state: "unreadable" }; }
   try {
-    const parsed = countSchema.safeParse(unseal<unknown>(key, HALT_COUNT_SEAL_SCOPE, raw));
-    return parsed.success ? { state: "readable", count: parsed.data } : { state: "unreadable" };
+    const parsed = epochsSchema.safeParse(unseal<unknown>(key, HALT_EPOCHS_SEAL_SCOPE, raw));
+    return parsed.success ? { state: "readable", epochs: parsed.data } : { state: "unreadable" };
   } catch {
     return { state: "unreadable" };
   }
 }
 
 /** False on any failure. Never throws. */
-export function writeHaltCount(file: string, key: Buffer, count: HaltCount): boolean {
+export function writeHaltEpochs(file: string, key: Buffer, epochs: HaltEpochs): boolean {
   try {
-    if (!countSchema.safeParse(count).success) return false;
-    writeSealed(file, key, HALT_COUNT_SEAL_SCOPE, count);
+    if (!epochsSchema.safeParse(epochs).success) return false;
+    writeSealed(file, key, HALT_EPOCHS_SEAL_SCOPE, epochs);
     return true;
   } catch {
     return false;

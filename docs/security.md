@@ -470,29 +470,23 @@ verdict that was recorded before the halt is not delivered. The halt is read
 before each turn of a review and again immediately before the reviewer
 process starts, so a halt that is recorded after the light turn holds the
 strong turn, and a verdict reached while the halt was recorded is withheld,
-also from a headless session. The host records every halt in the permission
-pipeline's state before it acknowledges the halt, and a halt ends the
-authority that earlier decisions were made under, as a new owner act does: a
-verdict reached before or during the halt and not yet delivered is never
-delivered, also after the release and after a restart, and the same request
-is decided again from current evidence. A halt that the pipeline cannot record
-is kept, also after its release, and the agent serves nothing until it is
-recorded; the halt's acknowledgement then carries `deliveryFence: "uncertain"`.
-The host counts every halt it engages in `halt-count.sealed`, a file apart from
-the halt record, with a hash chain over their ids. It writes the count before
-the record, and neither a release, a dropped request receipt, nor a restored or
-removed halt record changes it. The pipeline records how much of the count and
-chain it has accounted for. A counted halt it did not record, whether it was
-released between two reads or before a restart, a count that went down, and a
-chain that does not follow from the recorded one (a count file that was
-replaced, removed, or restored from an older copy) are recorded as a halt of
-every project; one seen and not yet recorded is kept until it is. While the
-count file cannot be read, the agent serves nothing. Restoring both halt files
-from the same older copy while the evidence store cannot be written, and then
-restarting, loses the halts engaged since that copy; this is not detected.
-Each period in which a halt is in force is a halt epoch of its own, so a halt
-that a restored copy of the record brings back under its old id retires the
-verdicts reached since its release, as a new halt does. A dialog that was
+also from a headless session. Each project has a halt epoch, kept in
+`halt-epochs.sealed`, a file apart from the halt record. Every engage and every
+release that covers a project gives its scope a new epoch, written before the
+halt record, and the epoch is part of the authority of each decision: a halt
+ends the authority that earlier decisions were made under, as a new owner act
+does, and so does its release. A verdict reached before or during the halt and
+not yet delivered is never delivered, also after the release and after a
+restart, and the same request is decided again from current evidence. Neither
+a restart, a dropped request receipt, nor a restored or removed halt record
+changes the epochs, so a halt that an older copy of the record brings back
+retires, at its release, the verdicts reached since the real release. A removed
+epochs file is replaced with a new host epoch, which retires every verdict not
+yet delivered. While the epochs or the halt record cannot be read, the agent
+serves nothing. The host does not detect a replayed older copy of its sealed
+state: restoring `halt-epochs.sealed` from an older copy, alone or together with
+`halt.sealed`, can make a verdict reached before a later halt applicable again,
+as restoring an older `halt.sealed` lifts a halt. A dialog that was
 pending is handed to the agent again after the release and decided from the
 evidence of that time. A host halt, or a halt record that the host cannot
 read, also holds every reviewer launch of a replay. A headless call that

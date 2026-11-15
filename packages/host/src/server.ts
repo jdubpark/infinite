@@ -341,10 +341,9 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       core: permissionAgent.core, journal: permissionJournal, delegation: permissionDelegation, state: permissionState,
       // An owner halt stops the permission agent too: while it covers the project no reviewer turn starts and no recorded verdict is delivered.
       halted: projectId => halt.check({ projectId }).state === "halted",
-      // Each halt is recorded: it retires the verdicts reached before it, and the release brings a fresh evaluation.
-      // The count of engaged halts catches one the pipeline never recorded, also when it was released before a restart.
-      halts: () => halt.engagements()?.halts,
-      haltCount: () => halt.engagements(),
+      // The halt service renews a project's epoch durably at every engage and release that covers it, before either takes
+      // effect: a verdict reached before a halt or its release no longer applies, and the request is decided again.
+      haltEpoch: projectId => halt.epoch(projectId),
     });
   // Sessions outside team runs: every session listing is read for their permission dialogs, which go to the delivery service.
   const sessionPermissions = new SessionPermissionRequests(config, manager, {
@@ -371,9 +370,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
    */
   const settlePermissionAuthority = async (): Promise<PermissionFence> => {
     let confirmed = true;
-    // A halt that this write engaged is recorded first, so the fence below sees the decisions it retired.
-    // A halt that could not be recorded is reported: nothing is served until it is.
-    try { if (permissionAgent.pipeline?.observeHalts?.() === false) confirmed = false; } catch { confirmed = false; }
     try { await teams.permissionAuthorityChanged(); } catch { confirmed = false; }
     try { if (!await permissionDelivery.fenceRetired()) confirmed = false; } catch { confirmed = false; }
     return confirmed ? {} : { deliveryFence: "uncertain" };

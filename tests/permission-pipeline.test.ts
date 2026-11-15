@@ -5,7 +5,6 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
-import { haltChain } from "../packages/host/src/halt/record.js";
 import { PermissionJournal, permissionJournalModule, type PermissionTier } from "../packages/host/src/evidence/permission-journal.js";
 import { PermissionDelegationService } from "../packages/host/src/permission-delegation.js";
 import {
@@ -13,7 +12,6 @@ import {
   PermissionOwnerControls,
   closeRejectsOnDirectionChange,
   openPermissionPipelineState,
-  permissionPipelineModule,
 } from "../packages/host/src/permission-pipeline.js";
 import type {
   PermissionAgentCore,
@@ -143,30 +141,24 @@ type Opened = {
 };
 
 /**
- * The projects under an owner halt. Each engagement gets its own halt id, its place in the count of engaged halts,
- * and extends the chain over their ids, as the host's halt record does; a release changes neither. A replaced record
- * starts again from none, and a restored copy brings back the count and chain it had.
+ * The projects under an owner halt, and each project's halt epoch, as the host's halt service keeps them: every
+ * engage and every release that covers a project gives it a new epoch. `reinstate` brings a halt back into force
+ * without one, as an older copy of the halt record does; `unreadable` stands for epochs that cannot be read.
  */
 class Halts extends Set<string> {
-  readonly ids = new Map<string, { haltId: string; serial: number }>();
-  count = 0;
-  chain = "";
-  replace() { this.restore({ count: 0, chain: "" }); }
-  snapshot() { return { count: this.count, chain: this.chain }; }
-  restore(copy: { count: number; chain: string }) { this.clear(); this.count = copy.count; this.chain = copy.chain; }
-  /** A halt in force again under its old id, as an older copy of the halt record brings it back; the count is kept apart. */
-  reinstate(projectId: string, mark: { haltId: string; serial: number }) { this.ids.set(projectId, mark); super.add(projectId); }
+  readonly epochs = new Map<string, string>();
+  unreadable = false;
+  epoch(projectId: string) { return this.unreadable ? undefined : this.epochs.get(projectId) ?? "never"; }
+  reinstate(projectId: string) { return super.add(projectId); }
   override add(projectId: string) {
-    if (!this.has(projectId)) {
-      const haltId = randomUUID();
-      this.ids.set(projectId, { haltId, serial: ++this.count });
-      this.chain = haltChain(this.chain, haltId);
-    }
+    if (!this.has(projectId)) this.epochs.set(projectId, randomUUID());
     return super.add(projectId);
   }
-  override delete(projectId: string) { this.ids.delete(projectId); return super.delete(projectId); }
-  override clear() { this.ids.clear(); super.clear(); }
-  marks() { return [...this.ids].map(([projectId, mark]) => ({ ...mark, projectId })); }
+  override delete(projectId: string) {
+    if (this.has(projectId)) this.epochs.set(projectId, randomUUID());
+    return super.delete(projectId);
+  }
+  override clear() { for (const projectId of this) this.delete(projectId); }
 }
 
 function fixture() {
@@ -191,7 +183,7 @@ function fixture() {
     opened = {
       state, store, journal, delegation,
       pipeline: new HostPermissionPipeline({
-        core, journal, delegation, state, halted: projectId => halted.has(projectId), halts: () => halted.marks(), haltCount: () => ({ count: halted.count, chain: halted.chain }), now: clock,
+        core, journal, delegation, state, halted: projectId => halted.has(projectId), haltEpoch: projectId => halted.epoch(projectId), now: clock,
       }),
       controls: new PermissionOwnerControls(journal, state, { now: clock }),
     };
@@ -322,7 +314,7 @@ test("a halt retires the verdicts reached before and during it, and after the re
   const before = decided(await f.pipeline.decide(request({ action: "npm test" })), "allow");
   // The halt is engaged while the final turn of a review runs; the host records it before it acknowledges the halt.
   const pending = request({ action: "npm run build" });
-  f.core.next = () => { f.halted.add("alpha-app"); f.pipeline.observeHalts(); return allow(); };
+  f.core.next = () => { f.halted.add("alpha-app"); return allow(); };
   const during = decided(await f.pipeline.decide(pending), "allow");
   assert.equal(f.pipeline.applicable(during.decisionId), false);
   f.halted.clear();
@@ -346,173 +338,41 @@ test("a halt retires the verdicts reached before and during it, and after the re
   assert.equal(f.pipeline.applicable(again.decisionId), true, "a halt of another project leaves this one's decisions in force");
 }));
 
-test("a halt the pipeline could not record is kept after its release, and recorded after a restart from the halt count", () => withFixture(async f => {
-  f.delegate();
-  const before = decided(await f.pipeline.decide(request({ action: "npm test" })), "allow");
-  // The evidence store refuses the halt's record while the halt lasts.
-  const noteHalt = f.state.noteHalt.bind(f.state);
-  let failing = true;
-  f.state.noteHalt = (...args) => { if (failing) throw new Error("disk full"); noteHalt(...args); };
-  f.halted.add("alpha-app");
-  assert.equal(f.pipeline.observeHalts(), false, "the failure is reported to the acknowledgement");
-  f.halted.clear();
-  assert.equal(f.pipeline.observeHalts(), false, "the release does not erase the unrecorded halt");
-  assert.equal(f.pipeline.serves("alpha-app").served, false, "nothing is served until it is recorded");
-  assert.equal(f.pipeline.applicable(before.decisionId), false);
-  failing = false;
-  assert.equal(f.pipeline.observeHalts(), true);
-  assert.equal(f.pipeline.applicable(before.decisionId), false, "the recorded halt retired the decision made before it");
-
-  // A restart loses what was kept in memory; the halt count brings it back, for every project.
-  const second = decided(await f.pipeline.decide(request({ action: "npm test", projectId: "beta-app" })), "allow");
-  f.state.noteHalt = () => { throw new Error("disk full"); };
-  f.halted.add("beta-app");
-  assert.equal(f.pipeline.observeHalts(), false);
-  f.halted.clear();
-  f.restart();
-  assert.equal(f.pipeline.applicable(second.decisionId), false, "the halt count recorded the lost halt after the restart");
-  assert.equal(f.pipeline.serves("beta-app").served, true);
-}));
-
-test("a halt engaged and released between two reads, or a halt record that was reset, retires every decision made before it", () => withFixture(async f => {
+test("a halt engaged and released between two reads retires its project's earlier decisions and no other project's", () => withFixture(async f => {
   f.delegate();
   const alpha = decided(await f.pipeline.decide(request({ action: "npm test" })), "allow");
   const beta = decided(await f.pipeline.decide(request({ action: "npm test", projectId: "beta-app" })), "allow");
-  // The halt comes and goes before the pipeline reads the halts in force: only the count shows it.
   f.halted.add("alpha-app");
-  f.halted.clear();
-  assert.equal(f.pipeline.observeHalts(), true);
+  f.halted.delete("alpha-app");
   assert.equal(f.pipeline.applicable(alpha.decisionId), false);
-  assert.equal(f.pipeline.applicable(beta.decisionId), false, "its project is unknown, so it counts for every project");
-  // A halt the pipeline saw while it lasted retires only its project's decisions.
-  const again = decided(await f.pipeline.decide(request({ action: "npm test" })), "allow");
-  const other = decided(await f.pipeline.decide(request({ action: "npm test", projectId: "beta-app" })), "allow");
-  f.halted.add("beta-app");
-  assert.equal(f.pipeline.observeHalts(), true);
-  f.halted.clear();
-  assert.equal(f.pipeline.applicable(again.decisionId), true);
-  assert.equal(f.pipeline.applicable(other.decisionId), false);
-  // A count that went down means the halt record was replaced: what it held before is unknown.
-  f.halted.count = 0;
-  assert.equal(f.pipeline.observeHalts(), true);
-  assert.equal(f.pipeline.applicable(again.decisionId), false);
+  assert.equal(f.pipeline.applicable(beta.decisionId), true);
 }));
 
-test("a replaced halt record that reaches the old count again, while nothing could be recorded, still retires every earlier decision", () => withFixture(async f => {
-  f.delegate();
-  // One halt is engaged, recorded and released; an allow decided after it stays undelivered.
-  f.halted.add("alpha-app");
-  assert.equal(f.pipeline.observeHalts(), true);
-  f.halted.clear();
-  const after = decided(await f.pipeline.decide(request({ action: "npm test" })), "allow");
-  // The halt record is replaced, and the evidence store refuses every write while the new record engages and
-  // releases one halt, so its count equals the old one.
-  f.halted.replace();
-  f.state.noteHalt = () => { throw new Error("disk full"); };
-  f.state.countHalts = () => { throw new Error("disk full"); };
-  assert.equal(f.pipeline.observeHalts(), false);
-  f.halted.add("beta-app");
-  assert.equal(f.pipeline.observeHalts(), false);
-  f.halted.clear();
-  f.restart();
-  assert.equal(f.pipeline.observeHalts(), true);
-  assert.equal(f.pipeline.applicable(after.decisionId), false, "another record's count is not a continuation of the old one");
-}));
-
-test("an older copy of the halt record, restored and brought back to the counted count while nothing could be recorded, retires every earlier decision", () => withFixture(async f => {
+test("a halt brought back into force by an older halt record retires, at its release, the verdicts reached since the real release", () => withFixture(async f => {
   f.delegate();
   f.halted.add("alpha-app");
-  assert.equal(f.pipeline.observeHalts(), true);
-  f.halted.clear();
-  const older = f.halted.snapshot();
-  f.halted.add("alpha-app");
-  assert.equal(f.pipeline.observeHalts(), true);
-  f.halted.clear();
-  const after = decided(await f.pipeline.decide(request({ action: "npm test" })), "allow");
-  // The older copy is restored, and while the evidence store refuses every write it engages and releases a halt,
-  // which brings its count back to the one the pipeline recorded.
-  f.halted.restore(older);
-  f.state.noteHalt = () => { throw new Error("disk full"); };
-  f.state.countHalts = () => { throw new Error("disk full"); };
-  assert.equal(f.pipeline.observeHalts(), false);
-  f.halted.add("alpha-app");
-  assert.equal(f.pipeline.observeHalts(), false);
-  f.halted.clear();
-  f.restart();
-  assert.equal(f.pipeline.observeHalts(), true);
-  assert.equal(f.pipeline.applicable(after.decisionId), false, "the same count with another history does not agree");
-}));
-
-test("a halt in force again under the same id, from a restored older halt record, retires the decisions made since its release", () => withFixture(async f => {
-  f.delegate();
-  f.halted.add("alpha-app");
-  assert.equal(f.pipeline.observeHalts(), true);
-  const halt = f.halted.ids.get("alpha-app")!;
-  f.halted.clear();
-  assert.equal(f.pipeline.observeHalts(), true);
+  f.halted.delete("alpha-app");
   const since = decided(await f.pipeline.decide(request({ action: "npm test" })), "allow");
-  // The halt record is restored from a copy taken while the halt was in force, and the host restarts.
-  f.halted.reinstate("alpha-app", halt);
+  // The halt record is restored from a copy taken while the halt was in force, the host restarts, and the owner
+  // releases the halt again before anything reads it.
+  f.halted.reinstate("alpha-app");
   f.restart();
-  assert.equal(f.pipeline.observeHalts(), true);
-  f.halted.clear();
-  assert.equal(f.pipeline.observeHalts(), true);
-  assert.equal(f.pipeline.applicable(since.decisionId), false, "the period in force again is a halt epoch of its own");
-  // The same within one process.
-  const again = decided(await f.pipeline.decide(request({ action: "npm test" })), "allow");
-  f.halted.reinstate("alpha-app", halt);
-  assert.equal(f.pipeline.observeHalts(), true);
-  f.halted.clear();
-  assert.equal(f.pipeline.applicable(again.decisionId), false);
-}));
-
-test("a halt record seen to differ from the count is kept until it is recorded, also when the record returns to the counted state", () => withFixture(async f => {
-  f.delegate();
-  f.halted.add("beta-app");
-  assert.equal(f.pipeline.observeHalts(), true);
-  f.halted.clear();
-  const counted = f.halted.snapshot();
+  f.halted.delete("alpha-app");
+  assert.equal(f.pipeline.applicable(since.decisionId), false, "the release renewed the project's epoch");
   const after = decided(await f.pipeline.decide(request({ action: "npm test" })), "allow");
-  // The count cannot be written. The record is replaced, engages and releases a halt of this project before the
-  // pipeline reads the halts in force, and the counted copy is then restored: the halt in between is gone from it.
-  const countHalts = f.state.countHalts.bind(f.state);
-  f.state.countHalts = () => { throw new Error("disk full"); };
-  f.halted.replace();
-  assert.equal(f.pipeline.observeHalts(), false);
-  f.halted.add("alpha-app");
-  f.halted.clear();
-  f.halted.restore(counted);
-  f.state.countHalts = countHalts;
-  assert.equal(f.pipeline.observeHalts(), true);
-  assert.equal(f.pipeline.applicable(after.decisionId), false, "what was seen is recorded as a halt of every project");
+  assert.equal(f.pipeline.applicable(after.decisionId), true);
 }));
 
-test("a store from before the chained halt count is migrated: its count is kept again from the start, and its decisions lose their authority", () => {
-  const root = mkdtempSync(join(tmpdir(), "permission-pipeline-migrate-"));
-  try {
-    const databasePath = evidenceDatabasePath(join(root, "state")), vaultKey = randomBytes(32);
-    // The version-3 shape: a count without a chain.
-    const older = new EvidenceStore({ databasePath, vaultKey });
-    older.register({
-      name: "permission-pipeline", version: 3, readVersion: 3,
-      migrate: tx => {
-        permissionPipelineModule.migrate(tx, 0);
-        tx.exec("DROP TABLE permission_pipeline_halt_count");
-        tx.exec("CREATE TABLE permission_pipeline_halt_count (id INTEGER PRIMARY KEY CHECK (id = 1), generation TEXT, engaged INTEGER NOT NULL)");
-        tx.run("INSERT INTO permission_pipeline_halt_count (id,generation,engaged) VALUES (1,NULL,1)");
-      },
-    });
-    older.close();
-    const store = new EvidenceStore({ databasePath, vaultKey });
-    const state = openPermissionPipelineState(store);
-    assert.ok(state, "the module migrates and opens");
-    assert.equal(state.haltsCounted(), undefined, "the old count is dropped");
-    state.countHalts({ chain: "", engaged: 0 });
-    assert.deepEqual(state.haltsCounted(), { chain: "", engaged: 0 });
-    assert.equal(state.haltEpoch("any-project"), "upgrade:4", "decisions made before the upgrade are under an earlier halt epoch");
-    store.close();
-  } finally { rmSync(root, { recursive: true, force: true }); }
-});
+test("halt epochs that cannot be read serve nothing, and earlier decisions apply again once they can be read unchanged", () => withFixture(async f => {
+  f.delegate();
+  const earlier = decided(await f.pipeline.decide(request({ action: "npm test" })), "allow");
+  f.halted.unreadable = true;
+  assert.deepEqual(f.pipeline.serves("alpha-app"), { served: false, reason: "not-ready" });
+  assert.deepEqual(await f.pipeline.decide(request({ action: "npm run lint" })), { kind: "not-served", reason: "not-ready" });
+  assert.equal(f.pipeline.applicable(earlier.decisionId), false);
+  f.halted.unreadable = false;
+  assert.equal(f.pipeline.applicable(earlier.decisionId), true);
+}));
 
 test("the adapter's evidence collection reaches the review, and no collection exists without it", () => withFixture(async f => {
   f.delegate();

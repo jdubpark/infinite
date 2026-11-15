@@ -170,7 +170,8 @@ function sandboxModeOverride(text: string): string | undefined {
 function claudeHits(args: string[]): string[] {
   const hits: string[] = [];
   args.forEach((arg, index) => {
-    if (["--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"].includes(arg)) hits.push(arg);
+    // Hidden aliases are kept on purpose: a flag absent from help can still be accepted.
+    if (["--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--enable-auto-mode"].includes(arg)) hits.push(arg);
     let mode: string | undefined;
     if (arg === "--permission-mode") mode = args[index + 1];
     else if (arg.startsWith("--permission-mode=")) mode = arg.slice("--permission-mode=".length);
@@ -185,7 +186,8 @@ function claudeHits(args: string[]): string[] {
 function codexHits(args: string[]): string[] {
   const hits: string[] = [];
   args.forEach((arg, index) => {
-    if (arg === "--dangerously-bypass-approvals-and-sandbox") hits.push(arg);
+    // Hidden aliases are kept on purpose: --yolo is absent from codex --help but accepted by codex-cli 0.167.2 (parse-level probe).
+    if (["--dangerously-bypass-approvals-and-sandbox", "--yolo"].includes(arg)) hits.push(arg);
     // --sandbox MODE, --sandbox=MODE, -s MODE, -sMODE
     let mode: string | undefined;
     if (arg === "--sandbox" || arg === "-s") mode = args[index + 1];

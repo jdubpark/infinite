@@ -108,8 +108,8 @@ A `missing`, `changed`, `writable`, or `conflict` word prints as a warning. Doct
 
 Forbidden flags:
 
-- Claude Code: `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`, and `--permission-mode` with `bypassPermissions` or `auto`, each as a separate argument or joined with `=`. `--enable-auto-mode` is not in the installed help, so it is not checked.
-- Codex: `--dangerously-bypass-approvals-and-sandbox`, and any `--sandbox` or `-s` value, and any `sandbox_mode` in a `-c` or `--config` override, that is not exactly `read-only` or `workspace-write`.
+- Claude Code: `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`, `--enable-auto-mode`, and `--permission-mode` with `bypassPermissions` or `auto`, each as a separate argument or joined with `=`. `--enable-auto-mode` is not in the installed help. It is checked anyway, because a flag can be accepted while hidden from help; a check for a flag that does not exist never matches.
+- Codex: `--dangerously-bypass-approvals-and-sandbox`, `--yolo` (a hidden alias: absent from `codex --help`, accepted by `codex-cli` 0.167.2 as shown by a parse-level probe), and any `--sandbox` or `-s` value, and any `sandbox_mode` in a `-c` or `--config` override, that is not exactly `read-only` or `workspace-write`.
 
 The Codex rule is an allow-list, so it reports a value it does not read as exactly one of the two allowed modes. Doctor reads a TOML string value only in its basic, literal, and multi-line forms, and it does not parse comments. A valid but unusual spelling of an allowed mode, such as a value with a trailing comment, is therefore reported. That costs one warning line.
 

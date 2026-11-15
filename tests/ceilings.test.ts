@@ -182,6 +182,15 @@ test("launch flags the ceilings turn off are found in each spelling, and look-al
   assert.deepEqual(forbiddenLaunchFlags("claude", ["--permission-mode", "dontAsk", "--append-system-prompt", "never use --permission-mode auto"]), []);
 });
 
+test("the hidden Codex alias --yolo is checked, as the CLI accepts it", () => {
+  // Hidden from codex --help, but accepted by codex-cli 0.167.2 (parse-level probe).
+  assert.deepEqual(forbiddenLaunchFlags("codex", ["--yolo"]), ["--yolo"]);
+});
+
+test("the Claude flag --enable-auto-mode is checked", () => {
+  assert.deepEqual(forbiddenLaunchFlags("claude", ["--enable-auto-mode"]), ["--enable-auto-mode"]);
+});
+
 test("codex sandbox values are reported unless they read as exactly read-only or workspace-write", () => {
   // A line-ending backslash in a multi-line TOML string joins the lines into danger-full-access.
   assert.equal(forbiddenLaunchFlags("codex", ["-c", 'sandbox_mode="""danger-\\\n full-access"""']).length, 1);

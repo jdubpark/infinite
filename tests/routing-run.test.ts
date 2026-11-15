@@ -50,8 +50,8 @@ async function membersClosed(teams: { get(id: string): TeamView }, id: string): 
 }
 
 /**
- * Runs the team to a terminal status. The mixed scenario's implementer of task b asks the owner one question, so each
- * open decision is answered with its first option as it appears.
+ * Runs the team to a terminal status. In the mixed scenario, task b's implementer question blocks the run, and the
+ * revision-2 project manager asks the owner one question, so each open decision is answered with its first option as it appears.
  */
 async function settleAnswering(teams: { get(id: string): TeamView; answer(id: string, decisionId: string, input: unknown): unknown }, id: string): Promise<TeamView> {
   return waitFor(async () => {
@@ -154,12 +154,12 @@ test("a shadow run records each first implementer and runs the coordinator's pro
   }
 });
 
-/** A goal context with a record digest: c0 reads the success text, and c1 is one owner criterion. */
+/** A goal context with a record digest as the host writes one: c0 judges the owner's text, and c1 is one owner criterion. */
 const goalWithRecord = (): TeamGoalContext => teamGoalContextSchema.parse({ id: randomUUID(), revision: 1, cycle: 1, successCriteria: "The owner has evidence",
   nonGoals: [], allowedPaths: ["."], evidence: [], previousWork: [], deadlineAt: new Date(Date.now() + 3600_000).toISOString(), maxMembers: 20,
   record: { version: 2, criteria: [
-    { id: "c0", statement: "", check: "The owner's success text", producer: "host" },
-    { id: "c1", statement: "Shows one owner-visible result", check: "Read the result", producer: "owner" },
+    { id: "c0", statement: "", check: "judgement:owner-text", producer: "evaluator" },
+    { id: "c1", statement: "Shows one owner-visible result", check: "artifact:b.txt", producer: "host" },
   ] } });
 
 test("a goal cycle with owner criteria records the digest prompt version, with the blackboard tools off", { timeout: 240000 }, async () => {

@@ -23,6 +23,7 @@ import type {
   PermissionReview,
   PermissionReviewContext,
 } from "../packages/host/src/permission-agent-types.js";
+import { PermissionReviewHeld } from "../packages/host/src/permission-agent-types.js";
 import { requesterNotice, type RejectCode } from "../packages/host/src/permission-policy.js";
 import type { ProjectGroup, ProjectGroupList } from "../packages/host/src/project-group-types.js";
 import type { Config, Project } from "../packages/host/src/types.js";
@@ -148,6 +149,7 @@ function fixture() {
   const core = new FakeCore();
   let now = Date.UTC(2026, 10, 14, 12);
   const clock = () => (now += 1000);
+  const halted = new Set<string>();
   let opened: Opened | undefined;
   const open = (): Opened => {
     const store = new EvidenceStore({ databasePath: evidenceDatabasePath(config.stateDir), vaultKey: key });
@@ -158,14 +160,14 @@ function fixture() {
     const delegation = new PermissionDelegationService(config, key, groups, { now: clock });
     opened = {
       store, journal, delegation,
-      pipeline: new HostPermissionPipeline({ core, journal, delegation, state, now: clock }),
+      pipeline: new HostPermissionPipeline({ core, journal, delegation, state, halted: projectId => halted.has(projectId), now: clock }),
       controls: new PermissionOwnerControls(journal, state, { now: clock }),
     };
     return opened;
   };
   const current = () => opened ?? open();
   return {
-    core, groups, ids,
+    core, groups, ids, halted,
     get pipeline() { return current().pipeline; },
     get journal() { return current().journal; },
     get delegation() { return current().delegation; },
@@ -245,6 +247,29 @@ test("a class match reaches the owner with no model turn, cannot be allowed, and
   f.core.classes.set("always allow edits", { interruptClass: "global-or-account-settings", rule: "persistent-only" });
   decided(await f.pipeline.decide(request({ action: "always allow edits", shape: { oneShotAccept: false, oneShotReject: false, persistentOnly: true } })), "owner");
   assert.equal(f.core.reviews.length, 0);
+}));
+
+test("an owner halt holds a request: no turn, no record and no delivery until the release", () => withFixture(async f => {
+  f.delegate();
+  const earlier = decided(await f.pipeline.decide(request({ action: "npm test" })), "allow");
+  const before = f.journal.decisions().length;
+
+  f.halted.add("alpha-app");
+  const pending = request({ action: "npm run build" });
+  decided(await f.pipeline.decide(pending), "held");
+  assert.equal(f.core.reviews.length, 1, "no model turn starts under a halt");
+  assert.equal(f.pipeline.applicable(earlier.decisionId), false, "an earlier decision is not delivered under a halt");
+  decided(await f.pipeline.decide(request({ action: "npm test", projectId: "beta-app" })), "allow");
+
+  // The launch gate holds a turn that the halt check did not see: the same result.
+  f.halted.clear();
+  f.core.next = () => { throw new PermissionReviewHeld(); };
+  decided(await f.pipeline.decide(pending), "held");
+  assert.equal(f.journal.decisions().length, before + 1, "a held request records nothing; only the other project's allow was added");
+
+  f.core.next = () => allow();
+  decided(await f.pipeline.decide(pending), "allow");
+  assert.equal(f.pipeline.applicable(earlier.decisionId), true);
 }));
 
 test("the adapter's evidence collection reaches the review, and no collection exists without it", () => withFixture(async f => {

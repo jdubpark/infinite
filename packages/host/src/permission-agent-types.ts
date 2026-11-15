@@ -186,6 +186,11 @@ export type PermissionOutcome =
   | { kind: "not-served"; reason: "not-covered" | "not-ready" }
   /** A class rule or a strong verdict names the owner. The request stays pending and the owner is pushed with the class. */
   | { kind: "owner"; decisionId: string; interruptClass: InterruptClass }
+  /**
+   * An owner halt covers the project, or the launch gate held the review turn. Nothing is recorded and
+   * nothing is delivered: the request stays pending and the caller evaluates it again after the release.
+   */
+  | { kind: "held" }
   /** The host cannot answer this request in either direction. It goes to the owner. This is a host limit, not a class. */
   | { kind: "undeliverable"; reason: string }
   /** `strongTier` says whether the allow came from the strong tier. A destructive request is delivered only then. */
@@ -214,7 +219,7 @@ export interface PermissionPipeline {
   decide(request: PermissionRequest, options?: PermissionDecideOptions): Promise<PermissionOutcome>;
   /**
    * Whether a recorded decision may still be applied now: its project is still covered under the same
-   * authority, the host is ready, and no revoke, regrouping or direction change retired it.
+   * authority, the host is ready, no owner halt covers it, and no revoke, regrouping or direction change retired it.
    */
   applicable(decisionId: string): boolean;
   /** Linked delivery events. The decision is in the journal before the first one. */

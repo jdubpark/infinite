@@ -7,6 +7,7 @@
  * allow is recorded only from a model turn that the host validated, or replayed from one.
  */
 import { createHash } from "node:crypto";
+import { PermissionReviewHeld } from "./permission-agent-types.js";
 import type {
   PermissionAgentCore,
   PermissionClassMatch,
@@ -162,6 +163,8 @@ export interface HostPermissionPipelineOptions {
   journal: PermissionJournal;
   delegation: Coverage;
   state: PermissionPipelineState;
+  /** Whether an owner halt covers the project now. Under a halt nothing is decided and nothing is delivered. */
+  halted?: (projectId: string) => boolean;
   now?: () => number;
 }
 
@@ -170,6 +173,7 @@ export class HostPermissionPipeline implements PermissionPipeline {
   private readonly journal: PermissionJournal;
   private readonly delegation: Coverage;
   private readonly state: PermissionPipelineState;
+  private readonly haltedOf: ((projectId: string) => boolean) | undefined;
   private readonly clock: () => number;
   /** One decision per request: a delivery retry while a review runs joins it instead of starting another. */
   private readonly inFlight = new Map<string, Promise<PermissionOutcome>>();
@@ -179,7 +183,14 @@ export class HostPermissionPipeline implements PermissionPipeline {
     this.journal = options.journal;
     this.delegation = options.delegation;
     this.state = options.state;
+    this.haltedOf = options.halted;
     this.clock = options.now ?? Date.now;
+  }
+
+  /** A halt that cannot be read counts as a halt. */
+  private halted(projectId: string): boolean {
+    try { return this.haltedOf?.(projectId) ?? false; }
+    catch { return true; }
   }
 
   private timestamp() { return new Date(this.clock()).toISOString(); }
@@ -212,6 +223,7 @@ export class HostPermissionPipeline implements PermissionPipeline {
   async decide(request: PermissionRequest, options: PermissionDecideOptions = {}): Promise<PermissionOutcome> {
     const served = this.coverage(request.requester.projectId);
     if (!served.served) return { kind: "not-served", reason: served.reason };
+    if (this.halted(request.requester.projectId)) return { kind: "held" };
     const decisionId = decisionIdFor(request, served.coverage.authorityHash);
     const running = this.inFlight.get(decisionId);
     if (running) return running;
@@ -231,7 +243,7 @@ export class HostPermissionPipeline implements PermissionPipeline {
   applicable(decisionId: string): boolean {
     try {
       const row = this.state.decision(decisionId);
-      if (!row || !this.ready()) return false;
+      if (!row || !this.ready() || this.halted(row.projectId)) return false;
       const coverage = this.delegation.coverage(row.projectId);
       // A revoke, an owner regrouping, a new owner act and a changed direction text each change or end the authority.
       return coverage.covered && coverage.authorityHash === row.authorityHash;
@@ -343,7 +355,11 @@ export class HostPermissionPipeline implements PermissionPipeline {
     };
     let review: PermissionReview;
     try { review = await this.core.review(request, context); }
-    catch { review = { verdict: "reject", code: "unavailable", tiers: [] }; }
+    catch (error) {
+      // The launch gate held the turn: no verdict exists, so nothing is recorded.
+      if (error instanceof PermissionReviewHeld) return { kind: "held" };
+      review = { verdict: "reject", code: "unavailable", tiers: [] };
+    }
 
     // 7. Validate the report before anything is recorded, then record it.
     const verdict = this.validate(review, { canAllow, raised, family, taskId: requester.taskId });

@@ -349,6 +349,19 @@ test("polling reads a session record once unless a title job is due", async () =
     assert.equal(waitingReads, 1, "a pending title job is not read again");
     assert.equal(pendingCalls, 1);
   } finally { waiting.readings.stop(); waiting.dispose(); }
+
+  // Part 5: with session readings off, no title job can follow, so a candidate is read once like any other session.
+  const off = setup({ title: "", generatedTitle: true, prompt: longLine, lastMessage: "Short.", transport: pending, writer });
+  let offReads = 0;
+  off.manager.meta = () => { offReads++; return { session: off.session }; };
+  const quiet = new Readings({ ...off.config, jev: { ...off.config.jev!, sessionReadings: false } }, off.key, off.manager, writer, pending);
+  try {
+    const listed = [{ ...off.row, backend: "infinite" as const }];
+    quiet.merge(listed);
+    quiet.merge(listed);
+    quiet.merge(listed);
+    assert.equal(offReads, 1, "with session readings off, a title candidate is not read again");
+  } finally { off.dispose(); }
 });
 
 test("failures are held briefly, list merging stays synchronous, stale hashes drop, and cache survives restart", async () => {
@@ -547,4 +560,49 @@ test("requestRoute is undefined without jev, on a transport error, and on an unk
     assert.equal(await c.readings.requestRoute("what is this?"), undefined);
     assert.equal(calls, 0);
   } finally { a.dispose(); b.dispose(); c.dispose(); }
+});
+
+test("sessionReadings false sends no session text to the reading service", async () => {
+  const fake = responding({});
+  const f = setup({ title: "", generatedTitle: true, prompt: longLine, transport: fake.transport });
+  try {
+    (f.config.jev as any).sessionReadings = false;
+    const readings = new Readings(f.config, f.key, f.manager, { titleFromPrompt: async () => ({ text: "Importer branch", model: "m" }) } as any, fake.transport);
+    await readings.tick();
+    const merged = readings.merge([f.row]);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const again = readings.merge([f.row]);
+    assert.equal(fake.calls.length, 0);
+    assert.equal(merged[0].reading?.now, undefined);
+    assert.equal(again[0].reading?.now, undefined);
+    assert.equal((await readings.requestTitle(longLine))?.text, "Importer branch");
+    assert.equal(fake.calls.length, 0, "requestTitle goes straight to the writer");
+  } finally { f.dispose(); }
+});
+
+test("sessionReadings false still reads the intake route", async () => {
+  const calls: any[] = [];
+  const transport = { systemOne: async (request: any) => { calls.push(request); return { model: "jev-latest", answers: { route: { type: "choice", choice: "answer", confidence: 0.9, probabilities: {} } } }; } } as unknown as JevTransport;
+  const f = setup({ transport });
+  try {
+    (f.config.jev as any).sessionReadings = false;
+    assert.deepEqual(await f.readings.requestRoute("How does the importer pick a branch?"), { route: "answer", confidence: 0.9 });
+    assert.equal(calls.length, 1);
+    assert.deepEqual(Object.keys(calls[0].state), ["request"]);
+  } finally { f.dispose(); }
+});
+
+test("sessionReadings false starts no timer", async () => {
+  const f = setup({ transport: responding({}).transport });
+  try {
+    (f.config.jev as any).sessionReadings = false;
+    let listCalls = 0, intervalCalls = 0;
+    f.manager.list = async () => { listCalls++; return [f.row]; };
+    const original = globalThis.setInterval;
+    globalThis.setInterval = ((...args: Parameters<typeof setInterval>) => { intervalCalls++; return original(...args); }) as typeof setInterval;
+    try { f.readings.start(); await new Promise(resolve => setTimeout(resolve, 30)); }
+    finally { globalThis.setInterval = original; f.readings.stop(); }
+    assert.equal(intervalCalls, 0);
+    assert.equal(listCalls, 0);
+  } finally { f.dispose(); }
 });

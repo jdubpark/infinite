@@ -123,8 +123,10 @@ export class Readings {
     }
     this.restore();
   }
+  /** True when the reading service may see session text; false leaves it to the intake route reading. */
+  private get sessionJev(): boolean { return Boolean(this.config.jev && this.config.jev.sessionReadings !== false); }
   start() {
-    if (!this.config.jev) return;
+    if (!this.sessionJev) return;
     void this.tick();
     this.timer = setInterval(() => void this.tick(), 2000);
     this.timer.unref();
@@ -154,16 +156,16 @@ export class Readings {
           reading.title = value?.title ?? fallback;
         }
       } catch { /* Native cmux rows have no Infinite metadata. */ }
-      if (this.config.jev) this.queueTurnReading(row);
+      if (this.sessionJev) this.queueTurnReading(row);
       return Object.keys(reading).length ? { ...row, reading } : row;
     });
-    if (this.config.jev) this.drain();
+    if (this.sessionJev) this.drain();
     return merged;
   }
 
   /** Captures session inputs and queues gated work. Repeated polls deduplicate pending calls. */
   async tick() {
-    if (!this.config.jev) return;
+    if (!this.sessionJev) return;
     const revision = this.observationRevision;
     let rows: ReadingRow[];
     try { rows = await this.manager.list({ includeFullMessage: true }) as ReadingRow[]; } catch { return; }
@@ -178,7 +180,7 @@ export class Readings {
   /** True when a title job for this session would be queued now. It is the only reason to read a known session's record again. */
   private titleDue(sessionId: string, latest: LatestSession): boolean {
     const hash = latest.promptHash;
-    if (!this.config.jev || !this.writer || !latest.defaultTitle || latest.promptLineLength <= 60 || !hash) return false;
+    if (!this.sessionJev || !this.writer || !latest.defaultTitle || latest.promptLineLength <= 60 || !hash) return false;
     if (this.cached(sessionId, "title", hash)) return false;
     const evaluation = this.evaluations.get(sessionId)?.title;
     if (evaluation?.hash === hash && evaluation.outcome.kind === "failure" && evaluation.outcome.failedUntil > Date.now()) return false;
@@ -247,7 +249,7 @@ export class Readings {
   }
 
   private queueTitleReading(row: ReadingRow, session: Session) {
-    if (!this.config.jev || !this.writer || !defaultTitle(session.title, session.provider, session.generatedTitle)) return;
+    if (!this.sessionJev || !this.writer || !defaultTitle(session.title, session.provider, session.generatedTitle)) return;
     const prompt = session.initialPrompt ?? "";
     if (!prompt) return;
     const line = firstLine(prompt);
@@ -300,7 +302,7 @@ export class Readings {
       return row.lastMessageHash === job.hash && row.state === "turn-finished" && row.lastMessageLength > 200;
     }
     const session = this.latestSessions.get(job.sessionId);
-    return Boolean(this.writer && this.config.jev && session?.defaultTitle && row.backend !== "cmux" &&
+    return Boolean(this.writer && this.sessionJev && session?.defaultTitle && row.backend !== "cmux" &&
       session.promptLineLength > 60 && session.promptHash === job.hash);
   }
 
@@ -352,7 +354,7 @@ export class Readings {
   async requestTitle(prompt: string): Promise<{ text: string; model?: string } | undefined> {
     if (!this.writer || firstLine(prompt).length <= 60) return undefined;
     const input = titleInput(prompt), clipped = clipTitle(firstLine(input));
-    if (this.config.jev) {
+    if (this.sessionJev) {
       const result = await this.ask({
         state: { clipped },
         questions: { clear: noul("Is `clipped` a clear title for the requested work?", { true: "The clipped first line clearly identifies the requested work.", false: "The clipped first line is not a clear title." }) },

@@ -955,7 +955,7 @@ test("permission recovery wakes the mission once with bounded observations and p
 for (const scenario of [
   // The objective sets the base prompt so that the whole recovery message does not fit under 80 KiB and its compact form does; retune it when coordinator instructions grow.
   { name: "a large mission delivers a compact recovery outcome", objectiveLength: 23400, summary: "One API change", held: false },
-  { name: "a full mission blocks and cancels its subteam when recovery evidence cannot fit", objectiveLength: 24000, summary: "S".repeat(900), held: true },
+  { name: "a full mission blocks and cancels its subteam when recovery evidence cannot fit", objectiveLength: 23700, summary: "S".repeat(900), held: true },
 ]) test(scenario.name, { timeout: 30000 }, async () => {
   const h = scripted();
   try {

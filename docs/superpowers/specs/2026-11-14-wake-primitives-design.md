@@ -193,7 +193,7 @@ Each part is one branch and one pull request from `main`.
 
 ## Owner decisions
 
-The owner approved the direction on 2026-11-14. These calls were made by the builder under that approval and are open to change:
+The owner approved the direction on 2026-11-14 and, the same day, told the builder to settle the open decisions by its own recommendations. The calls below stand on that delegation. The owner reviewed none of them one by one, and each stays open to change:
 
 1. Only host receipts and owner items wake work. No agent, commit message, pull request, or issue text.
 2. Signals are kept 30 days. The pending wake keeps 20.
@@ -202,6 +202,16 @@ The owner approved the direction on 2026-11-14. These calls were made by the bui
 5. Rotation defaults: idle 60 minutes, 120,000 tokens, 40 attempts.
 6. A halt release resumes what the halt paused, unless `keepPaused` is set.
 7. Engaging and releasing a halt need the owner role and work from the phone. Neither needs the host CLI.
+8. A running or paused standing goal keeps holding its project between cycles. Releasing the project between cycles is follow-up work, not part of this design.
+9. A follow-up wake is a coordinator attempt like any other and counts toward the mission's attempt limit.
+10. A viewer may read the halt reason, the device label of who engaged it, and the text of an owner signal. Only the owner role may engage, release, or record.
+11. The build ships without client screens. The halt, the signal inbox, and follow-ups are reached through the API and the host CLI until a client is designed.
+
+Known limits at the first release, recorded so nobody reads them as covered:
+
+- A subteam that was waiting for input when a halt engaged is not paused. Its existing work continues.
+- A subteam the halt paused keeps the halt reason as its label after a release that keeps it paused.
+- A follow-up that fired just before a pause is delivered again after the resume. Delivery is at least once, never zero.
 
 ## Left to the builder
 

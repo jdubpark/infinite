@@ -144,7 +144,7 @@ All root steps are the owner's. Each has a rollback in its runbook.
 
 ## Owner decisions
 
-The owner approved the direction on 2026-11-14. These calls were made by the builder under that approval and are open to change:
+The owner approved the direction on 2026-11-14 and, the same day, told the builder to settle the open decisions by its own recommendations. The calls below stand on that delegation. The owner reviewed none of them one by one, and each stays open to change:
 
 1. The default ceiling turns off Claude Code's auto mode. If the owner wants the provider's own classifier for some roles, that key is removed and the reason recorded.
 2. Unlisted egress is refused in `enforce`, and listed in the summary in `observe`. There is no "ask the owner per host" prompt.
@@ -152,6 +152,16 @@ The owner approved the direction on 2026-11-14. These calls were made by the bui
 4. The mission coordinator and the permission reviewer get no GitHub access.
 5. The `gh` allowlist is the seven commands above. `gh api` is refused.
 6. Managed hooks, managed permission rules, and managed MCP stay off until their tests pass on the real host.
+7. The first release installs none of the three controls. The code ships with `autonomy.boundary` absent, and a session's environment stays what it was. Each control is installed on its own, in the rollout order above, after its host checks pass on the real host.
+8. The ceilings wait for the host permission agent. They move every bypass-mode session to the provider's default mode, and until an agent answers those prompts, each one waits for the owner.
+9. The egress proxy starts in `observe`. `enforce` waits until briefing and code-graph launches carry the proxy variables, because their network calls would otherwise fail.
+10. The GitHub token switch waits until the owner names the `gh` commands and the Git LFS use they need. After the switch, an owner session loses `gh api`, `gh run`, `gh issue`, and LFS, and the boundary holds only one hour later, when the old tokens have expired.
+11. The ceiling template names the first instance's secret paths only. A host that runs a second instance adds that instance's paths to the installed file before relying on it.
+
+Known limits at the first release:
+
+- No deploy file of the three controls (firewall rule, service units, account and ACL commands) has run on a Linux host. Each was checked by tests and review on the build machine only.
+- The ceilings flag check does not read a Codex permission-profile selection.
 
 ## Left to the builder
 

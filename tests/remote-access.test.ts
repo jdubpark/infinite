@@ -444,3 +444,15 @@ test("the relay refuses roll-ups and imports", { timeout: 20000 }, async () => {
     assert.equal(runner.requests.length, 1, "a refused roll-up or import does not reach the host");
   } finally { client.close(); runner.close(); }
 });
+
+test("the relay refuses objective records", async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    // The objective record is read over a direct connection only, like the roll-ups.
+    for (const path of [`/goals/${randomUUID()}/record`, `/goals/${randomUUID()}/record?version=1`, `/teams/${randomUUID()}/record`])
+      await assert.rejects(client.request(path), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    assert.equal(runner.requests.length, 1, "a refused record read does not reach the host");
+  } finally { client.close(); runner.close(); }
+});

@@ -975,6 +975,15 @@ test("a team builds concurrently in isolated copies and produces checked, review
     assert.ok(workers.every(worker => worker.cwd !== f.source && worker.finishedAt));
     assert.ok(Math.max(...workers.map(worker => worker.startedAt)) < Math.min(...workers.map(worker => worker.finishedAt)), "The implementers must actually overlap");
     assert.equal((await viewer.request<{ teams: TeamView[] }>("/teams")).teams.filter(run => run.id === id).length, 1);
+    // A standalone run's record starts at its first accepted plan and holds the objective as its text.
+    const record = await f.host.fetchApi(`/teams/${id}/record`, "viewer");
+    assert.equal(record.status, 200, JSON.stringify(record.body));
+    assert.equal(record.body.owner.kind, "run");
+    assert.equal(record.body.record.criteria[0].statementOf, "objective");
+    assert.equal(record.body.record.statement.objective, request.objective);
+    assert.equal(record.body.log[0].op, "record.created"); assert.equal(record.body.log[0].actor, "host");
+    const missing = await f.host.fetchApi(`/teams/${randomUUID()}/record`, "viewer");
+    assert.equal(missing.status, 404); assert.equal(missing.body.code, "team-not-found");
     const commands = readFileSync(join(f.receipts, "commands.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     assert.ok(commands.some(command => command.cwd === f.source && command.command === "git"), "Source Git inspection must use the configured execution identity");
     for (const worker of workers)
@@ -1867,7 +1876,13 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
     const invalid = await client.rpc("tools/call", { name: "report", arguments: { report: { kind: "plan", summary: "No tasks supplied" } } });
     assert.equal(invalid.result.isError, true);
     assert.equal(requests, 0, "Malformed report input must not reach the worker");
-    const report = { kind: "blocked", summary: "MCP report boundary evidence" };
+    const report = { kind: "blocked", summary: "MCP report boundary evidence", blocker: {
+      cause: { status: "hypothesis", detail: "The provider may not expose the required tool." },
+      issueRefs: ["TASK-123"], sourceRefs: ["packages/host/src/team-prompts.ts@abc123"],
+      attemptedFixes: [{ fix: "Checked the assignment's available tools.", outcome: "The required capability remains unavailable." }],
+      proposedRecovery: "Request an owner-authorized supported capability.", prevention: "Check provider capabilities before dispatch.",
+      validationEvidence: [{ sourceRef: "packages/host/src/team-prompts.ts", observation: "The assignment lists its available tools." }],
+    } };
     const forged = await client.rpc("tools/call", { name: "report", arguments: { report, memberId: randomUUID() } });
     assert.equal(forged.result.isError, true);
     assert.equal(requests, 0, "Tool callers cannot substitute an assignment identity");
@@ -1883,6 +1898,7 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
     assert.equal(recorded[0].data.runId, running.id);
     assert.equal(recorded[0].data.memberId, member.memberId);
     assert.equal(recorded[0].data.revision, running.revision);
+    assert.deepEqual(recorded[0].data.report.blocker, report.blocker, "the durable worker journal retains structured blocker evidence");
     const release = releaseResponse!;
     releaseResponse = undefined;
     release();
@@ -1894,7 +1910,7 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
 
     const restarted = startMcp();
     await restarted.initialize();
-    const repeated = await restarted.rpc("tools/call", { name: "report", arguments: { report: { summary: report.summary, kind: report.kind } } });
+    const repeated = await restarted.rpc("tools/call", { name: "report", arguments: { report: { blocker: report.blocker, summary: report.summary, kind: report.kind } } });
     assert.notEqual(repeated.result.isError, true);
     assert.equal(repeated.result.structuredContent.requestId, delivered.result.structuredContent.requestId, "The same validated report retains its request identity across helper processes");
     const conflict = await restarted.rpc("tools/call", { name: "report", arguments: { report: { ...report, summary: "A conflicting result" } } });

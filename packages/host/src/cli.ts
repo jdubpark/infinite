@@ -239,6 +239,9 @@ infinite repo init [--permissions coordinator|off] [--permission-scope TEXT] [--
                                           First enrollment delegates to coordinator by default
 infinite repo init --permissions off        Disable delegation for future runs
 infinite team revoke-permissions TEAM_ID    Revoke delegation for an active run
+infinite permissions status [--json]        Show workspace permission delegation
+infinite permissions delegate (--workspace W | --all) [--direction TEXT | --clear-direction] [--request-id UUID]
+infinite permissions revoke --workspace W [--request-id UUID]
 infinite projects [--json]                 List projects and suggested groups
 infinite understand [--workspace ID] [--json] Read workspace Understanding
 infinite understand catalog|components|component ID|policy|refresh --workspace ID

@@ -33,6 +33,7 @@ import { isCollapsedPermissionPrompt, permissionEvidenceHash, oneShotPermissionO
 import { nativeContinuationSchema, teamModelProfileSchema, type NativeContinuation, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
 import { missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { withNativeContinuation } from "./native-continuation.js";
+import { deferredCallOpen, type HeadlessPermissionChannel } from "./permission-headless.js";
 import { agentBoundary, inventoryRuntimeProcesses, runtimeIdentity, stopRuntimeTree, type RuntimeProcess, type TeamRuntimeInspection, type TeamRuntimeRetirement } from "./team-retirement.js";
 import { TeamError } from "./team-workspace.js";
 import {
@@ -189,6 +190,9 @@ export class Manager {
   private fuse?: FuseGate;
   /** The launch-rate fuse. Without one, every session starts as before and nothing is counted. */
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
+  private headlessChannel?: Pick<HeadlessPermissionChannel, "admit">;
+  /** The headless permission channel. Without one, every headless launch starts as before. */
+  useHeadlessChannel(channel: Pick<HeadlessPermissionChannel, "admit">) { this.headlessChannel = channel; }
   reserveHandoff(projectId: string) {
     const project = this.config.projects.find(project => project.id === projectId);
     if (!project) throw new ContentError("Handoff project is unavailable");
@@ -804,6 +808,9 @@ export class Manager {
       return result;
     };
     if (session.team) throw new ContentError("Resume this member from its team so its assignment stays consistent");
+    // An ordinary resume has no permission channel, so the provider's own rules would decide the call the owner was asked about.
+    if (session.headless?.channel && deferredCallOpen((after, limit) => this.events(sessionId, after, limit, new Set(["lifecycle"]))))
+      throw new ContentError("This session ended while a call waited for the owner's answer. Start a new session instead of resuming it.", 409);
     const state = await this.state(sessionId);
     if (state.status === "running" || state.status === "starting") return remember({ ...session, ...state });
     const native = state.nativeSession ?? session.resumeNativeSession;
@@ -961,6 +968,10 @@ export class Manager {
       }
       session.handoff ??= { reason };
     }
+    const launchProfile = request.nativeArgs === undefined || request.localUi ? profile : { ...profile, args: [...profile.args, ...request.nativeArgs] };
+    // Recorded with the session: a headless launch, whether the permission channel serves it, and why not.
+    const headless = this.headlessChannel?.admit({ provider: request.provider, profile: launchProfile, session, hooks: request.nativeArgs === undefined && !request.localUi });
+    if (headless) session.headless = headless.record;
     // Keep the native prompt exact. Only opted-in, qualified sessions receive the
     // separate handoff MCP capability; the context snapshot stays in the record.
     const prompt = request.nativeArgs !== undefined ? "" : [
@@ -997,14 +1008,13 @@ export class Manager {
     child.stdin.end(
       JSON.stringify({
         session,
-        profile: request.nativeArgs === undefined || request.localUi ? profile : {
-          ...profile, args: [...profile.args, ...request.nativeArgs],
-        },
+        profile: launchProfile,
         stateDir: this.config.stateDir,
         runDir: this.config.runDir,
         key: this.key.toString("base64"),
         prompt,
         ...(request.workspace ? { executorTokenHash: createHash("sha256").update(request.workspace.token).digest("hex") } : {}),
+        ...(headless?.bootstrap ? { permissionChannel: headless.bootstrap } : {}),
         attention: {
           // Native CLI launches keep their exact argv: no hook settings are injected.
           hooks: request.nativeArgs !== undefined

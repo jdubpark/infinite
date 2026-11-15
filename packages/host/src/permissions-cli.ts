@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { WorkspaceDelegationView } from "./permission-delegation-types.js";
+import type { HeadlessChannelStatus } from "./permission-agent-types.js";
 
 type PermissionsApi = { json<T = unknown>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<T> };
 type Options = Record<string, string | boolean>;
-type PermissionStatus = { agent: string; policyVersion: number; interruptClasses: string[]; workspaces: WorkspaceDelegationView[]; rates: { lastHour: { decisions: number }; lastDay: { decisions: number } } | null };
+type PermissionStatus = { agent: string; policyVersion: number; interruptClasses: string[]; workspaces: WorkspaceDelegationView[]; rates: { lastHour: { decisions: number }; lastDay: { decisions: number } } | null; headless?: HeadlessChannelStatus | null };
 type DelegationResult = { agent: string; views: WorkspaceDelegationView[]; replacedOptOuts: string[] };
 type RevocationResult = { agent: string; view: WorkspaceDelegationView };
 
@@ -37,6 +38,18 @@ function printView(view: WorkspaceDelegationView) {
   for (const project of view.projects) console.log(`  ${clean(project.name)}  ${clean(project.projectId)}  ${clean(project.state)}`);
 }
 
+/** Live headless sessions, and the allow rules of served ones that a class rule outranks. */
+function printHeadless(status: HeadlessChannelStatus) {
+  if (!status.sessions.length) return;
+  console.log("Headless sessions:");
+  for (const session of status.sessions) {
+    console.log(`  ${clean(session.title, 200)}  ${clean(session.sessionId)}  ${clean(session.state)}${session.reason ? `: ${clean(session.reason)}` : ""}`);
+    if (session.waiting) console.log(`    Waits for you: ${clean(session.waiting.tool)} (${clean(session.waiting.interruptClass)}) since ${clean(session.waiting.since)}, retired at ${clean(session.waiting.expiresAt)}`);
+  }
+  for (const rule of status.shadowed)
+    console.log(`  Allow rule ${clean(rule.rule)} of ${clean(rule.sessionId)} is outranked by ${clean(rule.classRule)} (${clean(rule.interruptClass)}): such a call waits for you.`);
+}
+
 function printNotice(agent: string) {
   if (agent === "inactive") console.log(INACTIVE_NOTICE);
 }
@@ -51,6 +64,7 @@ export async function handlePermissionsClientCommand(positional: string[], optio
       if (!result.workspaces.length) console.log("No projects are enrolled on this host.");
       for (const view of result.workspaces) printView(view);
       if (result.rates) console.log(`Decisions: ${Number(result.rates.lastHour.decisions)} in the last hour, ${Number(result.rates.lastDay.decisions)} in the last day`);
+      if (result.headless) printHeadless(result.headless);
       printNotice(result.agent);
     }
     return true;

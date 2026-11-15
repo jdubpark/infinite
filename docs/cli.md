@@ -444,6 +444,17 @@ workspace, that project's coverage ends, and moving it back restores nothing:
 delegate again. A retried `--request-id` prints the recorded result and changes
 nothing.
 
+`status` also lists the live headless sessions. Each one is `served`,
+`admitted` (launched with the permission channel, no tool call yet), or
+`not-served` with the reason. Only a Claude Code `--print` launch in the
+default permission mode can be served. A served session's call that waits
+for you is listed with its class and the time it is retired unanswered, 29
+days after it started waiting. `status` also lists each allow rule of a
+served session's launch profile that a class rule outranks. A call under
+such a rule still waits for you. Answer a waiting call from the session's
+prompt. Stop the session to retire the call unanswered. A session that ended
+while a call waited cannot be resumed; start a new session instead.
+
 A project that is not on the host is covered by nothing. If it returns under
 the same id and path, it keeps the coverage it had, unless the owner delegated
 or revoked its workspace while it was away: either act ends that project's

@@ -8,7 +8,13 @@ import { createHash } from "node:crypto";
 const fuseSubject = (projectId: string | undefined) =>
   projectId === undefined ? "host" : projectId.length <= 40 ? projectId : createHash("sha256").update(projectId, "utf8").digest("hex").slice(0, 32);
 
-type Row = { id: string; title: string; provider: Provider; attention: Attention; reading?: { now?: { text: string } } };
+type Row = {
+  id: string; title: string; provider: Provider; attention: Attention; reading?: { now?: { text: string } };
+  /** A headless session's permission channel: the call that waits for the owner, and the latest call it could not hold. */
+  permissionChannel?: { waiting?: { interruptClass: string }; notice?: { id: string; interruptClass?: string } };
+  /** Set by the notifier on the copy of a row that announces a permission notice. */
+  permissionNotice?: true;
+};
 type TeamRow = { id: string; title: string; status: string; reason?: string; resumable?: boolean; goal?: boolean; mission?: boolean };
 /** Who a team member's open prompt waits on: the run's delegated coordinator, the owner, or a review the run has not started yet. */
 export type PromptOwner = "coordinator" | "user" | "undecided";
@@ -44,6 +50,9 @@ const TEAM_EVENTS: Record<string, { event: string; title: string; body: string; 
 
 export class Notifier {
   private seen = new Map<string, string>();
+  /** The last headless permission notice announced for each session. */
+  private notices = new Map<string, string>();
+  private noticesPrimed = false;
   /** Needs-you prompts held back because the run's coordinator may answer them, by session id. */
   private deferred = new Map<string, { key: string; since: number }>();
   private teamStatus = new Map<string, string>();
@@ -97,6 +106,7 @@ export class Notifier {
           }
         }
       }
+      due.push(...this.channelNotices(rows));
       this.prune("session", this.seen, new Set(rows.map(row => row.id)));
       // A session missing from one listing keeps its hold, so a prompt that comes back unchanged
       // can still reach the owner; the hold limit bounds how long an absent session is remembered.
@@ -267,8 +277,42 @@ export class Notifier {
       data: { url: `/${item.kind}/${item.id}`, ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
       priority: item.priority, collapseId: `${item.kind}:${item.id}` };
   }
+  /**
+   * A headless call that needed the owner and could not wait was denied: the owner hears of it once, with its class.
+   * Notices present at startup are taken as already announced.
+   */
+  private channelNotices(rows: Row[]): Row[] {
+    const due: Row[] = [];
+    for (const row of rows) {
+      const notice = row.permissionChannel?.notice;
+      if (!notice || this.notices.get(row.id) === notice.id) continue;
+      this.notices.set(row.id, notice.id);
+      if (this.noticesPrimed && this.options.events.includes("needs-you")) due.push({ ...row, permissionNotice: true });
+    }
+    const listed = new Set(rows.map(row => row.id));
+    for (const id of this.notices.keys()) if (!listed.has(id)) this.notices.delete(id);
+    this.noticesPrimed = true;
+    return due;
+  }
   private message(row: Row, to: string) {
     const name = PROVIDER_NAMES[row.provider] ?? row.provider;
+    const channel = row.permissionChannel;
+    if (row.permissionNotice) {
+      const named = channel?.notice?.interruptClass ? ` (${channel.notice.interruptClass})` : "";
+      return {
+        to, title: "Call denied: needs you", body: `${name} in ${row.title} made a call${named} that needs your own answer. It was denied and can be asked again.`,
+        data: { url: `/session/${row.id}`, ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
+        priority: "high" as const, collapseId: `${row.id}:permission`,
+      };
+    }
+    if (row.attention.state === "needs-you" && channel?.waiting) {
+      const minimal = `${name} waits for your answer in ${row.title} (${channel.waiting.interruptClass})`;
+      return {
+        to, title: "Needs your answer", body: minimal,
+        data: { url: `/session/${row.id}`, ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
+        priority: "high" as const, collapseId: row.id,
+      };
+    }
     const [title, minimal] =
       row.attention.state === "needs-you"
         ? row.attention.prompt?.kind === "question" ? ["Question for you", `${name} asked a question in ${row.title}`] : ["Needs your approval", `${name} needs your approval in ${row.title}`]

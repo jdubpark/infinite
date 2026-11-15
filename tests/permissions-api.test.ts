@@ -111,6 +111,8 @@ test("owner delegation covers one workspace or all, ends on an owner regroup als
     // No permission agent yet: the rates are empty, and the capability advertises delegation.
     const settled = await host.fetchApi("/permissions/status", "owner");
     assert.equal(settled.body.agent, "inactive");
+    // No headless session runs, so the channel lists none.
+    assert.deepEqual(settled.body.headless, { sessions: [], shadowed: [] });
     assert.equal(settled.body.policyVersion, PERMISSION_POLICY_VERSION);
     assert.deepEqual(settled.body.interruptClasses, [...INTERRUPT_CLASSES]);
     assert.equal(settled.body.rates.lastHour.decisions, 0);

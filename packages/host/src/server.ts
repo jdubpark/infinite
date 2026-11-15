@@ -68,6 +68,7 @@ import { createMissionSchema, missionActionSchema, missionTextSchema, type Creat
 import { ProjectGroupService } from "./project-groups.js";
 import { PermissionDelegationService } from "./permission-delegation.js";
 import type { PermissionAgentServices } from "./permission-agent-types.js";
+import { HeadlessPermissionChannel } from "./permission-headless.js";
 import { INTERRUPT_CLASSES, PERMISSION_POLICY_VERSION } from "./permission-policy.js";
 import { PermissionJournal, permissionJournalModule } from "./evidence/permission-journal.js";
 import { LinearService } from "./linear.js";
@@ -283,6 +284,10 @@ export function createApp(config: Config, key: Buffer) {
   // The permission agent's parts. A part that is absent leaves the requests it would serve with the owner.
   const permissionAgent: PermissionAgentServices = {};
   void permissionAgent;
+  // The headless channel reads the pipeline from this registry on every call: until one is added it serves nothing.
+  const headlessChannel = new HeadlessPermissionChannel({ key, runDir: config.runDir, sessions: manager, services: permissionAgent });
+  permissionAgent.headless = headlessChannel;
+  manager.useHeadlessChannel(headlessChannel);
   const missions = new MissionService(config, key, manager, teams, projectGroups);
   ownerServices.missions = missions;
   // A run is live while its sealed record file exists, so a record that failed to load keeps its evidence.
@@ -1037,7 +1042,7 @@ export function createApp(config: Config, key: Buffer) {
   app.put("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.update(projectGroupIdSchema.parse(req.params.id), updateProjectGroupSchema.parse(req.body))));
   app.delete("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.remove(projectGroupIdSchema.parse(req.params.id), z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict().parse(req.body))));
   const permissionsUnavailable = (res: express.Response) => res.status(503).json({ error: "Permission delegation is unavailable on this host." });
-  app.get("/api/permissions/status", requireRole(["owner", "controller"]), (_req, res) => {
+  app.get("/api/permissions/status", requireRole(["owner", "controller"]), async (_req, res) => {
     if (!permissionDelegation) return permissionsUnavailable(res);
     const journal = permissionJournal;
     const now = Date.now();
@@ -1051,6 +1056,8 @@ export function createApp(config: Config, key: Buffer) {
       interruptClasses: [...INTERRUPT_CLASSES],
       workspaces: permissionDelegation.status(),
       rates,
+      // Informational as well: a listing that fails reports null.
+      headless: await headlessChannel.status().catch(() => null),
     });
   });
   // Decision figures for one session, task or workspace, or for the host, over the last `hours` (one hour to seven days).
@@ -2002,6 +2009,7 @@ export function createApp(config: Config, key: Buffer) {
     void repositoryBriefings?.start().catch(() => {});
     understandingRuntime.start();
     balances.start();
+    void headlessChannel.listen().catch(() => console.warn("[Infinite] The headless permission channel could not start."));
     sweepEvidence();
     evidenceSweep = setInterval(sweepEvidence, 60 * 60 * 1000);
     evidenceSweep.unref();
@@ -2010,6 +2018,7 @@ export function createApp(config: Config, key: Buffer) {
     outboxTimer.unref();
   });
   server.once("close", () => {
+    headlessChannel.close();
     teams.close();
     usage.close();
     balances.close();

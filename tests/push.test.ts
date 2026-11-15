@@ -595,3 +595,30 @@ test("the notifier pushes one fuse interrupt and marks it announced", async () =
   assert.deepEqual(marked, [["trip-1"]], "and nothing is marked");
   rmSync(dir, { recursive: true, force: true });
 });
+
+test("a headless call that waits names its class, and a call that could not wait is announced once", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("controller", "ExponentPushToken[a]", "android");
+  const sent: Array<Array<{ title: string; body: string; collapseId: string }>> = [];
+  const session: Record<string, unknown> = { id: "s1", title: "Deploy", provider: "claude", status: "running", attention: att("working") };
+  const notifier = new Notifier({ list: async () => [session] } as never, store,
+    async (messages) => { sent.push(messages as never); return messages.map(() => ({ status: "ok" as const, id: "x" })); },
+    { detail: "minimal", events: ["needs-you"], intervalMs: 100000 });
+  // A notice present at startup was already announced.
+  session.permissionChannel = { served: true, notice: { id: "n0", interruptClass: "credentials" } };
+  await notifier.tick();
+  session.attention = att("needs-you", 9);
+  session.permissionChannel = { served: true, waiting: { interruptClass: "production-or-staging" }, notice: { id: "n0" } };
+  await notifier.tick();
+  assert.deepEqual(sent.map(batch => [batch[0].title, batch[0].body]), [["Needs your answer", "Claude Code waits for your answer in Deploy (production-or-staging)"]]);
+  session.attention = att("working");
+  session.permissionChannel = { served: true, notice: { id: "n1", interruptClass: "money" } };
+  await notifier.tick();
+  await notifier.tick();
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1][0].title, "Call denied: needs you");
+  assert.match(sent[1][0].body, /\(money\) that needs your own answer/);
+  assert.equal(sent[1][0].collapseId, "s1:permission");
+  rmSync(dir, { recursive: true, force: true });
+});

@@ -2,8 +2,10 @@ import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import type { SecondaryRequest } from "./transcript-secondary.js";
 
-export type HookRoute = "claude" | "codex" | "codex-notify" | "team-report" | "mission-report" | "team-handoff" | "transcript" | "drain";
-const ROUTES = new Set<string>(["claude", "codex", "codex-notify", "team-report", "mission-report", "team-handoff", "transcript", "drain"]);
+export type HookRoute = "claude" | "codex" | "codex-notify" | "team-report" | "mission-report" | "team-handoff" | "transcript" | "drain" |
+  "permission-check" | "permission-request";
+const ROUTES = new Set<string>(["claude", "codex", "codex-notify", "team-report", "mission-report", "team-handoff", "transcript", "drain",
+  "permission-check", "permission-request"]);
 const MAX_BODY = 256 * 1024;
 export class HookPayloadError extends Error {
   constructor(readonly status: number, message = "Hook payload was refused") { super(message); }
@@ -25,9 +27,15 @@ export interface HookReply {
   secondaries?: SecondaryRequest[];
 }
 
+/**
+ * The reply on a permission channel route. Only the channel's own hook command (permission-hook.ts) reads it; the
+ * signal relay never calls these routes.
+ */
+export type HookAnswer = import("./permission-hook.js").ChannelAnswer;
+
 export function startHookServer(opts: {
   token: string;
-  onPayload: (route: HookRoute, body: unknown) => HookReply | void | Promise<HookReply | void>;
+  onPayload: (route: HookRoute, body: unknown) => HookReply | HookAnswer | void | Promise<HookReply | HookAnswer | void>;
   onError: () => void;
 }): Promise<{ port: number; url: string; close: () => void }> {
   const expected = Buffer.from(opts.token);
@@ -74,7 +82,7 @@ export function startHookServer(opts: {
         res.writeHead(400).end();
         return;
       }
-      let reply: HookReply | void = undefined;
+      let reply: HookReply | HookAnswer | void = undefined;
       try {
         reply = await opts.onPayload(route as HookRoute, parsed);
       } catch (error) {

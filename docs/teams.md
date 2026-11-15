@@ -1695,9 +1695,11 @@ answer, an answer in flight is fenced, and the coordinator review decides
 nothing more for that run. The switch is fenced: from the moment the run can
 be served no coordinator answer starts, the run's coordinator answers already
 with a worker are fenced there, and only then does the permission agent serve
-the run. An answer whose fence the worker does not confirm, or one that was in
-flight when the host restarted, keeps the run from switching until the worker
-confirms the fence or the session has exited; meanwhile the run's dialogs stay
+the run. Each coordinator answer is recorded as one a worker may still type in
+the same save that dispatches it, and stays so until its result is conclusive,
+the worker confirms its fence, or its session has exited. An answer in that
+state, including one whose result was never confirmed or that was in flight
+when the host restarted, keeps the run from switching; meanwhile the run's dialogs stay
 with the owner. The switch runs at the owner act or the replay that made the host
 ready, not only at the next scheduler pass, and the coordinator's authority is
 read once more under the session's input lease immediately before its answer

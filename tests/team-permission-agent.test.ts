@@ -266,6 +266,46 @@ test("a coordinator answer whose fence the worker did not confirm keeps the run 
   } finally { await f.close(); }
 });
 
+test("a coordinator answer whose result was not confirmed keeps the run from switching until the worker confirms its fence", { timeout: 180000 }, async () => {
+  const f = await fixture("permissions-revoke", lineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const runId = created.body.id as string;
+    await waitFor(() => f.get(runId), run => run.permissionDecisions?.some(decision => decision.status === "reviewing") === true &&
+      existsSync(join(f.receipts, `${runId}.judge-ready`)), 60000);
+    // The coordinator's answer ends without a confirmed result, as a worker that stalls past the answer timeout does,
+    // before the permission agent serves the run. The worker's fence can be made to fail.
+    let fenceWorks = false;
+    let manager!: Manager;
+    const service = await f.openTeamService({
+      start: false,
+      manager: value => {
+        manager = value;
+        value.answerTeamPermission = async () => { throw new Error("The worker did not answer in time."); };
+        const fence = value.invalidateTeamPermission.bind(value);
+        value.invalidateTeamPermission = async (...args) => fenceWorks ? fence(...args) : "uncertain";
+      },
+    });
+    let served = false;
+    const { pipeline } = fakePipeline(() => ({ kind: "owner", decisionId: randomUUID(), interruptClass: "credentials" }));
+    pipeline.serves = () => served ? { served: true } : { served: false, reason: "not-covered" };
+    service.usePermissionAgent({ pipeline, delivery: new InteractivePermissionDelivery({ pipeline: () => pipeline, ledger: memoryLedger() }) });
+    service.start();
+    writeFileSync(join(f.receipts, `${runId}.judge-release`), "release", { mode: 0o600 });
+    await waitFor(() => service.get(runId), view => view.permissionDecisions?.[0]?.status === "uncertain", 60000);
+    const member = service.get(runId).members.find(item => item.taskId === "a")!;
+    const session = manager.meta(member.sessionId).session;
+    served = true;
+    // No coordinator review is live, but the uncertain answer may still be typed: the run does not switch.
+    await service.permissionAuthorityChanged();
+    assert.equal(service.permissionAgentLive(session), false, "an answer whose result was not confirmed blocks the switch");
+    fenceWorks = true;
+    await service.permissionAuthorityChanged();
+    assert.equal(service.permissionAgentLive(session), true);
+  } finally { await f.close(); }
+});
+
 test("an owner act that makes the permission agent serve a run retires its coordinator reviews at once, without the scheduler", { timeout: 180000 }, async () => {
   const f = await fixture("permissions-revoke", lineup);
   try {

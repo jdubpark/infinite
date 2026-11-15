@@ -153,11 +153,13 @@ type Stored = {
    */
   ownerHalt?: { haltId?: string; reason: string };
   /**
-   * Coordinator answers that were in flight when their authority ended, or when the host restarted, and whose
-   * fence the session's worker has not confirmed. The run is not switched to the permission agent while one
-   * remains: each is fenced again until the worker confirms it or its session has exited.
+   * Coordinator answers that a worker may still type. Each is added in the save that dispatches it and removed only
+   * on a conclusive result, a fence the worker confirmed, or an exit of its session. The run is not switched to the
+   * permission agent while one remains: each is fenced again until the worker confirms it or its session has exited.
    */
   unfencedAnswers?: string[];
+  /** Set once the uncertain answers of a record written before every dispatched answer was marked are marked too. */
+  answersMarked?: true;
   deliveryAttempt?: { memberId: string; revision: number; headCommit: string };
   continuationHead?: { revision: number; headCommit: string };
   checkHead?: string;
@@ -649,6 +651,14 @@ export class TeamService {
         }
         // Retain the intent so resume cannot disguise an ambiguous operation.
         this.save(stored); this.trackBlocked(stored);
+      }
+      // A record from before every dispatched answer was marked: its uncertain answers may still be typed, so each
+      // is fenced again before the run switches to the permission agent.
+      if (!stored.answersMarked) {
+        const uncertain = (stored.run.permissionDecisions ?? []).filter(decision => decision.status === "uncertain").map(decision => decision.id);
+        if (uncertain.length) stored.unfencedAnswers = [...new Set([...(stored.unfencedAnswers ?? []), ...uncertain])];
+        stored.answersMarked = true;
+        this.save(stored);
       }
       for (const decision of stored.run.permissionDecisions ?? []) if (decision.status === "answering") {
         decision.status = "uncertain";
@@ -1855,7 +1865,7 @@ export class TeamService {
       if (fence !== "invalidated") {
         uncertain = true;
         stored.unfencedAnswers = [...new Set([...(stored.unfencedAnswers ?? []), decision.id])];
-      }
+      } else this.settleAnswerMark(stored, decision.id);
     }
     if (uncertain) this.event(stored, "An in-flight delegated permission answer could not be conclusively fenced. Its decision remains uncertain; inspect the target session.");
     this.save(stored);
@@ -1885,6 +1895,11 @@ export class TeamService {
       this.save(stored);
     }
     return left.length === 0;
+  }
+  /** Removes a coordinator answer that no worker can type any more from the run's unfenced answers. */
+  private settleAnswerMark(stored: Stored, decisionId: string) {
+    const left = (stored.unfencedAnswers ?? []).filter(id => id !== decisionId);
+    if (left.length) stored.unfencedAnswers = left; else delete stored.unfencedAnswers;
   }
   pause(id: string, input: Action) { return this.action(id, "pause", teamActionSchema.parse(input)); }
   resume(id: string, input: Action) { return this.action(id, "resume", teamActionSchema.parse(input)); }
@@ -4451,6 +4466,9 @@ export class TeamService {
           Date.now() >= Date.parse(decision.expiresAt))
         return { status: "escalated" as const, reason: "The permission decision changed while the target session was being checked." };
       decision.status = "answering";
+      // Marked in the same save that dispatches it: until this answer is conclusively settled the run does not
+      // switch to the permission agent, whether the answer times out, its fence fails, or the host restarts.
+      stored.unfencedAnswers = [...new Set([...(stored.unfencedAnswers ?? []), decision.id])];
       if (coordinator) decision.reason = summary;
       this.save(stored);
       try {
@@ -4481,6 +4499,8 @@ export class TeamService {
       if (["reviewing", "approved", "answering"].includes(decision.status)) { decision.status = result.status; decision.reason = result.reason ?? decision.reason; }
       else decision.reason = "The decision changed while the answer was in flight. Inspect the target session before acting.";
       if ("receipt" in result) decision.receipt = result.receipt;
+      // A closed prompt, or an answer the worker refused or that was never sent, cannot be typed later.
+      if (result.status !== "uncertain") this.settleAnswerMark(stored, decision.id);
       if (coordinator) coordinator.status = "waiting";
       this.recordPermissionReviewOutcome(stored, decision, result, summary ?? decision.reason ?? "", false);
       this.event(stored, result.status === "answered" ? "A one-shot permission option was delivered and the prompt closed; command execution remains unknown." : "The permission request remains with the user.");

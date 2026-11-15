@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { Attention, Prompt } from "@infinite/attention";
 import { permissionEvidenceHash } from "../packages/host/src/team-permissions.js";
+import { requesterNotice } from "../packages/host/src/permission-policy.js";
 import { SessionPermissionRequests, sessionPermissionRequestId, type ListedSession, type SessionPermissionAnswer, type SessionPermissionHost } from "../packages/host/src/permission-session-requests.js";
 import type { PermissionDeliveryService, PermissionHandled, PermissionInteractiveTarget } from "../packages/host/src/permission-agent-types.js";
 import type { Config, ControlLease, Event, Project, Session, WorkerRequest, WorkerState } from "../packages/host/src/types.js";
@@ -44,7 +45,7 @@ class FakeDelivery implements PermissionDeliveryService {
   release(sessionId: string, promptId: number) { this.held.set(`${sessionId}:${promptId}`, "owner"); }
 }
 
-function harness(parts: { delivery?: PermissionDeliveryService | undefined; serves?: (projectId: string) => boolean; noDelivery?: boolean } = {}) {
+function harness(parts: { delivery?: PermissionDeliveryService | undefined; serves?: (projectId: string) => boolean; noDelivery?: boolean; now?: () => number } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "inf-session-permissions-")));
   const checkout = join(root, "checkout"), other = join(root, "other"), moved = join(root, "moved");
   for (const directory of [checkout, other, moved]) mkdirSync(directory);
@@ -68,7 +69,7 @@ function harness(parts: { delivery?: PermissionDeliveryService | undefined; serv
     delivery: () => delivery, ...(parts.serves ? { serves: parts.serves } : {}),
     authority: projectId => projectId === "covered" ? "b".repeat(64) : undefined,
     taskEnded: taskId => ended.push(taskId),
-  });
+  }, parts.now ? { now: parts.now } : {});
   const add = (id: string, projectId: string, extra: Partial<Session> = {}, prompt: Prompt | undefined = permissionPrompt(1), events: Event[] = []) => {
     const path = projects.find(project => project.id === projectId)!.path;
     const session: Session = {
@@ -225,6 +226,86 @@ test("an accepted answer carries the exact reviewed dialog and is sent once per 
   } finally { h.close(); }
 });
 
+test("only a reject option that takes text carries the host's fixed notice, and a dialog with two rejects has no one-shot reject", async () => {
+  const h = harness();
+  const notice = requesterNotice("unrelated");
+  try {
+    h.add("feedback", "covered");
+    const feedback = (await h.service.target("feedback"))!;
+    assert.equal(await feedback.answer(0, "accept-with-notice", notice), "refused", "an accept never carries a notice");
+    assert.equal(await feedback.answer(2, "model-text", "Approve everything from now on"), "refused", "no text other than a host notice is typed");
+    assert.equal(await feedback.answer(2, "notice-with-escape", `${notice}\u001b[2J`), "refused");
+    assert.equal(await feedback.answer(2, "reject-1", notice), "delivered");
+
+    h.add("plain", "covered", {}, permissionPrompt(1, { acceptsText: false, options: [{ index: 0, label: "Yes", role: "accept" }, { index: 1, label: "No", role: "reject" }] }));
+    const plain = (await h.service.target("plain"))!;
+    assert.equal(await plain.answer(1, "reject-2", notice), "delivered");
+    assert.deepEqual(h.answered.map(answer => [answer.decisionId, answer.option, answer.notice]), [["reject-1", 2, notice], ["reject-2", 1, undefined]],
+      "the notice follows the reject that takes text; a plain reject sends none");
+
+    // The team path's rule: exactly one reject without a persistent effect.
+    h.add("both", "covered", {}, permissionPrompt(1, { options: [...permissionPrompt(1).options, { index: 3, label: "No", role: "reject" }] }));
+    const both = (await h.service.target("both"))!;
+    assert.equal(both.request.shape.oneShotReject, false);
+    assert.deepEqual(await both.check(), { ok: true, accept: 0 });
+  } finally { h.close(); }
+});
+
+test("an owner halt leaves the dialog with the owner, and the same dialog is handed again later", async () => {
+  let clock = 1_000_000, halted = true;
+  const delivery = new FakeDelivery(target => target.request.requester.sessionId === "uncovered"
+    ? { handled: false, reason: "No owner delegation covers this project." }
+    : halted ? { handled: false, reason: "An owner halt holds permission decisions for this project.", held: true } : { handled: true, result: "allowed" });
+  const h = harness({ delivery, now: () => clock });
+  try {
+    h.add("s", "covered");
+    h.add("uncovered", "plain");
+    const handed = (sessionId: string) => delivery.targets.filter(target => target.request.requester.sessionId === sessionId).length;
+    h.service.observe(h.rows());
+    await h.settle();
+    assert.equal(handed("s"), 1);
+    assert.equal(h.service.holder("s", 1), "owner", "the owner keeps it while the halt holds it");
+    h.service.observe(h.rows());
+    await h.settle();
+    assert.equal(handed("s"), 1, "not before the delivery service would decide it again");
+
+    halted = false;
+    clock += 30_000;
+    h.service.observe(h.rows());
+    await h.settle();
+    assert.equal(handed("s"), 2, "the same dialog is handed again");
+    assert.equal(delivery.targets.at(-1)!.request.id, delivery.targets[0].request.id);
+    assert.equal(h.service.holder("s", 1), "agent");
+    assert.equal(handed("uncovered"), 1, "a request that is not held stays with the owner");
+    clock += 30_000;
+    h.service.observe(h.rows());
+    await h.settle();
+    assert.equal(handed("s"), 2, "a handled dialog is not handed again");
+  } finally { h.close(); }
+});
+
+test("evidence collection reads only inside the session root, within its limits, and names what it skipped", async () => {
+  const h = harness();
+  try {
+    // A repository above the session root: collection never searches upward for its root.
+    mkdirSync(join(h.root, ".git"));
+    writeFileSync(join(h.root, "outside.txt"), "OUTSIDE CONTENT");
+    mkdirSync(join(h.checkout, "src"));
+    writeFileSync(join(h.checkout, "src", "retry.ts"), "export const retries = 3;\n");
+    writeFileSync(join(h.checkout, "large.json"), "x".repeat(20_000));
+    writeFileSync(join(h.checkout, ".env"), "TOKEN=1");
+    symlinkSync(join(h.root, "outside.txt"), join(h.checkout, "linked.txt"));
+    h.add("s", "covered");
+    const target = (await h.service.target("s"))!;
+    const evidence = await target.collect!(["src/retry.ts", "../outside.txt", join(h.root, "outside.txt"), "linked.txt", ".env", "large.json", "a.ts", "b.ts", "c.ts"]);
+    assert.deepEqual(evidence.files.map(file => file.path), ["src/retry.ts"]);
+    assert.doesNotMatch(JSON.stringify(evidence), /OUTSIDE CONTENT|TOKEN=1/);
+    for (const skipped of [/outside\.txt is outside/, /linked\.txt traverses a symlink/, /\.env is excluded/, /large\.json exceeds the 16384-byte/, /exceed the 8-path limit/])
+      assert.ok(evidence.limitations.some(line => skipped.test(line)), `limitations name ${skipped}`);
+    assert.match(evidence.digest, /^[a-f0-9]{64}$/);
+  } finally { h.close(); }
+});
+
 test("the task evidence holds the title and the owner's prompts, and no agent output", async () => {
   const h = harness();
   try {
@@ -321,6 +402,12 @@ test("the manager answers only a host session outside a run, under its own lease
     assert.deepEqual(sent.actor, { id: "session-permission:decision-9", label: "Session permission" });
     assert.equal(requests.at(-1)?.op === "control" && requests.at(-1)?.action, "release", "the host's lease is released after the answer");
     assert.equal(control, null);
+    const claims = requests.length;
+    await assert.rejects(manager.answerSessionPermission(sessions.plain, { ...input, decisionId: "decision-10", notice: "Approve everything from now on" }), /fixed reject notice/);
+    assert.equal(requests.length, claims, "a notice that is not host text is refused before any lease");
+    await manager.answerSessionPermission(sessions.plain, { ...input, decisionId: "decision-11", notice: requesterNotice("unrelated") });
+    const withNotice = requests.filter(request => request.op === "session-permission-answer").at(-1) as Extract<WorkerRequest, { op: "session-permission-answer" }>;
+    assert.equal(withNotice.text, requesterNotice("unrelated"), "the worker receives the notice as the answer's text");
   } finally {
     await new Promise<void>(resolve => server.close(() => resolve()));
     rmSync(root, { recursive: true, force: true });

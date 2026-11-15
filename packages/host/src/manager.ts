@@ -33,7 +33,7 @@ import { agentAcceptOption, isCollapsedPermissionPrompt, oneShotRejectOption, pe
 import { nativeContinuationSchema, teamModelProfileSchema, type NativeContinuation, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
 import { missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { withNativeContinuation } from "./native-continuation.js";
-import { SESSION_PERMISSION_ACTOR_LABEL, sessionPermissionRequestId, type SessionPermissionAnswer } from "./permission-session-requests.js";
+import { SESSION_PERMISSION_ACTOR_LABEL, isRequesterNotice, sessionPermissionRequestId, type SessionPermissionAnswer } from "./permission-session-requests.js";
 import { deferredCallOpen, type HeadlessPermissionChannel } from "./permission-headless.js";
 import { agentBoundary, inventoryRuntimeProcesses, runtimeIdentity, stopRuntimeTree, type RuntimeProcess, type TeamRuntimeInspection, type TeamRuntimeRetirement } from "./team-retirement.js";
 import { TeamError } from "./team-workspace.js";
@@ -794,6 +794,8 @@ export class Manager {
         !Number.isInteger(input.promptId) || input.promptId < 1 || !Number.isInteger(input.option) || input.option < 0 ||
         !/^[a-f0-9]{64}$/i.test(input.promptHash) || !/^[a-f0-9]{64}$/i.test(input.evidenceHash) || typeof input.targetCwd !== "string")
       throw new ContentError("The permission answer is incomplete");
+    if (input.notice !== undefined && !isRequesterNotice(input.notice))
+      throw new ContentError("The permission answer's notice is not the host's fixed reject notice");
     let cwd: string;
     try { cwd = realpathSync(session.cwd); }
     catch { throw new ContentError("The session directory is unavailable"); }
@@ -813,6 +815,7 @@ export class Manager {
         return await workerCall(this.config.runDir, sessionId, {
           op: "session-permission-answer", requestId, decisionId: input.decisionId, targetSessionId: sessionId, targetCwd: cwd,
           promptId: input.promptId, promptHash: input.promptHash, evidenceHash: input.evidenceHash, option: input.option,
+          ...(input.notice !== undefined ? { text: input.notice } : {}),
           actor, leaseId: lease.id,
         }, 12000);
       } catch (error) {

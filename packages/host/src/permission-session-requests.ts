@@ -9,12 +9,14 @@
  * on a laptop never take this path.
  */
 import { realpathSync } from "node:fs";
-import { relative, isAbsolute } from "node:path";
+import { relative, isAbsolute, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { dialogCommand, matchDestructive, oneShotPermissionOption, type AnswerResult, type Prompt, type PromptOption } from "@infinite/attention";
 import { handoffNativePrompt } from "./handoff-types.js";
-import { permissionEvidenceHash, permissionReuseKey, refusedBeforeSend } from "./team-permissions.js";
-import type { PermissionDeliveryService, PermissionInteractiveTarget, PermissionRequest, PermissionRequestShape } from "./permission-agent-types.js";
+import { oneShotRejectOption, permissionEvidenceHash, permissionReuseKey, refusedBeforeSend } from "./team-permissions.js";
+import { collectPermissionEvidence, permissionEvidenceDigest } from "./team-permission-evidence.js";
+import { REJECT_CODES, requesterNotice } from "./permission-policy.js";
+import type { PermissionDeliveryService, PermissionEvidence, PermissionInteractiveTarget, PermissionRequest, PermissionRequestShape } from "./permission-agent-types.js";
 import type { AgentProfile, Config, Event, Project, Receipt, Session, WorkerState } from "./types.js";
 
 /** The control lease label of the host's own answer. A lease with it is not a person. */
@@ -29,6 +31,12 @@ const TASK_SCAN_PAGES = 16;
 const RESUME_HOPS = 4;
 /** Submitted owner prompts kept per session, newest first. */
 const KEPT_PROMPTS = 64;
+/**
+ * A request that an owner halt held is handed again after this long. The delivery service decides a
+ * request it left with the owner again only after the same time, so an earlier hand-off would only reread it.
+ */
+const HELD_RETRY_MS = 30_000;
+const NOTICE_LIMIT = 2_000;
 
 /* ---------------------------------------------------------------- one-shot choices */
 
@@ -46,15 +54,17 @@ const isReject = (option: PromptOption) => option.role === "reject" || option.ro
 /**
  * The recognised one-shot choices of a permission dialog, read with the team path's qualification
  * (`oneShotPermissionOption`). The destructive flag is set aside: it raises a request, it does not
- * disqualify it. `accept` is set only when the evidence is complete as well.
+ * disqualify it. `accept` is set only when the evidence is complete as well. `reject` follows the team
+ * path's rule (`oneShotRejectOption`: exactly one reject without a persistent effect), and a reject that
+ * would end the session is not one.
  */
 export function permissionChoices(prompt: Prompt): { accept?: number; reject?: number; shape: PermissionRequestShape } {
   const structural: Prompt = { ...prompt, destructive: undefined };
   const accept = oneShotPermissionOption(structural);
   const completeEvidence = oneShotPermissionOption({ ...structural, options: CANONICAL_CHOICES }) !== undefined;
   const offeredAccept = oneShotPermissionOption({ ...COMPLETE_PROBE, options: [...prompt.options.filter(option => !isReject(option)), { index: -1, label: "No", role: "reject" }] });
-  const rejects = prompt.options.filter(option => isReject(option) && !PERSISTENT_LABEL.test(option.label));
-  const reject = (rejects.find(option => option.role === "reject") ?? rejects[0])?.index;
+  const oneShotReject = prompt.options.find(option => option.index === oneShotRejectOption(prompt));
+  const reject = oneShotReject && !PERSISTENT_LABEL.test(oneShotReject.label) ? oneShotReject.index : undefined;
   const persistentOnly = offeredAccept === undefined &&
     prompt.options.some(option => option.role === "accept-always" || option.role === "accept" && PERSISTENT_LABEL.test(option.label));
   return {
@@ -65,6 +75,21 @@ export function permissionChoices(prompt: Prompt): { accept?: number; reject?: n
       trustPrompt: TRUST.test(prompt.title) || prompt.options.some(option => TRUST.test(option.label)),
     },
   };
+}
+
+/** Whether `option` is the dialog's recognised one-shot reject and takes text, so the host's notice follows it. */
+export function rejectTakesText(prompt: Prompt, option: number): boolean {
+  return prompt.acceptsText && permissionChoices(prompt).reject === option &&
+    prompt.options.some(item => item.index === option && item.role === "reject-with-feedback");
+}
+
+/**
+ * The host's fixed reject notice: exactly one of the `requesterNotice` texts, a bounded line without
+ * control characters. No other text is ever typed into a session after a reject.
+ */
+export function isRequesterNotice(text: unknown): text is string {
+  return typeof text === "string" && text.length > 0 && text.length <= NOTICE_LIMIT && !/[\u0000-\u001f\u007f-\u009f]/.test(text) &&
+    REJECT_CODES.some(code => requesterNotice(code) === text);
 }
 
 /** The command or action the dialog asks for, as the host extracts it. */
@@ -197,6 +222,8 @@ export interface SessionPermissionAnswer {
   evidenceHash: string;
   /** Canonical working directory of the session when the request was built. */
   targetCwd: string;
+  /** The host's fixed reject notice. Set only for a recognised one-shot reject that takes text; it is typed after that option. */
+  notice?: string;
 }
 
 /** The host operations this module uses. `Manager` provides them. */
@@ -218,7 +245,8 @@ export interface SessionPermissionParts {
   taskEnded?(taskId: string): void;
 }
 
-type Tracked = { key: string; promptId: number; phase: "building" | "handed" | "owner"; inFlight: boolean };
+/** `retryAt`: an owner halt held the request. It is the owner's meanwhile and is handed again from this time on. */
+type Tracked = { key: string; promptId: number; phase: "building" | "handed" | "owner"; inFlight: boolean; retryAt?: number };
 type TaskScan = { cursor: number; prompts: string[]; complete: boolean; dropped: number };
 
 /**
@@ -232,12 +260,16 @@ export class SessionPermissionRequests {
   private readonly scans = new Map<string, TaskScan>();
   /** Listed sessions that carry no team assignment. Their dialogs are this module's to place; a team member's are not. */
   private readonly unassigned = new Set<string>();
+  private readonly now: () => number;
 
   constructor(
     private readonly config: Pick<Config, "projects" | "agents">,
     private readonly host: SessionPermissionHost,
     private readonly parts: SessionPermissionParts,
-  ) {}
+    options: { now?: () => number } = {},
+  ) {
+    this.now = options.now ?? Date.now;
+  }
 
   /** Reads one session listing. It never throws and never waits: a dialog to hand is built in the background. */
   observe(rows: readonly ListedSession[]): void {
@@ -255,7 +287,8 @@ export class SessionPermissionRequests {
         continue;
       }
       const key = `${prompt.id}:${prompt.hash}`;
-      if (tracked?.key === key) continue;
+      const heldUntilNow = tracked?.retryAt !== undefined && this.now() >= tracked.retryAt;
+      if (tracked?.key === key && !heldUntilNow) continue;
       // One decision per dialog at a time. A dialog that changed while its predecessor is decided is read again on a later listing.
       if (tracked?.inFlight) continue;
       if (!delivery) { this.prompts.delete(row.id); continue; }
@@ -305,37 +338,65 @@ export class SessionPermissionRequests {
     return {
       request,
       check: () => this.check(sessionId, request, prompt, sessionRoot, cwd),
-      answer: (option, decisionId) => {
+      answer: (option, decisionId, notice) => {
         // One decision is answered once. A second call returns the first result and sends nothing.
         const previous = answers.get(decisionId);
         if (previous) return previous;
         const result = (async () => {
+          if (notice !== undefined && !isRequesterNotice(notice)) return "refused" as const;
           // The live checks run again here, so no key is sent to a session a person now controls, whatever the caller checked.
           const live = await this.check(sessionId, request, prompt, sessionRoot, cwd);
-          if (!live.ok || option !== live.accept && option !== live.reject) return "refused" as const;
-          return this.answer(sessionId, prompt, request.evidenceHash, cwd, option, decisionId);
+          // A notice comes only with a reject.
+          if (!live.ok || !(option === live.reject || option === live.accept && notice === undefined)) return "refused" as const;
+          // The notice is typed only after a reject option that takes text; any other reject sends none.
+          const typed = notice !== undefined && rejectTakesText(prompt, option) ? notice : undefined;
+          return this.answer(sessionId, prompt, request.evidenceHash, cwd, option, decisionId, typed);
         })();
         answers.set(decisionId, result);
         return result;
       },
+      collect: paths => this.collect(sessionId, prompt, sessionRoot, cwd, paths),
     };
+  }
+
+  /**
+   * Bounded read-only collection of source paths that the strong turn asks for, relative to the session
+   * root, with the team path's collector held to the session root itself: no upward search for a
+   * repository, no symbolic link, no excluded name, at most eight requested paths and its size limits.
+   * What it skipped is in `limitations`. Nothing is read once the session root changed.
+   */
+  private async collect(sessionId: string, prompt: Prompt, sessionRoot: string, cwd: string, paths: string[]): Promise<PermissionEvidence> {
+    const nothing = (reason: string): PermissionEvidence =>
+      ({ files: [], limitations: [reason], digest: permissionEvidenceDigest({ files: [], limitations: [reason] }) });
+    let session: Session;
+    try { session = this.host.meta(sessionId).session; }
+    catch { return nothing("The session record is gone; nothing was collected."); }
+    if (sessionRootOf(session, this.project(session.projectId)) !== sessionRoot || canonical(session.cwd) !== cwd)
+      return nothing("The session root changed; nothing was collected.");
+    const requested = (Array.isArray(paths) ? paths : []).map(path => typeof path === "string" ? resolve(sessionRoot, path) : path);
+    try { return collectPermissionEvidence({ prompt, cwd, root: sessionRoot, changedPaths: [], requestedPaths: requested }); }
+    catch { return nothing("The session root could not be read; nothing was collected."); }
   }
 
   private async hand(sessionId: string, key: string, delivery: PermissionDeliveryService) {
     let phase: Tracked["phase"] = "owner";
+    let retryAt: number | undefined;
     try {
       const target = await this.target(sessionId, key);
       if (!target) return;
       const handled = delivery.handle(target);
       this.mark(sessionId, key, "handed", true);
-      phase = (await handled).handled ? "handed" : "owner";
+      const result = await handled;
+      phase = result.handled ? "handed" : "owner";
+      // An owner halt: the owner's meanwhile, then handed again and decided from the evidence of that time.
+      if (!result.handled && result.held) retryAt = this.now() + HELD_RETRY_MS;
     } catch { phase = "owner"; }
-    finally { this.mark(sessionId, key, phase, false); }
+    finally { this.mark(sessionId, key, phase, false, retryAt); }
   }
 
-  private mark(sessionId: string, key: string, phase: Tracked["phase"], inFlight: boolean) {
+  private mark(sessionId: string, key: string, phase: Tracked["phase"], inFlight: boolean, retryAt?: number) {
     const tracked = this.prompts.get(sessionId);
-    if (tracked?.key === key) this.prompts.set(sessionId, { ...tracked, phase, inFlight });
+    if (tracked?.key === key) this.prompts.set(sessionId, { key, promptId: tracked.promptId, phase, inFlight, ...(retryAt !== undefined ? { retryAt } : {}) });
   }
 
   private async check(sessionId: string, request: PermissionRequest, reviewed: Prompt, sessionRoot: string, cwd: string):
@@ -360,10 +421,10 @@ export class SessionPermissionRequests {
     return { ok: true, ...(accept !== undefined ? { accept } : {}), ...(reject !== undefined ? { reject } : {}) };
   }
 
-  private async answer(sessionId: string, prompt: Prompt, evidenceHash: string, cwd: string, option: number, decisionId: string) {
+  private async answer(sessionId: string, prompt: Prompt, evidenceHash: string, cwd: string, option: number, decisionId: string, notice?: string) {
     try {
       const receipt = await this.host.answerSessionPermission(sessionId, {
-        decisionId, option, promptId: prompt.id, promptHash: prompt.hash!, evidenceHash, targetCwd: cwd,
+        decisionId, option, promptId: prompt.id, promptHash: prompt.hash!, evidenceHash, targetCwd: cwd, ...(notice !== undefined ? { notice } : {}),
       });
       // A dialog that stayed open, or a marker that never reached the option, may have taken keys: never retried.
       return receipt.state === "delivered" && receipt.result === "closed" ? "delivered" as const : "uncertain" as const;

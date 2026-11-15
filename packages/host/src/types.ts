@@ -314,6 +314,8 @@ export type WorkerRequest =
       promptHash: string;
       evidenceHash: string;
       option: number;
+      /** The host's fixed reject notice, typed after the recognised one-shot reject only when that option takes text. */
+      text?: string;
       actor: ControlActor;
       leaseId: string;
     })

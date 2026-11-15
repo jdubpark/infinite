@@ -41,7 +41,7 @@ import { startHookServer, HookPayloadError, type HookAnswer, type HookReply, typ
 import { teamReportEnvelopeSchema, type TeamAssignment } from "./team-types.js";
 import { missionReportEnvelopeSchema } from "./mission-types.js";
 import { agentAcceptOption, isCollapsedPermissionPrompt, oneShotRejectOption, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
-import { SESSION_PERMISSION_ACTOR_LABEL, permissionChoices } from "./permission-session-requests.js";
+import { SESSION_PERMISSION_ACTOR_LABEL, isRequesterNotice, permissionChoices, rejectTakesText } from "./permission-session-requests.js";
 import type { TranscriptMessage } from "./transcript.js";
 import { TranscriptWatch, closesTurn } from "./transcript-watch.js";
 import { drainLaunch, runFinalDrain } from "./final-drain.js";
@@ -1190,14 +1190,16 @@ function validSessionPermissionAnswer(request: SessionPermissionAnswerRequest) {
     typeof request.promptHash === "string" && /^[a-f0-9]{64}$/i.test(request.promptHash) &&
     typeof request.evidenceHash === "string" && /^[a-f0-9]{64}$/i.test(request.evidenceHash) &&
     Number.isInteger(request.option) && request.option >= 0 && validActor(request.actor) &&
+    (request.text === undefined || isRequesterNotice(request.text)) &&
     typeof request.leaseId === "string" && request.leaseId.length > 0 && request.leaseId.length <= 80;
 }
 
 /**
  * Types one permission-agent decision into a session outside any team run: one recognised one-shot
  * accept or reject, under the host's control lease, while the exact reviewed dialog is still pinned on
- * screen. A team member's session never takes this path. Once the intent is journaled the answer is
- * never typed again: a failure after it leaves the receipt uncertain.
+ * screen. A reject option that takes text is followed by the host's fixed notice once the dialog has
+ * closed; no other answer carries text. A team member's session never takes this path. Once the intent
+ * is journaled the answer is never typed again: a failure after it leaves the receipt uncertain.
  */
 async function answerSessionPermission(request: SessionPermissionAnswerRequest): Promise<Receipt & { result?: AnswerResult }> {
   const { actor: _actor, leaseId: _leaseId, ...input } = request;
@@ -1230,12 +1232,16 @@ async function answerSessionPermission(request: SessionPermissionAnswerRequest):
   const choices = permissionChoices(prompt);
   const role = request.option === choices.accept ? "accept" : request.option === choices.reject ? "reject" : undefined;
   if (!role) throw new Refusal("invalid-option");
+  // The notice follows only the recognised reject that takes text, the same option the host's live check offered.
+  const text = request.text;
+  if (text !== undefined && (role !== "reject" || !rejectTakesText(prompt, request.option))) throw new Refusal("text-not-accepted");
   // The hash ignores spacing inside lines, so the reviewed text must match exactly, and screen-only
   // evidence needs the dialog pinned to the bottom of the screen. Each key write checks this again.
   const showsReviewed = (now: ReturnType<typeof screenPrompt>) => Boolean(now &&
     hashOf(now.fingerprint) === prompt.hash && now.title === prompt.title && now.detail === prompt.detail &&
-    (prompt.tool || now.pinned) && !now.multiSelect && now.options.some(option => option.index === request.option &&
-      (role === "accept" ? option.role === "accept" : option.role === "reject" || option.role === "reject-with-feedback")));
+    (prompt.tool || now.pinned) && !now.multiSelect && (text === undefined || now.acceptsText) &&
+    now.options.some(option => option.index === request.option && (role === "accept" ? option.role === "accept"
+      : text !== undefined ? option.role === "reject-with-feedback" : option.role === "reject" || option.role === "reject-with-feedback")));
   const current = screenPrompt();
   if (!current || !showsReviewed(current)) throw new Refusal("prompt-changed");
   // A typed `y` changes the yes-no line before its Enter, so that Enter could not be checked against the reviewed screen.
@@ -1246,6 +1252,7 @@ async function answerSessionPermission(request: SessionPermissionAnswerRequest):
   flush();
   const intent = append("input-intent", {
     op: "session-permission-answer", requestId: request.requestId, promptId: prompt.id, option: chosen.index, keys,
+    ...(text !== undefined ? { text } : {}),
     delegation: { decisionId: request.decisionId, targetSessionId: request.targetSessionId, targetCwd: request.targetCwd,
       promptHash: request.promptHash, evidenceHash: request.evidenceHash },
   });
@@ -1286,7 +1293,17 @@ async function answerSessionPermission(request: SessionPermissionAnswerRequest):
       }
     if (result === "closed" && attention.prompt?.id === prompt.id)
       record({ kind: "prompt-closed", promptId: prompt.id, reason: "answered-here", label: chosen.label }, "host");
-    record({ kind: "answer", promptId: prompt.id, requestId: request.requestId, option: { index: chosen.index, label: chosen.label }, text: false, result }, "host");
+    if (result === "closed" && text !== undefined) {
+      // The notice follows a dialog that has closed, under the same lease. It is typed only while no other
+      // dialog shows, since its Enter would answer one; a refusal here leaves the receipt uncertain.
+      await sleep(150);
+      const noDialog = () => { assertTarget(); if (screenPrompt()) throw new Refusal("prompt-changed"); };
+      noDialog();
+      pty!.write(terminal.modes.bracketedPasteMode ? `\x1b[200~${text}\x1b[201~` : text);
+      noDialog();
+      pty!.write("\r");
+    }
+    record({ kind: "answer", promptId: prompt.id, requestId: request.requestId, option: { index: chosen.index, label: chosen.label }, text: text !== undefined, result }, "host");
     const done = append("input-result", { requestId: request.requestId, state: "delivered", result });
     receipt.state = "delivered";
     receipt.seq = done.seq;

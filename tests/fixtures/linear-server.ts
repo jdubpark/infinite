@@ -16,7 +16,8 @@ export async function startLinearServer() {
   const issues = new Map<string, FixtureIssue>(), comments = new Map<string, FixtureComment>();
   const labels = new Map<string, { id: string; name: string; team: { id: string } | null }>(), issueLabels = new Map<string, Set<string>>();
   let failLabels = false, rateLimitLabels = false, rateLimitLabelChanges = false;
-  let extraHeaders: Record<string, string> = {}, limitedReads: Record<string, string> | undefined;
+  let extraHeaders: Record<string, string> = {}, limitedReads: Record<string, string> | undefined, readDelayMs = 0;
+  const readSpans: { start: number; end?: number }[] = [];
   const calls: { operation: string; variables: Record<string, any> }[] = [];
   const lostResponses: { operation: WriteOperation; id: string }[] = [];
   const violations: string[] = [];
@@ -46,6 +47,11 @@ export async function startLinearServer() {
       const operation = parsed.operationName ?? /(?:query|mutation)\s+(\w+)/.exec(parsed.query ?? "")?.[1];
       const variables = parsed.variables ?? {};
       calls.push({ operation, variables });
+      let span: { start: number; end?: number } | undefined;
+      if (operation === "InfiniteLinearIssues") {
+        span = { start: performance.now() }; readSpans.push(span);
+        if (readDelayMs) await new Promise(resolve => setTimeout(resolve, readDelayMs));
+      }
       if (unavailable) { reply(503, { errors: [{ message: "Fixture transport unavailable" }] }); return; }
       let data: unknown, writtenId: string | undefined;
       switch (operation) {
@@ -55,7 +61,7 @@ export async function startLinearServer() {
         case "InfiniteLinearIssues": {
           const ids = variables.filter?.id?.in;
           if (!Array.isArray(ids)) throw new Error("Issue reconciliation requires canonical IDs");
-          if (limitedReads) { response.writeHead(429, { ...limitedReads, "Content-Type": "application/json" }).end(JSON.stringify({ errors: [{ message: "Rate limited", extensions: { code: "RATELIMITED" } }] })); return; }
+          if (limitedReads) { span!.end = performance.now(); response.writeHead(429, { ...limitedReads, "Content-Type": "application/json" }).end(JSON.stringify({ errors: [{ message: "Rate limited", extensions: { code: "RATELIMITED" } }] })); return; }
           data = { issues: { nodes: ids.flatMap(id => issues.has(id) ? [issues.get(id)] : []),
             pageInfo: { hasNextPage: false, endCursor: null } } };
           break;
@@ -123,6 +129,7 @@ export async function startLinearServer() {
         drop = undefined; unavailable = true;
         response.destroy(); return;
       }
+      if (span) span.end = performance.now();
       reply(200, { data });
     } catch (error) {
       violations.push(error instanceof Error ? error.message : "Invalid fixture request");
@@ -140,6 +147,9 @@ export async function startLinearServer() {
     responseHeaders(headers: Record<string, string>) { extraHeaders = headers; },
     /** Answers issue reads with a 429 carrying these headers until called with undefined. */
     rateLimitReads(headers: Record<string, string> | undefined) { limitedReads = headers; },
+    /** Holds each issue read this long; `readSpans` records when each one arrived and was answered. */
+    delayReads(ms: number) { readDelayMs = ms; },
+    readSpans,
     dropNextResponse(operation: WriteOperation, bodyIncludes?: string) { drop = { operation, bodyIncludes }; },
     restore() { unavailable = false; },
     editIssue(id: string, changes: IssueEdit) {

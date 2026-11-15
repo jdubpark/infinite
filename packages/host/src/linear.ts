@@ -18,8 +18,12 @@ const freshnessMs = 30000;
  * starts work from it asks for a current one, and any pending evidence or label still reads at once.
  */
 const settledFreshnessMs = 10 * 60000;
-/** Linear refills its limits continuously, so a pause never outlasts this before one request probes again. */
+/** Linear refills its limits continuously, so a pause from reset headers never outlasts this before one request probes. */
 const maxPauseMs = 5 * 60000;
+/** A limit that states no usable time waits this long, then twice as long each time it repeats, up to `maxPauseMs`. */
+const fallbackPauseMs = 60000;
+/** Linear's windows are hourly; a longer Retry-After is treated as this long. */
+const maxRetryAfterMs = 2 * 3600000;
 const confirmWaitMs = 5000;
 const at = (ms: number) => new Date(Math.ceil(ms / 1000) * 1000).toISOString().replace(".000Z", "Z");
 const rateLimitReason = (retryAt: number) => `Linear is rate-limiting this host's requests. Tracking retries at ${at(retryAt)}; execution waits until Linear confirms current requirements.`;
@@ -83,6 +87,14 @@ export function sharedText(value: string) {
   return value.replace(/(?:\/(?:Users|home|tmp|private\/tmp|private\/var|var\/folders)\/|~\/|[A-Za-z]:\\)[^\s<>"'`]+/g, "[local path omitted]");
 }
 
+type RateLimitWait = { delay: number; basis: "retry-after" | "reset" | "fallback"; retryAfterSeconds?: number };
+/** How far the server's clock runs ahead of this host's, by the response's Date header; under 5 s is header granularity. */
+function serverSkew(response: Response) {
+  const date = Date.parse(response.headers.get("date") ?? "");
+  const skew = Number.isFinite(date) ? date - Date.now() : 0;
+  return Math.abs(skew) < 5000 ? 0 : skew;
+}
+
 /** Linear's own failure. Its text is fixed, so it may be shown or stored. */
 export class LinearFailure extends Error {
   constructor(readonly retryAfterMs = 0) { super("Linear could not confirm synchronization. Check the connection and host credential; execution is waiting."); }
@@ -108,6 +120,11 @@ export class LinearService {
   private limits?: LinearBridgeStatus["limits"];
   private lastLimit?: LinearBridgeStatus["lastRateLimit"];
   private limitLoggedAt = 0;
+  /** Consecutive rate-limited answers; a limit without usable timing waits longer each time. */
+  private limitStreak = 0;
+  /** Set by a shared rate limit. Until one request is answered without a limit, requests go one at a time. */
+  private recovering = false;
+  private probe?: Promise<void>;
 
   constructor(private readonly config: Config, private readonly key: Buffer) {
     this.directory = join(config.stateDir, "linear");
@@ -413,7 +430,7 @@ export class LinearService {
     }
     for (const stored of records.filter(value => value.issue && !value.blocked && value.retryAt <= Date.now() && this.isFresh(value))) {
       if (this.closed) return;
-      if (this.pendingRetitle(stored) && Date.now() >= this.retryUntil) {
+      if (this.pendingRetitle(stored) && this.open()) {
         try { await this.applyRetitle(stored); }
         catch (error) {
           if (this.closed) return;
@@ -428,7 +445,7 @@ export class LinearService {
         }
         this.success(stored);
       } catch (error) { this.failure(stored, error); continue; }
-      if (this.pendingLabel(stored) && Date.now() >= this.retryUntil) {
+      if (this.pendingLabel(stored) && this.open()) {
         try { await this.applyLabel(stored); }
         catch (error) {
           if (this.closed) return;
@@ -572,6 +589,7 @@ export class LinearService {
     let token: string;
     try { token = readFileSync(api.apiKeyFile, "utf8").trim(); } catch { throw new LinearFailure(); }
     if (!token || token.length > 8192 || /\s/.test(token)) throw new LinearFailure();
+    const admission = await this.admit(shared);
     const controller = new AbortController(); this.requests.add(controller);
     const timeout = setTimeout(() => controller.abort(), 10000); timeout.unref();
     try {
@@ -597,29 +615,68 @@ export class LinearService {
       if (!response.ok || !body || body.errors?.length || !body.data) {
         const limited = response.status === 429 || body?.errors?.some(error => z.object({ extensions: z.object({ code: z.literal("RATELIMITED") }) }).safeParse(error).success);
         if (limited) {
-          const delay = this.limitDelay(response, seen);
-          if (shared) this.retryUntil = Math.max(this.retryUntil, Date.now() + delay);
-          this.limited(operationName, response, delay, shared);
-          throw new LinearFailure(delay);
+          this.limitStreak++;
+          const wait = this.limitDelay(response, seen);
+          if (shared) { this.retryUntil = Math.max(this.retryUntil, Date.now() + wait.delay); this.recovering = true; }
+          this.limited(operationName, response, wait, shared);
+          throw new LinearFailure(wait.delay);
         }
+        this.answered(admission.probe);
         throw new LinearFailure();
       }
+      this.answered(admission.probe);
       return body.data;
     } catch (error) { throw error instanceof LinearFailure ? error : new LinearFailure(); }
-    finally { clearTimeout(timeout); this.requests.delete(controller); }
+    finally { clearTimeout(timeout); this.requests.delete(controller); admission.release(); }
   }
   /**
-   * Retry-After is Linear's own wait. Without it, the reset of each limit the response reports as spent; without that,
-   * the latest reset. Linear's limits refill continuously, so no pause outlasts `maxPauseMs` before a probe.
+   * After a shared rate limit, the first request to pass the pause is the only one in flight. Others wait for its answer:
+   * a new limit refuses them with the new pause, and an answer without a limit reopens normal traffic. An optional
+   * request never probes; it is refused until traffic reopens.
    */
-  private limitDelay(response: Response, { requests, complexity, endpoint, cost }: ReturnType<LinearService["observe"]>) {
+  private async admit(shared: boolean): Promise<{ probe: boolean; release: () => void }> {
+    for (;;) {
+      if (this.closed) throw new LinearFailure();
+      if (Date.now() < this.retryUntil) throw new LinearFailure(this.retryUntil - Date.now());
+      if (!this.recovering) return { probe: false, release: () => {} };
+      if (!shared) throw new LinearFailure(fallbackPauseMs);
+      if (!this.probe) {
+        let done!: () => void;
+        this.probe = new Promise<void>(resolve => { done = resolve; });
+        return { probe: true, release: () => { this.probe = undefined; done(); } };
+      }
+      await this.probe;
+    }
+  }
+  /**
+   * A complete answer without a rate limit. Only the probe, sent after the pause began, can reopen normal traffic or
+   * end the fallback's growth; a request already in flight when the limit arrived proves nothing about the limit now.
+   */
+  private answered(probe: boolean) {
+    if (!probe && this.recovering) return;
+    this.limitStreak = 0;
+    this.recovering = false;
+  }
+  /**
+   * Retry-After, in seconds or as an HTTP date, is Linear's own deadline: no request goes before it (up to
+   * `maxRetryAfterMs`). Without it, the reset of each limit the response reports as spent, else the latest reset, read
+   * against the server's clock; Linear's limits refill continuously, so such a pause probes again after `maxPauseMs`.
+   * A limit with no usable time waits `fallbackPauseMs`, doubling while limits repeat, up to `maxPauseMs`.
+   */
+  private limitDelay(response: Response, { requests, complexity, endpoint, cost }: ReturnType<LinearService["observe"]>): RateLimitWait {
     const retryAfter = response.headers.get("retry-after")?.trim();
-    if (retryAfter && /^\d{1,7}$/.test(retryAfter)) return Math.min(maxPauseMs, Math.max(1000, Number(retryAfter) * 1000));
+    const stated = !retryAfter ? undefined : /^\d{1,10}$/.test(retryAfter) ? Number(retryAfter) * 1000
+      : /[A-Za-z]/.test(retryAfter) && Number.isFinite(Date.parse(retryAfter)) ? Date.parse(retryAfter) - Date.now() - serverSkew(response) : undefined;
+    if (stated !== undefined) {
+      const delay = Math.min(maxRetryAfterMs, Math.max(1000, stated));
+      return { delay, basis: "retry-after", retryAfterSeconds: Math.ceil(delay / 1000) };
+    }
     const families = [requests, complexity, endpoint].filter((value): value is LinearLimitView => Boolean(value?.resetAt));
     const spent = families.filter(value => value.remaining !== undefined && (value.remaining <= 0
       || value === complexity && cost !== undefined && value.remaining < cost));
-    const resets = (spent.length ? spent : families).map(value => Date.parse(value.resetAt!) - Date.now());
-    return Math.min(maxPauseMs, Math.max(1000, ...resets));
+    const resets = (spent.length ? spent : families).map(value => Date.parse(value.resetAt!) - Date.now()).filter(value => value > 0);
+    if (resets.length) return { delay: Math.min(maxPauseMs, Math.max(1000, ...resets)), basis: "reset" };
+    return { delay: Math.min(maxPauseMs, fallbackPauseMs * 2 ** Math.min(this.limitStreak - 1, 4)), basis: "fallback" };
   }
   /** Keeps Linear's rate-limit headers from every response. Numbers and reset times only. */
   private observe(response: Response, operation: string) {
@@ -627,11 +684,15 @@ export class LinearService {
       const value = response.headers.get(name)?.trim();
       return value && /^\d{1,16}(?:\.\d{1,6})?$/.test(value) ? Number(value) : undefined;
     };
+    // Linear states resets in epoch milliseconds; a value in epoch seconds is converted, anything else is ignored. The
+    // instant is moved onto this host's clock by the response's Date header, so a skewed clock does not shorten a pause.
+    const skew = serverSkew(response);
     const family = (prefix: string): LinearLimitView | undefined => {
-      const limit = count(`${prefix}-limit`), remaining = count(`${prefix}-remaining`), reset = count(`${prefix}-reset`);
-      if (limit === undefined && remaining === undefined && reset === undefined) return undefined;
+      const limit = count(`${prefix}-limit`), remaining = count(`${prefix}-remaining`), raw = count(`${prefix}-reset`);
+      if (limit === undefined && remaining === undefined && raw === undefined) return undefined;
+      const reset = raw === undefined ? undefined : raw >= 1e12 && raw < 1e14 ? raw : raw >= 1e9 && raw < 1e11 ? raw * 1000 : undefined;
       return { ...(limit !== undefined ? { limit } : {}), ...(remaining !== undefined ? { remaining } : {}),
-        ...(reset !== undefined && reset > 0 && reset < 8.64e15 ? { resetAt: new Date(reset).toISOString() } : {}) };
+        ...(reset !== undefined ? { resetAt: new Date(reset - skew).toISOString() } : {}) };
     };
     const requests = family("x-ratelimit-requests"), complexity = family("x-ratelimit-complexity"), endpoint = family("x-ratelimit-endpoint-requests");
     const cost = count("x-complexity"), name = response.headers.get("x-ratelimit-endpoint-name")?.trim(), observedAt = new Date().toISOString();
@@ -642,10 +703,9 @@ export class LinearService {
         : this.limits?.endpoint ? { endpoint: this.limits.endpoint } : {}) };
     return { requests, complexity, endpoint, cost };
   }
-  private limited(operation: string, response: Response, delay: number, shared: boolean) {
-    const retryAfter = response.headers.get("retry-after")?.trim();
+  private limited(operation: string, response: Response, { delay, basis, retryAfterSeconds }: RateLimitWait, shared: boolean) {
     this.lastLimit = { at: new Date().toISOString(), operation, httpStatus: response.status,
-      ...(retryAfter && /^\d{1,7}$/.test(retryAfter) ? { retryAfterSeconds: Number(retryAfter) } : {}), waitSeconds: Math.ceil(delay / 1000), shared };
+      ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}), waitSeconds: Math.ceil(delay / 1000), basis, shared };
     // One journal line a minute at most: the evidence a later incident review needs, without the key or issue content.
     if (Date.now() - this.limitLoggedAt < 60000) return;
     this.limitLoggedAt = Date.now();
@@ -655,6 +715,8 @@ export class LinearService {
       + `${limit("Requests", this.limits?.requests)}; ${limit("complexity", this.limits?.complexity)}${this.limits?.endpoint ? `; ${limit(`endpoint ${this.limits.endpoint.name ?? "limit"}`, this.limits.endpoint)}` : ""}. `
       + `This host sent ${sent.requests} requests (${sent.complexity} complexity points reported) in the last hour.`);
   }
+  /** Whether an optional request may go now: no pause and no probe still to answer. */
+  private open() { return Date.now() >= this.retryUntil && !this.recovering; }
   private tally(requests: number, complexity: number) {
     const minute = Math.floor(Date.now() / 60000);
     while (this.usage.length && this.usage[0].minute <= minute - 60) this.usage.shift();

@@ -871,6 +871,17 @@ export class TeamService {
         decision: boundedRecoveryText(outcome.decision), consequence: boundedRecoveryText(outcome.consequence),
       }));
   }
+  /**
+   * A run that would start work but waits for Linear says so, unless it has its own reason or is paused, halted, or
+   * finished. A confirmation that lapsed moments ago is routine, so a pending wait shows after a minute; an error or a
+   * rate-limit pause shows at once.
+   */
+  private trackingHold(stored: Stored, tracking: TeamRun["linear"]) {
+    const run = stored.run;
+    if (!run.linearTracking || !tracking || (tracking.status !== "pending" && tracking.status !== "error") || run.reason || stored.halt
+      || ["paused", "ready-for-review", "merged", "no-change", "blocked", "cancelled"].includes(run.status)) return false;
+    return tracking.status === "error" || Boolean(tracking.retryAt) || Date.now() - Date.parse(tracking.checkedAt ?? run.createdAt) > 60000;
+  }
   private view(stored: Stored): TeamView {
     const { members, permissionRecovery, ...run } = structuredClone(stored.run);
     // Queue evidence from this exact state before a goal can use its sync gate
@@ -879,6 +890,7 @@ export class TeamService {
     run.linear = this.linear?.getTeam(run.id) ?? tracking ?? run.linear;
     const safeRun = {
       ...run,
+      ...(this.trackingHold(stored, run.linear) ? { reason: `New work waits for Linear tracking: ${run.linear!.reason ?? "Linear has not confirmed current requirements."}` } : {}),
       resumable: this.canResume(stored, run.linear?.status),
       continuable: this.canContinue(stored, run.linear?.status),
       ...(run.permissionDecisions ? { permissionDecisions: run.permissionDecisions.map(({ prompt: _prompt, coordinatorSessionId: _sessionId, ...decision }) => decision) } : {}),

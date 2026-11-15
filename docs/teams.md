@@ -1250,13 +1250,29 @@ issues it names, and a read that is due also refreshes issues past half their
 window, so records expire together.
 
 Linear limits each user's requests and query complexity per hour. When Linear
-answers with a rate limit, the host pauses every Linear request until Linear's
-`Retry-After` time, or else until the reset of the limit Linear reports as
-spent. After five minutes at most, one request tries again. While the pause
-lasts, each waiting run and goal shows the reason with the retry time, and its
-tracking view carries `retryAt`. The service journal records one line with the
-remaining requests and complexity that Linear reported. `GET /api/linear/status`
-reports the last rate-limit headers, any current pause, and the requests and
+answers with a rate limit, the host pauses every Linear request. The first rule
+that applies sets the pause:
+
+1. A `Retry-After` header, in seconds or as an HTTP date, is Linear's deadline.
+   No request goes before it, up to two hours.
+2. Otherwise, the reset time of the limit Linear reports as spent, or the latest
+   reset it reports. Resets in epoch milliseconds or epoch seconds are accepted.
+   Linear's limits refill continuously, so this pause lasts five minutes at most.
+3. Otherwise, one minute, doubling each time the limit repeats, up to five
+   minutes.
+
+Dates and reset times are read against the response's `Date` header, so a host
+clock that differs from Linear's does not shorten the pause. When the pause
+ends, one request asks Linear first. Other requests wait for its answer: another
+limit starts a new pause, and any answer without a limit reopens normal traffic.
+
+While the pause lasts, each waiting goal and each active run without a reason
+of its own shows "New work waits for Linear tracking:" with the retry time, and
+its tracking view carries `retryAt`. A run also shows this when its tracking has
+failed or its last confirmation is more than a minute old. The service journal
+records one line a minute at most, with the remaining requests and complexity
+that Linear reported. `GET /api/linear/status` reports the last rate-limit
+headers, which rule set the last pause, any current pause, and the requests and
 complexity this host sent in the last hour. It carries no credential and no
 issue content.
 

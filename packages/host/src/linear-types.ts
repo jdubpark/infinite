@@ -39,5 +39,6 @@ export interface LinearBridgeStatus {
     endpoint?: LinearLimitView & { name?: string; observedAt: string };
   };
   pausedUntil?: string;
-  lastRateLimit?: { at: string; operation: string; httpStatus: number; retryAfterSeconds?: number; waitSeconds: number; shared: boolean };
+  /** `basis`: Linear's Retry-After deadline, a reported reset (probed again after five minutes at most), or no usable time. */
+  lastRateLimit?: { at: string; operation: string; httpStatus: number; retryAfterSeconds?: number; waitSeconds: number; basis: "retry-after" | "reset" | "fallback"; shared: boolean };
 }

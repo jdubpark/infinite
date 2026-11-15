@@ -5,7 +5,7 @@ import { canonicalJson } from "../packages/host/src/evidence/crypto.js";
 import type { ProductGoal } from "../packages/host/src/goal-types.js";
 import type { TeamRun } from "../packages/host/src/team-types.js";
 import { canonicalBytes, cappedBytes, objectiveRecordSchema, recordDigest } from "../packages/host/src/objective-types.js";
-import type { Criterion, ObjectiveRecord } from "../packages/host/src/objective-types.js";
+import type { Criterion, Direction, LogEntry, ObjectiveRecord } from "../packages/host/src/objective-types.js";
 import { goalRecord, logValue, readStoredRecord, rebuildVersion, recordView, runRecord, syncDirections } from "../packages/host/src/objective-record.js";
 
 const GOAL_ID = "6f1c2a3e-8b4d-4c5e-9f60-718293a4b5c6";
@@ -206,6 +206,54 @@ test("a rebuild refuses what it cannot undo", () => {
 
   const late = { ...record, log: record.log.slice(2) };
   assert.throws(() => rebuildVersion(late, 2), { status: 409, code: "objective-version-unavailable" });
+});
+
+test("a rebuild undoes owner corrections", () => {
+  const base = goalRecord(goalFixture(), AT, "created") as ObjectiveRecord;
+  const c0 = base.criteria[0];
+  const c1: Criterion = {
+    id: "c1", origin: "owner", statement: "Each source has a date.", check: { kind: "judgement", item: "dates" },
+    producer: "evaluator", threshold: { kind: "pass" }, state: "active",
+  };
+  const c2: Criterion = {
+    id: "c2", origin: "owner", statement: "Two sources agree.", check: { kind: "judgement", item: "agreement" },
+    producer: "evaluator", threshold: { kind: "pass" }, state: "active",
+  };
+  const c1Edited: Criterion = { ...c1, statement: "Each source has a date and a URL." };
+  const c2Retired: Criterion = { ...c2, state: "retired" };
+  const direction: Direction = { id: "s2", text: "Use primary sources.", source: "steering", at: at(2) };
+  const entry = (seq: number, version: number, op: string, target: string, extra: Partial<LogEntry>): LogEntry =>
+    ({ seq, at: AT, version, actor: "owner", authority: "direction", op, target, ...extra });
+  const log: LogEntry[] = [
+    base.log[0],
+    entry(2, 1, "criterion.added", "c2", { after: { inline: c2 } }),
+    entry(3, 2, "criterion.added", "c1", { after: { inline: c1 } }),
+    entry(4, 3, "direction.appended", "s2", { after: logValue(direction, "record:direction:s2"), handle: "owner-device" }),
+    entry(5, 4, "criterion.edited", "c1", { before: { inline: c1 }, after: { inline: c1Edited } }),
+    entry(6, 4, "criterion.retired", "c2", { before: { inline: c2 }, after: { inline: c2Retired } }),
+  ];
+  const record = {
+    ...base, version: 4, criteria: [c0, c2Retired, c1Edited], statement: { ...base.statement, directions: [direction] }, log, digest: "",
+  } as ObjectiveRecord;
+  record.digest = recordDigest(record);
+  assert.equal(objectiveRecordSchema.safeParse(record).success, true);
+
+  const expected = (version: number, criteria: Criterion[], directions: Direction[]): ObjectiveRecord => {
+    const snapshot = {
+      ...base, version, criteria, statement: { ...base.statement, directions }, log: log.filter(item => item.version <= version), digest: "",
+    } as ObjectiveRecord;
+    snapshot.digest = recordDigest(snapshot);
+    return snapshot;
+  };
+  assert.deepEqual(rebuildVersion(record, 3), expected(3, [c0, c2, c1], [direction]));
+  assert.deepEqual(rebuildVersion(record, 2), expected(2, [c0, c2, c1], []));
+  assert.deepEqual(rebuildVersion(record, 1), expected(1, [c0, c2], []));
+
+  const drifted = {
+    ...record,
+    log: record.log.map(item => (item.seq === 5 ? { ...item, after: { inline: { ...c1Edited, statement: "Each source has a date and a URL!" } } } : item)),
+  } as ObjectiveRecord;
+  assert.throws(() => rebuildVersion(drifted, 3), { status: 409, code: "objective-version-unavailable" });
 });
 
 test("a stored record is read strictly", () => {

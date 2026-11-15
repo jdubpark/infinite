@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { ProductGoal } from "./goal-types.js";
 import type { TeamRun } from "./team-types.js";
 import { TeamError } from "./team-workspace.js";
+import { canonicalJson } from "./evidence/crypto.js";
 import {
   OBJECTIVE_LIMITS,
   OBJECTIVE_SCHEMA_VERSION,
@@ -10,7 +11,7 @@ import {
   objectiveRecordSchema,
   recordDigest,
 } from "./objective-types.js";
-import type { Direction, LogEntry, LogValue, ObjectiveOwner, ObjectiveRecord } from "./objective-types.js";
+import type { Criterion, Direction, LogEntry, LogValue, ObjectiveOwner, ObjectiveRecord } from "./objective-types.js";
 
 export type ObjectiveUnavailable = "source-invalid" | "record-invalid" | "record-newer";
 export type ObjectiveState = { kind: "absent" } | { kind: "ready"; record: ObjectiveRecord }
@@ -21,9 +22,12 @@ export type LiveDirection = { revision: number; handle: string };
 export type ObjectiveRecordView = { owner: ObjectiveOwner; version: number; latestVersion: number; rebuilt: boolean;
   record: Omit<ObjectiveRecord, "log">; log: LogEntry[] };
 export type ObjectiveErrorCode = "objective-record-absent" | "objective-source-invalid" | "objective-record-invalid" | "objective-record-newer"
-  | "objective-record-of-goal" | "objective-record-of-mission" | "objective-record-of-handoff" | "objective-version-not-found" | "objective-version-unavailable";
+  | "objective-record-of-goal" | "objective-record-of-mission" | "objective-record-of-handoff" | "objective-version-not-found" | "objective-version-unavailable"
+  | "objective-prompts-off" | "objective-op-invalid" | "objective-op-target" | "objective-op-c0" | "objective-op-refused"
+  | "objective-version-stale" | "objective-criterion-misfit" | "objective-criterion-too-large" | "objective-command-unknown"
+  | "objective-secret" | "objective-criteria-limit" | "objective-too-large" | "objective-log-full" | "objective-digest-too-large";
 
-export const OBJECTIVE_ERRORS: Record<ObjectiveErrorCode, { status: 404 | 409; message: string }> = {
+export const OBJECTIVE_ERRORS: Record<ObjectiveErrorCode, { status: 400 | 404 | 409; message: string }> = {
   "objective-record-absent": { status: 404, message: "This run has no objective record yet. It gets one at its next accepted plan." },
   "objective-source-invalid": { status: 409, message: "The objective record could not be built from these fields." },
   "objective-record-invalid": { status: 409, message: "The stored objective record cannot be read. It is kept unchanged." },
@@ -33,6 +37,20 @@ export const OBJECTIVE_ERRORS: Record<ObjectiveErrorCode, { status: 404 | 409; m
   "objective-record-of-handoff": { status: 409, message: "A handoff run has no objective record." },
   "objective-version-not-found": { status: 404, message: "The record has no such version." },
   "objective-version-unavailable": { status: 409, message: "This host cannot rebuild that version of the record." },
+  "objective-prompts-off": { status: 409, message: "Turn on objective prompts for this goal's project before changing its criteria." },
+  "objective-op-invalid": { status: 400, message: "The correction is invalid." },
+  "objective-op-target": { status: 409, message: "A correction names a criterion that is missing or in another state." },
+  "objective-op-c0": { status: 409, message: "Criterion c0 is the goal's success text and cannot be edited or retired." },
+  "objective-op-refused": { status: 409, message: "The corrected record would be invalid, so nothing was changed." },
+  "objective-version-stale": { status: 409, message: "The record changed since it was read. Read it again and resend the correction." },
+  "objective-criterion-misfit": { status: 400, message: "A criterion's producer or threshold does not fit its check." },
+  "objective-criterion-too-large": { status: 400, message: "A criterion is over 2,048 bytes." },
+  "objective-command-unknown": { status: 400, message: "A command criterion must name one of the project's configured checks." },
+  "objective-secret": { status: 400, message: "A criterion looks like it holds a secret, so nothing was changed." },
+  "objective-criteria-limit": { status: 409, message: "A record holds at most 8 active criteria and 64 in all." },
+  "objective-too-large": { status: 409, message: "The corrected record would be over its size limit." },
+  "objective-log-full": { status: 409, message: "The record's log is full. Start a new goal with consolidated criteria." },
+  "objective-digest-too-large": { status: 409, message: "The active criteria would be over the 6 KiB prompt digest." },
 };
 
 const L = OBJECTIVE_LIMITS;
@@ -189,6 +207,21 @@ export function readStoredRecord(raw: unknown, owner: ObjectiveOwner): Objective
   }
 }
 
+const CRITERION_OPS = new Set(["criterion.added", "criterion.edited", "criterion.retired", "criterion.confirmed"]);
+
+/** Undoes one criterion entry: the criterion its `after` names goes back to its `before`, or is removed for an add. */
+function undoCriterion(criteria: Criterion[], entry: LogEntry): Criterion[] {
+  const after = entry.after;
+  if (after === undefined || !("inline" in after)) throw objectiveError("objective-version-unavailable");
+  const wanted = canonicalJson(JSON.parse(JSON.stringify(after.inline)));
+  const index = criteria.findIndex(item => canonicalJson(JSON.parse(JSON.stringify(item))) === wanted);
+  if (index === -1) throw objectiveError("objective-version-unavailable");
+  if (entry.op === "criterion.added") return criteria.filter((_, position) => position !== index);
+  const before = entry.before;
+  if (before === undefined || !("inline" in before)) throw objectiveError("objective-version-unavailable");
+  return criteria.map((item, position) => (position === index ? (before.inline as Criterion) : item));
+}
+
 /** Rebuilds the record as it was at `version` by undoing each later entry in descending seq. Throws objectiveError. */
 export function rebuildVersion(record: ObjectiveRecord, version: number): ObjectiveRecord {
   if (!Number.isInteger(version) || version < 1 || version > record.version) throw objectiveError("objective-version-not-found");
@@ -196,17 +229,25 @@ export function rebuildVersion(record: ObjectiveRecord, version: number): Object
   if (first === undefined || version < first.version) throw objectiveError("objective-version-unavailable");
   const undone = record.log.filter(entry => entry.version > version).sort((left, right) => right.seq - left.seq);
   let directions = record.statement.directions;
+  let criteria = record.criteria;
   for (const entry of undone) {
+    if (CRITERION_OPS.has(entry.op)) {
+      criteria = undoCriterion(criteria, entry);
+      continue;
+    }
     if (entry.op !== "direction.appended" && entry.op !== "direction.copied") throw objectiveError("objective-version-unavailable");
     if (!record.statement.directions.some(item => item.id === entry.target)) throw objectiveError("objective-version-unavailable");
     directions = directions.filter(item => item.id !== entry.target);
   }
-  return seal({
+  const rebuilt = seal({
     ...record,
     version,
+    criteria,
     statement: { ...record.statement, directions },
     log: record.log.filter(entry => entry.version <= version),
   });
+  if (!objectiveRecordSchema.safeParse(rebuilt).success) throw objectiveError("objective-version-unavailable");
+  return rebuilt;
 }
 
 /** The record at `version` (default: the latest) with its log. A version other than the latest is rebuilt. */

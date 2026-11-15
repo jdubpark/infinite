@@ -103,6 +103,16 @@ test("a reader refuses what it does not know", () => {
     } finally {
       open.close();
     }
+    // The module's version goes back, and a new reader reads again. So the next refusal is for the store's version alone.
+    const restore = new DatabaseSync(f.path);
+    restore.exec("UPDATE schema_modules SET read_version=3 WHERE name='toy'");
+    restore.close();
+    const again = reader(f);
+    try {
+      assert.equal(count(again), 2);
+    } finally {
+      again.close();
+    }
     const raw = new DatabaseSync(f.path);
     raw.exec("UPDATE schema_modules SET version=2 WHERE name='store'");
     raw.close();

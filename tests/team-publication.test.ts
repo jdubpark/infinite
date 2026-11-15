@@ -8,7 +8,7 @@ import { performance } from "node:perf_hooks";
 import { dirname, join } from "node:path";
 import type { Manager } from "../packages/host/src/manager.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
-import { DEFAULT_TEAM_RETENTION, type TeamMember } from "../packages/host/src/team-types.js";
+import { DEFAULT_TEAM_RETENTION, type TeamMember, type TeamRun } from "../packages/host/src/team-types.js";
 import { publishTeamHead } from "../packages/host/src/team-workspace.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 import { fixture, git, limitLineup } from "./team-fixture.js";
@@ -150,6 +150,26 @@ process.exit(child.status ?? 128);
   d.f.config.teams!.commandPrefix = { command: process.execPath, args: ["-e", script, d.receipts, fail ? "fail" : "pass"] };
 }
 
+function startMemberWorkSave(teams: TeamService, id: string) {
+  const internal = teams as unknown as {
+    records: Map<string, { run: TeamRun }>;
+    startMemberWorkSave: (stored: { run: TeamRun }) => boolean;
+  };
+  return internal.startMemberWorkSave(internal.records.get(id)!);
+}
+
+function storedRun(teams: TeamService, id: string) {
+  return (teams as unknown as { records: Map<string, { run: TeamRun }> }).records.get(id)!.run;
+}
+
+function runRetentionPass(teams: TeamService, id: string) {
+  const internal = teams as unknown as {
+    records: Map<string, { run: TeamRun }>;
+    retire: (stored: { run: TeamRun }) => Promise<void>;
+  };
+  return internal.retire(internal.records.get(id)!);
+}
+
 async function closeDirect(f: ReturnType<typeof schedulerFixture>, teams: TeamService) {
   teams.close();
   await teams.idle();
@@ -211,8 +231,46 @@ test("an integrated result tree is not published again as unfinished member work
   } finally { await closeDirect(d.f, teams); }
 });
 
+test("nested submodule edits stay retryable even when parent work is saved", { timeout: 30000 }, async () => {
+  const d = directFixture("cancelled", { cancelledMinutes: 60 });
+  const nestedSource = join(d.receipts, "nested-source");
+  mkdirSync(nestedSource, { recursive: true });
+  git(nestedSource, "init", "--quiet");
+  writeFileSync(join(nestedSource, "nested.txt"), "base nested content.\n");
+  git(nestedSource, "add", "nested.txt");
+  git(nestedSource, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "commit", "-m", "Add nested content");
+  git(d.f.run.workspace, "-c", "protocol.file.allow=always", "submodule", "add", "--", nestedSource, "nested");
+  git(d.f.run.workspace, "add", ".gitmodules", "nested");
+  git(d.f.run.workspace, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "commit", "-m", "Add nested repository");
+  d.head = git(d.f.run.workspace, "rev-parse", "HEAD");
+  d.f.run.headCommit = d.head;
+  d.createRemote();
+  const { member } = addMemberClone(d, { edit: false });
+  git(member.cwd, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive");
+  writeFileSync(join(member.cwd, "nested", "nested.txt"), "uncommitted nested edit.\n");
+  writeFileSync(join(member.cwd, "parent-edit.txt"), "parent work is saveable.\n");
+  recordMemberWorkPushes(d);
+  d.f.writeTeam();
+  const teams = d.open(), id = d.f.run.id, branch = `${d.f.run.branch}-wip-${member.memberId}`;
+  try {
+    assert.equal(startMemberWorkSave(teams, id), true);
+    const saved = await until(() => teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork,
+      value => value?.failure?.attempts === 1, 10000, "nested work did not record a failed member save");
+    assert.equal(saved?.state, "retrying");
+    assert.equal(saved?.failure?.category, "nested-repository");
+    assert.equal(saved?.repository, "example/app");
+    assert.notEqual(remoteRef(d.remote, branch), "", "the saveable parent snapshot is still pushed");
+    assert.equal(wipPushes(d.receipts), 1);
+    const nestedEvent = `Member ${member.memberId} has changes inside a nested repository or submodule that the host cannot save to GitHub. The workspace will be removed after the remaining attempts unless the owner saves the work.`;
+    assert.equal(teams.get(id).events.filter(item => item.text === nestedEvent).length, 1);
+    assert.notEqual(saved?.state, "published");
+    assert.notEqual(saved?.state, "nothing-to-save");
+    assert.equal(existsSync(member.cwd), true);
+  } finally { await closeDirect(d.f, teams); }
+});
+
 test("member work save retries with exponential backoff and gives up on attempt five", { timeout: 30000 }, async () => {
-  const d = directFixture("cancelled", { cancelledMinutes: 0 });
+  const d = directFixture("cancelled", { cancelledMinutes: 60 });
   d.createRemote();
   const { member } = addMemberClone(d);
   d.f.run.missionId = randomUUID();
@@ -222,6 +280,8 @@ test("member work save retries with exponential backoff and gives up on attempt 
   const savedWork = () => teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork;
   try {
     teams.start();
+    await until(() => teams.get(id).publication?.commit, commit => commit === d.head, 10000, "the integration head was not published first");
+    await assert.rejects(teams.removeRun(id), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "member-work-not-saved");
     let saved = await until(savedWork, value => value?.failure?.attempts === 1, 10000, "the first member work push failure was not recorded");
     assert.equal(saved?.state, "retrying");
     assert.equal(Date.parse(saved!.failure!.retryAt) - Date.parse(saved!.failure!.at), 60_000);
@@ -244,7 +304,29 @@ test("member work save retries with exponential backoff and gives up on attempt 
     const gaveUpEvent = `Could not save unfinished work of member ${member.memberId} to GitHub after 5 attempts (other); its workspace is removed with the run.`;
     assert.equal(teams.get(id).events.filter(item => item.text === memberEvent).length, 1);
     assert.equal(teams.get(id).events.filter(item => item.text === gaveUpEvent).length, 1);
+    assert.equal(existsSync(dirname(d.f.run.workspace)), true, "the requested retries finish before the one-hour retention deadline");
+    d.clock.advance(60 * 60_000);
     await until(() => existsSync(dirname(d.f.run.workspace)), present => !present, 10000, "retention did not proceed after the fifth failed attempt");
+  } finally { await closeDirect(d.f, teams); }
+});
+
+test("a prior revision's retry backoff does not delay saving the current revision", { timeout: 30000 }, async () => {
+  const d = directFixture("cancelled", { cancelledMinutes: 60 });
+  d.createRemote();
+  const { member } = addMemberClone(d);
+  const at = new Date().toISOString();
+  member.savedWork = { revision: 1, state: "retrying", repository: "example/app", branch: `${d.f.run.branch}-wip-${member.memberId}`, at,
+    failure: { category: "other", attempts: 4, at, retryAt: new Date(Date.parse(at) + 60 * 60_000).toISOString() } };
+  d.f.run.revision = 2;
+  recordMemberWorkPushes(d, true);
+  d.f.writeTeam();
+  const teams = d.open(), id = d.f.run.id;
+  try {
+    teams.start();
+    await until(() => teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork,
+      value => value?.revision === 2 && value.failure?.attempts === 1, 10000, "the stale retry deadline delayed the current revision");
+    assert.equal(teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork?.state, "retrying");
+    assert.equal(wipPushes(d.receipts), 1);
   } finally { await closeDirect(d.f, teams); }
 });
 
@@ -305,6 +387,45 @@ test("removeRun refuses a running member before snapshot, even with a recorded r
     assert.equal(wipPushes(stale.receipts), 0);
     assert.equal(existsSync(dirname(stale.f.run.workspace)), true);
   } finally { await closeDirect(stale.f, staleTeams); }
+});
+
+test("shutdown fences a save whose settlement check resumes after close", { timeout: 30000 }, async () => {
+  const d = directFixture("cancelled", { cancelledMinutes: 0 });
+  const { member } = addMemberClone(d);
+  member.status = "running";
+  member.sessionId = d.f.run.members[0]!.sessionId;
+  d.f.run.publication = { repository: "example/app", branch: d.f.run.branch, commit: d.head, publishedAt: new Date().toISOString() };
+  recordMemberWorkPushes(d);
+  d.f.writeTeam();
+  const manager = d.f.manager as unknown as { state: (sessionId?: string) => Promise<{ status: string }> };
+  const originalState = manager.state.bind(manager);
+  let enteredState!: () => void, releaseState!: () => void, settledStatus = "running";
+  const entered = new Promise<void>(resolve => { enteredState = resolve; });
+  const gate = new Promise<void>(resolve => { releaseState = resolve; });
+  manager.state = async sessionId => {
+    if (sessionId === member.sessionId) {
+      enteredState();
+      await gate;
+      return { ...(await originalState(sessionId)), status: settledStatus };
+    }
+    return originalState(sessionId);
+  };
+  const teams = d.open(), id = d.f.run.id;
+  try {
+    const retention = runRetentionPass(teams, id);
+    await entered;
+    teams.close();
+    settledStatus = "exited";
+    releaseState();
+    await retention;
+    await teams.idle();
+    assert.equal(wipPushes(d.receipts), 0, "a settlement check completing after close did not launch a snapshot");
+    assert.equal(teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork, undefined);
+    assert.equal(existsSync(dirname(d.f.run.workspace)), true);
+  } finally {
+    releaseState();
+    await closeDirect(d.f, teams);
+  }
 });
 
 test("a snapshot command that never closes records a bounded failure and reaches the removal cap", { timeout: 30000 }, async () => {
@@ -389,26 +510,33 @@ test("publishHeads false does not snapshot member work or hold retention", { tim
   } finally { await closeDirect(d.f, teams); }
 });
 
-test("a later retention pass at the same revision does not push saved member work again", { timeout: 30000 }, async () => {
-  const d = directFixture("cancelled", { cancelledMinutes: 0 });
+test("a saved revision is not resnapshotted while its clone remains, but a new revision is saved", { timeout: 30000 }, async () => {
+  const d = directFixture("cancelled", { cancelledMinutes: 60 });
   d.createRemote();
   const { member } = addMemberClone(d);
-  d.f.run.missionId = randomUUID();
+  d.f.run.publication = { repository: "example/app", branch: d.f.run.branch, commit: d.head, publishedAt: new Date().toISOString() };
   recordMemberWorkPushes(d);
   d.f.writeTeam();
-  const teams = d.open(), id = d.f.run.id, branch = `${d.f.run.branch}-wip-${member.memberId}`;
+  const teams = d.open(), id = d.f.run.id;
   try {
-    teams.start();
+    assert.equal(startMemberWorkSave(teams, id), true);
     await until(() => teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork?.state,
-      state => state === "published", 10000, "the first retention pass did not save member work");
-    await until(() => existsSync(dirname(d.f.run.workspace)), present => !present, 10000, "the first retention pass did not remove the workspace");
+      state => state === "published", 10000, "the first save did not publish member work");
+    assert.equal(existsSync(member.cwd), true, "the member clone remains available for the next pass");
     assert.equal(wipPushes(d.receipts), 1);
-    const firstCommit = remoteRef(d.remote, branch);
-    d.clock.advance(60_000);
-    await delay(700);
+    assert.equal(startMemberWorkSave(teams, id), false, "the same saved revision does not start another snapshot");
+    await delay(100);
     assert.equal(wipPushes(d.receipts), 1);
-    assert.equal(remoteRef(d.remote, branch), firstCommit);
-    assert.equal(teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork?.revision, d.f.run.revision);
+    assert.equal(existsSync(member.cwd), true);
+
+    writeFileSync(join(member.cwd, "second-revision.txt"), "Changed member work for the next revision.\n");
+    storedRun(teams, id).revision++;
+    assert.equal(startMemberWorkSave(teams, id), true, "a changed run revision requests a fresh snapshot despite its prior result");
+    const saved = await until(() => teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork,
+      value => value?.revision === 2 && value.state === "published", 10000, "the changed revision was not published");
+    assert.equal(saved?.revision, 2);
+    assert.equal(wipPushes(d.receipts), 3, "the new snapshot pushes on the diverged primary and its SHA sibling");
+    assert.equal(existsSync(member.cwd), true);
   } finally { await closeDirect(d.f, teams); }
 });
 

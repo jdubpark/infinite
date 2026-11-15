@@ -58,6 +58,24 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
     }
     scope?.started(child.pid);
     let output = "", stdout = "", interrupted = false, settled = false, truncated = false, stopRequested = false, stopTimer: NodeJS.Timeout | undefined;
+    const onStdoutData = (chunk: Buffer) => { capture(chunk); stdout = (stdout + chunk.toString("utf8")).slice(-65536); };
+    const onStderrData = (chunk: Buffer) => capture(chunk);
+    const onInputError = (error: Error) => {
+      truncated = true;
+      if ((error as NodeJS.ErrnoException).code !== "EPIPE") capture(Buffer.from("\n[The host could not send configured team input.]\n"));
+    };
+    const onChildError = () => {
+      if (settled) return;
+      settled = true;
+      finish();
+      reject(new TeamError(409, "command-unavailable", "A configured team command could not be started."));
+    };
+    const onChildClose = (exitCode: number | null) => {
+      if (settled) return;
+      settled = true;
+      finish();
+      resolveResult({ exitCode, output, stdout, interrupted, truncated });
+    };
     const stop = () => {
       if (stopRequested || settled) return;
       stopRequested = true;
@@ -74,6 +92,13 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
           finish();
           // A prefixed command may leave descendants holding these pipes open. Stop waiting for their close event;
           // the abandoned result is never observed by the caller.
+          child.stdout?.off("data", onStdoutData);
+          child.stderr?.off("data", onStderrData);
+          child.stdin?.off("error", onInputError);
+          child.off("close", onChildClose);
+          child.off("error", onChildError);
+          child.on("error", () => {});
+          child.unref();
           child.stdin?.destroy(); child.stdout?.destroy(); child.stderr?.destroy();
           reject(new TeamError(409, "command-stop-unconfirmed", "A configured team command did not close after the host tried to stop it."));
         }, forceSettleAfterMs);
@@ -85,20 +110,17 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
       truncated ||= output.length + text.length > 65536;
       output = (output + text).slice(-65536);
     };
-    child.stdout!.on("data", chunk => { capture(chunk); stdout = (stdout + chunk.toString("utf8")).slice(-65536); }); child.stderr!.on("data", capture);
+    child.stdout!.on("data", onStdoutData); child.stderr!.on("data", onStderrData);
     if (input !== undefined) {
-      child.stdin!.on("error", error => {
-        truncated = true;
-        if ((error as NodeJS.ErrnoException).code !== "EPIPE") capture(Buffer.from("\n[The host could not send configured team input.]\n"));
-      });
+      child.stdin!.on("error", onInputError);
       child.stdin!.end(input, "utf8");
     }
     const timer = setTimeout(stop, timeoutMs); timer.unref();
     const finish = () => { clearTimeout(timer); if (stopTimer) clearTimeout(stopTimer); signal?.removeEventListener("abort", stop); };
     signal?.addEventListener("abort", stop, { once: true });
     if (signal?.aborted) stop();
-    child.once("error", () => { if (settled) return; settled = true; finish(); reject(new TeamError(409, "command-unavailable", "A configured team command could not be started.")); });
-    child.once("close", exitCode => { if (settled) return; settled = true; finish(); resolveResult({ exitCode, output, stdout, interrupted, truncated }); });
+    child.once("error", onChildError);
+    child.once("close", onChildClose);
   });
 }
 /** `grantEnv` maps the pushed ref to a host GitHub grant (`push` on exactly that ref) when the GitHub proxy is configured. */
@@ -642,22 +664,40 @@ export async function captureMemberResult(cwd: string, base: string, paths?: str
   return commit;
 }
 /** Preserve a member clone's current tree in a local WIP ref before retention removes the clone. */
-export async function snapshotMemberWork(cwd: string, base: string, options: { skipIfResultTree?: boolean }, prefix?: TeamCommand, signal?: AbortSignal, commandTimeoutMs = 30000, forceSettleAfterMs?: number): Promise<{ commit: string; tree: string } | undefined> {
+export type MemberWorkSnapshot = { commit?: string; tree: string; nestedRepository: boolean };
+function hasNestedSubmoduleWork(status: string) {
+  return status.split("\n").some(line => {
+    if (!line.startsWith("1 ") && !line.startsWith("2 ")) return false;
+    const submodule = line.split(" ", 4)[2];
+    return submodule?.startsWith("S") && (submodule[2] === "M" || submodule[3] === "U");
+  });
+}
+function hasChangedGitlink(diff: string) {
+  return diff.split("\n").some(line => {
+    const modes = /^:([0-7]{6}) ([0-7]{6}) /.exec(line);
+    return modes?.[1] === "160000" || modes?.[2] === "160000";
+  });
+}
+export async function snapshotMemberWork(cwd: string, base: string, options: { skipIfResultTree?: boolean }, prefix?: TeamCommand, signal?: AbortSignal, commandTimeoutMs = 30000, forceSettleAfterMs?: number): Promise<MemberWorkSnapshot | undefined> {
   const runGit = (args: string[]) => git(cwd, args, prefix, commandTimeoutMs, signal, forceSettleAfterMs);
   await runGit(["add", "-A", "--", "."]);
   const tree = await runGit(["write-tree"]);
   const baseTree = await runGit(["rev-parse", `${base}^{tree}`]);
-  if (tree === baseTree) return undefined;
+  let nestedRepository = hasNestedSubmoduleWork(await runGit(["status", "--porcelain=v2", "--ignore-submodules=none"]));
+  if (tree !== baseTree)
+    nestedRepository ||= hasChangedGitlink(await runGit(["diff-tree", "--no-commit-id", "--raw", "-r", "--no-renames", baseTree, tree]));
+  if (tree === baseTree && !nestedRepository) return undefined;
   if (options.skipIfResultTree) {
     const resultRefs = lines(await runGit(["for-each-ref", "--format=%(refname)", "refs/heads/infinite-result"]));
     if (resultRefs.includes("refs/heads/infinite-result") && tree === await runGit(["rev-parse", "refs/heads/infinite-result^{tree}"]))
-      return undefined;
+      return nestedRepository ? { tree, nestedRepository } : undefined;
   }
+  if (tree === baseTree) return { tree, nestedRepository };
   const headTree = await runGit(["rev-parse", "HEAD^{tree}"]);
   const commit = tree === headTree ? await runGit(["rev-parse", "HEAD"])
     : await runGit(["commit-tree", tree, "-p", "HEAD", "-m", `Unfinished work of team member ${basename(cwd)}, saved before workspace removal`]);
   await runGit(["update-ref", "refs/heads/infinite-wip", commit]);
-  return { commit, tree };
+  return { commit, tree, nestedRepository };
 }
 export async function integrateMemberResult(workspace: string, memberCwd: string, commit: string, prefix?: TeamCommand, signal?: AbortSignal) {
   if (!/^[a-f0-9]{40,64}$/.test(commit)) throw new TeamError(409, "invalid-commit", "The task commit is invalid.");

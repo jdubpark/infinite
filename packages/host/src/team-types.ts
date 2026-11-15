@@ -72,7 +72,7 @@ export const teamDeliverySchema = z.discriminatedUnion("mode", [
   z.object({ mode: z.literal("pr"), repository: githubRepository, baseBranch: gitBranch }).strict(),
 ]);
 export type TeamDelivery = z.infer<typeof teamDeliverySchema>;
-export type TeamPublicationCategory = "auth" | "network" | "not-found" | "rejected" | "other";
+export type TeamPublicationCategory = "auth" | "network" | "not-found" | "rejected" | "nested-repository" | "other";
 export type TeamPublication = {
   repository: string;
   branch: string;

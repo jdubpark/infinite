@@ -11,7 +11,7 @@ const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 const temporaryDirectories: string[] = [];
 const templateFiles = ["agent-anchor.sh", "agent-env.sh", "agent-wrapper.sh", "config.example.json", "github-app-gh.sh",
   "infinite-github-refresh.service", "infinite-github-refresh.timer", "infinite.service", "infinite.sudoers", "infinite-tmpfiles.conf", "install-agent-env.sh",
-  "transcript-drain.sh"];
+  "transcript-drain.sh", "process-census.sh"];
 
 function tmp() {
   const path = mkdtempSync(join(tmpdir(), "infinite-instance-"));
@@ -82,7 +82,7 @@ test("no rendered file for an instance names the first instance", () => {
   const files = rendered(["--instance", "work"]);
   assert.deepEqual(files.map(([name]) => name).sort(), ["agent-anchor.sh", "agent-env.sh", "agent-wrapper.sh", "config.example.json", "github-app-gh.sh",
     "infinite-work-github-refresh.service", "infinite-work-github-refresh.timer", "infinite-work.service", "infinite-work.sudoers", "infinite-work-tmpfiles.conf", "install-agent-env.sh",
-    "transcript-drain.sh"].sort());
+    "process-census.sh", "transcript-drain.sh"].sort());
   for (const [name, text] of files)
     for (const pattern of first) assert.doesNotMatch(text, pattern, `${name} ${pattern}`);
 });
@@ -109,6 +109,14 @@ test("the instance drain wrapper runs the instance's relay, and the instance sud
   assert.match(sudoers, /^infinite-work-host ALL=\(infinite-work-agent\) NOPASSWD: \/usr\/local\/libexec\/infinite-work\/transcript-drain ""$/m);
   assert.match(sudoers, /NOPASSWD: \/usr\/local\/libexec\/infinite-work\/claude \*, /);
   assert.doesNotMatch(sudoers, /jevcode|repository-graph/);
+});
+
+test("the instance census wrapper runs the instance's census, and the instance sudoers permits it", () => {
+  const out = render(["--instance", "work"]);
+  assert.match(readFileSync(join(out, "process-census.sh"), "utf8"),
+    /^exec \/usr\/local\/bin\/node \/opt\/infinite-work\/packages\/host\/dist\/process-census\.js$/m);
+  assert.match(readFileSync(join(out, "infinite-work.sudoers"), "utf8"),
+    /^infinite-work-host ALL=\(infinite-work-agent\) NOPASSWD: \/usr\/local\/libexec\/infinite-work\/process-census ""$/m);
 });
 
 test("every tracked deploy file that names a first-instance path is rendered for an instance or kept for the first instance only", () => {
@@ -176,7 +184,7 @@ test("valid names that overlap template words are substituted only once", async 
 
 test("rendered shell files parse", () => {
   const out = render(["--instance", "work"]);
-  for (const name of ["agent-wrapper.sh", "github-app-gh.sh", "install-agent-env.sh", "transcript-drain.sh"])
+  for (const name of ["agent-wrapper.sh", "github-app-gh.sh", "install-agent-env.sh", "process-census.sh", "transcript-drain.sh"])
     execFileSync("sh", ["-n", join(out, name)]);
 });
 

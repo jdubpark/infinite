@@ -416,10 +416,32 @@ workspace removal completes, the host closes it as `cancelled` with the last
 blocker in its reason; it does not claim the work is complete. Its record then
 uses the normal `cancelledMinutes` retention. The outcome ledger keeps the run
 as blocked: the close writes no second settled event. A blocked run that
-still holds an unresolved operation from an interrupted restart keeps its
-workspaces and is not closed automatically: the host cannot see a process
-orphaned by an earlier API process, so elapsed time does not prove the operation
-ended. The owner cancels or reconciles such a run. Started and completed removals are
+still holds an unresolved operation keeps its workspaces unless the host looks
+and finds no process of that operation. The host records each command an
+operation starts, as the leader of its own session and process group, and while
+the operation runs it samples the process table for descendants that moved to
+other sessions or groups. The saved intent says that this record may be
+incomplete from before a command starts until a save holds it. While such a run
+is blocked or paused with no command of its own running, the host looks at most
+every ten minutes for processes that match the record, and for any process of
+the host account or of the account that runs team commands that uses the run
+directory as a working directory, open file, or command-line argument. The
+run's events record each change in what the host saw, and keep the two kinds
+apart: a process that only uses the directory is not called the operation's
+process. After `teams.retention.blockedHours` the host closes the run only when
+a look taken at that moment, in two passes, finds neither kind; the workspaces
+are then removed and the run closes as described above. In every other case the
+run keeps its workspaces and stays blocked: when a look finds a process; when it
+cannot finish; when a process of those accounts refuses inspection; when the
+record overflowed; or when an earlier API process stopped while the record was
+marked incomplete and the host has not rebooted since. In the last four cases
+the host says it cannot tell. The host never signals or stops a process it
+finds. The look has stated limits: it does not inspect other accounts or a
+process that left its recorded session and group and no longer uses the run
+directory, and it is evidence about left-over processes, not a defense against
+a process that hides on purpose. An intent recorded by an older host has no
+process record, so its run keeps the earlier behavior: elapsed time alone never
+closes it, and the owner cancels or reconciles it. Started and completed removals are
 recorded as host events, and a failed removal is retried on later scheduler
 ticks. A blocked run whose workspace is being removed cannot resume, continue,
 or be steered. An owner can cancel a blocked run directly after its goal or
@@ -592,12 +614,24 @@ restart-interruption reason, the same check operation is still pending, every
 member is stopped, the exact integrated head is unchanged and clean, and the
 retained check records show that the final configured command was interrupted.
 Result, prepare, member, permission, and delivery uncertainty stays fenced.
-The operator must first establish that the old check processes have exited:
-the host cannot see check processes orphaned by a previous API process (for
-example, when `systemd` uses `KillMode=process` or a sudo command prefix is
-configured). Before attesting, confirm that no process from the interrupted
-check remains and that no process has a working directory under the team root.
-The attestation is an operator claim, not host verification.
+The operator must first establish that the old check processes have exited. A
+check can outlive the API process that started it (for example, when `systemd`
+uses `KillMode=process` or a sudo command prefix is configured). Before
+attesting, confirm that no process from the interrupted check remains and that
+no process has a working directory under the team root. The attestation is an
+operator claim, not host verification.
+
+The host reports what it sees. A check whose intent carries a process record is
+looked for again before each reconciliation; the result is written to the run's
+events and to `pendingOperation.processes`, with `processesCheckedAt` (process
+ids are not exposed): `running` when processes match the host's record of the
+check, `in-use` when none does but a process uses the run directory, `ended`
+when the host looked and found neither, and `unknown` when it could not tell.
+The host's view is limited: it inspects processes of its own account and, through
+the installed `process-census` wrapper where a sudo command prefix is set, of the
+account that runs team commands; it does not inspect other accounts. Without that
+wrapper or its sudo rule the result is `unknown`. An `ended` or `unknown` result
+therefore does not replace the attestation, which is still required.
 
 Use `POST /api/teams/:id/reconcile-verification` with `requestId`, `revision`,
 `pendingId`, `headCommit`, and `attestation: { boundary: "check-only",
@@ -615,7 +649,11 @@ state. A different body with that ID is refused. Refusal codes include
 `verification-reconciliation-operation-changed`,
 `verification-reconciliation-head-changed`, and
 `verification-policy-changed`; a dirty integration workspace returns
-`integration-changed-files`.
+`integration-changed-files`. While the host sees a process that matches its
+record of the interrupted check, the request is refused with
+`team-operation-running`; while it sees only processes that use the run
+directory, with `team-directory-in-use`; and once workspace removal has started,
+with `team-workspace-removed`.
 
 An owner can retire a current-revision reviewer whose report is missing and
 whose runtime is in `recording-error`, then let the scheduler start one fresh

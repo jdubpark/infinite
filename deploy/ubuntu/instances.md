@@ -178,7 +178,10 @@ Install the rendered `transcript-drain.sh` as
 `/usr/local/libexec/infinite-NAME/transcript-drain`, owned `root:root` with
 mode `0755`, beside the provider wrappers; it is the path the rendered sudoers
 permits, and without it the instance's sudo sessions report
-`finalDrain: "skipped"`.
+`finalDrain: "skipped"`. Install the rendered `process-census.sh` the same way as
+`/usr/local/libexec/infinite-NAME/process-census`, owned `root:root` with mode
+`0755`; the rendered sudoers permits it, and without it the instance cannot
+check for processes left by an earlier API process.
 
 The rendered sudoers permits no `jevcode` or `repository-graph` wrapper,
 because the tracked ones name the first instance's paths. The instance runs
@@ -207,6 +210,8 @@ for provider in claude codex grok opencode; do
 done
 sudo install -o root -g root -m 0755 ".local/instance-$NAME/transcript-drain.sh" \
   "/usr/local/libexec/infinite-$NAME/transcript-drain"
+sudo install -o root -g root -m 0755 ".local/instance-$NAME/process-census.sh" \
+  "/usr/local/libexec/infinite-$NAME/process-census"
 sudo sh ".local/instance-$NAME/install-agent-env.sh"
 sudo systemctl daemon-reload
 sudo systemd-tmpfiles --create "/etc/tmpfiles.d/infinite-$NAME.conf"

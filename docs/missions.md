@@ -381,14 +381,15 @@ failed resume, as above, or when one of these rules holds:
 A new conversation, whether from a rotation or a failed resume, receives the
 full prompt, the coordinator's stored notes under a heading that marks them as its own earlier words rather than host
 facts, the open follow-ups in the mission state, and the pending messages. No
-extra model turn is spent on the switch. Owner direction that earlier attempts
-already received is listed under a heading that says so. It still applies, and
+extra model turn is spent on the switch. Direction that earlier attempts
+already received, from the owner or a connector, is listed under a heading that
+says so, each item named by its source. It still applies, and
 receiving it does not mean it was carried out: the coordinator checks its notes,
 refused reports, and the mission state, does not repeat what they show was done,
 and continues what is unresolved. Direction that no attempt has received is
 listed under its own heading only when its message is in this attempt; one
 still queued behind the message limit or the prompt budget is listed when its
-message arrives. The owner's text is unchanged. A rotation is not a missed report and
+message arrives. The direction text is unchanged. A rotation is not a missed report and
 does not count toward the three-refusal block. The host records a mission event
 that names the rule.
 

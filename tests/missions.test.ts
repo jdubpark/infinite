@@ -1577,7 +1577,7 @@ test("a full prompt lists only the new owner direction whose message it delivers
     await h.report(3, { kind: "answer-child", subtaskId: "a", decisionId: decisions[1].id, text: "No" });
     const fourth = (await h.attempt(4)).prompt, later = sent((await h.messages(4)) as PromptMessage[]);
     assert.deepEqual(later, directions.filter(text => !now.includes(text)));
-    const earlierAt = fourth.indexOf("Owner direction that earlier coordinator attempts already received"), newAt = fourth.indexOf("Owner direction that no earlier attempt received:");
+    const earlierAt = fourth.indexOf("Directions that earlier coordinator attempts already received"), newAt = fourth.indexOf("Directions that no earlier attempt received:");
     assert.ok(earlierAt >= 0 && newAt > earlierAt);
     for (const text of now) assert.ok(fourth.search(new RegExp(`${text}(?!\\d)`)) > earlierAt && fourth.search(new RegExp(`${text}(?!\\d)`)) < newAt, `${text} is under the received heading`);
     for (const text of later) assert.ok(fourth.search(new RegExp(`${text}(?!\\d)`)) > newAt, `${text} is under the new heading`);
@@ -2347,12 +2347,14 @@ test("after a rotation, owner direction that earlier attempts received is marked
 
     mock.timers.tick(61 * 60000);
     await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Mention the release in the summary" });
+    // A connector's direction queues its own message type; no attempt has received it, so it is new too, not "received".
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Link the tracking issue" }, { kind: "connector", id: "example-bot", name: "Example bot" });
     const third = await h.attempt(3);
     assert.equal(third.request.continuation?.mode, "start", "The idle rule starts a new conversation");
-    // The earlier direction sits under a received-not-fulfilled heading; only the new one is under the new heading.
-    assert.match(third.prompt, /Owner direction that earlier coordinator attempts already received[^\n]*Receiving it does not mean it was carried out[^\n]*\nFor this attempt only, file one follow-up in 90 minutes\n\nOwner direction that no earlier attempt received:\nMention the release in the summary/);
-    assert.doesNotMatch(third.prompt, /\nOwner direction:\n/, "No direction is listed without its delivery label");
-    assert.deepEqual(((await h.messages(3)) as PromptMessage[]).filter(message => message.type === "owner-direction").map(message => message.text), ["Mention the release in the summary"]);
+    // The earlier direction sits under a received-not-fulfilled heading; only the new ones are under the new heading.
+    assert.match(third.prompt, /Directions that earlier coordinator attempts already received[^\n]*Receiving one does not mean it was carried out[^\n]*\nOwner direction: For this attempt only, file one follow-up in 90 minutes\n\nDirections that no earlier attempt received:\nOwner direction: Mention the release in the summary\n\nConnector \(Example bot\) direction: Link the tracking issue/);
+    assert.doesNotMatch(third.prompt, /\nDirections:\n/, "No direction is listed without its delivery label");
+    assert.deepEqual(((await h.messages(3)) as PromptMessage[]).filter(message => message.type === "owner-direction" || message.type === "connector-direction").map(message => message.text), ["Mention the release in the summary", "Link the tracking issue"]);
   } finally { h.close(); mock.timers.reset(); }
 });
 

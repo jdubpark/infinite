@@ -22,7 +22,7 @@ import {
   PAYLOAD_LIMIT_BYTES,
 } from "../packages/host/src/routing-store.js";
 import { ROUTING_DEFAULTS } from "../packages/host/src/routing-policy.js";
-import type { DecisionRow, RoutingPayload } from "../packages/host/src/routing-types.js";
+import type { DecisionRow, RoutingPayload, RoutingPoint } from "../packages/host/src/routing-types.js";
 
 const NOW = "2026-11-15T12:00:00.000Z";
 const DAY_MS = 86_400_000;
@@ -58,6 +58,8 @@ type Spec = {
   area?: string;
   featureMap?: string;
   explore?: boolean;
+  point?: RoutingPoint;
+  elapsedMs?: number;
 };
 
 const PLAIN_SECRETS = ["proj-alpha-secret", "task-beta-secret", "area-gamma-secret", "map-delta-secret"];
@@ -75,7 +77,7 @@ function payloadOf(spec: Spec): RoutingPayload {
     chosenWeight: 0.5,
     current: [],
     candidates: [],
-    elapsedMs: 1,
+    elapsedMs: spec.elapsedMs ?? 1,
   };
 }
 
@@ -87,11 +89,11 @@ function rowOf(tx: EvidenceTx, spec: Spec): DecisionRow {
   const revision = spec.revision ?? 1;
   const featureMap = spec.featureMap ?? "map-delta-secret";
   return {
-    key: decisionKey(runId, revision, tx.index("task", taskId), "start", ordinal),
+    key: decisionKey(runId, revision, tx.index("task", taskId), spec.point ?? "start", ordinal),
     runId,
     revision,
     taskKey: tx.index("task", taskId),
-    point: "start",
+    point: spec.point ?? "start",
     ordinal,
     projectRef: tx.index("project", spec.projectId ?? "proj-alpha-secret"),
     role: "implementer",
@@ -267,6 +269,102 @@ test("decision reads seek their indexes", () => {
     ).map(row => row.detail).join(" | "));
     assert.ok(/routing_by_time/.test(sweep), sweep);
     assert.ok(!/TEMP B-TREE/.test(sweep), sweep);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("the module is version 1 with no run hooks", () => {
+  const module = routingModule();
+  assert.deepEqual([module.name, module.version, module.readVersion], ["routing", 1, 1]);
+  assert.equal(module.deleteRun, undefined);
+  assert.equal(module.runIds, undefined);
+});
+
+test("project decisions are start rows of the project since the bound, newest first, at most 500", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    const since = daysBefore(30);
+    const insert = (spec: Spec) => insertSpec(store!, { projectId: "proj-a", ...spec });
+    insert({ taskId: "t1", decidedAt: daysBefore(1) });
+    insert({ taskId: "t2", decidedAt: daysBefore(2) });
+    insert({ taskId: "t3", decidedAt: since });
+    insert({ taskId: "t4", decidedAt: daysBefore(31) });
+    insert({ taskId: "t5", point: "escalation", decidedAt: daysBefore(1) });
+    insert({ taskId: "t6", projectId: "proj-b", decidedAt: daysBefore(1) });
+    const keyOf = (taskId: string) => store!.read(db => decisionKey("run-1", 1, db.index("task", taskId), "start", 1));
+    const read = store.read(db => projectDecisions(db, "proj-a", since));
+    // The bound is inclusive; escalation rows and other projects are left out.
+    assert.deepEqual(read.rows.map(row => row.key), ["t1", "t2", "t3"].map(keyOf));
+    assert.equal(read.capped, false);
+    for (let index = 0; index < 498; index++) insert({ taskId: `bulk-${index}`, decidedAt: daysBefore(3) });
+    const full = store.read(db => projectDecisions(db, "proj-a", since));
+    assert.deepEqual([full.rows.length, full.capped, full.rows[0]!.key], [500, true, keyOf("t1")]);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("project cells keep the newest row of each four-part cell, at most the limit", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    insertSpec(store, { projectId: "proj-a", taskId: "new", decidedAt: daysBefore(1), elapsedMs: 11 });
+    insertSpec(store, { projectId: "proj-a", taskId: "old", decidedAt: daysBefore(2), elapsedMs: 22 });
+    insertSpec(store, { projectId: "proj-a", taskId: "map", decidedAt: daysBefore(3), featureMap: "f".repeat(64), elapsedMs: 33 });
+    const two = store.read(db => projectCells(db, "proj-a", daysBefore(30), 2));
+    assert.deepEqual([two.cells.map(cell => cell.payload?.elapsedMs), two.capped], [[11, 33], false]);
+    const one = store.read(db => projectCells(db, "proj-a", daysBefore(30), 1));
+    assert.deepEqual([one.cells.map(cell => cell.payload?.elapsedMs), one.capped], [[11], true]);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("shadow progress counts start rows up to 50 and names the first time", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    for (let index = 0; index < 49; index++) insertSpec(store, { projectId: "proj-a", taskId: `t-${index}`, decidedAt: daysBefore(index + 1) });
+    insertSpec(store, { projectId: "proj-a", taskId: "esc", point: "escalation", decidedAt: daysBefore(90) });
+    assert.deepEqual(store.read(db => shadowProgress(db, "proj-a")), { decisions: 49, capped: false, firstAt: daysBefore(49) });
+    for (let index = 0; index < 3; index++) insertSpec(store, { projectId: "proj-a", taskId: `late-${index}` });
+    assert.deepEqual(store.read(db => shadowProgress(db, "proj-a")), { decisions: 50, capped: true, firstAt: daysBefore(49) });
+    assert.deepEqual(store.read(db => shadowProgress(db, "proj-b")), { decisions: 0, capped: false, firstAt: null });
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("the sweep keeps 180 days, removes the oldest first and 100 by default, never throws, and a deleted run keeps its rows", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    insertSpec(store, { ordinal: 1, decidedAt: daysBefore(180) });
+    insertSpec(store, { ordinal: 2, decidedAt: daysBefore(180.5) });
+    insertSpec(store, { ordinal: 3, decidedAt: daysBefore(300) });
+    const left = () => store!.read(db => db.all<{ ordinal: number }>("SELECT ordinal FROM routing_decisions ORDER BY ordinal")).map(row => row.ordinal);
+    // Exactly 180 days old is kept; the oldest (300 days) goes first.
+    assert.equal(sweepExpiredDecisions(store, NOW, 1), 1);
+    assert.deepEqual(left(), [1, 2]);
+    assert.equal(sweepExpiredDecisions(store, NOW), 1);
+    assert.deepEqual(left(), [1]);
+    assert.equal(store.deleteRun("run-1"), true);
+    assert.deepEqual(left(), [1], "a deleted run keeps its decision rows");
+    for (let index = 0; index < 101; index++) insertSpec(store, { runId: "run-2", ordinal: index + 1, decidedAt: daysBefore(200) });
+    assert.equal(sweepExpiredDecisions(store, NOW), 100);
+    store.close();
+    assert.equal(sweepExpiredDecisions(store, NOW), 0, "never throws on a closed store");
+    store = undefined;
   } finally {
     store?.close();
     f.close();

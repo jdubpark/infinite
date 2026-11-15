@@ -1,373 +1,468 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { promptVersion } from "../packages/host/src/config-identity.js";
-import { configurationModule } from "../packages/host/src/configuration-store.js";
+import { profileIdentityKey, promptVersion } from "../packages/host/src/config-identity.js";
+import { advanceEpoch, configurationModule } from "../packages/host/src/configuration-store.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
-import { outcomeModule, writeOutcome, type OutcomeRow, type OutcomePayload } from "../packages/host/src/outcome-store.js";
-import { RoutingRecorder, type RouterStart } from "../packages/host/src/routing-recorder.js";
-import { decisionKey, taskDecisions, routingModule } from "../packages/host/src/routing-store.js";
-import { decisionSeed } from "../packages/host/src/routing-sample.js";
+import type { EvidenceTx } from "../packages/host/src/evidence/types.js";
+import { outcomeModule, writeOutcome, type OutcomePayload, type OutcomeRow } from "../packages/host/src/outcome-store.js";
 import { pinRouting } from "../packages/host/src/routing-policy.js";
-import { taskFeatures } from "../packages/host/src/task-features.js";
+import { RoutingRecorder, type RouterStart } from "../packages/host/src/routing-recorder.js";
+import { TIER_COSTS } from "../packages/host/src/routing-choice.js";
+import { decisionSeed } from "../packages/host/src/routing-sample.js";
+import { decisionKey, PAYLOAD_LIMIT_BYTES, routingModule, taskDecisions } from "../packages/host/src/routing-store.js";
+import { featureMapDigest, taskFeatures, type FeatureMap } from "../packages/host/src/task-features.js";
 import type { RoutingPayload } from "../packages/host/src/routing-types.js";
 import type { TeamLineup, TeamModelProfile, TeamRun, TeamTask } from "../packages/host/src/team-types.js";
 import { mixedLineup } from "./team-fixture.js";
 
 const NOW = "2026-11-15T12:00:00.000Z";
+const ago = (days: number) => new Date(Date.parse(NOW) - days * 86_400_000).toISOString();
 const PATHS = ["packages/host/src/a.ts"];
+const AREA = taskFeatures({ role: "implementer", paths: PATHS }).area;
+const UNAVAILABLE = "Routing shadow decision skipped: the evidence store is unavailable.";
+const FAILED = "Routing shadow decision failed.";
+const TOO_LARGE = "Routing shadow decision skipped: its details are over the size limit.";
 
-type Fixture = { root: string; path: string; key: Buffer; close: () => void };
-function fixture(): Fixture {
-  const root = mkdtempSync(join(tmpdir(), "infinite-routing-recorder-"));
-  return { root, path: evidenceDatabasePath(join(root, "state")), key: randomBytes(32), close: () => rmSync(root, { recursive: true, force: true }) };
-}
-
-function open(f: Fixture): EvidenceStore {
-  const store = new EvidenceStore({ databasePath: f.path, vaultKey: f.key });
+const ALL = (store: EvidenceStore) => {
   store.register(configurationModule());
   store.register(outcomeModule({ now: () => NOW }));
   store.register(routingModule());
-  return store;
+};
+
+/** A fresh store with the modules `register` adds. A fixed vault key keeps the blind indexes stable. */
+function withStore(fn: (store: EvidenceStore) => void, register: (store: EvidenceStore) => void = ALL): void {
+  const root = mkdtempSync(join(tmpdir(), "infinite-routing-recorder-"));
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: Buffer.alloc(32, 7) });
+  try {
+    register(store);
+    fn(store);
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
-function runOf(lineup: TeamLineup, routing: TeamRun["routing"], id = "run-1"): TeamRun {
-  return { id, revision: 1, projectId: "rehearsal", lineup, routing } as unknown as TeamRun;
+const runOf = (lineup: TeamLineup, routing: TeamRun["routing"], id = "run-1", projectId = "rehearsal") =>
+  ({ id, revision: 1, projectId, lineup, routing }) as unknown as TeamRun;
+const taskOf = (id: string, extra: Record<string, unknown> = {}) =>
+  ({ id, title: id, instructions: "do it", paths: PATHS, dependsOn: [], revision: 1, status: "pending", ...extra }) as unknown as TeamTask;
+const startOf = (run: TeamRun, task: TeamTask, extra: Partial<RouterStart> = {}): RouterStart =>
+  ({ run, task, publishHeads: false, entryTools: false, featureMap: undefined, limited: new Set(), ...extra });
+const recorder = (store: EvidenceStore, lines: string[] = [], clock?: () => number) =>
+  new RoutingRecorder({ store, now: () => NOW, clock, log: line => lines.push(line) });
+const rowsOf = (store: EvidenceStore, runId: string, taskId: string) => store.read(db => taskDecisions(db, runId, taskId)).rows;
+const countRows = (store: EvidenceStore) => store.read(db => routingModule().counts!(db).decisions);
+const effortOf = (profile: TeamModelProfile) => ("effort" in profile ? profile.effort : profile.variant) ?? null;
+const identityOf = (profile: TeamModelProfile) => profileIdentityKey({ provider: profile.provider, model: profile.model, effort: effortOf(profile) });
+const versionOf = (profile: TeamModelProfile, publishHeads = false, entryTools = false) =>
+  promptVersion("implementer", profile.provider, profile, publishHeads, entryTools);
+
+function config(tx: EvidenceTx, id: string, profile: TeamModelProfile, version: string): void {
+  tx.run("INSERT INTO configurations (config_id, provider, model, effort, prompt_version, guidance, knowledge, routing, shape, first_seen_at) "
+    + "VALUES (?, ?, ?, ?, ?, 'g', 'k', 'off', 's', ?)", id, profile.provider, profile.model, effortOf(profile), version, NOW);
 }
 
-function taskOf(id: string, agentProfileId?: string): TeamTask {
+/** An implementer start that integrated, was held, and froze. `failed` makes it stall instead. */
+function integrated(spec: { id: string; profile: TeamModelProfile; configId: string; endedAt?: string; area?: string;
+  projectId?: string; epoch?: number; failed?: boolean }): OutcomeRow {
+  const payload: OutcomePayload = { projectId: spec.projectId ?? "rehearsal", taskId: "task-x", area: spec.area ?? AREA, featureMap: "default",
+    rounds: { run: 1, attributed: 1, unknown: 0 }, limitEvents: 0, costCoverage: "none" };
+  const endedAt = spec.endedAt ?? ago(2);
   return {
-    id, title: id, instructions: "do it", paths: PATHS, dependsOn: [], revision: 1, status: "pending",
-    ...(agentProfileId === undefined ? {} : { agentProfileId }),
-  } as unknown as TeamTask;
-}
-
-function startOf(run: TeamRun, task: TeamTask, limited: RouterStart["limited"] = new Set()): RouterStart {
-  return { run, task, publishHeads: false, entryTools: false, featureMap: undefined, limited };
-}
-
-/** The implementer's recorded decisions of a task, read back through the store. */
-function decisionsOf(store: EvidenceStore, runId: string, taskId: string) {
-  return store.read(db => taskDecisions(db, runId, taskId));
-}
-
-function countRows(store: EvidenceStore): number {
-  return store.read(db => routingModule().counts!(db).decisions);
-}
-
-const PAYLOAD_BASE: OutcomePayload = { projectId: "rehearsal", taskId: "task-x", area: "host", featureMap: "default",
-  rounds: { run: 0, attributed: 0, unknown: 0 }, limitEvents: 0, costCoverage: "none" };
-
-/** A counted implementer row of the start point: completed, integrated, frozen, accepted, first pass. */
-function outcome(spec: { id: string; provider: OutcomeRow["provider"]; model: string; effort: string | null; projectId?: string;
-  area: string; configId?: string | null; endedAt?: string }): OutcomeRow {
-  const payload: OutcomePayload = { ...PAYLOAD_BASE, projectId: spec.projectId ?? "rehearsal", area: spec.area };
-  return {
-    outcomeId: `${spec.id}:m1`, source: "production", projectRef: "", taskRef: "", areaRef: "", runId: spec.id, revision: 1,
-    memberId: "m1", sessionId: null, attemptIndex: 1, inherited: false, role: "implementer", profileId: "profile",
-    provider: spec.provider, model: spec.model, effort: spec.effort, profileEpoch: 1, configId: spec.configId ?? null,
-    experimentRef: null, kind: null, risk: "normal", featureVersion: 1, disposition: "completed", exclusion: null, flags: [],
-    integrated: 1, accepted: 1, acceptance: 1, firstPass: 1, held: null, startedAt: null, endedAt: spec.endedAt ?? NOW,
-    frozenAt: NOW, holdUntil: null, runDeletedAt: null, payload,
+    outcomeId: `${spec.id}:m1`, source: "production", projectRef: "", taskRef: "", areaRef: "", runId: spec.id, revision: 1, memberId: "m1",
+    sessionId: null, attemptIndex: 1, inherited: false, role: "implementer", profileId: spec.profile.id, provider: spec.profile.provider,
+    model: spec.profile.model, effort: effortOf(spec.profile), profileEpoch: spec.epoch ?? 1, configId: spec.configId, experimentRef: null,
+    kind: null, risk: "normal", featureVersion: 1, disposition: spec.failed ? "stalled" : "integrated", exclusion: null, flags: [],
+    integrated: spec.failed ? 0 : 1, accepted: spec.failed ? 0 : 1, acceptance: spec.failed ? null : 1, firstPass: spec.failed ? 0 : 1,
+    held: spec.failed ? 0 : 1, startedAt: new Date(Date.parse(endedAt) - 3_600_000).toISOString(), endedAt,
+    frozenAt: spec.failed ? null : endedAt, holdUntil: null, runDeletedAt: null, payload,
   };
 }
 
-function plainRecorder(store: EvidenceStore, lines: string[] = [], clock?: () => number) {
-  return new RoutingRecorder({ store, now: () => NOW, clock, log: line => lines.push(line) });
-}
+test("a shadow start writes one recorded row with both picks", () => withStore(store => {
+  const routing = pinRouting(undefined, "autonomous", mixedLineup);
+  assert.ok(routing);
+  const run = runOf(mixedLineup, routing);
+  const lines: string[] = [];
+  const rec = recorder(store, lines);
+  rec.recordStart(startOf(run, taskOf("task-spark", { agentProfileId: "spark-high" })));
+  rec.recordStart(startOf(run, taskOf("task-astra", { agentProfileId: "astra-xhigh" })));
+  assert.deepEqual(lines, []);
+  for (const [taskId, coordinator] of [["task-spark", "spark-high"], ["task-astra", "astra-xhigh"]] as const) {
+    const rows = rowsOf(store, run.id, taskId);
+    assert.equal(rows.length, 1);
+    const row = rows[0]!;
+    assert.equal(row.coordinatorProfileId, coordinator);
+    // The contributor profile is removed by the fixed rules, so the coordinator's pick is the only candidate.
+    assert.equal(row.chosenProfileId, "astra-xhigh");
+    assert.equal(row.greedyProfileId, "astra-xhigh");
+    assert.equal(row.basis, "single-candidate");
+    assert.equal(row.mode, "shadow");
+    assert.equal(row.state, "recorded");
+    assert.equal(row.memberId, null);
+    assert.equal(row.policyDigest, routing.digest);
+    assert.equal(row.algorithmVersion, 1);
+    assert.equal(row.rewardVersion, 1);
+    assert.equal(row.point, "start");
+    assert.equal(row.ordinal, 1);
+    assert.equal(row.revision, 1);
+    assert.equal(row.payload?.projectId, "rehearsal");
+    assert.equal(row.payload?.taskId, taskId);
+  }
+  // The key and the seed use the task's blind index, never its plain id.
+  const blind = store.read(db => db.index("task", "task-spark"));
+  const row = rowsOf(store, run.id, "task-spark")[0]!;
+  assert.equal(row.key, decisionKey(run.id, run.revision, blind, "start", 1));
+  assert.equal(row.seed, decisionSeed(routing.digest, run.id, run.revision, blind, "start", 1));
+  assert.notEqual(row.key, decisionKey(run.id, run.revision, "task-spark", "start", 1));
+  assert.notEqual(row.seed, decisionSeed(routing.digest, run.id, run.revision, "task-spark", "start", 1));
+  assert.equal(row.taskKey, blind);
+}));
 
-test("a shadow start writes one recorded row with both picks", () => {
-  const f = fixture();
-  let store: EvidenceStore | undefined;
+test("with allowContributor the contributor is a candidate and the basis is sampled", () => withStore(store => {
+  const routing = pinRouting({ allowContributor: true }, "autonomous", mixedLineup);
+  assert.ok(routing);
+  const run = runOf(mixedLineup, routing, "run-sampled");
+  recorder(store).recordStart(startOf(run, taskOf("task-a", { agentProfileId: "spark-high" })));
+  const row = rowsOf(store, run.id, "task-a")[0]!;
+  assert.equal(row.basis, "sampled");
+  assert.ok(["spark-high", "astra-xhigh"].includes(row.chosenProfileId));
+  assert.equal(row.seed.length, 64);
+}));
+
+test("a second start reuses the row whatever the store holds now", () => withStore(store => {
+  const routing = pinRouting({ allowContributor: true }, "autonomous", mixedLineup);
+  assert.ok(routing);
+  const run = runOf(mixedLineup, routing);
+  const task = taskOf("task-a", { agentProfileId: "spark-high" });
+  const rec = recorder(store);
+  const original = store.read.bind(store) as EvidenceStore["read"];
+  // Statements that read evidence: the outcome rows and the profile epochs. The key read is not one of them.
+  let evidenceStatements = 0;
+  let reads = 0;
+  const counting = (fn: Parameters<EvidenceStore["read"]>[0]) => {
+    reads += 1;
+    return original(db => fn({
+      ...db,
+      get: (sql: string, ...params: never[]) => { if (/outcomes|profile_epochs/.test(sql)) evidenceStatements += 1; return db.get(sql, ...params); },
+      all: (sql: string, ...params: never[]) => { if (/outcomes|profile_epochs/.test(sql)) evidenceStatements += 1; return db.all(sql, ...params); },
+    } as typeof db));
+  };
+  (store as { read: EvidenceStore["read"] }).read = counting as EvidenceStore["read"];
   try {
-    store = open(f);
-    const routing = pinRouting(undefined, "autonomous", mixedLineup);
-    assert.ok(routing);
-    const run = runOf(mixedLineup, routing);
-    const recorder = plainRecorder(store);
-    recorder.recordStart(startOf(run, taskOf("task-spark", "spark-high")));
-    recorder.recordStart(startOf(run, taskOf("task-astra", "astra-xhigh")));
+    rec.recordStart(startOf(run, task));
+  } finally {
+    (store as { read: EvidenceStore["read"] }).read = original;
+  }
+  assert.ok(evidenceStatements > 0, "the first start reads the evidence");
+  const before = rowsOf(store, run.id, "task-a")[0]!;
 
-    const first = decisionsOf(store, run.id, "task-spark").rows;
-    const second = decisionsOf(store, run.id, "task-astra").rows;
-    assert.equal(first.length, 1);
-    assert.equal(second.length, 1);
-    for (const [row, coordinator] of [[first[0]!, "spark-high"], [second[0]!, "astra-xhigh"]] as const) {
-      assert.equal(row.coordinatorProfileId, coordinator);
-      // The contributor profile is removed by the fixed rules, so the coordinator's pick is the only candidate.
-      assert.equal(row.chosenProfileId, "astra-xhigh");
-      assert.equal(row.greedyProfileId, "astra-xhigh");
-      assert.equal(row.basis, "single-candidate");
-      assert.equal(row.mode, "shadow");
-      assert.equal(row.state, "recorded");
-      assert.equal(row.memberId, null);
-      assert.equal(row.policyDigest, routing.digest);
-      assert.equal(row.algorithmVersion, 1);
-      assert.equal(row.rewardVersion, 1);
-      assert.equal(row.point, "start");
-      assert.equal(row.ordinal, 1);
-      assert.equal(row.revision, 1);
+  // Thirty counted rows for the astra identity arrive between the two starts.
+  store.write(tx => {
+    for (let index = 0; index < 30; index++) {
+      writeOutcome(tx, integrated({ id: `late-${index}`, profile: mixedLineup.implementers[1]!, configId: "none", endedAt: NOW }));
     }
-    assert.equal(first[0]!.payload?.projectId, "rehearsal");
-    assert.equal(first[0]!.payload?.taskId, "task-spark");
-    // The key and the seed use the task's blind index, never its plain id.
-    const blind = store.read(db => db.index("task", "task-spark"));
-    assert.equal(first[0]!.key, decisionKey(run.id, run.revision, blind, "start", 1));
-    assert.equal(first[0]!.seed, decisionSeed(routing.digest, run.id, run.revision, blind, "start", 1));
-    assert.notEqual(first[0]!.key, decisionKey(run.id, run.revision, "task-spark", "start", 1));
-    assert.notEqual(first[0]!.seed, decisionSeed(routing.digest, run.id, run.revision, "task-spark", "start", 1));
-    assert.equal(first[0]!.taskKey, blind);
-  } finally {
-    store?.close();
-    f.close();
-  }
-});
+  });
 
-test("with allowContributor the contributor is a candidate and the basis is sampled", () => {
-  const f = fixture();
-  let store: EvidenceStore | undefined;
+  reads = 0;
+  evidenceStatements = 0;
+  (store as { read: EvidenceStore["read"] }).read = counting as EvidenceStore["read"];
   try {
-    store = open(f);
-    const routing = pinRouting({ allowContributor: true }, "autonomous", mixedLineup);
-    assert.ok(routing);
-    const run = runOf(mixedLineup, routing, "run-sampled");
-    plainRecorder(store).recordStart(startOf(run, taskOf("task-a", "spark-high")));
-    const row = decisionsOf(store, run.id, "task-a").rows[0]!;
-    assert.equal(row.basis, "sampled");
-    assert.ok(["spark-high", "astra-xhigh"].includes(row.chosenProfileId));
-    assert.equal(row.seed.length, 64);
+    rec.recordStart(startOf(run, task));
   } finally {
-    store?.close();
-    f.close();
+    (store as { read: EvidenceStore["read"] }).read = original;
   }
-});
+  // A reused row costs one read, the key read, and no evidence statement.
+  assert.equal(reads, 1);
+  assert.equal(evidenceStatements, 0);
+  assert.equal(countRows(store), 1);
+  assert.deepEqual(rowsOf(store, run.id, "task-a")[0], before);
+}));
 
-test("a second start reuses the row whatever the store holds now", () => {
-  const f = fixture();
-  let store: EvidenceStore | undefined;
-  try {
-    store = open(f);
-    const routing = pinRouting({ allowContributor: true }, "autonomous", mixedLineup);
-    assert.ok(routing);
-    const run = runOf(mixedLineup, routing);
-    const task = taskOf("task-a", "spark-high");
-    const recorder = plainRecorder(store);
-    const original = store.read.bind(store) as EvidenceStore["read"];
-    // Statements that read evidence: the outcome rows and the profile epochs. The key read is not one of them.
-    let evidenceStatements = 0;
-    let reads = 0;
-    const counting = (fn: Parameters<EvidenceStore["read"]>[0]) => {
-      reads += 1;
-      return original(db => fn({
-        ...db,
-        get: (sql: string, ...params: never[]) => { if (/outcomes|profile_epochs/.test(sql)) evidenceStatements += 1; return db.get(sql, ...params); },
-        all: (sql: string, ...params: never[]) => { if (/outcomes|profile_epochs/.test(sql)) evidenceStatements += 1; return db.all(sql, ...params); },
-      } as typeof db));
-    };
-    (store as { read: EvidenceStore["read"] }).read = counting as EvidenceStore["read"];
-    try {
-      recorder.recordStart(startOf(run, task));
-    } finally {
-      (store as { read: EvidenceStore["read"] }).read = original;
-    }
-    assert.ok(evidenceStatements > 0, "the first start reads the evidence");
-    const before = decisionsOf(store, run.id, "task-a").rows[0]!;
+test("the posterior counts the store's rows of each candidate, OpenCode included", () => withStore(store => {
+  const openCode: TeamModelProfile = { id: "oc-high", label: "OpenCode", provider: "opencode", model: "meta/muse-spark-1.3-contributor", variant: "high", tier: "light" };
+  const astra = mixedLineup.implementers[1]!;
+  const lineup: TeamLineup = { ...mixedLineup, implementers: [openCode, astra] };
+  const routing = pinRouting(undefined, "autonomous", lineup);
+  assert.ok(routing);
+  const run = runOf(lineup, routing, "run-counts");
+  store.write(tx => {
+    config(tx, "cfg-oc", openCode, versionOf(openCode));
+    config(tx, "cfg-astra", astra, versionOf(astra));
+    for (let index = 0; index < 3; index++) writeOutcome(tx, integrated({ id: `oc-${index}`, profile: openCode, configId: "cfg-oc", area: "other" }));
+    for (let index = 0; index < 2; index++) writeOutcome(tx, integrated({ id: `astra-${index}`, profile: astra, configId: "cfg-astra", area: "other" }));
+  });
+  recorder(store).recordStart(startOf(run, taskOf("task-a")));
+  const payload = rowsOf(store, run.id, "task-a")[0]!.payload as RoutingPayload;
+  const counted = (id: string) => payload.candidates.find(candidate => candidate.profileId === id)?.posterior?.rows.production;
+  assert.equal(counted("oc-high"), 3);
+  assert.equal(counted("astra-xhigh"), 2);
+}));
 
-    // Thirty counted rows for the astra identity arrive between the two starts.
-    store.write(tx => {
-      for (let index = 0; index < 30; index++) {
-        writeOutcome(tx, outcome({ id: `late-${index}`, provider: "codex", model: "gpt-6-astra", effort: "xhigh", area: "other", endedAt: NOW }));
-      }
-    });
-
-    reads = 0;
-    evidenceStatements = 0;
-    (store as { read: EvidenceStore["read"] }).read = counting as EvidenceStore["read"];
-    try {
-      recorder.recordStart(startOf(run, task));
-    } finally {
-      (store as { read: EvidenceStore["read"] }).read = original;
-    }
-    // A reused row costs one read, the key read, and no evidence statement.
-    assert.equal(reads, 1);
-    assert.equal(evidenceStatements, 0);
-    assert.equal(countRows(store), 1);
-    const after = decisionsOf(store, run.id, "task-a").rows[0]!;
-    assert.deepEqual(after, before);
-  } finally {
-    store?.close();
-    f.close();
-  }
-});
-
-test("the posterior counts the store's rows of each candidate, OpenCode included", () => {
-  const f = fixture();
-  let store: EvidenceStore | undefined;
-  try {
-    store = open(f);
-    const openCode: TeamModelProfile = { id: "oc-high", label: "OpenCode", provider: "opencode", model: "meta/muse-spark-1.3-contributor", variant: "high", tier: "light" };
-    const astra = mixedLineup.implementers[1]!;
-    const lineup: TeamLineup = { ...mixedLineup, implementers: [openCode, astra] };
-    const routing = pinRouting(undefined, "autonomous", lineup);
-    assert.ok(routing);
-    const run = runOf(lineup, routing, "run-counts");
-    const version = (profile: TeamModelProfile) => promptVersion("implementer", profile.provider, profile, false, false);
-    store.write(tx => {
-      tx.run("INSERT INTO configurations (config_id, provider, model, effort, prompt_version, guidance, knowledge, routing, shape, first_seen_at) "
-        + "VALUES ('cfg-oc', 'opencode', 'meta/muse-spark-1.3-contributor', 'high', ?, 'g', 'k', 'r', 's', ?)", version(openCode), NOW);
-      tx.run("INSERT INTO configurations (config_id, provider, model, effort, prompt_version, guidance, knowledge, routing, shape, first_seen_at) "
-        + "VALUES ('cfg-astra', 'codex', 'gpt-6-astra', 'xhigh', ?, 'g', 'k', 'r', 's', ?)", version(astra), NOW);
-      for (let index = 0; index < 3; index++) {
-        writeOutcome(tx, outcome({ id: `oc-${index}`, provider: "opencode", model: "meta/muse-spark-1.3-contributor", effort: "high", area: "other", configId: "cfg-oc" }));
-      }
-      for (let index = 0; index < 2; index++) {
-        writeOutcome(tx, outcome({ id: `astra-${index}`, provider: "codex", model: "gpt-6-astra", effort: "xhigh", area: "other", configId: "cfg-astra" }));
-      }
-    });
-    plainRecorder(store).recordStart(startOf(run, taskOf("task-a")));
-    const payload = decisionsOf(store, run.id, "task-a").rows[0]!.payload as RoutingPayload;
-    const counted = (id: string) => payload.candidates.find(candidate => candidate.profileId === id)?.posterior?.rows.production;
-    assert.equal(counted("oc-high"), 3);
-    assert.equal(counted("astra-xhigh"), 2);
-  } finally {
-    store?.close();
-    f.close();
-  }
-});
-
-test("without its modules the recorder writes nothing and never throws", () => {
-  const f = fixture();
+test("without its evidence store the recorder logs the reason once and writes nothing", () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-routing-broken-"));
   try {
     // The evidence directory is a file, so the store opens unavailable.
-    mkdirSync(join(f.root, "state"), { recursive: true });
-    writeFileSync(join(f.root, "state", "evidence"), "not a directory");
-    const broken = new EvidenceStore({ databasePath: f.path, vaultKey: f.key });
-    const routing = pinRouting(undefined, "autonomous", mixedLineup);
-    const run = runOf(mixedLineup, routing);
+    mkdirSync(join(root, "state"), { recursive: true });
+    writeFileSync(join(root, "state", "evidence"), "not a directory");
+    const broken = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: Buffer.alloc(32, 7) });
+    const run = runOf(mixedLineup, pinRouting(undefined, "autonomous", mixedLineup));
     const lines: string[] = [];
-    const recorder = plainRecorder(broken, lines);
-    assert.doesNotThrow(() => recorder.recordStart(startOf(run, taskOf("task-a"))));
-    assert.doesNotThrow(() => recorder.recordStart(startOf(run, taskOf("task-b"))));
-    assert.deepEqual(lines, ["Routing shadow decision skipped: the evidence store is unavailable."]);
+    const rec = recorder(broken, lines);
+    assert.doesNotThrow(() => rec.recordStart(startOf(run, taskOf("task-a", { agentProfileId: "astra-xhigh" }))));
+    assert.doesNotThrow(() => rec.recordStart(startOf(run, taskOf("task-b", { agentProfileId: "astra-xhigh" }))));
+    assert.deepEqual(lines, [UNAVAILABLE]);
     broken.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
-    // Stores with one or two of the modules.
-    const partial = fixture();
-    try {
-      for (const register of [
-        (store: EvidenceStore) => { store.register(configurationModule()); store.register(routingModule()); },
-        (store: EvidenceStore) => { store.register(outcomeModule({ now: () => NOW })); store.register(routingModule()); },
-        (store: EvidenceStore) => { store.register(configurationModule()); store.register(outcomeModule({ now: () => NOW })); },
-      ]) {
-        const store = new EvidenceStore({ databasePath: partial.path, vaultKey: partial.key });
-        register(store);
-        const log: string[] = [];
-        const partialRecorder = plainRecorder(store, log);
-        assert.doesNotThrow(() => partialRecorder.recordStart(startOf(run, taskOf("task-c"))));
-        assert.doesNotThrow(() => partialRecorder.recordStart(startOf(run, taskOf("task-d"))));
-        assert.equal(log.length, 1);
-        store.close();
-        rmSync(partial.path, { force: true });
+test("each module missing on its own logs the unavailable line and writes no row", () => {
+  const run = runOf(mixedLineup, pinRouting(undefined, "autonomous", mixedLineup));
+  const registrations: [string, (store: EvidenceStore) => void][] = [
+    ["outcomes", store => { store.register(configurationModule()); store.register(routingModule()); }],
+    ["configurations", store => { store.register(outcomeModule({ now: () => NOW })); store.register(routingModule()); }],
+    ["routing", store => { store.register(configurationModule()); store.register(outcomeModule({ now: () => NOW })); }],
+  ];
+  for (const [missing, register] of registrations) {
+    withStore(store => {
+      const lines: string[] = [];
+      const rec = recorder(store, lines);
+      rec.recordStart(startOf(run, taskOf("task-c", { agentProfileId: "astra-xhigh" })));
+      rec.recordStart(startOf(run, taskOf("task-d", { agentProfileId: "astra-xhigh" })));
+      assert.deepEqual(lines, [UNAVAILABLE], `${missing} missing`);
+      assert.equal(store.status().modules[missing], undefined, `${missing} is not registered`);
+      assert.equal(store.status().modules.routing === "ready" ? countRows(store) : 0, 0);
+    }, register);
+  }
+});
+
+test("a failed read is caught, logged once, and writes no row", () => withStore(store => {
+  const run = runOf(mixedLineup, pinRouting(undefined, "autonomous", mixedLineup));
+  const lines: string[] = [];
+  const rec = recorder(store, lines);
+  const original = store.read.bind(store) as EvidenceStore["read"];
+  (store as { read: EvidenceStore["read"] }).read = (() => { throw new Error("database is locked"); }) as EvidenceStore["read"];
+  try {
+    assert.doesNotThrow(() => rec.recordStart(startOf(run, taskOf("task-a"))));
+    assert.doesNotThrow(() => rec.recordStart(startOf(run, taskOf("task-b"))));
+  } finally {
+    (store as { read: EvidenceStore["read"] }).read = original;
+  }
+  assert.deepEqual(lines, [FAILED]);
+  assert.equal(countRows(store), 0);
+}));
+
+test("a payload over its limit logs its own line once and writes no row", () => withStore(store => {
+  const routing = pinRouting(undefined, "autonomous", mixedLineup)!;
+  // A pinned knob padded past the limit makes the payload's JSON too large. Legal inputs alone cannot reach it.
+  const padded = { ...routing, knobs: { ...routing.knobs, padding: "x".repeat(PAYLOAD_LIMIT_BYTES) } } as unknown as typeof routing;
+  const run = runOf(mixedLineup, padded, "run-large");
+  const lines: string[] = [];
+  const rec = recorder(store, lines);
+  rec.recordStart(startOf(run, taskOf("task-a")));
+  rec.recordStart(startOf(run, taskOf("task-b")));
+  assert.deepEqual(lines, [TOO_LARGE]);
+  assert.equal(countRows(store), 0);
+}));
+
+test("a decision over its budget writes no row", () => withStore(store => {
+  const routing = pinRouting(undefined, "autonomous", mixedLineup);
+  const run = runOf(mixedLineup, routing, "run-budget");
+  const lines: string[] = [];
+  const over = [0, 251];
+  const rec = recorder(store, lines, () => over.shift() ?? 0);
+  rec.recordStart(startOf(run, taskOf("task-a", { agentProfileId: "astra-xhigh" })));
+  assert.equal(countRows(store), 0);
+  assert.deepEqual(lines, ["Routing shadow decision skipped: it took longer than 250 ms."]);
+  over.push(0, 251);
+  rec.recordStart(startOf(run, taskOf("task-b", { agentProfileId: "astra-xhigh" })));
+  assert.equal(countRows(store), 0);
+  assert.equal(lines.length, 1, "the budget line is logged once per recorder");
+
+  const within = [0, 249];
+  recorder(store, [], () => within.shift() ?? 0).recordStart(startOf(run, taskOf("task-c", { agentProfileId: "astra-xhigh" })));
+  assert.equal(countRows(store), 1);
+  assert.equal(rowsOf(store, run.id, "task-c")[0]?.payload?.elapsedMs, 249);
+}));
+
+test("the budget allows exactly 250 ms, and a reused row logs nothing", () => withStore(store => {
+  const run = runOf(mixedLineup, pinRouting(undefined, "autonomous", mixedLineup), "run-edge");
+  const lines: string[] = [];
+  const ticks = [0, 250];
+  const rec = recorder(store, lines, () => ticks.shift() ?? 0);
+  rec.recordStart(startOf(run, taskOf("task-a")));
+  assert.equal(rowsOf(store, run.id, "task-a")[0]?.payload?.elapsedMs, 250);
+  rec.recordStart(startOf(run, taskOf("task-a")));
+  assert.equal(countRows(store), 1);
+  assert.deepEqual(lines, []);
+}));
+
+test("an uncovered start writes no row", () => withStore(store => {
+  const contributorOnly: TeamLineup = { ...mixedLineup, implementers: [mixedLineup.implementers[0]!] };
+  const run = runOf(contributorOnly, pinRouting(undefined, "autonomous", contributorOnly), "run-uncovered");
+  const lines: string[] = [];
+  recorder(store, lines).recordStart(startOf(run, taskOf("task-a")));
+  assert.equal(countRows(store), 0);
+  assert.deepEqual(lines, []);
+
+  // A run without a pinned policy reads nothing: the store is not even asked for a read.
+  let reads = 0;
+  const original = store.read.bind(store) as EvidenceStore["read"];
+  (store as { read: EvidenceStore["read"] }).read = fn => { reads += 1; return original(fn); };
+  try {
+    recorder(store, lines).recordStart(startOf(runOf(mixedLineup, undefined, "run-off"), taskOf("task-b")));
+  } finally {
+    (store as { read: EvidenceStore["read"] }).read = original;
+  }
+  assert.equal(reads, 0);
+  assert.equal(countRows(store), 0);
+  assert.deepEqual(lines, []);
+}));
+
+test("an advanced epoch makes that identity's rows earlier, OpenCode by its variant", () => withStore(store => {
+  const openCode: TeamModelProfile = { id: "oc-high", label: "OpenCode", provider: "opencode", model: "meta/muse-spark-1.3-contributor", variant: "high", tier: "light" };
+  const astra = mixedLineup.implementers[1]!;
+  const lineup: TeamLineup = { ...mixedLineup, implementers: [openCode, astra] };
+  store.write(tx => {
+    config(tx, "cfg-oc", openCode, versionOf(openCode));
+    config(tx, "cfg-astra", astra, versionOf(astra));
+    for (let index = 0; index < 3; index++) writeOutcome(tx, integrated({ id: `oc-${index}`, profile: openCode, configId: "cfg-oc" }));
+    for (let index = 0; index < 2; index++) writeOutcome(tx, integrated({ id: `astra-${index}`, profile: astra, configId: "cfg-astra" }));
+  });
+  advanceEpoch(store, { profile: { provider: "opencode", model: openCode.model, effort: "high" },
+    requestId: "6b0f4d0e-8a43-4d2c-9a37-3f1f0e3b9a11", now: ago(1) });
+  const run = runOf(lineup, pinRouting(undefined, "autonomous", lineup), "run-epoch");
+  recorder(store).recordStart(startOf(run, taskOf("task-a")));
+  const payload = rowsOf(store, run.id, "task-a")[0]!.payload!;
+  assert.deepEqual(payload.current.map(entry => [entry.identity, entry.epoch]), [[identityOf(openCode), 2], [identityOf(astra), 1]]);
+  const posteriorOf = (id: string) => payload.candidates.find(candidate => candidate.profileId === id)!.posterior!;
+  assert.deepEqual([posteriorOf("oc-high").rows.production, posteriorOf("oc-high").earlierRows], [0, 3]);
+  assert.deepEqual([posteriorOf("astra-xhigh").rows.production, posteriorOf("astra-xhigh").earlierRows], [2, 0]);
+}));
+
+test("publishHeads and entryTools choose the prompt version the row is counted against", () => withStore(store => {
+  const astra = mixedLineup.implementers[1]!;
+  store.write(tx => {
+    config(tx, "cfg-heads", astra, versionOf(astra, true, true));
+    for (let index = 0; index < 2; index++) writeOutcome(tx, integrated({ id: `heads-${index}`, profile: astra, configId: "cfg-heads" }));
+  });
+  const run = runOf(mixedLineup, pinRouting(undefined, "autonomous", mixedLineup), "run-heads");
+  recorder(store).recordStart(startOf(run, taskOf("task-a"), { publishHeads: true, entryTools: true }));
+  const payload = rowsOf(store, run.id, "task-a")[0]!.payload!;
+  assert.deepEqual(payload.current.map(entry => entry.promptVersion), [versionOf(astra, true, true)]);
+  assert.equal(payload.candidates.find(candidate => candidate.profileId === "astra-xhigh")!.posterior!.rows.production, 2);
+}));
+
+test("a limited provider changes the screening: with every eligible provider limited the default profile is chosen", () => withStore(store => {
+  const run = runOf(mixedLineup, pinRouting(undefined, "autonomous", mixedLineup), "run-limited");
+  const lines: string[] = [];
+  recorder(store, lines).recordStart(startOf(run, taskOf("task-a"), { limited: new Set(["codex"]) }));
+  const row = rowsOf(store, run.id, "task-a")[0];
+  assert.deepEqual([row?.basis, row?.chosenProfileId, row?.greedyProfileId, lines], ["default-all-limited", "astra-xhigh", "astra-xhigh", []]);
+}));
+
+test("the row and payload record the choice, the refs, the time, the current configurations, and tier costs", () => withStore(store => {
+  const routing = pinRouting({ allowContributor: true }, "autonomous", mixedLineup)!;
+  const run = runOf(mixedLineup, routing, "run-fields");
+  const rec = recorder(store);
+  const explored = new Set<boolean>();
+  for (let index = 0; index < 16; index++) {
+    rec.recordStart(startOf(run, taskOf(`task-${index}`, { agentProfileId: "spark-high" })));
+    const row = rowsOf(store, run.id, `task-${index}`)[0]!;
+    assert.equal(row.basis, "sampled");
+    assert.equal(row.explore, row.chosenProfileId !== row.greedyProfileId);
+    explored.add(row.explore);
+    const chosen = mixedLineup.implementers.find(profile => profile.id === row.chosenProfileId)!;
+    assert.equal(row.chosenIdentity, identityOf(chosen));
+    assert.equal(row.decidedAt, NOW);
+    const refs = store.read(db => [db.index("project", "rehearsal"), db.index("area", AREA), db.index("feature-map", "default")]);
+    assert.deepEqual([row.projectRef, row.areaRef, row.featureMapRef], refs);
+    const payload = row.payload!;
+    assert.equal(payload.coordinatorProfileId, "spark-high");
+    assert.deepEqual(payload.current, mixedLineup.implementers.map(profile => ({ identity: identityOf(profile), epoch: 1, promptVersion: versionOf(profile) })));
+    assert.deepEqual(payload.candidates.map(candidate => candidate.costUsd), mixedLineup.implementers.map(profile => TIER_COSTS[profile.tier ?? "light"]));
+  }
+  assert.deepEqual([...explored].sort(), [false, true], "some starts explore and some do not");
+}));
+
+test("the feature map and the task's risk reach the decision", () => withStore(store => {
+  const map: FeatureMap = { areas: [{ id: "host", paths: ["packages/host"] }] };
+  const run = runOf(mixedLineup, pinRouting({ allowContributor: true }, "autonomous", mixedLineup), "run-map");
+  recorder(store).recordStart(startOf(run, taskOf("task-a", { risk: "elevated" }), { featureMap: map }));
+  const row = rowsOf(store, run.id, "task-a")[0]!;
+  assert.deepEqual([row.payload?.area, row.payload?.featureMap, row.risk, row.basis], ["host", featureMapDigest(map), "elevated", "greedy-risk"]);
+  assert.equal(row.featureMapRef, store.read(db => db.index("feature-map", featureMapDigest(map))));
+}));
+
+test("a row ended 30 days ago counts at the half-life weight times the chosen weight", () => withStore(store => {
+  const astra = mixedLineup.implementers[1]!;
+  store.write(tx => {
+    config(tx, "cfg-astra", astra, versionOf(astra));
+    writeOutcome(tx, integrated({ id: "month", profile: astra, configId: "cfg-astra", endedAt: ago(30) }));
+  });
+  const run = runOf(mixedLineup, pinRouting(undefined, "autonomous", mixedLineup), "run-month");
+  recorder(store).recordStart(startOf(run, taskOf("task-a")));
+  const posterior = rowsOf(store, run.id, "task-a")[0]!.payload!.candidates.find(candidate => candidate.profileId === "astra-xhigh")!.posterior!;
+  assert.equal(posterior.rows.production, 1);
+  assert.equal(posterior.reward.find(record => record.level === "cell")!.observed.success, 0.25);
+}));
+
+test("two profiles of one identity share the first one's prompt version", () => withStore(store => {
+  const astra = mixedLineup.implementers[1]!;
+  const twin: TeamModelProfile = { ...astra, id: "astra-twin", label: "Astra twin" };
+  const lineup: TeamLineup = { ...mixedLineup, implementers: [astra, twin] };
+  const run = runOf(lineup, pinRouting(undefined, "autonomous", lineup), "run-twin");
+  recorder(store).recordStart(startOf(run, taskOf("task-a")));
+  const payload = rowsOf(store, run.id, "task-a")[0]!.payload!;
+  assert.notEqual(versionOf(astra), versionOf(twin));
+  assert.deepEqual(payload.current, [{ identity: identityOf(astra), epoch: 1, promptVersion: versionOf(astra) }]);
+}));
+
+test("a strong profile is costed at the strong tier default", () => withStore(store => {
+  const strong: TeamModelProfile = { ...mixedLineup.implementers[1]!, tier: "strong" };
+  const lineup: TeamLineup = { ...mixedLineup, implementers: [strong] };
+  const run = runOf(lineup, pinRouting(undefined, "autonomous", lineup), "run-strong");
+  recorder(store).recordStart(startOf(run, taskOf("task-a")));
+  const payload = rowsOf(store, run.id, "task-a")[0]!.payload!;
+  assert.deepEqual([payload.candidates[0]!.costUsd, payload.costs.strongUsd], [TIER_COSTS.strong, TIER_COSTS.strong]);
+}));
+
+test("eight candidates with integrated rows at all three levels stay within the payload limit", () => withStore(store => {
+  // The longest ids the schemas allow: profile id 40, label 100, model 120, project 80, task 40.
+  const pad = (text: string, length: number) => `${text}-${"x".repeat(length)}`.slice(0, length);
+  const projectId = pad("project", 80);
+  const taskId = pad("t", 40);
+  const implementers: TeamModelProfile[] = Array.from({ length: 8 }, (_, index) => ({
+    id: pad(`impl${index}`, 40), label: pad(`Implementer ${index}`, 100), provider: "codex", model: pad(`gpt-impl-${index}`, 120),
+    effort: "xhigh", tier: index % 2 ? "strong" : "light",
+  }));
+  const lineup: TeamLineup = { ...mixedLineup, implementers };
+  store.write(tx => {
+    for (const [index, profile] of implementers.entries()) {
+      config(tx, `cfg-${index}`, profile, versionOf(profile));
+      config(tx, `old-${index}`, profile, "an-earlier-version");
+      // Three levels: the task's cell, another area of the project, and another project.
+      const levels = [["cell", {}], ["project", { area: "elsewhere/" }], ["tenant", { projectId: "other" }]] as const;
+      for (const [level, where] of levels) {
+        for (let k = 0; k < 7; k++) {
+          writeOutcome(tx, integrated({ id: `${index}-${level}-${k}`, profile, configId: `cfg-${index}`,
+            endedAt: ago(1.37 * (k + 1) + index * 3.1), projectId, ...where }));
+        }
       }
-    } finally {
-      partial.close();
     }
-  } finally {
-    f.close();
-  }
-});
-
-test("a decision over its budget writes no row", () => {
-  const f = fixture();
-  let store: EvidenceStore | undefined;
-  try {
-    store = open(f);
-    const routing = pinRouting(undefined, "autonomous", mixedLineup);
-    const run = runOf(mixedLineup, routing, "run-budget");
-    const lines: string[] = [];
-    const over = [0, 251];
-    const recorder = plainRecorder(store, lines, () => over.shift() ?? 0);
-    recorder.recordStart(startOf(run, taskOf("task-a", "astra-xhigh")));
-    assert.equal(countRows(store), 0);
-    assert.deepEqual(lines, ["Routing shadow decision skipped: it took longer than 250 ms."]);
-    over.push(0, 251);
-    recorder.recordStart(startOf(run, taskOf("task-b", "astra-xhigh")));
-    assert.equal(countRows(store), 0);
-    assert.equal(lines.length, 1, "the budget line is logged once per recorder");
-
-    const within = [0, 249];
-    plainRecorder(store, [], () => within.shift() ?? 0).recordStart(startOf(run, taskOf("task-c", "astra-xhigh")));
-    assert.equal(countRows(store), 1);
-    const row = decisionsOf(store, run.id, "task-c").rows[0]!;
-    assert.equal(row.payload?.elapsedMs, 249);
-  } finally {
-    store?.close();
-    f.close();
-  }
-});
-
-test("an uncovered start writes no row", () => {
-  const f = fixture();
-  let store: EvidenceStore | undefined;
-  try {
-    store = open(f);
-    const contributorOnly: TeamLineup = { ...mixedLineup, implementers: [mixedLineup.implementers[0]!] };
-    const run = runOf(contributorOnly, pinRouting(undefined, "autonomous", contributorOnly), "run-uncovered");
-    const lines: string[] = [];
-    plainRecorder(store, lines).recordStart(startOf(run, taskOf("task-a")));
-    assert.equal(countRows(store), 0);
-    assert.deepEqual(lines, []);
-
-    // A run without a pinned policy reads nothing: the store is not even asked for a read.
-    let reads = 0;
-    const original = store.read.bind(store) as EvidenceStore["read"];
-    (store as { read: EvidenceStore["read"] }).read = fn => { reads += 1; return original(fn); };
-    try {
-      plainRecorder(store, lines).recordStart(startOf(runOf(mixedLineup, undefined, "run-off"), taskOf("task-b")));
-    } finally {
-      (store as { read: EvidenceStore["read"] }).read = original;
-    }
-    assert.equal(reads, 0);
-    assert.equal(countRows(store), 0);
-    assert.deepEqual(lines, []);
-  } finally {
-    store?.close();
-    f.close();
-  }
-});
-
-test("the payload stays within its limit with eight candidates", () => {
-  const f = fixture();
-  let store: EvidenceStore | undefined;
-  try {
-    store = open(f);
-    const implementers: TeamModelProfile[] = Array.from({ length: 8 }, (_, index) => ({
-      id: `impl-${index + 1}`, label: `Implementer ${index + 1}`, provider: "codex", model: `gpt-impl-${index + 1}`, effort: "high", tier: "light",
-    }));
-    const lineup: TeamLineup = { ...mixedLineup, implementers };
-    const routing = pinRouting(undefined, "autonomous", lineup);
-    const run = runOf(lineup, routing, "run-eight");
-    const task = taskOf("task-a");
-    const area = taskFeatures({ role: "implementer", paths: PATHS }).area;
-    store.write(tx => {
-      for (const [index, profile] of implementers.entries()) {
-        const model = profile.provider === "codex" ? profile.model : "";
-        writeOutcome(tx, outcome({ id: `cell-${index}`, provider: "codex", model, effort: "high", area }));
-        writeOutcome(tx, outcome({ id: `project-${index}`, provider: "codex", model, effort: "high", area: "elsewhere" }));
-        writeOutcome(tx, outcome({ id: `tenant-${index}`, provider: "codex", model, effort: "high", area, projectId: "other" }));
-      }
-    });
-    plainRecorder(store).recordStart(startOf(run, task));
-    assert.equal(countRows(store), 1);
-    const row = decisionsOf(store, run.id, "task-a").rows[0]!;
-    assert.ok(row.payload);
-    assert.equal(row.payload.candidates.filter(candidate => candidate.posterior !== undefined).length, 8);
-    assert.ok(JSON.stringify(row.payload).length < 16 * 1024, `payload is ${JSON.stringify(row.payload).length} bytes`);
-  } finally {
-    store?.close();
-    f.close();
-  }
-});
+  });
+  const run = runOf(lineup, pinRouting(undefined, "autonomous", lineup), "run-eight", projectId);
+  const lines: string[] = [];
+  recorder(store, lines).recordStart(startOf(run, taskOf(taskId)));
+  const row = rowsOf(store, run.id, taskId)[0];
+  assert.deepEqual(lines, []);
+  assert.ok(row?.payload, "one row");
+  assert.ok(row.payload.candidates.every(candidate => candidate.posterior!.rows.production > 0 && candidate.posterior!.level === "cell"));
+  const bytes = Buffer.byteLength(JSON.stringify(row.payload), "utf8");
+  assert.ok(bytes <= PAYLOAD_LIMIT_BYTES, `payload is ${bytes} bytes`);
+}));

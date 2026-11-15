@@ -23,7 +23,7 @@ export type ProfilePosterior = { reward: LevelRecord[]; rescue: LevelRecord[]; t
 export type CandidateRecord = { profileId: string; identity: string; tier: "light" | "strong" | null; removed?: RuleRemoval;
   posterior?: ProfilePosterior; costUsd?: number; thetaMean?: number; thetaSd?: number; phiMean?: number;
   greedyUtility?: number; sample?: number; sampledUtility?: number; samplerFallback?: true };
-/** Sealed in `routing_decisions.encrypted_payload`. At most 16 KiB of JSON. */
+/** Sealed in `routing_decisions.encrypted_payload`. At most 32 KiB of JSON. */
 export type RoutingPayload = { projectId: string; taskId: string; area: string; featureMap: string; coordinatorProfileId: string | null;
   knobs: RoutingKnobs; costs: { lightUsd: number; strongUsd: number; rescueUsd: number; basis: "tier-default" };
   headroom: "not-modelled"; chosenWeight: number; current: { identity: string; epoch: number; promptVersion: string }[];

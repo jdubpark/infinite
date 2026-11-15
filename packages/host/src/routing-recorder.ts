@@ -31,6 +31,7 @@ const LOG = {
   unavailable: "Routing shadow decision skipped: the evidence store is unavailable.",
   budget: `Routing shadow decision skipped: it took longer than ${DECISION_BUDGET_MS} ms.`,
   failed: "Routing shadow decision failed.",
+  tooLarge: "Routing shadow decision skipped: its details are over the size limit.",
 } as const;
 
 type Reason = keyof typeof LOG;
@@ -180,7 +181,10 @@ export class RoutingRecorder {
     }
     const { row, payload } = decided;
     payload.elapsedMs = Math.round(elapsed);
-    if (Buffer.byteLength(JSON.stringify(payload), "utf8") > PAYLOAD_LIMIT_BYTES) throw new RangeError("A routing decision payload is over its limit.");
+    if (Buffer.byteLength(JSON.stringify(payload), "utf8") > PAYLOAD_LIMIT_BYTES) {
+      this.once("tooLarge");
+      return;
+    }
     this.store.tryWrite(tx => {
       insertDecision(tx, row, payload);
     });

@@ -4,7 +4,7 @@ import type { EvidenceDb, EvidenceModule, EvidenceTx } from "./evidence/types.js
 import type { DecisionRow, RoutingPayload, RoutingPoint } from "./routing-types.js";
 
 export const ROUTING_MODULE = "routing";
-export const ROUTING_RETENTION_DAYS = 180, TASK_DECISION_LIMIT = 20, PROJECT_DECISION_LIMIT = 500, PAYLOAD_LIMIT_BYTES = 16 * 1024;
+export const ROUTING_RETENTION_DAYS = 180, TASK_DECISION_LIMIT = 20, PROJECT_DECISION_LIMIT = 500, PAYLOAD_LIMIT_BYTES = 32 * 1024;
 const SHADOW_PROGRESS_LIMIT = 50, SWEEP_LIMIT = 100, DAY_MILLISECONDS = 86_400_000;
 const TABLE = "routing_decisions";
 

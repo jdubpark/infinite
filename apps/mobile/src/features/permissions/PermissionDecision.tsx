@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ActivityIndicator, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
 import * as Crypto from "expo-crypto";
@@ -6,6 +6,7 @@ import { ApiError, api, connectionKey, type Connection } from "../../api/client"
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
 import { LiveStatus, TopBar } from "../../components/Glass";
+import { useKeyboardPadding } from "../../components/keyboard";
 import { theme } from "../../theme";
 import { Section, t } from "../teams/parts";
 import { deliveryLabels, isSessionId, rejectStates, seconds, verdictColors, verdictWords, when, type DecisionEntry, type Mark } from "./model";
@@ -16,6 +17,9 @@ const pendingMarks = new Map<string, { requestId: string; note: string }>();
 /** One recorded decision: the request, the verdict and its reviewers, delivery, the reviewer note and the owner's marks. */
 export function PermissionDecision({ connection, id }: { connection: Connection; id: string }) {
   const router = useRouter(), machine = connectionKey(connection);
+  // The mark form sits at the end of the page: the keyboard's height is added below it, and the page follows the field.
+  const keyboardPadding = useKeyboardPadding(), page = useRef<ScrollView>(null);
+  useEffect(() => { if (keyboardPadding) page.current?.scrollToEnd({ animated: true }); }, [keyboardPadding]);
   const decision = usePoll(() => api<{ entry: DecisionEntry }>(connection, `/permissions/decisions/${encodeURIComponent(id)}`).then(value => value.entry), 15000, [connection, id]);
   const top = <TopBar backLabel="Decisions" onBack={() => { if (router.canGoBack()) router.back(); else router.replace({ pathname: "/permissions", params: { machine } }); }}
     right={<LiveStatus online={decision.online} loading={decision.loading} seen={decision.seen} stale={decision.stale} />} />;
@@ -29,7 +33,7 @@ export function PermissionDecision({ connection, id }: { connection: Connection;
   return <View style={s.fill}>
     {top}
     {decision.stale ? <Text style={t.banner}>Offline · last received record.</Text> : null}
-    <ScrollView style={s.fill} contentContainerStyle={s.body} keyboardShouldPersistTaps="handled"
+    <ScrollView ref={page} style={s.fill} contentContainerStyle={[s.body, { paddingBottom: s.body.paddingBottom + keyboardPadding }]} keyboardShouldPersistTaps="handled"
       refreshControl={<RefreshControl refreshing={decision.refreshing} onRefresh={decision.refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <Text style={s.eyebrow}>{project === workspace ? workspace : `${workspace} · ${project}`}</Text>
       <Text style={s.action} accessibilityRole="header">{entry.action.summary || entry.action.tool}</Text>

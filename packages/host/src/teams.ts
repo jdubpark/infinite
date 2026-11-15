@@ -152,6 +152,12 @@ type Stored = {
    * reason stays. For a mission's subteam the id is the token of the mission's halt, and only the mission resumes it.
    */
   ownerHalt?: { haltId?: string; reason: string };
+  /**
+   * Coordinator answers that were in flight when their authority ended, or when the host restarted, and whose
+   * fence the session's worker has not confirmed. The run is not switched to the permission agent while one
+   * remains: each is fenced again until the worker confirms it or its session has exited.
+   */
+  unfencedAnswers?: string[];
   deliveryAttempt?: { memberId: string; revision: number; headCommit: string };
   continuationHead?: { revision: number; headCommit: string };
   checkHead?: string;
@@ -646,6 +652,7 @@ export class TeamService {
       }
       for (const decision of stored.run.permissionDecisions ?? []) if (decision.status === "answering") {
         decision.status = "uncertain";
+        stored.unfencedAnswers = [...new Set([...(stored.unfencedAnswers ?? []), decision.id])];
         decision.reason = "The host restarted while an answer was in flight. Inspect the target session before taking any further action.";
         this.finishLinkedPermissionRecovery(stored, decision, decision.reason, "restore-after-restart", "answer-state-uncertain",
           "The target session must be inspected before any further action.");
@@ -1828,7 +1835,8 @@ export class TeamService {
       return this.view(stored);
     });
   }
-  private async invalidatePermissionDecisions(stored: Stored, reason: string, fenceAgent = true) {
+  /** Retires the run's live coordinator decisions and fences answers in flight. False when a fence was not confirmed. */
+  private async invalidatePermissionDecisions(stored: Stored, reason: string, fenceAgent = true): Promise<boolean> {
     if (fenceAgent && !await this.fenceAgentDeliveries(stored.run.id))
       this.event(stored, "An in-flight permission agent answer could not be conclusively fenced. Inspect the member session before acting.");
     const inFlight: TeamPermissionDecision[] = [];
@@ -1842,13 +1850,41 @@ export class TeamService {
     if (inFlight.length) this.save(stored);
     let uncertain = false;
     for (const decision of inFlight) {
-      try {
-        const fence = await this.manager.invalidateTeamPermission(decision.targetSessionId, decision.id);
-        if (fence !== "invalidated") uncertain = true;
-      } catch { uncertain = true; }
+      let fence: "invalidated" | "uncertain" = "uncertain";
+      try { fence = await this.manager.invalidateTeamPermission(decision.targetSessionId, decision.id); } catch { /* uncertain */ }
+      if (fence !== "invalidated") {
+        uncertain = true;
+        stored.unfencedAnswers = [...new Set([...(stored.unfencedAnswers ?? []), decision.id])];
+      }
     }
     if (uncertain) this.event(stored, "An in-flight delegated permission answer could not be conclusively fenced. Its decision remains uncertain; inspect the target session.");
     this.save(stored);
+    return !uncertain;
+  }
+  /**
+   * Fences again each coordinator answer whose fence was not confirmed. One is settled when the worker confirms
+   * the fence or the session has exited; a worker that cannot be reached keeps it open. True when none is left.
+   */
+  private async refenceCoordinatorAnswers(stored: Stored): Promise<boolean> {
+    const open = stored.unfencedAnswers ?? [];
+    if (open.length === 0) return true;
+    const left: string[] = [];
+    for (const decisionId of open) {
+      const decision = stored.run.permissionDecisions?.find(item => item.id === decisionId);
+      if (!decision) continue;
+      let settled = false;
+      try { settled = (await this.manager.state(decision.targetSessionId)).status === "exited"; } catch { settled = false; }
+      if (!settled) {
+        try { settled = await this.manager.invalidateTeamPermission(decision.targetSessionId, decision.id) === "invalidated"; }
+        catch { settled = false; }
+      }
+      if (!settled) left.push(decisionId);
+    }
+    if (left.length !== open.length) {
+      if (left.length) stored.unfencedAnswers = left; else delete stored.unfencedAnswers;
+      this.save(stored);
+    }
+    return left.length === 0;
   }
   pause(id: string, input: Action) { return this.action(id, "pause", teamActionSchema.parse(input)); }
   resume(id: string, input: Action) { return this.action(id, "resume", teamActionSchema.parse(input)); }
@@ -3467,7 +3503,9 @@ export class TeamService {
       this.event(stored, coordinatorRetiredEvent);
       await this.invalidatePermissionDecisions(stored, coordinatorRetiredReason, false);
     }
-    // Every coordinator answer of the run is retired and fenced at its worker now, so the agent may start.
+    // The agent starts only once every coordinator answer of the run is retired and its fence confirmed, or its
+    // session has exited. Until then the run's dialogs stay with the owner, and the next pass fences again.
+    if (!await this.refenceCoordinatorAnswers(stored)) return;
     if (this.agentEligible(stored)) this.agentSwitched.add(stored.run.id);
   }
   /**

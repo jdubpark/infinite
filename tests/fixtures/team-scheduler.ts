@@ -110,6 +110,11 @@ export function schedulerFixture() {
       assert.ok(currentJournal, "The report session was not launched by this fixture");
       return currentJournal.append("team-report", envelope);
     },
+    post: (session: string, type: "team-entry" | "team-entry-read", data: object) => {
+      const currentJournal = journals.get(session);
+      assert.ok(currentJournal, "The post session was not launched by this fixture");
+      return currentJournal.append(type, data);
+    },
     blockRecordWrites: (kind: "team" | "goal", recordId: string) => {
       const file = join(config.stateDir, `${kind}s`, `${recordId}.sealed`), backup = `${file}.saved`;
       renameSync(file, backup); mkdirSync(file);

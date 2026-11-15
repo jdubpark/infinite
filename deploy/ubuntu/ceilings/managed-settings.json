@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "disableBypassPermissionsMode": "disable",
+    "disableAutoMode": "disable",
+    "deny": [
+      "Read(//etc/infinite-github/**)",
+      "Read(//srv/infinite-data/github-app/**)",
+      "Read(//srv/infinite-data/github-app-tokens/**)",
+      "Read(//run/infinite-key/**)"
+    ]
+  }
+}

@@ -5,6 +5,7 @@ import type { Config } from "./types.js";
 import type { TeamCommand } from "./team-types.js";
 import { syncFailure, type SyncFailureCategory } from "./project-sync.js";
 import { TeamError, teamCommand, teamGitArgs } from "./team-workspace.js";
+import { hostGithubGrantEnvironment } from "./github-grants.js";
 
 const FETCH_TIMEOUT_MS = 120_000;
 /** Longest wait between timer retries of a failing fetch; the wait doubles from the refresh interval per consecutive failure. */
@@ -168,8 +169,8 @@ export class ProjectSourceService {
     this.writeStatus(projectId, next);
     return next;
   }
-  private async command(cwd: string, args: string[], signal?: AbortSignal, timeoutMs = COMMAND_TIMEOUT_MS) {
-    return teamCommand({ command: "git", args: teamGitArgs(cwd, args) }, cwd, signal, timeoutMs, this.options.prefix);
+  private async command(cwd: string, args: string[], signal?: AbortSignal, timeoutMs = COMMAND_TIMEOUT_MS, env?: Record<string, string>) {
+    return teamCommand({ command: "git", args: teamGitArgs(cwd, args) }, cwd, signal, timeoutMs, this.options.prefix, undefined, env);
   }
   private async git(cwd: string, args: string[], signal?: AbortSignal, timeoutMs = COMMAND_TIMEOUT_MS) {
     const result = await this.command(cwd, args, signal, timeoutMs);
@@ -287,7 +288,9 @@ export class ProjectSourceService {
           status = this.noteMirrorHead(projectId, status, source, heldHead, false);
         }
       }
-      const fetched = await this.command(mirror, ["fetch", "--no-tags", remote, `+refs/heads/${source.baseBranch}:refs/heads/${source.baseBranch}`], options?.signal, FETCH_TIMEOUT_MS);
+      // With the GitHub proxy configured, this fetch carries a host grant for exactly this repository and operation.
+      const grant = hostGithubGrantEnvironment(this.config, { sid: `source:${projectId}`, project: projectId, repo: source.repository, ops: ["fetch"] });
+      const fetched = await this.command(mirror, ["fetch", "--no-tags", remote, `+refs/heads/${source.baseBranch}:refs/heads/${source.baseBranch}`], options?.signal, FETCH_TIMEOUT_MS, grant);
       if (options?.signal?.aborted) throw options.signal.reason ?? new DOMException("The operation was aborted", "AbortError");
       if (!this.sourceMatches(projectId, source)) return this.status(projectId);
       if (!commandSucceeded(fetched)) {

@@ -26,7 +26,7 @@ possible provider tool effect.
 Each member report is bound to its run, member, and revision and is acknowledged
 after durable recording. Separate Git copies isolate edits without sandboxing
 providers. Git, setup, and check commands must run under the intended agent
-identity. Workspace files remain plaintext runtime data. Provider permissions
+identity. Git commands that the host runs in team copies ignore replace refs (`GIT_NO_REPLACE_OBJECTS=1`), so a ref that a member plants in a team copy cannot change what a read returns. Workspace files remain plaintext runtime data. Provider permissions
 remain with the owner unless an explicit repository policy delegates bounded
 one-shot requests to the strong coordinator. Guarded delivery checks the current
 assignment, workspace, prompt, policy, expiry and human input control. Workspace
@@ -110,6 +110,8 @@ totals, and limit observations reach clients.
 The evidence database follows the at-rest rule of contract C1 in the self-improving teams design. Its file is private (`0600`) in a private directory (`0700`). The host narrows a wider file mode on open, after the key check passes. Each payload is sealed with AES-256-GCM under a key that HKDF-SHA-256 derives from the vault key. The seal binds a payload to its table and row ID, so a payload copied into another row does not open.
 
 A plain column holds only an opaque ID, an enumeration, a number, or a time. A task ID, a path, and any text from a repository or a run are encrypted. When such a value must be matched, the row stores a blind index: a keyed HMAC-SHA-256 that keeps value classes apart. Event keys are stored the same way. The host refuses an existing file that fails the encrypted key check, an empty file included, and it never falls back to plaintext. Status reasons and log lines never name a path.
+
+Eval capture ([teams](teams.md#eval-capture)) keeps its material only in the evidence store. The capsule, both patches, and the file names are sealed there. They never reach a mirror ref, a tracked file, a log line, an error, or a member's context. Plain columns hold only IDs, states, reason codes, counts, and times, and a project is matched by a blind index. A cancelled run's deletion deletes its eval material with it. The `eval` block of a project's team configuration reaches no member, and the routine approval digest leaves it out.
 
 ## Remote machine transport
 
@@ -195,6 +197,8 @@ lease grants permission to bypass provider approval. The existing Infinite cmux
 discovery adapter continues to verify its target surface and foreground process;
 it is a different attachment path from direct native cmux.
 
+Provider ceilings are root-owned Claude Code and Codex policy files that the agent account cannot change. They are installed by the owner on a server, not by the host. See [provider ceilings](../deploy/ubuntu/ceilings.md) for the keys, what each one does not stop, and how `infinite doctor` checks them.
+
 ## Required on a real host
 
 Use Tailscale with device approval, restrictive ACLs, and SSH policy. Expose the API through **Serve**, never Funnel. Serve is private to the tailnet; it is a transport layer, not file encryption or runtime isolation. Check with a device outside the tailnet that the host is inaccessible. [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve).
@@ -215,6 +219,22 @@ installation tokens. The Git/GitHub client refuses expired or mismatched tokens
 for configured repositories. Existing credentials for other repositories remain
 separate. Agents sharing a Unix identity can read that identity's token files;
 this does not add filesystem isolation or change provider approval controls.
+
+The optional [GitHub credential proxy](../deploy/ubuntu/github-proxy.md)
+(`autonomy.boundary.github`) moves the token cache to its own account. The host
+signs a grant for each session and host Git operation: one project and one
+repository; the operations fetch, push, pr, or merge; and the branches a push may
+update. A session outside a team gets the owner's scope only when an owner-only
+route started it; any other caller gets fetch only. Team members other than
+delivery can only fetch, delivery can push and open or merge pull requests only
+for its own head branch, and coordinators get no grant. The grant key must be a
+root-owned file below root-owned directories, and the proxy reports the cache as
+closed to agents only after ruling out ACLs. The
+proxy refuses tags, deletions, other refs, and `gh` commands outside a
+pull-request allowlist. A push grant can still push any content to its own
+branches, so base-branch protection stays necessary. Sessions share the agent
+account and can read each other's grants from the process environment; a grant
+bounds what the agent account can do, not which session does it.
 
 Workspace sync runs only on single-tenant hosts. Owner CLI launches without `--project` start or reuse it for the selected home-relative checkout; an explicit `infinite sync` can also start it. Folder registration accepts only an owner bearer key, persists in sealed host state, and refuses symlink aliases, overlapping projects, and protected host paths. It uploads the entire Git root of the selected checkout, including ignored and untracked files and its `.git` directory. For a linked Git worktree it also uploads Git metadata from outside the root: the common repository's objects, refs, ref logs, packed refs, `info/`, `shallow`, `description`, and a projected config, and the worktree's own `HEAD`, `index`, ref logs, refs, in-progress merge, rebase, cherry-pick, revert, and bisect state, and a projected `config.worktree`. A Git config can carry credentials such as a token in a remote URL. Keep credentials out of synced checkouts or accept that they reach the host. A forced apply replaces the cloud tree; one previous copy is kept beside the project directory. Received chunks are plaintext files under the host's private state directory, so that directory belongs on the encrypted storage above. See [workspace sync](workspace-sync.md).
 
@@ -492,3 +512,32 @@ the repository policy does not opt existing runs in. Coordinator prompts never
 qualify for recursive approval; workspace trust, persistent allow rules and
 unsupported native requests require owner handling. This does not isolate
 processes sharing a Unix account or grant permission beyond the accepted task.
+
+## Agent egress boundary
+
+The optional egress proxy narrows where agent sessions on the Ubuntu host can
+connect. It is off unless `autonomy.boundary.egress` is configured; without it,
+session environments are unchanged. When configured, each new session receives
+`HTTPS_PROXY` and `HTTP_PROXY` pointing at a loopback proxy, with a credential
+that names the session's project and expires. The host reads the shared key;
+no session receives it. When the key cannot be read, sessions and host commands
+still get the proxy address, without a credential, so their requests are
+refused rather than sent direct. The proxy refuses cloud metadata, loopback, private,
+shared, link-local, multicast, documentation, and other non-public addresses in
+both modes, after resolving the name once and connecting to the checked
+address. It records one line per connection with project, host, port, address,
+decision, and byte counts, never paths, headers, or credentials. In enforce mode
+it also refuses hosts that the owner's policy does not list. An nftables rule
+for the agent account logs, or in enforce mode refuses, connections that skip
+the proxy, and refuses link-local destinations in both modes. The owner reads
+the per-project summary with `infinite egress` (owner role only).
+
+This is attribution and destination control for one shared agent account, not
+isolation. The credential lives in the session environment, which every process
+of that account can read, so the recorded project says which credential was
+used rather than which project acted. The proxy never inspects TLS content: an
+allowed host such as a code host or package registry can still carry data out,
+as can DNS through the local resolver, and services on loopback remain
+reachable. Tools that ignore proxy variables go direct, which observe mode only
+logs. Installation, rollout, rollback, and the full list of limits are in the
+[egress runbook](../deploy/ubuntu/egress.md).

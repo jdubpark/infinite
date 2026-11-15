@@ -1,0 +1,54 @@
+[Unit]
+Description=Infinite agent egress proxy (loopback only; see deploy/ubuntu/egress.md)
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=infinite-egress
+Group=infinite-egress
+WorkingDirectory=/opt/infinite-egress
+Environment=NODE_ENV=production
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Name lookups run on libuv's thread pool; a few slow names must not stall every other lookup.
+Environment=UV_THREADPOOL_SIZE=16
+ExecStart=/usr/local/bin/node /opt/infinite-egress/egress-proxy.mjs --config /etc/infinite-egress/proxy.json
+# Re-reads the policy. A policy that fails to load leaves the last good one in force.
+ExecReload=/bin/kill -HUP $MAINPID
+# Sessions that use the proxy have no network while it is down, so it always comes back.
+Restart=always
+RestartSec=2
+# Holds summary.json (0640), which the host account reads through the infinite-egress group.
+StateDirectory=infinite-egress
+StateDirectoryMode=0750
+UMask=0027
+LimitCORE=0
+LimitNOFILE=16384
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Under the proxy's own address checks, the kernel also drops link-local (which holds the
+# cloud metadata address) and multicast for this service.
+IPAddressDeny=link-local multicast
+# It reads its config, policy, and key, listens on loopback, and connects out by checked
+# address. It holds no device keys or session tokens and never terminates TLS.
+
+[Install]
+WantedBy=multi-user.target

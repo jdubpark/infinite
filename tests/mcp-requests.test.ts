@@ -78,6 +78,27 @@ test("parallel starts and restart reconcile one sealed request, Linear issue and
   } finally { await ctx.close(); }
 });
 
+test("connector tracker baselines ignore redaction and survive records saved by older hosts", async () => {
+  const ctx = await setup();
+  try {
+    const input = request(`Inspect ${ctx.h.config.projects[0].path}/private.txt`);
+    const started = ctx.api.startRequest("bot", input);
+    await ctx.intake.poll();
+    const record = ctx.store.forMission(started.runId)!;
+    const issue = ctx.linearServer.allIssues()[0];
+    assert.notEqual(issue.title, record.title, "Only the tracker title is redacted");
+    assert.equal(record.editNotedAt, undefined, "Filing is not a tracker edit");
+    ctx.store.update(record.issueId, next => { delete next.tracked; });
+    ctx.restart();
+    await ctx.intake.poll();
+    assert.equal(ctx.store.get(record.issueId)!.editNotedAt, undefined, "Older records adopt the tracker baseline");
+    ctx.linearServer.edit(record.issueId, { title: "Changed after filing" });
+    await ctx.intake.poll();
+    assert.ok(ctx.store.get(record.issueId)!.editNotedAt, "A later tracker edit is noted");
+    assert.equal(ctx.h.missions.get(started.runId).objective, input.objective, "Tracker edits never replace sealed instructions");
+  } finally { await ctx.close(); }
+});
+
 test("project discovery and queued mutation are scoped without leaking private records", async () => {
   const ctx = await setup();
   try {
@@ -182,6 +203,7 @@ test("started replies and controls preserve revision guards and replay receipts 
 
 test("question IDs and safe views come from the owned mission and result remains an agent report", { timeout: 20000 }, async () => {
   const ctx = await setup();
+  ctx.h.config.linear!.reportName = "Northwind";
   try {
     const started = ctx.api.startRequest("bot", request());
     await ctx.intake.poll();
@@ -208,5 +230,6 @@ test("question IDs and safe views come from the owned mission and result remains
     await ctx.intake.poll();
     const comments = ctx.linearServer.comments(ctx.store.list()[0].issueId);
     assert.ok(comments.every(comment => !comment.body.includes("private.txt")), "tracking receipts must not copy connector context or reports");
+    assert.ok(comments.some(comment => comment.body === "Northwind agent report: ready for review. Read the report through the connector."), "Connector receipts use the configured report name");
   } finally { await ctx.close(); }
 });

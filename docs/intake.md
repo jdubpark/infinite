@@ -300,7 +300,9 @@ order as the mission moves:
   this line and the reply to a finished request say
   `Mention me in this thread to file a follow-up.` instead;
 - an edit note when the Linear issue changes after the run started. The run keeps
-  the original text.
+  the original text. For a request the host files itself, an edit is detected
+  against the text the tracker returned at filing, because the tracker may
+  reformat links.
 
 Text leaves the host only after a filter. A `file://` URL, and a path that starts
 with a configured directory (`stateDir`, `runDir`, `teams.workspaceDir`, or a
@@ -368,7 +370,9 @@ Delivery never gates a mission. An outage of Slack or Linear pauses nothing.
 
 ## Linear comments
 
-Intake writes two comments on the Linear issue, both labelled as agent reports:
+Intake writes two comments on the Linear issue, both labelled as agent reports.
+They begin with `Infinite` by default; set `linear.reportName` (1 to 40 characters: an ASCII letter first, then
+ASCII letters, digits, spaces, or hyphens) to use another name:
 
 1. When the mission starts: `Infinite agent report: a mission started on this issue. Questions and the result will follow.`
 2. When the mission ends: `Infinite agent report: ready for review.` with the

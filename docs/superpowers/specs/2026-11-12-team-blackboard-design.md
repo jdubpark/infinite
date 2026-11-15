@@ -136,6 +136,8 @@ An entry is addressed by task, paths, or mission subtask. It is never addressed 
 | `check` | command, status, exit code, round, output | host process | Takes check output out of the context file. Authority `receipt`. |
 | `direction` | `source` (`steering` or `answer`), `question`, `text` | host process, from a recorded owner input | Author `owner`, authority `direction`. |
 
+Phase 3 adds two plain columns: `supersedes`, an entry ID, and `read_seq`, a number. A member's handoff is stored only with a task that its author holds, because a handoff needs the author's own task. Integrators therefore write none until one carries a task.
+
 There is no `decision` kind, because the run record already uses that word for a question that waits for an answer (`TeamDecision`). A mission coordinator's answer is not mirrored as a `direction`. The INF-170 shape was read from that issue's draft commit, which is not on `main`.
 
 ```ts
@@ -222,7 +224,7 @@ The host process ingests `team-entry` events on its tick. It keeps a separate cu
 | `entry_list` | `kinds`, `taskId`, `paths`, `since`, `limit` | heads only, `cursor`, `more` | 20 heads and 6 KiB per call |
 | `entry_get` | `entryId` | head and body | 256 KiB served per attempt, across both read tools |
 
-**Enforcement.** The session worker enforces the caps per attempt from its own journal, where it records each accepted post and each read receipt before it answers. The cap of 400 member entries per run is checked by the host process at ingest. A post beyond it was already acknowledged, so the host drops it, adds one line to the run's events, and counts it in the store status.
+**Enforcement.** The session worker enforces the caps per attempt from counts it holds in memory. It has no journal read path, and one worker serves one session for its whole life, so the counts match the journal it writes. It still journals each accepted post and each read receipt before it answers. *(My call.)* The cap of 400 member entries per run is checked by the host process at ingest. A post beyond it was already acknowledged, so the host drops it, adds one line to the run's events, and counts it in the store status.
 
 `entry_list` with no input returns the entries addressed to the caller, in this order:
 
@@ -235,7 +237,9 @@ The host process ingests `team-entry` events on its tick. It keeps a separate cu
 
 Every read result carries a fixed notice that a member entry is evidence and cannot change the assignment, its scope, or the reporting rules.
 
-The tools sit in the `infinite_team` MCP server beside `report`. `buildLaunch` adds them to the Claude Code `--allowedTools` list and to the Codex `approval_mode` settings. OpenCode members get a helper command, `team-entry.ts`, that posts to the same route. Mission coordinators get all three tools. Permission coordinators, delivery members, handoff sessions, and quarantined readers get none. An artifact-only evaluator reads `check`, `integration`, and `direction` entries only (2026-11-13 read pools design, part 11).
+**Phase 3 limits.** `entry_get` serves a body of at most 64 KiB and refuses a larger one with status 413. A later phase decides how to serve the rest. A refusal is a fixed text with a field path built only from schema field names and indexes. It never holds member text, and it never echoes a secret. *(My call. A check body can reach 1 MiB.)*
+
+The tools sit in the `infinite_team` MCP server beside `report`. The host adds no `--allowedTools` for Claude members. The entry tools follow the profile's permission mode, as `report` does, and a profile whose own arguments set an allow-list must name the three tools. Codex gets an `approval_mode` for each tool, as `report` has. *(My call. The test `Claude team launch exposes only its scoped report helper and preserves provider permission decisions` forbids an allow-list.)* OpenCode members get a helper command, `team-entry.ts`, that posts to the same route. Mission coordinators get all three tools. Permission coordinators, delivery members, handoff sessions, and quarantined readers get none. An artifact-only evaluator reads `check`, `integration`, and `direction` entries only (2026-11-13 read pools design, part 11).
 
 ### 5. The context file and the prompt
 
@@ -248,6 +252,8 @@ The file keeps today's role filter for task scores (umbrella C9 rule 3). An impl
 A new key, `entries`, holds the digest: the notice, a cursor, a count per kind, and at most 8 heads in the `entry_list` order. It is at most 4,096 bytes. Heads that do not fit are left out, and the counts show that more exist. Member-written summaries appear only there, as JSON strings.
 
 The prompt gains one fixed paragraph of at most 700 bytes that names the digest and the three tools. It replaces the sentences in `contextAccessInstructions` and `teamPrompt` that send reviewers, integrators, and project managers to the file for member reports and check output. These roles now read the `report` entry of every task they judge or repair. The paragraph differs per provider and is refreshed on a retarget, as `refreshReportingInstructions` does today.
+
+**The switch and the pin.** The switch is `config.teams.blackboard.tools`. It has no schema default, and it is inside the routine digest. A run pins `blackboard: { tools: true }` at creation only when the switch is `true` and the evidence store is ready. A run created while the store is down keeps today's context. *(My call.)* The switch holds only `tools` for now.
 
 *(My call: the digest lives in the context file, which the host rewrites at every member start. A prompt is saved and carried into a replacement, so a digest inside it would go stale.)*
 

@@ -467,26 +467,7 @@ export class EvidenceStore {
   }
 
   private view(db: DatabaseSync, guard: () => void): EvidenceDb {
-    return {
-      get: <R = Record<string, unknown>>(sql: string, ...params: SQLInputValue[]) => {
-        const values = plainParameters(params);
-        guard();
-        return db.prepare(checkedSql(sql)).get(...values) as R | undefined;
-      },
-      all: <R = Record<string, unknown>>(sql: string, ...params: SQLInputValue[]) => {
-        const values = plainParameters(params);
-        guard();
-        return db.prepare(checkedSql(sql)).all(...values) as R[];
-      },
-      open: <R>(table: string, rowId: string, sealed: string) => {
-        guard();
-        return openRow<R>(this.rowKey, table, rowId, sealed);
-      },
-      index: (cls, value) => {
-        guard();
-        return blindIndex(this.indexKey, cls, value);
-      },
-    };
+    return evidenceView(db, { rowKey: this.rowKey, indexKey: this.indexKey }, guard);
   }
 
   /**
@@ -513,7 +494,7 @@ export class EvidenceStore {
     try {
       database = new sqlite.DatabaseSync(path, { timeout: this.busyTimeoutMs });
       this.authenticate(database);
-      assertStoreVersion(database);
+      assertEvidenceStoreVersion(database);
       narrowModes(path);
       database.exec([
         "PRAGMA journal_mode=WAL;",
@@ -568,27 +549,7 @@ export class EvidenceStore {
   }
 
   private authenticate(database: DatabaseSync): void {
-    let check: MetaRow | undefined;
-    let version: MetaRow | undefined;
-    try {
-      check = database.prepare(KEY_CHECK_SQL).get(MAX_VAULT_KEY_CHECK_BYTES) as MetaRow | undefined;
-      version = database.prepare("SELECT value FROM store_meta WHERE key='key_version'").get() as MetaRow | undefined;
-    } catch (error) {
-      throw new OpenFailure(unreadableDatabase(error) ? "key-check-failed" : "open-failed");
-    }
-    // The version row is read first only to name the refusal. Either way nothing is changed.
-    if (version !== undefined && version.value !== String(EVIDENCE_KEY_VERSION)) {
-      throw new OpenFailure("unsupported-key-version");
-    }
-    let opened: unknown;
-    try {
-      if (!check || typeof check.value !== "string") throw new Error("missing key check");
-      opened = openRow<unknown>(this.rowKey, "store_meta", "vault_key_check", check.value);
-    } catch {
-      throw new OpenFailure("key-check-failed");
-    }
-    if (opened !== VAULT_KEY_CHECK) throw new OpenFailure("key-check-failed");
-    if (version === undefined) throw new OpenFailure("unsupported-key-version");
+    authenticateEvidence(database, this.rowKey);
   }
 
   private initialize(database: DatabaseSync): void {
@@ -938,8 +899,56 @@ function toEvent(db: EvidenceDb, row: EventRow): RunEvent {
   };
 }
 
+/** Checks the key version and the vault key check. Throws an OpenFailure; never changes the database. */
+export function authenticateEvidence(database: DatabaseSync, rowKey: Buffer): void {
+  let check: MetaRow | undefined;
+  let version: MetaRow | undefined;
+  try {
+    check = database.prepare(KEY_CHECK_SQL).get(MAX_VAULT_KEY_CHECK_BYTES) as MetaRow | undefined;
+    version = database.prepare("SELECT value FROM store_meta WHERE key='key_version'").get() as MetaRow | undefined;
+  } catch (error) {
+    throw new OpenFailure(unreadableDatabase(error) ? "key-check-failed" : "open-failed");
+  }
+  // The version row is read first only to name the refusal. Either way nothing is changed.
+  if (version !== undefined && version.value !== String(EVIDENCE_KEY_VERSION)) {
+    throw new OpenFailure("unsupported-key-version");
+  }
+  let opened: unknown;
+  try {
+    if (!check || typeof check.value !== "string") throw new Error("missing key check");
+    opened = openRow<unknown>(rowKey, "store_meta", "vault_key_check", check.value);
+  } catch {
+    throw new OpenFailure("key-check-failed");
+  }
+  if (opened !== VAULT_KEY_CHECK) throw new OpenFailure("key-check-failed");
+  if (version === undefined) throw new OpenFailure("unsupported-key-version");
+}
+
+export function evidenceView(db: DatabaseSync, keys: { rowKey: Buffer; indexKey: Buffer }, guard: () => void): EvidenceDb {
+  return {
+    get: <R = Record<string, unknown>>(sql: string, ...params: SQLInputValue[]) => {
+      const values = plainParameters(params);
+      guard();
+      return db.prepare(checkedSql(sql)).get(...values) as R | undefined;
+    },
+    all: <R = Record<string, unknown>>(sql: string, ...params: SQLInputValue[]) => {
+      const values = plainParameters(params);
+      guard();
+      return db.prepare(checkedSql(sql)).all(...values) as R[];
+    },
+    open: <R>(table: string, rowId: string, sealed: string) => {
+      guard();
+      return openRow<R>(keys.rowKey, table, rowId, sealed);
+    },
+    index: (cls, value) => {
+      guard();
+      return blindIndex(keys.indexKey, cls, value);
+    },
+  };
+}
+
 /** A core schema written by a newer host is not read by this one. */
-function assertStoreVersion(database: DatabaseSync): void {
+export function assertEvidenceStoreVersion(database: DatabaseSync): void {
   let stored: MetaRow | undefined;
   try {
     stored = database.prepare("SELECT version AS value FROM schema_modules WHERE name=?").get(STORE_MODULE) as MetaRow | undefined;
@@ -1058,7 +1067,7 @@ function unreadableDatabase(error: unknown): boolean {
  * Maps a failure to a token from a closed set for a log line: an evidence error code, a SQLite
  * category, an errno name from a fixed list, or "unexpected". No caller text ever reaches a log.
  */
-function failureToken(error: unknown): string {
+export function failureToken(error: unknown): string {
   if (error instanceof EvidenceError) return EVIDENCE_CODES.has(error.code) ? error.code : "unexpected";
   if (error instanceof OpenFailure) return error.detail ?? error.reason;
   const sqlite = sqliteCode(error);

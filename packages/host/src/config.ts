@@ -9,6 +9,7 @@ import { autonomyModeSchema } from "./autonomy.js";
 import { projectSourceSchema, teamProjectSchema, teamCommandSchema, teamRetentionSchema, storageFloorSchema, teamLineupSchema } from "./team-types.js";
 import { intakeConfigSchema } from "./intake-types.js";
 import { mcpConfigSchema } from "./mcp-types.js";
+import { egressConfigSchema } from "./egress.js";
 
 /**
  * Provider hooks injected at launch when the config does not say. Codex hooks stay off: spike S2
@@ -16,6 +17,10 @@ import { mcpConfigSchema } from "./mcp-types.js";
  * also lets hooks defined in the working directory run without review.
  */
 export const DEFAULT_HOOKS = { claude: true, codex: false } as const;
+/** The name that starts the host's tracker comments when `linear.reportName` is not set. */
+export const DEFAULT_REPORT_NAME = "Infinite";
+/** The name that starts the host's tracker comments, as in "NAME agent report: ready for review.". */
+export const reportName = (config: Config): string => config.linear?.reportName ?? DEFAULT_REPORT_NAME;
 const nonNegative = z.number().min(0).finite();
 export const usageConfigSchema = z.object({
   /** USD per million tokens, keyed `provider/model`. */
@@ -34,21 +39,47 @@ export const fuseConfigSchema = z.object({
   projects: z.record(z.string().min(1), fuseCeilingsSchema).optional(),
 }).strict();
 export type FuseConfig = z.infer<typeof fuseConfigSchema>;
+/**
+ * Settings for work that continues on its own. No defaults here. Routines and standing goals apply a 5-minute wake
+ * gap at read. The mission service applies 60 minutes, 120,000 tokens, and 40 attempts for when a coordinator starts
+ * a new conversation instead of resuming; zero turns that rule off.
+ */
+export const continuityConfigSchema = z.object({
+  wakeMinGapMinutes: z.number().int().min(0).max(1440).optional(),
+  rotateIdleMinutes: z.number().int().min(0).max(10080).optional(),
+  rotateContextTokens: z.number().int().min(0).max(10_000_000).optional(),
+  rotateAttempts: z.number().int().min(0).max(1000).optional(),
+}).strict();
+export type ContinuityConfig = z.infer<typeof continuityConfigSchema>;
 /** Outcome measurement settings. No default here: each consumer applies its own default where it reads the value. */
 export const outcomeSettingsSchema = z.object({
   holdDays: z.number().int().min(1).max(365).optional(),
   retentionDays: z.number().int().min(30).max(3650).optional(),
 }).strict();
 
+/**
+ * The GitHub credential proxy (deploy/ubuntu/github-proxy.md). `proxyUrl` is the proxy's bare loopback origin;
+ * `keyPath` is the grant key the host shares with the proxy account. Absent means sessions get no grant.
+ */
+export const githubBoundarySchema = z.object({
+  proxyUrl: z.string().refine(value => {
+    try {
+      const url = new URL(value);
+      return ["http:", "https:"].includes(url.protocol) && ["127.0.0.1", "[::1]", "localhost"].includes(url.hostname) && value.replace(/\/$/, "") === url.origin;
+    } catch { return false; }
+  }, "The GitHub proxy URL must be a bare loopback origin"),
+  keyPath: z.string().refine(isAbsolute, "The GitHub grant key path must be absolute"),
+}).strict();
+
 const schema = z
   .object({
-    linear: z.object({ apiKeyFile: z.string().refine(isAbsolute), endpoint: z.url().optional() }).strict().optional(),
+    linear: z.object({ apiKeyFile: z.string().refine(isAbsolute), endpoint: z.url().optional(), reportName: z.string().trim().min(1).max(40).regex(/^[A-Za-z][A-Za-z0-9 -]*$/).default(DEFAULT_REPORT_NAME) }).strict().optional(),
     hostLoad: z.object({ minAvailableMemoryGiB: z.number().min(0).max(4096), maxLoadPerCpu: z.number().positive().max(64) }).strict().optional(),
     intake: intakeConfigSchema.optional(),
     mcp: mcpConfigSchema.optional(),
-    teams: z.object({ workspaceDir: z.string().refine(isAbsolute), commandPrefix: teamCommandSchema.optional(), lineup: teamLineupSchema.optional(), trustWorkspaces: z.boolean().optional(), publishHeads: z.boolean().default(true), stallMinutes: z.number().int().min(5).max(1440).optional(), checkMinutes: z.number().positive().max(240).optional(), retention: teamRetentionSchema.optional(), storageFloor: storageFloorSchema.optional(), outcomes: outcomeSettingsSchema.optional() }).strict().optional(),
+    teams: z.object({ workspaceDir: z.string().refine(isAbsolute), commandPrefix: teamCommandSchema.optional(), lineup: teamLineupSchema.optional(), trustWorkspaces: z.boolean().optional(), publishHeads: z.boolean().default(true), stallMinutes: z.number().int().min(5).max(1440).optional(), checkMinutes: z.number().positive().max(240).optional(), retention: teamRetentionSchema.optional(), storageFloor: storageFloorSchema.optional(), outcomes: outcomeSettingsSchema.optional(), blackboard: z.object({ tools: z.boolean().optional() }).strict().optional() }).strict().optional(),
     machine: z.object({ id: z.uuid(), label: machineLabelSchema }).strict().optional(),
-    autonomy: z.object({ defaultMode: autonomyModeSchema.optional(), fuse: fuseConfigSchema.optional() }).strict().optional(),
+    autonomy: z.object({ defaultMode: autonomyModeSchema.optional(), fuse: fuseConfigSchema.optional(), continuity: continuityConfigSchema.optional(), boundary: z.object({ egress: egressConfigSchema.optional(), github: githubBoundarySchema.optional() }).strict().optional() }).strict().optional(),
     cmux: z.object({ enabled: z.boolean(), command: z.string().min(1).optional(), hooksDir: z.string().refine(isAbsolute).optional() }).strict().optional(),
     remote: z.object({ enabled: z.boolean(), relay: z.object({ url: z.url(), tokenFile: z.string().refine(isAbsolute) }).strict().optional() }).strict().optional(),
     deployment: z.unknown().optional(),

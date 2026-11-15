@@ -1,6 +1,7 @@
 import type { ConnectorSource } from "./mcp-types.js";
 import { z } from "zod";
 import { featureMapSchema, TASK_KINDS } from "./task-features.js";
+import { evalProjectSchema } from "./eval-config.js";
 import type { Prompt, AnswerResult } from "@infinite/attention";
 import type { Receipt } from "./types.js";
 import type { Provider } from "./types.js";
@@ -205,6 +206,7 @@ export const teamProjectSchema = z.object({
   handoffMaxTotalMinutes: z.number().int().min(5).max(1440).optional(),
   /** The private feature map. Read at acceptance; never sent to a member. No default, so the authority digest is unchanged when unset. */
   features: featureMapSchema.optional(),
+  eval: evalProjectSchema.optional(),
 }).strict().superRefine((project, context) => {
   if (project.establishChecks ? project.checks.length > 0 : project.checks.length === 0)
     context.addIssue({ code: "custom", path: ["checks"], message: "Configure required checks, or explicitly authorize the team to establish them with an empty checks array." });
@@ -336,7 +338,9 @@ export const teamTaskRatingSchema = z.object({ requestId: z.uuid(), score: z.num
 export const teamParallelismSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), parallelism: z.number().int().min(1).max(4) }).strict();
 export type TeamParallelism = z.infer<typeof teamParallelismSchema>;
 const taskId = z.string().regex(/^[a-z][a-z0-9-]{0,39}$/);
+export const taskIdSchema = taskId;
 const ownedPath = z.string().min(1).max(300).refine(value => !value.startsWith("/") && !value.includes("\\") && !value.includes("\0") && !value.split("/").some(part => part === ".." || part === ".git" || part === "." || part === ""), "Use a repository-relative file or directory without glob syntax").refine(value => !/[*?\[\]:]/.test(value));
+export const ownedPathSchema = ownedPath;
 export const teamGoalContextSchema = z.object({
   id: z.uuid(), revision: z.number().int().min(1), cycle: z.number().int().min(1),
   successCriteria: z.string().trim().min(1).max(8000),
@@ -418,7 +422,7 @@ export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z
 export type TeamReportEnvelope = z.infer<typeof teamReportEnvelopeSchema>;
 export type TeamRole = "permission-coordinator" | "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
 /** A mission coordinator's assignment carries the mission ID as `runId`; it reports `MissionReport`s. */
-export type TeamAssignment = { runId: string; memberId: string; revision: number; role: TeamRole | "mission-coordinator"; taskId?: string; verificationRefused?: true };
+export type TeamAssignment = { runId: string; memberId: string; revision: number; role: TeamRole | "mission-coordinator"; taskId?: string; verificationRefused?: true; entryTools?: true };
 /** `merged` is set only from an explicit delivery report; it is not host verification. */
 export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
 export interface TeamMember extends TeamAssignment {
@@ -454,6 +458,8 @@ export interface TeamMember extends TeamAssignment {
   stalledAt?: string;
   report?: TeamReport;
   cursor: number;
+  /** The journal seq up to which the host has stored this member's entry events. */
+  entryCursor?: number;
   stopRequestId: string;
   /** Why the host stopped this member without a report, such as a provider usage limit. */
   stoppedReason?: string;
@@ -466,6 +472,8 @@ export interface TeamMember extends TeamAssignment {
   /** Computed on read for members whose provider reports usage; never stored. */
   usage?: UsageTotals;
 }
+/** The member states the team service counts as active. */
+export const ACTIVE_MEMBER_STATUSES: readonly TeamMember["status"][] = ["queued", "running", "reported", "unavailable"];
 export interface TeamTask extends TeamTaskPlan {
   /** Run revision whose plan created this task. */
   revision: number;
@@ -526,6 +534,8 @@ export interface TeamCheck {
   round?: number;
 }
 export interface TeamRun {
+  /** Set when the run was created with the blackboard tools switch on and a ready store. Absent means today's behaviour. */
+  blackboard?: { tools: true };
   /** The project's autonomy mode, pinned when the run starts. Absent on runs recorded before the mode existed; read with autonomyOf(). */
   autonomy?: AutonomyMode;
   /** Explicit owner delegation pinned at creation. Old runs remain opted out. */

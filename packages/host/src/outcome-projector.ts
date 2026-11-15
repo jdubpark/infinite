@@ -808,7 +808,7 @@ function setLink(tx: EvidenceTx, id: string, runId: string, revision: number, ro
   );
 }
 
-function outcomeId(runId: string, memberId: string): string {
+export function outcomeId(runId: string, memberId: string): string {
   return `${runId}:${memberId}`;
 }
 

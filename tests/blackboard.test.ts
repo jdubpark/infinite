@@ -68,7 +68,7 @@ test("the module registers once and creates its tables", () => {
     const version = reopened.read(db => db.get<{ version: number }>(
       "SELECT version FROM schema_modules WHERE name='blackboard'",
     )?.version);
-    assert.equal(version, 1);
+    assert.equal(version, 2);
     reopened.close();
   } finally {
     f.close();

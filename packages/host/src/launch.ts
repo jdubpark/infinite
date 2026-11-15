@@ -210,8 +210,11 @@ export function buildLaunch(
   teamModelProfile?: TeamModelProfile,
   handoffSessionId?: string,
   trustedCwd?: string,
+  entryTools?: boolean,
 ): AgentProfile {
   const args = [...profile.args];
+  // Entry tools ride the team report channel. They add no provider permission, so the profile's own decisions still apply.
+  const withEntryTools = Boolean(team && entryTools && !handoffSessionId);
   if (handoffSessionId) {
     if (!hooks || !["claude", "codex"].includes(provider)) throw new Error("Handoff requires an authenticated provider channel");
     const development = relayPath.endsWith(".ts");
@@ -237,6 +240,7 @@ export function buildLaunch(
         INFINITE_HOOK_TOKEN: "${INFINITE_HOOK_TOKEN}",
         INFINITE_TEAM_ASSIGNMENT: "${INFINITE_TEAM_ASSIGNMENT}",
         INFINITE_MISSION_ASSIGNMENT: "${INFINITE_MISSION_ASSIGNMENT:-}",
+        ...(withEntryTools ? { INFINITE_TEAM_ENTRY_TOOLS: "1" } : {}),
       },
     } } }));
   }
@@ -250,6 +254,12 @@ export function buildLaunch(
       env_vars: ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT", "INFINITE_PROJECT_ID"],
       "tools.report.approval_mode": "approve",
       "tools.mission_report.approval_mode": "approve",
+      ...(withEntryTools ? {
+        "env.INFINITE_TEAM_ENTRY_TOOLS": "1",
+        "tools.entry_post.approval_mode": "approve",
+        "tools.entry_list.approval_mode": "approve",
+        "tools.entry_get.approval_mode": "approve",
+      } : {}),
     })) args.push("-c", `mcp_servers.infinite_team.${key}=${JSON.stringify(value)}`);
   }
   // Dev runs the relay from TypeScript through tsx; builds run the compiled file. The tsx
@@ -261,7 +271,10 @@ export function buildLaunch(
     // A command hook, not an HTTP hook: the relay runs in the agent's account and is the only
     // process that can read the transcript the worker asks for in its reply.
     const handler = { type: "command", command: [...relay, "claude"].join(" "), timeout: 10 };
+    // Stated outright because a project settings file that sets `disableAllHooks` would otherwise switch these
+    // hooks off in a running session. This layer outranks project and local settings.
     const settings = {
+      disableAllHooks: false,
       hooks: Object.fromEntries(
         CLAUDE_EVENTS.map((e) => [e, [{ hooks: [handler] }]]),
       ),

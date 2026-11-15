@@ -125,14 +125,26 @@ test("discovery reads a record once when its answer cannot change", async () => 
     assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: replacedReason });
     assert.equal(reads.a, readsReplaced);
 
+    // The route asks first: the record is replaced and a listing has seen it (a new revision), but the handoff poller
+    // has not ticked since. The listed view must not answer from the old revision's memory.
+    const routeReason = "Replaced again, and the route asks before the poller.";
+    sessions.a = { id: "a", projectId: "p", handoff: { reason: routeReason } };
+    revisions.a = "rev-a-3";
+    const readsBeforeRoute = reads.a;
+    assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: routeReason });
+    // The stale memory is dropped: discovery reads the record, then the view reads it for its own answer.
+    assert.equal(reads.a, readsBeforeRoute + 2);
+    assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: routeReason });
+    assert.equal(reads.a, readsBeforeRoute + 2, "the new answer is remembered under the new revision");
+
     // A file that is not settled: nothing is remembered, so every row reads the record.
     revisions.a = undefined;
     await settleTicks();
     const readsUnsettled = reads.a;
-    assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: "Changed again without a new revision." });
+    assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: routeReason });
     // An unremembered view reads the record twice (discovery, then its own answer), on every call.
     assert.equal(reads.a, readsUnsettled + 2);
-    assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: "Changed again without a new revision." });
+    assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: routeReason });
     assert.equal(reads.a, readsUnsettled + 4);
   } finally {
     service.close();

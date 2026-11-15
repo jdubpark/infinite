@@ -14,9 +14,10 @@ const ACCESS_TOKENS: readonly RegExp[] = [
   /AIza[0-9A-Za-z_-]{35}/,
   /eyJ[A-Za-z0-9_-]{7,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/,
   // Credentials this host issues to a session, of any session: a GitHub grant (`VERSION.CLAIMS.MAC`, the claims being
-  // JSON in base64url) and an egress proxy password (`VERSION.EXPIRES.MAC`). The MAC is an HMAC-SHA256 in base64url.
-  /v\d+\.eyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{43,}/,
-  /v\d+\.\d{9,12}\.[A-Za-z0-9_-]{43,}/,
+  // JSON in base64url) and an egress proxy password (`VERSION.EXPIRES.MAC`). The MAC is an HMAC-SHA256 in base64url:
+  // exactly 43 characters, so a build or cache id that ends in a 64-character hash is left alone.
+  /v\d+\.eyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/,
+  /v\d+\.\d{9,12}\.[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/,
 ];
 /** A shorter string is no credential; it would only refuse ordinary text. */
 const MIN_CREDENTIAL_LENGTH = 16;

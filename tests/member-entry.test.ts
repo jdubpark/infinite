@@ -268,6 +268,9 @@ test("the scan finds secrets and never returns them", () => {
     "v2.eyJ" + "x".repeat(20) + "." + "y".repeat(42),
     "v1.1700000000." + "y".repeat(42),
     "release v1.2.3, then v2.10.1700000000",
+    // Build and cache ids that end in a 64-character hash are no credential.
+    "v1.1731628800." + "a".repeat(64),
+    "v3.202311150930." + "0123456789abcdef".repeat(4),
     "a short word",
   ];
   for (const value of near) {

@@ -188,7 +188,7 @@ export class HostPermissionPipeline implements PermissionPipeline {
   }
 
   /** A halt that cannot be read counts as a halt. */
-  private halted(projectId: string): boolean {
+  halted(projectId: string): boolean {
     try { return this.haltedOf?.(projectId) ?? false; }
     catch { return true; }
   }
@@ -351,6 +351,8 @@ export class HostPermissionPipeline implements PermissionPipeline {
       raised,
       canAllow,
       ...(options.collect ? { collect: options.collect } : {}),
+      // Every turn reads the halt again: one recorded after the light turn holds the strong turn.
+      held: () => this.halted(requester.projectId),
       ...(options.signal ? { signal: options.signal } : {}),
     };
     let review: PermissionReview;

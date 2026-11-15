@@ -3457,9 +3457,26 @@ export class TeamService {
    * answer in flight is fenced at the worker.
    */
   private async retireCoordinatorReviews(stored: Stored) {
-    if (!(stored.run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering"].includes(decision.status))) return;
+    if (!this.coordinatorReviewsLive(stored)) return;
     this.event(stored, coordinatorRetiredEvent);
     await this.invalidatePermissionDecisions(stored, coordinatorRetiredReason, false);
+  }
+  private coordinatorReviewsLive(stored: Stored) {
+    return (stored.run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering"].includes(decision.status));
+  }
+  /**
+   * An owner act or a finished replay may have made the permission agent serve runs in flight. Their coordinator
+   * reviews are retired now, and an answer that is already at the worker is fenced there, without waiting for the
+   * scheduler: it does not reach a run while an answer operation is pending. Nothing is queued when no served run
+   * has a live coordinator review, so a caller can run it on every write.
+   */
+  permissionAuthorityChanged(): Promise<void> {
+    const affected = () => [...this.records.values()].filter(stored => this.coordinatorReviewsLive(stored) && this.agentServes(stored));
+    if (this.closed || affected().length === 0) return Promise.resolve();
+    return this.enqueue(async () => {
+      if (this.closed) return;
+      for (const stored of affected()) await this.retireCoordinatorReviews(stored);
+    });
   }
   /** Whether the permission agent holds the member's open dialog now: a hand-off or its display expansion is under way. */
   private agentHolds(sessionId: string, promptId: number | undefined) {
@@ -4391,8 +4408,9 @@ export class TeamService {
             ? sourceCoordinatorMemberId : Reflect.get(current, property, receiver) })
           : undefined;
         if (!deliveryDecision) return { status: "escalated" as const, reason: "The recorded reviewer assignment for this reused approval is unavailable. The request remains with the user." };
+        // The permission agent can start to serve the run while this answer is under way; the manager reads this under its lease.
         const receipt = await this.manager.answerTeamPermission(decision.targetSessionId, decision.answerRequestId,
-          assignment(target), deliveryDecision);
+          assignment(target), deliveryDecision, () => !this.agentServes(stored));
         return receipt.state === "delivered" && receipt.result === "closed"
           ? { status: "answered" as const, receipt }
           : receipt.state === "uncertain" ? { status: "uncertain" as const, receipt, reason: "The host could not confirm whether the target prompt closed. Inspect the target session before acting." }

@@ -88,6 +88,7 @@ import { createPermissionAgentCore } from "./permission-core.js";
 import { realHostPath } from "./permission-shell.js";
 import { createCliTurnLauncher, type PermissionTurnGate } from "./permission-reviewer.js";
 import { PermissionReplayJobs } from "./permission-replay.js";
+import { permissionWriteFence, type PermissionFence } from "./permission-write-fence.js";
 import { PERMISSION_REPLAY_PATH, permissionAgentStatus, registerPermissionAgentRoutes } from "./permission-agent-routes.js";
 import { LinearService } from "./linear.js";
 import { createGoalSchema, goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema, goalParallelismSchema } from "./goal-types.js";
@@ -328,7 +329,9 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   const permissionCore = createPermissionAgentCore({ ...permissionCoreOptions, resolvePath: realHostPath });
   permissionAgent.core = permissionCore;
   const permissionReplays = permissionMeasurements
-    ? new PermissionReplayJobs({ core: () => createPermissionAgentCore({ ...permissionCoreOptions, purpose: "replay" }), measurements: permissionMeasurements })
+    ? new PermissionReplayJobs({ core: () => createPermissionAgentCore({ ...permissionCoreOptions, purpose: "replay" }), measurements: permissionMeasurements,
+      // A passing replay can make the host ready: coordinator reviews of the runs it now serves are retired at once.
+      onSettled: () => { void teams.permissionAuthorityChanged().catch(() => {}); } })
     : undefined;
   // The pipeline decides and records; it is built only when a decision core exists. The owner controls need only the journal.
   const permissionState = permissionJournal ? openPermissionPipelineState(evidence) : undefined;
@@ -357,12 +360,16 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   permissionAgent.delivery = permissionDelivery;
   teams.usePermissionAgent(permissionAgent);
   /**
-   * After an owner act that changed or ended a delegation, and before that act is acknowledged: answers in
-   * flight under the old authority are fenced at their sessions. `uncertain` when a fence was not confirmed.
+   * After a write that may have changed or ended an authority, and before that write is acknowledged. Coordinator
+   * reviews of runs that the permission agent now serves are retired, and permission-agent answers in flight
+   * under an authority that no longer applies (a revoke, a changed delegation, an opt-out, a regrouping, an owner
+   * halt) are fenced at their sessions. `uncertain` when a fence was not confirmed.
    */
-  const fenceRetiredPermissions = async (): Promise<{ deliveryFence?: "uncertain" }> => {
-    try { return await permissionDelivery.fenceRetired() ? {} : { deliveryFence: "uncertain" }; }
-    catch { return { deliveryFence: "uncertain" }; }
+  const settlePermissionAuthority = async (): Promise<PermissionFence> => {
+    let confirmed = true;
+    try { await teams.permissionAuthorityChanged(); } catch { confirmed = false; }
+    try { if (!await permissionDelivery.fenceRetired()) confirmed = false; } catch { confirmed = false; }
+    return confirmed ? {} : { deliveryFence: "uncertain" };
   };
   // Active only when a pipeline decides, interactive delivery can record what it sends, and the host is ready.
   const permissionAgentState = () => {
@@ -719,6 +726,9 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     res.locals.leaseId = id.optional().parse(req.get("X-Infinite-Control"));
     next();
   });
+  // No route is trusted to remember the permission fence: every write settles it before its JSON reply is sent.
+  // Both steps are in-memory reads unless an answer is in flight under an authority that the write ended.
+  app.use("/api", permissionWriteFence(settlePermissionAuthority));
   const requireRole =
     (roles: Role[]): express.RequestHandler =>
     (_req, res, next) =>
@@ -1177,17 +1187,9 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     }));
   });
   app.get("/api/project-groups/:id", requireRole(["owner", "controller", "viewer"]), (req, res) => res.json(projectGroups.get(projectGroupIdSchema.parse(req.params.id))));
-  // An owner regrouping can end a delegation's coverage of a project: answers in flight under it are fenced before the reply.
-  app.post("/api/project-groups", requireRole(["owner"]), async (req, res) => {
-    const view = projectGroups.create(createProjectGroupSchema.parse(req.body));
-    await fenceRetiredPermissions();
-    res.json(view);
-  });
-  app.put("/api/project-groups/:id", requireRole(["owner"]), async (req, res) => {
-    const view = projectGroups.update(projectGroupIdSchema.parse(req.params.id), updateProjectGroupSchema.parse(req.body));
-    await fenceRetiredPermissions();
-    res.json(view);
-  });
+  // An owner regrouping can end a delegation's coverage of a project. The write middleware fences answers in flight under it before the reply.
+  app.post("/api/project-groups", requireRole(["owner"]), (req, res) => res.json(projectGroups.create(createProjectGroupSchema.parse(req.body))));
+  app.put("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.update(projectGroupIdSchema.parse(req.params.id), updateProjectGroupSchema.parse(req.body))));
   app.delete("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.remove(projectGroupIdSchema.parse(req.params.id), z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict().parse(req.body))));
   const permissionsUnavailable = (res: express.Response) => res.status(503).json({ error: "Permission delegation is unavailable on this host." });
   app.get("/api/permissions/status", requireRole(["owner", "controller"]), async (_req, res) => {
@@ -1238,18 +1240,18 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     const recorded = <T>(act: () => T) => closeRejectsOnDirectionChange(delegation, permissionJournal, config.projects.map(project => project.id), act);
     if (body.all) {
       const result = recorded(() => delegation.delegateAll(request, actor));
-      return res.json({ agent: permissionAgentState(), views: result.views, replacedOptOuts: result.replacedOptOuts, ...await fenceRetiredPermissions() });
+      return res.json({ agent: permissionAgentState(), views: result.views, replacedOptOuts: result.replacedOptOuts });
     }
     const result = recorded(() => delegation.delegate(body.workspaceId!, request, actor));
-    // A new owner act or direction text replaces the authority: answers in flight under the earlier one are fenced first.
-    return res.json({ agent: permissionAgentState(), views: [result.view], replacedOptOuts: result.replacedOptOuts, ...await fenceRetiredPermissions() });
+    // A new owner act or direction text replaces the authority. The write middleware fences answers in flight under the earlier one first.
+    return res.json({ agent: permissionAgentState(), views: [result.view], replacedOptOuts: result.replacedOptOuts });
   });
   app.post("/api/permissions/revocations", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     if (!permissionDelegation) return permissionsUnavailable(res);
     const body = permissionRevocationBodySchema.parse(req.body);
     const view = permissionDelegation.revoke(body.workspaceId, { requestId: body.requestId }, { deviceId: String(res.locals.deviceId) });
-    // The revoke is recorded, so no new decision applies. An answer already with a session is fenced before the reply.
-    return res.json({ agent: permissionAgentState(), view, ...await fenceRetiredPermissions() });
+    // The revoke is recorded, so no new decision applies. The write middleware fences an answer already with a session before the reply.
+    return res.json({ agent: permissionAgentState(), view });
   });
   registerPermissionControlRoutes(app, { guards: [requireRole(["owner"]), requireOwnerCli], controls: permissionControls });
   registerPermissionReviewRoutes(app, { journal: permissionJournal, requireRole, requireOwnerCli, workspaces: projectGroups, projects: () => config.projects });
@@ -1462,8 +1464,8 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     try {
       const { view, first } = await enrollment.enroll(projectId, body, { beforeWrite: onboarding.beforeWrite });
       const coverage = onboarding.after(first);
-      // An opt-out ends the project's coverage: answers in flight under it are fenced before the reply.
-      res.json({ ...view, permissionAgent: coverage, ...await fenceRetiredPermissions() });
+      // An opt-out ends the project's coverage. The write middleware fences answers in flight under it before the reply.
+      res.json({ ...view, permissionAgent: coverage });
     } finally { projectConfigChanges.delete(projectId); }
   });
   app.put("/api/projects/:id/autonomy", requireRole(["owner"]), requireOwnerCli, async (req, res) => {

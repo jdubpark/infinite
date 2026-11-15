@@ -420,6 +420,29 @@ test("an allow is returned only while it still applies, and a destructive one on
   } finally { weak.done(); }
 });
 
+test("a reject is returned only while it still applies, and a halt recorded while the call was decided denies it as unavailable", async () => {
+  // The decision was retired (a revoke or regrouping) while the call was decided: the provider keeps the call.
+  const stale = fakePipeline({ applicable: () => false });
+  const h = hostRig(stale.pipeline);
+  try {
+    assert.deepEqual(await h.ask({ op: "decide", call: bash("npm publish"), requestId: `headless:${h.session.id}:toolu_1` }), { result: "not-served" });
+    assert.deepEqual(stale.deliveries.map(entry => entry.kind), ["stale"]);
+  } finally { h.done(); }
+  // An owner halt recorded while the call was decided: no recorded verdict reaches the session.
+  let halted = false;
+  const halting = fakePipeline({
+    decide: async () => { halted = true; return { kind: "reject", decisionId: randomUUID(), code: "unsafe", notice: "MODEL TEXT" }; },
+    applicable: () => !halted,
+    halted: () => halted,
+  });
+  const g = hostRig(halting.pipeline);
+  try {
+    const reply = await g.ask({ op: "decide", call: bash("npm publish"), requestId: `headless:${g.session.id}:toolu_2` });
+    assert.deepEqual(reply, { result: "deny", code: "unavailable", notice: requesterNotice("unavailable") });
+    assert.deepEqual(halting.deliveries.map(entry => entry.kind), ["stale"]);
+  } finally { g.done(); }
+});
+
 test("a session admitted without the channel is not served even when the pipeline serves its project", async () => {
   const h = hostRig(fakePipeline().pipeline, { channel: false, reason: "x" });
   try { assert.deepEqual(await h.ask({ op: "class", call: bash("deploy production") }), { result: "not-served" }); }

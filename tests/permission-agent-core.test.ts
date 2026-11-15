@@ -28,6 +28,7 @@ import {
   type ReportOptions,
 } from "../packages/host/src/permission-reviewer.js";
 import { hostProtectedPaths, permissionAgentConfigSchema, type PermissionAgentSettings } from "../packages/host/src/permission-agent-config.js";
+import { PermissionReviewHeld } from "../packages/host/src/permission-agent-types.js";
 import type { PermissionRequest, PermissionReviewContext } from "../packages/host/src/permission-agent-types.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 
@@ -268,6 +269,16 @@ test("the light tier can only allow or refer, and never sees a raised request or
   assert.deepEqual({ verdict: referred.verdict, code: referred.code }, { verdict: "reject", code: "uncertain" });
   assert.deepEqual(referring.turns.map(turn => turn.tier), ["light", "strong"]);
 
+  // An owner halt recorded after the light turn referred holds the strong turn: the review throws, so no verdict exists.
+  let halted = false;
+  const halting = fakeLauncher(turn => {
+    if (turn.held?.()) return "held";
+    if (turn.tier === "light") { halted = true; return { verdict: "refer", note: "Not plain." }; }
+    return { verdict: "allow", noInterruptClass: true, note: "Routine." };
+  });
+  await assert.rejects(createPermissionAgentCore({ settings: settings(), launcher: halting.launcher }).review(bash("npm test"), context({ held: () => halted })), PermissionReviewHeld);
+  assert.deepEqual(halting.turns.map(turn => turn.tier), ["light", "strong"], "the strong turn read the halt and never ran");
+
   // A light allow ends the review.
   const allowing = fakeLauncher(() => ({ verdict: "allow", note: "A read." }));
   const allowed = await createPermissionAgentCore({ settings: settings(), launcher: allowing.launcher }).review(bash("npm test"), context());
@@ -427,6 +438,13 @@ test("a reviewer launch offers no tools, no settings and no project files", { ti
     const before = launches().length;
     assert.deepEqual(await launcher("decide", () => false).run(turn(strongClaude)), { ok: false, failure: "held" });
     assert.equal(launches().length, before);
+    // The turn's own halt holds it the same way, at the gate and again after the OpenCode verification.
+    assert.deepEqual(await launcher().run({ ...turn(strongClaude), held: () => true }), { ok: false, failure: "held" });
+    assert.equal(launches().length, before);
+    let reads = 0;
+    const halting = { ...turn(strongDeepSeek), held: () => reads++ > 0 };
+    assert.deepEqual(await launcher("decide").run(halting), { ok: false, failure: "held" });
+    assert.deepEqual(launches().slice(before).map(entry => entry.argv[1]), ["debug"], "only the verification ran; the halted turn never started");
     const codex: TeamModelProfile = { id: "strong-codex", label: "Codex", provider: "codex", model: "gpt-5.5", effort: "high" };
     assert.equal(launcher().supports(codex), false);
     assert.deepEqual(await launcher().run(turn(codex)), { ok: false, failure: "unsupported" });

@@ -221,6 +221,8 @@ export interface PermissionTurn {
   prompt: string;
   schema: Record<string, unknown>;
   timeoutMs: number;
+  /** True while an owner halt covers the request that this turn judges. The launcher reads it with the gate. */
+  held?: () => boolean;
   signal?: AbortSignal;
 }
 
@@ -347,8 +349,13 @@ export function createCliTurnLauncher(options: CliTurnLauncherOptions): Permissi
     async run(turn) {
       const launch = launchOf(turn.profile);
       if (!launch) return { ok: false, failure: "unsupported" };
-      const allowed = await Promise.resolve(options.gate?.({ purpose: turn.purpose, tier: turn.tier, profileId: turn.profile.id, provider: turn.profile.provider })).then(value => value ?? true, () => false);
-      if (!allowed) return { ok: false, failure: "held" };
+      // The launch gate and the turn's own halt. A source that throws holds the launch.
+      const held = async () => {
+        const allowed = await Promise.resolve(options.gate?.({ purpose: turn.purpose, tier: turn.tier, profileId: turn.profile.id, provider: turn.profile.provider })).then(value => value ?? true, () => false);
+        if (!allowed) return true;
+        try { return turn.held?.() === true; } catch { return true; }
+      };
+      if (await held()) return { ok: false, failure: "held" };
       if (turn.signal?.aborted) return { ok: false, failure: "aborted" };
       const cwd = mkdtempSync(join(options.workRoot ?? tmpdir(), "infinite-permission-turn-"));
       try {
@@ -356,6 +363,8 @@ export function createCliTurnLauncher(options: CliTurnLauncherOptions): Permissi
         chmodSync(cwd, 0o755);
         const env = { ...(options.env ?? reviewerEnvironment()) };
         if (turn.profile.provider === "opencode" && !(await openCodeToolsOff(launch, { ...env, ...OPENCODE_ENV }, cwd))) return { ok: false, failure: "tools-offered" };
+        // The checks above can take a minute. Both are read again here, with nothing awaited before the model starts.
+        if (await held()) return { ok: false, failure: "held" };
         const startedAt = now().toISOString();
         const args = turn.profile.provider === "claude" ? claudeReviewerArgs(turn) : openCodeReviewerArgs(turn);
         const childEnv = turn.profile.provider === "opencode" ? { ...env, ...OPENCODE_ENV, OPENCODE_CONFIG_CONTENT: openCodeReviewerConfig(turn.system) } : env;

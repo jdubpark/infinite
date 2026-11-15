@@ -1692,7 +1692,10 @@ permission agent has replaced it on the host. A run uses one path or the
 other, never both for the same request. When the permission agent starts to
 serve a run in flight, the run's coordinator reviews are retired without an
 answer, an answer in flight is fenced, and the coordinator review decides
-nothing more for that run.
+nothing more for that run. The switch is read at the owner act or the replay
+that made the host ready, not only at the next scheduler pass, and once more
+under the session's input lease immediately before a coordinator answer is
+typed.
 
 The first repository enrollment enables this delegation by default:
 

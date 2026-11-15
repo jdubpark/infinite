@@ -270,6 +270,18 @@ test("an owner halt holds a request: no turn, no record and no delivery until th
   f.core.next = () => allow();
   decided(await f.pipeline.decide(pending), "allow");
   assert.equal(f.pipeline.applicable(earlier.decisionId), true);
+
+  // A halt recorded while a review runs reaches every later turn of that review through its context.
+  const seen: boolean[] = [];
+  f.core.next = (_request, context) => {
+    seen.push(context.held?.() === true);
+    f.halted.add("alpha-app");
+    seen.push(context.held?.() === true);
+    return allow();
+  };
+  await f.pipeline.decide(request({ action: "npm run lint" }));
+  assert.deepEqual(seen, [false, true]);
+  assert.equal(f.pipeline.halted("alpha-app"), true);
 }));
 
 test("the adapter's evidence collection reaches the review, and no collection exists without it", () => withFixture(async f => {

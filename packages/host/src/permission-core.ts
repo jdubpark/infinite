@@ -128,6 +128,7 @@ export function createPermissionAgentCore(options: PermissionCoreOptions): Permi
     if (timeoutMs <= 0 || context.signal?.aborted) return undefined;
     const outcome = await launcher.run({
       purpose, tier, profile, timeoutMs, signal: context.signal,
+      ...(context.held ? { held: context.held } : {}),
       system: turnSystemText(report, context),
       prompt: turnPrompt(request, context, evidence),
       schema: reportJsonSchema(report),

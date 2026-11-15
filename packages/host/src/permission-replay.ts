@@ -270,7 +270,11 @@ export class PermissionReplayJobs {
   private readonly jobs = new Map<string, ReplayJob>();
   private readonly byRequest = new Map<string, { digest: string; jobId: string }>();
 
-  constructor(private readonly deps: { core: () => PermissionAgentCoreService | undefined; measurements?: PermissionMeasurements; concurrency?: number; now?: () => Date }) {}
+  constructor(private readonly deps: {
+    core: () => PermissionAgentCoreService | undefined; measurements?: PermissionMeasurements; concurrency?: number; now?: () => Date;
+    /** A job ended and its result is recorded. A passing replay can make the host ready, so the caller reads its authority again. */
+    onSettled?: () => void;
+  }) {}
 
   current(): ReplayJob | undefined {
     return [...this.jobs.values()].find(job => job.state === "running");
@@ -303,7 +307,10 @@ export class PermissionReplayJobs {
         job.state = "failed";
         job.error = error instanceof PermissionReviewHeld ? "A reviewer launch was held by the launch gate." : "The replay could not finish.";
       })
-      .finally(() => { job.finishedAt = now().toISOString(); });
+      .finally(() => {
+        job.finishedAt = now().toISOString();
+        try { this.deps.onSettled?.(); } catch { /* The job's record stands without it. */ }
+      });
     return { job };
   }
 }

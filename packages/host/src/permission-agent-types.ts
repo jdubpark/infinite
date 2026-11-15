@@ -127,6 +127,11 @@ export interface PermissionReviewContext {
   canAllow: boolean;
   /** Bounded read-only collection of source paths that the strong model asked for (at most eight). */
   collect?: (paths: string[]) => Promise<PermissionEvidence>;
+  /**
+   * True while an owner halt covers the request's project. It is read before every turn of the review, so a
+   * halt that is recorded after the light turn still holds the strong turn. A held turn does not start.
+   */
+  held?: () => boolean;
   signal?: AbortSignal;
 }
 
@@ -222,6 +227,8 @@ export interface PermissionPipeline {
    * authority, the host is ready, no owner halt covers it, and no revoke, regrouping or direction change retired it.
    */
   applicable(decisionId: string): boolean;
+  /** Whether an owner halt covers the project now. A pipeline without a halt source leaves it out. */
+  halted?(projectId: string): boolean;
   /** Linked delivery events. The decision is in the journal before the first one. */
   recordDelivery(decisionId: string, kind: PermissionDelivery["kind"], detail?: string): void;
   /** A task ended: its open rejects close and its locks end. */

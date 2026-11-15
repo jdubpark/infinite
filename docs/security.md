@@ -416,11 +416,13 @@ under an ended authority is never applied and never replayed. On a host that
 is not ready the agent serves no request.
 
 The host reads a decision's authority again once it holds the session's input
-lease, immediately before the first key. A revoke, a changed delegation, an
-onboarding opt-out and an owner regrouping are acknowledged only after every
-answer that is already with a session under the ended authority is fenced at
-that session's worker: the worker drops the host's lease and sends nothing
-more for that decision. A key that the worker sent before the fence arrived
+lease, immediately before the first key. Every API write is acknowledged only
+after the host has fenced each answer that is already with a session under an
+authority that no longer applies, so a revoke, a changed delegation, an
+onboarding opt-out, an owner regrouping or removal of a workspace, and an owner
+halt cannot be acknowledged while such an answer can still be typed. The fence
+is applied once for all writes, not route by route. At the fence the session's
+worker drops the host's lease and sends nothing more for that decision. A key that the worker sent before the fence arrived
 stays sent. When a fence cannot be confirmed, the reply carries
 `deliveryFence: "uncertain"` and the CLI prints a line; the decision log shows
 what was delivered.
@@ -464,7 +466,11 @@ neither direction goes to the owner.
 
 The owner's halt stops the permission agent as it stops every other launch.
 While a halt covers a request's project, no reviewer turn starts, and a
-verdict that was recorded before the halt is not delivered. A dialog that was
+verdict that was recorded before the halt is not delivered. The halt is read
+before each turn of a review and again immediately before the reviewer
+process starts, so a halt that is recorded after the light turn holds the
+strong turn, and a verdict reached while the halt was recorded is withheld,
+also from a headless session. A dialog that was
 pending is handed to the agent again after the release and decided from the
 evidence of that time. A host halt, or a halt record that the host cannot
 read, also holds every reviewer launch of a replay. A headless call that

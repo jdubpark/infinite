@@ -308,13 +308,7 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
       pipeline.recordDelivery(outcome.decisionId, "refusal", "Headless: a call that the rules left open cannot wait for the owner; it was denied with needs-owner.");
       return { result: "deny", code: "needs-owner", notice: requesterNotice("needs-owner"), ...issued, interruptClass: outcome.interruptClass };
     }
-    if (outcome.kind === "reject") {
-      // The notice is rebuilt from the code, so no other text can reach the agent.
-      const code = (REJECT_CODES as readonly string[]).includes(outcome.code) ? outcome.code : "unavailable";
-      pipeline.recordDelivery(outcome.decisionId, "intent", "Headless deny returned to the session's hook.");
-      return { result: "deny", code, notice: requesterNotice(code), ...issued };
-    }
-    // An allow: the live checks before it is returned. A team member's run is read again here.
+    // The live checks before a verdict is returned, an allow or a reject. A team member's run is read again here.
     const live = (() => {
       try {
         return realpathSync(this.options.sessions.meta(session.id).session.cwd) === built.requester.sessionRoot &&
@@ -322,8 +316,21 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
       } catch { return false; }
     })();
     if (!live) {
+      // An owner halt that was recorded while the call was decided: the verdict is withheld, as at entry.
+      let halted: boolean;
+      try { halted = pipeline.halted?.(session.projectId) === true; } catch { halted = true; }
+      if (halted) {
+        pipeline.recordDelivery(outcome.decisionId, "stale", "Headless: an owner halt covers the project; the verdict was withheld and the call was denied as unavailable.");
+        return { result: "deny", code: "unavailable", notice: requesterNotice("unavailable") };
+      }
       pipeline.recordDelivery(outcome.decisionId, "stale", "Headless: the decision no longer applies; the call was left to the provider, which denies it.");
       return { result: "not-served" };
+    }
+    if (outcome.kind === "reject") {
+      // The notice is rebuilt from the code, so no other text can reach the agent.
+      const code = (REJECT_CODES as readonly string[]).includes(outcome.code) ? outcome.code : "unavailable";
+      pipeline.recordDelivery(outcome.decisionId, "intent", "Headless deny returned to the session's hook.");
+      return { result: "deny", code, notice: requesterNotice(code), ...issued };
     }
     if (built.destructive && !outcome.strongTier) {
       pipeline.recordDelivery(outcome.decisionId, "refusal", "Headless: a destructive call needs a strong verdict; it was denied.");

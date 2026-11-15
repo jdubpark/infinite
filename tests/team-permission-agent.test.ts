@@ -174,6 +174,72 @@ test("a coordinator review under way when the permission agent starts to serve t
   } finally { await f.close(); }
 });
 
+test("a coordinator answer already inside the manager when the permission agent starts to serve the run is refused under the lease", { timeout: 180000 }, async () => {
+  const f = await fixture("permissions-revoke", lineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const runId = created.body.id as string;
+    await waitFor(() => f.get(runId), run => run.permissionDecisions?.some(decision => decision.status === "reviewing") === true &&
+      existsSync(join(f.receipts, `${runId}.judge-ready`)), 60000);
+    // The coordinator's approved answer is held as it enters the manager, after the team service's own checks passed.
+    let entered = false, release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const service = await f.openTeamService({
+      start: false,
+      manager: manager => {
+        const answer = manager.answerTeamPermission.bind(manager);
+        manager.answerTeamPermission = async (...args) => { entered = true; await held; return answer(...args); };
+      },
+    });
+    // The permission agent is wired but does not serve the project yet, so the coordinator review decides.
+    let served = false;
+    const { pipeline, calls } = fakePipeline(() => ({ kind: "owner", decisionId: randomUUID(), interruptClass: "credentials" }));
+    pipeline.serves = () => served ? { served: true } : { served: false, reason: "not-covered" };
+    service.usePermissionAgent({ pipeline, delivery: new InteractivePermissionDelivery({ pipeline: () => pipeline, ledger: memoryLedger() }) });
+    service.start();
+    writeFileSync(join(f.receipts, `${runId}.judge-release`), "release", { mode: 0o600 });
+    await waitFor(async () => entered, value => value, 60000);
+    assert.equal(service.get(runId).permissionDecisions![0]!.status, "answering");
+    // The agent starts to serve the run while the answer is in the manager. The scheduler cannot reach a run whose
+    // answer operation is pending, so only the manager's read under its lease stands between the approval and the key.
+    served = true;
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    release();
+    const settled = await waitFor(() => service.get(runId),
+      view => view.permissionDecisions?.every(decision => !["pending", "reviewing", "approved", "answering"].includes(decision.status)) === true, 60000);
+    const decision = settled.permissionDecisions![0]!;
+    assert.notEqual(decision.status, "answered", JSON.stringify(decision));
+    assert.equal(decision.receipt, undefined, "the coordinator's approval sent no key");
+    // The dialog is still open, and it is the permission agent that decides it next.
+    await waitFor(async () => calls.decide.length, count => count > 0, 60000);
+  } finally { await f.close(); }
+});
+
+test("an owner act that makes the permission agent serve a run retires its coordinator reviews at once, without the scheduler", { timeout: 180000 }, async () => {
+  const f = await fixture("permissions-revoke", lineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const runId = created.body.id as string;
+    await waitFor(() => f.get(runId), run => run.permissionDecisions?.some(decision => decision.status === "reviewing") === true &&
+      existsSync(join(f.receipts, `${runId}.judge-ready`)), 60000);
+    // The service is not started, so no scheduler pass runs: only the authority change can retire the review.
+    const service = await f.openTeamService({ start: false });
+    let served = false;
+    const { pipeline } = fakePipeline(() => ({ kind: "owner", decisionId: randomUUID(), interruptClass: "credentials" }));
+    pipeline.serves = () => served ? { served: true } : { served: false, reason: "not-covered" };
+    service.usePermissionAgent({ pipeline, delivery: new InteractivePermissionDelivery({ pipeline: () => pipeline, ledger: memoryLedger() }) });
+    await service.permissionAuthorityChanged();
+    assert.equal(service.get(runId).permissionDecisions![0]!.status, "reviewing", "a run the agent does not serve keeps its review");
+    served = true;
+    await service.permissionAuthorityChanged();
+    const view = service.get(runId);
+    assert.equal(view.permissionDecisions![0]!.status, "stale", JSON.stringify(view.permissionDecisions));
+    assert.ok(view.events.some(event => event.text === "The permission agent now decides this run's provider requests; its coordinator reviews were retired."));
+  } finally { await f.close(); }
+});
+
 test("member instructions say a reject is final and its effect must not be reached another way", () => {
   const run = { id: randomUUID(), projectId: "rehearsal", provider: "claude", title: "t", objective: "o", revision: 1, status: "implementing",
     members: [], tasks: [], decisions: [], checks: [], steering: [], events: [], baseCommit: "a".repeat(40), workspace: "/home/dev/projects/infinite",

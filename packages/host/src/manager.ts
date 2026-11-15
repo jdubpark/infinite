@@ -715,6 +715,8 @@ export class Manager {
     requestId: string,
     team: TeamAssignment,
     decision: TeamPermissionDecision,
+    /** Whether the coordinator's authority to answer still stands. It is read under the control lease, before the key is sent. */
+    current?: () => boolean,
   ): Promise<import("./types.js").Receipt & { result?: import("@infinite/attention").AnswerResult }> {
     const session = this.meta(sessionId).session;
     const stored = session.team;
@@ -764,7 +766,7 @@ export class Manager {
       if (controlled.status !== "running" || controlled.control?.id !== acquired.id ||
           controlled.runtime?.nativeUi || session.runtime?.nativeUi)
         throw new ContentError("The team member or its control lease changed before the answer");
-      if (decision.status !== "answering" || Date.parse(decision.expiresAt) <= Date.now())
+      if (decision.status !== "answering" || Date.parse(decision.expiresAt) <= Date.now() || (current && !current()))
         throw new ContentError("The permission decision was invalidated before the answer");
       try {
         return await workerCall(this.config.runDir, sessionId, {

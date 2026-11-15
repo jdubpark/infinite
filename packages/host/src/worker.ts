@@ -37,7 +37,7 @@ import {
 } from "@infinite/attention";
 import { Journal, writeSealed } from "./vault.js";
 import { socketPath } from "./ipc.js";
-import { startHookServer, HookPayloadError, type HookReply, type HookRoute } from "./hooks.js";
+import { startHookServer, HookPayloadError, type HookAnswer, type HookReply, type HookRoute } from "./hooks.js";
 import { teamReportEnvelopeSchema, type TeamAssignment } from "./team-types.js";
 import { missionReportEnvelopeSchema } from "./mission-types.js";
 import { agentAcceptOption, isCollapsedPermissionPrompt, oneShotRejectOption, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
@@ -45,7 +45,9 @@ import { SESSION_PERMISSION_ACTOR_LABEL, permissionChoices } from "./permission-
 import type { TranscriptMessage } from "./transcript.js";
 import { TranscriptWatch, closesTurn } from "./transcript-watch.js";
 import { drainLaunch, runFinalDrain } from "./final-drain.js";
-import { buildLaunch } from "./launch.js";
+import { buildLaunch, headlessResumeProfile } from "./launch.js";
+import { channelToken } from "./permission-headless.js";
+import { HeadlessChannelWorker } from "./permission-headless-worker.js";
 import { addProjectIdToLaunchEnv } from "./worker-env.js";
 import { claudeConfigPath, recordClaudeTrust } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
@@ -339,7 +341,12 @@ function onTranscript(body: unknown): HookReply | void {
 let handoffReceipt: string | undefined;
 let handoffStopping = false;
 let handoffInFlight = false;
-async function onHook(route: HookRoute, body: unknown): Promise<HookReply | void> {
+async function onHook(route: HookRoute, body: unknown): Promise<HookReply | HookAnswer | void> {
+  // Only the permission channel's own hook command calls these routes, and only in a session the host admitted.
+  if (route === "permission-check" || route === "permission-request") {
+    if (!permissionChannel) throw new HookPayloadError(404);
+    return route === "permission-check" ? permissionChannel.check(body) : permissionChannel.request(body);
+  }
   if (route === "team-handoff") {
     const parsed = handoffEnvelopeSchema.safeParse(body);
     if (!parsed.success || !session.handoff?.policy) throw new HookPayloadError(400);
@@ -555,7 +562,8 @@ function watchLimit(lines: string[], nowMs: number, freshOutput: boolean) {
 
 /** Runs after every output flush and once a second. */
 function checkScreen() {
-  if (state.status !== "running") return;
+  // While a deferred call waits, no provider runs and the owner prompt is the channel's.
+  if (state.status !== "running" || permissionChannel?.waiting()) return;
   try {
     const lines = screen().split("\n");
     const detected = detectPrompt(lines, provider);
@@ -743,6 +751,8 @@ function deliver(
   }
   checkControl(request);
   if (handoffReceipt && request.op !== "stop") throw new Error("This session yielded to a team; further input is disabled");
+  // No provider runs while a deferred call waits: input would be lost, so it stays with the client. Stop retires the call.
+  if (permissionChannel?.waiting() && request.op !== "stop") throw new Refusal("prompt-open");
   if (state.status !== "running" || !child)
     throw new Error("Session is not running");
   // Text and Enter typed over an open dialog would pick its highlighted option. Only a
@@ -772,6 +782,7 @@ function deliver(
     digest,
   };
   receipts.set(request.requestId, receipt);
+  let retireWaiting = false;
   if (request.op === "input") {
     // Bracketed paste keeps embedded newlines inside one prompt.
     child.write(
@@ -792,7 +803,8 @@ function deliver(
         tab: "\t",
       }[request.key],
     );
-  } else {
+  } else if (permissionChannel?.waiting()) retireWaiting = true;
+  else {
     transcriptWatch.stopRequested();
     child.kill("SIGTERM");
   }
@@ -804,6 +816,7 @@ function deliver(
   receipt.state = "delivered";
   receipt.seq = result.seq;
   refreshControl(request);
+  if (retireWaiting) permissionChannel!.retire("stopped");
   return publicReceipt(receipt);
 }
 
@@ -1419,7 +1432,12 @@ const server = createServer((socket) => {
         });
       } else if (request.op === "answer") {
         if (!validAnswer(request)) throw new Error("Invalid answer request");
-        result = await serialize(() => answer(request));
+        result = await serialize(() => {
+          if (!permissionChannel?.owns(request.promptId, request.requestId)) return answer(request);
+          // The owner's answer to a deferred call: the same control rules as a dialog answer.
+          if (!request.missionManaged) checkControl(request);
+          return permissionChannel.answer(request);
+        });
       } else if (request.op === "team-answer") {
         if (!validTeamAnswer(request)) throw new Error("Invalid delegated answer request");
         result = await serialize(() => answer(request));
@@ -1479,11 +1497,34 @@ const server = createServer((socket) => {
 // ---- Launch ---------------------------------------------------------------------------------
 
 const hookToken = randomBytes(32).toString("hex");
+let resumeProvider: ((nativeSessionId: string) => void) | undefined;
+let endSession: (() => void) | undefined;
+// The headless permission channel, only when the host admitted this session to it at launch.
+const permissionChannel = config.permissionChannel && session.headless?.channel && provider === "claude"
+  ? new HeadlessChannelWorker({
+      sessionId: session.id,
+      token: channelToken(key, session.id),
+      socket: config.permissionChannel.socket,
+      record: data => append("lifecycle", { permissionChannel: data }).seq,
+      openPrompt: prompt => record({ kind: "prompt-open", prompt }, "protocol").seq,
+      closePrompt: (promptId, label) => {
+        if (attention.prompt?.id === promptId) record({ kind: "prompt-closed", promptId, reason: "answered-here", label }, "host");
+      },
+      publish: view => { state = { ...state, permissionChannel: view }; persist(); },
+      resume: nativeSessionId => {
+        if (!resumeProvider) throw new Error("The provider cannot be resumed");
+        resumeProvider(nativeSessionId);
+      },
+      end: () => endSession?.(),
+      refusal: code => new Refusal(code),
+    })
+  : undefined;
+if (permissionChannel) setInterval(() => permissionChannel.tick(), 60_000).unref();
 // Ordinary native arguments stay exact unless a scoped handoff policy was captured.
 const wantsHooks =
   !session.runtime?.nativeUi &&
   (Boolean(session.handoff?.policy) || session.nativeArgs === undefined) &&
-  (Boolean(session.handoff?.policy) || Boolean(session.team) || provider === "demo" ||
+  (Boolean(session.handoff?.policy) || Boolean(session.team) || provider === "demo" || Boolean(permissionChannel) ||
     (provider === "claude" && config.attention.hooks.claude) ||
     (provider === "codex" && config.attention.hooks.codex));
 // Hooks only add precision; the screen heuristics still work if the listener cannot start.
@@ -1555,6 +1596,7 @@ server.listen(socketPath(runDir, session.id), async () => {
           catch (error) { journal.append("lifecycle", { workspaceTrust: "unrecorded", reason: error instanceof Error ? error.message : String(error) }); }
       }
     }
+    if (permissionChannel && !hookServer) throw new Error("The permission channel could not start");
     if (hookServer) {
       env.INFINITE_HOOK_URL = hookServer.url;
       env.INFINITE_HOOK_TOKEN = hookToken;
@@ -1576,6 +1618,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       session.teamModelProfile,
       session.handoff?.policy ? session.id : undefined,
       session.workspaceTrusted ? session.cwd : undefined,
+      Boolean(permissionChannel),
     );
     if (session.runtime?.nativeUi === "codex") {
       if (session.workspace) {
@@ -1696,13 +1739,14 @@ server.listen(socketPath(runDir, session.id), async () => {
           checkScreen();
         }, 40);
     };
-    child.onData((data) => {
+    const onData = (data: string) => {
       if (snapshotQueue) {
         snapshotQueue.push(() => output(data));
         snapshotBytes += Buffer.byteLength(data, "utf8");
         if (snapshotBytes > 2 * 1024 * 1024) abortSnapshot?.(new Error("Snapshot output queue is full"));
       } else output(data);
-    });
+    };
+    child.onData(onData);
     /** After the provider exited, the relay reads the transcript once more, for at most FINAL_DRAIN_MS. Never rejects. */
     const finalDrain = async () => {
       try {
@@ -1722,6 +1766,8 @@ server.listen(socketPath(runDir, session.id), async () => {
       } catch { /* A failed drain loses the rows it did not read; the coverage record says so. */ }
     };
     const exited = (exitCode: number) => {
+      // The provider ended its run on a deferred call: the session stays open for the owner's answer.
+      if (permissionChannel?.exited(exitCode)) return;
       native?.stop();
       void hybrid?.close().catch(() => {}); executor?.close();
       try {
@@ -1745,10 +1791,28 @@ server.listen(socketPath(runDir, session.id), async () => {
         setTimeout(finish, 1500);
       })();
     };
-    child.onExit(({ exitCode }) => {
+    const onExit = ({ exitCode }: { exitCode: number }) => {
       if (snapshotQueue) snapshotQueue.push(() => exited(exitCode));
       else exited(exitCode);
-    });
+    };
+    child.onExit(onExit);
+    // The owner answered a deferred call: the same conversation continues in this session, with the channel.
+    resumeProvider = nativeSessionId => {
+      const next = buildLaunch(
+        provider, headlessResumeProfile(profile, nativeSessionId), "",
+        hookServer ? { url: hookServer.url, token: hookToken } : null, relayPath, config.attention.hooks,
+        Boolean(session.team), session.teamModelProfile, session.handoff?.policy ? session.id : undefined,
+        session.workspaceTrusted ? session.cwd : undefined, true,
+      );
+      const pty = spawn(next.command, next.args, { cwd: session.cwd, env, cols: terminal.cols, rows: terminal.rows, name: "xterm-256color" });
+      child = pty;
+      state = { ...state, status: "running", pid: pty.pid };
+      append("lifecycle", { status: "running", pid: pty.pid, permissionChannel: { event: "resumed" } });
+      persist();
+      pty.onData(onData);
+      pty.onExit(onExit);
+    };
+    endSession = () => exited(0);
   } catch (error) {
     state = { ...state, status: "exited", exitCode: 1 };
     publish(applyLifecycle(attention, "exited", new Date().toISOString()));

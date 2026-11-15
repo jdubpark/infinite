@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync,
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes, randomUUID } from "node:crypto";
-import { buildLaunch, missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "../packages/host/src/launch.js";
+import { buildLaunch, headlessLaunch, headlessResumeProfile, missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "../packages/host/src/launch.js";
 import { addProjectIdToLaunchEnv } from "../packages/host/src/worker-env.js";
 import { claudeConfigPath, recordClaudeTrust } from "../packages/host/src/workspace-trust.js";
 import { DEFAULT_HOOKS, readConfig } from "../packages/host/src/config.js";
@@ -82,6 +82,8 @@ test("claude gets --settings with relay command hooks before the prompt", () => 
   const i = launch.args.indexOf("--settings");
   assert.ok(i > 0);
   const settings = JSON.parse(launch.args[i + 1]);
+  // A project settings file must not be able to switch the host's hooks off.
+  assert.equal(settings.disableAllHooks, false);
   const events = Object.keys(settings.hooks).sort();
   assert.deepEqual(events, ["Elicitation", "Notification", "PermissionDenied", "PermissionRequest", "PostToolUse", "PostToolUseFailure", "PreToolUse", "SessionEnd", "Stop", "StopFailure", "UserPromptSubmit"]);
   const handler = settings.hooks.PreToolUse[0].hooks[0];
@@ -399,4 +401,45 @@ test("codex hooks stay off unless the config turns them on", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("a served headless Claude launch loads only the host's settings, with the channel hooks beside the signal relay", () => {
+  const launch = buildLaunch("claude", { command: "claude", args: ["-p"] }, "go", hooks, relay, enabled, false, undefined, undefined, undefined, true);
+  const sources = launch.args.indexOf("--setting-sources");
+  assert.equal(launch.args[sources + 1], "");
+  assert.equal(launch.args.filter(arg => arg === "--settings").length, 1);
+  const settings = JSON.parse(launch.args[launch.args.indexOf("--settings") + 1]);
+  assert.equal(settings.disableAllHooks, false);
+  const commands = (event: string) => settings.hooks[event][0].hooks.map((hook: { command: string; timeout: number }) => [hook.command.split(" ").slice(-2).join(" "), hook.timeout]);
+  assert.deepEqual(commands("PreToolUse"), [["/opt/infinite/packages/host/dist/hook-relay.js claude", 10], ["/opt/infinite/packages/host/dist/permission-hook.js check", 30]]);
+  // The relay would open a hook-only prompt and push the owner while the permission agent decides.
+  assert.deepEqual(commands("PermissionRequest"), [["/opt/infinite/packages/host/dist/permission-hook.js request", 360]]);
+  assert.equal(settings.hooks.PreToolUse[0].hooks[1].command.split(" ")[0], process.execPath);
+  assert.equal(launch.args.at(-1), "go");
+  // Without the signal hooks only the channel hooks remain.
+  const quiet = JSON.parse(buildLaunch("claude", { command: "claude", args: ["-p"] }, "", hooks, relay, { claude: false, codex: false }, false, undefined, undefined, undefined, true).args.at(-1)!);
+  assert.deepEqual(Object.keys(quiet.hooks).sort(), ["PermissionRequest", "PreToolUse"]);
+});
+
+test("the launch reader finds headless launches, their allow rules, and what the channel cannot serve", () => {
+  const claude = (...args: string[]) => headlessLaunch("claude", { command: "claude", args });
+  assert.deepEqual(claude("--model", "opus"), { headless: false, allowlist: [] });
+  assert.deepEqual(claude("--print", "--allowedTools", "Bash(git status)", "Read"), { headless: true, allowlist: ["Bash(git status)", "Read"] });
+  assert.deepEqual(claude("-p", "--allowedTools=Bash(git log:*),Read Edit").allowlist, ["Bash(git log:*)", "Read", "Edit"]);
+  assert.equal(claude("--print=false").headless, false);
+  assert.match(claude("-p", "--permission-mode", "dontAsk").unservable ?? "", /dontAsk/);
+  assert.match(claude("-p", "--permission-mode=acceptEdits").unservable ?? "", /acceptEdits/);
+  assert.equal(claude("-p", "--permission-mode", "default").unservable, undefined);
+  for (const flag of ["--setting-sources", "--permission-prompt-tool", "--fork-session", "--no-session-persistence", "--bare"])
+    assert.match(claude("-p", flag).unservable ?? "", new RegExp(flag));
+  assert.equal(headlessLaunch("claude", { command: "sudo", args: ["-n", "-u", "agent", "--", "/usr/local/bin/claude", "-p"] }).headless, true);
+  assert.match(headlessLaunch("opencode", { command: "opencode", args: ["run"] }).unservable ?? "", /OpenCode/);
+});
+
+test("an in-place resume replaces the profile's own continuation and keeps the sudo wrapper", () => {
+  assert.deepEqual(headlessResumeProfile({ command: "claude", args: ["-p", "--session-id", "old", "--continue", "--model", "opus"] }, "conv_1").args,
+    ["-p", "--model", "opus", "--resume", "conv_1"]);
+  assert.deepEqual(headlessResumeProfile({ command: "sudo", args: ["-u", "agent", "--", "/usr/local/bin/claude", "-p", "--resume=old"] }, "conv_1").args,
+    ["-u", "agent", "--", "/usr/local/bin/claude", "-p", "--resume", "conv_1"]);
+  assert.throws(() => headlessResumeProfile({ command: "claude", args: [] }, "bad id"), /Invalid/);
 });

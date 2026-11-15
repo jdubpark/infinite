@@ -280,6 +280,42 @@ export interface PermissionDeliveryService {
   holder(sessionId: string, promptId: number): "agent" | "owner" | "undecided";
 }
 
+/* ---------------------------------------------------------------- headless channel */
+
+/** One headless session as `permissions status` lists it. */
+export interface HeadlessSessionStatus {
+  sessionId: string;
+  projectId: string;
+  title: string;
+  provider: string;
+  /**
+   * `served`: launched with the channel and its first hook call arrived. `admitted`: launched with the channel, and
+   * no hook call has arrived yet, so it behaves as before. `not-served`: handled as before, for `reason`.
+   */
+  state: "served" | "admitted" | "not-served";
+  reason?: string;
+  /** The one call of this session that waits for the owner. */
+  waiting?: { interruptClass: string; tool: string; since: string; expiresAt: string };
+}
+
+/** An allow rule of a served session's launch profile that a class rule outranks: such a call waits for the owner. */
+export interface HeadlessShadowedRule {
+  sessionId: string;
+  rule: string;
+  interruptClass: InterruptClass;
+  classRule: string;
+}
+
+export interface HeadlessChannelStatus {
+  sessions: HeadlessSessionStatus[];
+  shadowed: HeadlessShadowedRule[];
+}
+
+/** The headless permission channel for Claude Code `--print` sessions. */
+export interface PermissionHeadlessChannel {
+  status(): Promise<HeadlessChannelStatus>;
+}
+
 /* ---------------------------------------------------------------- wiring */
 
 /** The parts that exist on this host. A missing part means the requests it would serve are handled as before. */
@@ -287,4 +323,5 @@ export interface PermissionAgentServices {
   core?: PermissionAgentCore;
   pipeline?: PermissionPipeline;
   delivery?: PermissionDeliveryService;
+  headless?: PermissionHeadlessChannel;
 }

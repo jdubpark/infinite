@@ -85,6 +85,17 @@ export interface Session {
   nativeArgs?: string[];
   runtime?: SessionRuntime;
   workspace?: LaptopWorkspace;
+  /** Host-owned: a headless launch, whether the permission channel serves it, and why not. */
+  headless?: { channel: boolean; reason?: string; allowlist?: string[] };
+}
+/** The permission channel's live view of a headless session. */
+export interface PermissionChannelView {
+  /** The session was launched with the channel and its first hook call arrived. */
+  served: boolean;
+  /** The one deferred call that waits for the owner. */
+  waiting?: { interruptClass: string; tool: string; since: string; expiresAt: string };
+  /** The latest request of this session that needed the owner and could not wait. The notifier pushes it once. */
+  notice?: { id: string; interruptClass?: string; at: string };
 }
 export interface Event {
   seq: number;
@@ -208,6 +219,7 @@ export interface WorkerState {
   runtime?: SessionRuntime;
   nativeSession?: { id: string; source: "hook" | "protocol" };
   execution?: ExecutionState;
+  permissionChannel?: PermissionChannelView;
 }
 export interface InputControl {
   actor?: ControlActor;
@@ -316,6 +328,8 @@ export interface Bootstrap {
   key: string;
   prompt: string;
   executorTokenHash?: string;
+  /** Set only when the host admitted this headless session to the permission channel. */
+  permissionChannel?: { socket: string };
   attention: {
     hooks: { claude: boolean; codex: boolean };
     idleAfterMs: number;

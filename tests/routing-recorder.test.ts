@@ -50,7 +50,7 @@ const runOf = (lineup: TeamLineup, routing: TeamRun["routing"], id = "run-1", pr
 const taskOf = (id: string, extra: Record<string, unknown> = {}) =>
   ({ id, title: id, instructions: "do it", paths: PATHS, dependsOn: [], revision: 1, status: "pending", ...extra }) as unknown as TeamTask;
 const startOf = (run: TeamRun, task: TeamTask, extra: Partial<RouterStart> = {}): RouterStart =>
-  ({ run, task, publishHeads: false, entryTools: false, featureMap: undefined, limited: new Set(), ...extra });
+  ({ run, task, publishHeads: false, entryTools: false, objectiveDigest: false, featureMap: undefined, limited: new Set(), ...extra });
 const recorder = (store: EvidenceStore, lines: string[] = [], clock?: () => number) =>
   new RoutingRecorder({ store, now: () => NOW, clock, log: line => lines.push(line) });
 const rowsOf = (store: EvidenceStore, runId: string, taskId: string) => store.read(db => taskDecisions(db, runId, taskId)).rows;
@@ -343,6 +343,16 @@ test("an advanced epoch makes that identity's rows earlier, OpenCode by its vari
   const posteriorOf = (id: string) => payload.candidates.find(candidate => candidate.profileId === id)!.posterior!;
   assert.deepEqual([posteriorOf("oc-high").rows.production, posteriorOf("oc-high").earlierRows], [0, 3]);
   assert.deepEqual([posteriorOf("astra-xhigh").rows.production, posteriorOf("astra-xhigh").earlierRows], [2, 0]);
+}));
+
+test("the objective digest flag chooses the prompt version the row records", () => withStore(store => {
+  const astra = mixedLineup.implementers[1]!;
+  const plain = versionOf(astra), withRecord = promptVersion("implementer", astra.provider, astra, false, false, true);
+  assert.notEqual(plain, withRecord, "the record digest changes the prompt version");
+  const run = runOf(mixedLineup, pinRouting(undefined, "autonomous", mixedLineup), "run-objective");
+  recorder(store).recordStart(startOf(run, taskOf("task-a", { agentProfileId: "astra-xhigh" }), { objectiveDigest: true }));
+  const payload = rowsOf(store, run.id, "task-a")[0]!.payload!;
+  assert.deepEqual(payload.current.map(entry => entry.promptVersion), [withRecord]);
 }));
 
 test("publishHeads and entryTools choose the prompt version the row is counted against", () => withStore(store => {

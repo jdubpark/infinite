@@ -4767,6 +4767,7 @@ export class TeamService {
     const run = stored.run, member = this.newMember(run, role, "", run.headCommit!, task?.id);
     if (role === "implementer" && task && run.routing && this.router)
       this.router.recordStart({ run, task: task as TeamTask, publishHeads: this.publishHeadsEnabled(), entryTools: entryToolsFor(run, "implementer"),
+        objectiveDigest: Boolean(stored.run.goal?.record),
         featureMap: (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features, limited: this.limits.limited() });
     const continuationHead = role === "project-manager" && stored.continuationHead?.revision === run.revision
       ? structuredClone(stored.continuationHead) : undefined;

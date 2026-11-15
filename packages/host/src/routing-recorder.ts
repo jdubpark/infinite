@@ -17,6 +17,8 @@ export type RouterStart = {
   task: TeamTask;
   publishHeads: boolean;
   entryTools: boolean;
+  /** Whether the run is a goal cycle with a record: the member's prompt version then carries the record digest. */
+  objectiveDigest: boolean;
   featureMap: FeatureMap | undefined;
   limited: ReadonlySet<Provider>;
 };
@@ -94,7 +96,7 @@ export class RoutingRecorder {
     const versions = new Map<string, { profile: TeamModelProfile; version: string }>();
     for (const item of kept) {
       if (versions.has(item.identity)) continue;
-      const version = promptVersion("implementer", item.profile.provider, item.profile, input.publishHeads, input.entryTools);
+      const version = promptVersion("implementer", item.profile.provider, item.profile, input.publishHeads, input.entryTools, input.objectiveDigest);
       versions.set(item.identity, { profile: item.profile, version });
     }
 

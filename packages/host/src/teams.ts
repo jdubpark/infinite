@@ -319,6 +319,8 @@ const coordinatorReviewLive = (run: TeamRun) =>
   run.members.some(member => member.revision === run.revision && member.role === "permission-coordinator" && activeMember(member)) ||
   (run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering"].includes(decision.status)) ||
   (run.permissionRecovery?.requests ?? []).some(request => livePermissionRecoveryStatuses.has(request.status));
+const coordinatorRetiredEvent = "The permission agent now decides this run's provider requests; its coordinator reviews were retired.";
+const coordinatorRetiredReason = "The permission agent now decides this run's provider requests; the coordinator review has no authority to answer.";
 /** One hand-off of a member dialog to the permission agent, by `sessionId:promptId:promptHash:evidenceHash`. In memory only. */
 type AgentHandOff = { runId: string; running: boolean; attempted: boolean; at: number; expandedAt?: number;
   outcome?: { request: PermissionRequest; handled: PermissionHandled } };
@@ -3101,8 +3103,10 @@ export class TeamService {
             // A member back from an outage may come back straight into a prompt; it is running again.
             if (state.status === "running" && member.status === "unavailable" && member.role !== "permission-coordinator") member.status = "running";
             // A served run's dialogs go to the permission agent; the coordinator review path runs only for the others.
-            if (this.agentServes(stored)) this.handOffPermission(stored, member, state);
-            else if (!this.agentBusy(run.id) && await this.maybeStartPermissionReview(stored, member, state)) return;
+            if (this.agentServes(stored)) {
+              await this.retireCoordinatorReviews(stored);
+              this.handOffPermission(stored, member, state);
+            } else if (!this.agentBusy(run.id) && await this.maybeStartPermissionReview(stored, member, state)) return;
             if (["unavailable", "recording-error"].includes(state.status)) { member.status = "unavailable"; run.reason = runtimeUnavailableReason; }
             // A prompt that waits on a person outranks one under review.
             else if (state.attention.state === "needs-you") {
@@ -3315,6 +3319,7 @@ export class TeamService {
     const run = stored.run;
     if (!run.permissions || run.permissionsRevokedAt || stored.halt || ["paused", "cancelled", "blocked"].includes(run.status))
       return "The run is paused, stopped, blocked, or its permission policy was revoked.";
+    if (this.agentServes(stored)) return coordinatorRetiredReason;
     if (request.revision !== run.revision || request.targetMemberId !== target.memberId || request.targetSessionId !== target.sessionId ||
         target.revision !== run.revision || target.role === "permission-coordinator" || !activeMember(target))
       return "The target member assignment is no longer current.";
@@ -3445,6 +3450,16 @@ export class TeamService {
     const services = this.permissionAgent, run = stored.run;
     if (!services?.delivery || !services.pipeline || run.permissionsRevokedAt) return false;
     try { return services.pipeline.serves(run.projectId).served; } catch { return false; }
+  }
+  /**
+   * The authority switch for a run in flight: once the permission agent serves the run, its pinned coordinator
+   * policy decides nothing more. Reviews that are pending or approved are retired without an answer, and an
+   * answer in flight is fenced at the worker.
+   */
+  private async retireCoordinatorReviews(stored: Stored) {
+    if (!(stored.run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering"].includes(decision.status))) return;
+    this.event(stored, coordinatorRetiredEvent);
+    await this.invalidatePermissionDecisions(stored, coordinatorRetiredReason, false);
   }
   /** Whether the permission agent holds the member's open dialog now: a hand-off or its display expansion is under way. */
   private agentHolds(sessionId: string, promptId: number | undefined) {
@@ -3676,7 +3691,7 @@ export class TeamService {
   private async maybeStartPermissionReview(stored: Stored, target: TeamMember, observedState?: Awaited<ReturnType<Manager["state"]>>) {
     const run = stored.run;
     if (!run.permissions || run.permissionsRevokedAt || target.status !== "running" || stored.halt ||
-        ["paused", "cancelled", "blocked"].includes(run.status) || target.revision !== run.revision) return false;
+        ["paused", "cancelled", "blocked"].includes(run.status) || target.revision !== run.revision || this.agentServes(stored)) return false;
     if (run.members.some(member => {
       if (member.memberId === target.memberId || member.revision !== run.revision || member.role !== "permission-coordinator" || !activeMember(member)) return false;
       const decision = permissionCoordinatorDecision(run, member);
@@ -3826,7 +3841,7 @@ export class TeamService {
     const reviewer = this.reviewerProfile(run);
     if (!run.permissions || run.permissionsRevokedAt || stored.halt || ["paused", "cancelled", "blocked"].includes(run.status) ||
         target.status !== "running" || target.revision !== run.revision || !run.lineup || !reviewer ||
-        !run.lineup.permissionReviewer && run.lineup.coordinator.tier !== "strong")
+        !run.lineup.permissionReviewer && run.lineup.coordinator.tier !== "strong" || this.agentServes(stored))
       return stopRecovery("The current run authority no longer permits a fresh permission review.");
     if (recovery && (recovery.policyHash !== digest(run.permissions) || !Number.isFinite(Date.parse(recovery.expiresAt)) || Date.now() >= Date.parse(recovery.expiresAt)))
       return stopRecovery("The original permission policy or recovery deadline is no longer current.");
@@ -4220,6 +4235,7 @@ export class TeamService {
   private async permissionAnswerInvalidReason(stored: Stored, decision: TeamPermissionDecision, coordinator?: TeamMember) {
     const run = stored.run;
     if (!run.permissions || run.permissionsRevokedAt || stored.halt || ["paused", "cancelled", "blocked"].includes(run.status)) return "The team is paused, stopped, blocked, or its permission policy was revoked.";
+    if (this.agentServes(stored)) return coordinatorRetiredReason;
     if (decision.purpose === "diagnose" || decision.option < 0) return "A diagnostic permission review has no authority to answer a provider prompt.";
     if (decision.status !== "approved" || decision.revision !== run.revision || coordinator &&
         (coordinator.revision !== run.revision || decision.coordinatorMemberId !== coordinator.memberId || decision.targetMemberId === coordinator.memberId))
@@ -4346,7 +4362,7 @@ export class TeamService {
       // The owner may have answered during the asynchronous checks above; nothing reviewed before that answer may deliver.
       if (decision.authorityHash !== ownerAuthorityHash(run))
         return { status: "escalated" as const, reason: "The owner's steering or answers changed while the target session was being checked." };
-      if (decision.status !== "approved" || !run.permissions || run.permissionsRevokedAt || stored.halt ||
+      if (decision.status !== "approved" || !run.permissions || run.permissionsRevokedAt || stored.halt || this.agentServes(stored) ||
           ["paused", "cancelled", "blocked"].includes(run.status) || decision.revision !== run.revision ||
           (coordinator && decision.coordinatorMemberId !== coordinator.memberId) || decision.policyHash !== digest(run.permissions) ||
           Date.now() >= Date.parse(decision.expiresAt))

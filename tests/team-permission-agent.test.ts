@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Prompt } from "@infinite/attention";
 import { claimControl, waitFor } from "./helpers.js";
@@ -144,6 +144,34 @@ test("a person holding input control keeps the dialog: nothing is decided or sen
     assert.equal(run.calls.deliveries.length, 0);
     assert.equal(run.delivery.holder(run.target.sessionId, run.prompt.id), "owner", "the notifier treats it as the person's, as today");
   } finally { await run.f.close(); }
+});
+
+test("a coordinator review under way when the permission agent starts to serve the run never answers the dialog", { timeout: 180000 }, async () => {
+  // The run starts on a host without the permission agent, so the coordinator review takes the member's dialog.
+  const f = await fixture("permissions-revoke", lineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const runId = created.body.id as string;
+    await waitFor(() => f.get(runId), run => run.permissionDecisions?.some(decision => decision.status === "reviewing") === true &&
+      existsSync(join(f.receipts, `${runId}.judge-ready`)), 60000);
+    // The permission agent becomes ready and serves the project while that review still runs.
+    const service = await f.openTeamService({ start: false });
+    const { pipeline, calls } = fakePipeline(() => ({ kind: "owner", decisionId: randomUUID(), interruptClass: "credentials" }));
+    service.usePermissionAgent({ pipeline, delivery: new InteractivePermissionDelivery({ pipeline: () => pipeline, ledger: memoryLedger() }) });
+    service.start();
+    writeFileSync(join(f.receipts, `${runId}.judge-release`), "release", { mode: 0o600 });
+    const settled = await waitFor(() => service.get(runId),
+      view => view.permissionDecisions?.every(decision => !["pending", "reviewing", "approved", "answering"].includes(decision.status)) === true, 60000);
+    const decision = settled.permissionDecisions![0]!;
+    assert.equal(decision.status, "stale", JSON.stringify(decision));
+    assert.equal(decision.receipt, undefined, "the coordinator's approval sent no key");
+    assert.equal(settled.permissionsRevokedAt, undefined, "the owner revoked nothing; the authority moved to the permission agent");
+    assert.ok(settled.events.some(event => event.text === "The permission agent now decides this run's provider requests; its coordinator reviews were retired."));
+    // The dialog is still open, and it is the permission agent that decides it next.
+    await waitFor(async () => calls.decide.length, count => count > 0, 60000);
+    assert.equal(service.get(runId).permissionDecisions!.length, 1, "no further coordinator review starts for a served run");
+  } finally { await f.close(); }
 });
 
 test("member instructions say a reject is final and its effect must not be reached another way", () => {

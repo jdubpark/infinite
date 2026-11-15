@@ -303,6 +303,12 @@ test("evidence collection reads only inside the session root, within its limits,
     for (const skipped of [/outside\.txt is outside/, /linked\.txt traverses a symlink/, /\.env is excluded/, /large\.json exceeds the 16384-byte/, /exceed the 8-path limit/])
       assert.ok(evidence.limitations.some(line => skipped.test(line)), `limitations name ${skipped}`);
     assert.match(evidence.digest, /^[a-f0-9]{64}$/);
+
+    // What the review read is read again before delivery: a changed source file makes the request stale.
+    assert.equal((await target.check()).ok, true);
+    writeFileSync(join(h.checkout, "src", "retry.ts"), "export const retries = 30;\n");
+    const live = await target.check();
+    assert.deepEqual([live.ok, live.ok ? undefined : live.stale, live.ok ? undefined : live.reason], [false, true, "A source file that the review read changed."]);
   } finally { h.close(); }
 });
 

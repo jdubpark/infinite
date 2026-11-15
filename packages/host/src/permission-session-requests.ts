@@ -335,9 +335,17 @@ export class SessionPermissionRequests {
       authority: this.safe(() => this.parts.authority?.(session.projectId)),
     });
     const answers = new Map<string, Promise<"delivered" | "refused" | "uncertain">>();
+    // What the review read is read again before delivery and must be unchanged.
+    let collected: { paths: string[]; digest: string } | undefined;
+    const check: PermissionInteractiveTarget["check"] = async () => {
+      const live = await this.check(sessionId, request, prompt, sessionRoot, cwd);
+      if (!live.ok || !collected) return live;
+      const again = await this.collect(sessionId, prompt, sessionRoot, cwd, collected.paths);
+      return again.digest === collected.digest ? live : { ok: false, stale: true, reason: "A source file that the review read changed." };
+    };
     return {
       request,
-      check: () => this.check(sessionId, request, prompt, sessionRoot, cwd),
+      check,
       answer: (option, decisionId, notice) => {
         // One decision is answered once. A second call returns the first result and sends nothing.
         const previous = answers.get(decisionId);
@@ -345,7 +353,7 @@ export class SessionPermissionRequests {
         const result = (async () => {
           if (notice !== undefined && !isRequesterNotice(notice)) return "refused" as const;
           // The live checks run again here, so no key is sent to a session a person now controls, whatever the caller checked.
-          const live = await this.check(sessionId, request, prompt, sessionRoot, cwd);
+          const live = await check();
           // A notice comes only with a reject.
           if (!live.ok || !(option === live.reject || option === live.accept && notice === undefined)) return "refused" as const;
           // The notice is typed only after a reject option that takes text; any other reject sends none.
@@ -355,7 +363,11 @@ export class SessionPermissionRequests {
         answers.set(decisionId, result);
         return result;
       },
-      collect: paths => this.collect(sessionId, prompt, sessionRoot, cwd, paths),
+      collect: async paths => {
+        const evidence = await this.collect(sessionId, prompt, sessionRoot, cwd, paths);
+        collected = { paths: Array.isArray(paths) ? [...paths] : [], digest: evidence.digest };
+        return evidence;
+      },
     };
   }
 

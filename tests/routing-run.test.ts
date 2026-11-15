@@ -10,10 +10,19 @@ import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/eviden
 import { outcomeModule } from "../packages/host/src/outcome-store.js";
 import { RoutingRecorder } from "../packages/host/src/routing-recorder.js";
 import { routingModule, taskDecisions } from "../packages/host/src/routing-store.js";
-import type { TeamView } from "../packages/host/src/team-types.js";
+import { promptVersion } from "../packages/host/src/config-identity.js";
+import { entryToolsFor } from "../packages/host/src/entry-roles.js";
+import { featureMapDigest, type FeatureMap } from "../packages/host/src/task-features.js";
+import type { TeamRun, TeamView } from "../packages/host/src/team-types.js";
 
 const TERMINAL = ["ready-for-review", "merged", "blocked", "cancelled"];
 const UNAVAILABLE_LOG = "Routing shadow decision skipped: the evidence store is unavailable.";
+
+/** The stored run, prompts included: the team view strips them. */
+const storedRun = (teams: unknown, id: string): TeamRun => (teams as { record(id: string): { run: TeamRun } }).record(id).run;
+
+/** The stored payloads of a task's decisions, one per revision. */
+const payloadsOf = (store: EvidenceStore, runId: string, taskId: string) => decisionsOf(store, runId, taskId).rows.map(row => row.payload!);
 
 /** The store the recorder writes to: the same modules the server registers before the team service starts. */
 function openStore(databasePath: string, key: Buffer): EvidenceStore {
@@ -54,22 +63,34 @@ async function settleAnswering(teams: { get(id: string): TeamView; answer(id: st
 }
 
 /** A mixed lineup run in the given mode, with a recorder attached to the team service. */
-async function mixedRun(autonomy: "autonomous" | "supervised", blockDatabase = false) {
+async function mixedRun(autonomy: "autonomous" | "supervised", blockDatabase = false, features?: FeatureMap) {
   const f = await fixture("mixed", mixedLineup, {}, { noServer: true });
   const key = readFileSync(f.host.config.keyFile);
   const databasePath = evidenceDatabasePath(f.host.config.stateDir);
   // A regular file where the database should be: the store cannot open, and its modules read unavailable.
   if (blockDatabase) { mkdirSync(dirname(databasePath), { recursive: true }); writeFileSync(databasePath, "not a database"); }
   const store = openStore(databasePath, key);
-  f.host.config.projects.find(project => project.id === "rehearsal")!.autonomy = autonomy;
+  const project = f.host.config.projects.find(item => item.id === "rehearsal")!;
+  project.autonomy = autonomy;
+  if (features) project.team = { ...project.team!, features };
   const logs: string[] = [];
+  // The `limited` set each start receives. An opencode limit is observed when task b first starts: task b's coordinator
+  // profile is codex, and the contributor profile of task a is removed before the limit is read, so no choice changes.
+  const limitedSeen: { taskId: string; limited: Set<string> }[] = [];
   const teams = await f.openTeamService();
-  teams.useRouter(new RoutingRecorder({ store, log: line => logs.push(line) }));
-  return { f, store, teams, logs };
+  const limits = (teams as unknown as { limits: { observe(limit: object): void } }).limits;
+  const recorder = new RoutingRecorder({ store, log: line => logs.push(line) });
+  teams.useRouter({ recordStart: input => {
+    if (input.task.id === "b") limits.observe({ provider: "opencode", detectedAt: new Date().toISOString(), sessionId: "routing-run-test", confidence: "corroborated" });
+    limitedSeen.push({ taskId: input.task.id, limited: input.limited as Set<string> });
+    recorder.recordStart(input);
+  } } as unknown as RoutingRecorder);
+  return { f, store, teams, logs, limitedSeen };
 }
 
 test("a shadow run records each first implementer and runs the coordinator's profiles", { timeout: 240000 }, async () => {
-  const { f, store, teams } = await mixedRun("autonomous");
+  const features: FeatureMap = { areas: [{ id: "host", paths: ["packages/host"] }] };
+  const { f, store, teams, limitedSeen } = await mixedRun("autonomous", false, features);
   try {
     const created = await teams.create(f.create());
     const settled = await settleAnswering(teams, created.id);
@@ -87,15 +108,40 @@ test("a shadow run records each first implementer and runs the coordinator's pro
     assert.ok(profilesOf("a").length >= 1 && profilesOf("a").every(id => id === "spark-high"), JSON.stringify(profilesOf("a")));
     assert.ok(profilesOf("b").length >= 1 && profilesOf("b").every(id => id === "astra-xhigh"), JSON.stringify(profilesOf("b")));
 
-    // No routing value reaches a member's prompt.
-    for (const member of view.members) {
-      assert.ok(!member.prompt?.includes('"routing":'), `${member.role} prompt carries routing`);
+    // No routing value reaches a member's prompt. The team view strips prompts, so read each stored member's prompt.
+    const run = storedRun(teams, created.id);
+    assert.ok(run.routing?.digest, "the run pins a policy digest");
+    const knobNames = ["successValueUsd", "maxExploreShare", "exploreWindow", "minSpareAttempts", "listWeight", "headroomWeight", "allowContributor"];
+    const implementers = run.members.filter(member => member.role === "implementer");
+    assert.ok(implementers.length >= 2, "both tasks' implementers are stored");
+    for (const member of implementers) {
+      assert.ok((member.prompt ?? "").length > 0, `${member.taskId} implementer prompt is empty`);
+    }
+    for (const member of run.members) {
+      const prompt = member.prompt ?? "";
+      assert.ok(!prompt.includes('"routing":'), `${member.role} prompt carries routing`);
+      assert.ok(!prompt.includes(run.routing!.digest), `${member.role} prompt carries the policy digest`);
+      for (const name of knobNames) assert.ok(!prompt.includes(name), `${member.role} prompt carries the knob ${name}`);
       for (const row of [...rowA, ...rowB]) {
-        assert.ok(!member.prompt?.includes(row.key), `${member.role} prompt carries a decision key`);
-        assert.ok(!member.prompt?.includes(row.policyDigest), `${member.role} prompt carries the policy digest`);
-        assert.ok(!member.prompt?.includes(row.seed), `${member.role} prompt carries a seed`);
+        assert.ok(!prompt.includes(row.key), `${member.role} prompt carries a decision key`);
+        assert.ok(!prompt.includes(row.seed), `${member.role} prompt carries a seed`);
       }
     }
+
+    // The recorder receives the run's real settings: the prompt version of the coordinator's profile for the run's
+    // publishHeads and entry tools, the project's feature map, and the limit set.
+    const publishHeads = f.host.config.teams?.publishHeads !== false;
+    const entryTools = entryToolsFor(run, "implementer");
+    const astra = mixedLineup.implementers[1]!;
+    const expectedVersion = promptVersion("implementer", astra.provider, astra, publishHeads, entryTools);
+    for (const payload of [...payloadsOf(store, created.id, "a"), ...payloadsOf(store, created.id, "b")]) {
+      assert.equal(payload.current[0]!.promptVersion, expectedVersion, "the recorded prompt version is the run's");
+      assert.equal(payload.featureMap, featureMapDigest(features), "the recorded feature map is the project's");
+    }
+    // The limit is observed as task b first starts, so the team service reads it on b's later starts.
+    const firstA = limitedSeen.find(item => item.taskId === "a")!, lastB = limitedSeen.filter(item => item.taskId === "b").at(-1)!;
+    assert.deepEqual([...firstA.limited], [], "task a's first start precedes the observed limit");
+    assert.deepEqual([...lastB.limited], ["opencode"], "task b's last start receives the observed opencode limit");
   } finally {
     store.close();
     await f.close();

@@ -373,7 +373,9 @@ test("a member context never carries the feature map, the eval block, or routing
   const checks = [{ command: "npm", args: ["test"] }];
   const project = { checks, features: { areas: [{ id: "host", paths: ["packages/host"] }] }, eval: { capture: true } };
   const plain = { ...base, handoff: { sourceSessionId: "session", checkpointHead: base.baseCommit, deadlineAt: "2026-11-13T12:00:00.000Z", maxMembers: 1, project } } as unknown as TeamRun;
-  const withRouting = { ...base, handoff: { sourceSessionId: "session", checkpointHead: base.baseCommit, deadlineAt: "2026-11-13T12:00:00.000Z", maxMembers: 1, project: { ...project, routing } } } as unknown as TeamRun;
+  // The run's own pinned policy, as a shadow run carries it, alongside the project's saved one.
+  const pinned = { mode: "shadow", requested: "shadow", source: "saved", knobs: { points: ["start"], cascade: false, successValueUsd: 8, maxExploreShare: 0.2, exploreWindow: 50, minSpareAttempts: 4, allowContributor: false, listWeight: 0.25, headroomWeight: 1 }, defaults: [], algorithmVersion: 1, rewardVersion: 1, digest: "d".repeat(64) };
+  const withRouting = { ...base, routing: pinned, handoff: { sourceSessionId: "session", checkpointHead: base.baseCommit, deadlineAt: "2026-11-13T12:00:00.000Z", maxMembers: 1, project: { ...project, routing } } } as unknown as TeamRun;
   const configuredPlain = project as Parameters<typeof teamContext>[2];
   const configuredWith = { ...project, routing } as unknown as Parameters<typeof teamContext>[2];
   const roles = ["project-manager", "scout", "implementer", "integrator", "reviewer"] as const;

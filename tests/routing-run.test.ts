@@ -14,7 +14,7 @@ import { Blackboard } from "../packages/host/src/evidence/blackboard.js";
 import { promptVersion } from "../packages/host/src/config-identity.js";
 import { entryToolsFor } from "../packages/host/src/entry-roles.js";
 import { featureMapDigest, type FeatureMap } from "../packages/host/src/task-features.js";
-import type { TeamRun, TeamView } from "../packages/host/src/team-types.js";
+import { teamGoalContextSchema, type TeamGoalContext, type TeamRun, type TeamView } from "../packages/host/src/team-types.js";
 
 const TERMINAL = ["ready-for-review", "merged", "blocked", "cancelled"];
 const UNAVAILABLE_LOG = "Routing shadow decision skipped: the evidence store is unavailable.";
@@ -148,6 +148,37 @@ test("a shadow run records each first implementer and runs the coordinator's pro
     const firstA = limitedSeen.find(item => item.taskId === "a")!, lastB = limitedSeen.filter(item => item.taskId === "b").at(-1)!;
     assert.deepEqual([...firstA.limited], [], "task a's first start precedes the observed limit");
     assert.deepEqual([...lastB.limited], ["opencode"], "task b's last start receives the observed opencode limit");
+  } finally {
+    store.close();
+    await f.close();
+  }
+});
+
+/** A goal context with a record digest: c0 reads the success text, and c1 is one owner criterion. */
+const goalWithRecord = (): TeamGoalContext => teamGoalContextSchema.parse({ id: randomUUID(), revision: 1, cycle: 1, successCriteria: "The owner has evidence",
+  nonGoals: [], allowedPaths: ["."], evidence: [], previousWork: [], deadlineAt: new Date(Date.now() + 3600_000).toISOString(), maxMembers: 20,
+  record: { version: 2, criteria: [
+    { id: "c0", statement: "", check: "The owner's success text", producer: "host" },
+    { id: "c1", statement: "Shows one owner-visible result", check: "Read the result", producer: "owner" },
+  ] } });
+
+test("a goal cycle with owner criteria records the digest prompt version, with the blackboard tools off", { timeout: 240000 }, async () => {
+  const { f, store, teams } = await mixedRun("autonomous");
+  try {
+    const created = await teams.createForGoal(f.create(), goalWithRecord(), mixedLineup, false, "autonomous");
+    const settled = await settleAnswering(teams, created.id);
+    await membersClosed(teams, created.id);
+    assert.equal(settled.status, "ready-for-review", JSON.stringify(settled.events.slice(-5)));
+    const run = storedRun(teams, created.id);
+    assert.ok(run.goal?.record, "the run pins the record digest");
+    // The entry tools are the question here, so the blackboard tools stay off: the run's prompt version takes entryTools false.
+    assert.notEqual(run.blackboard?.tools, true, "the run's blackboard tools are off");
+    const publishHeads = f.host.config.teams?.publishHeads !== false;
+    const astra = mixedLineup.implementers[1]!;
+    const expectedVersion = promptVersion("implementer", astra.provider, astra, publishHeads, false, true);
+    const payloads = [...payloadsOf(store, created.id, "a"), ...payloadsOf(store, created.id, "b")];
+    assert.ok(payloads.length >= 2, "both tasks record a first implementer decision");
+    for (const payload of payloads) assert.equal(payload.current[0]!.promptVersion, expectedVersion, "the recorded prompt version carries the digest flag");
   } finally {
     store.close();
     await f.close();

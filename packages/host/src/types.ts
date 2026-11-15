@@ -128,7 +128,8 @@ export interface AgentProfile {
 }
 export interface Config {
   /** Host-only credential; never copied into provider environment variables or prompts. */
-  linear?: { apiKeyFile: string; endpoint?: string };
+  /** `reportName` is the name that starts the host's tracker comments, as in "NAME agent report: ready for review.". */
+  linear?: { apiKeyFile: string; endpoint?: string; reportName?: string };
   /** Launch gate for automatic launches: the host holds them while available memory is below the floor or one-minute load per CPU is above the ceiling. */
   hostLoad?: { minAvailableMemoryGiB: number; maxLoadPerCpu: number };
   /** Linear and Slack request intake; the Linear credential above is required when this is set. */
@@ -152,8 +153,8 @@ export interface Config {
   machine?: { id: string; label: string };
   /** The permission agent's light and strong tiers, its miss-rate threshold and the least replay set size. */
   permissionAgent?: import("./permission-agent-config.js").PermissionAgentConfig;
-  /** Operator default for an enrollment that has no saved mode. Only defaultMode exists in this block so far. */
-  autonomy?: { defaultMode?: import("./autonomy.js").AutonomyMode; fuse?: import("./config.js").FuseConfig };
+  /** Owner autonomy settings: the default mode for an enrollment with no saved mode, the fuse, continuity (wake gap and mission conversation rotation), and the agent boundary. */
+  autonomy?: { defaultMode?: import("./autonomy.js").AutonomyMode; fuse?: import("./config.js").FuseConfig; continuity?: import("./config.js").ContinuityConfig; boundary?: { egress?: import("./egress.js").EgressConfig; github?: import("./github-grants.js").GithubBoundary } };
   cmux?: { enabled: boolean; command?: string; hooksDir?: string };
   remote?: { enabled: boolean; relay?: { url: string; tokenFile: string } };
   /** Token prices (USD per million) and per-provider spend budgets for the usage ledger. */
@@ -332,6 +333,8 @@ export interface Bootstrap {
   executorTokenHash?: string;
   /** Set only when the host admitted this headless session to the permission channel. */
   permissionChannel?: { socket: string };
+  /** This session's GitHub grant and proxy origin, set only when `autonomy.boundary.github` is configured. */
+  github?: { proxy: string; grant: string };
   attention: {
     hooks: { claude: boolean; codex: boolean };
     idleAfterMs: number;

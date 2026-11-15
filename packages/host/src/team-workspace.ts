@@ -7,12 +7,14 @@ import { rm as rmAsync } from "node:fs/promises";
 import { basename, dirname, join, resolve, relative, isAbsolute, parse, sep } from "node:path";
 import type { TeamCommand, TeamPublicationCategory, TeamTaskPlan } from "./team-types.js";
 import { fetchCategory } from "./project-source.js";
+import { hostEgressEnvironment } from "./egress.js";
 
 export class TeamError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) { super(message); }
 }
 export interface CommandResult { exitCode: number | null; output: string; stdout: string; interrupted: boolean; truncated: boolean }
-export function teamCommandEnvironment(): NodeJS.ProcessEnv {
+/** `extra` carries a host GitHub grant for one operation; without it the environment is exactly the fixed allowlist below. */
+export function teamCommandEnvironment(extra?: Record<string, string>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const name of ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"])
     if (process.env[name]) env[name] = process.env[name];
@@ -20,8 +22,13 @@ export function teamCommandEnvironment(): NodeJS.ProcessEnv {
   env.GIT_OPTIONAL_LOCKS = "0";
   env.GIT_CONFIG_NOSYSTEM = "1";
   env.GIT_CONFIG_GLOBAL = "/dev/null";
-  return env;
+  // Empty unless autonomy.boundary.egress is configured: then the egress proxy, under the host identity when the key
+  // is readable and with no credential (every request refused) when it is not.
+  Object.assign(env, hostEgressEnvironment());
+  return extra ? { ...env, ...extra } : env;
 }
+/** The environment of a Git command the host runs: replace refs are ignored, so a ref planted in a copy cannot change what a read prints. `extra` is the grant of one operation, as in `teamCommandEnvironment`; it cannot turn replace refs back on. */
+export function teamGitEnvironment(extra?: Record<string, string>): NodeJS.ProcessEnv { return { ...teamCommandEnvironment(extra), GIT_NO_REPLACE_OBJECTS: "1" }; }
 export function teamGitArgs(cwd: string, args: string[]) {
   return ["-c", `safe.directory=${cwd}`, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", "-c", "user.name=Infinite", "-c", "user.email=agent@example.invalid", ...args];
 }
@@ -34,14 +41,14 @@ export interface CommandScope {
 }
 export const commandScope = new AsyncLocalStorage<CommandScope>();
 /** Commands are argv arrays, from owner configuration or an explicitly authorized plan. */
-export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand, input?: string): Promise<CommandResult> {
+export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand, input?: string, extraEnv?: Record<string, string>): Promise<CommandResult> {
   const scope = commandScope.getStore(), ready = scope?.starting();
-  const run = () => runTeamCommand(scope, command, cwd, signal, timeoutMs, prefix, input);
+  const run = () => runTeamCommand(scope, command, cwd, signal, timeoutMs, prefix, input, extraEnv);
   return ready ? ready.then(run) : run();
 }
-function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, cwd: string, signal: AbortSignal | undefined, timeoutMs: number, prefix: TeamCommand | undefined, input: string | undefined): Promise<CommandResult> {
+function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, cwd: string, signal: AbortSignal | undefined, timeoutMs: number, prefix: TeamCommand | undefined, input: string | undefined, extraEnv: Record<string, string> | undefined): Promise<CommandResult> {
   return new Promise((resolveResult, reject) => {
-    const env = teamCommandEnvironment();
+    const env = command.command === "git" ? teamGitEnvironment(extraEnv) : teamCommandEnvironment(extraEnv);
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(prefix?.command ?? command.command, prefix ? [...prefix.args, command.command, ...command.args] : command.args, { cwd, env, stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
@@ -80,9 +87,11 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
     child.once("close", exitCode => { if (settled) return; settled = true; finish(); resolveResult({ exitCode, output, stdout, interrupted, truncated }); });
   });
 }
-export async function publishTeamHead(workspace: string, remoteUrl: string, commit: string, branch: string, prefix?: TeamCommand, signal?: AbortSignal): Promise<{ published: true } | { published: false; category: TeamPublicationCategory }> {
+/** `grantEnv` maps the pushed ref to a host GitHub grant (`push` on exactly that ref) when the GitHub proxy is configured. */
+export async function publishTeamHead(workspace: string, remoteUrl: string, commit: string, branch: string, prefix?: TeamCommand, signal?: AbortSignal, grantEnv?: (ref: string) => Record<string, string>): Promise<{ published: true } | { published: false; category: TeamPublicationCategory }> {
   try {
-    const result = await teamCommand({ command: "git", args: teamGitArgs(workspace, ["push", remoteUrl, `${commit}:refs/heads/${branch}`]) }, workspace, signal, 120000, prefix);
+    const ref = `refs/heads/${branch}`;
+    const result = await teamCommand({ command: "git", args: teamGitArgs(workspace, ["push", remoteUrl, `${commit}:${ref}`]) }, workspace, signal, 120000, prefix, undefined, grantEnv?.(ref));
     if (result.exitCode === 0 && !result.interrupted && !result.truncated) return { published: true };
     // Only Git's own ref status line marks divergence; a branch name or remote hook text must not route the head to a sibling.
     return { published: false, category: /^\s*!\s+\[rejected\]\s.*\((?:non-fast-forward|fetch first)\)\s*$/m.test(result.output) ? "rejected" : fetchCategory(result.output) };
@@ -93,7 +102,7 @@ export async function publishTeamHead(workspace: string, remoteUrl: string, comm
 /** Streams a full bundle of one branch on stdout, with the same restricted Git invocation as other team operations. */
 export function spawnTeamBundle(workspace: string, branch: string, prefix?: TeamCommand) {
   const args = teamGitArgs(workspace, ["bundle", "create", "-", `refs/heads/${branch}`]);
-  return spawn(prefix?.command ?? "git", prefix ? [...prefix.args, "git", ...args] : args, { cwd: workspace, env: teamCommandEnvironment(), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
+  return spawn(prefix?.command ?? "git", prefix ? [...prefix.args, "git", ...args] : args, { cwd: workspace, env: teamGitEnvironment(), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
 }
 async function git(cwd: string, args: string[], prefix?: TeamCommand, timeoutMs = 30000, signal?: AbortSignal) {
   const result = await teamCommand({ command: "git", args: teamGitArgs(cwd, args) }, cwd, signal, timeoutMs, prefix);

@@ -110,12 +110,16 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
   options?.configure?.(config);
   type CoordinatorRequest = { requestId: string; prompt: string; continuation?: NativeContinuation };
   const attempts: { sessionId: string; assignment: TeamAssignment; prompt: string; request: CoordinatorRequest }[] = [];
-  const reports = new Map<string, MissionReport>();
+  const reports = new Map<string, { report: MissionReport; note?: string }>();
   // Each coordinator session's journaled signals and the attention the real reducer derives from them.
   const signals = new Map<string, SignalEvent[]>(), attention = new Map<string, Attention>();
   const stateReads = new Map<string, number>(), sessionStatuses = new Map<string, "running" | "exited">();
   const nativeSessions = new Map<string, { id: string; source: "hook" }>();
   const held = new Set<string>(), stops: string[] = [];
+  // While set, coordinator launches wait for host capacity with this reason, and a session not yet created does not exist.
+  let launchHold: string | undefined;
+  // Each coordinator session's journaled usage records, as the provider usage readers append them.
+  const usage = new Map<string, { seq: number; at: string; type: "usage"; data: unknown }[]>();
   const signal = (sessionId: string, data: Signal, at = new Date()) => {
     const journal = signals.get(sessionId)!;
     const event: SignalEvent = { seq: journal.length + 1, at: at.toISOString(), type: "signal", data: { ...data, source: "hook", provider: "claude" } };
@@ -134,12 +138,17 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
     },
     events(sessionId: string, cursor: number, _limit: number, types: Set<string>) {
       if (types.has("signal")) { const events = signals.get(sessionId)!.filter(event => event.seq > cursor); return { events, cursor: events.at(-1)?.seq ?? cursor, more: false }; }
-      const report = reports.get(sessionId), attempt = attempts.find(item => item.sessionId === sessionId)!;
-      if (!report || cursor > 0) return { events: [], cursor, more: false };
+      if (types.has("usage")) { const events = (usage.get(sessionId) ?? []).filter(event => event.seq > cursor); return { events, cursor: events.at(-1)?.seq ?? cursor, more: false }; }
+      const filed = reports.get(sessionId), attempt = attempts.find(item => item.sessionId === sessionId)!;
+      if (!filed || cursor > 0) return { events: [], cursor, more: false };
       const { runId, memberId, revision } = attempt.assignment;
-      return { events: [{ data: { requestId: randomUUID(), missionId: runId, memberId, revision, report } }], cursor: 1, more: false };
+      return { events: [{ data: { requestId: randomUUID(), missionId: runId, memberId, revision, ...filed } }], cursor: 1, more: false };
     },
-    meta() { return {}; },
+    meta(sessionId: string) {
+      if (launchHold !== undefined && !attempts.some(item => item.sessionId === sessionId)) throw Object.assign(new Error("No such session"), { code: "ENOENT" });
+      return {};
+    },
+    hostLoad: { held: () => launchHold },
     async state(sessionId: string) {
       stateReads.set(sessionId, (stateReads.get(sessionId) ?? 0) + 1);
       return { status: sessionStatuses.get(sessionId) ?? "running", attention: attention.get(sessionId), nativeSession: nativeSessions.get(sessionId) };
@@ -238,12 +247,15 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
         { projectId: "web", name: "Web", path: config.projects[1].path, checkouts: [{ projectId: "web", name: "Web", path: config.projects[1].path, primary: true, teamReady: true }] },
       ] };
   } };
-  const missions = new MissionService(config, key, manager as unknown as Manager, teams as unknown as TeamService, groups);
-  missions.start();
+  const open = () => { const service = new MissionService(config, key, manager as unknown as Manager, teams as unknown as TeamService, groups); service.start(); return service; };
+  let missions = open();
   const attempt = async (n: number) => (await waitFor(async () => attempts[n - 1], value => Boolean(value), 20000))!;
   const parse = (prompt: string, label: string) => JSON.parse(prompt.split("\n").find(line => line.startsWith(label))!.slice(label.length));
   return {
-    missions, config, teams, runs, standalone, failing, created, answers, steers, capacityCalls, set,
+    get missions() { return missions; },
+    /** Stops the mission service after its queued work and loads a new one from the sealed records, as a host restart does. */
+    restart: async () => { missions.close(); await missions.idle(); missions = open(); },
+    config, teams, runs, standalone, failing, created, answers, steers, capacityCalls, set,
     /** Later steers of these subteams, or of every subteam, are refused at the steering limit. */
     limitSteering: (teamIds?: string[]) => { steerLimit = teamIds ? new Set(teamIds) : true; },
     /** Subteam steers are refused as busy until released. */
@@ -253,6 +265,8 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
     loseNextCapacityReply: () => { loseCapacityReply = true; },
     bumpNextCapacityRevision: () => { bumpCapacityRevision = true; },
     remove: () => { removed = true; },
+    /** Coordinator launches wait for host capacity with this reason until called without one. */
+    holdLaunches: (reason?: string) => { launchHold = reason; },
     attempts: () => attempts.length,
     attempt,
     confirmNative: async (n: number) => {
@@ -269,10 +283,18 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
       sessionStatuses.set(sessionId, "exited");
     },
     refusals: (id: string) => unseal<{ refusals: number }>(key, "mission:" + id, readFileSync(join(config.stateDir, "missions", id + ".sealed"), "utf8")).refusals,
+    /** The attempt records one model call whose context is this many input tokens; `secondary` marks a subagent's call. */
+    usage: async (n: number, contextTokens: number, secondary = false) => {
+      const sessionId = (await attempt(n)).sessionId, journal = usage.get(sessionId) ?? [], at = new Date().toISOString();
+      journal.push({ seq: journal.length + 1, at, type: "usage", data: { provider: "claude", providerId: "claude", modelId: "test-model", messageId: randomUUID(), partId: "",
+        modelSource: "requested", completedAt: at, tokens: { input: contextTokens, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, reportedCost: 0, ...(secondary ? { secondary: true } : {}) } });
+      usage.set(sessionId, journal);
+    },
     stored: (id: string) => unseal<{ attempts: { prompt: string; consumedInbox: MissionMessage[] }[]; inbox: MissionMessage[]; refusals: number }>(key, "mission:" + id, readFileSync(join(config.stateDir, "missions", id + ".sealed"), "utf8")),
     messages: async (n: number) => parse((await attempt(n)).prompt, "Messages since your last attempt (JSON): "),
     state: async (n: number) => parse((await attempt(n)).prompt, "Mission state (JSON): "),
-    report: async (n: number, report: MissionReport) => { reports.set((await attempt(n)).sessionId, report); },
+    /** The attempt files this report, with the optional note beside it as the mission report tool sends it. */
+    report: async (n: number, report: MissionReport, note?: string) => { reports.set((await attempt(n)).sessionId, { report, ...(note === undefined ? {} : { note }) }); },
     /** The coordinator's turn ends without a report; its session stays alive at the prompt. */
     endTurn: async (n: number, at?: Date) => { signal((await attempt(n)).sessionId, { kind: "turn-end" }, at); },
     signal: async (n: number, data: Signal) => signal((await attempt(n)).sessionId, data),

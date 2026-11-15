@@ -20,6 +20,9 @@ import { combineCoverage, type UsageService } from "./usage-service.js";
 import { type EvidenceStore, eventProblem } from "./evidence/store.js";
 import { applyFuseReason, workLaunch } from "./fuse/rules.js";
 import type { FuseAdmission, FuseCheck, FuseGate } from "./fuse/types.js";
+import type { CaptureSink } from "./eval-types.js";
+import { captureStart } from "./eval-rules.js";
+import { HALT_RUNNING_TEAM, KEPT_PAUSED, LEFT_AS_IS, STILL_HALTED, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 import type { EventOutbox, OutboxEvent } from "./evidence/outbox.js";
 import type { Blackboard } from "./evidence/blackboard.js";
 import { MAX_OUTBOX_EVENTS, pathField, planDigest, profileIdentity, runEventKey, runSummaryCounts, type MemberStopDetail, type MemberStopReason, type ReplacementCause } from "./run-events.js";
@@ -29,6 +32,7 @@ import { ProviderLimits, switchesMember, type LimitObservation } from "./provide
 import type { LinearService } from "./linear.js";
 import type { Readings } from "./readings.js";
 import { mirrorRemoteUrl } from "./project-source.js";
+import { hostGithubGrantEnvironment, projectGithubRepository, sessionGithubScope } from "./github-grants.js";
 import type { ProjectSourceService } from "./project-source.js";
 import type { RepositoryGraphs, RepositoryGraphResult } from "./repository-graphs.js";
 import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, publishTeamHead, removeMemberWorkspace, removeTeamWorkspace, commandScope, type CommandScope, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
@@ -40,6 +44,7 @@ import { collectPermissionEvidence, permissionEvidenceDigest } from "./team-perm
 import type { PermissionAgentServices, PermissionHandled, PermissionRequest } from "./permission-agent-types.js";
 import type { PermissionDeliverySource } from "./permission-delivery.js";
 import { teamPermissionRequest, teamPermissionTarget } from "./team-permission-adapter.js";
+import { planRunObjective, runObjectiveNote, runObjectiveView, steerRunObjective, type ObjectiveUnavailable } from "./objective-runs.js";
 export { TeamError } from "./team-workspace.js";
 
 type Mutation = { requestId: string; revision: number; text: string };
@@ -62,6 +67,8 @@ type TeamServiceOptions = {
   events?: EventOutbox;
   /** Host entries and launch sizes for the blackboard. Without it no entry is written and no size is recorded. */
   entries?: Blackboard;
+  /** Eval capture (INF-185). It observes only: it never changes a run, and its failure is swallowed. */
+  capture?: CaptureSink;
 };
 type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedAt: Record<string, string>; removalErrors: Record<string, string[]>; retryAt?: Record<string, string>;
   /** When a record removal first waited for its events to reach the evidence store. */
@@ -139,6 +146,12 @@ type Stored = {
   pending?: PendingOperation;
   verificationRecovery?: { pendingId: string; pendingKind: "check"; revision: number; headCommit: string; failure: "setup-changed-files" | "verification-changed-files" | "legacy-completed-check" };
   halt?: "pause" | "cancel" | "steer" | "block";
+  /**
+   * Set when the owner's halt paused this run: its id, and the reason the paused run shows. A release resumes the run
+   * only under that id. Any accepted owner request clears it. After a release that could not resume the run, only the
+   * reason stays. For a mission's subteam the id is the token of the mission's halt, and only the mission resumes it.
+   */
+  ownerHalt?: { haltId?: string; reason: string };
   deliveryAttempt?: { memberId: string; revision: number; headCommit: string };
   continuationHead?: { revision: number; headCommit: string };
   checkHead?: string;
@@ -148,6 +161,8 @@ type Stored = {
   ratings?: Record<string, { fingerprint: string; result: TeamTask["ownerRating"] }>;
   /** The member each queued replacement continues, until it starts. Written only with `options.events`. */
   ledgerReplaces?: Record<string, { memberId: string; cause: ReplacementCause }>;
+  /** The objective record of a standalone run (objective-runs.ts). Outside `run`, so no view, prompt, or digest reads it. */
+  objectiveRecord?: unknown; objectiveNotice?: ObjectiveUnavailable;
 };
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const timestamp = () => new Date().toISOString();
@@ -928,6 +943,18 @@ export class TeamService {
     }
     this.emit(stored, kind, keyParts, ids, data);
   }
+  private captureIntegrated(stored: Stored, member: TeamMember, task: TeamTask, commit: string, head: string): void {
+    try {
+      if (!this.options?.capture?.enabled(stored.run.projectId)) return;
+      this.options?.capture?.integrated(captureStart(stored.run, task, member, { commit, head, at: timestamp() }));
+    } catch { /* Capture never changes a run. */ }
+  }
+  private captureApproved(stored: Stored, reviewedHead: string): void {
+    try {
+      if (!this.options?.capture?.enabled(stored.run.projectId)) return;
+      this.options?.capture?.approved({ runId: stored.run.id, workspace: stored.run.workspace, anchorCommit: stored.run.baseCommit, reviewedHead, at: timestamp() });
+    } catch { /* Capture never changes a run. */ }
+  }
   /** Records that `next` continues `previous`, until `next` starts. A no-op without `options.events`. */
   private linkReplacement(stored: Stored, next: TeamMember, previous: TeamMember, cause: ReplacementCause): void {
     if (!this.options?.events) return;
@@ -1014,6 +1041,10 @@ export class TeamService {
   }
   /** Read mission ownership without building a view or updating external tracking. */
   missionIdOf(id: string): string | undefined { return this.record(id).run.missionId; }
+  /** Read goal ownership without building a view or updating external tracking. Undefined for an unknown run. */
+  goalIdOf(id: string): string | undefined { return this.records.get(id)?.run.goal?.id; }
+  /** Whether a run holds a delivery attempt that has not resolved, without building a view. False for an unknown run. */
+  hasDeliveryAttempt(id: string): boolean { return Boolean(this.records.get(id)?.deliveryAttempt); }
   /** Restores the mission-authored size boundary for subteams persisted before ceilings were stored. */
   ensureMissionCapacityCeiling(id: string, missionId: string, ceiling: number): number | undefined {
     if (!Number.isInteger(ceiling) || ceiling < 1 || ceiling > 4)
@@ -1031,6 +1062,7 @@ export class TeamService {
     return run.parallelism;
   }
   get(id: string): TeamView { return this.view(this.record(id)); }
+  objectiveRecord(id: string, version?: number) { return runObjectiveView(this.record(id), version); }
   private teamRoot(stored: Stored) {
     const root = stored.root ?? this.config.teams?.workspaceDir;
     if (!root) throw new TeamError(409, "invalid-workspace", "The team workspace is outside its configured root.");
@@ -1091,11 +1123,13 @@ export class TeamService {
     task = (async () => {
       let outcome: Awaited<ReturnType<typeof publishTeamHead>> = { published: false, category: "other" };
       let branch = runBranch, diverged = false;
+      // With the GitHub proxy configured, each push carries a host grant for exactly the ref it publishes.
+      const grantEnv = (ref: string) => hostGithubGrantEnvironment(this.config, { sid: `publish:${id}`, project: run.projectId, repo: target.repository, ops: ["push"], refs: [ref] });
       try {
-        outcome = await publishTeamHead(run.workspace, target.remoteUrl, commit, runBranch, this.config.teams?.commandPrefix, controller.signal);
+        outcome = await publishTeamHead(run.workspace, target.remoteUrl, commit, runBranch, this.config.teams?.commandPrefix, controller.signal, grantEnv);
         if (!outcome.published && outcome.category === "rejected") {
           branch = `${runBranch}-${commit.slice(0, 8)}`;
-          outcome = await publishTeamHead(run.workspace, target.remoteUrl, commit, branch, this.config.teams?.commandPrefix, controller.signal);
+          outcome = await publishTeamHead(run.workspace, target.remoteUrl, commit, branch, this.config.teams?.commandPrefix, controller.signal, grantEnv);
           diverged = outcome.published;
         }
       } catch {
@@ -1467,6 +1501,8 @@ export class TeamService {
     if (body.revision !== stored.run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before sending this action.");
     if (stored.run.status === "cancelled") throw new TeamError(409, "team-cancelled", "This team has been cancelled.");
     stored.receipts[body.requestId] = fingerprint;
+    // The owner acted on the run, so a halt release leaves it as the owner set it.
+    stored.ownerHalt = undefined;
     return true;
   }
   steer(id: string, input: Mutation) {
@@ -1488,6 +1524,7 @@ export class TeamService {
         this.event(stored, "User steering superseded automatic recovery; its original report remains recorded as evidence.");
       }
       stored.run.revision++; stored.run.steering.push({ text: body.text, revision: stored.run.revision, at: timestamp() });
+      const objectiveNote = runObjectiveNote(stored, steerRunObjective(stored, body.requestId, timestamp())); if (objectiveNote) this.event(stored, objectiveNote);
       this.emit(stored, "run.revision-advanced", [stored.run.revision], {}, { cause: "steer", fromRevision: stored.run.revision - 1, baseChanged: false });
       stored.run.status = "planning"; stored.halt = "steer"; stored.run.reason = "Stopping earlier members before planning the updated request."; stored.run.blockCode = undefined;
       stored.run.tasks = []; stored.run.review = undefined; stored.run.round = 0; stored.checkHead = undefined;
@@ -1868,12 +1905,14 @@ export class TeamService {
       next.run.reason = undefined;
       if (next.run.discovery && !next.run.discovery.completedAt) next.run.discovery.completedAt = timestamp();
       if (body.text) next.run.steering.push({ text: body.text, revision: nextRevision, at: timestamp() });
+      if (body.text) { const objectiveNote = runObjectiveNote(next, steerRunObjective(next, body.requestId, timestamp())); if (objectiveNote) this.event(next, objectiveNote); }
       next.run.status = "planning";
       next.halt = undefined;
       next.continuationHead = { revision: nextRevision, headCommit: head };
       this.event(next, `Owner continued the run from its clean integration commit at revision ${nextRevision}. Prior tasks, checks, member records, permissions, and review evidence remain available in the run history.`);
       this.save(next);
       Object.assign(stored, next);
+      if (!("objectiveNotice" in next)) delete stored.objectiveNotice;
       return this.view(stored);
     });
   }
@@ -1945,38 +1984,162 @@ export class TeamService {
       if (this.replay(stored, action, body)) return this.view(stored);
       if (action === "pause" && (["ready-for-review", "merged", "no-change"].includes(run.status) || run.status === "blocked" && !run.workspaceRemovedAt)) throw new TeamError(409, "team-not-running", "This team is not running and cannot be paused.");
       const verificationRecovery = action === "resume" && validVerificationRecovery(stored) ? stored.verificationRecovery : undefined;
-      // Uncertain operations and started deliveries keep their reconciliation contract; a removed
-      // workspace is reported next, before the generic blocked-run resume check it would otherwise fail.
-      if (action === "resume" && ((stored.pending && !verificationRecovery) || stored.deliveryAttempt || run.deliveryReceipt))
-        throw new TeamError(409, "team-reconciliation-required", "This team requires workspace reconciliation. Inspect its evidence and start a new team rather than replaying uncertain work.");
-      if (action === "resume" && run.workspaceRemovedAt) throw new TeamError(409, "team-workspace-removed", "This run's workspaces were removed under the retention policy; start a new run.");
-      if (action === "resume" && (!stored.prepared || (run.status === "blocked" && !this.canResume(stored, undefined, true))))
-        throw new TeamError(409, "team-reconciliation-required", "This team requires workspace reconciliation. Inspect its evidence and start a new team rather than replaying uncertain work.");
-      if (action === "resume" && verificationRecovery && this.commands.has(id)) throw new TeamError(409, "team-operation-running", "The verification operation is still stopping. Retry Resume after it settles.");
-      if (action === "resume" && stored.halt) throw new TeamError(409, "members-stopping", "Wait for the team's active members to stop before resuming.");
+      if (action === "resume") { const refusal = this.resumeRefusal(stored, verificationRecovery); if (refusal) throw refusal; }
       if (action === "resume" && verificationRecovery) return this.resumeVerificationRecovery(stored, body, verificationRecovery);
       if (!this.mutation(stored, action, body)) return this.view(stored);
       if (action === "resume") {
         if (run.status !== "paused" && !this.canResume(stored)) { this.save(stored); return this.view(stored); }
-        // Pausing stopped native agents. Replan from the confirmed integration head, preserving stopped copies for inspection.
-        run.revision++; run.tasks = []; run.review = undefined; run.round = 0; stored.checkHead = undefined;
-        this.emit(stored, "run.revision-advanced", [run.revision], {}, { cause: "resume", fromRevision: run.revision - 1, baseChanged: false });
-        run.brief = undefined; run.noChange = undefined;
-        if (run.discovery && !run.discovery.completedAt) run.discovery.completedAt = timestamp();
-        await this.invalidatePermissionDecisions(stored, "The team resumed under a new revision.");
-        run.status = "planning"; run.reason = undefined; run.blockCode = undefined;
-      } else {
-        if (run.recovery && run.recovery.status !== "exhausted") {
-          run.recovery.status = "exhausted";
-          run.recovery.source = { ...run.recovery.source, code: `owner-${action}`, reason: `The owner ${action} the team before automatic recovery finished.` };
-        }
-        run.status = action === "pause" ? "paused" : "cancelled"; stored.halt = action;
-        await this.invalidatePermissionDecisions(stored, `The team was ${action} before the permission request could be answered.`);
-        run.reason = "Stopping active team members; any human input lease remains authoritative.";
-        this.commands.get(id)?.abort();
-      }
+        await this.resumeRun(stored);
+      } else await this.stopRun(stored, action);
       this.event(stored, `Team ${action === "resume" ? "resumed with a fresh plan" : action === "pause" ? "paused" : "cancelled"}.`); this.save(stored);
       return this.view(stored);
+    });
+  }
+  /** Why the run cannot resume now, or undefined. The owner's resume and a halt release both apply these rules. */
+  private resumeRefusal(stored: Stored, verificationRecovery: Stored["verificationRecovery"]): TeamError | undefined {
+    const run = stored.run;
+    // Uncertain operations and started deliveries keep their reconciliation contract; a removed
+    // workspace is reported next, before the generic blocked-run resume check it would otherwise fail.
+    if ((stored.pending && !verificationRecovery) || stored.deliveryAttempt || run.deliveryReceipt)
+      return new TeamError(409, "team-reconciliation-required", "This team requires workspace reconciliation. Inspect its evidence and start a new team rather than replaying uncertain work.");
+    if (run.workspaceRemovedAt) return new TeamError(409, "team-workspace-removed", "This run's workspaces were removed under the retention policy; start a new run.");
+    if (!stored.prepared || (run.status === "blocked" && !this.canResume(stored, undefined, true)))
+      return new TeamError(409, "team-reconciliation-required", "This team requires workspace reconciliation. Inspect its evidence and start a new team rather than replaying uncertain work.");
+    if (verificationRecovery && this.commands.has(run.id)) return new TeamError(409, "team-operation-running", "The verification operation is still stopping. Retry Resume after it settles.");
+    if (stored.halt) return new TeamError(409, "members-stopping", "Wait for the team's active members to stop before resuming.");
+    return undefined;
+  }
+  /** Pausing stopped native agents. Replan from the confirmed integration head, preserving stopped copies for inspection. */
+  private async resumeRun(stored: Stored) {
+    const run = stored.run;
+    run.revision++; run.tasks = []; run.review = undefined; run.round = 0; stored.checkHead = undefined;
+    this.emit(stored, "run.revision-advanced", [run.revision], {}, { cause: "resume", fromRevision: run.revision - 1, baseChanged: false });
+    run.brief = undefined; run.noChange = undefined;
+    if (run.discovery && !run.discovery.completedAt) run.discovery.completedAt = timestamp();
+    await this.invalidatePermissionDecisions(stored, "The team resumed under a new revision.");
+    run.status = "planning"; run.reason = undefined; run.blockCode = undefined;
+  }
+  /**
+   * Pause or cancel: active members stop on the next pass. The owner's action and the owner's halt both use it. A halt
+   * passes its mark, which is set together with the paused status, before the first save on this path: no record is
+   * ever paused by the halt without the mark, and no record carries the mark without the pause.
+   */
+  private async stopRun(stored: Stored, action: "pause" | "cancel", ownerHalt?: Stored["ownerHalt"]) {
+    const run = stored.run;
+    if (run.recovery && run.recovery.status !== "exhausted") {
+      run.recovery.status = "exhausted";
+      run.recovery.source = { ...run.recovery.source, code: `owner-${action}`, reason: `The owner ${action} the team before automatic recovery finished.` };
+    }
+    run.status = action === "pause" ? "paused" : "cancelled"; stored.halt = action;
+    if (ownerHalt) stored.ownerHalt = ownerHalt;
+    await this.invalidatePermissionDecisions(stored, `The team was ${action} before the permission request could be answered.`);
+    run.reason = "Stopping active team members; any human input lease remains authoritative.";
+    this.commands.get(run.id)?.abort();
+  }
+  /**
+   * Host-internal: the owner's halt pauses each running run in scope through the owner's pause path, without an owner
+   * request, and marks it. A paused, blocked, waiting, or ended run is not touched. `covers` leaves out a run that a
+   * live goal or mission owns: its owner pauses it.
+   */
+  haltPause(mark: HaltMark, covers: HaltCovers) {
+    return this.enqueue(async () => {
+      const outcomes: HaltOutcome[] = [];
+      for (const stored of this.records.values()) {
+        const run = stored.run;
+        if (!HALT_RUNNING_TEAM.has(run.status) || !covers([run.projectId], run.id)) continue;
+        try {
+          await this.stopRun(stored, "pause", { haltId: mark.haltId, reason: mark.reason });
+          run.reason = mark.reason;
+          this.event(stored, `Team paused: ${mark.reason}`); this.save(stored);
+          outcomes.push({ kind: "team", id: run.id, title: run.title, result: "paused" });
+        } catch (error) { outcomes.push(pauseFailure("team", run.id, run.title, error)); }
+      }
+      return outcomes;
+    });
+  }
+  /**
+   * Host-internal: resumes each run that this halt paused and that is still paused under its mark, through the owner's
+   * resume rules. A run that another halt still covers moves to that halt. A run that the rules refuse stays paused and
+   * says why. With `keep`, no run resumes.
+   */
+  haltResume(haltId: string, heldBy: HaltHeldBy, keep: boolean) {
+    return this.enqueue(async () => {
+      const outcomes: HaltOutcome[] = [];
+      for (const stored of this.records.values()) {
+        const run = stored.run, base = { kind: "team" as const, id: run.id, title: run.title };
+        if (stored.ownerHalt?.haltId !== haltId) continue;
+        try {
+          if (run.status !== "paused") {
+            stored.ownerHalt = undefined; this.save(stored);
+            outcomes.push({ ...base, result: "left", reason: LEFT_AS_IS }); continue;
+          }
+          if (keep) {
+            stored.ownerHalt = { reason: KEPT_PAUSED };
+            if (!stored.halt) run.reason = KEPT_PAUSED;
+            this.save(stored);
+            outcomes.push({ ...base, result: "kept", reason: KEPT_PAUSED }); continue;
+          }
+          const other = heldBy([run.projectId]);
+          if (other) {
+            stored.ownerHalt = { ...other };
+            if (!stored.halt) run.reason = other.reason;
+            this.save(stored);
+            outcomes.push({ ...base, result: "held", reason: STILL_HALTED }); continue;
+          }
+          const refusal = this.resumeRefusal(stored, undefined);
+          if (refusal) {
+            stored.ownerHalt = { reason: releaseRefusal(refusal.message) };
+            if (!stored.halt) run.reason = stored.ownerHalt.reason;
+            this.save(stored);
+            outcomes.push({ ...base, result: "refused", reason: refusal.message }); continue;
+          }
+          await this.resumeRun(stored);
+          stored.ownerHalt = undefined;
+          this.event(stored, "Team resumed with a fresh plan: the owner released the halt."); this.save(stored);
+          outcomes.push({ ...base, result: "resumed" });
+        } catch (error) { outcomes.push({ ...base, result: "refused", reason: error instanceof Error ? error.message : "The run could not resume." }); }
+      }
+      return outcomes;
+    });
+  }
+  /**
+   * Host-internal: a mission's halt pauses one of its subteams. Decided in this team's queue, so it sees the state that
+   * every earlier operation left: only a working run is paused, and the pause and the token are saved together. True
+   * when the run is paused under this token, including a replay after the mission lost its record of the first call.
+   */
+  haltPauseChild(id: string, token: string, reason: string): Promise<boolean> {
+    return this.enqueue(async () => {
+      const stored = this.record(id), run = stored.run;
+      if (stored.ownerHalt?.haltId === token) return run.status === "paused";
+      if (!HALT_RUNNING_TEAM.has(run.status)) return false;
+      await this.stopRun(stored, "pause", { haltId: token, reason });
+      run.reason = reason;
+      this.event(stored, `Team paused: ${reason}`); this.save(stored);
+      return true;
+    });
+  }
+  /**
+   * Host-internal: a mission's halt release resumes one subteam that its halt paused. Decided in this team's queue: the
+   * run resumes only if it is still paused and still carries this token, which any accepted owner request clears.
+   * Otherwise nothing changes and the run keeps the state the owner gave it. Members still stopping are reported, so
+   * the mission retries; any other refusal leaves the run paused and says why.
+   */
+  haltResumeChild(id: string, token: string): Promise<boolean> {
+    return this.enqueue(async () => {
+      const stored = this.record(id), run = stored.run;
+      if (run.status !== "paused" || stored.ownerHalt?.haltId !== token) return false;
+      const refusal = this.resumeRefusal(stored, undefined);
+      if (refusal?.code === "members-stopping") throw refusal;
+      if (refusal) {
+        stored.ownerHalt = { reason: releaseRefusal(refusal.message) };
+        if (!stored.halt) run.reason = stored.ownerHalt.reason;
+        this.save(stored);
+        throw refusal;
+      }
+      await this.resumeRun(stored);
+      stored.ownerHalt = undefined;
+      this.event(stored, "Team resumed with a fresh plan: the owner released the halt."); this.save(stored);
+      return true;
     });
   }
   start() {
@@ -2821,7 +2984,8 @@ export class TeamService {
         }
         const safePendingRecovery = Boolean(run.recovery?.status === "stopping" && stored.pending &&
           (recoverableOperationFailure(stored, stored.pending) || recoverableUnattributedResult(stored, stored.pending)));
-        if (all && (!stored.pending || safePendingRecovery || run.status === "blocked" || run.status === "cancelled")) { stored.halt = undefined; if (!["blocked", "cancelled"].includes(run.status)) run.reason = undefined; }
+        // A run that the owner's halt paused keeps saying so once its members have stopped.
+        if (all && (!stored.pending || safePendingRecovery || run.status === "blocked" || run.status === "cancelled")) { stored.halt = undefined; if (!["blocked", "cancelled"].includes(run.status)) run.reason = run.status === "paused" ? stored.ownerHalt?.reason : undefined; }
         this.save(stored); return;
       }
       if (await this.startAutomaticRecovery(stored, trackingReady)) return;
@@ -4575,12 +4739,17 @@ export class TeamService {
     const request = { requestId: member.sessionId, provider: member.provider ?? stored.run.provider,
       projectId: stored.run.projectId, title: member.title, prompt: member.prompt,
       ...(member.role === "permission-coordinator" ? { continuation: member.continuation } : {}) };
-    try { result = await this.startInProject(stored.run.projectId, () => this.manager.createTeamSession(request, assignment(member), member.cwd, member.modelProfile, stored.root, this.config.teams?.trustWorkspaces === true)); }
+    // The GitHub grant scope (used only with autonomy.boundary.github): delivery pushes the run's head branch, others fetch.
+    const delivery = stored.run.delivery;
+    const github = sessionGithubScope({ kind: "team", role: member.role,
+      repository: delivery?.repository ?? projectGithubRepository(this.config.projects.find(project => project.id === stored.run.projectId)),
+      ...(delivery ? { delivery: { mode: delivery.mode, repository: delivery.repository, headBranch: teamDeliveryBranch(stored.run) } } : {}) });
+    try { result = await this.startInProject(stored.run.projectId, () => this.manager.createTeamSession(request, assignment(member), member.cwd, member.modelProfile, stored.root, this.config.teams?.trustWorkspaces === true, {}, github)); }
     catch (error) {
       this.fuse?.release(member.sessionId);
       if (error instanceof LaunchHeldError) { this.holdForHostLoad(stored, error.reason); return; }
       if (error instanceof Error && /configured session limit/.test(error.message)) { stored.run.reason = SESSION_SLOT_REASON; this.save(stored); return; }
-      if (error instanceof TeamError && error.code === "fuse-open") {
+      if (error instanceof TeamError && (error.code === "fuse-open" || error.code === "halted")) {
         if (stored.run.reason !== error.message) { stored.run.reason = error.message; this.save(stored); }
         return;
       }
@@ -4747,6 +4916,7 @@ export class TeamService {
           this.event(stored, "The coordinator established verification commands under the owner's project opt-in.");
         }
         run.status = "implementing";
+        const objectiveNote = runObjectiveNote(stored, planRunObjective(stored, member.memberId, timestamp())); if (objectiveNote) this.event(stored, objectiveNote);
         this.event(stored, `Project manager planned ${run.tasks.length} tasks.`);
         const map = (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features;
         this.emitWith(stored, "plan.accepted", [member.revision], { memberId: member.memberId, revision: member.revision }, () => ({
@@ -4948,6 +5118,7 @@ export class TeamService {
           return { verdict: report.verdict, headCommit: member.baseCommit, baseCommit: run.baseCommit,
             reviewer: profileIdentity(reviewer, member.provider ?? run.provider), rubric: rubricKept.length ? rubricKept : undefined };
         });
+        if (report.verdict === "approved") this.captureApproved(stored, member.baseCommit);
         if (report.verdict === "changes-requested") {
           for (const task of run.tasks) if (task.status === "integrated") task.reviewRounds = (task.reviewRounds ?? 0) + 1;
           this.repair(stored, report.summary, "review");
@@ -4994,6 +5165,7 @@ export class TeamService {
         this.emitWith(stored, "task.integrated", [member.revision, task.id], { memberId: member.memberId, taskId: task.id, revision: member.revision }, () => ({
           commit, headCommit: head, baseCommit: run.baseCommit, memberBaseCommit: member.baseCommit, diff: task.diffStat,
         }));
+        if (commit && member.role === "implementer") this.captureIntegrated(stored, member, task, commit, head);
       }
       if (member.role === "integrator" && run.round > 0) {
         this.emitWith(stored, "repair.integrated", [member.revision, run.round], { memberId: member.memberId, revision: member.revision }, () => ({

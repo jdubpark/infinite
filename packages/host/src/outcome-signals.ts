@@ -353,12 +353,16 @@ export type ScanWrite = {
   holdDays: number;
 };
 
+/** A landing or revert signal that `applyScan` wrote. Ids only: no text from Git or from an agent. */
+export type RecordedScanSignal = { kind: "landing" | "revert"; signalId: string; runId: string; commit: string };
+
 /**
  * One base branch scan, written in the caller's transaction. It applies only when the stored seq is `expectedSeq` and
  * `at` is not before the last scan's. A run keeps its first landing. A revert counts only while its landing is open at
- * `at`. Verdicts are stored once, and then the touched runs are recomputed.
+ * `at`. Verdicts are stored once, and then the touched runs are recomputed. When `recorded` is given, each landing and
+ * revert signal written is appended to it; the caller reads it only after the transaction commits.
  */
-export function applyScan(tx: EvidenceTx, scan: ScanWrite): { applied: boolean; seq: number } {
+export function applyScan(tx: EvidenceTx, scan: ScanWrite, recorded?: RecordedScanSignal[]): { applied: boolean; seq: number } {
   const ref = tx.index("project", scan.projectId);
   const current = readScanState(tx, ref)?.seq ?? 0;
   const last = lastScan(tx, ref);
@@ -402,6 +406,7 @@ export function applyScan(tx: EvidenceTx, scan: ScanWrite): { applied: boolean; 
         ...(landing.reviewedHead === undefined ? {} : { reviewedHead: landing.reviewedHead }),
       },
     });
+    recorded?.push({ kind: "landing", signalId, runId: landing.runId, commit: landing.commit });
     touched.add(landing.runId);
   }
   for (const match of scan.reverts) {
@@ -427,6 +432,7 @@ export function applyScan(tx: EvidenceTx, scan: ScanWrite): { applied: boolean; 
         scanSeq: seq,
       },
     });
+    recorded?.push({ kind: "revert", signalId, runId: landing.runId, commit: match.commit });
     touched.add(landing.runId);
   }
   for (const runId of decideWindows(tx, ref, at)) touched.add(runId);

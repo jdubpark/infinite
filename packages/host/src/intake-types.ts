@@ -80,6 +80,8 @@ export interface IntakeRecord {
   missionId?: string;
   closure?: { reason: string; at: string };
   editNotedAt?: string;
+  /** The issue's title and description as the tracker returned them when the host filed it; edits are detected against this. */
+  tracked?: { title: string; description: string };
   comments: { started?: IntakeComment; outcome?: IntakeComment };
   messages: IntakeMessage[];
   questions: { decisionId: string; n: number }[];

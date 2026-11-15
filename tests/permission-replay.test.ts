@@ -52,6 +52,12 @@ test("an owner replay measures the tiers, makes the host ready, delivers nothing
     const set = JSON.parse(readFileSync(SET_FILE, "utf8"));
     assert.equal((await host.fetchApi("/permissions/replays", "controller", { requestId: randomUUID(), set })).status, 403);
 
+    // The owner's host halt holds every reviewer launch, replays included; after the release the replay runs.
+    assert.equal((await host.fetchApi("/halt", "owner", { requestId: randomUUID(), scope: "host" })).status, 200);
+    await assert.rejects(permissions("replay", "--set", SET_FILE), (error: { stderr: string }) => /A reviewer launch was held by the launch gate/.test(error.stderr));
+    assert.equal(existsSync(log) ? readFileSync(log, "utf8") : "", "", "no reviewer process started under the halt");
+    assert.equal((await host.fetchApi("/halt/release", "owner", { requestId: randomUUID(), scope: "host" })).status, 200);
+
     const replay = await permissions("replay", "--set", SET_FILE, "--json");
     const result = JSON.parse(replay.stdout);
     assert.equal(result.cases, 20);

@@ -1,0 +1,48 @@
+[Unit]
+Description=Infinite GitHub credential proxy (holds GitHub App tokens; checks host-signed grants)
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/infinite-github/proxy.json
+
+[Service]
+Type=simple
+User=infinite-github-proxy
+Group=infinite-github-proxy
+# Read access to the grant key, which only this account and the host account share.
+SupplementaryGroups=infinite-github-grant
+Environment=NODE_ENV=production
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/node /opt/infinite-github-auth/github-proxy.mjs --config /etc/infinite-github/proxy.json
+# Agents lose GitHub access while the proxy is down, so it always comes back.
+Restart=always
+RestartSec=3
+# One JSON line per request goes to the journal; lines never carry a token or a grant.
+StandardOutput=journal
+StandardError=journal
+UMask=0077
+LimitCORE=0
+LimitNOFILE=4096
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+# The proxy reads its config, the grant key and the token cache, listens on loopback, and runs gh in a private
+# temporary directory. It writes nothing else.
+
+[Install]
+WantedBy=multi-user.target

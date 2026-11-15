@@ -162,12 +162,12 @@ test("team prompts never import the ledger", () => {
   };
   const promptSpecifiers = importsOf("team-prompts.ts");
   assert.ok(promptSpecifiers.length > 0);
-  const promptForbidden = ["outcome-", "configuration-store", "config-identity", "evidence/", "scorecard"];
+  const promptForbidden = ["outcome-", "configuration-store", "config-identity", "evidence/", "scorecard", "eval-"];
   for (const specifier of promptSpecifiers)
     for (const name of promptForbidden) assert.ok(!specifier.includes(name), `team-prompts imports ${specifier}`);
 
   const mcpSpecifiers = importsOf("team-mcp.ts");
   assert.ok(mcpSpecifiers.length > 0);
   for (const specifier of mcpSpecifiers)
-    for (const name of ["outcome-", "scorecard"]) assert.ok(!specifier.includes(name), `team-mcp imports ${specifier}`);
+    for (const name of ["outcome-", "scorecard", "eval-"]) assert.ok(!specifier.includes(name), `team-mcp imports ${specifier}`);
 });

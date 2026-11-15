@@ -398,6 +398,52 @@ test("mission prompt cuts blocker evidence to the remaining budget, not to the s
   assert.match(delivered.truncated, new RegExp(`subteam ${teamId}`));
 });
 
+test("a shortened leading message takes the whole prompt: no coordinator note is added, and a follow-up keeps its identifiers in every form", () => {
+  const followUpId = "0b0e7c1e-5a2f-4d53-9c1b-6f2a4e8d9b10", dueAt = "2026-11-14T10:00:00.000Z";
+  const message: MissionMessage = { type: "follow-up", followUpId, dueAt, reason: "Look at the staging check again.", check: "界".repeat(12000) };
+  const notes = [{ at: "2026-11-14T09:00:00.000Z", text: "First note" }, { at: "2026-11-14T09:10:00.000Z", text: "Second note" }];
+  const build = (objectiveLength: number, withNotes = true) => missionPromptWithMessageCount({
+    id: "mission", groupName: "Example", status: "working", deadlineAt: "", maxSubtasks: 8,
+    subtasks: [], decisions: [], dispatchSummary: "", steering: [], objective: "界".repeat(objectiveLength),
+  } as unknown as Mission, [], [message], 2, "claude", lineup.coordinator, { openChildDecisions: [], waiting: 0, ...(withNotes ? { notes } : {}) });
+  const label = "Messages since your last attempt (JSON): ";
+  const delivered = (prompt: string) => JSON.parse(prompt.split("\n").find(line => line.startsWith(label))!.slice(label.length))[0];
+
+  // Room to spare: the long field is cut, and the notes cost the message nothing, not even a sentence about them.
+  const roomy = build(20000);
+  assert.equal(roomy.shortened, true);
+  assert.ok(delivered(roomy.prompt).check.length > 0 && delivered(roomy.prompt).check.length < 12000, "the long field keeps a prefix of its text");
+  assert.equal(roomy.prompt, build(20000, false).prompt, "the prompt is the one a mission without notes gets");
+
+  // The largest objective that leaves room for any form of the message: only the identifiers fit.
+  let fits = 20000, tooLarge = 27500;
+  assert.throws(() => build(tooLarge), /exceeds the coordinator prompt limit/);
+  while (tooLarge - fits > 1) {
+    const middle = Math.floor((fits + tooLarge) / 2);
+    try { build(middle); fits = middle; } catch { tooLarge = middle; }
+  }
+  const tight = build(fits);
+  assert.ok(Buffer.byteLength(tight.prompt, "utf8") <= 80 * 1024);
+  assert.equal(tight.shortened, true);
+  assert.equal(tight.prompt, build(fits, false).prompt, "notes never keep a message that fits without them from being delivered");
+  const least = delivered(tight.prompt);
+  assert.equal(least.followUpId, followUpId);
+  assert.equal(least.dueAt, dueAt);
+  assert.ok(!least.check && !least.reason, "nothing but identifiers fits at the limit");
+  assert.match(least.truncated, /Shortened by the host to fit the prompt budget/);
+
+  // A little more room: text is cut to fewer bytes than an identifier holds, and the identifiers stay whole.
+  let narrow: ReturnType<typeof delivered> | undefined;
+  for (let less = 1; less <= 60 && !narrow; less++) {
+    const candidate = delivered(build(fits - less).prompt);
+    if (typeof candidate.reason === "string") narrow = candidate;
+  }
+  assert.ok(narrow, "a slightly smaller objective leaves room for cut text");
+  assert.ok(Buffer.byteLength(narrow.reason, "utf8") < dueAt.length && Buffer.byteLength(narrow.check, "utf8") < dueAt.length, "the cut is shorter than either identifier");
+  assert.equal(narrow.followUpId, followUpId);
+  assert.equal(narrow.dueAt, dueAt);
+});
+
 test("mission follow-up prompt defers trailing messages when they exceed the byte limit", () => {
   const mission = {
     id: "mission", groupName: "Example", status: "working", deadlineAt: "", maxSubtasks: 8,
@@ -812,6 +858,9 @@ test("a mission coordinator reports through its own MCP tool and envelope, separ
   const envelope = createMissionReportEnvelope({ kind: "result", summary: "Every subtask finished" }, env);
   assert.deepEqual({ ...envelope, requestId: undefined }, { requestId: undefined, missionId, memberId, revision: 3, report: { kind: "result", summary: "Every subtask finished" } });
   assert.equal(createMissionReportEnvelope({ kind: "result", summary: "Every subtask finished" }, env).requestId, envelope.requestId, "A retried report keeps its identity");
+  const noted = createMissionReportEnvelope({ report: { kind: "result", summary: "Every subtask finished" }, note: "Chose JSON for the web client." }, env);
+  assert.equal(noted.note, "Chose JSON for the web client.", "The tool's note reaches the envelope");
+  assert.notEqual(noted.requestId, envelope.requestId, "A note joins the report identity");
   assert.throws(() => createMissionReportEnvelope({ kind: "review", verdict: "approved", summary: "A team report" }, env));
   assert.throws(() => createMissionReportEnvelope({ ...envelope, missionId: randomUUID() }, env), /does not match/);
   assert.throws(() => createMissionReportEnvelope({ kind: "result", summary: "No assignment" }, { ...env, INFINITE_MISSION_ASSIGNMENT: "" }), /unavailable/);
@@ -867,7 +916,8 @@ test("permission recovery wakes the mission once with bounded observations and p
 });
 
 for (const scenario of [
-  { name: "a large mission delivers a compact recovery outcome", objectiveLength: 23800, summary: "One API change", held: false },
+  // The objective sets the base prompt so that the whole recovery message does not fit under 80 KiB and its compact form does; retune it when coordinator instructions grow.
+  { name: "a large mission delivers a compact recovery outcome", objectiveLength: 23400, summary: "One API change", held: false },
   { name: "a full mission blocks and cancels its subteam when recovery evidence cannot fit", objectiveLength: 24000, summary: "S".repeat(900), held: true },
 ]) test(scenario.name, { timeout: 30000 }, async () => {
   const h = scripted();
@@ -1902,6 +1952,317 @@ test("the report survives the recent-message window", { timeout: 30000 }, async 
   } finally { h.close(); }
 });
 
+const followUp = (inMinutes: number, reason = "The API subteam's CI run may have finished", check = "Read the API subtask's team status and checks") =>
+  ({ kind: "follow-up" as const, inMinutes, reason, check });
+const openFollowUpCount = (mission: Mission) => (mission.followUps ?? []).filter(item => item.state === "open").length;
+type PromptMessage = { type: string; kind?: string; reason?: string; check?: string; text?: string };
+
+test("a follow-up with nothing else pending wakes the coordinator at its time, and wait is accepted while it is open", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(240));
+    await h.report(1, followUp(30));
+    const sleeping = await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 1);
+    assert.deepEqual(sleeping.followUps!.map(item => [item.state, item.dueAt, item.reason, item.check]),
+      [["open", "2026-11-14T09:30:00.000Z", "The API subteam's CI run may have finished", "Read the API subtask's team status and checks"]]);
+    assert.ok(sleeping.events.some(event => event.text === "The coordinator plans to look again at 2026-11-14 09:30 UTC: The API subteam's CI run may have finished"));
+    assert.equal(missionBoard([sleeping], [], [], [], () => undefined).items[0].detail, "Waiting until 2026-11-14 09:30 UTC to look again: The API subteam's CI run may have finished");
+
+    // Owner direction wakes the coordinator early. The open follow-up will wake it again, so waiting is accepted.
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Keep the change small" });
+    assert.deepEqual((await h.state(2)).followUps, [{ id: sleeping.followUps![0].id, dueAt: "2026-11-14T09:30:00.000Z", reason: "The API subteam's CI run may have finished" }]);
+    await h.report(2, { kind: "wait", summary: "Nothing to decide before the check" });
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && mission.events.some(event => /waiting for subteam progress/.test(event.text)));
+    await new Promise(done => setTimeout(done, 1500));
+    assert.equal(h.attempts(), 2, "Nothing starts an attempt before the follow-up is due");
+
+    mock.timers.tick(30 * 60000);
+    const woken = (await h.messages(3)) as PromptMessage[];
+    assert.deepEqual(woken.filter(message => message.type === "follow-up").map(message => [message.reason, message.check]),
+      [["The API subteam's CI run may have finished", "Read the API subtask's team status and checks"]]);
+    const fired = h.get(id);
+    assert.equal(fired.followUps![0].state, "fired");
+    assert.equal(fired.events.filter(event => /follow-up for 2026-11-14 09:30 UTC came due/.test(event.text)).length, 1);
+    assert.equal(h.refusals(id), 0);
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("a follow-up survives a host restart and fires once", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(240));
+    await h.report(1, followUp(15));
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 1);
+    await h.restart();
+    mock.timers.tick(15 * 60000);
+    assert.equal(((await h.messages(2)) as PromptMessage[]).filter(message => message.type === "follow-up").length, 1);
+    // The woken attempt sets another follow-up; after a second restart the fired one starts nothing more.
+    await h.report(2, followUp(60, "Check again later"));
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 1);
+    await h.restart();
+    await new Promise(done => setTimeout(done, 1500));
+    assert.equal(h.attempts(), 2);
+    const mission = h.get(id);
+    assert.deepEqual(mission.followUps!.map(item => item.state), ["fired", "open"]);
+    assert.equal(mission.events.filter(event => /came due/.test(event.text)).length, 1);
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("a sixth open follow-up and one due at or after the deadline are refused", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.missions.create(missionRequest(240));
+    await h.report(1, followUp(240));
+    const late = ((await h.messages(2)) as PromptMessage[]).find(message => message.type === "refused")!;
+    assert.equal(late.kind, "follow-up");
+    assert.match(late.reason!, /^That time is at or after the mission deadline, /);
+    for (let n = 2; n <= 7; n++) {
+      if (n > 2) await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: `Direction ${n}` });
+      await h.report(n, followUp(30 + n));
+      if (n < 7) await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === n - 1);
+    }
+    const full = ((await h.messages(8)) as PromptMessage[]).find(message => message.type === "refused")!;
+    assert.equal(full.kind, "follow-up");
+    assert.equal(full.reason, "5 follow-ups are already open. Act on what you planned to check, wait for one to come due, or report wait.");
+    assert.equal(openFollowUpCount(h.get(id)), 5);
+  } finally { h.close(); }
+});
+
+test("a paused mission fires no follow-up, and one that came due during the pause fires once after resume", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(240));
+    await h.report(1, followUp(10));
+    const set = await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 1);
+    const paused = await h.missions.pause(id, { requestId: randomUUID(), revision: set.revision });
+    mock.timers.tick(20 * 60000);
+    await new Promise(done => setTimeout(done, 1500));
+    assert.equal(h.attempts(), 1);
+    assert.equal(h.get(id).followUps![0].state, "open", "A paused mission fires nothing");
+    await h.missions.resume(id, { requestId: randomUUID(), revision: paused.revision });
+    const messages = (await h.messages(2)) as PromptMessage[];
+    assert.equal(messages.filter(message => message.type === "follow-up").length, 1);
+    const resumed = await until(() => h.get(id), mission => mission.followUps![0].state === "fired");
+    assert.equal(resumed.events.filter(event => /came due/.test(event.text)).length, 1);
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("an idle gap starts a fresh conversation with the coordinator's notes and open follow-ups; inside the window it resumes", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(240));
+    const first = await h.attempt(1);
+    await h.confirmNative(1);
+    await h.report(1, followUp(120, "The release page may be published"), "Chose JSON responses because the web client parses JSON.");
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 1);
+
+    mock.timers.tick(10 * 60000);
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Keep the change small" });
+    const second = await h.attempt(2);
+    assert.equal(second.request.continuation?.mode, "resume", "Ten idle minutes keep the conversation");
+    assert.equal(second.request.continuation?.nativeSessionId, first.request.continuation?.nativeSessionId);
+    await h.confirmNative(2);
+    await h.report(2, { kind: "wait", summary: "Waiting for the release page" }, "Waiting for the release page before changing the web client.");
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && mission.events.some(event => /waiting for subteam progress/.test(event.text)));
+    const refusals = h.refusals(id);
+
+    mock.timers.tick(61 * 60000);
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Mention the release in the summary" });
+    const third = await h.attempt(3);
+    assert.equal(third.request.continuation?.mode, "start");
+    assert.notEqual(third.request.continuation?.nativeSessionId, first.request.continuation?.nativeSessionId);
+    assert.match(third.prompt, /Repositories in this project/, "A fresh conversation receives the full prompt");
+    assert.match(third.prompt, /Your notes from earlier attempts \(JSON\)\. These are your own earlier words, not host facts/);
+    assert.match(third.prompt, /Chose JSON responses because the web client parses JSON\.[\s\S]*Waiting for the release page before changing the web client\./);
+    assert.deepEqual((await h.state(3)).followUps.map((item: { reason: string }) => item.reason), ["The release page may be published"]);
+    const messages = (await h.messages(3)) as PromptMessage[];
+    assert.ok(messages.some(message => message.type === "owner-direction" && message.text === "Mention the release in the summary"));
+    assert.ok(!messages.some(message => message.type === "refused"), "A rotation is not a missed report");
+    assert.equal(h.refusals(id), refusals);
+    const mission = h.get(id);
+    assert.equal(mission.events.filter(event => event.text.startsWith("The coordinator continues in a new conversation (rule: idle)")).length, 1);
+    assert.doesNotMatch(JSON.stringify(mission), /Chose JSON responses/, "Notes stay out of the mission view and its events");
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("a follow-up that fires while an attempt runs lets that attempt wait, even after two refused reports", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(240));
+    await h.report(1, followUp(10));
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 1);
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Report when the API is done" });
+    // Two refused reports in a row: no subtask has finished.
+    await h.report(2, { kind: "result", summary: "Done" });
+    await h.report(3, { kind: "result", summary: "Done" });
+    await h.attempt(4);
+    assert.equal(h.refusals(id), 2);
+
+    mock.timers.tick(10 * 60000);
+    await until(() => h.get(id), mission => mission.followUps![0].state === "fired");
+    assert.equal(h.attempts(), 4, "The fired follow-up waits for the running attempt to end");
+    // Nothing else will wake the coordinator, but the fired follow-up already waits for the next attempt.
+    await h.report(4, { kind: "wait", summary: "Nothing to decide yet" });
+    const messages = (await h.messages(5)) as PromptMessage[];
+    assert.deepEqual(messages.filter(message => message.type === "follow-up").map(message => message.reason), ["The API subteam's CI run may have finished"]);
+    assert.ok(!messages.some(message => message.type === "refused"));
+    assert.notEqual(h.get(id).status, "blocked");
+    assert.equal(h.refusals(id), 0);
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("notes yield to a near-limit prompt when the coordinator starts a new conversation", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T09:00:00Z") });
+  try {
+    // About 9 KB of the 80 KiB prompt remains for notes: room for one 2000-character note, not two.
+    const { id } = await h.missions.create({ ...missionRequest(240), objective: "界".repeat(21000) });
+    const note = (n: number) => `Note ${n}: ${"界".repeat(1990)}`;
+    await h.confirmNative(1);
+    await h.report(1, followUp(120), note(1));
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 1);
+    for (const n of [2, 3]) {
+      mock.timers.tick(10 * 60000);
+      await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: `Direction ${n}` });
+      assert.equal((await h.attempt(n)).request.continuation?.mode, "resume");
+      await h.report(n, { kind: "wait", summary: "Waiting for the check" }, note(n));
+      await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && mission.events.filter(event => /waiting for subteam progress/.test(event.text)).length === n - 1);
+    }
+
+    mock.timers.tick(61 * 60000);
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Direction 4" });
+    const fourth = await h.attempt(4);
+    assert.equal(fourth.request.continuation?.mode, "start");
+    assert.ok(Buffer.byteLength(fourth.prompt) <= 80 * 1024);
+    assert.match(fourth.prompt, /Note 3: /);
+    assert.doesNotMatch(fourth.prompt, /Note [12]: /);
+    assert.match(fourth.prompt, /2 older notes did not fit in this prompt and were left out\./);
+    assert.ok(((await h.messages(4)) as PromptMessage[]).some(message => message.type === "owner-direction" && message.text === "Direction 4"));
+    const mission = h.get(id);
+    assert.equal(mission.status, "planning");
+    assert.equal(mission.reason, undefined);
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("after a rotation, an unconfirmed new conversation never brings back the retired one", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(240));
+    const retired = (await h.attempt(1)).request.continuation?.nativeSessionId;
+    await h.confirmNative(1);
+    await h.report(1, followUp(120), "Chose JSON responses because the web client parses JSON.");
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 1);
+    const waits = (count: number) => until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && mission.events.filter(event => /waiting for subteam progress/.test(event.text)).length === count);
+
+    mock.timers.tick(61 * 60000);
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Keep the change small" });
+    const second = await h.attempt(2);
+    assert.equal(second.request.continuation?.mode, "start");
+    // The new conversation ends without the host confirming its native session.
+    await h.report(2, { kind: "wait", summary: "Waiting for the release page" });
+    await waits(1);
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Mention the release" });
+    const third = await h.attempt(3);
+    assert.equal(third.request.continuation?.mode, "start");
+    assert.ok(![retired, second.request.continuation?.nativeSessionId].includes(third.request.continuation?.nativeSessionId));
+
+    // With the idle rule off, the retired conversation still is not resumed.
+    h.config.autonomy = { continuity: { rotateIdleMinutes: 0 } };
+    await h.report(3, { kind: "wait", summary: "Waiting for the release page" });
+    await waits(2);
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Keep the summary short" });
+    const fourth = await h.attempt(4);
+    assert.equal(fourth.request.continuation?.mode, "start");
+    assert.notEqual(fourth.request.continuation?.nativeSessionId, retired);
+    assert.equal(h.get(id).events.filter(event => /new conversation \(rule: /.test(event.text)).length, 1, "One rotation, not one per wake");
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("a main conversation at the size limit starts fresh; subagent usage does not count toward it", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.missions.create(missionRequest(240));
+    const first = (await h.attempt(1)).request.continuation?.nativeSessionId;
+    await h.confirmNative(1);
+    await h.usage(1, 50000);
+    await h.usage(1, 500000, true);
+    await h.report(1, followUp(120));
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 1);
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Keep the change small" });
+    const second = await h.attempt(2);
+    assert.deepEqual([second.request.continuation?.mode, second.request.continuation?.nativeSessionId], ["resume", first]);
+
+    await h.usage(2, 130000);
+    await h.report(2, { kind: "wait", summary: "Waiting for the release page" });
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && mission.events.some(event => /waiting for subteam progress/.test(event.text)));
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Mention the release" });
+    const third = await h.attempt(3);
+    assert.equal(third.request.continuation?.mode, "start");
+    assert.notEqual(third.request.continuation?.nativeSessionId, first);
+    assert.equal(h.get(id).events.filter(event => event.text.startsWith("The coordinator continues in a new conversation (rule: size)")).length, 1);
+  } finally { h.close(); }
+});
+
+test("a pause withdraws a held coordinator launch and returns its fired follow-up once after resume", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(240));
+    await h.report(1, followUp(10));
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 1);
+    h.holdLaunches("Waiting for host capacity: memory is low");
+    mock.timers.tick(10 * 60000);
+    // The follow-up fires into an attempt whose launch the host's load holds.
+    const held = await until(() => h.get(id), mission => mission.followUps![0].state === "fired" && mission.coordinator?.status === "running" && mission.reason === "Waiting for host capacity: memory is low");
+    await h.missions.pause(id, { requestId: randomUUID(), revision: held.revision });
+    await until(() => h.get(id), mission => mission.coordinator?.status === "stopped");
+    await h.restart();
+    h.holdLaunches();
+    await h.missions.resume(id, { requestId: randomUUID(), revision: h.get(id).revision });
+    const messages = (await h.messages(2)) as PromptMessage[];
+    assert.deepEqual(messages.filter(message => message.type === "follow-up").map(message => [message.reason, message.check]),
+      [["The API subteam's CI run may have finished", "Read the API subtask's team status and checks"]]);
+    assert.equal(messages.filter(message => message.type === "resumed").length, 1);
+    assert.equal(h.attempts(), 2, "The withdrawn attempt never launched");
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("a pause that stops a launched attempt before its report returns the fired follow-up to the next conversation", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(240));
+    await h.confirmNative(1);
+    await h.report(1, followUp(10));
+    await until(() => h.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 1);
+    mock.timers.tick(10 * 60000);
+    // The second attempt launches with the fired follow-up; the owner pauses before it reports.
+    const second = await h.attempt(2);
+    await h.confirmNative(2);
+    assert.equal(((await h.messages(2)) as PromptMessage[]).filter(message => message.type === "follow-up").length, 1);
+    const running = await until(() => h.get(id), mission => mission.coordinator?.sessionId === second.sessionId && mission.coordinator.status === "running");
+    await h.missions.pause(id, { requestId: randomUUID(), revision: running.revision });
+    await until(() => h.get(id), mission => mission.coordinator?.status === "stopped");
+    // A long pause, such as an owner halt, makes the next attempt start a new conversation.
+    mock.timers.tick(61 * 60000);
+    await h.missions.resume(id, { requestId: randomUUID(), revision: h.get(id).revision });
+    const third = await h.attempt(3);
+    assert.equal(third.request.continuation?.mode, "start");
+    const messages = (await h.messages(3)) as PromptMessage[];
+    assert.deepEqual(messages.filter(message => message.type === "follow-up").map(message => [message.reason, message.check]),
+      [["The API subteam's CI run may have finished", "Read the API subtask's team status and checks"]]);
+    assert.equal(messages.filter(message => message.type === "resumed").length, 1);
+    assert.equal(h.refusals(id), 0, "A paused stop is not a missed report");
+    assert.ok(!h.get(id).events.some(event => /could not be resumed/.test(event.text)), "The resumed conversation was confirmed, so this is not a failed resume");
+  } finally { h.close(); mock.timers.reset(); }
+});
+
 const answerDispatchRefusal = "This mission answers a question and cannot start subtasks. Report the answer as a result, ask the owner a question, or report blocked.";
 const answerRequest = (): CreateMission => ({ requestId: randomUUID(), groupId: "shop", objective: "Which route serves exports?", maxSubtasks: 8, maxMinutes: 30, mode: "answer" });
 
@@ -1979,5 +2340,17 @@ test("the answer-mode coordinator prompt says it can only read and cannot dispat
     const initial = missionPromptWithMessageCount(plain, repos, [], 1, "claude", lineup.coordinator, context).prompt;
     assert.match(initial, /Choose the initial team limit/);
     assert.doesNotMatch(initial, /cannot start subtasks/);
+  } finally { h.close(); }
+});
+
+test("an answer mission refuses a follow-up report", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.missions.create(answerRequest());
+    await h.report(1, followUp(30));
+    const refusal = (await h.messages(2)).find((message: { type: string }) => message.type === "refused");
+    assert.equal(refusal.kind, "follow-up");
+    assert.equal(refusal.reason, "This mission answers a question and cannot set a follow-up. Report the answer as a result, ask the owner a question, or report blocked.");
+    assert.equal(openFollowUpCount(h.get(id)), 0);
   } finally { h.close(); }
 });

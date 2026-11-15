@@ -167,6 +167,8 @@ export interface BoardItem {
   projectName: string;
   column: BoardColumn;
   status: string;
+  /** Deadline stop reason for missions; absent when the mission has no stop reason. */
+  stopReason?: "deadline";
   /** One line: the open question, the block reason, or the current step. */
   detail: string;
   createdAt: string;

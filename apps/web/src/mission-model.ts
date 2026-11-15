@@ -17,7 +17,11 @@ export function missionLeftLabel(milliseconds: number): string {
 }
 
 export function missionExtensionConfirmation(mission: { deadlineAt: string; clockStoppedAt?: string }, now: number, formatDate: (value: string) => string): string {
-  if (mission.clockStoppedAt !== undefined) return "Time extension recorded. The clock is stopped with " + missionLeftLabel(missionTimeLeftMs(mission, now)) + " left.";
+  if (mission.clockStoppedAt !== undefined) {
+    const timeLeft = missionTimeLeftMs(mission, now);
+    if (timeLeft <= 0) return "Time extension recorded. The mission's time limit has passed.";
+    return "Time extension recorded. The clock is stopped with " + missionLeftLabel(timeLeft) + " left.";
+  }
   return "Time extension recorded. The mission now stops " + formatDate(mission.deadlineAt) + ".";
 }
 

@@ -1606,6 +1606,7 @@ export function missionBoard(
     // A mission started before its checkout folded keeps its pinned record; the row follows the project that holds that checkout now.
     const owner = mission.repoProjectIds.map(id => containing(id)).find(Boolean);
     items.push({ kind: "mission", id: mission.id, title: mission.title, groupId: owner?.id ?? mission.groupId, projectName: owner?.name ?? mission.groupName, column, status: mission.status,
+      ...(mission.stopReason ? { stopReason: mission.stopReason } : {}),
       detail: oneLine(missionDetail(mission, teamById)), createdAt: mission.createdAt, updatedAt: mission.updatedAt,
       subtasks: subtaskCounts(mission) });
     attempts.push({ item: items.at(-1)!, scope: owner?.id ?? mission.groupId, objective: mission.objective });

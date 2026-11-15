@@ -1863,6 +1863,7 @@ test("the host closes a mission that stays blocked for the blocked-work retentio
     const blocked = await until(() => h.get(id), mission => mission.status === "blocked");
     assert.equal(blocked.stopReason, "deadline");
     assert.equal(blocked.reason, timeLimitText);
+    assert.equal(missionBoard([blocked], [], [], [], () => undefined).items[0].stopReason, "deadline", "The owner board carries the deadline stop reason to clients");
     // One hour short of the default 72 hours: the mission still waits on the owner.
     mock.timers.tick(71 * 3600000);
     await new Promise(done => setTimeout(done, 1200));

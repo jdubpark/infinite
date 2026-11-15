@@ -93,6 +93,8 @@ test("extension confirmation uses remaining time for a stopped clock and stop ti
   const deadlineAt = "2026-11-15T12:30:00.000Z";
   assert.equal(missionExtensionConfirmation({ deadlineAt, clockStoppedAt: "2026-11-15T12:10:00.000Z" }, NOW, () => "formatted"),
     "Time extension recorded. The clock is stopped with 20 min left.");
+  assert.equal(missionExtensionConfirmation({ deadlineAt: "2026-11-15T12:00:00.000Z", clockStoppedAt: "2026-11-15T12:00:01.000Z" }, NOW, () => "formatted"),
+    "Time extension recorded. The mission's time limit has passed.");
   assert.equal(missionExtensionConfirmation({ deadlineAt }, NOW, () => "formatted " + deadlineAt),
     "Time extension recorded. The mission now stops formatted " + deadlineAt + ".");
 });

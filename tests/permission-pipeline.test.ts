@@ -139,6 +139,15 @@ type Opened = {
   controls: PermissionOwnerControls;
 };
 
+/** The projects under an owner halt. Each engagement gets its own halt id, as the host's halt record gives one. */
+class Halts extends Set<string> {
+  readonly ids = new Map<string, string>();
+  override add(projectId: string) { if (!this.has(projectId)) this.ids.set(projectId, randomUUID()); return super.add(projectId); }
+  override delete(projectId: string) { this.ids.delete(projectId); return super.delete(projectId); }
+  override clear() { this.ids.clear(); super.clear(); }
+  marks() { return [...this.ids].map(([projectId, haltId]) => ({ haltId, projectId })); }
+}
+
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "permission-pipeline-"));
   const ids = ["alpha-app", "beta-app"];
@@ -149,7 +158,7 @@ function fixture() {
   const core = new FakeCore();
   let now = Date.UTC(2026, 10, 14, 12);
   const clock = () => (now += 1000);
-  const halted = new Set<string>();
+  const halted = new Halts();
   let opened: Opened | undefined;
   const open = (): Opened => {
     const store = new EvidenceStore({ databasePath: evidenceDatabasePath(config.stateDir), vaultKey: key });
@@ -160,7 +169,7 @@ function fixture() {
     const delegation = new PermissionDelegationService(config, key, groups, { now: clock });
     opened = {
       store, journal, delegation,
-      pipeline: new HostPermissionPipeline({ core, journal, delegation, state, halted: projectId => halted.has(projectId), now: clock }),
+      pipeline: new HostPermissionPipeline({ core, journal, delegation, state, halted: projectId => halted.has(projectId), halts: () => halted.marks(), now: clock }),
       controls: new PermissionOwnerControls(journal, state, { now: clock }),
     };
     return opened;
@@ -269,7 +278,7 @@ test("an owner halt holds a request: no turn, no record and no delivery until th
 
   f.core.next = () => allow();
   decided(await f.pipeline.decide(pending), "allow");
-  assert.equal(f.pipeline.applicable(earlier.decisionId), true);
+  assert.equal(f.pipeline.applicable(earlier.decisionId), false, "a verdict reached before the halt is not delivered after the release");
 
   // A halt recorded while a review runs reaches every later turn of that review through its context.
   const seen: boolean[] = [];
@@ -282,6 +291,35 @@ test("an owner halt holds a request: no turn, no record and no delivery until th
   await f.pipeline.decide(request({ action: "npm run lint" }));
   assert.deepEqual(seen, [false, true]);
   assert.equal(f.pipeline.halted("alpha-app"), true);
+}));
+
+test("a halt retires the verdicts reached before and during it, and after the release the request is decided again", () => withFixture(async f => {
+  f.delegate();
+  const before = decided(await f.pipeline.decide(request({ action: "npm test" })), "allow");
+  // The halt is engaged while the final turn of a review runs; the host records it before it acknowledges the halt.
+  const pending = request({ action: "npm run build" });
+  f.core.next = () => { f.halted.add("alpha-app"); f.pipeline.observeHalts(); return allow(); };
+  const during = decided(await f.pipeline.decide(pending), "allow");
+  assert.equal(f.pipeline.applicable(during.decisionId), false);
+  f.halted.clear();
+  assert.equal(f.pipeline.applicable(during.decisionId), false, "a verdict reached during the halt is not delivered after the release");
+  assert.equal(f.pipeline.applicable(before.decisionId), false, "nor one reached before it and not yet delivered");
+  // The same request, retried after the release, is a new decision from a fresh review.
+  const reviews = f.core.reviews.length;
+  f.core.next = () => allow();
+  const again = decided(await f.pipeline.decide(pending), "allow");
+  assert.notEqual(again.decisionId, during.decisionId);
+  assert.equal(f.core.reviews.length, reviews + 1);
+  assert.equal(f.pipeline.applicable(again.decisionId), true);
+  // A halt the pipeline sees only through a read while it lasts counts the same, and both survive a restart.
+  const beta = decided(await f.pipeline.decide(request({ action: "npm test", projectId: "beta-app" })), "allow");
+  f.halted.add("beta-app");
+  decided(await f.pipeline.decide(request({ action: "npm run lint", projectId: "beta-app" })), "held");
+  f.halted.clear();
+  f.restart();
+  assert.equal(f.pipeline.applicable(beta.decisionId), false);
+  assert.equal(f.pipeline.applicable(during.decisionId), false);
+  assert.equal(f.pipeline.applicable(again.decisionId), true, "a halt of another project leaves this one's decisions in force");
 }));
 
 test("the adapter's evidence collection reaches the review, and no collection exists without it", () => withFixture(async f => {

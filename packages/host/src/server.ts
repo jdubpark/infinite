@@ -341,6 +341,12 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       core: permissionAgent.core, journal: permissionJournal, delegation: permissionDelegation, state: permissionState,
       // An owner halt stops the permission agent too: while it covers the project no reviewer turn starts and no recorded verdict is delivered.
       halted: projectId => halt.check({ projectId }).state === "halted",
+      // Each halt is recorded: it retires the verdicts reached before it, and the release brings a fresh evaluation.
+      halts: () => {
+        const view = halt.view();
+        if (!view.readable) return undefined;
+        return [...(view.host ? [{ haltId: view.host.haltId }] : []), ...view.projects.map(entry => ({ haltId: entry.haltId, projectId: entry.projectId }))];
+      },
     });
   // Sessions outside team runs: every session listing is read for their permission dialogs, which go to the delivery service.
   const sessionPermissions = new SessionPermissionRequests(config, manager, {
@@ -367,6 +373,8 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
    */
   const settlePermissionAuthority = async (): Promise<PermissionFence> => {
     let confirmed = true;
+    // A halt that this write engaged is recorded first, so the fence below sees the decisions it retired.
+    try { permissionAgent.pipeline?.observeHalts?.(); } catch { confirmed = false; }
     try { await teams.permissionAuthorityChanged(); } catch { confirmed = false; }
     try { if (!await permissionDelivery.fenceRetired()) confirmed = false; } catch { confirmed = false; }
     return confirmed ? {} : { deliveryFence: "uncertain" };

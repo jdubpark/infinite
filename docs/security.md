@@ -470,7 +470,12 @@ verdict that was recorded before the halt is not delivered. The halt is read
 before each turn of a review and again immediately before the reviewer
 process starts, so a halt that is recorded after the light turn holds the
 strong turn, and a verdict reached while the halt was recorded is withheld,
-also from a headless session. A dialog that was
+also from a headless session. The host records every halt in the permission
+pipeline's state before it acknowledges the halt, and a halt ends the
+authority that earlier decisions were made under, as a new owner act does: a
+verdict reached before or during the halt and not yet delivered is never
+delivered, also after the release and after a restart, and the same request
+is decided again from current evidence. A dialog that was
 pending is handed to the agent again after the release and decided from the
 evidence of that time. A host halt, or a halt record that the host cannot
 read, also holds every reviewer launch of a replay. A headless call that

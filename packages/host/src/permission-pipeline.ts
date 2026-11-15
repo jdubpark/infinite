@@ -45,6 +45,7 @@ const MODULE = "permission-pipeline";
 const JOURNAL_MODULE = "permission-journal";
 const DECISIONS = "permission_pipeline_decisions";
 const RECEIPTS = "permission_pipeline_receipts";
+const HALTS = "permission_pipeline_halts";
 const MAX_TEXT = 2_000;
 
 const sha256 = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -59,8 +60,8 @@ const isHostCode = (code: string | undefined) => (HOST_REJECT_CODES as readonly 
  */
 export const permissionPipelineModule: EvidenceModule = {
   name: MODULE,
-  version: 1,
-  readVersion: 1,
+  version: 2,
+  readVersion: 2,
   migrate(tx: EvidenceTx) {
     tx.exec(
       `CREATE TABLE IF NOT EXISTS ${DECISIONS} (`
@@ -72,6 +73,11 @@ export const permissionPipelineModule: EvidenceModule = {
     tx.exec(
       `CREATE TABLE IF NOT EXISTS ${RECEIPTS} (`
       + "request_id TEXT PRIMARY KEY, at TEXT NOT NULL, fingerprint TEXT NOT NULL, result_json TEXT NOT NULL)",
+    );
+    // Version 2: every owner halt the pipeline has seen. A halt ends the authority of the decisions made before it.
+    tx.exec(
+      `CREATE TABLE IF NOT EXISTS ${HALTS} (`
+      + "seq INTEGER PRIMARY KEY AUTOINCREMENT, halt_id TEXT NOT NULL UNIQUE, project_id TEXT, at TEXT NOT NULL)",
     );
   },
 };
@@ -126,6 +132,20 @@ export class PermissionPipelineState {
     return row && { fingerprint: row.fingerprint, result: JSON.parse(row.result_json) as unknown };
   }
 
+  /** Records an owner halt once. `projectId` is absent for a host halt. */
+  noteHalt(haltId: string, projectId: string | undefined, at: string): void {
+    this.store.write(tx => {
+      tx.run(`INSERT OR IGNORE INTO ${HALTS} (halt_id,project_id,at) VALUES (?,?,?)`, haltId, projectId ?? null, at);
+    });
+  }
+
+  /** The latest recorded halt that covered the project, a host halt included. */
+  haltEpoch(projectId: string): string | undefined {
+    return this.store.read(db => db.get<{ halt_id: string }>(
+      `SELECT halt_id FROM ${HALTS} WHERE project_id IS NULL OR project_id=? ORDER BY seq DESC LIMIT 1`, projectId,
+    ))?.halt_id;
+  }
+
   saveReceipt(requestId: string, at: string, fingerprint: string, result: unknown): void {
     this.store.write(tx => {
       tx.run(
@@ -165,8 +185,13 @@ export interface HostPermissionPipelineOptions {
   state: PermissionPipelineState;
   /** Whether an owner halt covers the project now. Under a halt nothing is decided and nothing is delivered. */
   halted?: (projectId: string) => boolean;
+  /** The owner halts in force now, or undefined when the halt record cannot be read. */
+  halts?: () => readonly PermissionHaltMark[] | undefined;
   now?: () => number;
 }
+
+/** An owner halt in force: its id, and the project it covers (absent for a host halt). */
+export interface PermissionHaltMark { haltId: string; projectId?: string }
 
 export class HostPermissionPipeline implements PermissionPipeline {
   private readonly core: PermissionAgentCore;
@@ -174,6 +199,11 @@ export class HostPermissionPipeline implements PermissionPipeline {
   private readonly delegation: Coverage;
   private readonly state: PermissionPipelineState;
   private readonly haltedOf: ((projectId: string) => boolean) | undefined;
+  private readonly haltsOf: (() => readonly PermissionHaltMark[] | undefined) | undefined;
+  /** Halts already recorded, and each project's latest one. Both are rebuilt from the state after a restart. */
+  private readonly noted = new Set<string>();
+  private readonly epochs = new Map<string, string | undefined>();
+  private haltUnrecorded = false;
   private readonly clock: () => number;
   /** One decision per request: a delivery retry while a review runs joins it instead of starting another. */
   private readonly inFlight = new Map<string, Promise<PermissionOutcome>>();
@@ -184,7 +214,36 @@ export class HostPermissionPipeline implements PermissionPipeline {
     this.delegation = options.delegation;
     this.state = options.state;
     this.haltedOf = options.halted;
+    this.haltsOf = options.halts;
     this.clock = options.now ?? Date.now;
+  }
+
+  /**
+   * Records the owner halts in force. A halt ends the authority that earlier decisions were made under, as a
+   * new owner act does: a verdict reached before or during it is never delivered, and after the release the
+   * same request is decided again from current evidence. The host calls this before it acknowledges a halt;
+   * every coverage read calls it too. A halt that cannot be recorded serves nothing until it is.
+   */
+  observeHalts(): void {
+    let marks: readonly PermissionHaltMark[] | undefined;
+    try { marks = this.haltsOf?.(); } catch { marks = undefined; }
+    let failed = false;
+    for (const mark of marks ?? []) {
+      if (this.noted.has(mark.haltId)) continue;
+      try {
+        this.state.noteHalt(mark.haltId, mark.projectId, this.timestamp());
+        this.noted.add(mark.haltId);
+        this.epochs.clear();
+      } catch { failed = true; }
+    }
+    this.haltUnrecorded = failed;
+  }
+
+  /** The coverage with its authority narrowed to the latest halt recorded for the project. */
+  private underHalts(coverage: Covered): Covered {
+    if (!this.epochs.has(coverage.projectId)) this.epochs.set(coverage.projectId, this.state.haltEpoch(coverage.projectId));
+    const epoch = this.epochs.get(coverage.projectId);
+    return epoch === undefined ? coverage : { ...coverage, authorityHash: sha256(["permission-authority", coverage.authorityHash, epoch]) };
   }
 
   /** A halt that cannot be read counts as a halt. */
@@ -206,7 +265,10 @@ export class HostPermissionPipeline implements PermissionPipeline {
     catch { return { served: false, reason: "not-covered" }; }
     if (!coverage.covered) return { served: false, reason: "not-covered" };
     if (!this.ready()) return { served: false, reason: "not-ready" };
-    return { served: true, coverage };
+    this.observeHalts();
+    if (this.haltUnrecorded) return { served: false, reason: "not-ready" };
+    try { return { served: true, coverage: this.underHalts(coverage) }; }
+    catch { return { served: false, reason: "not-ready" }; }
   }
 
   serves(projectId: string): PermissionServed {
@@ -243,10 +305,10 @@ export class HostPermissionPipeline implements PermissionPipeline {
   applicable(decisionId: string): boolean {
     try {
       const row = this.state.decision(decisionId);
-      if (!row || !this.ready() || this.halted(row.projectId)) return false;
-      const coverage = this.delegation.coverage(row.projectId);
-      // A revoke, an owner regrouping, a new owner act and a changed direction text each change or end the authority.
-      return coverage.covered && coverage.authorityHash === row.authorityHash;
+      if (!row || this.halted(row.projectId)) return false;
+      const current = this.coverage(row.projectId);
+      // A revoke, an owner regrouping, a new owner act, a changed direction text and an owner halt each change or end the authority.
+      return current.served && current.coverage.authorityHash === row.authorityHash;
     } catch {
       return false;
     }

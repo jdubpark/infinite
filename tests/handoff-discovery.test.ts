@@ -11,6 +11,8 @@ test("discovery reads a record once when its answer cannot change", async () => 
   const stateDir = mkdtempSync(join(tmpdir(), "inf-handoff-discovery-"));
   const reads: Record<string, number> = { a: 0, b: 0, c: 0 };
   const requests: Record<string, number> = { a: 0, b: 0, c: 0 };
+  // The identity of each session's meta file; undefined while the file is younger than the settle time.
+  const revisions: Record<string, string | undefined> = { a: "rev-a", b: "rev-b", c: "rev-c" };
   let metaFails = false;
   let listCalls = 0;
   let listOmitsA = false;
@@ -35,6 +37,7 @@ test("discovery reads a record once when its answer cannot change", async () => 
       requests[id] += 1;
       return undefined;
     },
+    metaRevision: (id: string) => revisions[id],
     reserveHandoff() {},
     releaseHandoff() {},
   };
@@ -86,6 +89,51 @@ test("discovery reads a record once when its answer cannot change", async () => 
     const readsA = reads.a;
     assert.throws(() => service.listedView("a"), { code: "ENOENT", message: "record gone" });
     assert.equal(reads.a, readsA + 1);
+
+    // Two ticks with the listing's own revisions; the poller runs twice in that wait.
+    const settleTicks = async () => {
+      const target = listCalls + 2;
+      service.start();
+      const until = Date.now() + 5000;
+      while (listCalls < target) {
+        if (Date.now() > until) throw new Error("the handoff poller did not list again");
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      service.close();
+    };
+    metaFails = false;
+    listOmitsA = false;
+    const readsBeforeSettle = reads.a;
+    await settleTicks();
+    assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: reasonA });
+    assert.equal(reads.a, readsBeforeSettle + 1);
+
+    // A replaced record: the file's reason and its revision change together, as a rewritten file does.
+    const replacedReason = "Replaced handoff reason for a.";
+    sessions.a = { id: "a", projectId: "p", handoff: { reason: replacedReason } };
+    revisions.a = "rev-a-2";
+    const readsBeforeReplace = reads.a;
+    await settleTicks();
+    assert.equal(reads.a, readsBeforeReplace + 1);
+    const readsReplaced = reads.a;
+    assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: replacedReason });
+    assert.equal(reads.a, readsReplaced);
+
+    // Same revision, changed stub content: a real file cannot change without its revision changing,
+    // so the memory keeps answering with the remembered reason and reads nothing.
+    sessions.a = { id: "a", projectId: "p", handoff: { reason: "Changed again without a new revision." } };
+    assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: replacedReason });
+    assert.equal(reads.a, readsReplaced);
+
+    // A file that is not settled: nothing is remembered, so every row reads the record.
+    revisions.a = undefined;
+    await settleTicks();
+    const readsUnsettled = reads.a;
+    assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: "Changed again without a new revision." });
+    // An unremembered view reads the record twice (discovery, then its own answer), on every call.
+    assert.equal(reads.a, readsUnsettled + 2);
+    assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: "Changed again without a new revision." });
+    assert.equal(reads.a, readsUnsettled + 4);
   } finally {
     service.close();
     rmSync(stateDir, { recursive: true, force: true });

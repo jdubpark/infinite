@@ -27,7 +27,7 @@ function setup(options: { title?: string; prompt?: string; provider?: Provider; 
     context: "", initialPrompt: options.prompt ?? "", ...(options.generatedTitle ? { generatedTitle: true as const } : {}),
   };
   const row: ReadingRow = { id, title: session.title, provider: session.provider, attention: now(options.lastMessage ?? longMessage) };
-  const manager = { list: async () => [row], meta: () => ({ session }) } as any;
+  const manager = { list: async () => [row], meta: () => ({ session }), metaRevision: () => "rev-1" } as any;
   const config = { stateDir, jev: { apiKeyFile, model: "jev-latest", baseUrl: "https://api.typesafe.ai" } } as Config;
   const readings = new Readings(config, key, manager, options.writer, options.transport);
   return { root, row, session, manager, readings, config, key, dispose: () => rmSync(root, { recursive: true, force: true }) };
@@ -190,9 +190,12 @@ test("background polling retains compact session snapshots instead of full promp
   f.row.attention = { ...f.row.attention, state: "working" };
   try {
     await f.readings.tick();
-    const state = f.readings as unknown as { latestRows: Map<string, unknown>; latestSessions: Map<string, unknown> };
-    const retained = JSON.stringify({ rows: [...state.latestRows.values()], sessions: [...state.latestSessions.values()] });
-    assert.ok(retained.length < 2_048, `retained row and session snapshots were ${retained.length} bytes`);
+    const state = f.readings as unknown as { latestRows: Map<string, unknown>; latestSessions: Map<string, unknown>; settledSessions: Map<string, unknown> };
+    const retained = JSON.stringify({ rows: [...state.latestRows.values()], sessions: [...state.latestSessions.values()], settled: [...state.settledSessions.values()] });
+    assert.ok(retained.length < 2_048, `retained row, session, and settled snapshots were ${retained.length} bytes`);
+    assert.equal(state.settledSessions.has(f.row.id), true, "the listed session has a remembered snapshot");
+    f.readings.merge([]);
+    assert.equal(state.settledSessions.has(f.row.id), false, "a complete snapshot without the session drops its remembered entry");
   } finally { f.dispose(); }
 });
 
@@ -204,7 +207,7 @@ test("polling reads a session record once unless a title job is due", async () =
     C: { ...f.session, id: "C", title: "", generatedTitle: true, initialPrompt: longLine },
   };
   const reads: Record<string, number> = { O: 0, S: 0, C: 0 };
-  const rows: ReadingRow[] = (["O", "S", "C"] as const).map(id => ({ id, title: sessions[id].title, provider: "claude", attention: { ...now("Working."), state: "working" } }));
+  const rows: ReadingRow[] = (["O", "S", "C"] as const).map(id => ({ id, title: sessions[id].title, provider: "claude", backend: "infinite", attention: { ...now("Working."), state: "working" } }));
   f.manager.list = async () => rows;
   f.manager.meta = (id: string) => { reads[id]!++; return { session: sessions[id] }; };
   try {
@@ -212,15 +215,90 @@ test("polling reads a session record once unless a title job is due", async () =
     await f.readings.tick();
     await f.readings.tick();
     assert.deepEqual(reads, { O: 1, S: 1, C: 1 });
-    const merged = f.readings.merge([rows[1]!]);
-    assert.deepEqual(merged[0]!.reading?.title, { text: "Short prompt", source: "first-line" });
-    assert.equal(reads.S, 1, "a short first line is answered from the remembered snapshot");
+    const complete = f.readings.merge(rows);
+    assert.deepEqual(complete[1]!.reading?.title, { text: "Short prompt", source: "first-line" });
+    assert.equal(reads.S, 1, "a short first line of a complete snapshot is answered from the remembered snapshot");
+    const { backend: _backend, ...bare } = rows[1]!;
+    f.readings.merge([bare]);
+    assert.equal(reads.S, 2, "a single-session read follows no listing and reads that record again");
+    await f.readings.tick();
+    assert.equal(reads.S, 2, "a tick after a single-session read answers from the remembered snapshot");
     rows[0]!.title = "Renamed login flow";
     await f.readings.tick();
     assert.equal(reads.O, 2, "a renamed row is read again");
   } finally { f.dispose(); }
 
   const writer = { titleFromPrompt: async () => ({ text: "Database read consistency", model: "writer-model" }) };
+
+  // Part 1b: a replaced record. A remembered answer follows the meta file's revision, not only the row's title.
+  const replaced = setup({ title: "", generatedTitle: true, prompt: "Short A" });
+  let replacedPrompt = "Short A";
+  let replacedRevision: string | undefined = "rev-1";
+  let replacedReads = 0;
+  replaced.row.backend = "infinite";
+  replaced.manager.metaRevision = () => replacedRevision;
+  replaced.manager.meta = () => { replacedReads++; return { session: { ...replaced.session, initialPrompt: replacedPrompt } }; };
+  try {
+    await replaced.readings.tick();
+    await replaced.readings.tick();
+    assert.equal(replacedReads, 1, "an unchanged record is read once");
+    replacedPrompt = "Short B";
+    replacedRevision = "rev-2";
+    await replaced.readings.tick();
+    assert.equal(replacedReads, 2, "a record replaced under the same title is read again");
+    assert.deepEqual(replaced.readings.merge([replaced.row])[0]!.reading?.title, { text: "Short B", source: "first-line" });
+    replacedRevision = undefined;
+    const beforeUnsettled = replacedReads;
+    await replaced.readings.tick();
+    await replaced.readings.tick();
+    assert.equal(replacedReads, beforeUnsettled + 2, "a record with no settled revision is read on every listing");
+  } finally { replaced.dispose(); }
+
+  // Part 1c: title candidates behind two jobs that never answer. The queue holds at most MAX_PENDING (50) jobs.
+  const titleGate = async (count: number) => {
+    const settles: Array<(error: Error) => void> = [];
+    const hanging = { systemOne: (_request: unknown) => new Promise((_resolve, reject) => { settles.push(reject); }) } as unknown as JevTransport;
+    const fixture = setup({ title: "", generatedTitle: true, prompt: longLine, lastMessage: "Short.", transport: hanging, writer });
+    const ids = Array.from({ length: count }, (_, index) => `T${index}`);
+    const counts = new Map(ids.map(id => [id, 0]));
+    const gateRows: ReadingRow[] = ids.map(id => ({ id, title: "", provider: "claude", attention: { ...now("Working."), state: "working" } }));
+    fixture.manager.list = async () => gateRows;
+    fixture.manager.meta = (id: string) => { counts.set(id, counts.get(id)! + 1); return { session: { ...fixture.session, id, initialPrompt: longLine } }; };
+    return { fixture, ids, counts, settles };
+  };
+  const pendingState = (readings: Readings) => readings as unknown as { queue: Map<string, unknown>; active: Map<string, string> };
+  const total = (counts: Map<string, number>) => [...counts.values()].reduce((sum, value) => sum + value, 0);
+
+  const five = await titleGate(5);
+  try {
+    for (let tick = 0; tick < 3; tick++) await five.fixture.readings.tick();
+    assert.deepEqual([...five.counts.values()], [1, 1, 1, 1, 1], "each candidate is read once while two jobs run and three are queued");
+    assert.equal(five.settles.length, 2, "two title jobs run");
+  } finally { five.fixture.readings.stop(); five.fixture.dispose(); }
+
+  const full = await titleGate(60);
+  try {
+    await full.fixture.readings.tick();
+    await full.fixture.readings.tick();
+    const state = pendingState(full.fixture.readings);
+    assert.equal(state.queue.size, 50, "the queue is full after the second poll");
+    const waiting = full.ids.filter(id => !state.queue.has(`${id}:title`) && !state.active.has(`${id}:title`));
+    assert.ok(waiting.length > 0, "some candidates are neither queued nor running");
+    const readsBeforeFull = total(full.counts);
+    await full.fixture.readings.tick();
+    await full.fixture.readings.tick();
+    assert.equal(total(full.counts), readsBeforeFull, "a full queue reads no record, although candidates wait");
+
+    // Make room: one running job ends with a failure, which backs its candidate off and starts the next queued job.
+    const waitingBefore = new Set(full.ids.filter(id => !state.queue.has(`${id}:title`) && !state.active.has(`${id}:title`)));
+    const countsBefore = new Map(full.counts);
+    full.settles.shift()!(new Error("provider unavailable"));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await full.fixture.readings.tick();
+    const newlyRead = full.ids.filter(id => full.counts.get(id)! > countsBefore.get(id)!);
+    assert.equal(newlyRead.length, 1, "one free slot reads one waiting record");
+    assert.ok(waitingBefore.has(newlyRead[0]!), "the record read for the free slot was a waiting candidate");
+  } finally { full.fixture.readings.stop(); full.fixture.dispose(); }
 
   // Part 2: a failed title job is not retried, and its record is read again only after the failure expires.
   let failedCalls = 0;
@@ -250,7 +328,9 @@ test("polling reads a session record once unless a title job is due", async () =
   answered.manager.meta = () => { answeredReads++; return { session: answered.session }; };
   try {
     await answered.readings.tick();
-    await eventually(() => answered.readings.merge([answered.row])[0].reading?.title?.source === "jev-first-line");
+    // The rows of a session list all carry a backend; a row without one is a single-session read, which reads the record.
+    const listed = [{ ...answered.row, backend: "infinite" as const }];
+    await eventually(() => answered.readings.merge(listed)[0].reading?.title?.source === "jev-first-line");
     await answered.readings.tick();
     await answered.readings.tick();
     assert.equal(answeredReads, 1, "a finished title reading is not read again");

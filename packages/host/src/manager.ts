@@ -405,6 +405,14 @@ export class Manager {
       row.status === "fulfilled" ? [row.value] : [],
     );
   }
+
+  /**
+   * The identity of a session's meta file as the last listing kept it: it changes whenever the file is replaced.
+   * Undefined when no settled parse is kept (a file younger than the settle time, or an id that is not listed).
+   */
+  metaRevision(id: string): string | undefined {
+    return this.listedMeta.revision(id);
+  }
   context(projectId: string) { return new ProjectContexts(this.config, this.key).context(projectId); }
   setContext(projectId: string, text: string, expectedVersion: number) {
     return new ProjectContexts(this.config, this.key).setContext(projectId, text, expectedVersion);

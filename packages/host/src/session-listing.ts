@@ -61,4 +61,9 @@ export class SealedFileCache<T> {
     this.lastNow = now;
     for (const id of this.entries.keys()) if (!ids.has(id)) this.entries.delete(id);
   }
+
+  /** The identity of the file whose parse is kept for this id, or undefined when no parse is kept. */
+  revision(id: string): string | undefined {
+    return this.entries.get(id)?.key;
+  }
 }

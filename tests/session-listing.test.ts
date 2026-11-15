@@ -10,6 +10,7 @@ import { Manager, publicAttention, withDefaultAttention } from "../packages/host
 import { socketPath } from "../packages/host/src/ipc.js";
 import { writeSealed } from "../packages/host/src/vault.js";
 import type { Config, Session, WorkerState } from "../packages/host/src/types.js";
+import { inProcessHost } from "./helpers.js";
 
 const ID = () => randomUUID();
 const SETTLED_AGO_MS = 60_000;
@@ -375,5 +376,92 @@ test("a caller that changes its rows changes no later listing", { timeout: 30_00
   } finally {
     mock.timers.reset();
     f.close();
+  }
+});
+
+test("a kept parse has a revision, and a replaced file a new one", { timeout: 60_000 }, async () => {
+  const f = await fixture();
+  // Real clock: a file is settled only when its newer time is 2 s old, so the test waits between its steps.
+  const age = () => new Promise<void>(resolve => setTimeout(resolve, 2_200));
+  const writeRecord = (id: string, session: Session) => {
+    mkdirSync(recordDir(f, id), { recursive: true });
+    const meta = join(recordDir(f, id), "meta.sealed");
+    writeSealed(meta, f.key, `${id}:meta`, { session, fingerprint: "fixture" });
+    writeStatus(f, id, exitedState(1), false);
+    return meta;
+  };
+  try {
+    const E = ID(), Y = ID();
+    const eMeta = writeRecord(E, sessionOf(E));
+    writeRecord(Y, sessionOf(Y));
+    const manager = new Manager(f.config, f.key);
+
+    await manager.list();
+    assert.equal(manager.metaRevision(E), undefined, "a file younger than the settle time keeps no parse");
+    assert.equal(manager.metaRevision(Y), undefined, "a second young file keeps no parse");
+
+    await age();
+    await manager.list();
+    const first = manager.metaRevision(E);
+    assert.equal(typeof first, "string", "a settled parse has a revision");
+    assert.notEqual(first, "");
+    assert.equal(typeof manager.metaRevision(Y), "string", "the second file settled too");
+
+    await manager.list();
+    assert.equal(manager.metaRevision(E), first, "another listing keeps the same revision");
+
+    writeSealed(eMeta, f.key, `${E}:meta`, { session: sessionOf(E, { title: "Replaced" }), fingerprint: "fixture" });
+    await manager.list();
+    assert.equal(manager.metaRevision(E), undefined, "a replaced file that is still young keeps no parse");
+    await age();
+    const rows = await manager.list();
+    const second = manager.metaRevision(E);
+    assert.equal(typeof second, "string");
+    assert.notEqual(second, first, "a replaced file has a new revision");
+    assert.equal(rows.find(row => row.id === E)!.title, "Replaced");
+
+    rmSync(recordDir(f, E), { recursive: true, force: true });
+    await manager.list();
+    assert.equal(manager.metaRevision(E), undefined, "a deleted id that is no longer listed has no revision");
+  } finally {
+    f.close();
+  }
+});
+
+test("a warm session list reads no session record", { timeout: 60_000 }, async t => {
+  let host: Awaited<ReturnType<typeof inProcessHost>>;
+  try {
+    host = await inProcessHost();
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EPERM" || code === "EACCES" || code === "EADDRNOTAVAIL") {
+      t.skip(`the in-process host cannot listen on loopback here (${code})`);
+      return;
+    }
+    throw error;
+  }
+  const key = fs.readFileSync(host.config.keyFile);
+  const dir = (id: string) => join(host.config.stateDir, "sessions", id);
+  let spied: ReturnType<typeof spy> | undefined;
+  try {
+    const ids = Array.from({ length: 30 }, () => ID());
+    for (const id of ids) {
+      mkdirSync(dir(id), { recursive: true });
+      writeSealed(join(dir(id), "meta.sealed"), key, `${id}:meta`, { session: sessionOf(id), fingerprint: "fixture" });
+      writeSealed(join(dir(id), "status.sealed"), key, `${id}:status`, exitedState(1));
+    }
+    // The files settle, and the handoff poller runs twice; then the listing is warm.
+    await new Promise(resolve => setTimeout(resolve, 2_300));
+    await host.sessions.list();
+    await new Promise(resolve => setTimeout(resolve, 1_000));
+    await host.sessions.list();
+
+    spied = spy();
+    const rows = await host.sessions.list();
+    assert.ok(rows.length >= 30, `the warm listing returns the 30 rows (got ${rows.length})`);
+    assert.deepEqual(spied.reads.filter(path => path.includes("/sessions/")), [], "a warm listing reads no meta.sealed or status.sealed");
+  } finally {
+    spied?.restore();
+    await host.stop();
   }
 });

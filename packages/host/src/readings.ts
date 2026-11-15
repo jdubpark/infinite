@@ -102,8 +102,8 @@ export class Readings {
   private readonly active = new Map<string, string>();
   private readonly latestRows = new Map<string, LatestRow>();
   private readonly latestSessions = new Map<string, LatestSession>();
-  /** Every listed session's latest snapshot, valid while the row's title is the same. It never holds a prompt. */
-  private readonly settledSessions = new Map<string, { title: string; latest: LatestSession }>();
+  /** Every listed session's latest snapshot, valid while the row's title is the same and while the session's meta file has the same revision. It never holds a prompt. */
+  private readonly settledSessions = new Map<string, { title: string; revision: string; latest: LatestSession }>();
   private observationRevision = 0;
   private timer?: ReturnType<typeof setInterval>;
   private readonly apiKey?: string;
@@ -111,7 +111,7 @@ export class Readings {
   constructor(
     private readonly config: Config,
     private readonly key: Buffer,
-    private readonly manager: Pick<Manager, "list" | "meta">,
+    private readonly manager: Pick<Manager, "list" | "meta" | "metaRevision">,
     private readonly writer?: Pick<Summarizer, "titleFromPrompt">,
     private readonly transport?: JevTransport,
   ) {
@@ -203,11 +203,19 @@ export class Readings {
       const lastMessage = row.attention.lastMessage ?? "";
       this.latestRows.set(row.id, { backend: row.backend, state: row.attention.state,
         lastMessageHash: "", lastMessageLength: lastMessage.length });
-      const settled = this.settledSessions.get(row.id);
-      if (settled?.title === row.title && !this.titleDue(row.id, settled.latest)) { this.latestSessions.set(row.id, settled.latest); continue; }
+      const revision = source === "partial" ? undefined : this.manager.metaRevision(row.id);
+      const settled = source === "partial" ? undefined : this.settledSessions.get(row.id);
+      if (settled && revision !== undefined && settled.revision === revision && settled.title === row.title && !this.titleDue(row.id, settled.latest)) {
+        this.latestSessions.set(row.id, settled.latest);
+        continue;
+      }
       let session: Session;
       try { session = this.manager.meta(row.id).session; }
-      catch { this.latestSessions.delete(row.id); this.settledSessions.delete(row.id); continue; }
+      catch {
+        this.latestSessions.delete(row.id);
+        if (source !== "partial") this.settledSessions.delete(row.id);
+        continue;
+      }
       const prompt = session.initialPrompt ?? "";
       const titleIsDefault = defaultTitle(session.title, session.provider, session.generatedTitle);
       const line = titleIsDefault && prompt ? firstLine(prompt) : "";
@@ -215,7 +223,10 @@ export class Readings {
         promptLine: line.length <= 60 ? line : clipTitle(line), promptLineLength: line.length,
         ...(titleIsDefault && prompt ? { promptHash: messageHash(prompt) } : {}) };
       this.latestSessions.set(row.id, latest);
-      this.settledSessions.set(row.id, { title: row.title, latest });
+      if (source !== "partial") {
+        if (revision === undefined) this.settledSessions.delete(row.id);
+        else this.settledSessions.set(row.id, { title: row.title, revision, latest });
+      }
       onSession?.(row, session);
     }
     if (source === "partial") return;

@@ -13,8 +13,8 @@ type StartInProject = <T>(projectId: string, action: () => Promise<T>) => Promis
 /** One durable transfer per source. Creation retries reuse the persisted team identity. */
 export class HandoffService {
   private readonly records = new Map<string, Stored>();
-  /** Sources that will never request a handoff, with the view they keep: no policy (fixed at creation), or exited with no request in the journal. */
-  private readonly settled = new Map<string, HandoffView>();
+  /** Sources that will never request a handoff, with the view they keep: no policy (fixed at creation), or exited with no request in the journal. Valid only while the session's meta file has the same revision. */
+  private readonly settled = new Map<string, { view: HandoffView; revision: string }>();
   private readonly directory: string;
   private timer?: NodeJS.Timeout;
   private running = false;
@@ -36,12 +36,15 @@ export class HandoffService {
   private discover(sessionId: string, exited = false): Stored | undefined {
     const previous = this.records.get(sessionId);
     if (previous) return previous;
-    if (this.settled.has(sessionId)) return;
+    const kept = this.settled.get(sessionId);
+    if (kept) { if (kept.revision === this.manager.metaRevision(sessionId)) return; this.settled.delete(sessionId); }
     const source = this.manager.meta(sessionId).session;
-    if (!source.handoff?.policy) { this.settled.set(sessionId, { status: "unavailable", reason: source.handoff?.reason ?? "This session was created without a handoff capability." }); return; }
+    // The revision is the one the last listing saw. If the file changed since, the next listing sees another one and this answer is dropped.
+    const revision = this.manager.metaRevision(sessionId);
+    if (!source.handoff?.policy) { if (revision) this.settled.set(sessionId, { view: { status: "unavailable", reason: source.handoff?.reason ?? "This session was created without a handoff capability." }, revision }); return; }
     const event = this.manager.handoffRequest(sessionId);
     // A worker appends a request only while running, and an exited session gets no new events.
-    if (!event) { if (exited) this.settled.set(sessionId, { status: "available" }); return; }
+    if (!event) { if (exited && revision) this.settled.set(sessionId, { view: { status: "available" }, revision }); return; }
     const envelope = handoffEnvelopeSchema.parse(event.data);
     if (envelope.sessionId !== sessionId) throw new Error("Invalid handoff source");
     const policy = source.handoff.policy;
@@ -64,7 +67,7 @@ export class HandoffService {
   listedView(sessionId: string): HandoffView {
     if (this.records.has(sessionId)) return this.view(sessionId);
     const kept = this.settled.get(sessionId);
-    if (kept) return { ...kept };
+    if (kept && kept.revision === this.manager.metaRevision(sessionId)) return { ...kept.view };
     return this.view(sessionId);
   }
   activeForProject(projectId: string) {

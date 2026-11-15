@@ -10,6 +10,7 @@ import { createHash } from "node:crypto";
 import type {
   PermissionAgentCore,
   PermissionClassMatch,
+  PermissionDecideOptions,
   PermissionOutcome,
   PermissionPipeline,
   PermissionRejectRef,
@@ -208,7 +209,7 @@ export class HostPermissionPipeline implements PermissionPipeline {
     return this.core.classify(request, result.coverage.interruptClasses);
   }
 
-  async decide(request: PermissionRequest, options: { signal?: AbortSignal } = {}): Promise<PermissionOutcome> {
+  async decide(request: PermissionRequest, options: PermissionDecideOptions = {}): Promise<PermissionOutcome> {
     const served = this.coverage(request.requester.projectId);
     if (!served.served) return { kind: "not-served", reason: served.reason };
     const decisionId = decisionIdFor(request, served.coverage.authorityHash);
@@ -217,7 +218,7 @@ export class HostPermissionPipeline implements PermissionPipeline {
     const work = (async (): Promise<PermissionOutcome> => {
       try {
         // A delivery retry of one raised request gets the decision already recorded, so a repeat counts once.
-        return this.recordedOutcome(decisionId) ?? await this.decideFresh(request, served.coverage, decisionId, options.signal);
+        return this.recordedOutcome(decisionId) ?? await this.decideFresh(request, served.coverage, decisionId, options);
       } catch (error) {
         console.warn(`[Infinite] The permission pipeline could not decide a request (${error instanceof Error ? error.name : "error"}).`);
         return { kind: "undeliverable", reason: "The permission agent could not record a decision for this request." };
@@ -267,7 +268,7 @@ export class HostPermissionPipeline implements PermissionPipeline {
     request: PermissionRequest,
     coverage: Covered,
     decisionId: string,
-    signal: AbortSignal | undefined,
+    options: PermissionDecideOptions,
   ): Promise<PermissionOutcome> {
     const requester = request.requester;
     const familyText = this.core.familyOf({ provider: requester.provider, ...(requester.model ? { model: requester.model } : {}) });
@@ -337,7 +338,8 @@ export class HostPermissionPipeline implements PermissionPipeline {
         .filter(decision => decision.replayOf === undefined).map(rejectRef),
       raised,
       canAllow,
-      ...(signal ? { signal } : {}),
+      ...(options.collect ? { collect: options.collect } : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
     };
     let review: PermissionReview;
     try { review = await this.core.review(request, context); }

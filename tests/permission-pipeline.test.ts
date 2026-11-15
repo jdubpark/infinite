@@ -247,6 +247,15 @@ test("a class match reaches the owner with no model turn, cannot be allowed, and
   assert.equal(f.core.reviews.length, 0);
 }));
 
+test("the adapter's evidence collection reaches the review, and no collection exists without it", () => withFixture(async f => {
+  f.delegate();
+  const collect = async () => ({ files: [], limitations: [], digest: "none" });
+  await f.pipeline.decide(request({ action: "npm test" }), { collect });
+  assert.equal(f.core.reviews[0].context.collect, collect);
+  await f.pipeline.decide(request({ action: "npm run lint" }));
+  assert.equal(f.core.reviews[1].context.collect, undefined);
+}));
+
 test("a request that did not qualify is never allowed, and one with no one-shot reject is undeliverable", () => withFixture(async f => {
   f.delegate();
   f.core.next = () => allow();

@@ -182,6 +182,11 @@ export type PermissionOutcome =
   /** `notice` is the host's fixed text for the requester. No model text is in it. */
   | { kind: "reject"; decisionId: string; code: RejectCode; notice: string };
 
+export interface PermissionDecideOptions {
+  signal?: AbortSignal;
+  collect?: (paths: string[]) => Promise<PermissionEvidence>;
+}
+
 /**
  * Decides one request: coverage, class rules, qualify, lock, replay, raise, model turns. It records the
  * decision in the journal and returns it. It never delivers.
@@ -191,7 +196,11 @@ export interface PermissionPipeline {
   serves(projectId: string): PermissionServed;
   /** The class rule that sends this request to the owner, for a served project. It records nothing. */
   classOf(request: PermissionRequest): PermissionClassMatch | undefined;
-  decide(request: PermissionRequest, options?: { signal?: AbortSignal }): Promise<PermissionOutcome>;
+  /**
+   * `collect` is the requester adapter's bounded read-only collection inside the session root. The
+   * strong turn can ask for source paths only through it; without it no path is collected.
+   */
+  decide(request: PermissionRequest, options?: PermissionDecideOptions): Promise<PermissionOutcome>;
   /**
    * Whether a recorded decision may still be applied now: its project is still covered under the same
    * authority, the host is ready, and no revoke, regrouping or direction change retired it.

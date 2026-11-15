@@ -10,10 +10,10 @@ import { matchDestructive } from "@infinite/attention";
 import type { PermissionClassMatch, PermissionQualification, PermissionRequest } from "./permission-agent-types.js";
 import type { InterruptClass } from "./permission-policy.js";
 import { canonicalJson } from "./evidence/crypto.js";
-import { inlineShellScript, quoteWord, readShell, resolveWord, type PathResolver, type SimpleCommand } from "./permission-shell.js";
+import { quoteWord, readShell, resolveWord, type PathResolver, type SimpleCommand } from "./permission-shell.js";
 
-/** Bumped by any change to the rule code below that is not a change to the lists. */
-export const CLASS_RULES_VERSION = 1;
+/** Bumped by any change to the rule code below, or to the shell reading it uses, that is not a change to the lists. */
+export const CLASS_RULES_VERSION = 2;
 
 /**
  * The host's lists. Commands are word prefixes after wrappers (sudo, env, timeout) are removed. Paths
@@ -188,27 +188,22 @@ export function readRequest(request: PermissionRequest, resolvePath?: PathResolv
 
   const shell = SHELL_TOOLS.has(tool.toLowerCase()) || typeof input.command === "string" || Array.isArray(input.command);
   if (shell) {
-    let source: string;
-    if (Array.isArray(input.command) && input.command.every(word => typeof word === "string")) {
-      const argv = input.command as string[];
-      source = inlineShellScript(argv) ?? argv.map(quoteWord).join(" ");
-    } else source = typeof input.command === "string" ? input.command : request.action;
+    // An argv is one command: its words are literal. A literal shell body inside it is read by readShell, layer by layer.
+    const source = Array.isArray(input.command) && input.command.every(word => typeof word === "string")
+      ? (input.command as string[]).map(quoteWord).join(" ")
+      : typeof input.command === "string" ? input.command : request.action;
     const reading = readShell(source, cwd, real);
     for (const reason of reading.opaqueReasons) reasons.add(reason);
-    for (const command of reading.commands) {
-      // One level of `sh -c 'literal'` is read as the script it runs.
-      const script = inlineShellScript(command.argv);
-      if (script !== undefined && !command.scriptExpands) {
-        const inner = readShell(script, command.cwd ?? cwd, real);
-        for (const reason of inner.opaqueReasons) reasons.add(reason);
-        for (const nested of inner.commands) commands.push({ ...nested, privileged: nested.privileged || command.privileged });
-        for (const redirect of command.redirects) add(redirect.target, redirect.op.includes(">") ? "write" : "read", command.cwd ?? cwd);
-        continue;
-      }
-      commands.push(command);
-    }
+    commands.push(...reading.commands);
+    const entered = new Set<string>();
     for (const command of commands) {
-      const base = command.cwd ?? cwd;
+      // A directory the command runs in is a target of its own, so a command run elsewhere is judged there.
+      if (command.cwd !== undefined && command.cwd !== cwd && !entered.has(command.cwd)) {
+        entered.add(command.cwd);
+        targets.push({ path: command.cwd, access: "unknown", word: command.cwd });
+      }
+      // In a directory the text does not establish, a relative path is unresolved.
+      const base = command.cwdUnknown ? undefined : command.cwd ?? cwd;
       for (const redirect of command.redirects) add(redirect.target, redirect.op === "<" ? "read" : "write", base);
       operandTargets(command, base, add, real);
     }
@@ -231,7 +226,7 @@ export function readRequest(request: PermissionRequest, resolvePath?: PathResolv
   return { commands, targets, urls, opaque: reasons.size > 0, opaqueReasons: [...reasons], shell, tool, unresolved, ...(real ? { resolve: real } : {}) };
 }
 
-function operandTargets(command: SimpleCommand, cwd: string, add: (word: string, access: Access, base: string | undefined) => void, real?: PathResolver) {
+function operandTargets(command: SimpleCommand, cwd: string | undefined, add: (word: string, access: Access, base: string | undefined) => void, real?: PathResolver) {
   const { name, argv } = command;
   if (name === "cd" || name === "pushd") return;
   let base = cwd;
@@ -340,7 +335,7 @@ function isGlobalSettingsCommand(command: SimpleCommand, request: PermissionRequ
     if (has("--file", "-f")) {
       const index = command.argv.findIndex(arg => arg === "--file" || arg === "-f");
       const file = command.argv[index + 1];
-      const path = file && resolveWord(file, command.cwd ?? request.requester.sessionRoot, real);
+      const path = file && resolveWord(file, command.cwdUnknown ? undefined : command.cwd ?? request.requester.sessionRoot, real);
       if (!path || !insideSession(request, path)) return true;
     }
     // A hook path or fsmonitor in the repository's own config runs code on later git commands.
@@ -411,10 +406,12 @@ const CLASS_RULES: readonly ClassRule[] = [
       const scope = destructive.length ? destructive : reading.commands;
       const paths: string[] = [];
       for (const command of scope) {
-        const base = command.cwd ?? request.requester.sessionRoot;
+        const base = command.cwdUnknown ? undefined : command.cwd ?? request.requester.sessionRoot;
         for (const target of reading.targets) if (command.words.includes(target.word) || command.redirects.some(redirect => redirect.target === target.word)) paths.push(target.path);
-        // A git command with no path operand acts on its working directory.
-        if (command.name === "git") paths.push(command.argv.includes("-C") ? resolveWord(command.argv[command.argv.indexOf("-C") + 1] ?? "", base, reading.resolve) ?? base : base);
+        // A git command with no path operand acts on its working directory. An unknown one is not established: the reading is opaque.
+        const gitDirectory = command.name !== "git" ? undefined
+          : command.argv.includes("-C") ? resolveWord(command.argv[command.argv.indexOf("-C") + 1] ?? "", base, reading.resolve) ?? base : base;
+        if (gitDirectory !== undefined) paths.push(gitDirectory);
       }
       return paths.some(path => !insideSession(request, path));
     },

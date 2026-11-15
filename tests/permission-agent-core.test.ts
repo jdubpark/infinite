@@ -116,6 +116,55 @@ test("each interrupt class routes a concrete request through a class rule, and n
   assert.equal(classify(bash("gh auth login"), CLASSES.filter(name => name !== "credentials")), undefined);
 });
 
+test("literal shell bodies are read to three layers, and a shell or working directory the host cannot read is raised", async () => {
+  const request = (command: string | string[]) => typeof command === "string" ? bash(command) : tool("Bash", { command });
+  const rule = (command: string | string[]) => classify(request(command), CLASSES)?.rule;
+  const raised = (command: string | string[]) => raise(request(command), { rejectHistory: false });
+
+  // A literal shell body is read as the commands it runs, behind any wrapper the host unwraps.
+  for (const command of [
+    `sh -c 'sh -c "npm login"'`,
+    `sh -c "sh -c 'sh -c \\"npm login\\"'"`,
+    `bash -lc 'npm login'`, `zsh -c 'npm login'`, `dash -c 'npm login'`, ["bash", "-lc", "sh -c 'npm login'"],
+    `env sh -c 'npm login'`, `nice -n 5 bash -c 'npm login'`, `timeout 5 sh -c 'npm login'`, `nohup sh -c 'npm login'`,
+    `sudo -u root sh -c 'npm login'`, `sudo -iu root npm login`, `env -S 'npm login'`, `env -S 'sh -c "npm login"'`,
+  ]) assert.equal(rule(command), "class:credential-command", JSON.stringify(command));
+
+  // Past three layers, or where a shell's body is not literal text, the shell is opaque and the light tier never decides it.
+  const fourLayers = `sh -c "sh -c 'sh -c \\"sh -c npm\\\\ login\\"'"`;
+  for (const command of [
+    fourLayers, `bash -c "$NEXT"`, `sh -c 'eval npm login'`, `echo 'npm login' | bash -s`, `echo 'npm login' | sudo -i`,
+    `bash <<< 'npm login'`, "sh <<EOF\nnpm login\nEOF", `bash script.sh`, `env -S 'npm login'`,
+    `echo x | xargs sh -c 'npm login'`, `find . -exec sh -c 'npm login' \\;`,
+  ]) assert.ok(raised(command).includes("raise:opaque"), command);
+  assert.equal(rule(fourLayers), undefined);
+  const fake = fakeLauncher(turn => turn.tier === "light" ? { verdict: "allow", note: "Fine." } : { verdict: "reject", code: "uncertain", note: "Unsure." });
+  const core = createPermissionAgentCore({ settings: settings(), launcher: fake.launcher });
+  await core.review(request(fourLayers), context({ raised: core.raise(request(fourLayers), { rejectHistory: false }) }));
+  assert.deepEqual(fake.turns.map(turn => turn.tier), ["strong"]);
+  assert.deepEqual(raised(`bash -lc 'npm test'`), []);
+
+  // A wrapper's working directory is applied: a relative path resolves there.
+  for (const command of [
+    "env -C /etc tee profile", "env --chdir=/etc tee profile", "env -C/etc tee profile", "sudo -D /etc tee profile", "sudo --chdir=/etc tee profile",
+    "env -C /etc sh -c 'tee profile'", "bash -lc 'cd /etc && tee profile'",
+  ]) assert.equal(rule(command), "class:host-configuration", command);
+  assert.equal(rule("env -C /home/dev/projects/other-app rm -rf build"), "class:destructive-outside");
+  assert.equal(rule("sh -c 'cd /etc' && tee profile"), undefined, "a cd inside a shell body ends with it");
+  // An inside directory keeps the command inside; an outside one is a target even when the command names no path.
+  for (const command of ["env -C src tee notes.txt", `env -C ${ROOT}/src rm -rf build`]) {
+    assert.equal(rule(command), undefined, command);
+    assert.ok(!raised(command).includes("raise:outside-root"), command);
+  }
+  for (const command of ["env -C /home/dev/projects/other-app git status", "cd /home/dev/projects/other-app && ls",
+    "git -C /home/dev/projects/other-app status", "make -C /etc install", "npm --prefix /etc install left-pad"])
+    assert.ok(raised(command).includes("raise:outside-root"), command);
+  // A directory the text does not establish is unknown, never the previous one.
+  for (const command of ["env -C $DIR tee profile", "cd $DIR && rm -rf build", "cd - && rm -rf build", "sudo -R /srv/jail tee profile"])
+    assert.ok(raised(command).includes("raise:opaque"), command);
+  assert.equal(rule("cd && rm -rf build"), "class:destructive-outside", "cd alone goes to the home directory");
+});
+
 test("a write to the configuration file the host was started with needs the owner", () => {
   const config = { stateDir: "/srv/host/state", runDir: "/srv/host/run", keyFile: "/srv/host/vault.key", agents: {} };
   const facts = { protectedPaths: hostProtectedPaths(config, "/opt/host", ["/srv/custom/host.json"]) };

@@ -1319,7 +1319,7 @@ test("repo init keeps the team settings it does not own when it runs again", { t
     const enrolled = (await run.host.fetchApi("/projects/rehearsal/team")).body;
     const features = { areas: [{ id: "host", paths: ["src"] }] };
     const saved = await run.host.fetchApi("/projects/rehearsal/team", "owner", {
-      requestId: randomUUID(), revision: enrolled.revision, team: { ...enrolled.team, handoffMinutes: 30, features, eval: { capture: true } },
+      requestId: randomUUID(), revision: enrolled.revision, team: { ...enrolled.team, handoffMinutes: 30, features, eval: { capture: true }, objective: { prompts: "on" } },
     }, undefined, "PUT");
     assert.equal(saved.status, 200);
     const before = (await run.host.fetchApi("/projects/rehearsal/team")).body.team;
@@ -1330,6 +1330,7 @@ test("repo init keeps the team settings it does not own when it runs again", { t
     assert.equal(rerun.handoffMinutes, 30);
     assert.deepEqual(rerun.eval, { capture: true });
     assert.deepEqual(rerun.features, features);
+    assert.deepEqual(rerun.objective, { prompts: "on" });
     assert.deepEqual(rerun.checks, JSON.parse(firstChecks));
     await enroll(secondChecks);
     const changed = (await run.host.fetchApi("/projects/rehearsal/team")).body.team;
@@ -1337,5 +1338,6 @@ test("repo init keeps the team settings it does not own when it runs again", { t
     assert.equal(changed.handoffMinutes, 30);
     assert.deepEqual(changed.eval, { capture: true });
     assert.deepEqual(changed.features, features);
+    assert.deepEqual(changed.objective, { prompts: "on" });
   } finally { await run.close(); rmSync(localRoot, { recursive: true, force: true }); }
 });

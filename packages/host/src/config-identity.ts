@@ -4,7 +4,7 @@ import { canonicalJson } from "./evidence/crypto.js";
 import { profileIdentity } from "./run-events.js";
 import { entryCommand, reportCommand, teamPrompt } from "./team-prompts.js";
 import { teamCommand, teamGitArgs } from "./team-workspace.js";
-import type { TeamCommand, TeamMember, TeamModelProfile, TeamRun, TeamScout, TeamTask } from "./team-types.js";
+import type { RecordDigest, TeamCommand, TeamMember, TeamModelProfile, TeamRun, TeamScout, TeamTask } from "./team-types.js";
 import type { Provider } from "./types.js";
 
 /** Guidance files whose blobs a configuration identity covers (umbrella C7, component 3, default set). */
@@ -75,6 +75,14 @@ const FIXTURE_TASK: TeamTask = { id: "fixture-task", title: "Fixture task", inst
 const FIXTURE_SCOUT: TeamScout = { id: "fixture-scout", title: "Fixture scout", instructions: "Fixture scout instructions.", agentProfileId: "fixture-scout", status: "pending" };
 const FIXTURE_PROFILE = { id: "fixture-profile", label: "Fixture profile", provider: "claude", model: "fixture-model", effort: "high" } as const;
 
+/** The record digest the goal fixture takes when the objective switch is on. Its shape is the digest's, not a live record. */
+const FIXTURE_RECORD: RecordDigest = {
+  version: 1,
+  criteria: [
+    { id: "c0", statement: "", check: "judgement:owner-text", producer: "evaluator" },
+    { id: "c1", statement: "Fixture owner criterion.", check: "command:npm test", producer: "host" },
+  ],
+};
 /** Two fixed runs, each with its work item. Rendering them is the prompt version; no live run is read. */
 const FIXTURES: { run: TeamRun; work: TeamTask | TeamScout }[] = [
   {
@@ -116,23 +124,25 @@ function waitIn<T>(waiters: Set<(value: T | undefined) => void>, signal: AbortSi
  * which change with the install directory and not with the wording, so a placeholder stands in for it.
  * Throws when teamPrompt throws.
  */
-export function renderedPrompts(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean, entryTools = false): string[] {
+export function renderedPrompts(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean, entryTools = false, objectiveDigest = false): string[] {
   const command = reportCommand();
   const entry = entryCommand();
-  return FIXTURES.map(({ run, work }) =>
-    teamPrompt(entryTools ? { ...run, blackboard: { tools: true } } : run, role, work, undefined, provider, profile, { checks: FIXTURE_CHECKS }, [], publishHeads)
-      .split(command).join("<report-command>").split(entry).join("<entry-command>"));
+  return FIXTURES.map(({ run: plain, work }) => {
+    const run = objectiveDigest && plain.goal ? { ...plain, goal: { ...plain.goal, record: FIXTURE_RECORD } } : plain;
+    return teamPrompt(entryTools ? { ...run, blackboard: { tools: true } } : run, role, work, undefined, provider, profile, { checks: FIXTURE_CHECKS }, [], publishHeads)
+      .split(command).join("<report-command>").split(entry).join("<entry-command>");
+  });
 }
 
 /**
  * The digest of `renderedPrompts`. Cached per exact render input: the prompt prints the whole profile object, so
  * every profile field is part of the key. Throws when teamPrompt throws.
  */
-export function promptVersion(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean, entryTools = false): string {
-  const key = JSON.stringify([role, provider, profile ?? null, publishHeads, entryTools]);
+export function promptVersion(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean, entryTools = false, objectiveDigest = false): string {
+  const key = JSON.stringify([role, provider, profile ?? null, publishHeads, entryTools, objectiveDigest]);
   const cached = promptCache.get(key);
   if (cached !== undefined) return cached;
-  const version = sha256(canonicalJson(renderedPrompts(role, provider, profile, publishHeads, entryTools)));
+  const version = sha256(canonicalJson(renderedPrompts(role, provider, profile, publishHeads, entryTools, objectiveDigest)));
   if (promptCache.size >= PROMPT_CACHE_LIMIT) promptCache.delete(promptCache.keys().next().value!);
   promptCache.set(key, version);
   return version;
@@ -220,14 +230,14 @@ async function guidanceRead(workspace: string, commit: string, prefix: TeamComma
 /** The data of `member.configured`, or undefined when any component is unknown. Never throws. */
 export async function memberConfiguration(input: {
   workspace: string; baseCommit: string; role: TeamMember["role"]; provider: Provider;
-  profile?: TeamModelProfile; publishHeads: boolean; entryTools?: boolean; prefix?: TeamCommand;
+  profile?: TeamModelProfile; publishHeads: boolean; entryTools?: boolean; objectiveDigest?: boolean; prefix?: TeamCommand;
 }, signal: AbortSignal): Promise<MemberConfiguration | undefined> {
   try {
     const guidance = await readGuidanceDigest(input.workspace, input.baseCommit, input.prefix, signal);
     if (guidance === undefined) return undefined;
     const identity = profileIdentity(input.profile, input.provider);
     const profile: ProfileKey = { provider: identity.provider, model: identity.model ?? null, effort: identity.effort ?? null };
-    const version = promptVersion(input.role, input.provider, input.profile, input.publishHeads, input.entryTools === true);
+    const version = promptVersion(input.role, input.provider, input.profile, input.publishHeads, input.entryTools === true, input.objectiveDigest === true);
     const components: ConfigComponents = { profile, promptVersion: version, guidance, knowledge: "none", routing: "off", shape: "team" };
     return { ...profile, promptVersion: version, guidance, knowledge: "none", routing: "off", shape: "team", configId: configId(components) };
   } catch {

@@ -88,7 +88,7 @@ const positiveInt = z.number().int().min(1);
 const perEntry = z.number().int().min(1).max(8);
 const countBound = z.number().int().min(0).max(1_000_000);
 
-const threshold = z.union([
+export const thresholdSchema: z.ZodType<Threshold> = z.union([
   z.strictObject({ kind: z.literal("pass") }),
   z.strictObject({ kind: z.literal("count"), min: countBound.optional(), max: countBound.optional() })
     .refine(value => value.min !== undefined || value.max !== undefined, "A count threshold needs min or max")
@@ -99,7 +99,7 @@ const threshold = z.union([
 
 const commandDigest = z.string().regex(/^[0-9a-f]{64}$/, "A command is a 64-character lower-case hex digest");
 
-const check = z.union([
+export const checkSchema: z.ZodType<Check> = z.union([
   z.strictObject({ kind: z.literal("command"), command: commandDigest }),
   z.strictObject({ kind: z.literal("receipt"), receipt: z.enum(["checks-passed", "review-approved", "merged", "landed"]) }),
   z.strictObject({ kind: z.literal("artifact"), path: pathSchema, schema: handleSchema.optional(), count: pointer.optional() }),
@@ -114,9 +114,9 @@ const criterion = z.strictObject({
   derivedFrom: bytesBetween(1, L.derivedFromBytes).optional(),
   statement: z.string().refine(value => byteLength(value) <= L.c0Bytes, "Criterion statement is over 16,000 bytes"),
   statementOf: z.literal("objective").optional(),
-  check,
+  check: checkSchema,
   producer: z.enum(["host", "evaluator", "owner"]),
-  threshold,
+  threshold: thresholdSchema,
   pinned: z.array(z.strictObject({ path: pathSchema, blob: z.string().regex(BLOB_RE) })).max(L.pinnedPaths).optional(),
   latest: z.strictObject({
     state: z.enum(["met", "not-met", "inconclusive", "pending-owner"]),
@@ -128,7 +128,7 @@ const criterion = z.strictObject({
 
 const assumptionTest = z.union([
   z.strictObject({ kind: z.literal("command"), command: commandDigest, refutesOn: z.enum(["fail", "pass"]) }),
-  z.strictObject({ kind: z.literal("artifact"), path: pathSchema, count: pointer, citedPerEntry: perEntry.optional(), threshold }),
+  z.strictObject({ kind: z.literal("artifact"), path: pathSchema, count: pointer, citedPerEntry: perEntry.optional(), threshold: thresholdSchema }),
   z.strictObject({ kind: z.literal("citation"), source: bytesBetween(1, L.summaryBytes), quote: bytesBetween(1, L.summaryBytes), refutesOn: z.enum(["absent", "present"]) }),
   z.strictObject({
     kind: z.literal("owner"),
@@ -194,6 +194,23 @@ const owner = z.union([
   z.strictObject({ kind: z.literal("run"), runId: z.uuid() }),
 ]);
 
+/** The producer a check implies: host for command, receipt, artifact, and citation checks; evaluator for judgement; owner for owner-rating. */
+export function producerOf(check: Check): Criterion["producer"] {
+  if (check.kind === "judgement") return "evaluator";
+  if (check.kind === "owner-rating") return "owner";
+  return "host";
+}
+
+/** A count threshold for an artifact with a count, a share for citations, a score for owner ratings, and pass for the rest. */
+export function thresholdFits(check: Check, threshold: Threshold): boolean {
+  switch (check.kind) {
+    case "artifact": return check.count !== undefined ? threshold.kind === "count" : threshold.kind === "pass";
+    case "citations": case "citation-form": return threshold.kind === "share";
+    case "owner-rating": return threshold.kind === "score";
+    default: return threshold.kind === "pass";
+  }
+}
+
 /** Record-level rules. Each returns a fixed message, and the schema reports every one. */
 function recordProblems(record: ObjectiveRecord): string[] {
   const problems: string[] = [];
@@ -239,18 +256,9 @@ function recordProblems(record: ObjectiveRecord): string[] {
     }
   }
 
-  const hostChecks = ["command", "receipt", "artifact", "citations", "citation-form"];
   for (const item of record.criteria) {
-    const kind = item.check.kind;
-    const producer = hostChecks.includes(kind) ? "host" : kind === "judgement" ? "evaluator" : "owner";
-    if (item.producer !== producer) fail("A criterion's producer must fit its check");
-    const kindOfThreshold = item.threshold.kind;
-    let fits: boolean;
-    if (item.check.kind === "artifact") fits = item.check.count !== undefined ? kindOfThreshold === "count" : kindOfThreshold === "pass";
-    else if (item.check.kind === "citations" || item.check.kind === "citation-form") fits = kindOfThreshold === "share";
-    else if (item.check.kind === "owner-rating") fits = kindOfThreshold === "score";
-    else fits = kindOfThreshold === "pass";
-    if (!fits) fail("A criterion's threshold must fit its check");
+    if (item.producer !== producerOf(item.check)) fail("A criterion's producer must fit its check");
+    if (!thresholdFits(item.check, item.threshold)) fail("A criterion's threshold must fit its check");
   }
 
   const texts = [record.statement.objective, ...record.statement.directions.map(item => item.text)];

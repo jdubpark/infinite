@@ -1082,3 +1082,72 @@ test("the halt adds no clock rule: its pause stops an intake mission's clock as 
     assert.ok(left > 9 * 60000 && left <= 10 * 60000, "the intake mission keeps the 10 minutes it had when the halt paused it");
   } finally { s.close(); f.close(); }
 });
+
+test("an owner's pause after a halted extension supersedes the extension's waiting resume, so the release resumes nothing", async () => {
+  const f = schedulerFixture();
+  const missionId = randomUUID(), child = waitingRun(f, { missionId, title: "Waiting subteam" } as Partial<TeamRun>);
+  writeMission(f, "fixture", [subtaskOf("a", child.id)], missionId);
+  const s = missionsUnderHalt(f);
+  try {
+    await s.halt.engage(fixtureScope, { requestId: randomUUID() }, owner);
+    await s.applyOps(missionId);
+    s.record(missionId).mission.deadlineAt = new Date(Date.now() - 60000).toISOString();
+    await s.stepMission(missionId);
+    await s.extend(missionId);
+    await s.applyOps(missionId);
+    assert.deepEqual(s.record(missionId).ops.map(op => op.kind), ["resume"], "the extension's resume waits behind the halt");
+
+    // The owner pauses the mission before the halt is released.
+    await s.missions.pause(missionId, { requestId: randomUUID(), revision: s.record(missionId).mission.revision });
+    await s.applyOps(missionId);
+    assert.deepEqual(s.record(missionId).ops, [], "the owner's later pause supersedes the waiting resume");
+    await s.halt.release(fixtureScope, { requestId: randomUUID() }, owner);
+    await s.applyOps(missionId);
+    assert.equal(s.record(missionId).mission.status, "paused");
+    assert.equal(s.teams.get(child.id).status, "paused", "the release does not resume the subteam of a mission the owner paused");
+    assert.deepEqual(s.record(missionId).ops, []);
+
+    // The owner's resume of the mission continues the subteam where it waited.
+    await s.missions.resume(missionId, { requestId: randomUUID(), revision: s.record(missionId).mission.revision });
+    await s.applyOps(missionId);
+    assert.equal(s.teams.get(child.id).status, "needs-input");
+    assert.equal(s.teams.get(child.id).revision, 1);
+  } finally { s.close(); f.close(); }
+});
+
+test("a halt engaged before an earlier halt's resume reaches a subteam holds that resume, and its own release decides it", async () => {
+  for (const keepPaused of [false, true]) {
+    const f = schedulerFixture();
+    const missionId = randomUUID(), child = waitingRun(f, { missionId, title: "Waiting subteam" } as Partial<TeamRun>);
+    writeMission(f, "fixture", [subtaskOf("a", child.id)], missionId);
+    const s = missionsUnderHalt(f);
+    try {
+      await s.halt.engage(fixtureScope, { requestId: randomUUID() }, owner);
+      await s.applyOps(missionId);
+      assert.equal(s.teams.get(child.id).status, "paused");
+      // The first halt is released, and a second engages before its resume reaches the subteam.
+      await s.halt.release(fixtureScope, { requestId: randomUUID() }, owner);
+      assert.deepEqual(s.record(missionId).ops.map(op => op.kind), ["resume"]);
+      await s.halt.engage(fixtureScope, { requestId: randomUUID() }, owner);
+      assert.equal(s.record(missionId).mission.status, "paused");
+      await s.applyOps(missionId); await step(s.teams, child.id);
+      assert.equal(s.teams.get(child.id).status, "paused", "the earlier halt's resume waits under the second halt");
+      assert.equal(f.launches.length, 0);
+
+      await s.halt.release(fixtureScope, { requestId: randomUUID(), keepPaused }, owner);
+      await s.applyOps(missionId);
+      if (!keepPaused) {
+        assert.equal(s.teams.get(child.id).status, "needs-input", "the second release lets the waiting resume continue the subteam where it waited");
+        assert.equal(s.teams.get(child.id).revision, 1);
+      } else {
+        assert.equal(s.teams.get(child.id).status, "paused", "a release that keeps the mission paused keeps the subteam paused");
+        assert.equal(s.teams.get(child.id).reason, KEPT_PAUSED, "and the subteam no longer shows the first halt's reason");
+        assert.deepEqual(s.record(missionId).ops, [], "the earlier resume is retired");
+        await s.missions.resume(missionId, { requestId: randomUUID(), revision: s.record(missionId).mission.revision });
+        await s.applyOps(missionId);
+        assert.equal(s.teams.get(child.id).status, "needs-input", "the owner's resume continues the subteam where it waited");
+      }
+      assert.deepEqual(s.record(missionId).ops, []);
+    } finally { s.close(); f.close(); }
+  }
+});

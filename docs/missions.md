@@ -322,7 +322,12 @@ resumes none of its subteams; each subteam the halt paused shows the time limit
 instead of the halt. The owner can extend the time limit during the halt. The
 deadline moves at once, but the subteams stay paused: a mission the halt paused
 resumes them on release, and the resumes that an extension of a blocked mission
-queues wait until no halt covers any of its repositories.
+queues wait until no halt covers any of its repositories. Every subteam resume
+waits while its mission is paused, blocked at its time limit, or halted, and a
+later pause of the mission withdraws it. A halt that engages before an earlier
+halt's resume reaches a subteam holds that resume: its own release lets the
+subteam continue, or, if the mission stays paused, retires the resume and shows
+the mission's reason on the subteam.
 
 Status honesty: `ready-for-review` means the coordinator reported a result after
 every subtask finished. It does not establish product impact or acceptance. Each

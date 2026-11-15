@@ -27,6 +27,8 @@ export type ProjectGroupLookup = { get(id: string): ProjectGroup };
 type Action = { requestId: string; revision: number };
 /** One coordinator session. Like a team member, it ends with one report; the host starts the next attempt when needed. */
 type Attempt = { memberId: string; sessionId: string; revision: number; prompt: string; cursor: number; stopRequestId: string; status: "queued" | "running" | "reported" | "stopped"; report?: MissionReport; startedAt?: string;
+  /** The host requested this session stop because its mission was no longer live. */
+  stopping?: true;
   continuation?: NativeContinuation;
   nativeConfirmed?: boolean;
   resumeFailed?: boolean;
@@ -1041,7 +1043,7 @@ export class MissionService {
     if (attempt.status === "running") {
       // A report filed while a missed-report stop is pending or being retried still counts.
       this.readReport(stored, attempt);
-      if (attempt.status === "running" && !attempt.missedReport && live.has(mission.status)) {
+      if (attempt.status === "running" && !attempt.stopping && !attempt.missedReport && live.has(mission.status)) {
         const state = await this.manager.state(attempt.sessionId);
         if (attempt.continuation && state.nativeSession?.id === attempt.continuation.nativeSessionId) attempt.nativeConfirmed = true;
         // A coordinator that ends its turn without a report, or goes quiet, would otherwise hold the attempt open
@@ -1065,6 +1067,7 @@ export class MissionService {
     }
     // A reported attempt, or one the mission no longer wants, is stopped before anything acts on its report.
     let state;
+    if (!live.has(mission.status) && !attempt.stopping) { attempt.stopping = true; this.save(stored); }
     try { state = await this.manager.stopTeamSession(attempt.sessionId, attempt.stopRequestId, this.assignment(stored, attempt)); }
     catch { this.save(stored); return; }
     if (attempt.continuation && state.nativeSession?.id === attempt.continuation.nativeSessionId) attempt.nativeConfirmed = true;
@@ -1081,11 +1084,13 @@ export class MissionService {
       if (applied) { this.keepNote(stored, attempt); this.consume(stored, attempt.report!, attempt); }
       else this.event(stored, "A coordinator report arrived after the mission stopped; it was not applied.");
       delete attempt.note;
-    } else if (attempt.missedReport && live.has(mission.status))
+    } else if (attempt.missedReport && live.has(mission.status) && !attempt.stopping)
       this.refuse(stored, "missing", "Your previous attempt ended without a mission report. File exactly one report in every attempt; report wait when nothing needs a decision.");
     // A consumed message is settled only by an applied report. A pause that stopped this attempt first returns its
     // messages for the attempt after resume; a conversation resumed inside the idle window may see them twice.
-    if (!applied && (mission.status === "paused" || mission.status === "blocked" && mission.stopReason === "deadline")) returnConsumed(stored, attempt);
+    // An attempt the host stopped while its mission was not live, and which ended after the mission went live again
+    // (resume or extend), returns its messages too, so the next attempt reads them.
+    if (!applied && (attempt.stopping && live.has(mission.status) || mission.status === "paused" || mission.status === "blocked" && mission.stopReason === "deadline")) returnConsumed(stored, attempt);
     this.save(stored);
   }
   /** Keeps the newest notes within the count and length limits; the oldest go first. A refused report's note is kept too. */

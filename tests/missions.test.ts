@@ -1893,6 +1893,39 @@ test("a pending subteam resume stays withheld after deadline until the owner ext
   } finally { h.close(); mock.timers.reset(); }
 });
 
+test("an extension while the coordinator's stop is still in flight keeps the preserved work and starts a fresh attempt", { timeout: 60000 }, async () => {
+  const h = scripted(); mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const created = await h.missions.create(missionRequest(5)); await h.attempt(1);
+    await h.holdStop(1);
+    mock.timers.tick(6 * 60000);
+    await waitFor(() => h.stops(1), count => count > 0);
+    const blocked = await until(() => h.get(created.id), mission => mission.status === "blocked");
+    const extended = await h.missions.extend(created.id, { requestId: randomUUID(), revision: blocked.revision, minutes: 20 });
+    await h.releaseStop(1);
+    await until(() => h.attempts(), count => count >= 2);
+    const resumed = h.get(created.id);
+    assert.notEqual(resumed.status, "blocked");
+    assert.ok(!resumed.events.some(event => event.text.includes("coordinator exited without a valid structured report")));
+    assert.equal(extended.stopReason, undefined);
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("resuming a mission while the coordinator's pause stop is still in flight starts a fresh attempt", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const created = await h.missions.create(missionRequest()); await h.attempt(1); await h.holdStop(1);
+    const paused = await h.missions.pause(created.id, { requestId: randomUUID(), revision: created.revision });
+    await waitFor(() => h.stops(1), count => count > 0);
+    await h.missions.resume(created.id, { requestId: randomUUID(), revision: paused.revision });
+    await h.releaseStop(1);
+    await waitFor(() => Promise.resolve(h.attempts()), count => count >= 2);
+    const resumed = h.get(created.id);
+    assert.notEqual(resumed.status, "blocked");
+    assert.ok(!resumed.events.some(event => event.text.includes("coordinator exited without a valid structured report")));
+  } finally { h.close(); }
+});
+
 test("a queued steer for a blocked subteam waits until its deadline-blocked mission is extended", { timeout: 60000 }, async () => {
   const h = scripted(); mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
   try {

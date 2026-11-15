@@ -393,6 +393,14 @@ async function main() {
       summary: "The request is limited to reading the assigned project file for the stated objective." });
   } else if (assignment.role === "implementer") {
     if (scenario !== "live-limit" && scenario !== "mixed" && scenario !== "result-operation-fails-once") await waitForPeer();
+    if (scenario === "host-load-check") {
+      writeFileSync(join(receiptDir, `${assignment.memberId}.check-held`), "ready", { mode: 0o600 });
+      const until = Date.now() + 30000;
+      while (!existsSync(join(receiptDir, `${assignment.runId}.check-release`))) {
+        if (Date.now() >= until) throw new Error("The test did not release the implementers before checking host capacity");
+        await new Promise(resolve => setTimeout(resolve, 40));
+      }
+    }
     const shouldBlock = scenario === "agent-blocked-once" && assignment.revision === 1 || scenario === "agent-blocked-twice" && assignment.revision <= 3;
     if (shouldBlock && assignment.taskId === "a") {
       if (scenario === "agent-blocked-once") {

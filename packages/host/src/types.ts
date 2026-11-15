@@ -123,6 +123,8 @@ export interface Config {
   hostLoad?: { minAvailableMemoryGiB: number; maxLoadPerCpu: number };
   /** Linear and Slack request intake; the Linear credential above is required when this is set. */
   intake?: import("./intake-types.js").IntakeConfig;
+  /** Separate authenticated request connector; absent keeps its listener disabled. */
+  mcp?: import("./mcp-types.js").McpConfig;
   /** Separate working copies, writable by the host and selected provider execution account. */
   teams?: {
     workspaceDir: string; commandPrefix?: import("./team-types.js").TeamCommand; lineup?: import("./team-types.js").TeamLineup;

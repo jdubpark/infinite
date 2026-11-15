@@ -67,6 +67,8 @@ import { MissionService, missionBoard } from "./missions.js";
 import { IntakeStore } from "./intake-store.js";
 import { IntakeLinear } from "./intake-linear.js";
 import { IntakeService } from "./intake.js";
+import { createMcpServer } from "./mcp-server.js";
+import { McpRequestService } from "./mcp-requests.js";
 import { IntakeSlackSurface } from "./intake-slack.js";
 import { SlackClient } from "./slack-client.js";
 import { createMissionSchema, missionActionSchema, missionExtendSchema, missionTextSchema, type CreateMission, type Mission, type MissionOrigin } from "./mission-types.js";
@@ -343,20 +345,22 @@ export function createApp(config: Config, key: Buffer) {
     if (handoffs.activeForProject(projectId)) throw new TeamError(409, "handoff-in-progress", "This project is transferring a task to a team. Wait for its checkpoint to finish.");
   };
   // The owner's route and intake start missions through this one admission.
-  const createMission = async (body: CreateMission, origin?: MissionOrigin): Promise<Mission> => {
+  const createMission = async (body: CreateMission, origin?: MissionOrigin, authorize?: () => void): Promise<Mission> => {
+    authorize?.();
     // A retry returns the recorded mission even if the group or a handoff changed since it was admitted.
     const recorded = missions.replayCreate(body);
     if (recorded) return recorded;
     const group = projectGroups.get(body.groupId);
     for (const repo of group.repos)
       for (const checkout of repo.checkouts) assertNoHandoff(checkout.projectId);
-    return missions.create({ ...body, groupId: group.id }, body, origin);
+    return missions.create({ ...body, groupId: group.id }, body, origin, authorize);
   };
   // Intake exists only when configured; without it the intake route lists no records.
   // One store serves the service and the Slack surface, so a record the service admits is the record the surface posts.
   const intakeStore = config.intake ? new IntakeStore(config, key) : undefined;
   const intakeSlackClient = config.intake?.slack ? new SlackClient({ botTokenFile: config.intake.slack.botTokenFile, appTokenFile: config.intake.slack.appTokenFile, endpoint: config.intake.slack.endpoint }) : undefined;
   const intake = config.intake && intakeStore ? new IntakeService(config, intakeStore, missions, new IntakeLinear(linear), { create: createMission, threads: intakeSlackClient, ...(config.intake.slack?.classify ? { router: text => readings.requestRoute(text) } : {}) }) : undefined;
+  const mcp = config.mcp && intakeStore && intake ? createMcpServer(config, new McpRequestService(config, intakeStore, intake, missions, projectGroups)) : undefined;
   // The Slack surface exists only with an intake Slack block; without one, intake runs on Linear alone.
   const intakeSlack = intakeStore && intakeSlackClient ? new IntakeSlackSurface(config, intakeStore, missions, teams, intakeSlackClient, intake ? { direct: input => intake.requestFromSlack(input) } : {}) : undefined;
   const resumable = (session: { status: string; provider: string; workspace?: unknown; team?: unknown; nativeSession?: unknown; resumeNativeSession?: unknown }) =>
@@ -2114,6 +2118,7 @@ export function createApp(config: Config, key: Buffer) {
     void halt.start().catch(() => {});
   });
   server.once("close", () => {
+    void mcp?.close();
     teams.close();
     usage.close();
     balances.close();
@@ -2137,6 +2142,6 @@ export function createApp(config: Config, key: Buffer) {
   const closeTerminals = connectTerminals(server, manager, authenticate, missionManagedSession);
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); intakeSlack?.close(); readings.stop(); goals.close(); teams.close(); halt.stop(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
-  return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, closeConnections, fuse, halt };
+  const closeConnections = () => { routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); intakeSlack?.close(); readings.stop(); goals.close(); teams.close(); halt.stop(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([mcp?.close(), repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, mcpServer: mcp?.server, closeConnections, fuse, halt };
 }

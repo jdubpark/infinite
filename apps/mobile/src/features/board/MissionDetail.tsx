@@ -115,10 +115,10 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
         </View>
       </Section> : null}
 
-      {mission.steering.length || answered.length ? <Section title="Your directions and decisions" count={mission.steering.length + answered.length}>
-          {[...mission.steering].reverse().map((entry, index) => <Card key={`${entry.at}/${index}`}><Text style={t.note}>Direction · revision {entry.revision} · {age(entry.at, now)}</Text><Text style={t.body}>{entry.text}</Text></Card>)}
+      {mission.steering.length || answered.length ? <Section title="Directions and decisions" count={mission.steering.length + answered.length}>
+          {[...mission.steering].reverse().map((entry, index) => <Card key={`${entry.at}/${index}`}><Text style={t.note}>{typeof entry.source === "object" ? entry.source.name : entry.source === "coordinator" ? "Mission coordinator" : "You"} · direction · revision {entry.revision} · {age(entry.at, now)}</Text><Text style={t.body}>{entry.text}</Text></Card>)}
           {[...answered].reverse().map(decision => <Card key={decision.id}>
-            <Text style={t.note}>Decision · answered by {decision.answeredBy === "coordinator" ? "the coordinator" : "you"}{decision.answeredAt ? ` · ${age(decision.answeredAt, now)}` : ""}</Text>
+            <Text style={t.note}>Decision · answered by {decision.answeredBy === "connector" ? decision.source?.name ?? "Connector" : decision.answeredBy === "coordinator" ? "the coordinator" : "you"}{decision.answeredAt ? ` · ${age(decision.answeredAt, now)}` : ""}</Text>
             <Text style={t.body}>{decision.question}</Text>
             <Text style={t.strong}>Answer: {decision.answer}</Text>
           </Card>)}

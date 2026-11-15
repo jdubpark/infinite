@@ -377,14 +377,19 @@ test("mission prompt shortens and counts a leading message before deferring late
 test("mission prompt cuts blocker evidence to the remaining budget, not to the shortest top-level field", () => {
   const mission = {
     id: "mission", groupName: "Example", status: "working", deadlineAt: "", maxSubtasks: 8,
-    subtasks: [], decisions: [], dispatchSummary: "", steering: [], objective: "界".repeat(23000),
+    subtasks: [], decisions: [], dispatchSummary: "", steering: [], objective: "",
   } as unknown as Mission;
+  const build = (messages: MissionMessage[]) => missionPromptWithMessageCount(mission, [], messages, 2, "claude", lineup.coordinator,
+    { openChildDecisions: [], waiting: 0 });
+  // Keep 4 KiB for evidence even when coordinator instructions grow; both long fields must still be shortened.
+  const emptyPromptBytes = Buffer.byteLength(build([]).prompt, "utf8");
+  mission.objective = "界".repeat(Math.floor((80 * 1024 - emptyPromptBytes - 4 * 1024) / Buffer.byteLength("界", "utf8")));
   const teamId = "6f1d6a1e-2b3c-4d5e-8f90-123456789abc";
-  const result = missionPromptWithMessageCount(mission, [], [{
+  const result = build([{
     type: "subtask-finished", subtaskId: "api", teamId, status: "blocked", teamStatus: "blocked", reason: "The API route is absent.",
     blocker: { cause: { status: "observed", detail: "界".repeat(1200) }, proposedRecovery: "界".repeat(1200),
       prevention: "Confirm the upstream interface first.", validationEvidence: [{ sourceRef: "packages/host/src/server.ts", observation: "Route absent." }] },
-  }] as MissionMessage[], 2, "claude", lineup.coordinator, { openChildDecisions: [], waiting: 0 });
+  }] as MissionMessage[]);
   assert.ok(Buffer.byteLength(result.prompt, "utf8") <= 80 * 1024);
   assert.equal(result.includedMessageCount, 1);
   const label = "Messages since your last attempt (JSON): ";
@@ -953,15 +958,20 @@ test("permission recovery wakes the mission once with bounded observations and p
 });
 
 for (const scenario of [
-  // The objective sets the base prompt so that the whole recovery message does not fit under 80 KiB and its compact form does; retune it when coordinator instructions grow.
+  // Both objectives leave room for the initial attempt and dispatch. Recovery fits only compactly in the first case;
+  // the longer dispatch summary leaves no room even for recovery identifiers in the second. Retune when instructions grow.
   { name: "a large mission delivers a compact recovery outcome", objectiveLength: 23400, summary: "One API change", held: false },
-  { name: "a full mission blocks and cancels its subteam when recovery evidence cannot fit", objectiveLength: 23700, summary: "S".repeat(900), held: true },
+  { name: "a full mission blocks and cancels its subteam when recovery evidence cannot fit", objectiveLength: 23300, summary: "S".repeat(900), held: true },
 ]) test(scenario.name, { timeout: 30000 }, async () => {
   const h = scripted();
   try {
     const { id } = await h.create("界".repeat(scenario.objectiveLength));
     await h.report(1, { kind: "dispatch", summary: scenario.summary, subtasks: [plan("a", "api")] });
-    const teamId = (await until(() => h.get(id), mission => Boolean(teamOf(mission, "a")))).subtasks[0].teamId!;
+    const dispatched = await until(() => h.get(id), mission => Boolean(teamOf(mission, "a")));
+    const teamId = dispatched.subtasks[0].teamId!;
+    const repos = h.config.projects.map(project => ({ projectId: project.id, name: project.name, path: project.path, teamReady: true }));
+    const stateOnly = missionPromptWithMessageCount(dispatched, repos, [], 2, "claude", lineup.coordinator, { openChildDecisions: [], waiting: 0 });
+    assert.ok(Buffer.byteLength(stateOnly.prompt, "utf8") <= 80 * 1024, "The post-dispatch state fits before recovery arrives");
     const outcomeId = randomUUID();
     Object.assign(h.runs.get(teamId)!, { permissionRecovery: { outcomes: [{ id: outcomeId, revision: 1, promptId: 1,
       status: "exhausted", cause: "界".repeat(400), action: "界".repeat(400), decision: "界".repeat(400),

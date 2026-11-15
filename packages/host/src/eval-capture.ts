@@ -2,7 +2,7 @@ import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceTx } from "./evidence/types.js";
 import { captureSettings, EVAL_RETENTION_DAYS_DEFAULT, type EvalProjectSettings } from "./eval-config.js";
 import { LATER_FILES_MAX, promotion, referenceVerdict, REFERENCE_MAX_FILES, startVerdict, type PromotionFacts } from "./eval-rules.js";
-import { type Decide, type MarkerOutcome, type MaterialResult, capturedTaskId, completeApproval, completeMaterial, evalCorpusModule, failPending, insertMarker, markApproval, reconcileBatch, sweepEvalTasks } from "./eval-store.js";
+import { type Decide, type MarkerOutcome, type MaterialResult, type SweepCursor, capturedTaskId, completeApproval, completeMaterial, evalCorpusModule, failPending, insertMarker, markApproval, reconcileBatch, sweepEvalTasks } from "./eval-store.js";
 import { captureGit } from "./eval-git.js";
 import {
   EVAL_MODULE,
@@ -19,6 +19,7 @@ import { outcomeId } from "./outcome-projector.js";
 import { OUTCOMES_MODULE, readOutcome, type OutcomeRow } from "./outcome-store.js";
 import type { ProjectSourceService } from "./project-source.js";
 import type { FeatureMap } from "./task-features.js";
+import { commandScope } from "./team-workspace.js";
 import type { Config } from "./types.js";
 
 export const CAPTURE_QUEUE_MAX = 64, CAPTURE_CONCURRENCY = 2, CAPTURE_STALLED_MAX = 4, CAPTURE_DEADLINE_MS = 35_000, RECONCILE_BATCH = 100;
@@ -36,6 +37,8 @@ export type TaskCaptureOptions = {
 
 type JobKind = "material" | "approval";
 type Job = { kind: JobKind; taskId: string; run: () => Promise<void> };
+/** A deadline wait of `bounded`: its timer, and the settling of the wait as failed. */
+type Deadline = { timer: NodeJS.Timeout; settle: () => void };
 type BaseDelta = Extract<MaterialResult, { kind: "store" }>["baseDelta"];
 
 /** The skip lines already written in this process: one per code. */
@@ -90,6 +93,9 @@ export class TaskCapture implements CaptureSink {
   private running = 0;
   /** Git calls that passed their deadline and have not settled yet. */
   private stalled = 0;
+  /** The deadline waits still open. `close` settles them. */
+  private readonly deadlines = new Set<Deadline>();
+  private readonly sweepCursor: SweepCursor = { after: "" };
   private closed = false;
   private restartChecked = false;
 
@@ -194,7 +200,7 @@ export class TaskCapture implements CaptureSink {
       }));
       let removed = 0;
       this.store.write(tx => {
-        removed = sweepEvalTasks(tx, this.now(), projects, EVAL_RETENTION_DAYS_DEFAULT, RECONCILE_BATCH);
+        removed = sweepEvalTasks(tx, this.now(), projects, EVAL_RETENTION_DAYS_DEFAULT, RECONCILE_BATCH, this.sweepCursor);
       });
       return removed;
     } catch {
@@ -208,11 +214,25 @@ export class TaskCapture implements CaptureSink {
     return new Promise(resolve => this.waiters.push(resolve));
   }
 
-  /** Drops queued jobs and ignores later completions. A dropped job's row is failed by the next process's `failPending`. */
+  /**
+   * Drops queued jobs, settles the open deadline waits as failed (not as stalled), and stops the Git reads in flight.
+   * A dropped job's row is failed by the next process's `failPending`.
+   */
   close(): void {
     if (this.closed) return;
     this.closed = true;
     for (const job of this.queue.splice(0)) this.untrack(job);
+    const waits = [...this.deadlines];
+    this.deadlines.clear();
+    for (const wait of waits) {
+      clearTimeout(wait.timer);
+      wait.settle();
+    }
+    try {
+      this.git.close?.();
+    } catch {
+      // Close never throws.
+    }
     this.notifyIdle();
   }
 
@@ -245,7 +265,8 @@ export class TaskCapture implements CaptureSink {
     while (!this.closed && this.running < CAPTURE_CONCURRENCY && this.queue.length > 0) {
       const job = this.queue.shift()!;
       this.running += 1;
-      new Promise<void>(resolve => resolve(job.run()))
+      // A capture read is never a command of the operation that started it: each job starts outside every scope.
+      new Promise<void>(resolve => resolve(commandScope.exit(() => job.run())))
         .catch(() => undefined)
         .finally(() => {
           this.running -= 1;
@@ -270,31 +291,40 @@ export class TaskCapture implements CaptureSink {
 
   /**
    * Races one Git call against the deadline. When the deadline wins, the call counts as failed and as stalled until
-   * its promise settles; the job goes on.
+   * its promise settles; the job goes on. Starts no call once the stalled budget is spent or after close. Close settles
+   * the wait as failed without a stall, and the call's later settling changes nothing.
    */
   private bounded<T>(call: () => Promise<T>, failed: T): Promise<T> {
+    if (this.closed || this.stalled >= CAPTURE_STALLED_MAX) return Promise.resolve(failed);
     return new Promise<T>(resolve => {
-      let timedOut = false;
-      const timer = setTimeout(() => {
-        timedOut = true;
-        this.stalled += 1;
-        resolve(failed);
-      }, this.deadlineMs);
-      const finish = (value: T) => {
+      let open = true, stalledNow = false;
+      const end = (value: T) => {
+        if (!open) return;
+        open = false;
         clearTimeout(timer);
-        if (timedOut) {
-          this.stalled -= 1;
-          return;
-        }
+        this.deadlines.delete(deadline);
         resolve(value);
       };
+      const timer = setTimeout(() => {
+        if (!open) return;
+        stalledNow = true;
+        this.stalled += 1;
+        end(failed);
+      }, this.deadlineMs);
+      timer.unref();
+      const deadline: Deadline = { timer, settle: () => end(failed) };
+      this.deadlines.add(deadline);
       let pending: Promise<T>;
       try {
         pending = call();
       } catch {
         pending = Promise.reject(new Error("The Git call could not start."));
       }
-      pending.then(finish, () => finish(failed));
+      const settled = (value: T) => {
+        if (stalledNow) this.stalled -= 1;
+        else end(value);
+      };
+      pending.then(settled, () => settled(failed));
     });
   }
 

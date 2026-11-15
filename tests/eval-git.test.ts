@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -250,5 +250,128 @@ test("a copy's diff settings change no patch", async () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
     rmSync(clone, { recursive: true, force: true });
+  }
+});
+
+test("a copy's submodule setting hides no name", async () => {
+  const dir = makeRepo();
+  try {
+    const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
+    // The link to FROM is added without `git add -A`, which would drop it.
+    writeFileSync(join(dir, "a.txt"), "two\n");
+    run(dir, "add", "a.txt");
+    run(dir, "update-index", "--add", "--cacheinfo", `160000,${from},sub`);
+    run(dir, "commit", "-q", "-m", "to");
+    const to = run(dir, "rev-parse", "HEAD");
+    run(dir, "update-index", "--cacheinfo", `160000,${to},sub`);
+    run(dir, "commit", "-q", "-m", "later");
+    const later = run(dir, "rev-parse", "HEAD");
+    run(dir, "config", "diff.ignoreSubmodules", "all");
+    const git = captureGit(() => undefined);
+
+    assert.deepEqual(await git.names(dir, from, to, 500), { state: "read", names: ["a.txt", "sub"] });
+    assert.deepEqual(await git.names(dir, to, later, 2000), { state: "read", names: ["sub"] });
+
+    const { prefix, record } = recordingPrefix(dir);
+    assert.equal((await captureGit(() => prefix).names(dir, from, to, 500)).state, "read");
+    assert.deepEqual(
+      readFileSync(record, "utf8").split("\n").filter(Boolean),
+      ["git", ...teamGitArgs(dir, ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "--ignore-submodules=none", "-z", from, to, "--"])],
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a patch child that cannot be stopped counts until it exits", async () => {
+  const dir = makeRepo();
+  try {
+    const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
+    const to = commit(dir, writeFiles({ "a.txt": "two\n" }), "to");
+    const script = join(dir, "slow.sh");
+    writeFileSync(script, "#!/bin/sh\nsleep 2\nexit 0\n");
+    const seen: ChildProcess[] = [];
+    let stoppedAt = 0, releasedAt = 0;
+    // A host that may not signal the child: the stop is refused, and the child runs out its sleep.
+    const git = captureGit(() => ({ command: "/bin/sh", args: [script] }), 100, child => {
+      seen.push(child);
+      stoppedAt = Date.now();
+      const unref = child.unref.bind(child);
+      child.unref = () => { releasedAt = Date.now(); unref(); };
+      return false;
+    }, 200);
+    const started = Date.now();
+    const pending = git.patch(dir, from, to);
+    // A referenced timer keeps the loop alive: the child no longer does once it is released.
+    const keep = setInterval(() => undefined, 1_000);
+    try {
+      const until = Date.now() + 1_500;
+      while (releasedAt === 0 && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 20));
+      assert.equal(seen.length, 1);
+      assert.ok(releasedAt > 0, "the handle is released while the child still runs");
+      assert.ok(releasedAt - stoppedAt >= 150, "the handle is not released at the refused stop");
+      assert.equal(seen[0]!.stdout?.destroyed, true);
+      assert.equal(seen[0]!.stderr?.destroyed, true);
+      const probe = await Promise.race([
+        pending.then(() => "settled"),
+        new Promise(resolve => setTimeout(() => resolve("pending"), 10)),
+      ]);
+      assert.equal(probe, "pending");
+      assert.deepEqual(await pending, { state: "failed" });
+      assert.ok(Date.now() - started >= 1_500, "the read settles only when the child has ended");
+    } finally {
+      clearInterval(keep);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a refused stop of a child that has already ended still settles the read", async () => {
+  const dir = makeRepo();
+  try {
+    const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
+    const big = commit(dir, writeFiles({ "big.bin": randomBytes(1_200_000) }), "big");
+    // On macOS the group of a child that has already ended refuses the signal, as another account's group does. The
+    // read must still settle, and this test holds no timer: a handle released at the refusal would end the process.
+    const git = captureGit(() => undefined, 10_000, child => {
+      try { if (child.pid) process.kill(child.pid, "SIGKILL"); } catch { /* It may already be gone. */ }
+      return false;
+    });
+    assert.deepEqual(await git.patch(dir, from, big), { state: "too-large" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("close stops the reads in flight", async () => {
+  const dir = makeRepo();
+  try {
+    const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
+    const to = commit(dir, writeFiles({ "a.txt": "two\n" }), "to");
+    const { prefix, marker } = sleepingPrefix(dir);
+    const git = captureGit(() => prefix, 10_000);
+    const patch = git.patch(dir, from, to);
+    const names = git.names(dir, from, to, 500);
+
+    const waited = Date.now();
+    while (!existsSync(marker) && Date.now() - waited < 2000) await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(existsSync(marker), true);
+
+    git.close?.();
+    const both = Promise.all([patch, names]);
+    let timer: NodeJS.Timeout | undefined;
+    const late = new Promise<string>(resolve => { timer = setTimeout(() => resolve("late"), 2000); });
+    const settled = await Promise.race([both, late]);
+    clearTimeout(timer);
+    assert.deepEqual(settled, [{ state: "failed" }, { state: "failed" }]);
+
+    rmSync(marker, { force: true });
+    assert.deepEqual(await git.patch(dir, from, to), { state: "failed" });
+    assert.deepEqual(await git.names(dir, from, to, 500), { state: "failed" });
+    assert.equal(await git.onBaseBranch(dir, from, to), "not-proven");
+    assert.equal(existsSync(marker), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -116,6 +116,8 @@ export interface CaptureGit {
   patch(cwd: string, from: string, to: string): Promise<PatchRead>;
   names(cwd: string, from: string, to: string, max: number): Promise<NameRead>;
   onBaseBranch(mirror: string, anchor: string, head: string): Promise<BaseRead>;
+  /** Stops the reads in flight and refuses later reads. */
+  close?(): void;
 }
 
 export type ReconcileResult = { visited: number; promoted: number; rejected: number; demoted: number; waiting: number; unreadable: number };

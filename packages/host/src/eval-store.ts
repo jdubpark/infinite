@@ -62,7 +62,6 @@ const SCHEMA = [
   "CREATE INDEX IF NOT EXISTS eval_tasks_check ON eval_tasks (state, checked_at, task_id)",
   "CREATE INDEX IF NOT EXISTS eval_tasks_bytes ON eval_tasks (project_ref, material_bytes)",
   "CREATE INDEX IF NOT EXISTS eval_tasks_live_runs ON eval_tasks (run_id) WHERE run_deleted_at IS NULL",
-  "CREATE INDEX IF NOT EXISTS eval_tasks_captured ON eval_tasks (captured_at, project_ref)",
   `CREATE TABLE IF NOT EXISTS eval_material (
     task_id TEXT NOT NULL,
     part TEXT NOT NULL,
@@ -323,11 +322,14 @@ export function failPending(
 export const RECONCILE_ORDER_SQL = "SELECT task_id, checked_at FROM eval_tasks WHERE state = ? ORDER BY checked_at, task_id LIMIT ?";
 /** The runs with rows still held, read through `eval_tasks_live_runs`. */
 export const LIVE_RUN_IDS_SQL = "SELECT DISTINCT run_id FROM eval_tasks WHERE run_deleted_at IS NULL";
-/** The sweep's fallback for rows of no configured project, read through `eval_tasks_captured`. */
-export function sweepFallbackSql(configuredCount: number): string {
-  const exclude = configuredCount === 0 ? "" : ` AND project_ref NOT IN (${Array.from({ length: configuredCount }, () => "?").join(", ")})`;
-  return `SELECT task_id FROM eval_tasks WHERE captured_at < ?${exclude} ORDER BY captured_at LIMIT ?`;
-}
+/** The sweep visits at most this many project references a pass. */
+export const SWEEP_REFS_MAX = 64;
+/** The next project reference that has rows after `after`: one seek. */
+export const NEXT_PROJECT_REF_SQL = "SELECT project_ref AS ref FROM eval_tasks WHERE project_ref > ? ORDER BY project_ref LIMIT 1";
+/** One project's oldest rows before a cutoff, through `eval_tasks_project`. */
+export const PROJECT_OLD_SQL = "SELECT task_id FROM eval_tasks WHERE project_ref = ? AND captured_at < ? ORDER BY captured_at LIMIT ?";
+/** Where the next sweep pass goes on: after the last project reference it finished. */
+export type SweepCursor = { after: string };
 /** One task's full row, by its key. */
 export const TASK_BY_ID_SQL = `SELECT ${TASK_COLUMNS} FROM eval_tasks WHERE task_id=?`;
 
@@ -411,8 +413,10 @@ export function readMaterial(db: EvidenceDb, taskId: string): { capsule?: Capsul
 }
 
 /**
- * Deletes rows older than their project's retention, and older than `fallbackDays` for a project ref that no
- * configured project matches. At most `limit` rows per call, oldest first within each project.
+ * Deletes rows older than their project's retention, and older than `fallbackDays` for a project reference that no
+ * configured project maps. A pass walks the references that have rows, from `cursor.after`, visits at most
+ * SWEEP_REFS_MAX of them, and deletes at most `limit` rows. The cursor moves past each finished reference; when the row
+ * limit ends a reference, the next pass starts at that reference again.
  */
 export function sweepEvalTasks(
   tx: EvidenceTx,
@@ -420,32 +424,29 @@ export function sweepEvalTasks(
   projects: readonly { projectId: string; retentionDays: number }[],
   fallbackDays: number,
   limit = SWEEP_BATCH,
+  cursor: SweepCursor = { after: "" },
 ): number {
   const cutoff = (days: number) => new Date(Date.parse(now) - days * DAY_MS).toISOString();
+  const retention = new Map<string, number>();
+  for (const project of projects) retention.set(tx.index("project", project.projectId), project.retentionDays);
   let remaining = limit;
   let removed = 0;
-  const configured: string[] = [];
-  for (const project of projects) {
-    const ref = tx.index("project", project.projectId);
-    configured.push(ref);
-    if (remaining <= 0) continue;
+  for (let visited = 0; visited < SWEEP_REFS_MAX && remaining > 0; visited++) {
+    const next = tx.get<{ ref: string }>(NEXT_PROJECT_REF_SQL, cursor.after);
+    if (next === undefined) {
+      cursor.after = "";
+      break;
+    }
     const old = tx.all<{ task_id: string }>(
-      "SELECT task_id FROM eval_tasks WHERE project_ref=? AND captured_at < ? ORDER BY captured_at LIMIT ?",
-      ref,
-      cutoff(project.retentionDays),
+      PROJECT_OLD_SQL,
+      next.ref,
+      cutoff(retention.get(next.ref) ?? fallbackDays),
       remaining,
     );
     removed += deleteTasks(tx, old.map(row => row.task_id));
     remaining -= old.length;
-  }
-  if (remaining > 0) {
-    const old = tx.all<{ task_id: string }>(
-      sweepFallbackSql(configured.length),
-      cutoff(fallbackDays),
-      ...configured,
-      remaining,
-    );
-    removed += deleteTasks(tx, old.map(row => row.task_id));
+    if (remaining <= 0) break;
+    cursor.after = next.ref;
   }
   return removed;
 }

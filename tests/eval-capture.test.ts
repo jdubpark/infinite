@@ -12,6 +12,7 @@ import type { EvidenceTx } from "../packages/host/src/evidence/types.js";
 import { outcomeId } from "../packages/host/src/outcome-projector.js";
 import { outcomeModule, writeOutcome, type OutcomeRow } from "../packages/host/src/outcome-store.js";
 import type { ProjectSourceService } from "../packages/host/src/project-source.js";
+import { commandScope } from "../packages/host/src/team-workspace.js";
 
 const PROJECT = "project-a";
 const RUN = "run-1";
@@ -35,6 +36,8 @@ const SETTLE = () => new Promise<void>(resolve => setImmediate(resolve));
 /** A Git fake. A call waits on the gate of its commit id when the test holds one; the answer is per method and id. */
 class FakeGit implements CaptureGit {
   readonly calls: string[] = [];
+  /** The command scope in force at each name read, recorded when the read is called. */
+  readonly scopes: unknown[] = [];
   readonly answers = new Map<string, unknown>();
   private readonly gates = new Map<string, { promise: Promise<void>; open: () => void }>();
   /** When true, every call never settles, as a hung Git process would. */
@@ -74,6 +77,7 @@ class FakeGit implements CaptureGit {
   }
 
   names(_cwd: string, _from: string, to: string): Promise<NameRead> {
+    this.scopes.push(commandScope.getStore());
     return this.call<NameRead>("names", to, { state: "read", names: [] });
   }
 
@@ -130,6 +134,8 @@ function world(setup: Setup = { capture: true }): World {
   const git = new FakeGit();
   git.answer("names", COMMIT, { state: "read", names: ["a.txt", "tests/a.test.ts"] });
   const capture = new TaskCapture(captureOptions(root, store, git, setup));
+  // Deadline timers are unreferenced, so this keeps the loop alive while a test waits on a job.
+  const hold = setInterval(() => undefined, 1_000);
   return {
     root,
     path: evidenceDatabasePath(join(root, "state")),
@@ -138,6 +144,7 @@ function world(setup: Setup = { capture: true }): World {
     git,
     capture,
     close() {
+      clearInterval(hold);
       git.releaseAll();
       capture.close();
       store.close();
@@ -409,6 +416,69 @@ test("a stalled read refuses new work, never the run", async () => {
     assert.equal(taskRow(queued.store, "q63")?.state, "captured");
   } finally {
     await finish(queued);
+  }
+
+  // Five held name reads, then one read that would answer. Two jobs run at a time, so the sixth job starts when four
+  // reads have stalled, and it makes no call.
+  const held = world({ capture: true, deadlineMs: 50 });
+  try {
+    for (let i = 1; i <= 5; i++) {
+      const id = String(i).repeat(40);
+      held.git.hold(id);
+      held.capture.integrated(start({ memberId: `h${i}`, commit: id }));
+    }
+    held.capture.integrated(start({ memberId: "c6" }));
+    await held.capture.idle();
+    const refused = taskRow(held.store, "c6");
+    assert.equal(refused?.state, "rejected");
+    assert.equal(refused?.reason, "capture-failed");
+    assert.equal(held.git.calls.includes(`names:${COMMIT}`), false, "the sixth job starts no read");
+  } finally {
+    await finish(held);
+  }
+});
+
+test("closing stops the read chain", async () => {
+  const w = world({ capture: true, deadlineMs: 60_000 });
+  try {
+    w.git.hold(COMMIT);
+    w.capture.integrated(start());
+    await SETTLE();
+    w.capture.close();
+    let timer: NodeJS.Timeout | undefined;
+    const waiting = new Promise<string>(resolve => { timer = setTimeout(() => resolve("waiting"), 500); });
+    const outcome = await Promise.race([w.capture.idle().then(() => "idle"), waiting]);
+    clearTimeout(timer);
+    assert.equal(outcome, "idle");
+    w.git.release(COMMIT);
+    await SETTLE();
+    await SETTLE();
+    assert.deepEqual(w.git.calls, [`names:${COMMIT}`]);
+  } finally {
+    await finish(w);
+  }
+});
+
+test("a capture read reports to no operation", async () => {
+  const w = world();
+  try {
+    const scope = { starting: () => undefined, started: () => undefined };
+    commandScope.run(scope, () => w.capture.integrated(start()));
+    await w.capture.idle();
+    assert.equal(w.git.scopes.length, 1);
+    assert.deepEqual(w.git.scopes, [undefined]);
+
+    // The second job is queued while the first one's read is held, and starts from the first job's completion.
+    w.git.scopes.length = 0;
+    w.git.hold(COMMIT);
+    commandScope.run(scope, () => w.capture.integrated(start({ memberId: "m-first" })));
+    commandScope.run(scope, () => w.capture.integrated(start({ memberId: OTHER_MEMBER, commit: OTHER_COMMIT })));
+    w.git.release(COMMIT);
+    await w.capture.idle();
+    assert.equal(w.git.scopes.length, 2);
+    assert.deepEqual(w.git.scopes, [undefined, undefined]);
+  } finally {
+    await finish(w);
   }
 });
 

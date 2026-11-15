@@ -25,8 +25,10 @@ import {
   markApproval,
   readMaterial,
   reconcileBatch,
+  NEXT_PROJECT_REF_SQL,
+  PROJECT_OLD_SQL,
+  SWEEP_BATCH,
   sweepEvalTasks,
-  sweepFallbackSql,
   type MaterialResult,
 } from "../packages/host/src/eval-store.js";
 
@@ -372,6 +374,45 @@ test("retention removes old tasks per project", () => {
   }
 });
 
+test("a sweep pass visits a bounded number of projects, and the next pass goes on", () => {
+  const at = (days: number) => new Date(Date.parse(NOW) - days * DAY_MS).toISOString();
+  const f = ready();
+  try {
+    // Seventy projects, none configured: each has one row past the fallback cutoff and one younger row.
+    for (let i = 0; i < 70; i++) {
+      const projectId = `project-${String(i).padStart(3, "0")}`;
+      f.store.write(tx => insertMarker(tx, captureStart("m-old", COMMIT, { runId: `run-walk-${i}`, projectId, at: at(400) }), { state: "captured", capsule: capsule() }, NOW));
+      f.store.write(tx => insertMarker(tx, captureStart("m-young", COMMIT, { runId: `run-walk-${i}`, projectId, at: at(1) }), { state: "captured", capsule: capsule() }, NOW));
+    }
+    const cursor = { after: "" };
+    const pass = () => f.store.write(tx => sweepEvalTasks(tx, NOW, [], 365, SWEEP_BATCH, cursor));
+    assert.equal(pass(), 64);
+    assert.equal(pass(), 6);
+    assert.equal(pass(), 0);
+    assert.equal(count(f, "eval_tasks"), 70);
+    assert.equal(count(f, "eval_tasks", "member_id=?", "m-young"), 70);
+  } finally {
+    f.close();
+  }
+
+  // One configured project with five old rows, a row limit of two, and a fresh cursor, in a store of its own.
+  const g = ready();
+  try {
+    for (let i = 0; i < 5; i++) {
+      g.store.write(tx => insertMarker(tx, captureStart(`m-cfg-${i}`, COMMIT, { runId: `run-cfg-${i}`, projectId: "project-a", at: at(31) }), { state: "captured", capsule: capsule() }, NOW));
+    }
+    const cursor = { after: "" };
+    const projects = [{ projectId: "project-a", retentionDays: 30 }];
+    const pass = () => g.store.write(tx => sweepEvalTasks(tx, NOW, projects, 365, 2, cursor));
+    assert.equal(pass(), 2);
+    assert.equal(pass(), 2);
+    assert.equal(pass(), 1);
+    assert.equal(count(g, "eval_tasks"), 0);
+  } finally {
+    g.close();
+  }
+});
+
 test("the reconcile pass visits the oldest rows of both states", () => {
   const f = ready();
   try {
@@ -404,19 +445,20 @@ test("the periodic passes read through an index", () => {
   const f = ready();
   try {
     // The statements the reconcile pass, the hook's run list, and the sweep's fallback run, with their bound values.
-    const statements: { sql: string; params: (string | number)[] }[] = [
+    const statements: { sql: string; params: (string | number)[]; seek?: true }[] = [
       { sql: RECONCILE_ORDER_SQL, params: ["captured", 100] },
       { sql: RECONCILE_ORDER_SQL, params: ["candidate", 100] },
       { sql: TASK_BY_ID_SQL, params: ["captured:run-x:m-x"] },
       { sql: LIVE_RUN_IDS_SQL, params: [] },
-      { sql: sweepFallbackSql(0), params: [NOW, 100] },
-      { sql: sweepFallbackSql(2), params: [NOW, "project-a", "project-b", 100] },
+      { sql: NEXT_PROJECT_REF_SQL, params: [""], seek: true },
+      { sql: PROJECT_OLD_SQL, params: ["project-a", NOW, 100], seek: true },
     ];
-    for (const { sql, params } of statements) {
+    for (const { sql, params, seek } of statements) {
       const plan = f.store.read(db => db.all<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, ...params)).map(row => row.detail);
       for (const line of plan) {
         assert.equal(line.includes("SCAN eval_tasks") && !line.includes("USING"), false, `${sql}: ${line}`);
         assert.equal(line.includes("USE TEMP B-TREE"), false, `${sql}: ${line}`);
+        if (seek) assert.equal(line.includes("SEARCH eval_tasks USING"), true, `${sql}: ${line}`);
       }
     }
   } finally {

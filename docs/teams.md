@@ -443,7 +443,7 @@ Eval capture keeps each implementer task of a finished team run as an eval task.
 
 Capture is off by default. Only a project in `github` source mode captures. A laptop project writes nothing and reads nothing.
 
-**Turn capture on only after the owner has admitted the patch form in the launcher** (see [Git forms](#git-forms)). Until then every task that would qualify ends `patch-missing`. While the base check form is refused, every task ends `base-not-proven`.
+**Turn capture on only after the owner has admitted the patch form and the capture name list in the launcher** (see [Git forms](#git-forms)). Until then every task ends `capture-failed`. While the base check form is refused, every task ends `base-not-proven`.
 
 Capture never changes a run. A failed, stalled, or slow capture never delays a run, takes an enrichment slot, or reaches a member.
 
@@ -572,10 +572,10 @@ Each capture read runs through the team Git prefix, with the six `-c` settings. 
 | Form | Command | Limit | If refused |
 |---|---|---|---|
 | 1. Patch (new) | `git diff --no-ext-diff --no-textconv --no-color --binary --default-prefix --no-renames --submodule=short --ignore-submodules=none --unified=3 --inter-hunk-context=0 FROM TO --`, in the run's integration checkout | 1,048,576 bytes; Git 2.41 or later | The patch is `missing`, and the task ends `patch-missing`. |
-| 2. Name list (reused) | `git diff --no-ext-diff --no-textconv --name-only --no-renames -z FROM TO --`, in the same checkout | 500 names for a reference; 2,000 for later changes; 64 KiB of output | The reference ends `capture-failed`; a later-change list leaves the approval unknown. |
+| 2. Name list of capture (new) | `git diff --no-ext-diff --no-textconv --name-only --no-renames --ignore-submodules=none -z FROM TO --`, in the same checkout | 500 names for a reference; 2,000 for later changes; 64 KiB of output | Every capture ends `capture-failed`; a later-change list leaves the approval unknown. |
 | 3. Base check (reused, form 1 of the base scan) | `git merge-base --is-ancestor ANCHOR HEAD`, in the source mirror, where `HEAD` is the mirror's head | 30 seconds | Every task ends `base-not-proven`. |
 
-Form 3 is in a launcher audit that is pending with the outcome-ledger release. Form 1 needs the owner's launcher approval before capture is turned on.
+Form 3 is in a launcher audit that is pending with the outcome-ledger release. Forms 1 and 2 need the owner's launcher approval before capture is turned on. The launcher must also end each of the three reads by itself after 35 seconds: the host may not signal a command that the launcher runs as another account, and a read that hangs there holds one of four places until it ends.
 
 ## Head publication
 

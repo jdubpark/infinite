@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { configurationModule } from "../packages/host/src/configuration-store.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { outcomeModule } from "../packages/host/src/outcome-store.js";
@@ -12,21 +13,21 @@ import type { DecisionRow, RoutingPayload } from "../packages/host/src/routing-t
 import { startHost, type Host } from "./helpers.js";
 
 /** One stored start decision of a run's task, written while the host's API is stopped. */
-function seedDecision(host: Host, runId: string, taskId: string): void {
+function seedDecision(host: Host, runId: string, taskId: string, projectId = "rehearsal"): void {
   const store = new EvidenceStore({ databasePath: evidenceDatabasePath(host.config.stateDir), vaultKey: readFileSync(host.config.keyFile) });
   try {
     store.register(configurationModule());
     store.register(outcomeModule());
     store.register(routingModule());
     const payload: RoutingPayload = {
-      projectId: "rehearsal", taskId, area: "host", featureMap: "default", coordinatorProfileId: "astra-xhigh", knobs: ROUTING_DEFAULTS,
+      projectId, taskId, area: "host", featureMap: "default", coordinatorProfileId: "astra-xhigh", knobs: ROUTING_DEFAULTS,
       costs: { lightUsd: 0.4, strongUsd: 2.2, rescueUsd: 1.5, basis: "tier-default" }, headroom: "not-modelled", chosenWeight: 0.5,
       current: [], candidates: [], elapsedMs: 1,
     };
     store.write(tx => {
       const row: DecisionRow = {
         key: decisionKey(runId, 1, tx.index("task", taskId), "start", 1), runId, revision: 1, taskKey: tx.index("task", taskId),
-        point: "start", ordinal: 1, projectRef: tx.index("project", "rehearsal"), role: "implementer", areaRef: tx.index("area", "host"),
+        point: "start", ordinal: 1, projectRef: tx.index("project", projectId), role: "implementer", areaRef: tx.index("area", "host"),
         kind: "feature", risk: "normal", featureVersion: 1, featureMapRef: tx.index("feature-map", "default"), mode: "shadow",
         algorithmVersion: 1, rewardVersion: 1, policyDigest: "d".repeat(64), seed: "s".repeat(64), basis: "single-candidate",
         chosenProfileId: "astra-xhigh", chosenIdentity: "i".repeat(64), greedyProfileId: "astra-xhigh",
@@ -87,6 +88,28 @@ test("routing reads answer every paired role on a real host", { timeout: 60000 }
     const explainDown = await host.fetchApi(`/teams/${runId}/routing/task-one`, "owner");
     assert.equal(explainDown.status, 503);
     assert.equal(explainDown.body.code, "evidence-unavailable");
+  } finally {
+    await host.stop();
+  }
+});
+
+test("the routing command prints status and explain", { timeout: 90000 }, async () => {
+  // The project's saved policy makes its status shadow; a supervised project with no policy is off.
+  const host = await startHost({ config: { projects: [{ id: "routed", name: "Routed", path: process.cwd(), team: { checks: [], establishChecks: true, routing: { mode: "shadow" } } }] } });
+  const runId = randomUUID();
+  const clientFile = join(host.root, "routing-client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: host.origin, token: host.tokens.owner }), { mode: 0o600 });
+  const cli = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
+  const run = (args: string[]) => execFileSync(cli[0]!, [...cli.slice(1), "routing", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  try {
+    await host.stopApi();
+    seedDecision(host, runId, "task-one", "routed");
+    await host.start();
+
+    assert.match(run(["status", "routed"]), /routing shadow/);
+    assert.match(run(["explain", runId, "task-one"]), /basis single-candidate/);
+    assert.throws(() => run(["status", "missing"]), (error: { status?: number; stderr?: string }) =>
+      error.status !== 0 && String(error.stderr).includes("No project has this ID."));
   } finally {
     await host.stop();
   }

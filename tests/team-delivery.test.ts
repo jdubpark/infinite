@@ -594,7 +594,9 @@ test("attested reconciliation clears only a settled moved-base preparation failu
     const originalWorkspace = h.run.workspace;
     await restartDeliveryRecord(h);
     assert.deepEqual(h.stored.pending, pending, "the structured failure survives the generic restart reason");
-    assert.deepEqual(h.teams.get(h.id).pendingOperation, { id: pending.id, kind: "result", revision: 1, failed: true,
+    // What the host saw of left-over processes depends on the machine; the intent's own fields do not.
+    const { processes: _processes, processesCheckedAt: _checkedAt, ...operation } = h.teams.get(h.id).pendingOperation!;
+    assert.deepEqual(operation, { id: pending.id, kind: "result", revision: 1, failed: true,
       failureCode: "workspace-operation-failed", sourceMemberId: h.member.memberId, sourceRole: "delivery" });
     const plain = { requestId: randomUUID(), revision: h.run.revision, text: "Inspect remote delivery state again." };
     const beforePlain = structuredClone(h.stored);

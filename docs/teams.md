@@ -414,6 +414,11 @@ member's clone can be removed earlier, after its result was integrated and
 place and keeps a clone that a replacement member still uses as its working
 directory.
 
+A paused subteam keeps its workspace while its mission is blocked by the
+approved time limit. The mission owner can extend the limit to resume it. If the
+mission is cancelled or closed after the blocked retention period, it cancels
+the paused subteam and normal cancelled-run retention applies.
+
 Removal also waits for head publication; see [Head publication](#head-publication).
 
 The run record, events, reports, and receipts remain after merged, no-change,

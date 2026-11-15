@@ -53,7 +53,7 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   if (method === "GET" && /^\/api\/project-groups\/[a-z0-9-]{1,80}$/.test(url.pathname)) return true;
   if (["PUT", "DELETE"].includes(method) && /^\/api\/project-groups\/[a-z0-9-]{1,80}$/.test(url.pathname)) return true;
   if (["GET", "POST"].includes(method) && url.pathname === "/api/missions") return true;
-  const mission = /^\/api\/missions\/([^/]+)(?:\/(steer|pause|resume|cancel|answer\/([^/]+)))?$/.exec(url.pathname);
+  const mission = /^\/api\/missions\/([^/]+)(?:\/(steer|pause|resume|cancel|extend|answer\/([^/]+)))?$/.exec(url.pathname);
   if (mission && UUID.test(mission[1])) return method === "GET" ? !mission[2]
     : method === "POST" && Boolean(mission[2]) && (!mission[3] || UUID.test(mission[3]));
   // Read-only context for the Swarm graph: directory names, file paths and counts, the class of data the file listing and session events already serve.

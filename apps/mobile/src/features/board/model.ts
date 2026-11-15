@@ -80,16 +80,36 @@ export function missionStoppedAtLimit(mission: Pick<Mission, "status" | "stopRea
 }
 
 /**
+ * Time left before the mission stops. While an intake mission's clock is stopped, `deadlineAt`
+ * does not yet include the stopped span, so the time left is counted up to `clockStoppedAt`.
+ */
+export function missionTimeLeftMs(mission: Pick<Mission, "deadlineAt" | "clockStoppedAt">, now: number): number {
+  return mission.clockStoppedAt ? Date.parse(mission.deadlineAt) - Date.parse(mission.clockStoppedAt) : Date.parse(mission.deadlineAt) - now;
+}
+
+/** Time left in words, rounded down to whole minutes: "2 h 15 min", "2 h", "45 min", or "less than a minute". */
+export function missionLeftLabel(ms: number): string {
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 1) return "less than a minute";
+  const hours = Math.floor(minutes / 60), rest = minutes % 60;
+  if (hours === 0) return `${rest} min`;
+  return rest === 0 ? `${hours} h` : `${hours} h ${rest} min`;
+}
+
+/**
  * Extension amounts for the owner: one hour, six hours and a day, plus the mission's own limit
  * when it is a whole number of minutes from 5 to 1440 that the list does not already hold.
+ * `spoken` is the accessibility label for the button.
  */
-export function missionExtendChoices(maxMinutes: number): { minutes: number; label: string; ownLimit: boolean }[] {
+export function missionExtendChoices(maxMinutes: number): { minutes: number; label: string; spoken: string; ownLimit: boolean }[] {
   const minutes = [60, 360, 1440];
   if (Number.isInteger(maxMinutes) && maxMinutes >= 5 && maxMinutes <= 1440 && !minutes.includes(maxMinutes)) minutes.push(maxMinutes);
+  const unit = (count: number, word: string) => `${count} ${count === 1 ? word : `${word}s`}`;
   return minutes.sort((a, b) => a - b).map(value => {
     const ownLimit = value === maxMinutes;
     const span = value % 60 === 0 ? `+${value / 60} h` : `+${value} min`;
-    return { minutes: value, label: ownLimit ? `${span} (its limit)` : span, ownLimit };
+    const amount = value % 60 === 0 ? unit(value / 60, "hour") : unit(value, "minute");
+    return { minutes: value, label: ownLimit ? `${span} (its limit)` : span, spoken: `Extend by ${amount}${ownLimit ? ", its limit" : ""}`, ownLimit };
   });
 }
 
@@ -108,7 +128,7 @@ export function missionControls(mission: Mission, role: Me["role"] | undefined, 
     answer: owner && live,
     steer: owner && live && mission.status !== "paused",
     pause: owner && ["planning", "working", "needs-input"].includes(mission.status),
-    resume: owner && mission.status === "paused" && Date.parse(mission.deadlineAt) > now,
+    resume: owner && mission.status === "paused" && missionTimeLeftMs(mission, now) > 0,
     extend: owner && (["planning", "working", "needs-input", "paused"].includes(mission.status) || missionStoppedAtLimit(mission)),
     cancel: owner && live,
   };

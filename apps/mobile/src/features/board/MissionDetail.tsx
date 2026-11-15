@@ -13,7 +13,7 @@ import { theme } from "../../theme";
 import { newer, shortDate } from "../teams/model";
 import { RequestStatus, Section, SteerBox, t } from "../teams/parts";
 import { useRunRequest } from "../teams/useRunRequest";
-import { attemptLabel, attemptsOf, findBoardItem, missionControls, missionExtendChoices, missionStatusLabel, missionStoppedAtLimit, missionSubtaskLabel, openMissionDecisions } from "./model";
+import { attemptLabel, attemptsOf, findBoardItem, missionControls, missionExtendChoices, missionLeftLabel, missionStatusLabel, missionStoppedAtLimit, missionSubtaskLabel, missionTimeLeftMs, openMissionDecisions } from "./model";
 import { Attempts } from "./Attempts";
 
 export function MissionDetail({ connection, id }: { connection: Connection; id: string }) {
@@ -52,6 +52,7 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
   const locked = request.busy || Boolean(request.pending);
   const stoppedAtLimit = missionStoppedAtLimit(mission);
   const live = !["cancelled", "ready-for-review"].includes(mission.status);
+  const timeLeft = missionTimeLeftMs(mission, now);
   const decisions = openMissionDecisions(mission);
   const answered = mission.decisions.filter(decision => decision.answer != null);
   const titleOf = (subtaskId: string) => mission.subtasks.find(subtask => subtask.id === subtaskId)?.title ?? subtaskId;
@@ -62,7 +63,7 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
   const send = (action: string, label: string, fields?: Record<string, string | number>) => request.send(`/missions/${id}/${action}`, label, mission.revision, fields);
   const extend = (minutes: number) => { setExtendOpen(false); send("extend", "Time extension", { minutes }); };
   const extendChoices = (secondary: boolean) => <View style={s.controls}>
-    {missionExtendChoices(mission.maxMinutes).map(choice => <Button key={choice.minutes} compact secondary={secondary} title={choice.label} disabled={locked} onPress={() => extend(choice.minutes)} />)}
+    {missionExtendChoices(mission.maxMinutes).map(choice => <Button key={choice.minutes} compact secondary={secondary} title={choice.label} accessibilityLabel={choice.spoken} disabled={locked} onPress={() => extend(choice.minutes)} />)}
   </View>;
   const answer = (decisionId: string, text: string) => {
     const value = text.trim();
@@ -83,7 +84,9 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
           {attemptChip ? <Chip label={attemptChip} /> : null}
           <Chip label={`Updated ${age(mission.updatedAt, now)}`} /><Chip label={`Rev ${mission.revision}`} /></View>
         {stoppedAtLimit ? <Text style={t.warning}>Stopped at its time limit. Its work is kept. Extend to continue, or cancel.</Text>
-          : live ? <Text style={t.note}>{`Stops ${shortDate(mission.deadlineAt)}`}</Text> : null}
+          : mission.clockStoppedAt ? <Text style={t.note}>{`Clock stopped while it waits · ${missionLeftLabel(timeLeft)} left`}</Text>
+            : live && timeLeft > 0 ? <Text style={t.note}>{`Stops ${shortDate(mission.deadlineAt)}`}</Text>
+              : live ? <Text style={t.warning}>Its time limit has passed. Extend to continue.</Text> : null}
         {mission.reason ? <Text style={mission.status === "blocked" ? t.error : t.warning}>{mission.reason}</Text> : null}
       </View>
 

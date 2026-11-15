@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { attemptLabel, attemptsOf, foldAttempts, groupBoard, filterBoard, missionControls, missionExtendChoices, missionStatusLabel, missionStoppedAtLimit, openMissionDecisions } from "../apps/mobile/src/features/board/model.ts";
+import { attemptLabel, attemptsOf, foldAttempts, groupBoard, filterBoard, missionControls, missionExtendChoices, missionLeftLabel, missionStatusLabel, missionStoppedAtLimit, missionTimeLeftMs, openMissionDecisions } from "../apps/mobile/src/features/board/model.ts";
 import type { BoardItem, Mission } from "../apps/mobile/src/api/client.ts";
 
 const item = (overrides: Partial<BoardItem> = {}): BoardItem => ({
@@ -96,4 +96,35 @@ test("extend choices add the mission's own limit in ascending order and mark it"
 test("a deadline stop reads as stopped at the time limit, and other blocked missions stay blocked", () => {
   assert.equal(missionStatusLabel("blocked", "deadline"), "Stopped at time limit");
   assert.equal(missionStatusLabel("blocked"), "Blocked");
+});
+
+test("resume follows the time left, which an intake mission's stopped clock keeps", () => {
+  // The deadline has passed, but the clock stopped before it did, so the owner can still resume.
+  const stopped = controlMission("paused", { deadlineAt: "2026-09-30T23:00:00.000Z", clockStoppedAt: "2026-09-30T22:30:00.000Z" });
+  assert.equal(missionControls(stopped, "owner", true, now).resume, true);
+  const spent = controlMission("paused", { deadlineAt: "2026-09-30T22:30:00.000Z", clockStoppedAt: "2026-09-30T22:30:00.000Z" });
+  assert.equal(missionControls(spent, "owner", true, now).resume, false);
+  const overdue = controlMission("paused", { deadlineAt: "2026-09-30T22:00:00.000Z", clockStoppedAt: "2026-09-30T22:30:00.000Z" });
+  assert.equal(missionControls(overdue, "owner", true, now).resume, false);
+  assert.equal(missionControls(controlMission("paused", { deadlineAt: "2026-09-30T23:00:00.000Z" }), "owner", true, now).resume, false);
+  assert.equal(missionControls(controlMission("paused"), "owner", true, now).resume, true);
+});
+
+test("time left counts up to the stopped clock when an intake mission has one", () => {
+  const deadlineAt = "2026-10-01T02:00:00.000Z";
+  assert.equal(missionTimeLeftMs({ deadlineAt }, now), 2 * 60 * 60000);
+  assert.equal(missionTimeLeftMs({ deadlineAt, clockStoppedAt: "2026-10-01T00:30:00.000Z" }, now), 90 * 60000);
+});
+
+test("time left reads in hours and minutes, rounded down", () => {
+  assert.equal(missionLeftLabel(0), "less than a minute");
+  assert.equal(missionLeftLabel(59 * 1000), "less than a minute");
+  assert.equal(missionLeftLabel(45 * 60000), "45 min");
+  assert.equal(missionLeftLabel(2 * 60 * 60000), "2 h");
+  assert.equal(missionLeftLabel(135 * 60000), "2 h 15 min");
+});
+
+test("each extend choice has a spoken label that marks the mission's own limit", () => {
+  assert.deepEqual(missionExtendChoices(240).map(choice => choice.spoken), ["Extend by 1 hour", "Extend by 4 hours, its limit", "Extend by 6 hours", "Extend by 24 hours"]);
+  assert.deepEqual(missionExtendChoices(60).map(choice => choice.spoken), ["Extend by 1 hour, its limit", "Extend by 6 hours", "Extend by 24 hours"]);
 });

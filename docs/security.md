@@ -432,6 +432,13 @@ authority, and that no person holds input control. An uncertain delivery is
 not repeated, also after a restart. A dialog that the host can answer in
 neither direction goes to the owner.
 
+A request that waits for the owner because of a class rule or an `owner`
+verdict is pushed with the host's class identifier in parentheses, for example
+`(production-or-staging)`. The notifier shows only an identifier from the
+host's own class list, so no model text appears in a push. A request that the
+host cannot answer is pushed without a class: it is a host limit and not an
+interrupt class.
+
 Limits that remain:
 
 - A class rule establishes a class only from what the host can read: the

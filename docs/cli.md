@@ -411,8 +411,15 @@ workspace, and delivery still needs its separate repository policy.
 
 A later `repo init` changes neither: it preserves the saved coordinator
 policy, including an opt-out, and it never covers a project again after a
-revoke or an opt-out. Use `infinite permissions delegate` to cover an existing
-project. Use `--permissions coordinator` to enable the coordinator delegation
+revoke, an opt-out or a regrouping. A project that was enrolled before the
+permission agent existed is not covered by a later `repo init` either. Use
+`infinite permissions delegate` to cover an existing project.
+
+`repo init` prints one line that says what it left in the delegation record:
+covered (with the workspace), opted out, not covered, unchanged, or not
+recorded with the reason. When the delegation record cannot be opened,
+`repo init` still saves the enrollment and warns that coverage was not
+recorded, and `repo init --permissions off` fails and writes nothing. Use `--permissions coordinator` to enable the coordinator delegation
 on an existing enrollment, with `--permission-scope TEXT` or
 `--permission-limit N` to change its scope or its limit of twenty-five
 decisions (maximum fifty).

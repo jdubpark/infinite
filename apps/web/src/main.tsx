@@ -191,7 +191,7 @@ function App() {
         </div>
         <nav className="workspace-navigation" aria-label="Workspace views">
           <button aria-current={route.swarm ? "page" : undefined} onClick={() => route.navigateSwarm()}><Waypoints size={16} />Swarm</button>
-          <button aria-current={!route.teams && !route.goals && !route.cost && !route.swarm ? "page" : undefined} onClick={() => route.navigate(null)}><TerminalSquare size={16} />Sessions</button>
+          <button aria-current={!route.teams && !route.goals && !route.missionId && !route.cost && !route.swarm ? "page" : undefined} onClick={() => route.navigate(null)}><TerminalSquare size={16} />Sessions</button>
           <button aria-current={route.teams ? "page" : undefined} onClick={() => route.navigateTeam(null)}><Users size={16} />Teams</button>
           <button aria-current={route.goals ? "page" : undefined} onClick={() => route.navigateGoal(null)}><Target size={16} />Goals</button>
           {me.usage?.enabled && <button aria-current={route.cost ? "page" : undefined} onClick={() => route.navigateCost()}><Coins size={16} />Cost</button>}

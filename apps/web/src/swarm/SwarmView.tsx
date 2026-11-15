@@ -10,6 +10,7 @@ import { clockTime, cost, elapsed, shortModel, usd } from "./format";
 import { allAgents, buildSwarm, findAgent, findUnit } from "./model";
 import { createActivity } from "./activity";
 import { AGENT_STATES, STATE_LABEL, type AgentState, type Selection, type SwarmMission, type SwarmSession, type SwarmTeam, type ViewProps } from "./types";
+import { missionStateLabel } from "../mission-model";
 import "./swarm.css";
 import "./views.css";
 
@@ -99,7 +100,14 @@ export function SwarmView(props: SwarmViewProps) {
 
   return <div ref={root} className={`swarm${stale ? " sw-stale" : ""}`}>
     <div className="sw-canvas">
-      {empty ? <div className="sw-empty">
+      {model.held.length > 0 && <section className="sw-held-missions" aria-label="Missions waiting on you">
+        <div className="sw-group-label sw-dim" role="heading" aria-level={2}>Missions waiting on you</div>
+        {model.held.map(mission => <div className="sw-held-row" key={mission.id}>
+          <span className="sw-unit-sub" title={mission.title}>{mission.title}</span>
+          <div className="sw-held-row-meta"><span className="sw-dim">{missionStateLabel(mission)}</span><button type="button" className="sw-link" onClick={() => openMission(mission.id)}>Open mission</button></div>
+        </div>)}
+      </section>}
+      {empty ? <div className={`sw-empty${model.held.length > 0 ? " sw-held-empty" : ""}`}>
         <span className="sw-dim">no agents</span>
         {onCreate && <button type="button" className="sw-link" onClick={onCreate}>start a session</button>}
       </div>

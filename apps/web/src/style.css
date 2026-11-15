@@ -1439,6 +1439,11 @@ small,
 /* Mission details and links from the Swarm lanes. */
 .sw-mission-title { min-width: 0; padding: 0; border: 0; background: transparent; color: var(--sw-ink); font: inherit; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
 .sw-mission-title:hover, .sw-mission-title:focus-visible { text-decoration: underline; text-underline-offset: 3px; }
+.sw-held-missions { margin: 0 0 22px; padding: 8px 12px; border: 1px solid var(--sw-rule); border-radius: 8px; background: var(--sw-raised); }
+.sw-held-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 36px; border-top: 1px solid var(--sw-rule); }
+.sw-held-row .sw-unit-sub { display: block; min-width: 0; flex: 1; }
+.sw-held-row-meta { display: flex; align-items: center; gap: 12px; flex: 0 0 auto; }
+.sw-empty.sw-held-empty { position: relative; inset: auto; min-height: 160px; }
 .mission-stop-time { margin: 10px 0 0; font-size: 12px; }
 .mission-subtasks { list-style: none; margin: 0; padding: 0; }
 .mission-subtasks li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 0; border-top: 1px solid var(--rule); }

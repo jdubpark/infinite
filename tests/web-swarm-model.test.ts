@@ -264,6 +264,40 @@ test("missions", () => {
   assert.equal(findAgent(model, "s-coord")?.role, "MC");
 });
 
+test("held missions stay reachable while live missions keep their lane", () => {
+  const deadlineStopped = mission("M-deadline", {
+    title: "Deadline mission", status: "blocked", stopReason: "deadline", createdAt: iso(2 * HOUR),
+    coordinator: { memberId: "c-deadline", sessionId: "s-deadline", status: "stopped" },
+  });
+  const paused = mission("M-paused", {
+    status: "paused", createdAt: iso(3 * HOUR),
+    coordinator: { memberId: "c-paused", sessionId: "s-paused", status: "stopped" },
+  });
+  const working = mission("M-working", {
+    status: "working", createdAt: iso(4 * HOUR),
+    coordinator: { memberId: "c-working", sessionId: "s-working", status: "running" },
+  });
+  const cancelled = mission("M-cancelled", {
+    status: "cancelled", coordinator: { memberId: "c-cancelled", sessionId: "s-cancelled", status: "stopped" },
+  });
+  const ready = mission("M-ready", {
+    status: "ready-for-review", coordinator: { memberId: "c-ready", sessionId: "s-ready", status: "stopped" },
+  });
+  const model = buildSwarm(input({ missions: [paused, deadlineStopped, working, cancelled, ready] }));
+  const liveMissionIds = model.live.filter(swarm => swarm.kind === "mission").map(swarm => swarm.id);
+  assert.deepEqual(model.held, [
+    { id: "M-deadline", title: "Deadline mission", status: "blocked", stopReason: "deadline" },
+    { id: "M-paused", title: "M-paused title", status: "paused" },
+  ]);
+  assert.ok(!liveMissionIds.includes("M-deadline"), "a stopped coordinator without subtasks is not live");
+  assert.ok(liveMissionIds.includes("M-working"), "a working coordinator remains live");
+  assert.ok(!model.held.some(item => item.id === "M-working"));
+  for (const id of ["M-cancelled", "M-ready"]) {
+    assert.ok(!liveMissionIds.includes(id), id + " is not live");
+    assert.ok(!model.held.some(item => item.id === id), id + " is not held");
+  }
+});
+
 test("solo", () => {
   const model = buildSwarm(input({
     sessions: [

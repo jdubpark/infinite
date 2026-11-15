@@ -12,6 +12,7 @@ const HOUR_MS = 3_600_000;
 const QUIET_WINDOW_MS = 72 * HOUR_MS;
 const QUIET_LIMIT = 12;
 const LIVE_AGENT_STATES: AgentState[] = ["queued", "working", "waiting", "in-review", "needs-you"];
+const HELD_MISSION_STATUSES: SwarmMission["status"][] = ["planning", "working", "needs-input", "paused", "blocked"];
 const OBSERVABLE_PROVIDERS = new Set(["claude", "codex"]);
 
 /** Status to the stage it is working on. Verifying runs the checks. */
@@ -300,6 +301,11 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
   const live = built
     .filter(swarm => swarm.live)
     .sort((a, b) => rank(a) - rank(b) || timeOf(b.createdAt) - timeOf(a.createdAt) || a.id.localeCompare(b.id));
+  const missionSwarms = new Map(built.filter(swarm => swarm.kind === "mission").map(swarm => [swarm.id, swarm]));
+  const held = input.missions
+    .filter(mission => HELD_MISSION_STATUSES.includes(mission.status) && missionSwarms.get(mission.id)?.live === false)
+    .sort((a, b) => timeOf(b.createdAt) - timeOf(a.createdAt) || a.id.localeCompare(b.id))
+    .map(({ id, title, status, stopReason }) => ({ id, title, status, ...(stopReason ? { stopReason } : {}) }));
 
   // Quiet runs are counted one by one, by the age of their own last activity: a mission's twenty finished runs are twenty rows to cap, not one.
   const cutoff = input.now - QUIET_WINDOW_MS;
@@ -319,6 +325,7 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
 
   return {
     live,
+    held,
     quiet,
     quietOlder: quietAll.length - quiet.length,
     totals: {

@@ -24,7 +24,7 @@ const lineup: TeamLineup = {
   reviewer: { id: "reviewer", label: "Reviewer", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
 };
 
-async function fixture(scenario: string, linear?: Awaited<ReturnType<typeof startLinearServer>>) {
+async function fixture(scenario: string, linear?: Awaited<ReturnType<typeof startLinearServer>>, objective?: "on" | "off") {
   const root = realpathSync(mkdtempSync("/tmp/inf-goal-"));
   const source = join(root, "source"), receipts = join(root, "receipts");
   mkdirSync(join(source, "features"), { recursive: true }); mkdirSync(receipts, { mode: 0o700 });
@@ -54,7 +54,7 @@ async function fixture(scenario: string, linear?: Awaited<ReturnType<typeof star
       ...(linear ? { linear: { apiKeyFile, endpoint: linear.endpoint } } : {}),
       projects: [{ id: "rehearsal", name: "Rehearsal", path: source, team: bootstrapGoal
         ? { checks: [], establishChecks: true }
-        : { checks: [{ command: process.execPath, args: ["check.mjs"] }], ...(scenario === "delivery" ? { delivery: { mode: "merge" as const, repository: "example/app", baseBranch: "main", mergeMethod: "squash" as const } } : {}) },
+        : { checks: [{ command: process.execPath, args: ["check.mjs"] }], ...(objective ? { objective: { prompts: objective } } : {}), ...(scenario === "delivery" ? { delivery: { mode: "merge" as const, repository: "example/app", baseBranch: "main", mergeMethod: "squash" as const } } : {}) },
         ...(linear ? { linear: { teamId: linear.teamId } } : {}) }],
     } });
   } catch (error) { rmSync(root, { recursive: true, force: true }); await linear?.close(); throw error; }
@@ -274,7 +274,40 @@ test("a goal with no justified change records evidence without starting implemen
   } finally { await f.close(); }
 });
 
-test("a recoverable child report keeps its goal active through the bounded PM repair", { timeout: 120000 }, async () => {
+test("owner corrections through the host", { timeout: 60000 }, async () => {
+  const f = await fixture("no-change", undefined, "on");
+  try {
+    const criterion = { statement: "The progress file records one more step", check: { kind: "receipt", receipt: "checks-passed" }, threshold: { kind: "pass" } };
+    const created = await f.host.fetchApi("/goals", "owner", { ...f.create(), maxRuns: 3, criteria: [criterion] });
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    const record = await f.host.fetchApi(`/goals/${created.body.id}/record`, "viewer");
+    assert.equal(record.status, 200, JSON.stringify(record.body));
+    assert.deepEqual(record.body.record.criteria.map((item: { id: string }) => item.id), ["c0", "c1"]);
+    const body = { requestId: randomUUID(), version: record.body.version, ops: [{ op: "criterion.edit", id: "c1", statement: "The progress file records two more steps" }] };
+    const corrected = await f.host.fetchApi(`/goals/${created.body.id}/record`, "owner", body);
+    assert.equal(corrected.status, 200, JSON.stringify(corrected.body));
+    assert.equal(corrected.body.version, 2);
+    assert.equal((await f.host.fetchApi(`/goals/${created.body.id}/record`, "controller", { ...body, requestId: randomUUID(), version: 2 })).status, 403);
+    assert.equal((await f.host.fetchApi(`/goals/${created.body.id}/record`, "viewer", { ...body, requestId: randomUUID(), version: 2 })).status, 403);
+    const invalid = { code: "objective-op-invalid", error: "The correction is invalid." };
+    for (const bad of [
+      { ...body, requestId: randomUUID(), version: 2, extra: true },
+      { ...body, requestId: randomUUID(), version: 2, ops: Array.from({ length: 17 }, (_, index) => ({ op: "criterion.confirm", id: `c${index + 1}` })) },
+      { ...body, requestId: randomUUID(), version: 2, ops: [{ op: "criterion.add", criterion: { ...criterion, statement: "a".repeat(1001) } }] },
+    ]) {
+      const refused = await f.host.fetchApi(`/goals/${created.body.id}/record`, "owner", bad);
+      assert.equal(refused.status, 400, JSON.stringify(refused.body));
+      assert.deepEqual(refused.body, invalid);
+    }
+    // A replay answers the same view and writes nothing.
+    const replay = await f.host.fetchApi(`/goals/${created.body.id}/record`, "owner", body);
+    assert.equal(replay.status, 200, JSON.stringify(replay.body));
+    assert.deepEqual(replay.body, corrected.body);
+    assert.equal((await f.host.fetchApi(`/goals/${created.body.id}/record`, "viewer")).body.latestVersion, 2);
+  } finally { await f.close(); }
+});
+
+test("a recoverable child report keeps its goal active through the bounded PM repair",{ timeout: 120000 }, async () => {
   const f = await fixture("recoverable-blocker");
   try {
     const created = await f.host.fetchApi("/goals", "owner", f.create());

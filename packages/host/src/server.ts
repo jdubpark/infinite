@@ -50,6 +50,7 @@ import { ENTRY_KINDS } from "./evidence/entry-types.js";
 import { usagePlanSchema } from "./usage-api.js";
 import { TeamService, TeamError } from "./teams.js";
 import { objectiveRoutes } from "./objective-routes.js";
+import { parseGoalCreateBody } from "./objective-input.js";
 import { spawnTeamBundle } from "./team-workspace.js";
 import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
 import { scorecardFromRows, type ProfileIdentityOf } from "./scorecard.js";
@@ -75,7 +76,7 @@ import { PermissionDelegationService } from "./permission-delegation.js";
 import { INTERRUPT_CLASSES, PERMISSION_POLICY_VERSION } from "./permission-policy.js";
 import { PermissionJournal, permissionJournalModule } from "./evidence/permission-journal.js";
 import { LinearService } from "./linear.js";
-import { createGoalSchema, goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema, goalParallelismSchema } from "./goal-types.js";
+import { goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema, goalParallelismSchema } from "./goal-types.js";
 import { createProjectGroupSchema, projectGroupIdSchema, updateProjectGroupSchema } from "./project-group-types.js";
 import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./desktop.js";
 import type { Config, Role, Receipt, Session } from "./types.js";
@@ -983,7 +984,7 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/teams", (_req, res) => res.json({ teams: teams.list() }));
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
-  objectiveRoutes(app, { goals, teams }, requireRole(["owner", "controller", "viewer"]));
+  objectiveRoutes(app, { goals, teams }, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
   app.get("/api/routines", (_req, res) => res.json({ routines: routines.list() }));
   app.get("/api/routines/:id", (req, res) => res.json(routines.get(id.parse(req.params.id))));
   app.post("/api/routines", requireRole(["owner"]), async (req, res) => res.json(await routines.create(createRoutineSchema.parse(req.body))));
@@ -1148,9 +1149,9 @@ export function createApp(config: Config, key: Buffer) {
     return res.json({ agent: PERMISSION_AGENT_STATE, view });
   });
   app.post("/api/goals", requireRole(["owner"]), async (req, res) => {
-    const body = createGoalSchema.parse(req.body);
+    const { goal: body, criteria } = parseGoalCreateBody(req.body);
     assertNoHandoff(body.projectId);
-    return res.json(await startInProject(body.projectId, () => goals.create(body)));
+    return res.json(await startInProject(body.projectId, () => goals.create(body, undefined, criteria)));
   });
   app.post("/api/goals/:id/steer", requireRole(["owner", "controller"]), async (req, res) => res.json(await goals.steer(id.parse(req.params.id), goalSteerSchema.parse(req.body))));
   app.post("/api/goals/:id/parallelism", requireRole(["owner"]), async (req, res) => res.json(await goals.setParallelism(id.parse(req.params.id), goalParallelismSchema.parse(req.body))));

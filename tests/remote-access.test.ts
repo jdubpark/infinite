@@ -468,3 +468,14 @@ test("the relay refuses objective records", async () => {
     assert.equal(runner.requests.length, 1, "a refused record read does not reach the host");
   } finally { client.close(); runner.close(); }
 });
+
+test("the relay refuses corrections", async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    // An owner correction is written over a direct owner connection only.
+    await assert.rejects(client.request(`/goals/${randomUUID()}/record`, { method: "POST", body: {} }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    assert.equal(runner.requests.length, 1, "a refused correction does not reach the host");
+  } finally { client.close(); runner.close(); }
+});

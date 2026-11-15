@@ -139,6 +139,8 @@ export interface Config {
     outcomes?: { holdDays?: number; retentionDays?: number };
   };
   machine?: { id: string; label: string };
+  /** The permission agent's light and strong tiers, its miss-rate threshold and the least replay set size. */
+  permissionAgent?: import("./permission-agent-config.js").PermissionAgentConfig;
   /** Operator default for an enrollment that has no saved mode. Only defaultMode exists in this block so far. */
   autonomy?: { defaultMode?: import("./autonomy.js").AutonomyMode; fuse?: import("./config.js").FuseConfig };
   cmux?: { enabled: boolean; command?: string; hooksDir?: string };

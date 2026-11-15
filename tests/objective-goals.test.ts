@@ -7,12 +7,13 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 import { GoalService } from "../packages/host/src/goals.js";
-import { GOAL_DIGEST_EVENTS, GOAL_OBJECTIVE_EVENTS } from "../packages/host/src/objective-goals.js";
+import { GOAL_DIGEST_EVENTS, GOAL_OBJECTIVE_EVENTS, goalRecordDigest } from "../packages/host/src/objective-goals.js";
 import { goalRecord } from "../packages/host/src/objective-record.js";
-import { objectiveRecordSchema } from "../packages/host/src/objective-types.js";
+import { objectiveRecordSchema, recordDigest, type ObjectiveRecord, type Criterion } from "../packages/host/src/objective-types.js";
+import { commandDigest } from "../packages/host/src/objective-input.js";
 import type { CreateGoal, ProductGoal } from "../packages/host/src/goal-types.js";
 import type { Config } from "../packages/host/src/types.js";
-import type { TeamLineup } from "../packages/host/src/team-types.js";
+import type { TeamCommand, TeamLineup } from "../packages/host/src/team-types.js";
 import { TeamError } from "../packages/host/src/teams.js";
 
 type StoredShape = { goal: ProductGoal; fingerprint: string; receipts: Record<string, string>; objectiveRecord?: unknown; objectiveNotice?: string; launch?: any; control?: unknown };
@@ -324,6 +325,26 @@ test("creation criteria join version 1", async () => {
   } finally { f.close(); }
 });
 
+test("a creation criterion that cannot be built refuses the create and stores nothing", async () => {
+  const f = fixture(), teams = f.openTeam();
+  try {
+    // A configured check without args makes its digest throw: a host fault, not an owner error.
+    const configured = f.config.projects[0]!.team!.checks;
+    f.config.projects[0]!.team!.checks = [{ command: process.execPath } as TeamCommand];
+    const goals = new GoalService(f.config, f.key, teams);
+    const request = createInput();
+    await assert.rejects(goals.create(request, undefined, [commandCriterion("The checks pass")]), refused("objective-op-refused"));
+    assert.equal(goals.list().some(goal => goal.id === request.requestId), false);
+    assert.equal(existsSync(goalFile(f, request.requestId)), false);
+
+    f.config.projects[0]!.team!.checks = configured;
+    const created = await goals.create(request, undefined, [commandCriterion("The checks pass")]);
+    assert.equal(created.id, request.requestId);
+    assert.equal(goals.objectiveRecord(created.id).record.criteria.length, 2);
+    assert.equal((await goals.create(request, undefined, [commandCriterion("The checks pass")])).id, created.id);
+  } finally { f.close(); }
+});
+
 test("corrections and creation criteria need the switch", async () => {
   for (const value of [undefined, "off"] as const) {
     const f = fixture(), teams = f.openTeam();
@@ -360,6 +381,10 @@ test("a correction applies once", async () => {
     await assert.rejects(goals.correctObjective(created.id, correction(1, [add(judgement("Other"))], body.requestId)), refused("request-conflict"));
     await assert.rejects(goals.correctObjective(created.id, correction(1, [add(judgement("Other"))])), refused("objective-version-stale"));
     assert.equal(goals.get(created.id).revision, created.revision);
+    // The replay is checked before the switch: after the switch turns off, the applied correction still answers its view.
+    setSwitch(f, "off");
+    assert.deepEqual(await goals.correctObjective(created.id, body), first);
+    assert.equal(readFileSync(goalFile(f, created.id), "utf8"), text);
   } finally { f.close(); }
 });
 
@@ -414,6 +439,7 @@ test("a cycle pins the digest it launched with", async () => {
     f.writeRecord("goal", legacyId, { ...stored, launch: {
       request: { requestId: launchRequest, projectId: "fixture", provider: "claude", useConfiguredLineup: true, title: "Rank sources · 1", objective: "Find ranked sources", parallelism: 2 },
       context: { id: legacyId, revision: 1, cycle: 1, successCriteria: "A ranked shortlist with reasons and sources", nonGoals: ["no paid sources"], allowedPaths: ["research"], evidence: ["notes.md"], previousWork: [], deadlineAt: new Date(Date.now() + 3600000).toISOString(), maxMembers: 4, extendMinutes: 0, ceilingAt: new Date(Date.now() + 3600000).toISOString() },
+      autonomy: "supervised",
     } });
     const legacyGoals = new GoalService(f.config, f.key, reopenedTeams);
     legacyGoals.start();
@@ -443,6 +469,55 @@ test("an unreadable record launches without a digest", async () => {
     assert.equal(goal.status, "running");
     assert.equal("record" in teams.get(goal.activeTeamId!).goal!, false);
     assert.equal(eventTexts(goal).filter(text => text === GOAL_DIGEST_EVENTS["record-unavailable"]).length, 1);
+  } finally { f.close(); }
+});
+
+/** A goal's record with `extra` criteria after c0, resealed by hand: the writer refuses the shapes these tests need. */
+function recordWith(goal: ProductGoal, extra: Criterion[]): ObjectiveRecord {
+  const { digest: _digest, ...body } = goalRecord(goal, "2026-11-14T10:00:00.000Z", "created") as ObjectiveRecord;
+  const next = { ...body, criteria: [body.criteria[0]!, ...extra] };
+  return { ...next, digest: recordDigest(next) };
+}
+
+test("the digest skips with its reason and never throws", () => {
+  const goal = legacyGoal();
+  const full = { command: process.execPath, args: ["-e", "0"] };
+  const judged = (id: string): Criterion => ({ id, origin: "owner", statement: "a".repeat(1000), check: { kind: "judgement", item: "sources" }, producer: "evaluator", threshold: { kind: "pass" }, state: "active" });
+  assert.ok("digest" in goalRecordDigest({ goal, objectiveRecord: recordWith(goal, []) }, [full]), "a small record has a digest");
+
+  // Eight criteria of 1,000-byte statements cross the 6,144-byte digest limit: the digest is skipped, not thrown.
+  const large = recordWith(goal, Array.from({ length: 7 }, (_, index) => judged(`c${index + 1}`)));
+  assert.deepEqual(goalRecordDigest({ goal, objectiveRecord: large }, [full]), { skipped: "digest-too-large" });
+
+  // A configured check without args makes the digest's label throw: that is an unreadable record, never an escape.
+  const commanded = recordWith(goal, [{ id: "c1", origin: "owner", statement: "The checks pass", check: { kind: "command", command: commandDigest(full) }, producer: "host", threshold: { kind: "pass" }, state: "active" }]);
+  assert.ok("digest" in goalRecordDigest({ goal, objectiveRecord: commanded }, [full]));
+  assert.deepEqual(goalRecordDigest({ goal, objectiveRecord: commanded }, [{ command: process.execPath } as TeamCommand]), { skipped: "record-unavailable" });
+});
+
+test("a skipped digest is logged once while its reason holds", async () => {
+  const f = fixture(), teams = f.openTeam();
+  try {
+    const goals = new GoalService(f.config, f.key, teams);
+    const created = await goals.create(createInput());
+    goals.close();
+    const stored = f.readRecord<StoredShape>("goal", created.id);
+    f.writeRecord("goal", created.id, { ...stored, objectiveRecord: { schemaVersion: 1, junk: true } });
+
+    const first = new GoalService(f.config, f.key, teams);
+    first.start();
+    await barrier(first, created.id);
+    first.close();
+    // The first run has ended: the goal has no active run, so the next tick prepares a second cycle with the same skip.
+    const ended = f.readRecord<StoredShape>("goal", created.id);
+    f.writeRecord("goal", created.id, { ...ended, goal: { ...ended.goal, activeTeamId: undefined } });
+
+    const second = new GoalService(f.config, f.key, teams);
+    second.start();
+    await barrier(second, created.id);
+    second.close();
+    assert.equal(second.get(created.id).cycles.length, 2, "the second cycle launched");
+    assert.equal(eventTexts(second.get(created.id)).filter(text => text === GOAL_DIGEST_EVENTS["record-unavailable"]).length, 1);
   } finally { f.close(); }
 });
 

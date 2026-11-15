@@ -800,7 +800,9 @@ export class GoalService {
     // The digest is built before the launch is saved, so a replay of that launch carries the same digest.
     const project = this.config.projects.find(value => value.id === goal.projectId);
     const pinned = objectivePromptsOn(project) ? goalRecordDigest(stored, project?.team?.checks ?? []) : undefined;
-    if (pinned && "skipped" in pinned) this.event(stored, GOAL_DIGEST_EVENTS[pinned.skipped]);
+    // A skip is logged once per run of the same reason: the newest digest skip event is the last reason added.
+    const lastSkip = [...goal.events].reverse().find(event => Object.values(GOAL_DIGEST_EVENTS).includes(event.text));
+    if (pinned && "skipped" in pinned && lastSkip?.text !== GOAL_DIGEST_EVENTS[pinned.skipped]) this.event(stored, GOAL_DIGEST_EVENTS[pinned.skipped]);
     const parent = latestReviewed(goal.cycles);
     const sourceIssue = goal.linear?.issue;
     const context: TeamGoalContext = { id: goal.id, revision: goal.revision, cycle, successCriteria: goal.successCriteria, nonGoals: goal.nonGoals, allowedPaths: goal.allowedPaths, evidence: goal.evidence,

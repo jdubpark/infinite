@@ -40,8 +40,9 @@ function store(holder: GoalHolder, built: ObjectiveRecord | "source-invalid", re
 }
 
 /**
- * Builds the goal's first record, then adds the creation criteria as version 1's `criterion.added` entries. A refused
- * criterion throws; any other failure keeps the record without criteria. Used by `GoalService.create`.
+ * Builds the goal's first record, then adds the creation criteria as version 1's `criterion.added` entries. A refusal
+ * throws its own code. Any other failure throws `objective-op-refused`, so no criterion is ever dropped silently.
+ * Used by `GoalService.create`, which stores nothing when this throws.
  */
 export function createGoalObjective(holder: GoalHolder, at: string, criteria?: { inputs: readonly CriterionInput[]; context: OwnerOpContext }): GoalObjectiveResult {
   const built = goalRecord(holder.goal, at, "created");
@@ -50,7 +51,7 @@ export function createGoalObjective(holder: GoalHolder, at: string, criteria?: {
   try { record = addCreationCriteria(built, criteria.inputs, criteria.context); }
   catch (error) {
     if (error instanceof TeamError) throw error;
-    return store(holder, built, "built");
+    throw objectiveError("objective-op-refused");
   }
   return store(holder, record, "built");
 }

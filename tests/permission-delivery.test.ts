@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { EvidenceDeliveryLedger, InteractivePermissionDelivery, permissionDeliveryModule, type PermissionDeliveryLedger } from "../packages/host/src/permission-delivery.js";
 import type { PermissionInteractiveTarget, PermissionOutcome, PermissionPipeline, PermissionRequest } from "../packages/host/src/permission-agent-types.js";
+import { teamPermissionRequest, teamPermissionTarget } from "../packages/host/src/team-permission-adapter.js";
 
 type Live = Awaited<ReturnType<PermissionInteractiveTarget["check"]>>;
 
@@ -27,11 +28,11 @@ function request(overrides: Partial<PermissionRequest> = {}): PermissionRequest 
 }
 
 function fakePipeline(outcome: PermissionOutcome | (() => Promise<PermissionOutcome>), options: { served?: boolean; applicable?: boolean } = {}) {
-  const calls = { decide: 0, deliveries: [] as Array<{ decisionId: string; kind: string }> };
+  const calls = { decide: 0, options: [] as Array<Parameters<PermissionPipeline["decide"]>[1]>, deliveries: [] as Array<{ decisionId: string; kind: string }> };
   const pipeline: PermissionPipeline = {
     serves: () => options.served === false ? { served: false, reason: "not-covered" } : { served: true },
     classOf: () => undefined,
-    decide: async () => { calls.decide++; return typeof outcome === "function" ? outcome() : outcome; },
+    decide: async (_request, decideOptions) => { calls.decide++; calls.options.push(decideOptions); return typeof outcome === "function" ? outcome() : outcome; },
     applicable: () => options.applicable !== false,
     recordDelivery: (decisionId, kind) => { calls.deliveries.push({ decisionId, kind }); },
     taskEnded: () => {},
@@ -124,6 +125,26 @@ test("a reject is delivered only through a recognised one-shot reject option, wi
   assert.equal(refused.handled && refused.result, "undeliverable");
   assert.equal(noReject.answers.length, 0, "the accept option is never used for a reject");
   assert.equal(service.holder("session-1", 8), "owner");
+});
+
+test("the target's evidence collection reaches the decision, and an owner halt leaves the request to be handed again", async () => {
+  let outcome: PermissionOutcome = { kind: "held" };
+  const { pipeline, calls } = fakePipeline(async () => outcome);
+  let now = 1_000_000;
+  const service = new InteractivePermissionDelivery({ pipeline: () => pipeline, ledger: memoryLedger(), now: () => now });
+  const { target, answers } = fakeTarget();
+  const collect = async () => ({ files: [], limitations: [], digest: "none" });
+  target.collect = collect;
+  const held = await service.handle(target);
+  assert.deepEqual([held.handled, held.handled ? undefined : held.held], [false, true]);
+  assert.equal(calls.options[0]?.collect, collect);
+  assert.equal(answers.length, 0, "nothing is delivered under a halt");
+  // After the release the same request is decided from that time's evidence.
+  outcome = allow(true);
+  now += 31_000;
+  assert.equal((await service.handle(target)).handled, true);
+  assert.equal(calls.decide, 2);
+  assert.equal(answers.length, 1);
 });
 
 test("a request that changed or closed before delivery is stale: nothing is sent and nobody is pushed", async () => {
@@ -222,4 +243,28 @@ test("an intent that could not be recorded sends nothing", async () => {
   const handled = await service.handle(target);
   assert.equal(handled.handled && handled.result, "undeliverable");
   assert.equal(answers.length, 0);
+});
+
+test("a team member's source file that the review read must be unchanged at delivery", async () => {
+  const root = "/home/dev/projects/infinite";
+  const prompt = request().prompt!;
+  const workspace = { changedPaths: [], evidence: { files: [], limitations: [], digest: "workspace" } };
+  const built = teamPermissionRequest({
+    run: { id: "run-1", projectId: "project-1", provider: "codex", title: "Run", objective: "Objective" } as never,
+    member: { sessionId: "session-1", memberId: "member-1", role: "implementer", revision: 1 } as never,
+    prompt, sessionRoot: root, workspace, acceptedChecks: null,
+  });
+  let content = "first";
+  const target = teamPermissionTarget(built, {
+    manager: { meta: () => { throw new Error("not reached"); }, state: async () => { throw new Error("not reached"); }, answerAgentPermission: async () => { throw new Error("not reached"); } } as never,
+    assignment: { runId: "run-1", memberId: "member-1", revision: 1, role: "implementer" },
+    runCheck: () => undefined,
+    sessionRoot: () => root,
+    workspace: async () => workspace,
+    collect: async paths => ({ files: paths.map(path => ({ path, sha256: content, content })), limitations: [], digest: content }),
+  });
+  assert.equal((await target.collect!(["scripts/release.sh"])).files[0].content, "first");
+  content = "second";
+  const live = await target.check();
+  assert.deepEqual([live.ok, live.ok ? undefined : live.stale, live.ok ? undefined : live.reason], [false, true, "A source file that the review read changed."]);
 });

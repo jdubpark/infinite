@@ -36,7 +36,7 @@ import { assertTeamworkPath } from "./repo-enrollment.js";
 import { HOST_LOAD_REASON_PREFIX, LaunchHeldError } from "./host-load.js";
 import { agentAcceptOption, isCollapsedPermissionPrompt, oneShotPermissionOption, permissionAuthorityHash, permissionEvidenceHash, permissionReuseKey, refusedBeforeSend } from "./team-permissions.js";
 import { storageShortfall, volumeUsage, type VolumeUsage } from "./storage.js";
-import { collectPermissionEvidence } from "./team-permission-evidence.js";
+import { collectPermissionEvidence, permissionEvidenceDigest } from "./team-permission-evidence.js";
 import type { PermissionAgentServices, PermissionHandled, PermissionRequest } from "./permission-agent-types.js";
 import type { PermissionDeliverySource } from "./permission-delivery.js";
 import { teamPermissionRequest, teamPermissionTarget } from "./team-permission-adapter.js";
@@ -3465,6 +3465,16 @@ export class TeamService {
         await assertMemberReadOnly(sessionRoot, current.run.headCommit!, prefix);
       } } : {}),
       workspace,
+      // The strong tier's source paths, with today's rules: inside the clone or the scratch directory, at most eight, bounded sizes.
+      collect: async paths => {
+        const normalized = this.normalizeRequestedPermissionPaths(paths, sessionRoot, member.scratchDirectory);
+        if (!normalized) {
+          const limitations = ["The requested paths are malformed or outside the member's workspace; nothing was collected."];
+          return { files: [], limitations, digest: permissionEvidenceDigest({ files: [], limitations }) };
+        }
+        const changedPaths = await memberChangedPaths(sessionRoot, member.baseCommit, prefix);
+        return collectPermissionEvidence({ prompt, cwd: sessionRoot, changedPaths, approvedScratchRoots: scratch, requestedPaths: normalized });
+      },
       delivering: (deliveryId, active) => this.trackAgentDelivery(runId, sessionId, deliveryId, active),
       signal: this.agentController(runId).signal,
     });

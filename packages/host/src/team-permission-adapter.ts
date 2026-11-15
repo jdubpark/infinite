@@ -94,6 +94,11 @@ export type TeamTargetDeps = {
   roleCheck?(): Promise<void>;
   /** Collects the member's current workspace evidence with today's bounded collection. */
   workspace(): Promise<TeamWorkspaceEvidence>;
+  /**
+   * Today's bounded read-only collection of source paths that the strong tier asks for, inside the member's
+   * clone and scratch directory. What a decision read is read again before delivery and must be unchanged.
+   */
+  collect?(paths: string[]): Promise<PermissionEvidence>;
   /** Called with each delivery's id before its lease is claimed, and again when it ends, so a revoke can fence it. */
   delivering?(deliveryId: string, active: boolean): void;
   signal?: AbortSignal;
@@ -116,10 +121,17 @@ export function teamPermissionTarget(request: PermissionRequest, deps: TeamTarge
   const workspaceMatches = (workspace: TeamWorkspaceEvidence) => digest({ prompt: permissionEvidenceHash(prompt), workspace: workspaceDigest(workspace),
     sessionRoot: request.requester.sessionRoot }) === request.evidenceHash;
   const current = () => deps.runCheck() === undefined && !deps.signal?.aborted;
+  /** The source paths the decision read on request, and what they held. */
+  let requested: { paths: string[]; digest: string } | undefined;
 
   const target: PermissionInteractiveTarget = {
     request,
     ...(deps.signal ? { signal: deps.signal } : {}),
+    ...(deps.collect ? { collect: async (paths: string[]) => {
+      const evidence = await deps.collect!(paths);
+      requested = { paths: [...paths], digest: evidence.digest };
+      return evidence;
+    } } : {}),
     async check() {
       const run = deps.runCheck();
       if (run) return fail(run.stale, run.reason);
@@ -135,6 +147,11 @@ export function teamPermissionTarget(request: PermissionRequest, deps: TeamTarge
       try {
         if (!workspaceMatches(await deps.workspace())) return fail(true, "The inspected command sources or changed paths changed.");
       } catch { return fail(true, "The member's changed files could not be listed."); }
+      if (requested && deps.collect) {
+        try {
+          if ((await deps.collect(requested.paths)).digest !== requested.digest) return fail(true, "A source file that the review read changed.");
+        } catch { return fail(true, "The source files that the review read could not be read again."); }
+      }
       try {
         const metadata = deps.manager.meta(request.requester.sessionId).session;
         if (!sameAssignment(metadata.team) || metadata.cwd !== root)

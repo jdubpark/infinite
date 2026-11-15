@@ -464,7 +464,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   const usageRow = (id: string) => { const row = usage.session(id); return row.measured ? { usage: row } : {}; };
   const listSessions = async () => {
     const native = (await manager.list({ includeFullMessage: Boolean(config.jev && config.jev.sessionReadings !== false) })).map(session => {
-      const handoff = handoffs.view(session.id);
+      const handoff = handoffs.listedView(session.id);
       const managed = managedBy(session);
       return { ...session, ...(managed ? { managedBy: managed } : {}), handoff, ...usageRow(session.id), executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id,
         resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };
@@ -485,7 +485,8 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     const session = { ...manager.meta(sessionId).session, ...(await manager.state(sessionId, true)) };
     const handoff = handoffs.view(sessionId);
     const managed = managedBy(session);
-    const { generatedTitle: _generatedTitle, ...publicSession } = readings.merge([session])[0];
+    // One session's detail is no listing: it must not replace what the last listing left for every other session.
+    const { generatedTitle: _generatedTitle, ...publicSession } = readings.merge([session], false)[0];
     return { ...publicSession, ...(managed ? { managedBy: managed } : {}), handoff, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id,
       resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };
   };
@@ -1341,6 +1342,17 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       const found = blackboard.get(runId, entryId);
       if (!found) throw new TeamError(404, "entry-not-found", "Entry not found.");
       return found;
+    });
+  });
+  // The owner's withdrawal of one entry. The answer depends only on the entry's state, so a replay is safe. The body is not stored.
+  const entryWithdrawBody = z.object({ requestId: z.uuid() }).strict();
+  app.post("/api/teams/:id/entries/:entryId/withdraw", requireRole(["owner"]), (req, res) => {
+    const entryId = id.parse(req.params.entryId);
+    return entryRead(req, res, runId => {
+      if (!entryWithdrawBody.safeParse(req.body).success) throw new TeamError(400, "entry-withdraw-invalid", "The withdrawal request is invalid.");
+      const changed = blackboard.withdraw(runId, entryId);
+      if (changed === undefined) throw new TeamError(404, "entry-not-found", "Entry not found.");
+      return { entryId, state: "withdrawn", changed: changed === "withdrawn" };
     });
   });
   app.get("/api/teams/:id/context-usage", (req, res) => entryRead(req, res, runId => ({ members: blackboard.contextUsage(runId) })));

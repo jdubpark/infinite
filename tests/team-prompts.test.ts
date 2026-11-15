@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { teamContext, teamPrompt } from "../packages/host/src/team-prompts.js";
-import { teamReportSchema, type TeamRun, type TeamTask } from "../packages/host/src/team-types.js";
+import { ENTRY_PARAGRAPH_LIMIT_BYTES, entryCommand, entryInstructions, refreshReportingInstructions, retargetPrompt, teamContext, teamPrompt } from "../packages/host/src/team-prompts.js";
+import { teamReportSchema, type TeamModelProfile, type TeamRun, type TeamTask } from "../packages/host/src/team-types.js";
 
 const PROMPT_LIMIT_BYTES = 80 * 1024;
 
@@ -44,7 +44,7 @@ function largeRun(): TeamRun {
     decisions: [],
     checks,
     steering: [{ text: "Owner direction: retain backwards compatibility.", revision: 1, at: "2026-10-21T00:00:00.000Z" }],
-    decisions: [{ id: "decision-1", memberId: "member-1", revision: 1, question: "Should existing callers keep the same response shape?", options: ["yes", "no"], answer: "Yes, preserve it.", answeredBy: "owner", createdAt: "2026-10-21T00:00:00.000Z" }],
+    decisions: [{ id: "decision-1", memberId: "member-1", revision: 1, question: "Should existing callers keep the same response shape?", options: ["yes", "no"], answerMode: "single", answer: "Yes, preserve it.", answeredBy: "owner", createdAt: "2026-10-21T00:00:00.000Z" }],
     events: [],
     round: 1,
     permissions: { mode: "coordinator", scope: "Only one-time checks for this task." },
@@ -103,6 +103,7 @@ test("review prompt bounds derived evidence while preserving objective and immut
   assert.equal(snapshot.checks[8].output, run.checks[8].output);
   assert.equal(snapshot.feedback, feedback);
   assert.equal(snapshot.ownerAnswers[0].answer, "Yes, preserve it.");
+  assert.equal(snapshot.ownerAnswers[0].answerMode, "single", "The selected mode stays in the authoritative coordinator context");
   assert.equal(snapshot.authority.permissionsRevokedAt, run.permissionsRevokedAt, "the snapshot distinguishes pinned scope from revoked live authority");
 
   const implementerPrompt = teamPrompt(run, "implementer", run.tasks[0], undefined, "demo");
@@ -241,6 +242,27 @@ test("blocked reports accept bounded structured evidence and keep it in coordina
   assert.match(prompt("implementer"), /may add "blocker":\{"cause"/, "workers see the structured blocked example");
 });
 
+test("team question modes preserve legacy behavior and validate selectable semantics", () => {
+  const legacy = { kind: "question", question: "Which response format?", options: ["JSON", "Text"] };
+  assert.deepEqual(teamReportSchema.parse(legacy), legacy, "Two legacy options do not infer approval mode");
+  assert.deepEqual(teamReportSchema.parse({ ...legacy, options: [] }), { ...legacy, options: [] });
+  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "approval" }).success, true);
+  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "approval", options: ["Approve"] }).success, false);
+  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "multiple" }).success, true);
+  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "multiple", options: ["Only one"] }).success, false);
+  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "single", options: ["One"] }).success, true);
+  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "approval", options: ["Approve", "Deny", "Defer"] }).success, false);
+});
+
+test("team agent guidance distinguishes approval from choices and leaves authority with the owner", () => {
+  const prompt = teamPrompt(largeRun(), "project-manager", undefined, undefined, "demo");
+  assert.match(prompt, /when feasible, offer concrete selectable options/);
+  assert.match(prompt, /answerMode "approval" only for a real authorization proposal/);
+  assert.match(prompt, /first meaning approve and the second meaning deny/);
+  assert.match(prompt, /two arbitrary options never imply approval/);
+  assert.match(prompt, /Never choose or approve for the owner/);
+});
+
 test("permission evidence stays complete inline and an over-budget review fails closed", () => {
   const objective = "Run the exact assigned unit check.";
   const run = { ...largeRun(), objective, linear: undefined, tasks: [], checks: [], steering: [] } as TeamRun;
@@ -280,4 +302,67 @@ test("a member context never carries the feature map or the eval block", () => {
   assert.doesNotMatch(serialized, /"excludeAreas"/);
   assert.match(serialized, /"checks"/, "the configured checks are still present");
   assert.ok((snapshot.authority.handoff as { project?: unknown } | undefined)?.project, "the handoff project is still present");
+});
+
+const ENTRY_ROLES_UNDER_TEST = ["project-manager", "scout", "implementer", "integrator", "reviewer"] as const;
+const ENTRY_PROVIDERS = ["claude", "codex", "opencode"] as const;
+const ENTRY_PROFILE: TeamModelProfile = { id: "fixture-profile", label: "Fixture profile", provider: "claude", model: "fixture-model", effort: "high" };
+const CONTEXT_ACCESS_END = "even when their complete inline text is present.";
+
+function smallRun(extra: Partial<TeamRun> = {}): TeamRun {
+  return {
+    id: "00000000-0000-4000-8000-000000000011",
+    projectId: "example-project",
+    provider: "claude",
+    title: "Entry prompt run",
+    objective: "Preserve the owner-visible contract.",
+    parallelism: 1,
+    revision: 1,
+    status: "implementing",
+    createdAt: "2026-11-01T00:00:00.000Z",
+    updatedAt: "2026-11-01T00:00:00.000Z",
+    workspace: "/home/dev/projects/example",
+    branch: "infinite/team-entry",
+    baseCommit: "a".repeat(40),
+    tasks: [],
+    members: [],
+    decisions: [],
+    checks: [],
+    steering: [],
+    events: [],
+    round: 1,
+    ...extra,
+  } as TeamRun;
+}
+
+test("the entry paragraph is the only change and only with tools on", () => {
+  for (const provider of ENTRY_PROVIDERS) {
+    const paragraph = entryInstructions(provider);
+    assert.ok(Buffer.byteLength(entryInstructions(provider, "\0"), "utf8") <= ENTRY_PARAGRAPH_LIMIT_BYTES, provider);
+    if (provider === "codex") assert.ok(!paragraph.includes(entryCommand()));
+    for (const role of ENTRY_ROLES_UNDER_TEST) {
+      const off = teamPrompt(smallRun(), role, undefined, undefined, provider, ENTRY_PROFILE);
+      const on = teamPrompt(smallRun({ blackboard: { tools: true } }), role, undefined, undefined, provider, ENTRY_PROFILE);
+      assert.equal(on, off.replace(CONTEXT_ACCESS_END, `${CONTEXT_ACCESS_END}\n\n${paragraph}`), `${role} ${provider}`);
+    }
+    for (const role of ["delivery", "permission-coordinator"] as const) {
+      assert.equal(
+        teamPrompt(smallRun({ blackboard: { tools: true } }), role, undefined, undefined, provider, ENTRY_PROFILE),
+        teamPrompt(smallRun(), role, undefined, undefined, provider, ENTRY_PROFILE),
+        `${role} ${provider}`,
+      );
+    }
+  }
+});
+
+test("a retarget swaps the entry paragraph", () => {
+  const prompt = teamPrompt(smallRun({ blackboard: { tools: true } }), "implementer", undefined, undefined, "claude", ENTRY_PROFILE);
+  assert.ok(prompt.includes(entryInstructions("claude")));
+  const retargeted = retargetPrompt(prompt, { provider: "codex", profile: { ...ENTRY_PROFILE, provider: "codex" } });
+  assert.ok(retargeted);
+  assert.equal(retargeted.split(entryInstructions("codex")).length - 1, 1);
+  assert.equal(retargeted.includes(entryInstructions("claude")), false);
+  const plain = teamPrompt(smallRun(), "implementer", undefined, undefined, "claude", ENTRY_PROFILE);
+  assert.equal(refreshReportingInstructions(plain, "codex").includes(entryInstructions("codex")), false);
+  assert.equal(refreshReportingInstructions(plain, "codex").includes(entryInstructions("claude")), false);
 });

@@ -320,10 +320,13 @@ export function buildLaunch(
   teamModelProfile?: TeamModelProfile,
   handoffSessionId?: string,
   trustedCwd?: string,
+  entryTools?: boolean,
   /** The host admitted this headless Claude session to the permission channel. */
   channel = false,
 ): AgentProfile {
   const args = [...profile.args];
+  // Entry tools ride the team report channel. They add no provider permission, so the profile's own decisions still apply.
+  const withEntryTools = Boolean(team && entryTools && !handoffSessionId);
   if (handoffSessionId) {
     if (!hooks || !["claude", "codex"].includes(provider)) throw new Error("Handoff requires an authenticated provider channel");
     const development = relayPath.endsWith(".ts");
@@ -349,6 +352,7 @@ export function buildLaunch(
         INFINITE_HOOK_TOKEN: "${INFINITE_HOOK_TOKEN}",
         INFINITE_TEAM_ASSIGNMENT: "${INFINITE_TEAM_ASSIGNMENT}",
         INFINITE_MISSION_ASSIGNMENT: "${INFINITE_MISSION_ASSIGNMENT:-}",
+        ...(withEntryTools ? { INFINITE_TEAM_ENTRY_TOOLS: "1" } : {}),
       },
     } } }));
   }
@@ -362,6 +366,12 @@ export function buildLaunch(
       env_vars: ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT", "INFINITE_PROJECT_ID"],
       "tools.report.approval_mode": "approve",
       "tools.mission_report.approval_mode": "approve",
+      ...(withEntryTools ? {
+        "env.INFINITE_TEAM_ENTRY_TOOLS": "1",
+        "tools.entry_post.approval_mode": "approve",
+        "tools.entry_list.approval_mode": "approve",
+        "tools.entry_get.approval_mode": "approve",
+      } : {}),
     })) args.push("-c", `mcp_servers.infinite_team.${key}=${JSON.stringify(value)}`);
   }
   // Dev runs the relay from TypeScript through tsx; builds run the compiled file. The tsx

@@ -112,6 +112,8 @@ Enrolling a `github` project still uploads a one-time snapshot so the project
 directory exists at once. The first refresh then fast-forwards it to the base
 branch. See [GitHub-tracked sources](#github-tracked-sources).
 
+A rerun keeps every team setting that the command does not set itself: the handoff time limits, the feature map, and eval capture.
+
 A new empty repository can enroll immediately after `git init`. Its cloud source
 gets an empty baseline commit; local Git history and files stay unchanged. When
 no checks exist, enrollment records `checks: []` and `establishChecks: true`.
@@ -389,7 +391,11 @@ Each integration records what changed. The run's `changes` lists the files chang
 
 Runs also write run events to the evidence store: `run.created`, `run.blocked`, and `run.settled`, with a summary of the run's counts when it settles. Each run keeps its events in a small outbox inside its record until the store accepts them, and a restart does not lose them. The events only record what the run did. A run behaves the same whether or not its events are stored, and a store that stays unavailable never stops or changes a run.
 
-Runs also mirror their reports, integrations, check results, and owner directions into the evidence store as entries, and record each member's launch sizes. The owner reads them with `infinite team entries` and `infinite team entry`. Entries and sizes never change a run, and no member reads an entry yet.
+Runs also mirror their reports, integrations, check results, and owner directions into the evidence store as entries, and record each member's launch sizes. The owner reads them with `infinite team entries` and `infinite team entry`. Entries and sizes never change a run.
+
+Member entry tools are off by default. `config.teams.blackboard.tools` turns them on. The switch has no default, and it is part of the routine digest, so a routine blocks when it changes. A run pins the switch at creation only when it is `true` and the evidence store is ready. A run created otherwise keeps today's prompts and context files for its whole life. With the switch on, project managers, scouts, implementers, integrators, and reviewers get three tools: `entry_post`, `entry_list`, and `entry_get`. A post is one of `contract`, `finding`, `blocker`, or `handoff`, and a handoff needs the author's own task. Every member entry is a claim by its member, and it never changes an assignment, a scope, or the reporting rules. The session worker refuses a post that holds a private key, a known access token shape, the member's hook token or hook address, or a credential the host gave the session (a GitHub grant, an egress proxy password); the refusal names the field and never repeats the text. Caps per attempt: 20 posts and 64 KiB of bodies, 12 KiB per body, 16 KiB per request, and 256 KiB served across reads, with 200 read calls. A run holds at most 400 member entries. A member's context file carries a digest of at most 4,096 bytes. The owner withdraws an entry with `infinite team entry TEAM_ID ENTRY_ID withdraw`. Members then stop listing and getting it, and the owner still reads its body.
+
+The host adds no `--allowedTools` for Claude members. The entry tools follow the profile's permission mode, as `report` does. A Claude profile whose own arguments set an allow-list must name `mcp__infinite_team__entry_post`, `mcp__infinite_team__entry_list`, and `mcp__infinite_team__entry_get`, or the provider refuses the three tools.
 
 ## Workspace retention
 
@@ -498,7 +504,8 @@ The schema is strict, so an unknown key refuses the write. At this stage every f
 - A prefix is repository-relative. It cannot start with `/`, contain `..`, `.git`, `.`, an empty segment, or glob characters.
 - Without `testPaths`, the host rule applies. It counts a file as a test when a path segment is `test`, `tests`, or `__tests__`, or when the name contains `.test.` or `.spec.`. When `testPaths` is set, it replaces that rule and needs at least one prefix or suffix.
 - An area ID is lowercase letters, digits, and hyphens, up to 40 characters. An ID that the feature map does not know refuses every task with `excluded-area-unknown`.
-- A client that does not know `eval` replaces the whole team block and drops the setting, which turns capture off. That fails safe.
+- `infinite repo init` keeps every team setting it does not own, `eval` included, when it runs again.
+- A client from before that change, and any client that sends a whole team block without `eval`, replaces the block and turns capture off. That fails safe, and nothing reports it.
 
 ### What a captured task keeps
 

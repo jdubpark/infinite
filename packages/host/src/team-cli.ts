@@ -27,6 +27,13 @@ type Api = {
 type Options = Record<string, string | boolean>;
 const commandSchema = z.object({ command: z.string().min(1).max(4096).refine(value => !value.includes("\0")), args: z.array(z.string().max(4096).refine(value => !value.includes("\0"))).max(64).default([]) }).strict();
 const projectConfigSchema = z.object({ setup: commandSchema.optional(), checks: z.array(commandSchema).max(8), establishChecks: z.literal(true).optional() }).strict();
+/** The team keys that `repo init` sets itself. Every other key of the target's team block is carried over unchanged. */
+const REPO_INIT_TEAM_KEYS: ReadonlySet<string> = new Set(["setup", "checks", "establishChecks", "handoff", "delivery", "permissions"]);
+/** The settings of an enrolled project's team block that `repo init` does not own, as the host returned them. */
+export function carriedTeamSettings(team: unknown): Record<string, unknown> {
+  if (typeof team !== "object" || team === null || Array.isArray(team)) return {};
+  return Object.fromEntries(Object.entries(team).filter(([key]) => !REPO_INIT_TEAM_KEYS.has(key)));
+}
 const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 const projectIdPattern = /^[a-z0-9-]{1,80}$/;
 const directoryDefaultsSchema = z.object({
@@ -743,7 +750,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const enrolledSource: ProjectSource = sourceSupported ? projectSource : { mode: "laptop" };
     // Only an explicit off records a permission-agent opt-out; the host cannot tell it from a repeat that keeps no policy.
     const permissionOptOut = permissionMode === "off" && me.permissions?.onboardingCoverage === 1;
-    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...projectConfig, handoff, ...(delivery ? { delivery } : {}), ...(permissions ? { permissions } : {}) }, ...(sourceSupported ? { source: projectSource } : {}), ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}), ...(teamwork !== undefined ? { teamwork } : {}), ...(autonomy ? { autonomy } : {}), ...(permissionOptOut ? { permissionOptOut: true } : {}) };
+    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...carriedTeamSettings(target.team), ...projectConfig, handoff, ...(delivery ? { delivery } : {}), ...(permissions ? { permissions } : {}) }, ...(sourceSupported ? { source: projectSource } : {}), ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}), ...(teamwork !== undefined ? { teamwork } : {}), ...(autonomy ? { autonomy } : {}), ...(permissionOptOut ? { permissionOptOut: true } : {}) };
     // After a lost reply, inherited settings may already be the host's mapping.
     // An omitted mapping preserves that value; compare that intent while replay
     // still sends the original receipt body and request ID unchanged.
@@ -884,9 +891,22 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       }
       return true;
     }
-    if (!id || rest.length !== 1) throw new Error("Usage: infinite team entry ID ENTRY_ID [--json]");
+    const usage = "Usage: infinite team entry ID ENTRY_ID [withdraw] [--json]";
+    if (!id || rest.length < 1 || rest.length > 2 || (rest.length === 2 && rest[1] !== "withdraw")) throw new Error(usage);
     z.uuid().parse(id);
     z.uuid().parse(rest[0]);
+    if (rest[1] === "withdraw") {
+      let answer: { entryId: string; state: string; changed: boolean };
+      try {
+        answer = await api.json<{ entryId: string; state: string; changed: boolean }>(`/teams/${id}/entries/${rest[0]}/withdraw`, { requestId: randomUUID() }, undefined, undefined, "POST");
+      } catch (error) {
+        if ((error as { status?: number })?.status === 403) throw new Error("Withdrawing an entry requires an owner device key.");
+        throw error;
+      }
+      if (json) console.log(terminalJson(answer));
+      else console.log(answer.changed ? `Entry ${answer.entryId} withdrawn.` : `Entry ${answer.entryId} was already withdrawn.`);
+      return true;
+    }
     const found = await api.json<{ head: EntryHead; body: unknown }>(`/teams/${id}/entries/${rest[0]}`);
     if (json) console.log(terminalJson(found));
     else {

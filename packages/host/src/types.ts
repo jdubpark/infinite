@@ -100,7 +100,7 @@ export interface PermissionChannelView {
 export interface Event {
   seq: number;
   at: string;
-  type: "output" | "lifecycle" | "input-intent" | "input-result" | "signal" | "team-report" | "mission-report" | "team-handoff" | "usage" | "usage-coverage" | "message";
+  type: "output" | "lifecycle" | "input-intent" | "input-result" | "signal" | "team-report" | "mission-report" | "team-handoff" | "team-entry" | "team-entry-read" | "usage" | "usage-coverage" | "message";
   data: Record<string, unknown>;
 }
 export interface Project {
@@ -149,6 +149,8 @@ export interface Config {
     storageFloor?: import("./team-types.js").StorageFloor;
     /** Outcome measurement settings; they never change a routine's work, so routine approvals ignore them. */
     outcomes?: { holdDays?: number; retentionDays?: number };
+    /** Blackboard switches; they pin into each new run and stay in the routine approval digest. */
+    blackboard?: { tools?: boolean };
   };
   machine?: { id: string; label: string };
   /** The permission agent's light and strong tiers, its miss-rate threshold and the least replay set size. */

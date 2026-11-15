@@ -2,9 +2,9 @@ import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import type { SecondaryRequest } from "./transcript-secondary.js";
 
-export type HookRoute = "claude" | "codex" | "codex-notify" | "team-report" | "mission-report" | "team-handoff" | "transcript" | "drain" |
+export type HookRoute = "claude" | "codex" | "codex-notify" | "team-report" | "mission-report" | "team-handoff" | "transcript" | "drain" | "team-entry" |
   "permission-check" | "permission-request";
-const ROUTES = new Set<string>(["claude", "codex", "codex-notify", "team-report", "mission-report", "team-handoff", "transcript", "drain",
+const ROUTES = new Set<string>(["claude", "codex", "codex-notify", "team-report", "mission-report", "team-handoff", "transcript", "drain", "team-entry",
   "permission-check", "permission-request"]);
 const MAX_BODY = 256 * 1024;
 export class HookPayloadError extends Error {
@@ -25,6 +25,8 @@ export interface HookReply {
   after?: number;
   /** The secondary transcripts the worker wants, on the reply to a primary end mark. */
   secondaries?: SecondaryRequest[];
+  /** The answer to a `team-entry` request, sent as the JSON body of a 200. */
+  entry?: Record<string, unknown>;
 }
 
 /**

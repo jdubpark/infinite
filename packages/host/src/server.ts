@@ -68,6 +68,7 @@ import { createMissionSchema, missionActionSchema, missionTextSchema, type Creat
 import { ProjectGroupService } from "./project-groups.js";
 import { PermissionDelegationService } from "./permission-delegation.js";
 import type { PermissionAgentServices } from "./permission-agent-types.js";
+import { SessionPermissionRequests } from "./permission-session-requests.js";
 import { INTERRUPT_CLASSES, PERMISSION_POLICY_VERSION } from "./permission-policy.js";
 import { PermissionJournal, permissionJournalModule } from "./evidence/permission-journal.js";
 import { HostPermissionPipeline, PermissionOwnerControls, closeRejectsOnDirectionChange, openPermissionPipelineState } from "./permission-pipeline.js";
@@ -291,6 +292,14 @@ export function createApp(config: Config, key: Buffer) {
   const permissionControls = permissionJournal && permissionState ? new PermissionOwnerControls(permissionJournal, permissionState) : undefined;
   if (permissionAgent.core && permissionJournal && permissionDelegation && permissionState)
     permissionAgent.pipeline = new HostPermissionPipeline({ core: permissionAgent.core, journal: permissionJournal, delegation: permissionDelegation, state: permissionState });
+  // Sessions outside team runs: every session listing is read for their permission dialogs, which go to the delivery service.
+  const sessionPermissions = new SessionPermissionRequests(config, manager, {
+    delivery: () => permissionAgent.delivery,
+    serves: projectId => permissionAgent.pipeline ? permissionAgent.pipeline.serves(projectId).served : true,
+    authority: projectId => { const found = permissionDelegation?.coverage(projectId); return found?.covered ? found.authorityHash : undefined; },
+    taskEnded: taskId => permissionAgent.pipeline?.taskEnded(taskId),
+  });
+  manager.observeListings(rows => sessionPermissions.observe(rows));
   const missions = new MissionService(config, key, manager, teams, projectGroups);
   ownerServices.missions = missions;
   // A run is live while its sealed record file exists, so a record that failed to load keeps its evidence.
@@ -2047,5 +2056,6 @@ export function createApp(config: Config, key: Buffer) {
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
   const closeConnections = () => { routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); intakeSlack?.close(); readings.stop(); goals.close(); teams.close(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
-  return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, closeConnections, fuse };
+  return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, closeConnections, fuse,
+    permissions: { holder: (sessionId: string, promptId: number) => sessionPermissions.holder(sessionId, promptId) } };
 }

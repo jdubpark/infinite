@@ -415,6 +415,48 @@ test("notifier holds a team member's prompt while its coordinator can decide and
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("notifier holds a session's dialog only while the permission agent holds it", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("owner", "ExponentPushToken[a]", "android");
+  const sent: unknown[][] = [];
+  const sender = async (messages: unknown[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  const solo = { id: "s1", title: "Retry logic", provider: "claude", status: "running", attention: att("working") };
+  let holder: "agent" | "owner" | "undecided" = "agent";
+  const asked: [string, number][] = [];
+  const notifier = new Notifier({ list: async () => [solo] } as never, store, sender,
+    { detail: "minimal", events: ["needs-you"], intervalMs: 100000, reviewGraceMs: 0, reviewHoldLimitMs: 100000 },
+    undefined, undefined, undefined, undefined, { holder: (sessionId, promptId) => { asked.push([sessionId, promptId]); return holder; } });
+  try {
+    await notifier.tick();
+    solo.attention = att("needs-you", 1);
+    await notifier.tick();
+    await notifier.tick();
+    assert.equal(sent.length, 0, "a dialog the permission agent can still decide is not pushed");
+    assert.deepEqual(asked.at(-1), ["s1", 1]);
+    solo.attention = att("working");
+    await notifier.tick();
+    assert.equal(sent.length, 0, "an answered dialog never reaches the owner");
+
+    solo.attention = att("needs-you", 2);
+    await notifier.tick();
+    holder = "owner";
+    await notifier.tick();
+    assert.equal(sent.length, 1, "the dialog reaches the owner once it is theirs");
+
+    solo.attention = att("needs-you", 3);
+    await notifier.tick();
+    assert.equal(sent.length, 2, "a dialog that is the owner's from the start is pushed at once");
+
+    holder = "undecided";
+    solo.attention = att("needs-you", 4);
+    await notifier.tick();
+    assert.equal(sent.length, 2, "an undecided dialog gets the review grace");
+    await notifier.tick();
+    assert.equal(sent.length, 3);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("a held prompt survives a session missing from one listing and still reaches the owner", async () => {
   const dir = mkdtempSync("/tmp/inf-push-");
   const store = new PushStore(dir, randomBytes(32));

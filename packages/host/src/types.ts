@@ -285,6 +285,20 @@ export type WorkerRequest =
       actor: ControlActor;
       leaseId: string;
     })
+  | ({
+      /** Host-only permission-agent answer for a session outside any team run: one recognised one-shot option. */
+      op: "session-permission-answer";
+      requestId: string;
+      decisionId: string;
+      targetSessionId: string;
+      targetCwd: string;
+      promptId: number;
+      promptHash: string;
+      evidenceHash: string;
+      option: number;
+      actor: ControlActor;
+      leaseId: string;
+    })
   | { op: "team-answer-invalidate"; decisionId: string }
   | ({ op: "resize"; cols: number; rows: number } & InputControl)
   | ({ op: "stop"; requestId: string } & InputControl);

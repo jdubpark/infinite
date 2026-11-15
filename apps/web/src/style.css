@@ -1749,4 +1749,43 @@ small,
   .permission-detail h1.permission-action { font-size: 18px; }
   .permission-filter-fields select { min-height: 44px; }
   .text-button.permission-overview-link { display: inline-flex; min-height: 44px; margin: 0 6px 4px; }
+
+/* The owner's halt. It lasts until the owner releases it, so it takes its own place in the flow instead of floating. */
+.halt-banner {
+  display: flex;
+  flex-shrink: 0;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 12px 42px 13px;
+  border-bottom: 1px solid #e3d0ad;
+  background: #f7e8ce;
+  color: #724314;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.halt-banner > svg { flex: 0 0 auto; margin-top: 1px; }
+.halt-body { min-width: 0; max-width: 900px; }
+.halt-banner p { margin: 2px 0 0; }
+.halt-banner .halt-title { margin: 0; display: flex; flex-wrap: wrap; align-items: baseline; column-gap: 12px; }
+.halt-title strong { font-size: 14px; font-weight: 600; letter-spacing: -0.005em; }
+.halt-meta, .halt-note { font-size: 12px; }
+.halt-reason { display: flex; gap: 8px; }
+.halt-reason span { flex: 0 0 auto; font-weight: 600; }
+.halt-banner code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; background: rgba(114, 67, 20, .08); padding: 1px 5px; border-radius: 4px; }
+.halt-compact { padding-top: 10px; padding-bottom: 10px; }
+.halt-compact > svg { margin-top: 2px; }
+.halt-compact p { margin: 0; display: flex; flex-wrap: wrap; column-gap: 14px; row-gap: 2px; }
+.halt-compact b { font-weight: 600; }
+.halt-compact-item { min-width: 0; }
+/* The rail repeats the overview halt only where the list stands alone: the narrow layout without a detail view. */
+.halt-rail { display: none; }
+@media (max-width: 1000px) {
+  .halt-banner { padding-left: 25px; padding-right: 25px; }
+}
+@media (max-width: 700px) {
+  .halt-banner { padding-left: 17px; padding-right: 17px; }
+  /* The release command is for a terminal; a phone-width page keeps the room for its record. */
+  .halt-release { display: none; }
+  .app:not(.has-detail) .halt-rail { display: flex; margin: 14px 4px 0; padding: 10px 12px; border: 1px solid #e3d0ad; border-radius: 8px; }
 }

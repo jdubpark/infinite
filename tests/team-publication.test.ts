@@ -92,7 +92,9 @@ function directFixture(status: "implementing" | "cancelled", retention: Partial<
   Object.assign(f.config.teams!, { publishHeads: true, retention: { ...DEFAULT_TEAM_RETENTION, ...retention } });
   let now = Date.parse(at);
   const clock = { advance: (ms: number) => { now += ms; } };
-  const open = () => new TeamService(f.config, f.key, f.manager as unknown as Manager, (_project, start) => start(), undefined, undefined, { now: () => now, ownerActive: () => false });
+  const open = (memberWorkTiming: { memberWorkCommandTimeoutMs?: number; memberWorkPushTimeoutMs?: number; memberWorkCommandStopGraceMs?: number } = {}) =>
+    new TeamService(f.config, f.key, f.manager as unknown as Manager, (_project, start) => start(), undefined, undefined,
+      { now: () => now, ownerActive: () => false, ...memberWorkTiming });
   const remoteHead = () => existsSync(remote) ? execFileSync("git", ["--git-dir", remote, "for-each-ref", "--format=%(objectname)", `refs/heads/${f.run.branch}`], { encoding: "utf8" }).trim() : "";
   return { f, head, remote, receipts, clock, open, remoteHead, createRemote: () => execFileSync("git", ["init", "--bare", "--quiet", remote]) };
 }
@@ -263,6 +265,112 @@ test("removeRun returns member-work-not-saved until the background save complete
     assert.equal(remoteRef(d.remote, branch), removed.members.find(item => item.memberId === member.memberId)?.savedWork?.commit);
     assert.equal(existsSync(dirname(d.f.run.workspace)), false);
   } finally { await closeDirect(d.f, teams); }
+});
+
+test("removeRun refuses a running member before snapshot, even with a recorded result", { timeout: 30000 }, async () => {
+  const d = directFixture("cancelled", { cancelledMinutes: 60 });
+  d.createRemote();
+  const { member } = addMemberClone(d);
+  member.status = "running";
+  member.sessionId = d.f.run.members[0]!.sessionId;
+  recordMemberWorkPushes(d);
+  d.f.writeTeam();
+  const teams = d.open(), id = d.f.run.id;
+  try {
+    teams.start();
+    await until(() => teams.get(id).publication?.commit, commit => commit === d.head, 10000, "the integration head was not published first");
+    await assert.rejects(teams.removeRun(id), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "team-active");
+    assert.equal(teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork, undefined,
+      "owner removal refuses before any snapshot result is recorded");
+    await delay(200);
+    assert.equal(wipPushes(d.receipts), 0, "an unsettled member did not start a snapshot or WIP push");
+    assert.equal(existsSync(dirname(d.f.run.workspace)), true);
+  } finally { await closeDirect(d.f, teams); }
+
+  const stale = directFixture("cancelled", { cancelledMinutes: 60 });
+  stale.createRemote();
+  const { member: staleMember } = addMemberClone(stale);
+  staleMember.status = "running";
+  staleMember.sessionId = stale.f.run.members[0]!.sessionId;
+  staleMember.savedWork = { revision: stale.f.run.revision, state: "published", repository: "example/app",
+    branch: `${stale.f.run.branch}-wip-${staleMember.memberId}`, commit: stale.head, at: new Date().toISOString() };
+  recordMemberWorkPushes(stale);
+  stale.f.writeTeam();
+  const staleTeams = stale.open(), staleId = stale.f.run.id;
+  try {
+    staleTeams.start();
+    await until(() => staleTeams.get(staleId).publication?.commit, commit => commit === stale.head, 10000, "the stale-result run head was not published");
+    await assert.rejects(staleTeams.removeRun(staleId), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "team-active",
+      "a recorded save cannot authorize removal while a member may still write");
+    assert.equal(wipPushes(stale.receipts), 0);
+    assert.equal(existsSync(dirname(stale.f.run.workspace)), true);
+  } finally { await closeDirect(stale.f, staleTeams); }
+});
+
+test("a snapshot command that never closes records a bounded failure and reaches the removal cap", { timeout: 30000 }, async () => {
+  const d = directFixture("cancelled", { cancelledMinutes: 0 });
+  d.createRemote();
+  const { member } = addMemberClone(d);
+  d.f.run.missionId = randomUUID();
+  const prefixScript = `
+const { appendFileSync } = require("node:fs");
+const { join } = require("node:path");
+const { spawn, spawnSync } = require("node:child_process");
+const receiptDir = process.argv[1];
+const [command, ...args] = process.argv.slice(2);
+if (command === "git" && args.includes("add")) {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "inherit" });
+  appendFileSync(join(receiptDir, "hung-snapshot-pids"), String(child.pid) + "\\n");
+  process.exit(0);
+}
+const result = spawnSync(command, args, { cwd: process.cwd(), stdio: "inherit" });
+process.exit(result.status ?? 128);
+`;
+  d.f.config.teams!.commandPrefix = { command: process.execPath, args: ["-e", prefixScript, d.receipts] };
+  d.f.writeTeam();
+  const timing = { memberWorkCommandTimeoutMs: 100, memberWorkPushTimeoutMs: 100, memberWorkCommandStopGraceMs: 40 };
+  let teams = d.open(timing), id = d.f.run.id;
+  const savedWork = () => teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork;
+  const pidFile = join(d.receipts, "hung-snapshot-pids");
+  const pids = () => existsSync(pidFile) ? readFileSync(pidFile, "utf8").trim().split("\n").filter(Boolean).map(Number) : [];
+  const killHungChild = (pid: number) => { try { process.kill(pid, "SIGKILL"); } catch { /* already stopped */ } };
+  const killHungChildren = () => { for (const pid of pids()) killHungChild(pid); };
+  try {
+    teams.start();
+    let saved: ReturnType<typeof savedWork>;
+    try { saved = await until(savedWork, value => value?.failure?.attempts === 1, 5000, "the hung snapshot did not settle into a recorded failure"); }
+    catch (error) { throw new Error(`${error instanceof Error ? error.message : String(error)}; state=${JSON.stringify(savedWork())}; hungPids=${JSON.stringify(pids())}`); }
+    assert.equal(saved?.state, "retrying");
+    assert.equal(saved?.failure?.category, "other");
+    assert.ok(pids().length > 0, "the test prefix left a descendant holding the command pipes open");
+    assert.equal(existsSync(dirname(d.f.run.workspace)), true, "retention stays held before the attempt cap");
+
+    const firstHungPid = pids()[0]!;
+    d.clock.advance(60_001);
+    await until(pids, values => values.length >= 2, 5000, "the retry snapshot did not start");
+    const closeStarted = performance.now();
+    teams.close();
+    await teams.idle();
+    assert.ok(performance.now() - closeStarted < 1000, "close and idle settle a snapshot with a held pipe within the stop grace");
+
+    teams = d.open(timing);
+    teams.start();
+    for (const [attempt, advance] of [[2, 0], [3, 120_001], [4, 240_001], [5, 480_001]] as const) {
+      if (advance) d.clock.advance(advance);
+      saved = await until(savedWork, value => value?.failure?.attempts === attempt, 5000, `the hung snapshot did not record failure ${attempt}`);
+      assert.equal(saved?.failure?.category, "other");
+      assert.equal(saved?.state, attempt === 5 ? "gave-up" : "retrying");
+      if (attempt === 2) {
+        killHungChild(firstHungPid);
+        await delay(100);
+        assert.equal(savedWork()?.failure?.attempts, 2, "the abandoned command's late close cannot replace the newer failure record");
+      }
+    }
+    await until(() => existsSync(dirname(d.f.run.workspace)), present => !present, 5000, "retention stayed held after five bounded snapshot failures");
+  } finally {
+    killHungChildren();
+    await closeDirect(d.f, teams);
+  }
 });
 
 test("publishHeads false does not snapshot member work or hold retention", { timeout: 30000 }, async () => {

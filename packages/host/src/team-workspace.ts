@@ -41,12 +41,12 @@ export interface CommandScope {
 }
 export const commandScope = new AsyncLocalStorage<CommandScope>();
 /** Commands are argv arrays, from owner configuration or an explicitly authorized plan. */
-export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand, input?: string, extraEnv?: Record<string, string>): Promise<CommandResult> {
+export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand, input?: string, extraEnv?: Record<string, string>, forceSettleAfterMs?: number): Promise<CommandResult> {
   const scope = commandScope.getStore(), ready = scope?.starting();
-  const run = () => runTeamCommand(scope, command, cwd, signal, timeoutMs, prefix, input, extraEnv);
+  const run = () => runTeamCommand(scope, command, cwd, signal, timeoutMs, prefix, input, extraEnv, forceSettleAfterMs);
   return ready ? ready.then(run) : run();
 }
-function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, cwd: string, signal: AbortSignal | undefined, timeoutMs: number, prefix: TeamCommand | undefined, input: string | undefined, extraEnv: Record<string, string> | undefined): Promise<CommandResult> {
+function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, cwd: string, signal: AbortSignal | undefined, timeoutMs: number, prefix: TeamCommand | undefined, input: string | undefined, extraEnv: Record<string, string> | undefined, forceSettleAfterMs: number | undefined): Promise<CommandResult> {
   return new Promise((resolveResult, reject) => {
     const env = command.command === "git" ? teamGitEnvironment(extraEnv) : teamCommandEnvironment(extraEnv);
     let child: ReturnType<typeof spawn>;
@@ -57,13 +57,27 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
       throw error;
     }
     scope?.started(child.pid);
-    let output = "", stdout = "", interrupted = false, settled = false, truncated = false;
+    let output = "", stdout = "", interrupted = false, settled = false, truncated = false, stopRequested = false, stopTimer: NodeJS.Timeout | undefined;
     const stop = () => {
+      if (stopRequested || settled) return;
+      stopRequested = true;
       interrupted = true;
       try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); }
       catch (error) {
         // A prefixed launcher such as sudo leads a group the host may not signal; say so rather than imply the command stopped.
         if ((error as NodeJS.ErrnoException).code === "EPERM") capture(Buffer.from("\n[The host could not stop this command (EPERM); it was left to finish and its result is not used.]\n"));
+      }
+      if (forceSettleAfterMs !== undefined) {
+        stopTimer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          finish();
+          // A prefixed command may leave descendants holding these pipes open. Stop waiting for their close event;
+          // the abandoned result is never observed by the caller.
+          child.stdin?.destroy(); child.stdout?.destroy(); child.stderr?.destroy();
+          reject(new TeamError(409, "command-stop-unconfirmed", "A configured team command did not close after the host tried to stop it."));
+        }, forceSettleAfterMs);
+        stopTimer.unref();
       }
     };
     const capture = (chunk: Buffer) => {
@@ -80,7 +94,7 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
       child.stdin!.end(input, "utf8");
     }
     const timer = setTimeout(stop, timeoutMs); timer.unref();
-    const finish = () => { clearTimeout(timer); signal?.removeEventListener("abort", stop); };
+    const finish = () => { clearTimeout(timer); if (stopTimer) clearTimeout(stopTimer); signal?.removeEventListener("abort", stop); };
     signal?.addEventListener("abort", stop, { once: true });
     if (signal?.aborted) stop();
     child.once("error", () => { if (settled) return; settled = true; finish(); reject(new TeamError(409, "command-unavailable", "A configured team command could not be started.")); });
@@ -88,10 +102,10 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
   });
 }
 /** `grantEnv` maps the pushed ref to a host GitHub grant (`push` on exactly that ref) when the GitHub proxy is configured. */
-export async function publishTeamHead(workspace: string, remoteUrl: string, commit: string, branch: string, prefix?: TeamCommand, signal?: AbortSignal, grantEnv?: (ref: string) => Record<string, string>): Promise<{ published: true } | { published: false; category: TeamPublicationCategory }> {
+export async function publishTeamHead(workspace: string, remoteUrl: string, commit: string, branch: string, prefix?: TeamCommand, signal?: AbortSignal, grantEnv?: (ref: string) => Record<string, string>, timeoutMs = 120000, forceSettleAfterMs?: number): Promise<{ published: true } | { published: false; category: TeamPublicationCategory }> {
   try {
     const ref = `refs/heads/${branch}`;
-    const result = await teamCommand({ command: "git", args: teamGitArgs(workspace, ["push", remoteUrl, `${commit}:${ref}`]) }, workspace, signal, 120000, prefix, undefined, grantEnv?.(ref));
+    const result = await teamCommand({ command: "git", args: teamGitArgs(workspace, ["push", remoteUrl, `${commit}:${ref}`]) }, workspace, signal, timeoutMs, prefix, undefined, grantEnv?.(ref), forceSettleAfterMs);
     if (result.exitCode === 0 && !result.interrupted && !result.truncated) return { published: true };
     // Only Git's own ref status line marks divergence; a branch name or remote hook text must not route the head to a sibling.
     return { published: false, category: /^\s*!\s+\[rejected\]\s.*\((?:non-fast-forward|fetch first)\)\s*$/m.test(result.output) ? "rejected" : fetchCategory(result.output) };
@@ -104,8 +118,8 @@ export function spawnTeamBundle(workspace: string, branch: string, prefix?: Team
   const args = teamGitArgs(workspace, ["bundle", "create", "-", `refs/heads/${branch}`]);
   return spawn(prefix?.command ?? "git", prefix ? [...prefix.args, "git", ...args] : args, { cwd: workspace, env: teamGitEnvironment(), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
 }
-async function git(cwd: string, args: string[], prefix?: TeamCommand, timeoutMs = 30000, signal?: AbortSignal) {
-  const result = await teamCommand({ command: "git", args: teamGitArgs(cwd, args) }, cwd, signal, timeoutMs, prefix);
+async function git(cwd: string, args: string[], prefix?: TeamCommand, timeoutMs = 30000, signal?: AbortSignal, forceSettleAfterMs?: number) {
+  const result = await teamCommand({ command: "git", args: teamGitArgs(cwd, args) }, cwd, signal, timeoutMs, prefix, undefined, undefined, forceSettleAfterMs);
   if (result.exitCode !== 0 || result.interrupted || result.truncated) throw new TeamError(409, "workspace-operation-failed", "A team Git operation failed. The isolated workspace was preserved for inspection.");
   return args.includes("-z") ? result.stdout : result.stdout.trim();
 }
@@ -628,20 +642,21 @@ export async function captureMemberResult(cwd: string, base: string, paths?: str
   return commit;
 }
 /** Preserve a member clone's current tree in a local WIP ref before retention removes the clone. */
-export async function snapshotMemberWork(cwd: string, base: string, options: { skipIfResultTree?: boolean }, prefix?: TeamCommand, signal?: AbortSignal): Promise<{ commit: string; tree: string } | undefined> {
-  await git(cwd, ["add", "-A", "--", "."], prefix, 30000, signal);
-  const tree = await git(cwd, ["write-tree"], prefix, 30000, signal);
-  const baseTree = await git(cwd, ["rev-parse", `${base}^{tree}`], prefix, 30000, signal);
+export async function snapshotMemberWork(cwd: string, base: string, options: { skipIfResultTree?: boolean }, prefix?: TeamCommand, signal?: AbortSignal, commandTimeoutMs = 30000, forceSettleAfterMs?: number): Promise<{ commit: string; tree: string } | undefined> {
+  const runGit = (args: string[]) => git(cwd, args, prefix, commandTimeoutMs, signal, forceSettleAfterMs);
+  await runGit(["add", "-A", "--", "."]);
+  const tree = await runGit(["write-tree"]);
+  const baseTree = await runGit(["rev-parse", `${base}^{tree}`]);
   if (tree === baseTree) return undefined;
   if (options.skipIfResultTree) {
-    const resultRefs = lines(await git(cwd, ["for-each-ref", "--format=%(refname)", "refs/heads/infinite-result"], prefix, 30000, signal));
-    if (resultRefs.includes("refs/heads/infinite-result") && tree === await git(cwd, ["rev-parse", "refs/heads/infinite-result^{tree}"], prefix, 30000, signal))
+    const resultRefs = lines(await runGit(["for-each-ref", "--format=%(refname)", "refs/heads/infinite-result"]));
+    if (resultRefs.includes("refs/heads/infinite-result") && tree === await runGit(["rev-parse", "refs/heads/infinite-result^{tree}"]))
       return undefined;
   }
-  const headTree = await git(cwd, ["rev-parse", "HEAD^{tree}"], prefix, 30000, signal);
-  const commit = tree === headTree ? await git(cwd, ["rev-parse", "HEAD"], prefix, 30000, signal)
-    : await git(cwd, ["commit-tree", tree, "-p", "HEAD", "-m", `Unfinished work of team member ${basename(cwd)}, saved before workspace removal`], prefix, 30000, signal);
-  await git(cwd, ["update-ref", "refs/heads/infinite-wip", commit], prefix, 30000, signal);
+  const headTree = await runGit(["rev-parse", "HEAD^{tree}"]);
+  const commit = tree === headTree ? await runGit(["rev-parse", "HEAD"])
+    : await runGit(["commit-tree", tree, "-p", "HEAD", "-m", `Unfinished work of team member ${basename(cwd)}, saved before workspace removal`]);
+  await runGit(["update-ref", "refs/heads/infinite-wip", commit]);
   return { commit, tree };
 }
 export async function integrateMemberResult(workspace: string, memberCwd: string, commit: string, prefix?: TeamCommand, signal?: AbortSignal) {

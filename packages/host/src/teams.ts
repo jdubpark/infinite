@@ -64,6 +64,10 @@ type TeamServiceOptions = {
   onMerged?: (projectId: string) => void;
   ownerActive?: (run: TeamRun) => boolean;
   now?: () => number;
+  /** Short command deadlines are injectable for bounded member-save regressions. */
+  memberWorkCommandTimeoutMs?: number;
+  memberWorkPushTimeoutMs?: number;
+  memberWorkCommandStopGraceMs?: number;
   volumeUsage?: (path: string) => Promise<VolumeUsage>;
   /** Run events for the evidence store. Without it no record gains a ledger field and nothing is emitted. */
   events?: EventOutbox;
@@ -1204,10 +1208,12 @@ export class TeamService {
         let snapshotFailed = false;
         try {
           snapshot = await snapshotMemberWork(group.cwd, representative.baseCommit,
-            { skipIfResultTree: this.memberIntegratedAt(stored, representative) !== undefined }, this.config.teams?.commandPrefix, controller.signal);
+            { skipIfResultTree: this.memberIntegratedAt(stored, representative) !== undefined }, this.config.teams?.commandPrefix, controller.signal,
+            this.options?.memberWorkCommandTimeoutMs ?? 30000, this.options?.memberWorkCommandStopGraceMs ?? 2000);
         } catch {
           snapshotFailed = true;
         }
+        if (controller.signal.aborted) return;
         for (const member of group.members) {
           if (this.memberWorkDone(run, member)) continue;
           const currentNow = this.options?.now?.() ?? Date.now();
@@ -1225,15 +1231,16 @@ export class TeamService {
           let outcome: Awaited<ReturnType<typeof publishTeamHead>>;
           try {
             outcome = await publishTeamHead(group.cwd, target.remoteUrl, snapshot.commit, branch, this.config.teams?.commandPrefix, controller.signal,
-              ref => grantEnv(member, ref));
+              ref => grantEnv(member, ref), this.options?.memberWorkPushTimeoutMs ?? 120000, this.options?.memberWorkCommandStopGraceMs ?? 2000);
             if (!outcome.published && outcome.category === "rejected") {
               branch = `${primaryBranch}-${snapshot.commit.slice(0, 8)}`;
               outcome = await publishTeamHead(group.cwd, target.remoteUrl, snapshot.commit, branch, this.config.teams?.commandPrefix, controller.signal,
-                ref => grantEnv(member, ref));
+                ref => grantEnv(member, ref), this.options?.memberWorkPushTimeoutMs ?? 120000, this.options?.memberWorkCommandStopGraceMs ?? 2000);
             }
           } catch {
             outcome = { published: false, category: "other" };
           }
+          if (controller.signal.aborted) return;
           if (outcome.published) {
             const eventText = `Saved unfinished work of member ${member.memberId} as ${snapshot.commit.slice(0, 12)} to GitHub ${target.repository} ${branch} before its workspace is removed.`;
             await this.recordMemberWork(stored, member, { revision, state: "published", repository: target.repository, branch, commit: snapshot.commit, at: this.retentionNow() }, eventText);
@@ -1330,14 +1337,14 @@ export class TeamService {
     return this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
       if (this.needsPublication(stored)) throw new TeamError(409, "head-not-published", "The integrated head must be published to GitHub before this run can be removed.");
-      if (this.needsMemberWorkSaved(stored)) {
-        this.startMemberWorkSave(stored);
-        throw new TeamError(409, "member-work-not-saved", "Unfinished member work is being saved to GitHub before this run's workspaces are removed. Retry removal shortly.");
-      }
       if (this.removingRuns.has(id)) throw new TeamError(409, "team-operation-running", "A background workspace removal is still running. Retry deletion after it settles.");
       this.assertRunRetentionSafe(stored);
       if (!(["cancelled", "merged", "no-change"].includes(run.status) && await this.membersSettled(stored)))
         throw new TeamError(409, "team-active", "Only a settled cancelled, merged or no-change run can be removed.");
+      if (this.needsMemberWorkSaved(stored)) {
+        this.startMemberWorkSave(stored);
+        throw new TeamError(409, "member-work-not-saved", "Unfinished member work is being saved to GitHub before this run's workspaces are removed. Retry removal shortly.");
+      }
       if (!run.workspaceRemovedAt || filesystemEntryExists(teamRunDirectory(run.workspace))) {
         this.assertRunPath(stored, run.workspace);
         await removeTeamWorkspace(teamRunDirectory(run.workspace), this.config.teams?.commandPrefix, undefined, this.teamRoot(stored));

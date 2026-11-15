@@ -524,12 +524,18 @@ key never enters the agent's environment. A request with another session's
 key is refused, and so is a delivery for a decision that was issued to another
 session. The agent holds the hook token, so it can call the channel itself:
 that can start a review or get its own call denied, and it cannot make a call
-run.
+run. A team member's session is served only while its run is live. For a run
+that is stopped, paused or halted, or whose permissions the owner revoked, its
+calls are handled as before the permission agent, by the launch profile's own
+allowlist, and an allow is withheld when the run stops being live before it is
+returned.
 
 A class call from the primary agent is deferred: the provider ends its run,
 the session waits, and only the owner's answer on that session's prompt
 resumes it. The answer applies once, to that call id, and a resumed call whose
-input differs is denied. A class call from a subagent cannot be deferred. It
+input differs is denied. The session's worker holds the answer, so an API
+restart between the answer and the resume still runs the call once; a host
+restart that ends the worker loses the answer, and the call does not run. A class call from a subagent cannot be deferred. It
 is denied with `needs-owner`, and the owner gets a notice. While one call
 waits, every other call of the session is denied. A call is denied with
 `unavailable` when the host cannot be reached. An unanswered call is retired

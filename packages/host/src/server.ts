@@ -370,7 +370,9 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     catch { return "inactive" as const; }
   };
   // The headless channel reads the pipeline from this registry on every call: until one is added it serves nothing.
-  const headlessChannel = new HeadlessPermissionChannel({ key, runDir: config.runDir, sessions: manager, services: permissionAgent });
+  // A team member's headless calls are decided only while its run is live: the same run and member checks as a dialog hand-off.
+  const headlessChannel = new HeadlessPermissionChannel({ key, runDir: config.runDir, sessions: manager, services: permissionAgent,
+    teamLive: session => teams.permissionAgentLive(session) });
   permissionAgent.headless = headlessChannel;
   manager.useHeadlessChannel(headlessChannel);
   const missions = new MissionService(config, key, manager, teams, projectGroups);

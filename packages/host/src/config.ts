@@ -3,13 +3,14 @@ import { resolve, relative, isAbsolute } from "node:path";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { Config } from "./types.js";
-import { assertRunnerDeployment, parseDeployment } from "./deployment.js";
+import { assertRunnerDeployment, parseDeployment, runtimeSecurity } from "./deployment.js";
 import { machineIdentity } from "./machine.js";
 import { autonomyModeSchema } from "./autonomy.js";
 import { projectSourceSchema, teamProjectSchema, teamCommandSchema, teamRetentionSchema, storageFloorSchema, teamLineupSchema } from "./team-types.js";
 import { intakeConfigSchema } from "./intake-types.js";
 import { mcpConfigSchema } from "./mcp-types.js";
 import { egressConfigSchema } from "./egress.js";
+import { MirroredProjects } from "./mirrored-projects.js";
 
 /**
  * Provider hooks injected at launch when the config does not say. Codex hooks stay off: spike S2
@@ -253,14 +254,19 @@ export function validateIntakeConfig(config: Config): void {
   if (answerProjectId && !config.projects.some(project => project.id === answerProjectId))
     throw new Error("intake.mission.answerProjectId must name a configured project");
 }
-/** MCP credentials and project grants are independent of paired-device authority. */
-export function validateMcpConfig(config: Config): void {
+function validateMcpCredentials(config: Config): void {
   if (!config.mcp) return;
   mcpConfigSchema.parse(config.mcp);
   if (!config.linear || !config.intake) throw new Error("MCP requires host Linear and intake configuration");
   if (config.mcp.port !== 0 && config.mcp.port === config.port) throw new Error("MCP requires a separate port");
   for (const connector of config.mcp.connectors) {
     if (config.tokens.some(token => token.hash === connector.tokenHash)) throw new Error("MCP credentials must differ from device credentials");
+  }
+}
+/** MCP credentials and project grants are independent of paired-device authority. */
+export function validateMcpConfig(config: Config): void {
+  validateMcpCredentials(config);
+  for (const connector of config.mcp?.connectors ?? []) {
     if (connector.projectIds.some(id => !config.projects.some(project => project.id === id))) throw new Error("MCP grants must name configured projects");
   }
 }
@@ -272,7 +278,7 @@ export function readConfig(file: string): { config: Config; key: Buffer } {
   const config = parsed as Config;
   config.deployment = parseDeployment(config.deployment);
   validateLinearConfig(config);
-  validateMcpConfig(config);
+  validateMcpCredentials(config);
   validateIntakeConfig(config);
   assertRunnerDeployment(config);
   for (const path of [
@@ -348,5 +354,11 @@ export function readConfig(file: string): { config: Config; key: Buffer } {
     throw new Error("Origin must be a bare HTTP(S) origin");
   if (!["http:", "https:"].includes(origin.protocol))
     throw new Error("Invalid origin protocol");
+  if (config.mcp) {
+    // CLI edits serialize the returned config: keep vault-owned projects in a validation-only copy.
+    const effective = structuredClone(config);
+    if (runtimeSecurity(effective.deployment).tenancy === "single-tenant") new MirroredProjects(effective, key);
+    validateMcpConfig(effective);
+  }
   return { config, key };
 }

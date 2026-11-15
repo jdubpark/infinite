@@ -97,11 +97,11 @@ test("answering questions needs direct requests, and classifying needs both answ
   const defaults = parsed({}).intake!.slack!;
   assert.deepEqual([defaults.answerQuestions, defaults.classify], [false, false]);
 });
-test("linear.reportName defaults to Infinite, accepts a plain name, and rejects Markdown, newlines, and long values", () => {
+test("linear.reportName defaults to Infinite, accepts a plain name, and rejects Markdown, link text, newlines, and long values", () => {
   assert.equal(parsed({}).linear!.reportName, "Infinite");
   assert.equal(parsed({}, { linear: { apiKeyFile: privateFile("linear-key"), reportName: "Northwind" } }).linear!.reportName, "Northwind");
-  assert.equal(parsed({}, { linear: { apiKeyFile: privateFile("linear-key"), reportName: "Northwind Co. - East" } }).linear!.reportName, "Northwind Co. - East");
-  for (const reportName of ["[x](y)", "North\nwind", "", "a".repeat(41), "North _wind_", "1. Northwind", "_Northwind", "9Lives"])
+  assert.equal(parsed({}, { linear: { apiKeyFile: privateFile("linear-key"), reportName: "Northwind East - 2" } }).linear!.reportName, "Northwind East - 2");
+  for (const reportName of ["[x](y)", "North\nwind", "", "a".repeat(41), "North _wind_", "1. Northwind", "_Northwind", "9Lives", "www.example.com", "Northwind Co."])
     assert.throws(() => parsed({}, { linear: { apiKeyFile: privateFile("linear-key"), reportName } }), undefined, JSON.stringify(reportName));
 });
 test("jev.sessionReadings defaults to true and accepts false", () => {

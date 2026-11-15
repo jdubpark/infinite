@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { fixture, git, limitLineup } from "./team-fixture.js";
 import { waitFor } from "./helpers.js";
 import { TeamError, type TeamService } from "../packages/host/src/teams.js";
@@ -24,6 +24,7 @@ type DeliveryStored = {
 const deliveryInternals = (teams: TeamService) => teams as unknown as {
   records: Map<string, DeliveryStored>; commands: Map<string, AbortController>;
   save(stored: DeliveryStored): void; step(stored: DeliveryStored): Promise<void>; consume(stored: DeliveryStored, member: TeamMember): void;
+  startAutomaticDeliveryRecovery(stored: DeliveryStored, trackingReady: boolean): Promise<boolean>;
 };
 
 async function deliveryRecord(mode: "merge" | "pr", onMerged?: (projectId: string) => void,
@@ -433,6 +434,31 @@ test("automatic delivery recovery refuses a changed publication policy", { timeo
     assert.deepEqual(h.stored.deliveryAttempt, prior.attempt);
     assert.equal(h.run.deliveryRecovery, undefined);
     assert.equal(h.run.events.length, prior.events + 1);
+  } finally { await h.f.close(); }
+});
+
+test("delivery recovery leaves its pending member preparation running across scheduler passes", { timeout: 30000 }, async () => {
+  const h = await blockedDeliveryRecord();
+  try {
+    h.run.status = "planning";
+    h.run.recovery = { attempts: 1, status: "stopping", source: { code: "delivery-recovery", memberId: h.member.memberId,
+      revision: h.run.revision, reportKind: "blocked", reason: "Inspect publication state.", at: new Date().toISOString() } };
+    h.run.deliveryRecovery = { attempts: 1, status: "stopping", revision: h.run.revision, headCommit: h.headCommit,
+      policyHash: createHash("sha256").update(JSON.stringify(h.run.delivery ?? null)).digest("hex"), sourceMemberId: h.member.memberId };
+
+    const internals = deliveryInternals(h.teams);
+    assert.equal(await internals.startAutomaticDeliveryRecovery(h.stored, true), true);
+    const pendingId = h.stored.pending?.id;
+    assert.equal(h.stored.pending?.kind, "member");
+    const membersBeforeSecondPass = h.run.members.length;
+
+    assert.equal(await internals.startAutomaticDeliveryRecovery(h.stored, true), true);
+    assert.equal(h.stored.pending?.id, pendingId, "the scheduler keeps the original preparation operation alive");
+    assert.equal(h.run.status, "planning", "the in-flight preparation is not classified as reconciliation failure");
+    assert.equal(h.run.members.length, membersBeforeSecondPass, "a second pass does not prepare a duplicate member");
+
+    await waitFor(() => Promise.resolve(h.stored.pending), pending => pending === undefined, 10000);
+    assert.equal(h.run.members.length, membersBeforeSecondPass + 1);
   } finally { await h.f.close(); }
 });
 

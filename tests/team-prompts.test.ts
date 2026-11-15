@@ -45,7 +45,7 @@ function largeRun(): TeamRun {
     decisions: [],
     checks,
     steering: [{ text: "Owner direction: retain backwards compatibility.", revision: 1, at: "2026-10-21T00:00:00.000Z" }],
-    decisions: [{ id: "decision-1", memberId: "member-1", revision: 1, question: "Should existing callers keep the same response shape?", options: ["yes", "no"], answer: "Yes, preserve it.", answeredBy: "owner", createdAt: "2026-10-21T00:00:00.000Z" }],
+    decisions: [{ id: "decision-1", memberId: "member-1", revision: 1, question: "Should existing callers keep the same response shape?", options: ["yes", "no"], answerMode: "single", answer: "Yes, preserve it.", answeredBy: "owner", createdAt: "2026-10-21T00:00:00.000Z" }],
     events: [],
     round: 1,
     permissions: { mode: "coordinator", scope: "Only one-time checks for this task." },
@@ -104,6 +104,7 @@ test("review prompt bounds derived evidence while preserving objective and immut
   assert.equal(snapshot.checks[8].output, run.checks[8].output);
   assert.equal(snapshot.feedback, feedback);
   assert.equal(snapshot.ownerAnswers[0].answer, "Yes, preserve it.");
+  assert.equal(snapshot.ownerAnswers[0].answerMode, "single", "The selected mode stays in the authoritative coordinator context");
   assert.equal(snapshot.authority.permissionsRevokedAt, run.permissionsRevokedAt, "the snapshot distinguishes pinned scope from revoked live authority");
 
   const implementerPrompt = teamPrompt(run, "implementer", run.tasks[0], undefined, "demo");
@@ -240,6 +241,27 @@ test("blocked reports accept bounded structured evidence and keep it in coordina
   assert.match(prompt("project-manager"), /inspect prior structured blocker evidence before recovery/);
   assert.match(prompt("project-manager"), /A report, continuation, or claimed fix is not a verified resolution/);
   assert.match(prompt("implementer"), /may add "blocker":\{"cause"/, "workers see the structured blocked example");
+});
+
+test("team question modes preserve legacy behavior and validate selectable semantics", () => {
+  const legacy = { kind: "question", question: "Which response format?", options: ["JSON", "Text"] };
+  assert.deepEqual(teamReportSchema.parse(legacy), legacy, "Two legacy options do not infer approval mode");
+  assert.deepEqual(teamReportSchema.parse({ ...legacy, options: [] }), { ...legacy, options: [] });
+  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "approval" }).success, true);
+  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "approval", options: ["Approve"] }).success, false);
+  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "multiple" }).success, true);
+  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "multiple", options: ["Only one"] }).success, false);
+  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "single", options: ["One"] }).success, true);
+  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "approval", options: ["Approve", "Deny", "Defer"] }).success, false);
+});
+
+test("team agent guidance distinguishes approval from choices and leaves authority with the owner", () => {
+  const prompt = teamPrompt(largeRun(), "project-manager", undefined, undefined, "demo");
+  assert.match(prompt, /when feasible, offer concrete selectable options/);
+  assert.match(prompt, /answerMode "approval" only for a real authorization proposal/);
+  assert.match(prompt, /first meaning approve and the second meaning deny/);
+  assert.match(prompt, /two arbitrary options never imply approval/);
+  assert.match(prompt, /Never choose or approve for the owner/);
 });
 
 test("permission evidence stays complete inline and an over-budget review fails closed", () => {

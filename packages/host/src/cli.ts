@@ -241,6 +241,7 @@ infinite repo init [DIRECTORY]              Enroll a repository or set parent-fo
 infinite repo init [--permissions coordinator|off] [--permission-scope TEXT] [--permission-limit N]
                                           First enrollment delegates to coordinator by default
 infinite repo init --permissions off        Disable delegation for future runs
+infinite repo init [--routing off|shadow] [--routing-value cost|balanced|quality|USD] [--routing-contributor allow|deny]
 infinite team revoke-permissions TEAM_ID    Revoke delegation for an active run
 infinite permissions status [--json]        Show workspace permission delegation
 infinite permissions delegate (--workspace W | --all) [--direction TEXT | --clear-direction] [--request-id UUID]
@@ -268,6 +269,8 @@ infinite team answer ID QUESTION_ID TEXT    Answer a pending question
 infinite routine create --file FILE [--request-id UUID] [--json]
 infinite routine list [--json] | status ID [--json]
 infinite routine pause|resume|cancel ID --revision N [--request-id UUID] [--json]
+infinite routing status PROJECT [--json]
+infinite routing explain RUN_ID TASK_ID [--json]
 infinite signal add --project ID TEXT [--request-id UUID] [--json]
 infinite signal list --project ID [--after SEQ] [--json]
 infinite egress [--project ID] [--json]    Hosts agents reached through the egress proxy

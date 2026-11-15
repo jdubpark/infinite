@@ -48,7 +48,7 @@ class FakeThreads implements IntakeThreadReader {
   }
 }
 
-async function setup(options: { groupId?: string; maxActive?: number; requireSlackThread?: boolean; mirror?: boolean; scripted?: boolean; admitIssues?: boolean; answerQuestions?: boolean; classify?: boolean; router?: (text: string) => Promise<RouteReading | undefined>; routeWaitMs?: number } = {}) {
+async function setup(options: { groupId?: string; maxActive?: number; requireSlackThread?: boolean; mirror?: boolean; scripted?: boolean; admitIssues?: boolean; answerQuestions?: boolean; classify?: boolean; router?: (text: string) => Promise<RouteReading | undefined>; routeWaitMs?: number; reportName?: string } = {}) {
   const linearServer = await startIntakeLinearServer();
   const threads = new FakeThreads();
   /** While `blocked` is set, a start is refused with it, as the route's admission refuses a mid-handoff project. */
@@ -56,7 +56,7 @@ async function setup(options: { groupId?: string; maxActive?: number; requireSla
   let config!: Config;
   const configure = (target: Config) => {
     config = target;
-    target.linear = { apiKeyFile: linearServer.apiKeyFile, endpoint: linearServer.endpoint };
+    target.linear = { apiKeyFile: linearServer.apiKeyFile, endpoint: linearServer.endpoint, ...(options.reportName ? { reportName: options.reportName } : {}) };
     target.intake = {
       linear: { teamIds: [linearServer.teamId], creatorId: linearServer.ownerId, label: "infinite", commentsMirrorToSlack: options.mirror ?? false, admitIssues: options.admitIssues ?? true },
       slack: { appTokenFile: "/srv/infinite-data/slack-app-token", botTokenFile: "/srv/infinite-data/slack-bot-token", teamId: "T00000000",
@@ -385,6 +385,37 @@ test("the started and cancelled comments are delivered once each, even after a l
       "Infinite agent report: a mission started on this issue. Questions and the result will follow.",
       "Infinite agent report: cancelled.",
     ]);
+  } finally { await ctx.close(); }
+});
+
+test("the started comment and the outcome receipts use the configured report name", { timeout: 120000 }, async () => {
+  const ctx = await setup({ reportName: "Northwind" });
+  try {
+    const issue = ctx.issue();
+    await ctx.intake.poll();
+    const id = missionRequestId(issue.id);
+    await ctx.missions.cancel(id, { requestId: randomUUID(), revision: ctx.missions.peek(id)!.revision });
+    await ctx.intake.poll();
+    const bodies = ctx.linearServer.comments(issue.id).map(comment => comment.body);
+    assert.equal(bodies.length, 2);
+    assert.match(bodies[0], /^Northwind agent report: a mission started on this issue\./);
+    assert.match(bodies[1], /^Northwind agent report: cancelled\./);
+    assert.ok(bodies.every(body => !body.includes("Infinite")), "No posted comment names the product");
+  } finally { await ctx.close(); }
+});
+
+test("a direct request's fixed receipt uses the configured report name", { timeout: 120000 }, async () => {
+  const ctx = await setup({ requireSlackThread: false, reportName: "Northwind" });
+  try {
+    ctx.intake.requestFromSlack(direct(ctx));
+    await ctx.intake.poll();
+    const [issue] = ctx.linearServer.allIssues();
+    const id = missionRequestId(issue.id);
+    await ctx.missions.cancel(id, { requestId: randomUUID(), revision: ctx.missions.peek(id)!.revision });
+    await ctx.intake.poll();
+    const bodies = ctx.linearServer.comments(issue.id).map(comment => comment.body);
+    assert.match(bodies.at(-1)!, /^Northwind agent report: cancelled\. The reason is in the Slack thread/);
+    assert.ok(bodies.every(body => !body.includes("Infinite")));
   } finally { await ctx.close(); }
 });
 

@@ -97,6 +97,12 @@ test("answering questions needs direct requests, and classifying needs both answ
   const defaults = parsed({}).intake!.slack!;
   assert.deepEqual([defaults.answerQuestions, defaults.classify], [false, false]);
 });
+test("linear.reportName defaults to Infinite, accepts a plain name, and rejects Markdown, newlines, and long values", () => {
+  assert.equal(parsed({}).linear!.reportName, "Infinite");
+  assert.equal(parsed({}, { linear: { apiKeyFile: privateFile("linear-key"), reportName: "Northwind" } }).linear!.reportName, "Northwind");
+  for (const reportName of ["[x](y)", "North\nwind", "", "a".repeat(41)])
+    assert.throws(() => parsed({}, { linear: { apiKeyFile: privateFile("linear-key"), reportName } }), undefined, JSON.stringify(reportName));
+});
 test("jev.sessionReadings defaults to true and accepts false", () => {
   const apiKeyFile = privateFile("jev-key");
   assert.equal(parsed({}, { jev: { apiKeyFile } }).jev!.sessionReadings, true);

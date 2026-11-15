@@ -1294,3 +1294,40 @@ test("repository CLI pins, preserves and removes owner permission delegation", {
     assert.equal(retainedOff.team.permissions, undefined, "plain repo init preserves an explicitly saved off policy");
   } finally { await run.close(); rmSync(localRoot, { recursive: true, force: true }); }
 });
+
+test("repo init keeps the team settings it does not own when it runs again", { timeout: 120000 }, async () => {
+  const run = await teamFixture("success");
+  const localRoot = mkdtempSync(join(tmpdir(), "infinite-carry-cli-"));
+  const checkout = join(localRoot, "checkout");
+  const configFile = join(localRoot, "client.json");
+  writeFileSync(configFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
+  const firstChecks = JSON.stringify([{ command: process.execPath, args: ["check.mjs", "--prefix"] }]);
+  const secondChecks = JSON.stringify([{ command: process.execPath, args: ["check.mjs", "--suffix"] }]);
+  const enroll = (checks: string) => exec(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", configFile,
+    "repo", "init", "--project", "rehearsal", "--check-json", checks], { cwd: checkout });
+  try {
+    await exec("git", ["clone", "--no-hardlinks", run.source, checkout]);
+    await enroll(firstChecks);
+    const enrolled = (await run.host.fetchApi("/projects/rehearsal/team")).body;
+    const features = { areas: [{ id: "host", paths: ["src"] }] };
+    const saved = await run.host.fetchApi("/projects/rehearsal/team", "owner", {
+      requestId: randomUUID(), revision: enrolled.revision, team: { ...enrolled.team, handoffMinutes: 30, features, eval: { capture: true } },
+    }, undefined, "PUT");
+    assert.equal(saved.status, 200);
+    const before = (await run.host.fetchApi("/projects/rehearsal/team")).body.team;
+    await enroll(firstChecks);
+    const rerun = (await run.host.fetchApi("/projects/rehearsal/team")).body.team;
+    // The routine approval digest hashes this block as JSON, so a rerun with no change must leave it byte-identical.
+    assert.equal(JSON.stringify(rerun), JSON.stringify(before));
+    assert.equal(rerun.handoffMinutes, 30);
+    assert.deepEqual(rerun.eval, { capture: true });
+    assert.deepEqual(rerun.features, features);
+    assert.deepEqual(rerun.checks, JSON.parse(firstChecks));
+    await enroll(secondChecks);
+    const changed = (await run.host.fetchApi("/projects/rehearsal/team")).body.team;
+    assert.deepEqual(changed.checks, JSON.parse(secondChecks));
+    assert.equal(changed.handoffMinutes, 30);
+    assert.deepEqual(changed.eval, { capture: true });
+    assert.deepEqual(changed.features, features);
+  } finally { await run.close(); rmSync(localRoot, { recursive: true, force: true }); }
+});

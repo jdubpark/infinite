@@ -99,6 +99,7 @@ test("answering questions needs direct requests, and classifying needs both answ
 });
 test("linear.reportName defaults to Infinite, accepts a plain name, and rejects Markdown, link text, newlines, and long values", () => {
   assert.equal(reportName(parsed({})), "Infinite");
+  assert.equal(Object.hasOwn(parsed({}).linear!, "reportName"), false, "display defaults leave persisted configuration digests unchanged");
   assert.equal(reportName(parsed({}, { linear: { apiKeyFile: privateFile("linear-key"), reportName: "Northwind" } })), "Northwind");
   assert.equal(reportName(parsed({}, { linear: { apiKeyFile: privateFile("linear-key"), reportName: "Northwind East - 2" } })), "Northwind East - 2");
   for (const reportName of ["[x](y)", "North\nwind", "", "a".repeat(41), "North _wind_", "1. Northwind", "_Northwind", "9Lives", "www.example.com", "Northwind Co."])

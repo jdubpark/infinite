@@ -27,6 +27,13 @@ type Api = {
 type Options = Record<string, string | boolean>;
 const commandSchema = z.object({ command: z.string().min(1).max(4096).refine(value => !value.includes("\0")), args: z.array(z.string().max(4096).refine(value => !value.includes("\0"))).max(64).default([]) }).strict();
 const projectConfigSchema = z.object({ setup: commandSchema.optional(), checks: z.array(commandSchema).max(8), establishChecks: z.literal(true).optional() }).strict();
+/** The team keys that `repo init` sets itself. Every other key of the target's team block is carried over unchanged. */
+const REPO_INIT_TEAM_KEYS: ReadonlySet<string> = new Set(["setup", "checks", "establishChecks", "handoff", "delivery", "permissions"]);
+/** The settings of an enrolled project's team block that `repo init` does not own, as the host returned them. */
+export function carriedTeamSettings(team: unknown): Record<string, unknown> {
+  if (typeof team !== "object" || team === null || Array.isArray(team)) return {};
+  return Object.fromEntries(Object.entries(team).filter(([key]) => !REPO_INIT_TEAM_KEYS.has(key)));
+}
 const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 const projectIdPattern = /^[a-z0-9-]{1,80}$/;
 const directoryDefaultsSchema = z.object({
@@ -721,7 +728,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const sendLinear = Boolean(linearTeam || linearProject || (!targetLinear && rootDefault));
     const sourceSupported = me.teams?.projectSource === 1;
     const enrolledSource: ProjectSource = sourceSupported ? projectSource : { mode: "laptop" };
-    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...projectConfig, handoff, ...(delivery ? { delivery } : {}), ...(permissions ? { permissions } : {}) }, ...(sourceSupported ? { source: projectSource } : {}), ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}), ...(teamwork !== undefined ? { teamwork } : {}), ...(autonomy ? { autonomy } : {}) };
+    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...carriedTeamSettings(target.team), ...projectConfig, handoff, ...(delivery ? { delivery } : {}), ...(permissions ? { permissions } : {}) }, ...(sourceSupported ? { source: projectSource } : {}), ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}), ...(teamwork !== undefined ? { teamwork } : {}), ...(autonomy ? { autonomy } : {}) };
     // After a lost reply, inherited settings may already be the host's mapping.
     // An omitted mapping preserves that value; compare that intent while replay
     // still sends the original receipt body and request ID unchanged.

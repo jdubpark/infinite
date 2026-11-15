@@ -233,3 +233,31 @@ test("question IDs and safe views come from the owned mission and result remains
     assert.ok(comments.some(comment => comment.body === "Northwind agent report: ready for review. Read the report through the connector."), "Connector receipts use the configured report name");
   } finally { await ctx.close(); }
 });
+
+test("replies address current decision IDs when several structured questions are open", async () => {
+  const ctx = await setup();
+  try {
+    const started = ctx.api.startRequest("bot", request());
+    await ctx.intake.poll();
+    await ctx.h.report(1, { kind: "question", question: "Publish the proposed change?", options: ["Approve", "Deny"], answerMode: "approval" });
+    const asked = await waitFor(async () => ctx.api.getRequest("bot", started.runId), view => view.questions.length === 1);
+    await ctx.api.replyToRequest("bot", { runId: asked.runId, requestId: randomUUID(), revision: asked.revision!, text: "Also ask which checks to run." });
+    await ctx.h.report(2, { kind: "question", question: "Which checks?", options: ["API", "Web"], answerMode: "multiple" });
+    const current = await waitFor(async () => ctx.api.getRequest("bot", started.runId), view => view.questions.length === 2);
+    const answer = { runId: current.runId, requestId: randomUUID(), revision: current.revision!, decisionId: current.questions[1].id, text: "API and Web" };
+    const answered = await ctx.api.replyToRequest("bot", answer);
+    assert.deepEqual(answered.questions.map(question => question.id), [asked.questions[0].id], "Answering the second question leaves the first open");
+    const decisions = ctx.h.missions.get(current.runId).decisions;
+    assert.equal(decisions[0].answer, undefined);
+    assert.equal(decisions[1].answer, "API and Web");
+    assert.equal(decisions[1].answeredBy, "connector");
+    assert.deepEqual(decisions[1].source, { kind: "connector", id: "bot", name: "Delegated Bot" });
+    await assert.rejects(ctx.api.replyToRequest("bot", { ...answer, decisionId: asked.questions[0].id }), code("request-conflict"));
+    ctx.restart();
+    assert.equal((await ctx.api.replyToRequest("bot", answer)).revision, answered.revision);
+    await assert.rejects(ctx.api.replyToRequest("bot", { ...answer, requestId: randomUUID() }), code("decision-answered"));
+    const final = await ctx.api.replyToRequest("bot", { ...answer, requestId: randomUUID(), revision: answered.revision!, decisionId: asked.questions[0].id, text: "Deny" });
+    assert.deepEqual(final.questions, []);
+    assert.equal(ctx.h.missions.get(current.runId).decisions[0].answeredBy, "connector", "An approval-shaped question does not turn a connector answer into owner authority");
+  } finally { await ctx.close(); }
+});

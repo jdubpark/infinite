@@ -414,7 +414,12 @@ export const teamReportSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("delivery-repair"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("delivery-reconciliation"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), repository: githubRepository, branch: gitBranch, baseHeadCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), disposition: z.enum(["no-publication", "owned-branch", "pull-request"]), remoteHeadCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i).optional(), pullRequestUrl: z.string().trim().min(1).max(500).optional(), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("pull-request"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), pullRequestUrl: z.string().trim().min(1).max(500), summary: z.string().trim().min(1).max(4000) }).strict(),
-  z.object({ kind: z.literal("question"), question: z.string().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]) }).strict(),
+  z.object({ kind: z.literal("question"), question: z.string().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]), answerMode: z.enum(["approval", "single", "multiple"]).optional() }).strict().superRefine((report, context) => {
+    if (report.answerMode === "approval" && report.options.length !== 2)
+      context.addIssue({ code: "custom", path: ["options"], message: "Approval questions require exactly two options: approve first and deny second." });
+    if (report.answerMode === "multiple" && report.options.length < 2)
+      context.addIssue({ code: "custom", path: ["options"], message: "Multiple-selection questions require at least two options." });
+  }),
   z.object({ kind: z.literal("blocked"), summary: z.string().min(1).max(4000), blocker: blockerEvidenceSchema.optional() }).strict(),
 ]);
 export type TeamReport = z.infer<typeof teamReportSchema>;
@@ -514,6 +519,8 @@ export interface TeamDecision {
   revision: number;
   question: string;
   options: string[];
+  /** Absent on legacy decisions; approval uses option 1 to approve and option 2 to deny. */
+  answerMode?: "approval" | "single" | "multiple";
   createdAt: string;
   answer?: string;
   answeredBy?: "owner" | "coordinator" | "connector";

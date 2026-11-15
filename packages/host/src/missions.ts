@@ -832,7 +832,8 @@ export class MissionService {
       }
       if (!live.has(mission.status)) continue;
       for (const decision of team.decisions.filter(item => item.revision === team.revision && !item.answer))
-        this.message(stored, `${team.id}:${decision.id}`, { type: "child-decision", subtaskId: subtask.id, teamId: team.id, decisionId: decision.id, question: decision.question, options: decision.options });
+        this.message(stored, `${team.id}:${decision.id}`, { type: "child-decision", subtaskId: subtask.id, teamId: team.id, decisionId: decision.id, question: decision.question, options: decision.options,
+          ...(decision.answerMode ? { answerMode: decision.answerMode } : {}) });
       // A permission diagnostic can finish without changing the team's phase. Wake its
       // supervising coordinator once, with observations rather than approval authority.
       for (const outcome of team.permissionRecovery?.outcomes ?? []) {
@@ -1191,6 +1192,7 @@ export class MissionService {
         const escalated = mission.decisions.find(item => item.childDecisionId === decision.id && !item.answer);
         const answering = stored.ops.find(op => op.kind === "answer" && op.decisionId === decision.id);
         open.push({ subtaskId: subtask.id, teamId: team.id, decisionId: decision.id, question: decision.question, options: decision.options,
+          ...(decision.answerMode ? { answerMode: decision.answerMode } : {}),
           ...(escalated ? { ownerDecisionId: escalated.id } : {}), ...(answering ? { answerPendingBy: answering.by ?? "owner" } : {}) });
       }
     }
@@ -1286,11 +1288,11 @@ export class MissionService {
     const subtask = "subtaskId" in report && report.subtaskId ? mission.subtasks.find(item => item.id === report.subtaskId) : undefined;
     if ("subtaskId" in report && report.subtaskId && !subtask) return this.refuse(stored, report.kind, `Subtask ${report.subtaskId} does not exist.`);
     const openChildDecision = (decisionId: string) => {
-      if (!subtask?.teamId) return false;
+      if (!subtask?.teamId) return undefined;
       try {
         const team = this.teams.get(subtask.teamId);
-        return team.decisions.some(item => item.id === decisionId && item.revision === team.revision && !item.answer);
-      } catch (error) { if (notFound(error)) return false; throw error; }
+        return team.decisions.find(item => item.id === decisionId && item.revision === team.revision && !item.answer);
+      } catch (error) { if (notFound(error)) return undefined; throw error; }
     };
     switch (report.kind) {
       case "dispatch": {
@@ -1339,11 +1341,18 @@ export class MissionService {
       }
       case "question": {
         if (report.childDecisionId && !subtask) return this.refuse(stored, report.kind, "A forwarded question must name its subtask.");
-        if (report.childDecisionId && !openChildDecision(report.childDecisionId)) return this.refuse(stored, report.kind, "That subteam decision is not open.");
+        const forwardedDecision = report.childDecisionId ? openChildDecision(report.childDecisionId) : undefined;
+        if (report.childDecisionId && !forwardedDecision) return this.refuse(stored, report.kind, "That subteam decision is not open.");
         if (report.childDecisionId && mission.decisions.some(item => item.childDecisionId === report.childDecisionId && !item.answer))
           return this.refuse(stored, report.kind, "That subteam decision is already waiting for the owner.", false);
         if (mission.decisions.length >= 40) return this.refuse(stored, report.kind, "The mission reached its limit of 40 owner decisions.");
+        const answerMode = report.answerMode ?? forwardedDecision?.answerMode;
+        if (answerMode === "approval" && report.options.length !== 2)
+          return this.refuse(stored, report.kind, "Approval questions require exactly two options: approve first and deny second.");
+        if (answerMode === "multiple" && report.options.length < 2)
+          return this.refuse(stored, report.kind, "Multiple-selection questions require at least two options.");
         mission.decisions.push({ id: randomUUID(), question: report.question, options: report.options, createdAt: now(),
+          ...(answerMode ? { answerMode } : {}),
           ...(subtask ? { subtaskId: subtask.id } : {}), ...(report.childDecisionId ? { childDecisionId: report.childDecisionId } : {}) });
         this.event(stored, "The coordinator asked the owner a question.");
         break;

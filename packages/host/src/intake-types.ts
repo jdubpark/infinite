@@ -50,11 +50,15 @@ export interface IntakeMessage {
   status: "pending" | "sent" | "failed"; attempts: number;
   /** The last send may have reached Slack; look the key up in the thread before sending again. */
   uncertain?: boolean; nextAttemptAt?: string; ts?: string; error?: string;
+  /** Slack Block Kit controls attached to the final chunk of a decision question. */
+  blocks?: Record<string, unknown>[];
 }
 export interface IntakeInbound {
   eventId: string; ts: string; text: string; receivedAt: string; handledAt?: string; outcome?: string;
   /** The mission call chosen for this event, saved before the call; a replay performs exactly this call. */
   call?: { action: "answer" | "steer" | "pause" | "resume" | "cancel"; decisionId?: string; text?: string; revision: number };
+  /** Interactive Slack action identity, stable across envelope redelivery. */
+  interactionId?: string;
 }
 /** The owner's Slack mention a record was filed from; `filedAt` is set once Linear holds the issue. */
 export interface IntakeDirect {

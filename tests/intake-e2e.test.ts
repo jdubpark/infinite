@@ -111,8 +111,8 @@ test("a question reaches the thread and the owner's tagged reply answers it", { 
     const texts = () => slack!.posts(BINDING).map(post => post.text);
 
     await waitFor(async () => texts(), list => list.some(text => text.startsWith("Started on TEST-1")), 60000);
-    const question = await waitFor(async () => texts(), list => list.some(text => text.startsWith("Q1: The API subteam asks: Which response format should the endpoint use?")), 120000);
-    assert.ok(question.some(text => text === "Q1: The API subteam asks: Which response format should the endpoint use?\n1. JSON   2. Text\nReply with a mention and your answer."));
+    const question = await waitFor(async () => texts(), list => list.some(text => text.startsWith("**Q1: The API subteam asks: Which response format should the endpoint use?**")), 120000);
+    assert.ok(question.some(text => text === "**Q1: The API subteam asks: Which response format should the endpoint use?**\n\n1. JSON\n2. Text\n\nChoose below, or reply with a mention and your answer."));
 
     const { body: before } = await host.fetchApi("/intake");
     const missionId = before.records[0].missionId as string;
@@ -125,6 +125,7 @@ test("a question reaches the thread and the owner's tagged reply answers it", { 
 
     const answered = await waitFor(async () => (await host.fetchApi(`/missions/${missionId}`)).body,
       mission => mission.decisions.some((item: { answer?: string }) => item.answer === "JSON"), 60000);
+    await waitFor(async () => texts(), list => list.includes("Received your answer to Q1."), 30000);
     assert.ok(answered.decisions.some((item: { answer?: string }) => item.answer === "JSON"), "The mission decision holds the owner's answer");
     assert.notEqual(answered.status, "ready-for-review");
 

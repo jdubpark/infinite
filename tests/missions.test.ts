@@ -481,6 +481,43 @@ test("mission blocked reports accept summary-only legacy and bounded structured 
   assert.equal(missionReportSchema.safeParse({ ...legacy, blocker: { ...blocker, unexpected: true } }).success, false, "evidence objects are strict");
 });
 
+test("mission question modes preserve legacy behavior and validate selectable semantics", () => {
+  const legacy = { kind: "question", question: "Which response format?", options: ["JSON", "Text"] };
+  assert.deepEqual(missionReportSchema.parse(legacy), legacy, "Two legacy options do not infer approval mode");
+  assert.equal(missionReportSchema.safeParse({ ...legacy, answerMode: "approval" }).success, true);
+  assert.equal(missionReportSchema.safeParse({ ...legacy, answerMode: "approval", options: ["Approve"] }).success, false);
+  assert.equal(missionReportSchema.safeParse({ ...legacy, answerMode: "multiple" }).success, true);
+  assert.equal(missionReportSchema.safeParse({ ...legacy, answerMode: "multiple", options: ["Only one"] }).success, false);
+});
+
+test("a forwarded child decision retains its selection mode in messages, prompt context, and stored owner decision", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "One API subtask", subtasks: [plan("api-work", "api")] });
+    const dispatched = await until(() => h.get(id), mission => Boolean(mission.subtasks[0]?.teamId));
+    const teamId = dispatched.subtasks[0].teamId!;
+    const decisionId = randomUUID();
+    h.set(teamId, { status: "needs-input", decisions: [{ id: decisionId, memberId: randomUUID(), revision: 1, question: "May this operation proceed?",
+      options: ["Approve once", "Deny"], answerMode: "approval", createdAt: new Date().toISOString() }] });
+
+    const childMessage = (await h.messages(2)).find((message: MissionMessage) => message.type === "child-decision");
+    assert.ok(childMessage?.type === "child-decision");
+    if (childMessage?.type === "child-decision") assert.equal(childMessage.answerMode, "approval");
+    assert.match((await h.attempt(2)).prompt, /"answerMode":"approval"/);
+    assert.match((await h.attempt(2)).prompt, /preserve the child's answerMode/);
+
+    await h.report(2, { kind: "question", question: "May this operation proceed?", options: ["Approve", "Deny", "Defer"], subtaskId: "api-work", childDecisionId: decisionId });
+    const correction = await h.messages(3);
+    assert.ok(correction.some((message: { type: string; kind?: string; reason?: string }) => message.type === "refused" && message.kind === "question" && /exactly two options/.test(message.reason ?? "")),
+      "Inherited approval semantics reject incompatible owner-facing options");
+    await h.report(3, { kind: "question", question: "May this operation proceed?", options: ["Approve once", "Deny"], subtaskId: "api-work", childDecisionId: decisionId });
+    const waiting = await until(() => h.get(id), mission => mission.status === "needs-input");
+    assert.equal(waiting.decisions[0].answerMode, "approval", "The child mode is inherited when a forwarded report omits it");
+    assert.equal(h.stored(id).mission.decisions[0].answerMode, "approval", "The inherited mode is durable");
+  } finally { h.close(); }
+});
+
 test("a later mission coordinator attempt receives and durably records blocked subteam evidence", { timeout: 60000 }, async () => {
   const h = scripted();
   try {
@@ -919,13 +956,17 @@ for (const scenario of [
   // Both objectives leave room for the initial attempt and dispatch. Recovery fits only compactly in the first case;
   // the longer dispatch summary leaves no room even for recovery identifiers in the second. Retune when instructions grow.
   { name: "a large mission delivers a compact recovery outcome", objectiveLength: 23400, summary: "One API change", held: false },
-  { name: "a full mission blocks and cancels its subteam when recovery evidence cannot fit", objectiveLength: 23500, summary: "S".repeat(900), held: true },
+  { name: "a full mission blocks and cancels its subteam when recovery evidence cannot fit", objectiveLength: 23300, summary: "S".repeat(900), held: true },
 ]) test(scenario.name, { timeout: 30000 }, async () => {
   const h = scripted();
   try {
     const { id } = await h.create("界".repeat(scenario.objectiveLength));
     await h.report(1, { kind: "dispatch", summary: scenario.summary, subtasks: [plan("a", "api")] });
-    const teamId = (await until(() => h.get(id), mission => Boolean(teamOf(mission, "a")))).subtasks[0].teamId!;
+    const dispatched = await until(() => h.get(id), mission => Boolean(teamOf(mission, "a")));
+    const teamId = dispatched.subtasks[0].teamId!;
+    const repos = h.config.projects.map(project => ({ projectId: project.id, name: project.name, path: project.path, teamReady: true }));
+    const stateOnly = missionPromptWithMessageCount(dispatched, repos, [], 2, "claude", lineup.coordinator, { openChildDecisions: [], waiting: 0 });
+    assert.ok(Buffer.byteLength(stateOnly.prompt, "utf8") <= 80 * 1024, "The post-dispatch state fits before recovery arrives");
     const outcomeId = randomUUID();
     Object.assign(h.runs.get(teamId)!, { permissionRecovery: { outcomes: [{ id: outcomeId, revision: 1, promptId: 1,
       status: "exhausted", cause: "界".repeat(400), action: "界".repeat(400), decision: "界".repeat(400),

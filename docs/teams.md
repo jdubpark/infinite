@@ -467,6 +467,146 @@ When storage falls below `teams.storageFloor`, new runs are refused before their
 workspaces are created. See the configured reason in the API response and free
 space before retrying.
 
+## Eval capture
+
+Eval capture keeps each implementer task of a finished team run as an eval task. A later replay can run other configurations on the same tasks. This slice only captures and sorts them. Capture spends no model tokens, starts no session, and reads the corpus for no decision.
+
+Capture is off by default. Only a project in `github` source mode captures. A laptop project writes nothing and reads nothing.
+
+**Turn capture on only after the owner has admitted the patch form and the capture name list in the launcher** (see [Git forms](#git-forms)). Until then every task ends `capture-failed`. While the base check form is refused, every task ends `base-not-proven`.
+
+Capture never changes a run. A failed, stalled, or slow capture never delays a run, takes an enrichment slot, or reaches a member.
+
+### Settings
+
+Set `eval` in the project's team block, through the owner-only `PUT /api/projects/PROJECT_ID/team` route or the configuration file. Only `capture` is needed:
+
+```json
+{ "team": { "eval": { "capture": true } } }
+```
+
+The schema is strict, so an unknown key refuses the write. At this stage every field is optional.
+
+| Field | Limit | Default | Meaning |
+|---|---|---|---|
+| `capture` | boolean | `false` | Turns capture on. Read only for a `github` project. |
+| `testPaths.prefixes` | up to 32 paths, 200 characters each | host rule | Directories whose files count as tests |
+| `testPaths.suffixes` | up to 32 suffixes, 64 characters each | host rule | File-name endings that count as tests |
+| `excludeAreas` | up to 32 area IDs | none | Feature-map areas whose tasks never enter the corpus |
+| `retentionDays` | integer, 30 to 3650 | 365 | Days a captured task is kept before the sweep removes it |
+
+- A prefix is repository-relative. It cannot start with `/`, contain `..`, `.git`, `.`, an empty segment, or glob characters.
+- Without `testPaths`, the host rule applies. It counts a file as a test when a path segment is `test`, `tests`, or `__tests__`, or when the name contains `.test.` or `.spec.`. When `testPaths` is set, it replaces that rule and needs at least one prefix or suffix.
+- An area ID is lowercase letters, digits, and hyphens, up to 40 characters. An ID that the feature map does not know refuses every task with `excluded-area-unknown`.
+- A client that does not know `eval` replaces the whole team block and drops the setting, which turns capture off. That fails safe.
+
+### What a captured task keeps
+
+An implementer task is captured when its commit integrates. It keeps:
+
+- **The capsule.** The run's objective, the steering and owner answers dated before the member started, the brief and goal context when the run has them, and the task's ID, title, instructions, and paths. It is capped at 65,536 bytes of canonical JSON. A capsule over the cap refuses the task. It is never cut.
+- **Two binary patches.** The base delta, from the run's base to the member's base, when they differ. The reference, from the member's base to the task commit.
+- **File lists.** The reference's files, its hidden test files, and the files that later commits of the run changed.
+
+It never keeps a rendered prompt. The capsule holds the inputs that the prompt builder uses, so a later replay can render them again.
+
+All of this is sealed in the evidence store. See [Evidence store at rest](security.md#evidence-store-at-rest).
+
+### States and reason codes
+
+A task starts as `captured`. It becomes `candidate` when the outcome ledger counts its attempt as accepted and every other check passes. Otherwise it becomes `rejected` with one code. A `candidate` can become `rejected` later, for example after an owner exclusion.
+
+The decision waits for three facts: the capture reads, the approval read, and the frozen ledger row. The facts can arrive in any order, and every order gives the same result. A timer pass makes the decision, every 60 seconds, for at most 100 rows a pass, oldest check first. A restart turns a read that was still running into a failure.
+
+Start codes. The task is `rejected` before any read.
+
+| Code | Meaning |
+|---|---|
+| `ui-changes` | The run's brief says it changes the user interface. |
+| `start-unknown` | The member has no start time, so no capsule can be cut. |
+| `capsule-too-large` | The capsule is over 65,536 bytes. |
+| `excluded-area-unknown` | `excludeAreas` names an area that the feature map does not have. |
+| `capture-busy` | The queue is full, or four reads have stalled. |
+
+Material codes. The task is `rejected` after the reads.
+
+| Code | Meaning |
+|---|---|
+| `capture-failed` | The reference's name read failed or threw. |
+| `reference-too-wide` | The reference lists more than 500 files, or its list was cut. |
+| `excluded-area` | A reference file is in an excluded area. |
+| `no-hidden-tests` | The reference has no test file, or only test files. |
+| `patch-too-large` | A patch is over 1,048,576 bytes. |
+| `corpus-full` | A project or host material cap would be exceeded. |
+
+Promotion codes. The ledger's decision rule runs first, then the facts, in this order.
+
+| Code | Meaning |
+|---|---|
+| `ledger-missing` | The run was deleted, and its ledger row no longer exists. |
+| `ledger-withheld` | The ledger withholds the attempt because it is backfilled or has a gap. |
+| `excluded` | The owner excluded the attempt. |
+| `same-model-review` | The approving review ran on the same model as the work. |
+| `not-accepted` | The ledger counts the attempt as not accepted. |
+| `acceptance-unknown` | The ledger cannot tell whether the attempt was accepted. |
+| `patch-missing` | A patch could not be read, or the patch form is refused. |
+| `reference-unknown` | The approval read is missing, or the later-change list was too wide. |
+| `reference-ambiguous` | A later commit of the run changed a reference file. |
+| `base-not-proven` | Form 3 did not prove that the anchor is on the mirror's branch. |
+| `features-unknown` | The ledger row has no usable risk level. |
+| `unreadable` | A sealed payload does not open. |
+
+An unfrozen ledger row waits. A ledger row that does not open leaves its task as it is, and the pass counts it as `unreadable`.
+
+A missing fact stays missing. A refused patch is never stored as empty. A truncated list is never read as complete. An unknown acceptance is never a refusal or an acceptance. An empty reference patch counts as missing, because a captured task has at least two files, so an empty read means the read failed without saying so. An empty base delta is kept, because two different commits may have equal trees.
+
+### Deletion and retention
+
+- A deleted run keeps its captured tasks only when it merged or needed no change. Any other deleted run, and a run with no readable status, takes its tasks and their sealed material with it. The status is the run's last `run.deleted` or `run.settled` event.
+- A kept task is stamped with the deletion time, and retention removes it later.
+- Retention removes a task once its capture time is older than the project's `retentionDays`. A task whose project is no longer configured keeps the default of 365 days. The sweep removes at most 100 rows a pass.
+- Removing a run's clones does not change a captured task.
+
+These are the defaults this slice ships. The owner has not yet decided them (spec owner decision 5). They stand until the owner changes them.
+
+### Caps
+
+| Cap | Limit | Result |
+|---|---|---|
+| Capsule | 65,536 bytes | `capsule-too-large`, never cut |
+| Patch | 1,048,576 bytes each | `patch-too-large` |
+| Reference file list | 500 names | `reference-too-wide` |
+| Later-change list | 2,000 names | `reference-unknown` |
+| Tasks, per project | 20,000 rows, rejected rows included | No new row |
+| Material, per project | 134,217,728 bytes (128 MiB) | `corpus-full` at completion |
+| Material, per host | 536,870,912 bytes (512 MiB) | `corpus-full` at completion |
+
+A new task is refused at 20,000 tasks for a project. The byte caps are checked when the material completes: a completion that would pass either material cap rejects the task `corpus-full`, and every part is removed.
+
+### Queue limits
+
+| Limit | Value | Effect |
+|---|---|---|
+| Queued captures | 64 | A marker over the limit is `capture-busy`. |
+| Concurrent reads | 2 | Other reads wait in the queue. |
+| Stalled reads | 4 | While four reads are stalled, every new capture is `capture-busy`. |
+| Read deadline | 35 seconds | A read that runs longer counts as failed, and as stalled until its call settles. |
+| Git process | 30 seconds | A Git read that runs longer is stopped. |
+
+Capture writes one log line per code per process: `Eval capture skipped (CODE).`. The code is `capture-busy` or `corpus-full`. No log line carries a file name, a commit ID, or any other text.
+
+### Git forms
+
+Each capture read runs through the team Git prefix, with the six `-c` settings. A commit ID must match 40 or 64 lowercase hexadecimal characters before it enters an argument.
+
+| Form | Command | Limit | If refused |
+|---|---|---|---|
+| 1. Patch (new) | `git diff --no-ext-diff --no-textconv --no-color --binary --default-prefix --no-renames --submodule=short --ignore-submodules=none --unified=3 --inter-hunk-context=0 FROM TO --`, in the run's integration checkout | 1,048,576 bytes; Git 2.41 or later | The patch is `missing`, and the task ends `patch-missing`. |
+| 2. Name list of capture (new) | `git diff --no-ext-diff --no-textconv --name-only --no-renames --ignore-submodules=none -z FROM TO --`, in the same checkout | 500 names for a reference; 2,000 for later changes; 64 KiB of output | Every capture ends `capture-failed`; a later-change list leaves the approval unknown. |
+| 3. Base check (reused, form 1 of the base scan) | `git merge-base --is-ancestor ANCHOR HEAD`, in the source mirror, where `HEAD` is the mirror's head | 30 seconds | Every task ends `base-not-proven`. |
+
+Form 3 is in a launcher audit that is pending with the outcome-ledger release. Forms 1 and 2 need the owner's launcher approval before capture is turned on. The launcher must also end each of the three reads by itself after 35 seconds: the host may not signal a command that the launcher runs as another account, and a read that hangs there holds one of four places until it ends.
+
 ## Head publication
 
 The host publishes each integrated head to GitHub, so the work survives workspace

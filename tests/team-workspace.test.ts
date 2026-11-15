@@ -228,3 +228,25 @@ test("moved-base recovery copies from a source mirror through the restricted lau
     assert.equal(git(team.workspace, "status", "--porcelain"), "");
   } finally { rmSync(sandbox, { recursive: true, force: true }); }
 });
+
+test("a Git command keeps the grant of its operation and still ignores replace refs", async () => {
+  const { root } = repository();
+  try {
+    const grant = { INFINITE_GITHUB_GRANT: "grant-for-one-push" };
+    const viaGit = await teamCommand({ command: "git", args: teamGitArgs(root, ["-c", "alias.environment=!env", "environment"]) }, root, undefined, 30000, undefined, undefined, grant);
+    assert.equal(viaGit.exitCode, 0);
+    const gitLines = viaGit.stdout.split("\n");
+    assert.ok(gitLines.includes("INFINITE_GITHUB_GRANT=grant-for-one-push"));
+    assert.ok(gitLines.includes("GIT_NO_REPLACE_OBJECTS=1"));
+
+    // A grant cannot turn replace refs back on.
+    const unpinned = await teamCommand({ command: "git", args: teamGitArgs(root, ["-c", "alias.environment=!env", "environment"]) }, root, undefined, 30000, undefined, undefined, { GIT_NO_REPLACE_OBJECTS: "0" });
+    assert.ok(unpinned.stdout.split("\n").includes("GIT_NO_REPLACE_OBJECTS=1"));
+
+    const other = await teamCommand({ command: "env", args: [] }, root, undefined, 30000, undefined, undefined, grant);
+    assert.equal(other.exitCode, 0);
+    const otherLines = other.stdout.split("\n");
+    assert.ok(otherLines.includes("INFINITE_GITHUB_GRANT=grant-for-one-push"));
+    assert.ok(!otherLines.some(line => line.startsWith("GIT_NO_REPLACE_OBJECTS=")));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

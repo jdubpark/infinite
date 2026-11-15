@@ -18,7 +18,7 @@ possible provider tool effect.
 Each member report is bound to its run, member, and revision and is acknowledged
 after durable recording. Separate Git copies isolate edits without sandboxing
 providers. Git, setup, and check commands must run under the intended agent
-identity. Workspace files remain plaintext runtime data. Provider permissions
+identity. Git commands that the host runs in team copies ignore replace refs (`GIT_NO_REPLACE_OBJECTS=1`), so a ref that a member plants in a team copy cannot change what a read returns. Workspace files remain plaintext runtime data. Provider permissions
 remain with the owner unless an explicit repository policy delegates bounded
 one-shot requests to the strong coordinator. Guarded delivery checks the current
 assignment, workspace, prompt, policy, expiry and human input control. Workspace
@@ -102,6 +102,8 @@ totals, and limit observations reach clients.
 The evidence database follows the at-rest rule of contract C1 in the self-improving teams design. Its file is private (`0600`) in a private directory (`0700`). The host narrows a wider file mode on open, after the key check passes. Each payload is sealed with AES-256-GCM under a key that HKDF-SHA-256 derives from the vault key. The seal binds a payload to its table and row ID, so a payload copied into another row does not open.
 
 A plain column holds only an opaque ID, an enumeration, a number, or a time. A task ID, a path, and any text from a repository or a run are encrypted. When such a value must be matched, the row stores a blind index: a keyed HMAC-SHA-256 that keeps value classes apart. Event keys are stored the same way. The host refuses an existing file that fails the encrypted key check, an empty file included, and it never falls back to plaintext. Status reasons and log lines never name a path.
+
+Eval capture ([teams](teams.md#eval-capture)) keeps its material only in the evidence store. The capsule, both patches, and the file names are sealed there. They never reach a mirror ref, a tracked file, a log line, an error, or a member's context. Plain columns hold only IDs, states, reason codes, counts, and times, and a project is matched by a blind index. A cancelled run's deletion deletes its eval material with it. The `eval` block of a project's team configuration reaches no member, and the routine approval digest leaves it out.
 
 ## Remote machine transport
 

@@ -20,6 +20,8 @@ import { combineCoverage, type UsageService } from "./usage-service.js";
 import { type EvidenceStore, eventProblem } from "./evidence/store.js";
 import { applyFuseReason, workLaunch } from "./fuse/rules.js";
 import type { FuseAdmission, FuseCheck, FuseGate } from "./fuse/types.js";
+import type { CaptureSink } from "./eval-types.js";
+import { captureStart } from "./eval-rules.js";
 import { HALT_RUNNING_TEAM, KEPT_PAUSED, LEFT_AS_IS, STILL_HALTED, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 import type { EventOutbox, OutboxEvent } from "./evidence/outbox.js";
 import type { Blackboard } from "./evidence/blackboard.js";
@@ -62,6 +64,8 @@ type TeamServiceOptions = {
   events?: EventOutbox;
   /** Host entries and launch sizes for the blackboard. Without it no entry is written and no size is recorded. */
   entries?: Blackboard;
+  /** Eval capture (INF-185). It observes only: it never changes a run, and its failure is swallowed. */
+  capture?: CaptureSink;
 };
 type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedAt: Record<string, string>; removalErrors: Record<string, string[]>; retryAt?: Record<string, string>;
   /** When a record removal first waited for its events to reach the evidence store. */
@@ -880,6 +884,18 @@ export class TeamService {
       return;
     }
     this.emit(stored, kind, keyParts, ids, data);
+  }
+  private captureIntegrated(stored: Stored, member: TeamMember, task: TeamTask, commit: string, head: string): void {
+    try {
+      if (!this.options?.capture?.enabled(stored.run.projectId)) return;
+      this.options?.capture?.integrated(captureStart(stored.run, task, member, { commit, head, at: timestamp() }));
+    } catch { /* Capture never changes a run. */ }
+  }
+  private captureApproved(stored: Stored, reviewedHead: string): void {
+    try {
+      if (!this.options?.capture?.enabled(stored.run.projectId)) return;
+      this.options?.capture?.approved({ runId: stored.run.id, workspace: stored.run.workspace, anchorCommit: stored.run.baseCommit, reviewedHead, at: timestamp() });
+    } catch { /* Capture never changes a run. */ }
   }
   /** Records that `next` continues `previous`, until `next` starts. A no-op without `options.events`. */
   private linkReplacement(stored: Stored, next: TeamMember, previous: TeamMember, cause: ReplacementCause): void {
@@ -4785,6 +4801,7 @@ export class TeamService {
           return { verdict: report.verdict, headCommit: member.baseCommit, baseCommit: run.baseCommit,
             reviewer: profileIdentity(reviewer, member.provider ?? run.provider), rubric: rubricKept.length ? rubricKept : undefined };
         });
+        if (report.verdict === "approved") this.captureApproved(stored, member.baseCommit);
         if (report.verdict === "changes-requested") {
           for (const task of run.tasks) if (task.status === "integrated") task.reviewRounds = (task.reviewRounds ?? 0) + 1;
           this.repair(stored, report.summary, "review");
@@ -4831,6 +4848,7 @@ export class TeamService {
         this.emitWith(stored, "task.integrated", [member.revision, task.id], { memberId: member.memberId, taskId: task.id, revision: member.revision }, () => ({
           commit, headCommit: head, baseCommit: run.baseCommit, memberBaseCommit: member.baseCommit, diff: task.diffStat,
         }));
+        if (commit && member.role === "implementer") this.captureIntegrated(stored, member, task, commit, head);
       }
       if (member.role === "integrator" && run.round > 0) {
         this.emitWith(stored, "repair.integrated", [member.revision, run.round], { memberId: member.memberId, revision: member.revision }, () => ({

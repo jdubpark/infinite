@@ -7,11 +7,26 @@ import { DEFAULT_REPORT_NAME, reportName } from "./config.js";
 import type { Config } from "./types.js";
 import type { ProductGoal } from "./goal-types.js";
 import type { TeamRun, TeamView } from "./team-types.js";
-import type { LinearTrackingView } from "./linear-types.js";
+import type { LinearBridgeStatus, LinearLimitView, LinearTrackingView } from "./linear-types.js";
 import { unseal, writeSealed } from "./vault.js";
 
 const endpoint = "https://api.linear.app/graphql";
+/** A record execution can depend on must have been confirmed this recently. */
 const freshnessMs = 30000;
+/**
+ * A finished record only informs a client, so a passive read accepts a confirmation this old. An owner action that
+ * starts work from it asks for a current one, and any pending evidence or label still reads at once.
+ */
+const settledFreshnessMs = 10 * 60000;
+/** Linear refills its limits continuously, so a pause from reset headers never outlasts this before one request probes. */
+const maxPauseMs = 5 * 60000;
+/** A limit that states no usable time waits this long, then twice as long each time it repeats, up to `maxPauseMs`. */
+const fallbackPauseMs = 60000;
+/** Linear's windows are hourly; a longer Retry-After is treated as this long. */
+const maxRetryAfterMs = 2 * 3600000;
+const confirmWaitMs = 5000;
+const at = (ms: number) => new Date(Math.ceil(ms / 1000) * 1000).toISOString().replace(".000Z", "Z");
+const rateLimitReason = (retryAt: number) => `Linear is rate-limiting this host's requests. Tracking retries at ${at(retryAt)}; execution waits until Linear confirms current requirements.`;
 const maxResponseBytes = 1024 * 1024;
 const issueFields = "id identifier url title description updatedAt archivedAt team { id } project { id } parent { id } state { id name type }";
 const issueSchema = z.object({
@@ -72,6 +87,14 @@ export function sharedText(value: string) {
   return value.replace(/(?:\/(?:Users|home|tmp|private\/tmp|private\/var|var\/folders)\/|~\/|[A-Za-z]:\\)[^\s<>"'`]+/g, "[local path omitted]");
 }
 
+type RateLimitWait = { delay: number; basis: "retry-after" | "reset" | "fallback"; retryAfterSeconds?: number };
+/** How far the server's clock runs ahead of this host's, by the response's Date header; under 5 s is header granularity. */
+function serverSkew(response: Response) {
+  const date = Date.parse(response.headers.get("date") ?? "");
+  const skew = Number.isFinite(date) ? date - Date.now() : 0;
+  return Math.abs(skew) < 5000 ? 0 : skew;
+}
+
 /** Linear's own failure. Its text is fixed, so it may be shown or stored. */
 export class LinearFailure extends Error {
   constructor(readonly retryAfterMs = 0) { super("Linear could not confirm synchronization. Check the connection and host credential; execution is waiting."); }
@@ -89,6 +112,19 @@ export class LinearService {
   private pumping = false;
   private closed = false;
   private retryUntil = 0;
+  /** Each live goal's active run, as the goal last reported it. That finished run still gates the goal's next step. */
+  private readonly activeTeams = new Map<string, string | undefined>();
+  /** Each record's local status as last reported; memory only. */
+  private readonly statuses = new Map<string, string>();
+  private readonly usage: { minute: number; requests: number; complexity: number }[] = [];
+  private limits?: LinearBridgeStatus["limits"];
+  private lastLimit?: LinearBridgeStatus["lastRateLimit"];
+  private limitLoggedAt = 0;
+  /** Consecutive rate-limited answers; a limit without usable timing waits longer each time. */
+  private limitStreak = 0;
+  /** Set by a shared rate limit. Until one request is answered without a limit, requests go one at a time. */
+  private recovering = false;
+  private probe?: Promise<void>;
 
   constructor(private readonly config: Config, private readonly key: Buffer) {
     this.directory = join(config.stateDir, "linear");
@@ -122,6 +158,7 @@ export class LinearService {
   private register(kind: Stored["kind"], value: { id: string; projectId: string; title: string; status: string }, description: string, optedInAtCreation: boolean, existing?: string, parentKey?: string) {
     const recordKey = keyOf(kind, value.id), prior = this.records.get(recordKey);
     if (prior) {
+      this.statuses.set(recordKey, value.status);
       this.configuration(prior);
       if (prior.projectId !== value.projectId || prior.parentKey !== parentKey || (existing && prior.lookup !== existing))
         prior.blocked ??= "The Linear issue binding changed. Start a newly approved run with the intended issue.";
@@ -140,6 +177,7 @@ export class LinearService {
       attempted: false, failures: 0, retryAt: 0, terminal: terminalStatuses.has(value.status), comments: {},
     };
     this.records.set(recordKey, stored); this.fresh.set(recordKey, { requested: 1, verified: 0, queued: new Set(), readRequested: false });
+    this.statuses.set(recordKey, value.status);
     this.configuration(stored); this.save(stored);
     if (parentKey) { const parent = this.records.get(parentKey); if (parent) this.force(parent); }
     return stored;
@@ -161,6 +199,7 @@ export class LinearService {
       ...(goal.evidence.length ? [`Provided evidence:\n${goal.evidence.join("\n")}`] : [])].join("\n\n");
     const stored = this.register("goal", goal, description, optedInAtCreation, goal.linearIssueId);
     if (!stored) return goal.linearIssueId ? { status: "blocked", reason: "Configure Linear for this project before linking an existing issue." } : undefined;
+    this.activeTeams.set(keyOf("goal", goal.id), goal.activeTeamId);
     for (const direction of goal.steering) this.comment(stored, `direction:${direction.revision}`, `User direction for goal revision ${direction.revision}:\n\n${direction.text}\n\nThe approved scope and execution limits remain in force.`);
     for (const outcome of goal.outcomes) this.comment(stored, `outcome:${outcome.revision}`, `User-recorded product outcome: ${outcome.result}\n\n${outcome.summary}\n\nEvidence:\n${outcome.evidence}`);
     if (evidenceStatuses.has(goal.status)) { const status = (name: string) => `${name} goal execution\n\nStatus: ${goal.status}\nFeature runs: ${goal.cycles.length}\nAgent attempts: ${goal.memberCount}\n\nThis is local execution evidence. Linear's workflow status has not been changed.`; this.comment(stored, `status:${goal.revision}:${goal.status}`, status(reportName(this.config)), status(DEFAULT_REPORT_NAME)); }
@@ -222,33 +261,66 @@ export class LinearService {
     this.save(stored); return this.view(stored);
   }
   getGoal(id: string) { return this.get("goal", id); }
-  getTeam(id: string) { return this.get("team", id); }
-  private get(kind: Stored["kind"], id: string) {
+  /** `current` is for a caller about to start work from this run: it needs a confirmation of the gating age. */
+  getTeam(id: string, current = false) { return this.get("team", id, current); }
+  /** Asks for a current confirmation and waits briefly for it, so an owner action rarely meets a stale finished run. */
+  async confirmTeam(id: string): Promise<LinearTrackingView | undefined> {
+    const deadline = Date.now() + confirmWaitMs;
+    while (this.timer && !this.closed && Date.now() < deadline && Date.now() >= this.retryUntil && this.get("team", id, true)?.status === "pending")
+      await new Promise(resolve => setTimeout(resolve, 100));
+    return this.get("team", id, true);
+  }
+  private get(kind: Stored["kind"], id: string, current = false) {
     const stored = this.records.get(keyOf(kind, id));
     if (!stored) return undefined;
-    if (!this.isFresh(stored)) this.clock(stored).readRequested = true;
-    return this.view(stored);
+    if (stored.error || !this.isFresh(stored, this.window(stored, !current))) this.clock(stored).readRequested = true;
+    return this.view(stored, !current);
   }
-  private isFresh(stored: Stored) {
+  /**
+   * Execution can depend on a live record and on a finished run its live goal still names as active. A live child
+   * asks for its goal's confirmation through its own gate. A blocked record never syncs again, so it never gates.
+   */
+  private gating(stored: Stored) {
+    if (stored.blocked) return false;
+    if (!stored.terminal) return true;
+    const parent = stored.kind === "team" && stored.parentKey ? this.records.get(stored.parentKey) : undefined;
+    return Boolean(parent && !parent.terminal && !parent.blocked && this.activeTeams.get(stored.parentKey!) === stored.id);
+  }
+  private window(stored: Stored, relaxed: boolean) {
+    // The host can restart a blocked run by itself, so a client's read of one still refreshes it at the gating age.
+    const restartable = stored.kind === "team" && !stored.blocked && this.statuses.get(keyOf(stored.kind, stored.id)) === "blocked";
+    return relaxed && !restartable && !this.gating(stored) ? settledFreshnessMs : freshnessMs;
+  }
+  private isFresh(stored: Stored, windowMs = freshnessMs) {
     const clock = this.clock(stored);
-    return Boolean(stored.issue && stored.checkedAt && Date.now() - Date.parse(stored.checkedAt) < freshnessMs && clock.verified === clock.requested);
+    return Boolean(stored.issue && stored.checkedAt && Date.now() - Date.parse(stored.checkedAt) < windowMs && clock.verified === clock.requested);
   }
   private pendingComments(stored: Stored) { return Object.values(stored.comments).some(comment => !comment.delivered); }
   private pendingLabel(stored: Stored) { return (stored.label === "add" || stored.label === "remove") && (stored.labelRetryAt ?? 0) <= Date.now(); }
   // Unanswered requests are never evicted; at the cap further optional renames wait rather than lose that evidence.
   private pendingRetitle(stored: Stored) { return Boolean(stored.retitle && (stored.retitleRetryAt ?? 0) <= Date.now() && (stored.retitleSent?.length ?? 0) < RETITLE_SENT_LIMIT); }
-  private view(stored: Stored): LinearTrackingView {
+  /** `relaxed` is a passive read: a record execution cannot depend on keeps its older confirmation. */
+  private view(stored: Stored, relaxed = false): LinearTrackingView {
     this.configuration(stored);
     const { issue } = stored;
     const view: LinearTrackingView = { status: "pending", ...(stored.checkedAt ? { checkedAt: stored.checkedAt } : {}),
       ...(issue ? { issue: { id: issue.id, identifier: issue.identifier, url: issue.url, title: issue.title, description: issue.description, state: { name: issue.state.name, type: issue.state.type }, updatedAt: issue.updatedAt } } : {}) };
     if (stored.blocked) return { ...view, status: "blocked", reason: stored.blocked };
+    // While a rate limit pauses every request, that pause is why a waiting record waits.
+    const waiting = (status: "pending" | "error", reason: string): LinearTrackingView => {
+      const retryAt = this.retryUntil > Date.now() ? Math.max(this.retryUntil, stored.retryAt) : 0;
+      return retryAt ? { ...view, status, reason: rateLimitReason(retryAt), retryAt: at(retryAt) } : { ...view, status, reason };
+    };
     if (stored.parentKey) {
-      const parent = this.records.get(stored.parentKey), gate = parent ? this.view(parent) : undefined;
-      if (!gate || gate.status !== "synced") return { ...view, status: gate?.status ?? "pending", reason: gate?.reason ?? "Waiting for the parent goal's Linear issue." };
+      const parent = this.records.get(stored.parentKey), current = !relaxed || this.gating(stored);
+      // A child that gates execution needs its goal's current confirmation, so it asks for one.
+      if (parent && current && !this.isFresh(parent)) this.clock(parent).readRequested = true;
+      const gate = parent ? this.view(parent, !current) : undefined;
+      if (gate?.status === "blocked") return { ...view, status: "blocked", reason: gate.reason };
+      if (!gate || gate.status !== "synced") return waiting(gate?.status === "error" ? "error" : "pending", gate?.reason ?? "Waiting for the parent goal's Linear issue.");
     }
-    if (stored.error) return { ...view, status: "error", reason: stored.error };
-    if (!this.isFresh(stored) || this.pendingComments(stored)) return { ...view, reason: "Waiting for Linear to confirm current requirements and execution evidence." };
+    if (stored.error) return waiting("error", stored.error);
+    if (!this.isFresh(stored, this.window(stored, relaxed)) || this.pendingComments(stored)) return waiting("pending", "Waiting for Linear to confirm current requirements and execution evidence.");
     return { ...view, status: "synced" };
   }
   start() {
@@ -319,10 +391,27 @@ export class LinearService {
     }
     const due = records.filter(stored => stored.issue && this.configuration(stored) && stored.retryAt <= Date.now() && !this.isFresh(stored)
       && (stored.blocked ? this.clock(stored).readRequested
-        : !stored.terminal || this.pendingComments(stored) || this.pendingLabel(stored) || this.pendingRetitle(stored) || this.clock(stored).readRequested || this.clock(stored).requested !== this.clock(stored).verified));
-    for (let index = 0; index < Math.min(due.length, 1000); index += 100) {
+        : this.gating(stored) || this.pendingComments(stored) || this.pendingLabel(stored) || this.pendingRetitle(stored) || this.clock(stored).readRequested || this.clock(stored).requested !== this.clock(stored).verified));
+    // A read holds up to 100 issues and, judged by their last copies, half the response limit.
+    const batches: Stored[][] = [];
+    let bytes = 0;
+    const size = (stored: Stored) => Buffer.byteLength(JSON.stringify(stored.issue)) + 256;
+    const fits = (stored: Stored) => batches.length > 0 && batches.at(-1)!.length < 100 && bytes + size(stored) <= maxResponseBytes / 2;
+    for (const stored of due) {
+      if (fits(stored)) batches.at(-1)!.push(stored); else { batches.push([stored]); bytes = 0; }
+      bytes += size(stored);
+    }
+    // A read costs one request whatever it holds, so a read that is due also confirms records past half their window
+    // while it has room. Records then expire together instead of each costing its own request.
+    const age = (stored: Stored) => Date.now() - Date.parse(stored.checkedAt!);
+    for (const stored of records.filter(value => value.issue && value.checkedAt && !value.blocked && value.retryAt <= Date.now() && !due.includes(value)
+      && age(value) > this.window(value, true) / 2).sort((a, b) => age(b) - age(a))) {
+      if (!fits(stored)) break;
+      batches.at(-1)!.push(stored); bytes += size(stored);
+    }
+    for (const batch of batches.slice(0, 10)) {
       if (this.closed) return;
-      const batch = due.slice(index, index + 100), generations = batch.map(stored => this.clock(stored).requested);
+      const generations = batch.map(stored => this.clock(stored).requested);
       try {
         const issues = await this.issues([...new Set(batch.map(stored => stored.issue!.id))]);
         if (this.closed) return;
@@ -341,7 +430,7 @@ export class LinearService {
     }
     for (const stored of records.filter(value => value.issue && !value.blocked && value.retryAt <= Date.now() && this.isFresh(value))) {
       if (this.closed) return;
-      if (this.pendingRetitle(stored) && Date.now() >= this.retryUntil) {
+      if (this.pendingRetitle(stored) && this.open()) {
         try { await this.applyRetitle(stored); }
         catch (error) {
           if (this.closed) return;
@@ -356,7 +445,7 @@ export class LinearService {
         }
         this.success(stored);
       } catch (error) { this.failure(stored, error); continue; }
-      if (this.pendingLabel(stored) && Date.now() >= this.retryUntil) {
+      if (this.pendingLabel(stored) && this.open()) {
         try { await this.applyLabel(stored); }
         catch (error) {
           if (this.closed) return;
@@ -452,7 +541,8 @@ export class LinearService {
   private async issues(ids: string[]) {
     const result = new Map<string, Issue>(); let after: string | undefined;
     for (let page = 0; page < 3; page++) {
-      const data = await this.graphql("InfiniteLinearIssues", `query InfiniteLinearIssues($filter: IssueFilter!, $first: Int!, $after: String) { issues(filter: $filter, includeArchived: true, first: $first, after: $after) { nodes { ${issueFields} } pageInfo { hasNextPage endCursor } } }`, { filter: { id: { in: ids } }, first: 100, ...(after ? { after } : {}) });
+      // Linear prices a connection by its page size, not by the nodes it returns, so ask for only as many as requested.
+      const data = await this.graphql("InfiniteLinearIssues", `query InfiniteLinearIssues($filter: IssueFilter!, $first: Int!, $after: String) { issues(filter: $filter, includeArchived: true, first: $first, after: $after) { nodes { ${issueFields} } pageInfo { hasNextPage endCursor } } }`, { filter: { id: { in: ids } }, first: Math.min(100, Math.max(1, ids.length)), ...(after ? { after } : {}) });
       const connection = z.object({ nodes: z.array(issueSchema).max(100), pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullable() }) }).parse(data.issues);
       for (const issue of connection.nodes) {
         if (!ids.includes(issue.id) || result.has(issue.id)) throw new LinearFailure();
@@ -499,12 +589,15 @@ export class LinearService {
     let token: string;
     try { token = readFileSync(api.apiKeyFile, "utf8").trim(); } catch { throw new LinearFailure(); }
     if (!token || token.length > 8192 || /\s/.test(token)) throw new LinearFailure();
+    const admission = await this.admit(shared);
     const controller = new AbortController(); this.requests.add(controller);
     const timeout = setTimeout(() => controller.abort(), 10000); timeout.unref();
     try {
       if (delivery) delivery.sent = true;
+      this.tally(1, 0);
       const response = await fetch(url, { method: "POST", redirect: "error", signal: controller.signal,
         headers: { Authorization: token, "Content-Type": "application/json" }, body: JSON.stringify({ operationName, query, variables }) });
+      const seen = this.observe(response, operationName);
       const reader = response.body?.getReader();
       if (!reader) throw new LinearFailure();
       const chunks: Buffer[] = []; let bytes = 0;
@@ -514,22 +607,132 @@ export class LinearService {
         if (bytes > maxResponseBytes) { await reader.cancel(); throw new LinearFailure(); }
         chunks.push(Buffer.from(value));
       }
-      const body = z.object({ data: z.record(z.string(), z.unknown()).nullable().optional(), errors: z.array(z.unknown()).optional() }).parse(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      let body: { data?: Record<string, unknown> | null; errors?: unknown[] } | undefined;
+      try { body = z.object({ data: z.record(z.string(), z.unknown()).nullable().optional(), errors: z.array(z.unknown()).optional() }).parse(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }
+      catch (error) { if (response.status !== 429) throw error; }
       // A complete answer below 500 means the mutation either ran (its result follows) or was refused; it cannot commit later.
-      if (delivery) delivery.answered = response.status < 500;
-      if (!response.ok || body.errors?.length || !body.data) {
-        const limited = response.status === 429 || body.errors?.some(error => z.object({ extensions: z.object({ code: z.literal("RATELIMITED") }) }).safeParse(error).success);
+      if (delivery && (body || response.status === 429)) delivery.answered = response.status < 500;
+      if (!response.ok || !body || body.errors?.length || !body.data) {
+        const limited = response.status === 429 || body?.errors?.some(error => z.object({ extensions: z.object({ code: z.literal("RATELIMITED") }) }).safeParse(error).success);
         if (limited) {
-          const resets = ["x-ratelimit-requests-reset", "x-ratelimit-endpoint-requests-reset", "x-ratelimit-complexity-reset"].map(name => Number(response.headers.get(name))).filter(value => Number.isFinite(value) && value > Date.now());
-          const retry = Number(response.headers.get("retry-after"));
-          const delay = Math.max(1000, ...resets.map(value => value - Date.now()), Number.isFinite(retry) ? retry * 1000 : 0);
-          if (shared) this.retryUntil = Date.now() + delay;
-          throw new LinearFailure(delay);
+          this.limitStreak++;
+          const wait = this.limitDelay(response, seen);
+          if (shared) { this.retryUntil = Math.max(this.retryUntil, Date.now() + wait.delay); this.recovering = true; }
+          this.limited(operationName, response, wait, shared);
+          throw new LinearFailure(wait.delay);
         }
+        this.answered(admission.probe);
         throw new LinearFailure();
       }
+      this.answered(admission.probe);
       return body.data;
     } catch (error) { throw error instanceof LinearFailure ? error : new LinearFailure(); }
-    finally { clearTimeout(timeout); this.requests.delete(controller); }
+    finally { clearTimeout(timeout); this.requests.delete(controller); admission.release(); }
+  }
+  /**
+   * After a shared rate limit, the first request to pass the pause is the only one in flight. Others wait for its answer:
+   * a new limit refuses them with the new pause, and an answer without a limit reopens normal traffic. An optional
+   * request never probes; it is refused until traffic reopens.
+   */
+  private async admit(shared: boolean): Promise<{ probe: boolean; release: () => void }> {
+    for (;;) {
+      if (this.closed) throw new LinearFailure();
+      if (Date.now() < this.retryUntil) throw new LinearFailure(this.retryUntil - Date.now());
+      if (!this.recovering) return { probe: false, release: () => {} };
+      if (!shared) throw new LinearFailure(fallbackPauseMs);
+      if (!this.probe) {
+        let done!: () => void;
+        this.probe = new Promise<void>(resolve => { done = resolve; });
+        return { probe: true, release: () => { this.probe = undefined; done(); } };
+      }
+      await this.probe;
+    }
+  }
+  /**
+   * A complete answer without a rate limit. Only the probe, sent after the pause began, can reopen normal traffic or
+   * end the fallback's growth; a request already in flight when the limit arrived proves nothing about the limit now.
+   */
+  private answered(probe: boolean) {
+    if (!probe && this.recovering) return;
+    this.limitStreak = 0;
+    this.recovering = false;
+  }
+  /**
+   * Retry-After, in seconds or as an HTTP date, is Linear's own deadline: no request goes before it (up to
+   * `maxRetryAfterMs`). Without it, the reset of each limit the response reports as spent, else the latest reset, read
+   * against the server's clock; Linear's limits refill continuously, so such a pause probes again after `maxPauseMs`.
+   * A limit with no usable time waits `fallbackPauseMs`, doubling while limits repeat, up to `maxPauseMs`.
+   */
+  private limitDelay(response: Response, { requests, complexity, endpoint, cost }: ReturnType<LinearService["observe"]>): RateLimitWait {
+    const retryAfter = response.headers.get("retry-after")?.trim();
+    const stated = !retryAfter ? undefined : /^\d{1,10}$/.test(retryAfter) ? Number(retryAfter) * 1000
+      : /[A-Za-z]/.test(retryAfter) && Number.isFinite(Date.parse(retryAfter)) ? Date.parse(retryAfter) - Date.now() - serverSkew(response) : undefined;
+    if (stated !== undefined) {
+      const delay = Math.min(maxRetryAfterMs, Math.max(1000, stated));
+      return { delay, basis: "retry-after", retryAfterSeconds: Math.ceil(delay / 1000) };
+    }
+    const families = [requests, complexity, endpoint].filter((value): value is LinearLimitView => Boolean(value?.resetAt));
+    const spent = families.filter(value => value.remaining !== undefined && (value.remaining <= 0
+      || value === complexity && cost !== undefined && value.remaining < cost));
+    const resets = (spent.length ? spent : families).map(value => Date.parse(value.resetAt!) - Date.now()).filter(value => value > 0);
+    if (resets.length) return { delay: Math.min(maxPauseMs, Math.max(1000, ...resets)), basis: "reset" };
+    return { delay: Math.min(maxPauseMs, fallbackPauseMs * 2 ** Math.min(this.limitStreak - 1, 4)), basis: "fallback" };
+  }
+  /** Keeps Linear's rate-limit headers from every response. Numbers and reset times only. */
+  private observe(response: Response, operation: string) {
+    const count = (name: string) => {
+      const value = response.headers.get(name)?.trim();
+      return value && /^\d{1,16}(?:\.\d{1,6})?$/.test(value) ? Number(value) : undefined;
+    };
+    // Linear states resets in epoch milliseconds; a value in epoch seconds is converted, anything else is ignored. The
+    // instant is moved onto this host's clock by the response's Date header, so a skewed clock does not shorten a pause.
+    const skew = serverSkew(response);
+    const family = (prefix: string): LinearLimitView | undefined => {
+      const limit = count(`${prefix}-limit`), remaining = count(`${prefix}-remaining`), raw = count(`${prefix}-reset`);
+      if (limit === undefined && remaining === undefined && raw === undefined) return undefined;
+      const reset = raw === undefined ? undefined : raw >= 1e12 && raw < 1e14 ? raw : raw >= 1e9 && raw < 1e11 ? raw * 1000 : undefined;
+      return { ...(limit !== undefined ? { limit } : {}), ...(remaining !== undefined ? { remaining } : {}),
+        ...(reset !== undefined ? { resetAt: new Date(reset - skew).toISOString() } : {}) };
+    };
+    const requests = family("x-ratelimit-requests"), complexity = family("x-ratelimit-complexity"), endpoint = family("x-ratelimit-endpoint-requests");
+    const cost = count("x-complexity"), name = response.headers.get("x-ratelimit-endpoint-name")?.trim(), observedAt = new Date().toISOString();
+    if (cost !== undefined) this.tally(0, cost);
+    if (!requests && !complexity && !endpoint && cost === undefined) return { requests, complexity, endpoint, cost };
+    this.limits = { observedAt, operation, ...(requests ? { requests } : {}), ...(complexity ? { complexity } : {}), ...(cost !== undefined ? { lastComplexity: cost } : {}),
+      ...(endpoint ? { endpoint: { ...endpoint, ...(name && /^[A-Za-z][A-Za-z0-9_.-]{0,99}$/.test(name) ? { name } : {}), observedAt } }
+        : this.limits?.endpoint ? { endpoint: this.limits.endpoint } : {}) };
+    return { requests, complexity, endpoint, cost };
+  }
+  private limited(operation: string, response: Response, { delay, basis, retryAfterSeconds }: RateLimitWait, shared: boolean) {
+    this.lastLimit = { at: new Date().toISOString(), operation, httpStatus: response.status,
+      ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}), waitSeconds: Math.ceil(delay / 1000), basis, shared };
+    // One journal line a minute at most: the evidence a later incident review needs, without the key or issue content.
+    if (Date.now() - this.limitLoggedAt < 60000) return;
+    this.limitLoggedAt = Date.now();
+    const limit = (label: string, value?: LinearLimitView) => value ? `${label} ${value.remaining ?? "?"}/${value.limit ?? "?"} left, resets ${value.resetAt ?? "unknown"}` : `${label} not reported`;
+    const sent = this.lastHour();
+    console.warn(`Linear rate limit on ${operation} (HTTP ${response.status}): ${shared ? "the host's Linear requests pause" : "this optional request backs off"} until ${at(Date.now() + delay)}. `
+      + `${limit("Requests", this.limits?.requests)}; ${limit("complexity", this.limits?.complexity)}${this.limits?.endpoint ? `; ${limit(`endpoint ${this.limits.endpoint.name ?? "limit"}`, this.limits.endpoint)}` : ""}. `
+      + `This host sent ${sent.requests} requests (${sent.complexity} complexity points reported) in the last hour.`);
+  }
+  /** Whether an optional request may go now: no pause and no probe still to answer. */
+  private open() { return Date.now() >= this.retryUntil && !this.recovering; }
+  private tally(requests: number, complexity: number) {
+    const minute = Math.floor(Date.now() / 60000);
+    while (this.usage.length && this.usage[0].minute <= minute - 60) this.usage.shift();
+    let bucket = this.usage.at(-1);
+    if (!bucket || bucket.minute !== minute) { bucket = { minute, requests: 0, complexity: 0 }; this.usage.push(bucket); }
+    bucket.requests += requests; bucket.complexity += complexity;
+  }
+  private lastHour() {
+    const minute = Math.floor(Date.now() / 60000), live = this.usage.filter(bucket => bucket.minute > minute - 60);
+    return { requests: live.reduce((sum, bucket) => sum + bucket.requests, 0), complexity: Math.ceil(live.reduce((sum, bucket) => sum + bucket.complexity, 0)) };
+  }
+  /** The bridge's request budget evidence for the status route. */
+  status(): LinearBridgeStatus {
+    const records = [...this.records.values()];
+    return { configured: Boolean(this.config.linear), records: { total: records.length, gating: records.filter(stored => this.gating(stored)).length },
+      sentLastHour: this.lastHour(), ...(this.limits ? { limits: structuredClone(this.limits) } : {}),
+      ...(this.retryUntil > Date.now() ? { pausedUntil: at(this.retryUntil) } : {}), ...(this.lastLimit ? { lastRateLimit: { ...this.lastLimit } } : {}) };
   }
 }

@@ -8,6 +8,7 @@ import { useKeyboardPadding } from "../../components/keyboard";
 import { Card, Chip, LiveStatus, ProgressBar, TopBar } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
 import { FloatingNotice } from "../../components/FloatingNotice";
+import { HaltBanner } from "../halt/HaltBanner";
 import { theme } from "../../theme";
 import { DictationNotice } from "../../dictation/DictationControls";
 import { useDictation } from "../../dictation/useDictation";
@@ -84,6 +85,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
           <Chip label={`Rev ${goal.revision}`} accessibilityLabel={`Revision ${goal.revision}`} />
         </View>
         {goal.linear?.reason ? <Text style={t.warning}>{goal.linear.reason}</Text> : null}
+        <HaltBanner connection={connection} place={{ projectIds: [goal.projectId] }} />
         {owns ? <View style={s.metaRow}>
           {goal.status === "paused" && !expired ? <Button compact busy={Boolean(request.pending?.label === "Resume" && request.busy)} glyph="play" title="Resume" disabled={!controls.resume || locked} onPress={() => send("resume", "Resume")} />
             : ["running", "needs-input"].includes(goal.status) ? <Button compact busy={Boolean(request.pending?.label === "Pause" && request.busy)} secondary glyph="pause" title="Pause" disabled={!controls.pause || locked} onPress={() => send("pause", "Pause")} /> : null}

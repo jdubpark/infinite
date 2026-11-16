@@ -209,6 +209,14 @@ test("codex sandbox values are reported unless they read as exactly read-only or
   assert.deepEqual(forbiddenLaunchFlags("codex", ["-s=workspace-write", "-c=sandbox_mode=read-only", "-c=model=gpt"]), []);
 });
 
+test("a codex permission-profile selection is reported unless it is a built-in profile the ceiling allows", () => {
+  // The ceiling clamps :danger-full-access to read-only (codex-cli 0.169.0), so a launch profile that selects it conflicts.
+  assert.deepEqual(forbiddenLaunchFlags("codex", ["-c", 'default_permissions=":danger-full-access"']), ['-c default_permissions=":danger-full-access"']);
+  // A custom profile can grant full-disk write, which the reader cannot see, so it is reported too.
+  assert.equal(forbiddenLaunchFlags("codex", ["--config=default_permissions=wide"]).length, 1);
+  assert.deepEqual(forbiddenLaunchFlags("codex", ["-c", 'default_permissions=":workspace"', "-c=default_permissions=':read-only'"]), []);
+});
+
 test("a configured bypass-permissions profile conflicts with the ceiling", () => {
   const lines = run({ launchArgs: ["--dangerously-skip-permissions"] });
   const profile = byCheck(lines, "profile");

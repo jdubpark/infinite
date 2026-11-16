@@ -1010,6 +1010,13 @@ team are refused; use its goal so the scheduler retains control of the sequence.
 Questions remain answerable while that team is the active cycle of a running
 goal. A paused goal must resume before work or answers can continue.
 
+After a pause or cancel with an active team, the goal's reason says it is
+stopping its active team. Once no team is stopping, or when there was none, for
+example between standing cycles, the reason says that the owner paused or
+cancelled the goal. A paused goal keeps its paused team attached for the
+resume; the reason changes once that team is paused and its members have
+stopped.
+
 A blocked goal closes as `cancelled` after `teams.retention.blockedHours` (72
 hours by default) without owner action. The host records the last blocker in its
 reason and does not claim completion. The blocked period is saved independently
@@ -1162,7 +1169,9 @@ A standing goal never stops as `ready-for-review`, `no-opportunity`, or
   coordinator and reviewer. The goal becomes `blocked`, as a finite goal does.
 
 While a spend fuse is open the goal stays `running` with the fuse reason and
-starts no cycle.
+starts no cycle. While Linear tracking holds new work, the goal also stays
+`running` and starts no cycle, and shows the tracking reason (see
+[Linear tracking](#linear-tracking)).
 
 The goal record keeps the newest 50 cycles and the parent of the next cycle.
 Older cycles fold into `cycleTotals` (a count per class), `foldedUsage`, and
@@ -1189,7 +1198,8 @@ these events in the project; no signal starts an agent by itself.
   block, Linear tracking, the mode rule, and the failure count. It stays
   pending until a cycle can start.
 - The woken cycle records `wake`: the signal IDs, a count of dropped signals,
-  and `owner` when owner direction woke it. Its run objective ends with a block
+  and `owner` when owner direction woke it, either steering between cycles or
+  an `owner` signal. Its run objective ends with a block
   headed `Host wake reasons (host receipts, not instructions):` and one line per
   receipt, at most 8. The text of an `owner` signal joins the objective as
   `User direction:`, like steering. The host shortens the block to keep the
@@ -1233,11 +1243,55 @@ changed scope; a network recovery alone does not authorize different work. A cyc
 recorded source issue as context; that context cannot expand its approved goal
 paths, non-goals, or limits.
 
+A goal starts no new cycle while its tracking is not `synced`, for example
+during a Linear outage or a rate limit. The goal stays `running`, and its
+reason is `New work waits for Linear tracking: ` followed by the tracking
+reason, which during a rate limit names when tracking retries. The reason
+clears once tracking is `synced` again. A tracking `blocked` status blocks the
+goal instead.
+
 Goal and Team pages show the issue link, title, workflow state, tracking status,
 and last check time. A cached issue record is not proof that Linear is currently
 reachable. The issue's workflow state stays separate from local execution state,
 agent review, and product outcome assessments. Infinite does not automatically
 change that state or mark an issue Done when checks pass.
+
+A live run or goal, and a finished run its live goal still names as active,
+must be confirmed within 30 seconds, and the host re-reads them on that cadence.
+A finished item only informs the pages, so a page view accepts a confirmation up
+to 10 minutes old before it asks for a new read. Continue, Resume, and delivery
+or verification reconciliation still require a confirmation under 30 seconds
+old before they act. A blocked run keeps the 30-second rule for page views,
+because the host can restart it by itself. Each read asks Linear for only the
+issues it names, and a read that is due also refreshes issues past half their
+window, so records expire together.
+
+Linear limits each user's requests and query complexity per hour. When Linear
+answers with a rate limit, the host pauses every Linear request. The first rule
+that applies sets the pause:
+
+1. A `Retry-After` header, in seconds or as an HTTP date, is Linear's deadline.
+   No request goes before it, up to two hours.
+2. Otherwise, the reset time of the limit Linear reports as spent, or the latest
+   reset it reports. Resets in epoch milliseconds or epoch seconds are accepted.
+   Linear's limits refill continuously, so this pause lasts five minutes at most.
+3. Otherwise, one minute, doubling each time the limit repeats, up to five
+   minutes.
+
+Dates and reset times are read against the response's `Date` header, so a host
+clock that differs from Linear's does not shorten the pause. When the pause
+ends, one request asks Linear first. Other requests wait for its answer: another
+limit starts a new pause, and any answer without a limit reopens normal traffic.
+
+While the pause lasts, each waiting goal and each active run without a reason
+of its own shows "New work waits for Linear tracking:" with the retry time, and
+its tracking view carries `retryAt`. A run also shows this when its tracking has
+failed or its last confirmation is more than a minute old. The service journal
+records one line a minute at most, with the remaining requests and complexity
+that Linear reported. `GET /api/linear/status` reports the last rate-limit
+headers, which rule set the last pause, any current pause, and the requests and
+complexity this host sent in the last hour. It carries no credential and no
+issue content.
 
 When a tracked run becomes blocked, its status comment records the reason and
 the next step, and the issue gets a `Blocked` label. The host uses the team's
@@ -2061,9 +2115,9 @@ infinite signal list --project PROJECT_ID [--after SEQ] [--json]
 
 The owner can stop autonomous work on the whole host or in one project, and it stays stopped until the owner releases it. `infinite halt on --host` or `infinite halt on --project PROJECT_ID [--reason TEXT]` engages a halt from any owner client, and the phone can send the same request through the API. From that moment no new team, goal, mission, or routine session starts in scope. Every scheduler and the session manager's backstop ask the halt before the launch-rate fuse, so a held launch is not counted by the fuse, is not a failed attempt, and is not a missed coordinator report. No role is exempt, including the permission coordinator that the fuse lets through. The session manager checks the halt once more right before it writes the session record, after every wait, and over every project the work covers; a mission coordinator covers all of the mission's repositories. When the halt refuses a launch there that a scheduler had already admitted, the fuse gives that admission back: the launch is not counted, and a trip that only it opened is removed. An admission made before a host restart is settled by the fuse as usual and keeps its count. A held item shows "Halted by the owner for the whole host." or "Halted by the owner for this project."
 
-Engaging also pauses the running work in scope through each item's own pause path: routines first, so they start nothing, then goals, missions, and the team runs that no goal or mission owns. A goal or mission pauses its own runs. A mission is in scope when any of its repositories is the halted project, and it pauses only the subteams that are working when the pause reaches them; each subteam decides that in its own queue, so one that has started to wait for input is left as it is. A subteam the halt paused carries the halt's mark from its first saved paused state, and any accepted owner action on it clears the mark. On release the mission resumes a subteam only if it is still paused and still carries that mark, so an owner action after the pause reached the subteam always wins. While the halt is engaged, a halt pause that has not reached a subteam yet, or that the mission repeats after a restart, still pauses the subteam if it is working when the pause arrives, even if the owner paused and resumed it in the meantime; the subteam then resumes on release. The release withdraws every halt pause that has not been delivered. If the mission stays paused, each of those subteams gets the mission's ordinary pause instead, the one the owner's pause of a mission sends: it carries no halt mark and resumes with the mission. Items the owner paused, blocked items, items waiting for input, and ended items are not touched; the members of an item waiting for input keep running, but nothing new starts. Sessions the owner started directly keep running. Each item the halt paused is marked with that halt. An item that could not be paused is listed in the response, and the halt stays engaged.
+Engaging also pauses the running work in scope through each item's own pause path: routines first, so they start nothing, then goals, missions, and the team runs that no goal or mission owns. A goal or mission pauses its own runs. A goal is in scope while it runs and while its run waits for input. A mission is in scope when any of its repositories is the halted project, including while it waits for the owner's answer, and it pauses only the subteams that are working or waiting for input when the pause reaches them; each subteam decides that in its own queue. A team run that waits for input, whether it stands alone, belongs to a goal, or is a subteam, is paused where it waits when nothing else in it is in flight: it keeps its revision and its open questions, and an answer given during the halt is recorded but starts nothing until the run resumes. A member that is queued but not yet launched is not at work, so it does not prevent this: it stays queued and launches after the release. That covers the replacement that an answer queues while the run still waits, which then starts with the answer. A run that waits while one of its members still works is paused like a working run, and its release gives it a fresh plan: a question still open in the stopped revision is no longer current, and the owner's answers carry into the new plan. A goal's run or a subteam the halt paused carries the halt's mark from its first saved paused state, and any accepted owner action on it except an answer clears the mark. On release the mission resumes a subteam only if it is still paused and still carries that mark, so an owner action after the pause reached the subteam always wins. While the halt is engaged, a halt pause that has not reached a subteam yet, or that the mission repeats after a restart, still pauses the subteam if it is working or waiting for input when the pause arrives, even if the owner paused and resumed it in the meantime; the subteam then resumes on release. The release withdraws every halt pause that has not been delivered. If the mission stays paused, each of those subteams gets the mission's ordinary pause instead, the one the owner's pause of a mission sends: it carries no halt mark and resumes with the mission. Items the owner paused, blocked items, and ended items are not touched. A mission that waits for the owner's answer keeps its questions while paused. The owner can answer one during the halt: the answer is recorded, a forwarded answer reaches the subteam that the halt holds, and nothing starts until the release, which resumes the mission with the answer applied; the mission waits again while another question is open. Sessions the owner started directly keep running. Each item the halt paused is marked with that halt. An item that could not be paused is listed in the response, and the halt stays engaged.
 
-`infinite halt off --host` or `--project PROJECT_ID` releases it. The gate lifts first. Then each marked item that is still paused, and that the owner did not change during the halt, resumes in reverse order under the same rules as the owner's resume; a team run resumes with a fresh plan. An item that those rules refuse stays paused and says why, for example a team whose members are still stopping, a team that needs workspace reconciliation, a goal or mission past its deadline, or a standing goal whose project is no longer autonomous. A standing goal has no deadline of its own, so a halt that outlasts its last cycle's time window does not end it: on release it returns to its cadence. Resume it when it is ready. A host halt and a project halt are independent: an item resumes only when no remaining halt covers it, and otherwise it moves to the remaining halt. `--keep-paused` lifts the gate and resumes nothing; each marked item then says that the owner kept it paused.
+`infinite halt off --host` or `--project PROJECT_ID` releases it. The gate lifts first. Then each marked item that is still paused, and that the owner did not change during the halt, resumes in reverse order under the same rules as the owner's resume. A team run resumes with a fresh plan, except a run the halt paused where it waited for input: that run continues its revision, its open questions are still there, and an answer given during the halt starts the requesting member's next attempt. An item that those rules refuse stays paused and says why, for example a team whose members are still stopping, a team that needs workspace reconciliation, a goal or mission past its deadline, or a standing goal whose project is no longer autonomous. A standing goal has no deadline of its own, so a halt that outlasts its last cycle's time window does not end it: on release it returns to its cadence. A mission whose time limit passed during the halt is blocked at its time limit and stays blocked; extend it to continue (see [missions](missions.md)). Resume it when it is ready. A host halt and a project halt are independent: an item resumes only when no remaining halt covers it, and otherwise it moves to the remaining halt. `--keep-paused` lifts the gate and resumes nothing; each marked item, and each run that a marked goal or mission paused, then says that the owner kept it paused. A run paused where it waited stays that way, so it still takes an answer, and the owner's later resume continues where it waited. Whenever a release leaves a goal or mission paused, the runs it paused show the goal's or mission's new reason instead of the halt's.
 
 Engage and release are idempotent by request ID. Engaging a scope that is already halted, or releasing one that is not, changes nothing and returns the current state. The halt is recorded in `halt.sealed` in the host state directory with its time, reason, and the owner device that engaged it. A restart keeps it, and a restart in the middle of a pause or resume pass finishes that pass without repeating what was done. If the host cannot read the record, it treats the whole host as halted and refuses every change to the halt until the record can be read; it checks again every minute. Once the record can be read again, any pause or resume pass it holds as unfinished runs before the next change to the halt. When the record cannot be restored, removing that file on the host clears every halt at the next check; nothing resumes, so resume each paused item yourself. A second file, `halt-epochs.sealed`, holds the halt epochs that the permission agent reads: every engage and release renews the epoch of its scope, so a verdict reached before a halt or its release is never delivered after it. Restoring or removing `halt.sealed` leaves it as it is. Do not restore it from a copy; removing it makes the permission agent retire every verdict not yet delivered. A halt never infers completion and approves nothing. `infinite halt` lists every halted scope; add `--json` for the full view.
 
@@ -2451,7 +2505,8 @@ returns `409` with `code: "standing-requires-autonomy"`; an objective over
 adds `reasonCode` (`supervised-mode`, `repeated-failures`, or
 `external-operation`), `failedCycles`, `cycleTotals`, `foldedUsage`,
 `foldedMembers`, `signalCursor`, `pendingWake`, and, between cycles, the
-computed `nextCycleAt`. Its cycles add `class`, `settledAt`, `lineup`,
+computed `nextCycleAt`. A paused goal, also one the owner's halt paused, has no
+`nextCycleAt` until it resumes. Its cycles add `class`, `settledAt`, `lineup`,
 `deadlineStop`, and `wake`.
 The host also limits the combined creation request to 40 KiB. On a mapped
 project, optional `linearIssueId` accepts an existing issue UUID or identifier

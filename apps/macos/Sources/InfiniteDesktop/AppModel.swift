@@ -126,6 +126,10 @@ struct TeamResumeFailure: Equatable {
     /// The last board poll succeeded; otherwise Home says why its rows may be old.
     @Published private(set) var boardFresh = false
     @Published private(set) var boardError = ""
+    /// The owner's halt as the host last reported it. A failed poll keeps the last report.
+    @Published private(set) var halt = HaltView.clear
+    /// After the host refuses the halt route (an older host, or a remote channel without it), the next ask waits a minute.
+    private var haltRetryAt = Date.distantPast
     @Published var pendingMissionCreation = DraftRecord()
     var missionModels: [String: MissionModel] = [:]
     @Published var showingCreateTeam = false
@@ -276,6 +280,7 @@ struct TeamResumeFailure: Equatable {
         connected = false; connecting = true; sessions = []; resources = .null; me = .null
         teams = []; selectedTeamID = nil; selectedMissionID = nil; teamOpenedFrom = nil; projectFilter = nil; showingHome = true; teamModels.removeAll(); teamResumeFailures = [:]; teamsFresh = false
         projectGroups = .empty; board = .empty; boardFresh = false; boardError = ""; missionModels.removeAll(); cost = nil
+        halt = .clear; haltRetryAt = .distantPast
         showingUnderstanding = false; understandingWorkspaceID = nil
         sessionsLoaded = false; teamsLoaded = false
         sessionFreshness.recovered(); teamFreshness.recovered()
@@ -326,6 +331,8 @@ struct TeamResumeFailure: Equatable {
                 }
             }
             if selectedID == nil { selectedID = (sessions.first { $0.running } ?? sessions.first)?.id }
+            await refreshHalt(generation, visibility)
+            guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
             if teamsEnabled || !teams.isEmpty { await refreshTeams(generation, visibility) }
             guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
             await refreshBoard(generation, visibility)
@@ -373,6 +380,21 @@ struct TeamResumeFailure: Equatable {
             guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
             if teamsFresh { teamsFresh = false }
             teamFreshness.failed()
+        }
+    }
+    /// The halt arrives whole each poll; only a real change redraws. A failed read keeps the last report; a refused
+    /// route shows no halt, since the host offers none to this app, and is asked again a minute later.
+    private func refreshHalt(_ generation: UUID, _ visibility: UUID) async {
+        guard Date() >= haltRetryAt, displayVisible, generation == connectionGeneration, visibility == displayGeneration, let client else { return }
+        do {
+            let next = HaltView(try await client.request("/halt"))
+            guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
+            if next != halt { halt = next }
+        } catch {
+            guard generation == connectionGeneration, let refusal = error as? DesktopError,
+                  refusal.status == 404 || refusal.code == "remote-endpoint-denied" else { return }
+            haltRetryAt = Date().addingTimeInterval(60)
+            if halt != .clear { halt = .clear }
         }
     }
     /// Projects and the board arrive whole each poll; only a real change redraws.

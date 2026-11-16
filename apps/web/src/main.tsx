@@ -46,6 +46,8 @@ import { MissionPage, clearMissionRequests } from "./missions";
 import { CostPage, CostPicker } from "./cost";
 import { PermissionDetail, PermissionOverview, PermissionPicker, clearPermissionRequests, decisionLogAvailable } from "./permissions";
 import { SwarmView } from "./swarm/SwarmView";
+import { haltNotice, type HaltPlace, type HaltView } from "./halt";
+import { HaltBanner } from "./halt-banner";
 import "./style.css";
 
 const time = (value: string) =>
@@ -74,6 +76,7 @@ function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [teams, setTeams] = useState<TeamView[]>([]);
   const [goals, setGoals] = useState<ProductGoal[]>([]);
+  const [halt, setHalt] = useState<HaltView | null>(null);
   const route = useSessionLocation(machines.active.id);
   const selected = route.id, creating = route.creating;
   const [bootstrapError, setBootstrapError] = useState(false);
@@ -106,6 +109,11 @@ function App() {
     const data = await api<{ goals: ProductGoal[] }>("/goals");
     if (current()) setGoals(data.goals.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
   }, 1800, me?.goals ? me : null);
+  // A failed read keeps the last received halt, so the banner never drops out for one missed poll.
+  const haltFeed = useLiveRefresh(async current => {
+    const view = await api<HaltView>("/halt");
+    if (current()) setHalt(view);
+  }, 1800, me);
   const connected = host.fresh;
   const lastSeen = host.seen;
   async function login(event: React.FormEvent) {
@@ -178,6 +186,13 @@ function App() {
       </main>
     );
   const active = sessions.filter((s) => s.status === "running").length;
+  // A session, team, or goal screen shows the halt on its project; every other screen lists project halts compactly.
+  const screenProject = selected ? sessions.find(session => session.id === selected)?.projectId
+    : route.teamId ? teams.find(team => team.id === route.teamId)?.projectId
+      : route.goalId ? goals.find(goal => goal.id === route.goalId)?.projectId
+        : route.costProjectId;
+  const haltPlace: HaltPlace = selected || route.teamId || route.goalId || route.costProjectId ? { projectIds: screenProject ? [screenProject] : [] } : "overview";
+  const projectName = (id: string) => me.projects.find(project => project.id === id)?.name ?? id;
   // The Swarm view is the landing page: it fills the main area at the root route and at #/swarm.
   const permissionsShown = route.permissions && decisionLogAvailable(me);
   const swarmShown = route.swarm || !(selected || creating || route.teams || route.goals || route.missionId || route.cost || permissionsShown);
@@ -199,6 +214,7 @@ function App() {
           <button aria-current={route.goals ? "page" : undefined} onClick={() => route.navigateGoal(null)}><Target size={16} />Goals</button>
           {me.usage?.enabled && <button aria-current={route.cost ? "page" : undefined} onClick={() => route.navigateCost()}><Coins size={16} />Cost</button>}
         </nav>
+        <HaltBanner className="halt-rail" compact notice={haltNotice(halt, "overview")} name={projectName} owner={me.role === "owner"} />
         <div className="rail-heading">
           <h2>
             {permissionsShown ? "Permission decisions" : route.cost ? "Projects by cost" : <>{route.goals ? "Goals" : route.teams ? "Teams" : "Sessions"} <span>{route.goals ? goals.length : route.teams ? teams.length : sessions.length}</span></>}
@@ -285,7 +301,7 @@ function App() {
             </strong>
           </div>
           <div className="refresh-status">
-          <button className="text-button" onClick={() => { host.refresh(); if (me.teams) teamFeed.refresh(); if (me.goals) goalFeed.refresh(); }} disabled={host.refreshing} aria-busy={host.refreshing}>
+          <button className="text-button" onClick={() => { host.refresh(); haltFeed.refresh(); if (me.teams) teamFeed.refresh(); if (me.goals) goalFeed.refresh(); }} disabled={host.refreshing} aria-busy={host.refreshing}>
             <RefreshCw className={host.refreshing ? "is-refreshing" : ""} size={14} /> Refresh
           </button>
           <span className={`connection ${connected ? "" : "offline"}`}>
@@ -299,6 +315,7 @@ function App() {
             {host.seen ? "This device is offline or the host is unreachable. Showing the last received state. Work may still be running; controls are disabled until a fresh connection arrives." : "Can’t reach the host. Sessions haven’t loaded; controls are disabled until a fresh connection arrives."}
           </div>
         )}
+        <HaltBanner className="halt-main" notice={haltNotice(halt, haltPlace)} name={projectName} owner={me.role === "owner"} />
         {route.missionId ? <MissionPage key={route.missionId} id={route.missionId} me={me} connected={connected} openTeam={route.navigateTeam} /> : route.swarm ? swarm : permissionsShown ? (route.decisionId ? <PermissionDetail key={route.decisionId} id={route.decisionId} me={me} openSession={route.navigate} onSelect={route.navigatePermissions} /> : <PermissionOverview onSelect={route.navigatePermissions} />) : route.cost ? <CostPage me={me} view={route.costView} projectId={route.costProjectId} navigate={route.navigateCost} /> : route.creatingGoal ? <GoalCreate me={me} connected={connected} done={id => { goalFeed.refresh(); route.navigateGoal(id); }} /> : route.goalId ? <GoalDetail key={route.goalId} id={route.goalId} me={me} connected={connected} teams={teams} teamsStale={teamFeed.stale} refreshGoals={goalFeed.refresh} openTeam={route.navigateTeam} /> : route.goals ? <GoalList goals={goals} me={me} fresh={goalFeed.fresh} stale={goalFeed.stale} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} failed={goalFeed.failed} seen={goalFeed.seen} onCreate={route.createGoal} onSelect={route.navigateGoal} /> : route.creatingTeam ? <TeamCreate me={me} connected={connected} done={id => { teamFeed.refresh(); route.navigateTeam(id); }} /> : route.teamId ? <TeamDetail key={route.teamId} id={route.teamId} me={me} connected={connected} sessions={sessions} refreshTeams={teamFeed.refresh} openSession={route.navigate} /> : route.teams ? <TeamList teams={teams} me={me} fresh={teamFeed.fresh} stale={teamFeed.stale} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} failed={teamFeed.failed} seen={teamFeed.seen} onCreate={route.createTeam} onSelect={route.navigateTeam} refresh={teamFeed.refresh} openCost={() => route.navigateCost()} /> : creating ? (
           <Create
             me={me}

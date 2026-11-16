@@ -34,6 +34,7 @@ import { DictationNotice } from "../../dictation/DictationControls";
 import { useDictation } from "../../dictation/useDictation";
 import { ROLE_NAMES } from "../teams/model";
 import { MissionManagedLine } from "../board/MissionManagedLine";
+import { HaltBanner } from "../halt/HaltBanner";
 import { Conversation } from "./Conversation";
 import { Files } from "./Files";
 import { Lifecycle } from "./Lifecycle";
@@ -231,6 +232,7 @@ export function Brief({
               {toolsOn} · {online ? seen : seen ? `cached ${seen}` : "waiting…"}
             </Text>
             {tools ? <Text style={s.small} numberOfLines={1}>{tools}</Text> : null}
+            <HaltBanner connection={connection} place={{ projectIds: session.projectId ? [session.projectId] : [] }} style={s.halt} />
           </View>
           <ScrollView
             style={s.fill}
@@ -364,6 +366,7 @@ const s = StyleSheet.create({
   small: { fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk },
   empty: { padding: 30, gap: 15, alignItems: "center" },
   head: { paddingHorizontal: 16, paddingBottom: 6, gap: 5 },
+  halt: { marginTop: 3 },
   title: { fontSize: 21, lineHeight: 26, fontWeight: "600", color: theme.colors.ink, letterSpacing: -0.4 },
   chips: { flexDirection: "row", flexWrap: "wrap", gap: 5 },
   scrollBody: { paddingHorizontal: 16, paddingTop: 4, paddingBottom: 16, gap: 8 },

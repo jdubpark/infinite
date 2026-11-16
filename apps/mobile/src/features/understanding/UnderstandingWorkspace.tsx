@@ -7,12 +7,15 @@ import { Chip, LiveStatus, Segmented, type SegmentOption, TopBar } from "../../c
 import { Glyph } from "../../components/Icon";
 import type { UnderstandingRepository, UnderstandingWork, WorkspaceUnderstanding } from "@infinite/remote";
 import { theme } from "../../theme";
+import { HaltBanner } from "../halt/HaltBanner";
 import { KnowledgePanel } from "./KnowledgePanel";
 import { SystemOverview } from "./SystemOverview";
 import { clearUnderstandingSummary, readUnderstandingSummary, saveUnderstandingSummary } from "./offline-cache";
 
 type ViewMode = "work" | "system";
 type ReadResult = { scope: string; state: "ready" | "missing" | "upgrade" | "denied"; groupName: string; data?: WorkspaceUnderstanding; error?: string; cachedAt?: string };
+
+type Checkout = { projectId: string; name: string };
 
 const views: SegmentOption<ViewMode>[] = [
   { value: "work", label: "Work", glyph: "stack" },
@@ -31,14 +34,28 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
   const stopped = useRef("");
   const last = useRef<ReadResult | null>(null);
   const [view, setView] = useState<ViewMode>(params.view === "system" ? "system" : "work");
+  // The checkouts from the last successful workspace list, for the halt banner. They are kept apart from the brief,
+  // so a project halt still shows when the brief read fails after the list succeeded.
+  const [membership, setMembership] = useState<{ scope: string; checkouts: Checkout[] }>();
+  // Each list read takes a ticket before it starts; an answer may replace only an older read's membership, so a
+  // request that outlived a refocus or a pairing change cannot restore checkouts a newer read replaced.
+  const membershipIssued = useRef(0);
+  const membershipApplied = useRef(0);
 
   const poll = usePoll(async () => {
     if (stopped.current === scope && last.current?.scope === scope) return last.current;
+    const ticket = ++membershipIssued.current;
+    const keepMembership = (checkouts: Checkout[]) => {
+      if (ticket < membershipApplied.current) return;
+      membershipApplied.current = ticket;
+      setMembership({ scope, checkouts });
+    };
     let confirmedGroupName = "";
     try {
       const groups = await api<ProjectGroupList>(connection, "/project-groups");
       const group = groups.groups.find(candidate => candidate.id === workspaceId);
       if (!group) {
+        keepMembership([]);
         await clearUnderstandingSummary(connection, workspaceId);
         const result: ReadResult = { scope, state: "missing", groupName: "", error: "This workspace is no longer available on this machine." };
         last.current = result;
@@ -46,6 +63,7 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
         return result;
       }
       confirmedGroupName = group.name;
+      keepMembership(group.repos.flatMap(repo => repo.checkouts.map(({ projectId, name }) => ({ projectId, name }))));
       const data = await api<WorkspaceUnderstanding>(connection, `/project-groups/${encodeURIComponent(workspaceId)}/understanding`);
       if (data.schemaVersion !== 1 || data.workspace.id !== workspaceId) {
         const result: ReadResult = { scope, state: "upgrade", groupName: group.name, error: "This host returned an unsupported Understanding version." };
@@ -90,6 +108,7 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
   const data = result?.state === "ready" ? result.data : undefined;
   const repoById = new Map(data?.repositories.map(repo => [repo.id, repo]) ?? []);
   const groupName = result?.groupName || data?.workspace.name || "Workspace";
+  const checkouts = membership?.scope === scope ? membership.checkouts : [];
   const back = () => router.canGoBack() ? router.back() : router.replace({ pathname: "/(tabs)/understanding", params: { ...(params.machine ? { machine: params.machine } : {}) } });
   const revealKnowledge = (anchor: View | null) => {
     requestAnimationFrame(() => {
@@ -102,6 +121,7 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
   return <View style={s.fill}>
     <TopBar backLabel="Understand" onBack={back} title={groupName} right={<LiveStatus online={poll.online && result?.state === "ready" && !result.cachedAt} loading={poll.loading} seen={poll.seen} stale={poll.stale} />} />
     <Segmented options={views} value={view} onChange={setView} style={s.segment} />
+    <HaltBanner connection={connection} place={{ projectIds: checkouts.map(checkout => checkout.projectId) }} names={id => checkouts.find(checkout => checkout.projectId === id)?.name} style={s.halt} />
     <ScrollView ref={scroll} contentContainerStyle={s.content} keyboardShouldPersistTaps="handled"
       refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={() => { stopped.current = ""; poll.refresh(); }} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <View ref={content}>
@@ -209,6 +229,7 @@ function date(value: string) { const parsed = new Date(value); return Number.isN
 const s = StyleSheet.create({
   fill: { flex: 1, backgroundColor: theme.colors.paper },
   segment: { marginHorizontal: 16, marginBottom: 6 },
+  halt: { marginHorizontal: 16, marginBottom: 4 },
   content: { paddingHorizontal: 16, paddingTop: 10, paddingBottom: 36 },
   stack: { gap: 12 },
   intro: { fontSize: 13, lineHeight: 19, color: theme.colors.secondaryInk },

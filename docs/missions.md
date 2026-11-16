@@ -285,21 +285,57 @@ subteam. The deadline stops the coordinator and active subteams like a team
 deadline. Coordinator and subteam sessions are read-only to people; provider
 permission prompts continue to go to the owner or a delegated coordinator.
 
-The owner's [halt](teams.md#halt) pauses a `planning` or `working` mission when
+The owner's [halt](teams.md#halt) pauses a `planning`, `working`, or `needs-input` mission when
 any of its repositories is in the halted scope, as the owner's pause does, and
 holds every new coordinator and subteam launch in scope. The mission shows the
-halt as its reason. It pauses only the subteams that are working when the pause
-reaches them; a subteam that waits for input stays as it is. A release resumes the
-mission unless the owner acted on it during the halt or its deadline has passed,
-in which case it stays paused and says why. The mission then resumes only the
-subteams that the halt paused and that nobody has acted on since. An owner
-action on a subteam takes precedence once the halt's pause has reached it; a
-pause still on its way, or repeated after a restart, pauses a working subteam
-even if the owner acted on it in the meantime. The release withdraws every halt
+halt as its reason. It pauses only the subteams that are working or waiting for
+input when the pause reaches them. A subteam that waits for input, with nothing
+else in flight, is paused where it waits: it keeps its question, and an answer
+given during the halt is kept until it resumes. A release resumes the mission
+unless the owner acted on it during the halt or its deadline has passed, in
+which case it stays paused and says why. An answer or an extension during the
+halt does not count as such an action. Each subteam the halt paused then shows
+the mission's new reason, not the halt's; so does each one after a release that
+keeps the mission paused. When the mission resumes, it resumes only the
+subteams that the halt paused and that nobody has acted on since; a subteam
+paused where it waited continues where it waited. An answer is not such an
+action. Any other owner action on a subteam takes precedence once the halt's
+pause has reached it; a pause still on its way, or repeated after a restart,
+pauses a working or waiting subteam even if the owner acted on it in the
+meantime. The release withdraws every halt
 pause not yet delivered, and a mission that stays paused sends its ordinary
-pause in its place, as the owner's pause of a mission does. A `needs-input` mission is
-not paused, but no coordinator attempt starts while any of its repositories is
-halted, and no subteam starts in a halted repository.
+pause in its place, as the owner's pause of a mission does. A `needs-input`
+mission keeps its questions while paused. The owner can answer one during the
+halt: the answer is recorded and, for a forwarded question, reaches the subteam
+that the halt holds, but nothing starts. The release resumes the mission with
+the answer applied, and the mission waits again while another question is open.
+No coordinator attempt starts while any of its repositories is halted, and no
+subteam starts in a halted repository. A connector cannot resume a mission the
+halt paused, or one a halt covers: the halt is the owner's stop, and delegated
+agent input cannot undo it. A connector can still cancel such a mission.
+
+The halt does not stop a mission's time limit, except as a pause does: an intake
+mission's clock stops while it is paused, and any other mission keeps its
+deadline. When the deadline passes during the halt, the mission is blocked at
+its time limit and nothing is unpaused. The release leaves it blocked and
+resumes none of its subteams; each subteam the halt paused shows the time limit
+instead of the halt. The owner can extend the time limit during the halt. The
+deadline moves at once, but the subteams stay paused: a mission the halt paused
+resumes them on release, and the resumes that an extension of a blocked mission
+queues wait until no halt covers any of its repositories. Every subteam resume
+waits while its mission is paused, blocked at its time limit, or halted, and a
+later pause of the mission withdraws it. When the owner's resume or extension
+then withdraws that pause before it arrives, every subteam that is paused at
+that moment still gets a resume, so the withdrawn resume does not leave it
+paused. A halt that engages before an earlier
+halt's resume reaches a subteam holds that resume: its own release lets the
+subteam continue, or, if the mission stays paused, retires the resume and shows
+the mission's reason on the subteam. The same holds when the owner's pause or
+the time limit supersedes a release's resume before it reaches its subteam,
+even during a later halt: once no halt holds the mission, the subteam keeps its
+pause and shows the mission's reason, and the owner's resume or extension
+continues it. If the owner resumes the mission before that pause arrives, the
+subteam resumes as the halt paused it.
 
 Status honesty: `ready-for-review` means the coordinator reported a result after
 every subtask finished. It does not establish product impact or acceptance. Each
@@ -360,7 +396,15 @@ failed resume, as above, or when one of these rules holds:
 A new conversation, whether from a rotation or a failed resume, receives the
 full prompt, the coordinator's stored notes under a heading that marks them as its own earlier words rather than host
 facts, the open follow-ups in the mission state, and the pending messages. No
-extra model turn is spent on the switch. A rotation is not a missed report and
+extra model turn is spent on the switch. Direction that earlier attempts
+already received, from the owner or a connector, is listed under a heading that
+says so, each item named by its source. It still applies, and
+receiving it does not mean it was carried out: the coordinator checks its notes,
+refused reports, and the mission state, does not repeat what they show was done,
+and continues what is unresolved. Direction that no attempt has received is
+listed under its own heading only when its message is in this attempt; one
+still queued behind the message limit or the prompt budget is listed when its
+message arrives. The direction text is unchanged. A rotation is not a missed report and
 does not count toward the three-refusal block. The host records a mission event
 that names the rule.
 

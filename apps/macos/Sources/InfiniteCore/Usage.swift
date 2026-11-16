@@ -365,7 +365,13 @@ extension RemoteClient {
     }
     public func usageProjects(tz: String) async throws -> UsageProjects { try await request("/usage/projects" + Self.query([("tz", tz)])).decoded() }
     public func usageProject(_ id: String, tz: String) async throws -> ProjectUsage {
-        try await request("/usage/projects/" + (id.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? id) + Self.query([("tz", tz)])).decoded()
+        try await request(Self.usageProjectPath(id, tz: tz)).decoded()
+    }
+    /// `GET /api/usage/projects/:id`. Host project IDs keep their hyphens, which the remote channel requires.
+    static func usageProjectPath(_ id: String, tz: String) -> String { "/usage/projects/" + pathSegment(id) + query([("tz", tz)]) }
+    /// The remote channel refuses percent-encoded paths, so an ID in a path keeps the ASCII characters host IDs use.
+    static func pathSegment(_ id: String) -> String {
+        id.addingPercentEncoding(withAllowedCharacters: CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")) ?? id
     }
     public func usageModels(role: String? = nil) async throws -> Scorecard { try await request("/usage/models" + Self.query([("role", role)])).decoded() }
     /// Owner only; the host re-reads the balance at most once a minute.
@@ -377,10 +383,8 @@ extension RemoteClient {
     /// Returns every account as the host now sees it; a refused value arrives as the host's error text.
     public func setPlan(account: String, planUsd: Double?) async throws -> [AccountView] {
         struct Reply: Decodable { var accounts: [AccountView] }
-        // The remote channel refuses percent-encoded paths, so keep the ASCII characters account IDs use.
-        let id = account.addingPercentEncoding(withAllowedCharacters: CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")) ?? account
         let body: JSON = .object(["planUsd": planUsd.map { .number($0) } ?? .null])
-        return try await request("/usage/accounts/" + id + "/plan", body: body, method: "PUT").decoded(Reply.self).accounts
+        return try await request("/usage/accounts/" + Self.pathSegment(account) + "/plan", body: body, method: "PUT").decoded(Reply.self).accounts
     }
     /// Owner only, idempotent per `requestID`. Returns the host's updated team view.
     public func rateTask(team: String, task: String, score: Int, note: String? = nil, requestID: String) async throws -> JSON {

@@ -24,7 +24,7 @@ import { applyFuseReason, workLaunch } from "./fuse/rules.js";
 import type { FuseAdmission, FuseCheck, FuseGate } from "./fuse/types.js";
 import type { CaptureSink } from "./eval-types.js";
 import { captureStart } from "./eval-rules.js";
-import { HALT_RUNNING_TEAM, KEPT_PAUSED, LEFT_AS_IS, STILL_HALTED, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
+import { HALT_PAUSED_TEAM, KEPT_PAUSED, LEFT_AS_IS, STILL_HALTED, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 import type { EventOutbox, OutboxEvent } from "./evidence/outbox.js";
 import type { Blackboard } from "./evidence/blackboard.js";
 import { canonicalJson } from "./evidence/crypto.js";
@@ -160,9 +160,12 @@ type Stored = {
   /**
    * Set when the owner's halt paused this run: its id, and the reason the paused run shows. A release resumes the run
    * only under that id. Any accepted owner request clears it. After a release that could not resume the run, only the
-   * reason stays. For a mission's subteam the id is the token of the mission's halt, and only the mission resumes it.
+   * reason stays. For a goal's or mission's run the id is the token of its owner's halt, and only that owner resumes it.
+   * `waiting` marks a run the halt held where it waited for input, with nothing in flight: it keeps its revision, an
+   * answer is recorded without starting anything, and a resume continues that revision instead of planning afresh.
+   * The owner's pause and every other owner request except an answer clear the whole mark.
    */
-  ownerHalt?: { haltId?: string; reason: string };
+  ownerHalt?: { haltId?: string; reason: string; waiting?: true };
   /**
    * Coordinator answers that a worker may still type. Each is added in the save that dispatches it and removed only
    * on a conclusive result, a fence the worker confirmed, or an exit of its session. The run is not switched to the
@@ -195,6 +198,8 @@ const timestamp = () => new Date().toISOString();
 /** The owner authority a permission decision is bound to: pinned policy plus current steering and answers. */
 const ownerAuthorityHash = (run: TeamRun) => permissionAuthorityHash(run.permissions, ownerDirectionLines(run));
 const activeMember = (member: TeamMember) => ACTIVE_MEMBER_STATUSES.includes(member.status);
+/** A run the owner's halt paused where it waited for input; it stays held until a release or the owner resumes it. */
+const heldWaiting = (stored: Stored) => stored.run.status === "paused" && stored.ownerHalt?.waiting === true;
 function permissionCoordinatorDecision(run: TeamRun, member: TeamMember) {
   const decisions = run.permissionDecisions ?? [];
   const matches = (decision: TeamPermissionDecision) =>
@@ -765,6 +770,15 @@ export class TeamService {
   }
   /** Active host-level provider limits; new members of a limited provider launch on their fallback. */
   providerLimits() { return this.limits.active(); }
+  /**
+   * An owner action that can start work from this run first gives Linear a moment to confirm the run's issue, outside
+   * the queue: a finished run's passive view may carry an older confirmation than the action accepts.
+   */
+  private confirmed(id: string): Promise<void> {
+    const run = this.records.get(id)?.run;
+    if (!this.linear || !run || !(run.linearTracking || run.linear)) return Promise.resolve();
+    return this.linear.confirmTeam(id).then(() => undefined, () => undefined);
+  }
   private enqueue<T>(task: () => T | Promise<T>): Promise<T> {
     const next = this.serial.then(task); this.serial = next.catch(() => {}); return next;
   }
@@ -857,6 +871,17 @@ export class TeamService {
         decision: boundedRecoveryText(outcome.decision), consequence: boundedRecoveryText(outcome.consequence),
       }));
   }
+  /**
+   * A run that would start work but waits for Linear says so, unless it has its own reason or is paused, halted, or
+   * finished. A confirmation that lapsed moments ago is routine, so a pending wait shows after a minute; an error or a
+   * rate-limit pause shows at once.
+   */
+  private trackingHold(stored: Stored, tracking: TeamRun["linear"]) {
+    const run = stored.run;
+    if (!run.linearTracking || !tracking || (tracking.status !== "pending" && tracking.status !== "error") || run.reason || stored.halt
+      || ["paused", "ready-for-review", "merged", "no-change", "blocked", "cancelled"].includes(run.status)) return false;
+    return tracking.status === "error" || Boolean(tracking.retryAt) || Date.now() - Date.parse(tracking.checkedAt ?? run.createdAt) > 60000;
+  }
   private view(stored: Stored): TeamView {
     const { members, permissionRecovery, ...run } = structuredClone(stored.run);
     // Queue evidence from this exact state before a goal can use its sync gate
@@ -865,6 +890,7 @@ export class TeamService {
     run.linear = this.linear?.getTeam(run.id) ?? tracking ?? run.linear;
     const safeRun = {
       ...run,
+      ...(this.trackingHold(stored, run.linear) ? { reason: `New work waits for Linear tracking: ${run.linear!.reason ?? "Linear has not confirmed current requirements."}` } : {}),
       resumable: this.canResume(stored, run.linear?.status),
       continuable: this.canContinue(stored, run.linear?.status),
       ...(run.permissionDecisions ? { permissionDecisions: run.permissionDecisions.map(({ prompt: _prompt, coordinatorSessionId: _sessionId, ...decision }) => decision) } : {}),
@@ -1749,7 +1775,7 @@ export class TeamService {
   }
   reconcileDelivery(id: string, input: TeamDeliveryReconcile) {
     const body: TeamDeliveryReconcile = teamDeliveryReconcileSchema.parse(input);
-    return this.enqueue(async () => {
+    return this.confirmed(id).then(() => this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
       if (this.replay(stored, "reconcile-delivery", body)) return this.view(stored);
       if (body.revision !== run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before reconciling delivery.");
@@ -1761,7 +1787,7 @@ export class TeamService {
       }
       if (run.linearTracking || run.linear) {
         const refreshed = this.linear?.updateTeam(run, run.linearTracking === true) ?? run.linear;
-        const tracking = this.linear?.getTeam(run.id) ?? refreshed;
+        const tracking = this.linear?.getTeam(run.id, true) ?? refreshed;
         if (tracking && run.linear !== tracking) { run.linear = tracking; this.save(stored); }
         if (!this.linear || tracking?.status !== "synced")
           throw new TeamError(409, "linear-reconciliation-required", "Linear has not confirmed the current issue and requirements. Refresh tracking before delivery reconciliation.");
@@ -1875,11 +1901,11 @@ export class TeamService {
         throw error;
       }
       return this.view(stored);
-    });
+    }));
   }
   reconcileVerification(id: string, input: VerificationMutation) {
     const body = teamVerificationReconcileSchema.parse(input);
-    return this.enqueue(async () => {
+    return this.confirmed(id).then(() => this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
       if (this.replay(stored, "reconcile-verification", body)) return this.view(stored);
       if (body.revision !== run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before reconciling verification.");
@@ -1887,7 +1913,7 @@ export class TeamService {
       if (run.workspaceRemovedAt || this.removingRuns.has(id)) throw workspaceRemovedError();
       if (run.linearTracking || run.linear) {
         const refreshed = this.linear?.updateTeam(run, run.linearTracking === true) ?? run.linear;
-        const tracking = this.linear?.getTeam(run.id) ?? refreshed;
+        const tracking = this.linear?.getTeam(run.id, true) ?? refreshed;
         if (tracking && run.linear !== tracking) { run.linear = tracking; this.save(stored); }
         if (!this.linear || tracking?.status !== "synced") throw new TeamError(409, "linear-reconciliation-required", "Linear has not confirmed the current issue and requirements. Refresh tracking before reconciling verification.");
       }
@@ -1934,7 +1960,7 @@ export class TeamService {
       this.event(stored, `An operator attested that processes for the interrupted check had stopped. The ${head} integration and earlier evidence are retained; fresh verification will use a new disposable workspace. Operator claim, not host-verified: ${JSON.stringify(body.attestation.text.slice(0, 500))}`);
       this.save(stored);
       return this.view(stored);
-    });
+    }));
   }
   inspectMemberRuntime(id: string, memberId: string) {
     const stored = this.record(id), run = stored.run;
@@ -2002,21 +2028,27 @@ export class TeamService {
       return this.view(stored);
     });
   }
-  answer(id: string, decisionId: string, input: Mutation, authorizeNewAnswer?: () => void, by: "owner" | "coordinator" | "connector" = "owner", source?: ConnectorSource) {
+  /** `authorizeNewAnswer` learns whether the run is held where it waits, the one paused state that takes an answer. */
+  answer(id: string, decisionId: string, input: Mutation, authorizeNewAnswer?: (held: boolean) => void, by: "owner" | "coordinator" | "connector" = "owner", source?: ConnectorSource) {
     const body = { ...teamMutationSchema.parse(input), ...(by === "owner" && !source ? {} : { by, ...(source ? { source } : {}) }) };
     return this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
       if (this.replay(stored, `answer:${decisionId}`, body)) return this.view(stored);
-      authorizeNewAnswer?.();
+      authorizeNewAnswer?.(heldWaiting(stored));
       const decision = run.decisions.find(item => item.id === decisionId && item.revision === run.revision);
       if (!decision) throw new TeamError(404, "decision-not-found", "This decision is no longer current.");
       if (stored.receipts[body.requestId]) { this.mutation(stored, `answer:${decisionId}`, body); return this.view(stored); }
       if (decision.answer) throw new TeamError(409, "decision-answered", "This decision already has an answer.");
-      if (stored.halt || run.status === "paused") throw new TeamError(409, "team-paused", "Resume the team before answering its decision.");
+      // A run held where it waits keeps the answer and starts nothing until it resumes.
+      const held = heldWaiting(stored), mark = stored.ownerHalt;
+      if (!held && (stored.halt || run.status === "paused")) throw new TeamError(409, "team-paused", "Resume the team before answering its decision.");
       if (!this.mutation(stored, `answer:${decisionId}`, body)) return this.view(stored);
+      // An answer is input, not a change to how the run is held: the hold, and what a release does with it, stay.
+      if (held) stored.ownerHalt = mark;
       decision.answer = body.text; decision.answeredBy = by; decision.answeredAt = timestamp();
       if (source) decision.source = source;
-      this.event(stored, by === "connector" ? `${decisionAnswerLabel(decision)} decision was recorded as delegated agent input. The requesting member will continue in a new attempt.` : by === "coordinator" ? "A mission coordinator decision was recorded. The requesting member will continue in a new attempt." : "A user decision was recorded. The requesting member will continue in a new attempt."); this.save(stored);
+      const next = held ? "The requesting member will continue in a new attempt when the team resumes." : "The requesting member will continue in a new attempt.";
+      this.event(stored, by === "connector" ? `${decisionAnswerLabel(decision)} decision was recorded as delegated agent input. ${next}` : by === "coordinator" ? `A mission coordinator decision was recorded. ${next}` : `A user decision was recorded. ${next}`); this.save(stored);
       // An owner answer is new direction no outstanding review saw; those requests are reviewed again under it or stay with the user.
       if (by === "owner" && (run.permissionDecisions ?? []).some(item => ["pending", "reviewing", "approved", "answering"].includes(item.status)))
         await this.invalidatePermissionDecisions(stored, "The owner answered a team question; a request reviewed before that answer remains with the user.", false);
@@ -2095,11 +2127,11 @@ export class TeamService {
     if (left.length) stored.unfencedAnswers = left; else delete stored.unfencedAnswers;
   }
   pause(id: string, input: Action, source?: ConnectorSource) { return this.action(id, "pause", { ...teamActionSchema.parse(input), ...(source ? { source } : {}) }); }
-  resume(id: string, input: Action, source?: ConnectorSource) { return this.action(id, "resume", { ...teamActionSchema.parse(input), ...(source ? { source } : {}) }); }
+  resume(id: string, input: Action, source?: ConnectorSource) { const body = { ...teamActionSchema.parse(input), ...(source ? { source } : {}) }; return this.confirmed(id).then(() => this.action(id, "resume", body)); }
   cancel(id: string, input: Action, source?: ConnectorSource) { return this.action(id, "cancel", { ...teamActionSchema.parse(input), ...(source ? { source } : {}) }); }
   continueRun(id: string, input: TeamContinue) {
     const body = teamContinueSchema.parse(input);
-    return this.enqueue(async () => {
+    return this.confirmed(id).then(() => this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
       if (this.replay(stored, "continue", body)) return this.view(stored);
       if (body.revision !== run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before sending this action.");
@@ -2107,7 +2139,7 @@ export class TeamService {
 
       if (run.linearTracking || run.linear) {
         const refreshed = this.linear?.updateTeam(run, run.linearTracking === true) ?? run.linear;
-        const tracking = this.linear?.getTeam(run.id) ?? refreshed;
+        const tracking = this.linear?.getTeam(run.id, true) ?? refreshed;
         if (tracking && run.linear !== tracking) { run.linear = tracking; this.save(stored); }
         if (!this.linear || tracking?.status !== "synced")
           throw new TeamError(409, "linear-reconciliation-required", "Linear has not confirmed the current issue and requirements. Refresh tracking before continuing this run.");
@@ -2162,7 +2194,7 @@ export class TeamService {
       Object.assign(stored, next);
       if (!("objectiveNotice" in next)) delete stored.objectiveNotice;
       return this.view(stored);
-    });
+    }));
   }
   private async resumeVerificationRecovery(stored: Stored, body: Action & { source?: ConnectorSource }, recovery: NonNullable<Stored["verificationRecovery"]>) {
     const run = stored.run;
@@ -2230,22 +2262,37 @@ export class TeamService {
     return this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
       if (this.replay(stored, action, body)) return this.view(stored);
+      if (action === "resume" && (run.linearTracking || run.linear)) {
+        const tracking = this.linear?.getTeam(run.id, true) ?? run.linear;
+        if (tracking && JSON.stringify(run.linear) !== JSON.stringify(tracking)) { run.linear = tracking; this.save(stored); }
+      }
       if (action === "pause" && (["ready-for-review", "merged", "no-change"].includes(run.status) || run.status === "blocked" && !run.workspaceRemovedAt)) throw new TeamError(409, "team-not-running", "This team is not running and cannot be paused.");
       const verificationRecovery = action === "resume" && validVerificationRecovery(stored) ? stored.verificationRecovery : undefined;
       if (action === "resume") { const refusal = this.resumeRefusal(stored, verificationRecovery); if (refusal) throw refusal; }
       if (action === "resume" && verificationRecovery) return this.resumeVerificationRecovery(stored, body, verificationRecovery);
+      // Read before the request clears the mark: a run the halt held where it waited continues where it waited.
+      const inPlace = heldWaiting(stored);
       if (!this.mutation(stored, action, body)) return this.view(stored);
       if (action === "resume") {
         if (run.status !== "paused" && !this.canResume(stored)) { this.save(stored); return this.view(stored); }
-        await this.resumeRun(stored);
+        await this.resumeRun(stored, inPlace);
       } else await this.stopRun(stored, action, undefined, body.source);
-      this.event(stored, `Team ${action === "resume" ? "resumed with a fresh plan" : action === "pause" ? "paused" : "cancelled"}${body.source ? ` by ${inputSourceLabel(body.source)}` : ""}.`); this.save(stored);
+      this.event(stored, `Team ${action === "resume" ? inPlace ? "resumed where it waited for input" : "resumed with a fresh plan" : action === "pause" ? "paused" : "cancelled"}${body.source ? ` by ${inputSourceLabel(body.source)}` : ""}.`); this.save(stored);
       return this.view(stored);
     });
   }
   /** Why the run cannot resume now, or undefined. The owner's resume and a halt release both apply these rules. */
   private resumeRefusal(stored: Stored, verificationRecovery: Stored["verificationRecovery"]): TeamError | undefined {
     const run = stored.run;
+    // A run held where it waited stopped no work and replays nothing: it continues its own revision, a started
+    // delivery included, so only a missing workspace, an open operation, or a member still stopping holds it.
+    if (heldWaiting(stored)) {
+      if (run.workspaceRemovedAt) return new TeamError(409, "team-workspace-removed", "This run's workspaces were removed under the retention policy; start a new run.");
+      if (stored.pending || !stored.prepared)
+        return new TeamError(409, "team-reconciliation-required", "This team requires workspace reconciliation. Inspect its evidence and start a new team rather than replaying uncertain work.");
+      if (stored.halt) return new TeamError(409, "members-stopping", "Wait for the team's active members to stop before resuming.");
+      return undefined;
+    }
     // Uncertain operations and started deliveries keep their reconciliation contract; a removed
     // workspace is reported next, before the generic blocked-run resume check it would otherwise fail.
     if ((stored.pending && !verificationRecovery) || stored.deliveryAttempt || run.deliveryReceipt)
@@ -2257,9 +2304,14 @@ export class TeamService {
     if (stored.halt) return new TeamError(409, "members-stopping", "Wait for the team's active members to stop before resuming.");
     return undefined;
   }
-  /** Pausing stopped native agents. Replan from the confirmed integration head, preserving stopped copies for inspection. */
-  private async resumeRun(stored: Stored) {
+  /**
+   * Pausing stopped native agents. Replan from the confirmed integration head, preserving stopped copies for inspection.
+   * `inPlace` is for a run the halt held where it waited for input: it stopped no work, so it continues the same
+   * revision, its open questions stay current, and an answer recorded meanwhile starts the requesting member's next attempt.
+   */
+  private async resumeRun(stored: Stored, inPlace = false) {
     const run = stored.run;
+    if (inPlace) { run.status = "needs-input"; run.reason = undefined; return; }
     run.revision++; run.tasks = []; run.review = undefined; run.round = 0; stored.checkHead = undefined;
     this.emit(stored, "run.revision-advanced", [run.revision], {}, { cause: "resume", fromRevision: run.revision - 1, baseChanged: false });
     run.brief = undefined; run.noChange = undefined;
@@ -2285,20 +2337,61 @@ export class TeamService {
     this.commands.get(run.id)?.abort();
   }
   /**
-   * Host-internal: the owner's halt pauses each running run in scope through the owner's pause path, without an owner
-   * request, and marks it. A paused, blocked, waiting, or ended run is not touched. `covers` leaves out a run that a
-   * live goal or mission owns: its owner pauses it.
+   * Whether the halt can hold this run where it waits for input: it waits, and nothing is in flight that a pause would
+   * have to stop (no member at work, no workspace operation, no earlier stop still draining). A permission reviewer may
+   * still run; its open reviews are invalidated and the paused run's own pass stops it. A member queued but never
+   * launched, such as the replacement an answer queues while the run still shows needs-input, is not in flight: it
+   * stays queued while the run is held and launches, with the answer, once the run resumes.
+   */
+  private waitsWithNothingInFlight(stored: Stored) {
+    const run = stored.run;
+    const unlaunched = (member: TeamMember) => { try { return member.status === "queued" && !this.hasLaunch(member); } catch { return false; } };
+    return run.status === "needs-input" && !stored.halt && !stored.pending && !this.commands.has(run.id) &&
+      !run.members.some(member => activeMember(member) && member.role !== "permission-coordinator" && !unlaunched(member));
+  }
+  /**
+   * The owner's halt pauses one run and marks it. A working run stops through the owner's pause path. A run that waits
+   * for input with nothing in flight is held where it waits: same revision, its questions open, its recovery untouched.
+   * The status and the mark are saved together, before anything else on either path.
+   */
+  private async haltStop(stored: Stored, mark: { haltId: string; reason: string }) {
+    const run = stored.run;
+    if (this.waitsWithNothingInFlight(stored)) {
+      run.status = "paused"; run.reason = mark.reason; stored.ownerHalt = { ...mark, waiting: true };
+      await this.invalidatePermissionDecisions(stored, "The team was paused before the permission request could be answered.");
+      this.event(stored, `Team paused where it waits for input: ${mark.reason} Its questions stay open; an answer is kept until it resumes.`);
+    } else {
+      await this.stopRun(stored, "pause", mark);
+      run.reason = mark.reason;
+      this.event(stored, `Team paused: ${mark.reason}`);
+    }
+    this.save(stored);
+  }
+  /** The mark a run keeps when a release leaves it paused: only the reason, and whether it is held where it waits. */
+  private releasedMark(stored: Stored, reason: string): NonNullable<Stored["ownerHalt"]> {
+    return { reason, ...(stored.ownerHalt?.waiting ? { waiting: true as const } : {}) };
+  }
+  /** Resumes a run that a halt release resumes, the way the halt paused it. The caller has applied the resume rules. */
+  private async haltResumeRun(stored: Stored) {
+    const inPlace = heldWaiting(stored);
+    await this.resumeRun(stored, inPlace);
+    stored.ownerHalt = undefined;
+    this.event(stored, inPlace ? "Team resumed where it waited for input: the owner released the halt." : "Team resumed with a fresh plan: the owner released the halt.");
+    this.save(stored);
+  }
+  /**
+   * Host-internal: the owner's halt pauses each running or waiting run in scope, without an owner request, and marks
+   * it. A paused, blocked, or ended run is not touched. `covers` leaves out a run that a live goal or mission owns: its
+   * owner pauses it.
    */
   haltPause(mark: HaltMark, covers: HaltCovers) {
     return this.enqueue(async () => {
       const outcomes: HaltOutcome[] = [];
       for (const stored of this.records.values()) {
         const run = stored.run;
-        if (!HALT_RUNNING_TEAM.has(run.status) || !covers([run.projectId], run.id)) continue;
+        if (!HALT_PAUSED_TEAM.has(run.status) || !covers([run.projectId], run.id)) continue;
         try {
-          await this.stopRun(stored, "pause", { haltId: mark.haltId, reason: mark.reason });
-          run.reason = mark.reason;
-          this.event(stored, `Team paused: ${mark.reason}`); this.save(stored);
+          await this.haltStop(stored, { haltId: mark.haltId, reason: mark.reason });
           outcomes.push({ kind: "team", id: run.id, title: run.title, result: "paused" });
         } catch (error) { outcomes.push(pauseFailure("team", run.id, run.title, error)); }
       }
@@ -2308,7 +2401,7 @@ export class TeamService {
   /**
    * Host-internal: resumes each run that this halt paused and that is still paused under its mark, through the owner's
    * resume rules. A run that another halt still covers moves to that halt. A run that the rules refuse stays paused and
-   * says why. With `keep`, no run resumes.
+   * says why. With `keep`, no run resumes. A run held where it waited stays held in every case that leaves it paused.
    */
   haltResume(haltId: string, heldBy: HaltHeldBy, keep: boolean) {
     return this.enqueue(async () => {
@@ -2322,28 +2415,26 @@ export class TeamService {
             outcomes.push({ ...base, result: "left", reason: LEFT_AS_IS }); continue;
           }
           if (keep) {
-            stored.ownerHalt = { reason: KEPT_PAUSED };
+            stored.ownerHalt = this.releasedMark(stored, KEPT_PAUSED);
             if (!stored.halt) run.reason = KEPT_PAUSED;
             this.save(stored);
             outcomes.push({ ...base, result: "kept", reason: KEPT_PAUSED }); continue;
           }
           const other = heldBy([run.projectId]);
           if (other) {
-            stored.ownerHalt = { ...other };
+            stored.ownerHalt = { ...this.releasedMark(stored, other.reason), haltId: other.haltId };
             if (!stored.halt) run.reason = other.reason;
             this.save(stored);
             outcomes.push({ ...base, result: "held", reason: STILL_HALTED }); continue;
           }
           const refusal = this.resumeRefusal(stored, undefined);
           if (refusal) {
-            stored.ownerHalt = { reason: releaseRefusal(refusal.message) };
+            stored.ownerHalt = this.releasedMark(stored, releaseRefusal(refusal.message));
             if (!stored.halt) run.reason = stored.ownerHalt.reason;
             this.save(stored);
             outcomes.push({ ...base, result: "refused", reason: refusal.message }); continue;
           }
-          await this.resumeRun(stored);
-          stored.ownerHalt = undefined;
-          this.event(stored, "Team resumed with a fresh plan: the owner released the halt."); this.save(stored);
+          await this.haltResumeRun(stored);
           outcomes.push({ ...base, result: "resumed" });
         } catch (error) { outcomes.push({ ...base, result: "refused", reason: error instanceof Error ? error.message : "The run could not resume." }); }
       }
@@ -2351,26 +2442,32 @@ export class TeamService {
     });
   }
   /**
-   * Host-internal: a mission's halt pauses one of its subteams. Decided in this team's queue, so it sees the state that
-   * every earlier operation left: only a working run is paused, and the pause and the token are saved together. True
-   * when the run is paused under this token, including a replay after the mission lost its record of the first call.
+   * Host-internal: a goal's or mission's halt pauses one of its runs. Decided in this team's queue, so it sees the state
+   * that every earlier operation left: only a working or waiting run is paused, and the pause and the token are saved
+   * together. True when the run is paused under this token, including a replay after the owner lost its record of the
+   * first call. A replay shows the reason it carries, which a release that left the owner paused may have changed.
    */
   haltPauseChild(id: string, token: string, reason: string): Promise<boolean> {
     return this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
-      if (stored.ownerHalt?.haltId === token) return run.status === "paused";
-      if (!HALT_RUNNING_TEAM.has(run.status)) return false;
-      await this.stopRun(stored, "pause", { haltId: token, reason });
-      run.reason = reason;
-      this.event(stored, `Team paused: ${reason}`); this.save(stored);
+      if (stored.ownerHalt?.haltId === token) {
+        if (run.status === "paused" && stored.ownerHalt.reason !== reason) {
+          stored.ownerHalt = { ...stored.ownerHalt, reason };
+          if (!stored.halt) run.reason = reason;
+          this.save(stored);
+        }
+        return run.status === "paused";
+      }
+      if (!HALT_PAUSED_TEAM.has(run.status)) return false;
+      await this.haltStop(stored, { haltId: token, reason });
       return true;
     });
   }
   /**
-   * Host-internal: a mission's halt release resumes one subteam that its halt paused. Decided in this team's queue: the
-   * run resumes only if it is still paused and still carries this token, which any accepted owner request clears.
-   * Otherwise nothing changes and the run keeps the state the owner gave it. Members still stopping are reported, so
-   * the mission retries; any other refusal leaves the run paused and says why.
+   * Host-internal: a goal's or mission's halt release resumes one run that its halt paused. Decided in this team's
+   * queue: the run resumes only if it is still paused and still carries this token, which any accepted owner request
+   * except an answer clears. Otherwise nothing changes and the run keeps the state the owner gave it. Members still
+   * stopping are reported, so the owner retries; any other refusal leaves the run paused and says why.
    */
   haltResumeChild(id: string, token: string): Promise<boolean> {
     return this.enqueue(async () => {
@@ -2379,14 +2476,27 @@ export class TeamService {
       const refusal = this.resumeRefusal(stored, undefined);
       if (refusal?.code === "members-stopping") throw refusal;
       if (refusal) {
-        stored.ownerHalt = { reason: releaseRefusal(refusal.message) };
+        stored.ownerHalt = this.releasedMark(stored, releaseRefusal(refusal.message));
         if (!stored.halt) run.reason = stored.ownerHalt.reason;
         this.save(stored);
         throw refusal;
       }
-      await this.resumeRun(stored);
-      stored.ownerHalt = undefined;
-      this.event(stored, "Team resumed with a fresh plan: the owner released the halt."); this.save(stored);
+      await this.haltResumeRun(stored);
+      return true;
+    });
+  }
+  /**
+   * Host-internal: a goal's or mission's halt release that leaves one of its runs paused, such as one the owner kept
+   * paused. Decided in this team's queue: a run still paused under this token loses the token and shows `reason`
+   * instead of the halt's. A run held where it waited stays held. True when the run changed.
+   */
+  haltSettleChild(id: string, token: string, reason: string): Promise<boolean> {
+    return this.enqueue(async () => {
+      const stored = this.record(id), run = stored.run;
+      if (run.status !== "paused" || stored.ownerHalt?.haltId !== token) return false;
+      stored.ownerHalt = this.releasedMark(stored, reason);
+      if (!stored.halt) run.reason = reason;
+      this.save(stored);
       return true;
     });
   }

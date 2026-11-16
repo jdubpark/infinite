@@ -18,6 +18,7 @@ Policy mode and firewall variant are separate switches. Run both in observe, rea
 | `egress/infinite-egress-proxy.socket` | `/etc/systemd/system/`, optional |
 | `egress/egress-observe.nft`, `egress/egress-enforce.nft` | One of them as `/etc/infinite-egress/firewall.nft` |
 | `egress/infinite-egress-firewall.service` | `/etc/systemd/system/` |
+| `egress/nftables-keeps-egress.conf` | `/etc/systemd/system/nftables.service.d/infinite-egress.conf` |
 | `egress/infinite-requires-egress-firewall.conf` | `/etc/systemd/system/infinite.service.d/egress-firewall.conf`, in enforce mode |
 | `infinite.sudoers` | `/etc/sudoers.d/infinite`; it keeps the proxy variables through sudo |
 
@@ -25,7 +26,7 @@ Run the commands from a checkout of the release that the host runs. Port 4785 is
 
 ## Stopping agent work
 
-Any step that removes the firewall table leaves the agent account's direct connections unlogged and unrefused, cloud metadata addresses included, from that moment until a rule loads again. Those steps are: stopping or restarting `infinite-egress-firewall.service`, and restarting, reloading, or stopping `nftables.service`, which flushes every table. Before any of them, stop agent work:
+Any step that removes the firewall table leaves the agent account's direct connections unlogged and unrefused, cloud metadata addresses included, from that moment until a rule loads again. Those steps are: stopping or restarting `infinite-egress-firewall.service`, and starting, restarting, reloading, or stopping `nftables.service`, which flushes every table. With the drop-in from step 4, a start, restart, or reload of `nftables.service` loads the rule again within the same job, so the gap is the moment between the flush and the load; a stop leaves no rule. Before any of them, stop agent work:
 
 1. Close every session: `infinite list`, then `infinite close SESSION_ID` for each one, including team and goal members.
 2. Stop the API so it launches nothing new: `sudo systemctl stop infinite.service`.
@@ -149,9 +150,14 @@ sudo install -o root -g root -m 0644 deploy/ubuntu/egress/infinite-egress-firewa
 sudo systemctl daemon-reload
 sudo systemctl enable --now infinite-egress-firewall.service
 sudo nft list table inet infinite_egress
+sudo install -d -o root -g root -m 0755 /etc/systemd/system/nftables.service.d
+sudo install -o root -g root -m 0644 deploy/ubuntu/egress/nftables-keeps-egress.conf \
+  /etc/systemd/system/nftables.service.d/infinite-egress.conf
+sudo systemctl daemon-reload
+systemctl show nftables.service -p ExecStartPost   # lists the nft command for firewall.nft
 ```
 
-The unit replaces only the `inet infinite_egress` table, so Tailscale's and the system's tables stay as they are. Do not add the rule to `/etc/nftables.conf`, whose `flush ruleset` removes other tables. Restarting or reloading `nftables.service` flushes this table too; the unit then restarts or reloads after it, which leaves a moment without a rule, and no rule at all if that reload fails (see [Stopping agent work](#stopping-agent-work)).
+The unit replaces only the `inet infinite_egress` table, so Tailscale's and the system's tables stay as they are. Do not add the rule to `/etc/nftables.conf`, whose `flush ruleset` removes other tables. Starting, restarting, or reloading `nftables.service` flushes this table too. The firewall unit follows a restart or a reload, but systemd propagates no start, and Ubuntu 24.04 ships `nftables.service` disabled: without the drop-in, `systemctl start nftables.service` removed the table while the firewall unit kept reporting `active`. The drop-in loads the rule again as part of each start, restart, and reload of `nftables.service`. When the rule does not load, that job fails and no rule is left until a load succeeds, while the firewall unit still reports `active`. A moment without a rule remains between the flush and the load (see [Stopping agent work](#stopping-agent-work)).
 
 Run real work for at least a week, then read what agents reached:
 
@@ -163,7 +169,7 @@ journalctl -k --grep 'infinite-egress'   # direct connections that skipped the p
 
 Add the hosts that agents legitimately need to `allow` or to a project's entry and reload. A `bypass` kernel line names a destination address and port, not the program; `sudo ss -tnp` while it happens shows which process holds the socket. Each tool that bypasses the proxy will fail in enforce mode.
 
-Rollback: [stop agent work](#stopping-agent-work), then `sudo systemctl disable --now infinite-egress-firewall.service`, which deletes the table. From then on the agent account's direct connections are neither logged nor refused, metadata addresses included.
+Rollback: [stop agent work](#stopping-agent-work), then `sudo systemctl disable --now infinite-egress-firewall.service`, which deletes the table, and `sudo rm /etc/systemd/system/nftables.service.d/infinite-egress.conf` and `sudo systemctl daemon-reload`, so `nftables.service` does not load the rule again. From then on the agent account's direct connections are neither logged nor refused, metadata addresses included.
 
 ## 5. Enforce
 
@@ -194,7 +200,7 @@ Rollback, fastest first:
 
 - Back to logging, with no gap and no agent stop: install `egress-observe.nft` as `/etc/infinite-egress/firewall.nft` and `sudo systemctl reload infinite-egress-firewall`. The drop-in can stay.
 - Stop allow-list refusals: set `"mode": "observe"` and `sudo systemctl reload infinite-egress-proxy`.
-- Remove the rule entirely: [stop agent work](#stopping-agent-work); remove the drop-in (`sudo rm /etc/systemd/system/infinite.service.d/egress-firewall.conf` and `sudo systemctl daemon-reload`) so the API no longer depends on the firewall; then `sudo systemctl disable --now infinite-egress-firewall.service` and start the API. From then on the agent account's direct connections are neither logged nor refused, metadata addresses included.
+- Remove the rule entirely: [stop agent work](#stopping-agent-work); remove both drop-ins (`sudo rm /etc/systemd/system/infinite.service.d/egress-firewall.conf /etc/systemd/system/nftables.service.d/infinite-egress.conf` and `sudo systemctl daemon-reload`) so the API no longer depends on the firewall and `nftables.service` no longer loads the rule; then `sudo systemctl disable --now infinite-egress-firewall.service` and start the API. From then on the agent account's direct connections are neither logged nor refused, metadata addresses included.
 
 ## When the proxy is down
 
@@ -225,4 +231,5 @@ The proxy reads the key at start, and the API caches it for host commands, so bo
 - **Launches without proxy variables.** Repository briefings and code graph extraction run through their own sudo wrappers, and the host does not give them proxy variables. In enforce mode their network calls fail. Check that these features can do without the network, or keep the firewall in observe, before enforcing.
 - **Host-account commands.** Without `teams.commandPrefix`, team Git commands run as the host account. The firewall rule matches only the agent account, so the proxy variables are their only route; a tool that ignores them goes direct in every mode.
 - **One instance.** The rule matches `infinite-agent` only. A second instance's agent account is not covered, and its host account is not in the `infinite-egress` group. Cover it by adding its account to the rule and the group, or with a second proxy, key, and port.
+- **Rehearsed, not deployed.** Steps 1 to 5, the socket unit, and the drop-ins ran on Ubuntu 24.04 with systemd 255 and nftables 1.0.9 (arm64 container, 2026-11-15) against stand-in hosts. Observe logged an agent connection through the proxy as `would-deny` and let a direct one through the `bypass` rule; enforce answered `403` for an unlisted host, passed a listed one, and reset the agent account's direct connections; the host account's direct connections met neither rule. The container's network namespace drops kernel log lines, so the `log` rules were confirmed with `nft monitor trace`, not `journalctl -k`; read the kernel log on the server.
 - **Records hold destinations.** The journal and summary list every host each project reached. Members of `adm` and `systemd-journal` can read the journal; the agent account must not be one of them.

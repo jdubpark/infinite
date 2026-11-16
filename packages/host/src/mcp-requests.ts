@@ -8,6 +8,7 @@ import type { Mission } from "./mission-types.js";
 import type { ProjectGroupService } from "./project-groups.js";
 import type { ProjectGroup } from "./project-group-types.js";
 import type { Config } from "./types.js";
+import { isHaltReason } from "./halt/rules.js";
 import {
   McpRequestError, mcpStartSchema, mcpReplySchema, mcpControlSchema,
   type ConnectorSource, type McpConnector, type McpRequestApi, type McpRequestView,
@@ -30,6 +31,7 @@ export const mcpRequestErrorMessages: Readonly<Record<string, string>> = {
   "mission-not-paused": "This request is not paused.",
   "mission-cancelled": "This request has already been cancelled.",
   "mission-deadline": "This request's time limit has expired.",
+  "mission-halted": "The owner has halted this request. Only the owner can resume it.",
   "mission-steering-limit": "This request cannot accept more direction.",
 };
 
@@ -182,7 +184,8 @@ export class McpRequestService implements McpRequestApi {
       ...(mission?.result ? { result: { kind: "agent-report" as const, summary: outboundText(this.config, mission.result.summary) } } : {}),
       ...(!mission ? { message: record.holdReason ? "This request is queued and waiting for tracking or execution admission." : "This request is queued." }
         : mission.status === "blocked" && mission.stopReason === "deadline" ? { message: "This request's time limit has expired. The owner must extend it in Infinite before work can continue." } : {}),
-      availableActions: !mission ? [] : live ? ["reply", "pause", "cancel"] : mission.status === "paused" ? ["resume", "cancel"] : mission.status === "cancelled" ? [] : ["cancel"],
+      // A mission the owner's halt paused can be cancelled but not resumed by a connector.
+      availableActions: !mission ? [] : live ? ["reply", "pause", "cancel"] : mission.status === "paused" && !isHaltReason(mission.reason) ? ["resume", "cancel"] : mission.status === "cancelled" ? [] : ["cancel"],
     };
   }
 }

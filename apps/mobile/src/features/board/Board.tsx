@@ -10,6 +10,7 @@ import { FloatingNotice } from "../../components/FloatingNotice";
 import { age } from "../../status";
 import { theme } from "../../theme";
 import { visibleGroups } from "../projects/model";
+import { HaltBanner } from "../halt/HaltBanner";
 import { Composer } from "./Composer";
 import { attemptLabel, boardKind, boardStatusLabel, groupBoard } from "./model";
 
@@ -55,6 +56,7 @@ export function Board({ connection, machines, pushNote, onSelectMachine, onAddMa
     <ScrollView style={s.list} contentContainerStyle={[s.content, owner && s.contentWithComposer]} keyboardShouldPersistTaps="handled"
       refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <Text style={s.title} accessibilityRole="header">Board</Text>
+      <HaltBanner connection={connection} place="overview" names={id => poll.data?.me.projects?.find(project => project.id === id)?.name} style={s.halt} />
       <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.filters}>
         <Chip label="All" accessibilityLabel="All projects" selected={!projectId} onPress={() => setProjectId("")} />
         {chips.map(group => <Chip key={group.id} label={group.name} selected={projectId === group.id} onPress={() => setProjectId(group.id)} accessibilityLabel={`Filter by ${group.name}`} />)}
@@ -130,6 +132,7 @@ const s = StyleSheet.create({
   contentWithComposer: { paddingBottom: 88 },
   title: { fontSize: 28, lineHeight: 34, fontWeight: "700", color: theme.colors.ink, letterSpacing: -0.6, marginTop: 4 },
   filters: { flexDirection: "row", gap: 6, paddingVertical: 12, paddingRight: 16 },
+  halt: { marginTop: 10 },
   subtitle: { marginTop: -7, marginBottom: 2, fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk },
   row: { minHeight: 72, flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderColor: theme.colors.rule },
   pressed: { backgroundColor: theme.colors.secondarySurface },

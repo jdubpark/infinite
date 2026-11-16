@@ -141,6 +141,19 @@ shown. **New single-repo team…** (⇧⌘N) still starts a team directly in one
 workspace with a name, agents, and a longer brief. The PM and coordinator choose
 worker capacity; the client shows worker status without a capacity control.
 
+The owner's [halt](teams.md#halt) shows above the page. `GET /api/halt` is
+polled with the session list. A host halt shows on every page: what it holds,
+when it was engaged, the owner device that engaged it, and the owner's reason
+when one was given. A project halt shows the same way on the pages of the
+project that lists the halted repository or any of its checkouts, and on its
+missions, team runs, sessions, and cost page; Home for every project shows one
+line naming each halted repository, which opens its project. A host that cannot read its halt record shows a host
+halt that says so and holds every launch until it can. An owner device also sees
+the `infinite halt off` command that releases a halt; the app itself engages and
+releases nothing. A failed read keeps the last report. A host that does not
+offer the route to this app shows no halt, and the app asks again a minute
+later.
+
 Recent sessions stay attached and rendered off-screen, so switching back is
 immediate and keeps scrollback. Up to three terminals stay mounted; opening a
 fourth detaches the oldest. A hidden terminal releases its input lease, so it

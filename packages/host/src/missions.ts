@@ -11,7 +11,7 @@ import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, type BlockerEvidence, 
 import type { ProductGoal } from "./goal-types.js";
 import type { ProjectGroup } from "./project-group-types.js";
 import { createMissionSchema, missionActionSchema, missionExtendSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionFollowUp, type MissionInputSource, type MissionOrigin, type MissionReport, type MissionSubtaskPlan } from "./mission-types.js";
-import { missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, subteamReport, type MissionCoordinatorNote, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
+import { isDirectionMessage, missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, subteamReport, type MissionCoordinatorNote, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
 import { addRollups, emptyRollup, teamUsage } from "./team-usage.js";
 import type { UsageService } from "./usage-service.js";
 import { ledgerRecord } from "./usage-store.js";
@@ -21,7 +21,7 @@ import { resumeFailed } from "./native-continuation.js";
 import { HOST_LOAD_REASON_PREFIX, LaunchHeldError, holdsHostLoadReason } from "./host-load.js";
 import { applyFuseReason, workLaunch } from "./fuse/rules.js";
 import type { FuseAdmission, FuseCheck, FuseGate } from "./fuse/types.js";
-import { HALT_RUNNING_TEAM, KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
+import { HALT_PAUSED_TEAM, KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 
 /** The mission's only view of projects; the project group service implements it. */
 export type ProjectGroupLookup = { get(id: string): ProjectGroup };
@@ -69,6 +69,12 @@ type Stored = {
    * revision on. `token` marks the subteams this halt paused, and `children` lists the ones whose pause they confirmed.
    */
   ownerHalt?: { haltId: string; revision: number; token: string; children: string[] };
+  /**
+   * An earlier halt's resumes that a later pause, the time limit, or a release that kept the mission paused removed
+   * before they reached their subteam, each with the token that subteam may still carry. `applySettlements` retires
+   * each one once its subteam has decided against that token.
+   */
+  haltSettlements?: { teamId: string; token: string }[];
   folder: string;
   repos: MissionPromptRepo[];
   attempts: Attempt[];
@@ -413,7 +419,9 @@ export class MissionService {
   /**
    * The owner approves `minutes` more working time. A running or paused mission keeps going with a later deadline;
    * a mission blocked by its time limit (`stopReason: "deadline"`) resumes its paused subteams. Any other mission is
-   * refused. Idempotent by `requestId`.
+   * refused. Idempotent by `requestId`. While the owner's halt covers the mission, its subteams stay paused: a mission
+   * the halt paused stays paused and still resumes on release, and the resumes an extension queues wait in
+   * `applyOps` until no halt covers the mission's repositories.
    */
   extend(id: string, input: { requestId: string; revision: number; minutes: number }): ReturnType<MissionService["resume"]> {
     const body = missionExtendSchema.parse(input);
@@ -423,7 +431,10 @@ export class MissionService {
       const deadlineBlocked = mission.status === "blocked" && mission.stopReason === "deadline";
       if (!(live.has(mission.status) || mission.status === "paused" || deadlineBlocked))
         throw new TeamError(409, "mission-not-extendable", "Only a running mission, or one stopped by its time limit, can be extended.");
+      const halted = mission.status === "paused" && stored.ownerHalt?.revision === mission.revision;
       this.admit(stored, "extend", body);
+      // Approved time is not a change to the halt's pause, so the release still resumes the mission.
+      if (halted) stored.ownerHalt!.revision = mission.revision;
       const at = Date.now();
       // The extension adds working time to whatever is left, never to a deadline already passed. A stopped intake
       // clock measures what is left from the moment it stopped; the stopped span is added back when it restarts.
@@ -432,10 +443,14 @@ export class MissionService {
       mission.deadlineAt = new Date(deadline).toISOString();
       if (deadlineBlocked) {
         mission.status = "working"; mission.stopReason = undefined; mission.reason = undefined; stored.blockedAt = undefined;
+        const mark = stored.ownerHalt;
+        const haltPaused = (teamId: string) => Boolean(mark && (mark.children.includes(teamId) || stored.ops.some(op => op.teamId === teamId && op.kind === "pause" && op.halt?.token === mark.token)));
         for (const subtask of mission.subtasks.filter(item => item.teamId && item.status === "running")) {
-          const pending = stored.ops.findIndex(op => op.teamId === subtask.teamId && op.kind === "pause");
-          if (pending >= 0) stored.ops.splice(pending, 1);
-          else this.queueOp(stored, { kind: "resume", subtaskId: subtask.id, teamId: subtask.teamId! });
+          // A time-limit pause that never reached the subteam is withdrawn rather than followed by a resume. A subteam
+          // that the halt paused, or will pause, gets the resume anyway; it waits in `applyOps` until the halt lifts.
+          // So does one paused now, whose earlier resume that pause superseded.
+          const withdrawn = this.withdrawPauses(stored, subtask.teamId!, op => !op.halt);
+          if (!withdrawn || haltPaused(subtask.teamId!) || this.childPaused(subtask.teamId!)) this.queueOp(stored, { kind: "resume", subtaskId: subtask.id, teamId: subtask.teamId! });
         }
         stored.inbox.push({ type: "resumed" }); this.settle(stored);
       }
@@ -451,6 +466,10 @@ export class MissionService {
       if (this.replay(stored, action, body)) return this.view(stored);
       if (action === "pause" && !live.has(mission.status)) throw new TeamError(409, "mission-not-running", "Only a running mission can be paused.");
       if (action === "resume" && mission.status !== "paused") throw new TeamError(409, "mission-not-paused", "Only a paused mission can resume.");
+      // The halt is the owner's stop: delegated agent input cannot undo it, so a connector cannot resume a mission the
+      // halt paused or one a halt now covers. The owner's own resume keeps its rules.
+      if (action === "resume" && typeof body.source === "object" && (stored.ownerHalt || this.fuse?.held?.(mission.repoProjectIds)))
+        throw new TeamError(409, "mission-halted", "The owner's halt holds this mission. Only the owner can resume it while the halt holds.");
       // The paused status still holds here, so the stopped clock is added to the deadline without writing it yet.
       if (action === "resume" && Date.now() >= this.deadlineMs(stored, Date.now())) throw new TeamError(409, "mission-deadline", "This mission's time limit has expired. Extend the time limit to continue.");
       if (action === "cancel" && mission.status === "cancelled") throw new TeamError(409, "mission-cancelled", "This mission has already been cancelled.");
@@ -464,10 +483,10 @@ export class MissionService {
         mission.status = "working"; mission.reason = undefined;
         mission.stopReason = undefined;
         for (const subtask of mission.subtasks.filter(item => item.teamId && item.status === "running")) {
-          // A pause that never reached the subteam is withdrawn rather than followed by a resume.
-          const pending = stored.ops.findIndex(op => op.teamId === subtask.teamId && op.kind === "pause");
-          if (pending >= 0) stored.ops.splice(pending, 1);
-          else this.queueOp(stored, { kind: "resume", subtaskId: subtask.id, teamId: subtask.teamId!, ...(stored.controlSource ? { source: stored.controlSource } : {}) });
+          // A pause that never reached the subteam is withdrawn rather than followed by a resume, unless the subteam is
+          // paused now: that pause superseded an earlier resume meant to wake it.
+          const withdrawn = this.withdrawPauses(stored, subtask.teamId!, () => true);
+          if (!withdrawn || this.childPaused(subtask.teamId!)) this.queueOp(stored, { kind: "resume", subtaskId: subtask.id, teamId: subtask.teamId!, ...(stored.controlSource ? { source: stored.controlSource } : {}) });
         }
         stored.inbox.push({ type: "resumed" });
         this.settle(stored);
@@ -477,20 +496,21 @@ export class MissionService {
     });
   }
   /**
-   * Host-internal: the owner's halt pauses each planning or working mission with any repository in scope, as the
-   * owner's pause does, without an owner request, and marks it with the revision it leaves.
+   * Host-internal: the owner's halt pauses each planning, working, or waiting mission with any repository in scope, as
+   * the owner's pause does, without an owner request, and marks it with the revision it leaves. A waiting mission keeps
+   * its questions; the release settles it back to waiting while any of them is open.
    */
   haltPause(mark: HaltMark, covers: HaltCovers) {
     return this.enqueue(() => {
       const outcomes: HaltOutcome[] = [];
       for (const stored of this.records.values()) {
         const mission = stored.mission;
-        if ((mission.status !== "planning" && mission.status !== "working") || !covers(mission.repoProjectIds, mission.id)) continue;
+        if (!live.has(mission.status) || !covers(mission.repoProjectIds, mission.id)) continue;
         try {
-          // Only a subteam that is working now: one waiting for input, paused, blocked, or ended stays as it is.
+          // Only a subteam that is working or waiting for input now: one paused, blocked, or ended stays as it is.
           const working = mission.subtasks.filter(item => {
             if (!item.teamId || item.status !== "running") return false;
-            try { return HALT_RUNNING_TEAM.has(this.teams.get(item.teamId).status); } catch (error) { if (notFound(error)) return false; throw error; }
+            try { return HALT_PAUSED_TEAM.has(this.teams.get(item.teamId).status); } catch (error) { if (notFound(error)) return false; throw error; }
           });
           mission.revision++; mission.status = "paused"; mission.reason = mark.reason;
           const token = randomUUID();
@@ -503,21 +523,32 @@ export class MissionService {
       return outcomes;
     });
   }
-  /** Host-internal: resumes each mission still paused, unchanged, under this halt's mark, with the owner's resume rules. */
+  /**
+   * Host-internal: resumes each mission still paused, unchanged, under this halt's mark, with the owner's resume rules.
+   * A mission that stays paused hands its reason to each subteam its halt paused before the mark ends, so a restart
+   * in between repeats that step and no subteam keeps a halt's reason once the halt is off.
+   */
   haltResume(haltId: string, heldBy: HaltHeldBy, keep: boolean) {
-    return this.enqueue(() => {
+    return this.enqueue(async () => {
       const outcomes: HaltOutcome[] = [];
       for (const stored of this.records.values()) {
         const mission = stored.mission, mark = stored.ownerHalt, base = { kind: "mission" as const, id: mission.id, title: mission.title };
         if (mark?.haltId !== haltId) continue;
         try {
           if (mission.status !== "paused" || mission.revision !== mark.revision) {
+            // A mission whose time limit passed during the halt stays blocked, and its subteams stay paused until the
+            // owner extends it, the way a paused mission keeps its subteams paused.
+            const holds = mission.status === "paused" || mission.status === "blocked" && mission.stopReason === "deadline";
             if (mission.status === "paused" && isHaltReason(mission.reason)) mission.reason = LEFT_PAUSED;
-            this.endHaltMark(stored, mark, mission.status === "paused"); this.save(stored);
+            if (holds) await this.settleHaltChildren(stored, mark, mission.reason ?? LEFT_PAUSED);
+            this.endHaltMark(stored, mark, holds); this.save(stored);
+            if (holds) { await this.applySettlements(stored); this.save(stored); }
             outcomes.push({ ...base, result: "left", reason: LEFT_AS_IS }); continue;
           }
           if (keep) {
+            await this.settleHaltChildren(stored, mark, KEPT_PAUSED);
             this.endHaltMark(stored, mark, true); mission.reason = KEPT_PAUSED; this.save(stored);
+            await this.applySettlements(stored); this.save(stored);
             outcomes.push({ ...base, result: "kept", reason: KEPT_PAUSED }); continue;
           }
           const other = heldBy(mission.repoProjectIds);
@@ -526,8 +557,10 @@ export class MissionService {
             outcomes.push({ ...base, result: "held", reason: STILL_HALTED }); continue;
           }
           if (Date.now() >= this.deadlineMs(stored, Date.now())) {
-            const reason = "This mission's time limit has expired. Start a new mission to approve more time.";
+            const reason = "This mission's time limit has expired. Extend the time limit to continue.";
+            await this.settleHaltChildren(stored, mark, releaseRefusal(reason));
             this.endHaltMark(stored, mark, true); mission.reason = releaseRefusal(reason); this.save(stored);
+            await this.applySettlements(stored); this.save(stored);
             outcomes.push({ ...base, result: "refused", reason }); continue;
           }
           mission.revision++; mission.status = "working"; mission.reason = undefined;
@@ -576,21 +609,27 @@ export class MissionService {
       const decision = mission.decisions.find(item => item.id === decisionId);
       if (!decision) throw new TeamError(404, "decision-not-found", "This decision does not exist.");
       if (decision.answer) throw new TeamError(409, "decision-answered", "This decision already has an answer.");
-      if (!live.has(mission.status)) throw new TeamError(409, "mission-not-running", "Resume the mission before answering its decision.");
+      // A mission the halt paused, unchanged since, takes the answer and starts nothing: a forwarded answer reaches a
+      // subteam the halt holds, and one for the coordinator waits in its inbox, until the release resumes the mission.
+      const halted = mission.status === "paused" && stored.ownerHalt?.revision === mission.revision;
+      if (!live.has(mission.status) && !halted) throw new TeamError(409, "mission-not-running", "Resume the mission before answering its decision.");
       this.admit(stored, `answer:${decisionId}`, body);
+      // An answer is input, not a change to the halt's pause, so the release still resumes the mission.
+      if (halted) stored.ownerHalt!.revision = mission.revision;
       Object.assign(decision, { answer: body.text, answeredAt: now(), answeredBy: typeof source === "object" ? "connector" : "owner", ...(typeof source === "object" ? { source } : {}) });
       stored.ownerInputs = (stored.ownerInputs ?? 0) + 1;
       const subtask = decision.subtaskId ? mission.subtasks.find(item => item.id === decision.subtaskId) : undefined;
       const message = { ...(typeof source === "object" ? { type: "connector-answer" as const, source } : { type: "owner-answer" as const }), decisionId, question: decision.question, answer: body.text };
+      const later = halted ? " It takes effect when the mission resumes." : "";
       if (decision.childDecisionId && subtask?.teamId) {
         this.queueOp(stored, { kind: "answer", subtaskId: subtask.id, teamId: subtask.teamId, decisionId: decision.childDecisionId, text: body.text, by: typeof source === "object" ? "connector" : "owner", ...(typeof source === "object" ? { source } : {}) });
         stored.notes.push({ ...message, forwardedTo: { subtaskId: subtask.id, childDecisionId: decision.childDecisionId } });
-        this.event(stored, typeof source === "object" ? `${inputSourceLabel(source)} answered a question; the delegated answer is being forwarded to subtask ${subtask.id}.` : source === "slack"
+        this.event(stored, (typeof source === "object" ? `${inputSourceLabel(source)} answered a question; the delegated answer is being forwarded to subtask ${subtask.id}.` : source === "slack"
           ? `The owner answered a question from Slack; the answer is being forwarded to subtask ${subtask.id}.`
-          : `The owner answered a question; the answer is being forwarded to subtask ${subtask.id}.`);
+          : `The owner answered a question; the answer is being forwarded to subtask ${subtask.id}.`) + later);
       } else {
         stored.inbox.push(message);
-        this.event(stored, typeof source === "object" ? `${inputSourceLabel(source)} answered the coordinator question; this is delegated agent input.` : source === "slack" ? "The owner answered the coordinator's question from Slack." : "The owner answered the coordinator's question.");
+        this.event(stored, (typeof source === "object" ? `${inputSourceLabel(source)} answered the coordinator question; this is delegated agent input.` : source === "slack" ? "The owner answered the coordinator's question from Slack." : "The owner answered the coordinator's question.") + later);
       }
       this.settle(stored);
       this.save(stored); return this.view(stored);
@@ -628,17 +667,15 @@ export class MissionService {
     const mission = stored.mission;
     this.closeStaleBlocked(stored);
     // A stopped mission with nothing left to stop or observe needs no further ticks.
-    if (["blocked", "ready-for-review", "cancelled"].includes(mission.status) && !stored.ops.length && !Object.keys(stored.launches).length &&
+    if (["blocked", "ready-for-review", "cancelled"].includes(mission.status) && !stored.ops.length && !stored.haltSettlements?.length && !Object.keys(stored.launches).length &&
         (stored.attempts.at(-1)?.status ?? "stopped") === "stopped" &&
         !mission.subtasks.some(subtask => subtask.status === "running" || subtask.status === "cancelled" && subtask.teamId)) return;
     this.settleClock(stored);
     // A stopped intake clock is not checked; its deadline moves when the owner or the pause releases it.
     if ((live.has(mission.status) || mission.status === "paused") && !stored.clockStoppedAt && Date.now() >= Date.parse(mission.deadlineAt)) {
       mission.status = "blocked"; mission.stopReason = "deadline"; mission.reason = timeLimitReason; stored.blockedAt = stored.blockedAt ?? now();
-      for (const subtask of mission.subtasks.filter(item => item.teamId && item.status === "running")) {
-        stored.ops = stored.ops.filter(op => op.teamId !== subtask.teamId || op.kind !== "resume");
-        this.queueOp(stored, { kind: "pause", subtaskId: subtask.id, teamId: subtask.teamId! });
-      }
+      // Each pause supersedes the subteam's waiting resumes; a halt's resume leaves its token to `applySettlements`.
+      for (const subtask of mission.subtasks.filter(item => item.teamId && item.status === "running")) this.queueOp(stored, { kind: "pause", subtaskId: subtask.id, teamId: subtask.teamId! });
       mission.coordinator = mission.coordinator ? { ...mission.coordinator, status: "stopped" } : undefined;
       this.event(stored, timeLimitReason); this.save(stored);
     }
@@ -704,24 +741,106 @@ export class MissionService {
     mission.reason = undefined;
   }
   /**
+   * A release that leaves the mission paused: each subteam that its halt paused, and each one a withdrawn halt pause may
+   * already have reached, keeps its pause and shows `reason` instead of the halt's. Each subteam decides in its own
+   * queue, against the token it carries; one the pause never reached is not touched. A failure is recorded and the
+   * next subteam goes on. A subteam still paused under an earlier halt is settled by `applySettlements`.
+   */
+  private async settleHaltChildren(stored: Stored, mark: NonNullable<Stored["ownerHalt"]>, reason: string) {
+    const undelivered = stored.ops.filter(op => op.kind === "pause" && op.halt?.token === mark.token).map(op => op.teamId);
+    for (const teamId of new Set([...mark.children, ...undelivered])) {
+      try { await this.teams.haltSettleChild(teamId, mark.token, reason); }
+      catch (error) {
+        if (notFound(error)) continue;
+        this.event(stored, `The halt's reason on subteam ${teamId} could not be updated: ${error instanceof Error ? error.message : "the subteam could not be reached."}`);
+      }
+    }
+  }
+  /**
    * Ends the mission's halt mark. Every halt pause under its token that has not reached its subteam is withdrawn, so
-   * none arrives once no release owns the token. While the mission stays paused, each of those subteams gets the
-   * mission's ordinary pause instead, the one the owner's pause of a mission queues: it carries no halt token, it
-   * skips a subteam that is already paused, blocked, or finished, and the owner's resume of the mission resumes it.
+   * none arrives once no release owns the token. While the mission stays paused, or blocked at its time limit, each of
+   * those subteams gets the mission's ordinary pause instead, the one the owner's pause of a mission queues: it carries
+   * no halt token, it skips a subteam that is already paused, blocked, or finished, and the owner's resume or extension
+   * of the mission resumes it. An earlier halt's resume still waiting is removed too, so it cannot resume that subteam
+   * under a mission that stays paused; `applySettlements` settles its subteam instead.
    * Returns the subteams whose halt pause was withdrawn.
    */
   private endHaltMark(stored: Stored, mark: NonNullable<Stored["ownerHalt"]>, staysPaused: boolean) {
     const withdrawn = stored.ops.filter(op => op.kind === "pause" && op.halt?.token === mark.token);
     stored.ops = stored.ops.filter(op => !withdrawn.includes(op));
-    if (staysPaused) for (const op of withdrawn)
-      if (!stored.ops.some(item => item.kind === "pause" && item.teamId === op.teamId)) this.queueOp(stored, { kind: "pause", subtaskId: op.subtaskId, teamId: op.teamId });
     stored.ownerHalt = undefined;
+    if (staysPaused) {
+      this.dropResumes(stored, op => Boolean(op.halt));
+      for (const op of withdrawn)
+        if (!stored.ops.some(item => item.kind === "pause" && item.teamId === op.teamId)) this.queueOp(stored, { kind: "pause", subtaskId: op.subtaskId, teamId: op.teamId });
+    }
     return withdrawn.map(op => op.teamId);
   }
+  /**
+   * Removes the resumes that `drop` selects. A halt's resume may be all that would lift its subteam's halt pause, so
+   * its token is kept in `haltSettlements` until the subteam has decided against it.
+   */
+  private dropResumes(stored: Stored, drop: (op: ChildOp) => boolean) {
+    const settlements = stored.haltSettlements ?? [];
+    for (const op of stored.ops) {
+      if (op.kind !== "resume" || !op.halt || !drop(op)) continue;
+      const token = op.halt.token;
+      if (!settlements.some(item => item.teamId === op.teamId && item.token === token)) settlements.push({ teamId: op.teamId, token });
+    }
+    stored.ops = stored.ops.filter(op => op.kind !== "resume" || !drop(op));
+    if (settlements.length) stored.haltSettlements = settlements;
+  }
+  /**
+   * Decides each subteam whose halt resume was removed before it arrived, against the token that resume carried, once
+   * no halt holds the mission. While the mission is paused or stopped, a subteam still paused under that token keeps
+   * its pause and shows the mission's reason instead of the halt's; the owner's resume or extension of the mission
+   * resumes it. While the mission runs, the subteam resumes as the halt paused it, because the pause that removed its
+   * resume was withdrawn before it arrived. A subteam that no longer carries the token is not touched. Each entry is
+   * retired once its subteam has decided; one whose members are still stopping is kept for the next pass.
+   */
+  private async applySettlements(stored: Stored) {
+    const mission = stored.mission, pending = stored.haltSettlements;
+    if (!pending?.length || stored.ownerHalt) return;
+    const running = live.has(mission.status);
+    if (running && this.fuse?.held?.(mission.repoProjectIds)) return;
+    const kept: typeof pending = [];
+    for (const item of pending) {
+      try {
+        if (running) await this.teams.haltResumeChild(item.teamId, item.token);
+        else await this.teams.haltSettleChild(item.teamId, item.token, mission.reason ?? LEFT_PAUSED);
+      } catch (error) {
+        if (this.closed) return;
+        // An unexpected failure keeps every entry; a subteam already decided no longer carries its token on the next pass.
+        if (!(error instanceof TeamError)) throw error;
+        if (notFound(error)) continue;
+        if (["members-stopping", "team-operation-running"].includes(error.code)) { kept.push(item); continue; }
+        this.event(stored, `The halt's resume of subteam ${item.teamId} was not applied: ${error.message}`);
+      }
+    }
+    stored.haltSettlements = kept.length ? kept : undefined;
+  }
+  /**
+   * Withdraws every pause of the subteam that `match` selects; one still queued has not reached it. Each pause the
+   * mission queued is withdrawn, so a second one, such as the time limit's after the owner's, cannot pause the subteam
+   * after the resume. True when any was withdrawn.
+   */
+  private withdrawPauses(stored: Stored, teamId: string, match: (op: ChildOp) => boolean) {
+    const count = stored.ops.length;
+    stored.ops = stored.ops.filter(op => !(op.kind === "pause" && op.teamId === teamId && match(op)));
+    return stored.ops.length < count;
+  }
+  /** Whether the subteam is paused now. One that no longer exists has nothing to resume. */
+  private childPaused(teamId: string) {
+    try { return this.teams.get(teamId).status === "paused"; } catch (error) { if (notFound(error)) return false; throw error; }
+  }
   private queueOp(stored: Stored, op: Omit<ChildOp, "requestId">) {
-    // A cancel supersedes any earlier action on the same subteam, and a later pause supersedes a halt's resume.
-    if (op.kind === "cancel") stored.ops = stored.ops.filter(item => item.teamId !== op.teamId);
-    else if (op.kind === "pause") stored.ops = stored.ops.filter(item => !(item.kind === "resume" && item.halt && item.teamId === op.teamId));
+    // A cancel supersedes any earlier action on the same subteam, a displaced halt resume included, and a later pause
+    // supersedes every earlier resume of it: the halt's, an extension's, or the owner's.
+    if (op.kind === "cancel") {
+      stored.ops = stored.ops.filter(item => item.teamId !== op.teamId);
+      const settlements = stored.haltSettlements?.filter(item => item.teamId !== op.teamId);
+      stored.haltSettlements = settlements?.length ? settlements : undefined;
+    } else if (op.kind === "pause") this.dropResumes(stored, item => item.teamId === op.teamId);
     else if (op.kind === "parallelism") stored.ops = stored.ops.filter(item => item.kind !== "parallelism" || item.teamId !== op.teamId);
     stored.ops.push({ ...op, requestId: randomUUID() });
   }
@@ -899,12 +1018,20 @@ export class MissionService {
       ?? mission.origin?.source;
   }
   private async applyOps(stored: Stored) {
+    await this.applySettlements(stored);
+    if (this.closed) return;
     const remaining: ChildOp[] = [], steered: (string | undefined)[] = [];
+    // Every resume, the halt's own included, waits while its mission is paused or blocked at its time limit, and while
+    // the owner's halt covers any of the mission's repositories: one that an extension or an earlier halt's release
+    // queued must not resume a subteam under a later pause or halt.
+    const mission = stored.mission, resumeHeld = mission.status === "paused" || (mission.status === "blocked" && mission.stopReason === "deadline") ||
+      Boolean(this.fuse?.held?.(mission.repoProjectIds));
     for (const op of [...stored.ops]) {
       let team: TeamView;
       try { team = this.teams.get(op.teamId); } catch (error) { if (notFound(error)) continue; throw error; }
       const settled = teamDone.has(team.status) || team.status === "cancelled";
       if (op.halt) {
+        if (op.kind === "resume" && resumeHeld) { remaining.push(op); continue; }
         // The halt's own pause or resume: the subteam decides in its own queue, against the halt's token.
         try {
           const done = op.kind === "pause" ? await this.teams.haltPauseChild(op.teamId, op.halt.token, op.halt.reason ?? stored.mission.reason ?? "") : await this.teams.haltResumeChild(op.teamId, op.halt.token);
@@ -920,7 +1047,7 @@ export class MissionService {
       }
       if ((op.kind === "cancel" && settled) || (op.kind === "parallelism" && settled) || (op.kind === "pause" && (settled || ["paused", "blocked"].includes(team.status))) || (op.kind === "resume" && team.status !== "paused")) continue;
       const deadlineBlocked = stored.mission.status === "blocked" && stored.mission.stopReason === "deadline";
-      if (op.kind === "resume" && deadlineBlocked) { remaining.push(op); continue; }
+      if (op.kind === "resume" && resumeHeld) { remaining.push(op); continue; }
       // Steering restarts a paused or blocked subteam, so direction waits until both it and its owning mission are running again.
       if (op.kind === "steer" && (team.status === "paused" || stored.mission.status === "paused" || deadlineBlocked)) { remaining.push(op); continue; }
       if (op.kind === "steer" && settled) { steered.push(`Subtask ${op.subtaskId} finished before the direction reached it.`); continue; }
@@ -1161,8 +1288,12 @@ export class MissionService {
     const inbox = stored.inbox.slice(0, messageLimit), notes = stored.notes.slice(0, messageLimit - inbox.length);
     const waiting = stored.inbox.length + stored.notes.length - inbox.length - notes.length;
     // The prompt keeps a byte budget by leaving trailing messages queued, so inbox messages lead and notes are deferred first.
+    // Each direction, the owner's or a connector's, queues one direction message, delivered in order, and only an ending
+    // mission drops the inbox. So the directions whose message no attempt has taken are the newest ones; every older one
+    // reached an attempt.
+    const undelivered = stored.inbox.filter(isDirectionMessage).length;
     const messages = [...inbox, ...notes], context = { openChildDecisions: this.openChildDecisions(stored), waiting, answerProjectId: this.config.intake?.mission.answerProjectId,
-      notes: stored.coordinatorNotes ?? [] };
+      notes: stored.coordinatorNotes ?? [], deliveredDirections: Math.max(0, mission.steering.length - undelivered) };
     const build = (list: MissionMessage[], promptContext: typeof context) => continuation?.mode === "resume"
       ? missionFollowUpPromptWithMessageCount(mission, stored.repos, list, revision, profile.provider, profile, promptContext)
       : missionPromptWithMessageCount(mission, stored.repos, list, revision, profile.provider, profile, promptContext);

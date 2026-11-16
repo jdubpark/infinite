@@ -124,6 +124,20 @@ test("eval settings stay out of the routine approval digest", async () => {
   } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test("routing settings change the approval digest, and their absence keeps it", async () => {
+  const f = setup(); const service = f.createService();
+  try {
+    await service.create(f.create()); await wait(30); await service.tick();
+    assert.equal(service.list()[0]!.status, "running");
+    f.config.projects[0]!.team!.routing = undefined;
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "running");
+    f.config.projects[0]!.team!.routing = { mode: "shadow" };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "blocked");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test("the objective switch is inside the routine approval digest", async () => {
   const f = setup(); let service = f.createService();
   try {

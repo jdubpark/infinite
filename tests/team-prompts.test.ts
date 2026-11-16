@@ -370,6 +370,27 @@ test("a retarget swaps the entry paragraph", () => {
   assert.equal(refreshReportingInstructions(plain, "codex").includes(entryInstructions("claude")), false);
 });
 
+test("a member context never carries the feature map, the eval block, or routing", () => {
+  const routing = { mode: "shadow", successValueUsd: 8 };
+  const base = largeRun();
+  const checks = [{ command: "npm", args: ["test"] }];
+  const project = { checks, features: { areas: [{ id: "host", paths: ["packages/host"] }] }, eval: { capture: true } };
+  const plain = { ...base, handoff: { sourceSessionId: "session", checkpointHead: base.baseCommit, deadlineAt: "2026-11-13T12:00:00.000Z", maxMembers: 1, project } } as unknown as TeamRun;
+  // The run's own pinned policy, as a shadow run carries it, alongside the project's saved one.
+  const pinned = { mode: "shadow", requested: "shadow", source: "saved", knobs: { points: ["start"], cascade: false, successValueUsd: 8, maxExploreShare: 0.2, exploreWindow: 50, minSpareAttempts: 4, allowContributor: false, listWeight: 0.25, headroomWeight: 1 }, defaults: [], algorithmVersion: 1, rewardVersion: 1, digest: "d".repeat(64) };
+  const withRouting = { ...base, routing: pinned, handoff: { sourceSessionId: "session", checkpointHead: base.baseCommit, deadlineAt: "2026-11-13T12:00:00.000Z", maxMembers: 1, project: { ...project, routing } } } as unknown as TeamRun;
+  const configuredPlain = project as Parameters<typeof teamContext>[2];
+  const configuredWith = { ...project, routing } as unknown as Parameters<typeof teamContext>[2];
+  const roles = ["project-manager", "scout", "implementer", "integrator", "reviewer"] as const;
+  for (const role of roles) {
+    const snapshot = teamContext(withRouting, undefined, configuredWith, role);
+    assert.deepEqual(snapshot, teamContext(plain, undefined, configuredPlain, role), `${role} context changes with routing`);
+    assert.doesNotMatch(JSON.stringify(snapshot), /"routing":/);
+    const prompt = teamPrompt(withRouting, role, role === "implementer" ? withRouting.tasks[0] : undefined, undefined, "demo", undefined, configuredWith);
+    assert.equal(prompt, teamPrompt(plain, role, role === "implementer" ? plain.tasks[0] : undefined, undefined, "demo", undefined, configuredPlain), `${role} prompt changes with routing`);
+  }
+});
+
 // Byte pins: the prompts and contexts of a goal run, with the switch off, equal the output at the base commit.
 const PIN_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"] as const;
 const PIN_CHECKS = [{ command: "npm", args: ["test"] }];

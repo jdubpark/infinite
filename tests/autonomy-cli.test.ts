@@ -24,7 +24,9 @@ async function withFakeHost(view: Record<string, unknown>, run: (requests: Recor
       const body = data ? JSON.parse(data) : undefined;
       requests.push({ method: req.method ?? "GET", url: req.url ?? "", body });
       res.setHeader("content-type", "application/json");
-      if (req.url === "/api/projects/example/team" && req.method === "GET") res.end(JSON.stringify(view));
+      // A host that enrolls repositories and sets autonomy modes, but records no routing decisions.
+      if (req.url === "/api/me" && req.method === "GET") res.end(JSON.stringify({ role: "owner", projects: [], teams: { repoEnrollment: 1, autonomyMode: 1 } }));
+      else if (req.url === "/api/projects/example/team" && req.method === "GET") res.end(JSON.stringify(view));
       else if (req.url === "/api/projects/example/autonomy" && req.method === "PUT") {
         const change = body as { revision: number; mode: string };
         res.end(JSON.stringify({ ...view, autonomy: change.mode, autonomySource: "saved", revision: change.revision + 1 }));
@@ -149,4 +151,22 @@ test("repo init sets, keeps, and validates the mode", { timeout: 90000 }, async 
 
     assert.throws(() => invoke([plainPath, "--autonomy", "supervised"]), (error: { stderr?: string }) => /--autonomy/.test(String(error.stderr)));
   } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("repo init --routing refuses a host without the routing flag before any write", { timeout: 60000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-routing-cli-"));
+  const repoPath = join(root, "sample");
+  mkdirSync(repoPath);
+  git(repoPath, "init", "--initial-branch=main");
+  writeFileSync(join(repoPath, "tracked.txt"), "committed\n");
+  git(repoPath, "add", "tracked.txt");
+  git(repoPath, "-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial fixture");
+  const checks = JSON.stringify([{ command: "git", args: ["status", "--short"] }]);
+  try {
+    await withFakeHost({ id: "sample", revision: 0 }, async (requests, configPath) => {
+      const errors = await refused(() => handleClientCommand(["--client-config", configPath, "repo", "init", repoPath, "--project", "sample", "--check-json", checks, "--routing", "shadow"]));
+      assert.equal(errors, "[Infinite] This host does not support routing settings. Upgrade the host before using --routing.");
+      assert.deepEqual(requests.map(request => `${request.method} ${request.url}`), ["GET /api/me"], "only the capability is read; nothing is written");
+    });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

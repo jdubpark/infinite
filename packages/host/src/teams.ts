@@ -29,6 +29,8 @@ import type { EventOutbox, OutboxEvent } from "./evidence/outbox.js";
 import type { Blackboard } from "./evidence/blackboard.js";
 import { canonicalJson } from "./evidence/crypto.js";
 import { entryToolsFor } from "./entry-roles.js";
+import type { RoutingRecorder } from "./routing-recorder.js";
+import { pinRouting } from "./routing-policy.js";
 import { ENTRY_DROP_TEXT, ENTRY_INGEST_MS, EntryIngestQueue, ingestPass } from "./team-entry-ingest.js";
 import { MAX_OUTBOX_EVENTS, pathField, planDigest, profileIdentity, runEventKey, runSummaryCounts, type MemberStopDetail, type MemberStopReason, type ReplacementCause } from "./run-events.js";
 import { taskFeatures } from "./task-features.js";
@@ -556,6 +558,7 @@ export class TeamService {
   private readonly directory: string;
   private usage?: UsageService;
   private evidence?: EvidenceStore;
+  private router?: RoutingRecorder;
   private fuse?: FuseGate;
   private missionReservations?: MissionReservationLookup;
   private readonly limits: ProviderLimits;
@@ -734,6 +737,7 @@ export class TeamService {
   useMissionReservations(lookup: MissionReservationLookup) { this.missionReservations = lookup; }
   /** The evidence store that a deleted run's events leave with its record. */
   useEvidence(store: EvidenceStore) { this.evidence = store; }
+  useRouter(router: RoutingRecorder) { this.router = router; }
   /** The launch-rate fuse. Without one, every member launches as before and no record gains a fuse reason. */
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
   /**
@@ -1610,6 +1614,8 @@ export class TeamService {
       const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(project.team.permissions ? { permissions: currentPermissions(structuredClone(project.team.permissions)), permissionDecisions: [] } : {}), ...(goal ? { goal } : {}), ...(internal?.missionId ? { missionId: internal.missionId } : {}), ...(internal?.requestSource ? { requestSource: internal.requestSource } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), ...(titleSource ? { titleSource } : {}), title: parsed.title, objective: parsed.objective, parallelismCeiling: ceiling, parallelism: initialParallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
       // A goal run takes the mode its cycle passes; every other run takes the project's current mode.
       run.autonomy = goal ? autonomyOf(internal) : autonomyOf(project);
+      const routing = this.router ? pinRouting(project.team.routing, run.autonomy, lineup) : undefined;
+      if (routing) run.routing = routing;
       if (this.config.teams?.blackboard?.tools === true && this.options?.entries?.available()) run.blackboard = { tools: true };
       if (project.team.delivery) {
         if (!lineup || lineup.coordinator.tier !== "strong" || lineup.reviewer.tier !== "strong")
@@ -4911,6 +4917,10 @@ export class TeamService {
   private prepareMember(stored: Stored, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string, onPrepared?: (member: TeamMember) => void) {
     if (this.publicationGate(stored, role)) return;
     const run = stored.run, member = this.newMember(run, role, "", run.headCommit!, task?.id);
+    if (role === "implementer" && task && run.routing && this.router)
+      this.router.recordStart({ run, task: task as TeamTask, publishHeads: this.publishHeadsEnabled(), entryTools: entryToolsFor(run, "implementer"),
+        objectiveDigest: Boolean(stored.run.goal?.record),
+        featureMap: (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features, limited: this.limits.limited() });
     const continuationHead = role === "project-manager" && stored.continuationHead?.revision === run.revision
       ? structuredClone(stored.continuationHead) : undefined;
     if (feedback) {

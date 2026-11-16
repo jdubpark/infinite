@@ -1959,6 +1959,53 @@ Omit `--autonomy` on a later `repo init` to keep the saved mode.
 
 Only the owner can change the mode, from the paired owner CLI. Members, other roles, and browser sessions cannot.
 
+## Shadow routing
+
+Shadow routing records which profile the router would pick for each implementer start. It never applies that pick: the member runs on the profile the plan names, and the run is never refused, blocked, or failed by the router or the evidence store.
+
+### Settings
+
+```sh
+infinite repo init --routing shadow --routing-value quality --routing-contributor allow
+infinite repo init --routing off
+```
+
+- `--routing off|shadow` sets the mode. `--routing auto` is refused: this host records shadow decisions only.
+- `--routing-value` is the dollar value of one success: `cost` (0.5), `balanced` (2), `quality` (8), or a number from 0 to 100.
+- `--routing-contributor allow|deny` sets whether contributor profiles may be candidates. The default is deny.
+- A rerun without these options keeps the saved policy unchanged. Each option you give merges over the saved policy. The routing policy is part of the routine approval digest, so a change blocks the project's active routines until the owner approves them again.
+
+With no saved policy, the default mode follows the project's autonomy mode: a `supervised` project is `off`, an `autonomous` project is `shadow`. Setting `--routing shadow` turns shadow on in a supervised project too. Knobs you do not set show as defaults in `routing status`.
+
+### What a decision row holds
+
+One row per task and revision, written at the task's first implementer start, with nothing recorded for a replacement. A row holds the run, revision, task key, point, role, area, kind, risk, feature map reference, mode `shadow`, the algorithm and reward versions, the policy digest, the seed, the basis, the chosen and greedy profiles, the coordinator's pick when there is one, the exploration flag, and the decision time. The project, the task ID, the area, and the feature map name are stored only as blind indexes (`project_ref` among them); the sealed payload holds the clear values and each candidate's posterior, cost, and utility, at most 32 KiB. A shadow row has no member ID.
+
+Nothing about the routing reaches a member: no prompt, context file, or tool carries the policy, a seed, a posterior, or a utility. A shadow run writes no line to the run's events.
+
+A run's team view shows the policy the run pinned: the mode, the requested mode, the source, the knobs and which are defaults, the algorithm and reward versions, and the digest. The relay carries team views, and a handoff run's view also shows the project's saved policy. No view shows a seed, a posterior, or a utility. Status and explain are not served over the relay.
+
+### Status and explain
+
+```sh
+infinite routing status PROJECT [--json]
+infinite routing explain RUN_ID TASK_ID [--json]
+```
+
+`status` shows the mode and its source, the value and the contributor setting, whether start is covered, how often the router matched the coordinator over the last 30 days, the shadow period (it ends after 14 days and 50 decisions, whichever is later), and each profile's posterior at each recorded area and at the new-task line. Intervals are 90% normal approximations. A count of zero is shown as "no decision had a coordinator pick", never as a rate. A cost that is a tier default is labelled as one. `explain` lists one task's start decisions, with the candidates each one considered.
+
+With owner criteria on (`project.team.objective.prompts: "on"`), status reads the evidence as the start of a goal cycle with a pinned record digest would, with the digest in the prompt version. In such a project, the rows of a standalone run, and of a goal cycle whose digest was skipped, count as earlier evidence. A recorded decision keeps the prompt version its own start used.
+
+Status reads at most the newest 500 decisions of the last 30 days and shows at most 50 cells that have a decision in those 30 days. A cell's evidence still counts for 180 days, and a cell with no decision in the last 30 days is not shown. Earlier mass is evidence from an earlier configuration or prompt version; it counts at most 10 per level. When the applied and the raw earlier mass differ, a profile's line reads `earlier mass A of R applied`, where A is the applied mass and R the raw one.
+
+### Retention
+
+The host removes decisions decided more than 180 days ago. A decision holds no run text, so it outlives the run record until that sweep.
+
+### Rolling back
+
+Before rolling back past this release, remove `routing` from every project's team block. This release provides no command that removes the key, so this step is still open. A rollback also leaves the outcome ledger unavailable until a host of this release or later runs again, because an older host cannot read its version 4.
+
 ## Launch-rate fuse
 
 The host limits how often it starts team sessions: 30 per project and 80 across the host in a rolling hour. A launch that would pass a limit waits. The member or goal shows a reason that starts "Waiting for the spend fuse:", names the project or the host, and gives no figures. The first trip of a UTC day closes by itself when fewer than half the limit remain in the last hour. If the limit is reached again on the same UTC day, the trip stays open until the owner closes it with `infinite fuse close --project PROJECT_ID` or `infinite fuse close --host`. The permission coordinator is never counted or held. The limits can be changed under `autonomy.fuse` in the host configuration (`project`, `host`, and `projects.PROJECT_ID`, each with `launchesPerHour`). A trip opened because the launch record cannot be read closes once the record can be read. Run `infinite fuse` to read every scope, or add `--json` for the full view. The `autonomy-interrupt` push event is on by default and sends the owner one notification per trip and subject per UTC day.

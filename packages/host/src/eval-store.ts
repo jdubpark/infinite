@@ -11,7 +11,9 @@ import {
   type Capsule,
   type CaptureStart,
   type EvalFeatures,
+  type EvalOrigin,
   type EvalReason,
+  type Lineage,
   type EvalState,
   type EvalTaskRow,
   type MaterialState,
@@ -37,7 +39,7 @@ const DAY_MS = 86_400_000;
  */
 const KEEP_STATUSES: ReadonlySet<string> = new Set(["merged", "no-change"]);
 
-const SCHEMA = [
+export const SCHEMA_V1 = [
   `CREATE TABLE IF NOT EXISTS eval_tasks (
     task_id TEXT PRIMARY KEY,
     origin TEXT NOT NULL,
@@ -71,8 +73,54 @@ const SCHEMA = [
   )`,
 ];
 
+/** Version 2: provenance groups, mined rows, the validation fields, path rows, and the jobs and mining tables. */
+export const SCHEMA_V2 = [
+  "ALTER TABLE eval_tasks ADD COLUMN group_id TEXT",
+  "ALTER TABLE eval_tasks ADD COLUMN commit_ref TEXT",
+  "ALTER TABLE eval_tasks ADD COLUMN area_ref TEXT",
+  "ALTER TABLE eval_tasks ADD COLUMN lineage TEXT",
+  "ALTER TABLE eval_tasks ADD COLUMN validated_at TEXT",
+  "ALTER TABLE eval_tasks ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE eval_tasks ADD COLUMN paths_indexed INTEGER NOT NULL DEFAULT 0",
+  "UPDATE eval_tasks SET group_id = 'run:' || run_id WHERE origin = 'captured'",
+  "DROP INDEX IF EXISTS eval_tasks_check",
+  "CREATE INDEX IF NOT EXISTS eval_tasks_check_captured ON eval_tasks (state, checked_at, task_id) WHERE origin = 'captured'",
+  "CREATE INDEX IF NOT EXISTS eval_tasks_group ON eval_tasks (group_id, origin, state)",
+  "CREATE UNIQUE INDEX IF NOT EXISTS eval_tasks_commit ON eval_tasks (project_ref, commit_ref) WHERE commit_ref IS NOT NULL",
+  "CREATE INDEX IF NOT EXISTS eval_tasks_summary ON eval_tasks (project_ref, origin, state, area_ref)",
+  "CREATE INDEX IF NOT EXISTS eval_tasks_next ON eval_tasks (project_ref, state, task_id)",
+  "CREATE INDEX IF NOT EXISTS eval_tasks_unindexed ON eval_tasks (project_ref, task_id) WHERE paths_indexed = 0 AND material IN ('stored', 'partial')",
+  `CREATE TABLE IF NOT EXISTS eval_groups (
+    group_id TEXT PRIMARY KEY, kind TEXT NOT NULL, project_ref TEXT NOT NULL, root_id TEXT NOT NULL,
+    dev_only INTEGER NOT NULL DEFAULT 0, landing_ref TEXT, landing_checked_at TEXT, created_at TEXT NOT NULL)`,
+  "CREATE INDEX IF NOT EXISTS eval_groups_root ON eval_groups (root_id)",
+  "CREATE INDEX IF NOT EXISTS eval_groups_project ON eval_groups (project_ref, root_id)",
+  "CREATE INDEX IF NOT EXISTS eval_groups_landing ON eval_groups (project_ref, landing_ref) WHERE landing_ref IS NOT NULL",
+  "CREATE INDEX IF NOT EXISTS eval_groups_unlanded ON eval_groups (landing_checked_at, group_id) WHERE landing_ref IS NULL AND kind = 'run'",
+  "INSERT OR IGNORE INTO eval_groups (group_id, kind, project_ref, root_id, created_at) "
+    + "SELECT 'run:' || run_id, 'run', project_ref, 'run:' || run_id, MIN(captured_at) FROM eval_tasks "
+    + "WHERE origin = 'captured' GROUP BY run_id, project_ref",
+  `CREATE TABLE IF NOT EXISTS eval_paths (
+    path_ref TEXT NOT NULL, captured_at TEXT NOT NULL, task_id TEXT NOT NULL,
+    PRIMARY KEY (path_ref, captured_at, task_id)) WITHOUT ROWID`,
+  "CREATE INDEX IF NOT EXISTS eval_paths_task ON eval_paths (task_id)",
+  `CREATE TABLE IF NOT EXISTS eval_mining (
+    project_ref TEXT PRIMARY KEY, state TEXT NOT NULL, visited INTEGER NOT NULL DEFAULT 0,
+    mined INTEGER NOT NULL DEFAULT 0, skipped INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0,
+    retry_at TEXT, updated_at TEXT NOT NULL, payload TEXT NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS eval_jobs (
+    job_id TEXT PRIMARY KEY, project_ref TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, reason TEXT,
+    waiting TEXT, request_id TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, started_at TEXT, expires_at TEXT NOT NULL,
+    finished_at TEXT, updated_at TEXT NOT NULL, visited INTEGER NOT NULL DEFAULT 0, valid INTEGER NOT NULL DEFAULT 0,
+    rejected INTEGER NOT NULL DEFAULT 0, retired INTEGER NOT NULL DEFAULT 0, undecided INTEGER NOT NULL DEFAULT 0,
+    streak INTEGER NOT NULL DEFAULT 0, cursor TEXT, payload TEXT NOT NULL)`,
+  "CREATE INDEX IF NOT EXISTS eval_jobs_project ON eval_jobs (project_ref, status)",
+  "CREATE INDEX IF NOT EXISTS eval_jobs_status ON eval_jobs (status, created_at, job_id)",
+  "CREATE INDEX IF NOT EXISTS eval_jobs_created ON eval_jobs (created_at, job_id)",
+];
+
 const TASK_COLUMNS = "task_id, origin, run_id, member_id, project_ref, state, reason, material, approval, approved_at, base, "
-  + "material_bytes, captured_at, decided_at, checked_at, run_deleted_at, payload";
+  + "material_bytes, captured_at, decided_at, checked_at, run_deleted_at, payload, group_id, lineage, validated_at, attempts";
 
 type TaskRow = {
   task_id: string;
@@ -92,6 +140,10 @@ type TaskRow = {
   checked_at: string;
   run_deleted_at: string | null;
   payload: string;
+  group_id: string | null;
+  lineage: string | null;
+  validated_at: string | null;
+  attempts: number;
 };
 
 /** The marker's outcome: a captured task with its capsule, or a task refused before any read. */
@@ -109,15 +161,17 @@ export type MaterialResult =
  */
 
 export type Decide = (task: EvalTaskRow & { payload: CapturedPayload }) => Promotion | { kind: "wait"; unreadable: true };
+/** Called once for each captured row that a decision promotes to `candidate`. */
+export type Promoted = (tx: EvidenceTx, task: EvalTaskRow) => void;
 
 export function evalCorpusModule(store: EvidenceStore, now: () => string): EvidenceModule {
   return {
     name: EVAL_MODULE,
-    version: 1,
-    readVersion: 1,
+    version: 2,
+    readVersion: 2,
     migrate(tx, from) {
-      if (from >= 1) return;
-      for (const statement of SCHEMA) tx.exec(statement);
+      if (from === 0) for (const statement of SCHEMA_V1) tx.exec(statement);
+      if (from < 2) for (const statement of SCHEMA_V2) tx.exec(statement);
     },
     deleteRun(tx, runId) {
       const owned = tx.get<{ n: number }>("SELECT count(*) AS n FROM eval_tasks WHERE run_id=?", runId)?.n ?? 0;
@@ -129,20 +183,20 @@ export function evalCorpusModule(store: EvidenceStore, now: () => string): Evide
         return;
       }
       tx.run("DELETE FROM eval_material WHERE task_id IN (SELECT task_id FROM eval_tasks WHERE run_id=?)", runId);
+      tx.run("DELETE FROM eval_paths WHERE task_id IN (SELECT task_id FROM eval_tasks WHERE run_id=?)", runId);
       tx.run("DELETE FROM eval_tasks WHERE run_id=?", runId);
     },
     runIds: db => db.all<{ run_id: string }>(LIVE_RUN_IDS_SQL).map(row => row.run_id),
     counts: db => {
-      const row = db.get<{ captured: number; candidate: number; rejected: number; bytes: number }>(
+      const row = db.get<{ captured: number; candidate: number; valid: number; rejected: number; retired: number; mined: number; bytes: number }>(
         "SELECT COALESCE(SUM(state='captured'), 0) AS captured, COALESCE(SUM(state='candidate'), 0) AS candidate, "
-        + "COALESCE(SUM(state='rejected'), 0) AS rejected, COALESCE(SUM(material_bytes), 0) AS bytes FROM eval_tasks",
+        + "COALESCE(SUM(state='valid'), 0) AS valid, COALESCE(SUM(state='rejected'), 0) AS rejected, "
+        + "COALESCE(SUM(state='retired'), 0) AS retired, COALESCE(SUM(origin='mined'), 0) AS mined, "
+        + "COALESCE(SUM(material_bytes), 0) AS bytes FROM eval_tasks",
       );
-      return {
-        captured: row?.captured ?? 0,
-        candidate: row?.candidate ?? 0,
-        rejected: row?.rejected ?? 0,
-        materialBytes: row?.bytes ?? 0,
-      };
+      const jobs = db.get<{ n: number }>("SELECT count(*) AS n FROM eval_jobs")?.n ?? 0;
+      return { captured: row?.captured ?? 0, candidate: row?.candidate ?? 0, valid: row?.valid ?? 0, rejected: row?.rejected ?? 0,
+        retired: row?.retired ?? 0, mined: row?.mined ?? 0, jobs, materialBytes: row?.bytes ?? 0 };
     },
   };
 }
@@ -158,7 +212,7 @@ export function capturedTaskId(runId: string, memberId: string): string {
 export function insertMarker(tx: EvidenceTx, start: CaptureStart, outcome: MarkerOutcome, at: string): "inserted" | "exists" | "full" {
   const taskId = capturedTaskId(start.runId, start.memberId);
   const ref = tx.index("project", start.projectId);
-  const rows = tx.get<{ n: number }>("SELECT count(*) AS n FROM eval_tasks WHERE project_ref=?", ref)?.n ?? 0;
+  const rows = tx.get<{ n: number }>(CAPTURED_COUNT_SQL, ref)?.n ?? 0;
   if (rows >= PROJECT_TASK_MAX) return "full";
   const capsuleBytes = outcome.state === "captured" ? Buffer.byteLength(canonicalJson(outcome.capsule), "utf8") : 0;
   const captured = outcome.state === "captured";
@@ -171,10 +225,12 @@ export function insertMarker(tx: EvidenceTx, start: CaptureStart, outcome: Marke
       integratedHead: start.integratedHead,
     }
     : { projectId: start.projectId };
+  const groupId = runGroupId(start.runId);
+  tx.run("INSERT OR IGNORE INTO eval_groups (group_id, kind, project_ref, root_id, created_at) VALUES (?, 'run', ?, ?, ?)", groupId, ref, groupId, start.at);
   const inserted = tx.run(
     "INSERT OR IGNORE INTO eval_tasks (task_id, origin, run_id, member_id, project_ref, state, reason, material, approval, "
-    + "approved_at, base, material_bytes, captured_at, decided_at, checked_at, run_deleted_at, payload) "
-    + "VALUES (?, 'captured', ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, NULL, ?)",
+    + "approved_at, base, material_bytes, captured_at, decided_at, checked_at, run_deleted_at, payload, group_id) "
+    + "VALUES (?, 'captured', ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, NULL, ?, ?)",
     taskId,
     start.runId,
     start.memberId,
@@ -188,6 +244,7 @@ export function insertMarker(tx: EvidenceTx, start: CaptureStart, outcome: Marke
     captured ? null : at,
     at,
     tx.seal("eval_tasks", taskId, payload),
+    groupId,
   );
   if (inserted.changes === 0) return "exists";
   if (outcome.state === "captured") {
@@ -206,8 +263,8 @@ export function insertMarker(tx: EvidenceTx, start: CaptureStart, outcome: Marke
  * 512 MiB, removes every part and rejects the row. False when the row is gone or its material is not pending.
  */
 export function completeMaterial(tx: EvidenceTx, taskId: string, result: MaterialResult, at: string): boolean {
-  const row = tx.get<{ material: string; project_ref: string; material_bytes: number; payload: string }>(
-    "SELECT material, project_ref, material_bytes, payload FROM eval_tasks WHERE task_id=?",
+  const row = tx.get<{ material: string; project_ref: string; material_bytes: number; payload: string; captured_at: string }>(
+    "SELECT material, project_ref, material_bytes, payload, captured_at FROM eval_tasks WHERE task_id=?",
     taskId,
   );
   if (!row || row.material !== "pending") return false;
@@ -236,20 +293,21 @@ export function completeMaterial(tx: EvidenceTx, taskId: string, result: Materia
     reference: result.reference.state === "stored" ? "stored" : "missing",
   };
   tx.run(
-    "UPDATE eval_tasks SET material=?, base=?, material_bytes=material_bytes+?, payload=? WHERE task_id=?",
+    "UPDATE eval_tasks SET material=?, base=?, material_bytes=material_bytes+?, payload=?, paths_indexed=1 WHERE task_id=?",
     partial ? "partial" : "stored",
     result.base,
     size,
     tx.seal("eval_tasks", taskId, next),
     taskId,
   );
+  writePaths(tx, payload.projectId, taskId, row.captured_at, result.files);
   return true;
 }
 
 /** Marks the run's captured and candidate rows of this anchor. A payload that does not open is marked `unknown`. */
 export function markApproval(tx: EvidenceTx, start: ApprovalStart): { taskId: string; integratedHead: string }[] {
   const rows = tx.all<{ task_id: string; payload: string }>(
-    "SELECT task_id, payload FROM eval_tasks WHERE run_id=? AND state IN ('captured', 'candidate')",
+    "SELECT task_id, payload FROM eval_tasks WHERE run_id=? AND state IN ('captured', 'candidate', 'valid')",
     start.runId,
   );
   const marked: { taskId: string; integratedHead: string }[] = [];
@@ -277,7 +335,7 @@ export function completeApproval(tx: EvidenceTx, taskId: string, approvedAt: str
     "SELECT state, approval, approved_at, payload FROM eval_tasks WHERE task_id=?",
     taskId,
   );
-  if (!row || (row.state !== "captured" && row.state !== "candidate")) return false;
+  if (!row || (row.state !== "captured" && row.state !== "candidate" && row.state !== "valid")) return false;
   if (row.approval !== "pending" || row.approved_at !== approvedAt) return false;
   if (later === undefined) {
     tx.run("UPDATE eval_tasks SET approval='unknown' WHERE task_id=?", taskId);
@@ -318,8 +376,18 @@ export function failPending(
   return touched.size;
 }
 
-/** The reconcile pass's order query, run once per state through `eval_tasks_check`. */
-export const RECONCILE_ORDER_SQL = "SELECT task_id, checked_at FROM eval_tasks WHERE state = ? ORDER BY checked_at, task_id LIMIT ?";
+/** The reconcile pass's order query, run once per state through `eval_tasks_check_captured`. */
+export const RECONCILE_ORDER_SQL = "SELECT task_id, checked_at FROM eval_tasks WHERE origin = 'captured' AND state = ? ORDER BY checked_at, task_id LIMIT ?";
+/** Captured rows of one project, read through `eval_tasks_summary`. Mined rows never count against capture's cap. */
+export const CAPTURED_COUNT_SQL = "SELECT count(*) AS n FROM eval_tasks WHERE project_ref = ? AND origin = 'captured'";
+/** Rows whose reference paths are not indexed yet, read through `eval_tasks_unindexed`. */
+export const UNINDEXED_SQL = "SELECT task_id, captured_at, payload FROM eval_tasks WHERE paths_indexed = 0 AND material IN ('stored', 'partial') ORDER BY project_ref, task_id LIMIT ?";
+/** Whether a project has a row whose paths are still unindexed. */
+export const PATHS_PENDING_SQL = "SELECT 1 AS one FROM eval_tasks WHERE project_ref = ? AND paths_indexed = 0 AND material IN ('stored','partial') LIMIT 1";
+/** Path rows written per task. */
+export const PATHS_PER_TASK_MAX = 500;
+/** Rows one `indexPaths` call handles. */
+export const PATHS_BATCH = 100;
 /** The runs with rows still held, read through `eval_tasks_live_runs`. */
 export const LIVE_RUN_IDS_SQL = "SELECT DISTINCT run_id FROM eval_tasks WHERE run_deleted_at IS NULL";
 /** The sweep visits at most this many project references a pass. */
@@ -337,11 +405,18 @@ export const TASK_BY_ID_SQL = `SELECT ${TASK_COLUMNS} FROM eval_tasks WHERE task
  * Visits at most `limit` captured or candidate rows, oldest `checked_at` first. A payload that does not open rejects
  * its row `unreadable`. `decide` gives the promotion; a candidate is written once, and a reject removes the material.
  */
-export function reconcileBatch(tx: EvidenceTx, decide: Decide, at: string, limit = SWEEP_BATCH): ReconcileResult {
+export function reconcileBatch(
+  tx: EvidenceTx,
+  decide: Decide,
+  at: string,
+  limit = SWEEP_BATCH,
+  onPromoted?: Promoted,
+): ReconcileResult {
   const result: ReconcileResult = { visited: 0, promoted: 0, rejected: 0, demoted: 0, waiting: 0, unreadable: 0 };
   const order = [
     ...tx.all<{ task_id: string; checked_at: string }>(RECONCILE_ORDER_SQL, "captured", limit),
     ...tx.all<{ task_id: string; checked_at: string }>(RECONCILE_ORDER_SQL, "candidate", limit),
+    ...tx.all<{ task_id: string; checked_at: string }>(RECONCILE_ORDER_SQL, "valid", limit),
   ]
     .sort((a, b) => (a.checked_at === b.checked_at ? compareText(a.task_id, b.task_id) : compareText(a.checked_at, b.checked_at)))
     .slice(0, limit);
@@ -354,10 +429,10 @@ export function reconcileBatch(tx: EvidenceTx, decide: Decide, at: string, limit
     try {
       task = taskOf(tx, row) as EvalTaskRow & { payload: CapturedPayload };
     } catch {
-      rejectRow(tx, row.task_id, "unreadable", at);
-      if (row.state === "candidate") result.demoted++;
-      else result.rejected++;
+      dropRow(tx, row, "unreadable", at);
       result.unreadable++;
+      if (row.state === "captured") result.rejected++;
+      else result.demoted++;
       continue;
     }
     const decision = decide(task);
@@ -369,18 +444,20 @@ export function reconcileBatch(tx: EvidenceTx, decide: Decide, at: string, limit
     if (decision.kind === "candidate") {
       if (row.state === "captured") {
         tx.run(
-          "UPDATE eval_tasks SET state='candidate', decided_at=?, payload=? WHERE task_id=?",
+          "UPDATE eval_tasks SET state='candidate', decided_at=?, area_ref=?, payload=? WHERE task_id=?",
           at,
+          tx.index("area", decision.features.area),
           tx.seal("eval_tasks", row.task_id, { ...task.payload, features: decision.features }),
           row.task_id,
         );
         result.promoted++;
+        onPromoted?.(tx, { ...task, state: "candidate" });
       }
       continue;
     }
-    rejectRow(tx, row.task_id, decision.reason, at, task.payload.projectId);
-    if (row.state === "candidate") result.demoted++;
-    else result.rejected++;
+    dropRow(tx, row, decision.reason, at, task.payload.projectId);
+    if (row.state === "captured") result.rejected++;
+    else result.demoted++;
   }
   return result;
 }
@@ -455,12 +532,14 @@ export function sweepEvalTasks(
  * The one reject rule. Every part goes, the row resets, and no later completion can match it. The payload is replaced
  * only when the project is known; an unreadable payload stays sealed as it was.
  */
-function rejectRow(tx: EvidenceTx, taskId: string, reason: EvalReason, at: string, projectId?: string): void {
+function settle(tx: EvidenceTx, taskId: string, state: "rejected" | "retired", reason: EvalReason, at: string, projectId?: string): void {
   tx.run("DELETE FROM eval_material WHERE task_id=?", taskId);
+  tx.run("DELETE FROM eval_paths WHERE task_id=?", taskId);
   const payload = projectId === undefined ? null : tx.seal("eval_tasks", taskId, { projectId } satisfies RejectedPayload);
   tx.run(
-    "UPDATE eval_tasks SET state='rejected', reason=?, material='none', base='none', approval=NULL, approved_at=NULL, "
+    "UPDATE eval_tasks SET state=?, reason=?, material='none', base='none', approval=NULL, approved_at=NULL, "
     + "material_bytes=0, decided_at=?, payload=COALESCE(?, payload) WHERE task_id=?",
+    state,
     reason,
     at,
     payload,
@@ -468,6 +547,66 @@ function rejectRow(tx: EvidenceTx, taskId: string, reason: EvalReason, at: strin
   );
 }
 
+function rejectRow(tx: EvidenceTx, taskId: string, reason: EvalReason, at: string, projectId?: string): void {
+  settle(tx, taskId, "rejected", reason, at, projectId);
+}
+
+/** A valid row that a reject takes is retired; any other row is rejected. */
+function dropRow(tx: EvidenceTx, row: TaskRow, reason: EvalReason, at: string, projectId?: string): void {
+  settle(tx, row.task_id, row.state === "valid" ? "retired" : "rejected", reason, at, projectId);
+}
+
+/** The one reject rule, exported. It also deletes the task's eval_paths rows. */
+export function rejectTask(tx: EvidenceTx, taskId: string, reason: EvalReason, at: string, projectId?: string): void {
+  rejectRow(tx, taskId, reason, at, projectId);
+}
+
+/** As rejectTask, with state `retired`. For a task that was `valid` or a mined `candidate` taken by the duplicate rule. */
+export function retireTask(tx: EvidenceTx, taskId: string, reason: EvalReason, at: string, projectId?: string): void {
+  settle(tx, taskId, "retired", reason, at, projectId);
+}
+
+/** The group row id of a run's captured tasks. */
+function runGroupId(runId: string): string {
+  return `run:${runId}`;
+}
+
+/** The path reference of one reference file, keyed by its project. */
+export function pathRef(db: EvidenceDb, projectId: string, path: string): string {
+  return db.index("eval-path", `${projectId}\u0000${path}`);
+}
+
+/** Writes one path row per reference file, at most PATHS_PER_TASK_MAX. */
+function writePaths(tx: EvidenceTx, projectId: string, taskId: string, capturedAt: string, files: readonly string[]): void {
+  for (const file of files.slice(0, PATHS_PER_TASK_MAX)) {
+    tx.run(
+      "INSERT OR IGNORE INTO eval_paths (path_ref, captured_at, task_id) VALUES (?, ?, ?)",
+      pathRef(tx, projectId, file),
+      capturedAt,
+      taskId,
+    );
+  }
+}
+
+/** Writes the path rows that v1 left unindexed. Returns the number of rows marked indexed; a payload that does not open writes nothing. */
+export function indexPaths(tx: EvidenceTx, limit = PATHS_BATCH): number {
+  const rows = tx.all<{ task_id: string; captured_at: string; payload: string }>(UNINDEXED_SQL, limit);
+  for (const row of rows) {
+    try {
+      const payload = tx.open<CapturedPayload>("eval_tasks", row.task_id, row.payload);
+      writePaths(tx, payload.projectId, row.task_id, row.captured_at, payload.files ?? []);
+    } catch {
+      // Reconcile rejects an unreadable row; its paths stay out.
+    }
+    tx.run("UPDATE eval_tasks SET paths_indexed=1 WHERE task_id=?", row.task_id);
+  }
+  return rows.length;
+}
+
+/** Whether a project still has a row whose paths are not indexed. */
+export function pathsPending(db: EvidenceDb, projectRef: string): boolean {
+  return db.get(PATHS_PENDING_SQL, projectRef) !== undefined;
+}
 /** Code-unit order, the order SQLite's BINARY collation gives for these ASCII keys. */
 function compareText(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
@@ -486,6 +625,7 @@ function insertPart(tx: EvidenceTx, taskId: string, part: "base-delta" | "refere
 function deleteTasks(tx: EvidenceTx, taskIds: readonly string[]): number {
   for (const taskId of taskIds) {
     tx.run("DELETE FROM eval_material WHERE task_id=?", taskId);
+    tx.run("DELETE FROM eval_paths WHERE task_id=?", taskId);
     tx.run("DELETE FROM eval_tasks WHERE task_id=?", taskId);
   }
   return taskIds.length;
@@ -507,7 +647,7 @@ function projectIdOf(db: EvidenceDb, taskId: string, sealed: string): string | u
 function taskOf(db: EvidenceDb, row: TaskRow): EvalTaskRow {
   return {
     taskId: row.task_id,
-    origin: "captured",
+    origin: row.origin as EvalOrigin,
     runId: row.run_id,
     memberId: row.member_id,
     projectRef: row.project_ref,
@@ -522,10 +662,10 @@ function taskOf(db: EvidenceDb, row: TaskRow): EvalTaskRow {
     decidedAt: row.decided_at ?? null,
     checkedAt: row.checked_at,
     runDeletedAt: row.run_deleted_at ?? null,
-    groupId: null,
-    lineage: null,
-    validatedAt: null,
-    attempts: 0,
+    groupId: row.group_id ?? null,
+    lineage: (row.lineage ?? null) as Lineage | null,
+    validatedAt: row.validated_at ?? null,
+    attempts: row.attempts,
     payload: db.open<CapturedPayload | RejectedPayload>("eval_tasks", row.task_id, row.payload),
   };
 }
@@ -550,3 +690,4 @@ function lastRunStatus(store: EvidenceStore, tx: EvidenceTx, runId: string): str
   const status = last?.data.status;
   return typeof status === "string" ? status : undefined;
 }
+

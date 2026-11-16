@@ -171,8 +171,11 @@ test("elevated risk is greedy at the mean minus one deviation with triple value"
   }
 });
 
-// Recorded from the implementation on 2026-11-15. A changed generator must raise ROUTING_ALGORITHM_VERSION.
+// Recorded from the implementation on 2026-11-15 on arm64. A changed generator must raise ROUTING_ALGORITHM_VERSION.
+// Math.log, Math.cos and ** can differ in the last bits between CPUs: x64 gives 0.10943549295678799 for the third
+// value, 2 ULPs away. The pin allows 1e-12, far above that noise and far below what a changed generator moves.
 const GOLDEN_VALUES = [0.2881993592935194, 0.35225517656152383, 0.10943549295678802];
+const GOLDEN_TOLERANCE = 1e-12;
 
 test("the sampler is deterministic and matches its Beta", () => {
   assert.deepEqual(betaSample(2, 5, "repeat"), betaSample(2, 5, "repeat"));
@@ -194,10 +197,10 @@ test("the sampler is deterministic and matches its Beta", () => {
     assert.throws(() => betaSample(a, b, "s"), RangeError);
   }
 
-  assert.deepEqual(
-    ["golden-1", "golden-2", "golden-3"].map(seed => betaSample(2, 5, seed).value),
-    GOLDEN_VALUES,
-  );
+  ["golden-1", "golden-2", "golden-3"].forEach((seed, i) => {
+    const value = betaSample(2, 5, seed).value;
+    assert.ok(Math.abs(value - GOLDEN_VALUES[i]) <= GOLDEN_TOLERANCE, `${seed}: ${value} is not ${GOLDEN_VALUES[i]}`);
+  });
 });
 
 test("the seed binds every part of the key", () => {

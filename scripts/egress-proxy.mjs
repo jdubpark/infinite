@@ -28,6 +28,7 @@ const MAX_EARLY_BYTES = 64 * 1024;
 
 export const DEFAULT_LIMITS = Object.freeze({
   connectTimeoutMs: 10_000,
+  attemptDelayMs: 250,
   dnsTimeoutMs: 5_000,
   idleTimeoutMs: 600_000,
   headersTimeoutMs: 15_000,
@@ -42,6 +43,7 @@ export const DEFAULT_LIMITS = Object.freeze({
 });
 const LIMIT_BOUNDS = Object.freeze({
   connectTimeoutMs: [100, 120_000],
+  attemptDelayMs: [10, 60_000],
   dnsTimeoutMs: [100, 60_000],
   idleTimeoutMs: [1_000, 86_400_000],
   headersTimeoutMs: [1_000, 120_000],
@@ -616,6 +618,22 @@ function statusFor(reason, decision) {
   return 403;
 }
 
+/** Upstream attempts one request may hold open at once. With maxConnections clients this bounds upstream sockets at
+ * four per client, well inside the service's descriptor limit. */
+const MAX_ATTEMPTS_IN_FLIGHT = 4;
+
+/** Checked addresses in RFC 8305 order: the resolver's first family first, then alternating, each family in resolver order. */
+function alternateFamilies(addresses) {
+  const first = addresses.filter(entry => entry.family === addresses[0]?.family);
+  const other = addresses.filter(entry => entry.family !== addresses[0]?.family);
+  const ordered = [];
+  for (let i = 0; i < Math.max(first.length, other.length); i++) {
+    if (i < first.length) ordered.push(first[i]);
+    if (i < other.length) ordered.push(other[i]);
+  }
+  return ordered;
+}
+
 function sameAddress(actual, expected) {
   if (typeof actual !== "string") return false;
   const normalized = canonicalAddress(actual.startsWith("::ffff:") && isIPv4(actual.slice(7)) && expected.includes(".") ? actual.slice(7) : actual);
@@ -901,20 +919,32 @@ export function createEgressProxy(options) {
   }
 
   /**
-   * Connects to the checked addresses in order, by address, so no second lookup can change the target. `signal`
-   * aborts when the client goes away; the attempt in progress is then destroyed at once.
+   * Connects to the checked addresses, by address, so no second lookup can change the target. Attempts are staggered
+   * as RFC 8305 describes: families alternate, and the next address starts as soon as the current one fails or after
+   * `attemptDelayMs`, so an address that never answers (a route that drops packets) cannot use up the whole connect
+   * timeout. At most MAX_ATTEMPTS_IN_FLIGHT attempts are open per request: starting another retires the oldest, so a
+   * name with many silent addresses keeps moving without holding a socket for each. The first attempt to connect wins
+   * and the others are destroyed. `signal` aborts when the client goes away; every attempt in progress is then
+   * destroyed at once.
    */
   function connectUpstream(addresses, port, signal) {
+    const ordered = alternateFamilies(addresses);
     return new Promise((resolvePromise, reject) => {
       let index = 0;
       let settled = false;
-      let current;
-      const stop = code => {
-        if (settled) return;
+      let stagger;
+      const pending = new Set();
+      const finish = () => {
         settled = true;
         clearTimeout(overall);
+        clearTimeout(stagger);
         signal.removeEventListener("abort", abandoned);
-        current?.destroy();
+        for (const socket of pending) socket.destroy();
+        pending.clear();
+      };
+      const stop = code => {
+        if (settled) return;
+        finish();
         reject(new EgressError(code));
       };
       const abandoned = () => stop("client-closed");
@@ -923,19 +953,28 @@ export function createEgressProxy(options) {
       signal.addEventListener("abort", abandoned, { once: true });
       const attempt = () => {
         if (settled) return;
-        if (index >= addresses.length) { stop("connect-failed"); return; }
-        const { address, family } = addresses[index++];
+        clearTimeout(stagger);
+        if (index >= ordered.length) {
+          if (pending.size === 0) stop("connect-failed");
+          return;
+        }
+        if (pending.size >= MAX_ATTEMPTS_IN_FLIGHT) {
+          const oldest = pending.values().next().value;
+          pending.delete(oldest);
+          oldest.destroy();
+        }
+        const { address, family } = ordered[index++];
         const socket = openSocket({ host: address, port, family, noDelay: true });
-        current = socket;
+        pending.add(socket);
         socket.once("error", () => {
           socket.destroy();
+          pending.delete(socket);
           attempt();
         });
         socket.once("connect", () => {
           if (settled) { socket.destroy(); return; }
-          settled = true;
-          clearTimeout(overall);
-          signal.removeEventListener("abort", abandoned);
+          pending.delete(socket);
+          finish();
           socket.removeAllListeners("error");
           socket.on("error", () => {});
           if (!sameAddress(socket.remoteAddress, address)) {
@@ -945,6 +984,7 @@ export function createEgressProxy(options) {
           }
           resolvePromise({ socket, address });
         });
+        if (index < ordered.length) stagger = setTimeout(attempt, limits.attemptDelayMs);
       };
       attempt();
     });

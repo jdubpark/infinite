@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { ENTRY_PARAGRAPH_LIMIT_BYTES, entryCommand, entryInstructions, refreshReportingInstructions, reportCommand, retargetPrompt, teamContext, teamPrompt } from "../packages/host/src/team-prompts.js";
 import { teamReportSchema, type TeamBrief, type TeamModelProfile, type TeamRun, type TeamTask } from "../packages/host/src/team-types.js";
+import type { TeamRunRouting, TeamRunRoutingAuto } from "../packages/host/src/routing-types.js";
 
 const PROMPT_LIMIT_BYTES = 80 * 1024;
 
@@ -466,4 +467,81 @@ test("the record digest replaces the success text and nothing else", () => {
   const context = teamContext(withRecord, undefined, { checks: PIN_CHECKS }, "implementer");
   const plain = teamContext(without, undefined, { checks: PIN_CHECKS }, "implementer");
   assert.deepEqual(context, { ...plain, authority: { ...plain.authority, goal: { ...PIN_GOAL, record: PIN_RECORD } } });
+});
+
+// INF-280 step 2: `auto` prompts. Off and shadow runs keep their bytes; no member reads a routing value.
+const AUTO_SPARK: TeamModelProfile = { id: "spark-high", label: "Spark implementer", provider: "opencode", model: "meta/muse-spark-1.3-contributor", variant: "high", tier: "light", dataUse: "contributor" };
+const AUTO_ASTRA: TeamModelProfile = { id: "astra-xhigh", label: "Astra implementer", provider: "codex", model: "gpt-6-astra", effort: "xhigh" };
+const AUTO_LINEUP = { coordinator: ENTRY_PROFILE, integrator: ENTRY_PROFILE, reviewer: { id: "opus-reviewer", label: "Opus reviewer", provider: "claude", model: "claude-opus-5-5", effort: "xhigh" }, implementers: [AUTO_SPARK, AUTO_ASTRA] } as TeamRun["lineup"];
+const AUTO_KNOBS = { points: ["start"], cascade: false, successValueUsd: 8, maxExploreShare: 0.2, exploreWindow: 50, minSpareAttempts: 4, allowContributor: false, listWeight: 0.25, headroomWeight: 1 };
+const AUTO_DIGEST = sha256("auto-policy-digest-for-prompt-tests");
+const AUTO_PIN = { mode: "auto", requested: "auto", source: "autonomous-default", knobs: AUTO_KNOBS, defaults: [], algorithmVersion: 1, rewardVersion: 1, digest: AUTO_DIGEST, periodEndedAt: "2026-11-01T00:00:00.000Z" } as unknown as TeamRunRoutingAuto;
+const SHADOW_PIN = (requested: "shadow" | "auto") => ({ mode: "shadow", requested, source: "saved", knobs: AUTO_KNOBS, defaults: [], algorithmVersion: 1, rewardVersion: 1, digest: AUTO_DIGEST }) as unknown as TeamRunRouting;
+const HOST_ASSIGNS = "The host assigns each plan task's worker profile; omit agentProfileId from plan tasks. Coordinator, integrator, and reviewer profiles are fixed. Do not invent profile IDs, model names, effort settings, or executable arguments.";
+const SCOUT_POOL_SENTENCE = `Choose each scout's agentProfileId from this approved scout pool: ${JSON.stringify([AUTO_ASTRA])}.`;
+const ROUTING_VALUE_WORDS = /"routing":|routingRevokedAt|maxExploreShare|exploreWindow|minSpareAttempts|allowContributor|listWeight|headroomWeight|successValueUsd/;
+const autoRunWith = (extra: Partial<TeamRun> = {}) => smallRun({ lineup: AUTO_LINEUP, routing: AUTO_PIN, ...extra });
+const coordinatorPrompt = (run: TeamRun) => teamPrompt(run, "project-manager", undefined, undefined, "claude", ENTRY_PROFILE, { checks: PIN_CHECKS }, [], true);
+
+test("off and shadow prompts and contexts are byte-equal to main", () => {
+  for (const requested of ["shadow", "auto"] as const) {
+    const plain = smallRun({ lineup: AUTO_LINEUP });
+    const pinned = smallRun({ lineup: AUTO_LINEUP, routing: SHADOW_PIN(requested) });
+    for (const role of PIN_ROLES) {
+      const prompt = (run: TeamRun) => teamPrompt(run, role, undefined, undefined, "claude", ENTRY_PROFILE, { checks: PIN_CHECKS }, [], true);
+      assert.equal(prompt(pinned), prompt(plain), `${role} prompt with a ${requested} pin`);
+      assert.equal(JSON.stringify(teamContext(pinned, undefined, { checks: PIN_CHECKS }, role)), JSON.stringify(teamContext(plain, undefined, { checks: PIN_CHECKS }, role)), `${role} context with a ${requested} pin`);
+    }
+  }
+});
+
+test("an auto coordinator is told the host assigns profiles", () => {
+  const prompt = coordinatorPrompt(autoRunWith());
+  assert.equal(prompt.split(HOST_ASSIGNS).length, 2, "the assignment sentence appears once");
+  assert.doesNotMatch(prompt, /Every task MUST include agentProfileId/);
+  assert.match(prompt, /"instructions":"\.\.\.","paths"/, "the plan example omits agentProfileId");
+  assert.equal(prompt.split(SCOUT_POOL_SENTENCE).length, 2, "the scout pool names only the rule-1 profile");
+  assert.doesNotMatch(prompt, /spark-high/);
+  assert.doesNotMatch(prompt, ROUTING_VALUE_WORDS);
+  assert.equal(prompt.slice(0, 4000).includes(AUTO_DIGEST), false, "the policy digest stays out of the first 4,000 characters");
+  assert.equal(prompt.includes(AUTO_DIGEST), false, "the policy digest stays out of the prompt");
+});
+
+test("a revoked run and an auto implementer see only the profiles that pass", () => {
+  const revoked = autoRunWith({ routingRevokedAt: "2026-11-02T00:00:00.000Z" });
+  const prompt = coordinatorPrompt(revoked);
+  assert.ok(prompt.includes(`Every task MUST include agentProfileId from this approved worker pool: ${JSON.stringify([AUTO_ASTRA])}. Prefer light`), "the revoked run lists the rule-1 and rule-2 pool");
+  assert.doesNotMatch(prompt, /The host assigns each plan task's worker profile/);
+  assert.match(prompt, /"instructions":"\.\.\.",\"agentProfileId\":"astra-xhigh"/, "the revoked plan example names the first eligible profile");
+  assert.ok(prompt.includes(SCOUT_POOL_SENTENCE), "the revoked explore text names the rule-1 scout pool");
+  const escalation = (run: TeamRun) => teamPrompt(run, "implementer", undefined, undefined, "claude", ENTRY_PROFILE, { checks: PIN_CHECKS }, [], true);
+  const withEscalations = (routing: TeamRun["routing"], escalations: TeamModelProfile[], routingRevokedAt?: string) =>
+    smallRun({ lineup: { ...AUTO_LINEUP, escalations } as TeamRun["lineup"], routing, routingRevokedAt });
+  assert.ok(escalation(withEscalations(AUTO_PIN, [AUTO_SPARK, AUTO_ASTRA])).includes(`to this approved pool: ${JSON.stringify([AUTO_ASTRA])}.`), "an auto implementer escalates to the strong profile only");
+  assert.ok(escalation(withEscalations(AUTO_PIN, [AUTO_SPARK, AUTO_ASTRA], "2026-11-02T00:00:00.000Z")).includes(`to this approved pool: ${JSON.stringify([AUTO_ASTRA])}.`), "a revoked run escalates to the strong profile only");
+  assert.doesNotMatch(escalation(withEscalations(AUTO_PIN, [AUTO_SPARK])), /request one explicit escalation/, "no escalation paragraph without a rule-1 escalation profile");
+  assert.ok(escalation(withEscalations(undefined, [AUTO_SPARK, AUTO_ASTRA])).includes(`to this approved pool: ${JSON.stringify([AUTO_SPARK, AUTO_ASTRA])}.`), "an off run escalates to every approved profile");
+});
+
+test("a member context never carries a task's routing, in any role or snapshot", () => {
+  const routing = { profileId: "astra-xhigh", by: "router" };
+  const task = { id: "task-1", title: "Change the reader", instructions: "Read the file.", paths: ["src/reader.ts"], dependsOn: [], revision: 1, status: "pending" };
+  const scout = { id: "scout-1", title: "Inspect the flow", instructions: "Find the entry point.", agentProfileId: AUTO_ASTRA.id, status: "complete", summary: "Found it." };
+  const continuation = { revision: 1, requestId: "request-1", at: "2026-11-02T00:00:00.000Z", reason: "Repair", headCommit: "b".repeat(40), tasks: [{ ...task, status: "integrated" }] };
+  const plain = autoRunWith({ routingRevokedAt: "2026-11-02T00:00:00.000Z", tasks: [task], discovery: { revision: 1, summary: "Found it.", tasks: [scout] }, continuations: [continuation] } as unknown as Partial<TeamRun>);
+  const tagged = {
+    ...plain,
+    tasks: (plain.tasks ?? []).map(item => ({ ...item, routing })),
+    discovery: { ...plain.discovery!, tasks: plain.discovery!.tasks.map(item => ({ ...item, routing })) },
+    continuations: ((plain as TeamRun & { continuations: (typeof continuation)[] }).continuations).map(item => ({ ...item, tasks: item.tasks.map(next => ({ ...next, routing })) })),
+  } as unknown as TeamRun;
+  for (const role of ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer"] as const) {
+    const snapshot = JSON.stringify(teamContext(tagged, undefined, { checks: PIN_CHECKS }, role));
+    assert.doesNotMatch(snapshot, /"routing":/, `${role} context`);
+    assert.doesNotMatch(snapshot, /routingRevokedAt/, `${role} context`);
+    assert.equal(snapshot, JSON.stringify(teamContext(plain, undefined, { checks: PIN_CHECKS }, role)), `${role} context matches the run without routing`);
+  }
+  const inline = teamPrompt(tagged, "implementer", tagged.tasks[0], undefined, "codex", AUTO_ASTRA, { checks: PIN_CHECKS }, [], true);
+  assert.doesNotMatch(inline, /"routing":/, "the inline implementer task");
+  assert.equal(inline, teamPrompt(plain, "implementer", plain.tasks[0], undefined, "codex", AUTO_ASTRA, { checks: PIN_CHECKS }, [], true));
 });

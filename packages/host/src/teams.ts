@@ -16,6 +16,7 @@ import { autonomyOf, type AutonomyMode } from "./autonomy.js";
 import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionAgentDecision, type TeamPermissionDecision, type TeamPermissionRecoveryOutcome, type TeamPermissionRecoveryRequest, type TeamPermissionRecoveryStep, type TeamPermissionRecoveryView, type TeamPublication, type TeamPublicationCategory, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, ACTIVE_MEMBER_STATUSES, currentPermissions, DEFAULT_STORAGE_FLOOR, DEFAULT_TEAM_RETENTION, hostClosedBlockedReason } from "./team-types.js";
 import { memberConfiguration, type MemberConfiguration } from "./config-identity.js";
 import { ownerDirectionLines, permissionFollowUpPrompt, refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
+import { validateTeamAcceptance } from "./team-acceptance.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { resumeFailed } from "./native-continuation.js";
 import { combineCoverage, type UsageService } from "./usage-service.js";
@@ -5535,10 +5536,19 @@ export class TeamService {
       if (member.baseCommit !== run.headCommit || stored.checkHead !== run.headCommit) { this.block(stored, new TeamError(409, "stale-review", "The reviewer did not review the currently verified integration commit.")); return; }
       if (run.brief?.uiChanges && report.verdict === "approved" && !report.uiEvidence)
         throw new TeamError(409, "ui-review-evidence-required", "Approval of UI changes requires the reviewer's evidence from inspecting the runnable interface.");
+      const acceptanceProblem = validateTeamAcceptance(run.brief, report.verdict, report.acceptance);
+      if (acceptanceProblem) {
+        if (run.acceptanceCorrections?.includes(run.revision)) { this.block(stored, new TeamError(409, "acceptance-evidence-required", acceptanceProblem)); return; }
+        run.acceptanceCorrections = [...(run.acceptanceCorrections ?? []), run.revision];
+        this.event(stored, "The reviewer's acceptance evidence was incomplete or invalid; requesting a corrected review.");
+        this.save(stored);
+        this.prepareMember(stored, "reviewer", undefined, `Review rejected: ${acceptanceProblem}\nReport one acceptance entry per criterion. If any criterion is not verified, the verdict must be changes-requested.`);
+        return;
+      }
       this.operation(stored, "result", async signal => {
         await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
       }, () => {
-        run.review = { verdict: report.verdict, summary: report.summary, revision: run.revision, ...(report.uiEvidence ? { uiEvidence: report.uiEvidence } : {}) };
+        run.review = { verdict: report.verdict, summary: report.summary, revision: run.revision, ...(report.uiEvidence ? { uiEvidence: report.uiEvidence } : {}), ...(report.acceptance ? { acceptance: report.acceptance } : {}) };
         const rubricKept: { taskId: string; correctness: number; cleanliness: number; extensibility: number; docs: number }[] = [];
         if (report.verdict === "approved" && report.rubric?.length) {
           const reviewer = member.modelProfile ?? this.memberProfile(run, "reviewer");
@@ -5557,7 +5567,8 @@ export class TeamService {
         this.emitWith(stored, "review.recorded", [member.revision, member.memberId], { memberId: member.memberId, revision: member.revision }, () => {
           const reviewer = member.modelProfile ?? this.memberProfile(run, "reviewer");
           return { verdict: report.verdict, headCommit: member.baseCommit, baseCommit: run.baseCommit,
-            reviewer: profileIdentity(reviewer, member.provider ?? run.provider), rubric: rubricKept.length ? rubricKept : undefined };
+            reviewer: profileIdentity(reviewer, member.provider ?? run.provider), rubric: rubricKept.length ? rubricKept : undefined,
+            acceptance: report.acceptance?.map(({ criterion, verdict }) => ({ criterion, verdict })) };
         });
         if (report.verdict === "approved") this.captureApproved(stored, member.baseCommit);
         if (report.verdict === "changes-requested") {

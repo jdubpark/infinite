@@ -16,7 +16,8 @@
     "dev": "tsx packages/host/src/cli.ts dev",
     "host": "node packages/host/dist/cli.js",
     "web": "npm run dev -w @infinite/web",
-    "check": "npm run typecheck && npm test && npm run build",
+    "check:size": "node scripts/check-file-size.mjs",
+    "check": "npm run check:size && npm run typecheck && npm test && npm run build",
     "desktop:build": "node scripts/build-macos.mjs",
     "desktop:install": "node scripts/build-macos.mjs --install",
     "desktop:test": "tsx scripts/test-macos-integration.ts"

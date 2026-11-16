@@ -489,6 +489,18 @@ test("the relay refuses objective records", async () => {
   } finally { client.close(); runner.close(); }
 });
 
+test("the relay refuses routing reads", async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    // The routing status and the explain read reach the host over a direct connection only, like the records.
+    for (const path of [`/routing/projects/rehearsal`, `/teams/${randomUUID()}/routing/task-1`])
+      await assert.rejects(client.request(path), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    assert.equal(runner.requests.length, 1, "a refused routing read does not reach the host");
+  } finally { client.close(); runner.close(); }
+});
+
 test("the relay refuses corrections", async () => {
   const runner = await httpRunner();
   const client = createRemoteClient({ url: runner.url, token: runner.token });

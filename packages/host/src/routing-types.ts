@@ -4,16 +4,23 @@ export type RoutingMode = "off" | "shadow" | "auto";
 export type RoutingPoint = "start" | "escalation" | "scout";
 export type RoutingKnobs = { points: RoutingPoint[]; cascade: boolean; successValueUsd: number; maxExploreShare: number;
   exploreWindow: number; minSpareAttempts: number; allowContributor: boolean; listWeight: number; headroomWeight: number };
-/** Pinned on a run that records. Only `shadow` exists in this slice. */
-export type TeamRunRouting = { mode: "shadow"; requested: "shadow" | "auto"; source: "saved" | "autonomous-default";
+/** Pinned on a run that records. A stored step-1 pin is the shadow arm. */
+export type TeamRunRoutingShadow = { mode: "shadow"; requested: "shadow" | "auto"; source: "saved" | "autonomous-default";
   knobs: RoutingKnobs; defaults: (keyof RoutingKnobs)[]; algorithmVersion: number; rewardVersion: number; digest: string };
+/** `auto` pins carry the stored end of the project's shadow period. */
+export type TeamRunRoutingAuto = Omit<TeamRunRoutingShadow, "mode" | "requested"> & { mode: "auto"; requested: "auto"; periodEndedAt: string };
+export type TeamRunRouting = TeamRunRoutingShadow | TeamRunRoutingAuto;
 export type Identity = { provider: string; model: string; effort: string | null };
 export type RoutingEvidenceRow = Pick<OutcomeRow, "outcomeId" | "source" | "projectRef" | "areaRef" | "provider" | "model"
   | "effort" | "profileEpoch" | "kind" | "featureVersion" | "disposition" | "exclusion" | "flags" | "integrated" | "accepted"
   | "firstPass" | "held" | "endedAt" | "frozenAt">
   & { point: "start" | "escalation"; featureMapRef: string | null; ownerScore: number | null; promptVersion: string | null };
 export type RuleRemoval = "contributor" | "reviewer-model" | "limited";
-export type Basis = "sampled" | "greedy-risk" | "single-candidate" | "default-all-limited";
+export type Basis = "sampled" | "greedy-risk" | "greedy-paused" | "greedy-budget" | "greedy-share" | "single-candidate" | "default-all-limited";
+/** What the guards read for one `auto` start. Sealed in the payload of every `auto` row. */
+export type ExploreGuards = { pausedAt: string | null; spareAttempts: number; share: { exploratory: number; of: number } };
+/** The project's routing state the host keeps for the period and the explore pause. */
+export type ProjectRoutingState = { periodEndedAt: string | null; explorePausedAt: string | null };
 export type Beta = { a: number; b: number };
 export type LevelName = "cell" | "project" | "tenant";
 export type LevelRecord = { level: LevelName; observed: { success: number; failure: number; rows: number };
@@ -27,7 +34,7 @@ export type CandidateRecord = { profileId: string; identity: string; tier: "ligh
 export type RoutingPayload = { projectId: string; taskId: string; area: string; featureMap: string; coordinatorProfileId: string | null;
   knobs: RoutingKnobs; costs: { lightUsd: number; strongUsd: number; rescueUsd: number; basis: "tier-default" };
   headroom: "not-modelled"; chosenWeight: number; current: { identity: string; epoch: number; promptVersion: string }[];
-  candidates: CandidateRecord[]; elapsedMs: number };
+  candidates: CandidateRecord[]; elapsedMs: number; /** `auto` rows only; a stored shadow payload has none. */ guards?: ExploreGuards };
 export type DecisionRow = { key: string; runId: string; revision: number; taskKey: string; point: RoutingPoint; ordinal: number;
   projectRef: string; role: "implementer" | "scout"; areaRef: string | null; kind: string | null; risk: "normal" | "elevated";
   featureVersion: number; featureMapRef: string; mode: "shadow" | "auto"; algorithmVersion: number; rewardVersion: number;

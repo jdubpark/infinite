@@ -549,6 +549,8 @@ export interface TeamMember extends TeamAssignment {
 }
 /** The member states the team service counts as active. */
 export const ACTIVE_MEMBER_STATUSES: readonly TeamMember["status"][] = ["queued", "running", "reported", "unavailable"];
+/** `auto`-pinned runs only: the profile the host started the task on, and who chose it. Disclosed in the team view; never in a member's prompt or context. */
+export type TaskRouting = { profileId: string; by: "router" | "fallback" };
 export interface TeamTask extends TeamTaskPlan {
   /** Run revision whose plan created this task. */
   revision: number;
@@ -565,6 +567,8 @@ export interface TeamTask extends TeamTaskPlan {
   escalation?: { fromProfileId?: string; toProfileId: string; reason: string; memberId: string; at: string };
   /** Each provider-limit switch of this task's member; a replacement can itself be switched. */
   limitSwitches?: { fromProfileId?: string; toProfileId: string; reason: string; resetsAt?: string; memberId: string; at: string }[];
+  /** `auto`-pinned runs only: the profile the host started this task on, and who chose it. Never shown to a member. */
+  routing?: TaskRouting;
 }
 export interface TeamContinuation {
   revision: number;
@@ -615,6 +619,8 @@ export interface TeamRun {
   blackboard?: { tools: true };
   /** The routing policy pinned when the run starts. Absent on runs without a recording policy. */
   routing?: TeamRunRouting;
+  /** Set when the owner revokes the run's `auto` routing. Absent on every other run. */
+  routingRevokedAt?: string;
   /** The project's autonomy mode, pinned when the run starts. Absent on runs recorded before the mode existed; read with autonomyOf(). */
   autonomy?: AutonomyMode;
   /** Explicit owner delegation pinned at creation. Old runs remain opted out. */

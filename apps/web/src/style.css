@@ -1749,6 +1749,7 @@ small,
   .permission-detail h1.permission-action { font-size: 18px; }
   .permission-filter-fields select { min-height: 44px; }
   .text-button.permission-overview-link { display: inline-flex; min-height: 44px; margin: 0 6px 4px; }
+}
 
 /* The owner's halt. It lasts until the owner releases it, so it takes its own place in the flow instead of floating. */
 .halt-banner {

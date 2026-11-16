@@ -31,6 +31,21 @@ export type TeamWorkspaceEvidence = { changedPaths: string[]; evidence: Permissi
 /** Binds the request to the dialog and to the workspace evidence it was collected with. */
 const workspaceDigest = (workspace: TeamWorkspaceEvidence) => digest({ changedPaths: [...workspace.changedPaths].sort(), evidence: workspace.evidence.digest });
 
+/** The member's task: the run's task, or the run's discovery scout with that id. Undefined when the member has no task id. */
+export function memberTaskOf(run: Pick<TeamRun, "tasks" | "discovery">, taskId: string | undefined): TeamTask | TeamScout | undefined {
+  if (!taskId) return undefined;
+  return run.tasks.find(item => item.id === taskId) ?? run.discovery?.tasks.find(item => item.id === taskId);
+}
+
+/** The task a permission reviewer reads for a team member: the run objective and the task's instructions. */
+export function teamPermissionTask(run: Pick<TeamRun, "title" | "objective">, task: TeamTask | TeamScout | undefined): { title: string; text: string } {
+  const instructions = task && "instructions" in task ? task.instructions : undefined;
+  return {
+    title: bounded(task?.title ?? run.title, 200),
+    text: bounded([run.objective, instructions].filter(Boolean).join("\n\n"), 8000),
+  };
+}
+
 export function teamPermissionRequest(input: {
   run: TeamRun;
   member: TeamMember;
@@ -45,7 +60,6 @@ export function teamPermissionRequest(input: {
   const promptEvidence = permissionEvidenceHash(prompt);
   const evidenceHash = digest({ prompt: promptEvidence, workspace: workspaceDigest(input.workspace), sessionRoot: input.sessionRoot });
   const destructive = prompt.destructive ? { pattern: prompt.destructive.pattern } : undefined;
-  const instructions = task && "instructions" in task ? task.instructions : undefined;
   return {
     id: `team:${member.sessionId}:${prompt.id}:${evidenceHash.slice(0, 24)}`,
     requester: {
@@ -59,10 +73,7 @@ export function teamPermissionRequest(input: {
       ...(member.modelProfile?.model ? { model: member.modelProfile.model } : {}),
       sessionRoot: input.sessionRoot,
       scratchRoots: member.scratchDirectory ? [member.scratchDirectory] : [],
-      task: {
-        title: bounded(task?.title ?? run.title, 200),
-        text: bounded([run.objective, instructions].filter(Boolean).join("\n\n"), 8000),
-      },
+      task: teamPermissionTask(run, task),
     },
     tool: prompt.tool?.name ?? "dialog",
     ...(prompt.tool?.inputComplete ? { input: structuredClone(prompt.tool.input) } : {}),

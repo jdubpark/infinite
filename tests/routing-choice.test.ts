@@ -62,7 +62,7 @@ test("a sampled choice is the best of one draw per candidate, with ties to lineu
 
 // Golden draws pin the generator: a changed generator must raise ROUTING_ALGORITHM_VERSION. Math.log, Math.cos and **
 // can differ in the last bits between CPUs and Node builds, as the plan expects of a recheck, so each value is compared
-// within 1e-12: far above that drift, far below what a changed generator moves.
+// within 1e-12: far above that drift, far below what a structural change to the generator moves.
 const GOLDEN_TOLERANCE = 1e-12;
 function assertGolden(a: number, b: number, seeds: readonly string[], expected: readonly number[]) {
   assert.equal(seeds.length, expected.length);

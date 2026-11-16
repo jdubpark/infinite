@@ -60,6 +60,18 @@ test("a sampled choice is the best of one draw per candidate, with ties to lineu
   assert.ok(explored > 0 && explored < 200, `explored ${explored}`);
 });
 
+// Golden draws pin the generator: a changed generator must raise ROUTING_ALGORITHM_VERSION. Math.log, Math.cos and **
+// can differ in the last bits between CPUs and Node builds, as the plan expects of a recheck, so each value is compared
+// within 1e-12: far above that drift, far below what a changed generator moves.
+const GOLDEN_TOLERANCE = 1e-12;
+function assertGolden(a: number, b: number, seeds: readonly string[], expected: readonly number[]) {
+  assert.equal(seeds.length, expected.length);
+  seeds.forEach((seed, i) => {
+    const value = betaSample(a, b, seed).value;
+    assert.ok(Math.abs(value - expected[i]) <= GOLDEN_TOLERANCE, `${seed}: ${value} is not ${expected[i]}`);
+  });
+}
+
 // Beta(0.3, 0.7): the shape-below-1 path. An independent re-derivation agrees to 1 ulp.
 const GOLDEN_LOW = [0.026535592372285116, 0.1874803328660342];
 
@@ -78,7 +90,7 @@ test("rule order, the elevated value, the first of all-limited candidates, the s
   assert.equal(decisionSeed("digest", "run-1", 1, "task-a", "start", 0), sha("digest|run-1|1|task-a|start|0"));
   assert.equal(candidateSeed("seed", "identity-a"), sha("seed|identity-a"));
 
-  assert.deepEqual(["golden-low-1", "golden-low-2"].map(seed => betaSample(0.3, 0.7, seed).value), GOLDEN_LOW);
+  assertGolden(0.3, 0.7, ["golden-low-1", "golden-low-2"], GOLDEN_LOW);
 });
 
 test("fixed rules remove contributor, reviewer-model, and limited candidates", () => {
@@ -171,11 +183,8 @@ test("elevated risk is greedy at the mean minus one deviation with triple value"
   }
 });
 
-// Recorded from the implementation on 2026-11-15 on arm64. A changed generator must raise ROUTING_ALGORITHM_VERSION.
-// Math.log, Math.cos and ** can differ in the last bits between CPUs: x64 gives 0.10943549295678799 for the third
-// value, 2 ULPs away. The pin allows 1e-12, far above that noise and far below what a changed generator moves.
+// Recorded from the implementation on 2026-11-15 on arm64. x64 gives 0.10943549295678799 for the third, 2 ULPs away.
 const GOLDEN_VALUES = [0.2881993592935194, 0.35225517656152383, 0.10943549295678802];
-const GOLDEN_TOLERANCE = 1e-12;
 
 test("the sampler is deterministic and matches its Beta", () => {
   assert.deepEqual(betaSample(2, 5, "repeat"), betaSample(2, 5, "repeat"));
@@ -197,10 +206,7 @@ test("the sampler is deterministic and matches its Beta", () => {
     assert.throws(() => betaSample(a, b, "s"), RangeError);
   }
 
-  ["golden-1", "golden-2", "golden-3"].forEach((seed, i) => {
-    const value = betaSample(2, 5, seed).value;
-    assert.ok(Math.abs(value - GOLDEN_VALUES[i]) <= GOLDEN_TOLERANCE, `${seed}: ${value} is not ${GOLDEN_VALUES[i]}`);
-  });
+  assertGolden(2, 5, ["golden-1", "golden-2", "golden-3"], GOLDEN_VALUES);
 });
 
 test("the seed binds every part of the key", () => {

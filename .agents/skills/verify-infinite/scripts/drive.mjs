@@ -4,22 +4,23 @@
 // Usage (from the repository root):
 //   node .agents/skills/verify-infinite/scripts/drive.mjs doctor  --instance DIR
 //   node .agents/skills/verify-infinite/scripts/drive.mjs sign-in --instance DIR
+//   node .agents/skills/verify-infinite/scripts/drive.mjs session --instance DIR
 //   node .agents/skills/verify-infinite/scripts/drive.mjs cleanup --instance DIR
 //
 // DIR is the instance directory from the launch step (config.json, devices.json,
 // server.pid, run-dir). Evidence goes to DIR/../evidence and is never deleted by cleanup.
-// The owner key is read from devices.json for requests only: it is never printed,
-// logged, or written to evidence.
+// Device keys are read from devices.json for requests and sign-in only: they are never
+// printed, logged, or written to evidence.
 // Chromium: PLAYWRIGHT_CHROMIUM_PATH, else the macOS Google Chrome app, else Playwright's bundled build.
 
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { chromium } from "playwright";
 import { expect } from "@playwright/test";
+import { launchChromium, openSignIn, recorder, signInWithKey, writeJourney } from "./browser.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..");
 const { positionals, values } = parseArgs({
@@ -32,7 +33,7 @@ const { positionals, values } = parseArgs({
 });
 
 const command = positionals[0];
-if (!["doctor", "sign-in", "cleanup"].includes(command)) fail("Command must be doctor, sign-in, or cleanup");
+if (!["doctor", "sign-in", "session", "cleanup"].includes(command)) fail("Command must be doctor, sign-in, session, or cleanup");
 if (!values.instance) fail("Pass --instance DIR (the instance directory from the launch step)");
 const instance = resolve(values.instance);
 const configFile = join(instance, "config.json");
@@ -52,15 +53,16 @@ function fail(message) {
   process.exit(1);
 }
 
-// Loaded on demand. Every error and log line passes through redact().
-let key;
-function ownerKey() {
-  if (key === undefined) key = JSON.parse(readFileSync(join(instance, "devices.json"), "utf8")).owner;
-  return key;
+// Loaded on demand. Every error and log line passes through redact(), which removes all device keys.
+let devices;
+function deviceKeys() {
+  if (devices === undefined) devices = JSON.parse(readFileSync(join(instance, "devices.json"), "utf8"));
+  return devices;
 }
+const ownerKey = () => deviceKeys().owner;
 const redact = (text) => {
-  const secret = key ?? (existsSync(join(instance, "devices.json")) ? ownerKey() : undefined);
-  return secret ? String(text).split(secret).join("[owner key]") : String(text);
+  const secrets = existsSync(join(instance, "devices.json")) ? Object.values(deviceKeys()).filter((value) => typeof value === "string" && value) : [];
+  return secrets.reduce((out, secret) => out.split(secret).join("[device key]"), String(text));
 };
 
 async function api(path, { auth = true, method = "GET", body } = {}) {
@@ -203,26 +205,18 @@ async function doctor() {
   process.exit(failed ? 1 : 0);
 }
 
-function findChrome() {
-  return [process.env.PLAYWRIGHT_CHROMIUM_PATH, "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
-    .find((candidate) => candidate && existsSync(candidate));
-}
-
 async function signIn() {
   mkdirSync(evidence, { recursive: true });
-  const steps = [];
   const pageErrors = [];
   const startedAt = new Date().toISOString();
-  const executablePath = findChrome();
-  const browser = await chromium.launch({ headless: true, ...(executablePath ? { executablePath } : {}) });
-  const step = (name, ok, detail = "") => steps.push({ name, ok, detail: redact(detail), at: new Date().toISOString() });
-  let page;
+  const { steps, step } = recorder(redact);
+  let browser, executablePath, page;
   try {
+    ({ browser, executablePath } = await launchChromium());
     const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
     page = await context.newPage();
     page.on("pageerror", (error) => pageErrors.push(redact(error.message)));
-    await page.goto(origin);
-    await expect(page.getByRole("heading", { name: "Pick up where you left off." })).toBeVisible({ timeout: 15000 });
+    await openSignIn(page, origin);
     await page.screenshot({ path: join(evidence, "01-sign-in.png") });
     step("sign-in page shown", true, origin);
 
@@ -232,10 +226,7 @@ async function signIn() {
     await expect(page.getByRole("alert")).toHaveText("Device key was not recognized", { timeout: 15000 });
     step("unknown key refused", true, "Device key was not recognized");
 
-    await page.locator("#device-key").fill(ownerKey());
-    await page.locator("form:has(#device-key) button.primary").click();
-    await expect(page.getByRole("navigation", { name: "Sessions", exact: true })).toBeVisible({ timeout: 15000 });
-    await expect(page.getByRole("navigation", { name: "Workspace views" })).toBeVisible();
+    await signInWithKey(page, ownerKey());
     step("owner signed in", true, "session rail visible");
 
     // The session cookie is scoped to path /api, so ask for a URL under it.
@@ -262,7 +253,7 @@ async function signIn() {
     if (page) await page.screenshot({ path: join(evidence, "99-failure.png"), fullPage: true }).catch(() => {});
     step("journey completed", false, error.message.split("\n")[0]);
   } finally {
-    await browser.close();
+    await browser?.close().catch((error) => step("browser closed", false, error.message.split("\n")[0]));
   }
   const failed = steps.filter((item) => !item.ok);
   const record = {
@@ -275,12 +266,209 @@ async function signIn() {
     steps,
     pageErrors,
   };
-  writeFileSync(join(evidence, "sign-in.json"), JSON.stringify(record, null, 2) + "\n");
-  writeFileSync(
-    join(evidence, "sign-in.log"),
-    steps.map((item) => `${item.at} ${item.ok ? "ok  " : "FAIL"} ${item.name}${item.detail ? ` (${item.detail})` : ""}`).join("\n") + `\nverdict: ${record.verdict}\n`,
-  );
+  writeJourney(evidence, "sign-in", record);
   console.log(`sign-in: ${record.verdict} (${steps.length} steps) -> ${join(evidence, "sign-in.json")}`);
+  process.exit(failed.length ? 1 : 0);
+}
+
+const SESSION_TITLE = "Verification session";
+const FIRST_REQUEST = "Reply with one line.";
+const STEER_MESSAGE = "Verification message from the session journey";
+
+// Owner starts a Rehearsal session, takes control, steers it, and checks the PID across an offline gap.
+// A controller on a 390x844 touch phone then checks the same transcript and PID.
+async function session() {
+  mkdirSync(evidence, { recursive: true });
+  const startedAt = new Date().toISOString();
+  const { steps, step } = recorder(redact);
+  const pageErrors = [];
+  const pages = {};
+  let browser, executablePath, sessionId;
+  let pid;
+
+  // Runs one named step. A failure is recorded with the first line of its error and stops the journey.
+  const check = async (name, action) => {
+    try {
+      step(name, true, (await action()) ?? "");
+    } catch (error) {
+      step(name, false, error.message.split("\n")[0]);
+      throw error;
+    }
+  };
+  const sessionDetail = async (id) => {
+    const { status, json } = await api(`/api/sessions/${id}`);
+    if (status !== 200) throw new Error(`GET session returned HTTP ${status}`);
+    return json;
+  };
+  // The page clears its own lease before the host confirms a release, so lease state is read from the host.
+  const waitHostLease = async (held) => {
+    const deadline = Date.now() + 15000;
+    for (;;) {
+      if (Boolean((await sessionDetail(sessionId)).control) === held) return;
+      if (Date.now() > deadline) throw new Error(held ? "the host shows no control lease" : "the host still holds a control lease");
+      await new Promise((done) => setTimeout(done, 250));
+    }
+  };
+  const headerPid = async (page) => {
+    const text = await page.locator(".session-meta", { hasText: "PID" }).first().innerText();
+    const match = text.match(/PID (\d+)/);
+    if (!match) throw new Error("session header shows no PID");
+    return Number(match[1]);
+  };
+  const row = (page) => page.getByRole("navigation", { name: "Sessions", exact: true }).getByRole("button", { name: new RegExp(SESSION_TITLE) }).first();
+
+  try {
+    ({ browser, executablePath } = await launchChromium());
+    const ownerContext = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
+    const owner = pages.owner = await ownerContext.newPage();
+    owner.on("pageerror", (error) => pageErrors.push(redact(error.message)));
+
+    await check("owner signed in (1440x1000)", async () => {
+      await openSignIn(owner, origin);
+      await signInWithKey(owner, ownerKey());
+    });
+    await check("Rehearsal session started", async () => {
+      await owner.getByRole("button", { name: "New session", exact: true }).click();
+      await owner.locator("#provider").selectOption("demo");
+      await owner.locator("#title").fill(SESSION_TITLE);
+      await owner.locator("#prompt").fill(FIRST_REQUEST);
+      await owner.getByRole("button", { name: "Start session", exact: true }).click();
+    });
+    await check("session shows as running", async () => {
+      await expect(row(owner)).toBeVisible({ timeout: 15000 });
+      await expect(row(owner)).toContainText(/running/i, { timeout: 15000 });
+      return (await row(owner).innerText()).split("\n").filter(Boolean).slice(0, 3).join(" | ");
+    });
+    await check("session opened", async () => {
+      await row(owner).click();
+      await expect(owner.getByRole("heading", { name: SESSION_TITLE, exact: true })).toBeVisible({ timeout: 15000 });
+      const listed = (await api("/api/sessions")).json?.sessions?.filter((item) => item.title === SESSION_TITLE) ?? [];
+      if (listed.length !== 1) throw new Error(`expected one session titled "${SESSION_TITLE}", found ${listed.length}`);
+      sessionId = listed[0].id;
+      return `session ${sessionId.slice(0, 8)}`;
+    });
+    await check("control taken on Catch up", async () => {
+      await owner.getByRole("tab", { name: "Catch up", exact: true }).click();
+      const take = owner.getByRole("button", { name: /^Take (control|over)$/ });
+      await expect(take).toBeVisible({ timeout: 15000 });
+      await take.click();
+      await expect(owner.getByRole("button", { name: "Stop controlling", exact: true })).toBeVisible({ timeout: 15000 });
+      await waitHostLease(true);
+    });
+    const screen = owner.locator("pre.screen");
+    await check("steering message echoed and answered", async () => {
+      await owner.locator("#message").fill(STEER_MESSAGE);
+      await owner.getByRole("button", { name: "Send message", exact: true }).click();
+      await expect(screen).toContainText(`You: ${STEER_MESSAGE}`, { timeout: 10000 });
+      await expect(screen).toContainText("Rehearsal: message received by process", { timeout: 10000 });
+      await expect(owner.getByText("Input delivered to terminal", { exact: true })).toBeVisible({ timeout: 10000 });
+      await owner.screenshot({ path: join(evidence, "01-steering.png") });
+    });
+    await check("header PID matches reply and API", async () => {
+      pid = await headerPid(owner);
+      const replies = [...(await screen.innerText()).matchAll(/message received by process (\d+)/g)];
+      const replyPid = Number(replies.at(-1)?.[1]);
+      if (replyPid !== pid) throw new Error(`reply came from process ${replyPid}, header shows PID ${pid}`);
+      const apiPid = (await sessionDetail(sessionId)).pid;
+      if (apiPid !== pid) throw new Error(`API reports pid ${apiPid}, header shows PID ${pid}`);
+      return `PID ${pid}`;
+    });
+    await check("offline shows Reconnecting and disables Send", async () => {
+      await owner.locator("#message").fill("Draft written offline");
+      await ownerContext.setOffline(true);
+      await expect(owner.locator(".connection")).toContainText("Reconnecting", { timeout: 30000 });
+      await expect(owner.getByRole("button", { name: "Send message", exact: true })).toBeDisabled();
+      await owner.screenshot({ path: join(evidence, "02-offline.png") });
+    });
+    await check("online again with the same PID", async () => {
+      await ownerContext.setOffline(false);
+      await expect(owner.locator(".connection")).toContainText("Up to date", { timeout: 30000 });
+      const after = await headerPid(owner);
+      if (after !== pid) throw new Error(`PID changed from ${pid} to ${after} across the offline gap`);
+      await owner.locator("#message").fill("");
+      return `PID ${after}`;
+    });
+    // After the gap the page shows Monitoring even when the host still holds its lease, so take control again.
+    await check("control retaken after reconnecting", async () => {
+      const take = owner.getByRole("button", { name: /^Take (control|over)$/ });
+      const stop = owner.getByRole("button", { name: "Stop controlling", exact: true });
+      await expect(stop.or(take)).toBeVisible({ timeout: 15000 });
+      const lost = await take.isVisible();
+      if (lost) await take.click();
+      await expect(stop).toBeVisible({ timeout: 15000 });
+      await waitHostLease(true);
+      return lost ? "the page had dropped control; retaken" : "control was kept";
+    });
+    await check("Terminal tab shows the xterm screen", async () => {
+      await owner.getByRole("tab", { name: "Terminal", exact: true }).click();
+      await expect(owner.locator(".xterm-screen")).toBeVisible({ timeout: 15000 });
+      await owner.screenshot({ path: join(evidence, "03-terminal.png") });
+    });
+    await check("Context tab shows the first request", async () => {
+      await owner.getByRole("tab", { name: "Context", exact: true }).click();
+      await expect(owner.getByText(FIRST_REQUEST, { exact: true })).toBeVisible({ timeout: 15000 });
+      await owner.screenshot({ path: join(evidence, "04-context.png") });
+    });
+
+    const phoneContext = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 1 });
+    const phone = pages.controller = await phoneContext.newPage();
+    phone.on("pageerror", (error) => pageErrors.push(redact(error.message)));
+    await check("controller signed in (390x844 touch)", async () => {
+      await openSignIn(phone, origin);
+      await signInWithKey(phone, deviceKeys().controller);
+    });
+    await check("controller sees the transcript", async () => {
+      await row(phone).click();
+      await expect(phone.getByRole("heading", { name: SESSION_TITLE, exact: true })).toBeVisible({ timeout: 15000 });
+      await phone.getByRole("tab", { name: "Catch up", exact: true }).click();
+      await expect(phone.locator("pre.screen")).toContainText(`You: ${STEER_MESSAGE}`, { timeout: 10000 });
+    });
+    await check("controller header PID matches owner", async () => {
+      const controllerPid = await headerPid(phone);
+      if (controllerPid !== pid) throw new Error(`controller sees PID ${controllerPid}, owner saw ${pid}`);
+      return `PID ${controllerPid}`;
+    });
+    await check("phone layout fits the viewport", async () => {
+      const fits = await phone.evaluate("document.documentElement.scrollWidth <= window.innerWidth");
+      await phone.screenshot({ path: join(evidence, "05-controller-phone.png"), fullPage: true });
+      if (!fits) throw new Error("document is wider than the 390px viewport");
+    });
+    // A held control lease makes the worker refuse a stop from any other actor (HTTP 409) until it expires
+    // (30 seconds), so the journey ends by releasing it.
+    await check("owner released control", async () => {
+      await owner.getByRole("tab", { name: "Catch up", exact: true }).click();
+      const stop = owner.getByRole("button", { name: "Stop controlling", exact: true });
+      const take = owner.getByRole("button", { name: /^Take (control|over)$/ });
+      await expect(stop.or(take)).toBeVisible({ timeout: 15000 });
+      if (await stop.isVisible()) await stop.click();
+      await expect(take).toBeVisible({ timeout: 15000 });
+      await waitHostLease(false);
+      return "the host lease is cleared";
+    });
+  } catch (error) {
+    if (!steps.some((item) => !item.ok)) step("journey completed", false, error.message.split("\n")[0]);
+    for (const [role, page] of Object.entries(pages)) {
+      await page.screenshot({ path: join(evidence, `99-failure-${role}.png`), fullPage: true }).catch(() => {});
+    }
+  } finally {
+    await browser?.close().catch((error) => step("browser closed", false, error.message.split("\n")[0]));
+  }
+  step("no page errors", pageErrors.length === 0, `${pageErrors.length} page error(s)`);
+  const failed = steps.filter((item) => !item.ok);
+  const record = {
+    journey: "session",
+    origin,
+    chrome: executablePath ?? "playwright-bundled",
+    startedAt,
+    finishedAt: new Date().toISOString(),
+    verdict: failed.length ? "fail" : "pass",
+    sessionId,
+    pid,
+    steps,
+    pageErrors,
+  };
+  writeJourney(evidence, "session", record);
+  console.log(`session: ${record.verdict} (${steps.length} steps) -> ${join(evidence, "session.json")}`);
   process.exit(failed.length ? 1 : 0);
 }
 
@@ -304,7 +492,7 @@ async function cleanup() {
       if (!["running", "starting"].includes(session.status)) continue;
       const stop = await api(`/api/sessions/${session.id}/stop`, { method: "POST", body: { requestId: randomUUID() } })
         .catch((error) => ({ status: redact(error.message) }));
-      note(`stop session ${session.id.slice(0, 8)} (${session.provider}): HTTP ${stop.status}`);
+      note(`stop session ${session.id.slice(0, 8)} (${session.provider}): HTTP ${stop.status}${stop.status === 409 ? " (another device holds control; the worker is stopped by signal below)" : ""}`);
     }
   }
   for (const entry of instanceProcesses()) if (!known.has(entry.pid)) known.set(entry.pid, entry);
@@ -330,4 +518,5 @@ async function cleanup() {
 
 if (command === "doctor") await doctor();
 else if (command === "sign-in") await signIn();
+else if (command === "session") await session();
 else await cleanup();

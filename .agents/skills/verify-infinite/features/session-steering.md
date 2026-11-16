@@ -23,7 +23,7 @@ From the Sessions workspace, select a row in the session rail. The view opens on
 
 ## Driving it with Playwright
 
-Start from a signed-in page with a running Rehearsal session (see [sessions.md](sessions.md)). `scripts/browser-smoke.py` already drives the same steering and reconnect path with Python Playwright; use it as a reference for timing.
+Scripted: `drive.mjs session` runs the owner steering path below, the offline reconnect with the same PID, the Terminal and Context tabs, and the controller's phone view of the same transcript. It writes `session.json` and screenshots to the evidence directory. Start from a signed-in page with a running Rehearsal session (see [sessions.md](sessions.md)) if you drive it by hand.
 
 ```js
 await page.getByRole("navigation", { name: "Sessions", exact: true })
@@ -39,8 +39,13 @@ await expect(page.locator("pre.screen")).toContainText("message received by proc
 
 End-state checks: the screen shows the `You:` line and the Rehearsal reply, the activity list shows "Input delivered to terminal", and `GET /api/sessions/:id` shows the same process ID as the header's PID. To end the session, accept the confirmation dialog before the click registers: `page.once("dialog", (dialog) => dialog.accept());` and then click "End session". The status then changes to exited.
 
+Offline check, as the scripted run does it: fill `#message` with a draft, then `context.setOffline(true)`. Wait for the `.connection` span to read "Reconnecting" (the header also shows "Reconnecting · cached view" in the rail) and for "Send message" to be disabled. Then `context.setOffline(false)`, wait for "Up to date", and check that the header PID did not change. The browser context controls the offline state; API calls made from Node are not affected.
+
+Phone check: a context with a 390x844 viewport, `isMobile: true`, and `hasTouch: true`, signed in with the controller key. Open the session from the rail, select "Catch up", and check that `pre.screen` shows the owner's `You:` line and that `document.documentElement.scrollWidth <= window.innerWidth`.
+
 ## Gotchas
 
+- Control lease: after an offline gap the page drops its control (it shows "Monitoring" and "Take control") while the host keeps the lease for up to 30 seconds. During that time a stop or input from another actor gets HTTP 409. Take control again, and release it with "Stop controlling" when done.
 - Steering needs a fresh connection and the control lease when the control bar says so. Send stays disabled while the view is stale, while control is held by someone else, and when there is no text.
 - Viewer keys see "This device has view-only access." and no composer.
 - Input control is per worker. When the session reports `capabilities.inputControl === 1`, the state reads "Monitoring" and the "Take control" button appears; Send stays disabled until the lease is taken. Otherwise the state reads "Shared controls" and Send works without a lease. Read the state label before deciding whether a click is needed.

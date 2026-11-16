@@ -7,7 +7,7 @@ description: Drive the running Infinite web client (React app served by the host
 
 Use this skill to run a disposable Infinite host from this checkout, drive the web client in a real browser, and keep the evidence. The host runs with the demo provider only, which the UI calls **Rehearsal**: a local test process that does not call a model. Do not start any other provider from a verification run.
 
-Pick the feature to drive from `features/README.md`. Only the sign-in journey is scripted; the other feature files give the selectors and steps to drive with Playwright.
+Pick the feature to drive from `features/README.md`. The sign-in journey and the sessions and steering journey are scripted; the teams and goals feature files give the selectors and steps to drive with Playwright.
 
 ## Conventions
 
@@ -106,6 +106,26 @@ The `sign-in` journey does the following, and writes one line per step to `evide
 
 It exits 0 on pass and 1 on fail. A failed run also writes `99-failure.png`.
 
+Run the sessions and steering journey on the same instance, after `sign-in`:
+
+```sh
+ROOT=$(cd "${CHECKOUT:-.}" && git rev-parse --show-toplevel)
+RUN=$(cat "$ROOT/.local/verify/LAST-RUN")
+INST="$ROOT/.local/verify/$RUN/instance"
+node "$ROOT/.agents/skills/verify-infinite/scripts/drive.mjs" session --instance "$INST"
+```
+
+The `session` journey runs in two browser contexts and writes one line per step to `evidence/session.log`, with the same data in `session.json`:
+
+1. Owner, 1440x1000: signs in, starts a Rehearsal session titled "Verification session" with the first request "Reply with one line.", waits for the row to show `running`, and opens it.
+2. Takes control on the Catch up tab, sends one message, and waits for the `You:` line and the `Rehearsal: message received by process <pid>.` reply in `pre.screen`. The reply's PID, the header's "PID n", and `GET /api/sessions/:id` `pid` must agree.
+3. Goes offline with a draft in the composer. Expects the "Reconnecting" state and a disabled "Send message", then goes back online, waits for "Up to date", and checks the PID did not change. After the gap the page shows "Monitoring" even while the host still holds its control lease, so the journey takes control again and expects "Stop controlling".
+4. Opens the Terminal tab (expects `.xterm-screen`) and the Context tab (expects the first request), with a screenshot of each.
+5. Controller, 390x844 touch: signs in with the controller key, opens the session, sees the owner's `You:` line on Catch up, checks the same PID, and checks that the page does not scroll horizontally.
+6. Owner releases control ("Stop controlling", then "Take control" reappears) and waits until `GET /api/sessions/:id` shows no `control`. The page clears its own lease before the host confirms, so every control step reads the lease from the host, not from the buttons. A held lease makes the worker refuse a stop from any other actor with HTTP 409 for up to 30 seconds, so without this step `cleanup` would have to stop the worker by signal.
+
+It fails on any page error. It does not stop the session; `cleanup` stops it through the owner API. Its screenshots are `01-steering.png`, `02-offline.png`, `03-terminal.png`, `04-context.png`, and `05-controller-phone.png`. A failed step also writes `99-failure-owner.png` or `99-failure-controller.png`.
+
 For any other feature, write a script in `$ROOT/.local/verify/$RUN/` so Playwright resolves from the repository's `node_modules`. Read the owner key with `JSON.parse(readFileSync(...devices.json)).owner`, never print it, and launch Chromium with the same executable lookup as `drive.mjs` (see Helpers). Do not run `npx playwright install`; if no Chrome is available, set `PLAYWRIGHT_CHROMIUM_PATH` to an installed Chrome.
 
 ## Evidence
@@ -130,7 +150,7 @@ grep -rlF "$KEY" "$EVID" && echo "owner key found in evidence: fix before sharin
 unset KEY
 ```
 
-Files from the sign-in journey: `01-sign-in.png`, `02-session-list.png`, `sign-in.json` (verdict, steps, page errors), `sign-in.log`, `server.log`, and `doctor-cli.txt`. Cleanup adds `cleanup.log`.
+Files from the sign-in journey: `01-sign-in.png`, `02-session-list.png`, `sign-in.json` (verdict, steps, page errors), `sign-in.log`, `server.log`, and `doctor-cli.txt`. Files from the session journey: `session.json`, `session.log`, the five screenshots listed under Drive, and any `99-failure-*.png`. Cleanup adds `cleanup.log`.
 
 ## Cleanup
 
@@ -165,7 +185,10 @@ If cleanup reports a PID it could not stop, check its arguments and working dire
 
 - `doctor --instance DIR [--port PORT]`: read-only checks listed under Doctor.
 - `sign-in --instance DIR [--port PORT] [--evidence DIR]`: the sign-in journey.
+- `session --instance DIR [--port PORT] [--evidence DIR]`: the sessions and steering journey under Drive.
 - `cleanup --instance DIR`: teardown under Cleanup.
+
+`scripts/browser.mjs` holds the steps the journeys share: Chromium launch, sign-in with a device key, the step recorder, and the JSON and log writer. Add a shared step there, not a second copy in a journey.
 
 `--port` defaults to the port in `DIR/config.json`. `--evidence` defaults to `DIR/../evidence`. Chromium is taken from `PLAYWRIGHT_CHROMIUM_PATH` when set, then from the macOS Google Chrome app at `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`, then from Playwright's bundled build. The helper imports `playwright` and `@playwright/test` from the repository's `node_modules`.
 
@@ -182,7 +205,8 @@ These surfaces are not covered by this skill. Read their own docs:
 
 ## Known limits
 
-- Only the sign-in journey is scripted and has been run end to end. Sessions, steering, teams, and goals are mapped to source; their selectors come from `apps/web/src`, but they have not been driven yet.
+- The sign-in and session journeys are scripted and have been run end to end on a disposable host. Teams and goals are mapped to source; their selectors come from `apps/web/src`, but they have not been driven yet.
+- The session journey starts Rehearsal only. The session-steering checks rely on the Rehearsal reply line and on the composer's take-control state, so a provider with a different prompt or control model needs its own journey.
 - The cleanup path with a live session was tested with demo sessions started through the owner API on throwaway instances, not through the browser UI. Both orders were tested: API stopped through cleanup, and API killed first with a worker still running.
 - Socket path length was measured on the development machine only. Long repository-local socket paths bound and accepted connections there; the `/tmp` run directory is the portable choice.
 - The host binds to `127.0.0.1` only. Cloud, relay, and Tailscale access are out of scope.

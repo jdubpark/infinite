@@ -13,24 +13,23 @@ The Sessions workspace lists the agent sessions on the selected machine. Filters
 
 ## How to get to it (user POV)
 
-Sign in (see [sign-in.md](sign-in.md)). The Sessions item in the workspace views is selected by default. To start a session, select the "+" beside "Sessions" in the rail. The form appears. Choose the agent, type a name, and select "Start session". The page then shows "Session created." with "Open created session". The new row appears under Active.
+Sign in (see [sign-in.md](sign-in.md)). The Sessions item in the workspace views is selected by default. To start a session, select the "+" beside "Sessions" in the rail. The form appears. Choose the agent, type a name, and select "Start session". The UI then opens the new session directly on the Chat tab, with the first request as the first message, and the row appears under Active with the status `running`. The "Session created." banner is not shown on this build.
 
 ## Driving it with Playwright
 
-Sign in first. The selectors below are the ones the source uses; verify them against the running page the first time.
+Scripted: `drive.mjs session --instance DIR` starts the session, opens it, and checks the steps below, then writes `session.json`. Sign in first if you drive it by hand. The selectors below are the ones the source uses, and the scripted run confirmed them on a disposable host.
 
 ```js
-await page.getByRole("button", { name: "Sessions", exact: true }).click();
 await page.getByRole("button", { name: "New session", exact: true }).click();
 await page.locator("#provider").selectOption("demo"); // shown as "Rehearsal"
 await page.locator("#title").fill("Verification session");
 await page.locator("#prompt").fill("Reply with one line.");
 await page.getByRole("button", { name: "Start session", exact: true }).click();
 await expect(page.getByRole("navigation", { name: "Sessions", exact: true })
-  .getByRole("button", { name: /Verification session/ })).toBeVisible({ timeout: 15000 });
+  .getByRole("button", { name: /Verification session/ })).toContainText(/running/i, { timeout: 15000 });
 ```
 
-End-state checks: the row's text includes "Rehearsal" and "running", the Active count is 1, and `GET /api/sessions` (owner bearer) returns that session with `provider: "demo"`, `status: "running"`, and a `pid`. Stop the session before cleanup: open its row and select "End session". The confirmation dialog must be accepted, or the action does nothing. See [session-steering.md](session-steering.md).
+End-state checks: the row's text includes "Rehearsal" and "running", the Active count is 1, and `GET /api/sessions` (owner bearer) returns that session with `provider: "demo"`, `status: "running"`, and a `pid`. The header's "PID n" matches the API `pid`. Stop the session before cleanup: open its row and select "End session". The confirmation dialog must be accepted, or the action does nothing. The scripted command leaves the session running; `cleanup` stops it through the owner API. See [session-steering.md](session-steering.md).
 
 ## Gotchas
 

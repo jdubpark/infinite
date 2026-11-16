@@ -196,7 +196,7 @@ The integration test starts 12 real demo PTYs, kills and restarts the API proces
 
 An actual Android debug build was installed on the Pixel 9 emulator. Pairing, steering, native back navigation, and saved pairing after app restart were exercised. Android and iOS JavaScript bundles export successfully; iPhone native builds, physical phones, and release signing remain unverified. The terminal protocol regression also checks cursor-query responses without an attached client and a compact screen that preserves full history in the recording.
 
-`scripts/browser-smoke.py` checks desktop/phone browser reconnect and steering against the local rehearsal server using Python Playwright. It reads `.local/devices.json` without printing keys.
+The verification skill's `session` command (`node .agents/skills/verify-infinite/scripts/drive.mjs session --instance DIR`) drives sign-in, a Rehearsal session, steering, offline reconnect with the same PID, and a controller phone view in Node Playwright against a disposable host; see `.agents/skills/verify-infinite/SKILL.md`.
 
 See [architecture and protocol](docs/architecture.md), [server comparison](docs/hosting.md), and [Ubuntu commissioning](deploy/ubuntu/README.md). The commissioning record separates authenticated provider results, client/API continuity, tested data restoration, and cold-boot recovery work still required.
 

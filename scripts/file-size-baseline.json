@@ -1,0 +1,31 @@
+{
+  "limit": 1000,
+  "files": {
+    "apps/web/src/main.tsx": 1154,
+    "packages/host/src/client.ts": 1403,
+    "packages/host/src/evidence/permission-journal.ts": 1248,
+    "packages/host/src/evidence/store.ts": 1084,
+    "packages/host/src/manager.ts": 1243,
+    "packages/host/src/memory/store.ts": 2176,
+    "packages/host/src/missions.ts": 1632,
+    "packages/host/src/outcome-store.ts": 1382,
+    "packages/host/src/server.ts": 2280,
+    "packages/host/src/team-cli.ts": 1263,
+    "packages/host/src/teams.ts": 5634,
+    "packages/host/src/understanding-work.ts": 1021,
+    "packages/host/src/worker.ts": 1900,
+    "scripts/egress-proxy.mjs": 1319,
+    "tests/client-cli.test.ts": 1343,
+    "tests/evidence-outbox.test.ts": 1017,
+    "tests/evidence-store.test.ts": 1252,
+    "tests/goals.test.ts": 1080,
+    "tests/intake-slack.test.ts": 1724,
+    "tests/intake.test.ts": 1673,
+    "tests/missions.test.ts": 2560,
+    "tests/outcome-scan.test.ts": 1062,
+    "tests/outcome-store.test.ts": 1649,
+    "tests/team-events.test.ts": 1807,
+    "tests/teams.test.ts": 3430,
+    "tests/transcript-watch.test.ts": 1023
+  }
+}

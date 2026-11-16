@@ -679,6 +679,13 @@ These rulings override the text below where the two differ.
    - Task 9's line numbers are those of main `0e108bf`; find each place by its quoted code. #172 added `permissionAgentTask` after `permissionAgentLive`, and its hand-off uses `memberTaskOf`; neither is in a region Task 9 edits.
    - Task 11 step 5 lowers the two baseline entries with `node scripts/check-file-size.mjs --update` and checks the output.
 4. **Merge order.** This slice merges before the intent check (INF-282). Both change the plan path in `teams.ts`, so the intent check rebases on this one.
+5. **The status types belong to Task 8.** Task 1 adds the pin and run types, `TaskRouting`, the widened `Basis`, `ExploreGuards`, `ProjectRoutingState`, and `RoutingPayload.guards`. Every `RoutingStatus` change (the `mode` widening, `explore`, `period`, `share`, and `auto`) moves to Task 8, which owns their producer, `routing-reads.ts`, so no task breaks a file it does not own.
+   - Task 10, the routing command, consumes those fields, so it runs after Task 8, in parallel with Task 9.
+   - `TeamRunRouting` is a discriminated union of `TeamRunRoutingShadow` (step 1's shape) and `TeamRunRoutingAuto`, whose `periodEndedAt` is required, so an `auto` pin cannot lack its end.
+6. **The autonomous default decides the mode whenever no mode is saved.** That covers no saved policy, and a saved policy without `mode`, in an `autonomous` project; `repo init --routing-contributor allow` saves such a policy. A saved `mode` always wins.
+   - Once the end is stored, such a project pins `auto`. A saved policy keeps its own knobs and `source: "saved"`.
+   - Task 7's `pin` step (1) and Task 8's status `mode` use the same condition.
+   - In Task 10's status lines, "autonomous default" also names a saved policy without a mode in an `autonomous` project.
 
 ## Trust boundary, and what a review checks
 
@@ -759,7 +766,7 @@ The projector runs where the outbox advances, as the outcome projector does: onc
 | `docs/teams.md`, the design (modify) | Auto routing, and the amendments listed in Task 11 |
 | `tests/routing-{rules,guards,projector,identity,auto,auto-run}.test.ts` (create); `tests/{routing-policy,routing-store,routing-posterior,routing-recorder,routing-reads,routing-routes,routing-run,team-prompts,remote-access,client-args,autonomy-enrollment,usage-config}.test.ts`, `tests/fixtures/team-agent.mjs` (modify) | Pure rules, a real store, a direct team service, the host. No test file over the ratchet: `tests/teams.test.ts`, `tests/team-events.test.ts`, `tests/outcome-store.test.ts`, and `tests/evidence-store.test.ts` are not touched |
 
-**Order and owners.** Task 1 runs first and is small. Then Tasks 2, 3, 4, 5, and 10 run in parallel. Task 6 waits for Task 2. Task 7 waits for Tasks 2, 3, and 4. Task 8 waits for Tasks 3 and 4, and runs in parallel with Tasks 6 and 7. Task 9 waits for Tasks 5, 6, 7, and 8; it is the only writer of `teams.ts`, `server.ts`, `tests/routing-run.test.ts`, and `tests/fixtures/team-agent.mjs`. Task 11 waits for Tasks 9 and 10. Files with two writers have them in sequence: `team-types.ts` (Task 1, then Task 2) and `tests/routing-routes.test.ts` (Task 8, then Task 11). Every name, signature, statement, status code, and sentence that one task builds against another's is fixed below. Line numbers of `teams.ts` and `server.ts` are main's (`0e108bf`).
+**Order and owners.** Task 1 runs first and is small. Then Tasks 2, 3, 4, and 5 run in parallel (Task 10 waits for Task 8: coordinator ruling 5). Task 6 waits for Task 2. Task 7 waits for Tasks 2, 3, and 4. Task 8 waits for Tasks 3 and 4, and runs in parallel with Tasks 6 and 7. Task 9 waits for Tasks 5, 6, 7, and 8; it is the only writer of `teams.ts`, `server.ts`, `tests/routing-run.test.ts`, and `tests/fixtures/team-agent.mjs`. Task 11 waits for Tasks 9 and 10. Files with two writers have them in sequence: `team-types.ts` (Task 1, then Task 2) and `tests/routing-routes.test.ts` (Task 8, then Task 11). Every name, signature, statement, status code, and sentence that one task builds against another's is fixed below. Line numbers of `teams.ts` and `server.ts` are main's (`0e108bf`).
 
 ## Review Focus
 

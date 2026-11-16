@@ -11,9 +11,11 @@ import { effectiveRouting, type TeamRouting } from "./routing-policy.js";
 import {
   betaMean, betaSd, CHOSEN_WEIGHT, MAX_AGE_DAYS, posterior, type CurrentConfig, type RoutingTarget,
 } from "./routing-posterior.js";
-import { projectCells, projectDecisions, ROUTING_MODULE, shadowProgress, taskDecisions } from "./routing-store.js";
+import {
+  appliedOutcomeIds, computedPeriodEnd, projectCells, projectDecisions, readProjectState, ROUTING_MODULE, shadowProgress, shareWindow, taskDecisions,
+} from "./routing-store.js";
 import type {
-  ExplainedDecision, Identity, ProfilePosterior, RoutingEvidenceRow, RoutingExplain, RoutingKnobs, RoutingStatus, StatusCell,
+  DecisionRow, ExplainedDecision, Identity, ProfilePosterior, RoutingEvidenceRow, RoutingExplain, RoutingKnobs, RoutingMode, RoutingStatus, StatusCell,
   StatusProfile,
 } from "./routing-types.js";
 import type { TeamLineup, TeamModelProfile } from "./team-types.js";
@@ -65,7 +67,9 @@ function identityOf(profile: TeamModelProfile): Identity {
  * representative is the first eligible profile of the identity in lineup order, or its first removed profile when no
  * eligible one exists, as the recorder picks it. Keyed by the screened identity.
  */
-type Evidence = { representative: Map<string, TeamModelProfile>; rows: Map<string, RoutingEvidenceRow[]>; current: Map<string, CurrentConfig> };
+type Evidence = { representative: Map<string, TeamModelProfile>; rows: Map<string, RoutingEvidenceRow[]>; current: Map<string, CurrentConfig>;
+  /** The outcome ids of each identity's applied `auto` starts, which carry the who-chose weight. */
+  applied: Map<string, Set<string>> };
 
 function readEvidence(db: EvidenceDb, screened: readonly Screened[], publishHeads: boolean, entryTools: boolean, objectiveDigest: boolean, now: string): Evidence {
   const since = daysBefore(now, MAX_AGE_DAYS);
@@ -75,14 +79,16 @@ function readEvidence(db: EvidenceDb, screened: readonly Screened[], publishHead
   }
   const rows = new Map<string, RoutingEvidenceRow[]>();
   const current = new Map<string, CurrentConfig>();
+  const applied = new Map<string, Set<string>>();
   for (const [identity, profile] of representative) {
     current.set(identity, {
       epoch: epochAt(db, identity, now),
       promptVersion: promptVersion("implementer", profile.provider, profile, publishHeads, entryTools, objectiveDigest),
     });
     rows.set(identity, selectRoutingEvidence(db, identityOf(profile), "start", since));
+    applied.set(identity, appliedOutcomeIds(db, identity, since));
   }
-  return { representative, rows, current };
+  return { representative, rows, current, applied };
 }
 
 /**
@@ -93,7 +99,7 @@ function scoreAt(screened: readonly Screened[], evidence: Evidence, target: Rout
   const posteriors = new Map<string, ProfilePosterior>();
   const scored = new Map<string, Scored>();
   for (const [identity, profile] of evidence.representative) {
-    const found = posterior(evidence.rows.get(identity) ?? [], target, evidence.current.get(identity)!, now, CHOSEN_WEIGHT);
+    const found = posterior(evidence.rows.get(identity) ?? [], target, evidence.current.get(identity)!, now, CHOSEN_WEIGHT, evidence.applied.get(identity));
     posteriors.set(identity, found);
     scored.set(identity, { profile, identity, posterior: found, costUsd: tierCost(profile) });
   }
@@ -139,20 +145,31 @@ export function routingStatus(store: EvidenceStore, input: RoutingStatusInput): 
     : eligible ? null
     : "no-eligible-profile";
   const since = daysBefore(input.now, SHADOW_WINDOW_DAYS);
+  // A new run pins auto for a saved `auto`, even without a covered start (createRun then refuses). The autonomous
+  // default, with no saved mode, pins auto only when the start is covered; otherwise its run pins shadow.
+  const pinsAuto = knobs !== null && knobs.points.includes("start") && input.lineup !== undefined
+    && (input.saved?.mode === "auto" || (input.saved?.mode === undefined && input.autonomy === "autonomous" && reason === null));
 
   return store.read(db => {
     const decided = projectDecisions(db, input.projectId, since);
     const rows = decided.rows;
-    const withCoordinator = rows.filter(row => row.coordinatorProfileId !== null);
+    const recorded = rows.filter(row => row.state === "recorded");
+    const withCoordinator = recorded.filter(row => row.coordinatorProfileId !== null);
     const progress = shadowProgress(db, input.projectId);
+    const state = readProjectState(db, input.projectId);
+    const computed = computedPeriodEnd(db, input.projectId);
+    // The stored end, or the computed end once it has passed: the next run stores it.
+    const endedAt = state.periodEndedAt ?? (computed !== undefined && Date.parse(computed.endsAt) <= Date.parse(input.now) ? computed.endsAt : null);
+    const mode: RoutingMode = effective.mode === "off" ? "off" : pinsAuto && endedAt !== null ? "auto" : "shadow";
+    const autoMode = mode === "auto";
     let cells: { cell: StatusCell; profiles: StatusProfile[] }[] = [];
     let cellsCapped = false, unreadableCells = 0;
     if (knobs && reason === null && input.lineup) {
       const evidence = readEvidence(db, screened, input.publishHeads, input.entryTools, input.objectiveDigest, input.now);
       const projectRef = db.index("project", input.projectId);
-      const recorded = projectCells(db, input.projectId, since, STATUS_CELL_LIMIT);
-      cellsCapped = recorded.capped;
-      for (const cell of recorded.cells) {
+      const found = projectCells(db, input.projectId, since, STATUS_CELL_LIMIT);
+      cellsCapped = found.capped;
+      for (const cell of found.cells) {
         if (cell.payload === null) {
           unreadableCells++;
           continue;
@@ -172,9 +189,16 @@ export function routingStatus(store: EvidenceStore, input: RoutingStatusInput): 
       };
       cells.push({ cell: { scope: "new-task" }, profiles: scoreAt(screened, evidence, newTask, knobs, input.now) });
     }
+    // In auto, exploration counts the starts the router applied or still holds; in shadow, the recorded picks.
+    const exploring = autoMode ? rows.filter(row => row.state === "pending" || row.state === "applied") : recorded;
+    const explore: RoutingStatus["explore"] = {
+      exploratory: exploring.filter(row => row.explore).length, of: exploring.length, guards: autoMode ? "applied" : "risk-only",
+      pausedAt: state.explorePausedAt,
+    };
+    const count = (name: DecisionRow["state"]) => rows.filter(row => row.state === name).length;
     return {
       projectId: input.projectId,
-      mode: effective.mode,
+      mode,
       requested: effective.mode === "shadow" ? effective.requested : null,
       source: effective.mode === "shadow" ? effective.source : null,
       knobs,
@@ -187,14 +211,23 @@ export function routingStatus(store: EvidenceStore, input: RoutingStatusInput): 
       limits: "not-applied",
       shadow: {
         windowDays: SHADOW_WINDOW_DAYS,
-        decisions: rows.length,
+        decisions: recorded.length,
         withCoordinator: withCoordinator.length,
         agreements: withCoordinator.filter(row => row.chosenProfileId === row.coordinatorProfileId).length,
         greedyAgreements: withCoordinator.filter(row => row.greedyProfileId === row.coordinatorProfileId).length,
         capped: decided.capped,
       },
-      explore: { exploratory: rows.filter(row => row.explore).length, of: rows.length, guards: "risk-only" },
-      period: { decisions: progress.decisions, capped: progress.capped, firstAt: progress.firstAt, targetDays: 14, targetDecisions: 50 },
+      explore,
+      period: {
+        decisions: progress.decisions, capped: progress.capped, firstAt: progress.firstAt,
+        endsAt: computed?.endsAt ?? null, endedAt, stored: state.periodEndedAt !== null, targetDays: 14, targetDecisions: 50,
+      },
+      share: autoMode && knobs
+        ? { ...shareWindow(db, input.projectId, knobs.exploreWindow, input.now), window: knobs.exploreWindow, limit: knobs.maxExploreShare }
+        : null,
+      auto: autoMode
+        ? { windowDays: SHADOW_WINDOW_DAYS, pending: count("pending"), applied: count("applied"), released: count("released"), capped: decided.capped }
+        : null,
       cells,
       cellsCapped,
       unreadableCells,

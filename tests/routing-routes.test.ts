@@ -20,6 +20,7 @@ import type { TeamRun, TeamTask } from "../packages/host/src/team-types.js";
 import type { Config } from "../packages/host/src/types.js";
 import { mixedLineup } from "./team-fixture.js";
 import { startHost, type Host } from "./helpers.js";
+import { fixture as teamFixture } from "./team-fixture.js";
 
 const NOW = new Date().toISOString();
 const ASTRA = mixedLineup.implementers[1]!;
@@ -27,7 +28,8 @@ const ASTRA = mixedLineup.implementers[1]!;
 /** Serves the routes from an in-process app whose guard passes everyone, so the config function is the test's own. */
 async function serve(store: EvidenceStore, config: Config): Promise<{ get: (path: string) => Promise<Response>; close: () => Promise<void> }> {
   const app = express();
-  routingRoutes(app, { evidence: store, config: () => config }, (_req, _res, next) => next());
+  const pass: express.RequestHandler = (_req, _res, next) => next();
+  routingRoutes(app, { evidence: store, config: () => config, teams: { revokeRouting: async () => ({}) } }, pass, pass);
   const server = app.listen(0, "127.0.0.1");
   await new Promise<void>(resolve => server.once("listening", () => resolve()));
   const { port } = server.address() as AddressInfo;
@@ -206,5 +208,58 @@ test("the routes pass the saved policy, the lineup, and the flags a new run pins
   } finally {
     store.close();
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("pause, resume, and revoke answer the owner only", { timeout: 120000 }, async () => {
+  const run = await teamFixture("success");
+  const host = run.host;
+  const pause = (role: "owner" | "controller" | "viewer" | null, project = "rehearsal") => host.fetchApi(`/routing/projects/${project}/explore/pause`, role, undefined, {}, "POST");
+  const resume = (role: "owner" | "controller" | "viewer" | null, project = "rehearsal") => host.fetchApi(`/routing/projects/${project}/explore/resume`, role, undefined, {}, "POST");
+  try {
+    const paused = await pause("owner");
+    assert.equal(paused.status, 200);
+    assert.deepEqual([paused.body.projectId, typeof paused.body.explorePausedAt], ["rehearsal", "string"]);
+    const resumed = await resume("owner");
+    assert.deepEqual([resumed.status, resumed.body.explorePausedAt], [200, null]);
+
+    const created = await host.fetchApi("/teams", "owner", run.create());
+    const team = await run.settled(created.body.id);
+    // A run without an auto pin has nothing to revoke.
+    const revoked = await host.fetchApi(`/teams/${team.id}/routing/revoke`, "owner", { requestId: randomUUID(), revision: team.revision });
+    assert.deepEqual([revoked.status, revoked.body.code], [409, "routing-not-enabled"]);
+
+    for (const role of ["controller", "viewer"] as const) {
+      assert.equal((await pause(role)).status, 403, `pause for ${role}`);
+      assert.equal((await resume(role)).status, 403, `resume for ${role}`);
+      assert.equal((await host.fetchApi(`/teams/${randomUUID()}/routing/revoke`, role, { requestId: randomUUID(), revision: 1 })).status, 403, `revoke for ${role}`);
+    }
+    const unknown = await pause("owner", "missing");
+    assert.deepEqual([unknown.status, unknown.body.code], [404, "unknown-project"]);
+    assert.equal((await host.fetchApi("/me", "owner")).body.teams.routingAuto, 1);
+
+    // The evidence directory replaced by a file: the pause answers 503.
+    await host.stopApi();
+    rmSync(join(host.config.stateDir, "evidence"), { recursive: true, force: true });
+    writeFileSync(join(host.config.stateDir, "evidence"), "not a directory");
+    await host.start();
+    const down = await pause("owner");
+    assert.deepEqual([down.status, down.body.code], [503, "evidence-unavailable"]);
+  } finally {
+    await run.close();
+  }
+});
+
+test("a pause leaves the saved configuration unchanged", { timeout: 60000 }, async () => {
+  const host = await startHost({ config: { projects: [{ id: "rehearsal", name: "Rehearsal", path: process.cwd(), team: { checks: [], establishChecks: true, routing: { mode: "auto" } } }] } });
+  const file = join(host.root, "config.json");
+  try {
+    const before = readFileSync(file);
+    assert.equal((await host.fetchApi("/routing/projects/rehearsal/explore/pause", "owner", undefined, {}, "POST")).status, 200);
+    const paused = readFileSync(file);
+    assert.equal((await host.fetchApi("/routing/projects/rehearsal/explore/resume", "owner", undefined, {}, "POST")).status, 200);
+    assert.deepEqual([paused.equals(before), readFileSync(file).equals(before)], [true, true]);
+  } finally {
+    await host.stop();
   }
 });

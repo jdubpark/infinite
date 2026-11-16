@@ -46,14 +46,19 @@ export type StatusProfile = { profileId: string; removed?: "contributor" | "revi
   level: LevelName | "none"; costUsd: number; greedy: boolean };
 export type StatusCell = { scope: "cell"; area: string; taskKind: string | null; featureVersion: number; featureMap: string } | { scope: "new-task" };
 export type RoutingStatus = {
-  projectId: string; mode: "off" | "shadow"; requested: RoutingMode | null; source: "saved" | "autonomous-default" | null;
+  projectId: string; mode: RoutingMode; requested: RoutingMode | null; source: "saved" | "autonomous-default" | null;
   knobs: RoutingKnobs | null; defaults: (keyof RoutingKnobs)[];
   covers: { start: boolean; reason: "off" | "no-lineup" | "no-start-point" | "no-eligible-profile" | null };
   costs: { lightUsd: number; strongUsd: number; rescueUsd: number; basis: "tier-default" };
   headroom: "not-modelled"; interval: "normal-approx-90"; chosenWeight: number; limits: "not-applied";
   shadow: { windowDays: 30; decisions: number; withCoordinator: number; agreements: number; greedyAgreements: number; capped: boolean };
-  explore: { exploratory: number; of: number; guards: "risk-only" };
-  period: { decisions: number; capped: boolean; firstAt: string | null; targetDays: 14; targetDecisions: 50 };
+  explore: { exploratory: number; of: number; guards: "risk-only" | "applied"; pausedAt: string | null };
+  period: { decisions: number; capped: boolean; firstAt: string | null; endsAt: string | null; endedAt: string | null; stored: boolean;
+    targetDays: 14; targetDecisions: 50 };
+  /** `auto` only: the exploratory share of the newest starts, against the pinned window and limit. */
+  share: { exploratory: number; of: number; window: number; limit: number } | null;
+  /** `auto` only: the states of the last 30 days' start rows. `capped` is true when the read hit its row limit. */
+  auto: { windowDays: 30; pending: number; applied: number; released: number; capped: boolean } | null;
   cells: { cell: StatusCell; profiles: StatusProfile[] }[]; cellsCapped: boolean; unreadableCells: number };
 export type ExplainedDecision = Omit<DecisionRow, "projectRef" | "areaRef" | "taskKey" | "featureMapRef"> & { payload: RoutingPayload | null };
 export type RoutingExplain = { runId: string; taskId: string; decisions: ExplainedDecision[]; capped: boolean };

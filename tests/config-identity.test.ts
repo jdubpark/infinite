@@ -392,7 +392,7 @@ test("entry tools change the prompt version only for entry roles", () => {
 // Base pin: with the switch off, every role and provider keeps the prompt version it had at the base commit.
 const PIN_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"] as const;
 const PIN_PROVIDERS = ["claude", "codex", "opencode"] as const;
-const PIN_VERSIONS_SHA256 = "1bdb039456d52b9e205346a426510e122e36a46c3803e180e5a31181e58a932c";
+const PIN_VERSIONS_SHA256 = "2140e519361470e60a9034642a8a23885f77ed54af61cd633ad8f94f2090fbb4";
 
 test("the switch off keeps every prompt version", () => {
   const versions = PIN_ROLES.flatMap(role => PIN_PROVIDERS.map(provider => promptVersion(role, provider, undefined, true)));

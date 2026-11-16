@@ -42,7 +42,7 @@ import { mirrorRemoteUrl } from "./project-source.js";
 import { hostGithubGrantEnvironment, projectGithubRepository, sessionGithubScope } from "./github-grants.js";
 import type { ProjectSourceService } from "./project-source.js";
 import type { RepositoryGraphs, RepositoryGraphResult } from "./repository-graphs.js";
-import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, publishTeamHead, removeMemberWorkspace, removeTeamWorkspace, commandScope, type CommandScope, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
+import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, publishTeamHead, removeMemberWorkspace, removeTeamWorkspace, snapshotMemberWork, commandScope, type CommandScope, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
 import { HOST_LOAD_REASON_PREFIX, LaunchHeldError } from "./host-load.js";
 import { agentAcceptOption, isCollapsedPermissionPrompt, oneShotPermissionOption, permissionAuthorityHash, permissionEvidenceHash, permissionReuseKey, refusedBeforeSend } from "./team-permissions.js";
@@ -69,6 +69,10 @@ type TeamServiceOptions = {
   onMerged?: (projectId: string) => void;
   ownerActive?: (run: TeamRun) => boolean;
   now?: () => number;
+  /** Short command deadlines are injectable for bounded member-save regressions. */
+  memberWorkCommandTimeoutMs?: number;
+  memberWorkPushTimeoutMs?: number;
+  memberWorkCommandStopGraceMs?: number;
   volumeUsage?: (path: string) => Promise<VolumeUsage>;
   /** Run events for the evidence store. Without it no record gains a ledger field and nothing is emitted. */
   events?: EventOutbox;
@@ -533,6 +537,9 @@ export class TeamService {
   private readonly publishingRuns = new Set<string>();
   private readonly publicationTasks = new Set<Promise<void>>();
   private readonly publicationControllers = new Map<string, AbortController>();
+  private readonly memberWorkSaveRuns = new Set<string>();
+  private readonly memberWorkSaveTasks = new Set<Promise<void>>();
+  private readonly memberWorkSaveControllers = new Map<string, AbortController>();
   private readonly removalWaiters: Array<() => void> = [];
   private activeRemovals = 0;
   private readonly permissionPromptFirstSeen = new Map<string, number>();
@@ -1233,6 +1240,144 @@ export class TeamService {
     this.publicationTasks.add(task);
     return true;
   }
+  private memberWorkDone(run: TeamRun, member: TeamMember) {
+    const saved = member.savedWork;
+    return saved?.revision === run.revision && ["published", "nothing-to-save", "gave-up"].includes(saved.state);
+  }
+  /** Pending member clones are grouped by path so a shared clone is snapshotted only once. */
+  private memberWorkGroups(stored: Stored) {
+    const { run } = stored;
+    if (!["cancelled", "blocked"].includes(run.status) || run.workspaceRemovedAt || !this.publicationTarget(stored)) return [];
+    const groups = new Map<string, TeamMember[]>();
+    for (const member of run.members) {
+      if (member.cwd === run.workspace || member.workspaceRemovedAt || !filesystemEntryExists(member.cwd) || this.memberWorkDone(run, member)) continue;
+      const members = groups.get(member.cwd) ?? [];
+      members.push(member);
+      groups.set(member.cwd, members);
+    }
+    return [...groups].map(([cwd, members]) => ({ cwd, members }));
+  }
+  private needsMemberWorkSaved(stored: Stored) {
+    return this.memberWorkGroups(stored).length > 0;
+  }
+  private memberWorkRetryDue(stored: Stored, now: number) {
+    return this.memberWorkGroups(stored).some(group => group.members.some(member => {
+      const saved = member.savedWork;
+      return saved?.state === "retrying" && (saved.revision !== stored.run.revision || Boolean(saved.failure && now >= Date.parse(saved.failure.retryAt)));
+    }));
+  }
+  private recordMemberWork(stored: Stored, member: TeamMember, savedWork: NonNullable<TeamMember["savedWork"]>, eventText?: string, additionalEventText?: string) {
+    return this.enqueue(() => {
+      if (this.records.get(stored.run.id) !== stored) return;
+      const previous = member.savedWork, previousEvents = stored.run.events.slice();
+      member.savedWork = savedWork;
+      if (eventText && !stored.run.events.some(event => event.text === eventText)) this.event(stored, eventText);
+      if (additionalEventText && !stored.run.events.some(event => event.text === additionalEventText)) this.event(stored, additionalEventText);
+      try { this.save(stored); }
+      catch (error) {
+        member.savedWork = previous;
+        stored.run.events = previousEvents;
+        throw error;
+      }
+    });
+  }
+  /** Snapshot and publish eligible member clones without holding the mutation queue during Git work. */
+  private startMemberWorkSave(stored: Stored) {
+    const { run } = stored, target = this.publicationTarget(stored);
+    if (this.closed || !target || !this.needsMemberWorkSaved(stored) || this.memberWorkSaveRuns.has(run.id)) return false;
+    const now = this.options?.now?.() ?? Date.now();
+    const groups = this.memberWorkGroups(stored).map(group => ({ ...group, members: group.members.filter(member => {
+      const saved = member.savedWork;
+      return !saved?.failure || saved.revision !== run.revision || now >= Date.parse(saved.failure.retryAt);
+    }) })).filter(group => group.members.length > 0);
+    if (!groups.length) return false;
+    const id = run.id, revision = run.revision, runBranch = run.branch, controller = new AbortController();
+    this.memberWorkSaveRuns.add(id);
+    this.memberWorkSaveControllers.set(id, controller);
+    const grantEnv = (member: TeamMember, ref: string) => hostGithubGrantEnvironment(this.config, {
+      sid: `save-member-work:${id}:${member.memberId}`, project: run.projectId, repo: target.repository, ops: ["push"], refs: [ref],
+    });
+    let task: Promise<void>;
+    task = (async () => {
+      for (const group of groups) {
+        const representative = group.members.find(member => this.memberIntegratedAt(stored, member) === undefined) ?? group.members[0]!;
+        let snapshot: Awaited<ReturnType<typeof snapshotMemberWork>> | undefined;
+        let snapshotFailed = false;
+        try {
+          snapshot = await snapshotMemberWork(group.cwd, representative.baseCommit,
+            { skipIfResultTree: this.memberIntegratedAt(stored, representative) !== undefined }, this.config.teams?.commandPrefix, controller.signal,
+            this.options?.memberWorkCommandTimeoutMs ?? 30000, this.options?.memberWorkCommandStopGraceMs ?? 2000);
+        } catch {
+          snapshotFailed = true;
+        }
+        if (controller.signal.aborted) return;
+        for (const member of group.members) {
+          if (this.memberWorkDone(run, member)) continue;
+          const currentNow = this.options?.now?.() ?? Date.now();
+          if (member.savedWork?.failure && member.savedWork.revision === revision && currentNow < Date.parse(member.savedWork.failure.retryAt)) continue;
+          if (snapshotFailed) {
+            await this.recordMemberWorkFailure(stored, member, revision, target.repository, `${runBranch}-wip-${member.memberId}`, undefined, "other");
+            continue;
+          }
+          if (!snapshot) {
+            await this.recordMemberWork(stored, member, { revision, state: "nothing-to-save", at: this.retentionNow() });
+            continue;
+          }
+          const primaryBranch = `${runBranch}-wip-${member.memberId}`;
+          if (!snapshot.commit) {
+            if (snapshot.nestedRepository) {
+              const nestedEvent = `Member ${member.memberId} has changes inside a nested repository or submodule that the host cannot save to GitHub. The workspace will be removed after the remaining attempts unless the owner saves the work.`;
+              await this.recordMemberWorkFailure(stored, member, revision, target.repository, primaryBranch, undefined, "nested-repository", nestedEvent);
+            } else await this.recordMemberWork(stored, member, { revision, state: "nothing-to-save", at: this.retentionNow() });
+            continue;
+          }
+          let branch = primaryBranch;
+          let outcome: Awaited<ReturnType<typeof publishTeamHead>>;
+          try {
+            outcome = await publishTeamHead(group.cwd, target.remoteUrl, snapshot.commit, branch, this.config.teams?.commandPrefix, controller.signal,
+              ref => grantEnv(member, ref), this.options?.memberWorkPushTimeoutMs ?? 120000, this.options?.memberWorkCommandStopGraceMs ?? 2000);
+            if (!outcome.published && outcome.category === "rejected") {
+              branch = `${primaryBranch}-${snapshot.commit.slice(0, 8)}`;
+              outcome = await publishTeamHead(group.cwd, target.remoteUrl, snapshot.commit, branch, this.config.teams?.commandPrefix, controller.signal,
+                ref => grantEnv(member, ref), this.options?.memberWorkPushTimeoutMs ?? 120000, this.options?.memberWorkCommandStopGraceMs ?? 2000);
+            }
+          } catch {
+            outcome = { published: false, category: "other" };
+          }
+          if (controller.signal.aborted) return;
+          if (snapshot.nestedRepository) {
+            const nestedEvent = `Member ${member.memberId} has changes inside a nested repository or submodule that the host cannot save to GitHub. The workspace will be removed after the remaining attempts unless the owner saves the work.`;
+            await this.recordMemberWorkFailure(stored, member, revision, target.repository, branch, snapshot.commit, "nested-repository", nestedEvent);
+            continue;
+          }
+          if (outcome.published) {
+            const eventText = `Saved unfinished work of member ${member.memberId} as ${snapshot.commit.slice(0, 12)} to GitHub ${target.repository} ${branch} before its workspace is removed.`;
+            await this.recordMemberWork(stored, member, { revision, state: "published", repository: target.repository, branch, commit: snapshot.commit, at: this.retentionNow() }, eventText);
+          } else await this.recordMemberWorkFailure(stored, member, revision, target.repository, branch, snapshot.commit, outcome.category);
+        }
+      }
+    })().catch(() => {
+      console.warn("Could not record the result of a background team member work save.");
+    }).finally(() => {
+      this.memberWorkSaveRuns.delete(id);
+      this.memberWorkSaveControllers.delete(id);
+      this.memberWorkSaveTasks.delete(task);
+    });
+    this.memberWorkSaveTasks.add(task);
+    return true;
+  }
+  private recordMemberWorkFailure(stored: Stored, member: TeamMember, revision: number, repository: string, branch: string, commit: string | undefined, category: TeamPublicationCategory, additionalEventText?: string) {
+    const previous = member.savedWork?.revision === revision ? member.savedWork : undefined;
+    const attempts = previous?.failure?.attempts ? previous.failure.attempts + 1 : 1;
+    const state = attempts >= 5 ? "gave-up" : "retrying";
+    const at = this.retentionNow();
+    const retryAt = new Date(Date.parse(at) + 60_000 * 2 ** (attempts - 1)).toISOString();
+    const failure = { category, attempts, at, retryAt };
+    const eventText = state === "gave-up"
+      ? `Could not save unfinished work of member ${member.memberId} to GitHub after 5 attempts (${category}); its workspace is removed with the run.`
+      : `Could not save unfinished work of member ${member.memberId} to GitHub (${category}); the host retries before removing the workspace.`;
+    return this.recordMemberWork(stored, member, { revision, state, repository, branch, ...(commit ? { commit } : {}), at, failure }, eventText, additionalEventText);
+  }
   private persistRetiredRunId(id: string) {
     const ids = [...this.retiredRunIds].filter(item => item !== id);
     ids.push(id);
@@ -1305,6 +1450,10 @@ export class TeamService {
       this.assertRunRetentionSafe(stored);
       if (!(["cancelled", "merged", "no-change"].includes(run.status) && await this.membersSettled(stored)))
         throw new TeamError(409, "team-active", "Only a settled cancelled, merged or no-change run can be removed.");
+      if (this.needsMemberWorkSaved(stored)) {
+        this.startMemberWorkSave(stored);
+        throw new TeamError(409, "member-work-not-saved", "Unfinished member work is being saved to GitHub before this run's workspaces are removed. Retry removal shortly.");
+      }
       if (!run.workspaceRemovedAt || filesystemEntryExists(teamRunDirectory(run.workspace))) {
         this.assertRunPath(stored, run.workspace);
         await removeTeamWorkspace(teamRunDirectory(run.workspace), this.config.teams?.commandPrefix, undefined, this.teamRoot(stored));
@@ -2268,7 +2417,7 @@ export class TeamService {
     };
     this.timer = setInterval(tick, 500); this.timer.unref(); tick();
   }
-  close() { this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const timer of this.sampleTimers) clearTimeout(timer); this.sampleTimers.clear(); for (const controller of this.commands.values()) controller.abort(); for (const controller of this.publicationControllers.values()) controller.abort(); for (const controller of this.agentControllers.values()) controller.abort(); this.removeAgentSource?.(); }
+  close() { this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const timer of this.sampleTimers) clearTimeout(timer); this.sampleTimers.clear(); for (const controller of this.commands.values()) controller.abort(); for (const controller of this.publicationControllers.values()) controller.abort(); for (const controller of this.memberWorkSaveControllers.values()) controller.abort(); for (const controller of this.agentControllers.values()) controller.abort(); this.removeAgentSource?.(); }
   /** Settles once work queued before now has finished, so a caller can stop sessions it may still launch. */
   async idle() {
     await this.serial;
@@ -2277,8 +2426,8 @@ export class TeamService {
       await Promise.allSettled([...this.removalTasks]);
       await this.serial;
     }
-    for (let pass = 0; pass < 5 && this.publicationTasks.size; pass++) {
-      await Promise.allSettled([...this.publicationTasks]);
+    for (let pass = 0; pass < 5 && (this.publicationTasks.size || this.memberWorkSaveTasks.size); pass++) {
+      await Promise.allSettled([...this.publicationTasks, ...this.memberWorkSaveTasks]);
       await this.serial;
     }
     await this.serial;
@@ -2991,7 +3140,9 @@ export class TeamService {
         }
         return;
       }
-      if (retentionMs === undefined || elapsed < retentionMs) return;
+      const retentionDue = retentionMs !== undefined && elapsed >= retentionMs;
+      const retryDue = this.memberWorkRetryDue(stored, now);
+      if (!retentionDue && !retryDue) return;
       // An interrupted operation keeps its fence unless the host looks now and finds none of its processes. Without a
       // witness the fence stays. This pass runs on every tick, so the look comes last and only confirms: a look that
       // found a process, or could not finish, stands until the next scheduled one above.
@@ -3004,7 +3155,8 @@ export class TeamService {
         if (await this.refreshOperationCensus(stored, true) !== "ended") return;
         if (run.status !== "blocked" || this.commands.has(run.id) || this.removingRuns.has(run.id)) return;
       }
-
+      if (this.needsMemberWorkSaved(stored)) { this.startMemberWorkSave(stored); return; }
+      if (!retentionDue) return;
       run.workspaceRemovedAt = this.retentionNow();
       // The key names the fact, not the time, so a retried removal stores the same event once.
       const settledKey = runEventKey("run.settled", run.id, [run.revision, "blocked", "workspace-removed"]);

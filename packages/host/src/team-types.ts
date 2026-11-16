@@ -74,7 +74,7 @@ export const teamDeliverySchema = z.discriminatedUnion("mode", [
   z.object({ mode: z.literal("pr"), repository: githubRepository, baseBranch: gitBranch }).strict(),
 ]);
 export type TeamDelivery = z.infer<typeof teamDeliverySchema>;
-export type TeamPublicationCategory = "auth" | "network" | "not-found" | "rejected" | "other";
+export type TeamPublicationCategory = "auth" | "network" | "not-found" | "rejected" | "nested-repository" | "other";
 export type TeamPublication = {
   repository: string;
   branch: string;
@@ -527,6 +527,14 @@ export interface TeamMember extends TeamAssignment {
   permissionBlocked?: { code: "locked"; at: string };
   /** The member clone was removed under the retention policy after its result was integrated or its run settled. */
   workspaceRemovedAt?: string;
+  /** Unfinished work the host saved to GitHub before removing this member's clone (INF-268). Keyed to the run revision it was taken at. */
+  savedWork?: {
+    revision: number;
+    state: "published" | "nothing-to-save" | "retrying" | "gave-up";
+    repository?: string; branch?: string; commit?: string;
+    at: string;
+    failure?: { category: TeamPublicationCategory; attempts: number; at: string; retryAt: string };
+  };
   /** Confirmed process retirement for a recording-failed reviewer; its original journal remains sealed. */
   retirement?: { requestId: string; at: string; identity: string; seq: number; processes: number; unsignalable: number };
   /** Set only after stopped() confirms exit while the member waits for serialized integration. */

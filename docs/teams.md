@@ -421,6 +421,10 @@ the paused subteam and normal cancelled-run retention applies.
 
 Removal also waits for head publication; see [Head publication](#head-publication).
 
+Before removing a cancelled or blocked run's workspace, the host also saves each
+eligible member clone's unfinished work to its GitHub repository. It waits for a
+successful save or five failed attempts before removing the run workspace.
+
 The run record, events, reports, and receipts remain after merged, no-change,
 ready-for-review, and blocked workspaces are removed. After a blocked run's
 workspace removal completes, the host closes it as `cancelled` with the last
@@ -650,6 +654,19 @@ are never stored.
 If GitHub rejects the push as non-fast-forward, the host leaves that remote branch
 untouched and publishes the head as `RUN_BRANCH-` plus the first eight hex
 characters of the SHA. The host never deletes or force-updates a remote branch.
+
+**Unfinished member work.** For cancelled and blocked runs, the host snapshots unfinished member clone work
+(including uncommitted edits) to `RUN_BRANCH-wip-MEMBER_ID` before removing the
+workspace. If that branch is rejected, it tries `RUN_BRANCH-wip-MEMBER_ID-SHA8`;
+it never deletes or force-updates either branch. Failed snapshots or pushes retry
+after 1 minute, doubling each time. Once a save has been requested, the host
+retries when its backoff expires even if the normal retention period has not
+arrived. Only the retries are automatic: after an early owner request, the
+workspace is removed when the owner requests removal again or when retention
+comes due. After five failed attempts, the host records the give-up, and the
+workspace can then be removed the same way. This does not
+cover the integration workspace, runs without a GitHub publication target, or
+ready-for-review, merged and no-change runs.
 
 The delivery prompt says the host already published the reviewed head, so a remote
 branch already at that commit is the expected unchanged head. That host publication

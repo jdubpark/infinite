@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { ENTRY_PARAGRAPH_LIMIT_BYTES, entryCommand, entryInstructions, refreshReportingInstructions, reportCommand, retargetPrompt, teamContext, teamPrompt } from "../packages/host/src/team-prompts.js";
-import { teamReportSchema, type TeamModelProfile, type TeamRun, type TeamTask } from "../packages/host/src/team-types.js";
+import { teamReportSchema, type TeamBrief, type TeamModelProfile, type TeamRun, type TeamTask } from "../packages/host/src/team-types.js";
 
 const PROMPT_LIMIT_BYTES = 80 * 1024;
 
@@ -109,6 +109,30 @@ test("review prompt bounds derived evidence while preserving objective and immut
 
   const implementerPrompt = teamPrompt(run, "implementer", run.tasks[0], undefined, "demo");
   assert.ok(implementerPrompt.includes(run.tasks[0].instructions), "implementers retain the complete task contract inline");
+});
+
+test("review prompt defines the quality bar and asks for acceptance evidence only with a brief", () => {
+  const run = largeRun();
+  const ordinary = teamPrompt(run, "reviewer", undefined, undefined, "demo");
+  assert.match(ordinary, /Quality bar: do not approve merely because behavior looks correct/);
+  assert.match(ordinary, /a file pushed from under 1,000 lines to over 1,000/);
+  assert.match(ordinary, /special-case branch or flag added to a shared flow/);
+  assert.match(ordinary, /near-copy of an existing helper/);
+  assert.match(ordinary, /The rubric's cleanliness score must assess this bar/);
+  assert.match(ordinary, /high-conviction findings ordered by structural impact/);
+  assert.doesNotMatch(ordinary, /exactly one acceptance entry per criterion/);
+  assert.doesNotMatch(ordinary, /"acceptance":\[/);
+
+  const brief: TeamBrief = { title: "Evidence-backed change", problem: "The reviewed behavior needs a concrete check.",
+    evidence: [{ source: "Repository inspection", observation: "The behavior has two acceptance criteria." }],
+    dataShape: "No persistent data change.", acceptance: ["The first behavior is correct.", "The second behavior is correct."],
+    expectedOutcome: "Reviewers can verify both behaviors.", uiChanges: false };
+  const goalRun = { ...run, brief };
+  const withBrief = teamPrompt(goalRun, "reviewer", undefined, undefined, "demo");
+  assert.match(withBrief, /exactly one acceptance entry per criterion, numbered from 1 in brief order/);
+  assert.match(withBrief, /could not check a criterion from observed evidence, mark it "inconclusive"/);
+  assert.match(withBrief, /Any "not-verified" or "inconclusive" criterion requires verdict "changes-requested"/);
+  assert.match(withBrief, /"acceptance":\[\{"criterion":1,"verdict":"verified","evidence":"Observed check output or runnable behavior"\},\{"criterion":2,"verdict":"verified","evidence":"Observed check output or runnable behavior"\}\]/);
 });
 
 test("implementer context retains narrative history while withholding task ratings and review rubrics", () => {
@@ -409,7 +433,7 @@ function pinnedContexts() {
   const run = goalRun();
   return PIN_ROLES.map(role => JSON.stringify(teamContext(run, "Owner feedback excerpt.", { checks: PIN_CHECKS }, role), null, 2));
 }
-const PIN_PROMPTS_SHA256 = "33b74673ca9c9cc14cca3935de8c62083c270badba7b4ebc45c2224053733f3c";
+const PIN_PROMPTS_SHA256 = "d47d7a1e8fd478fb571e12c76b96714afecfec680d12b3cee5bc87d598859308";
 const PIN_CONTEXTS_SHA256 = "9ee8fe8ac898e2d70ddbb012ba398387d526294ea61739fb7aad4385b7a7412b";
 
 test("the switch off keeps every prompt and context byte", () => {

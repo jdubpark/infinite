@@ -420,6 +420,11 @@ export const teamBriefSchema = z.object({
   expectedOutcome: z.string().trim().min(1).max(2000), uiChanges: z.boolean(),
 }).strict();
 export type TeamBrief = z.infer<typeof teamBriefSchema>;
+export const teamAcceptanceEvidenceSchema = z.object({
+  criterion: z.number().int().min(1).max(8), verdict: z.enum(["verified", "not-verified", "inconclusive"]),
+  evidence: z.string().trim().min(1).max(600),
+}).strict();
+export type TeamAcceptanceEvidence = z.infer<typeof teamAcceptanceEvidenceSchema>;
 export const teamScoutPlanSchema = z.object({ id: taskId, title: z.string().trim().min(1).max(100), instructions: z.string().trim().min(1).max(4000), agentProfileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/) }).strict();
 export type TeamScoutPlan = z.infer<typeof teamScoutPlanSchema>;
 export const teamTaskPlanSchema = z.object({
@@ -464,7 +469,7 @@ export const teamReportSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("no-change"), summary: z.string().min(1).max(4000), evidence: z.array(teamEvidenceSchema).min(1).max(12) }).strict(),
   z.object({ kind: z.literal("escalate"), agentProfileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/), reason: z.string().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("result"), summary: z.string().min(1).max(8000) }).strict(),
-  z.object({ kind: z.literal("review"), verdict: z.enum(["approved", "changes-requested"]), summary: z.string().min(1).max(8000), uiEvidence: z.string().trim().min(1).max(4000).optional(), rubric: z.array(z.object({ taskId, correctness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), cleanliness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), extensibility: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), docs: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict() }).strict()).max(12).optional() }).strict(),
+  z.object({ kind: z.literal("review"), verdict: z.enum(["approved", "changes-requested"]), summary: z.string().min(1).max(8000), uiEvidence: z.string().trim().min(1).max(4000).optional(), acceptance: z.array(teamAcceptanceEvidenceSchema).max(8).optional(), rubric: z.array(z.object({ taskId, correctness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), cleanliness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), extensibility: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), docs: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict() }).strict()).max(12).optional() }).strict(),
   z.object({ kind: z.literal("delivery"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), pullRequestUrl: z.string().trim().min(1).max(500), mergeCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("delivery-repair"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("delivery-reconciliation"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), repository: githubRepository, branch: gitBranch, baseHeadCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), disposition: z.enum(["no-publication", "owned-branch", "pull-request"]), remoteHeadCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i).optional(), pullRequestUrl: z.string().trim().min(1).max(500).optional(), summary: z.string().trim().min(1).max(4000) }).strict(),
@@ -569,7 +574,7 @@ export interface TeamContinuation {
   baseCommit?: string;
   headCommit: string;
   tasks: TeamTask[];
-  review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string };
+  review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string; acceptance?: TeamAcceptanceEvidence[] };
   brief?: TeamBrief;
 }
 export interface TeamScout extends TeamScoutPlan {
@@ -709,7 +714,7 @@ export interface TeamRun {
   reason?: string;
   /** TeamError.code for the current blocked state; absent on legacy records. */
   blockCode?: string;
-  review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string };
+  review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string; acceptance?: TeamAcceptanceEvidence[] };
   round: number;
 }
 /** `providerLimits` is the host's active limit memory at read time, shared by every run. */

@@ -79,31 +79,24 @@ function listeners() {
   }
 }
 
-function processArgs(pid) {
+// ps rows with pid, parent, start time, and command line. The identity (start time plus command line)
+// comes from the same row that establishes ownership, so a PID reused later is never adopted. A reused
+// PID has a different start time even when its command line is identical. Limits: lstart has one-second
+// resolution, and macOS cannot make the check and the signal one step.
+const PS_ROW = /^(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\d+\s+[\d:]+\s+\d+)\s+(.*)$/;
+function psRows(args) {
   try {
-    return execFileSync("ps", ["-o", "args=", "-p", String(pid)], { encoding: "utf8" }).trim();
+    const out = execFileSync("ps", args, { encoding: "utf8", env: { ...process.env, LC_ALL: "C" }, stdio: ["ignore", "pipe", "ignore"] });
+    return out.split("\n").flatMap((line) => {
+      const match = line.trim().match(PS_ROW);
+      return match ? [{ pid: Number(match[1]), ppid: Number(match[2]), args: match[4], identity: `${match[3].replace(/\s+/g, " ")} ${match[4]}` }] : [];
+    });
   } catch {
-    return "";
+    return [];
   }
 }
-
-// Start time plus command line, as ps reports them. A reused PID has a different start time even when
-// its command line is identical. lstart has one-second resolution; the same PID being reused within the
-// same second for the same command line is not a case this guards.
-function processIdentity(pid) {
-  try {
-    return execFileSync("ps", ["-o", "lstart=,args=", "-p", String(pid)], { encoding: "utf8" }).trim();
-  } catch {
-    return "";
-  }
-}
-
-function processTable() {
-  return execFileSync("ps", ["-axo", "pid=,ppid=,args="], { encoding: "utf8" }).split("\n").flatMap((line) => {
-    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
-    return match ? [{ pid: Number(match[1]), ppid: Number(match[2]), args: match[3] }] : [];
-  });
-}
+const processTable = () => psRows(["-axo", "pid=,ppid=,lstart=,args="]);
+const processNow = (pid) => (Number.isInteger(pid) ? psRows(["-o", "pid=,ppid=,lstart=,args=", "-p", String(pid)])[0] : undefined);
 
 // Names lsof reports for one process's open files, e.g. unix socket paths with -U.
 function openNames(pid, flags) {
@@ -141,19 +134,22 @@ function instanceProcesses() {
   }
   found.delete(serverPid);
   found.delete(process.pid);
-  return [...found].filter(alive).map((pid) => ({ pid, identity: processIdentity(pid) }));
+  const rows = new Map(table.map((entry) => [entry.pid, entry]));
+  return [...found].map((pid) => rows.get(pid)).filter(Boolean);
 }
 
 // True only while the PID is still the process recorded at discovery (same start time and command line).
-const unchanged = (entry) => entry.identity !== "" && processIdentity(entry.pid) === entry.identity;
+const unchanged = (entry) => processNow(entry.pid)?.identity === entry.identity;
 
-// A PID that already exited is not an error; only signal what is still there.
-const signal = (pid, name) => {
+// Signals a recorded process only if its PID still holds that process. A PID that already exited is not an error.
+const signalIfUnchanged = (entry, name) => {
+  if (!unchanged(entry)) return false;
   try {
-    process.kill(pid, name);
+    process.kill(entry.pid, name);
   } catch (error) {
     if (error.code !== "ESRCH") throw error;
   }
+  return true;
 };
 
 const alive = (pid) => {
@@ -179,21 +175,13 @@ async function stopAll(entries, note) {
   if (!entries.length) return note("instance processes: none");
   note(`instance processes found: ${entries.map((entry) => entry.pid).join(",")}`);
   const stillRunning = await waitForExit(entries, 10000);
-  for (const entry of stillRunning) {
-    if (!unchanged(entry)) continue;
-    note(`process ${entry.pid} still running; SIGTERM`);
-    signal(entry.pid, "SIGTERM");
-  }
-  for (const entry of await waitForExit(stillRunning, 5000)) {
-    if (!unchanged(entry)) continue;
-    note(`process ${entry.pid} ignored SIGTERM; SIGKILL`);
-    signal(entry.pid, "SIGKILL");
-  }
+  for (const entry of stillRunning) if (signalIfUnchanged(entry, "SIGTERM")) note(`process ${entry.pid} still running; sent SIGTERM`);
+  for (const entry of await waitForExit(stillRunning, 5000)) if (signalIfUnchanged(entry, "SIGKILL")) note(`process ${entry.pid} ignored SIGTERM; sent SIGKILL`);
 }
 
-function ownsThisInstance(pid) {
-  return Number.isInteger(pid) && processArgs(pid).includes(`--config ${configFile}`);
-}
+// The API is ours when its command line carries this instance's config path.
+const isThisInstance = (entry) => Boolean(entry?.args.includes(`--config ${configFile}`));
+const ownsThisInstance = (pid) => isThisInstance(processNow(pid));
 
 async function doctor() {
   const checks = [];
@@ -305,7 +293,9 @@ async function cleanup() {
     log.push(line);
     console.log(line);
   };
-  const apiUp = ownsThisInstance(serverPid);
+  // The API's identity is recorded once here and rechecked before each signal, like every other process.
+  const apiEntry = processNow(serverPid);
+  const apiUp = isThisInstance(apiEntry);
   // Session workers are detached and outlive the API, so they are found and stopped even when the API is gone.
   const known = new Map(instanceProcesses().map((entry) => [entry.pid, entry]));
   if (apiUp) {
@@ -319,13 +309,10 @@ async function cleanup() {
   }
   for (const entry of instanceProcesses()) if (!known.has(entry.pid)) known.set(entry.pid, entry);
   await stopAll([...known.values()], note);
-  if (apiUp && ownsThisInstance(serverPid)) {
-    signal(serverPid, "SIGTERM");
-    const apiLeft = await waitForExit([{ pid: serverPid, identity: processIdentity(serverPid) }], 10000);
-    if (apiLeft.length && ownsThisInstance(serverPid)) {
-      note(`API ${serverPid} still running after SIGTERM; SIGKILL`);
-      signal(serverPid, "SIGKILL");
-    }
+  if (apiUp) {
+    signalIfUnchanged(apiEntry, "SIGTERM");
+    const apiLeft = await waitForExit([apiEntry], 10000);
+    if (apiLeft.length && signalIfUnchanged(apiEntry, "SIGKILL")) note(`API ${serverPid} still running after SIGTERM; sent SIGKILL`);
     note(`API ${serverPid} stopped`);
     await stopAll(instanceProcesses(), note);
   } else {

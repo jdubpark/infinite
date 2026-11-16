@@ -630,8 +630,8 @@ export interface TeamRun {
   verification?: TeamVerification;
   /** Revisions where an unauthorized verification plan already received its one correction. */
   verificationCorrections?: number[];
-  /** Revisions where a review report already received its one acceptance-evidence correction. */
-  acceptanceCorrections?: number[];
+  /** Revisions where a review report already received its one evidence correction. */
+  reviewCorrections?: number[];
   verificationReconciliations?: { requestId: string; pendingId: string; revision: number; round: number; headCommit: string; interruptedChecks: number; attestation: string; at: string }[];
   /** Changed files from the run's base to its recorded head, bounded to 400; absent when Git refused the read. */
   changes?: { headCommit: string; recordedAt: string; files: { path: string; status: "added" | "modified" | "removed" | "renamed"; added: number | null; removed: number | null }[]; truncated: boolean };

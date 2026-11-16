@@ -16,7 +16,7 @@ import { autonomyOf, type AutonomyMode } from "./autonomy.js";
 import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionAgentDecision, type TeamPermissionDecision, type TeamPermissionRecoveryOutcome, type TeamPermissionRecoveryRequest, type TeamPermissionRecoveryStep, type TeamPermissionRecoveryView, type TeamPublication, type TeamPublicationCategory, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, ACTIVE_MEMBER_STATUSES, currentPermissions, DEFAULT_STORAGE_FLOOR, DEFAULT_TEAM_RETENTION, hostClosedBlockedReason } from "./team-types.js";
 import { memberConfiguration, type MemberConfiguration } from "./config-identity.js";
 import { ownerDirectionLines, permissionFollowUpPrompt, refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
-import { validateTeamAcceptance } from "./team-acceptance.js";
+import { reviewEvidenceProblems } from "./team-acceptance.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { resumeFailed } from "./native-continuation.js";
 import { combineCoverage, type UsageService } from "./usage-service.js";
@@ -5534,16 +5534,13 @@ export class TeamService {
     }
     if (report.kind === "review") {
       if (member.baseCommit !== run.headCommit || stored.checkHead !== run.headCommit) { this.block(stored, new TeamError(409, "stale-review", "The reviewer did not review the currently verified integration commit.")); return; }
-      if (run.brief?.uiChanges && report.verdict === "approved" && !report.uiEvidence)
-        throw new TeamError(409, "ui-review-evidence-required", "Approval of UI changes requires the reviewer's evidence from inspecting the runnable interface.");
-      const acceptanceProblem = validateTeamAcceptance(run.brief, report.verdict, report.acceptance);
-      if (acceptanceProblem) {
-        if (run.acceptanceCorrections?.includes(run.revision)) { this.block(stored, new TeamError(409, "acceptance-evidence-required", acceptanceProblem)); return; }
-        run.acceptanceCorrections = [...(run.acceptanceCorrections ?? []), run.revision];
-        this.event(stored, "The reviewer's acceptance evidence was incomplete or invalid; requesting a corrected review.");
-        this.save(stored);
-        this.prepareMember(stored, "reviewer", undefined, `Review rejected: ${acceptanceProblem}\nReport one acceptance entry per criterion. If any criterion is not verified, the verdict must be changes-requested.`);
-        return;
+      const evidenceProblems = reviewEvidenceProblems(run.brief, report);
+      if (evidenceProblems.length) {
+        const problem = evidenceProblems.map(item => item.message).join(" ");
+        if (run.reviewCorrections?.includes(run.revision)) { this.block(stored, new TeamError(409, evidenceProblems[0]!.code, problem)); return; }
+        run.reviewCorrections = [...(run.reviewCorrections ?? []), run.revision];
+        this.event(stored, "The reviewer's evidence was missing or invalid; requesting a corrected review."); this.save(stored);
+        this.prepareMember(stored, "reviewer", undefined, `Review rejected: ${problem}\n${evidenceProblems.map(item => item.rule).join("\n")}`); return;
       }
       this.operation(stored, "result", async signal => {
         await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);

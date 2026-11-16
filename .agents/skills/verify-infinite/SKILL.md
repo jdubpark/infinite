@@ -155,7 +155,7 @@ Cleanup does this, and logs each step to `evidence/cleanup.log`:
 4. Stops the API the same way: TERM, a wait of up to 10 seconds, then KILL. Then it checks again for late instance processes and stops them.
 5. Removes the `/tmp/iv-*` run directory and the instance directory. It keeps the evidence directory.
 
-Workers are detached and outlive the API by design, so cleanup finds and stops them whether or not the API is still up. It does not match by process name (no `pkill`). It signals only the processes found by the checks above, and before every TERM or KILL it checks that the PID still has the recorded start time and command line (the API must also still carry this instance's config path), so a reused PID is not signalled.
+Workers are detached and outlive the API by design, so cleanup finds and stops them whether or not the API is still up. It does not match by process name (no `pkill`). It signals only the processes found by the checks above, and before every TERM or KILL it checks that the PID still has the start time and command line recorded in the same `ps` snapshot that established ownership (the API must also carry this instance's config path), so a PID reused by another process is not signalled. Two limits remain: `lstart` has one-second resolution, so the same command line restarted on the same PID within one second looks unchanged, and macOS cannot make the check and the signal one step.
 
 If cleanup reports a PID it could not stop, check its arguments and working directory before doing anything by hand. Do not kill by name, and do not kill a process whose arguments do not contain this instance's paths.
 

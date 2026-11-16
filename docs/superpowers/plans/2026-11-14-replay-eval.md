@@ -654,6 +654,13 @@ These override the text below them where the two differ.
    - rendering the grader files for a second instance (`scripts/render-instance.mjs`);
    - a transient systemd unit per round, as later hardening: a private `/proc` and `/tmp`, a cgroup kill, and memory limits.
 9. **Merge order.** This slice is independent of INF-280 and INF-282. Whichever merges second rebases `server.ts`, `docs/teams.md`, and `scripts/file-size-baseline.json`.
+10. **Report keys stay per format.** A JUnit key keeps `classname`, as the plan says, and a TAP key has none, so the two formats give different keys for one run. Node's JUnit reporter always writes `classname="test"`.
+    - A project pins one `reportFormat`, and a change of it blocks the job (`configuration-changed`).
+    - Task 8's test becomes `node's two reporters parse to the same statuses`: three cases in each format with the expected statuses, and each TAP key equal to its JUnit key without the `classname` part.
+    - `caseRef(key)` is the SHA-256 hex of a raw case key, the function `parseReport` uses for its map keys. It has no display form.
+    - Step 3 compares expected cases only under the format that validated them.
+11. **Cleanup limits.** `clean` and `remove` get 600 seconds, because a task's round clones and their dependencies can hold hundreds of thousands of files. `read` and `stop` keep 30 seconds, and `receive` and `digest` 600.
+12. **A rewrite answer must be followed by a read before it moves the cursor.** Form 1's `no` changes the cursor only in the transaction of the first commit visited after it (mined, rejected, or skipped). If the next read fails, nothing is written. A launcher that refuses form 1 with exit 1 therefore mines nothing and claims no rewrite. Task 5 also maps E2's `too-large` to `capsule-too-large`.
 
 ## Trust boundary, and what a review checks
 

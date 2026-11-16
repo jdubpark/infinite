@@ -1,4 +1,4 @@
-import { type ConfigComponents, configId, profileIdentityKey } from "./config-identity.js";
+import { type ConfigComponents, configId, isRoutingComponent, profileIdentityKey } from "./config-identity.js";
 import { CONFIGURATIONS_MODULE, epochAt } from "./configuration-store.js";
 import type { EventProjector } from "./evidence/outbox.js";
 import type { EvidenceStore } from "./evidence/store.js";
@@ -843,13 +843,14 @@ function configIdOf(data: Data): string | undefined {
   const guidance = str(data.guidance);
   const shape = data.shape;
   if (provider === undefined || promptVersion === undefined || guidance === undefined) return undefined;
-  if ((shape !== "team" && shape !== "trial") || data.knowledge !== "none" || data.routing !== "off") return undefined;
+  const routing = data.routing;
+  if ((shape !== "team" && shape !== "trial") || data.knowledge !== "none" || !isRoutingComponent(routing)) return undefined;
   const components: ConfigComponents = {
     profile: { provider, model: str(data.model) ?? null, effort: str(data.effort) ?? null },
     promptVersion,
     guidance,
     knowledge: "none",
-    routing: "off",
+    routing,
     shape,
   };
   const id = configId(components);

@@ -104,10 +104,11 @@ function openNames(pid, flags) {
   }
 }
 
-// Processes that belong to this instance and are not the API: session workers, the agent
-// processes they started (descendants), and anything with files or a working directory in the instance.
-// A worker is matched by a unix socket under this instance's run directory; the path stays
-// visible to lsof even after the directory is removed, so orphans are still found.
+// Processes that belong to this instance and are not the API: session workers and the agent
+// processes they started (descendants). Nothing else qualifies, so a shell or editor that merely
+// has a file open in the instance is never signalled. A worker is matched by a unix socket under
+// this instance's run directory; the path stays visible to lsof even after the directory is
+// removed, so orphans are still found. Each entry keeps the command line seen at discovery.
 function instanceProcesses() {
   const table = processTable();
   const runDirs = [runDir, existsSync(runDir) ? realpathSync(runDir) : ""].filter(Boolean);
@@ -127,18 +128,14 @@ function instanceProcesses() {
       }
     }
   }
-  if (existsSync(instance)) {
-    try {
-      const out = execFileSync("lsof", ["+D", instance, "-Fp"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-      for (const line of out.split("\n")) if (line.startsWith("p")) found.add(Number(line.slice(1)));
-    } catch {
-      /* no open files in the instance */
-    }
-  }
   found.delete(serverPid);
   found.delete(process.pid);
-  return [...found].filter(alive);
+  const args = new Map(table.map((entry) => [entry.pid, entry.args]));
+  return [...found].filter(alive).map((pid) => ({ pid, args: args.get(pid) ?? "" }));
 }
+
+// True only while the PID still runs the command line recorded at discovery, so a reused PID is never signalled.
+const unchanged = (entry) => entry.args !== "" && processArgs(entry.pid) === entry.args;
 
 // A PID that already exited is not an error; only signal what is still there.
 const signal = (pid, name) => {
@@ -158,25 +155,29 @@ const alive = (pid) => {
   }
 };
 
-// Polls until the PIDs exit or the timeout passes. Node timers, not a shell sleep.
-async function waitForExit(pids, timeoutMs) {
+// Polls until the processes exit (or stop matching their recorded command line) or the timeout passes.
+async function waitForExit(entries, timeoutMs) {
+  const running = (entry) => alive(entry.pid) && unchanged(entry);
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline && pids.some(alive)) await new Promise((done) => setTimeout(done, 200));
-  return pids.filter(alive);
+  while (Date.now() < deadline && entries.some(running)) await new Promise((done) => setTimeout(done, 200));
+  return entries.filter(running);
 }
 
-// Gives each PID time to exit on its own, then sends TERM, then KILL. Only the PIDs passed in are signalled.
-async function stopAll(pids, note) {
-  if (!pids.length) return note("instance processes: none");
-  note(`instance processes found: ${pids.join(",")}`);
-  const stillRunning = await waitForExit(pids, 10000);
-  for (const pid of stillRunning) {
-    note(`process ${pid} still running; SIGTERM`);
-    signal(pid, "SIGTERM");
+// Gives each process time to exit on its own, then sends TERM, then KILL. Only the entries passed in are
+// signalled, and each one only after its command line is checked again.
+async function stopAll(entries, note) {
+  if (!entries.length) return note("instance processes: none");
+  note(`instance processes found: ${entries.map((entry) => entry.pid).join(",")}`);
+  const stillRunning = await waitForExit(entries, 10000);
+  for (const entry of stillRunning) {
+    if (!unchanged(entry)) continue;
+    note(`process ${entry.pid} still running; SIGTERM`);
+    signal(entry.pid, "SIGTERM");
   }
-  for (const pid of await waitForExit(stillRunning, 5000)) {
-    note(`process ${pid} ignored SIGTERM; SIGKILL`);
-    signal(pid, "SIGKILL");
+  for (const entry of await waitForExit(stillRunning, 5000)) {
+    if (!unchanged(entry)) continue;
+    note(`process ${entry.pid} ignored SIGTERM; SIGKILL`);
+    signal(entry.pid, "SIGKILL");
   }
 }
 
@@ -285,8 +286,8 @@ async function signIn() {
   process.exit(failed.length ? 1 : 0);
 }
 
-// Stops only what this instance started: sessions through the owner API, then the PIDs
-// holding files under this instance's run directory, then the API PID. Evidence is kept.
+// Stops only what this instance started: sessions through the owner API, then the session workers
+// and their descendants, then the API PID. Evidence is kept.
 async function cleanup() {
   mkdirSync(evidence, { recursive: true });
   const log = [];
@@ -296,7 +297,7 @@ async function cleanup() {
   };
   const apiUp = ownsThisInstance(serverPid);
   // Session workers are detached and outlive the API, so they are found and stopped even when the API is gone.
-  const known = new Set(instanceProcesses());
+  const known = new Map(instanceProcesses().map((entry) => [entry.pid, entry]));
   if (apiUp) {
     const sessions = await api("/api/sessions").catch(() => ({ json: null }));
     for (const session of sessions.json?.sessions ?? []) {
@@ -306,12 +307,12 @@ async function cleanup() {
       note(`stop session ${session.id.slice(0, 8)} (${session.provider}): HTTP ${stop.status}`);
     }
   }
-  for (const pid of instanceProcesses()) known.add(pid);
-  await stopAll([...known], note);
-  if (apiUp) {
+  for (const entry of instanceProcesses()) if (!known.has(entry.pid)) known.set(entry.pid, entry);
+  await stopAll([...known.values()], note);
+  if (apiUp && ownsThisInstance(serverPid)) {
     signal(serverPid, "SIGTERM");
-    const apiLeft = await waitForExit([serverPid], 10000);
-    if (apiLeft.length) {
+    const apiLeft = await waitForExit([{ pid: serverPid, args: processArgs(serverPid) }], 10000);
+    if (apiLeft.length && ownsThisInstance(serverPid)) {
       note(`API ${serverPid} still running after SIGTERM; SIGKILL`);
       signal(serverPid, "SIGKILL");
     }

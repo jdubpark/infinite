@@ -50,6 +50,7 @@ If you find existing private information while working, remove or replace it and
 - Run `npm run check` (typecheck, tests, builds) before declaring host or shared-package work complete.
 - For the phone app, also run `npm run lint -w @infinite/mobile` and `npx tsc --noEmit` in `apps/mobile`.
 - Product, design, and protocol context: `PRODUCT.md`, `DESIGN.md`, `docs/architecture.md`, `docs/security.md`.
+- To drive the running product and capture evidence, follow `.agents/skills/verify-infinite/SKILL.md`.
 - Do not weaken the honesty rules in `PRODUCT.md`: the host never infers task completion or approves a provider permission on its own. A separate permission agent may decide current one-shot requests only under the owner's recorded workspace delegation, with guarded delivery; it never decides its own request, and the owner's five interrupt classes always need the owner's own answer. Until the earlier repository-level delegation is removed, a strong coordinator may decide current one-shot requests of a team run that the permission agent does not serve, only under explicit owner delegation, with recorded scope and guarded delivery.
 
 ## Repository summaries and architecture review

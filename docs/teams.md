@@ -1593,17 +1593,20 @@ For a brief that changes the interface, an approving reviewer must include
 `uiEvidence` describing the runnable flow inspected, results, and limitations.
 This is an agent's recorded claim, separate from the host's command results. If
 inspection is unavailable, the reviewer must request changes or report a
-blocker. For a run with a brief, the reviewer report also includes one
-`acceptance` entry per brief criterion, numbered in order, with a `verified`,
-`not-verified`, or `inconclusive` verdict and observed evidence. The host rejects
+blocker. Missing UI evidence and invalid acceptance evidence share one
+corrected review per run revision. For a run with a brief, the reviewer report
+also includes one `acceptance` entry per brief criterion, numbered in order,
+with a `verified`, `not-verified`, or `inconclusive` verdict and observed
+evidence. The host rejects
 approval unless every criterion is verified, and rejects duplicate or out-of-range
 criterion numbers for either verdict. Runs without a brief keep their existing
 review behavior. The evidence text is kept on `run.review` in the team view;
 the `review.recorded` event carries only each criterion's number and verdict,
-as it carries only rubric scores. An invalid acceptance report gets one
-corrected review per revision; a second invalid report in that revision blocks
-the run with `acceptance-evidence-required`. All roles are prompted to write
-plain English and report only evidence and checks they observed.
+as it carries only rubric scores. If the corrected report in that revision still
+has missing UI evidence or invalid acceptance evidence, the run blocks with the
+matching code (`ui-review-evidence-required` or `acceptance-evidence-required`)
+for the first problem. All roles are prompted to write plain English and report
+only evidence and checks they observed.
 
 ## Model routing
 

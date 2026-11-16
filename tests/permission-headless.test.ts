@@ -420,6 +420,8 @@ function hostRig(pipeline: PermissionPipeline, headless: Session["headless"] = {
     key, runDir: root, services: { pipeline },
     sessions: { meta: () => ({ session }), list: async () => [{ id: session.id, status: "running", headless }] },
     ...(extra.teamLive ? { teamLive: extra.teamLive } : {}),
+    // A team session is served only with a readable task (INF-274); this rig reads one from the run.
+    ...(extra.team ? { teamTask: () => ({ title: "Team task", text: "Run objective" }) } : {}),
   });
   const ask = (request: Record<string, unknown>) => channel.handle({ v: 1, sessionId: session.id, token: channelToken(key, session.id), ...request });
   return { channel, session, key, ask, done: () => rmSync(root, { recursive: true, force: true }) };

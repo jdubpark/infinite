@@ -125,8 +125,18 @@ export function headlessAssignment(session: Pick<Session, "id" | "team">): strin
   return team ? teamPermissionAssignment({ id: team.runId }, { role: team.role, ...(team.taskId ? { taskId: team.taskId } : {}) }) : session.id;
 }
 
+/**
+ * The task a permission reviewer reads for a headless call. A session outside a run is its own task: its title and its
+ * prompt. A team session's task is the host's team projection, and it is undefined when that cannot be read, so the
+ * call is not served. The member's prompt never reaches a team member's reviewer.
+ */
+export function headlessTask(session: Pick<Session, "team" | "title" | "initialPrompt">, teamTask: ((session: Session) => { title: string; text: string } | undefined) | undefined): { title: string; text: string } | undefined {
+  if (!session.team) return { title: bounded(session.title, 200), text: bounded(session.initialPrompt, 4000) };
+  try { return teamTask?.(session as Session); } catch { return undefined; }
+}
+
 /** Builds the request from the host's records of the session. Only the tool call itself comes from the hook. */
-export function headlessRequest(session: Session, call: ChannelCall, id: string): PermissionRequest {
+export function headlessRequest(session: Session, call: ChannelCall, id: string, task: { title: string; text: string }): PermissionRequest {
   const sessionRoot = realpathSync(session.cwd);
   const input = call.toolInput;
   const action = headlessAction(call.toolName, input);
@@ -144,7 +154,7 @@ export function headlessRequest(session: Session, call: ChannelCall, id: string)
       ...(session.teamModelProfile?.model ? { model: session.teamModelProfile.model } : {}),
       sessionRoot,
       scratchRoots: [],
-      task: { title: bounded(session.title, 200), text: bounded(session.initialPrompt, 4000) },
+      task,
     },
     tool: call.toolName,
     input,
@@ -195,6 +205,11 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
      * revoked. A session with `team` is served only when this is given and returns true. A throw counts as false.
      */
     teamLive?: (session: Session) => boolean;
+    /**
+     * The task a permission reviewer reads for a team member's session, from the run in memory. A session with `team`
+     * is served only when this returns a task; a throw or undefined leaves the session not served.
+     */
+    teamTask?: (session: Session) => { title: string; text: string } | undefined;
   }) {}
 
   private pipeline(): PermissionPipeline | undefined { return this.options.services.pipeline; }
@@ -323,8 +338,11 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
     const pipeline = this.pipeline();
     if (!session.headless?.channel || !pipeline) return { result: "not-served" };
     if (!pipeline.serves(session.projectId).served || !this.teamServed(session)) return { result: "not-served" };
+    // A team session whose task cannot be read is not served; no request is built for it.
+    const task = headlessTask(session, this.options.teamTask);
+    if (!task) return { result: "not-served" };
     if (request.op === "class") {
-      const built = headlessRequest(session, call, `headless:${session.id}:${call.toolUseId ?? createHash("sha256").update(JSON.stringify(call)).digest("hex")}`);
+      const built = headlessRequest(session, call, `headless:${session.id}:${call.toolUseId ?? createHash("sha256").update(JSON.stringify(call)).digest("hex")}`, task);
       const match = pipeline.classOf(built);
       if (!match) return { result: "none" };
       // The decision is recorded through the pipeline; its class rules run first, so no model turn starts.
@@ -342,7 +360,7 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
       return { result: "deny", code: "needs-owner", notice: requesterNotice("needs-owner"), interruptClass: match.interruptClass, ...(decided ?? {}) };
     }
     if (typeof request.requestId !== "string" || !/^headless:[a-f0-9-]{36}:[A-Za-z0-9_:-]{1,200}$/.test(request.requestId)) throw new Error("invalid");
-    const built = headlessRequest(session, call, request.requestId);
+    const built = headlessRequest(session, call, request.requestId, task);
     let outcome;
     try { outcome = await pipeline.decide(built, { signal: AbortSignal.timeout(DECIDE_MS - 5_000) }); }
     catch { return { result: "deny", code: "unavailable", notice: requesterNotice("unavailable") }; }
@@ -411,11 +429,14 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
         ...(view?.waiting ? { waiting: view.waiting } : {}),
       });
       if (!session.headless.channel || !pipeline) continue;
+      // A team session whose task cannot be read is skipped, as it is not served.
+      const task = headlessTask(session, this.options.teamTask);
+      if (!task) continue;
       for (const rule of session.headless.allowlist ?? []) {
         const call = ruleCall(rule);
         if (!call) continue;
         try {
-          const match = pipeline.classOf(headlessRequest(session, call, `headless:${id}:shadow`));
+          const match = pipeline.classOf(headlessRequest(session, call, `headless:${id}:shadow`, task));
           if (match) shadowed.push({ sessionId: id, rule, interruptClass: match.interruptClass, classRule: match.rule });
         } catch { /* a rule that cannot be checked is not listed */ }
       }

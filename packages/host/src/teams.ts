@@ -51,7 +51,7 @@ import { storageShortfall, volumeUsage, type VolumeUsage } from "./storage.js";
 import { collectPermissionEvidence, permissionEvidenceDigest } from "./team-permission-evidence.js";
 import type { PermissionAgentServices, PermissionHandled, PermissionRequest } from "./permission-agent-types.js";
 import type { PermissionDeliverySource } from "./permission-delivery.js";
-import { teamPermissionRequest, teamPermissionTarget } from "./team-permission-adapter.js";
+import { teamPermissionRequest, teamPermissionTarget, teamPermissionTask } from "./team-permission-adapter.js";
 import { planRunObjective, runObjectiveNote, runObjectiveView, steerRunObjective, type ObjectiveUnavailable } from "./objective-runs.js";
 export { TeamError } from "./team-workspace.js";
 
@@ -3963,6 +3963,10 @@ export class TeamService {
   permissionAgentLive(session: Pick<Session, "id" | "team">): boolean {
     const team = session.team;
     return Boolean(team) && this.agentRunCheck(team!.runId, team!.memberId, session.id) === undefined;
+  }
+  /** For the headless channel: the task a permission reviewer reads for this member, from the run record in memory. */
+  permissionAgentTask(session: Pick<Session, "team">): { title: string; text: string } | undefined {
+    const run = session.team && this.records.get(session.team.runId)?.run, taskId = session.team?.taskId; return run && teamPermissionTask(run, taskId ? run.tasks.find(item => item.id === taskId) ?? run.discovery?.tasks.find(item => item.id === taskId) : undefined);
   }
   /**
    * Hands a served member's open permission dialog to the permission agent. It never waits for the decision: the

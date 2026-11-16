@@ -87,6 +87,17 @@ function processArgs(pid) {
   }
 }
 
+// Start time plus command line, as ps reports them. A reused PID has a different start time even when
+// its command line is identical. lstart has one-second resolution; the same PID being reused within the
+// same second for the same command line is not a case this guards.
+function processIdentity(pid) {
+  try {
+    return execFileSync("ps", ["-o", "lstart=,args=", "-p", String(pid)], { encoding: "utf8" }).trim();
+  } catch {
+    return "";
+  }
+}
+
 function processTable() {
   return execFileSync("ps", ["-axo", "pid=,ppid=,args="], { encoding: "utf8" }).split("\n").flatMap((line) => {
     const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
@@ -108,7 +119,7 @@ function openNames(pid, flags) {
 // processes they started (descendants). Nothing else qualifies, so a shell or editor that merely
 // has a file open in the instance is never signalled. A worker is matched by a unix socket under
 // this instance's run directory; the path stays visible to lsof even after the directory is
-// removed, so orphans are still found. Each entry keeps the command line seen at discovery.
+// removed, so orphans are still found. Each entry keeps the start time and command line seen at discovery.
 function instanceProcesses() {
   const table = processTable();
   const runDirs = [runDir, existsSync(runDir) ? realpathSync(runDir) : ""].filter(Boolean);
@@ -130,12 +141,11 @@ function instanceProcesses() {
   }
   found.delete(serverPid);
   found.delete(process.pid);
-  const args = new Map(table.map((entry) => [entry.pid, entry.args]));
-  return [...found].filter(alive).map((pid) => ({ pid, args: args.get(pid) ?? "" }));
+  return [...found].filter(alive).map((pid) => ({ pid, identity: processIdentity(pid) }));
 }
 
-// True only while the PID still runs the command line recorded at discovery, so a reused PID is never signalled.
-const unchanged = (entry) => entry.args !== "" && processArgs(entry.pid) === entry.args;
+// True only while the PID is still the process recorded at discovery (same start time and command line).
+const unchanged = (entry) => entry.identity !== "" && processIdentity(entry.pid) === entry.identity;
 
 // A PID that already exited is not an error; only signal what is still there.
 const signal = (pid, name) => {
@@ -155,7 +165,7 @@ const alive = (pid) => {
   }
 };
 
-// Polls until the processes exit (or stop matching their recorded command line) or the timeout passes.
+// Polls until the processes exit (or stop matching their recorded identity) or the timeout passes.
 async function waitForExit(entries, timeoutMs) {
   const running = (entry) => alive(entry.pid) && unchanged(entry);
   const deadline = Date.now() + timeoutMs;
@@ -164,7 +174,7 @@ async function waitForExit(entries, timeoutMs) {
 }
 
 // Gives each process time to exit on its own, then sends TERM, then KILL. Only the entries passed in are
-// signalled, and each one only after its command line is checked again.
+// signalled, and each one only after its identity is checked again.
 async function stopAll(entries, note) {
   if (!entries.length) return note("instance processes: none");
   note(`instance processes found: ${entries.map((entry) => entry.pid).join(",")}`);
@@ -311,7 +321,7 @@ async function cleanup() {
   await stopAll([...known.values()], note);
   if (apiUp && ownsThisInstance(serverPid)) {
     signal(serverPid, "SIGTERM");
-    const apiLeft = await waitForExit([{ pid: serverPid, args: processArgs(serverPid) }], 10000);
+    const apiLeft = await waitForExit([{ pid: serverPid, identity: processIdentity(serverPid) }], 10000);
     if (apiLeft.length && ownsThisInstance(serverPid)) {
       note(`API ${serverPid} still running after SIGTERM; SIGKILL`);
       signal(serverPid, "SIGKILL");

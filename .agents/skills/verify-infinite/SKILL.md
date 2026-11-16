@@ -149,13 +149,13 @@ ls "$EVID"
 
 Cleanup does this, and logs each step to `evidence/cleanup.log`:
 
-1. Finds this instance's processes. A session worker is a `packages/host/src/worker.ts` (or `dist/worker.js`) process that holds a unix socket under this instance's run directory. Its agent process is any descendant of the worker. Nothing else is included: a shell or editor with a file open in the instance directory is never signalled. Each process's command line is recorded when it is found.
+1. Finds this instance's processes. A session worker is a `packages/host/src/worker.ts` (or `dist/worker.js`) process that holds a unix socket under this instance's run directory. Its agent process is any descendant of the worker. Nothing else is included: a shell or editor with a file open in the instance directory is never signalled. Each process's start time and command line are recorded when it is found.
 2. If the API is this instance's process (its arguments contain this instance's config path), stops each running or starting session through `POST /api/sessions/:id/stop` as the owner.
 3. Gives those processes 10 seconds to exit, sends TERM to any still alive, and sends KILL after a further 5 seconds.
 4. Stops the API the same way: TERM, a wait of up to 10 seconds, then KILL. Then it checks again for late instance processes and stops them.
 5. Removes the `/tmp/iv-*` run directory and the instance directory. It keeps the evidence directory.
 
-Workers are detached and outlive the API by design, so cleanup finds and stops them whether or not the API is still up. It does not match by process name (no `pkill`). It signals only the processes found by the checks above, and before every TERM or KILL it checks that the PID still runs the recorded command line (the API must still carry this instance's config path), so a reused PID is never signalled.
+Workers are detached and outlive the API by design, so cleanup finds and stops them whether or not the API is still up. It does not match by process name (no `pkill`). It signals only the processes found by the checks above, and before every TERM or KILL it checks that the PID still has the recorded start time and command line (the API must also still carry this instance's config path), so a reused PID is not signalled.
 
 If cleanup reports a PID it could not stop, check its arguments and working directory before doing anything by hand. Do not kill by name, and do not kill a process whose arguments do not contain this instance's paths.
 

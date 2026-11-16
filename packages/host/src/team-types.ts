@@ -3,7 +3,7 @@ import { z } from "zod";
 import { featureMapSchema, TASK_KINDS } from "./task-features.js";
 import { evalProjectSchema } from "./eval-config.js";
 import { teamRoutingSchema } from "./routing-policy.js";
-import type { TeamRunRouting } from "./routing-types.js";
+import type { RoutingKnobs, TeamRunRouting } from "./routing-types.js";
 import type { Prompt, AnswerResult } from "@infinite/attention";
 import type { Receipt } from "./types.js";
 import type { Provider } from "./types.js";
@@ -321,16 +321,66 @@ type LineupShape = Pick<TeamLineup, "coordinator" | "integrator" | "reviewer" | 
 export function lineupProfiles(lineup: LineupShape): TeamModelProfile[] {
   return [lineup.coordinator, lineup.integrator, lineup.reviewer, ...lineup.implementers, ...(lineup.escalations ?? []), ...(lineup.fallbacks ?? []), ...(lineup.permissionReviewer ? [lineup.permissionReviewer] : [])];
 }
-/** First profile reachable within two `limitFallback` hops whose provider is not limited. */
-export function resolveLimitFallback(lineup: LineupShape, profileId: string, limited: Set<Provider>): TeamModelProfile | undefined {
+/**
+ * Rule 1 or rule 2 of Part 5, in screen's order, or undefined when the profile passes both. Rule 1 is a contributor
+ * profile unless the policy allows one; rule 2 is a profile on the reviewer's model.
+ */
+export function fixedRuleFailure(lineup: Pick<TeamLineup, "reviewer">, knobs: Pick<RoutingKnobs, "allowContributor">, profile: TeamModelProfile): "contributor" | "reviewer-model" | undefined {
+  if (profile.dataUse === "contributor" && !knobs.allowContributor) return "contributor";
+  if (profile.model === lineup.reviewer.model) return "reviewer-model";
+  return undefined;
+}
+/** The run pinned `auto`, revoked or not: plan checks relax, and the fixed rules bind every implementer and scout profile. */
+export function autoPinned(run: Pick<TeamRun, "routing">): boolean {
+  return run.routing?.mode === "auto";
+}
+/** The router chooses: an `auto` pin the owner has not revoked. */
+export function autoRouted(run: Pick<TeamRun, "routing" | "routingRevokedAt">): boolean {
+  return autoPinned(run) && run.routingRevokedAt === undefined;
+}
+/**
+ * Lineup order. In an auto-pinned run, the profiles that pass rules 1 and 2 (implementers), or rule 1 (scouts, escalations);
+ * otherwise the lineup's own array. Empty without a lineup or an escalation pool.
+ */
+export function eligibleImplementers(run: Pick<TeamRun, "routing" | "lineup">): TeamModelProfile[] {
+  const { routing, lineup } = run;
+  if (!lineup) return [];
+  if (routing?.mode !== "auto") return lineup.implementers;
+  return lineup.implementers.filter(profile => fixedRuleFailure(lineup, routing.knobs, profile) === undefined);
+}
+export function scoutPool(run: Pick<TeamRun, "routing" | "lineup">): TeamModelProfile[] {
+  const { routing, lineup } = run;
+  if (!lineup) return [];
+  if (routing?.mode !== "auto") return lineup.implementers;
+  return lineup.implementers.filter(profile => fixedRuleFailure(lineup, routing.knobs, profile) !== "contributor");
+}
+export function escalationPool(run: Pick<TeamRun, "routing" | "lineup">): TeamModelProfile[] {
+  const { routing, lineup } = run;
+  const pool = lineup?.escalations ?? [];
+  if (!lineup || routing?.mode !== "auto") return pool;
+  return pool.filter(profile => fixedRuleFailure(lineup, routing.knobs, profile) !== "contributor");
+}
+/** The attempt limit of assertBudget: (run.goal ?? run.handoff)?.maxMembers ?? 60. */
+export function memberLimit(run: Pick<TeamRun, "goal" | "handoff">): number {
+  return (run.goal ?? run.handoff)?.maxMembers ?? 60;
+}
+/**
+ * First profile within two `limitFallback` hops whose provider is not limited and, given `eligible`, that passes it.
+ * A target that fails `eligible` is passed over, as a limited one is.
+ */
+export function resolveLimitFallback(lineup: LineupShape, profileId: string, limited: Set<Provider>, eligible?: (profile: TeamModelProfile) => boolean): TeamModelProfile | undefined {
   const profiles = lineupProfiles(lineup);
   let current = profiles.find(profile => profile.id === profileId);
   for (let hop = 0; hop < 2 && current?.limitFallback; hop++) {
     const next = profiles.find(profile => profile.id === current!.limitFallback);
-    if (next && !limited.has(next.provider)) return next;
+    if (next && !limited.has(next.provider) && (eligible?.(next) ?? true)) return next;
     current = next;
   }
   return undefined;
+}
+/** Moved from teams.ts unchanged, with `eligible` passed through. */
+export function switchFallback(lineup: TeamLineup, profileId: string, provider: Provider, limited: Set<Provider>, eligible?: (profile: TeamModelProfile) => boolean): TeamModelProfile | undefined {
+  return resolveLimitFallback(lineup, profileId, new Set([...limited, provider]), eligible);
 }
 export const createTeamSchema = z.object({
   requestId: z.uuid(),

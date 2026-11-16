@@ -686,6 +686,8 @@ These rulings override the text below where the two differ.
    - Once the end is stored, such a project pins `auto`. A saved policy keeps its own knobs and `source: "saved"`.
    - Task 7's `pin` step (1) and Task 8's status `mode` use the same condition.
    - In Task 10's status lines, "autonomous default" also names a saved policy without a mode in an `autonomous` project.
+7. **A limit fallback follows the rule of the pool its member starts from.** A scout's start needs rule 1 only, so `fallbackRule` gives a scout of an auto-pinned run rule 1 only, the test `scoutPool` uses. An implementer, escalated or not, keeps rules 1 and 2. Task 2's fallback test covers both roles.
+8. **Notes for Task 9.** `teams.ts` keeps its own `switchFallback` and `taskProfiles` until Task 9 replaces them with the `team-types.ts` and `routing-rules.ts` versions. Task 9 also switches `assertBudget`'s inline limit to `memberLimit`. In the code, the plan's "coordinator" role is `project-manager`.
 
 ## Trust boundary, and what a review checks
 

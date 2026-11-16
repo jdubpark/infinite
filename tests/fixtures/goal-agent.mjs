@@ -127,7 +127,8 @@ async function main() {
       throw new Error("The reviewed implementation is incomplete");
     // The UI scenario deliberately omits inspection evidence. The host must
     // reject this approval even though the configured code check passed.
-    await report({ kind: "review", verdict: "approved", summary: "Verified the progress data and configured check results" });
+    await report({ kind: "review", verdict: "approved", summary: "Verified the progress data and configured check results",
+      acceptance: [{ criterion: 1, verdict: "verified", evidence: "The configured check read the completed field." }] });
   } else throw new Error(`Unexpected fixture role: ${assignment.role}`);
 }
 

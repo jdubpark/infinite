@@ -816,6 +816,9 @@ ${branch}`;
     if (scenario === "changed-after-check")
       writeFileSync(join(process.cwd(), "..", "..", "integration", "a.txt"), "Changed after verification\n");
     await report({ kind: "review", verdict: "approved", summary: "Both requested files are present in the integrated checkout",
+      // A goal plan's brief has one acceptance criterion; a compliant reviewer reports it.
+      ...(scenario === "permissions-routine" || existsSync(join(receiptDir, "plan-brief"))
+        ? { acceptance: [{ criterion: 1, verdict: "verified", evidence: "The configured check validated both output files." }] } : {}),
       ...(scenario === "rubric" ? { rubric: ["a", "b"].map(taskId => ({ taskId,
         correctness: { score: 5, why: "The assigned file is present." }, cleanliness: { score: 4, why: "The change is narrow." },
         extensibility: { score: 4, why: "The structure is easy to extend." }, docs: { score: 3, why: "The task evidence is clear." } })) } : {}) });

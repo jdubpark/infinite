@@ -5536,7 +5536,15 @@ export class TeamService {
       if (member.baseCommit !== run.headCommit || stored.checkHead !== run.headCommit) { this.block(stored, new TeamError(409, "stale-review", "The reviewer did not review the currently verified integration commit.")); return; }
       if (run.brief?.uiChanges && report.verdict === "approved" && !report.uiEvidence)
         throw new TeamError(409, "ui-review-evidence-required", "Approval of UI changes requires the reviewer's evidence from inspecting the runnable interface.");
-      validateTeamAcceptance(run.brief, report.verdict, report.acceptance);
+      const acceptanceProblem = validateTeamAcceptance(run.brief, report.verdict, report.acceptance);
+      if (acceptanceProblem) {
+        if (run.acceptanceCorrections?.includes(run.revision)) { this.block(stored, new TeamError(409, "acceptance-evidence-required", acceptanceProblem)); return; }
+        run.acceptanceCorrections = [...(run.acceptanceCorrections ?? []), run.revision];
+        this.event(stored, "The reviewer's acceptance evidence was incomplete or invalid; requesting a corrected review.");
+        this.save(stored);
+        this.prepareMember(stored, "reviewer", undefined, `Review rejected: ${acceptanceProblem}\nReport one acceptance entry per criterion. If any criterion is not verified, the verdict must be changes-requested.`);
+        return;
+      }
       this.operation(stored, "result", async signal => {
         await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
       }, () => {

@@ -1600,8 +1600,10 @@ approval unless every criterion is verified, and rejects duplicate or out-of-ran
 criterion numbers for either verdict. Runs without a brief keep their existing
 review behavior. The evidence text is kept on `run.review` in the team view;
 the `review.recorded` event carries only each criterion's number and verdict,
-as it carries only rubric scores. All roles are prompted to
-write plain English and report only evidence and checks they observed.
+as it carries only rubric scores. An invalid acceptance report gets one
+corrected review per revision; a second invalid report in that revision blocks
+the run with `acceptance-evidence-required`. All roles are prompted to write
+plain English and report only evidence and checks they observed.
 
 ## Model routing
 

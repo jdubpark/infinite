@@ -522,6 +522,10 @@ function taskOf(db: EvidenceDb, row: TaskRow): EvalTaskRow {
     decidedAt: row.decided_at ?? null,
     checkedAt: row.checked_at,
     runDeletedAt: row.run_deleted_at ?? null,
+    groupId: null,
+    lineage: null,
+    validatedAt: null,
+    attempts: 0,
     payload: db.open<CapturedPayload | RejectedPayload>("eval_tasks", row.task_id, row.payload),
   };
 }

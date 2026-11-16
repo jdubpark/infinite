@@ -8,6 +8,7 @@ import { machineIdentity } from "./machine.js";
 import { autonomyModeSchema } from "./autonomy.js";
 import { projectSourceSchema, teamProjectSchema, teamCommandSchema, teamRetentionSchema, storageFloorSchema, teamLineupSchema } from "./team-types.js";
 import { intakeConfigSchema } from "./intake-types.js";
+import { evalHostSchema } from "./eval-config.js";
 import { permissionAgentConfigSchema } from "./permission-agent-config.js";
 import { mcpConfigSchema } from "./mcp-types.js";
 import { egressConfigSchema } from "./egress.js";
@@ -91,6 +92,7 @@ const schema = z
     usage: usageConfigSchema.optional(),
     sync: z.object({ sharedGroup: z.boolean().optional(), homeDir: z.string().refine(isAbsolute).optional() }).strict().optional(),
     source: z.object({ mirrorDir: z.string().refine(isAbsolute).optional(), refreshMinutes: z.number().int().min(1).max(1440).optional(), remoteOverrides: z.record(z.string(), z.string()).optional() }).strict().optional(),
+    eval: evalHostSchema.optional(),
     // Model-written chat digests. The key file is read once at startup and never logged.
     summaries: z.object({
       model: z.string().min(1).max(100),

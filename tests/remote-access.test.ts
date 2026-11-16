@@ -341,6 +341,9 @@ test("remote access rejects wrong keys, revoked keys, privileged paths and exces
     assert.deepEqual(await client.request(`/sessions/${contextSession}/context`), { count: 19, method: "GET", path: `/api/sessions/${contextSession}/context` });
     for (const [method, path] of [["POST", "/projects/project/graph/map"], ["GET", "/projects/project/graph"], ["POST", `/teams/${contextTeam}/context`], ["GET", "/teams/not-a-uuid/context"], ["POST", `/sessions/${contextSession}/context`]] as const)
       await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403);
+    // The phone extends a mission's time limit over this channel. It is a POST only.
+    assert.deepEqual(await client.request(`/missions/${missionId}/extend`, { body: {} }), { count: 20, method: "POST", path: `/api/missions/${missionId}/extend` });
+    await assert.rejects(client.request(`/missions/${missionId}/extend`, { method: "GET" }), (error: RemoteError) => error.status === 403);
     runner.oversized();
     await assert.rejects(client.request("/me"), (error: RemoteError) => error.status === 413 && error.code === "response-too-large");
     const beforeRevoke = runner.requests.length;

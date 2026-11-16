@@ -1,5 +1,6 @@
 import type { BoardColumn, BoardItem, Mission, Me, MissionDecision, MissionStatus, MissionSubtask } from "../../api/client";
 import type { StatusKind } from "../../status";
+import { shortDate } from "../teams/model";
 
 export type BoardSection = "needs-input" | "working" | "review" | "ended";
 export const BOARD_SECTIONS: { id: BoardSection; title: string; subtitle: string; column: BoardColumn }[] = [
@@ -47,7 +48,7 @@ export function findBoardItem(items: BoardItem[], kind: BoardItem["kind"], id: s
 }
 
 export function boardStatusLabel(item: BoardItem) {
-  if (item.kind === "mission") return missionStatusLabel(item.status as MissionStatus);
+  if (item.kind === "mission") return missionStatusLabel(item.status as MissionStatus, item.stopReason);
   const words = item.status.replace(/-/g, " ");
   return words.charAt(0).toUpperCase() + words.slice(1);
 }
@@ -65,12 +66,69 @@ export function openMissionDecisions(mission: Mission): MissionDecision[] {
   return mission.decisions.filter(decision => decision.answer == null);
 }
 
-export function missionStatusLabel(status: MissionStatus) {
+export function missionStatusLabel(status: MissionStatus, stopReason?: Mission["stopReason"]) {
+  if (status === "blocked" && stopReason === "deadline") return "Stopped at time limit";
   const labels: Record<MissionStatus, string> = {
     planning: "Planning", working: "Working", "needs-input": "Needs your input", paused: "Paused",
     blocked: "Blocked", "ready-for-review": "Ready for review", cancelled: "Cancelled",
   };
   return labels[status];
+}
+
+export function missionShowsReason(mission: Pick<Mission, "status" | "stopReason" | "reason">): boolean {
+  return Boolean(mission.reason) && !(mission.status === "blocked" && mission.stopReason === "deadline");
+}
+
+/** Blocked because its approved time ran out; its work is kept and the owner can extend it. */
+export function missionStoppedAtLimit(mission: Pick<Mission, "status" | "stopReason">): boolean {
+  return mission.status === "blocked" && mission.stopReason === "deadline";
+}
+
+/**
+ * Time left before the mission stops. While an intake mission's clock is stopped, `deadlineAt`
+ * does not yet include the stopped span, so the time left is counted up to `clockStoppedAt`.
+ */
+export function missionTimeLeftMs(mission: Pick<Mission, "deadlineAt" | "clockStoppedAt">, now: number): number {
+  return mission.clockStoppedAt ? Date.parse(mission.deadlineAt) - Date.parse(mission.clockStoppedAt) : Date.parse(mission.deadlineAt) - now;
+}
+
+/** Time left in words, rounded down to whole minutes: "2 h 15 min", "2 h", "45 min", or "less than a minute". */
+export function missionLeftLabel(ms: number): string {
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 1) return "less than a minute";
+  const hours = Math.floor(minutes / 60), rest = minutes % 60;
+  if (hours === 0) return `${rest} min`;
+  return rest === 0 ? `${hours} h` : `${hours} h ${rest} min`;
+}
+
+/**
+ * The line under the status chips. Only a mission that can still run or be extended speaks about
+ * its time: a blocked mission without a deadline stop has its reason shown instead, so it gets none.
+ */
+export function missionStopLine(mission: Pick<Mission, "status" | "stopReason" | "deadlineAt" | "clockStoppedAt">, now: number): string | undefined {
+  if (missionStoppedAtLimit(mission)) return "Stopped at its time limit. Its work is kept. Extend to continue, or cancel.";
+  if (!["planning", "working", "needs-input", "paused"].includes(mission.status)) return undefined;
+  const left = missionTimeLeftMs(mission, now);
+  if (left <= 0) return "Its time limit has passed. Extend to continue.";
+  if (mission.clockStoppedAt) return `Clock stopped while it waits · ${missionLeftLabel(left)} left`;
+  return `Stops ${shortDate(mission.deadlineAt)}`;
+}
+
+/**
+ * Extension amounts for the owner: one hour, six hours and a day, plus the mission's own limit
+ * when it is a whole number of minutes from 5 to 1440 that the list does not already hold.
+ * `spoken` is the accessibility label for the button.
+ */
+export function missionExtendChoices(maxMinutes: number): { minutes: number; label: string; spoken: string; ownLimit: boolean }[] {
+  const minutes = [60, 360, 1440];
+  if (Number.isInteger(maxMinutes) && maxMinutes >= 5 && maxMinutes <= 1440 && !minutes.includes(maxMinutes)) minutes.push(maxMinutes);
+  const unit = (count: number, word: string) => `${count} ${count === 1 ? word : `${word}s`}`;
+  return minutes.sort((a, b) => a - b).map(value => {
+    const ownLimit = value === maxMinutes;
+    const span = value % 60 === 0 ? `+${value / 60} h` : `+${value} min`;
+    const amount = value % 60 === 0 ? unit(value / 60, "hour") : unit(value, "minute");
+    return { minutes: value, label: ownLimit ? `${span} (its limit)` : span, spoken: `Extend by ${amount}${ownLimit ? ", its limit" : ""}`, ownLimit };
+  });
 }
 
 export function missionSubtaskLabel(status: MissionSubtask["status"]) {
@@ -88,7 +146,8 @@ export function missionControls(mission: Mission, role: Me["role"] | undefined, 
     answer: owner && live,
     steer: owner && live && mission.status !== "paused",
     pause: owner && ["planning", "working", "needs-input"].includes(mission.status),
-    resume: owner && mission.status === "paused" && Date.parse(mission.deadlineAt) > now,
+    resume: owner && mission.status === "paused" && missionTimeLeftMs(mission, now) > 0,
+    extend: owner && (["planning", "working", "needs-input", "paused"].includes(mission.status) || missionStoppedAtLimit(mission)),
     cancel: owner && live,
   };
 }

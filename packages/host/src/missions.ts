@@ -301,6 +301,7 @@ export class MissionService {
       catch (error) { if (notFound(error)) return [subtask.finalEvidence?.usage ?? emptyRollup()]; throw error; }
     });
     mission.usage = addRollups([coordinator, ...subteams]);
+    if (stored.clockStoppedAt) mission.clockStoppedAt = stored.clockStoppedAt;
     return mission;
   }
   list() { return [...this.records.values()].map(stored => this.view(stored)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
@@ -424,7 +425,10 @@ export class MissionService {
         throw new TeamError(409, "mission-not-extendable", "Only a running mission, or one stopped by its time limit, can be extended.");
       this.admit(stored, "extend", body);
       const at = Date.now();
-      const deadline = deadlineBlocked ? at + body.minutes * 60000 : Date.parse(mission.deadlineAt) + body.minutes * 60000;
+      // The extension adds working time to whatever is left, never to a deadline already passed. A stopped intake
+      // clock measures what is left from the moment it stopped; the stopped span is added back when it restarts.
+      const from = deadlineBlocked ? at : Math.max(Date.parse(mission.deadlineAt), stored.clockStoppedAt ? Date.parse(stored.clockStoppedAt) : at);
+      const deadline = from + body.minutes * 60000;
       mission.deadlineAt = new Date(deadline).toISOString();
       if (deadlineBlocked) {
         mission.status = "working"; mission.stopReason = undefined; mission.reason = undefined; stored.blockedAt = undefined;
@@ -1602,6 +1606,7 @@ export function missionBoard(
     // A mission started before its checkout folded keeps its pinned record; the row follows the project that holds that checkout now.
     const owner = mission.repoProjectIds.map(id => containing(id)).find(Boolean);
     items.push({ kind: "mission", id: mission.id, title: mission.title, groupId: owner?.id ?? mission.groupId, projectName: owner?.name ?? mission.groupName, column, status: mission.status,
+      ...(mission.stopReason ? { stopReason: mission.stopReason } : {}),
       detail: oneLine(missionDetail(mission, teamById)), createdAt: mission.createdAt, updatedAt: mission.updatedAt,
       subtasks: subtaskCounts(mission) });
     attempts.push({ item: items.at(-1)!, scope: owner?.id ?? mission.groupId, objective: mission.objective });

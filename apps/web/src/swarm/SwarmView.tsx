@@ -10,6 +10,7 @@ import { clockTime, cost, elapsed, shortModel, usd } from "./format";
 import { allAgents, buildSwarm, findAgent, findUnit } from "./model";
 import { createActivity } from "./activity";
 import { AGENT_STATES, STATE_LABEL, type AgentState, type Selection, type SwarmMission, type SwarmSession, type SwarmTeam, type ViewProps } from "./types";
+import { missionStateLabel } from "../mission-model";
 import "./swarm.css";
 import "./views.css";
 
@@ -26,6 +27,7 @@ export type SwarmViewProps = {
   setView(view: SwarmViewName): void;
   openSession(sessionId: string): void;
   openTeam(teamId: string): void;
+  openMission(missionId: string): void;
   /** Starts a session; shown to owners when the host has no sessions at all. */
   onCreate?: () => void;
   focus: boolean;
@@ -42,7 +44,7 @@ const isEditable = (target: EventTarget | null) =>
 
 /** The Swarm route: floating glass controls over the Lanes, Wall, or Graph canvas. */
 export function SwarmView(props: SwarmViewProps) {
-  const { me, sessions, teams, stale, seen, view, setView, openSession, openTeam, onCreate, focus, setFocus } = props;
+  const { me, sessions, teams, stale, seen, view, setView, openSession, openTeam, openMission, onCreate, focus, setFocus } = props;
   const api = useApi();
   const root = useRef<HTMLDivElement>(null);
   const [missions, setMissions] = useState<SwarmMission[]>([]);
@@ -94,11 +96,18 @@ export function SwarmView(props: SwarmViewProps) {
   const cpuPercent = resources?.cpu?.usagePercent ?? null;
   const limits = (me.providerLimits ?? []).filter(limit => Date.parse(limit.expiresAt) > now);
 
-  const viewProps: ViewProps = { model, selection, onSelect: setSelection, openSession, openTeam, activity, now };
+  const viewProps: ViewProps = { model, selection, onSelect: setSelection, openSession, openTeam, openMission, activity, now };
 
   return <div ref={root} className={`swarm${stale ? " sw-stale" : ""}`}>
     <div className="sw-canvas">
-      {empty ? <div className="sw-empty">
+      {model.held.length > 0 && <section className="sw-held-missions" aria-label="Missions waiting on you">
+        <div className="sw-group-label sw-dim" role="heading" aria-level={2}>Missions waiting on you</div>
+        {model.held.map(mission => <div className="sw-held-row" key={mission.id}>
+          <span className="sw-unit-sub" title={mission.title}>{mission.title}</span>
+          <div className="sw-held-row-meta"><span className="sw-dim">{missionStateLabel(mission)}</span><button type="button" className="sw-link" aria-label={"Open mission: " + mission.title} onClick={() => openMission(mission.id)}>Open mission</button></div>
+        </div>)}
+      </section>}
+      {empty ? <div className={`sw-empty${model.held.length > 0 ? " sw-held-empty" : ""}`}>
         <span className="sw-dim">no agents</span>
         {onCreate && <button type="button" className="sw-link" onClick={onCreate}>start a session</button>}
       </div>

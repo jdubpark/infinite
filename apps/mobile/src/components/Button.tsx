@@ -15,6 +15,7 @@ export function Button({
   compact = false,
   glyph,
   busy,
+  accessibilityLabel,
 }: {
   title: string;
   onPress: () => void;
@@ -24,11 +25,14 @@ export function Button({
   compact?: boolean;
   glyph?: GlyphName;
   busy?: boolean;
+  /** Spoken in place of the visible title when the title alone does not say what the control does. */
+  accessibilityLabel?: string;
 }) {
   const ink = destructive ? theme.colors.error : secondary ? theme.colors.secondaryInk : theme.colors.white;
   return (
     <Pressable
       accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel}
       accessibilityState={{ disabled }}
       disabled={disabled}
       onPress={onPress}

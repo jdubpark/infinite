@@ -13,7 +13,7 @@ import { theme } from "../../theme";
 import { newer } from "../teams/model";
 import { RequestStatus, Section, SteerBox, t } from "../teams/parts";
 import { useRunRequest } from "../teams/useRunRequest";
-import { attemptLabel, attemptsOf, findBoardItem, missionControls, missionStatusLabel, missionSubtaskLabel, openMissionDecisions } from "./model";
+import { attemptLabel, attemptsOf, findBoardItem, missionControls, missionExtendChoices, missionShowsReason, missionStatusLabel, missionStopLine, missionStoppedAtLimit, missionSubtaskLabel, missionTimeLeftMs, openMissionDecisions } from "./model";
 import { Attempts } from "./Attempts";
 
 export function MissionDetail({ connection, id }: { connection: Connection; id: string }) {
@@ -31,6 +31,7 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
   const [recorded, setRecorded] = useState<Mission | null>(null);
   const [direction, setDirection] = useState("");
   const [dockHeight, setDockHeight] = useState(0);
+  const [extendOpen, setExtendOpen] = useState(false);
   const mission = poll.data ? newer(recorded, poll.data.mission) : recorded;
   const request = useRunRequest<Mission>(connection, `${machine}/mission/${id}`, {
     accepted: result => { setRecorded(previous => newer(previous, result)); poll.refresh(); },
@@ -49,6 +50,9 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
   const attemptChip = boardItem ? attemptLabel(boardItem) : undefined;
   const controls = missionControls(mission, me?.role, fresh, now);
   const locked = request.busy || Boolean(request.pending);
+  const stoppedAtLimit = missionStoppedAtLimit(mission);
+  const timeLeft = missionTimeLeftMs(mission, now);
+  const stopLine = missionStopLine(mission, now);
   const decisions = openMissionDecisions(mission);
   const answered = mission.decisions.filter(decision => decision.answer != null);
   const titleOf = (subtaskId: string) => mission.subtasks.find(subtask => subtask.id === subtaskId)?.title ?? subtaskId;
@@ -56,7 +60,11 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
   const projectName = group?.name ?? mission.groupName;
   const repoName = (projectId: string) => me?.projects?.find(project => project.id === projectId)?.name
     ?? group?.repos.find(repo => repo.projectId === projectId)?.name ?? projectId;
-  const send = (action: string, label: string, fields?: Record<string, string>) => request.send(`/missions/${id}/${action}`, label, mission.revision, fields);
+  const send = (action: string, label: string, fields?: Record<string, string | number>) => request.send(`/missions/${id}/${action}`, label, mission.revision, fields);
+  const extend = (minutes: number) => { setExtendOpen(false); send("extend", "Time extension", { minutes }); };
+  const extendChoices = (secondary: boolean) => <View style={s.controls}>
+    {missionExtendChoices(mission.maxMinutes).map(choice => <Button key={choice.minutes} compact secondary={secondary} title={choice.label} accessibilityLabel={choice.spoken} disabled={locked} onPress={() => extend(choice.minutes)} />)}
+  </View>;
   const answer = (decisionId: string, text: string) => {
     const value = text.trim();
     if (value) send(`answer/${decisionId}`, "Answer", { text: value });
@@ -72,10 +80,11 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
       <View style={s.heading}>
         <Text style={t.note}>{projectName} · {age(mission.createdAt, now)}</Text>
         <Text style={t.title}>{mission.title}</Text>
-        <View style={s.chips}><Chip kind={statusIcon} label={missionStatusLabel(mission.status)} tone={mission.status === "needs-input" || mission.status === "paused" ? "attention" : mission.status === "blocked" ? "error" : undefined} />
+        <View style={s.chips}><Chip kind={statusIcon} label={missionStatusLabel(mission.status, mission.stopReason)} tone={mission.status === "needs-input" || mission.status === "paused" ? "attention" : mission.status === "blocked" ? "error" : undefined} />
           {attemptChip ? <Chip label={attemptChip} /> : null}
           <Chip label={`Updated ${age(mission.updatedAt, now)}`} /><Chip label={`Rev ${mission.revision}`} /></View>
-        {mission.reason ? <Text style={mission.status === "blocked" ? t.error : t.warning}>{mission.reason}</Text> : null}
+        {stopLine ? <Text style={stoppedAtLimit || timeLeft <= 0 ? t.warning : t.note}>{stopLine}</Text> : null}
+        {missionShowsReason(mission) ? <Text style={mission.status === "blocked" ? t.error : t.warning}>{mission.reason}</Text> : null}
       </View>
 
       {decisions.length ? <Section title="Needs your input" count={decisions.length}>
@@ -105,14 +114,17 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
       {mission.dispatchSummary ? <Section title="Coordinator update"><Text style={t.body}>{mission.dispatchSummary}</Text></Section> : null}
       {mission.result ? <Section title="Reported result"><Card><Text style={t.body}>{mission.result.summary}</Text><Text style={t.note}>Coordinator report · not an independent review</Text></Card></Section> : null}
 
-      {me?.role === "owner" && (controls.pause || controls.resume || controls.cancel) ? <Section title="Mission controls">
+      {me?.role === "owner" && (controls.pause || controls.resume || controls.extend || controls.cancel) ? <Section title="Mission controls">
+        {controls.extend && stoppedAtLimit ? extendChoices(false) : null}
         <View style={s.controls}>
           {controls.resume ? <Button compact title="Resume" glyph="play" disabled={locked} onPress={() => send("resume", "Resume")} />
             : controls.pause ? <Button compact secondary title="Pause" glyph="pause" disabled={locked} onPress={() => send("pause", "Pause")} /> : null}
+          {controls.extend && !stoppedAtLimit ? <Button compact secondary title="Extend…" glyph="plus" disabled={locked} onPress={() => setExtendOpen(open => !open)} /> : null}
           {controls.cancel ? <Button compact secondary title="Cancel…" glyph="close" disabled={locked} onPress={() => Alert.alert("Cancel this mission?", "Stops the coordinator and active subtasks. Recorded work stays.", [
             { text: "Keep running", style: "cancel" }, { text: "Cancel mission", style: "destructive", onPress: () => send("cancel", "Cancellation") },
           ])} /> : null}
         </View>
+        {controls.extend && !stoppedAtLimit && extendOpen ? extendChoices(true) : null}
       </Section> : null}
 
       {mission.steering.length || answered.length ? <Section title="Directions and decisions" count={mission.steering.length + answered.length}>

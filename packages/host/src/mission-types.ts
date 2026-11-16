@@ -127,6 +127,9 @@ export interface Mission {
   /** `deadline` while the mission is blocked because its approved time ran out: its subteams are paused, their
    * workspaces are kept, and the owner may extend it. Absent for every other status or reason. */
   stopReason?: "deadline";
+  /** Views only. Set while an intake mission's clock is stopped, because it waits on the owner or is paused. `deadlineAt`
+   * then leaves out the stopped span: the time left is `deadlineAt` minus this, and the deadline moves when the clock restarts. */
+  clockStoppedAt?: string;
   createdAt: string;
   updatedAt: string;
   lineup: TeamLineup;
@@ -164,6 +167,8 @@ export interface BoardItem {
   projectName: string;
   column: BoardColumn;
   status: string;
+  /** Deadline stop reason for missions; absent when the mission has no stop reason. */
+  stopReason?: "deadline";
   /** One line: the open question, the block reason, or the current step. */
   detail: string;
   createdAt: string;

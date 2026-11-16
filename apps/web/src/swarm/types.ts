@@ -1,4 +1,5 @@
 import type { Session, TeamModelProfile, UsageTotals } from "../api";
+import type { MissionStatus } from "../mission-model";
 
 // ---- Inputs: structural subsets of the host's session, team, and mission lists. ----
 
@@ -35,7 +36,7 @@ export type SwarmTeam = {
   workers?: { limit: number; max: number; running: number; ready: number };
 };
 export type SwarmMission = {
-  id: string; title: string; status: "planning" | "working" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "cancelled";
+  id: string; title: string; status: MissionStatus; stopReason?: "deadline";
   createdAt: string; updatedAt: string;
   coordinator?: { memberId: string; sessionId: string; status: "running" | "waiting" | "stopped" };
   subtasks: { id: string; repoProjectId: string; title: string; dependsOn: string[]; status: "queued" | "running" | "done" | "cancelled" | "blocked"; teamId?: string }[];
@@ -167,6 +168,7 @@ export interface SwarmTotals {
 }
 export interface SwarmModel {
   live: Swarm[];
+  held: { id: string; title: string; status: MissionStatus; stopReason?: "deadline" }[];
   /** Units of swarms with no live unit, each updated in the last 72 hours, newest first, at most 12. They carry no agents. */
   quiet: Unit[];
   /** Quiet units not shown: older than 72 hours or beyond the limit. */
@@ -189,6 +191,7 @@ export interface ViewProps {
   onSelect(selection: Selection): void;
   openSession(sessionId: string): void;
   openTeam(teamId: string): void;
+  openMission(missionId: string): void;
   activity: ActivityStore;
   now: number;
 }

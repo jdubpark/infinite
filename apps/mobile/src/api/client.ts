@@ -246,7 +246,12 @@ export type MissionUsage = {
 export type Mission = {
   id: string; groupId: string; groupName: string; repoProjectIds: string[]; title: string; objective: string;
   maxSubtasks: number; maxMinutes: number; deadlineAt: string; revision: number; status: MissionStatus;
-  reason?: string; createdAt: string; updatedAt: string; lineup: TeamLineup;
+  reason?: string;
+  /** Set while the mission is blocked because its approved time ran out; its work is kept and the owner can extend it. */
+  stopReason?: "deadline";
+  /** Set while an intake mission's clock is stopped (waiting on the owner or paused); `deadlineAt` then leaves out the stopped span. */
+  clockStoppedAt?: string;
+  createdAt: string; updatedAt: string; lineup: TeamLineup;
   coordinator?: { memberId: string; sessionId: string; status: "running" | "waiting" | "stopped" };
   dispatchSummary?: string; subtasks: MissionSubtask[]; decisions: MissionDecision[];
   steering: { text: string; revision: number; at: string; source?: { kind: "connector"; id: string; name: string } | "coordinator" | "slack" }[]; events: { at: string; text: string }[];
@@ -258,7 +263,7 @@ export type BoardColumn = "needs-input" | "working" | "review" | "ended";
 export type BoardAttempt = { workId: string; number: number; of: number; superseded: boolean };
 export type BoardItem = {
   kind: "mission" | "team" | "goal"; id: string; title: string; groupId?: string; projectName: string;
-  column: BoardColumn; status: string; detail: string; createdAt?: string; updatedAt: string;
+  column: BoardColumn; status: string; detail: string; stopReason?: "deadline"; createdAt?: string; updatedAt: string;
   subtasks?: { total: number; running: number; done: number };
   attempt?: BoardAttempt;
 };

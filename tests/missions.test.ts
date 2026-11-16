@@ -1766,12 +1766,14 @@ test("an intake mission waiting on the owner past its original deadline still re
     const { id } = await h.missions.create(missionRequest(5), undefined, intakeOrigin);
     await h.report(1, { kind: "question", question: "Which response format?", options: ["JSON", "Text"] });
     const asked = await until(() => h.get(id), mission => mission.status === "needs-input");
+    assert.ok(asked.clockStoppedAt, "The view says the clock is stopped while the mission waits on the owner");
     // Ten minutes pass while the owner is away, which is more than the five-minute limit.
     mock.timers.tick(10 * 60000);
     await new Promise(done => setTimeout(done, 1200));
     assert.equal(h.missions.peek(id)!.status, "needs-input", "The stopped clock does not block the mission");
     const answered = await h.missions.answer(id, asked.decisions[0].id, { requestId: randomUUID(), revision: asked.revision, text: "JSON" });
     assert.ok(["planning", "working"].includes(answered.status), `The answered mission resumes work, not ${answered.status}`);
+    assert.equal(answered.clockStoppedAt, undefined, "The clock runs again once the owner answers");
     assert.ok(Date.parse(h.missions.peek(id)!.deadlineAt) - Date.now() > 4 * 60000, "The owner's wait is added back to the deadline");
   } finally { h.close(); mock.timers.reset(); }
 });
@@ -1861,6 +1863,7 @@ test("the host closes a mission that stays blocked for the blocked-work retentio
     const blocked = await until(() => h.get(id), mission => mission.status === "blocked");
     assert.equal(blocked.stopReason, "deadline");
     assert.equal(blocked.reason, timeLimitText);
+    assert.equal(missionBoard([blocked], [], [], [], () => undefined).items[0].stopReason, "deadline", "The owner board carries the deadline stop reason to clients");
     // One hour short of the default 72 hours: the mission still waits on the owner.
     mock.timers.tick(71 * 3600000);
     await new Promise(done => setTimeout(done, 1200));
@@ -2027,10 +2030,16 @@ test("a mission started from the apps keeps the wall-clock deadline", { timeout:
     const created = await h.missions.create(missionRequest(5));
     await h.attempt(1);
     const paused = await h.missions.pause(created.id, { requestId: randomUUID(), revision: created.revision });
+    assert.equal(paused.clockStoppedAt, undefined, "A mission started from the apps never stops its clock");
     // Stop the tick, so no step can block the paused mission between the clock move and the resume.
     h.missions.close();
     mock.timers.tick(10 * 60000);
     await assert.rejects(h.missions.resume(created.id, { requestId: randomUUID(), revision: paused.revision }), (error: TeamError) => error.code === "mission-deadline");
+    // Extending a paused mission whose deadline already passed counts the extension from now, so it can resume.
+    const extended = await h.missions.extend(created.id, { requestId: randomUUID(), revision: paused.revision, minutes: 60 });
+    assert.equal(Date.parse(extended.deadlineAt), Date.now() + 60 * 60000);
+    const resumed = await h.missions.resume(created.id, { requestId: randomUUID(), revision: extended.revision });
+    assert.ok(["planning", "working"].includes(resumed.status), `The extended mission resumes, not ${resumed.status}`);
   } finally { h.close(); mock.timers.reset(); }
 });
 

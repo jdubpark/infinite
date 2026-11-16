@@ -28,7 +28,7 @@ function team(id: string, units: Unit[], over: Partial<Swarm> = {}): Swarm {
 
 function model(live: Swarm[]): SwarmModel {
   return {
-    live, quiet: [], quietOlder: 0,
+    live, held: [], quiet: [], quietOlder: 0,
     totals: {
       byState: { "needs-you": 0, "in-review": 0, working: 0, waiting: 0, queued: 0, reported: 0, stopped: 0, fault: 0 },
       agents: 0, waitingOnPerson: 0, slots: { running: 0, limit: 0 }, costUsd: 0,

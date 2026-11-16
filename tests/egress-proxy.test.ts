@@ -481,6 +481,76 @@ test("a pending upstream connection is cancelled when its client goes away", asy
   }
 });
 
+test("an address that never answers does not hold the connection: the other family starts after a short delay", async t => {
+  // A host whose IPv6 route drops packets: the resolver lists IPv6 first, and a SYN to it neither connects nor fails.
+  const echo = await echoServer();
+  t.after(() => echo.server.close());
+  const target = `dual.test:${echo.port}`;
+  const attempts: { host: string; socket: Socket }[] = [];
+  const fixture = await startProxy({ mode: "observe", ports: [echo.port], allow: [], allowPrivate: [target] },
+    { "dual.test": ["2001:db8::1", "2001:db8::2", "127.0.0.1"] }, { connectTimeoutMs: 60_000 },
+    { connect: (options: { host: string; port: number }) => {
+      const socket = options.host.includes(":") ? new Socket() : connect(options.port, options.host);
+      attempts.push({ host: options.host, socket });
+      return socket;
+    } });
+  t.after(() => fixture.proxy.close());
+  const started = Date.now();
+  const reply = await send(fixture.port, connectRequest(target, basic("project-a", SESSION)));
+  assert.equal(reply.status, 200);
+  assert.ok(Date.now() - started < 5_000, "the tunnel opened long before the connect timeout");
+  // Families alternate, so the IPv4 address is the second attempt rather than the last.
+  assert.deepEqual(attempts.map(attempt => attempt.host), ["2001:db8::1", "127.0.0.1"]);
+  await until(() => attempts[0].socket.destroyed, "the losing attempt to be destroyed");
+  reply.socket.write("ping");
+  assert.equal(await readExactly(reply.socket, 4), "ping");
+  reply.socket.destroy();
+  await until(() => fixture.records.some(record => record.address === "127.0.0.1" && record.decision === "would-deny"), "the record of the address used");
+});
+
+test("a failed address moves on at once, and every address failing ends the attempt", async t => {
+  const attempts: string[] = [];
+  const refuse = (host: string) => {
+    const socket = new Socket();
+    attempts.push(host);
+    setImmediate(() => socket.destroy(Object.assign(new Error("refused"), { code: "ECONNREFUSED" })));
+    return socket;
+  };
+  const fixture = await startProxy({ mode: "observe", ports: [443], allow: [], allowPrivate: ["down.test:443"] },
+    { "down.test": ["2001:db8::1", "192.0.2.10", "192.0.2.11"] }, { connectTimeoutMs: 60_000, attemptDelayMs: 60_000 },
+    { connect: (options: { host: string }) => refuse(options.host) });
+  t.after(() => fixture.proxy.close());
+  // The stagger delay is a minute, so only a failure can start the next attempt in time.
+  const started = Date.now();
+  const reply = await send(fixture.port, connectRequest("down.test:443", basic("project-a", SESSION)));
+  assert.equal(reply.status, 502);
+  assert.ok(Date.now() - started < 2_000, "each failure started the next attempt without waiting for the stagger delay");
+  assert.deepEqual(attempts, ["2001:db8::1", "192.0.2.10", "192.0.2.11"]);
+  await until(() => fixture.records.some(record => record.reason === "connect-failed"), "the record");
+  await until(() => fixture.proxy.state().open === 0, "the slot to be released");
+});
+
+test("a name with many silent addresses keeps at most four upstream attempts open and still tries every address", async t => {
+  const names = Array.from({ length: 10 }, (_, i) => `2001:db8::${i + 1}`);
+  const attempts: Socket[] = [];
+  let mostOpen = 0;
+  const fixture = await startProxy({ mode: "observe", ports: [443], allow: [], allowPrivate: ["silent.test:443"] },
+    { "silent.test": names }, { connectTimeoutMs: 2_000, attemptDelayMs: 10 },
+    { connect: () => {
+      const socket = new Socket();
+      attempts.push(socket);
+      mostOpen = Math.max(mostOpen, attempts.filter(attempt => !attempt.destroyed).length);
+      return socket;
+    } });
+  t.after(() => fixture.proxy.close());
+  const reply = await send(fixture.port, connectRequest("silent.test:443", basic("project-a", SESSION)));
+  assert.equal(reply.status, 504);
+  assert.equal(attempts.length, names.length);
+  assert.equal(mostOpen, 4);
+  await until(() => attempts.every(attempt => attempt.destroyed), "every attempt to be destroyed");
+  await until(() => fixture.proxy.state().open === 0, "the slot to be released");
+});
+
 test("plain HTTP sets the forwarded body's framing for every method and refuses ambiguous framing", async t => {
   const seen: { method?: string; te?: string; cl?: string; body: string }[] = [];
   let upstreamErrors = 0;

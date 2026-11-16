@@ -130,9 +130,9 @@ export function headlessAssignment(session: Pick<Session, "id" | "team">): strin
  * prompt. A team session's task is the host's team projection, and it is undefined when that cannot be read, so the
  * call is not served. The member's prompt never reaches a team member's reviewer.
  */
-export function headlessTask(session: Pick<Session, "team" | "title" | "initialPrompt">, teamTask: ((session: Session) => { title: string; text: string } | undefined) | undefined): { title: string; text: string } | undefined {
+export function headlessTask(session: Pick<Session, "team" | "title" | "initialPrompt">, teamTask: ((session: Pick<Session, "team">) => { title: string; text: string } | undefined) | undefined): { title: string; text: string } | undefined {
   if (!session.team) return { title: bounded(session.title, 200), text: bounded(session.initialPrompt, 4000) };
-  try { return teamTask?.(session as Session); } catch { return undefined; }
+  try { return teamTask?.(session); } catch { return undefined; }
 }
 
 /** Builds the request from the host's records of the session. Only the tool call itself comes from the hook. */
@@ -209,7 +209,7 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
      * The task a permission reviewer reads for a team member's session, from the run in memory. A session with `team`
      * is served only when this returns a task; a throw or undefined leaves the session not served.
      */
-    teamTask?: (session: Session) => { title: string; text: string } | undefined;
+    teamTask?: (session: Pick<Session, "team">) => { title: string; text: string } | undefined;
   }) {}
 
   private pipeline(): PermissionPipeline | undefined { return this.options.services.pipeline; }

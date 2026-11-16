@@ -31,6 +31,12 @@ export type TeamWorkspaceEvidence = { changedPaths: string[]; evidence: Permissi
 /** Binds the request to the dialog and to the workspace evidence it was collected with. */
 const workspaceDigest = (workspace: TeamWorkspaceEvidence) => digest({ changedPaths: [...workspace.changedPaths].sort(), evidence: workspace.evidence.digest });
 
+/** The member's task: the run's task, or the run's discovery scout with that id. Undefined when the member has no task id. */
+export function memberTaskOf(run: Pick<TeamRun, "tasks" | "discovery">, taskId: string | undefined): TeamTask | TeamScout | undefined {
+  if (!taskId) return undefined;
+  return run.tasks.find(item => item.id === taskId) ?? run.discovery?.tasks.find(item => item.id === taskId);
+}
+
 /** The task a permission reviewer reads for a team member: the run objective and the task's instructions. */
 export function teamPermissionTask(run: Pick<TeamRun, "title" | "objective">, task: TeamTask | TeamScout | undefined): { title: string; text: string } {
   const instructions = task && "instructions" in task ? task.instructions : undefined;

@@ -51,7 +51,7 @@ import { storageShortfall, volumeUsage, type VolumeUsage } from "./storage.js";
 import { collectPermissionEvidence, permissionEvidenceDigest } from "./team-permission-evidence.js";
 import type { PermissionAgentServices, PermissionHandled, PermissionRequest } from "./permission-agent-types.js";
 import type { PermissionDeliverySource } from "./permission-delivery.js";
-import { teamPermissionRequest, teamPermissionTarget, teamPermissionTask } from "./team-permission-adapter.js";
+import { memberTaskOf, teamPermissionRequest, teamPermissionTarget, teamPermissionTask } from "./team-permission-adapter.js";
 import { planRunObjective, runObjectiveNote, runObjectiveView, steerRunObjective, type ObjectiveUnavailable } from "./objective-runs.js";
 export { TeamError } from "./team-workspace.js";
 
@@ -3966,7 +3966,8 @@ export class TeamService {
   }
   /** For the headless channel: the task a permission reviewer reads for this member, from the run record in memory. */
   permissionAgentTask(session: Pick<Session, "team">): { title: string; text: string } | undefined {
-    const run = session.team && this.records.get(session.team.runId)?.run, taskId = session.team?.taskId; return run && teamPermissionTask(run, taskId ? run.tasks.find(item => item.id === taskId) ?? run.discovery?.tasks.find(item => item.id === taskId) : undefined);
+    const team = session.team, run = team ? this.records.get(team.runId)?.run : undefined;
+    return run ? teamPermissionTask(run, memberTaskOf(run, team?.taskId)) : undefined;
   }
   /**
    * Hands a served member's open permission dialog to the permission agent. It never waits for the decision: the
@@ -4044,7 +4045,7 @@ export class TeamService {
       const changedPaths = await memberChangedPaths(sessionRoot, member.baseCommit, prefix);
       return { changedPaths, evidence: collectPermissionEvidence({ prompt, cwd: sessionRoot, changedPaths, approvedScratchRoots: scratch }) };
     };
-    const task = member.taskId ? run.tasks.find(item => item.id === member.taskId) ?? run.discovery?.tasks.find(item => item.id === member.taskId) : undefined;
+    const task = memberTaskOf(run, member.taskId);
     const request = teamPermissionRequest({ run, member, task, prompt, sessionRoot, workspace: await workspace(), acceptedChecks: this.requiredChecks(run) ?? null });
     const target = teamPermissionTarget(request, {
       manager: this.manager,

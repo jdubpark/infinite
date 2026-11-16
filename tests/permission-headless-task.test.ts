@@ -92,8 +92,11 @@ for (const prompts of ["on", "off"] as const) {
       // (c) The host's task for the member is the shared projection.
       const hostTask = teams.permissionAgentTask(session);
       assert.deepEqual(hostTask, teamPermissionTask(run, task));
-      // (d) The reviewer's turn carries the run objective and not the member prompt's markers.
-      const request = headlessRequest(session, { toolName: "Bash", toolInput: { command: "make safe-build" } }, `headless:${session.id}:toolu_1`, hostTask!);
+      // (d) The reviewer's turn carries the run objective and not the member prompt's markers. The task comes from the
+      // channel's own projection, wired as server.ts wires it.
+      const channelTask = headlessTask(session, s => teams.permissionAgentTask(s));
+      assert.deepEqual(channelTask, hostTask);
+      const request = headlessRequest(session, { toolName: "Bash", toolInput: { command: "make safe-build" } }, `headless:${session.id}:toolu_1`, channelTask!);
       const context: TurnContext & { canAllow: boolean } = { interruptClasses: [], openRejects: [], evidenceRejects: [], raised: [], requesterFamily: undefined, canAllow: true };
       const text = turnPrompt(request, context);
       assert.ok(text.includes(run.objective), "the reviewer turn holds the run objective");
@@ -103,14 +106,15 @@ for (const prompts of ["on", "off"] as const) {
 }
 
 /** A channel over a fake pipeline, for the session's team task and its serve checks. */
-function rig(extra: { team?: Session["team"]; teamTask?: (session: Session) => { title: string; text: string } | undefined }) {
+function rig(extra: { team?: Session["team"]; teamTask?: (session: Pick<Session, "team">) => { title: string; text: string } | undefined; prompt?: string }) {
   const key = randomBytes(32);
-  const session = { id: randomUUID(), projectId: "rehearsal", provider: "claude", cwd: tmpdir(), title: "T", initialPrompt: "do it",
+  const session = { id: randomUUID(), projectId: "rehearsal", provider: "claude", cwd: tmpdir(), title: "T", initialPrompt: extra.prompt ?? "do it",
     headless: { channel: true }, ...(extra.team ? { team: extra.team } : {}) } as Session;
   const decided: unknown[] = [];
+  const classed: unknown[] = [];
   const pipeline = {
     serves: () => ({ served: true }),
-    classOf: () => ({ interruptClass: "production-or-staging", rule: "production-deploy" }),
+    classOf: (request: unknown) => { classed.push(request); return { interruptClass: "production-or-staging", rule: "production-deploy" }; },
     async decide(request: unknown) { decided.push(request); return { kind: "allow", decisionId: randomUUID(), strongTier: false }; },
     applicable: () => true,
     recordDelivery() {},
@@ -123,8 +127,27 @@ function rig(extra: { team?: Session["team"]; teamTask?: (session: Session) => {
     ...(extra.teamTask ? { teamTask: extra.teamTask } : {}),
   });
   const ask = (request: Record<string, unknown>) => channel.handle({ v: 1, sessionId: session.id, token: channelToken(key, session.id), ...request });
-  return { ask, session, decided };
+  return { ask, session, decided, classed };
 }
+
+test("a team session's request carries the reader's task, never the member prompt", async () => {
+  const marker = `PROMPT-${randomUUID()}`;
+  const team = { runId: "run-1", memberId: "member-1", revision: 1, role: "implementer", taskId: "task-a" } as NonNullable<Session["team"]>;
+  const task = { title: "Task", text: "OBJECTIVE" };
+  const h = rig({ team, teamTask: () => task, prompt: `The member prompt holds ${marker}` });
+  const assertClean = (request: unknown) => {
+    assert.deepEqual((request as { requester: { task: unknown } }).requester.task, task);
+    assert.equal(JSON.stringify(request).includes(marker), false, "the member prompt never reaches the request");
+  };
+  await h.ask({ op: "class", call: bash("deploy production") });
+  assert.equal(h.classed.length, 1, "the class check saw one request");
+  assertClean(h.classed[0]);
+  // The class owner path also decides, so the decide op's request is the one added after this point.
+  const before = h.decided.length;
+  await h.ask({ op: "decide", call: bash("make safe-build"), requestId: `headless:${h.session.id}:toolu_1` });
+  assert.equal(h.decided.length, before + 1, "the decide op saw one request");
+  assertClean(h.decided[before]);
+});
 
 test("a team session whose task cannot be read is not served", async () => {
   const team = { runId: "run-1", memberId: "member-1", revision: 1, role: "implementer", taskId: "task-a" } as NonNullable<Session["team"]>;

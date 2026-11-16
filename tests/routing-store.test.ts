@@ -6,15 +6,24 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { configurationModule } from "../packages/host/src/configuration-store.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
-import type { EvidenceDb, EvidenceTx } from "../packages/host/src/evidence/types.js";
+import type { EvidenceDb, EvidenceModule, EvidenceTx } from "../packages/host/src/evidence/types.js";
 import { outcomeModule } from "../packages/host/src/outcome-store.js";
 import {
+  appliedOutcomeIds,
+  computedPeriodEnd,
   decisionKey,
   insertDecision,
+  markPeriodEnded,
   projectDecisions,
   readDecision,
+  readProjectState,
+  releaseRun,
+  releaseStalePending,
   routingModule,
+  settleStart,
+  setExplorePause,
   shadowProgress,
+  shareWindow,
   sweepExpiredDecisions,
   taskDecisions,
   projectCells,
@@ -60,6 +69,10 @@ type Spec = {
   explore?: boolean;
   point?: RoutingPoint;
   elapsedMs?: number;
+  state?: DecisionRow["state"];
+  memberId?: string | null;
+  identity?: string;
+  mode?: "shadow" | "auto";
 };
 
 const PLAIN_SECRETS = ["proj-alpha-secret", "task-beta-secret", "area-gamma-secret", "map-delta-secret"];
@@ -102,19 +115,19 @@ function rowOf(tx: EvidenceTx, spec: Spec): DecisionRow {
     risk: "normal",
     featureVersion: 1,
     featureMapRef: tx.index("feature-map", featureMap),
-    mode: "shadow",
+    mode: spec.mode ?? "shadow",
     algorithmVersion: 1,
     rewardVersion: 1,
     policyDigest: "d".repeat(64),
     seed: "s".repeat(64),
     basis: "single-candidate",
     chosenProfileId: "astra-xhigh",
-    chosenIdentity: "i".repeat(64),
+    chosenIdentity: spec.identity ?? "i".repeat(64),
     greedyProfileId: "astra-xhigh",
     coordinatorProfileId: "astra-xhigh",
     explore: spec.explore ?? false,
-    state: "recorded",
-    memberId: null,
+    state: spec.state ?? "recorded",
+    memberId: spec.memberId ?? null,
     decidedAt: spec.decidedAt ?? NOW,
   };
 }
@@ -260,8 +273,10 @@ test("decision reads seek their indexes", () => {
       const text = plan.details.join(" | ");
       assert.ok(!/SCAN routing_decisions\b/.test(text), `${plan.sql}: ${text}`);
       assert.ok(!/TEMP B-TREE/.test(text), `${plan.sql}: ${text}`);
-      assert.ok(/routing_by_task|routing_by_project|routing_by_time|sqlite_autoindex_routing_decisions/.test(text), `${plan.sql}: ${text}`);
+      assert.ok(/routing_by_task|routing_by_project|routing_by_time|routing_by_state|sqlite_autoindex_routing_decisions/.test(text), `${plan.sql}: ${text}`);
     }
+    // Shadow progress counts recorded rows only, so its statements seek routing_by_state.
+    assert.ok(plans.some(plan => /routing_by_state/.test(plan.details.join(" | "))), "shadowProgress seeks routing_by_state");
     // The sweep's inner select seeks the time index.
     const sweep = store.read(db => db.all<{ detail: string }>(
       "EXPLAIN QUERY PLAN SELECT key FROM routing_decisions WHERE decided_at < ? ORDER BY decided_at, key LIMIT ?",
@@ -281,9 +296,9 @@ test("the decision key is the sha256 of the plan's formula, revision included", 
   assert.notEqual(decisionKey("run-1", 2, "tref", "start", 1), decisionKey("run-1", 1, "tref", "start", 1));
 });
 
-test("the module is version 1 with no run hooks", () => {
+test("the module is version 2 with no run hooks", () => {
   const module = routingModule();
-  assert.deepEqual([module.name, module.version, module.readVersion], ["routing", 1, 1]);
+  assert.deepEqual([module.name, module.version, module.readVersion], ["routing", 2, 1]);
   assert.equal(module.deleteRun, undefined);
   assert.equal(module.runIds, undefined);
 });
@@ -340,6 +355,8 @@ test("shadow progress counts start rows up to 50 and names the first time", () =
     store = open(f);
     for (let index = 0; index < 49; index++) insertSpec(store, { projectId: "proj-a", taskId: `t-${index}`, decidedAt: daysBefore(index + 1) });
     insertSpec(store, { projectId: "proj-a", taskId: "esc", point: "escalation", decidedAt: daysBefore(90) });
+    // A pending start row is not a recorded decision: it neither counts nor moves the first time.
+    insertSpec(store, { projectId: "proj-a", taskId: "pend", state: "pending", decidedAt: daysBefore(60) });
     assert.deepEqual(store.read(db => shadowProgress(db, "proj-a")), { decisions: 49, capped: false, firstAt: daysBefore(49) });
     for (let index = 0; index < 3; index++) insertSpec(store, { projectId: "proj-a", taskId: `late-${index}` });
     assert.deepEqual(store.read(db => shadowProgress(db, "proj-a")), { decisions: 50, capped: true, firstAt: daysBefore(49) });
@@ -371,6 +388,272 @@ test("the sweep keeps 180 days, removes the oldest first and 100 by default, nev
     store.close();
     assert.equal(sweepExpiredDecisions(store, NOW), 0, "never throws on a closed store");
     store = undefined;
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+/** Step 1's table set, copied here so a version 1 store can be built after the module changed. */
+const V1_STATEMENTS = [
+  "CREATE TABLE IF NOT EXISTS routing_decisions (key TEXT PRIMARY KEY, run_id TEXT NOT NULL, revision INTEGER NOT NULL, "
+  + "task_key TEXT NOT NULL, point TEXT NOT NULL, ordinal INTEGER NOT NULL, project_ref TEXT NOT NULL, role TEXT NOT NULL, "
+  + "area_ref TEXT, kind TEXT, risk TEXT NOT NULL, feature_version INTEGER NOT NULL, feature_map_ref TEXT NOT NULL, "
+  + "mode TEXT NOT NULL, algorithm_version INTEGER NOT NULL, reward_version INTEGER NOT NULL, policy_digest TEXT NOT NULL, "
+  + "seed TEXT NOT NULL, basis TEXT NOT NULL, chosen_profile_id TEXT NOT NULL, chosen_identity TEXT NOT NULL, "
+  + "greedy_profile_id TEXT NOT NULL, coordinator_profile_id TEXT, explore INTEGER NOT NULL, state TEXT NOT NULL, "
+  + "member_id TEXT, decided_at TEXT NOT NULL, encrypted_payload TEXT NOT NULL)",
+  "CREATE INDEX IF NOT EXISTS routing_by_task ON routing_decisions (run_id, task_key, revision, point, ordinal)",
+  "CREATE INDEX IF NOT EXISTS routing_by_project ON routing_decisions (project_ref, point, decided_at, key)",
+  "CREATE INDEX IF NOT EXISTS routing_by_time ON routing_decisions (decided_at, key)",
+];
+
+function version1Module(): EvidenceModule {
+  return {
+    name: "routing",
+    version: 1,
+    readVersion: 1,
+    migrate(tx) {
+      for (const statement of V1_STATEMENTS) tx.exec(statement);
+    },
+  };
+}
+
+const iso = (ms: number) => new Date(ms).toISOString();
+const ALL_ROWS = "SELECT * FROM routing_decisions ORDER BY key";
+
+function reopen(f: Fixture, module: EvidenceModule): EvidenceStore {
+  const store = new EvidenceStore({ databasePath: f.path, vaultKey: f.key });
+  store.register(module);
+  return store;
+}
+
+test("a version 1 store migrates to version 2 and keeps every row", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = reopen(f, version1Module());
+    for (let ordinal = 1; ordinal <= 3; ordinal++) insertSpec(store, { ordinal, decidedAt: daysBefore(ordinal) });
+    const before = store.read(db => db.all(ALL_ROWS));
+    store.close();
+    store = reopen(f, routingModule());
+    assert.equal(store.status().modules.routing, "ready");
+    assert.deepEqual(store.read(db => db.all(ALL_ROWS)), before);
+    assert.equal(before.length, 3);
+    const names = store.read(db => db.all<{ name: string }>("SELECT name FROM sqlite_master").map(row => row.name));
+    for (const name of ["routing_projects", "routing_by_state", "routing_by_identity"]) assert.ok(names.includes(name), name);
+    assert.equal(store.read(db => db.get<{ version: number }>("SELECT version FROM schema_modules WHERE name='routing'"))?.version, 2);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("a version 1 host leaves a version 2 store alone", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    insertSpec(store, { decidedAt: daysBefore(1) });
+    store.close();
+    store = reopen(f, version1Module());
+    assert.equal(store.status().modules.routing, "unavailable");
+    assert.equal(store.read(db => db.get<{ version: number }>("SELECT version FROM schema_modules WHERE name='routing'"))?.version, 2);
+    assert.equal(store.read(db => db.all(ALL_ROWS)).length, 1);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("the period end is the later of 14 days and the 50th recorded start, stored once", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  const DAY = DAY_MS;
+  const first = Date.parse("2026-10-01T00:00:00.000Z");
+  try {
+    store = open(f);
+    assert.equal(store.read(db => computedPeriodEnd(db, "proj-p")), undefined);
+    for (let index = 0; index < 49; index++) insertSpec(store, { projectId: "proj-p", taskId: `t-${index}`, decidedAt: iso(first + index * 60_000) });
+    // Rows that must not count: pending, applied, released, an escalation, and another project's start.
+    insertSpec(store, { projectId: "proj-p", taskId: "pend", state: "pending", decidedAt: iso(first - DAY) });
+    insertSpec(store, { projectId: "proj-p", taskId: "appl", state: "applied", decidedAt: iso(first - DAY) });
+    insertSpec(store, { projectId: "proj-p", taskId: "rel", state: "released", decidedAt: iso(first - DAY) });
+    insertSpec(store, { projectId: "proj-p", taskId: "esc", point: "escalation", decidedAt: iso(first - 2 * DAY) });
+    insertSpec(store, { projectId: "proj-q", taskId: "other", decidedAt: iso(first - 2 * DAY) });
+    assert.equal(store.read(db => computedPeriodEnd(db, "proj-p")), undefined, "49 recorded starts give no end");
+    insertSpec(store, { projectId: "proj-p", taskId: "t-49", decidedAt: iso(first + 2 * DAY) });
+    assert.deepEqual(store.read(db => computedPeriodEnd(db, "proj-p")), {
+      firstAt: iso(first), fiftiethAt: iso(first + 2 * DAY), endsAt: iso(first + 14 * DAY),
+    });
+    // A 50th row 20 days after the first: the 50th's time is the later one.
+    for (let index = 0; index < 49; index++) insertSpec(store, { projectId: "proj-late", taskId: `l-${index}`, decidedAt: iso(first + index * 60_000) });
+    insertSpec(store, { projectId: "proj-late", taskId: "l-49", decidedAt: iso(first + 20 * DAY) });
+    assert.equal(store.read(db => computedPeriodEnd(db, "proj-late"))?.endsAt, iso(first + 20 * DAY));
+    // Stored once: the first mark wins, and it survives a sweep of the oldest rows.
+    const X = iso(first + 30 * DAY);
+    const Y = iso(first + 40 * DAY);
+    assert.equal(store.write(tx => markPeriodEnded(tx, "proj-p", X, NOW)), X);
+    assert.equal(store.write(tx => markPeriodEnded(tx, "proj-p", Y, NOW)), X);
+    assert.equal(sweepExpiredDecisions(store, iso(first + 200 * DAY), 10), 10);
+    assert.equal(store.read(db => readProjectState(db, "proj-p")).periodEndedAt, X);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("the pause is kept per project, and a second pause keeps the first time", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  const A = "2026-11-15T09:00:00.000Z";
+  const B = "2026-11-15T10:00:00.000Z";
+  try {
+    store = open(f);
+    assert.deepEqual(store.read(db => readProjectState(db, "proj-x")), { periodEndedAt: null, explorePausedAt: null });
+    assert.equal(store.write(tx => setExplorePause(tx, "proj-x", A, NOW)), A);
+    assert.equal(store.write(tx => setExplorePause(tx, "proj-x", B, NOW)), A);
+    assert.equal(store.read(db => readProjectState(db, "proj-x")).explorePausedAt, A);
+    assert.equal(store.write(tx => setExplorePause(tx, "proj-x", null, NOW)), null);
+    assert.equal(store.read(db => readProjectState(db, "proj-x")).explorePausedAt, null);
+    // A stored period end survives a pause and a resume.
+    store.write(tx => markPeriodEnded(tx, "proj-x", A, NOW));
+    store.write(tx => setExplorePause(tx, "proj-x", B, NOW));
+    store.write(tx => setExplorePause(tx, "proj-x", null, NOW));
+    assert.equal(store.read(db => readProjectState(db, "proj-x")).periodEndedAt, A);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("the share window counts the newest pending and applied starts, and stale pending rows are released", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    const P = "proj-s";
+    insertSpec(store, { projectId: P, taskId: "fp-1", state: "pending", explore: true, decidedAt: daysBefore(1) });
+    insertSpec(store, { projectId: P, taskId: "fp-2", state: "pending", explore: true, decidedAt: daysBefore(2) });
+    insertSpec(store, { projectId: P, taskId: "ap-1", state: "applied", explore: true, decidedAt: daysBefore(20) });
+    insertSpec(store, { projectId: P, taskId: "ap-2", state: "applied", explore: false, decidedAt: daysBefore(40) });
+    insertSpec(store, { projectId: P, taskId: "ap-3", state: "applied", explore: false, decidedAt: daysBefore(90) });
+    insertSpec(store, { projectId: P, taskId: "rel-1", state: "released", explore: true, decidedAt: daysBefore(1) });
+    insertSpec(store, { projectId: P, taskId: "rec-1", state: "recorded", explore: true, decidedAt: daysBefore(1) });
+    insertSpec(store, { projectId: P, taskId: "esc-1", point: "escalation", state: "applied", explore: true, decidedAt: daysBefore(1) });
+    insertSpec(store, { projectId: "proj-other", taskId: "oth-1", state: "applied", explore: true, decidedAt: daysBefore(1) });
+    insertSpec(store, { projectId: P, taskId: "stale-1", state: "pending", explore: true, decidedAt: daysBefore(8) });
+    assert.deepEqual(store.read(db => shareWindow(db, P, 10, NOW)), { exploratory: 3, of: 5 });
+    // Twelve applied starts: window 10 caps the share at 9, the newest by time.
+    for (let index = 0; index < 12; index++) {
+      insertSpec(store, { projectId: "proj-q", taskId: `q-${index}`, state: "applied", explore: index < 2, decidedAt: daysBefore(30 + index) });
+    }
+    assert.deepEqual(store.read(db => shareWindow(db, "proj-q", 10, NOW)), { exploratory: 2, of: 9 });
+    // 101 stale pending rows: 100 are released, oldest first.
+    const stale = Date.parse(NOW) - 8 * DAY_MS;
+    for (let index = 0; index <= 100; index++) {
+      insertSpec(store, { projectId: "proj-stale", taskId: `sp-${index}`, state: "pending", decidedAt: iso(stale - index * 1000) });
+    }
+    assert.equal(store.write(tx => releaseStalePending(tx, "proj-stale", NOW)), 100);
+    const stateOf = (taskId: string) => store?.read(db => readDecision(db, decisionKey("run-1", 1, db.index("task", taskId), "start", 1))?.state);
+    assert.equal(stateOf("sp-0"), "pending");
+    assert.equal(stateOf("sp-1"), "released");
+    assert.equal(stateOf("sp-100"), "released");
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("applied outcome ids are one identity's applied starts, newest first, at most 2,000", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  const base = Date.parse("2026-11-01T00:00:00.000Z");
+  try {
+    store = open(f);
+    store.write(tx => {
+      for (let index = 0; index <= 2000; index++) {
+        insertDecision(tx, rowOf(tx, {
+          projectId: "proj-a", runId: `run-${index}`, taskId: `ai-${index}`, state: "applied", memberId: `m-${index}`,
+          identity: "ident-x", decidedAt: iso(base + index * 1000),
+        }), payloadOf({ projectId: "proj-a" }));
+      }
+    });
+    const newer = iso(base + 5_000_000);
+    insertSpec(store, { projectId: "proj-a", runId: "pend-run", taskId: "pn", state: "pending", memberId: "pend-m", identity: "ident-x", decidedAt: newer });
+    insertSpec(store, { projectId: "proj-a", runId: "rel-run", taskId: "rn", state: "released", memberId: "rel-m", identity: "ident-x", decidedAt: newer });
+    insertSpec(store, { projectId: "proj-a", runId: "esc-run", taskId: "en", point: "escalation", state: "applied", memberId: "esc-m", identity: "ident-x", decidedAt: newer });
+    insertSpec(store, { projectId: "proj-a", runId: "other-run", taskId: "on", state: "applied", memberId: "other-m", identity: "ident-y", decidedAt: newer });
+    insertSpec(store, { projectId: "proj-a", runId: "old-run", taskId: "old", state: "applied", memberId: "old-m", identity: "ident-x", decidedAt: iso(base - 1000) });
+    const ids = store.read(db => appliedOutcomeIds(db, "ident-x", iso(base)));
+    assert.equal(ids.size, 2000);
+    assert.ok(ids.has("run-2000:m-2000"));
+    assert.ok(ids.has("run-1:m-1"));
+    assert.ok(!ids.has("run-0:m-0"), "the oldest applied start is past the limit");
+    for (const excluded of ["pend-run:pend-m", "rel-run:rel-m", "esc-run:esc-m", "other-run:other-m", "old-run:old-m"]) {
+      assert.ok(!ids.has(excluded), excluded);
+    }
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+/** Records every statement a read or a write issues, so its plan can be checked. */
+type Recorded = { sql: string; params: unknown[] };
+function recording<T extends EvidenceDb>(target: T, log: Recorded[]): T {
+  const wrapped: Record<string, unknown> = {
+    ...target,
+    get: (sql: string, ...params: unknown[]) => { log.push({ sql, params }); return target.get(sql, ...(params as never[])); },
+    all: (sql: string, ...params: unknown[]) => { log.push({ sql, params }); return target.all(sql, ...(params as never[])); },
+  };
+  if ("run" in target) {
+    const tx = target as unknown as EvidenceTx;
+    wrapped.run = (sql: string, ...params: unknown[]) => { log.push({ sql, params }); return tx.run(sql, ...(params as never[])); };
+  }
+  return wrapped as T;
+}
+
+test("version 2 reads seek their indexes", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    for (let index = 0; index < 3; index++) insertSpec(store, { projectId: "proj-a", taskId: `r-${index}`, decidedAt: daysBefore(index + 1) });
+    insertSpec(store, { projectId: "proj-a", taskId: "pend", state: "pending", identity: "ident-x", decidedAt: daysBefore(1) });
+    insertSpec(store, { projectId: "proj-a", taskId: "appl", state: "applied", identity: "ident-x", memberId: "m-1", decidedAt: daysBefore(1) });
+    const key = store.read(db => decisionKey("run-1", 1, db.index("task", "pend"), "start", 1));
+    const log: Recorded[] = [];
+    store.read(db => {
+      const reader = recording(db, log);
+      readProjectState(reader, "proj-a");
+      computedPeriodEnd(reader, "proj-a");
+      shareWindow(reader, "proj-a", 10, NOW);
+      appliedOutcomeIds(reader, "ident-x", daysBefore(180));
+      shadowProgress(reader, "proj-a");
+    });
+    store.write(tx => {
+      const writer = recording(tx, log);
+      markPeriodEnded(writer, "proj-a", NOW, NOW);
+      setExplorePause(writer, "proj-a", NOW, NOW);
+      releaseStalePending(writer, "proj-a", NOW);
+      settleStart(writer, key as string, "m-2", "astra-xhigh");
+      releaseRun(writer, "run-1", 2);
+    });
+    // The inner selects of the two release statements, as the plan writes them.
+    log.push({ sql: "SELECT key FROM routing_decisions WHERE project_ref=? AND point='start' AND state='pending' AND decided_at < ? ORDER BY decided_at, key LIMIT 100", params: ["x", NOW] });
+    log.push({ sql: "SELECT key FROM routing_decisions WHERE run_id=? AND state='pending' AND revision < ? LIMIT 200", params: ["run-1", 2] });
+    assert.ok(log.length >= 12, "the reads and writes issue statements");
+    const plans = store.read(db => log.map(({ sql, params }) => ({
+      sql,
+      text: db.all<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, ...(params as never[])).map(row => row.detail).join(" | "),
+    })));
+    const seek = /SEARCH .*(routing_by_state|routing_by_identity|routing_by_task|sqlite_autoindex_routing_(decisions|projects)_\d+)/;
+    for (const plan of plans) {
+      assert.ok(!/SCAN routing_(decisions|projects)\b/.test(plan.text), `${plan.sql}: ${plan.text}`);
+      assert.ok(!/TEMP B-TREE/.test(plan.text), `${plan.sql}: ${plan.text}`);
+      if (!plan.sql.startsWith("INSERT")) assert.ok(seek.test(plan.text), `${plan.sql}: ${plan.text}`);
+    }
   } finally {
     store?.close();
     f.close();

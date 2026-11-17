@@ -12,6 +12,11 @@ const skip = existsSync(executablePath) ? false : "Chromium for Playwright is no
 const harness = fileURLToPath(new URL("./fixtures/web-polling-harness.tsx", import.meta.url));
 const controlHarness = fileURLToPath(new URL("./fixtures/web-control-harness.tsx", import.meta.url));
 const ORIGIN = "http://127.0.0.1/polling";
+type ControlProbe = {
+  ready: boolean; held: { id: string } | null; holdRenew: boolean; rejectRenew?: () => void;
+  refuseClaims: boolean; leaseMs: number; claims: number; renewals: number; calls: { action?: string; leaseId?: string }[];
+  hostHeld: { id: string; expiresAt: number } | null; releaseRequests: number; claim: () => void; teardown: () => void;
+};
 
 describe("web conversation polling", { skip }, () => {
   let browser: Browser;
@@ -40,6 +45,18 @@ describe("web conversation polling", { skip }, () => {
     Object.defineProperty(document, "visibilityState", { configurable: true, value: state });
     document.dispatchEvent(new Event("visibilitychange"));
   }, state);
+  async function holdRenewal(page: Page) {
+    await page.waitForFunction(() => (window as unknown as { control: ControlProbe }).control.ready);
+    await page.evaluate(() => (window as unknown as { control: ControlProbe }).control.claim());
+    await page.getByRole("button", { name: "Stop controlling" }).waitFor({ timeout: 2000 });
+    await page.evaluate(() => {
+      const control = (window as unknown as { control: ControlProbe }).control;
+      control.holdRenew = true;
+      window.dispatchEvent(new Event("online"));
+    });
+    await page.waitForFunction(() => Boolean((window as unknown as { control: ControlProbe }).control.rejectRenew));
+    await page.context().setOffline(true);
+  }
 
   test("a hidden tab stops polling, and returning to it polls at once", async () => {
     const page = await open();
@@ -107,18 +124,126 @@ describe("web conversation polling", { skip }, () => {
     }
   });
 
-  test("a held control lease renews as soon as a hidden tab returns", async () => {
-    type Control = { renewals: number; held: { id: string } | null; claim: () => void };
+  test("a hidden tab releases control and does not reclaim it when visible again", async () => {
     const page = await load(controlScript);
     try {
-      await page.waitForFunction(() => { (window as unknown as { control: Control }).control.claim(); return true; });
-      await page.waitForFunction(() => (window as unknown as { control: Control }).control.held?.id === "lease-1", undefined, { timeout: 2000 });
+      await page.waitForFunction(() => (window as unknown as { control: ControlProbe }).control.ready);
+      await page.evaluate(() => (window as unknown as { control: ControlProbe }).control.claim());
+      await page.getByRole("button", { name: "Stop controlling" }).waitFor({ timeout: 2000 });
       await setVisibility(page, "hidden");
-      await page.waitForTimeout(300);
-      assert.equal(await page.evaluate(() => (window as unknown as { control: Control }).control.renewals), 0);
+      await page.waitForFunction(() => {
+        const control = (window as unknown as { control: ControlProbe }).control;
+        return control.releaseRequests === 1 && control.hostHeld === null;
+      }, undefined, { timeout: 2000 });
+      await page.getByRole("button", { name: "Take control" }).waitFor({ timeout: 2000 });
       await setVisibility(page, "visible");
-      // The periodic renewal is every 10 seconds, so a renewal within half a second comes from the return itself.
-      await page.waitForFunction(() => (window as unknown as { control: Control }).control.renewals === 1, undefined, { timeout: 500 });
+      await page.waitForTimeout(300);
+      assert.equal(await page.evaluate(() => (window as unknown as { control: ControlProbe }).control.renewals), 0);
+      assert.equal(await page.evaluate(() => (window as unknown as { control: ControlProbe }).control.claims), 1);
+    } finally {
+      await page.close();
+    }
+  });
+
+  test("a failed renewal during an offline gap reclaims control without a lease id", async () => {
+    const page = await load(controlScript);
+    try {
+      await holdRenewal(page);
+      await page.evaluate(() => (window as unknown as { control: ControlProbe }).control.rejectRenew?.());
+      await page.context().setOffline(false);
+      await page.waitForFunction(() => (window as unknown as { control: ControlProbe }).control.claims === 2, undefined, { timeout: 2000 });
+      await page.getByRole("button", { name: "Stop controlling" }).waitFor({ timeout: 2000 });
+
+      const claims = await page.evaluate(() => (window as unknown as { control: ControlProbe }).control.calls.filter(call => call.action === "claim"));
+      assert.equal(claims.length, 2, "the page makes a second claim after reconnecting");
+      assert.equal(claims[1].leaseId, undefined, "the reclaim uses the host's same-actor reconnect path");
+    } finally {
+      await page.close();
+    }
+  });
+
+  test("going offline keeps control and sends no release", async () => {
+    const page = await load(controlScript);
+    try {
+      await page.waitForFunction(() => (window as unknown as { control: ControlProbe }).control.ready);
+      await page.evaluate(() => (window as unknown as { control: ControlProbe }).control.claim());
+      await page.getByRole("button", { name: "Stop controlling" }).waitFor({ timeout: 2000 });
+      await page.context().setOffline(true);
+      assert.equal(await page.evaluate(() => navigator.onLine), false, "the browser delivered its offline state");
+      await page.waitForTimeout(50);
+      assert.equal(await page.getByRole("button", { name: "Stop controlling" }).count(), 1, "control stays held while offline");
+      assert.equal(await page.evaluate(() => (window as unknown as { control: ControlProbe }).control.releaseRequests), 0,
+        "the offline event does not release the host lease");
+
+      await page.context().setOffline(false);
+      await page.waitForFunction(() => (window as unknown as { control: ControlProbe }).control.renewals > 0, undefined, { timeout: 2000 });
+      assert.equal(await page.getByRole("button", { name: "Stop controlling" }).count(), 1);
+      assert.equal(await page.evaluate(() => (window as unknown as { control: ControlProbe }).control.releaseRequests), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  test("a refused reconnect returns to Monitoring and offers the current control action", async () => {
+    const page = await load(controlScript);
+    try {
+      await holdRenewal(page);
+      await page.evaluate(() => {
+        const control = (window as unknown as { control: ControlProbe }).control;
+        control.refuseClaims = true;
+        control.rejectRenew?.();
+      });
+      await page.context().setOffline(false);
+      await page.getByRole("button", { name: /^Take (control|over)$/ }).waitFor({ timeout: 2000 });
+      await page.getByText("Monitoring", { exact: true }).waitFor({ timeout: 2000 });
+
+      const claims = await page.evaluate(() => (window as unknown as { control: ControlProbe }).control.calls.filter(call => call.action === "claim"));
+      assert.equal(claims.length, 2, "the page attempts one reconnect claim");
+      assert.equal(claims[1].leaseId, undefined, "the refused reclaim also uses no lease id");
+    } finally {
+      await page.close();
+    }
+  });
+
+  test("control given up offline is released when the page becomes reachable", async () => {
+    const page = await load(controlScript);
+    try {
+      await page.waitForFunction(() => (window as unknown as { control: ControlProbe }).control.ready);
+      await page.evaluate(() => (window as unknown as { control: ControlProbe }).control.claim());
+      await page.getByRole("button", { name: "Stop controlling" }).waitFor({ timeout: 2000 });
+      await page.context().setOffline(true);
+      await page.evaluate(() => (window as unknown as { control: ControlProbe }).control.teardown());
+      await page.waitForFunction(() => (window as unknown as { control: ControlProbe }).control.releaseRequests === 1);
+      await page.context().setOffline(false);
+      await page.waitForFunction(() => {
+        const control = (window as unknown as { control: ControlProbe }).control;
+        return control.releaseRequests === 2 && control.hostHeld === null;
+      }, undefined, { timeout: 2000 });
+    } finally {
+      await page.close();
+    }
+  });
+
+  test("a release given up offline stops retrying once its lease has expired", async () => {
+    const page = await load(controlScript);
+    try {
+      await page.waitForFunction(() => (window as unknown as { control: ControlProbe }).control.ready);
+      await page.evaluate(() => {
+        const control = (window as unknown as { control: ControlProbe }).control;
+        control.leaseMs = 1500;
+        control.claim();
+      });
+      await page.getByRole("button", { name: "Stop controlling" }).waitFor({ timeout: 2000 });
+      await page.context().setOffline(true);
+      await page.evaluate(() => (window as unknown as { control: ControlProbe }).control.teardown());
+      await page.waitForFunction(() => (window as unknown as { control: ControlProbe }).control.releaseRequests === 1);
+      await page.waitForFunction(() => {
+        const held = (window as unknown as { control: ControlProbe }).control.hostHeld;
+        return held !== null && Date.now() > held.expiresAt;
+      }, undefined, { timeout: 4000 });
+      await page.context().setOffline(false);
+      await page.waitForTimeout(1500);
+      assert.equal(await page.evaluate(() => (window as unknown as { control: ControlProbe }).control.releaseRequests), 1);
     } finally {
       await page.close();
     }

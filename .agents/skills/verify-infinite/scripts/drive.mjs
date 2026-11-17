@@ -388,16 +388,11 @@ async function session() {
       await owner.locator("#message").fill("");
       return `PID ${after}`;
     });
-    // After the gap the page shows Monitoring even when the host still holds its lease, so take control again.
-    await check("control retaken after reconnecting", async () => {
-      const take = owner.getByRole("button", { name: /^Take (control|over)$/ });
+    await check("control kept after reconnecting", async () => {
       const stop = owner.getByRole("button", { name: "Stop controlling", exact: true });
-      await expect(stop.or(take)).toBeVisible({ timeout: 15000 });
-      const lost = await take.isVisible();
-      if (lost) await take.click();
       await expect(stop).toBeVisible({ timeout: 15000 });
       await waitHostLease(true);
-      return lost ? "the page had dropped control; retaken" : "control was kept";
+      return "control was kept";
     });
     await check("Terminal tab shows the xterm screen", async () => {
       await owner.getByRole("tab", { name: "Terminal", exact: true }).click();

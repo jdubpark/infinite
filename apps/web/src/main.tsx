@@ -705,7 +705,7 @@ function SessionView({
       if (sessionViews.size > 20) sessionViews.delete(sessionViews.keys().next().value!);
     }
     return page.more ? 0 : 1100;
-  }, 1100, id, () => control.forget(true));
+  }, 1100, id, control.unavailable);
   useLayoutEffect(() => {
     const output = screen.current, viewport = body.current;
     if (!output || !viewport) return;

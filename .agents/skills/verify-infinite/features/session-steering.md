@@ -45,7 +45,7 @@ Phone check: a context with a 390x844 viewport, `isMobile: true`, and `hasTouch:
 
 ## Gotchas
 
-- Control lease: after an offline gap the page drops its control (it shows "Monitoring" and "Take control") while the host keeps the lease for up to 30 seconds. During that time a stop or input from another actor gets HTTP 409. Take control again, and release it with "Stop controlling" when done.
+- Control lease: through a brief offline gap the page keeps its control. If a renewal failed during the gap, it reclaims the lease through the host's same-actor path when it reconnects. If another actor has taken control, the page returns to "Monitoring" and offers the current control action. When the page gives up a known lease, it releases it as soon as the host is reachable so other actors do not wait for the 30-second expiry.
 - Steering needs a fresh connection and the control lease when the control bar says so. Send stays disabled while the view is stale, while control is held by someone else, and when there is no text.
 - Viewer keys see "This device has view-only access." and no composer.
 - Input control is per worker. When the session reports `capabilities.inputControl === 1`, the state reads "Monitoring" and the "Take control" button appears; Send stays disabled until the lease is taken. Otherwise the state reads "Shared controls" and Send works without a lease. Read the state label before deciding whether a click is needed.

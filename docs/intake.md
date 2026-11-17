@@ -18,7 +18,9 @@ The host polls Linear every 30 seconds. An issue qualifies when it:
 - is not archived, and its state is neither completed nor cancelled;
 - was created after the host first enabled intake.
 
-One cycle reads at most 10 pages of 200 issues. When more remain, the issues read
+One cycle reads at most 2,000 issues, in pages of 40. The page size keeps each
+query under Linear's 10,000-point limit for a single query, which a page of 200
+issues exceeded. When more remain, the issues read
 are still admitted, and `lastError` reads
 `More labelled issues than one intake cycle reads.`
 

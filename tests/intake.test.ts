@@ -928,12 +928,12 @@ test("the candidate query reads every page of open labelled issues and asks for 
     assert.equal(read.capped, false);
     assert.deepEqual(read.issues.map(issue => issue.id).sort(), open.map(issue => issue.id).sort(), "Every open issue is seen, and no finished one");
     const queries = ctx.linearServer.calls.filter(call => call.operation === "InfiniteIntakeCandidates");
-    assert.equal(queries.length, 2, "Two pages of 200");
+    assert.equal(queries.length, 6, "Six pages of 40");
     assert.ok(queries.every(call => !call.query.includes("includeArchived")), "Archived issues are not asked for");
   } finally { await ctx.close(); }
 });
 
-test("past ten pages of candidates the issues read are still processed and the cap is reported", { timeout: 120000 }, async () => {
+test("past the 2,000-issue scan cap the issues read are still processed and the cap is reported", { timeout: 120000 }, async () => {
   const ctx = await setup();
   try {
     const cap = "More labelled issues than one intake cycle reads.";

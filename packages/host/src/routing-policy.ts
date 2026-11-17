@@ -72,16 +72,30 @@ export function effectiveRouting(saved: TeamRouting | undefined, autonomy: Auton
   return { mode: "shadow", requested: mode === "auto" ? "auto" : "shadow", source: "saved", knobs, defaults };
 }
 
-/** SHA-256 hex of canonicalJson({ algorithmVersion, rewardVersion, mode: "shadow", knobs }). The source and the requested mode are left out. */
-export function policyDigest(effective: Extract<EffectiveRouting, { mode: "shadow" }>): string {
+/**
+ * SHA-256 hex of canonicalJson({ algorithmVersion, rewardVersion, mode, knobs }). `mode` defaults to shadow, so a shadow
+ * digest is unchanged. The source and the requested mode are left out.
+ */
+export function policyDigest(effective: Extract<EffectiveRouting, { mode: "shadow" }>, mode: "shadow" | "auto" = "shadow"): string {
   const knobs = { ...effective.knobs, points: normalizePoints(effective.knobs.points) };
-  return createHash("sha256").update(canonicalJson({ algorithmVersion: ROUTING_ALGORITHM_VERSION, rewardVersion: REWARD_VERSION, mode: "shadow", knobs })).digest("hex");
+  return createHash("sha256").update(canonicalJson({ algorithmVersion: ROUTING_ALGORITHM_VERSION, rewardVersion: REWARD_VERSION, mode, knobs })).digest("hex");
 }
 
-/** Undefined unless the effective mode is shadow, `points` holds "start", and the run has a lineup. */
-export function pinRouting(saved: TeamRouting | undefined, autonomy: AutonomyMode, lineup: TeamLineup | undefined): TeamRunRouting | undefined {
+/**
+ * Undefined unless the effective mode is shadow, `points` holds "start", and the run has a lineup. With a stored
+ * `periodEndedAt`, a saved `auto` mode or the autonomous default pins `auto`; every other input gives the shadow pin.
+ */
+export function pinRouting(saved: TeamRouting | undefined, autonomy: AutonomyMode, lineup: TeamLineup | undefined, periodEndedAt?: string): TeamRunRouting | undefined {
   const effective = effectiveRouting(saved, autonomy);
   if (effective.mode !== "shadow" || !effective.knobs.points.includes("start") || !lineup) return undefined;
+  // A saved mode wins. With no saved mode, an autonomous project's default decides; a saved policy keeps its own knobs and source.
+  const auto = saved?.mode === "auto" || (saved?.mode === undefined && autonomy === "autonomous");
+  if (periodEndedAt !== undefined && auto) {
+    return {
+      mode: "auto", requested: "auto", source: effective.source, knobs: effective.knobs, defaults: effective.defaults,
+      algorithmVersion: ROUTING_ALGORITHM_VERSION, rewardVersion: REWARD_VERSION, digest: policyDigest(effective, "auto"), periodEndedAt,
+    };
+  }
   return {
     mode: "shadow", requested: effective.requested, source: effective.source, knobs: effective.knobs, defaults: effective.defaults,
     algorithmVersion: ROUTING_ALGORITHM_VERSION, rewardVersion: REWARD_VERSION, digest: policyDigest(effective),

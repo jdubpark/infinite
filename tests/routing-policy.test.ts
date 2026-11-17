@@ -69,6 +69,88 @@ test("a pin needs shadow, the start point, and a lineup", () => {
   assert.equal(pin.digest, policyDigest(effective));
 });
 
+const AUTONOMOUS_DEFAULT_DIGEST = "ff4bbf1b489460809a862aa215af23d77e9afad6704072231c6e4ad06d012a34";
+const PERIOD_END = "2026-11-01T00:00:00.000Z";
+
+test("off and shadow pins are byte-equal to step 1", () => {
+  const cases: [Parameters<typeof pinRouting>[0], Parameters<typeof pinRouting>[1]][] = [
+    [{ mode: "off" }, "autonomous"], [{ mode: "off" }, "supervised"], [{ mode: "shadow" }, "supervised"],
+    [{ mode: "shadow" }, "autonomous"], [undefined, "autonomous"], [undefined, "supervised"],
+    [{ successValueUsd: 8 }, "autonomous"], [{ successValueUsd: 8 }, "supervised"],
+  ];
+  for (const lineupCase of [lineup, undefined]) {
+    for (const [saved, autonomy] of cases) {
+      const step1 = JSON.stringify(pinRouting(saved, autonomy, lineupCase, undefined));
+      assert.equal(JSON.stringify(pinRouting(saved, autonomy, lineupCase)), step1, JSON.stringify({ saved, autonomy }));
+      // A saved off or shadow mode keeps step 1's pin with an end too. So does a supervised project without a mode.
+      const ended = pinRouting(saved, autonomy, lineupCase, PERIOD_END);
+      const autoWithEnd = saved?.mode === "auto" || (saved?.mode === undefined && autonomy === "autonomous");
+      if (!autoWithEnd) {
+        assert.equal(JSON.stringify(ended), step1, JSON.stringify({ saved, autonomy, ended: true }));
+      }
+    }
+  }
+  const defaultPin = pinRouting(undefined, "autonomous", lineup);
+  assert.ok(defaultPin);
+  assert.equal(defaultPin.mode, "shadow");
+  assert.equal(defaultPin.requested, "shadow");
+  assert.equal(defaultPin.digest, AUTONOMOUS_DEFAULT_DIGEST);
+  const effective = effectiveRouting(undefined, "autonomous");
+  assert.ok(effective.mode === "shadow");
+  assert.equal(policyDigest(effective), AUTONOMOUS_DEFAULT_DIGEST);
+  assert.equal(policyDigest(effective, "shadow"), policyDigest(effective));
+});
+
+test("an auto pin needs a saved auto mode or the autonomous default, and a period end", () => {
+  // The autonomous default with a stored end pins auto, and its digest is the auto digest of the same policy.
+  const defaultAuto = pinRouting(undefined, "autonomous", lineup, PERIOD_END);
+  assert.ok(defaultAuto);
+  assert.equal(defaultAuto.mode, "auto");
+  assert.equal(defaultAuto.requested, "auto");
+  assert.equal(defaultAuto.source, "autonomous-default");
+  assert.equal(defaultAuto.periodEndedAt, PERIOD_END);
+  const effective = effectiveRouting(undefined, "autonomous");
+  assert.ok(effective.mode === "shadow");
+  assert.equal(defaultAuto.digest, policyDigest(effective, "auto"));
+  assert.notEqual(defaultAuto.digest, policyDigest(effective));
+  // A saved auto mode pins auto with an end, in either autonomy.
+  for (const autonomy of ["autonomous", "supervised"] as const) {
+    const savedAuto = pinRouting({ mode: "auto" }, autonomy, lineup, PERIOD_END);
+    assert.ok(savedAuto);
+    assert.equal(savedAuto.mode, "auto");
+    assert.equal(savedAuto.requested, "auto");
+    assert.equal(savedAuto.source, "saved");
+    assert.equal(savedAuto.periodEndedAt, PERIOD_END);
+  }
+  // A saved policy with no mode keeps its own knobs and source, and the autonomous project's default decides the mode.
+  const savedNoMode = pinRouting({ allowContributor: true }, "autonomous", lineup, PERIOD_END);
+  assert.ok(savedNoMode);
+  assert.equal(savedNoMode.mode, "auto");
+  assert.equal(savedNoMode.requested, "auto");
+  assert.equal(savedNoMode.source, "saved");
+  assert.equal(savedNoMode.knobs.allowContributor, true);
+  assert.equal(savedNoMode.periodEndedAt, PERIOD_END);
+  assert.deepEqual(pinRouting({ allowContributor: true }, "supervised", lineup, PERIOD_END), pinRouting({ allowContributor: true }, "supervised", lineup));
+  // With an end, these give step 1's result: a saved shadow, a supervised project without a policy, points without start, no lineup.
+  for (const [saved, autonomy, l, points] of [
+    [{ mode: "shadow" }, "autonomous", lineup, "start"],
+    [undefined, "supervised", lineup, "start"],
+    [{ mode: "auto", points: ["escalation"] }, "autonomous", lineup, "escalation"],
+    [{ mode: "auto" }, "autonomous", undefined, "start"],
+  ] as const) {
+    assert.deepEqual(pinRouting(saved, autonomy, l, PERIOD_END), pinRouting(saved, autonomy, l), `${points} ${autonomy}`);
+  }
+  assert.equal(pinRouting(undefined, "supervised", lineup, PERIOD_END), undefined);
+  // With no end, the autonomous default keeps step 1's shadow pin, byte for byte.
+  const noEnd = pinRouting(undefined, "autonomous", lineup);
+  assert.ok(noEnd);
+  assert.equal(noEnd.mode, "shadow");
+  assert.equal(noEnd.requested, "shadow");
+  assert.equal(noEnd.source, "autonomous-default");
+  assert.equal(noEnd.digest, AUTONOMOUS_DEFAULT_DIGEST);
+  assert.equal("periodEndedAt" in noEnd, false);
+});
+
 test("the digest changes with every knob and with nothing else", () => {
   const base = effectiveRouting({ mode: "shadow" }, "supervised");
   assert.ok(base.mode === "shadow");

@@ -64,3 +64,9 @@ export const MEMBER_STOP_REASONS = ["stall", "limit", "no-report", "owner", "hos
 export type MemberStopReason = typeof MEMBER_STOP_REASONS[number];
 /** The halt or retirement behind a stop. */
 export type MemberStopDetail = "pause" | "cancel" | "steer" | "block" | "retired";
+
+/** Pushes one run line stamped now, keeping the newest 300. Moved from teams.ts, which calls it under this name. */
+export function appendRunEvent(run: TeamRun, text: string): void {
+  run.events.push({ at: new Date().toISOString(), text });
+  if (run.events.length > 300) run.events.splice(0, run.events.length - 300);
+}

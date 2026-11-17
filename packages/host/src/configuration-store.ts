@@ -1,7 +1,7 @@
 import type { EventProjector } from "./evidence/outbox.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import { EvidenceError, type EvidenceDb, type EvidenceModule, type EvidenceTx, type RunEvent } from "./evidence/types.js";
-import { type ConfigComponents, configId, type ProfileKey, profileIdentityKey } from "./config-identity.js";
+import { type ConfigComponents, configId, isRoutingComponent, type ProfileKey, profileIdentityKey } from "./config-identity.js";
 
 export const CONFIGURATIONS_MODULE = "configurations";
 const CONFIGURED_KIND = "member.configured";
@@ -165,7 +165,7 @@ function parseConfigured(data: unknown): Parsed | undefined {
   if (!optionalText(model) || !optionalText(effort)) return undefined;
   if (typeof promptVersion !== "string" || !DIGEST.test(promptVersion)) return undefined;
   if (typeof guidance !== "string" || !DIGEST.test(guidance)) return undefined;
-  if (knowledge !== "none" || routing !== "off") return undefined;
+  if (knowledge !== "none" || !isRoutingComponent(routing)) return undefined;
   if (shape !== "team" && shape !== "trial") return undefined;
   const components: ConfigComponents = {
     profile: { provider, model: model ?? null, effort: effort ?? null },

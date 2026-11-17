@@ -10,7 +10,8 @@ import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/eviden
 import { outcomeModule, writeOutcome, type OutcomePayload, type OutcomeRow } from "../packages/host/src/outcome-store.js";
 import { ROUTING_DEFAULTS } from "../packages/host/src/routing-policy.js";
 import { routingExplain, routingStatus } from "../packages/host/src/routing-reads.js";
-import { decisionKey, insertDecision, routingModule } from "../packages/host/src/routing-store.js";
+import { decisionKey, insertDecision, markPeriodEnded, routingModule, setExplorePause } from "../packages/host/src/routing-store.js";
+import { profileIdentityKey } from "../packages/host/src/config-identity.js";
 import type { EvidenceTx } from "../packages/host/src/evidence/types.js";
 import type { DecisionRow, RoutingPayload, RoutingStatus } from "../packages/host/src/routing-types.js";
 import type { TeamModelProfile, TeamLineup } from "../packages/host/src/team-types.js";
@@ -36,7 +37,8 @@ function open(f: Fixture): EvidenceStore {
 }
 
 type Seed = { runId?: string; taskId?: string; revision?: number; ordinal?: number; projectId?: string; area?: string;
-  decidedAt?: string; chosen?: string; coordinator?: string | null; greedy?: string; explore?: boolean };
+  decidedAt?: string; chosen?: string; coordinator?: string | null; greedy?: string; explore?: boolean;
+  state?: DecisionRow["state"]; memberId?: string | null; identity?: string };
 
 /** One stored start decision. Its payload names the project, task, area, and feature map it was made for. */
 function seed(store: EvidenceStore, spec: Seed): void {
@@ -54,8 +56,8 @@ function seed(store: EvidenceStore, spec: Seed): void {
       projectRef: tx.index("project", projectId), role: "implementer", areaRef: tx.index("area", area), kind: "feature",
       risk: "normal", featureVersion: 1, featureMapRef: tx.index("feature-map", "default"), mode: "shadow", algorithmVersion: 1,
       rewardVersion: 1, policyDigest: "d".repeat(64), seed: "s".repeat(64), basis: "sampled", chosenProfileId: chosen,
-      chosenIdentity: "i".repeat(64), greedyProfileId: spec.greedy ?? chosen, coordinatorProfileId: spec.coordinator ?? null,
-      explore: spec.explore ?? false, state: "recorded", memberId: null, decidedAt: spec.decidedAt ?? NOW,
+      chosenIdentity: spec.identity ?? "i".repeat(64), greedyProfileId: spec.greedy ?? chosen, coordinatorProfileId: spec.coordinator ?? null,
+      explore: spec.explore ?? false, state: spec.state ?? "recorded", memberId: spec.memberId ?? null, decidedAt: spec.decidedAt ?? NOW,
     };
     insertDecision(tx, row, payload);
   });
@@ -452,7 +454,7 @@ test("greedy agreements count the greedy pick, and explore counts the explorator
     seed(store, { taskId: "t3", chosen: "b", greedy: "b", coordinator: "c" });
     const status = routingStatus(store, statusInput({ saved: { mode: "shadow" } }));
     assert.deepEqual([status.shadow.withCoordinator, status.shadow.agreements, status.shadow.greedyAgreements], [3, 2, 1]);
-    assert.deepEqual(status.explore, { exploratory: 1, of: 3, guards: "risk-only" });
+    assert.deepEqual(status.explore, { exploratory: 1, of: 3, guards: "risk-only", pausedAt: null });
   } finally {
     store?.close();
     f.close();
@@ -531,6 +533,11 @@ test("the status reports the requested mode, the source, the defaults, the start
     store = open(f);
     const auto = routingStatus(store, statusInput({ saved: { mode: "auto", successValueUsd: 8 } }));
     assert.deepEqual([auto.mode, auto.requested, auto.source, auto.defaults.includes("successValueUsd"), auto.defaults.includes("points")], ["shadow", "auto", "saved", false, true]);
+    // A saved mode decides; a saved policy without a mode in an autonomous project takes the autonomous default's mode.
+    assert.equal(auto.modeSource, "saved");
+    const noMode = routingStatus(store, statusInput({ autonomy: "autonomous", saved: { successValueUsd: 8 } }));
+    assert.deepEqual([noMode.source, noMode.requested, noMode.modeSource], ["saved", "shadow", "autonomous-default"]);
+    assert.equal(routingStatus(store, statusInput({ saved: { mode: "shadow" } })).modeSource, "saved");
     const escalationOnly = routingStatus(store, statusInput({ saved: { mode: "shadow", points: ["escalation"] } }));
     assert.deepEqual([escalationOnly.covers, escalationOnly.cells], [{ start: false, reason: "no-start-point" }, []]);
     for (let revision = 1; revision <= 21; revision++) seed(store, { taskId: "t1", revision });
@@ -558,5 +565,122 @@ test("status needs the outcomes and configurations modules, and explain needs on
       store?.close();
       f.close();
     }
+  }
+});
+
+test("status reports auto, the period end, and the pause", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    const empty = routingStatus(store, statusInput({ saved: { mode: "auto" } }));
+    assert.deepEqual([empty.mode, empty.requested, empty.period.endsAt, empty.period.endedAt, empty.share, empty.auto], ["shadow", "auto", null, null, null, null]);
+    assert.deepEqual([empty.explore.pausedAt, routingStatus(store, statusInput({ saved: { mode: "shadow" } })).explore.pausedAt], [null, null]);
+
+    for (let index = 0; index < 50; index++) seed(store, { taskId: `t-${index}`, decidedAt: daysBefore(15) });
+    // The first start is 15 days old, so the end is its 14 days: a day ago. Nothing is stored yet.
+    const unstored = routingStatus(store, statusInput({ saved: { mode: "auto" } }));
+    assert.deepEqual([unstored.mode, unstored.period.decisions, unstored.period.endedAt, unstored.period.stored], ["auto", 50, daysBefore(1), false]);
+
+    // A stored end is the one the status shows, and it never moves.
+    store.write(tx => markPeriodEnded(tx, "rehearsal", daysBefore(2), NOW));
+    const stored = routingStatus(store, statusInput({ saved: { mode: "auto" } }));
+    assert.deepEqual([stored.mode, stored.period.endedAt, stored.period.stored], ["auto", daysBefore(2), true]);
+
+    // Exploration is paused for the project in both modes, and the pause is not a configuration change.
+    store.write(tx => setExplorePause(tx, "rehearsal", NOW, NOW));
+    assert.equal(routingStatus(store, statusInput({ saved: { mode: "auto" } })).explore.pausedAt, NOW);
+    assert.equal(routingStatus(store, statusInput({ saved: { mode: "shadow" } })).explore.pausedAt, NOW);
+    store.write(tx => setExplorePause(tx, "rehearsal", null, NOW));
+    assert.equal(routingStatus(store, statusInput({ saved: { mode: "auto" } })).explore.pausedAt, null);
+
+    // The autonomous default: no saved policy, 50 recorded starts, the first 15 days ago, gives auto.
+    for (let index = 0; index < 50; index++) seed(store, { projectId: "fresh", taskId: `f-${index}`, decidedAt: daysBefore(15) });
+    const fresh = routingStatus(store, statusInput({ projectId: "fresh", autonomy: "autonomous", saved: undefined }));
+    assert.deepEqual([fresh.mode, fresh.period.endedAt, fresh.period.stored], ["auto", daysBefore(1), false]);
+    // Without a lineup that covers the start point, the default does not pin auto, so the status says shadow.
+    const contributorsOnly: TeamLineup = { ...mixedLineup, implementers: [mixedLineup.implementers[0]!] };
+    const uncovered = routingStatus(store, statusInput({ projectId: "fresh", autonomy: "autonomous", saved: undefined, lineup: contributorsOnly }));
+    assert.deepEqual([uncovered.mode, uncovered.covers.reason], ["shadow", "no-eligible-profile"]);
+    // A supervised project without a policy stays off, whatever its rows say.
+    assert.equal(routingStatus(store, statusInput({ projectId: "fresh" })).mode, "off");
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("auto status counts each state and the share, and weighs applied rows in full", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    const astra = mixedLineup.implementers[1]!;
+    const identity = profileIdentityKey({ provider: "codex", model: astra.model, effort: "xhigh" });
+    store.write(tx => markPeriodEnded(tx, "rehearsal", daysBefore(1), NOW));
+    for (let index = 0; index < 2; index++) seed(store, { taskId: `pending-${index}`, state: "pending" });
+    for (let index = 0; index < 3; index++) seed(store, { runId: `run-applied-${index}`, taskId: `applied-${index}`, state: "applied", memberId: "m1", identity });
+    seed(store, { taskId: "released", state: "released" });
+    for (let index = 0; index < 4; index++) seed(store, { taskId: `recorded-${index}` });
+
+    const status = routingStatus(store, statusInput({ saved: { mode: "auto" } }));
+    assert.equal(status.mode, "auto");
+    assert.deepEqual([status.auto!.pending, status.auto!.applied, status.auto!.released], [2, 3, 1]);
+    assert.deepEqual([status.auto!.windowDays, status.auto!.capped], [30, false]);
+    assert.equal(status.shadow.decisions, 4);
+    assert.deepEqual([status.share!.of, status.share!.window, status.share!.limit], [5, 50, 0.2]);
+    assert.deepEqual([status.explore.guards, status.explore.of], ["applied", 5]);
+    // In shadow, none of the state counts exist.
+    const shadow = routingStatus(store, statusInput({ saved: { mode: "shadow" } }));
+    assert.deepEqual([shadow.share, shadow.auto, shadow.explore.guards], [null, null, "risk-only"]);
+
+    // Past the 500-row read limit, the auto counts are capped. One transaction writes the rows, so the test stays fast.
+    store.write(tx => markPeriodEnded(tx, "bulk-auto", daysBefore(1), NOW));
+    const payload: RoutingPayload = {
+      projectId: "bulk-auto", taskId: "bulk", area: "host", featureMap: "default", coordinatorProfileId: null, knobs: ROUTING_DEFAULTS,
+      costs: { lightUsd: 0.4, strongUsd: 2.2, rescueUsd: 1.5, basis: "tier-default" }, headroom: "not-modelled", chosenWeight: 0.5,
+      current: [], candidates: [], elapsedMs: 1,
+    };
+    store.write(tx => {
+      for (let index = 0; index < 501; index++) {
+        const taskKey = tx.index("task", `bulk-${index}`);
+        insertDecision(tx, {
+          key: decisionKey("run-bulk", 1, taskKey, "start", 1), runId: "run-bulk", revision: 1, taskKey, point: "start", ordinal: 1,
+          projectRef: tx.index("project", "bulk-auto"), role: "implementer", areaRef: tx.index("area", "host"), kind: "feature",
+          risk: "normal", featureVersion: 1, featureMapRef: tx.index("feature-map", "default"), mode: "auto", algorithmVersion: 1,
+          rewardVersion: 1, policyDigest: "d".repeat(64), seed: "s".repeat(64), basis: "sampled", chosenProfileId: "astra-xhigh",
+          chosenIdentity: "i".repeat(64), greedyProfileId: "astra-xhigh", coordinatorProfileId: null, explore: false,
+          state: "pending", memberId: null, decidedAt: NOW,
+        }, payload);
+      }
+    });
+    const capped = routingStatus(store, statusInput({ projectId: "bulk-auto", saved: { mode: "auto" } }));
+    assert.deepEqual([capped.mode, capped.auto!.pending, capped.auto!.capped], ["auto", 500, true]);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("an applied first-pass row weighs in full in the profile's mean", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    const astra = mixedLineup.implementers[1]!;
+    const identity = profileIdentityKey({ provider: "codex", model: astra.model, effort: "xhigh" });
+    store.write(tx => {
+      markPeriodEnded(tx, "rehearsal", daysBefore(1), NOW);
+      configRow(tx, "now", astra, promptVersion("implementer", "codex", astra, false, false));
+      writeOutcome(tx, integratedRow({ id: "run-a", profile: astra, configId: "now" }));
+    });
+    seed(store, { runId: "run-a", taskId: "a-task", state: "applied", memberId: "m1", identity });
+    const withApplied = newTaskProfile(routingStatus(store, statusInput({ saved: { mode: "auto" } })), "astra-xhigh").mean;
+    store.write(tx => tx.run("UPDATE routing_decisions SET state='recorded', member_id=NULL WHERE run_id='run-a'"));
+    const withoutApplied = newTaskProfile(routingStatus(store, statusInput({ saved: { mode: "auto" } })), "astra-xhigh").mean;
+    assert.ok(withApplied > withoutApplied, `${withApplied} > ${withoutApplied}`);
+  } finally {
+    store?.close();
+    f.close();
   }
 });

@@ -2036,12 +2036,12 @@ infinite repo init --routing shadow --routing-value quality --routing-contributo
 infinite repo init --routing off
 ```
 
-- `--routing off|shadow` sets the mode. `--routing auto` is refused: this host records shadow decisions only.
+- `--routing off|shadow|auto` sets the mode. `auto` is described in [Auto routing](#auto-routing).
 - `--routing-value` is the dollar value of one success: `cost` (0.5), `balanced` (2), `quality` (8), or a number from 0 to 100.
 - `--routing-contributor allow|deny` sets whether contributor profiles may be candidates. The default is deny.
 - A rerun without these options keeps the saved policy unchanged. Each option you give merges over the saved policy. The routing policy is part of the routine approval digest, so a change blocks the project's active routines until the owner approves them again.
 
-With no saved policy, the default mode follows the project's autonomy mode: a `supervised` project is `off`, an `autonomous` project is `shadow`. Setting `--routing shadow` turns shadow on in a supervised project too. Knobs you do not set show as defaults in `routing status`.
+With no saved mode, the default follows the project's autonomy mode: a `supervised` project is `off`, and an `autonomous` project is `shadow` until its shadow period ends, then `auto`. Setting `--routing shadow` turns shadow on in a supervised project too. Knobs you do not set show as defaults in `routing status`.
 
 ### What a decision row holds
 
@@ -2071,6 +2071,80 @@ The host removes decisions decided more than 180 days ago. A decision holds no r
 ### Rolling back
 
 Before rolling back past this release, remove `routing` from every project's team block. This release provides no command that removes the key, so this step is still open. A rollback also leaves the outcome ledger unavailable until a host of this release or later runs again, because an older host cannot read its version 4.
+
+## Auto routing
+
+In `auto`, the router chooses each task's implementer profile when the task first starts in a plan revision. A saved `auto` starts a new run on the router's choice once the project's shadow period has ended. Until then, the run is pinned `shadow` and nothing changes.
+
+### Turning it on
+
+```sh
+infinite repo init --routing auto
+infinite routing status PROJECT
+```
+
+- `--routing auto` keeps the saved policy's other settings and replaces only the mode. The command refuses on a host that does not report `routingAuto`, and prints the shadow-period note after it saves.
+- A project with no saved mode and an `autonomous` autonomy mode gets this behaviour by default (`modeSource: autonomous-default`). A saved `mode` always wins: `--routing shadow` keeps an autonomous project in shadow, and `--routing off` turns routing off.
+- A `supervised` project without a saved mode stays `off`.
+
+### The shadow period
+
+The period ends at the later of two points: 14 days after the project's first recorded start decision, and the 50th recorded start decision. Both count recorded rows, including rows recorded before `auto` was saved. The end is stored the first time a run is created after it has passed, and it never moves afterwards. Until the end is stored, a saved `auto` pins `shadow`.
+
+`infinite routing status PROJECT` shows the progress and the mode with its source. The mode reads `auto` when a new run would pin `auto`.
+
+### What the coordinator and the members see
+
+In an `auto` run, the coordinator's plan may omit `agentProfileId` on its tasks, and the coordinator is told that the host assigns each task's worker profile. A plan that sends one still passes the existing checks. No member prompt, context file, or tool carries a task's routing, the policy digest, a decision key, or a score.
+
+### Fixed rules
+
+An `auto` run applies these rules to its profiles:
+
+1. A contributor profile is used only when the policy sets `allowContributor`. This holds for implementers, scouts, escalations, and their limit fallbacks. The coordinator, integrator, and reviewer slots and their limit fallbacks are the owner's lineup choices, and the router does not check them.
+2. A profile on the reviewer's model is never used for an implementer's start, or for an implementer's limit fallback, escalated or not. Scout and escalation profiles are not checked against this rule.
+3. A profile outside the owner's lineup is never used.
+
+When the router cannot choose a profile at a start, the task starts on the coordinator's profile if it passes rules 1 and 2, and otherwise on the first implementer in lineup order that passes them. The run's events then hold one line for that task and revision: `Host routing could not choose a profile for task ID; it is assigned LABEL.` A provider-limit fallback passes over a profile that fails its member's rules: rules 1 and 2 for an implementer, escalated or not, and rule 1 for a scout. A saved `auto` whose lineup has no implementer that passes rules 1 and 2 is refused with 409 `routing-no-eligible-profile` when a run is created. The autonomous default never refuses a run: it stays in shadow and logs once per host process that no implementer profile passes the rules.
+
+### Exploration guards
+
+A start explores (picks a profile other than the greedy one) only when all of these hold:
+
+- exploration is not paused for the project;
+- the run has at least `minSpareAttempts` spare attempts (default 4);
+- the share of exploratory starts over the project's last `exploreWindow` starts, counting pending and applied rows, stays within `maxExploreShare` (default 0.2) with the new start included;
+- the task's risk is not `elevated`.
+
+Pending rows that are not released within 7 days are released. Headroom is not applied.
+
+```sh
+infinite routing pause-explore PROJECT
+infinite routing resume-explore PROJECT
+```
+
+Pausing changes only the routing state in the evidence store, not the saved configuration.
+
+### Revoking routing for a run
+
+```sh
+infinite team revoke-routing TEAM_ID [--request-id UUID] [--json]
+```
+
+The command reads the run's current revision and stops host routing for the run's new tasks. Each starts on the coordinator's pick when it passes the fixed rules, else on the first implementer in lineup order that passes them; no run line is written per task. It is refused with 409 `routing-not-enabled` for a run that was not pinned `auto`, and it is owner-only.
+
+### Status lines
+
+`infinite routing status` prints one line per project:
+
+- `ID · routing auto (saved)` or `ID · routing auto (autonomous default)` when a new run would pin `auto`;
+- `ID · routing shadow (saved) · requested auto: auto starts after the shadow period` when `auto` is saved, an implementer passes the fixed rules, and the period has not ended; without such an implementer, `ID · routing shadow (saved) · requested auto`, and new runs are refused;
+- `ID · routing shadow (autonomous default) · auto starts after the shadow period` during the autonomous default's period, while an implementer passes the fixed rules;
+- `Shadow period: ended TIME. Auto routing needs --routing auto.` when the period has ended and `--routing shadow` is saved.
+
+### Rolling back
+
+To stop new runs from choosing profiles without a release rollback, run `infinite repo init --routing shadow`, and revoke host routing on any active run with `infinite team revoke-routing TEAM_ID`. Before a release rollback past this slice, let every run pinned `auto` settle, or cancel it: a host without this slice requires `agentProfileId` on every plan task, and an `auto` plan omits it, so that host refuses the run's next member start with `invalid-agent-profile`. The rollback note under Shadow routing still applies to a release rollback.
 
 ## Launch-rate fuse
 

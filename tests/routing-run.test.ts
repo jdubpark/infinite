@@ -18,6 +18,8 @@ import { teamGoalContextSchema, type TeamGoalContext, type TeamRun, type TeamVie
 
 const TERMINAL = ["ready-for-review", "merged", "blocked", "cancelled"];
 const UNAVAILABLE_LOG = "Routing shadow decision skipped: the evidence store is unavailable.";
+// Ruling 10: an autonomous project without a saved mode is `auto` by default, so its pin reads the store first.
+const AUTO_PIN_LOG = "Routing auto pin fell back to shadow: the evidence store is unavailable.";
 
 /** The stored run, prompts included: the team view strips them. */
 const storedRun = (teams: unknown, id: string): TeamRun => (teams as { record(id: string): { run: TeamRun } }).record(id).run;
@@ -83,12 +85,13 @@ async function mixedRun(autonomy: "autonomous" | "supervised", blockDatabase = f
   const limitedSeen: { taskId: string; limited: Set<string>; objectiveDigest: boolean }[] = [];
   const teams = await f.openTeamService({ entries });
   const limits = (teams as unknown as { limits: { observe(limit: object): void } }).limits;
-  const recorder = new RoutingRecorder({ store, log: line => logs.push(line) });
-  teams.useRouter({ recordStart: input => {
+  const recorder = new RoutingRecorder({ store, log: line => logs.push(line) }), start = recorder.recordStart.bind(recorder);
+  recorder.recordStart = input => {
     if (input.task.id === "b") limits.observe({ provider: "opencode", detectedAt: new Date().toISOString(), sessionId: "routing-run-test", confidence: "corroborated" });
     limitedSeen.push({ taskId: input.task.id, limited: input.limited as Set<string>, objectiveDigest: input.objectiveDigest });
-    recorder.recordStart(input);
-  } } as unknown as RoutingRecorder);
+    start(input);
+  };
+  teams.useRouter(recorder);
   return { f, store, teams, logs, limitedSeen };
 }
 
@@ -219,7 +222,7 @@ test("with the store unavailable the run continues", { timeout: 240000 }, async 
     assert.equal(settled.status, "ready-for-review", JSON.stringify(settled.events.slice(-5)));
     assert.equal(view.members.find(member => member.role === "implementer" && member.taskId === "a")?.modelProfile?.id, "spark-high");
     assert.equal(view.members.find(member => member.role === "implementer" && member.taskId === "b")?.modelProfile?.id, "astra-xhigh");
-    assert.deepEqual(logs, [UNAVAILABLE_LOG]);
+    assert.deepEqual(logs, [AUTO_PIN_LOG, UNAVAILABLE_LOG]);
   } finally {
     store.close();
     await f.close();

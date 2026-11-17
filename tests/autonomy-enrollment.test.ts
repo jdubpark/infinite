@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import type { Config } from "../packages/host/src/types.js";
 import { RepoEnrollmentService } from "../packages/host/src/repo-enrollment.js";
+import { ROUTING_AUTO_NOTE } from "../packages/host/src/routing-cli.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { startHost } from "./helpers.js";
 
@@ -302,9 +303,10 @@ test("repo init saves routing and keeps it when omitted", { timeout: 90000 }, as
     invoke(["--routing-contributor", "allow"]);
     assert.deepEqual(await savedRouting(), { mode: "shadow", successValueUsd: 8, allowContributor: true }, "one option merges over the saved policy and keeps the rest");
 
-    assert.throws(() => invoke(["--routing", "auto"]), (error: { stderr?: string }) =>
-      String(error.stderr).includes("This host records shadow decisions only. Use --routing shadow; auto routing comes with a later release."));
-    assert.deepEqual(await savedRouting(), { mode: "shadow", successValueUsd: 8, allowContributor: true }, "a refused auto stores nothing new");
+    const auto = spawnSync(cli[0]!, [...cli.slice(1), "repo", "init", repoPath, "--project", "sample", "--check-json", checks, "--routing", "auto", "--json"], { encoding: "utf8" });
+    assert.equal(auto.status, 0, auto.stderr);
+    assert.equal(auto.stderr.includes(ROUTING_AUTO_NOTE), true, "auto prints the shadow-period note on stderr");
+    assert.deepEqual(await savedRouting(), { mode: "auto", successValueUsd: 8, allowContributor: true }, "auto replaces only the mode and keeps the carried value");
 
     // Off replaces only the mode; the given deny and cost merge over the saved policy and keep nothing else.
     invoke(["--routing", "off"]);

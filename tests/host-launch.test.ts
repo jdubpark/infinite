@@ -5,6 +5,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync,
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes, randomUUID } from "node:crypto";
+import { EGRESS_ENVIRONMENT_NAMES } from "../packages/host/src/egress.js";
 import { buildLaunch, headlessLaunch, headlessResumeProfile, missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "../packages/host/src/launch.js";
 import { addProjectIdToLaunchEnv } from "../packages/host/src/worker-env.js";
 import { claudeConfigPath, recordClaudeTrust } from "../packages/host/src/workspace-trust.js";
@@ -249,6 +250,27 @@ test("Codex team launch configures its authenticated MCP report tool and require
     assert.equal(launch.args.at(-1), "Implement this task");
   }
   assert.throws(() => buildLaunch("codex", { command: "codex", args: [] }, "task", null, relay, enabled, true), /Codex team reporting/);
+});
+
+test("Codex forwards configured egress names to team, mission, and handoff MCP servers", () => {
+  const profile = { command: "codex", args: [] };
+  const launch = (egressConfigured: boolean) => buildLaunch("codex", profile, "task", hooks, relay, enabled,
+    true, undefined, "session-1", undefined, undefined, false, egressConfigured);
+  const envVars = (args: string[], server: string) => {
+    const key = `mcp_servers.${server}.env_vars=`;
+    const setting = args.find((arg, index) => args[index - 1] === "-c" && arg.startsWith(key));
+    assert.ok(setting, `${server} has an env_vars launch setting`);
+    return JSON.parse(setting.slice(key.length)) as string[];
+  };
+  const ordinary = launch(false);
+  const routed = launch(true);
+  const teamBase = ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT", "INFINITE_PROJECT_ID"];
+  const handoffBase = ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN"];
+
+  assert.deepEqual(envVars(ordinary.args, "infinite_team"), teamBase);
+  assert.deepEqual(envVars(ordinary.args, "infinite_handoff"), handoffBase);
+  assert.deepEqual(envVars(routed.args, "infinite_team"), [...teamBase, ...EGRESS_ENVIRONMENT_NAMES]);
+  assert.deepEqual(envVars(routed.args, "infinite_handoff"), [...handoffBase, ...EGRESS_ENVIRONMENT_NAMES]);
 });
 
 // A readable teamwork run path long enough that a terminal wraps it across lines.

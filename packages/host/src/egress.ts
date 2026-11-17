@@ -19,6 +19,16 @@ export const SESSION_CREDENTIAL_SECONDS = 30 * 24 * 60 * 60;
 export const HOST_CREDENTIAL_SECONDS = 24 * 60 * 60;
 export const HOST_IDENTITY = { project: "_host", session: "host" } as const;
 export const EGRESS_NO_PROXY = "localhost,127.0.0.1,::1";
+const EGRESS_ENVIRONMENT = {
+  HTTPS_PROXY: "HTTPS_PROXY",
+  HTTP_PROXY: "HTTP_PROXY",
+  httpsProxy: "https_proxy",
+  httpProxy: "http_proxy",
+  NO_PROXY: "NO_PROXY",
+  noProxy: "no_proxy",
+  nodeUseEnvProxy: "NODE_USE_ENV_PROXY",
+} as const;
+export const EGRESS_ENVIRONMENT_NAMES: readonly string[] = Object.freeze(Object.values(EGRESS_ENVIRONMENT));
 const PROJECT_ID = /^[a-z0-9-]{1,80}$/;
 const PROJECT_LABEL = /^(?:_host|_none|[a-z0-9-]{1,80})$/;
 const SESSION_LABEL = /^[A-Za-z0-9-]{1,64}$/;
@@ -82,11 +92,28 @@ export function egressCredential(key: Buffer, project: string, session: string, 
   return { username: `${project}.${session}`, password: `v1.${expires}.${mac}` };
 }
 
-/** The six proxy variables for one identity. Loopback stays direct. */
+function proxyEnvironment(value: string): Record<string, string> {
+  return {
+    [EGRESS_ENVIRONMENT.HTTPS_PROXY]: value,
+    [EGRESS_ENVIRONMENT.HTTP_PROXY]: value,
+    [EGRESS_ENVIRONMENT.httpsProxy]: value,
+    [EGRESS_ENVIRONMENT.httpProxy]: value,
+    [EGRESS_ENVIRONMENT.NO_PROXY]: EGRESS_NO_PROXY,
+    [EGRESS_ENVIRONMENT.noProxy]: EGRESS_NO_PROXY,
+    [EGRESS_ENVIRONMENT.nodeUseEnvProxy]: "1",
+  };
+}
+
+/** Remove inherited proxy state before applying the current egress policy. */
+export function clearEgressEnvironment(env: Record<string, string | undefined>): void {
+  for (const name of EGRESS_ENVIRONMENT_NAMES) delete env[name];
+}
+
+/** The six proxy variables and Node's opt-in flag for one identity. Loopback stays direct. */
 export function egressProxyEnvironment(proxyUrl: string, key: Buffer, identity: EgressIdentity, lifetimeSeconds: number, nowMs = Date.now()): Record<string, string> {
   const { username, password } = egressCredential(key, identity.project, identity.session, Math.floor(nowMs / 1000) + lifetimeSeconds);
   const value = `http://${username}:${password}@${new URL(proxyUrl).host}`;
-  return { HTTPS_PROXY: value, HTTP_PROXY: value, https_proxy: value, http_proxy: value, NO_PROXY: EGRESS_NO_PROXY, no_proxy: EGRESS_NO_PROXY };
+  return proxyEnvironment(value);
 }
 
 /**
@@ -95,7 +122,7 @@ export function egressProxyEnvironment(proxyUrl: string, key: Buffer, identity: 
  */
 export function egressUncredentialedEnvironment(proxyUrl: string): Record<string, string> {
   const value = `http://${new URL(proxyUrl).host}`;
-  return { HTTPS_PROXY: value, HTTP_PROXY: value, https_proxy: value, http_proxy: value, NO_PROXY: EGRESS_NO_PROXY, no_proxy: EGRESS_NO_PROXY };
+  return proxyEnvironment(value);
 }
 
 /** A session's identity: its project, or `_none` when it has no valid one. */

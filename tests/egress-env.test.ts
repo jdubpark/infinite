@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { egressConfigSchema, egressDoctorLine, installHostEgress, workerEgressEnvironment } from "../packages/host/src/egress.js";
+import { EGRESS_NO_PROXY, egressConfigSchema, egressDoctorLine, installHostEgress, workerEgressEnvironment } from "../packages/host/src/egress.js";
+import { RepositoryBriefings } from "../packages/host/src/repository-briefings.js";
 import { teamCommandEnvironment } from "../packages/host/src/team-workspace.js";
 // @ts-ignore -- a dependency-free script without type declarations
 import { verifyProxyAuthorization } from "../scripts/egress-proxy.mjs";
@@ -15,7 +16,7 @@ const key = randomBytes(32);
 const keyPath = join(root, "egress.key");
 writeFileSync(keyPath, key, { mode: 0o640 });
 const egress = { proxyUrl: "http://127.0.0.1:3128", keyPath };
-const PROXY_NAMES = ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy", "NO_PROXY", "no_proxy"];
+const PROXY_NAMES = ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy", "NO_PROXY", "no_proxy", "NODE_USE_ENV_PROXY"];
 
 /** The identity the proxy would accept for a proxy URL's user information. */
 function identityOf(proxyUrl: string) {
@@ -43,6 +44,7 @@ test("with the egress block, each session gets its own credential in the proxy U
     const second = workerEgressEnvironment("project-a", "6f1d2c3b-1111-4222-8333-944455566677", inherited);
     assert.equal(first.status, "on");
     assert.deepEqual(Object.keys(first.env).sort(), [...PROXY_NAMES].sort());
+    assert.equal(first.env.NODE_USE_ENV_PROXY, "1");
     for (const name of ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]) assert.equal(first.env[name], first.env.HTTPS_PROXY);
     for (const name of ["NO_PROXY", "no_proxy"]) assert.deepEqual(first.env[name].split(",").sort(), ["127.0.0.1", "::1", "localhost"]);
     const { origin, verdict } = identityOf(first.env.HTTPS_PROXY);
@@ -58,6 +60,7 @@ test("with the egress block, each session gets its own credential in the proxy U
     assert.equal(team.GIT_CONFIG_GLOBAL, "/dev/null");
     assert.deepEqual(identityOf(team.HTTPS_PROXY!).verdict, { ok: true, project: "_host", session: "host" });
     assert.equal(team.NO_PROXY, first.env.NO_PROXY);
+    assert.equal(team.NODE_USE_ENV_PROXY, "1");
   } finally {
     installHostEgress({}, inherited);
   }
@@ -66,7 +69,7 @@ test("with the egress block, each session gets its own credential in the proxy U
 test("without a readable key, sessions and host commands still get the proxy, with no credential, so nothing goes direct", async () => {
   const unreadable = join(root, "open.key");
   writeFileSync(unreadable, key, { mode: 0o644 });
-  const uncredentialed = Object.fromEntries(PROXY_NAMES.map(name => [name, name.toLowerCase() === "no_proxy" ? "localhost,127.0.0.1,::1" : "http://127.0.0.1:3128"]));
+  const uncredentialed = Object.fromEntries(PROXY_NAMES.map(name => [name, name === "NODE_USE_ENV_PROXY" ? "1" : name.toLowerCase() === "no_proxy" ? EGRESS_NO_PROXY : "http://127.0.0.1:3128"]));
   for (const keyFile of [unreadable, join(root, "missing.key"), "relative.key", ""])
     assert.deepEqual(workerEgressEnvironment("project-a", "0b6a3c52-6c1e-4b0e-9a55-3f1f2d0c9e71", { INFINITE_EGRESS_PROXY_URL: egress.proxyUrl, INFINITE_EGRESS_KEY_FILE: keyFile }), { status: "no-key", env: uncredentialed }, keyFile);
   assert.deepEqual(workerEgressEnvironment("project-a", "0b6a3c52-6c1e-4b0e-9a55-3f1f2d0c9e71", { INFINITE_EGRESS_PROXY_URL: egress.proxyUrl }), { status: "no-key", env: uncredentialed });
@@ -86,6 +89,50 @@ test("without a readable key, sessions and host commands still get the proxy, wi
   }
   const line = await egressDoctorLine({ proxyUrl: "http://127.0.0.1:9", keyPath: unreadable });
   assert.match(line, /key UNREADABLE \(permissions\): .*refused with 407/);
+});
+
+test("repository briefing children get configured egress and discard inherited proxy state when disabled", async () => {
+  const directory = mkdtempSync(join(root, "briefing-env-"));
+  const receipt = join(directory, "environment.json");
+  const previous = new Map(PROXY_NAMES.map(name => [name, process.env[name]]));
+  const script = `const fs = require("node:fs");
+const names = ${JSON.stringify(PROXY_NAMES)};
+const environment = Object.fromEntries(names.map(name => [name, name === "NODE_USE_ENV_PROXY" ? (process.env[name] ?? null) : Boolean(process.env[name])]));
+fs.writeFileSync(process.argv[1], JSON.stringify(environment));
+process.stdout.write(JSON.stringify({ decision: { action: "disabled", reason: "probe", judge: null, worthwhile: null, scope: null }, repo: null, brief: null }));`;
+  const manager = {
+    state: async () => ({ seq: 1, capabilities: { transcript: 1 } }),
+    events: () => ({ events: [{ seq: 1, type: "message", at: "2026-11-17T00:00:00.000Z", data: { id: "probe", role: "user", text: "inspect" } }], cursor: 1, more: false }),
+  };
+  const session = { id: "briefing-probe", projectId: "egress-test", cwd: process.cwd() };
+  const project = { id: "egress-test", name: "Egress test", path: process.cwd() };
+
+  try {
+    for (const name of PROXY_NAMES) process.env[name] = name === "NODE_USE_ENV_PROXY" ? "0" : "http://stale.invalid";
+    for (const configured of [false, true]) {
+      installHostEgress(configured ? { autonomy: { boundary: { egress } } } : {}, {});
+      const briefings = new RepositoryBriefings({ command: process.execPath, args: ["-e", script, receipt], automatic: false, intervalMs: 1000, cooldownMs: 0, timeoutMs: 10000 }, manager as never, [project as never]);
+      try {
+        await assert.rejects(briefings.summarize(session as never, "0"));
+      } finally {
+        await briefings.close();
+      }
+
+      const observed = JSON.parse(readFileSync(receipt, "utf8")) as Record<string, boolean | string | null>;
+      if (configured) {
+        for (const name of PROXY_NAMES) assert.ok(observed[name], `${name} is passed to a configured briefing`);
+        assert.equal(observed.NODE_USE_ENV_PROXY, "1");
+      } else {
+        assert.deepEqual(observed, Object.fromEntries(PROXY_NAMES.map(name => [name, name === "NODE_USE_ENV_PROXY" ? null : false])));
+      }
+    }
+  } finally {
+    installHostEgress({}, {});
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
 });
 
 test("the egress block accepts only a bare loopback HTTP proxy address", () => {

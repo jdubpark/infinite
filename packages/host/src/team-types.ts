@@ -3,6 +3,7 @@ import { z } from "zod";
 import { featureMapSchema, TASK_KINDS } from "./task-features.js";
 import { evalProjectSchema } from "./eval-config.js";
 import { teamRoutingSchema } from "./routing-policy.js";
+import { intentCheckReportSchema } from "./intent-report.js";
 import type { RoutingKnobs, TeamRunRouting } from "./routing-types.js";
 import type { Prompt, AnswerResult } from "@infinite/attention";
 import type { Receipt } from "./types.js";
@@ -231,8 +232,8 @@ export const teamProjectSchema = z.object({
   eval: evalProjectSchema.optional(),
   /** The routing policy (owner-set). No default, so an unset policy leaves the authority digest unchanged. */
   routing: teamRoutingSchema.optional(),
-  /** The objective switch. No default: an absent key leaves every routine digest and prompt unchanged. */
-  objective: z.strictObject({ prompts: z.enum(["on", "off"]) }).optional(),
+  /** The objective switches. No default: an absent key leaves every routine digest and prompt unchanged. `intentCheck` overrides the mode's default. */
+  objective: z.strictObject({ prompts: z.enum(["on", "off"]).optional(), intentCheck: z.enum(["on", "off"]).optional() }).optional(),
 }).strict().superRefine((project, context) => {
   if (project.establishChecks ? project.checks.length > 0 : project.checks.length === 0)
     context.addIssue({ code: "custom", path: ["checks"], message: "Configure required checks, or explicitly authorize the team to establish them with an empty checks array." });
@@ -268,12 +269,17 @@ export const teamLineupSchema = z.object({
   implementers: z.array(teamModelProfileSchema).min(1).max(8),
   escalations: z.array(teamModelProfileSchema).min(1).max(8).optional(),
   fallbacks: z.array(teamModelProfileSchema).min(1).max(8).optional(),
-  // Keep this last: lineup fingerprints include the parsed object's key order.
   permissionReviewer: teamModelProfileSchema.optional(),
+  // Keep this last: lineup fingerprints include the parsed object's key order.
+  /** Read-only intent checkers, strongest first. Each must be strong; the checker's family must differ from the coordinator's. */
+  evaluators: z.array(teamModelProfileSchema).min(1).max(4).optional(),
 }).strict().superRefine((lineup, context) => {
+  for (const [index, profile] of (lineup.evaluators ?? []).entries()) {
+    if (profile.tier !== "strong") context.addIssue({ code: "custom", path: ["evaluators", index, "tier"], message: "An evaluator must be a strong profile" });
+  }
   if (lineup.permissionReviewer && lineup.permissionReviewer.provider !== "claude")
     context.addIssue({ code: "custom", path: ["permissionReviewer", "provider"], message: "The permission reviewer profile must use Claude Code." });
-  for (const pool of ["implementers", "escalations", "fallbacks"] as const) {
+  for (const pool of ["implementers", "escalations", "fallbacks", "evaluators"] as const) {
     const ids = new Set<string>();
     for (const [index, profile] of (lineup[pool] ?? []).entries()) {
       if (ids.has(profile.id)) context.addIssue({ code: "custom", path: [pool, index, "id"], message: "Profile IDs must be unique within a pool" });
@@ -317,9 +323,9 @@ export const teamLineupSchema = z.object({
   }
 });
 export type TeamLineup = z.infer<typeof teamLineupSchema>;
-type LineupShape = Pick<TeamLineup, "coordinator" | "integrator" | "reviewer" | "implementers" | "escalations" | "fallbacks" | "permissionReviewer">;
+type LineupShape = Pick<TeamLineup, "coordinator" | "integrator" | "reviewer" | "implementers" | "escalations" | "fallbacks" | "permissionReviewer" | "evaluators">;
 export function lineupProfiles(lineup: LineupShape): TeamModelProfile[] {
-  return [lineup.coordinator, lineup.integrator, lineup.reviewer, ...lineup.implementers, ...(lineup.escalations ?? []), ...(lineup.fallbacks ?? []), ...(lineup.permissionReviewer ? [lineup.permissionReviewer] : [])];
+  return [lineup.coordinator, lineup.integrator, lineup.reviewer, ...lineup.implementers, ...(lineup.escalations ?? []), ...(lineup.fallbacks ?? []), ...(lineup.permissionReviewer ? [lineup.permissionReviewer] : []), ...(lineup.evaluators ?? [])];
 }
 /**
  * Rule 1 or rule 2 of Part 5, in screen's order, or undefined when the profile passes both. Rule 1 is a contributor
@@ -427,6 +433,8 @@ export const recordDigestSchema = z.strictObject({
     statement: z.string(), // "" for c0; 1 to 1,000 bytes otherwise
     check: z.string(), // 1 to RECORD_LABEL_BYTES bytes
     producer: z.enum(["host", "evaluator", "owner"]),
+    /** Marks a criterion the intent check derived from the objective, so the next cycle's prompt says so. */
+    derived: z.literal(true).optional(),
   })).min(1).max(8),
 }).superRefine((digest, context) => {
   const [first, ...rest] = digest.criteria;
@@ -531,6 +539,7 @@ export const teamReportSchema = z.discriminatedUnion("kind", [
       context.addIssue({ code: "custom", path: ["options"], message: "Multiple-selection questions require at least two options." });
   }),
   z.object({ kind: z.literal("blocked"), summary: z.string().min(1).max(4000), blocker: blockerEvidenceSchema.optional() }).strict(),
+  intentCheckReportSchema,
 ]);
 export type TeamReport = z.infer<typeof teamReportSchema>;
 export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: teamReportSchema }).strict();
@@ -650,6 +659,8 @@ export interface TeamDecision {
   answeredBy?: "owner" | "coordinator" | "connector";
   source?: ConnectorSource;
   answeredAt?: string;
+  /** Ids of the record questions this decision asks, set by the intent check. Authority surfaces print them in place of `question`. */
+  intentQuestions?: string[];
 }
 export interface TeamCheck {
   command: TeamCommand;
@@ -673,6 +684,8 @@ export interface TeamRun {
   routingRevokedAt?: string;
   /** The project's autonomy mode, pinned when the run starts. Absent on runs recorded before the mode existed; read with autonomyOf(). */
   autonomy?: AutonomyMode;
+  /** The intent check pinned when the run is created; absent on runs created before the check existed. Pinned by createRun. */
+  intentCheck?: "on" | "off";
   /** Explicit owner delegation pinned at creation. Old runs remain opted out. */
   permissions?: TeamPermissions;
   permissionsRevokedAt?: string;
@@ -800,3 +813,6 @@ export const inputSourceLabel = (source?: ConnectorSource | "coordinator" | "sla
   typeof source === "object" ? `Connector (${source.name})` : source === "coordinator" ? "Mission coordinator" : "Owner";
 export const decisionAnswerLabel = (decision: Pick<TeamDecision, "answeredBy" | "source">) =>
   decision.answeredBy === "connector" ? (decision.source ? inputSourceLabel(decision.source) : "Connector") : decision.answeredBy === "coordinator" ? "Mission coordinator" : "User";
+/** The one form every authority surface prints for a decision's question. Intent decisions print ids, never checker text (R2). */
+export const decisionAuthorityQuestion = (decision: Pick<TeamDecision, "question" | "intentQuestions">) =>
+  decision.intentQuestions ? `The intent check's questions ${decision.intentQuestions.join(", ")}` : decision.question;

@@ -154,6 +154,24 @@ test("the objective switch is inside the routine approval digest", async () => {
   } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test("the intent check settings are inside the routine approval digest", async () => {
+  const f = setup(); let service = f.createService();
+  try {
+    await service.create(f.create()); await wait(30); await service.tick();
+    assert.equal(service.list()[0]!.status, "running");
+    service.close(); service = f.createService(); await service.tick();
+    assert.equal(service.list()[0]!.status, "running", "a reload keeps the stored authority with both keys absent");
+    f.config.projects[0]!.team = { ...f.config.projects[0]!.team!, objective: { intentCheck: "off" } };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "blocked");
+    const second = await service.create(f.create()); await wait(30); await service.tick();
+    assert.equal(service.get(second.id).status, "running", "a second routine starts under the current authority");
+    f.config.teams!.lineup = { ...f.config.teams!.lineup!, evaluators: [{ id: "astra", label: "Astra", provider: "codex", model: "astra", effort: "high", tier: "strong" }] } as never;
+    await service.tick();
+    assert.equal(service.get(second.id).status, "blocked", "the lineup's evaluators change the authority digest");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test("a pending project run prevents overlap and launch is skipped when the approved budget cannot fit", async () => {
   const f = setup({ busy: async () => true }); const service = f.createService();
   try {

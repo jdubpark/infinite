@@ -692,6 +692,7 @@ These rulings override the text below where the two differ.
    - Task 8's status sets it beside `requested` and `source`. Its status test asserts both cases: a saved policy without a mode in an `autonomous` project gives `autonomous-default`, and a saved `shadow` gives `saved`.
    - Task 10's line (1) prints `(autonomous default)` for `modeSource` `autonomous-default` in both modes: `ID · routing auto (autonomous default)` and `ID · routing shadow (autonomous default) · auto starts after the shadow period`. Line (5)'s ` Auto routing needs --routing auto.` appears only for `modeSource` `saved` with `requested` shadow.
    - The routing usage lists `pause-explore` and `resume-explore`, and step 1's exact-usage assertion changes with it.
+10. **A failed pin read logs before the shadow line.** Rulings 1 and 6 make an `autonomous` project without a saved mode `auto` by default, so its pin reads the period end. When the store cannot be read, the pin falls back to shadow with `AUTO_LOG.pin`, and the shadow recorder then logs its own line. The step-1 test `with the store unavailable the run continues` keeps its setup and its other assertions; its log assertion becomes both lines, the pin's first. A project that saves `shadow` logs only the shadow line, as in step 1.
 
 ## Trust boundary, and what a review checks
 

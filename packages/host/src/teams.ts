@@ -13,7 +13,7 @@ import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { PROVIDER_NAMES, recoveryTurnEnd, type Prompt, type SignalData } from "@infinite/attention";
 import { autonomyOf, type AutonomyMode } from "./autonomy.js";
-import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionAgentDecision, type TeamPermissionDecision, type TeamPermissionRecoveryOutcome, type TeamPermissionRecoveryRequest, type TeamPermissionRecoveryStep, type TeamPermissionRecoveryView, type TeamPublication, type TeamPublicationCategory, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, ACTIVE_MEMBER_STATUSES, currentPermissions, DEFAULT_STORAGE_FLOOR, DEFAULT_TEAM_RETENTION, hostClosedBlockedReason } from "./team-types.js";
+import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionAgentDecision, type TeamPermissionDecision, type TeamPermissionRecoveryOutcome, type TeamPermissionRecoveryRequest, type TeamPermissionRecoveryStep, type TeamPermissionRecoveryView, type TeamPublication, type TeamPublicationCategory, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, ACTIVE_MEMBER_STATUSES, currentPermissions, DEFAULT_STORAGE_FLOOR, DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, autoPinned, escalationPool, memberLimit, switchFallback } from "./team-types.js";
 import { memberConfiguration, type MemberConfiguration } from "./config-identity.js";
 import { ownerDirectionLines, permissionFollowUpPrompt, refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
 import { reviewEvidenceProblems } from "./team-acceptance.js";
@@ -31,9 +31,9 @@ import type { Blackboard } from "./evidence/blackboard.js";
 import { canonicalJson } from "./evidence/crypto.js";
 import { entryToolsFor } from "./entry-roles.js";
 import type { RoutingRecorder } from "./routing-recorder.js";
-import { pinRouting } from "./routing-policy.js";
+import { assertTaskProfiles, fallbackProfile, fallbackRule, routingComponent } from "./routing-rules.js";
 import { ENTRY_DROP_TEXT, ENTRY_INGEST_MS, EntryIngestQueue, ingestPass } from "./team-entry-ingest.js";
-import { MAX_OUTBOX_EVENTS, pathField, planDigest, profileIdentity, runEventKey, runSummaryCounts, type MemberStopDetail, type MemberStopReason, type ReplacementCause } from "./run-events.js";
+import { MAX_OUTBOX_EVENTS, appendRunEvent as runEvent, pathField, planDigest, profileIdentity, runEventKey, runSummaryCounts, type MemberStopDetail, type MemberStopReason, type ReplacementCause } from "./run-events.js";
 import { taskFeatures } from "./task-features.js";
 import { teamUsage } from "./team-usage.js";
 import { ProviderLimits, switchesMember, type LimitObservation } from "./provider-limits.js";
@@ -226,10 +226,6 @@ const runtimeUnavailableReason = "An agent runtime is unavailable; the team is w
 /** Reasons that report a member's state. The scheduler writes them again from each running member on every pass. */
 const memberStateReasons: ReadonlySet<string> = new Set([runtimeUnavailableReason, permissionReviewReason, permissionAgentReason, providerInputReason]);
 const clock = (iso: string) => `${iso.slice(11, 16)} UTC`;
-const runEvent = (run: TeamRun, text: string) => {
-  run.events.push({ at: timestamp(), text });
-  if (run.events.length > 300) run.events.splice(0, run.events.length - 300);
-};
 function retentionEventAt(run: TeamRun) {
   const event = [...run.events].reverse().find(item => {
     switch (run.status) {
@@ -460,14 +456,6 @@ export function applyTeamBriefTitle(run: TeamRun, brief: TeamBrief | undefined, 
     run.title = brief.title;
     run.titleSource = "brief";
   }
-}
-
-/**
- * The fallback for a member stopped at a provider limit. Its own provider counts as limited even when
- * only a single-source observation saw the limit, so a second hop never returns to that account.
- */
-export function switchFallback(lineup: TeamLineup, profileId: string, provider: Provider, limited: Set<Provider>) {
-  return resolveLimitFallback(lineup, profileId, new Set([...limited, provider]));
 }
 
 /** A stalled or legacy one-hour member stop can replan. Interrupted workspace operations cannot. */
@@ -1641,7 +1629,7 @@ export class TeamService {
       const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(project.team.permissions ? { permissions: currentPermissions(structuredClone(project.team.permissions)), permissionDecisions: [] } : {}), ...(goal ? { goal } : {}), ...(internal?.missionId ? { missionId: internal.missionId } : {}), ...(internal?.requestSource ? { requestSource: internal.requestSource } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), ...(titleSource ? { titleSource } : {}), title: parsed.title, objective: parsed.objective, parallelismCeiling: ceiling, parallelism: initialParallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
       // A goal run takes the mode its cycle passes; every other run takes the project's current mode.
       run.autonomy = goal ? autonomyOf(internal) : autonomyOf(project);
-      const routing = this.router ? pinRouting(project.team.routing, run.autonomy, lineup) : undefined;
+      const routing = this.router?.pin(project.team.routing, run.autonomy, lineup, run.projectId);
       if (routing) run.routing = routing;
       if (this.config.teams?.blackboard?.tools === true && this.options?.entries?.available()) run.blackboard = { tools: true };
       if (project.team.delivery) {
@@ -2069,6 +2057,17 @@ export class TeamService {
       this.event(stored, "Delegated permission decisions were revoked by the owner.");
       this.save(stored);
       return this.view(stored);
+    });
+  }
+  revokeRouting(id: string, input: Action) {
+    const body = teamActionSchema.parse(input);
+    return this.enqueue(async () => {
+      const stored = this.record(id), run = stored.run;
+      if (run.routing?.mode !== "auto") throw new TeamError(409, "routing-not-enabled", "This team does not choose worker profiles automatically.");
+      if (this.replay(stored, "revoke-routing", body) || !this.mutation(stored, "revoke-routing", body)) return this.view(stored);
+      run.routingRevokedAt ??= timestamp();
+      this.event(stored, "Host profile routing was revoked by the owner; new tasks start on the coordinator's profiles.");
+      this.save(stored); return this.view(stored);
     });
   }
   /** Retires the run's live coordinator decisions and fences answers in flight. False when a fence was not confirmed. */
@@ -2599,7 +2598,7 @@ export class TeamService {
       run.stopReason = "deadline";
       throw new TeamError(409, "goal-deadline", "The goal reached its deadline. Active work is being stopped and retained for inspection.");
     }
-    const limit = (run.goal ?? run.handoff)?.maxMembers ?? 60;
+    const limit = memberLimit(run);
     if (run.members.length + (addingMember ? 1 : 0) > limit) {
       if (run.goal || run.handoff) run.stopReason = "member-limit";
       throw new TeamError(409, "team-attempt-limit", `The team reached its limit of ${limit} agent attempts. Review its evidence before continuing.`);
@@ -4826,15 +4825,6 @@ export class TeamService {
       this.event(stored, result.status === "answered" ? "A one-shot permission option was delivered and the prompt closed; command execution remains unknown." : "The permission request remains with the user.");
     }, coordinator);
   }
-  private taskProfiles(run: TeamRun, tasks: { agentProfileId?: string }[]) {
-    for (const task of tasks) {
-      if (!run.lineup) {
-        if (task.agentProfileId !== undefined) throw new TeamError(409, "invalid-agent-profile", "A single-provider team cannot select profiles from a configured lineup.");
-      } else if (!task.agentProfileId || !run.lineup.implementers.some(profile => profile.id === task.agentProfileId)) {
-        throw new TeamError(409, "invalid-agent-profile", "Every task must select an agentProfileId from the team's configured implementer pool.");
-      }
-    }
-  }
   private assertDelivery(stored: Stored) {
     const run = stored.run, configured = this.config.projects.find(project => project.id === run.projectId)?.team?.delivery;
     if (!run.delivery || !configured || digest(configured) !== digest(run.delivery))
@@ -4849,8 +4839,8 @@ export class TeamService {
     if (role === "integrator") return run.lineup.integrator;
     if (role === "reviewer") return run.lineup.reviewer;
     if (!task) throw new TeamError(409, "invalid-agent-profile", "An implementer requires an assigned task and allowed model profile.");
-    this.taskProfiles(run, [task]);
-    return run.lineup.implementers.find(profile => profile.id === task.agentProfileId)!;
+    assertTaskProfiles(run, [task], role === "scout" ? "scouts" : "plan");
+    return run.lineup.implementers.find(profile => profile.id === task.agentProfileId) ?? fallbackProfile(run, task);
   }
   private reviewerProfile(run: TeamRun): TeamModelProfile | undefined {
     return run.lineup?.permissionReviewer ?? run.lineup?.coordinator;
@@ -4861,7 +4851,7 @@ export class TeamService {
     const task = role === "scout" ? run.discovery?.tasks.find(task => task.id === taskId) : run.tasks.find(task => task.id === taskId);
     let selected = pinnedProfile ?? this.memberProfile(run, role, task);
     const limit = selected && this.limits.active().find(item => item.provider === selected!.provider);
-    const fallback = limit && run.lineup ? resolveLimitFallback(run.lineup, selected!.id, this.limits.limited()) : undefined;
+    const fallback = limit && run.lineup ? resolveLimitFallback(run.lineup, selected!.id, this.limits.limited(), fallbackRule(run, role)) : undefined;
     const retargeted = fallback && prompt !== undefined ? retargetPrompt(prompt, { provider: fallback.provider, profile: fallback }) : undefined;
     // Without a resolvable fallback, or with a passed prompt it cannot carry, the launch proceeds: the limit may have lifted.
     if (selected && limit && fallback && (prompt === undefined || retargeted !== undefined)) {
@@ -4992,7 +4982,7 @@ export class TeamService {
     if (member.role === "delivery" && stored.deliveryAttempt) {
       this.block(stored, new TeamError(409, "delivery-reconciliation-required", "The delivery provider stopped at a limit. Inspect the remote branch and PR before replacing a possibly completed publication.")); return;
     }
-    const from = member.modelProfile, selected = from && run.lineup ? switchFallback(run.lineup, from.id, provider, this.limits.limited()) : undefined;
+    const from = member.modelProfile, selected = from && run.lineup ? switchFallback(run.lineup, from.id, provider, this.limits.limited(), fallbackRule(run, member.role)) : undefined;
     // Only a Claude profile can run report-only permission review.
     const fallback = selected;
     if (!from || !fallback) {
@@ -5032,11 +5022,11 @@ export class TeamService {
   }
   private prepareMember(stored: Stored, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string, onPrepared?: (member: TeamMember) => void) {
     if (this.publicationGate(stored, role)) return;
-    const run = stored.run, member = this.newMember(run, role, "", run.headCommit!, task?.id);
-    if (role === "implementer" && task && run.routing && this.router)
-      this.router.recordStart({ run, task: task as TeamTask, publishHeads: this.publishHeadsEnabled(), entryTools: entryToolsFor(run, "implementer"),
-        objectiveDigest: Boolean(stored.run.goal?.record),
-        featureMap: (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features, limited: this.limits.limited() });
+    const run = stored.run, start = role === "implementer" && task && run.routing && this.router ? { run, task: task as TeamTask,
+      publishHeads: this.publishHeadsEnabled(), entryTools: entryToolsFor(run, "implementer"), objectiveDigest: Boolean(run.goal?.record),
+      limited: this.limits.limited(), featureMap: (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features } : undefined;
+    const member = this.newMember(run, role, "", run.headCommit!, task?.id, undefined, start && autoPinned(run) ? this.router!.applyStart(start) : undefined);
+    if (start) this.router!.recordStart(start);
     const continuationHead = role === "project-manager" && stored.continuationHead?.revision === run.revision
       ? structuredClone(stored.continuationHead) : undefined;
     if (feedback) {
@@ -5217,7 +5207,7 @@ export class TeamService {
     if (member.role !== "permission-coordinator") {
       const captured = { memberId: member.memberId, taskId: member.taskId, revision: member.revision, workspace: stored.run.workspace,
         baseCommit: member.baseCommit, role: member.role, provider: member.provider ?? run.provider, profile: member.modelProfile,
-        publishHeads: this.publishHeadsEnabled(), prefix: this.config.teams?.commandPrefix, entryTools: Boolean(member.entryTools), objectiveDigest: Boolean(stored.run.goal?.record) };
+        publishHeads: this.publishHeadsEnabled(), prefix: this.config.teams?.commandPrefix, entryTools: Boolean(member.entryTools), objectiveDigest: Boolean(stored.run.goal?.record), routing: routingComponent(stored.run) };
       this.enrich(stored, async signal => {
         const data = await memberConfiguration(captured, signal);
         if (!data) return undefined;
@@ -5279,7 +5269,7 @@ export class TeamService {
     if (report.kind === "explore") {
       if (run.discovery || run.tasks.length || !run.lineup) throw new TeamError(409, "discovery-already-used", "A team may request one read-only discovery batch before implementation planning.");
       if (new Set(report.tasks.map(task => task.id)).size !== report.tasks.length) throw new TeamError(409, "invalid-discovery", "Discovery task IDs must be unique.");
-      this.taskProfiles(run, report.tasks);
+      assertTaskProfiles(run, report.tasks, "scouts");
       if (report.parallelism !== undefined && report.parallelism > capacityCeiling(run))
         throw new TeamError(409, "team-parallelism-limit", `The project manager selected ${report.parallelism} workers, above this run's capacity ceiling of ${capacityCeiling(run)}.`);
       this.operation(stored, "result", signal => assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal), () => {
@@ -5307,7 +5297,7 @@ export class TeamService {
     }
     if (report.kind === "escalate") {
       const task = run.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId);
-      const profile = run.lineup?.escalations?.find(item => item.id === report.agentProfileId);
+      const profile = escalationPool(run).find(item => item.id === report.agentProfileId);
       if (!task || task.escalation || !profile || profile.id === member.modelProfile?.id)
         throw new TeamError(409, "invalid-escalation", "An implementer may escalate once to a different profile in the approved escalation pool.");
       this.operation(stored, "result", signal => assertMemberScope(member.cwd, member.baseCommit, task.paths, this.config.teams?.commandPrefix, signal), () => {
@@ -5324,7 +5314,7 @@ export class TeamService {
     }
     if (report.kind === "plan") {
       validateTeamPlan(report.tasks);
-      this.taskProfiles(run, report.tasks);
+      assertTaskProfiles(run, report.tasks, "plan");
       if (report.parallelism !== undefined && report.parallelism > capacityCeiling(run))
         throw new TeamError(409, "team-parallelism-limit", `The project manager selected ${report.parallelism} workers, above this run's capacity ceiling of ${capacityCeiling(run)}.`);
       if (report.verification && !run.establishChecks && !run.verification) {

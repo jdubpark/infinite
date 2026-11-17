@@ -336,6 +336,7 @@ async function main() {
       Object.assign(tasks[1], JSON.parse(readFileSync(join(receiptDir, "invalid-profile.json"), "utf8")));
     }
     if (scenario === "rubric") { tasks[0].agentProfileId = "haiku"; tasks[1].agentProfileId = "codex-light"; tasks[0].paths.push("docs", "tests"); }
+    if (existsSync(join(receiptDir, "plan-no-profiles"))) for (const task of tasks) delete task.agentProfileId;
     const verification = { setup: { command: process.execPath, args: [process.argv[1], "--bootstrap-setup", scenario] },
       checks: [{ command: process.execPath, args: ["check.mjs"] }] };
     if (scenario === "bootstrap-change" && assignment.revision > 2)

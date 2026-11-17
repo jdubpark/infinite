@@ -13,24 +13,29 @@ export function useSessionControl(id: string) {
   const reconnecting = useRef(false);
   const generation = useRef(0);
   const mounted = useRef(true);
+  // Retries last only while the lease is unexpired: after that the host has dropped it, so a release has nothing to do.
   const releaseRequest = (control: ControlLease) => {
     let timer: number | undefined, sending = false;
+    const expired = () => Date.now() >= control.expiresAt;
     const stop = () => {
       window.removeEventListener("online", release);
       if (timer !== undefined) window.clearTimeout(timer);
+      window.clearTimeout(expiry);
     };
     const release = () => {
       if (sending) return;
+      if (expired()) { stop(); return; }
       sending = true;
       void api(`/sessions/${id}/control`, { action: "release", leaseId: control.id }).then(() => {
         stop();
       }, error => {
-        if (isControlRefusal(error)) { stop(); return; }
+        if (isControlRefusal(error) || expired()) { stop(); return; }
         window.addEventListener("online", release, { once: true });
         if (timer !== undefined) window.clearTimeout(timer);
-        if (navigator.onLine && Date.now() < control.expiresAt) timer = window.setTimeout(release, 1000);
+        if (navigator.onLine) timer = window.setTimeout(release, 1000);
       }).finally(() => { sending = false; });
     };
+    const expiry = window.setTimeout(stop, Math.max(0, control.expiresAt - Date.now()));
     release();
   };
   const forget = (release = true) => {

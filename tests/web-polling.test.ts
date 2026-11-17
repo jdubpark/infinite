@@ -14,8 +14,8 @@ const controlHarness = fileURLToPath(new URL("./fixtures/web-control-harness.tsx
 const ORIGIN = "http://127.0.0.1/polling";
 type ControlProbe = {
   ready: boolean; held: { id: string } | null; holdRenew: boolean; rejectRenew?: () => void;
-  refuseClaims: boolean; claims: number; renewals: number; calls: { action?: string; leaseId?: string }[];
-  hostHeld: { id: string } | null; releaseRequests: number; claim: () => void; teardown: () => void;
+  refuseClaims: boolean; leaseMs: number; claims: number; renewals: number; calls: { action?: string; leaseId?: string }[];
+  hostHeld: { id: string; expiresAt: number } | null; releaseRequests: number; claim: () => void; teardown: () => void;
 };
 
 describe("web conversation polling", { skip }, () => {
@@ -219,6 +219,31 @@ describe("web conversation polling", { skip }, () => {
         const control = (window as unknown as { control: ControlProbe }).control;
         return control.releaseRequests === 2 && control.hostHeld === null;
       }, undefined, { timeout: 2000 });
+    } finally {
+      await page.close();
+    }
+  });
+
+  test("a release given up offline stops retrying once its lease has expired", async () => {
+    const page = await load(controlScript);
+    try {
+      await page.waitForFunction(() => (window as unknown as { control: ControlProbe }).control.ready);
+      await page.evaluate(() => {
+        const control = (window as unknown as { control: ControlProbe }).control;
+        control.leaseMs = 1500;
+        control.claim();
+      });
+      await page.getByRole("button", { name: "Stop controlling" }).waitFor({ timeout: 2000 });
+      await page.context().setOffline(true);
+      await page.evaluate(() => (window as unknown as { control: ControlProbe }).control.teardown());
+      await page.waitForFunction(() => (window as unknown as { control: ControlProbe }).control.releaseRequests === 1);
+      await page.waitForFunction(() => {
+        const held = (window as unknown as { control: ControlProbe }).control.hostHeld;
+        return held !== null && Date.now() > held.expiresAt;
+      }, undefined, { timeout: 4000 });
+      await page.context().setOffline(false);
+      await page.waitForTimeout(1500);
+      assert.equal(await page.evaluate(() => (window as unknown as { control: ControlProbe }).control.releaseRequests), 1);
     } finally {
       await page.close();
     }

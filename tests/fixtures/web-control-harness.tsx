@@ -11,10 +11,10 @@ const control = {
   calls: [] as ControlCall[], renewals: 0, claims: 0, releaseRequests: 0,
   held: null as ControlLease | null, holder: null as ControlLease | null, hostHeld: null as ControlLease | null,
   ready: false, holdRenew: false, rejectRenew: undefined as (() => void) | undefined,
-  refuseClaims: false, claim: () => {}, teardown: () => {},
+  refuseClaims: false, leaseMs: 30_000, claim: () => {}, teardown: () => {},
 };
 Object.assign(window, { control });
-const lease = (id: string): ControlLease => ({ id, label: "This browser", expiresAt: Date.now() + 30_000 });
+const lease = (id: string): ControlLease => ({ id, label: "This browser", expiresAt: Date.now() + control.leaseMs });
 
 const host = (async (path: string, body?: ControlCall) => {
   if (path !== "/sessions/s1/control") throw new Error(`Unexpected request: ${path}`);
@@ -32,7 +32,7 @@ const host = (async (path: string, body?: ControlCall) => {
     control.renewals++;
     if (control.holdRenew) return new Promise((_, reject) => { control.rejectRenew = () => reject(new TypeError("offline")); });
     if (control.hostHeld?.id === body.leaseId) {
-      control.hostHeld = { ...control.hostHeld, expiresAt: Date.now() + 30_000 };
+      control.hostHeld = { ...control.hostHeld, expiresAt: Date.now() + control.leaseMs };
       return { control: control.hostHeld };
     }
     return { control: null };

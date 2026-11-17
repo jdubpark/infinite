@@ -546,7 +546,9 @@ export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z
 export type TeamReportEnvelope = z.infer<typeof teamReportEnvelopeSchema>;
 export type TeamRole = "permission-coordinator" | "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery" | "intent-checker";
 /** A mission coordinator's assignment carries the mission ID as `runId`; it reports `MissionReport`s. */
-export type TeamAssignment = { runId: string; memberId: string; revision: number; role: TeamRole | "mission-coordinator"; taskId?: string; verificationRefused?: true; entryTools?: true };
+export type TeamAssignment = { runId: string; memberId: string; revision: number; role: TeamRole | "mission-coordinator"; taskId?: string; verificationRefused?: true; entryTools?: true;
+  /** The host selects this member's escalation (implementer) or scout (project manager) profiles; a report may omit them. */
+  hostProfiles?: true };
 /** `merged` is set only from an explicit delivery report; it is not host verification. */
 export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
 export interface TeamMember extends TeamAssignment {
@@ -642,6 +644,8 @@ export interface TeamContinuation {
 }
 export interface TeamScout extends TeamScoutPlan {
   status: "pending" | "running" | "waiting" | "complete";
+  /** The host's scout choice under an `auto` pin that lists `scout`. Absent otherwise. */
+  routing?: TaskRouting;
   memberId?: string;
   summary?: string;
   evidence?: TeamEvidence[];

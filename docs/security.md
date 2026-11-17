@@ -145,7 +145,7 @@ Each service below runs on loopback, so the grader can open a connection to it. 
 | Hook listener | The address that each session receives in its hook variables | The hook token |
 | Egress proxy | `127.0.0.1:4785` | The egress key, or the session credential that the host gives each session. See [egress](../deploy/ubuntu/egress.md). |
 | GitHub credential proxy | `127.0.0.1:8417` | A host-signed grant. See [the GitHub proxy](../deploy/ubuntu/github-proxy.md). |
-| Relay | `127.0.0.1:4790` | The relay registration key of the runner. See [the public relay](../deploy/ubuntu/public-relay.md). |
+| Relay | `127.0.0.1:4790` | The relay registration key of the runner. Started with `--proxy-socket`, as [the public relay](../deploy/ubuntu/public-relay.md) installs it, the port refuses relay clients, and only `/health` answers without the key. |
 | Egress socket | The same port as the egress proxy | The same as the egress proxy. systemd holds the port while the proxy is down. |
 
 A second instance runs its own listeners on its own ports, with its own credentials. See [instances](../deploy/ubuntu/instances.md).

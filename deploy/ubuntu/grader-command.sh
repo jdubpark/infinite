@@ -68,7 +68,7 @@ valid_seconds() {
 }
 
 tools_present() {
-  for tool in /usr/bin/setsid /usr/bin/timeout /usr/bin/prlimit /usr/bin/env /usr/bin/sha256sum /usr/bin/realpath /usr/bin/find; do
+  for tool in /usr/bin/setsid /usr/bin/timeout /usr/bin/prlimit /usr/bin/env /usr/bin/sha256sum /usr/bin/realpath /usr/bin/find /bin/mkdir /bin/bash; do
     if [ ! -x "$tool" ]; then
       return 1
     fi
@@ -79,7 +79,7 @@ tools_present() {
 # Creates one directory under the root with mode 0700. A link on the way is refused, and so is a non-directory.
 make_dir() {
   if [ -L "$1" ]; then refuse; fi
-  if [ ! -e "$1" ]; then mkdir -m 700 -- "$1" || die; fi
+  if [ ! -e "$1" ]; then /bin/mkdir -m 700 -- "$1" || die; fi
   if [ ! -d "$1" ]; then refuse; fi
 }
 

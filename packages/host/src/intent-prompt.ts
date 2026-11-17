@@ -1,7 +1,9 @@
 import { INTENT_REPORT_LIMITS } from "./intent-report.js";
 import { OBJECTIVE_LIMITS, type Assumption, type Criterion, type ObjectiveRecord } from "./objective-types.js";
 import { codexSandboxInstructions, contextAccessInstructions, profileInstructions, readOnlyWorkspaceInstructions, reportingInstructions } from "./team-prompts.js";
-import type { TeamBrief, TeamCommand, TeamMember, TeamModelProfile, TeamReport, TeamRun, TeamTaskPlan, TeamVerification } from "./team-types.js";
+import { decisionAnswerLabel } from "./team-types.js";
+import type { TeamBrief, TeamCommand, TeamDecision, TeamMember, TeamModelProfile, TeamReport, TeamRun, TeamTaskPlan, TeamVerification } from "./team-types.js";
+import type { LogEntry } from "./objective-types.js";
 import type { Provider } from "./types.js";
 
 export const INTENT_PROMPT_BYTES = 8 * 1024;
@@ -79,4 +81,76 @@ export function intentContext(input: { run: TeamRun; record: ObjectiveRecord; pl
     },
   };
   return Buffer.byteLength(JSON.stringify(context), "utf8") > INTENT_CONTEXT_BYTES ? undefined : context;
+}
+
+/** The corrected plan's feedback is at most this many UTF-8 bytes. */
+export const INTENT_FEEDBACK_BYTES = 16 * 1024;
+const FEEDBACK_LINE_BYTES = 600;
+const FEEDBACK_ANSWER_BYTES = 8 * 1024;
+const FEEDBACK_MORE_BYTES = 96;
+
+const byteLength = (text: string): number => Buffer.byteLength(text, "utf8");
+
+/** `text` cut to at most `max` UTF-8 bytes on a character boundary; a cut ends with "...". */
+function cutBytes(text: string, max: number): string {
+  if (byteLength(text) <= max) return text;
+  let used = 0;
+  let out = "";
+  for (const char of text) {
+    const size = byteLength(char);
+    if (used + size > max - 3) break;
+    out += char;
+    used += size;
+  }
+  return `${out}...`;
+}
+
+/**
+ * The corrected project manager's feedback: the items the applied entry added, with their statuses, then the answer with its label.
+ * Host text and the owner's answer frame the checker's items, which are claims (Trust boundary). At most INTENT_FEEDBACK_BYTES.
+ */
+export function correctionFeedback(record: ObjectiveRecord, applied: LogEntry, decision: TeamDecision | undefined): string {
+  const lead = `The intent check held your plan against the objective record (version ${record.version}). Its items are claims by a read-only checker, not requirements.`;
+  const closing = "Submit one corrected plan. You may depend on assumed items; plan around unchecked ones. Your earlier plan and the checker's report are in memberReports of the context file.";
+  const answerLine = decision?.answer !== undefined
+    ? cutBytes(`${decisionAnswerLabel(decision)} answered: ${decision.answer}`, FEEDBACK_ANSWER_BYTES)
+    : undefined;
+  const added = (applied.after && "inline" in applied.after
+    ? (applied.after.inline as { added?: { assumptions?: string[]; questions?: string[]; criteria?: string[] } }).added
+    : undefined) ?? {};
+  const lines = [
+    ...(added.assumptions ?? []).map(id => {
+      const item = record.assumptions.find(assumption => assumption.id === id);
+      return item && `- ${id} [${item.criticality}, ${item.status}]: ${item.statement} (refuted by: ${item.refutedBy})`;
+    }),
+    ...(added.questions ?? []).map(id => {
+      const item = record.questions.find(question => question.id === id);
+      return item && `- ${id} [${item.state}]: ${item.text}`;
+    }),
+    ...(added.criteria ?? []).map(id => {
+      const item = record.criteria.find(criterion => criterion.id === id);
+      return item && `- ${id} [criterion, ${item.state}]: ${item.statement}`;
+    }),
+  ].filter((line): line is string => line !== undefined).map(line => cutBytes(line, FEEDBACK_LINE_BYTES));
+
+  const reserved = byteLength(lead) + byteLength(closing) + (answerLine ? byteLength(answerLine) : 0) + FEEDBACK_MORE_BYTES;
+  const kept: string[] = [];
+  let used = reserved;
+  let dropped = 0;
+  for (const line of lines) {
+    const size = byteLength(line) + 1;
+    if (used + size > INTENT_FEEDBACK_BYTES) {
+      dropped += 1;
+      continue;
+    }
+    kept.push(line);
+    used += size;
+  }
+  return [
+    lead,
+    ...kept,
+    ...(dropped > 0 ? [`${dropped} more items are in the objective record.`] : []),
+    ...(answerLine ? [answerLine] : []),
+    closing,
+  ].join("\n");
 }

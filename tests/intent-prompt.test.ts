@@ -1,8 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { INTENT_CONTEXT_BYTES, INTENT_PROMPT_BYTES, intentCheckerPrompt, intentContext } from "../packages/host/src/intent-prompt.js";
+import { INTENT_CONTEXT_BYTES, INTENT_FEEDBACK_BYTES, INTENT_PROMPT_BYTES, correctionFeedback, intentCheckerPrompt, intentContext } from "../packages/host/src/intent-prompt.js";
+import { runRecord } from "../packages/host/src/objective-record.js";
+import { applyIntentReport, intentApplied } from "../packages/host/src/objective-intent.js";
+import type { IntentCheckReport, IntentItem } from "../packages/host/src/intent-report.js";
 import { codexSandboxInstructions, profileInstructions, reportingInstructions, retargetPrompt } from "../packages/host/src/team-prompts.js";
-import type { TeamMember, TeamModelProfile, TeamReport, TeamRun } from "../packages/host/src/team-types.js";
+import type { TeamDecision, TeamMember, TeamModelProfile, TeamReport, TeamRun } from "../packages/host/src/team-types.js";
 import type { ObjectiveRecord } from "../packages/host/src/objective-types.js";
 
 // Sentinels are built at run time, so the source holds no secret-shaped or run-specific text.
@@ -10,6 +13,7 @@ const SENTINEL = ["intent", "sentinel", "run", "data"].join("-");
 const CHECKER_PROFILE: TeamModelProfile = { id: "astra-high", label: "Astra checker", provider: "codex", model: "gpt-6-astra", effort: "high" };
 const CLAUDE_PROFILE: TeamModelProfile = { id: "opus-xhigh", label: "Opus", provider: "claude", model: "claude-opus-5-5", effort: "xhigh" };
 const RUN_ID = "00000000-0000-4000-8000-000000000021";
+const DECISION_ID = "00000000-0000-4000-8000-0000000000d1";
 const CHECKS = [{ command: "npm", args: ["test"] }];
 
 test("the checker's prompt holds no run data", () => {
@@ -90,4 +94,36 @@ test("the checker's context holds the record, the plan, and this revision's find
 test("a checker context over 1 MiB is not built", () => {
   const huge = { ...planMember, report: { ...PLAN_REPORT, summary: "x".repeat(INTENT_CONTEXT_BYTES + 1) } } as unknown as TeamMember;
   assert.equal(intentContext({ run: runFixture(), record: RECORD, planMember: huge, mode: "autonomous", criteriaDue: false, checks: CHECKS }), undefined);
+});
+
+test("the corrected plan's feedback is bounded and labelled", () => {
+  const run = { id: RUN_ID, objective: "Find ranked sources for the research brief.", steering: [] } as unknown as TeamRun;
+  const record = runRecord(run, "2026-11-17T09:00:00.000Z", "run-handle");
+  assert.equal(typeof record, "object", "the fixture record is built");
+  // Sixteen assumptions of 500-byte statements: with an 8,000-character answer they cannot all fit in 16 KiB.
+  const assume = (index: number): IntentItem => ({
+    dimension: `detail ${index}`, why: "A detail the plan can carry.", criticality: "plan", disposition: "assume",
+    assumption: { statement: `${String(index).padStart(3, "0")} ${"s".repeat(496)}`, refutedBy: "a counter example", test: { kind: "owner" } },
+  }) as IntentItem;
+  const report: IntentCheckReport = {
+    kind: "intent-check", summary: "Sixteen items.", items: Array.from({ length: 16 }, (_, index) => assume(index)),
+  };
+  const applied = applyIntentReport(record as ObjectiveRecord, report, {
+    runId: RUN_ID, revision: 1, checkerMemberId: "intent-checker-1", decisionId: DECISION_ID, mode: "supervised", goal: false, configured: [], at: "2026-11-17T09:00:01.000Z",
+  });
+  const entry = intentApplied(applied.record, "intent-checker-1");
+  assert.ok(entry, "the applied entry is written");
+  const decision = {
+    id: DECISION_ID, memberId: "intent-checker-1", revision: 1, question: "The intent check's questions", options: [],
+    createdAt: "2026-11-17T09:00:01.000Z", answer: "y".repeat(8000), answeredBy: "owner",
+  } as unknown as TeamDecision;
+
+  const text = correctionFeedback(applied.record, entry!, decision);
+  assert.ok(Buffer.byteLength(text, "utf8") <= INTENT_FEEDBACK_BYTES, "at most 16 KiB");
+  assert.ok(text.startsWith(`The intent check held your plan against the objective record (version ${applied.record.version}).`), "the lead sentence");
+  assert.ok(text.includes("- a1 [plan, assumed]: 000 "), "an assumption line with its criticality and status");
+  assert.ok(text.includes("(refuted by: a counter example)"), "the refutation");
+  assert.ok(/\d+ more items are in the objective record\./.test(text), "the items past the limit are counted");
+  assert.ok(text.includes(`User answered: ${"y".repeat(100)}`), "the owner's answer carries its label");
+  assert.ok(text.endsWith("Your earlier plan and the checker's report are in memberReports of the context file."), "the closing instruction");
 });

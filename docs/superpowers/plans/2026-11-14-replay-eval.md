@@ -1538,3 +1538,908 @@ The owner decided on 2026-11-13 to add the grader identity. None of the followin
 - A per-account `/proc` view (`hidepid`), a private `/tmp` for the grader, and a disk quota, each an owner hardening choice.
 - The summary in the web client, the phone, and the Mac app.
 - MCP tools: none, by design (C9 rules 3 and 8: an eval result and eval material never reach a member's prompt, workspace, or tool result).
+
+# Slice: trials
+
+Spec part 1 (the trial settings), part 3 (trials and the replay run), part 4 (the eval identity and the trial source), part 5 (grading), part 6 (the `baseline` job and the gates before a trial), and part 8 (outcome rows), delivery step 3, with acceptance 4 to 8 and the job clause of acceptance 9 (Linear INF-291). After it, an owner who installed the eval identity and turned trials on for a GitHub project can create a `baseline` job: the host replays the project's valid eval tasks under each named configuration, one implementer at a time as the eval identity, grades each result as the grader identity against the hidden tests, and keeps a sealed grade and result patch per trial for step 4. It builds on capture, mining and validation, the grader launcher, the launch-rate fuse, the host-load gate, the halt, the egress boundary, the permission pipeline, and the outcome ledger, which are on `main`; every replay run writes outcome rows with source `replay` that no routing read uses.
+
+## Coordinator rulings (2026-11-17)
+
+These override the text below where the two differ.
+
+1. **The plan's rulings stand.** Accepted as written: the eval identity as host configuration; no trial without both identities; the `trialsPerDay` stand-in; gates only on what exists; the grader-built source; the result patch; the permission rule; nullable grades; `no-result`; the home reset; the empty launcher environment; baseline-only configurations; the exclusions; and the purpose fields.
+2. **Trial dialogs.** A trial's permission dialogs go through the project's permission pipeline. For a project the host permission agent serves, they also go through that agent, as in production. This is the design's "pinned permission review" (part 3), without a second session. `docs/teams.md` and the pull request say so in one sentence, so the owner sees that the agent's delegation reaches trial dialogs. A dialog left to a person ends the trial `permission`, and nothing answers it.
+3. **Launcher test safety (lesson from INF-281).** Every test copy of `eval-command.sh` replaces the `kill -KILL -1` line of `stop` with `exit 99`, and asserts that the replacement happened. A broken account check can then never kill the test runner. A test that calls `stop` calls it last. Cleanup restores modes (`chmod -R u+rwX`) before it removes a tree. The same holds for every test copy of `grader-command.sh` in Task 5.
+4. **Linux-only tests.** The launcher tests of Tasks 4 and 5 skip off Linux, so a worker on macOS cannot see them fail. The worker writes them, runs `bash -n` (and `shellcheck` when it is installed), and reports. The coordinator runs them in a throwaway Linux container, as a non-root user with no network, and records the result before the commit.
+5. **Workers.** At most four implementers at once.
+   - Task 1 runs alone.
+   - Then Tasks 2, 3, 7, and 8.
+   - Then 4, 5, 6, and 10 as slots free.
+   - Then 14, 16, 12, and 9 (Task 9 after 2, 3, and 6).
+   - Then 11 (after 5 to 8) and 13 (after 12).
+   - Task 15 runs last.
+6. **Shared line budgets.** On this branch, `teams.ts` grows by at most 27 lines (5,707 to 5,734). INF-292 adds 5 lines on its own branch, so the composed tree stays at or under 5,739 of the 5,747 baseline. `server.ts`, `manager.ts`, `worker.ts`, `outcome-store.ts`, and `scripts/egress-proxy.mjs` change only in place.
+7. **Nothing is installed.** The deploy files are templates. The slice changes no installed launcher, sudo rule, or network rule. The pull request lists what the owner installs, from "Owner approvals".
+
+Where the design and the code disagree, or the design leaves a point open, this plan rules:
+
+- **Eval launch profiles.** Part 1 gives each project `memberProfile?: string`. A launch profile in the code is one `AgentProfile` per provider (`Config.agents`), and one eval account serves every project. Ruling: the eval identity is host configuration, `eval.member`, beside `eval.grader`: its launcher, its root, one launch profile per provider, and canaries. A project has no member-profile field. *(My call: the slice 2 ruling for the grader; a per-project field would name one account many times.)*
+- **No trial without both identities.** Acceptance 5 labels a trial `none` when a launch profile is missing. Ruling: without `eval.member`, or while the grader is not `ready` at launcher version 2, no trial starts. *(My call: a trial without the eval identity would run as the agent account, with production logins and credentials.)*
+- **The learning budget.** Part 6's budget (C8) needs the spend fuse's token, `listUsd`, and `spentUsd` ceilings (C13). The fuse on `main` has only the launch rate (`fuse/rules.ts`, `FuseCause = "launch-rate" | "unmeasurable"`), and no reservation rows exist. Ruling: a bounded stand-in, `project.team.eval.trialsPerDay`, absent by default, so no trial starts in any project, autonomous or supervised. A job has `maxTrials` and `maxWallMinutes` and no USD limits. `reserve`, `settle`, `status`, `estimate-unavailable`, `budget-exhausted`, and the per-trial estimate in the job view arrive with delivery step 4 of the delegated adoption design, "The standing budget", which removes `trialsPerDay`. Acceptance 9's `reserve` clause moves there. *(My call: one owner-set daily count is the smallest cap that bounds spend, and an autonomous project gets no default budget before the budget exists.)*
+- **Gates that need other designs.** Part 6 holds a trial while headroom is below the learning floor and while any run has an open duel. The floor is delegated adoption Part 9 and duels are their own design; neither is on `main`. Ruling: this slice gates on an active provider limit and on four free session slots, as part 6 also says. The floor joins with the standing budget, the duel gate with duels. *(My call: gate only on what exists.)*
+- **The trial source.** Part 4 builds it in a staging clone of the mirror, which needs five or more new `teams.commandPrefix` forms run as the agent account. Validation already builds the replay base in the grader's root (`eval-base` in the job's `task` clone). Ruling: the grader builds the source. A new grader operation, `export`, streams a bundle of one branch at `eval-base` through the host into the eval launcher, which clones it. *(My call: no new `teams.commandPrefix` form, and no eval material in a directory the agent account can read.)*
+- **The result's way to the grader.** Part 5 step 2 streams a bundle of the result commit. Ruling: the host reads the result as a binary patch through the eval launcher (slice 2's `captureGit` reader, at most 1 MiB) and sends it to the grader as `result.patch`. *(My call: the reader already streams with a limit, the grader already applies patches, and a patch carries no object the base lacks.)*
+- **Permission review.** Part 3 gives the replay member "the project's pinned permission review". That review is a second session, a permission coordinator, against part 4's one-session rule. Ruling: a replay run never sets `run.permissions`, so `maybeStartPermissionReview` never starts a coordinator. The session's permission pipeline, and the host permission agent for a project it serves, decide dialogs as in production. A dialog left to a person ends the trial `permission`. *(My call: one live session per eval identity, and part 3's own rule that no component answers an undecided prompt.)*
+- **Unknown grades.** Part 5's `TrialGrade` makes `expectedPassed` and `diff` numbers. A result can break the runner so that no report exists, and a numstat read can be truncated. Ruling: `expectedPassed: number | null` and `diff: {…} | null`. Null is unknown, never zero, and a null `expectedPassed` never resolves. *(My call: the honesty rule.)*
+- **A member that exits without a report.** Production blocks the run `missing-agent-report`. Ruling: the trial ends `no-result`, a member failure, not a void. *(My call: re-running member failures as voids would bias the measured rate upward.)*
+- **Sets, filters, and reuse.** Part 6's `taskFilter` has `set`, `excludeGroups`, and `promptOrigins`, and a later job reuses a recent trial. The sets arrive in step 4, and `promptOrigin` lives only in sealed payloads. Ruling: a baseline job reads every `valid` task its filter selects (task ids, origins, areas, `maxTasks`), never reuses a trial, and keeps on each trial row the keys that reuse and the sets need: task id, `configId`, profile epoch, and harness version. *(My call: step 4 owns the sets and reuse, and a filter on a sealed field would unseal every task on the job's path.)*
+- **Configurations.** Part 3's `EvalConfiguration` admits pinned guidance, forced knowledge, and a prompt override. Ruling: a baseline configuration is `{ profile, guidance: "as-of-base", knowledge: "none" }` only. *(My call: the others need the improvement gate, which also brings the `gate` purpose.)*
+- **State between trials.** Part 4 cleans the trial workspace. A member can also write the eval account's home: provider settings, hooks, user-level MCP servers, skills, and memory files that later trials would load. Ruling: before each trial the eval launcher resets the home from a root-owned template and keeps only the login files. *(My call: without the reset, one trial can change every later one.)*
+- **Paths outside part 3's table.** Part 3 removes replay runs from `list`, `statuses`, and `understandingRecords`. The member's session also reaches the session list (`server.ts` `listSessions`), the notifier's session pushes (`notifier.ts` `tick`), the provider-limit memory (`teams.ts` `limits.reconcile`), and project activity (`TeamService.activeForProject`). Ruling: each of them skips learning sessions or replay runs, and `get` and `objectiveRecord` answer `404` for a replay run. *(My call: acceptance 6 needs no notifier call, and a trial must neither hold back production work nor switch production members to their fallbacks.)*
+- **Hardcoded values.** `fuse/rules.ts` `workLaunch` and the `member.started` event in `teams.ts` hardcode `purpose: "work"`; `config-identity.ts` `memberConfiguration` hardcodes `shape: "team"`; `outcome-projector.ts` hardcodes `source: "production"` in `ensureSummary`, `blankOutcome`, and `blankResult`. Ruling: each takes the replay run's value (Tasks 2, 9, and 10).
+
+**Rulings before the build.**
+
+- Line numbers in this section were read on the reference tree at `7eb630a` (main `3c4e15b` with PRs #174, #175, and #176). Find each place by the quoted code.
+- The eval account, its launcher, its home template, its wrappers, its sudo rule, its network rule, the egress lists `_eval` and `_eval-setup`, the eval logins, and grader launcher version 2 wait for the owner (see "Owner approvals"). The slice ships with no trial able to start: without `eval.member` the eval identity is `not-configured` and a baseline job waits `eval-identity`; with grader launcher version 1 the job waits `grader`, and the summary shows `grader ready (version 1: no trials)`.
+- The owner defaults stand until the owner changes one: `trialsPerDay` absent (off), `trialMinutes` 45, three trials per task, 20 tasks per job, and the limits of Tasks 4 to 12.
+- One trial runs host-wide at a time, because one eval identity runs one live session. The eval host runs its validation step and its trial step in one chain, so one user holds the grader at a time.
+- No member report kind and no team role is added. The implementer role and the report kinds `result`, `question`, `blocked`, and `escalate` exist, so `tests/run-event-coverage.test.ts`'s `REPORT_SAMPLES` and the fake agents need no new entry. A trial spends one member launch, which the fuse counts with purpose `replay`. The one new run field, `replay`, is stripped from every team view, and no list or view route returns a replay run.
+- State stays bounded. After a trial is final, the pump deletes the replay run's record (with no tombstone), and one hour later the member's session. Trial rows and patches expire with the hourly sweep.
+
+**The eval identity is its own account behind a root-owned launcher, and the Manager is the one place a learning session gets its launch profile.** Every command in a trial workspace runs through `eval.member.prefix` (for example `sudo -n -u infinite-eval -- /usr/local/libexec/infinite/eval-command`), and the member's provider runs through `eval.member.agents[provider]` (`sudo -n -H -u infinite-eval -- /usr/local/libexec/infinite/eval/claude`). The account has its own provider logins and no repository credential, GitHub grant, or project environment. The Manager launches a session with purpose `replay` or `gate` only with that profile and refuses it without one (`409` `eval-identity-missing`); a `work` session never uses it. Before each trial the host stops the account's processes, removes every trial workspace, resets the account's home, and probes it. *(My call: one choke point makes "a trial never runs with production credentials" a single line to review, and a probe before each trial turns each part 4 claim into a check.)*
+
+**A replay run is a `TeamRun` with `replay` set once; `createForReplay` builds it without `createRun`, and a helper owns every difference.** `TeamService.createForReplay` stores a prepared record with one pending implementer task seeded from the capsule, and emits `run.created` (purpose `replay`, `trialId`), `plan.accepted`, and one `task.planned` with the eval task's features. The new `team-replay.ts` holds part 3's differences as closures over the service, the way `team-intent.ts` holds the intent check, so `teams.ts` grows by at most 27 lines and `createRun` does not change. A replay run never publishes, tracks Linear, captures into the corpus, asks the owner, or reaches a client list. *(My call: `createRun` checks production profiles, the team volume, missions, and delivery, none of which applies; a second `TeamService` instance would duplicate report routing, timers, and recovery in `server.ts`, which has no line to spare.)*
+
+**Only the runner report resolves a trial, and the grader grades it.** After every eval process has stopped, the host reads the member's result as a binary patch of at most 1 MiB through the eval launcher, checks its text for secret shapes, seals it, and sends it to the grader. The grader builds the grading commit on `eval-base`: the result, then from the reference the hidden files and every test file or `gradingPaths` file that either side changed. It runs `focusedTest` with the hidden files, and the guard checks only when every expected case passed. *(My call: restoring only the test files that either side changed gives the same tree as restoring every test file, because every other test file is equal in the base and the reference, and it keeps the restore list bounded.)*
+
+**Trials are off by default, and the stand-in cap is the switch.** `trialsPerDay` (1 to 50) lives in `project.team.eval`, which `routines.ts` `digestedProjectTeam` already removes before the routine authority digest and `team-prompts.ts` `withoutPrivateSettings` already drops from member contexts. `eval.member` is host configuration, and `RoutineService.authority` hashes only the project, `teams`, `source`, `linear`, and `agents`. Neither blocks a routine. A job without `trialsPerDay` is refused `409` `eval-config-incomplete`. *(My call: one setting that the standing budget later replaces is easier to retire than a switch plus a cap.)*
+
+**The member reaches only provider endpoints, through the egress boundary, and no host credential reaches the eval account.** The member's proxy credential carries the reserved egress identity `_eval`, and the proxy gives `_eval` only its own list, `projects._eval.allow`, never the global `allow`. The eval launcher receives no environment from the host (`!env_keep` in its sudo rule), so the host's `_host` proxy credential, which `teamCommandEnvironment` adds to every team command, never reaches the eval account. Setup, which installs dependencies, runs through a separate launcher operation that takes an `_eval-setup` proxy URL on standard input; that list holds the package registries, and its credential lasts 15 minutes. The recommended `eval.nft` rejects every output of the eval account except loopback. Before each trial the probe fetches the project's repository as the eval account, directly and through the proxy as `_eval`; when either succeeds, the trial is labelled `none`. *(My call: part 4 adds no egress filter, so a public repository could never be `isolated`; three in-place lines in `scripts/egress-proxy.mjs` give the label a meaning without a new service.)*
+
+## Trust boundary, and what a review checks
+
+The trial pump, the eval identity client, the replay helper, grading, the jobs, the routes, and the CLI are host code. These inputs originate outside the host:
+
+- **The trial member.** A model session as the eval identity. It writes files in its workspace and its home, reports through the team CLI (schema-checked by `teamReportSchema`), draws permission dialogs, and starts processes. Its result reaches the host only as a binary patch read through the eval launcher, at most 1 MiB. The host seals the patch, sends it to the grader, and never logs it, parses it, or writes it to a host path. The member's processes end with the stop rounds, and its home edits end with `scrub`.
+- **The repository's code at old commits.** `setup` runs as the eval identity in the trial workspace; `focusedTest` and the guard checks run as the grader in the grader's root. Neither identity holds a credential.
+- **Eval material.** The capsule (objective, steering, owner answers, brief, task) becomes the implementer's prompt through the production `teamPrompt`. The host runs `findSecret` over it before the run exists, as mining does; a match skips the task `secret-shaped`.
+- **Launcher output.** The eval probe's JSON (at most 4 KiB), `check`'s exit code, and the grader's runs and reports, as in slice 2. A refusal, a time-out, or a truncation is a failed call, never a pass.
+- **Provider output.** Limit notices, attention states, and transcripts (usage capture). A limit voids the trial; a dialog left to a person ends it `permission`.
+- **Owner configuration.** `project.team.eval` (`trialsPerDay`, `trialMinutes`, `candidateProfiles`) through the owner-only `PUT /api/projects/:id/team` or the configuration file; host `eval.member` and the egress policy through files. Strict schemas.
+- **Device roles.** Owner, controller, and viewer read the summary and the jobs: ids, enumerations, counts, and times. Only the owner creates or controls a job.
+
+**What a trial member can reach.** It runs as the eval identity in `ROOT/trials/TRIAL/work`. It has:
+
+- **No production credential.** The Manager launches it with `eval.member.agents[provider]`. The eval wrapper loads no project environment and unsets `INFINITE_GITHUB_GRANT` and `INFINITE_GITHUB_PROXY`, and a replay launch passes no GitHub scope. It holds its own hook token, which serves only its session, and an `_eval` egress credential. Test: Task 2 `a learning session launches only as the eval identity`.
+- **No later commit and no hidden test.** Its clone comes from a bundle of one branch at the replay base. Before launch, `check` proves absent the production reference commit, the integrated head, the grader's reference commit, the mirror head, and the reference blob of every hidden file, and proves that `git remote` prints nothing. Hidden material exists only in the grader's root, which the eval account cannot read. Test: Task 11 `the trial source holds only the base` (acceptance 4).
+- **No host state and no production work.** The probe proves unreadable, before each trial: the evidence database, `keyFile`, `stateDir`, `runDir`, `teams.workspaceDir`, every GitHub project's mirror, every project's checkout, `eval.grader.root`, and the owner's `eval.member.canaries` (the GitHub App, grant, egress, and vault key paths, and a canary in the agent account's home). A readable canary is `exposed`, and no trial starts. Test: Task 6 `the eval probe names every unsafe state`.
+- **No other session and no state from an earlier trial.** Before each trial the host runs up to three rounds of `stop` and the process inventory, then `clean`, then `scrub`, which resets the home from the root-owned template and keeps only the login files, then the probe, which must show no entry in `ROOT/trials` and no path in the home outside the login files and the template. Tests: Task 4 `scrub resets the home to the template`; Task 15 `no trial while the eval identity is busy` (acceptance 5).
+- **Provider endpoints only.** Its credential is `_eval`, the proxy gives `_eval` only its own list, and `eval.nft` rejects direct output. Commands the host runs in its workspace get a fixed environment with no proxy variable. Tests: Task 3 `an eval session leaves the network only for its own list`; Task 4 `the eval launcher starts commands with a fixed environment`.
+
+What stays reachable, and the docs say so: the package registries for up to 15 minutes after setup, to a process setup left running or a file holding its credential (the docs say not to list a registry that serves the project's own later releases); the shared `/tmp` (`stop` removes the eval account's files there); `/proc` command lines (the host passes no secret in an argument); loopback services, each of which needs a credential the member does not hold; the login files, which `scrub` keeps; and whatever a provider keeps for its login (owner decision 2).
+
+**What reaches the prompt and the store.** The prompt is `teamPrompt` over the capsule, with no shared project context (`withoutSharedContext`, Task 2), no blackboard tools, no head publication, and no goal. The capsule passed `findSecret`, which knows the host-issued grant and egress shapes. For a project the host permission agent serves, the agent reads up to 4,000 characters of the member's first prompt, the capsule text, as it does for any headless member. A trial row's plain columns hold ids, enumerations, counts, times, a session id, and two references (`project_ref`, `config_ref`). Sealed: the configuration, the probe facts, the grade, and the result patch. The member's session holds an egress credential, so the host runs `findSecret` over the patch text before sealing it; a match drops the patch (`patch: "secret-shaped"`) and keeps the grade. The one new log line is `Eval trials paused (CODE).`, once per code per process.
+
+The slice must survive these sequences. Each has a named test.
+
+| Sequence | Expected | Test |
+|---|---|---|
+| A host restart while the member runs, and again during grading | The trial ends `void-host`; the new process ends the replay run, stops, cleans, and resets the eval identity, and cleans the grader before any trial; the slot runs again with `attempt` plus 1 | Task 15 `a restart in the middle of a trial voids it` |
+| A host restart while the source is being prepared | The `preparing` row is dropped; no attempt is counted; the slot runs again with the same `attempt` | Task 15 `a restart in the middle of a trial voids it` |
+| `insertTrial` twice for one slot; `createForReplay` twice with one trial id | One row (`exists` the second time); one run | Task 7 `a trial moves through its states once`; Task 9 `a replay run is seeded and starts one implementer` |
+| The trial rows of one job in any order (200 seeded shuffles, 3 tasks, 3 configurations, 3 slots) | `nextSlot` returns the same slot | Task 8 `the next slot does not depend on the order of the rows` |
+| The owner cancels the job while the member runs, and while grading | `void-owner` once; a later grade writes nothing (`finishTrial` answers false) | Task 12 `cancel voids the running trial`; Task 7 `a trial moves through its states once` |
+| A void trial, three times in one slot; three voids in a row in one job | No fourth attempt; the job pauses `trial-voids` | Task 8 `a void trial runs again at most twice`; Task 12 `three voids in a row pause the job` |
+| An owner halt while the member runs | `void-owner`; the job waits `halt` | Task 9 `every member ending ends the trial with its name`; Task 12 `the job waits for every gate and says which` |
+| The result operation completes after the trial ended | Nothing changes | Task 9 `a stopped replay run ignores late completions` |
+| A validate job and a baseline job at once | One grader user at a time; no `stop` reaches the other's processes | Task 15 `validation and trials share the grader one step at a time` |
+| `trialMinutes`, `eval.member`, a validation setting, or a prompt version changes during a job | `blocked` `configuration-changed` before the next trial; `resume` pins the new digest | Task 12 `a changed configuration blocks the job` |
+| An unavailable store | No identity command runs; the tick throws nothing; the routes answer `503` `evidence-unavailable` | Task 15 `an unavailable store starts no trial` |
+| A task payload that does not open; a trial payload that does not open | The task is skipped `unreadable` before any command; the live trial ends `void-host` | Task 11 `an unreadable task starts no trial`; Task 15 `a restart in the middle of a trial voids it` |
+| The replay run's record is deleted while its member runs; the task's row is deleted during the trial | `void-host` within one step; the job moves past a task that is gone | Task 15 `a lost replay run voids its trial` |
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `packages/host/src/eval-config.ts` (modify) | `trialsPerDay`, `trialMinutes`, `candidateProfiles`; the host `eval.member` block; `trialSettings`; `evalCommandPrefix` |
+| `packages/host/src/eval-types.ts` (modify) | Trial configuration, ending, grade, state, the baseline request and view, waits, reasons, identity states, summary fields |
+| `packages/host/src/team-types.ts` (modify, +2) | `ReplayLink` and `replay?: ReplayLink` on `TeamRun` |
+| `packages/host/src/types.ts` (modify) | `LEARNING_PURPOSES` and `learningPurpose`, beside `SESSION_PURPOSES` |
+| `packages/host/src/launch.ts` (modify) | `sessionAgentProfile`, `withoutSharedContext` |
+| `packages/host/src/manager.ts` (modify, net 0) | Four in-place lines: the import, the fuse purpose, the profile, the context |
+| `packages/host/src/fuse/rules.ts` (modify) | `workLaunch` takes a purpose |
+| `packages/host/src/notifier.ts` (modify) | The session tick skips learning sessions |
+| `packages/host/src/egress.ts` (modify) | The `_eval` and `_eval-setup` identities; `evalProxyUrl` |
+| `packages/host/src/worker.ts` (modify, net 0) | One in-place line: the session purpose to `workerEgressEnvironment` |
+| `scripts/egress-proxy.mjs` (modify, net 0) | Three in-place lines: the two labels, and eval identities get only their own lists |
+| `deploy/ubuntu/eval-command.sh`, `eval-wrapper.sh`, `eval.sudoers`, `eval.nft` (create) | The eval launcher, the provider wrapper, the sudo rule, the network rule |
+| `deploy/ubuntu/grader-command.sh` (modify) | Version 2: `export`, the input `result.patch`, `"version": 2` in the probe |
+| `packages/host/src/eval-grader.ts` (modify) | `export`, the wider `GraderInput`, `GraderProbe.version` |
+| `packages/host/src/eval-identity.ts` (create) | The eval launcher client, the probe and its states, the stop rounds, the canaries |
+| `packages/host/src/eval-trial-store.ts` (create) | Evidence module `eval-trials`: trial rows, job counts, patches, the sweep |
+| `packages/host/src/eval-trial-rules.ts` (create) | Pure: grades, the restore set, the next slot, the isolation label, ending maps |
+| `packages/host/src/team-replay.ts` (create) | `TeamReplay`: seeding, prefixes, endings, settling, state |
+| `packages/host/src/teams.ts` (modify, at most +27) | `createForReplay`, `replayState`, `endReplay`, `forgetReplay`, `replayIds`, and the hooks of Task 9 |
+| `packages/host/src/config-identity.ts` (modify, net 0) | `memberConfiguration` takes `shape` |
+| `tests/fixtures/trial-agent.mjs` (create) | A fake implementer with one mode per trial ending |
+| `packages/host/src/outcome-projector.ts`, `outcome-signals.ts` (modify); `outcome-store.ts` (modify, net 0) | Source `replay`, `experiment_ref`, C5's unknown levels |
+| `packages/host/src/eval-validate.ts` (modify, at most +6) | Export the grader steps that grading reuses |
+| `packages/host/src/eval-trial.ts` (create) | The trial source and the grading of one trial |
+| `packages/host/src/eval-jobs.ts` (modify, at most +27) | Validate reads skip baseline rows; baseline views and resume digests come from `TrialJobs` |
+| `packages/host/src/eval-trial-jobs.ts` (create) | `TrialJobs`: the baseline schema, create, digest, gates, the next slot, records |
+| `packages/host/src/eval-summary.ts`, `eval-routes.ts` (modify) | The identity state, today's trials, grader version, the baseline request and view |
+| `packages/host/src/eval-cli.ts` (modify) | Status and job lines for trials |
+| `packages/host/src/eval-trial-pump.ts` (create) | The trial pump: start-up, one step, the hourly sweep |
+| `packages/host/src/eval-host.ts` (modify, at most +99) | Composition, the trial step in the validation chain, `create` by kind |
+| `packages/host/src/server.ts` (modify, net 0) | Three in-place lines: the import, the `EvalHost` options, the session list |
+| `tests/fixtures/eval-command.mjs` (create); `tests/fixtures/grader-command.mjs` (modify) | A same-user eval launcher; grader version 2 |
+| `docs/teams.md`, `docs/security.md`, `deploy/ubuntu/eval.md` (create), `deploy/ubuntu/grader.md`, `deploy/ubuntu/egress.md`, the spec | Trials, the eval identity, its installs, the amendments |
+| `tests/eval-{session,launcher,identity,trial-store,trial-rules,trial,trial-jobs,trial-run}.test.ts`, `tests/egress-eval.test.ts`, `tests/team-replay.test.ts`, `tests/outcome-replay.test.ts` (create); `tests/eval-config.test.ts`, `tests/routines.test.ts`, `tests/eval-grader.test.ts`, `tests/eval-grader-launcher.test.ts`, `tests/eval-routes.test.ts`, `tests/eval-cli.test.ts` (modify) | Pure rules, a real store, real Git, the fixture launchers, the host |
+
+`teams.ts` grows from 5,707 to at most 5,734 lines, inside its baseline of 5,747 (Task 9 lists each line). `server.ts`, `manager.ts`, `worker.ts`, and `outcome-store.ts` change only in place and keep their baselines (2,282; 1,243; 1,900; 1,382). `scripts/egress-proxy.mjs` changes three lines in place (baseline 1,359). `client.ts`, `team-cli.ts`, `missions.ts`, `goals.ts`, `tests/teams.test.ts`, and `tests/goals.test.ts` do not change. Every new source file stays under 600 lines; `eval-host.ts` grows from 371 to at most 470, `eval-jobs.ts` from 463 to at most 490, `eval-validate.ts` from 435 to at most 441.
+
+**Order and owners.** Task 1 runs first and alone. Then Tasks 2, 3, 4, 5, 6, 7, 8, 10, 14, and 16 run in parallel. Task 9 waits for Tasks 2, 3, and 6. Task 11 waits for Tasks 5, 6, 7, and 8. Task 12 waits for Tasks 7 and 8. Task 13 waits for Task 12. Task 15 waits for Tasks 9, 10, 11, 12, and 13. Each file has one writer: Task 1 alone writes `eval-config.ts`, `eval-types.ts`, `team-types.ts`, and `types.ts`; Task 2 alone `manager.ts`, `launch.ts`, `fuse/rules.ts`, and `notifier.ts` (each edit one to four lines); Task 9 alone `teams.ts`, `config-identity.ts`, and `tests/fixtures/trial-agent.mjs`; Task 11 alone `eval-validate.ts`; Task 12 alone `eval-jobs.ts`; Task 15 alone `server.ts` and `eval-host.ts`. Tasks 9, 11, and 12 build against each other's interfaces as fixed below, without talking.
+
+## Review Focus
+
+1. **A trial that sees what it must not**: a production launch profile for a learning session, a later commit or a hidden test in the workspace, a host credential in a command's environment, a file an earlier trial left in the home. Expect none. Task 2 `a learning session launches only as the eval identity`: deleting the learning branch of `sessionAgentProfile`, or restoring `this.config.agents[request.provider]` at `manager.ts:1099`, must fail it. Task 11 `the trial source holds only the base`: deleting the `identity.check` call in `prepareTrialSource` must fail it. Task 4 `prepare leaves only the base`: deleting `remote remove origin` in the launcher's `prepare` must fail it. Task 4 `the eval launcher starts commands with a fixed environment`: dropping `env -i` from `exec` must fail it. Task 4 `scrub resets the home to the template`: deleting the template copy in `scrub` must fail it.
+2. **A replay run that acts on the world or shows itself**: publication, Linear, a push, the corpus capture sink, a GitHub grant, a client list, a permission coordinator, an owner question, a production fallback switch, a held-back routine. Expect none. Task 9 `a replay run reaches no client`: deleting the `!stored.run.replay` filter in `list()`, the `!run.replay` guard before `captureIntegrated`, or the purpose filter on `limits.reconcile`'s rows must fail it. Task 2 `no learning session reaches the owner's devices`: deleting the filter in `Notifier.tick` must fail it.
+3. **A resolved grade without the report**: an exit code, a missing report, a result that rewrote the runner or a grading file. Expect not resolved, `expectedPassed` null when no report parses, and `overwritten` above 0. Task 8 `every ending grades as the design says`: deleting `expectedPassed !== null &&` in `gradeOf` must fail it. Task 11 `a grading path edit is overwritten`: dropping `gradingPaths` from `restoreSet` must fail it.
+4. **Ledger contamination**: a replay row counted as production, a replay row with `accepted`, `firstPass`, or `held` set, a replay row in a routing read. Expect source `replay`, `experiment_ref` the trial id, null levels. Task 10 `a replay run writes replay rows`: deleting the purpose branch in `runCreated`, or the `row.source === "replay"` line in `saveOutcomeRow`, must fail it.
+5. **Spend beyond the stand-in**: a trial after `maxTrials` or the day's cap, while its provider is limited, with fewer than four free slots, while halted, or a job that loops on voids. Expect a named wait or a completed job. Task 12 `a job starts no trial after its limits`: deleting the `daily-cap` gate line in `TrialJobs.next` must fail it. Task 12 `the job waits for every gate and says which`: deleting the `provider-limit` gate line must fail it.
+
+### Task 1: the settings and the shared types
+
+**Files:** `packages/host/src/eval-config.ts`, `packages/host/src/eval-types.ts`, `packages/host/src/team-types.ts` (+2), `packages/host/src/types.ts`, `tests/eval-config.test.ts`, `tests/routines.test.ts`. Runs first and alone. It may make compile-only fixes in `eval-cli.ts`, `eval-summary.ts`, `eval-routes.ts`, `eval-jobs.ts`, and `eval-host.ts` for the wider `EvalJobView` and `EvalSummary`, and reports each line.
+
+**Interfaces (produces):**
+```ts
+// types.ts, beside SESSION_PURPOSES
+export const LEARNING_PURPOSES: readonly SessionPurpose[] = ["replay", "gate"];
+export function learningPurpose(purpose: SessionPurpose | undefined): boolean;
+
+// eval-config.ts
+export const TRIALS_PER_DAY_MAX = 50, TRIAL_MINUTES_DEFAULT = 45, TRIAL_MINUTES_MIN = 10, TRIAL_MINUTES_MAX = 240,
+  CANDIDATE_PROFILES_MAX = 8, MEMBER_CANARIES_MAX = 32, EVAL_AGENT_ARGS_MAX = 64;
+// evalProjectSchema gains, all optional:
+//   trialsPerDay: z.number().int().min(1).max(TRIALS_PER_DAY_MAX)
+//   trialMinutes: z.number().int().min(TRIAL_MINUTES_MIN).max(TRIAL_MINUTES_MAX)
+//   candidateProfiles: z.array(teamModelProfileSchema).max(CANDIDATE_PROFILES_MAX)
+const evalAgentSchema = z.object({          // the AgentProfile fields
+  command: z.string().min(1).max(4096), args: z.array(z.string().max(4096)).max(EVAL_AGENT_ARGS_MAX),
+  appServerCommand: z.string().min(1).max(4096).optional(), appServerArgs: z.array(z.string().max(4096)).max(EVAL_AGENT_ARGS_MAX).optional(),
+  workspaceDir: absolutePath.optional(), sharedWorkspace: z.boolean().optional(),
+}).strict();
+const evalMemberSchema = z.object({
+  prefix: command,                     // the eval launcher
+  root: absolutePath,                  // the launcher's ROOT; trials live in ROOT/trials
+  agents: z.object({ claude: evalAgentSchema.optional(), codex: evalAgentSchema.optional(), opencode: evalAgentSchema.optional() }).strict(),
+  canaries: z.array(absolutePath).max(MEMBER_CANARIES_MAX).optional(),
+}).strict();
+export const evalHostSchema = z.object({ grader: graderSchema.optional(), member: evalMemberSchema.optional() }).strict();
+export type EvalMemberConfig = z.infer<typeof evalMemberSchema>;
+export type TrialSettings = ValidationSettings & { trialsPerDay: number; trialMinutes: number; candidateProfiles: TeamModelProfile[] };
+/** What a baseline job needs, or the first missing key in the order source, focusedTest, reportFormat, trialsPerDay. */
+export function trialSettings(project: Parameters<typeof validationSettings>[0]):
+  { settings: TrialSettings } | { missing: "source" | "focusedTest" | "reportFormat" | "trialsPerDay" };
+/** `{ command: prefix.command, args: [...prefix.args, op, "--"] }`, the TeamCommand prefix of one launcher operation. Undefined without eval.member. */
+export function evalCommandPrefix(member: EvalMemberConfig | undefined, op: "exec" | "setup"): TeamCommand | undefined;
+
+// eval-types.ts
+export type TrialConfiguration = { profile: TeamModelProfile; guidance: "as-of-base"; knowledge: "none" };
+export const TRIAL_ENDINGS = ["graded", "no-result", "escalated", "question", "blocked", "permission", "stalled",
+  "scope-violation", "timeout", "void-limit", "void-host", "void-owner"] as const;
+export type TrialEnding = typeof TRIAL_ENDINGS[number];
+export const VOID_ENDINGS: readonly TrialEnding[] = ["void-limit", "void-host", "void-owner"];
+export type TrialGrade = {
+  ending: TrialEnding;
+  expectedPassed: number | null; expectedTotal: number;
+  guardPassed: boolean | null;
+  resolved: boolean;
+  overwritten: number;
+  diff: { added: number; removed: number; referenceAdded: number; referenceRemoved: number } | null;
+  isolation: "isolated" | "none";
+};
+export type TrialState = "preparing" | "running" | "grading" | "final";
+export type EvalIdentityState = "not-configured" | "unavailable" | "misconfigured" | "exposed" | "network-open" | "busy" | "ready";
+export type BaselineJobRequest = {
+  kind: "baseline";
+  configurations: TrialConfiguration[];
+  taskFilter?: { taskIds?: string[]; origins?: EvalOrigin[]; areas?: string[]; maxTasks?: number };
+  trialsPerTask?: number;
+  limits: { maxTrials: number; maxWallMinutes: number };
+  windows?: { startHourUtc: number; endHourUtc: number }[];
+  expiresAt?: string;
+};
+/** The current EvalJobView, renamed. */
+export type ValidateJobView = { jobId: string; projectId: string | null; kind: "validate"; status: RoutineStatus; reason: EvalJobReason | null;
+  waiting: EvalJobWait | null; createdAt: string; startedAt: string | null; expiresAt: string; finishedAt: string | null;
+  counts: { visited: number; valid: number; rejected: number; retired: number; undecided: number } };
+export type BaselineJobView = Omit<ValidateJobView, "kind" | "counts"> & {
+  kind: "baseline";
+  tasks: { planned: number; reached: number; skipped: number };
+  trials: { planned: number; started: number; graded: number; resolved: number; ended: number; void: number };
+  dailyCap: number | null;
+};
+export type EvalJobView = ValidateJobView | BaselineJobView;
+// EvalJobReason gains "trial-voids" | "eval-processes-alive".
+// EvalJobWait gains "eval-identity" | "provider-limit" | "session-slots" | "daily-cap".
+// EvalRefusal's codes gain "profile-not-approved" (409).
+// EvalSummary: grader { state } gains version: number | null; the summary gains
+//   evalIdentity: { state: EvalIdentityState } and trials: { today: number; dailyCap: number | null }.
+// EvalHostApi.create takes request: ValidateJobRequest | BaselineJobRequest.
+
+// team-types.ts, beside missionId on TeamRun:
+export type ReplayLink = { jobId: string; trialId: string; purpose: "replay" | "gate"; ending?: TrialEnding; resultCommit?: string; resetsAt?: string };
+//   /** Set once by createForReplay. Stripped from every TeamView. */ replay?: ReplayLink;
+```
+
+**Decisions:**
+
+- `trialSettings` returns `validationSettings`' answer when it misses a key, then requires `trialsPerDay`; `trialMinutes` defaults to 45 and `candidateProfiles` to `[]`.
+- `eval.member.agents` admits Claude Code, Codex, and OpenCode only; Grok and Demo have no eval launch.
+- `ValidateJobView` is the current `EvalJobView` unchanged; code that reads `counts` narrows on `kind`.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `the trial settings parse with their limits` (`tests/eval-config.test.ts`) | `trialsPerDay` 0 and 51, `trialMinutes` 9 and 241, nine `candidateProfiles`: refused. `eval.member` with an unknown key, a relative `root`, or `agents.grok`: refused. `trialSettings` without `trialsPerDay`: `{ missing: "trialsPerDay" }`; with it: `trialMinutes` 45. `evalCommandPrefix(member, "setup")` ends its arguments with `"setup", "--"`. `learningPurpose("replay")` and `("gate")` are true; `("work")` and `(undefined)` false. |
+| `trial settings leave the routine digest alone` (`tests/routines.test.ts`) | Adding `trialsPerDay`, `trialMinutes`, and `candidateProfiles` under `project.team.eval`, and `eval.member` to the host configuration, leaves `RoutineService.authority`'s digest unchanged, and an implementer's `teamPrompt` text unchanged. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/eval-config.test.ts tests/routines.test.ts` and the typecheck.
+
+### Task 2: the learning session in the Manager and the notifier
+
+**Files:** `packages/host/src/launch.ts`, `packages/host/src/manager.ts` (net 0), `packages/host/src/fuse/rules.ts`, `packages/host/src/notifier.ts`, `tests/eval-session.test.ts`. Needs Task 1.
+
+**Interfaces (produces):**
+```ts
+// launch.ts
+/** eval.member.agents[provider] for a learning purpose, else config.agents[provider]. Throws TeamError 409
+ * "eval-identity-missing" for a learning purpose without an eval profile for the provider. */
+export function sessionAgentProfile(config: Pick<Config, "agents" | "eval">, provider: Provider, purpose: SessionPurpose | undefined): AgentProfile | undefined;
+/** For a learning purpose, the snapshot with `text: ""` and `sources: []`: today's text is not the text of the work's time. */
+export function withoutSharedContext<T extends { text: string; sources: readonly unknown[] }>(context: T, purpose: SessionPurpose | undefined): T;
+// fuse/rules.ts: workLaunch's input gains `purpose?: SessionPurpose`; the result's purpose is `input.purpose ?? "work"`.
+```
+
+**Decisions:** `manager.ts`, all its lines in this slice, each in place, inside `createRecorded`, where `request.purpose` is already set (line 1110):
+- Line 36, `import { missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";`, adds `sessionAgentProfile` and `withoutSharedContext`.
+- Line 1091, `workLaunch({ launchId: id, projectId: request.projectId, provider: request.provider, team: request.team, profile: request.teamModelProfile })`, adds `purpose: request.purpose`.
+- Line 1099, `const configuredProfile = this.config.agents[request.provider];`, becomes `const configuredProfile = sessionAgentProfile(this.config, request.provider, request.purpose);`. Line 1100's "Provider is not configured" check stays.
+- Line 1105, `const context = new ProjectContexts(this.config, this.key).snapshot(request.projectId);`, becomes `const context = withoutSharedContext(new ProjectContexts(this.config, this.key).snapshot(request.projectId), request.purpose);`. With empty text, line 1161's `Shared project context` block is not rendered.
+
+`teamModelLaunch` applies the model selection to the eval profile as to the production one, so the eval wrapper receives the same model flags. The worker receives the chosen profile (`worker.ts` line 86), so `drainLaunch` derives the drain from the eval wrapper's directory: `eval/transcript-drain`, as the eval account.
+
+`notifier.ts` line 93, `const rows = (await this.manager.list()) as unknown as Row[];`, becomes a list filtered by `!learningPurpose(row.purpose)`, plus its import line. The team lifecycle rows already come from `teams.statuses()`, which Task 9 filters.
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-session.test.ts`, with a real Manager, a temporary state directory, and fake agent scripts as both profiles.
+
+| Test name | Assertions |
+|---|---|
+| `a learning session launches only as the eval identity` | `createTeamSession(…, { purpose: "replay" })` with `eval.member.agents.claude` set: the worker spawns the eval profile's command, never `config.agents.claude`'s. Without `eval.member`: `409` `eval-identity-missing`, and no session directory exists. Purpose `work` with `eval.member` set: the production command. The fuse's launch row records purpose `replay`. |
+| `a learning session gets no shared project context` | With a project context set: a `replay` session's `initialPrompt` holds no `Shared project context`, and its `contextSources` is empty; a `work` session's holds both. |
+| `no learning session reaches the owner's devices` | A `Notifier` over a fake manager that lists a `replay` session and a `work` session, both in `needs-you`, one registered device, and a recording sender: one message, for the `work` session. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/eval-session.test.ts tests/fuse-rules.test.ts tests/push.test.ts`, `node scripts/check-file-size.mjs`, and the typecheck.
+
+### Task 3: the eval egress identities
+
+**Files:** `packages/host/src/egress.ts`, `packages/host/src/worker.ts` (net 0), `scripts/egress-proxy.mjs` (net 0), `tests/egress-eval.test.ts`. Needs Task 1.
+
+**Interfaces (produces):**
+```ts
+export const EVAL_EGRESS_PROJECT = "_eval", EVAL_SETUP_EGRESS_PROJECT = "_eval-setup",
+  EVAL_SETUP_CREDENTIAL_SECONDS = 900, EVAL_PROBE_CREDENTIAL_SECONDS = 60;
+export function sessionEgressIdentity(projectId: string | undefined, sessionId: string, purpose?: SessionPurpose): EgressIdentity;
+export function workerEgressEnvironment(projectId: string | undefined, sessionId: string, env?: NodeJS.ProcessEnv, nowMs?: number, purpose?: SessionPurpose):
+  { status: "off" | "on" | "no-key" | "invalid"; env: Record<string, string> };
+/** The proxy URL with a fresh credential for an eval identity, from the state installHostEgress set up: undefined without
+ *  the boundary; the URL with no credential (every request refused) when the key cannot be read. */
+export function evalProxyUrl(project: "_eval" | "_eval-setup", session: string, lifetimeSeconds: number, nowMs?: number): string | undefined;
+```
+
+**Decisions:**
+- `sessionEgressIdentity` returns `{ project: "_eval", session }` when `learningPurpose(purpose)`. `egress.ts` line 26, `EGRESS_PROJECT`, admits `_eval` and `_eval-setup` in place.
+- `worker.ts` line 1672, `const egress = workerEgressEnvironment(session.projectId, session.id);`, becomes `const egress = workerEgressEnvironment(session.projectId, session.id, process.env, Date.now(), session.purpose);`.
+- `scripts/egress-proxy.mjs`, each in place: line 17, `PROJECT_LABEL`, and line 18, `CREDENTIAL`, add `_eval|_eval-setup` beside `_host|_none`. Line 903, `const listed = listedIn(current.allow, target) || listedIn(current.projects.get(identity.project), target);`, becomes `const listed = (!identity.project.startsWith("_eval") && listedIn(current.allow, target)) || listedIn(current.projects.get(identity.project), target);`. In `observe` mode the proxy still allows and records; the probe's fetch then succeeds, and trials are labelled `none`.
+
+- [ ] **Step 1: Write the failing test** in `tests/egress-eval.test.ts`.
+
+| Test name | Assertions |
+|---|---|
+| `an eval session leaves the network only for its own list` | Policy `{ mode: "enforce", allow: ["registry.example"], projects: { _eval: { allow: ["api.example"] }, "_eval-setup": { allow: ["packages.example"] } } }`: an `_eval` credential reaches `api.example` and is refused `registry.example` and `packages.example`; an `_eval-setup` credential reaches only `packages.example`, and is refused once its 900 seconds have passed; a project credential reaches `registry.example`. Without `projects._eval`, an `_eval` credential reaches nothing. `workerEgressEnvironment(…, "replay")` mints identity `_eval`; `"work"` keeps the project. |
+
+- [ ] **Step 2: Run the test and confirm it fails.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/egress-eval.test.ts tests/egress-proxy.test.ts` and `node scripts/check-file-size.mjs`.
+
+### Task 4: the eval launcher template
+
+**Files:** `deploy/ubuntu/eval-command.sh`, `deploy/ubuntu/eval-wrapper.sh`, `deploy/ubuntu/eval.sudoers`, `deploy/ubuntu/eval.nft`, `tests/eval-launcher.test.ts`. Needs Task 1.
+
+**Interfaces (produces):** the launcher's argument contract, which Task 6's fixture also follows:
+```text
+eval-command probe [--fetch URL] -- [CANARY...]   # with --fetch, stdin's first line is the proxy URL or empty; JSON on stdout, at most 4 KiB
+eval-command receive TRIAL MAXBYTES               # stdin to ROOT/trials/TRIAL/in/base.bundle
+eval-command prepare TRIAL                        # the trial clone in ROOT/trials/TRIAL/work
+eval-command check TRIAL -- OBJECT...             # 0: no object exists and `git remote` prints nothing; 1: otherwise
+eval-command exec -- COMMAND [ARG...]             # in the caller's cwd, under ROOT/trials/TRIAL/work; a fixed environment
+eval-command setup -- COMMAND [ARG...]            # as exec, plus the proxy URL from stdin's first line; the child's stdin is /dev/null
+eval-command stop                                 # every process of the account, then its files in /tmp, /var/tmp, /dev/shm
+eval-command clean                                # every entry of ROOT/trials
+eval-command scrub                                # the home reset to TEMPLATE, keeping LOGIN_PATHS
+TRIAL   ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+OBJECT  ^[0-9a-f]{40}$|^[0-9a-f]{64}$, at most 200
+```
+
+**Decisions:**
+- **Constants** at the top, edited at install: `ROOT=/var/lib/infinite-eval/root`, `ACCOUNT=infinite-eval`, `EVAL_HOME=/var/lib/infinite-eval/home`, `TEMPLATE=/usr/local/share/infinite-eval/home`, and `LOGIN_PATHS`, relative to `EVAL_HOME`: `.claude/.credentials.json`, `.codex/auth.json`, `.local/share/opencode/auth.json`. Every operation first checks `[ "$(/usr/bin/id -un)" = "$ACCOUNT" ]` and a non-root caller, and exits 64 otherwise. `PATH=/usr/bin:/bin`; tools by absolute path; `umask 077`. `ROOT` must be a directory of mode `0711` owned by the caller.
+- **Modes.** `ROOT/trials`, `ROOT/trials/TRIAL`, and `ROOT/trials/TRIAL/work` are `0711`, so the host can resolve and enter the member's working directory without listing it; everything else is `0700` or `0600`.
+- **`prepare`**: `git clone --quiet --template= --no-checkout --branch trial -- in/base.bundle work`; `git -C work remote remove origin`; `git -C work -c advice.detachedHead=false checkout --quiet --detach trial`; `git -C work branch -D trial`; `rm -rf in`; `chmod 0711 work`. Git runs with `GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1`, 600 seconds.
+- **`check`** runs `git -C work cat-file -e OBJECT` for each object and `git -C work remote`; 60 seconds.
+- **`exec`** resolves `realpath -e .`, requires `ROOT/trials/TRIAL/work` or below it, and runs the command as `env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=$EVAL_HOME TMPDIR=ROOT/trials/TRIAL/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1`, under `prlimit --nproc=512 --fsize=4294967296 --core=0 --nofile=4096` and `timeout --kill-after=10 3600`, and exits with the child's status (124 at the limit). Team commands pass their Git identity as `-c` arguments (`team-workspace.ts` line 33), so the fixed environment keeps commits working. **`setup`** reads stdin's first line (at most 2 KiB), and when it is not empty adds `HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`, and `http_proxy` with that value and `NO_PROXY=localhost,127.0.0.1,::1`.
+- **`probe`** prints `{ version: 1, uid, root, rootMode, rootOwner, readable: boolean[], metadata, freeBytes, freeInodes, ancestorsWritable, tools, trials, leftovers, fetch }`. `trials` counts the entries of `ROOT/trials`. `leftovers` counts the paths under `EVAL_HOME` that are neither a `LOGIN_PATHS` entry, a directory on the way to one, nor a `TEMPLATE` path, plus the `TEMPLATE` files whose bytes differ (`cmp`), reading at most 10,000 paths and answering 10,000 past that. `fetch` is `skipped` without `--fetch`, else `open` when `timeout 15 git ls-remote --exit-code -- URL HEAD` succeeds once with no proxy variable or once with the stdin proxy URL, and `refused` otherwise.
+- **`stop`** is the grader's: `kill -KILL -1`, one second, then `find -xdev -user` removal in `/tmp`, `/var/tmp`, `/dev/shm`. **`clean`** removes every entry of `ROOT/trials`, 600 seconds. **`scrub`** removes every path under `EVAL_HOME` except `LOGIN_PATHS`, then `cp -R TEMPLATE/. EVAL_HOME/`; 60 seconds. The owner builds `TEMPLATE` after the eval logins (see "Owner approvals"), so provider settings, hooks, MCP servers, skills, and memory files return to the owner's choice before every trial.
+- **`eval-wrapper.sh`**, installed as `/usr/local/libexec/infinite/eval/{claude,codex,codex-app-server,opencode}`: `agent-wrapper.sh` without `agent-env.sh`, the pnpm store, and the corepack cache, with `TMPDIR=/var/lib/infinite-eval/tmp`, and `unset INFINITE_GITHUB_GRANT INFINITE_GITHUB_PROXY` first. The Claude trust step and the Codex `--no-daemon` stay.
+- **`eval.sudoers`**, installed as `/etc/sudoers.d/infinite-eval`: `Defaults!/usr/local/libexec/infinite/eval-command !env_keep` (a command default, applied after the `infinite-host` user default, so the launcher receives none of the host's variables, including the `_host` proxy credential that `teamCommandEnvironment` adds); `infinite-host ALL=(infinite-eval) NOPASSWD: /usr/local/libexec/infinite/eval-command`; `infinite-host ALL=(infinite-eval) NOPASSWD: /usr/local/libexec/infinite/eval/claude *, /usr/local/libexec/infinite/eval/codex *, /usr/local/libexec/infinite/eval/codex-app-server *, /usr/local/libexec/infinite/eval/opencode *`; `infinite-host ALL=(infinite-eval) NOPASSWD: /usr/local/libexec/infinite/eval/transcript-drain ""`. `infinite.sudoers` does not change; its `Defaults:infinite-host env_keep` lists already carry the session's hook and `_eval` proxy variables to the wrappers.
+- **`eval.nft`**: one table that accepts the eval account's output on `lo` and rejects the rest, IPv4 and IPv6. Its header says it requires `autonomy.boundary.egress`, because without the proxy the provider is unreachable.
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-launcher.test.ts`. They run the real script, copied into a temporary directory with `ROOT`, `ACCOUNT`, `EVAL_HOME`, and `TEMPLATE` rewritten to the current user's temporary paths, and skip off Linux and as root. They never call `stop` with `ACCOUNT` rewritten.
+
+| Test name | Assertions |
+|---|---|
+| `the eval launcher starts commands with a fixed environment` | With `INFINITE_HOOK_TOKEN`, `INFINITE_GITHUB_GRANT`, and `HTTPS_PROXY` set by the caller: `exec -- /usr/bin/env` in a trial's `work` prints exactly the fixed list. `setup -- /usr/bin/env` with stdin `http://u:p@127.0.0.1:9/` prints the fixed list plus the four proxy variables with that value and `NO_PROXY`; with an empty stdin line, the fixed list. |
+| `the eval launcher confines every operation to its root` | `exec` with a cwd outside `ROOT/trials/*/work`, `receive` with a TRIAL that is not a UUID, `check` with an object that is not hex, and a `work` replaced by a link: exit 64, nothing written outside the root. `clean` leaves `ROOT/trials` empty. |
+| `scrub resets the home to the template` | A home with `.claude/.credentials.json`, a changed `.claude/settings.json`, a new `.claude/skills/x/SKILL.md`, and `.claude/projects/p/1.jsonl`, and a template with the original `.claude/settings.json`: after `scrub`, the credentials file is unchanged, the settings file equals the template's, and the other two are gone; `probe` reports `leftovers` 0 before and 2 after a planted file and a changed template file. |
+| `prepare leaves only the base` | From a repository where C2 follows C1, a bundle of branch `trial` at C1. After `receive` and `prepare`: `check TRIAL -- C2` exits 0, `git remote` prints nothing, and `in/` is gone. After the test fetches C2 into `work` by path: `check TRIAL -- C2` exits 1. |
+| `stop refuses another account` | `stop` with `ACCOUNT` set to another name exits 64, and a `sleep` the test started still runs. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/eval-launcher.test.ts` on a Linux host; the coordinator runs it in a Linux container as a non-root user and records the result.
+
+### Task 5: the grader launcher, version 2
+
+**Files:** `deploy/ubuntu/grader-command.sh`, `packages/host/src/eval-grader.ts`, `tests/fixtures/grader-command.mjs`, `tests/eval-grader-launcher.test.ts`, `tests/eval-grader.test.ts`. Needs Task 1.
+
+**Interfaces (produces):**
+```text
+grader-command export JOB      # stdout: `git bundle create - refs/heads/trial` in ROOT/jobs/JOB/work/task; 600 seconds
+NAME   base.bundle | base-delta.patch | reference.patch | result.patch
+probe  JSON gains "version": 2
+```
+```ts
+export const EXPORT_SECONDS = 600;
+export type GraderInput = "base.bundle" | "base-delta.patch" | "reference.patch" | "result.patch";
+export type GraderProbe = { state: GraderState; uid?: number; storage?: boolean; version?: number };
+// Grader gains:
+export(job: string, sink: Writable, maxBytes: number): Promise<"exported" | "too-large" | "failed">;
+```
+
+**Decisions:** `export` runs under the launcher's `run` environment and limits, from `work/task`, and refuses when `refs/heads/trial` is missing (exit 2). The client counts bytes and destroys the stream past `maxBytes`. A version 1 probe has no `version`; the client reports it undefined, and validation runs as before.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `the grader exports only the trial branch` (launcher, Linux) | After `run` makes `refs/heads/trial` at C1 in `task`, whose clone also holds C2: `export JOB` writes a bundle whose `git bundle list-heads` shows only `refs/heads/trial`, and a clone of it lacks C2. `receive JOB result.patch 10` stores 10 bytes. `probe` prints `"version":2`. |
+| `export keeps its limit` (client, fixture) | An export over a shortened `maxBytes`: `too-large`, and the sink got at most `maxBytes`. A version 1 fixture probe: `version` undefined. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/eval-grader.test.ts`, and `tests/eval-grader-launcher.test.ts` on a Linux host.
+
+### Task 6: the eval identity client
+
+**Files:** `packages/host/src/eval-identity.ts`, `tests/fixtures/eval-command.mjs`, `tests/eval-identity.test.ts`. Needs Task 1; the launcher contract is fixed in Task 4.
+
+**Interfaces (produces):**
+```ts
+export const EVAL_PROBE_SECONDS = 45, EVAL_RECEIVE_SECONDS = 600, EVAL_PREPARE_SECONDS = 600, EVAL_CHECK_SECONDS = 60, EVAL_STOP_SECONDS = 30,
+  EVAL_CLEAN_SECONDS = 600, EVAL_SCRUB_SECONDS = 60, EVAL_GRACE_MS = 30_000, EVAL_PROBE_MAX = 4_096,
+  EVAL_FREE_BYTES_MIN = 10_737_418_240, EVAL_FREE_INODES_MIN = 200_000, CHECK_OBJECTS_MAX = 200;
+export type EvalProbe = { state: EvalIdentityState; uid?: number; storage?: boolean; fetch?: "refused" | "open" | "skipped" };
+export interface EvalIdentity {
+  probe(input: { canaries: readonly string[]; graderUid?: number; fetchUrl?: string; proxyUrl?: string }): Promise<EvalProbe>;
+  receive(trial: string, input: Readable, maxBytes: number): Promise<"stored" | "too-large" | "failed">;
+  prepare(trial: string): Promise<"ready" | "failed">;
+  check(trial: string, objects: readonly string[]): Promise<"clean" | "leaked" | "failed">;
+  teamPrefix(): TeamCommand | undefined;    // evalCommandPrefix(member, "exec")
+  setupPrefix(): TeamCommand | undefined;   // evalCommandPrefix(member, "setup")
+  stop(): Promise<boolean>;
+  clean(): Promise<boolean>;
+  scrub(): Promise<boolean>;
+}
+export function launcherEvalIdentity(config: () => EvalMemberConfig | undefined, options?: { hostUid?: number; graceMs?: number }): EvalIdentity;
+/** Up to three rounds of stop and inventory, one second apart. */
+export function stopEvalIdentity(identity: EvalIdentity, uid: number, inventory?: () => Promise<RuntimeProcess[]>): Promise<"stopped" | "alive" | "failed">;
+/** The evidence database, keyFile, stateDir, runDir, teams.workspaceDir, each GitHub mirror, each project path, eval.grader.root, then eval.member.canaries. */
+export function evalCanaries(config: Config, source: Pick<ProjectSourceService, "mirrorPath">): string[];
+/** `config.source.remoteOverrides[projectId]`, else `https://github.com/REPOSITORY.git`. */
+export function repositoryUrl(config: Pick<Config, "source">, projectId: string, repository: string): string;
+```
+
+**Decisions:**
+- **Spawning** follows `launcherGrader`: no shell; env `PATH` and `LANG` only; the probe's proxy URL goes on stdin, never in an argument or the environment; one call at a time except `stop`; a call that outlives its limit plus 30 seconds is `failed` and holds the channel until the child closes.
+- **The probe's states**, in this order: no `eval.member`: `not-configured`; a launcher failure or output that does not parse: `unavailable`; `uid` equal to the host's, to 0, or to `graderUid`, `root` other than the configured one, `rootOwner` other than `uid`, `rootMode` other than `711`, `ancestorsWritable`, or `tools` false: `misconfigured`; any readable canary: `exposed`; `metadata` `open`: `network-open`; `trials` or `leftovers` above 0: `busy`; otherwise `ready`, with `storage` (the free-space minimums) and `fetch`.
+- **`stopEvalIdentity`** is `stopGrader`'s rule for the eval uid. The host runs `stop` only after a probe in this process answered a state other than `not-configured`, `unavailable`, or `misconfigured`.
+- **The fixture** takes `--root DIR --uid N --home DIR --template DIR --metadata open|closed --fetch open|refused --record FILE` before the operation, implements every operation as the current user, records each argv line, and runs `exec` and `setup` in their cwd after the same path check.
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-identity.test.ts`, with the fixture.
+
+| Test name | Assertions |
+|---|---|
+| `the eval probe names every unsafe state` | No config: `not-configured`. A prefix that exits 1: `unavailable`. `--uid` equal to the host's or to `graderUid`, mode `0700`, a writable ancestor: `misconfigured`. A readable canary: `exposed` (mode `0000` passes; skipped as root). `--metadata open`: `network-open`. One entry in `trials`, or a planted file in the home: `busy`. Otherwise `ready`; `--fetch open` gives `ready` with `fetch: "open"`. The recorded probe line never holds the proxy URL. |
+| `a surviving eval process blocks trials` | An inventory that keeps one row of the eval uid: `alive` after three stops. One that empties after the second: `stopped`. |
+| `replay commands run only through exec and setup` | `teamCommand({ command: "git", args: ["status"] }, work, …, identity.teamPrefix())` records `exec -- git status` with cwd `work`; `identity.setupPrefix()` records `setup -- …`; a cwd outside the trials root is refused. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/eval-identity.test.ts` and the typecheck.
+
+### Task 7: the trial store
+
+**Files:** `packages/host/src/eval-trial-store.ts`, `tests/eval-trial-store.test.ts`. Needs Task 1.
+
+**Interfaces (produces):**
+```ts
+export const EVAL_TRIALS_MODULE = "eval-trials", TRIAL_KEEP_DAYS_DEFAULT = 365, TRIAL_PATCH_KEEP_DAYS = 90,
+  TRIAL_PATCH_MAX_BYTES = 1_048_576, TRIAL_PATCHES_HOST_MAX_BYTES = 268_435_456, TRIAL_SWEEP_BATCH = 100, LIVE_TRIALS_MAX = 8;
+export const SCHEMA_TRIALS_V1 = [
+  `CREATE TABLE IF NOT EXISTS eval_trials (trial_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, task_id TEXT NOT NULL, project_ref TEXT NOT NULL,
+    config_ref TEXT NOT NULL, config_id TEXT, profile_epoch INTEGER, harness INTEGER NOT NULL, slot INTEGER NOT NULL, attempt INTEGER NOT NULL,
+    state TEXT NOT NULL, ending TEXT, resolved INTEGER, isolation TEXT, session_id TEXT, created_at TEXT NOT NULL, started_at TEXT,
+    ended_at TEXT, expires_at TEXT NOT NULL, payload TEXT NOT NULL, UNIQUE (job_id, task_id, config_ref, slot, attempt))`,
+  "CREATE INDEX IF NOT EXISTS eval_trials_job ON eval_trials (job_id, task_id, config_ref, slot, attempt)",
+  "CREATE INDEX IF NOT EXISTS eval_trials_live ON eval_trials (state, created_at) WHERE state != 'final'",
+  "CREATE INDEX IF NOT EXISTS eval_trials_project_day ON eval_trials (project_ref, created_at)",
+  "CREATE INDEX IF NOT EXISTS eval_trials_expiry ON eval_trials (expires_at)",
+  "CREATE INDEX IF NOT EXISTS eval_trials_sessions ON eval_trials (ended_at) WHERE session_id IS NOT NULL",
+  `CREATE TABLE IF NOT EXISTS eval_trial_counts (job_id TEXT PRIMARY KEY, planned_tasks INTEGER NOT NULL, planned_trials INTEGER NOT NULL,
+    tasks INTEGER NOT NULL DEFAULT 0, skipped INTEGER NOT NULL DEFAULT 0, started INTEGER NOT NULL DEFAULT 0, graded INTEGER NOT NULL DEFAULT 0,
+    resolved INTEGER NOT NULL DEFAULT 0, ended INTEGER NOT NULL DEFAULT 0, voided INTEGER NOT NULL DEFAULT 0, void_streak INTEGER NOT NULL DEFAULT 0)`,
+  `CREATE TABLE IF NOT EXISTS eval_trial_patches (trial_id TEXT PRIMARY KEY, bytes INTEGER NOT NULL, stored_at TEXT NOT NULL, expires_at TEXT NOT NULL, payload TEXT NOT NULL)`,
+  "CREATE INDEX IF NOT EXISTS eval_trial_patches_expiry ON eval_trial_patches (expires_at)",
+  "CREATE TABLE IF NOT EXISTS eval_trial_totals (id INTEGER PRIMARY KEY CHECK (id = 1), patch_bytes INTEGER NOT NULL)",
+];
+export const LIVE_TRIALS_SQL = "SELECT trial_id, job_id, task_id, state FROM eval_trials WHERE state != 'final' ORDER BY state, created_at LIMIT 8";
+export const JOB_SLOTS_SQL = "SELECT task_id, config_ref, slot, attempt, state, ending FROM eval_trials WHERE job_id = ? AND task_id = ?";
+export const JOB_TRIALS_SQL = "SELECT count(*) AS n FROM eval_trials WHERE job_id = ?";
+export const PROJECT_DAY_SQL = "SELECT count(*) AS n FROM eval_trials WHERE project_ref = ? AND created_at >= ?";
+export const TRIALS_EXPIRED_SQL = "SELECT trial_id FROM eval_trials WHERE expires_at < ? ORDER BY expires_at LIMIT ?";
+export const PATCHES_EXPIRED_SQL = "SELECT trial_id, bytes FROM eval_trial_patches WHERE expires_at < ? ORDER BY expires_at LIMIT ?";
+export const TRIAL_SESSIONS_SQL = "SELECT trial_id, session_id FROM eval_trials WHERE session_id IS NOT NULL AND ended_at < ? ORDER BY ended_at LIMIT ?";
+export type TrialPayload = { projectId: string; taskId: string; configuration: TrialConfiguration;
+  probes?: { fetch: "refused" | "open" | "skipped"; sourceClean: boolean }; grade?: TrialGrade;
+  patch?: "stored" | "too-large" | "secret-shaped" | "dropped" };
+export type TrialRow = { trialId: string; jobId: string; taskId: string; projectRef: string; configRef: string; configId: string | null;
+  profileEpoch: number | null; harness: number; slot: number; attempt: number; state: TrialState; ending: TrialEnding | null;
+  resolved: boolean | null; isolation: "isolated" | "none" | null; createdAt: string; startedAt: string | null; endedAt: string | null; payload: TrialPayload };
+export type NewTrial = Pick<TrialRow, "trialId" | "jobId" | "taskId" | "configRef" | "harness" | "slot" | "attempt"> &
+  { projectId: string; configuration: TrialConfiguration; keepDays: number };
+export type TrialFinal = { grade: TrialGrade; configId: string | null; profileEpoch: number | null; sessionId: string | null;
+  probes?: TrialPayload["probes"]; patch?: Buffer | "too-large" | "secret-shaped"; patchKeepDays: number };
+export type TrialCounts = { plannedTasks: number; plannedTrials: number; tasks: number; skipped: number;
+  started: number; graded: number; resolved: number; ended: number; void: number; voidStreak: number };
+export function evalTrialsModule(store: EvidenceStore, now: () => string): EvidenceModule;
+export function openTrialCounts(tx: EvidenceTx, jobId: string, planned: { tasks: number; trials: number }): void;
+export function insertTrial(tx: EvidenceTx, trial: NewTrial, at: string): "inserted" | "exists";
+export function dropTrial(tx: EvidenceTx, trialId: string): boolean;                         // only a `preparing` row
+export function startTrial(tx: EvidenceTx, trialId: string, at: string): boolean;            // preparing → running
+export function gradingTrial(tx: EvidenceTx, trialId: string, at: string): boolean;          // running → grading
+export function finishTrial(tx: EvidenceTx, trialId: string, final: TrialFinal, at: string): boolean;   // running or grading → final
+export function advanceTask(tx: EvidenceTx, jobId: string, skipped: boolean): void;          // tasks + 1, and skipped + 1 when skipped
+export function clearTrialSession(tx: EvidenceTx, trialId: string): void;
+export function readTrial(db: EvidenceDb, trialId: string): TrialRow | undefined;            // throws EvidenceError "unreadable" for a payload that does not open
+export function liveTrials(db: EvidenceDb): Pick<TrialRow, "trialId" | "jobId" | "taskId" | "state">[];
+export function jobSlots(db: EvidenceDb, jobId: string, taskId: string): SlotRow[];
+export function jobTrialCount(db: EvidenceDb, jobId: string): number;
+export function trialsSince(db: EvidenceDb, projectRef: string, since: string): number;
+export function trialCounts(db: EvidenceDb, jobIds: readonly string[]): Map<string, TrialCounts>;   // one statement, primary key, at most 100 ids
+export function trialSessions(db: EvidenceDb, endedBefore: string, limit: number): { trialId: string; sessionId: string }[];
+export function sweepTrials(tx: EvidenceTx, now: string): number;
+```
+
+**Decisions:**
+- `project_ref` is `tx.index("project", projectId)`; `config_ref` is `configRef(configuration)` (Task 8); `expires_at` is `created_at` plus `keepDays`, the project's `retentionDays ?? 365`. The payload is sealed with context `eval-trial:TRIAL`; a patch with `eval-trial-patch:TRIAL`. `session_id` holds an id only.
+- `finishTrial` writes only from `running` or `grading`. In one transaction it sets `state` `final`, `ending`, `resolved`, `isolation`, `config_id`, `profile_epoch`, `session_id`, `ended_at`, the payload's grade and probes, and the counters: `graded`, and `resolved` when resolved, for `graded`; `ended` for the other non-void endings; `voided` for void endings. `void_streak` grows by 1 on a void and returns to 0 otherwise. A patch is stored when it is a buffer of at most 1 MiB and the host total stays at or under 256 MiB; otherwise the payload says `too-large` or `dropped`. `started` grows in `startTrial`. `dropTrial` changes no counter.
+- `sweepTrials` deletes at most 100 expired trials and 100 expired patches per call, keeps `eval_trial_totals` exact, and deletes at most 100 `eval_trial_counts` rows whose job is gone from `eval_jobs`.
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-trial-store.test.ts`, on a real store.
+
+| Test name | Assertions |
+|---|---|
+| `trial rows keep every text sealed` | A trial whose capsule objective is `Objective-7f3a` and whose patch holds `secret-name`: no plain column of the four tables contains either string or a profile model name. |
+| `a trial moves through its states once` | `insertTrial` twice: `inserted`, then `exists`. `dropTrial` removes a `preparing` row and refuses a `running` one. `startTrial`, `gradingTrial`, `finishTrial`: true each; a second `finishTrial`: false, and the row is unchanged. The counters match each step; three voids give `voidStreak` 3, a graded trial after them 0. |
+| `the patch caps hold` | A patch of 1 MiB plus 1 byte: `too-large`, no patch row. With the total at 256 MiB minus 10 bytes, a 20-byte patch: `dropped`. The total equals the sum of `bytes` after a sweep. |
+| `the hot statements read through an index` | `EXPLAIN QUERY PLAN` of `LIVE_TRIALS_SQL`, `JOB_SLOTS_SQL`, `JOB_TRIALS_SQL`, `PROJECT_DAY_SQL`, `TRIALS_EXPIRED_SQL`, `PATCHES_EXPIRED_SQL`, and `TRIAL_SESSIONS_SQL` uses `eval_trials_live`, `eval_trials_job`, `eval_trials_job`, `eval_trials_project_day`, `eval_trials_expiry`, `eval_trial_patches_expiry`, and `eval_trials_sessions`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/eval-trial-store.test.ts` and the typecheck.
+
+### Task 8: the trial rules
+
+**Files:** `packages/host/src/eval-trial-rules.ts`, `tests/eval-trial-rules.test.ts`. Needs Task 1. Pure, no I/O.
+
+**Interfaces (produces):**
+```ts
+export const TRIAL_HARNESS_VERSION = 1, VOID_ATTEMPTS_MAX = 3, VOID_STREAK_PAUSE = 3;
+export type SlotRow = { taskId: string; configRef: string; slot: number; attempt: number; state: TrialState; ending: TrialEnding | null };
+export type GradeFacts = {
+  ending: TrialEnding;              // "graded" when a grading round ran
+  expected: readonly string[];      // the task's expectedCases
+  report?: ParsedReport;            // eval-report.ts; absent: no parsed report after two rounds
+  guard?: "passed" | "failed";      // absent: not run
+  overwritten: number; diff: TrialGrade["diff"]; isolation: "isolated" | "none";
+};
+export function gradeOf(facts: GradeFacts): TrialGrade;
+export function restoreSet(input: { referenceChanged: readonly string[]; resultChanged: readonly string[]; hiddenFiles: readonly string[];
+  gradingPaths: readonly string[]; testPath: (path: string) => boolean }): { restore: string[]; overwritten: number };
+/** The first slot in task order, then slot, then configuration order, with no final non-void row and fewer than three attempts. */
+export function nextSlot(input: { tasks: readonly string[]; configRefs: readonly string[]; trialsPerTask: number; rows: readonly SlotRow[] }):
+  { taskId: string; configRef: string; slot: number; attempt: number } | undefined;
+export function isolationLabel(input: { probe: EvalProbe; sourceClean: boolean }): "isolated" | "none";
+/** SHA-256 hex of the canonical JSON of profileIdentityKey(profile), guidance, and knowledge. */
+export function configRef(configuration: TrialConfiguration): string;
+/** "task-scope-violation" → scope-violation; "missing-agent-report" → no-result; "halted" → void-owner; any other code → void-host. */
+export function endingOfBlock(code: string | undefined): TrialEnding;
+export function endingOfReport(kind: "question" | "blocked" | "escalate"): TrialEnding;   // question, blocked, escalated
+```
+
+**Decisions:**
+- **`gradeOf`**: for an ending other than `graded`, `expectedPassed` null, `guardPassed` null, `resolved` false. For `graded`: `expectedTotal` is `expected.length`; `expectedPassed` is the count of `expected` keys that the parsed report passes, or null without a parsed report; `guardPassed` is `guard === "passed"`, or null when absent; `resolved` is `expectedPassed !== null && expectedPassed === expectedTotal && expectedTotal > 0 && guardPassed === true`.
+- **`restoreSet`**: `restore` is the sorted union of `hiddenFiles` and every name in `referenceChanged ∪ resultChanged` that `testPath` accepts or that a grading path covers (equal, or under it plus `/`). `overwritten` is the count of `resultChanged` names in `restore`.
+- **`isolationLabel`** is `isolated` only when `probe.state` is `ready`, `probe.fetch` is `refused`, and `sourceClean` is true.
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-trial-rules.test.ts`.
+
+| Test name | Assertions |
+|---|---|
+| `every ending grades as the design says` | E `{a, b}`: a report passing both and guards `passed`: resolved, 2 of 2. Guards `failed`: not resolved, `guardPassed` false. A report passing only `a`: 1 of 2, `guardPassed` null. No report: `expectedPassed` null, not resolved. Ending `timeout`: null, null, not resolved. E empty: never resolved. `endingOfBlock("missing-agent-report")` is `no-result`; an unknown code `void-host`. |
+| `the restore set takes tests and grading paths from the reference` | Reference changed `src/a.js`, `tests/a.test.js`; result changed `src/a.js`, `package.json`, `tests/b.test.js`; hidden `tests/a.test.js`; grading path `package.json`: restore `package.json`, `tests/a.test.js`, `tests/b.test.js`; `overwritten` 2. |
+| `the next slot does not depend on the order of the rows` | 200 seeded shuffles of the same rows (3 tasks, 3 configurations, 3 slots, with voids and finals): one result. With no rows: the first task, slot 0, the first configuration, attempt 0. |
+| `a void trial runs again at most twice` | A slot with voids at attempts 0 and 1: attempt 2. With a third void: the next slot moves on. |
+| `the isolation label needs every probe` | `fetch: "open"`, `sourceClean` false, or a state other than `ready`: `none`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/eval-trial-rules.test.ts` and the typecheck.
+
+### Task 9: the replay run kind
+
+**Files:** `packages/host/src/team-replay.ts`, `packages/host/src/teams.ts` (at most +27), `packages/host/src/config-identity.ts` (net 0), `tests/fixtures/trial-agent.mjs`, `tests/team-replay.test.ts`. Needs Tasks 2, 3, and 6.
+
+**Interfaces (produces):**
+```ts
+// team-replay.ts
+export type ReplayCreate = {
+  trialId: string; jobId: string; purpose: "replay" | "gate"; projectId: string;
+  profile: TeamModelProfile; capsule: Capsule; features: EvalFeatures;
+  baseCommit: string; workspace: string;   // ROOT/trials/TRIAL/work, prepared by the pump
+};
+export type ReplayState = {
+  phase: "running" | "ended";
+  ending?: TrialEnding | "settled";   // with "ended"
+  resultCommit?: string;              // with "settled", when the member committed a change
+  resetsAt?: string;                  // with "void-limit", the provider's stated reset
+  memberId?: string; sessionId?: string; memberStartedAt?: string;
+  sessionExited: boolean;             // true when no member launched, or the member's session is exited
+};
+/** The service's record of a run, as team-intent.ts types its holder. */
+export type ReplayHolder = { run: TeamRun };
+export type ReplayHost = { config(): Config; emit(holder: ReplayHolder, type: RunEventType, data: Record<string, unknown>): void;
+  save(holder: ReplayHolder): void;
+  cancel(holder: ReplayHolder): Promise<void>;            // stopRun(stored, "cancel") through enqueue
+  sessionStatus(sessionId: string): Promise<WorkerState["status"] | undefined> };
+export class TeamReplay {
+  constructor(host: ReplayHost);
+  /** The new run: implementing, one pending task from capsule.task, parallelism 1, the host lineup with implementers [profile] and no
+   *  escalations or fallbacks, autonomy "supervised", linearTracking false, no permissions, routing, intentCheck, blackboard, delivery,
+   *  goal, or establishChecks; objective, brief, steering, and owner answers (as answered decisions of revision 1) from the capsule. */
+  seed(input: ReplayCreate, at: string): TeamRun;
+  /** join(eval.member.root, "trials"). Throws TeamError 409 "eval-identity-missing" without eval.member. */
+  root(): string;
+  /** run.created data: { projectId, purpose, trialId }. Then plan.accepted (taskCount 1, planDigest, parallelism 1) and one task.planned with `features`. */
+  created(holder: ReplayHolder, features: EvalFeatures): void;
+  prefixFor(run: TeamRun, fallback: TeamCommand | undefined): TeamCommand | undefined;     // evalCommandPrefix(member, "exec") for a replay run
+  /** For a replay run: the setup prefix and stdin `evalProxyUrl("_eval-setup", trialId, 900)` plus a newline ("\n" without the boundary). */
+  setupFor(run: TeamRun, fallback: TeamCommand | undefined): { prefix: TeamCommand | undefined; input?: string };
+  header(run: TeamRun): { purpose?: SessionPurpose };
+  trusted(run: TeamRun): boolean;          // true for a replay run; else teams.trustWorkspaces === true
+  step(holder: ReplayHolder): void;                                  // every task integrated and no member active
+  consume(holder: ReplayHolder, member: TeamMember): boolean;        // question, blocked, escalate
+  end(holder: ReplayHolder, ending: TrialEnding, resetsAt?: string): true;
+  blocked(holder: ReplayHolder, error: unknown): true;
+  state(holder: ReplayHolder | undefined): Promise<ReplayState | undefined>;
+  /** Ended or settled, no member active, and the outbox empty. */
+  forgettable(holder: ReplayHolder): boolean;
+}
+// teams.ts, public
+createForReplay(input: ReplayCreate): Promise<{ runId: string }>;
+replayState(trialId: string): Promise<ReplayState | undefined>;
+endReplay(trialId: string, ending: "timeout" | "void-owner" | "void-host"): Promise<void>;
+forgetReplay(trialId: string): Promise<boolean>;     // deleteRecord, with no tombstone; false while the run is not forgettable
+replayIds(): string[];
+// config-identity.ts: memberConfiguration's input gains `shape?: "team" | "trial"`; the components use `input.shape ?? "team"`.
+```
+
+**Decisions:**
+- **Creation.** `createForReplay` runs inside `enqueue`. A record with the trial id answers that run. Otherwise it stores `{ run: replays.seed(input, at), fingerprint: digest(input), receipts: {}, prepared: true, root: replays.root() }`, emits `run.created` with `replays.created`, saves, and lets the next step start the implementer. It never calls `createRun`, so the production checks (profiles in `config.agents`, the team volume, mission reservations, delivery) do not apply, and `createRun`'s `run.created` keeps its data. The replay methods read `this.records.get(id)` directly.
+- **Commands.** `private prefixFor(run)` gives `replays.prefixFor(run, this.config.teams?.commandPrefix)`. On every path a replay run reaches, `this.config.teams?.commandPrefix` becomes `this.prefixFor(run)` in place: the member operation's `assertMemberReadOnly`, `writeTeamContext`, `enrich`'s `prefix`, `assertMemberScope`, `captureMemberResult`, the result operation's `diff` and `gitRead`, and the retirement boundary. The member operation's setup `teamCommand` call takes its prefix and stdin from `replays.setupFor(run, …)` (`teamCommand(setup, cwd, signal, 600000, prefix, input)`). A path missed here fails closed: the agent account cannot enter a trial directory.
+- **The member** (each in place). In the member operation, `const cwd = run.replay ? run.workspace : await prepareMemberWorkspace(...)`, and the graph refresh is skipped for a replay run. No scratch directory (line 5118's condition). `publicationTarget`'s first line (1126) becomes `if (!this.publishHeadsEnabled() || stored.run.replay) return undefined;`. `enrich` passes `shape: run.replay ? "trial" : "team"`. In `launch()`, line 5138 becomes `const github = stored.run.replay ? undefined : sessionGithubScope({ …`, and line 5141's `this.config.teams?.trustWorkspaces === true, {}` becomes `this.replays.trusted(stored.run), this.replays.header(stored.run)`. `member.started`'s `purpose: "work"` (line 5160) becomes `purpose: run.replay?.purpose ?? "work"`.
+- **Endings** (+1 line each). First line of `consume` (line 5197): `if (stored.run.replay && this.replays.consume(stored, member)) return;` ends `question`, `blocked`, and `escalated`. First line of `replaceStalledMember` (line 4863): `end(…, "stalled")`. First line of `switchLimitedMember` (line 4916): `end(…, "void-limit", limit.resetsAt)`, before `this.limits.observe`. First line of `block` (line 2759): `blocked`, which maps the code with `endingOfBlock`; an implementer that exits without a report reaches `block` with `missing-agent-report` (line 3421) and ends `no-result`. In the member loop's `needs-you` branch, after line 3438, `const holder = this.promptHolder(run, member.sessionId, state.attention.prompt?.id);`: `if (run.replay && holder === "user") return void this.replays.end(stored, "permission");`. A served project's dialog goes to the host permission agent first (`handOffPermission`), and the holder is `agent` while it decides. `end` records `run.replay.ending` once and cancels the run through `host.cancel`; it never creates a member, asks the owner, or switches a profile. The members stop through the cancel path, which records its own stop reason; the trial row holds the ending.
+- **A result.** In the result operation, line 5546 becomes `const head = commit ? (run.replay ? commit : await integrateMemberResult(…)) : run.headCommit!;`, and `captureIntegrated` is guarded by `!run.replay`, both in place. `task.integrated` is emitted as for any run. After `if (activeCount) return;` in the run step (line 3517): `if (run.replay) return void this.replays.step(stored);`, which sets `run.replay.resultCommit` to the task's commit (absent for an empty result) and the status `ready-for-review`, and saves. It never starts checks, review, or delivery. A completion that finds `run.replay.ending` set or the run stopped changes nothing.
+- **`state`.** No record: `undefined`. `run.replay.ending` set: `ended` with it (and `resetsAt`). Status `ready-for-review`: `ended` `settled`. Status `paused` or `cancelled` without an ending (an owner halt or an owner's action by id): `ended` `void-owner`. Status `blocked` without an ending: `ended` `void-host`. Otherwise `running`. `sessionExited` reads `host.sessionStatus` of the implementer's session once per call.
+- **Exclusions**, each in place unless counted: `list()`, `statuses()`, and `understandingRecords()` skip replay runs; a new `private visible(id)` (+1) throws `TeamError(404, "team-not-found", "This team does not exist.")` for a replay run, and `get` (line 1097) and `objectiveRecord` (line 1098) use it; `view()`'s destructure, `const { members, permissionRecovery, ...run }`, also takes out `replay`; `activeForProject` skips replay runs; the tick's `this.limits.reconcile(this.manager, rows)` passes only rows with `!learningPurpose(row.purpose)` (the `import type { Config, Provider, Session } from "./types.js";` line becomes a value import in place); `deleteRecord`'s `this.persistRetiredRunId(stored.run.id)` (line 1397) runs only without `stored.run.replay`. `retire()` returns at once for a replay run (+1): the pump removes the workspace and the record. The notifier, Linear, and publication see no replay run, because they read `statuses()`, `linearTracking`, or `publicationTarget`. Repository briefings already skip sessions outside `teams.workspaceDir` (`repository-briefings.ts` `location()`).
+- **`teams.ts` line budget, +27 at most:** the `team-replay.js` import (1), the `replays` field, one line like `intentChecks` at line 507 (1), `createForReplay` (4), `replayState`, `endReplay`, `forgetReplay`, and `replayIds` (4), `prefixFor` (1), `visible` (1), the step hook (1), the `consume` hook (1), the stall, limit, block, and `needs-you` hooks (4), the `retire` return (1), and up to 8 lines where an in-place edit would pass 200 characters. Everything else is in place.
+- **`tests/fixtures/trial-agent.mjs`** reports the way `team-agent.mjs` does. Its modes: `reference DIR` (copies DIR's files into its cwd, then reports `result`), `empty`, `outside` (edits a file outside the task's paths), `question`, `blocked`, `escalate`, `silent` (exits with no report), `stall` (prints nothing and waits), `permission` (draws the dialog `hook-agent.mjs` draws, which the fixture pipeline leaves to a person), and `limit` (prints the limit notice `codex-limit-agent.mjs` prints).
+
+- [ ] **Step 1: Write the failing tests** in `tests/team-replay.test.ts`, with a real `TeamService` and Manager, the Task 6 fixture as the eval launcher (`eval.member.prefix`), and `trial-agent.mjs` as the eval profile.
+
+| Test name | Assertions |
+|---|---|
+| `a replay run is seeded and starts one implementer` | `createForReplay` twice with one trial id: one run, whose id is the trial id. Events in order: `run.created` (purpose `replay`, `trialId`), `plan.accepted` (`taskCount` 1), one `task.planned` with the eval features, `member.started` (purpose `replay`), and `member.configured` with shape `trial`. No project manager. The session's purpose is `replay`, its workspace trusted, and its prompt holds the capsule's objective. |
+| `a replay run reaches no client` (acceptance 6) | `list`, `statuses`, and `understandingRecords` omit it; `get` and `objectiveRecord` answer `404`; `activeForProject` is false while it runs. Spies on publication, Linear, the capture sink, and the GitHub grant scope record no call; the run has no `blackboard`, `permissions`, `routing`, or `delivery`. A corroborated limit shown on its session leaves `providerLimits()` empty. |
+| `every member ending ends the trial with its name` | Modes `question`, `blocked`, `escalate`, `silent`, `stall`, `limit`, `permission`, `outside`, and an owner halt: `replayState` gives `question`, `blocked`, `escalated`, `no-result`, `stalled`, `void-limit`, `permission`, `scope-violation`, `void-owner`. In each case no member is added and no decision asks the owner. `empty`: `settled` without `resultCommit`; `reference`: `settled` with it. |
+| `a stopped replay run ignores late completions` | The result operation completes after `endReplay(…, "void-owner")`: the run, its tasks, and its events stay as they were. |
+| `replay commands run as the eval identity` | Every command the run made went through the fixture's `exec` or `setup`; none went through `teams.commandPrefix`. After the run settles, `forgetReplay` answers true and the record file is gone, with no tombstone. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/team-replay.test.ts tests/run-event-coverage.test.ts` in the background, then `node scripts/check-file-size.mjs` and the typecheck. If `tests/run-event-coverage.test.ts` pins the keys of `run.created`, this task adds `trialId` there.
+
+### Task 10: outcome rows
+
+**Files:** `packages/host/src/outcome-projector.ts`, `packages/host/src/outcome-signals.ts`, `packages/host/src/outcome-store.ts` (net 0), `tests/outcome-replay.test.ts`. Needs Task 1. Builds against Task 9's event data: `run.created` with `purpose` and `trialId`.
+
+**Decisions:**
+- `runCreated`: when `data.purpose` is `replay` or `gate`, `summary.source = "replay"` and `summary.payload.trialId = str(data.trialId)`. `outcome-store.ts` line 63 in `RunSummaryPayload`, `missionId?: string;`, becomes `missionId?: string; trialId?: string;` in place.
+- `Facts` gains `source: "production" | "replay"` and `experimentRef: string | null`; `factsOf` copies them from the summary; `blankOutcome` and `blankResult` use `facts.source` and `facts.experimentRef`. A summary made by another event than `run.created` stays `production` with a gap, as today.
+- `saveOutcomeRow`: for `row.source === "replay"`, `accepted`, `firstPass`, and `held` are null after the levels are computed, and `acceptance` stays null (C5).
+- Routing and the scorecard already read `ROUTING_SOURCES = ["production", "duel"]` (`outcome-store.ts` line 672), and the coverage denominator reads `production`. Nothing there changes.
+
+- [ ] **Step 1: Write the failing tests** in `tests/outcome-replay.test.ts`, on a real store with the projector.
+
+| Test name | Assertions |
+|---|---|
+| `a replay run writes replay rows` | The events of a replay run (created, started, configured, reported, integrated, settled, deleted): the summary's source `replay`; the implementer's row source `replay` and `experiment_ref` the trial id; `accepted`, `firstPass`, and `held` null after the settle and after a landing signal for the run. |
+| `replay rows never reach routing or the scorecard` | `queryCells` with `sources: ["production"]`, and the routing reads, count no replay row. |
+| `a production run keeps production rows` | The same events with purpose `work`: source `production`, `experiment_ref` null, the levels as before. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/outcome-replay.test.ts tests/outcome-store.test.ts` in the background, then `node scripts/check-file-size.mjs`.
+
+### Task 11: the trial source and grading
+
+**Files:** `packages/host/src/eval-trial.ts`, `packages/host/src/eval-validate.ts` (at most +6), `tests/eval-trial.test.ts`. Needs Tasks 5, 6, 7, and 8.
+
+**Interfaces (produces):**
+```ts
+export const TRIAL_BUNDLE_MAX_BYTES = 1_073_741_824, GRADE_ROUNDS = 2, DIFF_OUTPUT_MAX = 65_536;
+export type TrialContext = ValidateContext & { trialId: string; identity: EvalIdentity; evalUid: number; probe: EvalProbe };
+export type SourceResult =
+  | { kind: "ready"; baseCommit: string; workspace: string; hiddenFiles: string[]; isolation: "isolated" | "none"; capsule: Capsule; features: EvalFeatures }
+  | { kind: "skip"; reason: "unreadable" | "not-valid" | "expected-missing" | "secret-shaped" | "source-leaked" }
+  | { kind: "environment"; cause: "grader-failed" | "grader-processes-alive" | "eval-failed" | "eval-processes-alive" | "bundle-missing" | "halted" | "storage" };
+export function prepareTrialSource(store: EvidenceStore, taskId: string, ctx: TrialContext): Promise<SourceResult>;
+export type GradeResult =
+  | { kind: "graded"; grade: TrialGrade; patch: Buffer | "too-large" | "secret-shaped" }
+  | { kind: "environment"; cause: "grader-failed" | "grader-processes-alive" | "eval-processes-alive" | "task-gone" | "halted" };
+export function gradeTrial(store: EvidenceStore, input: { taskId: string; baseCommit: string; resultCommit: string | undefined; workspace: string;
+  hiddenFiles: string[]; isolation: "isolated" | "none" }, ctx: TrialContext): Promise<GradeResult>;
+// eval-validate.ts exports, in place: Stop, loadTask, cloneTask, tagMined, applyCaptured, applyPatch (name: Exclude<GraderInput, "base.bundle">),
+// changedNames (from = "eval-base", to = "eval-reference"), guardChecks, focused, call, exec, expectZero, finish, reset.
+```
+
+**Decisions:**
+- **The source**, in the eval host's one step, with the grader job id equal to the baseline job id: `loadTask` (a payload that does not open: `skip` `unreadable`); the task must be `valid` with `expectedCases` (else `not-valid` or `expected-missing`); `findSecret(capsule, { token: "", url: "" })`, as `eval-mine-rules.ts` line 102 calls it (`secret-shaped`). Then slice 2's steps: the job's bundle (`prepareJob` with the trial pump's own `BundleState`), `cloneTask`, and `tagMined` or `applyCaptured`. Then, in `task`: `git update-ref refs/heads/trial refs/tags/eval-base`, `git rev-parse eval-base eval-reference`, and `git ls-tree -z eval-reference -- HIDDEN...` with `keepStdout`, which give the base, the grader's reference, and each hidden file's reference blob. Then `stopEvalIdentity`, `clean`, `scrub`, and a fresh probe that must be `ready`; then `export` piped into `identity.receive(trial, …, 1 GiB)`; `identity.prepare`; and `identity.check` with the payload's `commit` and `integratedHead` (captured) or `commit` (mined), the grader's reference, the mirror head, and the hidden blobs. `leaked` skips the task `source-leaked` after `clean`. The label is `isolationLabel({ probe, sourceClean: true })`. The grader's `task` clone stays for grading; `finish` cleans the rounds.
+- **Grading**, after the pump saw every eval process stop. No `resultCommit` grades `no-result`. Otherwise `captureGit(() => ctx.identity.teamPrefix()).patch(workspace, baseCommit, resultCommit)`: `too-large` grades `scope-violation`, since no corpus task needs 1 MiB; `failed` is `environment` `eval-processes-alive` only when the stop failed, else the pump ends the trial `void-host`. `findSecret` over the patch's UTF-8 text marks it `secret-shaped`; it is still graded. Then: `stopGrader`; the task clone as above (a task that is gone or unreadable: `environment` `task-gone`); in `task`, check out `eval-base`, `applyPatch(ctx, "result.patch", bytes)` (a refusal grades `scope-violation`), and `git update-ref refs/tags/eval-result HEAD`; `changedNames(ctx, "eval-base", "eval-result")` (truncated: `scope-violation`); `restoreSet` with the reference's `changedNames`. In `round-1`: clone `task`, check out `eval-result`, `git --literal-pathspecs restore --source=eval-reference --staged --worktree --pathspec-from-file=- --pathspec-file-nul` with the restore list, commit; `focused` with the hidden files. A time-out grades `timeout`; a missing or invalid report runs the same in `round-2` once (`GRADE_ROUNDS`). When every expected case passed, `guardChecks` in `round-3`. The numstats of `eval-base` to `eval-result` and to `eval-reference` (`--numstat --no-renames -z`, `keepStdout`) fill `diff`, or `diff` is null when either is truncated. `gradeOf` decides. Every path ends with `finish`.
+- **Halt.** `call` polls `halted()` as validation does; a halt is `environment` `halted`, and the pump ends the trial `void-owner`.
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-trial.test.ts`: real Git, the fixture grader and eval launchers, a real store with a valid mined task.
+
+| Test name | Assertions |
+|---|---|
+| `the trial source holds only the base` (acceptance 4) | After `prepareTrialSource`: in `work`, `git cat-file -e` fails for the mined commit, the grader's reference, and the mirror head; `git remote` prints nothing; no hidden test file exists and its reference blob is absent; `in/` is gone. A grader fixture whose export still holds the reference: `skip` `source-leaked`, and no trial workspace remains. |
+| `a member that applies the reference is resolved` (acceptance 7) | A result commit equal to the reference's tree: `graded`, `expectedPassed` equals `expectedTotal`, `guardPassed` true, `resolved` true, `overwritten` 0. |
+| `an exit code never resolves` (acceptance 7) | A result that makes the focused script exit 0 and write no report: `expectedPassed` null after two rounds, `resolved` false. A result that writes a report without the expected cases: not resolved. |
+| `a grading path edit is overwritten` (acceptance 7) | A result that edits `package.json`, under `gradingPaths`, and the source: graded with the reference's `package.json`, `overwritten` 1. |
+| `a grading time-out ends timeout` | A focused test past its limit: ending `timeout`, `resolved` false. |
+| `an unreadable task starts no trial` | A payload replaced with bad sealed text: `skip` `unreadable` before any launcher command. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/eval-trial.test.ts tests/eval-validate.test.ts` in the background, then the typecheck.
+
+### Task 12: the baseline job
+
+**Files:** `packages/host/src/eval-trial-jobs.ts`, `packages/host/src/eval-jobs.ts` (at most +27), `tests/eval-trial-jobs.test.ts`. Needs Tasks 7 and 8.
+
+**Interfaces (produces):**
+```ts
+export const TRIAL_CONFIGURATIONS_MAX = 4, TRIALS_PER_TASK_DEFAULT = 3, TRIALS_PER_TASK_MAX = 5, TRIAL_TASKS_DEFAULT = 20,
+  TRIAL_TASKS_MAX = 200, MAX_TRIALS_MAX = 1_000, TRIAL_SLOTS_FREE_MIN = 4, BASELINE_JOBS_MAX = 100;
+export const BASELINE_JOBS_SQL = "SELECT * FROM eval_jobs WHERE status = ? AND kind = 'baseline' ORDER BY created_at, job_id LIMIT ?";
+export const baselineJobSchema: z.ZodType<BaselineJobRequest>;
+/** SHA-256 of the canonical JSON of the validation settings, trialMinutes, eval.grader, eval.member, each configuration's
+ *  promptVersion("implementer", provider, profile, false, false, false), and project.team.permissions. */
+export function trialJobDigest(project: Project, config: Pick<Config, "eval">, configurations: readonly TrialConfiguration[]): string;
+export type TrialGates = {
+  identity: EvalProbe; grader: GraderProbe; hostLoadHeld: boolean; halted: (projectId: string) => boolean;
+  limited: ReadonlySet<Provider>;     // TeamService.providerLimits() providers and the pump's eval limits
+  freeSlots: () => Promise<number>; trialLive: boolean;
+};
+export type NextTrial =
+  | { kind: "trial"; jobId: string; projectId: string; taskId: string; configuration: TrialConfiguration; configRef: string;
+      slot: number; attempt: number; settings: TrialSettings }
+  | { kind: "wait"; jobId: string; waiting: EvalJobWait } | { kind: "none" };
+export class TrialJobs {
+  constructor(options: { store: EvidenceStore; config: Pick<Config, "projects" | "eval" | "teams">; now?: () => string });
+  create(projectId: string, request: BaselineJobRequest, requestId: string): { created: boolean; job: BaselineJobView } | EvalRefusal;
+  views(db: EvidenceDb, rows: readonly EvalJobRow[]): Map<string, BaselineJobView>;   // one trialCounts read for the page
+  next(gates: TrialGates): Promise<NextTrial>;
+  skip(jobId: string, taskId: string): void;          // the cursor moves past the task; skipped + 1
+  record(jobId: string, ending: TrialEnding): void;
+  block(jobId: string, reason: "eval-processes-alive"): void;
+  digest(projectId: string, jobId: string): string | undefined;
+  running(): string[];                                // ids of running baseline jobs, at most 100
+}
+// eval-jobs.ts, in place: ACTIVE_JOBS_SQL adds "AND kind = 'validate'"; ACTIVE_PROJECT_JOBS_SQL adds "AND kind = ?";
+// `export type EvalJobRow = JobRow;` (+1); the constructor options gain
+// `baseline?: { views(db: EvidenceDb, rows: readonly EvalJobRow[]): Map<string, BaselineJobView>; digest(projectId: string, jobId: string): string | undefined }`,
+// which viewOf, list, and projectJobs use for rows of kind 'baseline', and which control's resume uses to pin a baseline row.
+```
+
+**Decisions:**
+- **The schema**, strict: 1 to 4 configurations, each `{ profile: teamModelProfileSchema, guidance: "as-of-base", knowledge: "none" }`, no two with one `configRef`; `taskFilter` with task ids (at most `JOB_TASKS_MAX`), at most 2 origins, at most 32 areas, and `maxTasks` 1 to 200 (default 20); `trialsPerTask` 1 to 5 (default 3); `limits.maxTrials` 1 to 1,000 and `maxWallMinutes` 10 to 43,200; windows and `expiresAt` as the validate job's (at most 30 days).
+- **`create`.** An unknown project: `404` `unknown-project`. `trialSettings` with a `missing` key: `409` `eval-config-incomplete`. A profile whose provider is not `claude`, `codex`, or `opencode`; a profile in neither `lineupProfiles(config.teams.lineup)` nor the project's `candidateProfiles`; or a `dataUse: "contributor"` profile while `project.team.routing?.allowContributor` is not true: `409` `profile-not-approved`. Request ids as the validate job's. A baseline job of the project in `scheduled`, `running`, `paused`, or `blocked`: `409` `job-active` (a validate job does not count). The row goes into `eval_jobs` with `kind` `baseline` and the sealed payload `{ projectId, request, requestDigest, jobDigest }`; `openTrialCounts` writes the plan: `planned.tasks` is the count of matching `valid` tasks, at most `maxTasks`, read in pages of `NEXT_TASK_SQL`, and `planned.trials` is `min(maxTrials, tasks × configurations × trialsPerTask)`.
+- **`next`**, oldest job first among `scheduled` and `running` baseline rows (`BASELINE_JOBS_SQL` through `eval_jobs_status`), each gate in this order: expired (`expired`); `jobTrialCount` at `maxTrials` or the wall time at `maxWallMinutes` (`completed`, `limit-reached`); the digest (`blocked`, `configuration-changed`); halt (`halt`); window (`window`); host load (`host-load`); the eval identity not `ready`, or no `eval.member.agents` entry for the configuration's provider (`eval-identity`); the grader not `ready` or `version` below 2 (`grader`); storage (`storage`); a live trial (`another-job`); the configuration's provider in `limited` (`provider-limit`); `freeSlots()` below 4 (`session-slots`); `trialsSince(project, today 00:00 UTC)` at `trialsPerDay` (`daily-cap`). Then the slot: the job's `cursor` column holds the current task id; `nextSlot` over `jobSlots(job, cursor)`; when the task has no slot left, `NEXT_TASK_SQL` gives the next `valid` task after the cursor that passes the filter, `advanceTask` counts it, and the cursor moves. At `maxTasks` tasks reached, or with no task left, the job is `completed` `done`. `waiting` is written only when it changes.
+- **`record`** reads the counters after `finishTrial`; at `VOID_STREAK_PAUSE` (3) the job pauses `trial-voids`. **`skip`** moves the cursor past the task and calls `advanceTask(…, true)`.
+- **Control.** `pause` lets a live trial finish and starts no other; `cancel` also makes the pump end a live trial of the job `void-owner` (Task 15 reads the status). `resume` from `blocked` pins `trialJobDigest`.
+- **Cost.** `next` reads at most 100 active baseline jobs through `eval_jobs_status`, one count by job through `eval_trials_job`, one daily count through `eval_trials_project_day`, slot rows of one task through `eval_trials_job`, and at most one page of 200 tasks through `eval_tasks_next`. `freeSlots` runs only after every cheaper gate passed.
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-trial-jobs.test.ts`, on a real store with a fixed clock.
+
+| Test name | Assertions |
+|---|---|
+| `a baseline request makes one job` | The same id and body twice: one job, `created` true then false; another body: `request-conflict`. A profile outside the pools, a Grok profile, or a `contributor` profile without `allowContributor`: `profile-not-approved`. No `trialsPerDay`: `eval-config-incomplete`. A second baseline job of the project while one is `paused`: `job-active`; a validate job beside it: created. The view shows `tasks.planned` and `trials.planned`. |
+| `the job waits for every gate and says which` | Each gate in turn (halt, window, host load, the eval identity `busy`, a grader `version` 1, storage, a live trial, a limited provider, three free slots, the day's cap reached): `next` returns `wait` with that name, and the column holds it. |
+| `a job starts no trial after its limits` (acceptance 9) | `maxTrials` 2 with two trial rows: `completed` `limit-reached`. `trialsPerDay` 1 with one trial today: `daily-cap`; the clock moved to the next UTC day: a trial. |
+| `a changed configuration blocks the job` | `trialMinutes` changes: `blocked` `configuration-changed`; `resume` pins the new digest and `next` returns a trial. A change of `eval.member.root` blocks it the same way. |
+| `three voids in a row pause the job` | Three `void-host` records: `paused` `trial-voids`. |
+| `cancel voids the running trial` | `control(job, "cancel")` with a live trial: the job is `cancelled`, and the pump's next step ends the trial `void-owner`; `pause` leaves the live trial alone. |
+| `the baseline statements read through an index` | `EXPLAIN QUERY PLAN` of `BASELINE_JOBS_SQL` and of the edited `ACTIVE_JOBS_SQL` and `ACTIVE_PROJECT_JOBS_SQL` uses `eval_jobs_status`, `eval_jobs_status`, and `eval_jobs_project`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/eval-trial-jobs.test.ts tests/eval-jobs.test.ts` and the typecheck.
+
+### Task 13: the summary and the routes
+
+**Files:** `packages/host/src/eval-summary.ts`, `packages/host/src/eval-routes.ts`, `tests/eval-routes.test.ts`. Needs Task 12.
+
+**Decisions:**
+- `evalSummary`'s input gains `evalIdentity: EvalIdentityState`, `graderVersion: number | null`, and `trials: { today: number; dailyCap: number | null }`. `trialsSince` gives `today`; `trialSettings` gives `dailyCap` (null when `trialsPerDay` is absent). The grader's version is null until a probe answered one.
+- `POST /api/eval/jobs` parses `job` by `kind` with `validateJobSchema` or `baselineJobSchema` and calls `create`. `GET /api/eval/jobs` renders baseline rows with one `trialCounts` read for the page. No route returns a capsule, a patch, a file name, a case, a commit, a trial id, a session id, or a profile model.
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-routes.test.ts`.
+
+| Test name | Assertions |
+|---|---|
+| `the summary shows the eval identity and today's trials` | `evalIdentity.state` `not-configured` without `eval.member`; two trials today with a cap of 6: `today` 2, `dailyCap` 6; without `trialsPerDay`: `dailyCap` null; a version 1 grader: `grader.version` 1. |
+| `a baseline job is created and listed` | Owner `POST` of a baseline job: `201`, then `200` for the same id; `GET /api/eval/jobs` shows `kind` `baseline` with `tasks` and `trials`; viewer `POST`: `403`. No body contains the capsule's objective, the patch's text, a trial id, or the model name. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/eval-routes.test.ts` and the typecheck.
+
+### Task 14: the CLI
+
+**Files:** `packages/host/src/eval-cli.ts`, `tests/eval-cli.test.ts`. Needs Task 1. Runs in parallel with Tasks 2 to 12.
+
+**Decisions:** `evalStatusLines` replaces `grader STATE` with `grader STATE`, or `grader ready (version 1: no trials)` when the version is below 2, and adds `eval identity STATE` and `trials today N of CAP`, or `trials off` without a cap. `evalJobLines` prints, for a baseline job, `tasks R of P (skipped S) · trials started N of P, graded N, resolved N, ended N, void N`. `run` already sends any `job` body. Text passes through the existing `clean`, counts through `count`.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `status prints the eval identity and trials` | A summary with `evalIdentity.state` `busy` and `trials` `{ today: 2, dailyCap: 6 }`: the exact lines `eval identity busy` and `trials today 2 of 6`; a null cap prints `trials off`; a version 1 grader prints `grader ready (version 1: no trials)`. |
+| `job prints baseline counts` | A baseline view: the exact line of counts; a validate view prints as before. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/eval-cli.test.ts`.
+
+### Task 15: the trial pump, the eval host, the server, and the host test
+
+**Files:** `packages/host/src/eval-trial-pump.ts`, `packages/host/src/eval-host.ts` (at most +99), `packages/host/src/server.ts` (net 0), `tests/eval-trial-run.test.ts`. Needs Tasks 9, 10, 11, 12, and 13.
+
+**Interfaces (produces):**
+```ts
+// eval-trial-pump.ts
+export const EVAL_STOPPING_MS = 120_000, TRIAL_LAUNCH_MS = 900_000, TRIAL_SESSION_KEEP_MS = 3_600_000, TRIAL_SESSIONS_BATCH = 20,
+  EVAL_LIMIT_UNSTATED_MS = 900_000, EVAL_LIMIT_MAX_MS = 86_400_000;
+export type TrialTeams = Pick<TeamService, "createForReplay" | "replayState" | "endReplay" | "forgetReplay" | "replayIds" | "providerLimits">;
+export type TrialPumpOptions = {
+  config: Config; store: EvidenceStore; jobs: TrialJobs; grader: Grader; identity: EvalIdentity;
+  teams: () => TrialTeams; sessions: Pick<Manager, "list" | "remove">; source: Pick<ProjectSourceService, "mirrorPath" | "status">;
+  hostLoad: Pick<HostLoadGate, "held">; halt: () => Pick<HaltService, "check">;
+  graderProbe: () => Promise<GraderProbe>; inventory?: () => Promise<RuntimeProcess[]>; now?: () => string;
+};
+export class TrialPump {
+  constructor(options: TrialPumpOptions);
+  /** One step: start-up once, then advance the live trial or start one. Never throws. */
+  step(): Promise<void>;
+  /** Hourly: sweepTrials, forgetReplay for final trials whose run remains, and sessions.remove for at most 20 sessions ended over an hour ago. */
+  sweep(): Promise<void>;
+  identityState(): EvalIdentityState;   // the last probe, at most 10 minutes old
+}
+// eval-host.ts: EvalHostOptions gains `teams?: () => TrialTeams; sessions?: Pick<Manager, "list" | "remove">; identity?: EvalIdentity`.
+```
+
+**Decisions:**
+- **One chain.** `EvalHost.validate()` keeps its one in-flight promise; its `step()` runs the validation step, then `TrialPump.step()`. One user holds the grader at a time, and no lease is needed. The trial pump keeps its own `BundleState`, so a validate job and a baseline job each keep their bundle in the grader root. `EvalHost.sweep()` also calls `TrialPump.sweep()`. Without `options.teams` there is no trial pump.
+- **Free slots** are `config.maxSessions` minus the sessions in `running` or `starting`, the predicate `teams.ts` line 5098 uses, read through `sessions.list()` only after every cheaper gate passed.
+- **Start-up**, once per process, before any trial: every `preparing` row is dropped (no member was launched: `startTrial` precedes `createForReplay`); every `running` or `grading` row gets `endReplay(trialId, "void-host")` when its run exists, then `finishTrial` with `gradeOf({ ending: "void-host", … })` and `jobs.record`. Then, when the eval identity answers a state other than `not-configured`, `unavailable`, or `misconfigured`: `stopEvalIdentity`, `clean`, `scrub`; and `grader.clean(jobId)` for each of `jobs.running()`, because validation's start-up clean (`eval-host.ts` `startupClean`) now reads validate rows only. A failed stop or clean leaves start-up for the next step.
+- **A live trial**, one per step:
+  1. `running`: `replayState`. `undefined`: `finishTrial` `void-host`. `phase` `running`: a cancelled job or a halted project calls `endReplay(…, "void-owner")`; a member started more than `trialMinutes` ago calls `endReplay(…, "timeout")`; no member started 15 minutes after `startTrial` calls `endReplay(…, "void-host")`.
+  2. `phase` `ended` with `sessionExited` false: wait, up to 120 seconds from the first such step (the worker records the exit after its final transcript drain).
+  3. `phase` `ended` with a trial ending: `stopEvalIdentity` (`alive`: the job is blocked `eval-processes-alive`, the trial ends `void-host`), `finishTrial` with `gradeOf({ ending, … })`, `clean`, `scrub`, `jobs.record`, `forgetReplay`. A `void-limit` sets the pump's eval limit for the provider until `resetsAt`, at most 24 hours, or 15 minutes when no reset was stated.
+  4. `phase` `ended` `settled`: `stopEvalIdentity` as above, `gradingTrial`, `gradeTrial`, then `finishTrial` with `configId` and `profileEpoch` from one `readOutcome(db, outcomeId(trialId, memberId))` (the epoch only when the row has a `configId`; else both null) and the session id; then `clean`, `scrub`, `jobs.record`, `forgetReplay`. An `environment` answer from grading ends the trial `void-host` (`halted`: `void-owner`).
+- **No live trial**: probe the eval identity (cached `ready` for at most 10 minutes; the probe's `fetchUrl` is `repositoryUrl` of the oldest job's project and its `proxyUrl` is `evalProxyUrl("_eval", "probe", 60)`), take `graderProbe()`, and call `jobs.next`. On `trial`: `insertTrial` with a new UUID, then `prepareTrialSource`. `ready`: `startTrial`, then `createForReplay` (a throw ends the trial `void-host`). `skip`: `dropTrial` and `jobs.skip`. `environment`: `dropTrial`; the job waits one step (`*-processes-alive` blocks it `eval-processes-alive`).
+- **`server.ts`**, all its lines in this slice, each in place. Line 103, `import type { Config, Role, Receipt, Session } from "./types.js";`, becomes `import { type Config, type Role, type Receipt, type Session, learningPurpose } from "./types.js";`. Line 268's `new EvalHost({ config, store: evidence, source: projectSource, hostLoad: manager.hostLoad, halt: () => halt, runs: () => teams.understandingRecords() })` adds `teams: () => teams, sessions: manager`. Line 472, `const native = (await manager.list({ … })).map(session => {`, adds `.filter(session => !learningPurpose(session.purpose))` before `.map`. `teams` is read only inside closures the timers call after start-up.
+- **Cost per step at 1,000 sessions and 10,000 outcome rows:** one `liveTrials` read through `eval_trials_live`; with a live trial, one record lookup in `TeamService` and one session status read; without one, the job gates of Task 12. A trial start adds two eval probes, one `sessions.list()` (the read every team launch already makes), one daily count, and the source commands. Grading reads one outcome row by key. No step reads per session, and none scans outcome rows. Replay records leave memory and disk once a trial is final, and trial sessions an hour later, so trials add no lasting cost to `manager.list()` or the team tick.
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-trial-run.test.ts`. Setup: slice 2's fixture mirror (C0 to C3) with C1 validated; the project has `team.eval = { mine: true, focusedTest, reportFormat: "junit", trialsPerDay: 10, trialMinutes: 10 }`; `eval.grader` names the fixture grader with `--version 2`; `eval.member` names the fixture eval launcher and, as `agents.claude`, `tests/fixtures/trial-agent.mjs` with a mode argument. Long batches run in the background.
+
+| Test name | Assertions |
+|---|---|
+| `a fixture task is resolved by a member that applies the reference` (acceptances 4 and 7) | A baseline job with one configuration and `trialsPerTask` 1, ticked until it completes: one trial `graded`, `resolved` true, `isolation` `isolated` with `--fetch refused`; the outcome row's source `replay` and `experiment_ref` the trial id; `GET /api/teams` and `GET /api/sessions` never listed the run or its session; the trials root is empty after the job. |
+| `an empty result, an edit outside the paths, and an undecided permission end their trials` (acceptance 8) | Modes `empty`, `outside`, `permission`: `no-result`, `scope-violation`, `permission`; no owner question exists, and the recording push sender sent nothing. |
+| `a provider limit voids the trial, and it runs again` (acceptance 8) | Mode `limit` on attempt 0, `reference` after: the first row `void-limit`, the job waits `provider-limit` until the stated reset, then the second row is `graded` with `attempt` 1. `providerLimits()` stays empty throughout. |
+| `no trial while the eval identity is busy` (acceptance 5) | A planted entry in the trials root that `clean` cannot remove, or an inventory row of the eval uid that survives: no trial row; the job waits `eval-identity` or is blocked `eval-processes-alive`. |
+| `without both identities, no trial starts and the summary says why` | Without `eval.member`: the job waits `eval-identity`, and the summary shows `not-configured`. With a version 1 grader: the job waits `grader`. |
+| `a restart in the middle of a trial voids it` | `close()` while the member runs, then a new host on the same store: `void-host`, the run cancelled, `stop`, `clean`, and `scrub` recorded before any trial command, then the slot again with `attempt` 1. The same during grading. A restart during `prepareTrialSource`: the row is gone, and the slot runs again with `attempt` 0. |
+| `a lost replay run voids its trial` | The run's record removed while the member runs: `void-host` within one step. The task's row deleted while the member runs: `void-host`, and the job moves past the task. |
+| `validation and trials share the grader one step at a time` | A validate job and a baseline job together: the fixture grader's record never shows one job's commands between another job's `receive` and `clean`, and never a `stop` while the other job's command runs. |
+| `an unavailable store starts no trial` | A store that failed to open: `tick` throws nothing, no launcher command runs, the routes answer `503`. |
+| `a graded trial leaves no run record and, later, no session` | After a graded trial: `replayIds()` is empty and no tombstone was added; after the clock passes one hour and a sweep, the member's session directory is gone. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `tests/eval-trial-run.test.ts` on the host in the background, then the typecheck and `node scripts/check-file-size.mjs`.
+- [ ] **Step 5: The coordinator runs `npm run check` once, runs Tasks 4 and 5's launcher tests in a Linux container, requests the independent review, and commits.**
+
+### Task 16: the docs
+
+**Files:** `docs/teams.md`, `docs/security.md`, `deploy/ubuntu/eval.md` (create), `deploy/ubuntu/grader.md`, `deploy/ubuntu/egress.md`, `docs/superpowers/specs/2026-11-12-replay-eval-design.md`. Needs Task 1. Runs in parallel with Tasks 2 to 14.
+
+**Decisions:**
+- `docs/teams.md`, under Eval mining and validation, a section "Eval trials": the new fields and limits, `eval.member`, the baseline job and its waits, the endings, grading, the isolation label, the stand-in cap and what replaces it, and what is missing while each launcher refuses.
+- `docs/security.md`: the eval identity and what a trial member can and cannot reach, from "Trust boundary" above, the home reset, and the `_eval` and `_eval-setup` egress identities.
+- `deploy/ubuntu/eval.md`: the installs of "Owner approvals", step by step, with their checks, including how to build the home template and that a Codex eval profile with `workspaceDir` names a directory the eval account owns. `grader.md`: version 2. `egress.md`: `projects._eval` and `projects["_eval-setup"]`.
+- The spec. Part 1: no `memberProfile`; `trialsPerDay`. Part 3: the replay run's endings, `no-result` for a member without a report, the permission rule, and the session and project-activity exclusions. Part 4: the source built by the grader, the eval launcher, the home reset, the probe, the egress identities. Part 5: the result patch, the restore set, null `expectedPassed` and `diff`. Part 6: the baseline request, the stand-in cap, the gates of this slice, no reuse yet. Acceptance 5: no trial without both identities. Acceptance 9: the `reserve` clause moves to the standing budget.
+- No home path, host name, user name, or tracker link.
+
+- [ ] **Step 1: Write the docs.** **Step 2: Run** the privacy scan of `AGENTS.md` over the diff.
+
+## Launcher forms
+
+No new form of `teams.commandPrefix`: a replay run never uses it.
+
+1. **The eval launcher, new** (Task 4): `probe`, `receive`, `prepare`, `check`, `exec`, `setup`, `stop`, `clean`, and `scrub`, with the arguments of Task 4. Every command a replay run makes in its workspace goes through `exec` as the eval account: `writeTeamContext`'s `node -e`, the guidance read of `memberConfiguration`, the path-scope and capture commands of `team-workspace.ts`, the retirement boundary, and the result patch read (`patchArgs` of `eval-git.ts`). The project's `setup` goes through `setup`. Both admit any argument list, because the account, its root, and its environment are the boundary. **While it is not installed:** the eval identity is `not-configured` or `unavailable`, no trial starts, and every baseline job waits `eval-identity`.
+2. **The grader launcher, version 2** (Task 5): `export JOB`, the input name `result.patch`, and `"version": 2` in the probe. **While version 1 is installed:** validation runs as before, no trial starts, and baseline jobs wait `grader`; the summary shows `grader ready (version 1: no trials)`.
+3. **The eval provider wrappers and the drain** (Task 4): `eval/claude`, `eval/codex`, `eval/codex-app-server`, `eval/opencode`, and `eval/transcript-drain`, which `drainLaunch` finds beside the wrapper. **While refused:** the replay launch fails, the trial ends `void-host`, and three such trials pause the job `trial-voids`.
+
+## Owner approvals
+
+The owner decided on 2026-11-13 to add the eval identity. None of the following is installed, and the slice works without it: nothing starts a trial until items 1 to 10 are done and a project sets `trialsPerDay`.
+
+1. **The account.** `useradd --system --user-group --no-create-home --home-dir /var/lib/infinite-eval/home --shell /usr/sbin/nologin infinite-eval`, then `install -d -o root -g root -m 0755 /var/lib/infinite-eval`, `install -d -o infinite-eval -g infinite-eval -m 0700 /var/lib/infinite-eval/home /var/lib/infinite-eval/tmp`, and `install -d -o infinite-eval -g infinite-eval -m 0711 /var/lib/infinite-eval/root /var/lib/infinite-eval/root/trials`. It joins no other group. A second instance uses `infinite-NAME-eval`.
+2. **The launcher.** `install -o root -g root -m 0755 deploy/ubuntu/eval-command.sh /usr/local/libexec/infinite/eval-command`, with `ROOT=`, `ACCOUNT=`, `EVAL_HOME=`, and `TEMPLATE=` set.
+3. **The wrappers and the drain.** `install -d -o root -g root -m 0755 /usr/local/libexec/infinite/eval`; `deploy/ubuntu/eval-wrapper.sh` as `claude`, `codex`, `codex-app-server`, and `opencode` there; `deploy/ubuntu/transcript-drain.sh` as `transcript-drain` there; each `root:root 0755`.
+4. **The sudo rule.** `install -o root -g root -m 0440 deploy/ubuntu/eval.sudoers /etc/sudoers.d/infinite-eval`, then `visudo -c`.
+5. **The network rule.** `deploy/ubuntu/eval.nft`, only where `autonomy.boundary.egress` is configured.
+6. **The egress lists.** `projects._eval.allow` lists the provider API hosts of the eval logins and nothing else; `projects["_eval-setup"].allow` lists the package registries setup needs, and no registry that serves the project's own later releases; `mode: "enforce"` for `isolated` trials.
+7. **The eval logins.** Log in each provider as the eval account, with provider-side history and memory off where the provider offers that, and use these logins for nothing else (owner decision 2).
+8. **The home template.** After the logins, copy the files the providers need besides the login files (for example `.claude.json` without its `projects` map, `.claude/settings.json`, `.codex/config.toml`) into `/usr/local/share/infinite-eval/home`, owned `root:infinite-eval`, directories `0750`, files `0640`.
+9. **Grader launcher version 2.** Reinstall `grader-command` from Task 5's template, with its `ROOT=` and `ACCOUNT=` lines.
+10. **The configuration.** Host: `"eval": { "member": { "prefix": { "command": "/usr/bin/sudo", "args": ["-n", "-u", "infinite-eval", "--", "/usr/local/libexec/infinite/eval-command"] }, "root": "/var/lib/infinite-eval/root", "agents": { "claude": { "command": "/usr/bin/sudo", "args": ["-n", "-H", "-u", "infinite-eval", "--", "/usr/local/libexec/infinite/eval/claude"] } }, "canaries": [the deploy's GitHub App, grant, egress, and vault key paths, and a canary file in the agent account's home] } }`, and a canary file in `/var/lib/infinite-eval/home` added to `eval.grader.canaries`. Project: `team.eval.trialsPerDay`, and `candidateProfiles` to measure a model outside the lineup.
+11. **The checks.** `sudo -l -U infinite-host` shows exactly the eval rules of item 4; an `exec -- /usr/bin/env` round with `INFINITE_HOOK_TOKEN` and `HTTPS_PROXY` exported prints only the fixed list; a `sleep` started as the eval account is gone after `stop`; a file planted in the eval home is gone after `scrub`; `infinite eval status PROJECT` shows `eval identity ready`.
+
+Open for the owner, with the default this plan builds: the windows of a job (none: any hour); `trialsPerDay` (absent: off; 6 recommended when turned on); the hosts in `_eval` and `_eval-setup`; the files in the home template; and the fallback estimate, which waits for the standing budget.
+
+## Not in this slice
+
+- `compare` and `confirm` jobs, the dev and holdout sets, `excludeGroups`, reports, epochs in comparisons, the prior export, and the calibration pair read (step 4). The trial rows, their sealed grades, and their patches are stored for them.
+- Trial reuse (step 4's `compare` jobs).
+- The learning budget: `reserve`, `settle`, `status`, USD job limits, the learning floor, the per-trial estimate, `estimate-unavailable`, and `budget-exhausted` (delegated adoption delivery step 4, "The standing budget", which also removes `trialsPerDay`).
+- A `promptOrigins` filter, which needs a plain column for the prompt origin.
+- Pinned guidance, forced knowledge, prompt overrides, and the `gate` purpose (the improvement gate design).
+- Duel judges as the eval identity, and the open-duel gate (the duels design).
+- Run-level replay and the blind rubric (step 5). The capsule's goal context is not rendered in a trial's prompt until then.
+- Permission measurements that keep trial calls apart from production calls; the permission agent decides a served project's trial dialogs under its own limits.
+- A probe that the provider endpoints are reachable; a transient systemd unit per trial.
+- Rendering the eval files for a second instance (`scripts/render-instance.mjs`).
+- The trials in the web client, the phone, and the Mac app.
+- MCP tools: none (C9 rules 3 and 8).

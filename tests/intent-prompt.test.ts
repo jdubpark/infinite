@@ -66,7 +66,7 @@ function runFixture(): TeamRun {
   } as unknown as TeamRun;
 }
 
-test("the checker's context holds the record, the plan, and the findings, and nothing else", () => {
+test("the checker's context holds the record, the plan, and this revision's findings, and nothing else", () => {
   const context = intentContext({ run: runFixture(), record: RECORD, planMember, mode: "autonomous", criteriaDue: true, checks: CHECKS });
   assert.ok(context, "a context is built");
   assert.equal(context.kind, "intent-check");
@@ -83,6 +83,8 @@ test("the checker's context holds the record, the plan, and the findings, and no
   assert.equal(context.limits.assumptionsLeft, 31);
   assert.equal(context.limits.criteriaLeft, 6);
   assert.equal(JSON.stringify(context).includes(SENTINEL), false, "no implementer report, routing pin, or blackboard flag");
+  const revised = intentContext({ run: { ...runFixture(), revision: 3 }, record: RECORD, planMember, mode: "autonomous", criteriaDue: true, checks: CHECKS });
+  assert.deepEqual(revised?.findings, [], "an earlier revision's findings are not this plan's");
 });
 
 test("a checker context over 1 MiB is not built", () => {

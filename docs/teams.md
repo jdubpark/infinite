@@ -1157,10 +1157,10 @@ The corrected plan is accepted without a second check.
 **Failures and skips.** A checker that stops without a usable report, or fails
 its read-only check, counts one failure. A pause, cancel, halt, block, or
 recovery that stops the read-only check counts no failure and writes nothing; a
-resumed run plans a new revision, and its plan is checked. The first failure starts one replacement
-with the event `The intent checker stopped without a usable report; one
-replacement starts.` A second failure skips the check. Every skip accepts the held
-plan once and writes one event:
+resumed run plans a new revision, and its plan is checked. The first failure
+starts one replacement with the event `The intent checker stopped without a
+usable report; one replacement starts.` A second failure skips the check. Every
+skip accepts the held plan once and writes one event:
 
 - `checker-failed`: `The intent check was skipped: the checker failed twice. The plan is accepted unchecked.`
 - `no-eligible-profile`: `The intent check was skipped: no evaluator profile differs in family from the coordinator and the plan's author. The plan is accepted unchecked.`

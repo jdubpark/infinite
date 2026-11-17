@@ -47,6 +47,8 @@ export type StatusProfile = { profileId: string; removed?: "contributor" | "revi
 export type StatusCell = { scope: "cell"; area: string; taskKind: string | null; featureVersion: number; featureMap: string } | { scope: "new-task" };
 export type RoutingStatus = {
   projectId: string; mode: RoutingMode; requested: RoutingMode | null; source: "saved" | "autonomous-default" | null;
+  /** Who chose the mode: a saved mode, or the autonomous default (also when a saved policy has no mode). Null when off. */
+  modeSource: "saved" | "autonomous-default" | null;
   knobs: RoutingKnobs | null; defaults: (keyof RoutingKnobs)[];
   covers: { start: boolean; reason: "off" | "no-lineup" | "no-start-point" | "no-eligible-profile" | null };
   costs: { lightUsd: number; strongUsd: number; rescueUsd: number; basis: "tier-default" };

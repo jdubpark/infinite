@@ -4,7 +4,7 @@ import { clientCommandCandidate, handleClientCommand, legacyImportLines, legacyR
 import type { OutcomeRollup } from "../packages/host/src/outcome-rollup.js";
 import type { LegacyLineOutcome } from "../packages/host/src/outcome-legacy.js";
 import type { CellsResult } from "../packages/host/src/outcome-reads.js";
-import { DECISION_LIMIT, handleRoutingClientCommand, routingExplainLines, routingStatusLines } from "../packages/host/src/routing-cli.js";
+import { DECISION_LIMIT, handleRoutingClientCommand, requestedRouting, routingExplainLines, routingStatusLines } from "../packages/host/src/routing-cli.js";
 import { ROUTING_DEFAULTS } from "../packages/host/src/routing-policy.js";
 import { PROJECT_DECISION_LIMIT } from "../packages/host/src/routing-store.js";
 import type { CandidateRecord, ExplainedDecision, RoutingExplain, RoutingPayload, RoutingStatus } from "../packages/host/src/routing-types.js";
@@ -254,7 +254,7 @@ test("refused lines are named on their own", () => {
 const routingProfile = { profileId: "ops-light", rows: { production: 0, duel: 0 }, earlier: { mass: 0, rows: 0, appliedMass: 0 }, mean: 0.5, interval: [0.3, 0.7], rescue: 0.5, level: "none", costUsd: 0.4, greedy: true };
 const routingRemoved = { profileId: "review-strong", removed: "contributor", rows: { production: 0, duel: 0 }, earlier: { mass: 0, rows: 0, appliedMass: 0 }, mean: 0, interval: [0, 0], rescue: 0, level: "none", costUsd: 2.2, greedy: false };
 const routingStatusFixture = (overrides: Partial<RoutingStatus> = {}): RoutingStatus => ({
-  projectId: "alpha", mode: "shadow", requested: "shadow", source: "saved",
+  projectId: "alpha", mode: "shadow", requested: "shadow", source: "saved", modeSource: "saved",
   knobs: { points: ["start"], cascade: false, successValueUsd: 2, maxExploreShare: 0.2, exploreWindow: 50, minSpareAttempts: 4, allowContributor: false, listWeight: 0.25, headroomWeight: 1 },
   defaults: ["successValueUsd", "listWeight"],
   covers: { start: true, reason: null },
@@ -295,7 +295,7 @@ test("routing lines show unknown, never zero", () => {
     requested: "auto", shadow: { windowDays: 30, decisions: 3, withCoordinator: 3, agreements: 2, greedyAgreements: 1, capped: true },
     period: { decisions: 0, capped: false, firstAt: null, targetDays: 14, targetDecisions: 50 }, cellsCapped: true, unreadableCells: 2,
   } as Partial<RoutingStatus>));
-  assert.equal(withCoordinator[0], "alpha · routing shadow (saved) · requested auto: this host records shadow decisions only");
+  assert.equal(withCoordinator[0], "alpha · routing shadow (saved) · requested auto: auto starts after the shadow period");
   assert.equal(withCoordinator[3], "Shadow, last 30 days: 3 decisions; the router matched the coordinator in 2 of 3 (newest 500)");
   assert.equal(withCoordinator[4], "Shadow period: no decision yet.");
   const off = routingStatusLines(routingStatusFixture({ mode: "off", requested: null, source: null, knobs: null, defaults: [], covers: { start: false, reason: "off" }, cells: [] } as Partial<RoutingStatus>));
@@ -381,12 +381,12 @@ test("the newest-decisions cap is the store's limit", () => {
 test("routing lines: the other branch of each line, and clean on every id", () => {
   const knobs = routingStatusFixture().knobs!;
   const lines = routingStatusLines(routingStatusFixture({
-    source: "autonomous-default", defaults: ["allowContributor"], knobs: { ...knobs, allowContributor: true },
+    source: "autonomous-default", modeSource: "autonomous-default", defaults: ["allowContributor"], knobs: { ...knobs, allowContributor: true },
     shadow: { windowDays: 30, decisions: 500, withCoordinator: 0, agreements: 0, greedyAgreements: 0, capped: true },
     cells: [{ cell: { scope: "cell", area: "api", taskKind: "feature", featureVersion: 2, featureMap: "0123456789abcdef".repeat(4) },
       profiles: [{ ...routingProfile, profileId: "ops\x1blight\x9b", greedy: false }, routingProfile] as never }],
   } as Partial<RoutingStatus>));
-  assert.equal(lines[0], "alpha · routing shadow (autonomous default)");
+  assert.equal(lines[0], "alpha · routing shadow (autonomous default) · auto starts after the shadow period");
   assert.equal(lines[1], "Value $2 per success · list weight 0.25 · contributor profiles allowed (default)");
   assert.equal(lines[3], "Shadow, last 30 days: 500 decisions; no decision had a coordinator pick (newest 500)");
   assert.deepEqual(lines.slice(7), [
@@ -416,7 +416,7 @@ test("routing explain lines: the shape the host answers, a sampler fallback, and
 });
 
 test("the routing command refuses bad usage before any request, and maps or passes the other host errors", async () => {
-  const usage = "Usage: infinite routing status PROJECT [--json] | infinite routing explain RUN_ID TASK_ID [--json]";
+  const usage = "Usage: infinite routing status PROJECT [--json] | infinite routing explain RUN_ID TASK_ID [--json] | infinite routing pause-explore PROJECT [--json] | infinite routing resume-explore PROJECT [--json]";
   const run = "11111111-1111-4111-8111-111111111111";
   const calls: string[] = [];
   const fake = (routes: Record<string, unknown>) => ({
@@ -473,4 +473,122 @@ test("the routing command checks the host flag and prints the fixed sentences fo
   } finally {
     console.log = log;
   }
+});
+
+const autoPeriod = { decisions: 50, capped: false, firstAt: "2026-11-01T10:00:00.000Z", endsAt: "2026-11-15T10:00:00.000Z", endedAt: "2026-11-15T10:00:00.000Z", stored: true, targetDays: 14 as const, targetDecisions: 50 as const };
+
+test("routing auto lines show the period, the pause, and the share", () => {
+  const lines = routingStatusLines(routingStatusFixture({
+    mode: "auto", requested: "auto", period: autoPeriod,
+    explore: { exploratory: 1, of: 5, guards: "applied", pausedAt: null },
+    share: { exploratory: 1, of: 5, window: 50, limit: 0.2 },
+    auto: { windowDays: 30, pending: 2, applied: 3, released: 1, capped: true },
+  } as Partial<RoutingStatus>));
+  assert.equal(lines[0], "alpha · routing auto (saved)");
+  assert.equal(lines[4], "Shadow period: ended 2026-11-15T10:00:00.000Z.");
+  assert.equal(lines[5], "Explored: 1 of 5 auto start decisions in the last 30 days.");
+  assert.equal(lines[6], "Exploration share: 1 of the last 5 pending or applied starts; the limit is 0.2 of 50.");
+  assert.equal(lines[7], "Auto starts, last 30 days: 2 pending, 3 applied, 1 released. (newest 500)");
+  assert.equal(lines[9], "The router's applied choices count at full weight.");
+  const uncapped = routingStatusLines(routingStatusFixture({
+    mode: "auto", requested: "auto", period: autoPeriod, share: { exploratory: 0, of: 0, window: 50, limit: 0.2 },
+    explore: { exploratory: 0, of: 0, guards: "applied", pausedAt: null }, auto: { windowDays: 30, pending: 0, applied: 0, released: 0, capped: false },
+  } as Partial<RoutingStatus>));
+  assert.ok(uncapped.includes("Exploration share: no auto start decision yet."), uncapped.join("\n"));
+  assert.ok(uncapped.includes("Auto starts, last 30 days: 0 pending, 0 applied, 0 released."), uncapped.join("\n"));
+});
+
+test("a pause prints its line in both modes, and the autonomous default names itself", () => {
+  const paused = "2026-11-16T09:00:00.000Z";
+  const shadowPaused = routingStatusLines(routingStatusFixture({ explore: { exploratory: 1, of: 3, guards: "risk-only", pausedAt: paused } } as Partial<RoutingStatus>));
+  assert.ok(shadowPaused.includes(`Exploration paused since ${paused}.`), shadowPaused.join("\n"));
+  const autoPaused = routingStatusLines(routingStatusFixture({
+    mode: "auto", requested: "auto", period: autoPeriod, share: { exploratory: 0, of: 0, window: 50, limit: 0.2 },
+    explore: { exploratory: 0, of: 0, guards: "applied", pausedAt: paused }, auto: { windowDays: 30, pending: 0, applied: 0, released: 0, capped: false },
+  } as Partial<RoutingStatus>));
+  assert.ok(autoPaused.includes(`Exploration paused since ${paused}.`), autoPaused.join("\n"));
+
+  const endedDefault = routingStatusLines(routingStatusFixture({ source: "autonomous-default", modeSource: "autonomous-default", period: { ...autoPeriod, stored: false } } as Partial<RoutingStatus>));
+  assert.equal(endedDefault[0], "alpha · routing shadow (autonomous default) · auto starts after the shadow period");
+  assert.equal(endedDefault[4], "Shadow period: ended 2026-11-15T10:00:00.000Z.", "the autonomous default never says --routing auto is needed");
+  const endedSaved = routingStatusLines(routingStatusFixture({ period: autoPeriod } as Partial<RoutingStatus>));
+  assert.equal(endedSaved[4], "Shadow period: ended 2026-11-15T10:00:00.000Z. Auto routing needs --routing auto.");
+  // A saved policy without a mode in an autonomous project: the mode is the autonomous default's, so no --routing auto note.
+  const savedNoMode = routingStatusLines(routingStatusFixture({ source: "saved", modeSource: "autonomous-default", period: autoPeriod } as Partial<RoutingStatus>));
+  assert.equal(savedNoMode[0], "alpha · routing shadow (autonomous default) · auto starts after the shadow period");
+  assert.equal(savedNoMode[4], "Shadow period: ended 2026-11-15T10:00:00.000Z.", "a saved policy without a mode never asks for --routing auto");
+  const autoNoMode = routingStatusLines(routingStatusFixture({
+    mode: "auto", requested: "shadow", source: "saved", modeSource: "autonomous-default", period: autoPeriod,
+    share: { exploratory: 0, of: 0, window: 50, limit: 0.2 }, explore: { exploratory: 0, of: 0, guards: "applied", pausedAt: null },
+    auto: { windowDays: 30, pending: 0, applied: 0, released: 0, capped: false },
+  } as Partial<RoutingStatus>));
+  assert.equal(autoNoMode[0], "alpha · routing auto (autonomous default)");
+});
+
+test("requested routing accepts auto and keeps the step-1 checks", () => {
+  assert.deepEqual(requestedRouting({ "--routing": "auto" }), { mode: "auto" });
+  assert.deepEqual(requestedRouting({ "--routing": "shadow" }), { mode: "shadow" });
+  assert.deepEqual(requestedRouting({ "--routing": "off" }), { mode: "off" });
+  assert.throws(() => requestedRouting({ "--routing": "on" }), { message: "--routing must be off, shadow, or auto." });
+  assert.equal(requestedRouting({}), undefined);
+  assert.deepEqual(requestedRouting({ "--routing-value": "cost" }), { successValueUsd: 0.5 });
+  assert.deepEqual(requestedRouting({ "--routing-value": "12.5" }), { successValueUsd: 12.5 });
+  assert.throws(() => requestedRouting({ "--routing-value": "101" }), { message: "--routing-value must be cost, balanced, quality, or a dollar value from 0 to 100." });
+  assert.deepEqual(requestedRouting({ "--routing-contributor": "allow" }), { allowContributor: true });
+  assert.throws(() => requestedRouting({ "--routing-contributor": "maybe" }), { message: "--routing-contributor must be allow or deny." });
+});
+
+test("the routing command pauses and resumes exploration", async () => {
+  const usage = "Usage: infinite routing status PROJECT [--json] | infinite routing explain RUN_ID TASK_ID [--json] | infinite routing pause-explore PROJECT [--json] | infinite routing resume-explore PROJECT [--json]";
+  const paused = "2026-11-16T09:00:00.000Z";
+  const posted: [string, unknown][] = [];
+  const fake = (me: Record<string, unknown>, answers: Record<string, unknown> = {}) => ({
+    json: async (path: string, body?: unknown) => {
+      if (path === "/me") return me;
+      posted.push([path, body]);
+      return answers[path];
+    },
+  }) as unknown as Parameters<typeof handleRoutingClientCommand>[2];
+  const withAuto = { teams: { routing: 1, routingAuto: 1 } };
+  const logged: string[] = [];
+  const log = console.log;
+  console.log = (...values: unknown[]) => { logged.push(values.map(String).join(" ")); };
+  try {
+    await handleRoutingClientCommand(["pause-explore", "rehearsal"], {}, fake(withAuto, { "/routing/projects/rehearsal/explore/pause": { projectId: "rehearsal", explorePausedAt: paused } }));
+    assert.deepEqual(posted, [["/routing/projects/rehearsal/explore/pause", {}]]);
+    assert.equal(logged.at(-1), `Exploration paused for rehearsal since ${paused}.`);
+
+    await handleRoutingClientCommand(["resume-explore", "rehearsal"], {}, fake(withAuto, { "/routing/projects/rehearsal/explore/resume": { projectId: "rehearsal", explorePausedAt: null } }));
+    assert.equal(posted.at(-1)![0], "/routing/projects/rehearsal/explore/resume");
+    assert.equal(logged.at(-1), "Exploration resumed for rehearsal.");
+
+    const answer = { projectId: "rehearsal", explorePausedAt: paused };
+    await handleRoutingClientCommand(["pause-explore", "rehearsal"], { "--json": true }, fake(withAuto, { "/routing/projects/rehearsal/explore/pause": answer }));
+    assert.equal(logged.at(-1), JSON.stringify(answer, null, 2));
+
+    posted.length = 0;
+    await assert.rejects(handleRoutingClientCommand(["pause-explore", "rehearsal"], {}, fake({ teams: { routing: 1 } })), { message: "This host does not support exploration pauses. Upgrade the host first." });
+    await assert.rejects(handleRoutingClientCommand(["resume-explore", "rehearsal"], {}, fake({ teams: { routing: 1 } })), { message: "This host does not support exploration pauses. Upgrade the host first." });
+    assert.deepEqual(posted, [], "no pause or resume is posted to a host without the flag");
+
+    for (const args of [["pause-explore"], ["resume-explore"], ["pause-explore", "a", "b"]]) {
+      await assert.rejects(handleRoutingClientCommand(args, {}, fake(withAuto)), { message: usage }, args.join(" "));
+    }
+    assert.deepEqual(posted, []);
+  } finally {
+    console.log = log;
+  }
+});
+
+test("explain prints the guards of an auto decision", () => {
+  const guards = { pausedAt: "2026-11-16T09:00:00.000Z", spareAttempts: 3, share: { exploratory: 1, of: 4 } };
+  const lines = routingExplainLines(explainAnswer([explainDecision({
+    mode: "auto", state: "applied", payload: { ...explainPayload([]), guards },
+  })]));
+  assert.equal(lines[0], "Revision 1 · start 1 · auto · applied · basis sampled · decided 2026-11-14T10:00:00.000Z");
+  assert.equal(lines[3], "Guards: pause since 2026-11-16T09:00:00.000Z · spare attempts 3 · share 1 of 4");
+  const unpaused = routingExplainLines(explainAnswer([explainDecision({
+    mode: "auto", state: "pending", payload: { ...explainPayload([]), guards: { ...guards, pausedAt: null } },
+  })]));
+  assert.equal(unpaused[3], "Guards: pause none · spare attempts 3 · share 1 of 4");
 });

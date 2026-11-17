@@ -533,6 +533,11 @@ test("the status reports the requested mode, the source, the defaults, the start
     store = open(f);
     const auto = routingStatus(store, statusInput({ saved: { mode: "auto", successValueUsd: 8 } }));
     assert.deepEqual([auto.mode, auto.requested, auto.source, auto.defaults.includes("successValueUsd"), auto.defaults.includes("points")], ["shadow", "auto", "saved", false, true]);
+    // A saved mode decides; a saved policy without a mode in an autonomous project takes the autonomous default's mode.
+    assert.equal(auto.modeSource, "saved");
+    const noMode = routingStatus(store, statusInput({ autonomy: "autonomous", saved: { successValueUsd: 8 } }));
+    assert.deepEqual([noMode.source, noMode.requested, noMode.modeSource], ["saved", "shadow", "autonomous-default"]);
+    assert.equal(routingStatus(store, statusInput({ saved: { mode: "shadow" } })).modeSource, "saved");
     const escalationOnly = routingStatus(store, statusInput({ saved: { mode: "shadow", points: ["escalation"] } }));
     assert.deepEqual([escalationOnly.covers, escalationOnly.cells], [{ start: false, reason: "no-start-point" }, []]);
     for (let revision = 1; revision <= 21; revision++) seed(store, { taskId: "t1", revision });

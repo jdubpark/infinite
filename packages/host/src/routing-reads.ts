@@ -201,6 +201,7 @@ export function routingStatus(store: EvidenceStore, input: RoutingStatusInput): 
       mode,
       requested: effective.mode === "shadow" ? effective.requested : null,
       source: effective.mode === "shadow" ? effective.source : null,
+      modeSource: effective.mode === "off" ? null : input.saved?.mode !== undefined ? "saved" : "autonomous-default",
       knobs,
       defaults: effective.mode === "shadow" ? effective.defaults : [],
       covers: { start: reason === null, reason },

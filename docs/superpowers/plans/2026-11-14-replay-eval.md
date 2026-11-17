@@ -1516,7 +1516,7 @@ The Git commands that validation runs inside the grader's root (`clone` of the b
 
 ## Owner approvals
 
-The owner decided on 2026-11-13 to add the grader identity. None of the following is installed, and the slice works without it: mining needs only items 6 and 7, and validation needs items 1 to 5 and 7.
+The owner decided on 2026-11-13 to add the grader identity. None of the following is installed, and the slice works without it: mining needs only items 6 and 7, and validation needs items 1 to 5 and 7, plus E3 and form 1 of item 6 (see "Git commands").
 
 1. **The account.** `useradd --system --user-group --create-home --home-dir /var/lib/infinite-grader --shell /usr/sbin/nologin infinite-grader` (a second instance uses `infinite-NAME-grader`, as `deploy/ubuntu/instances.md` names accounts). It joins no other group: not the agent's, not the host's, and not the group that may read the GitHub App token cache. It has no provider login and no repository credential.
 2. **The root.** `install -d -o infinite-grader -g infinite-grader -m 0700 /var/lib/infinite-grader/root`, on the data volume. *(Recommended, not required: a disk quota for the account.)*

@@ -228,6 +228,13 @@ test("every item is written down or counted", () => {
   const viaKept = apply(record, screened.kept, { screened: screened.dropped });
   assert.deepEqual(viaKept.record, direct.record, "the kept report gives the same record");
   assert.deepEqual(viaKept.dropped, direct.dropped);
+
+  // Past the record's byte cap, the remaining items are counted and the rest of the report is still written.
+  const wide = (index: number): IntentItem => ({ ...assumeItem(`wide${index}`), assumption: { statement: `${index} ${"s".repeat(470)}`, refutedBy: "r".repeat(480), test: OWNER_TEST } });
+  const half = apply(record, report(Array.from({ length: 16 }, (_, index) => wide(index))));
+  const full = apply(half.record, report(Array.from({ length: 16 }, (_, index) => wide(16 + index))), { revision: 2, at: at(2) });
+  assert.ok(full.dropped.cap > 0 && full.record.assumptions.length > 16, "the cap drops only the items past it");
+  assert.equal(full.record.assumptions.length + full.dropped.cap, 32);
 });
 
 test("secret-shaped items are dropped and never echoed", () => {
@@ -313,9 +320,14 @@ test("a ninth open question closes the oldest that does not wait", () => {
 });
 
 test("with 8 waiting questions, a ninth is dropped and its assumption kept", () => {
-  const eight = Array.from({ length: 8 }, (_, index) => askItem(`w${index}`, { interrupt: true }));
+  // Each question is as long as the report allows, so the owner's decision must shorten every line to show all eight.
+  const eight = Array.from({ length: 8 }, (_, index) => {
+    const item = askItem(`w${index}-${"d".repeat(190)}`, { interrupt: true });
+    return { ...item, question: { ...item.question!, text: `Which one? ${"x".repeat(380)}` } };
+  });
   const full = apply(v1(), report(eight), { mode: "supervised" });
   assert.equal(full.record.questions.filter(item => item.waits).length, 8);
+  for (let index = 0; index < 8; index += 1) assert.ok(full.decision?.question.includes(`\n${index + 1}. w${index}-`), `the decision hides question ${index + 1}`);
   const more = apply(full.record, report([askItem("extra", { def: "z" })]), { mode: "supervised", revision: 2, at: at(2) });
   assert.equal(more.record.questions.length, 8, "the new question is dropped");
   assert.equal(more.record.assumptions.length, 9, "its assumption is kept");

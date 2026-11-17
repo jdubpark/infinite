@@ -9,7 +9,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import { createTeamSchema, gitBranchSchema, githubRepositorySchema, teamDeliverySchema, teamDeliveryReconcileSchema, teamPermissionsSchema, type ProjectSource, type TeamDelivery, DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE} from "./team-types.js";
 import { describeSource } from "./client.js";
-import { requestedRouting, ROUTING_AUTO_NOTE } from "./routing-cli.js";
+import { assertRoutingSupport, requestedRouting, ROUTING_AUTO_NOTE } from "./routing-cli.js";
 import { autonomyModeSchema } from "./autonomy.js";
 import type { EntryPage } from "./evidence/blackboard.js";
 import type { EntryHead } from "./evidence/entry-types.js";
@@ -633,7 +633,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const explicitLinearTeam = options["--linear-team"] === undefined ? undefined : z.uuid().parse(String(options["--linear-team"]));
     const explicitLinearProject = options["--linear-project"] === undefined ? undefined : z.uuid().parse(String(options["--linear-project"]));
     if ("nonGit" in gitResult) {
-      const unsupported = ["--project", "--source", "--teamwork", "--setup-json", "--check-json", "--handoff", "--request-id", "--delivery", "--repository", "--base-branch", "--merge-method", "--permissions", "--permission-scope", "--permission-limit", "--autonomy", "--routing", "--routing-value", "--routing-contributor"].filter(flag => options[flag] !== undefined);
+      const unsupported = ["--project", "--source", "--teamwork", "--setup-json", "--check-json", "--handoff", "--request-id", "--delivery", "--repository", "--base-branch", "--merge-method", "--permissions", "--permission-scope", "--permission-limit", "--autonomy", "--routing", "--routing-value", "--routing-contributor", "--routing-points"].filter(flag => options[flag] !== undefined);
       if (unsupported.length) throw new Error(`This directory is not a Git repository, so ${unsupported.join(", ")} cannot be used here. Run repo init in a Git repository for enrollment, or use only --linear-team and --linear-project to save directory defaults.`);
       if (!explicitLinearTeam && explicitLinearProject && !inheritedDefault?.teamId)
         throw new Error("--linear-project requires --linear-team or an inherited directory Linear team.");
@@ -669,8 +669,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const me = await api.json<any>("/me");
     if (me.teams?.repoEnrollment !== 1) throw new Error("This host does not support repository enrollment. Upgrade the host before running repo init.");
     if (autonomy && me.teams?.autonomyMode !== 1) throw new Error("This host does not support autonomy modes. Upgrade the host before using --autonomy.");
-    if (routingChoice && me.teams?.routing !== 1) throw new Error("This host does not support routing settings. Upgrade the host before using --routing.");
-    if (routingChoice?.mode === "auto" && me.teams?.routingAuto !== 1) throw new Error("This host does not support auto routing. Upgrade the host before using --routing auto.");
+    assertRoutingSupport(routingChoice, me);
     const mappings = readPrivateJson(mappingsPath, {}) as Record<string, unknown>;
     const key = `${config.origin}\n${root}`;
     const stored = mappings[key];

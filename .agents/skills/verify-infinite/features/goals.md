@@ -44,7 +44,7 @@ End-state checks on a host with goals enabled: `GET /api/goals` lists a goal who
 
 ## Gotchas
 
-- The development host has goals disabled (`GET /api/me` → `goals.enabled: false`) and no team lineup. Goals depend on the teams feature, so the same host setup applies. Report the gap rather than changing host configuration.
+- The development host has goals disabled (`GET /api/me` → `goals.enabled: false`) and no team lineup. Goals depend on the teams feature, so the same host setup applies. The `goal` journey enables goals only in its own disposable instance (`configure --profile goals` in SKILL.md, Teams and goals host); it never changes the host it is given. Report any gap in a host you did not create.
 - Goal cycles run teams. Everything in [teams.md](teams.md) about isolated working copies, configured checks, and real providers applies to every cycle.
 - Creation is owner only. Steering and recording an outcome are owner or controller actions. Pause, resume, cancel, extend, and parallelism are owner-only; the host answers a controller's request for them with 403.
 - "Total time ceiling" must be at least the time limit. The form enforces this with `min`, so a smaller value is rejected by the browser before the request is sent.

@@ -34,17 +34,17 @@ PORT=$(node -p "require('$INST/config.json').port")
    cd "$ROOT" && npm run build
    ```
 
-2. Pick a free port, create the run, and start the host. Run the whole block in one shell call, because the variables do not carry over. The README default is 4780, but another process may already hold it; this block skips any port with a listener and never touches a process it did not start. The first start initializes an empty instance: config, device keys, vault key, and the demo workspace.
+2. Pick a free port, create the run, and start the host. Run the whole block in one shell call, because the variables do not carry over. The candidates start at 4781: 4780 is the README default, but on some development machines it is a tunnel to another host, so this skill never uses it. The block skips any port with a listener and never touches a process it did not start. The first start initializes an empty instance: config, device keys, vault key, and the demo workspace.
 
    The run directory is under `/tmp`, which is also the host's own default run directory. The session workers listen on Unix sockets inside it, and short socket paths are the portable choice (the macOS header limits `sun_path` to 104 bytes). Repository-local socket paths also worked in testing on this machine, but do not rely on that. `npm run dev` wraps `tsx`; this block runs the same entry point directly, so the recorded PID is the API process.
 
    ```sh
    ROOT=$(cd "${CHECKOUT:-.}" && git rev-parse --show-toplevel) && echo "checkout: $ROOT ($(git -C "$ROOT" rev-parse --abbrev-ref HEAD) $(git -C "$ROOT" rev-parse --short HEAD))"
    PORT=""
-   for CANDIDATE in 4780 4781 4782 4783 4784 4785 4786 4787; do
+   for CANDIDATE in 4781 4782 4783 4784 4785 4786 4787; do
      if [ -z "$(lsof -nP -iTCP:$CANDIDATE -sTCP:LISTEN 2>/dev/null)" ]; then PORT=$CANDIDATE; break; fi
    done
-   [ -n "$PORT" ] || { echo "no free port in 4780-4787"; exit 1; }
+   [ -n "$PORT" ] || { echo "no free port in 4781-4787"; exit 1; }
    RUN="verify-$(date -u +%Y%m%dT%H%M%SZ)"
    INST="$ROOT/.local/verify/$RUN/instance"
    EVID="$ROOT/.local/verify/$RUN/evidence"
@@ -83,6 +83,43 @@ cd "$ROOT" && npm run --silent host -- doctor --config "$INST/config.json" > "$E
 The first command checks that the recorded PID is this instance's process (its arguments contain this instance's config path), that the port's listener is that PID, that anonymous API calls are refused, that the owner key is accepted, that the session list is readable, and that the web and host builds exist. It exits 1 on any failure.
 
 The second command is the CLI's own doctor. It prints provider versions and warnings. The warnings about `/etc/claude-code/managed-settings.json` and `/etc/codex/requirements.toml` are expected on a development host. Those ceilings are installed on the cloud host by `deploy/ubuntu/install-ceilings.sh`.
+
+## Teams and goals host
+
+The rehearsal instance above has teams and goals disabled, so the `team` and `goal` journeys need their own instance. Teams and goals read host configuration at startup, so the instance is created without starting, configured, and then started. Use this block in place of step 2 of Launch, with `PROFILE` set to `teams` (the team journey) or `goals` (the goal journey). Run the whole block in one shell call.
+
+```sh
+ROOT=$(cd "${CHECKOUT:-.}" && git rev-parse --show-toplevel)
+DRIVE="$ROOT/.agents/skills/verify-infinite/scripts/drive.mjs"
+PROFILE=teams   # or goals
+RUN="$PROFILE-$(date -u +%Y%m%dT%H%M%SZ)"
+INST="$ROOT/.local/verify/$RUN/instance"
+EVID="$ROOT/.local/verify/$RUN/evidence"
+PORT=""
+for CANDIDATE in 4781 4782 4783 4784 4785 4786 4787; do
+  if [ -z "$(lsof -nP -iTCP:$CANDIDATE -sTCP:LISTEN 2>/dev/null)" ]; then PORT=$CANDIDATE; break; fi
+done
+[ -n "$PORT" ] || { echo "no free port in 4781-4787"; exit 1; }
+RUNDIR=$(mktemp -d /tmp/iv-XXXXXX)
+mkdir -p "$INST" "$EVID" && printf '%s\n' "$RUNDIR" > "$INST/run-dir"
+cd "$ROOT"
+node --import tsx packages/host/src/cli.ts init --local --config "$INST/config.json" --port "$PORT" \
+  --state-dir "$INST/data" --run-dir "$RUNDIR" --project "$INST/workspace" --name "Verification host"
+node "$DRIVE" configure --instance "$INST" --profile "$PROFILE"
+nohup node --import tsx packages/host/src/cli.ts dev --config "$INST/config.json" --port "$PORT" \
+  --state-dir "$INST/data" --run-dir "$RUNDIR" --project "$INST/workspace" --name "Verification host" \
+  > "$EVID/server.log" 2>&1 &
+echo $! > "$INST/server.pid"
+curl --retry 30 --retry-connrefused --retry-delay 1 -s -o /dev/null -w 'api %{http_code}\n' "http://127.0.0.1:$PORT/api/me"
+```
+
+`init --local` writes the same config and device keys as `dev` does on its first start, but no demo agent, and `--port` must be passed so the config records the port the API uses. `configure` then replaces the agents with fixture agents from `tests/fixtures`, so no real provider command is in the instance config, and it writes a throwaway git project and the team workspace under `$INST`. Nothing outside the instance directory is written, and the `teams` journey and the `goals` journey each need their own instance.
+
+- Teams profile: `teams.workspaceDir` and a `demo` agent running `tests/fixtures/team-agent.mjs` (scenario `success`), with `enableDemo` on. The fixture's tasks name no agent profile, so a configured lineup would refuse them. The team runs on Rehearsal, as the team form's single-agent mode offers.
+- Goals profile: a lineup with a strong coordinator and reviewer (goals are off without one), `claude` and `codex` agents running `tests/fixtures/goal-agent.mjs` (scenario `cycles`), and `release-first-plan` written into the receipts directory. That fixture holds its first plan until the file exists; the goal tests write it by hand to inspect a held cycle, and a journey releases it up front.
+- Both profiles set `teams.publishHeads` to false, so no head is pushed to GitHub, and set the throwaway project's required check to `check.mjs`.
+
+The `goal-agent.mjs` fixture writes its plan brief on every plan, so a goal needs no `plan-brief` receipt. The `plan-brief` receipt is a `team-agent.mjs` switch for runs that are not goals.
 
 ## Drive
 
@@ -128,6 +165,20 @@ It fails on any page error. It does not stop the session; `cleanup` stops it thr
 
 For any other feature, write a script in `$ROOT/.local/verify/$RUN/` so Playwright resolves from the repository's `node_modules`. Read the owner key with `JSON.parse(readFileSync(...devices.json)).owner`, never print it, and launch Chromium with the same executable lookup as `drive.mjs` (see Helpers). Do not run `npx playwright install`; if no Chrome is available, set `PLAYWRIGHT_CHROMIUM_PATH` to an installed Chrome.
 
+Run the teams journey on a teams-profile instance (see Teams and goals host), or the goals journey on a goals-profile instance:
+
+```sh
+ROOT=$(cd "${CHECKOUT:-.}" && git rev-parse --show-toplevel)
+INST="<the instance directory from the teams or goals block>"
+node "$ROOT/.agents/skills/verify-infinite/scripts/drive.mjs" team --instance "$INST"   # or: goal --instance "$INST"
+```
+
+The `team` journey signs in as the owner, opens Teams, and checks that no setup notice shows and that `GET /api/me` reports teams enabled. It starts "Verification team" from the New team form on the throwaway project, opens the run, and waits for the page status to reach an end state. It passes when the page shows "Ready for your review" and `GET /api/teams/:id` reports `ready-for-review` with the same label. It writes `team.json`, `team.log`, `01-team-list.png`, and `02-team-run.png`.
+
+The `goal` journey signs in as the owner, opens Goals, and checks that no setup notice shows and that `GET /api/me` reports goals enabled. It starts "Verification goal" with one cycle on `features/progress.json`, waits for the page to reach an end state, and passes when the page shows "Ready for your review" or "Limit reached" and `GET /api/goals/:id` reports the same status, the form's objective, and the form's allowed paths. It writes `goal.json`, `goal.log`, `01-goal-list.png`, and `02-goal.png`.
+
+Both journeys end with the same owner-key check the other journeys use, and both write a failing verdict when the browser cannot start (`PLAYWRIGHT_CHROMIUM_PATH=/usr/bin/false` forces that). Each run's log ends with `verdict: pass` or `verdict: fail`.
+
 ## Evidence
 
 Proof standards:
@@ -150,7 +201,7 @@ grep -rlF "$KEY" "$EVID" && echo "owner key found in evidence: fix before sharin
 unset KEY
 ```
 
-Files from the sign-in journey: `01-sign-in.png`, `02-session-list.png`, `sign-in.json` (verdict, steps, page errors), `sign-in.log`, `server.log`, and `doctor-cli.txt`. Files from the session journey: `session.json`, `session.log`, the five screenshots listed under Drive, and any `99-failure-*.png`. Cleanup adds `cleanup.log`.
+Files from the sign-in journey: `01-sign-in.png`, `02-session-list.png`, `sign-in.json` (verdict, steps, page errors), `sign-in.log`, `server.log`, and `doctor-cli.txt`. Files from the session journey: `session.json`, `session.log`, the five screenshots listed under Drive, and any `99-failure-*.png`. Files from the team and goal journeys: `team.json` or `goal.json`, the matching `.log`, their screenshots, and any `99-failure-*.png`. Cleanup adds `cleanup.log`.
 
 ## Cleanup
 
@@ -161,7 +212,7 @@ ROOT=$(cd "${CHECKOUT:-.}" && git rev-parse --show-toplevel)
 RUN=$(cat "$ROOT/.local/verify/LAST-RUN")
 INST="$ROOT/.local/verify/$RUN/instance"
 EVID="$ROOT/.local/verify/$RUN/evidence"
-PORT=$(node -p "require('$INST/config.json').port" 2>/dev/null || echo 4780)
+PORT=$(node -p "require('$INST/config.json').port" 2>/dev/null || echo 4781)
 node "$ROOT/.agents/skills/verify-infinite/scripts/drive.mjs" cleanup --instance "$INST"
 lsof -nP -iTCP:"$PORT" -sTCP:LISTEN || echo "port $PORT is free"
 ls "$EVID"
@@ -170,7 +221,7 @@ ls "$EVID"
 Cleanup does this, and logs each step to `evidence/cleanup.log`:
 
 1. Finds this instance's processes. A session worker is a `packages/host/src/worker.ts` (or `dist/worker.js`) process that holds a unix socket under this instance's run directory. Its agent process is any descendant of the worker. Nothing else is included: a shell or editor with a file open in the instance directory is never signalled. Each process's start time and command line are recorded when it is found.
-2. If the API is this instance's process (its arguments contain this instance's config path), stops each running or starting session through `POST /api/sessions/:id/stop` as the owner.
+2. If the API is this instance's process (its arguments contain this instance's config path), stops each running or starting session through `POST /api/sessions/:id/stop` as the owner. It then cancels each goal and each standalone team run that is not finished, through `POST /api/goals/:id/cancel` and `POST /api/teams/:id/cancel`, and logs the HTTP status. Goals are cancelled first, because a goal's team runs are refused by the team cancel route. A finished run gets no call, so a passing teams or goals journey leaves nothing to cancel and its cleanup log says `active team runs: none` and `active goals: none`.
 3. Gives those processes 10 seconds to exit, sends TERM to any still alive, and sends KILL after a further 5 seconds.
 4. Stops the API the same way: TERM, a wait of up to 10 seconds, then KILL. Then it checks again for late instance processes and stops them.
 5. Removes the `/tmp/iv-*` run directory and the instance directory. It keeps the evidence directory.
@@ -186,6 +237,8 @@ If cleanup reports a PID it could not stop, check its arguments and working dire
 - `doctor --instance DIR [--port PORT]`: read-only checks listed under Doctor.
 - `sign-in --instance DIR [--port PORT] [--evidence DIR]`: the sign-in journey.
 - `session --instance DIR [--port PORT] [--evidence DIR]`: the sessions and steering journey under Drive.
+- `configure --instance DIR --profile teams|goals`: writes the teams or goals host configuration into an instance created by `init --local`, before its first start (Teams and goals host).
+- `team --instance DIR` and `goal --instance DIR`: the teams and goals journeys under Drive, on a matching profile instance.
 - `cleanup --instance DIR`: teardown under Cleanup.
 
 `scripts/browser.mjs` holds the steps the journeys share: Chromium launch, sign-in with a device key, the step recorder, and the JSON and log writer. Add a shared step there, not a second copy in a journey.
@@ -205,9 +258,10 @@ These surfaces are not covered by this skill. Read their own docs:
 
 ## Known limits
 
-- The sign-in and session journeys are scripted and have been run end to end on a disposable host. Teams and goals are mapped to source; their selectors come from `apps/web/src`, but they have not been driven yet.
+- The sign-in and session journeys are scripted and have been run end to end on a disposable host. The team and goal journeys are scripted on their own profile instances and have each passed three runs in a row on a disposable host (see Drive). They use fixture agents, so they check the web workflow and the host's status reporting, not that code was written. The goal journey runs one cycle (`maxRuns` 1).
 - The session journey starts Rehearsal only. The session-steering checks rely on the Rehearsal reply line and on the composer's take-control state, so a provider with a different prompt or control model needs its own journey.
 - The cleanup path with a live session was tested with demo sessions started through the owner API on throwaway instances, not through the browser UI. Both orders were tested: API stopped through cleanup, and API killed first with a worker still running.
 - Socket path length was measured on the development machine only. Long repository-local socket paths bound and accepted connections there; the `/tmp` run directory is the portable choice.
 - The host binds to `127.0.0.1` only. Cloud, relay, and Tailscale access are out of scope.
-- The rehearsal config has teams and goals disabled. Driving those pages needs host setup that this skill does not perform.
+- The rehearsal config has teams and goals disabled. The team and goal journeys need the teams or goals profile instance; the default `dev` instance does not have it.
+- The team and goal journeys write their runs, worktrees, and the throwaway project only under the instance directory, which cleanup removes. The fixture agents are the only agents configured, so no provider runs.

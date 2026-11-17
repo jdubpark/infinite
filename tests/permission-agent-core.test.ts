@@ -27,7 +27,7 @@ import {
   type PermissionTurnLauncher,
   type ReportOptions,
 } from "../packages/host/src/permission-reviewer.js";
-import { hostProtectedPaths, permissionAgentConfigSchema, type PermissionAgentSettings } from "../packages/host/src/permission-agent-config.js";
+import { hostProtectedPaths, permissionAgentConfigSchema, protectedInstallPath, type PermissionAgentSettings } from "../packages/host/src/permission-agent-config.js";
 import { PermissionReviewHeld } from "../packages/host/src/permission-agent-types.js";
 import type { PermissionRequest, PermissionReviewContext } from "../packages/host/src/permission-agent-types.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
@@ -264,6 +264,44 @@ test("a write to the configuration file the host was started with needs the owne
   const write = tool("Write", { file_path: "/srv/custom/host.json", content: "{}" });
   assert.equal(classify(write, CLASSES, facts)?.rule, "class:host-configuration");
   assert.equal(classify(write, CLASSES, { protectedPaths: hostProtectedPaths(config, "/opt/host") }), undefined);
+});
+
+test("marked release directories share a protected container and a stable class-rules digest", () => {
+  const base = mkdtempSync(join(tmpdir(), "permission-releases-"));
+  const config = { stateDir: "/srv/host/state", runDir: "/srv/host/run", keyFile: "/srv/host/vault.key", agents: {} };
+  try {
+    const root = join(base, "releases");
+    const releaseA = join(root, "release-a"), releaseB = join(root, "release-b"), releaseC = join(root, "release-c");
+    const releases = [releaseA, releaseB, releaseC];
+    for (const release of releases) {
+      mkdirSync(release, { recursive: true });
+      writeFileSync(join(release, ".infinite-release.json"), "{}\n");
+    }
+
+    const pathsA = hostProtectedPaths(config, releaseA);
+    const pathsB = hostProtectedPaths(config, releaseB);
+    const facts = { protectedPaths: pathsA };
+    assert.equal(classRulesDigest(facts), classRulesDigest({ protectedPaths: pathsB }));
+    assert.equal(classify(tool("Write", { file_path: join(releaseC, "notes.txt"), content: "x" }), CLASSES, facts)?.rule,
+      "class:host-configuration");
+    assert.equal(classify(tool("Write", { file_path: join(root, "release-index.json"), content: "x" }), CLASSES, facts)?.rule,
+      "class:host-configuration");
+
+    const checkout = join(base, "checkout");
+    mkdirSync(checkout);
+    const checkoutPaths = hostProtectedPaths(config, checkout);
+    assert.ok(!checkoutPaths.includes(base));
+    assert.equal(classify(tool("Write", { file_path: join(base, "sibling-project", "notes.txt"), content: "x" }), CLASSES,
+      { protectedPaths: checkoutPaths }), undefined);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("a marked release directly below the filesystem root keeps its own directory protected", () => {
+  assert.deepEqual(["/app", "/app/", "/srv/releases/r1/"].map(root => protectedInstallPath(root, true)), ["/app", "/app/", "/srv/releases"]);
+  const facts = { protectedPaths: [protectedInstallPath("/app", true)] };
+  assert.equal(classify(tool("Write", { file_path: "/app/notes.txt", content: "x" }), CLASSES, facts)?.rule, "class:host-configuration");
 });
 
 test("a live core judges real paths, so a link inside the session root cannot hide a target outside it", () => {

@@ -1,3 +1,5 @@
+import { lstatSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { z } from "zod";
 import { teamModelProfileSchema, type TeamModelProfile } from "./team-types.js";
 
@@ -42,6 +44,24 @@ export interface PermissionAgentSettings {
   minCases: number;
 }
 
+const RELEASE_MARKER = ".infinite-release.json";
+
+/** A marked release contributes its stable container to the class rules, not its versioned directory. A release directly
+ * below `/` keeps its own root, because the class rules drop `/` and the release would lose its protection. */
+export function protectedInstallPath(installRoot: string, marked = isMarkedRelease(installRoot)): string {
+  if (!marked) return installRoot;
+  const container = dirname(installRoot);
+  return container === "/" ? installRoot : container;
+}
+
+function isMarkedRelease(installRoot: string): boolean {
+  try {
+    return lstatSync(join(installRoot, RELEASE_MARKER)).isFile();
+  } catch {
+    return false; // A source checkout or an unreadable marker keeps only its own install root protected.
+  }
+}
+
 /** The effective tiers: `permissionAgent.light`, else the lineup's permission reviewer. */
 export function permissionAgentSettings(config: {
   permissionAgent?: Partial<PermissionAgentConfig>;
@@ -60,7 +80,8 @@ export function permissionAgentSettings(config: {
  * Host paths a write to which changes host configuration, the delegation records, the permission policy
  * or journal, or a provider launcher: the state, run and install directories, the vault key, and every
  * absolute launcher command, and the `extra` paths the caller names (the configuration file the host was
- * started with). A class rule sends such a write to the owner.
+ * started with). A marked release protects its containing release root; an unmarked install protects only
+ * its own directory. A class rule sends such a write to the owner.
  */
 export function hostProtectedPaths(config: {
   stateDir: string; runDir: string; keyFile: string;
@@ -68,7 +89,7 @@ export function hostProtectedPaths(config: {
   teams?: { commandPrefix?: { command: string } };
   cmux?: { hooksDir?: string };
 }, installRoot: string, extra: readonly string[] = []): string[] {
-  const paths = [config.stateDir, config.runDir, config.keyFile, installRoot, config.cmux?.hooksDir, config.teams?.commandPrefix?.command, ...extra];
+  const paths = [config.stateDir, config.runDir, config.keyFile, protectedInstallPath(installRoot), config.cmux?.hooksDir, config.teams?.commandPrefix?.command, ...extra];
   for (const profile of Object.values(config.agents)) {
     if (!profile) continue;
     paths.push(profile.command, profile.appServerCommand);

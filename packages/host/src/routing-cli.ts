@@ -55,8 +55,10 @@ export function routingStatusLines(status: RoutingStatus): string[] {
   else {
     // The autonomous default, also a saved policy without a mode, starts auto once its period ends; this line says so.
     const source = status.modeSource === "saved" ? "saved" : "autonomous default";
-    const requested = status.modeSource === "saved" && status.requested === "auto" ? " · requested auto: auto starts after the shadow period"
-      : status.modeSource === "autonomous-default" ? " · auto starts after the shadow period" : "";
+    // Without an implementer that passes the fixed rules, a saved auto refuses new runs and the default stays shadow.
+    const starts = status.covers.start ? ": auto starts after the shadow period" : "";
+    const requested = status.modeSource === "saved" && status.requested === "auto" ? ` · requested auto${starts}`
+      : status.modeSource === "autonomous-default" && status.covers.start ? " · auto starts after the shadow period" : "";
     lines.push(`${clean(status.projectId)} · routing shadow (${source})${requested}`);
   }
   if (status.knobs) {

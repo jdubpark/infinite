@@ -16,7 +16,7 @@ import { teamContext } from "../packages/host/src/team-prompts.js";
 import type { TeamMember, TeamRun, TeamView } from "../packages/host/src/team-types.js";
 
 const TERMINAL = ["ready-for-review", "merged", "blocked", "cancelled"];
-const REVOKED_LINE = "Host profile routing was revoked by the owner; new tasks start on the coordinator's profiles.";
+const REVOKED_LINE = "Host profile routing was revoked by the owner; new tasks start on the coordinator's pick when it passes the fixed rules, else on the first implementer that passes them.";
 const POOL_SENTENCE = "Every task MUST include agentProfileId from this approved worker pool: ";
 const AUTO_SENTENCE = "The host assigns each plan task's worker profile; omit agentProfileId from plan tasks.";
 

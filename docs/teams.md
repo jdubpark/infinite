@@ -2101,7 +2101,7 @@ In an `auto` run, the coordinator's plan may omit `agentProfileId` on its tasks,
 
 An `auto` run applies these rules to its profiles:
 
-1. A contributor profile is used only when the policy sets `allowContributor`. This holds for implementers, scouts, escalations, and every fallback.
+1. A contributor profile is used only when the policy sets `allowContributor`. This holds for implementers, scouts, escalations, and their limit fallbacks. The coordinator, integrator, and reviewer slots and their limit fallbacks are the owner's lineup choices, and the router does not check them.
 2. A profile on the reviewer's model is never used for an implementer's start, or for an implementer's limit fallback, escalated or not. Scout and escalation profiles are not checked against this rule.
 3. A profile outside the owner's lineup is never used.
 
@@ -2131,15 +2131,15 @@ Pausing changes only the routing state in the evidence store, not the saved conf
 infinite team revoke-routing TEAM_ID [--request-id UUID] [--json]
 ```
 
-The command reads the run's current revision and returns the run's new tasks to the coordinator's profiles. The fixed rules still bind those tasks. It is refused with 409 `routing-not-enabled` for a run that was not pinned `auto`, and it is owner-only.
+The command reads the run's current revision and stops host routing for the run's new tasks. Each starts on the coordinator's pick when it passes the fixed rules, else on the first implementer in lineup order that passes them; no run line is written per task. It is refused with 409 `routing-not-enabled` for a run that was not pinned `auto`, and it is owner-only.
 
 ### Status lines
 
 `infinite routing status` prints one line per project:
 
 - `ID · routing auto (saved)` or `ID · routing auto (autonomous default)` when a new run would pin `auto`;
-- `ID · routing shadow (saved) · requested auto: auto starts after the shadow period` when `auto` is saved and the period has not ended;
-- `ID · routing shadow (autonomous default) · auto starts after the shadow period` during the autonomous default's period;
+- `ID · routing shadow (saved) · requested auto: auto starts after the shadow period` when `auto` is saved, an implementer passes the fixed rules, and the period has not ended; without such an implementer, `ID · routing shadow (saved) · requested auto`, and new runs are refused;
+- `ID · routing shadow (autonomous default) · auto starts after the shadow period` during the autonomous default's period, while an implementer passes the fixed rules;
 - `Shadow period: ended TIME. Auto routing needs --routing auto.` when the period has ended and `--routing shadow` is saved.
 
 ### Rolling back

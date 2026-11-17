@@ -644,6 +644,12 @@ test("version 2 reads seek their indexes", () => {
     log.push({ sql: "SELECT key FROM routing_decisions WHERE project_ref=? AND point='start' AND state='pending' AND decided_at < ? ORDER BY decided_at, key LIMIT 100", params: ["x", NOW] });
     log.push({ sql: "SELECT key FROM routing_decisions WHERE run_id=? AND state='pending' AND revision < ? LIMIT 200", params: ["run-1", 2] });
     assert.ok(log.length >= 12, "the reads and writes issue statements");
+    // A read of many decision rows carries a bounded row limit, so its cost does not grow with the project's history.
+    for (const { sql, params } of log) {
+      if (!/^SELECT\b/.test(sql) || !/\bFROM routing_decisions\b/.test(sql) || /\bkey\s*=\s*\?/.test(sql)) continue;
+      assert.match(sql, /\bLIMIT\b/, `${sql}: no row limit`);
+      for (const value of params) if (typeof value === "number") assert.ok(value >= 0 && value <= 10_000, `${sql}: bound ${value}`);
+    }
     const plans = store.read(db => log.map(({ sql, params }) => ({
       sql,
       text: db.all<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, ...(params as never[])).map(row => row.detail).join(" | "),

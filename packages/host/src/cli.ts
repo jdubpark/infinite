@@ -243,7 +243,7 @@ infinite repo init [--permissions coordinator|off] [--permission-scope TEXT] [--
 infinite repo init --permissions off        Disable delegation for future runs
 infinite repo init [--routing off|shadow|auto] [--routing-value cost|balanced|quality|USD] [--routing-contributor allow|deny]
 infinite team revoke-permissions TEAM_ID    Revoke delegation for an active run
-infinite team revoke-routing TEAM_ID    Return new tasks to the coordinator's profiles
+infinite team revoke-routing TEAM_ID    Stop host routing for the run's new tasks
 infinite permissions status [--json]        Show workspace permission delegation
 infinite permissions delegate (--workspace W | --all) [--direction TEXT | --clear-direction] [--request-id UUID]
 infinite permissions revoke --workspace W [--request-id UUID]

@@ -365,13 +365,18 @@ test("the pin is auto only after the stored period end, and refuses without cove
   const contributorOnly: TeamLineup = { ...mixedLineup, implementers: [mixedLineup.implementers[0]!] };
 
   // Recorded starts decided at `at`. The first 49 leave the period open.
-  const recordStarts = (prefix: string, count: number, at: string) => {
-    const shadowRun = runOf(mixedLineup, pinRouting(undefined, "autonomous", mixedLineup), `run-rec-${prefix}`);
+  const recordStarts = (prefix: string, count: number, at: string, projectId = "rehearsal") => {
+    const shadowRun = runOf(mixedLineup, pinRouting(undefined, "autonomous", mixedLineup), `run-rec-${prefix}`, projectId);
     const recording = new RoutingRecorder({ store, now: () => at, log: () => undefined });
     for (let index = 0; index < count; index++) {
       recording.recordStart(startOf(shadowRun, taskOf(`${prefix}-${index}`, { agentProfileId: "astra-xhigh" })));
     }
   };
+
+  // Fifty recorded starts 5 days ago meet the count, but the end, the first start plus 14 days, has not passed.
+  recordStarts("early", 50, ago(5), "early");
+  assert.deepEqual(pinner.pin(saved, "supervised", mixedLineup, "early"), pinRouting(saved, "supervised", mixedLineup));
+  assert.equal(store.read(db => readProjectState(db, "early")).periodEndedAt, null, "no end is stored before it passes");
 
   recordStarts("a", 49, ago(15));
   assert.deepEqual(pinner.pin(saved, "supervised", mixedLineup, "rehearsal"), pinRouting(saved, "supervised", mixedLineup));

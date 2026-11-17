@@ -296,6 +296,9 @@ test("routing lines show unknown, never zero", () => {
     period: { decisions: 0, capped: false, firstAt: null, targetDays: 14, targetDecisions: 50 }, cellsCapped: true, unreadableCells: 2,
   } as Partial<RoutingStatus>));
   assert.equal(withCoordinator[0], "alpha · routing shadow (saved) · requested auto: auto starts after the shadow period");
+  const uncovered = { covers: { start: false, reason: "no-eligible-profile" } } as Partial<RoutingStatus>;
+  assert.equal(routingStatusLines(routingStatusFixture({ requested: "auto", ...uncovered }))[0], "alpha · routing shadow (saved) · requested auto");
+  assert.equal(routingStatusLines(routingStatusFixture({ source: "autonomous-default", modeSource: "autonomous-default", ...uncovered }))[0], "alpha · routing shadow (autonomous default)");
   assert.equal(withCoordinator[3], "Shadow, last 30 days: 3 decisions; the router matched the coordinator in 2 of 3 (newest 500)");
   assert.equal(withCoordinator[4], "Shadow period: no decision yet.");
   const off = routingStatusLines(routingStatusFixture({ mode: "off", requested: null, source: null, knobs: null, defaults: [], covers: { start: false, reason: "off" }, cells: [] } as Partial<RoutingStatus>));

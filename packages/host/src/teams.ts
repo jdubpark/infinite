@@ -2066,7 +2066,7 @@ export class TeamService {
       if (run.routing?.mode !== "auto") throw new TeamError(409, "routing-not-enabled", "This team does not choose worker profiles automatically.");
       if (this.replay(stored, "revoke-routing", body) || !this.mutation(stored, "revoke-routing", body)) return this.view(stored);
       run.routingRevokedAt ??= timestamp();
-      this.event(stored, "Host profile routing was revoked by the owner; new tasks start on the coordinator's profiles.");
+      this.event(stored, "Host profile routing was revoked by the owner; new tasks start on the coordinator's pick when it passes the fixed rules, else on the first implementer that passes them.");
       this.save(stored); return this.view(stored);
     });
   }
@@ -4836,11 +4836,11 @@ export class TeamService {
     if (!run.lineup) return undefined;
     if (role === "permission-coordinator") return this.reviewerProfile(run);
     if (role === "project-manager" || role === "delivery") return run.lineup.coordinator;
-    if (role === "integrator") return run.lineup.integrator;
-    if (role === "reviewer") return run.lineup.reviewer;
+    if (role === "integrator" || role === "reviewer") return run.lineup[role];
     if (!task) throw new TeamError(409, "invalid-agent-profile", "An implementer requires an assigned task and allowed model profile.");
     assertTaskProfiles(run, [task], role === "scout" ? "scouts" : "plan");
-    return run.lineup.implementers.find(profile => profile.id === task.agentProfileId) ?? fallbackProfile(run, task);
+    // Rule 1 is a data boundary: an auto-pinned implementer passes the fixed rules with or without the router's start.
+    return role === "implementer" && autoPinned(run) ? fallbackProfile(run, task) : run.lineup.implementers.find(profile => profile.id === task.agentProfileId) ?? fallbackProfile(run, task);
   }
   private reviewerProfile(run: TeamRun): TeamModelProfile | undefined {
     return run.lineup?.permissionReviewer ?? run.lineup?.coordinator;

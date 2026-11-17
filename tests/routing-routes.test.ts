@@ -240,6 +240,13 @@ test("pause, resume, and revoke answer the owner only", { timeout: 120000 }, asy
 
     // The evidence directory replaced by a file: the pause answers 503.
     await host.stopApi();
+    // First, with the API stopped: the host registered the routing projector, which advanced over the settled run's events.
+    const evidence = new EvidenceStore({ databasePath: evidenceDatabasePath(host.config.stateDir), vaultKey: readFileSync(host.config.keyFile) });
+    try {
+      assert.ok(evidence.read(db => db.get("SELECT name FROM projector_cursors WHERE name='routing'")), "the routing projector is registered");
+    } finally {
+      evidence.close();
+    }
     rmSync(join(host.config.stateDir, "evidence"), { recursive: true, force: true });
     writeFileSync(join(host.config.stateDir, "evidence"), "not a directory");
     await host.start();

@@ -763,3 +763,32 @@ test("a run that blocks while no client is reading still gets its reason and nex
     await waitFor(async () => [...linear.issueLabels.values()].some(applied => applied.size > 0), Boolean, 15000);
   } finally { await f.close(); await linear.close(); }
 });
+
+// INF-282 step 3: an intent decision's Linear comments print its question ids and the owner's answer, never checker text.
+test("an intent decision's Linear comments hold no checker text", { timeout: 45000 }, async () => {
+  const linear = await startLinearServer();
+  const root = mkdtempSync(join(tmpdir(), "infinite-linear-intent-"));
+  const config = { stateDir: join(root, "state"), linear: { apiKeyFile: join(root, "linear-key"), endpoint: linear.endpoint },
+    projects: [{ id: "intent", name: "Intent", path: root, linear: { teamId: linear.teamId } }] } as unknown as Config;
+  writeFileSync(config.linear!.apiKeyFile, linear.apiKey, { mode: 0o600 });
+  const service = new LinearService(config, randomBytes(32));
+  const sentinel = ["intent", "question", "sentinel"].join("-");
+  const run = { id: randomUUID(), projectId: "intent", title: "Export", objective: "Ship the export.", status: "implementing", revision: 1,
+    members: [], checks: [], steering: [], decisions: [] } as unknown as TeamRun;
+  try {
+    service.start();
+    service.updateTeam(run, true);
+    await waitFor(async () => service.getTeam(run.id)?.status, status => status === "synced", 15000);
+    const issue = service.getTeam(run.id)!.issue!.id;
+    run.decisions = [{ id: "decision", revision: 1, question: `Checker text: ${sentinel}`, intentQuestions: ["q1", "q2"], options: [], memberId: "member",
+      createdAt: new Date().toISOString(), answer: "Use the stated defaults", answeredBy: "owner", answeredAt: new Date().toISOString() }] as TeamRun["decisions"];
+    service.updateTeam(run, true);
+    const question = await waitFor(async () => [...linear.comments.values()].find(comment => comment.issue.id === issue && comment.body.includes("Agent question")), Boolean, 15000);
+    assert.match(question!.body, /The intent check's questions q1, q2/);
+    assert.doesNotMatch(question!.body, new RegExp(sentinel));
+    const answer = await waitFor(async () => [...linear.comments.values()].find(comment => comment.issue.id === issue && comment.body.includes("User answer")), Boolean, 15000);
+    assert.match(answer!.body, /Use the stated defaults/);
+    assert.doesNotMatch(answer!.body, new RegExp(sentinel));
+    assert.deepEqual(linear.violations, []);
+  } finally { service.close(); await linear.close(); rmSync(root, { recursive: true, force: true }); }
+});

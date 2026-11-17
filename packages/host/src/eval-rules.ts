@@ -4,7 +4,7 @@ import type { Capsule, CapturedPayload, CaptureStart, EvalFeatures, MaterialStat
 import type { OutcomeRow } from "./outcome-store.js";
 import { rowUse } from "./outcome-cells.js";
 import { isTestPath, pathArea, type FeatureMap } from "./task-features.js";
-import type { TeamMember, TeamRun, TeamTask } from "./team-types.js";
+import { decisionAuthorityQuestion, type TeamMember, type TeamRun, type TeamTask } from "./team-types.js";
 
 /** Pure capture rules. No I/O, no clock. */
 
@@ -21,7 +21,7 @@ export function buildCapsule(run: TeamRun, task: TeamTask, member: TeamMember): 
   const ownerAnswers: Capsule["ownerAnswers"] = [];
   for (const decision of run.decisions) {
     if (decision.answeredBy === "owner" && decision.answer !== undefined && before(decision.answeredAt)) {
-      ownerAnswers.push({ question: decision.question, answer: decision.answer });
+      ownerAnswers.push({ question: decisionAuthorityQuestion(decision), answer: decision.answer });
     }
   }
   return {

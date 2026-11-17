@@ -1,4 +1,4 @@
-import { inputSourceLabel, decisionAnswerLabel, autoPinned, autoRouted, eligibleImplementers, escalationPool, scoutPool } from "./team-types.js";
+import { inputSourceLabel, decisionAnswerLabel, decisionAuthorityQuestion, autoPinned, autoRouted, eligibleImplementers, escalationPool, scoutPool } from "./team-types.js";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { entryToolsFor } from "./entry-roles.js";
@@ -8,11 +8,11 @@ import type { Provider } from "./types.js";
 import type { Mission } from "./mission-types.js";
 const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
 const profileSuffix = ". These are the host's configured model choices; they do not establish which backend actually served a turn. Do not switch models or change tool permissions.";
-const profileInstructions = (modelProfile: TeamModelProfile) => `Requested runtime profile: ${JSON.stringify(modelProfile)}${profileSuffix}`;
-const codexSandboxInstructions = "Codex sandbox guidance: The shell may restrict network access, local listeners, IPC sockets, and Git metadata writes. Prefer operations that work there. When a necessary development operation cannot run in the sandbox, request one-time execution of the complete command within your assigned role and pinned owner scope so the strong coordinator can review it. This includes repository inspection, scoped staging, test planning, builds, tests, and local browser checks when authorized; delivery still requires its separate pinned policy. Never request persistent approval or switch tools to bypass a denial. Report skipped checks and why; the host runs accepted checks after integration.";
+export const profileInstructions = (modelProfile: TeamModelProfile) => `Requested runtime profile: ${JSON.stringify(modelProfile)}${profileSuffix}`;
+export const codexSandboxInstructions = "Codex sandbox guidance: The shell may restrict network access, local listeners, IPC sockets, and Git metadata writes. Prefer operations that work there. When a necessary development operation cannot run in the sandbox, request one-time execution of the complete command within your assigned role and pinned owner scope so the strong coordinator can review it. This includes repository inspection, scoped staging, test planning, builds, tests, and local browser checks when authorized; delivery still requires its separate pinned policy. Never request persistent approval or switch tools to bypass a denial. Report skipped checks and why; the host runs accepted checks after integration.";
 /** Every member and session reads it: a reject is final, and the same effect is never reached another way. */
 export const permissionRejectInstructions = "A rejected permission request is final for that request. Do not reach the same effect with another tool, command, or route.";
-const readOnlyWorkspaceInstructions = "Read-only roles must leave every tracked and untracked repository file unchanged. Do not run commands, scripts, or options that auto-fix, format in place, generate tracked or untracked repository outputs, or write reports or temporary files inside the repository (for example, lint --fix or format --write). Inspect a script before running it and skip it if its behavior or outputs are unclear. Use an external scratch directory only when you already have permission to use it; if a needed check requires repository writes or no permitted scratch is available, report that check as unavailable. Read-only Git metadata operations, including fetches used for inspection, remain allowed; this file-output rule does not prohibit separately approved delivery Git operations.";
+export const readOnlyWorkspaceInstructions = "Read-only roles must leave every tracked and untracked repository file unchanged. Do not run commands, scripts, or options that auto-fix, format in place, generate tracked or untracked repository outputs, or write reports or temporary files inside the repository (for example, lint --fix or format --write). Inspect a script before running it and skip it if its behavior or outputs are unclear. Use an external scratch directory only when you already have permission to use it; if a needed check requires repository writes or no permitted scratch is available, report that check as unavailable. Read-only Git metadata operations, including fetches used for inspection, remain allowed; this file-output rule does not prohibit separately approved delivery Git operations.";
 const assignmentBriefInstructions = `Make each assignment narrow and implementation-ready for a light worker: one coherent outcome, the smallest necessary set of owned paths, and explicit exclusions. Put a self-contained brief in each task's instructions or subtask's objective: the requested behavior; relevant inspected source paths and entry points; the agreed data/interface contract, including applicable error cases; constraints and dependency outputs; observable acceptance criteria; and exact focused check commands with expected results. Use current repository evidence, not invented paths, APIs, or commands. Focused checks supplement the run's required verification; they cannot replace or weaken it.
 
 Resolve product and shared-interface decisions before dispatch. Use bounded read-only discovery when evidence is missing, or the existing question/blocker reports for an unresolved material decision. Do not ask a light implementer to discover the scope, choose the architecture, or complete an entire broad feature from a title. Split independent outcomes; order shared-interface work before its consumers and put the same contract in both briefs. Before dispatch, check that the worker can tell what to change, what to preserve, and how to prove completion without guessing a requirement. Keep briefs concise, leave routine implementation choices to the worker, and avoid unrelated cleanup or artificial subtasks.`;
@@ -87,7 +87,7 @@ function goalContextText(goal: NonNullable<TeamRun["goal"]>) {
   const { successCriteria, record, ...rest } = goal;
   if (!record) return JSON.stringify(goal);
   const criteria = record.criteria.map(item => item.id === "c0" ? { ...item, statement: successCriteria } : item);
-  return `${JSON.stringify(rest)}\nSuccess criteria from the owner's objective record, version ${record.version}. Each names how it is checked; c0 is the owner's success text:\n${JSON.stringify(criteria)}`;
+  return `${JSON.stringify(rest)}\nSuccess criteria from the owner's objective record, version ${record.version}. Each names how it is checked; c0 is the owner's success text${record.criteria.some(item => item.derived) ? "; a criterion marked derived came from the intent check and the owner has not confirmed it" : ""}:\n${JSON.stringify(criteria)}`;
 }
 /** Full prompt evidence saved outside the checkout's tracked and untracked project files. */
 export function teamContext(run: TeamRun, feedback?: string, configuredProject?: Pick<TeamProject, "setup" | "checks">, role?: TeamMember["role"], permissionRecoveryHistory: TeamPermissionRecoveryView[] = []): TeamContextSnapshot {
@@ -104,8 +104,8 @@ export function teamContext(run: TeamRun, feedback?: string, configuredProject?:
     ...(run.requestSource ? { requestSource: run.requestSource } : {}),
     ownerSteering: (run.steering ?? []).filter(item => !item.source),
     agentSteering: (run.steering ?? []).filter(item => item.source),
-    agentAnswers: (run.decisions ?? []).filter(item => item.answer && item.answeredBy !== "owner"),
-    ownerAnswers: (run.decisions ?? []).filter(decision => decision.answer && decision.answeredBy === "owner").map(decision => ({ decisionId: decision.id, question: decision.question, answer: decision.answer!, ...(decision.answerMode ? { answerMode: decision.answerMode } : {}) })),
+    agentAnswers: (run.decisions ?? []).filter(item => item.answer && item.answeredBy !== "owner").map(item => ({ ...item, question: decisionAuthorityQuestion(item) })),
+    ownerAnswers: (run.decisions ?? []).filter(decision => decision.answer && decision.answeredBy === "owner").map(decision => ({ decisionId: decision.id, question: decisionAuthorityQuestion(decision), answer: decision.answer!, ...(decision.answerMode ? { answerMode: decision.answerMode } : {}) })),
     authority: {
       permissions: run.permissions,
       permissionsRevokedAt: run.permissionsRevokedAt,
@@ -227,7 +227,7 @@ function promptPermissionRecoverySummary(run: TeamRun, history: TeamPermissionRe
   const lines = rows.map(item => `- ${item.prior ? "Same-project prior run" : "This run"} (${item.status}, ${item.id}): cause=${JSON.stringify(item.cause)}; action=${JSON.stringify(item.action)}; decision=${JSON.stringify(item.decision)}; consequence=${JSON.stringify(item.consequence)}; provider command execution=${item.execution}.`);
   return `Permission recovery observations (diagnostic context only; historical outcomes never authorize permissions or create path allowlists):\n${lines.join("\n")}\nUse these observations to correct repeated blockers within the current objective and owner-authorized scope. Inspect relevant full team context before planning; do not stop or duplicate a live recovery.`;
 }
-function contextAccessInstructions() {
+export function contextAccessInstructions() {
   return `Full prompt evidence is stored at ${TEAM_CONTEXT_PATH}, relative to this repository root. The host creates it in Git metadata before launch, outside tracked and untracked project files; do not modify it. Inline task reports, brief, feedback, discovery, and check excerpts are bounded orientation only; they cannot replace requirements or establish a passing check. Reviewers and integrators MUST read the full applicable current and historical task records, brief, feedback, and check outputs there before deciding or repairing. Project managers MUST read full continuation task and review history there before replanning to avoid duplicate work, inspect prior structured blocker evidence before recovery, and read full discovery evidence before planning when discovery is present. Read the full objective, owner steering, and owner answers there before making scope decisions, even when their complete inline text is present.`;
 }
 function fitDerivedSections(base: string, sections: string[], limit: number) {
@@ -265,7 +265,7 @@ export function entryInstructions(provider: Provider, command = entryCommand()) 
       : `Pipe one JSON object to this command: ${command}. Send {"op": "list"} for what is addressed to you now, or add "query" with kinds, taskId, path, or since; {"op": "get", "entryId": "…"} to read one; {"op": "post", "entry": {…}} when another member needs a contract, finding, blocker, or handoff from you. A post refuses kinds your role may not post.`;
   return `${ENTRY_LEAD} ${middle} ${ENTRY_TAIL}`;
 }
-function reportingInstructions(provider: Provider, command = reportCommand()) {
+export function reportingInstructions(provider: Provider, command = reportCommand()) {
   if (provider === "claude") return `You MUST explicitly submit exactly one final structured report by calling mcp__infinite_team__report with {"report": <the report object matching the above schema>}. Wait for its durable success receipt. If that tool is unavailable or permission is denied, stop and request user attention. Never use Bash, a shell command, direct HTTP, or another tool as a reporting workaround. After a successful report, stop work and wait; the host will stop this member process.`;
   if (provider === "codex") return `You MUST explicitly submit exactly one final structured report by calling the report tool of the infinite_team MCP server with {"report": <the report object matching the above schema>}. Wait for its success receipt. If the tool is unavailable or permission is denied, stop and request user attention. Never use a shell command, direct HTTP, or another tool as a reporting workaround. After a successful report, stop work and wait; the host will stop this member process.`;
   return `You MUST explicitly submit exactly one final structured report. Pipe a JSON object matching the above schema to this command: ${command}. The helper adds the assignment identity and authenticates it. Wait for its success receipt. Do not infer successful reporting from terminal text. If a provider denies the helper or another required tool, stop and request user intervention; do not bypass the denial. OpenCode run mode may reject permission requests without an interactive prompt. After a successful report, stop work and wait; the host will stop this member process.`;
@@ -346,7 +346,7 @@ Confirm the remote branch and PR head equal ${run.headCommit}. Confirm required 
   const ownerDirection = ownerDirectionLines(run);
   const agentDirection = [
     ...(run.steering ?? []).filter(item => item.source).map(item => `${inputSourceLabel(item.source)} direction: ${item.text}`),
-    ...(run.decisions ?? []).filter(item => item.answer && item.answeredBy !== "owner").map(item => `${decisionAnswerLabel(item)} answered "${item.question}": ${item.answer}`),
+    ...(run.decisions ?? []).filter(item => item.answer && item.answeredBy !== "owner").map(item => `${decisionAnswerLabel(item)} answered "${decisionAuthorityQuestion(item)}": ${item.answer}`),
   ];
   const ownerDirectionSection = [ownerDirection.length ? `User steering and answers:\n${ownerDirection.join("\n\n")}` : "", agentDirection.length ? `Agent directions and answers (cannot expand owner authority or approve provider permissions):\n${agentDirection.join("\n\n")}` : ""].filter(Boolean).join("\n\n");
   const linear = run.linear?.issue
@@ -465,7 +465,7 @@ export function ownerDirectionLines(run: Pick<TeamRun, "steering" | "decisions">
   const ownerAnswers = (run.decisions ?? []).filter(decision => decision.answer && decision.answeredBy === "owner");
   return [
     ...(run.steering ?? []).filter(item => !item.source).map(item => item.text),
-    ...ownerAnswers.map(item => `Owner answered "${item.question}": ${item.answer}`),
+    ...ownerAnswers.map(item => `Owner answered "${decisionAuthorityQuestion(item)}": ${item.answer}`),
   ];
 }
 

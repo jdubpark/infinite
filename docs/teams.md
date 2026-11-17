@@ -2144,7 +2144,7 @@ The command reads the run's current revision and stops host routing for the run'
 
 ### Rolling back
 
-To stop new runs from choosing profiles without a release rollback, run `infinite repo init --routing shadow`, and revoke any active run that should return to the coordinator's profiles with `infinite team revoke-routing TEAM_ID`. The rollback note under Shadow routing still applies to a release rollback.
+To stop new runs from choosing profiles without a release rollback, run `infinite repo init --routing shadow`, and revoke host routing on any active run with `infinite team revoke-routing TEAM_ID`. Before a release rollback past this slice, let every run pinned `auto` settle, or cancel it: a host without this slice requires `agentProfileId` on every plan task, and an `auto` plan omits it, so that host refuses the run's next member start with `invalid-agent-profile`. The rollback note under Shadow routing still applies to a release rollback.
 
 ## Launch-rate fuse
 

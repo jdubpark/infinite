@@ -18,8 +18,8 @@
 
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { expect } from "@playwright/test";
@@ -37,15 +37,21 @@ const { positionals, values } = parseArgs({
 });
 
 const command = positionals[0];
-const COMMANDS = ["doctor", "sign-in", "session", "configure", "team", "goal", "cleanup"];
+const COMMANDS = ["doctor", "sign-in", "session", "claim", "configure", "team", "goal", "cleanup"];
 if (!COMMANDS.includes(command)) fail(`Command must be one of ${COMMANDS.join(", ")}`);
 if (!values.instance) fail("Pass --instance DIR (the instance directory from the launch step)");
+// Port 4780 is another host's tunnel on some development machines. No command here uses it, in any form.
+const RESERVED_PORT = 4780;
 const instance = resolve(values.instance);
 const configFile = join(instance, "config.json");
-// Cleanup still runs when the config is already gone; the other commands need it.
-if (!existsSync(configFile) && command !== "cleanup") fail(`No config.json in ${instance}; nothing to ${command}`);
+// Cleanup still runs when the config is already gone; the other commands need it. claim creates the instance.
+if (!existsSync(configFile) && !["cleanup", "claim"].includes(command)) fail(`No config.json in ${instance}; nothing to ${command}`);
 const config = existsSync(configFile) ? JSON.parse(readFileSync(configFile, "utf8")) : {};
 const port = Number(values.port ?? config.port);
+if (port === RESERVED_PORT) fail(`Refusing port ${RESERVED_PORT}: it is reserved and no verification command may use it`);
+if (values.port !== undefined && config.port !== undefined && Number(values.port) !== Number(config.port)) {
+  fail(`--port ${values.port} does not match the instance's configured port ${config.port}; refusing before any request`);
+}
 const origin = `http://127.0.0.1:${port}`;
 const evidence = resolve(values.evidence ?? join(dirname(instance), "evidence"));
 const pidFile = join(instance, "server.pid");
@@ -70,11 +76,22 @@ const redact = (text) => {
   return secrets.reduce((out, secret) => out.split(secret).join("[device key]"), String(text));
 };
 
+// Every request to the host goes through here. Before any request (authenticated or not) the target must be the
+// verified instance: the port is the configured one, and the API process recorded for this instance is the one
+// listening on it. Nothing is sent to a port that fails the check.
 async function api(path, { auth = true, method = "GET", body } = {}) {
+  assertTarget();
   const headers = auth ? { authorization: `Bearer ${ownerKey()}` } : {};
   if (body) headers["content-type"] = "application/json";
   const response = await fetch(`${origin}${path}`, { method, headers, body: body && JSON.stringify(body) });
   return { status: response.status, json: await response.json().catch(() => null) };
+}
+
+function assertTarget() {
+  if (port === RESERVED_PORT || !Number.isInteger(port)) throw new Error(`refusing request to port ${values.port ?? config.port ?? "unknown"}`);
+  if (Number(config.port) !== port) throw new Error(`port ${port} is not the instance's configured port ${config.port}`);
+  if (!isThisInstance(processNow(serverPid))) throw new Error("the recorded API process is not this instance; nothing sent");
+  if (!listeners().includes(serverPid)) throw new Error(`the instance process ${serverPid} is not listening on ${port}; nothing sent`);
 }
 
 function listeners() {
@@ -513,17 +530,90 @@ function createProject(directory, profile) {
   git("commit", "-m", "Verification project");
 }
 
+// Ownership: only an instance this harness claimed (claim, before init) may be configured. The receipt lives in the
+// instance; configure rejects a missing, copied, or already-configured receipt, a symlinked instance, config, or path,
+// a path that resolves outside the instance, a live server or listener, and any project or workspace that exists.
+const OWNERSHIP = "ownership.json";
+const FIXTURES = join(repoRoot, "tests/fixtures");
+
+// True when `path` exists, is not a symlink, and resolves inside the real instance directory.
+function insideInstance(realInstance, path) {
+  if (!existsSync(path) || lstatSync(path).isSymbolicLink()) return false;
+  const real = realpathSync(path);
+  return real === realInstance || real.startsWith(realInstance + sep);
+}
+
+function readReceipt() {
+  const file = join(instance, OWNERSHIP);
+  if (!existsSync(file) || lstatSync(file).isSymbolicLink()) return undefined;
+  return JSON.parse(readFileSync(file, "utf8"));
+}
+
+// Writes the instance and its run directory. Refuses a directory that already has content, so a claim can never
+// adopt an existing host. The run directory must be a fresh /tmp/iv- directory: the socket path limit keeps the
+// session workers' sockets out of the instance (see SKILL.md), so the run directory is the one path outside it.
+function claim() {
+  if (!Number.isInteger(port) || port === RESERVED_PORT) fail(`claim needs a port other than ${RESERVED_PORT}`);
+  if (existsSync(instance) && (lstatSync(instance).isSymbolicLink() || readdirSync(instance).length)) {
+    fail(`refusing to claim ${instance}: it exists and is not an empty directory`);
+  }
+  if (listeners().length) fail(`refusing to claim: port ${port} already has a listener`);
+  mkdirSync(instance, { recursive: true, mode: 0o700 });
+  const runDir = mkdtempSync("/tmp/iv-");
+  writeFileSync(join(instance, "run-dir"), runDir + "\n", { mode: 0o600 });
+  const receipt = {
+    harness: "verify-infinite",
+    token: randomUUID(),
+    instance: realpathSync(instance),
+    runDir,
+    port,
+    profile: values.profile ?? null,
+    state: "claimed",
+    claimedAt: new Date().toISOString(),
+  };
+  writeFileSync(join(instance, OWNERSHIP), JSON.stringify(receipt, null, 2) + "\n", { mode: 0o600 });
+  console.log(`claimed ${instance} for port ${port}`);
+}
+
 function configure() {
   const profile = values.profile;
   if (!["teams", "goals"].includes(profile)) fail("Pass --profile teams or --profile goals");
-  if (Number.isInteger(serverPid) && listeners().includes(serverPid)) fail("The API is already running; configure before the first start");
+  if (lstatSync(instance).isSymbolicLink()) fail("refusing: the instance directory is a symbolic link");
+  const realInstance = realpathSync(instance);
+  const receipt = readReceipt();
+  if (!receipt || receipt.harness !== "verify-infinite" || typeof receipt.token !== "string") {
+    fail(`refusing: ${OWNERSHIP} is missing or not written by this harness. Run claim first.`);
+  }
+  if (receipt.instance !== realInstance) fail("refusing: the ownership receipt belongs to another directory");
+  if (receipt.state !== "claimed") fail(`refusing: the instance is ${receipt.state}; configure runs once, before the first start`);
+  if (receipt.profile !== profile) fail(`refusing: the instance was claimed for ${receipt.profile}, not ${profile}`);
+  if (Number(config.port) !== receipt.port) fail(`refusing: config port ${config.port} differs from the claimed port ${receipt.port}`);
+  if (lstatSync(configFile).isSymbolicLink() || !insideInstance(realInstance, configFile)) fail("refusing: config.json must be a regular file inside the instance");
+  for (const [label, path] of [["stateDir", config.stateDir], ["keyFile", config.keyFile]]) {
+    if (!path || !insideInstance(realInstance, path)) fail(`refusing: ${label} does not resolve inside the instance (${path})`);
+  }
+  if (config.runDir !== receipt.runDir || !/^\/tmp\/iv-/.test(receipt.runDir) || lstatSync(receipt.runDir).isSymbolicLink()) {
+    fail("refusing: runDir is not the run directory this claim created");
+  }
+  // The init placeholder project is the only project allowed, and it must still be empty.
+  if (!Array.isArray(config.projects) || config.projects.length !== 1) fail("refusing: the config has unexpected projects");
+  const placeholder = join(instance, "workspace");
+  if (config.projects[0].path !== placeholder || !insideInstance(realInstance, placeholder) || readdirSync(placeholder).length) {
+    fail("refusing: the placeholder workspace is not an empty directory inside the instance");
+  }
+  for (const artifact of [join(instance, "project"), join(instance, "teams"), join(instance, "receipts")]) {
+    if (existsSync(artifact)) fail(`refusing: ${artifact} already exists`);
+  }
+  if (Number.isInteger(serverPid) && alive(serverPid)) fail("refusing: the API recorded in server.pid is running");
+  if (listeners().length) fail(`refusing: something is listening on ${port}`);
+
   const receipts = join(instance, "receipts");
   const project = join(instance, "project");
-  mkdirSync(receipts, { recursive: true, mode: 0o700 });
+  mkdirSync(receipts, { mode: 0o700 });
   createProject(project, profile);
   // The goal fixture holds its first plan until this file exists (the goal tests write it by hand to inspect a
-  // held cycle). A journey has nothing to inspect, so release the plan up front.
-  if (profile === "goals") writeFileSync(join(receipts, "release-first-plan"), "continue", { mode: 0o600 });
+  // held cycle). A journey has nothing to inspect, so release the plan up front. The cancel check leaves it out.
+  if (profile === "goals" && !process.env.VERIFY_HOLD_FIRST_PLAN) writeFileSync(join(receipts, "release-first-plan"), "continue", { mode: 0o600 });
   // Teams run on the Rehearsal provider (`demo`), which the fixture replaces: team-agent.mjs with scenario
   // "success" plans two file tasks without agent profiles, so it needs no lineup. A configured lineup would
   // refuse those tasks. Goals need a lineup with a strong coordinator and reviewer, so they use the goal fixture
@@ -532,14 +622,14 @@ function configure() {
     ? {
       ...config,
       enableDemo: true,
-      agents: { demo: { command: process.execPath, args: [join(repoRoot, "tests/fixtures/team-agent.mjs"), "success", receipts] } },
+      agents: { demo: { command: process.execPath, args: [join(FIXTURES, "team-agent.mjs"), "success", receipts] } },
       teams: { workspaceDir: join(instance, "teams"), publishHeads: false },
     }
     : {
       ...config,
       agents: {
-        claude: { command: process.execPath, args: [join(repoRoot, "tests/fixtures/goal-agent.mjs"), "cycles", receipts, "claude"] },
-        codex: { command: process.execPath, args: [join(repoRoot, "tests/fixtures/goal-agent.mjs"), "cycles", receipts, "codex"] },
+        claude: { command: process.execPath, args: [join(FIXTURES, "goal-agent.mjs"), "cycles", receipts, "claude"] },
+        codex: { command: process.execPath, args: [join(FIXTURES, "goal-agent.mjs"), "cycles", receipts, "codex"] },
       },
       teams: { workspaceDir: join(instance, "teams"), publishHeads: false, lineup: TEAM_LINEUP },
     };
@@ -550,7 +640,21 @@ function configure() {
     team: { checks: [{ command: process.execPath, args: ["check.mjs"] }] },
   }];
   writeFileSync(configFile, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
-  console.log(`configured ${profile}: fixture agents only, throwaway project and team workspace inside DIR`);
+
+  // Every agent must be a fixture. A config with any other command (for example a real provider CLI left by init)
+  // is refused here, so the launch stops before the API starts.
+  const written = JSON.parse(readFileSync(configFile, "utf8"));
+  const agentNames = Object.keys(written.agents ?? {});
+  if (!agentNames.length) fail("refusing: no fixture agents were written");
+  for (const name of agentNames) {
+    const agent = written.agents[name];
+    if (agent.command !== process.execPath || !String(agent.args?.[0] ?? "").startsWith(FIXTURES + sep)) {
+      fail(`refusing: agent ${name} is not a fixture under tests/fixtures`);
+    }
+  }
+  const updated = { ...receipt, state: "configured", configuredAt: new Date().toISOString() };
+  writeFileSync(join(instance, OWNERSHIP), JSON.stringify(updated, null, 2) + "\n", { mode: 0o600 });
+  console.log(`configured ${profile}: agents ${agentNames.join(", ")} are fixtures; project and team workspace inside DIR`);
 }
 
 const TEAM_LABELS = { planning: "Planning", discovering: "Investigating", implementing: "Implementing", integrating: "Integrating", verifying: "Running checks", reviewing: "Reviewing", delivering: "Delivering", merged: "Merge reported", "needs-input": "Needs your input", paused: "Paused", blocked: "Blocked", "ready-for-review": "Ready for your review", "no-change": "No change proposed", cancelled: "Cancelled" };
@@ -731,7 +835,7 @@ async function goal() {
     await check("goal reaches an end state on the page", async () => {
       pageStatus = await waitForEnd(page.locator(".goal-status"), GOAL_END, 300000);
       await page.screenshot({ path: join(evidence, "02-goal.png"), fullPage: true });
-      if (!["Ready for your review", "Limit reached"].includes(pageStatus)) throw new Error(`the page shows "${pageStatus}"`);
+      if (pageStatus !== GOAL_LABELS["ready-for-review"]) throw new Error(`the page shows "${pageStatus}", not "${GOAL_LABELS["ready-for-review"]}"`);
       return pageStatus;
     });
     await check("page and goal API agree on status and scope", async () => {
@@ -741,11 +845,25 @@ async function goal() {
       if (listed?.status !== detail.json.status) throw new Error("GET /api/goals and GET /api/goals/:id disagree");
       const label = GOAL_LABELS[detail.json.status];
       if (label !== pageStatus) throw new Error(`API status ${detail.json.status} (${label}) does not match the page "${pageStatus}"`);
+      if (detail.json.status !== "ready-for-review") throw new Error(`API status is ${detail.json.status}, not ready-for-review`);
       if (detail.json.objective !== GOAL_OBJECTIVE) throw new Error("the API objective differs from the form");
       if (JSON.stringify(detail.json.allowedPaths) !== JSON.stringify(["features/progress.json"])) throw new Error("the API allowed paths differ from the form");
       record.goalId = goalId;
       record.cycles = (detail.json.cycles ?? []).length;
       return `API ${detail.json.status} = page "${pageStatus}", ${record.cycles} cycle(s)`;
+    });
+    await check("exactly one reviewed cycle reached success", async () => {
+      // A goal reaches ready-for-review when its cycle limit is spent. The status alone does not prove that a cycle
+      // was reviewed, so the one cycle's team must itself be ready for review with an approved review.
+      const detail = (await call(`/api/goals/${goalId}`)).json;
+      if (detail.cycles?.length !== 1) throw new Error(`expected exactly one cycle, found ${detail.cycles?.length ?? 0}`);
+      const cycle = detail.cycles[0];
+      if (!["ready-for-review", "merged"].includes(cycle.status)) throw new Error(`cycle status is ${cycle.status}`);
+      const team = await call(`/api/teams/${cycle.teamId}`);
+      if (team.status !== 200) throw new Error(`GET /api/teams/:cycleTeam returned HTTP ${team.status}`);
+      if (team.json.status !== "ready-for-review") throw new Error(`the cycle's team is ${team.json.status}, not ready-for-review`);
+      if (team.json.review?.verdict !== "approved") throw new Error(`the cycle's team review is ${team.json.review?.verdict ?? "missing"}, not approved`);
+      return `cycle ${cycle.cycle} team ${cycle.teamId.slice(0, 8)} ready-for-review, review approved`;
     });
   });
 }
@@ -816,6 +934,7 @@ async function cleanup() {
 if (command === "doctor") await doctor();
 else if (command === "sign-in") await signIn();
 else if (command === "session") await session();
+else if (command === "claim") claim();
 else if (command === "configure") configure();
 else if (command === "team") await team();
 else if (command === "goal") await goal();

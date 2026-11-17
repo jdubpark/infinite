@@ -86,34 +86,22 @@ The second command is the CLI's own doctor. It prints provider versions and warn
 
 ## Teams and goals host
 
-The rehearsal instance above has teams and goals disabled, so the `team` and `goal` journeys need their own instance. Teams and goals read host configuration at startup, so the instance is created without starting, configured, and then started. Use this block in place of step 2 of Launch, with `PROFILE` set to `teams` (the team journey) or `goals` (the goal journey). Run the whole block in one shell call.
+The rehearsal instance above has teams and goals disabled, so the `team` and `goal` journeys need their own instance. Teams and goals read host configuration at startup, so the instance is claimed, initialized without starting, configured, and only then started. One script does all of it, and any failed step stops the launch:
 
 ```sh
 ROOT=$(cd "${CHECKOUT:-.}" && git rev-parse --show-toplevel)
-DRIVE="$ROOT/.agents/skills/verify-infinite/scripts/drive.mjs"
-PROFILE=teams   # or goals
-RUN="$PROFILE-$(date -u +%Y%m%dT%H%M%SZ)"
-INST="$ROOT/.local/verify/$RUN/instance"
-EVID="$ROOT/.local/verify/$RUN/evidence"
-PORT=""
-for CANDIDATE in 4781 4782 4783 4784 4785 4786 4787; do
-  if [ -z "$(lsof -nP -iTCP:$CANDIDATE -sTCP:LISTEN 2>/dev/null)" ]; then PORT=$CANDIDATE; break; fi
-done
-[ -n "$PORT" ] || { echo "no free port in 4781-4787"; exit 1; }
-RUNDIR=$(mktemp -d /tmp/iv-XXXXXX)
-mkdir -p "$INST" "$EVID" && printf '%s\n' "$RUNDIR" > "$INST/run-dir"
-cd "$ROOT"
-node --import tsx packages/host/src/cli.ts init --local --config "$INST/config.json" --port "$PORT" \
-  --state-dir "$INST/data" --run-dir "$RUNDIR" --project "$INST/workspace" --name "Verification host"
-node "$DRIVE" configure --instance "$INST" --profile "$PROFILE"
-nohup node --import tsx packages/host/src/cli.ts dev --config "$INST/config.json" --port "$PORT" \
-  --state-dir "$INST/data" --run-dir "$RUNDIR" --project "$INST/workspace" --name "Verification host" \
-  > "$EVID/server.log" 2>&1 &
-echo $! > "$INST/server.pid"
-curl --retry 30 --retry-connrefused --retry-delay 1 -s -o /dev/null -w 'api %{http_code}\n' "http://127.0.0.1:$PORT/api/me"
+sh "$ROOT/.agents/skills/verify-infinite/scripts/launch-profile.sh" teams   # or: goals
 ```
 
-`init --local` writes the same config and device keys as `dev` does on its first start, but no demo agent, and `--port` must be passed so the config records the port the API uses. `configure` then replaces the agents with fixture agents from `tests/fixtures`, so no real provider command is in the instance config, and it writes a throwaway git project and the team workspace under `$INST`. Nothing outside the instance directory is written, and the `teams` journey and the `goals` journey each need their own instance.
+The script prints `run NAME port PORT` and writes `.local/verify/LAST-RUN`, so the Doctor, Drive, and Cleanup blocks above read this run. Expected last line: `api 401`. If it exits non-zero, run cleanup on `LAST-RUN` before starting again.
+
+What each step does and refuses:
+
+- `claim` creates the instance directory, which must be new or empty, and a fresh `/tmp/iv-` run directory, and writes `ownership.json` with a token, the real instance path, the run directory, the port, and the profile. It refuses port 4780 and any port that has a listener.
+- `init --local` writes the config and device keys without starting the API. `--port` must be passed so the config records the port the API uses.
+- `configure` runs once, and only on an instance that `claim` created. It refuses a missing, copied, or already-configured receipt; a symlinked instance, config, state, key, or project path; any path that resolves outside the instance; a run directory other than the claimed one; a project, workspace, teams, or receipts directory that already exists; a live `server.pid`; and any listener on the config port. It then replaces the agents with fixture agents and checks that every agent command is a fixture under `tests/fixtures`. It writes a throwaway git project and the team workspace only inside the instance.
+
+Profiles:
 
 - Teams profile: `teams.workspaceDir` and a `demo` agent running `tests/fixtures/team-agent.mjs` (scenario `success`), with `enableDemo` on. The fixture's tasks name no agent profile, so a configured lineup would refuse them. The team runs on Rehearsal, as the team form's single-agent mode offers.
 - Goals profile: a lineup with a strong coordinator and reviewer (goals are off without one), `claude` and `codex` agents running `tests/fixtures/goal-agent.mjs` (scenario `cycles`), and `release-first-plan` written into the receipts directory. That fixture holds its first plan until the file exists; the goal tests write it by hand to inspect a held cycle, and a journey releases it up front.
@@ -175,7 +163,7 @@ node "$ROOT/.agents/skills/verify-infinite/scripts/drive.mjs" team --instance "$
 
 The `team` journey signs in as the owner, opens Teams, and checks that no setup notice shows and that `GET /api/me` reports teams enabled. It starts "Verification team" from the New team form on the throwaway project, opens the run, and waits for the page status to reach an end state. It passes when the page shows "Ready for your review" and `GET /api/teams/:id` reports `ready-for-review` with the same label. It writes `team.json`, `team.log`, `01-team-list.png`, and `02-team-run.png`.
 
-The `goal` journey signs in as the owner, opens Goals, and checks that no setup notice shows and that `GET /api/me` reports goals enabled. It starts "Verification goal" with one cycle on `features/progress.json`, waits for the page to reach an end state, and passes when the page shows "Ready for your review" or "Limit reached" and `GET /api/goals/:id` reports the same status, the form's objective, and the form's allowed paths. It writes `goal.json`, `goal.log`, `01-goal-list.png`, and `02-goal.png`.
+The `goal` journey signs in as the owner, opens Goals, and checks that no setup notice shows and that `GET /api/me` reports goals enabled. It starts "Verification goal" with one cycle on `features/progress.json`, waits for the page to reach an end state, and passes only when the page shows "Ready for your review", `GET /api/goals/:id` reports `ready-for-review` with the same label, the form's objective, and the form's allowed paths, and the goal has exactly one cycle whose team reports `ready-for-review` with an approved review. "Limit reached" is a failure: a budget stop can happen without a reviewed result. It writes `goal.json`, `goal.log`, `01-goal-list.png`, and `02-goal.png`.
 
 Both journeys end with the same owner-key check the other journeys use, and both write a failing verdict when the browser cannot start (`PLAYWRIGHT_CHROMIUM_PATH=/usr/bin/false` forces that). Each run's log ends with `verdict: pass` or `verdict: fail`.
 

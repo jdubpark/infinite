@@ -1,34 +1,22 @@
-import { promptVersion } from "./config-identity.js";
-import { CONFIGURATIONS_MODULE, epochAt } from "./configuration-store.js";
+import type { AutonomyMode } from "./autonomy.js";
+import { appendRunEvent } from "./run-events.js";
+import { screen } from "./routing-choice.js";
+import {
+  AUTO_LOG, DECISION_BUDGET_MS, decideAutoStart, evaluateStart, periodEnd, REQUIRED_MODULES, startFrame,
+  type AutoFailure, type RouterStart,
+} from "./routing-auto.js";
+import { effectiveRouting, pinRouting, type TeamRouting } from "./routing-policy.js";
+import { fallbackProfile, PROFILE_MESSAGES } from "./routing-rules.js";
+import { decisionKey, insertDecision, PAYLOAD_LIMIT_BYTES, readDecision } from "./routing-store.js";
+import type { TeamRunRouting } from "./routing-types.js";
+import { fixedRuleFailure, type TeamLineup, type TeamModelProfile } from "./team-types.js";
 import type { EvidenceStore } from "./evidence/store.js";
-import { OUTCOMES_MODULE, selectRoutingEvidence } from "./outcome-store.js";
-import { profileIdentity } from "./run-events.js";
-import { choose, RESCUE_USD, screen, TIER_COSTS, tierCost, type Scored } from "./routing-choice.js";
-import { CHOSEN_WEIGHT, MAX_AGE_DAYS, posterior, type CurrentConfig, type RoutingTarget } from "./routing-posterior.js";
-import { decisionSeed } from "./routing-sample.js";
-import { decisionKey, insertDecision, PAYLOAD_LIMIT_BYTES, readDecision, ROUTING_MODULE } from "./routing-store.js";
-import { taskFeatures, type FeatureMap } from "./task-features.js";
-import type { DecisionRow, RoutingPayload } from "./routing-types.js";
-import type { TeamModelProfile, TeamRun, TeamTask } from "./team-types.js";
-import type { Provider } from "./types.js";
+import { TeamError } from "./team-workspace.js";
 
-export type RouterStart = {
-  run: TeamRun;
-  task: TeamTask;
-  publishHeads: boolean;
-  entryTools: boolean;
-  /** Whether the run is a goal cycle with a record: the member's prompt version then carries the record digest. */
-  objectiveDigest: boolean;
-  featureMap: FeatureMap | undefined;
-  limited: ReadonlySet<Provider>;
-};
+export { DECISION_BUDGET_MS } from "./routing-auto.js";
+export type { RouterStart } from "./routing-auto.js";
 
-/** The start decision's budget. A decision that takes longer writes no row. */
-export const DECISION_BUDGET_MS = 250;
-const DAY_MS = 86_400_000;
-const REQUIRED_MODULES = [OUTCOMES_MODULE, CONFIGURATIONS_MODULE, ROUTING_MODULE] as const;
-
-/** The fixed log texts. Each names no id and no value. */
+/** The fixed log texts of the shadow recorder. Each names no id and no value. */
 const LOG = {
   unavailable: "Routing shadow decision skipped: the evidence store is unavailable.",
   budget: `Routing shadow decision skipped: it took longer than ${DECISION_BUDGET_MS} ms.`,
@@ -38,16 +26,10 @@ const LOG = {
 
 type Reason = keyof typeof LOG;
 
-/** The identity a profile has in the outcome ledger: provider, model, and effort (or the OpenCode variant). */
-function identityOf(profile: TeamModelProfile): { provider: string; model: string; effort: string | null } {
-  const identity = profileIdentity(profile, profile.provider);
-  return { provider: identity.provider, model: identity.model ?? profile.model, effort: identity.effort ?? null };
-}
-
 /**
- * Records the router's pick for the implementer of a task, when the task starts, in shadow. It writes at most one row
- * per run, revision, and task. It never throws, changes no field of the member, the task, or the run, and writes nothing
- * when the store or one of its modules is unavailable.
+ * Records the router's pick for the implementer of a task, when the task starts, in shadow; and applies the pick of an
+ * `auto` run. A shadow start writes at most one `recorded` row per run, revision, and task. An auto start writes one
+ * `pending` row before its member exists. Neither throws into a run.
  */
 export class RoutingRecorder {
   private readonly store: EvidenceStore;
@@ -55,6 +37,7 @@ export class RoutingRecorder {
   private readonly clock: () => number;
   private readonly log: (line: string) => void;
   private readonly logged = new Set<Reason>();
+  private readonly autoLogged = new Set<keyof typeof AUTO_LOG>();
 
   constructor(options: { store: EvidenceStore; now?: () => string; clock?: () => number; log?: (line: string) => void }) {
     this.store = options.store;
@@ -63,7 +46,38 @@ export class RoutingRecorder {
     this.log = options.log ?? (line => console.warn(line));
   }
 
-  /** Never throws. Writes at most one row. */
+  /**
+   * Step 1's pin. A saved `auto` mode, or the autonomous default (no saved mode in an autonomous project), reads the period
+   * end: before it is stored, the shadow pin; with it, the `auto` pin, unless no implementer passes the fixed rules. A saved
+   * `auto` then refuses with 409 `routing-no-eligible-profile`; the autonomous default logs once and pins shadow.
+   * A store failure gives the shadow pin and one log line.
+   */
+  pin(saved: TeamRouting | undefined, autonomy: AutonomyMode, lineup: TeamLineup | undefined, projectId: string): TeamRunRouting | undefined {
+    const shadowPin = () => pinRouting(saved, autonomy, lineup);
+    const effective = effectiveRouting(saved, autonomy);
+    // The same condition as pinRouting's `auto`: a saved auto mode, or no saved mode in an autonomous project.
+    const auto = saved?.mode === "auto" || (saved?.mode === undefined && autonomy === "autonomous");
+    if (effective.mode !== "shadow" || !effective.knobs.points.includes("start") || lineup === undefined || !auto) return shadowPin();
+
+    let end: string | undefined;
+    try {
+      end = periodEnd(this.store, projectId, this.now());
+    } catch {
+      this.autoOnce("pin");
+      return shadowPin();
+    }
+    if (end === undefined) return shadowPin();
+
+    const pin = pinRouting(saved, autonomy, lineup, end);
+    if (pin?.mode === "auto" && !screen(lineup, pin.knobs, new Set()).some(item => item.removed === undefined)) {
+      if (saved?.mode === "auto") throw new TeamError(409, "routing-no-eligible-profile", PROFILE_MESSAGES.noEligible);
+      this.autoOnce("uncovered");
+      return shadowPin();
+    }
+    return pin;
+  }
+
+  /** Never throws. Writes at most one shadow row. An `auto` pin returns at once: its start is `applyStart`'s. */
   recordStart(input: RouterStart): void {
     try {
       this.record(input);
@@ -72,34 +86,56 @@ export class RoutingRecorder {
     }
   }
 
+  /**
+   * The profile an `auto` run's task starts on, and `task.routing` set to it. Undefined unless the run is `auto`-pinned.
+   * A revoked run starts on the fallback profile without a run line, as the revoke wrote one. A fallback writes one run line.
+   * It throws only when no implementer passes the fixed rules, which `pin` refuses before a run exists.
+   */
+  applyStart(input: RouterStart): TeamModelProfile | undefined {
+    const { run, task } = input;
+    const routing = run.routing;
+    const lineup = run.lineup;
+    if (routing?.mode !== "auto" || lineup === undefined) return undefined;
+    if (run.routingRevokedAt !== undefined) {
+      const profile = fallbackProfile(run, task);
+      task.routing = { profileId: profile.id, by: "fallback" };
+      return profile;
+    }
+    const kept = task.routing === undefined ? undefined : lineup.implementers.find(profile => profile.id === task.routing?.profileId);
+    if (kept !== undefined && fixedRuleFailure(lineup, routing.knobs, kept) === undefined) return kept;
+
+    const decision = decideAutoStart(this.store, input, this.now, this.clock);
+    task.routing = { profileId: decision.profile.id, by: decision.by };
+    if (decision.by === "fallback") {
+      appendRunEvent(run, `Host routing could not choose a profile for task ${task.id}; it is assigned ${decision.profile.label}.`);
+      this.autoOnce(decision.reason);
+    }
+    return decision.profile;
+  }
+
   private once(reason: Reason): void {
     if (this.logged.has(reason)) return;
     this.logged.add(reason);
     this.log(LOG[reason]);
   }
 
+  private autoOnce(reason: AutoFailure | "pin" | "uncovered"): void {
+    if (this.autoLogged.has(reason)) return;
+    this.autoLogged.add(reason);
+    this.log(AUTO_LOG[reason]);
+  }
+
   private record(input: RouterStart): void {
     const { run, task } = input;
     const routing = run.routing;
-    if (routing === undefined || run.lineup === undefined || !routing.knobs.points.includes("start")) return;
+    if (routing === undefined || routing.mode === "auto" || run.lineup === undefined || !routing.knobs.points.includes("start")) return;
     const modules = this.store.status().modules;
     if (REQUIRED_MODULES.some(name => modules[name] !== "ready")) {
       this.once("unavailable");
       return;
     }
 
-    const knobs = routing.knobs;
-    const features = taskFeatures({ role: "implementer", paths: task.paths, kind: task.kind, risk: task.risk }, input.featureMap);
-    const screened = screen(run.lineup, knobs, input.limited);
-    const kept = screened.filter(item => item.removed === undefined || item.removed === "limited");
-    // One prompt version per identity, from the first kept profile with it, in lineup order.
-    const versions = new Map<string, { profile: TeamModelProfile; version: string }>();
-    for (const item of kept) {
-      if (versions.has(item.identity)) continue;
-      const version = promptVersion("implementer", item.profile.provider, item.profile, input.publishHeads, input.entryTools, input.objectiveDigest);
-      versions.set(item.identity, { profile: item.profile, version });
-    }
-
+    const frame = startFrame(input);
     const started = this.clock();
     const decided = this.store.read(db => {
       // The task's blind index, never its plain id: the key and the seed are stored as plain columns.
@@ -107,72 +143,7 @@ export class RoutingRecorder {
       const key = decisionKey(run.id, run.revision, taskKey, "start", 1);
       const existing = readDecision(db, key);
       if (existing !== undefined) return { existing };
-      const now = this.now();
-      const since = new Date(Date.parse(now) - MAX_AGE_DAYS * DAY_MS).toISOString();
-      const target: RoutingTarget = {
-        projectRef: db.index("project", run.projectId),
-        areaRef: db.index("area", features.area),
-        kind: features.kind,
-        featureVersion: features.featureVersion,
-        featureMapRef: db.index("feature-map", features.featureMap),
-        point: "start",
-      };
-      const scored = new Map<string, Scored>();
-      const current: { identity: string; epoch: number; promptVersion: string }[] = [];
-      for (const [identity, { profile, version }] of versions) {
-        const found: CurrentConfig = { epoch: epochAt(db, identity, now), promptVersion: version };
-        const rows = selectRoutingEvidence(db, identityOf(profile), "start", since);
-        scored.set(identity, { profile, identity, posterior: posterior(rows, target, found, now, CHOSEN_WEIGHT), costUsd: tierCost(profile) });
-        current.push({ identity, ...found });
-      }
-      const seed = decisionSeed(routing.digest, run.id, run.revision, taskKey, "start", 1);
-      const choice = choose(screened, scored, knobs, features.risk, seed);
-      if (choice === undefined) return undefined;
-      const chosen = choice.candidates.find(candidate => candidate.profileId === choice.chosen)!;
-      const row: DecisionRow = {
-        key,
-        runId: run.id,
-        revision: run.revision,
-        taskKey,
-        point: "start",
-        ordinal: 1,
-        projectRef: target.projectRef,
-        role: "implementer",
-        areaRef: target.areaRef,
-        kind: features.kind,
-        risk: features.risk,
-        featureVersion: features.featureVersion,
-        featureMapRef: target.featureMapRef,
-        mode: "shadow",
-        algorithmVersion: routing.algorithmVersion,
-        rewardVersion: routing.rewardVersion,
-        policyDigest: routing.digest,
-        seed,
-        basis: choice.basis,
-        chosenProfileId: choice.chosen,
-        chosenIdentity: chosen.identity,
-        greedyProfileId: choice.greedy,
-        coordinatorProfileId: task.agentProfileId ?? null,
-        explore: choice.explore,
-        state: "recorded",
-        memberId: null,
-        decidedAt: now,
-      };
-      const payload: RoutingPayload = {
-        projectId: run.projectId,
-        taskId: task.id,
-        area: features.area,
-        featureMap: features.featureMap,
-        coordinatorProfileId: row.coordinatorProfileId,
-        knobs,
-        costs: { lightUsd: TIER_COSTS.light, strongUsd: TIER_COSTS.strong, rescueUsd: RESCUE_USD, basis: "tier-default" },
-        headroom: "not-modelled",
-        chosenWeight: CHOSEN_WEIGHT,
-        current,
-        candidates: choice.candidates,
-        elapsedMs: 0,
-      };
-      return { row, payload };
+      return evaluateStart(db, input, frame, { taskKey, key }, this.now(), false);
     });
     if (decided === undefined || "existing" in decided) return;
 

@@ -19,6 +19,7 @@ const EMPTY_TREE_SHA1 = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const EMPTY_TREE_SHA256 = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321";
 const GUIDANCE_MODES = new Set(["100644", "100755", "120000"]);
 const PROMPT_CACHE_LIMIT = 256;
+const ROUTING_DIGEST = /^[0-9a-f]{64}$/;
 
 export type ProfileKey = { provider: string; model: string | null; effort: string | null };
 export interface ConfigComponents {
@@ -26,12 +27,18 @@ export interface ConfigComponents {
   promptVersion: string;
   guidance: string;
   knowledge: "none";
-  routing: "off";
+  /** `off`, or the policy digest of an `auto` run. */
+  routing: string;
   shape: "team" | "trial";
 }
 export type MemberConfiguration = ConfigComponents["profile"] & Omit<ConfigComponents, "profile"> & { configId: string };
 
 const sha256 = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
+
+/** The routing component of a configuration: `off`, or the policy digest of an `auto` run (umbrella C7, component 5). */
+export function isRoutingComponent(value: unknown): value is string {
+  return value === "off" || (typeof value === "string" && ROUTING_DIGEST.test(value));
+}
 
 /** SHA-256 hex of the canonical JSON of the key. The profile id and label are not part of it. */
 export function profileIdentityKey(profile: ProfileKey): string {
@@ -231,15 +238,19 @@ async function guidanceRead(workspace: string, commit: string, prefix: TeamComma
 export async function memberConfiguration(input: {
   workspace: string; baseCommit: string; role: TeamMember["role"]; provider: Provider;
   profile?: TeamModelProfile; publishHeads: boolean; entryTools?: boolean; objectiveDigest?: boolean; prefix?: TeamCommand;
+  /** The routing component. Absent means `off`, as every configuration before routing was stored. */
+  routing?: string;
 }, signal: AbortSignal): Promise<MemberConfiguration | undefined> {
+  if (input.routing !== undefined && !isRoutingComponent(input.routing)) return undefined;
+  const routing = input.routing ?? "off";
   try {
     const guidance = await readGuidanceDigest(input.workspace, input.baseCommit, input.prefix, signal);
     if (guidance === undefined) return undefined;
     const identity = profileIdentity(input.profile, input.provider);
     const profile: ProfileKey = { provider: identity.provider, model: identity.model ?? null, effort: identity.effort ?? null };
     const version = promptVersion(input.role, input.provider, input.profile, input.publishHeads, input.entryTools === true, input.objectiveDigest === true);
-    const components: ConfigComponents = { profile, promptVersion: version, guidance, knowledge: "none", routing: "off", shape: "team" };
-    return { ...profile, promptVersion: version, guidance, knowledge: "none", routing: "off", shape: "team", configId: configId(components) };
+    const components: ConfigComponents = { profile, promptVersion: version, guidance, knowledge: "none", routing, shape: "team" };
+    return { ...profile, promptVersion: version, guidance, knowledge: "none", routing, shape: "team", configId: configId(components) };
   } catch {
     return undefined;
   }

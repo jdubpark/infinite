@@ -505,6 +505,18 @@ test("the relay refuses routing reads", async () => {
   } finally { client.close(); runner.close(); }
 });
 
+test("the relay refuses routing writes", async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    // The pause, the resume, and the revoke are owner writes over a direct owner connection only.
+    for (const [method, path] of [["POST", `/routing/projects/rehearsal/explore/pause`], ["POST", `/routing/projects/rehearsal/explore/resume`], ["POST", `/teams/${randomUUID()}/routing/revoke`]] as const)
+      await assert.rejects(client.request(path, { method, body: {} }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    assert.equal(runner.requests.length, 1, "a refused routing write does not reach the host");
+  } finally { client.close(); runner.close(); }
+});
+
 test("the relay refuses corrections", async () => {
   const runner = await httpRunner();
   const client = createRemoteClient({ url: runner.url, token: runner.token });

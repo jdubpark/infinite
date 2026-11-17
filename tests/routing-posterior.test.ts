@@ -269,3 +269,21 @@ test("earlier evidence is capped at 10 below tenant, a row of another or no prom
   assert.deepEqual([rewardOnly.level, rewardOnly.rows, rewardOnly.phi], ["cell", { production: 1, duel: 0 }, { a: 1, b: 1 }]);
   assert.deepEqual(posterior([row({ source: "duel" })], TARGET, CURRENT, NOW, 1).rows, { production: 0, duel: 1 });
 });
+
+function assertBeta(actual: { a: number; b: number }, expected: { a: number; b: number }): void {
+  assert.ok(Math.abs(actual.a - expected.a) <= 1e-12, `a ${actual.a} is not ${expected.a}`);
+  assert.ok(Math.abs(actual.b - expected.b) <= 1e-12, `b ${actual.b} is not ${expected.b}`);
+}
+
+test("an applied row counts at full weight", () => {
+  const applied = row({ outcomeId: "applied-row" });
+  assertBeta(posterior([applied], TARGET, CURRENT, NOW, 0.5, new Set(["applied-row"])).theta, { a: 2, b: 1 });
+  assertBeta(posterior([applied], TARGET, CURRENT, NOW, 0.5).theta, { a: 1.5, b: 1 });
+  // A replacement's row, which is not the applied member's, keeps the half weight.
+  assertBeta(posterior([applied], TARGET, CURRENT, NOW, 0.5, new Set(["other-row"])).theta, { a: 1.5, b: 1 });
+
+  // With half the rows router-chosen, the posterior is still a function of the row set, not of the order.
+  const rows = Array.from({ length: 8 }, (_, index) => row({ outcomeId: `ordered-${index}`, accepted: index % 3 === 0 ? 0 : 1 }));
+  const chosen = new Set(rows.filter((_, index) => index % 2 === 0).map(item => item.outcomeId));
+  assert.deepEqual(posterior([...rows].reverse(), TARGET, CURRENT, NOW, 0.5, chosen), posterior(rows, TARGET, CURRENT, NOW, 0.5, chosen));
+});

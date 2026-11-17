@@ -493,3 +493,44 @@ test("eight candidates with integrated rows at all three levels stay within the 
   const bytes = Buffer.byteLength(JSON.stringify(row.payload), "utf8");
   assert.ok(bytes <= PAYLOAD_LIMIT_BYTES, `payload is ${bytes} bytes`);
 }));
+
+test("a shadow decision counts an applied row in full, and an auto pin records no shadow row", () => withStore(store => {
+  const astra = mixedLineup.implementers[1]!;
+  store.write(tx => {
+    config(tx, "cfg-astra", astra, versionOf(astra));
+    writeOutcome(tx, integrated({ id: "applied-run", profile: astra, configId: "cfg-astra", endedAt: ago(2) }));
+  });
+  const tenantSuccess = (runId: string, taskId: string) => {
+    const payload = rowsOf(store, runId, taskId)[0]!.payload as RoutingPayload;
+    const candidate = payload.candidates.find(item => item.profileId === "astra-xhigh")!;
+    return candidate.posterior!.reward.find(level => level.level === "cell")!.observed.success;
+  };
+
+  // Baseline: the outcome row counts at the chosen weight.
+  recorder(store).recordStart(startOf(runOf(mixedLineup, pinRouting(undefined, "autonomous", mixedLineup), "run-base"), taskOf("task-base")));
+  const before = tenantSuccess("run-base", "task-base");
+  assert.ok(before > 0);
+
+  // The same outcome row, now the router's applied choice: it counts in full.
+  const appliedTask = taskOf("task-applied");
+  const applied = { ...runOf(mixedLineup, pinRouting({ mode: "auto" }, "supervised", mixedLineup, ago(20)), "applied-run"), tasks: [appliedTask], members: [] } as unknown as TeamRun;
+  recorder(store).applyStart(startOf(applied, appliedTask));
+  store.write(tx => { tx.run("UPDATE routing_decisions SET state='applied', member_id='m1' WHERE run_id=?", "applied-run"); });
+  recorder(store).recordStart(startOf(runOf(mixedLineup, pinRouting(undefined, "autonomous", mixedLineup), "run-after"), taskOf("task-after")));
+  const after = tenantSuccess("run-after", "task-after");
+  assert.ok(Math.abs(after - 2 * before) < 1e-12, `applied success ${after} is twice the half-weight ${before}`);
+
+  // An auto pin records no shadow row and reads nothing at the start.
+  const rows = countRows(store);
+  const autoRun = runOf(mixedLineup, pinRouting({ mode: "auto", allowContributor: true }, "supervised", mixedLineup, ago(20)), "run-auto-skip");
+  let reads = 0;
+  const original = store.read.bind(store) as EvidenceStore["read"];
+  (store as { read: EvidenceStore["read"] }).read = ((fn: Parameters<EvidenceStore["read"]>[0]) => { reads += 1; return original(fn); }) as EvidenceStore["read"];
+  try {
+    recorder(store).recordStart(startOf(autoRun, taskOf("task-skip")));
+  } finally {
+    (store as { read: EvidenceStore["read"] }).read = original;
+  }
+  assert.equal(reads, 0);
+  assert.equal(countRows(store), rows);
+}));

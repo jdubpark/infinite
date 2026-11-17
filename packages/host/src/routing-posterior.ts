@@ -105,13 +105,17 @@ function chain(tally: Tally): LevelRecord[] {
   return records;
 }
 
-/** The posterior of one profile at one target. The result is a function of the row set: rows are sorted by outcome id first. */
+/**
+ * The posterior of one profile at one target. The result is a function of the row set: rows are sorted by outcome id first.
+ * A row whose outcome id is in `routerChosen` (an applied `auto` start) has who-chose weight 1; every other row has `chosenWeight`.
+ */
 export function posterior(
   rows: readonly RoutingEvidenceRow[],
   target: RoutingTarget,
   current: CurrentConfig,
   now: string,
   chosenWeight: number = CHOSEN_WEIGHT,
+  routerChosen?: ReadonlySet<string>,
 ): ProfilePosterior {
   const reward = emptyTally(), rescue = emptyTally();
   const counts = { production: 0, duel: 0 };
@@ -126,7 +130,7 @@ export function posterior(
       untimed++;
       continue;
     }
-    const found = observe(row, now, chosenWeight);
+    const found = observe(row, now, routerChosen?.has(row.outcomeId) ? 1 : chosenWeight);
     if (found === undefined) continue;
     const at = levelOf(row, target);
     const isCurrent = row.profileEpoch === current.epoch && row.promptVersion === current.promptVersion;

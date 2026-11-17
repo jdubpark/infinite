@@ -1,12 +1,15 @@
 import { createHash } from "node:crypto";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceDb, EvidenceModule, EvidenceTx } from "./evidence/types.js";
-import type { DecisionRow, RoutingPayload, RoutingPoint } from "./routing-types.js";
+import type { EventOutbox, EventProjector } from "./evidence/outbox.js";
+import type { DecisionRow, ProjectRoutingState, RoutingPayload, RoutingPoint } from "./routing-types.js";
 
 export const ROUTING_MODULE = "routing";
 export const ROUTING_RETENTION_DAYS = 180, TASK_DECISION_LIMIT = 20, PROJECT_DECISION_LIMIT = 500, PAYLOAD_LIMIT_BYTES = 32 * 1024;
 const SHADOW_PROGRESS_LIMIT = 50, SWEEP_LIMIT = 100, DAY_MILLISECONDS = 86_400_000;
 const TABLE = "routing_decisions";
+export const PERIOD_DAYS = 14, PERIOD_DECISIONS = 50, STALE_PENDING_DAYS = 7, STALE_RELEASE_LIMIT = 100,
+  APPLIED_ID_LIMIT = 2000, RUN_RELEASE_LIMIT = 200;
 
 const SCHEMA = [
   "CREATE TABLE IF NOT EXISTS routing_decisions (key TEXT PRIMARY KEY, run_id TEXT NOT NULL, revision INTEGER NOT NULL, "
@@ -19,6 +22,14 @@ const SCHEMA = [
   "CREATE INDEX IF NOT EXISTS routing_by_task ON routing_decisions (run_id, task_key, revision, point, ordinal)",
   "CREATE INDEX IF NOT EXISTS routing_by_project ON routing_decisions (project_ref, point, decided_at, key)",
   "CREATE INDEX IF NOT EXISTS routing_by_time ON routing_decisions (decided_at, key)",
+];
+
+/** Version 2: the project's period and pause, and the two indexes the launch path and the projector seek. */
+const SCHEMA_V2 = [
+  "CREATE TABLE IF NOT EXISTS routing_projects (project_ref TEXT PRIMARY KEY, period_ended_at TEXT, "
+  + "explore_paused_at TEXT, updated_at TEXT NOT NULL)",
+  "CREATE INDEX IF NOT EXISTS routing_by_state ON routing_decisions (project_ref, point, state, decided_at, key, explore)",
+  "CREATE INDEX IF NOT EXISTS routing_by_identity ON routing_decisions (chosen_identity, point, state, decided_at, run_id, member_id)",
 ];
 
 const COLUMNS = ["key", "run_id", "revision", "task_key", "point", "ordinal", "project_ref", "role", "area_ref", "kind", "risk",
@@ -66,13 +77,17 @@ function openPayload(db: EvidenceDb, row: SealedSql): RoutingPayload | null {
 export function routingModule(): EvidenceModule {
   return {
     name: ROUTING_MODULE,
-    version: 1,
+    version: 2,
     readVersion: 1,
-    migrate(tx) {
-      for (const statement of SCHEMA) tx.exec(statement);
+    migrate(tx, from) {
+      if (from === 0) for (const statement of SCHEMA) tx.exec(statement);
+      if (from < 2) for (const statement of SCHEMA_V2) tx.exec(statement);
     },
     counts(db) {
-      return { decisions: db.get<{ n: number }>(`SELECT count(*) AS n FROM ${TABLE}`)?.n ?? 0 };
+      return {
+        decisions: db.get<{ n: number }>(`SELECT count(*) AS n FROM ${TABLE}`)?.n ?? 0,
+        projects: db.get<{ n: number }>("SELECT count(*) AS n FROM routing_projects")?.n ?? 0,
+      };
     },
   };
 }
@@ -172,15 +187,18 @@ export function projectCells(db: EvidenceDb, projectId: string, since: string, l
   return { cells, capped };
 }
 
-/** The start decisions of a project (at most SHADOW_PROGRESS_LIMIT counted) and the first one's time. */
+/**
+ * The recorded start decisions of a project (at most SHADOW_PROGRESS_LIMIT counted) and the first one's time. Pending,
+ * applied, and released rows are not recorded decisions and count nowhere here.
+ */
 export function shadowProgress(db: EvidenceDb, projectId: string): { decisions: number; capped: boolean; firstAt: string | null } {
   const projectRef = db.index("project", projectId);
   const counted = db.get<{ n: number }>(
-    "SELECT count(*) AS n FROM (SELECT 1 FROM routing_decisions WHERE project_ref=? AND point='start' LIMIT ?)",
+    "SELECT count(*) AS n FROM (SELECT 1 FROM routing_decisions WHERE project_ref=? AND point='start' AND state='recorded' LIMIT ?)",
     projectRef, SHADOW_PROGRESS_LIMIT,
   )?.n ?? 0;
   const first = db.get<{ decided_at: string }>(
-    "SELECT decided_at FROM routing_decisions WHERE project_ref=? AND point='start' ORDER BY decided_at ASC LIMIT 1",
+    "SELECT decided_at FROM routing_decisions WHERE project_ref=? AND point='start' AND state='recorded' ORDER BY decided_at ASC LIMIT 1",
     projectRef,
   );
   return { decisions: counted, capped: counted >= SHADOW_PROGRESS_LIMIT, firstAt: first?.decided_at ?? null };
@@ -200,4 +218,138 @@ export function sweepExpiredDecisions(store: EvidenceStore, now: string, limit: 
   } catch {
     return 0;
   }
+}
+
+/** The project's stored period end and explore pause. Both are null without a row. One primary-key read. */
+export function readProjectState(db: EvidenceDb, projectId: string): ProjectRoutingState {
+  const row = db.get<{ period_ended_at: string | null; explore_paused_at: string | null }>(
+    "SELECT period_ended_at, explore_paused_at FROM routing_projects WHERE project_ref=?",
+    db.index("project", projectId),
+  );
+  return { periodEndedAt: row?.period_ended_at ?? null, explorePausedAt: row?.explore_paused_at ?? null };
+}
+
+/** Undefined below 50 recorded starts. endsAt is the later of firstAt + 14 days and fiftiethAt. */
+export function computedPeriodEnd(db: EvidenceDb, projectId: string): { firstAt: string; fiftiethAt: string; endsAt: string } | undefined {
+  const projectRef = db.index("project", projectId);
+  const select = "SELECT decided_at FROM routing_decisions WHERE project_ref=? AND point='start' AND state='recorded' "
+    + "ORDER BY decided_at, key LIMIT 1 OFFSET ?";
+  const first = db.get<{ decided_at: string }>(select, projectRef, 0);
+  const fiftieth = db.get<{ decided_at: string }>(select, projectRef, PERIOD_DECISIONS - 1);
+  if (first === undefined || fiftieth === undefined) return undefined;
+  const endsMs = Math.max(Date.parse(first.decided_at) + PERIOD_DAYS * DAY_MILLISECONDS, Date.parse(fiftieth.decided_at));
+  return { firstAt: first.decided_at, fiftiethAt: fiftieth.decided_at, endsAt: new Date(endsMs).toISOString() };
+}
+
+/** Stores the end unless one is stored, then returns the stored value: a stored end never moves. */
+export function markPeriodEnded(tx: EvidenceTx, projectId: string, endedAt: string, now: string): string {
+  const projectRef = tx.index("project", projectId);
+  tx.run(
+    "INSERT INTO routing_projects (project_ref, period_ended_at, explore_paused_at, updated_at) VALUES (?, ?, NULL, ?) "
+    + "ON CONFLICT(project_ref) DO UPDATE SET period_ended_at = COALESCE(routing_projects.period_ended_at, excluded.period_ended_at), "
+    + "updated_at = excluded.updated_at",
+    projectRef, endedAt, now,
+  );
+  return tx.get<{ period_ended_at: string }>("SELECT period_ended_at FROM routing_projects WHERE project_ref=?", projectRef)?.period_ended_at ?? endedAt;
+}
+
+/** A pause keeps the first pause time; null resumes. Returns the stored value. */
+export function setExplorePause(tx: EvidenceTx, projectId: string, pausedAt: string | null, now: string): string | null {
+  const projectRef = tx.index("project", projectId);
+  tx.run(
+    "INSERT INTO routing_projects (project_ref, period_ended_at, explore_paused_at, updated_at) VALUES (?, NULL, ?, ?) "
+    + "ON CONFLICT(project_ref) DO UPDATE SET explore_paused_at = CASE WHEN excluded.explore_paused_at IS NULL THEN NULL "
+    + "ELSE COALESCE(routing_projects.explore_paused_at, excluded.explore_paused_at) END, updated_at = excluded.updated_at",
+    projectRef, pausedAt, now,
+  );
+  return tx.get<{ explore_paused_at: string | null }>("SELECT explore_paused_at FROM routing_projects WHERE project_ref=?", projectRef)?.explore_paused_at ?? null;
+}
+
+/**
+ * The newest `window − 1` start rows of the project that are applied, or pending and decided within 7 days of `now`.
+ * Two seeks, one per state, merged in memory by (decided_at, key) descending.
+ */
+export function shareWindow(db: EvidenceDb, projectId: string, window: number, now: string): { exploratory: number; of: number } {
+  const projectRef = db.index("project", projectId);
+  const bound = new Date(Date.parse(now) - STALE_PENDING_DAYS * DAY_MILLISECONDS).toISOString();
+  const limit = Math.max(0, window - 1);
+  const select = "SELECT decided_at, key, explore FROM routing_decisions WHERE project_ref=? AND point='start' AND state=? "
+    + "AND decided_at >= ? ORDER BY decided_at DESC, key DESC LIMIT ?";
+  const rows = [
+    ...db.all<{ decided_at: string; key: string; explore: number }>(select, projectRef, "applied", "", limit),
+    ...db.all<{ decided_at: string; key: string; explore: number }>(select, projectRef, "pending", bound, limit),
+  ].sort((a, b) => (a.decided_at === b.decided_at ? (a.key < b.key ? 1 : a.key > b.key ? -1 : 0) : a.decided_at < b.decided_at ? 1 : -1))
+    .slice(0, limit);
+  return { exploratory: rows.filter(row => row.explore === 1).length, of: rows.length };
+}
+
+/** Releases the project's pending start rows decided more than 7 days before `now`, oldest first, at most 100. */
+export function releaseStalePending(tx: EvidenceTx, projectId: string, now: string): number {
+  const bound = new Date(Date.parse(now) - STALE_PENDING_DAYS * DAY_MILLISECONDS).toISOString();
+  return tx.run(
+    "UPDATE routing_decisions SET state='released' WHERE key IN (SELECT key FROM routing_decisions "
+    + "WHERE project_ref=? AND point='start' AND state='pending' AND decided_at < ? ORDER BY decided_at, key LIMIT 100)",
+    tx.index("project", projectId), bound,
+  ).changes;
+}
+
+/** `${run_id}:${member_id}` of the identity's applied start rows decided at or after `since`, newest first, at most 2,000. */
+export function appliedOutcomeIds(db: EvidenceDb, identity: string, since: string): Set<string> {
+  const rows = db.all<{ run_id: string; member_id: string | null }>(
+    "SELECT run_id, member_id FROM routing_decisions WHERE chosen_identity=? AND point='start' AND state='applied' "
+    + "AND decided_at>=? ORDER BY decided_at DESC LIMIT 2000",
+    identity, since,
+  );
+  return new Set(rows.map(row => `${row.run_id}:${row.member_id}`));
+}
+
+/** pending becomes applied with the member when the started profile is the chosen one, else released. No other state changes. */
+export function settleStart(tx: EvidenceTx, key: string, memberId: string, profileId: string): void {
+  tx.run(
+    "UPDATE routing_decisions SET state = CASE WHEN chosen_profile_id = ? THEN 'applied' ELSE 'released' END, "
+    + "member_id = CASE WHEN chosen_profile_id = ? THEN ? ELSE NULL END WHERE key=? AND state='pending'",
+    profileId, profileId, memberId, key,
+  );
+}
+
+/** pending becomes released for the run's rows, those of revisions below `beforeRevision` when given, at most 200. */
+export function releaseRun(tx: EvidenceTx, runId: string, beforeRevision: number = Number.MAX_SAFE_INTEGER): number {
+  return tx.run(
+    "UPDATE routing_decisions SET state='released' WHERE key IN (SELECT key FROM routing_decisions "
+    + "WHERE run_id=? AND state='pending' AND revision < ? LIMIT 200)",
+    runId, beforeRevision,
+  ).changes;
+}
+
+/**
+ * Settles the host's pending start rows from run events. A first implementer start (no `replaces`) on the chosen
+ * profile applies its row; any other profile releases it. A revision advance releases the lower revisions; a settle
+ * or a delete releases the run. Only `pending` rows change, so a repeated event changes nothing. Reads no payload.
+ */
+export function routingProjector(): EventProjector {
+  return {
+    name: "routing",
+    module: ROUTING_MODULE,
+    kinds: ["member.started", "run.deleted", "run.revision-advanced", "run.settled"],
+    project(tx, event) {
+      if (event.kind === "run.revision-advanced") {
+        releaseRun(tx, event.runId, event.revision);
+        return;
+      }
+      if (event.kind === "run.settled" || event.kind === "run.deleted") {
+        releaseRun(tx, event.runId);
+        return;
+      }
+      const data = event.data;
+      if (data.role !== "implementer" || data.replaces !== undefined || event.taskId === undefined
+        || event.memberId === undefined || typeof data.profileId !== "string") return;
+      settleStart(tx, decisionKey(event.runId, event.revision, tx.index("task", event.taskId), "start", 1), event.memberId, data.profileId);
+    },
+  };
+}
+
+/** Registers the module, then its projector. server.ts calls it in place of `evidence.register(routingModule())`. */
+export function registerRouting(store: EvidenceStore, outbox: EventOutbox): void {
+  store.register(routingModule());
+  outbox.registerProjector(routingProjector());
 }

@@ -1,4 +1,4 @@
-import { inputSourceLabel, decisionAnswerLabel } from "./team-types.js";
+import { inputSourceLabel, decisionAnswerLabel, autoPinned, autoRouted, eligibleImplementers, escalationPool, scoutPool } from "./team-types.js";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { entryToolsFor } from "./entry-roles.js";
@@ -74,6 +74,11 @@ function withoutPrivateSettings<T extends object>(project: T): T {
   delete copy.objective;
   return copy as T;
 }
+/** A task or scout without its routing decision: no member reads which profile the router chose, or why. */
+function withoutRouting<T extends object>(item: T): T {
+  const { routing: _routing, ...rest } = item as T & { routing?: unknown };
+  return rest as T;
+}
 /**
  * The goal's JSON. With a pinned record digest, the success text leaves the JSON and the digest's criteria follow, with
  * c0 carrying the success text, so the text appears once. Without a digest this is the goal's JSON, as before.
@@ -114,7 +119,7 @@ export function teamContext(run: TeamRun, feedback?: string, configuredProject?:
     ...(configuredProject ? { configuredProject: withoutPrivateSettings(configuredProject) } : {}),
     ...(run.linear ? { linear: run.linear } : {}),
     ...(run.brief ? { brief: run.brief } : {}),
-    ...(run.discovery ? { discovery: run.discovery } : {}),
+    ...(run.discovery ? { discovery: { ...run.discovery, tasks: run.discovery.tasks.map(withoutRouting) } } : {}),
     ...(run.noChange ? { noChange: run.noChange } : {}),
     ...(run.review ? { review: run.review } : {}),
     ...(run.recovery ? { recovery: run.recovery } : {}),
@@ -123,9 +128,9 @@ export function teamContext(run: TeamRun, feedback?: string, configuredProject?:
       steps: (run.permissionRecovery?.steps ?? []).slice(-20),
       sameProjectHistory: permissionRecoveryHistory.slice(-5),
     } } : {}),
-    tasks: run.tasks ?? [],
+    tasks: (run.tasks ?? []).map(withoutRouting),
     checks: run.checks ?? [],
-    continuations,
+    continuations: continuations.map(item => ({ ...item, tasks: item.tasks.map(withoutRouting) })),
     memberReports: (run.members ?? []).filter(member => member.role !== "permission-coordinator").map(({ memberId, revision, role, taskId, status, baseCommit, report, stoppedReason, permissionBlocked }) => ({ memberId, revision, role, ...(taskId ? { taskId } : {}), status, baseCommit, ...(report ? { report } : {}), ...(stoppedReason ? { stoppedReason } : {}), ...(permissionBlocked ? { permissionBlocked } : {}) })),
     ...(run.permissionAgentDecisions?.length ? { permissionAgentDecisions: run.permissionAgentDecisions.slice(-20) } : {}),
     feedback: feedback ?? null,
@@ -304,9 +309,9 @@ export function retargetPrompt(prompt: string, to: { provider: Provider; profile
 export function teamPrompt(run: TeamRun, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string, provider: Provider = run.provider, modelProfile?: TeamModelProfile, configuredProject?: Pick<TeamProject, "setup" | "checks">, permissionRecoveryHistory: TeamPermissionRecoveryView[] = [], publishHeads = true) {
   const deliveryBranch = teamDeliveryBranch(run);
   const implementerTask = task && role === "implementer" && "paths" in task
-    ? (({ rubric: _rubric, ownerRating: _ownerRating, diffStat: _diffStat, reviewRounds: _reviewRounds, summary: _summary, ...safeTask }) => safeTask)(task)
+    ? (({ rubric: _rubric, ownerRating: _ownerRating, diffStat: _diffStat, reviewRounds: _reviewRounds, summary: _summary, routing: _routing, ...safeTask }) => safeTask)(task)
     : task;
-  const taskProfileExample = run.lineup ? `,"agentProfileId":${JSON.stringify(run.lineup.implementers[0].id)}` : "";
+  const taskProfileExample = run.lineup && !autoRouted(run) ? `,"agentProfileId":${JSON.stringify(eligibleImplementers(run)[0].id)}` : "";
   const capacityExample = Math.min(2, run.parallelismCeiling ?? (run.handoff ? 2 : 4));
   const acceptanceInstructions = run.brief
     ? `For this brief, report exactly one acceptance entry per criterion, numbered from 1 in brief order. Use evidence you observed (command output, a test, or inspecting the running UI). If you could not check a criterion from observed evidence, mark it "inconclusive". Any "not-verified" or "inconclusive" criterion requires verdict "changes-requested". `
@@ -399,17 +404,19 @@ Confirm the remote branch and PR head equal ${run.headCommit}. Confirm required 
     role === "project-manager" && run.goal
       ? `A goal plan MUST include brief: {"title":"...","problem":"Observed user or product problem","evidence":[{"source":"Inspected source","observation":"Relevant fact or clearly marked hypothesis"}],"dataShape":"Entities and fields that the change reads or writes, or why no data change is needed","acceptance":["Observable acceptance criterion"],"expectedOutcome":"Expected product effect and how it could be checked","uiChanges":false}. Base the brief on evidence; do not invent usage metrics or customer demand. If no change is justified within this goal, report {"kind":"no-change","summary":"Why implementation is not justified","evidence":[{"source":"...","observation":"..."}]} and stop. This does not declare the goal achieved.`
       : "",
-    run.lineup && role === "project-manager"
-      ? `Every task MUST include agentProfileId from this approved worker pool: ${JSON.stringify(run.lineup.implementers)}. Prefer light profiles for bounded research and implementation. Choose strong profiles for work that requires difficult reasoning or has substantial consequences. Use the profiles the task needs; there is no requirement to use every model. Coordinator, integrator, and reviewer profiles are fixed. Do not invent profile IDs, model names, effort settings, or executable arguments.`
-      : "",
+    run.lineup && role === "project-manager" && autoRouted(run)
+      ? `The host assigns each plan task's worker profile; omit agentProfileId from plan tasks. Coordinator, integrator, and reviewer profiles are fixed. Do not invent profile IDs, model names, effort settings, or executable arguments.`
+      : run.lineup && role === "project-manager"
+        ? `Every task MUST include agentProfileId from this approved worker pool: ${JSON.stringify(eligibleImplementers(run))}. Prefer light profiles for bounded research and implementation. Choose strong profiles for work that requires difficult reasoning or has substantial consequences. Use the profiles the task needs; there is no requirement to use every model. Coordinator, integrator, and reviewer profiles are fixed. Do not invent profile IDs, model names, effort settings, or executable arguments.`
+        : "",
     run.lineup && role === "project-manager" && !run.discovery
-      ? `If focused evidence gathering would change the plan, you may request ONE batch of 1–3 read-only scouts before planning: {"kind":"explore","summary":"What needs evidence","parallelism":${capacityExample},"tasks":[{"id":"inspect-flow","title":"Inspect the current flow","instructions":"A bounded research question","agentProfileId":${JSON.stringify(run.lineup.implementers.find(profile => profile.tier === "light")?.id ?? run.lineup.implementers[0].id)}}]}. The optional parallelism is 1 through the capacity ceiling; choose it from independent ready investigations, repository contention, and the run's budgets. Omit it to use the full ceiling. Use the worker pool above. The host will return the recorded findings to you once. Skip this batch when the request and repository already provide enough evidence.`
+      ? `If focused evidence gathering would change the plan, you may request ONE batch of 1–3 read-only scouts before planning: {"kind":"explore","summary":"What needs evidence","parallelism":${capacityExample},"tasks":[{"id":"inspect-flow","title":"Inspect the current flow","instructions":"A bounded research question","agentProfileId":${JSON.stringify(scoutPool(run).find(profile => profile.tier === "light")?.id ?? scoutPool(run)[0].id)}}]}. The optional parallelism is 1 through the capacity ceiling; choose it from independent ready investigations, repository contention, and the run's budgets. Omit it to use the full ceiling. ${autoPinned(run) ? `Choose each scout's agentProfileId from this approved scout pool: ${JSON.stringify(scoutPool(run))}.` : "Use the worker pool above."} The host will return the recorded findings to you once. Skip this batch when the request and repository already provide enough evidence.`
       : "",
     role === "project-manager" && run.discovery
       ? `The team's one discovery batch is already used. Only tasks marked complete supplied validated read-only findings; unfinished tasks were interrupted and are not evidence. Read complete discovery records from ${TEAM_CONTEXT_PATH} before planning when they affect the outcome. Do not request another batch.`
       : "",
-    role === "implementer" && run.lineup?.escalations?.length
-      ? `If this task exceeds your reasoning capacity or the approach is failing, you may request one explicit escalation to this approved pool: ${JSON.stringify(run.lineup.escalations)}. Report {"kind":"escalate","agentProfileId":"Approved different profile ID","reason":"What failed or requires deeper reasoning; identify partial edits and remaining work"}. The host checks your partial edits, stops you, and continues in the same working copy. If this task already records an escalation, ask a material user question or report blocked; do not switch models yourself.`
+    role === "implementer" && escalationPool(run).length
+      ? `If this task exceeds your reasoning capacity or the approach is failing, you may request one explicit escalation to this approved pool: ${JSON.stringify(escalationPool(run))}. Report {"kind":"escalate","agentProfileId":"Approved different profile ID","reason":"What failed or requires deeper reasoning; identify partial edits and remaining work"}. The host checks your partial edits, stops you, and continues in the same working copy. If this task already records an escalation, ask a material user question or report blocked; do not switch models yourself.`
       : "",
     `Prefer API, process, integration, or end-to-end checks that prove changed behavior. Before adding a test, identify its observable contract, a credible failure it detects, and the gap in existing coverage. Avoid duplicate helper tests, copied implementation assertions, and production seams used only by tests. Inspect your diff and the runnable surface when relevant. Follow repository instructions and report checks actually run.`,
     `Write user-facing copy, docs, briefs, and summaries in plain English. Lead with concrete facts and outcomes. Remove generic filler, stock contrasts, and AI buzzwords. Do not invent evidence or claim checks, UI inspection, or product outcomes that you did not observe.`,

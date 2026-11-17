@@ -9,6 +9,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import { createTeamSchema, gitBranchSchema, githubRepositorySchema, teamDeliverySchema, teamDeliveryReconcileSchema, teamPermissionsSchema, type ProjectSource, type TeamDelivery, DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE} from "./team-types.js";
 import { describeSource } from "./client.js";
+import { requestedRouting, ROUTING_AUTO_NOTE } from "./routing-cli.js";
 import { autonomyModeSchema } from "./autonomy.js";
 import type { EntryPage } from "./evidence/blackboard.js";
 import type { EntryHead } from "./evidence/entry-types.js";
@@ -33,30 +34,6 @@ const REPO_INIT_TEAM_KEYS: ReadonlySet<string> = new Set(["setup", "checks", "es
 export function carriedTeamSettings(team: unknown): Record<string, unknown> {
   if (typeof team !== "object" || team === null || Array.isArray(team)) return {};
   return Object.fromEntries(Object.entries(team).filter(([key]) => !REPO_INIT_TEAM_KEYS.has(key)));
-}
-const ROUTING_VALUE_PRESETS = new Map<string, number>([["cost", 0.5], ["balanced", 2], ["quality", 8]]);
-/** The settings the three --routing options name, checked before any request. Undefined when none is given. */
-function requestedRouting(options: Options): Record<string, unknown> | undefined {
-  if (["--routing", "--routing-value", "--routing-contributor"].every(name => options[name] === undefined)) return undefined;
-  const choice: Record<string, unknown> = {};
-  if (options["--routing"] !== undefined) {
-    const mode = String(options["--routing"]);
-    if (mode === "auto") throw new Error("This host records shadow decisions only. Use --routing shadow; auto routing comes with a later release.");
-    if (mode !== "off" && mode !== "shadow") throw new Error("--routing must be off or shadow.");
-    choice.mode = mode;
-  }
-  if (options["--routing-value"] !== undefined) {
-    const value = String(options["--routing-value"]);
-    const dollars = ROUTING_VALUE_PRESETS.get(value) ?? (/^\d+(\.\d+)?$/.test(value) ? Number(value) : NaN);
-    if (!Number.isFinite(dollars) || dollars > 100) throw new Error("--routing-value must be cost, balanced, quality, or a dollar value from 0 to 100.");
-    choice.successValueUsd = dollars;
-  }
-  if (options["--routing-contributor"] !== undefined) {
-    const answer = String(options["--routing-contributor"]);
-    if (answer !== "allow" && answer !== "deny") throw new Error("--routing-contributor must be allow or deny.");
-    choice.allowContributor = answer === "allow";
-  }
-  return choice;
 }
 const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 const projectIdPattern = /^[a-z0-9-]{1,80}$/;
@@ -693,6 +670,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     if (me.teams?.repoEnrollment !== 1) throw new Error("This host does not support repository enrollment. Upgrade the host before running repo init.");
     if (autonomy && me.teams?.autonomyMode !== 1) throw new Error("This host does not support autonomy modes. Upgrade the host before using --autonomy.");
     if (routingChoice && me.teams?.routing !== 1) throw new Error("This host does not support routing settings. Upgrade the host before using --routing.");
+    if (routingChoice?.mode === "auto" && me.teams?.routingAuto !== 1) throw new Error("This host does not support auto routing. Upgrade the host before using --routing auto.");
     const mappings = readPrivateJson(mappingsPath, {}) as Record<string, unknown>;
     const key = `${config.origin}\n${root}`;
     const stored = mappings[key];
@@ -845,6 +823,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     if (explicitProject || uploadSource) { config.projectId = selected; privateJson(configPath, config); }
     const sourceSnapshot = uploadSource && !head.commit ? "empty cloud baseline" : uploadSource ? `local commit ${head.commit}` : detail.sync?.appliedManifest ? "existing cloud checkout retained" : "configured project checkout";
     console.log(JSON.stringify({ kind: "repository", id: selected, name: clean(output.name), path: clean(output.path), team: output.team, linear: output.linear, teamwork: output.teamwork, revision: output.revision, execution: output.execution, autonomy: output.autonomy, autonomySource: output.autonomySource, projectSource: enrolledSource, ...(linearDefaultsFrom ? { linearDefaultsFrom } : {}), source: sourceSnapshot }, null, 2));
+    if (routingChoice?.mode === "auto") console.error(ROUTING_AUTO_NOTE);
     return true;
   }
   const [subcommand, id, ...rest] = positional;
@@ -1196,11 +1175,11 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     outputTeam(await postMutation(api, receiptsPath, key, endpoint, body), Boolean(options["--json"]));
     return true;
   }
-  if (["steer", "answer", "pause", "resume", "cancel", "continue", "revoke-permissions", "reconcile-verification"].includes(subcommand ?? "")) {
+  if (["steer", "answer", "pause", "resume", "cancel", "continue", "revoke-permissions", "revoke-routing", "reconcile-verification"].includes(subcommand ?? "")) {
     if (!id) throw new Error(`Usage: infinite team ${subcommand} ID ...`);
     const current = await api.json<any>(`/teams/${id}`);
     const requestId = z.uuid().parse(String(options["--request-id"] ?? randomUUID()));
-    let endpoint = subcommand === "revoke-permissions" ? `/teams/${id}/permissions/revoke` : `/teams/${id}/${subcommand}`, body: Record<string, unknown>;
+    let endpoint = subcommand === "revoke-permissions" ? `/teams/${id}/permissions/revoke` : subcommand === "revoke-routing" ? `/teams/${id}/routing/revoke` : `/teams/${id}/${subcommand}`, body: Record<string, unknown>;
     if (subcommand === "reconcile-verification") {
       const pendingId = String(options["--pending"] ?? "").trim(), headCommit = String(options["--head"] ?? "").trim();
       const attestationText = [options["--processes-stopped"], ...rest].filter(value => typeof value === "string").join(" ").trim();
@@ -1259,5 +1238,5 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     }
     return true;
   }
-  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|continue|delete|entries|entry|reconcile-delivery|reconcile-verification|retire-member|cancel|revoke-permissions ...");
+  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|continue|delete|entries|entry|reconcile-delivery|reconcile-verification|retire-member|cancel|revoke-permissions|revoke-routing ...");
 }

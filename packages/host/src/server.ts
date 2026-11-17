@@ -42,7 +42,7 @@ import { outcomeProjector } from "./outcome-projector.js";
 import { EvalHost } from "./eval-host.js";
 import { EXCLUSION_REASONS, OUTCOMES_MODULE, outcomeModule, runOutcomeView, sweepExpiredOutcomes, type SignalRow } from "./outcome-store.js";
 import { RoutingRecorder } from "./routing-recorder.js";
-import { routingModule, sweepExpiredDecisions } from "./routing-store.js";
+import { registerRouting, sweepExpiredDecisions } from "./routing-store.js";
 import { ownerSignal, SignalRequestError, type OwnerSignalInput } from "./outcome-signals.js";
 import { COMMIT_ID, HOLD_DAYS_DEFAULT } from "./outcome-hold.js";
 import { BaseScanner } from "./outcome-scan.js";
@@ -257,7 +257,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   evidence.register(configurationModule());
   outbox.registerProjector(configurationProjector());
   evidence.register(outcomeModule());
-  evidence.register(routingModule());
+  registerRouting(evidence, outbox);
   // The project signal inbox. Sources record facts into it; only consumers' own scheduler passes act on them.
   const signals = new SignalService({ store: evidence });
   baseScanner = new BaseScanner({
@@ -829,7 +829,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       providers: Object.keys(config.agents).filter(
         (p) => p !== "demo" || config.enableDemo,
       ),
-      teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, projectSource: 1, autonomyMode: 1, routing: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
+      teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, projectSource: 1, autonomyMode: 1, routing: 1, routingAuto: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
       // onboardingCoverage: repo init's PUT takes permissionOptOut and answers what onboarding left in the delegation record.
       permissions: { workspaceDelegation: 1, decisionLog: 1, onboardingCoverage: 1 },
       goals: { enabled: goals.enabled() },
@@ -1095,7 +1095,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
   objectiveRoutes(app, { goals, teams }, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
-  routingRoutes(app, { evidence, config: () => config }, requireRole(["owner", "controller", "viewer"]));
+  routingRoutes(app, { evidence, config: () => config, teams }, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
   evalHost.routes(app, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
   app.get("/api/routines", (_req, res) => res.json({ routines: routines.list() }));
   app.get("/api/routines/:id", (req, res) => res.json(routines.get(id.parse(req.params.id))));

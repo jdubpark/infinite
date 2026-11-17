@@ -8,6 +8,7 @@ import { Glyph } from "../../components/Icon";
 import type { UnderstandingRepository, UnderstandingWork, WorkspaceUnderstanding } from "@infinite/remote";
 import { theme } from "../../theme";
 import { HaltBanner } from "../halt/HaltBanner";
+import { workspaceHaltScope } from "../halt/model";
 import { KnowledgePanel } from "./KnowledgePanel";
 import { SystemOverview } from "./SystemOverview";
 import { clearUnderstandingSummary, readUnderstandingSummary, saveUnderstandingSummary } from "./offline-cache";
@@ -109,6 +110,8 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
   const repoById = new Map(data?.repositories.map(repo => [repo.id, repo]) ?? []);
   const groupName = result?.groupName || data?.workspace.name || "Workspace";
   const checkouts = membership?.scope === scope ? membership.checkouts : [];
+  // The halt scope comes from the brief's repositories too, so an offline view from the cache still shows its projects' halts.
+  const haltScope = workspaceHaltScope(data?.repositories ?? [], checkouts);
   const back = () => router.canGoBack() ? router.back() : router.replace({ pathname: "/(tabs)/understanding", params: { ...(params.machine ? { machine: params.machine } : {}) } });
   const revealKnowledge = (anchor: View | null) => {
     requestAnimationFrame(() => {
@@ -121,7 +124,7 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
   return <View style={s.fill}>
     <TopBar backLabel="Understand" onBack={back} title={groupName} right={<LiveStatus online={poll.online && result?.state === "ready" && !result.cachedAt} loading={poll.loading} seen={poll.seen} stale={poll.stale} />} />
     <Segmented options={views} value={view} onChange={setView} style={s.segment} />
-    <HaltBanner connection={connection} place={{ projectIds: checkouts.map(checkout => checkout.projectId) }} names={id => checkouts.find(checkout => checkout.projectId === id)?.name} style={s.halt} />
+    <HaltBanner connection={connection} place={{ projectIds: haltScope.projectIds }} names={haltScope.name} style={s.halt} />
     <ScrollView ref={scroll} contentContainerStyle={s.content} keyboardShouldPersistTaps="handled"
       refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={() => { stopped.current = ""; poll.refresh(); }} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <View ref={content}>

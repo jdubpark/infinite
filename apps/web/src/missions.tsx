@@ -4,6 +4,8 @@ import { ApiError, useApi, type Me } from "./api";
 import { useLiveRefresh } from "./live-refresh";
 import { useMachines } from "./machines";
 import { requestStore } from "./requests";
+import { haltNotice, missionHaltPlace, type HaltView } from "./halt";
+import { HaltBanner } from "./halt-banner";
 import { missionControls, missionExtendChoices, missionExtensionConfirmation, missionShowsReason, missionStateLabel, missionStopLine, missionStoppedAtLimit, type MissionStatus } from "./mission-model";
 
 type MissionView = {
@@ -18,6 +20,8 @@ type MissionView = {
   deadlineAt: string;
   clockStoppedAt?: string;
   maxMinutes: number;
+  /** Pinned at creation; the host covers a mission with a project halt on any of these. */
+  repoProjectIds: string[];
   subtasks: { id: string; title: string; status: string; repoProjectId: string; teamId?: string }[];
   events: { at: string; text: string }[];
 };
@@ -30,7 +34,7 @@ export function clearMissionRequests(machine: string) { mutations.clearMachine(m
 const rejected = (error: unknown) => error instanceof ApiError && error.status >= 400 && error.status < 500;
 const date = (value: string) => new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 const missionStatusClass = (status: MissionStatus) => status === "working" ? "" : ["needs-input", "blocked", "paused"].includes(status) ? "waiting" : ["cancelled", "ready-for-review"].includes(status) ? "inactive" : "";
-export function MissionPage({ id, me, connected, openTeam }: { id: string; me: Me; connected: boolean; openTeam: (id: string) => void }) {
+export function MissionPage({ id, me, connected, openTeam, halt }: { id: string; me: Me; connected: boolean; openTeam: (id: string) => void; halt: HaltView | null }) {
   const api = useApi(), machine = useMachines().active.id, key = machine + "/" + id;
   const [mission, setMission] = useState<MissionView | null>(null);
   const [loadError, setLoadError] = useState("");
@@ -83,8 +87,11 @@ export function MissionPage({ id, me, connected, openTeam }: { id: string; me: M
     }
   }
 
-  if (me.missions?.enabled === false) return <div className="team-page"><h1>Mission</h1><p className="team-notice" role="status">Missions are not enabled on this host.</p></div>;
-  if (!mission) return <div className="team-page"><h1>Mission</h1><p role="status">{loadError || "Loading mission…"}</p>{loadError && <button type="button" className="text-button" onClick={view.refresh}><RefreshCw size={15} />Try again</button>}</div>;
+  // The owner's halt for this mission: the host halt, and halts on the projects it is pinned to. Until the mission
+  // loads there is no mission to scope to, so only the host halt shows.
+  const banner = <HaltBanner className="halt-main" notice={haltNotice(halt, missionHaltPlace(mission?.repoProjectIds ?? []))} name={projectId => me.projects.find(project => project.id === projectId)?.name ?? projectId} owner={me.role === "owner"} />;
+  if (me.missions?.enabled === false) return <div className="team-page"><h1>Mission</h1>{banner}<p className="team-notice" role="status">Missions are not enabled on this host.</p></div>;
+  if (!mission) return <div className="team-page"><h1>Mission</h1>{banner}<p role="status">{loadError || "Loading mission…"}</p>{loadError && <button type="button" className="text-button" onClick={view.refresh}><RefreshCw size={15} />Try again</button>}</div>;
 
   const stoppedAtLimit = missionStoppedAtLimit(mission);
   const stopLine = missionStopLine(mission, Date.now(), date);
@@ -104,6 +111,7 @@ export function MissionPage({ id, me, connected, openTeam }: { id: string; me: M
       </div>
       <button type="button" className="text-button" disabled={view.refreshing} onClick={view.refresh} aria-busy={view.refreshing}><RefreshCw className={view.refreshing ? "is-refreshing" : ""} size={14} />Refresh mission</button>
     </header>
+    {banner}
     <div className="team-detail-body">
       {missionShowsReason(mission) && <p className="team-notice" role="status">{mission.reason}</p>}
       <section className="team-section">

@@ -37,6 +37,22 @@ export function haltNotice(view: HaltView | null | undefined, place: HaltPlace):
 }
 
 /**
+ * The projects a workspace covers, read from its repositories: each repository's checkouts and its primary project
+ * (`id`). The cached offline summary keeps these IDs, so the halt scope does not depend on a live group read.
+ * `checkouts` from a live group read add names; a repository's name applies only to its primary project.
+ */
+export function workspaceHaltScope(
+  repositories: readonly { id: string; name: string; checkoutIds: readonly string[] }[],
+  checkouts: readonly { projectId: string; name: string }[] = [],
+) {
+  const names = new Map<string, string>();
+  for (const repo of repositories) if (!names.has(repo.id)) names.set(repo.id, repo.name);
+  for (const checkout of checkouts) names.set(checkout.projectId, checkout.name);
+  const projectIds = [...new Set([...repositories.flatMap(repo => [repo.id, ...repo.checkoutIds]), ...checkouts.map(checkout => checkout.projectId)])];
+  return { projectIds, name: (projectId: string) => names.get(projectId) };
+}
+
+/**
  * One halt snapshot per machine, shared by every screen. A read takes a ticket before it starts, and only a read that
  * started after the stored one may replace it, so a late answer to an earlier read, or a screen's own retained copy,
  * never brings back a halt the owner has released. A failed read leaves the snapshot as it was.

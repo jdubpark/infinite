@@ -12,12 +12,14 @@ import { AUTO_LOG } from "../packages/host/src/routing-auto.js";
 import { shareAllows } from "../packages/host/src/routing-guards.js";
 import { pinRouting, type TeamRouting } from "../packages/host/src/routing-policy.js";
 import { RoutingRecorder, type RouterStart } from "../packages/host/src/routing-recorder.js";
-import { spareAttempts } from "../packages/host/src/routing-rules.js";
+import { escalationFallback, scoutFallback, spareAttempts } from "../packages/host/src/routing-rules.js";
 import {
   markPeriodEnded, PAYLOAD_LIMIT_BYTES, readProjectState, routingModule, setExplorePause, shareWindow, taskDecisions,
 } from "../packages/host/src/routing-store.js";
+import { decideAutoEscalation, decideAutoScout, type RouterEscalation, type RouterScout } from "../packages/host/src/routing-points.js";
+import type { AutoDecision } from "../packages/host/src/routing-auto.js";
 import { TeamError } from "../packages/host/src/team-workspace.js";
-import type { TeamLineup, TeamModelProfile, TeamRun, TeamTask } from "../packages/host/src/team-types.js";
+import type { TeamLineup, TeamModelProfile, TeamRun, TeamScout, TeamTask } from "../packages/host/src/team-types.js";
 import type { TeamRunRouting } from "../packages/host/src/routing-types.js";
 import { mixedLineup } from "./team-fixture.js";
 
@@ -426,3 +428,228 @@ test("a stored period end is read from the table, and markPeriodEnded keeps the 
   store.write(tx => { markPeriodEnded(tx, "rehearsal", ago(1), NOW); });
   assert.equal(store.read(db => readProjectState(db, "rehearsal")).periodEndedAt, ago(3));
 }));
+
+/** The points lineup: spark is a contributor, astra has no tier, haiku is light, opus is strong and on the reviewer's model. */
+const POINT_LINEUP: TeamLineup = {
+  ...mixedLineup,
+  implementers: [
+    mixedLineup.implementers[0]!,
+    mixedLineup.implementers[1]!,
+    { id: "haiku-light", label: "Haiku implementer", provider: "claude", model: "claude-haiku-5-5", effort: "medium", tier: "light" },
+    { id: "opus-strong", label: "Opus implementer", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
+  ],
+  escalations: [
+    { id: "opus-escalation", label: "Opus escalation", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
+    { id: "astra-escalation", label: "Astra escalation", provider: "codex", model: "gpt-6-astra", effort: "high", tier: "strong" },
+    { id: "sonnet-escalation", label: "Sonnet escalation", provider: "claude", model: "claude-sonnet-5-5", effort: "high", tier: "strong" },
+    { id: "spark-escalation", label: "Spark escalation", provider: "opencode", model: "meta/muse-spark-1.3-contributor", variant: "high", tier: "strong", dataUse: "contributor" },
+  ],
+};
+const ASTRA_E = POINT_LINEUP.escalations![1]!;
+const SONNET_E = POINT_LINEUP.escalations![2]!;
+const POINTS_PIN = { mode: "auto", points: ["start", "escalation", "scout"] } as unknown as TeamRouting;
+const routingOf = () => pinRouting(POINTS_PIN, "supervised", POINT_LINEUP, ENDED)!;
+const TASK = taskOf("task-e");
+const SCOUT = ({ id: "scout-1", title: "scout", instructions: "look" }) as unknown as TeamScout;
+const escalationOf = (run: TeamRun, task: TeamTask, ownProfileId: string | undefined, namedProfileId?: string): RouterEscalation =>
+  ({ ...startOf(run, task), ownProfileId, namedProfileId });
+const scoutOf = (run: TeamRun, scout: TeamScout): RouterScout => ({ run, scout, featureMap: undefined, limited: new Set() });
+
+/** An integrated implementer row that replaced a member by escalation, so its point is `escalation`. */
+const escalated = (spec: Parameters<typeof integrated>[0]): OutcomeRow => {
+  const row = integrated(spec);
+  return { ...row, payload: { ...row.payload, replaces: { memberId: "m0", cause: "escalation" } } };
+};
+
+test("an escalation decision is greedy over escalation evidence only, and writes one pending row", () => {
+  withStore(store => {
+    const routing = pinRouting(POINTS_PIN, "supervised", POINT_LINEUP, ENDED)!;
+    assert.equal(routing.algorithmVersion, 2);
+    const run = runOf(POINT_LINEUP, routing, "run-escalation");
+    const task = taskOf("task-e");
+    run.tasks.push(task);
+    store.write(tx => {
+      for (let index = 0; index < 10; index++) writeOutcome(tx, escalated({ id: `esc-sonnet-${index}`, profile: SONNET_E, configId: "none", endedAt: NOW }));
+      // Start rows for astra-escalation's identity do not count at the escalation point.
+      for (let index = 0; index < 10; index++) writeOutcome(tx, integrated({ id: `start-astra-${index}`, profile: ASTRA_E, configId: "none", endedAt: NOW }));
+    });
+
+    assert.deepEqual(decideAutoEscalation(store, escalationOf(run, task, "astra-xhigh"), () => NOW, () => 0), { profile: SONNET_E, by: "router" });
+    const rows = rowsOf(store, run.id, "task-e");
+    assert.equal(rows.length, 1, "one row for the escalation");
+    const row = rows[0]!;
+    assert.equal(row.point, "escalation");
+    assert.equal(row.ordinal, 1);
+    assert.equal(row.role, "implementer");
+    assert.equal(row.mode, "auto");
+    assert.equal(row.algorithmVersion, 2);
+    assert.equal(row.state, "pending");
+    assert.equal(row.basis, "greedy-point");
+    assert.equal(row.explore, false);
+    assert.match(row.seed, /^[0-9a-f]{64}$/);
+    assert.equal(row.chosenProfileId, SONNET_E.id);
+    assert.equal(row.greedyProfileId, SONNET_E.id);
+    assert.equal(row.chosenIdentity, identityOf(SONNET_E));
+    assert.equal(row.coordinatorProfileId, null);
+    assert.equal(row.memberId, null);
+    assert.equal(row.payload?.guards, undefined, "an escalation reads no guard");
+    assert.deepEqual(
+      row.payload?.candidates.map(candidate => [candidate.profileId, candidate.removed]),
+      [["opus-escalation", "reviewer-model"], ["astra-escalation", undefined], ["sonnet-escalation", undefined], ["spark-escalation", "contributor"]],
+    );
+    assert.equal(countRows(store), 1);
+  });
+
+  // With no evidence, the two candidates tie and the first in lineup order wins.
+  withStore(fresh => {
+    const routing = pinRouting(POINTS_PIN, "supervised", POINT_LINEUP, ENDED)!;
+    const run = runOf(POINT_LINEUP, routing, "run-tie");
+    const task = taskOf("task-tie");
+    run.tasks.push(task);
+    assert.deepEqual(decideAutoEscalation(fresh, escalationOf(run, task, "astra-xhigh"), () => NOW, () => 0), { profile: ASTRA_E, by: "router" });
+  });
+
+  // Own profile sonnet-escalation, with the same evidence: the pick is astra-escalation, and sonnet is not a candidate.
+  withStore(store => {
+    const routing = pinRouting(POINTS_PIN, "supervised", POINT_LINEUP, ENDED)!;
+    store.write(tx => {
+      for (let index = 0; index < 10; index++) writeOutcome(tx, escalated({ id: `esc-sonnet-${index}`, profile: SONNET_E, configId: "none", endedAt: NOW }));
+      for (let index = 0; index < 10; index++) writeOutcome(tx, integrated({ id: `start-astra-${index}`, profile: ASTRA_E, configId: "none", endedAt: NOW }));
+    });
+    const run = runOf(POINT_LINEUP, routing, "run-escalation-own");
+    const task = taskOf("task-own");
+    run.tasks.push(task);
+    assert.deepEqual(decideAutoEscalation(store, escalationOf(run, task, SONNET_E.id), () => NOW, () => 0), { profile: ASTRA_E, by: "router" });
+    const row = rowsOf(store, run.id, "task-own")[0]!;
+    assert.equal(row.payload?.candidates.some(candidate => candidate.profileId === SONNET_E.id), false);
+
+    // A named escalation profile does not steer the pick. The row records it beside the router's pick.
+    const named = taskOf("task-named");
+    run.tasks.push(named);
+    assert.deepEqual(decideAutoEscalation(store, escalationOf(run, named, "astra-xhigh", ASTRA_E.id), () => NOW, () => 0), { profile: SONNET_E, by: "router" });
+    const namedRow = rowsOf(store, run.id, "task-named")[0]!;
+    assert.equal(namedRow.chosenProfileId, SONNET_E.id);
+    assert.equal(namedRow.coordinatorProfileId, ASTRA_E.id);
+  });
+});
+
+test("an applied escalation of the router's counts at full weight at the escalation point", () => withStore(store => {
+  const routing = routingOf();
+  const decide = (runId: string) => {
+    const run = runOf(POINT_LINEUP, routing, runId);
+    const task = taskOf(`task-${runId}`);
+    run.tasks.push(task);
+    return decideAutoEscalation(store, escalationOf(run, task, "astra-xhigh"), () => NOW, () => 0);
+  };
+  // With no evidence yet, the router picks astra four times. Those runs then integrate, as do six sonnet escalations.
+  for (let index = 0; index < 4; index++) assert.deepEqual(decide(`esc-astra-${index}`), { profile: ASTRA_E, by: "router" });
+  store.write(tx => {
+    for (let index = 0; index < 4; index++) writeOutcome(tx, escalated({ id: `esc-astra-${index}`, profile: ASTRA_E, configId: "none", endedAt: NOW }));
+    for (let index = 0; index < 6; index++) writeOutcome(tx, escalated({ id: `esc-sonnet-${index}`, profile: SONNET_E, configId: "none", endedAt: NOW }));
+  });
+  // Pending, the astra rows weigh 4 x 0.5 against sonnet's 6 x 0.5.
+  assert.deepEqual(decide("run-pending"), { profile: SONNET_E, by: "router" });
+  // Applied with their members, they weigh 4 x 1 against 6 x 0.5.
+  store.write(tx => { tx.run("UPDATE routing_decisions SET state='applied', member_id='m1' WHERE run_id LIKE 'esc-astra-%'"); });
+  assert.deepEqual(decide("run-applied"), { profile: ASTRA_E, by: "router" });
+}));
+
+test("a scout decision reads no outcome and writes one pending row", () => withStore(store => {
+  const routing = pinRouting(POINTS_PIN, "supervised", POINT_LINEUP, ENDED)!;
+  const run = runOf(POINT_LINEUP, routing, "run-scout");
+  // Twenty integrated starts for the astra identity would move a posterior. A scout reads none of them.
+  store.write(tx => {
+    for (let index = 0; index < 20; index++) writeOutcome(tx, integrated({ id: `scout-start-${index}`, profile: POINT_LINEUP.implementers[1]!, configId: "none", endedAt: NOW }));
+  });
+  let chosen: AutoDecision | undefined;
+  let reads = 0;
+  assert.equal(countWrites(store, () => {
+    reads = countReads(store, () => { chosen = decideAutoScout(store, scoutOf(run, SCOUT), () => NOW, () => 0); });
+  }), 1, "one insert");
+  assert.equal(reads, 1, "one read");
+  assert.deepEqual(chosen, { profile: POINT_LINEUP.implementers[1], by: "router" }, "the cheapest candidate, astra, wins the tie with haiku");
+
+  const rows = rowsOf(store, run.id, "scout-1");
+  assert.equal(rows.length, 1);
+  const row = rows[0]!;
+  assert.equal(row.point, "scout");
+  assert.equal(row.role, "scout");
+  assert.equal(row.state, "pending");
+  assert.equal(row.basis, "greedy-point");
+  assert.equal(row.coordinatorProfileId, null);
+  assert.equal(row.payload?.guards, undefined);
+  assert.deepEqual(row.payload?.current, []);
+  assert.deepEqual(
+    row.payload?.candidates.map(candidate => [candidate.profileId, candidate.costUsd, candidate.posterior]),
+    [["spark-high", undefined, undefined], ["astra-xhigh", 0.4, undefined], ["haiku-light", 0.4, undefined]],
+  );
+  assert.equal(countRows(store), 1);
+}));
+
+test("a second decision for one key reuses its row, even when its payload does not open", () => withStore(store => {
+  const routing = pinRouting(POINTS_PIN, "supervised", POINT_LINEUP, ENDED)!;
+  const run = runOf(POINT_LINEUP, routing, "run-repeat");
+  const task = taskOf("task-repeat");
+  run.tasks.push(task);
+  store.write(tx => {
+    for (let index = 0; index < 10; index++) writeOutcome(tx, escalated({ id: `repeat-sonnet-${index}`, profile: SONNET_E, configId: "none", endedAt: NOW }));
+  });
+  assert.deepEqual(decideAutoEscalation(store, escalationOf(run, task, "astra-xhigh"), () => NOW, () => 0), { profile: SONNET_E, by: "router" });
+  assert.deepEqual(decideAutoScout(store, scoutOf(run, SCOUT), () => NOW, () => 0), { profile: POINT_LINEUP.implementers[1], by: "router" });
+
+  // Thirty astra escalations would flip a fresh decision. The stored row is the answer, and its payload no longer opens.
+  store.write(tx => {
+    for (let index = 0; index < 30; index++) writeOutcome(tx, escalated({ id: `repeat-astra-${index}`, profile: ASTRA_E, configId: "none", endedAt: NOW }));
+    tx.run("UPDATE routing_decisions SET encrypted_payload='not-sealed' WHERE run_id=?", run.id);
+  });
+  assert.deepEqual(decideAutoEscalation(store, escalationOf(run, task, "astra-xhigh"), () => NOW, () => 0), { profile: SONNET_E, by: "router" });
+  assert.deepEqual(decideAutoScout(store, scoutOf(run, SCOUT), () => NOW, () => 0), { profile: POINT_LINEUP.implementers[1], by: "router" });
+  assert.equal(countRows(store), 2, "one row per key");
+
+  const [escalation] = rowsOf(store, run.id, "task-repeat");
+  assert.equal(escalation?.chosenProfileId, SONNET_E.id);
+  assert.equal(escalation?.payload, null, "the unreadable payload reads as null; the plain row still returns");
+  assert.equal(rowsOf(store, run.id, "scout-1")[0]?.payload, null);
+}));
+
+test("every failure at a new point gives the fallback and its reason", () => {
+  const padded = { ...routingOf(), knobs: { ...routingOf().knobs, padding: "x".repeat(PAYLOAD_LIMIT_BYTES) } } as unknown as TeamRunRouting;
+  const decide = (kind: "escalation" | "scout", store: EvidenceStore, run: TeamRun, clock: () => number = () => 0): AutoDecision | undefined =>
+    kind === "escalation"
+      ? decideAutoEscalation(store, escalationOf(run, TASK, "astra-xhigh"), () => NOW, clock)
+      : decideAutoScout(store, scoutOf(run, SCOUT), () => NOW, clock);
+  const fallbackOf = (kind: "escalation" | "scout", run: TeamRun): TeamModelProfile | undefined =>
+    kind === "escalation" ? escalationFallback(run, "astra-xhigh", undefined) : scoutFallback(run, SCOUT);
+  const missingRouting = (store: EvidenceStore) => { store.register(configurationModule()); store.register(outcomeModule({ now: () => NOW })); };
+
+  for (const kind of ["escalation", "scout"] as const) {
+    const run = runOf(POINT_LINEUP, routingOf(), `run-fail-${kind}`);
+    const expected = fallbackOf(kind, run)!;
+    assert.ok(expected, "a fallback exists");
+
+    withBrokenStore(store => assert.deepEqual(decide(kind, store, run), { profile: expected, by: "fallback", reason: "unavailable" }));
+    withStore(store => assert.deepEqual(decide(kind, store, run), { profile: expected, by: "fallback", reason: "unavailable" }), missingRouting);
+
+    withStore(store => {
+      let tick = 0;
+      assert.deepEqual(decide(kind, store, run, () => (tick++ % 2 === 0 ? 0 : 251)), { profile: expected, by: "fallback", reason: "budget" });
+      assert.equal(countRows(store), 0, "a decision over budget writes no row");
+    });
+
+    const large = runOf(POINT_LINEUP, padded, `run-large-${kind}`);
+    withStore(store => {
+      assert.deepEqual(decide(kind, store, large), { profile: fallbackOf(kind, large)!, by: "fallback", reason: "tooLarge" });
+      assert.equal(countRows(store), 0);
+    });
+
+    withStore(store => {
+      (store as { tryWrite: unknown }).tryWrite = () => false;
+      assert.deepEqual(decide(kind, store, run), { profile: expected, by: "fallback", reason: "write" });
+    });
+
+    withStore(store => {
+      (store as { read: unknown }).read = () => { throw new Error("database is locked"); };
+      assert.deepEqual(decide(kind, store, run), { profile: expected, by: "fallback", reason: "failed" });
+    });
+  }
+});

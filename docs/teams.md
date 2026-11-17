@@ -1100,7 +1100,9 @@ id wins, at most 4. The derived list is never written back to the configuration.
 is known, differs from the coordinator's family and the plan author's family,
 and runs on a provider that is not limited. If none qualifies, the check is
 skipped with `no-eligible-profile`. The checker's prompt is fixed text and holds
-no run data.
+no run data. The checker is a counted member: the fuse counts its launch, and in
+a goal cycle it uses one member of the goal's member budget, as do a replacement
+checker and a corrected project manager.
 
 **What the checker reads.** Its context file holds the objective record without
 its log, criteria without their latest values, and assumptions without their
@@ -1153,7 +1155,9 @@ The project manager then corrects its plan once, with the items and the answer.
 The corrected plan is accepted without a second check.
 
 **Failures and skips.** A checker that stops without a usable report, or fails
-its read-only check, counts one failure. The first failure starts one replacement
+its read-only check, counts one failure. A pause, cancel, halt, block, or
+recovery that stops the read-only check counts no failure and writes nothing; a
+resumed run plans a new revision, and its plan is checked. The first failure starts one replacement
 with the event `The intent checker stopped without a usable report; one
 replacement starts.` A second failure skips the check. Every skip accepts the held
 plan once and writes one event:

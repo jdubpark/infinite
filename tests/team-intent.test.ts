@@ -407,17 +407,21 @@ test("a stop during the read-only check is not a checker failure, and a stopped 
   } finally {
     rmSync(repo.dir, { recursive: true, force: true });
   }
-  // A clean check that completes after the run stopped writes nothing and leaves no question waiting on it.
-  for (const status of ["paused", "cancelled", "blocked"] as const) {
+  // A clean check that completes after the run stopped, or while a recovery stops its members, writes nothing and leaves no
+  // question waiting on it.
+  for (const stop of ["paused", "cancelled", "blocked", "recovery"] as const) {
     const { holder, host, intent, checker } = checkingFixture({ autonomy: "supervised" });
     reportChecker(intent, holder, checker, checkReport([askItem("scope", { def: "the stated default" })]));
-    holder.run.status = status;
-    if (status === "cancelled") intent.release(holder, "cancelled");
+    if (stop === "recovery") {
+      holder.run.recovery = { attempts: 1, status: "stopping",
+        source: { code: "permission-recovery", memberId: checker.memberId, revision: 1, reason: "Stopping members.", at: AT } };
+    } else holder.run.status = stop;
+    if (stop === "cancelled") intent.release(holder, "cancelled");
     const record = clone(holder.objectiveRecord);
     settle(host, true);
-    assert.equal(stateOf(holder).status, "checking", status);
-    assert.equal(holder.run.decisions.length, 0, `${status}: no question waits on a stopped run`);
-    assert.deepEqual(holder.objectiveRecord, record, `${status}: the record is unchanged`);
+    assert.equal(stateOf(holder).status, "checking", stop);
+    assert.equal(holder.run.decisions.length, 0, `${stop}: no question waits on a stopped run`);
+    assert.deepEqual(holder.objectiveRecord, record, `${stop}: the record is unchanged`);
   }
 });
 

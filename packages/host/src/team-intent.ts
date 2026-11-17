@@ -399,8 +399,9 @@ export class TeamIntent {
   private complete(holder: IntentHolder, checker: string, revision: number, report: IntentCheckReport, clean: boolean | undefined): void {
     const state = holder.intentCheck;
     if (!state || state.status !== "checking" || state.revision !== revision || state.checkerMemberId !== checker || holder.run.revision !== revision) return;
-    // A stopped run judges no checker and writes nothing: a resume plans a new revision, which drops this state.
-    if (clean === undefined || STOPPED.includes(holder.run.status)) return;
+    // A stopped run, or one whose recovery is stopping its members, judges no checker and writes nothing: the resume or the
+    // recovery plans a new revision, which drops this state.
+    if (clean === undefined || STOPPED.includes(holder.run.status) || holder.run.recovery?.status === "stopping") return;
     if (!clean) {
       this.failure(holder, state);
       return;

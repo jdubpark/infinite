@@ -37,6 +37,19 @@ node "$DRIVE" configure --instance "$INST" --profile "$PROFILE"
 nohup node --import tsx packages/host/src/cli.ts dev --config "$INST/config.json" --port "$PORT" \
   --state-dir "$INST/data" --run-dir "$RUNDIR" --project "$INST/workspace" --name "Verification host" \
   > "$EVID/server.log" 2>&1 &
-echo $! > "$INST/server.pid"
-curl --retry 30 --retry-connrefused --retry-delay 1 -s -o /dev/null -w 'api %{http_code}\n' "http://127.0.0.1:$PORT/api/me"
+API=$!
+echo "$API" > "$INST/server.pid"
 echo "run $RUN port $PORT"
+# Ready means: the API process is still running, it is the only listener on the port, and an anonymous call is
+# refused with 401. A process that exits, or a port another process holds, fails the launch.
+STATUS=""
+for _ in $(seq 1 60); do
+  kill -0 "$API" 2>/dev/null || { echo "the API process $API exited; see $EVID/server.log" >&2; exit 1; }
+  if [ "$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null)" = "$API" ]; then
+    STATUS=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/api/me" || true)
+    [ "$STATUS" = 401 ] && break
+  fi
+  sleep 1
+done
+[ "$STATUS" = 401 ] || { echo "the API process $API did not answer 401 on port $PORT as its only listener" >&2; exit 1; }
+echo "api $STATUS"

@@ -87,6 +87,18 @@ async function api(path, { auth = true, method = "GET", body } = {}) {
   return { status: response.status, json: await response.json().catch(() => null) };
 }
 
+// The browser sends a device key on sign-in, so it is held to the same check as api(): no page is opened and no
+// key is submitted unless this instance's recorded API process is the one listening on the configured port.
+// A refused check throws, so the journey records it as a failed step.
+async function openGuarded(page) {
+  assertTarget();
+  await openSignIn(page, origin);
+}
+async function signInGuarded(page, key) {
+  assertTarget();
+  await signInWithKey(page, key);
+}
+
 function assertTarget() {
   if (port === RESERVED_PORT || !Number.isInteger(port)) throw new Error(`refusing request to port ${values.port ?? config.port ?? "unknown"}`);
   if (Number(config.port) !== port) throw new Error(`port ${port} is not the instance's configured port ${config.port}`);
@@ -238,7 +250,7 @@ async function signIn() {
     const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
     page = await context.newPage();
     page.on("pageerror", (error) => pageErrors.push(redact(error.message)));
-    await openSignIn(page, origin);
+    await openGuarded(page);
     await page.screenshot({ path: join(evidence, "01-sign-in.png") });
     step("sign-in page shown", true, origin);
 
@@ -248,7 +260,7 @@ async function signIn() {
     await expect(page.getByRole("alert")).toHaveText("Device key was not recognized", { timeout: 15000 });
     step("unknown key refused", true, "Device key was not recognized");
 
-    await signInWithKey(page, ownerKey());
+    await signInGuarded(page, ownerKey());
     step("owner signed in", true, "session rail visible");
 
     // The session cookie is scoped to path /api, so ask for a URL under it.
@@ -348,8 +360,8 @@ async function session() {
     owner.on("pageerror", (error) => pageErrors.push(redact(error.message)));
 
     await check("owner signed in (1440x1000)", async () => {
-      await openSignIn(owner, origin);
-      await signInWithKey(owner, ownerKey());
+      await openGuarded(owner);
+      await signInGuarded(owner, ownerKey());
     });
     await check("Rehearsal session started", async () => {
       await owner.getByRole("button", { name: "New session", exact: true }).click();
@@ -433,8 +445,8 @@ async function session() {
     const phone = pages.controller = await phoneContext.newPage();
     phone.on("pageerror", (error) => pageErrors.push(redact(error.message)));
     await check("controller signed in (390x844 touch)", async () => {
-      await openSignIn(phone, origin);
-      await signInWithKey(phone, deviceKeys().controller);
+      await openGuarded(phone);
+      await signInGuarded(phone, deviceKeys().controller);
     });
     await check("controller sees the transcript", async () => {
       await row(phone).click();
@@ -733,8 +745,8 @@ async function team() {
   await runRunJourney("team", async ({ check, page, record, api: call, pages }) => {
     let teamId, pageStatus = "";
     await check("owner signed in", async () => {
-      await openSignIn(page, origin);
-      await signInWithKey(page, ownerKey());
+      await openGuarded(page);
+      await signInGuarded(page, ownerKey());
     });
     await check("teams enabled and a workspace is ready", async () => {
       await page.getByRole("button", { name: "Teams", exact: true }).click();
@@ -793,8 +805,8 @@ async function goal() {
   await runRunJourney("goal", async ({ check, page, record, api: call }) => {
     let goalId, pageStatus = "";
     await check("owner signed in", async () => {
-      await openSignIn(page, origin);
-      await signInWithKey(page, ownerKey());
+      await openGuarded(page);
+      await signInGuarded(page, ownerKey());
     });
     await check("goals enabled with a configured lineup", async () => {
       await page.getByRole("button", { name: "Goals", exact: true }).click();

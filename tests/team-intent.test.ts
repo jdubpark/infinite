@@ -64,7 +64,7 @@ function planOf(holder: IntentHolder, revision = holder.run.revision): TeamMembe
   return member;
 }
 
-type Pending = { perform: (signal: AbortSignal) => Promise<boolean>; complete: (clean: boolean) => void; member: TeamMember };
+type Pending = { perform: (signal: AbortSignal) => Promise<boolean | undefined>; complete: (clean: boolean | undefined) => void; member: TeamMember };
 type Prepared = { role: string; feedback?: string; prebuilt?: { prompt: string; profile: TeamModelProfile }; member: TeamMember };
 
 /** Records every host call. Operations stay pending until `settle` runs them, as the real result operation does. */
@@ -109,7 +109,7 @@ class FakeHost implements IntentHost {
     this.consumed.push(member.memberId);
     this.holds.push(this.onConsume ? this.onConsume(holder, member) : this.intent!.hold(holder, member));
   }
-  operation(_holder: IntentHolder, perform: (signal: AbortSignal) => Promise<boolean>, complete: (clean: boolean) => void, member: TeamMember): void {
+  operation(_holder: IntentHolder, perform: (signal: AbortSignal) => Promise<boolean | undefined>, complete: (clean: boolean | undefined) => void, member: TeamMember): void {
     this.operations += 1;
     this.pending.push({ perform, complete, member });
   }
@@ -386,6 +386,38 @@ test("a checker that changes its workspace counts a failure", async () => {
     assert.equal(holder.run.decisions.length, 0, "and it applies nothing");
   } finally {
     rmSync(repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("a stop during the read-only check is not a checker failure, and a stopped run takes no report", async () => {
+  const repo = makeRepo();
+  try {
+    // A pause, cancel, halt, block, or recovery aborts the check: no answer, so no failure, no event, and the state waits for the new revision.
+    const { holder, host, intent, checker } = checkingFixture({ autonomy: "supervised" }, { cwd: repo.dir, baseCommit: repo.baseCommit });
+    reportChecker(intent, holder, checker, checkReport([assumeItem("scope")]));
+    const [op] = host.pending.splice(0);
+    const aborted = new AbortController();
+    aborted.abort();
+    const clean = await op!.perform(aborted.signal);
+    assert.equal(clean, undefined, "an aborted check gives no answer");
+    const events = host.events.length;
+    op!.complete(clean);
+    assert.deepEqual({ status: stateOf(holder).status, failures: stateOf(holder).failures }, { status: "checking", failures: 0 });
+    assert.equal(host.events.length, events, "an aborted check writes no event");
+  } finally {
+    rmSync(repo.dir, { recursive: true, force: true });
+  }
+  // A clean check that completes after the run stopped writes nothing and leaves no question waiting on it.
+  for (const status of ["paused", "cancelled", "blocked"] as const) {
+    const { holder, host, intent, checker } = checkingFixture({ autonomy: "supervised" });
+    reportChecker(intent, holder, checker, checkReport([askItem("scope", { def: "the stated default" })]));
+    holder.run.status = status;
+    if (status === "cancelled") intent.release(holder, "cancelled");
+    const record = clone(holder.objectiveRecord);
+    settle(host, true);
+    assert.equal(stateOf(holder).status, "checking", status);
+    assert.equal(holder.run.decisions.length, 0, `${status}: no question waits on a stopped run`);
+    assert.deepEqual(holder.objectiveRecord, record, `${status}: the record is unchanged`);
   }
 });
 

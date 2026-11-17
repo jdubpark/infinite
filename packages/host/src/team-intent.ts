@@ -46,8 +46,8 @@ export type IntentHost = {
   prepare(holder: IntentHolder, role: "project-manager" | "intent-checker", feedback: string | undefined,
     onPrepared: (member: TeamMember) => void, prebuilt?: { prompt: string; profile: TeamModelProfile }): void;
   consume(holder: IntentHolder, member: TeamMember): void;
-  /** teams.ts' operation(holder, "result", perform, complete, member). */
-  operation(holder: IntentHolder, perform: (signal: AbortSignal) => Promise<boolean>, complete: (clean: boolean) => void, member: TeamMember): void;
+  /** teams.ts' operation(holder, "result", perform, complete, member). `undefined` is a check that was stopped before it answered. */
+  operation(holder: IntentHolder, perform: (signal: AbortSignal) => Promise<boolean | undefined>, complete: (clean: boolean | undefined) => void, member: TeamMember): void;
   save(holder: IntentHolder): void;
   event(holder: IntentHolder, text: string): void;
   block(holder: IntentHolder, error: unknown, member?: TeamMember): void;
@@ -66,7 +66,7 @@ export const INTENT_EVENTS: {
   answered: "The project manager will correct its plan with this answer.",
   correcting: "The project manager is correcting its plan with the intent check's items.",
   replaced: "The intent checker stopped without a usable report; one replacement starts.",
-  answerUnrecorded: "The answer reached the project manager, but the objective record could not record it.",
+  answerUnrecorded: "The objective record could not record the owner's answer; the run goes on.",
   releaseUnrecorded: "The objective record could not release the intent check's questions; the run goes on.",
   skipped: {
     "checker-failed": "The intent check was skipped: the checker failed twice. The plan is accepted unchecked.",
@@ -98,6 +98,7 @@ export function intentCheckDue(run: TeamRun): boolean {
 const modeOf = (run: TeamRun): IntentMode => (run.autonomy === "autonomous" ? "autonomous" : "supervised");
 
 const codeOf = (error: unknown): string | undefined => (error instanceof TeamError ? error.code : undefined);
+const STOPPED: readonly TeamRun["status"][] = ["paused", "cancelled", "blocked"];
 
 function statementOf(record: ObjectiveRecord): IntentStatement {
   return { objective: record.statement.objective, directions: record.statement.directions.map(item => item.text) };
@@ -387,14 +388,19 @@ export class TeamIntent {
     return true;
   }
 
-  /** One checker report at a time: the read-only check first, then the apply, both in the operation's completion. */
-  private readOnly(member: TeamMember, signal: AbortSignal): Promise<boolean> {
-    return assertMemberReadOnly(member.cwd, member.baseCommit, this.host.prefix(), signal).then(() => true, () => false);
+  /**
+   * One checker report at a time: the read-only check first, then the apply, both in the operation's completion. A check that a
+   * pause, cancel, halt, block, or recovery aborted gave no answer: undefined, not a failure of the checker.
+   */
+  private readOnly(member: TeamMember, signal: AbortSignal): Promise<boolean | undefined> {
+    return assertMemberReadOnly(member.cwd, member.baseCommit, this.host.prefix(), signal).then(() => true, () => signal.aborted ? undefined : false);
   }
 
-  private complete(holder: IntentHolder, checker: string, revision: number, report: IntentCheckReport, clean: boolean): void {
+  private complete(holder: IntentHolder, checker: string, revision: number, report: IntentCheckReport, clean: boolean | undefined): void {
     const state = holder.intentCheck;
     if (!state || state.status !== "checking" || state.revision !== revision || state.checkerMemberId !== checker || holder.run.revision !== revision) return;
+    // A stopped run judges no checker and writes nothing: a resume plans a new revision, which drops this state.
+    if (clean === undefined || STOPPED.includes(holder.run.status)) return;
     if (!clean) {
       this.failure(holder, state);
       return;

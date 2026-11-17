@@ -408,6 +408,34 @@ test("a failed checker is replaced once and then skipped", { timeout: 1500000 },
       assert.equal(view.members.filter(member => member.role === "project-manager").length, 1, "a plan report started a project manager");
     } finally { await f.close(); }
   }
+  // A stall: each held checker's session reports its last activity past the stall window, so the stall path stops it.
+  {
+    const quiet = new Set<string>();
+    const f = await fixture("intent", CHECKED_LINEUP, {}, { noServer: true });
+    f.host.config.projects.find(item => item.id === "rehearsal")!.autonomy = "autonomous";
+    const window = (f.host.config.teams?.stallMinutes ?? 30) * 60000;
+    const teams = await f.openTeamService({ manager: manager => {
+      const state = manager.state.bind(manager);
+      manager.state = async (id: string, screen?: boolean) => {
+        const value = await state(id, screen);
+        return quiet.has(id) ? { ...value, attention: { ...value.attention, lastActivityAt: new Date(Date.now() - window - 60000).toISOString() } } : value;
+      };
+    } });
+    try {
+      flag(f, "intent-hold");
+      const created = await teams.create(f.create());
+      for (const count of [1, 2]) {
+        const view = await until(teams, created.id, next => checkers(next).length === count && checkers(next).at(-1)!.status === "running");
+        quiet.add(checkers(view).at(-1)!.sessionId);
+      }
+      const view = await settle(teams, created.id);
+      assert.equal(view.status, "ready-for-review", JSON.stringify(view.events.slice(-5)));
+      assert.equal(checkers(view).length, 2, "the stalled checker was not replaced once");
+      assert.ok(checkers(view).every(member => member.stalledAt), "each checker left through the stall path");
+      assert.ok(texts(view).includes(INTENT_EVENTS.skipped["checker-failed"]), JSON.stringify(texts(view).slice(-5)));
+      assert.equal(texts(view).filter(text => text.startsWith("Project manager planned")).length, 1, "one plan accepted");
+    } finally { unflag(f, "intent-hold"); await f.close(); }
+  }
 });
 
 test("cancel and steer on a full log complete", { timeout: 1500000 }, async () => {

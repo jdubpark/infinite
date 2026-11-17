@@ -137,6 +137,14 @@ If the key cannot be read, the host still hands out the proxy address, without a
 
 If `teams.commandPrefix` runs a root-owned launcher that resets the environment, make it keep `HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`, `http_proxy`, `NO_PROXY`, `no_proxy`, and `NODE_USE_ENV_PROXY`. This repository does not ship that launcher, so update the server copy. Otherwise team Git fetches and pushes run as the agent account without the proxy: logged in observe, refused in enforce. Without `teams.commandPrefix`, those commands run as the host account, which the firewall rule does not match, so only the proxy variables route them.
 
+Codex starts stdio MCP servers with a restricted environment. Variables outside its built-in environment are forwarded only when named in that server's `env_vars`, and unset names are omitted. For each owner-configured Codex MCP server that needs egress, add this line to its `[mcp_servers.<server-name>]` table:
+
+```toml
+env_vars = ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy", "NO_PROXY", "no_proxy", "NODE_USE_ENV_PROXY"]
+```
+
+The host adds these names to its generated team/mission and handoff MCP server settings only when egress is configured.
+
 Rollback: remove the `egress` block, restart `infinite.service`, and recreate sessions. The sudoers line has no effect while the host sets no proxy variables.
 
 ## 4. Observe

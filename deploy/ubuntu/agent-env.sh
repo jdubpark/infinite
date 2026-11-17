@@ -52,10 +52,10 @@ _infinite_env_load_file() {
       continue
     fi
 
-    # Denied: launcher-owned keys, this loader's own namespace (any leading
-    # underscore), and names the shell interprets on assignment.
+    # Denied: launcher-owned keys, host-owned egress variables even when egress
+    # is disabled, this loader's namespace, and shell names unsafe to assign.
     case $_infinite_env_key in
-      PATH|HOME|SHELL|TMPDIR|LD_*|XDG_*|INFINITE_*|SUDO_*|OPENCODE_SERVER_*|OPENCODE_CONFIG_CONTENT|npm_config_prefix|provider) continue ;;
+      PATH|HOME|SHELL|TMPDIR|LD_*|XDG_*|INFINITE_*|SUDO_*|OPENCODE_SERVER_*|OPENCODE_CONFIG_CONTENT|npm_config_prefix|provider|HTTPS_PROXY|HTTP_PROXY|https_proxy|http_proxy|NO_PROXY|no_proxy|NODE_USE_ENV_PROXY) continue ;;
       _*) continue ;;
       IFS|OPTIND|OPTARG|PS1|PS2|PS3|PS4|PWD|OLDPWD|SHLVL|LINENO|RANDOM|SECONDS|PPID|UID|EUID|GROUPS) continue ;;
       ENV|BASH_ENV|BASH*|ZDOTDIR|CDPATH|FPATH|MAIL|MAILPATH|MAILCHECK|HIST*|LC_ALL|LANG|LC_*) continue ;;

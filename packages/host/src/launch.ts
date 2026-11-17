@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { teamModelProfileSchema, type TeamModelProfile } from "./team-types.js";
 import { codexTrustArgs } from "./workspace-trust.js";
 import { sudoShape } from "./sudo-profile.js";
+import { EGRESS_ENVIRONMENT_NAMES } from "./egress.js";
 
 /** Only model controls are added here; the configured provider permissions remain unchanged. */
 export function teamModelLaunch(profile: AgentProfile, input: TeamModelProfile): AgentProfile {
@@ -323,8 +324,10 @@ export function buildLaunch(
   entryTools?: boolean,
   /** The host admitted this headless Claude session to the permission channel. */
   channel = false,
+  egressConfigured = false,
 ): AgentProfile {
   const args = [...profile.args];
+  const hostEgressEnvVars = egressConfigured ? EGRESS_ENVIRONMENT_NAMES : [];
   // Entry tools ride the team report channel. They add no provider permission, so the profile's own decisions still apply.
   const withEntryTools = Boolean(team && entryTools && !handoffSessionId);
   if (handoffSessionId) {
@@ -336,7 +339,8 @@ export function buildLaunch(
       env: { INFINITE_HOOK_URL: "${INFINITE_HOOK_URL}", INFINITE_HOOK_TOKEN: "${INFINITE_HOOK_TOKEN}", INFINITE_HANDOFF_SESSION: handoffSessionId },
     } } }));
     else {
-      for (const [key, value] of Object.entries({ command: process.execPath, args: serverArgs, env_vars: ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN"], "env.INFINITE_HANDOFF_SESSION": handoffSessionId }))
+      const envVars = ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", ...hostEgressEnvVars];
+      for (const [key, value] of Object.entries({ command: process.execPath, args: serverArgs, env_vars: envVars, "env.INFINITE_HANDOFF_SESSION": handoffSessionId }))
         args.push("-c", `mcp_servers.infinite_handoff.${key}=${JSON.stringify(value)}`);
     }
   }
@@ -363,7 +367,7 @@ export function buildLaunch(
     for (const [key, value] of Object.entries({
       command: process.execPath,
       args: serverArgs,
-      env_vars: ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT", "INFINITE_PROJECT_ID"],
+      env_vars: ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT", "INFINITE_PROJECT_ID", ...hostEgressEnvVars],
       "tools.report.approval_mode": "approve",
       "tools.mission_report.approval_mode": "approve",
       ...(withEntryTools ? {

@@ -28,7 +28,7 @@ const EGRESS_ENVIRONMENT = {
   noProxy: "no_proxy",
   nodeUseEnvProxy: "NODE_USE_ENV_PROXY",
 } as const;
-const EGRESS_ENVIRONMENT_NAMES = Object.values(EGRESS_ENVIRONMENT);
+export const EGRESS_ENVIRONMENT_NAMES: readonly string[] = Object.freeze(Object.values(EGRESS_ENVIRONMENT));
 const PROJECT_ID = /^[a-z0-9-]{1,80}$/;
 const PROJECT_LABEL = /^(?:_host|_none|[a-z0-9-]{1,80})$/;
 const SESSION_LABEL = /^[A-Za-z0-9-]{1,64}$/;

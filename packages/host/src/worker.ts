@@ -1690,8 +1690,8 @@ server.listen(socketPath(runDir, session.id), async () => {
       session.teamModelProfile,
       session.handoff?.policy ? session.id : undefined,
       session.workspaceTrusted ? session.cwd : undefined,
-      Boolean(session.team?.entryTools),
-      Boolean(permissionChannel),
+      Boolean(session.team?.entryTools), Boolean(permissionChannel),
+      egress.status !== "off",
     );
     if (session.runtime?.nativeUi === "codex") {
       if (session.workspace) {
@@ -1876,7 +1876,7 @@ server.listen(socketPath(runDir, session.id), async () => {
         provider, headlessResumeProfile(profile, nativeSessionId), "",
         hookServer ? { url: hookServer.url, token: hookToken } : null, relayPath, config.attention.hooks,
         Boolean(session.team), session.teamModelProfile, session.handoff?.policy ? session.id : undefined,
-        session.workspaceTrusted ? session.cwd : undefined, Boolean(session.team?.entryTools), true,
+        session.workspaceTrusted ? session.cwd : undefined, Boolean(session.team?.entryTools), true, egress.status !== "off",
       );
       const pty = spawn(next.command, next.args, { cwd: session.cwd, env, cols: terminal.cols, rows: terminal.rows, name: "xterm-256color" });
       child = pty;

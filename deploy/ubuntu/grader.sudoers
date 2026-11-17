@@ -1,0 +1,4 @@
+# /etc/sudoers.d/infinite-grader. Install only after the infinite-grader account exists, and check with visudo -cf first.
+# The host may run exactly one command as the grader: the launcher. infinite.sudoers does not change.
+Defaults!/usr/local/libexec/infinite/grader-command env_reset
+infinite-host ALL=(infinite-grader) NOPASSWD: /usr/local/libexec/infinite/grader-command

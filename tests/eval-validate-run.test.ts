@@ -140,15 +140,23 @@ async function fixtureInventory(groups: string): Promise<RuntimeProcess[]> {
     .map(pid => ({ pid, parent: 1, group: pid, ruid: UID, euid: UID, born: "", state: "S" }));
 }
 
-function host(r: Rig, options: { config?: Config; metadata?: "open" | "closed"; noGrader?: boolean; grader?: Grader | undefined; store?: EvidenceStore; mineGit?: MineGit } = {}): EvalHost {
+type HostOptions = {
+  config?: Config; metadata?: "open" | "closed"; noGrader?: boolean; grader?: Grader | undefined; store?: EvidenceStore; mineGit?: MineGit;
+  /** The owner's halt state for every project, read at each check. */
+  halt?: () => "clear" | "halted";
+  /** The host-load gate's hold reason, read at each check. */
+  held?: () => string | undefined;
+};
+
+function host(r: Rig, options: HostOptions = {}): EvalHost {
   const config = options.config ?? configFor(r, { metadata: options.metadata, noGrader: options.noGrader });
   const status: ProjectSourceStatus = { mode: "github", repository: "example/app", baseBranch: "main", mirrorHead: r.head };
   return new EvalHost({
     config,
     store: options.store ?? r.store,
     source: { mirrorPath: () => r.mirror, status: () => status },
-    hostLoad: { held: () => undefined },
-    halt: () => ({ check: () => ({ state: "clear" }) }),
+    hostLoad: { held: options.held ?? (() => undefined) },
+    halt: () => ({ check: () => ({ state: options.halt?.() ?? "clear" }) }),
     runs: () => [],
     grader: "grader" in options ? options.grader : testGrader(config),
     inventory: () => fixtureInventory(r.groups),
@@ -309,9 +317,21 @@ test("a restart in the middle of a task counts no attempt", { timeout: 600_000 }
     first.close();
     await first.idle();
     // A restart is a new process: a new store on the same database. The corpus module registers once per store.
-    r.store.close();
-    r.store = new EvidenceStore({ databasePath: r.databasePath, vaultKey: r.key });
+    const restart = (): void => {
+      r.store.close();
+      r.store = new EvidenceStore({ databasePath: r.databasePath, vaultKey: r.key });
+    };
+    restart();
     const mark = ops(r.record).length;
+
+    // A stop that fails may leave a grader process in the job's work, so the host cleans nothing and starts nothing.
+    const failing = host(r, { grader: { ...testGrader(configFor(r)), stop: async () => false } });
+    failing.tick();
+    await failing.idle();
+    failing.close();
+    await failing.idle();
+    assert.deepEqual(ops(r.record).slice(mark).filter(op => op !== "probe"), [], "no clean and no run after a failed stop");
+    restart();
 
     second = host(r);
     second.tick();
@@ -446,6 +466,38 @@ test("a grader that can read a project's mirror runs nothing", { timeout: 600_00
     assert.ok(!("code" in summary));
     assert.equal(summary.grader.state, "exposed", "the grader state is exposed");
     assert.equal(ops(r.record).includes("run"), false, "no grader run was recorded");
+  } finally {
+    h.close();
+    await h.idle();
+    r.store.close();
+  }
+});
+
+test("the owner's halt and the host's load hold validation", { timeout: 600_000 }, async () => {
+  const r = rig();
+  let halt: "clear" | "halted" = "clear";
+  let held: string | undefined;
+  const h = host(r, { halt: () => halt, held: () => held });
+  try {
+    await mineAll(h);
+    const created = h.create(PROJECT, { kind: "validate", limits: { maxWallMinutes: 60 } }, randomUUID());
+    assert.ok("job" in created);
+    const jobId = created.job.jobId;
+    const holds = [{ halt: "halted", held: undefined, waiting: "halt" }, { halt: "clear", held: "memory", waiting: "host-load" }] as const;
+    for (const hold of holds) {
+      halt = hold.halt;
+      held = hold.held;
+      h.tick();
+      await h.idle();
+      assert.equal((h.job(jobId) as EvalJobView).waiting, hold.waiting);
+      assert.equal(ops(r.record).includes("run"), false, `no grader run while the job waits on ${hold.waiting}`);
+    }
+    held = undefined;
+    for (let attempt = 0; attempt < 40 && (h.job(jobId) as EvalJobView).counts.visited === 0; attempt++) {
+      h.tick();
+      await h.idle();
+    }
+    assert.ok((h.job(jobId) as EvalJobView).counts.visited >= 1, "the job runs once both clear");
   } finally {
     h.close();
     await h.idle();

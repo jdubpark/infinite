@@ -23,10 +23,15 @@ export function haltNotice(view: HaltView | null | undefined, place: HaltPlace):
   if (!view) return null;
   if (!view.readable) return { kind: "unreadable" };
   const projects = view.projects ?? [];
-  if (view.host) return { kind: "host", halt: view.host, projects };
+  const own = place === "overview" ? projects : projects.filter(halt => place.projectIds.includes(halt.projectId));
+  if (view.host) return { kind: "host", halt: view.host, projects: own };
   if (place === "overview") return projects.length ? { kind: "overview", halts: projects } : null;
-  const halts = projects.filter(halt => place.projectIds.includes(halt.projectId));
-  return halts.length ? { kind: "project", halts } : null;
+  return own.length ? { kind: "project", halts: own } : null;
+}
+
+/** The place of a mission page: the projects its subtasks run in. A mission with no subtasks yet covers none. */
+export function missionHaltPlace(subtasks: readonly { repoProjectId: string }[]): HaltPlace {
+  return { projectIds: [...new Set(subtasks.map(subtask => subtask.repoProjectId))] };
 }
 
 export const haltSince = (at: string) => new Date(at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });

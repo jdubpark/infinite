@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHaltStore, haltNotice as phoneNotice, type HaltView } from "../apps/mobile/src/features/halt/model.ts";
-import { haltNotice as webNotice } from "../apps/web/src/halt.ts";
+import { createHaltStore, haltNotice as phoneNotice, workspaceHaltScope, type HaltView } from "../apps/mobile/src/features/halt/model.ts";
+import { haltNotice as webNotice, missionHaltPlace } from "../apps/web/src/halt.ts";
 
 const at = "2026-11-15T09:00:00.000Z";
 const billing = { projectId: "billing", haltId: "h-billing", at, by: "Owner phone", reason: "Rotating keys" };
@@ -11,9 +11,9 @@ const view = (value: Partial<HaltView>): HaltView => ({ readable: true, projects
 
 test("a host halt, and an unreadable record, cover every screen on both clients", () => {
   for (const place of ["overview", { projectIds: ["billing"] }, { projectIds: [] }] as const) {
-    assert.deepEqual(webNotice(view({ host, projects: [billing] }), place), { kind: "host", halt: host, projects: [billing] });
-    // A phone project screen names only its own projects among those halted on their own; it has no other names.
+    // A screen that belongs to projects names only its own projects among those halted on their own, on both clients.
     const own = typeof place === "object" && !place.projectIds.length ? [] : [billing];
+    assert.deepEqual(webNotice(view({ host, projects: [billing] }), place), { kind: "host", halt: host, projects: own });
     assert.deepEqual(phoneNotice(view({ host, projects: [billing] }), place), { kind: "host", halt: host, projects: own });
     // An unreadable record carries no halts, and it still holds the whole host.
     assert.deepEqual(webNotice({ readable: false, projects: [] }, place), { kind: "unreadable" });
@@ -36,6 +36,38 @@ test("a project halt shows on that project's screens and compactly on the overvi
   }
   // The phone's other main screens show only a host halt.
   assert.equal(phoneNotice(both, "screen"), null);
+});
+
+test("a mission page shows the host halt and halts on its subtasks' projects only", () => {
+  const docs = { projectId: "docs", haltId: "h-docs", at, by: "Owner phone" };
+  const both = view({ host, projects: [billing, store, docs] });
+  // Subtasks in billing and store; docs is halted but no subtask runs there, so it is not named.
+  const place = missionHaltPlace([{ repoProjectId: "billing" }, { repoProjectId: "store" }, { repoProjectId: "billing" }]);
+  assert.deepEqual(place, { projectIds: ["billing", "store"] });
+  assert.deepEqual(webNotice(both, place), { kind: "host", halt: host, projects: [billing, store] });
+  // Without a host halt, the mission shows only the project halts it covers.
+  assert.deepEqual(webNotice(view({ projects: [billing, store, docs] }), place), { kind: "project", halts: [billing, store] });
+  assert.equal(webNotice(view({ projects: [docs] }), place), null);
+  // A mission with no subtasks yet covers no project: only a host halt or an unreadable record shows.
+  assert.equal(webNotice(view({ projects: [billing] }), missionHaltPlace([])), null);
+  assert.deepEqual(webNotice(view({ host, projects: [billing] }), missionHaltPlace([])), { kind: "host", halt: host, projects: [] });
+  assert.deepEqual(webNotice({ readable: false, projects: [] }, missionHaltPlace([])), { kind: "unreadable" });
+});
+
+test("a workspace's halt scope is its checkouts and primary projects, named from live membership", () => {
+  const repositories = [{ id: "api", name: "API", checkoutIds: ["api", "api-fork"] }, { id: "web", name: "Web", checkoutIds: ["web"] }];
+  // Offline, from the cached brief alone: the scope covers every checkout, and only a primary project takes its repo's name.
+  const cached = workspaceHaltScope(repositories);
+  assert.deepEqual(cached.projectIds, ["api", "api-fork", "web"]);
+  assert.equal(cached.name("api"), "API");
+  assert.equal(cached.name("api-fork"), undefined);
+  // A live group read names each checkout, and that name wins.
+  const live = workspaceHaltScope(repositories, [{ projectId: "api-fork", name: "API fork" }]);
+  assert.equal(live.name("api-fork"), "API fork");
+  assert.deepEqual(workspaceHaltScope([]).projectIds, []);
+  // Scoped to the workspace, a project halt outside it is not shown.
+  assert.equal(phoneNotice(view({ projects: [store] }), { projectIds: cached.projectIds }), null);
+  assert.deepEqual(phoneNotice(view({ projects: [billing, { ...store, projectId: "api-fork" }] }), { projectIds: cached.projectIds }), { kind: "project", halts: [{ ...store, projectId: "api-fork" }] });
 });
 
 test("every phone screen shows the newest halt read, so navigation cannot bring back a released halt", () => {

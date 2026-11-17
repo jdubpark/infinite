@@ -667,6 +667,12 @@ These override the text below them where the two differ.
     - `a deleted run leaves its mined copy` expects the mined row, its state, and its group row (the root, with its `dev_only`) to stay. The run's group row, which no task names and which is no other row's root, goes: the first `sweepGroups` returns 1, and a second returns 0.
     - `groupStats` counts root rows (`total`), roots with `dev_only` 1 (`devOnly`), and the most tasks under one root (`largest`). Task 11 uses these meanings.
     - Task 3's step M joins a landed run group through `eval_groups_landing`, as Task 5's transaction does, so the order L-M-P gives the same result.
+15. **Task 9's calls, the grader's `stop`, and what Task 13 owes.**
+    - Accepted from Task 9: R2 and R3 must pass exactly E, as the test table reads; `ValidateContext.bundle` (`BundleState`: the bundle factory, the job last streamed, its digest, and the job already streamed again for a missing commit), which the pump owns across tasks; a non-zero exit or a time-out of a preparation command (clone, checkout, restore, apply, commit, update-ref, diff) is undecided `setup-failed`, and a launcher failure is `grader-failed`; a missing patch rejects `patch-missing` and an oversized one `patch-too-large`; a mined task's base is its first parent; `restoreLists`' `files` is the task's file list.
+    - **`stop` bypasses the grader's channel.** `launcherGrader`'s `stop` neither waits for nor takes the channel that a running command holds, so a halt reaches a running round within 10 seconds. Task 9's repair makes the change in `eval-grader.ts`, with a test in `tests/eval-grader.test.ts`.
+    - **The report directory is the launcher's.** The launcher creates `work/reports` for every operation, and the fixture's `run` does the same. The validator runs no `mkdir`.
+    - **Task 13's pump** supplies `bundle` and keeps it across tasks; probes the grader before each task (ruling 4); calls `record` after every task, also when `validateTask` throws, so `inFlight` never outlives its task; and after an `environment` outcome waits one pump interval before its next `next`, so a task whose cause persists is not handed out again at once.
+    - Task 10's `record` clears `inFlight` before its write, so a failed write still frees the next job.
 
 ## Trust boundary, and what a review checks
 

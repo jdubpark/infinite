@@ -567,7 +567,7 @@ export function retireTask(tx: EvidenceTx, taskId: string, reason: EvalReason, a
 }
 
 /** The group row id of a run's captured tasks. */
-function runGroupId(runId: string): string {
+export function runGroupId(runId: string): string {
   return `run:${runId}`;
 }
 

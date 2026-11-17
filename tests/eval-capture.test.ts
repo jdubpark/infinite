@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TaskCapture, type TaskCaptureOptions } from "../packages/host/src/eval-capture.js";
 import type { CaptureGit, ApprovalStart, BaseRead, CaptureStart, NameRead, PatchRead } from "../packages/host/src/eval-types.js";
-import { capturedTaskId, readEvalTask, readMaterial, runEvalTasks } from "../packages/host/src/eval-store.js";
+import { type Promoted, capturedTaskId, readEvalTask, readMaterial, runEvalTasks } from "../packages/host/src/eval-store.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import type { EvidenceTx } from "../packages/host/src/evidence/types.js";
 import { outcomeId } from "../packages/host/src/outcome-projector.js";
@@ -102,7 +102,7 @@ type World = {
   close(): void;
 };
 
-type Setup = { capture?: boolean; source?: "github" | "laptop"; deadlineMs?: number };
+type Setup = { capture?: boolean; source?: "github" | "laptop"; deadlineMs?: number; onPromoted?: Promoted };
 
 function openStore(root: string, key: Buffer): EvidenceStore {
   const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: key });
@@ -130,6 +130,7 @@ function captureOptions(root: string, store: EvidenceStore, git: FakeGit, setup:
     git,
     now: () => T0,
     deadlineMs: setup.deadlineMs ?? 10_000,
+    ...(setup.onPromoted === undefined ? {} : { onPromoted: setup.onPromoted }),
   };
 }
 
@@ -301,9 +302,11 @@ test("the three facts give one result in every order", async () => {
     { name: "refused", later: [], accepted: 0 as const },
   ];
   for (const c of cases) {
-    let first: ReturnType<typeof snapshot> | undefined;
+    let first: (ReturnType<typeof snapshot> & { promoted: string[] }) | undefined;
     for (const order of orders) {
-      const w = world();
+      // The host's hook: it must see each promotion once, and nothing for a capture that is refused.
+      const promoted: string[] = [];
+      const w = world({ capture: true, onPromoted: (_tx, task) => { promoted.push(`${task.taskId} ${task.state}`); } });
       try {
         w.git.answer("names", REVIEWED, { state: "read", names: c.later });
         w.git.hold(COMMIT);
@@ -318,10 +321,11 @@ test("the three facts give one result in every order", async () => {
           w.capture.reconcile();
         }
         await w.capture.idle();
-        const result = snapshot(w.store);
+        const result = { ...snapshot(w.store), promoted };
         if (first === undefined) {
           first = result;
           const row = result.row;
+          assert.deepEqual(promoted, row?.state === "candidate" ? [`${capturedTaskId(RUN, MEMBER)} candidate`] : [], c.name);
           if (c.accepted === 0) {
             assert.equal(row?.state, "rejected", c.name);
             assert.equal(row?.reason, "not-accepted", c.name);

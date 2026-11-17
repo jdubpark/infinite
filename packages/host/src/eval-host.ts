@@ -1,6 +1,6 @@
 import type express from "express";
 import type { ChildProcess } from "node:child_process";
-import type { EvidenceStore } from "./evidence/store.js";
+import { type EvidenceStore, evidenceDatabasePath } from "./evidence/store.js";
 import { EvidenceError, type EvidenceTx } from "./evidence/types.js";
 import { TaskCapture } from "./eval-capture.js";
 import { type Grader, type GraderProbe, launcherGrader, PROBE_FRESH_MS, stopGrader } from "./eval-grader.js";
@@ -25,7 +25,7 @@ import type { HaltService } from "./halt/service.js";
 import type { HostLoadGate } from "./host-load.js";
 import { spawnTeamBundle } from "./team-workspace.js";
 import { inventoryRuntimeProcesses, type RuntimeProcess } from "./team-retirement.js";
-import type { ProjectSourceService } from "./project-source.js";
+import type { ProjectSourceService, ProjectSourceStatus } from "./project-source.js";
 import type { TeamRun } from "./team-types.js";
 import type { Config } from "./types.js";
 
@@ -68,7 +68,7 @@ export class EvalHost implements EvalHostApi {
   private readonly miner: Miner;
   private readonly evalJobs: EvalJobs;
   /** Owned by this pump across tasks: the job last streamed and its digest. */
-  private readonly bundle: BundleState = { spawn: () => { throw new Error("No bundle is set."); }, job: null, sha256: null, restreamedFor: null };
+  private readonly bundle: BundleState = { spawn: () => { throw new Error("No bundle is set."); }, job: null, sha256: null, restreamedFor: null, tooLarge: null };
   private probed: Probed | undefined;
   private validation: Promise<void> | undefined;
   private cleaned = false;
@@ -221,8 +221,15 @@ export class EvalHost implements EvalHostApi {
     const { jobId, projectId, taskId, settings } = work;
     const fresh = await this.probeNow();
     if (fresh.state !== "ready") return this.environment(jobId, taskId, "grader-failed");
-    const mirror = this.source.mirrorPath(projectId);
-    const status = this.source.status(projectId);
+    let mirror: string;
+    let status: ProjectSourceStatus;
+    try {
+      mirror = this.source.mirrorPath(projectId);
+      status = this.source.status(projectId);
+    } catch {
+      // The same record as a missing mirror head, so the job frees the task and waits one interval.
+      return this.environment(jobId, taskId, "anchor-unknown");
+    }
     const source = this.config.projects.find(project => project.id === projectId)?.source;
     const branch = source?.mode === "github" ? source.baseBranch : undefined;
     if (status.mirrorHead === undefined || branch === undefined) return this.environment(jobId, taskId, "anchor-unknown");
@@ -292,9 +299,18 @@ export class EvalHost implements EvalHostApi {
     return (await this.probeNow()).state;
   }
 
-  /** Each GitHub project's mirror: a grader that can read one is exposed. */
+  /** The host's own paths, then each GitHub project's mirror. A grader that can read any of them is exposed. */
   private canaries(): string[] {
-    return this.config.projects.filter(project => project.source?.mode === "github").map(project => this.source.mirrorPath(project.id));
+    const workspace = this.config.teams?.workspaceDir;
+    const mirrors = this.config.projects.filter(project => project.source?.mode === "github").map(project => this.source.mirrorPath(project.id));
+    return [
+      evidenceDatabasePath(this.config.stateDir),
+      this.config.keyFile,
+      this.config.stateDir,
+      this.config.runDir,
+      ...(workspace === undefined ? [] : [workspace]),
+      ...mirrors,
+    ];
   }
 
   /** Stops the grader's account, then cleans every job that was running, so a restart counts no attempt and leaves no process. */

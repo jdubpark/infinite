@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import type { Readable } from "node:stream";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
-import { evalCorpusModule, readEvalTask } from "../packages/host/src/eval-store.js";
+import { completeApproval, evalCorpusModule, markApproval, readEvalTask } from "../packages/host/src/eval-store.js";
 import { parseReport, type CaseStatus } from "../packages/host/src/eval-report.js";
 import { focusedArgv, nextRound, restoreLists, type RoundOutcome, type RoundFacts } from "../packages/host/src/eval-validate-rules.js";
 import { HALT_POLL_MS, prepareJob, validateTask, type BundleState, type ValidateContext } from "../packages/host/src/eval-validate.js";
@@ -18,6 +18,7 @@ const NOW = "2026-11-16T10:00:00.000Z";
 const PROJECT = "project-validate-1";
 const RUN = "run-validate-1";
 const JOB = "11111111-2222-4333-8444-555555555555";
+const OTHER_JOB = "22222222-3333-4444-8555-666666666666";
 const TASK = "captured:run-validate-1:m-1";
 const ANCHOR = "a".repeat(40);
 const COMMIT = "c".repeat(40);
@@ -150,7 +151,7 @@ function partCount(store: EvidenceStore, taskId: string): number {
 const bundleSpawn = (): ChildProcess => spawn(process.execPath, ["-e", "process.stdout.write('bundle bytes')"], { stdio: ["ignore", "pipe", "ignore"] });
 
 function freshBundle(): BundleState {
-  return { spawn: bundleSpawn, job: null, sha256: null, restreamedFor: null };
+  return { spawn: bundleSpawn, job: null, sha256: null, restreamedFor: null, tooLarge: null };
 }
 
 function context(fx: Fixture, grader: Grader, over: Partial<ValidateContext> = {}): ValidateContext {
@@ -378,6 +379,92 @@ test("prepareJob streams the bundle and records its digest", async () => {
     assert.equal(ctx.bundle.job, JOB);
     assert.equal(ctx.bundle.sha256, sha256(BUNDLE));
     assert.deepEqual(calls.map(call => call.op), ["stop", "remove", "receive"]);
+  } finally {
+    fx.close();
+  }
+});
+
+test("a bundle that exits non-zero is never ready", async () => {
+  const fx = open();
+  try {
+    const ctx = context(fx, scripted().grader);
+    const exits = (): ChildProcess => spawn("/bin/sh", ["-c", "printf PARTIAL; exit 128"], { stdio: ["ignore", "pipe", "ignore"] });
+    assert.equal(await prepareJob(ctx, exits), "failed");
+    assert.equal(ctx.bundle.job, null);
+    assert.equal(ctx.bundle.sha256, null);
+  } finally {
+    fx.close();
+  }
+});
+
+test("a bundle that cannot start is never ready", async () => {
+  const fx = open();
+  try {
+    const ctx = context(fx, scripted().grader);
+    const missing = (): ChildProcess => spawn(join(fx.root, "no-such-bundle"), [], { stdio: ["ignore", "pipe", "pipe"] });
+    assert.equal(await prepareJob(ctx, missing), "failed");
+    assert.equal(ctx.bundle.job, null);
+    assert.equal(ctx.bundle.sha256, null);
+  } finally {
+    fx.close();
+  }
+});
+
+test("a bundle over the limit is not streamed again for its job", async () => {
+  const fx = open();
+  try {
+    const grader: Grader = { ...scripted().grader, receive: async () => "too-large" };
+    const children: ChildProcess[] = [];
+    // A bundle the grader stopped reading would block on its full pipe, so the host must stop it. This one would
+    // end by itself after 3 seconds; a clean exit means the host waited instead of stopping it.
+    const counted = (): ChildProcess => {
+      const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 3_000)"], { stdio: ["ignore", "pipe", "ignore"] });
+      children.push(child);
+      return child;
+    };
+    const ctx = context(fx, grader);
+    assert.equal(await prepareJob(ctx, counted), "too-large");
+    assert.equal(children[0]?.signalCode, "SIGTERM", "the host stops a bundle the grader refused");
+    assert.equal(await prepareJob(ctx, counted), "too-large");
+    assert.equal(children.length, 1, "the bundle is streamed once for the job");
+
+    const other = context(fx, grader, { jobId: OTHER_JOB, bundle: ctx.bundle });
+    assert.equal(await prepareJob(other, counted), "too-large");
+    assert.equal(children.length, 2, "another job streams its own bundle");
+  } finally {
+    fx.close();
+  }
+});
+
+test("a decision keeps what an approval wrote during the task", async () => {
+  const fx = open();
+  try {
+    insertTask(fx.store, TASK, "candidate");
+    const reports: Record<string, Buffer> = {
+      "reports/round-1.xml": junit({ a: "passed" }),
+      "reports/round-3.xml": junit({ a: "failed" }),
+      "reports/round-4.xml": junit({ a: "passed" }),
+      "reports/round-5.xml": junit({ a: "failed" }),
+      "reports/round-6.xml": junit({ a: "passed" }),
+    };
+    const at = "2026-11-16T10:30:00.000Z";
+    let approved = false;
+    // An approval lands while the first focused test runs, then the rounds carry on as in a valid run.
+    const { grader } = scripted({
+      reports: name => reports[name],
+      onFocused: () => {
+        if (approved) return;
+        approved = true;
+        fx.store.write(tx => {
+          markApproval(tx, { runId: RUN, workspace: "/workspace", anchorCommit: ANCHOR, reviewedHead: HEAD, at });
+          completeApproval(tx, TASK, at, ["later/extra.ts"]);
+        });
+      },
+    });
+    assert.deepEqual(await validateTask(fx.store, TASK, context(fx, grader)), { kind: "decided", state: "valid", reason: null });
+    const payload = fx.store.read(db => readEvalTask(db, TASK))?.payload as { laterFiles?: string[]; expectedCases?: string[] };
+    assert.deepEqual(payload.laterFiles, ["later/extra.ts"], "the approval's files survive the decision");
+    assert.deepEqual(payload.expectedCases, [keyOf("a")]);
   } finally {
     fx.close();
   }

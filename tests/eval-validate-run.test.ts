@@ -111,17 +111,21 @@ function configFor(r: Rig, options: { metadata?: "open" | "closed"; noGrader?: b
   const prefix = { command: process.execPath, args: [FIXTURE, "--root", r.root, "--uid", String(UID), "--metadata", options.metadata ?? "closed", "--record", r.record] };
   return {
     projects: [projectConfig()],
+    stateDir: join(r.dir, "state"),
+    runDir: join(r.dir, "runs"),
+    keyFile: join(r.dir, "vault.key"),
+    teams: { workspaceDir: join(r.dir, "workspaces") },
     ...(options.noGrader ? {} : { eval: { grader: { prefix, root: r.root } } }),
   } as unknown as Config;
 }
 
 /**
- * The launcher as the host sees it in these tests. The fixture runs as this user, so the host's own mirror is readable and
- * cannot be a canary here; the probe checks the other canaries as the real launcher does. The host account is one id away.
+ * The launcher as the host sees it in these tests. The fixture runs as this user, so the host's own paths are readable and
+ * cannot be canaries here. The probe still receives them; `seen` records each list before it is replaced with none.
  */
-function testGrader(config: Config): Grader {
+function testGrader(config: Config, seen: string[][] = []): Grader {
   const inner = launcherGrader(() => config.eval?.grader, { hostUid: UID + 1, graceMs: 5_000 });
-  return { ...inner, probe: () => inner.probe([]) };
+  return { ...inner, probe: canaries => { seen.push([...canaries]); return inner.probe([]); } };
 }
 
 function alive(pid: number): boolean {
@@ -146,6 +150,7 @@ type HostOptions = {
   halt?: () => "clear" | "halted";
   /** The host-load gate's hold reason, read at each check. */
   held?: () => string | undefined;
+  source?: EvalHostOptions["source"];
 };
 
 function host(r: Rig, options: HostOptions = {}): EvalHost {
@@ -154,7 +159,7 @@ function host(r: Rig, options: HostOptions = {}): EvalHost {
   return new EvalHost({
     config,
     store: options.store ?? r.store,
-    source: { mirrorPath: () => r.mirror, status: () => status },
+    source: options.source ?? { mirrorPath: () => r.mirror, status: () => status },
     hostLoad: { held: options.held ?? (() => undefined) },
     halt: () => ({ check: () => ({ state: options.halt?.() ?? "clear" }) }),
     runs: () => [],
@@ -215,9 +220,13 @@ function plainText(r: Rig): string {
 
 test("a fixture commit becomes valid, and the two bad ones are rejected", { timeout: 600_000 }, async () => {
   const r = rig();
-  const h = host(r);
+  const seen: string[][] = [];
+  const h = host(r, { grader: testGrader(configFor(r), seen) });
   try {
     await mineAll(h);
+    const first = seen[0] ?? [];
+    const hostPaths = [evidenceDatabasePath(join(r.dir, "state")), join(r.dir, "vault.key"), join(r.dir, "state"), join(r.dir, "runs"), join(r.dir, "workspaces"), r.mirror];
+    for (const path of hostPaths) assert.ok(first.includes(path), `the probe checks ${path}`);
     const states = [1, 2, 3].map(index => byCommit(r, r.ids[index]).state);
     assert.deepEqual(states, ["candidate", "candidate", "candidate"]);
 
@@ -293,6 +302,8 @@ test("no grader, no validation", { timeout: 600_000 }, async () => {
     assert.ok(!("code" in summary));
     assert.equal(summary.grader.state, "network-open");
     assert.equal(ops(open.record).includes("run"), false, "no grader run was recorded");
+    assert.equal(ops(open.record).includes("stop"), false, "no stop before the grader answers ready");
+    assert.equal(ops(open.record).includes("clean"), false, "no clean before the grader answers ready");
   } finally {
     openHost.close();
     await openHost.idle();
@@ -315,7 +326,9 @@ test("a restart in the middle of a task counts no attempt", { timeout: 600_000 }
     }
     assert.ok(ops(r.record).includes("run"), "round 1 started");
     first.close();
+    const closedAt = ops(r.record).length;
     await first.idle();
+    assert.deepEqual(ops(r.record).slice(closedAt).filter(op => op === "run"), [], "close halts the task in flight: no run after close");
     // A restart is a new process: a new store on the same database. The corpus module registers once per store.
     const restart = (): void => {
       r.store.close();
@@ -466,6 +479,36 @@ test("a grader that can read a project's mirror runs nothing", { timeout: 600_00
     assert.ok(!("code" in summary));
     assert.equal(summary.grader.state, "exposed", "the grader state is exposed");
     assert.equal(ops(r.record).includes("run"), false, "no grader run was recorded");
+  } finally {
+    h.close();
+    await h.idle();
+    r.store.close();
+  }
+});
+
+test("a mirror read that throws still records the task", { timeout: 600_000 }, async () => {
+  const r = rig();
+  let broken = false;
+  const status: ProjectSourceStatus = { mode: "github", repository: "example/app", baseBranch: "main", mirrorHead: r.head };
+  // The miner reads the same source, so the read fails only once mining has caught up.
+  const h = host(r, {
+    source: {
+      mirrorPath: () => r.mirror,
+      status: () => {
+        if (broken) throw new Error("mirror read failed");
+        return status;
+      },
+    },
+  });
+  try {
+    await mineAll(h);
+    const created = h.create(PROJECT, { kind: "validate", limits: { maxWallMinutes: 60 } }, randomUUID());
+    assert.ok("job" in created);
+    broken = true;
+    h.tick();
+    await h.idle();
+    const view = h.job(created.job.jobId) as EvalJobView;
+    assert.equal(view.waiting, "mirror", "the task is recorded as an anchor the host could not read");
   } finally {
     h.close();
     await h.idle();

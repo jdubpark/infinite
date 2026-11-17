@@ -24,7 +24,10 @@ const ROUND_OF = { R1: 1, guards: 2, B1: 3, R2: 4, B2: 5, R3: 6 } as const;
 const IDENTITY = ["-c", "user.name=Infinite", "-c", "user.email=agent@example.invalid"];
 const PAUSE_CODES: ReadonlySet<string> = new Set(["anchor-unknown", "grader-failed", "grader-processes-alive", "bundle-missing"]);
 
-export type BundleState = { spawn: () => ChildProcess; job: string | null; sha256: string | null; restreamedFor: string | null };
+/** `tooLarge` is the job whose bundle went over the limit: its later tasks answer `too-large` without a stream. */
+export type BundleState = {
+  spawn: () => ChildProcess; job: string | null; sha256: string | null; restreamedFor: string | null; tooLarge: string | null;
+};
 export type ValidateContext = {
   jobId: string; projectId: string; settings: ValidationSettings; grader: Grader; graderRoot: string; uid: number;
   mirror: string; mirrorHead: string; git: Pick<MineGit, "isAncestor">; halted: () => boolean;
@@ -63,10 +66,14 @@ function refuse(reason: EvalReason): never {
   throw new Stop({ kind: "verdict", verdict: { kind: "reject", reason } });
 }
 
-/** Streams E3 into the grader once per job: stop, remove, then the bundle into `in/base.bundle`, counting its bytes. */
+/**
+ * Streams E3 into the grader once per job: stop, remove, then the bundle into `in/base.bundle`, counting its bytes. `ready`
+ * only when the grader stored every byte within the limit and the bundle exited 0 without an error.
+ */
 export async function prepareJob(ctx: ValidateContext, bundle: () => ChildProcess): Promise<"ready" | "too-large" | "failed"> {
   ctx.bundle.job = null;
   ctx.bundle.sha256 = null;
+  if (ctx.bundle.tooLarge === ctx.jobId) return "too-large";
   if ((await stopGrader(ctx.grader, ctx.uid, ctx.inventory)) !== "stopped") return "failed";
   if (!(await ctx.grader.remove(ctx.jobId))) return "failed";
   let child: ChildProcess;
@@ -75,11 +82,13 @@ export async function prepareJob(ctx: ValidateContext, bundle: () => ChildProces
   } catch {
     return "failed";
   }
+  const exit = exitOf(child);
   const out = child.stdout;
   if (!out) {
     child.kill();
     return "failed";
   }
+  child.stderr?.resume();
   const hash = createHash("sha256");
   let total = 0;
   const counter = new Transform({
@@ -96,18 +105,31 @@ export async function prepareJob(ctx: ValidateContext, bundle: () => ChildProces
   });
   out.pipe(counter);
   const result = await ctx.grader.receive(ctx.jobId, "base.bundle", counter, BUNDLE_MAX_BYTES);
-  if (total > BUNDLE_MAX_BYTES || result === "too-large") return "too-large";
-  if (result !== "stored") return "failed";
+  if (result !== "stored" || total > BUNDLE_MAX_BYTES) child.kill();
+  const ended = await exit;
+  if (total > BUNDLE_MAX_BYTES || result === "too-large") {
+    ctx.bundle.tooLarge = ctx.jobId;
+    return "too-large";
+  }
+  if (result !== "stored" || ended.error || ended.code !== 0) return "failed";
   ctx.bundle.job = ctx.jobId;
   ctx.bundle.sha256 = hash.digest("hex");
   return "ready";
+}
+
+/** The bundle's end: its exit code, or `error` when it could not start or failed. Listeners are attached at once. */
+function exitOf(child: ChildProcess): Promise<{ code: number | null; error: boolean }> {
+  return new Promise(resolve => {
+    child.once("error", () => resolve({ code: null, error: true }));
+    child.once("close", code => resolve({ code, error: false }));
+  });
 }
 
 /** Validates one candidate or valid task. The row is written only by the decision, and only when its state is unchanged. */
 export async function validateTask(store: EvidenceStore, taskId: string, ctx: ValidateContext): Promise<TaskValidation> {
   const loaded = loadTask(store, taskId);
   if (loaded.kind === "absent") return { kind: "environment", cause: "state-changed" };
-  if (loaded.kind === "unreadable") return decide(store, ctx, taskId, loaded.state, { kind: "reject", reason: "unreadable" }, undefined);
+  if (loaded.kind === "unreadable") return decide(store, ctx, taskId, loaded.state, { kind: "reject", reason: "unreadable" });
 
   let outcome: Outcome;
   try {
@@ -122,7 +144,7 @@ export async function validateTask(store: EvidenceStore, taskId: string, ctx: Va
   const cleanup = await finish(ctx);
   if (outcome.kind === "environment") return environment(outcome.cause);
   if (cleanup) return environment(cleanup);
-  return decide(store, ctx, taskId, loaded.task.state, outcome.verdict, loaded.task.payload);
+  return decide(store, ctx, taskId, loaded.task.state, outcome.verdict);
 }
 
 function environment(cause: EnvCause): TaskValidation {
@@ -366,16 +388,21 @@ async function settle(ctx: ValidateContext): Promise<void> {
 }
 
 /** The decision: one write that changes nothing when the row's state has moved since it was read. */
-function decide(store: EvidenceStore, ctx: ValidateContext, taskId: string, state: EvalState, verdict: Verdict, payload: EvalTaskRow["payload"] | undefined): TaskValidation {
+function decide(store: EvidenceStore, ctx: ValidateContext, taskId: string, state: EvalState, verdict: Verdict): TaskValidation {
   return store.write((tx: EvidenceTx): TaskValidation => {
-    const row = tx.get<{ state: string; attempts: number }>("SELECT state, attempts FROM eval_tasks WHERE task_id=?", taskId);
+    const row = tx.get<{ state: string; attempts: number; payload: string }>(
+      "SELECT state, attempts, payload FROM eval_tasks WHERE task_id=?",
+      taskId,
+    );
     if (row === undefined || row.state !== state) return { kind: "environment", cause: "state-changed" };
     const at = ctx.now();
     if (verdict.kind === "valid") {
+      // The payload is read here, not at the task's start, so an approval written meanwhile keeps its files.
+      const current = tx.open<CapturedPayload | MinedPayload>("eval_tasks", taskId, row.payload);
       tx.run(
         "UPDATE eval_tasks SET state='valid', reason=NULL, validated_at=?, attempts=0, payload=? WHERE task_id=?",
         at,
-        tx.seal("eval_tasks", taskId, { ...payload, expectedCases: verdict.expected }),
+        tx.seal("eval_tasks", taskId, { ...current, expectedCases: verdict.expected }),
         taskId,
       );
       return { kind: "decided", state: "valid", reason: null };

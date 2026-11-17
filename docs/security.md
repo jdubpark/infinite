@@ -113,6 +113,62 @@ A plain column holds only an opaque ID, an enumeration, a number, or a time. A t
 
 Eval capture ([teams](teams.md#eval-capture)) keeps its material only in the evidence store. The capsule, both patches, and the file names are sealed there. They never reach a mirror ref, a tracked file, a log line, an error, or a member's context. Plain columns hold only IDs, states, reason codes, counts, and times, and a project is matched by a blind index. A cancelled run's deletion deletes its eval material with it. The `eval` block of a project's team configuration reaches no member, and the routine approval digest leaves it out.
 
+Mined tasks keep their material the same way. Validation stores file lists sealed, and it stores each expected case only as a SHA-256 hash. No log line names a file, a commit, or a case. See [eval mining and validation](teams.md#eval-mining-and-validation).
+
+## Eval grader account
+
+The grader account runs the focused tests and the guard checks of a replay candidate. It is an account of its own. It has no provider login, no repository credential, and no read access to host state. The host reaches it only through the launcher that [the grader install](../deploy/ubuntu/grader.md) sets up. The launcher admits eight operations, and it confines each one to the grader's root.
+
+Before each task the host probes the account. The probe requires a user id that differs from the host's, a root of mode `0700` that the grader owns, no writable directory above that root, the tools the launcher needs, no readable canary, and a closed metadata address. Any other result is a named state, and no task starts. The probe runs before each task, not during one.
+
+### What a hostile test can reach
+
+| Channel | What the grader can reach | Control |
+|---|---|---|
+| Host environment | Nothing. A child starts from an empty environment plus a fixed list of ten names. No grant, egress key, hook token, provider login, or proxy variable reaches it. | The launcher sets the environment. The host starts the launcher with `PATH` and `LANG` only. |
+| Host files | Nothing that the probe lists. The probe reads the evidence database, the vault key, the state, run, and team workspace directories, each mirror of a GitHub project, and the owner's `canaries`. | A readable canary gives `exposed`. |
+| Grader files, read by the host | The host opens no file under the grader's root. It reads reports only through the launcher's `read`, which admits `reports/round-1.xml` to `reports/round-6.tap` and refuses links. A report is at most 8 MiB. | The launcher's read and the host's report parser. |
+| Other accounts | No signal, trace, or environment read of host or agent processes. A different user id cannot reach them. | The account's user id, checked by the probe. |
+| Loopback services | Reachable. Each one needs a credential that the grader does not hold. See the table below. | The credentials. |
+| Metadata address and private networks | Refused by the network rule in [the grader install](../deploy/ubuntu/grader.md#4-the-network-rule). The probe reports `network-open` while the metadata address answers. | The network rule and the probe. |
+| Processes after a task | Stopped. The host runs `stop` and checks the process table after each round and each task. A process that survives blocks the job with `grader-processes-alive`. | `stop`, and the process check of the host. |
+| Files after a task | Removed. Each task gets a new home and temporary directory. `clean` leaves only the job's base bundle, and the host checks its digest before each task. | `clean` and `remove`, and the digest. |
+| Test results | A focused test's exit code never validates a task. Only parsed reports from the reference and base rounds can validate one, and a missing or invalid report leaves the attempt undecided. | The round rules. |
+
+### Loopback services
+
+Each service below runs on loopback, so the grader can open a connection to it. Each one needs the credential in the last column.
+
+| Service | Address | Credential |
+|---|---|---|
+| API | `127.0.0.1:4780` | A device token |
+| Hook listener | The address that each session receives in its hook variables | The hook token |
+| Egress proxy | `127.0.0.1:4785` | The egress key, or the session credential that the host gives each session. See [egress](../deploy/ubuntu/egress.md). |
+| GitHub credential proxy | `127.0.0.1:8417` | A host-signed grant. See [the GitHub proxy](../deploy/ubuntu/github-proxy.md). |
+| Relay | `127.0.0.1:4790` | The relay registration key of the runner. Started with `--proxy-socket`, as [the public relay](../deploy/ubuntu/public-relay.md) installs it, the port refuses relay clients, and only `/health` answers without the key. |
+| Egress socket | The same port as the egress proxy | The same as the egress proxy. systemd holds the port while the proxy is down. |
+
+A second instance runs its own listeners on its own ports, with its own credentials. See [instances](../deploy/ubuntu/instances.md).
+
+### What stays with the owner
+
+These are the owner's choices. The design does not impose them.
+
+- Memory and CPU in a round are bounded only by the time limit and by the host-load check before each task.
+- `/proc` shows the grader the command lines of agent processes. The owner can mount `/proc` with `hidepid=invisible` and a `gid=` exemption for the host account.
+- A private `/tmp`, a disk quota, and a memory limit for the grader.
+
+### What stays reachable
+
+- The shared `/tmp`. The grader can read what other accounts leave readable there. The host writes no eval material outside the grader's root.
+- Process command lines in `/proc`. The host passes no secret in an argument.
+- The loopback services in the table above.
+- The public network. Package installs need it, so the network rule rejects only the private, link-local, carrier-grade NAT, and multicast ranges.
+- The disk. A file may reach 4 GiB. The host requires 10 GiB and 200,000 inodes free before each task.
+- Untrusted code. Each focused test is code from the repository at an old commit, with old dependencies. It runs as the grader, with the launcher's limits and no host credential.
+
+The probe checks each canary before a task. It cannot see a path that becomes readable during a round, and that path is checked only at the next probe.
+
 ## Remote machine transport
 
 Optional remote access is restricted to single-tenant runners. A runner can accept encrypted direct WebSockets and connect outbound to a separate relay. Keep the runner's ordinary HTTP API private. Only the separate relay endpoint is intended for public HTTPS exposure; it forwards opaque frames and routing metadata rather than exposing runner administration. The supported public deployment puts Cloudflare Access in front of it: a service token is checked at Cloudflare's edge and the tunnel validates the Access JWT before forwarding, so unauthenticated traffic does not reach the server. Access is a spam and flood gate, not the application authentication; the paired device key still authenticates every channel. [Remote machine setup](remote-machines.md) defines pairing and deployment.

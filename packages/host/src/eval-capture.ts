@@ -2,7 +2,7 @@ import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceTx } from "./evidence/types.js";
 import { captureSettings, EVAL_RETENTION_DAYS_DEFAULT, type EvalProjectSettings } from "./eval-config.js";
 import { LATER_FILES_MAX, promotion, referenceVerdict, REFERENCE_MAX_FILES, startVerdict, type PromotionFacts } from "./eval-rules.js";
-import { type Decide, type MarkerOutcome, type MaterialResult, type SweepCursor, capturedTaskId, completeApproval, completeMaterial, evalCorpusModule, failPending, insertMarker, markApproval, reconcileBatch, sweepEvalTasks } from "./eval-store.js";
+import { type Decide, type MarkerOutcome, type MaterialResult, type Promoted, type SweepCursor, capturedTaskId, completeApproval, completeMaterial, evalCorpusModule, failPending, insertMarker, markApproval, reconcileBatch, sweepEvalTasks } from "./eval-store.js";
 import { captureGit } from "./eval-git.js";
 import {
   EVAL_MODULE,
@@ -33,6 +33,8 @@ export type TaskCaptureOptions = {
   now?: () => string;
   /** Default CAPTURE_DEADLINE_MS. */
   deadlineMs?: number;
+  /** Called for each captured row a reconcile promotes. The host joins the mined copies of the run here. */
+  onPromoted?: Promoted;
 };
 
 type JobKind = "material" | "approval";
@@ -86,6 +88,7 @@ export class TaskCapture implements CaptureSink {
   private readonly git: CaptureGit;
   private readonly now: () => string;
   private readonly deadlineMs: number;
+  private readonly onPromoted: Promoted | undefined;
   private readonly queue: Job[] = [];
   /** Task ids with a job of each kind queued or running. The restart rule must not fail these for their own half. */
   private readonly live: Record<JobKind, Map<string, number>> = { material: new Map(), approval: new Map() };
@@ -106,6 +109,7 @@ export class TaskCapture implements CaptureSink {
     this.git = options.git ?? captureGit(() => options.config.teams?.commandPrefix);
     this.now = options.now ?? (() => new Date().toISOString());
     this.deadlineMs = options.deadlineMs ?? CAPTURE_DEADLINE_MS;
+    this.onPromoted = options.onPromoted;
     this.store.register(evalCorpusModule(this.store, this.now));
   }
 
@@ -182,7 +186,7 @@ export class TaskCapture implements CaptureSink {
         if (!this.restartChecked) {
           failPending(tx, new Set(this.live.material.keys()), new Set(this.live.approval.keys()), this.now());
         }
-        result = reconcileBatch(tx, decideWith(tx), this.now(), RECONCILE_BATCH);
+        result = reconcileBatch(tx, decideWith(tx), this.now(), RECONCILE_BATCH, this.onPromoted);
       });
       this.restartChecked = true;
       return result;

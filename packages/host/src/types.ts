@@ -168,6 +168,8 @@ export interface Config {
   sync?: { sharedGroup?: boolean; homeDir?: string };
   /** GitHub-tracked project sources: mirror directory, refresh period, and test-only remote overrides (refused on cloud hosts). */
   source?: { mirrorDir?: string; refreshMinutes?: number; remoteOverrides?: Record<string, string> };
+  /** Replay eval host settings: the grader identity. Outside the routine approval digest. */
+  eval?: import("./eval-config.js").EvalHostConfig;
   /** Chat digests written by a hosted model through an OpenAI-compatible Responses API. */
   summaries?: { model: string; apiKeyFile: string; baseUrl: string };
   /** Optional Jev readings for turn-finished lines and generated session titles. */

@@ -1,0 +1,9 @@
+# Output rules for the grader account. Replace GRADER_UID with the output of `id -u infinite-grader`, then load
+# with `nft -f` as root. Loopback and every other destination stay open; the listed private ranges are refused.
+table inet infinite_grader {
+  chain output {
+    type filter hook output priority 0; policy accept;
+    meta skuid GRADER_UID ip daddr { 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 224.0.0.0/4 } reject
+    meta skuid GRADER_UID ip6 daddr { fe80::/10, fc00::/7, ff00::/8 } reject
+  }
+}

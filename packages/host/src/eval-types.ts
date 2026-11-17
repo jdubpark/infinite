@@ -1,6 +1,10 @@
 import type { TeamBrief, TeamGoalContext } from "./team-types.js";
+import type { RoutineStatus } from "./routine-types.js";
 
 export const EVAL_MODULE = "eval-corpus";
+export const EVAL_STATES = ["captured", "candidate", "valid", "rejected", "retired"] as const;
+export const MINE_REASONS = ["too-large", "binary-change", "revert", "secret-shaped", "lineage-too-wide", "duplicate-of-captured"] as const;
+export const VALIDATION_REASONS = ["not-fail-to-pass", "guard-failed", "flaky", "too-slow", "anchor-missing", "unvalidated", "owner-retired"] as const;
 
 export type Capsule = {
   objective: string;
@@ -59,8 +63,13 @@ export const PROMOTION_REASONS = [
 export type StartReason = typeof START_REASONS[number];
 export type MaterialReason = typeof MATERIAL_REASONS[number];
 export type PromotionReason = typeof PROMOTION_REASONS[number];
-export type EvalReason = StartReason | MaterialReason | PromotionReason;
-export type EvalState = "captured" | "candidate" | "rejected";
+export type MineReason = typeof MINE_REASONS[number];
+export type ValidationReason = typeof VALIDATION_REASONS[number];
+export type EvalReason = StartReason | MaterialReason | PromotionReason | MineReason | ValidationReason;
+export type EvalState = typeof EVAL_STATES[number];
+export type EvalOrigin = "captured" | "mined";
+export type PromptOrigin = "assignment" | "run-objective" | "commit-message";
+export type Lineage = "clear" | "unclear";
 export type MaterialState = "pending" | "stored" | "partial" | "none";
 export type ApprovalState = "pending" | "read" | "unknown";
 export type BaseState = "pending" | "proven" | "not-proven" | "none";
@@ -83,6 +92,16 @@ export type CapturedPayload = {
   laterFiles?: string[];
   /** On promotion. */
   features?: EvalFeatures;
+  /** SHA-256 hex of each expected case key, after validation. */
+  expectedCases?: string[];
+};
+
+/** Sealed in `eval_tasks.payload` for a mined task. */
+export type MinedPayload = {
+  projectId: string; anchorCommit: string; commit: string; commitTime: string;
+  promptOrigin: "run-objective" | "commit-message"; runId?: string;
+  files: string[]; hiddenFiles: string[]; features: EvalFeatures;
+  expectedCases?: string[];
 };
 
 /** Sealed in `eval_tasks.payload` for a rejected task: nothing but the project. */
@@ -90,7 +109,7 @@ export type RejectedPayload = { projectId: string };
 
 export type EvalTaskRow = {
   taskId: string;
-  origin: "captured";
+  origin: EvalOrigin;
   runId: string;
   memberId: string;
   projectRef: string;
@@ -105,7 +124,11 @@ export type EvalTaskRow = {
   decidedAt: string | null;
   checkedAt: string;
   runDeletedAt: string | null;
-  payload: CapturedPayload | RejectedPayload;
+  groupId: string | null;
+  lineage: Lineage | null;
+  validatedAt: string | null;
+  attempts: number;
+  payload: CapturedPayload | MinedPayload | RejectedPayload;
 };
 
 export type PatchRead = { state: "read"; bytes: Buffer } | { state: "too-large" } | { state: "failed" };
@@ -121,3 +144,43 @@ export interface CaptureGit {
 }
 
 export type ReconcileResult = { visited: number; promoted: number; rejected: number; demoted: number; waiting: number; unreadable: number };
+
+export type GraderState = "not-configured" | "unavailable" | "misconfigured" | "exposed" | "network-open" | "ready";
+export type MiningState = "off" | "waiting" | "mining" | "caught-up" | "full" | "failing";
+export type MiningStatus = { state: MiningState; visited: number | null; mined: number | null; skipped: number | null; failures: number | null; backfillDone: boolean | null };
+export type EvalJobReason = "owner" | "validation-stuck" | "configuration-changed" | "grader-processes-alive" | "limit-reached" | "done" | "expired";
+export type EvalJobWait = "grader" | "window" | "host-load" | "halt" | "storage" | "bundle" | "mirror" | "another-job";
+export type EvalJobView = {
+  jobId: string; projectId: string | null; kind: "validate"; status: RoutineStatus;
+  reason: EvalJobReason | null; waiting: EvalJobWait | null;
+  createdAt: string; startedAt: string | null; expiresAt: string; finishedAt: string | null;
+  counts: { visited: number; valid: number; rejected: number; retired: number; undecided: number };
+};
+export type ValidateJobRequest = {
+  kind: "validate";
+  taskFilter?: { taskIds?: string[]; origins?: EvalOrigin[]; areas?: string[]; revalidate?: boolean; maxTasks?: number };
+  limits: { maxWallMinutes: number };
+  windows?: { startHourUtc: number; endHourUtc: number }[];
+  expiresAt?: string;
+};
+export type EvalSummary = {
+  projectId: string;
+  capture: { on: boolean };
+  mining: { on: boolean } & MiningStatus;
+  tasks: { byState: Record<EvalState, number>; byOrigin: Record<EvalOrigin, Record<EvalState, number>>;
+           byArea: { area: string; candidate: number; valid: number }[]; bySet: null };
+  groups: { total: number; devOnly: number; largest: number };
+  coverage: { days: number; validCaptured: number; accepted: number; share: number } | null;
+  grader: { state: GraderState };
+  jobs: EvalJobView[];
+};
+export type EvalRefusal = { status: 400 | 404 | 409 | 503; code: "invalid-eval-request" | "unknown-project" | "unknown-job" | "unknown-task"
+  | "job-active" | "request-conflict" | "eval-config-incomplete" | "invalid-job-transition" | "task-not-active" | "evidence-unavailable" };
+export interface EvalHostApi {
+  summary(projectId: string): Promise<EvalSummary | EvalRefusal>;
+  jobs(): EvalJobView[] | EvalRefusal;
+  job(jobId: string): EvalJobView | EvalRefusal;
+  create(projectId: string, request: ValidateJobRequest, requestId: string): { created: boolean; job: EvalJobView } | EvalRefusal;
+  control(jobId: string, action: "pause" | "resume" | "cancel"): EvalJobView | EvalRefusal;
+  retire(taskId: string): { taskId: string; state: "retired" } | EvalRefusal;
+}

@@ -298,7 +298,7 @@ One draw gives `θ` of 0.72, 0.44, and 0.86, with utilities 0.44, 0.13, and −0
 
 Cascade check against light-b: `2.00 · 0.15 + 1.50 · 0.20 = 0.60`, below the price gap of $1.90, so the task starts light. Against a light profile with `θ` of 0.20 and `φ` of 0.20, `2.00 · 0.62 + 1.50 · 0.70 = 2.29` exceeds the gap, so the task starts strong.
 
-*Auto slice (2026-11-16).* `infinite routing pause-explore PROJECT` and `resume-explore PROJECT` toggle the project's exploration pause in the evidence store; neither changes the saved configuration. `infinite team revoke-routing TEAM_ID` posts to the owner-only route `/api/teams/:id/routing/revoke`, reads the run's current revision, and returns new tasks to the coordinator's profiles. It is refused with 409 `routing-not-enabled` for a run that was not pinned `auto`.
+*Auto slice (2026-11-16).* `infinite routing pause-explore PROJECT` and `resume-explore PROJECT` toggle the project's exploration pause in the evidence store; neither changes the saved configuration. `infinite team revoke-routing TEAM_ID` posts to the owner-only route `/api/teams/:id/routing/revoke`, reads the run's current revision, and starts new tasks on the coordinator's pick when it passes the fixed rules, else on the first implementer that passes them. It is refused with 409 `routing-not-enabled` for a run that was not pinned `auto`.
 
 ## Authority and safety
 

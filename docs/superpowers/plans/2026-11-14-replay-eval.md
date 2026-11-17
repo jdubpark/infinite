@@ -662,6 +662,11 @@ These override the text below them where the two differ.
 11. **Cleanup limits.** `clean` and `remove` get 600 seconds, because a task's round clones and their dependencies can hold hundreds of thousands of files. `read` and `stop` keep 30 seconds, and `receive` and `digest` 600.
 12. **A rewrite answer must be followed by a read before it moves the cursor.** Form 1's `no` changes the cursor only in the transaction of the first commit visited after it (mined, rejected, or skipped). If the next read fails, nothing is written. A launcher that refuses form 1 with exit 1 therefore mines nothing and claims no rewrite. Task 5 also maps E2's `too-large` to `capsule-too-large`.
 13. **Each task keeps its own index test.** Tasks 3, 5, 10, and 11 run in parallel pairs, so none of them edits `tests/eval-store-v2.test.ts`. Each adds a test named `the hot statements read through an index` to its own test file, with the same `EXPLAIN QUERY PLAN` check as Task 2's, listing its exported statements and the index each must `SEARCH`.
+14. **The smallest group id is the root, and Task 3's table follows it.** The decision stands: `mergeRoots` picks the smallest id in code-unit order, so a mined group (`mined:…`) is the root of every merge with a run group (`run:…`), whichever merge came first.
+    - `the three group facts give one result in every order` expects `rootOf` of both tasks to be the mined task's group id.
+    - `a deleted run leaves its mined copy` expects the mined row, its state, and its group row (the root, with its `dev_only`) to stay. The run's group row, which no task names and which is no other row's root, goes: the first `sweepGroups` returns 1, and a second returns 0.
+    - `groupStats` counts root rows (`total`), roots with `dev_only` 1 (`devOnly`), and the most tasks under one root (`largest`). Task 11 uses these meanings.
+    - Task 3's step M joins a landed run group through `eval_groups_landing`, as Task 5's transaction does, so the order L-M-P gives the same result.
 
 ## Trust boundary, and what a review checks
 

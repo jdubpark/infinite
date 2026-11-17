@@ -158,3 +158,20 @@ test("digest reads the bundle's hash", async () => {
   writeFileSync(bundle, bytes);
   assert.deepEqual(await grader(sb, { hostUid: OTHER_UID }, ["--digest-text", "not-hex"]).digest(JOB), { state: "failed" });
 });
+
+test("stop reaches a round that is still running", async () => {
+  const sb = sandbox();
+  const client = grader(sb);
+  const running = client.run(JOB, ".", 60, ["sleep", "30"]);
+  // The fixture lists the run's process group once its child has started; a stop before that would find nothing.
+  const groups = `${sb.root}.groups`;
+  for (let i = 0; i < 200 && !(existsSync(groups) && readFileSync(groups, "utf8").trim() !== ""); i++) await sleep(25);
+  const started = Date.now();
+  assert.equal(await client.stop(), true, "stop answers true while the run is open");
+  assert.ok(Date.now() - started < 5000, "stop answers within 5 seconds");
+  const outcome = await Promise.race([running.then(() => "resolved"), sleep(10_000).then(() => "timeout")]);
+  assert.equal(outcome, "resolved", "the run resolves after the stop");
+  assert.ok(Date.now() - started < 10_000, "the run resolves within 10 seconds of the stop");
+  assert.equal(await client.clean(JOB), true, "a new call is accepted once the run has ended");
+});
+

@@ -60,10 +60,11 @@ function launch(
   prefix: EvalGraderConfig["prefix"],
   operation: string,
   args: readonly string[],
-  limit: { ms: number; keep: number; input?: Readable | Buffer },
+  limit: { ms: number; keep: number; input?: Readable | Buffer; bypass?: boolean },
 ): Promise<Spawned> {
   const failed: Spawned = { code: null, out: Buffer.alloc(0), truncated: false, failed: true, elapsedMs: 0 };
-  if (channel.held) return Promise.resolve(failed);
+  // A bypass call (`stop`) neither waits for nor holds the channel, so it reaches a command that is still running.
+  if (channel.held && !limit.bypass) return Promise.resolve(failed);
   const started = Date.now();
   return new Promise(resolve => {
     const env: Record<string, string> = {};
@@ -78,7 +79,7 @@ function launch(
       resolve(failed);
       return;
     }
-    channel.held = true;
+    if (!limit.bypass) channel.held = true;
     const chunks: Buffer[] = [];
     let kept = 0, total = 0, truncated = false, settled = false;
     const finish = (result: Partial<Spawned>) => {
@@ -102,11 +103,11 @@ function launch(
     if (Buffer.isBuffer(limit.input)) child.stdin?.end(limit.input);
     else if (limit.input) limit.input.pipe(child.stdin!);
     child.on("error", () => {
-      channel.held = false;
+      if (!limit.bypass) channel.held = false;
       finish({ failed: true });
     });
     child.on("close", code => {
-      channel.held = false;
+      if (!limit.bypass) channel.held = false;
       finish({ code, failed: false });
     });
   });
@@ -202,7 +203,7 @@ export function launcherGrader(config: () => EvalGraderConfig | undefined, optio
     async stop() {
       const current = config();
       if (!current) return false;
-      const result = await launch(channel, current.prefix, "stop", [], { ms: LAUNCHER_SECONDS * 1000, keep: 0 });
+      const result = await launch(channel, current.prefix, "stop", [], { ms: LAUNCHER_SECONDS * 1000, keep: 0, bypass: true });
       return !result.failed && result.code === 0;
     },
 

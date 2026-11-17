@@ -103,7 +103,7 @@ function run(job, dir, secondsText, argv) {
   const home = jobPath(job, "home");
   const tmp = jobPath(job, "tmp");
   const cwd = dir === "." ? jobPath(job, "work") : jobPath(job, "work", dir);
-  for (const d of [home, tmp, cwd]) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+  for (const d of [home, tmp, cwd, jobPath(job, "work", "reports")]) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
 
   const child = spawn(argv[1], argv.slice(2), {
     cwd, env: { ...FIXED_ENV, HOME: home, TMPDIR: tmp }, detached: true, stdio: "inherit",

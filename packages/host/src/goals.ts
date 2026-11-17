@@ -17,7 +17,7 @@ import { readSignals } from "./signals/consume.js";
 import { addToPendingWake, type PendingWake, type SignalReader } from "./signals/types.js";
 import { cadenceDue, classifyCycle, cycleWakeOf, defaultWakeMinGapMinutes, foldedCycles, isReviewed, keptCycles, latestReviewed, maxFailedCycles, maxPreviousWork, restoreWake, runObjectiveLimitBytes, unresolvedOperation, wakeObjective, retryableCreationFailure } from "./goal-standing.js";
 import { KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
-import { digestEvent, correctGoalObjective, createGoalObjective, goalObjectiveNote, goalObjectiveView, goalRecordDigest, loadGoalObjective, steerGoalObjective, type ObjectiveUnavailable } from "./objective-goals.js";
+import { digestEvent, correctGoalObjective, createGoalObjective, goalObjectiveNote, goalObjectiveView, goalRecordDigest, goalRecordPort, loadGoalObjective, steerGoalObjective, type ObjectiveUnavailable } from "./objective-goals.js";
 import { objectivePromptsOn } from "./objective-digest.js";
 import { correctionSchema, type CriterionInput } from "./objective-input.js";
 import { objectiveError, recordView, type ObjectiveRecordView } from "./objective-record.js";
@@ -121,6 +121,7 @@ export class GoalService {
       catch { this.saved.set(id, digest(stored)); unsaved++; }
     }
     if (unsaved) console.warn(`Objective records of ${unsaved} goals could not be saved at startup. Each is saved with its goal's next change.`);
+    this.teams.useGoalRecords?.(goalRecordPort(id => this.records.get(id), holder => this.save(holder as Stored)));
   }
   /** The launch-rate fuse. A service without one starts every cycle it would have started before. */
   useFuse(fuse: FuseGate) { this.fuse = fuse; }

@@ -10,6 +10,7 @@ import {
   type ObjectiveRecordView,
   type ObjectiveUnavailable,
 } from "./objective-record.js";
+import type { GoalRecordPort } from "./objective-intent.js";
 import type { ObjectiveRecord } from "./objective-types.js";
 import { recordDigestFor } from "./objective-digest.js";
 import type { Correction, CriterionInput } from "./objective-input.js";
@@ -81,6 +82,32 @@ export function steerGoalObjective(holder: GoalHolder, requestId: string, at: st
   if (next === state.record) return "unchanged";
   holder.objectiveRecord = next;
   return "synced";
+}
+
+/**
+ * A goal's record for the intent check. `read` answers the held record's state, and `absent` for a goal not held. `write`
+ * checks the held version, sets the held object's record in place, and saves the holder; a failed save restores the
+ * previous record and rethrows. It writes no goal event.
+ */
+export function goalRecordPort(holderOf: (goalId: string) => GoalHolder | undefined, save: (holder: GoalHolder) => void): GoalRecordPort {
+  return {
+    read(goalId) {
+      const holder = holderOf(goalId);
+      return holder ? readStoredRecord(holder.objectiveRecord, ownerOf(holder.goal)) : { kind: "absent" };
+    },
+    write(goalId, expectedVersion, next) {
+      const holder = holderOf(goalId);
+      if (!holder) throw objectiveError("objective-record-absent");
+      const state = readStoredRecord(holder.objectiveRecord, ownerOf(holder.goal));
+      if (state.kind === "absent") throw objectiveError("objective-record-absent");
+      if (state.kind === "unavailable") throw objectiveError(state.reason === "record-newer" ? "objective-record-newer" : "objective-record-invalid");
+      if (state.record.version !== expectedVersion) throw objectiveError("objective-version-stale");
+      const previous = holder.objectiveRecord;
+      holder.objectiveRecord = next;
+      try { save(holder); }
+      catch (error) { holder.objectiveRecord = previous; throw error; }
+    },
+  };
 }
 
 /** The event text to add once for this result, or undefined. */

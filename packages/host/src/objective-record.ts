@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { ProductGoal } from "./goal-types.js";
 import type { TeamRun } from "./team-types.js";
@@ -11,7 +12,7 @@ import {
   objectiveRecordSchema,
   recordDigest,
 } from "./objective-types.js";
-import type { Criterion, Direction, LogEntry, LogValue, ObjectiveOwner, ObjectiveRecord } from "./objective-types.js";
+import type { Assumption, Criterion, Direction, LogEntry, LogValue, ObjectiveOwner, ObjectiveRecord, Question } from "./objective-types.js";
 
 export type ObjectiveUnavailable = "source-invalid" | "record-invalid" | "record-newer";
 export type ObjectiveState = { kind: "absent" } | { kind: "ready"; record: ObjectiveRecord }
@@ -207,6 +208,15 @@ export function readStoredRecord(raw: unknown, owner: ObjectiveOwner): Objective
   }
 }
 
+/** The ops the intent check writes. `rebuildVersion` undoes each of them. */
+export const INTENT_OPS = {
+  applied: "intent-check.applied",
+  answered: "intent-check.answered",
+  released: "intent-check.released",
+  skipped: "intent-check.skipped",
+} as const;
+const INTENT_OP_SET = new Set<string>(Object.values(INTENT_OPS));
+
 const CRITERION_OPS = new Set(["criterion.added", "criterion.edited", "criterion.retired", "criterion.confirmed"]);
 
 /** Undoes one criterion entry: the criterion its `after` names goes back to its `before`, or is removed for an add. */
@@ -225,28 +235,121 @@ function undoCriterion(criteria: Criterion[], entry: LogEntry): Criterion[] {
   return criteria.map((item, position) => (position === index ? (restored as Criterion) : item));
 }
 
+type Undoable = { assumptions: Assumption[]; questions: Question[]; criteria: Criterion[]; directions: Direction[] };
+
+const unavailable = () => objectiveError("objective-version-unavailable");
+const digestOf = (value: unknown): string => createHash("sha256").update(canonicalJson(JSON.parse(JSON.stringify(value)))).digest("hex");
+const savedQuestion = z.strictObject({
+  id: z.string(),
+  state: z.enum(["open", "answered", "dismissed", "default-kept"]),
+  waits: z.boolean(),
+  decisionId: z.uuid().optional(),
+});
+const savedQuestions = z.strictObject({ questions: z.array(savedQuestion) });
+const appliedAfter = z.looseObject({
+  added: z.strictObject({ assumptions: z.array(z.string()), questions: z.array(z.string()), criteria: z.array(z.string()) }),
+  addedDigest: z.string(),
+});
+const answeredAfter = z.looseObject({ direction: z.looseObject({ id: z.string() }).optional(), directionsFull: z.boolean().optional() });
+const DIRECTION_REF = "record:direction:";
+
+function inlineOf(value: LogValue | undefined): unknown {
+  if (value === undefined || !("inline" in value)) throw unavailable();
+  return value.inline;
+}
+
+/** Puts back the state, wait, and decisionId that `before` names for each question. A name the record does not hold is unavailable. */
+function restoreQuestions(questions: Question[], before: LogValue | undefined): Question[] {
+  const saved = savedQuestions.safeParse(inlineOf(before));
+  if (!saved.success) throw unavailable();
+  let next = questions;
+  for (const item of saved.data.questions) {
+    const index = next.findIndex(question => question.id === item.id);
+    if (index === -1) throw unavailable();
+    const restored: Question = { ...next[index]!, state: item.state, waits: item.waits };
+    delete restored.decisionId;
+    if (item.decisionId !== undefined) restored.decisionId = item.decisionId;
+    next = next.map((question, position) => (position === index ? restored : question));
+  }
+  return next;
+}
+
+/** The direction an answer appended: inline by its id, or named by its reference. None when the answer hit the direction cap. */
+function answeredDirectionId(after: LogValue | undefined): string | undefined {
+  if (after === undefined) throw unavailable();
+  if ("ref" in after) {
+    if (!after.ref.startsWith(DIRECTION_REF)) throw unavailable();
+    return after.ref.slice(DIRECTION_REF.length);
+  }
+  const parsed = answeredAfter.safeParse(after.inline);
+  if (!parsed.success) throw unavailable();
+  return parsed.data.directionsFull === true ? undefined : parsed.data.direction?.id;
+}
+
+/** Undoes one intent entry. A check's added objects come out only when they hash to `addedDigest`. */
+function undoIntent(state: Undoable, entry: LogEntry): Undoable {
+  if (entry.op === INTENT_OPS.skipped) return state;
+  if (entry.op === INTENT_OPS.applied) {
+    const parsed = appliedAfter.safeParse(inlineOf(entry.after));
+    if (!parsed.success) throw unavailable();
+    const { added, addedDigest } = parsed.data;
+    const objects = {
+      assumptions: state.assumptions.filter(item => added.assumptions.includes(item.id)),
+      questions: state.questions.filter(item => added.questions.includes(item.id)),
+      criteria: state.criteria.filter(item => added.criteria.includes(item.id)),
+    };
+    if (digestOf(objects) !== addedDigest) throw unavailable();
+    const kept = state.questions.filter(item => !added.questions.includes(item.id));
+    return {
+      assumptions: state.assumptions.filter(item => !added.assumptions.includes(item.id)),
+      questions: restoreQuestions(kept, entry.before ?? { inline: { questions: [] } }),
+      criteria: state.criteria.filter(item => !added.criteria.includes(item.id)),
+      directions: state.directions,
+    };
+  }
+  if (entry.op === INTENT_OPS.answered) {
+    const questions = restoreQuestions(state.questions, entry.before);
+    const id = answeredDirectionId(entry.after);
+    if (id === undefined) return { ...state, questions };
+    const direction = state.directions.find(item => item.id === id);
+    if (direction === undefined || direction.source !== "correction") throw unavailable();
+    return { ...state, questions, directions: state.directions.filter(item => item.id !== id) };
+  }
+  return { ...state, questions: restoreQuestions(state.questions, entry.before) };
+}
+
 /** Rebuilds the record as it was at `version` by undoing each later entry in descending seq. Throws objectiveError. */
 export function rebuildVersion(record: ObjectiveRecord, version: number): ObjectiveRecord {
   if (!Number.isInteger(version) || version < 1 || version > record.version) throw objectiveError("objective-version-not-found");
   const first = record.log[0];
   if (first === undefined || version < first.version) throw objectiveError("objective-version-unavailable");
   const undone = record.log.filter(entry => entry.version > version).sort((left, right) => right.seq - left.seq);
-  let directions = record.statement.directions;
-  let criteria = record.criteria;
+  let state: Undoable = {
+    assumptions: record.assumptions,
+    questions: record.questions,
+    criteria: record.criteria,
+    directions: record.statement.directions,
+  };
   for (const entry of undone) {
     if (CRITERION_OPS.has(entry.op)) {
-      criteria = undoCriterion(criteria, entry);
+      state = { ...state, criteria: undoCriterion(state.criteria, entry) };
+      continue;
+    }
+    if (INTENT_OP_SET.has(entry.op)) {
+      state = undoIntent(state, entry);
       continue;
     }
     if (entry.op !== "direction.appended" && entry.op !== "direction.copied") throw objectiveError("objective-version-unavailable");
     if (!record.statement.directions.some(item => item.id === entry.target)) throw objectiveError("objective-version-unavailable");
-    directions = directions.filter(item => item.id !== entry.target);
+    state = { ...state, directions: state.directions.filter(item => item.id !== entry.target) };
   }
   const rebuilt = seal({
     ...record,
     version,
-    criteria,
-    statement: { ...record.statement, directions },
+    assumptions: state.assumptions,
+    questions: state.questions,
+    criteria: state.criteria,
+    statement: { ...record.statement, directions: state.directions },
     log: record.log.filter(entry => entry.version <= version),
   });
   if (!objectiveRecordSchema.safeParse(rebuilt).success) throw objectiveError("objective-version-unavailable");

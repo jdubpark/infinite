@@ -668,10 +668,10 @@ The `eval` block of a project and the `eval.grader` block do not change a run, a
 
 Mining reads the base branch of the project's mirror (`source.baseBranch`). Each pass mines at most 50 commits. A pass has two parts.
 
-1. **Forward.** The first-parent commits added since the last pass, oldest first. A pass keeps at most 500 new commits. It counts the rest as `skipped`.
+1. **Forward.** The first-parent commits added since the last pass, oldest first. A pass keeps the newest 500 new commits. Older new commits are not mined or counted.
 2. **Backfill.** The older first-parent commits, newest first. The backfill stops after 2,000 commits are visited.
 
-The first pass sets the cursor at the head of the base branch. Each commit is decided and the cursor moves in one transaction, so a restart neither skips nor repeats a commit. A rewritten branch restarts the forward walk at the new head. Rows that exist stay.
+The first pass sets the cursor at the head of the base branch. Each commit is decided and the cursor moves in one transaction, so a restart neither skips nor repeats a commit. A rewritten branch restarts the forward walk at the new head: the head is decided first, then the backfill walks down from it within its 2,000-commit bound. Rows that exist stay.
 
 Each commit is decided in this order:
 
@@ -703,7 +703,7 @@ The message of a commit is read after its change counts. A message that is too l
 
 Mined rows never count against the capture cap of 20,000 rows. A project holds at most 5,000 mined rows. A pass starts only when 50 capsules of 65,536 bytes fit under the project's and the host's material caps. Otherwise the state is `full`, and each pass checks again.
 
-A read that is refused, fails, or times out ends the pass. The cursor stays where it was. The state becomes `failing`, and the next pass waits one hour. The host logs `Eval mining paused (read-failed).` once per process. No commit is skipped for a failed read, and no failed read is recorded as "no test change".
+A read that is refused, fails, or times out ends the pass. The cursor stays where it was. The state becomes `failing`, and the next pass waits one hour. The host logs `Eval mining paused (read-failed).` when a project starts failing, not at each hourly retry. No commit is skipped for a failed read, and no failed read is recorded as "no test change".
 
 Mining states:
 
@@ -711,8 +711,8 @@ Mining states:
 |---|---|
 | `off` | Mining is not on for the project. |
 | `waiting` | A pass waits until capture has indexed the paths of its captured tasks. |
-| `mining` | A pass is running. |
-| `caught-up` | The last pass ended with no read failure and no full cap. |
+| `mining` | A pass is running, or the last pass stopped at its 50-commit budget and the next pass goes on. |
+| `caught-up` | The last pass reached the newest commit, and the backfill reached the first commit or its 2,000-commit bound. |
 | `full` | The project or host material cap, or the 5,000-row limit, leaves no room. |
 | `failing` | A read failed. The next pass waits one hour. |
 

@@ -30,7 +30,8 @@ import {
   readMaterial,
   reconcileBatch,
 } from "../packages/host/src/eval-store.js";
-import type { CaptureStart, Capsule, EvalFeatures, MinedPayload } from "../packages/host/src/eval-types.js";
+import type { CaptureStart, Capsule, EvalFeatures } from "../packages/host/src/eval-types.js";
+import { insertMined, minedTaskId, placeMined, type MinedCandidate } from "../packages/host/src/eval-miner.js";
 import { landingSignalId } from "../packages/host/src/outcome-signals.js";
 import { outcomeModule, writeSignal, type SignalRow } from "../packages/host/src/outcome-store.js";
 import type { TeamRun } from "../packages/host/src/team-types.js";
@@ -121,51 +122,23 @@ function approveTx(tx: EvidenceTx, taskId: string, at: string): void {
   tx.run("UPDATE eval_tasks SET approval = 'read', approved_at = ? WHERE task_id = ?", at, taskId);
 }
 
-/**
- * A mined row of `commit`, as Task 5's `insertMined` writes it, with its own group. Until Task 5 lands this is a direct
- * insert with the same columns.
- */
-function insertMinedTx(tx: EvidenceTx, commit: string, files: string[], at: string): string {
-  const taskId = `mined:${commit}`;
-  const projectRef = tx.index("project", PROJECT);
-  const payload: MinedPayload = {
-    projectId: PROJECT, anchorCommit: ANCHOR, commit, commitTime: COMMIT_AT, promptOrigin: "commit-message",
-    files, hiddenFiles: [], features: FEATURES,
+function minedInput(commit: string, files: string[]): MinedCandidate {
+  return {
+    kind: "candidate", projectId: PROJECT, commit, parent: ANCHOR, commitTime: COMMIT_AT, capsule: CAPSULE,
+    promptOrigin: "commit-message", files, hiddenFiles: [], features: FEATURES,
   };
-  tx.run(
-    "INSERT INTO eval_tasks (task_id, origin, run_id, member_id, project_ref, state, reason, material, approval, approved_at, "
-    + "base, material_bytes, captured_at, decided_at, checked_at, run_deleted_at, payload, group_id, commit_ref, paths_indexed) "
-    + "VALUES (?, 'mined', '', '', ?, 'candidate', NULL, 'stored', NULL, NULL, 'proven', 0, ?, NULL, ?, NULL, ?, ?, ?, 1)",
-    taskId,
-    projectRef,
-    at,
-    at,
-    tx.seal("eval_tasks", taskId, payload),
-    taskId,
-    tx.index("eval-commit", commit),
-  );
-  tx.run("INSERT OR IGNORE INTO eval_groups (group_id, kind, project_ref, root_id, created_at) VALUES (?, 'mined', ?, ?, ?)", taskId, projectRef, taskId, at);
-  return taskId;
 }
 
-/**
- * The mining step of one commit, as Task 5 applies it in one write: the landing join when a run already landed this
- * commit, otherwise the lineage merge (roots merge `devOnly`). Then the duplicate rule.
- */
+/** A mined candidate of `commit`, written by Task 5's `insertMined` with its own group. Returns its task id. */
+function insertMinedTx(tx: EvidenceTx, commit: string, files: string[], at: string): string {
+  insertMined(tx, minedInput(commit, files), at);
+  return minedTaskId(tx.index("project", PROJECT), tx.index("eval-commit", commit));
+}
+
+/** The mining step of one commit, as the miner writes it: the insert, then Task 5's `placeMined` in the same write. */
 function mineTx(tx: EvidenceTx, commit: string, files: string[], at: string): string {
   const taskId = insertMinedTx(tx, commit, files, at);
-  const landed = tx.get<{ group_id: string }>(
-    "SELECT group_id FROM eval_groups WHERE project_ref = ? AND landing_ref = ? LIMIT 1",
-    tx.index("project", PROJECT),
-    tx.index("eval-commit", commit),
-  );
-  if (landed !== undefined) {
-    applyDuplicateRule(tx, mergeRoots(tx, [taskId, rootOf(tx, landed.group_id)], false), at);
-    return taskId;
-  }
-  const lineage = lineageRoots(tx, { pathRefs: files.map(file => pathRef(tx, PROJECT, file)), commitTime: COMMIT_AT });
-  if ("tooWide" in lineage) throw new Error("the lineage is too wide for this test");
-  if (lineage.roots.length > 0) applyDuplicateRule(tx, mergeRoots(tx, [taskId, ...lineage.roots], true), at);
+  placeMined(tx, minedInput(commit, files), at);
   return taskId;
 }
 
@@ -265,7 +238,6 @@ test("a promotion retires a valid mined copy", () => {
     const mined = f.store.write(tx => mineTx(tx, LANDED, [SRC, TEST_B], COMMIT_AT));
     f.store.write(tx => {
       tx.run("UPDATE eval_tasks SET state = 'valid' WHERE task_id = ?", mined);
-      tx.run("INSERT INTO eval_material (task_id, part, bytes, payload) VALUES (?, 'capsule', 1, ?)", mined, tx.seal("eval_material", `${mined}/capsule`, { capsule: CAPSULE }));
     });
     f.store.write(tx => { promoteTx(tx); });
     const copy = f.store.read(db => readEvalTask(db, mined));
@@ -335,6 +307,10 @@ test("lineage is bounded in time and width", () => {
     });
     const sixtyFive = wide.store.read(db => lineageRoots(db, { pathRefs: [ref], commitTime: COMMIT_AT }));
     assert.deepEqual(sixtyFive, { tooWide: true });
+    // The miner rejects a commit whose lineage is too wide.
+    const mined = wide.store.write(tx => mineTx(tx, LANDED, [SRC, TEST_B], COMMIT_AT));
+    const copy = wide.store.read(db => readEvalTask(db, mined));
+    assert.deepEqual([copy?.state, copy?.reason], ["rejected", "lineage-too-wide"]);
   } finally {
     wide.cleanup();
   }
@@ -364,9 +340,9 @@ test("the groups pass joins a landing from either source", () => {
   // A run record whose deliveryReceipt names the commit.
   const fromRecord = open();
   try {
-    fromRecord.store.write(tx => {
+    const minedId = fromRecord.store.write(tx => {
       approveTx(tx, captureTx(tx, RUN, [SRC, TEST_A], CAPTURED_AT), APPROVED_AT);
-      insertMinedTx(tx, LANDED, [LIB_C, TEST_C], COMMIT_AT);
+      return insertMinedTx(tx, LANDED, [LIB_C, TEST_C], COMMIT_AT);
     });
     const run = { id: RUN, deliveryReceipt: { mergeCommit: LANDED } } as unknown as TeamRun;
     const pass = new GroupPass({ store: fromRecord.store, runs: () => [run], now: () => NOW });
@@ -374,7 +350,7 @@ test("the groups pass joins a landing from either source", () => {
     const state = fromRecord.store.read(db => ({
       landing: db.get<{ landing_ref: string | null }>("SELECT landing_ref FROM eval_groups WHERE group_id = ?", runGroupId(RUN))?.landing_ref,
       run: rootOf(db, runGroupId(RUN)),
-      mined: rootOf(db, `mined:${LANDED}`),
+      mined: rootOf(db, minedId),
     }));
     assert.equal(state.landing, fromRecord.store.write(tx => tx.index("eval-commit", LANDED)));
     assert.equal(state.mined, state.run);
@@ -385,14 +361,15 @@ test("the groups pass joins a landing from either source", () => {
   // A ledger landing signal with the commit. A signal whose payload does not open stamps the group and joins nothing.
   const fromSignal = open();
   try {
-    fromSignal.store.write(tx => {
+    const minedId = fromSignal.store.write(tx => {
       approveTx(tx, captureTx(tx, RUN, [SRC, TEST_A], CAPTURED_AT), APPROVED_AT);
-      insertMinedTx(tx, LANDED, [LIB_C, TEST_C], COMMIT_AT);
+      const id = insertMinedTx(tx, LANDED, [LIB_C, TEST_C], COMMIT_AT);
       writeSignal(tx, landingRow(RUN, LANDED));
+      return id;
     });
     const pass = new GroupPass({ store: fromSignal.store, runs: () => [], now: () => NOW });
     assert.deepEqual(pass.run(), { checked: 1, landed: 1, joined: 1, indexed: 0 });
-    assert.equal(fromSignal.store.read(db => rootOf(db, `mined:${LANDED}`)), fromSignal.store.read(db => rootOf(db, runGroupId(RUN))));
+    assert.equal(fromSignal.store.read(db => rootOf(db, minedId)), fromSignal.store.read(db => rootOf(db, runGroupId(RUN))));
   } finally {
     fromSignal.cleanup();
   }
@@ -400,9 +377,9 @@ test("the groups pass joins a landing from either source", () => {
   // A run group older than 90 days is stamped and never joined, even when its run record names the commit.
   const old = open();
   try {
-    old.store.write(tx => {
+    const minedId = old.store.write(tx => {
       approveTx(tx, captureTx(tx, RUN, [SRC, TEST_A], OLD_CAPTURED_AT), OLD_APPROVED_AT);
-      insertMinedTx(tx, LANDED, [LIB_C, TEST_C], COMMIT_AT);
+      return insertMinedTx(tx, LANDED, [LIB_C, TEST_C], COMMIT_AT);
     });
     const run = { id: RUN, deliveryReceipt: { mergeCommit: LANDED } } as unknown as TeamRun;
     const pass = new GroupPass({ store: old.store, runs: () => [run], now: () => NOW });
@@ -411,7 +388,7 @@ test("the groups pass joins a landing from either source", () => {
       ...db.get<{ landing_ref: string | null; landing_checked_at: string | null }>(
         "SELECT landing_ref, landing_checked_at FROM eval_groups WHERE group_id = ?", runGroupId(RUN)),
     })), { landing_ref: null, landing_checked_at: NOW });
-    assert.notEqual(old.store.read(db => rootOf(db, `mined:${LANDED}`)), old.store.read(db => rootOf(db, runGroupId(RUN))));
+    assert.notEqual(old.store.read(db => rootOf(db, minedId)), old.store.read(db => rootOf(db, runGroupId(RUN))));
   } finally {
     old.cleanup();
   }

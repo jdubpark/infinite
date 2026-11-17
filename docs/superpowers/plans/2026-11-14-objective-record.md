@@ -1721,3 +1721,1089 @@ export interface RepoEnrollmentView { /* existing fields */; autonomyReady: bool
 - **The evaluator role** (step 5). The `evaluators` slot lands here; only the checker reads it.
 - **The router avoiding `evaluators` profiles for a cycle's tasks** ("Left to the builder" in the spec).
 - **Record screens** on the web, the phone, and the Mac, and the checker in the Swarm view.
+
+# Slice: tests and proposals
+
+This slice covers part 3 of spec `2026-11-13-objective-record-design.md` (status changes, the four test kinds, and proposals), part 8's step-4 items (the register in the record digest, and the autonomous sentence "propose an assumption"), and delivery order 4 with acceptance 5. After it, on a run that the owner opted in, host test receipts set assumption statuses, members propose assumptions through `finding` entries, and the owner records owner results through the owner route and the CLI; step 5 reads all three. It builds on steps 1 to 3 on `main` (the record, owner corrections, the digest, and the intent check) and on the blackboard member tools (C17).
+
+## Coordinator rulings (2026-11-17)
+
+These override the text below where the two differ.
+
+1. **The plan's calls stand.** Accepted as written:
+   - the register is off by default and pinned at `createRun`;
+   - tests read results the host already has, and run nothing;
+   - a member's proposed test never runs;
+   - receipts live in the run's sealed file;
+   - the owner records results through two owner ops on the owner route;
+   - the register digest has its own 6 KiB budget;
+   - an entry's citations are its `sources`;
+   - no goal gate waits for a pass.
+2. **Owner questions.** The build uses these defaults until the owner says otherwise:
+   - A refuted outcome assumption does not hold the next cycle before C18; it writes one event.
+   - Ratings run from 1 to 5 in halves.
+   - The proposal share stays at 300 log entries, 160 KiB, and 24 KiB capped.
+   - Member proposals wait for a later slice to adopt them.
+3. **Form B1.** The live team launcher is specific to each instance and is not in this repository. The repository carries only the test model of B1, Task 18's two flags in `tests/fixtures/team-agent.mjs`. Until the owner installs a launcher that admits B1, every artifact and citation result is `unknown` (`read-failed`), as this plan says. The launcher edit is prepared at the release and installed only on the owner's word.
+4. **Workers.** At most four implementers run at once. The first wave runs in two batches: Tasks 1, 3, 5, and 7, then Tasks 2, 4, 6, and 8. The later waves follow the plan's order, four tasks at a time.
+5. **Shared line budgets.** `teams.ts` grows by at most 6 lines on this branch. INF-291 adds at most 27 lines and INF-292 adds 5, so the composed tree stays at or under 5,745 of the 5,747 baseline. `goals.ts` changes only in place.
+
+**Off by default, and pinned when the run is created.** A new key, `project.team.objective.register`, takes `"on"` or `"off"` and has no default. It is inside the routine authority digest, because `digestedProjectTeam` strips only `eval`; writing it therefore blocks active routines until the owner approves them again. `createRun` pins `run.register = "on"` only when the key is `"on"` and the run is neither a mission subteam nor a handoff run. Otherwise the field stays absent, so views and sealed runs keep today's bytes. A run created before this slice never tests, even after a restart. Proposals also need `run.blackboard`, which C17's switch `config.teams.blackboard.tools` sets; that switch is also off by default and inside the digest. *(My call against part 3, which reads as always on: new behaviour stays off until a setting turns it on, and artifact and citation tests need a launcher form that the owner installs first.)*
+
+**A test reads a result the host already has, and its receipt is a host fact, not a verdict.** A command test reads the status that `check()` recorded in `run.checks` at the revision's final check round. That check ran through today's runner, `teamCommand`, in the disposable verification workspace that `prepareVerificationWorkspace` builds at the integrated head. It ran through `teams.commandPrefix`, within `teams.checkMinutes` per command (default 60, at most 240). The test never reads the output. A result counts only when its command's digest is one of the project's configured checks now. The rule is `testOf` in `objective-intent.ts`, which this slice exports and reuses; it writes no second rule. A check that a plan established under `establishChecks`, or a digest no longer configured, is therefore `unknown`. Artifact and citation tests read one blob at a pinned commit through one new read-only launcher form (B1). They keep only counts, a parse result, a form check, or a quote boolean. Each result is an `ObjectiveReceipt` (kind, subject, id, commit, outcome, time, and a detail of enumerations and counts), kept in the run's sealed file (`Stored.register`, outside `run`) and in no view. A receipt changes only an assumption from the intent check or the owner, and only when the outcome differs from its status. On a pinned assumption it only attaches its handle, and `unknown` changes nothing. Criteria get receipts but no state. *(My call: step 5 owns verdicts, the evaluator role, and `provisional-met`. It reads `TeamRegister.receipts(runId)` and the owner entries in the log.)*
+
+**A proposal is a recorded claim; the host never runs its test.** A member proposes through the `assumption` field of a `finding` entry, as part 3 says. The host screens the proposal at ingest. A new proposal becomes an `unchecked` assumption with origin `member`. A stance is attached to its assumption. Nothing else changes: no status, test, or criticality. A member assumption is never a test subject and never enters the record digest. The design names adoption as "the next intent check sorts every `unchecked` assumption", and step 3's intent check does not do that sorting. So in this slice nobody adopts a member assumption, and it stays `unchecked`. *(My call: running a test that a member wrote, against a repository that members wrote, would let member text decide a status.)*
+
+**The owner records owner results through the owner route only.** `POST /api/goals/:id/record` takes two new ops. `assumption.set` sets `verified` or `refuted` on an assumption whose test is `owner`, and pins it. `rating.record` takes a score from 1 to 5 in halves, stamped with the head and number of the goal's latest reviewed cycle. The route is owner only. Controllers and viewers get 403, and the relay refuses the path. Connectors, delegates, the coordinator, the permission agent, and members have no path. Owner values live in the record's log. *(My call: these two ops are a narrow form of part 2's owner register ops, which their own slice widens. Halves keep scores exact in binary floating point.)*
+
+**The register reaches prompts within its own budget.** When objective prompts and the register are both on, a goal cycle's digest (`TeamGoalContext.record`) gains `register`. It holds the assumptions that the intent check or the owner wrote, with their statuses, and the open questions. Its budget is 6 KiB, separate from the criteria's 6 KiB. In a run pinned `autonomous`, a role that posts findings with entry tools reads the propose sentence in place of "Ask for a user decision if a material scope decision is required." The prompt version gains the two register shapes, so routing evidence never mixes them with today's prompts. *(My calls against part 8: 32 assumptions of 500 bytes alone exceed 6 KiB, so a shared budget would drop criteria; and member text never enters a digest that prints as the owner's record.)*
+
+**Where the code and the design disagree.**
+
+- **Receipt storage.** No `GoalCycle.receipts` exists (part 5, the authority table). Receipts live in the run's sealed file, and step 5 copies what it reads into its own verdict storage.
+- **Owner values.** The record has no field for them, so ratings live in `rating.recorded` log entries.
+- **Adoption.** Step 3's intent check does not sort `unchecked` assumptions, so member assumptions wait unadopted (ruled above).
+- **The relay.** It allows `POST /api/goals/:id/outcome` (`remote-access.ts` line 47), so the design's phrase "as it refuses the outcome routes" is wrong. The relay refuses `/api/goals/:id/record` for every method, because its goal pattern (line 47) has no `record` branch; `tests/remote-access.test.ts` line 526 checks POST. Owner results rely on that refusal.
+- **The digest budget.** A 6 KiB digest cannot hold the register; it gets its own budget (ruled above).
+- **Citation fields.** Part 7 names no field that holds an artifact entry's citations, so this plan uses the entry's `sources` array (Task 4).
+- **Blob reads.** `teamCommand` keeps only the last 65,536 characters of output, so it cannot read a blob, and no launcher form reads blob content. Task 5 adds a streamed reader and form B1.
+- **Readers' findings.** C16 is not built, so a reader's `findings` result is not a proposal.
+- **Refuted outcome assumptions.** C18 is not built, so such a refutation does not hold the next cycle. One run event names it (owner question 1).
+- **Outside citations.** No host-held text exists for an outside citation, so an outside citation test is `unknown`. The `citations` and `citation-form` criteria are delivery step 7.
+- **The ingest hook.** Blackboard ingest has no hook for proposals, so Task 8 adds one.
+- **The brief's wording.** The coordinator's brief speaks of "criterion tests" and "criterion proposals". The design's four test kinds belong to assumptions, and criteria carry checks; members propose assumptions only. Criteria with a command or artifact check get receipts here.
+
+## Trust boundary, and what a review checks
+
+These inputs originate outside the host:
+
+- **Members.** A `finding` entry may carry `assumption` (Task 6). Every member post passes these checks before it is stored:
+  - At the entry route: the strict schema, the role's kinds, 20 posts and 64 KiB per attempt, and `findSecret` with the session's own credentials (422 `entry-secret`). The project manager posts no finding, so it cannot propose.
+  - At ingest, inside the store's transaction: the binding, the entry id, the role, and 400 member entries per run.
+  - At the host's screen (Task 10): the pin, a readable record, `testOf` (shape, and a command must be configured), `findSecret` with `{ token: "", url: "" }` (private key, access token, GitHub grant, and egress proxy password shapes), the target, and the caps.
+
+  Member text (the statement, `refutedBy`, the test, and the entry's summary) lands only in the sealed record. It never reaches a digest, a prompt, an event, a log line, an error body, or a plain column. The finding's body, including `assumption`, is stored on the blackboard as today, sealed in the entry body.
+- **Repositories.** The B1 form reads blob content at the reviewed head, or at a full commit id that the record names. A read is at most 1 MiB. The content is decoded and parsed in memory, then reduced to counts and booleans. None of it is stored, logged, printed, or sent.
+
+  The integration checkout is agent-writable. The six `-c` settings, `GIT_NO_REPLACE_OBJECTS=1`, and `GIT_NO_LAZY_FETCH=1` pin its configuration, hooks, object replacement, and lazy fetch. `cat-file blob` runs no filter and no textconv.
+
+  Members write the repository, so they can shape what an artifact test counts. A receipt is a fact about what the commit holds, not proof that the content is true: a test cannot tell fabricated entries from real ones.
+- **Git output.** The host reads the exit code and stdout bytes only, and discards stderr. A missing path and a failed read look the same, so both are `unknown`.
+- **Provider output.** A command test reads only the status that the host derived from an exit code, never the output. The intent check's tests are model output; step 3 screened them, and Task 9 reads them as stored.
+- **The owner.** Owner ops arrive with the owner device key and pass `applyOps`'s secret scan, as today. They carry ids, enumerations, and numbers only.
+- **Other device roles.** Controllers and viewers read the record (`GET`) and cannot write owner results (403). Relay devices can neither read nor write `/record`. Through the team view, every device sees `run.register` (an enumeration) and the register digest in `run.goal.record.register`, which holds intent-check and owner text only.
+
+What can reach prompt and context text:
+
+- **The register digest.** It holds the ids, statuses, criticalities, and statements of intent-check and owner assumptions, the open questions' ids and texts, and a count. Every text was screened by `findSecret` when it was written. It reaches the goal section of every member prompt and every context file of a goal cycle with prompts and the register on. The goal section comes early in the prompt, so the digest can fall inside the permission agent's 4,000-character read.
+- **The propose sentence.** Fixed text.
+- **Nothing else.** No receipt, log entry, proposal, member text, repository text, or credential reaches a prompt or a context file. A session's GitHub grant and egress proxy password cannot reach the record: the route scans with the session's own credentials, and the host screen scans again for their shapes.
+
+## Launcher forms
+
+One new form needs the owner's launcher approval. No other form changes.
+
+1. **New, B1: one blob at a pinned commit.** It runs in the run's integration checkout (`TeamRun.workspace`), after the six `-c` settings of `teamGitArgs`:
+
+   `git cat-file blob COMMIT:PATH`
+
+   - **Arguments.** `COMMIT:PATH` is one argument. COMMIT matches `/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/`. PATH passes `isScopedPath` (`goal-types.ts`), is at most 300 characters, and is not `.`.
+   - **Environment.** `teamGitEnvironment` (`GIT_NO_REPLACE_OBJECTS=1`, `GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0`, `GIT_CONFIG_NOSYSTEM=1`) plus `GIT_NO_LAZY_FETCH=1`. The launcher sets `GIT_NO_LAZY_FETCH=1` again after its `env_reset`.
+   - **Limits.** The output is read as a stream, at most 1,048,576 bytes; the reader closes stdout at the next byte. The time limit is 30 seconds.
+   - **While the launcher refuses it:** every artifact and citation result is `unknown` with `read: "read-failed"`, so neither kind changes a status. Command tests and owner results still work.
+
+**The launcher ends B1 by itself after 35 seconds,** as it ends the capture reads. The host may not signal a command that the launcher runs as another account. Until the launcher has this limit, a hung read counts as stalled. With 4 reads stalled, the host starts no new read until one of them ends.
+
+**Sizes.**
+
+- **A proposal.** One per finding:
+  - statement: 1 to 500 bytes;
+  - `refutedBy`: 1 to 500 bytes;
+  - test: JSON of at most 1,024 bytes;
+  - criticality: an enumeration;
+  - id: the record's ID rule.
+
+  It adds at most about 2.1 KiB to a finding body, inside the body's 12 KiB. The entry tool's input schema grows by about 1 KiB on runs with entry tools.
+- **Proposals in the record.**
+  - At most 4 new assumptions per attempt (member), 8 stances per assumption, and 32 assumptions.
+  - Proposals write only while the record's capped bytes stay at most 24 KiB, and the log stays under 300 entries and 160 KiB.
+- **Log entries.**
+  - `test.recorded`: at most 8 assumptions each.
+  - `rating.recorded`: at most 8 assumptions each.
+  - `proposal.recorded`: at most 4 assumptions added and 16 stances attached each.
+  - Every value is inline and at most 2 KiB.
+- **A pass.**
+  - At most 40 subjects and 40 distinct blob reads.
+  - Each read is at most 1 MiB and 30 seconds; the whole pass is at most 120 seconds.
+  - One pass runs at a time, and at most 4 reads are stalled.
+- **Receipts.** At most 40 per pass, each about 250 bytes. Only the latest pass is kept, so `Stored.register` stays under 12 KiB plus a dozen drop counts.
+- **The register digest.** At most 6,144 bytes, 32 assumptions, and 8 questions.
+- **A citation.**
+  - At most 2,000 characters, with a line span under 10,000.
+  - At most 32 sources are read per entry.
+- **A rating.** The score is 1 to 5 in halves. The subject follows the ID rule.
+- **The correction file.** Unchanged: 64 KiB.
+
+**Cost.**
+
+- **Register off.** `save` checks one field, and the tick makes one call that returns at once on an empty queue. A stored entry page costs one field check.
+- **Register on.** A settled revision gets one pass:
+  - two record parses;
+  - at most 40 sequential Git reads outside the serial queue (at most 40 MiB streamed, one blob in memory at a time);
+  - one or two sealed writes (the goal and the run, or the run alone).
+
+  A stored page that carries a proposal costs one record parse and at most one write.
+- **Scale.** No store statement, index, list route, or view reads anything new. The work grows with settled revisions and proposal pages, not with sessions or rows, so 1,000 sessions and 10,000 outcome rows change nothing.
+
+The slice must survive these sequences. Each has a named test.
+
+| Sequence | Expected | Test |
+|---|---|---|
+| No key; `register: "off"`; a mission subteam or handoff run; a run created before this slice, after a restart | No pass, no proposal applied, no register digest, no `run.register`, no `Stored.register`; prompts, context files, events, and views as today | Task 18 `without the register a run is as today`, `each new run pins the register by setting`; Task 3 `the register setting stands alone and pins only plain runs`; Task 12 `without the register the goal section is byte for byte` |
+| The key written, then a routine's next check | The routine blocks; without the key it keeps its authority | Task 3 `the register setting is inside the routine approval digest` |
+| Acceptance 5 | The contradicting finding attaches to a2, and a2 stays `unchecked`; the artifact test counts 31 qualifying entries, so a2 becomes `refuted` with its receipt handle; nobody is interrupted | Task 10 `acceptance 5, proposal side: a contradicting finding attaches and changes no status`; Task 9 `acceptance 5, test side: an artifact test counts qualifying entries`; Task 18 `acceptance 5 end to end` |
+| A command test on an unconfigured digest, a plan-established check, or an interrupted, running, or absent result | `unknown`; no status change; no command run | Task 9 `command tests read the final round and run nothing`; Task 18 `acceptance 5 end to end` (`commands.jsonl`) |
+| The launcher refuses B1 | Artifact and citation results `unknown` (`read-failed`); command tests still apply | Task 18 `a refused blob form leaves artifact results unknown` |
+| A blob over 1 MiB, a read past 30 seconds, a pass past 120 seconds, or 4 stalled reads | `too-large`, `read-failed`, or `not-run`; never a number; no new read while 4 are stalled | Task 5 `a blob read streams within its limits`; Task 17 `stalled reads stop the pass from reading`; Task 9 `unknown is never a number` |
+| A restart after the mark, during the reads, or between a goal record's write and the run's save | One pass and one `test.recorded` version | Task 17 `seeded runs with restarts write each pass once`; Task 18 `a restart while a pass reads runs it once` |
+| The same journal page ingested twice; a pass applied twice | Applied once | Task 10 `proposals apply once`; Task 17 `seeded runs with restarts write each pass once` |
+| Pages from three members in every order, with the assumption cap reached | The same set of proposals and the same drop counts; only the id numbering differs | Task 10 `the order of members' pages does not change the result` |
+| A steer, resume, or continuation (a new revision) while a pass reads | The old pass writes nothing; the new revision's pass runs | Task 17 `a pass never outlives its run or its revision` |
+| A run deleted while its pass reads | Nothing is written; the record keeps its earlier handles, which show as expired once their runs are gone | Task 17 `a pass never outlives its run or its revision` |
+| An unreadable record, or a goal record write that fails | The pass is skipped (`record-unavailable`, `write-failed`) with one event, and its receipts are kept; proposals are counted under the same reasons | Task 17 `a pass never outlives its run or its revision`, `proposals follow the pin and the record` |
+| No evidence store, or one that is unready or held | Proposals wait with the cursor, because the hook runs only on a stored page; tests and owner results work | Task 8 `the proposal hook sees only the posts the store holds`; Task 18 `without the register a run is as today` |
+| A log at its share | Receipts are kept and the write is skipped (`log-full`) with one event; proposals stop at their 300-entry share | Task 13 `a full log keeps the receipts and writes nothing`; Task 10 `bad proposals are dropped and counted, never echoed` |
+| A secret-shaped proposal or summary | 422 at the route; dropped (`secret`) at the host screen if it gets that far; never in the record, a log entry, an event, or an error | Task 10 `bad proposals are dropped and counted, never echoed` |
+| A member assumption that names a test | Stored, never run, never in the digest | Task 9 `a pass plans at most 40 subjects and 40 distinct reads`; Task 3 `the register digest has its own budget and no member text` |
+| An owner result from a controller, a viewer, or the relay; with the register off | 403; refused by the relay; 409 `objective-register-off` | Task 15 `owner results take the owner route only`; `tests/remote-access.test.ts` `the relay refuses corrections` |
+| A rating before any reviewed cycle | 409 `objective-rating-no-head` | Task 11 `a rating stamps the reviewed head and moves unpinned owner tests`; Task 15 `a rating needs a reviewed cycle` |
+| Random register writes, intent applies, and owner ops, with a reload between steps | Every version rebuilds and parses | Task 17 `every version rebuilds after random register writes` |
+| A rollback to a host without this slice | See the right column | No test. `docs/teams.md` lists the steps before a rollback (Task 19). The old strict schema refuses a config with `objective.register`, so remove the key first. A pending goal launch whose digest holds `register` fails the old strict `teamGoalContextSchema` and blocks that goal. A record with register entries parses (`OP_RE` accepts the ops), but versions before them answer 409 `objective-version-unavailable`; the latest version still reads. An old host ignores `run.register` and `Stored.register`. It skips journal posts whose finding carries `assumption`, because its strict envelope schema refuses them, so those findings never reach its board; its entry route refuses new ones with 400. |
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `packages/host/src/objective-write.ts` (create) | Pure: shared record writes (next id, next seq, log room, sealing several entries at one version) |
+| `packages/host/src/objective-intent.ts` (modify) | Uses `objective-write.ts`; exports `testOf` |
+| `packages/host/src/objective-holder.ts` (create) | Reading and writing a record in its place: a goal's through the port, a standalone run's on its holder |
+| `packages/host/src/team-intent.ts` (modify) | Uses `objective-holder.ts` |
+| `packages/host/src/team-types.ts` (modify) | The setting, `TeamRun.register`, and the register digest schema with its budget |
+| `packages/host/src/objective-digest.ts` (modify) | The pin, the switch reader, the register digest, and the prompt shape |
+| `packages/host/src/objective-citations.ts` (create) | Pure: the citation form, the qualifying-entry count, and the quote match |
+| `packages/host/src/git-stream.ts` (create), `eval-git.ts` (modify) | Bounded streamed Git reads (moved from `eval-git.ts`), form B1, and the blob reader |
+| `packages/host/src/evidence/member-proposal.ts` (create), `evidence/member-entry.ts`, `intent-report.ts`, `objective-types.ts` (modify) | The `assumption` field of a finding |
+| `packages/host/src/objective-record.ts` (modify) | The register op names, their undo, and four error codes |
+| `packages/host/src/evidence/blackboard.ts`, `team-entry-ingest.ts` (modify) | Which posts the store holds; the proposal hook |
+| `packages/host/src/objective-receipts.ts` (create) | Pure: a pass's subjects and reads, and its receipts |
+| `packages/host/src/objective-proposals.ts` (create) | Pure: screening and applying one page of proposals |
+| `packages/host/src/objective-input.ts`, `objective-ops.ts` (modify) | The two owner ops |
+| `packages/host/src/register-prompt.ts` (create), `team-prompts.ts` (modify) | The register text and the scope sentence |
+| `packages/host/src/objective-register.ts` (create) | Pure: applying receipts to the record |
+| `packages/host/src/config-identity.ts`, `routing-auto.ts`, `routing-reads.ts`, `routing-routes.ts` (modify) | The prompt version's register shapes |
+| `packages/host/src/objective-goals.ts`, `goals.ts` (modify) | The correction gate, the rating stamp, and the goal digest's register |
+| `packages/host/src/objective-cli.ts` (modify) | `set-assumption` and `rate` |
+| `packages/host/src/team-register.ts` (create) | The runtime: mark, restore, drain, the pass, proposals, the events |
+| `packages/host/src/teams.ts` (modify) | Six one-line hooks and six lines changed in place (Task 18) |
+| `tests/fixtures/team-agent.mjs` (modify) | Two flags of the fake command prefix |
+| `docs/teams.md`, the spec (modify) | The setting, the form, the ops, the rollback steps, and the amendments |
+| `tests/{objective-write,register-schemas,objective-citations,git-stream,member-proposal,objective-receipts,objective-proposals,register-prompt,objective-register,register-goals,team-register,register-rebuild,register-host}.test.ts` (create); `tests/{objective-digest,routines,objective-record,blackboard-ingest,team-entry-ingest,objective-ops,config-identity,objective-cli,autonomy-pins}.test.ts` (modify) | Pure rules, the runtime with a fake host, and the host on the scheduler fixture |
+
+**Touch points in `teams.ts` and `goals.ts`.**
+
+- **`teams.ts`.** Only Task 18 writes it, and only the lines it lists (+6: from 5,707 to 5,713, baseline 5,747).
+- **`goals.ts`.** Only Task 15 writes it, and only lines 20, 21, 538, 548, 549, and 853, each changed in place (net 0: 1,034, baseline 1,042).
+- **Not touched:** `server.ts`, `client.ts`, `team-cli.ts`, `missions.ts`, `tests/teams.test.ts`, and `tests/goals.test.ts`.
+
+**Order and owners.**
+
+- **First wave, in parallel:** Tasks 1, 2, 3, 4, 5, 6, 7, and 8.
+- **Second wave, in parallel:** Task 9 (needs 4 and 5), Task 10 (needs 1 and 6), Task 11 (needs 7), and Task 12 (needs 3).
+- **Third wave, in parallel:** Task 13 (needs 1 and 9), Task 14 (needs 3 and 12), Task 15 (needs 3 and 11), and Task 16 (needs 11).
+- **Then, one at a time:** Task 17 (needs 2, 5, 9, 10, 11, and 13), Task 18 (needs 3, 6, 8, 14, and 17), and Task 19.
+
+**One writer per file.** No file has two writers in this slice. Every name, signature, limit, status code, entry shape, and test name below is fixed, so the workers of one wave never need to talk.
+
+**Line numbers.** Every line number is on the reference tree: `main` `3c4e15b9` with PRs #174, #175, and #176. Each edit quotes the code it changes, so a worker finds it by that code if `main` moves. Within a task, apply edits from the bottom up.
+
+**Checks.**
+
+- `check:size` holds after every task. Each task confirms its counts with `wc -l`. Every new file stays under 1,000 lines; the largest, `team-register.ts`, is expected near 380.
+- The host typecheck does not cover `tests/`, so each task runs its test files. A task reports any cancelled test as a failure.
+
+**Workers.**
+
+- Every worker in a worktree is told never to use `git stash`. It compares with `git show HEAD:<path>` and sets work aside with a WIP commit.
+- Workers run test batches that start a host in the background, so a steer can reach them.
+
+**Lessons from earlier waves.**
+
+- **No new status, role, or report kind.** `save` writes no new outcome event, and the outcome ledger records nothing new. The fuse and a goal's member budget count no new member: a cycle spends the members it spends today. `REPORT_SAMPLES` and the fake agents need no new entry; the only fixture change is Task 18's two prefix flags.
+- **Byte pins.** Tests that pin bytes from the base commit (Tasks 3, 6, and 12) re-pin from `main`'s own output when the build starts, because prompt bytes move whenever `main` changes a prompt.
+- **Goal tests.** A test that runs goal cycles with a fake agent (Task 15) sets `objective.intentCheck: "off"` and writes the fake agent's plan-brief flag file.
+- **Signals.** No test signals a child that already ended (macOS answers EPERM), runs a real launcher's stop (`kill -1`), or runs a launcher as root. Task 5 injects a `stop` that returns false.
+
+## Review Focus
+
+1. **A status set by anything but a host receipt or an owner direction.** A member proposal, member text, an unread blob, or an `unknown` result that changes a status, or a receipt that moves a pinned assumption. Expect none.
+   - Tests: Task 13 `pinned and member assumptions keep their status` and `receipts set statuses only where the outcome differs`; Task 9 `unknown is never a number`; Task 10 `acceptance 5, proposal side: a contradicting finding attaches and changes no status`.
+   - Lines whose deletion the tests must catch:
+     - in `applyReceipts`, the line that skips an `unknown` outcome and the line that skips origin `member`;
+     - in `receiptsFor`, the artifact branch's return of `unknown` when the blob did not read;
+     - in `applyProposals`, the new assumption's `status: "unchecked"`; changing it to `"assumed"` must fail.
+2. **A command run, or a read past its bounds.** Expect only B1 lines in the prefix log.
+   - Tests: Task 9 `command tests read the final round and run nothing`; Task 18 `acceptance 5 end to end`, which checks `commands.jsonl`; Task 5 `a blob read is one bounded form` and `a blob read streams within its limits`.
+   - Lines:
+     - in `receiptsFor`, the check that the digest is one of the configured checks now;
+     - in `readGitStream`, the line that decides `too-large` past `maxBytes`;
+     - in `blobArgs`, the `COMMIT_ID` check and the `isScopedPath` check.
+3. **Something on by default.** Expect today's bytes without the key.
+   - Tests: Task 18 `without the register a run is as today` and `each new run pins the register by setting`; Task 3 `the register setting is inside the routine approval digest` and `the register setting stands alone and pins only plain runs`; Task 12 `without the register the goal section is byte for byte`; Task 14 `the register changes the prompt version only where the prompt changes`.
+   - Lines:
+     - `registerPin`'s `setting === "on"` check;
+     - the `run.register !== "on"` guards in `mark` and `propose`;
+     - `goalRecordDigest`'s `if (register)`.
+4. **A lost or doubled write.** A proposal applied twice, a pass written twice, or an old pass overwriting a newer one after a restart or a new revision. Expect one write per page and per pass.
+   - Tests: Task 10 `proposals apply once`; Task 17 `seeded runs with restarts write each pass once` and `a pass never outlives its run or its revision`; Task 18 `a restart while a pass reads runs it once`.
+   - Lines:
+     - in `applyProposals`, the entry-id check;
+     - in the pass's apply step, the guard that `register.pass` is still this pass object;
+     - in `applyReceipts`, the `undefined` return when nothing changes; without it, every pass writes a version.
+5. **Member text or a credential where it must not be.** Member text in the digest, a prompt, an event, a log line, or a view; a secret-shaped proposal in the record; receipts in a view. Expect none.
+   - Tests: Task 3 `the register digest has its own budget and no member text`; Task 10 `bad proposals are dropped and counted, never echoed`; Task 18 `the view shows the pin and nothing else`.
+   - Lines:
+     - in `registerDigestFor`, the `origin !== "member"` filter;
+     - in `applyProposals`, the `findSecret` call;
+     - `Stored.register` kept outside `run`; moving the receipts into `run` must fail the view test.
+
+### Task 1: shared record writes
+
+**Files:** `packages/host/src/objective-write.ts` (create), `packages/host/src/objective-intent.ts`, `tests/objective-write.test.ts` (create). Runs first.
+
+**Interfaces (produces):** pure.
+```ts
+// objective-write.ts: imports objective-types, objective-record, and objective-ops only.
+/** `prefix` and one more than the highest number with that prefix among `existing`; never reused. Moved from objective-intent.ts `nextId`. */
+export function nextRecordId(prefix: string, existing: readonly string[]): string;
+export function nextSeq(record: ObjectiveRecord): number;
+export type LogRoom = { entries: number; bytes: number };
+/** Throws objectiveError("objective-log-full") when the log plus `entries` passes `room` (default CORRECTION_LOG: 380 entries, 210 KiB). */
+export function assertLogRoom(record: ObjectiveRecord, entries: readonly LogEntry[], room?: LogRoom): void;
+/** Seals the record at entries[0].version with every entry appended; every entry carries that version.
+ *  Throws objectiveError("objective-op-refused") when objectiveRecordSchema refuses the result. Generalizes objective-intent.ts `finish`. */
+export function sealRecord(record: ObjectiveRecord, changes: Partial<ObjectiveRecord>, entries: readonly LogEntry[]): ObjectiveRecord;
+
+// objective-intent.ts: nextId, assertRoom, finish, and nextSeq are removed; their callers use the four functions above
+//   (finish(r, c, e) becomes sealRecord(r, c, [e]); assertRoom(r, e) becomes assertLogRoom(r, [e])). testOf becomes exported, unchanged:
+export type TestVerdict = { ok: true; value: AssumptionTest } | { ok: false; drop: "shape" | "command" };
+export function testOf(test: unknown, configured: readonly TeamCommand[]): TestVerdict;
+```
+
+**Decisions:**
+
+- **A move, not a change.** The intent check writes the same bytes; `tests/objective-intent.test.ts` passes unchanged.
+- **The single command rule.** `testOf` is the only rule for a command test: it must name a configured check by `commandDigest`. Task 10 calls it, and no task writes another.
+
+- [ ] **Step 1: Write the failing test.**
+
+| Test name | Assertions |
+|---|---|
+| `record writes seal one version with every entry` | `sealRecord` with three entries at version v + 1 gives version v + 1, three more log entries, and `digest` equal to `recordDigest` of the body. A result that the schema refuses throws `objective-op-refused`. `assertLogRoom` at 380 entries plus one throws `objective-log-full`, and at 300 entries with `{ entries: 300, bytes: 160 * 1024 }` it throws too. `nextRecordId("a", ["a1", "a3", "q9"])` is `a4`. |
+
+- [ ] **Step 2: Run and confirm it fails.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/objective-write.test.ts tests/objective-intent.test.ts tests/objective-record.test.ts` and the host typecheck.
+
+### Task 2: the record holder
+
+**Files:** `packages/host/src/objective-holder.ts` (create), `packages/host/src/team-intent.ts` (lines 503 to 525: the bodies of `stateOfRecord` and `writeRecord` call the new functions). Runs first.
+
+**Interfaces (produces):**
+```ts
+// objective-holder.ts
+export type RecordHolder = { run: TeamRun; objectiveRecord?: unknown };
+/** A goal run's record through the port; a standalone run's from its holder. Unreadable, or a goal run without a port, is unavailable. Never throws. */
+export function heldRecordState(holder: RecordHolder, goals: GoalRecordPort | undefined): ObjectiveState;
+/** A goal run's through the port, which throws objectiveError("objective-version-stale") or rethrows a failed save after restoring;
+ *  a standalone run's on the holder. Throws Error when a goal run has no port. */
+export function writeHeldRecord(holder: RecordHolder, goals: GoalRecordPort | undefined, previous: ObjectiveRecord, next: ObjectiveRecord): void;
+```
+
+**Decisions:** a move. The intent check and the register read and write records the same way, through one pair of functions.
+
+- [ ] **Step 1: No new test.** **Step 2: Move the code.** **Step 3: Run** `node --import tsx --test tests/team-intent.test.ts tests/objective-intent.test.ts tests/objective-goals.test.ts` and the host typecheck. All pass unchanged.
+
+### Task 3: the setting, the pin, and the register digest
+
+**Files:** `packages/host/src/team-types.ts`, `packages/host/src/objective-digest.ts`, `tests/register-schemas.test.ts` (create), `tests/objective-digest.test.ts`, `tests/routines.test.ts`. Runs first.
+
+**Interfaces (produces):**
+```ts
+// team-types.ts
+// teamProjectSchema line 236: objective gains register: z.enum(["on", "off"]).optional()   — no default
+// TeamRun gains, after intentCheck (line 688):
+//   /** Pinned by createRun when the project's register is on; absent otherwise and on runs created before the register existed. */
+//   register?: "on";
+export const RECORD_REGISTER_BYTES = 6 * 1024;
+export const registerDigestSchema = z.strictObject({
+  assumptions: z.array(z.strictObject({ id: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/), status: z.enum(["refuted", "unchecked", "assumed", "verified"]),
+    criticality: z.enum(["outcome", "plan", "detail"]), statement: z.string() /* 1 to 500 bytes */ })).max(32),
+  questions: z.array(z.strictObject({ id: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/), text: z.string() /* 1 to 1,000 bytes */ })).max(8),
+  omitted: z.number().int().min(1).max(40).optional(),
+}).superRefine(/* the byte bounds, and registerDigestBytes ≤ RECORD_REGISTER_BYTES */);
+export type RegisterDigest = z.infer<typeof registerDigestSchema>;
+export function registerDigestBytes(register: RegisterDigest): number;   // Buffer.byteLength(JSON.stringify(register))
+// recordDigestSchema gains, as its last key: register: registerDigestSchema.optional()
+// recordDigestBytes, in place (line 454): counts the digest without `register`, so a digest without one counts exactly as today.
+
+// objective-digest.ts
+export function objectiveRegisterOn(project: Pick<Project, "team"> | undefined): boolean;   // true only for "on"
+/** The run pin: true only for setting "on" on a run that is neither a mission subteam nor a handoff run. */
+export function registerPin(input: { setting?: "on" | "off"; mission: boolean; handoff: boolean }): boolean;
+/** Assumptions of origin intent-check or owner, then open questions, in the fixed order, cut at RECORD_REGISTER_BYTES with the rest counted in `omitted`. */
+export function registerDigestFor(record: ObjectiveRecord): RegisterDigest;
+export type ObjectivePrompt = boolean | "register" | "register-autonomous";
+/** A live run's prompt shape: false without a record digest; true with a digest without a register; else by the run's pinned mode (autonomyOf). */
+export function objectivePromptOf(run: Pick<TeamRun, "goal" | "autonomy">): ObjectivePrompt;
+/** The shape a new run of `project` would render in `mode`: false with prompts off; true with the register off; else by `mode`. */
+export function objectivePromptFor(project: Pick<Project, "team"> | undefined, mode: AutonomyMode): ObjectivePrompt;
+```
+
+**Decisions:**
+
+- **No default.** Without the key, every routine digest, prompt, and context is unchanged. Writing the key changes `RoutineService.authority`, because `digestedProjectTeam` strips only `eval`. The key stays inside that digest, as C11 asks of anything that changes what a routine's runs do.
+- **The order.** First by status (refuted, unchecked, assumed, verified), then by criticality (outcome, plan, detail), then by id number; then the open questions in record order.
+- **The cut.** Each item enters whole or not at all. The first item that would pass 6,144 bytes stops the list, and `omitted` counts every assumption and question left out.
+- **Member assumptions.** They never enter, and `omitted` does not count them.
+- **Every register assumption counts.** The record has no retired state for assumptions.
+- **Two independent switches.** With `objective.prompts` off, nothing reaches prompts. With `objective.register` off, no digest has a register.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `the register setting stands alone and pins only plain runs` (register-schemas) | **Parsing.** `{ register: "on" }` and `{ register: "off", intentCheck: "off" }` parse; `{ register: "maybe" }` and an unknown key are refused. **The pin.** `registerPin` is true only for `{ setting: "on", mission: false, handoff: false }`. It is false for an absent setting, `"off"`, a mission subteam, and a handoff run. **The digest.** A digest whose register is over 6,144 bytes is refused. A digest with 6 KiB of criteria and a maximal register within 6,144 bytes parses. `JSON.stringify` of a digest without a register equals the string pinned from the base commit, and so does its `recordDigestBytes`. |
+| `the register digest has its own budget and no member text` (objective-digest) | The record has 32 assumptions (origins intent-check, owner, and member, across every status and criticality) and 8 open questions. In `registerDigestFor`'s result: no member-origin id appears; the order rule holds; `registerDigestBytes` is at most 6,144; `omitted` equals the number of non-member assumptions and questions left out. A record with neither gives `{ assumptions: [], questions: [] }` with no `omitted`. |
+| `the objective prompt shape follows the digest, the register, and the mode` (objective-digest) | **`objectivePromptOf`.** No goal record gives false. A record without a register gives true. With a register, an unpinned or `supervised` run gives `"register"` and an `autonomous` one `"register-autonomous"`. **`objectivePromptFor`.** Prompts off gives false; prompts on with the register off gives true; both on gives the shape by mode. |
+| `the register setting is inside the routine approval digest` (routines) | The pattern of step 2's test. A routine keeps its stored authority across a reload without the key. It blocks at its next check after the project gains `objective: { register: "on" }`. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/register-schemas.test.ts tests/objective-digest.test.ts tests/routines.test.ts tests/intent-schemas.test.ts` and the host typecheck.
+
+### Task 4: citations
+
+**Files:** `packages/host/src/objective-citations.ts` (create), `tests/objective-citations.test.ts` (create). Runs first.
+
+**Interfaces (produces):** pure.
+```ts
+export const CITATION_LIMITS = { chars: 2_000, lineSpan: 10_000, sourcesPerEntry: 32 } as const;
+export type RepositoryCitation = { kind: "repository"; path: string; lines?: { from: number; to: number }; commit?: string };
+export type OutsideCitation = { kind: "outside"; host: string };
+/** Form only: `path`, `path#Lfrom`, `path#Lfrom-Lto`, each with an optional `@commit`, or an https URL. Undefined for anything else. */
+export function parseCitation(text: string): RepositoryCitation | OutsideCitation | undefined;
+/** Array elements whose first 32 `sources` strings hold at least `perEntry` form-valid citations; outside citations count once per host. */
+export function qualifyingEntries(entries: readonly unknown[], perEntry: number): number;
+/** Whether `quote` appears in `text`, or in its lines `from` to `to`, after folding every whitespace run to one space and trimming.
+ *  Lines are split on "\n" with a trailing "\r" removed; lines past the end are absent. */
+export function quotePresent(text: string, quote: string, lines?: { from: number; to: number }): boolean;
+```
+
+**Decisions:**
+
+- **A repository path.** It passes `isScopedPath`, is at most 300 characters, and is not `.`. Lines are written `#L<from>` or `#L<from>-L<to>`, with 1 ≤ from ≤ to and to − from < 10,000. A commit is 40 or 64 lowercase hexadecimal characters.
+- **An outside citation.** It is an `https:` URL that `new URL` parses and that has a host; the host is lowercased. `http:` and every other scheme are refused. *(My call: the design names no scheme, and https keeps the form check strict.)*
+- **An entry's citations are the strings in its `sources` array.** Only the first 32 elements are read, and a non-string element counts as invalid. *(My call: part 7 names no field that holds an entry's citations.)*
+- **The check is form only, as part 7 says.** It reads no blob and no outside text.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `citations parse by form only` | **Repository.** `src/a.ts`, `src/a.ts#L7`, `src/a.ts#L10-L24`, `src/a.ts@<40 hex>`, and `docs/b.md#L1-L2@<64 hex>` parse as repository citations. **Outside.** `https://Example.com/x` parses as outside, with host `example.com`. **Refused:** `../a`, `/abs`, `.`, `.git/config`, `a.ts#L0`, `a.ts#L5-L4`, `a.ts#L1-L10001`, an uppercase commit, `http://example.com/x`, `ftp://example.com/x`, and a 2,001-character string. |
+| `qualifying entries count form-valid citations, one per outside host` | **At `perEntry` 2.** `{ sources: ["a.md#L1-L2", "https://a.example/1"] }` qualifies. `{ sources: ["https://a.example/1", "https://a.example/2"] }` does not, because both are on one host. **Never:** a string, null, an object without `sources`, and `{ sources: "a.md" }`. **The 32-source cut.** An entry whose second valid source is its 33rd does not qualify. |
+| `a quote is present only in the cited lines after whitespace folding` | In `"a\r\n  b   c\nd"`, the quote `b c` is present in lines 2 to 2 and in the whole text. It is absent in lines 3 to 3 and in lines 4 to 9. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/objective-citations.test.ts` and the host typecheck.
+
+### Task 5: streamed Git reads and form B1
+
+**Files:** `packages/host/src/git-stream.ts` (create), `packages/host/src/eval-git.ts`, `tests/git-stream.test.ts` (create). Runs first. `tests/eval-git.test.ts` is not edited and must pass.
+
+**Interfaces (produces):**
+```ts
+// git-stream.ts
+export type StreamRead = { state: "read"; bytes: Buffer } | { state: "too-large" } | { state: "failed" };
+/** Moved from eval-git.ts unchanged. */
+export function stopGroup(child: ChildProcess): boolean;
+export type GitStreamInput = {
+  cwd: string; args: readonly string[]; prefix: TeamCommand | undefined; maxBytes: number; timeoutMs: number; signal: AbortSignal;
+  stop: (child: ChildProcess) => boolean; releaseMs: number; env?: Record<string, string>;
+  /** Called once, when the answer is decided, before the child closes. */
+  decided?: (read: StreamRead) => void;
+};
+/** eval-git.ts readPatch's body with the arguments, the byte limit, and extra environment as inputs. Spawns with teamGitEnvironment(env).
+ *  Settles when the child closes, as readPatch did. */
+export function readGitStream(input: GitStreamInput): Promise<StreamRead>;
+export const BLOB_MAX_BYTES = 1_048_576, BLOB_READ_MS = 30_000, BLOB_RELEASE_MS = 1_000, BLOB_PATH_CHARS = 300;
+/** Form B1 after the six settings: ["cat-file", "blob", `${commit}:${path}`].
+ *  Throws TypeError for an id that fails COMMIT_ID, or a path that fails isScopedPath, is ".", or is over 300 characters. */
+export function blobArgs(commit: string, path: string): string[];
+export type BlobReader = {
+  /** Resolves when the answer is decided. A child that the stop could not end counts as stalled until it closes. Never throws. */
+  read(cwd: string, commit: string, path: string, signal: AbortSignal): Promise<StreamRead>;
+  stalled(): number;
+};
+/** Reads through `prefix()` with teamGitArgs(cwd, blobArgs(…)) and env { GIT_NO_LAZY_FETCH: "1" }. */
+export function blobReader(prefix: () => TeamCommand | undefined,
+  options?: { timeoutMs?: number; stop?: (child: ChildProcess) => boolean; releaseMs?: number }): BlobReader;
+
+// eval-git.ts: readPatch keeps its signature, builds teamGitArgs(cwd, patchArgs(from, to)) in its try as today, and returns
+//   readGitStream({ cwd, args, prefix, maxBytes: PATCH_MAX_BYTES, timeoutMs, signal, stop, releaseMs }). stopGroup is imported.
+```
+
+**Decisions:**
+
+- **The move is byte for byte**, except for three new inputs (`args`, `maxBytes`, `env`) and the `decided` callback. Eval capture keeps its behaviour, including settling at the child's close.
+- **The blob reader answers at the decision**, so a pass never waits on a child that the launcher keeps alive. `stalled()` counts those children until they close.
+- **Refused arguments start nothing.** A read that `blobArgs` refuses starts no child and resolves `failed`.
+
+- [ ] **Step 1: Write the failing tests.** The test builds its own repository with git and no prefix. No test runs a launcher's stop or runs as root.
+
+| Test name | Assertions |
+|---|---|
+| `a blob read is one bounded form` | **The form.** `blobArgs` of a 40-hex id and `docs/a.json` is exactly `["cat-file", "blob", "<id>:docs/a.json"]`, and a 64-hex id works. **Refusals.** An uppercase id, a 39-character id, `../a`, `a:b`, `.`, `.git/x`, a 301-character path, and a path with a control character each throw TypeError. A reader given a refused path resolves `failed`, and its fake prefix records nothing. |
+| `a blob read streams within its limits` | **Results.** A 10-byte blob reads with its bytes; a 1,048,577-byte blob is `too-large`; a missing path is `failed`. **The fake prefix.** The prefix is a node script that writes its argv and environment to a file, then runs git. The argv is the six settings followed by B1, and the environment holds `GIT_NO_LAZY_FETCH=1`. **A stalled read.** The prefix waits for a release file; `timeoutMs` is 200; the `stop` returns false. The read resolves `failed` after about 200 ms, and `stalled()` is 1. It returns to 0 after the test writes the release file and the child closes. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/git-stream.test.ts tests/eval-git.test.ts tests/eval-capture.test.ts` and the host typecheck.
+
+### Task 6: the proposal field
+
+**Files:** `packages/host/src/evidence/member-proposal.ts` (create), `packages/host/src/evidence/member-entry.ts` (+1), `tests/member-proposal.test.ts` (create). Two one-word changes in place: `export` on `bytes` and `boundedJson` in `packages/host/src/intent-report.ts` (lines 19 and 21), and on `ID_RE` in `packages/host/src/objective-types.ts` (line 66). Runs first.
+
+**Interfaces (produces):**
+```ts
+// member-proposal.ts: imports zod, ../intent-report.js (bytes, boundedJson), and ../objective-types.js (ID_RE).
+//   No cycle: objective-types imports only node:crypto, zod, evidence/crypto, and goal-types, whose team-types import is type only.
+export const PROPOSAL_FIELD_LIMITS = { statementBytes: 500, refutedByBytes: 500, testBytes: 1_024 } as const;
+export type MemberProposal =
+  | { id: string; stance: "supports" | "contradicts" }
+  | { propose: { statement: string; refutedBy: string; test: unknown; criticality: "outcome" | "plan" | "detail" } };
+/** Strict. `id` uses the record's own ID rule (ID_RE), so the two never drift; `test` is bounded JSON of at most 1,024 bytes. */
+export const memberProposalSchema: z.ZodType<MemberProposal>;
+// member-entry.ts
+// findingBody (lines 49 to 51): after line 50 (`items: …`), add `assumption: memberProposalSchema.optional(),`   +1
+// FIELD_NAMES (line 157) gains: "assumption", "propose", "id", "stance", "statement", "refutedBy", "test", "criticality"
+```
+
+**Decisions:**
+
+- **Where the field lives.** One proposal per finding, in its body, as part 3 says. Only `finding` has the field, and the project manager posts no finding.
+- **Existing limits still apply:** the body's 12 KiB, and the route's 20 posts and 64 KiB per attempt.
+- **The tool schema.** The entry tool's input schema (`team-mcp.ts`, built from `memberEntryPostSchema`) gains the optional field on every run with entry tools. No prompt, context file, or prompt version changes, and no test pins the schema's bytes. *(My call: a schema per register pin would need a second switch in `team-mcp.ts` for a field that a member can omit. On a run without the pin, the field is stored with the finding and changes nothing.)*
+- **Entry ids.** `memberEntryId` hashes the canonical entry, so an entry without the field keeps its id.
+
+- [ ] **Step 1: Write the failing test.**
+
+| Test name | Assertions |
+|---|---|
+| `a finding may name one assumption` | **Accepted.** `memberEntryPostSchema` parses a finding with `assumption: { id: "a2", stance: "contradicts" }`, and one with `assumption: { propose: { statement, refutedBy, test: { kind: "artifact", path: "research/entries.json", count: "/entries", threshold: { kind: "count", min: 40 } }, criticality: "plan" } }`. **Refused:** a contract with `assumption`; both `id` and `propose`; a 501-byte statement; a 1,025-byte test; criticality `major`; stance `neutral`; an unknown key. **Refusal path.** For the long statement, `refusalPath` gives `entry.body.assumption.propose.statement`. **Ids.** `memberEntryId` of a finding without the field equals the id pinned from the base commit. **The tool schema.** `z.toJSONSchema(z.object({ entry: memberEntryPostSchema }).strict(), { target: "draft-7", io: "input" })` does not throw and names `assumption`. |
+
+- [ ] **Step 2: Run and confirm it fails.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/member-proposal.test.ts tests/member-entry.test.ts tests/team-entry-route.test.ts tests/intent-schemas.test.ts` and the host typecheck.
+
+### Task 7: the rebuild and the error codes
+
+**Files:** `packages/host/src/objective-record.ts`, `tests/objective-record.test.ts`. Runs first.
+
+**Interfaces (produces):**
+```ts
+export const REGISTER_OPS = { tested: "test.recorded", proposed: "proposal.recorded", set: "assumption.set", rated: "rating.recorded" } as const;
+// ObjectiveErrorCode and OBJECTIVE_ERRORS gain:
+//   "objective-register-off":      409 "Turn on the assumption register for this goal's project before recording owner results."
+//   "objective-assumption-target": 409 "A correction names an assumption that is missing or has no owner test."
+//   "objective-rating-subject":    409 "A rating names a subject that no active criterion or owner test names."
+//   "objective-rating-no-head":    409 "The goal has no reviewed cycle to rate yet."
+export function rebuildVersion(record: ObjectiveRecord, version: number): ObjectiveRecord;   // signature unchanged
+```
+
+**The entry shapes.** Tasks 10, 11, and 13 write these entries, and every value is inline. In each shape, `replaced` is the earlier handle with the same prefix and its index in `evidence`.
+
+- **`test.recorded`.**
+  - Actor `host`, authority `receipt`, target the run id, handle `receipt:<runId>:<revision>`.
+  - `before`: `{ assumptions: [{ id, status, replaced?: { handle, at } }] }`.
+  - `after`: `{ revision, kind, changed: [{ id, status }] }`.
+  - At most 8 assumptions per entry, and every entry of a pass shares one version.
+  - Each assumption's new handle is `<handle>:<id>`, last in its `evidence`.
+- **`proposal.recorded`.**
+  - Actor `member`, authority `claim`, target the member id, handle the run id.
+  - `after`: `{ revision, added: [id…], addedDigest, attached: [{ id, entryId }…] }`. No `before`.
+  - At most 4 added and 16 attached per entry.
+  - `addedDigest` is the SHA-256 hex of the canonical JSON of the added assumptions as written.
+- **`assumption.set`.**
+  - Actor `owner`, authority `direction`, target the assumption id, handle the request id.
+  - `before`: `{ status, ownerPinned?, replaced? }`. `after`: `{ status }`.
+  - The new handle `owner:<requestId>` is last.
+- **`rating.recorded`.**
+  - Actor `owner`, authority `direction`, target the subject, handle the request id.
+  - `before`: `{ assumptions: [{ id, status, replaced? }] }`.
+  - `after`: `{ subject, score, commit, cycle, changed: [{ id, status }] }`.
+  - At most 8 assumptions per entry, and at least one entry even when nothing changes.
+  - Each changed assumption's new handle is `rating:<requestId>`.
+
+**Decisions:**
+
+- **Undo in reverse `seq` order:**
+  - **`test.recorded` and `rating.recorded`.** For each assumption in `before`, the current status must equal the one in `after`, and its last handle must be the entry's (`<handle>:<id>`, or `rating:<handle>`). The undo removes the last handle, puts `replaced` back at its index, and restores the status.
+  - **`proposal.recorded`.** The current assumptions named in `added`, in record order, must hash to `addedDigest`; the undo removes them. For each `attached` item, in reverse, its assumption's last proposal must carry that `entryId`; the undo removes it.
+  - **`assumption.set`.** The last handle must be `owner:<handle>`. The undo removes it, restores `replaced`, and restores the status and `ownerPinned` (an absent pin stays absent).
+- **A mismatch.** Any mismatch is 409 `objective-version-unavailable`, as for every other op. The rebuilt record is parsed as today.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `a rebuild undoes the register` | **The record, hand-built.** Version 1 is created with a1 and a2 (intent-check, `unchecked`), a4 (owner test), and a5 (owner test, rating `quality` below 4). Version 2 is a `test.recorded` that sets a1 `verified` and a2 `refuted`, replacing a1's `receipt:` handle at index 0. Version 3 is a `proposal.recorded` that adds a6 and attaches a stance to a2. Version 4 is an `assumption.set` that pins a4 `verified`. Version 5 is a `rating.recorded` that sets a5 `refuted`. **Rebuilds.** Versions 1 to 4 rebuild equal to hand-built snapshots. **Refusals.** An `addedDigest` one byte off, a stance that is not last, and a last handle that differs each answer 409. **Unchanged tests.** The existing `a rebuild refuses what it cannot undo` and `a rebuild undoes the intent check` pass unchanged. |
+| `register refusals have fixed codes and sentences` | `objectiveError` gives each of the four new codes its status and sentence. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/objective-record.test.ts tests/objective-ops.test.ts tests/objective-intent.test.ts` and the host typecheck.
+
+### Task 8: the ingest hook
+
+**Files:** `packages/host/src/evidence/blackboard.ts`, `packages/host/src/team-entry-ingest.ts`, `tests/blackboard-ingest.test.ts`, `tests/team-entry-ingest.test.ts`. Runs first.
+
+**Interfaces (produces):**
+```ts
+// blackboard.ts
+export type IngestOutcome = { result: "stored" | "unready" | "held" | "failed"; stored: number; dropped: number; invalid: number;
+  /** Seqs of this call's posts that the store holds afterwards, inserted now or already present. Only on "stored". */
+  kept?: ReadonlySet<number> };
+// ingest(): the transaction adds record.seq to `kept` wherever it counts a post stored (both branches) and resets it with the counts.
+// team-entry-ingest.ts
+export type IngestDeps = { /* events, entries, done, members as today */
+  /** Once per stored page with kept posts, after the store write and before the cursor moves. A throw is ignored. */
+  kept?: (run: TeamRun, member: TeamMember, posts: readonly MemberPostRecord[]) => void };
+// ingestPass's deps type: Pick<IngestDeps, "events" | "entries" | "kept">.
+```
+
+**Decisions:**
+
+- **What the hook sees.** Only posts that passed `checkedPost` and the run limit. An invalid post, or one over the 400-entry limit, never reaches the record.
+- **The cursor rule is unchanged.** The cursor moves only when the store holds the page. A throwing hook does not hold the cursor back, because the finding is already on the board; the host's screen counts what it could not record.
+- **Optional on purpose.** `kept` is optional, so tests whose fake `ingest` returns no `kept` keep working.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `the store reports which posts it holds` (blackboard-ingest) | The page holds a new post, a post already stored, a post with a wrong binding, and a post past the 400-entry limit. `kept` holds exactly the seqs of the first two. An unready store gives no `kept`. |
+| `the proposal hook sees only the posts the store holds` (team-entry-ingest) | The hook is called once, with the kept posts. It is never called for an unready or held store, or for a page without posts. After a hook that throws, the cursor has moved and the next member is read. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/blackboard-ingest.test.ts tests/team-entry-ingest.test.ts tests/team-entries.test.ts` (in the background) and the host typecheck.
+
+### Task 9: receipts
+
+**Files:** `packages/host/src/objective-receipts.ts` (create), `tests/objective-receipts.test.ts` (create). Needs Tasks 4 and 5.
+
+**Interfaces (produces):** pure; no I/O and no clock.
+```ts
+export const PASS_LIMITS = { subjects: 40, reads: 40 } as const;
+export type PassKind = "reviewed" | "check";
+export type ReceiptKind = "command" | "artifact" | "citation";
+export type ReceiptOutcome = "pass" | "fail" | "unknown";   // criterion: the threshold holds; assumption: it stands (verified) or is refuted
+export type ReadState = "read" | "too-large" | "read-failed" | "not-run";
+export type ReceiptDetail =
+  | { kind: "command"; observed: "passed" | "failed" | "interrupted" | "running" | "absent" | "not-configured"; round?: number }
+  | { kind: "artifact"; read: ReadState; problem?: "not-text" | "not-json" | "no-array" | "threshold-misfit" | "schema-deferred" | "empty" | "deadline" | "stalled";
+      total?: number; qualifying?: number }
+  | { kind: "citation"; read: ReadState; problem?: "outside-unchecked" | "malformed" | "not-text" | "deadline" | "stalled"; present?: boolean };
+/** The stored shape of a host test result (step 5 reads it). */
+export type ObjectiveReceipt = {
+  handle: string;                          // receipt:<runId>:<revision>:<id>
+  kind: ReceiptKind; subject: "criterion" | "assumption"; id: string;   // the criterion or assumption id
+  commit: string; outcome: ReceiptOutcome; at: string; detail: ReceiptDetail;
+};
+export type Subject =
+  | { subject: "criterion"; id: string; check: Extract<Check, { kind: "command" | "artifact" }>; threshold: Threshold }
+  | { subject: "assumption"; id: string; test: Extract<AssumptionTest, { kind: "command" | "artifact" | "citation" }> };
+export type BlobResult = StreamRead | { state: "not-run"; why: "deadline" | "stalled" };
+/** At most 40 subjects in the fixed order. A check pass plans command subjects only. */
+export function passSubjects(record: ObjectiveRecord, kind: PassKind): Subject[];
+/** Distinct `${commit}:${path}` keys in subject order, at most 40; none for a check pass. */
+export function passReads(subjects: readonly Subject[], head: string): { commit: string; path: string }[];
+export type PassInput = { runId: string; revision: number; kind: PassKind; head: string; at: string;
+  checks: readonly TeamCheck[]; configured: readonly TeamCommand[]; blobs: ReadonlyMap<string, BlobResult> };
+export function receiptsFor(subjects: readonly Subject[], input: PassInput): ObjectiveReceipt[];
+```
+
+**Decisions:**
+
+- **Subjects.**
+  - In a reviewed pass: active criteria whose check is `command` or `artifact`, in record order. Then assumptions whose origin is `intent-check` or `owner` and whose test is `command`, `artifact`, or `citation`, in record order.
+  - In a check pass: only those with a command check or test.
+  - At most 40; the rest wait for the next pass. Member assumptions and owner tests are never subjects.
+- **Command.**
+  - **The final round.** It is the highest `round` (absent counts as 0) among `checks` with the pass's revision. In a reviewed pass, its `headCommit` must also be the reviewed head.
+  - **The matching entry.** In that round, the entry with no `phase` whose `commandDigest(command)` equals the test's digest.
+  - **Configured now.** The digest must also be one of `configured`, the project's checks now; otherwise the result is `not-configured`.
+  - **Results.** `passed` and `failed` decide. `interrupted`, `running`, or no entry are `unknown`.
+  - **Outcomes.** A criterion passes on `passed`. An assumption with `refutesOn: "fail"` passes on `passed` and fails on `failed`; with `"pass"`, the reverse.
+  - **The commit** is the round's `headCommit`.
+- **Artifact.**
+  - **Reading.** The blob at the reviewed head and the path is decoded as strict UTF-8 (`TextDecoder` with `fatal: true`) and parsed with `JSON.parse`. The RFC 6901 pointer (with `~1` and `~0` unescaped) must name an array.
+  - **The counts.** `total` is the array's length. With `citedPerEntry`, `qualifying` is `qualifyingEntries(array, citedPerEntry)` and is the count compared; otherwise `total` is.
+  - **Thresholds.** A `count` threshold holds when the count is at least `min` and at most `max` (each when given). A `share` threshold needs `citedPerEntry` and a `total` above 0, and holds when `qualifying / total` is at least `min`; otherwise it is `unknown` (`empty`). A `pass` or `score` threshold on an assumption is `unknown` (`threshold-misfit`).
+  - **A criterion's artifact check.** With `count`, as above with its threshold. Without `count` and `schema`, it passes when the blob reads. With `schema`, it is `unknown` (`schema-deferred`).
+- **Citation.**
+  - An outside source is `unknown` (`outside-unchecked`), and an unparseable one is `unknown` (`malformed`).
+  - A repository source reads its `@commit`, or the reviewed head without one. `present` is `quotePresent(text, quote, lines)`.
+  - `refutesOn: "absent"` passes when the quote is present; `"present"` passes when it is absent.
+- **Unknown is never a number.** `total` and `qualifying` appear only when computed, and `present` only when the blob read and decoded. Criterion ids (`c<n>`) and assumption ids (`a<n>`) never collide, so handles are unique within a pass.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `command tests read the final round and run nothing` | **The final round.** Rounds 1 and 2 ran at the revision, and round 2's `rank-verify` failed: a4 (`refutesOn: "fail"`) fails, with the round's head and `round: 2`. With `refutesOn: "pass"`, a4 passes. **Ignored and unknown.** A setup entry with the same command is ignored. A digest not configured now gives `not-configured` and `unknown`. Interrupted, running, and absent results are `unknown`. **Criteria.** A criterion with a command check passes on `passed` and fails on `failed`. **Pure.** The module imports no `child_process`. |
+| `acceptance 5, test side: an artifact test counts qualifying entries` | a2 is `{ kind: "artifact", path: "research/entries.json", count: "/entries", citedPerEntry: 2, threshold: { kind: "count", min: 40 } }`. Against a blob of 45 entries, 31 of which qualify, it fails with detail `{ kind: "artifact", read: "read", total: 45, qualifying: 31 }`. With `min: 30`, it passes. |
+| `unknown is never a number` | Each of these gives `unknown` with no `total`, `qualifying`, or `present` key: too large; failed; not run (deadline, stalled); not UTF-8; not JSON; a pointer to an object; a `share` threshold with total 0; a `pass` threshold on an assumption; a criterion with `schema`. |
+| `citation tests follow refutesOn` | Present with `refutesOn: "absent"` passes; absent with `"absent"` fails; present with `"present"` fails. An outside source gives `outside-unchecked`, and a malformed one `malformed`. A source with `@<commit>` reads that commit's key. |
+| `a pass plans at most 40 subjects and 40 distinct reads` | **The cap and order.** A record with 50 subjects plans 40, criteria first, in the stated order. **Reads.** Two tests on one path share one read. **Never subjects:** member assumptions and owner tests. **A check pass** plans command subjects only, and no read. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/objective-receipts.test.ts tests/objective-citations.test.ts` and the host typecheck.
+
+### Task 10: applying proposals
+
+**Files:** `packages/host/src/objective-proposals.ts` (create), `tests/objective-proposals.test.ts` (create). Needs Tasks 1 and 6.
+
+**Interfaces (produces):** pure.
+```ts
+export const PROPOSAL_LIMITS = { log: { entries: 300, bytes: 160 * 1024 }, cappedBytes: 24 * 1024, addedPerEntry: 4, attachedPerEntry: 16 } as const;
+export type ProposalDrop = "test" | "command" | "secret" | "target" | "attempt" | "stances" | "assumptions" | "bytes" | "log" | "refused";
+export type Proposal = { entryId: string; memberId: string; revision: number; authorRole: string; summary: string; assumption: MemberProposal };
+export type ProposalContext = { runId: string; configured: readonly TeamCommand[]; at: string };
+export type ProposalsApplied = { record?: ObjectiveRecord; added: string[]; attached: number; dropped: Record<ProposalDrop, number> };
+/** One page of one member, in journal order: at most one version up, and `record` absent when nothing changed. Never throws. */
+export function applyProposals(record: ObjectiveRecord, proposals: readonly Proposal[], context: ProposalContext): ProposalsApplied;
+```
+
+**Decisions:**
+
+- **Each proposal, in order:**
+  1. **Repetition.** An `entryId` already in any assumption's `proposals` is skipped and not counted.
+  2. **Secrets.** `findSecret({ summary, assumption }, { token: "", url: "" })` drops it as `secret`.
+  3. **A stance.** Its assumption must exist (`target`) and hold fewer than 8 proposals (`stances`). It gains `{ entryId, stance, summary, authorRole }` last.
+  4. **A new proposal.** `testOf(test, configured)` may drop it as `test` or `command`. The member's additions stay at most 4: every `proposal.recorded` entry that targets the member counts, and so does this page (`attempt`). Assumptions stay at most 32 (`assumptions`), and capped bytes at most 24 KiB (`bytes`).
+
+     It becomes `a<n>` (`nextRecordId`) with `status: "unchecked"`, `origin: "member"`, the screened test, empty `evidence`, and `proposals: [{ entryId, stance: "supports", summary, authorRole }]`.
+- **After the page.** The log must stay under 300 entries and 160 KiB with the new entries; otherwise every proposal of the page counts under `log`. A result that the schema refuses counts every proposal under `refused`.
+- **Nothing else changes.** No existing status, test, criticality, or question changes, as part 3 says: "A member cannot change a test, a criticality, or a status."
+- **Entries.** One version per page, with entries of at most 4 added and 16 attached.
+- **The attempt is the member.** A replacement member gets its own 4.
+- **Why a share.** Proposals stop at their share, so intent checks, receipts, and owner ops keep at least 80 entries and 50 KiB of `CORRECTION_LOG`. *(My call on the share's size: owner question 2.)*
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `acceptance 5, proposal side: a contradicting finding attaches and changes no status` | a2 is a `plan` assumption, `unchecked`. A scout's finding with `assumption: { id: "a2", stance: "contradicts" }` attaches `{ entryId, stance: "contradicts", summary, authorRole: "scout" }` to a2. a2's status, test, and criticality are unchanged. The record is one version up, with one `proposal.recorded` entry. |
+| `a member proposes at most four assumptions per attempt` | Six proposals from one member: four `unchecked` member assumptions and two drops under `attempt`. A second page from the same member adds none. Another member adds its own four. |
+| `proposals apply once` | The same page applied again returns no `record` and counts no drop. |
+| `bad proposals are dropped and counted, never echoed` | **Drops.** An unconfigured command test drops as `command`, and a test that fails `assumptionTestSchema` as `test`. A private key header, a GitHub token shape, and an egress proxy password shape, each in a statement, a summary, and a test (built as `tests/member-entry.test.ts` builds them), each drop as `secret`, and `JSON.stringify` of the result holds none of them. A stance on a missing id drops as `target`, and a ninth stance as `stances`. The 33rd assumption drops as `assumptions`, capped bytes past 24 KiB as `bytes`, and a log at 300 entries as `log`. **Untouched.** A record that only drops is unchanged. |
+| `the order of members' pages does not change the result` | Pages from three members, with the record two assumptions below 32, in all 6 orders. Each order gives the same set of `(entryId, statement, status, origin)`, the same `added` count, and the same drop counts. Only the id numbering differs. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/objective-proposals.test.ts tests/objective-write.test.ts` and the host typecheck.
+
+### Task 11: owner results
+
+**Files:** `packages/host/src/objective-input.ts`, `packages/host/src/objective-ops.ts`, `tests/objective-ops.test.ts`. Needs Task 7.
+
+**Interfaces (produces):**
+```ts
+// objective-input.ts
+export type CorrectionOp = /* today's four */
+  | { op: "assumption.set"; id: string; status: "verified" | "refuted" }
+  | { op: "rating.record"; subject: string; score: number };   // 1 to 5, Number.isInteger(score * 2)
+// correctionOpSchema gains the two strict variants; correctionSchema's refine also allows each assumption id and each rating subject once.
+export const RATING_SCALE = { min: 1, max: 5, step: 0.5 } as const;
+// objective-ops.ts
+export type OwnerOpContext = { configured: readonly TeamCommand[]; requestId: string; at: string;
+  /** The goal's latest reviewed cycle; a rating without it is refused. */
+  rating?: { commit: string; cycle: number } };
+export const REGISTER_OP_NAMES: ReadonlySet<CorrectionOp["op"]>;   // "assumption.set", "rating.record"
+// applyOps: the two ops are applied in order with the criterion ops, against the input record's assumptions, after the
+//   secret scan; the body gains `assumptions`; sealing, log room, capped bytes, and the criteria digest check stay as today.
+```
+
+**Decisions:**
+
+- **`assumption.set`.** The assumption must exist and have an `owner` test; otherwise `objective-assumption-target`. It takes the status and `ownerPinned: true`. `owner:<requestId>` becomes its last handle, replacing an earlier `owner:` handle. *(My call: setting any assumption's status, and unpinning, belong to the owner-ops slice. An owner test is the only kind that no host test reaches.)*
+- **`rating.record`.**
+  - **Checks.** An active `owner-rating` criterion or an owner test's `rating` must name the subject; otherwise `objective-rating-subject`. Without `context.rating`, the answer is `objective-rating-no-head`.
+  - **Effects.** Each unpinned assumption whose owner test names the subject becomes `refuted` when the score is below its `below`, and `verified` otherwise. `rating:<requestId>` becomes its last handle, replacing an earlier `rating:` handle.
+  - **Always logged.** The entry records the subject, score, commit, and cycle even when no assumption changes. Owner values live in the log, because the record has no field for them.
+- **What step 5 reads.** The `after` values of `assumption.set` and `rating.recorded` (Task 7) are the stored owner results.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `the owner sets an owner-test assumption and pins it` | **Setting.** `assumption.set` sets a4 (owner test) `verified`: `ownerPinned: true`, last handle `owner:<requestId>`, and one entry with `before` `{ status: "unchecked" }`. A second set replaces the handle. **Refusals.** On a2 (artifact test) and on a missing id: 409 `objective-assumption-target`. `correctionSchema` refuses status `assumed`. |
+| `a rating stamps the reviewed head and moves unpinned owner tests` | **The rating.** Score 3.5 on `quality`, with `rating: { commit, cycle: 2 }`: a5 (below 4) becomes `refuted`, a6 (below 3) `verified`, and a7 (pinned) is unchanged. The entry's `after` is `{ subject: "quality", score: 3.5, commit, cycle: 2, changed }`. **Refusals.** Without `rating`: 409 `objective-rating-no-head`. A subject that nothing names: 409 `objective-rating-subject`. The schema refuses scores 0, 5.5, and 3.3. |
+| `register ops and criterion ops share one version` | One correction with `criterion.retire` and `assumption.set` goes one version up, with both entries at that version. A stale version answers 409, as today. The existing objective-ops tests pass unchanged. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/objective-ops.test.ts tests/objective-record.test.ts tests/objective-goals.test.ts` and the host typecheck.
+
+### Task 12: the register in prompts
+
+**Files:** `packages/host/src/register-prompt.ts` (create), `packages/host/src/team-prompts.ts` (+1 import; lines 90 and 376 in place), `tests/register-prompt.test.ts` (create). Needs Task 3.
+
+**Interfaces (produces):**
+```ts
+// register-prompt.ts
+export const REGISTER_LEAD = "Assumptions and open questions from the owner's objective record. A verified or refuted assumption rests on a host receipt or the owner; an assumed one stands in until it is tested; plan around unchecked and refuted ones; only the owner answers an open question";
+export const ASK_SENTENCE = "Ask for a user decision if a material scope decision is required.";
+export const PROPOSE_SENTENCE = "When the work depends on something the record does not settle, do not wait for a user decision: post a finding whose body proposes an assumption (a statement, what would refute it, a test, and a criticality), and plan so that the work survives if it is refuted. A proposal is a claim and changes no status.";
+export function registerText(register: RegisterDigest): string;   // `${REGISTER_LEAD}:\n${JSON.stringify(register)}`
+/** PROPOSE_SENTENCE when the goal digest holds a register, the run is pinned autonomous, and the role posts findings with entry tools
+ *  (entryToolsFor and ROLE_KINDS); ASK_SENTENCE otherwise. */
+export function scopeSentence(run: TeamRun, role: TeamMember["role"]): string;
+// team-prompts.ts line 90, in place: the return appends `\n${registerText(record.register)}` when record.register is present.
+// team-prompts.ts line 376, in place: the literal "Ask for a user decision if a material scope decision is required." becomes ${scopeSentence(run, role)}.
+```
+
+**Decisions:**
+
+- **Without a register in the digest, the prompt keeps today's bytes:** the goal section and the sentence are unchanged.
+- **Where the register text goes.** It comes right after the criteria, inside the goal section.
+- **The ask sentence stays** for the project manager, which posts no finding, and for members without entry tools.
+- **No text from the run** reaches the propose sentence.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `without the register the goal section is byte for byte` | For every role, `teamPrompt` of a goal run whose digest has no register equals the string pinned from the base commit. This holds with and without entry tools, supervised and autonomous. |
+| `the register reaches the goal section with its lead line` | With a register of one assumption and one question, the prompt holds `REGISTER_LEAD` once and the register JSON once, after the criteria JSON. |
+| `the scope sentence follows the mode, the register, and the role` | An autonomous run with a register, for an implementer with entry tools: `PROPOSE_SENTENCE`, and no `ASK_SENTENCE`. `ASK_SENTENCE` instead for the project manager, a reviewer without entry tools, a supervised run, and a digest without a register. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/register-prompt.test.ts tests/team-prompts.test.ts` and the host typecheck.
+
+### Task 13: applying receipts
+
+**Files:** `packages/host/src/objective-register.ts` (create), `tests/objective-register.test.ts` (create). Needs Tasks 1 and 9.
+
+**Interfaces (produces):** pure.
+```ts
+export const RECEIPT_CHANGES_PER_ENTRY = 8;
+export type ReceiptContext = { runId: string; revision: number; kind: PassKind; at: string };
+export type ReceiptsApplied = { record: ObjectiveRecord; changed: string[]; refutedOutcome: string[] };
+/** One version up with one `test.recorded` entry per 8 changes; undefined when no receipt changes a status or attaches a handle.
+ *  Throws objectiveError("objective-log-full") past CORRECTION_LOG, and objectiveError("objective-op-refused") when the schema refuses the result. */
+export function applyReceipts(record: ObjectiveRecord, receipts: readonly ObjectiveReceipt[], context: ReceiptContext): ReceiptsApplied | undefined;
+```
+
+**Decisions:**
+
+- **When a receipt changes an assumption.** Only assumption receipts count, and only when all of these hold:
+  - the outcome is `pass` or `fail`;
+  - the assumption exists, with a test of the receipt's kind;
+  - its origin is not `member`;
+  - the outcome differs from its status (`pass` agrees with `verified`, and `fail` with `refuted`).
+- **What it changes.** An unpinned assumption takes the status. A pinned one keeps its status and gains only the handle (part 3: "later receipts attach as evidence"). The handle `receipt:<runId>:<revision>:<id>` goes last, replacing an earlier `receipt:` handle. Each writer keeps one handle per prefix, so `evidence` holds at most three host and owner handles.
+- **A receipt that agrees writes nothing,** so an unchanged register spends no log room. *(My call: `CORRECTION_LOG` holds about 380 entries for a goal's whole life, and the newest receipts stay readable in the run's sealed file.)*
+- **`refutedOutcome`** lists the `outcome` assumptions that this pass set `refuted`, for the event.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `receipts set statuses only where the outcome differs` | **Changes.** a1 (`unchecked`) with a pass becomes `verified`. a2 (`assumed`) with a fail becomes `refuted`, with `receipt:R:3:a2` last in place of `receipt:R:2:a2`. **No change.** a3 (`verified`) with a pass is unchanged, and so is an assumption with an `unknown` receipt. **The write.** One version up, with one entry whose `before` and `after` follow Task 7. Receipts that change nothing return undefined. |
+| `pinned and member assumptions keep their status` | A pinned `verified` assumption with a fail receipt keeps `verified` and gains the handle; with a pass receipt, nothing changes. A member assumption named by a receipt is unchanged. |
+| `a pass writes entries of at most eight at one version` | 20 changes give 3 entries at one version, with consecutive seqs. Each entry's `before` and `after` is at most 2,048 bytes inline. |
+| `a full log keeps the receipts and writes nothing` | At 380 log entries the call throws `objective-log-full`, and the input record is unchanged. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/objective-register.test.ts tests/objective-receipts.test.ts` and the host typecheck.
+
+### Task 14: the prompt version
+
+**Files:** `packages/host/src/config-identity.ts`; in-place type lines in `packages/host/src/routing-auto.ts` (lines 1 and 32), `routing-reads.ts` (lines 2, 45, and 74), and `routing-routes.ts` (lines 6 and 68); `tests/config-identity.test.ts`. Needs Tasks 3 and 12.
+
+**Interfaces (produces):**
+```ts
+// config-identity.ts
+export type { ObjectivePrompt } from "./objective-digest.js";
+const FIXTURE_REGISTER: RegisterDigest = { assumptions: [{ id: "a1", status: "unchecked", criticality: "plan", statement: "Fixture assumption." }],
+  questions: [{ id: "q1", text: "Fixture question? Default: keep." }] };
+export function renderedPrompts(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean,
+  entryTools = false, objectiveDigest: ObjectivePrompt = false): string[];
+export function promptVersion(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean,
+  entryTools = false, objectiveDigest: ObjectivePrompt = false): string;
+// "register" renders the fixture goal's record with FIXTURE_REGISTER on a run pinned supervised; "register-autonomous", pinned autonomous.
+// memberConfiguration's input: objectiveDigest?: ObjectivePrompt; it passes input.objectiveDigest ?? false.
+// routing-auto.ts line 32 and routing-reads.ts lines 45 and 74: the objectiveDigest field and parameter take ObjectivePrompt,
+//   imported with promptVersion on line 1 (routing-auto.ts) and line 2 (routing-reads.ts), in place.
+// routing-routes.ts line 6: import { objectivePromptFor } from "./objective-digest.js";   (objectivePromptsOn has no other use there)
+// routing-routes.ts line 68: objectiveDigest: objectivePromptFor(project, startMode(project, config.teams?.lineup).mode),
+```
+
+**Decisions:**
+
+- **Existing identities stay.** `false` and `true` render exactly as today, so every configuration identity and routing evidence key keeps its value.
+- **What each shape renders.** Both register shapes render the register text. Only `"register-autonomous"` renders the propose sentence, and only for a role that posts findings with entry tools. So a project manager has one version under both shapes.
+- **Routing.** The router computes start versions with the run's own shape (Task 18 changes line 4983), and its preview uses the shape a new run would pin.
+
+- [ ] **Step 1: Write the failing test.**
+
+| Test name | Assertions |
+|---|---|
+| `the register changes the prompt version only where the prompt changes` | **The implementer with entry tools:** `true`, `"register"`, and `"register-autonomous"` give three versions. **Without entry tools,** the two register shapes give one version. **The project manager:** the two register shapes give one version. **Unchanged:** the existing base pin (line 394) and `entry tools change the prompt version only for entry roles` pass. |
+
+- [ ] **Step 2: Run and confirm it fails.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/config-identity.test.ts`, then `tests/routing-auto.test.ts tests/routing-reads.test.ts tests/routing-routes.test.ts` in the background, and the host typecheck.
+
+### Task 15: goal records and the owner route
+
+**Files:** `packages/host/src/objective-goals.ts`, `packages/host/src/goals.ts` (lines 20, 21, 538, 548, 549, and 853 in place; net 0; stays 1,034), `tests/register-goals.test.ts` (create). Needs Tasks 3 and 11.
+
+**Interfaces (produces):**
+```ts
+// objective-goals.ts
+/** Throws objective-prompts-off when a criterion op meets prompts off, and objective-register-off when a register op meets the register off. */
+export function correctionGate(project: Pick<Project, "team"> | undefined, correction: Pick<Correction, "ops">): void;
+/** latestReviewed(goal.cycles)'s headCommit and cycle number, or undefined when there is none or it has no head. */
+export function ratingStamp(goal: Pick<ProductGoal, "cycles">): { commit: string; cycle: number } | undefined;
+/** Today's digest; with `register`, it gains registerDigestFor(record) before the schema parse. */
+export function goalRecordDigest(holder: GoalHolder, configured: readonly TeamCommand[], register?: boolean): GoalDigestResult;
+// goals.ts, in place:
+//   20:  the objective-goals import gains correctionGate and ratingStamp
+//   21:  import { objectivePromptsOn, objectiveRegisterOn } from "./objective-digest.js";
+//   538: "…Criterion ops need objective prompts on; register ops need the register on."
+//   548: correctionGate(project, body);
+//   549: const next = correctGoalObjective(stored, body, { configured: project?.team?.checks ?? [], requestId: body.requestId, at: now(), rating: ratingStamp(goal) });
+//   853: const pinned = objectivePromptsOn(project) ? goalRecordDigest(stored, project?.team?.checks ?? [], objectiveRegisterOn(project)) : undefined;
+```
+
+**Decisions:**
+
+- **One route.** Owner results go only through `POST /api/goals/:id/record` (`objective-routes.ts` line 22), which `server.ts` line 1097 guards with `requireRole(["owner"])`; the relay refuses the path. No new route, and no `server.ts` line. Standalone runs get no owner route here; the owner-ops slice adds `POST /api/teams/:id/record`.
+- **The register never costs the criteria.** It has its own budget, so a goal never skips its criteria digest because of it.
+- **No goal gate.** A goal does not wait for its cycle's pass. A pass that finishes after the next cycle's launch reaches the cycle after it. *(My call: holding `activeTeamId` would repeat the event at `goals.ts` line 788 ("A feature passed checks and independent review…") on every tick, because the settle block from line 763 runs again on each tick while the team stays attached. A pass ends within 120 seconds.)*
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `owner results take the owner route only` | **On the server fixture** that `tests/goals.test.ts`'s record test uses (`f.host.fetchApi`). **The route.** With prompts and the register on, the owner's `assumption.set` on a missing id answers 409 `objective-assumption-target`, which shows that the op passed the role and the gate. A controller's and a viewer's answer 403. **The register switch.** With the register off, the answer is 409 `objective-register-off`. With prompts off and the register on, `criterion.retire` answers 409 `objective-prompts-off`. |
+| `a rating needs a reviewed cycle` | **`ratingStamp`.** Cycles blocked, ready-for-review (H1, cycle 2), no-change, and merged (H4, cycle 4) give `{ commit: H4, cycle: 4 }`; cycles with no reviewed one give undefined. **The route.** With an `owner-rating` criterion on `quality` and no reviewed cycle, `rating.record` answers 409 `objective-rating-no-head`. |
+| `a goal's next cycle carries the register digest` | **With prompts and the register on,** the next launch context's `record.register` lists intent-check and owner assumptions and no member assumption. **With the register off,** the digest's JSON equals the one from before the key was written. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/register-goals.test.ts tests/objective-goals.test.ts tests/standing-goals.test.ts` (in the background) and the host typecheck. Confirm with `wc -l` that `goals.ts` is 1,034 lines.
+
+### Task 16: the CLI
+
+**Files:** `packages/host/src/objective-cli.ts`, `tests/objective-cli.test.ts`. Needs Task 11.
+
+**Interfaces (produces):**
+```ts
+export const GOAL_RECORD_USAGE = [
+  "Usage: infinite goal record ID [--version N] [--json]",
+  "       infinite goal record ID retire CID|confirm CID [--version N] [--request-id ID] [--json]",
+  "       infinite goal record ID set-assumption AID verified|refuted [--version N] [--request-id ID] [--json]",
+  "       infinite goal record ID rate SUBJECT SCORE [--version N] [--request-id ID] [--json]",
+  "       infinite goal record ID apply --file PATH [--version N] [--request-id ID] [--json]",
+].join("\n");
+// formOf destructures [verb, goalId, form, target, value, ...rest]; set-assumption and rate take five positionals.
+// objectiveRecordLines, line 111 in place: `  ${id} ${status}${pinned} ${criticality} ${origin}${handle}: ${statement}`, where `pinned` is
+//   " pinned" when ownerPinned, and `handle` is ` [${h}]` for the last evidence handle h that starts with receipt:, owner:, or rating:.
+//   A line with neither prints as today, so the intent check's `the record lines show the register` passes unchanged.
+```
+
+**Decisions:**
+
+- **Scores.** A score must match `/^[1-5](?:\.[05])?$/` and be at most 5. Anything else is a usage error before any request.
+- **Failures.** The server's code gives its fixed sentence through `OBJECTIVE_ERRORS`, as today, and 403 keeps "Corrections need an owner device key." `team-cli.ts` and `client.ts` do not change: `client.ts` line 903 already sends `goal` commands here.
+
+- [ ] **Step 1: Write the failing test.**
+
+| Test name | Assertions |
+|---|---|
+| `the CLI records owner results` | **Requests.** `record G set-assumption a4 verified` posts one op, `{ op: "assumption.set", id: "a4", status: "verified" }`, at the latest version. `record G rate quality 3.5` posts `{ op: "rating.record", subject: "quality", score: 3.5 }`. **Usage errors with no request:** `rate quality 6`, `rate quality 3.3`, `set-assumption a4 assumed`, and an extra argument. **Output.** A 409 `objective-rating-no-head` prints its sentence. The record lines include `  a4 verified pinned detail owner [owner:<requestId>]: …` and `  a2 refuted plan intent-check [receipt:R:1:a2]: …`. The existing `the record lines show the register` passes unchanged. |
+
+- [ ] **Step 2: Run and confirm it fails.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/objective-cli.test.ts` and the host typecheck.
+
+### Task 17: the runtime
+
+**Files:** `packages/host/src/team-register.ts` (create), `tests/team-register.test.ts` (create), `tests/register-rebuild.test.ts` (create). Needs Tasks 2, 5, 9, 10, 11, and 13.
+
+**Interfaces (produces):**
+```ts
+export { objectivePromptOf, registerPin } from "./objective-digest.js";
+export const REGISTER_PASS = { passMs: 120_000, stalledReads: 4 } as const;   // subjects and reads: PASS_LIMITS
+export type RegisterPass = { revision: number; kind: PassKind; commit?: string; state: "pending" | "done"; markedAt: string; finishedAt?: string;
+  receipts?: ObjectiveReceipt[];   // at most 40
+  wrote?: number;                  // the record version written
+  skipped?: "record-unavailable" | "log-full" | "write-failed" };
+export type RegisterDrop = ProposalDrop | "record-unavailable" | "write-failed";
+export type RegisterState = { pass?: RegisterPass; drops?: Partial<Record<RegisterDrop, number>> };
+export type RegisterHolder = { run: TeamRun; objectiveRecord?: unknown; checkHead?: string; register?: RegisterState };
+export type RegisterHost = {
+  holder(runId: string): RegisterHolder | undefined;
+  configured(run: TeamRun): readonly TeamCommand[];        // the project's checks now
+  workspace(holder: RegisterHolder): string | undefined;   // run.workspace when assertRunPath passes
+  enqueue(work: () => void): Promise<void>;                // the serial queue
+  save(holder: RegisterHolder): void;
+  event(holder: RegisterHolder, text: string): void;
+  prefix(): TeamCommand | undefined;
+  now(): string;
+};
+export const REGISTER_EVENTS = {
+  recorded: (revision: number, counts: { pass: number; fail: number; unknown: number; changed: number }) =>
+    `Host tests for revision ${revision}: ${counts.pass} passed, ${counts.fail} failed, ${counts.unknown} unknown; ${counts.changed} assumption statuses changed.`,
+  refuted: (ids: readonly string[]) => `Host tests refuted outcome assumptions ${ids.join(", ")}.`,
+  skipped: {
+    "record-unavailable": "Host tests could not read the objective record, so no assumption status changed.",
+    "log-full": "The objective record's log is full, so host test receipts changed no assumption status.",
+    "write-failed": "The objective record could not be saved, so host test receipts changed no assumption status.",
+  },
+  proposalsDropped: "Member assumption proposals were dropped at a limit or could not be recorded.",
+} as const;
+export class TeamRegister {
+  goals?: GoalRecordPort;
+  constructor(host: RegisterHost, reader?: BlobReader);   // default blobReader(host.prefix)
+  /** In `save`, memory only: marks a pass due. */
+  mark(holder: RegisterHolder): void;
+  /** Once at startup: marks every holder and queues every pending pass. */
+  restore(holders: Iterable<RegisterHolder>): void;
+  /** In the tick: starts the oldest queued pass when none runs. Never awaits, never throws. */
+  drain(): void;
+  /** In the ingest pass: applies the kept finding posts that carry `assumption`. Never throws. */
+  propose(runId: string, member: TeamMember, posts: readonly MemberPostRecord[]): void;
+  /** For step 5 and tests: the latest pass's receipts, and whether a pass is pending. */
+  receipts(runId: string): readonly ObjectiveReceipt[] | undefined;
+  pending(runId: string): boolean;
+  close(): void;
+  /** Settles when the running pass has finished. Tests only. */
+  idle(): Promise<void>;
+}
+```
+
+**Decisions:**
+
+- **When a pass is due.**
+  - **The condition.** `mark` acts on a run pinned `register: "on"` whose status is `ready-for-review`, `merged`, or `blocked`, and whose revision has a check entry.
+  - **The kind.** A pass is `reviewed` when the reviewed-head rule holds, as `teams.ts` line 4787 reads it: `run.headCommit` is set, `checkHead` equals it, and `run.review` is approved at the revision. Otherwise it is `check`.
+  - **Replacement.** One pass per revision and kind. A reviewed pass replaces a check pass of the same revision; nothing replaces a reviewed pass of the same revision; a later revision replaces any earlier pass.
+  - **Persistence.** The `save` that marks a pass also writes it. `restore` marks every holder once at startup, so a run that settled just before a crash gets its pass.
+- **A pass, in three steps:**
+  1. **In the tick, inside the serial queue.** Read the record with `heldRecordState`, plan the subjects and the reads, and copy the revision's checks.
+  2. **Outside the queue.** Read each blob in order through the reader, with one `AbortController`. A read starts only while fewer than 4 reads are stalled and the pass is under 120 seconds; the others are `not-run`.
+  3. **Through `host.enqueue`.** If the holder is gone, or its `register.pass` is no longer this pass object, drop the result. Otherwise:
+     - read the record again and plan its subjects again;
+     - compute the receipts (`not-run` for any read it did not plan) and apply them with `applyReceipts`;
+     - write the record with `writeHeldRecord`, and set the pass `done` with its receipts and `wrote` or `skipped`;
+     - add the events and save the holder.
+- **A pass never changes the run's state.** It writes only the record and `Stored.register`, adds no status, and so writes no outcome event. A run that was paused, cancelled, or resumed after the mark keeps its state, and a receipt stays a fact about a commit, which does not change. This is the lesson that completions must ignore stopped runs: this completion changes no run state.
+- **Order.** One pass at a time, oldest first. `drain` returns at once while one runs.
+- **Proposals.**
+  - **Where it runs.** `propose` runs inside the ingest pass, in the serial queue, on a run pinned `register: "on"`.
+  - **What it builds.** A `Proposal` from each kept `finding` post that carries `assumption`. The entry id is the envelope's `requestId`, the author role is the member's role, and the summary is the entry's.
+  - **Applying.** It calls `applyProposals`, writes the record, and saves the holder.
+  - **Failures.** An unreadable record counts every proposal under `record-unavailable`, and a failed write under `write-failed`.
+  - **Drops.** They add to `register.drops`, and one fixed event per run reports them.
+- **Events** carry ids and counts only:
+  - one when a pass finishes;
+  - one listing the `outcome` assumptions that a pass refuted;
+  - one per skip.
+
+- [ ] **Step 1: Write the failing tests.** Each test uses a fake host and a fake reader, unless the row says otherwise.
+
+| Test name | Assertions |
+|---|---|
+| `a settled revision gets one pass` | **The reviewed pass.** `mark` at `ready-for-review` with the reviewed-head rule gives one pending reviewed pass, which is saved. `drain` reads each planned blob once. The apply writes the record one version up, sets the pass `done` with its receipts and `wrote`, adds one event, and saves. **No second pass.** A second `mark` at `merged` adds none. **A blocked revision with checks** gets a check pass that reads nothing. **An unpinned run** gets no pass. |
+| `a pass never outlives its run or its revision` | **Gone or replaced.** If the holder is removed before the apply, nothing is written and no event is added. If a new revision is marked while a pass reads, the old apply writes nothing and the new pass runs next. **Skips.** A goal port whose write throws gives `skipped: "write-failed"` and one event, and the receipts are kept. An unreadable record gives `record-unavailable`, and a full log gives `log-full`. |
+| `stalled reads stop the pass from reading` | **Stalls.** The reader's first four reads stall, so the fifth never starts. Its subjects' receipts are `unknown` with `read: "not-run"`, and the pass ends `done`. **The deadline.** A read that passes the 120-second deadline, on a fake clock, leaves the rest `not-run`. |
+| `proposals follow the pin and the record` | **An unpinned run:** nothing changes and no drop is counted. **A pinned run:** a stance and a proposal apply once across two calls with the same posts. **An unreadable record:** `record-unavailable` is counted with one event, and a second drop adds no second event. |
+| `seeded runs with restarts write each pass once` | **Seeded:** 100 seeds, with the seed printed on failure. **The sequences** are random: marks at random statuses and revisions, drains, read completions, proposal pages, and restarts. A restart is a new `TeamRegister` over a JSON round trip of the holders and the goal record. **Invariants.** At most one `test.recorded` version per run, revision, and kind. Every pass ends `done` or replaced. The final record equals the one from the same sequence without restarts. |
+| `every version rebuilds after random register writes` (register-rebuild) | **Seeded:** 200 seeds. **The writes** are random `applyReceipts`, `applyProposals`, owner ops (`applyOwnerOps` with `assumption.set`, `rating.record`, and criterion ops), and intent applies (`applyIntentReport`), with a JSON round trip between steps. **The check.** For each version, `rebuildVersion(final, v)` deep-equals the snapshot after the last write at `v`, and every snapshot parses. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/team-register.test.ts tests/register-rebuild.test.ts` and the host typecheck. Confirm with `wc -l` that `team-register.ts` is under 1,000 lines.
+
+### Task 18: the hooks in `teams.ts`
+
+**Files:** `packages/host/src/teams.ts` (+6: from 5,707 to 5,713), `tests/fixtures/team-agent.mjs` (`--command-prefix` mode, +6), `tests/register-host.test.ts` (create), `tests/autonomy-pins.test.ts` (one test). Needs Tasks 3, 6, 8, 14, and 17. Task 18 is the only task that writes `teams.ts`.
+
+**Interfaces (produces):**
+```ts
+// teams.ts, by line on the reference tree (apply bottom-up; find each by its code):
+// after 56:   import { TeamRegister, objectivePromptOf, registerPin, type RegisterState } from "./team-register.js";            +1
+// 192, in place:  objectiveRecord?: unknown; objectiveNotice?: ObjectiveUnavailable; intentCheck?: IntentCheckState; register?: RegisterState;
+// after 507:  private readonly objectiveTests = new TeamRegister({ holder: id => this.records.get(id), configured: run => this.config.projects.find(p => p.id === run.projectId)?.team?.checks ?? [],
+//               workspace: s => { try { this.assertRunPath(s as Stored, s.run.workspace); return s.run.workspace; } catch { return undefined; } },
+//               enqueue: work => this.enqueue(work), save: s => this.save(s as Stored), event: (s, text) => this.event(s as Stored, text),
+//               prefix: () => this.config.teams?.commandPrefix, now: timestamp });   // one line                                       +1
+// after 675 (the constructor's last statement): this.objectiveTests.restore(this.records.values());                               +1
+// 686, in place:  useGoalRecords(port: GoalRecordPort) { this.intentChecks.goals = port; this.objectiveTests.goals = port; }
+// after 862 (in save, after endPermissionTask): this.objectiveTests.mark(stored);                                                 +1
+// 909, in place:  { events: …as today…, entries, kept: (run, member, posts) => this.objectiveTests.propose(run.id, member, posts) })) {
+// after 1585: if (registerPin({ setting: project.team.objective?.register, mission: Boolean(internal?.missionId), handoff: Boolean(internal?.handoff) })) run.register = "on";   +1
+// after 2475 (in the tick, after drainEntries): this.objectiveTests.drain();                                                     +1
+// 2483, in place: close() gains this.objectiveTests.close(); before this.removeAgentSource?.();
+// 4983, in place: objectiveDigest: objectivePromptOf(run),
+// 5168, in place: objectiveDigest: objectivePromptOf(stored.run),
+```
+
+**Decisions:**
+
+- **One call per hook.** Each hook makes one call into `TeamRegister`. `teams.ts` reads nothing new from the store, a journal, or a sealed file.
+- **The view.** `run.register`, an enumeration, reaches every view and relay device through the team view, as `run.intentCheck` does. `Stored.register` is outside `run` and reaches no view.
+- **The fake prefix gains two flags.** With `refuse-cat-file`, it exits 128 for a `git … cat-file` command. With `hold-cat-file`, it waits for `release-cat-file` before it runs one.
+
+- [ ] **Step 1: Write the failing tests.** They run on `tests/fixtures/team-scheduler.ts`, with this setup:
+  - `teams.commandPrefix` is the fake agent's `--command-prefix` mode, with a receipt directory;
+  - the blackboard is on, as `tests/team-entries.test.ts` turns it on;
+  - the run is written at `ready-for-review` with the reviewed-head rule, and its member is a reviewer with entry tools.
+
+| Test name | Assertions |
+|---|---|
+| `acceptance 5 end to end` | **Setup.** The run's head commits `research/entries.json`: 45 entries, 31 of which cite two sources in checkable form on distinct hosts. The project's `team.checks` holds `rank-verify`, and the final check round has it `failed`. The record holds a2 (plan; artifact test with count `/entries`, `citedPerEntry` 2, min 40) and a4 (command test on `rank-verify`, `refutesOn: "fail"`). **The finding.** A finding that contradicts a2 is posted and ingested. a2 stays `unchecked`, with the proposal attached. **The pass.** a2 becomes `refuted` with handle `receipt:<run>:1:a2`, and its receipt detail is `{ read: "read", total: 45, qualifying: 31 }`. a4 becomes `refuted`. There is one `test.recorded` version, no decision, and no change to the run's status. **Commands.** `commands.jsonl` holds one B1 line for `<head>:research/entries.json` and no other command. |
+| `without the register a run is as today` | The same run without `run.register`, after drains and an ingest of the same finding: no `Stored.register`; the record unchanged; the finding on the board; no register event; no `cat-file` in `commands.jsonl`; and no `register` key in `teams.get(id)`. |
+| `a refused blob form leaves artifact results unknown` | With `refuse-cat-file`, a2 stays `unchecked`. Its receipt is `unknown`, with `read: "read-failed"` and no `total`. a4 becomes `refuted`. |
+| `a restart while a pass reads runs it once` | With `hold-cat-file`, the pass starts, the service closes, and a new service opens. After `release-cat-file`: one `test.recorded` version, and the pass `done`. |
+| `the view shows the pin and nothing else` | `teams.get(id).register` is `"on"`. The view's JSON holds no `receipt:` handle of the pass, no `qualifying`, and no proposal summary. |
+| `each new run pins the register by setting` (autonomy-pins) | `create()` pins `register: "on"` only with `objective: { register: "on" }`. `createForMission()` and a handoff run never pin it. The sealed record and the view carry the pin. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/register-host.test.ts tests/team-entries.test.ts tests/autonomy-pins.test.ts tests/intent-check.test.ts tests/objective-runs.test.ts` in the background, and the host typecheck. Confirm with `wc -l` that `teams.ts` is 5,713 lines.
+
+### Task 19: the docs and the spec
+
+**Files:** `docs/teams.md`, the spec. Runs last; the contract is fixed in this plan.
+
+**Decisions:**
+
+- **`docs/teams.md`, in the goal record section, covers:**
+  - **The setting:** `objective.register`, off by default and inside the routine approval digest; what it turns on; and that the pin is taken at `createRun`.
+  - **Tests:** the four kinds, when each runs, what each reads, and that no test runs a command. The B1 row in the Git forms table (Form, Command, Limit, If refused), with the 35-second launcher limit.
+  - **Receipts:** what a receipt stores and where.
+  - **Proposals:** the finding field, its limits and screens, and why member assumptions are never tested or shown in the digest until adopted.
+  - **Owner results:** the two ops, their roles, `set-assumption` and `rate`, and the scale in halves.
+  - **Prompts:** the register digest, the propose sentence, and that a refuted outcome assumption does not hold the next cycle until interruptions (C18) are built.
+  - **Rollback:** the steps before a rollback, from this section's rollback row.
+- **The spec:**
+  - **Part 3:** the setting; member tests never run; adoption deferred; a pinned assumption's receipt attaches only when it disagrees; one handle per prefix; writes only on a change; the refutation hold deferred to C18.
+  - **Part 5's authority table:** receipts in the run's sealed file, not `GoalCycle.receipts`.
+  - **Part 7:** the `sources` field and https only.
+  - **Part 8:** the register's own budget and no member text.
+  - **The delivery order:** updated to match.
+  - **"Left to the builder":** the answer on Git reads and their timeouts.
+
+- [ ] **Step 1: Amend the docs and the spec.** **Step 2: Run** the privacy scan of `AGENTS.md` over the diff.
+- [ ] **Step 3: After every task, the coordinator runs `npm run check` once on the integrated branch, requests the independent review, and commits.**
+
+## Not in this slice
+
+- **Adopting member assumptions:** the intent check sorting `unchecked` items, and owner promotion. This belongs to a later intent-check item or the owner-ops slice.
+- **The C18 interruptions:** the hold on a refuted `outcome` assumption ("the next cycle does not start"), and challenges in the daily digest.
+- **C16 readers' `findings` results as proposals.**
+- **Outside citation text held by the host,** and the `citations` and `citation-form` criteria (delivery step 7).
+- **Artifact `schema` checks** (`unknown` here).
+- **Step 5:** verdicts, the evaluator role, `provisional-met`, `GET /api/goals/:id/verdicts`, and copying receipts into its verdict storage.
+- **Owner register ops beyond the two:** setting any assumption's status, unpinning, per-question answers, promotions, and `POST /api/teams/:id/record` for standalone runs.
+- **A goal gate** that waits for a pending pass.
+- **Receipts in the outcome ledger.**
+- **Record screens** on the web, the phone, and the Mac.
+- **The launcher change for B1,** which the owner approves and installs.

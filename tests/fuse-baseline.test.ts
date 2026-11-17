@@ -13,6 +13,7 @@ import {
   writeBaseline,
   type FuseBaseline,
 } from "../packages/host/src/fuse/baseline.js";
+import { EXEMPT_ROLES } from "../packages/host/src/fuse/rules.js";
 import { seal, writeSealed } from "../packages/host/src/vault.js";
 import type { FuseLaunchRecord, FuseTripRecord, LaunchState } from "../packages/host/src/fuse/types.js";
 
@@ -177,5 +178,17 @@ test("an oversized baseline is unreadable", () => {
     const launches = Array.from({ length: 5001 }, (_, index) => launch(`L${index}`, "a", now));
     writeSealed(file, key, BASELINE_SCOPE, baseline({ launches }));
     assert.equal(readBaseline(file, key), undefined);
+  });
+});
+
+test("the intent checker is a counted launch role", () => {
+  withDirectory((directory) => {
+    const key = randomBytes(32);
+    const file = join(directory, BASELINE_FILE);
+    const value = baseline({ seq: 2, launches: [{ ...launch("L2", "a", now - minute), role: "intent-checker" }] });
+
+    assert.equal(writeBaseline(file, key, value), true);
+    assert.deepEqual(readBaseline(file, key), value);
+    assert.equal(EXEMPT_ROLES.has("intent-checker"), false);
   });
 });

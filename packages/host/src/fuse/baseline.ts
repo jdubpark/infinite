@@ -10,7 +10,7 @@ export const BASELINE_SCOPE = "fuse-baseline";
 export type FuseBaseline = { version: 1; seq: number; launches: FuseLaunchRecord[]; trips: FuseTripRecord[] };
 
 /** Every launch role. The check below fails the build when `LaunchRole` gains a role this list lacks. */
-const LAUNCH_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery", "mission-coordinator"] as const satisfies readonly LaunchRole[];
+const LAUNCH_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery", "intent-checker", "mission-coordinator"] as const satisfies readonly LaunchRole[];
 const everyRoleListed: Exclude<LaunchRole, typeof LAUNCH_ROLES[number]> extends never ? true : never = true;
 void everyRoleListed;
 

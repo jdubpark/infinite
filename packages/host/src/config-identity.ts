@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { basename } from "node:path";
 import { canonicalJson } from "./evidence/crypto.js";
+import { intentCheckerPrompt } from "./intent-prompt.js";
 import { profileIdentity } from "./run-events.js";
 import { entryCommand, reportCommand, teamPrompt } from "./team-prompts.js";
 import { teamCommand, teamGitArgs } from "./team-workspace.js";
@@ -133,6 +134,7 @@ function waitIn<T>(waiters: Set<(value: T | undefined) => void>, signal: AbortSi
  */
 export function renderedPrompts(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean, entryTools = false, objectiveDigest = false): string[] {
   const command = reportCommand();
+  if (role === "intent-checker") return [intentCheckerPrompt(provider, profile).split(command).join("<report-command>")];
   const entry = entryCommand();
   return FIXTURES.map(({ run: plain, work }) => {
     const run = objectiveDigest && plain.goal ? { ...plain, goal: { ...plain.goal, record: FIXTURE_RECORD } } : plain;

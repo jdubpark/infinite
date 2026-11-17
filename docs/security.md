@@ -577,6 +577,8 @@ Limits that remain:
   release and uses that stable path in `classRulesDigest`, so sibling releases
   are protected without making each deploy stale the replay result. Without the
   marker, the dynamic install path protects only the install directory itself.
+  A marked release directly below `/` also protects only its own directory,
+  because the class rules never protect `/`.
 - A command whose effect the host cannot read (a script file, a remote shell,
   a command substitution) matches no class rule. It is raised to the strong
   tier. The host reads a literal shell body (`sh -c '...'`) to three layers

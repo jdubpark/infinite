@@ -27,7 +27,7 @@ import {
   type PermissionTurnLauncher,
   type ReportOptions,
 } from "../packages/host/src/permission-reviewer.js";
-import { hostProtectedPaths, permissionAgentConfigSchema, type PermissionAgentSettings } from "../packages/host/src/permission-agent-config.js";
+import { hostProtectedPaths, permissionAgentConfigSchema, protectedInstallPath, type PermissionAgentSettings } from "../packages/host/src/permission-agent-config.js";
 import { PermissionReviewHeld } from "../packages/host/src/permission-agent-types.js";
 import type { PermissionRequest, PermissionReviewContext } from "../packages/host/src/permission-agent-types.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
@@ -296,6 +296,12 @@ test("marked release directories share a protected container and a stable class-
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
+});
+
+test("a marked release directly below the filesystem root keeps its own directory protected", () => {
+  assert.deepEqual(["/app", "/app/", "/srv/releases/r1/"].map(root => protectedInstallPath(root, true)), ["/app", "/app/", "/srv/releases"]);
+  const facts = { protectedPaths: [protectedInstallPath("/app", true)] };
+  assert.equal(classify(tool("Write", { file_path: "/app/notes.txt", content: "x" }), CLASSES, facts)?.rule, "class:host-configuration");
 });
 
 test("a live core judges real paths, so a link inside the session root cannot hide a target outside it", () => {

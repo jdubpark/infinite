@@ -46,12 +46,20 @@ export interface PermissionAgentSettings {
 
 const RELEASE_MARKER = ".infinite-release.json";
 
-/** A marked release contributes its stable container to the class rules, not its versioned directory. */
-function protectedInstallPath(installRoot: string): string {
+/** A marked release contributes its stable container to the class rules, not its versioned directory. A release directly
+ * below `/` keeps its own root, because the class rules drop `/` and the release would lose its protection. */
+export function protectedInstallPath(installRoot: string, marked = isMarkedRelease(installRoot)): string {
+  if (!marked) return installRoot;
+  const container = dirname(installRoot);
+  return container === "/" ? installRoot : container;
+}
+
+function isMarkedRelease(installRoot: string): boolean {
   try {
-    if (lstatSync(join(installRoot, RELEASE_MARKER)).isFile()) return dirname(installRoot);
-  } catch { /* A source checkout or an unreadable marker keeps only its own install root protected. */ }
-  return installRoot;
+    return lstatSync(join(installRoot, RELEASE_MARKER)).isFile();
+  } catch {
+    return false; // A source checkout or an unreadable marker keeps only its own install root protected.
+  }
 }
 
 /** The effective tiers: `permissionAgent.light`, else the lineup's permission reviewer. */

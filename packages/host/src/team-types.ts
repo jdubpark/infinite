@@ -2,7 +2,7 @@ import type { ConnectorSource } from "./mcp-types.js";
 import { z } from "zod";
 import { featureMapSchema, TASK_KINDS } from "./task-features.js";
 import { evalProjectSchema } from "./eval-config.js";
-import { teamRoutingSchema } from "./routing-policy.js";
+import { POINTS_ALGORITHM_VERSION, teamRoutingSchema } from "./routing-policy.js";
 import { intentCheckReportSchema } from "./intent-report.js";
 import type { RoutingKnobs, TeamRunRouting } from "./routing-types.js";
 import type { Prompt, AnswerResult } from "@infinite/attention";
@@ -366,6 +366,45 @@ export function escalationPool(run: Pick<TeamRun, "routing" | "lineup">): TeamMo
   if (!lineup || routing?.mode !== "auto") return pool;
   return pool.filter(profile => fixedRuleFailure(lineup, routing.knobs, profile) !== "contributor");
 }
+/** `lineup.escalations` that pass rules 1 and 2, in lineup order, without `ownProfileId`. */
+export function escalationCandidates(lineup: TeamLineup, knobs: Pick<RoutingKnobs, "allowContributor">, ownProfileId?: string): TeamModelProfile[] {
+  return (lineup.escalations ?? []).filter(profile => profile.id !== ownProfileId && fixedRuleFailure(lineup, knobs, profile) === undefined);
+}
+/** Implementers whose tier is not strong (a profile without a tier counts as light, as `tierCost` does) that pass rules 1 and 2. */
+export function scoutCandidates(lineup: TeamLineup, knobs: Pick<RoutingKnobs, "allowContributor">): TeamModelProfile[] {
+  return lineup.implementers.filter(profile => profile.tier !== "strong" && fixedRuleFailure(lineup, knobs, profile) === undefined);
+}
+/**
+ * An `auto` pin, revoked or not, of version POINTS_ALGORITHM_VERSION or later, lists `point`, and a candidate exists
+ * (at `escalation`, one other than `ownProfileId`). Without `ownProfileId` it is the run's coverage.
+ */
+export function coversPoint(run: Pick<TeamRun, "routing" | "lineup">, point: "escalation" | "scout", ownProfileId?: string): boolean {
+  const { routing, lineup } = run;
+  if (!lineup || !routing || routing.mode !== "auto" || routing.algorithmVersion < POINTS_ALGORITHM_VERSION || !routing.knobs.points.includes(point)) return false;
+  return point === "scout" ? scoutCandidates(lineup, routing.knobs).length > 0 : escalationCandidates(lineup, routing.knobs, ownProfileId).length > 0;
+}
+/** The member is told that the host selects: `coversPoint` and routing is not revoked. */
+export function hostSelects(run: Pick<TeamRun, "routing" | "routingRevokedAt" | "lineup">, point: "escalation" | "scout", ownProfileId?: string): boolean {
+  return run.routingRevokedAt === undefined && coversPoint(run, point, ownProfileId);
+}
+/** An implementer when `coversPoint(run, "escalation", ownProfileId)`; the project manager when `coversPoint(run, "scout")`;
+ *  false for every other role. */
+export function hostProfilesFor(run: Pick<TeamRun, "routing" | "lineup">, role: TeamRole, ownProfileId?: string): boolean {
+  if (role === "implementer") return coversPoint(run, "escalation", ownProfileId);
+  if (role === "project-manager") return coversPoint(run, "scout");
+  return false;
+}
+/** Moved from worker.ts unchanged. */
+export const PLAN_VERIFICATION_REFUSAL = "Plan rejected: this run uses the project's configured checks. Remove verification and submit a corrected plan. If the checks seem insufficient, explain that in the summary and assign tasks to run additional commands themselves and report results.";
+export const PROFILE_REQUIRED_REFUSAL = "Report rejected: name an approved agentProfileId for the escalation and for every scout, then submit the corrected report.";
+/** The worker's refusal before a report is recorded, or undefined. The verification rule first, unchanged. */
+export function reportRefusal(team: TeamAssignment, report: TeamReport): string | undefined {
+  if (team.role === "project-manager" && report.kind === "plan" && report.verification && team.verificationRefused) return PLAN_VERIFICATION_REFUSAL;
+  const missingProfile = (report.kind === "escalate" && report.agentProfileId === undefined)
+    || (report.kind === "explore" && report.tasks.some(task => task.agentProfileId === undefined));
+  if (team.hostProfiles !== true && missingProfile) return PROFILE_REQUIRED_REFUSAL;
+  return undefined;
+}
 /** The attempt limit of assertBudget: (run.goal ?? run.handoff)?.maxMembers ?? 60. */
 export function memberLimit(run: Pick<TeamRun, "goal" | "handoff">): number {
   return (run.goal ?? run.handoff)?.maxMembers ?? 60;
@@ -483,7 +522,7 @@ export const teamAcceptanceEvidenceSchema = z.object({
   evidence: z.string().trim().min(1).max(600),
 }).strict();
 export type TeamAcceptanceEvidence = z.infer<typeof teamAcceptanceEvidenceSchema>;
-export const teamScoutPlanSchema = z.object({ id: taskId, title: z.string().trim().min(1).max(100), instructions: z.string().trim().min(1).max(4000), agentProfileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/) }).strict();
+export const teamScoutPlanSchema = z.object({ id: taskId, title: z.string().trim().min(1).max(100), instructions: z.string().trim().min(1).max(4000), agentProfileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/).optional() }).strict();
 export type TeamScoutPlan = z.infer<typeof teamScoutPlanSchema>;
 export const teamTaskPlanSchema = z.object({
   id: taskId,
@@ -525,7 +564,7 @@ export const teamReportSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("explore"), summary: z.string().min(1).max(4000), parallelism: z.number().int().min(1).max(4).optional(), tasks: z.array(teamScoutPlanSchema).min(1).max(3) }).strict(),
   z.object({ kind: z.literal("findings"), summary: z.string().min(1).max(4000), evidence: z.array(teamEvidenceSchema).min(1).max(12) }).strict(),
   z.object({ kind: z.literal("no-change"), summary: z.string().min(1).max(4000), evidence: z.array(teamEvidenceSchema).min(1).max(12) }).strict(),
-  z.object({ kind: z.literal("escalate"), agentProfileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/), reason: z.string().min(1).max(4000) }).strict(),
+  z.object({ kind: z.literal("escalate"), agentProfileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/).optional(), reason: z.string().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("result"), summary: z.string().min(1).max(8000) }).strict(),
   z.object({ kind: z.literal("review"), verdict: z.enum(["approved", "changes-requested"]), summary: z.string().min(1).max(8000), uiEvidence: z.string().trim().min(1).max(4000).optional(), acceptance: z.array(teamAcceptanceEvidenceSchema).max(8).optional(), rubric: z.array(z.object({ taskId, correctness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), cleanliness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), extensibility: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), docs: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict() }).strict()).max(12).optional() }).strict(),
   z.object({ kind: z.literal("delivery"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), pullRequestUrl: z.string().trim().min(1).max(500), mergeCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), summary: z.string().trim().min(1).max(4000) }).strict(),

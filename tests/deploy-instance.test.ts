@@ -134,6 +134,8 @@ test("every tracked deploy file that names a first-instance path is rendered for
     ["instances.md", "names first-instance paths to tell them apart from an instance's"],
     ["jevcode-wrapper.sh", "repository briefings, which an instance runs without until an instance wrapper exists"],
     ["repository-graph-wrapper.py", "the code graph, which an instance runs without until an instance wrapper exists"],
+    ["grader.md", "the replay grader's runbook; a second instance changes each name by hand, as its third paragraph says"],
+    ["grader.sudoers", "the first instance's grader rule; a second instance writes its own from grader.md"],
   ]);
   const firstPath = /\/opt\/infinite\/|\/opt\/infinite-agents|\/srv\/infinite-data|\/usr\/local\/libexec\/infinite\//;
   const tracked = deployFiles();

@@ -76,14 +76,15 @@ type EvalProjectConfig = {
   capture?: boolean                       // amended 2026-11-14: turns capture on
   testPaths?: { prefixes: string[], suffixes: string[] }  // amended: optional at this stage
   retentionDays?: number                  // amended 2026-11-14: 30 to 3650, default 365
-  gradingPaths: string[]                  // runner configuration, package scripts, test helpers
+  mine?: boolean                          // amended 2026-11-16: turns mining on; read only for github projects
+  gradingPaths?: string[]                 // runner configuration, package scripts, test helpers; amended: optional at this stage
   focusedTest: TeamCommand                // argv with {files} and {report} placeholders
   reportFormat: "junit" | "tap"           // what focusedTest writes to {report}
   guardChecks?: TeamCommand[]             // default: the configured checks
   excludeAreas?: string[]                 // interface areas (contract C4); amended: optional at this stage
   candidateProfiles?: TeamModelProfile[]  // approved for replay only
   memberProfile?: string                  // launch profile of the eval identity
-  graderProfile?: string                  // launch profile of the grader identity
+  // amended 2026-11-16: no graderProfile. The grader is host configuration, eval.grader (Part 4).
   trialMinutes: number                    // default 45
 }
 ```
@@ -91,6 +92,8 @@ type EvalProjectConfig = {
 The harness replaces `{files}` with the hidden test paths and `{report}` with a file outside the checkout. A job may test a profile only from the project's lineup pools or from `candidateProfiles`, which no prompt shows. *(My call: the owner can measure a new model before it receives real work.)*
 
 *Amended 2026-11-14 (capture slice).* The first slice parses four fields, all optional: `capture`, `testPaths`, `excludeAreas`, and `retentionDays`. `capture` turns capture on, and the host reads it only for a `github` project. `retentionDays` is the number of days a captured task is kept. Without `testPaths`, the host's test-path rule applies. The other fields above are parsed as optional in delivery step 2, and a job that needs one refuses to start until it is set. *(My call: a block written for this slice stays valid when step 2 adds fields.)*
+
+*Amended 2026-11-16 (mining and validation slice).* `mine` turns mining on, and the host reads it only for a `github` project. `gradingPaths`, `focusedTest`, `reportFormat`, and `guardChecks` are optional in the stored block. A validate job refuses to start until `focusedTest` and `reportFormat` are set, and it reads the other two as they are. The grader is host configuration, `eval.grader`, with its probe and canaries (Part 4). A project has no grader field, so `graderProfile` is removed. A launch profile in the code belongs to a provider session, not to a host command. `candidateProfiles`, `memberProfile`, and `trialMinutes` wait for the trial step. *(My call: the grader is one account for every project, so a per-project field would name a choice the host does not make.)*
 
 ### Part 2. The corpus
 
@@ -140,7 +143,11 @@ When `deleteRecord` removes a run whose status is `cancelled`, the host deletes 
 
 If a kept run record has `deliveryReceipt.mergeCommit` equal to the commit, the capsule takes that run's objective and brief (`run-objective`). Otherwise it takes the commit message (`commit-message`). The host does not read Linear here, because `LinearService` cannot cut an issue's text at its creation time. The task's `paths` are the parent directories of the files the reference changes. A mined task has no coordinator label, so its kind is null.
 
+*Amended 2026-11-16 (mining slice).* A pass mines at most 50 commits. It takes the commits added since its last pass, oldest first, and then backfills older first-parent commits, newest first, until 2,000 are visited. A refused, failed, or timed-out read mines nothing for that commit, keeps the cursor, and ends the pass. A commit that changes no test file, or no other file, leaves no row. A mined capsule takes the objective and brief of the run whose `deliveryReceipt.mergeCommit` equals the commit, when a kept run record says so.
+
 **Provenance groups.** Tasks that derive from one change share a group. Set assignment, holdout rotation, and every exclusion act on whole groups. A run's captured tasks form one group. A mined commit joins it when the run's `deliveryReceipt.mergeCommit` equals the commit, or when the outcome ledger's base branch scan matched the commit to the run. The mined task is then `rejected` with `duplicate-of-captured` while the group has a `candidate` or `valid` captured task. Any other mined commit is its own group.
+
+*Amended 2026-11-16 (mining slice).* Lineage counts a captured task only when it was captured within 90 days before the commit and approved before it. A commit that would merge more than 64 groups, or that has more than 1,000 captured rows on one path in that window, is rejected `lineage-too-wide`. A merge takes the smallest group id as its root. A mined group's id begins with `mined:`, so a mined group is the root of any merge with a run group. A landing joins its mined copy without the dev-only mark. The duplicate rule applies after each mined insert, each merge, and each captured promotion.
 
 A mined commit with unclear lineage never enters the holdout set. Its lineage is unclear when it changes a file that a stored reference patch of some run's captured tasks also changes, that run was approved before the commit, and that run has no observed landing. The host reads the files from the stored patches, because `TeamTask.changedPaths` can be absent or truncated. The mined task then joins that run's group. When several runs match, their groups merge into one. The mined task is rejected while the group has a `candidate` or `valid` captured task, as above. Otherwise it is kept with the mark `lineage-unclear`. A group that holds such a task, or that was merged this way, is assigned to the dev set only. *(My call: a pull request delivery records no merge commit, and a squash merge onto a moved base matches no exact rule, so the host cannot prove that such a commit is a new change.)*
 
@@ -151,7 +158,11 @@ A mined commit with unclear lineage never enters the holdout set. Its lineage is
 3. Three reference runs pass the same expected cases, and two base runs both show the failure.
 4. The focused test run finishes within ten minutes.
 
-Validation commands run as the grader identity (Part 4), so a test that needs a network or a listener its launch profile denies fails there. A failed candidate is `rejected` with `not-fail-to-pass`, `guard-failed`, `flaky`, or `too-slow`. A scheduled revalidation retires a task whose reference stops passing, whose anchor leaves the mirror, or whose group gained a captured task. A seeded hash puts 30% of groups in the holdout set and the rest in the dev set. *(My call.)* An exposed group belongs to the dev set: it joins it, or moves to it at once. No group ever moves from the dev set to the holdout set.
+Validation commands run as the grader identity (Part 4), so a test that needs a network or a listener its launch profile denies fails there. A failed candidate is `rejected` with `not-fail-to-pass`, `guard-failed`, `flaky`, or `too-slow`.
+
+*Amended 2026-11-16 (validation slice).* The focused test receives only the hidden files, so every case in its report counts as a case of those files. The rounds run in this order, and the first decision stops them: R1 with the reference, which fixes the expected cases E; the guard checks on a fresh reference copy; B1 on the base; R2 on the reference; B2 on the base; and R3 on the reference. A base round uses Part 5's construction on the replay base: the hidden files and the `gradingPaths` files are taken from the reference. So an unchanged base fails. R2 and R3 must pass exactly E. B1 and B2 must each leave a nonempty set of E unpassed, and the two sets must be equal. A focused test's exit code never validates a task. A round without a parsable report is undecided, not a failure. Three undecided attempts end a task `unvalidated`. The reasons are in `docs/teams.md`, under Eval mining and validation.
+
+A scheduled revalidation retires a task whose reference stops passing, whose anchor leaves the mirror, or whose group gained a captured task. A seeded hash puts 30% of groups in the holdout set and the rest in the dev set. *(My call.)* An exposed group belongs to the dev set: it joins it, or moves to it at once. No group ever moves from the dev set to the holdout set.
 
 ### Part 3. Trials
 
@@ -204,6 +215,8 @@ The harness lists and stops processes by user with the means in `packages/host/s
 **What no probe covers.** The host cannot inspect history or memory that a provider holds on its own side for a login. The `isolated` label makes no claim about it. The owner sets up the eval logins with those features off where the provider offers that, and uses the logins for nothing else. This design also adds no egress filter, so a project with a public repository cannot reach `isolated`.
 
 When every probe passes, the trial is labelled `isolation: "isolated"`, otherwise `none`. A trial labelled `none` never enters a prior export or a gate receipt. Local trials are always `none`.
+
+*Amended 2026-11-16 (mining and validation slice).* The grader is one account for every project, and a launcher runs every validation command as that account. The launcher admits eight operations, and it confines each to the grader's root: `probe`, `receive`, `run`, `read`, `digest`, `stop`, `clean`, and `remove`. Before each task the host probes the account. The probe requires a different user id from the host's, a root of mode `0700` owned by the grader, no writable directory above the root, the tools the launcher needs, no readable canary, and a closed metadata address. The probe's states are `ready`, `not-configured`, `unavailable`, `misconfigured`, `exposed`, and `network-open`. A state other than `ready` starts no task. The host runs `stop` only after a probe in the same process has answered `ready`. The install and its checks are in `deploy/ubuntu/grader.md`, and the loopback services and their credentials are in `docs/security.md`.
 
 ### Part 5. Grading
 
@@ -282,6 +295,8 @@ Reservations are rows in the evidence store. The period is the spend fuse's week
 
 The host checks the job limits and reserves from the learning budget before each trial starts. It cannot cap tokens inside a session, so a job can exceed a limit by the trials already running. An exhausted limit pauses the job with `budget-exhausted`.
 
+*Amended 2026-11-16 (mining and validation slice).* A validate job has its own request shape: `kind`, `taskFilter` (task ids, origins, areas, `revalidate`, and `maxTasks`), `limits.maxWallMinutes`, `windows`, and `expiresAt`. It runs no trial and renders no prompt, so it has no `purpose`, `configurations`, `trialsPerTask`, or budget limit. Its pinned digest covers the fields that decide a validation: the validation settings, the team's setup and guard checks, and `eval.grader`. It does not cover the prompt version or the permission policy. A change to a pinned value blocks the job with `configuration-changed`, and the owner's `resume` pins the new values.
+
 No trial starts while its provider has an active limit in `ProviderLimits` or headroom below the learning floor (delegated adoption design, Part 9), while any run has an open duel, outside the job's windows, or when fewer than four host session slots are free. *(My call: real work keeps priority.)* A later job reuses a valid trial under 30 days old when the eval task, the `configId`, the profile epoch, and the harness version match. The harness version changes with grading or the trial lifecycle. A `confirm` job never reuses a trial.
 
 ### Part 7. Statistics
@@ -335,6 +350,8 @@ It covers `isolated` dev set trials, or the trials of a prospective `confirm` co
 
 The corpus summary shows task counts by state, origin, set, and area. It also shows coverage: the share of accepted production attempts that have a valid eval task.
 
+*Amended 2026-11-16 (mining and validation slice).* This slice ships `GET projects/:id`, `GET jobs`, `GET jobs/:id`, `POST jobs`, the pause, resume, and cancel controls, and `POST tasks/:id/retire`. It ships `infinite eval status`, `run PROJECT --file job.json --request-id UUID` (the route body is `{ projectId, requestId, job }`), `job`, `pause`, `resume`, `cancel`, and `retire`. The priors and report routes and commands arrive in later steps.
+
 - **API.** Under `/api/eval`: `GET projects/:id`, `GET projects/:id/priors`, `GET jobs`, `GET jobs/:id`, and `GET jobs/:id/report`. Owner only: `POST jobs`, `POST jobs/:id/pause`, `resume`, and `cancel`, and `POST tasks/:id/retire`. A task listing shows each task's group. No route returns a capsule, a patch, or a hidden file.
 - **CLI.** `infinite eval status PROJECT`, `infinite eval run --file job.json --request-id UUID`, `infinite eval report JOB`, and `infinite eval priors PROJECT`, each with `--json`.
 - **MCP.** None. No member can read eval data (contract C9 rule 3).
@@ -370,7 +387,7 @@ A later version needs a runnable interface on the host, which INF-110 tracks. It
 
 1. After a fixture run integrates an implementer task and records an approving review, a `candidate` eval task exists. Removing the run's clones does not change it. Deleting the cancelled run's record deletes it.
 2. A fixture commit whose test fails at its parent and passes with its diff becomes `valid`. One whose test passes at its parent is rejected with `not-fail-to-pass`, and one that fails one of three reference runs with `flaky`.
-3. A captured task and the mined commit of its run's merge share a group, the mined task is rejected with `duplicate-of-captured`, and no group spans both sets.
+3. A captured task and the mined commit of its run's merge share a group, the mined task is rejected with `duplicate-of-captured`, and no group spans both sets. *(Amended 2026-11-16: the clause "no group spans both sets" moves to delivery step 4, which creates the two sets. Step 2 proves the shared group and the duplicate rejection, and stores the dev-only mark for step 4 to read.)*
 4. In a prepared trial workspace, `git cat-file -e` fails for the reference commit, `git remote` prints nothing, and no hidden file content exists.
 5. No trial starts while a process runs under the eval identity, or while another session's workspace, of any project, exists in the eval root. Without both launch profiles a trial is labelled `none`, and the prior export omits it.
 6. A replay run makes no publication, Linear, or notifier call, and `GET /api/teams` does not list it.

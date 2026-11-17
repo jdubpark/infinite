@@ -623,6 +623,287 @@ Each capture read runs through the team Git prefix, with the six `-c` settings. 
 
 Form 3 is in a launcher audit that is pending with the outcome-ledger release. Forms 1 and 2 need the owner's launcher approval before capture is turned on. The launcher must also end each of the three reads by itself after 35 seconds: the host may not signal a command that the launcher runs as another account, and a read that hangs there holds one of four places until it ends.
 
+## Eval mining and validation
+
+Mining finds commits on a project's base branch that change a test file and another file. Validation runs each such commit's focused test as the grader account. A task becomes `valid` only when its runner reports show the expected cases failing on the base and passing on the reference. Neither step spends model tokens, starts a session, or changes a run. Both are off until the owner turns them on.
+
+Read this section before turning either one on. The grader account and the Git forms need owner steps first. See [the grader install](../deploy/ubuntu/grader.md) and [the grader's security boundary](security.md#eval-grader-account).
+
+### Turn it on
+
+1. Set up the grader account, if you want validation. Steps 1 to 4 of [the grader install](../deploy/ubuntu/grader.md) do it.
+2. Add the Git forms of [the mirror](#git-forms-of-mining-and-validation) to the production launcher.
+3. Set `eval.grader` in the host configuration. Without it, validation cannot start.
+4. Set `mine` for mining, and `focusedTest` and `reportFormat` for validation, in the project's `eval` block.
+5. Create a validate job with `infinite eval run PROJECT`. Mining runs without a job.
+
+### Settings
+
+Set the fields in the project's `eval` block, as the capture section shows. They are read only for a `github` project. The schema is strict.
+
+| Field | Limit | Default | Meaning |
+|---|---|---|---|
+| `mine` | boolean | `false` | Turns mining on. |
+| `gradingPaths` | up to 64 repository path prefixes | none | Paths that a round takes from the reference, so a result cannot change them. |
+| `focusedTest` | a command with `{files}` as one whole argument and `{report}` once in the arguments | none | The test that each round runs. Validation needs it. |
+| `reportFormat` | `junit` or `tap` | none | The format that the focused test writes to `{report}`. Validation needs it. |
+| `guardChecks` | up to 8 commands | the project's `checks` | Commands that must pass on the reference copy. |
+
+- The placeholder `{files}` becomes one argument per hidden file, each written as `./` plus its path. A file name cannot read as an option.
+- The placeholder `{report}` becomes a path in the grader's work directory, `reports/round-N.xml` or `.tap`.
+- The team's `setup` command, when set, runs before the tests of each round.
+- `excludeAreas` and `retentionDays` also apply to mined commits.
+
+The host configuration has one block for validation, `eval.grader`:
+
+| Field | Limit | Meaning |
+|---|---|---|
+| `prefix` | a command and its arguments | The launcher the host runs as the grader. |
+| `root` | an absolute path | The grader's root. |
+| `canaries` | up to 32 absolute paths | Files that the grader must not read. |
+
+The `eval` block of a project and the `eval.grader` block do not change a run, a member's prompt, or a team view. The routine approval digest leaves them out.
+
+### Mining
+
+Mining reads the base branch of the project's mirror (`source.baseBranch`). Each pass mines at most 50 commits. A pass has two parts.
+
+1. **Forward.** The first-parent commits added since the last pass, oldest first. A pass keeps the newest 500 new commits. Older new commits are not mined or counted.
+2. **Backfill.** The older first-parent commits, newest first. The backfill stops after 2,000 commits are visited.
+
+The first pass sets the cursor at the head of the base branch. Each commit is decided and the cursor moves in one transaction, so a restart neither skips nor repeats a commit. A rewritten branch restarts the forward walk at the new head: the head is decided first, then the backfill walks down from it within its 2,000-commit bound. Rows that exist stay.
+
+Each commit is decided in this order:
+
+1. A root commit is `skipped`.
+2. A commit with no test file, or with no other file, is `skipped`. It leaves no row.
+3. A commit that breaks a rule in the table below is rejected with that rule's code. The table lists the codes in the order the host checks them.
+4. A commit that breaks no rule becomes a `candidate`, and its groups are updated.
+
+A refused read or a failed read is not a rejection. It ends the pass, as described below.
+
+A mined capsule holds the objective, a task title, and the parent directories of the changed files, at most 32. The objective comes from the run that merged the commit, if a kept run's merge commit equals it (`run-objective`). Otherwise the objective is the commit message (`commit-message`). The message is sealed and never logged.
+
+Mined rejection codes:
+
+| Code | Meaning |
+|---|---|
+| `too-large` | More than 29 files, more than 1,499 changed lines, or a change list that was cut. |
+| `binary-change` | A file is binary. Its size is unknown, so it is never counted as small. |
+| `excluded-area-unknown` | `excludeAreas` is set, and the feature map is not available. |
+| `excluded-area` | A changed file is in an excluded area. |
+| `revert` | The commit is a revert, by its subject or by the commit it names. |
+| `ui-changes` | The run that merged the commit has UI changes. |
+| `capsule-too-large` | The commit message is over 24,000 characters, or the capsule is over 65,536 bytes. |
+| `secret-shaped` | The capsule matches a secret pattern. Nothing is stored. |
+| `lineage-too-wide` | The commit would merge more than 64 groups, or a path has more than 1,000 captured rows in the lineage window. |
+| `duplicate-of-captured` | The commit's group holds a captured `candidate` or `valid` task. |
+
+The message of a commit is read after its change counts. A message that is too large is `capsule-too-large`, as the capsule is.
+
+Mined rows never count against the capture cap of 20,000 rows. A project holds at most 5,000 mined rows. A pass starts only when 50 capsules of 65,536 bytes fit under the project's and the host's material caps. Otherwise the state is `full`, and each pass checks again.
+
+A read that is refused, fails, or times out ends the pass. The cursor stays where it was. The state becomes `failing`, and the next pass waits one hour. The host logs `Eval mining paused (read-failed).` when a project starts failing, not at each hourly retry. No commit is skipped for a failed read, and no failed read is recorded as "no test change".
+
+Mining states:
+
+| State | Meaning |
+|---|---|
+| `off` | Mining is not on for the project. |
+| `waiting` | A pass waits until capture has indexed the paths of its captured tasks. |
+| `mining` | A pass is running, or the last pass stopped at its 50-commit budget and the next pass goes on. |
+| `caught-up` | The last pass reached the newest commit, and the backfill reached the first commit or its 2,000-commit bound. |
+| `full` | The project or host material cap, or the 5,000-row limit, leaves no room. |
+| `failing` | A read failed. The next pass waits one hour. |
+
+Until the first pass, the visited, mined, skipped, and failure counts show `unknown`, never `0`.
+
+### Groups
+
+A group holds the tasks that come from one change. The captured tasks of one run share the run's group, whose id is `run:` plus the run id. A mined task starts in its own group, whose id is its task id, which begins with `mined:`.
+
+Two events merge groups:
+
+- **A landing.** A mined commit is the run's merge commit, from the run record or from the run's landing signal. The groups merge. A landing adds no dev-only mark.
+- **A lineage link.** A mined commit changes a file that a captured task changed. That task must be captured within 90 days before the commit, approved before it, and in a run with no observed landing. Its groups merge, the root takes the dev-only mark, and the mined row's `lineage` is `unclear`. With no such task, `lineage` is `clear`. More than 64 groups, or more than 1,000 rows on one path, rejects the commit `lineage-too-wide`.
+
+The smallest group id is the root of a merge. A mined group's id begins with `mined:`, which sorts before `run:`. So a mined group is the root of any merge with a run group, whichever event came first. A dev-only mark stays on its root when later merges happen. Step 4 of the delivery order will read the mark. This slice only stores it.
+
+The duplicate rule applies after each mined insert, each merge, and each captured promotion. In a root that holds a captured `candidate` or `valid` task:
+
+- a mined `candidate` is rejected `duplicate-of-captured`;
+- a mined `valid` task is retired `duplicate-of-captured`.
+
+A mined task is never reinstated. Its captured duplicate can be rejected later, and the mined task stays rejected.
+
+When a run is deleted, its captured rows and their paths go. The mined copy stays with its group row. Group rows that no task names are removed, at most 100 per sweep.
+
+Each run group without a landing is checked at most every 10 minutes, at most 100 groups per pass. A group older than 90 days is stamped as checked and skipped.
+
+The summary shows the number of roots, the dev-only roots, and the largest root's task count.
+
+### Validation
+
+A validate job runs one task at a time, host-wide. Each task's rounds run as the grader, in the directories `round-1` to `round-6` of that job's work directory. Before each task the host probes the grader and checks the copy of the base bundle. The copy is streamed again when its digest differs.
+
+A captured task's base is its anchor, with the stored base delta applied. Its reference adds the stored reference patch to the base. A mined task's base is the commit's first parent, and its reference is the commit. When the anchor of a captured task, or the commit of a mined task, is no longer on the base branch, the task is rejected or retired `anchor-missing`.
+
+The rounds run in this order. The order stops at the first decision.
+
+| Round | Tree | What the host checks |
+|---|---|---|
+| R1 | Reference | The passed hidden cases become the expected set E. An empty E rejects `not-fail-to-pass`. More than 5,000 expected cases reject `reference-too-wide`. |
+| Guards | A fresh copy of the reference | Every guard check must exit 0. A non-zero exit or a time-out rejects `guard-failed`. |
+| B1 | Base, with the hidden files and the `gradingPaths` files copied in from the reference | The cases of E that B1 does not pass form the set F1. An empty F1 rejects `not-fail-to-pass`. |
+| R2 | Reference | The passed cases must be exactly E. Any difference rejects `flaky`. |
+| B2 | Base, as B1 | The cases of E that B2 does not pass must equal F1. Any difference rejects `flaky`. |
+| R3 | Reference | The passed cases must be exactly E. Any difference rejects `flaky`. The task is then `valid`. |
+
+The focused test receives only the hidden files. Every case in its report counts as a case of those files. A report that is missing or invalid is undecided, as below. A focused test that runs past its limit rejects `too-slow`. The focused test's exit code is never read.
+
+Each command has its own limit of 10 minutes: the focused test, `setup`, each guard check, and each preparation command. A `setup` command or a preparation command that exits non-zero, or times out, is undecided `setup-failed`.
+
+A report is parsed under the job's `reportFormat`. A JUnit case key keeps its `classname`. A TAP key has no `classname`. A repeated key keeps its worst status. A report is invalid when it is over 8 MiB, has over 20,000 cases, has a key over 4,096 characters, has a DTD or an entity declaration, or, as TAP, has over 200,000 lines or a line over 16,384 characters.
+
+Validation outcomes:
+
+| Outcome | Code | Effect |
+|---|---|---|
+| Valid | none | `valid`. The expected cases are stored as hashes. Revalidation replaces them. |
+| Rejected | `not-fail-to-pass`, `guard-failed`, `flaky`, `too-slow`, `reference-too-wide` | A candidate is `rejected`. A valid task is `retired`. |
+| Rejected | `no-hidden-tests` | The reference changes no hidden test file that the diff can show. |
+| Rejected | `patch-missing`, `patch-too-large` | A stored patch is missing, or it is over 1 MiB. |
+| Rejected | `unreadable` | A sealed payload does not open. |
+| Retired | `anchor-missing` | The anchor or commit is no longer on the base branch. |
+| Retired | `owner-retired` | The owner retired the task with `infinite eval retire`. |
+| Rejected | `unvalidated` | Three attempts ended undecided. |
+| Undecided | `report-missing`, `report-invalid`, `setup-failed` | One attempt is counted on the task. The job moves on to its next task. |
+| Environment | `anchor-unknown`, `grader-failed`, `grader-processes-alive`, `halted`, `bundle-missing`, `state-changed` | No attempt is counted. The cursor stays, so the job visits the task again. |
+
+An exit code never validates a task. A focused test that exits 0 and writes no report is undecided. A round that has no report is never read as a pass or as a failure.
+
+The owner's halt stops a running command within 10 seconds. The attempt is not counted, and the job waits `halt`. A restart stops the grader's processes and cleans every job that was running, before any task starts. The restart counts no attempt.
+
+After each task the host stops every grader process, and it checks the process table. A process that survives blocks the job with `grader-processes-alive`. Each task gets a new home and temporary directory for the grader.
+
+### Validate jobs
+
+A job is created with a request. The CLI reads it from a file of at most 64 KiB, and sends it with a request id:
+
+```json
+{ "kind": "validate", "taskFilter": { "maxTasks": 20 }, "limits": { "maxWallMinutes": 60 } }
+```
+
+| Field | Limit | Default |
+|---|---|---|
+| `taskFilter.taskIds` | up to 1,000 ids, each `captured:` or `mined:` plus a name | all candidates |
+| `taskFilter.origins` | up to 2 of `captured` and `mined` | both |
+| `taskFilter.areas` | up to 32 area ids | all areas |
+| `taskFilter.revalidate` | boolean | `false`. With `true`, valid tasks validated 30 or more days ago also run. |
+| `taskFilter.maxTasks` | 1 to 1,000 | 100 |
+| `limits.maxWallMinutes` | 10 to 43,200 | none, required |
+| `windows` | up to 4 windows of whole UTC hours | No window applies. A window that ends before it starts crosses midnight. |
+| `expiresAt` | an ISO time up to 30 days ahead | 30 days |
+
+**Create.** A request id that matches a job with the same body returns that job. The same id with another body is `409` `request-conflict`. A project with a job that is `scheduled`, `running`, `paused`, or `blocked` is `409` `job-active`. Missing validation settings are `409` `eval-config-incomplete`.
+
+**Pinned configuration.** The job pins the validation settings and `eval.grader` when it is created. The settings are `focusedTest`, `reportFormat`, `gradingPaths`, `guardChecks`, and `setup`. A change to any of them blocks the job with `configuration-changed` before its next task. `resume` pins the new values, and that is the owner's approval. A change to the prompt version or the permission policy does not block a job.
+
+**Statuses.** A job is `scheduled`, `running`, `paused`, `blocked`, `completed`, `cancelled`, or `expired`. The reasons are `owner`, `validation-stuck`, `configuration-changed`, `grader-processes-alive`, `limit-reached`, `done`, and `expired`.
+
+**Waits.** A job that cannot start a task says why, in its `waiting` field:
+
+| Wait | Cause |
+|---|---|
+| `grader` | The grader state is not `ready`. |
+| `window` | The current hour is outside every window. |
+| `host-load` | The host load is high. The host checks it before each task, not during one. |
+| `halt` | The project is halted. |
+| `storage` | The grader has less than 10 GiB or 200,000 inodes free. |
+| `bundle` | The base bundle could not be streamed. |
+| `mirror` | A mirror read is refused. |
+| `another-job` | Another job's task is running. |
+
+**Order and counts.** The host works on the oldest job first. For each job it checks, in order: expiry; the limits (`maxTasks` and `maxWallMinutes`); the pinned configuration; the halt; the windows; the host load; the grader; and storage. Then it takes the next task after its cursor, by task id. The job is `completed` with reason `done` when no task is left.
+
+A job that gets three undecided results in a row is `paused` with `validation-stuck`. Environment results change no counter, and the cursor stays. The job visits the task again.
+
+**Control.** `pause` moves a `scheduled` or `running` job to `paused`. `resume` moves a `paused` or `blocked` job to `running`, or to `scheduled` when it never started. `cancel` moves any job that is not final to `cancelled`. Any other transition is `409` `invalid-job-transition`. Jobs finished more than 90 days ago are removed, at most 100 per sweep.
+
+### Summary and status
+
+`GET /api/eval/projects/:id` and `infinite eval status PROJECT` show:
+
+- task counts by state and by origin, where a state with no row counts 0;
+- the `candidate` and `valid` counts for each area, up to 64 areas;
+- the group counts of [groups](#groups);
+- the mining state and counts;
+- coverage;
+- the grader state, from a probe that runs at most every 10 minutes;
+- the project's 10 newest jobs.
+
+The set counts (dev and holdout) arrive in step 4 of the delivery order. Until then the summary shows `bySet` as null.
+
+Coverage is the share of accepted production attempts that have a valid captured task. The window is the project's `retentionDays` (365 by default), capped at 730 days. Coverage is `unknown` when there are no accepted attempts, when any ledger row cannot be read, or when the outcome ledger is not ready. An unknown share is never shown as a number.
+
+### CLI
+
+| Command | What it does |
+|---|---|
+| `infinite eval status PROJECT [--json]` | Prints the summary. |
+| `infinite eval run PROJECT --file job.json --request-id UUID [--json]` | Creates a validate job for the project. |
+| `infinite eval job JOB [--json]` | Prints one job. |
+| `infinite eval pause JOB`, `resume JOB`, `cancel JOB` | Controls a job. |
+| `infinite eval retire TASK` | Retires a `candidate` or `valid` task as `owner-retired`. |
+
+The status lines come in this order: the project; capture on or off, with the mining state and counts; the counts by state; the mined counts; the groups; the coverage; the grader state; and one line per job. A null count prints `unknown`, and so does an unknown coverage. A text value prints with control characters replaced by spaces. No line carries a file name, a message, a commit id, a case, or a capsule.
+
+A `404` without a known code prints `This host has no eval routes. Upgrade the host first.`
+
+### Routes
+
+| Route | Role |
+|---|---|
+| `GET /api/eval/projects/:id` | Owner, controller, or viewer |
+| `GET /api/eval/jobs`, `GET /api/eval/jobs/:id` | Owner, controller, or viewer |
+| `POST /api/eval/jobs` | Owner. Body `{ projectId, requestId, job }`. Answers `{ created, job }`: `201` when the job is created, `200` when the request id already holds a job. An unknown project is `404` `unknown-project`. |
+| `POST /api/eval/jobs/:id/pause`, `resume`, `cancel` | Owner |
+| `POST /api/eval/tasks/:id/retire` | Owner |
+
+A body or id that does not parse is `400` `invalid-eval-request`. An unknown project, job, or task is `404`. A store that is not ready is `503` `evidence-unavailable`. No route returns a capsule, a patch, a file name, a case, or a commit. The priors and report routes of part 8 of the design arrive in later steps.
+
+### Git forms of mining and validation
+
+Every mirror read runs through `teams.commandPrefix`, with the six `-c` settings of the capture section and `GIT_NO_REPLACE_OBJECTS=1`. Every commit id must be a full lowercase hexadecimal id before it enters an argument. A refused read changes the state of the work that depends on it, as the last column says.
+
+| Form | Command | Limit | While refused |
+|---|---|---|---|
+| E1, change counts | `git diff --no-ext-diff --no-textconv --numstat --no-renames --ignore-submodules=none --diff-algorithm=myers -z PARENT COMMIT --`, in the mirror | 30 seconds; 64 KiB, and a longer output is too large | No commit is mined. Mining is `failing`. Nothing is claimed about any commit. |
+| E2, time and message | `git log --no-walk=unsorted --no-show-signature --no-notes --encoding=UTF-8 --format=%ct%x00%B COMMIT`, in the mirror | 30 seconds; 64 KiB | No commit is mined. |
+| E3, base bundle | `git bundle create - refs/heads/BRANCH`, in the mirror | 600 seconds; streamed, at most 1 GiB | No validation starts. The job waits `bundle`. |
+| Forms 1 to 4, base scan | The base-scan forms of the outcome ledger: `merge-base --is-ancestor`, the first-parent lists, and `git log --no-walk` for up to 50 ids | 30 seconds each | Mining is `failing`. Validation waits `mirror` and counts no attempt. |
+
+The launcher ends E1 and E2 by itself after 35 seconds, and E3 after 660 seconds. The host cannot signal a command that the launcher runs as another account.
+
+The Git commands that validation runs inside the grader's root are grader commands. They run through the grader launcher, with its environment and limits. They are not forms of `teams.commandPrefix`.
+
+### Not in this slice
+
+These arrive in later steps of the delivery order:
+
+- trials, the eval identity, grading, and `baseline` jobs;
+- the dev and holdout sets, and the exposure of a group;
+- reports, priors, and their routes;
+- `candidateProfiles`, `memberProfile`, and `trialMinutes`;
+- a scheduled revalidation. An owner starts one with `revalidate`.
+
+Also not in this slice:
+
+- reinstating a mined task, and undoing a lineage merge that a later landing proves wrong;
+- skipping a commit whose reads keep failing. Mining stays `failing` and retries hourly, so the owner sees it;
+- the summary in the web client, the phone, and the Mac app;
+- MCP tools. None, by design. An eval result never reaches a member's prompt, workspace, or tool result.
+
 ## Head publication
 
 The host publishes each integrated head to GitHub, so the work survives workspace

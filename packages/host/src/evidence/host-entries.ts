@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { TeamDecision, TeamMember, TeamRun, TeamTask } from "../team-types.js";
+import { decisionAuthorityQuestion } from "../team-types.js";
 import { canonicalJson } from "./crypto.js";
 import type { HostEntry, HostEntryKind } from "./entry-types.js";
 
@@ -117,7 +118,7 @@ function answerEntry(run: TeamRun, id: string, now: string): HostEntry | undefin
     revision: decision.revision,
     at: decision.answeredAt ?? now,
     summary: entrySummary(`owner answer: ${answer}`, "owner answer"),
-    body: { source: "answer", question: decision.question, text: answer },
+    body: { source: "answer", question: decisionAuthorityQuestion(decision), text: answer },
   });
 }
 

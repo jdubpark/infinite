@@ -5,8 +5,8 @@ import { canonicalJson } from "../packages/host/src/evidence/crypto.js";
 import type { ProductGoal } from "../packages/host/src/goal-types.js";
 import type { TeamRun } from "../packages/host/src/team-types.js";
 import { canonicalBytes, cappedBytes, objectiveRecordSchema, recordDigest } from "../packages/host/src/objective-types.js";
-import type { Criterion, Direction, LogEntry, ObjectiveRecord } from "../packages/host/src/objective-types.js";
-import { goalRecord, logValue, readStoredRecord, rebuildVersion, recordView, runRecord, syncDirections } from "../packages/host/src/objective-record.js";
+import type { Assumption, Criterion, Direction, LogEntry, ObjectiveRecord, Question } from "../packages/host/src/objective-types.js";
+import { INTENT_OPS, goalRecord, logValue, readStoredRecord, rebuildVersion, recordView, runRecord, syncDirections } from "../packages/host/src/objective-record.js";
 
 const GOAL_ID = "6f1c2a3e-8b4d-4c5e-9f60-718293a4b5c6";
 const OTHER_GOAL_ID = "4b2d5f60-1c3e-4a7b-8d9f-a0b1c2d3e4f5";
@@ -278,6 +278,111 @@ test("a rebuild undoes owner corrections", () => {
   const misfit = withEntry(record, 6, { before: { inline: { ...c1, producer: "host" } }, after: { inline: c1Edited } });
   assert.equal(objectiveRecordSchema.safeParse(misfit).success, true);
   assert.throws(() => rebuildVersion(misfit, 3), { status: 409, code: "objective-version-unavailable" });
+});
+
+test("a rebuild undoes the intent check", () => {
+  const CHECKER = "intent-checker-1";
+  const DECISION = "9d3f2b1a-5c4e-4f70-8a1b-2c3d4e5f6a7b";
+  const DECISION_TWO = "1e2f3a4b-5c6d-4e7f-8091-a2b3c4d5e6f7";
+  const digestOf = (value: unknown) => createHash("sha256").update(canonicalJson(JSON.parse(JSON.stringify(value)))).digest("hex");
+  /** Seals a hand-built record the way the host does: the digest covers the record, not its log's digest. */
+  const sealed = (record: Omit<ObjectiveRecord, "digest">): ObjectiveRecord => {
+    const body = { ...record, digest: "" } as ObjectiveRecord;
+    body.digest = recordDigest(body);
+    return body;
+  };
+
+  const base = goalRecord(goalFixture(), AT, "created") as ObjectiveRecord;
+  const c1: Criterion = {
+    id: "c1", origin: "derived", derivedFrom: "Find ranked", statement: "Each source has a date.",
+    check: { kind: "judgement", item: "dates" }, producer: "evaluator", threshold: { kind: "pass" }, state: "active",
+  };
+  const a1: Assumption = {
+    id: "a1", statement: "Sources carry dates.", status: "unchecked", origin: "intent-check", criticality: "outcome",
+    refutedBy: "A source has no date.", test: { kind: "owner" }, evidence: [], proposals: [], question: "q1",
+  };
+  const q1: Question = {
+    id: "q1", text: "Outcome: must sources be dated? No default.", assumptions: ["a1"], waits: true, decisionId: DECISION, state: "open",
+  };
+  const a2: Assumption = { ...a1, id: "a2", statement: "Sources are recent.", question: "q2" };
+  const q2: Question = {
+    id: "q2", text: "Plan: how recent? No default.", assumptions: ["a2"], waits: true, decisionId: DECISION_TWO, state: "open",
+  };
+  const steered: Direction = { id: "s3", text: "Use primary sources.", source: "steering", at: at(3) };
+  const answer: Direction = { id: "ans1", text: "Sources must be dated.", source: "correction", at: at(4) };
+
+  // Version 2: the check adds a1, q1 (waiting on DECISION), and the derived criterion c1.
+  const applied2 = {
+    revision: 2, mode: "supervised", added: { assumptions: ["a1"], questions: ["q1"], criteria: ["c1"] },
+    addedDigest: digestOf({ assumptions: [a1], questions: [q1], criteria: [c1] }),
+    released: [], closed: [], waiting: ["q1"], converted: 0, dropped: {}, ignored: {},
+  };
+  const entry2: LogEntry = {
+    seq: 2, at: at(2), version: 2, actor: "intent-check", authority: "claim", op: INTENT_OPS.applied, target: RUN_ID,
+    handle: CHECKER, before: { inline: { questions: [] } }, after: { inline: applied2 },
+  };
+  const v2 = sealed({ ...base, version: 2, criteria: [...base.criteria, c1], assumptions: [a1], questions: [q1], log: [...base.log, entry2] });
+
+  // Version 3: a steered direction.
+  const entry3: LogEntry = {
+    seq: 3, at: at(3), version: 3, actor: "owner", authority: "direction", op: "direction.appended", target: "s3",
+    after: logValue(steered, "record:direction:s3"),
+  };
+  const v3 = sealed({ ...v2, version: 3, statement: { ...v2.statement, directions: [steered] }, log: [...v2.log, entry3] });
+
+  // Version 4: a text answer on DECISION sets q1 answered, drops its wait, and appends the correction ans1.
+  const entry4: LogEntry = {
+    seq: 4, at: at(4), version: 4, actor: "owner", authority: "direction", op: INTENT_OPS.answered, target: DECISION, handle: RUN_ID,
+    before: { inline: { questions: [{ id: "q1", state: "open", waits: true, decisionId: DECISION }] } },
+    after: { inline: { mode: "text", questions: ["q1"], direction: answer } },
+  };
+  const q1Answered: Question = { id: "q1", text: q1.text, assumptions: ["a1"], waits: false, state: "answered" };
+  const v4 = sealed({
+    ...v3, version: 4, questions: [q1Answered], statement: { ...v3.statement, directions: [steered, answer] }, log: [...v3.log, entry4],
+  });
+
+  // Version 5: a second check adds a2 and q2 (waiting on DECISION_TWO), then writes a skip at the same version.
+  const applied5 = {
+    revision: 5, mode: "supervised", added: { assumptions: ["a2"], questions: ["q2"], criteria: [] },
+    addedDigest: digestOf({ assumptions: [a2], questions: [q2], criteria: [] }),
+    released: [], closed: [], waiting: ["q2"], converted: 0, dropped: {}, ignored: {},
+  };
+  const entry5: LogEntry = {
+    seq: 5, at: at(5), version: 5, actor: "intent-check", authority: "claim", op: INTENT_OPS.applied, target: RUN_ID,
+    handle: CHECKER, before: { inline: { questions: [] } }, after: { inline: applied5 },
+  };
+  const entry6: LogEntry = {
+    seq: 6, at: at(5), version: 5, actor: "host", authority: "receipt", op: INTENT_OPS.skipped, target: RUN_ID,
+    after: { inline: { revision: 5, reason: "checker-failed" } },
+  };
+  const v5 = sealed({ ...v4, version: 5, assumptions: [a1, a2], questions: [q1Answered, q2], log: [...v4.log, entry5, entry6] });
+
+  // Version 6: the owner cancels the wait on DECISION_TWO.
+  const entry7: LogEntry = {
+    seq: 7, at: at(6), version: 6, actor: "host", authority: "receipt", op: INTENT_OPS.released, target: DECISION_TWO, handle: RUN_ID,
+    before: { inline: { questions: [{ id: "q2", state: "open", waits: true, decisionId: DECISION_TWO }] } },
+    after: { inline: { cause: "cancelled", questions: ["q2"] } },
+  };
+  const q2Released: Question = { id: "q2", text: q2.text, assumptions: ["a2"], waits: false, state: "open" };
+  const v6 = sealed({ ...v5, version: 6, questions: [q1Answered, q2Released], log: [...v5.log, entry7] });
+
+  for (const snapshot of [base, v2, v3, v4, v5, v6]) assert.equal(objectiveRecordSchema.safeParse(snapshot).success, true);
+  for (const [index, snapshot] of [base, v2, v3, v4, v5].entries()) {
+    assert.deepEqual(rebuildVersion(v6, index + 1), snapshot, `version ${index + 1}`);
+  }
+
+  // The applied entry's digest must match the objects it names: one byte off is a version this host cannot rebuild.
+  const after2Flipped = applied2.addedDigest.replace(/.$/, last => (last === "0" ? "1" : "0"));
+  const drifted = withEntry(v6, 2, { after: { inline: { ...applied2, addedDigest: after2Flipped } } });
+  assert.throws(() => rebuildVersion(drifted, 1), { status: 409, code: "objective-version-unavailable" });
+
+  // A `before` that names a question the record does not hold cannot be restored.
+  const missingQuestion = withEntry(v6, 4, { before: { inline: { questions: [{ id: "q9", state: "open", waits: true, decisionId: DECISION }] } } });
+  assert.throws(() => rebuildVersion(missingQuestion, 3), { status: 409, code: "objective-version-unavailable" });
+
+  // An answer's correction that is no longer in the record cannot be undone.
+  const noCorrection = sealed({ ...v6, statement: { ...v6.statement, directions: [steered] } });
+  assert.throws(() => rebuildVersion(noCorrection, 3), { status: 409, code: "objective-version-unavailable" });
 });
 
 test("a stored record is read strictly", () => {

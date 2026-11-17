@@ -928,3 +928,796 @@ Forms: `infinite goal record ID [--version N] [--json]` (step 1); `infinite goal
 - `pinned` criteria and artifact `schema` handles, which need a blob read through `teams.commandPrefix`.
 - A web, phone, or Mac form for corrections or creation criteria.
 - A controller's correction, and relay access to the route.
+
+---
+
+# Slice: the intent check
+
+**Coordinator rulings (2026-11-17)**, from the independent review. The task text below already says each one.
+
+- R1. A checker report of any kind but `intent-check` counts a failure, and `step` holds the run while the current checker exists (Task 7; Task 9's tests).
+- R2. Authority surfaces print an intent decision as fixed host text, its question ids, and the owner's answer; the checker's stored report omits every dropped item, and a checker report of any other kind is stored as fixed `blocked` text (Tasks 1, 2, 5, 7, and 9).
+- R3. A release never throws: a failed write emits one fixed event, and cancel, steer, `step`, and `hold` go on; the questions it leaves waiting are outside the current revision's invariants (Tasks 7 and 9).
+- R4. Task 13 updates `tests/autonomy-pins.test.ts` line 91 and `tests/routing-auto-run.test.ts`; Task 14 updates `tests/routing-routes.test.ts` lines 165 and 196.
+- R5. The `goals.ts` extraction moves from Task 10 into Task 13, so `goals.ts` and `teams.ts` stay within their baselines after every task ("Order and owners"; Tasks 10, 13, and 15).
+- R6. Task 8 runs before Task 7; `correctionFeedback` moves from Task 5 into Task 7; an answer ends its questions' waits and drops their `decisionId` (Tasks 2, 5, 7, and 8).
+- R7. An answer appends its correction only while the record holds fewer than 20 directions (Task 2).
+- R8. Only an answer that appends a direction logs `after` through `logValue(…, "record:direction:ans<n>")`, so a reference always names an appended direction. Any other answer logs `after` inline with no text: `{ mode: "defaults", questions }`, or at 20 or more directions `{ mode: "text", questions, directionsFull: true }`, and the decision keeps the owner's answer. The rebuild removes the direction that a reference or an inline `direction.id` names, and none otherwise; a named direction that is missing, or is not a `correction`, is 409 (Tasks 2 and 3).
+- R9. `answerIntentQuestions` returns undefined and writes nothing when no question waits on the decision, as a release does, so an answer replayed after a crash between a goal record's write and the run's save appends no second direction; Task 7 treats undefined as recorded. The text `Use the stated defaults` keeps defaults only when the decision offers that option (every waiting question's assumption is `assumed`); otherwise it is a text answer, so no question without a default is marked `default-kept` (Tasks 2 and 7).
+- Minor. Task 8's `config-identity.ts` line goes after `const command`; Task 13's step 2 exempts `pins already taken never move`. Every line number is now on the INF-280 branch.
+
+Spec `2026-11-13-objective-record-design.md` part 4 (the intent check), the parts of part 3 and part 8 that the check fills (the assumption register, open questions, and the derived-criterion marker), delivery order 3, acceptance 2 (the quote rule), 3, and 4, and the evaluator condition (C14) of `2026-11-13-continuous-autonomy-design.md` part 2. A goal cycle or standalone run pinned `autonomous` holds its project manager's plan while a read-only checker of another model family compares it with the objective record. Each gap the checker names becomes an assumption in the record. What only the owner knows becomes one blocking question, and the project manager then corrects the plan once. It builds on steps 1 and 2 (`# Slice: owner corrections and the record digest` above), which are on `main`, and on the autonomy pins of `2026-11-13-continuous-autonomy.md` Task 3, which left C14 three seams.
+
+**On by the pinned mode, as part 4 says, and pinned when the run is created.** `createRun` records `run.intentCheck` (`"on"` or `"off"`) beside `run.autonomy` and `run.routing`, so the team view shows it. It is `"on"` for a goal cycle or standalone run pinned `autonomous`, and for one pinned `supervised` only when the project sets `objective.intentCheck: "on"`. A mission subteam and a handoff run hold no record (delivery order 1), so they pin `"off"`. A run without the field was created before this slice and never checks, even after a restart. *(My reading of the coordinator's guard: the pin is per run, so a new cycle of a goal created earlier is a new run and gets the check, and a cycle created before the deploy never does.)* Release note: autonomous projects get the intent check on new runs after this deploy.
+
+**The owner's off switch.** `objective.intentCheck` takes `"on"` or `"off"` and has no default. Absent, the default of the pinned mode applies; `"off"` stops the check in autonomous mode, and `"on"` starts it in supervised mode. The key is inside the routine authority digest: `digestedProjectTeam` strips only `eval`, so `objective` is digested whole, as C11 asks. Writing the key therefore blocks active routines until the owner approves them again. The default needs no key, so no routine digest changes at the deploy, and routine runs get the check from then on. `objective.prompts` gates nothing here and becomes optional, so `{ intentCheck: "off" }` stands alone. *(My call: the check writes the record and corrects the plan whether or not the digest reaches prompts.)*
+
+**The evaluator condition (C14) lands here.** A lineup is autonomy-ready when one of its evaluators (the `evaluators` slot, else the strong reviewer, then each strong escalation) has a known family other than the coordinator's. At the two start pins, `createRun` for a run that is not a goal cycle and `GoalService.create`, an autonomous project whose lineup is not ready pins `supervised`, with an event that gives the reason, and a standing goal is refused with `standing-requires-autonomy`. The enrollment view and `repo init` report `autonomyReady` and the reason. A goal cycle copies its goal's pin (`GoalService.step`), and a resumed or restarted run keeps its own, so C14 never moves a goal or run already pinned `autonomous` under supervised ceilings; when its lineup later loses the evaluator, its checks skip (`no-eligible-profile`). The documented lineup in `docs/teams.md` (coordinator `opus-xhigh`, reviewer `astra-high`, escalations `opus-xhigh` and `astra-xhigh`) derives `[astra-high, opus-xhigh, astra-xhigh]`. It is ready, and its checker is `astra-high` (Astra 6 high, family `gpt`, against the coordinator's `claude`). *(My calls: a run without a lineup is not ready, because C14 fails closed; a derived reviewer must be strong, as part 4 asks of every evaluator.)*
+
+**The held plan is the stopped project manager's kept report.** When a plan passes today's checks, the result callback in `consume` records the check in a sealed `Stored.intentCheck` field and returns before `run.tasks` is set. The project manager is already stopped with its report. When the check ends, the host consumes that report again through today's path, so the accepted plan passes today's checks a second time and nothing else. *(My call against part 4's `run.pendingPlan`: the report is already durable in the sealed run file; a `run` field would reach every client and relay device through the team view; a second copy could drift from the one that passed the checks.)*
+
+**The checker is an ordinary member with a prebuilt prompt.** Role `intent-checker`. It is read-only (its workspace gets `assertMemberReadOnly`, as a scout's does), with no entry tools, no GitHub grant, and no setup command. The fuse counts its launch, and the router never sees it. Its profile is the first `evaluators` profile whose family (C19, `familyOf`) is known and differs from the coordinator's and from the plan author's, on a provider that is not limited. Its prompt holds no run data; it reads everything from its own context file. All its reports go to the intent module, so it cannot block the run or open a decision of its own.
+
+**One aggregated log entry per event.** `intent-check.applied`, `intent-check.answered`, `intent-check.released`, and `intent-check.skipped`, each with ids and counts inline and the prior state of every question it changed. Intent writes stop at step 2's `CORRECTION_LOG` share, so steering keeps its room, and `rebuildVersion` undoes all four. *(My call against one entry per assumption: up to 40 entries per check would fill the 380-entry share in about nine checks; one entry per event lasts about 180 to 350 checks.)*
+
+**The check writes the register; the owner answers through the decision.** This slice adds no owner op, no route, and no new digest part. *(My calls against parts 2 and 8: the owner register ops (`assumption.set`, per-question answers, promotions, definitions, rules, non-goals, excluded paths, rubric version, owner values), their CLI forms, and `POST /api/teams/:id/record` are a slice of their own. Assumptions and open questions join the record digest in step 4, with the receipts that give their statuses meaning, because 32 assumptions of 500 bytes alone exceed its 6 KiB. The autonomous-mode sentence "propose an assumption" waits for step 4's proposal tools.)* Derived criteria are the one exception, as part 4 asks: they take effect at once in the record and, where `objective.prompts` is `"on"`, in the next cycle's digest, marked `derived`.
+
+**Where the code and the design disagree.** No `run.pendingPlan` exists (ruled above). The lineup has no `crossReviewer`, so the derived `evaluators` list is the reviewer when it is strong, then each strong escalation. No enrollment view reports `autonomyReady`, and no pin site reads the lineup: the continuous-autonomy plan left C14 three seams (`createRun`, `GoalService.create`, `GoalService.step`), and Task 13 fills the first two, because the third must keep the goal's pin. Part 4 picks a checker whose family differs from the coordinator's; this plan also excludes the plan author's family, which a limit fallback can move (my call). `TeamDecision` has no `interrupt` field and no question ids, and C18 is not built: each record question names its decision through `Question.decisionId`, and the decision gains only `intentQuestions`, the ids that authority surfaces print in place of its text (R2). C16 is not on `main`, so a scout item is converted to `assume` and logged, as delivery order 3 says. Follow-ups are step 6, so `outOfScope` is ignored and counted. The option "I will answer each item" needs per-item controls, so a decision offers only "Use the stated defaults", and only when every waiting item has a default. `rebuildVersion` keeps the latest assumptions and questions today; Task 3 makes it undo them. `answer()` tells the owner "The requesting member will continue in a new attempt", which is false for the checker; Task 9 changes that sentence in place. A controller's answer is recorded `answeredBy: "owner"` (`server.ts` line 1447 calls `answer` with the default), so the record logs it as the owner's direction, as step 1 logs a controller's steer. `TeamService` already has a private method `intent` (`teams.ts` line 2649), so the new field is `intentChecks`.
+
+**Coordinator rulings (2026-11-16), with the same day's correction to the first.**
+
+- **The default follows part 4** (the correction replaced a default-off switch). The pin is taken in `createRun` (Task 13) and shown in the view, and a run created earlier never gets it. `objective.intentCheck` is the owner's off switch, inside the routine authority digest (Task 1). C14 starts new goals and runs without an eligible evaluator `supervised` and never moves a pin already taken (Tasks 4, 13, and 14).
+- **The router (INF-280) shares plan validation, prompts, and launch.** `assertTaskProfiles` and every `agentProfileId` rule stay unchanged, and the checker never reaches `applyStart` or `recordStart`, which run for implementers only (`teams.ts` lines 5025 to 5029). "Touch points shared with the router" lists every shared line.
+- **The checker sees and writes no routing value, score, member reasoning beyond the plan, or credential** ("Trust boundary").
+- **The pending plan survives a restart and meets steer, resume, cancel, and the halt** (Tasks 7 and 9).
+- **`teams.ts` stays inside its baseline after every task** ("Order and owners" gives the counts).
+
+## Trust boundary, and what a review checks
+
+These inputs originate outside the host:
+
+- **The checker's report** is model output from a member that read the repository at the run's head, so repository text can steer it. The report tool checks it with `intentCheckReportSchema` (strict, every text bounded; Task 1). The host then applies it item by item (Task 2). A command test must name a configured check and is stored as its digest; any other test must pass the record's own test schema. Every item and every derived criterion passes `findSecret(value, { token: "", url: "" })`, which knows the private key, access token, GitHub grant, and egress proxy password shapes; a hit drops the item and counts it under `secret` without echoing it. The member report is stored screened (R2, Task 7): an item or criterion that would drop as `shape`, `secret`, `command`, or `quote`, a secret-shaped `outOfScope` id, and a secret-shaped summary never reach `member.report`, so views, `memberReports`, and blackboard entries never show one. A checker report of any other kind is stored as a `blocked` report of fixed host text that names only the kind it replaced. Checker text lands only in the sealed record, the screened member report, and the decision's question. No event text, log line, error body, plain column, or authority surface carries it.
+- **The held plan and the discovery findings** are member text. They reach the checker's context file only, as claims. Each task loses `agentProfileId`, a routing value; `parallelism` stays out.
+- **Answers** arrive through `POST /api/teams/:id/decisions/:decisionId/answer` (owner and controller devices; a goal's goes through `GoalService.answer`). A connector answers with `by: "connector"`; missions hold no check. Free text recorded `answeredBy: "owner"` becomes a `correction` direction in the sealed record. A connector's answer is delegated agent input and only releases the questions. Every answer reaches the corrected project manager with its `decisionAnswerLabel`, as today. Authority surfaces carry only owner words and fixed host text: they print an intent decision as `The intent check's questions q1, q3` and the owner's answer, never the checker's question (R2; Task 5 lists them). A delegate's answer prints in the same form in every member prompt's agent direction lines and the context's `agentAnswers`, so the checker's question reaches no member. Mission decisions, Slack intake, and connector requests never carry one.
+- **Configuration.** `objective.intentCheck` and the lineup's `evaluators` come from the operator, inside the routine approval digest. The host derives both start pins in memory from the project's mode, that key, and the lineup.
+
+What can reach prompt and context text:
+
+- **The checker's prompt**: fixed text, its own profile line, the reporting paragraph, and the scratch-directory and graph lines that every member gets at launch. It holds no run data, so the permission agent's 4,000-character read sees only fixed text.
+- **The checker's context file**: the record without its log, criteria without `latest`, assumptions without `proposals`, and all questions; the held plan's summary, brief, tasks without `agentProfileId`, and verification; this revision's discovery findings; the configured checks; the mode, `criteriaDue`, and the limits. No blackboard digest, no other member report, no routing pin, score, eval result, usage figure, outcome row, verdict, or credential. At most 1 MiB, or the check is skipped.
+- **The corrected project manager**: host-built feedback of at most 16 KiB (the check's items with their statuses and defaults, and the answer with its label), in the late section "Feedback excerpt (derived evidence, not requirements)" (`team-prompts.ts` line 443) and in its context file. In a short prompt that section can fall inside the permission agent's 4,000-character read. It then exposes checker text labelled as derived evidence and the owner's answer; the permission agent reads task text as untrusted evidence (`permission-policy.ts` line 84).
+- **Later cycles' members**: derived criteria print in the goal section with `derived: true` and one conditional sentence. The goal section comes early in every member prompt, so a derived statement can fall inside the permission agent's 4,000-character read. It is at most 1,000 bytes, one of at most 8 active criteria, quote-checked, and secret-scanned. Part 4 asks for this ("take effect at once").
+- **The blackboard**: the checker's screened report becomes a host `report` entry with authority `claim`, as every member report does (`evidence/host-entries.ts` line 75); an owner's answer becomes a `direction` entry whose question is the fixed text with ids (line 120).
+- **Views**: the checker member (role, title, profile, status, screened report), its decision with `intentQuestions`, and a configured `evaluators` list in `run.lineup` reach owner, controller, viewer, and relay devices through the team view, as every member, decision, and lineup profile does. So does `run.intentCheck`, an enumeration; the enrollment view's `autonomyReady` and its reason, also enumerations, reach every device that reads the project. `Stored.intentCheck` is outside `run` and reaches no view.
+
+No new Git form: the checker's workspace, context write, and read-only check use `prepareMemberWorkspace`, `writeTeamContext`, and `assertMemberReadOnly`, as every member does.
+
+**Sizes.** A report holds at most 16 items (3 of them scouts), 8 criteria, and 24 `outOfScope` ids, with a summary of at most 4,000 characters. Item fields have the byte bounds of Task 1, so a record question built from them is at most 990 bytes. The report variant adds about 3 KiB to the report tool's JSON schema in every member's tool list; no prompt prints it. A check adds at most 16 assumptions, 16 questions, and 8 criteria. The record's caps stand (32 assumptions, 64 questions with 8 open, 8 active criteria, 32 KiB of capped bytes); an item over a cap is dropped and counted. One log entry per event, inline values at most 2 KiB, references as step 1 logs a long direction. The decision's question is at most 4,000 characters, each waiting item's line at most 440. The checker's prompt is at most 8 KiB, its context at most 1 MiB, the corrected-plan feedback at most 16 KiB, and `Stored.intentCheck` under 400 bytes (with the screen's four counts).
+
+**Cost.** On a run pinned `"off"`, an accepted plan costs one field read, and nothing runs per tick. `createRun`, `GoalService.create`, and the enrollment view compute readiness from the lineup in memory: at most 4 evaluators, one family match each. With it on, a run revision parses its record at most five times (hold, launch context, screen, apply, answer) and writes it at most three times. `step` runs once per tick for a run with no tasks and reads memory only: the state, the members, and one decision by id. A goal record is read and written in `GoalService`'s memory through Task 10's port, with one sealed write per change. No store statement, index, list route, or view reads anything new, so 1,000 sessions and 10,000 outcome rows change nothing. A checked revision adds one session, two after a failure.
+
+The slice must survive these sequences. Each has a named test.
+
+| Sequence | Expected | Test |
+|---|---|---|
+| A supervised run without the key; an autonomous run with `intentCheck: "off"`; a mission subteam or handoff run; a run created before this slice, after a restart | No checker; the plan accepted as today | Task 9 `the check follows the run's pin`; Task 13 `each new run pins the intent check by mode and setting`; Task 7 `the gate reads the run's pin` |
+| A key written, then a routine's next check | `objective.intentCheck` or the lineup's `evaluators` changes the authority digest and blocks the routine; absent keys keep it | Task 1 `the intent check settings are inside the routine approval digest` |
+| An autonomous project whose lineup has no eligible evaluator, or no lineup | New runs and goals pin `supervised` with an event that gives the reason; a standing goal is refused (`standing-requires-autonomy`); the enrollment view shows `autonomyReady: false` and the reason | Task 13 `a lineup without an eligible evaluator starts new runs and goals supervised`; Task 14 `the enrollment view says whether autonomy is ready` |
+| The lineup loses its evaluator while a goal pinned `autonomous` runs, or while a run pinned `autonomous` pauses and resumes | Pins never move: the next cycle and the resumed run stay `autonomous`, and their checks skip (`no-eligible-profile`) | Task 13 `pins already taken never move` |
+| An autonomous check with nothing that waits | The original plan accepted once; one `plan.accepted`; the record one version up | Task 9 `a check with nothing to ask accepts the plan once` |
+| Acceptance 3 | The plan waits on one decision; after the answer, the corrected plan is accepted with no second check | Task 9 `acceptance 3: an outcome ask waits for the owner and the corrected plan is not checked again` |
+| Acceptance 4 | `assumed`, the conversion logged, no decision | Task 2 `acceptance 4: an autonomous detail ask is assumed and logged` |
+| A restart in each state: queued, checking, waiting, correcting, accepting | One checker per revision, at most one decision, one accepted plan | Task 9 `the check survives a restart in every state` |
+| Random orders of hold, report, failure, answer, steer, cancel, and restart | At most one decision and two checkers per revision; the plan accepted at most once, never while a question waits | Task 7 `seeded event orders keep the invariants` |
+| The same checker report consumed twice | Applied once: the applied entry names the checker | Task 7 `a report applies once` |
+| A restart while the checker's report is being checked (its result operation is pending) | Today's restart recovery for a pending result operation; the next check releases any stale wait | Existing restart recovery tests; Task 2 `a new check releases earlier waits` |
+| A steer, or a pause and a resume, while the check runs or waits | A new revision: the old report is ignored, its waits released (`replanned`), the new revision checked once, and the old decision answers 404 `decision-not-found` | Task 9 `steering, resume, and cancel meet the pending plan` |
+| The owner's halt while waiting, an answer during the halt, then the release | The same revision (`resumeRun` in place, `teams.ts` line 2312): the decision stays current, and the kept answer resolves after the release | Task 9 `steering, resume, and cancel meet the pending plan` |
+| Cancel while waiting | `intent-check.released` with cause `cancelled` | Task 9 `steering, resume, and cancel meet the pending plan` |
+| Cancel or steer while the record's log is full or its write fails | One `releaseUnrecorded` event; the cancel saves and aborts, and the steer starts its revision, as without the check | Task 7 `a release that fails stops nothing`; Task 9 `cancel and steer on a full log complete` |
+| The checker ends without a report, stalls, hits a limit, reports any kind but `intent-check` (`question`, `blocked`, `plan`, …), or changes a file | One replacement on a fresh choice (limited providers excluded); a second failure skips (`checker-failed`) and accepts the plan unchecked; no project manager starts meanwhile | Task 7 `failures are bounded`, `a checker plan report counts a failure and starts no project manager`; Task 9 `a failed checker is replaced once and then skipped` |
+| A later pass while the checker exists (running, reported, or its operation pending) | `step` returns true; nothing starts | Task 7 `a second pass in checking with the checker present starts nothing` |
+| No eligible profile, an unreadable record, a full log, or a context over 1 MiB | Skipped with its reason and one event; the plan accepted; no checker launched | Task 7 `a skip never loses the plan` |
+| The fuse refuses the checker | The plan waits with the fuse; nothing is skipped | Task 8 `the intent checker is a counted launch role` |
+| 40 decisions already | Today's `team-decision-limit` block; the record unchanged | Task 7 `the decision cap blocks before anything is written` |
+| A secret-shaped item or criterion | Dropped and counted; never in the record, a log entry, an event, an error, the stored member report, a view, or a blackboard entry | Task 2 `secret-shaped items are dropped and never echoed`; Task 7 `the stored report is screened`; Task 9 `the checker is read-only and owns nothing` |
+| An answered intent decision | Owner sections, the authority hash input, permission follow-ups, the direction entry, Linear, and the eval capsule print fixed text, the ids, and the answer; for a delegate's answer, so do the agent direction lines and `agentAnswers` | Task 5 `an intent decision's question reaches no authority surface`, `an intent decision's Linear comments hold no checker text` |
+| A derived criterion without its quote, on a standalone run, or beyond 8 active | Dropped (`quote`, `cap`) or ignored, and counted | Task 2 `acceptance 2: a derived criterion must quote the statement` |
+| A ninth open question | The oldest open question that does not wait closes as `default-kept`; with 8 waiting, the new question is dropped and its assumption kept | Task 2 `a ninth open question closes the oldest that does not wait` |
+| A run deleted or blocked while its questions wait | The goal's next check releases them inside its applied entry | Task 2 `a new check releases earlier waits` |
+| Random intent writes, steering, and corrections with a reload between steps | Every version rebuilds to its snapshot and parses | Task 2 `every version rebuilds after random intent writes` |
+| A log at its share; a record with 20 directions | Apply, answer, and release refuse with `objective-log-full`; an answer at 20 directions appends none (`directionsFull`); 20 maximal steers still fit | Task 2 `intent writes keep room for steering` |
+| A goal record write that fails | The goal's record unchanged in memory and on disk; the check skipped (`record-unavailable`) | Task 10 `a failed goal record write changes nothing` |
+| No evidence store (`options.entries` absent) | The check runs; entries and launch marks are skipped as today | Task 9's tests run without a store |
+| A rollback to a host without this slice | A config with `objective.intentCheck` or lineup `evaluators` fails the old strict schemas; a goal whose pinned lineup has `evaluators` fails at its next cycle's creation and blocks; a pending launch whose digest marks a criterion `derived` fails the old strict `teamGoalContextSchema` and blocks that goal; a version before an intent entry answers 409 `objective-version-unavailable` (the latest still reads); a run with a held plan or a checker member blocks or replans on the old host, which also prints an answered intent decision's question on its authority surfaces; the old fuse cannot read a baseline that holds a checker launch and falls back as for an unreadable baseline until those launches leave its window; an older host ignores `run.intentCheck`, because no strict schema reads a stored run, and keeps the `supervised` pins that C14 wrote | No test. `docs/teams.md` lists the steps before a rollback: remove both keys, finish or cancel runs with a checker member, and expect goals with a pinned `evaluators` lineup to block |
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `packages/host/src/intent-report.ts` (create) | The checker's report schema and its limits; imports zod only |
+| `packages/host/src/team-types.ts` (modify) | The report variant, `objective.intentCheck`, the lineup's `evaluators`, the digest's `derived` marker, the run's pin field, the decision's `intentQuestions` and `decisionAuthorityQuestion` (Task 1); the role (Task 8) |
+| `packages/host/src/objective-types.ts` (modify) | Export the assumption test schema |
+| `packages/host/src/objective-intent.ts` (create) | Pure: applying a report, answers, releases, skips, the decision's text; the goal record port type |
+| `packages/host/src/objective-record.ts` (modify) | The intent op names; `rebuildVersion` undoes them |
+| `packages/host/src/evaluator-profiles.ts` (create) | Pure: the evaluator list, readiness, the start mode, the intent check pin, and the checker's profile |
+| `packages/host/src/intent-prompt.ts` (create) | Pure: the checker's prompt and context (Task 5), and the corrected plan's feedback (Task 7) |
+| `packages/host/src/team-prompts.ts` (modify) | Five helpers exported; the derived sentence; the decision's authority form in owner sections |
+| `packages/host/src/evidence/host-entries.ts`, `linear.ts`, `eval-rules.ts` (modify) | One line each: the decision's authority form (Task 5) |
+| `packages/host/src/objective-digest.ts`, `objective-cli.ts` (modify) | The digest marks derived criteria; the record lines show the register |
+| `packages/host/src/team-intent.ts` (create) | The per-run check: the gate, the states, the hooks, the events |
+| `packages/host/src/fuse/baseline.ts`, `manager.ts`, `worker.ts`, `github-grants.ts`, `config-identity.ts` (modify) | The role in every role list; no grant; its own prompt version |
+| `packages/host/src/teams.ts` (modify), `team-changes.ts` (create) | The change helpers moved out (Task 15); the start pins in `createRun` (Task 13); the hooks (Task 9) |
+| `packages/host/src/objective-goals.ts`, `goals.ts`, `goal-standing.ts` (modify) | C14 at goal creation and one creation helper moved (Task 13); the goal record port (Task 10) |
+| `packages/host/src/repo-enrollment.ts`, `routing-routes.ts`, `team-cli.ts` (modify) | `autonomyReady` and its reason in the enrollment view and `repo init`; the routing status previews the start mode |
+| `apps/web/src/teams.tsx`, `apps/mobile/src/features/teams/model.ts`, `packages/host/src/team-watch.ts` (modify) | The role's name and order in clients |
+| `tests/fixtures/team-agent.mjs` (modify) | The fake checker |
+| `docs/teams.md`, the spec (modify) | The check, its settings, the rollback steps, and the amendments |
+| `tests/{intent-schemas,objective-intent,evaluator-profiles,intent-prompt,team-intent,intent-check}.test.ts` (create); `tests/{routines,objective-record,team-prompts,linear-tracking,objective-digest,objective-cli,fuse-baseline,github-grants,config-identity,objective-goals,team-watch,autonomy-pins,autonomy-enrollment,standing-goals,routing-run,routing-auto-run,routing-routes}.test.ts` (modify) | Pure rules, the state machine with a fake host, the host with the fake agent, the pins, and the lineups that autonomous tests need |
+
+**Touch points shared with the router (INF-280).** This slice lands after INF-280, so it keeps every router line. In `teams.ts`: line 1631, where `run.autonomy` is pinned before `this.router?.pin` reads it (1632), changes in place for C14 with its comment (1630), and the intent check pin goes after line 1633; `routing-routes.ts` lines 3 and 62 change in place, so the routing status reads the mode a new run pins. In `prepareMember`, lines 5023, 5028, 5037, and 5046 change in place. Line 5028 is shared: its `newMember` call keeps the router's `applyStart` profile whenever no prebuilt profile is given, and the router's start (5025 to 5027) and `recordStart` (5029) are not touched. In `readMemberJournal`, line 4895 changes in place. In `consume`, one line after 5241 and one before 5343; `validateTeamPlan` and `assertTaskProfiles` (5316 and 5317) are not touched. In `launch`, one line before 5166, and 5167 and 5168 in place. In `team-prompts.ts`, `export` on lines 11, 12, 15, 230, and 268, and lines 90, 108, and 468 in place. In `team-types.ts`, the lineup schema after line 272 and `lineupProfiles` (line 321); `teamRoutingSchema` (`routing-policy.ts`) is not touched.
+
+**Order and owners.** Tasks 1, 3, 11, and 15 run first, in parallel. Then Tasks 4, 5, and 6 run in parallel (each needs Task 1). Then Tasks 2 (needs 3 and 6), 13 (needs 4 and 15), and 14 (needs 4) run in parallel. Then Task 8 (needs 1, 5, and 13). Then Task 7 (needs 2, 4, 5, and 8, because its code names the role). Then Task 9 (needs 7). Then Tasks 10 (needs 9) and 12 run in parallel. Each file has one writer at a time: Tasks 1 and 8 write `team-types.ts`, in that order; Tasks 15, 13, 8, and 9 write `teams.ts`; Tasks 13 and 10 write `goals.ts`; Tasks 5 and 7 write `intent-prompt.ts` and its test file. Every line number is on the INF-280 branch (`da7eef28` and the changes that complete it); files INF-280 does not touch read the same on `main` at `0e108bf`. Each edit quotes the code it changes, so a worker finds it by that code after INF-280 lands, and checks the position against the earlier tasks' edits: Task 15 removes `teams.ts` lines 254 to 309 and adds 2 lines after line 55; Task 13 adds 1 line after `teams.ts` line 55, 1 after 1633, and 1 after 1651, and in `goals.ts` adds 1 line after line 5 and 1 after 279 and removes lines 71 to 80 and 679. Within a task, apply edits from the bottom up. `check:size` holds after every task: `teams.ts` (5,747, baseline 5,757) is 5,693 after Task 15, 5,696 after Tasks 13 and 8, and 5,707 after Task 9; `goals.ts` (1,042, baseline 1,042) is 1,033 after Task 13 and 1,034 after Task 10. Each task confirms its counts with `wc -l`, and recomputes them from its stated net change if INF-280 lands with other counts. Every worker in a worktree is told never to use `git stash`; it compares with `git show HEAD:<path>` and sets work aside with a WIP commit. Workers run test batches that start a host in the background, so a steer can reach them. The host typecheck does not cover `tests/`, so each task runs its test files, and a task reports any cancelled test as a failure.
+
+## Review Focus
+
+1. A check the pin does not allow, or a pin that moves: a checker on a supervised run without the key, on an autonomous run with `"off"`, or on a run created before this slice; a routine digest or prompt byte changed while the key is absent; C14 moving a goal or run already pinned `autonomous`. Expect none (Task 9 `the check follows the run's pin`; Task 13 `pins already taken never move`, `each new run pins the intent check by mode and setting`; Task 1 `the intent check settings are inside the routine approval digest`; Task 5 `derived criteria are marked in the goal section`).
+2. A plan accepted twice, never, or checked twice; an answer lost; a run stuck after a restart, a steer, a pause, or a cancel; a checker report of another kind that starts planning again; a failed release that stops a cancel or a steer. Expect one accepted plan per revision and a run that always moves on (Task 9 `the check survives a restart in every state`, `steering, resume, and cancel meet the pending plan`, `cancel and steer on a full log complete`; Task 7 `seeded event orders keep the invariants`, `a skip never loses the plan`, `a checker plan report counts a failure and starts no project manager`).
+3. Member text or a credential where it must not be: run data in the checker's prompt; a routing value, score, other member's report, or credential in its context; a secret-shaped item in the record, the stored member report, a view, or a blackboard entry; checker text on an authority surface; item text in an event, log line, error body, or plain column. Expect none (Task 5 `the checker's prompt holds no run data`, `the checker's context holds the record, the plan, and the findings, and nothing else`, `an intent decision's question reaches no authority surface`; Task 2 `secret-shaped items are dropped and never echoed`; Task 9 `the checker is read-only and owns nothing`).
+4. A history that no longer rebuilds, a record that the schema refuses, or intent writes that crowd out steering. Expect every version to rebuild and parse, and steering to keep its room (Task 3 `a rebuild undoes the intent check`; Task 2 `every version rebuilds after random intent writes`, `intent writes keep room for steering`).
+5. A checker that can do more than read and report: an entry tool, a GitHub grant, an edit, a block, its own decision, a profile of the coordinator's or the plan author's family, or a launch the fuse does not count. Expect none (Task 8 `the intent checker gets no GitHub grant`, `the intent checker is a counted launch role`; Task 4 `the checker differs in family from the coordinator and the plan's author`; Task 7 `the checker cannot block, ask, or post`; Task 9 `the checker is read-only and owns nothing`).
+
+### Task 1: the report and the settings
+
+**Files:** `packages/host/src/intent-report.ts` (create), `packages/host/src/team-types.ts`, `tests/intent-schemas.test.ts` (create), `tests/routines.test.ts`. Runs first, in parallel with Tasks 3 and 11.
+
+**Interfaces (produces):**
+```ts
+// intent-report.ts: imports zod only, so team-types.ts imports it without an import cycle.
+export const INTENT_REPORT_LIMITS = {
+  items: 16, scouts: 3, criteria: 8, outOfScope: 24, summaryChars: 4_000,
+  dimensionBytes: 200, whyBytes: 500, statementBytes: 500, refutedByBytes: 500, questionBytes: 400,
+  options: 4, optionBytes: 40, defaultBytes: 200, scoutBytes: 500, testBytes: 1_024, criterionBytes: 2_048, followUpChars: 64,
+} as const;
+export type IntentItem = {
+  dimension: string; why: string; criticality: "outcome" | "plan" | "detail"; disposition: "ask" | "scout" | "assume";
+  assumption: { statement: string; refutedBy: string; test: unknown };              // test: JSON of at most testBytes
+  question?: { text: string; options: string[]; default?: string; interrupt?: "definition" };
+  scout?: string;
+};
+export const intentItemSchema: z.ZodType<IntentItem>;
+/** No type annotation, so z.discriminatedUnion takes it. */
+export const intentCheckReportSchema = z.object({
+  kind: z.literal("intent-check"),
+  summary: z.string().min(1).max(4_000),
+  items: z.array(intentItemSchema).max(16),
+  criteria: z.array(/* JSON of at most criterionBytes */).min(1).max(8).optional(),
+  outOfScope: z.array(z.string().min(1).max(64)).max(24).optional(),
+}).strict().superRefine(/* at most 3 items with disposition "scout" */);
+export type IntentCheckReport = z.infer<typeof intentCheckReportSchema>;
+
+// team-types.ts
+// teamReportSchema gains intentCheckReportSchema as its last variant.
+// teamProjectSchema: objective: z.strictObject({ prompts: z.enum(["on", "off"]).optional(), intentCheck: z.enum(["on", "off"]).optional() }).optional(),
+// TeamRun gains, after autonomy (line 675): intentCheck?: "on" | "off";  // pinned by createRun (Task 13); absent on runs created before this slice
+// TeamDecision gains, after answeredAt (line 652): intentQuestions?: string[];  // ids of the record questions it asks; set by Task 7
+// After decisionAnswerLabel (line 802), the one form every authority surface prints for a decision's question (R2):
+//   export const decisionAuthorityQuestion = (decision: Pick<TeamDecision, "question" | "intentQuestions">) =>
+//     decision.intentQuestions ? `The intent check's questions ${decision.intentQuestions.join(", ")}` : decision.question;
+// teamLineupSchema gains, after permissionReviewer: evaluators: z.array(teamModelProfileSchema).min(1).max(4).optional(),
+//   and its superRefine adds "evaluators" to the pools whose ids are unique and refuses an evaluator without tier "strong".
+// LineupShape gains "evaluators"; lineupProfiles appends ...(lineup.evaluators ?? []) last.
+// recordDigestSchema's criterion gains, after producer: derived: z.literal(true).optional().
+```
+
+**Decisions:**
+
+- An item's refinements: `question` iff `ask`; `scout` iff `scout`; a question has exactly one of `default` and `interrupt`. Bounded JSON is `z.unknown()` with a refinement that refuses `undefined` and a value whose `JSON.stringify` exceeds its bound, because `z.toJSONSchema` must still build the report tool's schema at load (`team-mcp.ts` line 20).
+- The schema checks shape and bounds; the host checks meaning item by item (Task 2). A shape refusal reaches the checker at once through the report tool, which is part 4's "refuses a question with neither and gives one correction". *(My call: refusing a whole report for one bad test would spend the checker's only replacement on a detail.)*
+- No key has a default. Absent keys leave every routine digest, lineup fingerprint, prompt, and context unchanged. Writing either key changes `RoutineService.authority` (`digestedProjectTeam` strips only `eval`, and `config.teams` is digested whole), as "Authority and safety" requires.
+- `objective.prompts` becomes optional, so the owner can write `{ intentCheck: "off" }` alone. `objectivePromptsOn` reads only `"on"`, so an absent value keeps prompts off, and step 2's `the objective switch is inside the routine approval digest` passes unchanged. `TeamRun.intentCheck` is a type only; Task 13 writes it.
+- `intentQuestions` holds ids only, so it may reach every view and relay device; no strict schema reads a stored decision. A decision without it prints as today everywhere.
+- `evaluators` is the lineup's last key, because lineup fingerprints follow key order; the comment "Keep this last" (line 271) moves to it. The identity rule already allows an evaluator that reuses another slot's id with the same identity, so a lineup can list its reviewer's profile (acceptance 11).
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `the intent report is bounded and strict` (intent-schemas) | A maximal report parses, and `teamReportSchema` accepts it. 17 items, a fourth scout, a 201-byte dimension, an ask without `question`, a question with both `default` and `interrupt` or with neither, a `scout` on an assume item, an unknown key, a test of 1,025 bytes, and a missing test are refused. `z.toJSONSchema(z.object({ report: teamReportSchema }).strict(), { target: "draft-7" })` does not throw. |
+| `the intent check setting stands alone` (intent-schemas) | `{ intentCheck: "off" }`, `{ prompts: "off", intentCheck: "on" }`, and `{ prompts: "on" }` parse; `{ intentCheck: "maybe" }` and an unknown key are refused; a project without the key parses with no `objective` key; `objectivePromptsOn` is false for `{ intentCheck: "on" }`. |
+| `evaluators are strong, unique, and last` (intent-schemas) | Five evaluators, a light one, and two with one id are refused. A parsed lineup's last key is `evaluators`. `JSON.stringify` of a lineup without the slot equals the string pinned from the base commit. `lineupProfiles` ends with the evaluators. An evaluator that reuses the reviewer's id and identity parses. |
+| `a digest criterion may be marked derived` (intent-schemas) | `derived: true` parses; `derived: false` and `derived: "yes"` are refused. `decisionAuthorityQuestion` gives `The intent check's questions q1, q2` for a decision with `intentQuestions: ["q1", "q2"]`, and the question itself without the field. |
+| `the intent check settings are inside the routine approval digest` (routines) | In the pattern of step 2's test: a routine keeps its stored authority across a reload with both keys absent; it blocks at its next check after the project gains `objective: { intentCheck: "off" }`; a second routine blocks after the lineup gains `evaluators`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/intent-schemas.test.ts tests/routines.test.ts tests/autonomy-mode.test.ts` and the host typecheck, then commit.
+
+### Task 2: applying a report to the record
+
+**Files:** `packages/host/src/objective-intent.ts` (create), `packages/host/src/objective-types.ts`, `tests/objective-intent.test.ts` (create). Needs Task 1, Task 3, and Task 6.
+
+**Interfaces (produces):** pure; no I/O, no clock, no randomness (time and ids come from the caller).
+```ts
+// objective-types.ts: today's private `assumptionTest`, exported unchanged.
+export const assumptionTestSchema: z.ZodType<AssumptionTest>;
+
+// objective-intent.ts
+export const INTENT_DEFAULTS_ANSWER = "Use the stated defaults";
+export type IntentMode = "autonomous" | "supervised";
+export type IntentDrop = "shape" | "secret" | "cap" | "quote" | "command";
+export type IntentSkipReason = "checker-failed" | "no-eligible-profile" | "record-unavailable" | "log-full" | "context-too-large";
+export type IntentReleaseCause = "replanned" | "cancelled" | "delegated-answer";
+export type IntentScreenDrop = Exclude<IntentDrop, "cap">;
+/** The report minus every item and criterion that fails shape, secret, command, or quote, and minus secret-shaped outOfScope ids;
+ *  a secret-shaped summary becomes "Summary withheld: it matched a secret shape.". Without a statement every criterion drops as quote.
+ *  Idempotent: screening a kept report drops nothing. */
+export function screenIntentReport(report: IntentCheckReport, input: { statement?: { objective: string; directions: string[] };
+  configured: readonly TeamCommand[] }): { kept: IntentCheckReport; dropped: Record<IntentScreenDrop, number> };
+export type IntentApplyContext = { runId: string; revision: number; checkerMemberId: string; decisionId: string; mode: IntentMode;
+  goal: boolean; configured: readonly TeamCommand[]; at: string; screened?: Partial<Record<IntentScreenDrop, number>> };
+export type IntentApplied = { record: ObjectiveRecord; decision?: IntentDecision;
+  added: { assumptions: string[]; questions: string[]; criteria: string[] }; dropped: Record<IntentDrop, number>; converted: number };
+export type IntentDecision = { id: string; question: string; options: string[]; questions: string[] };   // questions: the waiting ids
+/** One version up and one `intent-check.applied` entry. A bad item is dropped and counted, never thrown.
+ *  Throws objectiveError("objective-log-full") past CORRECTION_LOG, and objectiveError("objective-op-refused") when the result fails objectiveRecordSchema. */
+export function applyIntentReport(record: ObjectiveRecord, report: IntentCheckReport, context: IntentApplyContext): IntentApplied;
+/** The blocking question for the questions that wait on `decisionId`, built from the record alone; undefined when none waits. */
+export function intentDecision(record: ObjectiveRecord, decisionId: string): IntentDecision | undefined;
+/** The `intent-check.applied` entry whose handle is this checker. */
+export function intentApplied(record: ObjectiveRecord, checkerMemberId: string): LogEntry | undefined;
+/** No applied entry carries `statementDigest`, or the latest one differs from the current statement's. */
+export function criteriaDue(record: ObjectiveRecord): boolean;
+/** The owner's answer to the questions waiting on `decisionId`; each stops waiting and drops decisionId. One version up, one `intent-check.answered` entry.
+ *  Undefined when none waits (R9). Throws objectiveError("objective-log-full"), and objectiveError("objective-op-invalid") for text outside 1 to 8,000 characters. */
+export function answerIntentQuestions(record: ObjectiveRecord, answer: { decisionId: string; runId: string; text: string; at: string }): ObjectiveRecord | undefined;
+/** The questions waiting on `decisionId` stop waiting; undefined when none waits. One version up, one `intent-check.released` entry. Throws objectiveError("objective-log-full"). */
+export function releaseIntentQuestions(record: ObjectiveRecord, input: { decisionId: string; runId: string; cause: IntentReleaseCause; at: string }): ObjectiveRecord | undefined;
+/** One `intent-check.skipped` entry at the current version; the body is unchanged. Undefined when the log has no room. */
+export function skipIntentCheck(record: ObjectiveRecord, input: { runId: string; revision: number; reason: IntentSkipReason; at: string }): ObjectiveRecord | undefined;
+/** A goal's record in GoalService's memory (Task 10). `write` throws objectiveError("objective-version-stale") when the held version differs,
+ *  and rethrows a failed save after restoring the record. */
+export type GoalRecordPort = { read(goalId: string): ObjectiveState; write(goalId: string, expectedVersion: number, next: ObjectiveRecord): void };
+```
+
+**Decisions:**
+
+- **The order inside one apply.** First, every question that waits on another decision stops waiting; it is listed in the entry's `released`, with its prior state in `before`. A run has one blocking question, and a stale wait from a deleted or blocked run ends here. Then the items in report order, then the criteria, then log room, then `objectiveRecordSchema.safeParse`.
+- **An item.** (1) Its test: `{ kind: "command", run: TeamCommand, refutesOn }` must match a configured check by `commandDigest` (else `command`) and is stored as `{ kind: "command", command: <digest>, refutesOn }`; any other test must pass `assumptionTestSchema` (else `shape`). (2) `findSecret(item, { token: "", url: "" })` (else `secret`). (3) Its status. `assume` gives `assumed`. `scout` gives `assumed` and counts in `converted`, because C16 is absent (delivery order 3). In autonomous mode an `ask` is converted to `assumed` unless its criticality is `outcome` and its test kind is `owner`; a remaining ask with `default` gives `assumed` and an open question, and one with `interrupt` gives `unchecked` and a waiting question. In supervised mode every ask's question waits: `assumed` with a default, `unchecked` without. (4) Caps, all counted under `cap`: the 33rd assumption or the 65th question drops the item. Opening a ninth open question first closes the oldest open question that does not wait (`default-kept`, listed in `closed`); with 8 waiting, the new question is dropped and its assumption kept. An item that would pass 32 KiB of capped bytes is dropped. (5) Ids: `a<n>` and `q<n>`, one more than the highest number with that prefix in the record, never reused. The assumption has `origin: "intent-check"`, empty `evidence` and `proposals`, and `question` when one opens. The question's text is `${dimension}: ${text}`, then ` Options: a; b.` when there are options, then ` Default: ${default}.` or ` No default.`: at most 990 bytes under Task 1's bounds. A waiting question carries `decisionId`.
+- **The screen** (R2). `screenIntentReport` runs steps (1) and (2) on every item, the criteria's shape, secret, quote, and command checks below on every criterion (due or not), and `findSecret` on each `outOfScope` id and the summary. Task 7 stores its `kept` report as the member's report and keeps its counts; `applyIntentReport` screens again, a no-op on a kept report, and adds `context.screened` to `dropped`, so the applied entry counts every drop.
+- **Derived criteria** apply only when `context.goal` and `criteriaDue(record)`; otherwise each counts in `ignored.criteria`. Each: `derivedFrom` (1 to 500 bytes) is split off; the rest must pass step 2's `criterionInputSchema` and fit its check (`shape`); `findSecret` (`secret`); the quote must appear in the objective or a direction (`quote`, acceptance 2); a command must be configured (`command`); the canonical criterion is at most 2,048 bytes (`shape`); active criteria stay at most 8 and `recordDigestFor` at most 6,144 bytes (`cap`). An accepted one is `criterionFromInput(input, nextCriterionId(record), configured)` with `origin: "derived"` and `derivedFrom`. Task 6 adds the `derived` marker to `recordDigestFor`, so no test here pins a byte boundary. `outOfScope` ids count in `ignored.outOfScope`.
+- **The decision** (`intentDecision`) exists when a question waits on `decisionId`. Its text is `The intent check needs your answer on N item(s) before the plan proceeds. Answer in one message.`, then one line per waiting question in record order, `${i}. ${question.text}` cut to 440 characters at a character boundary ending in `...`. At most 4,000 characters. Options are `["Use the stated defaults"]` when every waiting question's assumption is `assumed`, else `[]`. `questions` lists the waiting ids, which Task 7 stores as the decision's `intentQuestions`. It reads only the record, so a restart rebuilds the same decision.
+- **The applied entry** is at version + 1: actor `intent-check`, authority `claim`, op `intent-check.applied`, target `context.runId`, handle `context.checkerMemberId`. `after` is inline: `{ revision, mode, added, addedDigest, released, closed, waiting, decision?, converted, dropped, ignored, statementDigest? }`. `before` is inline: `{ questions: [{ id, state, waits, decisionId? }] }` for each question it released or closed. `addedDigest` is the SHA-256 hex of the canonical JSON `{ assumptions, questions, criteria }` of the added objects as written. `statementDigest`, the SHA-256 hex of the canonical `{ objective, directions: [text…] }`, is written only when criteria were considered. At most 48 ids and the counts keep `after` inside 2 KiB.
+- **An answer**: actor `owner`, authority `direction`, op `intent-check.answered`, target the decision id, handle the run id. Each question that waits on the decision stops waiting and drops `decisionId`, as a release does, so no record question names the decision afterwards and the decision is closed (R6; the seeded test of Task 7 relies on it). The text `Use the stated defaults`, when the decision offers it, sets those questions to `default-kept` (R9). Other text sets them to `answered` and appends `{ id: "ans<n>", text, source: "correction", at }` to the directions only while the record holds fewer than 20 directions, so steering's 20 (`teams.ts` line 1746, `goals.ts` line 530) always fit under the record's 40 (`syncDirections` fails past it, `objective-record.ts` line 181); at 20 or more it appends none and logs `directionsFull: true` (R7). No status changes (part 4: "it sets no status"). `before` holds each question's prior `state`, `waits`, and `decisionId`. `after` is `{ mode: "defaults" | "text", questions, direction?, directionsFull? }`. An answer that appends a direction logs it through `logValue(…, "record:direction:ans<n>")`, so a long answer is logged by reference, as step 1 logs a long steer; any other answer logs `after` inline, with no text (R8). Rule 9 counts only `direction.appended` and `direction.copied` entries against steering directions, so a `correction` direction keeps step 1's history rule.
+- **A release**: actor `host`, authority `receipt`, op `intent-check.released`, target the decision id, handle the run id, `after` `{ cause, questions }`. Each question keeps its state, stops waiting, and drops `decisionId`.
+- **A skip**: actor `host`, authority `receipt`, op `intent-check.skipped`, target the run id, `after` `{ revision, reason }`, at the record's current version, so log versions stay or rise by one.
+- **Log room** is step 2's `CORRECTION_LOG` (380 entries, 210 KiB): apply, answer, and release throw `objective-log-full` past it, and a skip returns undefined.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `acceptance 4: an autonomous detail ask is assumed and logged` | Autonomous: an ask with criticality `detail`, an owner test, and a default gives one `assumed` assumption, no question, no decision, and `converted: 1` in the applied entry. |
+| `acceptance 3, record side: an outcome ask waits and a scout is assumed` | Autonomous: an outcome ask with an owner test and `interrupt`, and a scout item: `a1` `unchecked` with `q1` waiting on the decision id, `a2` `assumed`, `converted: 1`, and a decision whose text holds `q1`'s dimension, with options `[]`. Supervised, with a default instead of `interrupt`: options `["Use the stated defaults"]`. |
+| `every item is written down or counted` | 16 items with one bad test, one unconfigured command, and one secret: 13 assumptions added and dropped `{ shape: 1, command: 1, secret: 1 }`. Screening first and applying the kept report with `screened` gives the same entry. |
+| `secret-shaped items are dropped and never echoed` | A private key header, a GitHub token shape, and an egress proxy password shape, each built as `tests/member-entry.test.ts` builds them, in a statement, a question, a derived criterion, an `outOfScope` id, and the summary: `screenIntentReport` and `applyIntentReport` each drop or withhold every one as `secret`; `JSON.stringify` of the kept report and of the result holds none of them; screening the kept report again drops nothing. |
+| `acceptance 2: a derived criterion must quote the statement` | A goal's first check adds a quoting criterion as `c<n>` with `origin: "derived"` and `derivedFrom`; a non-quoting one is dropped `quote`; on a standalone run, and on a second check with an unchanged statement, criteria are ignored and counted; with 7 active criteria the second of two is dropped `cap`. |
+| `criteria are due on the first check and after a statement change` | Due on a new record; not due after an applied entry with `statementDigest`; due again after a steering direction and after an answer direction. |
+| `a ninth open question closes the oldest that does not wait` | 8 open questions with `q2` the oldest that does not wait: `q2` becomes `default-kept` and is listed in `closed`. With all 8 waiting, the new question is dropped `cap` and its assumption kept. |
+| `a new check releases earlier waits` | `q1` waits on an old decision; the next apply sets it not waiting, lists it in `released`, and keeps its prior state in `before`. |
+| `answers: defaults keep, text directs, a delegate releases` | Defaults: the waiting questions `default-kept`, statuses unchanged. Text: `answered`, and direction `ans1` with source `correction`. Release: not waiting. After each, no question waits or names the decision. Each is one version up with one entry. An 8,000-character answer is logged by reference. `intentDecision` returns the same decision before and after a JSON round trip. |
+| `intent writes keep room for steering` | At 380 log entries, apply, answer, and release throw `objective-log-full`, and a skip returns undefined; 20 steering entries of 8,000 characters, synced with `syncDirections`, still parse. With 19 directions a text answer appends `ans<n>`; with 20 it appends none and logs `directionsFull: true`; after either, 20 more steering entries sync and parse. |
+| `every version rebuilds after random intent writes` | Seeded (200 seeds, the seed printed on failure): random applies of valid and invalid items, answers, releases, skips, steering, and owner corrections (`applyOwnerOps`), with a JSON round trip between steps as a restart. For each version, `rebuildVersion(final, v)` deep-equals the snapshot taken after the last write at `v`, and every snapshot parses. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/objective-intent.test.ts tests/objective-record.test.ts tests/objective-ops.test.ts` and the host typecheck.
+
+### Task 3: the rebuild
+
+**Files:** `packages/host/src/objective-record.ts`, `tests/objective-record.test.ts`. Runs first, in parallel with Tasks 1 and 11.
+
+**Interfaces (produces):**
+```ts
+export const INTENT_OPS = { applied: "intent-check.applied", answered: "intent-check.answered",
+  released: "intent-check.released", skipped: "intent-check.skipped" } as const;
+export function rebuildVersion(record: ObjectiveRecord, version: number): ObjectiveRecord;   // signature unchanged
+```
+
+**Decisions:**
+
+- **The rebuild tracks criteria, directions, assumptions, and questions,** and undoes entries in reverse `seq`, with the entry shapes of Task 2:
+  - `intent-check.applied`: the current objects with the added ids, in record order, must hash to `addedDigest`, else 409 `objective-version-unavailable`. They are removed, and each question in `before.questions` gets back its `state`, `waits`, and `decisionId`.
+  - `intent-check.answered`: the questions in `before` are restored with their waits and `decisionId`, and the direction that `after` names (inline `direction.id`, or the id in the reference `record:direction:<id>`; none for an inline `after` without `direction`) is removed. A missing direction, or one that is not a `correction`, is 409 (R8).
+  - `intent-check.released`: the questions in `before` are restored.
+  - `intent-check.skipped`: nothing.
+  - Step 2's criterion ops and step 1's direction ops are undone as today; any other op stays 409.
+- The rebuilt record is parsed with `objectiveRecordSchema`, as step 2 does; a failure is the same 409.
+
+- [ ] **Step 1: Write the failing test** `a rebuild undoes the intent check`: a hand-built record. Version 1 is created; 2 is an applied entry adding `a1`, a waiting `q1`, and a derived `c1`; 3 a steered direction; 4 a text answer (`q1` answered, `ans1`); 5 an applied entry adding `a2` and a waiting `q2`, then a skip at 5; 6 a release of `q2` (`cancelled`). Versions 1 to 5 rebuild equal to hand-built snapshots. An `addedDigest` one byte off, and a `before` that names a missing question, answer 409. The existing `a rebuild refuses what it cannot undo` still passes unchanged. **Step 2: Run and confirm it fails.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/objective-record.test.ts tests/objective-ops.test.ts tests/objective-goals.test.ts tests/objective-runs.test.ts` and the host typecheck.
+
+### Task 4: evaluators, readiness, and the start pins
+
+**Files:** `packages/host/src/evaluator-profiles.ts` (create), `tests/evaluator-profiles.test.ts` (create). Needs Task 1. Runs in parallel with Tasks 5 and 6.
+
+**Interfaces (produces):** pure.
+```ts
+/** The lineup's `evaluators`; without the slot, the reviewer when its tier is "strong", then each strong escalation, first id wins, at most 4. Never written back. */
+export function evaluatorProfiles(lineup: TeamLineup): TeamModelProfile[];
+export type NotReady = "no-lineup" | "no-eligible-evaluator";
+export type AutonomyReadiness = { ready: true } | { ready: false; reason: NotReady };
+/** C14, from the lineup alone: ready when an evaluator's family is known and differs from the coordinator's. */
+export function autonomyReady(lineup: TeamLineup | undefined): AutonomyReadiness;
+/** The mode a new run or goal pins: an autonomous project whose lineup is not ready starts supervised, with the reason. Never used for a goal cycle. */
+export function startMode(project: { autonomy?: unknown } | undefined, lineup: TeamLineup | undefined): { mode: AutonomyMode; reason?: NotReady };
+/** The fixed event text a C14 pin writes on the run or the goal. */
+export function autonomyStartEvent(kind: "run" | "goal", reason: NotReady): string;
+/** The pin a new run records (part 4): "on" when pinned autonomous unless the setting is "off", or pinned supervised with the setting "on"; always "off" for a mission subteam or a handoff run. */
+export function intentCheckPin(input: { autonomy: AutonomyMode; setting?: "on" | "off"; mission: boolean; handoff: boolean }): "on" | "off";
+export type CheckerChoice = { profile: TeamModelProfile } | { skipped: "no-eligible-profile" };
+/** The first evaluator whose family is known and differs from the coordinator's and the plan author's, on a provider not in `limited`. */
+export function chooseIntentChecker(lineup: TeamLineup | undefined, planAuthor: TeamModelProfile | undefined, limited: ReadonlySet<Provider>): CheckerChoice;
+```
+
+**Decisions:**
+
+- Families come from `familyOf` (`permission-families.ts` line 51). An unknown family is never eligible, and an unknown coordinator family makes none eligible: C19 fails closed.
+- The plan author is the project manager member's own `modelProfile`, which a limit fallback may have moved to another provider.
+- A run without a lineup (a legacy run) gives `skipped`.
+- The derived list is never written into a config or a lineup, so the authority digest and lineup fingerprints stay as they are.
+- Readiness reads the lineup alone, as part 4 says, so it is known before the first cycle. Limits and the plan's author matter only when a checker is chosen, and then a miss skips the check; it never changes a pin.
+- The event texts: "This run starts supervised: no lineup profile of a model family other than the coordinator's can evaluate it." and, for `no-lineup`, "This run starts supervised: it has no lineup, so no evaluator of another model family can check it." The goal's texts start "This goal starts supervised:". They carry no member text.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `evaluators are listed, else derived` | The slot is returned as listed. Without it: `[reviewer, strong escalations]`, a reviewer also listed as an escalation once, a reviewer without tier `strong` and light escalations left out, at most 4. The lineup object is unchanged. |
+| `the checker differs in family from the coordinator and the plan's author` | `mixedLineup` (Claude coordinator, reviewer without a tier): `skipped`. With `evaluators` of a strong Claude and a strong Codex profile: the Codex one. A plan author on Codex: `skipped`. An evaluator whose family is unknown: `skipped`. Codex limited: `skipped`. |
+| `the documented lineup is ready and derives Astra` | The lineup of `docs/teams.md` (section "Add `lineup`"), copied into the test: `evaluatorProfiles` gives `astra-high`, `opus-xhigh`, `astra-xhigh`; `autonomyReady` is ready; `chooseIntentChecker` with the coordinator as the plan's author gives `astra-high`; with `codex` limited, `skipped`. |
+| `readiness and the start mode fail closed` | No lineup: not ready, `no-lineup`. `mixedLineup`, and a lineup whose coordinator's family is unknown: not ready, `no-eligible-evaluator`. `startMode` gives `supervised` with the reason for an autonomous project in each case, `autonomous` with no reason for a ready lineup, and `supervised` with no reason for a supervised project. |
+| `the pin follows the mode and the setting` | `intentCheckPin` over both modes, the setting absent, `"on"`, and `"off"`, and a mission subteam or handoff run: `"on"` exactly for autonomous without `"off"` and for supervised with `"on"`, never for a mission subteam or handoff run. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/evaluator-profiles.test.ts` and the host typecheck.
+
+### Task 5: the checker's prompt and context
+
+**Files:** `packages/host/src/intent-prompt.ts` (create), `packages/host/src/team-prompts.ts`, `packages/host/src/evidence/host-entries.ts`, `packages/host/src/linear.ts`, `packages/host/src/eval-rules.ts` (one line each, in place), `tests/intent-prompt.test.ts` (create), `tests/team-prompts.test.ts`, `tests/linear-tracking.test.ts`. Needs Task 1. Runs in parallel with Tasks 4 and 6. Task 7 adds the corrected plan's feedback to `intent-prompt.ts` later (R6).
+
+**Interfaces (produces):**
+```ts
+// team-prompts.ts: `export` added in place to profileInstructions (line 11), codexSandboxInstructions (12),
+//   readOnlyWorkspaceInstructions (15), contextAccessInstructions (230), and reportingInstructions (268).
+// Line 90, in place: the lead line ends "c0 is the owner's success text", then, when any digest criterion has `derived`,
+//   "; a criterion marked derived came from the intent check and the owner has not confirmed it", then ":".
+// R2, each in place, `decision.question` → `decisionAuthorityQuestion(decision)` (Task 1):
+//   team-prompts.ts line 468 (ownerDirectionLines: `Owner answered "${decisionAuthorityQuestion(item)}": ${item.answer}`),
+//   line 108 (teamContext's ownerAnswers), line 349 (the agent direction lines, a delegate's answer), and line 107
+//   (teamContext's agentAnswers, mapped to { ...item, question: decisionAuthorityQuestion(item) });
+//   evidence/host-entries.ts line 120 (the direction entry's body);
+//   linear.ts line 236 (the question comment); eval-rules.ts line 24 (the capsule's ownerAnswers).
+
+// intent-prompt.ts
+export const INTENT_PROMPT_BYTES = 8 * 1024;
+export const INTENT_CONTEXT_BYTES = 1024 * 1024;
+/** Fixed text; the profile line only when a profile is given. */
+export function intentCheckerPrompt(provider: Provider, profile?: TeamModelProfile): string;
+export type IntentContext = {
+  kind: "intent-check"; runId: string; revision: number; goal: boolean; mode: "autonomous" | "supervised"; criteriaDue: boolean;
+  record: Omit<ObjectiveRecord, "log" | "criteria" | "assumptions"> & { criteria: Omit<Criterion, "latest">[]; assumptions: Omit<Assumption, "proposals">[] };
+  plan: { memberId: string; summary: string; brief?: TeamBrief; tasks: Omit<TeamTaskPlan, "agentProfileId">[]; verification?: TeamVerification };
+  findings: { scoutId: string; title: string; report: TeamReport }[];   // this revision's scout reports, as claims
+  checks: TeamCommand[];
+  limits: { items: 16; scouts: 3; assumptionsLeft: number; criteriaLeft: number };
+};
+/** Undefined when the JSON is over INTENT_CONTEXT_BYTES. */
+export function intentContext(input: { run: TeamRun; record: ObjectiveRecord; planMember: TeamMember; mode: "autonomous" | "supervised";
+  criteriaDue: boolean; checks: readonly TeamCommand[] }): IntentContext | undefined;
+```
+
+**Decisions:**
+
+- **The prompt** is fixed text (wording is left to the builder, as the spec says) with these parts: the role (a read-only intent checker that compares a held plan with the objective record and lists what the request leaves unspecified); where its input is (`contextAccessInstructions()`); the report's shape and limits in prose, from `INTENT_REPORT_LIMITS`; when to use each disposition (ask only what only the owner knows; a scout question is recorded as an assumption in this version); derived criteria only when the context says `criteriaDue` and `goal`; never propose tasks, edit files, post entries, or ask for permissions; then `readOnlyWorkspaceInstructions`, `codexSandboxInstructions` for Codex, `profileInstructions(profile)`, and `reportingInstructions(provider)`. It takes no run, so no run data can reach it. The profile line and reporting paragraph keep `retargetPrompt` and `refreshReportingInstructions` working for it.
+- **The context** holds the parts listed under "Trust boundary". It reads only `run.discovery` (this revision's scouts and their `findings` reports), the record, the held plan member's report, and the configured checks. It never reads `run.members` beyond the plan member and the scouts, `run.routing`, `run.blackboard`, usage, or the evidence store.
+- **Authority surfaces** (R2) print `decisionAuthorityQuestion(decision)` wherever they print a decision's question today: `ownerDirectionLines` (line 468), which `ownerAuthorityHash` (`teams.ts` line 200), the permission follow-ups (`teams.ts` lines 4454 and 4457), and every member prompt's owner section read; the context's `ownerAnswers` (line 108); for a delegate's answer, the agent direction lines of every member prompt (line 349) and the context's `agentAnswers` (line 107); the blackboard's direction entry (`evidence/host-entries.ts` line 120); the Linear question comment (`linear.ts` line 236); and the eval capsule (`eval-rules.ts` line 24). A decision without `intentQuestions` prints as today, so no pinned prompt, authority hash, or entry changes. Views and CLI lines keep the question text: that is where the owner reads it to answer.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `the checker's prompt holds no run data` (intent-prompt) | For `claude`, `codex`, and `opencode` with a profile: at most 8 KiB; holds the context path, the profile line, and the reporting paragraph; `retargetPrompt` to another provider is not undefined; the Codex prompt alone holds the sandbox guidance. |
+| `the checker's context holds the record, the plan, and the findings, and nothing else` (intent-prompt) | From a run whose record has a log, `latest` on `c1`, and proposals on `a1`; a plan with `agentProfileId` and `parallelism`; findings from two scouts; and an implementer's report, a routing pin, and a blackboard flag holding sentinel strings: the context has a record without `log`, `c1` without `latest`, `a1` without `proposals`, tasks without `agentProfileId`, no `parallelism`, and both findings; `JSON.stringify` of it holds no sentinel. A context over 1 MiB gives undefined. |
+| `derived criteria are marked in the goal section` (team-prompts) | A digest with one derived criterion prints `"derived":true` on it and the conditional sentence; a digest without one prints today's text byte for byte; `the record digest replaces the success text and nothing else` still passes unchanged. |
+| `an intent decision's question reaches no authority surface` (team-prompts) | A run with an owner-answered decision and a connector-answered one, each with `intentQuestions` `["q1", "q2"]` and a question that holds a sentinel: `ownerDirectionLines` (the input of `ownerAuthorityHash` and `permissionFollowUpPrompt`), every role's `teamPrompt`, `teamContext(…)`'s `ownerAnswers` and `agentAnswers`, the `hostEntry` of the owner's answer, and `buildCapsule` hold `q1, q2` and the answers and no sentinel. A decision without the field renders as today, byte for byte. |
+| `an intent decision's Linear comments hold no checker text` (linear-tracking) | On this file's Linear fixture, with a run built as the one at line 390: the question comment holds `q1, q2` and no sentinel; the answer comment holds the owner's answer. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/intent-prompt.test.ts tests/team-prompts.test.ts tests/config-identity.test.ts tests/host-entries.test.ts tests/eval-rules.test.ts`, `tests/linear-tracking.test.ts` in the background on the host, and the host typecheck.
+
+### Task 6: the register in the digest and the CLI
+
+**Files:** `packages/host/src/objective-digest.ts`, `packages/host/src/objective-cli.ts`, `tests/objective-digest.test.ts`, `tests/objective-cli.test.ts`. Needs Task 1. Runs in parallel with Tasks 4 and 5.
+
+**Interfaces (produces):** signatures unchanged.
+```ts
+// recordDigestFor: a criterion with origin "derived" gets derived: true after producer; owner criteria are unchanged.
+// objectiveRecordLines: after "Criteria:", "Assumptions:" (or "Assumptions: none") with "  a1 assumed plan intent-check: statement",
+//   then "Open questions:" (or "Open questions: none") with "  q1 open waits: text" or "  q1 open: text". Every line through `clean`.
+```
+
+**Decisions:** a record without derived criteria gives today's digest byte for byte, so every pinned digest and prompt version holds. The CLI prints member text from the record as it prints criteria today, after `clean` removes control characters.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `the digest marks derived criteria and nothing else` (objective-digest) | A record with an owner `c1` and a derived `c2` gives `derived: true` on `c2` only; the result parses with `recordDigestSchema`; a record with owner criteria only gives the same JSON as on the base commit. |
+| `the record lines show the register` (objective-cli) | A view with `a1` (assumed), `a2` (unchecked), and `q1` (open, waiting) prints both lists in record order; a statement holding a newline prints a space; a record with neither prints `Assumptions: none` and `Open questions: none`. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/objective-digest.test.ts tests/objective-cli.test.ts tests/team-prompts.test.ts` and the host typecheck.
+
+### Task 7: the check's state machine
+
+**Files:** `packages/host/src/team-intent.ts` (create), `packages/host/src/intent-prompt.ts` (the feedback, moved from Task 5), `tests/team-intent.test.ts` (create), `tests/intent-prompt.test.ts`. Needs Tasks 2, 4, 5, and 8. Runs alone, after Task 8.
+
+**Interfaces (produces):**
+```ts
+export type IntentCheckState = {
+  revision: number; planMemberId: string;
+  status: "queued" | "checking" | "waiting" | "correcting" | "accepting" | "done" | "skipped";
+  failures: 0 | 1 | 2; checkerMemberId?: string; decisionId?: string; correctedMemberId?: string; reason?: IntentSkipReason;
+  screened?: Partial<Record<IntentScreenDrop, number>>;   // the current checker's screen counts, by assignment
+};
+/** The part of teams.ts' Stored that the check reads and writes. */
+export type IntentHolder = { run: TeamRun; intentCheck?: IntentCheckState; objectiveRecord?: unknown; objectiveNotice?: ObjectiveUnavailable };
+/** Closures over TeamService's private methods, built in one field initializer in teams.ts (Task 9). */
+export type IntentHost = {
+  prepare(holder: IntentHolder, role: "project-manager" | "intent-checker", feedback: string | undefined,
+    onPrepared: (member: TeamMember) => void, prebuilt?: { prompt: string; profile: TeamModelProfile }): void;
+  consume(holder: IntentHolder, member: TeamMember): void;
+  /** teams.ts' operation(holder, "result", perform, complete, member). */
+  operation(holder: IntentHolder, perform: (signal: AbortSignal) => Promise<boolean>, complete: (clean: boolean) => void, member: TeamMember): void;
+  save(holder: IntentHolder): void;
+  event(holder: IntentHolder, text: string): void;
+  block(holder: IntentHolder, error: unknown, member?: TeamMember): void;
+  project(run: TeamRun): Project | undefined;
+  limited(): Set<Provider>;
+  prefix(): TeamCommand | undefined;
+};
+export type { GoalRecordPort } from "./objective-intent.js";
+export const INTENT_EVENTS: { held: string; accepted: string; waiting: string; answered: string; correcting: string; replaced: string;
+  answerUnrecorded: string; releaseUnrecorded: string; skipped: Record<IntentSkipReason, string>; released: Record<IntentReleaseCause, string> };
+/** The run's pin (Task 13): true only for "on". A run created before this slice has no pin and never checks. */
+export function intentCheckDue(run: TeamRun): boolean;
+export class TeamIntent {
+  goals?: GoalRecordPort;
+  constructor(host: IntentHost);
+  /** In the plan's result callback, before tasks are set: true holds the plan. */
+  hold(holder: IntentHolder, member: TeamMember): boolean;
+  /** In the tick, where a new project manager would start: true when the check owns the run's next step. */
+  step(holder: IntentHolder): boolean;
+  /** The report stored for an intent-checker member (teams.ts line 4895): an intent-check report screened against the record
+   *  and the configured checks, its counts kept on the state when the member is the current checker; any other kind becomes a
+   *  `blocked` report of fixed host text that names only the kind it replaced (R2). */
+  screen(holder: IntentHolder, member: TeamMember, report: TeamReport): TeamReport;
+  /** Every report of an intent-checker member. */
+  consume(holder: IntentHolder, member: TeamMember): void;
+  /** A member that stopped without a usable report: true for an intent checker (handled), false for every other role. */
+  failed(holder: IntentHolder, member: TeamMember): boolean;
+  /** The checker's context at launch, or null after the check was skipped and the member stopped. */
+  context(holder: IntentHolder, member: TeamMember): IntentContext | null;
+  /** The record stops waiting on this run's decision. Never throws (R3). */
+  release(holder: IntentHolder, cause: "cancelled" | "replanned"): void;
+  answerNote(holder: IntentHolder, decision: TeamDecision): string | undefined;
+}
+
+// intent-prompt.ts (moved from Task 5, because it reads Task 2's applied entry):
+export const INTENT_FEEDBACK_BYTES = 16 * 1024;
+/** The applied entry's items with their statuses, then the answer with decisionAnswerLabel. At most INTENT_FEEDBACK_BYTES. */
+export function correctionFeedback(record: ObjectiveRecord, applied: LogEntry, decision: TeamDecision | undefined): string;
+```
+
+**Decisions:**
+
+- **The record**: a standalone run's is `holder.objectiveRecord`, read with `readStoredRecord` and written by assignment and `host.save`; a goal run's goes through `goals.read(run.goal.id)` and `goals.write(…)`. A goal run without a port (a test without `GoalService`) is `record-unavailable`. `GoalService`'s constructor registers the port (`server.ts` constructs it at line 306, and `teams.start()` runs at line 2227), so no tick runs before it.
+- **The states.** `hold` and `step` never start work while an operation is pending: `step` sits after the tick's `stored.pending` return (line 3378), and `hold` only records state.
+
+| State | On | Next | What the host does |
+|---|---|---|---|
+| none, or an older revision | `hold` with a plan that passed today's checks | `queued` | Releases an older revision's waits (`replanned`). When `intentCheckDue` is false, returns false and writes nothing. A standalone run's record is built by `planRunObjective`, and its note goes to the events. An unreadable record, a full log, or no eligible profile: `skipped` with its reason, logged when the log has room, one event, and `hold` returns false, so the plan is accepted in the same callback. Otherwise event `held`; true. |
+| `queued`, `checking`, `waiting` | `hold` with another plan of the revision | same | `planMemberId` moves to the newer plan; true. |
+| `accepting`, `correcting` | `hold` | `done`, or `skipped` when `reason` is set | False: the plan is accepted with no second check. |
+| `done`, `skipped` | `hold` | same | False. |
+| `queued` | `step` | `checking` | Chooses the profile (Task 4) with `host.limited()` and the plan member's profile, and prepares the checker with `intentCheckerPrompt`; `onPrepared` sets `checkerMemberId`. No eligible profile: a late skip. |
+| `checking` | `step` while the member with `checkerMemberId` exists, whatever its status | same | True: nothing starts, so no project manager starts while the checker runs, has reported, or waits for its operation (R1). |
+| `checking` | `step` finds no member with `checkerMemberId` | `queued` | The prepare never completed (a restart, or a failed operation); no failure is counted; true. |
+| `checking` | `consume` of the checker's `intent-check` report | `waiting` or `accepting` | `host.operation` runs `assertMemberReadOnly` on the checker's workspace and resolves false on `read-only-role-changed-files`, which is a failure. Then, if `intentApplied` finds the entry, the state follows it; else Task 2 applies with a new decision id. When a question waits and the run has 40 decisions, `block` with today's `team-decision-limit` and nothing written. Else the record is written, the decision pushed (`memberId` the checker, `revision`, `question`, `options`, `intentQuestions`, `createdAt`), `run.status` set to `needs-input`, event `waiting`. With nothing waiting: event `accepted`, `accepting`. `objective-log-full`: a late skip (`log-full`); any other failure to write: a late skip (`record-unavailable`). |
+| `checking` | a report of any kind but `intent-check` (`question`, `blocked`, `plan`, `result`, …), or `failed` (no report, stall, limit) | `queued` or `accepting` | `failures` + 1; at 2, a late skip (`checker-failed`), else event `replaced`. Such a report never reaches `host.consume` or `hold`, so it opens no decision and starts no plan (R1). A report or failure of any checker other than the current revision's `checkerMemberId` is ignored. |
+| `waiting` | `step`, no answer | `waiting` | `run.status` is `needs-input` (saved only when it changes); true. |
+| `waiting` | `step`, answered | `correcting` | `answeredBy: "owner"` (owner and controller devices): `answerIntentQuestions` (undefined: already recorded, R9). `"connector"` or `"coordinator"`: `releaseIntentQuestions` (`delegated-answer`). A failed write gives event `answerUnrecorded` (an owner's answer) or `releaseUnrecorded` (a delegate's), and the run goes on. Then as `correcting`. |
+| `correcting` | `step` | `correcting` | Without `correctedMemberId`: prepares a project manager with `correctionFeedback`, `onPrepared` sets `correctedMemberId`, event `correcting`, true. With it: false (today's flow). |
+| `accepting` | `step` | same | Consumes the held plan's member again; true. Its result callback calls `hold`, which ends the check. A held member without a plan report: `skipped`, and false (today's flow starts a project manager, whose plan is then accepted unchecked). |
+| `done`, `skipped` | `step` | same | False. |
+| any, older revision | `step` | none | Releases its waits (`replanned`) and drops the state; false. |
+| `waiting` | `release("cancelled")` | same | Releases its waits (`cancelled`). |
+
+- **A skip.** Inside `hold`, a skip sets `skipped` at once, and the plan is accepted in the same callback. After `hold` returned true, a late skip sets `accepting` with `reason`, writes `intent-check.skipped` when the log has room, and emits the skip's event; the next `step` consumes the held plan again, and its `hold` ends in `skipped`. `skipped` and `done` are final for the revision, so a plan is never consumed for acceptance twice.
+- **Releases never throw** (R3). Every release (in `hold` and `step` for an older revision, `release("cancelled")`, and a delegate's answer) catches any failure of the read or write (`objective-log-full`, a failed port write, an unreadable record), emits `releaseUnrecorded` once, and goes on as after a release that succeeded; the questions keep waiting in the record until the goal's next check releases them (Task 2). So a cancel still saves and aborts, and a steer, `step`, and `hold` go on.
+- **The screen** (R2) runs where the host stores every member report, before the tick's save and its await on the member's stop, so no view, context, or blackboard entry reads an unscreened checker report. It reads the record (a standalone run's, or the goal's through the port; unreadable: no statement, so every criterion drops) and the configured checks as the apply does, and writes `screened` by assignment only for the current checker, so a journal read twice after a restart keeps the same counts. The apply passes `screened` to Task 2. A report of any other kind from an intent-checker member, current or not, is stored as `{ kind: "blocked", summary: \`The intent checker sent a ${report.kind} report instead of an intent check; its text is withheld.\` }` with no `blocker`, so a checker's question, plan, or summary text reaches no view, context, or blackboard entry. Task 9's consume hook still sends it to `consume`, which counts it as a failure (R1).
+- **`context`** reads the record (unreadable: `skipped`, `record-unavailable`) and builds `intentContext` (over 1 MiB: `skipped`, `context-too-large`). On a skip it stops the queued checker (`status: "stopped"`, `stoppedReason` the skip's event text) and returns null; the next `step` consumes the plan again. A skipped checker never took a launch mark or a fuse admission.
+- **`answerNote`** gives `INTENT_EVENTS.answered` for the state's `decisionId`, else undefined.
+- **The feedback** (`correctionFeedback`) starts with `The intent check held your plan against the objective record (version V). Its items are claims by a read-only checker, not requirements.` One line per item added by the applied entry, `- a3 [plan, assumed]: statement (refuted by: …)` and `- q2 [answered]: text`, each cut to 600 bytes. Then `${decisionAnswerLabel(decision)} answered: ${answer}` when there is an answer. Then `Submit one corrected plan. You may depend on assumed items; plan around unchecked ones. Your earlier plan and the checker's report are in memberReports of the context file.` Items past the limit become `N more items are in the objective record.`
+- **Events** are fixed texts with no member text: `held` "The plan is held while a read-only intent check compares it with the objective record."; `accepted` "The intent check recorded its items; the plan is accepted."; `waiting` "The intent check needs the owner's answer before the plan proceeds."; `answered` "The project manager will correct its plan with this answer."; `correcting` "The project manager is correcting its plan with the intent check's items."; `replaced` "The intent checker stopped without a usable report; one replacement starts."; `answerUnrecorded` "The objective record could not record the owner's answer; the run goes on."; `releaseUnrecorded` "The objective record could not release the intent check's questions; the run goes on."; `skipped` "The intent check was skipped: REASON. The plan is accepted unchecked.", with REASON one of "the checker failed twice", "no evaluator profile differs in family from the coordinator and the plan's author", "the objective record could not be read or written", "the objective record's log is full", and "the checker's context is over 1 MiB"; `released` "The intent check's questions no longer wait: CAUSE.", with CAUSE one of "the plan was replaced", "the run was cancelled", and "a delegate answered, so the record keeps them open".
+- **The ledger.** No new run status and no new run event kind. The checker is not a row role (`isRowRole` is implementer or scout), so its member events project as the project manager's do. `plan.accepted` is emitted once, by today's callback, for the plan that is accepted.
+
+- [ ] **Step 1: Write the failing tests** in `tests/team-intent.test.ts`, with a fake host that records each call and holders built by hand.
+
+| Test name | Assertions |
+|---|---|
+| `the gate reads the run's pin` | `intentCheckDue` is true for `intentCheck: "on"`, and false for `"off"` and for a run without the field, whatever the project's settings and mode say. `hold` with the gate false returns false and calls nothing. |
+| `a plan is held once per revision` | `hold` gives true, `queued`, and one `held` event; a second `hold` of the same member gives true and no event; after `accepting`, `hold` gives false and `done`; a new revision gives a new `queued` state and releases the old waits. |
+| `a report applies once` | The same checker's report consumed twice, the second after a JSON round trip of the holder, gives one applied entry, one decision, and the same state. |
+| `the checker cannot block, ask, or post` | A checker `question` or `blocked` report counts a failure, opens no decision, and never calls `block`; a report from a checker of another revision or another member changes nothing. |
+| `failures are bounded` | No report, then a stall: `skipped` (`checker-failed`), one `intent-check.skipped` entry, and the held plan consumed again. After a limit on Codex, the replacement's profile is not on Codex. A changed file counts as a failure. |
+| `waiting meets answers` | The owner's defaults: questions `default-kept`, `correcting`, one project manager prepared with feedback that holds the answer's label. Text: `answered` and a direction. A connector: released, statuses unchanged. The corrected plan's `hold` gives false and `done`. |
+| `a skip never loses the plan` | No eligible profile, an unreadable record, a full log, and a context over 1 MiB: each `skipped` with its reason and its event; the plan accepted (`hold` false, or the plan consumed again); no checker launched; a queued checker stopped. |
+| `the decision cap blocks before anything is written` | With 40 decisions and a waiting item: `block` with `team-decision-limit`, and the record's version unchanged. |
+| `a checker plan report counts a failure and starts no project manager` | A `plan` report from the current checker, then a `result` report from its replacement: `failures` 1 then a late skip (`checker-failed`); `host.consume` and `hold` never see either report; no `prepare` of a project manager; the held plan is consumed once, after the skip. |
+| `a second pass in checking with the checker present starts nothing` | `step` twice in `checking` with the checker `running`, then twice with it `reported` and an operation pending: true each time, and no `prepare` call. |
+| `a release that fails stops nothing` | With a record whose log is at its share, and with a port whose write throws: `release("cancelled")`, `hold` of a new revision, and `step` of an older revision each throw nothing, emit `releaseUnrecorded` once, and leave the state as a successful release does. |
+| `the stored report is screened` | `screen` of an `intent-check` report with a secret-shaped statement, a bad test, an unconfigured command, and a non-quoting criterion returns it without them and sets `screened`; the applied entry's `dropped` counts all four; a `question` report and a `plan` report, each holding a secret-shaped string, come back as `blocked` reports whose summary is the fixed text naming their kind, from the current checker and from an older one; screening a member that is not the current checker sets nothing. |
+| `the corrected plan's feedback is bounded and labelled` (intent-prompt) | 16 items with 500-byte statements and an 8,000-character answer give at most 16 KiB, starting with the lead sentence and holding the answer's label. |
+| `seeded event orders keep the invariants` | Seeded (200 seeds, the seed printed on failure): random orders of hold, step, a checker report (valid, waiting, invalid, or of another kind), a failure, a failed release, an answer (owner, connector), a revision change, a cancel, and a JSON round trip of the holder as a restart. After each event: at most one decision and two checkers per revision; the plan consumed for acceptance at most once per revision and never while a question of the current revision's decision waits; every waiting question in the record names the state's current `decisionId` or a decision whose release the test made fail (R3 leaves those waiting until the goal's next check). |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/team-intent.test.ts tests/intent-prompt.test.ts` and the host typecheck.
+
+### Task 8: the role
+
+**Files:** `packages/host/src/team-types.ts` (line 538), `packages/host/src/teams.ts` (line 330, the `roleAcceptsReport` line that holds `delivery:`, in place: net 0, stays 5,696), `packages/host/src/fuse/baseline.ts` (line 13), `packages/host/src/manager.ts` (lines 614 and 752, in place: net 0, stays 1,243), `packages/host/src/worker.ts` (lines 1128 and 1385, in place: net 0, stays 1,900), `packages/host/src/github-grants.ts` (line 157, in place), `packages/host/src/config-identity.ts` (+1), `tests/fuse-baseline.test.ts`, `tests/github-grants.test.ts`, `tests/config-identity.test.ts`. Needs Tasks 1, 5, and 13 (`teams.ts` has one writer at a time). Runs alone, before Task 7, whose code names the role (R6). These are one-line edits that must land together: the new role breaks the build until every exhaustive list knows it.
+
+**Interfaces (produces):**
+```ts
+// team-types.ts line 538
+export type TeamRole = "permission-coordinator" | "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery" | "intent-checker";
+// teams.ts line 330, in place: delivery: [...], "intent-checker": ["intent-check"],
+// fuse/baseline.ts line 13: LAUNCH_ROLES gains "intent-checker" before "mission-coordinator".
+// manager.ts lines 614 and 752, worker.ts lines 1128 and 1385, in place: each role array gains "intent-checker".
+// github-grants.ts line 157, in place: || context.role === "intent-checker"  (returns undefined: no grant)
+// config-identity.ts, in renderedPrompts (line 134), after `const command = reportCommand();` (line 135), which it uses:
+//   if (role === "intent-checker") return [intentCheckerPrompt(provider, profile).split(command).join("<report-command>")];
+```
+
+**Decisions:**
+
+- `roleAcceptsReport` maps the role to `["intent-check"]`; `question` and `blocked` pass for every role, as today. The checker's reports never reach the wrong-kind block (lines 5254 and 5255): Task 9's consume hook sends them all to Task 7, which counts every kind but `intent-check` as a failure (R1).
+- The role is not in `EXEMPT_ROLES` (`fuse/rules.ts` line 18), so the fuse counts every checker launch (C13) and a refused launch waits.
+- `ENTRY_ROLES` (`entry-roles.ts` line 4) stays as it is, so `entryToolsFor` gives the checker no entry tools.
+- `teamPrompt` is never called for the checker: it launches with a prebuilt prompt of at most 8 KiB, under `newMember`'s 80 KiB rebuild threshold.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `the intent checker is a counted launch role` (fuse-baseline) | A baseline with a launch of role `intent-checker` writes and reads back; `EXEMPT_ROLES` does not hold it. |
+| `the intent checker gets no GitHub grant` (github-grants) | `sessionGithubScope({ kind: "team", role: "intent-checker", repository })` is undefined; a scout's scope still holds `fetch`. |
+| `the intent checker's prompt version is its own` (config-identity) | `promptVersion("intent-checker", provider, profile, false)` is stable across calls, differs from the reviewer's, and its render holds `<report-command>`. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/fuse-baseline.test.ts tests/github-grants.test.ts tests/config-identity.test.ts tests/team-prompts.test.ts` and the host typecheck. Also, once and not as a test: print `promptVersion` for every role and provider with the default arguments on the base commit and on the task's head, and put both lists in the task report. They must be equal for every role but the new one. Confirm with `wc -l` that `teams.ts`, `manager.ts`, and `worker.ts` did not grow.
+
+### Task 9: the hooks in `teams.ts`
+
+**Files:** `packages/host/src/teams.ts` (+11: from 5,696 after Tasks 15 and 13, to 5,707), `tests/fixtures/team-agent.mjs`, `tests/intent-check.test.ts` (create). Needs Task 7 (which follows Task 8).
+
+**Interfaces (produces):**
+```ts
+// teams.ts, by line on the INF-280 branch (find each by its code after the edits of Tasks 15, 13, and 8; apply bottom-up):
+// after 55:    import { TeamIntent, type GoalRecordPort, type IntentCheckState } from "./team-intent.js";            +1
+// 188, in place:   objectiveRecord?: unknown; objectiveNotice?: ObjectiveUnavailable; intentCheck?: IntentCheckState;
+// after 519:   private readonly intentChecks = new TeamIntent({ prepare: (s, r, f, o, p) => this.prepareMember(s as Stored, r, undefined, f, o, p),
+//                consume: (s, m) => this.consume(s as Stored, m), operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m),
+//                save: …, event: …, block: …, project: run => this.config.projects.find(…), limited: () => this.limits.limited(),
+//                prefix: () => this.config.teams?.commandPrefix });   // one line                                   +1
+// after 736:   useGoalRecords(port: GoalRecordPort) { this.intentChecks.goals = port; }                            +1
+// 2039, in place:  const next = this.intentChecks.answerNote(stored, decision) ?? (held ? "…" : "…");
+// after 2337, stopRun's last statement (the abort): if (action === "cancel") this.intentChecks.release(stored, "cancelled");   +1
+// after 3467:  if (this.intentChecks.failed(stored, member)) return;                                                +1
+// after 3549, the block's first line: if (this.intentChecks.step(stored)) return;                                   +1
+// 4895, in place:  member.report = member.role === "intent-checker" ? this.intentChecks.screen(stored, member, envelope.report) : envelope.report; …as today…
+// after 4933 and after 4980: if (this.intentChecks.failed(stored, member)) return;                                  +2
+// 5023, in place:  prepareMember(…, onPrepared?: (member: TeamMember) => void, prebuilt?: { prompt: string; profile: TeamModelProfile })
+// 5028, in place:  const member = this.newMember(run, role, "", run.headCommit!, task?.id, prebuilt?.prompt,
+//                    prebuilt?.profile ?? (start && autoPinned(run) ? this.router!.applyStart(start) : undefined));   // the router's argument kept
+// 5037, in place:  role === "project-manager" || role === "intent-checker" ? "planning" : …
+// 5046, in place:  role === "permission-coordinator" || role === "intent-checker" ? undefined : …
+// before 5166: const intentContext = member.role === "intent-checker" ? this.intentChecks.context(stored, member) : undefined; if (intentContext === null) return;   +1
+// 5167, in place:  const digest = intentContext ? undefined : this.options?.entries?.memberDigest(stored.run, member, launchSeq);
+// 5168, in place:  writeTeamContext(member.cwd, { ...(intentContext ?? teamContext(…as today…)), …as today… }, …)
+// after 5241:  if (member.role === "intent-checker") { this.intentChecks.consume(stored, member); return; }           +1
+// before 5343, the first statement of the plan's result callback: if (this.intentChecks.hold(stored, member)) return;   +1
+```
+
+**Decisions:**
+
+- **Where each hook sits.** `hold` runs after today's checks and the project manager's read-only check, before `applyProjectManagerCapacity`, so a held plan changes no capacity, task, brief, or verification. `step` is the first line inside the block that starts a project manager when the revision has no tasks (line 3549). The tick has already returned for active or waiting non-implementer members (lines 3545 and 3546), and for paused, cancelled, and blocked runs (line 3362), so a running checker or corrected project manager holds the run, a paused run is never moved to `needs-input`, and `step` never runs once the plan's tasks are set; a checker that has reported but not been consumed holds it through `step` (R1). The failure hooks run after `memberStopped`, so the ledger sees the stop as today, and before any block or same-copy replacement. The consume hook runs before `blocked` and `question` handling and before the wrong-kind block (lines 5254 and 5255), so no checker report of any kind reaches the run's own paths. The screen is line 4895, where every report is stored, before the tick's save (line 3499) and its await on the member's stop (line 3501) (R2). The cancel's release is `stopRun`'s last statement, after the abort, and never throws, so the cancel saves and aborts as today (R3).
+- **The answered-decision loop** (lines 3514 to 3531) skips the checker's decision, because the checker is `stopped`, not `waiting`. The check resolves the answer in `step` instead.
+- **The fake agent** gains a branch for role `intent-checker`. It copies its context file and its launch prompt to `${memberId}.intent-context.json` and `${memberId}.intent-prompt.txt` in the receipt directory, and writes its receipt as other roles do. With the flag file `intent-hold` it waits for `${runId}.intent-release`, as other roles wait for their release files; with `intent-silent` it exits without a report; with `intent-plan` it sends the first project manager's plan as its report; with `intent-edit` it changes a tracked file, then reports. Otherwise it reports the receipt directory's `intent-report.json`, or `{ kind: "intent-check", summary: "No gap found.", items: [] }`. A corrected project manager (its context's `feedback` starts with the intent check's lead sentence) waits for `${runId}.correct-release` while `intent-hold` exists, then sends the same plan as the first.
+
+- [ ] **Step 1: Write the failing tests** in `tests/intent-check.test.ts`: a host with the fake agent, `{ ...mixedLineup, evaluators: [<a strong Codex profile>] }`, and the configured project set to `autonomy: "autonomous"` as `tests/routing-run.test.ts` sets it, unless a row says otherwise.
+
+| Test name | Assertions |
+|---|---|
+| `the check follows the run's pin` | A supervised project without the key, and an autonomous one with `intentCheck: "off"`: no `intent-checker` member, no `intent-check.*` log entry, and the plan accepted once. A run whose sealed record loses `intentCheck` before a restart, as a run created before this slice: no checker after the restart. A supervised project with `intentCheck: "on"` and `mixedLineup` without `evaluators`: `intent-check.skipped` (`no-eligible-profile`) and the plan accepted. |
+| `a check with nothing to ask accepts the plan once` | The checker reports two assume items: no decision; the run's tasks are the first project manager's; one `plan.accepted` event; the record one version up with one `intent-check.applied`. |
+| `acceptance 3: an outcome ask waits for the owner and the corrected plan is not checked again` | The checker reports one outcome ask with an owner test and `interrupt`, and one scout. The run is `needs-input` with one decision whose `memberId` is the checker and whose text holds the item's dimension. The record has `a1` `unchecked` with `q1` waiting, and `a2` `assumed`. The owner's text answer starts one corrected project manager whose context `feedback` holds the answer. Its plan is accepted; the revision has exactly one checker; the record holds `intent-check.applied` and `intent-check.answered`. |
+| `the check survives a restart in every state` | For each of `queued` (no checker yet), `checking` (the checker held by a flag), `waiting`, `correcting` (the corrected project manager held), and `accepting` (before the held plan's operation): the host stops and starts again from disk, then the flags are released. One checker per revision, at most one decision, one `plan.accepted`, and the same final tasks as without the restart. |
+| `steering, resume, and cancel meet the pending plan` | A steer while the checker runs: a new revision, the old report ignored, one check in the new revision. A steer while waiting: the question no longer waits (`intent-check.released`, `replanned`), and answering the old decision gives 404 `decision-not-found`. A pause and a resume while waiting: a new revision, the waits released (`replanned`), and one check in the new revision. The owner's halt while waiting, an answer during the halt, then the release: the answer resolves in the same revision. A cancel while waiting: `intent-check.released` with `cancelled`. |
+| `a failed checker is replaced once and then skipped` | With `intent-silent`: two checker members, then `intent-check.skipped` (`checker-failed`), the plan accepted, and the skipped event's text. With `intent-plan`: the same, and exactly one project manager in the revision until the plan is accepted (R1). |
+| `cancel and steer on a full log complete` | While a run waits, the host stops; the test fills the sealed run record's log to its share (380 entries) and starts the host again. A cancel ends the run `cancelled` with every member stopped and one `releaseUnrecorded` event, as a cancel without the check ends. In a second run, a steer starts the new revision, whose check is skipped (`log-full`) and whose plan is accepted (R3). |
+| `the checker is read-only and owns nothing` | The copied context has no `agentProfileId`, no `log`, no `entries` key, and no implementer report. The copied prompt holds no objective text, plan text, or steering text. The checker member has no `entryTools`. With `intent-edit`, the edit counts as a failure. A checker item with a secret-shaped statement appears in no view, in no later member's `memberReports` (the corrected project manager's copied context), and in no `hostEntry` of the run's `hostEntrySources` (R2). The same holds for a checker `question` report with a secret-shaped question: the host stores the fixed `blocked` text in its place. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/intent-check.test.ts tests/objective-runs.test.ts tests/team-events.test.ts` on the host, in the background, and the host typecheck. Confirm with `wc -l` that `teams.ts` is 5,707 lines. Task 9 is the last task that writes `teams.ts`.
+
+### Task 10: goal records
+
+**Files:** `packages/host/src/objective-goals.ts`, `packages/host/src/goals.ts` (+1: from 1,033 after Task 13, to 1,034), `tests/objective-goals.test.ts`. Needs Task 9. Runs in parallel with Task 12.
+
+**Interfaces (produces):**
+```ts
+// objective-goals.ts
+/** Reads a goal's record from GoalService's memory. A write checks the held version, sets the held object's record in place,
+ *  and saves it; a failed save restores the record and rethrows. */
+export function goalRecordPort(holderOf: (goalId: string) => GoalHolder | undefined, save: (holder: GoalHolder) => void): GoalRecordPort;
+// goals.ts (Task 13 already moved lines 71 to 80 and 679 out):
+//   after the constructor's load loop (which starts at line 111 on the base): teams.useGoalRecords(goalRecordPort(id => this.records.get(id), holder => this.save(holder as Stored)));  (+1)
+//   the import on line 19 (objective-goals.js) changes in place.
+```
+
+**Decisions:**
+
+- **In place, not a copy.** A goal tick that holds the same object across an `await` saves the check's write with its own. `GoalService` replaces a record object only in synchronous code (`correctObjective`, creation, and load: the three `this.records.set` calls), so no copy taken before a port write can overwrite it later. *(Found while planning: `correctObjective` saves a copy and swaps it in, which is safe only because it never awaits.)*
+- The port writes no goal event; the run's events say what happened, and the goal's record route shows the result.
+- The running cycle keeps its pinned digest (step 2). Derived criteria reach the next cycle's digest.
+
+- [ ] **Step 1: Write the failing tests** in `tests/objective-goals.test.ts`.
+
+| Test name | Assertions |
+|---|---|
+| `a goal cycle's check writes the goal's record` | On this file's scheduler fixture (`tests/fixtures/team-scheduler.ts`), a goal on a project with `autonomy: "autonomous"` and `objective: { prompts: "on" }`, and a lineup whose `evaluators` holds a strong Codex profile, so the goal and its cycles pin `autonomous` and each cycle pins the check. The test injects, through `f.report`, the project manager's plan with a brief, then the checker's report: one assume item and one criterion that quotes the success text. The goal's record is version 2 with `a1`, a derived `c1`, and one `intent-check.applied`; the running cycle's `goal.record` is unchanged; the next cycle's digest lists `c1` with `derived: true`; reopened from disk, the same. |
+| `a failed goal record write changes nothing` | With `f.blockRecordWrites("goal", id)`: the check is skipped (`record-unavailable`), the plan accepted, and the goal's record still version 1 in memory and on disk. After the restore, the next cycle's check writes. |
+| `lists, single reads, and an idle tick parse no record and read no sealed file` (extended) | With a cycle waiting on the intent check's question, an idle tick parses no record and reads no sealed file. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/objective-goals.test.ts tests/standing-goals.test.ts` and the host typecheck. Confirm with `wc -l` that `goals.ts` is 1,034 lines, within its baseline of 1,042.
+
+### Task 11: clients
+
+**Files:** `apps/web/src/teams.tsx`, `apps/mobile/src/features/teams/model.ts`, `packages/host/src/team-watch.ts`, `tests/team-watch.test.ts`. Runs first, in parallel with Tasks 1 and 3.
+
+**Decisions:**
+
+- Web: `TeamRole` (line 14) gains `"intent-checker"`, and `roles` (line 55) gains `"intent-checker": { name: "Intent checker", description: "Compares the plan with the objective record before work starts." }`. Without it, `roles[member.role].name` (lines 300, 303, and 488) throws on the checker's member and on its decision.
+- Phone: `TeamRole` (line 10) gains it, and `ROLE_NAMES` (line 109) gains `"intent-checker": "Intent checker"`, in place.
+- `team-watch.ts` line 93: `roleRank` gains `"intent-checker"` after `"project-manager"`.
+- The Mac app decodes a role as a string, and the Swarm view's `ROLES` skips an unknown role: no change.
+
+- [ ] **Step 1: Write the failing test** `the intent checker sorts after the project manager` in `tests/team-watch.test.ts`: `orderedTeamMembers` of a team with a scout, a checker, and a project manager gives the project manager, the checker, then the scout. **Step 2: Run and confirm it fails.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/team-watch.test.ts`, `npm run typecheck -w @infinite/web`, `npm run lint -w @infinite/mobile`, and `npx tsc --noEmit` in `apps/mobile`.
+
+### Task 12: the docs and the spec
+
+**Files:** `docs/teams.md`, the spec. Runs last, in parallel with Task 10; the contract is fixed in this plan.
+
+**Decisions:**
+
+- **`docs/teams.md`**, the goal record section: when the check runs (the pin taken at `createRun`, the default by mode, the off switch, and the release note: autonomous projects get the intent check on new runs after this deploy); C14 (readiness, the `supervised` start pins and their events, the standing-goal refusal, `autonomyReady` in the enrollment view and `repo init`, and that a pin already taken never moves); the documented lineup's new explicit `evaluators` entry (`astra-high`), as continuous-autonomy part 2 asks; the `evaluators` slot, its derived default, and the family rule; what the checker reads and reports; how the owner answers (one decision; "Use the stated defaults"; free text becomes a direction while the record holds fewer than 20); that owner sections, permission reviews, the blackboard, and Linear name an intent decision by its question ids; what the record gains (assumptions, open questions, derived criteria) and the four log ops; the skip reasons; both keys inside the routine approval digest; and the steps before a rollback, from this section's rollback row.
+- **The spec**: part 4, the pin taken at `createRun` and never added to an earlier run, the held plan as the kept report (no `run.pendingPlan`), the plan author's family excluded beside the coordinator's, scout items converted until C16, the decision without `interrupt` and with one option, the read-only check of the checker's workspace, failures counted over no report, stall, limit, any report kind but `intent-check`, and changed files, the checker's report stored screened, an intent decision's authority form, an explicit `"off"` in autonomous mode, and `objective.prompts` optional; continuous-autonomy part 2, C14 at two of its three seams, a run without a lineup not ready, and a derived reviewer that must be strong; part 2, the owner register ops and `POST /api/teams/:id/record` moved to their own slice, and a standalone run's record built when its plan is held while the check is on; part 8, the digest's `derived` marker, and assumptions, open questions, and the autonomous sentence moved to step 4; the delivery order to match; "Left to the builder", the answer on how the pending plan survives a restart and meets steer and resume.
+
+- [ ] **Step 1: Amend the docs and the spec.** **Step 2: Run** the privacy scan of `AGENTS.md` over the diff.
+- [ ] **Step 3: After every task, Tasks 13 to 15 below included, the coordinator runs `npm run check` once on the integrated branch, requests the independent review, and commits.**
+
+Tasks 13 to 15 came with the coordinator's correction of 2026-11-16. "Order and owners" places them: Task 15 in the first wave, Tasks 13 and 14 in the third.
+
+### Task 13: the start pins
+
+**Files:** `packages/host/src/teams.ts` (+3: from 5,693 after Task 15, to 5,696), `packages/host/src/goals.ts` (−9: from 1,042 to 1,033), `packages/host/src/goal-standing.ts` (+11), `tests/autonomy-pins.test.ts`, and the lineups of `tests/standing-goals.test.ts`, `tests/routing-run.test.ts`, and `tests/routing-auto-run.test.ts`. Needs Tasks 4 and 15. Runs in parallel with Tasks 2 and 14.
+
+**Interfaces (produces):**
+```ts
+// teams.ts, by line on the INF-280 branch (Task 15 removed 254–309 and added 2 lines after 55; apply bottom-up):
+// after 55:        import { autonomyStartEvent, intentCheckPin, startMode } from "./evaluator-profiles.js";                 +1
+// 1630, in place:  // A goal run takes the mode its cycle passes; every other run takes the project's mode, or supervised when C14 fails.
+// 1631, in place:  const start = startMode(project, lineup); run.autonomy = goal ? autonomyOf(internal) : start.mode;
+// after 1633:      run.intentCheck = intentCheckPin({ autonomy: run.autonomy, setting: project.team.objective?.intentCheck,
+//                    mission: Boolean(internal?.missionId), handoff: Boolean(internal?.handoff) });   // one line              +1
+// after 1651 (`this.records.set(run.id, stored); this.event(stored, "Team created; …")`):
+//                  if (!goal && start.reason) this.event(stored, autonomyStartEvent("run", start.reason));                     +1
+// goals.ts (INF-280 does not touch it; same lines as on main):
+// after 5:         import { autonomyStartEvent, startMode } from "./evaluator-profiles.js";                                    +1
+// 17, in place:    the goal-standing.js import gains retryableCreationFailure.
+// 71–80 removed:   the comment, retryableCreation, and errorCode move to goal-standing.ts as one export (R5).                   −10
+// 263, in place:   const start = startMode(project, this.config.teams?.lineup); if (request.standing && start.mode !== "autonomous")
+// 264, in place:   throw new TeamError(409, "standing-requires-autonomy", start.reason ? "A standing goal needs an evaluator: no lineup
+//                    profile of a model family other than the coordinator's can evaluate it. Add one to the lineup's evaluators, or start
+//                    a finite goal." : <today's text>);
+// 276, in place:   … autonomy: start.mode, …
+// after 279:       if (start.reason) this.event(stored, autonomyStartEvent("goal", start.reason));                            +1
+// 679 removed, 680 in place: `if (this.closed || !stored.goal.standing || !retryableCreationFailure(error) || this.runCreated(…)) throw error;`   −1
+// goal-standing.ts: export function retryableCreationFailure(error: unknown): boolean;   // goals.ts lines 71 to 80, moved
+```
+
+**Decisions:**
+
+- **Two of C14's three seams.** `createRun` applies `startMode` to every run that is not a goal cycle (standalone, mission subteam, handoff), with the run's own lineup; `GoalService.create` applies it with the host lineup it pins on the goal. A goal cycle's run keeps `autonomyOf(internal)`. `GoalService.step` (line 875) keeps copying `autonomyOf(goal)`, and standing-goal resume (lines 328 and 407) and the cycle boundary's mode rule (line 892) keep reading the project's mode only. A resume and a restart keep the run's pin. So C14 never moves a pin already taken, and a standing goal pinned `autonomous` never runs under supervised ceilings.
+- **The intent check pin comes after C14**, from the run's final mode, so a run that C14 started `supervised` checks only with `intentCheck: "on"`.
+- **The size ratchet** (R5). The `goals.ts` extraction runs here, in the same commit as the two goal lines, so `goals.ts` goes from its baseline of 1,042 to 1,033 and never passes it between tasks; `retryableCreationFailure` keeps the moved behaviour byte for byte.
+- **Outside the request fingerprint.** Both pins are host-derived, as `autonomy` is (line 1555 leaves it out of the fingerprint), so a launch prepared before this slice still replays, and a replayed request returns the stored run with the pins it was created with.
+- **Test lineups.** A test that needs an autonomous run on a lineup with no eligible evaluator now gets `supervised`. `tests/standing-goals.test.ts`'s lineup gains `evaluators: [{ id: "evaluator", label: "Evaluator", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" }]`. `tests/routing-run.test.ts`'s `mixedRun` passes `{ ...mixedLineup, evaluators: [<the same profile>] }` to `fixture` and, for `"autonomous"`, adds `intentCheck: "off"` to the project's `objective` (wherever a test sets `objective`, it keeps that key too), so its runs keep their members and rows. `tests/routing-auto-run.test.ts`'s `autoRun` does the same, so its runs still pin `autonomous` and `auto`. `tests/autonomy-pins.test.ts`'s lineup has a strong Codex escalation and is ready, but `teams.create(teamRequest())` is a single-provider run with no lineup, so it now pins `supervised` (`no-lineup`) (R4): line 91 creates `{ ...teamRequest(), useConfiguredLineup: true }`, whose run carries the file's lineup, so line 94 still reads `autonomous`. No other assertion in those files changes.
+
+- [ ] **Step 1: Write the failing tests** in `tests/autonomy-pins.test.ts`, with its scheduler fixture and its stub `TeamService` for goals.
+
+| Test name | Assertions |
+|---|---|
+| `a lineup without an eligible evaluator starts new runs and goals supervised` | With `projects[0].autonomy = "autonomous"` and a lineup whose coordinator and reviewer are Claude and that has no other strong family: `create()` and `createForMission()` pin `supervised`, and each run's events hold the C14 event once; a single-provider `create()` pins `supervised` with the `no-lineup` text; `GoalService.create` gives `goal.autonomy: "supervised"` with the goal's event; a standing goal is refused with 409 `standing-requires-autonomy` and the evaluator text. With the file's ready lineup, `create()` pins `autonomous` and writes no C14 event. |
+| `pins already taken never move` | A run created `autonomous` with the ready lineup keeps `autonomous` after the host lineup loses its evaluator and the run pauses and resumes, and after a reload. A standing goal created `autonomous` with the ready lineup: after the host lineup loses its evaluator and the stub settles cycle 1 as `ready-for-review`, cycle 2's `createForGoal` call and its record carry `autonomous`. |
+| `each new run pins the intent check by mode and setting` | `create()` under `autonomous` pins `intentCheck: "on"`, and `"off"` with `objective: { intentCheck: "off" }`; under `supervised`, `"off"`, and `"on"` with `{ intentCheck: "on" }`; `createForMission()` pins `"off"`; `createForGoal(…, "autonomous")` pins `"on"`. The view and the sealed record carry the pin, and replaying a `create()` request returns the run with its original pin. |
+
+- [ ] **Step 2: Run and confirm they fail,** except `pins already taken never move`, which passes before this task, because no pin moves today; it guards the change. **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/autonomy-pins.test.ts tests/standing-goals.test.ts tests/goals.test.ts tests/autonomy-mode.test.ts tests/autonomy-cli.test.ts tests/routing-policy.test.ts tests/routing-recorder.test.ts`, and `tests/routing-run.test.ts` and `tests/routing-auto-run.test.ts` in the background, then the host typecheck. Confirm with `wc -l` that `teams.ts` is 5,696 lines and `goals.ts` 1,033.
+
+### Task 14: readiness in the views
+
+**Files:** `packages/host/src/repo-enrollment.ts` (+3), `packages/host/src/routing-routes.ts` (lines 3 and 62 in place), `packages/host/src/team-cli.ts` (line 847 in place: net 0, stays 1,263), `tests/autonomy-enrollment.test.ts`, `tests/routing-routes.test.ts`. Needs Task 4. Runs in parallel with Tasks 2 and 13.
+
+**Interfaces (produces):**
+```ts
+// repo-enrollment.ts
+export interface RepoEnrollmentView { /* existing fields */; autonomyReady: boolean; autonomyReason?: NotReady }   // +1
+// view(), after autonomySource (line 340), from autonomyReady(this.config.teams?.lineup):                            +1
+//   autonomyReady: true   or   autonomyReady: false, autonomyReason: <the reason>
+// import { autonomyReady, type NotReady } from "./evaluator-profiles.js";                                             +1
+// routing-routes.ts line 3, in place:   import { startMode } from "./evaluator-profiles.js";   // autonomyOf has no other use in the file
+// routing-routes.ts line 62, in place:  autonomy: startMode(project, config.teams?.lineup).mode,
+// team-cli.ts line 847, in place:       the repo init JSON gains autonomyReady and autonomyReason after autonomySource.
+```
+
+**Decisions:**
+
+- The view reads the host's configured lineup, which new runs and goals use by default. A run with a lineup of its own (a handoff policy's) is judged at its own pin. The fields are reported for every project; they matter while the mode is `autonomous`.
+- A stored receipt keeps the view it recorded, so a replayed enrollment request returns its old view without the fields: display only.
+- `infinite autonomy mode --json` prints the whole view, so it shows the fields; the plain line is unchanged.
+- The routing status previews what a new run pins (the comment at line 64), so it reads the C14 start mode, as `createRun` does.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `the enrollment view says whether autonomy is ready` (autonomy-enrollment) | With a ready lineup configured: `autonomyReady: true` and no reason. With a lineup whose evaluators are all Claude: `false` and `no-eligible-evaluator`. With no lineup: `false` and `no-lineup`. The view's other fields are unchanged. |
+| `the routing status previews the start mode` (routing-routes) | With `mixedLineup` and `autonomy: "autonomous"`, `GET /api/routing/projects/rehearsal` deep-equals the status of the same project served with `autonomy: "supervised"`. The two existing cases that serve `autonomous` with `mixedLineup` (lines 165 and 196) would now read `supervised`, which turns routing off (`routing-policy.ts` line 66) (R4); they serve `{ ...mixedLineup, evaluators: [<a strong Codex profile>] }` instead, so their expected counts hold. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/autonomy-enrollment.test.ts tests/routing-routes.test.ts tests/repo-enrollment.test.ts` and the host typecheck. Confirm with `wc -l` that `team-cli.ts` is 1,263 lines.
+
+### Task 15: the change helpers move out of `teams.ts`
+
+**Files:** `packages/host/src/teams.ts` (−54: from 5,747 to 5,693), `packages/host/src/team-changes.ts` (create). Runs first, in parallel with Tasks 1, 3, and 11.
+
+**Interfaces (produces):**
+```ts
+// team-changes.ts: teams.ts lines 254 to 309 moved unchanged (diffStat, maxRunChangeFiles, maxTaskChangedPaths, changeIndex,
+//   changedPathList); diffStat, changeIndex, and changedPathList exported; imports the TeamRun and TeamTask types only.
+// teams.ts, after line 55:
+//   import { changeIndex, changedPathList, diffStat } from "./team-changes.js";                                       +1
+//   export { changeIndex };   // tests/teams.test.ts line 15 imports it from teams.ts                                  +1
+// teams.ts lines 254–309: removed                                                                                     −56
+```
+
+**Decisions:** the move is byte for byte and changes no behaviour; the two limits are used only inside the moved lines (301 and 308). It runs first, so every later commit stays inside `teams.ts`'s baseline of 5,757 (Task 9 alone would pass it without the move).
+
+- [ ] **Step 1: Move the lines; no new test.** **Step 2: Run** `node --import tsx --test tests/teams.test.ts` in the background, and the host typecheck. Confirm with `wc -l` that `teams.ts` is 5,693 lines and `team-changes.ts` under 100.
+
+## Not in this slice
+
+- **Owner register ops**: `assumption.set` and its pin, per-question answers and dismissals, promotions to definitions, definitions, rules, non-goals, excluded paths, the rubric version, owner values, the CLI forms `set-assumption AID STATUS` and `answer QID TEXT`, per-item controls on the decision, and the option "I will answer each item". They are a slice of their own on the routes of step 2. *(My call: the decision answer carries the main path of acceptance 3, and these ops need their own route rules, rebuild cases, and client forms.)*
+- **`POST /api/teams/:id/record`**, corrections of a standalone run. With the owner register ops.
+- **Assumptions and open questions in the record digest**, and the autonomous-mode sentence "propose an assumption". Step 4, with receipts and proposals.
+- **C16 scout requests.** A scout item is converted to `assume` until C16 lands.
+- **C18**: `interrupt: "definition"` on the decision, and open questions and challenges in the daily digest.
+- **The daily digest line for a C14 pin** (continuous-autonomy 6.3). The daily digest is not built (C18); the run's or goal's event carries the reason until it is.
+- **The coordinator's full record in its context file** (part 8).
+- **Log overflow into the evidence store** (`objective_log`, `objective_values`). The share of step 2 lasts about 180 to 350 checks; a goal whose log is full skips the check (`log-full`).
+- **Follow-ups in the checker's context** (step 6); `outOfScope` is counted only.
+- **Running assumption tests** (command, artifact, citation, owner): step 4.
+- **The evaluator role** (step 5). The `evaluators` slot lands here; only the checker reads it.
+- **The router avoiding `evaluators` profiles for a cycle's tasks** ("Left to the builder" in the spec).
+- **Record screens** on the web, the phone, and the Mac, and the checker in the Swarm view.

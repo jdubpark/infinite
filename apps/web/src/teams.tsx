@@ -11,7 +11,7 @@ import { LinearTracking } from "./linear";
 import { DictationNotice, MicButton, useDictation } from "./dictation";
 
 type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
-type TeamRole = "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
+type TeamRole = "project-manager" | "intent-checker" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
 type TeamCommand = { command: string; args: string[] };
 export type TeamTask = { id: string; title: string; instructions: string; paths: string[]; dependsOn: string[]; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; memberId?: string; commit?: string; summary?: string; agentProfileId?: string; escalation?: { fromProfileId?: string; toProfileId: string; reason: string; memberId: string; at: string }; limitSwitches?: LimitSwitch[]; usage?: TaskUsage; ownerRating?: OwnerRating; rubric?: Rubric };
 type TeamContinuation = { revision: number; requestId: string; at: string; reason: string; headCommit: string; tasks: TeamTask[]; review?: TeamView["review"]; brief?: TeamBrief };
@@ -54,6 +54,7 @@ const rejected = (error: unknown) => error instanceof ApiError && error.status >
 const labels: Record<TeamStatus, string> = { planning: "Planning", discovering: "Investigating", implementing: "Implementing", integrating: "Integrating", verifying: "Running checks", reviewing: "Reviewing", delivering: "Delivering", merged: "Merge reported", "needs-input": "Needs your input", paused: "Paused", blocked: "Blocked", "ready-for-review": "Ready for your review", "no-change": "No change proposed", cancelled: "Cancelled" };
 const roles: Record<TeamRole, { name: string; description: string }> = {
   "project-manager": { name: "Coordinator", description: "Plans tasks, assigns implementers, and asks for decisions." },
+  "intent-checker": { name: "Intent checker", description: "Compares the plan with the objective record before work starts." },
   scout: { name: "Scout", description: "Investigates the project and reports evidence before implementation." },
   implementer: { name: "Implementers", description: "Build independent tasks in separate workspaces." },
   integrator: { name: "Integrator", description: "Repairs failed checks and review findings." },

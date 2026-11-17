@@ -154,7 +154,7 @@ export function sessionGithubScope(context: GithubSessionContext): GithubGrantSc
       ? { sub: "owner", repo: context.repository, ops: ["fetch", "push", "pr", "merge"], refs: ["refs/heads/*"] }
       : { sub: "unattributed", repo: context.repository, ops: ["fetch"] };
   }
-  if (context.role === "mission-coordinator" || context.role === "permission-coordinator") return undefined;
+  if (context.role === "mission-coordinator" || context.role === "permission-coordinator" || context.role === "intent-checker") return undefined;
   if (context.role === "delivery" && context.delivery) {
     const ref = `refs/heads/${context.delivery.headBranch}`;
     if (!validGrantRepository(context.delivery.repository) || !validGrantRef(ref, false)) return undefined;

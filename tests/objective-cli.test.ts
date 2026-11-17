@@ -86,6 +86,8 @@ test("record lines show the record and its log", () => {
     "Objective: Find ranked seed-stage companies",
     "Criteria:",
     "  c0 owner active · judgement owner-text · evaluator · pass: A ranked shortlist",
+    "Assumptions: none",
+    "Open questions: none",
     "Directions:",
     `  s2 steering at ${AT}: Prefer seed stage`,
     "Non-goals:",
@@ -104,6 +106,46 @@ test("record lines show the record and its log", () => {
   const separated = objectiveRecordLines(view({ direction: "Prefer\u2028seed\u2029stage" }), G);
   assert.ok(separated.includes(`  s2 steering at ${AT}: Prefer seed stage`));
   assert.ok(separated.every(line => !/[\u2028\u2029]/.test(line)));
+});
+
+test("the record lines show the register", () => {
+  const base = view();
+  const assumption = (id: string, status: string, criticality: string, origin: string, statement = `Statement ${id}.`) => ({
+    id, statement, status, origin, criticality, refutedBy: "Refuted by a check.", evidence: [], proposals: [],
+    test: { kind: "owner" },
+  });
+  const question = (id: string, text: string, state: string, waits = false) => ({ id, text, assumptions: [], waits, state });
+  const withRegister = {
+    ...base,
+    record: {
+      ...base.record,
+      assumptions: [
+        assumption("a1", "assumed", "plan", "intent-check"),
+        assumption("a2", "unchecked", "detail", "member", "The tests cover\nthe path."),
+      ],
+      questions: [
+        question("q1", "Ship the sample?", "open", true),
+        question("q2", "Keep the old index?", "open"),
+        question("q3", "Done already?", "answered"),
+      ],
+    },
+  } as unknown as ObjectiveRecordView;
+  const lines = objectiveRecordLines(withRegister, G);
+  const start = lines.indexOf("Assumptions:");
+  assert.ok(start > lines.indexOf("  c0 owner active · judgement owner-text · evaluator · pass: A ranked shortlist"), "the assumptions follow the criteria");
+  assert.deepEqual(lines.slice(start, start + 6), [
+    "Assumptions:",
+    "  a1 assumed plan intent-check: Statement a1.",
+    "  a2 unchecked detail member: The tests cover the path.",
+    "Open questions:",
+    "  q1 open waits: Ship the sample?",
+    "  q2 open: Keep the old index?",
+  ], "both lists print in record order, a newline becomes a space, and only open questions print");
+  assert.ok(!lines.some(line => line.includes("Done already?")), "an answered question is not listed");
+
+  const empty = objectiveRecordLines(base, G);
+  assert.ok(empty.includes("Assumptions: none"));
+  assert.ok(empty.includes("Open questions: none"));
 });
 
 test("the command reads a version and maps each error", async () => {

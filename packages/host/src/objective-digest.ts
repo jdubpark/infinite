@@ -28,6 +28,8 @@ export function recordDigestFor(record: ObjectiveRecord, configured: readonly Te
       statement: item.id === "c0" ? "" : item.statement,
       check: checkLabel(item.check, configured),
       producer: item.producer,
+      // Only a derived criterion carries the marker, so a record without one keeps today's bytes.
+      ...(item.origin === "derived" ? { derived: true as const } : {}),
     })),
   };
 }

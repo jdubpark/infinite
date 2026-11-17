@@ -611,7 +611,7 @@ export class Manager {
       const candidate = value as Partial<TeamAssignment>;
       return typeof candidate.runId === "string" && typeof candidate.memberId === "string" &&
         Number.isInteger(candidate.revision) &&
-        ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"].includes(candidate.role ?? "") &&
+        ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery", "intent-checker"].includes(candidate.role ?? "") &&
         (candidate.taskId === undefined || typeof candidate.taskId === "string");
     };
     const sameAssignment = (left: TeamAssignment | undefined, right: TeamAssignment) =>
@@ -749,7 +749,7 @@ export class Manager {
       const candidate = value as Partial<TeamAssignment>;
       return typeof candidate.runId === "string" && typeof candidate.memberId === "string" &&
         Number.isInteger(candidate.revision) &&
-        ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"].includes(candidate.role ?? "") &&
+        ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery", "intent-checker"].includes(candidate.role ?? "") &&
         (candidate.taskId === undefined || typeof candidate.taskId === "string");
     };
     const sameAssignment = (left: TeamAssignment | undefined, right: TeamAssignment) =>

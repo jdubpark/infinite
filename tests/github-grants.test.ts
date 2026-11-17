@@ -4,7 +4,7 @@ import { createHmac, randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { mintGithubGrant, readGithubGrantKey } from "../packages/host/src/github-grants.js";
+import { mintGithubGrant, readGithubGrantKey, sessionGithubScope } from "../packages/host/src/github-grants.js";
 // The proxy is a plain Node script; the host and the proxy must agree on every grant.
 import { loadGrantKey, verifyGrant } from "../scripts/github-proxy.mjs";
 
@@ -113,4 +113,9 @@ test("the host and the proxy read the grant key only from a root-owned file belo
     assert.equal(both(join(root, "missing.key")), "refused");
     assert.equal(both(`${root}/./grant.key`), "refused");
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("the intent checker gets no GitHub grant", () => {
+  assert.equal(sessionGithubScope({ kind: "team", role: "intent-checker", repository: "example/product" }), undefined);
+  assert.ok(sessionGithubScope({ kind: "team", role: "scout", repository: "example/product" })?.ops.includes("fetch"));
 });

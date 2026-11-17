@@ -126,7 +126,7 @@ const criterion = z.strictObject({
   state: z.enum(["active", "retired"]),
 });
 
-const assumptionTest = z.union([
+export const assumptionTestSchema: z.ZodType<AssumptionTest> = z.union([
   z.strictObject({ kind: z.literal("command"), command: commandDigest, refutesOn: z.enum(["fail", "pass"]) }),
   z.strictObject({ kind: z.literal("artifact"), path: pathSchema, count: pointer, citedPerEntry: perEntry.optional(), threshold: thresholdSchema }),
   z.strictObject({ kind: z.literal("citation"), source: bytesBetween(1, L.summaryBytes), quote: bytesBetween(1, L.summaryBytes), refutesOn: z.enum(["absent", "present"]) }),
@@ -143,7 +143,7 @@ const assumption = z.strictObject({
   origin: z.enum(["intent-check", "member", "owner"]),
   criticality: z.enum(["outcome", "plan", "detail"]),
   refutedBy: bytesBetween(1, L.assumptionBytes),
-  test: assumptionTest,
+  test: assumptionTestSchema,
   evidence: z.array(handleSchema).max(L.evidenceHandles),
   proposals: z.array(z.strictObject({
     entryId: handleSchema,

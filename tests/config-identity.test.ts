@@ -17,6 +17,8 @@ import {
   renderedPrompts,
   type ConfigComponents,
 } from "../packages/host/src/config-identity.js";
+import { intentCheckerPrompt } from "../packages/host/src/intent-prompt.js";
+import { reportCommand } from "../packages/host/src/team-prompts.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -412,4 +414,16 @@ test("the record digest changes the prompt version only for goal roles", () => {
     assert.notEqual(on[1], off[1], "the goal run is changed");
     assert.match(on[1]!, /Success criteria from the owner's objective record, version 1\. Each names how it is checked; c0 is the owner's success text:/);
   }
+});
+
+test("the intent checker's prompt version is its own", () => {
+  const checker = promptVersion("intent-checker", "claude", undefined, false);
+  assert.match(checker, HEX64);
+  assert.equal(promptVersion("intent-checker", "claude", undefined, false), checker);
+  assert.notEqual(checker, promptVersion("reviewer", "claude", undefined, false));
+  // Claude and Codex report through an MCP tool, so only a command provider prints the placeholder.
+  const profile = { id: "light", label: "Light", provider: "opencode", model: "vendor/model-a", variant: "high" } as unknown as TeamModelProfile;
+  const render = renderedPrompts("intent-checker", "opencode", profile, false);
+  assert.ok(render[0].includes("<report-command>"));
+  assert.deepEqual(render, [intentCheckerPrompt("opencode", profile).split(reportCommand()).join("<report-command>")], "the version digests the prompt the checker launches with");
 });

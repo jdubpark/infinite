@@ -10,6 +10,7 @@ import { RepoEnrollmentService } from "../packages/host/src/repo-enrollment.js";
 import { ROUTING_AUTO_NOTE } from "../packages/host/src/routing-cli.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { startHost } from "./helpers.js";
+import { mixedLineup } from "./team-fixture.js";
 
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 // The host resolves its own zod copy, so match the error by name.
@@ -83,6 +84,26 @@ test("an enrollment saved before this slice reads the host default and is not re
     assert.equal(view.autonomy, "autonomous");
     assert.equal(view.autonomySource, "host-default");
     assert.deepEqual(readFileSync(f.file), before, "loading and reading rewrite no record");
+  } finally { f.close(); }
+});
+
+test("the enrollment view says whether autonomy is ready", () => {
+  const f = fixture();
+  try {
+    const config = f.config();
+    const strong = (provider: "codex" | "claude") => ({ id: `${provider}-evaluator`, label: "Evaluator", provider, model: provider === "codex" ? "gpt-6-astra" : "claude-opus-5-5", effort: "xhigh" as const, tier: "strong" as const });
+    const viewFor = (lineup: typeof mixedLineup | undefined) => {
+      if (lineup) config.teams!.lineup = lineup; else delete config.teams!.lineup;
+      return new RepoEnrollmentService(config, f.key).get("example");
+    };
+    const ready = viewFor({ ...mixedLineup, evaluators: [strong("codex")] });
+    assert.equal(ready.autonomyReady, true);
+    assert.equal(Object.hasOwn(ready, "autonomyReason"), false);
+    const sameFamily = viewFor({ ...mixedLineup, evaluators: [strong("claude")] });
+    assert.deepEqual([sameFamily.autonomyReady, sameFamily.autonomyReason], [false, "no-eligible-evaluator"]);
+    const none = viewFor(undefined);
+    assert.deepEqual([none.autonomyReady, none.autonomyReason], [false, "no-lineup"]);
+    assert.deepEqual([none.id, none.autonomy, none.autonomySource], ["example", "supervised", "not-enrolled"]);
   } finally { f.close(); }
 });
 

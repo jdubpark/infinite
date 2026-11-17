@@ -67,7 +67,8 @@ async function settleAnswering(teams: { get(id: string): TeamView; answer(id: st
 
 /** A mixed lineup run in the given mode, with a recorder attached to the team service. `blackboardTools` turns the blackboard tools on. */
 async function mixedRun(autonomy: "autonomous" | "supervised", blockDatabase = false, features?: FeatureMap, blackboardTools = false) {
-  const f = await fixture("mixed", mixedLineup, {}, { noServer: true });
+  // The evaluator lets an autonomous project pin its runs autonomous (C14); the intent check stays off so these runs keep their members and rows.
+  const f = await fixture("mixed", { ...mixedLineup, evaluators: [{ id: "evaluator", label: "Evaluator", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" }] }, {}, { noServer: true });
   const key = readFileSync(f.host.config.keyFile);
   const databasePath = evidenceDatabasePath(f.host.config.stateDir);
   // A regular file where the database should be: the store cannot open, and its modules read unavailable.
@@ -78,6 +79,7 @@ async function mixedRun(autonomy: "autonomous" | "supervised", blockDatabase = f
   if (blackboardTools) f.host.config.teams!.blackboard = { tools: true };
   const project = f.host.config.projects.find(item => item.id === "rehearsal")!;
   project.autonomy = autonomy;
+  if (autonomy === "autonomous") project.team = { ...project.team!, objective: { intentCheck: "off" } };
   if (features) project.team = { ...project.team!, features };
   const logs: string[] = [];
   // The `limited` set each start receives. An opencode limit is observed when task b first starts: task b's coordinator

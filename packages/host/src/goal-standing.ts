@@ -115,3 +115,14 @@ export function restoreWake(withdrawn: PendingWake | undefined, later: PendingWa
   return { signals: signals.slice(overflow), dropped: withdrawn.dropped + later.dropped + overflow, since: withdrawn.since,
     ...(withdrawn.owner || later.owner ? { owner: true } : {}) };
 }
+/**
+ * Failures to create a standing cycle's run that leave no run and pass with time: storage the host could not measure
+ * or found low, a window that lapsed while creation waited (the retry gets a fresh one), a mission's hold on the
+ * repository, and file or process resource exhaustion. Everything else (configuration, lineup, parent, schema) blocks.
+ */
+const retryableCreation = new Set(["host-storage-low", "host-storage-unavailable", "goal-deadline", "mission-repository-reserved", "ENOSPC", "EDQUOT", "EMFILE", "ENFILE", "EAGAIN", "EBUSY"]);
+function errorCode(error: unknown) {
+  const code: unknown = error instanceof Error ? (error as Error & { code?: unknown }).code : undefined;
+  return typeof code === "string" ? code : undefined;
+}
+export function retryableCreationFailure(error: unknown): boolean { const code = errorCode(error); return code !== undefined && retryableCreation.has(code); }

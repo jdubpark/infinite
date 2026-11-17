@@ -72,6 +72,7 @@ const REPORT_SAMPLES: Record<TeamReport["kind"], TeamReport> = {
   "pull-request": { kind: "pull-request", headCommit: HASH, pullRequestUrl: "https://example.invalid/pull/1", summary: "Opened" },
   question: { kind: "question", question: "Which file?", options: [] },
   blocked: { kind: "blocked", summary: "Cannot proceed" },
+  "intent-check": { kind: "intent-check", summary: "No gap found", items: [] },
 };
 
 test("every report kind reaches member.reported", async () => {

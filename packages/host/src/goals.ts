@@ -3,6 +3,7 @@ import { mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { writeSealed, unseal } from "./vault.js";
 import { autonomyOf, type AutonomyMode } from "./autonomy.js";
+import { autonomyStartEvent, startMode } from "./evaluator-profiles.js";
 import { TeamService, TeamError } from "./teams.js";
 import { goalActionSchema, goalExtendSchema, goalOutcomeSchema, goalParallelismSchema, goalSteerSchema, parseCreateGoal, type CreateGoal, type CycleClass, type GoalCycle, type GoalReasonCode, type ProductGoal } from "./goal-types.js";
 import type { Config } from "./types.js";
@@ -14,9 +15,9 @@ import { applyFuseReason } from "./fuse/rules.js";
 import type { FuseGate } from "./fuse/types.js";
 import { readSignals } from "./signals/consume.js";
 import { addToPendingWake, type PendingWake, type SignalReader } from "./signals/types.js";
-import { cadenceDue, classifyCycle, cycleWakeOf, defaultWakeMinGapMinutes, foldedCycles, isReviewed, keptCycles, latestReviewed, maxFailedCycles, maxPreviousWork, restoreWake, runObjectiveLimitBytes, unresolvedOperation, wakeObjective } from "./goal-standing.js";
+import { cadenceDue, classifyCycle, cycleWakeOf, defaultWakeMinGapMinutes, foldedCycles, isReviewed, keptCycles, latestReviewed, maxFailedCycles, maxPreviousWork, restoreWake, runObjectiveLimitBytes, unresolvedOperation, wakeObjective, retryableCreationFailure } from "./goal-standing.js";
 import { KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
-import { digestEvent, correctGoalObjective, createGoalObjective, goalObjectiveNote, goalObjectiveView, goalRecordDigest, loadGoalObjective, steerGoalObjective, type ObjectiveUnavailable } from "./objective-goals.js";
+import { digestEvent, correctGoalObjective, createGoalObjective, goalObjectiveNote, goalObjectiveView, goalRecordDigest, goalRecordPort, loadGoalObjective, steerGoalObjective, type ObjectiveUnavailable } from "./objective-goals.js";
 import { objectivePromptsOn } from "./objective-digest.js";
 import { correctionSchema, type CriterionInput } from "./objective-input.js";
 import { objectiveError, recordView, type ObjectiveRecordView } from "./objective-record.js";
@@ -68,16 +69,6 @@ const repeatedFailuresReason = "Three cycles in a row failed, so this standing g
 const maxExtensionFailures = 3;
 const correctionEvent = (version: number) => `The owner corrected the objective record to version ${version}.`;
 const launchRetryMs = 60_000;
-/**
- * Failures to create a standing cycle's run that leave no run and pass with time: storage the host could not measure
- * or found low, a window that lapsed while creation waited (the retry gets a fresh one), a mission's hold on the
- * repository, and file or process resource exhaustion. Everything else (configuration, lineup, parent, schema) blocks.
- */
-const retryableCreation = new Set(["host-storage-low", "host-storage-unavailable", "goal-deadline", "mission-repository-reserved", "ENOSPC", "EDQUOT", "EMFILE", "ENFILE", "EAGAIN", "EBUSY"]);
-function errorCode(error: unknown) {
-  const code: unknown = error instanceof Error ? (error as Error & { code?: unknown }).code : undefined;
-  return typeof code === "string" ? code : undefined;
-}
 /** Goals created before ceilings existed use their original creation-time budget. */
 const ceilingOf = (goal: ProductGoal) => goal.ceilingAt ?? new Date(Date.parse(goal.createdAt) + (goal.maxTotalMinutes ?? goal.maxMinutes) * 60000).toISOString();
 /** Flatten totals for existing cycle displays while retaining the complete rollup for parent aggregation. */
@@ -130,6 +121,7 @@ export class GoalService {
       catch { this.saved.set(id, digest(stored)); unsaved++; }
     }
     if (unsaved) console.warn(`Objective records of ${unsaved} goals could not be saved at startup. Each is saved with its goal's next change.`);
+    this.teams.useGoalRecords?.(goalRecordPort(id => this.records.get(id), holder => this.save(holder as Stored)));
   }
   /** The launch-rate fuse. A service without one starts every cycle it would have started before. */
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
@@ -260,8 +252,8 @@ export class GoalService {
       const project = this.config.projects.find(value => value.id === request.projectId);
       if (!project?.team || (!project.team.checks.length && !project.team.establishChecks)) throw new TeamError(409, "goal-project-not-configured", "Configure required checks or authorize the team to establish them before a goal can start.");
       if (request.linearIssueId && !project.linear) throw new TeamError(409, "linear-not-configured", "Configure Linear for this project before linking an issue.");
-      if (request.standing && autonomyOf(project) !== "autonomous")
-        throw new TeamError(409, "standing-requires-autonomy", "A standing goal needs an autonomous project. Start a finite goal, or make the project autonomous first.");
+      const start = startMode(project, this.config.teams?.lineup); if (request.standing && start.mode !== "autonomous")
+        throw new TeamError(409, "standing-requires-autonomy", start.reason ? "A standing goal needs an evaluator: no lineup profile of a model family other than the coordinator's can evaluate it. Add one to the lineup's evaluators, or start a finite goal." : "A standing goal needs an autonomous project. Start a finite goal, or make the project autonomous first.");
       // Every cycle passes the whole objective; the host never cuts the owner's text to fit its wake reasons.
       if (request.standing && Buffer.byteLength(request.objective) > runObjectiveLimitBytes)
         throw new TeamError(400, "standing-objective-too-large", `A standing goal's objective must fit in ${runObjectiveLimitBytes.toLocaleString("en-US")} bytes of UTF-8. Shorten it and start the goal again.`);
@@ -273,10 +265,11 @@ export class GoalService {
         ...fields, parallelism: 4, maxTotalMinutes: request.maxTotalMinutes ?? request.maxMinutes, linearTracking: Boolean(project.linear), id: requestId, revision: 1, status: "running", createdAt, updatedAt: createdAt,
         deadlineAt: new Date(Date.parse(createdAt) + request.maxMinutes * 60000).toISOString(),
         ceilingAt: new Date(Date.parse(createdAt) + (request.maxTotalMinutes ?? request.maxMinutes) * 60000).toISOString(),
-        lineup: structuredClone(this.config.teams!.lineup!), autonomy: autonomyOf(project), cycles: [], memberCount: 0, steering: [], events: [], outcomes: [],
+        lineup: structuredClone(this.config.teams!.lineup!), autonomy: start.mode, cycles: [], memberCount: 0, steering: [], events: [], outcomes: [],
         ...(cursor !== undefined ? { signalCursor: cursor } : {}),
       } };
       { const note = goalObjectiveNote(stored, createGoalObjective(stored, createdAt, criteria && { inputs: criteria, context: { configured: project.team!.checks, requestId, at: createdAt } })); if (note) this.event(stored, note); }
+      if (start.reason) this.event(stored, autonomyStartEvent("goal", start.reason));
       this.event(stored, request.standing
         ? `Standing goal approved. A cycle starts now and then every ${request.standing.cadenceMinutes} minutes, each within its own time and attempt limits.`
         : "Goal approved. The coordinator can select and build work within its scope and limits.");
@@ -676,8 +669,7 @@ export class GoalService {
     catch (error) {
       // A standing goal outlives a creation failure that passes with time. With no run created, the cycle goes back
       // through every gate a minute later and gets a fresh window. A created run, or any other failure, still blocks.
-      const code = errorCode(error);
-      if (this.closed || !stored.goal.standing || !code || !retryableCreation.has(code) || this.runCreated(pending.request.requestId)) throw error;
+      if (this.closed || !stored.goal.standing || !retryableCreationFailure(error) || this.runCreated(pending.request.requestId)) throw error;
       const reason = `The next cycle's run could not be created: ${(error as Error).message} The goal retries in a minute.`;
       if (stored.goal.reason !== reason) this.event(stored, reason);
       stored.goal.reason = reason;

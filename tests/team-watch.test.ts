@@ -193,3 +193,16 @@ test("a failed brief refresh retains that session's previous summary", () => {
   assert.equal(failed.fetchError, "temporary timeout");
   assert.equal(failedTeamBriefRow("s-impl", "unavailable", [previous]).status.error, "unavailable");
 });
+
+test("the intent checker sorts after the project manager", () => {
+  const ordered = orderedTeamMembers({
+    id: "team-2",
+    revision: 1,
+    members: [
+      { memberId: "scout", sessionId: "s-scout", role: "scout", revision: 1, title: "Scout", status: "running" },
+      { memberId: "checker", sessionId: "s-checker", role: "intent-checker", revision: 1, title: "Check", status: "running" },
+      { memberId: "pm", sessionId: "s-pm", role: "project-manager", revision: 1, title: "Plan", status: "running" },
+    ],
+  });
+  assert.deepEqual(ordered.map(member => member.memberId), ["pm", "checker", "scout"]);
+});

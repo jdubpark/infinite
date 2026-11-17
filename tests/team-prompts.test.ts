@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { ENTRY_PARAGRAPH_LIMIT_BYTES, entryCommand, entryInstructions, refreshReportingInstructions, reportCommand, retargetPrompt, teamContext, teamPrompt } from "../packages/host/src/team-prompts.js";
-import { teamReportSchema, type TeamBrief, type TeamModelProfile, type TeamRun, type TeamTask } from "../packages/host/src/team-types.js";
+import { ENTRY_PARAGRAPH_LIMIT_BYTES, entryCommand, entryInstructions, ownerDirectionLines, refreshReportingInstructions, reportCommand, retargetPrompt, teamContext, teamPrompt } from "../packages/host/src/team-prompts.js";
+import { hostEntry } from "../packages/host/src/evidence/host-entries.js";
+import { buildCapsule } from "../packages/host/src/eval-rules.js";
+import { teamReportSchema, type TeamBrief, type TeamMember, type TeamModelProfile, type TeamRun, type TeamTask } from "../packages/host/src/team-types.js";
 import type { TeamRunRouting, TeamRunRoutingAuto } from "../packages/host/src/routing-types.js";
 
 const PROMPT_LIMIT_BYTES = 80 * 1024;
@@ -544,4 +546,52 @@ test("a member context never carries a task's routing, in any role or snapshot",
   const inline = teamPrompt(tagged, "implementer", tagged.tasks[0], undefined, "codex", AUTO_ASTRA, { checks: PIN_CHECKS }, [], true);
   assert.doesNotMatch(inline, /"routing":/, "the inline implementer task");
   assert.equal(inline, teamPrompt(plain, "implementer", plain.tasks[0], undefined, "codex", AUTO_ASTRA, { checks: PIN_CHECKS }, [], true));
+});
+
+// INF-282 step 3: a derived criterion is marked in the goal section; an intent decision prints fixed text and its ids.
+test("derived criteria are marked in the goal section", () => {
+  const derived = { ...PIN_RECORD, criteria: [...PIN_RECORD.criteria, { id: "c2", statement: "The export lists every order.", check: "command:npm test", producer: "host" as const, derived: true }] };
+  const marked = goalRun({ goal: { ...PIN_GOAL, record: derived } as TeamRun["goal"] });
+  const plain = goalRun({ goal: { ...PIN_GOAL, record: PIN_RECORD } as TeamRun["goal"] });
+  for (const role of PIN_ROLES) {
+    const prompt = teamPrompt(marked, role, undefined, undefined, "claude", ENTRY_PROFILE, { checks: PIN_CHECKS }, [], true);
+    assert.equal(prompt.split("c0 is the owner's success text; a criterion marked derived came from the intent check and the owner has not confirmed it:").length, 2, `${role}: one conditional sentence`);
+    assert.equal(prompt.split("\"derived\":true").length, 2, `${role}: only c2 is marked`);
+    assert.match(prompt, /"id":"c2".*"derived":true/, `${role}: c2 carries the marker`);
+    assert.doesNotMatch(teamPrompt(plain, role, undefined, undefined, "claude", ENTRY_PROFILE, { checks: PIN_CHECKS }, [], true), /came from the intent check/, `${role}: no digest criterion, no sentence`);
+  }
+});
+
+const INTENT_SENTINEL = ["intent", "question", "sentinel"].join("-");
+const INTENT_DECISIONS = [
+  { id: "d-owner", memberId: "m-plan", revision: 2, question: `The intent check needs your answer. 1. ${INTENT_SENTINEL} one`, options: [], createdAt: "2026-11-16T00:00:00.000Z",
+    answer: "Use the stated defaults", answeredBy: "owner", answeredAt: "2026-11-16T00:01:00.000Z", intentQuestions: ["q1", "q2"] },
+  { id: "d-connector", memberId: "m-plan", revision: 2, question: `The intent check needs your answer. 2. ${INTENT_SENTINEL} two`, options: [], createdAt: "2026-11-16T00:00:00.000Z",
+    answer: "Go with the default", answeredBy: "connector", answeredAt: "2026-11-16T00:02:00.000Z", intentQuestions: ["q1", "q2"] },
+] as TeamRun["decisions"];
+
+test("an intent decision's question reaches no authority surface", () => {
+  const run = smallRun({ decisions: INTENT_DECISIONS });
+  const ids = "The intent check's questions q1, q2";
+  assert.equal(ownerDirectionLines(run).join("\n").includes(INTENT_SENTINEL), false, "owner direction lines");
+  assert.deepEqual(ownerDirectionLines(run), [`Owner answered "${ids}": Use the stated defaults`]);
+  for (const role of PIN_ROLES) for (const provider of ENTRY_PROVIDERS) {
+    const prompt = teamPrompt(run, role, undefined, undefined, provider, ENTRY_PROFILE, { checks: PIN_CHECKS }, [], true);
+    assert.equal(prompt.includes(INTENT_SENTINEL), false, `${role} ${provider}: no checker text in a prompt`);
+    assert.ok(prompt.includes(ids), `${role} ${provider}: the ids print`);
+  }
+  const context = teamContext(run, undefined, { checks: PIN_CHECKS }, "implementer");
+  assert.equal(JSON.stringify(context).includes(INTENT_SENTINEL), false, "the context holds no checker text");
+  assert.match(JSON.stringify(context.ownerAnswers), /The intent check's questions q1, q2/);
+  assert.match(JSON.stringify(context.agentAnswers), /The intent check's questions q1, q2/);
+  const entry = JSON.stringify(hostEntry(run, "answer:d-owner", "2026-11-16T00:03:00.000Z"));
+  assert.equal(entry.includes(INTENT_SENTINEL), false, "the blackboard direction entry holds no checker text");
+  assert.match(entry, /The intent check's questions q1, q2/);
+  const capsule = buildCapsule(run, { id: "t1", title: "Task", instructions: "Do it.", paths: ["src"] } as unknown as TeamTask, { startedAt: "2026-11-16T00:05:00.000Z" } as unknown as TeamMember);
+  assert.ok(capsule, "a capsule is built");
+  assert.equal(JSON.stringify(capsule).includes(INTENT_SENTINEL), false, "the eval capsule holds no checker text");
+  assert.match(JSON.stringify(capsule), /The intent check's questions q1, q2/);
+  const legacy = smallRun({ decisions: [{ id: "d-legacy", memberId: "m-plan", revision: 1, question: "Which path?", options: [], createdAt: "2026-11-16T00:00:00.000Z",
+    answer: "Use A", answeredBy: "owner", answeredAt: "2026-11-16T00:01:00.000Z" }] as TeamRun["decisions"] });
+  assert.deepEqual(ownerDirectionLines(legacy), ['Owner answered "Which path?": Use A'], "a decision without intentQuestions prints as today");
 });

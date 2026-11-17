@@ -257,6 +257,15 @@ async function main() {
     process.exit(0);
   }
   if (assignment.role === "project-manager") {
+    // A project manager corrected after an intent check waits for its release while the hold flag exists.
+    const corrected = JSON.parse(readFileSync(join(".git", "infinite-team-context.json"), "utf8")).feedback;
+    if (typeof corrected === "string" && corrected.startsWith("The intent check held your plan") && existsSync(join(receiptDir, "intent-hold"))) {
+      const until = Date.now() + 120000;
+      while (!existsSync(join(receiptDir, `${assignment.runId}.correct-release`))) {
+        if (Date.now() >= until) throw new Error("The test did not release the corrected project manager");
+        await new Promise(resolve => setTimeout(resolve, 40));
+      }
+    }
     if (scenario === "no-change") {
       await report({ kind: "no-change", summary: "The requested behavior already exists in the inspected project.", evidence: [
         { source: "Current implementation", observation: "The accepted behavior is already implemented and the required check covers it." },
@@ -320,7 +329,7 @@ async function main() {
     if (scenario === "usage") {
       tasks[0].agentProfileId = "spark-high";
       tasks[1].agentProfileId = "deepseek-high";
-    } else if (scenario === "mixed") {
+    } else if (scenario === "mixed" || scenario === "intent") {
       tasks[0].agentProfileId = "spark-high";
       tasks[1].agentProfileId = "astra-xhigh";
     } else if (scenario.startsWith("permissions") || scenario.startsWith("delivery") || scenario === "integrator-limit" || scenario === "result-operation-fails-once") {
@@ -351,6 +360,10 @@ async function main() {
       } } : {}),
       ...(scenario === "live-limit" || scenario === "result-operation-fails-once" ? { parallelism: 1 } : {}),
       ...(scenario === "bootstrap-missing" || scenario === "bootstrap-replan" && assignment.revision > 1 ? {} : scenario.startsWith("bootstrap") ? { verification } : {}) };
+    // The first plan is what an intent-plan checker sends as its report. Its name has no .json ending, so tests that
+    // read every receipt never parse it.
+    const firstPlan = join(receiptDir, `${assignment.runId}.first-plan`);
+    if (!existsSync(firstPlan)) writeFileSync(firstPlan, JSON.stringify(plan), { mode: 0o600 });
     if (scenario === "bootstrap-override") {
       let rejection;
       try { await report(plan); }
@@ -360,6 +373,27 @@ async function main() {
         await report({ ...plan, verification: undefined });
       }
     } else await report(plan);
+  } else if (assignment.role === "intent-checker") {
+    // The checker copies its context and launch prompt for the test, then waits, exits, edits, or reports as the flags say.
+    writeFileSync(join(receiptDir, `${assignment.memberId}.intent-context.json`), readFileSync(join(".git", "infinite-team-context.json")), { mode: 0o600 });
+    writeFileSync(join(receiptDir, `${assignment.memberId}.intent-prompt.txt`), receipt.prompt ?? process.argv.at(-1) ?? "", { mode: 0o600 });
+    if (existsSync(join(receiptDir, "intent-hold"))) {
+      const until = Date.now() + 120000;
+      while (!existsSync(join(receiptDir, `${assignment.runId}.intent-release`))) {
+        if (Date.now() >= until) throw new Error("The test did not release the intent checker");
+        await new Promise(resolve => setTimeout(resolve, 40));
+      }
+    }
+    if (existsSync(join(receiptDir, "intent-silent"))) process.exit(0);
+    if (existsSync(join(receiptDir, "intent-edit"))) writeFileSync("intent-edit.txt", "A read-only checker changed a file\n");
+    if (existsSync(join(receiptDir, "intent-plan"))) {
+      await report(JSON.parse(readFileSync(join(receiptDir, `${assignment.runId}.first-plan`), "utf8")));
+      return;
+    }
+    const value = existsSync(join(receiptDir, "intent-report.json"))
+      ? JSON.parse(readFileSync(join(receiptDir, "intent-report.json"), "utf8"))
+      : { kind: "intent-check", summary: "No gap found.", items: [] };
+    await report(value);
   } else if (assignment.role === "permission-coordinator") {
     const launchPrompt = process.argv.at(-1) ?? "";
     const decisionId = /"decisionId":"([a-f0-9-]{36})"/.exec(launchPrompt)?.[1];

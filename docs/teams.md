@@ -1261,7 +1261,8 @@ is logged. The owner reads the record, or any past version of it, with
 `infinite goal record ID [--version N] [--json]` or `GET /api/goals/:id/record`.
 A standalone run gets its record at its first accepted plan. Goal cycle runs,
 mission subteams, and handoff runs have no record of their own. The relay does not
-carry the record or its corrections.
+carry the record or its corrections. Its assumptions, open questions, and derived
+criteria come from the intent check; see [Intent check](#intent-check).
 
 With `extendMinutes` above 0, the host moves the deadline forward when it arrives,
 if the active team has a member with attention activity within the stall window
@@ -1325,6 +1326,139 @@ assessment and supporting evidence. A paused goal remains resumable and cannot
 accept an outcome assessment; finish or cancel it first. Only an explicit user
 assessment can mark the goal `achieved`. Passing checks, agent approval, or an
 idle terminal cannot do so.
+
+### Intent check
+
+An autonomous goal cycle or standalone run holds its plan before any work
+starts and asks a read-only checker whether the plan matches the objective
+record. The checker is a member with role `intent-checker`. Every other run and
+goal is unchanged.
+
+**The pin.** `createRun` records `run.intentCheck` as `on` or `off`, beside
+`run.autonomy`, and the team view shows it. A goal cycle or standalone run pinned
+`autonomous` gets `on`. A `supervised` run gets `on` only when the project sets
+`objective.intentCheck: "on"`. A mission subteam and a handoff run always get
+`off`. A run without the field was created before this change and never checks.
+A new cycle is a new run, so a cycle of an older goal checks when that goal is
+pinned `autonomous`.
+
+**The off switch.** `objective.intentCheck` takes `"on"` or `"off"` and has no
+default. Without the key, the mode's default applies. `"off"` stops the check in
+autonomous mode, and `"on"` starts it in supervised mode. Both `objective.intentCheck`
+and each `evaluators` list are part of the routine authority digest. Writing or
+changing either one needs the owner's approval of active routines again; absent
+keys leave the digest unchanged. `objective.prompts` is optional, so
+`{ "intentCheck": "off" }` stands alone.
+
+**Start pins.** An autonomous project starts a new run or goal `supervised` when
+its lineup has no eligible evaluator. A lineup is autonomy-ready when one of its
+evaluators has a known model family that differs from the coordinator's. A lineup
+without a coordinator family, or a run with no lineup, is not ready. The run or
+goal then records one event:
+
+- `This run starts supervised: it has no lineup, so no evaluator of another model family can check it.`
+- `This run starts supervised: no lineup profile of a model family other than the coordinator's can evaluate it.`
+- A goal writes the same two texts with `This goal starts supervised:`.
+
+A standing goal is refused with `standing-requires-autonomy` (409) when its
+project is not autonomous. When the project is autonomous but its lineup is not
+ready, the refusal says that a standing goal needs an evaluator.
+The enrollment view reports `autonomyReady` and, when it is `false`,
+`autonomyReason` (`no-lineup` or `no-eligible-evaluator`). `infinite repo init`
+prints both.
+
+A pin already taken never moves. A goal cycle copies its goal's pin, and a
+resumed or restarted run keeps its own. If the lineup later loses its evaluator,
+the next cycle of an `autonomous` goal stays `autonomous`, and its checks skip
+with `no-eligible-profile`.
+
+**Evaluators.** The lineup's `evaluators` slot lists at most 4 strong profiles
+that may check a plan. Without the slot, the list is derived when the lineup is
+read: the reviewer, when its tier is `strong`, then each strong escalation, first
+id wins, at most 4. The derived list is never written back to the configuration.
+
+**Choosing the checker.** The host takes the first evaluator whose model family
+is known, differs from the coordinator's family and the plan author's family,
+and runs on a provider that is not limited. If none qualifies, the check is
+skipped with `no-eligible-profile`. The checker's prompt is fixed text and holds
+no run data. The checker is a counted member: the fuse counts its launch, and in
+a goal cycle it uses one member of the goal's member budget, as do a replacement
+checker and a corrected project manager.
+
+**What the checker reads.** Its context file holds the objective record without
+its log, criteria without their latest values, and assumptions without their
+proposals. It also holds the held plan's summary, brief, tasks without their
+agent profile, and verification, the scout reports of the same revision, the
+configured checks, the mode, whether criteria are due, and the limits. The
+context is at most 1 MiB. A larger context skips the check with
+`context-too-large`. The context holds no routing value, score, other member
+report, or credential.
+
+**What the checker reports.** One report of kind `intent-check`. It has a
+summary, up to 16 items (up to 3 of them scouts), up to 8 criteria, and up to 24
+`outOfScope` ids. Each item gives a dimension, a reason, a criticality
+(`outcome`, `plan`, or `detail`), and a disposition (`ask`, `scout`, or `assume`).
+Each item also gives an assumption, with what would refute it and a test. An
+`ask` item adds a question with a default or an `interrupt`. Criteria come only
+for a goal whose criteria are due. The host drops an item that fails its shape,
+secret, quote, or command checks, and counts each drop. A report of any other
+kind is stored as fixed text and counts as a failure.
+
+**What the host records.**
+
+- `assume` adds an assumption with status `assumed`.
+- `scout` is converted to `assume` and logged until the scout step is built.
+- `ask` in supervised mode always waits. In autonomous mode it is converted to
+  `assume`, unless it is an outcome question with an owner test. That question
+  stays open, and it waits only when it carries an `interrupt`.
+- Derived criteria join the record and show as `derived` in its digest.
+
+Each change the check makes to the record writes one log entry:
+`intent-check.applied`, `intent-check.answered`, `intent-check.released`, or
+`intent-check.skipped`. The entry names the ids and counts it changed.
+
+**The owner's answer.** Waiting questions become one decision. Its text opens
+with `The intent check needs your answer on N item(s) before the plan proceeds.
+Answer in one message.`, then numbers each item. Its options hold only `Use the
+stated defaults`, and only when every waiting item's assumptions are `assumed`.
+Otherwise the decision takes free text. Authority surfaces, including member
+prompts, permission reviews, the blackboard, and Linear, print the decision as
+`The intent check's questions` and its question ids, never its text.
+
+- `Use the stated defaults` marks the questions `default-kept`.
+- Any other text becomes a `correction` direction while the record holds fewer
+  than 20 directions. At 20, the answer reaches the project manager without a
+  new direction.
+- A delegate's answer records nothing. It releases the questions, and the record
+  keeps them open.
+
+The project manager then corrects its plan once, with the items and the answer.
+The corrected plan is accepted without a second check.
+
+**Failures and skips.** A checker that stops without a usable report, or fails
+its read-only check, counts one failure. A pause, cancel, halt, block, or
+recovery that stops the read-only check counts no failure and writes nothing; a
+resumed run plans a new revision, and its plan is checked. The first failure
+starts one replacement with the event `The intent checker stopped without a
+usable report; one replacement starts.` A second failure skips the check. Every
+skip accepts the held plan once and writes one event:
+
+- `checker-failed`: `The intent check was skipped: the checker failed twice. The plan is accepted unchecked.`
+- `no-eligible-profile`: `The intent check was skipped: no evaluator profile differs in family from the coordinator and the plan's author. The plan is accepted unchecked.`
+- `record-unavailable`: `The intent check was skipped: the objective record could not be read or written. The plan is accepted unchecked.`
+- `log-full`: `The intent check was skipped: the objective record's log is full. The plan is accepted unchecked.`
+- `context-too-large`: `The intent check was skipped: the checker's context is over 1 MiB. The plan is accepted unchecked.`
+
+**The held plan.** The held plan is the project manager's stored report. It is
+accepted again after the check ends and passes the same checks as before, with no
+second copy. A restart keeps the check's state. Cancelling the run releases its
+waiting questions as `cancelled`. A later plan revision releases them as
+`replanned`.
+
+**Before a rollback.** Remove `objective.intentCheck` and every `evaluators`
+list from the configuration. Finish or cancel each run that has an
+`intent-checker` member. A goal whose pinned lineup has `evaluators` is expected
+to block at its next cycle on an older host.
 
 ### Owner criteria
 
@@ -1956,10 +2090,21 @@ the deployment's host configuration to use it.
       "id": "haiku-permission-reviewer", "label": "Haiku 5.5 high",
       "provider": "claude", "model": "claude-haiku-5-5", "effort": "high",
       "tier": "light", "dataUse": "standard"
-    }
+    },
+    "evaluators": [
+      {
+        "id": "astra-high", "label": "Astra 6 high",
+        "provider": "codex", "model": "gpt-6-astra", "effort": "high",
+        "tier": "strong", "dataUse": "standard"
+      }
+    ]
   }
 }
 ```
+
+`evaluators` lists the profiles that may check a plan. This example names the
+reviewer's profile explicitly. See [Intent check](#intent-check) for how the
+list is derived and how a checker is chosen.
 
 Optional OpenCode workers can be added to `implementers`. OpenCode uses a
 provider-qualified `model` and optional `variant`; it does not accept an
@@ -2279,7 +2424,7 @@ Each project has an autonomy mode. The mode is `supervised` or `autonomous`.
 
 Standing objectives read the mode: only an autonomous project can run one, and a standing goal pauses at a cycle boundary when its project becomes supervised. Nothing else reads the mode yet.
 
-Each new run and each new goal records the project's mode when it starts. A goal's cycles keep the goal's mode. A change applies to the next run and the next goal. A run or a goal already in progress keeps its mode.
+Each new run and each new goal records the project's mode when it starts. A goal's cycles keep the goal's mode. A change applies to the next run and the next goal. A run or a goal already in progress keeps its mode. An autonomous project whose lineup has no eligible evaluator starts new runs and goals `supervised`, and the intent check follows the pinned mode; see [Intent check](#intent-check).
 
 An enrolled repository without a saved mode uses the host default. The default is `autonomous` unless the operator sets `autonomy.defaultMode` in the host configuration file. A project that is not enrolled reads as `supervised`.
 

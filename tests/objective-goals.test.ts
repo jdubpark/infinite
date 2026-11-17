@@ -6,6 +6,7 @@ import { chmodSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
+import { initialAttention } from "@infinite/attention";
 import { GoalService } from "../packages/host/src/goals.js";
 import { GOAL_DIGEST_EVENTS, GOAL_DIGEST_RESTORED, GOAL_OBJECTIVE_EVENTS, digestEvent, goalRecordDigest, type GoalDigestResult } from "../packages/host/src/objective-goals.js";
 import { goalRecord } from "../packages/host/src/objective-record.js";
@@ -13,8 +14,11 @@ import { objectiveRecordSchema, recordDigest, type ObjectiveRecord, type Criteri
 import { commandDigest } from "../packages/host/src/objective-input.js";
 import type { CreateGoal, ProductGoal } from "../packages/host/src/goal-types.js";
 import type { Config } from "../packages/host/src/types.js";
-import type { TeamCommand, TeamLineup } from "../packages/host/src/team-types.js";
-import { TeamError } from "../packages/host/src/teams.js";
+import type { TeamCommand, TeamLineup, TeamModelProfile, TeamRun } from "../packages/host/src/team-types.js";
+import { INTENT_EVENTS } from "../packages/host/src/team-intent.js";
+import { recordDigestFor } from "../packages/host/src/objective-digest.js";
+import { waitFor } from "./helpers.js";
+import { TeamError, type TeamService } from "../packages/host/src/teams.js";
 
 type StoredShape = { goal: ProductGoal; fingerprint: string; receipts: Record<string, string>; objectiveRecord?: unknown; objectiveNotice?: string; launch?: any; control?: unknown };
 
@@ -626,5 +630,138 @@ test("lists, single reads, and an idle tick parse no record and read no sealed f
       assert.deepEqual(prepared.counts, { parses: 1, sealed: 0 });
     } finally { prepared.stop(); }
     assert.equal(ticking.objectiveRecord(first.id).version, 2);
+
+    // A cycle waiting on the intent check's question, on its own fixture: an idle tick parses no record and reads no sealed file.
+    const checked = checkedFixture();
+    try {
+      const asking = checked.openTeam(), askingGoals = new GoalService(checked.config, checked.key, asking);
+      const asked = await askingGoals.create(createInput({ title: "Asked goal" }));
+      askingGoals.start();
+      await barrier(askingGoals, asked.id);
+      const askingTeam = askingGoals.get(asked.id).activeTeamId!;
+      asking.start();
+      const pm = await launchedMember(checked, asking, askingTeam, "project-manager");
+      checked.report(pm.sessionId, { requestId: randomUUID(), runId: askingTeam, memberId: pm.memberId, revision: pm.revision, report: PLAN });
+      const checker = await launchedMember(checked, asking, askingTeam, "intent-checker");
+      checked.report(checker.sessionId, { requestId: randomUUID(), runId: askingTeam, memberId: checker.memberId, revision: checker.revision, report: ASK });
+      await waitFor(() => Promise.resolve(asking.get(askingTeam)), view => view.decisions.length === 1, 20000);
+      askingGoals.close(); asking.close();
+
+      const waiting = checked.openTeam(), waitingGoals = new GoalService(checked.config, checked.key, waiting);
+      const idle = meter();
+      try {
+        waitingGoals.start();
+        await barrier(waitingGoals, asked.id);
+        waitingGoals.close();
+        assert.deepEqual(idle.counts, { parses: 0, sealed: 0 });
+      } finally { idle.stop(); waiting.close(); }
+    } finally { checked.close(); }
   } finally { f.close(); }
+});
+
+/** The scheduler fixture with an autonomous project whose lineup holds one strong evaluator of another family, so a goal and each cycle pin the check. */
+const EVALUATOR: TeamModelProfile = { id: "evaluator", label: "Evaluator", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" };
+function checkedFixture() {
+  const f = fixture();
+  f.config.teams = { ...f.config.teams!, lineup: { ...lineup, evaluators: [EVALUATOR] } };
+  f.config.projects[0]!.autonomy = "autonomous";
+  activeSessions(f);
+  return f;
+}
+/** The fixture's launched sessions are quiet from six minutes back, so the scheduler stalls each one before its report. These tests report every session as active. */
+function activeSessions(f: ReturnType<typeof fixture>) {
+  const state = f.manager.state;
+  f.manager.state = async (requestedId?: string) => ({ ...(await state(requestedId)), attention: initialAttention(new Date().toISOString(), true) });
+}
+
+const BRIEF = { title: "Rank sources", problem: "Find ranked sources", evidence: [{ source: "notes.md", observation: "The notes name the sources." }],
+  dataShape: "A ranked list of sources", acceptance: ["A ranked shortlist with reasons and sources"], expectedOutcome: "A ranked shortlist", uiChanges: false };
+const PLAN = { kind: "plan", summary: "Rank the sources", brief: BRIEF,
+  tasks: [{ id: "a", title: "Write the shortlist", instructions: "Write research/shortlist.md", paths: ["research/shortlist.md"], dependsOn: [], agentProfileId: "light" }] };
+/** One assumption, and one derived criterion that quotes the objective (the quote rule reads the objective and the directions). */
+const ASSUME_AND_CRITERION = { kind: "intent-check", summary: "One assumption and one criterion.", items: [{ dimension: "sources", why: "The sources are not named.", criticality: "detail", disposition: "assume",
+  assumption: { statement: "The sources are the notes' sources.", refutedBy: "The notes name other sources.", test: { kind: "owner" } } }],
+  criteria: [{ derivedFrom: "Find ranked sources", statement: "Every source is named", check: { kind: "judgement", item: "sources" }, threshold: { kind: "pass" } }] };
+/** One owner question that blocks the cycle until it is answered. */
+const ASK = { kind: "intent-check", summary: "One outcome needs the owner.", items: [{ dimension: "outcome", why: "The output name is not set.", criticality: "outcome", disposition: "ask",
+  assumption: { statement: "The owner chooses the output name.", refutedBy: "The owner names the output another way.", test: { kind: "owner" } },
+  question: { text: "Which output name should the files use?", options: ["alpha", "beta"], interrupt: "definition" } }] };
+
+const membersOf = (teams: TeamService, id: string) => (teams as unknown as { record(id: string): { run: TeamRun } }).record(id).run.members;
+const memberOf = (teams: TeamService, id: string, role: string) => membersOf(teams, id).find(member => member.role === role);
+/** The member of `role` once the host has launched its session. */
+const launchedMember = async (f: ReturnType<typeof fixture>, teams: TeamService, id: string, role: string) => {
+  try {
+    return await waitFor(() => Promise.resolve(memberOf(teams, id, role)), member => member !== undefined && f.launches.some(launch => launch.requestId === member.sessionId), 20000);
+  } catch (error) {
+    const view = teams.get(id);
+    throw new Error(`No ${role} session was launched; status ${view.status}; members ${JSON.stringify(view.members.map(m => [m.role, m.status]))}; events ${JSON.stringify(view.events.slice(-12).map(e => e.text))}`, { cause: error });
+  }
+};
+
+test("a goal cycle's check writes the goal's record", { timeout: 600000 }, async () => {
+  const f = checkedFixture(), teams = f.openTeam();
+  let goals: GoalService | undefined;
+  try {
+    goals = new GoalService(f.config, f.key, teams);
+    const created = await goals.create(createInput());
+    goals.start();
+    await barrier(goals, created.id);
+    const teamId = goals.get(created.id).activeTeamId;
+    assert.ok(teamId, "the tick launched the first cycle");
+    teams.start();
+    const pm = await launchedMember(f, teams, teamId, "project-manager");
+    f.report(pm.sessionId, { requestId: randomUUID(), runId: teamId, memberId: pm.memberId, revision: pm.revision, report: PLAN });
+    const checker = await launchedMember(f, teams, teamId, "intent-checker");
+    f.report(checker.sessionId, { requestId: randomUUID(), runId: teamId, memberId: checker.memberId, revision: checker.revision, report: ASSUME_AND_CRITERION });
+    const view = await waitFor(() => Promise.resolve(goals!.objectiveRecord(created.id)), record => record.version === 2, 20000);
+    teams.close();
+
+    assert.equal(view.version, 2);
+    assert.ok(view.record.assumptions.some(item => item.id === "a1"), "the assumption a1");
+    const derived = view.record.criteria.find(item => item.id === "c1");
+    assert.equal(derived?.origin, "derived");
+    assert.equal(view.log.filter(entry => entry.op === "intent-check.applied").length, 1);
+    // The running cycle keeps the digest it launched with, and the next cycle's digest lists c1 as derived.
+    assert.equal(teams.get(teamId).goal?.record?.version, 1);
+    const digest = recordDigestFor({ ...view.record, log: view.log }, [command]);
+    assert.equal(digest.criteria.find(item => item.id === "c1")?.derived, true);
+
+    const reopenedTeams = f.openTeam(), reopened = new GoalService(f.config, f.key, reopenedTeams);
+    try {
+      assert.equal(reopened.objectiveRecord(created.id).version, 2);
+      assert.equal(reopened.objectiveRecord(created.id).log.filter(entry => entry.op === "intent-check.applied").length, 1);
+    } finally { reopened.close(); reopenedTeams.close(); }
+  } finally { goals?.close(); teams.close(); f.close(); }
+});
+
+test("a failed goal record write changes nothing", { timeout: 600000 }, async () => {
+  const f = checkedFixture(), teams = f.openTeam();
+  let goals: GoalService | undefined;
+  try {
+    goals = new GoalService(f.config, f.key, teams);
+    const created = await goals.create(createInput());
+    goals.start();
+    await barrier(goals, created.id);
+    const teamId = goals.get(created.id).activeTeamId;
+    assert.ok(teamId, "the tick launched the first cycle");
+    // Once the cycle is running, every goal write fails: the check's write is the one this test is about.
+    const restore = f.blockRecordWrites("goal", created.id);
+    let restored = false;
+    try {
+      teams.start();
+      const pm = await launchedMember(f, teams, teamId, "project-manager");
+      f.report(pm.sessionId, { requestId: randomUUID(), runId: teamId, memberId: pm.memberId, revision: pm.revision, report: PLAN });
+      const checker = await launchedMember(f, teams, teamId, "intent-checker");
+      f.report(checker.sessionId, { requestId: randomUUID(), runId: teamId, memberId: checker.memberId, revision: checker.revision, report: ASSUME_AND_CRITERION });
+      await waitFor(() => Promise.resolve(teams.get(teamId)), view => view.events.some(event => event.text === INTENT_EVENTS.skipped["record-unavailable"]) && view.events.some(event => event.text.startsWith("Project manager planned")), 20000);
+      teams.close();
+      const view = teams.get(teamId);
+      assert.equal(view.events.filter(event => event.text.startsWith("Project manager planned")).length, 1, "the plan was accepted");
+      assert.equal(goals.objectiveRecord(created.id).version, 1, "in memory");
+      assert.equal(goals.objectiveRecord(created.id).log.filter(entry => entry.op.startsWith("intent-check.")).length, 0);
+      restore(); restored = true;
+      assert.equal((f.readRecord<StoredShape>("goal", created.id).objectiveRecord as ObjectiveRecord).version, 1, "on disk");
+    } finally { if (!restored) restore(); }
+  } finally { goals?.close(); teams.close(); f.close(); }
 });

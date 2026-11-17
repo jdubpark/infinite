@@ -1,6 +1,6 @@
 import type express from "express";
 import { z } from "zod";
-import { autonomyOf } from "./autonomy.js";
+import { startMode } from "./evaluator-profiles.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import { EvidenceError } from "./evidence/types.js";
 import { objectivePromptsOn } from "./objective-digest.js";
@@ -59,7 +59,7 @@ export function routingRoutes(app: express.Express, deps: RoutingRouteDeps, guar
       res.json(routingStatus(deps.evidence, {
         projectId: project.id,
         saved: project.team?.routing,
-        autonomy: autonomyOf(project),
+        autonomy: startMode(project, config.teams?.lineup).mode,
         lineup: config.teams?.lineup,
         // The values a new run pins, so the status shows the prompt versions a new decision would use.
         publishHeads: (config.teams as { publishHeads?: boolean } | undefined)?.publishHeads !== false,

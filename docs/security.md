@@ -572,6 +572,11 @@ Limits that remain:
   host's own service. Every other production or staging action depends on the
   raise rules and the strong model's verdict, and so on the measured miss
   rate. Name each workspace's deploy commands in the host configuration.
+- A versioned install is identified by a regular `.infinite-release.json` file
+  in its install directory. The host protects the directory containing that
+  release and uses that stable path in `classRulesDigest`, so sibling releases
+  are protected without making each deploy stale the replay result. Without the
+  marker, the dynamic install path protects only the install directory itself.
 - A command whose effect the host cannot read (a script file, a remote shell,
   a command substitution) matches no class rule. It is raised to the strong
   tier. The host reads a literal shell body (`sh -c '...'`) to three layers

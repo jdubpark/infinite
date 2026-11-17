@@ -97,6 +97,15 @@ Add `INFINITE_PROJECT_ID` to sudoers `env_keep`, validate the policy with `visud
 
 Build a release from this checkout using `npm ci --workspace @infinite/host --workspace @infinite/web --include-workspace-root` and `npm run build`. Build as an unprivileged build user, then install the resulting tree under `/opt/infinite` with root-owned files. Keep the pinned lockfile. Mobile dependencies are unnecessary on the execution server.
 
+For an immutable, versioned install placed directly below a directory that
+holds releases, create a regular `.infinite-release.json` file in each release
+directory after copying the build and before switching the service to it. This
+marks that install as a release so the permission agent protects its shared
+release root. Do not put the marker in a source checkout or in the directory
+holding releases. From the release directory's parent, create it with
+`printf '{}\n' >"$RELEASE_DIR/.infinite-release.json"`, where `RELEASE_DIR` is
+the absolute path of the release being installed.
+
 Prepare the Codex backend on the target operating system as the unprivileged build user. The build requires rustup with Rust 1.95.0 installed, plus tar, patch, pkg-config, libssl-dev, libcap-dev, and stock Codex 0.162.0; `codex` must be on the build user's `PATH`. From the checkout, run:
 
 ```sh

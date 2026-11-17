@@ -586,6 +586,13 @@ policy text, the tier instructions, the interrupt classes, the class rules or a
 tier profile's provider, model or effort makes the stored result stale, and the
 host is then not ready until the owner runs a new replay.
 
+A versioned release directory marked with `.infinite-release.json` contributes
+its containing release root to the class rules. Writes to that root and any
+sibling release need the owner. Releases under the same root keep the same
+`classRulesDigest`; an unmarked source checkout contributes only its own install
+directory to the dynamic protected paths, so its parent and sibling projects
+stay outside this rule.
+
 `replay` runs a labelled set of synthetic requests through the same class
 rules, raise rules and model turns that a live request would get, and stores
 the result. It needs an owner CLI. It delivers nothing to any session and

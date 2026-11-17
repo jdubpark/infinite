@@ -88,7 +88,7 @@ test("a mode change applies from the next run", async () => {
   const teams = f.openTeam();
   try {
     f.config.projects[0]!.autonomy = "autonomous";
-    const first = await teams.create(teamRequest());
+    const first = await teams.create({ ...teamRequest(), useConfiguredLineup: true } as CreateTeam);
     f.config.projects[0]!.autonomy = "supervised";
     const second = await teams.create(teamRequest());
     assert.equal(f.readRecord<{ run: TeamRun }>("team", first.id).run.autonomy, "autonomous");
@@ -291,4 +291,133 @@ test("a goal recorded before this slice stays supervised", async () => {
     assert.equal(autonomyOf(recorded), "supervised");
     assert.equal(recorded.cycles[1]!.autonomy, "supervised");
   } finally { goals?.close(); f.close(); }
+});
+
+/** The host lineup with no evaluator of another family: Claude coordinates and reviews, and no escalation is strong. */
+const { escalations: _strongEscalation, ...unreadyLineup } = lineup;
+const unready: TeamLineup = unreadyLineup;
+const noEvaluatorEvent = "This run starts supervised: no lineup profile of a model family other than the coordinator's can evaluate it.";
+const noLineupEvent = "This run starts supervised: it has no lineup, so no evaluator of another model family can check it.";
+const goalNoEvaluatorEvent = "This goal starts supervised: no lineup profile of a model family other than the coordinator's can evaluate it.";
+const standingNoEvaluator = "A standing goal needs an evaluator: no lineup profile of a model family other than the coordinator's can evaluate it. Add one to the lineup's evaluators, or start a finite goal.";
+const standingRequest = (): CreateGoal => ({ requestId: randomUUID(), projectId: "fixture", title: "Keep the fixture healthy", objective: "Choose scoped work",
+  successCriteria: "The owner has evidence", nonGoals: [], allowedPaths: ["."], evidence: [], maxMinutes: 5, maxMembers: 6, parallelism: 3,
+  standing: { shape: "objective", cadenceMinutes: 30 } } as CreateGoal);
+const eventsWith = (events: { text: string }[], text: string) => events.filter(event => event.text === text).length;
+const runEvents = (f: ReturnType<typeof teamFixture>, id: string) => f.readRecord<{ run: TeamRun }>("team", id).run.events;
+test("a lineup without an eligible evaluator starts new runs and goals supervised", async () => {
+  const f = teamFixture();
+  const teams = f.openTeam();
+  let goals: GoalService | undefined;
+  try {
+    f.config.projects[0]!.autonomy = "autonomous";
+    f.config.teams = { ...f.config.teams!, lineup: unready };
+    // The mission comes first: a mission cannot start while a standalone run of the project is active.
+    const mission = await teams.createForMission(teamRequest(), randomUUID(), unready);
+    assert.equal(mission.autonomy, "supervised");
+    assert.equal(eventsWith(runEvents(f, mission.id), noEvaluatorEvent), 1);
+
+    const configured = await teams.create({ ...teamRequest(), useConfiguredLineup: true } as CreateTeam);
+    assert.equal(configured.autonomy, "supervised");
+    assert.equal(eventsWith(runEvents(f, configured.id), noEvaluatorEvent), 1);
+
+    const single = await teams.create(teamRequest());
+    assert.equal(single.autonomy, "supervised");
+    assert.equal(eventsWith(runEvents(f, single.id), noLineupEvent), 1);
+
+    goals = new GoalService(f.config, f.key, stubTeams() as unknown as TeamService);
+    const goal = await goals.create(goalRequest());
+    assert.equal(goal.autonomy, "supervised");
+    assert.equal(eventsWith(f.readRecord<{ goal: ProductGoal }>("goal", goal.id).goal.events, goalNoEvaluatorEvent), 1);
+    await assert.rejects(goals.create(standingRequest()), (error: unknown) =>
+      error instanceof TeamError && error.code === "standing-requires-autonomy" && error.message === standingNoEvaluator);
+
+    f.config.teams = { ...f.config.teams!, lineup };
+    const ready = await teams.create({ ...teamRequest(), useConfiguredLineup: true } as CreateTeam);
+    assert.equal(ready.autonomy, "autonomous");
+    assert.equal(eventsWith(runEvents(f, ready.id), noEvaluatorEvent), 0);
+  } finally { goals?.close(); teams.close(); f.close(); }
+});
+
+test("pins already taken never move", async () => {
+  const f = teamFixture();
+  let teams = f.openTeam();
+  let goals: GoalService | undefined;
+  try {
+    f.config.projects[0]!.autonomy = "autonomous";
+    const run = await teams.create({ ...teamRequest(), useConfiguredLineup: true } as CreateTeam);
+    assert.equal(run.autonomy, "autonomous");
+    // The host lineup loses its evaluator; the pinned run stays autonomous through a pause and a reload.
+    f.config.teams = { ...f.config.teams!, lineup: unready };
+    const paused = await teams.pause(run.id, { requestId: randomUUID(), revision: run.revision });
+    assert.equal(paused.autonomy, "autonomous");
+    teams.close();
+    teams = f.openTeam();
+    assert.equal(autonomyOf(teams.get(run.id)), "autonomous");
+    // A goal cycle's run takes its goal's pin, whatever the lineup now gives, and logs no start event.
+    const cycle = await teams.createForGoal(teamRequest(), goalContext(randomUUID()), unready, false, "autonomous");
+    assert.equal(cycle.autonomy, "autonomous");
+    assert.equal(eventsWith(runEvents(f, cycle.id), noEvaluatorEvent), 0);
+
+    // A goal created autonomous keeps autonomous in its next cycle after the lineup loses its evaluator.
+    f.config.teams = { ...f.config.teams!, lineup };
+    const stub = stubTeams();
+    goals = new GoalService(f.config, f.key, stub as unknown as TeamService);
+    const created = await goals.create(goalRequest());
+    assert.equal(created.autonomy, "autonomous");
+    goals.start();
+    const first = await waitFor(() => stub.launches, value => value.length === 1, 5000);
+    assert.equal(first[0]!.autonomy, "autonomous");
+    const firstCycle = await waitFor(() => f.readRecord<{ goal: ProductGoal }>("goal", created.id), value => value.goal.cycles.length === 1, 5000);
+    f.config.teams = { ...f.config.teams!, lineup: unready };
+    stub.settle(firstCycle.goal.cycles[0]!.teamId, "ready-for-review");
+    const second = await waitFor(() => stub.launches, value => value.length === 2, 5000);
+    assert.equal(second[1]!.autonomy, "autonomous");
+    const secondCycle = await waitFor(() => f.readRecord<{ goal: ProductGoal }>("goal", created.id), value => value.goal.cycles.length === 2, 5000);
+    assert.equal(secondCycle.goal.cycles[1]!.autonomy, "autonomous");
+  } finally { goals?.close(); teams.close(); f.close(); }
+});
+
+test("each new run pins the intent check by mode and setting", async () => {
+  const f = teamFixture();
+  const teams = f.openTeam();
+  try {
+    f.config.projects[0]!.autonomy = "autonomous";
+    const mission = await teams.createForMission(teamRequest(), randomUUID(), lineup);
+    assert.equal(mission.intentCheck, "off");
+    assert.equal(f.readRecord<{ run: TeamRun }>("team", mission.id).run.intentCheck, "off");
+
+    const autonomous = await teams.create({ ...teamRequest(), useConfiguredLineup: true } as CreateTeam);
+    assert.equal(autonomous.intentCheck, "on");
+    assert.equal(f.readRecord<{ run: TeamRun }>("team", autonomous.id).run.intentCheck, "on");
+
+    f.config.projects[0]!.team!.objective = { intentCheck: "off" };
+    const disabled = await teams.create({ ...teamRequest(), useConfiguredLineup: true } as CreateTeam);
+    assert.equal(disabled.intentCheck, "off");
+
+    f.config.projects[0]!.autonomy = "supervised";
+    const supervisedOff = await teams.create(teamRequest());
+    assert.equal(supervisedOff.intentCheck, "off");
+    f.config.projects[0]!.team!.objective = { intentCheck: "on" };
+    const supervisedOn = await teams.create(teamRequest());
+    assert.equal(supervisedOn.intentCheck, "on");
+    assert.equal(f.readRecord<{ run: TeamRun }>("team", supervisedOn.id).run.intentCheck, "on");
+
+    delete f.config.projects[0]!.team!.objective;
+    const goalOn = await teams.createForGoal(teamRequest(), goalContext(randomUUID()), lineup, false, "autonomous");
+    assert.equal(goalOn.intentCheck, "on");
+    const goalOff = await teams.createForGoal(teamRequest(), goalContext(randomUUID()), lineup);
+    assert.equal(goalOff.intentCheck, "off");
+
+    // A replayed request returns the run with the pin it was created with, not the pin the current settings give.
+    const request = { ...teamRequest(), useConfiguredLineup: true } as CreateTeam;
+    f.config.projects[0]!.autonomy = "autonomous";
+    const first = await teams.create(request);
+    assert.equal(first.intentCheck, "on");
+    f.config.projects[0]!.autonomy = "supervised";
+    f.config.projects[0]!.team!.objective = { intentCheck: "off" };
+    const replay = await teams.create(request);
+    assert.equal(replay.id, first.id);
+    assert.equal(replay.intentCheck, "on");
+  } finally { teams.close(); f.close(); }
 });

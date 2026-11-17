@@ -19,6 +19,7 @@ const lineup: TeamLineup = {
   escalations: [],
   integrator: { id: "integrator", label: "Integrator", provider: "claude", model: "claude-opus-5-5", effort: "high", tier: "strong" },
   reviewer: { id: "reviewer", label: "Reviewer", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
+  evaluators: [{ id: "evaluator", label: "Evaluator", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" }],
 };
 const minute = 60_000;
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));

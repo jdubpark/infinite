@@ -55,7 +55,8 @@ async function settleAnswering(teams: { get(id: string): TeamView; answer(id: st
  * `planWithoutProfiles` writes the fixture's marker, so the project manager's plan omits every agentProfileId.
  */
 async function autoRun(planWithoutProfiles: boolean) {
-  const f = await fixture("mixed", mixedLineup, {}, { noServer: true });
+  // The evaluator lets the autonomous project pin its run autonomous (C14); the intent check stays off, as in routing-run.
+  const f = await fixture("mixed", { ...mixedLineup, evaluators: [{ id: "evaluator", label: "Evaluator", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" }] }, {}, { noServer: true });
   if (planWithoutProfiles) writeFileSync(join(f.receipts, "plan-no-profiles"), "");
   const key = readFileSync(f.host.config.keyFile);
   const store = new EvidenceStore({ databasePath: evidenceDatabasePath(f.host.config.stateDir), vaultKey: key });
@@ -69,7 +70,7 @@ async function autoRun(planWithoutProfiles: boolean) {
   assert.ok(store.tryWrite(tx => { markPeriodEnded(tx, "rehearsal", "2026-11-01T00:00:00.000Z", "2026-11-16T00:00:00.000Z"); }), "the period end could not be stored");
   const project = f.host.config.projects.find(item => item.id === "rehearsal")!;
   project.autonomy = "autonomous";
-  project.team = { ...project.team!, routing: { mode: "auto" } };
+  project.team = { ...project.team!, routing: { mode: "auto" }, objective: { intentCheck: "off" } };
   const teams = await f.openTeamService({ events: outbox });
   teams.useRouter(new RoutingRecorder({ store }));
   return { f, store, teams };

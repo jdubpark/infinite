@@ -16,7 +16,7 @@ import { RoutingRecorder } from "../packages/host/src/routing-recorder.js";
 import { routingRoutes } from "../packages/host/src/routing-routes.js";
 import { decisionKey, insertDecision, routingModule } from "../packages/host/src/routing-store.js";
 import type { DecisionRow, RoutingPayload, RoutingStatus } from "../packages/host/src/routing-types.js";
-import type { TeamRun, TeamTask } from "../packages/host/src/team-types.js";
+import type { TeamLineup, TeamRun, TeamTask } from "../packages/host/src/team-types.js";
 import type { Config } from "../packages/host/src/types.js";
 import { mixedLineup } from "./team-fixture.js";
 import { startHost, type Host } from "./helpers.js";
@@ -24,6 +24,8 @@ import { fixture as teamFixture } from "./team-fixture.js";
 
 const NOW = new Date().toISOString();
 const ASTRA = mixedLineup.implementers[1]!;
+// C14: an autonomous lineup is ready only with an evaluator of another family than the coordinator's.
+const READY_LINEUP: TeamLineup = { ...mixedLineup, evaluators: [{ id: "evaluator", label: "Evaluator", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" }] };
 
 /** Serves the routes from an in-process app whose guard passes everyone, so the config function is the test's own. */
 async function serve(store: EvidenceStore, config: Config): Promise<{ get: (path: string) => Promise<Response>; close: () => Promise<void> }> {
@@ -162,7 +164,7 @@ test("the status route reads the objective digest version only when owner criter
     const astraRows = (status: RoutingStatus) => status.cells.find(cell => cell.cell.scope === "new-task")!.profiles.find(profile => profile.profileId === ASTRA.id)!.rows.production;
     const cases = [[{ objective: { prompts: "on" } }, 2], [{ objective: { prompts: "off" } }, 0], [{}, 0]] as const;
     for (const [team, expected] of cases) {
-      const served = await serve(store, { projects: [{ id: "rehearsal", autonomy: "autonomous", team }], teams: { lineup: mixedLineup } } as unknown as Config);
+      const served = await serve(store, { projects: [{ id: "rehearsal", autonomy: "autonomous", team }], teams: { lineup: READY_LINEUP } } as unknown as Config);
       try {
         const status = await (await served.get("/api/routing/projects/rehearsal")).json() as RoutingStatus;
         assert.equal(astraRows(status), expected, JSON.stringify(team));
@@ -193,7 +195,7 @@ test("the routes pass the saved policy, the lineup, and the flags a new run pins
     });
     const astraRows = (status: RoutingStatus) => status.cells.find(cell => cell.cell.scope === "new-task")!.profiles.find(profile => profile.profileId === ASTRA.id)!.rows.production;
     const project = (team: object) => ({ id: "rehearsal", autonomy: "autonomous", team });
-    for (const [teams, expected] of [[{ lineup: mixedLineup }, 2], [{ lineup: mixedLineup, blackboard: { tools: true } }, 1]] as const) {
+    for (const [teams, expected] of [[{ lineup: READY_LINEUP }, 2], [{ lineup: READY_LINEUP, blackboard: { tools: true } }, 1]] as const) {
       const served = await serve(store, { projects: [project({})], teams } as unknown as Config);
       try {
         const status = await (await served.get("/api/routing/projects/rehearsal")).json() as RoutingStatus;
@@ -205,6 +207,23 @@ test("the routes pass the saved policy, the lineup, and the flags a new run pins
     try {
       assert.equal((await (await off.get("/api/routing/projects/rehearsal")).json() as RoutingStatus).mode, "off");
     } finally { await off.close(); }
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the routing status previews the start mode", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-routing-start-mode-"));
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: Buffer.alloc(32, 7) });
+  try {
+    store.register(configurationModule()); store.register(outcomeModule({ now: () => NOW })); store.register(routingModule());
+    // mixedLineup has no evaluator of another family, so an autonomous project starts supervised and routing is off.
+    const statusFor = async (autonomy: string) => {
+      const served = await serve(store, { projects: [{ id: "rehearsal", autonomy, team: {} }], teams: { lineup: mixedLineup } } as unknown as Config);
+      try { return await (await served.get("/api/routing/projects/rehearsal")).json() as RoutingStatus; } finally { await served.close(); }
+    };
+    assert.deepEqual(await statusFor("autonomous"), await statusFor("supervised"));
   } finally {
     store.close();
     rmSync(root, { recursive: true, force: true });

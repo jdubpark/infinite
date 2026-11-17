@@ -52,6 +52,23 @@ test("the digest lists active criteria with c0 first and empty", () => {
   assert.equal(recordDigestBytes(digest), Buffer.byteLength(JSON.stringify(digest)));
 });
 
+/** The digest of hostRecord() on the base commit, captured before Task 6 changed objective-digest.ts. */
+const BASE_DIGEST_JSON = '{"version":1,"criteria":[{"id":"c0","statement":"","check":"judgement:owner-text","producer":"evaluator"},{"id":"c1","statement":"Tests pass.","check":"command:npm test","producer":"host"},{"id":"c2","statement":"The summary is clear.","check":"judgement:owner-text","producer":"evaluator"}]}';
+
+test("the digest marks derived criteria and nothing else", () => {
+  const owner = hostRecord();
+  assert.equal(JSON.stringify(recordDigestFor(owner, [test1])), BASE_DIGEST_JSON, "a record without derived criteria gives the base digest byte for byte");
+
+  const base = hostRecord();
+  const criteria = base.criteria.map(item => (item.id === "c2" ? { ...item, origin: "derived" as const, derivedFrom: "ranked sources" } : item));
+  const record = objectiveRecordSchema.parse({ ...base, criteria, digest: recordDigest({ ...base, criteria }) });
+  const digest = recordDigestFor(record, [test1]);
+  assert.deepEqual(digest.criteria.map(item => [item.id, "derived" in item]), [["c0", false], ["c1", false], ["c2", true]], "only the derived criterion is marked");
+  assert.equal(digest.criteria[2]?.derived, true);
+  assert.deepEqual(Object.keys(digest.criteria[2] ?? {}), ["id", "statement", "check", "producer", "derived"], "the marker follows producer");
+  assert.ok(recordDigestSchema.safeParse(digest).success, "the marked digest parses with the digest schema");
+});
+
 test("labels are bounded and plain", () => {
   const withNewline = { command: "npm", args: ["run", "a\nb", "c\td"] } as TeamCommand;
   assert.equal(checkLabel({ kind: "command", command: commandDigest(withNewline) }, [withNewline]), "command:npm run a b c d", "control characters become spaces");

@@ -106,6 +106,12 @@ export function objectiveRecordLines(view: ObjectiveRecordView, goalId: string):
       return `  ${criterion.id} ${criterion.origin} ${criterion.state} · ${checkText(criterion.check)} · ${criterion.producer} · ${thresholdText(criterion.threshold)}: ${statement}`;
     }),
   ];
+  const assumptions = record.assumptions;
+  lines.push(assumptions.length ? "Assumptions:" : "Assumptions: none");
+  for (const assumption of assumptions) lines.push(`  ${assumption.id} ${assumption.status} ${assumption.criticality} ${assumption.origin}: ${assumption.statement}`);
+  const openQuestions = record.questions.filter(question => question.state === "open");
+  lines.push(openQuestions.length ? "Open questions:" : "Open questions: none");
+  for (const question of openQuestions) lines.push(`  ${question.id} open${question.waits ? " waits" : ""}: ${question.text}`);
   const directions = record.statement.directions;
   lines.push(directions.length ? "Directions:" : "Directions: none");
   for (const direction of directions) lines.push(`  ${direction.id} ${direction.source} at ${direction.at}: ${direction.text}`);

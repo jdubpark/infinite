@@ -16,7 +16,7 @@ const FIXED_ENV = {
   GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_NO_REPLACE_OBJECTS: "1", CI: "1",
 };
 
-const opts = { root: "", uid: process.getuid(), metadata: "closed", record: "", ancestorsWritable: false, toolsMissing: false, hang: 0, digestText: undefined };
+const opts = { root: "", uid: process.getuid(), metadata: "closed", record: "", ancestorsWritable: false, toolsMissing: false, hang: 0, digestText: undefined, freeBytes: 1099511627776, freeInodes: 10000000, metadataFile: undefined };
 const args = process.argv.slice(2);
 let i = 0;
 for (; i < args.length && args[i].startsWith("--"); i++) {
@@ -29,6 +29,9 @@ for (; i < args.length && args[i].startsWith("--"); i++) {
   else if (flag === "--tools") opts.toolsMissing = args[++i] === "missing";
   else if (flag === "--hang") opts.hang = Number(args[++i]);
   else if (flag === "--digest-text") opts.digestText = args[++i];
+  else if (flag === "--metadata-file") opts.metadataFile = args[++i];
+  else if (flag === "--free-bytes") opts.freeBytes = Number(args[++i]);
+  else if (flag === "--free-inodes") opts.freeInodes = Number(args[++i]);
   else process.exit(64);
 }
 const [op, ...rest] = args.slice(i);
@@ -65,16 +68,15 @@ function pruneTo(dir, keep) {
 
 function probe(canaries) {
   const stat = fs.statSync(opts.root);
-  const free = fs.statfsSync(opts.root);
   exit(0, Buffer.from(JSON.stringify({
     uid: opts.uid,
     root: opts.root,
     rootMode: (stat.mode & 0o777).toString(8),
     rootOwner: stat.uid,
     readable: canaries.map(readable),
-    metadata: opts.metadata,
-    freeBytes: Number(free.bavail) * Number(free.bsize),
-    freeInodes: Number(free.ffree),
+    metadata: opts.metadataFile === undefined ? opts.metadata : fs.readFileSync(opts.metadataFile, "utf8").trim(),
+    freeBytes: opts.freeBytes,
+    freeInodes: opts.freeInodes,
     ancestorsWritable: opts.ancestorsWritable,
     tools: !opts.toolsMissing,
   })));

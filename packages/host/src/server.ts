@@ -39,7 +39,7 @@ import { EvidenceError } from "./evidence/types.js";
 import { advanceEpoch, configurationModule, configurationProjector, EpochRequestConflict } from "./configuration-store.js";
 import { outcomeBackfill } from "./outcome-backfill.js";
 import { outcomeProjector } from "./outcome-projector.js";
-import { TaskCapture } from "./eval-capture.js";
+import { EvalHost } from "./eval-host.js";
 import { EXCLUSION_REASONS, OUTCOMES_MODULE, outcomeModule, runOutcomeView, sweepExpiredOutcomes, type SignalRow } from "./outcome-store.js";
 import { RoutingRecorder } from "./routing-recorder.js";
 import { routingModule, sweepExpiredDecisions } from "./routing-store.js";
@@ -265,7 +265,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     onApplied: scan => { signals.recordScan(scan); },
   });
   outbox.registerProjector(outcomeProjector(evidence));
-  const capture = new TaskCapture({ config, store: evidence, source: projectSource });
+  const evalHost: EvalHost = new EvalHost({ config, store: evidence, source: projectSource, hostLoad: manager.hostLoad, halt: () => halt, runs: () => teams.understandingRecords() });
   // The launch-rate fuse is built before any service that receives it starts. It stops before the store closes.
   const fuse = new FuseService({ config, key, store: evidence, sessionExists: id => {
     try { manager.meta(id); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
@@ -275,7 +275,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     source: projectSource,
     graphs: repositoryGraphs,
     events: outbox,
-    capture,
+    capture: evalHost.capture,
     entries: blackboard,
     onMerged: id => void projectSource.refresh(id).then(status => {
       sourceChanged(id);
@@ -401,7 +401,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
     sweepExpiredOutcomes(evidence, new Date().toISOString(), undefined, config.teams?.outcomes?.retentionDays);
     sweepExpiredDecisions(evidence, new Date().toISOString());
-    capture.sweep();
     signals.sweep();
   };
   let evidenceSweep: NodeJS.Timeout | undefined;
@@ -412,10 +411,9 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       if (!result.pending || result.blocked.length > 0) break;
     }
     backfillOutcomes();
-    capture.reconcile();
   };
   let outboxTimer: NodeJS.Timeout | undefined;
-  const closeEvidence = () => { baseScanner?.close(); clearInterval(evidenceSweep); clearInterval(outboxTimer); fuse.stop(); capture.close(); evidence.close(); };
+  const closeEvidence = () => { baseScanner?.close(); clearInterval(evidenceSweep); clearInterval(outboxTimer); fuse.stop(); evalHost.close(); evidence.close(); };
   missions.useUsage(usage);
   usage.useResolvers({
     goalOfRun: runId => { const goal = goals.list().find(value => value.cycles.some(cycle => cycle.teamId === runId)); return goal ? { id: goal.id, title: goal.title } : undefined; },
@@ -1098,6 +1096,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
   objectiveRoutes(app, { goals, teams }, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
   routingRoutes(app, { evidence, config: () => config }, requireRole(["owner", "controller", "viewer"]));
+  evalHost.routes(app, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
   app.get("/api/routines", (_req, res) => res.json({ routines: routines.list() }));
   app.get("/api/routines/:id", (req, res) => res.json(routines.get(id.parse(req.params.id))));
   app.post("/api/routines", requireRole(["owner"]), async (req, res) => res.json(await routines.create(createRoutineSchema.parse(req.body))));
@@ -2245,6 +2244,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     advanceOutbox();
     outboxTimer = setInterval(advanceOutbox, 60 * 1000);
     outboxTimer.unref();
+    evalHost.start();
     // A stop or resume pass that the previous process left unfinished is finished now.
     void halt.start().catch(() => {});
   });

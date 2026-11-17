@@ -1329,3 +1329,603 @@ export const ROUTING_AUTO_NOTE = "Auto routing applies to runs created after the
 3. **The fallback when the router cannot choose**: the coordinator's pick when it passes rules 1 and 2, else the default profile (the failure table says the default profile).
 4. **Contributor eligibility** (decision 4): not allowed by default. In an `auto` run this also bars contributor profiles from scouts, escalations, and limit fallbacks, so a lineup whose only light implementer is a contributor profile starts every task on a strong profile until the owner runs `--routing-contributor allow` for the project.
 5. **A saved `auto` before the period ends**: accepted, with a note; runs stay in shadow until the end is stored.
+
+# Slice: escalation target and scout rule
+
+Evidence router design (INF-186), delivery step 4 (INF-292): Part 2 (the `escalation` and `scout` points), Part 5 (coverage and the fixed rules there), Part 7 (`greedy-point` and the rows of the new points), Part 8 (the escalation and scout prompts and schemas), and Part 9 (`--routing-points`), with acceptance 4 to 8, 12, and 15 at the new points. After it, an owner who lists `escalation` or `scout` in a project's routing points gets the router's choice there in every `auto` run pinned after the upgrade: an escalated implementer starts on the greedy escalation profile, and a scout on the cheapest light implementer, both under the fixed rules, and a `shadow` run records those picks. It builds on step 2's pin, fixed rules, decisions, projector, and revoke, and adds no table, index, run status, event kind, or setting key.
+
+## Coordinator rulings (2026-11-17)
+
+These override the text below them where the two differ.
+
+1. **Owner decision 1, the report schema: the default stands.** `agentProfileId` becomes optional on `escalate` and on scouts in the one tool schema. The worker refuses a missing id with 409 and `PROFILE_REQUIRED_REFUSAL` unless the member's assignment carries `hostProfiles`. The pull request names this as the one model-visible change in `off` and `shadow` runs: the tool's `required` list. Prompts there still ask for the id.
+2. **Owner decision 2: accepted.** A `shadow` project whose saved points list `escalation` or `scout` pins version 2 on its next run and records rows at those points. Shadow writes rows only.
+3. **Owner decision 3: accepted.** Router and fallback picks pass rules 1 and 2. A profile a member names keeps step 2's rule 1.
+4. **Owner decision 4: accepted.** An implementer without a tier counts as a light scout candidate, as `tierCost` already counts it.
+5. **The model-family filter (design line 175, C19) stays out of this slice.** `permission-families.ts` now has `familyOf`, but the filter belongs with the C19 delivery gate (continuous autonomy step 6). It applies at `start` and `escalation` together, and only in runs that deliver by `merge`. Applying it at `escalation` alone would make the two points disagree.
+6. **Workers and checks.**
+   - Each task goes to one light worker: Haiku at effort xhigh, at most four at once. One attempt, then one focused repair.
+   - The coordinator commits each task after reading its diff, and mutation-tests every Review Focus line named below.
+   - Task 10 runs on the host. It is the only writer of `tests/fixtures/team-agent.mjs`.
+
+**The router acts at a new point only under a version-2 pin that lists it.** `pinRouting` writes `algorithmVersion: 2` when the points name `escalation` or `scout`, and 1 otherwise. Every pin made before this slice has version 1 and routes only `start`, whatever its points say. *(My call: the version is the pin's own record of what it routes. A start-only policy keeps version 1 and its digest, so step 1's and step 2's pins stay byte for byte.)*
+
+**Escalation is greedy over escalation evidence, and the scout rule is the lowest tier cost.** Neither draws a sample or reads a guard. The basis is `greedy-point`, `single-candidate`, or `default-all-limited`. A profile the router or its fallback picks passes rules 1 and 2 at both points (C9 rule 4). A profile a member names keeps step 2's rule 1 and is used only when the router makes no choice. *(My call for named profiles: tightening step 2's pools would change runs pinned before this slice.)*
+
+**The escalation decision runs in `consume`, before the scope check. The scout decision runs in `prepareMember`, before `newMember`.** Neither runs in an `operation()` completion, which also runs on paused, cancelled, and blocked runs. *(My call: Part 2 says "when the host accepts an escalate report". Deciding before the operation writes one row per key, and the completion starts the profile it captured.)*
+
+**`agentProfileId` becomes optional in the report schema for every run, and the worker refuses a missing one unless the member's assignment carries `hostProfiles`.** The refusal is a 409 that the member reads and corrects, as `verificationRefused` works today. *(My call, against Part 8's "schemas do not change" in off and shadow: the report tool has one schema per host. Per-member tool schemas would touch `launch.ts`, `team-mcp.ts`, and `team-report-client.ts`. Owner decision 1.)*
+
+**Revoking routing stops the router at every point, and a member that was told the host selects still gets a profile.** In a revoked run, an escalation or a scout without a named profile takes the fallback (rules 1 and 2) with no run line, as a revoked start does. A named one follows step 2's path. *(My call.)*
+
+## What runs today, and what this slice adds
+
+- **Escalation today.** A running implementer reports `{"kind":"escalate","agentProfileId":…,"reason":…}`. The schema requires the id (`team-types.ts` line 528). `consume` (`teams.ts` 5257–5272) accepts a profile from `escalationPool(run)`: all of `lineup.escalations` in `off` and `shadow`, and the rule-1 profiles in an auto-pinned run. The profile may not be the member's own, and a task escalates once. Anything else is 409 `invalid-escalation`. The `assertMemberScope` operation's completion records `task.escalation`, emits `task.escalated`, and calls `newMember(…, profile)`. Its limit fallback follows `fallbackRule`: rules 1 and 2 for an implementer of an auto-pinned run.
+- **Scouts today.** The coordinator's `explore` report names each scout's `agentProfileId`; `teamScoutPlanSchema` requires it (line 486). `assertTaskProfiles(run, tasks, "scouts")` checks it against `lineup.implementers` in `off` and `shadow`, and against `scoutPool` (rule 1) in an auto-pinned run. The step loop calls `prepareMember(stored, "scout", next)` while `active < run.parallelism`. `memberProfile` returns the named profile, and its limit fallback follows rule 1.
+- **The shadow recorder today** builds `RouterStart` for implementers only (`teams.ts` 4982). `record` returns unless the pin lists `start`. Nothing is recorded at an escalation or a scout. The projector settles first implementer starts only. Every project read filters `point='start'`. `taskDecisions`, which `routing explain` uses, reads every point.
+- **This slice adds** rows at `escalation` (role `implementer`) and `scout` (role `scout`), only under a version-2 pin that lists the point. The rows are `recorded` in `shadow`, and `pending`, then `applied` or `released`, in `auto`. In `auto` the host starts the chosen profile, and the projector settles the row.
+
+## Where the code and the design disagree, and the ruling for this slice
+
+- **Part 8: "In `off` and `shadow` mode, schemas … do not change."** The member's report tool takes its JSON schema once from `teamReportSchema` (`team-mcp.ts` lines 16 and 20). The member's process parses the same schema (`team-report-client.ts` line 50), and so does the worker (`worker.ts` line 399). Ruling: the two fields become optional in that one schema. The worker then refuses a missing id with 409 and `PROFILE_REQUIRED_REFUSAL` unless the assignment has `hostProfiles`. Prompts, contexts, plans, authority hashes, events, and views stay byte for byte in `off` and `shadow`. Only the tool's `required` list and the text of this one refusal change.
+- **Part 5, rule 2 "at every point", against step 2's docs** ("Scout and escalation profiles are not checked against this rule") **and `escalationPool` and `scoutPool`** (rule 1 only). Ruling: the router's candidates and every fallback pass rules 1 and 2. A named profile keeps rule 1, as in step 2. A covered run's scout limit fallback passes rules 1 and 2 (acceptance 7: no limit fallback lands on the reviewer's model).
+- **Part 2: "light profiles in `lineup.implementers`".** The tier is optional, and `tierCost` counts a profile without a tier as light. Ruling: the scout candidates are the implementers whose tier is not `strong`. Owner decision 4.
+- **Part 5: the model-family rule (C19) at `escalation`.** No family code exists; steps 1 and 2 left it out. Ruling: not applied, as before.
+- **Part 7 `basis` includes `greedy-point`; `Basis` in `routing-types.ts` lacks it.** Ruling: Task 1 adds `greedy-point`. `greedy-headroom` stays out, as in step 2.
+- **`appliedOutcomeIds`, `shareWindow`, `releaseStalePending`, `shadowProgress`, `computedPeriodEnd`, and the status reads hard-code `point='start'`.** Ruling: `appliedOutcomeIds` gains a point parameter. The share, the period, and status keep counting starts. A `pending` row at a new point counts nowhere, so it needs no 7-day release: its run's settle, advance, or delete releases it (`releaseRun` has no point filter).
+- **Part 1's `points` may omit `start`, but `pinRouting` pins nothing without `start`.** Ruling: kept. `--routing-points` refuses a list without `start`. The host schema stays as it is, so no saved configuration stops parsing.
+- **`discovery.accepted` carries `profileId: scout.agentProfileId`** (`teams.ts` line 5243). Ruling: a scout the host chooses has no `profileId` there; its profile appears on its `member.started`. The outcome projector reads only `taskId` and `features` from that event.
+- **Part 9's `--routing-points LIST` is not built** (`requestedRouting` knows three options). Ruling: Task 11 builds it, with the `/me` flag `routingPoints`.
+
+**Rollback.** This slice adds no schema, so a step-2 host reads the `routing` module (version 2) as ready. Escalation and scout rows stay `pending` there until their runs settle, advance, or are deleted. They count nowhere, because every step-2 read filters `point='start'`. A version-2 pin routes only `start` on that host. Two things break there:
+
+- A stored scout without `agentProfileId` blocks the run at its launch with 409 `invalid-agent-profile` (step 2's `scoutPool` message).
+- An `escalate` report without one does not parse there, so the member's exit blocks the run with `missing-agent-report`.
+
+`member.hostProfiles` and `scout.routing` are ignored, because `unseal<Stored>` casts the record without a schema (`teams.ts` line 527). The worker compares only the run, member, revision, role, and task of an assignment (`worker.ts` lines 1015–1017).
+
+The release note says: before rolling back past this release, run `infinite repo init --routing-points start` on every project that lists `escalation` or `scout`, and let every run whose pin has `algorithmVersion: 2` settle, or cancel it. Step 2's note (let every `auto` run settle: main refuses a plan task without `agentProfileId`) and step 1's note still apply.
+
+## Trust boundary, and what a review checks
+
+These inputs originate outside the host:
+
+- **The owner's points.** `points` arrives through `PUT /api/projects/:id/team` (owner role) or `infinite repo init --routing-points` with an owner key. It is inside the routine approval digest (C11), so a change blocks active routines until the owner approves them again. The read defaults and the autonomous defaults list only `start`, so the new behaviour is off by default.
+- **A worker's `escalate` report** is member text. The worker refuses a missing `agentProfileId` unless the member's assignment has `hostProfiles`. `consume` checks a present id against `escalationPool(run)` without the member's own profile, and answers 409 `invalid-escalation` otherwise, before any decision. The decision stores only a lineup id that passed this check. `reason` goes to `task.escalation` as today, never to the decision.
+- **The coordinator's `explore` report** is member text. A present scout id is checked as in step 2. An absent one passes only when the run covers `scout`.
+- **The member's assignment flag `hostProfiles`** is host-set in `newMember`, persisted on the member, and sent to the worker with the session. The member cannot set it, and its binding (`INFINITE_TEAM_ASSIGNMENT`) leaves it out.
+- **Run events** that the projector reads are host-emitted: `role`, `profileId`, and `replaces.cause` of `member.started`, plus each event's ids and revision.
+
+**What reaches stored text.** A decision row at a new point has step 1's columns. Its payload has step 1's fields over the new candidate set and no `guards`. A scout payload has `current: []` and no posterior. The run record gains `scout.routing` (a profile id and an enumeration) and `member.hostProfiles` (a boolean). A fallback adds one run line with a task or scout id and a profile label. These reach relay devices through the team view, and they are disclosed: they hold no member text. Nothing new reads a session environment, a journal, or provider output, so a GitHub grant or an egress proxy password cannot reach them. *(My call: no `evidence/secret-scan.ts` pass, as in steps 1 and 2.)*
+
+**What a member sees.** No routing value.
+
+- A run that covers `scout` and is not revoked changes the coordinator's explore paragraph. Its example drops `"agentProfileId"`, and the pool sentence becomes "The host assigns each scout's profile; omit agentProfileId from scouts."
+- An implementer gets a changed escalation paragraph when its run covers `escalation` with a candidate other than its own profile, and is not revoked. The paragraph drops the pool listing and the `agentProfileId` key, and says "The host selects the stronger profile." *(My call: coverage at `escalation` is per member. A member whose own profile is the only candidate keeps today's text and names a profile, so the host never promises a choice it cannot make.)*
+- A scout's inline assignment drops `routing` (`withoutRouting`), as an implementer's does. `teamContext` already drops it from `discovery.tasks`.
+- `memberReports` copies named member fields only, so `hostProfiles` stays out of contexts.
+- `task.escalation.toProfileId` names the router's profile in later contexts, as it names the worker's pick today. It is a lineup id, not a routing value. *(My call.)*
+- None of these sentences carries a policy, key, digest, seed, posterior, or utility, so the permission agent's 4,000-character read finds none.
+- No prompt version moves: `renderedPrompts` renders fixtures with no escalation pool and no pin (`config-identity.ts` FIXTURES).
+
+**What the ledger records.** No new event kind or run status. `task.escalated` and `member.started` keep their shape, and a host-chosen scout has no `profileId` in `discovery.accepted`. Outcome rows are unchanged: `pointOf` already gives `escalation`, and a scout row has no point. A version-2 `auto` run's routing component is its digest (C7).
+
+The slice must survive these sequences. Each has a named test.
+
+| Sequence | Expected | Test |
+|---|---|---|
+| An `off` or `shadow` project, and a version-1 pin (every pin made before this slice) whose points list `escalation` and `scout` | Pins, prompts, contexts, assignments, worker checks, and launches equal to step 2's; no row at a new point | Task 1 `off and shadow pins are byte-equal to step 1` (unchanged) and `a pin names version 2 only when its points list escalation or scout`; Task 8 `off, shadow, and version-1 prompts and contexts are byte-equal to step 2`; `the switch off keeps every prompt and context byte` and `the switch off keeps every prompt version` unchanged; Task 9 `version-1 and shadow pins keep step 2's escalation and scout paths` |
+| An `off` member reports an escalation without a profile | The worker refuses with 409; the member corrects it; the run continues | Task 10 `an off run refuses a report without a profile, and the member corrects it` |
+| Order: a first start, an escalated start, and a scout start in each of the 6 orders, then a new projector over the same store | The same rows as one projection | Task 4 `projecting the new points again, in each order of three events or after a restart, changes nothing` |
+| Repetition: a second decision for one key, with new outcome rows between | One row; the same profile | Task 6 `a second decision for one key reuses its row, even when its payload does not open` |
+| An unreadable record: a stored decision whose sealed payload does not open | The decision reuses the chosen profile from plain columns; explain shows the row with no payload | Task 6, same test |
+| A restart or a failed scope check between the escalation decision and its member's start | The row stays `pending`; the run's advance, settle, or delete releases it | Task 9 `a covered escalation without a profile starts the router's choice, decided before the scope check`; Task 4 `the projector applies or releases escalation and scout rows once` |
+| A deleted or settled run with `pending` escalation and scout rows | Released | Task 4 `the projector applies or releases escalation and scout rows once` |
+| A stall replacement starts before the escalated member | The escalation row stays `pending` until the escalated member starts | Task 4, same test |
+| An unavailable store (closed or missing module), a decision over 250 ms, a payload over 32 KiB, a failed write, a throw | The fallback profile, one run line, no row, one log line per reason; the run continues | Task 6 `every failure at a new point gives the fallback and its reason`; Task 7 `a fallback at a new point writes one run line and logs once per reason`; Task 9 `with the store closed an escalation and a scout start on the fallback, and the run continues` |
+| The owner revokes after members were told the host selects | No row; an unnamed escalation or scout takes the fallback without a run line; a named one follows step 2 | Task 7 `an auto run routes covered points, a revoked run falls back without a run line, and an uncovered run follows today's path`; Task 9 `a revoked run's unnamed escalation and scout take the fallback without a run line` |
+| Every escalation profile on the reviewer's model; no escalations; no light or untiered implementer that passes rules 1 and 2 | Uncovered: today's prompt and report check, no row, never a refused run | Task 2 `a run covers a point only under an auto pin of version 2 that lists it, with a candidate`; Task 8 `every escalation profile on the reviewer's model keeps today's escalation prompt` |
+| Every candidate limited | `default-all-limited`: the first candidate; `newMember`'s limit fallback under rules 1 and 2 | Task 5 `the scout rule takes the lowest tier cost and screens rules 1 to 3`; Task 3 `the fallbacks at the new points pass rules 1 and 2 and never the member's own profile` |
+| The member's own profile is the only escalation profile that passes rules 1 and 2 | Today's prompt and no `hostProfiles` for that member: it names a rule-1 profile, as today; no row | Task 2 `a run covers a point only under an auto pin of version 2 that lists it, with a candidate`; Task 8 `every escalation profile on the reviewer's model keeps today's escalation prompt` |
+| A named profile outside the pool, or the member's own, in a covered run | 409 `invalid-escalation` or `invalid-agent-profile`, before any row | Task 9 `a covered escalation without a profile starts the router's choice, decided before the scope check` |
+| A rollback to a step-2 host | See **Rollback** | Release note, no new test |
+
+## Exploration, guards, and the decision row
+
+The new points never explore (acceptance 6). `choose` returns `greedy-point` for a point other than `start` before it draws. `chooseScout` has no draw.
+
+- **The share and its window.** These count `start` rows only, as `shareWindow` does. A row at a new point neither takes nor frees share.
+- **The budget (`minSpareAttempts`) and the pause** gate only exploration, so they do nothing at these points. `newMember` still runs `assertBudget` for the escalated member and each scout, as today.
+- **The seed.** It is still computed, from the digest, run, revision, task key, point, and ordinal 1, and stored. It draws nothing.
+- **Elevated risk.** An escalation of an elevated-risk task takes the greedy profile at the mean minus one deviation, with three times the value (Part 5). The basis stays `greedy-point`, and the `risk` column records `elevated`.
+
+One row holds:
+
+- `key = sha256(runId|revision|taskKey|point|1)`;
+- the run, the revision, and the task key (the blind index of the task or scout id);
+- the point and ordinal 1;
+- the project, area, and feature-map references;
+- the role (`implementer` or `scout`), kind, risk, and feature version;
+- the mode, `algorithm_version` 2, `reward_version` 1, and the policy digest;
+- the seed and the basis;
+- the chosen and greedy profiles (always equal at these points) and the chosen identity;
+- `coordinator_profile_id`: the worker's or coordinator's validated pick, or null;
+- `explore` 0;
+- the state, the member (null until applied), and the decision time.
+
+## Cost on the launch path
+
+`createRun` reads nothing new: the pin's version comes from its knobs in memory. Coverage (`coversPoint`) is in memory over at most 8 profiles. It runs once per prompt build and once per member creation.
+
+**An escalation** happens at most once per task and revision, inside `consume`, synchronously:
+
+- one primary-key read of `routing_decisions`; a found row ends the read;
+- per distinct escalation identity (at most 8): `epochAt`, two seeks of `outcomes_by_route` (at most 1,000 rows each), and one covering seek of `routing_by_identity` at the `escalation` point (at most 2,000 entries);
+- one `store.tryWrite` with one insert.
+
+It reads no guard, releases no stale row, and opens no payload. At 10,000 outcome rows, it reads at most 10,000 outcome rows and 16,000 identity entries, the same bound as a start. The 250 ms budget applies.
+
+**A scout** (at most 3 per run, one batch per run) costs one primary-key read and one insert. It reads no outcome, configuration, or project state.
+
+**Shadow** reads the same and writes at most one row per key.
+
+**The projector** adds, per `member.started` of an escalated implementer or a first scout, one blind index and one primary-key update. Its other kinds are unchanged.
+
+**The worker's refusal** is an in-memory check per report.
+
+At 1,000 sessions nothing changes: nothing is read per session, member, or run on a list route or a tick.
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `packages/host/src/routing-types.ts` (modify) | Task 1: `greedy-point` in `Basis` |
+| `packages/host/src/routing-policy.ts` (modify) | Task 1: `POINTS_ALGORITHM_VERSION`, `algorithmVersionOf`; the digest and the pin take it |
+| `packages/host/src/team-types.ts` (modify) | Task 1: `TeamScout.routing`, `TeamAssignment.hostProfiles`. Task 2: the two optional schema fields, `escalationCandidates`, `scoutCandidates`, `coversPoint`, `hostSelects`, `hostProfilesFor`, `reportRefusal` and its two texts. About +35 lines (818 to about 853) |
+| `packages/host/src/worker.ts` (modify) | Task 2: lines 410–411 become a `reportRefusal` call; line 1652 strips `hostProfiles` from the binding. Net 0 (baseline 1,900) |
+| `packages/host/src/routing-rules.ts` (modify) | Task 3: covered scouts in `assertTaskProfiles` and `fallbackRule`; `escalationFallback`, `scoutFallback` |
+| `packages/host/src/routing-store.ts` (modify) | Task 4: the point parameter of `appliedOutcomeIds`; the projector settles escalation and scout rows |
+| `packages/host/src/routing-choice.ts` (modify) | Task 5: `screenProfiles`, `screenEscalations`, `screenScouts`, the point of `choose`, `chooseScout` |
+| `packages/host/src/routing-auto.ts` (modify) | Task 6: `frameOf`, and `evaluateImplementer` behind an unchanged `evaluateStart` |
+| `packages/host/src/routing-points.ts` (create) | Task 6: `RouterEscalation`, `RouterScout`, `evaluateScout`, `decideAutoEscalation`, `decideAutoScout`. Under 250 lines |
+| `packages/host/src/routing-recorder.ts` (modify) | Task 7: `routeEscalation`, `routeScout`, and shadow rows at the new points |
+| `packages/host/src/team-prompts.ts` (modify) | Task 8: the two host-selects texts and the scout's `withoutRouting` |
+| `packages/host/src/teams.ts` (modify) | Task 9: net +5 (5,707 to 5,712; baseline 5,747), only the lines Task 9 lists |
+| `packages/host/src/routing-cli.ts` (modify) | Task 11: `--routing-points` in `requestedRouting`; `assertRoutingSupport` |
+| `packages/host/src/team-cli.ts` (modify) | Task 11: net −1 (1,242 to 1,241): line 636 in place; lines 672–673 become one call |
+| `packages/host/src/server.ts` (modify) | Task 11: net 0 (2,282): `routingPoints: 1` in place on the `/me` line (832) |
+| `packages/host/src/client.ts`, `cli.ts`, `client-entry.ts` (modify) | Task 11: net 0 each: one option name and two help lines edited in place (`client.ts` stays 1,405) |
+| `tests/fixtures/team-agent.mjs` (modify) | Task 10: the scout role and two markers |
+| `docs/teams.md`, the design (modify) | Task 12 |
+| Tests | `tests/routing-points-rules.test.ts` (create, Task 2); `tests/routing-policy.test.ts` (1), `routing-rules.test.ts` (3), `routing-projector.test.ts` and `routing-store.test.ts` (4), `routing-choice.test.ts` (5), `routing-auto.test.ts` (6), `routing-recorder.test.ts` (7), `team-prompts.test.ts` (8), `routing-fixed-rules-run.test.ts` (9), `routing-auto-run.test.ts` (10), `autonomy-enrollment.test.ts` (11). Each stays under 1,000 lines. `tests/teams.test.ts`, `tests/goals.test.ts`, `missions.ts`, and `goals.ts` are not touched |
+
+**Order and owners.**
+
+- Task 1 runs first and is small.
+- Then Tasks 2, 4, and 11 run in parallel.
+- Tasks 3, 5, and 8 wait for Task 2, and run in parallel.
+- Task 6 waits for Tasks 3, 4, and 5. Task 7 waits for Task 6.
+- Task 9 waits for Tasks 3, 7, and 8. It is the only writer of `teams.ts`.
+- Task 10 waits for Task 9. It is the only writer of `tests/fixtures/team-agent.mjs`, and runs on the host, not in a network-off sandbox: its fake agents report through the worker's loopback hook.
+- Task 12 waits for Tasks 10 and 11.
+
+`team-types.ts` has two writers in sequence: Task 1, then Task 2. Every name, signature, statement, status code, text, and test name that one task builds against another's is fixed below. Line numbers are those of the reference tree; find each place by its quoted code. Every worker in a worktree commits with a WIP commit and never runs `git stash`.
+
+## Review Focus
+
+1. **Routing data reaching a member**: `scout.routing`, `hostProfiles`, a key, a digest, a seed, or a knob in any prompt, context, or the first 4,000 characters. Expect none. Tests: Task 8 `a scout's inline assignment never carries its routing` and `a covered run tells the coordinator and the implementer that the host selects, with no routing value`; Task 10 `an auto run routes its scouts and its escalation, and no member sees a routing value`. Mutation: deleting `withoutRouting(` from the scout text in `teamPrompt` must fail the first.
+2. **`off`, `shadow`, or a version-1 pin changing**: a prompt, context, assignment, pin, worker check, or launched profile. Expect none. Tests: Task 8 `off, shadow, and version-1 prompts and contexts are byte-equal to step 2`; Task 9 `version-1 and shadow pins keep step 2's escalation and scout paths`. Mutation: deleting `routing.algorithmVersion < POINTS_ALGORITHM_VERSION ||` from `coversPoint` must fail both.
+3. **A host pick that fails a fixed rule or is the member's own profile**: by the router, the fallback, or a covered scout's limit fallback. Expect none. Tests: Task 3 `the fallbacks at the new points pass rules 1 and 2 and never the member's own profile`; Task 5 `the scout rule takes the lowest tier cost and screens rules 1 to 3`. Mutation: deleting `profile.id !== ownProfileId &&` from `escalationFallback`, or returning rule 1 for a covered scout in `fallbackRule`, must fail Task 3's test.
+4. **A report without a profile accepted where no host selects**. Expect a 409 the member corrects. Tests: Task 2 `the worker refuses a missing profile unless the member's assignment says the host selects`; Task 10 `an off run refuses a report without a profile, and the member corrects it`. Mutation: deleting `if (refusal) throw new HookPayloadError(409, refusal);` in `worker.ts` must fail the Task 10 test; deleting `team.hostProfiles !== true &&` in `reportRefusal` must fail the Task 2 test.
+5. **A row stuck or misapplied**: an escalation row settled by a stall replacement, a scout row applied on a limit fallback, a second row per key, or a `pending` row that outlives its run. Expect none. Tests: Task 4 `the projector applies or releases escalation and scout rows once` and `projecting the new points again, in each order of three events or after a restart, changes nothing`; Task 6 `a second decision for one key reuses its row, even when its payload does not open`. Mutation: deleting `replaces.cause === "escalation" ?` from the projector (so any replacement settles the key) must fail the first.
+
+### Task 1: the version-2 pin and the shared types
+
+**Files:** `packages/host/src/routing-types.ts`, `packages/host/src/routing-policy.ts`, `packages/host/src/team-types.ts` (types only), `tests/routing-policy.test.ts`. Runs first.
+
+**Interfaces (produces):**
+```ts
+// routing-types.ts
+export type Basis = "sampled" | "greedy-risk" | "greedy-paused" | "greedy-budget" | "greedy-share" | "greedy-point"
+  | "single-candidate" | "default-all-limited";
+// routing-policy.ts
+export const ROUTING_ALGORITHM_VERSION = 1;
+/** A pin whose points name `escalation` or `scout`. A version-1 pin routes only `start`, whatever its points list. */
+export const POINTS_ALGORITHM_VERSION = 2;
+export function algorithmVersionOf(knobs: Pick<RoutingKnobs, "points">): number; // 2 when a point other than start is listed, else 1
+// policyDigest hashes canonicalJson({ algorithmVersion: algorithmVersionOf(knobs), rewardVersion, mode, knobs }).
+// pinRouting writes algorithmVersion: algorithmVersionOf(effective.knobs) in both arms.
+// team-types.ts
+export interface TeamScout extends TeamScoutPlan { /* existing fields */ routing?: TaskRouting }
+export type TeamAssignment = { /* existing fields */ verificationRefused?: true; entryTools?: true;
+  /** The host selects this member's escalation (implementer) or scout (project manager) profiles; a report may omit them. */
+  hostProfiles?: true };
+```
+
+**Decisions:** `ROUTING_ALGORITHM_VERSION` keeps its name and value; nothing else reads a version. `AUTONOMOUS_DEFAULTS` and `ROUTING_DEFAULTS` keep `points: ["start"]`.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `a pin names version 2 only when its points list escalation or scout` | With a lineup and `PERIOD_END`: `{ mode: "auto" }` and `{ mode: "shadow" }` give `algorithmVersion` 1 and the step-2 digest (`policyDigest` over version 1). `points` `["start","escalation"]`, `["start","scout"]`, and `["scout","start","escalation"]` give version 2, in both modes. The digest equals `sha256(canonicalJson({ algorithmVersion: 2, rewardVersion: 1, mode, knobs }))` with the points in the order start, escalation, scout. `points: ["escalation"]` still gives undefined |
+| `off and shadow pins are byte-equal to step 1` (unchanged) | Still passes: each case lists only `start` |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/routing-policy.test.ts` and `npm run typecheck`, and commit.
+
+### Task 2: who may omit a profile, and the worker's refusal
+
+**Files:** `packages/host/src/team-types.ts`, `packages/host/src/worker.ts`, `tests/routing-points-rules.test.ts` (create). After Task 1.
+
+**Interfaces (produces):**
+```ts
+// team-types.ts. Both fields become optional, with the same regex:
+//   teamScoutPlanSchema.agentProfileId, and the `escalate` report's agentProfileId.
+/** `lineup.escalations` that pass rules 1 and 2, in lineup order, without `ownProfileId`. */
+export function escalationCandidates(lineup: TeamLineup, knobs: Pick<RoutingKnobs, "allowContributor">, ownProfileId?: string): TeamModelProfile[];
+/** Implementers whose tier is not strong (a profile without a tier counts as light, as `tierCost` does) that pass rules 1 and 2. */
+export function scoutCandidates(lineup: TeamLineup, knobs: Pick<RoutingKnobs, "allowContributor">): TeamModelProfile[];
+/** An `auto` pin, revoked or not, of version POINTS_ALGORITHM_VERSION or later, lists `point`, and a candidate exists
+ *  (at `escalation`, one other than `ownProfileId`). Without `ownProfileId` it is the run's coverage. */
+export function coversPoint(run: Pick<TeamRun, "routing" | "lineup">, point: "escalation" | "scout", ownProfileId?: string): boolean;
+/** The member is told that the host selects: `coversPoint` and routing is not revoked. */
+export function hostSelects(run: Pick<TeamRun, "routing" | "routingRevokedAt" | "lineup">, point: "escalation" | "scout", ownProfileId?: string): boolean;
+/** An implementer when `coversPoint(run, "escalation", ownProfileId)`; the project manager when `coversPoint(run, "scout")`;
+ *  false for every other role. */
+export function hostProfilesFor(run: Pick<TeamRun, "routing" | "lineup">, role: TeamMember["role"], ownProfileId?: string): boolean;
+/** Moved from worker.ts line 411, byte for byte. */
+export const PLAN_VERIFICATION_REFUSAL: string;
+export const PROFILE_REQUIRED_REFUSAL = "Report rejected: name an approved agentProfileId for the escalation and for every scout, then submit the corrected report.";
+/** The worker's refusal before a report is recorded, or undefined. The verification rule first, unchanged. */
+export function reportRefusal(team: TeamAssignment, report: TeamReport): string | undefined;
+```
+```ts
+// worker.ts lines 410–411 become exactly:
+const refusal = reportRefusal(session.team, report.report);
+if (refusal) throw new HookPayloadError(409, refusal);
+// worker.ts line 1652, in place:
+const { verificationRefused: _refused, entryTools: _entryTools, hostProfiles: _hostProfiles, ...binding } = session.team;
+```
+
+**Decisions:**
+- `reportRefusal` returns `PROFILE_REQUIRED_REFUSAL` when `team.hostProfiles !== true` and the report is an `escalate` without `agentProfileId`, or an `explore` with a scout without one.
+- `coversPoint` imports `POINTS_ALGORITHM_VERSION` from `routing-policy.ts`, which `team-types.ts` already imports from. The prompts need these helpers, and the import guard bars `routing-` modules from `team-prompts.ts`, so they live here.
+
+- [ ] **Step 1: Write the failing tests.** The lineup is `POINT_LINEUP`. Its reviewer is `claude-opus-5-5`. Implementers: `spark-high` (light, contributor), `astra-xhigh` (codex `gpt-6-astra` xhigh, no tier), `haiku-light` (claude `claude-haiku-5-5`, light), `opus-strong` (claude `claude-opus-5-5`, strong). Escalations: `opus-escalation` (`claude-opus-5-5`, strong), `astra-escalation` (codex `gpt-6-astra` high, strong), `sonnet-escalation` (claude `claude-sonnet-5-5`, strong), `spark-escalation` (contributor).
+
+| Test name | Assertions |
+|---|---|
+| `a run covers a point only under an auto pin of version 2 that lists it, with a candidate` | `coversPoint` is true at both points for an `auto` version-2 pin listing all three points, revoked or not. `hostSelects` is false once `routingRevokedAt` is set. It is false at both points for: a version-1 pin with the same points; a version-2 `shadow` pin; a pin listing only `start`. Escalation is false with escalations `[opus-escalation]` (acceptance 8) and with none. Scout is false with implementers `[spark-high, opus-strong]`, and true with `allowContributor`. `escalationCandidates(…, "astra-escalation")` is `[sonnet-escalation]`. With escalations `[sonnet-escalation, opus-escalation]`, `coversPoint(run, "escalation")` is true and `coversPoint(run, "escalation", "sonnet-escalation")` is false. `scoutCandidates` is `[astra-xhigh, haiku-light]`. `hostProfilesFor` follows escalation, with the own profile, for `implementer`, and scout for `project-manager`; it is false for every other role |
+| `the worker refuses a missing profile unless the member's assignment says the host selects` | An escalate without an id gives `PROFILE_REQUIRED_REFUSAL`; with `hostProfiles: true`, undefined; with an id, undefined. An explore whose second of two scouts lacks an id gives the refusal; with the flag, undefined. A project manager with `verificationRefused` and a plan with `verification` gives `PLAN_VERIFICATION_REFUSAL`, equal to the literal at `worker.ts` line 411 before this task. Without the flag, undefined. Every other report kind gives undefined. `teamReportSchema` parses an escalate and a scout without `agentProfileId` |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/routing-points-rules.test.ts` and `npm run typecheck`, and commit. The worker change is proven end to end by Task 10.
+
+### Task 3: named profiles and fallbacks at the new points
+
+**Files:** `packages/host/src/routing-rules.ts`, `tests/routing-rules.test.ts`. After Task 2.
+
+**Interfaces (produces):**
+```ts
+// assertTaskProfiles, the auto-pinned `scouts` branch, before its pool check:
+//   if (id === undefined && coversPoint(run, "scout")) continue;
+// fallbackRule: a scout of a run that covers `scout` passes rules 1 and 2; any other scout of an auto-pinned run, rule 1.
+/** The worker's named escalation profile when it passes rules 1 and 2, else the first that does; never `ownProfileId`. */
+export function escalationFallback(run: TeamRun, ownProfileId: string | undefined, namedProfileId: string | undefined): TeamModelProfile | undefined;
+/** The coordinator's named profile when it is a scout candidate, else the first scout candidate. Undefined when none exists. */
+export function scoutFallback(run: TeamRun, scout: Pick<TeamScout, "agentProfileId">): TeamModelProfile | undefined;
+```
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `a covered run accepts scouts without a profile, and a named one still passes rule 1` | In a covered run, a scout without an id passes. A scout named `spark-high` (contributor) throws 409 `invalid-agent-profile` with `PROFILE_MESSAGES.scoutPool`. Under a version-1 `auto` pin, a scout without an id throws the `scoutPool` message. With no pin, it throws the `pool` message (main's) |
+| `the fallbacks at the new points pass rules 1 and 2 and never the member's own profile` | `escalationFallback`: a named `sonnet-escalation` with own `astra-xhigh` gives `sonnet-escalation`. A named `opus-escalation` (reviewer model) gives `astra-escalation`. A named profile equal to own gives the first other passing profile. Own `astra-escalation` with no name gives `sonnet-escalation`. Escalations `[astra-escalation]` with own `astra-escalation` give undefined. `scoutFallback`: named `haiku-light` gives `haiku-light`; named `opus-strong` or `spark-high`, or no name, gives `astra-xhigh`. `fallbackRule(run, "scout")` in a covered run refuses a reviewer-model target and a contributor, and accepts a standard one. Under a version-1 pin it refuses only the contributor (step 2's) |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/routing-rules.test.ts` and `npm run typecheck`, and commit.
+
+### Task 4: the store and the projector at the new points
+
+**Files:** `packages/host/src/routing-store.ts`, `tests/routing-projector.test.ts`, `tests/routing-store.test.ts`. After Task 1.
+
+**Interfaces (produces):**
+```ts
+/** `${run_id}:${member_id}` of the identity's applied rows at `point` decided at or after `since`, newest first, at most 2,000. */
+export function appliedOutcomeIds(db: EvidenceDb, identity: string, since: string, point: "start" | "escalation" = "start"): Set<string>;
+// SQL, through routing_by_identity:
+// "SELECT run_id, member_id FROM routing_decisions WHERE chosen_identity=? AND point=? AND state='applied' AND decided_at>=? ORDER BY decided_at DESC LIMIT 2000"
+```
+```ts
+// routingProjector, member.started. settleStart keeps its name and SQL; it settles a pending row at any point.
+const data = event.data, replaces = data.replaces as { cause?: unknown } | undefined;
+if (event.taskId === undefined || event.memberId === undefined || typeof data.profileId !== "string") return;
+const point = data.role === "implementer" ? (replaces === undefined ? "start" : replaces.cause === "escalation" ? "escalation" : undefined)
+  : data.role === "scout" && replaces === undefined ? "scout" : undefined;
+if (point !== undefined) settleStart(tx, decisionKey(event.runId, event.revision, tx.index("task", event.taskId), point, 1), event.memberId, data.profileId);
+```
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `the projector applies or releases escalation and scout rows once` | Three `pending` rows of one run and revision: start (task `a`), escalation (task `a`), and scout (`s1`). A first start on the start pick applies its row only. A stall replacement (`replaces.cause` `stall`) on another profile leaves the escalation row `pending`. The escalated start (`cause` `escalation`) on the chosen profile applies it, with its member id. The scout start on a limit fallback releases the scout row. A replayed event changes nothing. On a second run, `run.deleted` releases all three, and `run.settled` and `run.revision-advanced` release the lower revisions' rows, at the new points too |
+| `projecting the new points again, in each order of three events or after a restart, changes nothing` | The first start, the escalated start, and the scout start, in each of the 6 orders, give rows equal to one projection. A new `routingProjector()` over the same store, given the same events, changes nothing |
+| `applied ids at the escalation point seek routing_by_identity` | `EXPLAIN QUERY PLAN` of the statement above with point `escalation` names `routing_by_identity`. An applied start row is not returned at `escalation`, and an applied escalation row is not returned at `start` |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/routing-projector.test.ts tests/routing-store.test.ts` and `npm run typecheck`, and commit.
+
+### Task 5: the choice at the new points
+
+**Files:** `packages/host/src/routing-choice.ts`, `tests/routing-choice.test.ts`. After Task 2.
+
+**Interfaces (produces):**
+```ts
+/** Rules 1 to 3 over `profiles`, in their order, as `screen` applies them to the implementers. */
+export function screenProfiles(profiles: readonly TeamModelProfile[], lineup: Pick<TeamLineup, "reviewer">, knobs: RoutingKnobs,
+  limited: ReadonlySet<Provider>): Screened[];
+// screen(lineup, knobs, limited) becomes screenProfiles(lineup.implementers, lineup, knobs, limited); its output is unchanged.
+export function screenEscalations(lineup: TeamLineup, knobs: RoutingKnobs, limited: ReadonlySet<Provider>, ownProfileId: string | undefined): Screened[];
+export function screenScouts(lineup: TeamLineup, knobs: RoutingKnobs, limited: ReadonlySet<Provider>): Screened[];
+/** Unchanged at `start`. At any other point it returns basis `greedy-point` with the greedy profile, before the risk and sample branches. */
+export function choose(screened: readonly Screened[], scored: ReadonlyMap<string, Scored>, knobs: RoutingKnobs,
+  risk: "normal" | "elevated", seed: string, point: RoutingPoint = "start"): Choice | undefined;
+/** The scout rule: `default-all-limited`, `single-candidate`, or `greedy-point` at the lowest `tierCost`, ties in lineup order.
+ *  Each kept candidate records `costUsd`. Undefined when no candidate passes rules 1 and 2. */
+export function chooseScout(screened: readonly Screened[]): Choice | undefined;
+```
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `escalation and scout choices never sample, over 1,000 seeds` | Two escalation candidates, both at normal and at elevated risk: for 1,000 seeds, `choose(…, seed, "escalation")` has basis `greedy-point`, `explore` false, and chosen equal to greedy, and no candidate records a `sample`. `chooseScout` never returns `sampled` (acceptance 6) |
+| `the scout rule takes the lowest tier cost and screens rules 1 to 3` | On `POINT_LINEUP`: nothing limited gives `greedy-point` `astra-xhigh`, each kept candidate at `costUsd` 0.40; `spark-high` is removed as `contributor`; `opus-strong` is no candidate. `codex` limited gives `single-candidate` `haiku-light`. `codex` and `claude` limited give `default-all-limited` `astra-xhigh`. `allowContributor` gives `greedy-point` `spark-high`. A light profile at 0.40 beats an earlier one costed at 2.20 (a test profile through `screenScouts` with tier `strong` removed from its record) |
+| `coverage agrees with the router's screen at both new points` | For the 9 lineups and knobs of Task 2's coverage test: `coversPoint(run, "escalation")` holds exactly when `screenEscalations(…, new Set(), undefined)` keeps a profile without a removal, and the same for `scout` with `screenScouts`. `screen` gives the same output as before this task |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/routing-choice.test.ts` and `npm run typecheck`, and commit.
+
+### Task 6: decisions at the new points
+
+**Files:** `packages/host/src/routing-auto.ts`, `packages/host/src/routing-points.ts` (create), `tests/routing-auto.test.ts`. After Tasks 3, 4, and 5.
+
+**Interfaces (produces):**
+```ts
+// routing-auto.ts
+export function frameOf(input: RouterStart, screened: Screened[]): StartFrame; // startFrame(input) = frameOf(input, screen(…)), unchanged
+/**
+ * Scores an implementer decision inside a read. `start` explores under the guards in `auto`; `escalation` is greedy and reads
+ * no guard. Every "start" literal of evaluateStart becomes `at.point`: the target, the evidence read, appliedOutcomeIds,
+ * the seed, `choose`, and the row. `coordinatorProfileId` is `at.named`. Undefined when no candidate passes rules 1 and 2.
+ */
+export function evaluateImplementer(db: EvidenceDb, input: RouterStart, frame: StartFrame, keys: { taskKey: string; key: string },
+  now: string, auto: boolean, at: { point: "start" | "escalation"; named: string | null }): Evaluated | undefined;
+// evaluateStart keeps its signature: evaluateImplementer(…, { point: "start", named: input.task.agentProfileId ?? null }).
+```
+```ts
+// routing-points.ts
+export type RouterEscalation = RouterStart & { ownProfileId: string | undefined; namedProfileId: string | undefined };
+export type RouterScout = { run: TeamRun; scout: TeamScout; featureMap: FeatureMap | undefined; limited: ReadonlySet<Provider> };
+/** Features `taskFeatures({ role: "scout", paths: [] }, featureMap)`; `chooseScout(screenScouts(…))`; `current: []`; no guards. */
+export function evaluateScout(db: EvidenceDb, input: RouterScout, keys: { taskKey: string; key: string }, now: string, auto: boolean): Evaluated | undefined;
+/**
+ * Undefined when no escalation profile other than the member's own passes rules 1 and 2. Otherwise decideAutoStart's flow at
+ * key (run, revision, task key, "escalation", 1), with these changes: the candidates come from screenEscalations; the fallback
+ * is escalationFallback; a found row's profile is looked up in lineup.escalations; and no stale row is released.
+ */
+export function decideAutoEscalation(store: EvidenceStore, input: RouterEscalation, now: () => string, clock: () => number): AutoDecision | undefined;
+/** The same at key (run, revision, scout key, "scout", 1), with scoutFallback. It needs only the `routing` module. */
+export function decideAutoScout(store: EvidenceStore, input: RouterScout, now: () => string, clock: () => number): AutoDecision | undefined;
+```
+
+**Decisions:** A row's chosen profile is read from its plain columns, never from its payload. `DECISION_BUDGET_MS` (250), `PAYLOAD_LIMIT_BYTES` (32 KiB), and the `AutoFailure` reasons apply as at `start`.
+
+- [ ] **Step 1: Write the failing tests.** They reuse the file's `withStore`, `withBrokenStore`, `config`, `integrated`, and `countReads`.
+
+| Test name | Assertions |
+|---|---|
+| `an escalation decision is greedy over escalation evidence only, and writes one pending row` | Own profile `astra-xhigh`. Ten integrated rows at point `escalation` for `sonnet-escalation`'s identity and ten at `start` for `astra-escalation`'s give `{ by: "router" }` `sonnet-escalation`. With no rows, ties go to `astra-escalation`. One row: point `escalation`, ordinal 1, role `implementer`, mode `auto`, `algorithmVersion` 2, state `pending`, basis `greedy-point`, `explore` false, a 64-hex seed, chosen equal to greedy, `coordinatorProfileId` equal to the named id or null, and member null. The payload has no `guards` and lists the four escalations without the own profile, with `opus-escalation` removed as `reviewer-model` and `spark-escalation` as `contributor`. Escalations `[astra-escalation]` with own `astra-escalation` give undefined and no row |
+| `a scout decision reads no outcome and writes one pending row` | `{ by: "router" }` `astra-xhigh`. One row: point `scout`, role `scout`, basis `greedy-point`, `coordinatorProfileId` null; payload `current` `[]`, candidates with `costUsd` 0.40 and no posterior. `countReads` sees one read and no statement on `outcomes` or `configurations` |
+| `a second decision for one key reuses its row, even when its payload does not open` | Decide an escalation and a scout. Set each row's `encrypted_payload` to `'not-sealed'`, and add outcome rows that would change the escalation pick. Decide again: the same profiles, `by: "router"`, and still one row per key. `taskDecisions` returns both rows with `payload` null |
+| `every failure at a new point gives the fallback and its reason` | For an escalation and a scout, with the setups of `every failure starts the fallback profile with one run line`: a closed store or a missing module gives `unavailable`, a clock step of 251 ms `budget`, a 40 KiB feature-map name `tooLarge`, a failing write `write`, and a throwing read `failed`. Each gives `escalationFallback`'s or `scoutFallback`'s profile, `by: "fallback"`, and no row |
+| existing tests of this file | Unchanged: start rows, guards, and pins are byte-equal to step 2 |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/routing-auto.test.ts tests/routing-choice.test.ts` and `npm run typecheck`, and commit.
+
+### Task 7: the recorder at the new points
+
+**Files:** `packages/host/src/routing-recorder.ts`, `tests/routing-recorder.test.ts`. After Task 6.
+
+**Interfaces (produces):**
+```ts
+export type { RouterEscalation, RouterScout } from "./routing-points.js";
+/**
+ * Never throws. A shadow pin of version 2 that lists `escalation` records one `recorded` row and returns undefined. Undefined
+ * also when the run does not cover the point, or is revoked and the worker named a profile: today's path then applies.
+ * A revoked run without a named profile gets escalationFallback, with no row and no run line. Otherwise decideAutoEscalation.
+ * A fallback writes one run line and logs AUTO_LOG once per reason.
+ */
+routeEscalation(input: RouterEscalation): TeamModelProfile | undefined;
+/** The same at `scout`. A kept `scout.routing` that is still a scout candidate is returned without a read. Sets `scout.routing`. */
+routeScout(input: RouterScout): TeamModelProfile | undefined;
+```
+
+**Decisions:**
+- The run lines are ``Host routing could not choose an escalation profile for task ${task.id}; it is assigned ${profile.label}.`` and ``Host routing could not choose a profile for scout ${scout.id}; it is assigned ${profile.label}.``
+- The log lines are `LOG` and `AUTO_LOG` as they stand: each names no id and no value.
+- A shadow row at a new point is written only under `algorithmVersion >= POINTS_ALGORITHM_VERSION`, with the point in `points` and a lineup.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `a shadow pin of version 2 records the new points, and a version-1 pin records none` | Version-2 shadow: `routeEscalation` returns undefined and writes one `recorded` escalation row whose `coordinatorProfileId` is the named id. `routeScout` returns undefined and writes one `recorded` scout row. The same pins at version 1 write nothing. A closed store logs `LOG.unavailable` once over both calls. `shadowProgress` counts neither row |
+| `an auto run routes covered points, a revoked run falls back without a run line, and an uncovered run follows today's path` | Covered: `sonnet-escalation` (with Task 6's rows) and `astra-xhigh`, with `scout.routing` `{ profileId: "astra-xhigh", by: "router" }`. A second `routeScout` with that `scout.routing` reads nothing. Revoked without a name: `escalationFallback`'s and `scoutFallback`'s profiles, `scout.routing.by` `fallback`, and no row or run line. Revoked with a name, uncovered (escalations `[opus-escalation]`), a version-1 pin, and the own-profile case each give undefined and no row |
+| `a fallback at a new point writes one run line and logs once per reason` | With the store closed, one escalation and two scouts write the two run lines above, once per task or scout, and log `AUTO_LOG.unavailable` once |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/routing-recorder.test.ts` and `npm run typecheck`, and commit.
+
+### Task 8: the prompts
+
+**Files:** `packages/host/src/team-prompts.ts`, `tests/team-prompts.test.ts`. After Task 2.
+
+**Interfaces (produces):** No export changes. Three edits to `teamPrompt`:
+- **Scout text:** `JSON.stringify(task)` becomes `JSON.stringify(task && withoutRouting(task))`. The bytes are unchanged when `routing` is absent.
+- **Explore paragraph:** when `hostSelects(run, "scout")`, the example task is `{"id":"inspect-flow","title":"Inspect the current flow","instructions":"A bounded research question"}`, and the auto-pinned sentence becomes `The host assigns each scout's profile; omit agentProfileId from scouts.`
+- **Escalation paragraph:** when `role === "implementer" && hostSelects(run, "escalation", modelProfile?.id)`, it is:
+  `If this task exceeds your reasoning capacity or the approach is failing, you may request one explicit escalation. The host selects the stronger profile. Report {"kind":"escalate","reason":"What failed or requires deeper reasoning; identify partial edits and remaining work"}. The host checks your partial edits, stops you, and continues in the same working copy. If this task already records an escalation, ask a material user question or report blocked; do not switch models yourself.`
+  Otherwise today's paragraph is unchanged.
+
+**Decisions:** Re-pin rule: if main changed a prompt before this merges, `PIN_PROMPTS_SHA256` and `PIN_CONTEXTS_SHA256` come from the new main's output. This slice moves neither, and `PIN_VERSIONS_SHA256` in `tests/config-identity.test.ts` does not move.
+
+- [ ] **Step 1: Write the failing tests.** Constants: `HOST_SCOUT_SENTENCE` and `HOST_ESCALATION` (the paragraph above). `POINTS_PIN` is `AUTO_PIN` with `algorithmVersion` 2 and `points` `["start","escalation","scout"]`. `AUTO_ESCALATIONS` is `[AUTO_SPARK, AUTO_ASTRA, OPUS_ESCALATION]`, where `OPUS_ESCALATION` uses the reviewer's model.
+
+| Test name | Assertions |
+|---|---|
+| `off, shadow, and version-1 prompts and contexts are byte-equal to step 2` | With `AUTO_ESCALATIONS`, for every `PIN_ROLES` role: a version-2 shadow pin listing all points gives prompts and contexts equal to no pin. `POINTS_PIN` at version 1 equals `AUTO_PIN`. `POINTS_PIN` revoked gives no host-selects sentence |
+| `a covered run tells the coordinator and the implementer that the host selects, with no routing value` | `POINTS_PIN`: the coordinator prompt holds `HOST_SCOUT_SENTENCE` once, not `SCOUT_POOL_SENTENCE`, and no `"agentProfileId"` in the explore example. The implementer prompt holds `HOST_ESCALATION` once, and neither `to this approved pool:` nor `"agentProfileId"`. Neither matches `ROUTING_VALUE_WORDS` or holds `AUTO_DIGEST`, in the whole prompt or its first 4,000 characters |
+| `every escalation profile on the reviewer's model keeps today's escalation prompt` | Escalations `[OPUS_ESCALATION]` under `POINTS_PIN`: the implementer prompt equals the same run under `AUTO_PIN` and holds `to this approved pool: ${JSON.stringify([OPUS_ESCALATION])}` (acceptance 8). Escalations `[AUTO_ASTRA, OPUS_ESCALATION]`: an implementer on `AUTO_ASTRA` gets today's paragraph, and one on `AUTO_SPARK` gets `HOST_ESCALATION` |
+| `a scout's inline assignment never carries its routing` | A scout with `routing: { profileId: "astra-xhigh", by: "router" }`: the scout prompt has no `"routing":` and equals the prompt of the same scout without the field |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/team-prompts.test.ts tests/config-identity.test.ts` and `npm run typecheck`, and commit.
+
+### Task 9: the team service
+
+**Files:** `packages/host/src/teams.ts` (net +5, 5,707 to 5,712), `tests/routing-fixed-rules-run.test.ts`. After Tasks 3, 7, and 8.
+
+**The exact edits:**
+1. Line 16: add `coversPoint, hostProfilesFor` to the `team-types` import, in place.
+2. Line 447 (`assignment`), in place: add `...(member.hostProfiles ? { hostProfiles: true as const } : {})` after `entryTools`.
+3. Line 2021, in place: the revoke line appends ``(coversPoint(run, "escalation") || coversPoint(run, "scout") ? " Escalations and scouts use the profile their member names, else the first that passes the fixed rules." : "")``. Step 2's text is unchanged for every other run.
+4. Line 4826 (`newMember`'s return), in place: add `...(hostProfilesFor(run, role, modelProfile?.id) ? { hostProfiles: true as const } : {})` after `entryTools`. `modelProfile` is the local that already holds the profile after the limit fallback.
+5. Lines 4982–4986 (`prepareMember`) become four lines:
+```ts
+const run = stored.run, routed = task && run.routing && this.router && (role === "implementer" || role === "scout") ? this.routerInput(run) : undefined;
+const start = routed && role === "implementer" ? { ...routed, run, task: task as TeamTask } : undefined, scout = routed && role === "scout" ? { run, scout: task as TeamScout, limited: routed.limited, featureMap: routed.featureMap } : undefined;
+const member = this.newMember(run, role, "", run.headCommit!, task?.id, prebuilt?.prompt, prebuilt?.profile ?? (start && autoPinned(run) ? this.router!.applyStart(start) : scout ? this.router!.routeScout(scout) : undefined));
+if (start) this.router!.recordStart(start);
+```
+6. A new private method, four lines, after `prepareMember`:
+```ts
+private routerInput(run: TeamRun) {
+  return { publishHeads: this.publishHeadsEnabled(), entryTools: entryToolsFor(run, "implementer"), objectiveDigest: Boolean(run.goal?.record),
+    limited: this.limits.limited(), featureMap: (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features };
+}
+```
+7. Lines 5258–5261 (`consume`, escalate) become six lines. The completion is unchanged and starts the captured `profile`.
+```ts
+const task = run.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId);
+const named = escalationPool(run).find(item => item.id === report.agentProfileId && item.id !== member.modelProfile?.id);
+const profile = !task || task.escalation || (report.agentProfileId !== undefined && !named) || !run.routing || !this.router ? named
+  : this.router.routeEscalation({ ...this.routerInput(run), run, task, ownProfileId: member.modelProfile?.id, namedProfileId: named?.id }) ?? named;
+if (!task || task.escalation || !profile || profile.id === member.modelProfile?.id)
+  throw new TeamError(409, "invalid-escalation", "An implementer may escalate once to a different profile in the approved escalation pool.");
+```
+
+**Decisions:**
+- The explore branch and `memberProfile` are unchanged: Task 3 moved their rule.
+- The host always installs the router (`server.ts` line 290), and only the router pins. Without one (tests only), a covered unnamed escalation is refused with 409 `invalid-escalation`, and a covered unnamed scout starts on `fallbackProfile` (rules 1 and 2).
+- A replacement built from a prebuilt prompt and moved by a limit fallback keeps the escalation text of its earlier profile (`retargetPrompt` rewrites only the reporting and profile blocks). Its `hostProfiles` follows the new profile. The two disagree only when the new profile is the only escalation candidate. The worker then refuses an unnamed report, and the member must name a profile. *(My call: a rare case that needs no code.)*
+- The run lines and refusals of `off` and `shadow` runs are unchanged.
+
+- [ ] **Step 1: Write the failing tests.** They reuse the file's `openStore`, `openTeam`, `pin`, `internal`, `runningTask`, `implementer`, `eventsOfKind`, and `waitFor`. The lineup is `mixedLineup` with escalations `[sonnet-escalation, opus-escalation]`. The version-2 pin is `pin(f, { mode: "auto", points: ["start", "escalation", "scout"] })`.
+
+| Test name | Assertions |
+|---|---|
+| `a covered escalation without a profile starts the router's choice, decided before the scope check` | An escalate without an id: right after `consume` returns, one `pending` escalation row chooses `sonnet-escalation`. After the operation: `task.escalation.toProfileId`, `task.escalated`'s `toProfileId`, and the new member's `modelProfile.id` are `sonnet-escalation`. The run line reads `… escalated to Sonnet escalation; …`, and the member has `hostProfiles: true`. A named `astra-xhigh` (own) or `spark-escalation` (not in the pool) throws 409 `invalid-escalation` with no row. When a path outside `task.paths` fails the scope check, the run blocks, the row stays `pending`, and no member or `task.escalation` exists |
+| `a covered scout without a profile starts on the router's choice` | An explore without scout ids is accepted. `discovery.accepted` lists the scout without `profileId`. After `step`, the scout member's `modelProfile.id` is `astra-xhigh`, `scout.routing` is `{ profileId: "astra-xhigh", by: "router" }`, and the member's prompt has neither `"routing":` nor `agentProfileId`. The project manager's assignment has `hostProfiles: true` |
+| `a revoked run's unnamed escalation and scout take the fallback without a run line` | After `revokeRouting`, which writes step 2's line plus the new sentence: an unnamed escalation starts `sonnet-escalation`, and an unnamed scout starts `astra-xhigh` with `by: "fallback"`. No row is written, and no fallback run line |
+| `with the store closed an escalation and a scout start on the fallback, and the run continues` | The two run lines of Task 7, once each. The members start on the fallback profiles. The run is not blocked |
+| `version-1 and shadow pins keep step 2's escalation and scout paths` | `f.run.routing` set to the version-2 pin with `algorithmVersion: 1`: a named escalation runs the named profile, and an escalate without an id throws 409 `invalid-escalation`. Scouts must be named. No member has `hostProfiles`, and no row is written. A version-2 `shadow` pin: the named profiles run, and one `recorded` row exists per point |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/routing-fixed-rules-run.test.ts tests/routing-auto-run.test.ts tests/routing-run.test.ts` and `npm run typecheck`, check the `teams.ts` count with `node scripts/check-file-size.mjs`, and commit.
+
+### Task 10: the host path, end to end
+
+**Files:** `tests/fixtures/team-agent.mjs` (at most +40 lines, 863 to about 903), `tests/routing-auto-run.test.ts` (181 lines now). After Task 9. Run on the host.
+
+**Fake agent.** Markers are files in the receipt directory, as `plan-no-profiles` is.
+- **A scout branch:** `assignment.role === "scout"` reports `{"kind":"findings","summary":"Read the module","evidence":[…]}`, the evidence in the shape `teamEvidenceSchema` requires.
+- **The marker `explore-unnamed`:** the revision-1 project manager, before any discovery, reports an explore with one scout `s1` and no `agentProfileId`. Once its context holds the scouts' findings, it plans as before.
+- **The marker `escalate-unnamed`:** the first implementer of task `a` reports `{"kind":"escalate","reason":"Needs the stronger model"}` without an id. If the report is refused, it writes the refusal to `${memberId}.rejection.txt`, following the `bootstrap-override` pattern, and reports again with the id read from the marker file `escalate-to`. An implementer whose prompt holds `The previous implementer requested escalation` writes its file and reports done.
+- Every other scenario is unchanged.
+
+- [ ] **Step 1: Write the failing tests.** `autoRun` gains a points argument. The project's `team.routing` is `{ mode: "auto", points }`, the lineup has escalations `[sonnet-escalation]`, and `objective.intentCheck` stays `"off"`.
+
+| Test name | Assertions |
+|---|---|
+| `an auto run routes its scouts and its escalation, and no member sees a routing value` | With both markers and all three points, the run reaches `ready-for-review`. The scout row is `applied` to the scout member on `astra-xhigh`. Task `a`'s escalation row is `applied` to the escalated member on `sonnet-escalation`. Each first start row is `applied`. The coordinator's prompt holds `The host assigns each scout's profile; omit agentProfileId from scouts.`, and the first implementer's prompt holds `The host selects the stronger profile.` No member prompt or context holds `"routing":`, the digest, a decision key, or a seed |
+| `an off run refuses a report without a profile, and the member corrects it` | An `off` project (no routing and no `plan-no-profiles` marker, so the plan names its profiles) with escalations `[sonnet-escalation]`, the marker `escalate-unnamed`, and `escalate-to` holding `sonnet-escalation`. The rejection file holds `PROFILE_REQUIRED_REFUSAL`. Task `a` escalates to `sonnet-escalation`, the run reaches `ready-for-review`, and no routing row exists |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/routing-auto-run.test.ts tests/routing-run.test.ts` on the host, and commit.
+
+### Task 11: `--routing-points`
+
+**Files:** `packages/host/src/routing-cli.ts`, plus in-place edits to `team-cli.ts`, `server.ts`, `client.ts`, `cli.ts`, and `client-entry.ts`; `tests/autonomy-enrollment.test.ts`. After Task 1.
+
+**Interfaces (produces):**
+```ts
+type Me = { teams?: { routing?: number; routingAuto?: number; routingPoints?: number } };
+// requestedRouting also reads "--routing-points": comma-separated, trimmed, each of start, escalation, scout, unique, start
+// included; it sets choice.points. Otherwise it throws:
+//   "--routing-points must list start, and may add escalation and scout, separated by commas."
+/** team-cli.ts lines 672–673 move here unchanged, with a third check:
+ *  "This host does not support escalation and scout routing. Upgrade the host before using --routing-points." */
+export function assertRoutingSupport(choice: Record<string, unknown> | undefined, me: Me): void;
+```
+
+**The in-place edits:**
+- **`team-cli.ts`:** line 636 adds `"--routing-points"` to the non-Git list. Lines 672–673 become `assertRoutingSupport(routingChoice, me);`, with `assertRoutingSupport` added to the existing `routing-cli.js` import line. Net −1.
+- **`server.ts`:** line 832 becomes `routing: 1, routingAuto: 1, routingPoints: 1,`.
+- **`client.ts`:** line 502 adds `"--routing-points"` to `CLIENT_STRING_OPTIONS`.
+- **Help:** `cli.ts` line 244 and `client-entry.ts` line 35 append ` [--routing-points start[,escalation][,scout]]`.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `repo init saves routing points, refuses a list without start, and checks the host` | `--routing-points start,scout,escalation` saves `points` `["start","scout","escalation"]` and merges over the saved policy. A rerun without the option keeps it. `escalation`, `start,start`, `start,review`, and `""` each fail with the message above and leave the saved policy unchanged. A host whose `/me` lacks `routingPoints` refuses `start,escalation` with the capability message, and accepts `--routing-points start` |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/autonomy-enrollment.test.ts tests/client-args.test.ts` and `npm run typecheck`, and commit.
+
+### Task 12: docs and design amendments
+
+**Files:** `docs/teams.md`, `docs/superpowers/specs/2026-11-12-evidence-router-design.md`. After Tasks 10 and 11.
+
+- **`docs/teams.md`, "Auto routing":** a new subsection "Escalations and scouts". It covers:
+  - `--routing-points` (it requires `start`; the setting is in the approval digest);
+  - coverage, and what an uncovered point does;
+  - what the coordinator and the implementer are told;
+  - the greedy escalation and the scout cost rule;
+  - router and fallback picks pass rules 1 and 2, and named picks rule 1;
+  - the revoke behaviour;
+  - the two run lines;
+  - `routing explain RUN_ID SCOUT_ID`.
+- **`docs/teams.md`, "Fixed rules" rule 2:** the last sentence becomes "A profile the host chooses for an escalation or a scout is checked against this rule; a profile a member names is not."
+- **`docs/teams.md`, "What a decision row holds":** names the new points.
+- **`docs/teams.md`, "Rolling back":** gains this slice's note.
+- **The design**, amended in place and marked *Escalation slice (2026-11-17)*:
+  - Part 2: the scout candidates and the decision placement;
+  - Part 5: rule 2 on host picks, named picks, coverage, and version 2;
+  - Part 7: `greedy-point`; new-point rows released by run events only;
+  - Part 8: one report schema and the worker's refusal;
+  - Part 9: `--routing-points` requires `start`.
+
+- [ ] **Step 1:** Write the amendments. **Step 2:** Check that every new test name in this section exists and passes. **Step 3:** The coordinator runs `npm run check` once, and runs `node scripts/check-file-size.mjs`: `teams.ts` 5,712, `team-cli.ts` 1,241, and `worker.ts`, `server.ts`, and `client.ts` unchanged. The coordinator decides whether to lower the baselines with `--update`. This slice raises none. Commit.
+
+## Not in this slice
+
+- **The learned cascade and `--routing-cascade`** (step 5). Start candidates stay `lineup.implementers`.
+- **Status lines for the new points.** `routing status` still covers `start` only. `routing explain` shows rows at every point. The client views are step 6, and a client shows a host-chosen scout's profile only from its member until then, since it reads `agentProfileId`.
+- **The replay prior and dry run** (step 3).
+- **Other designs' terms:** the model-family rule (C19), headroom and pressure, and the duel tie-break.
+- **Per-member report tool schemas** (owner decision 1's alternative).
+- **A 7-day release of `pending` rows at the new points.**
+- **Ordinals above 1.** Replacements never reach the router.
+- **A quality measure for scouts.**
+
+## Owner decisions this slice needs, with the defaults it builds
+
+1. **The report schema.** Default: `agentProfileId` is optional in the one tool schema, and the worker refuses a missing id with a correctable 409 unless the host selects. The alternative is per-member tool schemas, which need `launch.ts`, `team-mcp.ts`, `team-report-client.ts`, and `worker.ts`, and keep the tool's `required` list byte for byte.
+2. **Saved points in shadow projects.** A `shadow` project whose saved policy already lists `escalation` or `scout` (possible only through the API or the configuration file before this slice) pins version 2 on its next run and records at those points. Default: accept, since the owner listed the points.
+3. **Rule 2 at the new points.** Default: router and fallback picks pass rules 1 and 2, and a member's named pick keeps step 2's rule 1.
+4. **Scout candidates.** Default: implementers without a tier count as light.

@@ -766,8 +766,9 @@ processes sharing a Unix account or grant permission beyond the accepted task.
 The optional egress proxy narrows where agent sessions on the Ubuntu host can
 connect. It is off unless `autonomy.boundary.egress` is configured; without it,
 session environments are unchanged. When configured, each new session receives
-`HTTPS_PROXY` and `HTTP_PROXY` pointing at a loopback proxy, with a credential
-that names the session's project and expires. The host reads the shared key;
+the six proxy variables and `NODE_USE_ENV_PROXY=1`. The proxy URLs point at a
+loopback proxy and carry a credential that names the session's project and
+expires. The host reads the shared key;
 no session receives it. When the key cannot be read, sessions and host commands
 still get the proxy address, without a credential, so their requests are
 refused rather than sent direct. The proxy refuses cloud metadata, loopback, private,
@@ -786,6 +787,8 @@ of that account can read, so the recorded project says which credential was
 used rather than which project acted. The proxy never inspects TLS content: an
 allowed host such as a code host or package registry can still carry data out,
 as can DNS through the local resolver, and services on loopback remain
-reachable. Tools that ignore proxy variables go direct, which observe mode only
-logs. Installation, rollout, rollback, and the full list of limits are in the
-[egress runbook](../deploy/ubuntu/egress.md).
+reachable. Node's built-in `fetch` and HTTP clients need `NODE_USE_ENV_PROXY=1`
+on Node releases that support environment proxies; the host sets this flag when
+egress is configured. Other tools that ignore proxy variables go direct, which
+observe mode only logs. Installation, rollout, rollback, and the full list of
+limits are in the [egress runbook](../deploy/ubuntu/egress.md).

@@ -8,8 +8,8 @@ Defaults:infinite-host env_keep += "INFINITE_HOOK_URL INFINITE_HOOK_TOKEN INFINI
 # The member folder under an owner-trusted team root (teams.trustWorkspaces), for the Claude wrapper.
 Defaults:infinite-host env_keep += "INFINITE_TRUSTED_WORKSPACE"
 # Optional egress proxy (deploy/ubuntu/egress.md): a loopback proxy URL holding a per-session
-# attribution credential. The proxy key itself is never in the environment.
-Defaults:infinite-host env_keep += "HTTPS_PROXY HTTP_PROXY https_proxy http_proxy NO_PROXY no_proxy"
+# attribution credential. The Node flag makes supported Node clients honor it. The proxy key is never in the environment.
+Defaults:infinite-host env_keep += "HTTPS_PROXY HTTP_PROXY https_proxy http_proxy NO_PROXY no_proxy NODE_USE_ENV_PROXY"
 # Per-session GitHub grant and the loopback GitHub proxy (autonomy.boundary.github). A grant is a scoped,
 # expiring capability the proxy checks; it is not a GitHub token. Also passed to the team launcher.
 Defaults:infinite-host env_keep += "INFINITE_GITHUB_GRANT INFINITE_GITHUB_PROXY"

@@ -54,7 +54,7 @@ import { buildLaunch, headlessResumeProfile } from "./launch.js";
 import { channelToken } from "./permission-headless.js";
 import { HeadlessChannelWorker } from "./permission-headless-worker.js";
 import { addProjectIdToLaunchEnv } from "./worker-env.js";
-import { workerEgressEnvironment } from "./egress.js";
+import { clearEgressEnvironment, workerEgressEnvironment } from "./egress.js";
 import { claudeConfigPath, recordClaudeTrust } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
@@ -1671,7 +1671,7 @@ server.listen(socketPath(runDir, session.id), async () => {
     // Without the key it gets the proxy with no credential, so its requests are refused rather than sent direct.
     const egress = workerEgressEnvironment(session.projectId, session.id);
     if (egress.status === "invalid") throw new Error("The egress proxy address this worker inherited is unusable, so the session was not started");
-    Object.assign(env, egress.env);
+    clearEgressEnvironment(env); Object.assign(env, egress.env);
     if (egress.status === "no-key") journal.append("lifecycle", { egress: "no-credential" });
     const relayPath = fileURLToPath(
       new URL(

@@ -20,7 +20,7 @@ Policy mode and firewall variant are separate switches. Run both in observe, rea
 | `egress/infinite-egress-firewall.service` | `/etc/systemd/system/` |
 | `egress/nftables-keeps-egress.conf` | `/etc/systemd/system/nftables.service.d/infinite-egress.conf` |
 | `egress/infinite-requires-egress-firewall.conf` | `/etc/systemd/system/infinite.service.d/egress-firewall.conf`, in enforce mode |
-| `infinite.sudoers` | `/etc/sudoers.d/infinite`; it keeps the proxy variables through sudo |
+| `infinite.sudoers` | `/etc/sudoers.d/infinite`; it keeps the six proxy variables and `NODE_USE_ENV_PROXY` through sudo |
 
 Run the commands from a checkout of the release that the host runs. Port 4785 is an example; any free loopback port works if the proxy config, the optional socket unit, and the host's `proxyUrl` agree.
 
@@ -122,7 +122,7 @@ Add the block to `/etc/infinite/config.json`, merging it into an existing `auton
 }
 ```
 
-`proxyUrl` must be `http://` to a loopback IP address with a port and nothing else. Then install the sudoers file from this release, which keeps the proxy variables through sudo, and restart the API so it picks up the configuration and the new group:
+`proxyUrl` must be `http://` to a loopback IP address with a port and nothing else. Then install the sudoers file from this release, which keeps the six proxy variables and `NODE_USE_ENV_PROXY` through sudo, and restart the API so it picks up the configuration and the new group:
 
 ```sh
 sudo visudo -cf deploy/ubuntu/infinite.sudoers
@@ -135,7 +135,7 @@ The doctor line reads `Egress: proxy reachable at 127.0.0.1:4785 · key readable
 
 If the key cannot be read, the host still hands out the proxy address, without a credential. Network requests from new sessions and host commands are then refused with `407` rather than sent direct, local work is unaffected, the worker journals `no-credential`, and `doctor` reports `key UNREADABLE (...)` with that consequence. Fix the key's owner, group, or mode; new sessions and the next host command pick it up.
 
-If `teams.commandPrefix` runs a root-owned launcher that resets the environment, make it keep `HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`, `http_proxy`, `NO_PROXY`, and `no_proxy`. Otherwise team Git fetches and pushes run as the agent account without the proxy: logged in observe, refused in enforce. Without `teams.commandPrefix`, those commands run as the host account, which the firewall rule does not match, so only the proxy variables route them.
+If `teams.commandPrefix` runs a root-owned launcher that resets the environment, make it keep `HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`, `http_proxy`, `NO_PROXY`, `no_proxy`, and `NODE_USE_ENV_PROXY`. This repository does not ship that launcher, so update the server copy. Otherwise team Git fetches and pushes run as the agent account without the proxy: logged in observe, refused in enforce. Without `teams.commandPrefix`, those commands run as the host account, which the firewall rule does not match, so only the proxy variables route them.
 
 Rollback: remove the `egress` block, restart `infinite.service`, and recreate sessions. The sudoers line has no effect while the host sets no proxy variables.
 
@@ -224,12 +224,12 @@ The proxy reads the key at start, and the API caches it for host commands, so bo
 
 - **Names, not content.** The proxy sees the host name and port of each connection and never decrypts TLS. An allowed host can carry data out: `github.com` accepts pushes to any repository the agent can write, and `*.githubusercontent.com` serves user content. Domain fronting through a shared CDN is not detected.
 - **DNS and loopback stay open.** Agents resolve names through the local resolver over loopback, and DNS queries can carry data. The firewall leaves all loopback traffic alone, and traffic to this host's own addresses, including its tailnet address, also travels over loopback. The Infinite API, the proxy, and any other local service remain reachable and rely on their own authentication. A server an agent runs is reachable only from this host in enforce mode.
-- **Tools that ignore proxy variables.** SSH (including Git over SSH), UDP and QUIC, ICMP, and raw sockets do not use the proxy. Node's built-in `fetch` ignores proxy variables unless `NODE_USE_ENV_PROXY=1` is set on a Node release that supports it; an owner can set it in a `secrets/*.env` file. These go direct and are logged in observe mode, and fail in enforce mode.
+- **Tools that ignore proxy variables.** SSH (including Git over SSH), UDP and QUIC, ICMP, and raw sockets do not use the proxy. Node's built-in `fetch` and HTTP clients need `NODE_USE_ENV_PROXY=1` on Node releases that support environment proxies. When egress is configured, the host sets this flag with the six proxy variables for sessions and host commands. Other tools that ignore proxy variables go direct and are logged in observe mode, and fail in enforce mode.
 - **Attribution, not isolation.** The credential is in the session's environment, and every process of the agent account can read other sessions' environments and files. The project in the records says which credential was used, not which project acted, so per-project allow entries do not isolate projects from each other. Tools that print their proxy URL also print the credential.
 - **Credential lifetime.** Session credentials last 30 days and host-command credentials one day. The proxy refuses credentials that claim more than 31 days. Rotating the key is the only revocation.
 - **Observe resolves everything.** In observe mode the proxy resolves every name it is asked for; in enforce mode it resolves only listed names.
-- **Launches without proxy variables.** Repository briefings and code graph extraction run through their own sudo wrappers, and the host does not give them proxy variables. In enforce mode their network calls fail. Check that these features can do without the network, or keep the firewall in observe, before enforcing.
-- **Host-account commands.** Without `teams.commandPrefix`, team Git commands run as the host account. The firewall rule matches only the agent account, so the proxy variables are their only route; a tool that ignores them goes direct in every mode.
+- **Launches without proxy variables.** Code graph extraction still runs through its own sudo wrapper without host proxy variables. In enforce mode its network calls fail. Repository briefings receive the configured proxy variables through sudo using the `env_keep` entries in `infinite.sudoers`.
+- **Host-account commands.** Without `teams.commandPrefix`, team Git commands run as the host account, which the firewall does not cover; the proxy variables are their only route. With a prefix, they run through a root-owned server launcher that resets the environment; this repository does not ship that launcher. Keep the six proxy variables and `NODE_USE_ENV_PROXY` in its environment when egress is configured. Tools that ignore the proxy go direct in every mode.
 - **One instance.** The rule matches `infinite-agent` only. A second instance's agent account is not covered, and its host account is not in the `infinite-egress` group. Cover it by adding its account to the rule and the group, or with a second proxy, key, and port.
 - **Rehearsed, not deployed.** Steps 1 to 5, the socket unit, and the drop-ins ran on Ubuntu 24.04 with systemd 255 and nftables 1.0.9 (arm64 container, 2026-11-15) against stand-in hosts. Observe logged an agent connection through the proxy as `would-deny` and let a direct one through the `bypass` rule; enforce answered `403` for an unlisted host, passed a listed one, and reset the agent account's direct connections; the host account's direct connections met neither rule. The container's network namespace drops kernel log lines, so the `log` rules were confirmed with `nft monitor trace`, not `journalctl -k`; read the kernel log on the server.
 - **Records hold destinations.** The journal and summary list every host each project reached. Members of `adm` and `systemd-journal` can read the journal; the agent account must not be one of them.

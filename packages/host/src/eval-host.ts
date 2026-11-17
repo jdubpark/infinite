@@ -221,6 +221,8 @@ export class EvalHost implements EvalHostApi {
     const { jobId, projectId, taskId, settings } = work;
     const fresh = await this.probeNow();
     if (fresh.state !== "ready") return this.environment(jobId, taskId, "grader-failed");
+    // The gate may have read a probe ten minutes old; this one also decides whether the grader has room for the task.
+    if (fresh.storage !== true) return this.environment(jobId, taskId, "storage");
     let mirror: string;
     let status: ProjectSourceStatus;
     try {
@@ -251,7 +253,7 @@ export class EvalHost implements EvalHostApi {
     if (outcome.kind === "environment") this.cooldown = 1;
   }
 
-  private environment(jobId: string, taskId: string, cause: "grader-failed" | "anchor-unknown"): void {
+  private environment(jobId: string, taskId: string, cause: "grader-failed" | "anchor-unknown" | "storage"): void {
     this.record(jobId, taskId, { kind: "environment", cause });
     this.cooldown = 1;
   }

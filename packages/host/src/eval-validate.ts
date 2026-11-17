@@ -38,7 +38,7 @@ export type ValidateContext = {
 export type TaskValidation =
   | { kind: "decided"; state: "valid" | "rejected" | "retired"; reason: EvalReason | null }
   | { kind: "undecided"; cause: "report-missing" | "report-invalid" | "setup-failed"; attempts: number }
-  | { kind: "environment"; cause: "anchor-unknown" | "grader-failed" | "grader-processes-alive" | "halted" | "bundle-missing" | "state-changed" };
+  | { kind: "environment"; cause: "anchor-unknown" | "grader-failed" | "grader-processes-alive" | "halted" | "bundle-missing" | "state-changed" | "storage" };
 
 type EnvCause = Extract<TaskValidation, { kind: "environment" }>["cause"];
 type Verdict = { kind: "valid"; expected: string[] } | { kind: "reject"; reason: EvalReason } | { kind: "undecided"; cause: "report-missing" | "report-invalid" | "setup-failed" };

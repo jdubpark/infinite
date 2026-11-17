@@ -251,7 +251,7 @@ export class EvalJobs {
           update(tx, jobId, at, { waiting: "halt" });
         } else {
           const waiting = outcome.cause === "anchor-unknown" ? "mirror" : outcome.cause === "grader-failed" ? "grader"
-            : outcome.cause === "bundle-missing" ? "bundle" : null;
+            : outcome.cause === "bundle-missing" ? "bundle" : outcome.cause === "storage" ? "storage" : null;
           update(tx, jobId, at, { waiting });
         }
       }

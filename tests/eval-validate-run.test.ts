@@ -516,6 +516,30 @@ test("a mirror read that throws still records the task", { timeout: 600_000 }, a
   }
 });
 
+test("a grader low on storage at the task's probe runs nothing", { timeout: 600_000 }, async () => {
+  const r = rig();
+  const base = testGrader(configFor(r));
+  let low = false;
+  // Mining leaves a ready probe in the cache, which the gate reads; only the probe before the task sees the room gone.
+  const grader: Grader = { ...base, probe: async canaries => ({ ...(await base.probe(canaries)), ...(low ? { storage: false } : {}) }) };
+  const h = host(r, { grader });
+  try {
+    await mineAll(h);
+    low = true;
+    const created = h.create(PROJECT, { kind: "validate", limits: { maxWallMinutes: 60 } }, randomUUID());
+    assert.ok("job" in created);
+    const before = ops(r.record).length;
+    h.tick();
+    await h.idle();
+    assert.deepEqual(ops(r.record).slice(before).filter(op => op === "run"), [], "no task runs while the grader is low on storage");
+    assert.equal((h.job(created.job.jobId) as EvalJobView).waiting, "storage");
+  } finally {
+    h.close();
+    await h.idle();
+    r.store.close();
+  }
+});
+
 test("the owner's halt and the host's load hold validation", { timeout: 600_000 }, async () => {
   const r = rig();
   let halt: "clear" | "halted" = "clear";

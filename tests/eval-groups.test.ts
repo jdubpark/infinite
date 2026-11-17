@@ -387,7 +387,7 @@ test("the groups pass joins a landing from either source", () => {
     assert.deepEqual(old.store.read(db => ({
       ...db.get<{ landing_ref: string | null; landing_checked_at: string | null }>(
         "SELECT landing_ref, landing_checked_at FROM eval_groups WHERE group_id = ?", runGroupId(RUN)),
-    })), { landing_ref: null, landing_checked_at: NOW });
+    })), { landing_ref: null, landing_checked_at: "9999-12-31T23:59:59.999Z" });
     assert.notEqual(old.store.read(db => rootOf(db, minedId)), old.store.read(db => rootOf(db, runGroupId(RUN))));
   } finally {
     old.cleanup();
@@ -413,6 +413,34 @@ test("the groups pass joins a landing from either source", () => {
     assert.equal(pass.run().checked, 1, "a pass after 10 minutes reads the group again");
   } finally {
     unopened.cleanup();
+  }
+});
+
+test("a group past the landing window is checked once", () => {
+  const f = open();
+  try {
+    f.store.write(tx => {
+      approveTx(tx, captureTx(tx, RUN, [SRC, TEST_A], OLD_CAPTURED_AT), OLD_APPROVED_AT);
+    });
+    let runReads = 0;
+    const runs = () => {
+      runReads++;
+      return [];
+    };
+    const first = new GroupPass({ store: f.store, runs, now: () => NOW });
+    assert.equal(first.run().checked, 1, "the first pass checks the old group once");
+    assert.equal(runReads, 0, "a group past the window needs no merge commit, so the runs are not copied");
+
+    // Eleven minutes later the group is due by the recheck age, but past the window it is stamped with a value
+    // that never falls due, so no pass reads it again and no pass copies the runs.
+    runReads = 0;
+    const later = new GroupPass({ store: f.store, runs, now: () => new Date(Date.parse(NOW) + 11 * 60_000).toISOString() });
+    assert.equal(later.run().checked, 0, "the old group is not due again");
+    assert.equal(runReads, 0, "no pass copies the runs when no group is inside the window");
+    assert.equal(f.store.read(db => db.get<{ landing_checked_at: string | null }>(
+      "SELECT landing_checked_at FROM eval_groups WHERE group_id = ?", runGroupId(RUN))?.landing_checked_at), "9999-12-31T23:59:59.999Z");
+  } finally {
+    f.cleanup();
   }
 });
 

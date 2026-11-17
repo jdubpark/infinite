@@ -26,6 +26,8 @@ import type { Config } from "./types.js";
 export const MINING_BATCH = 50, MINING_BACKFILL_MAX = 2_000, MINED_TASK_MAX = 5_000, MINING_RETRY_MS = 3_600_000;
 /** The room one pass needs: a batch of capsules at their largest. */
 const MINING_ROOM_BYTES = MINING_BATCH * CAPSULE_MAX_BYTES;
+/** Commits per form-4 read of first parents: the most one `parents` call takes. */
+const PARENT_CHUNK = 50;
 
 /** Mined rows of one project, read through `eval_tasks_summary`. */
 export const MINED_COUNT_SQL = "SELECT count(*) AS n FROM eval_tasks WHERE project_ref = ? AND origin = 'mined'";
@@ -153,7 +155,8 @@ type Pass = {
   /** The cursor the walk is on. It differs from `saved` only after a rewrite answer, which is written with the next commit. */
   cursor: MiningCursor;
   budget: number;
-  runs: Map<string, TeamRun>;
+  /** The run records by merge commit. Built on first use, so a pass that decides no commit copies none. */
+  runs?: Map<string, TeamRun>;
 };
 
 const OFF: MiningStatus = { state: "off", visited: null, mined: null, skipped: null, failures: null, backfillDone: null };
@@ -261,7 +264,6 @@ export class Miner {
       saved: loaded.saved,
       cursor: loaded.saved.cursor,
       budget: MINING_BATCH,
-      runs: this.mergeRuns(projectId),
     };
     if (this.store.read(db => pathsPending(db, ref))) return this.note(pass, "waiting");
     if (!this.hasRoom(ref)) return this.note(pass, "full");
@@ -282,22 +284,42 @@ export class Miner {
   private async walk(p: Pass): Promise<End> {
     const forward = p.cursor.forward;
     if (forward !== undefined && forward !== p.head) {
-      const answer = await this.git.isAncestor(p.mirror, forward, p.head);
+      let answer = await this.git.isAncestor(p.mirror, forward, p.head);
       if (this.closed) return "stop";
-      if (answer === "failed") return this.failed(p);
+      let headList: Map<string, string[]> | undefined;
+      if (answer === "failed") {
+        // Form 1 also fails when a rewrite and garbage collection pruned `forward`. The head reads and `forward` does not:
+        // that is a rewrite, and it takes the rewrite path. Any other failure stays failed.
+        headList = await this.git.parents(p.mirror, [p.head]);
+        const forwardList = await this.git.parents(p.mirror, [forward]);
+        if (this.closed) return "stop";
+        if (headList?.has(p.head) !== true || forwardList?.has(forward) === true) return this.failed(p);
+        answer = "no";
+      }
       if (answer === "no") {
         // A rewrite. The head is decided first, and its write moves `forward` to it (ruling 12), so a backfill already at
         // its bound cannot stop the forward walk. The backfill then walks down from the head's first parent.
-        const outcome = await this.decide(p, p.head, "rewrite");
+        headList ??= await this.git.parents(p.mirror, [p.head]);
+        if (this.closed) return "stop";
+        const outcome = await this.decide(p, p.head, "rewrite", headList?.get(p.head));
         if (outcome !== "ok") return outcome;
       } else {
         const list = await this.git.firstParents(p.mirror, p.head, forward);
         if (this.closed) return "stop";
         if (list === undefined) return this.failed(p);
         // The list is at most 500 commits, newest first. The oldest of them is mined first.
-        for (const commit of [...list.ids].reverse()) {
+        const ordered = [...list.ids].reverse();
+        let parents: Map<string, string[]> | undefined;
+        let chunkEnd = 0;
+        for (let index = 0; index < ordered.length; index++) {
           if (p.budget <= 0) return "budget";
-          const outcome = await this.decide(p, commit, "forward");
+          if (index === chunkEnd) {
+            // A chunk holds no more commits than the pass can still decide, so no read reaches past the budget.
+            chunkEnd = index + Math.min(PARENT_CHUNK, p.budget, ordered.length - index);
+            parents = await this.git.parents(p.mirror, ordered.slice(index, chunkEnd));
+            if (this.closed) return "stop";
+          }
+          const outcome = await this.decide(p, ordered[index], "forward", parents?.get(ordered[index]));
           if (outcome !== "ok") return outcome;
         }
       }
@@ -309,21 +331,27 @@ export class Miner {
       const list = await this.git.firstParents(p.mirror, bf.next);
       if (this.closed) return "stop";
       if (list === undefined || list.ids.length === 0) return this.failed(p);
-      for (const commit of list.ids) {
+      let parents: Map<string, string[]> | undefined;
+      let chunkEnd = 0;
+      for (let index = 0; index < list.ids.length; index++) {
         const current = p.cursor.backfill;
         if (current === undefined || current.done || current.visited >= MINING_BACKFILL_MAX) break;
         if (p.budget <= 0) return "budget";
-        const outcome = await this.decide(p, commit, "backfill");
+        if (index === chunkEnd) {
+          // As in the forward walk, a chunk never reads past what the pass can still decide: the budget or the bound.
+          const allowed = Math.min(PARENT_CHUNK, p.budget, MINING_BACKFILL_MAX - current.visited);
+          chunkEnd = index + Math.min(allowed, list.ids.length - index);
+          parents = await this.git.parents(p.mirror, list.ids.slice(index, chunkEnd));
+          if (this.closed) return "stop";
+        }
+        const outcome = await this.decide(p, list.ids[index], "backfill", parents?.get(list.ids[index]));
         if (outcome !== "ok") return outcome;
       }
     }
   }
 
-  /** Reads one commit, then decides it and advances the cursor in one write. */
-  private async decide(p: Pass, commit: string, path: CursorPath): Promise<Outcome> {
-    const parents = await this.git.parents(p.mirror, [commit]);
-    if (this.closed) return "stop";
-    const list = parents?.get(commit);
+  /** Decides one commit from its first-parent list, read in a chunk by the walk, then advances the cursor in one write. */
+  private async decide(p: Pass, commit: string, path: CursorPath, list: string[] | undefined): Promise<Outcome> {
     if (list === undefined) return this.failed(p);
     const parent = list[0];
     const verdict = await this.verdict(p, commit, parent);
@@ -347,6 +375,7 @@ export class Miner {
     if (message.state === "failed") return { kind: "failed" };
     if (message.state === "too-large") return { kind: "reject", reason: "capsule-too-large" };
     if (isRevert(message.message)) return { kind: "reject", reason: "revert" };
+    p.runs ??= this.mergeRuns(p.projectId);
     const run = p.runs.get(commit);
     const built = minedCapsule(message.message, counts.paths, run);
     if ("reject" in built) return { kind: "reject", reason: built.reject };

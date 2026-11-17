@@ -136,6 +136,19 @@ test("a request id makes one job", () => {
     assert.equal(first.job.projectId, PROJECT);
     assert.equal(first.job.status, "scheduled");
 
+    // The default expiry is the clock plus 30 days, so a replay later must still match the body as sent.
+    f.setClock(START + 1);
+    const moved = f.jobs.create(PROJECT, request, REQUEST_ONE);
+    assert.ok("job" in moved, "a replay 1 ms later is not a conflict");
+    assert.equal(moved.created, false);
+    assert.equal(moved.job.jobId, first.job.jobId);
+    f.setClock(START + DAY_MS);
+    const laterDay = f.jobs.create(PROJECT, request, REQUEST_ONE);
+    assert.ok("job" in laterDay, "a replay a day later is not a conflict");
+    assert.equal(laterDay.created, false);
+    assert.equal(laterDay.job.jobId, first.job.jobId);
+    f.setClock(START);
+
     const again = f.jobs.create(PROJECT, request, REQUEST_ONE);
     assert.ok("job" in again);
     assert.equal(again.created, false, "the same id and body return the same job");
@@ -422,6 +435,36 @@ test("the sweep removes only finished jobs", () => {
     assert.equal(f.jobs.sweep(), 1, "only the cancelled job is older than the cutoff and finished");
     assert.equal(f.jobs.view(done.job.jobId), undefined);
     assert.equal(f.jobs.view(paused.job.jobId)?.status, "paused", "an old paused job is kept");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("revalidation visits each valid task once", () => {
+  const f = fixture();
+  try {
+    const job = f.jobs.create(
+      PROJECT,
+      { kind: "validate", taskFilter: { revalidate: true }, limits: { maxWallMinutes: 600 } },
+      REQUEST_ONE,
+    );
+    assert.ok("job" in job);
+    const jobId = job.job.jobId;
+    // Both are valid and older than REVALIDATE_DAYS, so the revalidation phase reaches them.
+    const validatedAt = new Date(START - 40 * DAY_MS).toISOString();
+    addTask(f, "captured:run-1:v1", { state: "valid", validatedAt });
+    addTask(f, "captured:run-1:v2", { state: "valid", validatedAt });
+
+    const handed: string[] = [];
+    for (let turn = 0; turn < 6; turn++) {
+      const work = f.jobs.next(f.gates());
+      if (work.kind !== "task") break;
+      handed.push(work.taskId);
+      f.jobs.record(jobId, work.taskId, UNDECIDED);
+    }
+    assert.deepEqual(handed, ["captured:run-1:v1", "captured:run-1:v2"], "each valid task is handed out once, in order");
+    assert.equal(f.jobs.view(jobId)?.status, "completed", "the job ends after the last valid task");
+    assert.equal(f.jobs.view(jobId)?.reason, "done");
   } finally {
     f.cleanup();
   }

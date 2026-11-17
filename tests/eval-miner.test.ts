@@ -220,12 +220,17 @@ test("a history is mined newest first, new commits oldest first, within its boun
       change(index, index !== 0 && !(index % 3 === 2 && index <= 56)));
     const { mirror, ids } = mirrorWith(r.dir, commits);
     const head = { value: ids[ids.length - 1] };
-    const miner = minerFor(r, { mirror, head });
+    const counted = countingGit();
+    const miner = minerFor(r, { mirror, head, git: counted.git });
 
     miner.pump();
     await miner.idle();
     assert.equal(miner.status(PROJECT).visited, 50, "the first pass decides 50 commits");
     assert.equal(miner.status(PROJECT).backfillDone, false);
+    // One list of 50 commits: its first parents come from one form-4 read, not one read per commit.
+    const firstPassParents = counted.calls.filter(call => call === "parents").length;
+    assert.ok(firstPassParents <= 2, `at most one parents read per list chunk, saw ${firstPassParents}`);
+    counted.calls.length = 0;
 
     miner.pump();
     await miner.idle();
@@ -415,6 +420,42 @@ test("a rewrite answer that cannot be followed moves no cursor", async () => {
     assert.equal(cursorOf(r.store)?.forward, ids[2], "the rewrite is not claimed");
     assert.equal(minedOf(r.store, rewritten), undefined, "the new head is not mined");
     assert.equal(miningRow(r.store)?.state, "failing");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("a rewrite whose old commits were pruned restarts the walk", async () => {
+  const r = rig();
+  try {
+    const commits = Array.from({ length: 3 }, (_, index) => change(index, true));
+    const { mirror, ids } = mirrorWith(r.dir, commits);
+    const head = { value: ids[2] };
+    const miner = minerFor(r, { mirror, head });
+    miner.pump();
+    await miner.idle();
+    assert.equal(minedCount(r.store), 2, "the root is skipped; two rows");
+
+    // Rewrite the branch on top of ids[1], so ids[2] is unreachable.
+    const [rewritten] = importCommits(mirror, "refs/heads/rewrite", [change(9, true)], ids[1]);
+    git(mirror, ["update-ref", "refs/heads/main", rewritten]);
+    head.value = rewritten;
+    // While ids[2] is still in the mirror, a failed ancestry read is a failed read, not a rewrite.
+    const unread = minerFor(r, { mirror, head, git: mineGit(() => scriptedPrefix(r.dir, "ancestry", [{ pattern: "merge-base", code: 128 }])) });
+    unread.pump();
+    await unread.idle();
+    assert.equal(miningRow(r.store)?.state, "failing", "both commits read, so the failed answer stays a failure");
+    assert.equal(cursorOf(r.store)?.forward, ids[2], "the walk does not move");
+
+    // Prune ids[2] from the mirror as a gc would. The retry falls due an hour later.
+    git(mirror, ["reflog", "expire", "--expire=now", "--all"]);
+    git(mirror, ["gc", "--prune=now", "--quiet"]);
+    const later = minerFor(r, { mirror, head, now: () => new Date(Date.parse(NOW) + MINING_RETRY_MS).toISOString() });
+    later.pump();
+    await later.idle();
+    assert.notEqual(miningRow(r.store)?.state, "failing", "a pruned forward commit is a rewrite, not a failed read");
+    assert.equal(cursorOf(r.store)?.forward, rewritten, "the forward cursor moves to the new head");
+    assert.equal(minedOf(r.store, rewritten)?.state, "candidate", "the new head is mined");
   } finally {
     r.cleanup();
   }

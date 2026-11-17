@@ -108,7 +108,8 @@ export class EvalJobs {
       taskFilter: { ...parsed.data.taskFilter, maxTasks: parsed.data.taskFilter?.maxTasks ?? JOB_TASKS_DEFAULT },
       expiresAt: new Date(expiresMs).toISOString(),
     };
-    const requestDigest = sha256(canonicalJson({ projectId, request: normalized }));
+    // Digest the body as the client sent it, so a replay later still matches. The default expiry moves with the clock.
+    const requestDigest = sha256(canonicalJson({ projectId, request: parsed.data }));
     return this.store.write(tx => {
       const existing = tx.get<JobRow>("SELECT * FROM eval_jobs WHERE request_id = ?", requestId);
       if (existing !== undefined) {
@@ -335,8 +336,10 @@ export class EvalJobs {
         return NONE;
       }
       if (phase === "candidate" && revalidate) {
+        // Written now, so `record` keeps the valid phase even when the first valid match is at index 0.
         phase = "valid";
         after = "";
+        update(tx, row.job_id, at, { cursor: cursorOf("valid", "") });
         continue;
       }
       this.finish(tx, row.job_id, at, "completed", "done");

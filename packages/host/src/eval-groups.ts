@@ -17,6 +17,8 @@ export const LANDINGS_DUE_SQL = "SELECT group_id, project_ref, created_at FROM e
 
 const DAY_MS = 86_400_000;
 const RUN_PREFIX = "run:";
+/** Stamped on a group past the landing window: a value that never falls due, so the group is not checked again. */
+export const LANDING_NEVER = "9999-12-31T23:59:59.999Z";
 
 type DueRow = { group_id: string; project_ref: string; created_at: string };
 
@@ -86,7 +88,7 @@ export function recordLanding(tx: EvidenceTx, input: { projectRef: string; group
     input.groupId,
   );
   const mined = tx.get<{ group_id: string }>(
-    "SELECT group_id FROM eval_tasks WHERE project_ref = ? AND commit_ref = ?",
+    "SELECT group_id FROM eval_tasks WHERE project_ref = ? AND commit_ref = ? AND origin = 'mined'",
     input.projectRef,
     input.landingRef,
   );
@@ -187,12 +189,14 @@ export class GroupPass {
       const oldest = isoAt(nowMs - LANDING_CHECK_DAYS * DAY_MS);
       const due = this.store.read(db => db.all<DueRow>(LANDINGS_DUE_SQL, recheck, GROUP_BATCH));
       if (due.length > 0) {
-        const merges = this.mergeCommits();
+        // The run records are copied only when a group in the window needs a merge commit.
+        const inWindow = due.some(group => Date.parse(group.created_at) >= Date.parse(oldest));
+        const merges = inWindow ? this.mergeCommits() : new Map<string, string>();
         const outcomes = this.store.status().modules[OUTCOMES_MODULE] === "ready";
         for (const group of due) {
           result.checked++;
           if (Date.parse(group.created_at) < Date.parse(oldest)) {
-            this.stamp(group.group_id, at);
+            this.stamp(group.group_id, LANDING_NEVER);
             continue;
           }
           const commit = merges.get(group.group_id) ?? (outcomes ? this.signalCommit(group.group_id) : undefined);

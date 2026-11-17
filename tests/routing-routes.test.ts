@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -247,6 +247,25 @@ test("pause, resume, and revoke answer the owner only", { timeout: 120000 }, asy
     assert.deepEqual([down.status, down.body.code], [503, "evidence-unavailable"]);
   } finally {
     await run.close();
+  }
+});
+
+test("the team revoke-routing command reaches the route", { timeout: 120000 }, async () => {
+  const run = await teamFixture("success");
+  const host = run.host;
+  const root = mkdtempSync(join(tmpdir(), "infinite-revoke-routing-"));
+  const clientFile = join(root, "client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: host.origin, token: host.tokens.owner }), { mode: 0o600 });
+  try {
+    const created = await host.fetchApi("/teams", "owner", run.create());
+    const team = await run.settled(created.body.id);
+    // A run without an auto pin has nothing to revoke. The CLI reports the route's 409 code, not its message.
+    const cli = spawnSync(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile, "team", "revoke-routing", team.id], { encoding: "utf8" });
+    assert.notEqual(cli.status, 0);
+    assert.equal(cli.stderr.includes("Host returned HTTP 409 (routing-not-enabled)"), true, cli.stderr);
+  } finally {
+    await run.close();
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

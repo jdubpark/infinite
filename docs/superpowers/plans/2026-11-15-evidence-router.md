@@ -693,6 +693,7 @@ These rulings override the text below where the two differ.
    - Task 10's line (1) prints `(autonomous default)` for `modeSource` `autonomous-default` in both modes: `ID · routing auto (autonomous default)` and `ID · routing shadow (autonomous default) · auto starts after the shadow period`. Line (5)'s ` Auto routing needs --routing auto.` appears only for `modeSource` `saved` with `requested` shadow.
    - The routing usage lists `pause-explore` and `resume-explore`, and step 1's exact-usage assertion changes with it.
 10. **A failed pin read logs before the shadow line.** Rulings 1 and 6 make an `autonomous` project without a saved mode `auto` by default, so its pin reads the period end. When the store cannot be read, the pin falls back to shadow with `AUTO_LOG.pin`, and the shadow recorder then logs its own line. The step-1 test `with the store unavailable the run continues` keeps its setup and its other assertions; its log assertion becomes both lines, the pin's first. A project that saves `shadow` logs only the shadow line, as in step 1.
+11. **`team revoke-routing` prints the host's usual refusal.** Every team mutation reports a refusal as `Host returned HTTP 409 (routing-not-enabled)`, without the message text. Task 11's test `the team revoke-routing command reaches the route` asserts that line and a non-zero exit; the CLI's error reporting stays as it is for every command.
 
 ## Trust boundary, and what a review checks
 

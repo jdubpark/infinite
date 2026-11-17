@@ -436,6 +436,39 @@ test("a bundle over the limit is not streamed again for its job", async () => {
   }
 });
 
+test("a bundle the grader refused unread ends even with its pipe full", async () => {
+  const fx = open();
+  const children: ChildProcess[] = [];
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    // The grader answers once the bundle's output waits unread, and reads none of it, so megabytes of the bundle stay
+    // in the pipe and its stream can only close if dropped.
+    const grader: Grader = {
+      ...scripted().grader,
+      receive: async (_job, _name, input) => {
+        while ((input as Readable).readableLength === 0) await new Promise(resolve => setTimeout(resolve, 10));
+        return "failed";
+      },
+    };
+    const flooding = (): ChildProcess => {
+      const child = spawn(process.execPath, ["-e", "process.stdout.write(Buffer.alloc(4 << 20))"], { stdio: ["ignore", "pipe", "ignore"] });
+      children.push(child);
+      return child;
+    };
+    const ctx = context(fx, grader);
+    const stalled = new Promise<"stalled">(resolve => { timer = setTimeout(() => resolve("stalled"), 10_000); });
+    assert.equal(await Promise.race([prepareJob(ctx, flooding), stalled]), "failed");
+    assert.equal(ctx.bundle.job, null);
+  } finally {
+    clearTimeout(timer);
+    for (const child of children) {
+      child.stdout?.destroy();
+      child.kill("SIGKILL");
+    }
+    fx.close();
+  }
+});
+
 test("a decision keeps what an approval wrote during the task", async () => {
   const fx = open();
   try {

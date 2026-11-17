@@ -14,6 +14,8 @@ import { FEATURE_VERSION } from "../packages/host/src/task-features.js";
 
 const settings: EvalProjectSettings = { testPaths: { prefixes: ["tests"], suffixes: [".test.ts"] } };
 const FAKE_HEX = "a".repeat(39);
+/** A well-formed id no test mirror holds. */
+const ABSENT = "0123456789abcdef0123456789abcdef01234567";
 
 function run(cwd: string, ...args: string[]) {
   const result = spawnSync("git", ["-c", "commit.gpgsign=false", ...args], { cwd, encoding: "utf8" });
@@ -92,6 +94,9 @@ test("the mining forms are exact and checked", async () => {
 
     assert.deepEqual(await git.parents(mirror, [to, base]), new Map([[to, [base]], [base, []]]));
     assert.deepEqual(argv(), ["git", ...teamGitArgs(mirror, ["log", "--no-walk=unsorted", "--no-show-signature", "--format=%H %T %P", to, base])]);
+    assert.equal(await git.present(mirror, to), "yes");
+    assert.deepEqual(argv(), ["git", ...teamGitArgs(mirror, ["log", "--no-walk=unsorted", "--no-show-signature", "--format=%H %T %P", to])]);
+    assert.equal(await git.present(mirror, ABSENT), "no", "Git ran and holds no such commit");
 
     // A malformed id never reaches an argument.
     for (const bad of ["HEAD", "-x", FAKE_HEX]) {
@@ -106,6 +111,7 @@ test("the mining forms are exact and checked", async () => {
       assert.equal(await git.firstParents(mirror, bad), undefined);
       assert.equal(await git.firstParents(mirror, to, bad), undefined);
       assert.equal(await git.parents(mirror, [bad]), undefined);
+      assert.equal(await git.present(mirror, bad), "failed");
       assert.equal(existsSync(record), false);
     }
     assert.equal(await git.parents(mirror, Array.from({ length: 51 }, () => to)), undefined);
@@ -114,6 +120,7 @@ test("the mining forms are exact and checked", async () => {
     // A refused launcher is a failed read.
     assert.deepEqual(await mineGit(() => failingPrefix(dir)).numstat(mirror, base, to), { state: "failed" });
     assert.deepEqual(await mineGit(() => failingPrefix(dir)).message(mirror, to), { state: "failed" });
+    assert.equal(await mineGit(() => failingPrefix(dir)).present(mirror, ABSENT), "failed", "a refusal is not an answer");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

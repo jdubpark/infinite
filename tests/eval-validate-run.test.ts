@@ -395,7 +395,7 @@ test("an unavailable store takes nothing and throws nothing", { timeout: 60_000 
     halt: () => ({ check: () => ({ state: "clear" }) }),
     runs: () => [],
     grader: counted({ probe: async () => ({ state: "ready" }), receive: async () => "failed", run: async () => ({ exitCode: null, timedOut: false, truncated: false, failed: true }), read: async () => ({ state: "failed" }), digest: async () => ({ state: "failed" }), stop: async () => true, clean: async () => true, remove: async () => true }) as unknown as Grader,
-    mineGit: counted({ isAncestor: async () => "failed", firstParents: async () => undefined, parents: async () => undefined, numstat: async () => ({ state: "failed" }), message: async () => ({ state: "failed" }) }) as unknown as MineGit,
+    mineGit: counted({ isAncestor: async () => "failed", firstParents: async () => undefined, parents: async () => undefined, present: async () => "failed", numstat: async () => ({ state: "failed" }), message: async () => ({ state: "failed" }) }) as unknown as MineGit,
     inventory: async () => { calls += 1; return []; },
   } as EvalHostOptions);
   assert.doesNotThrow(() => h.tick());

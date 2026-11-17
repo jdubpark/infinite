@@ -288,12 +288,15 @@ export class Miner {
       if (this.closed) return "stop";
       let headList: Map<string, string[]> | undefined;
       if (answer === "failed") {
-        // Form 1 also fails when a rewrite and garbage collection pruned `forward`. The head reads and `forward` does not:
-        // that is a rewrite, and it takes the rewrite path. Any other failure stays failed.
+        // Form 1 also fails when a rewrite and garbage collection pruned `forward`. The head reads and Git answers that it
+        // holds no `forward`: that is a rewrite, and it takes the rewrite path. Any other failure stays failed, a read
+        // that timed out or a launcher that refused included.
         headList = await this.git.parents(p.mirror, [p.head]);
-        const forwardList = await this.git.parents(p.mirror, [forward]);
         if (this.closed) return "stop";
-        if (headList?.has(p.head) !== true || forwardList?.has(forward) === true) return this.failed(p);
+        if (headList?.has(p.head) !== true) return this.failed(p);
+        const held = await this.git.present(p.mirror, forward);
+        if (this.closed) return "stop";
+        if (held !== "no") return this.failed(p);
         answer = "no";
       }
       if (answer === "no") {

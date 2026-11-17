@@ -122,6 +122,7 @@ function countingGit(inner: MineGit = mineGit(() => undefined)): { git: MineGit;
     isAncestor: (mirror, older, newer) => { calls.push("isAncestor"); return inner.isAncestor(mirror, older, newer); },
     firstParents: (mirror, head, exclude) => { calls.push("firstParents"); return inner.firstParents(mirror, head, exclude); },
     parents: (mirror, ids) => { calls.push("parents"); return inner.parents(mirror, ids); },
+    present: (mirror, id) => { calls.push("present"); return inner.present(mirror, id); },
     numstat: (mirror, parent, commit) => { calls.push("numstat"); return inner.numstat(mirror, parent, commit); },
     message: (mirror, commit) => { calls.push("message"); return inner.message(mirror, commit); },
   };
@@ -450,7 +451,17 @@ test("a rewrite whose old commits were pruned restarts the walk", async () => {
     // Prune ids[2] from the mirror as a gc would. The retry falls due an hour later.
     git(mirror, ["reflog", "expire", "--expire=now", "--all"]);
     git(mirror, ["gc", "--prune=now", "--quiet"]);
-    const later = minerFor(r, { mirror, head, now: () => new Date(Date.parse(NOW) + MINING_RETRY_MS).toISOString() });
+    // A launcher that refuses the presence read gives no answer about ids[2], so the retry fails again in place.
+    const refused = minerFor(r, {
+      mirror, head,
+      git: mineGit(() => scriptedPrefix(r.dir, "refused", [{ pattern: `no-walk*${ids[2]}`, code: 1 }])),
+      now: () => new Date(Date.parse(NOW) + MINING_RETRY_MS).toISOString(),
+    });
+    refused.pump();
+    await refused.idle();
+    assert.equal(miningRow(r.store)?.state, "failing", "a refused read of the old commit is not its absence");
+    assert.equal(cursorOf(r.store)?.forward, ids[2], "the walk does not move");
+    const later = minerFor(r, { mirror, head, now: () => new Date(Date.parse(NOW) + 2 * MINING_RETRY_MS).toISOString() });
     later.pump();
     await later.idle();
     assert.notEqual(miningRow(r.store)?.state, "failing", "a pruned forward commit is a rewrite, not a failed read");

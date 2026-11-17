@@ -46,6 +46,7 @@ export interface MineGit {
   isAncestor(mirror: string, older: string, newer: string): Promise<"yes" | "no" | "failed">;                    // form 1
   firstParents(mirror: string, head: string, exclude?: string): Promise<{ ids: string[]; more: boolean } | undefined>;  // form 3, or form 2 with exclude
   parents(mirror: string, ids: readonly string[]): Promise<Map<string, string[]> | undefined>;                    // form 4, 1 to 50 ids
+  present(mirror: string, id: string): Promise<"yes" | "no" | "failed">;                                         // form 4, one id
   numstat(mirror: string, parent: string, commit: string): Promise<{ state: "read"; entries: NumstatEntry[] } | { state: "too-large" } | { state: "failed" }>;
   message(mirror: string, commit: string): Promise<{ state: "read"; commitTime: string; message: string } | { state: "too-large" } | { state: "failed" }>;
 }
@@ -88,6 +89,16 @@ export function mineGit(prefix: () => TeamCommand | undefined): MineGit {
       if (result === undefined || result.interrupted || result.truncated || result.exitCode !== 0) return undefined;
       const commits = parseCommits(result.stdout, ids);
       return commits === undefined ? undefined : new Map(commits.map(commit => [commit.id, commit.parents]));
+    },
+    async present(mirror, id) {
+      let args: string[];
+      try { args = parentArgs([id]); } catch { return "failed"; }
+      const result = await run(mirror, args);
+      if (result === undefined || result.interrupted || result.truncated) return "failed";
+      // Git exits 128 for an object it does not hold. Any other exit, a refusing launcher's included, is not an answer.
+      if (result.exitCode === 128) return "no";
+      if (result.exitCode !== 0) return "failed";
+      return parseCommits(result.stdout, [id]) === undefined ? "failed" : "yes";
     },
     async numstat(mirror, parent, commit) {
       let args: string[];

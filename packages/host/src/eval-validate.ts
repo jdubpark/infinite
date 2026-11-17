@@ -105,7 +105,11 @@ export async function prepareJob(ctx: ValidateContext, bundle: () => ChildProces
   });
   out.pipe(counter);
   const result = await ctx.grader.receive(ctx.jobId, "base.bundle", counter, BUNDLE_MAX_BYTES);
-  if (result !== "stored" || total > BUNDLE_MAX_BYTES) child.kill();
+  if (result !== "stored" || total > BUNDLE_MAX_BYTES) {
+    // A grader that stopped reading leaves output in the pipe, and the bundle never closes until the host drops it.
+    out.destroy();
+    child.kill();
+  }
   const ended = await exit;
   if (total > BUNDLE_MAX_BYTES || result === "too-large") {
     ctx.bundle.tooLarge = ctx.jobId;

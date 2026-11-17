@@ -20,6 +20,8 @@ type MissionView = {
   deadlineAt: string;
   clockStoppedAt?: string;
   maxMinutes: number;
+  /** Pinned at creation; the host covers a mission with a project halt on any of these. */
+  repoProjectIds: string[];
   subtasks: { id: string; title: string; status: string; repoProjectId: string; teamId?: string }[];
   events: { at: string; text: string }[];
 };
@@ -85,10 +87,10 @@ export function MissionPage({ id, me, connected, openTeam, halt }: { id: string;
     }
   }
 
-  if (me.missions?.enabled === false) return <div className="team-page"><h1>Mission</h1><p className="team-notice" role="status">Missions are not enabled on this host.</p></div>;
-  // The owner's halt for this mission: the host halt, and halts on the projects its subtasks run in. Until the mission
-  // loads it has no subtasks, so only the host halt shows.
-  const banner = <HaltBanner className="halt-main" notice={haltNotice(halt, missionHaltPlace(mission?.subtasks ?? []))} name={projectId => me.projects.find(project => project.id === projectId)?.name ?? projectId} owner={me.role === "owner"} />;
+  // The owner's halt for this mission: the host halt, and halts on the projects it is pinned to. Until the mission
+  // loads there is no mission to scope to, so only the host halt shows.
+  const banner = <HaltBanner className="halt-main" notice={haltNotice(halt, missionHaltPlace(mission?.repoProjectIds ?? []))} name={projectId => me.projects.find(project => project.id === projectId)?.name ?? projectId} owner={me.role === "owner"} />;
+  if (me.missions?.enabled === false) return <div className="team-page"><h1>Mission</h1>{banner}<p className="team-notice" role="status">Missions are not enabled on this host.</p></div>;
   if (!mission) return <div className="team-page"><h1>Mission</h1>{banner}<p role="status">{loadError || "Loading mission…"}</p>{loadError && <button type="button" className="text-button" onClick={view.refresh}><RefreshCw size={15} />Try again</button>}</div>;
 
   const stoppedAtLimit = missionStoppedAtLimit(mission);

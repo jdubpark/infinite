@@ -29,9 +29,12 @@ export function haltNotice(view: HaltView | null | undefined, place: HaltPlace):
   return own.length ? { kind: "project", halts: own } : null;
 }
 
-/** The place of a mission page: the projects its subtasks run in. A mission with no subtasks yet covers none. */
-export function missionHaltPlace(subtasks: readonly { repoProjectId: string }[]): HaltPlace {
-  return { projectIds: [...new Set(subtasks.map(subtask => subtask.repoProjectId))] };
+/**
+ * The place of a mission page: its pinned repositories (`repoProjectIds`), which is how the host decides a project halt
+ * covers a mission. Subtasks can run in only some of them, so they do not narrow the scope.
+ */
+export function missionHaltPlace(repoProjectIds: readonly string[]): HaltPlace {
+  return { projectIds: [...new Set(repoProjectIds)] };
 }
 
 export const haltSince = (at: string) => new Date(at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });

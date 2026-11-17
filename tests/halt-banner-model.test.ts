@@ -38,17 +38,20 @@ test("a project halt shows on that project's screens and compactly on the overvi
   assert.equal(phoneNotice(both, "screen"), null);
 });
 
-test("a mission page shows the host halt and halts on its subtasks' projects only", () => {
+test("a mission page covers its pinned repositories, as the host does, not only where subtasks run", () => {
   const docs = { projectId: "docs", haltId: "h-docs", at, by: "Owner phone" };
   const both = view({ host, projects: [billing, store, docs] });
-  // Subtasks in billing and store; docs is halted but no subtask runs there, so it is not named.
-  const place = missionHaltPlace([{ repoProjectId: "billing" }, { repoProjectId: "store" }, { repoProjectId: "billing" }]);
+  // Pinned to billing and store; docs is halted but not pinned, so it is not named.
+  const place = missionHaltPlace(["billing", "store", "billing"]);
   assert.deepEqual(place, { projectIds: ["billing", "store"] });
   assert.deepEqual(webNotice(both, place), { kind: "host", halt: host, projects: [billing, store] });
-  // Without a host halt, the mission shows only the project halts it covers.
   assert.deepEqual(webNotice(view({ projects: [billing, store, docs] }), place), { kind: "project", halts: [billing, store] });
   assert.equal(webNotice(view({ projects: [docs] }), place), null);
-  // A mission with no subtasks yet covers no project: only a host halt or an unreadable record shows.
+  // Regression: a mission with no subtasks yet is still covered by a halt on its pinned repository.
+  assert.deepEqual(webNotice(view({ projects: [billing] }), missionHaltPlace(["billing"])), { kind: "project", halts: [billing] });
+  // Regression: a two-repository mission whose subtasks all run in the unhalted repository is still covered by a halt on the other.
+  assert.deepEqual(webNotice(view({ projects: [store] }), missionHaltPlace(["billing", "store"])), { kind: "project", halts: [store] });
+  // Before the mission loads there is no pinned repository: only the host halt or an unreadable record shows.
   assert.equal(webNotice(view({ projects: [billing] }), missionHaltPlace([])), null);
   assert.deepEqual(webNotice(view({ host, projects: [billing] }), missionHaltPlace([])), { kind: "host", halt: host, projects: [] });
   assert.deepEqual(webNotice({ readable: false, projects: [] }, missionHaltPlace([])), { kind: "unreadable" });

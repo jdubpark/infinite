@@ -7,7 +7,7 @@ import type { StatusKind } from "../../status";
 import type { OwnerRating, Rubric, TaskUsage } from "../cost/model";
 
 export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
-export type TeamRole = "project-manager" | "permission-coordinator" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
+export type TeamRole = "project-manager" | "intent-checker" | "permission-coordinator" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
 export type TeamCommand = { command: string; args: string[] };
 export type ModelProfile = { id: string; label: string; provider: string; model: string; effort?: string; variant?: string; tier?: "light" | "strong"; dataUse?: "standard" | "contributor" };
 export type TeamLineup = { coordinator: ModelProfile; integrator: ModelProfile; reviewer: ModelProfile; implementers: ModelProfile[]; escalations?: ModelProfile[]; fallbacks?: ModelProfile[] };
@@ -106,7 +106,7 @@ export const GOAL_LABELS: Record<GoalStatus, string> = {
   cancelled: "Cancelled", achieved: "Outcome recorded: achieved",
 };
 export const OUTCOME_LABELS: Record<GoalResult, string> = { achieved: "Achieved", "not-achieved": "Not achieved", inconclusive: "Inconclusive" };
-export const ROLE_NAMES: Record<TeamRole, string> = { "project-manager": "Coordinator", "permission-coordinator": "Permission coordinator", scout: "Scout", implementer: "Implementer", integrator: "Integrator", reviewer: "Reviewer", delivery: "Delivery" };
+export const ROLE_NAMES: Record<TeamRole, string> = { "project-manager": "Coordinator", "intent-checker": "Intent checker", "permission-coordinator": "Permission coordinator", scout: "Scout", implementer: "Implementer", integrator: "Integrator", reviewer: "Reviewer", delivery: "Delivery" };
 
 /** RunPill tones: amber waits on a person, forest is working or ready, error is stuck. */
 export type Tone = "amber" | "forest" | "muted" | "error";

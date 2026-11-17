@@ -5,6 +5,7 @@ const short = (value: unknown, max: number) => {
 };
 const roleNames: Record<string, string> = {
   "project-manager": "Coordinator",
+  "intent-checker": "Intent checker",
   scout: "Scout",
   implementer: "Implementer",
   integrator: "Integrator",
@@ -90,7 +91,7 @@ export function failedTeamBriefRow(sessionId: string, error: string, previous: T
   return prior ? { ...prior, fetchError: error } : { sessionId, status: { state: "unknown", error }, fetchError: error };
 }
 
-const roleRank = ["project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"];
+const roleRank = ["project-manager", "intent-checker", "scout", "implementer", "integrator", "reviewer", "delivery"];
 
 export function orderedTeamMembers(team: any): any[] {
   const revision = team?.revision;

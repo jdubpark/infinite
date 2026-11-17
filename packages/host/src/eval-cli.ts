@@ -4,7 +4,7 @@ import { EVAL_STATES, type EvalJobView, type EvalState, type EvalSummary } from 
 type Options = Record<string, string | boolean>;
 export type EvalApi = { json<T = unknown>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<T> };
 
-const USAGE = "Usage: infinite eval status PROJECT [--json] | infinite eval run --file job.json --request-id UUID [--json] | infinite eval job JOB [--json] | infinite eval pause|resume|cancel JOB | infinite eval retire TASK";
+const USAGE = "Usage: infinite eval status PROJECT [--json] | infinite eval run PROJECT --file job.json --request-id UUID [--json] | infinite eval job JOB [--json] | infinite eval pause|resume|cancel JOB | infinite eval retire TASK";
 /** A job file is read at most this many bytes; a larger one is refused before any call. */
 const JOB_FILE_LIMIT = 64 * 1024;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -66,7 +66,7 @@ async function read<T>(call: () => Promise<T>): Promise<T> {
 function jobRequest(options: Options): { requestId: string; job: unknown } {
   const file = options["--file"], requestId = options["--request-id"];
   if (typeof file !== "string" || typeof requestId !== "string" || !UUID.test(requestId)) {
-    throw new Error("Usage: infinite eval run --file job.json --request-id UUID [--json]");
+    throw new Error("Usage: infinite eval run PROJECT --file job.json --request-id UUID [--json]");
   }
   let fd: number;
   try {
@@ -104,8 +104,8 @@ export async function handleEvalClientCommand(positional: string[], options: Opt
     print(summary, () => evalStatusLines(summary));
     return true;
   }
-  if (verb === "run" && positional.length === 1) {
-    const body = jobRequest(options);
+  if (verb === "run" && positional.length === 2) {
+    const body = { projectId: first!, ...jobRequest(options) };
     const result = await read(() => api.json<{ created: boolean; job: EvalJobView }>("/eval/jobs", body, undefined, undefined, "POST"));
     print(result, () => [
       ...(result.created ? [] : ["This request ID already created a job. Its existing job follows."]),

@@ -673,6 +673,7 @@ These override the text below them where the two differ.
     - **The report directory is the launcher's.** The launcher creates `work/reports` for every operation, and the fixture's `run` does the same. The validator runs no `mkdir`.
     - **Task 13's pump** supplies `bundle` and keeps it across tasks; probes the grader before each task (ruling 4); calls `record` after every task, also when `validateTask` throws, so `inFlight` never outlives its task; and after an `environment` outcome waits one pump interval before its next `next`, so a task whose cause persists is not handed out again at once.
     - Task 10's `record` clears `inFlight` before its write, so a failed write still frees the next job.
+16. **A job names its project in the request body.** `EvalHostApi.create` takes a project id, and the body of Task 11 gave it none. `POST /api/eval/jobs` takes `{ projectId, requestId, job }`. A `projectId` that names no configured project is `404` `unknown-project`. The answer's body is `create`'s `{ created, job }`, with `201` when created and `200` otherwise. The CLI is `infinite eval run PROJECT --file job.json --request-id UUID [--json]`, like `status PROJECT`, and sends `{ projectId, requestId, job }`. Task 12 carries the change; Task 11 builds the route to it.
 
 ## Trust boundary, and what a review checks
 

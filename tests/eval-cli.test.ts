@@ -58,15 +58,15 @@ test("run sends the file and the request id", async () => {
     const good = join(dir, "job.json");
     writeFileSync(good, JSON.stringify({ kind: "validate", limits: { maxWallMinutes: 10 } }));
     const { api, calls } = fakeApi(() => ({ created: true, job }));
-    await handleEvalClientCommand(["run"], { "--file": good, "--request-id": REQUEST_ID }, api);
+    await handleEvalClientCommand(["run", "proj-1"], { "--file": good, "--request-id": REQUEST_ID }, api);
     assert.equal(calls.length, 1);
     assert.equal(calls[0].path, "/eval/jobs");
     assert.equal(calls[0].method, "POST");
-    assert.deepEqual(calls[0].body, { requestId: REQUEST_ID, job: { kind: "validate", limits: { maxWallMinutes: 10 } } });
+    assert.deepEqual(calls[0].body, { projectId: "proj-1", requestId: REQUEST_ID, job: { kind: "validate", limits: { maxWallMinutes: 10 } } });
 
     const refused = async (options: Record<string, string>, file: string, message: RegExp) => {
       const probe = fakeApi(() => ({ created: true, job }));
-      await assert.rejects(handleEvalClientCommand(["run"], options, probe.api), message, file);
+      await assert.rejects(handleEvalClientCommand(["run", "proj-1"], options, probe.api), message, file);
       assert.equal(probe.calls.length, 0, `no call for ${file}`);
     };
     await refused({ "--file": good }, "a missing request id", /Usage: infinite eval run/);

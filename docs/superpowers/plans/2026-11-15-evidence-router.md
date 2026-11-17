@@ -688,6 +688,10 @@ These rulings override the text below where the two differ.
    - In Task 10's status lines, "autonomous default" also names a saved policy without a mode in an `autonomous` project.
 7. **A limit fallback follows the rule of the pool its member starts from.** A scout's start needs rule 1 only, so `fallbackRule` gives a scout of an auto-pinned run rule 1 only, the test `scoutPool` uses. An implementer, escalated or not, keeps rules 1 and 2. Task 2's fallback test covers both roles.
 8. **Notes for Task 9.** `teams.ts` keeps its own `switchFallback` and `taskProfiles` until Task 9 replaces them with the `team-types.ts` and `routing-rules.ts` versions. Task 9 also switches `assertBudget`'s inline limit to `memberLimit`. In the code, the plan's "coordinator" role is `project-manager`.
+9. **Status names where the mode comes from.** `RoutingStatus` gains `modeSource: "saved" | "autonomous-default" | null`: `autonomous-default` when no mode is saved in an `autonomous` project, with or without a saved policy (ruling 6); `saved` when a saved `mode` decides; null when the status is `off`. `source` keeps its meaning, where the knobs come from, as in the pin.
+   - Task 8's status sets it beside `requested` and `source`. Its status test asserts both cases: a saved policy without a mode in an `autonomous` project gives `autonomous-default`, and a saved `shadow` gives `saved`.
+   - Task 10's line (1) prints `(autonomous default)` for `modeSource` `autonomous-default` in both modes: `ID · routing auto (autonomous default)` and `ID · routing shadow (autonomous default) · auto starts after the shadow period`. Line (5)'s ` Auto routing needs --routing auto.` appears only for `modeSource` `saved` with `requested` shadow.
+   - The routing usage lists `pause-explore` and `resume-explore`, and step 1's exact-usage assertion changes with it.
 
 ## Trust boundary, and what a review checks
 

@@ -49,12 +49,12 @@ async function fixture(scenario: string, linear?: Awaited<ReturnType<typeof star
       claude: { command: process.execPath, args: [resolve("tests/fixtures/goal-agent.mjs"), scenario, receipts, "claude"] },
       codex: { command: process.execPath, args: [resolve("tests/fixtures/goal-agent.mjs"), scenario, receipts, "codex"] },
     }, config: {
-      // Head publication would push to GitHub; goal tests do not exercise it.
+      // Goal tests exercise neither head publication (it would push to GitHub) nor the intent check (goal-agent.mjs has no checker role).
       teams: { workspaceDir: join(root, "teams"), lineup, publishHeads: false },
       ...(linear ? { linear: { apiKeyFile, endpoint: linear.endpoint } } : {}),
       projects: [{ id: "rehearsal", name: "Rehearsal", path: source, team: bootstrapGoal
-        ? { checks: [], establishChecks: true }
-        : { checks: [{ command: process.execPath, args: ["check.mjs"] }], ...(objective ? { objective: { prompts: objective } } : {}), ...(scenario === "delivery" ? { delivery: { mode: "merge" as const, repository: "example/app", baseBranch: "main", mergeMethod: "squash" as const } } : {}) },
+        ? { checks: [], establishChecks: true, objective: { intentCheck: "off" as const } }
+        : { checks: [{ command: process.execPath, args: ["check.mjs"] }], objective: { ...(objective ? { prompts: objective } : {}), intentCheck: "off" as const }, ...(scenario === "delivery" ? { delivery: { mode: "merge" as const, repository: "example/app", baseBranch: "main", mergeMethod: "squash" as const } } : {}) },
         ...(linear ? { linear: { teamId: linear.teamId } } : {}) }],
     } });
   } catch (error) { rmSync(root, { recursive: true, force: true }); await linear?.close(); throw error; }
@@ -351,7 +351,7 @@ test("goal cycles retain their accepted verification when project configuration 
     assert.ok(accepted?.checks?.length);
     assert.equal(first.establishChecks, true);
 
-    f.host.config.projects[0]!.team = { checks: [{ command: process.execPath, args: ["check.mjs"] }] };
+    f.host.config.projects[0]!.team = { checks: [{ command: process.execPath, args: ["check.mjs"] }], objective: { intentCheck: "off" } };
     writeFileSync(join(f.host.root, "config.json"), JSON.stringify(f.host.config));
     await f.host.stopApi(); await f.host.start();
     assert.deepEqual((await f.team(first.id)).verification, accepted);

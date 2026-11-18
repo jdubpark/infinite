@@ -104,6 +104,8 @@ The scout rule is cost only. The outcome ledger records that a scout completed, 
 
 Replacements stay as they are, so an assignment has at most one `start` decision and one `escalation` decision. The ordinal in the decision key is therefore 1 today.
 
+*Escalation slice (2026-11-17).* The scout candidates are the implementers whose tier is not `strong`. A profile without a tier counts as light, as `tierCost` counts it. The `escalation` decision is made in `consume`, after the escalate report is accepted and before the path-scope check. The `scout` decision is made in `prepareMember`, before `newMember`. Neither runs in an operation's completion, which also runs for paused, cancelled, and blocked runs.
+
 ### Part 3: Reward (`rewardVersion: 1`)
 
 The router reads outcome rows whose source is `production` or `duel`, once the ledger has frozen them. A row that ended without integration counts as soon as its attempt ends. The router never reads `legacy` rows, and it skips rows with an exclusion. It needs rows, not cell totals, because the reward joins several levels of one attempt.
@@ -203,6 +205,8 @@ c(a) = expected listUsd of one attempt
 
 *Auto slice (2026-11-16).* The exploration guards run in the order paused, budget, share. The share counts the newest `exploreWindow − 1` `start` rows of the project that are `pending` or `applied`, and one more exploratory start must keep the exploratory count within `maxExploreShare` of the window, with the new start included, plus the epsilon `SHARE_EPSILON` (1e-9). A pending row older than 7 days is released and counts nowhere. Headroom is not applied in this slice: no headroom guard is added, and `headroomWeight` stays inert.
 
+*Escalation slice (2026-11-17).* Rule 2 of the eligibility list binds every profile the host chooses at `escalation` and `scout`: the router's candidates and every fallback. A profile a member names at those points keeps rule 1 only. A run covers `escalation` for a member when a candidate other than that member's own profile passes the fixed rules. It covers `scout` when a scout candidate passes them. Either needs a version-2 pin that lists the point. A version-1 pin routes only `start`. An uncovered point keeps today's path. A covered run's scout limit fallback passes rules 1 and 2, so no limit fallback lands on the reviewer's model. The model-family rule (C19) is still not applied at `escalation`.
+
 ### Part 6: Learned cascade
 
 The cascade is the same utility with a wider candidate set. With `cascade` on, the escalation pool joins the `start` candidates. A strong profile `S` beats a light profile `L` at the start when:
@@ -254,6 +258,8 @@ The run record gains `task.routing = { decisionKey, profileId, mode }`. The host
 
 *Auto slice (2026-11-16).* A `task.routing` value is `{ profileId, by }`, where `by` records who chose the profile. It replaces the `{ decisionKey, profileId, mode }` shape above. The `routing` projector is the startup pass: it applies or releases each pending row once, and a restart or a second pass changes nothing. A run that blocks keeps its pending rows until the run settles, advances, or is deleted, or until the 7-day release applies.
 
+*Escalation slice (2026-11-17).* An escalation or scout row's basis is `greedy-point`, `single-candidate`, or `default-all-limited`. No sample is drawn at these points. A pending row at `escalation` or `scout` counts nowhere in the share, the shadow period, or the status reads, which count `start` rows only. Its 7-day release does not apply: the run's settle, advance, or delete releases it, since `releaseRun` has no point filter. `appliedOutcomeIds` takes the point as a parameter.
+
 ### Part 8: Plan schema and prompts
 
 In `off` and `shadow` mode, schemas and prompts do not change. In `auto` mode, for each point the run covers:
@@ -266,6 +272,8 @@ In `off` and `shadow` mode, schemas and prompts do not change. In `auto` mode, f
 
 *Auto slice (2026-11-16).* In an `auto` run, a scout's profile passes rule 1 of Part 5 only. The escalation pool passes rule 1 only, as `escalationPool` in `team-types.ts` does. A limit fallback follows the rule of the pool its member starts from (plan ruling 7): an implementer's, escalated or not, passes rules 1 and 2, and a scout's passes rule 1.
 
+*Escalation slice (2026-11-17).* `escalate` and each scout in the report tool's one schema take an optional `agentProfileId`, and the tool's `required` list drops it. This is the one model-visible change in `off` and `shadow` runs. The worker refuses a report that omits a profile with 409 and `PROFILE_REQUIRED_REFUSAL`, unless the member's assignment carries `hostProfiles`. The prompts in `off` and `shadow` still ask for the id. In a run that covers `escalation` or `scout` for a member, the prompt carries the host-selects text, and the member's assignment carries `hostProfiles`. The report schema is the same for every run, so the "schemas do not change" sentence above holds for the prompts and contexts only.
+
 ### Part 9: Owner surface
 
 **CLI**
@@ -273,6 +281,8 @@ In `off` and `shadow` mode, schemas and prompts do not change. In `auto` mode, f
 - `infinite repo init --routing off|shadow|auto [--routing-points LIST] [--routing-cascade on|off] [--routing-value PRESET|USD] [--routing-contributor allow|deny]`
 - `infinite routing status [PROJECT] [--json]`: per cell and profile, the observed n by source, each labelled prior with its mass, the posterior mean, 90% interval, rescue estimate, pooling level, expected cost, and greedy mark, plus the mode, exploratory share, pause state, and shadow agreement rate.
 - `infinite routing explain RUN_ID TASK_ID`: one decision, decoded.
+
+*Escalation slice (2026-11-17).* `--routing-points LIST` is built. `LIST` is a comma-separated set of `start`, `escalation`, and `scout`, and it must include `start`: `pinRouting` pins nothing without `start`, so a list without it is refused before any request. The saved configuration schema does not change, so no saved configuration stops parsing. `routing explain RUN_ID TASK_ID` also takes a scout's ID and shows that scout's decision. The command's usage line still names the argument `TASK_ID`.
 - `infinite routing pause-explore PROJECT` and `resume-explore PROJECT`.
 - `infinite team revoke-routing RUN_ID --revision N`.
 

@@ -117,11 +117,12 @@ export const readGrantSchema = z.strictObject({
     requestAttempts: setting(40),
     outside: z.boolean(),
   }),
-  // At most runAttempts, whose range is 0 to 200.
+  // The run's read allowance after reservations, at most runAttempts (0 to 200). A project manager's
+  // request is charged to it. PROPOSED: the grant's allowanceLeft excludes every scout lead's reservation.
   allowanceLeft: count(200),
-  // Scout lead only, at most lead.maxAttempts (12). PROPOSED: what remains of the attempts reserved
-  // for this lead, its own second attempt included. The validator charges the request and that
-  // attempt to allowanceLeft as well, which fails closed if allowanceLeft already excludes it.
+  // Scout lead only, at most lead.maxAttempts (12): what remains of the attempts the host reserved for
+  // this lead at admission. Part 5: a scout lead's request and its own second attempt are funded by
+  // its reservation alone.
   reservation: count(12).optional(),
   outsideProfiles: z.array(taskIdSchema).max(64),
   // Set by the host. The validator only reads it.
@@ -135,6 +136,8 @@ export const readGrantSchema = z.strictObject({
 export type ReadGrant = z.infer<typeof readGrantSchema>;
 
 export type ReadErrorCode =
+  // PROPOSED: the design's table has no code for a request whose shape is wrong.
+  | "malformed"
   | "not-granted"
   | "unknown-profile"
   | "forward-reference"
@@ -187,13 +190,20 @@ function locate(request: ReadRequest): LocatedStep[] {
     phase.steps.map((step, stepIndex) => ({ step, phase: phaseIndex, path: `phases[${phaseIndex}].steps[${stepIndex}]` })));
 }
 
-/** Returns every rule violation in one pass, so the member fixes the request once. */
-export function validateReadRequest(request: ReadRequest, grantInput: unknown): ReadRequestResult {
+/**
+ * Parses the grant (an invalid one is a host fault), then the request (one error per schema issue, and
+ * no rule runs), then returns every rule violation in one pass, so the member fixes the request once.
+ * Never throws for any JSON value.
+ */
+export function validateReadRequest(requestInput: unknown, grantInput: unknown): ReadRequestResult {
   const parsedGrant = readGrantSchema.safeParse(grantInput);
   if (!parsedGrant.success) {
     return { ok: false, errors: [error("not-granted", "grant", "The host's read grant is invalid, so no read can start.",
       "This is a host fault: report it as a blocker instead of sending another read request.")] };
   }
+  const parsedRequest = readRequestSchema.safeParse(requestInput);
+  if (!parsedRequest.success) return { ok: false, errors: parsedRequest.error.issues.map(issueError) };
+  const request = parsedRequest.data;
   const grant = parsedGrant.data;
   const errors: ReadRequestError[] = [];
   const steps = locate(request);
@@ -204,8 +214,9 @@ export function validateReadRequest(request: ReadRequest, grantInput: unknown): 
   const isLead = grant.requester === "project-manager";
 
   if (!grant.poolOn) {
-    errors.push(error("not-granted", "request", "The read pool is off for this run.",
-      "Do the work without a read request; the owner has not turned the pool on."));
+    // Acceptance 15: the pool may be off because the evidence store was unavailable, so the text names explore.
+    errors.push(error("not-granted", "request", "The read pool is not available for this run.",
+      "Send an explore report instead; it runs as before."));
   }
   if (grant.requester === "reader" || grant.requester === "quarantined-reader") {
     errors.push(error("not-granted", "request", `A ${grant.requester} cannot send a read request.`,
@@ -312,6 +323,8 @@ export function validateReadRequest(request: ReadRequest, grantInput: unknown): 
     }
   }
 
+  // The request-level value is accepted against the list ceiling when any phase has forEach. The
+  // scheduler must still hold a phase without forEach to the concurrency setting (part 1).
   const hasListFanout = steps.some(({ step }) => step.forEach !== undefined);
   if (request.concurrency !== undefined) {
     const cap = hasListFanout ? grant.limits.listConcurrency : grant.limits.concurrency;
@@ -326,22 +339,20 @@ export function validateReadRequest(request: ReadRequest, grantInput: unknown): 
       `The expanded request is ${total} steps; the per-request limit is ${grant.limits.requestAttempts}.`,
       `Cut the steps or maxItems so the expanded total is ${grant.limits.requestAttempts} or less.`), limit: "request" });
   }
-  // Part 5: a scout lead's second attempt is a read attempt, so it is charged beside the request's
-  // steps. The per-request ceiling above counts only the request's own steps.
-  const ownAttempt = grant.requester === "scout-lead" ? 1 : 0;
-  const charged = ownAttempt ? `${total} steps, plus 1 for the scout lead's second attempt` : `${total} steps`;
-  if (total + ownAttempt > grant.allowanceLeft) {
-    errors.push({ ...error("over-ceiling", "phases",
-      `The expanded request is ${charged}; the run has ${grant.allowanceLeft} left.`,
-      sendAtMost(grant.allowanceLeft - ownAttempt)), limit: "allowance" });
-  }
+  // Part 5: the host reserved a scout lead's attempts from the run's allowance at admission, so its
+  // request and its own second attempt are charged to the reservation alone. The per-request
+  // ceiling above counts only the request's own steps.
   if (grant.requester === "scout-lead") {
     const reservation = grant.reservation ?? 0;
-    if (total + ownAttempt > reservation) {
+    if (total + 1 > reservation) {
       errors.push({ ...error("over-ceiling", "phases",
-        `The expanded request is ${charged}; the scout lead's reservation is ${reservation}.`,
-        sendAtMost(reservation - ownAttempt)), limit: "reservation" });
+        `The expanded request is ${total} steps, plus 1 for the scout lead's second attempt; the scout lead's reservation is ${reservation}.`,
+        sendAtMost(reservation - 1)), limit: "reservation" });
     }
+  } else if (total > grant.allowanceLeft) {
+    errors.push({ ...error("over-ceiling", "phases",
+      `The expanded request is ${total} steps; the run has ${grant.allowanceLeft} left.`,
+      sendAtMost(grant.allowanceLeft)), limit: "allowance" });
   }
 
   return errors.length > 0 ? { ok: false, errors } : { ok: true, total, phases, keys: Object.fromEntries(keyById) };
@@ -353,6 +364,64 @@ function error(code: ReadErrorCode, path: string, message: string, fix: string):
 
 function sendAtMost(room: number): string {
   return room > 0 ? `Send at most ${room} expanded steps.` : "No read step fits; continue with the evidence you have.";
+}
+
+type RequestIssue = z.ZodError["issues"][number];
+const KEY = /^[A-Za-z][A-Za-z0-9]*$/;
+
+/** Renders an issue path the way the rule paths are written; a root issue is at `request`. */
+function issuePath(path: readonly PropertyKey[]): string {
+  if (path.length === 0) return "request";
+  return path.map((part, index) => (typeof part === "number" ? `[${part}]`
+    : `${index === 0 ? "" : "."}${typeof part === "string" && KEY.test(part) ? part : "?"}`)).join("");
+}
+
+/**
+ * Part 3 puts phases, steps, maxItems, concurrency and a lead's maxAttempts above their bounds under
+ * over-ceiling, so a list or number above its schema maximum is over-ceiling. Every other issue is
+ * malformed. The text names schema keys and bounds only, never a value taken from the request.
+ */
+function issueError(issue: RequestIssue): ReadRequestError {
+  const path = issuePath(issue.path);
+  const key = issue.path.filter(part => typeof part === "string").at(-1);
+  const name = typeof key === "string" && KEY.test(key) ? `\`${key}\`` : "the request";
+  const subject = issue.path.length === 0 ? "the request" : typeof issue.path.at(-1) === "number" ? `an item of ${name}` : name;
+  if (issue.code === "too_big" && (issue.origin === "array" || issue.origin === "number" || issue.origin === "int")) {
+    return issue.origin === "array"
+      ? error("over-ceiling", path, `${name} has more than ${issue.maximum} items.`, `Cut ${name} to ${issue.maximum} items or fewer.`)
+      : error("over-ceiling", path, `${name} is above ${issue.maximum}.`, `Set ${name} to ${issue.maximum} or less.`);
+  }
+  const [message, fix] = malformedText(issue, subject);
+  return error("malformed", path, message.charAt(0).toUpperCase() + message.slice(1), fix);
+}
+
+function malformedText(issue: RequestIssue, subject: string): [string, string] {
+  const plural = (count: number | bigint, unit: string) => `${count} ${unit}${count === 1 ? "" : "s"}`;
+  switch (issue.code) {
+    case "invalid_type":
+      return issue.path.length === 0
+        ? ["the read request is not an object.", "Send an object with kind, summary and phases."]
+        : [`${subject} is missing or is not of type ${issue.expected}.`, `Send ${subject} with type ${issue.expected}.`];
+    case "unrecognized_keys":
+      return [`${subject} has a field the read request schema does not define.`, "Remove every field the schema does not list."];
+    case "too_small": {
+      const unit = issue.origin === "array" ? "item" : issue.origin === "string" ? "character" : "";
+      return unit
+        ? [`${subject} needs at least ${plural(issue.minimum, unit)}.`, `Give ${subject} at least ${plural(issue.minimum, unit)}.`]
+        : [`${subject} is below ${issue.minimum}.`, `Set ${subject} to ${issue.minimum} or more.`];
+    }
+    case "too_big":
+      return [`${subject} is longer than ${issue.maximum} characters.`, `Shorten ${subject} to ${issue.maximum} characters or fewer.`];
+    case "invalid_value":
+      return [`${subject} is not an allowed value.`, `Use one of: ${issue.values.map(String).join(", ")}.`];
+    case "invalid_format":
+      return [`${subject} does not have the required format.`, issue.pattern ? `Match the pattern ${issue.pattern}.` : "Use the format the schema gives."];
+    case "custom":
+      return [`${subject} is not accepted.`, subject.endsWith("`refs`") ? "Use an https URL or evidence:N."
+        : subject.endsWith("`paths`") ? "Use a repository-relative path without glob syntax." : "Check it against the read request schema."];
+    default:
+      return [`${subject} is not valid.`, "Check it against the read request schema."];
+  }
 }
 
 /** One line per error, then the sentence that tells the member a refusal is recoverable. */

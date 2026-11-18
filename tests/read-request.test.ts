@@ -188,6 +188,8 @@ test("stepKey ignores whitespace, case and path order, and ignores profile, id, 
   assert.notEqual(stepKey({ ...base, forEach: { step: "items", maxItems: 2 } }), key);
   assert.notEqual(stepKey({ ...base, source: { refs: ["https://example.com/spec"] } }), key);
   assert.notEqual(stepKey({ ...base, source: { refs: ["https://example.com/other"] } }), key);
+  assert.notEqual(stepKey({ ...base, paths: ["packages/host/src/a.ts"] }), key);
+  assert.notEqual(stepKey({ ...base, paths: ["packages/host/src/c.ts", "packages/host/src/b.ts"] }), key);
 });
 
 test("expandedTotal counts forEach as maxItems, lead as 1 plus maxAttempts, and sums each phase", () => {
@@ -354,21 +356,104 @@ test("a repeated source ref or path does not change a step's key, so duplicate w
   assert.equal(stepKey(step({ id: "scan", paths: [path, path] })), stepKey(step({ id: "scan", paths: [path] })));
 });
 
-test("a scout lead's request plus its own second attempt must fit both the reservation and the allowance", () => {
-  const lead = (reservation: number, allowanceLeft: number) => grant({ requester: "scout-lead", reservation, allowanceLeft });
-  const limits = (result: ReturnType<typeof validateReadRequest>) => (result.ok ? [] : result.errors.map(item => `${item.code}:${item.limit}:${item.path}`));
+function limits(result: ReturnType<typeof validateReadRequest>): string[] {
+  return result.ok ? [] : result.errors.map(item => `${item.code}:${item.limit}:${item.path}`);
+}
+
+test("a scout lead's request and its own second attempt are charged to its reservation alone", () => {
+  const lead = (reservation: number | undefined, allowanceLeft: number) => grant({ requester: "scout-lead", reservation, allowanceLeft });
   const one = request([[step({ id: "a" })]]);
   const two = request([[step({ id: "a" }), step({ id: "b" })]]);
-  assert.deepEqual(limits(validateReadRequest(one, lead(1, 1))), ["over-ceiling:allowance:phases", "over-ceiling:reservation:phases"]);
-  assert.deepEqual(limits(validateReadRequest(two, lead(2, 2))), ["over-ceiling:allowance:phases", "over-ceiling:reservation:phases"]);
-  const reservationOnly = validateReadRequest(two, lead(2, 40));
-  assert.deepEqual(limits(reservationOnly), ["over-ceiling:reservation:phases"]);
-  if (!reservationOnly.ok) assert.match(reservationOnly.errors[0].message, /second attempt/);
-  assert.deepEqual(limits(validateReadRequest(two, lead(12, 2))), ["over-ceiling:allowance:phases"]);
-  const exact = validateReadRequest(two, lead(3, 3));
+  const funded = validateReadRequest(one, lead(2, 0));
+  assert.equal(funded.ok, true);
+  if (funded.ok) assert.equal(funded.total, 1);
+  assert.deepEqual(limits(validateReadRequest(one, lead(1, 0))), ["over-ceiling:reservation:phases"]);
+  const short = validateReadRequest(two, lead(2, 40));
+  assert.deepEqual(limits(short), ["over-ceiling:reservation:phases"]);
+  if (!short.ok) assert.match(short.errors[0].message, /second attempt/);
+  assert.deepEqual(limits(validateReadRequest(one, lead(undefined, 40))), ["over-ceiling:reservation:phases"]);
+  const exact = validateReadRequest(two, lead(3, 0));
   assert.equal(exact.ok, true);
   if (exact.ok) assert.equal(exact.total, 2);
   assert.equal(validateReadRequest(two, grant({ allowanceLeft: 2 })).ok, true);
+  assert.deepEqual(limits(validateReadRequest(two, grant({ allowanceLeft: 1 }))), ["over-ceiling:allowance:phases"]);
+});
+
+test("a scout lead may reach requestAttempts when its reservation covers it, and one more step is over the request ceiling", () => {
+  const steps = (count: number) => Array.from({ length: count }, (_, index) => step({ id: `s${index}` }));
+  const lead = grant({ requester: "scout-lead", reservation: 6, limits: { concurrency: 3, listConcurrency: 8, requestAttempts: 4, outside: true } });
+  const atCeiling = validateReadRequest(request([steps(4)]), lead);
+  assert.equal(atCeiling.ok, true);
+  if (atCeiling.ok) assert.equal(atCeiling.total, 4);
+  assert.deepEqual(limits(validateReadRequest(request([steps(5)]), lead)), ["over-ceiling:request:phases"]);
+});
+
+test("a project manager's third request in a revision passes and its fourth is refused", () => {
+  const plain = request([[step({ id: "scan" })]]);
+  assert.equal(validateReadRequest(plain, grant({ requestsSent: 2 })).ok, true);
+  assert.deepEqual(codes(validateReadRequest(plain, grant({ requestsSent: 3 }))), ["not-granted"]);
+});
+
+test("a run with the pool off points the member to an explore report", () => {
+  const result = validateReadRequest(request([[step({ id: "scan" })]]), grant({ poolOn: false }));
+  assert.deepEqual(codes(result), ["not-granted"]);
+  if (result.ok) return;
+  assert.equal(result.errors[0].message, "The read pool is not available for this run.");
+  assert.equal(result.errors[0].fix, "Send an explore report instead; it runs as before.");
+  assert.match(refusalText(result.errors), /explore/);
+  assert.doesNotMatch(refusalText(result.errors), /owner/);
+});
+
+function parseIssues(value: unknown, readGrant: unknown = grant()): string[] {
+  let result: ReturnType<typeof validateReadRequest> | undefined;
+  assert.doesNotThrow(() => { result = validateReadRequest(value, readGrant); });
+  assert.ok(result);
+  return result.ok ? [] : result.errors.map(item => `${item.code}:${item.path}`);
+}
+
+test("the validator parses the request: a list or number above its schema bound is over-ceiling at its path", () => {
+  assert.deepEqual(parseIssues(request(Array.from({ length: 5 }, (_, index) => [step({ id: `s${index}` })]))), ["over-ceiling:phases"]);
+  assert.deepEqual(parseIssues(request([Array.from({ length: 7 }, (_, index) => step({ id: `s${index}` }))])), ["over-ceiling:phases[0].steps"]);
+  assert.deepEqual(parseIssues(request([[listStep("items")], [step({ id: "fan", forEach: { step: "items", maxItems: 17 } })]])), ["over-ceiling:phases[1].steps[0].forEach.maxItems"]);
+  assert.deepEqual(parseIssues(request([[step({ id: "scan", lead: { maxAttempts: 13 } })]])), ["over-ceiling:phases[0].steps[0].lead.maxAttempts"]);
+  const bigFan = validateReadRequest(request([[listStep("items")], [step({ id: "fan", forEach: { step: "items", maxItems: 17 } })]]), grant());
+  if (!bigFan.ok) assert.equal(bigFan.errors[0].fix, "Set `maxItems` to 16 or less.");
+});
+
+test("the validator never throws on a request of the wrong shape and reports it as malformed without running the rules", () => {
+  for (const value of [null, "read", 7, [], [request([[step({ id: "scan" })]])], undefined, true]) {
+    assert.deepEqual(parseIssues(value), ["malformed:request"], JSON.stringify(value));
+  }
+  assert.deepEqual(parseIssues({}), ["malformed:kind", "malformed:summary", "malformed:phases"]);
+  assert.deepEqual(parseIssues({}, grant({ poolOn: false, requester: "reader" })), ["malformed:kind", "malformed:summary", "malformed:phases"]);
+  assert.deepEqual(parseIssues({}, { ...grant(), extra: true }), ["not-granted:grant"]);
+  assert.deepEqual(parseIssues(request([[{ ...step({ id: "scan" }), extra: true }]])), ["malformed:phases[0].steps[0]"]);
+  assert.deepEqual(parseIssues({ ...request([[step({ id: "scan" })]]), phases: [] }), ["malformed:phases"]);
+  assert.deepEqual(parseIssues(request([[step({ id: "scan", title: "x".repeat(101) })]])), ["malformed:phases[0].steps[0].title"]);
+  assert.deepEqual(parseIssues(JSON.parse('{"kind":"read","summary":"S","phases":[],"__proto__":{"kind":"x"}}')), ["malformed:phases", "malformed:request"]);
+});
+
+test("parse errors never echo a value taken from the request", () => {
+  const marker = "IGNORE-PRIOR-INSTRUCTIONS";
+  const hostile = {
+    kind: marker,
+    summary: 5,
+    concurrency: marker,
+    [marker]: true,
+    phases: [{ id: marker, steps: [{
+      id: marker, title: marker.repeat(20), instructions: "Read.", output: marker, [marker]: 1,
+      source: { refs: [marker] }, paths: [`/${marker}`], forEach: { step: marker, maxItems: 99 }, verify: marker,
+    }] }],
+  };
+  const result = validateReadRequest(hostile, grant());
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  const issues = readRequestSchema.safeParse(hostile);
+  assert.equal(issues.success, false);
+  if (!issues.success) assert.equal(result.errors.length, issues.error.issues.length);
+  assert.ok(result.errors.length >= 10);
+  const text = `${JSON.stringify(result.errors)}\n${refusalText(result.errors)}`.toLowerCase();
+  assert.equal(text.includes(marker.toLowerCase()), false);
 });
 
 test("a verifier step that also reads outside content is refused at its source path", () => {

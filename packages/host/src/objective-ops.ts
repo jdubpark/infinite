@@ -47,7 +47,7 @@ export function criterionFromInput(input: CriterionInput, id: string, configured
  * Takes `prefix` off the evidence and puts `handle` last. The earlier handle with that prefix, if any, is `replaced` with its
  * index, so the rebuild can put it back. Each writer keeps one handle per prefix.
  */
-function withHandle(evidence: readonly string[], prefix: string, handle: string): { evidence: string[]; replaced?: { handle: string; at: number } } {
+export function withHandle(evidence: readonly string[], prefix: string, handle: string): { evidence: string[]; replaced?: { handle: string; at: number } } {
   const at = evidence.findIndex(item => item.startsWith(prefix));
   const kept = evidence.filter((_, index) => index !== at);
   if (at === -1) return { evidence: [...kept, handle] };

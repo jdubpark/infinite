@@ -26,7 +26,7 @@ export interface ContextGauge {
 const MAX_CALLS = 8192;
 /** PROPOSED: recent step ids kept for deduplication. An id seen again after 1,024 other ids counts again. */
 const MAX_STEP_IDS = 1024;
-/** PROPOSED: a string longer than this is not an id. The row is handled as if the id were missing. */
+/** PROPOSED: a string longer than this is not an id. A row without a usable id is not counted: no step, no call, no output, no item. */
 const MAX_ID_LENGTH = 256;
 
 const TOOL_CLASSES: readonly ToolClass[] = ["program", "shell", "file-read", "file-write", "search", "web", "mcp", "agent", "other"];

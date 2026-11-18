@@ -193,6 +193,18 @@ test("numbers: Claude token fields that are not safe integers count as 0", () =>
   assert.deepEqual(steps({ input_tokens: 0.5 }), { modelSteps: 1, peakInputTokens: 0 });
 });
 
+test("numbers: a Codex usage row whose input is not a safe non-negative integer is no step", () => {
+  for (const input of [1e308, 0.5, -1, Number.MAX_SAFE_INTEGER + 2, "7"]) {
+    const record = new ContextGaugeTail("codex");
+    record.push(usage("resp_bad", input as number));
+    const counted = new ContextGaugeTail("codex");
+    counted.push({ type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: input } } } });
+    for (const gauge of [record.snapshot(), counted.snapshot()]) {
+      assert.deepEqual({ modelSteps: gauge.modelSteps, peak: gauge.peakInputTokens }, { modelSteps: 0, peak: 0 }, `input ${String(input)}`);
+    }
+  }
+});
+
 test("a synthetic Claude row is no model step, and its content is still read", () => {
   const tail = new ContextGaugeTail("claude");
   tail.push(claudeStep("msg_syn", { input_tokens: 500 }, "<synthetic>"));

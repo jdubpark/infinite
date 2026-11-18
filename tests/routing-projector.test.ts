@@ -16,7 +16,7 @@ import {
   routingModule,
   routingProjector,
 } from "../packages/host/src/routing-store.js";
-import type { DecisionRow, RoutingPayload } from "../packages/host/src/routing-types.js";
+import type { DecisionRow, RoutingPayload, RoutingPoint } from "../packages/host/src/routing-types.js";
 
 const NOW = "2026-11-15T12:00:00.000Z";
 const RUN = "run-r";
@@ -244,5 +244,115 @@ test("projecting again, in each order of three events or after a restart, change
     store.close();
   } finally {
     f.close();
+  }
+});
+
+const ESCALATION_PROFILE = "sonnet-escalation";
+const SCOUT_PROFILE = "haiku-light";
+
+/** A pending row at `point` for the task (or scout), as the host writes it before its member starts. */
+function pendingAt(tx: EvidenceTx, runId: string, taskId: string, profileId: string, point: RoutingPoint, revision = 1, state: DecisionRow["state"] = "pending"): DecisionRow {
+  const row = pendingRow(tx, runId, taskId, profileId, revision, state);
+  return { ...row, key: decisionKey(runId, revision, row.taskKey, point, 1), point, role: point === "scout" ? "scout" : "implementer" };
+}
+
+function seedAt(store: EvidenceStore, rows: { runId: string; taskId: string; profileId: string; point: RoutingPoint; revision?: number }[]): void {
+  store.write(tx => {
+    for (const row of rows) insertDecision(tx, pendingAt(tx, row.runId, row.taskId, row.profileId, row.point, row.revision), payload(row.taskId));
+  });
+}
+
+function stateAt(store: EvidenceStore, runId: string, taskId: string, point: RoutingPoint, revision = 1): { state: string | undefined; memberId: string | null | undefined } {
+  const row = store.read(db => readDecision(db, decisionKey(runId, revision, db.index("task", taskId), point, 1)));
+  return { state: row?.state, memberId: row?.memberId };
+}
+
+test("the projector applies or releases escalation and scout rows once", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    store.register(routingModule());
+    seedAt(store, [
+      { runId: RUN, taskId: "a", profileId: PROFILE, point: "start" },
+      { runId: RUN, taskId: "a", profileId: ESCALATION_PROFILE, point: "escalation" },
+      { runId: RUN, taskId: "s1", profileId: SCOUT_PROFILE, point: "scout" },
+      { runId: RUN, taskId: "c", profileId: ESCALATION_PROFILE, point: "escalation" },
+      { runId: RUN, taskId: "s2", profileId: SCOUT_PROFILE, point: "scout" },
+      { runId: RUN, taskId: "e", profileId: ESCALATION_PROFILE, point: "escalation", revision: 2 },
+      { runId: OTHER_RUN, taskId: "x", profileId: PROFILE, point: "start" },
+      { runId: OTHER_RUN, taskId: "x", profileId: ESCALATION_PROFILE, point: "escalation" },
+      { runId: OTHER_RUN, taskId: "sx", profileId: SCOUT_PROFILE, point: "scout" },
+    ]);
+    const events = [
+      started(RUN, "a", "m-a", PROFILE),
+      started(RUN, "a", "m-stall", ESCALATION_PROFILE, { replaces: { cause: "stall" } }),
+      started(RUN, "a", "m-esc", ESCALATION_PROFILE, { replaces: { cause: "escalation" } }),
+      runEvent("member.started", RUN, { taskId: "s1", memberId: "m-s1", data: { role: "scout", profileId: OTHER_PROFILE } }),
+    ];
+    project(store, events);
+    assert.deepEqual(stateAt(store, RUN, "a", "start"), { state: "applied", memberId: "m-a" }, "a first start applies its start row");
+    assert.deepEqual(stateAt(store, RUN, "a", "escalation"), { state: "applied", memberId: "m-esc" }, "an escalated start applies its escalation row");
+    assert.deepEqual(stateAt(store, RUN, "s1", "scout"), { state: "released", memberId: null }, "a scout on a limit fallback releases its row");
+    project(store, events);
+    assert.deepEqual(stateAt(store, RUN, "a", "escalation"), { state: "applied", memberId: "m-esc" }, "a replayed escalated start changes nothing");
+    assert.deepEqual(stateAt(store, RUN, "s1", "scout"), { state: "released", memberId: null }, "a replayed scout start changes nothing");
+    project(store, [runEvent("member.started", RUN, { taskId: "c", memberId: "m-c", data: { role: "implementer", profileId: PROFILE, replaces: { cause: "stall" } } })]);
+    assert.deepEqual(stateAt(store, RUN, "c", "escalation"), { state: "pending", memberId: null }, "a stall replacement keeps the escalation row pending");
+    project(store, [runEvent("run.revision-advanced", RUN, { revision: 2 })]);
+    assert.equal(stateAt(store, RUN, "c", "escalation").state, "released", "a revision advance releases lower-revision escalation rows");
+    assert.equal(stateAt(store, RUN, "s2", "scout").state, "released", "a revision advance releases lower-revision scout rows");
+    assert.equal(stateAt(store, RUN, "e", "escalation", 2).state, "pending", "the new revision keeps its escalation row");
+    assert.deepEqual(stateAt(store, RUN, "a", "escalation"), { state: "applied", memberId: "m-esc" }, "an applied escalation row keeps its member");
+    project(store, [runEvent("run.deleted", OTHER_RUN)]);
+    assert.equal(stateAt(store, OTHER_RUN, "x", "start").state, "released", "a deleted run releases its start row");
+    assert.equal(stateAt(store, OTHER_RUN, "x", "escalation").state, "released", "a deleted run releases its escalation row");
+    assert.equal(stateAt(store, OTHER_RUN, "sx", "scout").state, "released", "a deleted run releases its scout row");
+    project(store, [runEvent("run.settled", RUN)]);
+    assert.equal(stateAt(store, RUN, "e", "escalation", 2).state, "released", "a settled run releases its escalation rows");
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("projecting the new points again, in each order of three events or after a restart, changes nothing", () => {
+  const orders: number[][] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+  const expected = [
+    { state: "applied", memberId: "m-a" },
+    { state: "applied", memberId: "m-esc" },
+    { state: "applied", memberId: "m-s1" },
+  ];
+  for (const order of orders) {
+    const f = fixture();
+    let store: EvidenceStore | undefined;
+    try {
+      store = open(f);
+      store.register(routingModule());
+      seedAt(store, [
+        { runId: RUN, taskId: "a", profileId: PROFILE, point: "start" },
+        { runId: RUN, taskId: "a", profileId: ESCALATION_PROFILE, point: "escalation" },
+        { runId: RUN, taskId: "s1", profileId: SCOUT_PROFILE, point: "scout" },
+      ]);
+      const events = [
+        started(RUN, "a", "m-a", PROFILE),
+        started(RUN, "a", "m-esc", ESCALATION_PROFILE, { replaces: { cause: "escalation" } }),
+        runEvent("member.started", RUN, { taskId: "s1", memberId: "m-s1", data: { role: "scout", profileId: SCOUT_PROFILE } }),
+      ];
+      const sequenceEvents = order.map(index => events[index]);
+      project(store, sequenceEvents);
+      const once = [stateAt(store, RUN, "a", "start"), stateAt(store, RUN, "a", "escalation"), stateAt(store, RUN, "s1", "scout")];
+      assert.deepEqual(once, expected, `order ${order.join(",")} applies each row once`);
+      project(store, sequenceEvents);
+      assert.deepEqual([stateAt(store, RUN, "a", "start"), stateAt(store, RUN, "a", "escalation"), stateAt(store, RUN, "s1", "scout")], once, `order ${order.join(",")} is idempotent`);
+      store.close();
+      store = open(f);
+      store.register(routingModule());
+      project(store, sequenceEvents);
+      assert.deepEqual([stateAt(store, RUN, "a", "start"), stateAt(store, RUN, "a", "escalation"), stateAt(store, RUN, "s1", "scout")], once, `order ${order.join(",")} after a restart`);
+    } finally {
+      store?.close();
+      f.close();
+    }
   }
 });

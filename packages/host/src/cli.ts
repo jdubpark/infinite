@@ -241,7 +241,7 @@ infinite repo init [DIRECTORY]              Enroll a repository or set parent-fo
 infinite repo init [--permissions coordinator|off] [--permission-scope TEXT] [--permission-limit N]
                                           First enrollment delegates to coordinator by default
 infinite repo init --permissions off        Disable delegation for future runs
-infinite repo init [--routing off|shadow|auto] [--routing-value cost|balanced|quality|USD] [--routing-contributor allow|deny]
+infinite repo init [--routing off|shadow|auto] [--routing-value cost|balanced|quality|USD] [--routing-contributor allow|deny] [--routing-points start[,escalation][,scout]]
 infinite team revoke-permissions TEAM_ID    Revoke delegation for an active run
 infinite team revoke-routing TEAM_ID    Stop host routing for the run's new tasks
 infinite permissions status [--json]        Show workspace permission delegation

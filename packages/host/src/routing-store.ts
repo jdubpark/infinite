@@ -293,12 +293,12 @@ export function releaseStalePending(tx: EvidenceTx, projectId: string, now: stri
   ).changes;
 }
 
-/** `${run_id}:${member_id}` of the identity's applied start rows decided at or after `since`, newest first, at most 2,000. */
-export function appliedOutcomeIds(db: EvidenceDb, identity: string, since: string): Set<string> {
+/** `${run_id}:${member_id}` of the identity's applied rows at `point` decided at or after `since`, newest first, at most 2,000. */
+export function appliedOutcomeIds(db: EvidenceDb, identity: string, since: string, point: "start" | "escalation" = "start"): Set<string> {
   const rows = db.all<{ run_id: string; member_id: string | null }>(
-    "SELECT run_id, member_id FROM routing_decisions WHERE chosen_identity=? AND point='start' AND state='applied' "
+    "SELECT run_id, member_id FROM routing_decisions WHERE chosen_identity=? AND point=? AND state='applied' "
     + "AND decided_at>=? ORDER BY decided_at DESC LIMIT 2000",
-    identity, since,
+    identity, point, since,
   );
   return new Set(rows.map(row => `${row.run_id}:${row.member_id}`));
 }
@@ -322,9 +322,11 @@ export function releaseRun(tx: EvidenceTx, runId: string, beforeRevision: number
 }
 
 /**
- * Settles the host's pending start rows from run events. A first implementer start (no `replaces`) on the chosen
- * profile applies its row; any other profile releases it. A revision advance releases the lower revisions; a settle
- * or a delete releases the run. Only `pending` rows change, so a repeated event changes nothing. Reads no payload.
+ * Settles the host's pending rows from run events. A first implementer start (no `replaces`) settles the `start` row;
+ * an implementer start that replaces an escalated member settles the `escalation` row; a first scout start settles the
+ * `scout` row. Each settles on the chosen profile (applied) or releases otherwise. A stall replacement settles nothing.
+ * A revision advance releases the lower revisions; a settle or a delete releases the run. Only `pending` rows change,
+ * so a repeated event changes nothing. Reads no payload.
  */
 export function routingProjector(): EventProjector {
   return {
@@ -340,10 +342,11 @@ export function routingProjector(): EventProjector {
         releaseRun(tx, event.runId);
         return;
       }
-      const data = event.data;
-      if (data.role !== "implementer" || data.replaces !== undefined || event.taskId === undefined
-        || event.memberId === undefined || typeof data.profileId !== "string") return;
-      settleStart(tx, decisionKey(event.runId, event.revision, tx.index("task", event.taskId), "start", 1), event.memberId, data.profileId);
+      const data = event.data, replaces = data.replaces as { cause?: unknown } | undefined;
+      if (event.taskId === undefined || event.memberId === undefined || typeof data.profileId !== "string") return;
+      const point = data.role === "implementer" ? (replaces === undefined ? "start" : replaces.cause === "escalation" ? "escalation" : undefined)
+        : data.role === "scout" && replaces === undefined ? "scout" : undefined;
+      if (point !== undefined) settleStart(tx, decisionKey(event.runId, event.revision, tx.index("task", event.taskId), point, 1), event.memberId, data.profileId);
     },
   };
 }

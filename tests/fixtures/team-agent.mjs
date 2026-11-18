@@ -142,6 +142,9 @@ const providerIndex = process.argv.indexOf("--fixture-provider");
 const receipt = { ...assignment, cwd: process.cwd(), pid: process.pid, startedAt: Date.now(),
   ...(process.env.INFINITE_TRUSTED_WORKSPACE ? { trustedWorkspace: process.env.INFINITE_TRUSTED_WORKSPACE } : {}),
   ...(providerIndex >= 0 ? { provider: process.argv[providerIndex + 1], argv: process.argv.slice(2) } : {}) };
+// A test that writes record-context keeps a copy of each member's context file.
+if (existsSync(join(receiptDir, "record-context")) && existsSync(join(".git", "infinite-team-context.json")))
+  writeFileSync(join(receiptDir, `${assignment.memberId}.context.json`), readFileSync(join(".git", "infinite-team-context.json")), { mode: 0o600 });
 if (receipt.provider === "opencode") {
   const args = process.argv.slice(providerIndex + 2), boundary = args.indexOf("--");
   if (args[0] !== "run" || boundary < 1 || boundary !== args.length - 2
@@ -257,6 +260,11 @@ async function main() {
     process.exit(0);
   }
   if (assignment.role === "project-manager") {
+    // Under explore-unnamed, the project manager asks for one scout before its first plan, and names no scout profile.
+    if (existsSync(join(receiptDir, "explore-unnamed")) && !(receipt.prompt ?? process.argv.at(-1) ?? "").includes("The team's one discovery batch is already used")) {
+      await report({ kind: "explore", summary: "Read the module before planning", tasks: [{ id: "s1", title: "Read the module", instructions: "Read the module and report what it exports" }] });
+      return;
+    }
     // A project manager corrected after an intent check waits for its release while the hold flag exists.
     const corrected = JSON.parse(readFileSync(join(".git", "infinite-team-context.json"), "utf8")).feedback;
     if (typeof corrected === "string" && corrected.startsWith("The intent check held your plan") && existsSync(join(receiptDir, "intent-hold"))) {
@@ -373,6 +381,8 @@ async function main() {
         await report({ ...plan, verification: undefined });
       }
     } else await report(plan);
+  } else if (assignment.role === "scout") {
+    await report({ kind: "findings", summary: "Read the module", evidence: [{ source: "module.txt", observation: "The module exports one function." }] });
   } else if (assignment.role === "intent-checker") {
     // The checker copies its context and launch prompt for the test, then waits, exits, edits, or reports as the flags say.
     writeFileSync(join(receiptDir, `${assignment.memberId}.intent-context.json`), readFileSync(join(".git", "infinite-team-context.json")), { mode: 0o600 });
@@ -469,6 +479,22 @@ async function main() {
         if (Date.now() >= until) throw new Error("The test did not release the first implementer");
         await new Promise(resolve => setTimeout(resolve, 40));
       }
+    }
+    // Under escalate-unnamed, the first implementer of task a escalates without a profile. A refused report is kept in a file,
+    // and the report repeats with the profile named in escalate-to. The escalated member writes its file, then reports as usual.
+    const launchPrompt = receipt.prompt ?? process.argv.at(-1) ?? "";
+    if (launchPrompt.includes("The previous implementer requested escalation")) writeFileSync(join(receiptDir, `${assignment.memberId}.escalated`), "escalated", { mode: 0o600 });
+    else if (existsSync(join(receiptDir, "escalate-unnamed")) && assignment.taskId === "a" && !existsSync(join(receiptDir, `${assignment.runId}.a-escalated`))) {
+      writeFileSync(join(receiptDir, `${assignment.runId}.a-escalated`), "requested", { mode: 0o600 });
+      const escalation = { kind: "escalate", reason: "Needs the stronger model" };
+      let rejection;
+      try { await report(escalation); }
+      catch (error) { rejection = error instanceof Error ? error.message : String(error); }
+      if (rejection) {
+        writeFileSync(join(receiptDir, `${assignment.memberId}.rejection.txt`), rejection, { mode: 0o600 });
+        await report({ ...escalation, agentProfileId: readFileSync(join(receiptDir, "escalate-to"), "utf8").trim() });
+      }
+      return;
     }
     const asked = join(receiptDir, `${assignment.runId}.${assignment.taskId}.asked`);
     if ((scenario === "mixed" || (scenario === "bootstrap-replan" || scenario === "bootstrap-change") && assignment.revision === 1) && assignment.taskId === "b" && !existsSync(asked)) {

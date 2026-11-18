@@ -1,11 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { RESCUE_USD, TIER_COSTS, choose, screen, tierCost, utility, type Scored, type Screened } from "../packages/host/src/routing-choice.js";
+import { RESCUE_USD, TIER_COSTS, choose, chooseScout, screen, screenEscalations, screenProfiles, screenScouts, tierCost, utility, type Scored, type Screened } from "../packages/host/src/routing-choice.js";
 import { ROUTING_DEFAULTS } from "../packages/host/src/routing-policy.js";
 import { betaSample, candidateSeed, decisionSeed } from "../packages/host/src/routing-sample.js";
-import type { Beta, ProfilePosterior, RoutingKnobs } from "../packages/host/src/routing-types.js";
-import type { TeamLineup, TeamModelProfile } from "../packages/host/src/team-types.js";
+import type { Beta, ProfilePosterior, RoutingKnobs, RoutingPoint, TeamRunRouting } from "../packages/host/src/routing-types.js";
+import { coversPoint, type TeamLineup, type TeamModelProfile, type TeamRun } from "../packages/host/src/team-types.js";
 import type { Provider } from "../packages/host/src/types.js";
 import { mixedLineup } from "./team-fixture.js";
 
@@ -224,4 +224,144 @@ test("the seed binds every part of the key", () => {
 
   assert.notEqual(candidateSeed(base, "identity-a"), candidateSeed(base, "identity-b"));
   assert.notEqual(candidateSeed(base, "identity-a"), base);
+});
+
+const ALL_POINTS: RoutingPoint[] = ["start", "escalation", "scout"];
+
+// The point lineup: the reviewer is on claude-opus-5-5, as in tests/routing-points-rules.test.ts.
+const claudeAt = (id: string, model: string, effort: "high" | "xhigh", tier?: "light" | "strong"): TeamModelProfile =>
+  ({ id, label: id, provider: "claude", model, effort, ...(tier ? { tier } : {}) }) as TeamModelProfile;
+const contributorAt = (id: string): TeamModelProfile =>
+  ({ id, label: id, provider: "opencode", model: "contrib/spark", variant: "high", tier: "light", dataUse: "contributor" }) as TeamModelProfile;
+const POINT_LINEUP = {
+  coordinator: claudeAt("coord", "claude-sonnet-5-5", "high"),
+  integrator: claudeAt("integ", "claude-sonnet-5-5", "high"),
+  reviewer: claudeAt("reviewer", "claude-opus-5-5", "xhigh"),
+  implementers: [
+    contributorAt("spark-high"),
+    codex("astra-xhigh", "gpt-6-astra", "xhigh"),
+    claudeAt("haiku-light", "claude-haiku-5-5", "high", "light"),
+    claudeAt("opus-strong", "claude-opus-5-5", "xhigh", "strong"),
+  ],
+  escalations: [
+    claudeAt("opus-escalation", "claude-opus-5-5", "xhigh", "strong"),
+    codex("astra-escalation", "gpt-6-astra", "high"),
+    claudeAt("sonnet-escalation", "claude-sonnet-5-5", "high", "strong"),
+    contributorAt("spark-escalation"),
+  ],
+} as unknown as TeamLineup;
+
+test("escalation and scout choices never sample, over 1,000 seeds", () => {
+  const example = knobs({ successValueUsd: 2, listWeight: 1 });
+  const escalations = screenEscalations(POINT_LINEUP, example, new Set<Provider>(), undefined);
+  assert.deepEqual(escalations.filter(item => item.removed === undefined).map(item => item.profile.id), ["astra-escalation", "sonnet-escalation"]);
+  const shape: Record<string, { theta: Beta; phi: Beta; costUsd: number }> = {
+    "astra-escalation": { theta: beta(2, 1), phi: beta(7, 3), costUsd: 2.2 },
+    "sonnet-escalation": { theta: beta(9, 2), phi: beta(9, 1), costUsd: 2.2 },
+  };
+  const scored = scoredFor(escalations, id => shape[id] ?? { theta: beta(1, 1), phi: beta(1, 1), costUsd: 2.2 });
+  for (const risk of ["normal", "elevated"] as const) {
+    for (let i = 0; i < 1000; i += 1) {
+      const choice = choose(escalations, scored, example, risk, `seed-${risk}-${i}`, "escalation")!;
+      assert.equal(choice.basis, "greedy-point");
+      assert.equal(choice.explore, false);
+      assert.equal(choice.chosen, choice.greedy);
+      for (const record of choice.candidates) {
+        assert.equal(record.sample, undefined);
+        assert.equal(record.sampledUtility, undefined);
+      }
+    }
+  }
+
+  const scouts = screenScouts(POINT_LINEUP, example, new Set<Provider>());
+  const first = chooseScout(scouts)!;
+  for (let i = 0; i < 1000; i += 1) {
+    const again = chooseScout(scouts)!;
+    assert.notEqual(again.basis, "sampled");
+    assert.equal(again.explore, false);
+    assert.deepEqual(again, first);
+  }
+});
+
+test("the scout rule takes the lowest tier cost and screens rules 1 to 3", () => {
+  const example = knobs({ successValueUsd: 2, listWeight: 1 });
+
+  const nothing = chooseScout(screenScouts(POINT_LINEUP, example, new Set<Provider>()))!;
+  assert.deepEqual([nothing.basis, nothing.chosen, nothing.greedy, nothing.explore], ["greedy-point", "astra-xhigh", "astra-xhigh", false]);
+  assert.deepEqual(nothing.candidates.map(record => [record.profileId, record.removed ?? null, record.costUsd ?? null]),
+    [["spark-high", "contributor", null], ["astra-xhigh", null, 0.4], ["haiku-light", null, 0.4]]);
+  assert.equal(nothing.candidates.some(record => record.profileId === "opus-strong"), false);
+
+  const codexLimited = chooseScout(screenScouts(POINT_LINEUP, example, new Set<Provider>(["codex"])))!;
+  assert.deepEqual([codexLimited.basis, codexLimited.chosen], ["single-candidate", "haiku-light"]);
+
+  const allLimited = chooseScout(screenScouts(POINT_LINEUP, example, new Set<Provider>(["codex", "claude"])))!;
+  assert.deepEqual([allLimited.basis, allLimited.chosen], ["default-all-limited", "astra-xhigh"]);
+
+  const contributorOk = chooseScout(screenScouts(POINT_LINEUP, knobs({ allowContributor: true, successValueUsd: 2, listWeight: 1 }), new Set<Provider>()))!;
+  assert.deepEqual([contributorOk.basis, contributorOk.chosen], ["greedy-point", "spark-high"]);
+
+  // Rule 2 applies to the scout's candidates when they come through screenProfiles: opus-strong is on the reviewer's model.
+  const unscreenedScouts = chooseScout(screenProfiles(POINT_LINEUP.implementers, POINT_LINEUP, example, new Set<Provider>()))!;
+  assert.equal(unscreenedScouts.candidates.find(record => record.profileId === "opus-strong")?.removed, "reviewer-model");
+  assert.equal(unscreenedScouts.chosen, "astra-xhigh");
+
+  // Lowest tier cost, not lineup order: the strong profile comes first and costs 2.20; the light one costs 0.40.
+  const cheapest = chooseScout(screenProfiles([claudeAt("strong-first", "claude-sonnet-5-5", "high", "strong"), codex("light-second", "gpt-6-astra", "high")],
+    POINT_LINEUP, example, new Set<Provider>()))!;
+  assert.deepEqual([cheapest.basis, cheapest.chosen], ["greedy-point", "light-second"]);
+  assert.deepEqual(cheapest.candidates.map(record => record.costUsd), [2.2, 0.4]);
+
+  // No candidate passes rules 1 and 2: undefined, so the caller writes no row.
+  assert.equal(chooseScout(screenProfiles([contributorAt("spark-only")], POINT_LINEUP, example, new Set<Provider>())), undefined);
+  assert.equal(chooseScout([] as Screened[]), undefined);
+});
+
+test("coverage agrees with the router's screen at both new points", () => {
+  const autoPin = (points: RoutingPoint[], over: Partial<RoutingKnobs> = {}) => ({
+    mode: "auto", requested: "auto", periodEndedAt: "2026-11-01T00:00:00.000Z", source: "saved",
+    knobs: { ...ROUTING_DEFAULTS, points, ...over }, defaults: [], algorithmVersion: 2, rewardVersion: 1, digest: "d",
+  }) as unknown as TeamRunRouting;
+  const withLineup = (over: Partial<TeamLineup>): TeamLineup => ({ ...POINT_LINEUP, ...over }) as TeamLineup;
+  const sonnetStrong = claudeAt("sonnet-strong", "claude-sonnet-5-5", "high", "strong");
+  const opusEscalation = POINT_LINEUP.escalations![0];
+  const sonnetEscalation = POINT_LINEUP.escalations![2];
+  const contributorScoutLineup = withLineup({ implementers: [contributorAt("spark-high"), POINT_LINEUP.implementers[3]] });
+  const contributorOnly = withLineup({ implementers: [contributorAt("spark-high")], escalations: [POINT_LINEUP.escalations![3]] });
+
+  // The nine lineups and knob sets: the point lineup, with and without contributors, and variants that cover or uncover each point.
+  const cases: { lineup: TeamLineup; over: Partial<RoutingKnobs> }[] = [
+    { lineup: POINT_LINEUP, over: {} },
+    { lineup: POINT_LINEUP, over: { allowContributor: true } },
+    { lineup: withLineup({ escalations: [opusEscalation] }), over: {} },
+    { lineup: withLineup({ escalations: undefined }), over: {} },
+    { lineup: withLineup({ escalations: [sonnetEscalation, opusEscalation] }), over: {} },
+    { lineup: contributorScoutLineup, over: {} },
+    { lineup: contributorScoutLineup, over: { allowContributor: true } },
+    { lineup: withLineup({ implementers: [sonnetStrong] }), over: {} },
+    { lineup: contributorOnly, over: {} },
+  ];
+  assert.equal(cases.length, 9);
+
+  const escalationCovered: boolean[] = [];
+  const scoutCovered: boolean[] = [];
+  for (const { lineup, over } of cases) {
+    const routing = autoPin(ALL_POINTS, over);
+    const knobsOf = routing.knobs as RoutingKnobs;
+    const run = { routing, lineup } as Pick<TeamRun, "routing" | "lineup">;
+    const escalationKept = screenEscalations(lineup, knobsOf, new Set<Provider>(), undefined).some(item => item.removed === undefined);
+    const scoutKept = screenScouts(lineup, knobsOf, new Set<Provider>()).some(item => item.removed === undefined);
+    assert.equal(coversPoint(run, "escalation"), escalationKept);
+    assert.equal(coversPoint(run, "scout"), scoutKept);
+    escalationCovered.push(escalationKept);
+    scoutCovered.push(scoutKept);
+    // The member's own profile is never its escalation candidate, in the coverage check or in the screen.
+    for (const own of (lineup.escalations ?? []).map(profile => profile.id)) {
+      const screened = screenEscalations(lineup, knobsOf, new Set<Provider>(), own);
+      assert.equal(screened.some(item => item.profile.id === own), false);
+      assert.equal(coversPoint(run, "escalation", own), screened.some(item => item.removed === undefined));
+    }
+  }
+  assert.ok(escalationCovered.includes(true) && escalationCovered.includes(false));
+  assert.ok(scoutCovered.includes(true) && scoutCovered.includes(false));
 });

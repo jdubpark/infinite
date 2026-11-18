@@ -57,12 +57,10 @@ export function identityOf(profile: TeamModelProfile): { provider: string; model
 /** What one start scores before any read: the features, the screen, and one prompt version per kept identity. */
 export type StartFrame = { features: TaskFeatures; screened: Screened[]; versions: Map<string, { profile: TeamModelProfile; version: string }> };
 
-export function startFrame(input: RouterStart): StartFrame {
-  const { run, task } = input;
-  const { routing, lineup } = run;
-  if (routing === undefined || lineup === undefined) throw new Error("A routed start needs a routing pin and a lineup.");
+/** The frame of one implementer decision over the candidates `screened` holds, whatever the point. */
+export function frameOf(input: RouterStart, screened: Screened[]): StartFrame {
+  const { task } = input;
   const features = taskFeatures({ role: "implementer", paths: task.paths, kind: task.kind, risk: task.risk }, input.featureMap);
-  const screened = screen(lineup, routing.knobs, input.limited);
   // One prompt version per identity, from the first kept profile with it, in lineup order.
   const versions = new Map<string, { profile: TeamModelProfile; version: string }>();
   for (const item of screened) {
@@ -72,6 +70,13 @@ export function startFrame(input: RouterStart): StartFrame {
     versions.set(item.identity, { profile: item.profile, version });
   }
   return { features, screened, versions };
+}
+
+export function startFrame(input: RouterStart): StartFrame {
+  const { run } = input;
+  const { routing, lineup } = run;
+  if (routing === undefined || lineup === undefined) throw new Error("A routed start needs a routing pin and a lineup.");
+  return frameOf(input, screen(lineup, routing.knobs, input.limited));
 }
 
 export type Evaluated = { row: DecisionRow; payload: RoutingPayload };
@@ -86,11 +91,13 @@ function guardsAt(db: EvidenceDb, run: TeamRun, knobs: RoutingKnobs, now: string
 }
 
 /**
- * Scores one start inside a read and builds its row and payload. A shadow start records a `recorded` row; an `auto`
- * start adds the exploration guards and writes a `pending` row. Undefined when no candidate passes rules 1 and 2.
+ * Scores one implementer decision inside a read and builds its row and payload. `start` explores under the guards in
+ * `auto`; `escalation` is greedy and reads no guard. A shadow decision records a `recorded` row; an `auto` decision
+ * writes a `pending` row. Undefined when no candidate passes rules 1 and 2. `at.named` is the coordinator's or the
+ * worker's validated profile id, or null.
  */
-export function evaluateStart(db: EvidenceDb, input: RouterStart, frame: StartFrame, keys: { taskKey: string; key: string },
-  now: string, auto: boolean): Evaluated | undefined {
+export function evaluateImplementer(db: EvidenceDb, input: RouterStart, frame: StartFrame, keys: { taskKey: string; key: string },
+  now: string, auto: boolean, at: { point: "start" | "escalation"; named: string | null }): Evaluated | undefined {
   const { run, task } = input;
   const { routing, lineup } = run;
   if (routing === undefined || lineup === undefined) throw new Error("A routed start needs a routing pin and a lineup.");
@@ -102,23 +109,24 @@ export function evaluateStart(db: EvidenceDb, input: RouterStart, frame: StartFr
     kind: features.kind,
     featureVersion: features.featureVersion,
     featureMapRef: db.index("feature-map", features.featureMap),
-    point: "start",
+    point: at.point,
   };
   const since = new Date(Date.parse(now) - MAX_AGE_DAYS * DAY_MS).toISOString();
   const scored = new Map<string, Scored>();
   const current: { identity: string; epoch: number; promptVersion: string }[] = [];
   for (const [identity, { profile, version }] of frame.versions) {
     const found: CurrentConfig = { epoch: epochAt(db, identity, now), promptVersion: version };
-    const rows = selectRoutingEvidence(db, identityOf(profile), "start", since);
+    const rows = selectRoutingEvidence(db, identityOf(profile), at.point, since);
     // An applied start of the router's counts at full weight, the one place a choice has a weight of 1.
-    const applied = appliedOutcomeIds(db, identity, since);
+    const applied = appliedOutcomeIds(db, identity, since, at.point);
     scored.set(identity, { profile, identity, posterior: posterior(rows, target, found, now, CHOSEN_WEIGHT, applied), costUsd: tierCost(profile) });
     current.push({ identity, ...found });
   }
-  const seed = decisionSeed(routing.digest, run.id, run.revision, keys.taskKey, "start", 1);
-  const raw = choose(frame.screened, scored, knobs, features.risk, seed);
+  const seed = decisionSeed(routing.digest, run.id, run.revision, keys.taskKey, at.point, 1);
+  const raw = choose(frame.screened, scored, knobs, features.risk, seed, at.point);
   if (raw === undefined) return undefined;
-  const guards = auto ? guardsAt(db, run, knobs, now) : undefined;
+  // Only a start explores, so only a start reads the guards.
+  const guards = auto && at.point === "start" ? guardsAt(db, run, knobs, now) : undefined;
   const choice: Choice = guards === undefined ? raw : guardExploration(raw, guards, knobs);
   const chosen = choice.candidates.find(candidate => candidate.profileId === choice.chosen)!;
   const row: DecisionRow = {
@@ -126,7 +134,7 @@ export function evaluateStart(db: EvidenceDb, input: RouterStart, frame: StartFr
     runId: run.id,
     revision: run.revision,
     taskKey: keys.taskKey,
-    point: "start",
+    point: at.point,
     ordinal: 1,
     projectRef: target.projectRef,
     role: "implementer",
@@ -144,7 +152,7 @@ export function evaluateStart(db: EvidenceDb, input: RouterStart, frame: StartFr
     chosenProfileId: choice.chosen,
     chosenIdentity: chosen.identity,
     greedyProfileId: choice.greedy,
-    coordinatorProfileId: task.agentProfileId ?? null,
+    coordinatorProfileId: at.named,
     explore: choice.explore,
     state: auto ? "pending" : "recorded",
     memberId: null,
@@ -166,6 +174,15 @@ export function evaluateStart(db: EvidenceDb, input: RouterStart, frame: StartFr
     ...(guards === undefined ? {} : { guards }),
   };
   return { row, payload };
+}
+
+/**
+ * Scores one start inside a read. A shadow start records a `recorded` row; an `auto` start adds the exploration guards
+ * and writes a `pending` row. Undefined when no candidate passes rules 1 and 2.
+ */
+export function evaluateStart(db: EvidenceDb, input: RouterStart, frame: StartFrame, keys: { taskKey: string; key: string },
+  now: string, auto: boolean): Evaluated | undefined {
+  return evaluateImplementer(db, input, frame, keys, now, auto, { point: "start", named: input.task.agentProfileId ?? null });
 }
 
 function profileNamed(run: TeamRun, profileId: string): TeamModelProfile {

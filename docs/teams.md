@@ -2480,11 +2480,11 @@ With no saved mode, the default follows the project's autonomy mode: a `supervis
 
 ### What a decision row holds
 
-One row per task and revision, written at the task's first implementer start, with nothing recorded for a replacement. A row holds the run, revision, task key, point, role, area, kind, risk, feature map reference, mode `shadow`, the algorithm and reward versions, the policy digest, the seed, the basis, the chosen and greedy profiles, the coordinator's pick when there is one, the exploration flag, and the decision time. The project, the task ID, the area, and the feature map name are stored only as blind indexes (`project_ref` among them); the sealed payload holds the clear values and each candidate's posterior, cost, and utility, at most 32 KiB. A shadow row has no member ID.
+One row per task and revision, written at the task's first implementer start, with nothing recorded for a replacement. A run pinned at algorithm version 2 that lists the escalation or scout point also writes one row per escalated task and revision (point `escalation`, role `implementer`) and one per scout (point `scout`, role `scout`). A scout's row has no posterior, and its payload's `current` list is empty. An escalation row has the same fields as a start row, and its payload has no guards. A row holds the run, revision, task key, point, role, area, kind, risk, feature map reference, mode `shadow`, the algorithm and reward versions, the policy digest, the seed, the basis, the chosen and greedy profiles, the coordinator's pick when there is one, the exploration flag, and the decision time. The project, the task ID (a scout's ID for a scout row), the area, and the feature map name are stored only as blind indexes (`project_ref` among them); the sealed payload holds the clear values and each candidate's posterior, cost, and utility, at most 32 KiB. A shadow row has no member ID.
 
 Nothing about the routing reaches a member: no prompt, context file, or tool carries the policy, a seed, a posterior, or a utility. A shadow run writes no line to the run's events.
 
-A run's team view shows the policy the run pinned: the mode, the requested mode, the source, the knobs and which are defaults, the algorithm and reward versions, and the digest. The relay carries team views, and a handoff run's view also shows the project's saved policy. No view shows a seed, a posterior, or a utility. Status and explain are not served over the relay.
+A run's team view shows the policy the run pinned: the mode, the requested mode, the source, the knobs and which are defaults, the algorithm and reward versions, and the digest. The relay carries team views, and a handoff run's view also shows the project's saved policy. A team view also shows each task's and each scout's `routing` (the profile the host chose, and whether the router or its fallback chose it) and each member's `hostProfiles` flag. No view shows a seed, a posterior, or a utility. Status and explain are not served over the relay.
 
 ### Status and explain
 
@@ -2537,10 +2537,10 @@ In an `auto` run, the coordinator's plan may omit `agentProfileId` on its tasks,
 An `auto` run applies these rules to its profiles:
 
 1. A contributor profile is used only when the policy sets `allowContributor`. This holds for implementers, scouts, escalations, and their limit fallbacks. The coordinator, integrator, and reviewer slots and their limit fallbacks are the owner's lineup choices, and the router does not check them.
-2. A profile on the reviewer's model is never used for an implementer's start, or for an implementer's limit fallback, escalated or not. Scout and escalation profiles are not checked against this rule.
+2. A profile on the reviewer's model is never used for an implementer's start, or for an implementer's limit fallback, escalated or not. A profile the host chooses for an escalation or a scout is checked against this rule; a profile a member names is not.
 3. A profile outside the owner's lineup is never used.
 
-When the router cannot choose a profile at a start, the task starts on the coordinator's profile if it passes rules 1 and 2, and otherwise on the first implementer in lineup order that passes them. The run's events then hold one line for that task and revision: `Host routing could not choose a profile for task ID; it is assigned LABEL.` A provider-limit fallback passes over a profile that fails its member's rules: rules 1 and 2 for an implementer, escalated or not, and rule 1 for a scout. A saved `auto` whose lineup has no implementer that passes rules 1 and 2 is refused with 409 `routing-no-eligible-profile` when a run is created. The autonomous default never refuses a run: it stays in shadow and logs once per host process that no implementer profile passes the rules.
+When the router cannot choose a profile at a start, the task starts on the coordinator's profile if it passes rules 1 and 2, and otherwise on the first implementer in lineup order that passes them. The run's events then hold one line for that task and revision: `Host routing could not choose a profile for task ID; it is assigned LABEL.` A provider-limit fallback passes over a profile that fails its member's rules: rules 1 and 2 for an implementer, escalated or not, rules 1 and 2 for a scout of a run that covers `scout`, and rule 1 for any other scout. A saved `auto` whose lineup has no implementer that passes rules 1 and 2 is refused with 409 `routing-no-eligible-profile` when a run is created. The autonomous default never refuses a run: it stays in shadow and logs once per host process that no implementer profile passes the rules.
 
 ### Exploration guards
 
@@ -2568,6 +2568,54 @@ infinite team revoke-routing TEAM_ID [--request-id UUID] [--json]
 
 The command reads the run's current revision and stops host routing for the run's new tasks. Each starts on the coordinator's pick when it passes the fixed rules, else on the first implementer in lineup order that passes them; no run line is written per task. It is refused with 409 `routing-not-enabled` for a run that was not pinned `auto`, and it is owner-only.
 
+### Escalations and scouts
+
+Two more points can route under `auto`: `escalation`, the profile of an implementer that escalates, and `scout`, the profile of each scout. The owner lists them with `--routing-points`:
+
+```sh
+infinite repo init --routing auto --routing-points start,escalation,scout
+infinite repo init --routing-points start
+```
+
+- `--routing-points LIST` sets the points the router covers. `LIST` is a comma-separated set of `start`, `escalation`, and `scout`. It must include `start`; a list without it is refused before any request. A rerun without the option keeps the saved points.
+- The points are part of the routing policy. A change blocks the project's active routines until the owner approves them again.
+- A run pinned with `escalation` or `scout` in its points is pinned at algorithm version 2. A run pinned at version 1 routes only `start`, whatever its points list.
+- In `shadow`, a point that a version-2 pin lists records rows and applies nothing, as `start` does.
+
+**Coverage.** A point is covered when the run is pinned `auto` at version 2, lists the point, and has a candidate that passes the fixed rules.
+
+- `escalation`: a profile in `lineup.escalations` other than the escalated member's own profile. Coverage is per member: when the member's own profile is the only candidate, that member is not covered.
+- `scout`: an implementer whose tier is not `strong`. A profile without a tier counts as light.
+
+An uncovered point keeps today's path. The member names a profile from the pool, and the host checks it as it does in every other run.
+
+**What the members are told.** In a covered run that is not revoked:
+
+- The coordinator is told that the host assigns each scout's profile, and its explore example omits `agentProfileId`.
+- An implementer is told that the host selects the stronger profile, and its escalate report is `{"kind":"escalate","reason":…}` with no profile.
+
+Otherwise the text is today's, and names the pool. No member is told a candidate, a score, the policy digest, or a decision key. A scout's inline assignment has no `routing` field, and no context file or permission review prompt carries `routing` or `hostProfiles`. After a revoke, the prompts return to today's text, but a member of a covered run still holds `hostProfiles`, including a member created after the revoke. A report from it without a profile is still accepted and takes the fallback.
+
+**What the router picks.** Neither point draws a sample or reads an exploration guard.
+
+- An escalation takes the candidate with the highest greedy utility. An elevated-risk task uses the mean minus one posterior deviation, as the design's Part 5 says. The basis is `greedy-point`. It is `single-candidate` when one candidate is left, and `default-all-limited` when every candidate is limited, which takes the first candidate.
+- A scout takes the candidate with the lowest tier cost, and ties go to lineup order. A limited candidate is passed over unless every candidate is limited. The basis is `greedy-point`, `single-candidate`, or `default-all-limited`. A scout candidate is never `strong`, so every candidate has the light cost, and in practice the first candidate in lineup order that is not limited is chosen.
+
+A router pick and a fallback pick pass rules 1 and 2, and are never the escalated member's own profile. In a covered run that is not revoked, a profile a member names does not choose, but it must still be in its pool and pass rule 1. Otherwise the run blocks when the host takes the report, with `invalid-escalation` for an escalation or `invalid-agent-profile` for a scout batch, as an out-of-pool name does today. The router's pick replaces a named profile that passes. When the router cannot choose, the named profile is the fallback if it is a candidate: it passes rules 1 and 2 and, for a scout, is not `strong`. In an uncovered or revoked run, a named profile is used as before and keeps rule 1 only. When the chosen profile's provider is limited at launch, the member starts on that profile's limit fallback, as every launch does. That fallback passes rules 1 and 2 but can be the escalated member's own profile, and the decision row is then released.
+
+**When the decision is written.** An escalation is decided when the host accepts the escalate report, before the path-scope check. A scout is decided before its member is created. Each decision writes one `pending` row, or reuses the row already stored for its key, and the row becomes `applied` when the member starts on that profile. Otherwise it becomes `released`. A `pending` row at these points is not released after 7 days. The run's settle, advance, or delete releases it.
+
+**When the router cannot choose.** The store is unavailable, a decision takes more than 250 ms, its payload is over 32 KiB, a write fails, or an error is thrown. The member then gets the fallback profile and no row is written. The fallback for an escalation is the member's named profile when it passes rules 1 and 2, else the first escalation candidate. The fallback for a scout is the coordinator's named profile when it is a candidate, else the first scout candidate. The run's events then hold one line for the escalation or scout:
+
+- `Host routing could not choose an escalation profile for task TASK_ID; it is assigned LABEL.`
+- `Host routing could not choose a profile for scout SCOUT_ID; it is assigned LABEL.`
+
+The host logs one line for each reason, once per host process. The run continues.
+
+**Revoking.** `infinite team revoke-routing TEAM_ID` stops the router at these points too. A revoked run writes no row. An escalation or a scout with no profile named takes the fallback, with no run line. A named one follows today's path. A member that was already told that the host selects therefore still gets a profile.
+
+**Reading the decisions.** `infinite routing explain RUN_ID SCOUT_ID` shows a scout's decision. `infinite routing explain RUN_ID TASK_ID` shows a task's start and escalation decisions. Both list the decisions at every point. The command's usage line still calls the second argument `TASK_ID`; a scout ID works in its place. `infinite routing status` counts `start` decisions only.
+
 ### Status lines
 
 `infinite routing status` prints one line per project:
@@ -2580,6 +2628,8 @@ The command reads the run's current revision and stops host routing for the run'
 ### Rolling back
 
 To stop new runs from choosing profiles without a release rollback, run `infinite repo init --routing shadow`, and revoke host routing on any active run with `infinite team revoke-routing TEAM_ID`. Before a release rollback past this slice, let every run pinned `auto` settle, or cancel it: a host without this slice requires `agentProfileId` on every plan task, and an `auto` plan omits it, so that host refuses the run's next member start with `invalid-agent-profile`. The rollback note under Shadow routing still applies to a release rollback.
+
+For the escalation and scout points, before a release rollback past this release, run `infinite repo init --routing-points start` on every project that lists `escalation` or `scout`, and let every run whose pin has `algorithmVersion: 2` settle, or cancel it. An unsettled version-2 run that a host from before this release picks up can block: a stored scout without `agentProfileId` stops at launch with 409 `invalid-agent-profile`, and an `escalate` report without one does not parse, so the member's exit blocks the run with `missing-agent-report`. That host also cannot replay the launch of a member that holds `hostProfiles`: the launch fingerprint covers the assignment, so the replay fails with "Request ID already belongs to a different session".
 
 ## Launch-rate fuse
 

@@ -1,0 +1,11 @@
+# Output rules for the eval account. Requires autonomy.boundary.egress: without the egress proxy on loopback the
+# provider is unreachable, so load this only where that boundary is configured. Replace EVAL_UID with the output of
+# `id -u infinite-eval`, then load with `nft -f` as root. Loopback stays open for the proxy; every other destination
+# is refused, over IPv4 and IPv6 alike, because the table is in the inet family.
+table inet infinite_eval {
+  chain output {
+    type filter hook output priority 0; policy accept;
+    meta skuid EVAL_UID oifname "lo" accept
+    meta skuid EVAL_UID reject
+  }
+}

@@ -1,4 +1,4 @@
-import { promptVersion } from "./config-identity.js";
+import { promptVersion, type ObjectivePrompt } from "./config-identity.js";
 import { CONFIGURATIONS_MODULE, epochAt } from "./configuration-store.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceDb } from "./evidence/types.js";
@@ -29,7 +29,7 @@ export type RouterStart = {
   publishHeads: boolean;
   entryTools: boolean;
   /** Whether the run is a goal cycle with a record: the member's prompt version then carries the record digest. */
-  objectiveDigest: boolean;
+  objectiveDigest: ObjectivePrompt;
   featureMap: FeatureMap | undefined;
   limited: ReadonlySet<Provider>;
 };

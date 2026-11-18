@@ -290,6 +290,11 @@ export function validateReadRequest(requestInput: unknown, grantInput: unknown):
           errors.push(error("forward-reference", forEachPath, `forEach names "${step.forEach.step}", whose output is ${target.step.output}, not list.`,
             "Name a step whose output is list."));
         }
+        // PROPOSED: the design gives no total for a forEach over a forEach; the phase engine refuses it at admission as well.
+        if (target.step.forEach) {
+          errors.push(error("forward-reference", forEachPath, `forEach names "${step.forEach.step}", which is itself a forEach step, not one list.`,
+            "Name a list step that has no forEach."));
+        }
       }
     }
 

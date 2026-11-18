@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { expandedTotal, readRequestSchema, stepKey, type ReadRequest } from "./read-request.js";
 import { taskIdSchema } from "./team-types.js";
@@ -6,12 +7,14 @@ import { taskIdSchema } from "./team-types.js";
 // transitions between its states. No I/O, clock or randomness. Read slots, the fuse, retries, scout-lead
 // behaviour, events, prompts and ingest belong to later slices: a step with `lead` is an ordinary step here.
 // The state holds ids, keys, statuses, member ids, entry handles and counts. Never an item, a brief, a title,
-// a path or any output text.
+// a path or any output text. The state depends on the order of admissions: the earlier step owns the work and a later
+// duplicate joins it, so the host must apply events in journal order.
 
 export const READS_LIMITS = {
-  // PROPOSED: a run keeps at most 32 read requests.
+  // PROPOSED: a run keeps at most 32 read requests, and the next admission is refused with `request-limit`.
   requests: 32,
-  // PROPOSED: two attempts per step (part 6) for each of a scout lead's two attempts (part 5).
+  // PROPOSED: a step holds at most four member ids. This is storage room only (two attempts per step, part 6, for each
+  // of a scout lead's two attempts, part 5); the launcher must still enforce the attempt limits.
   memberIds: 4,
   // The list output schema's maximum, so the largest item count a source can report.
   listItems: 32,
@@ -21,8 +24,8 @@ export const READS_LIMITS = {
 
 const uuid = z.uuid();
 const keySchema = z.string().regex(/^[0-9a-f]{64}$/);
-// PROPOSED: a forEach child's id is its parent's id, a dot, and its zero-based item index. A dot is outside the
-// taskId alphabet, so a child id never collides with a step id of the request.
+// PROPOSED: a forEach child's id is its parent's id, a dot, and its zero-based item index, and the child carries its
+// parent's key and list flag. A dot is outside the taskId alphabet, so a child id never collides with a step id.
 const stepIdSchema = z.string().regex(/^[a-z][a-z0-9-]{0,39}(?:\.(?:1[0-5]|[0-9]))?$/);
 const itemCount = z.number().int().min(0).max(READS_LIMITS.listItems);
 const revisionSchema = z.number().int().min(1);
@@ -34,7 +37,9 @@ export const readStepStatusSchema = z.enum([
   "running",
   "joined", // its phase started; it waits for the step it joined to settle
   "complete", "partial", "failed",
-  "expanded", // a forEach step, once its phase started: its children are the steps that run
+  // PROPOSED: a forEach step becomes `expanded` when its phase starts and never runs itself. It counts as settled for
+  // phase order, and its children are the steps that run.
+  "expanded",
   "refused", // its phase was refused for allowance; it never starts
 ]);
 export type ReadStepStatus = z.infer<typeof readStepStatusSchema>;
@@ -68,8 +73,11 @@ const requestStateSchema = z.strictObject({
   requester: requesterSchema,
   // A project manager's readers are one level below it, a scout lead's two (part 5).
   depth: z.union([z.literal(1), z.literal(2)]),
-  // PROPOSED: `running` while an admitted phase is unsettled, `ended` once every admitted phase settled (refused
-  // phases included), `refused` when no phase was admitted.
+  // SHA-256 over the canonical JSON of the admission's revision, requester and parsed request: what a replayed
+  // admission is compared with. It holds no request text.
+  digest: keySchema,
+  // PROPOSED: a request is `running` while an admitted phase is unsettled and `ended` once every admitted phase settled.
+  // A request with no admitted phase is still recorded, with status `refused`.
   status: z.enum(["running", "ended", "refused"]),
   phases: z.array(phaseStateSchema).min(1).max(4),
 });
@@ -139,19 +147,20 @@ export type ReadTransition =
 const SETTLED: ReadonlySet<string> = new Set(["complete", "partial", "failed"]);
 const JOINABLE: ReadonlySet<string> = new Set(["queued", "running", "complete", "partial"]);
 
-export type ReadJoinCandidate = { key: string; requestId: string; stepId: string; status: ReadStepStatus; output?: string };
+export type ReadJoinCandidate = { key: string; requestId: string; stepId: string; status: ReadStepStatus; list?: true; output?: string };
 
 /**
- * The steps a later step with the same key joins: in this revision, queued, running, complete or partial.
- * PROPOSED: the design's "running or complete" includes a queued step (its phase started) and a partial one
- * (it has an output). A failed step is not a target, so the work runs again. A forEach step and its children are
- * never targets: a forEach key names its source by a request-local id. A joined step is skipped, because its own
- * target carries the same key. The host builds the grant's `activeSteps` from this list.
+ * The steps a later step with the same key and list flag joins. The host builds the grant's `activeSteps` from this list.
+ * PROPOSED: join targets are steps of the same revision that are queued, running, complete or partial. A failed step
+ * is not a target, so its work runs again.
+ * PROPOSED: a forEach step and its children never join and are never targets, because a forEach key names its source
+ * by a request-local id. A joined step is never a target either, so a third duplicate joins the original step.
  */
 export function joinCandidates(state: ReadsState, revision: number): ReadJoinCandidate[] {
   return state.requests.filter(request => request.revision === revision).flatMap(request => request.phases.flatMap(phase => phase.steps
     .filter(step => step.join === undefined && step.forEach === undefined && step.item === undefined && JOINABLE.has(step.status))
-    .map(step => ({ key: step.key, requestId: request.id, stepId: step.id, status: step.status, ...(step.output ? { output: step.output } : {}) }))));
+    .map(step => ({ key: step.key, requestId: request.id, stepId: step.id, status: step.status, ...(step.list ? { list: true as const } : {}),
+      ...(step.output ? { output: step.output } : {}) }))));
 }
 
 /**
@@ -169,12 +178,13 @@ export function applyReadEvent(state: ReadsState, eventInput: unknown): ReadTran
   const step = findStep(request, event.stepId);
   if (!step) return refuse("unknown-step", `Request ${event.requestId} has no step ${event.stepId}.`);
   if (event.type === "start") {
+    // PROPOSED: a start for a running step records a new attempt's member id, and a start whose member id the step
+    // already holds changes nothing, whatever its status, so a journal replays. When to retry is a later slice.
     if (step.memberIds.includes(event.memberId)) return { ok: true, state, changed: false };
     if (step.status === "running" && step.memberIds.length >= READS_LIMITS.memberIds) {
       return refuse("member-limit", `Step ${step.id} already holds ${READS_LIMITS.memberIds} member ids.`);
     }
     if (step.status !== "queued" && step.status !== "running") return refuse("not-startable", `Step ${step.id} is ${step.status}; only a queued step starts.`);
-    // PROPOSED: a start for a running step records the new attempt's member id. When to retry is a later slice.
     return change(state, event.requestId, event.stepId, next => {
       next.status = "running";
       next.memberIds.push(event.memberId);
@@ -200,13 +210,15 @@ export function applyReadEvent(state: ReadsState, eventInput: unknown): ReadTran
 
 function admit(state: ReadsState, event: AdmitEvent): ReadTransition {
   const existing = state.requests.find(request => request.id === event.requestId);
-  if (existing) {
-    return JSON.stringify(fingerprint(existing)) === JSON.stringify(eventFingerprint(event))
-      ? { ok: true, state, changed: false }
-      : refuse("conflicting-admission", `Request ${event.requestId} was admitted with other content.`);
-  }
   const problem = inputProblem(event);
   if (problem) return problem;
+  const digest = admissionDigest(event);
+  // PROPOSED: a replayed admission must match the first on everything except `allowanceLeft`, compared by digest. Any
+  // other difference is refused with `conflicting-admission`, and the first admission's phases stand.
+  if (existing) {
+    return existing.digest === digest ? { ok: true, state, changed: false }
+      : refuse("conflicting-admission", `Request ${event.requestId} was admitted with other content.`);
+  }
   if (state.requests.length >= READS_LIMITS.requests) return refuse("request-limit", `The run already holds ${READS_LIMITS.requests} read requests.`);
   const next = structuredClone(state);
   // Part 3: whole phases in order while the running sum fits the allowance; the rest are `refused: allowance`.
@@ -224,7 +236,9 @@ function admit(state: ReadsState, event: AdmitEvent): ReadTransition {
     };
   });
   const { role } = event.requester;
-  next.requests.push({ id: event.requestId, revision: event.revision, requester: { ...event.requester }, depth: role === "project-manager" ? 1 : 2, status: "running", phases });
+  next.requests.push({
+    id: event.requestId, revision: event.revision, requester: { ...event.requester }, depth: role === "project-manager" ? 1 : 2, digest, status: "running", phases,
+  });
   advance(next);
   return { ok: true, state: next, changed: true };
 }
@@ -233,8 +247,10 @@ function newStep(state: ReadsState, event: AdmitEvent, step: ReadRequest["phases
   const key = event.keys[step.id];
   const base: ReadStepState = { id: step.id, key, status: admitted ? "pending" : "refused", memberIds: [], ...(step.output === "list" ? { list: true as const } : {}) };
   if (step.forEach) return { ...base, forEach: { source: step.forEach.step, maxItems: step.forEach.maxItems } };
-  // Part 3: a late duplicate joins the earlier step instead of running again.
-  const target = admitted ? joinCandidates(state, event.revision).find(candidate => candidate.key === key) : undefined;
+  // Part 3: a late duplicate joins the earlier step instead of running again. The key encodes the output, so the list
+  // flag always agrees in a state the engine wrote; checking it keeps a stored state with an altered key safe.
+  const list = step.output === "list";
+  const target = admitted ? joinCandidates(state, event.revision).find(candidate => candidate.key === key && (candidate.list === true) === list) : undefined;
   return target ? { ...base, join: { requestId: target.requestId, stepId: target.stepId } } : base;
 }
 
@@ -246,26 +262,26 @@ function inputProblem(event: AdmitEvent): ReadTransition | undefined {
   if (!keysMatch || JSON.stringify(expandedTotal(event.request).phases) !== JSON.stringify(event.phaseTotals)) {
     return refuse("inconsistent-input", "The step keys or phase totals do not match the request.");
   }
+  // Slice 1's validator refuses two steps with one key (`repeated-step`), so a validated request never holds them.
+  if (new Set(steps.map(({ step }) => event.keys[step.id])).size !== steps.length) return refuse("inconsistent-input", "Two steps of the request share a key.");
   for (const { step, phase } of steps) {
     if (!step.forEach) continue;
     const source = steps.find(candidate => candidate.step.id === step.forEach?.step);
     if (!source || source.phase >= phase || source.step.output !== "list") {
       return refuse("inconsistent-input", `Step ${step.id} names a forEach source that is not a list of an earlier phase.`);
     }
-    // PROPOSED: the design defines no item count for a forEach over another forEach's children, so it is refused.
+    // PROPOSED: a forEach over another forEach is refused with `nested-for-each`, because the design gives no total or
+    // item count for it. Slice 1's validator refuses it as well.
     if (source.step.forEach) return refuse("nested-for-each", `Step ${step.id} iterates over forEach step ${source.step.id}.`);
   }
   return undefined;
 }
 
-function fingerprint(request: ReadRequestState): unknown {
-  return [request.revision, request.requester.role, request.requester.memberId,
-    request.phases.map(phase => [phase.id, phase.steps.filter(step => step.item === undefined).map(step => [step.id, step.key])])];
-}
-
-function eventFingerprint(event: AdmitEvent): unknown {
-  return [event.revision, event.requester.role, event.requester.memberId,
-    event.request.phases.map(phase => [phase.id, phase.steps.map(step => [step.id, event.keys[step.id] ?? null])])];
+/** SHA-256 over sorted-key JSON of what an admission decides from. The allowance is left out: it is neutral on a replay. */
+function admissionDigest(event: AdmitEvent): string {
+  const material = JSON.stringify([event.revision, event.requester, event.request], (_, value: unknown) =>
+    value && typeof value === "object" && !Array.isArray(value) ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => (a < b ? -1 : 1))) : value);
+  return createHash("sha256").update(material).digest("hex");
 }
 
 function change(state: ReadsState, requestId: string, stepId: string, edit: (step: ReadStepState) => void): ReadTransition {
@@ -299,9 +315,10 @@ function advance(state: ReadsState): void {
 
 /**
  * A forEach step expands when its phase starts: one child per item of its settled source, up to maxItems, and the
- * rest recorded as truncated. A failed or empty source expands to nothing. PROPOSED: a joined source counts the item
- * count it mirrored from its target. PROPOSED: a joined step whose target already settled mirrors it when its own
- * phase starts, never earlier.
+ * rest recorded as truncated. A failed or empty source expands to nothing.
+ * PROPOSED: a forEach over a joined list counts the item count the joined step mirrored from its target.
+ * PROPOSED: a joined step shows its target's result only when its own phase starts, never earlier. The design says it
+ * settles when the step it joined settles; this keeps phase order for a joined step in a later phase.
  */
 function startPhase(request: ReadRequestState, phase: ReadPhaseState): void {
   phase.status = "started";
@@ -349,6 +366,8 @@ const IN_PHASE: Record<ReadPhaseState["status"], ReadonlySet<string>> = {
   settled: new Set(["complete", "partial", "failed", "expanded"]),
 };
 const RAN: ReadonlySet<string> = new Set(["running", "complete", "partial", "failed"]);
+// A target may fail after the join. A target in any other status could never settle, so its joined step would wait forever.
+const JOIN_TARGET: ReadonlySet<string> = new Set(["queued", "running", "complete", "partial", "failed"]);
 
 /** The rules every transition keeps. Messages name indices only, never stored text. */
 function integrity(state: ReadsState): string | undefined {
@@ -363,9 +382,13 @@ function integrity(state: ReadsState): string | undefined {
     if (request.status !== (/^r+$/.test(shape) ? "refused" : shape.includes("t") ? "running" : "ended")) return `${at} has a status that does not match its phases`;
     const all = request.phases.flatMap(phase => phase.steps);
     if (new Set(all.map(step => step.id)).size !== all.length) return `${at} repeats a step id`;
+    const tops = all.filter(step => !step.id.includes("."));
+    if (new Set(tops.map(step => step.key)).size !== tops.length) return `${at} repeats a step key`;
     for (const [p, phase] of request.phases.entries()) {
       const where = `${at}.phases[${p}]`;
       if ((phase.status === "refused") !== (phase.reason === "allowance")) return `${where} has a reason that does not match its status`;
+      // A request phase has at most 6 steps, which bounds the children a phase can expand to.
+      if (phase.steps.filter(step => !step.id.includes(".")).length > 6) return `${where} holds more than 6 steps`;
       if (phase.status === "started" && phase.steps.every(step => SETTLED.has(step.status) || step.status === "expanded")) return `${where} is started with every step settled`;
       for (const [s, step] of phase.steps.entries()) {
         const problem = stepProblem(state, r, p, step);
@@ -399,6 +422,8 @@ function stepProblem(state: ReadsState, r: number, p: number, step: ReadStepStat
   const target = findStep(state.requests[targetIndex], step.join.stepId);
   if (!target || targetIndex >= r || state.requests[targetIndex].revision !== request.revision || target.key !== step.key
     || target.join || target.forEach || target.item !== undefined) return "joins a step that is not an earlier step of its revision with its key";
+  if (!JOIN_TARGET.has(target.status)) return "joins a step that can no longer settle";
+  if (step.list !== target.list) return "disagrees on the list flag with the step it joined";
   if (step.status === "pending") return undefined;
   const mirrored = SETTLED.has(target.status)
     ? step.status === target.status && step.output === target.output && step.items === target.items

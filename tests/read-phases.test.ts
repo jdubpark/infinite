@@ -207,13 +207,13 @@ test("joinCandidates lists the steps the grant's activeSteps come from", () => {
   let state = run(empty(), admit(REQ_A, request([step("scan"), list("items")], [fan("fan", "items", 2), step("later")])), start(REQ_A, "scan"));
   assert.deepEqual(joinCandidates(state, 1), [
     { key: stepKey(step("scan")), requestId: REQ_A, stepId: "scan", status: "running" },
-    { key: stepKey(list("items")), requestId: REQ_A, stepId: "items", status: "queued" },
+    { key: stepKey(list("items")), requestId: REQ_A, stepId: "items", status: "queued", list: true },
   ]);
   assert.deepEqual(joinCandidates(state, 2), []);
   state = run(state, done(REQ_A, "scan", 1), start(REQ_A, "items", 2), settle(REQ_A, "items", "partial", { output: handle(2), items: 3 }));
   assert.deepEqual(joinCandidates(state, 1), [
     { key: stepKey(step("scan")), requestId: REQ_A, stepId: "scan", status: "complete", output: handle(1) },
-    { key: stepKey(list("items")), requestId: REQ_A, stepId: "items", status: "partial", output: handle(2) },
+    { key: stepKey(list("items")), requestId: REQ_A, stepId: "items", status: "partial", list: true, output: handle(2) },
     { key: stepKey(step("later")), requestId: REQ_A, stepId: "later", status: "queued" },
   ]);
 });
@@ -331,6 +331,7 @@ test("events that do not apply return a named refusal and leave the state as it 
     ["a wrong key", { ...admitted, keys: { x: "0".repeat(64) } }, "inconsistent-input"],
     ["an extra key", { ...admitted, keys: { x: stepKey(step("x")), y: "0".repeat(64) } }, "inconsistent-input"],
     ["wrong phase totals", { ...admitted, phaseTotals: [2] }, "inconsistent-input"],
+    ["two steps with one key", admit(REQ_C, request([step("x"), step("y", { instructions: "Read the x code." })])), "inconsistent-input"],
     ["a forEach over a missing step", admit(REQ_C, request([list("items")], [fan("fan", "ghost", 2)])), "inconsistent-input"],
     ["a forEach over a step that is not a list", admit(REQ_C, parts("other", "other")), "inconsistent-input"],
     ["a forEach over a list of the same phase", admit(REQ_C, request([list("items"), fan("fan", "items", 2)])), "inconsistent-input"],
@@ -368,6 +369,25 @@ test("a run holds at most 32 requests, and a replayed admission at the cap is un
   assert.equal(refused.ok ? "ok" : refused.code, "request-limit");
   const replay = applyReadEvent(state, admit(uid(500), request([step("s0")]), { allowance: 0 }));
   assert.ok(replay.ok && !replay.changed && replay.state === state);
+});
+
+test("a replayed admission is checked against its input first, then against what was admitted", () => {
+  const first = request([list("items")], [fan("fan", "items", 1)]);
+  const state = deepFreeze(run(empty(), admit(REQ_A, first, { allowance: 2 })));
+  const before = JSON.stringify(state);
+  const code = (event: unknown) => { const result = applyReadEvent(state, event); return result.ok ? (result.changed ? "changed" : "unchanged") : result.code; };
+  assert.equal(code(admit(REQ_A, request([list("items")], [fan("fan", "items", 8)]), { allowance: 9 })), "conflicting-admission");
+  const renamed = request([step("items", { output: "list", instructions: "List other items." })], [fan("fan", "items", 1)]);
+  assert.equal(code({ ...admit(REQ_A, renamed), keys: admit(REQ_A, first).keys, phaseTotals: [0] }), "inconsistent-input");
+  assert.equal(code(admit(REQ_A, { ...first, summary: "Another reason." })), "conflicting-admission");
+  assert.equal(code(admit(REQ_A, first, { allowance: 0 })), "unchanged");
+  assert.equal(code(admit(REQ_A, first, { allowance: 40 })), "unchanged");
+  assert.equal(JSON.stringify(state), before);
+  assert.deepEqual(phasesOf(state, REQ_A), ["started", "pending"]);
+  assert.equal(stepOf(state, REQ_A, "fan").forEach?.maxItems, 1);
+  // The stored digest stands in for the request: no summary, title or brief is kept.
+  assert.match(requestOf(state, REQ_A).digest, /^[0-9a-f]{64}$/);
+  for (const text of ["Gather evidence", "List the items", "Read items", "Read fan"]) assert.ok(!before.includes(text), text);
 });
 
 test("applying a valid event twice gives the state of applying it once, and replaying a journal changes nothing", () => {
@@ -416,8 +436,8 @@ function parseError(value: unknown): string {
   return parsed.ok ? "" : parsed.error;
 }
 
-function edited(edit: (state: ReadsState) => void): unknown {
-  const copy = structuredClone(fixture()) as ReadsState;
+function edited(edit: (state: ReadsState) => void, base: ReadsState = fixture()): unknown {
+  const copy = structuredClone(base) as ReadsState;
   edit(copy);
   return JSON.parse(JSON.stringify(copy));
 }
@@ -508,8 +528,43 @@ test("the stored-state parser refuses a state that breaks a cross-field rule", (
     ["an expanded step without forEach", state => { delete step(state, 1, 0).forEach; }, "expanded without forEach"],
     ["a forEach step that runs", state => { step(state, 1, 0).status = "running"; step(state, 1, 0).memberIds = [member(1)]; }, "forEach step that ran itself"],
     ["a forEach over a findings step", state => { step(state, 1, 0).forEach!.source = "a"; }, "names a source that is not a list"],
+    ["seven steps in a phase", state => { for (let index = 1; index < 7; index += 1) a(state).phases[2].steps.push({ ...step(state, 2, 0), id: `c${index}`,
+      key: String(index).repeat(64) }); }, "holds more than 6 steps"],
+    ["two steps with one key", state => { step(state, 2, 0).key = step(state, 0, 0).key; }, "repeats a step key"],
   ];
   for (const [name, edit, expected] of cases) assert.ok(parseError(edited(edit)).includes(expected), name);
+});
+
+test("the stored-state parser refuses a join that could deadlock or break a later state", () => {
+  const dup = (id: string, instructions: string, output: "findings" | "list" = "findings") => step(id, { instructions, output });
+  // Review round 1: a joined step whose target sits in a refused request would wait forever.
+  const queued = run(empty(), admit(REQ_A, request([step("a")]), { allowance: 1 }), admit(REQ_B, request([dup("x", "Read the a code.")])));
+  assert.deepEqual(stepOf(queued, REQ_B, "x").join, { requestId: REQ_A, stepId: "a" });
+  assert.ok(parseError(edited(({ requests: [target] }) => {
+    Object.assign(target, { status: "refused" });
+    Object.assign(target.phases[0], { status: "refused", reason: "allowance" });
+    target.phases[0].steps[0].status = "refused";
+  }, queued)).includes("joins a step that can no longer settle"));
+  // A pending target is never a join target either.
+  const pending = run(empty(), admit(REQ_A, request([step("first")], [step("scan")])), admit(REQ_B, request([dup("x", "Read the scan code.")])));
+  assert.ok(parseError(edited(state => { Object.assign(state.requests[1].phases[0].steps[0], { status: "joined", join: { requestId: REQ_A, stepId: "scan" } }); }, pending))
+    .includes("joins a step that can no longer settle"));
+  // Review round 1: a joined list step without the list flag would mirror an item count the schema then refuses.
+  const lists = run(empty(), admit(REQ_A, request([list("items")])), admit(REQ_B, request([dup("mine", "List the items items.", "list")])));
+  assert.deepEqual(stepOf(lists, REQ_B, "mine").join, { requestId: REQ_A, stepId: "items" });
+  assert.ok(parseError(edited(state => { delete state.requests[1].phases[0].steps[0].list; }, lists)).includes("list flag"));
+  assert.ok(parseError(edited(state => { delete state.requests[0].phases[0].steps[0].list; }, lists)).includes("list flag"));
+  // A target may fail after the join: the pending joined step then mirrors the failure.
+  const later = run(empty(), admit(REQ_A, request([step("a")])), start(REQ_A, "a"), admit(REQ_B, request([step("first")], [dup("x", "Read the a code.")])));
+  const failed = run(later, settle(REQ_A, "a", "failed"));
+  assert.ok(parseReadsState(JSON.parse(JSON.stringify(failed))).ok);
+  assert.equal(stepOf(run(failed, start(REQ_B, "first"), done(REQ_B, "first", 1)), REQ_B, "x").status, "failed");
+  // Found by the corruption check: a stored list step whose key was changed to a findings key is never joined by a findings step.
+  const altered = parseReadsState(edited(state => { state.requests[0].phases[0].steps[0].key = stepKey(step("scan")); }, run(empty(), admit(REQ_A, request([list("items")])))));
+  assert.ok(altered.ok);
+  const joinedLater = run(altered.state, admit(REQ_B, request([step("scan")])));
+  assert.equal(stepOf(joinedLater, REQ_B, "scan").join, undefined);
+  assert.ok(parseReadsState(joinedLater).ok);
 });
 
 // ---- Seeded simulator ----
@@ -561,8 +616,12 @@ function randomSettle(sim: Sim, target: Located): Event {
   return settle(target.requestId, target.step.id, status, { output: fresh(sim), ...(target.step.list ? { items: Math.floor(sim.random() * 33) } : {}) });
 }
 
+function allSteps(state: ReadsState): Located[] {
+  return state.requests.flatMap(item => item.phases.flatMap(phase => phase.steps.map(entry => ({ requestId: item.id, step: entry }))));
+}
+
 function nextEvent(sim: Sim, state: ReadsState): unknown {
-  const steps: Located[] = state.requests.flatMap(item => item.phases.flatMap(phase => phase.steps.map(entry => ({ requestId: item.id, step: entry }))));
+  const steps = allSteps(state);
   const having = (status: string) => steps.filter(item => item.step.status === status);
   const roll = sim.random();
   if (roll < 0.12 || steps.length === 0) {
@@ -600,12 +659,94 @@ function nextEvent(sim: Sim, state: ReadsState): unknown {
   }
 }
 
+const STATUSES = ["pending", "queued", "running", "joined", "complete", "partial", "failed", "expanded", "refused"] as const;
+const CORRUPT_EVERY = 4;
+
+const CHANGES = ["step status", "step key", "list flag", "join", "join to a step with the same key", "join request", "join removed", "output",
+  "items", "member ids", "forEach source", "maxItems", "truncated", "item", "request status", "revision", "depth", "request id", "phase status",
+  "phase reason", "step removed"] as const;
+
+/** One random change to a copy of a state the engine produced, or undefined when the change altered nothing. */
+function corrupt(side: Sim, state: ReadsState): { state: ReadsState; change: string } | undefined {
+  const copy = structuredClone(state);
+  const steps = allSteps(copy);
+  if (steps.length === 0) return undefined;
+  const change = pick(side, CHANGES);
+  const joined = steps.filter(item => item.step.join);
+  const chosen = change.startsWith("join") && joined.length > 0 ? pick(side, joined) : pick(side, steps);
+  const target = chosen.step;
+  const request = copy.requests.find(item => item.id === chosen.requestId)!;
+  const phase = request.phases.find(item => item.steps.includes(target))!;
+  const others = steps.filter(item => item.step !== target);
+  const other = others.length > 0 ? pick(side, others) : chosen;
+  const twins = others.filter(item => item.step.key === target.key);
+  const count = (max: number) => Math.floor(side.random() * (max + 1));
+  const edits: Record<(typeof CHANGES)[number], () => void> = {
+    "step status": () => { target.status = pick(side, STATUSES); },
+    "step key": () => { target.key = other.step.key; },
+    "list flag": () => { if (target.list) delete target.list; else target.list = true; },
+    "join": () => { target.join = { requestId: other.requestId, stepId: other.step.id }; },
+    "join to a step with the same key": () => {
+      const twin = twins.length > 0 ? pick(side, twins) : other;
+      target.join = { requestId: twin.requestId, stepId: twin.step.id };
+    },
+    "join request": () => { if (target.join) target.join.requestId = pick(side, copy.requests).id; },
+    "join removed": () => { delete target.join; },
+    "output": () => { if (target.output) delete target.output; else target.output = fresh(side); },
+    "items": () => { if (target.items !== undefined && side.random() < 0.5) delete target.items; else target.items = count(32); },
+    "member ids": () => { target.memberIds = target.memberIds.length > 0 ? [] : [fresh(side)]; },
+    "forEach source": () => { if (target.forEach) target.forEach.source = other.step.id; },
+    "maxItems": () => { if (target.forEach) target.forEach.maxItems = 1 + count(15); },
+    "truncated": () => { if (target.forEach) target.forEach.truncated = count(32); },
+    "item": () => { target.item = count(15); },
+    "request status": () => { request.status = pick(side, ["running", "ended", "refused"] as const); },
+    "revision": () => { request.revision = pick(side, copy.requests).revision + count(1); },
+    "depth": () => { request.depth = request.depth === 1 ? 2 : 1; },
+    "request id": () => { request.id = pick(side, copy.requests).id; },
+    "phase status": () => { phase.status = pick(side, ["pending", "started", "settled", "refused"] as const); },
+    "phase reason": () => { if (phase.reason) delete phase.reason; else phase.reason = "allowance"; },
+    "step removed": () => { if (phase.steps.length > 1) phase.steps.splice(phase.steps.indexOf(target), 1); },
+  };
+  edits[change]();
+  if (JSON.stringify(copy) === JSON.stringify(state)) return undefined;
+  return { state: copy, change: `${change} (request ${state.requests.findIndex(item => item.id === chosen.requestId)}, step ${target.id})` };
+}
+
+/** A corrupted state is refused by the parser, or every later event keeps it parsing and every request can still end. */
+function corruptionFinding(side: Sim, state: ReadsState): string | undefined {
+  const corrupted = corrupt(side, state);
+  if (!corrupted) return undefined;
+  const parsed = parseReadsState(JSON.parse(JSON.stringify(corrupted.state)));
+  if (!parsed.ok) return undefined;
+  let current = parsed.state;
+  const apply = (event: unknown, valid: boolean): string | undefined => {
+    const result = applyReadEvent(current, event);
+    if (!result.ok) return valid ? `after ${corrupted.change}, a valid event was refused with ${result.code}` : undefined;
+    if (!parseReadsState(result.state).ok) return `after ${corrupted.change}, an event produced a state that does not parse`;
+    current = result.state;
+    return undefined;
+  };
+  for (let index = 0; index < 4; index += 1) {
+    const problem = apply(nextEvent(side, current), false);
+    if (problem) return problem;
+  }
+  for (let index = 0; index < 5000; index += 1) {
+    const live = allSteps(current).find(item => item.step.status === "queued" || item.step.status === "running");
+    if (!live) break;
+    const problem = apply(live.step.status === "queued"
+      ? { type: "start", requestId: live.requestId, stepId: live.step.id, memberId: fresh(side) }
+      : settle(live.requestId, live.step.id, "complete", { output: fresh(side), ...(live.step.list ? { items: Math.floor(side.random() * 33) } : {}) }), true);
+    if (problem) return problem;
+  }
+  return current.requests.some(item => item.status === "running") ? `after ${corrupted.change}, a request can never end` : undefined;
+}
+
 function located(state: ReadsState): Map<string, ReadStepState> {
   return new Map(state.requests.flatMap(item => item.phases.flatMap(phase => phase.steps.map(entry => [`${item.id}/${entry.id}`, entry] as const))));
 }
 
 function overlong(value: unknown, field = ""): boolean {
-  if (typeof value === "string") return value.length > (field === "key" ? 64 : 43);
+  if (typeof value === "string") return value.length > (field === "key" || field === "digest" ? 64 : 43);
   if (Array.isArray(value)) return value.some(item => overlong(item, field));
   if (value && typeof value === "object") return Object.entries(value).some(([name, inner]) => overlong(inner, name));
   return false;
@@ -658,6 +799,8 @@ function violations(previous: ReadsState, next: ReadsState, sim: Sim): string[] 
 
 function simulate(seed: number): void {
   const sim: Sim = { random: mulberry32(seed), counter: 0, settled: new Map(), admitted: [] };
+  // The corruption check draws from its own generator, so it never changes the main sequence.
+  const side: Sim = { random: mulberry32(seed + 1_000_003), counter: 500_000, settled: new Map(), admitted: [] };
   let state = emptyReadsState();
   const journal: unknown[] = [];
   for (let index = 0; index < 60; index += 1) {
@@ -679,6 +822,10 @@ function simulate(seed: number): void {
     assert.deepEqual(broken, [], `${label} broke: ${broken.join(", ")}`);
     if (result.changed) journal.push(event);
     state = result.state;
+    if (index % CORRUPT_EVERY === 0) {
+      const finding = corruptionFinding(side, state);
+      assert.equal(finding, undefined, `${label}: ${finding}`);
+    }
   }
   for (const event of journal) {
     const replay = applyReadEvent(state, event);
@@ -686,7 +833,7 @@ function simulate(seed: number): void {
   }
 }
 
-test("seeded simulator: random requests and event interleavings keep every invariant", () => {
+test("seeded simulator: random requests and event interleavings keep every invariant, and corrupted states stay safe", () => {
   const only = process.env.READ_PHASES_SEED;
   const seeds = only ? [Number(only)] : Array.from({ length: 300 }, (_, index) => index + 1);
   for (const seed of seeds) {

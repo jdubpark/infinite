@@ -5674,7 +5674,8 @@ export class TeamService {
         await this.enqueue(() => { if (!this.closed) { run.checks.push(check); this.save(stored); } });
         const scanner = new CheckOutputScanner();
         const result = await teamCommand(entry.command, verification.workspace, signal, (this.config.teams?.checkMinutes ?? 60) * 60000, this.config.teams?.commandPrefix, undefined, undefined, undefined, (chunk, stream) => scanner.push(chunk, stream));
-        Object.assign(check, { status: result.interrupted ? "interrupted" : result.exitCode === 0 ? "passed" : "failed", finishedAt: timestamp(), exitCode: result.exitCode, output: result.output, scan: scanner.finish() });
+        const status = result.interrupted ? "interrupted" : result.exitCode === 0 ? "passed" : "failed";
+        Object.assign(check, { status, finishedAt: timestamp(), exitCode: result.exitCode, output: result.output, ...(status === "passed" ? {} : { scan: scanner.finish() }) });
         results.push(check);
         await this.enqueue(() => { if (!this.closed) this.save(stored); });
         if (!signal.aborted) await assertMemberReadOnly(verification.workspace, head, this.config.teams?.commandPrefix, signal, context);

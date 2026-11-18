@@ -1544,7 +1544,7 @@ test("an unchanged required-check failure stops after one repair and owner Conti
     assert.deepEqual([context.runId, context.revision], [blocked.id, blocked.revision]);
     assert.match(context.objective, /Create independent files/);
     assert.match(context.feedback, /Configured verification failed/);
-    assert.match(context.feedback, /Check 1: failed, exit 17/);
+    assert.match(context.feedback, /Check 1: failed, exit 17/); assert.ok(context.checks.every(check => (check.status === "passed") !== ("scan" in check)), "only checks that did not pass carry scan");
 
     const key = readFileSync(f.host.config.keyFile);
     const storedFile = join(f.host.config.stateDir, "teams", `${blocked.id}.sealed`);

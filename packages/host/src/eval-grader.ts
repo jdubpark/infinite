@@ -52,15 +52,15 @@ const probeSchema = z.object({
   version: z.number().int().optional(),
 });
 
-type Spawned = { code: number | null; out: Buffer; truncated: boolean; overflow: boolean; failed: boolean; elapsedMs: number };
-type Channel = { held: boolean; graceMs: number };
+export type Spawned = { code: number | null; out: Buffer; truncated: boolean; overflow: boolean; failed: boolean; elapsedMs: number };
+export type Channel = { held: boolean; graceMs: number };
 
 /**
  * Runs one launcher operation. The host never signals the child: it runs as another account behind sudo. A call that
  * does not close within its limit plus the grace counts as failed, and the channel stays held until the child closes,
- * so no further call starts meanwhile.
+ * so no further call starts meanwhile. The eval identity's client uses it too.
  */
-function launch(
+export function launch(
   channel: Channel,
   prefix: EvalGraderConfig["prefix"],
   operation: string,

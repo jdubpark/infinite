@@ -142,6 +142,9 @@ const providerIndex = process.argv.indexOf("--fixture-provider");
 const receipt = { ...assignment, cwd: process.cwd(), pid: process.pid, startedAt: Date.now(),
   ...(process.env.INFINITE_TRUSTED_WORKSPACE ? { trustedWorkspace: process.env.INFINITE_TRUSTED_WORKSPACE } : {}),
   ...(providerIndex >= 0 ? { provider: process.argv[providerIndex + 1], argv: process.argv.slice(2) } : {}) };
+// A test that writes record-context keeps a copy of each member's context file.
+if (existsSync(join(receiptDir, "record-context")) && existsSync(join(".git", "infinite-team-context.json")))
+  writeFileSync(join(receiptDir, `${assignment.memberId}.context.json`), readFileSync(join(".git", "infinite-team-context.json")), { mode: 0o600 });
 if (receipt.provider === "opencode") {
   const args = process.argv.slice(providerIndex + 2), boundary = args.indexOf("--");
   if (args[0] !== "run" || boundary < 1 || boundary !== args.length - 2

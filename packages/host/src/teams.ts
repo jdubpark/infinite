@@ -15,7 +15,7 @@ import { PROVIDER_NAMES, recoveryTurnEnd, type Prompt, type SignalData } from "@
 import { autonomyOf, type AutonomyMode } from "./autonomy.js";
 import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionAgentDecision, type TeamPermissionDecision, type TeamPermissionRecoveryOutcome, type TeamPermissionRecoveryRequest, type TeamPermissionRecoveryStep, type TeamPermissionRecoveryView, type TeamPublication, type TeamPublicationCategory, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, ACTIVE_MEMBER_STATUSES, currentPermissions, DEFAULT_STORAGE_FLOOR, DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, autoPinned, coversPoint, escalationPool, hostProfilesFor, memberLimit, switchFallback } from "./team-types.js";
 import { memberConfiguration, type MemberConfiguration } from "./config-identity.js";
-import { ownerDirectionLines, permissionFollowUpPrompt, refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
+import { ownerDirectionLines, permissionFollowUpPrompt, refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt, withoutRouting } from "./team-prompts.js";
 import { reviewEvidenceProblems } from "./team-acceptance.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { resumeFailed } from "./native-continuation.js";
@@ -442,9 +442,9 @@ const configuredData = (data: MemberConfiguration) => ({
 });
 /** Milliseconds since the member last showed attention activity, or since it started before any was observed. */
 const quietFor = (member: TeamMember) => Date.now() - Date.parse(member.lastActivityAt ?? member.startedAt ?? timestamp());
-// The flag is persisted on the member at creation, so a recovered or stopped session keeps the fingerprint it launched with.
-const assignment = (member: TeamMember): TeamAssignment => ({ runId: member.runId, memberId: member.memberId, revision: member.revision, role: member.role, ...(member.taskId ? { taskId: member.taskId } : {}),
-  ...(member.verificationRefused ? { verificationRefused: true } : {}), ...(member.entryTools ? { entryTools: true as const } : {}), ...(member.hostProfiles ? { hostProfiles: true as const } : {}) });
+// The flags are persisted on the member at creation, so a recovered or stopped session keeps the fingerprint it launched with. Text an agent reads (`agentText`) leaves out hostProfiles.
+const assignment = (member: TeamMember, agentText = false): TeamAssignment => ({ runId: member.runId, memberId: member.memberId, revision: member.revision, role: member.role, ...(member.taskId ? { taskId: member.taskId } : {}),
+  ...(member.verificationRefused ? { verificationRefused: true } : {}), ...(member.entryTools ? { entryTools: true as const } : {}), ...(member.hostProfiles && !agentText ? { hostProfiles: true as const } : {}) });
 
 /** Durable orchestration; reports describe agent claims, configured checks describe host evidence. */
 /** Delivery evidence may name the run branch (recorded before publication) or the branch the host published the head to. */
@@ -4383,7 +4383,7 @@ export class TeamService {
     }
     const permissionRecoveryHistory = this.permissionRecoveryHistory(run);
     const feedbackBase = { decisionId: decision.id, recoveryRequestId: recovery?.id ?? null, reviewPurpose: decision.purpose,
-      targetAssignment: assignment(target), targetCwd: decision.targetCwd, targetScratchDirectory: target.scratchDirectory ?? null, targetTask: task ?? null,
+      targetAssignment: assignment(target, true), targetCwd: decision.targetCwd, targetScratchDirectory: target.scratchDirectory ?? null, targetTask: task ? withoutRouting(task) : null,
       targetChangedPaths: changedPaths.slice(0, 100), targetChangedPathCount: changedPaths.length, acceptedChecks,
       permissionEvidence, deliveryAuthority, prompt: decision.prompt };
     const feedback = (history: TeamPermissionRecoveryView[]) => JSON.stringify({ ...feedbackBase, ...(history.length ? { priorPermissionRecovery: history } : {}) });
@@ -5126,7 +5126,7 @@ export class TeamService {
       const intentContext = member.role === "intent-checker" ? this.intentChecks.context(stored, member) : undefined; if (intentContext === null) return;
       const launchSeq = this.options?.entries?.launchMark(stored.run.id);
       const digest = intentContext ? undefined : this.options?.entries?.memberDigest(stored.run, member, launchSeq);
-      const contextBytes = await writeTeamContext(member.cwd, { ...(intentContext ?? teamContext(stored.run, member.contextFeedback, configuredProject, member.role, this.permissionRecoveryHistory(stored.run))), ...(digest ? { entries: digest } : {}), assignment: assignment(member), memberBaseCommit: member.baseCommit, scratchDirectory: member.scratchDirectory }, this.config.teams?.commandPrefix);
+      const contextBytes = await writeTeamContext(member.cwd, { ...(intentContext ?? teamContext(stored.run, member.contextFeedback, configuredProject, member.role, this.permissionRecoveryHistory(stored.run))), ...(digest ? { entries: digest } : {}), assignment: assignment(member, true), memberBaseCommit: member.baseCommit, scratchDirectory: member.scratchDirectory }, this.config.teams?.commandPrefix);
       this.options?.entries?.recordLaunch(stored.run, member, { launchSeq, promptBytes: Buffer.byteLength(member.prompt, "utf8"), contextBytes, digestBytes: digest ? Buffer.byteLength(canonicalJson(digest), "utf8") : 0 });
     }
     // The launch is charged once, right before its session starts. A member whose session exists is a replay.

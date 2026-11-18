@@ -75,7 +75,7 @@ function withoutPrivateSettings<T extends object>(project: T): T {
   return copy as T;
 }
 /** A task or scout without its routing decision: no member reads which profile the router chose, or why. */
-function withoutRouting<T extends object>(item: T): T {
+export function withoutRouting<T extends object>(item: T): T {
   const { routing: _routing, ...rest } = item as T & { routing?: unknown };
   return rest as T;
 }

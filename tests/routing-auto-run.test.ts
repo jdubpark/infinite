@@ -191,6 +191,7 @@ test("an auto run routes its scouts and its escalation, and no member sees a rou
     writeFileSync(join(f.receipts, "explore-unnamed"), "");
     writeFileSync(join(f.receipts, "escalate-unnamed"), "");
     writeFileSync(join(f.receipts, "escalate-to"), "sonnet-escalation");
+    writeFileSync(join(f.receipts, "record-context"), "");
     const created = await teams.create(f.create());
     const settled = await settleAnswering(teams, created.id);
     await membersClosed(teams, created.id);
@@ -245,6 +246,16 @@ test("an auto run routes its scouts and its escalation, and no member sees a rou
     }
     for (const role of ["project-manager", "implementer", "reviewer"] as TeamMember["role"][])
       assert.ok(!JSON.stringify(teamContext(run, undefined, undefined, role)).includes('"routing":'), `the ${role} context carries routing`);
+    // The context files and the assignments the members read carry no hostProfiles, though the coordinator and the first implementer hold it.
+    assert.equal(coordinator?.hostProfiles, true, "the coordinator does not hold hostProfiles");
+    assert.equal(firstA?.hostProfiles, true, "the first implementer does not hold hostProfiles");
+    for (const member of [coordinator!, firstA!, scout]) {
+      const context = readFileSync(join(f.receipts, `${member.memberId}.context.json`), "utf8");
+      assert.ok(!context.includes('"hostProfiles"'), `the ${member.role} context file carries hostProfiles`);
+      assert.ok(!context.includes('"routing":'), `the ${member.role} context file carries routing`);
+      const launched = JSON.parse(readFileSync(join(f.receipts, `${member.memberId}.json`), "utf8")) as Record<string, unknown>;
+      assert.equal("hostProfiles" in launched, false, `the ${member.role} assignment carries hostProfiles`);
+    }
   } finally {
     await f.close();
     store.close();

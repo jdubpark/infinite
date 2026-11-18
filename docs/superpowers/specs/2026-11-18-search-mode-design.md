@@ -17,13 +17,13 @@ A measuring mode comes first. It records how often a first result fails its chec
 Read in `packages/host/src` on `main` on 2026-11-18:
 
 - **One member per task.** `TeamTask.memberId` names one member, and the dispatcher starts a member only for a `pending` task. `replaceStalledMember`, `switchLimitedMember`, and the `escalate` branch of `consume` each put one new member in the old one's place.
-- **A result integrates at once.** For an implementer `result`, `consume` calls `captureMemberResult` and then `integrateMemberResult`. No command runs between the two.
-- **Checks follow integration.** The host runs the run's required checks (`requiredChecks`) in a verification workspace when every task is integrated, and again after each correction round. A failed check, or a review that requests changes, starts a correction round (`repair`): a new integrator works on the integrated head, at most twice. A check that runs past its limit, or that fails again on an unchanged head, blocks the run instead.
+- **A result integrates in plan order.** For an implementer `result`, `consume` runs one workspace operation that calls `captureMemberResult` and then `integrateMemberResult`. No command runs between the two. The host does this only when every earlier task of the plan is integrated.
+- **Checks follow integration.** The host runs the run's required checks (`requiredChecks`) in a verification workspace when every task is integrated and no member is at work, and again after each correction round. A failed check, or a review that requests changes, starts a correction round (`repair`): a new integrator works on the integrated head, at most twice. A check that runs past its limit, or that fails again on an unchanged head, blocks the run instead. A check waits while the host-load hold is on.
 - **No check belongs to a task.** `teamTaskPlanSchema` has no check field and names no criterion.
 - **A criterion can name a command, and cannot yet pin a file.** A criterion of the objective record can hold a `command` check: the digest of a command in the project's configured checks or the run's accepted verification. The owner adds one when creating a goal or with a record correction. The stored criterion can hold up to 8 `pinned` files, whose change voids a met state. The owner's criterion input has no `pinned` field, so no criterion pins a file today. A goal cycle run pins a digest of its goal's record, with the record's version, when the objective switch is on. No route adds a criterion to a standalone run's record, and no code runs a command for a criterion.
 - **A retry keeps the working copy.** After a stall the host starts one replacement on the same profile in the same working copy. An escalation starts another profile in that working copy, with the first member's partial edits. No retry starts again from the base commit. A member has no runtime limit: the host replaces it only when it shows no activity.
-- **One workspace operation at a time.** A run has one workspace operation at a time (`operation`). The host records the operation's intent before it starts. After a host restart an unfinished operation is not replayed: the run blocks. An interrupted check is released only by an explicit reconciliation (`reconcileVerification`), which needs a quiet run and a process census that sees no process of that check.
-- **Limits.** `holdsWorkerSlot` counts implementers and scouts against `run.parallelism`, which is at most 4. `assertBudget` counts every entry in `run.members` against the run's attempt limit, and a goal run that reaches the limit stops. The router's `spareAttempts` is that limit, less the members so far, less one for each task not yet integrated, less three. Every member launch passes the spend fuse, which holds a launch-rate limit today.
+- **One workspace operation at a time.** A run has one workspace operation at a time (`operation`), and the host records the operation's intent before it starts. After a host restart an unfinished operation is not replayed, and the run blocks. The owner can reconcile an interrupted check (`reconcileVerification`). The run must be quiet. Where the host has a record of the check's processes, it refuses while it still sees one of them, or sees a process that uses the run's directory. The owner attests that the processes have stopped, and the check then runs again in a new workspace. The host stops a running command by killing its process group. Where a launcher does not let the host signal the group, the command runs on to its end, and the operation stays open until it closes.
+- **Limits.** `holdsWorkerSlot` counts implementers and scouts against `run.parallelism`, which is at most 4. `assertBudget` counts every entry in `run.members` against the run's attempt limit, and a goal run stops when a launch would exceed it. A goal's limit is 24 attempts by default, and its cycles share it. `assertBudget` also stops a goal run at its deadline, unless an approved extension applies. The router's `spareAttempts` is the run's limit, less the members so far, less one for each task not yet integrated, less three. The router explores only while that count is at or above `minSpareAttempts`, 4 by default. Every member launch passes the spend fuse, which holds a launch-rate limit today.
 - **Sources.** An outcome row has a source: `production`, `duel`, `replay`, or `legacy`. The router reads `production` and `duel` rows.
 - **Duels have no code.** The duels design specifies a capture that is not integrated, an objective gate in a verification clone, and isolation between two contestants. None of it is built.
 - **The ledger is small.** On 2026-11-18 the live host's ledger held 88 implementer rows from 31 runs since 2026-10-18. 65 of them came from a one-time backfill of runs whose records still existed. Of 87 first attempts, 83 were integrated, 2 reported a blocker, 1 escalated, and the host stopped 1. No row is a stall, a missing report, or a provider limit. 11 correction rounds ran in 9 runs, and 10 of them were backfilled without a cause or an end state. Nothing in the ledger says how often a first result fails one named check.
@@ -33,10 +33,10 @@ A field of a sibling design that is named here is defined in that design.
 ## Goals
 
 1. Up to four approved profiles of different families work one implementer task from the same commit, and a host-run command decides which result is integrated.
-2. The command is one the owner already authorized, it fails before any attempt starts, and no attempt can change the files that the owner pinned for it.
+2. The command is one the owner already authorized, it fails at the commit that every attempt starts from, and no attempt can change the files that the owner pinned for it.
 3. The attempts stay independent until one is chosen.
-4. A search stays inside the run's approved limits: its parallelism, its attempt limit, its deadline, and the spend fuse. It takes no attempt that the run's remaining tasks, its review, and its correction rounds are counted to need.
-5. A search that ends without a pass releases the task to today's single-attempt path. It holds a task's integration for at most its allowance (Part 7). The one exception is a host restart during a gate run, which blocks the run as an interrupted check does today (Failure modes).
+4. A search stays inside the run's approved limits: its parallelism, its attempt limit, its deadline, and the spend fuse. A challenger starts only while the run keeps a reserve of attempts (Part 7). The reserve is a rule of thumb. It covers the longest planned sequence after the last integration, and it does not cover a stall or an escalation on the way.
+5. A search that ends without a pass releases the task to today's single-attempt path. Its hold on a task ends at most its allowance after the champion's result arrived or the champion left (Part 7). The task is then scheduled as today, in plan order and behind the run's other operations. Two events break that bound: a host restart during a workspace operation of the search, and a gate run that the host cannot stop (Failure modes).
 6. The records show whether the mode pays before it spends, so the owner can keep it, narrow it, or turn it off.
 
 ## Non-goals
@@ -86,7 +86,7 @@ const teamSearchSchema = z.object({                          // read default:
 
 The routine digest hashes the project team configuration, so no key has a schema default, and the code applies each default at read (umbrella C11). The owner saves the policy through the route that saves `routing`. `createRun` pins a copy as `run.search`. The mode is `off` in every project until the owner sets it. *(My call: a search spends the run's own attempts, so autonomy mode does not turn it on.)*
 
-**Modes.** `measure` admits a search, runs the base run, and gates the first result after it is integrated as today. It holds nothing, starts no challenger, and changes no outcome row (Part 3). `live` holds the first result for its gate, and widens.
+**Modes.** `measure` admits a search and changes nothing in the task's handling. Before the run's final check round, the host runs the criterion's command at the task's base commit and at the first result's commit, and records both (Part 3). It starts no challenger, holds no result, and changes no outcome row. `live` runs the command at the base commit while the first attempt works, holds the first result for its gate, and widens.
 
 A task plan gains one optional field:
 
@@ -107,9 +107,9 @@ The coordinator names a criterion only when the task's result alone is expected 
 3. The task names a criterion, and no other task of the plan names the same one. In the run's record the criterion is active, its origin is `owner`, its check is a `command` with producer `host`, and it pins at least one file. The command is one of the run's required checks (`requiredChecks`).
 4. At the task's `baseCommit` every pinned file has the blob the record holds, and no pinned file matches the task's owned paths.
 5. The task has no duel, and its `start` routing decision is not exploratory. *(My call: one experiment per task, as in the duels design.)*
-6. The run has no search that is `wide`, and has had fewer than two searches. If the run has a deadline, the search's allowance fits before it (Part 7).
-7. Searches stay at or below `share` of the project's last 100 applied `start` decisions, and searches are not paused for the project (Part 8).
-8. The base run fails (Part 3).
+6. The run has no search that is `wide`, and has had fewer than two searches. Searches are not paused for the project (Part 8).
+7. In `live` mode, searches stay at or below `share` of the project's last 100 applied `start` decisions. If the run has a deadline, the search's allowance fits before it (Part 7). The share does not limit `measure`.
+8. In `live` mode, the base run fails (Part 3).
 
 Otherwise the task gets a single attempt as today, and the host counts the first failed condition per day.
 
@@ -119,7 +119,7 @@ Otherwise the task gets a single attempt as today, and the host counts the first
 
 9. No other search of the run is `wide`. The champion's family is known. Part 2 yields at least one challenger, and no provider limit is active for it.
 10. A worker slot is free that no ready task needs, and a host session slot is free. The host starts one challenger for each such pair of slots, up to `attempts − 1`.
-11. The run keeps its reserve: with the challengers counted as members, `spareAttempts(run)` is 0 or more. The host checks this before it prepares a challenger. It never asks `assertBudget` for an attempt that the limit would refuse, because a refused attempt stops a goal run. The spend fuse admits each launch (C13).
+11. The run keeps its reserve: with the challengers counted as members, `spareAttempts(run)` is 3 or more (Part 7). The host checks this before it prepares a challenger. It never asks `assertBudget` for an attempt that the limit would refuse, because a refused attempt stops a goal run. The spend fuse admits each launch (C13).
 12. If the run has a deadline, the rest of the allowance fits before it.
 
 ### Part 2: The contestants
@@ -130,23 +130,25 @@ Every contestant is a normal work member. It has purpose `work`, the task's owne
 
 ### Part 3: The gate
 
-The gate is the criterion's command. It is one of the run's required checks, so the owner authorized it and the host already runs it at the final check round. The host runs it in a gate clone: a verification clone at one commit, after the project's setup command. The command gets `gateMinutes`, or the limit of the final check round (`teams.checkMinutes`) when that is shorter.
+The gate is the criterion's command. It is one of the run's required checks, so the owner authorized it and the host already runs it at the final check round. The host runs it in a gate clone: a verification clone at one commit, after the project's setup command. The command gets `gateMinutes`, or the limit of the final check round (`teams.checkMinutes`) when that is shorter. A gate run waits while the host-load hold is on, as a check does.
 
-**A gate run is a workspace operation.** It holds the run's one operation slot, and the host records its intent before it starts, as it does for a check today. It is a new operation kind, `gate`. After a host restart an interrupted gate run is handled as an interrupted check is today, and it is never replayed (Failure modes).
+**A gate run is a workspace operation.** It holds the run's one operation slot, and the host records its intent before it starts, as it does for a check today. It is a new operation kind, `gate`. The host stops a gate run as it stops a check, and a stopped gate run has no result. Where the launcher does not let the host signal the command, the command runs on to its end, and the run's other operations wait for it, as they do behind such a check today. After a host restart an interrupted gate run is never replayed (Failure modes).
 
-**The base run.** When conditions 1 to 7 hold, the host writes `task.search` in state `admitting` and runs the gate at the task's `baseCommit`, while the champion works. The search goes on only when the command exits non-zero inside its limit, and it is then `armed`. A pass, a timeout, a failed setup, or an abort for the run's own work (Part 7) ends the search as `abandoned` with that reason, and the champion continues as a single attempt. A `result` that arrives while the base run is open is captured when that run ends, and it is then gated or integrated as the base run decided. Any other event that ends the champion's attempt in that time abandons the search. *(My call: a command that passes at the base cannot tell a right result from an empty one. One command run for each search buys that certainty for this exact commit.)*
+**The base run** is a gate run at the task's `baseCommit`. A search goes on only when the command exits non-zero inside its limit. A pass, a timeout, or a failed setup ends the search as `abandoned` with that reason. *(My call: a command that passes at the base cannot tell a right result from an empty one. One command run for each search buys that certainty for this exact commit.)*
 
-**A result in `live` mode.** When a contestant reports `result`, the host captures it with `captureMemberResult` and does not integrate it. In the order the captures completed, each capture meets three checks:
+**`live` mode: the base run.** When conditions 1 to 7 hold, the host writes `task.search` in state `admitting` and starts the base run while the champion works. It starts the base run only when the run has no workspace operation waiting, and it stops the base run when one arrives. That stop also ends the search as `abandoned`. After a failed base run the search is `armed`. A `result` that arrives before the base run has ended waits for it, and is then gated or integrated as the base run decided. Any other event that ends the champion's attempt in that time abandons the search.
+
+**`live` mode: a result.** When a contestant reports `result` and has stopped, the host captures the result with `captureMemberResult` and does not integrate it. The capture is a workspace operation with a recorded intent, as today's capture is. It does not wait for the task's turn in plan order. In the order the captures completed, each capture meets three checks:
 
 - **Scope.** A scope violation fails the contestant (`fail-scope`). It does not block the run while the search goes on. A pinned file lies outside the owned paths (condition 4), so a change to one is a scope violation.
 - **Empty.** An unchanged tree fails without a run (`fail-empty`), because the base already failed.
 - **Command.** The host runs the gate at the captured commit. Exit 0 inside the limit passes. Any other exit, a timeout, or a failed setup fails (`fail-check`).
 
-The first pass ends the search (Part 4). A captured result that has not been gated by then is never gated.
+The first pass ends the search (Part 4). A captured result that has not been gated by then is never gated. The result that passed is integrated in plan order, as a single attempt's result is.
 
 The same command runs again on the integrated head at the run's final check round, as today. A gate pass is therefore never the last check of a result, and a command that passed by chance gets a second run before review.
 
-**A result in `measure` mode.** The champion's result is integrated as today, without waiting. The host then puts the captured commit through the same three checks when the run has no workspace operation waiting, and records the result. It aborts that gate run when the run needs the slot, and records `skipped`. The result changes nothing in the run.
+**`measure` mode.** The champion's result is captured and integrated as today, in one operation. When every task of the plan is integrated and no member is at work, and before the first final check round of the revision, the host runs two gate runs for each `measure` search whose champion's result was integrated: the base run, and after a failed base run the gate at the champion's captured commit. An unchanged tree is recorded as `fail-empty` without a run. The final check round begins when these gate runs have ended. The results change nothing in the run. *(My call: no member is at work at that moment, so a host restart during a gate run costs the run what a restart during its final check costs today, and nothing more. The price is a later final check round.)*
 
 **What the gate cannot see.** The host cannot tell which files define a command. The pinned files are the owner's statement of them. A contestant can still weaken a test that is not pinned and lies inside its owned paths. A single attempt can do the same today, and review is the guard in both cases. A search gives more attempts that chance, and the first pass wins, so the pinned-file rule of condition 3 stays strict (owner decision 7).
 
@@ -169,11 +171,15 @@ search?: {
   class?: "champion-pass" | "rescued" | "challenger-first" | "none";
   endReason?: string;
 };
-type GateRun = { result: "pass" | "fail-scope" | "fail-empty" | "fail-check" | "skipped"; ms: number; failures?: number; at: string };
+type GateRun = { result: "pass" | "fail-scope" | "fail-empty" | "fail-check"; ms: number; failures?: number; at: string };
 type Contestant = { memberId: string; profileId: string; captured?: true; commit?: string; tree?: string; gate?: GateRun; left?: string };
 ```
 
-`task.memberId` stays the champion until a result passes. A `measure` search goes from `armed` to `measured` when its one gate result is recorded, or to `abandoned`. The rules below are those of a `live` search.
+`task.memberId` stays the champion until a result passes.
+
+**A `measure` search** is `admitting` from its admission until its gate runs. It ends as `measured` when the base run failed and the gate result of the champion's commit is recorded. It ends as `abandoned`, with the reason recorded, in three cases. The base run does not fail. The champion's attempt ends without an integrated result: a stall, an exit without a report, a provider limit, a failed preparation, a `question`, `blocked`, or `escalate` report, a scope violation, or an integration conflict. An event of rule 9 happens before the gate result is recorded. Only the champion's own result is measured. A replacement or an escalation that finishes the task is never measured in its place.
+
+**A `live` search** follows these rules:
 
 1. **Armed.** After a failed base run the search is `armed`: the champion works alone. With `start: "together"` the host widens at once when conditions 9 to 12 hold. When they do not, the search stays `armed` and goes on as under `after-fail`.
 2. **The champion leaves** when it stalls or exits without a report. The host stops it. Today's handling of that event, a stall replacement for example, does not start. It waits for the release (rule 8).
@@ -182,8 +188,8 @@ type Contestant = { memberId: string; profileId: string; captured?: true; commit
 5. **A challenger leaves** when it stalls, hits a provider limit, exits without a report, fails preparation, opens a provider permission prompt, or reports `question`, `blocked`, or `escalate`. The host stops it and starts no replacement.
 6. **The hold and the wait.** `holdUntil` is the moment the champion's `result` arrived, or the champion left, plus the allowance (Part 7). `waitUntil` is the moment the champion's result failed its gate, or the champion left, plus `waitMinutes`. A challenger that is still working at `waitUntil` is stopped. A result that was captured before `waitUntil` is gated, even when its gate run ends later.
 7. **Exhausted.** The search ends as `exhausted` when every contestant has failed its gate or left, when `waitUntil` has passed and no captured result waits for its gate, or at `holdUntil`.
-8. **Release.** A search that ends as `exhausted` or `abandoned` releases the task. The host stops every challenger, aborts the search's open gate run, and handles the champion as if no search had run. A captured result is handled as `consume` handles a result today: it is integrated when it has a commit, and it meets the final check round and its correction rounds. A scope violation blocks the run. A stall or an exit without a report gets today's handling of that event. A champion that is still working goes on as a single attempt.
-9. **Abandoned.** These events abandon the search: a `question`, `blocked`, or `escalate` report from the champion; a provider limit on the champion; a failed preparation of the champion; a steer, a pause, a cancel, a routing revocation, or a revision advance; an allowance that no longer fits before the run's deadline (Part 7); a host restart during a gate run (Failure modes); and any other event that blocks the run today. The task is released, and today's rule for the event applies.
+8. **Release.** A search that ends as `exhausted` or `abandoned` releases the task. The host stops every challenger and the search's open gate run. When that gate run has closed, the champion is handled as if no search had run. A captured result is integrated as a single attempt's result is, in plan order, and it meets the final check round and its correction rounds. A scope violation blocks the run. A stall or an exit without a report gets today's handling of that event. A champion that is still working goes on as a single attempt.
+9. **Abandoned.** These events abandon the search: a `question`, `blocked`, or `escalate` report from the champion; a provider limit on the champion; a failed preparation of the champion; a steer, a pause, a cancel, a routing revocation, or a revision advance; an allowance that no longer fits before the run's deadline (Part 7); a host restart during a workspace operation of the search (Failure modes); and any other event that blocks the run today. The task is released, and today's rule for the event applies.
 
 *(My call on rule 9: a question or a blocker says the task itself may be wrong, and more attempts at a wrong task are waste. A limit is no fault of the attempt, and today's limit switch already carries its work to another profile.)*
 
@@ -205,13 +211,13 @@ One limit remains, and the duels design names it: member clones of one run share
 
 The host writes `task.search` first, and then emits events with this design's own prefix, as umbrella contract C2 allows:
 
-- `search.admitted`: conditions 1 to 7 held and the base run begins.
-- `search.started`: the base run failed and a `live` search is `armed`. It names the champion's member ID.
+- `search.admitted`: the admission conditions held. It names the task and the champion's member ID.
+- `search.started`: the base run failed and a `live` search is `armed`.
 - `search.widened`: it names each challenger's member ID.
-- `search.captured` and `search.gated`: one for each result.
+- `search.captured` and `search.gated`: one for each result of a `live` search.
 - `search.resolved`: the search ended as `resolved` or `exhausted`.
 - `search.abandoned`: the search ended as `abandoned`, with its reason.
-- `search.measured`: a `measure` search recorded its gate result.
+- `search.measured`: a `measure` search recorded its base run and its gate result.
 
 `search.resolved` and `search.abandoned` carry the class and, for each contestant, the member ID, the gate result, whether its result was captured, and whether the search selected it. A projector that this design registers derives the durable row:
 
@@ -232,7 +238,7 @@ The payload holds the task ID, the criterion ID, the member IDs, config IDs, eve
 
 `failures` on a gate run is the failure-line count of the check-output scanner (INF-314), when that scanner is on `main` and finds failure lines. It is absent otherwise. No rule of this design reads it. Part 9 says why it is recorded.
 
-**Classification comes before outcomes.** The outcome ledger's projector sets source `search` and `experiment_ref` on a contestant's row from `search.started` and `search.widened`. The host emits `search.started` before it captures any result of the search, and `search.widened` before a challenger launches, so no terminal event of a contestant is projected first. Both events apply idempotently by search ID and member ID, and reconciliation replays them from `task.search`. The source never changes afterwards, whether the search is resolved, exhausted, or abandoned. A `measure` search emits neither event, and its rows keep source `production`.
+**Classification comes before outcomes.** `search.started` marks the task's assignment: the task in that run and revision. From then on the outcome ledger's projector gives every attempt of that assignment source `search` and the search's `experiment_ref`. That covers the champion, each challenger, and a member that starts for the task after the search ended, a stall replacement for example. The host emits `search.started` before it captures any result of the search, so no terminal event of a contestant is projected first. The event applies idempotently by search ID, and reconciliation replays it from `task.search`. The source never changes afterwards, whether the search is resolved, exhausted, or abandoned. A `measure` search never emits the event, and its rows keep source `production`.
 
 **Outcome rows.** The search sets the fate of these contestants, from `search.resolved` or `search.abandoned`:
 
@@ -244,27 +250,33 @@ The payload holds the task ID, the criterion ID, the member IDs, config IDs, eve
 | Its result was captured and never gated, because another passed or the search ended | `not-chosen` | excluded: `search` |
 | The host stopped it while it worked, because the search ended | `host-stop` | excluded: `host` |
 
-A contestant that left for its own reason keeps its own disposition. After a release the champion's row takes the disposition that today's rules give it, and its failed gate stays in the `searches` row. Both keep source `search`. A search that was abandoned before it was armed leaves the champion a `production` row. A challenger's row has `inherited` 0, because it began at the base commit.
+A contestant that left for its own reason keeps its own disposition. After a release the champion's row takes the disposition that today's rules give it, as does the row of a member that starts for the task later. A search that was abandoned before it was armed leaves the champion a `production` row. A challenger's row has `inherited` 0, because it began at the base commit.
 
-The router does not read `search` rows in this version. *(My call: in a `search` row, `integrated` means the result passed a command before integration. No production row was asked to do that, so the two rates differ in meaning, and C6 keeps them apart. A champion that passed alone is a `search` row too. If only the champions that failed left `production`, the production rate of their profiles would rise for no reason.)*
+The router does not read `search` rows in this version. *(My call: a `search` row is an attempt whose fate a search could change. Its result may have been held for a gate, refused by it, or stopped because another passed. No `production` row met any of that, so the two populations differ, and C6 keeps them apart. `integrated` keeps the ledger's meaning. Some `search` rows were integrated after a gate pass, and some after a release with a failed gate or none, and the `searches` row tells them apart. A champion that passed alone is a `search` row too. If only the champions that failed left `production`, the production rate of their profiles would rise for no reason.)*
 
 ### Part 7: Budget, slots, and time
 
-**Budget.** Every contestant has purpose `work` (C8). It counts against the run's attempt limit and against the goal's member count, and its launch passes the spend fuse like any member's. The learning budget pays nothing. Condition 11 keeps the run's reserve: a challenger starts only while `spareAttempts(run)` stays at 0 or more, so one attempt remains for each task not yet integrated, and three more. A run that later needs more than that reserve reaches its attempt limit sooner than it would have without the search. *(My call: the router's explore guard uses the same count with a floor of 4. A search is work the owner asked for, so its floor is 0.)* A challenger that the reserve refuses or the fuse holds is not started, and the search goes on with the others. A search never waits for a fuse.
+**Budget.** Every contestant has purpose `work` (C8). It counts against the run's attempt limit and against the goal's member count, and its launch passes the spend fuse like any member's. The learning budget pays nothing.
+
+Condition 11 keeps a reserve. A challenger starts only while `spareAttempts(run)` stays at 3 or more with it counted. The run then has one attempt left for each task not yet integrated, and six more. Six is the longest planned sequence after the last integration: a review, two correction rounds with a review after each, and delivery. The reserve is a rule of thumb. A stall replacement, an escalation, or a review that the host rejects takes an attempt that it does not count. A run can therefore still reach its attempt limit sooner than it would have without the search (owner decision 5). A challenger that the reserve refuses or the fuse holds is not started, and the search goes on with the others. A search never waits for a fuse.
 
 **Worker slots.** Each contestant holds a normal worker slot inside `run.parallelism`. Condition 10 gives a challenger only a slot that no ready task needs. A task that becomes ready later waits for a slot, as it waits today behind any running implementer. *(My call: unlike a duel's challenger, a search contestant is work the owner asked for, so the host does not stop it for a later task.)*
 
-**Time.** A gate run counts as 20 minutes for the clone and the setup command, plus `gateMinutes`. A search's **allowance** is one gate run for each contestant, one more for a base run that is still open, and the wait. With the defaults and three attempts that is 4 × 35 + 60 = 200 minutes. The host enforces it through `holdUntil` (Part 4, rule 6): at that moment the search is `exhausted`, its open gate run is aborted, and the task is released. Time that the search's operations spend waiting behind other operations of the run counts inside the allowance. A task's integration therefore starts at most the allowance later than it would have alone. Integration follows plan order, so later results wait too while their members keep working. A run has at most two searches. Choosing `live` is the owner's authorization for that delay.
+**Time.** A gate run counts as 20 minutes for the clone and the setup command, plus `gateMinutes`. A `live` search's **allowance** is one gate run for each contestant, one more for a base run that has not ended, and the wait. With the defaults and three attempts that is 4 × 35 + 60 = 200 minutes. The host enforces it through `holdUntil` (Part 4, rule 6): at that moment the search is `exhausted`, the host stops its open gate run, and the task is released. Time that the search's operations spend waiting behind other operations of the run, or behind the host-load hold, counts inside the allowance.
+
+The search's hold on a task therefore ends at most the allowance after the champion's result arrived or the champion left. After the release the task is scheduled as today: its result is integrated in plan order, when the run's operation slot is free. Later results of the plan wait for it meanwhile, as they wait today behind any earlier task, and their members keep working. A run has at most two searches. Choosing `live` is the owner's authorization for that delay. Two events break the bound: a host restart during a workspace operation of the search, and a gate run that the host cannot stop (Failure modes).
+
+A `measure` search holds no result. It delays the run's final check round by its two gate runs, at most 70 minutes with the defaults, and a run has at most two such searches.
 
 The wait is a cutoff of this design. A single attempt has no runtime limit, and a challenger that is still working at `waitUntil` is stopped. *(My call: without a cutoff a slow challenger holds the task's integration open. The status counts the challengers that the wait stopped.)*
 
-`assertBudget` stops a goal run at its `deadlineAt`. The host therefore requires the allowance to fit before the deadline at admission, again at widening, and again when the champion's result arrives. A search that no longer fits is abandoned, and the task is released (Part 4, rules 8 and 9).
+`assertBudget` stops a goal run at its deadline, unless an approved extension applies. The host therefore requires the allowance to fit before the deadline at admission, again at widening, and again when the champion's result arrives. A search that no longer fits is abandoned, and the task is released (Part 4, rules 8 and 9).
 
-**The operation slot.** A base run and a `measure` gate run start only when the run has no workspace operation waiting, and the host aborts them when the run needs the slot. In `live` mode a gate run of a captured result waits its turn like any capture, and production work that arrives during it waits until it ends.
+**The operation slot.** In `live` mode a base run yields to the run's other operations (Part 3). A capture and a gate run of a captured result wait their turn like any operation, and production work that arrives during a gate run waits until it ends. In `measure` mode the gate runs take the slot when no other operation of the run needs it, before the final check round.
 
 ### Part 8: Measures and the brake
 
-A `measure` search records one gate result for the first result: `pass`, a failure kind, or `skipped`.
+A `measure` search records its base run and one gate result for the first result: `pass`, `fail-empty`, or `fail-check`.
 
 Each ended `live` search that was armed has one class, from host records alone:
 
@@ -275,9 +287,9 @@ Each ended `live` search that was armed has one class, from host records alone:
 
 `infinite search status` shows, per project: admissions and the reasons that ended them at the base run; first results by gate result, from both modes; `live` searches by class; the share of widened searches that were `rescued`; the cost of all contestants beside the champion's cost; the minutes a search added; gate failures by kind; challengers that left, by reason, and challengers that the wait stopped; and the count of searches with two equal captured trees.
 
-Two of these numbers answer questions that nothing answers today. The share of first results that pass their gate is how often a first attempt turns such a check. The `rescued` share of widened searches is how often a fresh start on another family passes where the first attempt failed.
+Two of these numbers answer questions that nothing answers today. The share of first results that pass their gate is how often a first attempt turns such a check. The `rescued` share of widened searches is how often a fresh start on another family passes where the first attempt failed. For a first result that failed its gate in `measure` mode, the run's own records then show what today's path made of it: a pass at the final check round, or a correction round.
 
-**When `live` pays.** If a first result passes with probability p, an `after-fail` search widens with probability 1 − p. `measure` mode gives p for two command runs a task. *(My call: the owner runs `measure` until about 20 first results are recorded, and then decides on `live`. At the ledger's volume, a share of 0.1 allows at most two or three searches in an active week.)*
+**When `live` pays.** If a first result passes with probability p, an `after-fail` search widens with probability 1 − p. `measure` mode gives p for two command runs a task. *(My call: the owner runs `measure` until about 20 first results are recorded, and then decides on `live`. How long that takes depends on how many goals carry an owner criterion with a command and pinned files. No goal can carry one today.)*
 
 **The brake.** Searches pause for a project when it has 10 or more widened searches and the last 10 hold fewer than 2 `rescued`. The owner resumes them, and the count starts again. A `challenger-first` search does not count as a rescue, because the champion might have passed. *(My call: below one rescue in five, the extra attempts mostly fail where the first one failed, and today's correction round is the cheaper path. Under `start: "together"` the same rule pauses a project whose first attempts mostly pass.)*
 
@@ -308,19 +320,22 @@ Two rules are left out on purpose, because no measurement on Infinite supports t
 
 | Situation | Behaviour |
 |---|---|
-| The base run passes, times out, fails setup, or is aborted for the run's own work | The search is abandoned with that reason. The champion continues as a single attempt, with a `production` row. |
-| The champion's result passes its gate | It integrates. Under `after-fail` no challenger ever started. |
+| The base run passes, times out, fails setup, or is stopped for the run's own work | The search is abandoned with that reason. The champion continues as a single attempt, with a `production` row. |
+| The champion's result passes its gate | It integrates in plan order. Under `after-fail` no challenger ever started. |
 | No challenger can start when the champion's result fails | `exhausted` at once, then the release. |
 | No challenger can start at arming under `together` | The search stays `armed`. It widens when the champion's result fails, if conditions 9 to 12 hold then. |
 | A challenger stalls, hits a limit, or opens a permission prompt | It leaves (Part 4). The search goes on without it. |
 | Every result fails, the wait ends, or the hold ends | `exhausted`. The task is released to today's rules for the champion. |
 | The command fails fast at the base and runs past its limit on a right result | Every gate run fails by time. The search is `exhausted`, the task is released, and the brake counts it. |
-| The run's attempt reserve is used up | No challenger starts (condition 11). A run that later needs more attempts than the reserve reaches its limit sooner than without the search. |
+| The run's attempt reserve is used up | No challenger starts (condition 11). |
+| After a search, the run needs more attempts than the reserve held | The run reaches its attempt limit sooner than without the search, and stops as today. |
 | The winner's commit conflicts at integration | The run blocks with `integration-conflict`, as today. |
 | The command passes by chance on a wrong result | The final check round runs it again on the integrated head, and review follows. |
 | A pinned file changed before the task's base | Condition 4 fails. No search starts. |
-| The host restarts during a gate run, in either mode | The gate run is never replayed. The run blocks with the interrupted-operation reason, as it does for an interrupted check today. The reconciliation of that state gains the `gate` kind, with the same conditions: a quiet run, and a process census that sees no process of the gate run and none using the gate clone. It then removes the clone, abandons the search, and releases the task. A search spends more time inside workspace operations than a single attempt does, so a restart blocks such a run more often (owner decision 13). |
-| The host restarts at another moment of a search | It resumes from `task.search`. Events and the `searches` row are idempotent by key, and no second challenger starts for a contestant. |
+| The host cannot stop a gate run | The command runs on to its end. The gate operation stays open until then, its result is not used, and the run's other operations wait, as they do behind a check that cannot be stopped today. The hold can pass `holdUntil` by that time. |
+| The host restarts during a gate run | The gate run is never replayed. The run blocks with the interrupted-operation reason, as it does for an interrupted check today. The owner's reconciliation of an interrupted check gains the `gate` kind, with its conditions unchanged: a quiet run, no process of the gate run that the host still sees, and the owner's attestation. It clears the intent, removes the gate clone, and abandons the search. After a `measure` gate run the run then goes on to its final check round. A `live` gate run can be interrupted while members work. The block stops them, and the run continues only as a blocked run does today: with a new plan, under a new revision (owner decision 13). |
+| The host restarts during another workspace operation of a search: a challenger's preparation, a capture, or an integration | Today's rule for an interrupted operation of that kind applies unchanged, and the search is abandoned. A `live` search adds such operations to a run: one preparation for each challenger and one capture for each result. |
+| The host restarts while the run has no workspace operation open | The search resumes from `task.search`. Events and the `searches` row are idempotent by key, and no second challenger starts for a contestant. |
 | The evidence store is unavailable | No search starts. An open search finishes in the run record, and reconciliation writes its row and its classification later. |
 | Searches are paused, or the share is used up, during a search | The open search finishes. The next one does not start. |
 
@@ -328,8 +343,8 @@ Two rules are left out on purpose, because no measurement on Infinite supports t
 
 - **Objective record design.** The owner's criterion input gains `pinned`, a list of up to 8 paths, on `criterion.add` and `criterion.edit`, as an amendment to its step 2. Nothing else changes: a criterion still never adds a command, and this design reads `pinned` as that design uses it, as the files that define a check.
 - **Team plan schema.** `teamTaskPlanSchema` gains `criterion`.
-- **Team workspace operations.** A fifth operation kind, `gate`. The reconciliation of an interrupted check accepts it, under the rule of the failure-mode table.
-- **Outcome ledger design.** A fifth source, `search`, set from `search.started` and `search.widened`. `search.resolved` and `search.abandoned` set `out-of-scope`, `gate-failed`, and `not-chosen` as `duel.resolved` does, and `not-chosen` under a search has exclusion `search`. A challenger's `attempt_index` counts it after the champion, in start order.
+- **Team workspace operations.** A fifth operation kind, `gate`, and a capture that integration does not follow at once. The owner's reconciliation of an interrupted check accepts the `gate` kind, with its conditions unchanged.
+- **Outcome ledger design.** A fifth source, `search`: every attempt of an assignment that `search.started` marks. `search.resolved` and `search.abandoned` set `out-of-scope` and `gate-failed` as `duel.resolved` does. They set `not-chosen`, with exclusion `search`, for a captured result that was never gated. Under a duel that disposition means a result that passed the gate. A challenger's `attempt_index` counts it after the champion, in start order.
 - **Umbrella.** Its table of designs gains this one. In C6 the list of sources gains `search`. In C11 the search policy joins the settings inside the routine digest, for the duel policy's reason: it changes who does the work.
 - **Duels design.** Its conditions 3 and 8 count a search as an experiment on the task and as an open duel of the run.
 - **Evidence router design.** The choice does not change. A pure helper of the router module returns a decision's candidates in the order of Part 2.
@@ -339,9 +354,9 @@ Two rules are left out on purpose, because no measurement on Infinite supports t
 Each phase is its own pull request.
 
 1. **The search engine.** A pure module that applies admission, widening, a gate result, a leave, the wait, the hold, and the release to `task.search`, with a seeded simulator of its orders. Nothing imports it.
-2. **A gate run at a commit.** The gate clone, the `gate` operation with its restart rule, and the base run. The duels design's gate needs the same piece.
-3. **Measure mode.** The policy and its pin, the `criterion` field, admission, the gate of an integrated result, the `searches` table, and `infinite search status`.
-4. **Live search.** Hold and choose, challengers, the release, the ledger source, and the brake.
+2. **A gate run at a commit.** The gate clone, the `gate` operation with its stop and restart rules, and its reconciliation. The duels design's gate needs the same piece.
+3. **Measure mode.** The policy and its pin, the `criterion` field, admission, the two gate runs before the final check round, the `searches` table, and `infinite search status`.
+4. **Live search.** The base run during the work, a capture that is not integrated at once, hold and choose, challengers, the release, the ledger source, and the brake.
 5. **Client views.**
 
 Phases 3 and 4 need the router in `auto` and owner criteria with `command` checks in goal records, which are on `main`. They also need the owner's `pinned` input, which is not built. No phase needs the eval identity, a judge, the learning budget, or the assumption tests of the objective record design.
@@ -350,31 +365,32 @@ Phases 3 and 4 need the router in `auto` and owner criteria with `command` check
 
 1. With mode `off`, generated prompts, scheduling, and stored records match today's.
 2. A plan whose `criterion` names no criterion of the run's pinned digest is refused. A plan with a valid `criterion` and mode `off` runs as today. A task whose criterion is derived, or pins no file, gets a single attempt, and the status counts condition 3.
-3. With conditions 1 to 7 true and a command that fails at `baseCommit`, the search is `armed` and one implementer works. With a command that passes at `baseCommit`, the search is abandoned and the task runs as today, with a `production` row.
-4. In `measure` mode the champion's result integrates without waiting for a gate run, no second implementer starts, the `searches` row holds the gate result of the captured commit, and the champion's row has source `production`. A gate run that the run's own work interrupts is recorded as `skipped`.
-5. Under `after-fail`, a champion result that passes its gate integrates, and no second implementer ever starts for the task. A champion result that fails its gate is not integrated, and challengers start on the champion's `baseCommit`, each of a family that no other contestant has. No challenger starts when the champion's family is unknown.
-6. Under `together`, challengers start when the base run fails and conditions 9 to 12 hold. When they do not hold, the search stays `armed`, and it widens when the champion's result fails its gate.
-7. The first result that passes its gate is integrated, `task.memberId` names its member, and every other running contestant is stopped with no replacement. A result that was captured before the pass and not yet gated is never gated, and its row is `not-chosen`.
-8. A result that changes a pinned file, or a path outside the task's owned paths, fails with `fail-scope` and does not block the run while the search goes on.
-9. When every result fails, when the wait ends with no capture left to gate, or at `holdUntil`, the task is released: the champion's captured result integrates as today and the final check round runs. When the champion stalled and no challenger passed, today's stall replacement starts then, and not before.
-10. The task's integration starts no later than the allowance after the champion's result arrived. A gate run that is open at that moment is aborted.
-11. A `question` from the champion abandons the search, stops every challenger, and blocks the run as today. Every contestant of a search that was abandoned after it was armed keeps source `search`.
-12. No challenger starts when it would take `spareAttempts(run)` below 0, and the host makes no `assertBudget` call that the limit refuses. With one attempt left and a reviewer still to start, a search starts no challenger.
-13. No search starts when the run has had two searches, when the allowance does not fit before the deadline, or when the share is used up. Each case counts its condition. When every free worker slot has a ready task as the champion's result fails, no challenger starts, and the search is `exhausted`.
-14. After a resolved search, a later member's context file has no `search` field and no report of a contestant that was not integrated.
-15. A restart while no gate run is open resumes the search with the same contestants and one `searches` row. A restart during a gate run starts no second command and blocks the run as an interrupted check does. Its reconciliation is refused while the census sees a process of the gate run, and it otherwise abandons the search and releases the task.
-16. With 10 widened searches of which 1 is `rescued`, the next task that meets every other condition gets a single attempt, and the status shows the pause.
-17. Every contestant row of a `live` search that was armed has source `search`, and no production cell counts it.
+3. In `live` mode, with conditions 1 to 7 true and a command that fails at `baseCommit`, the search is `armed` and one implementer works. With a command that passes at `baseCommit`, the search is abandoned and the task runs as today, with a `production` row.
+4. In `measure` mode every result is captured, integrated, and scheduled as today, and no second implementer starts. Before the first final check round the host runs the base run and, after it fails, the gate at the champion's captured commit. The `searches` row holds both results, the search is `measured`, and the champion's row has source `production`. A used-up share does not stop a `measure` search.
+5. In `measure` mode a champion that stalls, escalates, or reports a blocker ends the search as `abandoned` with that reason. The result of the member that replaces it is not measured.
+6. Under `after-fail`, a champion result that passes its gate integrates, and no second implementer ever starts for the task. A champion result that fails its gate is not integrated, and challengers start on the champion's `baseCommit`, each of a family that no other contestant has. No challenger starts when the champion's family is unknown.
+7. Under `together`, challengers start when the base run fails and conditions 9 to 12 hold. When they do not hold, the search stays `armed`, and it widens when the champion's result fails its gate.
+8. The first result that passes its gate is integrated in plan order, `task.memberId` names its member, and every other running contestant is stopped with no replacement. A result that was captured before the pass and not yet gated is never gated, and its row is `not-chosen`.
+9. A result that changes a pinned file, or a path outside the task's owned paths, fails with `fail-scope` and does not block the run while the search goes on.
+10. When every result fails, when the wait ends with no capture left to gate, or at `holdUntil`, the task is released: the champion's captured result integrates as today and the final check round runs. When the champion stalled and no challenger passed, today's stall replacement starts then, and not before.
+11. At `holdUntil` the search is `exhausted` and the host stops its open gate run. When that gate run has closed, nothing of the search holds the task: the champion's captured result is integrated when plan order and the run's operation slot allow.
+12. A `question` from the champion abandons the search, stops every challenger, and blocks the run as today. Every attempt of a task whose `live` search was armed keeps source `search` after the abandonment.
+13. No challenger starts when it would take `spareAttempts(run)` below 3, and the host makes no `assertBudget` call that the limit refuses. With eight attempts left and one task not yet integrated, a search starts one challenger and no second.
+14. No `live` search starts when the run has had two searches, when the allowance does not fit before the deadline, or when the share is used up. Each case counts its condition. When every free worker slot has a ready task as the champion's result fails, no challenger starts, and the search is `exhausted`.
+15. After a resolved search, a later member's context file has no `search` field and no report of a contestant that was not integrated.
+16. A restart while the run has no workspace operation open resumes the search with the same contestants and one `searches` row. A restart during a gate run starts no second command and blocks the run as an interrupted check does. Its reconciliation has the conditions of an interrupted check's, clears the intent, and abandons the search. A restart during a challenger's preparation or a capture gets today's handling of that interrupted operation.
+17. With 10 widened searches of which 1 is `rescued`, the next task that meets every other condition gets a single attempt, and the status shows the pause.
+18. Every attempt of a task whose `live` search was armed has source `search`, a stall replacement after the release included, and no production cell counts it.
 
 ## Owner decisions
 
 Each value below was my call.
 
-1. **Measure first.** Run `measure` until about 20 first results are recorded, and then decide on `live`. `measure` costs two command runs for each eligible task and starts no extra attempt. A host restart during one of those runs blocks the run (decision 13).
+1. **Measure first.** Run `measure` until about 20 first results are recorded, and then decide on `live`. `measure` costs two command runs for each eligible task, delays the run's final check round by them, and starts no extra attempt. A host restart during one of them blocks the run as a restart during its final check does today.
 2. **When challengers start.** `after-fail` by default, `together` as an option. `together` finishes sooner and pays for challengers on every search.
-3. **The numbers.** A share of 0.1 with a ceiling of 0.25, three attempts with a ceiling of four, two searches per run, 15 minutes for a gate command, and a wait of 60 minutes. With the defaults a search may hold an integration for up to 200 minutes.
+3. **The numbers.** A share of 0.1 with a ceiling of 0.25, three attempts with a ceiling of four, two searches per run, 15 minutes for a gate command, and a wait of 60 minutes. With the defaults a `live` search may hold a result for up to 200 minutes.
 4. **The wait.** A challenger that is still working 60 minutes after the champion's result failed is stopped. A single attempt has no such limit.
-5. **The reserve.** A challenger starts only while `spareAttempts(run)` stays at 0 or more. A higher floor, such as the router's 4, makes a search rarer and leaves the run more attempts.
+5. **The reserve.** A challenger starts only while `spareAttempts(run)` stays at 3 or more: one attempt for each task not yet integrated, and six for the longest planned sequence after the last integration. It is a rule of thumb, and a run can still reach its attempt limit sooner than without the search. A lower floor widens more often in a run that is near its limit.
 6. **Slots.** A challenger takes only a slot that no ready task needs, and keeps it when a task becomes ready later. The other choice stops the newest challenger for that task.
 7. **Pinned files and origin.** Only an owner criterion with at least one pinned file opens a search. Without the rule, more criteria qualify, and a result that weakens the test can win. The rule needs the owner's `pinned` input, which is not built.
 8. **Evidence.** `search` rows stay out of the router, and a gated pass beside a gated failure is not counted as a pair. Counting it would add judge-free pairs to the duels design's statistic.
@@ -382,13 +398,14 @@ Each value below was my call.
 10. **Permission prompts.** A challenger leaves at its first provider permission prompt, as a duel's challenger does. The other choice lets it use the run's delegated permission reviewer under the run's cap.
 11. **Autonomy.** The mode stays `off` in an autonomous project until the owner sets it. Duels default to `live` there.
 12. **The plan field.** A coordinator, which is a model, names the criterion a task must turn. The host checks everything else. Without the field the host cannot tell which task a failing criterion belongs to.
-13. **A restart during a gate run.** The run blocks, and the same reconciliation as for an interrupted check releases it. The other choice lets the host release it alone when its census sees no process. That is a weaker fence than a check has today.
+13. **A restart during a search's operations.** A `live` search adds workspace operations to a run while members work: a base run, a capture and a gate run for each result, and a preparation for each challenger. A host restart during one blocks the run under today's rules, and a block stops the members at work. After an interrupted gate run, the owner's reconciliation releases the run. The other choice lets the host release an interrupted gate run alone when it sees no process of it. That is a weaker fence than a check has today.
 
 ## Left to the builder
 
 - The Git commands that build a gate clone at a commit, and how one clone is reused between the gate runs of a search without carrying a file from one result to the next. A new command form needs an entry in the server's owner-approved team command list.
 - The fields of the `gate` operation's intent, and how the process census matches a gate run's processes.
-- How base runs, captures, and gate runs use the run's one operation slot under the rules of Part 7.
+- Whether a capture that is not integrated at once is its own operation kind or a form of today's result operation.
+- How the captured commit of an integrated result stays readable until its `measure` gate run.
 - The order of candidates that have no stored utility.
 - How `TeamService` reads the goal's record at the pinned version. The goal service owns that record.
 - The wording of the coordinator prompt's sentence about `criterion`.

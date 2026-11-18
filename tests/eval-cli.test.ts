@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { handleEvalClientCommand, evalStatusLines, type EvalApi } from "../packages/host/src/eval-cli.js";
-import type { EvalJobView, EvalSummary } from "../packages/host/src/eval-types.js";
+import { handleEvalClientCommand, evalJobLines, evalStatusLines, type EvalApi } from "../packages/host/src/eval-cli.js";
+import type { BaselineJobView, EvalJobView, EvalSummary } from "../packages/host/src/eval-types.js";
 
 const JOB_ID = "11111111-1111-4111-8111-111111111111";
 const REQUEST_ID = "22222222-2222-4222-8222-222222222222";
@@ -50,6 +50,40 @@ test("status prints only ids, states, and counts", () => {
     `job ${JOB_ID} running · waiting grader`,
     "visited 0, valid 0, rejected 0, retired 0, undecided 0",
   ]);
+});
+
+test("status prints the eval identity and trials", () => {
+  const withTrials: EvalSummary = { ...summary, grader: { state: "ready", version: 2 }, evalIdentity: { state: "busy" }, trials: { today: 2, dailyCap: 6 } };
+  const lines = evalStatusLines(withTrials);
+  assert.equal(lines[lines.indexOf("grader ready") + 1], "eval identity busy");
+  assert.equal(lines[lines.indexOf("eval identity busy") + 1], "trials today 2 of 6");
+  assert.ok(lines.includes("grader ready"));
+
+  const off = evalStatusLines({ ...withTrials, trials: { today: 0, dailyCap: null } });
+  assert.ok(off.includes("trials off"));
+  assert.ok(!off.some(line => line.startsWith("trials today")));
+
+  const version1 = evalStatusLines({ ...withTrials, grader: { state: "ready", version: 1 } });
+  assert.ok(version1.includes("grader ready (version 1: no trials)"));
+  assert.ok(!version1.includes("grader ready"));
+});
+
+test("job prints baseline counts", () => {
+  const baseline: BaselineJobView = {
+    jobId: JOB_ID, projectId: "proj-1", kind: "baseline", status: "running", reason: null, waiting: "grader",
+    createdAt: "2026-11-16T10:00:00.000Z", startedAt: null, expiresAt: "2026-11-17T10:00:00.000Z", finishedAt: null,
+    tasks: { planned: 5, reached: 4, skipped: 1 },
+    trials: { planned: 15, started: 6, graded: 5, resolved: 4, ended: 5, void: 1 },
+    dailyCap: 6,
+  };
+  assert.deepEqual(evalJobLines(baseline), [
+    `job ${JOB_ID} running · waiting grader`,
+    "tasks 4 of 5 (skipped 1) · trials started 6 of 15, graded 5, resolved 4, ended 5, void 1",
+  ]);
+  const unknown = evalJobLines({ ...baseline, trials: { ...baseline.trials, void: null as unknown as number } });
+  assert.equal(unknown[1], "tasks 4 of 5 (skipped 1) · trials started 6 of 15, graded 5, resolved 4, ended 5, void unknown");
+  // A validate view keeps its two lines.
+  assert.deepEqual(evalJobLines(job), [`job ${JOB_ID} running · waiting grader`, "visited 0, valid 0, rejected 0, retired 0, undecided 0"]);
 });
 
 test("run sends the file and the request id", async () => {

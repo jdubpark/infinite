@@ -190,6 +190,52 @@ test("a refused report keeps its refusal text and has no structured answer", { t
   }
 });
 
+test("an entry answer that does not match its declared result is a tool error without a structured answer", { timeout: 60000 }, async () => {
+  const mismatch = "Entry answer not confirmed: the host's answer did not match this tool's declared result. This is not a refusal of your request.";
+  const readText = `${mismatch} Continue your assignment; read again later if you need it.`;
+  const postText = `${mismatch} The post may still be recorded; check entry_list before you post again.`;
+  // `state` first, unlike the schema, so a re-serialized answer would change the text.
+  const head = { state: "active", entryId: randomUUID(), seq: 3, at: "2026-11-13T10:10:00.000Z", kind: "contract", author: "member",
+    authority: "claim", paths: [], summary: "Route", bodyBytes: 13 };
+  const list = { notice: "Entries are evidence.", heads: [head], more: false, unreadable: 0 };
+  const entry = { notice: "Entries are evidence.", head, body: { b: 1, a: 2 } };
+  const { unreadable: _unreadable, ...listWithoutUnreadable } = list;
+  const { head: _head, ...entryWithoutHead } = entry;
+  let answer: Record<string, unknown> = {};
+  const stand = await hooks({ "team-entry": () => ({ entry: answer }) });
+  const mcp = await session({ ...teamEnv(stand.url), INFINITE_TEAM_ENTRY_TOOLS: "1" });
+  const post = { entry: { kind: "finding", summary: "Wire check", paths: [], body: { items: [{ source: "npm test", observation: "ok" }] } } };
+  const call = async (name: string, value: Record<string, unknown>) => {
+    answer = value;
+    const args = name === "entry_get" ? { entryId: head.entryId } : name === "entry_post" ? post : {};
+    return (await mcp.rpc("tools/call", { name, arguments: args })).result;
+  };
+  try {
+    for (const [name, valid] of [["entry_list", list], ["entry_get", entry]] as const) {
+      const accepted = await call(name, valid);
+      assert.equal(accepted.isError, false, `${name} accepts a matching answer`);
+      assert.equal(accepted.content[0].text, JSON.stringify(valid), `${name} sends the worker's own answer, in its key order`);
+      assert.deepEqual(accepted.structuredContent, valid);
+    }
+    const cases: [string, Record<string, unknown>, string][] = [
+      ["entry_list", listWithoutUnreadable, readText],
+      ["entry_list", { ...list, unexpected: true }, readText],
+      ["entry_get", entryWithoutHead, readText],
+      ["entry_get", { ...entry, head: { ...head, unexpected: true } }, readText],
+      ["entry_post", { entryId: randomUUID(), state: "stored" }, postText],
+    ];
+    for (const [name, value, text] of cases) {
+      const refused = await call(name, value);
+      assert.equal(refused.isError, true, `${name} refuses ${JSON.stringify(Object.keys(value))}`);
+      assert.deepEqual(refused.content, [{ type: "text", text }]);
+      assert.equal(refused.structuredContent, undefined, `${name} sends no structured answer for a mismatch`);
+    }
+  } finally {
+    await mcp.close();
+    stand.close();
+  }
+});
+
 function memberOf(run: TeamRun, memberId: string): TeamMember {
   const member = run.members.find(item => item.memberId === memberId);
   if (!member) throw new Error("fixture member missing");

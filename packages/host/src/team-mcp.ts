@@ -7,9 +7,9 @@ import { z } from "zod";
 import { teamReportSchema } from "./team-types.js";
 import { missionAssignment, reportErrorMessage, submitMissionReport, submitTeamReport } from "./team-report-client.js";
 import { missionReportArgumentsSchema } from "./mission-types.js";
-import { ENTRY_TOOLS_ENV, entryErrorMessage, submitEntryCall, type EntryCall } from "./team-entry-client.js";
+import { ENTRY_TOOLS_ENV, EntryError, entryErrorMessage, submitEntryCall, type EntryCall } from "./team-entry-client.js";
 import { memberEntryPostSchema, memberListQuerySchema } from "./evidence/member-entry.js";
-import { outputSchemas, pendingEntrySchema, type WriteResults } from "./team-mcp-results.js";
+import { memberEntrySchema, memberListSchema, outputSchemas, pendingEntrySchema, type WriteResults } from "./team-mcp-results.js";
 
 const MAX_FRAME_BYTES = 256 * 1024;
 const PROTOCOL_VERSION = "2025-11-25";
@@ -44,6 +44,13 @@ function entryCallFor(name: string, args: Record<string, unknown>): EntryCall {
 const HANDOFF_RECORDED = "Handoff recorded. Stop work now; the host waits for client control to detach before transferring the clean checkpoint.";
 const MISSION_RECORDED = "Mission report recorded. Stop work on this attempt.";
 const TEAM_RECORDED = "Team report recorded. Stop work on this assignment.";
+const ANSWER_MISMATCH = "Entry answer not confirmed: the host's answer did not match this tool's declared result. This is not a refusal of your request.";
+/** The worker's answer as the tool's declared result, or a fixed error that never repeats the answer or the parse issues. */
+function declared<S extends z.ZodType>(schema: S, answer: unknown, guidance: string): z.output<S> {
+  const parsed = schema.safeParse(answer);
+  if (!parsed.success) throw new EntryError(`${ANSWER_MISMATCH} ${guidance}`);
+  return parsed.data;
+}
 const entryPosted = (entryId: string) => `Entry ${entryId} is written to this session's journal and waits for the host to store it. Other members can read it after that. The host can still refuse it, for example at the run's limit of member entries.`;
 const MISSION_INSTRUCTIONS = "Use the mission_report tool for this coordinator attempt only. Report once, wait for the durable receipt, then stop; the host starts a new attempt when the mission needs you. Never edit a repository, approve a permission, or bypass a refusal through a shell command.";
 type RequestId = string | number;
@@ -111,14 +118,18 @@ export async function runTeamMcp() {
     }
     const entryCall = params.name !== selectedTool.name;
     if (entryCall && !(withEntryTools && ENTRY_TOOL_NAMES.has(params.name))) { await error(id, -32602, `Unknown tool. Only ${availableTools} ${withEntryTools ? "are" : "is"} available.`); return; }
+    // Every successful result is built by `written`, or is a worker answer that its declared result's schema accepted.
     try {
       if (entryCall) {
         const answer = await submitEntryCall(entryCallFor(params.name, params.arguments));
         if (params.name === "entry_post") {
-          const receipt = pendingEntrySchema.parse(answer);
+          const receipt = declared(pendingEntrySchema, answer, "The post may still be recorded; check entry_list before you post again.");
           await written(id, "entry_post", { entryId: receipt.entryId, state: receipt.state, message: entryPosted(receipt.entryId) });
           return;
         }
+        // The strict schema only gates: an accepted answer holds exactly the declared fields, and the answer itself
+        // is sent so the text keeps the worker's key order.
+        declared(params.name === "entry_list" ? memberListSchema : memberEntrySchema, answer, "Continue your assignment; read again later if you need it.");
         await result(id, { content: [{ type: "text", text: JSON.stringify(answer) }], structuredContent: answer, isError: false });
         return;
       }

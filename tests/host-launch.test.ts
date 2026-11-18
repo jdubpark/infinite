@@ -404,7 +404,7 @@ test("the agent-side Claude trust entry records only the folder it is launched i
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("disabled hooks or no hook server leave the profile untouched", () => {
+test("disabled hooks or no hook server leave the profile untouched, and a Codex session with a listener keeps only notify", () => {
   assert.deepEqual(buildLaunch("claude", { command: "claude", args: [] }, "p", null, relay, enabled).args, ["p"]);
   assert.deepEqual(buildLaunch("codex", { command: "codex", args: [] }, "", hooks, relay, { claude: true, codex: false }).args, ["-c", 'notify=["node","/opt/infinite/packages/host/dist/hook-relay.js","codex-notify"]']);
   assert.deepEqual(buildLaunch("opencode", { command: "opencode", args: [] }, "p", hooks, relay, enabled).args, ["--prompt", "p"]);

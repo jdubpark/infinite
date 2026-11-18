@@ -296,7 +296,7 @@ Fixtures come from synthetic sessions against a scratch repository. A script rep
    - Read the transcript from the `notify` route with hooks off. Codex's `notify` fires without the flag, and the relay can resolve the rollout from its thread id. It needs one verification that a notify reply can start the transcript stream.
    - Host-recorded trust for the host's own hooks only. The trust key and hash format for hooks set by session flags are unknown.
 
-   Update (INF-213): Codex capture now uses the notify route. A Codex session with a hook listener gets the turn-end `notify` setting with hooks off, and the worker reads its rollout. A Codex session that ends before its first turn completes still reports `none` / `hooks-off`.
+   Update (INF-213): Codex capture now uses the notify route. A Codex session with a hook listener gets the turn-end `notify` setting with hooks off, and the worker reads its rollout. With hooks off, the notice journals no attention signal; the host uses it only to find and read the session record. A Codex session that ends before its first turn completes still reports `none` / `hooks-off`.
 
    **Open owner decision:** which route to take. The proposed next step is the first.
 3. **Final drain wrapper. Decided 2026-11-13: added.** The Ubuntu template gains the root-owned wrapper and its line in `deploy/ubuntu/infinite.sudoers`.

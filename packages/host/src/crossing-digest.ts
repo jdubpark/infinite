@@ -34,9 +34,10 @@ import { z } from "zod";
  * paths measure 2,047 bytes, and six are kept.
  *
  * PROPOSED merge contract. Counters add when digests merge, so mergeDigest expects two digests of disjoint histories.
- * Merging a digest with itself, or with a digest built from it, keeps each row once and counts the omissions twice,
- * because a digest cannot tell which omissions two histories share. The storage slice must merge each crossing once,
- * by its crossing id.
+ * When a digest is merged with itself or with a digest built from it, rows that both hold fold into one, the two sets
+ * of counters are added (up to OMITTED_MAX), and any row that a cap or the fit drops again is counted again. The
+ * omissions the two histories share are therefore counted more than once, and a digest cannot tell which those are.
+ * The storage slice must merge each crossing once, by its crossing id.
  */
 
 /** Byte bound for a digest, measured as JSON. */
@@ -122,9 +123,10 @@ const counter = z.number().int().min(0).max(OMITTED_MAX);
  *     never replaces or changes an older receipt.
  * PROPOSED (g) `forSiblings` and `open` get counters in `omitted`, beside the three of the design.
  * PROPOSED (h), for the owner: a claim whose path, or signal and place, a receipt holds is dropped without a count,
- *     even when a cap or the fit later drops the receipt. Its ids and its operation do not survive, so a digest holds
- *     identifiers only for paths that have no receipt. Keeping such a claim as a row of its own would keep the
- *     identifiers and would take bytes from decisions, sibling notes and open questions, which the fit trims first.
+ *     even when a cap or the fit later drops the receipt. Its ids and its operation do not survive, so a member's
+ *     identifiers survive only on claim rows whose path no receipt holds. Keeping such a claim as a row of its own
+ *     would keep the identifiers and would take bytes from decisions, sibling notes and open questions, which the
+ *     fit trims first.
  */
 /** Checks shape, never provenance: a digest that passes is not thereby host-built. */
 export const crossingDigestSchema = z.object({

@@ -4,7 +4,7 @@ import { realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { z } from "zod";
 import { failureReason } from "./failure-reason.js";
-import { clearEgressEnvironment, hostEgressEnvironment } from "./egress.js";
+import { hostCommandEnvironment } from "./egress.js";
 import type { Manager } from "./manager.js";
 import type { ChatMessage } from "./session-content.js";
 import type { Project, Session } from "./types.js";
@@ -515,11 +515,8 @@ export class RepositoryBriefings {
     this.controllers.add(controller);
     try {
       const activity = activityInput(job.messages);
-      const env: NodeJS.ProcessEnv = { ...process.env };
-      clearEgressEnvironment(env);
-      Object.assign(env, hostEgressEnvironment());
       const raw = await collectProcess(this.config.command, args, {
-        cwd: job.location.cwd, env, input: activity.input, timeoutMs: this.config.timeoutMs,
+        cwd: job.location.cwd, env: hostCommandEnvironment(), input: activity.input, timeoutMs: this.config.timeoutMs,
         maxBytes: MAX_STDOUT_BYTES, signal: controller.signal,
       });
       const value: unknown = JSON.parse(raw);

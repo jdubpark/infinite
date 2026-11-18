@@ -5,7 +5,7 @@ import { isAbsolute, relative, sep } from "node:path";
 import { z } from "zod";
 import { parseMermaid, type Diagram, type UnderstandingBrief, type KnowledgeClaim, type KnowledgeComponent, type KnowledgeDelivery, type KnowledgeEnvironment, type KnowledgePlan, type KnowledgePullRequest } from "@infinite/remote";
 import { expectedIdentity, normalizeRemote, readGit } from "./checkout-identity.js";
-import { clearEgressEnvironment, hostEgressEnvironment } from "./egress.js";
+import { hostCommandEnvironment } from "./egress.js";
 import { failureReason } from "./failure-reason.js";
 import { createContextAdapter, runRepositoryContext, understandingOutputLimits, type RepoContext, type RepositoryBriefOutput, type UnderstandingAdapter, type UnderstandingAdapterOptions } from "./understanding-runtime.js";
 import type { Config } from "./types.js";
@@ -68,14 +68,11 @@ export function validateBrief(value: unknown, root: string, context: RepoContext
   };
 }
 
-function run(command: string, args: string[], options: UnderstandingAdapterOptions & { cwd: string; timeoutMs?: number; maxBytes?: number }): Promise<string> {
+/** `env` defaults to the host process environment; brief runs pass `hostCommandEnvironment()`. */
+function run(command: string, args: string[], options: UnderstandingAdapterOptions & { cwd: string; timeoutMs?: number; maxBytes?: number; env?: NodeJS.ProcessEnv }): Promise<string> {
   return new Promise((resolvePromise, rejectPromise) => {
     let child: ChildProcess;
-    // Briefs run model writers as the agent account: they get the configured egress, never inherited proxy state.
-    const env: NodeJS.ProcessEnv = { ...process.env };
-    clearEgressEnvironment(env);
-    Object.assign(env, hostEgressEnvironment());
-    try { child = spawn(command, args, { cwd: options.cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" }); }
+    try { child = spawn(command, args, { cwd: options.cwd, ...(options.env ? { env: options.env } : {}), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" }); }
     catch { rejectPromise(new Error("understanding-process-unavailable")); return; }
     let output = Buffer.alloc(0), stderrTail = Buffer.alloc(0), reason: string | undefined, closed: number | null | undefined, escalated = false, settled = false;
     const finish = () => {
@@ -172,7 +169,7 @@ export function createUnderstandingAdapter(config: Config): UnderstandingAdapter
       if (!briefing) throw new Error("repository-briefings-unavailable");
       const context = await runRepositoryContext(config, input.root, options);
       const writerArgs = [...(briefing.runner ? ["--runner", briefing.runner] : []), ...(briefing.model ? ["--model", briefing.model] : []), "--timeout", String(Math.min(1800, Math.max(10, Math.ceil(briefing.timeoutMs / 1000))))];
-      const raw = await run(briefing.command, [...briefing.args, ...writerArgs, "brief", "--repo", input.root, "--base", input.baseCommit, "--format", "json", "--no-state", "--question", input.question], { ...options, cwd: input.root, timeoutMs: options.timeoutMs, maxBytes: Math.min(options.maxBytes, MAX_STDOUT) });
+      const raw = await run(briefing.command, [...briefing.args, ...writerArgs, "brief", "--repo", input.root, "--base", input.baseCommit, "--format", "json", "--no-state", "--question", input.question], { ...options, env: hostCommandEnvironment(), cwd: input.root, timeoutMs: options.timeoutMs, maxBytes: Math.min(options.maxBytes, MAX_STDOUT) });
       if (Buffer.byteLength(raw) > Math.min(options.maxBytes, MAX_STDOUT)) throw new Error("understanding-output-too-large");
       const parsed = validateBrief(JSON.parse(raw), input.root, context);
       if (parsed.base !== input.baseCommit) throw new Error("understanding-brief-base-mismatch");
@@ -204,7 +201,7 @@ export function createUnderstandingAdapter(config: Config): UnderstandingAdapter
         try {
           const briefConfig = config.repositoryBriefings;
           if (!briefConfig) throw new Error("repository-briefings-unavailable");
-                    const raw = await run(briefConfig.command, [...briefConfig.args, ...writerArgs(briefConfig), "brief", "--repo", input.root, "--focus", component.paths[0]?.path ?? "", "--question", briefQuestion(component, plans), "--format", "json", "--no-state"], { ...options, cwd: input.root, timeoutMs: options.timeoutMs, maxBytes: Math.min(options.maxBytes, MAX_STDOUT) });
+                    const raw = await run(briefConfig.command, [...briefConfig.args, ...writerArgs(briefConfig), "brief", "--repo", input.root, "--focus", component.paths[0]?.path ?? "", "--question", briefQuestion(component, plans), "--format", "json", "--no-state"], { ...options, env: hostCommandEnvironment(), cwd: input.root, timeoutMs: options.timeoutMs, maxBytes: Math.min(options.maxBytes, MAX_STDOUT) });
           if (Buffer.byteLength(raw) > Math.min(options.maxBytes, MAX_STDOUT)) throw new Error("understanding-output-too-large");
           const parsed = validateBrief(JSON.parse(raw), input.root, input.context);
           components.push(synthesized(component, parsed, plans, input.repositoryId));
@@ -220,7 +217,7 @@ export function createUnderstandingAdapter(config: Config): UnderstandingAdapter
       const briefConfig = config.repositoryBriefings;
       if (!briefConfig) throw new Error("repository-briefings-unavailable");
       const args = [...briefConfig.args, ...writerArgs(briefConfig), "brief", "--repo", input.root, "--format", "json", "--no-state", ...(input.base ? ["--base", input.base] : []), "--question", repositoryQuestion(input.components)];
-      const raw = await run(briefConfig.command, args, { ...options, cwd: input.root, timeoutMs: options.timeoutMs, maxBytes: Math.min(options.maxBytes, MAX_STDOUT) });
+      const raw = await run(briefConfig.command, args, { ...options, env: hostCommandEnvironment(), cwd: input.root, timeoutMs: options.timeoutMs, maxBytes: Math.min(options.maxBytes, MAX_STDOUT) });
       const parsed = validateBrief(JSON.parse(raw), input.root, input.context);
       const { diagrams = [], ...brief } = parsed.brief;
       const output: RepositoryBriefOutput = {

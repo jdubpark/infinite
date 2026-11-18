@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -187,6 +187,11 @@ test("System tab brief and context children get configured egress and discard in
   const context = { version: 1, repo: checkout, generatedAt: "2026-11-18T00:00:00.000Z", head, base: null, files: {}, components: [], edges: [], limitations: [] };
   const config = { projects: [], repositoryBriefings: { command: process.execPath, args: ["-e", observedScript("argv"), receipt], automatic: false, intervalMs: 1000, cooldownMs: 0, timeoutMs: 10000 } } as Config;
   const options = () => ({ signal: new AbortController().signal, timeoutMs: 10000, maxBytes: 1024 * 1024 });
+  const bin = join(directory, "bin"), ghReceipt = join(directory, "gh.txt");
+  mkdirSync(bin);
+  writeFileSync(join(bin, "gh"), `#!/bin/sh\nprintf '%s\\n' "$HTTPS_PROXY" >> '${ghReceipt}'\nexit 1\n`, { mode: 0o755 });
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${bin}:${previousPath ?? ""}`;
 
   await withStaleProxy(async () => {
     for (const configured of [false, true]) {
@@ -198,8 +203,15 @@ test("System tab brief and context children get configured egress and discard in
       const lines = readFileSync(receipt, "utf8").trim().split("\n").map(line => JSON.parse(line) as { mode: string; environment: Record<string, boolean | string | null> });
       assert.deepEqual(lines.map(line => line.mode), ["context", "brief"]);
       for (const line of lines) assertProxyEnvironment(line.environment, configured, `a System tab ${line.mode} child`);
+
+      // The System tab's gh reads run as the host account and keep the host's own environment.
+      rmSync(ghReceipt, { force: true });
+      const github = { ...config, projects: [{ id: "repo", name: "Repository", path: checkout, source: { mode: "github", repository: "example/repo" } }] } as Config;
+      const delivery = await createUnderstandingAdapter(github).delivery!({ workspaceId: "workspace", root: checkout, repositoryId: "repo", head }, options());
+      assert.equal(delivery.state, "unavailable");
+      assert.deepEqual([...new Set(readFileSync(ghReceipt, "utf8").trim().split("\n"))], ["http://stale.invalid"], "gh keeps the inherited proxy state");
     }
-  });
+  }).finally(() => { process.env.PATH = previousPath; });
 });
 
 test("permission reviewer processes get configured egress with the host identity and nothing else of the host's", async () => {

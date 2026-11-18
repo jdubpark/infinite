@@ -1849,7 +1849,7 @@ One new form needs the owner's launcher approval. No other form changes.
 - **Register off.** `save` checks one field, and the tick makes one call that returns at once on an empty queue. A stored entry page costs one field check.
 - **Register on.** A settled revision gets one pass:
   - two record parses;
-  - at most 40 sequential Git reads outside the serial queue (at most 40 MiB streamed, one blob in memory at a time);
+  - at most 40 sequential Git reads outside the serial queue (at most 40 MiB streamed). *(Changed when built: the pass keeps what it read until it applies the receipts, at most 40 MiB, and decodes and parses it in the serial queue at apply.)*
   - one or two sealed writes (the goal and the run, or the run alone).
 
   A stored page that carries a proposal costs one record parse and at most one write.

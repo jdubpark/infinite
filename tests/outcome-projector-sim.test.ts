@@ -42,10 +42,11 @@ import { bump, type Counts, type Rand, rand, RunScript } from "./outcome-sim-scr
  *    page writes the same rows" (outcome-projector.ts:64). The reference projects every event twice in a row and
  *    compares. Replaying the whole log onto the final state is not promised: a replayed run.settled freezes a row that
  *    integrated after the settle.
- * P3 A row that was integrated or completed keeps that disposition (outcome-rules.ts:66-72). TeamService emits no
- *    stop, block or report for a member after its integration or completion: it confirms the exit before it consumes
- *    the report, and a halt emits only on a change to stopped (teams.ts:3455-3462, 3303-3304). So P3 fails only if the
- *    emitter or the script starts to; the precedence itself stays with tests/outcome-rules.test.ts.
+ * P3 A row that was integrated or completed keeps that disposition (outcome-rules.ts:66-72). The scripts send a new
+ *    member.stopped after an integration or a completion when a drain stops a consumed member again after its journal
+ *    read threw (teams.ts:3292-3304). A drain can also emit a member's report again, under a key the store already
+ *    holds, so the store keeps the first event (teams.ts:4850-4853; the repeated-key fault). P3 also fails when any
+ *    handler rewrites a stored disposition; the precedence table itself stays with tests/outcome-rules.test.ts.
  * P4 Once frozenAt is set, frozenAt, acceptance and the last review never change: "a later steer or continuation ...
  *    changes no frozen row" (spec part 4, Freeze; outcome-projector.ts:329, 508-528).
  * P5 Each row's levels, exclusion, round counts and scan-gap flag equal levels(), rowExclusion(), roundCounts() and
@@ -433,19 +434,21 @@ function simulate(seed: number, counts: Counts): void {
  * kind, every fault and every reorder ran at least 10 times there, and each floor is about half of that count.
  * Held completions after a cancel's settle are floored together, as reorder:completion-after-settle, and the late
  * run.prepared also alone: a run cancels at most once, so the five held kinds share the cancels, and alone the repair
- * answer, the review and the scout completion ran under 10 times (5, 7 and 4). The diagnostic shows each kind.
+ * answer, the review and the scout completion ran under 10 times (7, 3 and 8). The diagnostic shows each kind.
+ * block:member-stalled is a path, not a kind, fault or reorder: a second stall of one assignment ran 6 times.
  */
 const FLOORS: Readonly<Record<string, number>> = {
-  "kind:run.created": 43, "kind:run.prepared": 43, "kind:member.started": 387, "kind:member.configured": 282,
-  "kind:member.reported": 341, "kind:member.stopped": 86, "kind:task.integrated": 75, "kind:scout.completed": 36,
-  "kind:task.escalated": 11, "kind:review.recorded": 28, "kind:review.tree": 17, "kind:repair.started": 20,
-  "kind:repair.integrated": 19, "kind:repair.paths": 13, "kind:delivery.recorded": 9, "kind:rating.recorded": 9,
-  "kind:run.blocked": 13, "kind:run.revision-advanced": 42, "kind:run.settled": 41, "kind:run.deleted": 10, "kind:ledger.gap": 23,
-  "fault:restart": 91, "fault:sealed-outbox-again": 42, "fault:small-page": 20, "fault:rollback": 86, "fault:rollback-mid-page": 58,
-  "fault:gap": 23, "fault:dropped-event": 47, "fault:repeated-key": 57,
-  "reorder:report-after-stop": 6, "reorder:completion-after-halt": 12, "reorder:completion-after-settle": 19,
-  "reorder:enrichment-after-settle": 61, "reorder:stop-without-start": 11, "after-settle:member.stopped": 10, "after-settle:run.prepared": 6,
-  "runs:settled": 38, "rows:frozen": 57, "rows:member-results": 161,
+  "kind:run.created": 44, "kind:run.prepared": 43, "kind:member.started": 355, "kind:member.configured": 248,
+  "kind:member.reported": 300, "kind:member.stopped": 117, "kind:task.integrated": 54, "kind:scout.completed": 35,
+  "kind:task.escalated": 7, "kind:review.recorded": 23, "kind:review.tree": 13, "kind:repair.started": 17,
+  "kind:repair.integrated": 17, "kind:repair.paths": 13, "kind:delivery.recorded": 7, "kind:rating.recorded": 7,
+  "kind:run.blocked": 14, "kind:run.revision-advanced": 37, "kind:run.settled": 39, "kind:run.deleted": 14, "kind:ledger.gap": 21,
+  "fault:restart": 92, "fault:sealed-outbox-again": 45, "fault:small-page": 19, "fault:rollback": 65, "fault:rollback-mid-page": 41,
+  "fault:gap": 21, "fault:dropped-event": 35, "fault:repeated-key": 49,
+  "reorder:report-after-stop": 5, "reorder:completion-after-halt": 7, "reorder:completion-after-settle": 20,
+  "reorder:enrichment-after-settle": 52, "reorder:stop-without-start": 10, "reorder:stop-after-consumed": 20,
+  "after-settle:member.stopped": 17, "after-settle:run.prepared": 5, "block:member-stalled": 3,
+  "runs:settled": 35, "rows:frozen": 42, "rows:member-results": 144,
 };
 
 test("the outcome projector keeps its invariants under seeded faults", t => {

@@ -14,12 +14,12 @@ const DETAIL_LINES = 30;
 const DETAIL_BYTES = 1500;
 // PROPOSED: one cleaned line is cut to this many bytes.
 const LINE_BYTES = 240;
-// PROPOSED: a raw line longer than PENDING_BYTES keeps its first PENDING_BYTES bytes and its last TAIL_CHARS characters for display,
-// and its class (test point, TAP failure, marker) is read from the kept start. Two facts are computed over the whole line in constant
-// memory: whether a TAP directive occurs, matched on its raw text, and its identity, a SHA-256 of the raw line after its leading
-// whitespace. So a long line's escape sequences and trailing whitespace are part of its identity. A line that fits is read whole
-// without its escape sequences, and its identity is its trimmed text.
-const PENDING_BYTES = 4096, TAIL_CHARS = 80;
+// PROPOSED: a raw line longer than PENDING_BYTES keeps only its first PENDING_BYTES bytes, and the scan reads the line from that
+// kept start: its class (test point, TAP failure, marker, block mark, blank line), its indentation and its shown text. Two facts
+// are computed over the whole line in constant memory: whether a TAP directive occurs, matched on its raw text, and its identity,
+// a SHA-256 of the raw line after its leading whitespace. So a long line's escape sequences and trailing whitespace are part of
+// its identity. A line that fits is read whole without its escape sequences, and its identity is its trimmed text.
+const PENDING_BYTES = 4096;
 // PROPOSED: distinct marker-line hashes remembered; past this the scan is capped.
 const MAX_DISTINCT = 1024;
 // PROPOSED: size limit of the repair feedback text.
@@ -44,13 +44,13 @@ const HOST_NOTE = 'Lines that start with "| " are text from the command\'s outpu
 interface Kept { failure: CheckFailure; lines: number; bytes: number }
 /** An open region of one stream: the line after a test point, a YAML block, or a marker's detail. Its detail goes to `kept` when set. */
 interface Open { kind: "after" | "block" | "marker"; indent: number; kept?: Kept }
-/** Facts of a long line over all of its text: its identity hash, whether its leading whitespace is still skipped, and the directive matcher. */
-interface Long { hash: Hash; lead: boolean; mark: 0 | 1 | 2; word: string; found: boolean }
-interface StreamState { decoder: StringDecoder; head: string; headBytes: number; tail: string; long?: Long; open?: Open }
+/** Facts of a long line over all of its text: its identity hash and the state of the directive matcher. */
+interface Long { hash: Hash; mark: 0 | 1 | 2; word: string; found: boolean }
+/** One stream's pending line: `head` is its kept start, and `long` exists once it is longer than PENDING_BYTES. */
+interface StreamState { decoder: StringDecoder; head: string; headBytes: number; long?: Long; open?: Open }
 
-const fresh = (): StreamState => ({ decoder: new StringDecoder("utf8"), head: "", headBytes: 0, tail: "" });
-const clearLine = (state: StreamState) => { state.head = ""; state.headBytes = 0; state.tail = ""; state.long = undefined; };
-const full = (state: StreamState) => state.long ? `${state.head} [...] ${state.tail}` : state.head;
+const fresh = (): StreamState => ({ decoder: new StringDecoder("utf8"), head: "", headBytes: 0 });
+const clearLine = (state: StreamState) => { state.head = ""; state.headBytes = 0; state.long = undefined; };
 const strip = (text: string) => text.replace(OSC, "").replace(CSI, "").replace(ESC_PAIR, "");
 const indentOf = (text: string) => text.match(/^ */)![0].length;
 const digest = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -75,7 +75,6 @@ function lastBytes(text: string, bytes: number): string {
   }
   return out;
 }
-const lastChars = (text: string) => { const chars = [...text]; return chars.length > TAIL_CHARS ? chars.slice(-TAIL_CHARS).join("") : text; };
 const clean = (text: string) => cut(strip(text).replace(CONTROL, " "), LINE_BYTES);
 const WORD = /\w/, SPACE = /\s/;
 /**
@@ -94,12 +93,6 @@ function matchDirective(long: Long, text: string): void {
   }
 }
 const directiveFound = (long: Long) => long.found || long.word.length === 4;
-/** Feeds one part of a long line to its facts. The leading-whitespace flag lasts across parts, so the hash does not depend on the cuts. */
-function feedLong(long: Long, part: string): void {
-  matchDirective(long, part);
-  const rest = long.lead ? part.replace(/^\s+/, "") : part;
-  if (rest) { long.lead = false; long.hash.update(rest); }
-}
 /** Streaming scan of command output. Memory is bounded by the kept failures, one pending line per stream, constant state per long line, and at most MAX_DISTINCT marker hashes. */
 export class CheckOutputScanner {
   private readonly streams: Record<"stdout" | "stderr", StreamState> = { stdout: fresh(), stderr: fresh() };
@@ -118,7 +111,7 @@ export class CheckOutputScanner {
   finish(): CheckScan {
     for (const state of Object.values(this.streams)) {
       this.consume(state, state.decoder.end());
-      if (state.head) this.line(state, full(state));
+      if (state.head) this.line(state);
       clearLine(state);
       state.open = undefined;
     }
@@ -129,7 +122,7 @@ export class CheckOutputScanner {
     let start = 0;
     for (let end = text.indexOf("\n"); end !== -1; end = text.indexOf("\n", start)) {
       this.append(state, text.slice(start, end));
-      this.line(state, full(state));
+      this.line(state);
       clearLine(state);
       start = end + 1;
     }
@@ -138,18 +131,18 @@ export class CheckOutputScanner {
 
   private append(state: StreamState, part: string): void {
     if (!part) return;
-    state.tail = lastChars(state.tail + part);
-    if (state.long) { feedLong(state.long, part); return; }
+    if (state.long) { matchDirective(state.long, part); state.long.hash.update(part); return; }
     state.head += part; state.headBytes += Buffer.byteLength(part);
     if (state.headBytes <= PENDING_BYTES) return;
-    // The line has just overflowed: replay the text held so far, then feed each later part.
-    state.long = { hash: createHash("sha256"), lead: true, mark: 0, word: "", found: false };
-    feedLong(state.long, state.head);
+    // The line has just overflowed: its facts start from all the text held so far, and each later part is fed to them. A line that
+    // can be a marker has its first visible character in the kept start, so its leading whitespace is dropped here, once.
+    state.long = { hash: createHash("sha256").update(state.head.replace(/^\s+/, "")), mark: 0, word: "", found: false };
+    matchDirective(state.long, state.head);
     state.head = cut(state.head, PENDING_BYTES);
   }
 
-  private line(state: StreamState, raw: string): void {
-    const text = strip(raw), open = state.open;
+  private line(state: StreamState): void {
+    const text = strip(state.head), open = state.open;
     state.open = undefined;
     if (open && (open.kind === "block" || open.kind === "marker")) {
       // A whitespace-only line stays inside and adds no detail: Node prints one for each blank line of an error message.

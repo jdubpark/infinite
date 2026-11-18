@@ -146,6 +146,8 @@ test("a long line is classed by its start; its directive and identity cover the 
   const cases: [string, number][] = [
     [`not ok 1 - ${"x".repeat(4200)} # SKIP later\n`, 0],
     [`not ok 1 - ${"x".repeat(4200)} # SKIP ${"r".repeat(600)}\n`, 0],
+    // No directive: the word must follow the "#" and its whitespace directly, and a part of a word ends the attempt.
+    [`not ok 1 - ${"x".repeat(4200)} # ski skip\n`, 1],
     // The same first 4,200 characters and last 200 characters, with different middles.
     [`${start}one${end}\n${start}two${end}\n`, 2],
     // Indentation is not part of a long line's identity.
@@ -268,6 +270,8 @@ test("block, detail and stream rules hold at their edges", () => {
   const stopped = scanCheckOutput(["not ok 1 - a", "  ---", ...Array.from({ length: 6 }, () => `  ${"w".repeat(300)}`), `  ${"v".repeat(200)}`, "  short", "  ..."].join("\n"));
   assert.equal(stopped.failures[0]!.detail.split("\n").length, 7);
   assert.ok(!stopped.failures[0]!.detail.includes("short"));
+  // A line is cut to 240 bytes between characters: after its first 11 bytes, 114 two-byte, 76 three-byte or 57 four-byte characters.
+  for (const [char, kept] of [[ACCENT, 114], [CHECK, 76], [EMOJI, 57]] as const) assert.equal(scanCheckOutput(`not ok 1 - ${char.repeat(150)}\n`).failures[0]!.line, `not ok 1 - ${char.repeat(kept)}`);
 });
 
 test("10,000 distinct TAP failures are all counted and 8 are kept, without a cap", () => {

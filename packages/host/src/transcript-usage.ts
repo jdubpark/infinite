@@ -66,6 +66,7 @@ export class UsageTail {
   private readonly turnModels = new Map<string, string>();
   private lastTurnModel: string | undefined;
   private lastTurn: string | undefined;
+  private turns = 0;
   private sawRequestRows = false;
   private threadId: string | undefined;
   private total: number | undefined;
@@ -128,9 +129,17 @@ export class UsageTail {
     return this.requestTokens;
   }
 
-  /** Codex: the turn id of the last `turn_context` row. Undefined when no row named one. */
+  /** Codex: the id of the last turn the transcript started. Undefined when the row that started it named none. */
   lastTurnId(): string | undefined {
     return this.lastTurn;
+  }
+
+  /**
+   * Codex: how many turns the transcript has started. A `task_started` row starts one. A `turn_context` row starts
+   * one only when it names a turn other than the last started, because a turn can write its context more than once.
+   */
+  turnStarts(): number {
+    return this.turns;
   }
 
   /** Codex: a row of type "inter_agent_communication_metadata" was seen. */
@@ -218,7 +227,7 @@ export class UsageTail {
     if (row.type === "turn_context") {
       const turnId = text(payload?.turn_id);
       const model = text(payload?.model);
-      if (turnId) this.lastTurn = turnId;
+      if (turnId && turnId !== this.lastTurn) this.startTurn(turnId);
       if (turnId && model) {
         if (!this.turnModels.has(turnId) && this.turnModels.size >= MAX_TURNS) {
           const oldest = this.turnModels.keys().next();
@@ -233,8 +242,14 @@ export class UsageTail {
       this.sawRequestRows = true;
       return this.requestRecord(row, payload);
     }
+    if (row.type === "event_msg" && payload?.type === "task_started") this.startTurn(text(payload.turn_id));
     if (row.type === "event_msg" && payload?.type === "token_count") this.cumulativeRow(row, payload);
     return [];
+  }
+
+  private startTurn(turnId: string | undefined) {
+    this.turns += 1;
+    this.lastTurn = turnId;
   }
 
   private requestRecord(row: Record<string, unknown>, payload: Record<string, unknown> | undefined): UsageRecord[] {

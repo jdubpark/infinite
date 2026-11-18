@@ -227,12 +227,17 @@ test("the codex notify argument keeps a relay path with a space, a quote and a b
   const odd = "/opt/a b/in\"fi\\nite/hook-relay.js";
   const launch = buildLaunch("codex", { command: "codex", args: [] }, "", hooks, odd, { claude: true, codex: false });
   const value = launch.args.find((a) => a.startsWith("notify="))!.slice("notify=".length);
-  // A JSON array of strings is a TOML array of basic strings: both escape a quote and a backslash with a backslash.
+  // TOML and JSON escape a quote and a backslash the same way, so the argument stays one array of three strings.
   assert.equal(value, '["node","/opt/a b/in\\"fi\\\\nite/hook-relay.js","codex-notify"]');
   assert.deepEqual(JSON.parse(value), ["node", odd, "codex-notify"]);
   const on = buildLaunch("codex", { command: "codex", args: [] }, "", hooks, odd, enabled);
   const hook = on.args.find((a) => a.startsWith("hooks.Stop="))!;
   assert.ok(hook.includes(`command=${JSON.stringify(`node ${odd} codex`)}`), hook);
+  // TOML refuses a raw DEL in a basic string and JSON leaves it raw, so the host escapes it.
+  const del = buildLaunch("codex", { command: "codex", args: [] }, "", hooks, "/opt/a\x7fb/hook-relay.js", enabled);
+  const delNotify = del.args.find((a) => a.startsWith("notify="))!;
+  assert.equal(delNotify, 'notify=["node","/opt/a\\u007fb/hook-relay.js","codex-notify"]');
+  assert.ok(!del.args.some((a) => a.includes("\x7f")));
 });
 
 test("codex dev relay runs the TypeScript file through an absolute tsx loader", () => {

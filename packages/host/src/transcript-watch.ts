@@ -54,6 +54,8 @@ export interface WatchHook {
    * marks the start of the next turn, so the transcript must show that no later turn began.
    */
   endOnly?: boolean;
+  /** With `endOnly`: the provider's id for the turn that ended, when the hook names one. */
+  turn?: string | undefined;
 }
 
 /** A secondary transcript the watch reads, with its own end evidence for one drain. */
@@ -139,10 +141,11 @@ export class TranscriptWatch {
   /** The last provider hook: whether it closed a turn, and which drain it started. */
   private last: { turnEnd: boolean; drain: number | undefined } | undefined;
   /**
-   * Set while the last provider hook was an end-only turn end. `offset` and `turn` are the cursor and the last turn
-   * id at the end mark of its drain; both stay undefined when that drain never reached its end.
+   * Set while the last provider hook was an end-only turn end. `turn` is the turn the hook named. `mark` is the
+   * transcript at the first end mark of its drain: the cursor, the count of turns started, and the last turn started.
+   * It stays undefined when that drain never reached its end, and a later end mark of the drain does not move it.
    */
-  private endOnly: { drain: number | undefined; offset?: number; turn?: string } | undefined;
+  private endOnly: { drain: number | undefined; turn: string | undefined; mark?: { offset: number; starts: number; turn: string | undefined } } | undefined;
   /** The end evidence for `drain`: the offset at which its end mark arrived. */
   private evidence: { drain: number; offset: number } | undefined;
   /** A subagent hook that arrived before any transcript was open. It counts for the first transcript that opens. */
@@ -185,7 +188,9 @@ export class TranscriptWatch {
       // After a stop request, the provider's SessionEnd proves the process is ending, not that the turn ended: it keeps the turn boundary of the hook before it.
       const turnEnd = input.sessionEnd === true && this.stopped ? (this.last?.turnEnd ?? false) : input.turnEnd;
       const started = this.receiveHook({ ...input, turnEnd });
-      this.endOnly = input.endOnly === true && turnEnd ? { drain: started?.drain } : undefined;
+      this.endOnly = input.endOnly === true && turnEnd
+        ? { drain: started?.drain, turn: input.turn && input.turn.length <= 200 ? input.turn : undefined }
+        : undefined;
       return started;
     });
   }
@@ -350,18 +355,26 @@ export class TranscriptWatch {
   private mark(drain: unknown, offset: number) {
     if (this.drain === undefined || drain !== this.drain) return;
     this.evidence = { drain: this.drain, offset };
-    if (this.endOnly && this.endOnly.drain === this.drain) this.endOnly = { drain: this.drain, offset, turn: this.current?.usage.lastTurnId() };
+    const end = this.endOnly;
+    if (end && end.drain === this.drain && !end.mark && this.current)
+      end.mark = { offset, starts: this.current.usage.turnStarts(), turn: this.current.usage.lastTurnId() };
   }
 
   /**
-   * An end-only turn end still stands: its drain reached its end, and the transcript shows no later turn. Where
-   * the transcript names no turn, no byte may have arrived since. True when the last hook was not end-only.
+   * An end-only turn end still stands. Its drain reached its end, the turn it names was the last the transcript had
+   * started there, and the transcript has started no turn since. A hook that names no turn cannot be matched to the
+   * transcript's turns, so it does not stand. Where the transcript starts no turn at all, no byte may have arrived
+   * since. True when the last hook was not end-only.
    */
   private endStands(current: Current | undefined): boolean {
     const end = this.endOnly;
     if (!end) return true;
-    if (!current || end.offset === undefined) return false;
-    return end.turn !== undefined ? current.usage.lastTurnId() === end.turn : current.tail.offset === end.offset && !current.tail.pending;
+    const mark = end.mark;
+    if (!current || !mark) return false;
+    const starts = current.usage.turnStarts();
+    if (starts !== mark.starts) return false;
+    if (starts === 0) return current.tail.offset === mark.offset && !current.tail.pending;
+    return end.turn !== undefined && end.turn === mark.turn;
   }
 
   /** The drain of the last transcript hook reached the end of `current`, and nothing is pending. */

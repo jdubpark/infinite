@@ -190,6 +190,9 @@ const CLAUDE_EVENTS = [
   "StopFailure",
   "SessionEnd",
 ];
+/** A TOML basic string. JSON escapes what TOML requires escaped, except DEL, which TOML also refuses raw. */
+const tomlString = (value: string) => JSON.stringify(value).replace(/\x7f/g, "\\u007f");
+
 const CODEX_EVENTS = [
   "SessionStart",
   "UserPromptSubmit",
@@ -402,13 +405,13 @@ export function buildLaunch(
   if (hooks && provider === "claude" && channel) args.push(...headlessChannelArgs(relayPath, enabled.claude));
   if (hooks && provider === "codex") {
     // notify needs no hook trust, so it stays on when Codex hooks are off; turn-end usage then needs no bypass (INF-213).
-    args.push("-c", `notify=${JSON.stringify([...relay, "codex-notify"])}`);
+    args.push("-c", `notify=[${[...relay, "codex-notify"].map(tomlString).join(",")}]`);
     if (enabled.codex) {
       const command = [...relay, "codex"].join(" ");
       for (const event of CODEX_EVENTS)
         args.push(
           "-c",
-          `hooks.${event}=[{hooks=[{type="command",command=${JSON.stringify(command)}}]}]`,
+          `hooks.${event}=[{hooks=[{type="command",command=${tomlString(command)}}]}]`,
         );
       args.push("--dangerously-bypass-hook-trust");
       args.push(

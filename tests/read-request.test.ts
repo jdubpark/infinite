@@ -43,7 +43,7 @@ function grant(overrides: Partial<ReadGrant> = {}): ReadGrant {
     limits: { concurrency: 3, listConcurrency: 8, requestAttempts: 24, outside: true },
     allowanceLeft: 40,
     outsideProfiles: ["outside-reader"],
-    lineagesLeft: 3,
+    lineage: { state: "new", uncleared: [] },
     requestsSent: 0,
     activeSteps: [],
     ...overrides,
@@ -54,6 +54,11 @@ function codes(result: ReturnType<typeof validateReadRequest>): string[] {
   assert.equal(result.ok, false);
   return result.ok ? [] : result.errors.map(item => item.code);
 }
+
+const RUN_ID = "11111111-1111-4111-8111-111111111111";
+const RUN_B = "22222222-2222-4222-8222-222222222222";
+const HEAD = "a".repeat(40);
+const HEAD_B = "b".repeat(64);
 
 function listStep(id: string): ReadStep {
   return step({ id, output: "list", instructions: `List the ${id} items.` });
@@ -141,8 +146,6 @@ test("outside-off fires when outside is off, the profile is not outside-capable,
   assert.deepEqual(codes(off), ["outside-off"]);
   const wrongProfile = validateReadRequest(request([[step({ id: "web", source: { refs: ["evidence:1"] } })]]), grant());
   assert.deepEqual(codes(wrongProfile), ["outside-off"]);
-  const noLineage = validateReadRequest(request([[sourced]]), grant({ lineagesLeft: 0 }));
-  assert.deepEqual(codes(noLineage), ["outside-off"]);
   assert.equal(validateReadRequest(request([[sourced]]), grant()).ok, true);
 });
 
@@ -234,7 +237,7 @@ test("notes enforce their list caps and the 240-byte text limit", () => {
 });
 
 test("the read grant schema accepts a project manager grant", () => {
-  assert.equal(readGrantSchema.safeParse(grant({ reservation: 5, lineagesLeft: 2 })).success, true);
+  assert.equal(readGrantSchema.safeParse(grant({ reservation: 5, lineage: { state: "extends", uncleared: [{ runId: RUN_ID, head: HEAD }] } })).success, true);
 });
 
 test("refusalText names every error with its path, message and fix, and says the refusal is not a denial", () => {
@@ -246,4 +249,129 @@ test("refusalText names every error with its path, message and fix, and says the
   assert.match(text, /phases\[0\]\.steps\[1\]\.id: Step id scan is already used\. Fix: Give each step its own id\./);
   assert.match(text, /not recorded/);
   assert.match(text, /This is not a denial/);
+});
+
+test("a forEach step with a lead costs maxItems times its attempts, in the total and the phase totals", () => {
+  const parsed = request([
+    [listStep("items")],
+    [step({ id: "fan", forEach: { step: "items", maxItems: 4 }, lead: { maxAttempts: 10 } })],
+  ]);
+  assert.deepEqual(expandedTotal(parsed), { total: 45, phases: [1, 44] });
+  const refused = validateReadRequest(parsed, grant());
+  assert.deepEqual(codes(refused), ["over-ceiling", "over-ceiling"]);
+  if (!refused.ok) assert.deepEqual(refused.errors.map(item => item.limit), ["request", "allowance"]);
+  const passing = validateReadRequest(parsed, grant({ limits: { concurrency: 3, listConcurrency: 8, requestAttempts: 100, outside: true }, allowanceLeft: 100 }));
+  assert.equal(passing.ok, true);
+  if (passing.ok) assert.equal(passing.total, 45);
+});
+
+test("a step with both source and lead is refused at its lead path", () => {
+  const bad = validateReadRequest(request([[step({ id: "web", source: { refs: ["https://example.com/spec"] }, agentProfileId: "outside-reader", lead: { maxAttempts: 2 } })]]), grant());
+  assert.deepEqual(codes(bad), ["not-granted"]);
+  if (!bad.ok) {
+    assert.equal(bad.errors[0].path, "phases[0].steps[0].lead");
+    assert.match(bad.errors[0].message, /outside-content step cannot be a lead/);
+  }
+});
+
+test("an invalid grant is refused with one not-granted error at path grant", () => {
+  const plain = request([[step({ id: "scan" })]]);
+  const invalid: unknown[] = [
+    { ...grant(), allowanceLeft: undefined },
+    { ...grant(), requestsSent: -1 },
+    { ...grant(), extra: true },
+  ];
+  for (const candidate of invalid) {
+    const result = validateReadRequest(plain, candidate);
+    assert.equal(result.ok, false);
+    if (result.ok) continue;
+    assert.equal(result.errors.length, 1);
+    assert.equal(result.errors[0].code, "not-granted");
+    assert.equal(result.errors[0].path, "grant");
+  }
+});
+
+test("lineage: an absent state refuses, capped refuses and names each head, extends and new pass", () => {
+  const plain = request([[step({ id: "web", source: { refs: ["https://example.com/spec"] }, agentProfileId: "outside-reader" })]]);
+  assert.deepEqual(codes(validateReadRequest(plain, grant({ lineage: undefined }))), ["outside-off"]);
+  const capped = validateReadRequest(plain, grant({ lineage: { state: "capped", uncleared: [{ runId: RUN_ID, head: HEAD }, { runId: RUN_B, head: HEAD_B }] } }));
+  assert.deepEqual(codes(capped), ["outside-off"]);
+  if (!capped.ok) {
+    assert.match(capped.errors[0].message, new RegExp(`run ${RUN_ID} head ${HEAD}`));
+    assert.match(capped.errors[0].message, new RegExp(`run ${RUN_B} head ${HEAD_B}`));
+  }
+  assert.equal(validateReadRequest(plain, grant({ lineage: { state: "extends", uncleared: [] } })).ok, true);
+  assert.equal(validateReadRequest(plain, grant({ lineage: { state: "new", uncleared: [] } })).ok, true);
+});
+
+test("step ids that name Object prototype members are keyed as own properties", () => {
+  const result = validateReadRequest(request([[step({ id: "constructor" })]]), grant());
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(Object.hasOwn(result.keys, "constructor"), true);
+  const repeated = validateReadRequest(request([[step({ id: "constructor" }), step({ id: "constructor", instructions: "Other brief." })]]), grant());
+  assert.deepEqual(codes(repeated), ["repeated-step"]);
+});
+
+test("a forEach that is in the same phase and not a list reports both faults at the same path", () => {
+  const result = validateReadRequest(request([[step({ id: "items" }), step({ id: "fan", forEach: { step: "items", maxItems: 2 } })]]), grant());
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  const forward = result.errors.filter(item => item.code === "forward-reference");
+  assert.equal(forward.length, 2);
+  assert.deepEqual(forward.map(item => item.path), ["phases[0].steps[1].forEach.step", "phases[0].steps[1].forEach.step"]);
+});
+
+test("source refs are a set for the key: order does not change it, different sets do", () => {
+  const forward = step({ id: "web", source: { refs: ["evidence:1", "evidence:2"] } });
+  const reversed = step({ id: "web", source: { refs: ["evidence:2", "evidence:1"] } });
+  assert.equal(stepKey(forward), stepKey(reversed));
+  assert.notEqual(stepKey(step({ id: "web", source: { refs: ["evidence:3"] } })), stepKey(step({ id: "web", source: { refs: ["evidence:4"] } })));
+  assert.deepEqual(forward.source?.refs, ["evidence:1", "evidence:2"]);
+});
+
+test("notes cap each text at 240 bytes, counting multi-byte characters by their UTF-8 length", () => {
+  const base = { kind: "read-result", output: "findings", partial: true, summary: "Partial.", evidence };
+  const withOpen = (text: string) => readResultSchema.safeParse({ ...base, notes: { open: [text] } }).success;
+  assert.equal(withOpen("\u20ac".repeat(80)), true);
+  assert.equal(withOpen("\u20ac".repeat(81)), false);
+  assert.equal(withOpen("\u00e9".repeat(240)), false);
+  assert.equal(withOpen("\u00e9".repeat(120)), true);
+});
+
+test("over-ceiling errors carry the path of the field they name", () => {
+  const five = Array.from({ length: 5 }, (_, index) => step({ id: `s${index}`, instructions: `Brief ${index}.` }));
+  const concurrency = validateReadRequest(request([[step({ id: "scan" })]], { concurrency: 4 }), grant());
+  const requestLimit = validateReadRequest(request([five]), grant({ limits: { concurrency: 3, listConcurrency: 8, requestAttempts: 4, outside: true } }));
+  const allowance = validateReadRequest(request([five]), grant({ allowanceLeft: 4 }));
+  const reservation = validateReadRequest(request([five]), grant({ requester: "scout-lead", reservation: 2 }));
+  const paths = (result: ReturnType<typeof validateReadRequest>) => (result.ok ? [] : result.errors.map(item => `${item.limit}:${item.path}`));
+  assert.deepEqual(paths(concurrency), ["concurrency:concurrency"]);
+  assert.deepEqual(paths(requestLimit), ["request:phases"]);
+  assert.deepEqual(paths(allowance), ["allowance:phases"]);
+  assert.deepEqual(paths(reservation), ["reservation:phases"]);
+});
+
+test("schema lower bounds and caps: phases, maxItems, maxAttempts, refs and result item counts", () => {
+  const parse = (value: unknown) => readRequestSchema.safeParse(value).success;
+  assert.equal(parse({ ...request([[step({ id: "scan" })]]), phases: [] }), false);
+  assert.equal(parse(request([[listStep("items")], [step({ id: "fan", forEach: { step: "items", maxItems: 0 } })]])), false);
+  assert.equal(parse(request([[listStep("items")], [step({ id: "fan", forEach: { step: "items", maxItems: 16 } })]])), true);
+  assert.equal(parse(request([[step({ id: "scan", lead: { maxAttempts: 0 } })]])), false);
+  assert.equal(parse(request([[step({ id: "scan", lead: { maxAttempts: 12 } })]])), true);
+  assert.equal(parse(request([[step({ id: "web", source: { refs: Array.from({ length: 8 }, (_, index) => `evidence:${index + 1}`) } })]])), true);
+
+  const items = (count: number) => Array.from({ length: count }, (_, index) => ({ key: `k${index}`, title: "T", source: "s.ts" }));
+  const locations = (count: number) => Array.from({ length: count }, (_, index) => ({ path: `packages/host/src/f${index}.ts`, symbols: [], role: "r" }));
+  const listResult = (count: number) => ({ kind: "read-result", output: "list", partial: false, summary: "S", items: items(count) });
+  const locationResult = (count: number) => ({ kind: "read-result", output: "locations", partial: false, summary: "S", items: locations(count) });
+  assert.equal(readResultSchema.safeParse(listResult(0)).success, false);
+  assert.equal(readResultSchema.safeParse(listResult(32)).success, true);
+  assert.equal(readResultSchema.safeParse(listResult(33)).success, false);
+  assert.equal(readResultSchema.safeParse(locationResult(24)).success, true);
+  assert.equal(readResultSchema.safeParse(locationResult(25)).success, false);
+
+  const base = { kind: "read-result", output: "findings", partial: false, summary: "S", evidence };
+  assert.equal(readResultSchema.safeParse({ ...base, notes: { open: ["a", "b", "c", "d"] } }).success, true);
+  assert.equal(readResultSchema.safeParse({ ...base, notes: { open: ["a", "b", "c", "d", "e"] } }).success, false);
 });

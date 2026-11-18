@@ -102,23 +102,29 @@ export const readResultSchema = z.discriminatedUnion("output", [
 ]);
 export type ReadResult = z.infer<typeof readResultSchema>;
 
+const count = (max: number) => z.number().int().min(0).max(max);
+
 export const readGrantSchema = z.strictObject({
   requester: z.enum(["project-manager", "scout-lead", "reader", "quarantined-reader"]),
   poolOn: z.boolean(),
-  profiles: z.array(z.string()),
+  profiles: z.array(taskIdSchema).max(64),
   routerCoversScout: z.boolean(),
   limits: z.strictObject({
-    concurrency: z.number().int().min(0),
-    listConcurrency: z.number().int().min(0),
-    requestAttempts: z.number().int().min(0),
+    concurrency: count(64),
+    listConcurrency: count(64),
+    requestAttempts: count(100),
     outside: z.boolean(),
   }),
-  allowanceLeft: z.number().int().min(0),
-  reservation: z.number().int().min(0).optional(),
-  outsideProfiles: z.array(z.string()),
-  lineagesLeft: z.number().int().min(0).optional(),
-  requestsSent: z.number().int().min(0),
-  activeSteps: z.array(z.strictObject({ key: z.string(), stepId: z.string() })),
+  allowanceLeft: count(1000),
+  reservation: count(100).optional(),
+  outsideProfiles: z.array(taskIdSchema).max(64),
+  // Set by the host. The validator only reads it.
+  lineage: z.strictObject({
+    state: z.enum(["extends", "new", "capped"]),
+    uncleared: z.array(z.strictObject({ runId: z.uuid(), head: z.string().regex(/^[0-9a-f]{40,64}$/) })).max(3),
+  }).optional(),
+  requestsSent: count(100),
+  activeSteps: z.array(z.strictObject({ key: z.string().regex(/^[0-9a-f]{64}$/), stepId: taskIdSchema })).max(256),
 });
 export type ReadGrant = z.infer<typeof readGrantSchema>;
 
@@ -148,21 +154,21 @@ export type ReadRequestResult =
 export function stepKey(step: ReadStep): string {
   const instructions = step.instructions.replace(/\s+/g, " ").trim().toLowerCase();
   const paths = [...(step.paths ?? [])].sort();
-  const refs = step.source?.refs ?? [];
+  const refs = [...(step.source?.refs ?? [])].sort();
   const material = JSON.stringify([instructions, paths, step.output, step.forEach?.step ?? null, refs]);
   return createHash("sha256").update(material).digest("hex");
 }
 
-/** Part 3: a forEach step costs its maxItems, a lead step 1 plus its attempts, anything else 1. */
+/** Part 3: a step costs its forEach maxItems times its lead attempts (1 plus maxAttempts); each defaults to 1. */
 export function expandedTotal(request: ReadRequest): { total: number; phases: number[] } {
   const phases = request.phases.map(phase => phase.steps.reduce((sum, step) => sum + stepCost(step), 0));
   return { total: phases.reduce((sum, count) => sum + count, 0), phases };
 }
 
 function stepCost(step: ReadStep): number {
-  if (step.forEach) return step.forEach.maxItems;
-  if (step.lead) return 1 + step.lead.maxAttempts;
-  return 1;
+  const fanOut = step.forEach?.maxItems ?? 1;
+  const attempts = step.lead ? 1 + step.lead.maxAttempts : 1;
+  return fanOut * attempts;
 }
 
 type LocatedStep = { step: ReadStep; phase: number; path: string };
@@ -173,11 +179,17 @@ function locate(request: ReadRequest): LocatedStep[] {
 }
 
 /** Returns every rule violation in one pass, so the member fixes the request once. */
-export function validateReadRequest(request: ReadRequest, grant: ReadGrant): ReadRequestResult {
+export function validateReadRequest(request: ReadRequest, grantInput: unknown): ReadRequestResult {
+  const parsedGrant = readGrantSchema.safeParse(grantInput);
+  if (!parsedGrant.success) {
+    return { ok: false, errors: [error("not-granted", "grant", "The host's read grant is invalid, so no read can start.",
+      "This is a host fault: report it as a blocker instead of sending another read request.")] };
+  }
+  const grant = parsedGrant.data;
   const errors: ReadRequestError[] = [];
   const steps = locate(request);
   const { total, phases } = expandedTotal(request);
-  const keys: Record<string, string> = {};
+  const keyById = new Map<string, string>();
   const firstIdPath = new Map<string, string>();
   const firstKeyStep = new Map<string, string>();
   const isLead = grant.requester === "project-manager";
@@ -201,7 +213,7 @@ export function validateReadRequest(request: ReadRequest, grant: ReadGrant): Rea
 
   for (const { step, phase, path } of steps) {
     const stepKeyValue = stepKey(step);
-    if (!(step.id in keys)) keys[step.id] = stepKeyValue;
+    if (!keyById.has(step.id)) keyById.set(step.id, stepKeyValue);
 
     if (step.lead !== undefined && !isLead) {
       errors.push(error("not-granted", `${path}.lead`, "Only a project manager may set lead.",
@@ -212,6 +224,10 @@ export function validateReadRequest(request: ReadRequest, grant: ReadGrant): Rea
         "Remove the verify field."));
     }
 
+    if (step.source && step.lead) {
+      errors.push(error("not-granted", `${path}.lead`, "An outside-content step cannot be a lead.",
+        "Remove lead, or remove source from this step."));
+    }
     if (step.agentProfileId !== undefined && !grant.profiles.includes(step.agentProfileId)) {
       errors.push(error("unknown-profile", `${path}.agentProfileId`, `Profile "${step.agentProfileId}" is not in this run's pool.`,
         `Name one of the profiles in the pool: ${grant.profiles.join(", ") || "none"}.`));
@@ -226,12 +242,15 @@ export function validateReadRequest(request: ReadRequest, grant: ReadGrant): Rea
       if (!target) {
         errors.push(error("forward-reference", forEachPath, `forEach names "${step.forEach.step}", which is not a step in this request.`,
           "Name a list step from an earlier phase."));
-      } else if (target.phase >= phase) {
-        errors.push(error("forward-reference", forEachPath, `forEach names "${step.forEach.step}", which is in the same or a later phase.`,
-          "Move the list step into an earlier phase."));
-      } else if (target.step.output !== "list") {
-        errors.push(error("forward-reference", forEachPath, `forEach names "${step.forEach.step}", whose output is ${target.step.output}, not list.`,
-          "Name a step whose output is list."));
+      } else {
+        if (target.phase >= phase) {
+          errors.push(error("forward-reference", forEachPath, `forEach names "${step.forEach.step}", which is in the same or a later phase.`,
+            "Move the list step into an earlier phase."));
+        }
+        if (target.step.output !== "list") {
+          errors.push(error("forward-reference", forEachPath, `forEach names "${step.forEach.step}", whose output is ${target.step.output}, not list.`,
+            "Name a step whose output is list."));
+        }
       }
     }
 
@@ -267,9 +286,13 @@ export function validateReadRequest(request: ReadRequest, grant: ReadGrant): Rea
         errors.push(error("outside-off", sourcePath, "The step's profile has no verified outside-read tool.",
           "Use a profile that can read outside sources, or remove the source field."));
       }
-      if (grant.lineagesLeft === 0) {
-        errors.push(error("outside-off", sourcePath, "This run has no outside-read lineage left.",
-          "Remove the source field, or finish the run at a pull request."));
+      if (grant.lineage === undefined) {
+        errors.push(error("outside-off", sourcePath, "The host has not established whether this run may read outside content.",
+          "Report a blocker; outside reads wait for the host to set the lineage state."));
+      } else if (grant.lineage.state === "capped") {
+        const heads = grant.lineage.uncleared.map(item => `run ${item.runId} head ${item.head}`).join("; ");
+        errors.push(error("outside-off", sourcePath, `This run already holds the cap of uncleared outside lineages: ${heads}.`,
+          "The owner must clear one of these heads before a new outside lineage can start."));
       }
     }
   }
@@ -302,7 +325,7 @@ export function validateReadRequest(request: ReadRequest, grant: ReadGrant): Rea
     }
   }
 
-  return errors.length > 0 ? { ok: false, errors } : { ok: true, total, phases, keys };
+  return errors.length > 0 ? { ok: false, errors } : { ok: true, total, phases, keys: Object.fromEntries(keyById) };
 }
 
 function error(code: ReadErrorCode, path: string, message: string, fix: string): ReadRequestError {

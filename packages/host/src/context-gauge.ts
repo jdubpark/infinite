@@ -1,4 +1,5 @@
 /** Measures tool output the model received, and output kept in the record, from transcript rows. Lengths only, never text. */
+
 export type GaugeProvider = "claude" | "codex";
 
 /** PROPOSED: tool classes. Each name is a coarse bucket of what a tool does, not a tool name. */
@@ -15,12 +16,18 @@ export interface ContextGauge {
   insidePrograms: Partial<Record<ToolClass, ClassCount>>; // Codex only: results of calls a program made; the record keeps them
   images: number; // image parts in output the model received
   unmatched: number; // outputs with no known call
-  dropped: number; // ids forgotten because a bound was reached
+  dropped: number; // call ids forgotten because a bound was reached
 }
 
-/** PROPOSED bounds: 8,192 recorded call ids and 8,192 pending program items. The oldest is forgotten first. */
+/**
+ * PROPOSED bounds. A call id lives only while its call is in flight. The survey of 150 Codex records
+ * showed at most one call in flight at once, so 8,192 is far above the need.
+ */
 const MAX_CALLS = 8192;
-const MAX_PENDING = 8192;
+/** PROPOSED: recent step ids kept for deduplication. An id seen again after 1,024 other ids counts again. */
+const MAX_STEP_IDS = 1024;
+/** PROPOSED: a string longer than this is not an id. The row is handled as if the id were missing. */
+const MAX_ID_LENGTH = 256;
 
 const TOOL_CLASSES: readonly ToolClass[] = ["program", "shell", "file-read", "file-write", "search", "web", "mcp", "agent", "other"];
 
@@ -33,7 +40,7 @@ const CLAUDE_CLASSES = new Map<string, ToolClass>([
   ["Agent", "agent"], ["Task", "agent"],
 ]);
 
-/** PROPOSED: Codex function names by class. Any other name is `other`. */
+/** PROPOSED: Codex function names by class. Names ending in `_agent` or `_agents` are also `agent`; any other name is `other`. */
 const CODEX_CLASSES = new Map<string, ToolClass>([
   ["exec", "program"], ["wait", "program"],
   ["spawn_agent", "agent"], ["send_message", "agent"], ["wait_agent", "agent"], ["followup_task", "agent"], ["list_agents", "agent"],
@@ -42,13 +49,16 @@ const CODEX_CLASSES = new Map<string, ToolClass>([
 type Table = Partial<Record<ToolClass, ClassCount>>;
 interface Measure { chars: number; images: number }
 
+const SAFE = Number.MAX_SAFE_INTEGER;
 const object = (value: unknown): Record<string, unknown> | undefined =>
   value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 const list = (value: unknown): unknown[] | undefined => Array.isArray(value) ? value : undefined;
 const isCount = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-
-/** A Claude count: anything that is not a finite non-negative number counts as 0. */
-const claudeNumber = (value: unknown): number => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+const isId = (value: unknown): value is string => typeof value === "string" && value.length <= MAX_ID_LENGTH;
+/** A Claude token field counts only when it is a safe non-negative integer; otherwise it counts 0. */
+const claudeCount = (value: unknown): number => isCount(value) ? value : 0;
+/** Adds without exceeding Number.MAX_SAFE_INTEGER. */
+const saturate = (a: number, b: number): number => Math.min(SAFE, a + b);
 
 /** Output content: a string counts its length; a list counts each part's text. An image part adds no characters. */
 function measure(content: unknown, isImage: (type: string) => boolean): Measure {
@@ -58,14 +68,14 @@ function measure(content: unknown, isImage: (type: string) => boolean): Measure 
     const value = object(part);
     if (!value) continue;
     if (typeof value.type === "string" && isImage(value.type)) result.images += 1;
-    else if (typeof value.text === "string") result.chars += value.text.length;
+    else if (typeof value.text === "string") result.chars = saturate(result.chars, value.text.length);
   }
   return result;
 }
 
 function tally(table: Table, cls: ToolClass, chars: number): void {
   const count = table[cls] ?? { calls: 0, chars: 0, maxChars: 0 };
-  table[cls] = { calls: count.calls + 1, chars: count.chars + chars, maxChars: Math.max(count.maxChars, chars) };
+  table[cls] = { calls: saturate(count.calls, 1), chars: saturate(count.chars, chars), maxChars: Math.max(count.maxChars, chars) };
 }
 
 function copyTable(table: Table): Table {
@@ -84,26 +94,36 @@ function programItem(item: Record<string, unknown>): { cls: ToolClass; chars: nu
     case "CommandExecution": return { cls: "shell", chars: length(item.aggregated_output) };
     case "McpToolCall": return { cls: "mcp", chars: measure(object(item.result)?.content, () => false).chars };
     case "FileChange": return { cls: "file-write", chars: length(item.stdout) + length(item.stderr) };
+    // PROPOSED: an Extension result shape is not verified, so it counts as a call with no characters.
     case "Extension": return { cls: "web", chars: 0 };
     default: return undefined;
   }
 }
 
 const claudeClass = (name: string): ToolClass => name.startsWith("mcp__") ? "mcp" : CLAUDE_CLASSES.get(name) ?? "other";
-/** Reads one row at a time; never throws. Codex program items wait in `pending` until a call row shows whether the model made the call. */
+const codexClass = (name: string): ToolClass =>
+  CODEX_CLASSES.get(name) ?? (name.endsWith("_agent") || name.endsWith("_agents") ? "agent" : "other");
+
+/**
+ * Reads one row at a time; never throws.
+ * PROPOSED: a Codex program item counts as inside a program unless its id is a call in flight. The survey
+ * showed each direct call's item arrives between its call row and its output row, so an item before its
+ * call row, or after its output row, is counted inside. That limit is kept, not fixed.
+ */
 export class ContextGaugeTail {
   private readonly provider: GaugeProvider;
+  /** Call ids in flight. An id is forgotten when its output arrives. */
   private readonly calls = new Map<string, ToolClass>();
-  private readonly pending = new Map<string, { cls: ToolClass; chars: number }>();
-  private readonly received: Table = {};
-  private readonly inside: Table = {};
-  /** Claude message or Codex response ids, each with its largest input. */
-  private readonly steps = new Map<string, number>();
+  /** Recent step ids for deduplication, in insertion order. */
+  private readonly stepIds = new Set<string>();
+  private modelSteps = 0;
   private peak = 0;
-  /** Codex `token_count` rows, used only when the session has no valid `token_usage_record` row. */
+  /** Codex `token_count` rows, used only when the session has no valid `token_usage_record` row. PROPOSED: a session with only cumulative totals (no `last_token_usage`) gives no steps. */
   private sawRecord = false;
   private legacySteps = 0;
   private legacyPeak = 0;
+  private readonly received: Table = {};
+  private readonly inside: Table = {};
   private images = 0;
   private unmatched = 0;
   private dropped = 0;
@@ -136,12 +156,17 @@ export class ContextGaugeTail {
   /** A fresh object on every call. */
   snapshot(): ContextGauge {
     const legacy = this.provider === "codex" && !this.sawRecord;
-    const inside = copyTable(this.inside);
-    for (const { cls, chars } of this.pending.values()) tally(inside, cls, chars);
-    const steps = legacy ? this.legacySteps : this.steps.size;
-    const peak = legacy ? this.legacyPeak : this.peak;
-    return { v: 1, provider: this.provider, modelSteps: steps, peakInputTokens: peak, received: copyTable(this.received),
-      insidePrograms: inside, images: this.images, unmatched: this.unmatched, dropped: this.dropped };
+    return {
+      v: 1,
+      provider: this.provider,
+      modelSteps: legacy ? this.legacySteps : this.modelSteps,
+      peakInputTokens: legacy ? this.legacyPeak : this.peak,
+      received: copyTable(this.received),
+      insidePrograms: copyTable(this.inside),
+      images: this.images,
+      unmatched: this.unmatched,
+      dropped: this.dropped,
+    };
   }
 
   private pushClaude(row: Record<string, unknown>): void {
@@ -150,17 +175,19 @@ export class ContextGaugeTail {
     if (!message) return;
     if (row.type === "assistant") {
       const usage = object(message.usage);
-      if (usage && typeof message.id === "string") {
-        this.step(message.id, claudeNumber(usage.input_tokens) + claudeNumber(usage.cache_read_input_tokens) + claudeNumber(usage.cache_creation_input_tokens));
+      const synthetic = typeof message.model === "string" && message.model.startsWith("<");
+      if (usage && isId(message.id) && !synthetic) {
+        const input = claudeCount(usage.input_tokens) + claudeCount(usage.cache_read_input_tokens) + claudeCount(usage.cache_creation_input_tokens);
+        if (Number.isSafeInteger(input)) this.step(message.id, input);
       }
       for (const block of list(message.content) ?? []) {
         const value = object(block);
-        if (value?.type === "tool_use" && typeof value.id === "string" && typeof value.name === "string") this.remember(value.id, claudeClass(value.name));
+        if (value?.type === "tool_use" && isId(value.id) && typeof value.name === "string") this.remember(value.id, claudeClass(value.name));
       }
     } else if (row.type === "user") {
       for (const block of list(message.content) ?? []) {
         const value = object(block);
-        if (value?.type === "tool_result" && typeof value.tool_use_id === "string") {
+        if (value?.type === "tool_result" && isId(value.tool_use_id)) {
           this.output(value.tool_use_id, value.content, type => type === "image");
         }
       }
@@ -171,68 +198,62 @@ export class ContextGaugeTail {
     const payload = object(row.payload);
     if (row.type === "token_usage_record") {
       const input = object(payload?.usage)?.input_tokens;
-      if (typeof payload?.response_id === "string" && isCount(input)) {
+      if (isId(payload?.response_id) && isCount(input)) {
         this.sawRecord = true;
         this.step(payload.response_id, input);
       }
     } else if (row.type === "event_msg" && payload?.type === "token_count") {
       const input = object(object(payload.info)?.last_token_usage)?.input_tokens;
       if (isCount(input)) {
-        this.legacySteps += 1;
+        this.legacySteps = saturate(this.legacySteps, 1);
         this.legacyPeak = Math.max(this.legacyPeak, input);
       }
     } else if (row.type === "event_msg" && payload?.type === "item_completed") {
       const item = object(payload.item);
-      if (item && typeof item.id === "string" && !this.calls.has(item.id)) {
+      if (item && isId(item.id) && !this.calls.has(item.id)) {
         const found = programItem(item);
-        if (found) this.hold(item.id, found.cls, found.chars);
+        if (found) tally(this.inside, found.cls, found.chars);
       }
     } else if (row.type === "response_item" && payload) {
       const callId = payload.call_id;
-      if ((payload.type === "custom_tool_call" || payload.type === "function_call") && typeof callId === "string" && typeof payload.name === "string") {
-        this.remember(callId, CODEX_CLASSES.get(payload.name) ?? "other");
-      } else if ((payload.type === "custom_tool_call_output" || payload.type === "function_call_output") && typeof callId === "string") {
+      if ((payload.type === "custom_tool_call" || payload.type === "function_call") && isId(callId) && typeof payload.name === "string") {
+        this.remember(callId, codexClass(payload.name));
+      } else if ((payload.type === "custom_tool_call_output" || payload.type === "function_call_output") && isId(callId)) {
         this.output(callId, payload.output, type => type.includes("image"));
       }
     }
   }
 
+  /** A step counts once per id among the most recent 1,024 ids. The peak is a running maximum. */
   private step(id: string, input: number): void {
-    this.steps.set(id, Math.max(this.steps.get(id) ?? 0, input));
     this.peak = Math.max(this.peak, input);
+    if (this.stepIds.has(id)) return;
+    if (this.stepIds.size >= MAX_STEP_IDS) {
+      const oldest = this.stepIds.values().next();
+      if (!oldest.done) this.stepIds.delete(oldest.value);
+    }
+    this.stepIds.add(id);
+    this.modelSteps = saturate(this.modelSteps, 1);
   }
 
-  /** A call row means the model made the call directly, so a pending item with this id is dropped. */
+  /** Remembers a call id until its output arrives. When full, the oldest id is forgotten and counted as dropped. */
   private remember(id: string, cls: ToolClass): void {
     if (this.calls.has(id)) return;
     if (this.calls.size >= MAX_CALLS) {
       const oldest = this.calls.keys().next();
       if (!oldest.done) this.calls.delete(oldest.value);
-      this.dropped += 1;
+      this.dropped = saturate(this.dropped, 1);
     }
     this.calls.set(id, cls);
-    this.pending.delete(id);
   }
 
-  /** Past the bound, the oldest pending item counts as inside a program. */
-  private hold(id: string, cls: ToolClass, chars: number): void {
-    if (this.pending.size >= MAX_PENDING && !this.pending.has(id)) {
-      const oldest = this.pending.keys().next();
-      if (!oldest.done) {
-        const evicted = this.pending.get(oldest.value);
-        this.pending.delete(oldest.value);
-        if (evicted) tally(this.inside, evicted.cls, evicted.chars);
-      }
-      this.dropped += 1;
-    }
-    this.pending.set(id, { cls, chars });
-  }
-
+  /** The output of a call: look up its class, count it, then forget the id. */
   private output(callId: string, content: unknown, isImage: (type: string) => boolean): void {
     const cls = this.calls.get(callId);
-    if (cls === undefined) this.unmatched += 1;
+    this.calls.delete(callId);
+    if (cls === undefined) this.unmatched = saturate(this.unmatched, 1);
     const measured = measure(content, isImage);
     tally(this.received, cls ?? "other", measured.chars);
-    this.images += measured.images;
+    this.images = saturate(this.images, measured.images);
   }
 }

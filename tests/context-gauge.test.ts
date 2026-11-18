@@ -3,17 +3,18 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { ContextGaugeTail } from "../packages/host/src/context-gauge.js";
 
-const codexFixture = new URL("./fixtures/usage/codex-session.jsonl", import.meta.url);
+const fixture = (name: string) => new URL(`./fixtures/usage/${name}`, import.meta.url);
 
 const call = (callId: string, name: string, type = "custom_tool_call") => ({ type: "response_item", payload: { type, call_id: callId, name } });
 const output = (callId: string, body: unknown, type = "custom_tool_call_output") => ({ type: "response_item", payload: { type, call_id: callId, output: body } });
 const item = (id: string, body: Record<string, unknown>) => ({ type: "event_msg", payload: { type: "item_completed", item: { id, ...body } } });
 const usage = (responseId: string, inputTokens: number) => ({ type: "token_usage_record", payload: { response_id: responseId, usage: { input_tokens: inputTokens } } });
+const claudeStep = (id: string, usageFields: Record<string, unknown>, model = "model-fixture-a") => ({
+  type: "assistant", message: { id, model, usage: usageFields, content: [] },
+});
 
-/** A synthetic Codex session: two programs, one direct call with its event, usage rows, an image, and an orphan output. */
-function codexSession(directEventFirst: boolean): unknown[] {
-  const directEvent = item("call_direct", { type: "CommandExecution", aggregated_output: "hi" });
-  const directCall = call("call_direct", "exec");
+/** A synthetic Codex session: two programs, one direct call with its item event, usage rows, an image, and an orphan output. */
+function codexSession(): unknown[] {
   return [
     call("call_p1", "exec"),
     item("cmd_1", { type: "CommandExecution", aggregated_output: "x".repeat(10) }),
@@ -26,7 +27,8 @@ function codexSession(directEventFirst: boolean): unknown[] {
     item("fc_1", { type: "FileChange", stdout: "ab", stderr: "c" }),
     item("ext_1", { type: "Extension" }),
     output("call_p2", "q".repeat(50)),
-    ...(directEventFirst ? [directEvent, directCall] : [directCall, directEvent]),
+    call("call_direct", "exec"),
+    item("call_direct", { type: "CommandExecution", aggregated_output: "hi" }),
     output("call_direct", "hi"),
     call("call_img", "view_image", "function_call"),
     output("call_img", [{ type: "input_text", text: "abc" }, { type: "input_image", image_url: "data:omitted" }], "function_call_output"),
@@ -40,7 +42,7 @@ function codexSession(directEventFirst: boolean): unknown[] {
 
 test("Codex session gives the exact gauge", () => {
   const tail = new ContextGaugeTail("codex");
-  for (const row of codexSession(false)) tail.push(row);
+  for (const row of codexSession()) tail.push(row);
   assert.deepEqual(tail.snapshot(), {
     v: 1,
     provider: "codex",
@@ -62,18 +64,23 @@ test("Codex session gives the exact gauge", () => {
   });
 });
 
-test("Codex direct item gives the same gauge whichever row arrives first", () => {
-  const before = new ContextGaugeTail("codex");
-  const after = new ContextGaugeTail("codex");
-  for (const row of codexSession(true)) before.push(row);
-  for (const row of codexSession(false)) after.push(row);
-  assert.deepEqual(before.snapshot(), after.snapshot());
-  assert.equal(before.snapshot().insidePrograms.shell?.calls, 3);
+test("Codex direct item is not inside a program; the two documented limits are counted inside", () => {
+  const shell = (rows: unknown[]) => {
+    const tail = new ContextGaugeTail("codex");
+    for (const row of rows) tail.push(row);
+    return tail.snapshot().insidePrograms;
+  };
+  const direct = [call("d", "exec"), item("d", { type: "CommandExecution", aggregated_output: "hi" }), output("d", "hi")];
+  assert.deepEqual(shell(direct), {});
+  // Limit: an item that arrives before its call row counts inside a program.
+  assert.deepEqual(shell([item("d", { type: "CommandExecution", aggregated_output: "hi" }), ...direct]), { shell: { calls: 1, chars: 2, maxChars: 2 } });
+  // Limit: an item that arrives after its output row counts inside a program.
+  assert.deepEqual(shell([...direct, item("d", { type: "CommandExecution", aggregated_output: "hi" })]), { shell: { calls: 1, chars: 2, maxChars: 2 } });
 });
 
 test("Codex usage kinds: token_count rows count only without record rows", () => {
-  const legacyOnly = new ContextGaugeTail("codex");
   const countRow = (input: number) => ({ type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: input } } } });
+  const legacyOnly = new ContextGaugeTail("codex");
   for (const row of [countRow(300), countRow(700), countRow(400)]) legacyOnly.push(row);
   assert.deepEqual({ modelSteps: legacyOnly.snapshot().modelSteps, peak: legacyOnly.snapshot().peakInputTokens }, { modelSteps: 3, peak: 700 });
 
@@ -126,6 +133,118 @@ test("Claude session gives the exact gauge", () => {
   });
 });
 
+test("a Claude step input is the sum of its three token fields", () => {
+  const tail = new ContextGaugeTail("claude");
+  tail.push(claudeStep("msg_sum", { input_tokens: 100, cache_read_input_tokens: 50, cache_creation_input_tokens: 10 }));
+  assert.deepEqual({ steps: tail.snapshot().modelSteps, peak: tail.snapshot().peakInputTokens }, { steps: 1, peak: 160 });
+});
+
+test("tool classes: wait is program and an *_agent name is agent", () => {
+  const tail = new ContextGaugeTail("codex");
+  tail.push(call("w", "wait"));
+  tail.push(output("w", "abc"));
+  tail.push(call("i", "interrupt_agent", "function_call"));
+  tail.push(output("i", "de", "function_call_output"));
+  assert.deepEqual(tail.snapshot().received, {
+    program: { calls: 1, chars: 3, maxChars: 3 },
+    agent: { calls: 1, chars: 2, maxChars: 2 },
+  });
+});
+
+test("Codex bounds: forgotten call ids, one call in flight, and recent step ids", () => {
+  const abandoned = new ContextGaugeTail("codex");
+  for (let index = 0; index < 10_000; index += 1) abandoned.push(call(`c${index}`, "view_image", "function_call"));
+  assert.equal(abandoned.snapshot().dropped, 1808);
+  abandoned.push(output("c0", "abc", "function_call_output"));
+  assert.equal(abandoned.snapshot().unmatched, 1);
+  assert.deepEqual(abandoned.snapshot().received.other, { calls: 1, chars: 3, maxChars: 3 });
+
+  const paired = new ContextGaugeTail("codex");
+  for (let index = 0; index < 10_000; index += 1) {
+    paired.push(call(`p${index}`, "view_image", "function_call"));
+    paired.push(output(`p${index}`, "x", "function_call_output"));
+  }
+  assert.deepEqual({ dropped: paired.snapshot().dropped, unmatched: paired.snapshot().unmatched, calls: paired.snapshot().received.other?.calls }, { dropped: 0, unmatched: 0, calls: 10_000 });
+
+  const distinct = new ContextGaugeTail("codex");
+  for (let index = 0; index < 3000; index += 1) distinct.push(usage(`r${index}`, 1));
+  assert.equal(distinct.snapshot().modelSteps, 3000);
+
+  // PROPOSED: an id seen again within the last 1,024 ids is one step; after that it counts again.
+  const recent = new ContextGaugeTail("codex");
+  for (const id of ["a", "b", "a"]) recent.push(usage(id, 1));
+  assert.equal(recent.snapshot().modelSteps, 2);
+  const aged = new ContextGaugeTail("codex");
+  aged.push(usage("a", 1));
+  for (let index = 0; index < 1024; index += 1) aged.push(usage(`o${index}`, 1));
+  aged.push(usage("a", 1));
+  assert.equal(aged.snapshot().modelSteps, 1026);
+});
+
+test("numbers: Claude token fields that are not safe integers count as 0", () => {
+  const steps = (usageFields: Record<string, unknown>) => {
+    const tail = new ContextGaugeTail("claude");
+    tail.push(claudeStep("msg_n", usageFields));
+    const gauge = tail.snapshot();
+    return { modelSteps: gauge.modelSteps, peakInputTokens: gauge.peakInputTokens };
+  };
+  assert.deepEqual(steps({ input_tokens: 1e308, cache_read_input_tokens: 1e308 }), { modelSteps: 1, peakInputTokens: 0 });
+  assert.deepEqual(steps({ input_tokens: 9007199254740991, cache_creation_input_tokens: 1 }), { modelSteps: 0, peakInputTokens: 0 });
+  assert.deepEqual(steps({ input_tokens: 0.5 }), { modelSteps: 1, peakInputTokens: 0 });
+});
+
+test("a synthetic Claude row is no model step, and its content is still read", () => {
+  const tail = new ContextGaugeTail("claude");
+  tail.push(claudeStep("msg_syn", { input_tokens: 500 }, "<synthetic>"));
+  tail.push({ type: "assistant", message: { id: "msg_syn", usage: { input_tokens: 500 }, model: "<synthetic>", content: [{ type: "tool_use", id: "t_syn", name: "Bash" }] } });
+  tail.push({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t_syn", content: "ok" }] } });
+  assert.deepEqual({ steps: tail.snapshot().modelSteps, peak: tail.snapshot().peakInputTokens, shell: tail.snapshot().received.shell }, { steps: 0, peak: 0, shell: { calls: 1, chars: 2, maxChars: 2 } });
+});
+
+test("the Claude fixture gives one step per distinct non-synthetic message id with usage", () => {
+  // Lines that are not JSON are skipped, as the relay does.
+  const rows = readFileSync(fixture("claude-session.jsonl"), "utf8").split("\n").flatMap(line => {
+    try { return [JSON.parse(line) as Record<string, unknown>]; } catch { return []; }
+  });
+  assert.ok(rows.length > 0, "the fixture has rows to read");
+  const ids = new Set<string>();
+  let synthetic = 0;
+  for (const row of rows) {
+    const message = row.message as { id?: unknown; usage?: unknown; model?: unknown } | undefined;
+    if (row.type !== "assistant" || !message?.usage || typeof message.id !== "string") continue;
+    if (typeof message.model === "string" && message.model.startsWith("<")) synthetic += 1;
+    else ids.add(message.id);
+  }
+  assert.ok(ids.size > 0, "the fixture has model steps to count");
+  assert.ok(synthetic > 0, "the fixture has a synthetic row to skip");
+
+  const tail = new ContextGaugeTail("claude");
+  for (const line of readFileSync(fixture("claude-session.jsonl"), "utf8").split("\n")) tail.pushLine(line);
+  assert.equal(tail.snapshot().modelSteps, ids.size);
+});
+
+test("an id longer than 256 characters is ignored as if it were missing", () => {
+  const longId = "x".repeat(300);
+  const claude = new ContextGaugeTail("claude");
+  claude.push(claudeStep(longId, { input_tokens: 700 }));
+  assert.deepEqual({ steps: claude.snapshot().modelSteps, peak: claude.snapshot().peakInputTokens }, { steps: 0, peak: 0 });
+
+  const codex = new ContextGaugeTail("codex");
+  codex.push(call(longId, "exec"));
+  codex.push(output(longId, "abc"));
+  const gauge = codex.snapshot();
+  assert.deepEqual({ unmatched: gauge.unmatched, other: gauge.received.other }, { unmatched: 0, other: undefined });
+  assert.deepEqual(gauge.received, {});
+});
+
+test("a Codex session with only cumulative totals gives no steps", () => {
+  const tail = new ContextGaugeTail("codex");
+  const lines = readFileSync(fixture("codex-cumulative-session.jsonl"), "utf8").split("\n").filter(line => line.trim().length > 0);
+  assert.ok(lines.length > 0, "the fixture has rows to read");
+  for (const line of lines) tail.pushLine(line);
+  assert.equal(tail.snapshot().modelSteps, 0);
+});
+
 test("hostile rows change nothing and nothing throws", () => {
   const junk: unknown[] = [
     null, undefined, 0, 1, "text", true, [], [null], [{}], {},
@@ -158,28 +277,4 @@ test("hostile rows change nothing and nothing throws", () => {
   bigCodex.push(call("big", "exec"));
   bigCodex.push(output("big", "a".repeat(5_000_000)));
   assert.deepEqual(bigCodex.snapshot().received.program, { calls: 1, chars: 5_000_000, maxChars: 5_000_000 });
-});
-
-test("Codex call ids are bounded and a forgotten output is unmatched", () => {
-  const tail = new ContextGaugeTail("codex");
-  for (let index = 0; index < 10_000; index += 1) tail.push(call(`c${index}`, "view_image", "function_call"));
-  assert.equal(tail.snapshot().dropped, 1808);
-  tail.push(output("c0", "abc", "function_call_output"));
-  const gauge = tail.snapshot();
-  assert.equal(gauge.unmatched, 1);
-  assert.deepEqual(gauge.received.other, { calls: 1, chars: 3, maxChars: 3 });
-});
-
-test("the Codex fixture gives one step per distinct response id", () => {
-  const lines = readFileSync(codexFixture, "utf8").split("\n").filter(line => line.trim().length > 0);
-  const responseIds = new Set<string>();
-  for (const line of lines) {
-    const row = JSON.parse(line) as { type?: string; payload?: { response_id?: unknown } };
-    if (row.type === "token_usage_record" && typeof row.payload?.response_id === "string") responseIds.add(row.payload.response_id);
-  }
-  assert.ok(responseIds.size > 0, "the fixture has usage records to count");
-
-  const tail = new ContextGaugeTail("codex");
-  for (const line of lines) tail.pushLine(line);
-  assert.equal(tail.snapshot().modelSteps, responseIds.size);
 });

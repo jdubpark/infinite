@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { fixture, mixedLineup } from "./team-fixture.js";
@@ -56,11 +56,12 @@ async function settleAnswering(teams: { get(id: string): TeamView; answer(id: st
  * registers: the configuration and outcome projectors, then the routing module and its projector, on one outbox.
  * `planWithoutProfiles` writes the fixture's marker, so the project manager's plan omits every agentProfileId.
  * `points` sets the project's routing points, and `escalations` the lineup's escalation profiles, when given.
+ * `scenario` and `base` replace the fixture scenario and the lineup the evaluator and escalations are added to.
  */
-async function autoRun(planWithoutProfiles: boolean, points?: RoutingPoint[], escalations?: TeamLineup["escalations"]) {
+async function autoRun(planWithoutProfiles: boolean, points?: RoutingPoint[], escalations?: TeamLineup["escalations"], scenario = "mixed", base: TeamLineup = mixedLineup) {
   // The evaluator lets the autonomous project pin its run autonomous (C14); the intent check stays off, as in routing-run.
-  const lineup: TeamLineup = { ...mixedLineup, evaluators: [{ id: "evaluator", label: "Evaluator", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" }], ...(escalations ? { escalations } : {}) };
-  const f = await fixture("mixed", lineup, {}, { noServer: true });
+  const lineup: TeamLineup = { ...base, evaluators: [{ id: "evaluator", label: "Evaluator", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" }], ...(escalations ? { escalations } : {}) };
+  const f = await fixture(scenario, lineup, {}, { noServer: true });
   if (planWithoutProfiles) writeFileSync(join(f.receipts, "plan-no-profiles"), "");
   const key = readFileSync(f.host.config.keyFile);
   const store = new EvidenceStore({ databasePath: evidenceDatabasePath(f.host.config.stateDir), vaultKey: key });
@@ -256,6 +257,34 @@ test("an auto run routes its scouts and its escalation, and no member sees a rou
       const launched = JSON.parse(readFileSync(join(f.receipts, `${member.memberId}.json`), "utf8")) as Record<string, unknown>;
       assert.equal("hostProfiles" in launched, false, `the ${member.role} assignment carries hostProfiles`);
     }
+  } finally {
+    await f.close();
+    store.close();
+  }
+});
+
+test("a permission review in a covered auto run reads neither hostProfiles nor the task's routing", { timeout: 240000 }, async () => {
+  // A strong coordinator reviews the dialog. The router starts task a on astra-xhigh, a Codex profile, whose session shows the
+  // fixture's Codex command dialog, and the escalation profile makes the run cover `escalation` for that implementer.
+  const reviewing: TeamLineup = { ...mixedLineup, coordinator: { ...mixedLineup.coordinator, tier: "strong" } };
+  const { f, store, teams } = await autoRun(true, ["start", "escalation"], [SONNET_ESCALATION], "permissions-codex", reviewing);
+  try {
+    const created = await teams.create(f.create());
+    const feedbackFile = join(f.receipts, `${created.id}.permission-feedback.json`);
+    await waitFor(() => Promise.resolve(existsSync(feedbackFile) && existsSync(join(f.receipts, `${created.id}.judge-ready`))), Boolean, 120000);
+    const run = storedRun(teams, created.id);
+    const target = run.members.find(member => member.memberId === run.permissionDecisions?.[0]?.targetMemberId);
+    assert.ok(target, "the permission decision names no member");
+    assert.equal(target.hostProfiles, true, "the reviewed implementer does not hold hostProfiles");
+    assert.deepEqual(run.tasks.find(task => task.id === target.taskId)?.routing, { profileId: "astra-xhigh", by: "router" });
+    const feedback = JSON.parse(readFileSync(feedbackFile, "utf8")) as { targetAssignment: Record<string, unknown>; targetTask: Record<string, unknown> };
+    assert.equal(feedback.targetAssignment.memberId, target.memberId);
+    assert.equal("hostProfiles" in feedback.targetAssignment, false, "the review input's assignment carries hostProfiles");
+    assert.equal(feedback.targetTask.id, target.taskId);
+    assert.equal("routing" in feedback.targetTask, false, "the review input's task carries its routing decision");
+    writeFileSync(join(f.receipts, `${created.id}.judge-release`), "release", { mode: 0o600 });
+    await settleAnswering(teams, created.id);
+    await membersClosed(teams, created.id);
   } finally {
     await f.close();
     store.close();

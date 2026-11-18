@@ -222,6 +222,19 @@ test("a malformed gauge still integrates the row and stores no gauge", () => {
   } finally { h.close(); }
 });
 
+test("a later integration without a valid gauge removes the earlier one", () => {
+  const gauge = { writers: 1, staleBase: false, changedPaths: 1 };
+  for (const later of [{}, { integration: { writers: "x" } }]) {
+    const h = harness();
+    try {
+      h.flush([...prologue(), integratedEvent({ integration: gauge })]);
+      assert.deepEqual(rowOf(h)?.payload.integration, gauge);
+      h.flush([integratedEvent(later)]);
+      assert.equal("integration" in (rowOf(h)?.payload ?? {}), false, JSON.stringify(later));
+    } finally { h.close(); }
+  }
+});
+
 // ---------- d. end to end through the team service ----------
 
 type Fixture = ReturnType<typeof schedulerFixture>;
@@ -282,5 +295,82 @@ test("an integrated result stores the writers in flight and the path count", asy
     assert.ok(event, "task.integrated is stored");
     assert.deepEqual(event.data.integration, { writers: 1, staleBase: false, changedPaths: 1 });
     assert.equal(JSON.stringify(allEvents(store, f.run.id)).includes("a.txt"), false, "owned paths are stored only by task.planned");
+  } finally { store.close(); f.close(); }
+});
+
+test("a result with no change records a known zero path count", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f);
+  try {
+    const memberId = randomUUID(), cwd = await prepareMemberWorkspace(f.run.workspace, memberId, f.run.baseCommit, f.config.teams?.commandPrefix);
+    f.run.headCommit = f.run.baseCommit;
+    f.run.tasks = [{ id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [], status: "running", memberId }];
+    const member = { ...f.run.members[0]!, memberId, role: "implementer" as const, taskId: "a", cwd, status: "reported" as const,
+      report: { kind: "result" as const, summary: "Nothing to change" } };
+    f.run.members = [member];
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    scheduler.consume(stored, member);
+    await waitFor(() => stored.pending === undefined, "the empty result completes");
+    await teams.idle();
+    const event = allEvents(store, f.run.id).find(item => item.kind === "task.integrated");
+    assert.ok(event, "task.integrated is stored");
+    assert.equal("commit" in event.data, false);
+    assert.deepEqual(event.data.integration, { writers: 0, staleBase: false, changedPaths: 0 });
+  } finally { store.close(); f.close(); }
+});
+
+test("two members integrate in order and their outcome rows replay identically", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f);
+  try {
+    const idA = randomUUID(), idB = randomUUID();
+    const cwdA = await prepareMemberWorkspace(f.run.workspace, idA, f.run.baseCommit, f.config.teams?.commandPrefix);
+    const cwdB = await prepareMemberWorkspace(f.run.workspace, idB, f.run.baseCommit, f.config.teams?.commandPrefix);
+    writeFileSync(join(cwdA, "a.txt"), "one\n");
+    writeFileSync(join(cwdB, "b.txt"), "two\n");
+    f.run.headCommit = f.run.baseCommit;
+    f.run.tasks = [
+      { id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [], status: "running", memberId: idA },
+      { id: "b", title: "Write b", instructions: "Write b.txt", paths: ["b.txt"], dependsOn: [], status: "running", memberId: idB },
+    ];
+    const memberOf = (memberId: string, taskId: string, cwd: string) => ({ ...f.run.members[0]!, memberId, role: "implementer" as const,
+      taskId, cwd, baseCommit: f.run.baseCommit, status: "reported" as const, report: { kind: "result" as const, summary: `Wrote ${taskId}` } });
+    const memberA = memberOf(idA, "a", cwdA), memberB = memberOf(idB, "b", cwdB);
+    f.run.members = [memberA, memberB];
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    scheduler.consume(stored, memberA);
+    await waitFor(() => stored.pending === undefined, "member A is integrated");
+    scheduler.consume(stored, stored.run.members.find(item => item.memberId === idB)!);
+    await waitFor(() => stored.pending === undefined, "member B is integrated");
+    await teams.idle();
+    const integrated = allEvents(store, f.run.id).filter(item => item.kind === "task.integrated");
+    assert.equal(integrated.length, 2);
+    assert.equal(integrated[0]!.memberId, idA);
+    assert.deepEqual(integrated[0]!.data.integration, { writers: 1, staleBase: false, changedPaths: 1 });
+    assert.equal(integrated[1]!.memberId, idB);
+    assert.deepEqual(integrated[1]!.data.integration, { writers: 0, staleBase: true, changedPaths: 1 });
+
+    const runEvents = allEvents(store, f.run.id);
+    const project = () => {
+      const h = harness();
+      h.flush(runEvents.map(({ seq: _seq, ...rest }) => rest));
+      const rows = [idA, idB].map(memberId => h.store.read(db => readOutcome(db, `${f.run.id}:${memberId}`)));
+      h.close();
+      return rows;
+    };
+    const first = project();
+    assert.deepEqual(first.map(row => row?.payload.integration), [
+      { writers: 1, staleBase: false, changedPaths: 1 },
+      { writers: 0, staleBase: true, changedPaths: 1 },
+    ]);
+    // The *Ref fields are keyed by each store's vault key, so a fresh store hashes them differently. Compare everything else.
+    const unkeyed = (rows: typeof first) => rows.map(row => Object.fromEntries(Object.entries(row ?? {}).filter(([key]) => !key.endsWith("Ref"))));
+    assert.deepEqual(unkeyed(project()), unkeyed(first), "a replay writes the same rows");
   } finally { store.close(); f.close(); }
 });

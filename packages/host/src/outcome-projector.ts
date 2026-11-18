@@ -276,6 +276,7 @@ function taskIntegrated(ctx: Ctx): void {
   if (diff) row.payload.diff = diff;
   const gauge = integrationOf(data.integration);
   if (gauge) row.payload.integration = gauge;
+  else delete row.payload.integration;
   // An integration with no commit changed nothing, so the attempt is an empty result.
   if (str(data.commit) === undefined) row.flags = withFlag(row.flags, "empty-result");
   saveOutcomeRow(tx, row);

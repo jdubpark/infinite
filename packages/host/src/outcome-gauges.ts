@@ -7,7 +7,12 @@ export type GaugePayload = {
 export type IntegrationGauge = {
   /** Other tasks of the run with status `running` or `waiting` when this result was integrated. */
   writers: number;
-  /** True when the integration head had moved past this member's base before this integration. Absent when unknown. */
+  /**
+   * True when the integration head had moved past this member's base before this integration. Absent when unknown.
+   * It measures only that the head had moved past the base, not that two members ran at the same time. It is true for an
+   * assignment that waited in the queue on an older base while another result landed, and a result with no commit can be
+   * stale too. It is false for a member created after earlier integrations, even though other work had landed before it started.
+   */
   staleBase?: boolean;
   /** Paths this result changed. Absent when the host could not read the list. */
   changedPaths?: number;

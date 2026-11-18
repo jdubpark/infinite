@@ -5,6 +5,7 @@ import { isAbsolute, relative, sep } from "node:path";
 import { z } from "zod";
 import { parseMermaid, type Diagram, type UnderstandingBrief, type KnowledgeClaim, type KnowledgeComponent, type KnowledgeDelivery, type KnowledgeEnvironment, type KnowledgePlan, type KnowledgePullRequest } from "@infinite/remote";
 import { expectedIdentity, normalizeRemote, readGit } from "./checkout-identity.js";
+import { clearEgressEnvironment, hostEgressEnvironment } from "./egress.js";
 import { failureReason } from "./failure-reason.js";
 import { createContextAdapter, runRepositoryContext, understandingOutputLimits, type RepoContext, type RepositoryBriefOutput, type UnderstandingAdapter, type UnderstandingAdapterOptions } from "./understanding-runtime.js";
 import type { Config } from "./types.js";
@@ -70,7 +71,11 @@ export function validateBrief(value: unknown, root: string, context: RepoContext
 function run(command: string, args: string[], options: UnderstandingAdapterOptions & { cwd: string; timeoutMs?: number; maxBytes?: number }): Promise<string> {
   return new Promise((resolvePromise, rejectPromise) => {
     let child: ChildProcess;
-    try { child = spawn(command, args, { cwd: options.cwd, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" }); }
+    // Briefs run model writers as the agent account: they get the configured egress, never inherited proxy state.
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    clearEgressEnvironment(env);
+    Object.assign(env, hostEgressEnvironment());
+    try { child = spawn(command, args, { cwd: options.cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" }); }
     catch { rejectPromise(new Error("understanding-process-unavailable")); return; }
     let output = Buffer.alloc(0), stderrTail = Buffer.alloc(0), reason: string | undefined, closed: number | null | undefined, escalated = false, settled = false;
     const finish = () => {

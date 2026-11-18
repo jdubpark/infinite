@@ -44,7 +44,7 @@ End-state checks on a host with teams enabled: the page shows "Team started.", `
 
 ## Gotchas
 
-- The development host has teams disabled. Enabling them needs host configuration (`teams.workspaceDir`, and required checks on each workspace). See the "Start from a terminal" section of `docs/teams.md`. A verification run does not change host configuration on its own; report the gap instead.
+- The development host has teams disabled. Enabling them needs host configuration (`teams.workspaceDir`, and required checks on each workspace). See the "Start from a terminal" section of `docs/teams.md`. The `team` journey enables teams only in its own disposable instance (`configure --profile teams` in SKILL.md, Teams and goals host); it never changes the host it is given. Report any gap in a host you did not create.
 - A started team creates isolated working copies and runs the configured checks. With a real provider lineup it uses the provider accounts and permissions configured on the host.
 - The form is disabled for non-owners ("An owner key is required to start a team.").
 - If the request is not confirmed, the page shows "Delivery is unconfirmed. Retry keeps the same creation request." Use the retry button rather than starting a second run.

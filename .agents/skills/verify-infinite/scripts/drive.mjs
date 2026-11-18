@@ -5,6 +5,9 @@
 //   node .agents/skills/verify-infinite/scripts/drive.mjs doctor  --instance DIR
 //   node .agents/skills/verify-infinite/scripts/drive.mjs sign-in --instance DIR
 //   node .agents/skills/verify-infinite/scripts/drive.mjs session --instance DIR
+//   node .agents/skills/verify-infinite/scripts/drive.mjs configure --instance DIR --profile teams|goals
+//   node .agents/skills/verify-infinite/scripts/drive.mjs team --instance DIR
+//   node .agents/skills/verify-infinite/scripts/drive.mjs goal --instance DIR
 //   node .agents/skills/verify-infinite/scripts/drive.mjs cleanup --instance DIR
 //
 // DIR is the instance directory from the launch step (config.json, devices.json,
@@ -15,8 +18,8 @@
 
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { expect } from "@playwright/test";
@@ -29,18 +32,26 @@ const { positionals, values } = parseArgs({
     instance: { type: "string" },
     port: { type: "string" },
     evidence: { type: "string" },
+    profile: { type: "string" },
   },
 });
 
 const command = positionals[0];
-if (!["doctor", "sign-in", "session", "cleanup"].includes(command)) fail("Command must be doctor, sign-in, session, or cleanup");
+const COMMANDS = ["doctor", "sign-in", "session", "claim", "configure", "team", "goal", "cleanup"];
+if (!COMMANDS.includes(command)) fail(`Command must be one of ${COMMANDS.join(", ")}`);
 if (!values.instance) fail("Pass --instance DIR (the instance directory from the launch step)");
+// Port 4780 is another host's tunnel on some development machines. No command here uses it, in any form.
+const RESERVED_PORT = 4780;
 const instance = resolve(values.instance);
 const configFile = join(instance, "config.json");
-// Cleanup still runs when the config is already gone; the other commands need it.
-if (!existsSync(configFile) && command !== "cleanup") fail(`No config.json in ${instance}; nothing to ${command}`);
+// Cleanup still runs when the config is already gone; the other commands need it. claim creates the instance.
+if (!existsSync(configFile) && !["cleanup", "claim"].includes(command)) fail(`No config.json in ${instance}; nothing to ${command}`);
 const config = existsSync(configFile) ? JSON.parse(readFileSync(configFile, "utf8")) : {};
 const port = Number(values.port ?? config.port);
+if (port === RESERVED_PORT) fail(`Refusing port ${RESERVED_PORT}: it is reserved and no verification command may use it`);
+if (values.port !== undefined && config.port !== undefined && Number(values.port) !== Number(config.port)) {
+  fail(`--port ${values.port} does not match the instance's configured port ${config.port}; refusing before any request`);
+}
 const origin = `http://127.0.0.1:${port}`;
 const evidence = resolve(values.evidence ?? join(dirname(instance), "evidence"));
 const pidFile = join(instance, "server.pid");
@@ -65,11 +76,34 @@ const redact = (text) => {
   return secrets.reduce((out, secret) => out.split(secret).join("[device key]"), String(text));
 };
 
+// Every request to the host goes through here. Before any request (authenticated or not) the target must be the
+// verified instance: the port is the configured one, and the API process recorded for this instance is the one
+// listening on it. Nothing is sent to a port that fails the check.
 async function api(path, { auth = true, method = "GET", body } = {}) {
+  assertTarget();
   const headers = auth ? { authorization: `Bearer ${ownerKey()}` } : {};
   if (body) headers["content-type"] = "application/json";
   const response = await fetch(`${origin}${path}`, { method, headers, body: body && JSON.stringify(body) });
   return { status: response.status, json: await response.json().catch(() => null) };
+}
+
+// The browser sends a device key on sign-in, so it is held to the same check as api(): no page is opened and no
+// key is submitted unless this instance's recorded API process is the one listening on the configured port.
+// A refused check throws, so the journey records it as a failed step.
+async function openGuarded(page) {
+  assertTarget();
+  await openSignIn(page, origin);
+}
+async function signInGuarded(page, key) {
+  assertTarget();
+  await signInWithKey(page, key);
+}
+
+function assertTarget() {
+  if (port === RESERVED_PORT || !Number.isInteger(port)) throw new Error(`refusing request to port ${values.port ?? config.port ?? "unknown"}`);
+  if (Number(config.port) !== port) throw new Error(`port ${port} is not the instance's configured port ${config.port}`);
+  if (!isThisInstance(processNow(serverPid))) throw new Error("the recorded API process is not this instance; nothing sent");
+  if (!listeners().includes(serverPid)) throw new Error(`the instance process ${serverPid} is not listening on ${port}; nothing sent`);
 }
 
 function listeners() {
@@ -216,7 +250,7 @@ async function signIn() {
     const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
     page = await context.newPage();
     page.on("pageerror", (error) => pageErrors.push(redact(error.message)));
-    await openSignIn(page, origin);
+    await openGuarded(page);
     await page.screenshot({ path: join(evidence, "01-sign-in.png") });
     step("sign-in page shown", true, origin);
 
@@ -226,7 +260,7 @@ async function signIn() {
     await expect(page.getByRole("alert")).toHaveText("Device key was not recognized", { timeout: 15000 });
     step("unknown key refused", true, "Device key was not recognized");
 
-    await signInWithKey(page, ownerKey());
+    await signInGuarded(page, ownerKey());
     step("owner signed in", true, "session rail visible");
 
     // The session cookie is scoped to path /api, so ask for a URL under it.
@@ -271,6 +305,8 @@ async function signIn() {
   process.exit(failed.length ? 1 : 0);
 }
 
+const TEAM_TERMINAL = ["ready-for-review", "merged", "no-change", "cancelled"];
+const GOAL_TERMINAL = ["ready-for-review", "no-opportunity", "limit-reached", "cancelled", "achieved"];
 const SESSION_TITLE = "Verification session";
 const FIRST_REQUEST = "Reply with one line.";
 const STEER_MESSAGE = "Verification message from the session journey";
@@ -324,8 +360,8 @@ async function session() {
     owner.on("pageerror", (error) => pageErrors.push(redact(error.message)));
 
     await check("owner signed in (1440x1000)", async () => {
-      await openSignIn(owner, origin);
-      await signInWithKey(owner, ownerKey());
+      await openGuarded(owner);
+      await signInGuarded(owner, ownerKey());
     });
     await check("Rehearsal session started", async () => {
       await owner.getByRole("button", { name: "New session", exact: true }).click();
@@ -409,8 +445,8 @@ async function session() {
     const phone = pages.controller = await phoneContext.newPage();
     phone.on("pageerror", (error) => pageErrors.push(redact(error.message)));
     await check("controller signed in (390x844 touch)", async () => {
-      await openSignIn(phone, origin);
-      await signInWithKey(phone, deviceKeys().controller);
+      await openGuarded(phone);
+      await signInGuarded(phone, deviceKeys().controller);
     });
     await check("controller sees the transcript", async () => {
       await row(phone).click();
@@ -467,6 +503,383 @@ async function session() {
   process.exit(failed.length ? 1 : 0);
 }
 
+// Host configuration for the teams and goals journeys. It runs after `cli.ts init --local` writes config.json
+// and before the API starts, so the API reads it at startup. It replaces the agents with the fixture agents from
+// tests/fixtures (no real provider command remains), puts a throwaway git project in the instance, and sets
+// teams.workspaceDir inside the instance. Nothing outside DIR is written.
+const TEAM_LINEUP = {
+  coordinator: { id: "coordinator", label: "Coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
+  implementers: [{ id: "light", label: "Light worker", provider: "codex", model: "gpt-6-luna", effort: "high", tier: "light" }],
+  escalations: [{ id: "strong", label: "Strong worker", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" }],
+  integrator: { id: "integrator", label: "Integrator", provider: "claude", model: "claude-opus-5-5", effort: "high", tier: "strong" },
+  reviewer: { id: "reviewer", label: "Reviewer", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
+};
+const TEAM_CHECK = [
+  'import assert from "node:assert/strict";',
+  'import { readFileSync } from "node:fs";',
+  'assert.match(readFileSync("a.txt", "utf8"), /^revision [1-9][0-9]*\\n$/);',
+  'assert.equal(readFileSync("a.txt", "utf8"), readFileSync("b.txt", "utf8"));',
+].join("\n") + "\n";
+const GOAL_CHECK = [
+  'import assert from "node:assert/strict";',
+  'import { readFileSync } from "node:fs";',
+  'const progress = JSON.parse(readFileSync("features/progress.json", "utf8"));',
+  'assert.deepEqual(Object.keys(progress), ["completed"]);',
+  'assert.ok(Number.isInteger(progress.completed) && progress.completed >= 1 && progress.completed <= 2);',
+].join("\n") + "\n";
+
+function createProject(directory, profile) {
+  const files = profile === "teams"
+    ? { "original.txt": "The configured project remains unchanged.\n", "check.mjs": TEAM_CHECK }
+    : { "features/progress.json": '{"completed":0}\n', "check.mjs": GOAL_CHECK };
+  for (const [name, content] of Object.entries(files)) {
+    mkdirSync(dirname(join(directory, name)), { recursive: true, mode: 0o700 });
+    writeFileSync(join(directory, name), content);
+  }
+  const git = (...args) => execFileSync("git", ["-c", "user.name=Verification", "-c", "user.email=verify@example.invalid", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", ...args], { cwd: directory, stdio: ["ignore", "pipe", "pipe"] });
+  git("init", "--initial-branch=main");
+  git("add", ...Object.keys(files));
+  git("commit", "-m", "Verification project");
+}
+
+// Ownership: only an instance this harness claimed (claim, before init) may be configured. The receipt lives in the
+// instance; configure rejects a missing, copied, or already-configured receipt, a symlinked instance, config, or path,
+// a path that resolves outside the instance, a live server or listener, and any project or workspace that exists.
+const OWNERSHIP = "ownership.json";
+const FIXTURES = join(repoRoot, "tests/fixtures");
+
+// True when `path` exists, is not a symlink, and resolves inside the real instance directory.
+function insideInstance(realInstance, path) {
+  if (!existsSync(path) || lstatSync(path).isSymbolicLink()) return false;
+  const real = realpathSync(path);
+  return real === realInstance || real.startsWith(realInstance + sep);
+}
+
+function readReceipt() {
+  const file = join(instance, OWNERSHIP);
+  if (!existsSync(file) || lstatSync(file).isSymbolicLink()) return undefined;
+  return JSON.parse(readFileSync(file, "utf8"));
+}
+
+// Writes the instance and its run directory. Refuses a directory that already has content, so a claim can never
+// adopt an existing host. The run directory must be a fresh /tmp/iv- directory: the socket path limit keeps the
+// session workers' sockets out of the instance (see SKILL.md), so the run directory is the one path outside it.
+function claim() {
+  if (!Number.isInteger(port) || port === RESERVED_PORT) fail(`claim needs a port other than ${RESERVED_PORT}`);
+  if (existsSync(instance) && (lstatSync(instance).isSymbolicLink() || readdirSync(instance).length)) {
+    fail(`refusing to claim ${instance}: it exists and is not an empty directory`);
+  }
+  if (listeners().length) fail(`refusing to claim: port ${port} already has a listener`);
+  mkdirSync(instance, { recursive: true, mode: 0o700 });
+  const runDir = mkdtempSync("/tmp/iv-");
+  writeFileSync(join(instance, "run-dir"), runDir + "\n", { mode: 0o600 });
+  const receipt = {
+    harness: "verify-infinite",
+    token: randomUUID(),
+    instance: realpathSync(instance),
+    runDir,
+    port,
+    profile: values.profile ?? null,
+    state: "claimed",
+    claimedAt: new Date().toISOString(),
+  };
+  writeFileSync(join(instance, OWNERSHIP), JSON.stringify(receipt, null, 2) + "\n", { mode: 0o600 });
+  console.log(`claimed ${instance} for port ${port}`);
+}
+
+function configure() {
+  const profile = values.profile;
+  if (!["teams", "goals"].includes(profile)) fail("Pass --profile teams or --profile goals");
+  if (lstatSync(instance).isSymbolicLink()) fail("refusing: the instance directory is a symbolic link");
+  const realInstance = realpathSync(instance);
+  const receipt = readReceipt();
+  if (!receipt || receipt.harness !== "verify-infinite" || typeof receipt.token !== "string") {
+    fail(`refusing: ${OWNERSHIP} is missing or not written by this harness. Run claim first.`);
+  }
+  if (receipt.instance !== realInstance) fail("refusing: the ownership receipt belongs to another directory");
+  if (receipt.state !== "claimed") fail(`refusing: the instance is ${receipt.state}; configure runs once, before the first start`);
+  if (receipt.profile !== profile) fail(`refusing: the instance was claimed for ${receipt.profile}, not ${profile}`);
+  if (Number(config.port) !== receipt.port) fail(`refusing: config port ${config.port} differs from the claimed port ${receipt.port}`);
+  if (lstatSync(configFile).isSymbolicLink() || !insideInstance(realInstance, configFile)) fail("refusing: config.json must be a regular file inside the instance");
+  for (const [label, path] of [["stateDir", config.stateDir], ["keyFile", config.keyFile]]) {
+    if (!path || !insideInstance(realInstance, path)) fail(`refusing: ${label} does not resolve inside the instance (${path})`);
+  }
+  if (config.runDir !== receipt.runDir || !/^\/tmp\/iv-/.test(receipt.runDir) || lstatSync(receipt.runDir).isSymbolicLink()) {
+    fail("refusing: runDir is not the run directory this claim created");
+  }
+  // The init placeholder project is the only project allowed, and it must still be empty.
+  if (!Array.isArray(config.projects) || config.projects.length !== 1) fail("refusing: the config has unexpected projects");
+  const placeholder = join(instance, "workspace");
+  if (config.projects[0].path !== placeholder || !insideInstance(realInstance, placeholder) || readdirSync(placeholder).length) {
+    fail("refusing: the placeholder workspace is not an empty directory inside the instance");
+  }
+  for (const artifact of [join(instance, "project"), join(instance, "teams"), join(instance, "receipts")]) {
+    if (existsSync(artifact)) fail(`refusing: ${artifact} already exists`);
+  }
+  if (Number.isInteger(serverPid) && alive(serverPid)) fail("refusing: the API recorded in server.pid is running");
+  if (listeners().length) fail(`refusing: something is listening on ${port}`);
+
+  const receipts = join(instance, "receipts");
+  const project = join(instance, "project");
+  mkdirSync(receipts, { mode: 0o700 });
+  createProject(project, profile);
+  // The goal fixture holds its first plan until this file exists (the goal tests write it by hand to inspect a
+  // held cycle). A journey has nothing to inspect, so release the plan up front. The cancel check leaves it out.
+  if (profile === "goals" && !process.env.VERIFY_HOLD_FIRST_PLAN) writeFileSync(join(receipts, "release-first-plan"), "continue", { mode: 0o600 });
+  // Teams run on the Rehearsal provider (`demo`), which the fixture replaces: team-agent.mjs with scenario
+  // "success" plans two file tasks without agent profiles, so it needs no lineup. A configured lineup would
+  // refuse those tasks. Goals need a lineup with a strong coordinator and reviewer, so they use the goal fixture
+  // ("cycles") behind the claude and codex providers. The goal fixture writes its plan brief on every plan.
+  const next = profile === "teams"
+    ? {
+      ...config,
+      enableDemo: true,
+      agents: { demo: { command: process.execPath, args: [join(FIXTURES, "team-agent.mjs"), "success", receipts] } },
+      teams: { workspaceDir: join(instance, "teams"), publishHeads: false },
+    }
+    : {
+      ...config,
+      agents: {
+        claude: { command: process.execPath, args: [join(FIXTURES, "goal-agent.mjs"), "cycles", receipts, "claude"] },
+        codex: { command: process.execPath, args: [join(FIXTURES, "goal-agent.mjs"), "cycles", receipts, "codex"] },
+      },
+      teams: { workspaceDir: join(instance, "teams"), publishHeads: false, lineup: TEAM_LINEUP },
+    };
+  next.projects = [{
+    id: "verify-team",
+    name: "Verification project",
+    path: project,
+    team: { checks: [{ command: process.execPath, args: ["check.mjs"] }] },
+  }];
+  writeFileSync(configFile, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+
+  // Every agent must be a fixture. A config with any other command (for example a real provider CLI left by init)
+  // is refused here, so the launch stops before the API starts.
+  const written = JSON.parse(readFileSync(configFile, "utf8"));
+  const agentNames = Object.keys(written.agents ?? {});
+  if (!agentNames.length) fail("refusing: no fixture agents were written");
+  for (const name of agentNames) {
+    const agent = written.agents[name];
+    if (agent.command !== process.execPath || !String(agent.args?.[0] ?? "").startsWith(FIXTURES + sep)) {
+      fail(`refusing: agent ${name} is not a fixture under tests/fixtures`);
+    }
+  }
+  const updated = { ...receipt, state: "configured", configuredAt: new Date().toISOString() };
+  writeFileSync(join(instance, OWNERSHIP), JSON.stringify(updated, null, 2) + "\n", { mode: 0o600 });
+  console.log(`configured ${profile}: agents ${agentNames.join(", ")} are fixtures; project and team workspace inside DIR`);
+}
+
+const TEAM_LABELS = { planning: "Planning", discovering: "Investigating", implementing: "Implementing", integrating: "Integrating", verifying: "Running checks", reviewing: "Reviewing", delivering: "Delivering", merged: "Merge reported", "needs-input": "Needs your input", paused: "Paused", blocked: "Blocked", "ready-for-review": "Ready for your review", "no-change": "No change proposed", cancelled: "Cancelled" };
+const GOAL_LABELS = { running: "Working", "needs-input": "Needs your input", paused: "Paused", blocked: "Blocked", "ready-for-review": "Ready for your review", "no-opportunity": "No opportunity found", "limit-reached": "Limit reached", cancelled: "Cancelled", achieved: "Outcome recorded: achieved" };
+// Labels that end a wait on the page. The journey then checks that the label is the expected end state.
+const TEAM_END = ["Ready for your review", "Merge reported", "No change proposed", "Cancelled", "Blocked", "Needs your input"];
+const GOAL_END = ["Ready for your review", "Limit reached", "No opportunity found", "Cancelled", "Outcome recorded: achieved", "Blocked", "Needs your input"];
+const TEAM_TITLE = "Verification team";
+const TEAM_OBJECTIVE = "Write matching revision files for the verification project.";
+const GOAL_TITLE = "Verification goal";
+const GOAL_OBJECTIVE = "Advance the verification progress file by one step.";
+const GOAL_SUCCESS = "The progress file reaches the next step and the check passes.";
+
+// Polls a locator's text until it is one of the end labels or the timeout passes, and returns the last text.
+async function waitForEnd(locator, ends, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let text = "";
+  for (;;) {
+    text = (await locator.first().innerText().catch(() => "")).trim();
+    if (ends.includes(text) || Date.now() > deadline) return text;
+    await new Promise((done) => setTimeout(done, 1000));
+  }
+}
+
+// Shared shape for the teams and goals journeys: sign in as owner, run each step through `check`, record the
+// evidence, and write NAME.json and NAME.log. The page label and the API status are compared at the end state.
+async function runRunJourney(name, body) {
+  mkdirSync(evidence, { recursive: true });
+  const startedAt = new Date().toISOString();
+  const { steps, step } = recorder(redact);
+  const pageErrors = [];
+  const pages = {};
+  const record = { journey: name, origin, startedAt };
+  let browser, executablePath;
+  const check = async (stepName, action) => {
+    try {
+      step(stepName, true, (await action()) ?? "");
+    } catch (error) {
+      step(stepName, false, error.message.split("\n")[0]);
+      throw error;
+    }
+  };
+  try {
+    ({ browser, executablePath } = await launchChromium());
+    const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
+    const page = (pages.owner = await context.newPage());
+    page.on("pageerror", (error) => pageErrors.push(redact(error.message)));
+    await body({ check, step, page, record, api, pages });
+    const pageText = await page.locator("body").innerText();
+    const html = await page.content();
+    step("owner key absent from page", !pageText.includes(ownerKey()) && !html.includes(ownerKey()), "");
+  } catch (error) {
+    if (!steps.some((item) => !item.ok)) step("journey completed", false, error.message.split("\n")[0]);
+    for (const [role, page] of Object.entries(pages)) await page.screenshot({ path: join(evidence, `99-failure-${role}.png`), fullPage: true }).catch(() => {});
+  } finally {
+    await browser?.close().catch((error) => step("browser closed", false, error.message.split("\n")[0]));
+  }
+  step("no page errors", pageErrors.length === 0, `${pageErrors.length} page error(s)`);
+  const failed = steps.filter((item) => !item.ok);
+  const result = {
+    ...record,
+    chrome: executablePath ?? "playwright-bundled",
+    finishedAt: new Date().toISOString(),
+    verdict: failed.length ? "fail" : "pass",
+    steps,
+    pageErrors,
+  };
+  writeJourney(evidence, name, result);
+  console.log(`${name}: ${result.verdict} (${steps.length} steps) -> ${join(evidence, `${name}.json`)}`);
+  process.exit(failed.length ? 1 : 0);
+}
+
+// Starts a team from the web client on the throwaway project, follows it to its end state, and checks that the
+// page and GET /api/teams and GET /api/teams/:id agree on the status.
+async function team() {
+  await runRunJourney("team", async ({ check, page, record, api: call, pages }) => {
+    let teamId, pageStatus = "";
+    await check("owner signed in", async () => {
+      await openGuarded(page);
+      await signInGuarded(page, ownerKey());
+    });
+    await check("teams enabled and a workspace is ready", async () => {
+      await page.getByRole("button", { name: "Teams", exact: true }).click();
+      await expect(page.getByRole("heading", { name: "Give your team an outcome." })).toBeVisible({ timeout: 15000 });
+      const me = (await call("/api/me")).json;
+      if (!me?.teams?.enabled) throw new Error("GET /api/me reports teams.enabled false");
+      if (await page.getByRole("status").filter({ hasText: "Teams need host setup." }).count()) throw new Error("the page shows Teams need host setup.");
+      if (await page.getByRole("status").filter({ hasText: "No workspace is ready for a team." }).count()) throw new Error("the page shows No workspace is ready for a team.");
+      await page.screenshot({ path: join(evidence, "01-team-list.png"), fullPage: true });
+      return `${me.projects.length} workspace(s)`;
+    });
+    await check("team started from the New team form", async () => {
+      await page.getByRole("button", { name: "New team", exact: true }).first().click();
+      await page.locator("#team-title").fill(TEAM_TITLE);
+      await page.locator("#team-objective").fill(TEAM_OBJECTIVE);
+      await page.locator("#team-project").selectOption("verify-team");
+      await page.getByRole("button", { name: "Start team", exact: true }).click();
+      // The page may stay on the form with "Team started." or open the team directly.
+      const started = page.getByRole("status").filter({ hasText: "Team started." });
+      await expect(started.or(page.getByRole("heading", { name: TEAM_TITLE, exact: true }))).toBeVisible({ timeout: 15000 });
+    });
+    await check("API lists the new run once", async () => {
+      const runs = ((await call("/api/teams")).json?.teams ?? []).filter((item) => item.title === TEAM_TITLE);
+      if (runs.length !== 1) throw new Error(`expected one run titled "${TEAM_TITLE}", found ${runs.length}`);
+      teamId = runs[0].id;
+      return `run ${teamId.slice(0, 8)}`;
+    });
+    await check("team page opened", async () => {
+      const open = page.getByRole("button", { name: "Open team", exact: true });
+      if (await open.isVisible().catch(() => false)) await open.click();
+      await expect(page.getByRole("heading", { name: TEAM_TITLE, exact: true })).toBeVisible({ timeout: 15000 });
+    });
+    await check("run reaches an end state on the page", async () => {
+      pageStatus = await waitForEnd(page.locator(".team-status"), TEAM_END, 300000);
+      await page.screenshot({ path: join(evidence, "02-team-run.png"), fullPage: true });
+      if (pageStatus !== TEAM_LABELS["ready-for-review"]) throw new Error(`the page shows "${pageStatus}"`);
+      return pageStatus;
+    });
+    await check("page and team API agree on status", async () => {
+      const detail = await call(`/api/teams/${teamId}`);
+      if (detail.status !== 200) throw new Error(`GET /api/teams/:id returned HTTP ${detail.status}`);
+      const listed = ((await call("/api/teams")).json?.teams ?? []).find((item) => item.id === teamId);
+      if (listed?.status !== detail.json.status) throw new Error("GET /api/teams and GET /api/teams/:id disagree");
+      const label = TEAM_LABELS[detail.json.status];
+      if (label !== pageStatus) throw new Error(`API status ${detail.json.status} (${label}) does not match the page "${pageStatus}"`);
+      record.teamId = teamId;
+      record.revision = detail.json.revision;
+      return `API ${detail.json.status} = page "${pageStatus}" at revision ${detail.json.revision}`;
+    });
+  });
+}
+
+// Creates a goal from the web client on the throwaway project, follows it to its end state, and checks that the
+// page and GET /api/goals agree on the status and the recorded objective and paths.
+async function goal() {
+  await runRunJourney("goal", async ({ check, page, record, api: call }) => {
+    let goalId, pageStatus = "";
+    await check("owner signed in", async () => {
+      await openGuarded(page);
+      await signInGuarded(page, ownerKey());
+    });
+    await check("goals enabled with a configured lineup", async () => {
+      await page.getByRole("button", { name: "Goals", exact: true }).click();
+      await expect(page.getByRole("heading", { name: "Set the outcome and the limits." })).toBeVisible({ timeout: 15000 });
+      const me = (await call("/api/me")).json;
+      if (!me?.goals?.enabled) throw new Error("GET /api/me reports goals.enabled false");
+      if (await page.getByRole("status").filter({ hasText: "Goals need a configured team lineup." }).count()) throw new Error("the page shows Goals need a configured team lineup.");
+      await page.screenshot({ path: join(evidence, "01-goal-list.png"), fullPage: true });
+      return "goals.enabled true";
+    });
+    await check("goal started from the New goal form", async () => {
+      await page.getByRole("button", { name: "New goal", exact: true }).first().click();
+      await page.locator("#goal-title").fill(GOAL_TITLE);
+      await page.locator("#goal-objective").fill(GOAL_OBJECTIVE);
+      await page.locator("#goal-success").fill(GOAL_SUCCESS);
+      await page.locator("#goal-paths").fill("features/progress.json");
+      await page.locator("#goal-maxRuns").fill("1");
+      await page.locator("#goal-project").selectOption("verify-team");
+      await page.getByRole("button", { name: "Start goal", exact: true }).click();
+    });
+    await check("API lists the new goal once", async () => {
+      const deadline = Date.now() + 20000;
+      for (;;) {
+        const goals = ((await call("/api/goals")).json?.goals ?? []).filter((item) => item.title === GOAL_TITLE);
+        if (goals.length === 1) { goalId = goals[0].id; return `goal ${goalId.slice(0, 8)}`; }
+        if (goals.length > 1 || Date.now() > deadline) throw new Error(`expected one goal titled "${GOAL_TITLE}", found ${goals.length}`);
+        await new Promise((done) => setTimeout(done, 500));
+      }
+    });
+    await check("goal page opened", async () => {
+      // Starting a goal may open its page directly; otherwise open the row in the list.
+      const opened = page.getByRole("heading", { name: GOAL_TITLE, exact: true });
+      const row = page.locator(".team-run-row", { hasText: GOAL_TITLE }).locator("button").first();
+      await expect(opened.or(row)).toBeVisible({ timeout: 15000 });
+      if (!(await opened.isVisible().catch(() => false))) await row.click();
+      await expect(opened).toBeVisible({ timeout: 15000 });
+    });
+    await check("goal reaches an end state on the page", async () => {
+      pageStatus = await waitForEnd(page.locator(".goal-status"), GOAL_END, 300000);
+      await page.screenshot({ path: join(evidence, "02-goal.png"), fullPage: true });
+      if (pageStatus !== GOAL_LABELS["ready-for-review"]) throw new Error(`the page shows "${pageStatus}", not "${GOAL_LABELS["ready-for-review"]}"`);
+      return pageStatus;
+    });
+    await check("page and goal API agree on status and scope", async () => {
+      const detail = await call(`/api/goals/${goalId}`);
+      if (detail.status !== 200) throw new Error(`GET /api/goals/:id returned HTTP ${detail.status}`);
+      const listed = ((await call("/api/goals")).json?.goals ?? []).find((item) => item.id === goalId);
+      if (listed?.status !== detail.json.status) throw new Error("GET /api/goals and GET /api/goals/:id disagree");
+      const label = GOAL_LABELS[detail.json.status];
+      if (label !== pageStatus) throw new Error(`API status ${detail.json.status} (${label}) does not match the page "${pageStatus}"`);
+      if (detail.json.status !== "ready-for-review") throw new Error(`API status is ${detail.json.status}, not ready-for-review`);
+      if (detail.json.objective !== GOAL_OBJECTIVE) throw new Error("the API objective differs from the form");
+      if (JSON.stringify(detail.json.allowedPaths) !== JSON.stringify(["features/progress.json"])) throw new Error("the API allowed paths differ from the form");
+      record.goalId = goalId;
+      record.cycles = (detail.json.cycles ?? []).length;
+      return `API ${detail.json.status} = page "${pageStatus}", ${record.cycles} cycle(s)`;
+    });
+    await check("exactly one reviewed cycle reached success", async () => {
+      // A goal reaches ready-for-review when its cycle limit is spent. The status alone does not prove that a cycle
+      // was reviewed, so the one cycle's team must itself be ready for review with an approved review.
+      const detail = (await call(`/api/goals/${goalId}`)).json;
+      if (detail.cycles?.length !== 1) throw new Error(`expected exactly one cycle, found ${detail.cycles?.length ?? 0}`);
+      const cycle = detail.cycles[0];
+      if (!["ready-for-review", "merged"].includes(cycle.status)) throw new Error(`cycle status is ${cycle.status}`);
+      const team = await call(`/api/teams/${cycle.teamId}`);
+      if (team.status !== 200) throw new Error(`GET /api/teams/:cycleTeam returned HTTP ${team.status}`);
+      if (team.json.status !== "ready-for-review") throw new Error(`the cycle's team is ${team.json.status}, not ready-for-review`);
+      if (team.json.review?.verdict !== "approved") throw new Error(`the cycle's team review is ${team.json.review?.verdict ?? "missing"}, not approved`);
+      return `cycle ${cycle.cycle} team ${cycle.teamId.slice(0, 8)} ready-for-review, review approved`;
+    });
+  });
+}
+
 // Stops only what this instance started: sessions through the owner API, then the session workers
 // and their descendants, then the API PID. Evidence is kept.
 async function cleanup() {
@@ -488,6 +901,25 @@ async function cleanup() {
       const stop = await api(`/api/sessions/${session.id}/stop`, { method: "POST", body: { requestId: randomUUID() } })
         .catch((error) => ({ status: redact(error.message) }));
       note(`stop session ${session.id.slice(0, 8)} (${session.provider}): HTTP ${stop.status}${stop.status === 409 ? " (another device holds control; the worker is stopped by signal below)" : ""}`);
+    }
+    // Goals first: a goal cancels the team runs of its cycles, and the team cancel route refuses goal-owned runs
+    // (HTTP 409). Standalone teams that a failed journey left running are cancelled through the owner API, as
+    // sessions are. A finished run gets no call, and cleanup logs that it found none.
+    const goalRuns = (await api("/api/goals").catch(() => ({ json: null }))).json?.goals ?? [];
+    const activeGoals = goalRuns.filter((goal) => !GOAL_TERMINAL.includes(goal.status));
+    if (!activeGoals.length) note("active goals: none");
+    for (const goal of activeGoals) {
+      const cancel = await api(`/api/goals/${goal.id}/cancel`, { method: "POST", body: { requestId: randomUUID(), revision: goal.revision } })
+        .catch((error) => ({ status: redact(error.message) }));
+      note(`cancel goal ${goal.id.slice(0, 8)} (${goal.status}): HTTP ${cancel.status}`);
+    }
+    const teamRuns = (await api("/api/teams").catch(() => ({ json: null }))).json?.teams ?? [];
+    const activeTeams = teamRuns.filter((run) => !TEAM_TERMINAL.includes(run.status) && !run.goal);
+    if (!activeTeams.length) note("active team runs: none");
+    for (const run of activeTeams) {
+      const cancel = await api(`/api/teams/${run.id}/cancel`, { method: "POST", body: { requestId: randomUUID(), revision: run.revision } })
+        .catch((error) => ({ status: redact(error.message) }));
+      note(`cancel team ${run.id.slice(0, 8)} (${run.status}): HTTP ${cancel.status}`);
     }
   }
   for (const entry of instanceProcesses()) if (!known.has(entry.pid)) known.set(entry.pid, entry);
@@ -514,4 +946,8 @@ async function cleanup() {
 if (command === "doctor") await doctor();
 else if (command === "sign-in") await signIn();
 else if (command === "session") await session();
+else if (command === "claim") claim();
+else if (command === "configure") configure();
+else if (command === "team") await team();
+else if (command === "goal") await goal();
 else await cleanup();

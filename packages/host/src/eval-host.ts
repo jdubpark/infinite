@@ -152,6 +152,8 @@ export class EvalHost implements EvalHostApi {
       project,
       mining: this.miner.status(projectId),
       grader,
+      // Compile-only seam (INF-291 Task 13): Task 15 passes the probe's version, the eval identity, and today's trials.
+      graderVersion: null, evalIdentity: "not-configured", trials: { today: 0, dailyCap: null },
       jobs: this.evalJobs.projectJobs(projectId, SUMMARY_JOBS),
       now: this.now(),
     }));

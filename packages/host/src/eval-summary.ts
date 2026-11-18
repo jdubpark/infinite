@@ -6,6 +6,7 @@ import { groupStats } from "./eval-groups.js";
 import {
   EVAL_MODULE,
   EVAL_STATES,
+  type EvalIdentityState,
   type EvalJobView,
   type EvalOrigin,
   type EvalState,
@@ -36,6 +37,11 @@ export type SummaryInput = {
   project: Project;
   mining: MiningStatus;
   grader: GraderState;
+  /** The grader's launcher version, or null until a probe answered one. */
+  graderVersion: number | null;
+  evalIdentity: EvalIdentityState;
+  /** Trials the project started today (`trialsSince`), and the cap the project sets (null when `trialsPerDay` is absent). */
+  trials: { today: number; dailyCap: number | null };
   /** The project's newest jobs, as `EvalJobs.projectJobs` returns them. */
   jobs: EvalJobView[];
   now: string;
@@ -77,11 +83,9 @@ export function evalSummary(store: EvidenceStore, input: SummaryInput): EvalSumm
     tasks: { ...tasksOf(counted.states), byArea: counted.areas, bySet: null },
     groups: counted.groups,
     coverage: coverageOf(store, project, counted.validCaptured, days, now),
-    // Compile-only seam (INF-291 Task 1): the grader version is null until Task 11 or 13 reads it.
-    grader: { state: input.grader, version: null },
-    // Compile-only seam (INF-291 Task 1): no eval identity probe or trial count exists yet; Tasks 12 and 13 fill these.
-    evalIdentity: { state: "not-configured" },
-    trials: { today: 0, dailyCap: null },
+    grader: { state: input.grader, version: input.graderVersion },
+    evalIdentity: { state: input.evalIdentity },
+    trials: { today: input.trials.today, dailyCap: input.trials.dailyCap },
     jobs: input.jobs.slice(0, SUMMARY_JOBS),
   };
 }

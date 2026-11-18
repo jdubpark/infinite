@@ -2231,10 +2231,13 @@ effect by another route. The reason codes are `outside-workspace`, `unrelated`,
 `unsafe`, `incomplete`, `uncertain`, `unavailable`, `locked` and `needs-owner`.
 `outside-workspace` covers reading, fetching, copying or running anything from
 another session's, run's, worktree's or checkout's directory, even when the
-request changes nothing there. The session's scratch roots, its task-owned
-temporary files and a fetch from the repository's network remotes stay inside.
-The task text cannot widen the session root: a directory that the task names or
-asks for is still outside it.
+request changes nothing there. A fetch, pull or clone that names another
+checkout's path is such a read. These stay inside: the session's scratch roots,
+its task-owned temporary files, its own repository's Git metadata (also a
+worktree's shared Git directory), fetches from the repository's network remotes,
+and the installed toolchains and package-manager caches that an allowed
+operation uses. The task text cannot widen the session root: a directory that
+the task names or asks for is still outside it.
 Run status shows the code, and a locked assignment shows as blocked on a
 permission. `infinite permissions unlock` ends a lock and `infinite permissions
 reopen` closes a reject so that the request gets a fresh review; neither

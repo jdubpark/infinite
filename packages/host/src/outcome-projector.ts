@@ -3,6 +3,7 @@ import { CONFIGURATIONS_MODULE, epochAt } from "./configuration-store.js";
 import type { EventProjector } from "./evidence/outbox.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceDb, EvidenceTx, RunEvent } from "./evidence/types.js";
+import { integrationOf } from "./outcome-gauges.js";
 import {
   BLOCK_DISPOSITIONS,
   type Disposition,
@@ -273,6 +274,8 @@ function taskIntegrated(ctx: Ctx): void {
   if (base !== undefined) row.payload.baseCommit = base;
   const diff = diffOf(data.diff);
   if (diff) row.payload.diff = diff;
+  const gauge = integrationOf(data.integration);
+  if (gauge) row.payload.integration = gauge;
   // An integration with no commit changed nothing, so the attempt is an empty result.
   if (str(data.commit) === undefined) row.flags = withFlag(row.flags, "empty-result");
   saveOutcomeRow(tx, row);

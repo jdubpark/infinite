@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import {
   expandedTotal,
   readGrantSchema,
@@ -118,7 +119,8 @@ test("over-ceiling fires for concurrency with and without list fan-out", () => {
   const plain = validateReadRequest(request([[step({ id: "scan" })]], { concurrency: 4 }), grant());
   assert.equal(plain.ok, false);
   if (!plain.ok) assert.equal(plain.errors[0].limit, "concurrency");
-  const fanOut = validateReadRequest(request([[listStep("items")], [step({ id: "fan", forEach: { step: "items", maxItems: 2 } })]], { concurrency: 9 }), grant());
+  const fanOut = validateReadRequest(request([[listStep("items")], [step({ id: "fan", forEach: { step: "items", maxItems: 2 } })]], { concurrency: 7 }),
+    grant({ limits: { concurrency: 3, listConcurrency: 6, requestAttempts: 24, outside: true } }));
   assert.equal(fanOut.ok, false);
   if (!fanOut.ok) assert.equal(fanOut.errors[0].limit, "concurrency");
   const fanOutOk = validateReadRequest(request([[listStep("items")], [step({ id: "fan", forEach: { step: "items", maxItems: 2 } })]], { concurrency: 8 }), grant());
@@ -411,13 +413,62 @@ function parseIssues(value: unknown, readGrant: unknown = grant()): string[] {
   return result.ok ? [] : result.errors.map(item => `${item.code}:${item.path}`);
 }
 
-test("the validator parses the request: a list or number above its schema bound is over-ceiling at its path", () => {
-  assert.deepEqual(parseIssues(request(Array.from({ length: 5 }, (_, index) => [step({ id: `s${index}` })]))), ["over-ceiling:phases"]);
-  assert.deepEqual(parseIssues(request([Array.from({ length: 7 }, (_, index) => step({ id: `s${index}` }))])), ["over-ceiling:phases[0].steps"]);
-  assert.deepEqual(parseIssues(request([[listStep("items")], [step({ id: "fan", forEach: { step: "items", maxItems: 17 } })]])), ["over-ceiling:phases[1].steps[0].forEach.maxItems"]);
-  assert.deepEqual(parseIssues(request([[step({ id: "scan", lead: { maxAttempts: 13 } })]])), ["over-ceiling:phases[0].steps[0].lead.maxAttempts"]);
-  const bigFan = validateReadRequest(request([[listStep("items")], [step({ id: "fan", forEach: { step: "items", maxItems: 17 } })]]), grant());
+test("a parse issue is over-ceiling only for the table's list, without a limit property; other too-big lists are malformed", () => {
+  const ceiling: [ReadRequest, string][] = [
+    [request(Array.from({ length: 5 }, (_, index) => [step({ id: `s${index}` })])), "phases"],
+    [request([Array.from({ length: 7 }, (_, index) => step({ id: `s${index}` }))]), "phases[0].steps"],
+    [request([[listStep("items")], [step({ id: "fan", forEach: { step: "items", maxItems: 17 } })]]), "phases[1].steps[0].forEach.maxItems"],
+    [request([[step({ id: "scan", lead: { maxAttempts: 13 } })]]), "phases[0].steps[0].lead.maxAttempts"],
+    [request([[step({ id: "scan" })]], { concurrency: 9 }), "concurrency"],
+  ];
+  for (const [value, path] of ceiling) {
+    const result = validateReadRequest(value, grant());
+    assert.deepEqual(result.ok ? [] : result.errors.map(item => `${item.code}:${item.path}`), [`over-ceiling:${path}`], path);
+    if (!result.ok) assert.equal("limit" in result.errors[0], false, path);
+  }
+  const bigFan = validateReadRequest(ceiling[2][0], grant());
   if (!bigFan.ok) assert.equal(bigFan.errors[0].fix, "Set `maxItems` to 16 or less.");
+  const nineRefs = step({ id: "web", agentProfileId: "outside-reader", source: { refs: Array.from({ length: 9 }, (_, index) => `evidence:${index + 1}`) } });
+  assert.deepEqual(parseIssues(request([[nineRefs]])), ["malformed:phases[0].steps[0].source.refs"]);
+  const seventeenPaths = step({ id: "scan", paths: Array.from({ length: 17 }, (_, index) => `packages/host/src/f${index}.ts`) });
+  assert.deepEqual(parseIssues(request([[seventeenPaths]])), ["malformed:phases[0].steps[0].paths"]);
+  assert.deepEqual(limits(validateReadRequest(request([[step({ id: "scan" })]], { concurrency: 8 }), grant())), ["over-ceiling:concurrency:concurrency"]);
+});
+
+test("the worst malformed request inside the schema's list limits is refused in full, without throwing, within stated bounds", () => {
+  // Every field of 4 phases of 6 steps fails, with 16 paths of three issues each and 8 refs.
+  // Measured with zod 4.6.7 on a 617,732-byte request: 1,692 errors and 217,297 bytes of refusal text.
+  const badStep = (index: number) => ({
+    id: `BAD-${index}`, title: "t".repeat(101), instructions: "i".repeat(4001), agentProfileId: "BAD", output: "nothing", effort: "huge",
+    forEach: { step: "BAD", maxItems: 17, extra: true }, lead: { maxAttempts: 13, extra: true }, verify: false, extra: true,
+    paths: Array.from({ length: 16 }, () => `/${"*".repeat(300)}`),
+    source: { refs: Array.from({ length: 8 }, () => `x${"y".repeat(2048)}`), extra: true },
+  });
+  const worst = {
+    kind: "write", summary: "s".repeat(2001), concurrency: 0, extra: true,
+    phases: Array.from({ length: 4 }, (_, phase) => ({ id: "BAD", extra: true, steps: Array.from({ length: 6 }, (_, index) => badStep(phase * 6 + index)) })),
+  };
+  let result: ReturnType<typeof validateReadRequest> | undefined;
+  assert.doesNotThrow(() => { result = validateReadRequest(worst, grant()); });
+  assert.ok(result && !result.ok);
+  assert.ok(result.errors.length >= 1600 && result.errors.length <= 1800, `${result.errors.length} errors`);
+  const bytes = Buffer.byteLength(refusalText(result.errors), "utf8");
+  assert.ok(bytes <= 240_000, `${bytes} bytes`);
+});
+
+test("a source reference may hold 2,048 characters; a longer one is one malformed error at its own path that names the bound", () => {
+  const url = (length: number) => `https://example.com/${"a".repeat(length - 20)}`;
+  const sourced = (ref: string) => request([[step({ id: "web", agentProfileId: "outside-reader", source: { refs: [ref] } })]]);
+  assert.equal(url(2048).length, 2048);
+  assert.equal(validateReadRequest(sourced(url(2048)), grant()).ok, true);
+  for (const ref of [url(2049), `x${"y".repeat(2048)}`]) {
+    const result = validateReadRequest(sourced(ref), grant());
+    assert.deepEqual(result.ok ? [] : result.errors.map(item => `${item.code}:${item.path}`), ["malformed:phases[0].steps[0].source.refs[0]"]);
+    if (result.ok) continue;
+    const text = refusalText(result.errors);
+    assert.match(result.errors[0].fix, /2048/);
+    assert.equal(text.includes(ref.slice(0, 19)) || text.includes(ref.slice(-16)), false);
+  }
 });
 
 test("the validator never throws on a request of the wrong shape and reports it as malformed without running the rules", () => {

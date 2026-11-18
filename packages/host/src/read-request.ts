@@ -8,7 +8,9 @@ import { ownedPathSchema, taskIdSchema, teamEvidenceSchema } from "./team-types.
 
 const NOTE_BYTES = 240;
 
-const sourceRef = z.string().max(2048).refine(value => {
+// PROPOSED: a reference is at most 2,048 characters, and evidence:N names an item from 1 to 9999; the
+// design states neither. The bound aborts, so an over-long reference gets one error, not two.
+const sourceRef = z.string().max(2048, { abort: true }).refine(value => {
   if (/^evidence:[1-9]\d{0,3}$/.test(value)) return true;
   if (/\s/.test(value)) return false;
   try {
@@ -39,7 +41,7 @@ export type ReadStep = z.infer<typeof readStepSchema>;
 export const readRequestSchema = z.strictObject({
   kind: z.literal("read"),
   summary: z.string().trim().min(1).max(2000),
-  concurrency: z.number().int().min(1).optional(),
+  concurrency: z.number().int().min(1).max(8).optional(), // at most the largest listConcurrency (part 1)
   phases: z.array(z.strictObject({
     id: taskIdSchema,
     steps: z.array(readStepSchema).min(1).max(6),
@@ -61,6 +63,9 @@ const resultBase = {
   notes: readNotesSchema.optional(),
 };
 
+// PROPOSED: the design bounds the result lists but not these strings: the list and locations summaries
+// (4,000, as today's findings), key 120, title 200, source 1,000, path 512, 16 symbols of 200, role 240,
+// and a verdict's criterion 1,000.
 const listItemSchema = z.strictObject({
   key: z.string().trim().min(1).max(120),
   title: z.string().trim().min(1).max(200),
@@ -105,6 +110,9 @@ export type ReadResult = z.infer<typeof readResultSchema>;
 const count = (max: number) => z.number().int().min(0).max(max);
 const setting = (max: number) => z.number().int().min(1).max(max);
 
+// PROPOSED: the host fills the grant within these caps (64 profiles, 64 outside profiles, 256 active
+// steps, 100 requests sent), and a grant outside them refuses every read as a host fault. An absent
+// lineage refuses every source step, and an absent reservation refuses a scout lead's request.
 export const readGrantSchema = z.strictObject({
   requester: z.enum(["project-manager", "scout-lead", "reader", "quarantined-reader"]),
   poolOn: z.boolean(),
@@ -136,7 +144,8 @@ export const readGrantSchema = z.strictObject({
 export type ReadGrant = z.infer<typeof readGrantSchema>;
 
 export type ReadErrorCode =
-  // PROPOSED: the design's table has no code for a request whose shape is wrong.
+  // PROPOSED: the design's table has no code for a request whose shape is wrong. A parse issue is
+  // over-ceiling only on the table's list (CEILING_PATHS); every other parse issue is malformed.
   | "malformed"
   | "not-granted"
   | "unknown-profile"
@@ -161,7 +170,8 @@ export type ReadRequestResult =
 
 /**
  * Part 2: a step's key ignores profile, id, title and effort, so the same work is recognized however it is labelled.
- * Paths and refs count as sets: order and repeats do not change the key. The step is never mutated.
+ * PROPOSED: paths and refs count as sets, so order and repeats do not change the key; the design says only
+ * "sorted paths" and "source refs". The step is never mutated.
  */
 export function stepKey(step: ReadStep): string {
   const instructions = step.instructions.replace(/\s+/g, " ").trim().toLowerCase();
@@ -171,7 +181,10 @@ export function stepKey(step: ReadStep): string {
   return createHash("sha256").update(material).digest("hex");
 }
 
-/** Part 3: a step costs its forEach maxItems times its lead attempts (1 plus maxAttempts); each defaults to 1. */
+/**
+ * Part 3: a step costs its forEach maxItems times its lead attempts (1 plus maxAttempts); each defaults to 1.
+ * PROPOSED: a step with both forEach and lead costs the product; the design gives each factor alone.
+ */
 export function expandedTotal(request: ReadRequest): { total: number; phases: number[] } {
   const phases = request.phases.map(phase => phase.steps.reduce((sum, step) => sum + stepCost(step), 0));
   return { total: phases.reduce((sum, count) => sum + count, 0), phases };
@@ -376,26 +389,26 @@ function issuePath(path: readonly PropertyKey[]): string {
     : `${index === 0 ? "" : "."}${typeof part === "string" && KEY.test(part) ? part : "?"}`)).join("");
 }
 
+// Part 3's table puts too many phases or steps, and maxItems, concurrency or a lead's maxAttempts above
+// its bound, under over-ceiling. Paths are written with # for an array index.
+const CEILING_PATHS = new Set(["phases", "phases.#.steps", "phases.#.steps.#.forEach.maxItems", "concurrency", "phases.#.steps.#.lead.maxAttempts"]);
+
 /**
- * Part 3 puts phases, steps, maxItems, concurrency and a lead's maxAttempts above their bounds under
- * over-ceiling, so a list or number above its schema maximum is over-ceiling. Every other issue is
- * malformed. The text names schema keys and bounds only, never a value taken from the request.
+ * A too-big issue on a CEILING_PATHS field is over-ceiling; every other parse issue is malformed. The
+ * text names schema keys and bounds only, never a value taken from the request.
  */
 function issueError(issue: RequestIssue): ReadRequestError {
   const path = issuePath(issue.path);
+  const shape = issue.path.map(part => (typeof part === "number" ? "#" : String(part))).join(".");
   const key = issue.path.filter(part => typeof part === "string").at(-1);
   const name = typeof key === "string" && KEY.test(key) ? `\`${key}\`` : "the request";
   const subject = issue.path.length === 0 ? "the request" : typeof issue.path.at(-1) === "number" ? `an item of ${name}` : name;
-  if (issue.code === "too_big" && (issue.origin === "array" || issue.origin === "number" || issue.origin === "int")) {
-    return issue.origin === "array"
-      ? error("over-ceiling", path, `${name} has more than ${issue.maximum} items.`, `Cut ${name} to ${issue.maximum} items or fewer.`)
-      : error("over-ceiling", path, `${name} is above ${issue.maximum}.`, `Set ${name} to ${issue.maximum} or less.`);
-  }
-  const [message, fix] = malformedText(issue, subject);
-  return error("malformed", path, message.charAt(0).toUpperCase() + message.slice(1), fix);
+  const code = issue.code === "too_big" && CEILING_PATHS.has(shape) ? "over-ceiling" : "malformed";
+  const [message, fix] = issueText(issue, subject);
+  return error(code, path, message.charAt(0).toUpperCase() + message.slice(1), fix);
 }
 
-function malformedText(issue: RequestIssue, subject: string): [string, string] {
+function issueText(issue: RequestIssue, subject: string): [string, string] {
   const plural = (count: number | bigint, unit: string) => `${count} ${unit}${count === 1 ? "" : "s"}`;
   switch (issue.code) {
     case "invalid_type":
@@ -410,8 +423,12 @@ function malformedText(issue: RequestIssue, subject: string): [string, string] {
         ? [`${subject} needs at least ${plural(issue.minimum, unit)}.`, `Give ${subject} at least ${plural(issue.minimum, unit)}.`]
         : [`${subject} is below ${issue.minimum}.`, `Set ${subject} to ${issue.minimum} or more.`];
     }
-    case "too_big":
-      return [`${subject} is longer than ${issue.maximum} characters.`, `Shorten ${subject} to ${issue.maximum} characters or fewer.`];
+    case "too_big": {
+      const unit = issue.origin === "array" ? "items" : issue.origin === "string" ? "characters" : "";
+      return unit
+        ? [`${subject} has more than ${issue.maximum} ${unit}.`, `Cut ${subject} to ${issue.maximum} ${unit} or fewer.`]
+        : [`${subject} is above ${issue.maximum}.`, `Set ${subject} to ${issue.maximum} or less.`];
+    }
     case "invalid_value":
       return [`${subject} is not an allowed value.`, `Use one of: ${issue.values.map(String).join(", ")}.`];
     case "invalid_format":
@@ -424,7 +441,10 @@ function malformedText(issue: RequestIssue, subject: string): [string, string] {
   }
 }
 
-/** One line per error, then the sentence that tells the member a refusal is recoverable. */
+/**
+ * One line per error, then the sentence that tells the member a refusal is recoverable. The size of the
+ * 409 body returned to a member is the host slice's decision.
+ */
 export function refusalText(errors: ReadRequestError[]): string {
   const lines = errors.map(item => `- ${item.path}: ${item.message} Fix: ${item.fix}`);
   return [

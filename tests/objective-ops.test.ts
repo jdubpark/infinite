@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { canonicalJson } from "../packages/host/src/evidence/crypto.js";
 import { commandDigest } from "../packages/host/src/objective-input.js";
+import { correctionSchema } from "../packages/host/src/objective-input.js";
 import type { CheckInput, Correction, CorrectionOp, CriterionInput } from "../packages/host/src/objective-input.js";
 import {
   CORRECTION_LOG,
@@ -14,7 +15,7 @@ import type { OwnerOpContext } from "../packages/host/src/objective-ops.js";
 import { OBJECTIVE_ERRORS, goalRecord, rebuildVersion, syncDirections } from "../packages/host/src/objective-record.js";
 import type { ObjectiveErrorCode } from "../packages/host/src/objective-record.js";
 import { canonicalBytes, objectiveRecordSchema, recordDigest } from "../packages/host/src/objective-types.js";
-import type { Criterion, LogEntry, ObjectiveRecord, Threshold } from "../packages/host/src/objective-types.js";
+import type { Assumption, Criterion, LogEntry, ObjectiveRecord, Threshold } from "../packages/host/src/objective-types.js";
 import { RECORD_DIGEST_BYTES, recordDigestBytes } from "../packages/host/src/team-types.js";
 import type { TeamCommand } from "../packages/host/src/team-types.js";
 import { recordDigestFor } from "../packages/host/src/objective-digest.js";
@@ -461,4 +462,185 @@ test("creation criteria are version 1 and never stale", () => {
   assert.ok(created.log.slice(1).every(entry => entry.op === "criterion.added" && entry.version === 1));
   assert.ok(objectiveRecordSchema.safeParse(created).success);
   assert.equal(criterionFromInput(inputs[1]!, "c9", configured).id, "c9");
+});
+
+const REQUEST_TWO = "0b1e2d3c-4a5b-4c6d-8e7f-9a0b1c2d3e4f";
+const COMMIT = "a".repeat(40);
+const COMMIT_TWO = "b".repeat(40);
+
+/** The record with its assumptions replaced and its digest recomputed. The log is kept as it is. */
+function withAssumptions(record: ObjectiveRecord, assumptions: Assumption[]): ObjectiveRecord {
+  const body = { ...record, assumptions };
+  return { ...body, digest: recordDigest(body) };
+}
+
+function assumptionOf(id: string, test: Assumption["test"], patch: Partial<Assumption> = {}): Assumption {
+  return {
+    id, statement: `Assumption ${id}.`, status: "unchecked", origin: "intent-check", criticality: "plan",
+    refutedBy: `A fact that refutes ${id}.`, test, evidence: [], proposals: [], ...patch,
+  };
+}
+
+/** Version 1 with a2 (artifact test), a4 (owner test), a5 and a6 (owner tests rating quality below 4 and 3), and a7 (pinned). */
+function register(): ObjectiveRecord {
+  const artifact: Assumption["test"] = { kind: "artifact", path: "research/shortlist.md", count: "/items", threshold: { kind: "count", min: 1 } };
+  return withAssumptions(v1(), [
+    assumptionOf("a2", artifact),
+    assumptionOf("a4", { kind: "owner" }),
+    assumptionOf("a5", { kind: "owner", rating: { subject: "quality", below: 4 } }),
+    assumptionOf("a6", { kind: "owner", rating: { subject: "quality", below: 3 } }),
+    assumptionOf("a7", { kind: "owner", rating: { subject: "quality", below: 4 } }, { status: "verified", ownerPinned: true, evidence: ["owner:seed"] }),
+  ]);
+}
+
+test("the owner sets an owner-test assumption and pins it", () => {
+  const start = register();
+  const first = applyOwnerOps(start, correction(1, [{ op: "assumption.set", id: "a4", status: "verified" }]), context);
+  const a4 = first.assumptions.find(item => item.id === "a4")!;
+  assert.equal(a4.status, "verified");
+  assert.equal(a4.ownerPinned, true);
+  assert.deepEqual(a4.evidence, [`owner:${REQUEST}`], "the owner handle is last");
+  const setEntries = first.log.filter(entry => entry.op === "assumption.set");
+  assert.equal(setEntries.length, 1, "one entry for the set");
+  assert.deepEqual(setEntries[0], {
+    seq: 2, at: AT, version: 2, actor: "owner", authority: "direction", op: "assumption.set", target: "a4", handle: REQUEST,
+    before: { inline: { status: "unchecked" } }, after: { inline: { status: "verified" } },
+  }, "the entry holds the status before and after, with no pin before");
+  assert.deepEqual(rebuildVersion(first, 1), start, "the rebuild undoes the set");
+
+  const second = applyOwnerOps(first, correction(2, [{ op: "assumption.set", id: "a4", status: "refuted" }]), { ...context, requestId: REQUEST_TWO, at: at(2) });
+  const again = second.assumptions.find(item => item.id === "a4")!;
+  assert.deepEqual(again.evidence, [`owner:${REQUEST_TWO}`], "a second set replaces the earlier owner handle");
+  assert.deepEqual(second.log.at(-1)!.before, {
+    inline: { status: "verified", ownerPinned: true, replaced: { handle: `owner:${REQUEST}`, at: 0 } },
+  }, "the replaced handle and its index are logged");
+  assert.deepEqual(rebuildVersion(second, 2), first, "the rebuild undoes the second set");
+
+  const seeded = withAssumptions(start, start.assumptions.map(item => (item.id === "a4"
+    ? { ...item, evidence: ["rating:seed", "owner:old"] } : item)));
+  const replacing = applyOwnerOps(seeded, correction(1, [{ op: "assumption.set", id: "a4", status: "verified" }]), context);
+  assert.deepEqual(replacing.log.at(-1)!.before, {
+    inline: { status: "unchecked", replaced: { handle: "owner:old", at: 1 } },
+  }, "the replaced owner handle is at index 1");
+  assert.deepEqual(replacing.assumptions.find(item => item.id === "a4")!.evidence, ["rating:seed", `owner:${REQUEST}`],
+    "the new owner handle goes last and the rating handle stays");
+  assert.deepEqual(rebuildVersion(replacing, 1), seeded, "the rebuild puts the replaced handle back at index 1");
+
+  const refuted = refusal(() => applyOwnerOps(start, correction(1, [{ op: "assumption.set", id: "a2", status: "verified" }]), context));
+  assert.equal(refuted.status, 409);
+  assert.equal(refuted.code, "objective-assumption-target", "an artifact test is not an owner test");
+  const missing = refusal(() => applyOwnerOps(start, correction(1, [{ op: "assumption.set", id: "a9", status: "verified" }]), context));
+  assert.equal(missing.status, 409);
+  assert.equal(missing.code, "objective-assumption-target", "a missing assumption");
+  assert.equal(correctionSchema.safeParse({ requestId: REQUEST, version: 1, ops: [{ op: "assumption.set", id: "a4", status: "assumed" }] }).success, false,
+    "the schema refuses status assumed");
+});
+
+test("a rating stamps the reviewed head and moves unpinned owner tests", () => {
+  const start = withCriteria(register(), [v1().criteria[0]!, {
+    id: "c1", origin: "owner", statement: "Speed is rated.", check: { kind: "owner-rating", subject: "speed" },
+    producer: "owner", threshold: { kind: "score", min: 3, of: 5 }, state: "active",
+  }]);
+  const stamp = { commit: COMMIT, cycle: 2 };
+  const rated = applyOwnerOps(start, correction(1, [{ op: "rating.record", subject: "quality", score: 3.5 }]), { ...context, rating: stamp });
+  const find = (record: ObjectiveRecord, id: string) => record.assumptions.find(item => item.id === id)!;
+  assert.equal(find(rated, "a5").status, "refuted", "3.5 is below 4");
+  assert.deepEqual(find(rated, "a5").evidence, [`rating:${REQUEST}`]);
+  assert.equal(find(rated, "a6").status, "verified", "3.5 is not below 3");
+  assert.deepEqual(find(rated, "a6").evidence, [`rating:${REQUEST}`]);
+  assert.deepEqual(find(rated, "a7"), find(start, "a7"), "a pinned test is unchanged");
+  const entry = rated.log.at(-1)!;
+  assert.equal(entry.op, "rating.recorded");
+  assert.equal(entry.target, "quality");
+  assert.equal(entry.handle, REQUEST);
+  assert.deepEqual(entry.before, { inline: { assumptions: [{ id: "a5", status: "unchecked" }, { id: "a6", status: "unchecked" }] } });
+  assert.deepEqual(entry.after, {
+    inline: { subject: "quality", score: 3.5, commit: COMMIT, cycle: 2, changed: [{ id: "a5", status: "refuted" }, { id: "a6", status: "verified" }] },
+  });
+  assert.deepEqual(rebuildVersion(rated, 1), start, "the rebuild undoes the rating");
+
+  const again = applyOwnerOps(rated, correction(2, [{ op: "rating.record", subject: "quality", score: 4.5 }]), {
+    ...context, requestId: REQUEST_TWO, at: at(2), rating: { commit: COMMIT_TWO, cycle: 3 },
+  });
+  assert.equal(find(again, "a5").status, "verified", "4.5 is not below 4");
+  assert.deepEqual(find(again, "a5").evidence, [`rating:${REQUEST_TWO}`], "a second rating replaces the earlier handle");
+  assert.deepEqual(rebuildVersion(again, 2), rated, "the rebuild undoes the second rating");
+
+  const speed = applyOwnerOps(start, correction(1, [{ op: "rating.record", subject: "speed", score: 4 }]), { ...context, rating: stamp });
+  assert.deepEqual(speed.log.at(-1)!.after, { inline: { subject: "speed", score: 4, commit: COMMIT, cycle: 2, changed: [] } },
+    "an owner-rating criterion names the subject, and an entry is logged even when nothing changes");
+  assert.equal(speed.log.length, start.log.length + 1);
+
+  const boundary = applyOwnerOps(start, correction(1, [{ op: "rating.record", subject: "quality", score: 3 }]), { ...context, rating: stamp });
+  assert.equal(find(boundary, "a5").status, "refuted", "3 is below 4");
+  assert.equal(find(boundary, "a6").status, "verified", "3 is not below 3");
+
+  const retiredOnly = withCriteria(register(), [v1().criteria[0]!, {
+    id: "c2", origin: "owner", statement: "Tone is rated.", check: { kind: "owner-rating", subject: "tone" },
+    producer: "owner", threshold: { kind: "score", min: 3, of: 5 }, state: "retired",
+  }]);
+  const retired = refusal(() => applyOwnerOps(retiredOnly, correction(1, [{ op: "rating.record", subject: "tone", score: 4 }]), { ...context, rating: stamp }));
+  assert.equal(retired.status, 409);
+  assert.equal(retired.code, "objective-rating-subject", "a retired owner-rating criterion names nothing");
+
+  const noHead = refusal(() => applyOwnerOps(start, correction(1, [{ op: "rating.record", subject: "quality", score: 3.5 }]), context));
+  assert.equal(noHead.status, 409);
+  assert.equal(noHead.code, "objective-rating-no-head");
+  const unnamed = refusal(() => applyOwnerOps(start, correction(1, [{ op: "rating.record", subject: "tone", score: 3.5 }]), { ...context, rating: stamp }));
+  assert.equal(unnamed.status, 409);
+  assert.equal(unnamed.code, "objective-rating-subject");
+
+  const scoreAt = (score: number) => ({ op: "rating.record", subject: "quality", score });
+  for (const score of [0, 5.5, 3.3]) {
+    assert.equal(correctionSchema.safeParse({ requestId: REQUEST, version: 1, ops: [scoreAt(score)] }).success, false, `the schema refuses ${score}`);
+  }
+  for (const score of [1, 2.5, 5]) {
+    assert.equal(correctionSchema.safeParse({ requestId: REQUEST, version: 1, ops: [scoreAt(score)] }).success, true, `the schema accepts ${score}`);
+  }
+});
+
+test("register ops and criterion ops share one version", () => {
+  const retirable: Criterion = {
+    id: "c1", origin: "owner", statement: "A ranked list.", check: { kind: "judgement", item: "method-applied" },
+    producer: "evaluator", threshold: { kind: "pass" }, state: "active",
+  };
+  const start = withCriteria(register(), [v1().criteria[0]!, retirable]);
+  const next = applyOwnerOps(start, correction(1, [
+    { op: "criterion.retire", id: "c1" },
+    { op: "assumption.set", id: "a4", status: "verified" },
+  ]), context);
+  assert.equal(next.version, 2);
+  assert.deepEqual(next.log.slice(-2).map(entry => [entry.op, entry.target, entry.version]), [
+    ["criterion.retired", "c1", 2],
+    ["assumption.set", "a4", 2],
+  ]);
+  assert.equal(next.criteria.find(item => item.id === "c1")!.state, "retired");
+  assert.equal(next.assumptions.find(item => item.id === "a4")!.status, "verified");
+
+  const stale = refusal(() => applyOwnerOps(start, correction(7, [{ op: "assumption.set", id: "a4", status: "verified" }]), context));
+  assert.equal(stale.status, 409);
+  assert.equal(stale.code, "objective-version-stale");
+});
+
+test("a rating writes entries of eight changes and rebuilds", () => {
+  const nine = withAssumptions(v1(), Array.from({ length: 9 }, (_, index) =>
+    assumptionOf(`a${index + 1}`, { kind: "owner", rating: { subject: "quality", below: 4 } })));
+  const rated = applyOwnerOps(nine, correction(1, [{ op: "rating.record", subject: "quality", score: 3.5 }]), { ...context, rating: { commit: COMMIT, cycle: 2 } });
+  const entries = rated.log.filter(entry => entry.op === "rating.recorded");
+  assert.equal(entries.length, 2, "nine changes make two entries");
+  assert.ok(entries.every(entry => entry.version === 2), "both entries share one version");
+  assert.deepEqual(entries.map(entry => (entry.after as { inline: { changed: unknown[] } }).inline.changed.length), [8, 1]);
+  assert.ok(entries.every(entry => entry.seq > nine.log.at(-1)!.seq), "the seqs follow the record's log");
+  assert.ok(rated.assumptions.every(item => item.status === "refuted" && item.evidence.length === 1), "all nine take the rating");
+  assert.deepEqual(rebuildVersion(rated, 1), nine, "the rebuild undoes both entries");
+});
+
+test("a correction names each assumption and each rating subject once", () => {
+  const twice = (ops: CorrectionOp[]) => correctionSchema.safeParse({ requestId: REQUEST, version: 1, ops }).success;
+  assert.equal(twice([{ op: "assumption.set", id: "a4", status: "verified" }, { op: "assumption.set", id: "a4", status: "refuted" }]), false,
+    "two sets on one assumption are refused");
+  assert.equal(twice([{ op: "rating.record", subject: "quality", score: 3 }, { op: "rating.record", subject: "quality", score: 4 }]), false,
+    "two ratings on one subject are refused");
+  assert.equal(twice([{ op: "assumption.set", id: "a4", status: "verified" }, { op: "rating.record", subject: "quality", score: 3 }]), true,
+    "one set and one rating are accepted");
 });

@@ -350,12 +350,13 @@ export class TranscriptWatch {
   }
 
   /**
-   * An end-only turn end stands only while the transcript shows that its last started turn ended. The hook itself
-   * proves no more than that some turn ended: a later turn may have begun before or after the watch read for it.
+   * An end-only turn end stands only when the final drain read the transcript to its end, and the transcript shows
+   * that its last turn ended. The hook itself proves no more than that some turn ended: a later turn may have begun
+   * before or after the watch read for it, and only a read after the provider exited has seen every row.
    * True when the last hook was not end-only.
    */
-  private endStands(current: Current | undefined): boolean {
-    return !this.endOnly || (current !== undefined && current.usage.lastTurnEnded());
+  private endStands(current: Current | undefined, finalDrain: FinalDrainState | undefined): boolean {
+    return !this.endOnly || (finalDrain === "complete" && current !== undefined && current.usage.lastTurnEnded());
   }
 
   /** The drain of the last transcript hook reached the end of `current`, and nothing is pending. */
@@ -469,7 +470,7 @@ export class TranscriptWatch {
         || readers.some(reader => reader.tail.dropped || reader.tail.discarded > 0 || reader.usage.rejectedCount() > 0),
       lastDrain: {
         complete: current !== undefined && this.complete(current) && !this.retired.gap,
-        turnEnd: (this.last?.turnEnd ?? false) && !this.retired.midTurn && this.endStands(current),
+        turnEnd: (this.last?.turnEnd ?? false) && !this.retired.midTurn && this.endStands(current, finalState),
       },
       finalDrain: finalState,
       secondary: this.sessionSecondary(current),

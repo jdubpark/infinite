@@ -103,20 +103,26 @@ export const readResultSchema = z.discriminatedUnion("output", [
 export type ReadResult = z.infer<typeof readResultSchema>;
 
 const count = (max: number) => z.number().int().min(0).max(max);
+const setting = (max: number) => z.number().int().min(1).max(max);
 
 export const readGrantSchema = z.strictObject({
   requester: z.enum(["project-manager", "scout-lead", "reader", "quarantined-reader"]),
   poolOn: z.boolean(),
   profiles: z.array(taskIdSchema).max(64),
   routerCoversScout: z.boolean(),
+  // Part 1 settings table: the ranges a run may pin.
   limits: z.strictObject({
-    concurrency: count(64),
-    listConcurrency: count(64),
-    requestAttempts: count(100),
+    concurrency: setting(5),
+    listConcurrency: setting(8),
+    requestAttempts: setting(40),
     outside: z.boolean(),
   }),
-  allowanceLeft: count(1000),
-  reservation: count(100).optional(),
+  // At most runAttempts, whose range is 0 to 200.
+  allowanceLeft: count(200),
+  // Scout lead only, at most lead.maxAttempts (12). PROPOSED: what remains of the attempts reserved
+  // for this lead, its own second attempt included. The validator charges the request and that
+  // attempt to allowanceLeft as well, which fails closed if allowanceLeft already excludes it.
+  reservation: count(12).optional(),
   outsideProfiles: z.array(taskIdSchema).max(64),
   // Set by the host. The validator only reads it.
   lineage: z.strictObject({
@@ -150,11 +156,14 @@ export type ReadRequestResult =
   | { ok: true; total: number; phases: number[]; keys: Record<string, string> }
   | { ok: false; errors: ReadRequestError[] };
 
-/** Part 2: a step's key ignores profile, id, title and effort, so the same work is recognized however it is labelled. */
+/**
+ * Part 2: a step's key ignores profile, id, title and effort, so the same work is recognized however it is labelled.
+ * Paths and refs count as sets: order and repeats do not change the key. The step is never mutated.
+ */
 export function stepKey(step: ReadStep): string {
   const instructions = step.instructions.replace(/\s+/g, " ").trim().toLowerCase();
-  const paths = [...(step.paths ?? [])].sort();
-  const refs = [...(step.source?.refs ?? [])].sort();
+  const paths = [...new Set(step.paths ?? [])].sort();
+  const refs = [...new Set(step.source?.refs ?? [])].sort();
   const material = JSON.stringify([instructions, paths, step.output, step.forEach?.step ?? null, refs]);
   return createHash("sha256").update(material).digest("hex");
 }
@@ -227,6 +236,12 @@ export function validateReadRequest(request: ReadRequest, grantInput: unknown): 
     if (step.source && step.lead) {
       errors.push(error("not-granted", `${path}.lead`, "An outside-content step cannot be a lead.",
         "Remove lead, or remove source from this step."));
+    }
+    // PROPOSED: part 11 gives a verifier an artifact-only context and a quarantined reader only its
+    // brief, with no clone and no entries. One step cannot be both.
+    if (step.verify && step.source) {
+      errors.push(error("not-granted", `${path}.source`, "A verifier step cannot read outside content.",
+        "Remove source from the verifier step, or remove verify."));
     }
     if (step.agentProfileId !== undefined && !grant.profiles.includes(step.agentProfileId)) {
       errors.push(error("unknown-profile", `${path}.agentProfileId`, `Profile "${step.agentProfileId}" is not in this run's pool.`,
@@ -311,17 +326,21 @@ export function validateReadRequest(request: ReadRequest, grantInput: unknown): 
       `The expanded request is ${total} steps; the per-request limit is ${grant.limits.requestAttempts}.`,
       `Cut the steps or maxItems so the expanded total is ${grant.limits.requestAttempts} or less.`), limit: "request" });
   }
-  if (total > grant.allowanceLeft) {
+  // Part 5: a scout lead's second attempt is a read attempt, so it is charged beside the request's
+  // steps. The per-request ceiling above counts only the request's own steps.
+  const ownAttempt = grant.requester === "scout-lead" ? 1 : 0;
+  const charged = ownAttempt ? `${total} steps, plus 1 for the scout lead's second attempt` : `${total} steps`;
+  if (total + ownAttempt > grant.allowanceLeft) {
     errors.push({ ...error("over-ceiling", "phases",
-      `The expanded request is ${total} steps; the run has ${grant.allowanceLeft} left.`,
-      `Send at most ${grant.allowanceLeft} expanded steps.`), limit: "allowance" });
+      `The expanded request is ${charged}; the run has ${grant.allowanceLeft} left.`,
+      sendAtMost(grant.allowanceLeft - ownAttempt)), limit: "allowance" });
   }
   if (grant.requester === "scout-lead") {
     const reservation = grant.reservation ?? 0;
-    if (total > reservation) {
+    if (total + ownAttempt > reservation) {
       errors.push({ ...error("over-ceiling", "phases",
-        `The expanded request is ${total} steps; the scout lead's reservation is ${reservation}.`,
-        `Send at most ${reservation} expanded steps.`), limit: "reservation" });
+        `The expanded request is ${charged}; the scout lead's reservation is ${reservation}.`,
+        sendAtMost(reservation - ownAttempt)), limit: "reservation" });
     }
   }
 
@@ -330,6 +349,10 @@ export function validateReadRequest(request: ReadRequest, grantInput: unknown): 
 
 function error(code: ReadErrorCode, path: string, message: string, fix: string): ReadRequestError {
   return { code, path, message, fix };
+}
+
+function sendAtMost(room: number): string {
+  return room > 0 ? `Send at most ${room} expanded steps.` : "No read step fits; continue with the evidence you have.";
 }
 
 /** One line per error, then the sentence that tells the member a refusal is recoverable. */

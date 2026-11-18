@@ -65,7 +65,7 @@ export type EvidenceDescription = EvidenceStatus & {
 };
 
 export type EvidenceErrorCode =
-  "unavailable" | "nested-write" | "invalid-event" | "event-too-large" | "invalid-module" | "invalid-statement";
+  "unavailable" | "nested-write" | "invalid-event" | "event-too-large" | "invalid-module" | "invalid-statement" | "unreadable";
 
 export class EvidenceError extends Error {
   constructor(readonly code: EvidenceErrorCode, message: string) {

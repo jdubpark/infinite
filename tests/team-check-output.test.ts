@@ -152,6 +152,10 @@ test("a long line is classed by its start; its directive and identity cover the 
     [`${start}one${end}\n${start}two${end}\n`, 2],
     // Indentation is not part of a long line's identity.
     [`${" ".repeat(9)}${start}one${end}\n${start}one${end}\n`, 1],
+    // Nor does it change the identity when it alone takes the line over 4,096 bytes: here 4,098 bytes indented and 4,094 without.
+    [`    ${CHECK} ${"x".repeat(4084)} (1ms)\n${CHECK} failing tests:\n${CHECK} ${"x".repeat(4084)} (1ms)\n  Error: detail\n`, 1],
+    // The same with an escape sequence and a trailing space in both prints: the identity is one function of the raw line.
+    [`    ${CHECK} ${"x".repeat(4085)}${ESC}[0m \n${CHECK} ${"x".repeat(4085)}${ESC}[0m \n`, 1],
   ];
   for (const [text, count] of cases) {
     const whole = scanCheckOutput(text);

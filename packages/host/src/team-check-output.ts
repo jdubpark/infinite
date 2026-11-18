@@ -16,10 +16,11 @@ const DETAIL_BYTES = 1500;
 const LINE_BYTES = 240;
 // PROPOSED: a raw line longer than PENDING_BYTES keeps only its first PENDING_BYTES bytes, and the scan reads the line from that
 // kept start: its class (test point, TAP failure, marker, block mark, blank line), its indentation and its shown text. Two facts
-// are computed over the whole line in constant memory: whether a TAP directive occurs, matched on its raw text, and its identity,
-// a SHA-256 of the raw line after its leading whitespace. So a long line's escape sequences and trailing whitespace are part of
-// its identity. A line that fits is read whole without its escape sequences, and its identity is its trimmed text.
+// are computed over the whole line in constant memory: its identity, and whether a TAP directive occurs. A long line's directive
+// is matched on its raw text; a line that fits is matched without its escape sequences.
 const PENDING_BYTES = 4096;
+// PROPOSED: the identity of a marker line of any length is a SHA-256 of its raw text after its leading whitespace. Two prints of
+// one failure that differ only in indentation are one failure; escape sequences and trailing whitespace are part of the identity.
 // PROPOSED: distinct marker-line hashes remembered; past this the scan is capped.
 const MAX_DISTINCT = 1024;
 // PROPOSED: size limit of the repair feedback text.
@@ -179,7 +180,7 @@ export class CheckOutputScanner {
   }
 
   private marker(state: StreamState, text: string): void {
-    const key = state.long ? `long ${state.long.hash.digest("hex")}` : digest(text.trim());
+    const key = state.long ? state.long.hash.digest("hex") : digest(state.head.replace(/^\s+/, ""));
     let kept: Kept | undefined;
     if (!this.seen.has(key)) {
       if (this.seen.size >= MAX_DISTINCT) this.capped = true;

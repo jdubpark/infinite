@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import * as goal from "../packages/host/src/goal-digest.js";
 import * as crossing from "../packages/host/src/crossing-digest.js";
-import type { CriterionInput, EndedCycle, GoalDigest } from "../packages/host/src/goal-digest.js";
+import type { CriterionInput, EndedCycle, GoalDigest, HistoryLineInput } from "../packages/host/src/goal-digest.js";
 import type { ClaimInput, CrossingDigest, HostInput } from "../packages/host/src/crossing-digest.js";
 
 // The goal digest of design part 10. Special characters are built from code points.
@@ -196,8 +196,9 @@ const STATUSES = ["blocked", "failed", "merged", "ready-for-review", "cancelled"
 /**
  * A random sequence of ended cycles, each in two forms: as generated, and with every claim erased (the run digest's
  * claim rows, the criteria and the brief text). Claims draw paths and failure keys from the pools receipts use, so
- * they collide with receipts of the same and of earlier cycles; a quarter of the run digests put such claims before
- * their receipts, which the crossing builders never do. Short paths reach the caps, long ones the byte bound.
+ * they collide with receipts of the same and of earlier cycles. A quarter of the run digests put such claims before
+ * their receipts and hold more decisions and open questions than a crossing digest's caps allow, which the crossing
+ * builders never do. Short paths reach the caps, long ones the byte bound.
  */
 function randomCycles(seed: number, count: number): Step[] {
   const random = mulberry32(seed);
@@ -234,8 +235,8 @@ function randomCycles(seed: number, count: number): Step[] {
         ...hostRun,
         touched: [...(claims.touched ?? []).map(row => ({ ...row, by: "claim" as const })), ...hostRun.touched],
         failures: [...(claims.failures ?? []).map(row => ({ ...row, class: "claim" as const, by: "claim" as const })), ...hostRun.failures],
-        decisions: run.decisions,
-        open: run.open,
+        decisions: claims.decisions ?? [],
+        open: claims.open ?? [],
       };
     }
     const receiptPaths = new Set(hostRun.touched.map(row => row.path));
@@ -269,6 +270,26 @@ function randomCycles(seed: number, count: number): Step[] {
   return steps;
 }
 
+const CAP_OF = { touched: 24, failures: 6, decisions: 6, open: 4, criteria: 8 } as const;
+
+/**
+ * Per counted list, whether this call trimmed it: "cap" when its counter rose above what the inputs brought and the
+ * list is full, "bound" when it rose and the list is shorter, otherwise "none". The generator makes no malformed row.
+ */
+function trims(digest: GoalDigest, previous: GoalDigest | undefined, cycle: EndedCycle): Record<keyof typeof CAP_OF, "cap" | "bound" | "none"> {
+  const received = cycle.run.omitted;
+  const claims = cycle.claimsUnavailable !== true;
+  const brought = {
+    touched: Math.min(OMITTED_MAX, (previous?.omitted.touched ?? 0) + received.touched),
+    failures: cycle.handles.reviewedHead === undefined ? received.failures : 0,
+    decisions: claims ? received.decisions : 0,
+    open: claims ? (received.open ?? 0) : 0,
+    criteria: 0,
+  };
+  const keys = Object.keys(CAP_OF) as (keyof typeof CAP_OF)[];
+  return Object.fromEntries(keys.map(key => [key, digest.omitted[key] <= brought[key] ? "none" : (digest[key]?.length ?? 0) === CAP_OF[key] ? "cap" : "bound"])) as Record<keyof typeof CAP_OF, "cap" | "bound" | "none">;
+}
+
 test("differential: every sequence of cycles gives the same receipt fields with its claims erased", t => {
   const seeds = Array.from({ length: 160 }, (_, index) => 310_000 + index);
   const names = ["touched cap", "failures cap", "decisions cap", "open cap", "criteria cap", "history cap", "bound with receipts", "bound with claims", "bound with history"] as const;
@@ -281,7 +302,6 @@ test("differential: every sequence of cycles gives the same receipt fields with 
     let lines = 0;
     for (const [index, step] of randomCycles(seed, 22).entries()) {
       const where = `seed ${seed}, cycle ${index + 1}`;
-      const available = new Set([...step.erased.run.touched.map(row => row.path), ...(erased?.touched ?? []).map(row => row.path)]).size;
       let left: GoalDigest;
       let right: GoalDigest;
       try {
@@ -291,19 +311,19 @@ test("differential: every sequence of cycles gives the same receipt fields with 
         throw new Error(`${where}: ${(error as Error).message}`);
       }
       assert.deepEqual(receiptFields(left), receiptFields(right), where);
+      // A real trim: a counter rose above what the inputs brought. At its cap the cap trimmed; below it, the bound.
+      const [trimClaimed, trimErased] = [trims(left, claimed, step.claimed), trims(right, erased, step.erased)];
       claimed = left;
       erased = right;
       steps += 1;
       collisions += step.collisions;
       lines += 1;
-      // What the erased run dropped is receipts alone: a full list is the cap, a shorter one the byte bound.
-      const { run } = step.claimed;
       const full: [(typeof names)[number], boolean][] = [
-        ["touched cap", available > 24 && right.touched.length === 24], ["failures cap", right.failures.length === 6],
-        ["decisions cap", left.decisions.length === 6], ["open cap", left.open.length === 4],
-        ["criteria cap", (left.criteria?.length ?? 0) === 8], ["history cap", left.history.length === 16],
-        ["bound with receipts", right.touched.length < Math.min(24, available)],
-        ["bound with claims", step.claimed.claimsUnavailable !== true && (left.open.length < Math.min(4, run.open.length) || left.decisions.length < Math.min(6, run.decisions.length))],
+        ["touched cap", trimErased.touched === "cap"], ["failures cap", trimClaimed.failures === "cap"],
+        ["decisions cap", trimClaimed.decisions === "cap"], ["open cap", trimClaimed.open === "cap"],
+        ["criteria cap", trimClaimed.criteria === "cap"], ["history cap", left.history.length === 16 && lines > 16],
+        ["bound with receipts", trimErased.touched === "bound" || trimErased.failures === "bound"],
+        ["bound with claims", trimClaimed.decisions === "bound" || trimClaimed.open === "bound" || trimClaimed.criteria === "bound"],
         ["bound with history", left.history.length < Math.min(16, lines)],
       ];
       for (const [name, hit] of full) if (hit) reached[name].add(seed);
@@ -353,6 +373,11 @@ test("counters: cycles without a line, the run digest's own counts, saturation, 
   assert.deepEqual([marked.decisions, marked.open, marked.failures], [[], [], [{ signal: "exit 1", class: "check", by: "receipt" }]]);
   assert.deepEqual(marked.touched.map(row => row.path), ["b", "a"]);
   assert.equal(valid(goal.nextGoalDigest(marked, ended(10, run))).claimsUnavailable, undefined);
+  // Claims change omitted.failures too: seven distinct claim failures beside no host failure count one, erased none.
+  const host = must(crossing.hostDigest({ outcome: "failed" }));
+  const seven = must(crossing.withClaims(host, { failures: Array.from({ length: 7 }, (_, index) => ({ signal: `claimed ${index}` })) }));
+  assert.equal(valid(goal.nextGoalDigest(undefined, ended(1, seven))).omitted.failures, 1);
+  assert.equal(valid(goal.nextGoalDigest(undefined, ended(1, host))).omitted.failures, 0);
 });
 
 // Totality: no input throws. A host-owned argument that is unusable refuses; a malformed row is dropped and counted.
@@ -461,4 +486,100 @@ test("nothing else carries: extra fields on every input object never reach the d
     assert.equal(JSON.stringify(decorated).includes(MARK), false);
     assert.deepEqual(valid(goal.fitGoalDigest(decorate(plain) as GoalDigest)), plain);
   }
+});
+
+test("totality: 200,000 rows in any list position build a valid digest and never throw", () => {
+  const rows = 200_000;
+  const make: Record<string, (index: number) => unknown> = {
+    history: index => ({ cycle: rows - index, status: "blocked", line: "x" }),
+    touched: index => ({ path: `p${index}`, op: "read", by: "receipt" }),
+    failures: index => ({ signal: `s${index}`, class: "check", by: "receipt" }),
+    decisions: index => ({ what: `w${index}`, why: "y" }),
+    open: index => `q${index}`,
+    criteria: index => ({ criterion: `c${index}`, status: "met" }),
+  };
+  const base = valid(goal.nextGoalDigest(undefined, richCycle(1)));
+  const { run } = richCycle(1);
+  let calls = 0;
+  const call = (label: string, build: () => GoalDigest | undefined) => {
+    let result: GoalDigest | undefined;
+    assert.doesNotThrow(() => { result = build(); }, label);
+    valid(result, label);
+    calls += 1;
+  };
+  for (const [name, row] of Object.entries(make)) {
+    const list = Array.from({ length: rows }, (_, index) => row(index));
+    const previous = { ...base, cycle: rows, [name]: list } as GoalDigest;
+    call(`previous ${name}, next cycle`, () => goal.nextGoalDigest(previous, richCycle(rows + 1)));
+    call(`previous ${name}, replay`, () => goal.nextGoalDigest(previous, richCycle(rows)));
+    call(`previous ${name}, refit`, () => goal.fitGoalDigest(previous));
+    if (name === "history") continue;
+    const cycle = (name === "criteria" ? { ...richCycle(2), criteria: list } : { ...richCycle(2), run: { ...run, [name]: list } }) as EndedCycle;
+    call(`ended ${name}, first digest`, () => goal.nextGoalDigest(undefined, cycle));
+    call(`ended ${name}, next cycle`, () => goal.nextGoalDigest(base, cycle));
+  }
+  assert.equal(calls, 6 * 3 + 5 * 2);
+});
+
+// Pins: each holds one rule that a one-line change to the module would otherwise break unseen.
+
+test("pin: outside content comes from the ended cycle alone, so a clearance turns it off", () => {
+  const previous = valid(goal.nextGoalDigest(undefined, richCycle(1)));
+  assert.deepEqual([previous.outsideContent, previous.unclearedHead], [true, { runId: runId(99), head: sha(99) }]);
+  const { unclearedHead: _, ...cleared } = richCycle(2);
+  const next = valid(goal.nextGoalDigest(previous, { ...cleared, outsideContent: false }));
+  assert.equal(next.outsideContent, false);
+  assert.equal(Object.hasOwn(next, "unclearedHead"), false);
+});
+
+test("pin: a stop line holds codes only and a brief line text only; otherwise the cycle has no line", () => {
+  const previous = valid(goal.nextGoalDigest(undefined, richCycle(1)));
+  const lines = [
+    { kind: "stop", blockCode: "Checks failed" }, { kind: "stop", stopClass: "failed; see the report" }, { kind: "stop", blockCode: 7 },
+    { kind: "brief", title: 7, expectedOutcome: "done" }, { kind: "brief", title: "Title", expectedOutcome: null },
+  ] as unknown as HistoryLineInput[];
+  for (const line of lines) {
+    const digest = valid(goal.nextGoalDigest(previous, { ...richCycle(2), line }), JSON.stringify(line));
+    assert.deepEqual([digest.history.map(row => row.cycle), digest.omitted.cycles], [[1], 1], JSON.stringify(line));
+  }
+  const coded = valid(goal.nextGoalDigest(previous, { ...richCycle(2), line: { kind: "stop", blockCode: "checks-failed" } }));
+  assert.deepEqual(coded.history[0], { cycle: 2, status: "blocked", line: "block checks-failed" });
+});
+
+test("pin: a claim failure with a receipt's signal and place is dropped, and the receipts keep their order", () => {
+  const run: CrossingDigest = {
+    ...must(crossing.hostDigest({ outcome: "failed" })),
+    failures: [
+      { signal: "exit 1", where: "npm test", class: "claim", by: "claim" },
+      { signal: "lint", class: "check", by: "receipt" },
+      { signal: "exit 1", where: "npm test", class: "check", by: "receipt" },
+      { signal: "flaky", class: "claim", by: "claim" },
+    ],
+  };
+  assert.deepEqual(valid(goal.nextGoalDigest(undefined, ended(1, run))).failures, [
+    { signal: "lint", class: "check", by: "receipt" },
+    { signal: "exit 1", where: "npm test", class: "check", by: "receipt" },
+    { signal: "flaky", class: "claim", by: "claim" },
+  ]);
+});
+
+test("pin: a replayed cycle returns the refitted digest, never the stored object", () => {
+  const digest = valid(goal.nextGoalDigest(undefined, richCycle(1)));
+  const stored = { ...digest, extra: "written by an older host", omitted: { ...digest.omitted, extra: 1 } } as GoalDigest;
+  const replayed = valid(goal.nextGoalDigest(stored, richCycle(1)));
+  assert.deepEqual(replayed, digest);
+  assert.notEqual(replayed, stored);
+});
+
+test("pin: omitted.cycles saturates at 9,999", () => {
+  const digest = valid(goal.nextGoalDigest(undefined, ended(10_001, must(crossing.hostDigest({ outcome: "failed" })))));
+  assert.deepEqual([digest.history.length, digest.omitted.cycles], [1, OMITTED_MAX]);
+});
+
+test("pin: a criterion and its check label are normalized by the text rule", () => {
+  const raw = ["a", char(0x200e), "b", char(0x2028), "c", char(0x202e), "d"].join("");
+  const escape = (code: number) => `${char(0x5c)}u{${code.toString(16)}}`;
+  const expected = ["a", escape(0x200e), "b", char(0x0a), "c", escape(0x202e), "d"].join("");
+  const digest = valid(goal.nextGoalDigest(undefined, { ...richCycle(1), criteria: [{ criterion: raw, status: "met", check: raw }] }));
+  assert.deepEqual(digest.criteria, [{ criterion: expected, status: "met", check: expected }]);
 });

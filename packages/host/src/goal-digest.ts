@@ -9,11 +9,13 @@ import {
  * Goal digest (design part 10). Pure: no I/O, clock, globals or model calls. It carries a goal into its next cycle in
  * place of `previousWork`. Every list is newest first, so the oldest item sits at the end of each array.
  *
- * Input boundary, as in crossing-digest.ts. Arguments are JSON values as JSON.parse returns them. Objects with getters,
- * proxies or a toJSON method are outside the contract, and the caller bounds the input size.
+ * Input boundary. Arguments are JSON values as JSON.parse returns them, of any size. Objects with getters, proxies or a
+ * toJSON method are outside the contract. Every function is total on such values, and its work is linear in the size
+ * of its input: each row is read once, text is clipped as it is read, every list is cut to its cap before it is spread
+ * into a call or fitted, and fitting therefore works on a digest whose size the caps bound.
  *
  * Authority boundary. Both arguments are host-owned. `previous` is a digest this module returned, and GoalService
- * builds `ended` from the goal record, the run record and the run digest. Text that members wrote reaches `ended` in
+ * builds `ended` from host records; EndedCycle says which of them exist today. Text that members wrote reaches `ended` in
  * three places only: the claim lists of `ended.run`, the brief of a `brief` line, and the criteria, whose statuses
  * record an evaluator's assessment. Every row is rebuilt from named fields, so no other field of any input reaches the
  * digest: no report, transcript, check output, score, rating, usage, routing decision or quarantined text. The run
@@ -83,8 +85,9 @@ const crossing = crossingDigestSchema.shape;
  * the cap or the bound, malformed lines, and cycles never applied, such as those before a goal's first digest. It is
  * derived, so it needs no replay care. `decisions`, `open` and `criteria` get counters beside the three of part 10.
  * `touched` accumulates across cycles; the other list counters describe the last cycle only, like their lists. Each
- * adds the run digest's own counter for its list. That counter counts claims too, so `omitted.touched` can count rows
- * that were never receipts: it reads as "the list may be incomplete", not as an exact number of lost receipts.
+ * adds the run digest's own counter for its list, which counts rows of both authorities, so claims change
+ * `omitted.touched` and `omitted.failures` as well as the claim counters. Both mean "the list may be incomplete" and
+ * never "a host fact was lost": seven claim failures beside no host failure give `omitted.failures` 1.
  * PROPOSED marker. `claimsUnavailable: true` stands for part 10's failure-mode row "marks claim fields unavailable":
  * the run digest's claim lists could not be read, so `decisions`, `open` and claim failures are empty for that reason.
  */
@@ -132,9 +135,16 @@ export type HistoryLineInput =
 export type CriterionInput = { criterion: string; status: (typeof CRITERION_STATUSES)[number]; check?: string };
 
 /**
- * Host-owned: the facts of the cycle that ended, which GoalService reads from the goal record, the run record and the
- * run digest when it starts the next cycle. The only member text is named in the module comment. No field takes a
- * report, transcript, check output, score, rating, usage figure, routing decision or quarantined text.
+ * Host-owned: the facts of the cycle that ended, which GoalService passes when it starts the next cycle. The only
+ * member text is named in the module comment. No field takes a report, transcript, check output, score, rating, usage
+ * figure, routing decision or quarantined text.
+ *
+ * Sources. Records that exist today hold the cycle number, status, run id and reviewed head (the goal record's cycle:
+ * `cycle`, `status`, `teamId`, `headCommit`), the brief (the cycle's `brief`), the block code (the run record's
+ * `blockCode`) and the stop class (the cycle's `class` or the run's `stopReason`). Later slices supply the rest: no
+ * production code stores or builds a run digest yet, so `run` and `claimsUnavailable` wait for the crossings slice;
+ * no goal or run record holds an outside-content lineage, so `outsideContent` and `unclearedHead` wait for part 11;
+ * and nothing produces C14 criteria rows, so `criteria` waits for C14.
  */
 export type EndedCycle = {
   /** The number of the cycle that ended. Becomes the digest's `cycle`. */
@@ -147,6 +157,9 @@ export type EndedCycle = {
    * The cycle's run digest: the merge of the run's crossings, or, when the store is unavailable, hostDigest over the
    * run record. Its receipt `touched` rows join the goal's `touched`; its failures, decisions and open questions
    * describe the cycle that ended. Its claim lists are member JSON; the rest is host-owned.
+   * PROPOSED, for the wiring slice: the `where` of a receipt failure must be host vocabulary, such as a check's
+   * position in the run's check list, and never the text of a command. A check's command can come from a member's
+   * report (TeamService copies a plan's `verification` into the checks it runs), and a receipt carries no member text.
    */
   run: CrossingDigest;
   /** True when the run digest's claim lists could not be read (the store was unavailable). */
@@ -431,12 +444,12 @@ function assemble(parts: Parts): GoalDigest {
     const rows = claims[key];
     const list = digest[key];
     if (rows === undefined || list === undefined) continue;
+    // Cut to the cap first, so the spread passes at most CAPS[key] arguments.
     omitted[key] = add(omitted[key], cut(rows, CAPS[key] - list.length));
     (list as unknown[]).push(...rows);
   }
   fit(digest, ["open", "decisions", "failures", "criteria"], restBytes, row => field(row, "by") !== "receipt");
-  digest.history.push(...parts.history);
-  cut(digest.history, CAPS.history);
+  digest.history = parts.history.slice(0, CAPS.history);
   fit(digest, ["history"], restBytes, () => true);
   omitted.cycles = Math.min(OMITTED_MAX, digest.cycle - digest.history.length);
   return digest;

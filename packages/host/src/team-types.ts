@@ -1,4 +1,5 @@
 import type { ConnectorSource } from "./mcp-types.js";
+import type { CheckScan } from "./team-check-output.js";
 import { z } from "zod";
 import { featureMapSchema, TASK_KINDS } from "./task-features.js";
 import { evalProjectSchema } from "./eval-config.js";
@@ -674,6 +675,8 @@ export interface TeamCheck {
   revision: number;
   /** Correction round that launched this verification attempt. */
   round?: number;
+  /** Prompt evidence for the repair feedback. Not sent to clients: the view strips it. */
+  scan?: CheckScan;
 }
 export interface TeamRun {
   /** Set when the run was created with the blackboard tools switch on and a ready store. Absent means today's behaviour. */

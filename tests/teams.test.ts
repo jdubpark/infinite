@@ -1414,7 +1414,7 @@ test("configured verification failures exhaust bounded repair rounds without bec
     assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
     assert.ok(blocked.checks.length > 0);
     assert.ok(blocked.checks.every(check => check.status === "failed" && check.exitCode === 17));
-    assert.ok(blocked.checks.some(check => check.output.includes("Configured verification failed")));
+    assert.ok(blocked.checks.some(check => check.output.includes("Configured verification failed")) && blocked.checks.every(check => !("scan" in check)), "the view carries check output, never prompt evidence");
     assert.equal(blocked.review, undefined);
     assert.ok(blocked.members.filter(member => member.role === "integrator").length <= 2, "Repairs must have a finite attempt budget");
     assert.equal(git(f.source, "rev-parse", "HEAD"), f.base);
@@ -1544,7 +1544,7 @@ test("an unchanged required-check failure stops after one repair and owner Conti
     assert.deepEqual([context.runId, context.revision], [blocked.id, blocked.revision]);
     assert.match(context.objective, /Create independent files/);
     assert.match(context.feedback, /Configured verification failed/);
-    assert.match(context.feedback, /"exitCode":17/);
+    assert.match(context.feedback, /Check 1: failed, exit 17/);
 
     const key = readFileSync(f.host.config.keyFile);
     const storedFile = join(f.host.config.stateDir, "teams", `${blocked.id}.sealed`);

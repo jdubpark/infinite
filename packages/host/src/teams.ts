@@ -17,6 +17,7 @@ import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchem
 import { memberConfiguration, type MemberConfiguration } from "./config-identity.js";
 import { ownerDirectionLines, permissionFollowUpPrompt, refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
 import { reviewEvidenceProblems } from "./team-acceptance.js";
+import { CheckOutputScanner, checkFeedback } from "./team-check-output.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { resumeFailed } from "./native-continuation.js";
 import { combineCoverage, type UsageService } from "./usage-service.js";
@@ -829,6 +830,7 @@ export class TeamService {
     run.linear = this.linear?.getTeam(run.id) ?? tracking ?? run.linear;
     const safeRun = {
       ...run,
+      checks: run.checks.map(({ scan: _scan, ...check }) => check),
       ...(this.trackingHold(stored, run.linear) ? { reason: `New work waits for Linear tracking: ${run.linear!.reason ?? "Linear has not confirmed current requirements."}` } : {}),
       resumable: this.canResume(stored, run.linear?.status),
       continuable: this.canContinue(stored, run.linear?.status),
@@ -5670,8 +5672,9 @@ export class TeamService {
       for (const { context, ...entry } of commands) {
         const check: TeamRun["checks"][number] = { ...entry, status: "running", startedAt: timestamp(), output: "", revision, round: run.round, headCommit: head };
         await this.enqueue(() => { if (!this.closed) { run.checks.push(check); this.save(stored); } });
-        const result = await teamCommand(entry.command, verification.workspace, signal, (this.config.teams?.checkMinutes ?? 60) * 60000, this.config.teams?.commandPrefix);
-        Object.assign(check, { status: result.interrupted ? "interrupted" : result.exitCode === 0 ? "passed" : "failed", finishedAt: timestamp(), exitCode: result.exitCode, output: result.output });
+        const scanner = new CheckOutputScanner();
+        const result = await teamCommand(entry.command, verification.workspace, signal, (this.config.teams?.checkMinutes ?? 60) * 60000, this.config.teams?.commandPrefix, undefined, undefined, undefined, (chunk, stream) => scanner.push(chunk, stream));
+        Object.assign(check, { status: result.interrupted ? "interrupted" : result.exitCode === 0 ? "passed" : "failed", finishedAt: timestamp(), exitCode: result.exitCode, output: result.output, scan: scanner.finish() });
         results.push(check);
         await this.enqueue(() => { if (!this.closed) this.save(stored); });
         if (!signal.aborted) await assertMemberReadOnly(verification.workspace, head, this.config.teams?.commandPrefix, signal, context);
@@ -5700,7 +5703,7 @@ export class TeamService {
           prior.headCommit === head && (prior.phase ?? "verification") === (result.phase ?? "verification") &&
           prior.command.command === result.command.command && JSON.stringify(prior.command.args) === JSON.stringify(result.command.args)));
         if (repeated) this.block(stored, new TeamError(409, "repeated-check-failure", repeatedCheckFailureReason));
-        else this.repair(stored, `Configured verification failed:\n${JSON.stringify(results)}`, "check");
+        else this.repair(stored, checkFeedback(results), "check");
       }
     });
   }

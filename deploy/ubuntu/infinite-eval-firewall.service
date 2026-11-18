@@ -1,0 +1,21 @@
+[Unit]
+Description=Infinite eval account output rule (see deploy/ubuntu/eval.md)
+# Loads after the system ruleset, which may flush everything, and before the host can start a trial.
+After=nftables.service
+Before=infinite.service
+# Restarting or reloading nftables.service flushes every table, this one included, so this unit follows it.
+PartOf=nftables.service
+ReloadPropagatedFrom=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The file deletes and recreates only the inet infinite_eval table, in one transaction. A file that fails to load
+# leaves the previous table in force.
+ExecStart=/usr/sbin/nft -f /etc/infinite/eval.nft
+ExecReload=/usr/sbin/nft -f /etc/infinite/eval.nft
+# Stopping the unit removes the rule. Trials then reach the network directly, so stop trials first (eval.md, step 5).
+ExecStop=-/usr/sbin/nft delete table inet infinite_eval
+
+[Install]
+WantedBy=multi-user.target

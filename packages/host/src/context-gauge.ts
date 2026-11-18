@@ -24,9 +24,13 @@ export interface ContextGauge {
  * showed at most one call in flight at once, so 8,192 is far above the need.
  */
 const MAX_CALLS = 8192;
-/** PROPOSED: recent step ids kept for deduplication. An id seen again after 1,024 other ids counts again. */
+/** PROPOSED: the step ids seen most recently are kept for deduplication, and seeing an id again makes it recent. An id seen again after 1,024 other ids counts again. */
 const MAX_STEP_IDS = 1024;
-/** PROPOSED: a string longer than this is not an id. A row without a usable id is not counted: no step, no call, no output, no item. */
+/**
+ * PROPOSED: a string longer than this is not an id. An id only links rows. A call row or a step row without a usable id
+ * links nothing and is not counted (a `token_count` row has no id by nature and counts by itself). An output or a
+ * program item without one is still measured: the output as an unmatched `other` output, the item as inside a program.
+ */
 const MAX_ID_LENGTH = 256;
 
 const TOOL_CLASSES: readonly ToolClass[] = ["program", "shell", "file-read", "file-write", "search", "web", "mcp", "agent", "other"];
@@ -55,9 +59,12 @@ const object = (value: unknown): Record<string, unknown> | undefined =>
 const list = (value: unknown): unknown[] | undefined => Array.isArray(value) ? value : undefined;
 const isCount = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 const isId = (value: unknown): value is string => typeof value === "string" && value.length <= MAX_ID_LENGTH;
-/** A Claude token field counts only when it is a safe non-negative integer; otherwise it counts 0. */
+/**
+ * PROPOSED numeric policy. A Claude token field counts only when it is a safe non-negative integer, otherwise 0, and a
+ * step whose sum is not a safe integer is not counted. A Codex usage row with any other input value is not counted.
+ */
 const claudeCount = (value: unknown): number => isCount(value) ? value : 0;
-/** Adds without exceeding Number.MAX_SAFE_INTEGER. */
+/** Adds without exceeding Number.MAX_SAFE_INTEGER. No stream a host can store reaches it (about 9e15 characters), so no test exercises it. */
 const saturate = (a: number, b: number): number => Math.min(SAFE, a + b);
 
 /** Output content: a string counts its length; a list counts each part's text. An image part adds no characters. */
@@ -175,6 +182,7 @@ export class ContextGaugeTail {
     if (!message) return;
     if (row.type === "assistant") {
       const usage = object(message.usage);
+      // PROPOSED, as transcript-usage.ts: a model name that starts with "<" marks a row the client wrote, so it is no step. Its content is still read.
       const synthetic = typeof message.model === "string" && message.model.startsWith("<");
       if (usage && isId(message.id) && !synthetic) {
         const input = claudeCount(usage.input_tokens) + claudeCount(usage.cache_read_input_tokens) + claudeCount(usage.cache_creation_input_tokens);
@@ -187,9 +195,7 @@ export class ContextGaugeTail {
     } else if (row.type === "user") {
       for (const block of list(message.content) ?? []) {
         const value = object(block);
-        if (value?.type === "tool_result" && isId(value.tool_use_id)) {
-          this.output(value.tool_use_id, value.content, type => type === "image");
-        }
+        if (value?.type === "tool_result") this.output(isId(value.tool_use_id) ? value.tool_use_id : undefined, value.content, type => type === "image");
       }
     }
   }
@@ -210,24 +216,23 @@ export class ContextGaugeTail {
       }
     } else if (row.type === "event_msg" && payload?.type === "item_completed") {
       const item = object(payload.item);
-      if (item && isId(item.id) && !this.calls.has(item.id)) {
-        const found = programItem(item);
-        if (found) tally(this.inside, found.cls, found.chars);
-      }
+      const direct = item !== undefined && isId(item.id) && this.calls.has(item.id);
+      const found = item && !direct ? programItem(item) : undefined;
+      if (found) tally(this.inside, found.cls, found.chars);
     } else if (row.type === "response_item" && payload) {
       const callId = payload.call_id;
       if ((payload.type === "custom_tool_call" || payload.type === "function_call") && isId(callId) && typeof payload.name === "string") {
         this.remember(callId, codexClass(payload.name));
-      } else if ((payload.type === "custom_tool_call_output" || payload.type === "function_call_output") && isId(callId)) {
-        this.output(callId, payload.output, type => type.includes("image"));
+      } else if (payload.type === "custom_tool_call_output" || payload.type === "function_call_output") {
+        this.output(isId(callId) ? callId : undefined, payload.output, type => type.includes("image"));
       }
     }
   }
 
-  /** A step counts once per id among the most recent 1,024 ids. The peak is a running maximum. */
+  /** A step counts once per id among the 1,024 ids seen most recently. The peak is a running maximum. */
   private step(id: string, input: number): void {
     this.peak = Math.max(this.peak, input);
-    if (this.stepIds.has(id)) return;
+    if (this.stepIds.delete(id)) { this.stepIds.add(id); return; }
     if (this.stepIds.size >= MAX_STEP_IDS) {
       const oldest = this.stepIds.values().next();
       if (!oldest.done) this.stepIds.delete(oldest.value);
@@ -236,7 +241,10 @@ export class ContextGaugeTail {
     this.modelSteps = saturate(this.modelSteps, 1);
   }
 
-  /** Remembers a call id until its output arrives. When full, the oldest id is forgotten and counted as dropped. */
+  /**
+   * Remembers a call id until its output arrives. When full, the oldest id is forgotten and counted as dropped.
+   * PROPOSED: a call row that repeats an id in flight changes nothing. The first class stays and no id is forgotten for it.
+   */
   private remember(id: string, cls: ToolClass): void {
     if (this.calls.has(id)) return;
     if (this.calls.size >= MAX_CALLS) {
@@ -247,10 +255,10 @@ export class ContextGaugeTail {
     this.calls.set(id, cls);
   }
 
-  /** The output of a call: look up its class, count it, then forget the id. */
-  private output(callId: string, content: unknown, isImage: (type: string) => boolean): void {
-    const cls = this.calls.get(callId);
-    this.calls.delete(callId);
+  /** The output of a call: look up its class, count it, then forget the id. An output without a usable id is unmatched. */
+  private output(callId: string | undefined, content: unknown, isImage: (type: string) => boolean): void {
+    const cls = callId === undefined ? undefined : this.calls.get(callId);
+    if (callId !== undefined) this.calls.delete(callId);
     if (cls === undefined) this.unmatched = saturate(this.unmatched, 1);
     const measured = measure(content, isImage);
     tally(this.received, cls ?? "other", measured.chars);

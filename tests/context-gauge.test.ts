@@ -139,15 +139,20 @@ test("a Claude step input is the sum of its three token fields", () => {
   assert.deepEqual({ steps: tail.snapshot().modelSteps, peak: tail.snapshot().peakInputTokens }, { steps: 1, peak: 160 });
 });
 
-test("tool classes: wait is program and an *_agent name is agent", () => {
+test("tool classes: wait is program, and a name that ends in _agent or _agents is agent", () => {
   const tail = new ContextGaugeTail("codex");
   tail.push(call("w", "wait"));
   tail.push(output("w", "abc"));
   tail.push(call("i", "interrupt_agent", "function_call"));
   tail.push(output("i", "de", "function_call_output"));
+  tail.push(call("s", "inspect_agents", "function_call"));
+  tail.push(output("s", "fghi", "function_call_output"));
+  tail.push(call("o", "agent_notes", "function_call"));
+  tail.push(output("o", "j", "function_call_output"));
   assert.deepEqual(tail.snapshot().received, {
     program: { calls: 1, chars: 3, maxChars: 3 },
-    agent: { calls: 1, chars: 2, maxChars: 2 },
+    agent: { calls: 2, chars: 6, maxChars: 4 },
+    other: { calls: 1, chars: 1, maxChars: 1 },
   });
 });
 
@@ -179,6 +184,24 @@ test("Codex bounds: forgotten call ids, one call in flight, and recent step ids"
   for (let index = 0; index < 1024; index += 1) aged.push(usage(`o${index}`, 1));
   aged.push(usage("a", 1));
   assert.equal(aged.snapshot().modelSteps, 1026);
+
+  // The window holds exactly 1,024 ids, and seeing an id again makes it recent.
+  const refreshed = new ContextGaugeTail("codex");
+  refreshed.push(usage("a", 1));
+  for (let index = 0; index < 1023; index += 1) refreshed.push(usage(`o${index}`, 1));
+  refreshed.push(usage("a", 1));
+  assert.equal(refreshed.snapshot().modelSteps, 1024);
+  refreshed.push(usage("new", 1));
+  refreshed.push(usage("a", 1));
+  assert.equal(refreshed.snapshot().modelSteps, 1025);
+
+  // PROPOSED: a call row that repeats an id in flight changes nothing, even when the map is full.
+  const repeated = new ContextGaugeTail("codex");
+  for (let index = 0; index < 8192; index += 1) repeated.push(call(`f${index}`, index === 0 ? "exec" : "view_image", "function_call"));
+  repeated.push(call("f0", "view_image", "function_call"));
+  repeated.push(output("f0", "abc", "function_call_output"));
+  assert.deepEqual({ dropped: repeated.snapshot().dropped, unmatched: repeated.snapshot().unmatched, program: repeated.snapshot().received.program },
+    { dropped: 0, unmatched: 0, program: { calls: 1, chars: 3, maxChars: 3 } });
 });
 
 test("numbers: Claude token fields that are not safe integers count as 0", () => {
@@ -235,18 +258,35 @@ test("the Claude fixture gives one step per distinct non-synthetic message id wi
   assert.equal(tail.snapshot().modelSteps, ids.size);
 });
 
-test("an id longer than 256 characters is ignored as if it were missing", () => {
-  const longId = "x".repeat(300);
-  const claude = new ContextGaugeTail("claude");
-  claude.push(claudeStep(longId, { input_tokens: 700 }));
-  assert.deepEqual({ steps: claude.snapshot().modelSteps, peak: claude.snapshot().peakInputTokens }, { steps: 0, peak: 0 });
+test("an id of 256 characters links rows and one of 257 does not", () => {
+  for (const [length, linked] of [[256, true], [257, false]] as const) {
+    const id = "x".repeat(length);
+    const claude = new ContextGaugeTail("claude");
+    claude.push(claudeStep(id, { input_tokens: 700 }));
+    assert.deepEqual({ steps: claude.snapshot().modelSteps, peak: claude.snapshot().peakInputTokens }, linked ? { steps: 1, peak: 700 } : { steps: 0, peak: 0 }, `length ${length}`);
 
+    // The call row links nothing without a usable id; its output is still measured, as an unmatched `other` output.
+    const codex = new ContextGaugeTail("codex");
+    codex.push(call(id, "exec"));
+    codex.push(output(id, "abc"));
+    const counted = { calls: 1, chars: 3, maxChars: 3 };
+    assert.deepEqual({ unmatched: codex.snapshot().unmatched, received: codex.snapshot().received }, linked ? { unmatched: 0, received: { program: counted } } : { unmatched: 1, received: { other: counted } }, `length ${length}`);
+  }
+});
+
+test("an output or a program item without a usable id is still measured", () => {
+  const parts = [{ type: "input_text", text: "abc" }, { type: "input_image", image_url: "data:omitted" }];
   const codex = new ContextGaugeTail("codex");
-  codex.push(call(longId, "exec"));
-  codex.push(output(longId, "abc"));
+  for (const callId of [undefined, 7, "x".repeat(257)]) codex.push({ type: "response_item", payload: { type: "function_call_output", call_id: callId, output: parts } });
+  for (const id of [undefined, 7, "x".repeat(257)]) codex.push({ type: "event_msg", payload: { type: "item_completed", item: { id, type: "CommandExecution", aggregated_output: "hi" } } });
   const gauge = codex.snapshot();
-  assert.deepEqual({ unmatched: gauge.unmatched, other: gauge.received.other }, { unmatched: 0, other: undefined });
-  assert.deepEqual(gauge.received, {});
+  assert.deepEqual({ received: gauge.received, inside: gauge.insidePrograms, images: gauge.images, unmatched: gauge.unmatched },
+    { received: { other: { calls: 3, chars: 9, maxChars: 3 } }, inside: { shell: { calls: 3, chars: 6, maxChars: 2 } }, images: 3, unmatched: 3 });
+
+  const claude = new ContextGaugeTail("claude");
+  claude.push({ type: "user", message: { content: [{ type: "tool_result", content: "abc" }, { type: "tool_result", tool_use_id: 9, content: [{ type: "image" }, { type: "text", text: "de" }] }] } });
+  assert.deepEqual({ received: claude.snapshot().received, images: claude.snapshot().images, unmatched: claude.snapshot().unmatched },
+    { received: { other: { calls: 2, chars: 5, maxChars: 3 } }, images: 1, unmatched: 2 });
 });
 
 test("a Codex session with only cumulative totals gives no steps", () => {
@@ -262,9 +302,9 @@ test("hostile rows change nothing and nothing throws", () => {
     null, undefined, 0, 1, "text", true, [], [null], [{}], {},
     { type: null }, { type: "assistant" }, { type: "assistant", message: null }, { type: "assistant", message: [] },
     { type: "assistant", message: { id: 5, usage: {} } }, { type: "assistant", message: { id: "m", usage: null, content: "s" } },
-    { type: "user", message: { content: "str" } }, { type: "user", message: { content: [null, 5, "x", { type: "tool_result" }] } },
+    { type: "user", message: { content: "str" } }, { type: "user", message: { content: [null, 5, "x", { type: "tool_use" }] } },
     { type: "response_item", payload: null }, { type: "response_item", payload: { type: "custom_tool_call", call_id: 4, name: "exec" } },
-    { type: "event_msg", payload: { type: "item_completed", item: null } }, { type: "event_msg", payload: { type: "item_completed", item: { id: 7, type: "CommandExecution" } } },
+    { type: "event_msg", payload: { type: "item_completed", item: null } }, { type: "event_msg", payload: { type: "item_completed", item: { id: 7, type: "Unknown" } } },
     { type: "token_usage_record", payload: { response_id: 5 } }, { type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: -1 } } } },
     { type: "event_msg", payload: { type: "item_completed", item: { id: "j", type: "Unknown" } } },
   ];

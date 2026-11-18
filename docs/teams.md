@@ -2475,7 +2475,7 @@ One row per task and revision, written at the task's first implementer start, wi
 
 Nothing about the routing reaches a member: no prompt, context file, or tool carries the policy, a seed, a posterior, or a utility. A shadow run writes no line to the run's events.
 
-A run's team view shows the policy the run pinned: the mode, the requested mode, the source, the knobs and which are defaults, the algorithm and reward versions, and the digest. The relay carries team views, and a handoff run's view also shows the project's saved policy. No view shows a seed, a posterior, or a utility. Status and explain are not served over the relay.
+A run's team view shows the policy the run pinned: the mode, the requested mode, the source, the knobs and which are defaults, the algorithm and reward versions, and the digest. The relay carries team views, and a handoff run's view also shows the project's saved policy. A team view also shows each task's and each scout's `routing` (the profile the host chose, and whether the router or its fallback chose it) and each member's `hostProfiles` flag. No view shows a seed, a posterior, or a utility. Status and explain are not served over the relay.
 
 ### Status and explain
 
@@ -2585,14 +2585,14 @@ An uncovered point keeps today's path. The member names a profile from the pool,
 - The coordinator is told that the host assigns each scout's profile, and its explore example omits `agentProfileId`.
 - An implementer is told that the host selects the stronger profile, and its escalate report is `{"kind":"escalate","reason":…}` with no profile.
 
-Otherwise the text is today's, and names the pool. No member is told a candidate, a score, the policy digest, or a decision key. A scout's inline assignment has no `routing` field.
+Otherwise the text is today's, and names the pool. No member is told a candidate, a score, the policy digest, or a decision key. A scout's inline assignment has no `routing` field, and no context file or permission review prompt carries `routing` or `hostProfiles`. After a revoke, the prompts return to today's text, but a member of a covered run still holds `hostProfiles`, including a member created after the revoke. A report from it without a profile is still accepted and takes the fallback.
 
 **What the router picks.** Neither point draws a sample or reads an exploration guard.
 
 - An escalation takes the candidate with the highest greedy utility. An elevated-risk task uses the mean minus one posterior deviation, as the design's Part 5 says. The basis is `greedy-point`. It is `single-candidate` when one candidate is left, and `default-all-limited` when every candidate is limited, which takes the first candidate.
 - A scout takes the candidate with the lowest tier cost, and ties go to lineup order. A limited candidate is passed over unless every candidate is limited. The basis is `greedy-point`, `single-candidate`, or `default-all-limited`. A scout candidate is never `strong`, so every candidate has the light cost, and in practice the first candidate in lineup order that is not limited is chosen.
 
-A router pick and a fallback pick pass rules 1 and 2, and never the escalated member's own profile. A profile a member names at these points keeps rule 1 only.
+A router pick and a fallback pick pass rules 1 and 2, and are never the escalated member's own profile. In a covered run that is not revoked, a profile a member names does not choose: the router's pick replaces it, and the named profile is the fallback when the router cannot choose, if it passes rules 1 and 2. In an uncovered or revoked run, a named profile is used as before and keeps rule 1 only. When the chosen profile's provider is limited at launch, the member starts on that profile's limit fallback, as every launch does. That fallback passes rules 1 and 2 but can be the escalated member's own profile, and the decision row is then released.
 
 **When the decision is written.** An escalation is decided when the host accepts the escalate report, before the path-scope check. A scout is decided before its member is created. Each decision writes one `pending` row, or reuses the row already stored for its key, and the row becomes `applied` when the member starts on that profile. Otherwise it becomes `released`. A `pending` row at these points is not released after 7 days. The run's settle, advance, or delete releases it.
 
@@ -2620,7 +2620,7 @@ The host logs one line for each reason, once per host process. The run continues
 
 To stop new runs from choosing profiles without a release rollback, run `infinite repo init --routing shadow`, and revoke host routing on any active run with `infinite team revoke-routing TEAM_ID`. Before a release rollback past this slice, let every run pinned `auto` settle, or cancel it: a host without this slice requires `agentProfileId` on every plan task, and an `auto` plan omits it, so that host refuses the run's next member start with `invalid-agent-profile`. The rollback note under Shadow routing still applies to a release rollback.
 
-For the escalation and scout points, before a release rollback past this release, run `infinite repo init --routing-points start` on every project that lists `escalation` or `scout`, and let every run whose pin has `algorithmVersion: 2` settle, or cancel it. An unsettled version-2 run that a host from before this release picks up can block: a stored scout without `agentProfileId` stops at launch with 409 `invalid-agent-profile`, and an `escalate` report without one does not parse, so the member's exit blocks the run with `missing-agent-report`.
+For the escalation and scout points, before a release rollback past this release, run `infinite repo init --routing-points start` on every project that lists `escalation` or `scout`, and let every run whose pin has `algorithmVersion: 2` settle, or cancel it. An unsettled version-2 run that a host from before this release picks up can block: a stored scout without `agentProfileId` stops at launch with 409 `invalid-agent-profile`, and an `escalate` report without one does not parse, so the member's exit blocks the run with `missing-agent-report`. That host also cannot replay the launch of a member that holds `hostProfiles`: the launch fingerprint covers the assignment, so the replay fails with "Request ID already belongs to a different session".
 
 ## Launch-rate fuse
 

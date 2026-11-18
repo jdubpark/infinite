@@ -65,8 +65,8 @@ export class UsageTail {
   private readonly messages = new Map<string, ClaudeCounts>();
   private readonly turnModels = new Map<string, string>();
   private lastTurnModel: string | undefined;
-  private lastTurn: string | undefined;
   private turns = 0;
+  private openTurn: { id: string | undefined } | undefined;
   private sawRequestRows = false;
   private threadId: string | undefined;
   private total: number | undefined;
@@ -129,17 +129,13 @@ export class UsageTail {
     return this.requestTokens;
   }
 
-  /** Codex: the id of the last turn the transcript started. Undefined when the row that started it named none. */
-  lastTurnId(): string | undefined {
-    return this.lastTurn;
-  }
-
   /**
-   * Codex: how many turns the transcript has started. A `task_started` row starts one. A `turn_context` row starts
-   * one only when it names a turn other than the last started, because a turn can write its context more than once.
+   * Codex: the transcript shows that its last started turn ended. A `task_started` row starts a turn, and a
+   * `task_complete` row that names the same turn ends it. False when the transcript starts no turn, when the last
+   * started turn has no such row (it was cut short, or aborted), and when either row names no turn.
    */
-  turnStarts(): number {
-    return this.turns;
+  lastTurnEnded(): boolean {
+    return this.turns > 0 && this.openTurn === undefined;
   }
 
   /** Codex: a row of type "inter_agent_communication_metadata" was seen. */
@@ -227,7 +223,6 @@ export class UsageTail {
     if (row.type === "turn_context") {
       const turnId = text(payload?.turn_id);
       const model = text(payload?.model);
-      if (turnId && turnId !== this.lastTurn) this.startTurn(turnId);
       if (turnId && model) {
         if (!this.turnModels.has(turnId) && this.turnModels.size >= MAX_TURNS) {
           const oldest = this.turnModels.keys().next();
@@ -242,14 +237,15 @@ export class UsageTail {
       this.sawRequestRows = true;
       return this.requestRecord(row, payload);
     }
-    if (row.type === "event_msg" && payload?.type === "task_started") this.startTurn(text(payload.turn_id));
+    if (row.type === "event_msg" && payload?.type === "task_started") {
+      this.turns += 1;
+      this.openTurn = { id: text(payload.turn_id) };
+    }
+    // An end row closes the open turn only when both rows name the same turn. `turn_aborted` closes nothing.
+    if (row.type === "event_msg" && payload?.type === "task_complete" && this.openTurn?.id !== undefined && text(payload.turn_id) === this.openTurn.id)
+      this.openTurn = undefined;
     if (row.type === "event_msg" && payload?.type === "token_count") this.cumulativeRow(row, payload);
     return [];
-  }
-
-  private startTurn(turnId: string | undefined) {
-    this.turns += 1;
-    this.lastTurn = turnId;
   }
 
   private requestRecord(row: Record<string, unknown>, payload: Record<string, unknown> | undefined): UsageRecord[] {

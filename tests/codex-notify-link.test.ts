@@ -11,7 +11,7 @@ import { fixture } from "./team-fixture.js";
 const THREAD = "019a1b2c-3d4e-7f80-9a1b-2c3d4e5f6a7b";
 
 /** One team Codex member, run by the scripted stand-in. Returns its journal and worker state. */
-async function runCodexMember(codexHooks: boolean, mode?: "later-turn" | "stale-notice") {
+async function runCodexMember(codexHooks: boolean, mode?: "later-turn") {
   const home = mkdtempSync(join(tmpdir(), "infinite-codex-home-"));
   const savedHome = process.env.HOME;
   process.env.HOME = home;
@@ -68,13 +68,6 @@ test("with Codex hooks off, a later turn cut short after a notify is not reporte
   const [coverage] = ofType(events, "usage-coverage");
   assert.deepEqual(coverage.data, { coverage: "partial", reason: "stopped-mid-turn", records: 1, provider: "codex", finalDrain: "complete" });
   assert.ok(ofType(events, "usage").length >= 1, "the first turn's usage is still journaled");
-});
-
-test("with Codex hooks off, a notify for a turn that is not the newest in the record is not complete usage (INF-213)", { timeout: 120000 }, async () => {
-  // The worker passes the turn the notice names to the watch. The record's newest turn is turn-1; the notice says turn-0.
-  const { events } = await runCodexMember(false, "stale-notice");
-  const [coverage] = ofType(events, "usage-coverage");
-  assert.deepEqual(coverage.data, { coverage: "partial", reason: "stopped-mid-turn", records: 1, provider: "codex", finalDrain: "complete" });
 });
 
 test("with Codex hooks on, the same notify still journals its turn-end signal (INF-213)", { timeout: 120000 }, async () => {

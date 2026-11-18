@@ -4,7 +4,8 @@ import { TranscriptWatch, type WatchHook } from "../packages/host/src/transcript
 import type { UsageRecord } from "../packages/host/src/usage.js";
 
 // An end-only hook is a Codex turn-end notify with Codex hooks off (INF-213). No hook marks the start of the next
-// turn, so the watch reads the turn boundary from the transcript itself: it counts the turns the transcript starts.
+// turn, so the watch reads the turn boundary from the transcript itself: a `task_started` row starts a turn, and a
+// `task_complete` row that names the same turn ends it. The hook is only the reason to read.
 
 const PATH = "/transcripts/rollout.jsonl";
 const OTHER = "/transcripts/rollout-2.jsonl";
@@ -17,9 +18,8 @@ const usageOf = (total: number) => ({
   output_tokens: total - 1000, reasoning_output_tokens: 0, total_tokens: total,
 });
 const event = (type: string, turn?: string) => line({ timestamp: STAMP, type: "event_msg", payload: { type, ...(turn ? { turn_id: turn } : {}) } });
-/** The row that starts a turn. */
 const startRow = (turn?: string) => event("task_started", turn);
-/** The row a turn writes for its settings. A turn can write it more than once. */
+const endRow = (turn?: string) => event("task_complete", turn);
 const contextRow = (turn: string) => line({ timestamp: STAMP, type: "turn_context", payload: { turn_id: turn, model: "model-fixture-a" } });
 /** One request of `own` tokens. `thread` is the conversation's total after it. */
 const requestRow = (response: string, turn: string, own: number, thread = own) => line({
@@ -30,17 +30,17 @@ const totalRow = (total: number) => line({
   timestamp: STAMP, type: "event_msg", payload: { type: "token_count", info: { total_token_usage: usageOf(total) } },
 });
 
-/** A completed turn as Codex writes it: start, context, one request, the total that reconciles it, and the end. */
-const TURN_1 = startRow("turn-1") + contextRow("turn-1") + requestRow("resp_1", "turn-1", 1150) + totalRow(1150) + event("task_complete", "turn-1");
-const TURN_2 = startRow("turn-2") + contextRow("turn-2") + requestRow("resp_2", "turn-2", 1150, 2300) + totalRow(2300) + event("task_complete", "turn-2");
+/** A turn up to its usage, as Codex writes it: start, context, one request, and the total that reconciles it. */
+const OPEN_1 = startRow("turn-1") + contextRow("turn-1") + requestRow("resp_1", "turn-1", 1150) + totalRow(1150);
+const TURN_1 = OPEN_1 + endRow("turn-1");
+const OPEN_2 = startRow("turn-2") + contextRow("turn-2") + requestRow("resp_2", "turn-2", 1150, 2300) + totalRow(2300);
+const TURN_2 = OPEN_2 + endRow("turn-2");
 
 const COMPLETE = { coverage: "complete", provider: "codex", finalDrain: "complete" };
 const MID_TURN = { coverage: "partial", reason: "stopped-mid-turn", provider: "codex", finalDrain: "complete" };
 
 const watchFor = (usage: UsageRecord[] = []) => new TranscriptWatch({ provider: "codex", onUsage: record => usage.push(record) });
-/** A turn-end notice. `turn` is the turn it names; `null` is a notice that names none. */
-const notify = (turn: string | null = "turn-1", path = PATH): WatchHook =>
-  ({ subagent: false, turnEnd: true, endOnly: true, ...(turn === null ? {} : { turn }), transcript: { path, provider: "codex" } });
+const NOTIFY: WatchHook = { subagent: false, turnEnd: true, endOnly: true, transcript: { path: PATH, provider: "codex" } };
 const mark = (watch: TranscriptWatch, path: string, offset: number, drain: number) => watch.post({ path, offset, end: true, drain });
 
 /** The drain of `hook` reads `rows` from `offset` to its end mark. Returns the cursor. */
@@ -59,139 +59,117 @@ function finalDrain(watch: TranscriptWatch, offset: number, rows = "") {
   return watch.finish(true, true);
 }
 
-test("an end-only turn end with no later turn is complete", () => {
+/** One notice whose drain reads `first`, then an exit whose final drain reads `rest`. */
+function exitAfter(first: string, rest = "") {
   const watch = watchFor();
-  const offset = drainOf(watch, notify(), TURN_1);
-  assert.deepEqual(finalDrain(watch, offset), { ...COMPLETE, records: 1 });
-});
+  return finalDrain(watch, drainOf(watch, NOTIFY, first), rest);
+}
 
-test("a later turn stopped before its context row is stopped mid-turn", () => {
-  for (const stopAt of ["never", "before-final"] as const) {
-    const usage: UsageRecord[] = [];
-    const watch = watchFor(usage);
-    const offset = drainOf(watch, notify(), TURN_1);
-    if (stopAt === "before-final") watch.stopRequested();
-    // The second turn wrote the row that starts it and nothing else.
-    assert.deepEqual(finalDrain(watch, offset, startRow("turn-2")), { ...MID_TURN, records: 1 }, stopAt);
-    assert.equal(usage.length, 1);
-  }
-});
-
-test("a later turn stopped after its context row is stopped mid-turn", () => {
+test("an end-only turn end is complete when the transcript shows the turn ended", () => {
+  assert.deepEqual(exitAfter(TURN_1), { ...COMPLETE, records: 1 });
+  // Without a final drain, the notice's own read decides.
   const watch = watchFor();
-  const offset = drainOf(watch, notify(), TURN_1);
-  assert.deepEqual(finalDrain(watch, offset, startRow("turn-2") + contextRow("turn-2")), { ...MID_TURN, records: 1 });
+  drainOf(watch, NOTIFY, TURN_1);
+  assert.deepEqual(watch.finish(true), { coverage: "complete", records: 1, provider: "codex" });
 });
 
-test("a later turn that reuses the ended turn's id is still a later turn", () => {
+test("a later turn that was cut short is stopped mid-turn, wherever it stopped", () => {
+  // The later turn wrote its start row only; its start and context; or everything except its end row.
+  assert.deepEqual(exitAfter(TURN_1, startRow("turn-2")), { ...MID_TURN, records: 1 });
+  assert.deepEqual(exitAfter(TURN_1, startRow("turn-2") + contextRow("turn-2")), { ...MID_TURN, records: 1 });
+  assert.deepEqual(exitAfter(TURN_1, OPEN_2), { ...MID_TURN, records: 2 });
+  const usage: UsageRecord[] = [];
+  const watch = watchFor(usage);
+  const offset = drainOf(watch, NOTIFY, TURN_1);
+  watch.stopRequested();
+  assert.deepEqual(finalDrain(watch, offset, startRow("turn-2")), { ...MID_TURN, records: 1 });
+  assert.equal(usage.length, 1);
+});
+
+test("a later turn read by the notice's own drain is still an open turn", () => {
+  // The next turn began before the watch read for the notice, so no row arrives after that read.
+  assert.deepEqual(exitAfter(TURN_1 + startRow("turn-2")), { ...MID_TURN, records: 1 });
+  assert.deepEqual(exitAfter(TURN_1 + startRow("turn-2") + contextRow("turn-2")), { ...MID_TURN, records: 1 });
+});
+
+test("a later turn that reuses an ended turn's id is still an open turn", () => {
+  assert.deepEqual(exitAfter(TURN_1, startRow("turn-1")), { ...MID_TURN, records: 1 });
+  // The reused start is read by the notice's own drain.
+  assert.deepEqual(exitAfter(TURN_1 + startRow("turn-1")), { ...MID_TURN, records: 1 });
+  // A second notice for the first turn follows the reused start.
   const watch = watchFor();
-  const offset = drainOf(watch, notify(), TURN_1);
-  assert.deepEqual(finalDrain(watch, offset, startRow("turn-1") + contextRow("turn-1")), { ...MID_TURN, records: 1 });
+  const first = drainOf(watch, NOTIFY, TURN_1);
+  const second = drainOf(watch, NOTIFY, startRow("turn-1"), first);
+  assert.deepEqual(finalDrain(watch, second), { ...MID_TURN, records: 1 });
 });
 
-test("rows the ended turn writes after its end-only turn end keep it complete", () => {
-  const watch = watchFor();
-  // The notice's drain read the request row. The turn wrote its total, a second context row and its end after it,
-  // and Codex wrote a between-turn row. None of them starts a turn.
-  const offset = drainOf(watch, notify(), startRow("turn-1") + contextRow("turn-1") + requestRow("resp_1", "turn-1", 1150));
-  const late = totalRow(1150) + contextRow("turn-1") + event("task_complete", "turn-1") + event("thread_settings_applied");
-  assert.deepEqual(finalDrain(watch, offset, late), { ...COMPLETE, records: 1 });
+test("an aborted turn is not an ended turn", () => {
+  assert.deepEqual(exitAfter(TURN_1, startRow("turn-2") + event("turn_aborted", "turn-2")), { ...MID_TURN, records: 1 });
 });
 
-test("a second end-only turn end restores complete coverage", () => {
-  const watch = watchFor();
-  const first = drainOf(watch, notify("turn-1"), TURN_1);
-  const second = drainOf(watch, notify("turn-2"), TURN_2, first);
-  assert.deepEqual(finalDrain(watch, second), { ...COMPLETE, records: 2 });
+test("an end row closes only the turn it names", () => {
+  // A late end row of an earlier turn, an end row with no turn, and a start row with no turn close nothing.
+  assert.deepEqual(exitAfter(TURN_1, startRow("turn-2") + endRow("turn-1")), { ...MID_TURN, records: 1 });
+  assert.deepEqual(exitAfter(TURN_1, startRow("turn-2") + endRow()), { ...MID_TURN, records: 1 });
+  assert.deepEqual(exitAfter(TURN_1, startRow() + endRow()), { ...MID_TURN, records: 1 });
 });
 
-test("an end-only turn end for a turn that is not the newest in the transcript does not stand", () => {
-  // The next turn began before the notice's drain read the file: the notice names turn-1, the transcript is in turn-2.
-  const watch = watchFor();
-  const offset = drainOf(watch, notify("turn-1"), TURN_1 + startRow("turn-2") + contextRow("turn-2"));
-  assert.deepEqual(finalDrain(watch, offset), { ...MID_TURN, records: 1 });
-  // The notice for turn-2 then closes it.
-  const racing = watchFor();
-  const first = drainOf(racing, notify("turn-1"), TURN_1 + startRow("turn-2") + contextRow("turn-2"));
-  const rest = requestRow("resp_2", "turn-2", 1150, 2300) + totalRow(2300) + event("task_complete", "turn-2");
-  const second = drainOf(racing, notify("turn-2"), rest, first);
-  assert.deepEqual(finalDrain(racing, second), { ...COMPLETE, records: 2 });
+test("rows the turn writes after the notice was read complete it", () => {
+  // The notice's drain read up to the request row. The total, a second context row, the end row and a between-turn
+  // row arrive in the final drain.
+  const first = startRow("turn-1") + contextRow("turn-1") + requestRow("resp_1", "turn-1", 1150);
+  const late = totalRow(1150) + contextRow("turn-1") + endRow("turn-1") + event("thread_settings_applied");
+  assert.deepEqual(exitAfter(first, late), { ...COMPLETE, records: 1 });
+  // Without the end row the turn stays open.
+  assert.deepEqual(exitAfter(first, totalRow(1150)), { ...MID_TURN, records: 1 });
 });
 
-test("a later end mark of the same drain does not move the turn boundary", () => {
-  // The second case reuses the ended turn's id, so only the count taken at the first mark shows the later turn.
-  for (const more of [startRow("turn-2") + contextRow("turn-2"), startRow("turn-1")]) {
-    const watch = watchFor();
-    const started = watch.hook(notify("turn-1"))!;
-    watch.post({ path: PATH, offset: 0, text: TURN_1, drain: started.drain });
-    mark(watch, PATH, bytes(TURN_1), started.drain);
-    // More bytes of the same drain open the next turn, and a second end mark follows them.
-    watch.post({ path: PATH, offset: bytes(TURN_1), text: more, drain: started.drain });
-    mark(watch, PATH, bytes(TURN_1 + more), started.drain);
-    assert.deepEqual(finalDrain(watch, bytes(TURN_1 + more)), { ...MID_TURN, records: 1 }, more);
-  }
+test("a later turn that ends completes the session, with or without its own notice", () => {
+  const noticed = watchFor();
+  const first = drainOf(noticed, NOTIFY, TURN_1);
+  const second = drainOf(noticed, NOTIFY, TURN_2, first);
+  assert.deepEqual(finalDrain(noticed, second), { ...COMPLETE, records: 2 });
+  // The second notice was lost. The final drain reads the turn to its end row.
+  assert.deepEqual(exitAfter(TURN_1, TURN_2), { ...COMPLETE, records: 2 });
 });
 
-test("an end-only turn end that names no turn cannot be matched to the transcript, and does not stand", () => {
-  // Read after the next turn began, such a notice could not be told from that turn's own notice.
-  const unnamed = watchFor();
-  assert.deepEqual(finalDrain(unnamed, drainOf(unnamed, notify(null), TURN_1)), { ...MID_TURN, records: 1 });
-  // An id too long to be a turn id counts as no name.
-  const long = watchFor();
-  const id = "t".repeat(201);
-  const rows = startRow(id) + contextRow(id) + requestRow("resp_1", id, 1150) + totalRow(1150);
-  assert.deepEqual(finalDrain(long, drainOf(long, notify(id), rows)), { ...MID_TURN, records: 1 });
-  // A transcript whose start row names no turn cannot be matched either.
-  const bare = watchFor();
-  const anonymous = startRow() + requestRow("resp_1", "turn-1", 1150) + totalRow(1150);
-  assert.deepEqual(finalDrain(bare, drainOf(bare, notify("turn-1"), anonymous)), { ...MID_TURN, records: 1 });
-});
-
-test("a transcript with context rows and no start rows still shows a later turn", () => {
+test("a transcript that starts no turn cannot show that one ended", () => {
   const rows = contextRow("turn-1") + requestRow("resp_1", "turn-1", 1150) + totalRow(1150);
-  const same = watchFor();
-  assert.deepEqual(finalDrain(same, drainOf(same, notify(), rows), contextRow("turn-1")), { ...COMPLETE, records: 1 });
-  const later = watchFor();
-  assert.deepEqual(finalDrain(later, drainOf(later, notify(), rows), contextRow("turn-2")), { ...MID_TURN, records: 1 });
+  assert.deepEqual(exitAfter(rows), { ...MID_TURN, records: 1 });
+  assert.deepEqual(exitAfter(rows + endRow("turn-1")), { ...MID_TURN, records: 1 });
 });
 
-test("a transcript that starts no turn needs no later byte after an end-only turn end", () => {
-  const rows = requestRow("resp_1", "turn-1", 1150) + totalRow(1150);
-  const quiet = watchFor();
-  assert.deepEqual(finalDrain(quiet, drainOf(quiet, notify(), rows)), { ...COMPLETE, records: 1 });
-  const grown = watchFor();
-  assert.deepEqual(finalDrain(grown, drainOf(grown, notify(), rows), totalRow(1150)), { ...MID_TURN, records: 1 });
-});
-
-test("an end-only turn end whose drain never reached its end does not stand", () => {
-  const watch = watchFor();
-  const started = watch.hook(notify())!;
-  // The relay sent the bytes and was cut before its end mark.
-  watch.post({ path: PATH, offset: 0, text: TURN_1, drain: started.drain });
-  assert.deepEqual(finalDrain(watch, bytes(TURN_1)), { ...MID_TURN, records: 1 });
-});
-
-test("a hook that is not end-only keeps its turn end when a later turn starts", () => {
+test("a hook that is not end-only keeps its turn end whatever the transcript shows", () => {
   // With Codex hooks on, a turn-start hook would have cleared the turn end. The watch does not read the transcript for it.
+  const hook: WatchHook = { subagent: false, turnEnd: true, transcript: { path: PATH, provider: "codex" } };
   const watch = watchFor();
-  const hook: WatchHook = { subagent: false, turnEnd: true, turn: "turn-1", transcript: { path: PATH, provider: "codex" } };
   const offset = drainOf(watch, hook, TURN_1);
   assert.deepEqual(finalDrain(watch, offset, startRow("turn-2") + contextRow("turn-2")), { ...COMPLETE, records: 1 });
+  // A transcript with no start row at all changes nothing for it either.
+  const bare = watchFor();
+  const rows = requestRow("resp_1", "turn-1", 1150) + totalRow(1150);
+  assert.deepEqual(finalDrain(bare, drainOf(bare, hook, rows)), { ...COMPLETE, records: 1 });
 });
 
 test("a later hook that is not end-only replaces an end-only turn end", () => {
-  const watch = watchFor();
-  const first = drainOf(watch, notify(), TURN_1);
   const open: WatchHook = { subagent: false, turnEnd: false, transcript: { path: PATH, provider: "codex" } };
-  const second = drainOf(watch, open, startRow("turn-2") + contextRow("turn-2"), first);
-  assert.deepEqual(finalDrain(watch, second), { ...MID_TURN, records: 1 });
+  const closed: WatchHook = { subagent: false, turnEnd: true, transcript: { path: PATH, provider: "codex" } };
+  const watch = watchFor();
+  const first = drainOf(watch, NOTIFY, TURN_1);
+  const second = drainOf(watch, open, TURN_2, first);
+  // The transcript shows the turn ended, and the later hook says it did not: the hook is the source again.
+  assert.deepEqual(finalDrain(watch, second), { ...MID_TURN, records: 2 });
+  const other = watchFor();
+  const start = drainOf(other, NOTIFY, TURN_1);
+  const end = drainOf(other, closed, OPEN_2, start);
+  assert.deepEqual(finalDrain(other, end), { ...COMPLETE, records: 2 });
 });
 
 test("a transcript replaced after an end-only turn end leaves a gap", () => {
   const watch = watchFor();
-  drainOf(watch, notify(), TURN_1);
-  const rows = startRow("turn-9") + contextRow("turn-9") + requestRow("resp_9", "turn-9", 1150) + totalRow(1150);
-  const started = watch.hook(notify("turn-9", OTHER))!;
+  drainOf(watch, NOTIFY, TURN_1);
+  const rows = startRow("turn-9") + contextRow("turn-9") + requestRow("resp_9", "turn-9", 1150) + totalRow(1150) + endRow("turn-9");
+  const started = watch.hook({ ...NOTIFY, transcript: { path: OTHER, provider: "codex" } })!;
   watch.post({ path: OTHER, offset: 0, text: rows, drain: started.drain });
   mark(watch, OTHER, bytes(rows), started.drain);
   const final = watch.drainFinal()!;

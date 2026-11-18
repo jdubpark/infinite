@@ -473,7 +473,7 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | Hook
   const started = transcriptWatch.hook({
     subagent: b.agent_id !== undefined,
     turnEnd: closesTurn(signals, event),
-    ...(linkOnly ? { endOnly: true, turn: typeof b["turn-id"] === "string" ? b["turn-id"] : undefined } : {}),
+    endOnly: linkOnly,
     sessionEnd: event === "SessionEnd",
     ...(transcriptPath !== undefined ? { transcript: { path: transcriptPath, provider: route === "claude" ? "claude" : "codex" } } : {}),
   });

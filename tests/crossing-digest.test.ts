@@ -1,19 +1,21 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
-import {
-  DIGEST_LIMIT_BYTES,
-  OMITTED_MAX,
-  crossingDigestSchema,
-  emptyDigest,
-  fitDigest,
-  hostDigest,
-  mergeDigest,
-  withClaims,
-  type ClaimInput,
-  type CrossingDigest,
-  type HostInput,
-} from "../packages/host/src/crossing-digest.js";
+import * as built from "../packages/host/src/crossing-digest.js";
+import type { ClaimInput, CrossingDigest, HostInput } from "../packages/host/src/crossing-digest.js";
+
+const { DIGEST_LIMIT_BYTES, OMITTED_MAX, crossingDigestSchema } = built;
+
+/** The builders for arguments a test means as valid: a refusal fails the test. `built.*` returns a refusal raw. */
+function must(digest: CrossingDigest | undefined): CrossingDigest {
+  assert.ok(digest, "a builder refused a host-owned argument the test meant as valid");
+  return digest;
+}
+const emptyDigest = (outcome: CrossingDigest["outcome"]) => must(built.emptyDigest(outcome));
+const hostDigest = (input: HostInput) => must(built.hostDigest(input));
+const withClaims = (digest: CrossingDigest, claims: ClaimInput) => must(built.withClaims(digest, claims));
+const mergeDigest = (a: CrossingDigest, b: CrossingDigest) => must(built.mergeDigest(a, b));
+const fitDigest = (digest: CrossingDigest) => must(built.fitDigest(digest));
 
 const OPS = ["read", "changed", "added", "removed"] as const;
 type Op = (typeof OPS)[number];
@@ -361,7 +363,7 @@ test("failures are deduplicated after clipping, so long signals that match after
 
 test("a lone surrogate becomes U+FFFD and the stored text is well formed", () => {
   const digest = valid(withClaims(emptyDigest("partial"), { open: ["\ud800"] }));
-  assert.deepEqual(digest.open, ["�"]);
+  assert.deepEqual(digest.open, ["\ufffd"]);
   assert.equal(digest.open[0].isWellFormed(), true);
 });
 
@@ -611,15 +613,17 @@ test("random inputs with unique text and paths stay valid, bounded and fully acc
 
 test("adversarial inputs (duplicates, hostile text and paths, malformed types and enums, counters near the cap) stay valid and bounded", () => {
   const gen = generator(9304, true);
+  // A host-owned position may refuse a mangled argument. Whatever it returns must be valid; claims never refuse.
+  const maybe = (digest: CrossingDigest | undefined) => (digest === undefined ? undefined : valid(digest));
   for (let run = 0; run < 300; run += 1) {
-    const host = valid(hostDigest(mangle(gen, randomHostInput(gen))));
+    const host = maybe(built.hostDigest(mangle(gen, randomHostInput(gen)))) ?? emptyDigest("partial");
     const claimed = valid(withClaims(host, mangle(gen, randomClaims(gen))));
-    let accumulated = valid(mergeDigest(emptyDigest("partial"), mangle(gen, nearCap(gen, claimed))));
+    let accumulated = maybe(built.mergeDigest(emptyDigest("partial"), mangle(gen, nearCap(gen, claimed)))) ?? claimed;
     for (let step = 0; step < 20; step += 1) {
       const next = step % 3 === 0
         ? mangle(gen, nearCap(gen, hostDigest(randomHostInput(gen))))
         : withClaims(emptyDigest("partial"), mangle(gen, randomClaims(gen)));
-      accumulated = valid(mergeDigest(accumulated, next));
+      accumulated = maybe(built.mergeDigest(accumulated, next)) ?? accumulated;
     }
     assert.ok(measure(accumulated) <= DIGEST_LIMIT_BYTES);
   }
@@ -630,18 +634,19 @@ test("the same inputs give byte-identical digests on every run", () => {
     const gen = generator(77, true);
     const out: string[] = [];
     for (let step = 0; step < 50; step += 1) {
-      const digest = mergeDigest(
+      const digest = built.mergeDigest(
         withClaims(emptyDigest("partial"), mangle(gen, randomClaims(gen))),
-        hostDigest(mangle(gen, randomHostInput(gen))),
+        built.hostDigest(mangle(gen, randomHostInput(gen))) as CrossingDigest,
       );
-      out.push(JSON.stringify(digest));
+      out.push(JSON.stringify(digest ?? null));
     }
     return out;
   };
   assert.deepEqual(run(), run());
 });
 
-// Runtime totality. Callers pass parsed JSON, so each builder must accept a value of any kind in any field.
+// Runtime totality. Callers pass parsed JSON, so no builder may throw on a value of any kind in any field. A
+// host-owned argument without a valid outcome is refused with undefined; the claims argument is never refused.
 
 type FieldPath = (string | number)[];
 
@@ -692,41 +697,44 @@ const receiptsOf = (digest: CrossingDigest) => [...digest.touched, ...digest.fai
   .filter(row => row.by === "receipt")
   .map(row => JSON.stringify(row, Object.keys(row).sort()));
 
-const BUILDERS: readonly [string, unknown, (input: unknown) => CrossingDigest][] = [
-  ["emptyDigest", "partial", input => emptyDigest(input as CrossingDigest["outcome"])],
-  ["hostDigest", HOST_BASE, input => hostDigest(input as HostInput)],
-  ["withClaims(claims)", CLAIMS_BASE, input => withClaims(DIGEST_BASE, input as ClaimInput)],
-  ["withClaims(digest)", DIGEST_BASE, input => withClaims(input as CrossingDigest, CLAIMS_BASE)],
-  ["mergeDigest(older)", DIGEST_BASE, input => mergeDigest(input as CrossingDigest, DIGEST_BASE)],
-  ["mergeDigest(newer)", DIGEST_BASE, input => mergeDigest(DIGEST_BASE, input as CrossingDigest)],
-  ["fitDigest", DIGEST_BASE, input => fitDigest(input as CrossingDigest)],
+/** [name, valid base argument, builder, whether the argument is host-owned]. */
+const BUILDERS: readonly [string, unknown, (input: unknown) => CrossingDigest | undefined, boolean][] = [
+  ["emptyDigest", "partial", input => built.emptyDigest(input as CrossingDigest["outcome"]), true],
+  ["hostDigest", HOST_BASE, input => built.hostDigest(input as HostInput), true],
+  ["withClaims(claims)", CLAIMS_BASE, input => built.withClaims(DIGEST_BASE, input as ClaimInput), false],
+  ["withClaims(digest)", DIGEST_BASE, input => built.withClaims(input as CrossingDigest, CLAIMS_BASE), true],
+  ["mergeDigest(older)", DIGEST_BASE, input => built.mergeDigest(input as CrossingDigest, DIGEST_BASE), true],
+  ["mergeDigest(newer)", DIGEST_BASE, input => built.mergeDigest(DIGEST_BASE, input as CrossingDigest), true],
+  ["fitDigest", DIGEST_BASE, input => built.fitDigest(input as CrossingDigest), true],
 ];
 
-test("every builder is total over hostile values in every field: no throw, schema-valid, at most 2,048 bytes", () => {
-  const baseReceipts = receiptsOf(DIGEST_BASE);
-  let cases = 0;
-  for (const [name, base, build] of BUILDERS) {
+test("hostile values in every field: a host-owned position refuses only a bad argument or outcome, claims never refuse", () => {
+  const baseReceipts = receiptsOf(DIGEST_BASE).sort();
+  for (const [name, base, build, hostOwned] of BUILDERS) {
     for (const path of fieldPaths(base)) {
       for (const [label, value] of HOSTILE) {
         const where = `${name} with ${path.join(".") || "the argument"} = ${label}`;
-        let result: CrossingDigest;
+        let result: CrossingDigest | undefined;
         try {
           result = build(replaceAt(base, path, value));
         } catch (error) {
           assert.fail(`${where} threw: ${(error as Error).message}`);
         }
+        // No hostile value is a valid outcome. emptyDigest's argument is the outcome itself, its only path.
+        if (hostOwned && (path.length === 0 || (path.length === 1 && path[0] === "outcome"))) {
+          assert.equal(result, undefined, `${where} was not refused`);
+          continue;
+        }
+        assert.ok(result, `${where} was refused`);
         assert.ok(crossingDigestSchema.safeParse(result).success, `${where} fails the schema`);
         assert.ok(Buffer.byteLength(JSON.stringify(result), "utf8") <= DIGEST_LIMIT_BYTES, `${where} is over the bound`);
-        if (name === "withClaims(claims)") {
+        if (!hostOwned) {
           assert.equal(result.outcome, DIGEST_BASE.outcome, `${where} changed the outcome`);
-          for (const row of receiptsOf(result)) assert.ok(baseReceipts.includes(row), `${where} made a receipt: ${row}`);
+          assert.deepEqual(receiptsOf(result).sort(), baseReceipts, `${where} lost or made a receipt`);
         }
-        cases += 1;
       }
     }
   }
-  // 200 field paths (1 + 13 + 22 + 41 × 4) times 16 hostile values.
-  assert.equal(cases, 3200);
 });
 
 test("reproductions: a malformed row is dropped and counted, a malformed optional field is dropped, and nothing is coerced to text", () => {
@@ -768,14 +776,22 @@ test("reproductions: a malformed row is dropped and counted, a malformed optiona
   }
 });
 
-test("reproductions: an invalid outcome reads as failed, and a row with an invalid op, class or by is dropped and counted", () => {
-  assert.equal(emptyDigest("winning" as CrossingDigest["outcome"]).outcome, "failed");
-  assert.equal(hostDigest({ outcome: "done" } as unknown as HostInput).outcome, "failed");
-  assert.equal(hostDigest({} as HostInput).outcome, "failed");
-  assert.equal(fitDigest({ ...emptyDigest("complete"), outcome: "x" } as unknown as CrossingDigest).outcome, "failed");
-  assert.equal(withClaims({ ...emptyDigest("complete"), outcome: null } as unknown as CrossingDigest, {}).outcome, "failed");
-  // The newer digest's outcome wins, so an invalid newer outcome never borrows the older "complete".
-  assert.equal(mergeDigest(emptyDigest("complete"), { ...emptyDigest("partial"), outcome: "x" } as unknown as CrossingDigest).outcome, "failed");
+test("a host-owned argument with a missing, mistyped or unknown outcome is refused; a row with an invalid op, class or by is dropped and counted", () => {
+  const complete = emptyDigest("complete");
+  const missing: Record<string, unknown> = { ...complete };
+  delete missing.outcome;
+  const outcomes = [undefined, null, 7, true, "", "winning", "Complete", "__proto__", ["complete"], { outcome: "complete" }];
+  for (const [index, forged] of [missing, ...outcomes.map(outcome => ({ ...complete, outcome }))].entries()) {
+    const label = index === 0 ? "missing" : String(JSON.stringify(outcomes[index - 1]));
+    const digest = forged as unknown as CrossingDigest;
+    assert.equal(built.emptyDigest((forged as Record<string, unknown>).outcome as CrossingDigest["outcome"]), undefined, `emptyDigest ${label}`);
+    assert.equal(built.hostDigest({ ...forged, read: ["src/a.ts"] } as unknown as HostInput), undefined, `hostDigest ${label}`);
+    assert.equal(built.fitDigest(digest), undefined, `fitDigest ${label}`);
+    assert.equal(built.mergeDigest(complete, digest), undefined, `mergeDigest newer ${label}`);
+    // The older digest's outcome is never used, and it is still refused rather than ignored.
+    assert.equal(built.mergeDigest(digest, complete), undefined, `mergeDigest older ${label}`);
+    assert.equal(built.withClaims(digest, { open: ["q"] }), undefined, `withClaims digest ${label}`);
+  }
 
   const host = valid(hostDigest({
     outcome: "failed",
@@ -815,10 +831,14 @@ test("reproductions: counters and containers of the wrong kind", () => {
   // A list that is not an array reads as empty and counts nothing.
   const lists = valid(fitDigest({ ...emptyDigest("complete"), touched: "src/a.ts", open: { 0: "q" } } as unknown as CrossingDigest));
   assert.deepEqual([lists.touched, lists.open, lists.omitted], [[], [], zero]);
-  // An argument that is not an object reads as empty.
+  // A host-owned argument that is not an object is refused. A claims argument that is not an object reads as empty.
   for (const value of [null, undefined, 7, "partial", ["partial"]]) {
-    assert.deepEqual(valid(fitDigest(value as unknown as CrossingDigest)), emptyDigest("failed"));
-    assert.deepEqual(valid(hostDigest(value as unknown as HostInput)), emptyDigest("failed"));
+    const label = String(JSON.stringify(value));
+    assert.equal(built.fitDigest(value as unknown as CrossingDigest), undefined, `fitDigest ${label}`);
+    assert.equal(built.hostDigest(value as unknown as HostInput), undefined, `hostDigest ${label}`);
+    assert.equal(built.mergeDigest(value as unknown as CrossingDigest, emptyDigest("partial")), undefined, `mergeDigest older ${label}`);
+    assert.equal(built.mergeDigest(emptyDigest("partial"), value as unknown as CrossingDigest), undefined, `mergeDigest newer ${label}`);
+    assert.equal(built.withClaims(value as unknown as CrossingDigest, {}), undefined, `withClaims digest ${label}`);
     assert.deepEqual(valid(withClaims(emptyDigest("partial"), value as unknown as ClaimInput)), emptyDigest("partial"));
   }
 });
@@ -843,7 +863,7 @@ test("a member-supplied by, class, outcome or omitted never raises authority in 
   assert.deepEqual(crafted.decisions, [{ what: "w", why: "y" }]);
   assert.deepEqual(crafted.forSiblings, [{ note: "n" }]);
   assert.equal(JSON.stringify(crafted).includes("MEMBER"), false);
-  // The authority-bearing fields fail closed on the digest argument too: no outcome borrowed from the claims.
-  const unknownOutcome = valid(withClaims({ ...receipt, outcome: "sometimes" } as unknown as CrossingDigest, { outcome: "complete" } as unknown as ClaimInput));
-  assert.equal(unknownOutcome.outcome, "failed");
+  // The digest argument is host-owned: without a valid outcome the call is refused, and none is borrowed from claims.
+  const unknownOutcome = built.withClaims({ ...receipt, outcome: "sometimes" } as unknown as CrossingDigest, { outcome: "complete" } as unknown as ClaimInput);
+  assert.equal(unknownOutcome, undefined);
 });

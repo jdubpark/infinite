@@ -400,6 +400,15 @@ export function buildLaunch(
   // A served headless session: the permission channel's hooks and the signal hooks in one settings layer, with no
   // user, project or local settings loaded, so no settings file can switch them off or answer before them.
   if (hooks && provider === "claude" && channel) args.push(...headlessChannelArgs(relayPath, enabled.claude));
+  // Every other Claude team launch (member, mission coordinator, permission coordinator) loads the agent account's own
+  // settings and no project or local file. A Codex member can commit `.claude/settings.json` or `.mcp.json`; Claude Code
+  // runs their hooks and MCP server commands in any folder and applies their allow rules in a trusted one, so a later
+  // member would load what an earlier one wrote. Managed settings and the host's `--settings` layer load either way.
+  if (team && provider === "claude" && !channel) {
+    if (profile.args.some(arg => arg === "--setting-sources" || arg.startsWith("--setting-sources=")))
+      throw new Error("A Claude team launch chooses its own setting sources; remove --setting-sources from the profile.");
+    args.push("--setting-sources", "user");
+  }
   if (hooks && provider === "codex" && enabled.codex) {
     const command = [...relay, "codex"].join(" ");
     for (const event of CODEX_EVENTS)

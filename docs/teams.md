@@ -2824,12 +2824,26 @@ writes it in the agent account, for the current folder only, from
 leaves the prompt for the owner. The setting is off by default. Turning it off
 affects members launched afterwards; existing Claude entries stay until removed.
 
-Trust lets each provider apply the repository's own provider settings in member
-folders, such as Claude hooks, permission rules and MCP configuration, or a
-project Codex configuration. Team members can edit those files, and later
-members load the integrated result. Review them like the rest of a run's
-changes. Tool permission prompts, delegation limits and the root ownership rules
-above are unchanged; sessions outside team runs never receive this trust.
+Claude team launches (members, mission coordinators and permission
+coordinators) load no project or local settings file and start no server from
+a project `.mcp.json`. They pass
+`--setting-sources user`, which keeps the agent account's own settings, or
+`--setting-sources ""` when the
+[headless permission channel](security.md#headless-permission-channel) serves
+them. The host's `--settings` layer and the machine's managed settings load
+either way. A Codex member can commit `.claude/settings.json` or `.mcp.json`.
+Without this flag Claude Code runs their hooks and MCP server commands in any
+folder and applies their allow rules in a trusted one, so a later Claude
+member would load what an earlier member wrote. A repository's own
+`.claude/settings.json` and `.mcp.json` therefore never apply in a team run;
+`CLAUDE.md` instructions still load. A profile
+that sets `--setting-sources` cannot launch a Claude team role.
+
+Trust still lets Codex apply a project Codex configuration in member folders.
+Team members can edit that file, and later Codex members load the integrated
+result. Review it like the rest of a run's changes. Tool permission prompts,
+delegation limits and the root ownership rules above are unchanged; sessions
+outside team runs never receive this trust.
 
 ## Team questions and steering
 

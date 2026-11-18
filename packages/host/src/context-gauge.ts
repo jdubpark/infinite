@@ -64,7 +64,7 @@ const isId = (value: unknown): value is string => typeof value === "string" && v
  * step whose sum is not a safe integer is not counted. A Codex usage row with any other input value is not counted.
  */
 const claudeCount = (value: unknown): number => isCount(value) ? value : 0;
-/** Adds without exceeding Number.MAX_SAFE_INTEGER. No stream a host can store reaches it (about 9e15 characters), so no test exercises it. */
+/** Adds without exceeding Number.MAX_SAFE_INTEGER: a defence for totals far beyond an ordinary transcript (about 9e15 characters). No test exercises it. */
 const saturate = (a: number, b: number): number => Math.min(SAFE, a + b);
 
 /** Output content: a string counts its length; a list counts each part's text. An image part adds no characters. */

@@ -319,7 +319,7 @@ test("hostile rows change nothing and nothing throws", () => {
     assert.deepEqual(tail.snapshot(), before);
   }
 
-  // A 5 million character output is counted by length and never copied.
+  // A 5 million character output is counted by its length.
   const big = new ContextGaugeTail("claude");
   big.push({ type: "assistant", message: { id: "m_big", usage: { input_tokens: 1 }, content: [{ type: "tool_use", id: "big", name: "Bash" }] } });
   big.push({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "big", content: "a".repeat(5_000_000) }] } });

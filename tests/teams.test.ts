@@ -1937,6 +1937,7 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
     assert.equal(delivered.result.structuredContent.memberId, member.memberId);
     assert.deepEqual(reportResultSchema.safeParse(delivered.result.structuredContent).success, true, "the report answer matches its declared result type");
     assert.equal(delivered.result.content[0].text, "Team report recorded. Stop work on this assignment.");
+    assert.equal(delivered.result.structuredContent.message, delivered.result.content[0].text, "the receipt sentence is in message and in the text");
     await client.close();
 
     const restarted = startMcp();

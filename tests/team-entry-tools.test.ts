@@ -100,7 +100,8 @@ test("a member posts, lists, and reads through the MCP tools", { timeout: 60000 
     const entryId = answerOf(first).entryId as string;
     assert.match(entryId, UUID);
     assert.deepEqual(refusalsOf(entryPostResultSchema, first.result.structuredContent), []);
-    assert.deepEqual(first.result.structuredContent, { entryId, state: "pending" });
+    assert.deepEqual(first.result.structuredContent, { entryId, state: "pending", message: first.result.content[0].text });
+    assert.equal(first.result.structuredContent.message, first.result.content[0].text, "the receipt sentence is in message and in the text");
     const receipt = String(first.result.content[0].text);
     assert.ok(receipt.includes(entryId), "the receipt names the entry id");
     assert.ok(receipt.includes("waits for the host to store it"), "the receipt says the host has not stored the entry yet");

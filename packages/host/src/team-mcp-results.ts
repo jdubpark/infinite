@@ -12,22 +12,25 @@ const TEAM_ROLES = ["permission-coordinator", "project-manager", "scout", "imple
 const uuid = z.uuid();
 const revision = z.number().int().min(1);
 
-/** The `report` answer: the durable receipt's binding. */
-export const reportResultSchema = z.object({ requestId: uuid, runId: uuid, memberId: uuid, revision }).strict();
-export const reportResultMatches: Exact<z.output<typeof reportResultSchema>, Pick<TeamReportEnvelope, "requestId" | "runId" | "memberId" | "revision">> = true;
+/** The receipt sentence every structured write result carries in `message`, equal to its text content. */
+const message = z.string();
 
-/** The `mission_report` answer: the durable receipt's binding. */
-export const missionReportResultSchema = z.object({ requestId: uuid, missionId: uuid, memberId: uuid, revision }).strict();
-export const missionReportResultMatches: Exact<z.output<typeof missionReportResultSchema>, Pick<z.infer<typeof missionReportEnvelopeSchema>, "requestId" | "missionId" | "memberId" | "revision">> = true;
+/** The `report` answer: the durable receipt's binding and the receipt sentence. */
+export const reportResultSchema = z.object({ requestId: uuid, runId: uuid, memberId: uuid, revision, message }).strict();
+export const reportResultMatches: Exact<z.output<typeof reportResultSchema>, Pick<TeamReportEnvelope, "requestId" | "runId" | "memberId" | "revision"> & { message: string }> = true;
 
-/** The `handoff` answer: the session that the handoff names. */
-export const handoffResultSchema = z.object({ sessionId: uuid }).strict();
-export const handoffResultMatches: Exact<z.output<typeof handoffResultSchema>, Pick<z.infer<typeof handoffEnvelopeSchema>, "sessionId">> = true;
+/** The `mission_report` answer: the durable receipt's binding and the receipt sentence. */
+export const missionReportResultSchema = z.object({ requestId: uuid, missionId: uuid, memberId: uuid, revision, message }).strict();
+export const missionReportResultMatches: Exact<z.output<typeof missionReportResultSchema>, Pick<z.infer<typeof missionReportEnvelopeSchema>, "requestId" | "missionId" | "memberId" | "revision"> & { message: string }> = true;
 
-/** The `entry_post` answer: the entry id and its state before the host stores it. */
-export const entryPostResultSchema = z.object({ entryId: uuid, state: z.literal("pending") }).strict();
+/** The `handoff` answer: the session that the handoff names and the receipt sentence. */
+export const handoffResultSchema = z.object({ sessionId: uuid, message }).strict();
+export const handoffResultMatches: Exact<z.output<typeof handoffResultSchema>, Pick<z.infer<typeof handoffEnvelopeSchema>, "sessionId"> & { message: string }> = true;
+
+/** The `entry_post` answer: the entry id, its state before the host stores it, and the receipt sentence. */
+export const entryPostResultSchema = z.object({ entryId: uuid, state: z.literal("pending"), message }).strict();
 export type EntryPostResult = z.infer<typeof entryPostResultSchema>;
-export const entryPostResultMatches: Exact<EntryPostResult, { entryId: string; state: "pending" }> = true;
+export const entryPostResultMatches: Exact<EntryPostResult, { entryId: string; state: "pending"; message: string }> = true;
 
 /** A member's view of one head. Field-for-field the `MemberHead` pick of `EntryHead`. */
 export const memberHeadSchema = z.object({

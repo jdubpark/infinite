@@ -41,6 +41,9 @@ function entryCallFor(name: string, args: Record<string, unknown>): EntryCall {
   if (name === "entry_list") return { op: "list", query: memberListQuerySchema.parse(args) };
   return { op: "get", entryId: ENTRY_GET_ARGUMENTS.parse(args).entryId };
 }
+const HANDOFF_RECORDED = "Handoff recorded. Stop work now; the host waits for client control to detach before transferring the clean checkpoint.";
+const MISSION_RECORDED = "Mission report recorded. Stop work on this attempt.";
+const TEAM_RECORDED = "Team report recorded. Stop work on this assignment.";
 const MISSION_INSTRUCTIONS = "Use the mission_report tool for this coordinator attempt only. Report once, wait for the durable receipt, then stop; the host starts a new attempt when the mission needs you. Never edit a repository, approve a permission, or bypass a refusal through a shell command.";
 type RequestId = string | number;
 const isObject = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -108,7 +111,8 @@ export async function runTeamMcp() {
       if (entryCall) {
         const answer = await submitEntryCall(entryCallFor(params.name, params.arguments));
         if (params.name === "entry_post") {
-          await result(id, { content: [{ type: "text", text: `Entry ${String(answer.entryId)} is written to this session's journal and waits for the host to store it. Other members can read it after that. The host can still refuse it, for example at the run's limit of member entries.` }], structuredContent: entryPostResultSchema.parse(answer), isError: false });
+          const text = `Entry ${String(answer.entryId)} is written to this session's journal and waits for the host to store it. Other members can read it after that. The host can still refuse it, for example at the run's limit of member entries.`;
+          await result(id, { content: [{ type: "text", text }], structuredContent: entryPostResultSchema.parse({ ...answer, message: text }), isError: false });
           return;
         }
         await result(id, { content: [{ type: "text", text: JSON.stringify(answer) }], structuredContent: answer, isError: false });
@@ -116,20 +120,20 @@ export async function runTeamMcp() {
       }
       if (handoff) {
         const envelope = await submitHandoff(params.arguments);
-        await result(id, { content: [{ type: "text", text: "Handoff recorded. Stop work now; the host waits for client control to detach before transferring the clean checkpoint." }], structuredContent: { sessionId: envelope.sessionId }, isError: false });
+        await result(id, { content: [{ type: "text", text: HANDOFF_RECORDED }], structuredContent: { sessionId: envelope.sessionId, message: HANDOFF_RECORDED }, isError: false });
         return;
       }
       if (mission) {
         const envelope = await submitMissionReport(missionArgumentsSchema.parse(params.arguments));
-        await result(id, { content: [{ type: "text", text: "Mission report recorded. Stop work on this attempt." }],
-          structuredContent: { requestId: envelope.requestId, missionId: envelope.missionId, memberId: envelope.memberId, revision: envelope.revision }, isError: false });
+        await result(id, { content: [{ type: "text", text: MISSION_RECORDED }],
+          structuredContent: { requestId: envelope.requestId, missionId: envelope.missionId, memberId: envelope.memberId, revision: envelope.revision, message: MISSION_RECORDED }, isError: false });
         return;
       }
       const input = argumentsSchema.parse(params.arguments);
       const envelope = await submitTeamReport(input.report);
       await result(id, {
-        content: [{ type: "text", text: "Team report recorded. Stop work on this assignment." }],
-        structuredContent: { requestId: envelope.requestId, runId: envelope.runId, memberId: envelope.memberId, revision: envelope.revision },
+        content: [{ type: "text", text: TEAM_RECORDED }],
+        structuredContent: { requestId: envelope.requestId, runId: envelope.runId, memberId: envelope.memberId, revision: envelope.revision, message: TEAM_RECORDED },
         isError: false,
       });
     } catch (failure) {

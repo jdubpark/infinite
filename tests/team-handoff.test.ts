@@ -95,6 +95,7 @@ test("authenticated handoff refuses dirty source, waits for its lease, and survi
     const handoffAnswer = await tool(receipt.server, request(head));
     assert.equal(handoffAnswer.isError, false);
     assert.equal(handoffResultSchema.safeParse(handoffAnswer.structuredContent).success, true, "the handoff answer matches its declared result type");
+    assert.equal(handoffAnswer.structuredContent.message, handoffAnswer.content[0].text, "the receipt sentence is in message and in the text");
     assert.equal((await tool(receipt.server, request(head))).isError, false, "An identical MCP retry is acknowledged without another transfer");
     assert.equal((await tool(receipt.server, { ...request(head), summary: "Conflicting retry" })).isError, true);
     const waiting = await waitFor(() => f.view(id), value => value.status === "waiting-for-control");

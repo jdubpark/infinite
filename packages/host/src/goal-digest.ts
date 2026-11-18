@@ -139,9 +139,12 @@ export type CriterionInput = { criterion: string; status: (typeof CRITERION_STAT
  * member text is named in the module comment. No field takes a report, transcript, check output, score, rating, usage
  * figure, routing decision or quarantined text.
  *
- * Sources. Records that exist today hold the cycle number, status, run id and reviewed head (the goal record's cycle:
- * `cycle`, `status`, `teamId`, `headCommit`), the brief (the cycle's `brief`), the block code (the run record's
- * `blockCode`) and the stop class (the cycle's `class` or the run's `stopReason`). Later slices supply the rest: no
+ * Sources. Records that exist today hold the cycle number, status and run id (the goal record's cycle: `cycle`,
+ * `status`, `teamId`), the brief (the cycle's `brief`), the block code (the run record's `blockCode`) and the stop
+ * class (the cycle's `class` or the run's `stopReason`). The cycle's `headCommit` is not a reviewed head by itself: a
+ * run gets one as soon as it is prepared. It is the reviewed head only when the cycle ended reviewed (the statuses in
+ * goal-standing.ts `reviewedStatuses`), and the wiring slice must pass no `reviewedHead` for any other cycle, or no
+ * failure would ever carry. Later slices supply the rest: no
  * production code stores or builds a run digest yet, so `run` and `claimsUnavailable` wait for the crossings slice;
  * no goal or run record holds an outside-content lineage, so `outsideContent` and `unclearedHead` wait for part 11;
  * and nothing produces C14 criteria rows, so `criteria` waits for C14.

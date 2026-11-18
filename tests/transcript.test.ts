@@ -29,7 +29,7 @@ test("transcript tail joins records split across chunks and never repeats a mess
   assert.deepEqual(parseTranscriptRecord(JSON.stringify({ type: "assistant", uuid: "s1", isSidechain: true, message: { content: "subagent" } }), "claude", 0), []);
 });
 
-test("a Codex turn-end notify with hooks off gets its rollout read by the worker (INF-213)", async () => {
+test("the relay finds a Codex rollout by the thread id of a turn-end notify and streams it (INF-213)", async () => {
   const home = mkdtempSync(join(tmpdir(), "infinite-codex-notify-"));
   const thread = "019a1b2c-3d4e-7f80-9a1b-2c3d4e5f6a7b";
   const day = join(home, ".codex", "sessions", "2026", "11", "18");

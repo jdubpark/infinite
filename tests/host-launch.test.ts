@@ -223,6 +223,18 @@ test("codex with hooks off keeps only the turn-end notify route for a hook liste
   assert.equal(on.args.filter((a) => a.startsWith("notify=")).length, 1);
 });
 
+test("the codex notify argument keeps a relay path with a space, a quote and a backslash whole (INF-213)", () => {
+  const odd = "/opt/a b/in\"fi\\nite/hook-relay.js";
+  const launch = buildLaunch("codex", { command: "codex", args: [] }, "", hooks, odd, { claude: true, codex: false });
+  const value = launch.args.find((a) => a.startsWith("notify="))!.slice("notify=".length);
+  // A JSON array of strings is a TOML array of basic strings: both escape a quote and a backslash with a backslash.
+  assert.equal(value, '["node","/opt/a b/in\\"fi\\\\nite/hook-relay.js","codex-notify"]');
+  assert.deepEqual(JSON.parse(value), ["node", odd, "codex-notify"]);
+  const on = buildLaunch("codex", { command: "codex", args: [] }, "", hooks, odd, enabled);
+  const hook = on.args.find((a) => a.startsWith("hooks.Stop="))!;
+  assert.ok(hook.includes(`command=${JSON.stringify(`node ${odd} codex`)}`), hook);
+});
+
 test("codex dev relay runs the TypeScript file through an absolute tsx loader", () => {
   const launch = buildLaunch("codex", { command: "codex", args: [] }, "", hooks, "/repo/packages/host/src/hook-relay.ts", enabled);
   const hook = launch.args.find((a) => a.startsWith("hooks.PermissionRequest="))!;

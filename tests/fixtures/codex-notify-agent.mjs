@@ -2,7 +2,7 @@
 // $HOME/.codex/sessions, then runs its turn-end `notify` program once, as Codex does at a turn end.
 // The `notify=` argument carries the program as a TOML array of quoted strings, which JSON.parse reads.
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const THREAD = "019a1b2c-3d4e-7f80-9a1b-2c3d4e5f6a7b";
@@ -23,11 +23,21 @@ const rows = [
 
 const day = join(process.env.HOME, ".codex", "sessions", "2026", "11", "18");
 mkdirSync(day, { recursive: true });
-writeFileSync(join(day, `rollout-2026-11-18T09-00-00-${THREAD}.jsonl`), rows.map((row) => JSON.stringify(row) + "\n").join(""));
+const rollout = join(day, `rollout-2026-11-18T09-00-00-${THREAD}.jsonl`);
+writeFileSync(rollout, rows.map((row) => JSON.stringify(row) + "\n").join(""));
 console.log("stand-in turn started");
 
 const payload = { type: "agent-turn-complete", "thread-id": THREAD, "turn-id": "turn-1", cwd: process.cwd(), "input-messages": ["go"], "last-assistant-message": "done" };
 spawnSync(notify[0], [...notify.slice(1), JSON.stringify(payload)], { stdio: "ignore" });
 console.log("stand-in turn complete");
+// With the `later-turn` argument a second turn starts after the notice and is cut before its usage row, as a stop does.
+if (process.argv.includes("later-turn")) {
+  const later = [
+    { timestamp: "2026-11-18T09:00:05.000Z", type: "event_msg", payload: { type: "task_started", turn_id: "turn-2" } },
+    { timestamp: "2026-11-18T09:00:05.100Z", type: "turn_context", payload: { turn_id: "turn-2", model: "model-fixture-a", effort: "medium" } },
+  ];
+  appendFileSync(rollout, later.map((row) => JSON.stringify(row) + "\n").join(""));
+  console.log("stand-in second turn started");
+}
 await new Promise((resolve) => setTimeout(resolve, 1000));
 process.exit(0);

@@ -402,16 +402,13 @@ export function buildLaunch(
   if (hooks && provider === "claude" && channel) args.push(...headlessChannelArgs(relayPath, enabled.claude));
   if (hooks && provider === "codex") {
     // notify needs no hook trust, so it stays on when Codex hooks are off; turn-end usage then needs no bypass (INF-213).
-    args.push(
-      "-c",
-      `notify=[${[...relay, "codex-notify"].map((a) => `"${a}"`).join(",")}]`,
-    );
+    args.push("-c", `notify=${JSON.stringify([...relay, "codex-notify"])}`);
     if (enabled.codex) {
       const command = [...relay, "codex"].join(" ");
       for (const event of CODEX_EVENTS)
         args.push(
           "-c",
-          `hooks.${event}=[{hooks=[{type="command",command="${command}"}]}]`,
+          `hooks.${event}=[{hooks=[{type="command",command=${JSON.stringify(command)}}]}]`,
         );
       args.push("--dangerously-bypass-hook-trust");
       args.push(

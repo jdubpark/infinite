@@ -49,6 +49,11 @@ export interface WatchHook {
   transcript?: { path: string; provider: TranscriptProvider };
   /** The hook is the provider's `SessionEnd`. */
   sessionEnd?: boolean;
+  /**
+   * The hook's source reports turn ends and nothing else, as a Codex notify does with hooks off. No later hook
+   * marks the start of the next turn, so the transcript must show that no later turn began.
+   */
+  endOnly?: boolean;
 }
 
 /** A secondary transcript the watch reads, with its own end evidence for one drain. */
@@ -133,6 +138,11 @@ export class TranscriptWatch {
   private drain: number | undefined;
   /** The last provider hook: whether it closed a turn, and which drain it started. */
   private last: { turnEnd: boolean; drain: number | undefined } | undefined;
+  /**
+   * Set while the last provider hook was an end-only turn end. `offset` and `turn` are the cursor and the last turn
+   * id at the end mark of its drain; both stay undefined when that drain never reached its end.
+   */
+  private endOnly: { drain: number | undefined; offset?: number; turn?: string } | undefined;
   /** The end evidence for `drain`: the offset at which its end mark arrived. */
   private evidence: { drain: number; offset: number } | undefined;
   /** A subagent hook that arrived before any transcript was open. It counts for the first transcript that opens. */
@@ -174,7 +184,9 @@ export class TranscriptWatch {
       if (this.closed || this.finalDrain !== undefined) return undefined;
       // After a stop request, the provider's SessionEnd proves the process is ending, not that the turn ended: it keeps the turn boundary of the hook before it.
       const turnEnd = input.sessionEnd === true && this.stopped ? (this.last?.turnEnd ?? false) : input.turnEnd;
-      return this.receiveHook({ ...input, turnEnd });
+      const started = this.receiveHook({ ...input, turnEnd });
+      this.endOnly = input.endOnly === true && turnEnd ? { drain: started?.drain } : undefined;
+      return started;
     });
   }
 
@@ -336,7 +348,20 @@ export class TranscriptWatch {
 
   /** Records end evidence only for the drain the last transcript hook started. */
   private mark(drain: unknown, offset: number) {
-    if (this.drain !== undefined && drain === this.drain) this.evidence = { drain: this.drain, offset };
+    if (this.drain === undefined || drain !== this.drain) return;
+    this.evidence = { drain: this.drain, offset };
+    if (this.endOnly && this.endOnly.drain === this.drain) this.endOnly = { drain: this.drain, offset, turn: this.current?.usage.lastTurnId() };
+  }
+
+  /**
+   * An end-only turn end still stands: its drain reached its end, and the transcript shows no later turn. Where
+   * the transcript names no turn, no byte may have arrived since. True when the last hook was not end-only.
+   */
+  private endStands(current: Current | undefined): boolean {
+    const end = this.endOnly;
+    if (!end) return true;
+    if (!current || end.offset === undefined) return false;
+    return end.turn !== undefined ? current.usage.lastTurnId() === end.turn : current.tail.offset === end.offset && !current.tail.pending;
   }
 
   /** The drain of the last transcript hook reached the end of `current`, and nothing is pending. */
@@ -398,7 +423,8 @@ export class TranscriptWatch {
     this.retired.secondary = worse(this.retired.secondary, this.stateOf(old));
     this.retireUsage(old.usage, old.tail);
     for (const reader of old.readers.values()) this.retireUsage(reader.usage, reader.tail);
-    this.retired.gap = this.retired.gap || !complete;
+    // After an end-only turn end, nothing tells the watch whether the replaced transcript grew again.
+    this.retired.gap = this.retired.gap || !complete || this.endOnly !== undefined;
     // A transcript that ended its drain outside a turn boundary leaves the session mid-turn, even if a later one ends a turn.
     this.retired.midTurn = this.retired.midTurn || (complete && !(this.last?.turnEnd ?? false));
   }
@@ -449,7 +475,7 @@ export class TranscriptWatch {
         || readers.some(reader => reader.tail.dropped || reader.tail.discarded > 0 || reader.usage.rejectedCount() > 0),
       lastDrain: {
         complete: current !== undefined && this.complete(current) && !this.retired.gap,
-        turnEnd: (this.last?.turnEnd ?? false) && !this.retired.midTurn,
+        turnEnd: (this.last?.turnEnd ?? false) && !this.retired.midTurn && this.endStands(current),
       },
       finalDrain: finalState,
       secondary: this.sessionSecondary(current),

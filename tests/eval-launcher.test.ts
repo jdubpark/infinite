@@ -20,7 +20,7 @@ const FIXED = [
   "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_NO_REPLACE_OBJECTS", "GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT",
   "HOME", "LANG", "LC_ALL", "PATH", "TMPDIR",
 ];
-const PROXY = ["HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "http_proxy", "https_proxy"];
+const PROXY = ["HTTPS_PROXY", "HTTP_PROXY", "NODE_USE_ENV_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"];
 
 type Sandbox = { dir: string; root: string; home: string; template: string; tmp: string; script: string };
 
@@ -160,6 +160,8 @@ test("the eval launcher starts commands with a fixed environment", { skip: SKIP 
       assert.ok(proxyLines.includes(`${name}=http://u:p@127.0.0.1:9/`), `${name} carries the stdin proxy`);
     }
     assert.ok(proxyLines.includes("NO_PROXY=localhost,127.0.0.1,::1"));
+    assert.ok(proxyLines.includes("no_proxy=localhost,127.0.0.1,::1"));
+    assert.ok(proxyLines.includes("NODE_USE_ENV_PROXY=1"), "Node 22 clients use the proxy variables");
 
     const bare = run(sb, ["setup", "--", "/usr/bin/env"], { cwd: work, env, input: "\n" });
     assert.equal(bare.status, 0, bare.stderr.toString("utf8"));

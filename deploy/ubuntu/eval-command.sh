@@ -125,9 +125,10 @@ run_trial() {
   trial=$1
   proxy=$2
   shift 2
+  # The host's egress set (egress.ts): the six proxy variables and NODE_USE_ENV_PROXY, which Node 22 needs to use them.
   if [ -n "$proxy" ]; then
     set -- HTTPS_PROXY="$proxy" HTTP_PROXY="$proxy" https_proxy="$proxy" http_proxy="$proxy" \
-      NO_PROXY=localhost,127.0.0.1,::1 "$@"
+      NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1 NODE_USE_ENV_PROXY=1 "$@"
   fi
   status=0
   /usr/bin/prlimit --nproc=512 --fsize=4294967296 --core=0 --nofile=4096 \

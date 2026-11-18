@@ -120,6 +120,20 @@ test("a YAML block after a failure is its detail, even when it holds test-point 
   assert.match(scan.failures[0]!.detail, /not ok this is just error text/);
 });
 
+test("a blank line inside a diagnostic block or a spec detail stays inside it", () => {
+  // Node prints a whitespace-only line for each blank line of an error message, and assert.deepEqual messages have one.
+  const block = ["not ok 1 - deep equal", "  ---", "  error: |-", "    + actual - expected", "    ", "    +   a: 1", "", "    not ok 77 - text after a blank line", "  ...", "ok 2 - passes", ""].join("\n");
+  const tapScan = scanCheckOutput(block);
+  assert.equal(tapScan.failureCount, 1);
+  assert.deepEqual(tapScan.failures[0]!.detail.split("\n"), ["  ---", "  error: |-", "    + actual - expected", "    +   a: 1", "    not ok 77 - text after a blank line", "  ..."]);
+
+  const spec = [`${CHECK} deep equal (1ms)`, `${CHECK} failing tests:`, "", "test at example.ts:3:1", `${CHECK} deep equal (1ms)`, "  AssertionError: + actual - expected", "  ", "  +   a: 1", "",
+    "  not ok 77 - text after a blank line", "", "test at example.ts:9:1", `${CHECK} second (1ms)`, "  Error: other", ""].join("\n");
+  const specScan = scanCheckOutput(spec);
+  assert.equal(specScan.failureCount, 2);
+  assert.deepEqual(specScan.failures.map(failure => failure.detail.split("\n")), [["  AssertionError: + actual - expected", "  +   a: 1", "  not ok 77 - text after a blank line"], ["  Error: other"]]);
+});
+
 test("a long line with a directive past its first 4096 bytes is not a failure", () => {
   const scan = scanCheckOutput(`not ok 1 - ${"x".repeat(4200)} # SKIP later\n`);
   assert.equal(scan.failureCount, 0);

@@ -115,10 +115,11 @@ export class CheckOutputScanner {
     const text = strip(raw), open = state.open;
     state.open = undefined;
     if (open && (open.kind === "block" || open.kind === "marker")) {
+      // A whitespace-only line stays inside and adds no detail: Node prints one for each blank line of an error message.
       const blank = text.trim() === "";
-      const inside = open.kind === "block" ? !blank && indentOf(text) >= open.indent : !blank && indentOf(text) > open.indent;
+      const inside = blank || (open.kind === "block" ? indentOf(text) >= open.indent : indentOf(text) > open.indent);
       if (inside) {
-        this.add(open, text);
+        if (!blank) this.add(open, text);
         if (!(open.kind === "block" && text.trim() === "..." && indentOf(text) === open.indent)) state.open = open;
         return;
       }

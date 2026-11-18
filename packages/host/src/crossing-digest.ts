@@ -30,8 +30,8 @@ import { z } from "zod";
  *
  * Receipt space. PROPOSED reserve: fitting measures a digest as if all five `omitted` counters stood at OMITTED_MAX
  * and the outcome were the widest one, so later counting or a newer outcome never takes receipt space. The reserve is
- * 0 to 17 bytes, so a receipt that would fit without it can be dropped: seven 229-byte paths fit in 2,047 bytes, and
- * six are kept.
+ * 0 to 17 bytes, so a receipt that would fit without it can be dropped: with the outcome `partial`, seven 229-byte
+ * paths measure 2,047 bytes, and six are kept.
  */
 
 /** Byte bound for a digest, measured as JSON. */

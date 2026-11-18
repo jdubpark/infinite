@@ -312,7 +312,7 @@ test("differential: every call sequence gives the same receipt rows with its cla
 
 // The text rule.
 
-const char =(code: number) => String.fromCodePoint(code);
+const char = (code: number) => String.fromCodePoint(code);
 const escapeOf = (code: number) => "\\u{" + code.toString(16) + "}";
 const range = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, index) => from + index);
 const BIDI = [0x061c, 0x200e, 0x200f, ...range(0x202a, 0x202e), ...range(0x2066, 0x2069)];

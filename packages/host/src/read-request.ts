@@ -215,7 +215,7 @@ export function validateReadRequest(requestInput: unknown, grantInput: unknown):
       "This is a host fault: report it as a blocker instead of sending another read request.")] };
   }
   const parsedRequest = readRequestSchema.safeParse(requestInput);
-  if (!parsedRequest.success) return { ok: false, errors: parsedRequest.error.issues.map(issueError) };
+  if (!parsedRequest.success) return { ok: false, errors: ownIssues(parsedRequest.error.issues).map(issueError) };
   const request = parsedRequest.data;
   const grant = parsedGrant.data;
   const errors: ReadRequestError[] = [];
@@ -390,12 +390,23 @@ function issuePath(path: readonly PropertyKey[]): string {
 }
 
 // Part 3's table puts too many phases or steps, and maxItems, concurrency or a lead's maxAttempts above
-// its bound, under over-ceiling. Paths are written with # for an array index.
-const CEILING_PATHS = new Set(["phases", "phases.#.steps", "phases.#.steps.#.forEach.maxItems", "concurrency", "phases.#.steps.#.lead.maxAttempts"]);
+// its bound, under over-ceiling. Paths are written with # for an array index; the value says what the
+// field must be for its size to count.
+const CEILING_PATHS = new Map<string, "list" | "number">([["phases", "list"], ["phases.#.steps", "list"],
+  ["phases.#.steps.#.forEach.maxItems", "number"], ["concurrency", "number"], ["phases.#.steps.#.lead.maxAttempts", "number"]]);
 
 /**
- * A too-big issue on a CEILING_PATHS field is over-ceiling; every other parse issue is malformed. The
- * text names schema keys and bounds only, never a value taken from the request.
+ * A value of the wrong type gets one error. The schema library also reports a size issue for it (a
+ * string where a list belongs has a length), which names nothing the member can fix.
+ */
+function ownIssues(issues: RequestIssue[]): RequestIssue[] {
+  const wrongType = new Set(issues.filter(issue => issue.code === "invalid_type").map(issue => JSON.stringify(issue.path)));
+  return issues.filter(issue => issue.code === "invalid_type" || !wrongType.has(JSON.stringify(issue.path)));
+}
+
+/**
+ * A too-big list or number on its own CEILING_PATHS field is over-ceiling; every other parse issue is
+ * malformed. The text names schema keys and bounds only, never a value taken from the request.
  */
 function issueError(issue: RequestIssue): ReadRequestError {
   const path = issuePath(issue.path);
@@ -403,7 +414,8 @@ function issueError(issue: RequestIssue): ReadRequestError {
   const key = issue.path.filter(part => typeof part === "string").at(-1);
   const name = typeof key === "string" && KEY.test(key) ? `\`${key}\`` : "the request";
   const subject = issue.path.length === 0 ? "the request" : typeof issue.path.at(-1) === "number" ? `an item of ${name}` : name;
-  const code = issue.code === "too_big" && CEILING_PATHS.has(shape) ? "over-ceiling" : "malformed";
+  const sized = issue.code !== "too_big" ? undefined : issue.origin === "array" ? "list" : issue.origin === "number" || issue.origin === "int" ? "number" : undefined;
+  const code = sized !== undefined && CEILING_PATHS.get(shape) === sized ? "over-ceiling" : "malformed";
   const [message, fix] = issueText(issue, subject);
   return error(code, path, message.charAt(0).toUpperCase() + message.slice(1), fix);
 }

@@ -435,6 +435,19 @@ test("a parse issue is over-ceiling only for the table's list, without a limit p
   assert.deepEqual(limits(validateReadRequest(request([[step({ id: "scan" })]], { concurrency: 8 }), grant())), ["over-ceiling:concurrency:concurrency"]);
 });
 
+test("a value of the wrong type at a ceiling path is one malformed error, never over-ceiling", () => {
+  const valid = request([[listStep("items")], [step({ id: "fan", forEach: { step: "items", maxItems: 4 } })]]);
+  const fan = valid.phases[1].steps[0];
+  const wrong: [unknown, string][] = [
+    [{ ...valid, phases: "secret" }, "phases"],
+    [{ ...valid, phases: [{ id: "phase-1", steps: "1234567" }] }, "phases[0].steps"],
+    [{ ...valid, concurrency: "999999999" }, "concurrency"],
+    [{ ...valid, phases: [valid.phases[0], { id: "phase-2", steps: [{ ...fan, forEach: { step: "items", maxItems: "seventeen-or-more" } }] }] }, "phases[1].steps[0].forEach.maxItems"],
+    [request([[{ ...step({ id: "scan" }), lead: { maxAttempts: Array.from({ length: 13 }, () => 1) } } as unknown as ReadStep]]), "phases[0].steps[0].lead.maxAttempts"],
+  ];
+  for (const [value, path] of wrong) assert.deepEqual(parseIssues(value), [`malformed:${path}`], path);
+});
+
 test("the worst malformed request inside the schema's list limits is refused in full, without throwing, within stated bounds", () => {
   // Every field of 4 phases of 6 steps fails, with 16 paths of three issues each and 8 refs.
   // Measured with zod 4.6.7 on a 617,732-byte request: 1,692 errors and 217,297 bytes of refusal text.

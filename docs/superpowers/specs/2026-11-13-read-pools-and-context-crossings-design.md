@@ -151,16 +151,18 @@ A step's **key** is the SHA-256 of its normalized instructions (whitespace colla
 
 The session worker refuses at most 2 times per requester attempt, and records the third report as sent. *(My call: 2 matches `automaticRecoveryLimit`.)*
 
-**Proposed by slice 1 (INF-303), not yet accepted.** The validator in `packages/host/src/read-request.ts` needed rules that this design does not state. Each is marked `PROPOSED` in the code. A host must not use the validator until the owner has accepted or changed them.
+**Proposed by slice 1 (INF-303), not yet accepted.** The validator in `packages/host/src/read-request.ts` needed rules that this design does not state. Each is marked `PROPOSED` in the code. A host must not use the validator until the owner has accepted or changed these:
 
-- A request whose shape does not match the schema is refused with a new code, `malformed`, one error per schema issue. A parse issue is `over-ceiling` only when the table lists it: too many phases or steps, or a `maxItems`, `concurrency`, or lead `maxAttempts` above its bound. Too many `paths` or `refs` is `malformed`.
+- A request whose shape does not match the schema is refused with a new code, `malformed`: one error per schema issue, and one error in all for a value of the wrong type. A parse issue is `over-ceiling` only when the table lists it: too many phases or steps, or a `maxItems`, `concurrency`, or lead `maxAttempts` above its bound. Too many `paths` or `refs` is `malformed`.
 - A `source` reference is at most 2,048 characters, and an `evidence:N` reference names an item from 1 to 9999.
 - A scout lead's request and its own second attempt are charged to its reservation alone, so the grant's allowance left excludes every reservation. A project manager's request is charged to that allowance.
 - A step that sets both `verify` and `source` is refused with `not-granted`, because a verifier's artifact-only context and a quarantined reader cannot be one member.
 - A step's key treats its paths and its `source` refs as sets, so their order and any repeated entry do not change the key.
 - A step with both `forEach` and `lead` counts as `maxItems` times (1 plus `maxAttempts`) steps.
-- Result strings have bounds: the `list` and `locations` summaries 4,000 characters, as today's `findings`; a list item's `key` 120, `title` 200, and `source` 1,000; a location's `path` 512, at most 16 `symbols` of 200 each, and `role` 240; and a verdict's `criterion` 1,000.
 - The host fills the grant within fixed caps: 64 profiles, 64 outside-read profiles, 256 active steps, and 100 requests sent. A grant outside them refuses every read as a host fault. A grant without a lineage state refuses every `source` step, and a scout lead's grant without a reservation refuses its request.
+- A location holds at most 16 `symbols`.
+
+One more is the builder's choice under "Left to the builder", listed here so that it is visible. Result strings have bounds: the `list` and `locations` summaries 4,000 characters, as today's `findings`; a list item's `key` 120, `title` 200, and `source` 1,000; a location's `path` 512, each symbol 200, and `role` 240; and a verdict's `criterion` 1,000.
 
 **In the host process, before launch.** `consume` runs the function again against the current run. A difference can come only from work that started after the requester launched. A late duplicate is not an error: the host marks the step `joined` to the earlier one. A `joined` step settles when the step it joined settles, and takes that step's status and output handle. If the allowance fell below the request, the host admits whole phases in order and records the rest as `refused: allowance`. Any other failure, the third report included, refuses the request. A refusal never blocks the run. The host records `read.refused` with the errors and starts the requester's next attempt with them in its context file.
 

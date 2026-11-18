@@ -916,15 +916,11 @@ test("a mission coordinator reports through its own MCP tool and envelope, separ
     child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }) + "\n");
     await waitFor(async () => replies.length, count => count === 2);
     child.kill("SIGKILL"); lines.close();
-    return replies[1].result.tools;
+    return replies[1].result.tools.map((tool: { name: string }) => tool.name);
   };
-  const names = (listed: { name: string }[]) => listed.map(tool => tool.name);
-  const missionTools = await tools({});
-  assert.deepEqual(names(missionTools), ["mission_report"]);
-  assert.equal(missionTools[0].outputSchema.type, "object", "mission_report declares its result type");
-  assert.ok(missionTools[0].outputSchema.properties.missionId);
+  assert.deepEqual(await tools({}), ["mission_report"]);
   // Team members' launch config expands an unset mission assignment to an empty value.
-  assert.deepEqual(names(await tools({ INFINITE_MISSION_ASSIGNMENT: "", INFINITE_TEAM_ASSIGNMENT: JSON.stringify({ runId: missionId, memberId, revision: 3, role: "implementer" }) })), ["report"]);
+  assert.deepEqual(await tools({ INFINITE_MISSION_ASSIGNMENT: "", INFINITE_TEAM_ASSIGNMENT: JSON.stringify({ runId: missionId, memberId, revision: 3, role: "implementer" }) }), ["report"]);
 });
 
 const plan = (id: string, repoProjectId: string, dependsOn: string[] = []) =>

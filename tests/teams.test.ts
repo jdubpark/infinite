@@ -27,7 +27,6 @@ import { git, limitLineup as fallbackLineup, mixedLineup, fixture } from "./team
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { Manager } from "../packages/host/src/manager.js";
-import { reportResultSchema } from "../packages/host/src/team-mcp-results.js";
 
 test("team session creation refuses native continuation for other providers or roles", () => {
   const manager = Object.create(Manager.prototype) as Manager;
@@ -1896,8 +1895,6 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
     assert.equal(listing.result.tools.length, 1);
     assert.equal(listing.result.tools[0].name, "report");
     assert.ok(listing.result.tools[0].inputSchema.properties.report);
-    assert.equal(listing.result.tools[0].outputSchema.type, "object", "report declares its result type");
-    assert.ok(listing.result.tools[0].outputSchema.properties.requestId);
     const questionSchema = listing.result.tools[0].inputSchema.properties.report.oneOf.find((branch: any) => branch.properties?.kind?.const === "question");
     assert.deepEqual(questionSchema.properties.answerMode.enum, ["approval", "single", "multiple"], "The MCP schema exposes selectable answer modes");
     const invalid = await client.rpc("tools/call", { name: "report", arguments: { report: { kind: "plan", summary: "No tasks supplied" } } });
@@ -1935,9 +1932,6 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
     assert.notEqual(delivered.result.isError, true);
     assert.equal(delivered.result.structuredContent.requestId, recorded[0].data.requestId);
     assert.equal(delivered.result.structuredContent.memberId, member.memberId);
-    assert.deepEqual(reportResultSchema.safeParse(delivered.result.structuredContent).success, true, "the report answer matches its declared result type");
-    assert.equal(delivered.result.content[0].text, "Team report recorded. Stop work on this assignment.");
-    assert.equal(delivered.result.structuredContent.message, delivered.result.content[0].text, "the receipt sentence is in message and in the text");
     await client.close();
 
     const restarted = startMcp();

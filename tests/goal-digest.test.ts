@@ -299,7 +299,6 @@ test("differential: every sequence of cycles gives the same receipt fields with 
   for (const seed of seeds) {
     let claimed: GoalDigest | undefined;
     let erased: GoalDigest | undefined;
-    let lines = 0;
     for (const [index, step] of randomCycles(seed, 22).entries()) {
       const where = `seed ${seed}, cycle ${index + 1}`;
       let left: GoalDigest;
@@ -313,18 +312,19 @@ test("differential: every sequence of cycles gives the same receipt fields with 
       assert.deepEqual(receiptFields(left), receiptFields(right), where);
       // A real trim: a counter rose above what the inputs brought. At its cap the cap trimmed; below it, the bound.
       const [trimClaimed, trimErased] = [trims(left, claimed, step.claimed), trims(right, erased, step.erased)];
+      // The history lines this call had to place: the lines it was given and the new one.
+      const historyAvailable = (claimed?.history.length ?? 0) + 1;
       claimed = left;
       erased = right;
       steps += 1;
       collisions += step.collisions;
-      lines += 1;
       const full: [(typeof names)[number], boolean][] = [
         ["touched cap", trimErased.touched === "cap"], ["failures cap", trimClaimed.failures === "cap"],
         ["decisions cap", trimClaimed.decisions === "cap"], ["open cap", trimClaimed.open === "cap"],
-        ["criteria cap", trimClaimed.criteria === "cap"], ["history cap", left.history.length === 16 && lines > 16],
+        ["criteria cap", trimClaimed.criteria === "cap"], ["history cap", left.history.length === 16 && historyAvailable > 16],
         ["bound with receipts", trimErased.touched === "bound" || trimErased.failures === "bound"],
         ["bound with claims", trimClaimed.decisions === "bound" || trimClaimed.open === "bound" || trimClaimed.criteria === "bound"],
-        ["bound with history", left.history.length < Math.min(16, lines)],
+        ["bound with history", left.history.length < Math.min(16, historyAvailable)],
       ];
       for (const [name, hit] of full) if (hit) reached[name].add(seed);
     }

@@ -17,11 +17,17 @@ import { runEventKey } from "../packages/host/src/run-events.js";
 import { bump, type Counts, type Rand, rand, RunScript } from "./outcome-sim-script.js";
 
 /*
- * A seeded fault simulator for the outcome ledger projector (INF-309). Each seed scripts one or two team runs the way
+ * A seeded fault simulator for the outcome ledger projector (INF-309). Each seed scripts three team runs the way
  * TeamService emits their events (tests/outcome-sim-script.ts states each order it keeps or breaks), delivers them to
  * the real evidence store, outbox and projectors on temporary SQLite files under faults, and checks the invariants
  * below after every delivery, from the stored state alone. A failure names its seed and step.
- * OUTCOME_SIM_SEED=N runs that seed alone; OUTCOME_SIM_SEEDS=N runs N seeds from OUTCOME_SIM_BASE (default 1).
+ *
+ * What it checks, and what it does not: scheduling and stored-state consistency under restarts, replays, rollbacks,
+ * gaps and the emitter's orders. It does not check that a handler applies the right rule. P1's reference store runs
+ * every handler it compares against; P5 and P6 recount with production's helpers or a copy of their logic; P7 checks
+ * gap propagation only where a gap is already recorded. Rule semantics stay with tests/outcome-projector.test.ts,
+ * tests/outcome-rules.test.ts and tests/outcome-signals.test.ts. For example, an empty repair answer that leaves its
+ * round "answered", or a repair answer that keeps another base's links pending, passes every invariant (INF-316).
  *
  * Faults: a restart after the store took a flush and before any projection (close, then reopen the same path with the
  * same key and register everything again); the sealed outbox flushed again after that restart; a projector that throws
@@ -35,25 +41,33 @@ import { bump, type Counts, type Rand, rand, RunScript } from "./outcome-sim-scr
  *    page writes the same rows" (outcome-projector.ts:64). The reference projects every event twice in a row and
  *    compares. Replaying the whole log onto the final state is not promised: a replayed run.settled freezes a row that
  *    integrated after the settle.
- * P3 A row that was integrated or completed keeps that disposition (outcome-rules.ts:66-72).
+ * P3 A row that was integrated or completed keeps that disposition (outcome-rules.ts:66-72). TeamService emits no
+ *    stop, block or report for a member after its integration or completion: it confirms the exit before it consumes
+ *    the report, and a halt emits only on a change to stopped (teams.ts:3455-3462, 3303-3304). So P3 fails only if the
+ *    emitter or the script starts to; the precedence itself stays with tests/outcome-rules.test.ts.
  * P4 Once frozenAt is set, frozenAt, acceptance and the last review never change: "a later steer or continuation ...
  *    changes no frozen row" (spec part 4, Freeze; outcome-projector.ts:329, 508-528).
  * P5 Each row's levels, exclusion, round counts and scan-gap flag equal levels(), rowExclusion(), roundCounts() and
  *    scanGap() over its stored disposition, acceptance, links and signals (outcome-signals.ts:133-164).
  * P6 A settled summary's attempts equal its run's rows counted by disposition (outcome-projector.ts:530, 547-559).
- *    While the run rests settled, with no run.revision-advanced after its last run.settled, its rounds equal its round
- *    states and links counted as roundTotals documents (outcome-projector.ts:424-428; recounted at 419 and 531).
+ *    While the run rests settled, with no run.revision-advanced and no event of a later revision after its last
+ *    run.settled, its rounds equal its round states and links counted as roundTotals documents
+ *    (outcome-projector.ts:424-428; recounted at 419 and 531).
  * P7 When a summary has gap, every row and member result of its run has gap; no gap flag is ever removed.
  * P8 last_seq <= the outcomes cursor <= the highest stored seq; the cursor never moves back, a page that throws keeps
  *    it, and the final drain projects every stored event (evidence/outbox.ts:210-275).
  */
 
+// OUTCOME_SIM_SEED=N runs that seed alone; OUTCOME_SIM_SEEDS=N runs N seeds from OUTCOME_SIM_BASE (default 1). The
+// count floors describe the default corpus, so they apply only to it; any other seed set prints its counts and checks
+// the invariants alone.
 const DEFAULT_SEEDS = 30;
 const ONLY = process.env.OUTCOME_SIM_SEED;
 const COUNT = Number(process.env.OUTCOME_SIM_SEEDS ?? DEFAULT_SEEDS);
 const BASE_SEED = Number(process.env.OUTCOME_SIM_BASE ?? 1);
 const SEEDS = ONLY === undefined ? Array.from({ length: COUNT }, (_, index) => BASE_SEED + index) : [Number(ONLY)];
 assert.ok(SEEDS.length > 0 && SEEDS.every(Number.isSafeInteger), "OUTCOME_SIM_SEED, OUTCOME_SIM_SEEDS and OUTCOME_SIM_BASE take integers");
+const DEFAULT_CORPUS = ONLY === undefined && COUNT === DEFAULT_SEEDS && BASE_SEED === 1;
 
 const T0 = Date.parse("2026-11-13T10:00:00.000Z");
 const DELETED_AT = "2026-11-14T00:00:00.000Z";
@@ -209,22 +223,14 @@ function fail(where: string, message: string): never {
   return assert.fail(`${where}: ${message}`);
 }
 
-/** Deep equality with a short message: for tables, the first table and row that differ. */
+/** assert.deepStrictEqual, with the seed, step and reproduce line in front of its diff. */
 function same(where: string, label: string, actual: unknown, expected: unknown): void {
-  if (isDeepStrictEqual(actual, expected)) return;
-  let detail = `${JSON.stringify(actual)} instead of ${JSON.stringify(expected)}`;
-  if (actual && expected && typeof actual === "object" && !Array.isArray(actual)) {
-    for (const table of Object.keys(expected as Tables)) {
-      const got = (actual as Tables)[table] ?? [], want = (expected as Tables)[table]!;
-      if (!Array.isArray(got) || !Array.isArray(want)) break;
-      const index = [...Array(Math.max(got.length, want.length)).keys()].find(i => !isDeepStrictEqual(got[i], want[i]));
-      if (index !== undefined) {
-        detail = `${table} row ${index}: ${JSON.stringify(got[index])} instead of ${JSON.stringify(want[index])}`;
-        break;
-      }
-    }
+  try {
+    assert.deepStrictEqual(actual, expected);
+  } catch (error) {
+    (error as Error).message = `${where}: ${label}\n${(error as Error).message}`;
+    throw error;
   }
-  fail(where, `${label} ${detail.slice(0, 1500)}`);
 }
 
 const flagsOf = (row: Row) => String(row.flags ?? "").split(",").filter(Boolean);
@@ -261,7 +267,7 @@ function check(live: Live, reference: Reference, prev: Snapshot | undefined, whe
     fail(where, `P8: last_seq ${now.lastSeq}, outcomes cursor ${now.cursor}, highest seq ${now.maxSeq}`);
   }
   if (prev && now.cursor < prev.cursor) fail(where, `P8: the outcomes cursor moved back from ${prev.cursor} to ${now.cursor}`);
-  same(where, "P1: the live tables differ from the reference projection:", now.tables, reference.store.read(db => tablesOf(db)));
+  same(where, "P1: the live tables differ from the reference projection", now.tables, reference.store.read(db => tablesOf(db)));
 
   const rows = new Map(now.tables.outcomes!.map(row => [String(row.outcome_id), row]));
   for (const old of prev?.tables.outcomes ?? []) {
@@ -301,8 +307,11 @@ function check(live: Live, reference: Reference, prev: Snapshot | undefined, whe
         const counted: Record<string, number> = {};
         for (const row of runRows) bump(counted, row.disposition);
         same(where, `P6: the settled summary of ${runId} counts attempts`, sortedCounts(stored.payload.attempts), sortedCounts(counted));
-        const last = (kind: string) => db.get<{ seq: number | null }>("SELECT max(seq) AS seq FROM run_events WHERE run_id=? AND kind=? AND seq<=?", runId, kind, cursor)?.seq ?? 0;
-        if (last("run.settled") > last("run.revision-advanced")) {
+        // A dropped run.revision-advanced leaves its revision's later events behind, so they count as an advance too.
+        const settle = db.get<Row>("SELECT seq, revision FROM run_events WHERE run_id=? AND kind='run.settled' AND seq<=? ORDER BY seq DESC LIMIT 1", runId, cursor);
+        const moved = settle && db.get<Row>("SELECT 1 AS found FROM run_events WHERE run_id=? AND seq>? AND seq<=? AND (revision>? OR kind='run.revision-advanced')",
+          runId, Number(settle.seq), cursor, Number(settle.revision));
+        if (settle && !moved) {
           same(where, `P6: the settled summary of ${runId} counts rounds`, stored.payload.rounds, roundTotals(db, runId));
         }
       }
@@ -385,16 +394,17 @@ function simulate(seed: number, counts: Counts): void {
   const r = rand(seed);
   let tick = 0;
   const clock = () => new Date(T0 + 1000 * tick++).toISOString();
-  const runIds = r.chance(0.7) ? ["run-a", "run-b"] : ["run-a"];
+  const runIds = ["run-a", "run-b", "run-c"];
   const queues = runIds.map(runId => batches(r, new RunScript(r, runId, clock, counts).script()));
-  const root = mkdtempSync(join(tmpdir(), "infinite-outcome-sim-"));
   const key = createHash("sha256").update(`outcome-sim:${seed}`).digest();
-  const live = new Live(evidenceDatabasePath(join(root, "live")), key);
-  const reference = new Reference(evidenceDatabasePath(join(root, "reference")), key);
   const delivered: OutboxEvent[] = [];
   const reproduce = `reproduce with OUTCOME_SIM_SEED=${seed}`;
+  let root: string | undefined, live: Live | undefined, reference: Reference | undefined;
   let prev: Snapshot | undefined;
   try {
+    root = mkdtempSync(join(tmpdir(), "infinite-outcome-sim-"));
+    live = new Live(evidenceDatabasePath(join(root, "live")), key);
+    reference = new Reference(evidenceDatabasePath(join(root, "reference")), key);
     for (let step = 1; queues.some(queue => queue.length > 0); step += 1) {
       const queue = r.pick(queues.filter(item => item.length > 0));
       const fault = deliver(r, live, queue.shift()!, queue, delivered, counts);
@@ -407,35 +417,34 @@ function simulate(seed: number, counts: Counts): void {
     for (const { kind, n } of live.store.read(db => db.all<{ kind: string; n: number }>("SELECT kind, count(*) AS n FROM run_events GROUP BY kind"))) {
       bump(counts, `kind:${kind}`, n);
     }
-    for (const row of last.tables.outcomes!) {
-      bump(counts, `disposition:${String(row.disposition)}`);
-      if (row.frozen_at !== null) bump(counts, "rows:frozen");
-    }
+    bump(counts, "rows:frozen", last.tables.outcomes!.filter(row => row.frozen_at !== null).length);
     for (const summary of last.tables.run_summaries!) if (summary.settled_at !== null) bump(counts, "runs:settled");
     bump(counts, "rows:member-results", last.tables.member_results!.length);
   } finally {
-    live.store.close();
-    reference.store.close();
-    rmSync(root, { recursive: true, force: true });
+    live?.store.close();
+    reference?.store.close();
+    if (root !== undefined) rmSync(root, { recursive: true, force: true });
   }
 }
 
 /**
- * Floors for the default run, so a generator that silently stops producing a case fails. Each is about a third of what
- * the default seeds produced when it was set.
+ * Floors for the default corpus, so a generator that silently stops producing a case fails: every outcome event
+ * kind, every fault and every reorder ran at least 10 times there, and each floor is about half of that count.
+ * Held completions after a cancel's settle are floored together, as reorder:completion-after-settle, and the late
+ * run.prepared also alone: a run cancels at most once, so the five held kinds share the cancels, and alone the repair
+ * answer, the review and the scout completion ran under 10 times (5, 7 and 4). The diagnostic shows each kind.
  */
 const FLOORS: Readonly<Record<string, number>> = {
-  "kind:run.created": 18, "kind:run.prepared": 18, "kind:member.started": 160, "kind:member.configured": 115,
-  "kind:member.reported": 145, "kind:member.stopped": 128, "kind:task.integrated": 34, "kind:scout.completed": 15,
-  "kind:task.escalated": 5, "kind:review.recorded": 22, "kind:review.tree": 16, "kind:repair.started": 11,
-  "kind:repair.integrated": 11, "kind:repair.paths": 7, "kind:delivery.recorded": 4, "kind:rating.recorded": 4,
-  "kind:run.blocked": 7, "kind:run.revision-advanced": 12, "kind:run.settled": 16, "kind:run.deleted": 4, "kind:ledger.gap": 10,
-  "fault:restart": 45, "fault:sealed-outbox-again": 25, "fault:small-page": 7, "fault:rollback": 39, "fault:rollback-mid-page": 26,
-  "fault:gap": 10, "fault:dropped-event": 24, "fault:repeated-key": 24,
-  "reorder:report-after-stop": 1, "reorder:completion-after-halt": 2, "reorder:stop-without-start": 6,
-  "after-settle:member.stopped": 34, "after-settle:member.configured": 17, "after-settle:review.tree": 6,
-  "after-settle:task.integrated": 1, "after-settle:repair.integrated": 1, "after-settle:repair.paths": 1,
-  "runs:settled": 13, "rows:frozen": 26, "rows:member-results": 79,
+  "kind:run.created": 43, "kind:run.prepared": 43, "kind:member.started": 387, "kind:member.configured": 282,
+  "kind:member.reported": 341, "kind:member.stopped": 86, "kind:task.integrated": 75, "kind:scout.completed": 36,
+  "kind:task.escalated": 11, "kind:review.recorded": 28, "kind:review.tree": 17, "kind:repair.started": 20,
+  "kind:repair.integrated": 19, "kind:repair.paths": 13, "kind:delivery.recorded": 9, "kind:rating.recorded": 9,
+  "kind:run.blocked": 13, "kind:run.revision-advanced": 42, "kind:run.settled": 41, "kind:run.deleted": 10, "kind:ledger.gap": 23,
+  "fault:restart": 91, "fault:sealed-outbox-again": 42, "fault:small-page": 20, "fault:rollback": 86, "fault:rollback-mid-page": 58,
+  "fault:gap": 23, "fault:dropped-event": 47, "fault:repeated-key": 57,
+  "reorder:report-after-stop": 6, "reorder:completion-after-halt": 12, "reorder:completion-after-settle": 19,
+  "reorder:enrichment-after-settle": 61, "reorder:stop-without-start": 11, "after-settle:member.stopped": 10, "after-settle:run.prepared": 6,
+  "runs:settled": 38, "rows:frozen": 57, "rows:member-results": 161,
 };
 
 test("the outcome projector keeps its invariants under seeded faults", t => {
@@ -451,25 +460,27 @@ test("the outcome projector keeps its invariants under seeded faults", t => {
   }
   const perSeed = (performance.now() - started) / SEEDS.length;
   t.diagnostic(`outcome sim: ${SEEDS.length} seeds from ${SEEDS[0]}, ${perSeed.toFixed(0)} ms per seed, ${JSON.stringify(Object.fromEntries(sortedCounts(counts)))}`);
-  if (ONLY !== undefined || COUNT < DEFAULT_SEEDS) return;
+  if (!DEFAULT_CORPUS) return;
   for (const [name, floor] of Object.entries(FLOORS)) {
     assert.ok((counts[name] ?? 0) >= floor, `${name} ran ${counts[name] ?? 0} times, under its floor of ${floor}: the generator stopped producing it`);
   }
 });
 
 test("a repair answer with no commit after a cancel settle recounts the summary's rounds", {
-  todo: "INF-309: repairIntegrated (outcome-projector.ts:374-395) does not recount a settled summary's rounds",
+  todo: "INF-316: repairIntegrated (outcome-projector.ts:374-395) does not recount a settled summary's rounds; once fixed, "
+    + "drop this todo and switch on EMPTY_REPAIR_AFTER_SETTLE in tests/outcome-sim-script.ts",
 }, () => {
-  // The smallest list without a gap, reduced from simulator seed 11 with EMPTY_REPAIR_AFTER_SETTLE on. Production emits
+  // The smallest list without a gap, reduced from simulator seed 18 with EMPTY_REPAIR_AFTER_SETTLE on. Production emits
   // this order when the integrator's operation finished before an owner cancel: the cancel saves run.settled, then the
   // queued completion emits repair.integrated, with no commit when nothing changed (teams.ts:2279-2292, 2695-2704, 5575).
-  const root = mkdtempSync(join(tmpdir(), "infinite-outcome-sim-"));
-  const live = new Live(evidenceDatabasePath(root), createHash("sha256").update("outcome-sim:directed").digest());
   const base = "b".repeat(40), head = "c".repeat(40);
   const event = (second: number, kind: string, parts: (string | number)[], ids: { memberId?: string; taskId?: string }, data: Row): OutboxEvent => ({
     key: runEventKey(kind, "run-d", parts), runId: "run-d", revision: 1, at: new Date(T0 + second * 1000).toISOString(), kind, ...ids, data: { v: 1, ...data },
   });
+  let root: string | undefined, live: Live | undefined;
   try {
+    root = mkdtempSync(join(tmpdir(), "infinite-outcome-sim-"));
+    live = new Live(evidenceDatabasePath(root), createHash("sha256").update("outcome-sim:directed").digest());
     live.flush([
       event(0, "run.created", [], {}, { projectId: "example", purpose: "work" }),
       event(1, "member.started", ["m1"], { memberId: "m1", taskId: "a" }, { role: "implementer", startedAt: new Date(T0 + 1000).toISOString(), baseCommit: base, provider: "claude", model: "m-1" }),
@@ -481,7 +492,7 @@ test("a repair answer with no commit after a cancel settle recounts the summary'
     // Shown: { total: 1, attributed: 0, unattributed: 0, unknown: 1 }; the round is resolved and its one link is clear.
     live.store.read(db => assert.deepEqual(readSummary(db, "run-d")!.payload.rounds, roundTotals(db, "run-d")));
   } finally {
-    live.store.close();
-    rmSync(root, { recursive: true, force: true });
+    live?.store.close();
+    if (root !== undefined) rmSync(root, { recursive: true, force: true });
   }
 });

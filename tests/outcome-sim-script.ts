@@ -6,11 +6,16 @@ import { runEventKey } from "../packages/host/src/run-events.js";
 /*
  * The event scripts of the outcome projector simulator (tests/outcome-projector-sim.test.ts): team runs as TeamService
  * emits them. Each order below is one the emitter guarantees, so a script keeps it (lines in teams.ts unless named):
- * - run.created and then run.prepared open a run (1604, 1664).
+ * - run.created opens a run (1604); run.prepared follows it (1664).
  * - A run's events reach the store in emission order: one outbox array per run, flushed whole (936-961, 1004-1019).
- * - task.planned of a revision precedes every member.started of that revision (5322 in the plan's completion; launch 5158).
- * - discovery.accepted precedes the starts of its scouts (5240, then launch 5158).
+ * - A revision's project manager starts and reports first. Its task.planned events precede the starts of the plan's
+ *   implementers, and discovery.accepted precedes the starts of its scouts (5240, 5322; launch 5158).
  * - A member's start precedes its report, its integration, its completion and its escalation (5158, 4852, 5569, 5254, 5264).
+ * - An implementer's result is consumed (integrated, or refused for scope or conflict) only after every earlier planned
+ *   task of its revision is integrated. Its other reports, escalations among them, and scout findings are consumed as
+ *   they arrive (3458-3462, 5197).
+ * - A member's exit is confirmed before its report is consumed, so a halt stops, and emits member.stopped for, only
+ *   members still active: queued, running, or reported and not yet consumed (2971-2974, 3456, 3270-3305).
  * - member.stopped(stall | no-report) follows a drained journal, so no report of that member follows it (4880-4888, 3399-3420).
  * - A replacement starts after its predecessor's stall, limit or escalation (4908, 4936, 5269 link it before its launch).
  * - review.recorded precedes the repair.started it causes (5519, 5528, 5599); repair.integrated answers its own round (5575).
@@ -19,24 +24,29 @@ import { runEventKey } from "../packages/host/src/run-events.js";
  *   drained revision first and then emits run.revision-advanced (3267-3305, 2942).
  * - One key per fact (run-events.ts:9); the store keeps the first event of a repeated key (store.ts:287-318).
  * Reorders the emitter allows, which the scripts produce:
- * - The members of a revision run at once, so their events interleave (3333 loops over them on each pass).
+ * - The members of a revision run at once, so their starts and reports interleave (3333 loops over them on each pass).
  * - member.configured, review.tree and repair.paths are reads that end later, also after a settle (5172, 5535, 5584, 5618-5640).
  * - In a drain, a report read from a later journal page follows the halt's stop (3298-3305; outcome-rules.ts:61-65).
  * - An owner cancel settles first, and the halt loop stops the members afterwards (2204, 2231-2232, then 3304).
- * - An operation that finished before a cancel or pause completes while held, after the settle: stopRun aborts the
- *   command but keeps `pending`, and the queued completion runs `complete` (2279-2292, 2695-2704, 5569, 5575).
+ * - An operation that finished before a cancel or pause completes while held, before or after the halt's stops and,
+ *   for a cancel, after the settle: stopRun aborts the command but keeps `pending`, and the queued completion runs
+ *   (2279-2292, 2695-2704). Covered: an integration, a scout's completion, a review, a repair answer (5569, 5254, 5519,
+ *   5575), and the workspace preparation, so run.prepared can follow a cancel's run.settled (1664).
  * - A halt stops a queued member that never launched, with no start event (3283, 3291, then 3304).
  * - Runs interleave at flush granularity: each save flushes one run's outbox (855-866).
+ * Not produced: owner answers and their replacements, permission and intent members, no-change settles, delivery
+ * recovery, budget stops, and an implementer question that becomes a decision instead of a block.
  */
 
-// Off: production can emit an empty repair answer after a cancel settle, and it leaves the summary's rounds stale (INF-309).
+// Off: production can emit an empty repair answer after a cancel settle, which leaves the summary's rounds stale
+// (INF-316). Once INF-316 is fixed, switch this on and remove the `todo` from the directed case in the test file.
 export const EMPTY_REPAIR_AFTER_SETTLE = false;
 
 export type Counts = Record<string, number>;
 export type Rand = { next(): number; chance(p: number): boolean; int(lo: number, hi: number): number; pick<T>(items: readonly T[]): T };
 type Member = {
   id: string; role: string; revision: number; taskId?: string; model: string; attempt: number;
-  replaces?: { memberId: string; cause: string }; started: boolean; stopped: boolean; steps: string[];
+  replaces?: { memberId: string; cause: string }; started: boolean; reported: boolean; stopped: boolean; steps: string[];
 };
 type Task = { escalated: boolean; integrated: boolean; member?: Member };
 type Data = Record<string, unknown>;
@@ -44,6 +54,11 @@ type Data = Record<string, unknown>;
 const MAX_REVISION = 3;
 /** Codes a member's own report or an operation failure recovers from (teams.ts:269, 274). */
 const RECOVERY_CODES = new Set(["agent-blocked", "agent-question", "missing-agent-report", "wrong-agent-report", "task-scope-violation", "integration-conflict"]);
+/** The steps that consume an implementer's result, which wait for the earlier planned tasks (teams.ts:3458-3462). */
+const CONSUMES_RESULT = new Set(["integrate", "block:task-scope-violation", "block:integration-conflict"]);
+/** Completions a cancel holds, which then land after its run.settled, and enrichment reads that can land after one. */
+const HELD_KINDS = new Set(["run.prepared", "task.integrated", "scout.completed", "review.recorded", "repair.integrated"]);
+const LATE_KINDS = new Set(["member.configured", "review.tree", "repair.paths"]);
 const DIGESTS = ["a".repeat(64), "e".repeat(64)];
 const MODELS = ["m-1", "m-2", "m-3"];
 const PATHS = ["a.txt", "b.txt", "c.txt", "z.txt"];
@@ -53,10 +68,10 @@ const IMPLEMENTER_ENDINGS: readonly (readonly [number, string[]])[] = [
   [55, ["report:result", "integrate"]],
   [8, ["stop:stall"]],
   [5, ["stop:limit"]],
-  [7, ["report:escalate", "escalate"]],
+  [10, ["report:escalate", "escalate"]],
   [4, ["report:question", "block:agent-question"]],
   [3, ["report:blocked", "block:agent-blocked"]],
-  [4, ["stop:no-report", "block:missing-agent-report"]],
+  [4, ["stop:no-report"]],
   [4, ["report:review", "block:wrong-agent-report"]],
   [5, ["report:result", "block:task-scope-violation"]],
   [5, ["report:result", "block:integration-conflict"]],
@@ -126,12 +141,15 @@ export class RunScript {
   script(): OutboxEvent[] {
     const goal = this.r.chance(0.3) ? { goalId: "goal-1", goalCycle: 1, missionId: "mission-1" } : {};
     this.emit("run.created", [], {}, { projectId: "example", purpose: "work", ...goal });
+    // An owner cancel during the workspace preparation settles the run; the held preparation then completes (teams.ts:1664).
+    this.ended = this.r.chance(0.1);
+    if (this.ended) this.settle("cancelled");
     this.emit("run.prepared", [], {}, { baseCommit: this.base });
     while (!this.ended) this.revise();
     // A read still running when the record is last saved emits later, or never when it fails.
     for (const read of this.late.splice(0)) if (this.r.chance(0.8)) read();
     // Deleting the record flushes its outbox last; the projector only advances past run.deleted (teams.ts:1384).
-    if (this.r.chance(0.2)) this.emit("run.deleted", [], {}, { status: this.status });
+    if (this.r.chance(0.25)) this.emit("run.deleted", [], {}, { status: this.status });
     return this.events;
   }
 
@@ -148,13 +166,17 @@ export class RunScript {
       ...(ids.taskId === undefined ? {} : { taskId: ids.taskId }),
       data: { v: 1, ...Object.fromEntries(Object.entries(body).filter(([, value]) => value !== undefined)) },
     });
-    if (this.settled) bump(this.counts, `after-settle:${kind}`);
+    if (this.settled) {
+      bump(this.counts, `after-settle:${kind}`);
+      if (HELD_KINDS.has(kind)) bump(this.counts, "reorder:completion-after-settle");
+      if (LATE_KINDS.has(kind)) bump(this.counts, "reorder:enrichment-after-settle");
+    }
     if (this.late.length > 0 && this.r.chance(0.2)) this.late.splice(this.r.int(0, this.late.length - 1), 1)[0]!();
   }
 
   /** One revision: an optional discovery, a plan and its members, then checks and reviews. */
   private revise(): void {
-    if (this.r.chance(0.3)) {
+    if (this.r.chance(0.4)) {
       this.discover();
       if (!this.work()) return;
     }
@@ -178,7 +200,7 @@ export class RunScript {
     const pm = this.member("project-manager");
     this.start(pm);
     this.report(pm, "plan");
-    const ids = ["a", "b", "c"].slice(0, this.r.int(1, 3));
+    const ids = ["a", "b", "c"].slice(0, this.r.pick([1, 2, 3, 3]));
     this.tasks = new Map(ids.map(id => [id, { escalated: false, integrated: false }]));
     this.emit("plan.accepted", [this.revision], { memberId: pm.id }, { taskCount: ids.length, planDigest: DIGESTS[0], parallelism: 2 });
     for (const id of ids) {
@@ -190,17 +212,30 @@ export class RunScript {
     }
   }
 
+  /** Whether a member's next step may run now: a result waits until every earlier planned task is integrated. */
+  private inOrder(m: Member): boolean {
+    if (m.role !== "implementer" || !CONSUMES_RESULT.has(m.steps[0]!)) return true;
+    const ids = [...this.tasks.keys()];
+    return ids.slice(0, ids.indexOf(m.taskId!)).every(id => this.tasks.get(id)!.integrated);
+  }
+
   /** Runs this revision's members as threads. False when a block or an owner halt ended the revision. */
   private work(): boolean {
     for (;;) {
-      const runnable = this.members.filter(m => m.revision === this.revision && !m.stopped && m.steps.length > 0);
-      if (runnable.length === 0) return true;
-      if (this.r.chance(0.025)) {
-        this.ownerHalt(this.pendingResult());
+      const waiting = this.members.filter(m => m.revision === this.revision && !m.stopped && m.steps.length > 0);
+      if (waiting.length === 0) return true;
+      const runnable = waiting.filter(m => this.inOrder(m));
+      if (runnable.length === 0) throw new Error("the script waits on a task that cannot integrate");
+      // An operation in flight when the owner halts: the next result or findings to consume.
+      const due = runnable.find(m => m.steps[0] === "integrate" || m.steps[0] === "complete");
+      if (this.r.chance(due ? 0.08 : 0.006)) {
+        const step = due?.steps.shift();
+        this.ownerHalt(due && (() => (step === "integrate" ? this.integrate(due) : this.complete(due))));
         return false;
       }
       const m = this.r.pick(runnable);
       const [verb, arg = ""] = m.steps.shift()!.split(":");
+      if (verb === "work") continue;
       if (verb === "start") this.start(m);
       else if (verb === "report") this.report(m, arg);
       else if (verb === "integrate") this.integrate(m);
@@ -211,6 +246,11 @@ export class RunScript {
       } else if (verb === "stop") {
         this.stop(m, arg);
         if (arg === "stall" || arg === "limit") this.member(m.role, m.taskId, m.attempt + 1, { memberId: m.id, cause: arg });
+        if (arg === "no-report") {
+          // A member that exits without a report blocks the run (teams.ts:3419-3422).
+          this.block("missing-agent-report", m);
+          return false;
+        }
       } else {
         this.block(arg, m);
         return false;
@@ -222,7 +262,7 @@ export class RunScript {
   private review(): void {
     for (;;) {
       this.emit("check.finished", [this.revision, this.round, this.stamp()], {}, { round: this.round });
-      if (this.round < 2 && this.r.chance(0.2)) {
+      if (this.round < 2 && this.r.chance(0.3)) {
         if (!this.repair("check")) return;
         continue;
       }
@@ -231,7 +271,7 @@ export class RunScript {
       this.report(reviewer, "review");
       const verdict = this.r.chance(0.5) ? "approved" : "changes-requested";
       const record = () => this.recordReview(reviewer, verdict);
-      if (this.r.chance(0.06)) return this.ownerHalt(record);
+      if (this.r.chance(0.15)) return this.ownerHalt(record);
       record();
       if (verdict === "approved") return this.approve();
       if (this.round >= 2) return this.block("repair-limit");
@@ -273,7 +313,7 @@ export class RunScript {
         this.late.push(() => this.emit("repair.paths", [revision, round], { memberId: integrator.id, revision }, { round, commit, ...paths }));
       }
     };
-    if (this.r.chance(0.25)) {
+    if (this.r.chance(0.3)) {
       this.ownerHalt(answer);
       return false;
     }
@@ -284,7 +324,7 @@ export class RunScript {
   private approve(): void {
     const roll = this.r.next();
     let status = "ready-for-review";
-    if (roll < 0.55) {
+    if (roll < 0.75) {
       const delivery = this.member("delivery");
       this.start(delivery);
       if (roll < 0.08 && this.revision < MAX_REVISION) {
@@ -300,7 +340,7 @@ export class RunScript {
     }
     this.settle(status);
     for (const [taskId, task] of this.tasks) {
-      if (task.member && this.r.chance(0.35)) {
+      if (task.member && this.r.chance(0.5)) {
         this.emit("rating.recorded", [`request-${this.stamp()}`], { taskId, memberId: task.member.id, revision: task.member.revision }, { score: this.r.int(1, 5) });
       }
     }
@@ -312,7 +352,7 @@ export class RunScript {
 
   /** A block. A recoverable one drains its revision and advances; any other one blocks the run (teams.ts:2759-2833). */
   private block(code: string, source?: Member): void {
-    if (source && RECOVERY_CODES.has(code) && this.recoveries < 2 && this.revision < MAX_REVISION && this.r.chance(0.6)) {
+    if (source && RECOVERY_CODES.has(code) && this.recoveries < 2 && this.revision < MAX_REVISION && this.r.chance(0.8)) {
       this.recoveries += 1;
       this.halt("host", "block", this.revision);
       return this.advance("automatic-recovery", { sourceCode: code, sourceMemberId: source.id });
@@ -327,38 +367,47 @@ export class RunScript {
     this.ended = true;
   }
 
-  /** An owner halt: cancel, pause and resume, or steer. `pending` is a workspace operation that already finished. */
+  /**
+   * An owner halt: cancel, pause (and maybe resume), or steer. `pending` is a workspace operation that already
+   * finished. Steering refuses to start while one runs (teams.ts:1695); a cancel or pause holds its completion.
+   */
   private ownerHalt(pending?: () => void): void {
     const action = this.revision < MAX_REVISION ? this.r.pick(["cancel", "cancel", "pause", "steer"]) : "cancel";
-    if (action === "cancel") return this.cancel(pending);
-    // Steering refuses a running operation (teams.ts:1695); a pause holds the completion like a cancel does.
-    pending?.();
     if (action === "steer") {
+      pending?.();
       this.advance("steer");
       return this.halt("owner", "steer");
     }
-    this.halt("owner", "pause");
-    this.status = "paused";
-    if (this.r.chance(0.7)) this.advance("resume");
+    if (action === "cancel") this.settle("cancelled");
+    const after = pending !== undefined && this.r.chance(0.6);
+    if (!after) pending?.();
+    this.halt("owner", action);
+    if (after) {
+      pending!();
+      bump(this.counts, "reorder:completion-after-halt");
+    }
+    if (action === "pause") this.status = "paused";
+    if (action === "pause" && this.r.chance(0.7)) this.advance("resume");
     else this.ended = true;
   }
 
-  private cancel(pending?: () => void): void {
+  private cancel(): void {
     this.settle("cancelled");
-    const first = this.r.chance(0.5);
-    if (pending && first) pending();
     this.halt("owner", "cancel");
-    if (pending && !first) pending();
     this.ended = true;
   }
 
-  /** The halt loop stops every active member (teams.ts:3270-3305). A drained revision reads one journal page first. */
+  /**
+   * The halt loop stops every active member (teams.ts:3270-3305): one with steps left, or one never started. A
+   * consumed member stopped already. A drained revision reads one journal page, so a report can land on either side.
+   */
   private halt(reason: "owner" | "host", detail: string, drained?: number): void {
     for (const m of this.members) {
-      if (m.stopped) continue;
-      const next = m.steps[0];
+      if (m.stopped || (m.started && m.steps.length === 0)) continue;
+      // Work turns are only time, so a report after them can already sit in the journal the drain reads.
+      const next = m.steps.find(step => step !== "work");
       const report = m.started && m.revision === drained && next?.startsWith("report:") ? next.slice(7) : undefined;
-      const when = report === undefined ? "never" : this.r.pick(["before", "after", "after", "never"]);
+      const when = report === undefined ? "never" : this.r.pick(["before", "after", "after", "after", "never"]);
       if (when === "before") this.report(m, report!);
       this.stop(m, reason, detail);
       if (when === "after") {
@@ -390,18 +439,6 @@ export class RunScript {
     this.status = status;
   }
 
-  /** The one operation that can be in flight: a reported result or findings awaiting its completion. */
-  private pendingResult(): (() => void) | undefined {
-    const m = this.members.find(item => item.revision === this.revision && !item.stopped && (item.steps[0] === "integrate" || item.steps[0] === "complete"));
-    if (!m) return undefined;
-    const step = m.steps[0];
-    return () => {
-      bump(this.counts, "reorder:completion-after-halt");
-      if (step === "integrate") this.integrate(m);
-      else this.complete(m);
-    };
-  }
-
   private member(role: string, taskId?: string, attempt = 1, replaces?: Member["replaces"]): Member {
     const table = role === "implementer" ? IMPLEMENTER_ENDINGS : role === "scout" ? SCOUT_ENDINGS : undefined;
     let steps = table === undefined ? [] : attempt >= 3 ? [...table[0]![1]] : weighted(this.r, table);
@@ -413,7 +450,8 @@ export class RunScript {
     const prefix: Record<string, string> = { implementer: "m", scout: "s", reviewer: "r", integrator: "g", delivery: "d", "project-manager": "p" };
     const member: Member = {
       id: `${prefix[role]}${++this.serial}`, role, revision: this.revision, taskId, model: this.r.pick(MODELS), attempt, replaces,
-      started: false, stopped: false, steps: table === undefined ? [] : ["start", ...steps],
+      // Work turns emit nothing; they keep a member in flight while the others move on.
+      started: false, reported: false, stopped: false, steps: table === undefined ? [] : ["start", ...Array(this.r.int(0, 3)).fill("work"), ...steps],
     };
     this.members.push(member);
     return member;
@@ -436,6 +474,7 @@ export class RunScript {
   }
 
   private report(m: Member, kind: string): void {
+    m.reported = true;
     this.emit("member.reported", [m.id], this.ids(m), { role: m.role, reportKind: kind });
   }
 
@@ -458,7 +497,7 @@ export class RunScript {
     if (!m.started) bump(this.counts, "reorder:stop-without-start");
     m.stopped = true;
     m.steps = [];
-    this.emit("member.stopped", [m.id], this.ids(m), { role: m.role, reason, detail, reported: false });
+    this.emit("member.stopped", [m.id], this.ids(m), { role: m.role, reason, detail, reported: m.reported });
   }
 
   private stamp(): string {

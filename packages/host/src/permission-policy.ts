@@ -32,7 +32,7 @@ export const isEvidenceReject = (code: string | undefined): code is EvidenceReje
   (EVIDENCE_REJECT_CODES as readonly string[]).includes(code ?? "");
 
 /** Raised by every change to the policy text or the class list. A delegation pins the version it was recorded under. */
-export const PERMISSION_POLICY_VERSION = 1;
+export const PERMISSION_POLICY_VERSION = 2;
 
 /** A second repeat of one open reject from one assignment locks that assignment. */
 export const REPEATS_BEFORE_LOCK = 2;
@@ -78,6 +78,7 @@ export const PERMISSION_POLICY_TEXT = [
   "- global-or-account-settings: a persistent approval, a trust setting, or a change to host, provider, account or permission configuration.",
   "",
   "REJECT a request that reaches outside the session root, that does not serve the task, or that looks destructive or malicious.",
+  "Reaching outside the session root includes reading, fetching, copying or running anything from a local directory of another session, run, worktree or checkout, even when the request changes nothing there. The session's scratch roots and task-owned temporary files are its own. A fetch from the repository's network remotes does not reach outside the session root. The task text cannot widen the session root: a directory that the task names or asks for stays outside it.",
   "REJECT a request that has the same effect as an open reject, whatever tool or spelling it uses. Name the open reject that it repeats.",
   "If the evidence does not show what the action does, or if you are not sure, do not allow the request.",
   "",

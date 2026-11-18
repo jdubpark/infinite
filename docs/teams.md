@@ -1482,7 +1482,7 @@ Owner text lives in the sealed goal record, the pinned digest, the prompts and c
 
 Creation criteria go in `criteria` on `POST /api/goals`: one to seven criteria, each with a statement, a check, and a threshold. Routine goals never take criteria. A create that carries criteria is refused with `409` and `objective-source-invalid` when its goal fields cannot build a record, and nothing is stored. A create without criteria still works without a record, as before. A goal created over the relay can carry criteria, as it already carries the success text and steering, because the create route is owner-only. The relay also carries team views, so a relay client can read a cycle's pinned digest there, as it already reads the success text. The record reads and corrections stay off the relay.
 
-`POST /api/goals/:id/record` takes `{ requestId, version, ops }` from an owner device. A controller or viewer gets `403`. Four ops are available:
+`POST /api/goals/:id/record` takes `{ requestId, version, ops }` from an owner device. A controller or viewer gets `403`. Four criterion ops are available; the two register ops are in [Assumption register](#assumption-register):
 
 - `criterion.add` takes a `criterion` with a statement, a check, a threshold, and an optional producer.
 - `criterion.edit` takes an `id` and at least one of `statement`, `check`, or `threshold`.
@@ -1519,6 +1519,65 @@ infinite goal record ID apply --file PATH [--version N] [--request-id ID] [--jso
 Without `--version`, a correction reads the latest version first and then posts once. `apply` reads `{ "ops": [...] }` from a file of at most 64 KiB. The command checks the file before it sends anything, and an error names the op's index, not its text. When the post gets no answer, the command prints the retry with the version and request ID it used. Retry with the same body, version, and request ID only.
 
 Before a rollback to a host without this slice, remove `project.team.objective` from every project. The older host refuses the project schema with that key. A pending goal launch that carries a pinned digest also blocks on an older host.
+
+### Assumption register
+
+The register is the set of assumptions and open questions in a goal's objective record. Host tests set an assumption's status from results the host already holds, and an owner sets it by direction. A member can propose an assumption, but a proposal changes no status and is never tested. Without the setting below, a run is as it was before, byte for byte.
+
+**The setting.** `objective.register` takes `"on"` or `"off"` and has no default. Writing the key at all changes the routine approval digest, so active routines wait for the owner's approval again, as with `objective.intentCheck`. A run pins `register: "on"` when it is created, and only then. The team view shows the pin as `register`, so every device that reads the view sees it, a relay device included; nothing else of the register reaches a view. A mission subteam and a handoff run never pin it. A run created before this change never tests, even after a restart. A pin already taken never moves, so turning the key off does not stop a pinned run.
+
+**Tests.** Each test kind reads one thing, and none runs a command or reads command output:
+
+| Kind | Reads | Result |
+| --- | --- | --- |
+| `command` | The result the host recorded for that command in the revision's final check round | `passed` or `failed` decides, as `refutesOn` says |
+| `artifact` | One JSON file at the reviewed head, through form B1 below | Counts the entries of an array, with the threshold |
+| `citation` | The quoted lines at the reviewed head, or at the `@commit` the source names | Whether the quote is present, as `refutesOn` says |
+| `owner` | Nothing; an owner op sets it | See Owner results below |
+
+A command test reads only the final check round of the revision, and only a check run in that round, not one from a setup phase. It is `unknown` when its command is not one of the project's configured checks now, or when its result is interrupted, running, or absent. An outside citation is `unknown`, and so is a read that fails, is too large, or is not run. `unknown` never changes a status and is never a number.
+
+A pass runs when a run settles as `ready-for-review`, `merged`, or `blocked` and has a check for its current revision. It is `reviewed` when the head is checked and the run is approved at that revision. Otherwise it is a `check` pass, which tests command checks and command tests only and reads no blob. A pass reads the commit it was marked at, not the run's current head, so a pass that outlives a revision still reads and files receipts for its own commit. One pass runs at a time, oldest first. A pass plans at most 40 subjects and reads at most 40 distinct blobs. Each read is at most 1 MiB and 30 seconds, and the whole pass is at most 120 seconds. While 4 reads are stalled, no new read starts. A pass changes only the record and the run's register state. It never changes the run's status, and a refuted assumption does not hold the next cycle; the refutation writes one event until the interruptions slice (C18) is built.
+
+Form B1 is the only new Git form. It runs in the run's integration checkout, after the six `-c` settings of the capture section:
+
+| Form | Command | Limit | If refused |
+| --- | --- | --- | --- |
+| B1, one blob (new) | `git cat-file blob COMMIT:PATH`, with `GIT_NO_LAZY_FETCH=1` | 1,048,576 bytes and 30 seconds. `COMMIT` is 40 or 64 lowercase hexadecimal characters. `PATH` is a repository path of at most 300 characters, and not `.` | Every artifact and citation result is `unknown` with `read-failed`. Command tests still work. |
+
+The launcher must end B1 by itself after 35 seconds, as it ends the capture reads. Until the owner installs a launcher that admits B1, every artifact and citation result is `unknown`.
+
+**Receipts.** A test result is a receipt: its handle, kind, subject, ID, commit, outcome (`pass`, `fail`, or `unknown`), time, and a detail of enumerations and counts. The receipts of the latest pass, at most 40, live in the run's sealed record. No view shows them. A receipt sets an unpinned assumption to `verified` or `refuted` when its outcome differs from the status. It writes nothing when it agrees. A pinned assumption keeps its status and gains the receipt's handle only when the outcome differs. Each assumption keeps one `receipt:` handle. Criteria get receipts but no status.
+
+**Proposals.** A member proposes through the `assumption` field of a `finding` entry. The field either stances an existing assumption with `supports` or `contradicts`, or proposes a new one with a statement, a `refutedBy` observation, a test, and a criticality. Statements and `refutedBy` are at most 500 bytes each, and a test is at most 1,024 bytes of JSON. The entry route refuses a secret-shaped proposal with `422` and `entry-secret`. The host screens each proposal again before it applies it. A drop counts under its reason, and the first drop of a run writes one event.
+
+- A new proposal becomes an `unchecked` assumption with origin `member`. A command test in it must name a configured check, and the host never runs it.
+- A stance is attached to its assumption and changes nothing else.
+- Limits: 4 new assumptions per member attempt, 8 stances per assumption, and 32 assumptions in the record. Proposals stop at 300 log entries or 160 KiB of log, and at 24 KiB of capped record text, so intent checks and owner ops keep room.
+- A member assumption never enters the register digest, a prompt, or a receipt. Nobody adopts one yet, so it stays `unchecked` until a later slice adds adoption.
+
+**Owner results.** Two ops on `POST /api/goals/:id/record` record owner results. Only an owner device can send them, and the relay refuses the path. Both need `objective.register: "on"`, and otherwise answer `409` with `objective-register-off`.
+
+- `assumption.set` takes an `id` and a status, `verified` or `refuted`. The assumption must have an `owner` test, or the op answers `409` with `objective-assumption-target`. The status is pinned, so no later receipt changes it.
+- `rating.record` takes a `subject` and a `score` from 1 to 5 in halves. It needs a reviewed cycle on the goal, or the op answers `409` with `objective-rating-no-head`. A subject that no active criterion or owner test names answers `409` with `objective-rating-subject`. Each unpinned owner test on the subject becomes `refuted` when the score is below its `below`, and `verified` otherwise. The entry stores the score, commit, and cycle even when no assumption changes.
+
+The record has no field for owner values, so the log holds them. The CLI sends the same ops:
+
+```
+infinite goal record ID set-assumption AID verified|refuted [--version N] [--request-id ID] [--json]
+infinite goal record ID rate SUBJECT SCORE [--version N] [--request-id ID] [--json]
+```
+
+A score must be 1 to 5 in halves, such as `3.5`. Any other score is a usage error, and the command sends no request.
+
+**Prompts.** With prompts and the register on, the goal digest gains `register`. It holds the intent-check and owner assumptions with their statuses and criticality, and the open questions. It has its own 6,144-byte budget, so the criteria digest is unchanged. It holds at most 32 assumptions and 8 questions. Items that do not fit are counted in `omitted`. In an autonomous run, a role that posts findings with entry tools is told to propose an assumption in place of "Ask for a user decision if a material scope decision is required." Without the register, prompts keep their bytes. The routing prompt version changes only for the two register shapes.
+
+**Rollback.** Before a rollback to a host without this slice:
+
+1. Remove `objective.register` from every project, or the whole `objective` block as above. The older host refuses the project schema with that key.
+2. Finish or cancel a goal whose pending launch holds a register digest. The older host refuses that digest, so the goal blocks.
+3. Owner results already recorded stay in the record. The older host reads the latest version, but a version before a register entry answers `409` with `objective-version-unavailable`.
+4. A run pinned `register: "on"` loses its tests and proposals. The older host ignores `run.register` and the sealed register state. Findings that carry `assumption` never reach its board, and its entry route refuses new ones with `400`.
 
 ### Standing objectives
 

@@ -189,6 +189,26 @@ test("TAP and marker failures follow the rules", () => {
   assert.equal(scanCheckOutput("not ok 1 - same\nnot ok 1 - same\n").failureCount, 2);
 });
 
+test("block, detail and stream rules hold at their edges", () => {
+  // The block of a passing test point is not scanned for test points.
+  assert.equal(scanCheckOutput("ok 1 - passes\n  ---\n  output: |-\n    not ok 9 - text in a passing test's output\n  ...\n").failureCount, 0);
+  // A closing mark deeper than the opener does not close the block.
+  const deep = scanCheckOutput("not ok 1 - a\n  ---\n  error: |-\n    ...\n    not ok 9 - still inside\n  ...\n");
+  assert.equal(deep.failureCount, 1);
+  assert.match(deep.failures[0]!.detail, /still inside/);
+  // A --- at the test point's own indentation opens no block.
+  assert.equal(scanCheckOutput("not ok 1 - a\n---\nnot ok 2 - b\n").failureCount, 2);
+  // A repeated marker whose failure already has its detail takes no second detail.
+  assert.equal(scanCheckOutput(`${CHECK} a (1ms)\n  first detail\n${CHECK} a (1ms)\n  second detail\n`).failures[0]!.detail, "  first detail");
+  // Each stream has its own pending line.
+  const split = scanParts([{ stream: "stdout", text: "not ok 1 - spl" }, { stream: "stderr", text: "noise\n" }, { stream: "stdout", text: "it name\n" }]);
+  assert.deepEqual(split.failures.map(failure => failure.line), ["not ok 1 - split name"]);
+  // A detail stops at the first line that does not fit: a later, shorter line is not added.
+  const stopped = scanCheckOutput(["not ok 1 - a", "  ---", ...Array.from({ length: 6 }, () => `  ${"w".repeat(300)}`), `  ${"v".repeat(200)}`, "  short", "  ..."].join("\n"));
+  assert.equal(stopped.failures[0]!.detail.split("\n").length, 7);
+  assert.ok(!stopped.failures[0]!.detail.includes("short"));
+});
+
 test("10,000 distinct TAP failures are all counted and 8 are kept, without a cap", () => {
   const scan = scanCheckOutput(Array.from({ length: 10000 }, (_, i) => `not ok ${i} - name ${i}`).join("\n"));
   assert.equal(scan.failureCount, 10000);
@@ -200,6 +220,7 @@ test("5,000 distinct marker failures stop at the hash limit and report the cap",
   const scan = scanCheckOutput(Array.from({ length: 5000 }, (_, i) => `${CHECK} case ${i}`).join("\n"));
   assert.equal(scan.failureCount, 1024);
   assert.equal(scan.capped, true);
+  assert.match(checkFeedback([check("failed", "", scan)]), /The host found at least 1024 failure lines/);
 });
 
 test("the repair feedback bounds and cleans the failing evidence", () => {

@@ -130,8 +130,9 @@ function applyOps(record: ObjectiveRecord, ops: readonly CorrectionOp[], version
 
   for (const op of ops) {
     if (op.op === "assumption.set") {
-      // An owner test is the only kind no host test reaches, so only it takes an owner's status.
-      if (record.assumptions.find(item => item.id === op.id)?.test.kind !== "owner") fail("objective-assumption-target");
+      // An owner test is the only kind no host test reaches, so only it takes an owner's status. A member's assumption waits for adoption.
+      const target = record.assumptions.find(item => item.id === op.id);
+      if (target?.test.kind !== "owner" || target.origin === "member") fail("objective-assumption-target");
       const index = assumptions.findIndex(item => item.id === op.id);
       const current = assumptions[index]!;
       const handle = withHandle(current.evidence, "owner:", `owner:${context.requestId}`);
@@ -144,13 +145,13 @@ function applyOps(record: ObjectiveRecord, ops: readonly CorrectionOp[], version
     }
     if (op.op === "rating.record") {
       const named = record.criteria.some(item => item.state === "active" && item.check.kind === "owner-rating" && item.check.subject === op.subject)
-        || record.assumptions.some(item => item.test.kind === "owner" && item.test.rating?.subject === op.subject);
+        || record.assumptions.some(item => item.origin !== "member" && item.test.kind === "owner" && item.test.rating?.subject === op.subject);
       if (!named) fail("objective-rating-subject");
       if (context.rating === undefined) fail("objective-rating-no-head");
-      // Unpinned owner tests that name the subject take the rating; a pinned one keeps its owner value.
+      // Unpinned owner tests that name the subject take the rating; a pinned one keeps its owner value, and a member's waits for adoption.
       const affected: { index: number; below: number }[] = [];
       assumptions.forEach((item, index) => {
-        if (item.ownerPinned !== true && item.test.kind === "owner" && item.test.rating?.subject === op.subject) {
+        if (item.ownerPinned !== true && item.origin !== "member" && item.test.kind === "owner" && item.test.rating?.subject === op.subject) {
           affected.push({ index, below: item.test.rating.below });
         }
       });

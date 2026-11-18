@@ -10,10 +10,14 @@ import type { Assumption, LogEntry, ObjectiveRecord } from "./objective-types.js
 import { TeamError } from "./team-workspace.js";
 import type { TeamCommand } from "./team-types.js";
 
-/** Caps of a member's proposals. `log` is the share that proposals may fill; intent checks, receipts, and owner ops keep the rest. */
+/**
+ * Caps of a member's proposals. `log`, `cappedBytes`, and `assumptions` are the shares that proposals and stances may fill;
+ * intent checks, receipts, and owner ops keep the rest. 16 of the record's 32 assumptions leave room for one intent check's 16 items.
+ */
 export const PROPOSAL_LIMITS = {
   log: { entries: 300, bytes: 160 * 1024 },
   cappedBytes: 24 * 1024,
+  assumptions: 16,
   addedPerEntry: 4,
   attachedPerEntry: 16,
 } as const;
@@ -80,8 +84,9 @@ function createdAssumption(id: string, propose: Extract<MemberProposal, { propos
 
 /**
  * One member's page of proposals, applied in journal order at one version up. Each proposal is screened once, in this order:
- * a repeated entry is skipped and not counted; a secret drops; a stance needs an existing assumption and a free slot; a new
- * proposal needs a valid test, the member's cap, the assumption cap, and the capped-bytes cap. Member text stays in the record.
+ * a repeated entry is skipped and not counted; a secret drops; a stance needs an existing assumption, a free slot, and the
+ * capped-bytes share; a new proposal needs a valid test, the member's cap, the members' share and the record's cap of assumptions,
+ * and the capped-bytes share. Member text stays in the record.
  * A page that changes nothing returns no record. A log or schema refusal counts every proposal of the page under `log` or `refused`.
  * Never throws.
  */
@@ -127,10 +132,16 @@ export function applyProposals(record: ObjectiveRecord, proposals: readonly Prop
         drop("stances");
         continue;
       }
-      assumptions[index] = {
+      const stanced = [...assumptions];
+      stanced[index] = {
         ...current,
         proposals: [...current.proposals, { entryId: item.entryId, stance: field.stance, summary: item.summary, authorRole: item.authorRole }],
       };
+      if (cappedBytes({ ...record, assumptions: stanced }) > PROPOSAL_LIMITS.cappedBytes) {
+        drop("bytes");
+        continue;
+      }
+      assumptions = stanced;
       attached.push({ id: field.id, entryId: item.entryId });
       seen.add(item.entryId);
       applied(item.revision);
@@ -145,7 +156,7 @@ export function applyProposals(record: ObjectiveRecord, proposals: readonly Prop
       drop("attempt");
       continue;
     }
-    if (assumptions.length >= OBJECTIVE_LIMITS.assumptions) {
+    if (assumptions.length >= OBJECTIVE_LIMITS.assumptions || assumptions.filter(candidate => candidate.origin === "member").length >= PROPOSAL_LIMITS.assumptions) {
       drop("assumptions");
       continue;
     }

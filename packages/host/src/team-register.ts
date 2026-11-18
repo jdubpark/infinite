@@ -85,6 +85,10 @@ function countsOf(receipts: readonly ObjectiveReceipt[], changed: number): { pas
 
 const isLogFull = (error: unknown): boolean => error instanceof TeamError && error.code === "objective-log-full";
 
+/** The same mark: continue and verification recovery assign back a structuredClone of the holder, so its pass is a copy. */
+const sameMark = (live: RegisterPass | undefined, pass: RegisterPass): live is RegisterPass =>
+  live !== undefined && (live === pass || (live.revision === pass.revision && live.kind === pass.kind && live.markedAt === pass.markedAt));
+
 /**
  * The host's test runtime for one run set. A settled revision gets one pass: the host reads the record, plans its subjects and reads,
  * reads each blob outside the serial queue, then applies the receipts through the queue. Member proposals are screened and applied
@@ -140,7 +144,9 @@ export class TeamRegister {
       while (this.running === undefined && !this.closed) {
         const job = this.queue.shift();
         if (job === undefined) return;
-        if (job.holder.register?.pass !== job.pass || job.pass.state !== "pending") continue;
+        const live = job.holder.register?.pass;
+        if (!sameMark(live, job.pass) || live.state !== "pending") continue;
+        job.pass = live;
         this.start(job);
         return;
       }
@@ -333,7 +339,10 @@ export class TeamRegister {
 
   /** The job still belongs to its run and is the holder's latest pass, and the register is open. */
   private current(job: Job): boolean {
-    return !this.closed && this.host.holder(job.holder.run.id) === job.holder && job.holder.register?.pass === job.pass;
+    const live = job.holder.register?.pass;
+    if (this.closed || this.host.holder(job.holder.run.id) !== job.holder || !sameMark(live, job.pass)) return false;
+    job.pass = live;
+    return true;
   }
 }
 

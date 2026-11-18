@@ -212,6 +212,19 @@ test("bad proposals are dropped and counted, never echoed", () => {
   const overflow = applyProposals(heavy, [proposal("scout-1", "entry-bytes", propose("z".repeat(500)))], CONTEXT);
   assert.equal(overflow.dropped.bytes, 1);
 
+  // Stances count against the same share: top the record up to within one stance of it, then attach one with a full summary.
+  const small = (index: number) => assumption(`a${index}`, { statement: "x".repeat(100), refutedBy: "y" });
+  const topped = [...fillers];
+  while (sized([...topped, small(topped.length + 1)]) <= PROPOSAL_LIMITS.cappedBytes) topped.push(small(topped.length + 1));
+  const stanceOver = applyProposals(recordWith(topped), [proposal("scout-1", "entry-stance-bytes", { id: "a1", stance: "contradicts" }, { summary: "s".repeat(240) })], CONTEXT);
+  assert.equal(stanceOver.dropped.bytes, 1, "a stance past the capped-bytes share drops as bytes");
+  assert.equal(stanceOver.record, undefined);
+
+  // Members hold at most 16 of the 32 assumptions, so one intent check's 16 items still fit.
+  const memberHeld = recordWith(Array.from({ length: 16 }, (_, index) => assumption(`a${index + 1}`, { origin: "member" })));
+  const seventeenth = applyProposals(memberHeld, [proposal("scout-1", "entry-share", propose("Seventeenth member assumption"))], CONTEXT);
+  assert.equal(seventeenth.dropped.assumptions, 1, "a seventeenth member assumption drops as assumptions");
+
   const logFull = recordWith([assumption("a2")], [
     ...v1().log,
     ...Array.from({ length: PROPOSAL_LIMITS.log.entries - 1 }, (_, index) => ({

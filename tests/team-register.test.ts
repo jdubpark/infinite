@@ -272,6 +272,27 @@ test("a pass never outlives its run or its revision", async () => {
       "the receipt is a fact about the marked commit");
   }
 
+  // The holder is copied and assigned back, as continue and verification recovery do, before the pass starts or while it reads:
+  // the pass settles once, on the copy the holder now holds, and nothing stays pending.
+  for (const when of ["queued", "reading"] as const) {
+    const w = world();
+    const holder = holderOf(w, runOf(), baseRecord([artifactAssumption("a2", ENTRIES, 2)]));
+    w.reader.files.set(`${HEAD}:${ENTRIES}`, json({ entries: [] }));
+    const copyBack = () => {
+      const next = structuredClone(holder);
+      Object.assign(next.run, { status: "planning", revision: 2 });
+      Object.assign(holder, next);
+    };
+    if (when === "reading") w.reader.onRead = copyBack;
+    w.register.mark(holder);
+    if (when === "queued") copyBack();
+    w.register.drain();
+    await w.register.idle();
+    assert.equal(w.register.pending(RUN), false, `${when}: the copied pass is not left pending`);
+    assert.equal(holder.register?.pass?.state, "done", when);
+    assert.equal(w.port.records.get(GOAL_ID)?.version, 2, `${when}: one write, from the pass marked before the copy`);
+  }
+
   // A goal record write that fails: skipped write-failed, one event, and the receipts are kept.
   {
     const w = world();

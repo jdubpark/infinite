@@ -532,6 +532,10 @@ test("the owner sets an owner-test assumption and pins it", () => {
   const missing = refusal(() => applyOwnerOps(start, correction(1, [{ op: "assumption.set", id: "a9", status: "verified" }]), context));
   assert.equal(missing.status, 409);
   assert.equal(missing.code, "objective-assumption-target", "a missing assumption");
+  const proposed = withAssumptions(start, [...start.assumptions, assumptionOf("a8", { kind: "owner" }, { origin: "member" })]);
+  const memberSet = refusal(() => applyOwnerOps(proposed, correction(1, [{ op: "assumption.set", id: "a8", status: "verified" }]), context));
+  assert.equal(memberSet.status, 409);
+  assert.equal(memberSet.code, "objective-assumption-target", "a member's assumption waits for adoption");
   assert.equal(correctionSchema.safeParse({ requestId: REQUEST, version: 1, ops: [{ op: "assumption.set", id: "a4", status: "assumed" }] }).success, false,
     "the schema refuses status assumed");
 });
@@ -589,6 +593,18 @@ test("a rating stamps the reviewed head and moves unpinned owner tests", () => {
   const unnamed = refusal(() => applyOwnerOps(start, correction(1, [{ op: "rating.record", subject: "tone", score: 3.5 }]), { ...context, rating: stamp }));
   assert.equal(unnamed.status, 409);
   assert.equal(unnamed.code, "objective-rating-subject");
+
+  // A member's owner test takes no rating: its threshold is the member's, and the assumption waits for adoption.
+  const proposed = withAssumptions(start, [...start.assumptions,
+    assumptionOf("a8", { kind: "owner", rating: { subject: "quality", below: 1 } }, { origin: "member" }),
+    assumptionOf("a9", { kind: "owner", rating: { subject: "tone", below: 5 } }, { origin: "member" })]);
+  const memberRated = applyOwnerOps(proposed, correction(1, [{ op: "rating.record", subject: "quality", score: 2 }]), { ...context, rating: stamp });
+  assert.equal(find(memberRated, "a8").status, "unchecked", "a member's owner test keeps its status");
+  assert.deepEqual(find(memberRated, "a8").evidence, []);
+  assert.deepEqual((memberRated.log.at(-1)!.after as { inline: { changed: unknown[] } }).inline.changed,
+    [{ id: "a5", status: "refuted" }, { id: "a6", status: "refuted" }], "only the intent check's owner tests change");
+  const memberOnly = refusal(() => applyOwnerOps(proposed, correction(1, [{ op: "rating.record", subject: "tone", score: 4 }]), { ...context, rating: stamp }));
+  assert.equal(memberOnly.code, "objective-rating-subject", "a subject only a member's assumption names is named by nothing");
 
   const scoreAt = (score: number) => ({ op: "rating.record", subject: "quality", score });
   for (const score of [0, 5.5, 3.3]) {

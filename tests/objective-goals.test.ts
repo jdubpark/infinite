@@ -425,6 +425,7 @@ test("a cycle pins the digest it launched with", async () => {
     const teamId = goals.get(created.id).activeTeamId;
     assert.ok(teamId, "the tick launched the first cycle");
     assert.equal(teams.get(teamId).goal?.record?.version, 2);
+    assert.equal("register" in teams.get(teamId).goal!.record!, false, "with the register off, the launch carries no register digest");
 
     await goals.correctObjective(created.id, correction(2, [add(judgement("Owners are named"))]));
     assert.equal(teams.get(teamId).goal?.record?.version, 2);
@@ -454,6 +455,73 @@ test("a cycle pins the digest it launched with", async () => {
     assert.equal("record" in legacyTeam.goal!, false);
     reopenedTeams.close();
   } finally { goals?.close(); f.close(); }
+});
+
+/** Turns both objective switches on for this fixture's project, as a register run needs. */
+function setRegisterOn(f: ReturnType<typeof fixture>) {
+  f.config.projects[0]!.team = { ...f.config.projects[0]!.team!, objective: { prompts: "on", register: "on" } } as Config["projects"][number]["team"];
+}
+
+/** A goal's record with `items` as its assumptions, resealed by hand: the writer does not take these shapes. */
+function recordWithAssumptions(goal: ProductGoal, items: unknown[]): ObjectiveRecord {
+  const { digest: _digest, ...body } = goalRecord(goal, "2026-11-18T10:00:00.000Z", "created") as ObjectiveRecord;
+  const next = { ...body, assumptions: items };
+  return { ...next, digest: recordDigest(next as Parameters<typeof recordDigest>[0]) };
+}
+const assumptionOf = (id: string, origin: "intent-check" | "owner" | "member") => ({
+  id, statement: `Statement ${id}.`, status: "unchecked", origin, criticality: "plan", refutedBy: "The owner refutes it.", test: { kind: "owner" }, evidence: [], proposals: [],
+});
+
+test("a launch with the register on carries the register digest", async () => {
+  const f = fixture(), teams = f.openTeam();
+  setRegisterOn(f);
+  let goals: GoalService | undefined;
+  try {
+    goals = new GoalService(f.config, f.key, teams);
+    const created = await goals.create(createInput());
+    goals.close();
+    const stored = f.readRecord<StoredShape>("goal", created.id);
+    f.writeRecord("goal", created.id, { ...stored, objectiveRecord: recordWithAssumptions(stored.goal, [
+      assumptionOf("a1", "intent-check"), assumptionOf("a2", "owner"), assumptionOf("a3", "member"),
+    ]) });
+
+    goals = new GoalService(f.config, f.key, teams);
+    goals.start();
+    await barrier(goals, created.id);
+    const teamId = goals.get(created.id).activeTeamId;
+    assert.ok(teamId, "the tick launched the cycle");
+    const register = teams.get(teamId).goal?.record?.register;
+    assert.ok(register, "the launched run carries the register digest");
+    assert.deepEqual(register.assumptions.map(item => item.id).sort(), ["a1", "a2"]);
+    assert.equal(JSON.stringify(teams.get(teamId).goal).includes("Statement a3."), false, "member text never reaches the launch context");
+  } finally { goals?.close(); teams.close(); f.close(); }
+});
+
+test("an owner rating stamps the latest reviewed cycle's head", async () => {
+  const f = fixture(), teams = f.openTeam();
+  setRegisterOn(f);
+  let goals: GoalService | undefined;
+  try {
+    goals = new GoalService(f.config, f.key, teams);
+    const created = await goals.create(createInput());
+    await goals.correctObjective(created.id, correction(1, [add({ statement: "The quality rating reaches three", check: { kind: "owner-rating", subject: "quality" }, threshold: { kind: "score", min: 3, of: 5 } } as never)]));
+    goals.close();
+    // Cycle 4 is merged with head H4: the latest reviewed cycle, so its head and number are the rating's stamp.
+    const stored = f.readRecord<StoredShape>("goal", created.id);
+    const cycles = [{ teamId: randomUUID(), cycle: 4, goalRevision: 1, status: "merged", startedAt: "2026-11-18T10:00:00.000Z", memberCount: 1, headCommit: "H4" }];
+    f.writeRecord("goal", created.id, { ...stored, goal: { ...stored.goal, cycles } });
+
+    goals = new GoalService(f.config, f.key, teams);
+    const rated = await goals.correctObjective(created.id, correction(2, [{ op: "rating.record", subject: "quality", score: 3.5 }]));
+    assert.equal(rated.version, 3);
+    const entry = f.readRecord<StoredShape & { objectiveRecord: ObjectiveRecord }>("goal", created.id).objectiveRecord.log.findLast(item => item.op === "rating.recorded");
+    assert.ok(entry && "inline" in (entry.after ?? {}), "the rating is recorded inline");
+    const value = (entry!.after as { inline: { subject: string; score: number; commit: string; cycle: number } }).inline;
+    assert.equal(value.subject, "quality");
+    assert.equal(value.score, 3.5);
+    assert.equal(value.commit, "H4");
+    assert.equal(value.cycle, 4);
+  } finally { goals?.close(); teams.close(); f.close(); }
 });
 
 test("an unreadable record launches without a digest", async () => {

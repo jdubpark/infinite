@@ -577,7 +577,7 @@ test("a rebuild undoes the register", () => {
 test("register refusals have fixed codes and sentences", () => {
   const expected: [ObjectiveErrorCode, number, string][] = [
     ["objective-register-off", 409, "Turn on the assumption register for this goal's project before recording owner results."],
-    ["objective-assumption-target", 409, "A correction names an assumption that is missing or has no owner test."],
+    ["objective-assumption-target", 409, "A correction names an assumption that is missing, has no owner test, or was proposed by a member."],
     ["objective-rating-subject", 409, "A rating names a subject that no active criterion or owner test names."],
     ["objective-rating-no-head", 409, "The goal has no reviewed cycle to rate yet."],
   ];

@@ -1825,8 +1825,8 @@ One new form needs the owner's launcher approval. No other form changes.
 
   It adds at most about 2.1 KiB to a finding body, inside the body's 12 KiB. The entry tool's input schema grows by about 1 KiB on runs with entry tools.
 - **Proposals in the record.**
-  - At most 4 new assumptions per attempt (member), 8 stances per assumption, and 32 assumptions.
-  - Proposals write only while the record's capped bytes stay at most 24 KiB, and the log stays under 300 entries and 160 KiB.
+  - At most 4 new assumptions per attempt (member), 8 stances per assumption, 16 member assumptions, and 32 assumptions. *(The member share was added at review, so one intent check's 16 items still fit.)*
+  - Proposals and stances write only while the record's capped bytes stay at most 24 KiB, and the log stays under 300 entries and 160 KiB.
 - **Log entries.**
   - `test.recorded`: at most 8 assumptions each.
   - `rating.recorded`: at most 8 assumptions each.
@@ -2216,7 +2216,7 @@ export const memberProposalSchema: z.ZodType<MemberProposal>;
 export const REGISTER_OPS = { tested: "test.recorded", proposed: "proposal.recorded", set: "assumption.set", rated: "rating.recorded" } as const;
 // ObjectiveErrorCode and OBJECTIVE_ERRORS gain:
 //   "objective-register-off":      409 "Turn on the assumption register for this goal's project before recording owner results."
-//   "objective-assumption-target": 409 "A correction names an assumption that is missing or has no owner test."
+//   "objective-assumption-target": 409 "A correction names an assumption that is missing, has no owner test, or was proposed by a member."
 //   "objective-rating-subject":    409 "A rating names a subject that no active criterion or owner test names."
 //   "objective-rating-no-head":    409 "The goal has no reviewed cycle to rate yet."
 export function rebuildVersion(record: ObjectiveRecord, version: number): ObjectiveRecord;   // signature unchanged

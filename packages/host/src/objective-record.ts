@@ -54,7 +54,7 @@ export const OBJECTIVE_ERRORS: Record<ObjectiveErrorCode, { status: 400 | 404 | 
   "objective-log-full": { status: 409, message: "The record's log is full. Start a new goal with consolidated criteria." },
   "objective-digest-too-large": { status: 409, message: "The active criteria would be over the 6 KiB prompt digest." },
   "objective-register-off": { status: 409, message: "Turn on the assumption register for this goal's project before recording owner results." },
-  "objective-assumption-target": { status: 409, message: "A correction names an assumption that is missing or has no owner test." },
+  "objective-assumption-target": { status: 409, message: "A correction names an assumption that is missing, has no owner test, or was proposed by a member." },
   "objective-rating-subject": { status: 409, message: "A rating names a subject that no active criterion or owner test names." },
   "objective-rating-no-head": { status: 409, message: "The goal has no reviewed cycle to rate yet." },
 };

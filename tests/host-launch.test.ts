@@ -208,6 +208,21 @@ test("codex gets -c hook overrides, notify, osc notifications and trust bypass",
   assert.equal(launch.args.at(-1), "do it");
 });
 
+test("codex with hooks off keeps only the turn-end notify route for a hook listener (INF-213)", () => {
+  const off = { claude: true, codex: false };
+  const launch = buildLaunch("codex", { command: "codex", args: [] }, "do it", hooks, relay, off);
+  const notify = launch.args.filter((a) => a.startsWith("notify="));
+  assert.deepEqual(notify, [`notify=["node","/opt/infinite/packages/host/dist/hook-relay.js","codex-notify"]`]);
+  assert.ok(!launch.args.includes("--dangerously-bypass-hook-trust"));
+  assert.ok(!launch.args.some((a) => a.startsWith("hooks.")));
+  assert.ok(!launch.args.some((a) => a.startsWith("tui.notification")));
+  assert.equal(launch.args.at(-1), "do it");
+  const bare = buildLaunch("codex", { command: "codex", args: [] }, "", null, relay, enabled);
+  assert.ok(!bare.args.some((a) => a.startsWith("notify=")));
+  const on = buildLaunch("codex", { command: "codex", args: [] }, "", hooks, relay, enabled);
+  assert.equal(on.args.filter((a) => a.startsWith("notify=")).length, 1);
+});
+
 test("codex dev relay runs the TypeScript file through an absolute tsx loader", () => {
   const launch = buildLaunch("codex", { command: "codex", args: [] }, "", hooks, "/repo/packages/host/src/hook-relay.ts", enabled);
   const hook = launch.args.find((a) => a.startsWith("hooks.PermissionRequest="))!;
@@ -391,7 +406,7 @@ test("the agent-side Claude trust entry records only the folder it is launched i
 
 test("disabled hooks or no hook server leave the profile untouched", () => {
   assert.deepEqual(buildLaunch("claude", { command: "claude", args: [] }, "p", null, relay, enabled).args, ["p"]);
-  assert.deepEqual(buildLaunch("codex", { command: "codex", args: [] }, "", hooks, relay, { claude: true, codex: false }).args, []);
+  assert.deepEqual(buildLaunch("codex", { command: "codex", args: [] }, "", hooks, relay, { claude: true, codex: false }).args, ["-c", 'notify=["node","/opt/infinite/packages/host/dist/hook-relay.js","codex-notify"]']);
   assert.deepEqual(buildLaunch("opencode", { command: "opencode", args: [] }, "p", hooks, relay, enabled).args, ["--prompt", "p"]);
   assert.deepEqual(buildLaunch("grok", { command: "grok", args: ["-x"] }, "", hooks, relay, enabled).args, ["-x"]);
 });
@@ -418,7 +433,7 @@ test("codex hooks stay off unless the config turns them on", () => {
     assert.deepEqual(parse({ attention: { hooks: { claude: false } } }).attention?.hooks, { claude: false, codex: false });
     assert.deepEqual(parse({ attention: { hooks: { codex: true } } }).attention?.hooks, { claude: true, codex: true });
     // With the defaults, Codex launches exactly as its profile says.
-    assert.deepEqual(buildLaunch("codex", { command: "codex", args: ["-a", "on-request"] }, "go", hooks, relay, DEFAULT_HOOKS).args, ["-a", "on-request", "go"]);
+    assert.deepEqual(buildLaunch("codex", { command: "codex", args: ["-a", "on-request"] }, "go", hooks, relay, DEFAULT_HOOKS).args, ["-a", "on-request", "-c", 'notify=["node","/opt/infinite/packages/host/dist/hook-relay.js","codex-notify"]', "go"]);
     assert.ok(buildLaunch("claude", { command: "claude", args: [] }, "", hooks, relay, DEFAULT_HOOKS).args.includes("--settings"));
   } finally {
     rmSync(root, { recursive: true, force: true });

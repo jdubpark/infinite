@@ -29,6 +29,47 @@ test("transcript tail joins records split across chunks and never repeats a mess
   assert.deepEqual(parseTranscriptRecord(JSON.stringify({ type: "assistant", uuid: "s1", isSidechain: true, message: { content: "subagent" } }), "claude", 0), []);
 });
 
+test("a Codex turn-end notify with hooks off gets its rollout read by the worker (INF-213)", async () => {
+  const home = mkdtempSync(join(tmpdir(), "infinite-codex-notify-"));
+  const thread = "019a1b2c-3d4e-7f80-9a1b-2c3d4e5f6a7b";
+  const day = join(home, ".codex", "sessions", "2026", "11", "18");
+  mkdirSync(day, { recursive: true });
+  const rollout = join(day, `rollout-2026-11-18T09-00-00-${thread}.jsonl`);
+  const text = Array.from({ length: 3 }, (_, i) => JSON.stringify({ type: "response_item", n: i }) + "\n").join("");
+  writeFileSync(rollout, text);
+  const payloads: Record<string, unknown>[] = [];
+  let received = "", ended = false;
+  const server = await startHookServer({
+    token: "t",
+    onPayload: (route, body): HookReply | void => {
+      const b = body as Record<string, unknown>;
+      if (route === "codex-notify") {
+        payloads.push(b);
+        return { transcript: { path: String(b.transcript_path), after: 0 } };
+      }
+      if (route === "transcript") {
+        if (b.offset !== Buffer.byteLength(received)) return { after: Buffer.byteLength(received) };
+        if (b.text !== undefined) received += String(b.text);
+        if (b.end === true) ended = true;
+        return { after: Buffer.byteLength(received) };
+      }
+    },
+    onError: () => assert.fail("hook error"),
+  });
+  try {
+    const notice = { type: "agent-turn-complete", "thread-id": thread, "turn-id": "turn-1", cwd: "/home/dev/projects/infinite" };
+    await relay("codex-notify", JSON.stringify(notice), { url: server.url, token: "t", home });
+    assert.equal(payloads.length, 1);
+    assert.equal(payloads[0].transcript_path, rollout, "the relay names the rollout it found by thread id");
+    assert.equal(payloads[0]["turn-id"], "turn-1");
+    assert.equal(received, text, "the rollout bytes arrive in order");
+    assert.equal(ended, true, "the relay closes the stream with an end mark");
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("relay forwards the hook, then streams the transcript from the worker's cursor in order", async () => {
   const root = mkdtempSync(join(tmpdir(), "infinite-relay-"));
   const path = join(root, "conversation.jsonl");

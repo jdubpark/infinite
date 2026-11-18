@@ -400,24 +400,27 @@ export function buildLaunch(
   // A served headless session: the permission channel's hooks and the signal hooks in one settings layer, with no
   // user, project or local settings loaded, so no settings file can switch them off or answer before them.
   if (hooks && provider === "claude" && channel) args.push(...headlessChannelArgs(relayPath, enabled.claude));
-  if (hooks && provider === "codex" && enabled.codex) {
-    const command = [...relay, "codex"].join(" ");
-    for (const event of CODEX_EVENTS)
-      args.push(
-        "-c",
-        `hooks.${event}=[{hooks=[{type="command",command="${command}"}]}]`,
-      );
-    args.push("--dangerously-bypass-hook-trust");
+  if (hooks && provider === "codex") {
+    // notify needs no hook trust, so it stays on when Codex hooks are off; turn-end usage then needs no bypass (INF-213).
     args.push(
       "-c",
       `notify=[${[...relay, "codex-notify"].map((a) => `"${a}"`).join(",")}]`,
     );
-    args.push(
-      "-c",
-      `tui.notifications=["agent-turn-complete","approval-requested","async-question"]`,
-    );
-    args.push("-c", `tui.notification_method="osc9"`);
-    args.push("-c", `tui.notification_condition="always"`);
+    if (enabled.codex) {
+      const command = [...relay, "codex"].join(" ");
+      for (const event of CODEX_EVENTS)
+        args.push(
+          "-c",
+          `hooks.${event}=[{hooks=[{type="command",command="${command}"}]}]`,
+        );
+      args.push("--dangerously-bypass-hook-trust");
+      args.push(
+        "-c",
+        `tui.notifications=["agent-turn-complete","approval-requested","async-question"]`,
+      );
+      args.push("-c", `tui.notification_method="osc9"`);
+      args.push("-c", `tui.notification_condition="always"`);
+    }
   }
   if (trustedCwd && provider === "codex") args.push(...codexTrustArgs(trustedCwd));
   if (prompt)

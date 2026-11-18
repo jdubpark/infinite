@@ -48,8 +48,8 @@ test("with Codex hooks off, a turn-end notify links the record and journals no a
   const [coverage] = ofType(events, "usage-coverage");
   t.diagnostic(`observed usage-coverage: ${JSON.stringify(coverage.data)}`);
   assert.equal(ofType(events, "usage-coverage").length, 1);
-  assert.notEqual(coverage.data.reason, "hooks-off");
-  assert.notEqual(coverage.data.coverage, "none");
+  assert.equal(coverage.data.coverage, "complete");
+  assert.equal(coverage.data.reason, undefined);
   assert.ok(ofType(events, "usage").length >= 1, "the rollout's token usage is journaled");
   const kinds = ofType(events, "signal").map((event) => event.data.kind);
   assert.ok(!kinds.includes("hooks-ready"), `no hooks-ready signal, saw ${kinds.join(",")}`);

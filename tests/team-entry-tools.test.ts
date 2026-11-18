@@ -5,6 +5,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { ENTRY_NOTICE } from "../packages/host/src/evidence/entry-reads.js";
+import { entryPostResultSchema, memberEntrySchema, memberListSchema } from "../packages/host/src/team-mcp-results.js";
 import { claimControl, waitFor } from "./helpers.js";
 import { fixture } from "./team-fixture.js";
 
@@ -58,6 +59,12 @@ function startChild(env: NodeJS.ProcessEnv, cwd: string): Child {
 /** The structured answer of a tool call. */
 const answerOf = (response: any) => response.result.structuredContent ?? JSON.parse(response.result.content[0].text);
 
+/** The schema's refusals of a value, or none. The issues name the field that drifted. */
+function refusalsOf(schema: { safeParse: (value: unknown) => { success: boolean; error?: { issues: unknown[] } } }, value: unknown): unknown[] {
+  const parsed = schema.safeParse(value);
+  return parsed.success ? [] : parsed.error?.issues ?? [];
+}
+
 /** Starts a run with the member's MCP child, after the member's capability receipt exists. */
 async function runningMember(f: Awaited<ReturnType<typeof fixture>>) {
   const created = await f.host.fetchApi("/teams", "owner", f.create());
@@ -82,6 +89,9 @@ test("a member posts, lists, and reads through the MCP tools", { timeout: 60000 
     const listing = await child.rpc("tools/list");
     const names = listing.result.tools.map((tool: { name: string }) => tool.name);
     for (const name of ["entry_post", "entry_list", "entry_get"]) assert.ok(names.includes(name), `${name} is listed`);
+    for (const tool of listing.result.tools.filter((item: { name: string }) => item.name.startsWith("entry_"))) {
+      assert.equal(tool.outputSchema?.type, "object", `${tool.name} declares an object result`);
+    }
 
     const entry = { kind: "contract", summary: "Interface for the report", paths: [],
       body: { interface: "report(entry)", change: "Add the entry tools", sources: [] } };
@@ -89,6 +99,8 @@ test("a member posts, lists, and reads through the MCP tools", { timeout: 60000 
     assert.notEqual(first.result.isError, true);
     const entryId = answerOf(first).entryId as string;
     assert.match(entryId, UUID);
+    assert.deepEqual(refusalsOf(entryPostResultSchema, first.result.structuredContent), []);
+    assert.deepEqual(first.result.structuredContent, { entryId, state: "pending" });
     const receipt = String(first.result.content[0].text);
     assert.ok(receipt.includes(entryId), "the receipt names the entry id");
     assert.ok(receipt.includes("waits for the host to store it"), "the receipt says the host has not stored the entry yet");
@@ -104,15 +116,23 @@ test("a member posts, lists, and reads through the MCP tools", { timeout: 60000 
 
     const got = await child.rpc("tools/call", { name: "entry_get", arguments: { entryId } });
     assert.match(JSON.stringify(answerOf(got)), /Add the entry tools/);
+    assert.deepEqual(refusalsOf(memberEntrySchema, got.result.structuredContent), [], "entry_get answers its declared result");
+    assert.equal(got.result.content[0].text, JSON.stringify(got.result.structuredContent), "entry_get text is the answer");
     const listed = await child.rpc("tools/call", { name: "entry_list", arguments: {} });
     assert.equal(answerOf(listed).notice, ENTRY_NOTICE);
     assert.equal(JSON.stringify(answerOf(listed)).includes(entryId), false, "the member does not list its own entry");
+    assert.deepEqual(refusalsOf(memberListSchema, listed.result.structuredContent), [], "entry_list answers its declared result");
+    assert.equal(listed.result.content[0].text, JSON.stringify(listed.result.structuredContent), "entry_list text is the answer");
+    // A filtered list keeps the member's own entry, so one head carries every field of a real MemberHead.
+    const filtered = await child.rpc("tools/call", { name: "entry_list", arguments: { kinds: ["contract"] } });
+    assert.ok(filtered.result.structuredContent.heads.some((head: { entryId: string }) => head.entryId === entryId));
+    assert.deepEqual(refusalsOf(memberListSchema, filtered.result.structuredContent), [], "a filtered entry_list answers its declared result");
 
     const context = JSON.parse(readFileSync(join(member.cwd, ".git", "infinite-team-context.json"), "utf8")) as { entries?: { notice?: string } };
     assert.equal(context.entries?.notice, ENTRY_NOTICE);
     await waitFor(async () => (await f.host.fetchApi(`/teams/${id}/context-usage`, "owner")).body.members,
       rows => rows.some((row: { memberId: string; listCalls: number; getCalls: number; digestBytes: number }) =>
-        row.memberId === member.memberId && row.listCalls === 1 && row.getCalls === 1 && row.digestBytes > 0), 30000);
+        row.memberId === member.memberId && row.listCalls === 2 && row.getCalls === 1 && row.digestBytes > 0), 30000);
   } finally {
     await Promise.all(children.map(child => child.close()));
     await f.close();
@@ -134,6 +154,7 @@ test("a secret post is refused without echo, and tools off answers 403", { timeo
     const secret = await child.rpc("tools/call", { name: "entry_post", arguments: { entry: { kind: "contract", summary: "Secret check", paths: [],
       body: { interface: "none", change: `token ${token}`, sources: [] } } } });
     assert.equal(secret.result.isError, true);
+    assert.equal(secret.result.structuredContent, undefined, "a refused post has no structured answer");
     const secretText = JSON.stringify(secret);
     assert.match(secretText, /entry-secret at entry\.body\.change/);
     assert.equal(secretText.includes(token), false, "the token is in no answer");
@@ -141,6 +162,7 @@ test("a secret post is refused without echo, and tools off answers 403", { timeo
     const hookToken = await child.rpc("tools/call", { name: "entry_post", arguments: { entry: { kind: "contract", summary: `hook ${capability.token}`, paths: [],
       body: { interface: "none", change: "none", sources: [] } } } });
     assert.equal(hookToken.result.isError, true);
+    assert.equal(hookToken.result.structuredContent, undefined, "a refused post has no structured answer");
     assert.equal(JSON.stringify(hookToken).includes(capability.token), false, "the hook token is in no answer");
 
     const stored = await on.host.fetchApi(`/teams/${id}/entries?kind=contract`, "owner");

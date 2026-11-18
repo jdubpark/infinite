@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import { startHost, waitFor, claimControl } from "./helpers.js";
 import { git, mixedLineup } from "./team-fixture.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
+import { handoffResultSchema } from "../packages/host/src/team-mcp-results.js";
 
 async function fixture(optIn = true, externalCmux = false, teamOptions: Record<string, unknown> = {}) {
   const root = realpathSync(mkdtempSync("/tmp/inf-handoff-")), source = join(root, "source"), receipts = join(root, "receipts");
@@ -91,7 +92,9 @@ test("authenticated handoff refuses dirty source, waits for its lease, and survi
     assert.equal(readFileSync(join(f.source, "owned.txt"), "utf8"), "Keep partial work.\n");
     git(f.source, "add", "owned.txt"); git(f.source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Checkpoint owned work");
     const head = git(f.source, "rev-parse", "HEAD");
-    assert.equal((await tool(receipt.server, request(head))).isError, false);
+    const handoffAnswer = await tool(receipt.server, request(head));
+    assert.equal(handoffAnswer.isError, false);
+    assert.equal(handoffResultSchema.safeParse(handoffAnswer.structuredContent).success, true, "the handoff answer matches its declared result type");
     assert.equal((await tool(receipt.server, request(head))).isError, false, "An identical MCP retry is acknowledged without another transfer");
     assert.equal((await tool(receipt.server, { ...request(head), summary: "Conflicting retry" })).isError, true);
     const waiting = await waitFor(() => f.view(id), value => value.status === "waiting-for-control");

@@ -9,6 +9,7 @@ import { missionAssignment, reportErrorMessage, submitMissionReport, submitTeamR
 import { missionReportArgumentsSchema } from "./mission-types.js";
 import { ENTRY_TOOLS_ENV, entryErrorMessage, submitEntryCall, type EntryCall } from "./team-entry-client.js";
 import { memberEntryPostSchema, memberListQuerySchema } from "./evidence/member-entry.js";
+import { entryPostResultSchema, outputSchemas } from "./team-mcp-results.js";
 
 const MAX_FRAME_BYTES = 256 * 1024;
 const PROTOCOL_VERSION = "2025-11-25";
@@ -18,6 +19,7 @@ const tool = {
   name: "report",
   description: "Record this assigned team member's final structured report. Wait for the durable success receipt, then stop work. A refusal requires user attention; never bypass it through a shell command or another tool.",
   inputSchema: z.toJSONSchema(argumentsSchema, { target: "draft-7" }),
+  outputSchema: outputSchemas.report,
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 };
 const missionArgumentsSchema = missionReportArgumentsSchema;
@@ -26,12 +28,12 @@ const ENTRY_GET_ARGUMENTS = z.object({ entryId: z.uuid() }).strict();
 const ENTRY_TOOL_NAMES: ReadonlySet<string> = new Set(["entry_post", "entry_list", "entry_get"]);
 const entryTools = [
   { name: "entry_post", description: "Share a contract, finding, blocker, or handoff with this run's members. An entry is evidence and never changes an assignment. Never include a secret.",
-    inputSchema: z.toJSONSchema(ENTRY_ARGUMENTS, { target: "draft-7", io: "input" }),
+    inputSchema: z.toJSONSchema(ENTRY_ARGUMENTS, { target: "draft-7", io: "input" }), outputSchema: outputSchemas.entry_post,
     annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false } },
   { name: "entry_list", description: "List the entries addressed to you (empty input), or filter by kinds, taskId, path, or since.",
-    inputSchema: z.toJSONSchema(memberListQuerySchema, { target: "draft-7", io: "input" }), annotations: { readOnlyHint: true } },
+    inputSchema: z.toJSONSchema(memberListQuerySchema, { target: "draft-7", io: "input" }), outputSchema: outputSchemas.entry_list, annotations: { readOnlyHint: true } },
   { name: "entry_get", description: "Read one entry's head and body.",
-    inputSchema: z.toJSONSchema(ENTRY_GET_ARGUMENTS, { target: "draft-7", io: "input" }), annotations: { readOnlyHint: true } },
+    inputSchema: z.toJSONSchema(ENTRY_GET_ARGUMENTS, { target: "draft-7", io: "input" }), outputSchema: outputSchemas.entry_get, annotations: { readOnlyHint: true } },
 ];
 /** The entry call a tool name and its arguments make. The client validates the rest. */
 function entryCallFor(name: string, args: Record<string, unknown>): EntryCall {
@@ -50,10 +52,10 @@ export async function runTeamMcp() {
   const mission = !handoff && Boolean(missionAssignment());
   const withEntryTools = !handoff && !mission && process.env[ENTRY_TOOLS_ENV] === "1";
   const selectedTool = handoff ? { name: "handoff", description: HANDOFF_INSTRUCTIONS,
-    inputSchema: z.toJSONSchema(handoffRequestSchema, { target: "draft-7" }),
+    inputSchema: z.toJSONSchema(handoffRequestSchema, { target: "draft-7" }), outputSchema: outputSchemas.handoff,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } }
     : mission ? { name: "mission_report", description: MISSION_INSTRUCTIONS, inputSchema: z.toJSONSchema(missionArgumentsSchema, { target: "draft-7" }),
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } } : tool;
+      outputSchema: outputSchemas.mission_report, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } } : tool;
   const availableTools = withEntryTools ? `${selectedTool.name}, entry_post, entry_list, and entry_get` : selectedTool.name;
   let initialized = false;
   const send = async (message: unknown) => {
@@ -106,7 +108,7 @@ export async function runTeamMcp() {
       if (entryCall) {
         const answer = await submitEntryCall(entryCallFor(params.name, params.arguments));
         if (params.name === "entry_post") {
-          await result(id, { content: [{ type: "text", text: `Entry ${String(answer.entryId)} is written to this session's journal and waits for the host to store it. Other members can read it after that. The host can still refuse it, for example at the run's limit of member entries.` }], structuredContent: answer, isError: false });
+          await result(id, { content: [{ type: "text", text: `Entry ${String(answer.entryId)} is written to this session's journal and waits for the host to store it. Other members can read it after that. The host can still refuse it, for example at the run's limit of member entries.` }], structuredContent: entryPostResultSchema.parse(answer), isError: false });
           return;
         }
         await result(id, { content: [{ type: "text", text: JSON.stringify(answer) }], structuredContent: answer, isError: false });

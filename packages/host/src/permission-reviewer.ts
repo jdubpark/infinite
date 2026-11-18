@@ -22,6 +22,7 @@ import { EFFECT_REJECT_CODES, EVIDENCE_REJECT_CODES, INTERRUPT_CLASSES, PERMISSI
 import type { TeamModelProfile } from "./team-types.js";
 import type { AgentProfile, Provider } from "./types.js";
 import { sudoShape } from "./sudo-profile.js";
+import { hostEgressEnvironment } from "./egress.js";
 import { usageFromRunLine } from "./opencode-usage.js";
 import type { UsageTokens } from "./usage.js";
 
@@ -245,11 +246,15 @@ export interface PermissionTurnLauncher {
 const ENV_NAMES = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"];
 const REVIEW_AGENT = "infinite-permission-review";
 
-/** The environment of a reviewer process: the same short list a provider session receives, and nothing of the host's. */
+/**
+ * The environment of a reviewer process: the same short list a provider session receives, and nothing else of the
+ * host's, plus the configured egress with the host identity. A reviewer is a model client, so without the proxy
+ * variables it would reach its provider directly.
+ */
 export function reviewerEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const name of ENV_NAMES) if (source[name]) env[name] = source[name];
-  return env;
+  return { ...env, ...hostEgressEnvironment() };
 }
 
 const BINARY: Partial<Record<Provider, string>> = { claude: "claude", opencode: "opencode" };

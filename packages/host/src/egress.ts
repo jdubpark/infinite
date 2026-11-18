@@ -172,6 +172,18 @@ export function hostEgressEnvironment(nowMs = Date.now()): Record<string, string
 }
 
 /**
+ * The environment for a model client the host runs as the agent account (briefings, System tab briefs and context
+ * runs): `base` without inherited proxy state, plus the configured egress with the host identity. Without the egress
+ * block it carries no proxy variables. Host-account calls such as `gh` keep their own environment.
+ */
+export function agentModelClientEnvironment(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base };
+  clearEgressEnvironment(env);
+  Object.assign(env, hostEgressEnvironment());
+  return env;
+}
+
+/**
  * In a worker: the proxy variables for its session, from what the host process exported.
  * - `off`: egress is not configured. No variables; the environment is unchanged.
  * - `on`: the proxy address with the session's credential.

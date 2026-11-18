@@ -2,13 +2,15 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import * as built from "../packages/host/src/crossing-digest.js";
-import type { ClaimInput, CrossingDigest } from "../packages/host/src/crossing-digest.js";
+import type { ClaimInput, CrossingDigest, HostInput } from "../packages/host/src/crossing-digest.js";
 
-// Receipt space under counter growth, and the text rule. Special characters are built from code points.
+// Receipt space under counter growth, claims invisible to receipts, and the text rule. Special characters are built
+// from code points.
 
 const { DIGEST_LIMIT_BYTES, OMITTED_MAX, crossingDigestSchema } = built;
 type Outcome = CrossingDigest["outcome"];
 const LISTS = ["touched", "decisions", "failures", "forSiblings", "open"] as const;
+const OUTCOMES = ["complete", "partial", "failed", "refused"] as const;
 
 /** Independent measure: the test never calls the module's own byte helper. */
 const measure = (digest: CrossingDigest) => Buffer.byteLength(JSON.stringify(digest), "utf8");
@@ -111,6 +113,7 @@ test("boundary sweep: withClaims keeps every receipt of a host digest from 1,900
   for (const digest of SWEEP) {
     for (const [count, claims] of claimSets) {
       const where = `${measure(digest)}-byte ${digest.outcome} digest, counters ${digest.omitted.open}, ${count} rows per list`;
+      assert.ok(receipts(digest).length > 0, `${where}: no receipt to keep`);
       const result = valid(built.withClaims(digest, claims));
       assert.deepEqual(receipts(result), receipts(digest), where);
       // The rows were dropped and counted: a list keeps at most 24 rows.
@@ -120,6 +123,7 @@ test("boundary sweep: withClaims keeps every receipt of a host digest from 1,900
     }
   }
   const heavy = claimRows(10_000, true);
+  assert.ok(BOUNDARY.largest.length > 0, "no largest digest");
   for (const digest of BOUNDARY.largest) {
     assert.deepEqual(receipts(valid(built.withClaims(digest, heavy))), receipts(digest), `${measure(digest)} bytes, 10,000 valid rows`);
   }
@@ -128,7 +132,9 @@ test("boundary sweep: withClaims keeps every receipt of a host digest from 1,900
 test("mergeDigest keeps every receipt of the older digest when the newer one holds only counters or claims", () => {
   const countersOnly = valid(built.fitDigest({ ...valid(built.emptyDigest("complete")), omitted: counts(OMITTED_MAX) }));
   const claimsOnly = valid(built.withClaims(valid(built.emptyDigest("complete")), claimRows(100)));
+  assert.ok(SWEEP.length > DIGEST_LIMIT_BYTES - 1900, `the sweep holds only ${SWEEP.length} digests`);
   for (const digest of SWEEP) {
+    assert.ok(receipts(digest).length > 0, `${measure(digest)}-byte digest: no receipt to keep`);
     for (const newer of [countersOnly, claimsOnly]) {
       const merged = valid(built.mergeDigest(digest, newer));
       assert.deepEqual(receipts(merged), receipts(digest), `${measure(digest)}-byte ${digest.outcome} digest`);
@@ -137,9 +143,176 @@ test("mergeDigest keeps every receipt of the older digest when the newer one hol
   }
 });
 
+// Claims are invisible to receipts: receipt rows, their order and their survival never depend on claims.
+
+/** Receipt rows per list, in order: `touched` rows marked as receipts and `failures` rows of a host class. */
+const receiptRows = (digest: CrossingDigest) => ({
+  touched: digest.touched.filter(row => row.by === "receipt").map(row => JSON.stringify(row, Object.keys(row).sort())),
+  failures: digest.failures.filter(row => row.class !== "claim").map(row => JSON.stringify(row, Object.keys(row).sort())),
+});
+const paths = (digest: CrossingDigest) => digest.touched.map(row => `${row.path}:${row.by}`);
+const signals = (digest: CrossingDigest) => digest.failures.map(row => `${row.signal}:${row.by}`);
+
+test("reproduction: a claim on a receipt's path leaves the receipts' order and content alone", () => {
+  const d = valid(built.hostDigest({ outcome: "partial", read: ["a", "b"] }));
+  const claimed = valid(built.withClaims(d, { touched: [{ path: "b", op: "removed", ids: ["fake"] }] }));
+  assert.deepEqual(claimed.touched, d.touched);
+  assert.deepEqual(paths(claimed), ["a:receipt", "b:receipt"]);
+});
+
+test("reproduction: a claim duplicating the second host failure leaves the failure order alone", () => {
+  const host = valid(built.hostDigest({ outcome: "failed", failures: [{ signal: "s1", class: "check" }, { signal: "s2", where: "w", class: "stop" }] }));
+  const claimed = valid(built.withClaims(host, { failures: [{ signal: "s2", where: "w" }] }));
+  assert.deepEqual(claimed.failures, host.failures);
+  assert.deepEqual(signals(claimed), ["s1:receipt", "s2:receipt"]);
+});
+
+test("reproduction: merging a claims-only digest leaves both receipt orders alone", () => {
+  const host = valid(built.hostDigest({
+    outcome: "partial", read: ["a", "b"], failures: [{ signal: "s1", class: "check" }, { signal: "s2", where: "w", class: "stop" }],
+  }));
+  const claimsOnly = valid(built.withClaims(valid(built.emptyDigest("partial")), {
+    touched: [{ path: "b", op: "removed", ids: ["fake"] }], failures: [{ signal: "s2", where: "w" }],
+  }));
+  const merged = valid(built.mergeDigest(host, claimsOnly));
+  assert.deepEqual([paths(merged), signals(merged)], [["a:receipt", "b:receipt"], ["s1:receipt", "s2:receipt"]]);
+});
+
+test("reproduction: a claim on the oldest of 24 receipts does not change which receipt a later merge drops", () => {
+  const reads = Array.from({ length: 24 }, (_, index) => `r${index}`);
+  const full = valid(built.hostDigest({ outcome: "partial", read: reads }));
+  const fresh = valid(built.hostDigest({ outcome: "partial", read: ["new"] }));
+  const expected = ["new", ...reads.slice(0, 23)].map(path => `${path}:receipt`);
+  for (const claims of [{ touched: [{ path: "r23", op: "removed" as const }] }, {}]) {
+    const merged = valid(built.mergeDigest(valid(built.withClaims(full, claims)), fresh));
+    assert.deepEqual(paths(merged), expected, JSON.stringify(claims));
+    assert.equal(merged.omitted.touched, 1);
+  }
+});
+
+function mulberry32(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+type Call =
+  | { kind: "host"; input: HostInput }
+  | { kind: "claims"; target: number; claims: ClaimInput }
+  | { kind: "claimsOnly"; outcome: Outcome; claims: ClaimInput }
+  | { kind: "merge"; older: number; newer: number }
+  | { kind: "fit"; target: number };
+
+/**
+ * A random call sequence. Claims draw most paths and failure keys from the pools the host inputs use, so they often
+ * collide with a receipt (same path with another op or with ids, same signal and place). Short paths reach the
+ * 24-row cap, long ones the byte limit.
+ */
+function randomCalls(seed: number, length: number): Call[] {
+  const random = mulberry32(seed);
+  const int = (min: number, max: number) => min + Math.floor(random() * (max - min + 1));
+  const pick = <T>(items: readonly T[]): T => items[int(0, items.length - 1)];
+  const longOdds = pick([0, 0.2, 0.6]);
+  const pool = Array.from({ length: 40 }, (_, index) => `src/${index}/${"x".repeat(random() < longOdds ? int(80, 220) : int(1, 12))}.ts`);
+  const failureKeys = ["exit 1", "exit 2", "timeout", "lint", "denied", "merge"].flatMap(signal => [{ signal }, { signal, where: "npm test" }]);
+  const list = <T>(max: number, row: () => T) => Array.from({ length: int(0, max) }, row);
+  const text = (prefix: string) => `${prefix} ${int(0, 30)} ${"t".repeat(int(0, 200))}`;
+  const host = (): HostInput => ({
+    outcome: pick(OUTCOMES),
+    changed: list(30, () => ({ path: pick(pool), op: pick(["changed", "added", "removed"] as const) })),
+    read: list(12, () => pick(pool)),
+    failures: list(8, () => ({ ...pick(failureKeys), class: pick(["check", "stop", "refusal", "conflict"] as const) })),
+  });
+  const claims = (): ClaimInput => ({
+    touched: list(12, () => ({
+      path: random() < 0.7 ? pick(pool) : `claim/${int(0, 40)}.ts`,
+      op: pick(["read", "changed", "added", "removed"] as const),
+      ...(random() < 0.5 ? { ids: list(3, () => `id${int(0, 9)}`) } : {}),
+    })),
+    failures: list(8, () => (random() < 0.7 ? pick(failureKeys) : { signal: `member ${int(0, 9)}` })),
+    decisions: list(7, () => ({ what: text("decision"), why: text("because") })),
+    forSiblings: list(5, () => ({ note: text("note"), paths: [pick(pool)] })),
+    open: list(5, () => text("question")),
+  });
+  const calls: Call[] = [{ kind: "host", input: host() }];
+  while (calls.length < length) {
+    const recent = () => int(Math.max(0, calls.length - 6), calls.length - 1);
+    const roll = random();
+    if (roll < 0.2) calls.push({ kind: "host", input: host() });
+    else if (roll < 0.5) calls.push({ kind: "claims", target: recent(), claims: claims() });
+    else if (roll < 0.62) calls.push({ kind: "claimsOnly", outcome: pick(OUTCOMES), claims: claims() });
+    else if (roll < 0.9) calls.push({ kind: "merge", older: recent(), newer: recent() });
+    else calls.push({ kind: "fit", target: recent() });
+  }
+  return calls;
+}
+
+/** One call. With `erase`, every claims argument is {} and every claims-only digest is an empty digest. */
+function apply(call: Call, results: CrossingDigest[], erase: boolean): CrossingDigest | undefined {
+  switch (call.kind) {
+    case "host": return built.hostDigest(call.input);
+    case "claims": return built.withClaims(results[call.target], erase ? {} : call.claims);
+    case "claimsOnly": return erase ? built.emptyDigest(call.outcome) : built.withClaims(valid(built.emptyDigest(call.outcome)), call.claims);
+    case "merge": return built.mergeDigest(results[call.older], results[call.newer]);
+    case "fit": return built.fitDigest(results[call.target]);
+  }
+}
+
+/** The digests a call reads, so a counter's growth shows what the call itself dropped. */
+const inputsOf = (call: Call, results: CrossingDigest[]) =>
+  call.kind === "merge" ? [results[call.older], results[call.newer]] : call.kind === "claims" || call.kind === "fit" ? [results[call.target]] : [];
+
+test("differential: every call sequence gives the same receipt rows with its claims erased", t => {
+  const seeds = Array.from({ length: 240 }, (_, index) => 304_000 + index);
+  const reached = { touchedCap: new Set<number>(), failureCap: new Set<number>(), bytes: new Set<number>() };
+  let calls = 0;
+  let collisions = 0;
+  for (const seed of seeds) {
+    const sequence = randomCalls(seed, 32);
+    const claimed: CrossingDigest[] = [];
+    const erased: CrossingDigest[] = [];
+    for (const [index, call] of sequence.entries()) {
+      const where = `seed ${seed}, call ${index} (${call.kind})`;
+      if (call.kind === "claims") {
+        const held = receiptRows(claimed[call.target]);
+        const hits = [...held.touched, ...held.failures].map(row => JSON.parse(row) as Record<string, string>);
+        collisions += (call.claims.touched ?? []).filter(row => hits.some(hit => hit.path === row.path)).length;
+        collisions += (call.claims.failures ?? []).filter(row => hits.some(hit => hit.signal === row.signal && hit.where === row.where)).length;
+      }
+      let left: CrossingDigest;
+      let right: CrossingDigest;
+      try {
+        left = valid(apply(call, claimed, false));
+        right = valid(apply(call, erased, true));
+      } catch (error) {
+        throw new Error(`${where}: ${(error as Error).message}`);
+      }
+      assert.deepEqual(receiptRows(left), receiptRows(right), where);
+      claimed.push(left);
+      erased.push(right);
+      calls += 1;
+      // What the erased run dropped is receipts alone: at a full list it is the cap, below it the byte fit.
+      const before = (key: "touched" | "failures") => Math.min(OMITTED_MAX, inputsOf(call, erased).reduce((sum, digest) => sum + digest.omitted[key], 0));
+      const grew = (key: "touched" | "failures") => right.omitted[key] > before(key);
+      if (grew("touched") && right.touched.length === 24) reached.touchedCap.add(seed);
+      if (grew("failures") && right.failures.length === 6) reached.failureCap.add(seed);
+      if ((grew("touched") && right.touched.length < 24) || (grew("failures") && right.failures.length < 6)) reached.bytes.add(seed);
+    }
+  }
+  t.diagnostic(`${seeds.length} seeds, ${calls} calls, ${collisions} colliding claim rows; sequences reaching the touched cap ${reached.touchedCap.size}, the failures cap ${reached.failureCap.size}, the byte limit ${reached.bytes.size}`);
+  assert.equal(calls, seeds.length * 32);
+  for (const [name, set] of Object.entries(reached)) assert.ok(set.size >= seeds.length / 5, `only ${set.size} sequences reached ${name}`);
+  assert.ok(collisions >= seeds.length * 4, `only ${collisions} colliding claim rows`);
+});
+
 // The text rule.
 
-const char = (code: number) => String.fromCodePoint(code);
+const char =(code: number) => String.fromCodePoint(code);
 const escapeOf = (code: number) => "\\u{" + code.toString(16) + "}";
 const range = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, index) => from + index);
 const BIDI = [0x061c, 0x200e, 0x200f, ...range(0x202a, 0x202e), ...range(0x2066, 0x2069)];
@@ -251,26 +424,34 @@ test("text rule: a clip keeps whole escapes, line breaks and characters, is maxi
   assert.equal(viaOpen(viaOpen(typed)), viaOpen(typed));
 });
 
-test("text rule: text made only of expanding characters stays within every bound", () => {
+test("text rule: text made only of expanding characters stays within every bound, field by field", () => {
   const empty = valid(built.emptyDigest("partial"));
   for (const code of [0x202e, 0x01, 0x85]) {
-    const fill = (index: number) => `${index}${char(code).repeat(240)}`;
-    const rows = (count: number) => Array.from({ length: count }, (_, index) => index);
-    const claims: ClaimInput = {
-      decisions: rows(6).map(index => ({ what: fill(index), why: fill(index) })),
-      open: rows(4).map(fill),
-      forSiblings: rows(4).map(index => ({ note: fill(index) })),
-      failures: rows(6).map(index => ({ signal: fill(index), where: fill(index) })),
-      touched: rows(24).map(index => ({ path: `src/${index}.ts`, op: "read", ids: rows(8).map(fill) })),
-    };
-    const digest = valid(built.withClaims(empty, claims));
-    const texts = [
-      ...digest.decisions.flatMap(row => [row.what, row.why]), ...digest.open, ...digest.forSiblings.map(row => row.note),
-      ...digest.failures.flatMap(row => [row.signal, row.where ?? ""]),
+    const fill = char(code).repeat(240);
+    /** As many whole escapes as fit after `prefix` in `max` bytes. */
+    const clipped = (prefix: string, max: number) => prefix + escapeOf(code).repeat(Math.floor((max - prefix.length) / escapeOf(code).length));
+    // One field per fixture, small enough to survive the fit: [name, claims, the field read back, expected values].
+    const ids = Array.from({ length: 8 }, (_, index) => `${index}${fill}`);
+    const cases: [string, ClaimInput, (digest: CrossingDigest) => unknown[], string[]][] = [
+      ["decision", { decisions: [{ what: fill, why: fill }] }, digest => [digest.decisions[0]?.what, digest.decisions[0]?.why], [clipped("", 240), clipped("", 240)]],
+      ["open", { open: [fill] }, digest => [digest.open[0]], [clipped("", 240)]],
+      ["note", { forSiblings: [{ note: fill }] }, digest => [digest.forSiblings[0]?.note], [clipped("", 240)]],
+      ["failure", { failures: [{ signal: fill, where: fill }] }, digest => [digest.failures[0]?.signal, digest.failures[0]?.where], [clipped("", 240), clipped("", 240)]],
+      ["ids", { touched: [{ path: "src/a.ts", op: "read", ids }] }, digest => digest.touched[0]?.ids ?? [], ids.map((_, index) => clipped(String(index), 120))],
     ];
-    for (const text of texts) assert.ok(utf8(text) <= 240 && /^\d+(\\u\{[0-9a-f]+\})*$/.test(text), JSON.stringify(text));
-    for (const id of digest.touched.flatMap(row => row.ids ?? [])) assert.ok(utf8(id) <= 120 && /^\d+(\\u\{[0-9a-f]+\})*$/.test(id), id);
-    const refit = valid(built.fitDigest({ ...empty, open: [fill(0)], decisions: [{ what: fill(1), why: fill(2) }] }));
-    assert.equal(refit.open[0], valid(built.fitDigest(refit)).open[0]);
+    for (const [name, claims, read, expected] of cases) {
+      const where = `${name}, U+${code.toString(16)}`;
+      const values = read(valid(built.withClaims(empty, claims)));
+      assert.equal(values.length, expected.length, `${where}: field count`);
+      for (const value of values) assert.equal(typeof value, "string", `${where}: field missing`);
+      assert.deepEqual(values, expected, where);
+      for (const value of expected) assert.ok(utf8(value) <= (name === "ids" ? 120 : 240), where);
+      assert.deepEqual(read(valid(built.fitDigest(valid(built.withClaims(empty, claims))))), expected, `${where}: refit`);
+    }
+    // Every field at once is still within the byte bound (the fit decides which rows remain).
+    valid(built.withClaims(empty, {
+      decisions: [{ what: fill, why: fill }], open: [fill], forSiblings: [{ note: fill }],
+      failures: [{ signal: fill, where: fill }], touched: [{ path: "src/a.ts", op: "read", ids }],
+    }));
   }
 });

@@ -3,10 +3,11 @@ import { z } from "zod";
 
 /*
  * Crossing digest (design part 9). Pure: no I/O, clock, globals or model calls. Every list is newest first, so the
- * oldest item sits at the end of each array.
+ * oldest item sits at the end of each array; `touched` and `failures` hold their receipts before their claims.
  *
  * Input boundary. Arguments are JSON values as JSON.parse returns them. Objects with getters, proxies or a toJSON
- * method are outside the contract.
+ * method are outside the contract. The output bounds do not bound processing time: the caller must bound the input
+ * size, and claims must reach this module from a report whose schema bounds each list.
  *
  * Authority boundary. Every argument is host-owned except the claims argument of withClaims: the host builds it from
  * run state, Git and check results. Member JSON enters only through that claims argument, and every row read from it
@@ -14,21 +15,30 @@ import { z } from "zod";
  * host-built. A forged digest passed in a host-owned position keeps its receipts and outcome by design, so the
  * storage slice must never put member JSON there.
  *
- * Refusal. A host-owned argument that is not an object or has no valid outcome refuses the call: the builder returns
- * undefined, throws nothing and invents no outcome (part 9: the outcome comes from run state and is a receipt).
- * Inside a valid host-owned argument, and anywhere in the claims argument, a malformed row is dropped and counted,
- * and no value is coerced to text. The claims argument never refuses a call.
+ * PROPOSED refusal contract. A host-owned argument that is not an object or has no valid outcome refuses the call:
+ * the builder returns undefined, throws nothing and invents no outcome (part 9: the outcome comes from run state and
+ * is a receipt). Inside a valid host-owned argument, and anywhere in the claims argument, a malformed row is dropped
+ * and counted, and no value is coerced to text. The claims argument never refuses a call.
  *
- * Receipt space. Every digest is fitted as if all five `omitted` counters stood at OMITTED_MAX and the outcome were
- * the widest one, so later counting or a newer outcome never takes receipt space. Hence, for any digest d that this
- * module returned, withClaims(d, claims) keeps every receipt of d whatever the claims are, and mergeDigest(d, b)
- * keeps every receipt of d when b holds no receipts.
+ * Claims are invisible to receipts. Receipt rows are the `touched` rows marked as receipts and the `failures` rows of
+ * a host class. For every digest this module returned and every sequence of module calls on it, the receipt rows of
+ * the result (their content, their order, and which ones survive every cap and the byte fit) are exactly those of the
+ * same sequence with every claim removed. This holds by construction: `combine` folds, caps and fits the receipts of
+ * each list alone, as if no claim existed, and only then lets claims take the slots and bytes that are left, for keys
+ * no receipt holds (rule (f)).
+ * PROPOSED order: within `touched` and `failures` every receipt precedes every claim, and each group is newest first.
+ *
+ * Receipt space. PROPOSED reserve: fitting measures a digest as if all five `omitted` counters stood at OMITTED_MAX
+ * and the outcome were the widest one, so later counting or a newer outcome never takes receipt space. The reserve is
+ * 0 to 17 bytes, so a receipt that would fit without it can be dropped: seven 229-byte paths fit in 2,047 bytes, and
+ * six are kept.
  */
 
 /** Byte bound for a digest, measured as JSON. */
 export const DIGEST_LIMIT_BYTES = 2048;
-/** Counters saturate here. A counter at the cap means "this many or more". PROPOSED. */
+/** Counters saturate here, by rule (c). */
 export const OMITTED_MAX = 9999;
+/** PROPOSED sizes the design does not state: a failure's signal and place 240 bytes, an id 120, a path 300. */
 const TEXT_BYTES = 240;
 const SHORT_BYTES = 120;
 const PATH_BYTES = 300;
@@ -46,7 +56,8 @@ const COUNTERS = ["touched", "decisions", "failures", "forSiblings", "open"] as 
 
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 /**
- * Refused in a path: C0 and C1 controls, DEL, the line and paragraph separators, and the bidirectional controls.
+ * PROPOSED path rule: a literal repository path of 1 to 300 bytes, without a leading slash, a .. segment, a lone
+ * surrogate, or any of C0 and C1 controls, DEL, the line and paragraph separators and the bidirectional controls.
  * Zero-width and tag characters (U+200B, U+2060, U+FEFF, U+E0000 to U+E007F) are kept, because real file names can
  * hold them; a presentation layer must show them.
  */
@@ -57,15 +68,18 @@ const CONTROL = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a
  * control except tab and line feed, DEL, the C1 controls and the bidirectional controls of the path rule become a
  * visible escape: a backslash, "u{", the code point in lower-case hex without leading zeros, and "}", so U+0007 reads
  * as \u{7}. Every other character, ordinary whitespace included, is kept, and a lone surrogate becomes U+FFFD.
- * Clipping keeps whole characters and whole escapes, and normalizing twice equals normalizing once. The schema
- * refuses text that is not in this form.
+ * Clipping keeps whole characters and whole escapes, and normalizing twice equals normalizing once.
+ * PROPOSED, for the owner: the escape form is not reversible. Text a member typed that looks like an escape cannot be
+ * told from an escaped control character.
+ * PROPOSED, for the owner: the schema refuses text that is not in this normal form, so a digest stored before this
+ * rule needs a migration or a lenient read.
  */
 const UNSAFE_TEXT = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/;
 const LINE_BREAKS = new Set([0x0d, 0x2028, 0x2029]);
 
 const bytes = (value: string) => Buffer.byteLength(value, "utf8");
 
-/** A literal repository path. Brackets, colons, spaces, backslashes and non-ASCII names are allowed. */
+/** A literal repository path, by the path rule. Brackets, colons, spaces, backslashes and non-ASCII names pass. */
 function isRepoPath(value: string): boolean {
   const size = bytes(value);
   return size >= 1 && size <= PATH_BYTES && !LONE_SURROGATE.test(value) && !CONTROL.test(value)
@@ -83,18 +97,25 @@ const authority = z.enum(AUTHORITIES);
 const counter = z.number().int().min(0).max(OMITTED_MAX);
 
 /*
- * PROPOSED rules (design part 9 states none of them):
- * (a) `omitted` counts whole rows dropped by a cap, by the size trim, for an invalid path, or as malformed: a row
- *     that is not an object, lacks a required string, or holds an invalid enum value. A row folded into another
- *     row for the same path, failure or note is not counted. A list that is not an array reads as empty, and
- *     nothing is counted for it. A claims argument that is not an object reads as empty.
- * (b) `ids` and sibling `paths` are capped at 8 without a count. An entry in them that is not a string or not a
- *     valid path is dropped without a count. A malformed optional field (`ids`, `paths`, `where`) is dropped and
- *     its row kept.
- * (c) A received counter that is NaN, negative or not a number reads as 0, a fraction floors, and a value above
- *     the cap, Infinity included, reads as the cap. Counters saturate at OMITTED_MAX.
- * (d) hostDigest refuses class "claim" on a failure and "read" in `changed`, as HostInput types them.
- * `forSiblings` and `open` counters are a proposed amendment too.
+ * Rules design part 9 does not state, each proposed to the owner.
+ * PROPOSED (a) `omitted` counts whole rows dropped by a cap, by the size trim, for an invalid path, or as malformed:
+ *     a row that is not an object, lacks a required string, or holds an invalid enum value. A row folded into another
+ *     row is not counted. A list that is not an array reads as empty, and nothing is counted for it. A claims
+ *     argument that is not an object reads as empty.
+ * PROPOSED (b) `ids` and sibling `paths` are capped at 8 without a count. An entry in them that is not a string or
+ *     not a valid path is dropped without a count. A malformed optional field (`ids`, `paths`, `where`) is dropped
+ *     and its row kept.
+ * PROPOSED (c) A received counter that is NaN, negative or not a number reads as 0, a fraction floors, and a value
+ *     above OMITTED_MAX, Infinity included, reads as OMITTED_MAX. Counters saturate there, and a counter at
+ *     OMITTED_MAX means "this many or more".
+ * PROPOSED (d) hostDigest refuses class "claim" on a failure and "read" in `changed`, as HostInput types them.
+ * PROPOSED (e) A failure row is a receipt exactly when its class is a host class; a row whose `by` and `class`
+ *     disagree is malformed.
+ * PROPOSED (f) Folding: rows of one authority with the same path union their ids (at most 8) and keep the stronger
+ *     operation; the newest failure per signal and place wins; sibling notes with the same text union their paths.
+ *     A claim whose path, or signal and place, a receipt holds is folded into that receipt without a count, even
+ *     when a cap or the fit later drops the receipt.
+ * PROPOSED (g) `forSiblings` and `open` get counters in `omitted`, beside the three of the design.
  */
 /** Checks shape, never provenance: a digest that passes is not thereby host-built. */
 export const crossingDigestSchema = z.object({
@@ -112,7 +133,7 @@ export const crossingDigestSchema = z.object({
     where: text.optional(),
     class: z.enum(CLASSES),
     by: authority,
-  }).strict()).max(CAPS.failures),
+  }).strict().refine(row => (row.class === "claim") === (row.by === "claim"), "A failure is a claim exactly when its class is claim")).max(CAPS.failures),
   forSiblings: z.array(z.object({
     note: text,
     paths: z.array(repoPath).max(SIBLING_PATH_LIMIT).optional(),
@@ -163,6 +184,7 @@ const field = (value: unknown, key: string): unknown => (isRow(value) && Object.
 const listOf = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
 const isText = (value: unknown): value is string => typeof value === "string";
 const isPath = (value: unknown): value is string => isText(value) && isRepoPath(value);
+const isReceipt = (row: unknown): boolean => field(row, "by") === "receipt";
 const oneOf = <T extends string>(options: readonly T[], value: unknown): T | undefined => options.find(option => option === value);
 /** The outcome of a host-owned argument, or undefined when it is not an object or has no valid outcome. */
 const hostOutcome = (value: unknown): Outcome | undefined => oneOf(OUTCOMES, field(value, "outcome"));
@@ -203,7 +225,7 @@ export function hostDigest(input: HostInput): CrossingDigest | undefined {
 /**
  * Host-owned: `digest`. Member JSON: `claims`, the only argument where it may enter, read as any JSON value. Claim
  * arrays are newest first, like digest arrays. Rows are rebuilt from named fields, so a member's `by`, `class`,
- * `outcome` or `omitted` never reaches the digest, and a claim never replaces a receipt.
+ * `outcome` or `omitted` never reaches the digest, and no claim changes a receipt row.
  */
 export function withClaims(digest: CrossingDigest, claims: ClaimInput): CrossingDigest | undefined {
   const outcome = hostOutcome(digest);
@@ -228,7 +250,7 @@ export function withClaims(digest: CrossingDigest, claims: ClaimInput): Crossing
   return checked("withClaims", combine(outcome, [fresh, digest]));
 }
 
-/** Host-owned: `a` and `b`. `b` is the newer digest. Its outcome wins, and its items come first in every list. */
+/** Host-owned: `a` and `b`. `b` is the newer digest. Its outcome wins, and its items come first in each group. */
 export function mergeDigest(a: CrossingDigest, b: CrossingDigest): CrossingDigest | undefined {
   const outcome = hostOutcome(b);
   if (outcome === undefined || hostOutcome(a) === undefined) return undefined;
@@ -245,7 +267,7 @@ function zeroCounts(): Counts {
   return { touched: 0, decisions: 0, failures: 0, forSiblings: 0, open: 0 };
 }
 
-/** A received counter as a count, by PROPOSED rule (c). */
+/** A received counter as a count, by rule (c). */
 function sanitize(value: unknown): number {
   if (typeof value !== "number" || Number.isNaN(value) || value <= 0) return 0;
   return Math.min(Math.floor(value), OMITTED_MAX);
@@ -260,8 +282,8 @@ function bump(omitted: Omitted, key: keyof Counts, amount = 1): void {
 }
 
 /**
- * Normalizes text by the PROPOSED text rule and clips it to `max` UTF-8 bytes in the same pass, one whole character
- * or escape at a time, so a clip never splits either. Reads no further than the clip.
+ * Normalizes text by the text rule and clips it to `max` UTF-8 bytes in the same pass, one whole character or escape
+ * at a time, so a clip never splits either. Reads no further than the clip.
  */
 function cleanText(value: string, max = TEXT_BYTES): string {
   let out = "";
@@ -312,7 +334,7 @@ function readFailure(row: unknown): Failure | undefined {
   const where = field(row, "where");
   const kind = oneOf(CLASSES, field(row, "class"));
   const by = oneOf(AUTHORITIES, field(row, "by"));
-  if (!isText(signal) || !kind || !by) return undefined;
+  if (!isText(signal) || !kind || !by || (kind === "claim") !== (by === "claim")) return undefined;
   return { signal: cleanText(signal), ...(isText(where) ? { where: cleanText(where) } : {}), class: kind, by };
 }
 
@@ -325,20 +347,18 @@ function readSibling(row: unknown): Sibling | undefined {
 
 const readOpen = (item: unknown): string | undefined => (isText(item) ? cleanText(item) : undefined);
 
+const failureKey = (row: Failure) => JSON.stringify([row.signal, row.where ?? null]);
+
 /**
- * The single builder. Reads every source through the row readers first (text normalized and clipped, malformed
- * rows and invalid paths dropped and counted), so every dedupe key is computed from the stored text. Then merges,
- * applies the caps, and trims to the size bound.
+ * The single builder. Reads every source through the row readers (text normalized and clipped, malformed rows and
+ * invalid paths dropped and counted), so every dedupe key is computed from the stored text. Then builds the receipts
+ * alone (fold, caps, fit) and lets claims fill what is left, which makes claims invisible to receipts.
  */
 function combine(outcome: Outcome, sources: unknown[]): CrossingDigest {
   const omitted = zeroCounts();
-  const touched: Touched[] = [];
-  const decisions: Decision[] = [];
-  const failures: Failure[] = [];
-  const forSiblings: Sibling[] = [];
-  const open: string[] = [];
-  const collect = <T>(rows: unknown, read: (row: unknown) => T | undefined, into: T[], key: keyof Counts) => {
-    for (const row of listOf(rows)) {
+  const rows = { touched: [] as Touched[], decisions: [] as Decision[], failures: [] as Failure[], forSiblings: [] as Sibling[], open: [] as string[] };
+  const collect = <T>(list: unknown, read: (row: unknown) => T | undefined, into: T[], key: keyof Counts) => {
+    for (const row of listOf(list)) {
       const value = read(row);
       if (value === undefined) bump(omitted, key);
       else into.push(value);
@@ -347,66 +367,63 @@ function combine(outcome: Outcome, sources: unknown[]): CrossingDigest {
   for (const source of sources) {
     const received = field(source, "omitted");
     for (const key of COUNTERS) omitted[key] = add(omitted[key], sanitize(field(received, key)));
-    collect(field(source, "touched"), readTouched, touched, "touched");
-    collect(field(source, "decisions"), readDecision, decisions, "decisions");
-    collect(field(source, "failures"), readFailure, failures, "failures");
-    collect(field(source, "forSiblings"), readSibling, forSiblings, "forSiblings");
-    collect(field(source, "open"), readOpen, open, "open");
+    collect(field(source, "touched"), readTouched, rows.touched, "touched");
+    collect(field(source, "decisions"), readDecision, rows.decisions, "decisions");
+    collect(field(source, "failures"), readFailure, rows.failures, "failures");
+    collect(field(source, "forSiblings"), readSibling, rows.forSiblings, "forSiblings");
+    collect(field(source, "open"), readOpen, rows.open, "open");
   }
-
-  const digest: CrossingDigest = {
-    v: 1,
-    outcome,
-    touched: unionTouched(touched),
-    decisions: unique(decisions, item => JSON.stringify([item.what, item.why])),
-    failures: latestFailures(failures),
-    forSiblings: mergeSiblings(forSiblings),
-    open: unique(open, item => item),
-    omitted,
+  const [touched, claimTouched] = tiers(rows.touched, unionTouched, row => row.path);
+  const [failures, claimFailures] = tiers(rows.failures, list => unique(list, failureKey), failureKey);
+  const claims: Record<keyof Counts, unknown[]> = {
+    touched: claimTouched,
+    decisions: unique(rows.decisions, item => JSON.stringify([item.what, item.why])),
+    failures: claimFailures,
+    forSiblings: mergeSiblings(rows.forSiblings),
+    open: unique(rows.open, item => item),
   };
-  const isClaim = (row: { by: string }) => row.by === "claim";
-  bump(omitted, "touched", trimTo(digest.touched, CAPS.touched, isClaim));
-  bump(omitted, "decisions", trimTo(digest.decisions, CAPS.decisions));
-  bump(omitted, "failures", trimTo(digest.failures, CAPS.failures, isClaim));
-  bump(omitted, "forSiblings", trimTo(digest.forSiblings, CAPS.forSiblings));
-  bump(omitted, "open", trimTo(digest.open, CAPS.open));
-  return trimBytes(digest);
+
+  // Receipts alone, as if no claim existed: each list's cap, then the byte fit with every claim list empty.
+  const digest: CrossingDigest = { v: 1, outcome, touched, decisions: [], failures, forSiblings: [], open: [], omitted };
+  for (const key of COUNTERS) bump(omitted, key, cut(digest[key], CAPS[key]));
+  fit(digest, ["touched", "failures"], () => true);
+  // Claims take only the slots and bytes that are left, after the receipts of their list, and never move a receipt.
+  for (const key of COUNTERS) {
+    bump(omitted, key, cut(claims[key], CAPS[key] - digest[key].length));
+    (digest[key] as unknown[]).push(...claims[key]);
+  }
+  fit(digest, ["open", "forSiblings", "decisions", "touched", "failures"], row => !isReceipt(row));
+  return digest;
 }
 
-/** Unions rows by path. A receipt beats a claim, and with equal authority the stronger operation wins. */
+/**
+ * Splits rows into receipts and claims and folds each group alone, so a claim never takes a receipt's position or
+ * slot. A claim whose key a receipt holds is folded away without a count, as any folded row is.
+ */
+function tiers<T>(rows: T[], fold: (rows: T[]) => T[], key: (row: T) => string): [T[], T[]] {
+  const receipts = rows.filter(isReceipt);
+  const held = new Set(receipts.map(key));
+  return [fold(receipts), fold(rows.filter(row => !isReceipt(row) && !held.has(key(row))))];
+}
+
+/** Folds rows of one authority by path: the stronger operation wins and ids are unioned, newest first. */
 function unionTouched(rows: Touched[]): Touched[] {
   const merged = new Map<string, Touched>();
   for (const row of rows) {
     const previous = merged.get(row.path);
-    merged.set(row.path, previous ? joinTouched(previous, row) : row);
+    if (!previous) {
+      merged.set(row.path, row);
+      continue;
+    }
+    const op = OP_RANK[row.op] > OP_RANK[previous.op] ? row.op : previous.op;
+    const ids = [...new Set([...(previous.ids ?? []), ...(row.ids ?? [])])].slice(0, ID_LIMIT);
+    merged.set(row.path, { path: previous.path, op, by: previous.by, ...withIds(ids) });
   }
   return [...merged.values()];
 }
 
-/** Across authorities the receipt's operation and ids stand alone, so member ids never reach a receipt. */
-function joinTouched(previous: Touched, next: Touched): Touched {
-  if (previous.by !== next.by) {
-    const receipt = previous.by === "receipt" ? previous : next;
-    return { path: receipt.path, op: receipt.op, by: "receipt", ...withIds(receipt.ids) };
-  }
-  const op = OP_RANK[next.op] > OP_RANK[previous.op] ? next.op : previous.op;
-  const ids = [...new Set([...(previous.ids ?? []), ...(next.ids ?? [])])].slice(0, ID_LIMIT);
-  return { path: previous.path, op, by: previous.by, ...withIds(ids) };
-}
-
 function withIds(ids: string[] | undefined): { ids?: string[] } {
   return ids?.length ? { ids } : {};
-}
-
-/** Keeps one failure per signal and place. The first row in the list wins, and a receipt beats a claim. */
-function latestFailures(rows: Failure[]): Failure[] {
-  const best = new Map<string, Failure>();
-  for (const row of rows) {
-    const key = JSON.stringify([row.signal, row.where ?? null]);
-    const previous = best.get(key);
-    if (!previous || (row.by === "receipt" && previous.by !== "receipt")) best.set(key, row);
-  }
-  return [...best.values()];
 }
 
 /** Sibling notes with the same text fold into one row whose paths are the union, capped at 8. */
@@ -424,6 +441,7 @@ function mergeSiblings(rows: Sibling[]): Sibling[] {
   return [...merged.values()];
 }
 
+/** The first row per key, so the newest of each kept. */
 function unique<T>(items: T[], keyOf: (item: T) => string): T[] {
   const seen = new Set<string>();
   return items.filter(item => {
@@ -434,54 +452,27 @@ function unique<T>(items: T[], keyOf: (item: T) => string): T[] {
   });
 }
 
-/** Drops claims first, then the oldest rows, until the list fits. Returns how many rows went. */
-function trimTo<T>(items: T[], max: number, isClaim: (item: T) => boolean = () => false): number {
-  let dropped = 0;
-  for (let index = items.length - 1; index >= 0 && items.length > max; index -= 1) {
-    if (isClaim(items[index])) {
-      items.splice(index, 1);
-      dropped += 1;
-    }
-  }
-  while (items.length > max) {
-    items.pop();
-    dropped += 1;
-  }
-  return dropped;
+/** Drops the oldest rows past `max`. Returns how many went. */
+function cut(items: unknown[], max: number): number {
+  return items.splice(Math.max(0, max)).length;
 }
 
 /**
- * Proposed trim order (design part 9 gives none): open, forSiblings, decisions, claim touched, claim failures,
- * receipt touched, receipt failures. Each step drops the oldest row of its kind until the digest fits. Fitting
- * measures the digest with every counter at OMITTED_MAX and the widest outcome (the receipt-space invariant).
- * PROPOSED: the outcome reserve, because mergeDigest takes the newer digest's outcome, which may be wider.
+ * PROPOSED trim order (design part 9 gives none): receipts are fitted alone first, oldest receipt touched rows and then
+ * oldest receipt failures; claims are fitted afterwards in the order open, forSiblings, decisions, claim touched,
+ * claim failures. Each step drops the oldest droppable row of its list until the digest fits, measured with the
+ * reserve.
  */
-function trimBytes(digest: CrossingDigest): CrossingDigest {
+function fit(digest: CrossingDigest, order: readonly (keyof Counts)[], droppable: (row: unknown) => boolean): void {
   const reserved = () => digestBytes({ ...digest, outcome: WIDEST_OUTCOME, omitted: WIDEST_COUNTS });
-  const dropOldest = <T>(items: T[], pick: (item: T) => boolean = () => true): boolean => {
-    for (let index = items.length - 1; index >= 0; index -= 1) {
-      if (pick(items[index])) {
-        items.splice(index, 1);
-        return true;
-      }
+  for (const key of order) {
+    const items: unknown[] = digest[key];
+    for (let index = items.length - 1; index >= 0 && reserved() > DIGEST_LIMIT_BYTES; index -= 1) {
+      if (!droppable(items[index])) continue;
+      items.splice(index, 1);
+      bump(digest.omitted, key);
     }
-    return false;
-  };
-  const isClaim = (row: { by: string }) => row.by === "claim";
-  const isReceipt = (row: { by: string }) => row.by === "receipt";
-  const steps: [() => boolean, keyof Counts][] = [
-    [() => dropOldest(digest.open), "open"],
-    [() => dropOldest(digest.forSiblings), "forSiblings"],
-    [() => dropOldest(digest.decisions), "decisions"],
-    [() => dropOldest(digest.touched, isClaim), "touched"],
-    [() => dropOldest(digest.failures, isClaim), "failures"],
-    [() => dropOldest(digest.touched, isReceipt), "touched"],
-    [() => dropOldest(digest.failures, isReceipt), "failures"],
-  ];
-  for (const [drop, counter] of steps) {
-    while (reserved() > DIGEST_LIMIT_BYTES && drop()) bump(digest.omitted, counter);
   }
-  return digest;
 }
 
 /**

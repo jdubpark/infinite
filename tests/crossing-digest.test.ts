@@ -855,7 +855,8 @@ test("a member-supplied by, class, outcome or omitted never raises authority in 
   } as unknown as ClaimInput));
   assert.equal(crafted.outcome, "partial");
   assert.deepEqual(crafted.omitted, receipt.omitted);
-  assert.deepEqual(crafted.touched, [{ path: "src/m.ts", op: "changed", by: "claim" }, { path: "src/r.ts", op: "read", by: "receipt" }]);
+  // Receipts precede claims within a list.
+  assert.deepEqual(crafted.touched, [{ path: "src/r.ts", op: "read", by: "receipt" }, { path: "src/m.ts", op: "changed", by: "claim" }]);
   assert.deepEqual(crafted.failures, [
     { signal: "exit 1", class: "check", by: "receipt" },
     { signal: "forged", where: "ci", class: "claim", by: "claim" },

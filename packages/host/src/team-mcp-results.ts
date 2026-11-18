@@ -1,12 +1,54 @@
 import { z } from "zod";
 import { ENTRY_KINDS, type MemberHead } from "./evidence/entry-types.js";
 import type { MemberEntry, MemberList } from "./evidence/entry-reads.js";
-import { handoffEnvelopeSchema } from "./handoff-types.js";
-import { missionReportEnvelopeSchema } from "./mission-types.js";
-import type { TeamReportEnvelope, TeamRole } from "./team-types.js";
+import type { PendingEntry } from "./team-entry-route.js";
+import type { TeamRole } from "./team-types.js";
 
-/** Whether two types are mutually assignable. A field added to one side only makes the check `false`, and `tsc` fails. */
-type Exact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+/**
+ * A type's wire shape. Each object becomes its key set and its fields, every key made required and tagged with
+ * whether it was optional, recursively through nested objects, array elements, and union members. Readonly and
+ * mutable arrays have the same shape. `unknown` stays `unknown`; `any` gets a shape of its own, so it matches only `any`.
+ */
+type Shape<T> = 0 extends 1 & T ? { any: true }
+  : unknown extends T ? T
+  : T extends readonly (infer E)[] ? readonly Shape<E>[]
+  : T extends object ? { keys: keyof T; fields: { -readonly [K in keyof T]-?: { optional: {} extends Pick<T, K> ? true : false; value: Shape<T[K]> } } }
+  : T;
+
+/**
+ * Whether two types have the same wire shape: mutual assignability of their shapes. A key on one side only, required
+ * or optional, a key optional on one side only, or a different field type makes it `false`, at any depth.
+ * `exactOptionalPropertyTypes` is off in this package, so `x?: T` and `x?: T | undefined` are one type and this check
+ * cannot tell them apart. Tuples compare as arrays of their element union.
+ */
+export type Exact<A, B> = [Shape<A>] extends [Shape<B>] ? ([Shape<B>] extends [Shape<A>] ? true : false) : false;
+/** Fails the typecheck unless its argument is `true`. */
+type Check<T extends true> = T;
+
+// Compile-time cases for `Exact`. A case under `@ts-expect-error` fails the typecheck if it ever compiles.
+type Head = { id: string; tags: string[]; body: unknown; kind: "a" | "b"; at?: string };
+type ExactCases = [
+  Check<Exact<Head, { id: string; tags: readonly string[]; body: unknown; kind: "b" | "a"; at?: string | undefined }>>,
+  Check<Exact<{ heads: Head[]; next?: number }, { heads: readonly Head[]; next?: number }>>,
+];
+// @ts-expect-error An optional key added on the second side.
+type ExactOptionalAdded = Check<Exact<{ id: string }, { id: string; added?: number }>>;
+// @ts-expect-error An optional key added on the first side.
+type ExactOptionalRemoved = Check<Exact<{ id: string; added?: number }, { id: string }>>;
+// @ts-expect-error A required key made optional.
+type ExactOptionalMade = Check<Exact<{ id: string }, { id?: string }>>;
+// @ts-expect-error An optional key added inside a nested object.
+type ExactNestedOptional = Check<Exact<{ head: { id: string } }, { head: { id: string; added?: string } }>>;
+// @ts-expect-error An optional key added inside an array element.
+type ExactElementOptional = Check<Exact<{ heads: { id: string }[] }, { heads: { id: string; added?: string }[] }>>;
+// @ts-expect-error A literal member added to an enum.
+type ExactEnumWidened = Check<Exact<{ kind: "a" | "b" }, { kind: "a" | "b" | "c" }>>;
+// @ts-expect-error A known type in place of `unknown`.
+type ExactUnknownNarrowed = Check<Exact<{ body: unknown }, { body: string }>>;
+// @ts-expect-error `any` in place of a known type.
+type ExactAny = Check<Exact<{ id: any }, { id: string }>>;
+// @ts-expect-error A key added to one object member of a union.
+type ExactUnionMember = Check<Exact<{ a: string } | { a: string; b: string }, { a: string } | { a: string; b: string; c?: string }>>;
 
 const TEAM_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery", "intent-checker"] as const satisfies readonly TeamRole[];
 const uuid = z.uuid();
@@ -17,20 +59,19 @@ const message = z.string();
 
 /** The `report` answer: the durable receipt's binding and the receipt sentence. */
 export const reportResultSchema = z.object({ requestId: uuid, runId: uuid, memberId: uuid, revision, message }).strict();
-export const reportResultMatches: Exact<z.output<typeof reportResultSchema>, Pick<TeamReportEnvelope, "requestId" | "runId" | "memberId" | "revision"> & { message: string }> = true;
 
 /** The `mission_report` answer: the durable receipt's binding and the receipt sentence. */
 export const missionReportResultSchema = z.object({ requestId: uuid, missionId: uuid, memberId: uuid, revision, message }).strict();
-export const missionReportResultMatches: Exact<z.output<typeof missionReportResultSchema>, Pick<z.infer<typeof missionReportEnvelopeSchema>, "requestId" | "missionId" | "memberId" | "revision"> & { message: string }> = true;
 
 /** The `handoff` answer: the session that the handoff names and the receipt sentence. */
 export const handoffResultSchema = z.object({ sessionId: uuid, message }).strict();
-export const handoffResultMatches: Exact<z.output<typeof handoffResultSchema>, Pick<z.infer<typeof handoffEnvelopeSchema>, "sessionId"> & { message: string }> = true;
 
-/** The `entry_post` answer: the entry id, its state before the host stores it, and the receipt sentence. */
-export const entryPostResultSchema = z.object({ entryId: uuid, state: z.literal("pending"), message }).strict();
-export type EntryPostResult = z.infer<typeof entryPostResultSchema>;
-export const entryPostResultMatches: Exact<EntryPostResult, { entryId: string; state: "pending"; message: string }> = true;
+/** The session worker's answer to a post: the entry id and its state before the host stores it. */
+export const pendingEntrySchema = z.object({ entryId: uuid, state: z.literal("pending") }).strict();
+type PendingEntryMatches = Check<Exact<z.output<typeof pendingEntrySchema>, PendingEntry>>;
+
+/** The `entry_post` answer: the worker's pending receipt and the receipt sentence. */
+export const entryPostResultSchema = pendingEntrySchema.extend({ message }).strict();
 
 /** A member's view of one head. Field-for-field the `MemberHead` pick of `EntryHead`. */
 export const memberHeadSchema = z.object({
@@ -48,7 +89,7 @@ export const memberHeadSchema = z.object({
   supersedes: uuid.optional(),
   state: z.enum(["active", "superseded", "withdrawn"]),
 }).strict();
-export const memberHeadMatches: Exact<z.output<typeof memberHeadSchema>, MemberHead> = true;
+type MemberHeadMatches = Check<Exact<z.output<typeof memberHeadSchema>, MemberHead>>;
 
 /** The `entry_list` answer, as `listForMember` builds it. */
 export const memberListSchema = z.object({
@@ -58,7 +99,7 @@ export const memberListSchema = z.object({
   cursor: z.number().int().min(0).optional(),
   unreadable: z.number().int().min(0),
 }).strict();
-export const memberListMatches: Exact<z.output<typeof memberListSchema>, MemberList> = true;
+type MemberListMatches = Check<Exact<z.output<typeof memberListSchema>, MemberList>>;
 
 /** The `entry_get` answer, as `getForMember` builds it. */
 export const memberEntrySchema = z.object({
@@ -66,7 +107,18 @@ export const memberEntrySchema = z.object({
   head: memberHeadSchema,
   body: z.unknown(),
 }).strict();
-export const memberEntryMatches: Exact<z.output<typeof memberEntrySchema>, MemberEntry> = true;
+type MemberEntryMatches = Check<Exact<z.output<typeof memberEntrySchema>, MemberEntry>>;
+
+/**
+ * The result a write tool answers, by tool name. team-mcp.ts builds each write result as this type, so the compiler
+ * checks the returned object against the schema that `outputSchemas` advertises for the same name.
+ */
+export type WriteResults = {
+  report: z.output<typeof reportResultSchema>;
+  mission_report: z.output<typeof missionReportResultSchema>;
+  handoff: z.output<typeof handoffResultSchema>;
+  entry_post: z.output<typeof entryPostResultSchema>;
+};
 
 /** The `tools/list` `outputSchema` of each result. Each root is an object. */
 export const outputSchemas = {

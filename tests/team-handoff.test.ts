@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import { startHost, waitFor, claimControl } from "./helpers.js";
 import { git, mixedLineup } from "./team-fixture.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
-import { handoffResultSchema } from "../packages/host/src/team-mcp-results.js";
+import { schemaRefusals } from "./wire-schema.js";
 
 async function fixture(optIn = true, externalCmux = false, teamOptions: Record<string, unknown> = {}) {
   const root = realpathSync(mkdtempSync("/tmp/inf-handoff-")), source = join(root, "source"), receipts = join(root, "receipts");
@@ -63,13 +63,17 @@ async function tool(server: any, request: unknown) {
   let stdout = ""; child.stdout.on("data", value => stdout += value); child.stderr.resume();
   child.stdin.end([
     { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "Handoff process test", version: "1" } } },
+    { jsonrpc: "2.0", id: 3, method: "tools/list", params: {} },
     { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "handoff", arguments: request } },
   ].map(value => JSON.stringify(value)).join("\n") + "\n");
   const timer = setTimeout(() => child.kill("SIGKILL"), 15000);
   try { await new Promise<void>((done, reject) => { child.once("error", reject); child.once("exit", () => done()); }); }
   finally { clearTimeout(timer); }
-  const reply = stdout.trim().split("\n").map(value => JSON.parse(value)).find(value => value.id === 2);
+  const replies = stdout.trim().split("\n").map(value => JSON.parse(value));
+  const reply = replies.find(value => value.id === 2);
   assert.ok(reply?.result, "The generated MCP command must return a tool receipt");
+  const advertised = replies.find(value => value.id === 3)?.result?.tools?.find((item: { name: string }) => item.name === "handoff")?.outputSchema;
+  if (reply.result.isError === false) assert.deepEqual(schemaRefusals(advertised, reply.result.structuredContent), [], "A handoff answers the result type its own server advertised");
   return reply.result;
 }
 const request = (head: string) => ({ backgroundWorkStopped: true, objective: "Inspect whether the source needs parallel implementation", reason: "Independent review may resolve the task", summary: "No partial edits remain", checkpointHead: head, parallelism: 2 });
@@ -94,7 +98,6 @@ test("authenticated handoff refuses dirty source, waits for its lease, and survi
     const head = git(f.source, "rev-parse", "HEAD");
     const handoffAnswer = await tool(receipt.server, request(head));
     assert.equal(handoffAnswer.isError, false);
-    assert.equal(handoffResultSchema.safeParse(handoffAnswer.structuredContent).success, true, "the handoff answer matches its declared result type");
     assert.equal(handoffAnswer.structuredContent.message, handoffAnswer.content[0].text, "the receipt sentence is in message and in the text");
     assert.equal((await tool(receipt.server, request(head))).isError, false, "An identical MCP retry is acknowledged without another transfer");
     assert.equal((await tool(receipt.server, { ...request(head), summary: "Conflicting retry" })).isError, true);

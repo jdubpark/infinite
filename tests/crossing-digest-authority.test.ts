@@ -190,6 +190,24 @@ test("reproduction: a claim on the oldest of 24 receipts does not change which r
   }
 });
 
+test("contract: a claim on a receipt's path is dropped with its ids, and overlapping merges count omissions twice", () => {
+  // Rule (h): the claim's ids and operation do not survive, and nothing is counted.
+  const held = valid(built.withClaims(valid(built.hostDigest({ outcome: "partial", read: ["a"] })), {
+    touched: [{ path: "a", op: "removed", ids: ["symbol"] }, { path: "new", op: "added" }],
+  }));
+  assert.deepEqual(held.touched, [{ path: "a", op: "read", by: "receipt" }, { path: "new", op: "added", by: "claim" }]);
+  assert.equal(held.omitted.touched, 0);
+  // The merge contract: counters add, so a digest merged with itself or with its own descendant counts twice.
+  const d = valid(built.hostDigest({ outcome: "partial", read: Array.from({ length: 25 }, (_, index) => `r${index}`) }));
+  assert.equal(d.omitted.touched, 1);
+  assert.equal(valid(built.fitDigest(d)).omitted.touched, 1);
+  for (const other of [d, valid(built.withClaims(d, { open: ["q"] }))]) {
+    const merged = valid(built.mergeDigest(d, other));
+    assert.deepEqual(merged.touched, d.touched);
+    assert.equal(merged.omitted.touched, 2);
+  }
+});
+
 function mulberry32(seed: number): () => number {
   let state = seed >>> 0;
   return () => {
@@ -445,7 +463,7 @@ test("text rule: text made only of expanding characters stays within every bound
       assert.equal(values.length, expected.length, `${where}: field count`);
       for (const value of values) assert.equal(typeof value, "string", `${where}: field missing`);
       assert.deepEqual(values, expected, where);
-      for (const value of expected) assert.ok(utf8(value) <= (name === "ids" ? 120 : 240), where);
+      for (const value of values as string[]) assert.ok(utf8(value) <= (name === "ids" ? 120 : 240), where);
       assert.deepEqual(read(valid(built.fitDigest(valid(built.withClaims(empty, claims))))), expected, `${where}: refit`);
     }
     // Every field at once is still within the byte bound (the fit decides which rows remain).

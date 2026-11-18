@@ -25,13 +25,18 @@ import { z } from "zod";
  * the result (their content, their order, and which ones survive every cap and the byte fit) are exactly those of the
  * same sequence with every claim removed. This holds by construction: `combine` folds, caps and fits the receipts of
  * each list alone, as if no claim existed, and only then lets claims take the slots and bytes that are left, for keys
- * no receipt holds (rule (f)).
+ * no receipt holds (rule (h)).
  * PROPOSED order: within `touched` and `failures` every receipt precedes every claim, and each group is newest first.
  *
  * Receipt space. PROPOSED reserve: fitting measures a digest as if all five `omitted` counters stood at OMITTED_MAX
  * and the outcome were the widest one, so later counting or a newer outcome never takes receipt space. The reserve is
  * 0 to 17 bytes, so a receipt that would fit without it can be dropped: with the outcome `partial`, seven 229-byte
  * paths measure 2,047 bytes, and six are kept.
+ *
+ * PROPOSED merge contract. Counters add when digests merge, so mergeDigest expects two digests of disjoint histories.
+ * Merging a digest with itself, or with a digest built from it, keeps each row once and counts the omissions twice,
+ * because a digest cannot tell which omissions two histories share. The storage slice must merge each crossing once,
+ * by its crossing id.
  */
 
 /** Byte bound for a digest, measured as JSON. */
@@ -113,9 +118,13 @@ const counter = z.number().int().min(0).max(OMITTED_MAX);
  *     disagree is malformed.
  * PROPOSED (f) Folding: rows of one authority with the same path union their ids (at most 8) and keep the stronger
  *     operation; the newest failure per signal and place wins; sibling notes with the same text union their paths.
- *     A claim whose path, or signal and place, a receipt holds is folded into that receipt without a count, even
- *     when a cap or the fit later drops the receipt.
+ *     The stronger operation and the newest failure are chosen among rows of one authority only, so a newer claim
+ *     never replaces or changes an older receipt.
  * PROPOSED (g) `forSiblings` and `open` get counters in `omitted`, beside the three of the design.
+ * PROPOSED (h), for the owner: a claim whose path, or signal and place, a receipt holds is dropped without a count,
+ *     even when a cap or the fit later drops the receipt. Its ids and its operation do not survive, so a digest holds
+ *     identifiers only for paths that have no receipt. Keeping such a claim as a row of its own would keep the
+ *     identifiers and would take bytes from decisions, sibling notes and open questions, which the fit trims first.
  */
 /** Checks shape, never provenance: a digest that passes is not thereby host-built. */
 export const crossingDigestSchema = z.object({
@@ -398,7 +407,7 @@ function combine(outcome: Outcome, sources: unknown[]): CrossingDigest {
 
 /**
  * Splits rows into receipts and claims and folds each group alone, so a claim never takes a receipt's position or
- * slot. A claim whose key a receipt holds is folded away without a count, as any folded row is.
+ * slot. A claim whose key a receipt holds is dropped without a count, by rule (h).
  */
 function tiers<T>(rows: T[], fold: (rows: T[]) => T[], key: (row: T) => string): [T[], T[]] {
   const receipts = rows.filter(isReceipt);

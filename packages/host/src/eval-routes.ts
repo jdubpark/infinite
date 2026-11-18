@@ -21,6 +21,7 @@ const MESSAGES: Record<EvalRefusal["code"], string> = {
   "job-active": "This project already has an active validation job.",
   "request-conflict": "This request ID already names a different job.",
   "eval-config-incomplete": "The project's validation settings are incomplete.",
+  "profile-not-approved": "The trial profile is not approved for this project.",
   "invalid-job-transition": "The job cannot take this action in its current state.",
   "task-not-active": "The task is not a candidate or valid task.",
   "evidence-unavailable": "The evidence store is unavailable.",

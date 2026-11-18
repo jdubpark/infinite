@@ -77,7 +77,11 @@ export function evalSummary(store: EvidenceStore, input: SummaryInput): EvalSumm
     tasks: { ...tasksOf(counted.states), byArea: counted.areas, bySet: null },
     groups: counted.groups,
     coverage: coverageOf(store, project, counted.validCaptured, days, now),
-    grader: { state: input.grader },
+    // Compile-only seam (INF-291 Task 1): the grader version is null until Task 11 or 13 reads it.
+    grader: { state: input.grader, version: null },
+    // Compile-only seam (INF-291 Task 1): no eval identity probe or trial count exists yet; Tasks 12 and 13 fill these.
+    evalIdentity: { state: "not-configured" },
+    trials: { today: 0, dailyCap: null },
     jobs: input.jobs.slice(0, SUMMARY_JOBS),
   };
 }

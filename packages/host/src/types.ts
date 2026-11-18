@@ -44,6 +44,10 @@ export interface ExecutionState {
 /** Why a team session exists. Only the host sets it, through createTeamSession. */
 export type SessionPurpose = "work" | "duel" | "replay" | "gate";
 export const SESSION_PURPOSES: readonly SessionPurpose[] = ["work", "duel", "replay", "gate"];
+export const LEARNING_PURPOSES: readonly SessionPurpose[] = ["replay", "gate"];
+export function learningPurpose(purpose: SessionPurpose | undefined): boolean {
+  return purpose !== undefined && LEARNING_PURPOSES.includes(purpose);
+}
 export interface Session {
   /** Host-owned (contract C8). Set only through createTeamSession, and never changed. */
   purpose?: SessionPurpose;

@@ -22,6 +22,8 @@ const stateCounts = (byState: Record<EvalState, number>) => EVAL_STATES.map(stat
 export function evalJobLines(job: EvalJobView): string[] {
   const reason = job.reason ? ` · ${clean(job.reason)}` : "";
   const waiting = job.waiting ? ` · waiting ${clean(job.waiting)}` : "";
+  // Compile-only seam (INF-291 Task 1): a baseline job has no counts until Task 14 renders its own lines.
+  if (job.kind !== "validate") return [`job ${clean(job.jobId)} ${clean(job.status)}${reason}${waiting}`];
   const { counts } = job;
   return [
     `job ${clean(job.jobId)} ${clean(job.status)}${reason}${waiting}`,

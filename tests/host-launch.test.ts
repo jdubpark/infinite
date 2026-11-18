@@ -443,6 +443,26 @@ test("a served headless Claude launch loads only the host's settings, with the c
   assert.deepEqual(Object.keys(quiet.hooks).sort(), ["PermissionRequest", "PreToolUse"]);
 });
 
+test("Claude team launches load no project or local settings file, so one member cannot widen a later member", () => {
+  const sources = (args: string[]) => args.flatMap((arg, index) => arg === "--setting-sources" ? [args[index + 1]] : []);
+  const member = buildLaunch("claude", { command: "claude", args: ["--model", "opus"] }, "Implement this task", hooks, relay, enabled, true);
+  assert.deepEqual(sources(member.args), ["user"]);
+  assert.equal(member.args.at(-1), "Implement this task");
+  const mission = buildLaunch("claude", missionCoordinatorLaunch("claude", { command: "claude", args: [] }), "Report the mission", hooks, relay, enabled, true);
+  assert.deepEqual(sources(mission.args), ["user"]);
+  const reviewer = buildLaunch("claude", permissionCoordinatorLaunch("claude", { command: "claude", args: ["--model", "sonnet"] }), "Review", hooks, relay, enabled, true);
+  assert.deepEqual(sources(reviewer.args), ["user"]);
+  // A served member already loads no settings file at all; the two flags never meet.
+  const served = buildLaunch("claude", { command: "claude", args: ["-p"] }, "go", hooks, relay, enabled, true, undefined, undefined, undefined, undefined, true);
+  assert.deepEqual(sources(served.args), [""]);
+  // Owner sessions and Codex members keep their settings files.
+  assert.deepEqual(sources(buildLaunch("claude", { command: "claude", args: [] }, "p", hooks, relay, enabled).args), []);
+  assert.deepEqual(sources(buildLaunch("codex", { command: "codex", args: [] }, "p", hooks, relay, enabled, true).args), []);
+  for (const args of [["--setting-sources", "project"], ["--setting-sources=user,project"]])
+    assert.throws(() => buildLaunch("claude", { command: "claude", args }, "p", hooks, relay, enabled, true), /setting sources/);
+  assert.deepEqual(sources(buildLaunch("claude", { command: "claude", args: ["--setting-sources", "project"] }, "p", hooks, relay, enabled).args), ["project"]);
+});
+
 test("the launch reader finds headless launches, their allow rules, and what the channel cannot serve", () => {
   const claude = (...args: string[]) => headlessLaunch("claude", { command: "claude", args });
   assert.deepEqual(claude("--model", "opus"), { headless: false, allowlist: [] });

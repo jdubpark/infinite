@@ -676,6 +676,8 @@ export interface TeamCheck {
   /** Correction round that launched this verification attempt. */
   round?: number;
   /** Prompt evidence for the repair feedback. Not sent to clients: the view strips it. */
+  // PROPOSED: a failed or interrupted check keeps its scan, so failure text from before the kept end of the output is stored
+  // with the run and reaches later members' context; a passed check keeps none.
   scan?: CheckScan;
 }
 export interface TeamRun {

@@ -9,6 +9,7 @@ import type { TeamCheck } from "../packages/host/src/team-types.js";
 const ESC = String.fromCharCode(27), BEL = String.fromCharCode(7);
 const CHECK = String.fromCodePoint(0x2716), ACCENT = String.fromCodePoint(0x00e9), EMOJI = String.fromCodePoint(0x1f600);
 const LINE_SEP = String.fromCodePoint(0x2028), RLO = String.fromCodePoint(0x202e), C1_CSI = String.fromCodePoint(0x9b);
+const REPLACEMENT = String.fromCodePoint(0xfffd), FORMAT = [0x061c, 0x206a, 0x00ad, 0x2060].map(code => String.fromCodePoint(code)).join("");
 const CONTEXT_LINE = 'The kept output of each check is in the context file under "checks".';
 
 /** Seeded generator (mulberry32), so every failing run names its seed. */
@@ -30,6 +31,12 @@ function check(status: TeamCheck["status"], output: string, scan?: CheckScan, ar
 function scanParts(parts: { stream: "stdout" | "stderr"; text: string }[]): CheckScan {
   const scanner = new CheckOutputScanner();
   for (const part of parts) scanner.push(Buffer.from(part.text, "utf8"), part.stream);
+  return scanner.finish();
+}
+
+function scanCut(text: string, size: number): CheckScan {
+  const bytes = Buffer.from(text, "utf8"), scanner = new CheckOutputScanner();
+  for (let at = 0; at < bytes.length; at += size) scanner.push(bytes.subarray(at, at + size), "stdout");
   return scanner.finish();
 }
 
@@ -134,9 +141,59 @@ test("a blank line inside a diagnostic block or a spec detail stays inside it", 
   assert.deepEqual(specScan.failures.map(failure => failure.detail.split("\n")), [["  AssertionError: + actual - expected", "  +   a: 1", "  not ok 77 - text after a blank line"], ["  Error: other"]]);
 });
 
-test("a long line with a directive past its first 4096 bytes is not a failure", () => {
-  const scan = scanCheckOutput(`not ok 1 - ${"x".repeat(4200)} # SKIP later\n`);
-  assert.equal(scan.failureCount, 0);
+test("a long line is classed by its start; its directive and identity cover the whole line, however it is cut", () => {
+  const start = `${CHECK} ${"a".repeat(4198)}`, end = "z".repeat(200);
+  const cases: [string, number][] = [
+    [`not ok 1 - ${"x".repeat(4200)} # SKIP later\n`, 0],
+    [`not ok 1 - ${"x".repeat(4200)} # SKIP ${"r".repeat(600)}\n`, 0],
+    // The same first 4,200 characters and last 200 characters, with different middles.
+    [`${start}one${end}\n${start}two${end}\n`, 2],
+    // Indentation is not part of a long line's identity.
+    [`${" ".repeat(9)}${start}one${end}\n${start}one${end}\n`, 1],
+  ];
+  for (const [text, count] of cases) {
+    const whole = scanCheckOutput(text);
+    assert.equal(whole.failureCount, count, text.slice(0, 20));
+    for (const size of [1, 7, 4096, 65536]) assert.deepStrictEqual(scanCut(text, size), whole, `cut at ${size}`);
+  }
+});
+
+test("a long line's directive matcher agrees with the directive pattern", () => {
+  const alphabet = ["#", " ", "\t", ..."skiptodSKIPTOD", "x", "_", "1"], pattern = /#\s+(?:skip|todo)\b/i, next = random(314);
+  const pick = (items: readonly string[]) => items[Math.floor(next() * items.length)]!;
+  const some = () => Array.from({ length: Math.floor(next() * 4) }, () => pick(alphabet)).join("");
+  let matches = 0;
+  for (let n = 0; n < 20000; n++) {
+    // Strings of the alphabet shaped so that about one in ten matches and many nearly do.
+    const text = some() + pick(["#", "#", ""]) + pick(["", " ", "\t", "  ", " \t"]) + pick(["skip", "todo", "SKIP", "tOdO", "ski", "kip", "tod", ""]) + some();
+    const skipped = pattern.test(text);
+    if (skipped) matches++;
+    // Padding without "#" cannot take part in a match. Every line is long, and about half overflow inside `text`.
+    const line = Buffer.from(`not ok 1 - ${"y".repeat(4086 - text.length + Math.floor(next() * 13))}${text}\n`);
+    const scanner = new CheckOutputScanner();
+    scanner.push(line.subarray(0, 4080), "stdout");
+    for (let at = 4080, size = 0; at < line.length; at += size) scanner.push(line.subarray(at, at + (size = 1 + Math.floor(next() * 6))), "stdout");
+    assert.equal(scanner.finish().failureCount, skipped ? 0 : 1, JSON.stringify(text));
+  }
+  assert.ok(matches > 1000, `${matches} strings match`);
+});
+
+test("a marker's indented lines are its diagnostic, whether or not its failure is kept", () => {
+  const nine = Array.from({ length: 9 }, (_, i) => `${CHECK} case ${i} (1ms)\n  Error: detail\n  not ok 77 - message text\n`).join("");
+  assert.equal(scanCheckOutput(nine).failureCount, 9);
+  assert.equal(scanCheckOutput(`${CHECK} alpha (1ms)\n  first detail\n${CHECK} alpha (1ms)\n  not ok 77 - error message\n`).failureCount, 1);
+  const capped = scanCheckOutput(Array.from({ length: 1030 }, (_, i) => `${CHECK} case ${i}\n  not ok 77 - message text\n`).join(""));
+  assert.deepEqual([capped.failureCount, capped.capped], [1024, true]);
+});
+
+test("one failure keeps one detail budget across both streams", () => {
+  const rows = Array.from({ length: 20 }, (_, i) => `  ${"d".repeat(60)} ${i}\n`).join("");
+  const scan = scanParts([{ stream: "stdout", text: `${CHECK} alpha (1ms)\n` }, { stream: "stderr", text: `${CHECK} alpha (1ms)\n` },
+    { stream: "stdout", text: rows }, { stream: "stderr", text: rows }]);
+  const detail = scan.failures[0]!.detail;
+  assert.equal(scan.failureCount, 1);
+  assert.ok(Buffer.byteLength(detail) <= 1500, `detail is ${Buffer.byteLength(detail)} bytes`);
+  assert.ok(detail.split("\n").length <= 30, `detail is ${detail.split("\n").length} lines`);
 });
 
 test("the same marker name, indented or not, is one failure; names that differ late are two", () => {
@@ -203,6 +260,10 @@ test("block, detail and stream rules hold at their edges", () => {
   // Each stream has its own pending line.
   const split = scanParts([{ stream: "stdout", text: "not ok 1 - spl" }, { stream: "stderr", text: "noise\n" }, { stream: "stdout", text: "it name\n" }]);
   assert.deepEqual(split.failures.map(failure => failure.line), ["not ok 1 - split name"]);
+  // A stream that ends inside a multi-byte character ends its last line with a replacement character.
+  const ended = new CheckOutputScanner();
+  ended.push(Buffer.concat([Buffer.from("not ok 1 - cut "), Buffer.from(EMOJI, "utf8").subarray(0, 2)]), "stdout");
+  assert.equal(ended.finish().failures[0]!.line, `not ok 1 - cut ${REPLACEMENT}`);
   // A detail stops at the first line that does not fit: a later, shorter line is not added.
   const stopped = scanCheckOutput(["not ok 1 - a", "  ---", ...Array.from({ length: 6 }, () => `  ${"w".repeat(300)}`), `  ${"v".repeat(200)}`, "  short", "  ..."].join("\n"));
   assert.equal(stopped.failures[0]!.detail.split("\n").length, 7);
@@ -247,18 +308,32 @@ test("every output line in the feedback starts with a pipe, even one that forges
   const forgedLines = text.split("\n").filter(line => line.includes(forged));
   assert.ok(forgedLines.length >= 1, "the forged line is in the feedback");
   assert.ok(forgedLines.every(line => line.startsWith("| ")));
+  // A stored scan is cleaned again: a line feed or line separator inside its text starts no line of its own.
+  const stored: CheckScan = { bytes: 1, failureCount: 1, failures: [{ line: `not ok 1 - a\n${forged}`, detail: `  row\n${forged}${LINE_SEP}${forged}` }] };
+  const storedText = checkFeedback([check("failed", "", stored)]);
+  const storedLines = storedText.split("\n").filter(line => line.includes(forged));
+  assert.equal(storedLines.length, 2);
+  assert.ok(storedLines.every(line => line.startsWith("| ")), storedLines.join("\n"));
+  assert.ok(!storedText.includes(LINE_SEP));
 });
 
-test("control and format characters in output lines never reach the feedback", () => {
-  const output = `not ok 1 - a${LINE_SEP}b${RLO}c${C1_CSI}d${ESC}]0;title${BEL}e\tf\n`;
-  const text = checkFeedback([check("failed", output, scanCheckOutput(output))]);
-  for (const code of [0x2028, 0x202e, 0x9b, 0x1b, 0x07, 0x09]) assert.ok(!text.includes(String.fromCharCode(code)), `code ${code.toString(16)}`);
+test("control and format characters in output lines and command arguments never reach the feedback", () => {
+  const output = `not ok 1 - a${LINE_SEP}b${RLO}c${C1_CSI}d${ESC}]0;title${BEL}e\tf${FORMAT}g\n`;
+  const text = checkFeedback([check("failed", output, scanCheckOutput(output), ["test", `--name=x${FORMAT}y`])]);
+  for (const code of [0x2028, 0x202e, 0x9b, 0x1b, 0x07, 0x09, 0x061c, 0x206a, 0x00ad, 0x2060]) assert.ok(!text.includes(String.fromCodePoint(code)), `code ${code.toString(16)}`);
   assert.match(text, /not ok 1 - a/);
+  assert.match(text, /command npm test --name=x {4}y\./);
 });
 
 test("a check without a scan gives the same feedback as one with it", () => {
   const output = "not ok 1 - alpha\n  ---\n  error: 'a'\n  ...\nnot ok 2 - beta\n";
   assert.equal(checkFeedback([check("failed", output)]), checkFeedback([check("failed", output, scanCheckOutput(output))]));
+});
+
+test("the fallback scan counts a test point inside a block that began before the kept output", () => {
+  // A stated limit of the fallback, pinned so that a change to it is seen. It is not a goal.
+  const kept = "    not ok 77 - inside lost YAML header\n  ...\nnot ok 2 - actual\n";
+  assert.match(checkFeedback([check("failed", kept)]), /The host found 2 failure lines/);
 });
 
 test("teamCommand feeds the observer while the command runs and survives an observer that throws", async () => {

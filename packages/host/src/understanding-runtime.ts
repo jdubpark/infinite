@@ -7,7 +7,7 @@ import type { Diagram, DiagramGraph, KnowledgeCatalog, KnowledgeComponent, Knowl
 import type { Config } from "./types.js";
 import type { ProjectGroup, ProjectGroupList, ProjectGroupRepo } from "./project-group-types.js";
 import { expectedIdentity, readGit } from "./checkout-identity.js";
-import { hostCommandEnvironment } from "./egress.js";
+import { agentModelClientEnvironment } from "./egress.js";
 import { failureReason } from "./failure-reason.js";
 import { componentGraph, diagramFromMermaid, diagramGraphSchema, linkDiagramNodes } from "./understanding-diagrams.js";
 import { seal, unseal, writeSealed } from "./vault.js";
@@ -846,7 +846,7 @@ export function runRepositoryContext(config: Config, root: string, options: Unde
   const commandArgs = [...briefing.args, "context", "--repo", root];
   return new Promise((resolvePromise, rejectPromise) => {
     let child: ChildProcess;
-    try { child = spawn(briefing.command, commandArgs, { cwd: root, env: hostCommandEnvironment(), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" }); }
+    try { child = spawn(briefing.command, commandArgs, { cwd: root, env: agentModelClientEnvironment(), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" }); }
     catch { rejectPromise(new Error("context-spawn-failed")); return; }
     onChild(child);
     let out = Buffer.alloc(0), stderrTail = Buffer.alloc(0), settled = false;

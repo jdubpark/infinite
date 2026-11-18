@@ -5,7 +5,7 @@ import { isAbsolute, relative, sep } from "node:path";
 import { z } from "zod";
 import { parseMermaid, type Diagram, type UnderstandingBrief, type KnowledgeClaim, type KnowledgeComponent, type KnowledgeDelivery, type KnowledgeEnvironment, type KnowledgePlan, type KnowledgePullRequest } from "@infinite/remote";
 import { expectedIdentity, normalizeRemote, readGit } from "./checkout-identity.js";
-import { hostCommandEnvironment } from "./egress.js";
+import { agentModelClientEnvironment } from "./egress.js";
 import { failureReason } from "./failure-reason.js";
 import { createContextAdapter, runRepositoryContext, understandingOutputLimits, type RepoContext, type RepositoryBriefOutput, type UnderstandingAdapter, type UnderstandingAdapterOptions } from "./understanding-runtime.js";
 import type { Config } from "./types.js";
@@ -68,11 +68,11 @@ export function validateBrief(value: unknown, root: string, context: RepoContext
   };
 }
 
-/** `env` defaults to the host process environment; brief runs pass `hostCommandEnvironment()`. */
+/** Brief runs are model clients run as the agent account, so `env` defaults to the configured egress; host-account `gh` reads pass `process.env`. */
 function run(command: string, args: string[], options: UnderstandingAdapterOptions & { cwd: string; timeoutMs?: number; maxBytes?: number; env?: NodeJS.ProcessEnv }): Promise<string> {
   return new Promise((resolvePromise, rejectPromise) => {
     let child: ChildProcess;
-    try { child = spawn(command, args, { cwd: options.cwd, ...(options.env ? { env: options.env } : {}), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" }); }
+    try { child = spawn(command, args, { cwd: options.cwd, env: options.env ?? agentModelClientEnvironment(), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" }); }
     catch { rejectPromise(new Error("understanding-process-unavailable")); return; }
     let output = Buffer.alloc(0), stderrTail = Buffer.alloc(0), reason: string | undefined, closed: number | null | undefined, escalated = false, settled = false;
     const finish = () => {
@@ -169,7 +169,7 @@ export function createUnderstandingAdapter(config: Config): UnderstandingAdapter
       if (!briefing) throw new Error("repository-briefings-unavailable");
       const context = await runRepositoryContext(config, input.root, options);
       const writerArgs = [...(briefing.runner ? ["--runner", briefing.runner] : []), ...(briefing.model ? ["--model", briefing.model] : []), "--timeout", String(Math.min(1800, Math.max(10, Math.ceil(briefing.timeoutMs / 1000))))];
-      const raw = await run(briefing.command, [...briefing.args, ...writerArgs, "brief", "--repo", input.root, "--base", input.baseCommit, "--format", "json", "--no-state", "--question", input.question], { ...options, env: hostCommandEnvironment(), cwd: input.root, timeoutMs: options.timeoutMs, maxBytes: Math.min(options.maxBytes, MAX_STDOUT) });
+      const raw = await run(briefing.command, [...briefing.args, ...writerArgs, "brief", "--repo", input.root, "--base", input.baseCommit, "--format", "json", "--no-state", "--question", input.question], { ...options, cwd: input.root, timeoutMs: options.timeoutMs, maxBytes: Math.min(options.maxBytes, MAX_STDOUT) });
       if (Buffer.byteLength(raw) > Math.min(options.maxBytes, MAX_STDOUT)) throw new Error("understanding-output-too-large");
       const parsed = validateBrief(JSON.parse(raw), input.root, context);
       if (parsed.base !== input.baseCommit) throw new Error("understanding-brief-base-mismatch");
@@ -201,7 +201,7 @@ export function createUnderstandingAdapter(config: Config): UnderstandingAdapter
         try {
           const briefConfig = config.repositoryBriefings;
           if (!briefConfig) throw new Error("repository-briefings-unavailable");
-                    const raw = await run(briefConfig.command, [...briefConfig.args, ...writerArgs(briefConfig), "brief", "--repo", input.root, "--focus", component.paths[0]?.path ?? "", "--question", briefQuestion(component, plans), "--format", "json", "--no-state"], { ...options, env: hostCommandEnvironment(), cwd: input.root, timeoutMs: options.timeoutMs, maxBytes: Math.min(options.maxBytes, MAX_STDOUT) });
+                    const raw = await run(briefConfig.command, [...briefConfig.args, ...writerArgs(briefConfig), "brief", "--repo", input.root, "--focus", component.paths[0]?.path ?? "", "--question", briefQuestion(component, plans), "--format", "json", "--no-state"], { ...options, cwd: input.root, timeoutMs: options.timeoutMs, maxBytes: Math.min(options.maxBytes, MAX_STDOUT) });
           if (Buffer.byteLength(raw) > Math.min(options.maxBytes, MAX_STDOUT)) throw new Error("understanding-output-too-large");
           const parsed = validateBrief(JSON.parse(raw), input.root, input.context);
           components.push(synthesized(component, parsed, plans, input.repositoryId));
@@ -217,7 +217,7 @@ export function createUnderstandingAdapter(config: Config): UnderstandingAdapter
       const briefConfig = config.repositoryBriefings;
       if (!briefConfig) throw new Error("repository-briefings-unavailable");
       const args = [...briefConfig.args, ...writerArgs(briefConfig), "brief", "--repo", input.root, "--format", "json", "--no-state", ...(input.base ? ["--base", input.base] : []), "--question", repositoryQuestion(input.components)];
-      const raw = await run(briefConfig.command, args, { ...options, env: hostCommandEnvironment(), cwd: input.root, timeoutMs: options.timeoutMs, maxBytes: Math.min(options.maxBytes, MAX_STDOUT) });
+      const raw = await run(briefConfig.command, args, { ...options, cwd: input.root, timeoutMs: options.timeoutMs, maxBytes: Math.min(options.maxBytes, MAX_STDOUT) });
       const parsed = validateBrief(JSON.parse(raw), input.root, input.context);
       const { diagrams = [], ...brief } = parsed.brief;
       const output: RepositoryBriefOutput = {
@@ -233,7 +233,7 @@ export function createUnderstandingAdapter(config: Config): UnderstandingAdapter
       const common = ["--repo", `${identity.owner}/${identity.repo}`];
       let prs: KnowledgePullRequest[];
       try {
-        const raw = await run("gh", ["pr", "list", ...common, "--state", "all", "--limit", "20", "--json", "number,title,url,state,headRefOid,mergeCommit,statusCheckRollup"], { ...options, cwd: input.root, maxBytes: 256 * 1024 });
+        const raw = await run("gh", ["pr", "list", ...common, "--state", "all", "--limit", "20", "--json", "number,title,url,state,headRefOid,mergeCommit,statusCheckRollup"], { ...options, env: process.env, cwd: input.root, maxBytes: 256 * 1024 });
         const parsed = prSchema.parse(JSON.parse(raw));
         prs = parsed.filter(item => githubUrl(item.url, identity.owner, identity.repo)).slice(0, 20).map(item => ({
           repositoryId: input.repositoryId, number: item.number, title: item.title, url: item.url,
@@ -245,7 +245,7 @@ export function createUnderstandingAdapter(config: Config): UnderstandingAdapter
       const coverage: string[] = [];
       let environments: KnowledgeEnvironment[] = [];
       try {
-        const raw = await run("gh", ["api", "--method", "GET", `repos/${identity.owner}/${identity.repo}/deployments?per_page=10`], { ...options, cwd: input.root, maxBytes: 128 * 1024 });
+        const raw = await run("gh", ["api", "--method", "GET", `repos/${identity.owner}/${identity.repo}/deployments?per_page=10`], { ...options, env: process.env, cwd: input.root, maxBytes: 128 * 1024 });
         const deployments = deploymentsSchema.parse(JSON.parse(raw));
         const newestDeployment = new Map<string, (typeof deployments)[number]>();
         for (const deployment of deployments) {
@@ -255,7 +255,7 @@ export function createUnderstandingAdapter(config: Config): UnderstandingAdapter
         const newest = new Map<string, KnowledgeEnvironment>();
         for (const deployment of newestDeployment.values()) {
           try {
-            const statusRaw = await run("gh", ["api", "--method", "GET", `repos/${identity.owner}/${identity.repo}/deployments/${deployment.id}/statuses?per_page=1`], { ...options, cwd: input.root, maxBytes: 32 * 1024 });
+            const statusRaw = await run("gh", ["api", "--method", "GET", `repos/${identity.owner}/${identity.repo}/deployments/${deployment.id}/statuses?per_page=1`], { ...options, env: process.env, cwd: input.root, maxBytes: 32 * 1024 });
             const status = statusSchema.parse(JSON.parse(statusRaw))[0];
             if (!status) { coverage.push(`Deployment ${deployment.id} has no reported status.`); continue; }
             const environment = status.environment || deployment.environment;

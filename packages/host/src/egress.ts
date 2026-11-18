@@ -176,7 +176,7 @@ export function hostEgressEnvironment(nowMs = Date.now()): Record<string, string
  * runs): `base` without inherited proxy state, plus the configured egress with the host identity. Without the egress
  * block it carries no proxy variables. Host-account calls such as `gh` keep their own environment.
  */
-export function hostCommandEnvironment(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+export function agentModelClientEnvironment(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   clearEgressEnvironment(env);
   Object.assign(env, hostEgressEnvironment());

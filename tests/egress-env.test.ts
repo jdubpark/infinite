@@ -211,7 +211,7 @@ test("System tab brief and context children get configured egress and discard in
       assert.equal(delivery.state, "unavailable");
       assert.deepEqual([...new Set(readFileSync(ghReceipt, "utf8").trim().split("\n"))], ["http://stale.invalid"], "gh keeps the inherited proxy state");
     }
-  }).finally(() => { process.env.PATH = previousPath; });
+  }).finally(() => { if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath; });
 });
 
 test("permission reviewer processes get configured egress with the host identity and nothing else of the host's", async () => {

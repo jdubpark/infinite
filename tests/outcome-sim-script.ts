@@ -5,7 +5,8 @@ import { runEventKey } from "../packages/host/src/run-events.js";
 
 /*
  * The event scripts of the outcome projector simulator (tests/outcome-projector-sim.test.ts): team runs as TeamService
- * emits them. Each order below is one the emitter guarantees, so a script keeps it (lines in teams.ts unless named):
+ * emits them. Each order below is one the emitter guarantees, so a script keeps it. Line numbers are those of teams.ts,
+ * unless a file is named, as the sources stood when this simulator was written:
  * - run.created opens a run (1604); run.prepared follows it (1664).
  * - A run's events reach the store in emission order: one outbox array per run, flushed whole (936-961, 1004-1019).
  * - A revision's project manager starts and reports first. Its task.planned events precede the starts of the plan's

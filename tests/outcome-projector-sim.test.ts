@@ -20,7 +20,8 @@ import { bump, type Counts, type Rand, rand, RunScript } from "./outcome-sim-scr
  * A seeded fault simulator for the outcome ledger projector (INF-309). Each seed scripts three team runs the way
  * TeamService emits their events (tests/outcome-sim-script.ts states each order it keeps or breaks), delivers them to
  * the real evidence store, outbox and projectors on temporary SQLite files under faults, and checks the invariants
- * below after every delivery, from the stored state alone. A failure names its seed and step.
+ * below after every delivery, from the stored state alone. A failure names its seed and step. Line numbers in this
+ * header are those of the sources as they stood when the simulator was written.
  *
  * What it checks, and what it does not: scheduling and stored-state consistency under restarts, replays, rollbacks,
  * gaps and the emitter's orders. It does not check that a handler applies the right rule. P1's reference store runs

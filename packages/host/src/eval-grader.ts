@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import type { Readable } from "node:stream";
+import type { Readable, Writable } from "node:stream";
 import { z } from "zod";
 import type { EvalGraderConfig } from "./eval-config.js";
 import type { GraderState } from "./eval-types.js";
@@ -9,12 +9,14 @@ export const PROBE_SECONDS = 30, STOP_ROUNDS = 3, STOP_PAUSE_MS = 1_000, GRADER_
   GRADER_OUTPUT_MAX = 65_536, GRADER_FREE_BYTES_MIN = 10_737_418_240, GRADER_FREE_INODES_MIN = 200_000;
 export const GRADER_ROUNDS = ["round-1", "round-2", "round-3", "round-4", "round-5", "round-6"] as const;
 export type GraderDir = "." | "task" | typeof GRADER_ROUNDS[number];
-export type GraderInput = "base.bundle" | "base-delta.patch" | "reference.patch";
-export type GraderProbe = { state: GraderState; uid?: number; storage?: boolean };
+export type GraderInput = "base.bundle" | "base-delta.patch" | "reference.patch" | "result.patch";
+export type GraderProbe = { state: GraderState; uid?: number; storage?: boolean; version?: number };
 export type GraderRun = { exitCode: number | null; timedOut: boolean; stdout?: Buffer; truncated: boolean; failed: boolean };
 export interface Grader {
   probe(canaries: readonly string[]): Promise<GraderProbe>;
   receive(job: string, name: GraderInput, input: Readable | Buffer, maxBytes: number): Promise<"stored" | "too-large" | "failed">;
+  /** Streams the trial branch's bundle into `sink`. Past `maxBytes` the stream is destroyed and nothing more is written. */
+  export(job: string, sink: Writable, maxBytes: number): Promise<"exported" | "too-large" | "failed">;
   /** `stdout` is kept, at most 64 KiB, only when `keepStdout` is true. `input` goes to the child's stdin. */
   run(job: string, dir: GraderDir, seconds: number, argv: readonly string[], options?: { input?: Buffer; keepStdout?: boolean }): Promise<GraderRun>;
   read(job: string, report: string, maxBytes: number): Promise<{ state: "read"; bytes: Buffer } | { state: "missing" | "too-large" | "failed" }>;
@@ -29,6 +31,7 @@ const REPORT_RE = /^reports\/round-[1-6]\.(xml|tap)$/;
 const DIGEST_RE = /^[0-9a-f]{64}\n?$/;
 /** Launcher time limits, in seconds. A round's clones and installed dependencies can hold hundreds of thousands of files, so `clean` and `remove` get the longer limit. */
 export const READ_SECONDS = 30, STOP_SECONDS = 30, RECEIVE_SECONDS = 600, DIGEST_SECONDS = 600, CLEAN_SECONDS = 600;
+export const EXPORT_SECONDS = 600;
 const LAUNCHER_SECONDS = STOP_SECONDS;
 /** Exit codes that only the launcher returns, before a child starts. */
 const REFUSED = 64, LAUNCHER_FAILED = 125, RUN_TIMEOUT = 124, MISSING = 2, TOO_LARGE = 3;
@@ -45,9 +48,11 @@ const probeSchema = z.object({
   freeInodes: z.number().min(0),
   ancestorsWritable: z.boolean(),
   tools: z.boolean(),
+  // Launcher version 2 prints it; version 1 prints nothing, so the host reads it as undefined.
+  version: z.number().int().optional(),
 });
 
-type Spawned = { code: number | null; out: Buffer; truncated: boolean; failed: boolean; elapsedMs: number };
+type Spawned = { code: number | null; out: Buffer; truncated: boolean; overflow: boolean; failed: boolean; elapsedMs: number };
 type Channel = { held: boolean; graceMs: number };
 
 /**
@@ -60,9 +65,9 @@ function launch(
   prefix: EvalGraderConfig["prefix"],
   operation: string,
   args: readonly string[],
-  limit: { ms: number; keep: number; input?: Readable | Buffer; bypass?: boolean },
+  limit: { ms: number; keep: number; input?: Readable | Buffer; bypass?: boolean; sink?: Writable; maxBytes?: number },
 ): Promise<Spawned> {
-  const failed: Spawned = { code: null, out: Buffer.alloc(0), truncated: false, failed: true, elapsedMs: 0 };
+  const failed: Spawned = { code: null, out: Buffer.alloc(0), truncated: false, overflow: false, failed: true, elapsedMs: 0 };
   // A bypass call (`stop`) neither waits for nor holds the channel, so it reaches a command that is still running.
   if (channel.held && !limit.bypass) return Promise.resolve(failed);
   const started = Date.now();
@@ -81,15 +86,30 @@ function launch(
     }
     if (!limit.bypass) channel.held = true;
     const chunks: Buffer[] = [];
-    let kept = 0, total = 0, truncated = false, settled = false;
+    let kept = 0, total = 0, truncated = false, overflow = false, sinkFailed = false, settled = false;
     const finish = (result: Partial<Spawned>) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve({ code: null, out: Buffer.concat(chunks), truncated, failed: false, elapsedMs: Date.now() - started, ...result });
+      resolve({ code: null, out: Buffer.concat(chunks), truncated, overflow, failed: false, elapsedMs: Date.now() - started, ...result });
     };
     const timer = setTimeout(() => finish({ failed: true }), limit.ms + channel.graceMs);
     child.stdout!.on("data", (chunk: Buffer) => {
+      if (limit.sink) {
+        // A streamed call writes to the sink and stops the child's output past the limit. The call still settles at close.
+        if (overflow) return;
+        if (total + chunk.length > (limit.maxBytes ?? 0)) {
+          overflow = true;
+          child.stdout!.destroy();
+          return;
+        }
+        total += chunk.length;
+        if (!limit.sink.write(chunk)) {
+          child.stdout!.pause();
+          limit.sink.once("drain", () => child.stdout?.resume());
+        }
+        return;
+      }
       total += chunk.length;
       if (total > limit.keep) truncated = true;
       if (kept < limit.keep) {
@@ -98,6 +118,8 @@ function launch(
         kept += take.length;
       }
     });
+    // A sink that fails (its reader closed) stops the child's output, and the call fails at close instead of throwing.
+    limit.sink?.once("error", () => { sinkFailed = true; child.stdout?.destroy(); });
     child.stderr!.resume();
     child.stdin?.on("error", () => undefined);
     if (Buffer.isBuffer(limit.input)) child.stdin?.end(limit.input);
@@ -108,7 +130,7 @@ function launch(
     });
     child.on("close", code => {
       if (!limit.bypass) channel.held = false;
-      finish({ code, failed: false });
+      finish({ code, failed: sinkFailed });
     });
   });
 }
@@ -145,17 +167,29 @@ export function launcherGrader(config: () => EvalGraderConfig | undefined, optio
       }
       if (p.readable.some(Boolean)) return { state: "exposed", uid: p.uid };
       if (p.metadata === "open") return { state: "network-open", uid: p.uid };
-      return { state: "ready", uid: p.uid, storage: p.freeBytes >= GRADER_FREE_BYTES_MIN && p.freeInodes >= GRADER_FREE_INODES_MIN };
+      return {
+        state: "ready", uid: p.uid, version: p.version,
+        storage: p.freeBytes >= GRADER_FREE_BYTES_MIN && p.freeInodes >= GRADER_FREE_INODES_MIN,
+      };
     },
 
     async receive(job, name, input, maxBytes) {
       const current = config();
-      if (!current || !JOB_RE.test(job) || !["base.bundle", "base-delta.patch", "reference.patch"].includes(name)) return "failed";
+      if (!current || !JOB_RE.test(job) || !["base.bundle", "base-delta.patch", "reference.patch", "result.patch"].includes(name)) return "failed";
       const result = await launch(channel, current.prefix, "receive", [job, name, String(maxBytes)], { ms: RECEIVE_SECONDS * 1000, keep: 0, input });
       if (result.failed) return "failed";
       if (result.code === 0) return "stored";
       if (result.code === TOO_LARGE) return "too-large";
       return "failed";
+    },
+
+    async export(job, sink, maxBytes) {
+      const current = config();
+      if (!current || !JOB_RE.test(job) || !Number.isSafeInteger(maxBytes) || maxBytes < 1) return "failed";
+      const result = await launch(channel, current.prefix, "export", [job], { ms: EXPORT_SECONDS * 1000, keep: 0, sink, maxBytes });
+      if (result.overflow) return "too-large";
+      if (result.failed || result.code === null) return "failed";
+      return result.code === 0 ? "exported" : "failed";
     },
 
     async run(job, dir, seconds, argv, runOptions) {

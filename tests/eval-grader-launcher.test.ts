@@ -253,3 +253,38 @@ test("the launcher refuses a root that is not a private directory", { skip: SKIP
     cleanup(sb);
   }
 });
+
+test("the grader exports only the trial branch", { skip: SKIP }, () => {
+  const sb = sandbox();
+  try {
+    // C1 is the trial branch; C2 is on the default branch only, so the bundle must not carry it.
+    const identity = "-c user.name=t -c user.email=t@example.invalid";
+    const made = grader(sb, ["run", JOB, "task", "60", "--", "/bin/sh", "-c",
+      `git init -q && git ${identity} commit -q --allow-empty -m c1 && git branch trial && git ${identity} commit -q --allow-empty -m c2`]);
+    assert.equal(made.status, 0, made.stderr.toString("utf8"));
+
+    const exported = grader(sb, ["export", JOB]);
+    assert.equal(exported.status, 0, exported.stderr.toString("utf8"));
+    const out = join(sb.dir, "out");
+    mkdirSync(out);
+    const bundle = join(out, "trial.bundle");
+    writeFileSync(bundle, exported.stdout);
+    // The test's own git calls run in the sandbox, never in the checkout under test.
+    const heads = spawnSync("git", ["bundle", "list-heads", bundle], { cwd: out }).stdout.toString("utf8").trim().split("\n");
+    assert.deepEqual(heads.map(line => line.split(" ")[1]), ["refs/heads/trial"]);
+
+    const clone = join(out, "clone");
+    assert.equal(spawnSync("git", ["clone", "-q", "--branch", "trial", bundle, clone], { cwd: out }).status, 0);
+    assert.deepEqual(spawnSync("git", ["-C", clone, "log", "--all", "--format=%s"], { cwd: out }).stdout.toString("utf8").trim().split("\n"), ["c1"]);
+
+    // A missing trial branch refuses with status 2.
+    assert.equal(grader(sb, ["export", OTHER]).status, 2);
+
+    assert.equal(grader(sb, ["receive", JOB, "result.patch", "10"], { input: "0123456789" }).status, 0);
+    assert.equal(readFileSync(jobPath(sb, "in", "result.patch"), "utf8"), "0123456789");
+
+    assert.match(grader(sb, ["probe", "--"]).stdout.toString("utf8"), /"version":2/);
+  } finally {
+    cleanup(sb);
+  }
+});

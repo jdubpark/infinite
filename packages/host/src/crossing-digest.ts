@@ -3,6 +3,8 @@ import { z } from "zod";
 
 // Crossing digest (design part 9). Pure: no I/O, clock, globals or model calls.
 // Every list is newest first, so the oldest item sits at the end of each array.
+// Callers pass parsed JSON (a member's report, a stored digest), so every exported builder reads its arguments as
+// unknown values and is total over any JSON-like input: it never throws, and it never coerces a value to text.
 
 /** Byte bound for a digest, measured as JSON. */
 export const DIGEST_LIMIT_BYTES = 2048;
@@ -15,13 +17,18 @@ const ID_LIMIT = 8;
 const SIBLING_PATH_LIMIT = 8;
 const CAPS = { touched: 24, decisions: 6, failures: 6, forSiblings: 4, open: 4 } as const;
 const OPS = ["read", "changed", "added", "removed"] as const;
+const CHANGE_OPS = ["changed", "added", "removed"] as const;
 const OP_RANK: Record<(typeof OPS)[number], number> = { read: 0, changed: 1, added: 2, removed: 3 };
 const OUTCOMES = ["complete", "partial", "failed", "refused"] as const;
 const CLASSES = ["check", "stop", "refusal", "conflict", "claim"] as const;
+const HOST_CLASSES = ["check", "stop", "refusal", "conflict"] as const;
+const AUTHORITIES = ["receipt", "claim"] as const;
+const COUNTERS = ["touched", "decisions", "failures", "forSiblings", "open"] as const;
 
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 const LONE_SURROGATES = new RegExp(LONE_SURROGATE.source, "g");
-const CONTROL = /[\u0000-\u001f\u007f]/;
+/** C0 and C1 controls, DEL, the line and paragraph separators, and the bidirectional controls. */
+const CONTROL = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/;
 
 const bytes = (value: string) => Buffer.byteLength(value, "utf8");
 
@@ -38,16 +45,23 @@ const boundedText = (max: number) => z.string().refine(
 );
 const text = boundedText(TEXT_BYTES);
 const shortText = boundedText(SHORT_BYTES);
-const repoPath = z.string().refine(isRepoPath, "Use a repository path of 1 to 300 UTF-8 bytes without control characters, lone surrogates, a leading slash or a .. segment");
-const authority = z.enum(["receipt", "claim"]);
+const repoPath = z.string().refine(isRepoPath, "Use a repository path of 1 to 300 UTF-8 bytes without control, separator or direction characters, lone surrogates, a leading slash or a .. segment");
+const authority = z.enum(AUTHORITIES);
 const counter = z.number().int().min(0).max(OMITTED_MAX);
 
 /*
- * PROPOSED rules (design part 9 states neither):
- * (a) `omitted` counts whole rows dropped by a cap, by the size trim, or for an invalid path. A row folded into
- *     another row for the same path, failure or note is not counted.
- * (b) `ids` and sibling `paths` are capped at 8 without a count.
- * Counters saturate at OMITTED_MAX. `forSiblings` and `open` counters are a proposed amendment too.
+ * PROPOSED rules (design part 9 states none of them):
+ * (a) `omitted` counts whole rows dropped by a cap, by the size trim, for an invalid path, or as malformed: a row
+ *     that is not an object, lacks a required string, or holds an invalid enum value. A row folded into another
+ *     row for the same path, failure or note is not counted. A list that is not an array reads as empty, and
+ *     nothing is counted for it. An argument that is not an object reads as empty.
+ * (b) `ids` and sibling `paths` are capped at 8 without a count. An entry in them that is not a string or not a
+ *     valid path is dropped without a count. A malformed optional field (`ids`, `paths`, `where`) is dropped and
+ *     its row kept.
+ * (c) A received counter that is NaN, negative or not a number reads as 0, a fraction floors, and a value above
+ *     the cap, Infinity included, reads as the cap. Counters saturate at OMITTED_MAX.
+ * (d) hostDigest refuses class "claim" on a failure and "read" in `changed`, as HostInput types them.
+ * `forSiblings` and `open` counters are a proposed amendment too.
  */
 export const crossingDigestSchema = z.object({
   v: z.literal(1),
@@ -87,6 +101,13 @@ type Omitted = CrossingDigest["omitted"];
 type Counts = Required<Omitted>;
 type Outcome = CrossingDigest["outcome"];
 
+/*
+ * PROPOSED: an invalid or missing outcome reads as "failed", the outcome that claims least. "complete" and
+ * "partial" claim finished work, and "refused" claims a cause (a refusal) that the host did not record. "failed"
+ * claims neither.
+ */
+const FALLBACK_OUTCOME: Outcome = "failed";
+
 export type HostInput = {
   outcome: Outcome;
   changed?: { path: string; op: "changed" | "added" | "removed" }[];
@@ -102,15 +123,14 @@ export type ClaimInput = {
   failures?: { signal: string; where?: string }[];
 };
 
-/** One source of rows, newest first. Every builder passes its rows through `combine`. */
-type Lists = {
-  touched: Touched[];
-  decisions: Decision[];
-  failures: Failure[];
-  forSiblings: Sibling[];
-  open: string[];
-  omitted: Omitted;
-};
+type Row = Record<string, unknown>;
+const isRow = (value: unknown): value is Row => typeof value === "object" && value !== null && !Array.isArray(value);
+/** An own property of an object. Anything else, an inherited property included, reads as missing. */
+const field = (value: unknown, key: string): unknown => (isRow(value) && Object.hasOwn(value, key) ? value[key] : undefined);
+const listOf = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
+const isText = (value: unknown): value is string => typeof value === "string";
+const isPath = (value: unknown): value is string => isText(value) && isRepoPath(value);
+const oneOf = <T extends string>(options: readonly T[], value: unknown): T | undefined => options.find(option => option === value);
 
 export function digestBytes(digest: CrossingDigest): number {
   return bytes(JSON.stringify(digest));
@@ -121,58 +141,67 @@ export function emptyDigest(outcome: Outcome): CrossingDigest {
 }
 
 export function hostDigest(input: HostInput): CrossingDigest {
-  return checked("hostDigest", combine(input.outcome, [{
+  return checked("hostDigest", combine(field(input, "outcome"), [{
     touched: [
-      ...(input.changed ?? []).map(change => ({ path: change.path, op: change.op, by: "receipt" as const })),
-      ...(input.read ?? []).map(path => ({ path, op: "read" as const, by: "receipt" as const })),
+      ...listOf(field(input, "changed")).map(change => ({
+        path: field(change, "path"),
+        op: oneOf(CHANGE_OPS, field(change, "op")),
+        by: "receipt",
+      })),
+      ...listOf(field(input, "read")).map(path => ({ path, op: "read", by: "receipt" })),
     ],
-    decisions: [],
-    failures: (input.failures ?? []).map(failure => ({
-      signal: failure.signal,
-      ...(failure.where === undefined ? {} : { where: failure.where }),
-      class: failure.class,
-      by: "receipt" as const,
+    failures: listOf(field(input, "failures")).map(failure => ({
+      signal: field(failure, "signal"),
+      where: field(failure, "where"),
+      class: oneOf(HOST_CLASSES, field(failure, "class")),
+      by: "receipt",
     })),
-    forSiblings: [],
-    open: [],
-    omitted: zeroCounts(),
   }]));
 }
 
-/** Adds member text as claims. Claim arrays are newest first, like digest arrays. A claim never replaces a receipt. */
+/**
+ * Adds member text as claims. Claim arrays are newest first, like digest arrays. A claim never replaces a receipt.
+ * Rows are rebuilt from named fields, so a member's `by`, `class`, `outcome` or `omitted` never reaches the digest.
+ */
 export function withClaims(digest: CrossingDigest, claims: ClaimInput): CrossingDigest {
-  const fresh: Lists = {
-    touched: (claims.touched ?? []).map(row => ({ ...row, by: "claim" as const })),
-    decisions: claims.decisions ?? [],
-    failures: (claims.failures ?? []).map(failure => ({
-      signal: failure.signal,
-      ...(failure.where === undefined ? {} : { where: failure.where }),
-      class: "claim" as const,
-      by: "claim" as const,
+  const fresh = {
+    touched: listOf(field(claims, "touched")).map(row => ({
+      path: field(row, "path"),
+      ids: field(row, "ids"),
+      op: field(row, "op"),
+      by: "claim",
     })),
-    forSiblings: claims.forSiblings ?? [],
-    open: claims.open ?? [],
-    omitted: zeroCounts(),
+    decisions: field(claims, "decisions"),
+    failures: listOf(field(claims, "failures")).map(failure => ({
+      signal: field(failure, "signal"),
+      where: field(failure, "where"),
+      class: "claim",
+      by: "claim",
+    })),
+    forSiblings: field(claims, "forSiblings"),
+    open: field(claims, "open"),
   };
-  return checked("withClaims", combine(digest.outcome, [fresh, digest]));
+  return checked("withClaims", combine(field(digest, "outcome"), [fresh, digest]));
 }
 
 /** `b` is the newer digest. Its outcome wins, and its items come first in every list. */
 export function mergeDigest(a: CrossingDigest, b: CrossingDigest): CrossingDigest {
-  return checked("mergeDigest", combine(b.outcome, [b, a]));
+  return checked("mergeDigest", combine(field(b, "outcome"), [b, a]));
 }
 
 /** Re-normalizes any digest-shaped input, then trims it to the 2 KiB bound. */
 export function fitDigest(digest: CrossingDigest): CrossingDigest {
-  return checked("fitDigest", combine(digest.outcome, [digest]));
+  return checked("fitDigest", combine(field(digest, "outcome"), [digest]));
 }
 
 function zeroCounts(): Counts {
   return { touched: 0, decisions: 0, failures: 0, forSiblings: 0, open: 0 };
 }
 
-function sanitize(value: number | undefined): number {
-  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.min(Math.floor(value), OMITTED_MAX) : 0;
+/** A received counter as a count, by PROPOSED rule (c). */
+function sanitize(value: unknown): number {
+  if (typeof value !== "number" || Number.isNaN(value) || value <= 0) return 0;
+  return Math.min(Math.floor(value), OMITTED_MAX);
 }
 
 function add(a: number, b: number): number {
@@ -201,51 +230,73 @@ function clip(value: string, max: number): string {
   return out;
 }
 
+// Row readers. Each returns a normalized row, or undefined for a malformed row, which the caller counts.
+
+function readTouched(row: unknown): Touched | undefined {
+  const path = field(row, "path");
+  const op = oneOf(OPS, field(row, "op"));
+  const by = oneOf(AUTHORITIES, field(row, "by"));
+  if (!isPath(path) || !op || !by) return undefined;
+  const ids = listOf(field(row, "ids")).filter(isText).slice(0, ID_LIMIT).map(id => clipText(id, SHORT_BYTES));
+  return { path, op, by, ...withIds(ids) };
+}
+
+function readDecision(row: unknown): Decision | undefined {
+  const what = field(row, "what");
+  const why = field(row, "why");
+  return isText(what) && isText(why) ? { what: clipText(what), why: clipText(why) } : undefined;
+}
+
+function readFailure(row: unknown): Failure | undefined {
+  const signal = field(row, "signal");
+  const where = field(row, "where");
+  const kind = oneOf(CLASSES, field(row, "class"));
+  const by = oneOf(AUTHORITIES, field(row, "by"));
+  if (!isText(signal) || !kind || !by) return undefined;
+  return { signal: clipText(signal), ...(isText(where) ? { where: clipText(where) } : {}), class: kind, by };
+}
+
+function readSibling(row: unknown): Sibling | undefined {
+  const note = field(row, "note");
+  const paths = field(row, "paths");
+  if (!isText(note)) return undefined;
+  return { note: clipText(note), ...(Array.isArray(paths) ? { paths: paths.filter(isPath).slice(0, SIBLING_PATH_LIMIT) } : {}) };
+}
+
+const readOpen = (item: unknown): string | undefined => (isText(item) ? clipText(item) : undefined);
+
 /**
- * The single builder. Normalizes every source first (text clipped, invalid paths dropped and counted), so every
- * dedupe key is computed from the stored text. Then merges, applies the caps, and trims to the size bound.
+ * The single builder. Reads every source through the row readers first (text clipped, malformed rows and invalid
+ * paths dropped and counted), so every dedupe key is computed from the stored text. Then merges, applies the
+ * caps, and trims to the size bound.
  */
-function combine(outcome: Outcome, sources: Lists[]): CrossingDigest {
+function combine(outcome: unknown, sources: unknown[]): CrossingDigest {
   const omitted = zeroCounts();
   const touched: Touched[] = [];
   const decisions: Decision[] = [];
   const failures: Failure[] = [];
   const forSiblings: Sibling[] = [];
   const open: string[] = [];
+  const collect = <T>(rows: unknown, read: (row: unknown) => T | undefined, into: T[], key: keyof Counts) => {
+    for (const row of listOf(rows)) {
+      const value = read(row);
+      if (value === undefined) bump(omitted, key);
+      else into.push(value);
+    }
+  };
   for (const source of sources) {
-    const received = source.omitted;
-    omitted.touched = add(omitted.touched, sanitize(received.touched));
-    omitted.decisions = add(omitted.decisions, sanitize(received.decisions));
-    omitted.failures = add(omitted.failures, sanitize(received.failures));
-    omitted.forSiblings = add(omitted.forSiblings, sanitize(received.forSiblings));
-    omitted.open = add(omitted.open, sanitize(received.open));
-    for (const row of source.touched) {
-      if (!isRepoPath(row.path)) {
-        bump(omitted, "touched");
-        continue;
-      }
-      const ids = row.ids?.slice(0, ID_LIMIT).map(id => clipText(id, SHORT_BYTES));
-      touched.push({ path: row.path, op: row.op, by: row.by, ...(ids?.length ? { ids } : {}) });
-    }
-    for (const item of source.decisions) decisions.push({ what: clipText(item.what), why: clipText(item.why) });
-    for (const failure of source.failures) {
-      failures.push({
-        signal: clipText(failure.signal),
-        ...(failure.where === undefined ? {} : { where: clipText(failure.where) }),
-        class: failure.class,
-        by: failure.by,
-      });
-    }
-    for (const sibling of source.forSiblings) {
-      const paths = sibling.paths?.filter(isRepoPath).slice(0, SIBLING_PATH_LIMIT);
-      forSiblings.push({ note: clipText(sibling.note), ...(paths ? { paths } : {}) });
-    }
-    for (const item of source.open) open.push(clipText(item));
+    const received = field(source, "omitted");
+    for (const key of COUNTERS) omitted[key] = add(omitted[key], sanitize(field(received, key)));
+    collect(field(source, "touched"), readTouched, touched, "touched");
+    collect(field(source, "decisions"), readDecision, decisions, "decisions");
+    collect(field(source, "failures"), readFailure, failures, "failures");
+    collect(field(source, "forSiblings"), readSibling, forSiblings, "forSiblings");
+    collect(field(source, "open"), readOpen, open, "open");
   }
 
   const digest: CrossingDigest = {
     v: 1,
-    outcome,
+    outcome: oneOf(OUTCOMES, outcome) ?? FALLBACK_OUTCOME,
     touched: unionTouched(touched),
     decisions: unique(decisions, item => JSON.stringify([item.what, item.why])),
     failures: latestFailures(failures),
@@ -370,7 +421,10 @@ function trimBytes(digest: CrossingDigest): CrossingDigest {
   return digest;
 }
 
-/** Every exported builder ends here. A failure is a bug in this module, not in the caller's input. */
+/**
+ * Every exported builder ends here. An internal invariant: the row readers above admit only valid rows, so no
+ * input reaches this throw. A failure is a bug in this module, not in the caller's input.
+ */
 function checked(name: string, digest: CrossingDigest): CrossingDigest {
   if (!crossingDigestSchema.safeParse(digest).success || digestBytes(digest) > DIGEST_LIMIT_BYTES) {
     throw new Error(`${name} built a crossing digest that fails the schema or the ${DIGEST_LIMIT_BYTES}-byte bound`);

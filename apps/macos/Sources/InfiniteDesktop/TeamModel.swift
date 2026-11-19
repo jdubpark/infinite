@@ -30,7 +30,8 @@ struct TeamMutation: Equatable {
     private var detailed = false
     /// The newest team list row seen for a run read in full.
     private var listed: TeamRun?
-    /// Set while the one early read of a shown page is under way.
+    /// Set while the one early read of a shown page is under way. It is kept when the page hides, until that read ends,
+    /// so a page hidden and shown again starts no second one beside it.
     private var refreshToken: UUID?
     /// The team list has reported a later state that differs from the full read held here in what controls are
     /// decided from. A request sent now would name a revision the host has left, or act on a status it no longer has.
@@ -99,7 +100,7 @@ struct TeamMutation: Equatable {
     }
     private func updatePolling() {
         guard pageShown && displayVisible else {
-            pollGeneration = UUID(); pollTask?.cancel(); pollTask = nil; refreshToken = nil
+            pollGeneration = UUID(); pollTask?.cancel(); pollTask = nil
             return
         }
         guard pollTask == nil else { return }

@@ -80,9 +80,12 @@ async function stopInFence(f: Fixture, act: (teams: TeamService) => Promise<Team
     },
   });
   const first = f.openTeam();
-  const host = first as unknown as { record(id: string): Saved; deliverApprovedDecision(stored: Saved, decision: TeamPermissionDecision): Promise<void> };
+  type Deliver = { deliverApprovedDecision(stored: Saved, decision: TeamPermissionDecision): Promise<void> };
+  const host = first as unknown as Deliver & { record(id: string): Saved; permissions?: Deliver };
+  // The delivery lives on the service until the teams.ts split (INF-330) moves it into the permission cluster.
+  const delivery = host.permissions ?? host;
   const stored = host.record(f.run.id);
-  await host.deliverApprovedDecision(stored, stored.run.permissionDecisions![0]!);
+  await delivery.deliverApprovedDecision(stored, stored.run.permissionDecisions![0]!);
   await answering;
   void act(first);
   await fencing;

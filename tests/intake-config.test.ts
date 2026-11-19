@@ -99,6 +99,16 @@ test("answering questions needs direct requests, and classifying needs both answ
   const defaults = parsed({}).intake!.slack!;
   assert.deepEqual([defaults.answerQuestions, defaults.classify], [false, false]);
 });
+test("request channels are optional, bounded unique Slack channel IDs and require direct requests when enabled", () => {
+  assert.deepEqual(parsed({}).intake!.slack!.requestChannelIds, undefined);
+  assert.deepEqual(parsed({ slack: { ...slack, requestChannelIds: [] } }).intake!.slack!.requestChannelIds, []);
+  assert.doesNotThrow(() => validate({ slack: { ...slack, directRequests: true, requestChannelIds: ["C123", "G456"] } }));
+  assert.throws(() => validate({ slack: { ...slack, requestChannelIds: ["C123"] } }), /requestChannelIds needs intake\.slack\.directRequests/);
+  assert.throws(() => parsed({ slack: { ...slack, requestChannelIds: ["C123", "C123"] } }));
+  assert.throws(() => parsed({ slack: { ...slack, requestChannelIds: ["U123"] } }));
+  const tooManyChannels = Array.from({ length: 21 }, (_, index) => `C${String(index).padStart(3, "0")}`);
+  assert.throws(() => parsed({ slack: { ...slack, requestChannelIds: tooManyChannels } }));
+});
 test("linear.reportName defaults to Infinite, accepts a plain name, and rejects Markdown, link text, newlines, and long values", () => {
   assert.equal(reportName(parsed({})), "Infinite");
   assert.equal(Object.hasOwn(parsed({}).linear!, "reportName"), false, "display defaults leave persisted configuration digests unchanged");

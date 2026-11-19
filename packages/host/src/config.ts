@@ -237,6 +237,7 @@ export function validateIntakeConfig(config: Config): void {
   // Without admission and without direct requests nothing could ever start a mission.
   if (intake.linear.admitIssues === false && !slack?.directRequests && !config.mcp) throw new Error("admitIssues false needs intake.slack.directRequests or mcp");
   if (slack?.answerQuestions && !slack.directRequests) throw new Error("answerQuestions needs intake.slack.directRequests");
+  if (slack?.requestChannelIds?.length && !slack.directRequests) throw new Error("requestChannelIds needs intake.slack.directRequests");
   if (slack?.classify && !slack.answerQuestions) throw new Error("classify needs intake.slack.answerQuestions");
   if (slack?.classify && !config.jev) throw new Error("classify needs the jev block");
   if (slack) {

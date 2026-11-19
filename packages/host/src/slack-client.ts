@@ -9,7 +9,7 @@ export class SlackError extends Error {
 
 export interface SlackEnvelope {
   envelopeId: string; teamId?: string; eventId?: string;
-  event?: { type: string; user?: string; botId?: string; channel?: string; ts?: string; threadTs?: string; text?: string };
+  event?: { type: string; user?: string; botId?: string; appId?: string; botProfile?: true; subtype?: string; channelType?: string; channel?: string; ts?: string; threadTs?: string; text?: string };
   interaction?: SlackInteraction;
 }
 
@@ -106,6 +106,15 @@ export class SlackClient implements IntakeThreadReader {
     const data = await this.call("chat.getPermalink", "bot", { channel: binding.channelId, message_ts: ts });
     if (typeof data.permalink !== "string" || data.permalink === "") throw new SlackError("invalid_response", false);
     return data.permalink;
+  }
+
+  /** Acknowledges a teammate's proposal without posting a message. Repeated acknowledgements are idempotent. */
+  async acknowledgeProposal(channelId: string, ts: string): Promise<void> {
+    try {
+      await this.call("reactions.add", "bot", { channel: channelId, timestamp: ts, name: "eyes" });
+    } catch (error) {
+      if (!(error instanceof SlackError) || error.code !== "already_reacted") throw error;
+    }
   }
 
   /** Opens Socket Mode. The envelope is acknowledged only after `handle` resolves; a rejection leaves it for redelivery. */
@@ -250,14 +259,21 @@ function toEnvelope(envelopeId: string, type: unknown, payload: Record<string, a
   }
   if (type !== "events_api") return { envelopeId };
   const event = payload?.event;
+  const optionalStrings = ["user", "bot_id", "app_id", "channel", "ts", "thread_ts", "text", "subtype", "channel_type"];
+  if (!isRecord(event) || typeof event.type !== "string" || (event.hidden !== undefined && event.hidden !== false)
+    || Object.hasOwn(event, "edited")
+    || optionalStrings.some(key => Object.hasOwn(event, key) && typeof event[key] !== "string")
+    || (Object.hasOwn(event, "bot_profile") && !isRecord(event.bot_profile))) return { envelopeId };
   return defined({
     envelopeId,
     teamId: typeof payload?.team_id === "string" ? payload.team_id : undefined,
     eventId: typeof payload?.event_id === "string" ? payload.event_id : undefined,
-    event: event && typeof event.type === "string" ? defined({
-      type: event.type, user: event.user, botId: event.bot_id, channel: event.channel,
+    event: defined({
+      type: event.type, user: event.user, botId: event.bot_id, appId: event.app_id,
+      botProfile: Object.hasOwn(event, "bot_profile") ? true as const : undefined,
+      subtype: event.subtype, channelType: event.channel_type, channel: event.channel,
       ts: event.ts, threadTs: event.thread_ts, text: event.text,
-    }) : undefined,
+    }),
   });
 }
 

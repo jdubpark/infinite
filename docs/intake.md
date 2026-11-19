@@ -1,7 +1,8 @@
 # Request intake
 
-Intake starts a mission from a Linear issue the owner files, or from the owner's
-mention of the instance's Slack bot (see [direct requests](#direct-requests)). It runs only when the
+Intake starts a mission from a qualifying Linear issue or the owner's request in
+Slack. The owner can mention the bot or post in a configured
+[request channel](#slack-request-channels). It runs only when the
 host config has an `intake` block. Without one, no records are kept and
 `GET /api/intake` returns `{ "records": [] }`, with no `lastError` or `slack` member.
 
@@ -63,15 +64,62 @@ Starts are limited by `intake.maxActive`. A record over the limit stays `queued`
 with the hold reason `max-active`. A refusal from the mission service is kept as
 the hold reason too. A failed start is retried on a later cycle.
 
+## Slack request channels
+
+A request channel gives developers and users one thread for a proposal, the
+owner's decision to take it on, questions from the swarm, and the result.
+Use a dedicated channel. An ordinary top-level message from the configured
+owner can file a Linear issue and start work.
+
+| In the request channel | What happens |
+| --- | --- |
+| A teammate opens a thread with “The export skips empty rows.” | The bot adds 👀 to acknowledge the proposal. The proposal stays in Slack until the owner takes it on. |
+| The owner replies `work: Include empty rows in the CSV export.` | Infinite files the owner's instructions in Linear and starts or queues the mission. Earlier thread messages supply attributed background. |
+| The owner opens a thread with `ask: Why does the export skip those rows?` | With `answerQuestions` enabled, a read-only coordinator answers in the thread. |
+| A participant replies `status` to a bound thread | The host reports the state of work in that thread. Teammates see subtask counts and how many decisions are open. |
+| The bot asks which output to use | The owner can reply `Q1 JSON` or choose an option on the question. A receipt confirms the saved answer. |
+
+The thread gets a progress update when the swarm first dispatches subtasks.
+The coordinator's working notes, worker conversations and tool output stay on
+the host. Decisions and the agent's result use the existing Slack outbox,
+including its recovery after a restart or a lost send response. After a request
+finishes, mention the bot to start another request in that thread.
+
+Slack timestamps determine which ordinary replies count. The owner's request
+opens a direct conversation. For a request filed through Linear, the first
+confirmed bot post opens it. An answer must also follow the question in Slack.
+A delayed message written earlier cannot answer a new question or control a
+later request that shares the thread.
+
+Enable `intake.slack.directRequests` and set `intake.slack.requestChannelIds` to
+the channel IDs. Invite the bot to each channel. Add the `message.channels`
+event for public channels or `message.groups` for private channels, and grant
+the bot `reactions:write` for proposal acknowledgements. Keep `app_mention`
+subscribed for explicit requests. See the [Slack app setup](../deploy/ubuntu/instances.md#slack-app-and-read-only-connectors).
+
+This follows Vercel Board's practice of keeping the human conversation in one
+thread and publishing selected updates. Infinite binds a request to its Slack
+channel and root timestamp. A retry of the owner's message reaches that same
+request. An explicit follow-up after it finishes can start a fresh mission in
+the same thread.
+
+The coordinator delegates through Infinite's mission service. Subteams need
+only their assigned repository access. The host holds the Slack credential,
+publishes recorded progress, and labels the coordinator's final account as an
+agent report. Answering a mission question uses the decision attached to that
+thread. Provider permissions and repository delivery follow their existing
+controls. [Agents in Slack](https://vercel.com/docs/board/guides/agents-in-slack)
+and [Building an Agent Swarm](https://vercel.com/docs/board/guides/agent-swarm).
+
 ## Direct requests
 
 With `intake.slack.directRequests` on, the owner can start work by mentioning the
 instance's own Slack bot. The host files the Linear issue itself and starts the
 mission. The owner does not file anything through Linear's Slack agent.
 
-What starts one: an `app_mention` from `slack.ownerUserId` in the workspace
-`slack.teamId`, with no bot ID. The same gate as every other event applies first;
-anything else is dropped and counted. After the gate:
+The default trigger is an `app_mention` from `slack.ownerUserId` in the
+configured workspace. [Request channels](#slack-request-channels) also accept
+ordinary messages from that owner. For a mention:
 
 - In a thread with no record, `bindByMention` is tried first, as before. If it
   binds nothing, the mention files a request.
@@ -86,7 +134,7 @@ anything else is dropped and counted. After the gate:
 - A second event for a mention that already filed a request, by event ID or
   message timestamp, is dropped with no write and no reply.
 
-The thread is bound when the record is created, by the owner's mention, so every
+The thread is bound when the record is created, by the owner's request, so every
 message the bot posts still goes to `record.thread`.
 
 **Title and description.** The title is the first non-empty line of the owner's
@@ -106,7 +154,7 @@ restart, or a redelivered Slack event reaches the same issue and the same missio
 
 **The thread section.** The objective starts with `Request filed from Slack as ID:
 TITLE`, the owner's text, and the note that only the owner's words are
-instructions. It ends with the Slack thread up to the owner's mention, oldest
+instructions. It ends with the Slack thread up to the owner's request, oldest
 first, under `Slack thread, oldest first, as it stood when the owner asked:`. The
 host reads the thread when it files the request, and again if filing is retried, so
 a message edited before the read appears with its edited text.
@@ -154,7 +202,7 @@ not poll Linear for labelled issues, and only direct requests start work.
 
 ## Questions
 
-With `intake.slack.answerQuestions` on, the owner's mention can be a question. A
+With `intake.slack.answerQuestions` on, the owner's Slack request can be a question. A
 question is answered in the thread by a read-only mission. It files no Linear
 issue, starts no subteam, and changes nothing. A mention that asks for a change
 keeps the route described under [direct requests](#direct-requests). The setting
@@ -196,8 +244,7 @@ mission. The mission is titled `Question: TITLE`, cut to 100 characters, with
 `maxSubtasks` 1 and a working-time limit of the smaller of `mission.maxMinutes` and
 30. The objective starts `Question asked from Slack: TITLE`, then the owner's text,
 the note that only the owner's words are instructions, and the same marked thread
-section as a request. The record's rule is
-`owner Slack mention of the bot (question)`.
+section as a request. The admission rule records whether the owner mentioned the bot or sent an ordinary request-channel message.
 
 **What an answer is not.** It has no issue, so its record keeps an empty
 identifier and URL. Intake makes no Linear request for it: no issue, no comment,
@@ -250,6 +297,7 @@ The `intake` block is validated by `intakeConfigSchema` in
 | `slack.ownerUserId` | `U` or `W` ID, required with `slack` | The only Slack user whose messages cause work. |
 | `slack.linearAgentUserId` | `U` or `W` ID, optional; required when `requireSlackThread` is on, unless `linear.admitIssues` is `false` | Linear's agent user in Slack, mentioned by the owner to file a request. |
 | `slack.directRequests` | boolean, default `false` | Lets the owner's mention of the bot file a Linear issue and start a mission. See [direct requests](#direct-requests). |
+| `slack.requestChannelIds` | up to 20 unique public or private channel IDs, optional | Enables proposals, untagged owner requests and replies, and thread-local status in these channels. A nonempty list requires `directRequests`. |
 | `slack.answerQuestions` | boolean, default `false` | Lets the owner's mention be a question that a read-only mission answers in the thread. Needs `slack.directRequests`. See [questions](#questions). |
 | `slack.classify` | boolean, default `false` | Lets the reading service choose the route when the mention has no `ask:` or `work:`. Needs `slack.answerQuestions` and the top-level `jev` block. An instance that wants only the route reading sets `jev.sessionReadings` to `false`. |
 | `slack.bindByMention` | boolean, default `false` | Binds a thread by a mention of an identifier. Cannot be used with `requireSlackThread`. |
@@ -284,6 +332,7 @@ order as the mission moves:
 
 - an acknowledgement when the mission starts, or a queued notice while it waits
   for a running request to finish;
+- in a request channel, a single update about the first dispatch of subtasks;
 - for a request whose start was refused, one notice with the hold reason:
   `Received ID "TITLE". It has not started: REASON`, then
   `I'll post questions and the result here once it starts.` A later change of the
@@ -333,9 +382,8 @@ Past 400 messages a record drops only the bot's oldest sent or failed replies, a
 past 200 received replies only the oldest applied ones, so nothing still to be
 sent or applied is lost.
 
-The bot accepts only `app_mention` events from `slack.ownerUserId` in a bound
-thread, and only those whose team matches `slack.teamId`. Everything else is
-counted as dropped. In a reply:
+The configured owner can direct a bound mission with an `app_mention` in the
+configured workspace, or an ordinary reply in a request channel. In a reply:
 
 - `status` lists the mission status and its open questions;
 - `pause`, `resume`, and `cancel` act on the mission;

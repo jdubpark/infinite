@@ -1,0 +1,488 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
+import { randomBytes, randomUUID } from "node:crypto";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { EvalHost, type EvalHostOptions } from "../packages/host/src/eval-host.js";
+import { type Grader, launcherGrader } from "../packages/host/src/eval-grader.js";
+import { type EvalIdentity, launcherEvalIdentity } from "../packages/host/src/eval-identity.js";
+import { TrialJobs } from "../packages/host/src/eval-trial-jobs.js";
+import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
+import { EventOutbox } from "../packages/host/src/evidence/outbox.js";
+import { configurationModule, configurationProjector } from "../packages/host/src/configuration-store.js";
+import { outcomeProjector } from "../packages/host/src/outcome-projector.js";
+import { learningPurpose } from "../packages/host/src/types.js";
+import { evalTrialsModule } from "../packages/host/src/eval-trial-store.js";
+import { outcomeModule } from "../packages/host/src/outcome-store.js";
+import type { EvalJobView } from "../packages/host/src/eval-types.js";
+import type { ProjectSourceStatus } from "../packages/host/src/project-source.js";
+import type { RuntimeProcess } from "../packages/host/src/team-retirement.js";
+import type { TeamModelProfile } from "../packages/host/src/team-types.js";
+import type { Config } from "../packages/host/src/types.js";
+import type { Manager } from "../packages/host/src/manager.js";
+import { fixture } from "./team-fixture.js";
+
+// The trial pump end to end: a validated fixture task, a baseline job, the eval launcher and the fake member of the replay
+// tests, the grader fixture, and a real team service. The rig and the validation steps follow eval-validate-run.test.ts.
+
+const GRADER = fileURLToPath(new URL("./fixtures/grader-command.mjs", import.meta.url));
+const LAUNCHER = fileURLToPath(new URL("./fixtures/eval-command.mjs", import.meta.url));
+const TRIAL_AGENT = fileURLToPath(new URL("./fixtures/trial-agent.mjs", import.meta.url));
+const PROJECT = "project-a";
+const UID = process.getuid?.() ?? 0;
+const profile: TeamModelProfile = { id: "trial-member", label: "Trial member", provider: "claude", model: "claude-haiku-5-5", effort: "medium", tier: "light" };
+const sandboxes: string[] = [];
+const NOW = "2026-11-19T00:00:00.000Z";
+
+test.after(() => {
+  for (const dir of sandboxes) rmSync(dir, { recursive: true, force: true });
+});
+
+type Rig = { dir: string; root: string; mirror: string; head: string; ids: string[]; record: string; store: EvidenceStore; groups: string };
+
+function git(cwd: string, args: string[]): string {
+  return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+}
+
+function commit(work: string, files: Record<string, string>, message: string, time: number): string {
+  for (const [path, content] of Object.entries(files)) {
+    mkdirSync(dirname(join(work, path)), { recursive: true });
+    writeFileSync(join(work, path), content);
+  }
+  git(work, ["add", "-A"]);
+  const result = spawnSync("git", ["-c", "user.name=Placeholder", "-c", "user.email=placeholder@example.invalid", "commit", "-q", "--no-verify", "-m", message], {
+    cwd: work, encoding: "utf8", env: { ...process.env, GIT_COMMITTER_DATE: `${time} +0000`, GIT_AUTHOR_DATE: `${time} +0000` },
+  });
+  if (result.status !== 0) throw new Error("commit failed");
+  return git(work, ["rev-parse", "HEAD"]);
+}
+
+/** A bare mirror with branch main. C0 has no test; C1 adds `add` and its passing test; C2 and C3 are rejected. */
+function rig(): Rig {
+  const dir = mkdtempSync(join(tmpdir(), "infinite-eval-trial-"));
+  sandboxes.push(dir);
+  const work = join(dir, "work");
+  mkdirSync(work);
+  git(work, ["init", "--quiet", "--template=", "-b", "main"]);
+  const ids = [
+    commit(work, { "package.json": "{\"type\":\"module\"}\n", "src/math.js": "export function sub(a, b) { return a - b; }\n" }, "Start the math module", 1_700_000_000),
+    commit(work, {
+      "src/math.js": "export function sub(a, b) { return a - b; }\nexport function add(a, b) { return a + b; }\n",
+      "tests/add.test.js": "import test from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { add } from \"../src/math.js\";\ntest(\"add\", () => { assert.equal(add(1, 2), 3); });\n",
+    }, "Add the addition function", 1_700_000_060),
+    commit(work, {
+      "src/math.js": "// second\nexport function sub(a, b) { return a - b; }\nexport function add(a, b) { return a + b; }\n",
+      "tests/sub.test.js": "import test from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { sub } from \"../src/math.js\";\ntest(\"sub\", () => { assert.equal(sub(3, 1), 2); });\n",
+    }, "Test the subtraction function", 1_700_000_120),
+    commit(work, {
+      "src/math.js": "// third\nexport function sub(a, b) { return a - b; }\nexport function add(a, b) { return a + b; }\n",
+      "tests/flaky.test.js": "import test from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { existsSync, writeFileSync } from \"node:fs\";\nimport { join } from \"node:path\";\ntest(\"flaky\", () => {\n  const flag = join(process.env.HOME, \"flag\");\n  assert.equal(existsSync(flag), false);\n  writeFileSync(flag, \"\");\n});\n",
+    }, "Test the flaky path", 1_700_000_180),
+  ];
+  const mirror = join(dir, "mirror.git");
+  git(dir, ["clone", "--quiet", "--bare", work, mirror]);
+  const root = join(dir, "grader");
+  mkdirSync(root, { mode: 0o700 });
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(dir, "state")), vaultKey: randomBytes(32) });
+  store.register(outcomeModule({ now: () => NOW }));
+  store.register(evalTrialsModule(store, () => NOW));
+  return { dir, root, mirror, head: ids[3], ids, record: join(dir, "record.log"), store, groups: `${root}.groups` };
+}
+
+/** The validation project, with the trial settings and the one candidate profile. */
+function projectConfig() {
+  return {
+    id: PROJECT,
+    source: { mode: "github", repository: "example/app", baseBranch: "main" },
+    team: {
+      checks: [],
+      eval: {
+        mine: true,
+        testPaths: { prefixes: ["tests"], suffixes: [".test.js"] },
+        focusedTest: { command: process.execPath, args: ["--test", "--test-reporter=junit", "--test-reporter-destination={report}", "{files}"] },
+        reportFormat: "junit",
+        trialsPerDay: 10,
+        trialMinutes: 10,
+        candidateProfiles: [profile],
+      },
+    },
+  };
+}
+
+type Setup = { r: Rig; reference: string; receipts: string; evalRoot: string; config: Config; grader: Grader; identity: EvalIdentity };
+
+/**
+ * The host's configuration: the grader fixture as `eval.grader` (version 1 when `version1` is set), and the eval launcher,
+ * with the fake member, as `eval.member`. The replay team service reads the same member.
+ */
+function setup(options: { member?: boolean; version1?: boolean } = {}): Setup {
+  const r = rig();
+  // The launcher's ROOT holds only trials: its clean removes every other entry, so the home, template, and tmp stand beside it.
+  const evalRoot = join(r.dir, "eval");
+  const home = join(r.dir, "home"), template = join(r.dir, "template"), tmp = join(r.dir, "tmp");
+  for (const directory of [join(evalRoot, "trials"), home, template, tmp]) mkdirSync(directory, { recursive: true, mode: 0o700 });
+  chmodSync(evalRoot, 0o711);
+  // The reference is the validated commit's own files, which the fake member applies in `reference` mode.
+  const reference = join(r.dir, "reference");
+  mkdirSync(join(reference, "src"), { recursive: true });
+  mkdirSync(join(reference, "tests"), { recursive: true });
+  writeFileSync(join(reference, "src", "math.js"), showAt(r, r.ids[1], "src/math.js"));
+  writeFileSync(join(reference, "tests", "add.test.js"), showAt(r, r.ids[1], "tests/add.test.js"));
+  const receipts = join(r.dir, "receipts");
+  mkdirSync(receipts, { recursive: true, mode: 0o700 });
+  const prefix = { command: process.execPath, args: [GRADER, "--root", r.root, "--uid", String(UID), "--metadata", "closed", "--record", r.record, ...(options.version1 ? ["--no-version"] : [])] };
+  const member = options.member === false ? undefined : {
+    prefix: { command: process.execPath, args: [LAUNCHER, "--root", evalRoot, "--home", home, "--template", template, "--tmp", tmp, "--record", join(r.dir, "eval-record.log")] },
+    root: evalRoot,
+    agents: { claude: { command: process.execPath, args: [TRIAL_AGENT, receipts] } },
+  };
+  const project = projectConfig();
+  const config = {
+    projects: [project],
+    stateDir: join(r.dir, "state"),
+    runDir: join(r.dir, "runs"),
+    keyFile: join(r.dir, "vault.key"),
+    teams: { workspaceDir: join(r.dir, "workspaces") },
+    eval: { grader: { prefix, root: r.root }, ...(member ? { member } : {}) },
+  } as unknown as Config;
+  const grader = testGrader(config, options.version1);
+  const identity = testIdentity(config);
+  return { r, reference, receipts, evalRoot, config, grader, identity };
+}
+
+function showAt(r: Rig, commitId: string, path: string): string {
+  return execFileSync("git", ["--git-dir", r.mirror, "show", `${commitId}:${path}`], { encoding: "utf8" });
+}
+
+/**
+ * The eval identity as the host sees it in these tests. Every fixture runs as this one user, so the launcher's own probe can
+ * never see a second account: its uid is the grader's, and the host's canaries are readable. The probe here reports the
+ * account the fixture stands in for, and every other operation runs through the same-user launcher.
+ */
+const STAND_IN_EVAL_UID = UID + 1;
+function testIdentity(config: Config): EvalIdentity {
+  const inner = launcherEvalIdentity(() => config.eval?.member, { hostUid: UID + 2, graceMs: 5_000 });
+  return { ...inner, probe: async () => config.eval?.member === undefined
+    ? { state: "not-configured" as const }
+    : { state: "ready" as const, uid: STAND_IN_EVAL_UID, storage: true, fetch: "refused" as const } };
+}
+
+/** The grader as the host sees it in these tests. The fixture runs as this user, so its probe lists no canaries. */
+function testGrader(config: Config, version1 = false): Grader {
+  const inner = launcherGrader(() => config.eval?.grader, { hostUid: UID + 1, graceMs: 5_000 });
+  return { ...inner, probe: async () => {
+    const probe = await inner.probe([]);
+    return version1 ? { ...probe, version: 1 } : probe;
+  } };
+}
+
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** The grader fixture's own process groups, as the processes of the grader's account. */
+async function fixtureInventory(groups: string): Promise<RuntimeProcess[]> {
+  const text = readFileOr(groups);
+  return text.split("\n").map(Number).filter(pid => Number.isInteger(pid) && pid > 1 && alive(pid))
+    .map(pid => ({ pid, parent: 1, group: pid, ruid: UID, euid: UID, born: "", state: "S" }));
+}
+
+function readFileOr(path: string): string {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+/** Teams and sessions that only the gates touch: a job that waits never reaches them. */
+const gatesOnly = { teams: () => ({ providerLimits: () => [] }) as never, sessions: { list: async () => [], remove: async () => undefined } };
+
+/** The eval host over the rig, with the team service the trial pump starts runs on. */
+function host(s: Setup, options: { identity?: EvalIdentity; teams?: EvalHostOptions["teams"]; sessions?: EvalHostOptions["sessions"];
+  now?: () => string; inventory?: () => Promise<RuntimeProcess[]> } = {}): EvalHost {
+  const status: ProjectSourceStatus = { mode: "github", repository: "example/app", baseBranch: "main", mirrorHead: s.r.head };
+  return new EvalHost({
+    config: s.config,
+    store: s.r.store,
+    source: { mirrorPath: () => s.r.mirror, status: () => status },
+    hostLoad: { held: () => undefined },
+    halt: () => ({ check: () => ({ state: "clear" as const }) }),
+    runs: () => [],
+    grader: s.grader,
+    inventory: options.inventory ?? (() => fixtureInventory(s.r.groups)),
+    ...(options.now ? { now: options.now } : {}),
+    ...(options.identity ? { identity: options.identity } : { identity: s.identity }),
+    ...(options.teams && options.sessions ? { teams: options.teams, sessions: options.sessions } : {}),
+  } as EvalHostOptions);
+}
+
+/** Mines the fixture commits, then validates them in one validation job. */
+async function validated(h: EvalHost): Promise<void> {
+  for (let attempt = 0; attempt < 40; attempt++) {
+    h.tick();
+    await h.idle();
+    const summary = await h.summary(PROJECT);
+    if ("code" in summary) throw new Error(`summary refused: ${summary.code}`);
+    if (summary.mining.state === "caught-up") break;
+  }
+  const created = h.create(PROJECT, { kind: "validate", limits: { maxWallMinutes: 60 } }, randomUUID());
+  assert.ok("job" in created, "the validation job is created");
+  for (let attempt = 0; attempt < 60; attempt++) {
+    h.tick();
+    await h.idle();
+    if ((h.job(created.job.jobId) as EvalJobView).status === "completed") return;
+  }
+  throw new Error("validation did not complete");
+}
+
+/** The baseline job over the valid mined task, with the given trials per task. */
+function baseline(s: Setup, trialsPerTask: number, maxTrials: number, options: { now?: () => string; maxWallMinutes?: number } = {}): string {
+  const jobs = new TrialJobs({ store: s.r.store, config: s.config, ...(options.now ? { now: options.now } : {}) });
+  const created = jobs.create(PROJECT, {
+    kind: "baseline",
+    configurations: [{ profile, guidance: "as-of-base", knowledge: "none" }],
+    taskFilter: { origins: ["mined"], maxTasks: 1 },
+    trialsPerTask,
+    limits: { maxTrials, maxWallMinutes: options.maxWallMinutes ?? 120 },
+  }, randomUUID());
+  assert.ok("job" in created, "the baseline job is created");
+  return created.job.jobId;
+}
+
+type JobRow = { status: string; reason: string | null; waiting: string | null };
+function jobRow(s: Setup, jobId: string): JobRow | undefined {
+  return s.r.store.read(db => db.get<JobRow>("SELECT status, reason, waiting FROM eval_jobs WHERE job_id = ?", jobId));
+}
+
+type TrialSql = { trial_id: string; state: string; ending: string | null; attempt: number; resolved: number | null; isolation: string | null };
+function trialRows(s: Setup, jobId: string): TrialSql[] {
+  return s.r.store.read(db => db.all<TrialSql>(
+    "SELECT trial_id, state, ending, attempt, resolved, isolation FROM eval_trials WHERE job_id = ? ORDER BY created_at, attempt", jobId));
+}
+
+/**
+ * Ticks the host until `done` holds. Each new trial takes the next mode from `modes`, written as the fake member's receipt
+ * before the member starts; the default mode is `reference`. Ticks run until the budget ends, and then the test asserts.
+ */
+async function drive(s: Setup, h: EvalHost, done: () => boolean, modes: string[], budgetMs: number): Promise<void> {
+  const assigned = new Set<string>();
+  const deadline = Date.now() + budgetMs;
+  while (!done() && Date.now() < deadline) {
+    h.tick();
+    await h.idle();
+    const live = s.r.store.read(db => db.all<{ trial_id: string }>("SELECT trial_id FROM eval_trials WHERE state != 'final'"));
+    for (const { trial_id } of live) {
+      if (assigned.has(trial_id)) continue;
+      assigned.add(trial_id);
+      const mode = modes.shift() ?? "reference";
+      writeFileSync(join(s.receipts, `${trial_id}.mode`), JSON.stringify({ mode, dir: s.reference }), { mode: 0o600 });
+    }
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+}
+
+type Fixture = Awaited<ReturnType<typeof fixture>>;
+
+/** The team fixture, with the eval member and the validation project, whose checkout is the fixture source. */
+async function teamFixture(s: Setup): Promise<Fixture> {
+  const fx = await fixture("success", undefined, {}, { trustWorkspaces: true });
+  fx.host.config.eval = s.config.eval;
+  fx.host.config.projects.push({ ...s.config.projects[0], path: fx.source } as never);
+  return fx;
+}
+
+/**
+ * The team service, with its events projected into the eval store as the server projects them: configuration, then outcomes.
+ * The events are also kept, so a test can read the kinds a run emitted.
+ */
+async function serveTeam(s: Setup, fx: Fixture) {
+  s.r.store.register(configurationModule());
+  const outbox = new EventOutbox(s.r.store);
+  outbox.registerProjector(configurationProjector());
+  outbox.registerProjector(outcomeProjector(s.r.store));
+  const events: Array<{ kind: string; runId: string; data: Record<string, unknown> }> = [];
+  let manager: Manager | undefined;
+  const service = await fx.openTeamService({
+    events: {
+      flush(items: unknown[]) { events.push(...(items as typeof events)); return outbox.flush(items as never); },
+      advance() { return outbox.advance(); },
+    } as never,
+    manager: m => { manager = m; },
+  });
+  return { service, events, manager: manager! };
+}
+
+test("a fixture task is resolved by a member that applies the reference", { timeout: 900_000 }, async () => {
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  const h = host(s, { teams: () => served.service, sessions: served.manager });
+  try {
+    await validated(h);
+    const jobId = baseline(s, 1, 1);
+    await drive(s, h, () => jobRow(s, jobId)?.status === "completed", [], 600_000);
+    const rows = trialRows(s, jobId);
+    assert.equal(rows.length, 1, "one trial");
+    assert.equal(rows[0].ending, "graded");
+    assert.equal(rows[0].resolved, 1, "the reference resolves the task");
+    assert.equal(rows[0].isolation, "isolated");
+    const outcome = s.r.store.read(db => db.get<{ source: string; experiment_ref: string | null }>(
+      "SELECT source, experiment_ref FROM outcomes WHERE run_id = ?", rows[0].trial_id));
+    assert.equal(outcome?.source, "replay", "the outcome row is a replay row");
+    assert.equal(outcome?.experiment_ref, rows[0].trial_id, "the outcome row names the trial");
+    assert.deepEqual(readdirSync(join(s.evalRoot, "trials")), [], "the trials root is empty after the job");
+    assert.equal(served.service.list().some(view => view.id === rows[0].trial_id), false, "the run is not listed");
+    // The server's session filter (server.ts listSessions): the replay session exists and the filter removes it.
+    const sessions = await served.manager.list();
+    const learning = sessions.filter(row => learningPurpose(row.purpose));
+    assert.ok(learning.length > 0, "the replay session exists");
+    assert.equal(sessions.filter(row => !learningPurpose(row.purpose)).length, sessions.length - learning.length);
+    assert.equal(served.service.replayIds().length, 0, "the graded trial leaves no run record");
+  } finally {
+    h.close();
+    await h.idle();
+    await fx.close();
+    s.r.store.close();
+  }
+});
+
+test("an empty result, an edit outside the paths, and an undecided permission end their trials", { timeout: 900_000 }, async () => {
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  const h = host(s, { teams: () => served.service, sessions: served.manager });
+  try {
+    await validated(h);
+    const endings: string[] = [];
+    for (const mode of ["empty", "outside", "permission"]) {
+      const jobId = baseline(s, 1, 1);
+      await drive(s, h, () => jobRow(s, jobId)?.status === "completed", [mode], 600_000);
+      endings.push(trialRows(s, jobId)[0]?.ending ?? "none");
+    }
+    assert.deepEqual(endings, ["no-result", "scope-violation", "permission"]);
+    // The team-replay test asserts endings only, so this owner-question check is new: no decision or question event for any run.
+    const asked = served.events.filter(event => /decision|question/.test(event.kind));
+    assert.deepEqual(asked.map(event => event.kind), [], "no owner question was asked");
+  } finally {
+    h.close();
+    await h.idle();
+    await fx.close();
+    s.r.store.close();
+  }
+});
+
+test("a provider limit voids the trial, and it runs again", { timeout: 900_000 }, async () => {
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  // The host's clock is real time plus an offset the test raises. The fixture's notice resets within a day.
+  let offset = 0;
+  const clock = () => new Date(Date.now() + offset).toISOString();
+  const h = host(s, { teams: () => served.service, sessions: served.manager, now: clock });
+  try {
+    await validated(h);
+    const jobId = baseline(s, 1, 2, { now: clock, maxWallMinutes: 43_200 });
+    const modes = ["limit", "reference"];
+    await drive(s, h, () => trialRows(s, jobId).some(row => row.ending === "void-limit"), modes, 240_000);
+    const first = trialRows(s, jobId);
+    assert.equal(first.length, 1, "one trial so far");
+    assert.equal(first[0]?.ending, "void-limit");
+    assert.deepEqual(served.service.providerLimits(), [], "the limit memory stays empty");
+    await drive(s, h, () => false, modes, 5_000);
+    assert.equal(trialRows(s, jobId).length, 1, "no second trial while the provider is limited");
+    assert.equal(jobRow(s, jobId)?.waiting, "provider-limit", "the job waits for the provider");
+    offset += 25 * 3_600_000;
+    await drive(s, h, () => jobRow(s, jobId)?.status === "completed", modes, 240_000);
+    const rows = trialRows(s, jobId);
+    assert.equal(rows[1]?.ending, "graded", "the second trial is graded");
+    assert.equal(rows[1]?.attempt, 1, "the second run is attempt 1");
+    assert.deepEqual(served.service.providerLimits(), [], "the limit memory stays empty");
+  } finally {
+    h.close();
+    await h.idle();
+    await fx.close();
+    s.r.store.close();
+  }
+});
+
+test("no trial while the eval identity is busy", { timeout: 300_000 }, async () => {
+  const s = setup();
+  // The identity answers busy: the probe is the only thing the test changes.
+  const busy: EvalIdentity = { ...s.identity, probe: async () => ({ state: "busy" }) };
+  const h = host(s, { identity: busy, ...gatesOnly });
+  try {
+    await validated(h);
+    const jobId = baseline(s, 1, 1);
+    await drive(s, h, () => false, [], 20_000);
+    assert.equal(trialRows(s, jobId).length, 0, "no trial row");
+    assert.equal(jobRow(s, jobId)?.waiting, "eval-identity");
+  } finally {
+    h.close();
+    await h.idle();
+    s.r.store.close();
+  }
+  // An eval-uid process that stays alive: the account cannot be stopped, so the trial is never started.
+  const alive = setup();
+  let planted = false;
+  const aliveRow: RuntimeProcess = { pid: 2, parent: 1, group: 2, ruid: STAND_IN_EVAL_UID, euid: STAND_IN_EVAL_UID, born: "", state: "S" };
+  const hAlive = host(alive, { ...gatesOnly, inventory: async () => (planted ? [aliveRow] : []) });
+  try {
+    await validated(hAlive);
+    // Start-up has stopped the account while nothing was planted; the row appears only before the trial starts.
+    planted = true;
+    const jobId = baseline(alive, 1, 1);
+    await drive(alive, hAlive, () => jobRow(alive, jobId)?.status === "blocked", [], 120_000);
+    assert.equal(trialRows(alive, jobId).length, 0, "no trial row");
+    assert.equal(jobRow(alive, jobId)?.status, "blocked");
+    assert.equal(jobRow(alive, jobId)?.reason, "eval-processes-alive");
+  } finally {
+    hAlive.close();
+    await hAlive.idle();
+    alive.r.store.close();
+  }
+});
+
+test("without both identities, no trial starts and the summary says why", { timeout: 300_000 }, async () => {
+  const none = setup({ member: false });
+  const hNone = host(none, gatesOnly);
+  try {
+    await validated(hNone);
+    const jobId = baseline(none, 1, 1);
+    await drive(none, hNone, () => false, [], 10_000);
+    assert.equal(trialRows(none, jobId).length, 0);
+    assert.equal(jobRow(none, jobId)?.waiting, "eval-identity");
+    const summary = await hNone.summary(PROJECT);
+    assert.ok(!("code" in summary));
+    assert.equal(summary.evalIdentity.state, "not-configured");
+    assert.equal(summary.trials.dailyCap, 10, "the daily cap is the project's trialsPerDay");
+  } finally {
+    hNone.close();
+    await hNone.idle();
+    none.r.store.close();
+  }
+  const v1 = setup({ version1: true });
+  const hV1 = host(v1, gatesOnly);
+  try {
+    await validated(hV1);
+    const jobId = baseline(v1, 1, 1);
+    await drive(v1, hV1, () => false, [], 10_000);
+    assert.equal(trialRows(v1, jobId).length, 0);
+    assert.equal(jobRow(v1, jobId)?.waiting, "grader");
+    const summary = await hV1.summary(PROJECT);
+    assert.ok(!("code" in summary));
+    assert.equal(summary.grader.version, 1, "the summary shows the version 1 grader");
+  } finally {
+    hV1.close();
+    await hV1.idle();
+    v1.r.store.close();
+  }
+});

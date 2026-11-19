@@ -5,7 +5,11 @@ import { EvidenceError, type EvidenceTx } from "./evidence/types.js";
 import { TaskCapture } from "./eval-capture.js";
 import { type Grader, type GraderProbe, launcherGrader, PROBE_FRESH_MS, stopGrader } from "./eval-grader.js";
 import { applyDuplicateRule, GroupPass, rootOf, sweepGroups } from "./eval-groups.js";
+import { launcherEvalIdentity, type EvalIdentity } from "./eval-identity.js";
 import { ACTIVE_JOBS_SQL, EvalJobs, JOB_LIST_MAX, type NextWork } from "./eval-jobs.js";
+import { TrialJobs } from "./eval-trial-jobs.js";
+import { trialsSince } from "./eval-trial-store.js";
+import { TrialPump, type TrialTeams } from "./eval-trial-pump.js";
 import { mineGit, type MineGit } from "./eval-mine-git.js";
 import { Miner } from "./eval-miner.js";
 import { evalRoutes } from "./eval-routes.js";
@@ -23,6 +27,7 @@ import {
 import { type BundleState, type TaskValidation, type ValidateContext, validateTask } from "./eval-validate.js";
 import type { HaltService } from "./halt/service.js";
 import type { HostLoadGate } from "./host-load.js";
+import type { Manager } from "./manager.js";
 import { spawnTeamBundle } from "./team-workspace.js";
 import { inventoryRuntimeProcesses, type RuntimeProcess } from "./team-retirement.js";
 import type { ProjectSourceService, ProjectSourceStatus } from "./project-source.js";
@@ -44,6 +49,11 @@ export type EvalHostOptions = {
   mineGit?: MineGit;
   inventory?: () => Promise<RuntimeProcess[]>;
   now?: () => string;
+  /** The team service the trial pump starts replay runs on. Without it, or without `sessions`, there is no trial pump. */
+  teams?: () => TrialTeams;
+  sessions?: Pick<Manager, "list" | "remove">;
+  /** The eval identity's launcher client; the default is the host's `eval.member`. */
+  identity?: EvalIdentity;
 };
 
 type Probed = { at: number; probe: GraderProbe };
@@ -67,6 +77,8 @@ export class EvalHost implements EvalHostApi {
   private readonly groups: GroupPass;
   private readonly miner: Miner;
   private readonly evalJobs: EvalJobs;
+  /** The baseline trial pump, one step after each validation step. Undefined without `teams` and `sessions`. */
+  private readonly trials: TrialPump | undefined;
   /** Owned by this pump across tasks: the job last streamed and its digest. */
   private readonly bundle: BundleState = { spawn: () => { throw new Error("No bundle is set."); }, job: null, sha256: null, restreamedFor: null, tooLarge: null };
   private probed: Probed | undefined;
@@ -96,6 +108,13 @@ export class EvalHost implements EvalHostApi {
     this.groups = new GroupPass({ store: this.store, runs: options.runs, now: this.now });
     this.miner = new Miner({ config: this.config, store: this.store, source: this.source, git: this.git, runs: options.runs, now: this.now });
     this.evalJobs = new EvalJobs({ store: this.store, config: this.config, now: this.now });
+    const identity = options.identity ?? launcherEvalIdentity(() => this.config.eval?.member);
+    this.trials = options.teams && options.sessions ? new TrialPump({
+      config: this.config, store: this.store, jobs: new TrialJobs({ store: this.store, config: this.config, now: this.now }),
+      grader: this.grader, identity, teams: options.teams, sessions: options.sessions, source: this.source, hostLoad: this.hostLoad,
+      halt: this.halt, graderProbe: () => this.grader.probe(this.canaries()).catch((): GraderProbe => ({ state: "unavailable" })),
+      inventory: this.inventory, now: this.now,
+    }) : undefined;
   }
 
   /** One sweep and one tick, then both timers, unreferenced. */
@@ -120,6 +139,7 @@ export class EvalHost implements EvalHostApi {
     try { this.capture.sweep(); } catch { /* the sweep never throws */ }
     try { this.store.tryWrite(tx => { sweepGroups(tx); }); } catch { /* an unavailable store sweeps nothing */ }
     try { this.evalJobs.sweep(); } catch { /* an unavailable store sweeps nothing */ }
+    void this.trials?.sweep();
   }
 
   routes(app: express.Express, readGuard: express.RequestHandler, ownerGuard: express.RequestHandler): void {
@@ -148,12 +168,14 @@ export class EvalHost implements EvalHostApi {
     if (project === undefined) return refusal(404, "unknown-project");
     if (!this.ready()) return refusal(503, "evidence-unavailable");
     const grader = await this.graderState();
+    const day = `${this.now().slice(0, 10)}T00:00:00.000Z`;
     return this.guard(() => evalSummary(this.store, {
       project,
       mining: this.miner.status(projectId),
       grader,
-      // Compile-only seam (INF-291 Task 13): Task 15 passes the probe's version, the eval identity, and today's trials.
-      graderVersion: null, evalIdentity: "not-configured", trials: { today: 0, dailyCap: null },
+      graderVersion: this.probed?.probe.version ?? null,
+      evalIdentity: this.trials?.identityState() ?? "not-configured",
+      trials: { today: this.trialsToday(projectId, day), dailyCap: project.team?.eval?.trialsPerDay ?? null },
       jobs: this.evalJobs.projectJobs(projectId, SUMMARY_JOBS),
       now: this.now(),
     }));
@@ -197,8 +219,19 @@ export class EvalHost implements EvalHostApi {
     this.validation = run;
   }
 
-  /** One task at most: the probe, the start-up clean once, the next task, the task, and its record. */
+  /** Today's trials of the project; 0 while the trials module cannot be read, so the summary still answers. */
+  private trialsToday(projectId: string, day: string): number {
+    try { return this.store.read(db => trialsSince(db, projectId, day)); } catch { return 0; }
+  }
+
+  /** One chain: the validation step, then the trial step. One user holds the grader at a time. */
   private async step(): Promise<void> {
+    await this.validateStep();
+    await this.trials?.step();
+  }
+
+  /** One task at most: the probe, the start-up clean once, the next task, the task, and its record. */
+  private async validateStep(): Promise<void> {
     if (this.cooldown > 0) {
       this.cooldown -= 1;
       return;

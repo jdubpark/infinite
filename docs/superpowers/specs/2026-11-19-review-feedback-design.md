@@ -1,6 +1,6 @@
 # Review feedback returns to delivered work (INF-324)
 
-Date: 2026-11-19. Status: design for review, third draft. Two independent reviews read the first and second drafts; the changes made after the second review have not been reviewed again. Nothing is built. The design recommends not building it yet: the live host holds no pull request on which the owner could have requested changes (see "How often it would fire"). Six decisions at the end are the owner's.
+Date: 2026-11-19. Status: design for review, fourth draft. An independent reviewer read the first three drafts. The corrections made after its third read have not been reviewed again: the order of the receipt lookup and the GitHub check (sections 3 and 5), the delivery recovery record (section 4), and the wording of the counts. Nothing is built. The design recommends not building it yet: the host's records hold no run this design would watch (see "How often it would fire"). Six decisions at the end are the owner's.
 
 ## Intent
 
@@ -36,14 +36,16 @@ Read-only counts from the live host on 2026-11-19, over the 29 runs it holds (th
 
 | Outcome | Runs |
 | --- | --- |
-| An open pull request recorded, waiting for the owner's review | 0 |
+| A pull request recorded and not merged: what this design would watch | 0 |
 | Merged by the delivery member after the independent review (delivery mode `merge`) | 15 |
 | `ready-for-review` with no pull request recorded | 5 (3 goal cycles, 2 runs the owner started directly) |
 | Cancelled, blocked, or ended without a change | 9 |
 
 None of the 29 runs belongs to a mission.
 
-In this history there was no pull request on which a changes-requested review could have started anything. The delivered runs on this host were merged by their delivery member, so the pull request is already merged when the owner reads it, and this design watches open pull requests only. The count covers the runs the host still holds; runs removed under retention are not in it.
+These records hold no run this design would watch. The delivered runs on this host were merged by their delivery member, so the pull request is already merged when the owner reads it, and this design watches open pull requests only.
+
+The count reads the host's records, not GitHub. A `merge` delivery that opened a pull request and then blocked before merging, or a `pr` delivery whose report was lost, leaves an open pull request that no record names (`packages/host/src/team-prompts.ts:345-347`, `teams.ts:5476-5481`). The count also covers only the runs the host still holds; runs removed under retention are not in it.
 
 ## Design
 
@@ -90,7 +92,13 @@ Applying an intent takes three steps, and no step holds one service's queue whil
 2. On no queue: make the call the intent names (section 4 or 5) with the saved payload.
 3. On the team queue: mark the intent `applied`, or `refused` with the destination's reason, add an applied review to the handled list, and save.
 
-Both destinations answer a repeated request id with the first result. A drain therefore repeats step 2 first and asks GitHub afterwards: an intent whose call already took effect is acknowledged and never judged again. Only an intent whose call has not taken effect (a host halt, a paused or blocked mission) is checked against GitHub before the call is retried, and it becomes `superseded` when the review is no longer the owner's newest, was dismissed, or the head moved. The accepted text is never replaced by a later edit of the review. Pending intents are drained at startup and at every poll, whatever the run's status is by then.
+Pending intents are drained at startup and at every poll, whatever the run's status is by then, and one drain runs at a time for a run. A drain never makes the call blind. Both destinations keep a receipt for each request id they applied, and each gains a read of that receipt that changes nothing. For each pending intent the drain:
+
+1. Reads the destination's receipt for the intent's request id. A receipt means the call took effect: the intent is marked `applied` and is never judged again.
+2. Without a receipt (a host halt, a paused or blocked mission), asks GitHub. When the review is no longer the owner's newest, was dismissed, or the head moved, the intent becomes `superseded` and no call is made.
+3. Otherwise makes the call with the saved payload and acknowledges it.
+
+A call that cannot run yet, because the mission is paused, leaves the intent `pending`. `refused` records only the destination's final answer. The accepted text is never replaced by a later edit of the review.
 
 **A defect in `steer` must be fixed first (INF-331).** Today `steer` writes its request receipt (`teams.ts:1699`) and then waits for the permission invalidation, which saves the run (`teams.ts:2037`, `:2048`) before the revision and the text change (`:1706`). A host that stops between those saves keeps the receipt without the steer, and a repeated request id is then answered as if it had been applied. The fix records the receipt in the same save that advances the revision. Without it the three steps above do not apply a review exactly once.
 
@@ -105,7 +113,7 @@ The intent's call is the existing `steer`, with the review summary as text and t
 - **The pull request moves only at delivery.** While a recorded pull request is older than the run's revision, head publication goes to `BRANCH-<8 hex>`, the form the host already uses when a push is rejected. The delivery member then pushes the reviewed commit to the pull request's branch, after the checks and the independent review pass. The owner never sees commits on the pull request that the independent reviewer has not approved.
 - **The delivery prompt accepts that push.** Its fast-forward rule gains the heads this run delivered earlier.
 - **Delivery recovery learns that a pull request exists.** Three things in it assume a first delivery. The delivery prompt tells the member to report `no-publication` when the host's published branch has no pull request and the base moved (`team-prompts.ts:385-386`); in a continued revision that branch is the side branch, which never has one. A `no-publication` report rebuilds the workspace from the moved base (`teams.ts:5360-5384`, `:5414`), which drops the commits the existing pull request needs for a fast-forward. And delivery evidence may name the run's branch or the delivery branch (`teams.ts:451`). With a pull request recorded, the host refuses `no-publication`, accepts evidence only for the recorded branch and URL, and the prompt says that the side branch is a checkpoint and names the pull request. A delivery failure in a continued revision therefore blocks the run for the owner. It does not recover by itself in the first build.
-- **An earlier delivery recovery does not block the next delivery.** The first delivery leaves `run.deliveryRecovery` at `complete` (`teams.ts:5483`), and a later delivery report is refused unless that record is `planning` at the current revision (`teams.ts:5442-5444`). A steer that advances the revision clears the record's status and keeps its attempt count.
+- **An earlier delivery recovery does not block the next delivery.** When a delivery recovery ran before the first delivery, its record stays on the run as `complete` (`teams.ts:5483`). Any record that is not `planning` at the current revision, head and policy refuses a later delivery report (`teams.ts:5442-5444`), so clearing its status would not be enough. A steer that advances the revision removes the active record and keeps the number of recoveries already used in a separate counter, so the limit on recoveries stays cumulative.
 
 The delivery member reports `pull-request` with the same URL, and the run is `ready-for-review` again with the new head.
 
@@ -122,12 +130,13 @@ The owner talks only to the coordinator, so the intent's call goes to the missio
 
 The inbox message carries the owner's words unchanged, names the subtask and the pull request, and tells the coordinator that `steer-subtask` on that subtask continues it from its delivered commit and updates the same pull request. The coordinator decides, as it does for any owner direction: forward it, ask the owner, or do something else in scope. Waking it costs one coordinator attempt, inside the mission's limit of 60.
 
-One allowance makes the forward possible. Today `steer-subtask` is refused for a finished subtask, and the queued steer behind it would be lost anyway: `applyOps` drops a steer for a settled team (`missions.ts:1053`) and rebinds a stale steer to the team's newer revision (`missions.ts:1065-1067`), which would send an old review to a later delivery. So the forward is its own queued operation, `review-forward`. It carries the review id, the delivered revision and head it applies to, and an authorization that works once. The host accepts it for a finished subtask while the mission holds an unforwarded review direction for that subtask, the subteam's run is at `ready-for-review` with a pull request at that revision and head, and its workspace is present. `applyOps` then:
+One allowance makes the forward possible. Today `steer-subtask` is refused for a finished subtask, and the queued steer behind it would be lost anyway: `applyOps` drops a steer for a settled team (`missions.ts:1053`) and rebinds a stale steer to the team's newer revision (`missions.ts:1065-1067`), which would send an old review to a later delivery. So the forward is its own queued operation, `review-forward`. It carries the review id, the delivered revision and head it applies to, the exact text, a stable request id, and an authorization that works once. The host accepts it for a finished subtask while the mission holds an unforwarded review direction for that subtask, the subteam's run is at `ready-for-review` with a pull request at that revision and head, and its workspace is present. `applyOps` then, in this order:
 
+- reads the team's receipt for the operation's request id. A receipt means the steer already happened: the authorization is marked used and the operation ends, whatever GitHub or the team says by then. Without this, a host that stopped after the steer would refuse its own forward, because the steer advanced the revision;
 - waits while another run holds the repository, as `schedule` does for a new subtask (`missions.ts:892-899`);
 - checks GitHub once more, immediately before the steer: the review is still the owner's newest, it is not dismissed, and the head has not moved (decision 5). Otherwise the operation ends as `superseded` and the coordinator is told;
 - refuses a team whose revision or head is no longer the one the operation names, and never rebinds it;
-- performs the existing team `steer` by the coordinator, and marks the authorization used only after the steer succeeded. The subtask's status follows the team's as it does today (`missions.ts:973-976`), so nothing sets it by hand.
+- performs the existing team `steer` by the coordinator with the saved text and request id, and marks the authorization used after the steer succeeded. The subtask's status follows the team's as it does today (`missions.ts:973-976`), so nothing sets it by hand.
 
 Section 4's changes apply to the subteam's run. A reopened mission holds its subteams' workspaces again, because the retention hold reads the mission's status.
 
@@ -175,10 +184,10 @@ A review is steering text and reaches as far as an owner steer does today. It ca
 
 ## When to build
 
-Build it when runs stop at an open pull request for the owner's review. Today none does (see "How often it would fire"). That is decision 0 below. Two things do not wait for it:
+Build it when runs stop at an open pull request for the owner's review. Today the host's records hold no such run (see "How often it would fire"). That is decision 0 below. Two things do not wait for it:
 
 - INF-331, the receipt order in `steer`, is a defect today for every steer that is retried.
-- Feedback on merged work has no path. `steer` refuses a run with a merge receipt (`teams.ts:1693`), so the owner's correction starts a new run or mission that knows nothing of the first. A follow-up that starts from the merged run's record is the same idea for merged work. It is not designed here.
+- The owner's review of merged work reaches nothing by itself. `steer` refuses a run with a merge receipt (`teams.ts:1693`). Inside a mission a later subtask can already build on a merged one: the mission picks the merged predecessor, and the new run starts from its merge commit (`missions.ts:946-951`, `teams.ts:1541-1550`). The missing part is the intake: reading the owner's review of a merged pull request and turning it into such a follow-up. It is not designed here.
 
 ## Build plan
 
@@ -194,12 +203,12 @@ Steps 2 and 4 change the run and mission state machines and go to a strong imple
 
 | # | Decision | Recommendation |
 | --- | --- | --- |
-| 0 | Should runs stop at an open pull request for your review? On this host the delivered runs are merged after the independent review, so this design has nothing to act on | Decide per project. Where your review should be the gate, set that project to delivery mode `pr` and build this. Where merging after the independent review is right, this design does not apply, and feedback on merged work needs its own design (see "When to build") |
+| 0 | Should runs stop at an open pull request for your review? On this host the delivered runs are merged after the independent review, so the host's records hold no run this design would watch | Decide per project. Where your review should be the gate, set that project to delivery mode `pr` and build this. Where merging after the independent review is right, this design does not apply, and taking your review of merged work needs its own design (see "When to build") |
 | 1 | How much working time does a mission get when a review reopens it? | The mission's original `maxMinutes`, once per accepted review. It is a ceiling, and the limits on subtasks, members and coordinator attempts stay cumulative |
 | 2 | Inline comments: add a narrow proxy read for a review's comments now, or ship summary-only first? | Summary-only first, and say so in the pull request description the delivery member writes. The proxy holds the installation token, so a new read deserves its own review and its own deploy |
 | 3 | After the workspace is removed: restore it from the published branch, or stop taking reviews? | Stop in the first build. Restoring needs a fetch of a non-base ref into the mirror and a proof that the fetched commit is the recorded one. Build it when a review is actually lost to retention |
 | 4 | A changes-requested review that is already on a pull request when the feature is turned on: act on it, or ignore it? | Ignore it, counting from the last time the feature was switched on. Turning a switch on should not start work on old pull requests |
-| 5 | You approve or dismiss your review after it reached the coordinator and before the coordinator forwarded it: does the forward still run? | No. The host checks GitHub once more immediately before it steers the subteam, and ends the forward as superseded. For a run you started directly the question does not arise: acceptance and the steer are one step |
+| 5 | You approve or dismiss your review after it reached the coordinator and before the coordinator forwarded it: does the forward still run? | No. The host checks GitHub once more immediately before it steers the subteam, and ends the forward as superseded. For a run you started directly the steer follows acceptance at once. If a halt holds it, the same check runs before the steer is made |
 
 The first draft asked whether a review on a mission's pull request should go straight to the subteam. It does not: on 2026-10-20 the owner set the rule that owner input for a mission goes to the coordinator, and this design follows it.
 
@@ -211,6 +220,7 @@ The first draft asked whether a review on a mission's pull request should go str
 - Whether GitHub accepts a changes-requested review on a merged pull request. This design watches open pull requests only.
 - INF-331 is confirmed by reading the code, not by a test.
 - That every caller of `applyOps` holds the mission queue. The queue rule in section 3 does not depend on it.
-- The counts in "How often it would fire" cover the runs the host still holds.
+- The counts in "How often it would fire" cover the runs the host still holds, and they read the host's records, not GitHub.
+- Neither destination has a receipt read today. The design adds one to each.
 - Whether anything removes the `BRANCH-<8 hex>` branches the host publishes. This design leaves one per continued revision.
 - The live server's credential isolation, beyond what the deployment guide documents.

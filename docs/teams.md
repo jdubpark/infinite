@@ -2930,6 +2930,9 @@ selects other options; and `other` when it is any other text. Free text
 matches only word for word; the host does not judge whether words agree. A
 recommendation is evidence beside the question. Nothing answers a question
 with it, and the intent check's decisions carry none.
+The recommendation is part of the decision in the team view, so it reaches
+every paired device that reads the run or the team list, through the relay as
+well, exactly as the question and its options do. An older client ignores it.
 
 For a standalone team, steering records a new requirements revision. Earlier
 member results cannot satisfy it. The scheduler stops old assignments and replans from the integrated

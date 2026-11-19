@@ -39,11 +39,13 @@ struct TeamMutation: Equatable {
         if next != run { run = next }
     }
     /// A team list row omits what only this page shows: the request, check output and member reports. It seeds a run
-    /// not yet read in full and keeps a hidden page's revision current; a shown page takes changes from its own poll.
+    /// not yet read in full and never replaces a full read. A newer row marks a hidden page's read out of date, so its
+    /// controls wait for the poll that starts when the page is shown; a shown page takes changes from its own poll.
     func observeListRow(_ next: TeamRun) {
-        guard !(detailed && pageShown && displayVisible), supersedes(next) else { return }
-        detailed = false
-        if next != run { run = next }
+        guard supersedes(next) else { return }
+        guard detailed else { if next != run { run = next }; return }
+        let newer = next.revision > run.revision || next.updatedAt > run.updatedAt
+        if newer, !(pageShown && displayVisible), fresh { fresh = false }
     }
     private func supersedes(_ next: TeamRun) -> Bool {
         next.revision > run.revision || (next.revision == run.revision && next.updatedAt >= run.updatedAt)

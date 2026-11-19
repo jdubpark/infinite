@@ -156,8 +156,8 @@ test("remote event streams replace oversized snapshots with refetch and keep del
     streams.splice(0).forEach(stream => stream.close());
     await new Promise(resolve => setTimeout(resolve, 100));
 
-    const teams = host.teams as unknown as { listItems(): unknown };
-    const originalList = teams.listItems;
+    const teams = host.teams as unknown as { list(): unknown };
+    const originalList = teams.list;
     const manager = host.manager as unknown as { events(id: string, after: number, limit: number, types?: Set<string>): { events: unknown[]; cursor: number; more: boolean } };
     const originalEvents = manager.events;
     const session = await owner.request<{ id: string }>("/sessions", { body: {
@@ -171,7 +171,7 @@ test("remote event streams replace oversized snapshots with refetch and keep del
       cursor: journalCursor, more: false,
     });
     const oversized = [{ title: "💥".repeat(Math.ceil(MAX_EVENTS_EVENT_BYTES / 4)) }];
-    teams.listItems = () => oversized;
+    teams.list = () => oversized;
     const sessionTopic = `session/${session.id}`;
     const updates: { topic: string; data: any }[] = [], freshSessionUpdates: { topic: string; data: any }[] = [];
     const stream = await owner.openEvents({ topics: ["teams", sessionTopic], onEvent: event => updates.push(event as { topic: string; data: any }), onClose: () => {} });
@@ -182,7 +182,7 @@ test("remote event streams replace oversized snapshots with refetch and keep del
     const journal = await owner.request<{ events: unknown[]; cursor: number }>(`/sessions/${session.id}/events?after=0`);
     assert.deepEqual(journal.events, [journalEvent], "REST retains the oversized journal event");
     const before = updates.filter(value => value.topic === "refetch" && value.data.topic === sessionTopic).length;
-    teams.listItems = () => [{ title: "small snapshot" }];
+    teams.list = () => [{ title: "small snapshot" }];
     journalCursor = 2;
     const freshSession = await owner.openEvents({ topics: [sessionTopic], after: journal.cursor, onEvent: event => freshSessionUpdates.push(event as { topic: string; data: any }), onClose: () => {} });
     await waitFor(async () => freshSessionUpdates, values => values.some(value => value.topic === sessionTopic && value.data.events.events.some((event: { seq: number }) => event.seq === 2)), 4000);
@@ -194,7 +194,7 @@ test("remote event streams replace oversized snapshots with refetch and keep del
       "once refetch is required, later team changes on this subscription never send an inline snapshot");
     stream.close();
     freshSession.close();
-    teams.listItems = originalList;
+    teams.list = originalList;
     manager.events = originalEvents;
 
     host.config.tokens = host.config.tokens.filter(device => device.role !== "owner");

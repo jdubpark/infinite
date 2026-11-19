@@ -267,7 +267,7 @@ test("HTTP live streams stop after cookie logout or paired-token revocation", { 
   const host = await inProcessHost();
   const readers: ReadableStreamDefaultReader<Uint8Array>[] = [];
   let revision = 0;
-  t.mock.method(host.teams, "listItems", () => [{ title: `Revision ${revision}` }] as ReturnType<typeof host.teams.listItems>);
+  t.mock.method(host.teams, "list", () => [{ title: `Revision ${revision}` }] as ReturnType<typeof host.teams.list>);
   try {
     async function cookieFor(token: string) {
       const login = await fetch(`${host.origin}/api/login`, { method: "POST", headers: { Origin: host.config.origin, "Content-Type": "application/json" }, body: JSON.stringify({ token }) });

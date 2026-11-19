@@ -71,12 +71,12 @@ function TeamRunRow({ connection, team: received, role, machine, now, kind, done
   const request = useRunRequest<TeamView>(connection, `${machine}/team/${team.id}`, {
     accepted: result => {
       setRecorded(previous => newer<TeamListItem>(previous, result));
-      void api<{ teams: TeamListItem[] }>(connection, "/teams").then(value => {
+      void api<{ teams: TeamListItem[] }>(connection, "/teams?view=list").then(value => {
         const refreshed = value.teams.find(item => item.id === result.id);
         if (refreshed) setRecorded(previous => newer(previous, refreshed));
       }).catch(() => {});
     },
-    refused: () => { void api<{ teams: TeamListItem[] }>(connection, "/teams").then(value => {
+    refused: () => { void api<{ teams: TeamListItem[] }>(connection, "/teams?view=list").then(value => {
       const refreshed = value.teams.find(item => item.id === team.id);
       if (refreshed) setRecorded(previous => newer(previous, refreshed));
     }).catch(() => {}); },

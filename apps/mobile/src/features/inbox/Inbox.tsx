@@ -87,7 +87,7 @@ export function Inbox({
   const pace = (tab: InboxView) => focused && view === tab ? 4000 : 20000;
   const teamsPoll = useLive<TeamListItem[] | null>(connection, {
     topics: ["teams"], intervalMs: pace("teams"), deps: [hasTeams],
-    load: () => hasTeams ? api<{ teams: TeamListItem[] }>(connection, "/teams").then(value => value.teams) : Promise.resolve(null),
+    load: () => hasTeams ? api<{ teams: TeamListItem[] }>(connection, "/teams?view=list").then(value => value.teams) : Promise.resolve(null),
     select: (topic, payload) => topic === "teams" && Array.isArray((payload as { teams?: unknown }).teams) ? (payload as { teams: TeamListItem[] }).teams : undefined,
   });
   const goalsPoll = usePoll(() => hasGoals ? api<{ goals: ProductGoal[] }>(connection, "/goals").then(value => value.goals) : Promise.resolve(null), pace("goals"), [connection, hasGoals]);

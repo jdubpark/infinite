@@ -359,7 +359,7 @@ struct TeamResumeFailure: Equatable {
     private func refreshTeams(_ generation: UUID, _ visibility: UUID) async {
         guard displayVisible, generation == connectionGeneration, visibility == displayGeneration, let client else { return }
         do {
-            let response = try await client.request("/teams")
+            let response = try await client.request("/teams?view=list")
             guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
             let next = TeamRun.blockedFirst(response["teams"].array.map(TeamRun.init).sorted {
                 if $0.needsYou != $1.needsYou { return $0.needsYou }

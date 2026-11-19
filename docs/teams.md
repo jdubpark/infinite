@@ -3125,7 +3125,7 @@ cycle's PM selects capacity for its work. The refusal uses `409` with
 
 | Method and endpoint | Body | Role |
 | --- | --- | --- |
-| `GET /api/teams` | None; returns `{teams}` as compact list rows without check output, reports, task instructions or the request | Any paired device |
+| `GET /api/teams[?view=list]` | None; returns `{teams}`: every run in full, or with `view=list` one compact row per run (see below) | Any paired device |
 | `GET /api/teams/:id` | None; returns the full record with reports and check evidence | Any paired device |
 | `GET /api/teams/:id/context` | None; returns the files each member's recorded tool inputs pointed at | Any paired device |
 | `GET /api/teams/:id/record[?version=N]` | Optional `version` (a positive integer); returns the objective record of a standalone run at that version | Owner, controller, or viewer |
@@ -3135,6 +3135,29 @@ cycle's PM selects capacity for its work. The refusal uses `409` with
 | `POST /api/teams/:id/decisions/:decisionId/answer` | `requestId`, `revision`, `text` | Owner/controller |
 | `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams |
 | `POST /api/teams/:id/tasks/:taskId/rating` | `requestId`, `score` (1–5), optional `note` (≤1,000 characters) | Owner |
+
+`GET /api/teams` without `view` answers every run in full, which is what
+installed clients read. `view=list` answers one compact row per run for list
+screens. A row uses the same keys and meanings as the full record and leaves
+out the request, check commands and output, member reports, task instructions
+and summaries, continuations, steering, the brief and issue descriptions. It
+keeps the run's identity, status, revision, times, branch and commits, reason
+and worker counts; its decisions in full; reduced `members`, `tasks` (at most
+20 changed paths each, then `truncated`) and `checks`; the latest entry of
+`events`; and the identifying fields of `lineup`, `goal`, `linear`, `review`,
+`discovery`, `pullRequest`, `deliveryReceipt`, `permissions`,
+`permissionDecisions` and `usage`. `TeamListItem` in
+`packages/host/src/team-list.ts` is the exact shape. A row is reduced, not
+redacted: decision text, the reason and paths appear as in the full record.
+The list is not paginated. Read a run's detail from `GET /api/teams/:id`.
+
+A full list grows with every stored run and its check output. The remote
+channel carries at most 4 MiB per response, so when the full list exceeds
+that, the channel answers the compact rows in its place and skips the full
+read for the next five minutes. A client built before `view=list` existed then
+reads rows where it expected full records: its list screens work, and a screen
+that shows a run's detail from a list row lacks that detail until it reads the
+run itself.
 
 The context response lists, for each member of the current revision and each
 earlier member still running, its repository-relative `files` with `reads`,

@@ -1034,7 +1034,7 @@ export class TeamService {
   }
   private event(stored: Stored, text: string) { runEvent(stored.run, text); }
   list(): TeamView[] { return [...this.records.values()].map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
-  /** Compact rows for `GET /api/teams` and the live `teams` topic, in `list()` order. `get()` keeps the full record. */
+  /** Compact rows for `GET /api/teams?view=list`, in `list()` order. `list()` and `get()` keep the full record. */
   listItems(): TeamListItem[] { return this.list().map(teamListItem); }
   /** Persisted team records for the read-only Understanding view; performs no tracker or usage refresh. */
   understandingRecords() { return [...this.records.values()].map(stored => structuredClone(stored.run)); }

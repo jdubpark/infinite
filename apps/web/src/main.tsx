@@ -102,7 +102,7 @@ function App() {
     if (current()) setSessions(data.sessions.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
   }, 1800, me);
   const teamFeed = useLiveRefresh(async current => {
-    const data = await api<{ teams: TeamListItem[] }>("/teams");
+    const data = await api<{ teams: TeamListItem[] }>("/teams?view=list");
     if (current()) setTeams(data.teams.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
   }, 1800, me?.teams ? me : null);
   const goalFeed = useLiveRefresh(async current => {

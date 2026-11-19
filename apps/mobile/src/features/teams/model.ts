@@ -51,8 +51,9 @@ export type TeamView = {
   permissionDecisions?: PermissionDecision[];
 };
 /**
- * A run as `GET /teams` and the live `teams` topic list it: the fields list screens read, with the long detail
- * (the request, check output, reports, task instructions) left to `GET /teams/:id`. A full view also fits this type.
+ * A run as `GET /teams?view=list` lists it: the fields list screens read, with the long detail (the request, check
+ * output, reports, task instructions) left to `GET /teams/:id`. A full view also fits this type, which is what an
+ * older host answers and what a live `teams` event carries.
  */
 export type TeamListItem = Pick<TeamView, "id" | "projectId" | "provider" | "title" | "parallelism" | "workers" | "revision" | "status" | "createdAt" | "updatedAt"
   | "workspace" | "branch" | "baseCommit" | "headCommit" | "decisions" | "events" | "reason" | "linear" | "goal" | "missionId" | "resumable" | "continuable" | "permissionsRevokedAt"> & {

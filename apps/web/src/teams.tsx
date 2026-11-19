@@ -44,7 +44,7 @@ export type TeamView = {
   /** Omitted by older hosts. */
   workers?: { limit: number; max: number; running: number; ready: number };
 };
-/** A run as `GET /teams` lists it. The long detail (the request, check output, reports, task instructions) comes from `GET /teams/:id`. */
+/** A run as `GET /teams?view=list` lists it. The long detail (the request, check output, reports, task instructions) comes from `GET /teams/:id`. */
 export type TeamListItem = Pick<TeamView, "id" | "projectId" | "provider" | "title" | "parallelism" | "revision" | "status" | "createdAt" | "updatedAt"
   | "workspace" | "branch" | "baseCommit" | "headCommit" | "decisions" | "events" | "reason" | "missionId" | "resumable" | "continuable" | "workers"> & {
   members: (Omit<TeamMember, "cwd" | "baseCommit" | "modelProfile" | "usage"> & { startedAt?: string; reportedAt?: string; lastActivityAt?: string; pendingLimit?: boolean; stalledAt?: string;

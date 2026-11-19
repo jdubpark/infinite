@@ -2,14 +2,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { LiveFeed } from "../packages/host/src/live.js";
+import { createRemoteClient } from "@infinite/remote";
+import { MAX_RESPONSE_BYTES } from "@infinite/remote/protocol";
+import { connectRemoteAccess } from "../packages/host/src/remote-access.js";
 import { teamListItem } from "../packages/host/src/team-list.js";
 import type { TeamModelProfile, TeamView } from "../packages/host/src/team-types.js";
 import type { UsageTotals } from "../packages/host/src/usage.js";
-import { waitFor } from "./helpers.js";
+import { inProcessHost, waitFor } from "./helpers.js";
 import { fixture } from "./team-fixture.js";
 
-const KIB = 1024, MIB = 1024 * KIB;
+const KIB = 1024;
 const prose = (seed: string, bytes: number) => `${seed} `.repeat(Math.ceil(bytes / (seed.length + 1))).slice(0, bytes);
 const at = (minute: number) => new Date(Date.UTC(2026, 0, 1, 0, minute)).toISOString();
 const commit = (seed: number) => seed.toString(16).padStart(40, "a");
@@ -90,7 +92,7 @@ test("thirty finished runs list in compact rows far under the relay's response l
   const full = Buffer.byteLength(JSON.stringify({ teams: views }));
   const rows = Buffer.byteLength(JSON.stringify({ teams: views.map(teamListItem) }));
   t.diagnostic(`30 full views: ${full} bytes; 30 rows: ${rows} bytes (${Math.round(rows / 30)} per run)`);
-  assert.ok(full > 4 * MIB, `the fixture reproduces the refused list: ${full} bytes`);
+  assert.ok(full > MAX_RESPONSE_BYTES, `the fixture reproduces the refused list: ${full} bytes`);
   assert.ok(rows < 30 * 12 * KIB, `rows average under 12 KiB per run: ${rows} bytes`);
 });
 
@@ -115,23 +117,7 @@ test("a list row keeps every field client list code reads, unchanged, and nothin
   assert.equal(read(row, ["checks", "0", "output"]), undefined);
 });
 
-test("the live teams topic notifies a refetch instead of sending rows", async t => {
-  t.mock.timers.enable({ apis: ["setInterval"] });
-  let title = "First";
-  const feed = new LiveFeed({ sessions: async () => ({}), teams: () => ({ teams: [{ title }] }), session: async () => ({}), events: async () => ({ events: [], cursor: 0, more: false }) });
-  const updates: unknown[] = [];
-  try {
-    const flush = async () => { await new Promise<void>(resolve => setImmediate(resolve)); await new Promise<void>(resolve => setImmediate(resolve)); };
-    feed.subscribe(["teams"], 0, update => updates.push(update));
-    await flush();
-    title = "Second";
-    t.mock.timers.tick(750);
-    await flush();
-    assert.deepEqual(updates, Array(2).fill({ topic: "refetch", data: { topic: "teams" } }), "each change is a refetch notice; a phone reloads the list or its open run");
-  } finally { feed.close(); t.mock.timers.reset(); }
-});
-
-test("GET /api/teams answers rows and GET /api/teams/:id keeps the full record", { timeout: 120000 }, async () => {
+test("GET /api/teams?view=list answers rows; the default list and GET /api/teams/:id keep the full record", { timeout: 120000 }, async () => {
   const f = await fixture();
   try {
     const request = f.create();
@@ -140,7 +126,7 @@ test("GET /api/teams answers rows and GET /api/teams/:id keeps the full record",
     assert.equal((await f.settled(created.body.id)).status, "ready-for-review");
     // Usage is read from the ledger as journals arrive, so compare a list and a detail read taken while the run is still.
     const { row, detail } = await waitFor(async () => {
-      const listed = await f.host.fetchApi("/teams");
+      const listed = await f.host.fetchApi("/teams?view=list");
       assert.equal(listed.status, 200, JSON.stringify(listed.body));
       return { row: listed.body.teams.find((team: { id: string }) => team.id === created.body.id), detail: await f.get(created.body.id) };
     }, value => isDeepStrictEqual(value.row, json(teamListItem(value.detail))), 15000);
@@ -150,5 +136,37 @@ test("GET /api/teams answers rows and GET /api/teams/:id keeps the full record",
     assert.ok(detail.members.some(member => member.report), "the detail keeps member reports");
     assert.ok(detail.tasks.every(task => typeof task.instructions === "string"), "the detail keeps task instructions");
     assert.ok(Array.isArray(detail.providerLimits) && "byProfile" in detail.usage, "the detail keeps the view's computed fields");
+    // An installed client asks without a view and still reads every run in full.
+    const full = (await f.host.fetchApi("/teams")).body.teams.find((team: { id: string }) => team.id === created.body.id);
+    assert.equal(full.objective, request.objective);
+    assert.ok(full.checks.every((check: { output?: unknown }) => typeof check.output === "string"));
+    assert.equal((await f.host.fetchApi("/teams?view=rows")).status, 400, "an unknown view is refused");
   } finally { await f.close(); }
+});
+
+test("the remote channel answers a team list over its limit with compact rows", { timeout: 60000 }, async t => {
+  const host = await inProcessHost();
+  host.config.remote = { enabled: true };
+  const closeRemote = connectRemoteAccess(host.server, host.config);
+  const owner = createRemoteClient({ url: host.origin, token: host.tokens.owner });
+  const teams = host.teams as unknown as { list(): TeamView[]; listItems(): unknown[] };
+  const original = { list: teams.list, listItems: teams.listItems };
+  type Listed = { teams: { id: string; objective?: string }[] };
+  try {
+    const views = Array.from({ length: 30 }, (_, index) => finishedRun(index)), rows = json(views.map(teamListItem));
+    teams.listItems = () => rows;
+    teams.list = () => views.slice(0, 2);
+    const fits = await owner.request<Listed>("/teams");
+    assert.deepEqual(fits.teams.map(team => typeof team.objective), ["string", "string"], "a list that fits arrives in full, as an installed client reads it");
+
+    teams.list = () => views;
+    assert.deepEqual((await owner.request<Listed>("/teams")).teams, rows, "rows answer in place of a refusal");
+    assert.deepEqual((await owner.request<Listed>("/teams?view=list")).teams, rows, "a client that asks for rows reads them");
+    // The next reads skip the full list that could not be carried, so rows answer even though the full list would fit again.
+    teams.list = () => views.slice(0, 2);
+    assert.deepEqual((await owner.request<Listed>("/teams")).teams, rows);
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+    t.mock.timers.tick(5 * 60_000);
+    assert.equal((await owner.request<Listed>("/teams")).teams.length, 2, "after the retry interval the full list is read again");
+  } finally { t.mock.timers.reset(); teams.list = original.list; teams.listItems = original.listItems; owner.close(); closeRemote(); await host.stop(); }
 });

@@ -4,6 +4,7 @@ import { featureMapSchema, TASK_KINDS } from "./task-features.js";
 import { evalProjectSchema } from "./eval-config.js";
 import { POINTS_ALGORITHM_VERSION, teamRoutingSchema } from "./routing-policy.js";
 import { intentCheckReportSchema } from "./intent-report.js";
+import { questionRecommendationSchema, refineQuestion, type DecisionRecommendation } from "./question-recommendation.js";
 import type { RoutingKnobs, TeamRunRouting } from "./routing-types.js";
 import type { Prompt, AnswerResult } from "@infinite/attention";
 import type { Receipt } from "./types.js";
@@ -553,7 +554,8 @@ export const blockerEvidenceSchema = z.object({
     context.addIssue({ code: "custom", message: "Blocker evidence must fit within 12 KiB of UTF-8 JSON" });
 });
 export type BlockerEvidence = z.infer<typeof blockerEvidenceSchema>;
-export const teamReportSchema = z.discriminatedUnion("kind", [
+const questionReportShape = { kind: z.literal("question"), question: z.string().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]), answerMode: z.enum(["approval", "single", "multiple"]).optional() };
+const teamReportVariants = [
   z.object({ kind: z.literal("permission-decision"), decisionId: z.uuid(), verdict: z.enum(["approve-once", "request-evidence", "escalate"]), summary: z.string().trim().min(1).max(2000), requestedPaths: z.array(z.string().trim().min(1).max(512)).max(8).optional() }).strict().superRefine((report, context) => {
     if (report.verdict === "request-evidence" && !report.requestedPaths?.length)
       context.addIssue({ code: "custom", path: ["requestedPaths"], message: "Request evidence with at least one repository-relative or approved scratch path." });
@@ -571,17 +573,20 @@ export const teamReportSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("delivery-repair"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("delivery-reconciliation"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), repository: githubRepository, branch: gitBranch, baseHeadCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), disposition: z.enum(["no-publication", "owned-branch", "pull-request"]), remoteHeadCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i).optional(), pullRequestUrl: z.string().trim().min(1).max(500).optional(), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("pull-request"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), pullRequestUrl: z.string().trim().min(1).max(500), summary: z.string().trim().min(1).max(4000) }).strict(),
-  z.object({ kind: z.literal("question"), question: z.string().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]), answerMode: z.enum(["approval", "single", "multiple"]).optional() }).strict().superRefine((report, context) => {
-    if (report.answerMode === "approval" && report.options.length !== 2)
-      context.addIssue({ code: "custom", path: ["options"], message: "Approval questions require exactly two options: approve first and deny second." });
-    if (report.answerMode === "multiple" && report.options.length < 2)
-      context.addIssue({ code: "custom", path: ["options"], message: "Multiple-selection questions require at least two options." });
-  }),
   z.object({ kind: z.literal("blocked"), summary: z.string().min(1).max(4000), blocker: blockerEvidenceSchema.optional() }).strict(),
   intentCheckReportSchema,
-]);
-export type TeamReport = z.infer<typeof teamReportSchema>;
-export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: teamReportSchema }).strict();
+] as const;
+/** What the report tool accepts from a member: every question carries the member's recommendation. */
+export const teamReportSchema = z.discriminatedUnion("kind", [...teamReportVariants,
+  z.object({ ...questionReportShape, recommendation: questionRecommendationSchema }).strict().superRefine(refineQuestion)]);
+/**
+ * A report as the session journal and the run record hold it. A member started before recommendations were required
+ * may still ask a question without one, so the worker and the host read this form.
+ */
+export const recordedTeamReportSchema = z.discriminatedUnion("kind", [...teamReportVariants,
+  z.object({ ...questionReportShape, recommendation: questionRecommendationSchema.optional() }).strict().superRefine(refineQuestion)]);
+export type TeamReport = z.infer<typeof recordedTeamReportSchema>;
+export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: recordedTeamReportSchema }).strict();
 export type TeamReportEnvelope = z.infer<typeof teamReportEnvelopeSchema>;
 export type TeamRole = "permission-coordinator" | "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery" | "intent-checker";
 /** A mission coordinator's assignment carries the mission ID as `runId`; it reports `MissionReport`s. */
@@ -704,6 +709,11 @@ export interface TeamDecision {
   answeredAt?: string;
   /** Ids of the record questions this decision asks, set by the intent check. Authority surfaces print them in place of `question`. */
   intentQuestions?: string[];
+  /**
+   * What the asking member would answer and why, with how the recorded answer compared. Absent on the intent check's
+   * decisions and on a decision asked by a member started before recommendations were required.
+   */
+  recommendation?: DecisionRecommendation;
 }
 export interface TeamCheck {
   command: TeamCommand;

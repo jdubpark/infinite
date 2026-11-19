@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { waitFor } from "./helpers.js";
@@ -92,6 +92,13 @@ test("a replay run reaches no client", { timeout: 120000 }, async () => {
     assert.equal(context.service.activeForProject("rehearsal"), false);
     await assert.rejects(async () => context.service.get(trialId), error => (error as { status?: number; code?: string }).code === "team-not-found");
     assert.throws(() => context.service.objectiveRecord(trialId), error => (error as { code?: string }).code === "team-not-found");
+    // The owner's routes by id answer as for a run that does not exist, so none can pull the record from under the trial.
+    const missing = (error: unknown) => (error as { code?: string }).code === "team-not-found";
+    await assert.rejects(async () => context.service.removeRun(trialId), missing, "delete");
+    await assert.rejects(async () => context.service.bundle(trialId), missing, "bundle");
+    await assert.rejects(async () => context.service.rateTask(trialId, "t1", { requestId: randomUUID(), score: 5 }), missing, "rating");
+    await assert.rejects(async () => context.service.revokePermissions(trialId, { requestId: randomUUID(), revision: 1 }), missing, "revoke");
+    assert.equal((await context.service.replayState(trialId))?.phase, "running", "the trial still runs after the refused calls");
     await context.ended(trialId);
     assert.deepEqual(context.service.providerLimits(), [], "a replay run's limit notice never reaches the provider limits");
   } finally {
@@ -121,6 +128,23 @@ test("every member ending ends the trial with its name", { timeout: 120000 }, as
     const settled = await context.ended(reference.trialId);
     assert.equal(settled?.ending, "settled");
     assert.match(settled?.resultCommit ?? "", /^[0-9a-f]{40}$/, "a reference result settles with its commit");
+  } finally {
+    await context.f.close();
+  }
+});
+
+test("a trials root that another account can write starts no member", { timeout: 120000 }, async () => {
+  const context = await replayFixture();
+  try {
+    // The eval account owns the trials root, so the check is on its mode, not its owner: group-writable is refused.
+    chmodSync(join(context.evalRoot, "trials"), 0o770);
+    const { trialId } = await context.start("reference");
+    const state = await context.ended(trialId);
+    assert.equal(state?.ending, "void-host");
+    assert.equal(state?.memberId, undefined, "no member was launched");
+    chmodSync(join(context.evalRoot, "trials"), 0o700);
+    const again = await context.start("reference");
+    assert.equal((await context.ended(again.trialId))?.ending, "settled", "the same root with a private mode runs the trial");
   } finally {
     await context.f.close();
   }

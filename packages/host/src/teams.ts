@@ -744,7 +744,7 @@ export class TeamService {
     if (!root) throw new TeamError(409, "invalid-workspace", "The team workspace is outside its configured root.");
     if (!stored.anchor && root !== this.config.teams?.workspaceDir && !(stored.run.replay && root === this.replays.root()))
       throw new TeamError(409, "team-root-unsafe", "A team root outside the configured workspace directory requires a trusted anchor.");
-    const canonical = stored.anchor ? ensureHostDirectory(stored.anchor, root, 0o750, create) : ensureDefaultTeamRoot(root, create);
+    const canonical = stored.anchor ? ensureHostDirectory(stored.anchor, root, 0o750, create) : stored.run.replay ? this.replays.canonicalRoot() : ensureDefaultTeamRoot(root, create);
     assertTeamPath(canonical, path);
   }
   private canResume(stored: Stored, linearStatus = stored.run.linear?.status, allowRemovedWorkspace = false) {
@@ -1421,7 +1421,7 @@ export class TeamService {
   }
   removeRun(id: string): Promise<TeamView> {
     return this.enqueue(async () => {
-      const stored = this.record(id), run = stored.run;
+      const stored = this.visible(id), run = stored.run;
       if (this.needsPublication(stored)) throw new TeamError(409, "head-not-published", "The integrated head must be published to GitHub before this run can be removed.");
       if (this.removingRuns.has(id)) throw new TeamError(409, "team-operation-running", "A background workspace removal is still running. Retry deletion after it settles.");
       this.assertRunRetentionSafe(stored);
@@ -1443,7 +1443,7 @@ export class TeamService {
     });
   }
   rateTask(id: string, taskId: string, input: { requestId: string; score: number; note?: string }) {
-    const stored = this.record(id), task = stored.run.tasks.find(item => item.id === taskId);
+    const stored = this.visible(id), task = stored.run.tasks.find(item => item.id === taskId);
     if (!task) throw new TeamError(404, "task-not-found", "The team task was not found.");
     const fingerprint = digest({ taskId, score: input.score, ...(input.note ? { note: input.note } : {}) });
     const prior = stored.ratings?.[input.requestId];
@@ -1459,7 +1459,7 @@ export class TeamService {
     return task;
   }
   async bundle(id: string) {
-    const stored = this.record(id), run = stored.run;
+    const stored = this.visible(id), run = stored.run;
     if (run.workspaceRemovedAt) throw new TeamError(409, "team-workspace-removed", "This run's workspaces were removed under the retention policy; start a new run.");
     if (run.status !== "ready-for-review") throw new TeamError(409, "team-not-ready", "This team is not ready to pull.");
     const { revision, headCommit, branch, workspace } = run;
@@ -2011,7 +2011,7 @@ export class TeamService {
   revokePermissions(id: string, input: Action) {
     const body = teamActionSchema.parse(input);
     return this.enqueue(async () => {
-      const stored = this.record(id), run = stored.run;
+      const stored = this.visible(id), run = stored.run;
       if (!run.permissions && !this.agentEligible(stored) && !run.permissionAgentDecisions?.length)
         throw new TeamError(409, "permissions-not-enabled", "This team has no delegated permission policy to revoke.");
       if (this.replay(stored, "revoke-permissions", body)) return this.view(stored);
@@ -4008,7 +4008,7 @@ export class TeamService {
     const run = stored.run, runId = run.id, { memberId, sessionId } = member;
     const sessionRoot = realpathSync(member.cwd);
     this.assertRunPath(stored, sessionRoot);
-    const prefix = this.config.teams?.commandPrefix;
+    const prefix = this.prefixFor(run);
     const scratch = member.scratchDirectory ? [member.scratchDirectory] : [];
     // Today's bounded collection: the member's changed paths and the command sources the dialog names.
     const workspace = async () => {

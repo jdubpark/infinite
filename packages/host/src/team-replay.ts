@@ -1,12 +1,12 @@
-import { realpathSync } from "node:fs";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { lstatSync, realpathSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { evalCommandPrefix } from "./eval-config.js";
 import { evalProxyUrl } from "./egress.js";
 import { planDigest } from "./run-events.js";
 import type { Capsule, EvalFeatures, TrialEnding } from "./eval-types.js";
 import type { Config, SessionPurpose } from "./types.js";
 import type { TeamCommand, TeamMember, TeamModelProfile, TeamReport, TeamRun } from "./team-types.js";
-import { TeamError } from "./team-workspace.js";
+import { assertSecureAncestors, TeamError } from "./team-workspace.js";
 
 export type ReplayCreate = {
   trialId: string; jobId: string; purpose: "replay" | "gate"; projectId: string;
@@ -77,6 +77,25 @@ export class TeamReplay {
     const member = this.host.config().eval?.member;
     if (!member) throw new TeamError(409, "eval-identity-missing", "The eval identity is not configured.");
     return join(member.root, "trials");
+  }
+
+  /**
+   * The trials root's real path, for the run-path check. The eval account owns the launcher root and its trials directory,
+   * so the host-owned rule of a team root cannot hold for them: both must be real directories that no group or other
+   * account can write, and every directory above the launcher root must pass the host-owned rule.
+   */
+  canonicalRoot(): string {
+    try {
+      const real = realpathSync(this.root()), launcherRoot = dirname(real);
+      for (const directory of [real, launcherRoot]) {
+        const info = lstatSync(directory);
+        if (!info.isDirectory() || (info.mode & 0o022) !== 0) throw new Error("unsafe");
+      }
+      assertSecureAncestors(dirname(launcherRoot));
+      return real;
+    } catch {
+      throw new TeamError(409, "team-root-unsafe", "The trials root must be a real directory that only its account can write, below host-owned directories.");
+    }
   }
 
   /** The trial workspace below the trials root's real path, which is how the run-path check reads the root. The rest of the

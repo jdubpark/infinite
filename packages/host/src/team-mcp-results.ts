@@ -27,7 +27,7 @@ type Check<T extends true> = T;
 
 // Compile-time cases for `Exact`. A case under `@ts-expect-error` fails the typecheck if it ever compiles.
 type Head = { id: string; tags: string[]; body: unknown; kind: "a" | "b"; at?: string };
-type ExactCases = [
+export type ExactCases = [
   Check<Exact<Head, { id: string; tags: readonly string[]; body: unknown; kind: "b" | "a"; at?: string | undefined }>>,
   Check<Exact<{ heads: Head[]; next?: number }, { heads: readonly Head[]; next?: number }>>,
 ];
@@ -68,7 +68,7 @@ export const handoffResultSchema = z.object({ sessionId: uuid, message }).strict
 
 /** The session worker's answer to a post: the entry id and its state before the host stores it. */
 export const pendingEntrySchema = z.object({ entryId: uuid, state: z.literal("pending") }).strict();
-type PendingEntryMatches = Check<Exact<z.output<typeof pendingEntrySchema>, PendingEntry>>;
+export type PendingEntryMatches = Check<Exact<z.output<typeof pendingEntrySchema>, PendingEntry>>;
 
 /** The `entry_post` answer: the worker's pending receipt and the receipt sentence. */
 export const entryPostResultSchema = pendingEntrySchema.extend({ message }).strict();
@@ -89,7 +89,7 @@ export const memberHeadSchema = z.object({
   supersedes: uuid.optional(),
   state: z.enum(["active", "superseded", "withdrawn"]),
 }).strict();
-type MemberHeadMatches = Check<Exact<z.output<typeof memberHeadSchema>, MemberHead>>;
+export type MemberHeadMatches = Check<Exact<z.output<typeof memberHeadSchema>, MemberHead>>;
 
 /** The `entry_list` answer, as `listForMember` builds it. */
 export const memberListSchema = z.object({
@@ -99,7 +99,7 @@ export const memberListSchema = z.object({
   cursor: z.number().int().min(0).optional(),
   unreadable: z.number().int().min(0),
 }).strict();
-type MemberListMatches = Check<Exact<z.output<typeof memberListSchema>, MemberList>>;
+export type MemberListMatches = Check<Exact<z.output<typeof memberListSchema>, MemberList>>;
 
 /** The `entry_get` answer, as `getForMember` builds it. */
 export const memberEntrySchema = z.object({
@@ -107,7 +107,7 @@ export const memberEntrySchema = z.object({
   head: memberHeadSchema,
   body: z.unknown(),
 }).strict();
-type MemberEntryMatches = Check<Exact<z.output<typeof memberEntrySchema>, MemberEntry>>;
+export type MemberEntryMatches = Check<Exact<z.output<typeof memberEntrySchema>, MemberEntry>>;
 
 /**
  * The result a write tool answers, by tool name. team-mcp.ts builds each write result as this type, so the compiler

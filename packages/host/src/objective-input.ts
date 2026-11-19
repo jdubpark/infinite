@@ -3,7 +3,7 @@ import { z } from "zod";
 import { canonicalJson } from "./evidence/crypto.js";
 import { isScopedPath, parseCreateGoal } from "./goal-types.js";
 import type { CreateGoal } from "./goal-types.js";
-import { OBJECTIVE_LIMITS, checkSchema, thresholdSchema } from "./objective-types.js";
+import { OBJECTIVE_LIMITS, thresholdSchema } from "./objective-types.js";
 import type { Check, Criterion, Threshold } from "./objective-types.js";
 import { objectiveError } from "./objective-record.js";
 import { teamCommandSchema } from "./team-types.js";

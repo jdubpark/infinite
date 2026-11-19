@@ -24,7 +24,6 @@ export const missionActionSchema = z.object({ requestId: z.uuid(), revision: z.n
 export const missionTextSchema = missionActionSchema.extend({ text: z.string().trim().min(1).max(8000) }).strict();
 /** The owner approves more working time: up to 24 hours per extension. */
 export const missionExtendSchema = missionActionSchema.extend({ minutes: z.number().int().min(5).max(1440) }).strict();
-export type MissionExtend = z.infer<typeof missionExtendSchema>;
 
 /** One unit of work the main coordinator hands to a single-repository subteam. */
 export const missionSubtaskPlanSchema = z.object({

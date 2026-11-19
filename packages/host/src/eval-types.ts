@@ -68,7 +68,6 @@ export type ValidationReason = typeof VALIDATION_REASONS[number];
 export type EvalReason = StartReason | MaterialReason | PromotionReason | MineReason | ValidationReason;
 export type EvalState = typeof EVAL_STATES[number];
 export type EvalOrigin = "captured" | "mined";
-export type PromptOrigin = "assignment" | "run-objective" | "commit-message";
 export type Lineage = "clear" | "unclear";
 export type MaterialState = "pending" | "stored" | "partial" | "none";
 export type ApprovalState = "pending" | "read" | "unknown";

@@ -23,7 +23,6 @@ export const HOST_REJECT_CODES = ["unavailable", "locked", "needs-owner"] as con
 export const REJECT_CODES = [...EFFECT_REJECT_CODES, ...EVIDENCE_REJECT_CODES, ...HOST_REJECT_CODES] as const;
 export type EffectRejectCode = typeof EFFECT_REJECT_CODES[number];
 export type EvidenceRejectCode = typeof EVIDENCE_REJECT_CODES[number];
-export type HostRejectCode = typeof HOST_REJECT_CODES[number];
 export type RejectCode = typeof REJECT_CODES[number];
 
 export const isEffectReject = (code: string | undefined): code is EffectRejectCode =>

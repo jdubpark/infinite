@@ -749,15 +749,6 @@ function boundedMissionPrompt(messages: MissionMessage[], build: (includedMessag
   if (Buffer.byteLength(prompt, "utf8") > MISSION_PROMPT_LIMIT_BYTES) throw new TeamError(409, "mission-prompt-too-large", "The mission state exceeds the coordinator prompt limit. Start a new mission with a consolidated objective.");
   return { prompt, includedMessageCount, shortened: false };
 }
-/**
- * Each coordinator attempt is one session that ends with one report, like a team member. The host
- * starts the next attempt when a subteam, the owner, or a refusal needs the coordinator again.
- */
-export function missionPrompt(mission: Mission, repos: MissionPromptRepo[], messages: MissionMessage[], attempt: number, provider: Provider, modelProfile: TeamModelProfile,
-  context: MissionPromptContext) {
-  return missionPromptWithMessageCount(mission, repos, messages, attempt, provider, modelProfile, context).prompt;
-}
-
 /** Build a bounded prompt and report how many leading messages it includes so the caller can keep the rest queued. */
 export function missionPromptWithMessageCount(mission: Mission, repos: MissionPromptRepo[], messages: MissionMessage[], attempt: number, provider: Provider, modelProfile: TeamModelProfile,
   context: MissionPromptContext) {
@@ -791,7 +782,7 @@ export function missionPromptWithMessageCount(mission: Mission, repos: MissionPr
 }
 
 /** Build only the authoritative snapshot and newly delivered messages for a resumed coordinator conversation. */
-export function missionFollowUpPromptWithMessageCount(mission: Mission, repos: MissionPromptRepo[], messages: MissionMessage[], attempt: number, provider: Provider, modelProfile: TeamModelProfile,
+export function missionFollowUpPromptWithMessageCount(mission: Mission, repos: MissionPromptRepo[], messages: MissionMessage[], attempt: number, provider: Provider, _modelProfile: TeamModelProfile,
   context: MissionPromptContext) {
   const state = missionPromptState(mission, context);
   const recent = recentMissionMessages(messages, context.openChildDecisions);

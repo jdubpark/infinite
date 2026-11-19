@@ -640,7 +640,7 @@ test("an uncertain team start is resumed under its saved request ID instead of s
     assert.match(retried.stderr, /Resuming earlier request [a-f0-9-]{36}/);
     const teams = (await run.host.fetchApi("/teams")).body.teams;
     assert.equal(teams.length, 1);
-    assert.equal(teams[0].objective, "Unique retry objective");
+    assert.equal((await run.host.fetchApi(`/teams/${teams[0].id}`)).body.objective, "Unique retry objective");
   } finally { proxy.closeAllConnections(); await new Promise<void>(resolve => proxy.close(() => resolve())); await run.close(); }
 });
 

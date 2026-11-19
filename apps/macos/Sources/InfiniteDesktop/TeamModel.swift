@@ -26,14 +26,27 @@ struct TeamMutation: Equatable {
     private var pollTask: Task<Void, Never>?
     private var pageShown = false
     private var displayVisible = false
+    /// `run` came from `/teams/:id` or a mutation result, not from a team list row.
+    private var detailed = false
     private var pollGeneration = UUID()
     private lazy var freshness = DisplayFreshness { [weak self] in self?.displayStale = $0 }
     init(run: TeamRun, client: RemoteClient, role: String) { self.run = run; self.client = client; self.role = role }
     var id: String { run.id }
-    /// Newer revisions always win; within a revision the later update does.
+    /// A full read of the run. Newer revisions always win; within a revision the later update does.
     func observe(_ next: TeamRun) {
-        guard next.revision > run.revision || (next.revision == run.revision && next.updatedAt >= run.updatedAt) else { return }
+        guard supersedes(next) else { return }
+        detailed = true
         if next != run { run = next }
+    }
+    /// A team list row omits what only this page shows: the request, check output and member reports. It seeds a run
+    /// not yet read in full and keeps a hidden page's revision current; a shown page takes changes from its own poll.
+    func observeListRow(_ next: TeamRun) {
+        guard !(detailed && pageShown && displayVisible), supersedes(next) else { return }
+        detailed = false
+        if next != run { run = next }
+    }
+    private func supersedes(_ next: TeamRun) -> Bool {
+        next.revision > run.revision || (next.revision == run.revision && next.updatedAt >= run.updatedAt)
     }
     func startPolling() {
         pageShown = true

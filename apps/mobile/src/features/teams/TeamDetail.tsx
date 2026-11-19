@@ -48,7 +48,8 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   const poll = useLive<TeamView>(connection, {
     topics: ["teams"], intervalMs: 2000, deps: [id],
     load: () => api<TeamView>(connection, `/teams/${id}`),
-    select: (topic, payload) => topic === "teams" ? (payload as { teams: TeamView[] }).teams.find(team => team.id === id) : undefined,
+    // A `teams` event carries list rows, not this run's detail, so any team change reloads the run.
+    select: () => undefined,
   });
   const rating = useTaskRating(connection, id, poll.refresh);
   const { data: me } = usePoll(() => api<Me>(connection, "/me"), 10000, [connection]);

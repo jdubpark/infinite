@@ -12,6 +12,11 @@ type Listener = { topics: Set<LiveTopic>; cursors: Map<string, number>; values: 
 type EventPage = { events: unknown[]; cursor: number; more: boolean };
 type EventRead = { topic: `session/${string}`; id: string; after: number };
 
+/**
+ * Topics sent only as refetch notices. Installed phone builds take a `teams` event as the open run's detail, and the
+ * topic carries list rows, so a client reloads the list or the run from REST instead.
+ */
+const REFETCH_ONLY: ReadonlySet<LiveTopic> = new Set(["teams"]);
 const MAX_EVENT_READS_PER_TICK = 32;
 const MAX_EVENT_READ_CONCURRENCY = 4;
 
@@ -101,7 +106,7 @@ export class LiveFeed {
         listener.values.set(topic, serialized);
         const update = { topic, data };
         const eventBytes = Buffer.byteLength(JSON.stringify(update));
-        if (eventBytes > MAX_EVENTS_EVENT_BYTES || lastRefetch !== undefined) listener.refetch.set(topic, Date.now());
+        if (eventBytes > MAX_EVENTS_EVENT_BYTES || lastRefetch !== undefined || REFETCH_ONLY.has(topic)) listener.refetch.set(topic, Date.now());
         // Keep the latch after the first refetch: a later inline event could move
         // the phone's journal cursor past data it has not fetched yet. Repeat
         // unchanged refetches periodically so a failed REST load can recover.

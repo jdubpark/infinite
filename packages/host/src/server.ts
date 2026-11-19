@@ -505,7 +505,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   };
   const live = new LiveFeed({
     sessions: async () => ({ sessions: await listSessions() }),
-    teams: () => ({ teams: teams.list() }),
+    teams: () => ({ teams: teams.listItems() }),
     session: sessionDetail,
     events: (sessionId, after) => sessionEvents(sessionId, after),
   });
@@ -1091,7 +1091,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       throw error;
     }
   });
-  app.get("/api/teams", (_req, res) => res.json({ teams: teams.list() }));
+  app.get("/api/teams", (_req, res) => res.json({ teams: teams.listItems() }));
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
   objectiveRoutes(app, { goals, teams }, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));

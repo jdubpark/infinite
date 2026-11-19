@@ -3125,8 +3125,8 @@ cycle's PM selects capacity for its work. The refusal uses `409` with
 
 | Method and endpoint | Body | Role |
 | --- | --- | --- |
-| `GET /api/teams` | None; returns `{teams}` | Any paired device |
-| `GET /api/teams/:id` | None; returns reports and check evidence | Any paired device |
+| `GET /api/teams` | None; returns `{teams}` as compact list rows without check output, reports, task instructions or the request | Any paired device |
+| `GET /api/teams/:id` | None; returns the full record with reports and check evidence | Any paired device |
 | `GET /api/teams/:id/context` | None; returns the files each member's recorded tool inputs pointed at | Any paired device |
 | `GET /api/teams/:id/record[?version=N]` | Optional `version` (a positive integer); returns the objective record of a standalone run at that version | Owner, controller, or viewer |
 | `POST /api/teams` | `requestId`, `projectId`, `provider`, `title`, `objective`, optional `useConfiguredLineup` | Owner |

@@ -372,7 +372,7 @@ struct TeamResumeFailure: Equatable {
                 if retained != teamResumeFailures { teamResumeFailures = retained }
             }
             teamsLoaded = true
-            for team in next { teamModels[team.id]?.observe(team) }
+            for team in next { teamModels[team.id]?.observeListRow(team) }
             pruneDetailModels()
             if !teamsFresh { teamsFresh = true }
             teamFreshness.recovered()

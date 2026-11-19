@@ -10,7 +10,7 @@ import { age } from "../../status";
 import { theme } from "../../theme";
 import {
   blockedTeamsFirst, canContinueBlockedTeam, canResumeBlockedTeam, GOAL_LABELS, goalGroup, goalKind, groupRuns, newer, openDecisions, pendingApprovals, shortDate, TEAM_LABELS, teamGroup, teamKind, teamProgress, teamReady,
-  type ProductGoal, type RunGroup, type TeamView,
+  type ProductGoal, type RunGroup, type TeamListItem, type TeamView,
 } from "./model";
 import { providerName, RequestStatus } from "./parts";
 import { orderedMembers } from "./summary";
@@ -26,7 +26,7 @@ function useFolds() {
  * The Teams tab as a Linear-style project list: each run's state, plan progress, and the agents
  * assigned to it, grouped by what it needs from a person.
  */
-export function TeamList({ connection, me, teams, sessions, now }: { connection: Connection; me: Me; teams: TeamView[]; sessions: SessionRow[]; now: number }) {
+export function TeamList({ connection, me, teams, sessions, now }: { connection: Connection; me: Me; teams: TeamListItem[]; sessions: SessionRow[]; now: number }) {
   const router = useRouter();
   const machine = connectionKey(connection);
   const folds = useFolds();
@@ -62,21 +62,21 @@ export function TeamList({ connection, me, teams, sessions, now }: { connection:
 }
 
 function TeamRunRow({ connection, team: received, role, machine, now, kind, done, total, open, asks, note, agents, attention, project, onOpen }: {
-  connection: Connection; team: TeamView; role: Me["role"]; machine: string; now: number; kind: ReturnType<typeof teamKind>["kind"];
-  done: number; total: number; open: number; asks: number; note: string; agents: TeamView["members"]; attention: Set<string>;
+  connection: Connection; team: TeamListItem; role: Me["role"]; machine: string; now: number; kind: ReturnType<typeof teamKind>["kind"];
+  done: number; total: number; open: number; asks: number; note: string; agents: TeamListItem["members"]; attention: Set<string>;
   project: (id: string) => string; onOpen: () => void;
 }) {
-  const [recorded, setRecorded] = useState<TeamView | null>(null);
+  const [recorded, setRecorded] = useState<TeamListItem | null>(null);
   const team = newer(recorded, received);
   const request = useRunRequest<TeamView>(connection, `${machine}/team/${team.id}`, {
     accepted: result => {
-      setRecorded(previous => newer(previous, result));
-      void api<{ teams: TeamView[] }>(connection, "/teams").then(value => {
+      setRecorded(previous => newer<TeamListItem>(previous, result));
+      void api<{ teams: TeamListItem[] }>(connection, "/teams").then(value => {
         const refreshed = value.teams.find(item => item.id === result.id);
         if (refreshed) setRecorded(previous => newer(previous, refreshed));
       }).catch(() => {});
     },
-    refused: () => { void api<{ teams: TeamView[] }>(connection, "/teams").then(value => {
+    refused: () => { void api<{ teams: TeamListItem[] }>(connection, "/teams").then(value => {
       const refreshed = value.teams.find(item => item.id === team.id);
       if (refreshed) setRecorded(previous => newer(previous, refreshed));
     }).catch(() => {}); },

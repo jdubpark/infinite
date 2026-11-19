@@ -50,6 +50,22 @@ export type TeamView = {
   permissionsRevokedAt?: string;
   permissionDecisions?: PermissionDecision[];
 };
+/**
+ * A run as `GET /teams` and the live `teams` topic list it: the fields list screens read, with the long detail
+ * (the request, check output, reports, task instructions) left to `GET /teams/:id`. A full view also fits this type.
+ */
+export type TeamListItem = Pick<TeamView, "id" | "projectId" | "provider" | "title" | "parallelism" | "workers" | "revision" | "status" | "createdAt" | "updatedAt"
+  | "workspace" | "branch" | "baseCommit" | "headCommit" | "decisions" | "events" | "reason" | "linear" | "goal" | "missionId" | "resumable" | "continuable" | "permissionsRevokedAt"> & {
+  members: (Omit<TeamMember, "modelProfile"> & { modelProfile?: Pick<ModelProfile, "label" | "provider" | "tier"> })[];
+  tasks: Pick<TeamTask, "id" | "title" | "status" | "paths" | "memberId" | "ownerRating">[];
+  checks: Pick<TeamCheck, "status" | "revision">[];
+  lineup?: Pick<TeamLineup, "coordinator">;
+  review?: Pick<NonNullable<TeamView["review"]>, "verdict" | "revision">;
+  deliveryReceipt?: Omit<NonNullable<TeamView["deliveryReceipt"]>, "summary">;
+  pullRequest?: Omit<NonNullable<TeamView["pullRequest"]>, "summary">;
+  permissions?: Pick<NonNullable<TeamView["permissions"]>, "mode" | "maxDecisions">;
+  permissionDecisions?: Pick<PermissionDecision, "targetSessionId" | "promptId" | "status">[];
+};
 
 /** Older hosts omit worker counts, so their reported parallelism backs the live status. */
 export function workerStatus(team: Pick<TeamView, "parallelism" | "workers">): string {
@@ -61,19 +77,19 @@ export function workerStatus(team: Pick<TeamView, "parallelism" | "workers">): s
 }
 
 /** Blocked runs lead the team list; each status group keeps its received order. */
-export function blockedTeamsFirst(teams: TeamView[]) {
+export function blockedTeamsFirst<T extends Pick<TeamListItem, "status">>(teams: T[]) {
   return teams.map((team, index) => ({ team, index }))
     .sort((a, b) => Number(b.team.status === "blocked") - Number(a.team.status === "blocked") || a.index - b.index)
     .map(({ team }) => team);
 }
 
 /** List resume is only available for a standalone blocked run its owner can restart. */
-export function canResumeBlockedTeam(team: TeamView, role: DeviceRole | undefined) {
+export function canResumeBlockedTeam(team: TeamListItem, role: DeviceRole | undefined) {
   return role === "owner" && team.status === "blocked" && team.resumable === true && team.continuable !== true && !team.goal && !team.missionId && !team.deliveryReceipt && !team.pullRequest;
 }
 
 /** Continuation is an owner action for a safe standalone blocked run only. */
-export function canContinueBlockedTeam(team: TeamView, role: DeviceRole | undefined) {
+export function canContinueBlockedTeam(team: TeamListItem, role: DeviceRole | undefined) {
   return role === "owner" && team.status === "blocked" && team.continuable === true
     && !team.goal && !team.missionId && !team.deliveryReceipt && !team.pullRequest;
 }
@@ -124,12 +140,12 @@ export function newer<T extends { revision: number; updatedAt: string }>(previou
 }
 
 /** Questions of the current revision that nobody has answered. Earlier revisions' questions no longer apply. */
-export function openDecisions(team: TeamView) {
+export function openDecisions(team: TeamListItem) {
   return team.decisions.filter(decision => decision.revision === team.revision && decision.answer == null);
 }
 
 /** Integrated tasks out of the current plan. */
-export function teamProgress(team: TeamView) {
+export function teamProgress(team: TeamListItem) {
   return { done: team.tasks.filter(task => task.status === "integrated").length, total: team.tasks.length };
 }
 
@@ -139,7 +155,7 @@ const PHASE_FLOOR: Partial<Record<TeamStatus, number>> = {
 };
 
 /** The run's status icon. Words beside it carry the meaning; a filled ring is not completion. */
-export function teamKind(team: TeamView, approvals = 0): { kind: StatusKind; fraction: number } {
+export function teamKind(team: TeamListItem, approvals = 0): { kind: StatusKind; fraction: number } {
   if (team.status === "cancelled") return { kind: "cancelled", fraction: 0 };
   if (team.status === "no-change") return { kind: "stopped", fraction: 0 };
   if (team.status === "paused") return { kind: "paused", fraction: 0 };
@@ -174,7 +190,7 @@ export const RUN_GROUPS: { group: RunGroup; title: string; kind: StatusKind }[] 
 ];
 
 /** Stopped runs are closed even with unanswered questions, since those can no longer be answered. */
-export function teamGroup(team: TeamView, approvals = 0): RunGroup {
+export function teamGroup(team: TeamListItem, approvals = 0): RunGroup {
   if (team.status === "cancelled" || team.status === "no-change") return "closed";
   if (team.status === "needs-input" || team.status === "blocked" || openDecisions(team).length || approvals) return "attention";
   if (team.status === "ready-for-review" || team.status === "merged") return "review";
@@ -234,7 +250,7 @@ export type WaitingSession = { id: string; attention: { state: string; prompt?: 
  * destructive or multi-select prompts, prompts without the host's review evidence, weaker
  * coordinators, and runs without delegation.
  */
-export function approvalOwner(team: TeamView, sessionId: string, prompt?: WaitingSession["attention"]["prompt"]): "coordinator" | "person" {
+export function approvalOwner(team: TeamListItem, sessionId: string, prompt?: WaitingSession["attention"]["prompt"]): "coordinator" | "person" {
   const decision = [...(team.permissionDecisions ?? [])].reverse().find(item => item.targetSessionId === sessionId && item.promptId === prompt?.id);
   if (decision) return ["pending", "reviewing", "approved", "answering"].includes(decision.status) ? "coordinator" : "person";
   const delegated = Boolean(team.permissions) && !team.permissionsRevokedAt && (team.permissionDecisions?.length ?? 0) < (team.permissions?.maxDecisions ?? 0);
@@ -242,7 +258,7 @@ export function approvalOwner(team: TeamView, sessionId: string, prompt?: Waitin
 }
 
 /** Live members of the current revision whose open prompt waits on a person rather than the coordinator. */
-export function pendingApprovals<S extends WaitingSession>(team: TeamView, sessions: S[]) {
+export function pendingApprovals<M extends TeamListItem["members"][number], S extends WaitingSession>(team: Omit<TeamListItem, "members"> & { members: M[] }, sessions: S[]) {
   const listed = new Map(sessions.map(session => [session.id, session]));
   return team.members.flatMap(member => {
     const session = listed.get(member.sessionId);

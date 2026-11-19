@@ -1672,18 +1672,30 @@ export class TeamService {
     return true;
   }
   private mutation(stored: Stored, operation: string, body: Action | Mutation | TeamContinue | TeamParallelism | VerificationMutation) {
+    const fingerprint = this.admit(stored, operation, body);
+    if (fingerprint) this.recordReceipt(stored, body.requestId, fingerprint);
+    return fingerprint !== undefined;
+  }
+  /** A mutation's request checks without its receipt: the fingerprint to record, or undefined when this request is already recorded. */
+  private admit(stored: Stored, operation: string, body: Action | Mutation | TeamContinue | TeamParallelism | VerificationMutation) {
     const fingerprint = receiptDigest({ operation, ...body });
     const prior = stored.receipts[body.requestId];
     if (prior) {
       if (prior !== fingerprint) throw new TeamError(409, "request-conflict", "This request ID belongs to a different team action.");
-      return false;
+      return undefined;
     }
     if (body.revision !== stored.run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before sending this action.");
     if (stored.run.status === "cancelled") throw new TeamError(409, "team-cancelled", "This team has been cancelled.");
-    stored.receipts[body.requestId] = fingerprint;
+    return fingerprint;
+  }
+  /**
+   * Records an admitted request. The caller saves the action's effect with it and awaits nothing in between: any save
+   * before then, such as one inside a permission invalidation, would let a replay succeed without the effect.
+   */
+  private recordReceipt(stored: Stored, requestId: string, fingerprint: string) {
+    stored.receipts[requestId] = fingerprint;
     // The owner acted on the run, so a halt release leaves it as the owner set it.
     stored.ownerHalt = undefined;
-    return true;
   }
   steer(id: string, input: Mutation, source?: ConnectorSource | "coordinator") {
     const body = { ...teamMutationSchema.parse(input), ...(source === undefined ? {} : { source }) };
@@ -1696,9 +1708,11 @@ export class TeamService {
       if (stored.run.workspaceRemovedAt) throw new TeamError(409, "team-workspace-removed", "This run's workspaces were removed under the retention policy; start a new run.");
       if (Buffer.byteLength(stored.run.steering.map(item => item.text).join("")) + Buffer.byteLength(body.text) > 32 * 1024) throw new TeamError(409, "team-steering-limit", "This team reached its 32 KiB steering limit. Start a new team with consolidated requirements.");
       if (stored.run.steering.length >= 20) throw new TeamError(409, "team-steering-limit", "This team reached its steering limit. Start a new team from the reviewed integration branch.");
-      if (!this.mutation(stored, "steer", body)) return this.view(stored);
+      const receipt = this.admit(stored, "steer", body);
+      if (!receipt) return this.view(stored);
       this.commands.get(id)?.abort();
       await this.invalidatePermissionDecisions(stored, "The team revision changed before the permission request could be answered.");
+      this.recordReceipt(stored, body.requestId, receipt);
       if (stored.run.recovery && stored.run.recovery.status !== "exhausted") {
         stored.run.recovery.status = "exhausted";
         this.event(stored, `${source ? inputSourceLabel(source) : "User"} steering superseded automatic recovery; its original report remains recorded as evidence.`);
@@ -1983,16 +1997,18 @@ export class TeamService {
       // A run held where it waits keeps the answer and starts nothing until it resumes.
       const held = heldWaiting(stored), mark = stored.ownerHalt;
       if (!held && (stored.halt || run.status === "paused")) throw new TeamError(409, "team-paused", "Resume the team before answering its decision.");
-      if (!this.mutation(stored, `answer:${decisionId}`, body)) return this.view(stored);
+      const receipt = this.admit(stored, `answer:${decisionId}`, body);
+      if (!receipt) return this.view(stored);
+      // An owner answer is new direction no outstanding review saw; those requests are reviewed again under it or stay with the user.
+      if (by === "owner" && (run.permissionDecisions ?? []).some(item => ["pending", "reviewing", "approved", "answering"].includes(item.status)))
+        await this.invalidatePermissionDecisions(stored, "The owner answered a team question; a request reviewed before that answer remains with the user.", false);
+      this.recordReceipt(stored, body.requestId, receipt);
       // An answer is input, not a change to how the run is held: the hold, and what a release does with it, stay.
       if (held) stored.ownerHalt = mark;
       decision.answer = body.text; decision.answeredBy = by; decision.answeredAt = timestamp();
       if (source) decision.source = source;
       const next = this.intentChecks.answerNote(stored, decision) ?? (held ? "The requesting member will continue in a new attempt when the team resumes." : "The requesting member will continue in a new attempt.");
       this.event(stored, by === "connector" ? `${decisionAnswerLabel(decision)} decision was recorded as delegated agent input. ${next}` : by === "coordinator" ? `A mission coordinator decision was recorded. ${next}` : `A user decision was recorded. ${next}`); this.save(stored);
-      // An owner answer is new direction no outstanding review saw; those requests are reviewed again under it or stay with the user.
-      if (by === "owner" && (run.permissionDecisions ?? []).some(item => ["pending", "reviewing", "approved", "answering"].includes(item.status)))
-        await this.invalidatePermissionDecisions(stored, "The owner answered a team question; a request reviewed before that answer remains with the user.", false);
       return this.view(stored);
     });
   }
@@ -2003,9 +2019,12 @@ export class TeamService {
       if (!run.permissions && !this.agentEligible(stored) && !run.permissionAgentDecisions?.length)
         throw new TeamError(409, "permissions-not-enabled", "This team has no delegated permission policy to revoke.");
       if (this.replay(stored, "revoke-permissions", body)) return this.view(stored);
-      if (!this.mutation(stored, "revoke-permissions", body)) return this.view(stored);
+      const receipt = this.admit(stored, "revoke-permissions", body);
+      if (!receipt) return this.view(stored);
+      // Set before the fence so no new delegated answer starts while it runs; a replay keeps the first time.
       run.permissionsRevokedAt ??= timestamp();
       await this.invalidatePermissionDecisions(stored, "The owner revoked delegated permission decisions.");
+      this.recordReceipt(stored, body.requestId, receipt);
       this.event(stored, "Delegated permission decisions were revoked by the owner.");
       this.save(stored);
       return this.view(stored);

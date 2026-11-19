@@ -2914,6 +2914,23 @@ delivery questions retain the direct decision path: an owner or controller
 answers from the team page, and a new assignment receives the recorded answer.
 Provider tool permission dialogs use their separate permission policy.
 
+Every question carries a recommendation: the answer the asking member would
+give and a one-line reason. For a question with options, the recommendation
+copies option text exactly, one option unless the question takes several; for
+a question without options, it is one short answer in words. The report tool
+refuses a question without one. A question from a member started before this
+rule still becomes a decision, with no recommendation. The decision stores the
+recommendation and clients show it first, as the asking agent's. A worker's
+question reaches the project manager's recovery with its recommendation
+appended to the reason. When the decision is answered, by the owner, a mission
+coordinator, or a connector, the host records how the answer compared:
+`matched` when the answer selects exactly the recommended options, or repeats
+the recommended words of a question without options; `different` when it
+selects other options; and `other` when it is any other text. Free text
+matches only word for word; the host does not judge whether words agree. A
+recommendation is evidence beside the question. Nothing answers a question
+with it, and the intent check's decisions carry none.
+
 For a standalone team, steering records a new requirements revision. Earlier
 member results cannot satisfy it. The scheduler stops old assignments and replans from the integrated
 workspace with the new direction. Completed earlier integration remains visible;

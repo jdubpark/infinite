@@ -40,12 +40,16 @@ function reportIdentity(value: unknown) {
   const hex = bytes.toString("hex");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
-/** Accept a raw report or an explicit retry envelope, always bound to this worker's assignment. */
+/**
+ * Accept a raw report or an explicit retry envelope, always bound to this worker's assignment. An envelope is read in
+ * its recorded form, and its report must still satisfy the report tool, so an envelope cannot skip a required field.
+ */
 export function createReportEnvelope(input: unknown, env: NodeJS.ProcessEnv = process.env): TeamReportEnvelope {
   const { binding } = hookCapability(env, "team-report");
   let envelope: TeamReportEnvelope;
   if (input !== null && typeof input === "object" && !Array.isArray(input) && "report" in input) {
     envelope = teamReportEnvelopeSchema.parse(input);
+    teamReportSchema.parse(envelope.report);
   } else {
     const report = teamReportSchema.parse(input);
     envelope = teamReportEnvelopeSchema.parse({ ...binding, report, requestId: reportIdentity({ ...binding, report }) });
@@ -111,13 +115,16 @@ export function missionAssignment(env: NodeJS.ProcessEnv = process.env) {
 /**
  * Accept a raw mission report, the tool's `{ report, note }` arguments, or an explicit retry envelope, always bound to
  * this coordinator's assignment. A note joins the request identity; a report without one keeps its earlier identity.
+ * An envelope's report must still satisfy the report tool, like the other two forms.
  */
 export function createMissionReportEnvelope(input: unknown, env: NodeJS.ProcessEnv = process.env): MissionReportEnvelope {
   const { binding } = missionReportEnvironment(env);
   const object = input !== null && typeof input === "object" && !Array.isArray(input);
   let envelope: MissionReportEnvelope;
-  if (object && "report" in input && "requestId" in input) envelope = missionReportEnvelopeSchema.parse(input);
-  else {
+  if (object && "report" in input && "requestId" in input) {
+    envelope = missionReportEnvelopeSchema.parse(input);
+    missionReportSchema.parse(envelope.report);
+  } else {
     const { report, note } = object && "report" in input ? missionReportArgumentsSchema.parse(input) : { report: missionReportSchema.parse(input), note: undefined };
     const content = { report, ...(note === undefined ? {} : { note }) };
     envelope = missionReportEnvelopeSchema.parse({ ...binding, ...content, requestId: reportIdentity({ ...binding, ...content }) });

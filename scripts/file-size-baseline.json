@@ -27,7 +27,7 @@
     "tests/outcome-scan.test.ts": 1062,
     "tests/outcome-store.test.ts": 1649,
     "tests/team-events.test.ts": 1807,
-    "tests/teams.test.ts": 3430,
+    "tests/teams.test.ts": 3436,
     "tests/transcript-watch.test.ts": 1023
   }
 }

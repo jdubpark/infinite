@@ -1,4 +1,14 @@
+import { recommendationLine, type QuestionRecommendation } from "./question-recommendation.js";
+
 const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+
+/** An open team question as the CLI prints it: its text, numbered options, and the recommendation line when it has one. */
+export function openQuestionLines(question: { id: unknown; question: unknown; options?: unknown; recommendation?: QuestionRecommendation }): string[] {
+  const options: unknown[] = Array.isArray(question.options) ? question.options : [];
+  return [`Question ${clean(question.id)}: ${clean(question.question)}`,
+    ...options.map((option, index) => `  ${index + 1}. ${clean(option)}`),
+    ...(question.recommendation ? [`  ${clean(recommendationLine(question.recommendation))}`] : [])];
+}
 const short = (value: unknown, max: number) => {
   const text = clean(value).trim();
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
@@ -45,6 +55,7 @@ export function teamMonitorText(team: any, checkedAt = "", detach = false): stri
   for (const question of team.decisions ?? []) {
     if (question?.answer || questions >= 3) continue;
     lines.push(`Question ${short(question.id, 40)}: ${short(question.question, 180)}`);
+    if (question.recommendation) lines.push(short(recommendationLine(question.recommendation), 240));
     questions += 1;
   }
   const events = Array.isArray(team.events) ? team.events : [];
@@ -168,6 +179,7 @@ function decisionLines(lines: string[], team: any) {
     lines.push(`  • ${short(question.question, 400)}`);
     const options = Array.isArray(question.options) ? question.options.map((option: unknown) => short(option, 60)).filter(Boolean) : [];
     if (options.length) lines.push(`    Options: ${options.join(" / ")}`);
+    if (question.recommendation) lines.push(`    ${short(recommendationLine(question.recommendation), 400)}`);
     lines.push(`    infinite team answer ${clean(team?.id)} ${clean(question.id)} "YOUR ANSWER"`);
   }
   if (open.length > 3) lines.push(`  + ${open.length - 3} more`);

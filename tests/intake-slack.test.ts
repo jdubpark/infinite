@@ -955,7 +955,7 @@ test("questions, results, and blocked reasons reach Slack without host paths or 
   const base = { revision: 1, decisions: [], subtasks: [], steering: [], events: [] };
   const missions = new Map<string, Mission>([
     ["m-question", { ...base, id: "m-question", status: "needs-input",
-      decisions: [{ id: "d1", question: `Keep ${leak}?`, options: ["Keep", `Move it from ${leak}`] }] } as unknown as Mission],
+      decisions: [{ id: "d1", question: `Keep ${leak}?`, options: ["Keep", `Move it from ${leak}`], recommendation: { answers: ["Keep"], reason: `It matches the current default at ${leak}` } }] } as unknown as Mission],
     ["m-result", { ...base, id: "m-result", status: "ready-for-review", result: { revision: 1, summary: `Changed ${leak}. Docs: https://example.com/opt/x` },
       subtasks: [{ id: "a", status: "done", teamStatus: "ready-for-review", teamId: "team-a" }] } as unknown as Mission],
     ["m-blocked", { ...base, id: "m-blocked", status: "blocked", reason: `Cannot reach ${leak}` } as unknown as Mission],
@@ -977,7 +977,7 @@ test("questions, results, and blocked reasons reach Slack without host paths or 
     const stored = [ISSUE, second, third].flatMap(id => s.store.get(id)!.messages.map(message => message.text));
     const posted = [BINDING, OTHER, THIRD].flatMap(thread => s.texts(thread));
     for (const text of [...stored, ...posted]) assert.deepEqual(leaks(text), [], text);
-    assert.equal(s.texts(BINDING)[1], "**Q1: Keep [local path omitted], [local path omitted] and [address omitted]?**\n\n1. Keep\n2. Move it from [local path omitted], [local path omitted] and [address omitted]\n\nChoose below, or reply with a mention and your answer.");
+    assert.equal(s.texts(BINDING)[1], "**Q1: Keep [local path omitted], [local path omitted] and [address omitted]?**\n\nThe asking agent recommends: Keep. Reason: It matches the current default at [local path omitted], [local path omitted] and [address omitted]\n\n1. Keep (recommended)\n2. Move it from [local path omitted], [local path omitted] and [address omitted]\n\nChoose below, or reply with a mention and your answer.");
     assert.equal(s.texts(OTHER)[1], "Ready for review (agent report):\nChanged [local path omitted], [local path omitted] and [address omitted]. Docs: https://example.com/opt/x\nPull request: https://github.com/example/api/pull/1");
     assert.match(s.texts(THIRD)[1], /^Blocked: Cannot reach \[local path omitted\]/);
   } finally { await s.close(); rmSync(stateRoot, { recursive: true, force: true }); }

@@ -3,6 +3,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { Board, BoardItem, Mission } from "./mission-types.js";
 import type { ProjectGroup, ProjectGroupList } from "./project-group-types.js";
 import type { TeamRun } from "./team-types.js";
+import { recommendationLine } from "./question-recommendation.js";
 import { boundTeamProject } from "./team-cli.js";
 import { teamWatchFrame } from "./team-watch.js";
 
@@ -314,7 +315,10 @@ async function openItem(item: BoardItem, api: Api, config: ClientConfig, configP
     const decisions = mission.decisions.filter(decision => !decision.answer);
     if (decisions.length) {
       lines.push("", "Open decisions");
-      for (const decision of decisions) lines.push(`  ${decision.id}  ${safe(decision.question)}`);
+      for (const decision of decisions) {
+        lines.push(`  ${decision.id}  ${safe(decision.question)}`);
+        if (decision.recommendation) lines.push(`    ${safe(recommendationLine(decision.recommendation))}`);
+      }
     }
     if (mission.subtasks.length) {
       lines.push("", "Subtasks");
@@ -405,7 +409,10 @@ export async function handleBoardClientCommand(
 function formatMission(mission: Mission) {
   const lines = [`${mission.title}  ${mission.id}`, `${mission.groupName}  · ${mission.status}  · revision ${mission.revision}`, safe(mission.objective)];
   if (mission.reason) lines.push(`Reason: ${safe(mission.reason)}`);
-  for (const decision of mission.decisions.filter(item => !item.answer)) lines.push(`Decision ${decision.id}: ${safe(decision.question)}`);
+  for (const decision of mission.decisions.filter(item => !item.answer)) {
+    lines.push(`Decision ${decision.id}: ${safe(decision.question)}`);
+    if (decision.recommendation) lines.push(safe(recommendationLine(decision.recommendation)));
+  }
   for (const task of mission.subtasks) lines.push(`${task.title}  ${task.repoProjectId}  ${task.status}`);
   return lines.join("\n");
 }

@@ -9,6 +9,7 @@ import type { ProductGoal } from "./goal-types.js";
 import type { TeamRun, TeamView } from "./team-types.js";
 import type { LinearBridgeStatus, LinearLimitView, LinearTrackingView } from "./linear-types.js";
 import { unseal, writeSealed } from "./vault.js";
+import { recommendationLine } from "./question-recommendation.js";
 
 const endpoint = "https://api.linear.app/graphql";
 /** A record execution can depend on must have been confirmed this recently. */
@@ -233,7 +234,7 @@ export class LinearService {
     }
     for (const direction of run.steering) this.comment(stored, `direction:${direction.revision}`, `${direction.source ? inputSourceLabel(direction.source) : "User"} direction for feature revision ${direction.revision}:\n\n${direction.text}\n\nThe approved scope and execution limits remain in force.`);
     if (!run.missionId) for (const decision of run.decisions) {
-      this.comment(stored, `question:${decision.id}`, `Agent question for feature revision ${decision.revision}:\n\n${decisionAuthorityQuestion(decision)}`);
+      this.comment(stored, `question:${decision.id}`, `Agent question for feature revision ${decision.revision}:\n\n${decisionAuthorityQuestion(decision)}${decision.recommendation ? `\n\n${recommendationLine(decision.recommendation)}` : ""}`);
       if (decision.answer) this.comment(stored, `answer:${decision.id}`, `${decision.answeredBy === "connector" ? decisionAnswerLabel(decision) : decision.answeredBy === "coordinator" ? "Coordinator" : "User"} answer for feature revision ${decision.revision}:\n\n${decision.answer}`);
     }
     if (run.brief) this.comment(stored, `brief:${run.revision}`, [`Proposed feature: ${run.brief.title}`, run.brief.problem,

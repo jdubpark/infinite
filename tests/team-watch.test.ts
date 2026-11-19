@@ -19,7 +19,7 @@ const team = {
     { memberId: "impl", sessionId: "s-impl", role: "implementer", revision: 2, title: "Alarm stop", status: "waiting", taskId: "task-1" },
   ],
   tasks: [{ status: "pending" }, { status: "running" }],
-  decisions: [{ id: "q1", question: "Which signal means awake?", answer: undefined }],
+  decisions: [{ id: "q1", question: "Which signal means awake?", answer: undefined, recommendation: { answers: ["Heartbeat"], reason: "It is the signal the host already records" } }],
   events: [{ text: "Coordinator started the fresh plan" }],
 };
 
@@ -30,6 +30,7 @@ test("the watch card shows current members and stays stable when nothing changed
   assert.doesNotMatch(first, /First plan/);
   assert.match(first, /Tasks {2}1 pending · 1 running/);
   assert.match(first, /Which signal means awake/);
+  assert.match(first, /The asking agent recommends: Heartbeat\. Reason: It is the signal the host already records/);
   assert.equal(teamWatchFrame(first, teamMonitorText(team), false), null);
   assert.equal(teamWatchFrame(first, teamMonitorText({ ...team, status: "implementing" }), false)?.includes("implementing"), true);
   assert.equal(teamWatchFrame(first, first, true)?.startsWith("\x1b[H\x1b[J"), true);

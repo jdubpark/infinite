@@ -282,7 +282,7 @@ test("a trusted member folder reaches Codex as one per-launch override for that 
   assert.ok(index > 0 && trusted.args[index - 1] === "-c", trusted.args.join(" "));
   assert.equal(trusted.args.at(-1), "do it");
   const quoted = buildLaunch("codex", { command: "codex", args: [] }, "", null, relay, enabled, false, undefined, undefined, '/srv/a "b"\\c');
-  assert.deepEqual(quoted.args, ["-c", 'projects={"/srv/a \\"b\\"\\\\c"={trust_level="trusted"}}']);
+  assert.deepEqual(quoted.args, ["-c", 'project_root_markers=[".git"]', "-c", 'projects={"/srv/a \\"b\\"\\\\c"={trust_level="trusted"}}']);
   for (const folder of ["relative/member", "/srv/a\nb", "/srv/a/../b", "/"])
     assert.throws(() => buildLaunch("codex", { command: "codex", args: [] }, "", null, relay, enabled, false, undefined, undefined, folder), /absolute folder/);
   // Claude has no per-launch trust flag, and untrusted launches carry no override.
@@ -295,9 +295,13 @@ test("a trusted Codex launch refuses a folder whose repository carries Codex pro
   try {
     const repo = join(base, "repo"), member = join(repo, "packages", "app");
     mkdirSync(join(repo, ".git"), { recursive: true });
+    writeFileSync(join(repo, ".git", "HEAD"), "ref: refs/heads/main\n");
     mkdirSync(member, { recursive: true });
     const launch = (cwd: string) => buildLaunch("codex", { command: "codex", args: [] }, "p", hooks, relay, enabled, true, undefined, undefined, cwd);
-    assert.ok(launch(member).args.includes(`projects={${JSON.stringify(member)}={trust_level="trusted"}}`));
+    const args = launch(member).args;
+    // Codex looks for the same root as the check: the root markers are pinned next to the trust override.
+    const trust = args.indexOf(`projects={${JSON.stringify(member)}={trust_level="trusted"}}`);
+    assert.ok(trust > 2 && args[trust - 2] === 'project_root_markers=[".git"]' && args[trust - 3] === "-c", args.join(" "));
 
     // Above the Git root is outside the project: Codex reads no project configuration there.
     mkdirSync(join(base, ".codex"));
@@ -308,6 +312,10 @@ test("a trusted Codex launch refuses a folder whose repository carries Codex pro
     writeFileSync(join(repo, ".codex", "config.toml"), 'model = "planted"\n');
     assert.throws(() => launch(member), (error: Error) => error.message.includes(join(repo, ".codex")) && /Codex member not started/.test(error.message));
     assert.throws(() => launch(repo), /Codex project configuration/);
+    // Codex skips a `.git` folder without HEAD when it looks for the root, so the check looks past it too.
+    mkdirSync(join(repo, "packages", ".git"));
+    assert.deepEqual(repositoryCodexConfig(member), [join(repo, ".codex")]);
+    rmSync(join(repo, "packages", ".git"), { recursive: true });
     rmSync(join(repo, ".codex"), { recursive: true });
     writeFileSync(join(repo, "packages", ".codex"), "");
     assert.deepEqual(repositoryCodexConfig(member), [join(repo, "packages", ".codex")]);
@@ -324,6 +332,9 @@ test("a trusted Codex launch refuses a folder whose repository carries Codex pro
     assert.deepEqual(repositoryCodexConfig(worktree), []);
     mkdirSync(join(worktree, ".codex"));
     assert.deepEqual(repositoryCodexConfig(worktree), [join(worktree, ".codex")]);
+    const loose = join(base, "loose");
+    mkdirSync(join(loose, ".codex"), { recursive: true });
+    assert.ok(repositoryCodexConfig(loose).includes(join(loose, ".codex")));
 
     // A folder the host cannot inspect is refused, not trusted.
     if (process.getuid?.() !== 0) {

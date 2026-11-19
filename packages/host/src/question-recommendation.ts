@@ -14,6 +14,11 @@ export const questionRecommendationSchema = z.object({
   reason: z.string().trim().min(1).max(300),
 }).strict();
 export type QuestionRecommendation = z.infer<typeof questionRecommendationSchema>;
+/** What a question without a recommendation is told. A member whose prompt predates recommendations reads only this. */
+export const RECOMMENDATION_REQUIRED = `A question needs "recommendation": {"answers": ["the answer you would give"], "reason": "one line why"}. Copy option text exactly into "answers", one option unless answerMode is "multiple"; for a question without options, give one short answer in words.`;
+/** The report tools' form of the field: required, and refused with the shape to send when it is missing. */
+export const requiredQuestionRecommendationSchema = z.object(questionRecommendationSchema.shape,
+  { error: issue => issue.input === undefined ? RECOMMENDATION_REQUIRED : undefined }).strict();
 export type QuestionAnswerMode = "approval" | "single" | "multiple";
 /** How an answer compared with the recommendation: the same, another option, or words that are neither. */
 export type RecommendationOutcome = "matched" | "different" | "other";
@@ -51,21 +56,33 @@ export function refineQuestion(report: Question & { answerMode?: QuestionAnswerM
 const same = (left: string, right: string) => left.trim() === right.trim();
 
 /**
- * The options an answer text selects: the text itself when it is an option, or the options named by numbered lines
- * ("1. text"), which is how a multiple selection is written. Undefined when the text is neither. An option that
- * spans lines is found only as the whole answer.
+ * The options a multiple selection names. It is written as numbered lines ("1. text") in the order chosen, each with
+ * the option's text as the question gave it, which may itself span lines. Undefined when the text is not that.
+ */
+function numberedOptions(options: readonly string[], text: string, chosen: readonly string[] = []): string[] | undefined {
+  if (!text) return chosen.length ? [...chosen] : undefined;
+  const number = /^\d+\. /.exec(text)?.[0];
+  if (!number) return undefined;
+  const rest = text.slice(number.length);
+  for (const option of options) {
+    const after = rest.startsWith(option) ? rest.slice(option.length) : undefined;
+    if (after === undefined || (after && after[0] !== "\n")) continue;
+    const found = numberedOptions(options, after.slice(1), [...chosen, option]);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/**
+ * The options an answer text selects: the option it equals, exactly before apart from surrounding spaces, or the
+ * options of a multiple selection. Undefined when the text is neither.
  */
 function selectedOptions(options: readonly string[], answer: string): Set<string> | undefined {
-  const whole = options.find(option => same(option, answer));
+  const whole = options.find(option => option === answer) ?? options.find(option => same(option, answer));
   if (whole !== undefined) return new Set([whole]);
-  const selected = new Set<string>();
-  for (const line of answer.trim().split("\n")) {
-    const text = /^\d+\. (.*)$/.exec(line.trim())?.[1];
-    const option = text === undefined ? undefined : options.find(item => same(item, text));
-    if (option === undefined) return undefined;
-    selected.add(option);
-  }
-  return selected;
+  const lines = answer.replace(/\r\n/g, "\n");
+  const numbered = numberedOptions(options, lines) ?? numberedOptions(options, lines.trim());
+  return numbered && new Set(numbered);
 }
 
 /**

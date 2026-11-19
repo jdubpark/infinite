@@ -2918,8 +2918,10 @@ Every question carries a recommendation: the answer the asking member would
 give and a one-line reason. For a question with options, the recommendation
 copies option text exactly, one option unless the question takes several; for
 a question without options, it is one short answer in words. The report tool
-refuses a question without one. A question from a member started before this
-rule still becomes a decision, with no recommendation. The decision stores the
+refuses a question without one, and the refusal names the shape to send, so a
+member whose prompt predates this rule can add it. A question a member's
+session recorded before this rule still becomes a decision, with no
+recommendation. The decision stores the
 recommendation and clients show it first, as the asking agent's. A worker's
 question reaches the project manager's recovery with its recommendation
 appended to the reason. When the decision is answered, by the owner, a mission

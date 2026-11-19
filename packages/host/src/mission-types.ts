@@ -3,7 +3,7 @@ import { z } from "zod";
 import { blockerEvidenceSchema, type TeamLineup, type TeamStatus } from "./team-types.js";
 import type { UsageRollup } from "./team-usage.js";
 import { projectGroupIdSchema } from "./project-group-types.js";
-import { questionRecommendationSchema, refineQuestion, type DecisionRecommendation } from "./question-recommendation.js";
+import { questionRecommendationSchema, refineQuestion, requiredQuestionRecommendationSchema, type DecisionRecommendation } from "./question-recommendation.js";
 
 const subtaskId = z.string().regex(/^[a-z][a-z0-9-]{0,39}$/);
 
@@ -58,7 +58,7 @@ const missionReportVariants = [
 ] as const;
 /** Reports the mission coordinator may send: every question carries its recommendation. Subteam members keep using `TeamReport`. */
 export const missionReportSchema = z.discriminatedUnion("kind", [...missionReportVariants,
-  z.object({ ...missionQuestionShape, recommendation: questionRecommendationSchema }).strict().superRefine(refineQuestion)]);
+  z.object({ ...missionQuestionShape, recommendation: requiredQuestionRecommendationSchema }).strict().superRefine(refineQuestion)]);
 /**
  * A report as the session journal and the mission record hold it. A coordinator started before recommendations were
  * required may still ask a question without one, so the worker and the host read this form.

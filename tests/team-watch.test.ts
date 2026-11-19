@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { chooseTeamBrief, failedTeamBriefRow, orderedTeamMembers, teamLogsText, teamMonitorText, teamSummaryText, teamWatchCommand, teamWatchFrame, teamWatchScreen, visibleScreen, wrapText } from "../packages/host/src/team-watch.ts";
+import { chooseTeamBrief, failedTeamBriefRow, openQuestionLines, orderedTeamMembers, teamLogsText, teamMonitorText, teamSummaryText, teamWatchCommand, teamWatchFrame, teamWatchScreen, visibleScreen, wrapText } from "../packages/host/src/team-watch.ts";
 import { chooseBrief, monitorMembers, summarySessionId, type BriefingView } from "../apps/web/src/team-monitor.ts";
 import { chooseBrief as choosePhoneBrief, orderedMembers, plainScreen } from "../apps/mobile/src/features/teams/summary.ts";
 
@@ -22,6 +22,14 @@ const team = {
   decisions: [{ id: "q1", question: "Which signal means awake?", answer: undefined, recommendation: { answers: ["Heartbeat"], reason: "It is the signal the host already records" } }],
   events: [{ text: "Coordinator started the fresh plan" }],
 };
+
+test("a question prints the asking agent's recommendation before its options", () => {
+  const question = { id: "q1", revision: 2, question: "Which store?", options: ["SQLite", "Files"], recommendation: { answers: ["SQLite"], reason: "One writer." } };
+  assert.deepEqual(openQuestionLines(question), ["Question q1: Which store?", "  The asking agent recommends: SQLite. Reason: One writer.", "  1. SQLite", "  2. Files"]);
+  const card = teamSummaryText({ ...team, decisions: [question] }, []).split("\n");
+  const recommended = card.findIndex(line => line.includes("The asking agent recommends: SQLite")), options = card.findIndex(line => line.includes("Options: SQLite / Files"));
+  assert.ok(recommended > 0 && options === recommended + 1, card.join("\n"));
+});
 
 test("the watch card shows current members and stays stable when nothing changed", () => {
   const first = teamMonitorText(team);

@@ -4,7 +4,7 @@ import { featureMapSchema, TASK_KINDS } from "./task-features.js";
 import { evalProjectSchema } from "./eval-config.js";
 import { POINTS_ALGORITHM_VERSION, teamRoutingSchema } from "./routing-policy.js";
 import { intentCheckReportSchema } from "./intent-report.js";
-import { questionRecommendationSchema, refineQuestion, type DecisionRecommendation } from "./question-recommendation.js";
+import { questionRecommendationSchema, refineQuestion, requiredQuestionRecommendationSchema, type DecisionRecommendation } from "./question-recommendation.js";
 import type { RoutingKnobs, TeamRunRouting } from "./routing-types.js";
 import type { Prompt, AnswerResult } from "@infinite/attention";
 import type { Receipt } from "./types.js";
@@ -578,7 +578,7 @@ const teamReportVariants = [
 ] as const;
 /** What the report tool accepts from a member: every question carries the member's recommendation. */
 export const teamReportSchema = z.discriminatedUnion("kind", [...teamReportVariants,
-  z.object({ ...questionReportShape, recommendation: questionRecommendationSchema }).strict().superRefine(refineQuestion)]);
+  z.object({ ...questionReportShape, recommendation: requiredQuestionRecommendationSchema }).strict().superRefine(refineQuestion)]);
 /**
  * A report as the session journal and the run record hold it. A member started before recommendations were required
  * may still ask a question without one, so the worker and the host read this form.

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { missionReportSchema, recordedMissionReportSchema } from "../packages/host/src/mission-types.js";
-import { questionProblem, recommendationOutcome } from "../packages/host/src/question-recommendation.js";
+import { questionProblem, recommendationOutcome, RECOMMENDATION_REQUIRED } from "../packages/host/src/question-recommendation.js";
 import { recordedTeamReportSchema, teamReportSchema } from "../packages/host/src/team-types.js";
 
 const question = { kind: "question", question: "Which store?", options: ["SQLite", "Files"] };
@@ -9,7 +9,8 @@ const recommended = { ...question, recommendation: { answers: ["SQLite"], reason
 
 test("the report tool requires a recommendation; the journal still reads a question without one", () => {
   for (const [tool, recorded] of [[teamReportSchema, recordedTeamReportSchema], [missionReportSchema, recordedMissionReportSchema]] as const) {
-    assert.equal(tool.safeParse(question).success, false);
+    // A member whose prompt predates recommendations reads only the refusal, so it names the shape to send.
+    assert.deepEqual(tool.safeParse(question).error?.issues.map(issue => [issue.path.join("."), issue.message]), [["recommendation", RECOMMENDATION_REQUIRED]]);
     assert.equal(tool.safeParse(recommended).success, true);
     assert.equal(recorded.safeParse(question).success, true);
     assert.equal(recorded.safeParse(recommended).success, true);
@@ -47,6 +48,11 @@ test("an answer is recorded as matched, different, or other", () => {
   assert.equal(recommendationOutcome(options, both, "1. SQLite"), "different");
   assert.equal(recommendationOutcome(options, both, "1. SQLite\n2. SQLite"), "different");
   assert.equal(recommendationOutcome(options, one, "1. SQLite\nand keep a backup"), "other");
+  // An option may span lines, and two options may differ only in a space: the exact text decides.
+  const spanning = ["Keep\nboth", "Drop", "Drop "];
+  assert.equal(recommendationOutcome(spanning, { answers: ["Keep\nboth", "Drop"], reason: "r" }, "1. Keep\nboth\n2. Drop"), "matched");
+  assert.equal(recommendationOutcome(spanning, { answers: ["Drop"], reason: "r" }, "Drop "), "different");
+  assert.equal(recommendationOutcome(spanning, { answers: ["Drop"], reason: "r" }, "Drop"), "matched");
   // Free text matches only word for word: the host does not judge whether words agree.
   const free = { answers: ["Keep the flag off"], reason: "r" };
   assert.equal(recommendationOutcome([], free, "Keep the flag off"), "matched");

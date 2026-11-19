@@ -41,7 +41,7 @@ import { agentBoundary, inventoryRuntimeProcesses, runtimeIdentity, stopRuntimeT
 import { TeamError } from "./team-workspace.js";
 import { projectGithubRepository, sessionGithubGrant, sessionGithubScopeFor, type GithubGrantScope, type SessionGithubOrigin } from "./github-grants.js";
 import {
-  SESSION_PURPOSES,
+  learningPurpose, SESSION_PURPOSES,
   type SessionPurpose,
 } from "./types.js";
 import type {
@@ -312,7 +312,7 @@ export class Manager {
   remove(id: string): Promise<void> {
     const operation = this.serial.then(async () => {
       const stored = this.meta(id);
-      if (stored.session.team) throw new ContentError("Team sessions cannot be removed", 409);
+      if (stored.session.team && !learningPurpose(stored.session.purpose)) throw new ContentError("Team sessions cannot be removed", 409); // the trial sweep removes a learning session
 
       let workerStateReadFailed = false;
       try {

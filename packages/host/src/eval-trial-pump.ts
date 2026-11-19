@@ -95,8 +95,9 @@ export class TrialPump {
       for (const { trialId, sessionId } of ended) {
         try {
           await this.options.sessions.remove(sessionId);
-        } catch {
-          // A session that is already gone needs no removal.
+        } catch (error) {
+          // A session that is already gone needs no removal; any other refusal keeps the row for the next sweep.
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
         }
         this.options.store.write(tx => clearTrialSession(tx, trialId));
       }
@@ -173,6 +174,11 @@ export class TrialPump {
     const teams = this.options.teams();
     if (this.jobStatus(live.jobId) === "cancelled" || this.halted(live.projectId)) {
       await teams.endReplay(live.trialId, "void-owner");
+      return;
+    }
+    // A task that no longer opens (its row was removed or retired) has nothing to grade: its run ends void-host.
+    if (loadTask(this.options.store, live.taskId).kind !== "task") {
+      await teams.endReplay(live.trialId, "void-host");
       return;
     }
     if (state.memberStartedAt !== undefined) {

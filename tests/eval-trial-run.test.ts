@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,6 +20,7 @@ import { outcomeModule } from "../packages/host/src/outcome-store.js";
 import type { EvalJobView } from "../packages/host/src/eval-types.js";
 import type { ProjectSourceStatus } from "../packages/host/src/project-source.js";
 import type { RuntimeProcess } from "../packages/host/src/team-retirement.js";
+import type { TrialTeams } from "../packages/host/src/eval-trial-pump.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 import type { Config } from "../packages/host/src/types.js";
 import type { Manager } from "../packages/host/src/manager.js";
@@ -35,13 +36,23 @@ const PROJECT = "project-a";
 const UID = process.getuid?.() ?? 0;
 const profile: TeamModelProfile = { id: "trial-member", label: "Trial member", provider: "claude", model: "claude-haiku-5-5", effort: "medium", tier: "light" };
 const sandboxes: string[] = [];
+/** Stores a restarted host replaced; the test closes them after the run. */
+const retired: EvidenceStore[] = [];
 const NOW = "2026-11-19T00:00:00.000Z";
 
 test.after(() => {
   for (const dir of sandboxes) rmSync(dir, { recursive: true, force: true });
+  for (const store of retired) {
+    try {
+      store.close();
+    } catch {
+      // A store the test already closed needs no close.
+    }
+  }
 });
 
-type Rig = { dir: string; root: string; mirror: string; head: string; ids: string[]; record: string; store: EvidenceStore; groups: string };
+type Rig = { dir: string; root: string; mirror: string; head: string; ids: string[]; record: string; store: EvidenceStore; groups: string;
+  databasePath: string; vaultKey: Buffer };
 
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -86,10 +97,11 @@ function rig(): Rig {
   git(dir, ["clone", "--quiet", "--bare", work, mirror]);
   const root = join(dir, "grader");
   mkdirSync(root, { mode: 0o700 });
-  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(dir, "state")), vaultKey: randomBytes(32) });
+  const databasePath = evidenceDatabasePath(join(dir, "state")), vaultKey = randomBytes(32);
+  const store = new EvidenceStore({ databasePath, vaultKey });
   store.register(outcomeModule({ now: () => NOW }));
   store.register(evalTrialsModule(store, () => NOW));
-  return { dir, root, mirror, head: ids[3], ids, record: join(dir, "record.log"), store, groups: `${root}.groups` };
+  return { dir, root, mirror, head: ids[3], ids, record: join(dir, "record.log"), store, groups: `${root}.groups`, databasePath, vaultKey };
 }
 
 /** The validation project, with the trial settings and the one candidate profile. */
@@ -225,8 +237,8 @@ function host(s: Setup, options: { identity?: EvalIdentity; teams?: EvalHostOpti
   } as EvalHostOptions);
 }
 
-/** Mines the fixture commits, then validates them in one validation job. */
-async function validated(h: EvalHost): Promise<void> {
+/** Mines the fixture commits until the miner is caught up. */
+async function mine(h: EvalHost): Promise<void> {
   for (let attempt = 0; attempt < 40; attempt++) {
     h.tick();
     await h.idle();
@@ -234,6 +246,11 @@ async function validated(h: EvalHost): Promise<void> {
     if ("code" in summary) throw new Error(`summary refused: ${summary.code}`);
     if (summary.mining.state === "caught-up") break;
   }
+}
+
+/** Mines the fixture commits, then validates them in one validation job. */
+async function validated(h: EvalHost): Promise<void> {
+  await mine(h);
   const created = h.create(PROJECT, { kind: "validate", limits: { maxWallMinutes: 60 } }, randomUUID());
   assert.ok("job" in created, "the validation job is created");
   for (let attempt = 0; attempt < 60; attempt++) {
@@ -288,6 +305,36 @@ async function drive(s: Setup, h: EvalHost, done: () => boolean, modes: string[]
     }
     await new Promise(resolve => setTimeout(resolve, 200));
   }
+}
+
+/** The operation names of the eval launcher's record, in call order. */
+function launcherOps(s: Setup): string[] {
+  return readFileOr(join(s.r.dir, "eval-record.log")).split("\n").filter(Boolean)
+    .map(line => (JSON.parse(line) as { argv: string[] }).argv[0]);
+}
+
+/** The grader's record, in call order: each entry is the operation and its arguments. */
+function graderRecord(s: Setup): string[][] {
+  return readFileOr(s.r.record).split("\n").filter(Boolean).map(line => JSON.parse(line) as string[]);
+}
+
+/**
+ * A restarted host opens the store anew: the host registers its modules on the store it is given, so a second host over the
+ * same handle would register them twice. The new handle reads the same database file; the retired handle stays open for the
+ * team service, which flushes its events through it.
+ */
+function reopen(s: Setup): void {
+  const next = new EvidenceStore({ databasePath: s.r.databasePath, vaultKey: s.r.vaultKey });
+  next.register(outcomeModule({ now: () => NOW }));
+  next.register(evalTrialsModule(next, () => NOW));
+  next.register(configurationModule());
+  retired.push(s.r.store);
+  s.r.store = next;
+}
+
+/** True once the fake member has written its start receipt. */
+function memberStarted(s: Setup): boolean {
+  return readdirSync(s.receipts).some(name => name.endsWith(".started.json"));
 }
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
@@ -484,5 +531,198 @@ test("without both identities, no trial starts and the summary says why", { time
     hV1.close();
     await hV1.idle();
     v1.r.store.close();
+  }
+});
+
+test("a restart in the middle of a trial voids it", { timeout: 900_000 }, async () => {
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  const first = host(s, { teams: () => served.service, sessions: served.manager });
+  let second: EvalHost | undefined;
+  try {
+    await validated(first);
+    const jobId = baseline(s, 1, 2);
+    // The member stalls: its run stays live until the host stops.
+    await drive(s, first, () => memberStarted(s), ["stall"], 240_000);
+    assert.ok(memberStarted(s), "the member started");
+    const before = launcherOps(s).length;
+    first.close();
+    await first.idle();
+    reopen(s);
+    second = host(s, { teams: () => served.service, sessions: served.manager });
+    await drive(s, second, () => jobRow(s, jobId)?.status === "completed", ["reference"], 600_000);
+    const rows = trialRows(s, jobId);
+    assert.equal(rows.length, 2, "two trial rows");
+    assert.equal(rows[0].ending, "void-host", "the interrupted trial is void");
+    assert.equal(rows[0].attempt, 0, "the interrupted trial is attempt 0");
+    assert.equal(rows[1].attempt, 1, "the slot runs again as attempt 1");
+    assert.equal(rows[1].ending, "graded", "the second trial is graded");
+    const run = await served.service.replayState(rows[0].trial_id);
+    assert.ok(run === undefined || run.ending === "void-host", "the run ends void-host");
+    // The new host's start-up stops, cleans, and scrubs the account before the second trial's first command.
+    assert.deepEqual(launcherOps(s).slice(before, before + 3), ["stop", "clean", "scrub"], "the account is reset before any trial command");
+  } finally {
+    first.close();
+    await first.idle();
+    second?.close();
+    await second?.idle();
+    await fx.close();
+    s.r.store.close();
+  }
+});
+
+test("a lost replay run voids its trial", { timeout: 900_000 }, async () => {
+  // The run's record is lost while its member runs: replayState reports no run for that trial. The team service has no
+  // call that removes a live run, so the test stands a wrapper over the service for that one answer.
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  const service = served.service;
+  let lost: string | undefined;
+  const teams = (): TrialTeams => ({
+    createForReplay: input => service.createForReplay(input),
+    replayState: async trialId => (trialId === lost ? undefined : service.replayState(trialId)),
+    endReplay: (trialId, ending) => service.endReplay(trialId, ending),
+    forgetReplay: trialId => service.forgetReplay(trialId),
+    replayIds: () => service.replayIds(),
+    providerLimits: () => service.providerLimits(),
+  });
+  const h = host(s, { teams, sessions: served.manager });
+  try {
+    await validated(h);
+    const jobId = baseline(s, 1, 1);
+    await drive(s, h, () => memberStarted(s), ["stall"], 240_000);
+    lost = trialRows(s, jobId)[0]?.trial_id;
+    assert.ok(lost, "the trial row exists");
+    await drive(s, h, () => trialRows(s, jobId)[0]?.state === "final", [], 60_000);
+    assert.equal(trialRows(s, jobId)[0]?.ending, "void-host", "the lost run voids its trial");
+  } finally {
+    h.close();
+    await h.idle();
+    await fx.close();
+    s.r.store.close();
+  }
+
+  // The task's row is deleted while its member runs: the trial voids, and the job does not run the task again.
+  const t = setup();
+  const tfx = await teamFixture(t);
+  const tserved = await serveTeam(t, tfx);
+  const th = host(t, { teams: () => tserved.service, sessions: tserved.manager });
+  try {
+    await validated(th);
+    const jobId = baseline(t, 1, 2);
+    await drive(t, th, () => memberStarted(t), ["stall"], 240_000);
+    const taskId = t.r.store.read(db => db.get<{ task_id: string }>("SELECT task_id FROM eval_trials WHERE job_id = ?", jobId))?.task_id;
+    assert.ok(taskId, "the trial names its task");
+    t.r.store.write(tx => { tx.run("DELETE FROM eval_tasks WHERE task_id = ?", taskId); });
+    await drive(t, th, () => trialRows(t, jobId)[0]?.state === "final", [], 60_000);
+    assert.equal(trialRows(t, jobId)[0]?.ending, "void-host", "the deleted task voids its trial");
+    await drive(t, th, () => jobRow(t, jobId)?.status === "completed", ["reference"], 120_000);
+    assert.equal(jobRow(t, jobId)?.status, "completed", "the job moves past the task");
+    assert.equal(trialRows(t, jobId).length, 1, "no second trial for the deleted task");
+  } finally {
+    th.close();
+    await th.idle();
+    await tfx.close();
+    t.r.store.close();
+  }
+});
+
+test("validation and trials share the grader one step at a time", { timeout: 900_000 }, async () => {
+  const JOB_OPS = new Set(["receive", "run", "read", "digest", "export", "clean", "remove"]);
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  const h = host(s, { teams: () => served.service, sessions: served.manager });
+  try {
+    await mine(h);
+    // The validation job and the baseline job run together: the baseline waits for the first valid task.
+    const created = h.create(PROJECT, { kind: "validate", limits: { maxWallMinutes: 60 } }, randomUUID());
+    assert.ok("job" in created, "the validation job is created");
+    const validation = created.job.jobId;
+    // The baseline job is created once the first candidate is valid: a baseline created earlier finds no task and completes empty.
+    await drive(s, h, () => (h.job(validation) as EvalJobView).counts.valid >= 1 || (h.job(validation) as EvalJobView).status === "completed",
+      [], 240_000);
+    const jobId = baseline(s, 1, 1);
+    await drive(s, h, () => jobRow(s, jobId)?.status === "completed" && (h.job(validation) as EvalJobView).status === "completed",
+      ["reference"], 840_000);
+    assert.equal(jobRow(s, jobId)?.status, "completed", "the baseline job completes");
+    const record = graderRecord(s);
+    const open = new Set<string>();
+    const seen = new Set<string>();
+    // A job holds the grader from its receive to its clean. A stop inside that span is the holder's own launcher step.
+    for (const [op, job] of record) {
+      if (!JOB_OPS.has(op) || job === undefined) continue;
+      seen.add(job);
+      for (const other of open) assert.equal(other, job, "no other job's command runs between a receive and its clean");
+      if (op === "receive") open.add(job);
+      if (op === "clean") open.delete(job);
+    }
+    assert.ok(seen.has(validation) && seen.has(jobId), "both jobs used the grader");
+  } finally {
+    h.close();
+    await h.idle();
+    await fx.close();
+    s.r.store.close();
+  }
+});
+
+test("an unavailable store starts no trial", { timeout: 300_000 }, async () => {
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  const h = host(s, { teams: () => served.service, sessions: served.manager });
+  try {
+    s.r.store.close();
+    assert.doesNotThrow(() => h.tick());
+    await h.idle();
+    h.sweep();
+    assert.deepEqual(launcherOps(s), [], "no launcher command runs");
+    assert.equal(readFileOr(s.r.record), "", "no grader command runs");
+    assert.deepEqual(await h.summary(PROJECT), { status: 503, code: "evidence-unavailable" }, "the summary answers 503");
+    assert.deepEqual(h.jobs(), { status: 503, code: "evidence-unavailable" }, "the jobs list answers 503");
+  } finally {
+    h.close();
+    await h.idle();
+    await fx.close();
+  }
+});
+
+test("a graded trial leaves no run record and, later, no session", { timeout: 900_000 }, async () => {
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  // The host's clock is real time plus an offset the test raises before the sweep.
+  let offset = 0;
+  const clock = () => new Date(Date.now() + offset).toISOString();
+  const h = host(s, { teams: () => served.service, sessions: served.manager, now: clock });
+  try {
+    await validated(h);
+    const jobId = baseline(s, 1, 1, { now: clock });
+    await drive(s, h, () => jobRow(s, jobId)?.status === "completed", [], 600_000);
+    const trial = trialRows(s, jobId)[0];
+    assert.ok(trial, "the trial row exists");
+    assert.equal(trial.ending, "graded");
+    assert.deepEqual(served.service.replayIds(), [], "the graded trial leaves no run record");
+    const sessionOf = () => s.r.store.read(db => db.get<{ session_id: string | null }>(
+      "SELECT session_id FROM eval_trials WHERE trial_id = ?", trial.trial_id))?.session_id ?? null;
+    const sessionId = sessionOf();
+    assert.ok(sessionId, "the trial keeps its session until the sweep");
+    const directory = join(fx.host.config.stateDir, "sessions", sessionId);
+    assert.ok(existsSync(directory), "the session directory exists after grading");
+    offset += 2 * 3_600_000;
+    h.sweep();
+    // The sweep runs in the background; the wait is bounded.
+    for (let attempt = 0; attempt < 150 && (existsSync(directory) || sessionOf() !== null); attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    assert.equal(existsSync(directory), false, "the session directory is gone after the sweep");
+    assert.equal(sessionOf(), null, "the trial no longer names its session");
+  } finally {
+    h.close();
+    await h.idle();
+    await fx.close();
+    s.r.store.close();
   }
 });

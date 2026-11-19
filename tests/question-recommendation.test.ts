@@ -47,6 +47,8 @@ test("an answer is recorded as matched, different, or other", () => {
   assert.equal(recommendationOutcome(options, both, "1. Files\n2. SQLite"), "matched");
   assert.equal(recommendationOutcome(options, both, "1. SQLite"), "different");
   assert.equal(recommendationOutcome(options, both, "1. SQLite\n2. SQLite"), "other", "a selection names an option once");
+  // Two options may carry the same text. Selecting both is still a selection of that one answer.
+  assert.equal(recommendationOutcome(["SQLite", "SQLite", "Files"], one, "1. SQLite\n2. SQLite"), "matched");
   assert.equal(recommendationOutcome(options, one, "1. SQLite\nand keep a backup"), "other");
   // An option may span lines. An answer arrives trimmed, so options that differ only in surrounding spaces are one answer.
   const spanning = ["Keep\nboth", "Drop", "Drop "];

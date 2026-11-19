@@ -56,9 +56,16 @@ export function refineQuestion(report: Question & { answerMode?: QuestionAnswerM
 /** An answer arrives trimmed, and a client may send its line ends either way. Option text is compared in the same form. */
 const plain = (text: string) => text.replace(/\r\n/g, "\n").trim();
 
-/** Every ordered choice of one or more different options. A question has four options at most, so 64 at most. */
-function orderedSelections(options: readonly string[], chosen: readonly string[] = []): string[][] {
-  return options.filter(option => !chosen.includes(option)).flatMap(option => [[...chosen, option], ...orderedSelections(options, [...chosen, option])]);
+/**
+ * Every ordered choice of one or more options, each chosen once. Options are told apart by position, because two may
+ * carry the same text. A question has four options at most, so 64 choices at most.
+ */
+function orderedSelections(options: readonly string[], chosen: readonly number[] = []): string[][] {
+  return options.flatMap((_, index) => {
+    if (chosen.includes(index)) return [];
+    const next = [...chosen, index];
+    return [next.map(position => options[position]), ...orderedSelections(options, next)];
+  });
 }
 
 /**
@@ -69,11 +76,11 @@ function orderedSelections(options: readonly string[], chosen: readonly string[]
  * spaces are one answer, because the answer's own were trimmed.
  */
 function selectedOptions(options: readonly string[], answer: string): Set<string> | undefined {
-  const reply = plain(answer), distinct = [...new Set(options)];
+  const reply = plain(answer);
   const numbered = (selection: readonly string[]) => selection.map((option, index) => `${index + 1}. ${option}`).join("\n");
   const readings = [
-    ...distinct.filter(option => plain(option) === reply).map(option => [option]),
-    ...orderedSelections(distinct).filter(selection => plain(numbered(selection)) === reply),
+    ...options.filter(option => plain(option) === reply).map(option => [option]),
+    ...orderedSelections(options).filter(selection => plain(numbered(selection)) === reply),
   ].map(selection => [...new Set(selection.map(plain))].sort());
   return new Set(readings.map(reading => JSON.stringify(reading))).size === 1 ? new Set(readings[0]) : undefined;
 }

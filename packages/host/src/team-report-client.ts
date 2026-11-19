@@ -62,7 +62,8 @@ export function createReportEnvelope(input: unknown, env: NodeJS.ProcessEnv = pr
 /**
  * A question without its recommendation. A worker started before recommendations existed keeps the older report schema
  * in memory and answers 400 to a question that carries one. The reporter then sends the question once more without it,
- * under its own request identity, so the member can still ask. That worker cannot record a recommendation.
+ * under its own request identity, so the member can still ask. That worker cannot record a recommendation. The
+ * reporter returns the envelope the worker recorded; a retry sends the original report again and falls back the same way.
  */
 function questionForOlderWorker(report: { kind: string }): Record<string, unknown> | undefined {
   if (report.kind !== "question" || !("recommendation" in report)) return undefined;

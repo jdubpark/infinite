@@ -17,6 +17,7 @@ import { retireTask, runGroupId } from "./eval-store.js";
 import { evalSummary, SUMMARY_JOBS } from "./eval-summary.js";
 import {
   EVAL_MODULE,
+  type BaselineJobRequest,
   type EvalHostApi,
   type EvalJobView,
   type EvalRefusal,
@@ -77,6 +78,7 @@ export class EvalHost implements EvalHostApi {
   private readonly groups: GroupPass;
   private readonly miner: Miner;
   private readonly evalJobs: EvalJobs;
+  private readonly trialJobs: TrialJobs;
   /** The baseline trial pump, one step after each validation step. Undefined without `teams` and `sessions`. */
   private readonly trials: TrialPump | undefined;
   /** Owned by this pump across tasks: the job last streamed and its digest. */
@@ -107,10 +109,14 @@ export class EvalHost implements EvalHostApi {
     });
     this.groups = new GroupPass({ store: this.store, runs: options.runs, now: this.now });
     this.miner = new Miner({ config: this.config, store: this.store, source: this.source, git: this.git, runs: options.runs, now: this.now });
-    this.evalJobs = new EvalJobs({ store: this.store, config: this.config, now: this.now });
+    this.trialJobs = new TrialJobs({ store: this.store, config: this.config, now: this.now });
+    this.evalJobs = new EvalJobs({
+      store: this.store, config: this.config, now: this.now,
+      baseline: { views: (db, rows) => this.trialJobs.views(db, rows), digest: (projectId, jobId) => this.trialJobs.digest(projectId, jobId) },
+    });
     const identity = options.identity ?? launcherEvalIdentity(() => this.config.eval?.member);
     this.trials = options.teams && options.sessions ? new TrialPump({
-      config: this.config, store: this.store, jobs: new TrialJobs({ store: this.store, config: this.config, now: this.now }),
+      config: this.config, store: this.store, jobs: this.trialJobs,
       grader: this.grader, identity, teams: options.teams, sessions: options.sessions, source: this.source, hostLoad: this.hostLoad,
       halt: this.halt, graderProbe: () => this.grader.probe(this.canaries()).catch((): GraderProbe => ({ state: "unavailable" })),
       inventory: this.inventory, now: this.now,
@@ -132,6 +138,8 @@ export class EvalHost implements EvalHostApi {
     try { this.groups.run(); } catch { /* the pass never throws */ }
     try { this.miner.pump(); } catch { /* the miner never throws */ }
     try { this.validate(); } catch { /* the pump never throws */ }
+    // Outside the chain, so a long validation task cannot delay a trial's timeout or cancel.
+    void this.trials?.watch();
   }
 
   /** Capture sweeps, the group sweep, and the job sweep. Never throws. */
@@ -189,8 +197,9 @@ export class EvalHost implements EvalHostApi {
     return this.guard(() => this.evalJobs.view(jobId) ?? refusal(404, "unknown-job"));
   }
 
-  create(projectId: string, request: ValidateJobRequest, requestId: string): { created: boolean; job: EvalJobView } | EvalRefusal {
-    return this.guard(() => this.evalJobs.create(projectId, request, requestId));
+  create(projectId: string, request: ValidateJobRequest | BaselineJobRequest, requestId: string): { created: boolean; job: EvalJobView } | EvalRefusal {
+    return this.guard(() => request.kind === "baseline" ? this.trialJobs.create(projectId, request, requestId)
+      : this.evalJobs.create(projectId, request, requestId));
   }
 
   control(jobId: string, action: "pause" | "resume" | "cancel"): EvalJobView | EvalRefusal {
@@ -224,10 +233,13 @@ export class EvalHost implements EvalHostApi {
     try { return this.store.read(db => trialsSince(db, projectId, day)); } catch { return 0; }
   }
 
-  /** One chain: the validation step, then the trial step. One user holds the grader at a time. */
+  /** One chain: the validation step, then the trial step, which runs even when the validation step throws. */
   private async step(): Promise<void> {
-    await this.validateStep();
-    await this.trials?.step();
+    try {
+      await this.validateStep();
+    } finally {
+      await this.trials?.step();
+    }
   }
 
   /** One task at most: the probe, the start-up clean once, the next task, the task, and its record. */

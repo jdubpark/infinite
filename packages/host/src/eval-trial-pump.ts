@@ -33,7 +33,7 @@ import type { Config, Provider } from "./types.js";
 
 export const EVAL_STOPPING_MS = 120_000, TRIAL_LAUNCH_MS = 900_000, TRIAL_SESSION_KEEP_MS = 3_600_000, TRIAL_SESSIONS_BATCH = 20,
   EVAL_LIMIT_UNSTATED_MS = 900_000, EVAL_LIMIT_MAX_MS = 86_400_000;
-const IDENTITY_FRESH_MS = 600_000;
+const IDENTITY_FRESH_MS = 600_000, STOP_TRIES = 3;
 
 export type TrialTeams = Pick<TeamService, "createForReplay" | "replayState" | "endReplay" | "forgetReplay" | "replayIds" | "providerLimits">;
 export type TrialPumpOptions = {
@@ -49,6 +49,10 @@ type Trial = Extract<NextTrial, { kind: "trial" }>;
 type Live = {
   trialId: string; jobId: string; taskId: string; projectId: string; configuration: TrialConfiguration; settings: TrialSettings;
   source: ReadyTrial; ctx: TrialContext; launchedAt: number; endedSeenAt?: number;
+  /** The last session the run reported, kept for a run that is later lost. */
+  sessionId?: string;
+  /** Stops that failed so far; the third voids the trial. */
+  stopFailures?: number;
 };
 type Stop = "stopped" | "alive" | "failed";
 
@@ -64,7 +68,9 @@ export class TrialPump {
   private readonly limits = new Map<Provider, number>();
   private started = false;
   private live: Live | undefined;
-  private probed: { at: number; probe: EvalProbe } | undefined;
+  private probed: { at: number; probe: EvalProbe; projectId: string | undefined } | undefined;
+  /** Steps to skip before the next trial start, after a source that could not start. */
+  private cooldown = 0;
 
   constructor(options: TrialPumpOptions) {
     this.options = options;
@@ -81,6 +87,23 @@ export class TrialPump {
     }
   }
 
+  /**
+   * The checks of a running member, outside the chain: a cancelled job or halted project, the member's time, the launch limit,
+   * and a task that no longer opens. It never stops the account, grades, cleans, or starts a trial. Never throws.
+   */
+  async watch(): Promise<void> {
+    try {
+      const live = this.live;
+      if (live === undefined) return;
+      const state = await this.options.teams().replayState(live.trialId);
+      if (state === undefined || this.live !== live) return;
+      this.seen(live, state);
+      if (state.phase === "running") await this.checkRunning(live, state);
+    } catch {
+      // A failed check is repeated on the next tick.
+    }
+  }
+
   /** Hourly: sweepTrials, forgetReplay for final trials whose run remains, and sessions.remove for at most 20 sessions ended over an hour ago. */
   async sweep(): Promise<void> {
     try {
@@ -88,18 +111,26 @@ export class TrialPump {
       this.options.store.tryWrite(tx => { sweepTrials(tx, at); });
       const teams = this.options.teams();
       for (const trialId of teams.replayIds()) {
-        if (this.options.store.read(db => readTrial(db, trialId))?.state === "final") await teams.forgetReplay(trialId);
+        try {
+          if (this.options.store.read(db => readTrial(db, trialId))?.state === "final") await teams.forgetReplay(trialId);
+        } catch {
+          // One unreadable row or failed removal leaves that run for the next sweep.
+        }
       }
       const endedBefore = new Date(Date.parse(at) - TRIAL_SESSION_KEEP_MS).toISOString();
       const ended = this.options.store.read(db => trialSessions(db, endedBefore, TRIAL_SESSIONS_BATCH));
       for (const { trialId, sessionId } of ended) {
         try {
-          await this.options.sessions.remove(sessionId);
-        } catch (error) {
-          // A session that is already gone needs no removal; any other refusal keeps the row for the next sweep.
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
+          try {
+            await this.options.sessions.remove(sessionId);
+          } catch (error) {
+            // A session that is already gone needs no removal; any other refusal keeps the row for the next sweep.
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
+          }
+          this.options.store.write(tx => clearTrialSession(tx, trialId));
+        } catch {
+          // One failed row leaves the others to their removal.
         }
-        this.options.store.write(tx => clearTrialSession(tx, trialId));
       }
     } catch {
       // The sweep never throws.
@@ -119,6 +150,10 @@ export class TrialPump {
     if (this.live !== undefined) return this.advanceLive(this.live);
     const open = this.openJob();
     if (open === undefined) return;
+    if (this.cooldown > 0) {
+      this.cooldown -= 1;
+      return;
+    }
     const grader = await this.graderState();
     const identity = await this.identityProbe(grader.uid, open.projectId);
     const next = await this.options.jobs.next(this.gates(identity, grader));
@@ -134,13 +169,17 @@ export class TrialPump {
         this.options.store.write(tx => dropTrial(tx, row.trialId));
         continue;
       }
+      // The run's session is read before the run ends, so the sweep can remove it later.
+      const session = await this.options.teams().replayState(row.trialId).then(state => state?.sessionId, () => undefined);
       await this.options.teams().endReplay(row.trialId, "void-host").catch(() => undefined);
       this.options.store.write(tx => finishTrial(tx, row.trialId, this.final(gradeOf({ ending: "void-host", expected: this.expectedOf(row.taskId),
-        overwritten: 0, diff: null, isolation: "none" }), null, null, null), at));
+        overwritten: 0, diff: null, isolation: "none" }), null, null, session ?? null), at));
       this.options.jobs.record(row.jobId, "void-host");
     }
     const identity = await this.identityProbe(undefined, this.openJob()?.projectId);
-    if (identity.state !== "not-configured" && identity.state !== "unavailable" && identity.state !== "misconfigured") {
+    // An identity that is configured but cannot be probed has not been cleaned: start-up runs again on the next step.
+    if (identity.state === "unavailable" || identity.state === "misconfigured") return false;
+    if (identity.state !== "not-configured") {
       if ((await stopEvalIdentity(this.options.identity, identity.uid ?? -1, this.inventory)) !== "stopped") return false;
       if (!(await this.cleanAndScrub())) return false;
       for (const jobId of this.options.jobs.running()) {
@@ -155,6 +194,7 @@ export class TrialPump {
   private async advanceLive(live: Live): Promise<void> {
     const teams = this.options.teams();
     const state = await teams.replayState(live.trialId);
+    if (state !== undefined) this.seen(live, state);
     if (state === undefined) {
       // The run was deleted while its member ran: the trial voids at once.
       return this.close(live, "void-host", undefined, await this.stop(live));
@@ -165,12 +205,26 @@ export class TrialPump {
       if (Date.now() - live.endedSeenAt < EVAL_STOPPING_MS) return;
     }
     const stopped = await this.stop(live);
-    if (stopped !== "stopped") return this.close(live, "void-host", state, stopped);
+    // A stop that failed is tried again on the next steps; the third failure voids the trial.
+    if (stopped === "failed" && (live.stopFailures = (live.stopFailures ?? 0) + 1) < STOP_TRIES) return;
+    if (stopped !== "stopped") {
+      if (state.ending === "void-limit") this.limit(live.configuration.profile.provider, state.resetsAt);
+      return this.close(live, "void-host", state, stopped);
+    }
     if (state.ending === "settled") return this.grade(live, state);
     return this.close(live, state.ending ?? "void-host", state, stopped);
   }
 
+  private seen(live: Live, state: ReplayState): void {
+    if (state.sessionId !== undefined) live.sessionId = state.sessionId;
+  }
+
   private async advanceRunning(live: Live, state: ReplayState): Promise<void> {
+    await this.checkRunning(live, state);
+  }
+
+  /** The checks of a running member; `advanceLive` and `watch` share them. */
+  private async checkRunning(live: Live, state: ReplayState): Promise<void> {
     const teams = this.options.teams();
     if (this.jobStatus(live.jobId) === "cancelled" || this.halted(live.projectId)) {
       await teams.endReplay(live.trialId, "void-owner");
@@ -192,18 +246,31 @@ export class TrialPump {
   private async grade(live: Live, state: ReplayState): Promise<void> {
     const flagged = this.options.store.write(tx => gradingTrial(tx, live.trialId, this.now()));
     if (!flagged) {
+      // A row already in `grading` was left by a step that failed: the trial closes void-host instead of being forgotten.
+      const row = this.options.store.read(db => readTrial(db, live.trialId));
+      if (row?.state === "grading") return this.close(live, "void-host", state, "stopped");
       this.live = undefined;
       return;
     }
-    const result = await gradeTrial(this.options.store, {
-      taskId: live.taskId, baseCommit: live.source.baseCommit, resultCommit: state.resultCommit, workspace: live.source.workspace,
-      hiddenFiles: live.source.hiddenFiles, isolation: live.source.isolation,
-    }, live.ctx);
+    let result: Awaited<ReturnType<typeof gradeTrial>>;
+    try {
+      result = await gradeTrial(this.options.store, {
+        taskId: live.taskId, baseCommit: live.source.baseCommit, resultCommit: state.resultCommit, workspace: live.source.workspace,
+        hiddenFiles: live.source.hiddenFiles, isolation: live.source.isolation,
+      }, live.ctx);
+    } catch {
+      // The account is already stopped; a grading that threw leaves nothing to grade.
+      return this.close(live, "void-host", state, "stopped");
+    }
     if (result.kind === "environment") return this.close(live, result.cause === "halted" ? "void-owner" : "void-host", state, "stopped");
-    const configured = this.configOf(live.trialId, state);
-    const at = this.now();
-    this.options.store.write(tx => finishTrial(tx, live.trialId, this.final(result.grade, configured.configId, configured.profileEpoch,
-      state.sessionId ?? null, result.patch), at));
+    try {
+      const configured = this.configOf(live.trialId, state);
+      const at = this.now();
+      this.options.store.write(tx => finishTrial(tx, live.trialId, this.final(result.grade, configured.configId, configured.profileEpoch,
+        state.sessionId ?? live.sessionId ?? null, result.patch), at));
+    } catch {
+      return this.close(live, "void-host", state, "stopped");
+    }
     await this.afterFinal(live, result.grade.ending, state);
   }
 
@@ -213,7 +280,7 @@ export class TrialPump {
     if (stopped !== "stopped") this.started = false;
     const at = this.now();
     const grade = gradeOf({ ending, expected: this.expectedOf(live.taskId), overwritten: 0, diff: null, isolation: live.source.isolation });
-    this.options.store.write(tx => finishTrial(tx, live.trialId, this.final(grade, null, null, state?.sessionId ?? null), at));
+    this.options.store.write(tx => finishTrial(tx, live.trialId, this.final(grade, null, null, state?.sessionId ?? live.sessionId ?? null), at));
     await this.afterFinal(live, ending, state);
   }
 
@@ -237,6 +304,7 @@ export class TrialPump {
     const ctx = this.contextOf(next, trialId, identity, grader);
     if (ctx === undefined) {
       this.options.store.write(tx => dropTrial(tx, trialId));
+      this.cooldown = 1;
       return;
     }
     let source: SourceResult;
@@ -251,6 +319,7 @@ export class TrialPump {
       return;
     }
     if (source.kind === "environment") {
+      this.cooldown = 1;
       this.options.store.write(tx => dropTrial(tx, trialId));
       if (source.cause === "eval-processes-alive" || source.cause === "grader-processes-alive") this.options.jobs.block(next.jobId, "eval-processes-alive");
       return;
@@ -264,7 +333,12 @@ export class TrialPump {
         profile: next.configuration.profile as TeamModelProfile, capsule: source.capsule, features: source.features,
         baseCommit: source.baseCommit, workspace: source.workspace });
     } catch {
-      // No member was launched: the trial ends void-host, and the account is cleaned.
+      // No member was launched, but a run may exist: it ends void-host, then the trial does, and the account is cleaned.
+      try {
+        await this.options.teams().endReplay(trialId, "void-host");
+      } catch {
+        // A run that cannot end is left to the sweep.
+      }
       await this.close(live, "void-host", undefined, "stopped");
     }
   }
@@ -329,7 +403,9 @@ export class TrialPump {
 
   /** The cached identity probe while it answered `ready` within the freshness window; otherwise a probe now. */
   private async identityProbe(graderUid: number | undefined, projectId: string | undefined): Promise<EvalProbe> {
-    if (this.probed !== undefined && this.probed.probe.state === "ready" && Date.now() - this.probed.at < IDENTITY_FRESH_MS) return this.probed.probe;
+    // The probe names the project's repository, so a probe made for another project, or none, is not reused.
+    if (this.probed !== undefined && this.probed.projectId === projectId && this.probed.probe.state === "ready"
+      && Date.now() - this.probed.at < IDENTITY_FRESH_MS) return this.probed.probe;
     const { config, source, identity } = this.options;
     let probe: EvalProbe;
     try {
@@ -344,7 +420,7 @@ export class TrialPump {
     } catch {
       probe = { state: "unavailable" };
     }
-    this.probed = { at: Date.now(), probe };
+    this.probed = { at: Date.now(), probe, projectId };
     return probe;
   }
 

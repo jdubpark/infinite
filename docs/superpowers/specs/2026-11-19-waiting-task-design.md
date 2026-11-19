@@ -1,6 +1,6 @@
 # A blocked task waits alone (INF-325)
 
-Date: 2026-11-19. Status: design for review. Nothing is built, and the design recommends not building it until one of the two triggers in "When to build" is met.
+Date: 2026-11-19. Status: design for review, second draft after an independent review of the first. Nothing is built. The design recommends not building it until the trigger in "When to build" is met, and the measurement there says it is not met today.
 
 ## Intent
 
@@ -12,102 +12,127 @@ Board's guide states the rule as "a question doesn't hold a worker": a worker th
 
 ### The rule
 
-**One task's question stops one task.** The member that asked stops. Its task and the tasks that depend on it wait. Every other task keeps its member, integrates, and is checked as today. The project manager resolves the waiting task. Today's run-wide recovery stays as the path for everything this design does not cover, and as the fallback when a wait cannot be resolved.
+**One task's question stops one task.** The implementer that asked stops. Its task and the tasks that depend on it wait. Every other task keeps its member and is integrated. The project manager resolves the waiting task. A wait that cannot be resolved ends where the same report ends today: automatic recovery when its conditions hold, otherwise a blocked run the owner sees.
 
 ## Current state
 
 Observed on `main` at `c96e361e`:
 
-- **A worker's question or blocker becomes a run block.** In `TeamService.consume` an implementer, scout, integrator or reviewer that reports `question` blocks the run with `agent-question`, and a `blocked` report blocks it with `agent-blocked` (`packages/host/src/teams.ts:5204-5207`).
-- **A recoverable block stops the whole run.** `block` starts automatic recovery for the codes `agent-blocked`, `agent-question`, `missing-agent-report`, `invalid-no-change` and `wrong-agent-report` (`teams.ts:269`). It aborts the run's commands, sets the run to `planning` under a halt, and waits "after all active members stop" (`teams.ts:2788-2799`).
-- **Recovery replans everything not yet integrated.** `startAutomaticRecovery` saves the plan as a continuation, advances the revision and clears `run.tasks` (`teams.ts:2936-2943`). The project manager is told to diagnose the report, inspect the retained member workspaces read-only, and carry approved work forward in new assignments (`teams.ts:2929-2934`). The limit is two recoveries per run (`teams.ts:270`).
-- **A project manager's own question already waits alone.** It becomes a decision, the run shows `needs-input`, and the prompt says "Independent teammates can continue while a decision is pending" (`teams.ts:5208-5215`, `packages/host/src/team-prompts.ts:436`).
-- **An answered question already continues in the same working copy.** A recorded answer starts one replacement member with the earlier prompt plus the answer, in the earlier member's clone, when a worker slot is free (`teams.ts:3467-3478`).
-- **Width is at most 4.** `run.parallelism` is 1 to 4, and 2 for a handoff run.
-- **The frequency is low.** On 2026-11-18 the coordinator's ledger held 87 implementer first attempts, of which 2 ended blocked, and 37 runs, of which 3 ended blocked on `agent-blocked`.
+- **A worker's question or blocker becomes a run block.** An implementer, scout, integrator or reviewer that reports `question` blocks the run with `agent-question`, and a `blocked` report blocks it with `agent-blocked` (`packages/host/src/teams.ts:5204-5207`).
+- **A recoverable block stops the whole run.** `block` starts automatic recovery for five codes, these two among them (`teams.ts:269`). It aborts the run's commands, sets the run to `planning` under a halt, and waits "after all active members stop" (`teams.ts:2788-2799`). Recovery runs only when its conditions hold: a source member of the current revision, no pending operation, no delivery, permissions neither revoked nor uncertain, tracking in step, a run that is not paused or cancelled, and fewer than two recoveries so far (`teams.ts:2784-2799`).
+- **Recovery replans everything not yet integrated.** `startAutomaticRecovery` saves the plan as a continuation, advances the revision and clears `run.tasks` (`teams.ts:2936-2943`). The project manager inspects the retained member workspaces read-only and carries approved work forward in new assignments.
+- **Results are integrated in plan order.** An implementer's result waits while any task before it in the plan is not integrated, whether or not it depends on that task (`teams.ts:3458-3460`).
+- **An active project manager stops new starts.** While any member of the revision other than an implementer or a permission coordinator is active, no task starts (`teams.ts:3499`). While one is waiting on a decision, the run shows `needs-input` and no task starts (`teams.ts:3500`). Preparing a project manager sets the run to `planning` (`teams.ts:4993`). So the prompt's sentence "Independent teammates can continue while a decision is pending" (`packages/host/src/team-prompts.ts:436`) holds only for members already running.
+- **Dependents already wait.** A task starts only when every task it depends on is integrated (`teams.ts:3512`), and checks, review and delivery start only when every task is integrated and no member is active (`teams.ts:3513-3538`).
+- **An answered question continues in the same working copy.** A recorded answer starts one replacement member with the earlier prompt plus the answer, in the earlier member's clone, when a worker slot is free (`teams.ts:3467-3478`).
+- **A waiting clone is kept.** Member workspace cleanup applies only to a stopped member with an integrated result (`teams.ts:3070-3076`, `:3138-3145`).
+- **Width is at most 4**, and a handoff run's ceiling is 2. The member limit is the goal's or handoff's `maxMembers`, otherwise 60 (`packages/host/src/team-types.ts:409-410`), checked when a member is created and not reserved ahead.
+- **Scouts are a separate graph.** Discovery scouts live in `run.discovery.tasks` and finish as `complete` under their own scheduler (`teams.ts:3486-3497`).
+- **A mission protects a subteam in recovery.** A coordinator's blocker report is refused while a subteam's recovery is `stopping` or `planning` (`packages/host/src/missions.ts:1612-1616`).
 
-So the cost today is bounded by width: one question stops at most three healthy members, and their partial work is retained, not lost. The cost grows with width and with task length.
+### How often it happens
+
+Read-only counts from the live host on 2026-11-19, over the 29 runs it holds (28 created in the last 30 days; 11 at width 1, 11 at width 2, 7 at width 4):
+
+- Automatic recoveries from `agent-blocked`: 5. From `agent-question`: 0.
+- Tasks that were not integrated when one of those five recoveries replanned the run: 0. Four happened at a revision with no task list and one after both of its tasks were integrated, so the blocker came from a later stage each time.
+
+In this history no worker's question or blocker interrupted another task. The rule in this document would have changed nothing.
 
 ## Design
 
 ### 1. When a task waits instead of the run
 
-A worker's `question` or `blocked` report puts its task into a wait, in place of a run block, only when all of these hold:
+An implementer's `question` or `blocked` report opens a wait, in place of a run block, only when all of these hold:
 
-1. The reporting member is an implementer or a scout of the current revision.
-2. At least one other task of the revision is running, or ready with its dependencies integrated, and does not depend on the reporting task, directly or through other tasks.
-3. The task has not waited before in this revision. A second question from the same task goes to run-wide recovery as today.
-4. The run holds fewer than 4 open waits, no delivery attempt, no stop reason, no halt, and its member budget has room for the project manager's attempt and one replacement.
-5. The task is not under a live search (INF-317). A search releases its task to the single-attempt path first.
+1. The reporter is an implementer of the current revision. Scouts, integrators and reviewers keep today's path.
+2. At least one other task of the revision is running, or pending with its dependencies integrated, and does not depend on the reporting task directly or through other tasks.
+3. The task has not waited before in this revision.
+4. The run has fewer than 4 open waits, no delivery attempt, no stop reason and no halt, and at that moment the member limit has room for a project manager attempt and one replacement. The room is checked, not reserved.
+5. The task is not under a live search (INF-317).
 
-Otherwise nothing changes: the report blocks the run and recovery runs as today. `missing-agent-report`, `invalid-no-change` and `wrong-agent-report` always take today's path, because they say the member is unreliable, not that it needs an answer.
+Otherwise the report blocks the run as today. `missing-agent-report`, `invalid-no-change` and `wrong-agent-report` always take today's path: they say the member is unreliable, not that it needs an answer.
 
-### 2. What a wait is
+### 2. The wait record
 
-The run record gains `waits`: `{ id, taskId, memberId, revision, kind: "question" | "blocked", text, recommendation?, blocker?, createdAt, resolution? }`. The task's status becomes `waiting`, a status tasks already have. The member is `stopped` with its report kept, and its clone is retained exactly as a blocked member's is today.
+`run.waits` holds `{ id, taskId, memberId, revision, kind: "question" | "blocked", text, recommendation?, createdAt, managerMemberIds, decisionId?, resolution? }`. The task's status becomes `waiting`, a status tasks and clients already have. The member is stopped with its report kept, and its clone is retained.
 
-Scheduling needs no new rule: a task starts only when its dependencies are integrated, so the dependents of a waiting task do not start. Tasks outside that set run, integrate one at a time, and are checked as today.
+Every project manager attempt for a wait carries the wait's id, and so do its successors after an answer, a stall or a provider limit. Stall and provider-limit histories are grouped by wait id, because ordinary project managers have no task id and would otherwise share one allowance.
 
-### 3. Who resolves it
+### 3. Three scheduler rules change
 
-The host starts one **project manager attempt for the wait**. It is read-only, so it runs beside the working members without contention. It reads the wait, the task's brief, the retained clone, and the integrated head, and reports one of:
+This is the part the first draft missed. Without all three, the other tasks do not keep moving.
 
-- **`answer`**: text for the task. The host starts one replacement member in the same clone with the earlier prompt plus the answer. This is the existing answered-question path, with the project manager as the answerer.
-- **`replace`**: new tasks that replace the waiting task and its dependents. The host validates the amended plan with the same checks as a first plan (`validateTeamPlan`: ids, cycles, unknown dependencies, path overlap) over the tasks that are not yet integrated, and refuses an amendment that touches a running or integrated task or their owned paths.
-- **`question`**: a decision for the owner, with a recommendation (INF-323). The wait stays open, the other tasks continue, and the owner's answer returns to this attempt's successor.
-- **`recover`**: the project manager judges the plan itself wrong. The host falls back to run-wide recovery.
+1. **Integration follows dependencies.** An implementer's result may be integrated when every task it depends on is integrated, instead of every task before it in the plan. Integration stays one at a time, with the same scope validation and conflict handling. The plan check already refuses overlapping paths between tasks without a dependency order (`packages/host/src/team-workspace.ts:725-730`), which is what makes the order free.
+2. **A wait's project manager does not stop new starts.** A member that carries a wait id is exempt from the two rules at `teams.ts:3499-3500`, and preparing it does not set the run to `planning`. Wait managers run one at a time; other open waits queue.
+3. **Run status has an order.** `needs-input` while an owner decision is open, otherwise `implementing` while any task is not integrated. Checks, review and delivery are unchanged: they start only when every task is integrated, so an open wait holds them.
 
-An attempt that exits without a report, reports anything else, or sends an amendment the host refuses also falls back to run-wide recovery. The fallback is the behaviour of today, so the new path can only save work, never strand it.
+### 4. How a wait is resolved
 
-### 4. When the rest finishes first
+The wait's project manager is read-only. The host confirms that its process stopped and that its working copy is unchanged (`assertMemberReadOnly`) before applying any of its reports:
 
-If every other task is integrated and the wait is still open, the run stays in `implementing` while the project manager attempt runs, and in `needs-input` while an owner decision is open. Checks and review do not start until no task is waiting, because they run on the whole integrated revision.
+- **`answer`**: text for the task. The host starts one replacement implementer in the same clone with the earlier prompt plus the answer, recorded as the project manager's answer and never as the owner's.
+- **`replace`**: an amended plan. The host validates the complete task graph, not a subset. Tasks that are integrated or running must appear unchanged. The waiting task and its dependents are replaced by tasks with new ids, and any surviving task's dependency on a replaced id is rewritten in the same amendment. Profiles, goal scope and the pinned verification are checked as for a first plan (`teams.ts:5281`, `:5299-5305`). Ledger events for an amendment carry an amendment number, so they do not repeat the identities of the revision's first plan. The replaced member's clone stays as evidence; its edits are carried forward only by a new assignment whose brief says so, as recovery does today.
+- **`question`**: a decision for the owner with a recommendation (INF-323). The wait stays open and the other tasks continue. The answer returns to a successor attempt for the same wait.
+- **`recover`**: the project manager judges the plan itself wrong.
 
-### 5. Owner actions and limits
+### 5. When a wait cannot be resolved
 
-- Steer, pause, cancel, a halt, and a deadline act on the run as today. A steer replans the revision and drops its waits, with an event that says so.
-- A wait counts no automatic recovery. A fallback from a wait counts one, as today.
-- Budget: the project manager attempt and the replacement member each count as a member attempt (limit 60 a run).
-- A wait that stays open for the run's stall window with no project manager attempt at work falls back to recovery.
+A `recover` report, a refused amendment, a manager that exits without a report, a second question from the same task, or a wait with no manager at work for the run's stall window ends the wait. Its source is the original implementer's report, with its original code. From there:
 
-### 6. What clients and records show
+- **Automatic recovery** when `block`'s conditions hold. The work integrated while the task waited stays integrated.
+- **A blocked run the owner sees** when they do not: two recoveries already used, permissions revoked or uncertain, tracking out of step, or the member limit reached.
 
-- The run view: the task shows `waiting` with the wait's text and, once resolved, how. Clients already render task status; the wait text is one line on the task.
+The stall window does not run while an owner decision for the wait is open, or while the run is paused or halted.
+
+Owner control takes over at any time. A steer, a resume that advances the revision, and a cancel drop the revision's waits with an event that says so, and a resolution that arrives for a dropped wait is refused. A halt that keeps the revision keeps its waits.
+
+### 6. Missions
+
+A subteam with an open wait under local resolution gets the protection a subteam in recovery has: a coordinator's blocker report is refused while it lasts. An owner decision from a wait is forwarded to the coordinator like any open decision (`missions.ts:998-1000`), and the coordinator is woken when a wait ends in recovery or a block.
+
+### 7. What clients and records show
+
+- The run view: the task shows `waiting` with the wait's text and, once resolved, how.
 - The run's events: "Task T is waiting on the project manager: QUESTION. N other tasks continue." and its resolution.
-- The outcome ledger: one new event kind for a wait opening and one for its resolution, so the saving can be measured (members that kept working while a task waited).
+- The outcome ledger: one event when a wait opens and one when it ends, with the wait id.
 
-### 7. The search-mode design (INF-317, PR #199)
+### 8. The search-mode design (INF-317, PR #199)
 
-That design runs challengers for one task under one run and already speaks of a search's "hold" on a task. The two designs meet at one point: a task under a live search is not eligible for a wait (rule 5 of section 1). No other part of the search design reads run-wide recovery, so neither blocks the other. This document says "wait" throughout to keep "hold" for the search.
+That design already speaks of a search's "hold" on a task, so this document says "wait". The two meet at one point: a task under a live search is not eligible for a wait.
 
 ## When to build
 
-The owner's condition is width above four. Two measurable triggers, either one:
+The owner's condition is a run wider than four. Width is capped at 4 today, so that condition cannot be met until the cap changes.
 
-1. `run.parallelism` may exceed 4.
-2. Over 30 days, run-wide recoveries from `agent-question` or `agent-blocked` stopped 10 or more healthy members, counted from the outcome ledger's member stop events (`host` stops in a revision whose block source is another member).
+A second trigger, measurable from data the host already keeps: **interrupted tasks**. For each automatic recovery from `agent-question` or `agent-blocked`, count the tasks in the continuation's snapshot that were not integrated, leaving out the source's own task and its dependents. Build when that count reaches 10 in 30 days. The count is a proxy: an interrupted task is not proven lost work, because recovery can carry it forward.
 
-On the 2026-11-18 numbers neither is met: two blocked first attempts in 87, at width 4 or less.
+On 2026-11-19 the count over the retained history is 0.
 
-One small change is worth making before then, because it is independent of the rest and INF-323 builds it: a worker's question carries its recommendation into the `agent-question` text, so the recovering project manager reads what the member would have done.
+Two smaller items do not wait for the trigger:
+
+- INF-323 puts a worker's recommendation into the `agent-question` text, so the recovering project manager reads what the member would have done.
+- The escalation path sets no `contextFeedback` on the replacement member, unlike the three other replacement paths (`teams.ts:5262-5276` against `:3475`, `:4904`, `:4962`). The note still reaches the member in its prompt. It is a four-line consistency fix for the next change to that code.
 
 ## Build plan (when triggered)
 
-1. Types: `waits` on the run, the project manager's wait reports, and the pure eligibility function of section 1 with its table as unit tests.
-2. `TeamService`: open a wait in `consume`, start and consume the project manager attempt, the `answer` and `replace` paths, and every fallback. A strong implementer and independent review: this is the run state machine.
-3. Plan amendment validation in `team-workspace.ts`, sharing `validateTeamPlan`.
-4. Prompts for the wait attempt; client line; ledger events; documents.
+1. Types and the pure eligibility function of section 1, with its table as unit tests.
+2. The three scheduler rules of section 3, each behind the run's pinned setting, with tests that a task behind a waiting task integrates and that a wait manager does not stop a new start.
+3. The wait lifecycle in `TeamService`: open, manager attempts bound to the wait id, `answer`, `question`, every ending of section 5.
+4. The amendment: validation over the complete graph, new ids, ledger identities.
+5. Mission protection, prompts, the client line, ledger events, documents.
 
-Off by default behind `config.teams.taskWaits`, pinned on the run at creation like the entry tools.
+Steps 2 to 4 change the run state machine and go to a strong implementer with independent review. Off by default behind `config.teams.taskWaits`, pinned on the run at creation.
 
 ## Risks
 
-- **A second state machine beside recovery.** Mitigated by making every failure of the new path enter the old one, and by refusing the cases that complicate it (delivery in flight, a halt, a second wait on a task).
-- **A plan amended while members work.** The amendment may only replace tasks that have not started or are waiting, and must keep owned paths separate from every running and integrated task. The host checks it; the prompt does not carry that rule alone.
-- **The project manager answers what the owner should.** Its prompt keeps the existing rule: never choose or approve for the owner. A material product, scope or permission decision is a `question`.
+- **A second path beside recovery.** Section 5 keeps every ending inside today's two outcomes and bypasses none of recovery's conditions.
+- **Integration order.** Rule 1 of section 3 changes when results land for every run that has the setting, not only for runs with a wait. It needs its own tests on dependency chains and on a conflict between independent tasks.
+- **A plan amended while members work.** The host validates the whole graph and holds running and integrated tasks unchanged; the prompt does not carry that rule alone.
+- **The project manager answers what the owner should.** Its prompt keeps the existing rule: a material product, scope or permission decision is a `question` for the owner. Its answers are recorded as an agent's.
 
 ## Not verified
 
-- The exact scheduler lines that start a task once its dependencies are integrated (`TeamService.step` was read for the answered-question path only).
-- Whether the outcome ledger can already count healthy members stopped by a recovery, or needs the block source joined by hand.
-- The retention of a waiting member's clone when the run's other members finish (`memberMinutes`).
+- That the search-mode design reads run-wide recovery nowhere else. Only its text on holds was read.
+- The count above covers the runs the live host still holds (the oldest is 32 days old). Runs removed under retention are not in it.
+- Whether integration in dependency order can meet a conflict that plan order avoided, for example through files generated by a build step outside the planned paths.

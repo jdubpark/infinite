@@ -547,6 +547,9 @@ test("an entry that reached the mission before a crash is applied once, with no 
     await waitFor(async () => s.store.get(ISSUE)!.inbound[0].handledAt, handled => Boolean(handled), 30000);
     assert.equal(sh.get(id).steering.length, 1, "The reply applies once");
     assert.equal(sh.get(id).revision, before + 1, "The replay advances the revision once");
+    const messages = await waitFor(async () => s.store.get(ISSUE)!.messages,
+      items => items.some(item => item.key === "ack" && item.status === "sent"), 20000);
+    assert.deepEqual(messages.map(item => item.key), ["ack"], "A replayed reply queues no refusal");
     assert.deepEqual(s.texts(), [ACK], "A replayed reply posts no refusal");
   } finally { await close(); }
 });

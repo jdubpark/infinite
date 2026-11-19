@@ -1997,18 +1997,16 @@ export class TeamService {
       // A run held where it waits keeps the answer and starts nothing until it resumes.
       const held = heldWaiting(stored), mark = stored.ownerHalt;
       if (!held && (stored.halt || run.status === "paused")) throw new TeamError(409, "team-paused", "Resume the team before answering its decision.");
-      const receipt = this.admit(stored, `answer:${decisionId}`, body);
-      if (!receipt) return this.view(stored);
-      // An owner answer is new direction no outstanding review saw; those requests are reviewed again under it or stay with the user.
-      if (by === "owner" && (run.permissionDecisions ?? []).some(item => ["pending", "reviewing", "approved", "answering"].includes(item.status)))
-        await this.invalidatePermissionDecisions(stored, "The owner answered a team question; a request reviewed before that answer remains with the user.", false);
-      this.recordReceipt(stored, body.requestId, receipt);
+      if (!this.mutation(stored, `answer:${decisionId}`, body)) return this.view(stored);
       // An answer is input, not a change to how the run is held: the hold, and what a release does with it, stay.
       if (held) stored.ownerHalt = mark;
       decision.answer = body.text; decision.answeredBy = by; decision.answeredAt = timestamp();
       if (source) decision.source = source;
       const next = this.intentChecks.answerNote(stored, decision) ?? (held ? "The requesting member will continue in a new attempt when the team resumes." : "The requesting member will continue in a new attempt.");
       this.event(stored, by === "connector" ? `${decisionAnswerLabel(decision)} decision was recorded as delegated agent input. ${next}` : by === "coordinator" ? `A mission coordinator decision was recorded. ${next}` : `A user decision was recorded. ${next}`); this.save(stored);
+      // An owner answer is new direction no outstanding review saw; those requests are reviewed again under it or stay with the user.
+      if (by === "owner" && (run.permissionDecisions ?? []).some(item => ["pending", "reviewing", "approved", "answering"].includes(item.status)))
+        await this.invalidatePermissionDecisions(stored, "The owner answered a team question; a request reviewed before that answer remains with the user.", false);
       return this.view(stored);
     });
   }
@@ -2016,9 +2014,11 @@ export class TeamService {
     const body = teamActionSchema.parse(input);
     return this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
-      if (!run.permissions && !this.agentEligible(stored) && !run.permissionAgentDecisions?.length)
-        throw new TeamError(409, "permissions-not-enabled", "This team has no delegated permission policy to revoke.");
+      // A replay comes first, and a revoked run still has a delegation to revoke: revocation ends the agent's eligibility,
+      // so a run the agent alone served would refuse the retry of a revocation that was saved without its receipt.
       if (this.replay(stored, "revoke-permissions", body)) return this.view(stored);
+      if (!run.permissions && !run.permissionsRevokedAt && !this.agentEligible(stored) && !run.permissionAgentDecisions?.length)
+        throw new TeamError(409, "permissions-not-enabled", "This team has no delegated permission policy to revoke.");
       const receipt = this.admit(stored, "revoke-permissions", body);
       if (!receipt) return this.view(stored);
       // Set before the fence so no new delegated answer starts while it runs; a replay keeps the first time.

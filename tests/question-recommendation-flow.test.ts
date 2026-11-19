@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { waitFor } from "./helpers.js";
 import { scriptedMissionHarness as scripted } from "./mission-harness.js";
 import { recommendationLine } from "../packages/host/src/question-recommendation.js";
-import { createMissionReportEnvelope, createReportEnvelope } from "../packages/host/src/team-report-client.js";
+import { createMissionReportEnvelope, createReportEnvelope, submitMissionReport, submitTeamReport } from "../packages/host/src/team-report-client.js";
 import type { Mission } from "../packages/host/src/mission-types.js";
 
 const until = (read: () => Mission, accepts: (mission: Mission) => boolean) => waitFor(async () => read(), accepts, 60000);
@@ -19,6 +21,30 @@ test("a retry envelope is read in its recorded form but cannot skip the recommen
   assert.equal(createReportEnvelope({ requestId, runId, memberId, revision: 1, report: recommended }, team).requestId, requestId);
   assert.throws(() => createMissionReportEnvelope({ requestId, missionId: runId, memberId, revision: 1, report: question }, mission), /recommendation/);
   assert.equal(createMissionReportEnvelope({ requestId, missionId: runId, memberId, revision: 1, report: recommended }, mission).requestId, requestId);
+});
+
+test("a question still reaches a worker started before recommendations, without its recommendation", async () => {
+  // That worker holds the older strict schema in memory and answers 400 to the field it does not know.
+  const seen: { requestId: string; report: Record<string, unknown> }[] = [];
+  const worker = createServer((request, response) => {
+    let body = "";
+    request.on("data", chunk => { body += chunk; });
+    request.on("end", () => { seen.push(JSON.parse(body)); response.writeHead("recommendation" in seen.at(-1)!.report ? 400 : 204).end(); });
+  });
+  await new Promise<void>(resolve => worker.listen(0, "127.0.0.1", resolve));
+  try {
+    const runId = randomUUID(), memberId = randomUUID(), question = { kind: "question", question: "Which format?", options: ["JSON", "Text"] };
+    const env = { INFINITE_HOOK_URL: `http://127.0.0.1:${(worker.address() as AddressInfo).port}/hook`, INFINITE_HOOK_TOKEN: "capability",
+      INFINITE_TEAM_ASSIGNMENT: JSON.stringify({ runId, memberId, revision: 1 }), INFINITE_MISSION_ASSIGNMENT: JSON.stringify({ missionId: runId, memberId, revision: 1 }) };
+    for (const submit of [submitTeamReport, submitMissionReport]) {
+      seen.length = 0;
+      const recorded = await submit({ ...question, recommendation: { answers: ["JSON"], reason: "Clients parse it." } }, env);
+      assert.deepEqual(seen.map(envelope => "recommendation" in envelope.report), [true, false], "the question is sent once more without the field");
+      assert.deepEqual(recorded.report, question);
+      assert.equal(recorded.requestId, seen[1].requestId);
+      assert.notEqual(seen[0].requestId, seen[1].requestId, "a different report has a different identity");
+    }
+  } finally { worker.close(); }
 });
 
 test("a subteam's recommendation reaches the coordinator, whose forwarded question keeps its own, and the owner's answer records how it compared", { timeout: 60000 }, async () => {

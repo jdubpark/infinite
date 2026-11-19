@@ -46,13 +46,21 @@ test("an answer is recorded as matched, different, or other", () => {
   // A multiple selection arrives as numbered lines, in the order chosen.
   assert.equal(recommendationOutcome(options, both, "1. Files\n2. SQLite"), "matched");
   assert.equal(recommendationOutcome(options, both, "1. SQLite"), "different");
-  assert.equal(recommendationOutcome(options, both, "1. SQLite\n2. SQLite"), "different");
+  assert.equal(recommendationOutcome(options, both, "1. SQLite\n2. SQLite"), "other", "a selection names an option once");
   assert.equal(recommendationOutcome(options, one, "1. SQLite\nand keep a backup"), "other");
-  // An option may span lines, and two options may differ only in a space: the exact text decides.
+  // An option may span lines. An answer arrives trimmed, so options that differ only in surrounding spaces are one answer.
   const spanning = ["Keep\nboth", "Drop", "Drop "];
   assert.equal(recommendationOutcome(spanning, { answers: ["Keep\nboth", "Drop"], reason: "r" }, "1. Keep\nboth\n2. Drop"), "matched");
-  assert.equal(recommendationOutcome(spanning, { answers: ["Drop"], reason: "r" }, "Drop "), "different");
-  assert.equal(recommendationOutcome(spanning, { answers: ["Drop"], reason: "r" }, "Drop"), "matched");
+  assert.equal(recommendationOutcome(spanning, { answers: ["Drop "], reason: "r" }, "Drop"), "matched");
+  // An option that looks like numbered lines makes the text two selections: the host does not pick one.
+  const lookalike = ["A", "B", "A\n2. B"], pair = { answers: ["A", "B"], reason: "r" };
+  assert.equal(recommendationOutcome(lookalike, pair, "1. A\n2. B"), "other");
+  assert.equal(recommendationOutcome(lookalike, pair, "1. B\n2. A"), "matched");
+  // The work is bounded by the options, whatever the answer's length.
+  assert.equal(recommendationOutcome(["A", "A\n1. A"], { answers: ["A"], reason: "r" }, `${"1. A\n".repeat(900)}X`), "other");
+  // A selection is read as the client wrote it, so an option's own surrounding spaces do not hide it.
+  assert.equal(recommendationOutcome(["Drop ", "Keep"], { answers: ["Drop ", "Keep"], reason: "r" }, "1. Drop \n2. Keep"), "matched");
+  assert.equal(recommendationOutcome(["Drop ", "Keep"], { answers: ["Keep"], reason: "r" }, "1. Keep\r\n2. Drop"), "different");
   // Free text matches only word for word: the host does not judge whether words agree.
   const free = { answers: ["Keep the flag off"], reason: "r" };
   assert.equal(recommendationOutcome([], free, "Keep the flag off"), "matched");

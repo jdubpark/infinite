@@ -53,36 +53,29 @@ export function refineQuestion(report: Question & { answerMode?: QuestionAnswerM
   if (problem) context.addIssue({ code: "custom", path: [problem.path], message: problem.message });
 }
 
-const same = (left: string, right: string) => left.trim() === right.trim();
+/** An answer arrives trimmed, and a client may send its line ends either way. Option text is compared in the same form. */
+const plain = (text: string) => text.replace(/\r\n/g, "\n").trim();
 
-/**
- * The options a multiple selection names. It is written as numbered lines ("1. text") in the order chosen, each with
- * the option's text as the question gave it, which may itself span lines. Undefined when the text is not that.
- */
-function numberedOptions(options: readonly string[], text: string, chosen: readonly string[] = []): string[] | undefined {
-  if (!text) return chosen.length ? [...chosen] : undefined;
-  const number = /^\d+\. /.exec(text)?.[0];
-  if (!number) return undefined;
-  const rest = text.slice(number.length);
-  for (const option of options) {
-    const after = rest.startsWith(option) ? rest.slice(option.length) : undefined;
-    if (after === undefined || (after && after[0] !== "\n")) continue;
-    const found = numberedOptions(options, after.slice(1), [...chosen, option]);
-    if (found) return found;
-  }
-  return undefined;
+/** Every ordered choice of one or more different options. A question has four options at most, so 64 at most. */
+function orderedSelections(options: readonly string[], chosen: readonly string[] = []): string[][] {
+  return options.filter(option => !chosen.includes(option)).flatMap(option => [[...chosen, option], ...orderedSelections(options, [...chosen, option])]);
 }
 
 /**
- * The options an answer text selects: the option it equals, exactly before apart from surrounding spaces, or the
- * options of a multiple selection. Undefined when the text is neither.
+ * The options an answer selects, in their plain form. An answer is one option's text, or a multiple selection as a
+ * client writes it: numbered lines ("1. text") in the order chosen. The answer is compared with each selection written
+ * that way, so its length never drives the work. Undefined when the answer is neither, or reads as two different
+ * selections, as it can when one option's text looks like numbered lines. Options that differ only in surrounding
+ * spaces are one answer, because the answer's own were trimmed.
  */
 function selectedOptions(options: readonly string[], answer: string): Set<string> | undefined {
-  const whole = options.find(option => option === answer) ?? options.find(option => same(option, answer));
-  if (whole !== undefined) return new Set([whole]);
-  const lines = answer.replace(/\r\n/g, "\n");
-  const numbered = numberedOptions(options, lines) ?? numberedOptions(options, lines.trim());
-  return numbered && new Set(numbered);
+  const reply = plain(answer), distinct = [...new Set(options)];
+  const numbered = (selection: readonly string[]) => selection.map((option, index) => `${index + 1}. ${option}`).join("\n");
+  const readings = [
+    ...distinct.filter(option => plain(option) === reply).map(option => [option]),
+    ...orderedSelections(distinct).filter(selection => plain(numbered(selection)) === reply),
+  ].map(selection => [...new Set(selection.map(plain))].sort());
+  return new Set(readings.map(reading => JSON.stringify(reading))).size === 1 ? new Set(readings[0]) : undefined;
 }
 
 /**
@@ -91,11 +84,11 @@ function selectedOptions(options: readonly string[], answer: string): Set<string
  * free text agrees.
  */
 export function recommendationOutcome(options: readonly string[], recommendation: QuestionRecommendation, answer: string): RecommendationOutcome {
-  const recommended = recommendation.answers;
-  if (options.length === 0) return recommended.some(item => same(item, answer)) ? "matched" : "other";
+  const recommended = new Set(recommendation.answers.map(plain));
+  if (options.length === 0) return recommended.has(plain(answer)) ? "matched" : "other";
   const selected = selectedOptions(options, answer);
   if (!selected) return "other";
-  return selected.size === recommended.length && recommended.every(item => selected.has(item)) ? "matched" : "different";
+  return selected.size === recommended.size && [...recommended].every(item => selected.has(item)) ? "matched" : "different";
 }
 
 /** The one line every text surface prints for a recommendation. It names the agent, so it never reads as the owner's choice. */

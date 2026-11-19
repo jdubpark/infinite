@@ -59,19 +59,25 @@ export function createReportEnvelope(input: unknown, env: NodeJS.ProcessEnv = pr
   if (Buffer.byteLength(JSON.stringify(envelope)) > MAX_TEAM_REPORT_BYTES) throw new ReportError("Report exceeds 64 KiB.");
   return envelope;
 }
+/**
+ * A question without its recommendation. A worker started before recommendations existed keeps the older report schema
+ * in memory and answers 400 to a question that carries one. The reporter then sends the question once more without it,
+ * under its own request identity, so the member can still ask. That worker cannot record a recommendation.
+ */
+function questionForOlderWorker(report: { kind: string }): Record<string, unknown> | undefined {
+  if (report.kind !== "question" || !("recommendation" in report)) return undefined;
+  return Object.fromEntries(Object.entries(report).filter(([key]) => key !== "recommendation"));
+}
 /** HTTP 204 is sent by the worker only after its authenticated journal append has succeeded. */
 export async function submitTeamReport(input: unknown, env: NodeJS.ProcessEnv = process.env): Promise<TeamReportEnvelope> {
-  const { endpoint, token } = hookCapability(env, "team-report");
-  const envelope = createReportEnvelope(input, env);
-  let response: Response;
-  try {
-    response = await fetch(endpoint, {
-      method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-      body: JSON.stringify(envelope), signal: AbortSignal.timeout(10000), redirect: "error",
-    });
-  } catch {
-    // A rejection can follow a durable append whose acknowledgement was lost, so delivery stays unconfirmed, not failed.
-    throw new ReportError("Team report delivery was not confirmed: the report endpoint gave this process no answer. A sandbox or network policy may block local connections, or the acknowledgement was lost. Stop and request user attention; inspect this member's recorded report before retrying the identical report, and do not bypass or submit a different report.");
+  const { endpoint, token, binding } = hookCapability(env, "team-report");
+  let envelope = createReportEnvelope(input, env);
+  let response = await postTeamReport(endpoint, token, envelope);
+  const older = response.status === 400 ? questionForOlderWorker(envelope.report) : undefined;
+  if (older) {
+    await response.body?.cancel();
+    envelope = teamReportEnvelopeSchema.parse({ ...binding, report: older, requestId: reportIdentity({ ...binding, report: older }) });
+    response = await postTeamReport(endpoint, token, envelope);
   }
   if (response.status >= 400 && response.status < 500) {
     const detail = (await response.text()).trim().slice(0, 2000);
@@ -81,6 +87,17 @@ export async function submitTeamReport(input: unknown, env: NodeJS.ProcessEnv = 
   if (response.status !== 204)
     throw new ReportError(`Report refused or unconfirmed (${response.status}). Stop and inspect this member's recorded report; do not bypass the refusal or submit a different report.`);
   return envelope;
+}
+async function postTeamReport(endpoint: URL, token: string, envelope: TeamReportEnvelope): Promise<Response> {
+  try {
+    return await fetch(endpoint, {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify(envelope), signal: AbortSignal.timeout(10000), redirect: "error",
+    });
+  } catch {
+    // A rejection can follow a durable append whose acknowledgement was lost, so delivery stays unconfirmed, not failed.
+    throw new ReportError("Team report delivery was not confirmed: the report endpoint gave this process no answer. A sandbox or network policy may block local connections, or the acknowledgement was lost. Stop and request user attention; inspect this member's recorded report before retrying the identical report, and do not bypass or submit a different report.");
+  }
 }
 export function reportErrorMessage(error: unknown): string {
   if (error instanceof z.ZodError) return ("Invalid team report: " + error.issues.map(issue => `${issue.path.join(".") || "report"}: ${issue.message}`).join("; ")).slice(0, 2000);
@@ -136,12 +153,20 @@ export function createMissionReportEnvelope(input: unknown, env: NodeJS.ProcessE
 }
 /** HTTP 204 is sent by the worker only after its authenticated journal append has succeeded. */
 export async function submitMissionReport(input: unknown, env: NodeJS.ProcessEnv = process.env): Promise<MissionReportEnvelope> {
-  const { endpoint, token } = missionReportEnvironment(env);
-  const envelope = createMissionReportEnvelope(input, env);
-  const response = await fetch(endpoint, {
+  const { endpoint, token, binding } = missionReportEnvironment(env);
+  let envelope = createMissionReportEnvelope(input, env);
+  const post = (body: MissionReportEnvelope) => fetch(endpoint, {
     method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-    body: JSON.stringify(envelope), signal: AbortSignal.timeout(10000), redirect: "error",
+    body: JSON.stringify(body), signal: AbortSignal.timeout(10000), redirect: "error",
   });
+  let response = await post(envelope);
+  const older = response.status === 400 ? questionForOlderWorker(envelope.report) : undefined;
+  if (older) {
+    await response.body?.cancel();
+    const content = { report: older, ...(envelope.note === undefined ? {} : { note: envelope.note }) };
+    envelope = missionReportEnvelopeSchema.parse({ ...binding, ...content, requestId: reportIdentity({ ...binding, ...content }) });
+    response = await post(envelope);
+  }
   await response.body?.cancel();
   if (response.status !== 204)
     throw new ReportError(`Report refused or unconfirmed (${response.status}). Stop and inspect this attempt's recorded report; do not bypass the refusal or submit a different report.`);

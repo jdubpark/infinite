@@ -260,7 +260,8 @@ coordinator's `question` report requires its own recommendation through the
 report tool. A forwarded question without `answerMode` takes the subteam
 decision's mode, so the host checks the options and the recommendation against
 that final mode: one option unless the mode is `multiple`. A question from a
-coordinator started before this rule is still read, with no recommendation.
+coordinator started before this rule is still read, with no recommendation,
+and its reporter falls back the same way a team member's does.
 When the owner, a connector, or the coordinator's `answer-child` answers a
 mission decision, the host records `matched`, `different`, or `other` on its
 recommendation, as for team decisions. A connector reads the recommendation

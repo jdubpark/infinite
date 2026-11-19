@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -13,9 +13,39 @@ function trustable(cwd: string) {
 const isObject = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === "object" && !Array.isArray(value);
 
-/** A per-launch Codex override; nothing is written to the account's configuration. */
+function present(path: string) {
+  try { lstatSync(path); return true; }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return false;
+    throw new Error(`Cannot check ${path} for repository Codex configuration (${code ?? "error"})`);
+  }
+}
+
+/**
+ * The `.codex` entries a trusted Codex launch in `cwd` reads as project configuration: one in the folder itself or in
+ * any folder above it up to its Git root, of any file type. Without a Git root only the folder itself counts.
+ */
+export function repositoryCodexConfig(cwd: string): string[] {
+  const chain: string[] = [];
+  for (let dir = cwd; ; dir = dirname(dir)) {
+    chain.push(dir);
+    if (present(join(dir, ".git"))) break;
+    if (dirname(dir) === dir) { chain.length = 1; break; }
+  }
+  return chain.map(dir => join(dir, ".codex")).filter(present);
+}
+
+/**
+ * A per-launch Codex override; nothing is written to the account's configuration. In a trusted folder Codex loads the
+ * repository's `.codex` settings, hooks and exec policy, and starts its MCP server commands outside the command
+ * sandbox, so a member that commits one would change how every later Codex member runs. Such a folder is refused.
+ */
 export function codexTrustArgs(cwd: string): string[] {
   if (!trustable(cwd)) throw new Error("Workspace trust requires an absolute folder path");
+  const planted = repositoryCodexConfig(cwd);
+  if (planted.length)
+    throw new Error(`Codex member not started: the repository carries Codex project configuration (${planted.join(", ")}), which a trusted Codex launch would load. Remove it from the repository to start Codex members here.`);
   // A JSON string is a valid TOML basic string once control characters are excluded.
   return ["-c", `projects={${JSON.stringify(cwd)}={trust_level="trusted"}}`];
 }

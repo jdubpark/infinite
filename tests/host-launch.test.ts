@@ -1,14 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes, randomUUID } from "node:crypto";
 import { EGRESS_ENVIRONMENT_NAMES } from "../packages/host/src/egress.js";
 import { buildLaunch, headlessLaunch, headlessResumeProfile, missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "../packages/host/src/launch.js";
 import { addProjectIdToLaunchEnv } from "../packages/host/src/worker-env.js";
-import { claudeConfigPath, recordClaudeTrust } from "../packages/host/src/workspace-trust.js";
+import { claudeConfigPath, codexTrustArgs, recordClaudeTrust, repositoryCodexConfig } from "../packages/host/src/workspace-trust.js";
 import { DEFAULT_HOOKS, readConfig } from "../packages/host/src/config.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 
@@ -288,6 +288,50 @@ test("a trusted member folder reaches Codex as one per-launch override for that 
   // Claude has no per-launch trust flag, and untrusted launches carry no override.
   assert.ok(!buildLaunch("claude", { command: "claude", args: [] }, "p", hooks, relay, enabled, true, undefined, undefined, memberFolder).args.some(arg => arg.includes("trust_level")));
   assert.ok(!buildLaunch("codex", { command: "codex", args: [] }, "p", hooks, relay, enabled, true).args.some(arg => arg.startsWith("projects=")));
+});
+
+test("a trusted Codex launch refuses a folder whose repository carries Codex project configuration", () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "codex-config-gate-")));
+  try {
+    const repo = join(base, "repo"), member = join(repo, "packages", "app");
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    mkdirSync(member, { recursive: true });
+    const launch = (cwd: string) => buildLaunch("codex", { command: "codex", args: [] }, "p", hooks, relay, enabled, true, undefined, undefined, cwd);
+    assert.ok(launch(member).args.includes(`projects={${JSON.stringify(member)}={trust_level="trusted"}}`));
+
+    // Above the Git root is outside the project: Codex reads no project configuration there.
+    mkdirSync(join(base, ".codex"));
+    assert.deepEqual(repositoryCodexConfig(member), []);
+
+    // At the Git root, in between, or in the folder itself, in any file type.
+    mkdirSync(join(repo, ".codex"));
+    writeFileSync(join(repo, ".codex", "config.toml"), 'model = "planted"\n');
+    assert.throws(() => launch(member), (error: Error) => error.message.includes(join(repo, ".codex")) && /Codex member not started/.test(error.message));
+    assert.throws(() => launch(repo), /Codex project configuration/);
+    rmSync(join(repo, ".codex"), { recursive: true });
+    writeFileSync(join(repo, "packages", ".codex"), "");
+    assert.deepEqual(repositoryCodexConfig(member), [join(repo, "packages", ".codex")]);
+    rmSync(join(repo, "packages", ".codex"));
+    symlinkSync(join(base, "missing"), join(member, ".codex"));
+    assert.throws(() => codexTrustArgs(member), /Codex project configuration/);
+    rmSync(join(member, ".codex"));
+    assert.deepEqual(repositoryCodexConfig(member), []);
+
+    // A worktree's `.git` file marks the root too, and a folder with no Git root counts only itself.
+    const worktree = join(base, "worktree");
+    mkdirSync(worktree);
+    writeFileSync(join(worktree, ".git"), "gitdir: elsewhere\n");
+    assert.deepEqual(repositoryCodexConfig(worktree), []);
+    mkdirSync(join(worktree, ".codex"));
+    assert.deepEqual(repositoryCodexConfig(worktree), [join(worktree, ".codex")]);
+
+    // A folder the host cannot inspect is refused, not trusted.
+    if (process.getuid?.() !== 0) {
+      chmodSync(repo, 0);
+      try { assert.throws(() => codexTrustArgs(member), /Cannot check/); }
+      finally { chmodSync(repo, 0o755); }
+    }
+  } finally { rmSync(base, { recursive: true, force: true }); }
 });
 
 test("Claude trust adds one exact folder entry and leaves the rest of its config unchanged", () => {

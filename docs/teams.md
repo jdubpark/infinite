@@ -2898,6 +2898,17 @@ member would load what an earlier member wrote. A repository's own
 `CLAUDE.md` instructions still load. A profile
 that sets `--setting-sources` cannot launch a Claude team role.
 
+A trusted Codex launch loads the repository's `.codex` configuration: its
+settings, hooks and exec policy, and MCP servers whose commands run outside the
+command sandbox. A member that commits one would change how every later Codex
+member runs. So when a `.codex` entry of any type exists in a Codex member's
+folder, or in a folder above it up to the Git root, the host does not start that
+member and names the path in the session's exit reason. A folder the host cannot
+inspect is refused the same way. Remove the entry from the repository to start
+Codex members there. The check runs at every launch, so it does not cover a file
+written between the check and Codex's start, or the agent account's own Codex
+configuration.
+
 Trust still lets Codex apply a project Codex configuration in member folders.
 Team members can edit that file, and later Codex members load the integrated
 result. Review it like the rest of a run's changes. Tool permission prompts,

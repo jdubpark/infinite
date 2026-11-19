@@ -28,11 +28,24 @@ struct TeamMutation: Equatable {
     private var displayVisible = false
     /// `run` came from `/teams/:id` or a mutation result, not from a team list row.
     private var detailed = false
-    /// The highest revision a team list row has reported for this run.
-    private var listedRevision = 0
-    /// The team list has reported a revision past the full read held here. A request names `run.revision`, so the
-    /// host would refuse one sent now.
-    var behind: Bool { detailed && listedRevision > run.revision }
+    /// The newest team list row seen for a run read in full.
+    private var listed: TeamRun?
+    /// Set while the one early read of a shown page is under way.
+    private var refreshToken: UUID?
+    /// The team list has reported a later state that differs from the full read held here in what controls are
+    /// decided from. A request sent now would name a revision the host has left, or act on a status it no longer has.
+    var behind: Bool {
+        guard detailed, let listed, Self.later(listed, than: run) else { return false }
+        return Self.controlState(listed) != Self.controlState(run)
+    }
+    /// What this page's controls and a list's Resume are decided from. A team list row carries all of it.
+    private static func controlState(_ run: TeamRun) -> [JSON] {
+        [.number(Double(run.revision)), .string(run.status), .string(run.missionID), .bool(run.value["continuable"].bool), .bool(run.value["resumable"].bool),
+         .bool(run.value["goal"] != .null), .bool(run.value["deliveryReceipt"] != .null), .bool(run.value["pullRequest"] != .null)]
+    }
+    private static func later(_ next: TeamRun, than run: TeamRun) -> Bool {
+        next.revision > run.revision || (next.revision == run.revision && next.updatedAt > run.updatedAt)
+    }
     private var pollGeneration = UUID()
     private lazy var freshness = DisplayFreshness { [weak self] in self?.displayStale = $0 }
     init(run: TeamRun, client: RemoteClient, role: String) { self.run = run; self.client = client; self.role = role }
@@ -44,18 +57,28 @@ struct TeamMutation: Equatable {
         if next != run { run = next }
     }
     /// A team list row omits what only this page shows: the request, check output and member reports. It seeds a run
-    /// not yet read in full and never replaces a full read. A row of a later revision puts the full read behind:
-    /// controls wait, and a shown page reads the run at once. A later row of the same revision marks only a hidden
-    /// page's read out of date; a shown page takes that change from its own poll, within two seconds.
+    /// not yet read in full and never replaces a full read. A later row that changes the revision, the status or what
+    /// the run is eligible for puts the full read behind: controls wait, and a shown page reads the run at once. Any
+    /// other later row marks only a hidden page's read out of date; a shown page takes that change from its own poll.
     func observeListRow(_ next: TeamRun) {
         guard supersedes(next) else { return }
         guard detailed else { if next != run { run = next }; return }
-        listedRevision = max(listedRevision, next.revision)
+        if listed.map({ !Self.later($0, than: next) }) ?? true { listed = next }
         let shown = pageShown && displayVisible
         if behind {
             if fresh { fresh = false }
-            if shown { Task { await self.poll() } }
-        } else if !shown, next.updatedAt > run.updatedAt, fresh { fresh = false }
+            if shown { refreshSoon() }
+        } else if !shown, Self.later(next, than: run), fresh { fresh = false }
+    }
+    /// One read ahead of the two-second poll. Rows that arrive while it is under way start no second one.
+    private func refreshSoon() {
+        guard refreshToken == nil else { return }
+        let token = UUID(), generation = pollGeneration
+        refreshToken = token
+        Task { [weak self] in
+            await self?.poll(generation)
+            if self?.refreshToken == token { self?.refreshToken = nil }
+        }
     }
     private func supersedes(_ next: TeamRun) -> Bool {
         next.revision > run.revision || (next.revision == run.revision && next.updatedAt >= run.updatedAt)
@@ -76,7 +99,7 @@ struct TeamMutation: Equatable {
     }
     private func updatePolling() {
         guard pageShown && displayVisible else {
-            pollGeneration = UUID(); pollTask?.cancel(); pollTask = nil
+            pollGeneration = UUID(); pollTask?.cancel(); pollTask = nil; refreshToken = nil
             return
         }
         guard pollTask == nil else { return }
@@ -95,11 +118,11 @@ struct TeamMutation: Equatable {
         await poll(pollGeneration)
     }
     private func poll(_ generation: UUID) async {
-        guard displayVisible else { return }
+        guard displayVisible, generation == pollGeneration else { return }
         do {
             let value = try await client.request("/teams/\(run.id)")
             guard displayVisible, generation == pollGeneration else { return }
-            // A read that started before the list reported a later revision is already out of date.
+            // A read that started before the list reported a later state is already out of date.
             observe(TeamRun(value)); let current = !behind; if fresh != current { fresh = current }; freshness.recovered()
         } catch {
             guard displayVisible, generation == pollGeneration else { return }

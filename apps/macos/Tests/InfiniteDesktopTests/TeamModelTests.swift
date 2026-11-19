@@ -3,8 +3,8 @@ import InfiniteCore
 @testable import InfiniteDesktop
 
 @MainActor final class TeamModelTests: XCTestCase {
-    private func run(_ updatedAt: String, revision: Double = 1, objective: String? = nil) -> TeamRun {
-        var fields: [String: JSON] = ["id": .string("run-1"), "revision": .number(revision), "updatedAt": .string(updatedAt), "status": .string("implementing")]
+    private func run(_ updatedAt: String, revision: Double = 1, status: String = "implementing", objective: String? = nil) -> TeamRun {
+        var fields: [String: JSON] = ["id": .string("run-1"), "revision": .number(revision), "updatedAt": .string(updatedAt), "status": .string(status)]
         if let objective { fields["objective"] = .string(objective) }
         return TeamRun(.object(fields))
     }
@@ -19,17 +19,19 @@ import InfiniteCore
         XCTAssertEqual(model.run, row)
     }
 
-    func testARowOfALaterRevisionPutsAFullReadBehindUntilTheRunIsReadAgain() {
+    func testARowThatChangesWhatControlsUsePutsAFullReadBehindUntilTheRunIsReadAgain() {
         let model = model(run("2026-01-01T00:00:00.000Z", revision: 3))
         XCTAssertFalse(model.behind, "a row seed is not a full read")
         model.observe(run("2026-01-01T00:01:00.000Z", revision: 3, objective: "The request."))
         model.observeListRow(run("2026-01-01T00:02:00.000Z", revision: 3))
-        XCTAssertFalse(model.behind, "a later row of the same revision leaves requests valid")
-        model.observeListRow(run("2026-01-01T00:03:00.000Z", revision: 4))
+        XCTAssertFalse(model.behind, "a later row with the same revision and status leaves the controls valid")
+        model.observeListRow(run("2026-01-01T00:03:00.000Z", revision: 3, status: "blocked"))
+        XCTAssertTrue(model.behind, "the page would still offer the controls of a working run")
+        model.observe(run("2026-01-01T00:03:00.000Z", revision: 3, status: "blocked", objective: "The request."))
+        XCTAssertFalse(model.behind)
+        model.observeListRow(run("2026-01-01T00:04:00.000Z", revision: 4, status: "blocked"))
         XCTAssertTrue(model.behind, "a request naming revision 3 would be refused")
         XCTAssertEqual(model.run.revision, 3)
-        model.observe(run("2026-01-01T00:03:00.000Z", revision: 4, objective: "The request."))
-        XCTAssertFalse(model.behind)
     }
 
     func testAListRowNeverReplacesAFullRead() {

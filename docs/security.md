@@ -35,9 +35,13 @@ trust and persistent allow rules remain outside delegation. An owner who sets
 their own folders. Claude team launches load no project or local settings file
 (`--setting-sources user`), so hooks, allow rules and MCP servers that an
 earlier member committed to `.claude/settings.json` or `.mcp.json` never apply
-to a later member. Codex
-members may still load a project Codex configuration that earlier members
-edited. Headless OpenCode
+to a later member. A trusted Codex member does not start while its folder, or
+any folder above it up to the Git root, holds a `.codex` entry, so Codex
+settings, hooks and MCP servers that an earlier member committed do not reach
+it. That check runs just before the launch, so a file written in the moment
+between the check and Codex's start is not caught. Both checks cover what the
+repository carries, not the agent account's own provider configuration, which
+any agent-account process can edit. Headless OpenCode
 rejects unmet permissions instead of providing an interactive approval flow. Profile `dataUse` labels disclose
 configured contributor use without changing provider terms or retention. See
 [Goals and agent teams](teams.md) for scope, routing, limits, and recovery.

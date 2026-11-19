@@ -35,9 +35,13 @@ trust and persistent allow rules remain outside delegation. An owner who sets
 their own folders. Claude team launches load no project or local settings file
 (`--setting-sources user`), so hooks, allow rules and MCP servers that an
 earlier member committed to `.claude/settings.json` or `.mcp.json` never apply
-to a later member. Codex
-members may still load a project Codex configuration that earlier members
-edited. Headless OpenCode
+to a later member. A trusted Codex member does not start while its folder, or
+any folder above it up to the Git root, holds a `.codex` entry, so Codex
+settings, hooks and MCP servers that an earlier member committed do not reach
+it. That check runs just before the launch, so a file written in the moment
+between the check and Codex's start is not caught. Both checks cover what the
+repository carries, not the agent account's own provider configuration, which
+any agent-account process can edit. Headless OpenCode
 rejects unmet permissions instead of providing an interactive approval flow. Profile `dataUse` labels disclose
 configured contributor use without changing provider terms or retention. See
 [Goals and agent teams](teams.md) for scope, routing, limits, and recovery.
@@ -314,7 +318,7 @@ Use encrypted off-host backups with restore testing. Keep the backup decryption 
 - Signal payloads can contain commands and file contents. They are journaled encrypted like the rest of the recording and shown only to paired roles.
 - Transcript bytes reach the worker only through the authenticated hook relay, which runs as the agent and reads only a regular `.jsonl` file the provider's own hook named, and for Claude Code the subagent transcript files in that session's `subagents` folder, for their usage only. After a provider exits, the same relay runs once more in drain mode; on the Ubuntu deployment that runs through the root-owned `transcript-drain` wrapper, which takes no arguments, and the worker's authenticated reply names the file. The path checks do not change for the drain. These path checks prevent accidental reads. They are not a boundary against the agent's own account, which can read the same files. The worker records them as `message` events in the encrypted journal, so chat carries the same plaintext the provider already stores in its home. On the Linux deployment the hook variables must be in sudo's `env_keep`, or hooks and transcripts never leave the agent account.
 - The process census looks for processes left by an earlier API process after a restart. The host reads the process table itself and inspects processes of its own account. On the Ubuntu deployment it inspects the agent account through the root-owned `process-census` wrapper, which takes no arguments, takes its directory on standard input, and reads the working directories, open files and command lines of that account's processes. It reports only process ids and a reason, and it never signals, stops or changes a process. Its output crosses an account boundary and is validated before use. A process that refuses inspection is reported as such, and the host then says it cannot tell. The census is evidence about left-over processes; it is not a defense against a process of the agent account that hides on purpose or interferes with the census.
-- Chat summaries send recorded messages to the configured external model (`summaries`). With `jev` configured, the host can also send candidate sentences from an agent's last message and the clipped first line of a long default-titled prompt to TypeSafe; the summary writer's provider receives that prompt only when Jev finds its clipped first line unclear. A team run's long untitled request is handled the same way, except that local paths and file URLs are removed before either model sees it and, with no `jev` configured, the request goes to the summary writer directly. Configure `jev` with an absolute `apiKeyFile` to a private 0600 file outside the state directory, and optional `model` (default `jev-latest`) and `baseUrl` (default TypeSafe API URL). The summary writer's key file follows the same private-file rule. Provider retention policies remain separate boundaries. With no `jev` key configured, no TypeSafe calls occur. With `intake.slack.classify` on, the host also sends the owner's own Slack mention text, cut to 1,000 characters, to TypeSafe so the reading can choose between an answer and a request; nothing else from the thread, and no text from anyone else, is sent. Setting `jev.sessionReadings` to `false` (default `true`) stops both session flows, the last-message sentences and the clipped prompt line, and leaves only the intake route reading; the long-title question then goes to the summary writer directly.
+- Chat summaries send recorded messages to the configured external model (`summaries`). With `jev` configured, the host can also send candidate sentences from an agent's last message and the clipped first line of a long default-titled prompt to TypeSafe; the summary writer's provider receives that prompt only when Jev finds its clipped first line unclear. A team run's long untitled request is handled the same way, except that local paths and file URLs are removed before either model sees it and, with no `jev` configured, the request goes to the summary writer directly. Configure `jev` with an absolute `apiKeyFile` to a private 0600 file outside the state directory, and optional `model` (default `jev-latest`) and `baseUrl` (default TypeSafe API URL). The summary writer's key file follows the same private-file rule. Provider retention policies remain separate boundaries. With no `jev` key configured, no TypeSafe calls occur. With `intake.slack.classify` on, the host also sends the owner's own Slack request text, cut to 1,000 characters, to TypeSafe so the reading can choose between an answer and a request; nothing else from the thread, and no text from anyone else, is sent. Setting `jev.sessionReadings` to `false` (default `true`) stops both session flows, the last-message sentences and the clipped prompt line, and leaves only the intake route reading; the long-title question then goes to the summary writer directly.
 - Speech recognition runs in the platform's recognizer (Apple, Google, or the browser vendor), which may process audio on its own servers. With `dictation` configured, the transcript text goes to that model with `store: false`. Leave the block unset to send no transcripts to a model; clients then insert raw transcripts.
 - Confidential VMs can narrow provider/hypervisor threats, but they do not protect against compromised software inside the trusted guest. Attestation and external key release would be a separate security project, not a box to check on this service. [Confidential VM model](https://docs.cloud.google.com/confidential-computing/confidential-vm/docs/about-cvm).
 
@@ -353,13 +357,21 @@ Slack surface:
   `intake.linear.creatorId`. When a Slack thread is required, the thread must also
   hold a message from the owner's Slack user ID, `intake.slack.ownerUserId`, that
   mentions Linear's agent and was sent before the issue was filed. A direct
-  request, with `intake.slack.directRequests` on, starts only from an `app_mention`
-  of the bot by that Slack user in the configured workspace, with no bot ID. With
-  `intake.linear.admitIssues` false, the first route is off.
-- The bot acts only on `app_mention` events from the owner's Slack user in a thread
-  bound to a record. A mention or reply from anyone else in a bound thread is
-  dropped before anything is stored; the surface keeps only a count of dropped
-  events. Nothing from that message reaches the record, the mission, or an agent.
+  request, with `intake.slack.directRequests` on, starts from the owner's
+  mention of the bot in the configured workspace. In a configured request
+  channel, the owner's ordinary top-level message or explicit instruction to
+  take on a proposal can start the same flow. With `intake.linear.admitIssues`
+  false, the first route is off.
+- Only the configured owner's messages can answer, steer, or control a
+  mission. With `intake.slack.ownerOnlyInJoinedChannels` enabled, sender
+  identity gates every inbound response, including proposal reactions and
+  status replies. The policy applies to mentions and ordinary messages in
+  all joined public and private channels. With shared proposal channels enabled,
+  a teammate can receive a fixed 👀 reaction
+  on their proposal and ask for status in a bound thread. The public status
+  comes from that thread's records and contains counts and state. The host
+  neither stores the teammate's proposal text on arrival nor sends their
+  status request to a model. Channel membership grants no mission controls.
 - The thread the issue links is read once, at admission. The objective keeps only
   the owner's own messages from it. Messages from anyone else, and bot messages,
   are read at admission to check authorship and are not stored, shown to agents,
@@ -367,11 +379,11 @@ Slack surface:
   after an uncertain send; it stores nothing from that read.
 - For a direct request, other people's messages are read, because the owner's
   decision of 2026-11-14 is that they reach agents. The messages in the thread
-  at the time of the mention, sent no later than the mention, are put in the
+  through the owner's request are put in the
   mission objective, stored with the mission, and shown to agents. They are not
   logged, not copied into the Linear issue or any comment, and not posted to
   Slack. The host reads the thread when it files the request, and again if
-  filing is retried. It keeps messages whose timestamp is at or before the mention
+  filing is retried. It keeps messages whose timestamp is at or before the owner's request
   and discards later ones before anything is stored, passed to an agent, shown, or
   logged. A message edited before the read appears with its edited text. The
   tracker receives only the owner's text and the Slack link, and fixed receipts for
@@ -383,9 +395,10 @@ Slack surface:
 - A skipped issue's title and description are not stored. Its record keeps the
   issue's IDs, URL, times, and skip reason, and no text from the issue.
 
-The bot posts only into the thread a record is bound to. Every outbound Slack
-function takes an intake record and reads its thread; none takes a channel ID
-from an inbound event. Linear comments go only to the issue whose record they
+The bot posts messages only into the thread a record is bound to. A proposal
+reaction targets the original Slack message in a configured request channel.
+Everyone who can read that channel can read the questions and results posted
+there. Linear comments go only to the issue whose record they
 belong to. Neither surface changes a Linear issue's state, assignee, or labels,
 and neither approves a provider permission or marks work complete. Results are
 labelled as agent reports.
@@ -417,7 +430,7 @@ places: a mission service refusal (`TeamError`), a Slack request failure
 Residual risk: the objective carries the Linear title and description, and the
 owner's Slack messages, to the coordinator and subteams. For a direct request it
 also carries the other people's text in the thread, so anyone who can post in a
-thread where the owner mentions the bot can put words in front of agents. Agent reports posted in the
+thread where the owner starts a request can put words in front of agents. Agent reports posted in the
 thread may restate thread content, and pull requests the agents open are written by
 the agents. Anyone
 who can edit the issue before it is admitted can put instructions in its title or
@@ -428,12 +441,12 @@ guarantee, and it does not stop an injected request from the owner's own account
 
 ### Answers and the route
 
-With `intake.slack.answerQuestions` on, the first host action for an owner's mention
+With `intake.slack.answerQuestions` on, the first host action for an owner's Slack request
 can be chosen by a model reading. The bounds:
 
 - The owner's word wins. A mention that starts with `ask:` or `work:` takes that route
   and the reading is never asked.
-- Eligibility is fixed when the mention is saved. Only a record saved with
+- Eligibility is fixed when the request is saved. Only a record saved with
   `answerQuestions` on is routed or read by the reading service; a request saved
   before the setting was on stays work, including one whose Linear filing is
   pending, so reconciliation of an issue Linear may already hold is never
@@ -442,7 +455,7 @@ can be chosen by a model reading. The bounds:
   and a missing, failed, or slow (over six seconds) reading routes to work, which is
   the route that already existed. A reading can send a request to the answer route
   only when it is confident of an answer or unsure.
-- The only text sent to the reading service is the owner's own mention text, cut to
+- The only text sent to the reading service is the owner's own Slack request text, cut to
   1,000 characters, and only with `intake.slack.classify` on. Thread messages, other
   people's text, and bot text are never sent. The call is made in the intake cycle,
   not in the Slack event handler.

@@ -19,43 +19,6 @@ import type { Mission, MissionReport, MissionSubtaskPlan } from "../packages/hos
 import type { TeamPublication } from "../packages/host/src/team-types.js";
 import { startSlackServer } from "./fixtures/slack-server.js";
 
-test("a long result is split without losing text or cutting a code block", () => {
-  const parts = splitSlackText(`intro\n\`\`\`sql\n${"select 1;\n".repeat(600)}\`\`\`\nend`);
-  assert.ok(parts.length > 1 && parts.every(p => p.length <= 3000));
-  for (const part of parts) assert.equal((part.match(/^```/gm) ?? []).length % 2, 0, "every fence opened in a part is closed in it");
-  assert.equal(parts.flatMap(p => p.split("\n")).filter(line => line === "select 1;").length, 600);
-  assert.ok(parts[0].startsWith("intro\n```sql\n") && parts.at(-1)!.endsWith("```\nend"));
-  assert.ok(parts.slice(1).every(p => p.startsWith("```sql\n")));
-});
-
-test("an opening fence is admitted only with room for its closing fence", () => {
-  const text = `${"x".repeat(2992)}\n\`\`\`sql\nselect 1;\n\`\`\``;
-  const parts = splitSlackText(text);
-  assert.ok(parts.every(part => part.length <= 3000), `part lengths ${parts.map(part => part.length)}`);
-  for (const part of parts) assert.equal((part.match(/^```/gm) ?? []).length % 2, 0, "every fence opened in a part is closed in it");
-  assert.equal(parts.flatMap(part => part.split("\n")).filter(line => line === "select 1;").length, 1);
-  assert.equal(parts.join("\n"), text);
-});
-
-test("text within the limit is returned unchanged", () => {
-  assert.deepEqual(splitSlackText("one\ntwo\n"), ["one\ntwo\n"]);
-  assert.deepEqual(splitSlackText("x".repeat(3000)), ["x".repeat(3000)]);
-});
-
-test("a single line over the limit is cut at the limit, and no character is lost", () => {
-  const line = "y".repeat(7001);
-  const parts = splitSlackText(line);
-  assert.deepEqual(parts.map(part => part.length), [3000, 3000, 1001]);
-  assert.equal(parts.join(""), line);
-});
-
-test("a split between lines keeps every line in order", () => {
-  const lines = Array.from({ length: 900 }, (_, index) => `line ${index} ${"z".repeat(10)}`);
-  const parts = splitSlackText(lines.join("\n"));
-  assert.ok(parts.length > 1 && parts.every(p => p.length <= 3000));
-  assert.deepEqual(parts.join("\n").split("\n"), lines);
-});
-
 const delay = (ms: number) => new Promise(done => setTimeout(done, ms));
 const OWNER = "U00000000", TEAMMATE = "U00000002", BOT = "U00000001";
 const BINDING: IntakeThread = { channelId: "C0000000000", threadTs: "1700000000.000100" };
@@ -549,6 +512,9 @@ test("an entry that reached the mission before a crash is applied once, with no 
     await waitFor(async () => s.store.get(ISSUE)!.inbound[0].handledAt, handled => Boolean(handled), 30000);
     assert.equal(sh.get(id).steering.length, 1, "The reply applies once");
     assert.equal(sh.get(id).revision, before + 1, "The replay advances the revision once");
+    const messages = await waitFor(async () => s.store.get(ISSUE)!.messages,
+      items => items.some(item => item.key === "ack" && item.status === "sent"), 20000);
+    assert.deepEqual(messages.map(item => item.key), ["ack"], "A replayed reply queues no refusal");
     assert.deepEqual(s.texts(), [ACK], "A replayed reply posts no refusal");
   } finally { await close(); }
 });

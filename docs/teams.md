@@ -2898,9 +2898,21 @@ member would load what an earlier member wrote. A repository's own
 `CLAUDE.md` instructions still load. A profile
 that sets `--setting-sources` cannot launch a Claude team role.
 
-Trust still lets Codex apply a project Codex configuration in member folders.
-Team members can edit that file, and later Codex members load the integrated
-result. Review it like the rest of a run's changes. Tool permission prompts,
+A trusted Codex launch loads the repository's `.codex` configuration: its
+settings, hooks and exec policy, and MCP servers whose commands run outside the
+command sandbox. A member that commits one would change how every later Codex
+member runs. So when a `.codex` entry of any type exists in a Codex member's
+folder, or in a folder above it up to the Git root, the host does not start that
+member and names the path in the session's exit reason. A folder the host cannot
+inspect is refused the same way. The launch pins `project_root_markers` to
+`.git`, so Codex finds the same root as the check. Remove the entry from the
+repository to start Codex members there. The check runs just before each
+launch. It does not cover a file written between the check and Codex's start,
+the agent account's own Codex configuration, or a managed Codex configuration
+that sets other root markers.
+
+Review a run's changes to `.codex`, `.claude` and `.mcp.json` before merging
+them: they apply to whoever opens the repository next. Tool permission prompts,
 delegation limits and the root ownership rules above are unchanged; sessions
 outside team runs never receive this trust.
 

@@ -1,6 +1,6 @@
 # Review feedback returns to delivered work (INF-324)
 
-Date: 2026-11-19. Status: design for review, fourth draft. An independent reviewer read the first three drafts. The corrections made after its third read have not been reviewed again: the order of the receipt lookup and the GitHub check (sections 3 and 5), the delivery recovery record (section 4), and the wording of the counts. Nothing is built. The design recommends not building it yet: the host's records hold no run this design would watch (see "How often it would fire"). Six decisions at the end are the owner's.
+Date: 2026-11-19. Status: design for review, fourth draft. An independent reviewer read four drafts. Its fourth read found the third's four findings resolved and asked for one statement, added here and not reviewed again: a review counts as current at the host's last read of GitHub. Nothing is built. The design recommends not building it yet: the host's records hold no run this design would watch (see "How often it would fire"). Six decisions at the end are the owner's.
 
 ## Intent
 
@@ -99,6 +99,8 @@ Pending intents are drained at startup and at every poll, whatever the run's sta
 3. Otherwise makes the call with the saved payload and acknowledges it.
 
 A call that cannot run yet, because the mission is paused, leaves the intent `pending`. `refused` records only the destination's final answer. The accepted text is never replaced by a later edit of the review.
+
+GitHub and the host's record cannot change together. A review counts as current at the host's last successful read of GitHub. An approval or a dismissal after that read, and before the steer runs, does not stop the steer. The same holds for the check before a mission's forward (section 5).
 
 **A defect in `steer` must be fixed first (INF-331).** Today `steer` writes its request receipt (`teams.ts:1699`) and then waits for the permission invalidation, which saves the run (`teams.ts:2037`, `:2048`) before the revision and the text change (`:1706`). A host that stops between those saves keeps the receipt without the steer, and a repeated request id is then answered as if it had been applied. The fix records the receipt in the same save that advances the revision. Without it the three steps above do not apply a review exactly once.
 
@@ -208,7 +210,7 @@ Steps 2 and 4 change the run and mission state machines and go to a strong imple
 | 2 | Inline comments: add a narrow proxy read for a review's comments now, or ship summary-only first? | Summary-only first, and say so in the pull request description the delivery member writes. The proxy holds the installation token, so a new read deserves its own review and its own deploy |
 | 3 | After the workspace is removed: restore it from the published branch, or stop taking reviews? | Stop in the first build. Restoring needs a fetch of a non-base ref into the mirror and a proof that the fetched commit is the recorded one. Build it when a review is actually lost to retention |
 | 4 | A changes-requested review that is already on a pull request when the feature is turned on: act on it, or ignore it? | Ignore it, counting from the last time the feature was switched on. Turning a switch on should not start work on old pull requests |
-| 5 | You approve or dismiss your review after it reached the coordinator and before the coordinator forwarded it: does the forward still run? | No. The host checks GitHub once more immediately before it steers the subteam, and ends the forward as superseded. For a run you started directly the steer follows acceptance at once. If a halt holds it, the same check runs before the steer is made |
+| 5 | You approve or dismiss your review after it reached the coordinator and before the coordinator forwarded it: does the forward still run? | No, when the host's last read of GitHub shows it. The host checks GitHub once more immediately before it steers the subteam, and ends the forward as superseded. A change after that read does not stop the steer. For a run you started directly the steer follows acceptance at once. If a halt holds it, the same check runs before the steer is made |
 
 The first draft asked whether a review on a mission's pull request should go straight to the subteam. It does not: on 2026-10-20 the owner set the rule that owner input for a mission goes to the coordinator, and this design follows it.
 

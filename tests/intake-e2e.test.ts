@@ -112,7 +112,7 @@ test("a question reaches the thread and the owner's tagged reply answers it", { 
 
     await waitFor(async () => texts(), list => list.some(text => text.startsWith("Started on TEST-1")), 60000);
     const question = await waitFor(async () => texts(), list => list.some(text => text.startsWith("**Q1: The API subteam asks: Which response format should the endpoint use?**")), 120000);
-    assert.ok(question.some(text => text === "**Q1: The API subteam asks: Which response format should the endpoint use?**\n\n1. JSON\n2. Text\n\nChoose below, or reply with a mention and your answer."));
+    assert.ok(question.some(text => text === "**Q1: The API subteam asks: Which response format should the endpoint use?**\n\nThe asking agent recommends: JSON. Reason: The subteam recommends it, and the web client parses JSON.\n\n1. JSON (recommended)\n2. Text\n\nChoose below, or reply with a mention and your answer."));
 
     const { body: before } = await host.fetchApi("/intake");
     const missionId = before.records[0].missionId as string;
@@ -127,6 +127,7 @@ test("a question reaches the thread and the owner's tagged reply answers it", { 
       mission => mission.decisions.some((item: { answer?: string }) => item.answer === "JSON"), 60000);
     await waitFor(async () => texts(), list => list.includes("Received your answer to Q1."), 30000);
     assert.ok(answered.decisions.some((item: { answer?: string }) => item.answer === "JSON"), "The mission decision holds the owner's answer");
+    assert.equal(answered.decisions.find((item: { answer?: string }) => item.answer === "JSON")?.recommendation?.outcome, "matched");
     assert.notEqual(answered.status, "ready-for-review");
 
     // The record keeps the reply as handled; read from the sealed record, since the API does not expose inbound entries.

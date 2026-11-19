@@ -16,6 +16,9 @@ EVAL_HOME=/var/lib/infinite-eval/home
 TEMPLATE=/usr/local/share/infinite-eval/home
 EVAL_TMP=/var/lib/infinite-eval/tmp
 LOGIN_PATHS=".claude/.credentials.json .codex/auth.json .local/share/opencode/auth.json"
+# The world-writable directories where the account can leave files. stop empties them of the account's files, and the
+# probe counts what remains. A directory that does not exist is skipped.
+STOP_DIRS="/tmp /var/tmp /dev/shm /dev/mqueue /run/lock /var/crash"
 TRIALS=$ROOT/trials
 TRIAL_DIR=
 REAL_TRIAL=
@@ -60,7 +63,7 @@ valid_count() {
 tools_present() {
   for tool in /usr/bin/timeout /usr/bin/prlimit /usr/bin/env /usr/bin/git /usr/bin/realpath /usr/bin/find \
     /usr/bin/cmp /usr/bin/head /usr/bin/stat /usr/bin/cp /usr/bin/chmod /usr/bin/rm /usr/bin/mv /usr/bin/sleep \
-    /usr/bin/id /usr/bin/wc /bin/mkdir /bin/bash; do
+    /usr/bin/id /usr/bin/wc /usr/bin/ipcs /usr/bin/ipcrm /bin/mkdir /bin/bash; do
     if [ ! -x "$tool" ]; then
       return 1
     fi
@@ -100,6 +103,7 @@ setup_trial() {
 
 # Sets CWD_TRIAL to the trial whose work directory, or a directory below it, is the current directory, or refuses.
 cwd_trial() {
+  if [ -L "$TRIALS" ]; then refuse; fi
   real=$(/usr/bin/realpath -e -- .) || refuse
   case "$real" in
     "$ROOT"/trials/*/work|"$ROOT"/trials/*/work/*) ;;
@@ -110,12 +114,19 @@ cwd_trial() {
   valid_trial "$CWD_TRIAL" || refuse
 }
 
-# Runs git with the fixed Git environment under a time limit of $1 seconds. NAME=VALUE arguments before the git
-# path are passed to the child; the caller's environment never is.
+# Runs git with the fixed Git environment under a time limit of $1 seconds. $2 is a proxy URL or empty, and the rest is
+# the command. The proxy variables and the fixed environment come before timeout, so that timeout, which lives as
+# long as the command, holds no credential in its arguments. The caller's environment is never passed.
 git_run() {
   seconds=$1
-  shift
-  /usr/bin/timeout "$seconds" /usr/bin/env -i PATH=/usr/bin:/bin HOME="$EVAL_HOME" \
+  gitproxy=$2
+  shift 2
+  set -- /usr/bin/timeout "$seconds" "$@"
+  if [ -n "$gitproxy" ]; then
+    set -- HTTPS_PROXY="$gitproxy" HTTP_PROXY="$gitproxy" https_proxy="$gitproxy" http_proxy="$gitproxy" \
+      NO_PROXY=localhost,127.0.0.1,::1 "$@"
+  fi
+  /usr/bin/env -i PATH=/usr/bin:/bin HOME="$EVAL_HOME" \
     GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 \
     "$@"
 }
@@ -125,6 +136,9 @@ run_trial() {
   trial=$1
   proxy=$2
   shift 2
+  # timeout and the command come last, so that timeout's arguments, which stay readable in /proc for the whole run,
+  # hold no variable. prlimit runs env, and env runs timeout.
+  set -- /usr/bin/timeout --kill-after=10 3600 "$@"
   # The host's egress set (egress.ts): the six proxy variables and NODE_USE_ENV_PROXY, which Node 22 needs to use them.
   if [ -n "$proxy" ]; then
     set -- HTTPS_PROXY="$proxy" HTTP_PROXY="$proxy" https_proxy="$proxy" http_proxy="$proxy" \
@@ -132,7 +146,6 @@ run_trial() {
   fi
   status=0
   /usr/bin/prlimit --nproc=512 --fsize=4294967296 --core=0 --nofile=4096 \
-    /usr/bin/timeout --kill-after=10 3600 \
     /usr/bin/env -i \
       PATH=/usr/local/bin:/usr/bin:/bin HOME="$EVAL_HOME" TMPDIR="$TRIALS/$trial/tmp" \
       LANG=C.UTF-8 LC_ALL=C.UTF-8 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
@@ -161,10 +174,9 @@ op_probe() {
     proxy=$(/usr/bin/head -n 1 | /usr/bin/head -c 2048)
     fetch=refused
     cd "$ROOT" || die
-    if git_run 15 /usr/bin/git ls-remote --exit-code -- "$url" HEAD >/dev/null 2>&1; then
+    if git_run 15 "" /usr/bin/git ls-remote --exit-code -- "$url" HEAD >/dev/null 2>&1; then
       fetch=open
-    elif [ -n "$proxy" ] && git_run 15 HTTPS_PROXY="$proxy" HTTP_PROXY="$proxy" https_proxy="$proxy" \
-      http_proxy="$proxy" NO_PROXY=localhost,127.0.0.1,::1 /usr/bin/git ls-remote --exit-code -- "$url" HEAD \
+    elif [ -n "$proxy" ] && git_run 15 "$proxy" /usr/bin/git ls-remote --exit-code -- "$url" HEAD \
       >/dev/null 2>&1; then
       fetch=open
     fi
@@ -247,8 +259,31 @@ EOF
   count=$((count + extra))
   extra=$(count_obstructions)
   count=$((count + extra))
+  extra=$(count_account_state)
+  count=$((count + extra))
   if [ "$count" -gt 10000 ]; then count=10000; fi
   printf '%s' "$count"
+}
+
+# Counts the account's System V objects, and its files in STOP_DIRS, which stop empties. A listing that fails counts
+# as one, so that the probe never reads an unknown state as empty.
+count_account_state() {
+  n=0
+  uid=$(/usr/bin/id -u)
+  for kind in m s q; do
+    if ids=$(ipc_ids "$kind"); then
+      for ipc_obj in $ids; do n=$((n + 1)); done
+    else
+      n=$((n + 1))
+    fi
+  done
+  for dir in $STOP_DIRS; do
+    if [ -d "$dir" ]; then
+      found=$(/usr/bin/find "$dir" -xdev -mindepth 1 -user "$uid" -printf x 2>/dev/null | /usr/bin/head -c 10000 | /usr/bin/wc -c)
+      n=$((n + found))
+    fi
+  done
+  printf '%s' "$n"
 }
 
 # Counts the entries of ROOT other than trials.
@@ -322,10 +357,10 @@ op_prepare() {
   [ -f "$TRIAL_DIR/in/base.bundle" ] && [ ! -L "$TRIAL_DIR/in/base.bundle" ] || refuse
   [ ! -e "$TRIAL_DIR/work" ] && [ ! -L "$TRIAL_DIR/work" ] || refuse
   cd "$TRIAL_DIR" || die
-  git_run 600 /usr/bin/git clone --quiet --template= --no-checkout --branch trial -- in/base.bundle work || die
-  git_run 600 /usr/bin/git -C work remote remove origin || die
-  git_run 600 /usr/bin/git -C work -c advice.detachedHead=false checkout --quiet --detach trial || die
-  git_run 600 /usr/bin/git -C work branch -D trial || die
+  git_run 600 "" /usr/bin/git clone --quiet --template= --no-checkout --branch trial -- in/base.bundle work || die
+  git_run 600 "" /usr/bin/git -C work remote remove origin || die
+  git_run 600 "" /usr/bin/git -C work -c advice.detachedHead=false checkout --quiet --detach trial || die
+  git_run 600 "" /usr/bin/git -C work branch -D trial || die
   /usr/bin/rm -rf -- in
   /usr/bin/chmod 0711 work
 }
@@ -341,11 +376,11 @@ op_check() {
     valid_object "$object" || refuse
   done
   work=$TRIALS/$trial/work
-  if [ -L "$work" ] || [ ! -d "$work" ]; then refuse; fi
+  if [ -L "$TRIALS" ] || [ -L "$work" ] || [ ! -d "$work" ]; then refuse; fi
   for object in "$@"; do
-    if git_run 60 /usr/bin/git -C "$work" cat-file -e "$object" >/dev/null 2>&1; then exit 1; fi
+    if git_run 60 "" /usr/bin/git -C "$work" cat-file -e "$object" >/dev/null 2>&1; then exit 1; fi
   done
-  if [ -n "$(git_run 60 /usr/bin/git -C "$work" remote)" ]; then exit 1; fi
+  if [ -n "$(git_run 60 "" /usr/bin/git -C "$work" remote)" ]; then exit 1; fi
 }
 
 op_exec() {
@@ -369,14 +404,47 @@ op_setup() {
   run_trial "$CWD_TRIAL" "$proxy" "$@" </dev/null
 }
 
-# Ends every process of the account, then removes the account's files from the shared temporary directories.
+# Prints the ids of the account's System V objects of one kind (m shared memory, s semaphores, q message queues), one
+# per line, digits only. The owner column of ipcs is a name, or the number when the name does not resolve. Fails when
+# the listing fails, so that a caller never reads a failed listing as an empty one.
+ipc_ids() {
+  ipc_uid=$(/usr/bin/id -u)
+  listing=$(/usr/bin/ipcs "-$1" 2>/dev/null) || return 1
+  while read -r key ipc_id owner _; do
+    case "$key" in
+      0x*) ;;
+      *) continue ;;
+    esac
+    case "$owner" in
+      "$ACCOUNT"|"$ipc_uid") ;;
+      *) continue ;;
+    esac
+    case "$ipc_id" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    printf '%s\n' "$ipc_id"
+  done <<EOF
+$listing
+EOF
+}
+
+# Ends every process of the account, then removes the account's System V objects and its files from the shared
+# directories of STOP_DIRS. Fails when any of them remains, or when it cannot list the System V objects.
 op_stop() {
   [ $# -eq 0 ] || refuse
   kill -KILL -1 2>/dev/null || true
   /usr/bin/sleep 1
   uid=$(/usr/bin/id -u)
   status=0
-  for dir in /tmp /var/tmp /dev/shm; do
+  for kind in m s q; do
+    ids=$(ipc_ids "$kind") || { status=1; continue; }
+    for ipc_obj in $ids; do
+      /usr/bin/ipcrm "-$kind" "$ipc_obj" 2>/dev/null || true
+    done
+    left=$(ipc_ids "$kind") || { status=1; continue; }
+    if [ -n "$left" ]; then status=1; fi
+  done
+  for dir in $STOP_DIRS; do
     if [ -d "$dir" ]; then
       /usr/bin/find "$dir" -xdev -type d -user "$uid" ! -perm -u=rwx -exec /usr/bin/chmod u+rwx -- {} \; 2>/dev/null || true
       /usr/bin/find "$dir" -xdev -mindepth 1 -user "$uid" -prune -exec /usr/bin/rm -rf -- {} + 2>/dev/null || true
@@ -419,7 +487,12 @@ done
 '
 op_clean() {
   [ $# -eq 0 ] || refuse
-  if [ -L "$TRIALS" ]; then refuse; fi
+  # The account owns ROOT, so a trial can swap trials for a link or a file. Only clean repairs that, and it never
+  # follows the link: rm removes the entry itself, and the directory is made again with the mode setup_trial uses.
+  if [ -L "$TRIALS" ] || { [ -e "$TRIALS" ] && [ ! -d "$TRIALS" ]; }; then
+    /usr/bin/rm -f -- "$TRIALS" || die
+    make_dir 711 "$TRIALS"
+  fi
   /usr/bin/timeout 600 /bin/sh -c "$CLEAN_SCRIPT" clean "$ROOT" "$TRIALS" "$EVAL_TMP"
 }
 

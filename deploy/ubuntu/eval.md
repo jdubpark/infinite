@@ -47,7 +47,9 @@ sudo install -d -o root -g root -m 0755 /usr/local/libexec/infinite
 sudo install -o root -g root -m 0755 deploy/ubuntu/eval-command.sh /usr/local/libexec/infinite/eval-command
 ```
 
-Set the variables at the top of the installed file to the values of this runbook. They are `ROOT=/var/lib/infinite-eval/root`, `ACCOUNT=infinite-eval`, `EVAL_HOME=/var/lib/infinite-eval/home`, `TEMPLATE=/usr/local/share/infinite-eval/home`, and `EVAL_TMP=/var/lib/infinite-eval/tmp`. `EVAL_TMP` must equal the `TMPDIR` of the provider wrappers (step 3). Change nothing else.
+The launcher needs these tools at the absolute paths it names, and refuses every operation but `probe` and `stop` with exit 125 when one is missing: `timeout`, `prlimit`, `env`, `git`, `realpath`, `find`, `cmp`, `head`, `stat`, `cp`, `chmod`, `rm`, `mv`, `sleep`, `id`, `wc`, `ipcs`, and `ipcrm` under `/usr/bin`, and `mkdir` and `bash` under `/bin`. `ipcs` and `ipcrm` come with the `util-linux` package. `probe` reports `"tools":false` when one is missing, and `stop` exits 1 when it cannot list the account's System V objects.
+
+Set the variables at the top of the installed file to the values of this runbook. They are `ROOT=/var/lib/infinite-eval/root`, `ACCOUNT=infinite-eval`, `EVAL_HOME=/var/lib/infinite-eval/home`, `TEMPLATE=/usr/local/share/infinite-eval/home`, and `EVAL_TMP=/var/lib/infinite-eval/tmp`. `EVAL_TMP` must equal the `TMPDIR` of the provider wrappers (step 3). Change nothing else, including the `STOP_DIRS` list of shared directories that `stop` empties and the probe counts.
 
 The launcher refuses to run as root, and it refuses every operation, with exit 64, when the caller is not `ACCOUNT` or when `ROOT` is not a directory of mode `711` owned by the account. It admits these operations: `probe`, `receive`, `prepare`, `check`, `exec`, `setup`, `stop`, `clean`, and `scrub`. Any other argument is refused.
 
@@ -112,18 +114,23 @@ sudo install -o root -g root -m 0644 deploy/ubuntu/eval.nft /etc/infinite/eval.n
 sudo install -o root -g root -m 0644 deploy/ubuntu/infinite-eval-firewall.service /etc/systemd/system/infinite-eval-firewall.service
 sudo install -d -o root -g root -m 0755 /etc/systemd/system/nftables.service.d
 sudo install -o root -g root -m 0644 deploy/ubuntu/nftables-keeps-eval.conf /etc/systemd/system/nftables.service.d/infinite-eval.conf
+sudo install -d -o root -g root -m 0755 /etc/systemd/system/infinite.service.d
+sudo install -o root -g root -m 0644 deploy/ubuntu/infinite-requires-eval-firewall.conf /etc/systemd/system/infinite.service.d/eval-firewall.conf
 sudo systemctl daemon-reload
 sudo systemctl enable --now infinite-eval-firewall.service
 ```
 
+The last drop-in makes `infinite.service` require the firewall unit: the API does not start while the rule is missing or failed to load, and it loads the rule again on every start. Without it, a firewall unit that fails at boot leaves every trial on a direct route, labelled `none`. Install it only on a host where the rule is installed, because it makes the API depend on this unit. A restart of the firewall unit also restarts the API, so stop trials first. It follows the egress firewall's drop-in (`deploy/ubuntu/egress/infinite-requires-egress-firewall.conf`).
+
 The first command checks the file and that the `infinite-eval` account exists. The rule is in the `inet` family, so it rejects IPv4 and IPv6 alike, and each load replaces only the table `infinite_eval`, in one transaction. After a change to the file, reload the unit, never restart it: a restart removes the table first. The probe does not check the provider route, and it reports `network-open` only while the cloud metadata address answers, so `systemctl is-active infinite-eval-firewall.service` is what shows that the rule loaded.
 
-Undo: stop trials first (write each project's team block without `trialsPerDay`). Then `sudo systemctl disable --now infinite-eval-firewall.service`, which deletes the table; remove `/etc/systemd/system/infinite-eval-firewall.service`, `/etc/systemd/system/nftables.service.d/infinite-eval.conf`, and `/etc/infinite/eval.nft`; and run `sudo systemctl daemon-reload`.
+Undo: stop trials first (write each project's team block without `trialsPerDay`). Then `sudo systemctl disable --now infinite-eval-firewall.service`, which deletes the table; remove `/etc/systemd/system/infinite.service.d/eval-firewall.conf` first, so that the API no longer requires the unit; remove `/etc/systemd/system/infinite-eval-firewall.service`, `/etc/systemd/system/nftables.service.d/infinite-eval.conf`, and `/etc/infinite/eval.nft`; and run `sudo systemctl daemon-reload`.
 
 Check:
 
 ```sh
 systemctl is-active infinite-eval-firewall.service     # active
+systemctl show infinite.service -p Requires | grep -c infinite-eval-firewall.service   # 1
 sudo nft list table inet infinite_eval                 # prints the table
 sudo -u infinite-eval curl -sS --max-time 5 https://example.com   # fails: the rule refuses the direct connection
 ```
@@ -267,6 +274,8 @@ sleep 2 && pgrep -u infinite-eval -l sleep                     # prints the slee
 sudo -u infinite-host -- sudo -n -u infinite-eval -- /usr/local/libexec/infinite/eval-command stop
 pgrep -u infinite-eval -l sleep                                # prints nothing
 ```
+
+`stop` also removes the account's System V shared memory, semaphores, and message queues, and its files in `/tmp`, `/var/tmp`, `/dev/shm`, `/dev/mqueue`, `/run/lock`, and `/var/crash`. After it, `ipcs` lists no object owned by the account, and `sudo find /tmp /var/tmp /dev/shm /dev/mqueue /run/lock /var/crash -xdev -user infinite-eval` prints nothing.
 
 Clean. Plant a file in the temporary directory and remove it with `clean`:
 

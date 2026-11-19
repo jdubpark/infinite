@@ -2,15 +2,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { randomInt } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// The launcher runs only as copies whose ROOT, ACCOUNT, EVAL_HOME, and TEMPLATE lines are rewritten, as the current
-// user. The installed file is never run here. `stop` ends every process of the account and deletes its temporary
-// files, so in every copy its kill line becomes `exit 99`: a broken account check fails a test instead of ending the
-// test runner's processes. Every test skips on a platform other than Linux, and when the test runs as root.
+// The launcher runs only as copies whose ROOT, ACCOUNT, EVAL_HOME, TEMPLATE, and STOP_DIRS lines are rewritten, as the
+// current user. The installed file is never run here. `stop` ends every process of the account and deletes its
+// temporary files, so in every copy its kill line becomes `exit 99`: a broken account check fails a test instead of
+// ending the test runner's processes. The one test that runs `stop` to the end replaces the kill line with a no-op
+// and narrows STOP_DIRS to one directory. Every test skips on a platform other than Linux, and when the test runs as root.
 const LAUNCHER = fileURLToPath(new URL("../deploy/ubuntu/eval-command.sh", import.meta.url));
 const SKIP = process.platform !== "linux" ? "the launcher runs on Linux only"
   : process.getuid?.() === 0 ? "the launcher test must not run as root" : false;
@@ -24,12 +25,15 @@ const PROXY = ["HTTPS_PROXY", "HTTP_PROXY", "NODE_USE_ENV_PROXY", "NO_PROXY", "h
 
 type Sandbox = { dir: string; root: string; home: string; template: string; tmp: string; script: string };
 
-function sandbox(account: string = userInfo().username): Sandbox {
+function sandbox(account: string = userInfo().username, stopDirs?: string): Sandbox {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "eval-launcher-")));
   const root = join(dir, "root");
   const home = join(dir, "home");
   const template = join(dir, "template");
   const tmp = join(dir, "tmp");
+  // Probe and stop look here instead of the machine's shared directories, so a test sees only its own files.
+  const shared = join(dir, "shared");
+  mkdirSync(shared, { mode: 0o700 });
   mkdirSync(root, { mode: 0o711 });
   chmodSync(root, 0o711);
   mkdirSync(home, { mode: 0o700 });
@@ -46,8 +50,9 @@ function sandbox(account: string = userInfo().username): Sandbox {
     .replace(/^EVAL_HOME=.*$/m, `EVAL_HOME='${home}'`)
     .replace(/^TEMPLATE=.*$/m, `TEMPLATE='${template}'`)
     .replace(/^EVAL_TMP=.*$/m, `EVAL_TMP='${tmp}'`)
-    .replace(kill, "  exit 99");
-  assert.match(text, /^ {2}exit 99$/m, "the kill line was not replaced");
+    .replace(/^STOP_DIRS=.*$/m, `STOP_DIRS='${stopDirs ?? shared}'`)
+    .replace(kill, stopDirs ? "  :" : "  exit 99");
+  assert.match(text, stopDirs ? /^ {2}:$/m : /^ {2}exit 99$/m, "the kill line was not replaced");
   assert.doesNotMatch(text, /kill -KILL -1/);
   writeFileSync(script, text, { mode: 0o700 });
   chmodSync(script, 0o700);
@@ -292,6 +297,123 @@ test("stop refuses another account", { skip: SKIP }, async () => {
     assert.equal(sleeper.signalCode, null);
   } finally {
     sleeper.kill("SIGKILL");
+    cleanup(sb);
+  }
+});
+
+test("stop removes the account's System V objects and its files in the added directories", { skip: SKIP || !["ipcs", "ipcrm", "ipcmk"].every(tool => existsSync(`/usr/bin/${tool}`)) && "util-linux ipcs, ipcrm, and ipcmk are missing" }, t => {
+  // The launcher's own list names the directories the review found, and each is used only when it exists.
+  const listed = readFileSync(LAUNCHER, "utf8").match(/^STOP_DIRS="([^"]*)"$/m)?.[1].split(" ") ?? [];
+  for (const dir of ["/tmp", "/var/tmp", "/dev/shm", "/dev/mqueue", "/run/lock", "/var/crash"]) assert.ok(listed.includes(dir), `${dir} is in STOP_DIRS`);
+
+  const sb = sandbox(undefined, "/run/lock");
+  const lockFile = join("/run/lock", `eval-launcher-test-${process.pid}`);
+  let segment = "";
+  try {
+    let writable = true;
+    try { accessSync("/run/lock", constants.W_OK); } catch { writable = false; }
+    if (writable) writeFileSync(lockFile, "x");
+    else t.diagnostic("/run/lock is not writable by the test user, so the file in it is not asserted");
+    const made = spawnSync("/usr/bin/ipcmk", ["-M", "4096"], { encoding: "utf8" });
+    assert.equal(made.status, 0, made.stderr);
+    segment = /(\d+)\s*$/m.exec(made.stdout)?.[1] ?? "";
+    assert.match(segment, /^\d+$/, `ipcmk printed no id: ${made.stdout}`);
+    const listing = () => spawnSync("/usr/bin/ipcs", ["-m"], { encoding: "utf8" }).stdout.split("\n").map(line => line.trim().split(/\s+/));
+    const present = () => listing().some(fields => fields[0]?.startsWith("0x") && fields[1] === segment);
+    assert.equal(present(), true, "the segment exists before stop");
+    // The probe reports the segment, and the file when there is one, as leftovers.
+    assert.ok(leftovers(sb) >= (writable ? 2 : 1), "the probe counts the account's shared memory and its file");
+
+    const stopped = run(sb, ["stop"]);
+    assert.equal(stopped.status, 0, stopped.stderr.toString("utf8"));
+    assert.equal(present(), false, "stop removed the segment");
+    assert.equal(existsSync(lockFile), false, "stop removed the file");
+    assert.equal(leftovers(sb), 0);
+  } finally {
+    if (segment) spawnSync("/usr/bin/ipcrm", ["-m", segment]);
+    rmSync(lockFile, { force: true });
+    cleanup(sb);
+  }
+});
+
+test("the proxy credential is in no process's arguments while a command runs", { skip: SKIP }, async () => {
+  const sb = sandbox();
+  let child: ReturnType<typeof spawn> | undefined;
+  let sleeperPid = 0;
+  try {
+    const repo = makeRepo(sb);
+    const work = prepareTrial(sb, repo.bundle);
+    const secret = `credential-part-${randomInt(1_000_000, 9_000_000)}`;
+    const duration = String(randomInt(100_000, 900_000));
+    child = spawn("/bin/sh", [sb.script, "setup", "--", "/bin/sleep", duration], {
+      cwd: work,
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },
+      stdio: ["pipe", "ignore", "ignore"],
+    });
+    child.stdin?.end(`http://user:${secret}@127.0.0.1:9/\n`);
+    const processes = () => readdirSync("/proc").filter(name => /^\d+$/.test(name)).flatMap(pid => {
+      try { return [{ pid: Number(pid), args: readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0") }]; } catch { return []; }
+    });
+    const deadline = Date.now() + 20_000;
+    while (!sleeperPid && Date.now() < deadline) {
+      sleeperPid = processes().find(p => p.args[0]?.endsWith("sleep") && p.args[1] === duration)?.pid ?? 0;
+      if (!sleeperPid) await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.ok(sleeperPid, "the command started");
+    const all = processes();
+    assert.ok(all.some(p => p.args.includes("--kill-after=10")), "the launcher's timeout is running, so its arguments were checked");
+    assert.deepEqual(all.filter(p => p.args.join(" ").includes(secret)).map(p => p.args[0]), []);
+  } finally {
+    if (sleeperPid) { try { process.kill(sleeperPid, "SIGKILL"); } catch { /* already gone */ } }
+    if (child) {
+      const ended = new Promise(resolve => child?.once("exit", resolve));
+      child.kill("SIGKILL");
+      await ended;
+    }
+    cleanup(sb);
+  }
+});
+
+test("clean replaces a trials link or file with a directory and never follows the link", { skip: SKIP }, () => {
+  const sb = sandbox();
+  try {
+    const elsewhere = join(sb.dir, "elsewhere");
+    writeTree(elsewhere, { "keep.txt": "keep\n" });
+    const trials = join(sb.root, "trials");
+    symlinkSync(elsewhere, trials);
+    assert.equal(run(sb, ["clean"]).status, 0);
+    assert.equal(lstatSync(trials).isSymbolicLink(), false);
+    assert.equal(lstatSync(trials).isDirectory(), true);
+    assert.equal(statSync(trials).mode & 0o777, 0o711);
+    assert.deepEqual(readdirSync(trials), []);
+    assert.equal(readFileSync(join(elsewhere, "keep.txt"), "utf8"), "keep\n", "the link's target is untouched");
+
+    // A plain file in its place is replaced the same way.
+    rmSync(trials, { recursive: true });
+    writeFileSync(trials, "x");
+    assert.equal(run(sb, ["clean"]).status, 0);
+    assert.equal(lstatSync(trials).isDirectory(), true);
+    assert.deepEqual(readdirSync(trials), []);
+  } finally {
+    cleanup(sb);
+  }
+});
+
+test("every operation but clean refuses a trials link", { skip: SKIP }, () => {
+  const sb = sandbox();
+  try {
+    const repo = makeRepo(sb);
+    const elsewhere = join(sb.dir, "elsewhere");
+    mkdirSync(join(elsewhere, TRIAL, "work"), { recursive: true });
+    symlinkSync(elsewhere, join(sb.root, "trials"));
+    assert.equal(run(sb, ["receive", TRIAL, "1000000"], { input: repo.bundle }).status, 64);
+    assert.equal(run(sb, ["prepare", TRIAL]).status, 64);
+    assert.equal(run(sb, ["check", TRIAL, "--", "a".repeat(40)]).status, 64);
+    assert.equal(run(sb, ["exec", "--", "/bin/sh", "-c", "echo x > marker"], { cwd: join(sb.root, "trials", TRIAL, "work") }).status, 64);
+    assert.equal(run(sb, ["setup", "--", "/bin/sh", "-c", "echo x > marker"], { cwd: join(sb.root, "trials", TRIAL, "work"), input: "\n" }).status, 64);
+    assert.deepEqual(readdirSync(join(elsewhere, TRIAL, "work")), []);
+    assert.equal(lstatSync(join(sb.root, "trials")).isSymbolicLink(), true, "only clean repairs the link");
+  } finally {
     cleanup(sb);
   }
 });

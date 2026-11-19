@@ -1,5 +1,7 @@
 import { ACTIVE_MEMBER_STATUSES, type TeamAssignment, type TeamMember, type TeamPermissionDecision, type TeamRun } from "./team-types.js";
 import { createHash } from "node:crypto";
+import { lstatSync } from "node:fs";
+import { basename, dirname } from "node:path";
 import type { Config } from "./types.js";
 import type { Manager } from "./manager.js";
 import type { Prompt } from "@infinite/attention";
@@ -55,3 +57,11 @@ export function permissionRequestCount(run: TeamRun) {
 // The flags are persisted on the member at creation, so a recovered or stopped session keeps the fingerprint it launched with. Text an agent reads (`agentText`) leaves out hostProfiles.
 export const assignment = (member: TeamMember, agentText = false): TeamAssignment => ({ runId: member.runId, memberId: member.memberId, revision: member.revision, role: member.role, ...(member.taskId ? { taskId: member.taskId } : {}),
   ...(member.verificationRefused ? { verificationRefused: true } : {}), ...(member.entryTools ? { entryTools: true as const } : {}), ...(member.hostProfiles && !agentText ? { hostProfiles: true as const } : {}) });
+export function teamRunDirectory(workspace: string) {
+  const parent = dirname(workspace);
+  return ["recovery", "verification"].includes(basename(parent)) ? dirname(parent) : parent;
+}
+export function filesystemEntryExists(path: string) {
+  try { lstatSync(path); return true; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+}

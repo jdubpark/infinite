@@ -153,9 +153,9 @@ process.exit(child.status ?? 128);
 function startMemberWorkSave(teams: TeamService, id: string) {
   const internal = teams as unknown as {
     records: Map<string, { run: TeamRun }>;
-    startMemberWorkSave: (stored: { run: TeamRun }) => boolean;
+    retention: { startMemberWorkSave: (stored: { run: TeamRun }) => boolean };
   };
-  return internal.startMemberWorkSave(internal.records.get(id)!);
+  return internal.retention.startMemberWorkSave(internal.records.get(id)!);
 }
 
 function storedRun(teams: TeamService, id: string) {

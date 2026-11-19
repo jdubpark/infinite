@@ -3,9 +3,8 @@ import { inputSourceLabel, decisionAnswerLabel } from "./team-types.js";
 import type { HandoffPolicy, TeamHandoffContext } from "./handoff-types.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync } from "node:fs";
-import { rm as rmAsync } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep, basename } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import type { Config, Provider, Session } from "./types.js";
 import { TeamStopRefused, type Manager } from "./manager.js";
 import { bootId, extendWitness, hostProcesses, newWitness, recordCommand, type CensusResult, type HostProcesses, type ProcessWitness } from "./process-census.js";
@@ -13,7 +12,7 @@ import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { PROVIDER_NAMES, recoveryTurnEnd, type Prompt, type SignalData } from "@infinite/attention";
 import { autonomyOf, type AutonomyMode } from "./autonomy.js";
-import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamPermissionRecoveryView, type TeamPublication, type TeamPublicationCategory, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, autoPinned, coversPoint, escalationPool, hostProfilesFor, memberLimit, switchFallback } from "./team-types.js";
+import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamPermissionRecoveryView, type TeamPublication, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, hostClosedBlockedReason, autoPinned, coversPoint, escalationPool, hostProfilesFor, memberLimit, switchFallback } from "./team-types.js";
 import { memberConfiguration, type MemberConfiguration } from "./config-identity.js";
 import { refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
 import { reviewEvidenceProblems } from "./team-acceptance.js";
@@ -43,15 +42,16 @@ import { mirrorRemoteUrl } from "./project-source.js";
 import { hostGithubGrantEnvironment, projectGithubRepository, sessionGithubScope } from "./github-grants.js";
 import type { ProjectSourceService } from "./project-source.js";
 import type { RepositoryGraphs, RepositoryGraphResult } from "./repository-graphs.js";
-import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, publishTeamHead, removeMemberWorkspace, removeTeamWorkspace, snapshotMemberWork, commandScope, type CommandScope, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
+import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, publishTeamHead, commandScope, type CommandScope, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
 import { HOST_LOAD_REASON_PREFIX, LaunchHeldError } from "./host-load.js";
 import { permissionEvidenceHash } from "./team-permissions.js";
 import { storageShortfall, volumeUsage, type VolumeUsage } from "./storage.js";
 import type { PermissionAgentServices } from "./permission-agent-types.js";
-import { activeMember, activeTeamRun, assignment, automaticRecoveryLimit, boundedRecoveryText, coordinatorPermissionPrompt, digest, livePermissionRecoveryStatuses, permissionCoordinatorDecision, permissionRequestCount, timestamp } from "./team-kernel.js";
+import { activeMember, activeTeamRun, assignment, automaticRecoveryLimit, boundedRecoveryText, coordinatorPermissionPrompt, digest, filesystemEntryExists, livePermissionRecoveryStatuses, permissionCoordinatorDecision, permissionRequestCount, teamRunDirectory, timestamp } from "./team-kernel.js";
 import type { PermissionHost } from "./team-permission-agent.js";
 import { TeamPermissionReview } from "./team-permission-review.js";
+import { TeamRetention, type RetentionHost } from "./team-retention.js";
 import { planRunObjective, runObjectiveNote, runObjectiveView, steerRunObjective, type ObjectiveUnavailable } from "./objective-runs.js";
 import { TeamIntent, type GoalRecordPort, type IntentCheckState } from "./team-intent.js";
 import { autonomyStartEvent, intentCheckPin, startMode } from "./evaluator-profiles.js";
@@ -66,7 +66,7 @@ type LimitSwitch = LimitObservation & { at: string; seq: number };
 type StartInProject = <T>(projectId: string, start: () => Promise<T>) => Promise<T>;
 type MissionReservationLookup = (projectId: string, exceptMissionId?: string) => string | undefined;
 type DeliveryReconciliationReport = Extract<TeamReport, { kind: "delivery-reconciliation" }>;
-type TeamServiceOptions = {
+export type TeamServiceOptions = {
   /** The process census; tests replace it. */
   processes?: HostProcesses;
   source?: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status">;
@@ -86,13 +86,9 @@ type TeamServiceOptions = {
   /** Eval capture (INF-185). It observes only: it never changes a run, and its failure is swallowed. */
   capture?: CaptureSink;
 };
-type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedAt: Record<string, string>; removalErrors: Record<string, string[]>; retryAt?: Record<string, string>;
+export type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedAt: Record<string, string>; removalErrors: Record<string, string[]>; retryAt?: Record<string, string>;
   /** When a record removal first waited for its events to reach the evidence store. */
   evidenceHeldAt?: string };
-/** How long a failed workspace removal waits before the scheduler tries it again. */
-const REMOVAL_RETRY_MS = 5 * 60_000;
-/** A run's record waits at most this long for its events to reach the evidence store before retention removes it. */
-const EVIDENCE_WAIT_MS = 24 * 3600_000;
 /** Ledger-only reads that may be pending in one service. A read that never ends keeps its place. */
 const ENRICH_LIMIT = 16;
 let enrichSkipLogged = false;
@@ -223,18 +219,6 @@ function retentionEventAt(run: TeamRun) {
     }
   });
   return event?.at ?? run.updatedAt ?? run.createdAt;
-}
-function teamRunDirectory(workspace: string) {
-  const parent = dirname(workspace);
-  return ["recovery", "verification"].includes(basename(parent)) ? dirname(parent) : parent;
-}
-function pathStrictlyInside(root: string, target: string) {
-  const rel = relative(resolve(root), resolve(target));
-  return Boolean(rel) && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
-}
-function filesystemEntryExists(path: string) {
-  try { lstatSync(path); return true; }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
 }
 
 /** Written by hosts before stall detection; still resumable. */
@@ -391,16 +375,11 @@ export class TeamService {
    */
   private readonly recorders = new Map<string, OperationRecorder>();
   private readonly sampleTimers = new Set<NodeJS.Timeout>();
-  private readonly removingRuns = new Set<string>();
-  private readonly removalTasks = new Set<Promise<void>>();
+  /** Retention of settled runs (team-retention.ts), on the kernel this service lends it. */
+  private readonly retention = new TeamRetention(this.retentionHost());
   private readonly publishingRuns = new Set<string>();
   private readonly publicationTasks = new Set<Promise<void>>();
   private readonly publicationControllers = new Map<string, AbortController>();
-  private readonly memberWorkSaveRuns = new Set<string>();
-  private readonly memberWorkSaveTasks = new Set<Promise<void>>();
-  private readonly memberWorkSaveControllers = new Map<string, AbortController>();
-  private readonly removalWaiters: Array<() => void> = [];
-  private activeRemovals = 0;
   /** Permission review, its recovery and the permission agent (team-permission-*.ts), on the kernel this service lends them. */
   private readonly permissions = new TeamPermissionReview(this.permissionHost());
   private readonly directory: string;
@@ -1002,28 +981,51 @@ export class TeamService {
   }
   get(id: string): TeamView { return this.view(this.record(id)); }
   objectiveRecord(id: string, version?: number) { return runObjectiveView(this.record(id), version); }
-  private teamRoot(stored: Stored) {
-    const root = stored.root ?? this.config.teams?.workspaceDir;
-    if (!root) throw new TeamError(409, "invalid-workspace", "The team workspace is outside its configured root.");
-    return stored.anchor ? ensureHostDirectory(stored.anchor, root, 0o750, false) : ensureDefaultTeamRoot(root, false);
+  /* ------------------------------------------------ retention of settled runs */
+
+  /**
+   * The kernel the retention class runs on (team-retention.ts). Each member reads this service at the time of use, so
+   * a field set later (evidence) or a method a test replaces is seen as before the move.
+   */
+  private retentionHost(): RetentionHost {
+    const service = this;
+    return {
+      get records() { return service.records; },
+      get commands() { return service.commands; },
+      get manager() { return service.manager; },
+      get config() { return service.config; },
+      get closed() { return service.closed; },
+      save: stored => service.save(stored),
+      event: (stored, text) => service.event(stored, text),
+      record: id => service.record(id),
+      enqueue: task => service.enqueue(task),
+      assertRunPath: (stored, path, create) => service.assertRunPath(stored, path, create),
+      get options() { return service.options; },
+      get directory() { return service.directory; },
+      get recorders() { return service.recorders; },
+      get entryBacklog() { return service.entryBacklog; },
+      get evidence() { return service.evidence; },
+      view: stored => service.view(stored),
+      emit: (stored, kind, keyParts, ids, data) => service.emit(stored, kind, keyParts, ids, data),
+      flushOutbox: (stored, afterGap) => service.flushOutbox(stored, afterGap),
+      persistRetiredRunId: id => service.persistRetiredRunId(id),
+      retentionNow: () => service.retentionNow(),
+      retentionState: stored => service.retentionState(stored),
+      publicationTarget: stored => service.publicationTarget(stored),
+      needsPublication: stored => service.needsPublication(stored),
+      startPublication: stored => service.startPublication(stored),
+      refreshOperationCensus: (stored, force) => service.refreshOperationCensus(stored, force),
+      closeStaleBlockedRun: (stored, hours) => service.closeStaleBlockedRun(stored, hours),
+    };
   }
-  private ownerPreventsRemoval(run: TeamRun) {
-    return Boolean(run.goal || run.missionId || run.handoff) && (this.options?.ownerActive?.(run) ?? true);
-  }
-  private hasPendingPreparationFrom(stored: Stored) {
-    const runDirectory = teamRunDirectory(stored.run.workspace);
-    for (const candidate of this.records.values()) {
-      if (candidate.run.id === stored.run.id || candidate.pending?.kind !== "prepare" || !candidate.source?.path) continue;
-      if (pathStrictlyInside(runDirectory, candidate.source.path)) return true;
-    }
-    return false;
-  }
-  private assertRunRetentionSafe(stored: Stored) {
-    if (this.ownerPreventsRemoval(stored.run))
-      throw new TeamError(409, "team-retained", "A live goal, mission or handoff still uses this run as its source; it is removed when that owner finishes.");
-    if (this.hasPendingPreparationFrom(stored))
-      throw new TeamError(409, "team-in-use", "Another run is preparing from this run's workspace; retry removal after preparation settles.");
-  }
+  // State the retention class owns that unchanged code here still reads (createRun, the reconciles, close, idle).
+  private get removingRuns() { return this.retention.removingRuns; }
+  private get removalTasks() { return this.retention.removalTasks; }
+  private get memberWorkSaveTasks() { return this.retention.memberWorkSaveTasks; }
+  private get memberWorkSaveControllers() { return this.retention.memberWorkSaveControllers; }
+  // Entry points keep their names on the service, so callers here, in server.ts, goals.ts, missions.ts and tests are unchanged.
+  removeRun(id: string): Promise<TeamView> { return this.retention.removeRun(id); }
+  private retire(...args: Parameters<TeamRetention["retire"]>) { return this.retention.retire(...args); }
   private publishHeadsEnabled() {
     const teams = this.config.teams as (NonNullable<Config["teams"]> & { publishHeads?: boolean }) | undefined;
     return teams?.publishHeads !== false;
@@ -1111,144 +1113,6 @@ export class TeamService {
     this.publicationTasks.add(task);
     return true;
   }
-  private memberWorkDone(run: TeamRun, member: TeamMember) {
-    const saved = member.savedWork;
-    return saved?.revision === run.revision && ["published", "nothing-to-save", "gave-up"].includes(saved.state);
-  }
-  /** Pending member clones are grouped by path so a shared clone is snapshotted only once. */
-  private memberWorkGroups(stored: Stored) {
-    const { run } = stored;
-    if (!["cancelled", "blocked"].includes(run.status) || run.workspaceRemovedAt || !this.publicationTarget(stored)) return [];
-    const groups = new Map<string, TeamMember[]>();
-    for (const member of run.members) {
-      if (member.cwd === run.workspace || member.workspaceRemovedAt || !filesystemEntryExists(member.cwd) || this.memberWorkDone(run, member)) continue;
-      const members = groups.get(member.cwd) ?? [];
-      members.push(member);
-      groups.set(member.cwd, members);
-    }
-    return [...groups].map(([cwd, members]) => ({ cwd, members }));
-  }
-  private needsMemberWorkSaved(stored: Stored) {
-    return this.memberWorkGroups(stored).length > 0;
-  }
-  private memberWorkRetryDue(stored: Stored, now: number) {
-    return this.memberWorkGroups(stored).some(group => group.members.some(member => {
-      const saved = member.savedWork;
-      return saved?.state === "retrying" && (saved.revision !== stored.run.revision || Boolean(saved.failure && now >= Date.parse(saved.failure.retryAt)));
-    }));
-  }
-  private recordMemberWork(stored: Stored, member: TeamMember, savedWork: NonNullable<TeamMember["savedWork"]>, eventText?: string, additionalEventText?: string) {
-    return this.enqueue(() => {
-      if (this.records.get(stored.run.id) !== stored) return;
-      const previous = member.savedWork, previousEvents = stored.run.events.slice();
-      member.savedWork = savedWork;
-      if (eventText && !stored.run.events.some(event => event.text === eventText)) this.event(stored, eventText);
-      if (additionalEventText && !stored.run.events.some(event => event.text === additionalEventText)) this.event(stored, additionalEventText);
-      try { this.save(stored); }
-      catch (error) {
-        member.savedWork = previous;
-        stored.run.events = previousEvents;
-        throw error;
-      }
-    });
-  }
-  /** Snapshot and publish eligible member clones without holding the mutation queue during Git work. */
-  private startMemberWorkSave(stored: Stored) {
-    const { run } = stored, target = this.publicationTarget(stored);
-    if (this.closed || !target || !this.needsMemberWorkSaved(stored) || this.memberWorkSaveRuns.has(run.id)) return false;
-    const now = this.options?.now?.() ?? Date.now();
-    const groups = this.memberWorkGroups(stored).map(group => ({ ...group, members: group.members.filter(member => {
-      const saved = member.savedWork;
-      return !saved?.failure || saved.revision !== run.revision || now >= Date.parse(saved.failure.retryAt);
-    }) })).filter(group => group.members.length > 0);
-    if (!groups.length) return false;
-    const id = run.id, revision = run.revision, runBranch = run.branch, controller = new AbortController();
-    this.memberWorkSaveRuns.add(id);
-    this.memberWorkSaveControllers.set(id, controller);
-    const grantEnv = (member: TeamMember, ref: string) => hostGithubGrantEnvironment(this.config, {
-      sid: `save-member-work:${id}:${member.memberId}`, project: run.projectId, repo: target.repository, ops: ["push"], refs: [ref],
-    });
-    let task: Promise<void>;
-    task = (async () => {
-      for (const group of groups) {
-        const representative = group.members.find(member => this.memberIntegratedAt(stored, member) === undefined) ?? group.members[0]!;
-        let snapshot: Awaited<ReturnType<typeof snapshotMemberWork>> | undefined;
-        let snapshotFailed = false;
-        try {
-          snapshot = await snapshotMemberWork(group.cwd, representative.baseCommit,
-            { skipIfResultTree: this.memberIntegratedAt(stored, representative) !== undefined }, this.config.teams?.commandPrefix, controller.signal,
-            this.options?.memberWorkCommandTimeoutMs ?? 30000, this.options?.memberWorkCommandStopGraceMs ?? 2000);
-        } catch {
-          snapshotFailed = true;
-        }
-        if (controller.signal.aborted) return;
-        for (const member of group.members) {
-          if (this.memberWorkDone(run, member)) continue;
-          const currentNow = this.options?.now?.() ?? Date.now();
-          if (member.savedWork?.failure && member.savedWork.revision === revision && currentNow < Date.parse(member.savedWork.failure.retryAt)) continue;
-          if (snapshotFailed) {
-            await this.recordMemberWorkFailure(stored, member, revision, target.repository, `${runBranch}-wip-${member.memberId}`, undefined, "other");
-            continue;
-          }
-          if (!snapshot) {
-            await this.recordMemberWork(stored, member, { revision, state: "nothing-to-save", at: this.retentionNow() });
-            continue;
-          }
-          const primaryBranch = `${runBranch}-wip-${member.memberId}`;
-          if (!snapshot.commit) {
-            if (snapshot.nestedRepository) {
-              const nestedEvent = `Member ${member.memberId} has changes inside a nested repository or submodule that the host cannot save to GitHub. The workspace will be removed after the remaining attempts unless the owner saves the work.`;
-              await this.recordMemberWorkFailure(stored, member, revision, target.repository, primaryBranch, undefined, "nested-repository", nestedEvent);
-            } else await this.recordMemberWork(stored, member, { revision, state: "nothing-to-save", at: this.retentionNow() });
-            continue;
-          }
-          let branch = primaryBranch;
-          let outcome: Awaited<ReturnType<typeof publishTeamHead>>;
-          try {
-            outcome = await publishTeamHead(group.cwd, target.remoteUrl, snapshot.commit, branch, this.config.teams?.commandPrefix, controller.signal,
-              ref => grantEnv(member, ref), this.options?.memberWorkPushTimeoutMs ?? 120000, this.options?.memberWorkCommandStopGraceMs ?? 2000);
-            if (!outcome.published && outcome.category === "rejected") {
-              branch = `${primaryBranch}-${snapshot.commit.slice(0, 8)}`;
-              outcome = await publishTeamHead(group.cwd, target.remoteUrl, snapshot.commit, branch, this.config.teams?.commandPrefix, controller.signal,
-                ref => grantEnv(member, ref), this.options?.memberWorkPushTimeoutMs ?? 120000, this.options?.memberWorkCommandStopGraceMs ?? 2000);
-            }
-          } catch {
-            outcome = { published: false, category: "other" };
-          }
-          if (controller.signal.aborted) return;
-          if (snapshot.nestedRepository) {
-            const nestedEvent = `Member ${member.memberId} has changes inside a nested repository or submodule that the host cannot save to GitHub. The workspace will be removed after the remaining attempts unless the owner saves the work.`;
-            await this.recordMemberWorkFailure(stored, member, revision, target.repository, branch, snapshot.commit, "nested-repository", nestedEvent);
-            continue;
-          }
-          if (outcome.published) {
-            const eventText = `Saved unfinished work of member ${member.memberId} as ${snapshot.commit.slice(0, 12)} to GitHub ${target.repository} ${branch} before its workspace is removed.`;
-            await this.recordMemberWork(stored, member, { revision, state: "published", repository: target.repository, branch, commit: snapshot.commit, at: this.retentionNow() }, eventText);
-          } else await this.recordMemberWorkFailure(stored, member, revision, target.repository, branch, snapshot.commit, outcome.category);
-        }
-      }
-    })().catch(() => {
-      console.warn("Could not record the result of a background team member work save.");
-    }).finally(() => {
-      this.memberWorkSaveRuns.delete(id);
-      this.memberWorkSaveControllers.delete(id);
-      this.memberWorkSaveTasks.delete(task);
-    });
-    this.memberWorkSaveTasks.add(task);
-    return true;
-  }
-  private recordMemberWorkFailure(stored: Stored, member: TeamMember, revision: number, repository: string, branch: string, commit: string | undefined, category: TeamPublicationCategory, additionalEventText?: string) {
-    const previous = member.savedWork?.revision === revision ? member.savedWork : undefined;
-    const attempts = previous?.failure?.attempts ? previous.failure.attempts + 1 : 1;
-    const state = attempts >= 5 ? "gave-up" : "retrying";
-    const at = this.retentionNow();
-    const retryAt = new Date(Date.parse(at) + 60_000 * 2 ** (attempts - 1)).toISOString();
-    const failure = { category, attempts, at, retryAt };
-    const eventText = state === "gave-up"
-      ? `Could not save unfinished work of member ${member.memberId} to GitHub after 5 attempts (${category}); its workspace is removed with the run.`
-      : `Could not save unfinished work of member ${member.memberId} to GitHub (${category}); the host retries before removing the workspace.`;
-    return this.recordMemberWork(stored, member, { revision, state, repository, branch, ...(commit ? { commit } : {}), at, failure }, eventText, additionalEventText);
-  }
   private persistRetiredRunId(id: string) {
     const ids = [...this.retiredRunIds].filter(item => item !== id);
     ids.push(id);
@@ -1256,85 +1120,6 @@ export class TeamService {
     writeSealed(join(this.directory, "retired.sealed"), this.key, "team:retired", ids);
     this.retiredRunIds.clear();
     for (const item of ids) this.retiredRunIds.add(item);
-  }
-  private async withRemovalSlot<T>(operation: () => Promise<T>) {
-    if (this.activeRemovals >= 2) await new Promise<void>(resolve => this.removalWaiters.push(resolve));
-    else this.activeRemovals++;
-    try { return await operation(); }
-    finally {
-      const next = this.removalWaiters.shift();
-      if (next) next();
-      else this.activeRemovals--;
-    }
-  }
-  /** Filesystem cleanup runs outside the serialized team mutation queue; only its result is enqueued. */
-  private removeOutsideQueue(stored: Stored, remove: () => Promise<unknown>, completed: (result: unknown) => void | Promise<void>, failed: (error: unknown) => void | Promise<void>) {
-    const id = stored.run.id;
-    if (this.removingRuns.has(id)) return false;
-    this.removingRuns.add(id);
-    let task: Promise<void>;
-    task = (async () => {
-      let didFail = false, failure: unknown, result: unknown;
-      try { result = await this.withRemovalSlot(remove); }
-      catch (error) { didFail = true; failure = error; }
-      try { await this.enqueue(() => didFail ? failed(failure) : completed(result)); }
-      catch (error) { console.warn("Could not record the result of a background team workspace removal.", error); }
-      finally { this.removingRuns.delete(id); }
-    })().finally(() => this.removalTasks.delete(task));
-    this.removalTasks.add(task);
-    return true;
-  }
-  private async deleteRecord(stored: Stored, waitForEvidence: boolean) {
-    const finalView = this.view(stored);
-    if (this.options?.events) {
-      this.emit(stored, "run.deleted", [], {}, { status: stored.run.status });
-      const flushed = this.flushOutbox(stored);
-      const advanced = this.options.events.advance();
-      // A blocked projector cannot catch up without a repair, so it does not hold the deletion.
-      if (!flushed || advanced.pending && advanced.blocked.length === 0) {
-        const retention = this.retentionState(stored);
-        retention.evidenceHeldAt ??= this.retentionNow();
-        const heldFor = (this.options.now?.() ?? Date.now()) - Date.parse(retention.evidenceHeldAt);
-        if (waitForEvidence && heldFor < EVIDENCE_WAIT_MS)
-          throw new TeamError(503, "team-evidence-pending", "The team's run events are not yet in the evidence store; its record is kept until they are stored.");
-        console.warn("Run events for a removed team were not stored; its record is removed anyway.");
-      }
-    }
-    try { this.persistRetiredRunId(stored.run.id); }
-    catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's deletion tombstone could not be saved; its record was kept."); }
-    try { await rmAsync(join(this.directory, `${stored.run.id}.sealed`), { force: true }); }
-    catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's record could not be removed."); }
-    this.commands.get(stored.run.id)?.abort();
-    this.commands.delete(stored.run.id);
-    this.records.delete(stored.run.id);
-    this.recorders.delete(stored.run.id);
-    this.entryBacklog.delete(stored.run.id);
-    // deleteRun never throws. A failed delete is repeated by the hourly sweep, so the removal does not wait on it.
-    this.evidence?.deleteRun(stored.run.id);
-    return finalView;
-  }
-  removeRun(id: string): Promise<TeamView> {
-    return this.enqueue(async () => {
-      const stored = this.record(id), run = stored.run;
-      if (this.needsPublication(stored)) throw new TeamError(409, "head-not-published", "The integrated head must be published to GitHub before this run can be removed.");
-      if (this.removingRuns.has(id)) throw new TeamError(409, "team-operation-running", "A background workspace removal is still running. Retry deletion after it settles.");
-      this.assertRunRetentionSafe(stored);
-      if (!(["cancelled", "merged", "no-change"].includes(run.status) && await this.membersSettled(stored)))
-        throw new TeamError(409, "team-active", "Only a settled cancelled, merged or no-change run can be removed.");
-      if (this.needsMemberWorkSaved(stored)) {
-        this.startMemberWorkSave(stored);
-        throw new TeamError(409, "member-work-not-saved", "Unfinished member work is being saved to GitHub before this run's workspaces are removed. Retry removal shortly.");
-      }
-      if (!run.workspaceRemovedAt || filesystemEntryExists(teamRunDirectory(run.workspace))) {
-        this.assertRunPath(stored, run.workspace);
-        await removeTeamWorkspace(teamRunDirectory(run.workspace), this.config.teams?.commandPrefix, undefined, this.teamRoot(stored));
-        run.workspaceRemovedAt ??= this.retentionNow();
-        for (const member of run.members) member.workspaceRemovedAt ??= run.workspaceRemovedAt;
-        this.event(stored, "Workspaces removed by the owner through removeRun after the run settled.");
-        this.save(stored);
-      }
-      return this.deleteRecord(stored, false);
-    });
   }
   rateTask(id: string, taskId: string, input: { requestId: string; score: number; note?: string }) {
     const stored = this.record(id), task = stored.run.tasks.find(item => item.id === taskId);
@@ -2952,197 +2737,6 @@ export class TeamService {
         ? "The permission reviewer was stopped because the run authority or revision changed."
         : "The obsolete permission review turn was confirmed stopped; the request remains with the user.");
       this.save(stored);
-    }
-  }
-  /** `operationEnded` lifts the fence of an interrupted operation. Only the retention gate passes it, and it then closes the run only after a look taken in the same pass found none of the operation's processes. */
-  private async membersSettled(stored: Stored, operationEnded = false) {
-    const { run } = stored;
-    if (this.commands.has(run.id)) return false;
-    // A terminal run's interrupted operation is never replayed, so it does not keep the run's clones alive.
-    if (stored.pending && !["cancelled", "merged", "no-change"].includes(run.status) && !operationEnded) return false;
-    for (const member of run.members) {
-      if (member.status === "stopped") continue;
-      // Whatever the recorded member status, a session that has exited or no longer exists has nothing left to stop.
-      // A deleted session can still answer state() from its saved status file, so existence is checked first.
-      try { this.manager.meta(member.sessionId); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; }
-      try { if ((await this.manager.state(member.sessionId)).status !== "exited") return false; }
-      catch { continue; }
-      // An exited process can precede the halt pass that records its owner stop. Keep that event's record alive.
-      if (stored.halt === "cancel" && activeMember(member)) return false;
-    }
-    return true;
-  }
-  private memberIntegratedAt(stored: Stored, member: TeamMember) {
-    if (member.status !== "stopped" || member.report?.kind !== "result") return undefined;
-    const retention = this.retentionState(stored), existing = retention.integratedAt[member.memberId];
-    if (existing) return existing;
-    const integratedTask = member.role === "implementer" && stored.run.tasks.some(task => task.id === member.taskId && task.memberId === member.memberId && task.status === "integrated");
-    const integratedEvent = [...stored.run.events].reverse().find(event => event.text === `${member.title} reported a result; its validated changes were integrated.`);
-    if (!integratedTask && !(member.role === "integrator" && integratedEvent)) return undefined;
-    const at = integratedEvent?.at ?? member.exitConfirmedAt ?? stored.run.updatedAt ?? stored.run.createdAt;
-    retention.integratedAt[member.memberId] = at;
-    return at;
-  }
-  private async reportRemovalFailure(stored: Stored, scope: string, error: unknown) {
-    const retention = this.retentionState(stored);
-    (retention.retryAt ??= {})[scope] = new Date((this.options?.now?.() ?? Date.now()) + REMOVAL_RETRY_MS).toISOString();
-    const message = error instanceof Error ? error.message : String(error);
-    const code = (error as NodeJS.ErrnoException)?.code ?? (error as { constructor?: { name?: string } })?.constructor?.name ?? "unknown";
-    const fingerprint = digest({ code, message });
-    const seen = (retention.removalErrors[scope] ??= []);
-    if (seen.includes(fingerprint)) return;
-    const previousEvents = stored.run.events.slice();
-    seen.push(fingerprint);
-    this.event(stored, `Workspace removal under the retention policy failed (failure ${fingerprint.slice(0, 12)}); the host will retry. See docs/teams.md.`);
-    try { this.save(stored); }
-    catch (saveError) {
-      seen.pop();
-      stored.run.events = previousEvents;
-      console.warn("Could not record a team workspace retention failure.", saveError);
-    }
-  }
-  /** A failed removal waits out its backoff before the scheduler launches it again. */
-  private removalBackoffActive(retention: RetentionState, scope: string, now: number) {
-    const retryAt = retention.retryAt?.[scope];
-    return retryAt !== undefined && now < Date.parse(retryAt);
-  }
-  private async retire(stored: Stored) {
-    try {
-      const { run } = stored, retention = this.retentionState(stored), policy = this.config.teams?.retention ?? DEFAULT_TEAM_RETENTION;
-      if (run.status === "blocked" || run.status === "paused") await this.refreshOperationCensus(stored);
-      // A run a live goal, mission or handoff still retains is left alone, so it is never closed underneath its owner.
-      if (this.removingRuns.has(run.id) || this.ownerPreventsRemoval(run) || this.hasPendingPreparationFrom(stored)) return;
-      const statusAtStart = run.status;
-      const runDirectory = teamRunDirectory(run.workspace);
-      const now = this.options?.now?.() ?? Date.now();
-      const elapsed = Math.max(0, now - Date.parse(retention.statusAt));
-      const retentionMs = run.status === "merged" || run.status === "no-change" ? policy.finishedMinutes * 60000
-        : run.status === "cancelled" ? policy.cancelledMinutes * 60000
-          : run.status === "ready-for-review" ? policy.reviewHours * 3600000
-            : run.status === "blocked" ? policy.blockedHours * 3600000 : undefined;
-      const removeRunInBackground = (startedAt: string) => this.removeOutsideQueue(stored,
-        () => removeTeamWorkspace(runDirectory, this.config.teams?.commandPrefix, undefined, this.teamRoot(stored)),
-        async () => {
-          if (this.records.get(run.id) !== stored) return;
-          for (const member of run.members) member.workspaceRemovedAt ??= startedAt;
-          if (!run.events.some(event => event.text.startsWith("Workspaces removed under the retention policy after this ")))
-            this.event(stored, `Workspaces removed under the retention policy after this ${run.status} run settled. See docs/teams.md.`);
-          try { this.save(stored); } catch (error) { console.warn("Could not persist a removed team workspace marker.", error); }
-          if (run.status === "cancelled" && !run.goal && !run.missionId && !this.ownerPreventsRemoval(run) && !this.hasPendingPreparationFrom(stored) && await this.membersSettled(stored)) {
-            try { await this.deleteRecord(stored, true); }
-            catch (error) { await this.reportRemovalFailure(stored, "record", error); }
-          }
-        },
-        async error => {
-          if (this.records.get(run.id) !== stored) return;
-          // The removal intent stays durable: a partially removed tree must never be resumed, and a later tick retries while the directory exists.
-          await this.reportRemovalFailure(stored, "workspaces", error);
-        });
-
-      if (!run.workspaceRemovedAt && !["cancelled", "merged", "no-change", "ready-for-review", "blocked"].includes(run.status)) {
-        const memberRetentionMs = policy.memberMinutes * 60000;
-        for (const member of run.members) {
-          const anotherMemberSharesWorkspace = run.members.some(candidate => candidate !== member && candidate.cwd === member.cwd);
-          if (stored.pending?.source?.cwd === member.cwd || anotherMemberSharesWorkspace) continue;
-          if (!member.workspaceRemovedAt) {
-            const integratedAt = this.memberIntegratedAt(stored, member);
-            if (!integratedAt || now - Date.parse(integratedAt) < memberRetentionMs) continue;
-            if (!filesystemEntryExists(member.cwd)) {
-              member.workspaceRemovedAt = this.retentionNow();
-              try { this.save(stored); }
-              catch (error) { member.workspaceRemovedAt = undefined; console.warn("Could not persist a missing member workspace marker.", error); }
-              continue;
-            }
-            member.workspaceRemovedAt = this.retentionNow();
-            const previousEvents = run.events.slice();
-            this.event(stored, "Member workspace removal under the retention policy started.");
-            try { this.save(stored); }
-            catch (error) {
-              member.workspaceRemovedAt = undefined;
-              run.events = previousEvents;
-              console.warn("Could not persist a started member workspace removal.", error);
-              continue;
-            }
-          } else if (!filesystemEntryExists(member.cwd) || this.removalBackoffActive(retention, `member:${member.memberId}`, now)) {
-            continue;
-          }
-          this.removeOutsideQueue(stored,
-            () => removeMemberWorkspace(runDirectory, member.cwd, this.config.teams?.commandPrefix, undefined, this.teamRoot(stored)),
-            async removed => {
-              if (this.records.get(run.id) !== stored) return;
-              const removedEvent = `Member workspace removed under the retention policy after its integrated result was consumed (member ${member.memberId}). See docs/teams.md.`;
-              if (removed && !run.events.some(event => event.text === removedEvent)) this.event(stored, removedEvent);
-              try { this.save(stored); } catch (error) { console.warn("Could not persist a removed member workspace marker.", error); }
-            },
-            async error => {
-              if (this.records.get(run.id) !== stored) return;
-              // Keep the member's removal marker: the clone may be partially removed and is retried while it exists.
-              await this.reportRemovalFailure(stored, `member:${member.memberId}`, error);
-            });
-          return;
-        }
-      }
-
-      if (this.needsPublication(stored)) this.startPublication(stored);
-      if (run.workspaceRemovedAt) {
-        if (filesystemEntryExists(runDirectory)) {
-          if (!this.removalBackoffActive(retention, "workspaces", now)) removeRunInBackground(run.workspaceRemovedAt);
-          return;
-        }
-        let completionChanged = false;
-        for (const member of run.members) if (!member.workspaceRemovedAt) {
-          member.workspaceRemovedAt = run.workspaceRemovedAt;
-          completionChanged = true;
-        }
-        const started = run.events.some(event => event.text === "Workspace removal under the retention policy started.");
-        const completed = run.events.some(event => event.text.startsWith("Workspaces removed under the retention policy after this "));
-        if (started && !completed) {
-          this.event(stored, `Workspaces removed under the retention policy after this ${run.status} run settled. See docs/teams.md.`);
-          completionChanged = true;
-        }
-        if (completionChanged) try { this.save(stored); } catch (error) { console.warn("Could not persist a completed team workspace removal.", error); }
-        if (run.status === "blocked") await this.closeStaleBlockedRun(stored, policy.blockedHours);
-        if (statusAtStart === "cancelled" && run.status === "cancelled" && !run.goal && !run.missionId && retentionMs !== undefined && elapsed >= retentionMs && await this.membersSettled(stored)) {
-          try { await this.deleteRecord(stored, true); }
-          catch (error) { await this.reportRemovalFailure(stored, "record", error); }
-        }
-        return;
-      }
-      const retentionDue = retentionMs !== undefined && elapsed >= retentionMs;
-      const retryDue = this.memberWorkRetryDue(stored, now);
-      if (!retentionDue && !retryDue) return;
-      // An interrupted operation keeps its fence unless the host looks now and finds none of its processes. Without a
-      // witness the fence stays. This pass runs on every tick, so the look comes last and only confirms: a look that
-      // found a process, or could not finish, stands until the next scheduled one above.
-      const witnessed = run.status === "blocked" && Boolean(stored.pending?.witness);
-      if (!(await this.membersSettled(stored, witnessed))) return;
-      if (this.needsPublication(stored)) { this.startPublication(stored); return; }
-      if (witnessed && stored.pending) {
-        const last = stored.census?.pendingId === stored.pending.id ? stored.census : undefined;
-        if (last && last.state !== "ended") return;
-        if (await this.refreshOperationCensus(stored, true) !== "ended") return;
-        if (run.status !== "blocked" || this.commands.has(run.id) || this.removingRuns.has(run.id)) return;
-      }
-      if (this.needsMemberWorkSaved(stored)) { this.startMemberWorkSave(stored); return; }
-      if (!retentionDue) return;
-      run.workspaceRemovedAt = this.retentionNow();
-      // The key names the fact, not the time, so a retried removal stores the same event once.
-      const settledKey = runEventKey("run.settled", run.id, [run.revision, "blocked", "workspace-removed"]);
-      if (run.status === "blocked") this.emit(stored, "run.settled", [run.revision, "blocked", "workspace-removed"], {}, { status: "blocked", summary: runSummaryCounts(run) });
-      const startedAt = run.workspaceRemovedAt, previousEvents = run.events.slice();
-      this.event(stored, "Workspace removal under the retention policy started.");
-      try { this.save(stored); }
-      catch (error) {
-        run.workspaceRemovedAt = undefined;
-        run.events = previousEvents;
-        if (stored.outbox) stored.outbox = stored.outbox.filter(event => event.key !== settledKey);
-        console.warn("Could not persist a started team workspace removal.", error);
-        return;
-      }
-      removeRunInBackground(startedAt);
-    } catch (error) {
-      console.warn("Team workspace retention could not be evaluated; the run was left unchanged.", error);
     }
   }
   private async step(stored: Stored) {

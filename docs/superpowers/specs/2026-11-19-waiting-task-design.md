@@ -1,6 +1,6 @@
 # A blocked task waits alone (INF-325)
 
-Date: 2026-11-19. Status: design for review, third draft. Two independent reviews read the first and second drafts; the changes made after the second review (the superseding rule in section 5, the provenance of the trigger, and the wording of the measurement) have not been reviewed again. Nothing is built. The design recommends not building it until the trigger in "When to build" is met, and the measurement there says it is not met today.
+Date: 2026-11-19. Status: design for review, fourth draft. An independent reviewer read the first three drafts. Its third look confirmed the superseding rule and found two inexact statements, about the join for the trigger and about resuming a blocked run; this draft corrects both, and those two corrections have not been reviewed again. Nothing is built, and the design recommends not building it yet (see "When to build").
 
 ## Intent
 
@@ -88,7 +88,7 @@ The stall window does not run while an owner decision for the wait is open, or w
 
 **Every change of revision supersedes every open wait.** The task list belongs to one revision, and six paths replace it: an owner steer, an owner continuation (`teams.ts:2127-2129`), a resume that advances the revision, automatic recovery (`teams.ts:2941-2943`), verification recovery (`teams.ts:2179`) and delivery recovery after the base moved (`teams.ts:5415`). In the same save that advances the revision, each open wait of the old revision is marked superseded with the cause, its manager is stopped, its open owner decision is closed as no longer applicable, and a resolution that arrives for it later is refused. This covers the case of several open waits where one ends in recovery: the others end with it. Superseded waits stay in the record as evidence. A cancel does the same without advancing the revision.
 
-**A block that keeps the revision suspends its waits.** When the run blocks without recovery (a deadline reached, `teams.ts:2550-2552`, or recovery not available), no further wait manager starts. The waits stay open in the record and continue only if the owner resumes the run in place. A halt that keeps the revision keeps its waits the same way.
+**A block that keeps the revision suspends its waits.** When the run blocks without recovery (a deadline reached, `teams.ts:2550-2552`, or recovery not available), no further wait manager starts. The waits stay in the record and nothing acts on them. A blocked run has no resume in place: the owner's resume or continuation advances the revision (`teams.ts:2264-2267`), and the rule above then supersedes them. One existing path keeps a revision across a pause: the owner's halt of a run that waits for input with nothing in flight (`teams.ts:2299-2313`). A run held that way keeps its waits, and they continue when the halt is released.
 
 ### 6. Missions
 
@@ -110,7 +110,7 @@ The owner's condition is a run wider than four. Width is capped at 4 today, so t
 
 A second trigger, measurable from data the host already keeps: **interrupted tasks**. For each automatic recovery from `agent-question` or `agent-blocked`, count the tasks in the continuation's snapshot that were not integrated, leaving out the source's own task and its dependents. Build when that count reaches 10 in 30 days. The count is a proxy: an interrupted task is not proven lost work, because recovery can carry it forward, and a pending task counts even if it had not started.
 
-The snapshot does not name the source (`packages/host/src/team-types.ts:673-682`). The `run.revision-advanced` event of the same revision does: it carries `sourceMemberId`, `sourceCode` and `fromRevision` (`teams.ts:2942`). The count joins the two by revision and then the member to its task. A recovery whose event is missing counts as unknown, not as zero. `run.recovery.source` cannot serve, because a later recovery overwrites it (`teams.ts:2793`). A block that never reaches a completed recovery leaves no snapshot, so blocked runs are counted from their current task list.
+The snapshot does not name the source (`packages/host/src/team-types.ts:673-682`). The `run.revision-advanced` event does: it carries `sourceMemberId`, `sourceCode` and `fromRevision` (`teams.ts:2942`). The snapshot records the revision that ended and the event records the one that began (`teams.ts:2937`, `:2941-2942`). The count therefore joins them by run id, with the snapshot's `revision` equal to the event's `fromRevision`, keeps the events whose cause is `automatic-recovery`, and maps the member to its task. A recovery whose event is missing, or whose event names no member, counts as unknown, not as zero. `run.recovery.source` cannot serve, because a later recovery overwrites it (`teams.ts:2793`). A block that never reaches a completed recovery leaves no snapshot, so blocked runs are counted from their current task list. Their source is the `sourceMemberId` of the `run.blocked` event (`teams.ts:928`), and a block without one counts as unknown.
 
 On 2026-11-19 the count over the retained history is 0. The join was not needed for that figure: every snapshot's candidate set was already empty.
 

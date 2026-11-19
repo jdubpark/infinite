@@ -159,7 +159,8 @@ test("a question is posted with its number and options, and an option number ans
     const { id, decision } = await questionFlow(h, services.missions);
     s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: id }));
     await s.surface.start(); await s.connected();
-    const question = `**Q1: ${decision.question}**\n\n1. JSON\n2. Text\n\nChoose below, or reply with a mention and your answer.`;
+    // The coordinator's own recommendation is posted before the options, and its option is marked.
+    const question = `**Q1: ${decision.question}**\n\nThe asking agent recommends: JSON. Reason: The subteam recommends it, and the web client parses JSON.\n\n1. JSON (recommended)\n2. Text\n\nChoose below, or reply with a mention and your answer.`;
     await waitFor(async () => s.texts(), list => list.includes(question));
     const questionPost = s.slack.posts(BINDING).find(post => post.text === question)!;
     const posted = s.slack.postPayloads(BINDING).find(post => post.text === question)!;
@@ -173,6 +174,7 @@ test("a question is posted with its number and options, and an option number ans
     const answered = await waitFor(async () => services.missions.peek(id)!, mission => Boolean(mission.decisions[0].answer), 30000);
     assert.equal(answered.decisions[0].answer, "JSON");
     assert.equal(answered.decisions[0].answeredBy, "owner");
+    assert.equal(answered.decisions[0].recommendation?.outcome, "matched", "A Slack button answer records how it compared with the recommendation");
     assert.ok(answered.events.some(event => /^The owner answered a question from Slack; the answer is being forwarded to subtask /.test(event.text)));
     await waitFor(async () => s.texts(), texts => texts.includes("Received your answer to Q1."));
     assert.equal(s.texts().at(-1), "Received your answer to Q1.", "A successful answer gets an in-thread receipt");

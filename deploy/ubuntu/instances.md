@@ -646,13 +646,18 @@ Until that attribution check has passed, set `intake.linear.admitIssues` to
 `false`, so that only the owner's direct requests start work and no issue filed
 through Linear's Slack agent is admitted.
 
-For a dedicated request channel, add its channel ID to
-`intake.slack.requestChannelIds` and enable `directRequests`. Subscribe to
-`message.channels` for public channels or `message.groups` for private channels.
-Grant the bot `reactions:write`, reinstall the Slack app to apply the added
-scope, and invite it to the channel. An empty or omitted list keeps mention-based
-intake. The workspace owner can post their request at the top level or reply
-to a teammate's proposal with `work:` followed by instructions.
+For requests from a single member in every channel the bot joins, enable
+`intake.slack.ownerOnlyInJoinedChannels` and `directRequests`. Set
+`ownerUserId` to the permitted member's Slack ID. Slack delivers public
+channel messages through `message.channels` and private channel messages
+through `message.groups`. Subscribe to both bot events, keep `app_mention`,
+and invite the bot to the intended channels. This mode uses the existing
+history and message scopes.
+
+For shared proposals, enable `directRequests` and list the dedicated channel
+IDs in `intake.slack.requestChannelIds`. Grant the bot `reactions:write` and
+reinstall the Slack app to apply the added scope. The owner can then sponsor
+a teammate's proposal by replying with `work:` and instructions.
 See [Slack request channels](../../docs/intake.md#slack-request-channels).
 
 Questions need no new scope either. Set `intake.slack.answerQuestions` to `true`

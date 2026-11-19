@@ -104,6 +104,8 @@ test("request channels are optional, bounded unique Slack channel IDs and requir
   assert.deepEqual(parsed({ slack: { ...slack, requestChannelIds: [] } }).intake!.slack!.requestChannelIds, []);
   assert.doesNotThrow(() => validate({ slack: { ...slack, directRequests: true, requestChannelIds: ["C123", "G456"] } }));
   assert.throws(() => validate({ slack: { ...slack, requestChannelIds: ["C123"] } }), /requestChannelIds needs intake\.slack\.directRequests/);
+  assert.doesNotThrow(() => validate({ slack: { ...slack, directRequests: true, ownerOnlyInJoinedChannels: true } }));
+  assert.throws(() => validate({ slack: { ...slack, ownerOnlyInJoinedChannels: true } }), /directRequests/);
   assert.throws(() => parsed({ slack: { ...slack, requestChannelIds: ["C123", "C123"] } }));
   assert.throws(() => parsed({ slack: { ...slack, requestChannelIds: ["U123"] } }));
   const tooManyChannels = Array.from({ length: 21 }, (_, index) => `C${String(index).padStart(3, "0")}`);

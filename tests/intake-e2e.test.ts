@@ -23,8 +23,10 @@ const slackLink = (thread: IntakeThread) => `https://example.slack.com/archives/
  * A real host through createApp, with Linear and (optionally) Slack fakes and two repository projects the mission
  * fixture agent can work in. Intake polls Linear every 30 seconds, so each issue is filed after the host starts.
  */
-async function intakeHost(withSlack: boolean, options: { direct?: boolean; answerQuestions?: boolean; requestChannelIds?: string[] } = {}) {
-  const { direct, answerQuestions, requestChannelIds } = options;
+async function intakeHost(withSlack: boolean, options: {
+  direct?: boolean; answerQuestions?: boolean; requestChannelIds?: string[]; ownerOnlyInJoinedChannels?: boolean;
+} = {}) {
+  const { direct, answerQuestions, requestChannelIds, ownerOnlyInJoinedChannels } = options;
   const root = realpathSync(mkdtempSync("/tmp/inf-intake-e2e-"));
   const receipts = join(root, "receipts");
   mkdirSync(receipts, { mode: 0o700 });
@@ -50,7 +52,8 @@ async function intakeHost(withSlack: boolean, options: { direct?: boolean; answe
       linear: { teamIds: [linear.teamId], creatorId: linear.ownerId, label: "infinite", commentsMirrorToSlack: false, ...(direct ? { admitIssues: false } : {}) },
       ...(slack ? { slack: { appTokenFile: slack.appTokenFile, botTokenFile: slack.botTokenFile, teamId: "T00000000", ownerUserId: OWNER,
         linearAgentUserId: AGENT, bindByMention: false, endpoint: slack.endpoint, ...(direct ? { directRequests: true } : {}),
-        ...(answerQuestions ? { answerQuestions: true } : {}), ...(requestChannelIds ? { requestChannelIds } : {}) } } : {}),
+        ...(answerQuestions ? { answerQuestions: true } : {}), ...(requestChannelIds ? { requestChannelIds } : {}),
+        ...(ownerOnlyInJoinedChannels ? { ownerOnlyInJoinedChannels } : {}) } } : {}),
       mission: { groupId: "api", maxSubtasks: 8, maxMinutes: 30 },
       maxActive: 3,
       requireSlackThread: slack !== undefined,
@@ -294,6 +297,54 @@ test("the owner's mention files one issue, starts the mission, and is acknowledg
   } finally {
     await world.close();
   }
+});
+
+test("only the owner can get a response in joined public and private channels", { timeout: 150_000 }, async () => {
+  const world = await intakeHost(true, {
+    direct: true, answerQuestions: true, ownerOnlyInJoinedChannels: true, requestChannelIds: [BINDING.channelId],
+  });
+  const { host, linear, slack: peer } = world, slack = peer!;
+  const teammate = "U22222222";
+  const question = "ask: ANSWER-DIRECT which exports failed?";
+  const bindings = [
+    { channelId: "C0000000041", threadTs: "1700000100.000001", channelType: "channel" },
+    { channelId: "C0000000042", threadTs: "1700000100.000002", channelType: "group" },
+    { channelId: "G0000000043", threadTs: "1700000100.000003", channelType: "group" },
+  ];
+  const send = async (event: Record<string, unknown>) => {
+    const envelope = await slack.emit(event);
+    await waitFor(async () => slack.acks().includes(envelope), Boolean, 5000);
+  };
+  try {
+    await waitFor(async () => (await host.fetchApi("/intake")).body.slack?.connected, Boolean);
+    for (const type of ["message", "app_mention"]) {
+      await send({ type, channel_type: "channel", user: teammate, channel: BINDING.channelId, ts: BINDING.threadTs,
+        text: type === "message" ? question : `<@${slack.botUserId}> ${question}` });
+    }
+    assert.equal(slack.calls.filter(call => call.method === "reactions.add").length, 0, "Even a listed channel stays owner-only");
+    for (const binding of bindings) {
+      slack.seedThread(binding, [{ user: OWNER, text: question }]);
+      await send({ type: "message", channel_type: binding.channelType, user: OWNER, channel: binding.channelId, ts: binding.threadTs, text: question });
+      await waitFor(async () => slack.posts(binding), posts => posts.some(post => post.text.startsWith("Answer (agent report)")), 60_000);
+      const before = slack.posts(binding).length;
+      const reply = { channel_type: binding.channelType, channel: binding.channelId, thread_ts: binding.threadTs };
+      await send({ ...reply, type: "message", user: teammate, ts: "1700000999.000001", text: "status" });
+      const mention = { type: "app_mention", channel: binding.channelId, thread_ts: binding.threadTs, text: `<@${slack.botUserId}> status` };
+      await send({ ...mention, user: teammate, ts: "1700000999.000002" });
+      await send({ ...mention, user: OWNER, ts: "1700000999.000003" });
+      const posts = await waitFor(async () => slack.posts(binding), list => list.length > before);
+      assert.equal(posts.length, before + 1, "Only the owner's status query gets a reply");
+      assert.match(posts.at(-1)!.text, /Question ·/);
+    }
+    const { records } = (await host.fetchApi("/intake")).body;
+    assert.equal(records.length, bindings.length);
+    for (const { issueId } of records) {
+      const stored = unseal<IntakeRecord>(readFileSync(host.config.keyFile), `intake-record:${issueId}`,
+        readFileSync(join(host.config.stateDir, "intake", "records", `${issueId}.sealed`), "utf8"));
+      assert.equal(stored.messages.filter(message => message.kind === "reply").length, 1, "Only one status reply can be delivered or retried");
+    }
+    assert.deepEqual(linear.calls, []);
+  } finally { await world.close(); }
 });
 
 for (const entry of ["mention", "request channel"] as const) {

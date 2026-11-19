@@ -24,6 +24,8 @@ export const intakeConfigSchema = z.object({
     bindByMention: z.boolean().default(false),
     /** True lets the owner's mention of the bot file a Linear issue and start a mission. */
     directRequests: z.boolean().default(false),
+    /** True accepts the owner's ordinary messages in joined public and private channels. Needs directRequests. */
+    ownerOnlyInJoinedChannels: z.boolean().optional(),
     /** True lets the owner's mention be a question: it is routed to a read-only answer or to a filed request. Needs directRequests. */
     answerQuestions: z.boolean().default(false),
     /** Slack channels whose owner-authored messages can be filed directly as requests. Empty or absent disables channel intake. */

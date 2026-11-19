@@ -245,9 +245,11 @@ export class IntakeSlackSurface {
     return this.directOn() ? FOLLOW_UP_DIRECT : FOLLOW_UP_LINEAR;
   }
 
-  /** Ordinary channel messages are enabled only by the explicit channel map and direct-request switch. */
+  /** Ordinary channel messages use the joined-channel policy or the legacy explicit channel map. */
   private mappedChannel(channelId: string): boolean {
-    return this.directOn() && (this.slack?.requestChannelIds ?? []).includes(channelId);
+    if (!this.directOn()) return false;
+    if (this.slack?.ownerOnlyInJoinedChannels) return /^[CG][A-Z0-9]{2,20}$/.test(channelId);
+    return (this.slack?.requestChannelIds ?? []).includes(channelId);
   }
 
   private threadReplies(thread: IntakeThread | undefined): boolean {
@@ -519,9 +521,15 @@ export class IntakeSlackSurface {
       this.droppedCount += 1;
       return;
     }
-    const mention = event.type === "app_mention";
+    const owner = event.user === slack.ownerUserId;
     const mapped = this.mappedChannel(event.channel);
-    const channelMessage = event.type === "message" && mapped && (event.channelType === "channel" || event.channelType === "group");
+    const isChannel = event.channelType === "channel" || event.channelType === "group";
+    // Slack omits channel_type on app_mention. A private channel can have a C or G ID.
+    if (slack.ownerOnlyInJoinedChannels && (!owner || !mapped || (event.channelType !== undefined && !isChannel))) {
+      this.droppedCount += 1; return;
+    }
+    const mention = event.type === "app_mention";
+    const channelMessage = event.type === "message" && mapped && isChannel;
     if (!mention && !channelMessage) { this.droppedCount += 1; return; }
     const ts = event.ts, thread = { channelId: event.channel, threadTs: event.threadTs ?? ts };
     const inThread = thread.threadTs !== ts;
@@ -535,8 +543,6 @@ export class IntakeSlackSurface {
     if (channelMessage && raw !== text) return;
     if (channelMessage && (!text || addressedToSomeoneElse(text))) { this.droppedCount += 1; return; }
     const eventId = envelope.eventId ?? envelope.envelopeId;
-    const owner = event.user === slack.ownerUserId;
-
     if (mapped && inThread && text.toLowerCase() === "status") {
       this.postThreadStatus(this.store.boundTo(thread), ts, owner);
       return;

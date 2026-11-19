@@ -68,10 +68,22 @@ the hold reason too. A failed start is retried on a later cycle.
 
 A request channel gives developers and users one thread for a proposal, the
 owner's decision to take it on, questions from the swarm, and the result.
-Use a dedicated channel. An ordinary top-level message from the configured
-owner can file a Linear issue and start work.
+An ordinary top-level message from the configured owner can file a Linear
+issue and start work. Choose who can interact with the bot.
 
-| In the request channel | What happens |
+- **One member across joined channels.** Enable `intake.slack.directRequests`
+  and `intake.slack.ownerOnlyInJoinedChannels`. The member identified by
+  `intake.slack.ownerUserId` can ask, start work, steer, and request status
+  in any public or private channel the bot joins. Only that member can
+  trigger a reply, including by mentioning the bot. Proposal reactions apply
+  only to the shared proposal policy below. The one-member policy
+  also applies to any listed request channels. Channel members can read the
+  resulting thread.
+- **Shared proposals in dedicated channels.** Set `intake.slack.requestChannelIds`
+  and enable `directRequests`. Teammates in those channels can propose work
+  and ask for status. The owner decides which proposals to take on.
+
+| In a shared proposal channel | What happens |
 | --- | --- |
 | A teammate opens a thread with “The export skips empty rows.” | The bot adds 👀 to acknowledge the proposal. The proposal stays in Slack until the owner takes it on. |
 | The owner replies `work: Include empty rows in the CSV export.` | Infinite files the owner's instructions in Linear and starts or queues the mission. Earlier thread messages supply attributed background. |
@@ -91,11 +103,10 @@ confirmed bot post opens it. An answer must also follow the question in Slack.
 A delayed message written earlier cannot answer a new question or control a
 later request that shares the thread.
 
-Enable `intake.slack.directRequests` and set `intake.slack.requestChannelIds` to
-the channel IDs. Invite the bot to each channel. Add the `message.channels`
-event for public channels or `message.groups` for private channels, and grant
-the bot `reactions:write` for proposal acknowledgements. Keep `app_mention`
-subscribed for explicit requests. See the [Slack app setup](../deploy/ubuntu/instances.md#slack-app-and-read-only-connectors).
+Invite the bot to each channel. Subscribe to `message.channels` for public
+channels and `message.groups` for private channels, and keep `app_mention`
+for explicit requests. Shared proposal acknowledgements also need the
+`reactions:write` scope. See the [Slack app setup](../deploy/ubuntu/instances.md#slack-app-and-read-only-connectors).
 
 This follows Vercel Board's practice of keeping the human conversation in one
 thread and publishing selected updates. Infinite binds a request to its Slack
@@ -298,6 +309,7 @@ The `intake` block is validated by `intakeConfigSchema` in
 | `slack.linearAgentUserId` | `U` or `W` ID, optional; required when `requireSlackThread` is on, unless `linear.admitIssues` is `false` | Linear's agent user in Slack, mentioned by the owner to file a request. |
 | `slack.directRequests` | boolean, default `false` | Lets the owner's mention of the bot file a Linear issue and start a mission. See [direct requests](#direct-requests). |
 | `slack.requestChannelIds` | up to 20 unique public or private channel IDs, optional | Enables proposals, untagged owner requests and replies, and thread-local status in these channels. A nonempty list requires `directRequests`. |
+| `slack.ownerOnlyInJoinedChannels` | boolean, optional | Accepts requests only from `ownerUserId` in every joined public or private channel. Takes precedence over `requestChannelIds` and requires `directRequests`. |
 | `slack.answerQuestions` | boolean, default `false` | Lets the owner's mention be a question that a read-only mission answers in the thread. Needs `slack.directRequests`. See [questions](#questions). |
 | `slack.classify` | boolean, default `false` | Lets the reading service choose the route when the mention has no `ask:` or `work:`. Needs `slack.answerQuestions` and the top-level `jev` block. An instance that wants only the route reading sets `jev.sessionReadings` to `false`. |
 | `slack.bindByMention` | boolean, default `false` | Binds a thread by a mention of an identifier. Cannot be used with `requireSlackThread`. |

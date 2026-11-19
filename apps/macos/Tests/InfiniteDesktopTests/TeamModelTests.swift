@@ -19,6 +19,19 @@ import InfiniteCore
         XCTAssertEqual(model.run, row)
     }
 
+    func testARowOfALaterRevisionPutsAFullReadBehindUntilTheRunIsReadAgain() {
+        let model = model(run("2026-01-01T00:00:00.000Z", revision: 3))
+        XCTAssertFalse(model.behind, "a row seed is not a full read")
+        model.observe(run("2026-01-01T00:01:00.000Z", revision: 3, objective: "The request."))
+        model.observeListRow(run("2026-01-01T00:02:00.000Z", revision: 3))
+        XCTAssertFalse(model.behind, "a later row of the same revision leaves requests valid")
+        model.observeListRow(run("2026-01-01T00:03:00.000Z", revision: 4))
+        XCTAssertTrue(model.behind, "a request naming revision 3 would be refused")
+        XCTAssertEqual(model.run.revision, 3)
+        model.observe(run("2026-01-01T00:03:00.000Z", revision: 4, objective: "The request."))
+        XCTAssertFalse(model.behind)
+    }
+
     func testAListRowNeverReplacesAFullRead() {
         let model = model(run("2026-01-01T00:00:00.000Z"))
         let full = run("2026-01-01T00:00:01.000Z", objective: "Export the report")

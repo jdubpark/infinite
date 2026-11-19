@@ -14,19 +14,22 @@ export type TeamListMember = Pick<ViewMember, "memberId" | "sessionId" | "role" 
   modelProfile?: Pick<TeamModelProfile, "label" | "provider" | "tier">;
   usage?: Pick<UsageTotals, "cost">;
 };
-export type TeamListTask = Pick<ViewTask, "id" | "title" | "status" | "paths" | "memberId" | "changedPaths" | "ownerRating">;
+export type TeamListTask = Pick<ViewTask, "id" | "title" | "status" | "paths" | "dependsOn" | "memberId" | "changedPaths" | "ownerRating">;
 
 /**
- * One run as `GET /api/teams` and the live `teams` topic list it. It keeps, under the same keys and with the same meaning,
- * every field the web, phone, Mac and CLI list code reads, and drops the long text that only a run's detail shows:
- * check output, member reports, task instructions and summaries, continuations, the objective, steering, briefs and
- * issue bodies. Arrays that list code counts or filters keep every item, reduced. `GET /api/teams/:id` keeps the full record.
+ * One run as `GET /api/teams?view=list` lists it, and as the remote channel answers a full list too large for it. It
+ * keeps, under the same keys and with the same meaning, every field the web, phone and Mac list code reads, and drops
+ * the long text that only a run's detail shows: check output, member reports, task instructions and summaries,
+ * continuations, the objective, steering, briefs and issue bodies. Arrays that list code counts or filters keep every
+ * item, reduced. A client built before rows existed may show a row as a whole run, so a row also keeps what a run's
+ * check summary and task order are computed from: each check's command and phase, and each task's dependencies.
+ * `GET /api/teams` without `view` and `GET /api/teams/:id` keep the full record.
  */
 export type TeamListItem = Pick<TeamView, "id" | "projectId" | "provider" | "title" | "status" | "revision" | "parallelism" | "createdAt" | "updatedAt"
   | "workspace" | "branch" | "baseCommit" | "headCommit" | "reason" | "missionId" | "permissionsRevokedAt" | "decisions" | "workers" | "resumable" | "continuable"> & {
   members: TeamListMember[];
   tasks: TeamListTask[];
-  checks: Pick<TeamView["checks"][number], "status" | "revision">[];
+  checks: Pick<TeamView["checks"][number], "command" | "phase" | "status" | "revision">[];
   /** The latest history entry only. */
   events: TeamView["events"];
   lineup?: Pick<NonNullable<TeamView["lineup"]>, "coordinator">;
@@ -51,9 +54,9 @@ function memberRow(member: ViewMember): TeamListMember {
 }
 
 function taskRow(task: ViewTask): TeamListTask {
-  const { id, title, status, paths, memberId, changedPaths, ownerRating } = task;
+  const { id, title, status, paths, dependsOn, memberId, changedPaths, ownerRating } = task;
   return {
-    id, title, status, paths, memberId, ownerRating,
+    id, title, status, paths, dependsOn, memberId, ownerRating,
     changedPaths: changedPaths && changedPaths.paths.length > LIST_CHANGED_PATHS ? { paths: changedPaths.paths.slice(0, LIST_CHANGED_PATHS), truncated: true } : changedPaths,
   };
 }
@@ -68,7 +71,7 @@ export function teamListItem(view: TeamView): TeamListItem {
     missionId, permissionsRevokedAt, decisions, workers, resumable, continuable,
     members: view.members.map(memberRow),
     tasks: view.tasks.map(taskRow),
-    checks: view.checks.map(check => ({ status: check.status, revision: check.revision })),
+    checks: view.checks.map(check => ({ command: check.command, phase: check.phase, status: check.status, revision: check.revision })),
     events: view.events.slice(-1),
     lineup: lineup && { coordinator: lineup.coordinator },
     goal: goal && { id: goal.id, revision: goal.revision, cycle: goal.cycle },

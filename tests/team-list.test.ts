@@ -53,7 +53,7 @@ function finishedRun(index: number): TeamView {
       title: `Parser grammar ${index}`, description: prose("The parser refuses documented input.", 6000), state: { name: "In Review", type: "started" }, updatedAt: at(95) } },
     members, tasks, permissionDecisions,
     decisions: [{ id: randomUUID(), memberId: members[0].memberId, revision: 1, question: prose("Should the parser keep the old error text?", 400), options: ["Keep", "Replace"], createdAt: at(30), answer: "Keep", answeredBy: "owner", answeredAt: at(31) }],
-    checks: Array.from({ length: 4 }, (_, slot) => ({ command: { command: "npm", args: ["run", `check-${slot}`] }, status: "passed" as const, startedAt: at(60 + slot), finishedAt: at(61 + slot),
+    checks: Array.from({ length: 4 }, (_, slot) => ({ command: { command: "npm", args: ["run", `check-${slot}`] }, ...(slot ? {} : { phase: "setup" as const }), status: "passed" as const, startedAt: at(60 + slot), finishedAt: at(61 + slot),
       exitCode: 0, output: prose(`ok ${slot} - grammar case passes`, 60 * KIB), revision: 1 })),
     continuations: [{ revision: 1, requestId: randomUUID(), at: at(50), reason: prose("Continue with the remaining grammar cases.", 800), headCommit: commit(index + 2), tasks: tasks.slice(0, 6) }],
     steering: [{ text: prose("Prefer small commits.", 600), revision: 1, at: at(40) }],
@@ -105,6 +105,8 @@ test("a list row keeps every field client list code reads, unchanged, and nothin
     "deliveryReceipt.headCommit", "deliveryReceipt.pullRequestUrl", "deliveryReceipt.mergeCommit", "pullRequest.pullRequestUrl", "review.verdict", "review.revision", "discovery.revision",
     "permissions.mode", "permissions.maxDecisions", "permissionDecisions.*.targetSessionId", "permissionDecisions.*.promptId", "permissionDecisions.*.status",
     "usage.total", "usage.unmeasuredMembers", "checks.*.status", "checks.*.revision",
+    // A client that shows a row as a whole run computes its check summary and task order from these.
+    "checks.*.command", "checks.*.phase", "tasks.*.dependsOn",
     ...["memberId", "sessionId", "role", "revision", "title", "status", "taskId", "provider", "startedAt", "reportedAt", "lastActivityAt", "stalledAt", "stoppedReason",
       "pendingLimit", "modelProfile.label", "modelProfile.provider", "modelProfile.tier", "usage.cost"].map(key => `members.*.${key}`),
     ...["id", "title", "status", "paths", "memberId", "changedPaths", "ownerRating"].map(key => `tasks.*.${key}`),

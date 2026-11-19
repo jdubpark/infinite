@@ -3139,25 +3139,30 @@ cycle's PM selects capacity for its work. The refusal uses `409` with
 `GET /api/teams` without `view` answers every run in full, which is what
 installed clients read. `view=list` answers one compact row per run for list
 screens. A row uses the same keys and meanings as the full record and leaves
-out the request, check commands and output, member reports, task instructions
-and summaries, continuations, steering, the brief and issue descriptions. It
+out the request, check output, member reports, task instructions and
+summaries, continuations, steering, the brief and issue descriptions. It
 keeps the run's identity, status, revision, times, branch and commits, reason
-and worker counts; its decisions in full; reduced `members`, `tasks` (at most
-20 changed paths each, then `truncated`) and `checks`; the latest entry of
+and worker counts; its decisions in full; reduced `members`; `tasks` with
+their dependencies and at most 20 changed paths each, then `truncated`;
+`checks` with their command, phase, status and revision; the latest entry of
 `events`; and the identifying fields of `lineup`, `goal`, `linear`, `review`,
 `discovery`, `pullRequest`, `deliveryReceipt`, `permissions`,
 `permissionDecisions` and `usage`. `TeamListItem` in
 `packages/host/src/team-list.ts` is the exact shape. A row is reduced, not
-redacted: decision text, the reason and paths appear as in the full record.
-The list is not paginated. Read a run's detail from `GET /api/teams/:id`.
+redacted: decision text, the reason, check commands and paths appear as in
+the full record. The list is not paginated. Read a run's detail from
+`GET /api/teams/:id`.
 
 A full list grows with every stored run and its check output. The remote
-channel carries at most 4 MiB per response, so when the full list exceeds
-that, the channel answers the compact rows in its place and skips the full
-read for the next five minutes. A client built before `view=list` existed then
-reads rows where it expected full records: its list screens work, and a screen
-that shows a run's detail from a list row lacks that detail until it reads the
-run itself.
+channel carries at most 4 MiB per response. When the answer to
+`GET /api/teams` with no query exceeds that, the channel answers the compact
+rows in its place, and answers rows without the full read for the next five
+minutes, also when the list has shrunk in that time. A client built before
+`view=list` existed then reads rows where it expected full records. Its list
+screens work. A screen that shows a run from a list row computes the run's
+status, check summary and task order correctly, because a row keeps what
+those are computed from, and lacks the request, check output, reports and
+task text until it reads the run itself.
 
 The context response lists, for each member of the current revision and each
 earlier member still running, its repository-relative `files` with `reads`,

@@ -471,6 +471,8 @@ struct TeamResumeFailure: Equatable {
         }
         resumingTeams.insert(id)
         teamResumeFailures[id] = nil
+        // A kept model holds its last full read. Resume names the run's revision, so read the run again when the list has passed it.
+        if model.behind { await model.poll() }
         await model.perform("resume")
         resumingTeams.remove(id)
         teamResumeFailures[id] = model.noticeIsError ? TeamResumeFailure(message: model.notice) : nil

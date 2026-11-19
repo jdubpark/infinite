@@ -497,6 +497,43 @@ test("a launch with the register on carries the register digest", async () => {
   } finally { goals?.close(); teams.close(); f.close(); }
 });
 
+test("a goal run's pass reads and writes the goal's record", async () => {
+  const f = fixture(), teams = f.openTeam();
+  setRegisterOn(f);
+  let goals: GoalService | undefined;
+  try {
+    goals = new GoalService(f.config, f.key, teams);
+    const created = await goals.create(createInput());
+    goals.close();
+    const stored = f.readRecord<StoredShape>("goal", created.id);
+    const checked = { ...assumptionOf("a1", "intent-check"), test: { kind: "command", command: commandDigest(command), refutesOn: "fail" } };
+    f.writeRecord("goal", created.id, { ...stored, objectiveRecord: recordWithAssumptions(stored.goal, [checked]) });
+    goals = new GoalService(f.config, f.key, teams);
+    goals.start();
+    await barrier(goals, created.id);
+    const teamId = goals.get(created.id).activeTeamId!;
+    assert.ok(teamId, "the tick launched the cycle");
+    // A goal service that never starts still gives the team service its record port, and no goal tick races the pass.
+    goals.close();
+    goals = new GoalService(f.config, f.key, teams);
+    const before = (f.readRecord<StoredShape>("goal", created.id).objectiveRecord as ObjectiveRecord).version;
+
+    // The run settles with a failed check at its revision: the check pass tests a1 and writes the goal's record.
+    const held = (teams as unknown as { record(id: string): { run: TeamRun } }).record(teamId);
+    held.run.headCommit ??= "1".repeat(40);
+    held.run.status = "ready-for-review";
+    held.run.checks = [{ command, status: "failed", startedAt: new Date().toISOString(), output: "", revision: held.run.revision,
+      headCommit: held.run.headCommit, round: 1 }] as TeamRun["checks"];
+    const register = (teams as unknown as { objectiveTests: { mark(holder: unknown): void; drain(): void; idle(): Promise<void> } }).objectiveTests;
+    register.mark(held);
+    register.drain();
+    await register.idle();
+    const after = f.readRecord<StoredShape>("goal", created.id).objectiveRecord as ObjectiveRecord;
+    assert.equal(after.version, before + 1, "the pass writes one version of the goal's record");
+    assert.equal(after.assumptions.find(item => item.id === "a1")?.status, "refuted", "the failed check refutes a1");
+  } finally { goals?.close(); teams.close(); f.close(); }
+});
+
 test("an owner rating stamps the latest reviewed cycle's head", async () => {
   const f = fixture(), teams = f.openTeam();
   setRegisterOn(f);

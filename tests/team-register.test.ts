@@ -212,11 +212,30 @@ test("a settled revision gets one pass", async () => {
   assert.equal(holder.register?.pass?.state, "done", "the check pass ends done");
   assert.equal(w.reader.calls.length, 1, "a check pass reads nothing");
 
+  // The same revision is then reviewed on its head: a reviewed pass follows the check pass.
+  holder.run.status = "ready-for-review";
+  holder.run.review = { verdict: "approved", summary: "Approved.", revision: 2 };
+  holder.checkHead = HEAD;
+  w.register.mark(holder);
+  assert.equal(holder.register?.pass?.kind, "reviewed", "a reviewed pass follows a check pass of the same revision");
+  w.register.drain();
+  await w.register.idle();
+  assert.equal(holder.register?.pass?.state, "done", "the reviewed pass ends done");
+
   // An unpinned run gets no pass.
   const plain = runOf({ id: "run-plain", register: undefined });
   const plainHolder: RegisterHolder = { run: plain, checkHead: HEAD };
   w.register.mark(plainHolder);
   assert.equal(plainHolder.register?.pass, undefined, "an unpinned run gets no pass");
+
+  // A run that has not settled gets no pass, and neither does a settled revision with no check at that revision.
+  const busyHolder: RegisterHolder = { run: runOf({ id: "run-busy", status: "implementing" }), checkHead: HEAD };
+  w.register.mark(busyHolder);
+  assert.equal(busyHolder.register?.pass, undefined, "a run that has not settled gets no pass");
+  const unchecked = runOf({ id: "run-unchecked", revision: 2, review: { verdict: "approved", summary: "Approved.", revision: 2 } });
+  const uncheckedHolder: RegisterHolder = { run: unchecked, checkHead: HEAD };
+  w.register.mark(uncheckedHolder);
+  assert.equal(uncheckedHolder.register?.pass, undefined, "a revision without a check at that revision gets no pass");
 });
 
 test("a pass never outlives its run or its revision", async () => {
@@ -254,6 +273,37 @@ test("a pass never outlives its run or its revision", async () => {
     assert.equal(tested.length > 0 && tested.every(entry => (entry.after as { inline: { revision: number } }).inline.revision === 2), true,
       "every test.recorded entry is revision 2's");
     assert.equal(w.port.records.get(GOAL_ID)?.version, 2, "one write, from revision 2's pass");
+  }
+
+  // A newer revision is marked before the queued pass starts: the stale job is skipped, and the newer pass runs once.
+  {
+    const w = world();
+    const holder = holderOf(w, runOf(), baseRecord([artifactAssumption("a2", ENTRIES, 2)]));
+    w.reader.files.set(`${HEAD}:${ENTRIES}`, json({ entries: [] }));
+    w.reader.files.set(`${OTHER}:${ENTRIES}`, json({ entries: [] }));
+    w.register.mark(holder);
+    Object.assign(holder.run, { revision: 2, headCommit: OTHER, review: { verdict: "approved", summary: "Approved.", revision: 2 } });
+    holder.run.checks.push(check("failed", 2, OTHER));
+    holder.checkHead = OTHER;
+    w.register.mark(holder);
+    w.register.drain();
+    await w.register.idle();
+    assert.deepEqual(w.reader.calls, [`${OTHER}:${ENTRIES}`], "only the newer pass reads, once");
+    assert.equal(w.port.records.get(GOAL_ID)?.version, 2, "one write, from the newer pass");
+    assert.equal(w.events.length, 1, "one event");
+  }
+
+  // The register closes while the pass reads: the pass is aborted, so no further read starts and nothing is written.
+  {
+    const w = world();
+    const holder = holderOf(w, runOf(), baseRecord([artifactAssumption("a1", "p1.json", 1), artifactAssumption("a2", ENTRIES, 2)]));
+    w.reader.onRead = () => { w.register.close(); };
+    w.register.mark(holder);
+    w.register.drain();
+    await w.register.idle();
+    assert.equal(w.reader.calls.length, 1, "no read starts after close");
+    assert.equal(w.port.records.get(GOAL_ID)?.version, 1, "a closed register writes nothing");
+    assert.equal(w.events.length, 0, "a closed register adds no event");
   }
 
   // The run moves on to a revision that is not due before the pass plans: the pass still reads the commit it was marked at.

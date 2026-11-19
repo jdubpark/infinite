@@ -23,6 +23,7 @@ type Fixture = ReturnType<typeof schedulerFixture>;
 type Internal = {
   record(id: string): unknown;
   ingestEntries(): void;
+  save(stored: unknown): void;
 };
 const internal = (teams: TeamService) => teams as unknown as Internal;
 
@@ -92,8 +93,8 @@ function recordFor(f: Fixture): ObjectiveRecord {
  * Writes the run at ready-for-review on `head`, approved, with a failed `rank-verify` at its head, and its reviewer holding the
  * entry tools. The record is standalone and sealed with the run; `register` pins the run as a created run would.
  */
-function seedRun(f: Fixture, head: string, record: ObjectiveRecord, options: { register?: boolean } = {}): void {
-  f.run.status = "ready-for-review";
+function seedRun(f: Fixture, head: string, record: ObjectiveRecord, options: { register?: boolean; status?: TeamRun["status"] } = {}): void {
+  f.run.status = options.status ?? "ready-for-review";
   f.run.revision = 1;
   f.run.headCommit = head;
   f.run.review = { verdict: "approved", summary: "Approved.", revision: 1 } as TeamRun["review"];
@@ -175,6 +176,27 @@ test("acceptance 5 end to end", async () => {
     assert.equal(lines.length, 1, `commands: ${JSON.stringify(lines)}`);
     assert.ok(lines[0]!.args.includes("cat-file"));
     assert.equal(lines[0]!.args.at(-1), `${head}:${ENTRIES}`);
+  } finally { store.close(); f.close(); }
+});
+
+test("a run that settles while the service runs gets its pass from the tick", async () => {
+  const { f } = registerFixture(), store = openStore(f);
+  try {
+    const head = commitEntries(f, entriesDocument(31));
+    seedRun(f, head, recordFor(f), { status: "integrating" });
+    const teams = f.openTeam({ entries: new Blackboard(store) });
+    const tests = registerOf(teams);
+    assert.equal(tests.pending(f.run.id), false, "a run that has not settled has no pass at open");
+
+    // The run settles: the save that writes it marks the pass, and the service's own tick starts it.
+    const held = internal(teams).record(f.run.id) as { run: TeamRun };
+    held.run.status = "ready-for-review";
+    internal(teams).save(held);
+    assert.equal(tests.pending(f.run.id), true, "the save marks the pass");
+    teams.start();
+    await waitUntil(() => tests.receipts(f.run.id) !== undefined, "the tick runs the pass", 15000);
+    await tests.idle();
+    assert.equal(recordOf(teams, f.run.id).log.filter(entry => entry.op === "test.recorded").length, 1, "one test version");
   } finally { store.close(); f.close(); }
 });
 

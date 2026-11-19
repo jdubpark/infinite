@@ -1,6 +1,6 @@
 # A blocked task waits alone (INF-325)
 
-Date: 2026-11-19. Status: design for review, second draft after an independent review of the first. Nothing is built. The design recommends not building it until the trigger in "When to build" is met, and the measurement there says it is not met today.
+Date: 2026-11-19. Status: design for review, third draft. Two independent reviews read the first and second drafts; the changes made after the second review (the superseding rule in section 5, the provenance of the trigger, and the wording of the measurement) have not been reviewed again. Nothing is built. The design recommends not building it until the trigger in "When to build" is met, and the measurement there says it is not met today.
 
 ## Intent
 
@@ -34,10 +34,11 @@ Observed on `main` at `c96e361e`:
 
 Read-only counts from the live host on 2026-11-19, over the 29 runs it holds (28 created in the last 30 days; 11 at width 1, 11 at width 2, 7 at width 4):
 
-- Automatic recoveries from `agent-blocked`: 5. From `agent-question`: 0.
-- Tasks that were not integrated when one of those five recoveries replanned the run: 0. Four happened at a revision with no task list and one after both of its tasks were integrated, so the blocker came from a later stage each time.
+- Completed automatic recoveries from `agent-blocked`: 5. From `agent-question`: 0.
+- Tasks not integrated in the plan snapshot those five recoveries saved: 0. Four snapshots hold no task list and one holds two tasks, both integrated.
+- Runs blocked now without a completed recovery: 1. It ran at width 1, holds no task, and was blocked by its project manager's own report.
 
-In this history no worker's question or blocker interrupted another task. The rule in this document would have changed nothing.
+These recoveries and this blocked run contain no task that a worker's question or blocker interrupted, so the rule in this document would have changed none of them. The count cannot see runs removed under retention, and it says nothing about time or money lost or about wider runs.
 
 ## Design
 
@@ -85,7 +86,9 @@ A `recover` report, a refused amendment, a manager that exits without a report, 
 
 The stall window does not run while an owner decision for the wait is open, or while the run is paused or halted.
 
-Owner control takes over at any time. A steer, a resume that advances the revision, and a cancel drop the revision's waits with an event that says so, and a resolution that arrives for a dropped wait is refused. A halt that keeps the revision keeps its waits.
+**Every change of revision supersedes every open wait.** The task list belongs to one revision, and six paths replace it: an owner steer, an owner continuation (`teams.ts:2127-2129`), a resume that advances the revision, automatic recovery (`teams.ts:2941-2943`), verification recovery (`teams.ts:2179`) and delivery recovery after the base moved (`teams.ts:5415`). In the same save that advances the revision, each open wait of the old revision is marked superseded with the cause, its manager is stopped, its open owner decision is closed as no longer applicable, and a resolution that arrives for it later is refused. This covers the case of several open waits where one ends in recovery: the others end with it. Superseded waits stay in the record as evidence. A cancel does the same without advancing the revision.
+
+**A block that keeps the revision suspends its waits.** When the run blocks without recovery (a deadline reached, `teams.ts:2550-2552`, or recovery not available), no further wait manager starts. The waits stay open in the record and continue only if the owner resumes the run in place. A halt that keeps the revision keeps its waits the same way.
 
 ### 6. Missions
 
@@ -105,9 +108,11 @@ That design already speaks of a search's "hold" on a task, so this document says
 
 The owner's condition is a run wider than four. Width is capped at 4 today, so that condition cannot be met until the cap changes.
 
-A second trigger, measurable from data the host already keeps: **interrupted tasks**. For each automatic recovery from `agent-question` or `agent-blocked`, count the tasks in the continuation's snapshot that were not integrated, leaving out the source's own task and its dependents. Build when that count reaches 10 in 30 days. The count is a proxy: an interrupted task is not proven lost work, because recovery can carry it forward.
+A second trigger, measurable from data the host already keeps: **interrupted tasks**. For each automatic recovery from `agent-question` or `agent-blocked`, count the tasks in the continuation's snapshot that were not integrated, leaving out the source's own task and its dependents. Build when that count reaches 10 in 30 days. The count is a proxy: an interrupted task is not proven lost work, because recovery can carry it forward, and a pending task counts even if it had not started.
 
-On 2026-11-19 the count over the retained history is 0.
+The snapshot does not name the source (`packages/host/src/team-types.ts:673-682`). The `run.revision-advanced` event of the same revision does: it carries `sourceMemberId`, `sourceCode` and `fromRevision` (`teams.ts:2942`). The count joins the two by revision and then the member to its task. A recovery whose event is missing counts as unknown, not as zero. `run.recovery.source` cannot serve, because a later recovery overwrites it (`teams.ts:2793`). A block that never reaches a completed recovery leaves no snapshot, so blocked runs are counted from their current task list.
+
+On 2026-11-19 the count over the retained history is 0. The join was not needed for that figure: every snapshot's candidate set was already empty.
 
 Two smaller items do not wait for the trigger:
 
@@ -130,6 +135,7 @@ Steps 2 to 4 change the run state machine and go to a strong implementer with in
 - **Integration order.** Rule 1 of section 3 changes when results land for every run that has the setting, not only for runs with a wait. It needs its own tests on dependency chains and on a conflict between independent tasks.
 - **A plan amended while members work.** The host validates the whole graph and holds running and integrated tasks unchanged; the prompt does not carry that rule alone.
 - **The project manager answers what the owner should.** Its prompt keeps the existing rule: a material product, scope or permission decision is a `question` for the owner. Its answers are recorded as an agent's.
+- **The reviewer's "recent reports".** The reviewer prompt lists the last five tasks in plan order (`packages/host/src/team-prompts.ts:197-198`). With integration in dependency order that list is no longer the most recent work. It is orientation and gates nothing; the build relabels it or sorts it by integration time.
 
 ## Not verified
 

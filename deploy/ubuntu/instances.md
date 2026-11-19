@@ -627,9 +627,9 @@ Use a dedicated Slack app for the instance. Turn on Socket Mode and enable
 Interactivity under **Interactivity & Shortcuts**. Socket Mode carries button
 and select-menu actions over the existing connection; no public Request URL is
 needed. Give the bot
-only `app_mentions:read`, `chat:write`, `channels:history`, and `groups:history`;
-give the app-level token `connections:write`. Subscribe to the `app_mention`
-event only. Obtain the owner's approval before installing the app. Store each
+`app_mentions:read`, `chat:write`, `channels:history`, and `groups:history`;
+give the app-level token `connections:write`. Subscribe to `app_mention` for
+mention-based intake. Obtain the owner's approval before installing the app. Store each
 token in a separate mode `0600` file readable by the
 instance host account, then set the corresponding `intake.slack.appTokenFile`
 and `intake.slack.botTokenFile` values in the instance config. Set the Slack
@@ -646,12 +646,21 @@ Until that attribution check has passed, set `intake.linear.admitIssues` to
 `false`, so that only the owner's direct requests start work and no issue filed
 through Linear's Slack agent is admitted.
 
+For a dedicated request channel, add its channel ID to
+`intake.slack.requestChannelIds` and enable `directRequests`. Subscribe to
+`message.channels` for public channels or `message.groups` for private channels.
+Grant the bot `reactions:write`, reinstall the Slack app to apply the added
+scope, and invite it to the channel. An empty or omitted list keeps mention-based
+intake. The workspace owner can post their request at the top level or reply
+to a teammate's proposal with `work:` followed by instructions.
+See [Slack request channels](../../docs/intake.md#slack-request-channels).
+
 Questions need no new scope either. Set `intake.slack.answerQuestions` to `true`
 (it needs `directRequests`) to let a mention that asks a question, or starts with
 `ask:`, be answered read-only in the thread with no Linear issue; a mention that
 starts with `work:` always files a request. Set `intake.slack.classify` to `true`
 (it needs `answerQuestions` and the top-level `jev` block) to let the reading
-service choose when the mention has neither word; the owner's mention text, cut to
+service choose when the mention has neither word; the owner's request text, cut to
 1,000 characters, is sent to it. To use the reading service for this route only, set `jev.sessionReadings` to `false`. Both default to `false`. See
 [intake](../../docs/intake.md#questions).
 Set `linear.reportName` when the organization should see its own name in tracker

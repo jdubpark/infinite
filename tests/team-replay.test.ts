@@ -8,8 +8,9 @@ import { fixture, git } from "./team-fixture.js";
 import type { Config } from "../packages/host/src/types.js";
 import type { Manager } from "../packages/host/src/manager.js";
 import type { EventOutbox } from "../packages/host/src/evidence/outbox.js";
-import type { Capsule, EvalFeatures } from "../packages/host/src/eval-types.js";
+import type { CaptureSink, Capsule, EvalFeatures } from "../packages/host/src/eval-types.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
+import { DEFAULT_TEAM_RETENTION } from "../packages/host/src/team-types.js";
 import type { TeamService } from "../packages/host/src/teams.js";
 
 const LAUNCHER = resolve("tests/fixtures/eval-command.mjs");
@@ -20,7 +21,7 @@ const capsule = (objective: string): Capsule => ({ objective, steering: ["Keep t
   task: { id: "a", title: "Write a.txt", instructions: "Write a.txt with the reviewed content.", paths: ["a.txt"] } });
 
 /** A real service over a fixture project, with the eval identity configured as the same-user launcher and the fake member. */
-async function replayFixture() {
+async function replayFixture(options: { capture?: CaptureSink } = {}) {
   const f = await fixture("success", undefined, {}, { trustWorkspaces: true });
   const evalRoot = join(f.host.root, "eval");
   const home = join(evalRoot, "home"), template = join(evalRoot, "template"), tmp = join(evalRoot, "tmp");
@@ -37,7 +38,7 @@ async function replayFixture() {
   const events: unknown[] = [];
   const outbox = { flush(items: unknown[]) { events.push(...items); return { stored: true }; }, advance() { return { pending: false, blocked: [] }; } } as unknown as EventOutbox;
   let manager: Manager | undefined;
-  const service = await f.openTeamService({ events: outbox, manager: m => { manager = m; } });
+  const service = await f.openTeamService({ events: outbox, ...(options.capture ? { capture: options.capture } : {}), manager: m => { manager = m; } });
   /** Creates a trial whose workspace is a clone of the fixture project at its base commit, and whose member runs `mode`. */
   const start = async (mode: string, objective = "Write a.txt for the replay trial.") => {
     const trialId = randomUUID(), work = join(evalRoot, "trials", trialId, "work");
@@ -90,6 +91,8 @@ test("a replay run reaches no client", { timeout: 120000 }, async () => {
     assert.equal(context.service.statuses().some(row => row.id === trialId), false);
     assert.equal(context.service.understandingRecords().some(record => record.id === trialId), false);
     assert.equal(context.service.activeForProject("rehearsal"), false);
+    const purposes = await waitFor(async () => (await context.getManager().list()).map(row => row.purpose), rows => rows.includes("replay"), 30000).catch(async () => (await context.getManager().list()).map(row => row.purpose));
+    assert.ok(purposes.includes("replay"), `the member's session carries the replay purpose, saw ${JSON.stringify(purposes)}`);
     await assert.rejects(async () => context.service.get(trialId), error => (error as { status?: number; code?: string }).code === "team-not-found");
     assert.throws(() => context.service.objectiveRecord(trialId), error => (error as { code?: string }).code === "team-not-found");
     // The owner's routes by id answer as for a run that does not exist, so none can pull the record from under the trial.
@@ -128,6 +131,16 @@ test("every member ending ends the trial with its name", { timeout: 120000 }, as
     const settled = await context.ended(reference.trialId);
     assert.equal(settled?.ending, "settled");
     assert.match(settled?.resultCommit ?? "", /^[0-9a-f]{40}$/, "a reference result settles with its commit");
+    // The trial member gets no host scratch directory: it works in the trial workspace alone.
+    const memberContext = JSON.parse(readFileSync(join(reference.work, ".git", "infinite-team-context.json"), "utf8")) as Record<string, unknown>;
+    assert.equal(memberContext.scratchDirectory, undefined, "no scratch directory is assigned to a trial member");
+    // A cancelled trial is not retired by the retention sweep: only forgetReplay removes it, even when retention is due at once.
+    context.f.host.config.teams!.retention = { ...DEFAULT_TEAM_RETENTION, cancelledMinutes: 0 };
+    const kept = await context.start("question");
+    assert.equal((await context.ended(kept.trialId))?.ending, "question");
+    await new Promise(resolve => setTimeout(resolve, 4000));
+    assert.equal((await context.service.replayState(kept.trialId))?.ending, "question", "the ended trial's record is still there");
+    assert.equal(existsSync(kept.work), true, "the ended trial's workspace is still there");
   } finally {
     await context.f.close();
   }
@@ -163,6 +176,9 @@ test("a stopped replay run ignores late completions", { timeout: 120000 }, async
     const after = await context.service.replayState(trialId);
     assert.equal(after?.ending, "void-owner");
     assert.equal(after?.resultCommit, undefined);
+    // The first ending stands: a later ending call changes nothing.
+    await context.service.endReplay(trialId, "void-host");
+    assert.equal((await context.service.replayState(trialId))?.ending, "void-owner", "a second ending does not replace the first");
     assert.equal(context.events.some(item => (item as { runId: string; kind: string }).runId === trialId && (item as { kind: string }).kind === "task.integrated"), false);
   } finally {
     await context.f.close();
@@ -186,6 +202,52 @@ test("replay commands run as the eval identity", { timeout: 120000 }, async () =
     const removed = await waitFor(() => context.service.forgetReplay(trialId), value => value === true, 90000);
     assert.equal(removed, true);
     assert.equal(existsSync(join(context.f.host.config.stateDir, "teams", `${trialId}.sealed`)), false, "the record is gone, with no tombstone");
+  } finally {
+    await context.f.close();
+  }
+});
+
+test("a replay run never acts on the world outside its workspace", { timeout: 120000 }, async () => {
+  const integrated: unknown[] = [];
+  const capture = { enabled: () => true, integrated: (start: unknown) => { integrated.push(start); }, approved: () => {} } as unknown as CaptureSink;
+  const context = await replayFixture({ capture });
+  try {
+    // A project that follows a GitHub repository, so a run that were treated as an ordinary team would publish, save, and take a grant.
+    context.f.host.config.projects.find(project => project.id === "rehearsal")!.source = { mode: "github", repository: "example/app", baseBranch: "main" };
+    const manager = context.getManager() as unknown as { createTeamSession: (...args: unknown[]) => Promise<unknown> };
+    const original = manager.createTeamSession.bind(manager);
+    const launches: unknown[][] = [];
+    manager.createTeamSession = (...args: unknown[]) => { launches.push(args); return original(...args); };
+    const { trialId } = await context.start("reference");
+    const state = await context.ended(trialId);
+    assert.equal(state?.ending, "settled");
+    // Give the scheduler its next passes, which is when an ordinary run's integrated head would be pushed.
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    assert.ok(launches.length > 0, "the member was launched");
+    for (const launch of launches) assert.equal(launch[7], undefined, "a replay member gets no GitHub grant scope");
+    assert.deepEqual(integrated, [], "a replay result is not captured as an integrated task");
+    const teamCommands = join(context.f.receipts, "commands.jsonl");
+    assert.equal(existsSync(teamCommands) ? readFileSync(teamCommands, "utf8").includes(trialId) : false, false, "no push or save ran through the team prefix");
+    assert.equal(await waitFor(() => context.service.forgetReplay(trialId), value => value === true, 90000), true);
+    assert.equal(existsSync(join(context.f.host.config.stateDir, "teams", "retired.sealed")), false, "forgetting a replay run leaves no deletion tombstone");
+  } finally {
+    await context.f.close();
+  }
+});
+
+test("a replay run's permission hand-off reads the member's changes as the eval identity", { timeout: 120000 }, async () => {
+  const context = await replayFixture();
+  try {
+    const handled: unknown[] = [];
+    context.service.usePermissionAgent({
+      delivery: { addSource: () => () => {}, handle: async (target: unknown) => { handled.push(target); return { handled: false }; } },
+      pipeline: { serves: () => ({ served: true }), taskEnded: () => {} },
+    } as never);
+    const { trialId } = await context.start("permission");
+    assert.equal((await context.ended(trialId))?.ending, "permission");
+    assert.ok(handled.length > 0, "the dialog was handed to the permission agent first");
+    const teamCommands = join(context.f.receipts, "commands.jsonl");
+    assert.equal(existsSync(teamCommands) ? readFileSync(teamCommands, "utf8").includes(trialId) : false, false, "the hand-off ran no command through the team prefix");
   } finally {
     await context.f.close();
   }

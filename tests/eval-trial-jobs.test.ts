@@ -250,6 +250,9 @@ test("the job waits for every gate and says which", async () => {
     f.gate.grader = { state: "ready", storage: false, version: 2 } as GraderProbe;
     await expectWait("storage");
     f.gate.grader = { state: "ready", storage: true, version: 2 } as GraderProbe;
+    f.gate.identity = { state: "ready", storage: false, fetch: "refused" } as EvalProbe;
+    await expectWait("storage");
+    f.gate.identity = { state: "ready", storage: true, fetch: "refused" } as EvalProbe;
 
     f.gate.trialLive = true;
     await expectWait("another-job");
@@ -382,6 +385,61 @@ test("the baseline statements read through an index", () => {
       assert.ok(details.some(detail => detail.includes(index)), `${name} uses ${index}: ${details.join("; ")}`);
       assert.ok(details.every(detail => !detail.includes("SCAN eval_jobs") || detail.includes(index)), `${name} does not scan eval_jobs`);
     }
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("a provider outside the supported three is refused even when the lineup lists it", () => {
+  const f = fixture();
+  try {
+    addTask(f, TASK_ONE);
+    const teams = f.config.teams as unknown as { lineup: typeof LINEUP };
+    teams.lineup = { ...LINEUP, implementers: [CLAUDE, CODEX, GROK] };
+    assertRefusal(f.trial.create(PROJECT, request({ configurations: [configuration(GROK)] }), REQUEST_TWO), 409, "profile-not-approved");
+    assert.equal(f.jobs.list().length, 0, "no job was made");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("a baseline job is not a validation job", () => {
+  const f = fixture();
+  try {
+    addTask(f, TASK_ONE);
+    const created = f.trial.create(PROJECT, request(), REQUEST_ONE);
+    assert.ok("job" in created);
+    const work = f.jobs.next({ grader: f.gate.grader, hostLoadHeld: false, halted: () => false });
+    assert.deepEqual(work, { kind: "none" }, "the validation pump leaves the baseline job alone");
+    assert.equal(f.jobs.view(created.job.jobId)?.status, "scheduled");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("a job ends done at maxTasks and expired at its expiry time", async () => {
+  const f = fixture();
+  try {
+    addTask(f, TASK_ONE);
+    addTask(f, TASK_TWO);
+    const body = request({ trialsPerTask: 1, taskFilter: { maxTasks: 1 } });
+    const first = f.trial.create(PROJECT, body, REQUEST_ONE);
+    assert.ok("job" in first);
+    const trialId = insertAt(f, first.job.jobId, 0, { at: new Date(START - DAY_MS).toISOString() });
+    f.store.write(tx => {
+      finishTrial(tx, trialId, { grade: { ...VOID_GRADE, ending: "graded" }, configId: null, profileEpoch: null, sessionId: null, patchKeepDays: 90 }, f.now());
+    });
+    assert.deepEqual(await f.trial.next(f.gates()), { kind: "none" }, "the one task is reached, so the second is not started");
+    const done = f.jobs.view(first.job.jobId);
+    assert.equal(done?.status, "completed");
+    assert.equal(done?.reason, "done");
+
+    const expires = new Date(START + 3_600_000).toISOString();
+    const second = f.trial.create(PROJECT, request({ expiresAt: expires }), REQUEST_TWO);
+    assert.ok("job" in second);
+    f.setClock(START + 3_600_000);
+    assert.deepEqual(await f.trial.next(f.gates()), { kind: "none" }, "a job is expired at its expiry time");
+    assert.equal(f.jobs.view(second.job.jobId)?.status, "expired");
   } finally {
     f.cleanup();
   }

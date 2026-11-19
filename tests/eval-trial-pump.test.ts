@@ -35,7 +35,7 @@ test.after(() => {
 type Probe = Parameters<EvalIdentity["probe"]>[0];
 
 /** The pump with no member and a source whose `status` has no mirror head, so no trial can start. Every call is logged. */
-function rig(options: { baseBranch?: string; probes?: EvalProbe[]; sessionsRemoved?: string[]; forgetThrows?: boolean; replayIds?: string[];
+function rig(options: { removeRefused?: boolean; baseBranch?: string; probes?: EvalProbe[]; sessionsRemoved?: string[]; forgetThrows?: boolean; replayIds?: string[];
   replayState?: (trialId: string) => Promise<unknown>; onStatus?: () => void } = {}) {
   const root = mkdtempSync(join(tmpdir(), "infinite-trial-pump-"));
   dirs.push(root);
@@ -83,7 +83,7 @@ function rig(options: { baseBranch?: string; probes?: EvalProbe[]; sessionsRemov
   const jobs = new TrialJobs({ store, config, now });
   const pump = new TrialPump({
     config, store, jobs, grader, identity, teams: () => teams,
-    sessions: { list: async () => [], remove: async (id: string) => { sessionsRemoved.push(id); } } as never,
+    sessions: { list: async () => [], remove: async (id: string) => { sessionsRemoved.push(id); if (options.removeRefused) throw new Error("refused"); } } as never,
     source: { mirrorPath: () => join(root, "mirror.git"), status: () => { log.push("status"); options.onStatus?.(); return { mode: "github", repository: "example/app", baseBranch: "main" } as never; } },
     hostLoad: { held: () => undefined }, halt: () => ({ check: () => ({ state: "clear" as const }) }),
     graderProbe: async () => ({ state: "ready", storage: true, version: 2, uid: 5002 }), inventory: async () => [], now,
@@ -136,6 +136,7 @@ test("a start-up with an unavailable identity runs again, and stops and cleans b
   try {
     r.addJob();
     await r.pump.step();
+    assert.deepEqual(r.log.filter(entry => entry !== "probe"), [], "an identity that cannot be probed is not stopped or cleaned, and no trial command runs");
     await r.pump.step();
     const first = r.log.indexOf("status");
     for (const op of ["stop", "clean", "scrub"]) {
@@ -182,6 +183,21 @@ test("a sweep that meets a failed removal still removes the due sessions", async
     await r.pump.sweep();
     assert.deepEqual(r.sessionsRemoved, ["session-due"], "the due session is removed in the same sweep");
     assert.ok(r.forgotten.includes(trialId), "the failing forget was attempted");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("a session whose removal is refused keeps its place for the next sweep", async () => {
+  const r = rig({ removeRefused: true });
+  try {
+    const jobId = r.addJob(), trialId = r.seed(jobId, 0, "running");
+    const long = new Date(Date.now() - 2 * 3_600_000).toISOString();
+    r.store.write(tx => finishTrial(tx, trialId, { grade: VOID_GRADE, configId: null, profileEpoch: null, sessionId: "session-kept", patchKeepDays: 90 }, long));
+    await r.pump.sweep();
+    assert.deepEqual(r.sessionsRemoved, ["session-kept"], "the removal was tried");
+    const row = r.store.read(db => db.get<{ session_id: string | null }>("SELECT session_id FROM eval_trials WHERE trial_id = ?", trialId));
+    assert.equal(row?.session_id, "session-kept", "a refused removal leaves the session on the row");
   } finally {
     r.cleanup();
   }

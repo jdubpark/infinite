@@ -364,3 +364,204 @@ test("an unreadable task starts no trial", { timeout: 120_000 }, async () => {
     fx.close();
   }
 });
+
+// A secret-shaped value, built at run time so that no source line holds one.
+const TOKEN = `ghp_${"a1B2".repeat(9)}`;
+
+type Source = Extract<Awaited<ReturnType<typeof prepareTrialSource>>, { kind: "ready" }>;
+
+const inputOf = (source: Source, resultCommit: string, baseCommit = source.baseCommit) => ({
+  taskId: TASK, baseCommit, resultCommit, workspace: source.workspace, hiddenFiles: source.hiddenFiles, isolation: source.isolation,
+});
+
+/** The stored key of a test case named `name`, as the runner reports it. */
+function keyOf(name: string): string {
+  return [...parseReport("junit", Buffer.from(
+    `<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite name="suite"><testcase name="${name}" classname="cls"></testcase></testsuite></testsuites>`,
+  )).cases.keys()][0];
+}
+
+/** A grader whose export holds `target` as the trial branch, in place of the base. */
+function exportingCommit(grader: Grader, target: string): Grader {
+  return {
+    ...grader,
+    async run(job, dir, seconds, argv, options) {
+      const rewritten = argv.includes("refs/heads/trial") ? argv.map(arg => (arg === "refs/tags/eval-base" ? target : arg)) : argv;
+      return grader.run(job, dir, seconds, rewritten, options);
+    },
+  };
+}
+
+test("a task that cannot be a trial source starts no trial", { timeout: 120_000 }, async () => {
+  const fx = rig();
+  try {
+    const calls: string[] = [];
+    const run = () => prepareTrialSource(fx.store, TASK, contextOf(fx, spied(graderOf(fx), calls, "grader"), spied(identityOf(fx), calls, "identity")));
+    const reseal = (payload: object) => fx.store.write(tx => {
+      tx.run("UPDATE eval_tasks SET payload = ? WHERE task_id = ?", tx.seal("eval_tasks", TASK, { ...PAYLOAD, anchorCommit: fx.anchor, commit: fx.commit, ...payload }), TASK);
+    });
+    const capsule = (body: object | null) => fx.store.write(tx => {
+      if (body === null) tx.run("DELETE FROM eval_material WHERE task_id = ?", TASK);
+      else tx.run("UPDATE eval_material SET payload = ? WHERE task_id = ?", tx.seal("eval_material", `${TASK}/capsule`, { capsule: body }), TASK);
+    });
+
+    fx.store.write(tx => tx.run("UPDATE eval_tasks SET state = 'candidate' WHERE task_id = ?", TASK));
+    assert.deepEqual(await run(), { kind: "skip", reason: "not-valid" });
+    fx.store.write(tx => tx.run("UPDATE eval_tasks SET state = 'valid' WHERE task_id = ?", TASK));
+
+    reseal({ expectedCases: [] });
+    assert.deepEqual(await run(), { kind: "skip", reason: "expected-missing" });
+    reseal({});
+
+    capsule({ ...CAPSULE, objective: `Use ${TOKEN} to fetch.` });
+    assert.deepEqual(await run(), { kind: "skip", reason: "secret-shaped" });
+    capsule(null);
+    assert.deepEqual(await run(), { kind: "skip", reason: "unreadable" });
+    assert.deepEqual(calls, [], "no launcher command ran");
+  } finally {
+    fx.close();
+  }
+});
+
+test("a leak of the mirror head or of a hidden blob alone skips the source", { timeout: 120_000 }, async () => {
+  const fx = rig();
+  try {
+    // Two commits outside the reference: one holds the hidden file's blob only, the other is a mirror head that holds nothing hidden.
+    git(fx.work, ["checkout", "-q", "-b", "blob-only", fx.anchor]);
+    const blobOnly = commitFiles(fx.work, { [HIDDEN]: "fixed\n" }, "Blob only");
+    git(fx.work, ["checkout", "-q", "-b", "head-only", fx.anchor]);
+    const headOnly = commitFiles(fx.work, { "other.txt": "other\n" }, "Head only");
+    git(fx.work, ["push", "-q", fx.mirror, "blob-only", "head-only"]);
+    const grader = graderOf(fx);
+    const identity = identityOf(fx);
+
+    const blob = await prepareTrialSource(fx.store, TASK, contextOf(fx, exportingCommit(grader, blobOnly), identity));
+    assert.deepEqual(blob, { kind: "skip", reason: "source-leaked" });
+    const head = await prepareTrialSource(fx.store, TASK, contextOf(fx, exportingCommit(grader, headOnly), identity, { mirrorHead: headOnly }));
+    assert.deepEqual(head, { kind: "skip", reason: "source-leaked" });
+    assert.deepEqual(readdirSync(join(fx.evalRoot, "trials")), [], "no trial workspace remains");
+  } finally {
+    fx.close();
+  }
+});
+
+test("a result that adds a hidden file the reference lacks does not keep it", { timeout: 120_000 }, async () => {
+  const fx = rig();
+  try {
+    const ghost = "tests/ghost.test.txt";
+    fx.store.write(tx => {
+      tx.run("UPDATE eval_tasks SET payload = ? WHERE task_id = ?",
+        tx.seal("eval_tasks", TASK, { ...PAYLOAD, anchorCommit: fx.anchor, commit: fx.commit, hiddenFiles: [HIDDEN, ghost], expectedCases: [keyOf(ghost)] }), TASK);
+    });
+    const ctx = contextOf(fx, graderOf(fx), identityOf(fx));
+    const source = await prepareTrialSource(fx.store, TASK, ctx);
+    assert.equal(source.kind, "ready", JSON.stringify(source));
+    if (source.kind !== "ready") return;
+    const result = memberCommit(source.workspace, { "src/x.txt": "fixed\n", [ghost]: "fixed\n" });
+    const graded = await gradeTrial(fx.store, inputOf(source, result), ctx);
+    assert.equal(graded.kind, "graded", JSON.stringify(graded));
+    if (graded.kind !== "graded") return;
+    assert.equal(graded.grade.expectedPassed, 0);
+    assert.equal(graded.grade.resolved, false);
+  } finally {
+    fx.close();
+  }
+});
+
+test("a second round runs when the first leaves no report", { timeout: 120_000 }, async () => {
+  const fx = rig();
+  try {
+    const grader = graderOf(fx);
+    const identity = identityOf(fx);
+    const source = await prepareTrialSource(fx.store, TASK, contextOf(fx, grader, identity));
+    assert.equal(source.kind, "ready", JSON.stringify(source));
+    if (source.kind !== "ready") return;
+    let focusedRuns = 0;
+    const flaky: Grader = {
+      ...grader,
+      async run(job, dir, seconds, argv, options) {
+        if (argv[0] === process.execPath) {
+          focusedRuns += 1;
+          if (focusedRuns === 1) return { exitCode: 0, timedOut: false, truncated: false, failed: false };
+        }
+        return grader.run(job, dir, seconds, argv, options);
+      },
+    };
+    const result = memberCommit(source.workspace, { "src/x.txt": "fixed\n" });
+    const graded = await gradeTrial(fx.store, inputOf(source, result), contextOf(fx, flaky, identity));
+    assert.equal(graded.kind, "graded", JSON.stringify(graded));
+    if (graded.kind !== "graded") return;
+    assert.equal(focusedRuns, 2);
+    assert.equal(graded.grade.expectedPassed, 1);
+    assert.equal(graded.grade.resolved, true);
+  } finally {
+    fx.close();
+  }
+});
+
+test("a failing guard check keeps a passing trial from resolving", { timeout: 120_000 }, async () => {
+  const fx = rig();
+  try {
+    const grader = graderOf(fx);
+    const identity = identityOf(fx);
+    const check = (code: number) => ({ command: process.execPath, args: ["-e", `process.exit(${code})`] });
+    const source = await prepareTrialSource(fx.store, TASK, contextOf(fx, grader, identity));
+    assert.equal(source.kind, "ready", JSON.stringify(source));
+    if (source.kind !== "ready") return;
+    const result = memberCommit(source.workspace, { "src/x.txt": "fixed\n" });
+    const failing = await gradeTrial(fx.store, inputOf(source, result), contextOf(fx, grader, identity, { settings: { ...SETTINGS, guardChecks: [check(1)] } }));
+    assert.equal(failing.kind, "graded", JSON.stringify(failing));
+    if (failing.kind !== "graded") return;
+    assert.equal(failing.grade.expectedPassed, 1);
+    assert.equal(failing.grade.guardPassed, false);
+    assert.equal(failing.grade.resolved, false);
+    const passing = await gradeTrial(fx.store, inputOf(source, result), contextOf(fx, grader, identity, { settings: { ...SETTINGS, guardChecks: [check(0)] } }));
+    assert.equal(passing.kind, "graded", JSON.stringify(passing));
+    if (passing.kind !== "graded") return;
+    assert.equal(passing.grade.guardPassed, true);
+    assert.equal(passing.grade.resolved, true);
+  } finally {
+    fx.close();
+  }
+});
+
+test("a refused, oversize, or secret-shaped result is never graded as resolved or stored whole", { timeout: 120_000 }, async () => {
+  const fx = rig();
+  try {
+    const grader = graderOf(fx);
+    const identity = identityOf(fx);
+    const ctx = contextOf(fx, grader, identity);
+    const source = await prepareTrialSource(fx.store, TASK, ctx);
+    assert.equal(source.kind, "ready", JSON.stringify(source));
+    if (source.kind !== "ready") return;
+
+    // A patch that does not apply to the base is a refusal: scope-violation, not graded.
+    const mid = memberCommit(source.workspace, { "src/x.txt": "mid\n" });
+    const last = memberCommit(source.workspace, { "src/x.txt": "fixed\n" });
+    const refused = await gradeTrial(fx.store, inputOf(source, last, mid), ctx);
+    assert.equal(refused.kind, "graded", JSON.stringify(refused));
+    if (refused.kind !== "graded") return;
+    assert.equal(refused.grade.ending, "scope-violation");
+    assert.equal(refused.grade.resolved, false);
+    assert.equal(refused.grade.expectedPassed, null);
+
+    // A patch holding a secret shape is graded, but only a marker is kept.
+    const secret = memberCommit(source.workspace, { "src/x.txt": "fixed\n", "notes.txt": `${TOKEN}\n` });
+    const marked = await gradeTrial(fx.store, inputOf(source, secret), ctx);
+    assert.equal(marked.kind, "graded", JSON.stringify(marked));
+    if (marked.kind !== "graded") return;
+    assert.equal(marked.patch, "secret-shaped");
+    assert.equal(marked.grade.resolved, true);
+
+    // A patch over the size limit is not graded and its bytes are not kept.
+    const big = memberCommit(source.workspace, { "src/x.txt": "fixed\n", "big.txt": `${"x".repeat(1_100_000)}\n` });
+    const large = await gradeTrial(fx.store, inputOf(source, big), ctx);
+    assert.equal(large.kind, "graded", JSON.stringify(large));
+    if (large.kind !== "graded") return;
+    assert.equal(large.patch, "too-large");
+    assert.equal(large.grade.ending, "scope-violation");
+    assert.equal(large.grade.resolved, false);
+  } finally {
+    fx.close();
+  }
+});

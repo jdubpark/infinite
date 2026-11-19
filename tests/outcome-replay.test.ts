@@ -8,10 +8,11 @@ import { configId } from "../packages/host/src/config-identity.js";
 import { configurationModule, configurationProjector } from "../packages/host/src/configuration-store.js";
 import { EventOutbox, type OutboxEvent } from "../packages/host/src/evidence/outbox.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
-import { applyScan } from "../packages/host/src/outcome-signals.js";
+import { applyCheck, applyScan } from "../packages/host/src/outcome-signals.js";
 import { outcomeProjector } from "../packages/host/src/outcome-projector.js";
 import {
   outcomeModule,
+  readMemberResult,
   readOutcome,
   readScanState,
   readSummary,
@@ -91,8 +92,8 @@ function ev(kind: string, runId: string, time: string, fields: {
 }
 
 /** The events of one run: an implementer that reports, integrates, and is approved, then settles. */
-function runEvents(runId: string, purpose: "work" | "replay", trialId?: string): OutboxEvent[] {
-  const shape = purpose === "replay" ? "trial" : "team";
+function runEvents(runId: string, purpose: "work" | "replay" | "gate", trialId?: string): OutboxEvent[] {
+  const shape = purpose === "work" ? "team" : "trial";
   const components = { profile: PROFILE, promptVersion: HEX_A, guidance: HEX_B, knowledge: "none" as const, routing: "off" as const, shape };
   return [
     ev("run.created", runId, at(0), { data: { projectId: PROJECT, purpose, ...(trialId === undefined ? {} : { trialId }) } }),
@@ -135,6 +136,23 @@ function land(h: Harness, runId: string): void {
   assert.equal(result.applied, true);
 }
 
+/** A reviewer start: a role without an outcome row, so the projector writes a member result for it. */
+function reviewerStart(runId: string): OutboxEvent {
+  return ev("member.started", runId, at(3), {
+    memberId: "rv1", taskId: "a",
+    data: { role: "reviewer", purpose: "work", sessionId: `review-${runId}`, startedAt: at(3), provider: "claude", profileId: "rev", model: "r-1" },
+  });
+}
+
+/** The window check one minute after the hold ends, which stores the verdict and closes the window. */
+function closeWindow(h: Harness): void {
+  const result = h.store.write(tx => applyCheck(tx, {
+    projectId: PROJECT, head: SCAN_HEAD, at: "2026-12-13T10:09:00.000Z",
+    expectedSeq: readScanState(tx, tx.index("project", PROJECT))?.seq ?? 0,
+  }));
+  assert.equal(result.applied, true);
+}
+
 /** The implementer row of a run, read from the store. */
 function rowOf(store: EvidenceStore, runId: string) {
   return store.read(db => readOutcome(db, `${runId}:m1`));
@@ -143,7 +161,7 @@ function rowOf(store: EvidenceStore, runId: string) {
 test("a replay run writes replay rows", () => {
   const h = harness();
   try {
-    h.flush(runEvents("run-replay", "replay", "trial-1"));
+    h.flush([...runEvents("run-replay", "replay", "trial-1"), reviewerStart("run-replay")]);
     const summary = h.store.read(db => readSummary(db, "run-replay"));
     assert.equal(summary?.source, "replay");
     assert.equal(summary?.payload.trialId, "trial-1");
@@ -161,6 +179,30 @@ test("a replay run writes replay rows", () => {
     assert.equal(landed?.accepted, null);
     assert.equal(landed?.firstPass, null);
     assert.equal(landed?.held, null);
+    // A closed window with no revert is a yes for production. For a replay row it must stay unknown.
+    closeWindow(h);
+    assert.equal(rowOf(h.store, "run-replay")?.held, null);
+    assert.equal(rowOf(h.store, "run-replay")?.accepted, null);
+    // The member result carries the same source.
+    const result = h.store.read(db => readMemberResult(db, "run-replay:rv1"));
+    assert.equal(result?.source, "replay");
+  } finally {
+    h.close();
+  }
+});
+
+test("a gate run writes replay rows with its trial id", () => {
+  const h = harness();
+  try {
+    h.flush(runEvents("run-gate", "gate", "trial-g"));
+    const summary = h.store.read(db => readSummary(db, "run-gate"));
+    assert.equal(summary?.source, "replay");
+    assert.equal(summary?.payload.trialId, "trial-g");
+    const row = rowOf(h.store, "run-gate");
+    assert.equal(row?.source, "replay");
+    assert.equal(row?.experimentRef, "trial-g");
+    assert.equal(row?.accepted, null);
+    assert.equal(row?.firstPass, null);
   } finally {
     h.close();
   }
@@ -186,7 +228,7 @@ test("replay rows never reach routing or the scorecard", () => {
 test("a production run keeps production rows", () => {
   const h = harness();
   try {
-    h.flush(runEvents("run-prod", "work"));
+    h.flush([...runEvents("run-prod", "work"), reviewerStart("run-prod")]);
     const summary = h.store.read(db => readSummary(db, "run-prod"));
     assert.equal(summary?.source, "production");
     assert.equal(summary?.payload.trialId, undefined);
@@ -200,6 +242,9 @@ test("a production run keeps production rows", () => {
     const landed = rowOf(h.store, "run-prod");
     assert.equal(landed?.accepted, 1);
     assert.equal(landed?.holdUntil !== null, true);
+    closeWindow(h);
+    assert.equal(rowOf(h.store, "run-prod")?.held, 1);
+    assert.equal(h.store.read(db => readMemberResult(db, "run-prod:rv1"))?.source, "production");
   } finally {
     h.close();
   }

@@ -66,6 +66,11 @@ test("status prints the eval identity and trials", () => {
   const version1 = evalStatusLines({ ...withTrials, grader: { state: "ready", version: 1 } });
   assert.ok(version1.includes("grader ready (version 1: no trials)"));
   assert.ok(!version1.includes("grader ready"));
+
+  // A grader that is not ready says its own state, whatever version it reports.
+  const busy = evalStatusLines({ ...withTrials, grader: { state: "busy", version: 1 } as unknown as EvalSummary["grader"] });
+  assert.ok(busy.includes("grader busy"));
+  assert.ok(!busy.some(line => line.includes("version 1: no trials")));
 });
 
 test("job prints baseline counts", () => {

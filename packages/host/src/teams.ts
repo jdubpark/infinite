@@ -2243,11 +2243,13 @@ export class TeamService {
       if (action === "resume" && verificationRecovery) return this.resumeVerificationRecovery(stored, body, verificationRecovery);
       // Read before the request clears the mark: a run the halt held where it waited continues where it waited.
       const inPlace = heldWaiting(stored);
-      if (!this.mutation(stored, action, body)) return this.view(stored);
+      const receipt = this.admit(stored, action, body);
+      if (!receipt) return this.view(stored);
+      const record = () => this.recordReceipt(stored, body.requestId, receipt);
       if (action === "resume") {
-        if (run.status !== "paused" && !this.canResume(stored)) { this.save(stored); return this.view(stored); }
-        await this.resumeRun(stored, inPlace);
-      } else await this.stopRun(stored, action, undefined, body.source);
+        if (run.status !== "paused" && !this.canResume(stored)) { record(); this.save(stored); return this.view(stored); }
+        await this.resumeRun(stored, inPlace, record);
+      } else { record(); await this.stopRun(stored, action, undefined, body.source); }
       this.event(stored, `Team ${action === "resume" ? inPlace ? "resumed where it waited for input" : "resumed with a fresh plan" : action === "pause" ? "paused" : "cancelled"}${body.source ? ` by ${inputSourceLabel(body.source)}` : ""}.`); this.save(stored);
       return this.view(stored);
     });
@@ -2279,15 +2281,18 @@ export class TeamService {
    * Pausing stopped native agents. Replan from the confirmed integration head, preserving stopped copies for inspection.
    * `inPlace` is for a run the halt held where it waited for input: it stopped no work, so it continues the same
    * revision, its open questions stay current, and an answer recorded meanwhile starts the requesting member's next attempt.
+   * The fence's saves hold the run still stopped at its old revision, so a host stop there leaves a request to retry.
+   * `record` then records the owner's request with the resume, nothing awaited between (see `recordReceipt`).
    */
-  private async resumeRun(stored: Stored, inPlace = false) {
+  private async resumeRun(stored: Stored, inPlace = false, record?: () => void) {
     const run = stored.run;
+    if (!inPlace) await this.invalidatePermissionDecisions(stored, "The team resumed under a new revision.");
+    record?.();
     if (inPlace) { run.status = "needs-input"; run.reason = undefined; return; }
     run.revision++; run.tasks = []; run.review = undefined; run.round = 0; stored.checkHead = undefined;
     this.emit(stored, "run.revision-advanced", [run.revision], {}, { cause: "resume", fromRevision: run.revision - 1, baseChanged: false });
     run.brief = undefined; run.noChange = undefined;
     if (run.discovery && !run.discovery.completedAt) run.discovery.completedAt = timestamp();
-    await this.invalidatePermissionDecisions(stored, "The team resumed under a new revision.");
     run.status = "planning"; run.reason = undefined; run.blockCode = undefined;
   }
   /**

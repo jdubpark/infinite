@@ -5,7 +5,7 @@ import type { Prompt } from "@infinite/attention";
 import type { Blackboard } from "../packages/host/src/evidence/blackboard.js";
 import type { PermissionAgentServices } from "../packages/host/src/permission-agent-types.js";
 import type { TeamPermissionDecision, TeamRun, TeamView } from "../packages/host/src/team-types.js";
-import type { TeamService } from "../packages/host/src/teams.js";
+import { memberStallReason, type TeamService } from "../packages/host/src/teams.js";
 import { permissionAuthorityHash, permissionEvidenceHash } from "../packages/host/src/team-permissions.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 import { limitLineup } from "./team-fixture.js";
@@ -106,6 +106,27 @@ test("whichever record write a steer stops after, a retry of the same request ap
     assert.deepEqual(again.steering.map(item => item.text), [request.text]);
   });
 });
+
+// A run the owner paused, and one blocked on a stalled member, which may replan: both resume under a new revision.
+for (const status of ["paused", "blocked"] as const) {
+  test(`whichever record write a resume of a ${status} run stops after, a retry of the same request resumes it exactly once`, async () => {
+    const resumed = "Team resumed with a fresh plan.", request = { requestId: randomUUID(), revision: 1 };
+    await eachStop(f => {
+      f.run.status = status; f.run.members[0]!.status = "stopped";
+      if (status === "blocked") f.run.reason = memberStallReason;
+      f.writeTeam();
+    }, (f, teams) => teams.resume(f.run.id, request), async (f, teams, stopAt) => {
+      const replayed = await teams.resume(f.run.id, request);
+      assert.equal(replayed.status, "planning", `a stop after write ${stopAt} must not answer the retry while the run stays ${status}`);
+      assert.equal(replayed.revision, 2);
+      assert.equal(count(replayed, resumed), 1);
+      assert.ok(f.readRecord<Saved>("team", f.run.id).receipts[request.requestId], "the receipt is saved with the resume");
+      const again = await teams.resume(f.run.id, request);
+      assert.equal(again.revision, 2);
+      assert.equal(count(again, resumed), 1);
+    });
+  });
+}
 
 test("whichever record write an agent-only revocation stops after, a retry of the same request records it exactly once", async () => {
   const agent = { delivery: {}, pipeline: { serves: () => ({ served: true }), taskEnded: () => {} } } as unknown as PermissionAgentServices;

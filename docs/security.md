@@ -359,7 +359,11 @@ Slack surface:
   take on a proposal can start the same flow. With `intake.linear.admitIssues`
   false, the first route is off.
 - Only the configured owner's messages can answer, steer, or control a
-  mission. In a request channel a teammate can receive a fixed 👀 reaction
+  mission. With `intake.slack.ownerOnlyInJoinedChannels` enabled, sender
+  identity gates every inbound response, including proposal reactions and
+  status replies. The policy applies to mentions and ordinary messages in
+  all joined public and private channels. With shared proposal channels enabled,
+  a teammate can receive a fixed 👀 reaction
   on their proposal and ask for status in a bound thread. The public status
   comes from that thread's records and contains counts and state. The host
   neither stores the teammate's proposal text on arrival nor sends their

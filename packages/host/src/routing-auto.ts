@@ -1,4 +1,4 @@
-import { promptVersion } from "./config-identity.js";
+import { promptVersion, type ObjectivePrompt } from "./config-identity.js";
 import { CONFIGURATIONS_MODULE, epochAt } from "./configuration-store.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceDb } from "./evidence/types.js";
@@ -15,7 +15,7 @@ import {
 } from "./routing-store.js";
 import { taskFeatures, type FeatureMap, type TaskFeatures } from "./task-features.js";
 import type { DecisionRow, ExploreGuards, RoutingKnobs, RoutingPayload } from "./routing-types.js";
-import type { TeamLineup, TeamModelProfile, TeamRun, TeamTask } from "./team-types.js";
+import type { TeamModelProfile, TeamRun, TeamTask } from "./team-types.js";
 import type { Provider } from "./types.js";
 
 /** The start decision's budget. A decision that takes longer writes no row. */
@@ -29,7 +29,7 @@ export type RouterStart = {
   publishHeads: boolean;
   entryTools: boolean;
   /** Whether the run is a goal cycle with a record: the member's prompt version then carries the record digest. */
-  objectiveDigest: boolean;
+  objectiveDigest: ObjectivePrompt;
   featureMap: FeatureMap | undefined;
   limited: ReadonlySet<Provider>;
 };

@@ -414,7 +414,6 @@ export async function checkBehaviorModel(
   const queue = [initialKey];
   const targetCounts = new Map(normalized.properties.map(property => [property.id, 0]));
   const violations = new Map<string, string>();
-  const propertyById = new Map(normalized.properties.map(property => [property.id, property]));
   const discover = (key: string, state: InternalState) => {
     for (const property of normalized.properties) {
       if (!inPropertyScope(property, state)) continue;

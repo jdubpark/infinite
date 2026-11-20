@@ -100,7 +100,7 @@ import { LinearService } from "./linear.js";
 import { goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema, goalParallelismSchema } from "./goal-types.js";
 import { createProjectGroupSchema, projectGroupIdSchema, updateProjectGroupSchema } from "./project-group-types.js";
 import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./desktop.js";
-import type { Config, Role, Receipt, Session } from "./types.js";
+import { type Config, type Role, type Receipt, type Session, learningPurpose } from "./types.js";
 import { Summarizer, SummaryError } from "./summary.js";
 import { DictationCleaner, DictationError } from "./dictation.js";
 import { RepositoryBriefings } from "./repository-briefings.js";
@@ -265,7 +265,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     onApplied: scan => { signals.recordScan(scan); },
   });
   outbox.registerProjector(outcomeProjector(evidence));
-  const evalHost: EvalHost = new EvalHost({ config, store: evidence, source: projectSource, hostLoad: manager.hostLoad, halt: () => halt, runs: () => teams.understandingRecords() });
+  const evalHost: EvalHost = new EvalHost({ config, store: evidence, source: projectSource, hostLoad: manager.hostLoad, halt: () => halt, runs: () => teams.understandingRecords(), teams: () => teams, sessions: manager });
   // The launch-rate fuse is built before any service that receives it starts. It stops before the store closes.
   const fuse = new FuseService({ config, key, store: evidence, sessionExists: id => {
     try { manager.meta(id); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
@@ -469,7 +469,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     session.executionLocation ?? (session.workspace ? "laptop" : "cloud");
   const usageRow = (id: string) => { const row = usage.session(id); return row.measured ? { usage: row } : {}; };
   const listSessions = async () => {
-    const native = (await manager.list({ includeFullMessage: Boolean(config.jev && config.jev.sessionReadings !== false) })).map(session => {
+    const native = (await manager.list({ includeFullMessage: Boolean(config.jev && config.jev.sessionReadings !== false) })).filter(session => !learningPurpose(session.purpose)).map(session => {
       const handoff = handoffs.listedView(session.id);
       const managed = managedBy(session);
       return { ...session, ...(managed ? { managedBy: managed } : {}), handoff, ...usageRow(session.id), executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id,
@@ -1091,7 +1091,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       throw error;
     }
   });
-  app.get("/api/teams", (_req, res) => res.json({ teams: teams.list() }));
+  app.get("/api/teams", (req, res) => res.json({ teams: z.enum(["full", "list"]).default("full").parse(req.query.view) === "list" ? teams.listItems() : teams.list() })); // Full by default, as installed clients read it; `?view=list` answers the compact rows of team-list.ts.
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
   objectiveRoutes(app, { goals, teams }, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));

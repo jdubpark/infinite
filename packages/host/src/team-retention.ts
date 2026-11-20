@@ -14,6 +14,8 @@ import type { RetentionState, Stored, TeamServiceOptions } from "./teams.js";
  * time of use.
  */
 export type RetentionHost = Pick<TeamKernel, "records" | "commands" | "manager" | "config" | "closed" | "save" | "event" | "record" | "enqueue" | "assertRunPath"> & {
+  /** The record, refused as not found for a replay run (team-replay.ts). */
+  visible(id: string): Stored;
   readonly options: TeamServiceOptions | undefined;
   readonly directory: string;
   readonly recorders: Map<string, unknown>;
@@ -242,7 +244,7 @@ export class TeamRetention {
     this.removalTasks.add(task);
     return true;
   }
-  private async deleteRecord(stored: Stored, waitForEvidence: boolean) {
+  async deleteRecord(stored: Stored, waitForEvidence: boolean) {
     const finalView = this.host.view(stored);
     if (this.host.options?.events) {
       this.host.emit(stored, "run.deleted", [], {}, { status: stored.run.status });
@@ -258,7 +260,7 @@ export class TeamRetention {
         console.warn("Run events for a removed team were not stored; its record is removed anyway.");
       }
     }
-    try { this.host.persistRetiredRunId(stored.run.id); }
+    try { if (!stored.run.replay) this.host.persistRetiredRunId(stored.run.id); }
     catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's deletion tombstone could not be saved; its record was kept."); }
     try { await rmAsync(join(this.host.directory, `${stored.run.id}.sealed`), { force: true }); }
     catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's record could not be removed."); }
@@ -273,7 +275,7 @@ export class TeamRetention {
   }
   removeRun(id: string): Promise<TeamView> {
     return this.host.enqueue(async () => {
-      const stored = this.host.record(id), run = stored.run;
+      const stored = this.host.visible(id), run = stored.run;
       if (this.host.needsPublication(stored)) throw new TeamError(409, "head-not-published", "The integrated head must be published to GitHub before this run can be removed.");
       if (this.removingRuns.has(id)) throw new TeamError(409, "team-operation-running", "A background workspace removal is still running. Retry deletion after it settles.");
       this.assertRunRetentionSafe(stored);
@@ -348,6 +350,7 @@ export class TeamRetention {
     return retryAt !== undefined && now < Date.parse(retryAt);
   }
   async retire(stored: Stored) {
+    if (stored.run.replay) return;
     try {
       const { run } = stored, retention = this.host.retentionState(stored), policy = this.host.config.teams?.retention ?? DEFAULT_TEAM_RETENTION;
       if (run.status === "blocked" || run.status === "paused") await this.host.refreshOperationCensus(stored);

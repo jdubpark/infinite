@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { blockDestructive, detectPrompt, type Prompt } from "@infinite/attention";
-import { array, object, string, CmuxError, type Json } from "./client.js";
+import { array, string, CmuxError, type Json } from "./client.js";
 import type { CmuxProvider } from "./discovery.js";
 
 export interface PendingPrompt {

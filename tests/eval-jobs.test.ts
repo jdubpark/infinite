@@ -319,7 +319,7 @@ test("the hot statements read through an index", () => {
     const cases = [
       { name: "NEXT_TASK_SQL", sql: NEXT_TASK_SQL, params: ["p", "candidate", ""], index: "eval_tasks_next", search: true },
       { name: "ACTIVE_JOBS_SQL", sql: ACTIVE_JOBS_SQL, params: ["scheduled", 20], index: "eval_jobs_status", search: true },
-      { name: "ACTIVE_PROJECT_JOBS_SQL", sql: ACTIVE_PROJECT_JOBS_SQL, params: ["p"], index: "eval_jobs_project", search: true },
+      { name: "ACTIVE_PROJECT_JOBS_SQL", sql: ACTIVE_PROJECT_JOBS_SQL, params: ["p", "validate"], index: "eval_jobs_project", search: true },
       { name: "PROJECT_JOBS_SQL", sql: PROJECT_JOBS_SQL, params: ["p", 10], index: "eval_jobs_project", search: true },
       { name: "JOB_SWEEP_SQL", sql: JOB_SWEEP_SQL, params: [cut, cut, 100], index: "eval_jobs_created", search: true },
       { name: "JOBS_SQL", sql: JOBS_SQL, params: [100], index: "eval_jobs_created", search: false },

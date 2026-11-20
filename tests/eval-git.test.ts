@@ -338,7 +338,8 @@ test("a refused stop of a child that has already ended still settles the read", 
       try { if (child.pid) process.kill(child.pid, "SIGKILL"); } catch { /* It may already be gone. */ }
       return false;
     });
-    assert.deepEqual(await git.patch(dir, from, big), { state: "too-large" });
+    // Compare the state alone: a failing deepEqual on a megabyte of bytes makes node's assert diff exhaust memory.
+    assert.equal((await git.patch(dir, from, big)).state, "too-large");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

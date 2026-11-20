@@ -49,6 +49,11 @@ export interface WatchHook {
   transcript?: { path: string; provider: TranscriptProvider };
   /** The hook is the provider's `SessionEnd`. */
   sessionEnd?: boolean;
+  /**
+   * The hook's source reports turn ends and nothing else, as a Codex notify does with hooks off. No later hook
+   * marks the start of the next turn, so the transcript, not the hook, says whether the last turn ended.
+   */
+  endOnly?: boolean;
 }
 
 /** A secondary transcript the watch reads, with its own end evidence for one drain. */
@@ -133,6 +138,8 @@ export class TranscriptWatch {
   private drain: number | undefined;
   /** The last provider hook: whether it closed a turn, and which drain it started. */
   private last: { turnEnd: boolean; drain: number | undefined } | undefined;
+  /** The last provider hook was an end-only turn end: the transcript decides whether the last turn ended. */
+  private endOnly = false;
   /** The end evidence for `drain`: the offset at which its end mark arrived. */
   private evidence: { drain: number; offset: number } | undefined;
   /** A subagent hook that arrived before any transcript was open. It counts for the first transcript that opens. */
@@ -174,7 +181,9 @@ export class TranscriptWatch {
       if (this.closed || this.finalDrain !== undefined) return undefined;
       // After a stop request, the provider's SessionEnd proves the process is ending, not that the turn ended: it keeps the turn boundary of the hook before it.
       const turnEnd = input.sessionEnd === true && this.stopped ? (this.last?.turnEnd ?? false) : input.turnEnd;
-      return this.receiveHook({ ...input, turnEnd });
+      const started = this.receiveHook({ ...input, turnEnd });
+      this.endOnly = input.endOnly === true && turnEnd;
+      return started;
     });
   }
 
@@ -336,7 +345,18 @@ export class TranscriptWatch {
 
   /** Records end evidence only for the drain the last transcript hook started. */
   private mark(drain: unknown, offset: number) {
-    if (this.drain !== undefined && drain === this.drain) this.evidence = { drain: this.drain, offset };
+    if (this.drain === undefined || drain !== this.drain) return;
+    this.evidence = { drain: this.drain, offset };
+  }
+
+  /**
+   * An end-only turn end stands only when the final drain read the transcript to its end, and the transcript shows
+   * that its last turn ended. The hook itself proves no more than that some turn ended: a later turn may have begun
+   * before or after the watch read for it, and only a read after the provider exited has seen every row.
+   * True when the last hook was not end-only.
+   */
+  private endStands(current: Current | undefined, finalDrain: FinalDrainState | undefined): boolean {
+    return !this.endOnly || (finalDrain === "complete" && current !== undefined && current.usage.lastTurnEnded());
   }
 
   /** The drain of the last transcript hook reached the end of `current`, and nothing is pending. */
@@ -398,7 +418,8 @@ export class TranscriptWatch {
     this.retired.secondary = worse(this.retired.secondary, this.stateOf(old));
     this.retireUsage(old.usage, old.tail);
     for (const reader of old.readers.values()) this.retireUsage(reader.usage, reader.tail);
-    this.retired.gap = this.retired.gap || !complete;
+    // After an end-only turn end, nothing tells the watch whether the replaced transcript grew again.
+    this.retired.gap = this.retired.gap || !complete || this.endOnly;
     // A transcript that ended its drain outside a turn boundary leaves the session mid-turn, even if a later one ends a turn.
     this.retired.midTurn = this.retired.midTurn || (complete && !(this.last?.turnEnd ?? false));
   }
@@ -449,7 +470,7 @@ export class TranscriptWatch {
         || readers.some(reader => reader.tail.dropped || reader.tail.discarded > 0 || reader.usage.rejectedCount() > 0),
       lastDrain: {
         complete: current !== undefined && this.complete(current) && !this.retired.gap,
-        turnEnd: (this.last?.turnEnd ?? false) && !this.retired.midTurn,
+        turnEnd: (this.last?.turnEnd ?? false) && !this.retired.midTurn && this.endStands(current, finalState),
       },
       finalDrain: finalState,
       secondary: this.sessionSecondary(current),

@@ -387,7 +387,7 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
       const sessionId = randomUUID(), stopRequestId = randomUUID(), startedAt = timestamp();
       this.host.operation(stored, "member", async signal => {
         this.host.assertRunPath(stored, run.workspace);
-        await assertMemberReadOnly(member.cwd, member.baseCommit, this.host.config.teams?.commandPrefix, signal);
+        await assertMemberReadOnly(member.cwd, member.baseCommit, this.host.prefixFor(run), signal);
       }, () => {
         member.sessionId = sessionId;
         member.stopRequestId = stopRequestId;
@@ -457,8 +457,8 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
     this.host.save(stored);
     this.host.operation(stored, "member", async signal => {
       this.host.assertRunPath(stored, run.workspace);
-      const cwd = await prepareMemberWorkspace(run.workspace, member.memberId, member.baseCommit, this.host.config.teams?.commandPrefix, signal);
-      await assertMemberReadOnly(cwd, member.baseCommit, this.host.config.teams?.commandPrefix, signal);
+      const cwd = await prepareMemberWorkspace(run.workspace, member.memberId, member.baseCommit, this.host.prefixFor(run), signal);
+      await assertMemberReadOnly(cwd, member.baseCommit, this.host.prefixFor(run), signal);
       return cwd;
     }, cwd => {
       member.cwd = cwd; run.members.push(member); decision.status = "reviewing";

@@ -1198,8 +1198,10 @@ test("mixed teams pin real worker launches across configuration changes, restart
     const decision = waiting.decisions[0];
     const original = waiting.members.find(member => member.memberId === decision.memberId)!;
     assert.equal(original.role, "project-manager", "The owner question is routed through the PM after worker diagnosis");
+    assert.equal(decision.recommendation, undefined, "A question from a member started before recommendations were required still becomes a decision");
     assert.equal(waiting.recovery?.source.code, "agent-question");
     assert.equal(waiting.recovery?.source.reportKind, "question");
+    assert.match(waiting.recovery?.source.reason ?? "", /owner decision: .* The asking agent recommends: Compact\. Reason: The first file already uses it\.$/, "The PM's recovery reads the worker's recommendation");
     const sourceMember = waiting.members.find(member => member.memberId === waiting.recovery?.source.memberId)!;
     assert.equal(sourceMember.taskId, "b");
     assert.deepEqual(sourceMember.modelProfile, mixedLineup.implementers[1]);
@@ -1352,6 +1354,7 @@ test("questions and steering survive API restart with durable retries and stale 
     const waiting = await waitFor(() => f.get(created.body.id), run => run.decisions.length === 1 && run.status === "needs-input", 30000);
     const decision = waiting.decisions[0];
     assert.equal(decision.answerMode, undefined, "Legacy two-option questions remain ordinary choices after service persistence");
+    assert.deepEqual(decision.recommendation, { answers: ["Compact"], reason: "Both files share one short label." }, "The decision carries the asking member's recommendation");
     await f.host.stopApi(); await f.host.start();
     const recovered = await f.get(waiting.id);
     assert.equal(recovered.decisions[0].id, decision.id);
@@ -1365,6 +1368,7 @@ test("questions and steering survive API restart with durable retries and stale 
     controller = createRemoteClient({ url: f.host.origin, token: f.host.tokens.controller });
     const answered = await controller.request<TeamView>(answerPath, { body: answer });
     assert.equal(answered.decisions.find(item => item.id === decision.id)?.answer, "Compact");
+    assert.deepEqual(answered.decisions.find(item => item.id === decision.id)?.recommendation, { ...decision.recommendation, outcome: "matched" }, "The recommendation survives the restart, and the answer records how it compared");
     assert.equal((await f.host.fetchApi(answerPath, "controller", answer)).status, 200);
     assert.equal((await f.host.fetchApi(answerPath, "controller", { ...answer, text: "Detailed" })).status, 409);
     const steer = { requestId: randomUUID(), revision: recovered.revision, text: "Use the revised requirements for both files." };
@@ -1414,7 +1418,7 @@ test("configured verification failures exhaust bounded repair rounds without bec
     assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
     assert.ok(blocked.checks.length > 0);
     assert.ok(blocked.checks.every(check => check.status === "failed" && check.exitCode === 17));
-    assert.ok(blocked.checks.some(check => check.output.includes("Configured verification failed")));
+    assert.ok(blocked.checks.some(check => check.output.includes("Configured verification failed")) && blocked.checks.every(check => !("scan" in check)), "the view carries check output, never prompt evidence");
     assert.equal(blocked.review, undefined);
     assert.ok(blocked.members.filter(member => member.role === "integrator").length <= 2, "Repairs must have a finite attempt budget");
     assert.equal(git(f.source, "rev-parse", "HEAD"), f.base);
@@ -1544,7 +1548,7 @@ test("an unchanged required-check failure stops after one repair and owner Conti
     assert.deepEqual([context.runId, context.revision], [blocked.id, blocked.revision]);
     assert.match(context.objective, /Create independent files/);
     assert.match(context.feedback, /Configured verification failed/);
-    assert.match(context.feedback, /"exitCode":17/);
+    assert.match(context.feedback, /Check 1: failed, exit 17/); assert.ok(context.checks.every(check => (check.status === "passed") !== ("scan" in check)), "only checks that did not pass carry scan");
 
     const key = readFileSync(f.host.config.keyFile);
     const storedFile = join(f.host.config.stateDir, "teams", `${blocked.id}.sealed`);
@@ -1897,10 +1901,12 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
     assert.ok(listing.result.tools[0].inputSchema.properties.report);
     const questionSchema = listing.result.tools[0].inputSchema.properties.report.oneOf.find((branch: any) => branch.properties?.kind?.const === "question");
     assert.deepEqual(questionSchema.properties.answerMode.enum, ["approval", "single", "multiple"], "The MCP schema exposes selectable answer modes");
+    assert.ok(questionSchema.required.includes("recommendation"), "The MCP schema requires a recommendation on every question");
     const invalid = await client.rpc("tools/call", { name: "report", arguments: { report: { kind: "plan", summary: "No tasks supplied" } } });
     assert.equal(invalid.result.isError, true);
-    const invalidApproval = await client.rpc("tools/call", { name: "report", arguments: { report: { kind: "question", question: "Proceed?", options: ["Approve"], answerMode: "approval" } } });
+    const invalidApproval = await client.rpc("tools/call", { name: "report", arguments: { report: { kind: "question", question: "Proceed?", options: ["Approve"], answerMode: "approval", recommendation: { answers: ["Approve"], reason: "Scoped." } } } });
     assert.equal(invalidApproval.result.isError, true, "The MCP boundary enforces approval option cardinality from the refined schema");
+    assert.equal((await client.rpc("tools/call", { name: "report", arguments: { report: { kind: "question", question: "Proceed?", options: ["Approve", "Deny"] } } })).result.isError, true, "A question without a recommendation is refused");
     assert.equal(requests, 0, "Malformed report input must not reach the worker");
     const report = { kind: "blocked", summary: "MCP report boundary evidence", blocker: {
       cause: { status: "hypothesis", detail: "The provider may not expose the required tool." },

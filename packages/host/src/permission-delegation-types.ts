@@ -15,12 +15,10 @@ export const permissionDelegationRequestSchema = z.object({
   requestId: z.uuid(),
   direction: permissionDelegationDirectionSchema.nullable().optional(),
 }).strict();
-export type PermissionDelegationRequest = z.infer<typeof permissionDelegationRequestSchema>;
 
 export const permissionDelegationMutationRequestSchema = z.object({
   requestId: z.uuid(),
 }).strict();
-export type PermissionDelegationMutationRequest = z.infer<typeof permissionDelegationMutationRequestSchema>;
 
 export interface PermissionCoverageEntry {
   projectId: string;
@@ -91,7 +89,6 @@ export const permissionDelegationStoredStateSchema = z.object({
       context.addIssue({ code: "custom", path: ["knownProjectIds"], message: "Known project IDs must include every opt-out." });
   }
 });
-export type PermissionDelegationStoredState = z.infer<typeof permissionDelegationStoredStateSchema>;
 
 export type CoverageResult =
   | {

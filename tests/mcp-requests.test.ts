@@ -207,17 +207,21 @@ test("question IDs and safe views come from the owned mission and result remains
   try {
     const started = ctx.api.startRequest("bot", request());
     await ctx.intake.poll();
-    await ctx.h.report(1, { kind: "question", question: `Inspect ${ctx.h.config.projects[0].path}/private.txt?`, options: ["Yes", "No"] });
+    await ctx.h.report(1, { kind: "question", question: `Inspect ${ctx.h.config.projects[0].path}/private.txt?`, options: ["Yes", "No"],
+      recommendation: { answers: ["No"], reason: `${ctx.h.config.projects[0].path}/private.txt is outside the request.` } });
     await waitFor(async () => ctx.h.missions.get(started.runId), mission => mission.status === "needs-input");
     const view = ctx.api.getRequest("bot", started.runId);
     assert.ok(!JSON.stringify(view).includes(ctx.h.config.projects[0].path));
-    assert.deepEqual(Object.keys(view.questions[0]).sort(), ["id", "options", "question"]);
+    assert.deepEqual(Object.keys(view.questions[0]).sort(), ["id", "options", "question", "recommendation"]);
+    assert.deepEqual(view.questions[0].recommendation?.answers, ["No"], "the connector reads what the asking agent would answer");
+    assert.match(view.questions[0].recommendation!.reason, /is outside the request\.$/);
     const answer = { runId: view.runId, requestId: randomUUID(), revision: view.revision!, decisionId: view.questions[0].id, text: "Yes" };
     await assert.rejects(ctx.api.replyToRequest("bot", { ...answer, decisionId: randomUUID() }), code("decision-not-found"));
     const accepted = await ctx.api.replyToRequest("bot", answer);
     ctx.restart();
     assert.equal((await ctx.api.replyToRequest("bot", answer)).revision, accepted.revision);
     assert.equal(ctx.h.missions.get(view.runId).decisions[0].answeredBy, "connector");
+    assert.equal(ctx.h.missions.get(view.runId).decisions[0].recommendation?.outcome, "different", "a connector answer records how it compared");
     await assert.rejects(ctx.api.replyToRequest("bot", { ...answer, requestId: randomUUID() }), code("decision-answered"));
     await ctx.h.report(2, { kind: "dispatch", summary: "Apply the answer", subtasks: [{ id: "api-check", repoProjectId: "api", title: "Inspect API", objective: "Apply the accepted answer", size: "solo", parallelism: 1, dependsOn: [] }] });
     const dispatched = await waitFor(async () => ctx.h.missions.get(view.runId), mission => Boolean(mission.subtasks[0]?.teamId));

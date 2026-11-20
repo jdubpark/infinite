@@ -13,6 +13,9 @@ export const MAX_ATTEMPT_POST_BYTES = 64 * 1024;
 export const MAX_ATTEMPT_SERVED_BYTES = 256 * 1024;
 export const MAX_ATTEMPT_READ_CALLS = 200;
 
+/** The answer to an accepted post, before the host stores the entry. The `entry_post` result type is checked against it. */
+export type PendingEntry = { entryId: string; state: "pending" };
+
 export type EntryRefusal = "entry-tools-off" | "entry-too-large" | "entry-invalid" | "entry-binding" | "entry-closed"
   | "entry-id-mismatch" | "entry-kind-forbidden" | "entry-task-forbidden" | "entry-supersede-forbidden" | "entry-secret"
   | "entry-post-limit" | "entry-read-limit" | "entry-not-found" | "entry-unavailable";
@@ -142,7 +145,8 @@ export function createEntryRoute(options: EntryRouteOptions): { handle(body: unk
         }
         options.append("team-entry", envelope);
         postBytes += size;
-        const answer: HookReply = { entry: { entryId: requestId, state: "pending" } };
+        const receipt: PendingEntry = { entryId: requestId, state: "pending" };
+        const answer: HookReply = { entry: receipt };
         accepted.set(requestId, answer);
         return answer;
       }

@@ -159,6 +159,7 @@ struct MissionDetailView: View {
                         Text("Decision · answered by \(decision["answeredBy"].string == "connector" ? (decision["source"]["name"].string.isEmpty ? "Connector" : decision["source"]["name"].string) : decision["answeredBy"].string == "coordinator" ? "the coordinator" : "you")").font(.caption).foregroundStyle(.secondary)
                         Text(decision["question"].string).font(.callout).fixedSize(horizontal: false, vertical: true)
                         Text("Answer: \(decision["answer"].string)").font(.callout.weight(.medium)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        if let note = DecisionRecommendation(decision["recommendation"])?.comparisonNote { Text(note).font(.caption).foregroundStyle(.secondary) }
                     }
                 }
             }

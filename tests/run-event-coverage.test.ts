@@ -72,7 +72,7 @@ const REPORT_SAMPLES: Record<TeamReport["kind"], TeamReport> = {
   "delivery-reconciliation": { kind: "delivery-reconciliation", headCommit: HASH, repository: "example/app", branch: "feature-a",
     baseHeadCommit: BASE, disposition: "no-publication", summary: "Nothing to publish" },
   "pull-request": { kind: "pull-request", headCommit: HASH, pullRequestUrl: "https://example.invalid/pull/1", summary: "Opened" },
-  question: { kind: "question", question: "Which file?", options: [] },
+  question: { kind: "question", question: "Which file?", options: [], recommendation: { answers: ["a.txt"], reason: "It holds the change." } },
   blocked: { kind: "blocked", summary: "Cannot proceed" },
   "intent-check": { kind: "intent-check", summary: "No gap found", items: [] },
 };

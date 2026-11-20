@@ -14,7 +14,6 @@ import type {
   FuseLaunch,
   FuseLaunchRecord,
   FuseLimits,
-  FuseOpen,
   FuseScope,
   FuseTripRecord,
   FuseWindow,

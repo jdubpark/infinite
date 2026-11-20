@@ -10,12 +10,12 @@ export type TeamStatus = "planning" | "discovering" | "implementing" | "integrat
 
 export type SwarmMember = {
   memberId: string; sessionId: string; role: string; revision: number; title: string; status: string;
-  taskId?: string; provider?: string; modelProfile?: TeamModelProfile; usage?: UsageTotals;
+  taskId?: string; provider?: string; modelProfile?: Pick<TeamModelProfile, "label" | "tier">; usage?: Pick<UsageTotals, "cost">;
   startedAt?: string; reportedAt?: string; lastActivityAt?: string; pendingLimit?: boolean; stalledAt?: string; stoppedReason?: string;
 };
 export type SwarmTask = {
-  id: string; title: string; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; dependsOn: string[]; paths: string[];
-  memberId?: string; commit?: string;
+  id: string; title: string; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; paths: string[];
+  memberId?: string;
   /** Paths the host read from Git for this task's integrated diff. */
   changedPaths?: { paths: string[]; truncated: boolean };
 };

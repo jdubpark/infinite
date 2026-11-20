@@ -43,8 +43,9 @@ const placeholdered = (text: string) => text.split(reportCommand()).join("<repor
 const promptOf = (run: TeamRun, role: TeamMember["role"]) =>
   teamPrompt(run, role, undefined, undefined, "claude", PROFILE, { checks: CHECKS }, [], true);
 
-// Byte pin: a goal run without a register keeps every prompt byte. The value is this tree's output before Task 12.
-const PIN_PROMPTS_SHA256 = "96ea12dbb1a38bb24e8cc478a870516621ea458aa8fbd74b8aa1c11d1dcd7004";
+// Byte pin: a goal run without a register keeps every prompt byte. The value is this tree's output before Task 12,
+// moved once from 96ea12db when INF-323 added the recommendation to the question format line, the only change.
+const PIN_PROMPTS_SHA256 = "a4ff6934ae47f73f01d005a42bd9e89a5f33b44c559b5e03ea3f8e45a4f0d3f8";
 
 test("without the register the goal section is byte for byte", () => {
   const prompts: string[] = [];

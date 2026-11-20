@@ -146,10 +146,13 @@ export async function removeMemberTraces(stateDir: string, runId: string) {
   await rmdir(run);
 }
 
-/** The manifest, opened without following a link. Undefined when there is none or it is no manifest. */
+/**
+ * The manifest, opened without following a link and without blocking, so a FIFO in its place cannot hold the open;
+ * the descriptor must then be a regular file. Undefined when there is none or it is no manifest.
+ */
 async function readManifest(directory: string): Promise<Manifest | undefined> {
   let file;
-  try { file = await open(join(directory, MANIFEST), constants.O_RDONLY | constants.O_NOFOLLOW); }
+  try { file = await open(join(directory, MANIFEST), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
   catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
   try {
     const info = await file.stat();

@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, closeSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { readConfig } from "../packages/host/src/config.js";
@@ -293,6 +294,25 @@ test("trace settlement never follows a link, and its log names no path", async (
       for (const line of logged) for (const path of [refused.f.config.stateDir, outside, tmpdir()]) assert.equal(line.includes(path), false, line);
     } finally { refused.close(); }
   } finally { rmSync(outside, { recursive: true, force: true }); }
+});
+
+test("a manifest that is a FIFO does not hold settlement waiting for a writer", { timeout: 30000 }, async () => {
+  const t = codexTeam(64, { memberBytes: 1000, runBytes: 5000 });
+  try {
+    await t.step();
+    const file = join(t.directory(), MANIFEST);
+    rmSync(file);
+    execFileSync("mkfifo", [file]);
+    let timer: NodeJS.Timeout | undefined;
+    const ended = await Promise.race([t.cancel().then(() => true),
+      new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), 5000); })]);
+    clearTimeout(timer);
+    // A settlement blocked on the FIFO is released, so this test fails instead of hanging the file.
+    if (!ended) closeSync(openSync(file, constants.O_WRONLY | constants.O_NONBLOCK));
+    assert.ok(ended, "settlement waited for a writer on the FIFO");
+    assert.ok(lstatSync(file).isFIFO(), "a manifest that is no regular file is left in place");
+    assert.ok(existsSync(join(t.directory(), TRACE, "trace.jsonl")), "and the trace is not measured or removed on its say");
+  } finally { t.close(); }
 });
 
 /** A cancelled run whose members' sessions the fake manager knows, each with a trace of the given size. */

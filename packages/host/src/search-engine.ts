@@ -66,7 +66,8 @@ const contestantSchema = z.object({
   commit: z.string().min(1).optional(),
   tree: z.string().min(1).optional(),
   gate: gateRunSchema.optional(),
-  /** Why the contestant stopped working without a result: its own leave, `wait` (rule 6), or `host` (rules 4 and 8). */
+  // Why the contestant stopped working without a result: its own leave reason. PROPOSED: the engine's own stops record
+  // `wait` (rule 6) and `host` (rules 4 and 8).
   left: z.string().min(1).optional(),
 }).strict();
 
@@ -94,6 +95,8 @@ export const searchStateSchema = z.object({
   waitUntil: isoTime.optional(),
   winner: z.string().min(1).optional(),
   class: z.enum(SEARCH_CLASSES).optional(),
+  // PROPOSED: `base-pass`, `base-timeout`, `base-setup`, `base-yielded`, `champion-<leave>`, `deadline`, `hold`, `wait`,
+  // `all-failed`, `no-challenger`, `window`, or a halt reason.
   endReason: z.string().min(1).optional(),
 }).strict();
 
@@ -170,7 +173,7 @@ export type Decision =
   /** Prepare challengers on these profiles from the champion's base commit, each through the spend fuse. */
   | { kind: "start-challengers"; profileIds: string[]; baseCommit: string }
   | { kind: "stop"; memberIds: string[]; reason: string }
-  /** Stop the search's open gate run, and drop its queued captures and gate runs. */
+  /** Stop the search's open gate run, and drop its queued captures and gate runs. PROPOSED: every end emits it. */
   | { kind: "stop-operations" }
   /** The winner enters today's integration path in plan order, and `task.memberId` becomes it (rule 4). */
   | { kind: "integrate"; memberId: string }
@@ -319,6 +322,8 @@ export function step(search: SearchState, event: SearchEvent, view: RunView): St
   const head = nextGate(s)?.memberId;
   advance(ctx);
   if (isOpen(s)) HANDLERS[event.kind](ctx, event as never);
+  // PROPOSED: one gate decision is outstanding per search; the next is decided when its result arrives, so the engine,
+  // not the host's queue, keeps capture order.
   const next = event.kind === "resume" ? undefined : nextGate(s);
   if (next !== undefined && next.memberId !== head) ctx.out.push({ kind: "gate", memberId: next.memberId, commit: next.commit! });
   return { search: s, decisions: ctx.out };
@@ -438,6 +443,8 @@ const HANDLERS: Handlers = {
   base(ctx, e) {
     const { s, view, out } = ctx;
     if (s.base !== undefined || (s.mode === "live" ? s.state !== "admitting" : s.holdUntil === undefined)) return;
+    // PROPOSED: a timeout or a failed setup is stored as `fail-check`, and `endReason` tells it from a failing exit; a
+    // yielded base run stores nothing, as a stopped gate run has no result (Part 3).
     if (e.outcome === "yielded") return end(ctx, "abandoned", "base-yielded");
     s.base = { result: e.outcome === "pass" ? "pass" : "fail-check", ms: e.ms, ...(e.failures === undefined ? {} : { failures: e.failures }), at: view.now };
     if (e.outcome !== "fail") return end(ctx, "abandoned", BASE_REASONS[e.outcome]);

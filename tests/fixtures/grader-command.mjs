@@ -2,13 +2,13 @@
 // Same-user stand-in for the grader launcher (deploy/ubuntu/grader-command.sh), for tests only.
 // It runs as the current user and follows the launcher's argument contract. Flags come before the operation.
 // It never signals a process group it did not start, and never deletes anything outside its --root.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
 const JOB_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const NAMES = ["base.bundle", "base-delta.patch", "reference.patch"];
+const NAMES = ["base.bundle", "base-delta.patch", "reference.patch", "result.patch"];
 const DIRS = [".", "task", "round-1", "round-2", "round-3", "round-4", "round-5", "round-6"];
 const REPORT_RE = /^reports\/round-[1-6]\.(xml|tap)$/;
 const FIXED_ENV = {
@@ -16,7 +16,7 @@ const FIXED_ENV = {
   GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_NO_REPLACE_OBJECTS: "1", CI: "1",
 };
 
-const opts = { root: "", uid: process.getuid(), metadata: "closed", record: "", ancestorsWritable: false, toolsMissing: false, hang: 0, digestText: undefined, freeBytes: 1099511627776, freeInodes: 10000000, metadataFile: undefined };
+const opts = { root: "", uid: process.getuid(), metadata: "closed", record: "", ancestorsWritable: false, toolsMissing: false, hang: 0, digestText: undefined, freeBytes: 1099511627776, freeInodes: 10000000, metadataFile: undefined, noVersion: false };
 const args = process.argv.slice(2);
 let i = 0;
 for (; i < args.length && args[i].startsWith("--"); i++) {
@@ -32,6 +32,7 @@ for (; i < args.length && args[i].startsWith("--"); i++) {
   else if (flag === "--metadata-file") opts.metadataFile = args[++i];
   else if (flag === "--free-bytes") opts.freeBytes = Number(args[++i]);
   else if (flag === "--free-inodes") opts.freeInodes = Number(args[++i]);
+  else if (flag === "--no-version") opts.noVersion = true;
   else process.exit(64);
 }
 const [op, ...rest] = args.slice(i);
@@ -79,6 +80,8 @@ function probe(canaries) {
     freeInodes: opts.freeInodes,
     ancestorsWritable: opts.ancestorsWritable,
     tools: !opts.toolsMissing,
+    // Version 1 launchers print no version field; --no-version reproduces that.
+    ...(opts.noVersion ? {} : { version: 2 }),
   })));
 }
 
@@ -136,6 +139,17 @@ function read(job, report, maxText) {
   if (!stat.isFile()) exit(2);
   if (stat.size > Number(maxText)) exit(3);
   exit(0, fs.readFileSync(file));
+}
+
+// Streams a bundle of refs/heads/trial from the task clone, as the launcher's export does. Exit 2 when the clone or the branch is missing.
+function exportTrial(job) {
+  if (!JOB_RE.test(job)) exit(64);
+  const cwd = jobPath(job, "work", "task");
+  if (!fs.existsSync(cwd)) exit(2);
+  const env = { ...FIXED_ENV, HOME: jobPath(job, "home"), TMPDIR: jobPath(job, "tmp") };
+  if (spawnSync("git", ["rev-parse", "--verify", "--quiet", "refs/heads/trial"], { cwd, env, stdio: "ignore" }).status !== 0) exit(2);
+  const bundle = spawnSync("git", ["bundle", "create", "-", "refs/heads/trial"], { cwd, env, maxBuffer: 64 << 20 });
+  exit(bundle.status ?? 1, bundle.stdout);
 }
 
 function digest(job) {
@@ -197,6 +211,7 @@ switch (op) {
   case "run": run(rest[0], rest[1], rest[2], rest.slice(3)); break;
   case "read": read(rest[0], rest[1], rest[2]); break;
   case "digest": digest(rest[0]); break;
+  case "export": exportTrial(rest[0]); break;
   case "stop": stop(); break;
   case "clean": clean(rest[0]); break;
   case "remove": remove(rest[0]); break;

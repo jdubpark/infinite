@@ -16,6 +16,8 @@ import type { Stored } from "./teams.js";
 
 /** What the permission classes use of TeamService beyond the kernel. teams.ts builds it in `permissionHost`. */
 export type PermissionHost = TeamKernel & {
+  /** The command prefix for a run: a replay run's own, otherwise the configured one. */
+  prefixFor(run: TeamRun): TeamCommand | undefined;
   assertDelivery(stored: Stored): void;
   invalidatePermissionDecisions(stored: Stored, reason: string, fenceAgent?: boolean): Promise<boolean>;
   newMember(run: TeamRun, role: TeamMember["role"], cwd: string, baseCommit: string, taskId?: string, prompt?: string, pinnedProfile?: TeamModelProfile): TeamMember;
@@ -333,7 +335,7 @@ export class TeamPermissionAgent {
     const run = stored.run, runId = run.id, { memberId, sessionId } = member;
     const sessionRoot = realpathSync(member.cwd);
     this.host.assertRunPath(stored, sessionRoot);
-    const prefix = this.host.config.teams?.commandPrefix;
+    const prefix = this.host.prefixFor(run);
     const scratch = member.scratchDirectory ? [member.scratchDirectory] : [];
     // Today's bounded collection: the member's changed paths and the command sources the dialog names.
     const workspace = async () => {

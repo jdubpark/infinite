@@ -333,3 +333,53 @@ test("goal options parse", async () => {
   await assert.rejects(handleGoalClientCommand(["record", G], { "--request-id": R }, readWithFlag.api), { message: GOAL_RECORD_USAGE });
   assert.deepEqual(readWithFlag.paths, []);
 });
+
+test("the CLI records owner results", async () => {
+  const set = fakeApi();
+  await handleGoalClientCommand(["record", G, "set-assumption", "a4", "verified"], { "--request-id": R }, set.api);
+  assert.deepEqual(set.calls.map(call => call.method), ["GET", "POST"]);
+  assert.deepEqual(set.calls[1].body, { requestId: R, version: 3, ops: [{ op: "assumption.set", id: "a4", status: "verified" }] });
+
+  const rate = fakeApi();
+  await handleGoalClientCommand(["record", G, "rate", "quality", "3.5"], { "--version": "3", "--request-id": R }, rate.api);
+  assert.deepEqual(rate.calls.map(call => call.method), ["POST"]);
+  assert.deepEqual(rate.calls[0].body, { requestId: R, version: 3, ops: [{ op: "rating.record", subject: "quality", score: 3.5 }] });
+
+  const scoreUsage = "Give SCORE as a number from 1 to 5 in halves, such as 3 or 3.5.";
+  const usageCases: { positional: string[]; message: string }[] = [
+    { positional: ["record", G, "rate", "quality", "6"], message: scoreUsage },
+    { positional: ["record", G, "rate", "quality", "3.3"], message: scoreUsage },
+    { positional: ["record", G, "rate", "quality", "5.5"], message: scoreUsage },
+    { positional: ["record", G, "set-assumption", "a4", "assumed"], message: GOAL_RECORD_USAGE },
+    { positional: ["record", G, "set-assumption", "a4", "verified", "extra"], message: GOAL_RECORD_USAGE },
+    { positional: ["record", G, "rate", "quality", "3", "extra"], message: GOAL_RECORD_USAGE },
+  ];
+  for (const { positional, message } of usageCases) {
+    const { api, paths } = fakeApi();
+    await assert.rejects(handleGoalClientCommand(positional, { "--version": "3", "--request-id": R }, api), { message });
+    assert.deepEqual(paths, [], positional.join(" "));
+  }
+
+  const noHead = fakeApi({ status: 409, code: "objective-rating-no-head" }, true);
+  await assert.rejects(handleGoalClientCommand(["record", G, "rate", "quality", "3"], { "--version": "3", "--request-id": R }, noHead.api), { message: "The goal has no reviewed cycle to rate yet." });
+
+  const register = {
+    ...view(),
+    record: {
+      ...view().record,
+      assumptions: [
+        { id: "a4", statement: "Statement a4.", status: "verified", origin: "owner", criticality: "detail", refutedBy: "x", evidence: [`owner:${R}`], proposals: [], test: { kind: "owner" }, ownerPinned: true },
+        { id: "a2", statement: "Statement a2.", status: "refuted", origin: "intent-check", criticality: "plan", refutedBy: "x", evidence: ["plan:x", "receipt:run-1:1:a2"], proposals: [], test: { kind: "command", command: "c".repeat(64) } },
+        { id: "a3", statement: "Statement a3.", status: "assumed", origin: "intent-check", criticality: "plan", refutedBy: "x", evidence: ["plan:x"], proposals: [], test: { kind: "owner" } },
+        { id: "a5", statement: "Statement a5.", status: "verified", origin: "intent-check", criticality: "plan", refutedBy: "x", evidence: [`owner:${R}`, "receipt:run-1:1:a5"], proposals: [], test: { kind: "command", command: "c".repeat(64) }, ownerPinned: true },
+        { id: "a6", statement: "Statement a6.", status: "refuted", origin: "intent-check", criticality: "outcome", refutedBy: "x", evidence: ["plan:x", `rating:${R}`], proposals: [], test: { kind: "owner", rating: { subject: "quality", below: 3 } } },
+      ],
+    },
+  } as unknown as ObjectiveRecordView;
+  const lines = objectiveRecordLines(register, G);
+  assert.ok(lines.includes(`  a4 verified pinned detail owner [owner:${R}]: Statement a4.`), "an owner result shows its pin and handle");
+  assert.ok(lines.includes("  a2 refuted plan intent-check [receipt:run-1:1:a2]: Statement a2."), "a receipt handle shows on its line");
+  assert.ok(lines.includes("  a3 assumed plan intent-check: Statement a3."), "a handle of another prefix does not show");
+  assert.ok(lines.includes("  a5 verified pinned plan intent-check [receipt:run-1:1:a5]: Statement a5."), "of two shown handles, the later one prints");
+  assert.ok(lines.includes(`  a6 refuted outcome intent-check [rating:${R}]: Statement a6.`), "a rating handle shows on its line");
+});

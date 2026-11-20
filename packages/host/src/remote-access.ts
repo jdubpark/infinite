@@ -21,6 +21,8 @@ const MAX_ACTIVE_REQUESTS = 16;
 const MAX_BUFFERED_BYTES = MAX_FRAME_BYTES * 2;
 const MAX_REQUEST_FRAME = MAX_REQUEST_BYTES * 2 + 4096;
 const REQUEST_TIMEOUT_MS = 30000;
+/** After a full team list exceeded the remote limit, later reads skip it for this long and answer rows at once. */
+const TEAM_LIST_RETRY_MS = 5 * 60_000;
 
 function allowedPath(method: RemoteMethod, path: string): boolean {
   if (path.length > 8192 || !path.startsWith("/api/") || path.includes("\\") || path.includes("#") || /[\x00-\x20]/.test(path)) return false;
@@ -146,7 +148,7 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
   if (!machineId || !UUID.test(machineId)) throw new Error("Remote access requires a stable machine identifier");
   const sockets = new WebSocketServer({ noServer: true, maxPayload: MAX_REQUEST_FRAME, perMessageDeflate: false });
   const peers = new Set<{ close: () => void }>();
-  let closed = false, activeRequests = 0;
+  let closed = false, activeRequests = 0, teamListTooLargeAt = -Infinity;
   let relay: WebSocket | undefined, retry: ReturnType<typeof setTimeout> | undefined, retryMs = 1000;
   const relayPeers = new Map<string, { receive: (text: string) => void; close: () => void }>();
   const tokenKeys = () => config.tokens.map(device => keyFromHash(device.hash));
@@ -312,27 +314,38 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
         for (const [name, value] of Object.entries(request.headers ?? {})) {
           if (["x-infinite-client", "x-infinite-control"].includes(name.toLowerCase())) headers[name] = value;
         }
-        const response = await fetch(`http://127.0.0.1:${address.port}${request.path}`, {
-          method: request.method, headers, redirect: "error", signal: controller.signal,
-          body: request.body === undefined ? undefined : JSON.stringify(request.body),
-        });
-        const reader = response.body?.getReader();
-        const chunks: Uint8Array[] = [];
-        let bytes = 0;
-        if (reader) for (;;) {
-          const chunk = await reader.read();
-          if (chunk.done) break;
-          bytes += chunk.value.byteLength;
-          if (bytes > MAX_RESPONSE_BYTES) {
-            await reader.cancel();
-            reply({ type: "response", id: request.id, status: 413, body: { error: "Machine response exceeds the remote limit", code: "response-too-large" } }); return;
+        /** One loopback response, or nothing when it exceeds the remote limit. */
+        const read = async (path: string) => {
+          const response = await fetch(`http://127.0.0.1:${address.port}${path}`, {
+            method: request.method, headers, redirect: "error", signal: controller.signal,
+            body: request.body === undefined ? undefined : JSON.stringify(request.body),
+          });
+          const reader = response.body?.getReader();
+          const chunks: Uint8Array[] = [];
+          let bytes = 0;
+          if (reader) for (;;) {
+            const chunk = await reader.read();
+            if (chunk.done) break;
+            bytes += chunk.value.byteLength;
+            if (bytes > MAX_RESPONSE_BYTES) { await reader.cancel(); return undefined; }
+            chunks.push(chunk.value);
           }
-          chunks.push(chunk.value);
+          let body: unknown;
+          try { body = bytes ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : null; }
+          catch { throw new Error("Runner returned a non-JSON response"); }
+          return { status: response.status, body };
+        };
+        // An installed client asks for every run in full. On a host with many runs that list outgrows the remote limit,
+        // so its compact rows answer in its place: they keep each field a list screen reads, under the same key.
+        const fullTeamList = request.method === "GET" && request.path === "/api/teams";
+        const skipFull = fullTeamList && Date.now() - teamListTooLargeAt < TEAM_LIST_RETRY_MS;
+        let result = skipFull ? undefined : await read(request.path);
+        if (!result && fullTeamList) {
+          if (!skipFull) teamListTooLargeAt = Date.now();
+          result = await read("/api/teams?view=list");
         }
-        let body: unknown;
-        try { body = bytes ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : null; }
-        catch { throw new Error("Runner returned a non-JSON response"); }
-        reply({ type: "response", id: request.id, status: response.status, body });
+        if (!result) { reply({ type: "response", id: request.id, status: 413, body: { error: "Machine response exceeds the remote limit", code: "response-too-large" } }); return; }
+        reply({ type: "response", id: request.id, status: result.status, body: result.body });
       } catch {
         reply({ type: "response", id: request.id, status: 502, body: {
           error: request.method === "GET" ? "Machine request failed. Refresh to reconnect." : "Delivery may be uncertain. Refresh the session before retrying.",

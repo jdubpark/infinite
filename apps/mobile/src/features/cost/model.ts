@@ -1,5 +1,4 @@
 /** Usage records shared by the phone's Cost screens; kept platform-free for simple calculation tests. */
-export type Pricing = "configured" | "catalog" | "provider" | "unknown";
 export type Money = { usd: number; unpriced: number };
 export type Balance = { amount: number; currency: string; asOf: string; stale: boolean } | null;
 /** `planSource` says whether a subscription fee is the config default or one the owner set; older hosts omit it. */

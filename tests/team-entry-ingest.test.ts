@@ -214,3 +214,93 @@ test("a run that is gone or has the tools off leaves the queue", () => {
   ingestPass(queue, id => runs.get(id), { events: silentJournal, entries });
   assert.equal(queue.size, 0);
 });
+
+test("the proposal hook sees only the posts the store holds", () => {
+  const scripted = (outcomes: IngestOutcome[]) => {
+    const ingested: number[][] = [];
+    const entries = {
+      ingest: (_run: TeamRun, _member: TeamMember, posts: MemberPostRecord[]): IngestOutcome => {
+        ingested.push(posts.map(post => post.seq));
+        const outcome = outcomes.shift();
+        if (outcome === undefined) throw new Error("no scripted outcome");
+        return outcome;
+      },
+    } as unknown as Blackboard;
+    return { entries, ingested };
+  };
+
+  // The store keeps post 1 of two. The hook gets only that post, and an unready or held store gives it nothing.
+  const { run, member } = memberState("running");
+  const journal: Event[] = [postEvent(member, 1, "kept post"), postEvent(member, 2, "unkept post")];
+  const { entries, ingested } = scripted([
+    { result: "stored", stored: 2, dropped: 0, invalid: 0, kept: new Set([1]) },
+    { result: "unready", stored: 0, dropped: 0, invalid: 0 },
+    { result: "held", stored: 0, dropped: 0, invalid: 0 },
+  ]);
+  const hooked: number[][] = [];
+  const deps: IngestDeps = {
+    events: (_id, after) => journalAfter(journal, after),
+    entries,
+    done: new Set(),
+    members: [member],
+    kept: (_run, _member, posts) => { hooked.push(posts.map(post => post.seq)); },
+  };
+
+  ingestRunEntries(run, deps);
+  assert.deepEqual(hooked, [[1]], "the hook gets the kept posts once");
+  assert.equal(member.entryCursor, 2);
+
+  journal.push(postEvent(member, 3, "unready post"));
+  ingestRunEntries(run, deps);
+  journal.push(postEvent(member, 4, "held post"));
+  ingestRunEntries(run, deps);
+  assert.deepEqual(hooked, [[1]], "an unready or held store gives the hook nothing");
+  assert.equal(member.entryCursor, 2, "an unready or held store holds the cursor");
+  assert.equal(ingested.length, 3);
+
+  // A page with no post and no read calls no store and no hook.
+  const quiet: IngestDeps = {
+    ...deps,
+    events: () => ({ events: [{ seq: 9, at, type: "heartbeat", data: {} }], cursor: 9, more: false }),
+  };
+  ingestRunEntries(run, quiet);
+  assert.equal(ingested.length, 3, "a page without posts is not stored");
+  assert.deepEqual(hooked, [[1]], "a page without posts gives the hook nothing");
+
+  // A stored page whose posts the store keeps none of gives the hook nothing.
+  const none = scripted([{ result: "stored", stored: 0, dropped: 0, invalid: 1, kept: new Set() }]);
+  const noneJournal: Event[] = [postEvent(member, 10, "invalid post")];
+  ingestRunEntries(run, { ...deps, entries: none.entries, events: (_id, after) => journalAfter(noneJournal, after) });
+  assert.equal(none.ingested.length, 1, "the page is stored");
+  assert.deepEqual(hooked, [[1]], "a page the store keeps nothing of gives the hook nothing");
+
+  // A throwing hook does not hold the cursor back: the next member is read.
+  const state = memberState("running");
+  const second = state.run.members.find(item => item.memberId === hostEntryIds.implB);
+  if (!second) throw new Error("fixture member missing");
+  second.status = "running";
+  second.entryTools = true;
+  second.startedAt = at;
+  second.entryCursor = 0;
+  second.report = undefined;
+  second.sessionId = "00000000-0000-4000-8000-0000000000c9";
+  const firstJournal: Event[] = [postEvent(state.member, 1, "throwing hook post")];
+  const secondJournal: Event[] = [postEvent(second, 1, "next member post")];
+  const ingestedBy: string[] = [];
+  const throwing = {
+    ingest: (_run: TeamRun, read: TeamMember, posts: MemberPostRecord[]): IngestOutcome => {
+      ingestedBy.push(read.memberId);
+      return { result: "stored", stored: posts.length, dropped: 0, invalid: 0, kept: new Set(posts.map(post => post.seq)) };
+    },
+  } as unknown as Blackboard;
+  ingestRunEntries(state.run, {
+    events: (id, after) => journalAfter(id === state.member.sessionId ? firstJournal : secondJournal, after),
+    entries: throwing,
+    done: new Set(),
+    members: [state.member, second],
+    kept: () => { throw new Error("hook failed"); },
+  });
+  assert.equal(state.member.entryCursor, 1, "a throwing hook does not hold the cursor");
+  assert.deepEqual(ingestedBy, [state.member.memberId, second.memberId]);
+  assert.equal(second.entryCursor, 1, "the next member is read after a throwing hook");
+});

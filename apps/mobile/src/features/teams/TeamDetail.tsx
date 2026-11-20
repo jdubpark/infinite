@@ -20,6 +20,7 @@ import {
   type ModelProfile, type PhaseState, type TeamCheck, type TeamDecision, type TeamMember, type TeamTask, type TeamView,
 } from "./model";
 import { Clamp, Disclosure, LinearChip, LineupView, ProfileLine, providerName, RequestStatus, Section, SteerBox, t } from "./parts";
+import { DecisionOptions, OutcomeNote, RecommendationBlock } from "./Recommendation";
 import { useRunRequest } from "./useRunRequest";
 import { AgentApproval } from "./TeamApprovals";
 import { AgentLog, UnderstandingSummary } from "./TeamSummary";
@@ -389,7 +390,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
         </Section> : null}
         {team.steering.length || answered.length ? <Section title="Directions and decisions" count={team.steering.length + answered.length}>
           {team.steering.map((entry, index) => <View key={`${entry.at}/${index}`} style={s.record}><Text style={t.note}>{typeof entry.source === "object" ? entry.source.name : entry.source === "coordinator" ? "Mission coordinator" : "You"} · direction · rev {entry.revision} · {shortDate(entry.at)}</Text><Clamp text={entry.text} lines={3} /></View>)}
-          {answered.map(decision => <View key={decision.id} style={s.record}><Text style={t.note}>Decision · rev {decision.revision}</Text><Text style={t.body}>{decision.question}</Text><Text style={t.strong}>{decision.answeredBy === "connector" ? decision.source?.name ?? "Connector" : decision.answeredBy === "coordinator" ? "Mission coordinator" : "You"}: {decision.answer}</Text></View>)}
+          {answered.map(decision => <View key={decision.id} style={s.record}><Text style={t.note}>Decision · rev {decision.revision}</Text><Text style={t.body}>{decision.question}</Text><Text style={t.strong}>{decision.answeredBy === "connector" ? decision.source?.name ?? "Connector" : decision.answeredBy === "coordinator" ? "Mission coordinator" : "You"}: {decision.answer}</Text><OutcomeNote recommendation={decision.recommendation} /></View>)}
         </Section> : null}
         {team.events.length ? <Section title="History" count={team.events.length}>
           {[...team.events].reverse().slice(0, 6).map((event, index) => <HistoryRow key={`${event.at}/${index}`} at={event.at} day={team.updatedAt} text={event.text} />)}
@@ -446,8 +447,9 @@ function DecisionCard({ decision, member, disabled, onAnswer }: { decision: Team
   return <Card attention>
     <Text style={s.decisionMeta}>{member ? ROLE_NAMES[member.role] : "Team"} · rev {decision.revision} · {shortDate(decision.createdAt)}</Text>
     <Text selectable style={t.body}>{decision.question}</Text>
-    {decision.options.length ? <View style={s.options}>
-      {decision.options.map((option, index) => <Button key={index} compact secondary title={option} disabled={disabled} onPress={() => onAnswer(option)} />)}
+    {decision.recommendation ? <RecommendationBlock recommendation={decision.recommendation} /> : null}
+    {decision.options.length || decision.recommendation ? <View style={s.options}>
+      <DecisionOptions options={decision.options} recommendation={decision.recommendation} disabled={disabled} onAnswer={onAnswer} />
     </View> : null}
     <View style={s.answer}>
       <TextInput accessibilityLabel="Your answer" value={text} onChangeText={setText} editable={!disabled} multiline maxLength={8000}

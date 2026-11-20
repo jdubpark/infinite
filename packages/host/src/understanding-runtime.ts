@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
@@ -231,9 +231,10 @@ export class UnderstandingRuntime {
     this.queue = []; this.queued.clear();
     return new Promise(resolvePromise => {
       if (!this.running) return resolvePromise();
-      const timer = setInterval(() => { if (!this.running) { clearInterval(timer); resolvePromise(); } }, 10);
-      timer.unref();
-      setTimeout(() => { clearInterval(timer); resolvePromise(); }, 1500).unref();
+      // Both timers keep the process alive, so a caller that awaits close always gets an answer within the limit.
+      const done = () => { clearInterval(timer); clearTimeout(limit); resolvePromise(); };
+      const timer = setInterval(() => { if (!this.running) done(); }, 10);
+      const limit = setTimeout(done, 1500);
     });
   }
 
@@ -503,7 +504,7 @@ export class UnderstandingRuntime {
           if (!this.boundStillCurrent(workspaceId, groupAtStart, binding)) throw new Error("source-rebound-before-synthesis");
           let result: { components: KnowledgeComponent[]; coverage: string[] };
           try {
-            result = await this.invoke(binding.root, options => this.adapter.synthesize!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, context: observation.context, components: [component], plans: entry.plans.filter(plan => plan.componentId === component.id) }, options), MAX_OUTPUT_BYTES, { reserveMs });
+            result = await this.invoke(options => this.adapter.synthesize!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, context: observation.context, components: [component], plans: entry.plans.filter(plan => plan.componentId === component.id) }, options), MAX_OUTPUT_BYTES, { reserveMs });
           } catch (error) {
             if (this.closed || !isDeadline(error)) throw error;
             // Out of time: keep the components already explained and publish the source map.
@@ -557,7 +558,7 @@ export class UnderstandingRuntime {
         const observation = repos[binding.repo.projectId]; if (!observation || !this.boundStillCurrent(workspaceId, groupAtStart, binding)) continue;
         let value: KnowledgeDelivery;
         try {
-          value = await this.invoke(binding.root, options => this.adapter.delivery!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, head: observation.head }, options), MAX_OUTPUT_BYTES, { reserveMs });
+          value = await this.invoke(options => this.adapter.delivery!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, head: observation.head }, options), MAX_OUTPUT_BYTES, { reserveMs });
         } catch (error) {
           if (this.closed || !isDeadline(error)) throw error;
           partial.push(`Repository ${binding.repo.name}: delivery unavailable: ${failureReason(error)}`);
@@ -575,7 +576,7 @@ export class UnderstandingRuntime {
         const observation = repos[binding.repo.projectId]; if (!observation) continue;
         let fresh: RepoContext;
         try {
-          fresh = parseRepoContext(await this.invoke(binding.root, options => this.adapter.context!(binding.root, options), MAX_CONTEXT_BYTES));
+          fresh = parseRepoContext(await this.invoke(options => this.adapter.context!(binding.root, options), MAX_CONTEXT_BYTES));
         } catch (error) {
           const before = beforeHooks.get(binding.repo.projectId);
           if (this.closed || !isDeadline(error) || !before) throw error;
@@ -627,7 +628,7 @@ export class UnderstandingRuntime {
       try {
         if (!this.boundStillCurrent(workspaceId, group, binding)) throw new Error("source-rebound-before-brief");
         // Each brief may use the configured timeout; the extension above keeps the later steps their own time.
-        const result = await this.invoke(binding.root, options => this.adapter.brief!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, context: observation.context, base: observation.brief?.head ?? null, components: components.map(({ id, name }) => ({ id, name })) }, options), MAX_OUTPUT_BYTES, { reserveMs });
+        const result = await this.invoke(options => this.adapter.brief!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, context: observation.context, base: observation.brief?.head ?? null, components: components.map(({ id, name }) => ({ id, name })) }, options), MAX_OUTPUT_BYTES, { reserveMs });
         if (!this.boundStillCurrent(workspaceId, group, binding)) throw new Error("source-rebound-after-brief");
         const observedAt = new Date().toISOString();
         const stored = storedBriefSchema.parse({
@@ -646,7 +647,7 @@ export class UnderstandingRuntime {
   }
 
   private async capture(workspaceId: string, binding: SourceBinding, catalog: KnowledgeCatalog): Promise<StoredRepository> {
-    const context = await this.invoke(binding.root, options => {
+    const context = await this.invoke(options => {
       if (this.adapter.context) return this.adapter.context(binding.root, options);
       throw new Error("context-unavailable");
     }, MAX_CONTEXT_BYTES);
@@ -771,7 +772,7 @@ export class UnderstandingRuntime {
    * Runs one engine call inside the attempt deadline. `reserveMs` is kept back for the final re-check and
    * `share` limits the call to that fraction of what is left after the reserve.
    */
-  private async invoke<T>(root: string, callback: (options: UnderstandingAdapterOptions) => Promise<T>, maxBytes = MAX_OUTPUT_BYTES, window: { reserveMs?: number; share?: number } = {}): Promise<T> {
+  private async invoke<T>(callback: (options: UnderstandingAdapterOptions) => Promise<T>, maxBytes = MAX_OUTPUT_BYTES, window: { reserveMs?: number; share?: number } = {}): Promise<T> {
     const configured = this.attemptMs();
     const remaining = this.activeDeadline ? this.activeDeadline - Date.now() : configured;
     const available = Math.floor((remaining - (window.reserveMs ?? 0)) * (window.share ?? 1));
@@ -818,7 +819,7 @@ export class UnderstandingRuntime {
     }
     return { group, repo, root, rootIdentity: digest({ path: root, dev: String(rootStat.dev), ino: String(rootStat.ino), identity }), membership: digest({ groupId: group.id, revision: group.revision, key: identity, checkoutIdentities }), projects };
   }
-  private boundStillCurrent(workspaceId: string, group: ProjectGroup, binding: SourceBinding) {
+  private boundStillCurrent(workspaceId: string, _group: ProjectGroup, binding: SourceBinding) {
     try {
       const latest = this.group(workspaceId), repo = latest.repos.find(item => item.projectId === binding.repo.projectId);
       return Boolean(repo && this.binding(repo, latest).rootIdentity === binding.rootIdentity && this.binding(repo, latest).membership === binding.membership);

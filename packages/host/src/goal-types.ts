@@ -19,7 +19,6 @@ export const goalStandingSchema = z.object({
   /** Host signal kinds that may start the next cycle before its cadence. */
   wakeOn: z.array(z.enum(signalKinds)).min(1).max(4).refine(kinds => new Set(kinds).size === kinds.length, "List each signal kind once").optional(),
 }).strict();
-export type GoalStanding = z.infer<typeof goalStandingSchema>;
 export const createGoalSchema = z.object({
   requestId: z.uuid(),
   projectId: z.string().regex(/^[a-z0-9-]{1,80}$/),

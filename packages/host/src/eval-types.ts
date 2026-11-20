@@ -1,4 +1,4 @@
-import type { TeamBrief, TeamGoalContext } from "./team-types.js";
+import type { TeamBrief, TeamGoalContext, TeamModelProfile } from "./team-types.js";
 import type { RoutineStatus } from "./routine-types.js";
 
 export const EVAL_MODULE = "eval-corpus";
@@ -68,7 +68,6 @@ export type ValidationReason = typeof VALIDATION_REASONS[number];
 export type EvalReason = StartReason | MaterialReason | PromotionReason | MineReason | ValidationReason;
 export type EvalState = typeof EVAL_STATES[number];
 export type EvalOrigin = "captured" | "mined";
-export type PromptOrigin = "assignment" | "run-objective" | "commit-message";
 export type Lineage = "clear" | "unclear";
 export type MaterialState = "pending" | "stored" | "partial" | "none";
 export type ApprovalState = "pending" | "read" | "unknown";
@@ -148,14 +147,48 @@ export type ReconcileResult = { visited: number; promoted: number; rejected: num
 export type GraderState = "not-configured" | "unavailable" | "misconfigured" | "exposed" | "network-open" | "ready";
 export type MiningState = "off" | "waiting" | "mining" | "caught-up" | "full" | "failing";
 export type MiningStatus = { state: MiningState; visited: number | null; mined: number | null; skipped: number | null; failures: number | null; backfillDone: boolean | null };
-export type EvalJobReason = "owner" | "validation-stuck" | "configuration-changed" | "grader-processes-alive" | "limit-reached" | "done" | "expired";
-export type EvalJobWait = "grader" | "window" | "host-load" | "halt" | "storage" | "bundle" | "mirror" | "another-job";
-export type EvalJobView = {
+export type EvalJobReason = "owner" | "validation-stuck" | "configuration-changed" | "grader-processes-alive" | "limit-reached" | "done" | "expired"
+  | "trial-voids" | "eval-processes-alive";
+export type EvalJobWait = "grader" | "window" | "host-load" | "halt" | "storage" | "bundle" | "mirror" | "another-job"
+  | "eval-identity" | "provider-limit" | "session-slots" | "daily-cap";
+export type ValidateJobView = {
   jobId: string; projectId: string | null; kind: "validate"; status: RoutineStatus;
   reason: EvalJobReason | null; waiting: EvalJobWait | null;
   createdAt: string; startedAt: string | null; expiresAt: string; finishedAt: string | null;
   counts: { visited: number; valid: number; rejected: number; retired: number; undecided: number };
 };
+export const TRIAL_ENDINGS = ["graded", "no-result", "escalated", "question", "blocked", "permission", "stalled",
+  "scope-violation", "timeout", "void-limit", "void-host", "void-owner"] as const;
+export type TrialEnding = typeof TRIAL_ENDINGS[number];
+export const VOID_ENDINGS: readonly TrialEnding[] = ["void-limit", "void-host", "void-owner"];
+export type TrialConfiguration = { profile: TeamModelProfile; guidance: "as-of-base"; knowledge: "none" };
+export type TrialGrade = {
+  ending: TrialEnding;
+  expectedPassed: number | null; expectedTotal: number;
+  guardPassed: boolean | null;
+  resolved: boolean;
+  overwritten: number;
+  diff: { added: number; removed: number; referenceAdded: number; referenceRemoved: number } | null;
+  isolation: "isolated" | "none";
+};
+export type TrialState = "preparing" | "running" | "grading" | "final";
+export type EvalIdentityState = "not-configured" | "unavailable" | "misconfigured" | "exposed" | "network-open" | "busy" | "ready";
+export type BaselineJobRequest = {
+  kind: "baseline";
+  configurations: TrialConfiguration[];
+  taskFilter?: { taskIds?: string[]; origins?: EvalOrigin[]; areas?: string[]; maxTasks?: number };
+  trialsPerTask?: number;
+  limits: { maxTrials: number; maxWallMinutes: number };
+  windows?: { startHourUtc: number; endHourUtc: number }[];
+  expiresAt?: string;
+};
+export type BaselineJobView = Omit<ValidateJobView, "kind" | "counts"> & {
+  kind: "baseline";
+  tasks: { planned: number; reached: number; skipped: number };
+  trials: { planned: number; started: number; graded: number; resolved: number; ended: number; void: number };
+  dailyCap: number | null;
+};
+export type EvalJobView = ValidateJobView | BaselineJobView;
 export type ValidateJobRequest = {
   kind: "validate";
   taskFilter?: { taskIds?: string[]; origins?: EvalOrigin[]; areas?: string[]; revalidate?: boolean; maxTasks?: number };
@@ -171,16 +204,19 @@ export type EvalSummary = {
            byArea: { area: string; candidate: number; valid: number }[]; bySet: null };
   groups: { total: number; devOnly: number; largest: number };
   coverage: { days: number; validCaptured: number; accepted: number; share: number } | null;
-  grader: { state: GraderState };
+  grader: { state: GraderState; version: number | null };
+  evalIdentity: { state: EvalIdentityState };
+  trials: { today: number; dailyCap: number | null };
   jobs: EvalJobView[];
 };
 export type EvalRefusal = { status: 400 | 404 | 409 | 503; code: "invalid-eval-request" | "unknown-project" | "unknown-job" | "unknown-task"
-  | "job-active" | "request-conflict" | "eval-config-incomplete" | "invalid-job-transition" | "task-not-active" | "evidence-unavailable" };
+  | "job-active" | "request-conflict" | "eval-config-incomplete" | "invalid-job-transition" | "task-not-active" | "evidence-unavailable"
+  | "profile-not-approved" };
 export interface EvalHostApi {
   summary(projectId: string): Promise<EvalSummary | EvalRefusal>;
   jobs(): EvalJobView[] | EvalRefusal;
   job(jobId: string): EvalJobView | EvalRefusal;
-  create(projectId: string, request: ValidateJobRequest, requestId: string): { created: boolean; job: EvalJobView } | EvalRefusal;
+  create(projectId: string, request: ValidateJobRequest | BaselineJobRequest, requestId: string): { created: boolean; job: EvalJobView } | EvalRefusal;
   control(jobId: string, action: "pause" | "resume" | "cancel"): EvalJobView | EvalRefusal;
   retire(taskId: string): { taskId: string; state: "retired" } | EvalRefusal;
 }

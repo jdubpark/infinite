@@ -210,6 +210,32 @@ Rollback, fastest first:
 - Stop allow-list refusals: set `"mode": "observe"` and `sudo systemctl reload infinite-egress-proxy`.
 - Remove the rule entirely: [stop agent work](#stopping-agent-work); remove both drop-ins (`sudo rm /etc/systemd/system/infinite.service.d/egress-firewall.conf /etc/systemd/system/nftables.service.d/infinite-egress.conf` and `sudo systemctl daemon-reload`) so the API no longer depends on the firewall and `nftables.service` no longer loads the rule; then `sudo systemctl disable --now infinite-egress-firewall.service` and start the API. From then on the agent account's direct connections are neither logged nor refused, metadata addresses included.
 
+## 6. Eval identities
+
+The eval account ([the eval member account](eval.md)) has two egress identities. The host gives each one a credential that names it, and the proxy gives each one only its own list in the `projects` map of `policy.json`. The global `allow` list never applies to them.
+
+- `_eval` is the member of a trial and the probe that checks its isolation. The member's credential lasts 30 days, as every session's does, and the probe's lasts 60 seconds. Its list holds the provider API hosts of the eval logins.
+- `_eval-setup` is the project's `setup` command, which installs dependencies in a trial's workspace. Its credential lasts 15 minutes. Its list holds the package registries that `setup` needs.
+
+```json
+"projects": {
+  "_eval": { "allow": ["PROVIDER_API_HOST"] },
+  "_eval-setup": { "allow": ["PACKAGE_REGISTRY_HOST"] }
+}
+```
+
+The lists are the owner's. Step 6 of [the eval member account](eval.md#6-the-egress-lists) says how to choose them and why a registry that serves the project's own later releases does not belong in `_eval-setup`.
+
+Setup runs with the host's whole egress set: the four proxy variables, `NO_PROXY` and `no_proxy` with the loopback addresses, and `NODE_USE_ENV_PROXY=1`. Node 22 uses the proxy only with the last one. Commands that a trial runs through `exec` get no proxy variable, so a tool that calls out directly reaches the network only where the network rule of [the eval member account](eval.md#5-the-network-rule) allows it, which is nowhere but loopback.
+
+Check: the journal's `_eval` lines name the hosts that a trial reached. In enforce mode a host that is missing from the list shows `refused`.
+
+```sh
+journalctl -u infinite-egress-proxy -o cat | grep '"project":"_eval' | tail -n 5
+```
+
+Undo: remove the two keys from `projects`, and reload the proxy with `sudo systemctl reload infinite-egress-proxy`. The eval account then reaches no host through the proxy, and every trial's probe and setup fail.
+
 ## When the proxy is down
 
 Sessions with proxy variables cannot reach the network: model calls, package installs, and Git over HTTPS fail with connection refused. The firewall rule is separate and stays in force. The host API, web client, and phone keep working, because the host's own requests do not use the proxy and the firewall rule matches only the agent account. Systemd restarts the proxy after two seconds; with the socket unit, new connections wait instead of failing. `infinite doctor` shows `proxy UNREACHABLE`.

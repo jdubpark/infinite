@@ -1,5 +1,5 @@
 import type { AutonomyMode } from "./autonomy.js";
-import { promptVersion } from "./config-identity.js";
+import { promptVersion, type ObjectivePrompt } from "./config-identity.js";
 import { CONFIGURATIONS_MODULE, epochAt } from "./configuration-store.js";
 import type { EvidenceDb } from "./evidence/types.js";
 import type { EvidenceStore } from "./evidence/store.js";
@@ -42,7 +42,7 @@ export type RoutingStatusInput = {
   publishHeads: boolean;
   entryTools: boolean;
   /** Owner criteria are on: the evidence is read with the record digest, as a goal cycle's start would be. */
-  objectiveDigest: boolean;
+  objectiveDigest: ObjectivePrompt;
   now: string;
 };
 
@@ -71,7 +71,7 @@ type Evidence = { representative: Map<string, TeamModelProfile>; rows: Map<strin
   /** The outcome ids of each identity's applied `auto` starts, which carry the who-chose weight. */
   applied: Map<string, Set<string>> };
 
-function readEvidence(db: EvidenceDb, screened: readonly Screened[], publishHeads: boolean, entryTools: boolean, objectiveDigest: boolean, now: string): Evidence {
+function readEvidence(db: EvidenceDb, screened: readonly Screened[], publishHeads: boolean, entryTools: boolean, objectiveDigest: ObjectivePrompt, now: string): Evidence {
   const since = daysBefore(now, MAX_AGE_DAYS);
   const representative = new Map<string, TeamModelProfile>();
   for (const item of [...screened.filter(item => item.removed === undefined), ...screened.filter(item => item.removed !== undefined)]) {

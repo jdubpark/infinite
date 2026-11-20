@@ -1,5 +1,5 @@
 import { closeSync, openSync, readSync } from "node:fs";
-import { EVAL_STATES, type EvalJobView, type EvalState, type EvalSummary } from "./eval-types.js";
+import { EVAL_STATES, type BaselineJobView, type EvalJobView, type EvalState, type EvalSummary } from "./eval-types.js";
 
 type Options = Record<string, string | boolean>;
 export type EvalApi = { json<T = unknown>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<T> };
@@ -18,16 +18,31 @@ const clean = (value: string) => value.replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 const count = (value: number | null | undefined) => value === null || value === undefined ? "unknown" : String(value);
 const stateCounts = (byState: Record<EvalState, number>) => EVAL_STATES.map(state => `${state} ${count(byState[state])}`).join(" · ");
 
+/** A baseline job's counts: tasks reached of planned, then the trials that started, were graded, resolved, ended, and voided. */
+function baselineCountLine(job: BaselineJobView): string {
+  const { tasks, trials } = job;
+  return `tasks ${count(tasks.reached)} of ${count(tasks.planned)} (skipped ${count(tasks.skipped)}) · trials started ${count(trials.started)} of ${count(trials.planned)}, graded ${count(trials.graded)}, resolved ${count(trials.resolved)}, ended ${count(trials.ended)}, void ${count(trials.void)}`;
+}
+
 /** One job as two lines: its header, then its counts. Every text value passes through `clean`. */
 export function evalJobLines(job: EvalJobView): string[] {
   const reason = job.reason ? ` · ${clean(job.reason)}` : "";
   const waiting = job.waiting ? ` · waiting ${clean(job.waiting)}` : "";
+  const header = `job ${clean(job.jobId)} ${clean(job.status)}${reason}${waiting}`;
+  if (job.kind === "baseline") return [header, baselineCountLine(job)];
+  if (job.kind !== "validate") return [header];
   const { counts } = job;
   return [
-    `job ${clean(job.jobId)} ${clean(job.status)}${reason}${waiting}`,
+    header,
     `visited ${count(counts.visited)}, valid ${count(counts.valid)}, rejected ${count(counts.rejected)}, retired ${count(counts.retired)}, undecided ${count(counts.undecided)}`,
   ];
 }
+
+/** A grader at launcher version 1 is ready but cannot run a trial, so the line says so. */
+const graderLine = (grader: EvalSummary["grader"]) =>
+  grader.state === "ready" && typeof grader.version === "number" && grader.version < 2
+    ? "grader ready (version 1: no trials)"
+    : `grader ${clean(grader.state)}`;
 
 /** The status of one project, in the order the plan fixes. Plain columns only: ids, states, counts, and hashes. */
 export function evalStatusLines(summary: EvalSummary): string[] {
@@ -41,8 +56,15 @@ export function evalStatusLines(summary: EvalSummary): string[] {
     summary.coverage === null
       ? "coverage unknown"
       : `coverage ${Math.round(summary.coverage.share * 100)}% of ${count(summary.coverage.accepted)} accepted attempts over ${count(summary.coverage.days)} days`,
-    `grader ${clean(summary.grader.state)}`,
+    graderLine(summary.grader),
   ];
+  // An older host sends no identity or trial fields; those lines are then left out, not shown as zero.
+  if (summary.evalIdentity) lines.push(`eval identity ${clean(summary.evalIdentity.state)}`);
+  if (summary.trials) {
+    lines.push(summary.trials.dailyCap === null
+      ? "trials off"
+      : `trials today ${count(summary.trials.today)} of ${count(summary.trials.dailyCap)}`);
+  }
   for (const job of summary.jobs) lines.push(...evalJobLines(job));
   return lines;
 }

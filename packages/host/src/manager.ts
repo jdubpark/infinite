@@ -33,7 +33,7 @@ import type { FuseGate } from "./fuse/types.js";
 import { haltReason } from "./halt/rules.js";
 import { agentAcceptOption, isCollapsedPermissionPrompt, oneShotRejectOption, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { nativeContinuationSchema, teamModelProfileSchema, type NativeContinuation, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
-import { missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
+import { missionCoordinatorLaunch, permissionCoordinatorLaunch, sessionAgentProfile, teamModelLaunch, withoutSharedContext } from "./launch.js";
 import { withNativeContinuation } from "./native-continuation.js";
 import { SESSION_PERMISSION_ACTOR_LABEL, isRequesterNotice, sessionPermissionRequestId, type SessionPermissionAnswer } from "./permission-session-requests.js";
 import { deferredCallOpen, type HeadlessPermissionChannel } from "./permission-headless.js";
@@ -41,7 +41,7 @@ import { agentBoundary, inventoryRuntimeProcesses, runtimeIdentity, stopRuntimeT
 import { TeamError } from "./team-workspace.js";
 import { projectGithubRepository, sessionGithubGrant, sessionGithubScopeFor, type GithubGrantScope, type SessionGithubOrigin } from "./github-grants.js";
 import {
-  SESSION_PURPOSES,
+  learningPurpose, SESSION_PURPOSES,
   type SessionPurpose,
 } from "./types.js";
 import type {
@@ -312,7 +312,7 @@ export class Manager {
   remove(id: string): Promise<void> {
     const operation = this.serial.then(async () => {
       const stored = this.meta(id);
-      if (stored.session.team) throw new ContentError("Team sessions cannot be removed", 409);
+      if (stored.session.team && !learningPurpose(stored.session.purpose)) throw new ContentError("Team sessions cannot be removed", 409); // the trial sweep removes a learning session
 
       let workerStateReadFailed = false;
       try {
@@ -1088,7 +1088,7 @@ export class Manager {
     if (request.team && this.fuse) {
       const spanning = haltScope?.length ? this.fuse.held?.(haltScope) : undefined;
       const admission = spanning ? { ok: false as const, launchId: id, halted: spanning }
-        : this.fuse.admit(workLaunch({ launchId: id, projectId: request.projectId, provider: request.provider, team: request.team, profile: request.teamModelProfile }));
+        : this.fuse.admit(workLaunch({ launchId: id, projectId: request.projectId, provider: request.provider, team: request.team, profile: request.teamModelProfile, purpose: request.purpose }));
       if (!admission.ok && "halted" in admission) {
         this.fuse.refund?.(id);
         throw new TeamError(409, "halted", haltReason(admission.halted));
@@ -1096,13 +1096,13 @@ export class Manager {
       if (!admission.ok) throw new TeamError(409, "fuse-open", fuseReason("open" in admission ? admission.open : "write-failed"));
     }
     if (!request.team && [...this.handoffProjects.values()].some(path => handoffPathsOverlap(path, realpathSync(project.path)))) throw new ContentError("This project is capturing an accepted team handoff");
-    const configuredProfile = this.config.agents[request.provider];
+    const configuredProfile = sessionAgentProfile(this.config, request.provider, request.purpose);
     if (!configuredProfile) throw new Error("Provider is not configured on this host");
     let profile = request.teamModelProfile ? teamModelLaunch(configuredProfile, request.teamModelProfile) : configuredProfile;
     if (request.team?.role === "permission-coordinator") profile = permissionCoordinatorLaunch(request.provider, profile);
     if (request.team?.role === "mission-coordinator") profile = missionCoordinatorLaunch(request.provider, profile);
     if (request.continuation) profile = withNativeContinuation(profile, request.continuation);
-    const context = new ProjectContexts(this.config, this.key).snapshot(request.projectId);
+    const context = withoutSharedContext(new ProjectContexts(this.config, this.key).snapshot(request.projectId), request.purpose);
     const session: Session = {
       id,
       ...(request.team ? { team: request.team } : {}),

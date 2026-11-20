@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { choice, noul } from "@typesafe-ai/sdk";
-import type { Questions, RequestOptions, SystemOneRequest, SystemOneResult, TypeSafeClient } from "@typesafe-ai/sdk";
+import type { Questions, RequestOptions, SystemOneRequest, SystemOneResult } from "@typesafe-ai/sdk";
 import { firstSentence } from "@infinite/attention";
 import type { Attention, Provider } from "@infinite/attention";
 import { ROUTE_INPUT_LIMIT, type RouteReading } from "./intake-route.js";
@@ -63,7 +63,7 @@ export function clipTitle(line: string, max = 60) {
   return (boundary > 0 ? prefix.slice(0, boundary) : firstLine.slice(0, max)).trimEnd();
 }
 
-function defaultTitle(title: string, provider: Provider, generatedTitle?: boolean) {
+function defaultTitle(title: string, generatedTitle?: boolean) {
   return generatedTitle === true || (generatedTitle === undefined && title === "");
 }
 function keyOf(id: string, type: Key, hash: string) { return `${id}:${type}:${hash}`; }
@@ -223,7 +223,7 @@ export class Readings {
         continue;
       }
       const prompt = session.initialPrompt ?? "";
-      const titleIsDefault = defaultTitle(session.title, session.provider, session.generatedTitle);
+      const titleIsDefault = defaultTitle(session.title, session.generatedTitle);
       const line = titleIsDefault && prompt ? firstLine(prompt) : "";
       const latest: LatestSession = { defaultTitle: titleIsDefault,
         promptLine: line.length <= 60 ? line : clipTitle(line), promptLineLength: line.length,
@@ -253,7 +253,7 @@ export class Readings {
   }
 
   private queueTitleReading(row: ReadingRow, session: Session) {
-    if (!this.sessionJev || !this.writer || !defaultTitle(session.title, session.provider, session.generatedTitle)) return;
+    if (!this.sessionJev || !this.writer || !defaultTitle(session.title, session.generatedTitle)) return;
     const prompt = session.initialPrompt ?? "";
     if (!prompt) return;
     const line = firstLine(prompt);

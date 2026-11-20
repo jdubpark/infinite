@@ -125,6 +125,21 @@ test("eval settings stay out of the routine approval digest", async () => {
   } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test("trial settings leave the routine digest alone", async () => {
+  const f = setup(); const service = f.createService();
+  try {
+    await service.create(f.create()); await wait(30); await service.tick();
+    const profile = { id: "trial-a", label: "Trial A", provider: "claude" as const, model: "model", effort: "high" as const, tier: "strong" as const };
+    f.config.projects[0]!.team!.eval = { trialsPerDay: 4, trialMinutes: 60, candidateProfiles: [profile], capture: true, reportFormat: "junit", focusedTest: { command: "node", args: ["{files}", "--test-reporter-destination={report}"] } };
+    f.config.eval = { member: { prefix: { command: "sudo", args: ["-n", "-u", "infinite-eval", "--", "/usr/local/libexec/infinite/eval-command"] }, root: "/var/lib/infinite-eval", agents: { claude: { command: "claude", args: [] } } } };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "running");
+    f.config.projects[0]!.team!.features = { areas: [{ id: "host", paths: ["src"] }] };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "blocked", "the feature map still moves the digest");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test("routing settings change the approval digest, and their absence keeps it", async () => {
   const f = setup(); const service = f.createService();
   try {
@@ -170,6 +185,19 @@ test("the intent check settings are inside the routine approval digest", async (
     f.config.teams!.lineup = { ...f.config.teams!.lineup!, evaluators: [{ id: "astra", label: "Astra", provider: "codex", model: "astra", effort: "high", tier: "strong" }] } as never;
     await service.tick();
     assert.equal(service.get(second.id).status, "blocked", "the lineup's evaluators change the authority digest");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("the register setting is inside the routine approval digest", async () => {
+  const f = setup(); let service = f.createService();
+  try {
+    await service.create(f.create()); await wait(30); await service.tick();
+    assert.equal(service.list()[0]!.status, "running");
+    service.close(); service = f.createService(); await service.tick();
+    assert.equal(service.list()[0]!.status, "running", "a reload keeps the stored authority with the key absent");
+    f.config.projects[0]!.team = { ...f.config.projects[0]!.team!, objective: { register: "on" } };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "blocked", "writing the register key blocks the active routine");
   } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 

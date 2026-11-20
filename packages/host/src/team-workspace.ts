@@ -41,12 +41,12 @@ export interface CommandScope {
 }
 export const commandScope = new AsyncLocalStorage<CommandScope>();
 /** Commands are argv arrays, from owner configuration or an explicitly authorized plan. */
-export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand, input?: string, extraEnv?: Record<string, string>, forceSettleAfterMs?: number): Promise<CommandResult> {
+export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand, input?: string, extraEnv?: Record<string, string>, forceSettleAfterMs?: number, onOutput?: (chunk: Buffer, stream: "stdout" | "stderr") => void): Promise<CommandResult> {
   const scope = commandScope.getStore(), ready = scope?.starting();
-  const run = () => runTeamCommand(scope, command, cwd, signal, timeoutMs, prefix, input, extraEnv, forceSettleAfterMs);
+  const run = () => runTeamCommand(scope, command, cwd, signal, timeoutMs, prefix, input, extraEnv, forceSettleAfterMs, onOutput);
   return ready ? ready.then(run) : run();
 }
-function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, cwd: string, signal: AbortSignal | undefined, timeoutMs: number, prefix: TeamCommand | undefined, input: string | undefined, extraEnv: Record<string, string> | undefined, forceSettleAfterMs: number | undefined): Promise<CommandResult> {
+function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, cwd: string, signal: AbortSignal | undefined, timeoutMs: number, prefix: TeamCommand | undefined, input: string | undefined, extraEnv: Record<string, string> | undefined, forceSettleAfterMs: number | undefined, onOutput?: (chunk: Buffer, stream: "stdout" | "stderr") => void): Promise<CommandResult> {
   return new Promise((resolveResult, reject) => {
     const env = command.command === "git" ? teamGitEnvironment(extraEnv) : teamCommandEnvironment(extraEnv);
     let child: ReturnType<typeof spawn>;
@@ -58,8 +58,10 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
     }
     scope?.started(child.pid);
     let output = "", stdout = "", interrupted = false, settled = false, truncated = false, stopRequested = false, stopTimer: NodeJS.Timeout | undefined;
-    const onStdoutData = (chunk: Buffer) => { capture(chunk); stdout = (stdout + chunk.toString("utf8")).slice(-65536); };
-    const onStderrData = (chunk: Buffer) => capture(chunk);
+    // An observer is evidence only; a throw in it must not break the command.
+    const observe = (chunk: Buffer, stream: "stdout" | "stderr") => { try { onOutput?.(chunk, stream); } catch { /* ignored */ } };
+    const onStdoutData = (chunk: Buffer) => { observe(chunk, "stdout"); capture(chunk); stdout = (stdout + chunk.toString("utf8")).slice(-65536); };
+    const onStderrData = (chunk: Buffer) => { observe(chunk, "stderr"); capture(chunk); };
     const onInputError = (error: Error) => {
       truncated = true;
       if ((error as NodeJS.ErrnoException).code !== "EPIPE") capture(Buffer.from("\n[The host could not send configured team input.]\n"));
@@ -242,7 +244,7 @@ const hostOwned = (stat: ReturnType<typeof lstatSync>) => {
   return typeof process.getuid !== "function" || stat.uid === process.getuid() || stat.uid === 0;
 };
 const unsafeTeamRoot = () => new TeamError(409, "team-root-unsafe", "Team roots must contain only host-owned real directories that are not writable by group or others.");
-function assertSecureAncestors(path: string) {
+export function assertSecureAncestors(path: string) {
   try {
     const canonical = realpathSync(path), root = parse(canonical).root;
     let current = root;

@@ -282,6 +282,7 @@ export class CmuxSessions {
       const live = surface?.workspaceId === record.workspaceId && surface?.type === "terminal" && (!record.pid || processAlive(record.pid));
       const pending = record.launchedAt !== undefined && Date.now() - record.launchedAt < 30_000;
       const status = live ? "running" : pending ? "starting" : record.creation?.state === "uncertain" ? "unavailable" : "exited";
+      let unreadable = false;
       if (record.session.id === screenId && live) {
         try {
           // A lines argument enables scrollback on some cmux versions. Read the
@@ -310,16 +311,16 @@ export class CmuxSessions {
             record.screen = screen.text.slice(-512 * 1024);
             this.append(record, "output", { text: `\u001b[2J\u001b[H${record.screen.replace(/\r?\n/g, "\r\n")}`, snapshot: true });
           }
-        } catch { this.observe(record, "unavailable"); continue; }
+        } catch { unreadable = true; }
       }
-      const nativeFeed = matchingFeed(this.feed, { provider: record.session.provider as CmuxProvider, nativeId: record.nativeId, surfaceId: record.surfaceId });
-      const prompt = status === "running" ? pendingPrompt(record.session.provider as CmuxProvider, record.screen, nativeFeed) : undefined;
       // Failure to refresh native Feed must never erase a known unanswered approval.
-      if (feed.status === "rejected" && record.prompt?.feed) {
-        this.observe(record, "unavailable");
-        continue;
+      if (unreadable || feed.status === "rejected" && record.prompt?.feed) this.observe(record, "unavailable");
+      else {
+        const nativeFeed = matchingFeed(this.feed, { provider: record.session.provider as CmuxProvider, nativeId: record.nativeId, surfaceId: record.surfaceId });
+        this.observe(record, status, status === "running" ? pendingPrompt(record.session.provider as CmuxProvider, record.screen, nativeFeed) : undefined);
       }
-      this.observe(record, status, prompt);
+      // Compared with the record before this refresh, on every path: observe() saves only what it changes itself, and
+      // in a lasting outage it changes nothing, so a hook or Vault change merged above is saved here.
       if (JSON.stringify(record) !== previous.get(record.session.id)) this.save(record);
     }
   }

@@ -7,6 +7,7 @@ import { hostGithubGrantEnvironment } from "./github-grants.js";
 import { ensureDefaultTeamRoot, ensureHostDirectory, publishTeamHead, removeMemberWorkspace, removeTeamWorkspace, snapshotMemberWork, TeamError } from "./team-workspace.js";
 import { activeMember, digest, filesystemEntryExists, type TeamKernel, teamRunDirectory } from "./team-kernel.js";
 import type { RetentionState, Stored, TeamServiceOptions } from "./teams.js";
+import { MemberTraces, removeMemberTraces } from "./member-traces.js";
 
 /**
  * What the retention class uses of TeamService: part of the kernel, and the record, event and publication members it
@@ -56,6 +57,7 @@ export class TeamRetention {
   readonly memberWorkSaveControllers = new Map<string, AbortController>();
   private readonly removalWaiters: Array<() => void> = [];
   private activeRemovals = 0;
+  private readonly traces = new MemberTraces();
   constructor(private readonly host: RetentionHost) {}
   private teamRoot(stored: Stored) {
     const root = stored.root ?? this.host.config.teams?.workspaceDir;
@@ -262,6 +264,8 @@ export class TeamRetention {
     }
     try { if (!stored.run.replay) this.host.persistRetiredRunId(stored.run.id); }
     catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's deletion tombstone could not be saved; its record was kept."); }
+    try { await removeMemberTraces(this.host.config.stateDir, stored.run.id); }
+    catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's member traces could not be removed; its record was kept."); }
     try { await rmAsync(join(this.host.directory, `${stored.run.id}.sealed`), { force: true }); }
     catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's record could not be removed."); }
     this.host.commands.get(stored.run.id)?.abort();
@@ -350,6 +354,9 @@ export class TeamRetention {
     return retryAt !== undefined && now < Date.parse(retryAt);
   }
   async retire(stored: Stored) {
+    // Trace caps apply to replay runs too. The measurement runs in the background, where idle() waits for it.
+    const traces = this.traces.settle(this.host.config, stored.run);
+    if (traces) { this.removalTasks.add(traces); void traces.finally(() => this.removalTasks.delete(traces)); }
     if (stored.run.replay) return;
     try {
       const { run } = stored, retention = this.host.retentionState(stored), policy = this.host.config.teams?.retention ?? DEFAULT_TEAM_RETENTION;

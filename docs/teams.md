@@ -482,6 +482,62 @@ When storage falls below `teams.storageFloor`, new runs are refused before their
 workspaces are created. See the configured reason in the API response and free
 space before retrying.
 
+## Member traces
+
+Codex can write a native trace of a member's run: every model request with its
+token usage, each program's source, a start and an end event for each nested
+tool call, and each nested call's result whole. The Codex session record in the
+provider's home already keeps every nested call, but cuts each stored result at
+64 KiB. Codex writes the trace when its environment carries
+`CODEX_ROLLOUT_TRACE_ROOT`. Codex does not document this variable; its name was
+found in the Codex binary.
+
+The host keeps these traces only when `teams.memberTraces` is on. It is off by
+default. Turning it on needs both caps, in bytes; the configuration refuses
+`enabled: true` without them, and there are no default caps:
+
+```json
+{ "teams": { "memberTraces": { "enabled": true, "memberBytes": 52428800, "runBytes": 524288000 } } }
+```
+
+- **Where.** Before a Codex team member starts, the host creates
+  `teams/traces/RUN_ID/MEMBER_ID` under its state directory, each level mode
+  `0700`, and points the member's Codex process there. Claude Code and OpenCode
+  members get nothing. The directory is outside every workspace and scratch
+  directory, and no API route, run or member field, team view, context file or
+  prompt names it.
+- **Caps.** When a member has ended (stopped, or reported with its exit
+  confirmed), a scheduler pass measures its trace once. A trace over
+  `memberBytes`, or one that would take the run's kept traces over `runBytes`,
+  is removed. A running member is not measured, so its trace can pass the caps
+  until it ends.
+- **Manifest.** Each member's directory keeps `infinite-trace.json` (mode
+  `0600`): the state (`kept`, `removed` or `not-recorded`), the bytes measured,
+  the time, the reason (`member-cap`, `run-cap` or `separate-account`), and
+  `sessionRecord: "kept"`, because the Codex session record is never touched.
+  It holds no trace content.
+- **Deletion.** Removing a run (the owner's delete, cancelled-run retention, or
+  forgetting a replay) removes `teams/traces/RUN_ID`, also after the setting was
+  turned off. Workspace retention leaves traces alone: they last as long as the
+  run record. Turning the setting off stops new traces only.
+
+Who can read a trace depends on the launch model. Traces are plain JSON, not
+sealed like the host's records.
+
+- **One account** (the default local profiles, where the host and its members
+  run as the same account). Only that account and root can read a trace. That
+  account is also every member's account, so a member can read traces as it can
+  read the rest of the account's files. The variable is in the member's Codex
+  process environment, and Codex may pass it to the commands it runs.
+- **Separate agent account** (sudo launch profiles, as in the Ubuntu template).
+  The host's state directory is private to the host account, so the agent
+  account cannot write there. The host does not set the variable for such a
+  launch; it writes the manifest with state `not-recorded` and reason
+  `separate-account`. Keeping traces here needs an owner decision: Codex would
+  write them as the shared agent account, so every session of that account, in
+  every project, could read and change them, and sudo would need the variable in
+  its `env_keep` list. Nothing is built for that case.
+
 ## Eval capture
 
 Eval capture keeps each implementer task of a finished team run as an eval task. A later replay can run other configurations on the same tasks. This slice only captures and sorts them. Capture spends no model tokens, starts no session, and reads the corpus for no decision.

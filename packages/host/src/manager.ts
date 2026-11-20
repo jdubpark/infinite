@@ -39,6 +39,7 @@ import { SESSION_PERMISSION_ACTOR_LABEL, isRequesterNotice, sessionPermissionReq
 import { deferredCallOpen, type HeadlessPermissionChannel } from "./permission-headless.js";
 import { agentBoundary, inventoryRuntimeProcesses, runtimeIdentity, stopRuntimeTree, type RuntimeProcess, type TeamRuntimeInspection, type TeamRuntimeRetirement } from "./team-retirement.js";
 import { TeamError } from "./team-workspace.js";
+import { prepareMemberTrace } from "./member-traces.js";
 import { projectGithubRepository, sessionGithubGrant, sessionGithubScopeFor, type GithubGrantScope, type SessionGithubOrigin } from "./github-grants.js";
 import {
   learningPurpose, SESSION_PURPOSES,
@@ -1189,7 +1190,7 @@ export class Manager {
     child.stdin.on("error", () => {});
     // Inert unless autonomy.boundary.github is configured; the grant travels only in the private bootstrap pipe.
     const githubScope = sessionGithubScopeFor({ team: Boolean(request.team), origin: github, repository: projectGithubRepository(project) });
-    const githubGrant = sessionGithubGrant(this.config, githubScope, { sessionId: id, projectId: request.projectId });
+    const githubGrant = sessionGithubGrant(this.config, githubScope, { sessionId: id, projectId: request.projectId }), codexTraceRoot = prepareMemberTrace(this.config, id, request.provider, request.team, launchProfile);
     child.stdin.end(
       JSON.stringify({
         session,
@@ -1200,7 +1201,7 @@ export class Manager {
         prompt,
         ...(request.workspace ? { executorTokenHash: createHash("sha256").update(request.workspace.token).digest("hex") } : {}),
         ...(headless?.bootstrap ? { permissionChannel: headless.bootstrap } : {}),
-        ...(githubGrant ? { github: githubGrant } : {}),
+        ...(githubGrant ? { github: githubGrant } : {}), ...(codexTraceRoot ? { codexTraceRoot } : {}),
         attention: {
           // Native CLI launches keep their exact argv: no hook settings are injected.
           hooks: request.nativeArgs !== undefined

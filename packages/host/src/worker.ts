@@ -1640,6 +1640,7 @@ server.listen(socketPath(runDir, session.id), async () => {
     }
     env.TERM = "xterm-256color";
     addProjectIdToLaunchEnv(env, session.projectId);
+    if (config.codexTraceRoot) env.CODEX_ROLLOUT_TRACE_ROOT = config.codexTraceRoot;
     // Present only with autonomy.boundary.github: Git and gh reach GitHub through the proxy with this grant.
     if (config.github) {
       env.INFINITE_GITHUB_GRANT = config.github.grant;

@@ -56,19 +56,35 @@ const manifestText = (manifest: Manifest) => `${JSON.stringify(manifestSchema.pa
 const temporaryName = () => `.${MANIFEST}.${randomUUID()}.tmp`;
 const NEW_FILE = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
 
+const ignoreMissing = (error: unknown) => { if (errorCode(error) !== "ENOENT") throw error; };
+async function lstatIfPresent(path: string) {
+  try { return await lstat(path); } catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
+}
+/** The traces root, when it is a directory the host can use. A link or a file there is the owner's and is left alone. */
+async function tracesRoot(stateDir: string) {
+  const info = await lstatIfPresent(tracesDirectory(stateDir));
+  return info && !info.isSymbolicLink() && info.isDirectory() ? tracesDirectory(stateDir) : undefined;
+}
 /**
- * Whether `traces/<parts...>` exists. The traces root and each level below it must be a directory and no link, and
- * the last must resolve to the path built from the real state directory; otherwise this throws.
+ * Whether `traces/<runId>[/<memberId>]` is a usable directory. A link, or anything else that is not a directory, at a
+ * level below the traces root is unlinked as itself, never its target, and logged by id; the directory then counts as
+ * absent. The directory must also resolve to its place under the real traces root; otherwise this throws.
  */
-async function realDirectory(stateDir: string, parts: string[]) {
-  let path = tracesDirectory(stateDir);
-  for (const part of ["", ...parts]) {
-    if (part) path = join(path, part);
-    let info;
-    try { info = await lstat(path); } catch (error) { if (errorCode(error) === "ENOENT") return false; throw error; }
-    if (info.isSymbolicLink() || !info.isDirectory()) throw traceError("trace-path-unsafe", "A trace directory is a link or not a directory.");
+async function traceDirectory(stateDir: string, parts: [string] | [string, string]) {
+  const root = await tracesRoot(stateDir);
+  if (!root) return false;
+  let path = root;
+  for (const [index, part] of parts.entries()) {
+    path = join(path, part);
+    const info = await lstatIfPresent(path);
+    if (!info) return false;
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      await unlink(path).catch(ignoreMissing);
+      console.warn(`The trace directory of ${index ? `member ${parts[1]} in team ${parts[0]}` : `team ${parts[0]}`} was a link or not a directory; the host removed that entry and left its target alone.`);
+      return false;
+    }
   }
-  if (await realpath(path) !== join(await realpath(stateDir), "teams", "traces", ...parts))
+  if (await realpath(path) !== join(await realpath(root), ...parts))
     throw traceError("trace-path-unsafe", "A trace directory resolves outside the host's traces root.");
   return true;
 }
@@ -110,7 +126,6 @@ export function prepareMemberTrace(config: Pick<Config, "stateDir" | "teams">, s
   }
 }
 
-const ignoreMissing = (error: unknown) => { if (errorCode(error) !== "ENOENT") throw error; };
 /**
  * The bytes of every entry below `directory` that is not a directory, by lstat, without following a link; with
  * `remove`, removes each entry. With `manifest`, the directory's own regular-file manifest is neither counted nor
@@ -138,9 +153,17 @@ async function walkTrace(directory: string, remove: boolean, manifest: boolean) 
   return total;
 }
 
-/** Removes a run's member traces. A run without traces, including one whose id could never name a directory, is a no-op. */
+/**
+ * Removes a run's member traces. A run without traces, including one whose id could never name a directory, is a no-op.
+ * A link in the way is unlinked as itself, so a link never holds up the removal of the run's record.
+ */
 export async function removeMemberTraces(stateDir: string, runId: string) {
-  if (!SAFE_ID.test(runId) || !await realDirectory(stateDir, [runId])) return;
+  if (!SAFE_ID.test(runId)) return;
+  if (!await tracesRoot(stateDir) && await lstatIfPresent(tracesDirectory(stateDir))) {
+    console.warn(`The member traces of team ${runId} were not looked for: the traces root is a link or not a directory, which the host leaves alone.`);
+    return;
+  }
+  if (!await traceDirectory(stateDir, [runId])) return;
   const run = join(tracesDirectory(stateDir), runId);
   await walkTrace(run, true, false);
   await rmdir(run);
@@ -223,7 +246,7 @@ export class MemberTraces {
     this.running.add(run.id);
     return (async () => {
       let present: boolean | Error;
-      try { present = SAFE_ID.test(run.id) && await realDirectory(host.stateDir, [run.id]); } catch (error) { present = error as Error; }
+      try { present = SAFE_ID.test(run.id) && await traceDirectory(host.stateDir, [run.id]); } catch (error) { present = error as Error; }
       for (const { memberId, key } of due) {
         try {
           if (present instanceof Error) throw present;
@@ -239,7 +262,7 @@ export class MemberTraces {
     })().finally(() => this.running.delete(run.id));
   }
   private async settleMember(host: TraceSettlementHost, runId: string, memberId: string): Promise<Outcome> {
-    if (!await realDirectory(host.stateDir, [runId, memberId])) return "settled";
+    if (!await traceDirectory(host.stateDir, [runId, memberId])) return "settled";
     const directory = join(tracesDirectory(host.stateDir), runId, memberId);
     let manifest = await readManifest(directory);
     // The manifest names the session that recorded, which is the member's earlier session if a later launch had none.
@@ -255,7 +278,7 @@ export class MemberTraces {
       if (!reason) return "settled";
     }
     // Checked again just before the removal.
-    if (!await realDirectory(host.stateDir, [runId, memberId])) return "settled";
+    if (!await traceDirectory(host.stateDir, [runId, memberId])) return "settled";
     await walkTrace(directory, true, true);
     await writeManifest(directory, { ...manifest, state: "removed", at: new Date(host.now()).toISOString() });
     return "settled";

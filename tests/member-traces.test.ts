@@ -4,13 +4,13 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { chmodSync, closeSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { readConfig } from "../packages/host/src/config.js";
 import { Manager } from "../packages/host/src/manager.js";
 import { prepareMemberTrace } from "../packages/host/src/member-traces.js";
 import type { Provider } from "../packages/host/src/types.js";
 import type { TeamService } from "../packages/host/src/teams.js";
-import type { TeamAssignment, TeamMember } from "../packages/host/src/team-types.js";
+import { DEFAULT_TEAM_RETENTION, type TeamAssignment, type TeamMember } from "../packages/host/src/team-types.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 import { fixture } from "./team-fixture.js";
 import { waitFor } from "./helpers.js";
@@ -238,24 +238,33 @@ test("only the manifest itself is exempt: a file named like it is trace, and a s
   } finally { t.close(); }
 });
 
-test("trace settlement never follows a link, and its log names no path", async () => {
+test("trace settlement and removal unlink links as themselves, leave their targets, and log no path", async () => {
   const outside = mkdtempSync(join(tmpdir(), "inf-trace-outside-"));
+  const noPath = (logged: string[], stateDir: string) => {
+    for (const line of logged) for (const path of [stateDir, outside, tmpdir()]) assert.equal(line.includes(path), false, line);
+  };
   try {
     writeFileSync(join(outside, "keep.txt"), "z".repeat(1000));
     writeFileSync(join(outside, "keep-too.txt"), "kept");
+    mkdirSync(join(outside, "folder"));
+    writeFileSync(join(outside, "folder", "inside.txt"), "w".repeat(1000));
     const inner = codexTeam(120, { memberBytes: 100, runBytes: 5000 });
     try {
       await inner.step();
-      // A link inside the trace, and one at the name a fixed temporary file would have.
-      symlinkSync(join(outside, "keep.txt"), join(inner.directory(), TRACE, "outside"));
-      symlinkSync(join(outside, "keep-too.txt"), join(inner.directory(), `${MANIFEST}.tmp`));
-      const links = lstatSync(join(inner.directory(), TRACE, "outside")).size + lstatSync(join(inner.directory(), `${MANIFEST}.tmp`)).size;
+      // A link to a file and one to a directory inside the trace, and one at the name a fixed temporary file would have.
+      const fileLink = join(inner.directory(), TRACE, "outside"), folderLink = join(inner.directory(), TRACE, "payloads", "folder");
+      const tempLink = join(inner.directory(), `${MANIFEST}.tmp`);
+      symlinkSync(join(outside, "keep.txt"), fileLink);
+      symlinkSync(join(outside, "folder"), folderLink);
+      symlinkSync(join(outside, "keep-too.txt"), tempLink);
+      const links = lstatSync(fileLink).size + lstatSync(folderLink).size + lstatSync(tempLink).size;
       await inner.cancel();
       assert.deepEqual(shape(inner.directory()), { version: 1, sessionId: inner.pm.sessionId, state: "removed", caps: { memberBytes: 100, runBytes: 5000 },
-        bytes: 120 + links, at: undefined, reason: "member-cap", sessionRecord: "kept" }, "a link counts as itself");
+        bytes: 120 + links, at: undefined, reason: "member-cap", sessionRecord: "kept" }, "a link counts as itself, not its target");
       assert.deepEqual(readdirSync(inner.directory()), [MANIFEST], "the links were removed");
       assert.equal(readFileSync(join(outside, "keep.txt"), "utf8"), "z".repeat(1000), "their targets were not");
       assert.equal(readFileSync(join(outside, "keep-too.txt"), "utf8"), "kept");
+      assert.equal(readFileSync(join(outside, "folder", "inside.txt"), "utf8"), "w".repeat(1000), "nor a linked directory's contents");
     } finally { inner.close(); }
 
     const swapped = codexTeam(120, { memberBytes: 100, runBytes: 5000 });
@@ -266,20 +275,29 @@ test("trace settlement never follows a link, and its log names no path", async (
       renameSync(swapped.directory(), moved);
       symlinkSync(moved, swapped.directory());
       const logged = await warnings(() => swapped.cancel());
-      assert.ok(existsSync(join(moved, TRACE, "trace.jsonl")), "nothing behind the link was removed");
-      assert.equal(manifest(moved).state, "recording", "nothing behind the link was written");
+      assert.equal(existsSync(swapped.directory()), false, "the link was removed");
+      assert.ok(existsSync(join(moved, TRACE, "trace.jsonl")), "nothing behind it was removed");
+      assert.equal(manifest(moved).state, "recording", "nothing behind it was written");
       assert.equal(logged.length, 1);
-      assert.match(logged[0]!, new RegExp(swapped.pm.memberId));
-      for (const line of logged) for (const path of [swapped.f.config.stateDir, outside, tmpdir()]) assert.equal(line.includes(path), false, line);
-
-      // The run directory as a link: its removal is refused and the record kept.
-      const runTraces = traces(swapped.f.config.stateDir, swapped.f.run.id);
-      renameSync(runTraces, join(outside, "run"));
-      symlinkSync(join(outside, "run"), runTraces);
-      await assert.rejects(swapped.teams.removeRun(swapped.f.run.id), /member traces could not be removed/);
-      assert.ok(existsSync(join(outside, "run")));
-      assert.ok(existsSync(join(moved, TRACE, "trace.jsonl")));
+      assert.match(logged[0]!, new RegExp(`member ${swapped.pm.memberId} in team ${swapped.f.run.id}`));
+      noPath(logged, swapped.f.config.stateDir);
     } finally { swapped.close(); }
+
+    // The run's trace directory as a link: the link goes, its target stays, and the record is removed.
+    const linkedRun = codexTeam(64, { memberBytes: 1000, runBytes: 5000 });
+    try {
+      await linkedRun.step();
+      await linkedRun.cancel();
+      const runTraces = traces(linkedRun.f.config.stateDir, linkedRun.f.run.id), target = join(outside, "run");
+      renameSync(runTraces, target);
+      symlinkSync(target, runTraces);
+      const logged = await warnings(async () => { await linkedRun.teams.removeRun(linkedRun.f.run.id); });
+      assert.throws(() => lstatSync(runTraces), /ENOENT/, "the link was removed");
+      assert.ok(existsSync(join(target, linkedRun.pm.memberId, TRACE, "trace.jsonl")), "its target was not");
+      assert.equal(existsSync(join(linkedRun.f.config.stateDir, "teams", `${linkedRun.f.run.id}.sealed`)), false, "the record was removed");
+      assert.equal(logged.filter(line => line.includes(linkedRun.f.run.id)).length, 1, logged.join("\n"));
+      noPath(logged, linkedRun.f.config.stateDir);
+    } finally { linkedRun.close(); }
 
     // A traces root that is a link is refused at launch; the warning names the member, not the path.
     const refused = codexTeam(64, { memberBytes: 100, runBytes: 5000 });
@@ -291,9 +309,48 @@ test("trace settlement never follows a link, and its log names no path", async (
       const logged = await warnings(() => refused.step());
       assert.deepEqual(readdirSync(elsewhere), [], "no directory was made behind the link");
       assert.equal(logged.filter(line => line.includes(refused.pm.memberId)).length, 1, logged.join("\n"));
-      for (const line of logged) for (const path of [refused.f.config.stateDir, outside, tmpdir()]) assert.equal(line.includes(path), false, line);
+      noPath(logged, refused.f.config.stateDir);
     } finally { refused.close(); }
   } finally { rmSync(outside, { recursive: true, force: true }); }
+});
+
+test("retention waits out a failed record removal before it tries again", async () => {
+  const f = schedulerFixture();
+  const at = Date.now() - 2 * 60_000, iso = new Date(at).toISOString();
+  f.run.status = "cancelled";
+  f.run.updatedAt = iso;
+  f.run.workspaceRemovedAt = iso;
+  f.run.members.forEach(member => { member.status = "stopped"; member.workspaceRemovedAt = iso; });
+  f.run.events.push({ at: iso, text: "Team cancelled." });
+  f.config.teams!.retention = { ...DEFAULT_TEAM_RETENTION, cancelledMinutes: 1 };
+  rmSync(dirname(f.run.workspace), { recursive: true, force: true });
+  // An entry the host cannot remove makes each removal of the record fail.
+  const locked = traces(f.config.stateDir, f.run.id, randomUUID(), "locked");
+  mkdirSync(locked, { recursive: true });
+  writeFileSync(join(locked, "file"), "x");
+  chmodSync(locked, 0o500);
+  f.writeTeam();
+  let clock = Date.now();
+  const teams = f.openTeam({ now: () => clock } as Parameters<typeof f.openTeam>[0]);
+  const retention = (teams as unknown as { retention: { deleteRecord(...args: unknown[]): Promise<unknown> } }).retention;
+  const deleteRecord = retention.deleteRecord.bind(retention);
+  let attempts = 0;
+  retention.deleteRecord = (...args: unknown[]) => { attempts++; return deleteRecord(...args); };
+  try {
+    await sweep(teams, f.run.id);
+    assert.equal(attempts, 1);
+    assert.ok(existsSync(join(f.config.stateDir, "teams", `${f.run.id}.sealed`)), "the failed removal kept the record");
+    clock += 1_000;
+    await sweep(teams, f.run.id);
+    clock += 60_000;
+    await sweep(teams, f.run.id);
+    assert.equal(attempts, 1, "no attempt inside the backoff");
+    chmodSync(locked, 0o700);
+    clock += 5 * 60_000;
+    await sweep(teams, f.run.id);
+    assert.equal(attempts, 2);
+    assert.equal(existsSync(join(f.config.stateDir, "teams", `${f.run.id}.sealed`)), false, "the retry removed the record");
+  } finally { if (existsSync(locked)) chmodSync(locked, 0o700); teams.close(); f.close(); }
 });
 
 test("a manifest that is a FIFO does not hold settlement waiting for a writer", { timeout: 30000 }, async () => {

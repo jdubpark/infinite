@@ -369,6 +369,12 @@ export class TeamRetention {
     const retryAt = retention.retryAt?.[scope];
     return retryAt !== undefined && now < Date.parse(retryAt);
   }
+  /** Removes a cancelled run's record under the retention policy, unless the last attempt failed within its backoff. */
+  private async removeRetainedRecord(stored: Stored) {
+    if (this.removalBackoffActive(this.host.retentionState(stored), "record", this.host.options?.now?.() ?? Date.now())) return;
+    try { await this.deleteRecord(stored, true); }
+    catch (error) { await this.reportRemovalFailure(stored, "record", error); }
+  }
   async retire(stored: Stored) {
     // Trace caps apply to replay runs too, and to traces recorded before the setting was turned off. The measurement
     // runs in the background, where idle() waits for it.
@@ -396,10 +402,8 @@ export class TeamRetention {
           if (!run.events.some(event => event.text.startsWith("Workspaces removed under the retention policy after this ")))
             this.host.event(stored, `Workspaces removed under the retention policy after this ${run.status} run settled. See docs/teams.md.`);
           try { this.host.save(stored); } catch (error) { console.warn("Could not persist a removed team workspace marker.", error); }
-          if (run.status === "cancelled" && !run.goal && !run.missionId && !this.ownerPreventsRemoval(run) && !this.hasPendingPreparationFrom(stored) && await this.membersSettled(stored)) {
-            try { await this.deleteRecord(stored, true); }
-            catch (error) { await this.reportRemovalFailure(stored, "record", error); }
-          }
+          if (run.status === "cancelled" && !run.goal && !run.missionId && !this.ownerPreventsRemoval(run) && !this.hasPendingPreparationFrom(stored) && await this.membersSettled(stored))
+            await this.removeRetainedRecord(stored);
         },
         async error => {
           if (this.host.records.get(run.id) !== stored) return;
@@ -470,10 +474,8 @@ export class TeamRetention {
         }
         if (completionChanged) try { this.host.save(stored); } catch (error) { console.warn("Could not persist a completed team workspace removal.", error); }
         if (run.status === "blocked") await this.host.closeStaleBlockedRun(stored, policy.blockedHours);
-        if (statusAtStart === "cancelled" && run.status === "cancelled" && !run.goal && !run.missionId && retentionMs !== undefined && elapsed >= retentionMs && await this.membersSettled(stored)) {
-          try { await this.deleteRecord(stored, true); }
-          catch (error) { await this.reportRemovalFailure(stored, "record", error); }
-        }
+        if (statusAtStart === "cancelled" && run.status === "cancelled" && !run.goal && !run.missionId && retentionMs !== undefined && elapsed >= retentionMs && await this.membersSettled(stored))
+          await this.removeRetainedRecord(stored);
         return;
       }
       const retentionDue = retentionMs !== undefined && elapsed >= retentionMs;

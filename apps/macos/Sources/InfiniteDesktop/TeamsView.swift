@@ -289,6 +289,7 @@ struct TeamDetailView: View {
                         Text("Decision · revision \(decision["revision"].int)").font(.caption).foregroundStyle(.secondary)
                         Text(decision["question"].string).font(.callout).fixedSize(horizontal: false, vertical: true)
                         Text("\(decision["answeredBy"].string == "connector" ? (decision["source"]["name"].string.isEmpty ? "Connector" : decision["source"]["name"].string) : decision["answeredBy"].string == "coordinator" ? "Mission coordinator" : "Your answer"): \(decision["answer"].string)").font(.callout.weight(.medium)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        if let note = DecisionRecommendation(decision["recommendation"])?.comparisonNote { Text(note).font(.caption).foregroundStyle(.secondary) }
                     }
                 }
             }
@@ -443,9 +444,28 @@ struct DecisionCard: View {
                 Text(caption).font(.caption).foregroundStyle(.secondary)
             }
             Text(decision["question"].string).font(.system(size: 13, weight: .medium)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            let recommendation = DecisionRecommendation(decision["recommendation"])
             let options = decision["options"].array.map(\.string)
+            if let recommendation {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Recommended by the agent").font(.caption).foregroundStyle(.secondary)
+                    Text(recommendation.answers.joined(separator: ", ")).font(.callout.weight(.medium)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    if !recommendation.reason.isEmpty { Text(recommendation.reason).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+                    if options.isEmpty {
+                        Button("Use the recommended answer") { answer(recommendation.firstAnswer) }.disabled(disabled).padding(.top, 2)
+                    }
+                }
+            }
             if !options.isEmpty {
-                HStack(spacing: 8) { ForEach(Array(options.enumerated()), id: \.offset) { _, option in Button(option) { answer(option) }.disabled(disabled) } }
+                HStack(spacing: 8) {
+                    ForEach(Array(options.enumerated()), id: \.offset) { _, option in
+                        if recommendation?.recommends(option) == true {
+                            Button(option) { answer(option) }.buttonStyle(.borderedProminent).disabled(disabled).accessibilityLabel("\(option), recommended")
+                        } else {
+                            Button(option) { answer(option) }.disabled(disabled)
+                        }
+                    }
+                }
             }
             HStack {
                 TextField("Write your answer…", text: $text).textFieldStyle(.roundedBorder).disabled(disabled).onSubmit { submit() }

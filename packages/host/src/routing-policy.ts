@@ -6,8 +6,9 @@ import type { RoutingKnobs, RoutingPoint, TeamRunRouting } from "./routing-types
 import type { TeamLineup } from "./team-types.js";
 
 export const ROUTING_ALGORITHM_VERSION = 1;
+/** A pin whose points name `escalation` or `scout`. A version-1 pin routes only `start`, whatever its points list. */
+export const POINTS_ALGORITHM_VERSION = 2;
 export const REWARD_VERSION = 1;
-export const VALUE_PRESETS = { cost: 0.5, balanced: 2, quality: 8 } as const;
 
 /** The read defaults of Part 1. Nothing writes them into a saved policy, so the routine digest is unchanged by them. */
 export const ROUTING_DEFAULTS: RoutingKnobs = {
@@ -72,13 +73,18 @@ export function effectiveRouting(saved: TeamRouting | undefined, autonomy: Auton
   return { mode: "shadow", requested: mode === "auto" ? "auto" : "shadow", source: "saved", knobs, defaults };
 }
 
+/** 2 when a point other than `start` is listed, else 1. */
+export function algorithmVersionOf(knobs: Pick<RoutingKnobs, "points">): number {
+  return knobs.points.some(point => point !== "start") ? POINTS_ALGORITHM_VERSION : ROUTING_ALGORITHM_VERSION;
+}
+
 /**
  * SHA-256 hex of canonicalJson({ algorithmVersion, rewardVersion, mode, knobs }). `mode` defaults to shadow, so a shadow
  * digest is unchanged. The source and the requested mode are left out.
  */
 export function policyDigest(effective: Extract<EffectiveRouting, { mode: "shadow" }>, mode: "shadow" | "auto" = "shadow"): string {
   const knobs = { ...effective.knobs, points: normalizePoints(effective.knobs.points) };
-  return createHash("sha256").update(canonicalJson({ algorithmVersion: ROUTING_ALGORITHM_VERSION, rewardVersion: REWARD_VERSION, mode, knobs })).digest("hex");
+  return createHash("sha256").update(canonicalJson({ algorithmVersion: algorithmVersionOf(knobs), rewardVersion: REWARD_VERSION, mode, knobs })).digest("hex");
 }
 
 /**
@@ -93,11 +99,11 @@ export function pinRouting(saved: TeamRouting | undefined, autonomy: AutonomyMod
   if (periodEndedAt !== undefined && auto) {
     return {
       mode: "auto", requested: "auto", source: effective.source, knobs: effective.knobs, defaults: effective.defaults,
-      algorithmVersion: ROUTING_ALGORITHM_VERSION, rewardVersion: REWARD_VERSION, digest: policyDigest(effective, "auto"), periodEndedAt,
+      algorithmVersion: algorithmVersionOf(effective.knobs), rewardVersion: REWARD_VERSION, digest: policyDigest(effective, "auto"), periodEndedAt,
     };
   }
   return {
     mode: "shadow", requested: effective.requested, source: effective.source, knobs: effective.knobs, defaults: effective.defaults,
-    algorithmVersion: ROUTING_ALGORITHM_VERSION, rewardVersion: REWARD_VERSION, digest: policyDigest(effective),
+    algorithmVersion: algorithmVersionOf(effective.knobs), rewardVersion: REWARD_VERSION, digest: policyDigest(effective),
   };
 }

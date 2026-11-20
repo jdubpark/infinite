@@ -10,7 +10,9 @@ import { teamReportSchema, type TeamReport } from "../packages/host/src/team-typ
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
 const spec = readFileSync(fileURLToPath(new URL("../docs/superpowers/specs/2026-11-12-outcome-ledger-design.md", import.meta.url)), "utf8");
-const teamsSource = readFileSync(fileURLToPath(new URL("../packages/host/src/teams.ts", import.meta.url)), "utf8");
+// The team service and the modules split out of it, which emit through their host.
+const teamsSource = ["teams.ts", "team-retention.ts"]
+  .map(file => readFileSync(fileURLToPath(new URL(`../packages/host/src/${file}`, import.meta.url)), "utf8")).join("\n");
 
 const LITERAL_KIND = /^"[a-z.-]+"$/;
 
@@ -24,7 +26,7 @@ function specKinds(): string[] {
 }
 
 test("every spec event kind has an emission site, and every emitted kind is in the spec", () => {
-  const calls = [...teamsSource.matchAll(/this\.emit(?:With)?\(\s*[\w.]+\s*,\s*([^,\s)]+)/g)];
+  const calls = [...teamsSource.matchAll(/this\.(?:host\.)?emit(?:With)?\(\s*[\w.]+\s*,\s*([^,\s)]+)/g)];
   const emitted = calls.filter(call => LITERAL_KIND.test(call[1]!)).map(call => call[1]!.slice(1, -1));
   const computed = calls.filter(call => !LITERAL_KIND.test(call[1]!)).map(call => call[0]);
   // The one forwarding call inside emitWith is the only place a kind is passed on as a variable.
@@ -70,7 +72,7 @@ const REPORT_SAMPLES: Record<TeamReport["kind"], TeamReport> = {
   "delivery-reconciliation": { kind: "delivery-reconciliation", headCommit: HASH, repository: "example/app", branch: "feature-a",
     baseHeadCommit: BASE, disposition: "no-publication", summary: "Nothing to publish" },
   "pull-request": { kind: "pull-request", headCommit: HASH, pullRequestUrl: "https://example.invalid/pull/1", summary: "Opened" },
-  question: { kind: "question", question: "Which file?", options: [] },
+  question: { kind: "question", question: "Which file?", options: [], recommendation: { answers: ["a.txt"], reason: "It holds the change." } },
   blocked: { kind: "blocked", summary: "Cannot proceed" },
   "intent-check": { kind: "intent-check", summary: "No gap found", items: [] },
 };

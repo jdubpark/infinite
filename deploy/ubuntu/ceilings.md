@@ -49,6 +49,8 @@ Run `claude doctor` after install all the same. It reports settings-file validat
 
 Each of these changes how the host's own launch flags work. Each needs a test on the real host before it is added.
 
+Without the first three keys, the ceiling does not stop a repository `.claude/settings.json` or `.mcp.json` from adding hooks, allow rules or MCP servers. The host keeps those files out of team launches itself, with `--setting-sources user` (see [workspace trust](../../docs/teams.md#workspace-trust)). Checked on the live host with Claude Code 2.1.302 on 2026-11-18: a planted SessionStart hook ran and a planted `.mcp.json` server command started in both untrusted and trusted folders, and a planted allow rule applied in a trusted folder. With `--setting-sources user`, none of them did.
+
 - `allowManagedHooksOnly`. Hooks passed with `--settings` are probably blocked by this key. The host's Claude hooks use `--settings`. Test first: move the hooks into the managed file, or use the Agent SDK hook path, and confirm with a marker-file hook.
 - `allowManagedPermissionRulesOnly`. This makes allow rules from `--allowedTools` inert. The host's headless roles depend on those rules. Test first: move the required allow rules into the managed file.
 - `allowManagedMcpServersOnly` with `allowedMcpServers`. This filters the servers passed with `--mcp-config`. Test first: list every host server and confirm each one matches an entry.

@@ -29,7 +29,7 @@ import { outcomeProjector } from "../packages/host/src/outcome-projector.js";
 import { outcomeModule, runOutcomes } from "../packages/host/src/outcome-store.js";
 import { queryRollup } from "../packages/host/src/outcome-reads.js";
 import { teamReportSchema } from "../packages/host/src/team-types.js";
-import { missionReportSchema } from "../packages/host/src/mission-types.js";
+import { missionReportSchema, recordedMissionReportSchema } from "../packages/host/src/mission-types.js";
 
 const until = (read: () => Mission, accepts: (mission: Mission) => boolean, timeout = 60000) => waitFor(async () => read(), accepts, timeout);
 const standaloneRequest = (projectId: string): CreateTeam => ({
@@ -488,11 +488,11 @@ test("mission blocked reports accept summary-only legacy and bounded structured 
 
 test("mission question modes preserve legacy behavior and validate selectable semantics", () => {
   const legacy = { kind: "question", question: "Which response format?", options: ["JSON", "Text"] };
-  assert.deepEqual(missionReportSchema.parse(legacy), legacy, "Two legacy options do not infer approval mode");
-  assert.equal(missionReportSchema.safeParse({ ...legacy, answerMode: "approval" }).success, true);
-  assert.equal(missionReportSchema.safeParse({ ...legacy, answerMode: "approval", options: ["Approve"] }).success, false);
-  assert.equal(missionReportSchema.safeParse({ ...legacy, answerMode: "multiple" }).success, true);
-  assert.equal(missionReportSchema.safeParse({ ...legacy, answerMode: "multiple", options: ["Only one"] }).success, false);
+  assert.deepEqual(recordedMissionReportSchema.parse(legacy), legacy, "Two legacy options do not infer approval mode");
+  assert.equal(recordedMissionReportSchema.safeParse({ ...legacy, answerMode: "approval" }).success, true);
+  assert.equal(recordedMissionReportSchema.safeParse({ ...legacy, answerMode: "approval", options: ["Approve"] }).success, false);
+  assert.equal(recordedMissionReportSchema.safeParse({ ...legacy, answerMode: "multiple" }).success, true);
+  assert.equal(recordedMissionReportSchema.safeParse({ ...legacy, answerMode: "multiple", options: ["Only one"] }).success, false);
 });
 
 test("a forwarded child decision retains its selection mode in messages, prompt context, and stored owner decision", { timeout: 60000 }, async () => {
@@ -960,8 +960,8 @@ test("permission recovery wakes the mission once with bounded observations and p
 for (const scenario of [
   // Both objectives leave room for the initial attempt and dispatch. Recovery fits only compactly in the first case;
   // the longer dispatch summary leaves no room even for recovery identifiers in the second. Retune when instructions grow.
-  { name: "a large mission delivers a compact recovery outcome", objectiveLength: 23400, summary: "One API change", held: false },
-  { name: "a full mission blocks and cancels its subteam when recovery evidence cannot fit", objectiveLength: 23300, summary: "S".repeat(900), held: true },
+  { name: "a large mission delivers a compact recovery outcome", objectiveLength: 23240, summary: "One API change", held: false },
+  { name: "a full mission blocks and cancels its subteam when recovery evidence cannot fit", objectiveLength: 23140, summary: "S".repeat(900), held: true },
 ]) test(scenario.name, { timeout: 30000 }, async () => {
   const h = scripted();
   try {

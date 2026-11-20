@@ -1,7 +1,7 @@
 import XCTest
 @testable import InfiniteCore
 
-/// The cost views decode the host's usage contract as `usage-api.ts` defines it. A missing balance,
+/// The cost views decode the host's usage responses (`usage-service.ts`, `scorecard.ts`). A missing balance,
 /// a subscription without metered spend, and nulls in the scorecard must all decode, never crash.
 final class UsageTests: XCTestCase {
     private func decode<T: Decodable>(_ type: T.Type, _ json: String) throws -> T {

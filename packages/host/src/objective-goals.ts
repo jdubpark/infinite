@@ -12,11 +12,13 @@ import {
 } from "./objective-record.js";
 import type { GoalRecordPort } from "./objective-intent.js";
 import type { ObjectiveRecord } from "./objective-types.js";
-import { recordDigestFor } from "./objective-digest.js";
+import { objectivePromptsOn, objectiveRegisterOn, recordDigestFor, registerDigestFor } from "./objective-digest.js";
+import { latestReviewed } from "./goal-standing.js";
 import type { Correction, CriterionInput } from "./objective-input.js";
-import { addCreationCriteria, applyOwnerOps, type OwnerOpContext } from "./objective-ops.js";
+import { REGISTER_OP_NAMES, addCreationCriteria, applyOwnerOps, type OwnerOpContext } from "./objective-ops.js";
 import { RECORD_DIGEST_BYTES, recordDigestBytes, recordDigestSchema, type RecordDigest } from "./team-types.js";
 import type { TeamCommand } from "./team-types.js";
+import type { Project } from "./types.js";
 import { TeamError } from "./team-workspace.js";
 
 export type { ObjectiveUnavailable } from "./objective-record.js";
@@ -135,6 +137,21 @@ export function correctGoalObjective(holder: GoalHolder, correction: Correction,
   return applyOwnerOps(state.record, correction, context);
 }
 
+/**
+ * Refuses a correction that the project's switches do not allow: criterion ops need objective prompts on, and register
+ * ops need the register on. Throws objectiveError before anything is applied.
+ */
+export function correctionGate(project: Pick<Project, "team"> | undefined, correction: Pick<Correction, "ops">): void {
+  if (correction.ops.some(op => !REGISTER_OP_NAMES.has(op.op)) && !objectivePromptsOn(project)) throw objectiveError("objective-prompts-off");
+  if (correction.ops.some(op => REGISTER_OP_NAMES.has(op.op)) && !objectiveRegisterOn(project)) throw objectiveError("objective-register-off");
+}
+
+/** latestReviewed(goal.cycles)'s headCommit and cycle number, or undefined when there is none or it has no head. */
+export function ratingStamp(goal: Pick<ProductGoal, "cycles">): { commit: string; cycle: number } | undefined {
+  const reviewed = latestReviewed(goal.cycles);
+  return reviewed?.headCommit === undefined ? undefined : { commit: reviewed.headCommit, cycle: reviewed.cycle };
+}
+
 export type GoalDigestResult = { digest: RecordDigest } | { skipped: "record-unavailable" | "digest-too-large" };
 export const GOAL_DIGEST_EVENTS: Record<"record-unavailable" | "digest-too-large", string> = {
   "record-unavailable": "The objective record could not be read, so this cycle's members read the success text without its criteria.",
@@ -161,14 +178,15 @@ export function digestEvent(events: readonly { text: string }[], pinned: GoalDig
 /**
  * The digest of the holder's latest record, for one cycle's goal context. One parse of the record. A digest that is
  * too large, or that the full digest schema refuses, is skipped with its reason; the record is never changed.
+ * Today's digest; with `register`, it gains registerDigestFor(record) before the schema parse.
  */
-export function goalRecordDigest(holder: GoalHolder, configured: readonly TeamCommand[]): GoalDigestResult {
+export function goalRecordDigest(holder: GoalHolder, configured: readonly TeamCommand[], register?: boolean): GoalDigestResult {
   const state = readStoredRecord(holder.objectiveRecord, ownerOf(holder.goal));
   if (state.kind !== "ready") return { skipped: "record-unavailable" };
   try {
     const digest = recordDigestFor(state.record, configured);
     if (recordDigestBytes(digest) > RECORD_DIGEST_BYTES) return { skipped: "digest-too-large" };
-    const parsed = recordDigestSchema.safeParse(digest);
+    const parsed = recordDigestSchema.safeParse(register ? { ...digest, register: registerDigestFor(state.record) } : digest);
     return parsed.success ? { digest: parsed.data } : { skipped: "record-unavailable" };
   } catch {
     return { skipped: "record-unavailable" };

@@ -19,7 +19,7 @@ import { FloatingNotice } from "../../components/FloatingNotice";
 import { HaltBanner } from "../halt/HaltBanner";
 import { age, SESSION_KIND, SESSION_LABELS, type StatusKind } from "../../status";
 import { theme } from "../../theme";
-import { goalGroup, pendingApprovals, ROLE_NAMES, teamGroup, type ProductGoal, type TeamView } from "../teams/model";
+import { goalGroup, pendingApprovals, ROLE_NAMES, teamGroup, type ProductGoal, type TeamListItem } from "../teams/model";
 import { GoalList, listStyles, TeamList } from "../teams/RunLists";
 import { decisionLogAvailable } from "../permissions/model";
 
@@ -82,13 +82,13 @@ export function Inbox({
   });
   // Hosts that predate teams advertise no `teams` field and have no team routes to poll.
   const hasTeams = Boolean(data?.me.teams), hasGoals = Boolean(data?.me.goals);
-  // Full run records are large, so only the visible tab polls quickly; the others refresh their counts slowly.
+  // Only the visible tab polls quickly; the others refresh their counts slowly.
   const focused = useIsFocused();
   const pace = (tab: InboxView) => focused && view === tab ? 4000 : 20000;
-  const teamsPoll = useLive<TeamView[] | null>(connection, {
+  const teamsPoll = useLive<TeamListItem[] | null>(connection, {
     topics: ["teams"], intervalMs: pace("teams"), deps: [hasTeams],
-    load: () => hasTeams ? api<{ teams: TeamView[] }>(connection, "/teams").then(value => value.teams) : Promise.resolve(null),
-    select: (topic, payload) => topic === "teams" && Array.isArray((payload as { teams?: unknown }).teams) ? (payload as { teams: TeamView[] }).teams : undefined,
+    load: () => hasTeams ? api<{ teams: TeamListItem[] }>(connection, "/teams?view=list").then(value => value.teams) : Promise.resolve(null),
+    select: (topic, payload) => topic === "teams" && Array.isArray((payload as { teams?: unknown }).teams) ? (payload as { teams: TeamListItem[] }).teams : undefined,
   });
   const goalsPoll = usePoll(() => hasGoals ? api<{ goals: ProductGoal[] }>(connection, "/goals").then(value => value.goals) : Promise.resolve(null), pace("goals"), [connection, hasGoals]);
   const teams = teamsPoll.data ?? [];

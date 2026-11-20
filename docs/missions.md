@@ -250,6 +250,24 @@ coordinator's `question` report reaches the owner. Provider permission prompts
 are unaffected and keep their existing owner or delegated coordinator path per
 repository.
 
+Recommendations: a subteam decision carries the asking member's recommendation
+when it has one (see [team questions](teams.md#team-questions-and-steering)).
+The `child-decision` message and the decision's `openChildDecisions` entry
+carry its answers and reason, and the prompt prints it as the asking agent's
+recommendation. It is evidence for the coordinator's own choice between
+`answer-child` and asking the owner; it changes neither rule. The
+coordinator's `question` report requires its own recommendation through the
+report tool. A forwarded question without `answerMode` takes the subteam
+decision's mode, so the host checks the options and the recommendation against
+that final mode: one option unless the mode is `multiple`. A question from a
+coordinator started before this rule is still read, with no recommendation,
+and its reporter falls back the same way a team member's does.
+When the owner, a connector, or the coordinator's `answer-child` answers a
+mission decision, the host records `matched`, `different`, or `other` on its
+recommendation, as for team decisions. A connector reads the recommendation
+in its request view ([MCP](mcp.md)). Nothing answers a question with its
+recommendation.
+
 Prompt budget: each coordinator attempt includes the longest run of waiting
 messages that fits the 80 KiB prompt and the 30-message cap. If even the first
 message does not fit, the host shortens it for that prompt only, in this order:

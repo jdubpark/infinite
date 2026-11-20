@@ -63,7 +63,8 @@ export function intentContext(input: { run: TeamRun; record: ObjectiveRecord; pl
     record: {
       ...rest,
       criteria: criteria.map(({ latest: _latest, ...item }) => item),
-      assumptions: assumptions.map(({ proposals: _proposals, ...item }) => item),
+      // A member's assumption is member text, which reaches no prompt or context file.
+      assumptions: assumptions.filter(item => item.origin !== "member").map(({ proposals: _proposals, ...item }) => item),
     },
     plan: {
       memberId: planMember.memberId,

@@ -7,7 +7,7 @@ import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import type { Config } from "../packages/host/src/types.js";
 import { RepoEnrollmentService } from "../packages/host/src/repo-enrollment.js";
-import { ROUTING_AUTO_NOTE } from "../packages/host/src/routing-cli.js";
+import { assertRoutingSupport, ROUTING_AUTO_NOTE } from "../packages/host/src/routing-cli.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { startHost } from "./helpers.js";
 import { mixedLineup } from "./team-fixture.js";
@@ -342,5 +342,47 @@ test("repo init saves routing and keeps it when omitted", { timeout: 90000 }, as
         String(error.stderr).includes("--routing-value must be cost, balanced, quality, or a dollar value from 0 to 100."), `--routing-value ${value}`);
       assert.equal(JSON.stringify(await savedRouting()), kept, `--routing-value ${value} leaves the saved policy unchanged`);
     }
+  } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("repo init saves routing points, refuses a list without start, and checks the host", { timeout: 90000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-routing-points-"));
+  const repoPath = join(root, "sample");
+  mkdirSync(repoPath);
+  git(repoPath, "init", "--initial-branch=main");
+  writeFileSync(join(repoPath, "tracked.txt"), "committed\n");
+  git(repoPath, "add", "tracked.txt");
+  git(repoPath, "-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial fixture");
+  const checks = JSON.stringify([{ command: "git", args: ["status", "--short"] }]);
+  const host = await startHost({ config: {
+    projects: [{ id: "sample", name: "Sample", path: repoPath, team: { checks: [{ command: "git", args: ["status", "--short"] }] } }],
+    teams: { workspaceDir: join(root, "team-workspaces") },
+  } });
+  const clientFile = join(host.root, "routing-points-client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: host.origin, token: host.tokens.owner }), { mode: 0o600 });
+  const cli = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
+  const invoke = (args: string[]) => execFileSync(cli[0]!, [...cli.slice(1), "repo", "init", repoPath, "--project", "sample", "--check-json", checks, ...args, "--json"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const savedRouting = async () => (await host.fetchApi("/projects/sample/team")).body.team.routing;
+  const pointsMessage = "--routing-points must list start, and may add escalation and scout, separated by commas.";
+  try {
+    invoke(["--routing", "shadow", "--routing-value", "quality", "--routing-points", "start,scout,escalation"]);
+    assert.deepEqual(await savedRouting(), { mode: "shadow", successValueUsd: 8, points: ["start", "scout", "escalation"] });
+
+    const kept = JSON.stringify(await savedRouting());
+    invoke([]);
+    assert.equal(JSON.stringify(await savedRouting()), kept, "a rerun without the option keeps the saved points");
+
+    for (const points of ["escalation", "start,start", "start,review", ""]) {
+      assert.throws(() => invoke(["--routing-points", points]), (error: { stderr?: string }) =>
+        String(error.stderr).includes(pointsMessage), `--routing-points "${points}"`);
+      assert.equal(JSON.stringify(await savedRouting()), kept, `--routing-points "${points}" leaves the saved policy unchanged`);
+    }
+
+    // An older host that does not record routing points refuses escalation and scout, and accepts start alone.
+    const oldHost = { teams: { routing: 1, routingAuto: 1 } };
+    assert.throws(() => assertRoutingSupport({ points: ["start", "escalation"] }, oldHost), (error: Error) =>
+      error.message === "This host does not support escalation and scout routing. Upgrade the host before using --routing-points.");
+    assert.doesNotThrow(() => assertRoutingSupport({ points: ["start"] }, oldHost));
+    assert.doesNotThrow(() => assertRoutingSupport({ points: ["start", "scout"] }, { teams: { routing: 1, routingAuto: 1, routingPoints: 1 } }));
   } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
 });

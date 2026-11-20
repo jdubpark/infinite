@@ -136,6 +136,9 @@ test("every tracked deploy file that names a first-instance path is rendered for
     ["repository-graph-wrapper.py", "the code graph, which an instance runs without until an instance wrapper exists"],
     ["grader.md", "the replay grader's runbook; a second instance changes each name by hand, as its third paragraph says"],
     ["grader.sudoers", "the first instance's grader rule; a second instance writes its own from grader.md"],
+    ["eval-wrapper.sh", "the first instance's eval provider wrapper; rendering the eval files for an instance is a later slice"],
+    ["eval.sudoers", "the first instance's eval rule; rendering the eval files for an instance is a later slice"],
+    ["eval.md", "the eval account's runbook; a second instance changes each name by hand, as its account paragraph says"],
   ]);
   const firstPath = /\/opt\/infinite\/|\/opt\/infinite-agents|\/srv\/infinite-data|\/usr\/local\/libexec\/infinite\//;
   const tracked = deployFiles();

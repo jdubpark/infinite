@@ -665,3 +665,27 @@ test("version 2 reads seek their indexes", () => {
     f.close();
   }
 });
+
+test("applied ids at the escalation point seek routing_by_identity", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  const since = daysBefore(30);
+  const sql = "SELECT run_id, member_id FROM routing_decisions WHERE chosen_identity=? AND point=? AND state='applied' "
+    + "AND decided_at>=? ORDER BY decided_at DESC LIMIT 2000";
+  try {
+    store = open(f);
+    insertSpec(store, { projectId: "proj-a", runId: "r-start", taskId: "t1", state: "applied", memberId: "m-start", identity: "ident-e", decidedAt: daysBefore(1) });
+    insertSpec(store, { projectId: "proj-a", runId: "r-esc", taskId: "t2", point: "escalation", state: "applied", memberId: "m-esc", identity: "ident-e", decidedAt: daysBefore(1) });
+    const escalation = store.read(db => appliedOutcomeIds(db, "ident-e", since, "escalation"));
+    assert.deepEqual([...escalation], ["r-esc:m-esc"], "an applied escalation row is not an applied start");
+    const start = store.read(db => appliedOutcomeIds(db, "ident-e", since));
+    assert.deepEqual([...start], ["r-start:m-start"], "an applied start row is not an applied escalation");
+    const plan = store.read(db => db.all<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, "ident-e", "escalation", since).map(row => row.detail).join(" | "));
+    assert.match(plan, /SEARCH .*routing_by_identity/, plan);
+    assert.doesNotMatch(plan, /SCAN routing_decisions/, plan);
+    assert.doesNotMatch(plan, /TEMP B-TREE/, plan);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});

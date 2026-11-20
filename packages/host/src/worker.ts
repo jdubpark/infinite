@@ -43,7 +43,7 @@ import { evidenceDatabasePath } from "./evidence/store.js";
 import { BLACKBOARD_READ_VERSION } from "./evidence/blackboard.js";
 import { createEntryRoute, ENTRY_REFUSALS } from "./team-entry-route.js";
 import { sessionCredentials } from "./evidence/secret-scan.js";
-import { teamReportEnvelopeSchema, type TeamAssignment } from "./team-types.js";
+import { reportRefusal, teamReportEnvelopeSchema, type TeamAssignment } from "./team-types.js";
 import { missionReportEnvelopeSchema } from "./mission-types.js";
 import { agentAcceptOption, isCollapsedPermissionPrompt, oneShotRejectOption, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { SESSION_PERMISSION_ACTOR_LABEL, isRequesterNotice, permissionChoices, rejectTakesText } from "./permission-session-requests.js";
@@ -407,8 +407,8 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | Hook
       return;
     }
     if (state.status !== "running") throw new HookPayloadError(409);
-    if (session.team.role === "project-manager" && report.report.kind === "plan" && report.report.verification && session.team.verificationRefused)
-      throw new HookPayloadError(409, "Plan rejected: this run uses the project's configured checks. Remove verification and submit a corrected plan. If the checks seem insufficient, explain that in the summary and assign tasks to run additional commands themselves and report results.");
+    const refusal = reportRefusal(session.team, report.report);
+    if (refusal) throw new HookPayloadError(409, refusal);
     append("team-report", report);
     teamReportReceipt = { requestId: report.requestId, digest };
     return;
@@ -1649,7 +1649,7 @@ server.listen(socketPath(runDir, session.id), async () => {
     if (session.team) {
       if (!hookServer) throw new Error("Team report channel could not start");
       // The verification flag is host policy; the agent's binding stays the stable assignment identity.
-      const { verificationRefused: _refused, entryTools: _entryTools, ...binding } = session.team;
+      const { verificationRefused: _refused, entryTools: _entryTools, hostProfiles: _hostProfiles, ...binding } = session.team;
       env.INFINITE_TEAM_ASSIGNMENT = JSON.stringify(binding);
       if (session.team.role === "mission-coordinator")
         env.INFINITE_MISSION_ASSIGNMENT = JSON.stringify({ missionId: session.team.runId, memberId: session.team.memberId, revision: session.team.revision });
@@ -1669,7 +1669,7 @@ server.listen(socketPath(runDir, session.id), async () => {
     }
     // With autonomy.boundary.egress, the session reaches the network through the egress proxy under its own credential.
     // Without the key it gets the proxy with no credential, so its requests are refused rather than sent direct.
-    const egress = workerEgressEnvironment(session.projectId, session.id);
+    const egress = workerEgressEnvironment(session.projectId, session.id, process.env, Date.now(), session.purpose);
     if (egress.status === "invalid") throw new Error("The egress proxy address this worker inherited is unusable, so the session was not started");
     clearEgressEnvironment(env); Object.assign(env, egress.env);
     if (egress.status === "no-key") journal.append("lifecycle", { egress: "no-credential" });
@@ -1697,7 +1697,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       if (session.workspace) {
         hybrid = await createHybridWorkspace({
           workspace: session.workspace, directory: join(dir, "workspace"), sharedPoolDirectory: join(stateDir, "workspace-pool"),
-          command: profile.command, commandArgs: profile.args,
+          command: profile.command, commandArgs: profile.args, egress: egress.env,
           ...(profile.workspaceDir ? { workspaceDirectory: join(profile.workspaceDir, session.id), sharedWorkspace: profile.sharedWorkspace } : {}),
           record: data => { append("lifecycle", { execution: data }); },
           publish: execution => {

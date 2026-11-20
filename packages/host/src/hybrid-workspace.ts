@@ -53,6 +53,8 @@ export async function createHybridWorkspace(options: {
   workspaceDirectory?: string;
   sharedWorkspace?: boolean;
   sharedPoolDirectory?: string;
+  /** The session's egress variables, given to the cloud executor in place of the worker's environment. */
+  egress?: Record<string, string>;
 }) {
   const directory = resolve(options.directory), scopeDirectory = join(directory, "blobs");
   const storeDir: WorkspaceStoreTarget = options.sharedPoolDirectory
@@ -200,7 +202,7 @@ export async function createHybridWorkspace(options: {
         await chmod(dataDirectory, 0o2750);
       }
       stage = "starting the cloud executor";
-      const executor = await startCloudExecutor({ cwd: prepared.cwd, command: options.command, commandArgs: options.commandArgs });
+      const executor = await startCloudExecutor({ cwd: prepared.cwd, command: options.command, commandArgs: options.commandArgs, egress: options.egress });
       if (closed) { await executor.close(); return; }
       cloud = executor;
       void executor.exited.then(() => {

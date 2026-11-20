@@ -1,14 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes, randomUUID } from "node:crypto";
 import { EGRESS_ENVIRONMENT_NAMES } from "../packages/host/src/egress.js";
 import { buildLaunch, headlessLaunch, headlessResumeProfile, missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "../packages/host/src/launch.js";
 import { addProjectIdToLaunchEnv } from "../packages/host/src/worker-env.js";
-import { claudeConfigPath, recordClaudeTrust } from "../packages/host/src/workspace-trust.js";
+import { claudeConfigPath, codexTrustArgs, recordClaudeTrust, repositoryCodexConfig } from "../packages/host/src/workspace-trust.js";
 import { DEFAULT_HOOKS, readConfig } from "../packages/host/src/config.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 
@@ -282,12 +282,67 @@ test("a trusted member folder reaches Codex as one per-launch override for that 
   assert.ok(index > 0 && trusted.args[index - 1] === "-c", trusted.args.join(" "));
   assert.equal(trusted.args.at(-1), "do it");
   const quoted = buildLaunch("codex", { command: "codex", args: [] }, "", null, relay, enabled, false, undefined, undefined, '/srv/a "b"\\c');
-  assert.deepEqual(quoted.args, ["-c", 'projects={"/srv/a \\"b\\"\\\\c"={trust_level="trusted"}}']);
+  assert.deepEqual(quoted.args, ["-c", 'project_root_markers=[".git"]', "-c", 'projects={"/srv/a \\"b\\"\\\\c"={trust_level="trusted"}}']);
   for (const folder of ["relative/member", "/srv/a\nb", "/srv/a/../b", "/"])
     assert.throws(() => buildLaunch("codex", { command: "codex", args: [] }, "", null, relay, enabled, false, undefined, undefined, folder), /absolute folder/);
   // Claude has no per-launch trust flag, and untrusted launches carry no override.
   assert.ok(!buildLaunch("claude", { command: "claude", args: [] }, "p", hooks, relay, enabled, true, undefined, undefined, memberFolder).args.some(arg => arg.includes("trust_level")));
   assert.ok(!buildLaunch("codex", { command: "codex", args: [] }, "p", hooks, relay, enabled, true).args.some(arg => arg.startsWith("projects=")));
+});
+
+test("a trusted Codex launch refuses a folder whose repository carries Codex project configuration", () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "codex-config-gate-")));
+  try {
+    const repo = join(base, "repo"), member = join(repo, "packages", "app");
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    writeFileSync(join(repo, ".git", "HEAD"), "ref: refs/heads/main\n");
+    mkdirSync(member, { recursive: true });
+    const launch = (cwd: string) => buildLaunch("codex", { command: "codex", args: [] }, "p", hooks, relay, enabled, true, undefined, undefined, cwd);
+    const args = launch(member).args;
+    // Codex looks for the same root as the check: the root markers are pinned next to the trust override.
+    const trust = args.indexOf(`projects={${JSON.stringify(member)}={trust_level="trusted"}}`);
+    assert.ok(trust > 2 && args[trust - 2] === 'project_root_markers=[".git"]' && args[trust - 3] === "-c", args.join(" "));
+
+    // Above the Git root is outside the project: Codex reads no project configuration there.
+    mkdirSync(join(base, ".codex"));
+    assert.deepEqual(repositoryCodexConfig(member), []);
+
+    // At the Git root, in between, or in the folder itself, in any file type.
+    mkdirSync(join(repo, ".codex"));
+    writeFileSync(join(repo, ".codex", "config.toml"), 'model = "planted"\n');
+    assert.throws(() => launch(member), (error: Error) => error.message.includes(join(repo, ".codex")) && /Codex member not started/.test(error.message));
+    assert.throws(() => launch(repo), /Codex project configuration/);
+    // Codex skips a `.git` folder without HEAD when it looks for the root, so the check looks past it too.
+    mkdirSync(join(repo, "packages", ".git"));
+    assert.deepEqual(repositoryCodexConfig(member), [join(repo, ".codex")]);
+    rmSync(join(repo, "packages", ".git"), { recursive: true });
+    rmSync(join(repo, ".codex"), { recursive: true });
+    writeFileSync(join(repo, "packages", ".codex"), "");
+    assert.deepEqual(repositoryCodexConfig(member), [join(repo, "packages", ".codex")]);
+    rmSync(join(repo, "packages", ".codex"));
+    symlinkSync(join(base, "missing"), join(member, ".codex"));
+    assert.throws(() => codexTrustArgs(member), /Codex project configuration/);
+    rmSync(join(member, ".codex"));
+    assert.deepEqual(repositoryCodexConfig(member), []);
+
+    // A worktree's `.git` file marks the root too, and a folder with no Git root counts only itself.
+    const worktree = join(base, "worktree");
+    mkdirSync(worktree);
+    writeFileSync(join(worktree, ".git"), "gitdir: elsewhere\n");
+    assert.deepEqual(repositoryCodexConfig(worktree), []);
+    mkdirSync(join(worktree, ".codex"));
+    assert.deepEqual(repositoryCodexConfig(worktree), [join(worktree, ".codex")]);
+    const loose = join(base, "loose");
+    mkdirSync(join(loose, ".codex"), { recursive: true });
+    assert.ok(repositoryCodexConfig(loose).includes(join(loose, ".codex")));
+
+    // A folder the host cannot inspect is refused, not trusted.
+    if (process.getuid?.() !== 0) {
+      chmodSync(repo, 0);
+      try { assert.throws(() => codexTrustArgs(member), /Cannot check/); }
+      finally { chmodSync(repo, 0o755); }
+    }
+  } finally { rmSync(base, { recursive: true, force: true }); }
 });
 
 test("Claude trust adds one exact folder entry and leaves the rest of its config unchanged", () => {
@@ -441,6 +496,26 @@ test("a served headless Claude launch loads only the host's settings, with the c
   // Without the signal hooks only the channel hooks remain.
   const quiet = JSON.parse(buildLaunch("claude", { command: "claude", args: ["-p"] }, "", hooks, relay, { claude: false, codex: false }, false, undefined, undefined, undefined, undefined, true).args.at(-1)!);
   assert.deepEqual(Object.keys(quiet.hooks).sort(), ["PermissionRequest", "PreToolUse"]);
+});
+
+test("Claude team launches load no project or local settings file, so one member cannot widen a later member", () => {
+  const sources = (args: string[]) => args.flatMap((arg, index) => arg === "--setting-sources" ? [args[index + 1]] : []);
+  const member = buildLaunch("claude", { command: "claude", args: ["--model", "opus"] }, "Implement this task", hooks, relay, enabled, true);
+  assert.deepEqual(sources(member.args), ["user"]);
+  assert.equal(member.args.at(-1), "Implement this task");
+  const mission = buildLaunch("claude", missionCoordinatorLaunch("claude", { command: "claude", args: [] }), "Report the mission", hooks, relay, enabled, true);
+  assert.deepEqual(sources(mission.args), ["user"]);
+  const reviewer = buildLaunch("claude", permissionCoordinatorLaunch("claude", { command: "claude", args: ["--model", "sonnet"] }), "Review", hooks, relay, enabled, true);
+  assert.deepEqual(sources(reviewer.args), ["user"]);
+  // A served member already loads no settings file at all; the two flags never meet.
+  const served = buildLaunch("claude", { command: "claude", args: ["-p"] }, "go", hooks, relay, enabled, true, undefined, undefined, undefined, undefined, true);
+  assert.deepEqual(sources(served.args), [""]);
+  // Owner sessions and Codex members keep their settings files.
+  assert.deepEqual(sources(buildLaunch("claude", { command: "claude", args: [] }, "p", hooks, relay, enabled).args), []);
+  assert.deepEqual(sources(buildLaunch("codex", { command: "codex", args: [] }, "p", hooks, relay, enabled, true).args), []);
+  for (const args of [["--setting-sources", "project"], ["--setting-sources=user,project"]])
+    assert.throws(() => buildLaunch("claude", { command: "claude", args }, "p", hooks, relay, enabled, true), /setting sources/);
+  assert.deepEqual(sources(buildLaunch("claude", { command: "claude", args: ["--setting-sources", "project"] }, "p", hooks, relay, enabled).args), ["project"]);
 });
 
 test("the launch reader finds headless launches, their allow rules, and what the channel cannot serve", () => {

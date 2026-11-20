@@ -1,12 +1,9 @@
-import type { ChildProcess } from "node:child_process";
 import { COMMIT_ID, parseCommits, parseIds, SCAN_BOUND } from "./outcome-hold.js";
 import { scanGit } from "./outcome-scan.js";
 import { COMMIT_MESSAGE_MAX, type NumstatEntry, parseMessage, parseNumstat } from "./eval-mine-rules.js";
 import type { TeamCommand } from "./team-types.js";
-import { type CommandResult, spawnTeamBundle } from "./team-workspace.js";
+import type { CommandResult } from "./team-workspace.js";
 
-/** The mining reads (see "Git commands"). Every read runs in the mirror through `teams.commandPrefix`. */
-export const MINE_READ_MS = 30_000, BUNDLE_MAX_BYTES = 1_073_741_824;
 /** Form 4 takes 1 to this many ids. */
 const PARENTS_MAX = 50;
 
@@ -127,7 +124,3 @@ export function mineGit(prefix: () => TeamCommand | undefined): MineGit {
   };
 }
 
-/** E3. The base branch of the mirror, streamed as a bundle. The caller streams stdout and destroys it past BUNDLE_MAX_BYTES. */
-export function spawnMirrorBundle(mirror: string, branch: string, prefix?: TeamCommand): ChildProcess {
-  return spawnTeamBundle(mirror, branch, prefix);
-}

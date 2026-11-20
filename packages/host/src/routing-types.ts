@@ -16,7 +16,8 @@ export type RoutingEvidenceRow = Pick<OutcomeRow, "outcomeId" | "source" | "proj
   | "firstPass" | "held" | "endedAt" | "frozenAt">
   & { point: "start" | "escalation"; featureMapRef: string | null; ownerScore: number | null; promptVersion: string | null };
 export type RuleRemoval = "contributor" | "reviewer-model" | "limited";
-export type Basis = "sampled" | "greedy-risk" | "greedy-paused" | "greedy-budget" | "greedy-share" | "single-candidate" | "default-all-limited";
+export type Basis = "sampled" | "greedy-risk" | "greedy-paused" | "greedy-budget" | "greedy-share" | "greedy-point"
+  | "single-candidate" | "default-all-limited";
 /** What the guards read for one `auto` start. Sealed in the payload of every `auto` row. */
 export type ExploreGuards = { pausedAt: string | null; spareAttempts: number; share: { exploratory: number; of: number } };
 /** The project's routing state the host keeps for the period and the explore pause. */

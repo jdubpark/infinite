@@ -63,16 +63,16 @@ export async function readUnderstandingSummary(connection: Connection, workspace
     return null;
   }
   const capturedAt = Date.parse(entry.capturedAt);
-  if (!Number.isFinite(capturedAt) || Date.now() - capturedAt > TTL_MS || entry.chunkCount < 1 || entry.chunkCount > CHUNK_LIMIT) { await clearEntry(index, entry); return null; }
+  if (!Number.isFinite(capturedAt) || Date.now() - capturedAt > TTL_MS || entry.chunkCount < 1 || entry.chunkCount > CHUNK_LIMIT) { await clearEntry(entry); return null; }
   const workspaceHash = (await digest(workspaceId)).slice(0, 24);
   try {
     const chunks = await Promise.all(Array.from({ length: entry.chunkCount }, (_, i) => SecureStore.getItemAsync(chunkKey(workspaceHash, entry.generation, i))));
-    if (chunks.some(chunk => chunk === null)) { await clearEntry(index, entry); return null; }
+    if (chunks.some(chunk => chunk === null)) { await clearEntry(entry); return null; }
     const data = JSON.parse(chunks.join("")) as WorkspaceUnderstanding;
-    if (data.schemaVersion !== 1 || data.workspace.id !== workspaceId || !Array.isArray(data.repositories) || !Array.isArray(data.work)) { await clearEntry(index, entry); return null; }
+    if (data.schemaVersion !== 1 || data.workspace.id !== workspaceId || !Array.isArray(data.repositories) || !Array.isArray(data.work)) { await clearEntry(entry); return null; }
     return { data, cachedAt: entry.capturedAt };
   } catch {
-    await clearEntry(index, entry);
+    await clearEntry(entry);
     return null;
   }
 }
@@ -129,7 +129,7 @@ async function readIndex(): Promise<Index> {
 async function writeIndex(index: Index) {
   await SecureStore.setItemAsync(INDEX_KEY, JSON.stringify(index), { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
 }
-async function clearEntry(index: Index, entry: Entry) {
+async function clearEntry(entry: Entry) {
   await withIndexLock(async () => {
     const latest = await readIndex();
     const current = latest.entries.find(candidate => candidate.scope === entry.scope && candidate.credential === entry.credential && candidate.workspaceId === entry.workspaceId && candidate.generation === entry.generation);

@@ -132,7 +132,7 @@ test("a delivered report answers the result type its own server advertised, with
   const stand = await hooks();
   const mcp = await session(teamEnv(stand.url));
   try {
-    const reply = await mcp.rpc("tools/call", { name: "report", arguments: { report: { kind: "question", question: "Proceed?", options: [] } } });
+    const reply = await mcp.rpc("tools/call", { name: "report", arguments: { report: { kind: "question", question: "Proceed?", options: [], recommendation: { answers: ["Yes"], reason: "The plan is complete." } } } });
     assert.equal(reply.result.isError, false);
     assertWire(mcp.schemas.report, reply.result.structuredContent);
     assert.deepEqual(reply.result.content, [{ type: "text", text: REPORT_TEXT }]);
@@ -180,7 +180,7 @@ test("a refused report keeps its refusal text and has no structured answer", { t
   const stand = await hooks({ "team-report": () => { throw new HookPayloadError(409, "Stand-in refused this report."); } });
   const mcp = await session(teamEnv(stand.url));
   try {
-    const reply = await mcp.rpc("tools/call", { name: "report", arguments: { report: { kind: "question", question: "Proceed?", options: [] } } });
+    const reply = await mcp.rpc("tools/call", { name: "report", arguments: { report: { kind: "question", question: "Proceed?", options: [], recommendation: { answers: ["Yes"], reason: "The plan is complete." } } } });
     assert.equal(reply.result.isError, true);
     assert.equal(reply.result.content[0].text, "Stand-in refused this report.");
     assert.equal(reply.result.structuredContent, undefined);

@@ -17,7 +17,7 @@ export type TeamTask = { id: string; title: string; instructions: string; paths:
 type TeamContinuation = { revision: number; requestId: string; at: string; reason: string; headCommit: string; tasks: TeamTask[]; review?: TeamView["review"]; brief?: TeamBrief };
 type TeamScout = { id: string; title: string; instructions: string; agentProfileId: string; status: "pending" | "running" | "waiting" | "complete"; memberId?: string; summary?: string; evidence?: TeamEvidence[] };
 type TeamMember = { memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string; taskId?: string; cwd: string; baseCommit: string; provider?: string; modelProfile?: TeamModelProfile; usage?: UsageTotals; stoppedReason?: string };
-type TeamDecision = { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator" | "connector"; source?: { kind: "connector"; id: string; name: string } };
+type TeamDecision = { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator" | "connector"; source?: { kind: "connector"; id: string; name: string }; recommendation?: { answers: string[]; reason: string; outcome?: "matched" | "different" | "other" } };
 export type TeamView = {
   id: string; projectId: string; provider: string; title: string; objective: string; parallelism: number;
   revision: number; status: TeamStatus; createdAt: string; updatedAt: string; workspace: string;
@@ -44,6 +44,25 @@ export type TeamView = {
   /** Omitted by older hosts. */
   workers?: { limit: number; max: number; running: number; ready: number };
 };
+/** A run as `GET /teams?view=list` lists it. The long detail (the request, check output, reports, task instructions) comes from `GET /teams/:id`. */
+export type TeamListItem = Pick<TeamView, "id" | "projectId" | "provider" | "title" | "parallelism" | "revision" | "status" | "createdAt" | "updatedAt"
+  | "workspace" | "branch" | "baseCommit" | "headCommit" | "decisions" | "events" | "reason" | "missionId" | "resumable" | "continuable" | "workers"> & {
+  members: (Omit<TeamMember, "cwd" | "baseCommit" | "modelProfile" | "usage"> & { startedAt?: string; reportedAt?: string; lastActivityAt?: string; pendingLimit?: boolean; stalledAt?: string;
+    modelProfile?: Pick<TeamModelProfile, "label" | "provider" | "tier">; usage?: Pick<UsageTotals, "cost"> })[];
+  tasks: (Pick<TeamTask, "id" | "title" | "status" | "paths" | "memberId" | "ownerRating"> & { changedPaths?: { paths: string[]; truncated: boolean } })[];
+  checks: Pick<TeamView["checks"][number], "status" | "revision">[];
+  lineup?: Pick<TeamLineup, "coordinator">;
+  goal?: Pick<NonNullable<TeamView["goal"]>, "id" | "revision" | "cycle">;
+  linear?: Omit<LinearTrackingView, "issue"> & { issue?: Pick<NonNullable<LinearTrackingView["issue"]>, "identifier" | "url" | "title" | "state"> };
+  review?: Pick<NonNullable<TeamView["review"]>, "verdict" | "revision">;
+  discovery?: { revision: number };
+  deliveryReceipt?: Omit<NonNullable<TeamView["deliveryReceipt"]>, "summary">;
+  pullRequest?: Omit<NonNullable<TeamView["pullRequest"]>, "summary">;
+  permissions?: { mode: "coordinator"; maxDecisions: number };
+  permissionsRevokedAt?: string;
+  permissionDecisions?: { targetSessionId: string; promptId: number; status: string }[];
+  usage?: Pick<TeamUsage, "total" | "unmeasuredMembers">;
+};
 type CreateRequest = { requestId: string; projectId: string; provider: string; title: string; objective: string; useConfiguredLineup?: boolean };
 type MutationRequest = { requestId: string; revision: number; text?: string; path: string; label: string };
 const creations = requestStore<CreateRequest, { id: string }>();
@@ -65,7 +84,7 @@ const date = (value: string) => new Date(value).toLocaleString([], { month: "sho
 const statusClass = (status: TeamStatus) => ["needs-input", "blocked", "paused"].includes(status) ? "waiting" : ["ready-for-review", "merged"].includes(status) ? "ready" : ["cancelled", "no-change"].includes(status) ? "inactive" : "";
 function Status({ status }: { status: TeamStatus }) { return <span className={"team-status " + statusClass(status)}><span className="dot" />{labels[status]}</span>; }
 function RoleGuide() { return <div className="team-roles" aria-label="Team responsibilities">{Object.entries(roles).map(([id, role]) => <div key={id}><strong>{role.name}</strong><p>{role.description}</p></div>)}</div>; }
-const leadLabel = (team: TeamView) => team.lineup ? "Coordinator: " + team.lineup.coordinator.label : names[team.provider] ?? team.provider;
+const leadLabel = (team: Pick<TeamListItem, "lineup" | "provider">) => team.lineup ? "Coordinator: " + team.lineup.coordinator.label : names[team.provider] ?? team.provider;
 /** Older hosts omit worker counts, so their reported parallelism backs the live status. */
 export function workerStatus(parallelism: number, workers?: NonNullable<TeamView["workers"]>) {
   if (!workers) return `Up to ${parallelism} workers`;
@@ -118,9 +137,9 @@ function SetupNotice({ me }: { me: Me }) {
 }
 
 /** Blocked runs lead every team list; each group keeps its received order. */
-const blockedFirst = (teams: TeamView[]) => [...teams.filter(team => team.status === "blocked"), ...teams.filter(team => team.status !== "blocked")];
+const blockedFirst = (teams: TeamListItem[]) => [...teams.filter(team => team.status === "blocked"), ...teams.filter(team => team.status !== "blocked")];
 
-export function TeamPicker({ teams, selected, loading, onSelect }: { teams: TeamView[]; selected: string | null; loading: boolean; onSelect: (id: string) => void }) {
+export function TeamPicker({ teams, selected, loading, onSelect }: { teams: TeamListItem[]; selected: string | null; loading: boolean; onSelect: (id: string) => void }) {
   return <nav className="session-list team-picker" aria-label="Agent teams">
     {blockedFirst(teams).map(team => <button className={"session-row " + (selected === team.id ? "selected" : "")} key={team.id} onClick={() => onSelect(team.id)} aria-current={selected === team.id ? "page" : undefined}>
       <div className="row-top"><Users size={15} /><strong>{team.title}</strong><ChevronRight size={16} /></div>
@@ -132,7 +151,7 @@ export function TeamPicker({ teams, selected, loading, onSelect }: { teams: Team
 }
 
 export function TeamList({ teams, me, fresh, stale, loading, failed, seen, onCreate, onSelect, refresh, openCost }: {
-  teams: TeamView[]; me: Me; fresh: boolean; stale: boolean; loading: boolean; failed: boolean; seen: string;
+  teams: TeamListItem[]; me: Me; fresh: boolean; stale: boolean; loading: boolean; failed: boolean; seen: string;
   onCreate: () => void; onSelect: (id: string) => void; refresh: () => void; openCost: () => void;
 }) {
   return <div className="team-page team-list-page">
@@ -152,7 +171,7 @@ export function TeamList({ teams, me, fresh, stale, loading, failed, seen, onCre
   </div>;
 }
 
-function TeamListResume({ team, fresh, refresh }: { team: TeamView; fresh: boolean; refresh: () => void }) {
+function TeamListResume({ team, fresh, refresh }: { team: TeamListItem; fresh: boolean; refresh: () => void }) {
   const api = useApi();
   const machine = useMachines().active.id;
   const key = machine + "/" + team.id;
@@ -470,7 +489,7 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
       <section className="team-section"><h2>Verification evidence</h2><p className="quiet">Host check results and the reviewer’s assessment are recorded separately.</p><h3>Required checks</h3>{team.checks.length ? team.checks.map((check, index) => <details className="team-check" key={check.startedAt + "/" + index}><summary><code>{[check.command.command, ...check.command.args].join(" ")}</code><span className={"team-check-status " + check.status}>{check.status} · revision {check.revision}</span></summary><p className="quiet">Revision {check.revision} · started {date(check.startedAt)}{check.finishedAt && " · finished " + date(check.finishedAt)}{check.exitCode !== undefined && " · exit " + String(check.exitCode)}</p><pre>{check.output || "No output recorded."}</pre></details>) : <p className="quiet">No check results recorded yet.</p>}<h3 className="team-review-heading">Reviewer assessment <span className="quiet">(agent report)</span></h3>{team.review ? <div><p><strong>{team.review.verdict === "approved" ? "Approved by reviewer" : "Changes requested"}</strong> <span className="quiet">· revision {team.review.revision}</span></p><p className="team-prose">{team.review.summary}</p>{team.review.uiEvidence && <><h4>Reviewer UI evidence</h4><p className="team-prose">{team.review.uiEvidence}</p></>}</div> : <p className="quiet">No reviewer assessment recorded yet.</p>}</section>
       <UsageRollup me={me} usage={team.usage} heading="Agent spend" />
       <section className="team-section"><h2>Review the changes</h2><dl className="team-output"><dt><GitBranch size={15} />Branch</dt><dd><code>{team.branch}</code></dd><dt>Workspace</dt><dd><code>{team.workspace}</code></dd><dt>Base commit</dt><dd><code>{team.baseCommit}</code></dd>{team.headCommit && <><dt>Head commit</dt><dd><code>{team.headCommit}</code></dd></>}</dl></section>
-      {(team.steering.length > 0 || team.decisions.some(decision => decision.answer !== undefined)) && <section className="team-section"><h2>Directions and decisions</h2>{team.steering.map((entry, index) => <div className="team-record" key={entry.at + "/" + index}><small>{typeof entry.source === "object" ? entry.source.name : entry.source === "coordinator" ? "Mission coordinator" : "You"} · direction · revision {entry.revision} · {date(entry.at)}</small><p className="team-prose">{entry.text}</p></div>)}{team.decisions.filter(decision => decision.answer !== undefined).map(decision => <div className="team-record" key={decision.id}><small>Decision · revision {decision.revision}</small><p className="team-prose">{decision.question}</p><p className="team-prose"><strong>{decision.answeredBy === "connector" ? `${decision.source?.name ?? "Connector"}: ` : decision.answeredBy === "coordinator" ? "Mission coordinator: " : "Your answer: "}</strong>{decision.answer}</p></div>)}</section>}
+      {(team.steering.length > 0 || team.decisions.some(decision => decision.answer !== undefined)) && <section className="team-section"><h2>Directions and decisions</h2>{team.steering.map((entry, index) => <div className="team-record" key={entry.at + "/" + index}><small>{typeof entry.source === "object" ? entry.source.name : entry.source === "coordinator" ? "Mission coordinator" : "You"} · direction · revision {entry.revision} · {date(entry.at)}</small><p className="team-prose">{entry.text}</p></div>)}{team.decisions.filter(decision => decision.answer !== undefined).map(decision => <div className="team-record" key={decision.id}><small>Decision · revision {decision.revision}</small><p className="team-prose">{decision.question}</p><p className="team-prose"><strong>{decision.answeredBy === "connector" ? `${decision.source?.name ?? "Connector"}: ` : decision.answeredBy === "coordinator" ? "Mission coordinator: " : "Your answer: "}</strong>{decision.answer}</p><OutcomeNote decision={decision} /></div>)}</section>}
       {team.continuations?.length ? <section className="team-section"><h2>Earlier blocked revisions</h2>{team.continuations.map(continuation => <article className="team-record" key={continuation.requestId}><small>Revision {continuation.revision} · continued {date(continuation.at)}</small><p className="team-prose">{continuation.reason}</p><p className="quiet">Preserved head commit: <code>{continuation.headCommit}</code> · {continuation.tasks.length} tasks</p>{continuation.tasks.map(task => <details key={task.id}><summary>{task.title} · {task.status}</summary>{task.summary && <p className="team-prose">{task.summary}</p>}<p className="team-prose">{task.instructions}</p>{task.paths.length > 0 && <p className="quiet">Paths: {task.paths.join(", ")}</p>}{task.commit && <p className="quiet">Integrated commit: <code>{task.commit}</code></p>}</details>)}{continuation.review && <><h3>Reviewer assessment · revision {continuation.review.revision}</h3><p className="team-prose">{continuation.review.verdict}: {continuation.review.summary}</p>{continuation.review.uiEvidence && <p className="team-prose">Interface evidence: {continuation.review.uiEvidence}</p>}</>}{continuation.brief && <TeamBriefView brief={continuation.brief} />}</article>)}</section> : null}
       {team.events.length > 0 && <section className="team-section"><div className="team-history"><h2>Run history</h2><ol>{team.events.map((event, index) => <li key={event.at + "/" + index}><time>{date(event.at)}</time><p>{event.text}</p></li>)}</ol></div></section>}
       </details>
@@ -484,7 +503,17 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
   </div>;
 }
 
+function OutcomeNote({ decision }: { decision: TeamDecision }) {
+  const outcome = decision.recommendation?.outcome;
+  if (outcome === "matched") return <p className="quiet">Matched the recommendation</p>;
+  if (outcome === "different") return <p className="quiet">Different from the recommendation</p>;
+  return null;
+}
+
 function Decision({ decision, disabled, member, answer, readOnly }: { decision: TeamDecision; disabled: boolean; member?: TeamMember; answer: (text: string) => void; readOnly: boolean }) {
   const [text, setText] = useState("");
-  return <article className="team-decision"><p className="quiet">{member ? roles[member.role].name : "Team"} · revision {decision.revision}</p><p className="team-prose">{decision.question}</p>{!readOnly && <><div className="team-decision-options">{decision.options.map((option, index) => <button key={index} disabled={disabled} onClick={() => answer(option)}>{option}</button>)}</div><form onSubmit={event => { event.preventDefault(); if (text.trim()) answer(text.trim()); }}><label className="sr-only" htmlFor={"decision-" + decision.id}>Your answer</label><textarea id={"decision-" + decision.id} rows={2} maxLength={8000} placeholder="Write your answer…" value={text} onChange={event => setText(event.target.value)} disabled={disabled} /><button className="primary" disabled={disabled || !text.trim()}>Send answer <ArrowUpRight size={16} /></button></form></>}</article>;
+  const recommendation = decision.recommendation;
+  const isRecommended = (option: string) => recommendation?.answers.includes(option) === true;
+  const recommendedOnly = recommendation !== undefined && decision.options.length === 0 && recommendation.answers.length > 0 ? recommendation.answers[0] : undefined;
+  return <article className="team-decision"><p className="quiet">{member ? roles[member.role].name : "Team"} · revision {decision.revision}</p><p className="team-prose">{decision.question}</p>{recommendation && <div className="team-recommendation"><p className="quiet">Recommended by the agent</p><p className="team-prose"><strong>{recommendation.answers.join(", ")}</strong></p><p className="quiet">{recommendation.reason}</p></div>}{!readOnly && <><div className="team-decision-options">{decision.options.map((option, index) => <button key={index} className={isRecommended(option) ? "recommended" : undefined} aria-label={isRecommended(option) ? `${option}, recommended` : undefined} disabled={disabled} onClick={() => answer(option)}>{option}{isRecommended(option) && <span className="team-recommended-tag">Recommended</span>}</button>)}{recommendedOnly !== undefined && <button className="recommended" disabled={disabled} onClick={() => answer(recommendedOnly)}>Use the recommended answer</button>}</div><form onSubmit={event => { event.preventDefault(); if (text.trim()) answer(text.trim()); }}><label className="sr-only" htmlFor={"decision-" + decision.id}>Your answer</label><textarea id={"decision-" + decision.id} rows={2} maxLength={8000} placeholder="Write your answer…" value={text} onChange={event => setText(event.target.value)} disabled={disabled} /><button className="primary" disabled={disabled || !text.trim()}>Send answer <ArrowUpRight size={16} /></button></form></>}</article>;
 }

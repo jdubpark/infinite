@@ -3,7 +3,7 @@ import { z } from "zod";
 import { startMode } from "./evaluator-profiles.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import { EvidenceError } from "./evidence/types.js";
-import { objectivePromptsOn } from "./objective-digest.js";
+import { objectivePromptFor } from "./objective-digest.js";
 import { routingExplain, routingStatus } from "./routing-reads.js";
 import { ROUTING_MODULE, setExplorePause } from "./routing-store.js";
 import { teamActionSchema } from "./team-types.js";
@@ -64,8 +64,8 @@ export function routingRoutes(app: express.Express, deps: RoutingRouteDeps, guar
         // The values a new run pins, so the status shows the prompt versions a new decision would use.
         publishHeads: (config.teams as { publishHeads?: boolean } | undefined)?.publishHeads !== false,
         entryTools: config.teams?.blackboard?.tools === true,
-        // Owner criteria on: a goal cycle start carries the record digest, so the status reads that version.
-        objectiveDigest: objectivePromptsOn(project),
+        // The shape a new run of this project would pin: the criteria digest, and the register when it is on.
+        objectiveDigest: objectivePromptFor(project, startMode(project, config.teams?.lineup).mode),
         now: new Date().toISOString(),
       }));
     } catch (error) {

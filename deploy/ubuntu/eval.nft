@@ -1,0 +1,24 @@
+#!/usr/sbin/nft -f
+# Infinite eval account output rule. See deploy/ubuntu/eval.md, step 5.
+#
+# Load it only where autonomy.boundary.egress is configured: the eval account reaches its provider through the egress
+# proxy on loopback, and this rule refuses every other output of the account, over IPv4 and IPv6 alike (inet family).
+# infinite-eval-firewall.service loads it at boot and again after nftables.service flushes the ruleset.
+#
+# nft resolves the account name when the file loads. A file that fails to load changes nothing: the table stays as it
+# was, or absent at boot. A second instance names its own account (infinite-NAME-eval) in its own copy.
+
+define eval_user = "infinite-eval"
+
+# Replace this table, and only this table, in one transaction.
+table inet infinite_eval
+delete table inet infinite_eval
+
+table inet infinite_eval {
+	chain output {
+		type filter hook output priority filter; policy accept;
+		meta skuid $eval_user oifname "lo" accept
+		meta skuid $eval_user meta l4proto tcp reject with tcp reset
+		meta skuid $eval_user reject with icmpx admin-prohibited
+	}
+}

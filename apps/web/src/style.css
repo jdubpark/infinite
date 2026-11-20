@@ -1328,6 +1328,12 @@ small,
 .team-decision-options button { min-height: 44px; padding: 10px 14px; border: 1px solid #c9b894; border-radius: 8px; background: var(--paper); font-size: 13px; text-align: left; }
 .team-decision form { display: flex; flex-direction: column; align-items: flex-end; gap: 10px; margin-top: 14px; }
 .team-decision .primary { min-height: 44px; font-size: 12px; padding: 10px 14px; }
+.team-recommendation { margin-top: 12px; padding-top: 10px; border-top: 1px solid #c9b894; }
+.team-recommendation > .quiet { font-size: 11px; color: #724314; margin: 0 0 4px; }
+.team-recommendation > .team-prose { margin: 0; font-size: 14px; }
+.team-recommendation > .team-prose + .quiet { margin: 4px 0 0; }
+.team-decision-options button.recommended { border-color: var(--green); }
+.team-recommended-tag { margin-left: 8px; font-size: 11px; color: var(--green); }
 .team-session-link { width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 14px; text-align: left; border: 0; border-bottom: 1px solid var(--rule); background: transparent; min-height: 60px; padding: 14px 0; }
 .team-session-link strong { font-size: 13px; }
 .team-session-link small { display: block; font-size: 12px; margin-top: 7px; }

@@ -77,7 +77,7 @@ Another design may add event kinds under its own prefix and register a projector
 | `member.configured` | `launch`, a read after the session starts | `configId` and its six components. Absent when the read fails |
 | `member.reported` | `readMemberJournal` | report kind |
 | `member.stopped` | `replaceStalledMember`, `switchLimitedMember`, `retireMember`, `step` (halt loop, exit branch) | reason class |
-| `task.integrated` | `consume` (implementer `result`) | commit, head, base commit, diff counts |
+| `task.integrated` | `consume` (implementer `result`) | commit, head, base commit, diff counts, integration gauge |
 | `scout.completed` | `consume` (`findings`) | |
 | `task.escalated` | `consume` (`escalate`) | from and to profile |
 | `task.limit-switched` | `switchLimitedMember` | from and to profile |
@@ -162,8 +162,17 @@ type OutcomePayload = {
   costCoverage: "none" | "partial" | "complete";               // from the usage ledger
   landing?: { at: string; method: "merge-commit" | "merge-parent" | "tree-equal" };
   flags?: ("backfilled" | "gap" | "empty-result" | "scan-gap" | "same-model-review")[];
+  integration?: { writers: number; staleBase?: boolean; changedPaths?: number; truncated?: true };   // INF-307
 };
 ```
+
+**Integration gauge (INF-307).** `integration` says how concurrent one integration was. It holds numbers and flags only, computed from run state the host already holds, with no added Git command.
+
+- `writers` counts the run's other tasks with status `running` or `waiting` when the result was integrated. It counts tasks, including one that waits on a question or will change nothing. It does not measure members writing the same files.
+- `staleBase` is true when the integration head had moved past the member's base before this integration. It is absent when the head was unknown. It shows that the base had fallen behind, which also happens to an assignment that waited in the queue. It is false for a member created after earlier integrations.
+- `changedPaths` is the number of paths the result changed, never the list. `0` is a known zero, for a result with no commit. It is absent when the host could not read the list. `truncated` marks a count cut at its bound, so the count is a lower bound.
+
+A later `task.integrated` event for the same attempt replaces the gauge, and one that carries no valid gauge removes it.
 
 Plaintext columns hold opaque identifiers, enumerations, numbers, and times. Names from the repository or the run stay in the encrypted payload. A row never holds an objective, instructions, a summary, a rubric reason, a rating note, a path, or a URL.
 

@@ -89,6 +89,15 @@ test("the checker's context holds the record, the plan, and this revision's find
   assert.equal(JSON.stringify(context).includes(SENTINEL), false, "no implementer report, routing pin, or blackboard flag");
   const revised = intentContext({ run: { ...runFixture(), revision: 3 }, record: RECORD, planMember, mode: "autonomous", criteriaDue: true, checks: CHECKS });
   assert.deepEqual(revised?.findings, [], "an earlier revision's findings are not this plan's");
+
+  // A member's assumption is member text, so it never reaches the checker; the room left still counts it.
+  const memberStatement = ["member", "assumption", "statement"].join("-");
+  const withMember = { ...RECORD, assumptions: [...RECORD.assumptions,
+    { ...RECORD.assumptions[0]!, id: "a2", origin: "member", statement: memberStatement, refutedBy: `${memberStatement} refuted` }] } as ObjectiveRecord;
+  const screened = intentContext({ run: runFixture(), record: withMember, planMember, mode: "autonomous", criteriaDue: true, checks: CHECKS });
+  assert.deepEqual(screened?.record.assumptions.map(item => item.id), ["a1"], "a member's assumption is left out");
+  assert.equal(JSON.stringify(screened).includes(memberStatement), false, "and its text with it");
+  assert.equal(screened?.limits.assumptionsLeft, 30);
 });
 
 test("a checker context over 1 MiB is not built", () => {

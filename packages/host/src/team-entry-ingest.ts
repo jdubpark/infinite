@@ -24,6 +24,8 @@ export type IngestDeps = {
   done: Set<string>;
   /** The members to read this pass. The caller bounds the list. */
   members: readonly TeamMember[];
+  /** Once per stored page with kept posts, after the store write and before the cursor moves. A throw is ignored. */
+  kept?: (run: TeamRun, member: TeamMember, posts: readonly MemberPostRecord[]) => void;
 };
 
 /** Whether a member's journal may still hold entry events the host has not stored. */
@@ -64,6 +66,15 @@ export function ingestRunEntries(run: TeamRun, deps: IngestDeps): { advanced: bo
         const outcome: IngestOutcome = deps.entries.ingest(run, member, posts, reads);
         if (outcome.result !== "stored") continue;
         result.dropped += outcome.dropped;
+        const keptPosts = posts.filter(post => outcome.kept?.has(post.seq) === true);
+        if (keptPosts.length > 0) {
+          // The post is already on the board, so a failing hook neither holds the cursor nor undoes the page.
+          try {
+            deps.kept?.(run, member, keptPosts);
+          } catch {
+            // Ignored by design: the host's screen counts what the hook could not record.
+          }
+        }
         if (page.cursor !== (member.entryCursor ?? 0)) { member.entryCursor = page.cursor; result.advanced = true; }
         // A stopped member whose journal was read to its end sends no more entry calls, so it is settled for good.
         if (!page.more && !ACTIVE_MEMBER_STATUSES.includes(member.status)) deps.done.add(member.memberId);
@@ -117,7 +128,7 @@ export class EntryIngestQueue {
 export function ingestPass(
   queue: EntryIngestQueue,
   run: (runId: string) => TeamRun | undefined,
-  deps: Pick<IngestDeps, "events" | "entries">,
+  deps: Pick<IngestDeps, "events" | "entries" | "kept">,
 ): { run: TeamRun; advanced: boolean; dropped: number }[] {
   const groups = new Map<string, string[]>();
   for (const { runId, memberId } of queue.take(ENTRY_INGEST_MEMBERS)) groups.set(runId, [...(groups.get(runId) ?? []), memberId]);

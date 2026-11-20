@@ -59,7 +59,10 @@ export class TeamRetention {
   readonly memberWorkSaveControllers = new Map<string, AbortController>();
   private readonly removalWaiters: Array<() => void> = [];
   private activeRemovals = 0;
-  private readonly traces = new MemberTraces();
+  private memberTraces?: MemberTraces;
+  /** Member traces, made when the service starts (`findMemberTraces`), which looks for their root once. */
+  private get traces() { return this.memberTraces ??= new MemberTraces(this.host.config.stateDir); }
+  findMemberTraces() { void this.traces; }
   constructor(private readonly host: RetentionHost) {}
   private traceHost(): TraceSettlementHost {
     const { manager } = this.host;
@@ -282,10 +285,13 @@ export class TeamRetention {
     }
     try { if (!stored.run.replay) this.host.persistRetiredRunId(stored.run.id); }
     catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's deletion tombstone could not be saved; its record was kept."); }
-    // A settlement pass still running over the run's traces ends first, and nothing of the run is kept after it.
-    await this.traces.forget(stored.run);
-    try { await removeMemberTraces(this.host.config.stateDir, stored.run.id); }
-    catch { throw new TraceRemovalError(500, "team-record-removal-failed", "The settled team's member traces could not be removed; its record was kept."); }
+    // A host that never kept traces skips this. Otherwise a settlement pass still running over the run's traces ends
+    // first, and nothing of the run is kept after it.
+    if (this.traces.inUse(this.host.config)) {
+      await this.traces.forget(stored.run);
+      try { await removeMemberTraces(this.host.config.stateDir, stored.run.id); }
+      catch { throw new TraceRemovalError(500, "team-record-removal-failed", "The settled team's member traces could not be removed; its record was kept."); }
+    }
     try { await rmAsync(join(this.host.directory, `${stored.run.id}.sealed`), { force: true }); }
     catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's record could not be removed."); }
     this.host.commands.get(stored.run.id)?.abort();
@@ -387,9 +393,9 @@ export class TeamRetention {
     }
   }
   async retire(stored: Stored) {
-    // Trace caps apply to replay runs too, and to traces recorded before the setting was turned off. The measurement
-    // runs in the background, where idle() waits for it.
-    const traces = this.traces.settle(stored.run, this.traceHost());
+    // Trace caps apply to replay runs too, and to traces recorded before the setting was turned off; a host that never
+    // kept traces skips this. The measurement runs in the background, where idle() waits for it.
+    const traces = this.traces.inUse(this.host.config) ? this.traces.settle(stored.run, this.traceHost()) : undefined;
     if (traces) { this.removalTasks.add(traces); void traces.finally(() => this.removalTasks.delete(traces)); }
     if (stored.run.replay) return;
     try {

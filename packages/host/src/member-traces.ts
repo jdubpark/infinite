@@ -52,6 +52,8 @@ const manifestSchema = z.object({
 type Manifest = z.infer<typeof manifestSchema>;
 
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+/** State directories whose traces root this process found when its team service started, or created since. */
+const knownRoots = new Set<string>();
 /** Errors from this module name no path, so they can reach the host log. */
 const traceError = (code: string, message: string) => Object.assign(new Error(message), { code });
 const errorCode = (error: unknown) => (error as NodeJS.ErrnoException | undefined)?.code ?? "unknown";
@@ -111,6 +113,7 @@ export function prepareMemberTrace(config: Pick<Config, "stateDir" | "teams">, s
     const root = tracesDirectory(config.stateDir), directory = join(root, team.runId, team.memberId);
     for (const path of [join(config.stateDir, "teams"), root, join(root, team.runId), directory]) {
       try { mkdirSync(path, { mode: 0o700 }); } catch (error) { if (errorCode(error) !== "EEXIST") throw error; }
+      if (path === root) knownRoots.add(config.stateDir);
       // Opens the directory without following a link, so a link here fails.
       chmodDirectoryNoFollow(path, 0o700);
       if (!lstatSync(path).isDirectory()) throw traceError("trace-path-unsafe", "A trace directory is a link or not a directory.");
@@ -241,6 +244,18 @@ type Outcome = "settled" | "running";
  * is deleted. A pass that ends after its run was forgotten records nothing.
  */
 export class MemberTraces {
+  /** Looks for the traces root once, when the team service starts. */
+  constructor(private readonly stateDir: string) {
+    try { lstatSync(tracesDirectory(stateDir)); knownRoots.add(stateDir); }
+    catch (error) { if (errorCode(error) !== "ENOENT") knownRoots.add(stateDir); }
+  }
+  /**
+   * Whether any trace work can be due: the setting is on, or a traces root was found at start or created since. A host
+   * that never kept traces does none, and one that did keeps settling and removing them after the setting is off.
+   */
+  inUse(config: Pick<Config, "teams">) {
+    return config.teams?.memberTraces?.enabled === true || knownRoots.has(this.stateDir);
+  }
   private readonly looked = new WeakMap<TeamRun, string>();
   private readonly waits = new Map<string, Map<string, { at: number; failures: number }>>();
   private readonly passes = new Map<string, Promise<void>>();

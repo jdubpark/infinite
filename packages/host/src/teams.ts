@@ -406,6 +406,7 @@ export class TeamService {
     this.directory = join(config.stateDir, "teams");
     this.limits = new ProviderLimits(join(config.stateDir, "provider-limits.sealed"), key);
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
+    this.retention.findMemberTraces();
     const retiredPath = join(this.directory, "retired.sealed");
     try {
       const retired = unseal<unknown>(key, "team:retired", readFileSync(retiredPath, "utf8"));

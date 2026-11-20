@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, closeSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { readConfig } from "../packages/host/src/config.js";
 import { Manager } from "../packages/host/src/manager.js";
 import { prepareMemberTrace } from "../packages/host/src/member-traces.js";
@@ -511,4 +512,63 @@ test("trace bookkeeping holds nothing for members without a trace directory, and
     assert.equal(existsSync(traces(f.config.stateDir, f.run.id)), false);
     assert.equal(traceEntries(teams, f.run.id), 0, "nothing of the deleted run is kept");
   } finally { teams.close(); f.close(); }
+});
+
+const require = createRequire(import.meta.url);
+const SPIED = ["access", "chmod", "existsSync", "lstat", "lstatSync", "mkdir", "mkdirSync", "open", "openSync", "readdir", "readdirSync",
+  "readFile", "readFileSync", "realpath", "realpathSync", "rename", "renameSync", "rm", "rmSync", "rmdir", "rmdirSync", "stat",
+  "statSync", "unlink", "unlinkSync", "writeFile", "writeFileSync"];
+/** Counts calls into node:fs and node:fs/promises whose path is under `root` while `body` runs. */
+async function fsCallsUnder(root: string, body: () => Promise<void>) {
+  const originals: [Record<string, unknown>, string, unknown][] = [];
+  let calls = 0;
+  for (const module of [require("node:fs"), require("node:fs/promises")] as Record<string, unknown>[]) {
+    for (const name of SPIED) {
+      const original = module[name];
+      if (typeof original !== "function") continue;
+      const spy = Object.assign(function (this: unknown, ...args: unknown[]) {
+        if (String(args[0]).startsWith(root)) calls++;
+        return (original as (...values: unknown[]) => unknown).apply(this, args);
+      }, original);
+      originals.push([module, name, original]);
+      module[name] = spy;
+    }
+  }
+  syncBuiltinESMExports();
+  try { await body(); } finally {
+    for (const [module, name, original] of originals) module[name] = original;
+    syncBuiltinESMExports();
+  }
+  return calls;
+}
+
+test("a host that never kept traces does no trace work in a tick or a deletion; one that did still removes them", async () => {
+  const never = schedulerFixture();
+  never.run.status = "cancelled";
+  never.run.members.forEach(member => { member.status = "stopped"; });
+  never.writeTeam();
+  const neverTeams = never.openTeam();
+  try {
+    const calls = await fsCallsUnder(traces(never.config.stateDir), async () => {
+      const internals = internal(neverTeams);
+      await internals.step(internals.records.get(never.run.id));
+      await neverTeams.idle();
+      await neverTeams.removeRun(never.run.id);
+    });
+    assert.equal(existsSync(join(never.config.stateDir, "teams", `${never.run.id}.sealed`)), false, "the run was deleted");
+    assert.equal(calls, 0, "no filesystem call touched the traces root");
+  } finally { neverTeams.close(); never.close(); }
+
+  // Traces kept while the setting was on, and a host started after it was removed: the root found at start keeps
+  // deletion working.
+  const once = schedulerFixture();
+  once.run.status = "cancelled";
+  once.run.members.forEach(member => { member.status = "stopped"; });
+  writeTrace(traces(once.config.stateDir, once.run.id, once.run.members[0]!.memberId), 64);
+  once.writeTeam();
+  const onceTeams = once.openTeam();
+  try {
+    await onceTeams.removeRun(once.run.id);
+    assert.equal(existsSync(traces(once.config.stateDir, once.run.id)), false, "the run's traces went with it");
+  } finally { onceTeams.close(); once.close(); }
 });

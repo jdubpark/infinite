@@ -313,13 +313,15 @@ struct TeamResumeFailure: Equatable {
         let generation = connectionGeneration, visibility = displayGeneration
         do {
             // The poll names the version of the rows held: an unchanged list answers with its version alone.
-            let answer = try await client.request(sessionList.path)
+            // Refreshes overlap (the poll and an action's refresh), so each answer goes back with the read it answers.
+            let read = sessionList.begin()
+            let answer = try await client.request(read.path)
             guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
-            var outcome = sessionList.accept(answer)
+            var outcome = sessionList.accept(answer, to: read)
             if outcome == .unreadable {
                 let plain = try await client.request("/sessions")
                 guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
-                sessionList.acceptPlain(plain); outcome = .replaced
+                outcome = sessionList.acceptPlain(plain, to: read)
             }
             if outcome == .replaced {
                 let next = sessionList.rows.map(AgentSession.init).sorted {

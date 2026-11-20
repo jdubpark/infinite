@@ -335,7 +335,8 @@ export class CmuxSessions {
       // An outage is not evidence that an authenticated Feed decision closed.
       // Keep it latched in durable state until a successful observation resolves it.
       if (status !== "unavailable" || !record.prompt?.feed) record.prompt = undefined;
-      record.attention = applyLifecycle(record.attention, status as "exited" | "unavailable" | "recording-error", at);
+      // Entering the state records its time once; a later observation of the same state changes nothing, so a listing reads the same.
+      if (record.attention.state !== status) record.attention = applyLifecycle(record.attention, status as "exited" | "unavailable" | "recording-error", at);
     } else {
       if (pending?.fingerprint !== record.prompt?.fingerprint) {
         if (record.prompt) this.append(record, "signal", { kind: "prompt-closed", promptId: record.prompt.id, reason: "vanished", source: "host", provider: record.session.provider });
@@ -364,7 +365,8 @@ export class CmuxSessions {
     const status = record.recordingError ? "recording-error" : record.session.status;
     return {
       status, pid: record.pid, seq: this.journals.get(record.session.id)?.seq ?? 0, screen: record.screen,
-      attention: record.recordingError ? applyLifecycle(record.attention, "recording-error", now()) : record.attention,
+      // The record holds no time for the error, so the last recorded activity stands for it, never the time of the read.
+      attention: record.recordingError ? applyLifecycle(record.attention, "recording-error", record.attention.lastActivityAt) : record.attention,
       capabilities: { terminalSnapshot: 1, inputControl: 1 }, control: this.currentControl(record),
       runtime: record.session.runtime,
       ...(record.nativeId ? { nativeSession: { id: record.nativeId, source: "hook" as const } } : {}),
@@ -385,7 +387,7 @@ export class CmuxSessions {
       // Keep managed workers visible when cmux is overloaded, without presenting
       // a cached cmux observation as a connected runtime or valid input lease.
       return rows().map(row => ({ ...row, status: "unavailable" as const, control: null,
-        attention: applyLifecycle(row.attention, "unavailable", now()) }));
+        attention: applyLifecycle(row.attention, "unavailable", row.attention.lastActivityAt) }));
     });
   }
 

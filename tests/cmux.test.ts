@@ -218,6 +218,10 @@ test("cmux refuses unknown foreground, stale surfaces, and dialog bypasses", { t
   assert.equal(f.mutations().length, 0);
   f.setState({ offline: true });
   assert.equal((await f.sessions.get(f.id)).status, "unavailable");
+  // An outage that lasts reads the same on every poll: the row keeps the time it became unavailable.
+  const during = JSON.stringify(await f.sessions.list());
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(JSON.stringify(await f.sessions.list()), during);
   f.config.cmux!.command = join(f.root, "missing-cmux");
   await f.restart();
   assert.equal((await f.sessions.get(f.id)).status, "unavailable");

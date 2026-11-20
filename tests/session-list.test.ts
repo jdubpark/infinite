@@ -133,3 +133,20 @@ test("the client reader keeps the newer rows when two overlapping reads answer o
   assert.deepEqual(await next, [{ id: "new" }]);
   assert.deepEqual(asked, ["/sessions?since=", "/sessions?since=", "/sessions?since=v2"], "the next read names the newer version");
 });
+
+test("an unchanged answer stands only for the version held when it arrives", async () => {
+  const read = sessionListReader<{ id: string }>(), asked: string[] = [], answer: ((body: unknown) => void)[] = [];
+  const get = (path: string) => { asked.push(path); return new Promise<unknown>(resolve => answer.push(resolve)); };
+  const first = read(get);
+  answer[0]!({ version: "v1", sessions: [{ id: "one" }] });
+  await first;
+  // Two reads ask with v1. The first answers with v2's rows; the second, later, says v1 is unchanged.
+  const a = read(get), b = read(get);
+  answer[1]!({ version: "v2", sessions: [{ id: "two" }] });
+  assert.deepEqual(await a, [{ id: "two" }]);
+  answer[2]!({ version: "v1", unchanged: true });
+  await new Promise(resolve => setImmediate(resolve));
+  answer[3]?.({ sessions: [{ id: "two" }] });
+  assert.deepEqual(await b, [{ id: "two" }], "v1's rows never come back once v2's are held");
+  assert.deepEqual(asked, ["/sessions?since=", "/sessions?since=v1", "/sessions?since=v1", "/sessions"], "a stale unchanged is followed by a full read");
+});

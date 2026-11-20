@@ -1,11 +1,16 @@
 // Codex members' native traces (INF-337): where the host keeps them, the caps it enforces after a member's session
 // exits, and their removal with the run. See docs/teams.md "Member traces".
 //
-// Links: each trace directory is checked with lstat up to the traces root, and with realpath, before the host reads or
-// changes it, and no walk follows a link: a link is one entry, measured and unlinked as itself. Node has no openat, so a
-// process of the host's own account can still swap a checked directory for a link before the removal that follows.
-// Such a process can already change every file of that account, so this is no escalation; the checks keep the host
-// from following a link by accident.
+// Links: each trace directory is checked with lstat from the traces root down, and with realpath, before the host reads
+// or changes it. A run's or member's directory that is a link or not a directory is unlinked as itself, and a walk
+// never descends into a link: a link is one entry, measured and unlinked as itself, and its target is left alone.
+// The residual: Node has no openat, so every later operation names its path again. Another process of the host's own
+// account can swap a checked directory for a link before a read, walk, create, rename, chmod or removal resolves it as
+// an ancestor. Such a process can already change every file of that account, so this is no escalation; the checks keep
+// the host from following a link by accident.
+//
+// Caps: in the one-account launch model a member can edit its own manifest (caps, bytes, state), which can change its
+// own settlement and a sibling's run-cap decision. That reaches nothing beyond its own trace; the caps are cooperative.
 import { closeSync, constants, fchmodSync, lstatSync, mkdirSync, openSync, realpathSync, renameSync, writeSync } from "node:fs";
 import { lstat, open, readdir, realpath, rename, rmdir, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";

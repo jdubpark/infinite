@@ -509,13 +509,27 @@ default. Turning it on needs both caps, in bytes; the configuration refuses
 - **Caps.** The caps in force when a member starts are written into its
   manifest and apply to that trace. Once the member's session has exited,
   whatever the member's status (a project manager waiting on the owner's answer
-  has exited too), a scheduler pass measures the trace. A trace over
-  `memberBytes`, or one that would take the run's kept traces over `runBytes`,
-  is removed. The size counts every entry in the member's directory except the
-  manifest itself. A running session is not measured, so its trace can pass the
-  caps until it exits. A measurement or removal that fails is tried again on a
-  later pass, after a wait that doubles from 30 seconds up to 30 minutes, and
-  the host log names the run and member, not the path.
+  has exited too), a scheduler pass measures the trace. A session that still
+  answers as live is live even when its metadata is missing; it counts as
+  exited only when it says so, or when it neither answers nor exists. A trace
+  over `memberBytes`, or one that would take the run's kept traces over
+  `runBytes`, is removed. The size is the sum of the `lstat` sizes of the
+  entries below the member's directory that are not directories, links
+  included. Directories are walked, not counted. The manifest itself is neither
+  counted nor removed. A leftover temporary manifest file is removed without
+  being counted. A running session is not measured, so its trace can pass the
+  caps until it exits. Codex writes made after a trace was settled are not
+  measured again; they are removed with the run. A measurement or removal that
+  fails, including a manifest of the member or of a sibling that cannot be
+  read, is tried again on a later pass, after a wait that doubles from 30
+  seconds up to 30 minutes. No cap is decided while a sibling's usage is
+  unknown. The host log names the run and member, not the path.
+- **Cooperative caps.** In the one-account case a member can edit its own
+  manifest: its caps, bytes and state. That can change its own settlement and a
+  sibling's run-cap decision. It gives the member no access beyond what it
+  already has over its own trace, but the caps are cooperative, not
+  tamper-proof. A missing manifest, or one that is not a valid regular file, is
+  left alone and its trace is not measured.
 - **Manifest.** Each member's directory keeps `infinite-trace.json` (mode
   `0600`): the state (`recording`, `kept`, `removing`, `removed` or
   `not-recorded`), the caps recorded at the start, the bytes measured, the time,
@@ -528,16 +542,25 @@ default. Turning it on needs both caps, in bytes; the configuration refuses
   sessions exit, and are removed with their runs.
 - **Deletion.** Removing a run (the owner's delete, cancelled-run retention, or
   forgetting a replay) removes `teams/traces/RUN_ID`. Workspace retention leaves
-  traces alone: they last as long as the run record.
-- **Links.** The host checks every level from `teams/traces` down to a member's
-  directory with `lstat`, refuses a link or a non-directory, and requires the
-  directory to resolve to where it should be, before it reads or changes it. It
-  never follows a link inside a trace: a link counts as one entry and is
-  removed as itself, never its target. A run whose trace directory is a link is
-  not removed; its record is kept. Node has no `openat`, so a process running as
-  the host's own account could still swap a checked directory for a link before
-  the removal that follows. Such a process can already change every file of that
-  account, so this gives it nothing new.
+  traces alone: they last as long as the run record. A record removal that
+  fails is tried again after the retention backoff, not on every scheduler
+  pass.
+- **Links.** Before it reads or changes a trace directory, the host checks each
+  level from `teams/traces` down with `lstat` and requires the directory to
+  resolve to its place under the traces root. A run's or member's trace
+  directory that is a link, or not a directory, is unlinked as itself and
+  logged by id; its target is preserved, and the run's removal goes on. A link
+  inside a trace counts as one entry and is unlinked as itself; a linked
+  directory's contents are not walked or removed. A traces root that is a link
+  is left alone: no trace is prepared under it, and run removal logs that it did
+  not look there. The checks leave one residual. Node has no `openat`, so the
+  host names each path again for every later operation. Another process
+  running as the host's own account could swap a checked directory for a link
+  before such an operation resolves it as an ancestor. That applies to reads,
+  walks, creates, renames, `chmod` and removal alike. Such a process can
+  already change every file of that account, so this gives it nothing new.
+- **Known limit.** Deciding the run cap reads every sibling's manifest in the
+  run, so settling one member costs a scan of the run's member directories.
 - **Routines.** The setting is outside the routine approval digest: it changes
   what the host keeps, not a routine's work.
 

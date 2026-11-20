@@ -506,20 +506,38 @@ default. Turning it on needs both caps, in bytes; the configuration refuses
   members get nothing. The directory is outside every workspace and scratch
   directory, and no API route, run or member field, team view, context file or
   prompt names it.
-- **Caps.** When a member has ended (stopped, or reported with its exit
-  confirmed), a scheduler pass measures its trace once. A trace over
+- **Caps.** The caps in force when a member starts are written into its
+  manifest and apply to that trace. Once the member's session has exited,
+  whatever the member's status (a project manager waiting on the owner's answer
+  has exited too), a scheduler pass measures the trace. A trace over
   `memberBytes`, or one that would take the run's kept traces over `runBytes`,
-  is removed. A running member is not measured, so its trace can pass the caps
-  until it ends.
+  is removed. The size counts every entry in the member's directory except the
+  manifest itself. A running session is not measured, so its trace can pass the
+  caps until it exits. A measurement or removal that fails is tried again on a
+  later pass, after a wait that doubles from 30 seconds up to 30 minutes, and
+  the host log names the run and member, not the path.
 - **Manifest.** Each member's directory keeps `infinite-trace.json` (mode
-  `0600`): the state (`kept`, `removed` or `not-recorded`), the bytes measured,
-  the time, the reason (`member-cap`, `run-cap` or `separate-account`), and
+  `0600`): the state (`recording`, `kept`, `removing`, `removed` or
+  `not-recorded`), the caps recorded at the start, the bytes measured, the time,
+  the reason (`member-cap`, `run-cap` or `separate-account`), and
   `sessionRecord: "kept"`, because the Codex session record is never touched.
-  It holds no trace content.
+  It holds no trace content. A trace over a cap is marked `removing` first and
+  `removed` only after its files are gone.
+- **Turning it off.** Turning the setting off stops new traces only. Traces
+  recorded before keep their recorded caps, are still measured when their
+  sessions exit, and are removed with their runs.
 - **Deletion.** Removing a run (the owner's delete, cancelled-run retention, or
-  forgetting a replay) removes `teams/traces/RUN_ID`, also after the setting was
-  turned off. Workspace retention leaves traces alone: they last as long as the
-  run record. Turning the setting off stops new traces only.
+  forgetting a replay) removes `teams/traces/RUN_ID`. Workspace retention leaves
+  traces alone: they last as long as the run record.
+- **Links.** The host checks every level from `teams/traces` down to a member's
+  directory with `lstat`, refuses a link or a non-directory, and requires the
+  directory to resolve to where it should be, before it reads or changes it. It
+  never follows a link inside a trace: a link counts as one entry and is
+  removed as itself, never its target. A run whose trace directory is a link is
+  not removed; its record is kept. Node has no `openat`, so a process running as
+  the host's own account could still swap a checked directory for a link before
+  the removal that follows. Such a process can already change every file of that
+  account, so this gives it nothing new.
 - **Routines.** The setting is outside the routine approval digest: it changes
   what the host keeps, not a routine's work.
 

@@ -1,11 +1,18 @@
-// Codex members' native traces (INF-337): where the host keeps them, the caps it enforces after a member ends, and
-// their removal with the run. See docs/teams.md "Member traces".
-import { mkdirSync, renameSync, writeFileSync } from "node:fs";
-import { lstat, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+// Codex members' native traces (INF-337): where the host keeps them, the caps it enforces after a member's session
+// exits, and their removal with the run. See docs/teams.md "Member traces".
+//
+// Links: each trace directory is checked with lstat up to the traces root, and with realpath, before the host reads or
+// changes it, and no walk follows a link: a link is one entry, measured and unlinked as itself. Node has no openat, so a
+// process of the host's own account can still swap a checked directory for a link before the removal that follows.
+// Such a process can already change every file of that account, so this is no escalation; the checks keep the host
+// from following a link by accident.
+import { closeSync, constants, fchmodSync, lstatSync, mkdirSync, openSync, realpathSync, renameSync, writeSync } from "node:fs";
+import { lstat, open, readdir, realpath, rename, rmdir, unlink } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { z } from "zod";
 import type { AgentProfile, Config, Provider } from "./types.js";
-import type { TeamAssignment, TeamMember, TeamRun } from "./team-types.js";
+import type { TeamAssignment, TeamRun } from "./team-types.js";
 import { chmodDirectoryNoFollow } from "./team-workspace.js";
 
 const capBytes = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
@@ -16,14 +23,22 @@ export const memberTraceSettingsSchema = z.discriminatedUnion("enabled", [
 ]);
 export type MemberTraceSettings = z.infer<typeof memberTraceSettingsSchema>;
 
-/** The host's own file in a member's trace directory. It holds no trace content. */
+/** The host's own file in a member's trace directory. It holds no trace content. Every other entry counts as trace. */
 const MANIFEST = "infinite-trace.json";
+/** A manifest write in progress, under a random name. One left by an interrupted write is removed when found. */
+const TEMPORARY = /^\.infinite-trace\.json\.[0-9a-f-]{36}\.tmp$/;
+const MANIFEST_MAX_BYTES = 4096;
+/**
+ * `recording` from the member's start, with the caps then in force; once its session exited, `kept`, or `removing`
+ * then `removed`; `not-recorded` for a launch the host could not give a private directory.
+ */
 const manifestSchema = z.object({
   version: z.literal(1),
-  /** The member session this entry describes. A later session of the same member is measured again. */
-  sessionId: z.string(),
-  state: z.enum(["kept", "removed", "not-recorded"]),
-  bytes: z.number().int().min(0),
+  /** The member session this entry describes. */
+  sessionId: z.string().min(1).max(128),
+  state: z.enum(["recording", "kept", "removing", "removed", "not-recorded"]),
+  caps: z.object({ memberBytes: capBytes, runBytes: capBytes }).strict().optional(),
+  bytes: z.number().int().min(0).optional(),
   at: z.string(),
   reason: z.enum(["member-cap", "run-cap", "separate-account"]).optional(),
   /** The trace never replaces Codex's own session record, which stays where Codex keeps it. */
@@ -32,132 +47,204 @@ const manifestSchema = z.object({
 type Manifest = z.infer<typeof manifestSchema>;
 
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+/** Errors from this module name no path, so they can reach the host log. */
+const traceError = (code: string, message: string) => Object.assign(new Error(message), { code });
+const errorCode = (error: unknown) => (error as NodeJS.ErrnoException | undefined)?.code ?? "unknown";
 const tracesDirectory = (stateDir: string) => join(stateDir, "teams", "traces");
-function runDirectory(stateDir: string, runId: string) {
-  if (!SAFE_ID.test(runId)) throw new Error("A trace directory needs a path-safe run id.");
-  return join(tracesDirectory(stateDir), runId);
-}
-function memberDirectory(stateDir: string, runId: string, memberId: string) {
-  if (!SAFE_ID.test(memberId)) throw new Error("A trace directory needs a path-safe member id.");
-  return join(runDirectory(stateDir, runId), memberId);
-}
 const separateAccount = (profile: AgentProfile) => /(^|\/)sudo$/.test(profile.command);
 const manifestText = (manifest: Manifest) => `${JSON.stringify(manifestSchema.parse(manifest))}\n`;
+const temporaryName = () => `.${MANIFEST}.${randomUUID()}.tmp`;
+const NEW_FILE = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
+
+/**
+ * Whether `traces/<parts...>` exists. The traces root and each level below it must be a directory and no link, and
+ * the last must resolve to the path built from the real state directory; otherwise this throws.
+ */
+async function realDirectory(stateDir: string, parts: string[]) {
+  let path = tracesDirectory(stateDir);
+  for (const part of ["", ...parts]) {
+    if (part) path = join(path, part);
+    let info;
+    try { info = await lstat(path); } catch (error) { if (errorCode(error) === "ENOENT") return false; throw error; }
+    if (info.isSymbolicLink() || !info.isDirectory()) throw traceError("trace-path-unsafe", "A trace directory is a link or not a directory.");
+  }
+  if (await realpath(path) !== join(await realpath(stateDir), "teams", "traces", ...parts))
+    throw traceError("trace-path-unsafe", "A trace directory resolves outside the host's traces root.");
+  return true;
+}
 
 /**
  * Before a team member's launch: the directory that Codex's native trace recorder writes to, or undefined. Only a Codex
  * member of a team run gets one, and only with the setting on. Each level below the state directory is created 0700 for
- * the host account. A launch under another account (a sudo profile) could not write there, and a trace that account
- * wrote would be readable by every session of it, so it gets no directory to write to: its manifest says
- * `not-recorded`. Never throws; a member whose directory cannot be prepared starts without a trace.
+ * the host account, and a `recording` manifest keeps the caps in force, so they still apply after the setting is turned
+ * off. A launch under another account (a sudo profile) could not write there, and a trace that account wrote would be
+ * readable by every session of it, so it gets no directory to write to: its manifest says `not-recorded`. Never throws;
+ * a member whose directory cannot be prepared starts without a trace.
  */
 export function prepareMemberTrace(config: Pick<Config, "stateDir" | "teams">, sessionId: string, provider: Provider,
   team: TeamAssignment | undefined, profile: AgentProfile): string | undefined {
-  if (!config.teams?.memberTraces?.enabled || provider !== "codex" || !team || team.role === "mission-coordinator") return undefined;
+  const settings = config.teams?.memberTraces;
+  if (!settings?.enabled || provider !== "codex" || !team || team.role === "mission-coordinator") return undefined;
   try {
-    const directory = memberDirectory(config.stateDir, team.runId, team.memberId);
-    for (const path of [join(config.stateDir, "teams"), tracesDirectory(config.stateDir), runDirectory(config.stateDir, team.runId), directory]) {
-      try { mkdirSync(path, { mode: 0o700 }); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    if (!SAFE_ID.test(team.runId) || !SAFE_ID.test(team.memberId)) throw traceError("trace-id-unsafe", "A trace directory needs path-safe ids.");
+    const root = tracesDirectory(config.stateDir), directory = join(root, team.runId, team.memberId);
+    for (const path of [join(config.stateDir, "teams"), root, join(root, team.runId), directory]) {
+      try { mkdirSync(path, { mode: 0o700 }); } catch (error) { if (errorCode(error) !== "EEXIST") throw error; }
+      // Opens the directory without following a link, so a link here fails.
       chmodDirectoryNoFollow(path, 0o700);
+      if (!lstatSync(path).isDirectory()) throw traceError("trace-path-unsafe", "A trace directory is a link or not a directory.");
     }
-    if (!separateAccount(profile)) return directory;
-    const file = join(directory, MANIFEST);
-    writeFileSync(`${file}.tmp`, manifestText({ version: 1, sessionId, state: "not-recorded", bytes: 0, at: new Date().toISOString(),
-      reason: "separate-account", sessionRecord: "kept" }), { mode: 0o600 });
-    renameSync(`${file}.tmp`, file);
+    if (realpathSync(directory) !== join(realpathSync(config.stateDir), "teams", "traces", team.runId, team.memberId))
+      throw traceError("trace-path-unsafe", "A trace directory resolves outside the host's traces root.");
+    const recording = !separateAccount(profile), at = new Date().toISOString();
+    const manifest: Manifest = recording
+      ? { version: 1, sessionId, state: "recording", caps: { memberBytes: settings.memberBytes, runBytes: settings.runBytes }, at, sessionRecord: "kept" }
+      : { version: 1, sessionId, state: "not-recorded", bytes: 0, at, reason: "separate-account", sessionRecord: "kept" };
+    const temporary = join(directory, temporaryName()), fd = openSync(temporary, NEW_FILE, 0o600);
+    try { fchmodSync(fd, 0o600); writeSync(fd, manifestText(manifest)); } finally { closeSync(fd); }
+    renameSync(temporary, join(directory, MANIFEST));
+    return recording ? directory : undefined;
   } catch (error) {
-    console.warn("A Codex member's trace directory could not be prepared; the member starts without a trace.", error);
+    console.warn(`Member ${team.memberId} of team ${team.runId} starts without a trace: its trace directory could not be prepared (${errorCode(error)}).`);
+    return undefined;
   }
-  return undefined;
+}
+
+const ignoreMissing = (error: unknown) => { if (errorCode(error) !== "ENOENT") throw error; };
+/**
+ * The bytes of every entry below `directory` that is not a directory, by lstat, without following a link; with
+ * `remove`, removes each entry. With `manifest`, the directory's own regular-file manifest is neither counted nor
+ * removed, and a regular file left by an interrupted manifest write is removed without being counted.
+ */
+async function walkTrace(directory: string, remove: boolean, manifest: boolean) {
+  let total = 0;
+  const visit = async (current: string, top: boolean) => {
+    for (const name of await readdir(current)) {
+      const path = join(current, name);
+      let info;
+      try { info = await lstat(path); } catch (error) { if (errorCode(error) === "ENOENT") continue; throw error; }
+      if (top && manifest && info.isFile() && name === MANIFEST) continue;
+      if (top && manifest && info.isFile() && TEMPORARY.test(name)) { await unlink(path).catch(ignoreMissing); continue; }
+      if (info.isDirectory()) {
+        await visit(path, false);
+        if (remove) await rmdir(path);
+      } else {
+        total += info.size;
+        if (remove) await unlink(path).catch(ignoreMissing);
+      }
+    }
+  };
+  await visit(directory, true);
+  return total;
 }
 
 /** Removes a run's member traces. A run without traces, including one whose id could never name a directory, is a no-op. */
 export async function removeMemberTraces(stateDir: string, runId: string) {
-  if (SAFE_ID.test(runId)) await rm(runDirectory(stateDir, runId), { recursive: true, force: true });
+  if (!SAFE_ID.test(runId) || !await realDirectory(stateDir, [runId])) return;
+  const run = join(tracesDirectory(stateDir), runId);
+  await walkTrace(run, true, false);
+  await rmdir(run);
 }
 
+/** The manifest, opened without following a link. Undefined when there is none or it is no manifest. */
 async function readManifest(directory: string): Promise<Manifest | undefined> {
-  try { return manifestSchema.parse(JSON.parse(await readFile(join(directory, MANIFEST), "utf8"))); }
-  catch { return undefined; }
+  let file;
+  try { file = await open(join(directory, MANIFEST), constants.O_RDONLY | constants.O_NOFOLLOW); }
+  catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
+  try {
+    const info = await file.stat();
+    if (!info.isFile() || info.size > MANIFEST_MAX_BYTES) throw traceError("trace-manifest-invalid", "A trace manifest is not a small regular file.");
+    let parsed: unknown;
+    try { parsed = JSON.parse(await file.readFile("utf8")); } catch { return undefined; }
+    const result = manifestSchema.safeParse(parsed);
+    return result.success ? result.data : undefined;
+  } finally { await file.close(); }
 }
 async function writeManifest(directory: string, manifest: Manifest) {
-  const file = join(directory, MANIFEST);
-  await writeFile(`${file}.tmp`, manifestText(manifest), { mode: 0o600 });
-  await rename(`${file}.tmp`, file);
+  const temporary = join(directory, temporaryName()), file = await open(temporary, NEW_FILE, 0o600);
+  try { await file.chmod(0o600); await file.writeFile(manifestText(manifest)); } finally { await file.close(); }
+  await rename(temporary, join(directory, MANIFEST));
 }
-/** Bytes of the regular files Codex wrote, without following links and without the manifest. */
-async function traceBytes(directory: string) {
-  let total = 0;
-  const pending = [directory];
-  while (pending.length) {
-    const current = pending.pop()!;
-    for (const entry of await readdir(current, { withFileTypes: true })) {
-      if (current === directory && entry.name.startsWith(MANIFEST)) continue;
-      const path = join(current, entry.name);
-      if (entry.isDirectory()) pending.push(path);
-      else if (entry.isFile()) total += (await lstat(path)).size;
-    }
-  }
-  return total;
-}
-async function clearTrace(directory: string) {
-  for (const name of await readdir(directory))
-    if (!name.startsWith(MANIFEST)) await rm(join(directory, name), { recursive: true, force: true });
-}
+/** Bytes of the run's traces in state `kept`, other than one member's. */
 async function keptBytes(run: string, exceptMemberId: string) {
   let total = 0;
-  for (const name of await readdir(run)) {
-    if (name === exceptMemberId) continue;
-    const manifest = await readManifest(join(run, name));
-    if (manifest?.state === "kept") total += manifest.bytes;
+  for (const entry of await readdir(run, { withFileTypes: true })) {
+    if (entry.name === exceptMemberId || !entry.isDirectory()) continue;
+    const manifest = await readManifest(join(run, entry.name)).catch(() => undefined);
+    if (manifest?.state === "kept") total += manifest.bytes ?? 0;
   }
   return total;
 }
 
-/** A member whose process has ended: stopped, or reported with its exit confirmed. */
-const memberEnded = (member: TeamMember) => member.status === "stopped" || (member.status === "reported" && Boolean(member.exitConfirmedAt));
+/** How long a trace whose session still runs waits for the next look, and the waits after a failure. */
+const EXIT_RECHECK_MS = 5_000, FAILURE_RETRY_MS = 30_000, FAILURE_RETRY_MAX_MS = 30 * 60_000;
+export interface TraceSettlementHost {
+  stateDir: string;
+  /** Whether a session has exited, asked of the session itself: a member's status says nothing about its process. */
+  exited(sessionId: string): Promise<boolean>;
+  now(): number;
+}
+type Outcome = "settled" | "running";
 
 /**
  * The caps, enforced after the fact because Codex writes the files itself. The scheduler tick calls `settle` for each
- * run; it measures each ended Codex member's trace once per member session, one run at a time, outside the team
- * mutation queue. A trace over the member cap, or one that would take the run's kept traces over the run cap, is
- * removed after its manifest records the measurement and the reason.
+ * run, whatever the setting is now: a trace keeps the caps its manifest recorded when its member started. Members are
+ * looked at one run at a time, outside the team mutation queue, once each has started. A trace whose session still
+ * runs is looked at again a few seconds later. Once that session exited, a trace over the member cap, or one that would
+ * take the run's kept traces over the run cap, is marked `removing`, removed, and only then marked `removed`. A member
+ * session counts as settled only after that work succeeded; a failure is retried on a later tick, after a wait that
+ * doubles up to a bound.
  */
 export class MemberTraces {
   private readonly settled = new Set<string>();
+  private readonly retryAt = new Map<string, { at: number; failures: number }>();
   private readonly running = new Set<string>();
-  settle(config: Pick<Config, "stateDir" | "teams">, run: TeamRun): Promise<void> | undefined {
-    const settings = config.teams?.memberTraces;
-    if (!settings?.enabled || this.running.has(run.id)) return undefined;
-    const ended = run.members
-      .filter(member => (member.provider ?? run.provider) === "codex" && memberEnded(member) && !this.settled.has(`${run.id}/${member.memberId}/${member.sessionId}`))
-      .map(member => ({ memberId: member.memberId, sessionId: member.sessionId }));
-    if (!ended.length) return undefined;
+  settle(run: TeamRun, host: TraceSettlementHost): Promise<void> | undefined {
+    if (this.running.has(run.id)) return undefined;
+    const now = host.now();
+    // A member has its start time only after its launch returned, so by then its directory was prepared if ever.
+    const due = run.members.filter(member => member.startedAt)
+      .map(member => ({ memberId: member.memberId, key: `${run.id}/${member.memberId}/${member.sessionId}` }))
+      .filter(({ key }) => !this.settled.has(key) && (this.retryAt.get(key)?.at ?? 0) <= now);
+    if (!due.length) return undefined;
     this.running.add(run.id);
-    return this.settleRun(config.stateDir, run.id, ended, settings)
-      .catch(error => console.warn("A Codex member's trace could not be measured; it is measured again after a host restart.", error))
-      .finally(() => this.running.delete(run.id));
-  }
-  private async settleRun(stateDir: string, runId: string, members: { memberId: string; sessionId: string }[], caps: { memberBytes: number; runBytes: number }) {
-    const run = runDirectory(stateDir, runId);
-    for (const { memberId, sessionId } of members) {
-      const key = `${runId}/${memberId}/${sessionId}`, directory = memberDirectory(stateDir, runId, memberId);
-      // Marked first: a failure is not retried on every tick, only after a restart.
-      this.settled.add(key);
-      const current = await readManifest(directory);
-      if (current?.sessionId === sessionId) {
-        // A removal that stopped part way is finished.
-        if (current.state === "removed") await clearTrace(directory);
-        continue;
+    return (async () => {
+      let present: boolean | Error;
+      try { present = SAFE_ID.test(run.id) && await realDirectory(host.stateDir, [run.id]); } catch (error) { present = error as Error; }
+      for (const { memberId, key } of due) {
+        try {
+          if (present instanceof Error) throw present;
+          const outcome: Outcome = present && SAFE_ID.test(memberId) ? await this.settleMember(host, run.id, memberId) : "settled";
+          if (outcome === "settled") { this.settled.add(key); this.retryAt.delete(key); }
+          else this.retryAt.set(key, { at: host.now() + EXIT_RECHECK_MS, failures: 0 });
+        } catch (error) {
+          const failures = (this.retryAt.get(key)?.failures ?? 0) + 1;
+          this.retryAt.set(key, { at: host.now() + Math.min(FAILURE_RETRY_MAX_MS, FAILURE_RETRY_MS * 2 ** (failures - 1)), failures });
+          console.warn(`The trace of member ${memberId} in team ${run.id} could not be settled (${errorCode(error)}); the host tries again later.`);
+        }
       }
-      let bytes: number;
-      try { bytes = await traceBytes(directory); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
-      const reason = bytes > caps.memberBytes ? "member-cap" as const
-        : await keptBytes(run, memberId) + bytes > caps.runBytes ? "run-cap" as const : undefined;
-      await writeManifest(directory, { version: 1, sessionId, state: reason ? "removed" : "kept", bytes, at: new Date().toISOString(),
-        ...(reason ? { reason } : {}), sessionRecord: "kept" });
-      if (reason) await clearTrace(directory);
+    })().finally(() => this.running.delete(run.id));
+  }
+  private async settleMember(host: TraceSettlementHost, runId: string, memberId: string): Promise<Outcome> {
+    if (!await realDirectory(host.stateDir, [runId, memberId])) return "settled";
+    const directory = join(tracesDirectory(host.stateDir), runId, memberId);
+    let manifest = await readManifest(directory);
+    // The manifest names the session that recorded, which is the member's earlier session if a later launch had none.
+    if (manifest?.state !== "recording" && manifest?.state !== "removing") return "settled";
+    if (!manifest.caps) throw traceError("trace-manifest-invalid", "A recording trace manifest has no caps.");
+    if (manifest.state === "recording") {
+      if (!await host.exited(manifest.sessionId)) return "running";
+      const bytes = await walkTrace(directory, false, true);
+      const reason = bytes > manifest.caps.memberBytes ? "member-cap" as const
+        : await keptBytes(join(tracesDirectory(host.stateDir), runId), memberId) + bytes > manifest.caps.runBytes ? "run-cap" as const : undefined;
+      manifest = { ...manifest, state: reason ? "removing" : "kept", bytes, at: new Date(host.now()).toISOString(), ...(reason ? { reason } : {}) };
+      await writeManifest(directory, manifest);
+      if (!reason) return "settled";
     }
+    // Checked again just before the removal.
+    if (!await realDirectory(host.stateDir, [runId, memberId])) return "settled";
+    await walkTrace(directory, true, true);
+    await writeManifest(directory, { ...manifest, state: "removed", at: new Date(host.now()).toISOString() });
+    return "settled";
   }
 }

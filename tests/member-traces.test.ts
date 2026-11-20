@@ -1,11 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { readConfig } from "../packages/host/src/config.js";
 import { Manager } from "../packages/host/src/manager.js";
+import { prepareMemberTrace } from "../packages/host/src/member-traces.js";
+import type { Provider } from "../packages/host/src/types.js";
 import type { TeamService } from "../packages/host/src/teams.js";
 import type { TeamAssignment, TeamMember } from "../packages/host/src/team-types.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
@@ -14,8 +16,23 @@ import { waitFor } from "./helpers.js";
 
 const STAND_IN = resolve("tests/fixtures/trace-agent.mjs");
 const MANIFEST = "infinite-trace.json";
+const TRACE = "trace-fixture-0001-thread-0001";
 const traces = (stateDir: string, ...parts: string[]) => join(stateDir, "teams", "traces", ...parts);
 const manifest = (directory: string) => JSON.parse(readFileSync(join(directory, MANIFEST), "utf8"));
+const shape = (directory: string) => ({ ...manifest(directory), at: undefined });
+/** Writes `bytes` of trace where Codex's recorder would: an event log and one payload file. */
+function writeTrace(root: string, bytes: number) {
+  mkdirSync(join(root, TRACE, "payloads"), { recursive: true });
+  writeFileSync(join(root, TRACE, "trace.jsonl"), "x".repeat(bytes - 2));
+  writeFileSync(join(root, TRACE, "payloads", "1.json"), "{}");
+}
+/** Collects console.warn output as text while `body` runs. */
+async function warnings(body: () => Promise<void>) {
+  const lines: string[] = [], warn = console.warn;
+  console.warn = (...args: unknown[]) => { lines.push(args.map(arg => arg instanceof Error ? `${arg.message} ${arg.stack}` : String(arg)).join(" ")); };
+  try { await body(); } finally { console.warn = warn; }
+  return lines;
+}
 
 test("member traces parse only off, or on with both caps", () => {
   const root = mkdtempSync(join(tmpdir(), "inf-trace-config-"));
@@ -75,7 +92,10 @@ test("only a Codex member launched under the host's account gets a private trace
     assert.equal(codex.receipt.traceRoot, directory);
     for (const path of [traces(config.stateDir), traces(config.stateDir, runId), directory])
       assert.equal(statSync(path).mode & 0o777, 0o700, path);
-    assert.ok(existsSync(join(directory, "trace-fixture-0001-thread-0001", "trace.jsonl")), "the recorder could write there");
+    assert.ok(existsSync(join(directory, TRACE, "trace.jsonl")), "the recorder could write there");
+    assert.deepEqual(shape(directory), { version: 1, sessionId: codex.id, state: "recording", caps: { memberBytes: 1_000_000, runBytes: 5_000_000 }, at: undefined, sessionRecord: "kept" },
+      "the caps in force at the start are kept with the trace");
+    assert.equal(statSync(join(directory, MANIFEST)).mode & 0o777, 0o600);
     assert.equal(JSON.stringify(codex.receipt.argv).includes(directory), false, "the prompt and arguments do not name it");
     assert.equal(JSON.stringify(manager.meta(codex.id)).includes(directory), false, "the session record does not name it");
 
@@ -85,81 +105,242 @@ test("only a Codex member launched under the host's account gets a private trace
 
     const separate = await launch("codex", true);
     assert.equal(separate.receipt.traceRoot, null, "a launch under another account gets no directory to write to");
-    assert.deepEqual({ ...manifest(traces(config.stateDir, runId, separate.memberId)), at: undefined },
+    assert.deepEqual(shape(traces(config.stateDir, runId, separate.memberId)),
       { version: 1, sessionId: separate.id, state: "not-recorded", bytes: 0, at: undefined, reason: "separate-account", sessionRecord: "kept" });
   } finally { await team.close(); }
 });
 
-type Internals = { records: Map<string, { run: { members: TeamMember[] } }>; retire(record: unknown): Promise<void> };
+type Internals = { records: Map<string, unknown>; retire(record: unknown): Promise<void>; step(record: unknown): Promise<void> };
+const internal = (teams: TeamService) => teams as unknown as Internals;
 
-/** A run whose members are given, with a trace of the given size written where the host keeps it. */
-function tracedRun(members: { provider: "codex" | "claude"; status: TeamMember["status"]; exitConfirmedAt?: string; bytes?: number }[]) {
+/**
+ * A scheduler fixture whose run is a Codex team with its project manager queued, and the setting on with `caps`. The
+ * fake manager prepares the member's trace at launch, as the real one does, and then writes `bytes` of trace there,
+ * plus any `extra` files by name and size, as Codex would.
+ */
+function codexTeam(bytes: number, caps: { memberBytes: number; runBytes: number }, extra: Record<string, number> = {}) {
+  const f = schedulerFixture();
+  let clock = Date.now();
+  f.run.provider = "codex";
+  const pm = f.run.members[0]!;
+  pm.status = "queued";
+  delete pm.startedAt;
+  f.config.teams!.memberTraces = { enabled: true, ...caps };
+  const create = f.manager.createTeamSession;
+  f.manager.createTeamSession = async (...args: Parameters<typeof create>) => {
+    const [request, assignment] = args;
+    const root = prepareMemberTrace(f.config, request.requestId, request.provider as Provider, assignment, { command: process.execPath, args: [] });
+    if (root) {
+      writeTrace(root, bytes);
+      for (const [name, size] of Object.entries(extra)) writeFileSync(join(root, name), "y".repeat(size));
+    }
+    return create(...args);
+  };
+  f.writeTeam();
+  const teams = f.openTeam({ now: () => clock } as Parameters<typeof f.openTeam>[0]);
+  const directory = () => traces(f.config.stateDir, f.run.id, pm.memberId);
+  const step = async () => { const internals = internal(teams); await internals.step(internals.records.get(f.run.id)); await teams.idle(); };
+  return {
+    f, teams, pm, directory, step,
+    member: () => (internal(teams).records.get(f.run.id) as { run: { members: TeamMember[] } }).run.members[0]!,
+    /** One retention pass, `advanceMs` after the last. */
+    sweep: async (advanceMs = 0) => { clock += advanceMs; const internals = internal(teams); await internals.retire(internals.records.get(f.run.id)); await teams.idle(); },
+    /** The owner cancels the run, and the scheduler stops its members. */
+    cancel: async () => { await teams.cancel(f.run.id, { requestId: randomUUID(), revision: 1 }); await step(); },
+    close: () => { teams.close(); f.close(); },
+  };
+}
+
+test("a project manager waiting on the owner has exited, so its trace is settled", async () => {
+  const t = codexTeam(64, { memberBytes: 1000, runBytes: 5000 });
+  try {
+    await t.step();
+    assert.equal(t.member().status, "running");
+    assert.ok(existsSync(join(t.directory(), TRACE, "trace.jsonl")), "the launch prepared the directory and Codex wrote there");
+    await t.sweep();
+    assert.equal(manifest(t.directory()).state, "recording", "a running session's trace is not measured");
+
+    t.f.report(t.pm.sessionId, { requestId: randomUUID(), runId: t.f.run.id, memberId: t.pm.memberId, revision: t.pm.revision,
+      report: { kind: "question", question: "Which file?", options: [], recommendation: { answers: ["a.txt"], reason: "It holds the change." } } });
+    await t.step();
+    assert.equal(t.member().status, "waiting", "the scheduler confirmed the exit and left the manager waiting");
+    assert.equal((await t.f.manager.state(t.pm.sessionId)).status, "exited");
+    await t.sweep(10_000);
+    assert.deepEqual(shape(t.directory()), { version: 1, sessionId: t.pm.sessionId, state: "kept", caps: { memberBytes: 1000, runBytes: 5000 },
+      bytes: 64, at: undefined, sessionRecord: "kept" });
+  } finally { t.close(); }
+});
+
+test("turning the setting off stops new traces only: a recorded trace keeps its caps, and run removal still removes it", async () => {
+  const t = codexTeam(120, { memberBytes: 100, runBytes: 5000 });
+  try {
+    await t.step();
+    t.f.config.teams!.memberTraces = { enabled: false };
+    await t.cancel();
+    assert.equal(t.member().status, "stopped");
+    assert.deepEqual(shape(t.directory()), { version: 1, sessionId: t.pm.sessionId, state: "removed", caps: { memberBytes: 100, runBytes: 5000 },
+      bytes: 120, at: undefined, reason: "member-cap", sessionRecord: "kept" });
+    assert.deepEqual(readdirSync(t.directory()), [MANIFEST], "only the manifest is left");
+    assert.equal(statSync(join(t.directory(), MANIFEST)).mode & 0o777, 0o600);
+
+    const other = traces(t.f.config.stateDir, randomUUID(), randomUUID());
+    mkdirSync(other, { recursive: true, mode: 0o700 });
+    writeFileSync(join(other, "trace.jsonl"), "{}");
+    await t.teams.removeRun(t.f.run.id);
+    assert.equal(existsSync(traces(t.f.config.stateDir, t.f.run.id)), false, "the run's traces went with it");
+    assert.ok(existsSync(join(other, "trace.jsonl")), "another run's traces stay");
+  } finally { t.close(); }
+});
+
+test("a failed measurement is retried later, and a trace is marked removed only after its removal finished", async () => {
+  const measured = codexTeam(64, { memberBytes: 1000, runBytes: 5000 });
+  try {
+    await measured.step();
+    chmodSync(measured.directory(), 0o300);
+    const logged = await warnings(() => measured.cancel());
+    chmodSync(measured.directory(), 0o700);
+    assert.equal(manifest(measured.directory()).state, "recording", "nothing was measured");
+    assert.equal(logged.length, 1);
+    assert.match(logged[0]!, new RegExp(`member ${measured.pm.memberId} in team ${measured.f.run.id} .*EACCES`));
+    assert.equal(logged[0]!.includes(measured.f.config.stateDir), false, "the log names the ids, not the path");
+    await measured.sweep(1_000);
+    assert.equal(manifest(measured.directory()).state, "recording", "the retry waits");
+    await measured.sweep(60_000);
+    assert.equal(manifest(measured.directory()).state, "kept", "a later tick measured it");
+  } finally { measured.close(); }
+
+  const removed = codexTeam(120, { memberBytes: 100, runBytes: 5000 });
+  try {
+    await removed.step();
+    const payloads = join(removed.directory(), TRACE, "payloads");
+    chmodSync(payloads, 0o500);
+    await warnings(() => removed.cancel());
+    chmodSync(payloads, 0o700);
+    assert.equal(manifest(removed.directory()).state, "removing", "a removal that failed is not reported as done");
+    assert.ok(existsSync(join(payloads, "1.json")));
+    await removed.sweep(60_000);
+    assert.deepEqual(shape(removed.directory()), { version: 1, sessionId: removed.pm.sessionId, state: "removed", caps: { memberBytes: 100, runBytes: 5000 },
+      bytes: 120, at: undefined, reason: "member-cap", sessionRecord: "kept" });
+    assert.deepEqual(readdirSync(removed.directory()), [MANIFEST]);
+  } finally { removed.close(); }
+});
+
+test("only the manifest itself is exempt: a file named like it is trace, and a stale manifest write is removed", async () => {
+  const stale = `.${MANIFEST}.${randomUUID()}.tmp`;
+  const t = codexTeam(64, { memberBytes: 100, runBytes: 5000 }, { [`${MANIFEST}.big`]: 500, [stale]: 10 });
+  try {
+    await t.step();
+    await t.cancel();
+    assert.deepEqual(shape(t.directory()), { version: 1, sessionId: t.pm.sessionId, state: "removed", caps: { memberBytes: 100, runBytes: 5000 },
+      bytes: 564, at: undefined, reason: "member-cap", sessionRecord: "kept" });
+    assert.deepEqual(readdirSync(t.directory()), [MANIFEST]);
+  } finally { t.close(); }
+});
+
+test("trace settlement never follows a link, and its log names no path", async () => {
+  const outside = mkdtempSync(join(tmpdir(), "inf-trace-outside-"));
+  try {
+    writeFileSync(join(outside, "keep.txt"), "z".repeat(1000));
+    writeFileSync(join(outside, "keep-too.txt"), "kept");
+    const inner = codexTeam(120, { memberBytes: 100, runBytes: 5000 });
+    try {
+      await inner.step();
+      // A link inside the trace, and one at the name a fixed temporary file would have.
+      symlinkSync(join(outside, "keep.txt"), join(inner.directory(), TRACE, "outside"));
+      symlinkSync(join(outside, "keep-too.txt"), join(inner.directory(), `${MANIFEST}.tmp`));
+      const links = lstatSync(join(inner.directory(), TRACE, "outside")).size + lstatSync(join(inner.directory(), `${MANIFEST}.tmp`)).size;
+      await inner.cancel();
+      assert.deepEqual(shape(inner.directory()), { version: 1, sessionId: inner.pm.sessionId, state: "removed", caps: { memberBytes: 100, runBytes: 5000 },
+        bytes: 120 + links, at: undefined, reason: "member-cap", sessionRecord: "kept" }, "a link counts as itself");
+      assert.deepEqual(readdirSync(inner.directory()), [MANIFEST], "the links were removed");
+      assert.equal(readFileSync(join(outside, "keep.txt"), "utf8"), "z".repeat(1000), "their targets were not");
+      assert.equal(readFileSync(join(outside, "keep-too.txt"), "utf8"), "kept");
+    } finally { inner.close(); }
+
+    const swapped = codexTeam(120, { memberBytes: 100, runBytes: 5000 });
+    try {
+      await swapped.step();
+      // The member directory itself becomes a link to a directory elsewhere that holds the trace.
+      const moved = join(outside, "member");
+      renameSync(swapped.directory(), moved);
+      symlinkSync(moved, swapped.directory());
+      const logged = await warnings(() => swapped.cancel());
+      assert.ok(existsSync(join(moved, TRACE, "trace.jsonl")), "nothing behind the link was removed");
+      assert.equal(manifest(moved).state, "recording", "nothing behind the link was written");
+      assert.equal(logged.length, 1);
+      assert.match(logged[0]!, new RegExp(swapped.pm.memberId));
+      for (const line of logged) for (const path of [swapped.f.config.stateDir, outside, tmpdir()]) assert.equal(line.includes(path), false, line);
+
+      // The run directory as a link: its removal is refused and the record kept.
+      const runTraces = traces(swapped.f.config.stateDir, swapped.f.run.id);
+      renameSync(runTraces, join(outside, "run"));
+      symlinkSync(join(outside, "run"), runTraces);
+      await assert.rejects(swapped.teams.removeRun(swapped.f.run.id), /member traces could not be removed/);
+      assert.ok(existsSync(join(outside, "run")));
+      assert.ok(existsSync(join(moved, TRACE, "trace.jsonl")));
+    } finally { swapped.close(); }
+
+    // A traces root that is a link is refused at launch; the warning names the member, not the path.
+    const refused = codexTeam(64, { memberBytes: 100, runBytes: 5000 });
+    try {
+      const elsewhere = join(outside, "root");
+      mkdirSync(elsewhere);
+      mkdirSync(join(refused.f.config.stateDir, "teams"), { recursive: true });
+      symlinkSync(elsewhere, traces(refused.f.config.stateDir));
+      const logged = await warnings(() => refused.step());
+      assert.deepEqual(readdirSync(elsewhere), [], "no directory was made behind the link");
+      assert.equal(logged.filter(line => line.includes(refused.pm.memberId)).length, 1, logged.join("\n"));
+      for (const line of logged) for (const path of [refused.f.config.stateDir, outside, tmpdir()]) assert.equal(line.includes(path), false, line);
+    } finally { refused.close(); }
+  } finally { rmSync(outside, { recursive: true, force: true }); }
+});
+
+/** A cancelled run whose members' sessions the fake manager knows, each with a trace of the given size. */
+async function tracedRun(members: { exited: boolean; bytes: number }[], caps: { memberBytes: number; runBytes: number }) {
   const f = schedulerFixture();
   const base = f.run.members[0]!;
   f.run.status = "cancelled";
-  f.run.members = members.map(({ bytes, ...fields }, index) => {
-    const member: TeamMember = { ...base, ...fields, memberId: randomUUID(), sessionId: randomUUID(), role: "implementer", title: `Member ${index}` };
-    if (bytes !== undefined) {
-      const trace = traces(f.config.stateDir, f.run.id, member.memberId, "trace-fixture-0001-thread-0001");
-      mkdirSync(join(trace, "payloads"), { recursive: true, mode: 0o700 });
-      writeFileSync(join(trace, "trace.jsonl"), "x".repeat(bytes - 2));
-      writeFileSync(join(trace, "payloads", "1.json"), "{}");
-    }
-    return member;
-  });
+  f.run.provider = "codex";
+  f.config.teams!.memberTraces = { enabled: true, ...caps };
+  f.run.members = [];
+  for (const [index, { exited, bytes }] of members.entries()) {
+    const member: TeamMember = { ...base, memberId: randomUUID(), sessionId: randomUUID(), role: "implementer", title: `Member ${index}`, status: "running" };
+    const assignment = { runId: f.run.id, memberId: member.memberId, revision: 1, role: "implementer", taskId: "a" } satisfies TeamAssignment;
+    await f.manager.createTeamSession({ requestId: member.sessionId, provider: "codex", title: member.title, prompt: "Do the task" }, assignment, member.cwd);
+    writeTrace(prepareMemberTrace(f.config, member.sessionId, "codex", assignment, { command: process.execPath, args: [] })!, bytes);
+    if (exited) await f.manager.stopTeamSession(member.sessionId);
+    f.run.members.push(member);
+  }
   f.writeTeam();
   return f;
 }
 async function sweep(teams: TeamService, id: string) {
-  const internals = teams as unknown as Internals;
-  await internals.retire(internals.records.get(id));
+  await internal(teams).retire(internal(teams).records.get(id));
   await teams.idle();
 }
 
-test("an ended Codex member's trace over a cap is removed and its manifest says so; a running member's trace waits", async () => {
-  const at = new Date().toISOString();
-  const f = tracedRun([
-    { provider: "codex", status: "stopped", bytes: 120 },
-    { provider: "codex", status: "stopped", bytes: 80 },
-    { provider: "codex", status: "reported", exitConfirmedAt: at, bytes: 80 },
-    { provider: "codex", status: "running", bytes: 500 },
-  ]);
-  f.config.teams!.memberTraces = { enabled: true, memberBytes: 100, runBytes: 150 };
+test("an exited Codex member's trace over a cap is removed and its manifest says so; a running member's trace waits", async () => {
+  const caps = { memberBytes: 100, runBytes: 150 };
+  const f = await tracedRun([{ exited: true, bytes: 120 }, { exited: true, bytes: 80 }, { exited: true, bytes: 80 }, { exited: false, bytes: 500 }], caps);
   const teams = f.openTeam();
   try {
     const [over, kept, overRun, running] = f.run.members.map(member => ({ member, directory: traces(f.config.stateDir, f.run.id, member.memberId) }));
     const recordBefore = JSON.stringify(f.readRecord("team", f.run.id));
     await sweep(teams, f.run.id);
 
-    const shape = (directory: string) => ({ ...manifest(directory), at: undefined });
-    assert.deepEqual(shape(over.directory), { version: 1, sessionId: over.member.sessionId, state: "removed", bytes: 120, at: undefined, reason: "member-cap", sessionRecord: "kept" });
+    assert.deepEqual(shape(over.directory), { version: 1, sessionId: over.member.sessionId, state: "removed", caps, bytes: 120, at: undefined, reason: "member-cap", sessionRecord: "kept" });
     assert.deepEqual(readdirSync(over.directory), [MANIFEST], "only the manifest is left");
-    assert.deepEqual(shape(kept.directory), { version: 1, sessionId: kept.member.sessionId, state: "kept", bytes: 80, at: undefined, sessionRecord: "kept" });
-    assert.ok(existsSync(join(kept.directory, "trace-fixture-0001-thread-0001", "trace.jsonl")));
-    assert.deepEqual(shape(overRun.directory), { version: 1, sessionId: overRun.member.sessionId, state: "removed", bytes: 80, at: undefined, reason: "run-cap", sessionRecord: "kept" });
+    assert.deepEqual(shape(kept.directory), { version: 1, sessionId: kept.member.sessionId, state: "kept", caps, bytes: 80, at: undefined, sessionRecord: "kept" });
+    assert.ok(existsSync(join(kept.directory, TRACE, "trace.jsonl")));
+    assert.deepEqual(shape(overRun.directory), { version: 1, sessionId: overRun.member.sessionId, state: "removed", caps, bytes: 80, at: undefined, reason: "run-cap", sessionRecord: "kept" });
     assert.deepEqual(readdirSync(overRun.directory), [MANIFEST]);
-    assert.equal(existsSync(join(running.directory, MANIFEST)), false, "a running member is not measured");
-    assert.ok(existsSync(join(running.directory, "trace-fixture-0001-thread-0001", "trace.jsonl")));
-    assert.ok(statSync(join(over.directory, MANIFEST)).size < 300, "the manifest stays small");
-    assert.equal(statSync(join(over.directory, MANIFEST)).mode & 0o777, 0o600);
+    assert.equal(manifest(running.directory).state, "recording", "a running member is not measured");
+    assert.ok(existsSync(join(running.directory, TRACE, "trace.jsonl")));
+    assert.ok(statSync(join(over.directory, MANIFEST)).size < 400, "the manifest stays small");
     assert.equal(JSON.stringify(f.readRecord("team", f.run.id)), recordBefore, "the run record is unchanged");
 
     const first = readFileSync(join(kept.directory, MANIFEST), "utf8");
     await sweep(teams, f.run.id);
     assert.equal(readFileSync(join(kept.directory, MANIFEST), "utf8"), first, "a later tick does not measure the same session again");
-  } finally { teams.close(); f.close(); }
-});
-
-test("removing a run removes its member traces, also after the switch is turned off, and leaves other runs' traces", async () => {
-  const f = tracedRun([{ provider: "codex", status: "stopped", bytes: 64 }]);
-  const other = traces(f.config.stateDir, randomUUID(), randomUUID());
-  mkdirSync(other, { recursive: true, mode: 0o700 });
-  writeFileSync(join(other, "trace.jsonl"), "{}");
-  const teams = f.openTeam();
-  try {
-    assert.ok(existsSync(traces(f.config.stateDir, f.run.id)));
-    await teams.removeRun(f.run.id);
-    assert.equal(existsSync(traces(f.config.stateDir, f.run.id)), false);
-    assert.ok(existsSync(join(other, "trace.jsonl")));
   } finally { teams.close(); f.close(); }
 });

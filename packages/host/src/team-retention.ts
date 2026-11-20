@@ -7,7 +7,7 @@ import { hostGithubGrantEnvironment } from "./github-grants.js";
 import { ensureDefaultTeamRoot, ensureHostDirectory, publishTeamHead, removeMemberWorkspace, removeTeamWorkspace, snapshotMemberWork, TeamError } from "./team-workspace.js";
 import { activeMember, digest, filesystemEntryExists, type TeamKernel, teamRunDirectory } from "./team-kernel.js";
 import type { RetentionState, Stored, TeamServiceOptions } from "./teams.js";
-import { MemberTraces, removeMemberTraces } from "./member-traces.js";
+import { MemberTraces, removeMemberTraces, type TraceSettlementHost } from "./member-traces.js";
 
 /**
  * What the retention class uses of TeamService: part of the kernel, and the record, event and publication members it
@@ -59,6 +59,19 @@ export class TeamRetention {
   private activeRemovals = 0;
   private readonly traces = new MemberTraces();
   constructor(private readonly host: RetentionHost) {}
+  private traceHost(): TraceSettlementHost {
+    const { manager } = this.host;
+    return {
+      stateDir: this.host.config.stateDir,
+      now: () => this.host.options?.now?.() ?? Date.now(),
+      // A session has exited when it says so, or when it no longer exists.
+      exited: async sessionId => {
+        if ((await manager.state(sessionId)).status === "exited") return true;
+        try { manager.meta(sessionId); return false; }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return true; throw error; }
+      },
+    };
+  }
   private teamRoot(stored: Stored) {
     const root = stored.root ?? this.host.config.teams?.workspaceDir;
     if (!root) throw new TeamError(409, "invalid-workspace", "The team workspace is outside its configured root.");
@@ -354,8 +367,9 @@ export class TeamRetention {
     return retryAt !== undefined && now < Date.parse(retryAt);
   }
   async retire(stored: Stored) {
-    // Trace caps apply to replay runs too. The measurement runs in the background, where idle() waits for it.
-    const traces = this.traces.settle(this.host.config, stored.run);
+    // Trace caps apply to replay runs too, and to traces recorded before the setting was turned off. The measurement
+    // runs in the background, where idle() waits for it.
+    const traces = this.traces.settle(stored.run, this.traceHost());
     if (traces) { this.removalTasks.add(traces); void traces.finally(() => this.removalTasks.delete(traces)); }
     if (stored.run.replay) return;
     try {

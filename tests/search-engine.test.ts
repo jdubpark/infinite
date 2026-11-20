@@ -269,6 +269,9 @@ test("every result failing, the wait, and the hold each end the search as exhaus
   hold.at(180, { kind: "gated", memberId: "m-c1", outcome: "pass", ms: 1000 });
   assert.deepEqual(hold.search, released, "a gate run that closes after the hold changes nothing");
   assert.deepEqual(hold.last, []);
+  hold.at(181, { kind: "started", challengers: [{ memberId: "m-late", profileId: "p-mistral" }] });
+  assert.deepEqual(hold.last, [{ kind: "stop", memberIds: ["m-late"], reason: "host" }], "a challenger launched after the end is stopped");
+  assert.deepEqual(hold.search, released);
 });
 
 test("a stalled champion is stopped without a replacement and released only when the search ends (acceptance 10)", () => {

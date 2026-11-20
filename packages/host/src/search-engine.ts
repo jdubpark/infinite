@@ -26,7 +26,7 @@ export type TeamSearch = z.infer<typeof teamSearchSchema>;
 export type SearchPolicy = Required<TeamSearch>;
 
 /** The owner's accepted defaults (owner decisions 2 and 3). */
-export const SEARCH_DEFAULTS: SearchPolicy = { mode: "off", start: "after-fail", share: 0.1, attempts: 3, gateMinutes: 15, waitMinutes: 60 };
+const SEARCH_DEFAULTS: SearchPolicy = { mode: "off", start: "after-fail", share: 0.1, attempts: 3, gateMinutes: 15, waitMinutes: 60 };
 
 export function searchPolicy(saved: TeamSearch = {}): SearchPolicy {
   const d = SEARCH_DEFAULTS;
@@ -35,14 +35,14 @@ export function searchPolicy(saved: TeamSearch = {}): SearchPolicy {
 }
 
 /** The clone and the setup command of one gate run (Part 3). */
-export const GATE_SETUP_MINUTES = 20;
+const GATE_SETUP_MINUTES = 20;
 /** Condition 6. */
-export const SEARCHES_PER_RUN = 2;
+const SEARCHES_PER_RUN = 2;
 /** Condition 11: a challenger starts only while `spareAttempts(run)`, with it counted, stays at this or above. */
-export const RESERVE = 3;
+const RESERVE = 3;
 /** Part 8: the brake reads the last 10 widened searches and pauses below 2 rescues. */
-export const BRAKE_WINDOW = 10;
-export const BRAKE_RESCUES = 2;
+const BRAKE_WINDOW = 10;
+const BRAKE_RESCUES = 2;
 
 // ---- State (Part 4) ----------------------------------------------------------------------------------------------
 
@@ -60,9 +60,9 @@ const contestantSchema = z.object({
   // PROPOSED: the moment the contestant's `result` arrived. It holds the champion's result while the base run is open,
   // marks a result that waits for its capture after a restart, and starts nothing on its own.
   resultAt: isoTime.optional(),
-  // PROPOSED: the moment the capture completed, in place of the design's `captured: true`. Gate runs follow capture
-  // order (Part 3), and a restart rebuilds that order from the record; equal times keep the contestants' order.
-  captured: isoTime.optional(),
+  // PROPOSED: the capture's place in capture order (1, 2, …) in place of the design's `captured: true`. Gate runs follow
+  // capture order (Part 3), and a restart rebuilds it from the record; two captures can complete in one millisecond.
+  captured: z.number().int().min(1).optional(),
   commit: z.string().min(1).optional(),
   tree: z.string().min(1).optional(),
   gate: gateRunSchema.optional(),
@@ -70,7 +70,7 @@ const contestantSchema = z.object({
   left: z.string().min(1).optional(),
 }).strict();
 
-export const SEARCH_CLASSES = ["champion-pass", "rescued", "challenger-first", "none"] as const;
+const SEARCH_CLASSES = ["champion-pass", "rescued", "challenger-first", "none"] as const;
 
 /** `task.search` in the sealed run record. Parse persisted state with it at the boundary. */
 export const searchStateSchema = z.object({
@@ -192,7 +192,7 @@ const pastDeadline = (deadline: string | undefined, at: string) => deadline !== 
  * One gate run: the clone and the setup command, then the command. PROPOSED: the allowance and the measurement window
  * use the command's effective limit, `gateMinutes` or `checkMinutes` when shorter, as the gate run itself does.
  */
-export function gateRunMinutes(policy: SearchPolicy, checkMinutes: number): number {
+function gateRunMinutes(policy: SearchPolicy, checkMinutes: number): number {
   return GATE_SETUP_MINUTES + Math.min(policy.gateMinutes, checkMinutes);
 }
 
@@ -201,12 +201,12 @@ export function gateRunMinutes(policy: SearchPolicy, checkMinutes: number): numb
  * and the wait. PROPOSED: "each contestant" is the policy's `attempts`, so admission, the champion's result and widening
  * all reckon with the full search; the design's example counts it so (4 × 35 + 60 = 200 with three attempts).
  */
-export function allowanceMinutes(policy: SearchPolicy, checkMinutes: number, baseOpen: boolean): number {
+function allowanceMinutes(policy: SearchPolicy, checkMinutes: number, baseOpen: boolean): number {
   return (policy.attempts + (baseOpen ? 1 : 0)) * gateRunMinutes(policy, checkMinutes) + policy.waitMinutes;
 }
 
 /** The run's measurement window (Part 3): two gate runs for each `measure` search that waits at the boundary. */
-export function measureWindowMinutes(policy: SearchPolicy, checkMinutes: number, searches: number): number {
+function measureWindowMinutes(policy: SearchPolicy, checkMinutes: number, searches: number): number {
   return 2 * gateRunMinutes(policy, checkMinutes) * searches;
 }
 
@@ -297,7 +297,7 @@ function nextGate(s: SearchState): Contestant | undefined {
   if (!isOpen(s) || s.base?.result !== "fail-check") return undefined;
   let head: Contestant | undefined;
   for (const c of s.contestants) {
-    if (c.captured !== undefined && c.gate === undefined && (head === undefined || Date.parse(c.captured) < Date.parse(head.captured!))) head = c;
+    if (c.captured !== undefined && c.gate === undefined && (head === undefined || c.captured < head.captured!)) head = c;
   }
   return head;
 }
@@ -468,7 +468,7 @@ const HANDLERS: Handlers = {
     const { s, view } = ctx;
     const c = find(s, e.memberId);
     if (s.state === "admitting" || c === undefined || c.resultAt === undefined || c.captured !== undefined || c.left !== undefined) return;
-    Object.assign(c, { captured: view.now, commit: e.commit, tree: e.tree });
+    Object.assign(c, { captured: 1 + Math.max(0, ...s.contestants.map(other => other.captured ?? 0)), commit: e.commit, tree: e.tree });
     if (e.scope === "violation" || e.empty) {
       record(c, e.scope === "violation" ? "fail-scope" : "fail-empty", view.now);
       failed(ctx, c);
@@ -523,7 +523,7 @@ const HANDLERS: Handlers = {
     const { s, view } = ctx;
     const c = champion(s);
     if (s.mode !== "measure" || c.memberId !== e.memberId || !isWorking(c)) return;
-    Object.assign(c, { resultAt: view.now, captured: view.now, commit: e.commit, tree: e.tree });
+    Object.assign(c, { resultAt: view.now, captured: 1, commit: e.commit, tree: e.tree });
     // PROPOSED: an unchanged tree is recorded as `fail-empty` at integration; the base run at the boundary still decides
     // between `measured` and `abandoned`.
     if (e.empty) record(c, "fail-empty", view.now);
@@ -548,8 +548,8 @@ const HANDLERS: Handlers = {
     const { s, out } = ctx;
     if (s.base === undefined && (s.mode === "live" || s.holdUntil !== undefined)) out.push({ kind: "base-run", commit: s.baseCommit });
     if (s.state === "armed" || s.state === "wide") {
-      const waiting = s.contestants.filter(c => c.resultAt !== undefined && c.captured === undefined && c.left === undefined)
-        .sort((a, b) => Date.parse(a.resultAt!) - Date.parse(b.resultAt!));
+      // Captures that have not completed have no order yet.
+      const waiting = s.contestants.filter(c => c.resultAt !== undefined && c.captured === undefined && c.left === undefined);
       for (const c of waiting) out.push({ kind: "capture", memberId: c.memberId });
       if (s.state === "armed" && isDone(champion(s))) widen(ctx, false);
     }

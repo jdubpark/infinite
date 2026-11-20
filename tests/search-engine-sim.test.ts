@@ -33,7 +33,7 @@ const FLOORS: Readonly<Record<string, number>> = {
   "reason:base-pass": 60, "reason:base-yielded": 67, "reason:champion-stall": 88, "reason:champion-question": 54,
   "event:boundary": 230, "event:resume": 90, "fault:restart-during-operation": 55, "fault:unstoppable-gate": 19, "fault:late-gate-result": 10,
   "fault:launch-lost": 2, "fuse:refused": 34, "receipt:first": 200, "receipt:repeat": 50, "receipt:after-end": 39, "receipt:crossing-timer": 23,
-  "fault:unknown-started": 50, "fault:unknown-result": 40,
+  "fault:unknown-started": 50, "fault:unknown-result": 40, "clock:back": 320, "clock:forward": 210, "cutoff:holdUntil": 790, "cutoff:waitUntil": 300,
 };
 
 test("the search engine keeps its invariants under seeded event orders", t => {
@@ -141,6 +141,11 @@ const MUTATIONS: readonly Mutation[] = [
   }) },
   { name: "the measurement window counts the shorter check limit", invariant: "S7", engine: wrapStep((s, e, v) =>
     step(s, e, e.kind === "boundary" ? { ...v, policy: { ...v.policy, gateMinutes: Math.min(v.policy.gateMinutes, v.checkMinutes) } } : v)) },
+  { name: "cutoffs count from the latest time the record holds", invariant: "S7", engine: wrapStep((s, e, v) => {
+    const held = [s.armedAt, s.base?.at, ...s.contestants.flatMap(c => [c.resultAt, c.gate?.at])].filter((x): x is string => x !== undefined);
+    const latest = Math.max(...held.map(x => Date.parse(x)));
+    return step(s, e, latest > Date.parse(v.now) ? { ...v, now: new Date(latest).toISOString() } : v);
+  }) },
   { name: "the allowance counts the shorter check limit", invariant: "S7", engine: wrapStep((s, e, v) =>
     step(s, e, e.kind === "boundary" ? v : { ...v, policy: { ...v.policy, gateMinutes: Math.min(v.policy.gateMinutes, v.checkMinutes) } })) },
   { name: "a hold that ends before the arming abandons the search", invariant: "S7", engine: wrapStep((s, e, v) => {

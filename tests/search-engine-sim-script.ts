@@ -17,7 +17,8 @@ import { bump, type Counts, type Rand, rand } from "./outcome-sim-script.js";
  * work arriving, a halt (steer, pause, cancel, block, routing revoked, revision), a restart during an operation (the run
  * blocks), a restart at rest (`resume`, which loses launches not yet prepared), a gate run that the host cannot stop
  * and that reports after its search ended, launches the spend fuse refuses, events of members and launches the search
- * does not know, the owner pausing and resuming the project, and the host-load hold, under which queued operations wait.
+ * does not know, the owner pausing and resuming the project, the host-load hold, under which queued operations wait,
+ * and a host clock that jumps forward and back: every view carries the host's time, and S7 reads that time.
  *
  * Invariants, checked after every step from the engine's output and the simulator's own records. The simulator's
  * values are the truth: a mutant engine may see a tampered view, the checks never do.
@@ -36,10 +37,12 @@ import { bump, type Counts, type Rand, rand } from "./outcome-sim-script.js";
  * S5 Nothing is gated after a pass, also not in the step that resolves the search.
  * S6 A `live` search that ends releases the task exactly once when exhausted or abandoned and never when resolved; no
  *    acknowledged challenger works after the end, and no champion works after another result won.
- * S7 Time, from the simulator's own clock and the design's formulas: an open search is before its hold (and a `measure`
- *    one before its window), and ends by the hold, the wait or the window not before that time; the hold ends a search
- *    as `exhausted`; the hold and the window fit before the deadline; no challenger works past the wait, and a search
- *    open past the wait has a capture made before it still waiting for its gate; every run ends with every search ended.
+ * S7 Time, from the host time of each step and the design's formulas: each cutoff (hold, wait, window) is set at most
+ *    its duration after the host time of the event that sets it, and never moves; an open search is before its hold
+ *    (and a `measure` one before its window), and ends by the hold, the wait or the window not before that time; the
+ *    hold ends a search as `exhausted`; the hold and the window fit before the deadline; no challenger works past the
+ *    wait, and a search open past the wait has a capture made before it still waiting for its gate; every run ends with
+ *    every search ended.
  * S8 Classes follow Part 8 from the winner and the champion's fate; `challenger-first` only under together; no class
  *    on a search that never armed.
  * S9 A search arms only in the step of a failed base run of a `live` search, always does when it stays open, and stays armed.
@@ -161,6 +164,8 @@ class RunSim {
   private halted = false;
   /** The host-load hold: queued operations wait, so a restart can find work queued and none open. */
   private loadHold = false;
+  /** The host clock's error: views carry `clock + skew`, and the clock jumps forward and back now and then. */
+  private skew = 0;
 
   constructor(private readonly r: Rand, private readonly engine: Engine, private readonly counts: Counts,
     private readonly project: Project, private readonly label: string) {
@@ -189,7 +194,7 @@ class RunSim {
   }
 
   private where(task?: Task): string {
-    return `${this.label} step ${this.steps}${task ? ` task ${task.id}` : ""} at ${at(this.clock)}`;
+    return `${this.label} step ${this.steps}${task ? ` task ${task.id}` : ""} at ${at(this.clock)}, host time ${at(this.now())}`;
   }
 
   private fail(invariant: string, message: string, task?: Task): never {
@@ -199,6 +204,18 @@ class RunSim {
   private finished(): boolean {
     if (this.tasks.some(task => task.launches.some(l => l.intent || l.due > 0))) return false;
     return this.halted || (this.tasks.every(task => task.prepared && (!task.search || !isOpen(task.search))) && this.current === undefined);
+  }
+
+  /** The host's time, which every view and every check of S7 reads. */
+  private now(): number {
+    return this.clock + this.skew;
+  }
+
+  /** The host clock jumps: forward, or back across moments the record already holds. */
+  private jump(): void {
+    const minutes = this.r.pick([-150, -60, -20, -5, 5, 20, 60]);
+    this.skew += minutes * MINUTE;
+    bump(this.counts, minutes < 0 ? "clock:back" : "clock:forward");
   }
 
   private openTasks(): Task[] {
@@ -231,6 +248,7 @@ class RunSim {
       list.push([0.06, later(this.r.int(0, 5), () => this.halt())]);
       list.push([0.12, later(this.r.int(0, 5), () => this.restart())]);
       list.push([0.4, later(this.r.int(0, 5), () => { this.loadHold = !this.loadHold; bump(this.counts, `load-hold:${this.loadHold ? "on" : "off"}`); })]);
+      list.push([0.5, () => this.jump()]);
       list.push([0.2, later(this.r.int(0, 5), () => this.ghost())]);
     }
     if (list.length === 0) list.push([1, later(5, () => undefined)]);
@@ -257,7 +275,7 @@ class RunSim {
   private view(task: Task): RunView {
     const family = FAMILIES[task.champion!.profileId];
     return {
-      now: at(this.clock), policy: this.policy, checkMinutes: this.checkMinutes, ...(this.deadline === undefined ? {} : { deadline: this.deadline }),
+      now: at(this.now()), policy: this.policy, checkMinutes: this.checkMinutes, ...(this.deadline === undefined ? {} : { deadline: this.deadline }),
       otherSearchWide: this.tasks.some(other => other !== task && this.wide(other)),
       ...(family === undefined ? {} : { championFamily: family }),
       candidates: this.candidates.filter(c => c.profileId !== task.champion!.profileId),
@@ -287,7 +305,7 @@ class RunSim {
     const searches = this.tasks.filter(other => other.search !== undefined).length;
     const wide = this.tasks.some(other => this.wide(other));
     const facts: AdmissionFacts = {
-      id: `${this.label}:${task.id}`, now: at(this.clock), policy: this.policy,
+      id: `${this.label}:${task.id}`, now: at(this.now()), policy: this.policy,
       routing: { mode: flips[0] ? "shadow" : "auto", coversStart: true, revoked: false },
       run: { goalCycle: true, recordDigest: true, requiredChecks: ["digest-check"], searches, wideSearch: wide,
         ...(this.deadline === undefined ? {} : { deadline: this.deadline }) },
@@ -438,8 +456,8 @@ class RunSim {
 
   // ---- The model host ----------------------------------------------------------------------------------------------
 
-  /** One operation at a time, none started under the host-load hold: other work first; a `live` base run starts only when
-   * nothing else waits, and yields to it. */
+  /** One operation at a time, none started under the host-load hold: other work first, in any order (captures can
+   * overtake a queued gate run); a `live` base run starts only when nothing else waits, and yields to it. */
   private settleOps(): void {
     for (;;) {
       const op = this.current;
@@ -450,8 +468,8 @@ class RunSim {
         continue;
       }
       if (this.current === undefined && this.queue.length > 0 && !this.loadHold) {
-        const index = this.queue.findIndex(item => item.kind !== "base");
-        this.current = this.queue.splice(index >= 0 ? index : 0, 1)[0];
+        const other = this.queue.flatMap((item, index) => (item.kind === "base" ? [] : [index]));
+        this.current = this.queue.splice(other.length > 0 ? this.r.pick(other) : 0, 1)[0];
         continue;
       }
       return;
@@ -523,7 +541,7 @@ class RunSim {
   private check(task: Task, prev: SearchState, next: SearchState, decisions: readonly Decision[], event: SearchEvent, view: RunView, meta: Meta): void {
     const fail = (invariant: string, message: string): never => this.fail(invariant, `${message} (event ${JSON.stringify(event)}, decisions ${JSON.stringify(decisions)})`, task);
     const ledger = task.ledger;
-    const now = this.clock;
+    const now = this.now();
     const of = (kind: Decision["kind"]) => decisions.filter(d => d.kind === kind);
     const stops = decisions.flatMap(d => (d.kind === "stop" ? d.memberIds : []));
     this.parse(next, task);
@@ -577,7 +595,19 @@ class RunSim {
     }
     if (ledger.outstanding !== undefined && next.contestants.find(c => c.memberId === ledger.outstanding)?.gate !== undefined) ledger.outstanding = undefined;
 
-    // S7's times, from the events the simulator delivered, its clock, and the design's formulas.
+    // S7: each cutoff the step sets is at most its design duration after the host time of the step, and none moves.
+    for (const key of ["holdUntil", "waitUntil"] as const) {
+      const before = prev[key];
+      const after = next[key];
+      if (before !== undefined && after !== before) fail("S7", `${key} moved from ${before} to ${after}`);
+      if (before !== undefined || after === undefined) continue;
+      const minutes = key === "waitUntil" ? this.policy.waitMinutes : live ? allowance(this.policy, ledger.base === undefined)
+        : event.kind === "boundary" ? windowMinutes(this.policy, event.searches) : 0;
+      if (Date.parse(after) > now + minutes * MINUTE) fail("S7", `${key} ${after} is more than ${minutes} minutes after the host time ${at(now)}`);
+      bump(this.counts, `cutoff:${key}`);
+    }
+
+    // S7's times, from the events the simulator delivered, the host time, and the design's formulas.
     if (isOpen(next) && !meta.ghost) {
       if (live && event.kind === "result" && event.memberId === championId) ledger.hold ??= now + allowance(this.policy, ledger.base === undefined) * MINUTE;
       const left = live && event.kind === "left" && event.memberId === championId && (event.reason === "stall" || event.reason === "no-report") && ledger.base === "fail";
@@ -711,7 +741,7 @@ class RunSim {
 
   /** Checks on the simulator's members and its own clock once the host has acted on the step's decisions. */
   private checkAfter(task: Task, prev: SearchState, next: SearchState): void {
-    const now = this.clock;
+    const now = this.now();
     const ledger = task.ledger;
     const working = this.members.filter(m => m.taskId === task.id && m.challenger && m.acked && m.working);
     if (next.mode === "live" && !isOpen(next)) {

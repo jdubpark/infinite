@@ -119,7 +119,7 @@ export type Candidate = { profileId: string; family?: string; limited: boolean }
 
 /** What the host reads from the run and the project at the moment of an event. */
 export type RunView = {
-  /** The host's clock. The engine never runs it back past a moment the record already holds. */
+  /** The host's effective time (Time, below). Every cutoff the step sets counts from it. */
   now: string;
   /** The run's pinned policy, read through `searchPolicy`. */
   policy: SearchPolicy;
@@ -197,6 +197,14 @@ export type Step = { search: SearchState; decisions: Decision[] };
 
 // ---- Time --------------------------------------------------------------------------------------------------------
 
+/*
+ * The engine reads time only from `view.now`. It sets each cutoff once, from the `now` of the event that sets it:
+ * `holdUntil` at the champion's result or leave (a `measure` window at the boundary), `waitUntil` at the champion's
+ * failed gate or leave. A cutoff already set never moves, and capture order is the capture ordinal, which needs no time.
+ * PROPOSED: the host supplies effective time, its wall clock. A clock that runs back by R delays the expiry of a cutoff
+ * set before the step back by at most R, never more, and a cutoff set after it still lasts its own duration from the
+ * `now` that set it; a clock that runs forward ends cutoffs early by the jump.
+ */
 const MINUTE = 60_000;
 const plus = (at: string, minutes: number) => new Date(Date.parse(at) + minutes * MINUTE).toISOString();
 const reached = (now: string, at: string | undefined) => at !== undefined && Date.parse(now) >= Date.parse(at);
@@ -216,17 +224,6 @@ function allowanceMinutes(policy: SearchPolicy, baseOpen: boolean): number {
 /** The run's measurement window (Part 3): 2 × (20 + `gateMinutes`) for each `measure` search that waits at the boundary. */
 function measureWindowMinutes(policy: SearchPolicy, searches: number): number {
   return 2 * (GATE_SETUP_MINUTES + policy.gateMinutes) * searches;
-}
-
-/**
- * PROPOSED: the engine's clock never runs back. A step's time is `now`, or the latest moment the record already holds
- * (the arming, the base run, a result, a gate run) when `now` is earlier, so a host clock that steps back records no
- * earlier moment and starts no timer from one.
- */
-function clock(s: SearchState, now: string): string {
-  const held = [s.armedAt, s.base?.at, ...s.contestants.flatMap(c => [c.resultAt, c.gate?.at])].filter((t): t is string => t !== undefined);
-  const latest = Math.max(...held.map(t => Date.parse(t)));
-  return latest > Date.parse(now) ? new Date(latest).toISOString() : now;
 }
 
 // ---- Admission (Part 1, conditions 1 to 7) -----------------------------------------------------------------------
@@ -341,7 +338,7 @@ function nextGate(s: SearchState): Contestant | undefined {
  */
 export function step(search: SearchState, event: SearchEvent, view: RunView): Step {
   const s = structuredClone(search);
-  const ctx: Ctx = { s, view: { ...view, now: clock(search, view.now) }, out: [] };
+  const ctx: Ctx = { s, view, out: [] };
   const head = nextGate(s)?.memberId;
   // PROPOSED: the time rules apply before the step's event, a halt included: a hold that has passed ends the search as
   // `exhausted` before a steer in the same step could abandon it.
@@ -453,7 +450,7 @@ function receive(ctx: Ctx, e: Receipt): void {
 function failed(ctx: Ctx, c: Contestant): void {
   const { s, view } = ctx;
   if (c !== champion(s)) return settle(ctx);
-  s.waitUntil = plus(view.now, view.policy.waitMinutes);
+  s.waitUntil ??= plus(view.now, view.policy.waitMinutes);
   if (s.state === "armed") widen(ctx, false);
   else settle(ctx);
 }
@@ -524,7 +521,7 @@ const HANDLERS: Handlers = {
     if (s.mode === "measure" || c === undefined || !isWorking(c)) return;
     c.resultAt = view.now;
     if (c === champion(s)) {
-      s.holdUntil = plus(view.now, allowanceMinutes(view.policy, s.state === "admitting"));
+      s.holdUntil ??= plus(view.now, allowanceMinutes(view.policy, s.state === "admitting"));
       if (pastDeadline(view.deadline, s.holdUntil)) return end(ctx, "abandoned", "deadline");
       if (s.state === "admitting") return;
     }
@@ -569,8 +566,8 @@ const HANDLERS: Handlers = {
     }
     if (s.mode === "measure" || s.state === "admitting" || !CHAMPION_LEAVES.has(e.reason)) return end(ctx, "abandoned", `champion-${e.reason}`);
     out.push(stop([c], e.reason));
-    s.holdUntil = plus(view.now, allowanceMinutes(view.policy, false));
-    s.waitUntil = plus(view.now, view.policy.waitMinutes);
+    s.holdUntil ??= plus(view.now, allowanceMinutes(view.policy, false));
+    s.waitUntil ??= plus(view.now, view.policy.waitMinutes);
     // PROPOSED: a champion that leaves gets the deadline check of a champion's result (Part 7 names the result only).
     if (pastDeadline(view.deadline, s.holdUntil)) return end(ctx, "abandoned", "deadline");
     if (s.state === "armed") widen(ctx, false);

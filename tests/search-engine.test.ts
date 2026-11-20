@@ -532,12 +532,25 @@ test("measure: the base run and the gate run at the boundary, inside the window,
   assert.deepEqual(stalled.last, [], "no measurement runs for the replacement's result");
 });
 
-test("PROPOSED: a host clock that steps back records nothing earlier than the record already holds", () => {
+test("PROPOSED: each cutoff counts from the now of the event that sets it, and a cutoff already set never moves (rule 6)", () => {
+  // The clock jumps forward to 90 for the champion's result, then back to 32 for its failed gate run.
   const drive = armed();
-  drive.at(30, { kind: "result", memberId: CHAMPION });
-  drive.at(20, { kind: "captured", memberId: CHAMPION, commit: "commit-champion", tree: "tree-champion", scope: "ok", empty: false });
-  drive.at(10, { kind: "gated", memberId: CHAMPION, outcome: "fail", ms: 1000 });
-  assert.equal(drive.member(CHAMPION).gate?.at, at(30));
-  assert.equal(drive.search.waitUntil, at(30 + 60), "the wait counts from the latest moment recorded");
-  assert.equal(drive.search.holdUntil, at(30 + 165));
+  drive.at(90, { kind: "result", memberId: CHAMPION });
+  assert.equal(drive.search.holdUntil, at(90 + 165));
+  drive.at(91, { kind: "captured", memberId: CHAMPION, commit: "commit-champion", tree: "tree-champion", scope: "ok", empty: false });
+  drive.at(32, { kind: "gated", memberId: CHAMPION, outcome: "fail", ms: 1000 });
+  assert.equal(drive.search.waitUntil, at(32 + 60), "not from the result's later time");
+  assert.equal(drive.member(CHAMPION).gate?.at, at(32));
+  assert.equal(drive.search.holdUntil, at(90 + 165), "the hold set at the result keeps its time");
+  drive.at(32, receipt(1, ["m-c1", "p-gpt"], ["m-c2", "p-gemini"]));
+  drive.at(91, { kind: "tick" });
+  assert.equal(drive.search.state, "wide");
+  drive.at(92, { kind: "tick" });
+  assert.deepEqual([drive.search.state, drive.search.endReason], ["exhausted", "wait"], "the wait ends at 92");
+
+  // The base run fails at 60; the clock runs back, and the champion leaves at 25: both cutoffs count from 25.
+  const left = admitted();
+  left.at(60, { kind: "base", outcome: "fail", ms: 60_000 });
+  left.at(25, { kind: "left", memberId: CHAMPION, reason: "stall" });
+  assert.deepEqual([left.search.holdUntil, left.search.waitUntil], [at(25 + 165), at(25 + 60)]);
 });

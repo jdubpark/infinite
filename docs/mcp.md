@@ -185,6 +185,11 @@ Present result.kind=agent-report as the agent's report. Ready-for-review does
 not prove merge, deployment, tests beyond reported evidence, or product impact.
 Show the tracker link only when returned. Surface blocked states and questions.
 
+A question may carry recommendation: the answers the asking agent would give
+and its one-line reason. Show it before the options and say it is the agent's
+recommendation. It decides nothing. Reply only with the answer the person
+chooses, and never send the recommendation as the reply on your own.
+
 These tools do not approve provider permissions or grant broader owner access.
 Direct permission decisions to the owner's established Infinite permission flow.
 Never request or display credentials, private config, terminal logs, or unrelated
@@ -212,7 +217,10 @@ credential in chat. Confirm these boundaries and wait for my explicit work reque
 
 Start objectives are limited to 24,000 characters, titles to 100, and replies to
 8,000. Each view contains status, tracking state, open questions, available
-actions, and a revision once a mission exists. Results carry
+actions, and a revision once a mission exists. A question is
+`{ "id", "question", "options" }`, with
+`"recommendation": { "answers": [...], "reason": "..." }` when the asking agent
+gave one. Results carry
 `{ "kind": "agent-report", "summary": "..." }`. Views exclude raw host config,
 credentials, filesystem paths, terminal output and other connectors' requests.
 

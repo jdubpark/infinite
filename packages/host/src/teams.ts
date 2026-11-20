@@ -59,6 +59,7 @@ import { TeamReplay, type ReplayCreate, type ReplayState } from "./team-replay.j
 import { autonomyStartEvent, intentCheckPin, startMode } from "./evaluator-profiles.js";
 export { TeamError } from "./team-workspace.js";
 import { changeIndex, changedPathList, diffStat } from "./team-changes.js";
+import { recommendationLine, recommendationOutcome } from "./question-recommendation.js";
 export { changeIndex };
 
 type Mutation = { requestId: string; revision: number; text: string };
@@ -268,6 +269,9 @@ const promptTooLargeReason = "The accumulated team requirements exceed the promp
 const missingAgentReportReason = "An agent exited without a valid structured report. Its task is unresolved.";
 const invalidNoChangeReason = "A no-change report is valid only before implementation tasks are planned and when the integration head is unchanged from the base.";
 const wrongAgentReportReason = "An agent's report does not match its assigned role.";
+/** Why a worker's question blocked the run. It carries the worker's recommendation, so the project manager's recovery reads it. */
+const agentQuestionReason = (role: TeamMember["role"], report: Extract<TeamReport, { kind: "question" }>) =>
+  `The ${role} requested an owner decision: ${report.question}${report.recommendation ? ` ${recommendationLine(report.recommendation)}` : ""}`;
 const automaticRecoveryCodes = new Set(["agent-blocked", "agent-question", "missing-agent-report", "invalid-no-change", "wrong-agent-report"]);
 const automaticRecoveryLimit = 2;
 const permissionRecoveryRoundLimit = 2;
@@ -777,7 +781,7 @@ export class TeamService {
     const candidates = run.members.filter(member => member.revision === run.revision && member.status === "stopped" &&
       member.role !== "delivery" && member.role !== "permission-coordinator" && (
         code === "agent-blocked" ? member.report?.kind === "blocked" && member.report.summary === run.reason :
-          code === "agent-question" ? member.report?.kind === "question" && `The ${member.role} requested an owner decision: ${member.report.question}` === run.reason :
+          code === "agent-question" ? member.report?.kind === "question" && agentQuestionReason(member.role, member.report) === run.reason :
             code === "missing-agent-report" ? member.report === undefined && run.reason === missingAgentReportReason :
               code === "invalid-no-change" ? member.role === "project-manager" && member.report?.kind === "no-change" && run.reason === invalidNoChangeReason :
                 code === "wrong-agent-report" ? Boolean(member.report && !roleAcceptsReport(member.role, member.report.kind)) && run.reason === wrongAgentReportReason : false));
@@ -2004,6 +2008,7 @@ export class TeamService {
       // An answer is input, not a change to how the run is held: the hold, and what a release does with it, stay.
       if (held) stored.ownerHalt = mark;
       decision.answer = body.text; decision.answeredBy = by; decision.answeredAt = timestamp();
+      if (decision.recommendation) decision.recommendation.outcome = recommendationOutcome(decision.options, decision.recommendation, body.text);
       if (source) decision.source = source;
       const next = this.intentChecks.answerNote(stored, decision) ?? (held ? "The requesting member will continue in a new attempt when the team resumes." : "The requesting member will continue in a new attempt.");
       this.event(stored, by === "connector" ? `${decisionAnswerLabel(decision)} decision was recorded as delegated agent input. ${next}` : by === "coordinator" ? `A mission coordinator decision was recorded. ${next}` : `A user decision was recorded. ${next}`); this.save(stored);
@@ -5228,13 +5233,13 @@ export class TeamService {
     if (member.role === "intent-checker") { this.intentChecks.consume(stored, member); return; }
     if (report.kind === "blocked") { this.block(stored, new TeamError(409, "agent-blocked", report.summary), member); return; }
     if (report.kind === "question" && ["implementer", "scout", "integrator", "reviewer"].includes(member.role)) {
-      this.block(stored, new TeamError(409, "agent-question", `The ${member.role} requested an owner decision: ${report.question}`), member); return;
+      this.block(stored, new TeamError(409, "agent-question", agentQuestionReason(member.role, report)), member); return;
     }
     if (report.kind === "question") {
       if (run.decisions.length >= 40) { this.block(stored, new TeamError(409, "team-decision-limit", "The team reached its limit of 40 decisions. Review its evidence before starting another team.")); return; }
       member.status = "waiting";
       run.decisions.push({ id: randomUUID(), memberId: member.memberId, revision: run.revision, question: report.question, options: report.options,
-        ...(report.answerMode ? { answerMode: report.answerMode } : {}), createdAt: timestamp() });
+        ...(report.answerMode ? { answerMode: report.answerMode } : {}), ...(report.recommendation ? { recommendation: { ...report.recommendation } } : {}), createdAt: timestamp() });
       const task = member.role === "scout" ? run.discovery?.tasks.find(item => item.id === member.taskId) : run.tasks.find(item => item.id === member.taskId); if (task) task.status = "waiting";
       run.status = "needs-input"; this.event(stored, `${member.title} requested a user decision.`); this.save(stored); return;
     }

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { blockerEvidenceSchema, type TeamLineup, type TeamStatus } from "./team-types.js";
 import type { UsageRollup } from "./team-usage.js";
 import { projectGroupIdSchema } from "./project-group-types.js";
+import { questionRecommendationSchema, refineQuestion, requiredQuestionRecommendationSchema, type DecisionRecommendation } from "./question-recommendation.js";
 
 const subtaskId = z.string().regex(/^[a-z][a-z0-9-]{0,39}$/);
 
@@ -40,34 +41,37 @@ export const missionSubtaskPlanSchema = z.object({
 }).strict();
 export type MissionSubtaskPlan = z.infer<typeof missionSubtaskPlanSchema>;
 
-/** Reports from the mission coordinator. Subteam members keep using `TeamReport`. */
-export const missionReportSchema = z.discriminatedUnion("kind", [
+const missionQuestionShape = { kind: z.literal("question"), question: z.string().trim().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]), answerMode: z.enum(["approval", "single", "multiple"]).optional(), subtaskId: subtaskId.optional(), childDecisionId: z.uuid().optional() };
+const missionReportVariants = [
   z.object({ kind: z.literal("dispatch"), summary: z.string().trim().min(1).max(4000), subtasks: z.array(missionSubtaskPlanSchema).min(1).max(12) }).strict(),
   z.object({ kind: z.literal("resize-subtask"), subtaskId, parallelism: z.number().int().min(1).max(4), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("answer-child"), subtaskId, decisionId: z.uuid(), text: z.string().trim().min(1).max(8000) }).strict(),
   z.object({ kind: z.literal("cancel-subtask"), subtaskId, reason: z.string().trim().min(1).max(2000) }).strict(),
   /** Forwards owner direction or an owner answer to a running subteam; the subteam replans under a new revision. */
   z.object({ kind: z.literal("steer-subtask"), subtaskId, text: z.string().trim().min(1).max(8000) }).strict(),
-  z.object({ kind: z.literal("question"), question: z.string().trim().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]), answerMode: z.enum(["approval", "single", "multiple"]).optional(), subtaskId: subtaskId.optional(), childDecisionId: z.uuid().optional() }).strict().superRefine((report, context) => {
-    if (report.answerMode === "approval" && report.options.length !== 2)
-      context.addIssue({ code: "custom", path: ["options"], message: "Approval questions require exactly two options: approve first and deny second." });
-    if (report.answerMode === "multiple" && report.options.length < 2)
-      context.addIssue({ code: "custom", path: ["options"], message: "Multiple-selection questions require at least two options." });
-  }),
   z.object({ kind: z.literal("result"), summary: z.string().trim().min(1).max(8000) }).strict(),
   z.object({ kind: z.literal("blocked"), summary: z.string().trim().min(1).max(4000), blocker: blockerEvidenceSchema.optional() }).strict(),
   /** Ends the attempt without a decision; the next subteam event or owner input starts another. */
   z.object({ kind: z.literal("wait"), summary: z.string().trim().min(1).max(2000) }).strict(),
   /** Ends the attempt and asks the host to start another at a time; it schedules a look and decides nothing. */
   z.object({ kind: z.literal("follow-up"), inMinutes: z.number().int().min(5).max(10080), reason: z.string().trim().min(1).max(500), check: z.string().trim().min(1).max(1000) }).strict(),
-]);
-export type MissionReport = z.infer<typeof missionReportSchema>;
+] as const;
+/** Reports the mission coordinator may send: every question carries its recommendation. Subteam members keep using `TeamReport`. */
+export const missionReportSchema = z.discriminatedUnion("kind", [...missionReportVariants,
+  z.object({ ...missionQuestionShape, recommendation: requiredQuestionRecommendationSchema }).strict().superRefine(refineQuestion)]);
+/**
+ * A report as the session journal and the mission record hold it. A coordinator started before recommendations were
+ * required may still ask a question without one, so the worker and the host read this form.
+ */
+export const recordedMissionReportSchema = z.discriminatedUnion("kind", [...missionReportVariants,
+  z.object({ ...missionQuestionShape, recommendation: questionRecommendationSchema.optional() }).strict().superRefine(refineQuestion)]);
+export type MissionReport = z.infer<typeof recordedMissionReportSchema>;
 /** The coordinator's own words for a later conversation. Kept in the stored record only; never host fact. */
 export const missionNoteSchema = z.string().trim().min(1).max(2000)
   .describe("Optional. What the mission state does not show: decisions and their reasons, what you are waiting for, and what to check next.");
 /** The mission_report tool input. */
 export const missionReportArgumentsSchema = z.object({ report: missionReportSchema, note: missionNoteSchema.optional() }).strict();
-export const missionReportEnvelopeSchema = z.object({ requestId: z.uuid(), missionId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: missionReportSchema, note: missionNoteSchema.optional() }).strict();
+export const missionReportEnvelopeSchema = z.object({ requestId: z.uuid(), missionId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: recordedMissionReportSchema, note: missionNoteSchema.optional() }).strict();
 
 export type MissionStatus = "planning" | "working" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "cancelled";
 export interface MissionSubtask extends MissionSubtaskPlan {
@@ -93,6 +97,11 @@ export interface MissionDecision {
   answeredAt?: string;
   answeredBy?: "owner" | "coordinator" | "connector";
   source?: ConnectorSource;
+  /**
+   * What the coordinator would answer and why, with how the recorded answer compared. Absent on a decision asked by a
+   * coordinator started before recommendations were required.
+   */
+  recommendation?: DecisionRecommendation;
 }
 /** A time the coordinator asked to look again. `fired` means the host woke the coordinator; it records no outcome. */
 export interface MissionFollowUp {

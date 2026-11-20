@@ -3120,6 +3120,35 @@ delivery questions retain the direct decision path: an owner or controller
 answers from the team page, and a new assignment receives the recorded answer.
 Provider tool permission dialogs use their separate permission policy.
 
+Every question carries a recommendation: the answer the asking member would
+give and a one-line reason. For a question with options, the recommendation
+copies option text exactly, one option unless the question takes several; for
+a question without options, it is one short answer in words. The report tool
+refuses a question without one, and the refusal names the shape to send, so a
+member whose prompt predates this rule can add it. A question a member's
+session recorded before this rule still becomes a decision, with no
+recommendation. A session started before this rule keeps a worker that does
+not know the field. When that worker refuses a question for it, the reporter
+sends the question once more without its recommendation, so the member can
+still ask. The decision stores the
+recommendation and clients show it first, as the asking agent's. A worker's
+question reaches the project manager's recovery with its recommendation
+appended to the reason. When the decision is answered, by the owner, a mission
+coordinator, or a connector, the host records how the answer compared:
+`matched` when the answer selects exactly the recommended options, or repeats
+the recommended words of a question without options; `different` when it
+selects other options; and `other` when it is any other text. Free text
+matches only word for word; the host does not judge whether words agree. An
+answer is compared as it arrives, trimmed: options that differ only in
+surrounding spaces count as one answer, and an answer that reads as two
+different selections, as it can when one option's text looks like numbered
+lines, is `other`. A
+recommendation is evidence beside the question. Nothing answers a question
+with it, and the intent check's decisions carry none.
+The recommendation is part of the decision in the team view, so it reaches
+every paired device that reads the run or the team list, through the relay as
+well, exactly as the question and its options do. An older client ignores it.
+
 For a standalone team, steering records a new requirements revision. Earlier
 member results cannot satisfy it. The scheduler stops old assignments and replans from the integrated
 workspace with the new direction. Completed earlier integration remains visible;

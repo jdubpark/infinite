@@ -69,7 +69,8 @@ async function coordinator() {
   const decision = messages.find(message => message.type === "child-decision");
   const openDecision = decision && state.openChildDecisions.find(item => item.decisionId === decision.decisionId);
   if (decision?.subtaskId === "api-change") {
-    await report({ kind: "question", question: `The API subteam asks: ${openDecision?.question}`, options: openDecision?.options ?? [], subtaskId: decision.subtaskId, childDecisionId: decision.decisionId });
+    await report({ kind: "question", question: `The API subteam asks: ${openDecision?.question}`, options: openDecision?.options ?? [], subtaskId: decision.subtaskId, childDecisionId: decision.decisionId,
+      recommendation: { answers: ["JSON"], reason: openDecision?.recommendation ? "The subteam recommends it, and the web client parses JSON." : "The web client parses JSON." } });
     return;
   }
   if (decision?.subtaskId === "web-change") {
@@ -90,7 +91,10 @@ async function subteam() {
     }
     if (!api) await until(() => existsSync(join(receipts, "release-web-question")));
     if (!/(?:User|Mission coordinator|Connector(?: \([^\n]*\))?) answered(?: "[^\n]*")?:/.test(prompt)) {
-      await report({ kind: "question", question: api ? "Which response format should the endpoint use?" : "Should the button be primary?", options: api ? ["JSON", "Text"] : ["Primary", "Secondary"] });
+      // The web question carries no recommendation: a member started before recommendations were required.
+      await report(api
+        ? { kind: "question", question: "Which response format should the endpoint use?", options: ["JSON", "Text"], recommendation: { answers: ["JSON"], reason: "Clients already parse JSON." } }
+        : { kind: "question", question: "Should the button be primary?", options: ["Primary", "Secondary"] });
       return;
     }
     await report({ kind: "plan", summary: `Write ${file}`, tasks: [{ id: "write", title: `Write ${file}`, instructions: `Create ${file}`, agentProfileId: "light", paths: [file], dependsOn: [] }] });

@@ -15,6 +15,7 @@ import { newer } from "../teams/model";
 import { RequestStatus, Section, SteerBox, t } from "../teams/parts";
 import { useRunRequest } from "../teams/useRunRequest";
 import { attemptLabel, attemptsOf, findBoardItem, missionControls, missionExtendChoices, missionShowsReason, missionStatusLabel, missionStopLine, missionStoppedAtLimit, missionSubtaskLabel, missionTimeLeftMs, openMissionDecisions } from "./model";
+import { DecisionOptions, OutcomeNote, RecommendationBlock, type DecisionRecommendation } from "../teams/Recommendation";
 import { Attempts } from "./Attempts";
 
 export function MissionDetail({ connection, id }: { connection: Connection; id: string }) {
@@ -90,7 +91,7 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
       </View>
 
       {decisions.length ? <Section title="Needs your input" count={decisions.length}>
-        {decisions.map(decision => <Decision key={decision.id} question={decision.question} options={decision.options}
+        {decisions.map(decision => <Decision key={decision.id} question={decision.question} options={decision.options} recommendation={decision.recommendation}
           enabled={controls.answer && !locked} onAnswer={value => answer(decision.id, value)} />)}
       </Section> : null}
 
@@ -135,6 +136,7 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
             <Text style={t.note}>Decision · answered by {decision.answeredBy === "connector" ? decision.source?.name ?? "Connector" : decision.answeredBy === "coordinator" ? "the coordinator" : "you"}{decision.answeredAt ? ` · ${age(decision.answeredAt, now)}` : ""}</Text>
             <Text style={t.body}>{decision.question}</Text>
             <Text style={t.strong}>Answer: {decision.answer}</Text>
+            <OutcomeNote recommendation={decision.recommendation} />
           </Card>)}
       </Section> : null}
 
@@ -156,11 +158,12 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
   </View>;
 }
 
-function Decision({ question, options, enabled, onAnswer }: { question: string; options: string[]; enabled: boolean; onAnswer: (text: string) => void }) {
+function Decision({ question, options, recommendation, enabled, onAnswer }: { question: string; options: string[]; recommendation?: DecisionRecommendation; enabled: boolean; onAnswer: (text: string) => void }) {
   const [text, setText] = useState("");
   return <Card attention style={s.decision}>
     <Text style={s.decisionQuestion}>{question}</Text>
-    {options.map((option, index) => <Button key={`${option}/${index}`} compact secondary title={option} disabled={!enabled} onPress={() => onAnswer(option)} />)}
+    {recommendation ? <RecommendationBlock recommendation={recommendation} /> : null}
+    <DecisionOptions options={options} recommendation={recommendation} disabled={!enabled} onAnswer={onAnswer} />
     <TextInput accessibilityLabel="Write an answer" value={text} onChangeText={setText} multiline maxLength={8000}
       placeholder="Or write your answer…" placeholderTextColor={theme.colors.placeholder} editable={enabled} style={s.answerInput} />
     <Button compact title="Send answer" disabled={!enabled || !text.trim()} onPress={() => onAnswer(text.trim())} />

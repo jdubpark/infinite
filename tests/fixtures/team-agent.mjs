@@ -288,7 +288,8 @@ async function main() {
     }
     if (scenario === "limit" && !existsSync(join(receiptDir, "limit-owner-question-asked"))) {
       writeFileSync(join(receiptDir, "limit-owner-question-asked"), "asked", { mode: 0o600 });
-      await report({ kind: "question", question: "Which display label should the first file use?", options: ["Detailed", "Compact"] });
+      await report({ kind: "question", question: "Which display label should the first file use?", options: ["Detailed", "Compact"],
+        recommendation: { answers: ["Compact"], reason: "The label fits the narrow layout." } });
       return;
     }
     if (scenario.startsWith("agent-blocked-") && assignment.revision > 1) {
@@ -310,6 +311,7 @@ async function main() {
       const recoveryQuestion = join(receiptDir, `${assignment.runId}.mixed-recovery-asked`);
       if (!existsSync(recoveryQuestion)) {
         writeFileSync(recoveryQuestion, "asked", { mode: 0o600 });
+        // No recommendation: a member started before recommendations were required still reaches its decision.
         await report({ kind: "question", question: "Which display label should the second file use?", options: ["Detailed", "Compact"] });
         return;
       }
@@ -330,7 +332,8 @@ async function main() {
     const asked = join(receiptDir, `${assignment.runId}.asked`);
     if (scenario === "question" && !existsSync(asked)) {
       writeFileSync(asked, "asked", { mode: 0o600 });
-      await report({ kind: "question", question: "Which display label should the implementation use?", options: ["Detailed", "Compact"] });
+      await report({ kind: "question", question: "Which display label should the implementation use?", options: ["Detailed", "Compact"],
+        recommendation: { answers: ["Compact"], reason: "Both files share one short label." } });
       return;
     }
     const tasks = [
@@ -505,7 +508,8 @@ async function main() {
     const asked = join(receiptDir, `${assignment.runId}.${assignment.taskId}.asked`);
     if ((scenario === "mixed" || (scenario === "bootstrap-replan" || scenario === "bootstrap-change") && assignment.revision === 1) && assignment.taskId === "b" && !existsSync(asked)) {
       writeFileSync(asked, "asked", { mode: 0o600 });
-      await report({ kind: "question", question: "Which display label should the second file use?", options: ["Detailed", "Compact"] });
+      await report({ kind: "question", question: "Which display label should the second file use?", options: ["Detailed", "Compact"],
+        recommendation: { answers: ["Compact"], reason: "The first file already uses it." } });
       return;
     }
     if (scenario.startsWith("limit") && receipt.provider === "claude" && receipt.argv[receipt.argv.indexOf("--model") + 1] === "claude-haiku-5-5") {

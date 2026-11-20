@@ -234,6 +234,7 @@ export type MissionSubtask = {
 export type MissionDecision = {
   id: string; question: string; options: string[]; createdAt: string; subtaskId?: string; childDecisionId?: string;
   answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator" | "connector"; source?: { kind: "connector"; id: string; name: string };
+  recommendation?: { answers: string[]; reason: string; outcome?: "matched" | "different" | "other" };
 };
 export type MissionUsageTotals = {
   cost: number; tokens: { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number };

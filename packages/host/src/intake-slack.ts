@@ -7,6 +7,7 @@ import type { TeamService } from "./teams.js";
 import { TeamError } from "./teams.js";
 import { SlackError, type SlackClient, type SlackEnvelope } from "./slack-client.js";
 import { splitSlackText } from "./slack-text.js";
+import { recommendationLine } from "./question-recommendation.js";
 import { failureSummary, isAnswerRecord, outboundText, slackMessageAfter } from "./intake.js";
 import { explicitRoute } from "./intake-route.js";
 import { formatThreadStatus } from "./slack-thread-status.js";
@@ -110,11 +111,14 @@ function addParts(config: Config, draft: IntakeRecord, key: string, kind: Intake
 }
 
 const questionText = (decision: MissionDecision, channelReplies = false) => (n: number) => {
-  const options = decision.options.map((option, index) => `${index + 1}. ${option}`);
+  const recommended = decision.recommendation?.answers ?? [];
+  const options = decision.options.map((option, index) => `${index + 1}. ${option}${recommended.includes(option) ? " (recommended)" : ""}`);
   const how = channelReplies ? "in this thread with your answer." : "with a mention and your answer.";
   const footer = decision.answerMode === "multiple" ? `Choose one or more options, then Submit. You can also reply ${how}`
     : options.length ? `Choose below, or reply ${how}` : `Reply ${how}`;
-  return [`**Q${n}: ${decision.question}**`, ...(options.length ? ["", ...options] : []), "", footer].join("\n");
+  // The recommendation comes first, before the options it names.
+  const recommendation = decision.recommendation ? ["", recommendationLine(decision.recommendation)] : [];
+  return [`**Q${n}: ${decision.question}**`, ...recommendation, ...(options.length ? ["", ...options] : []), "", footer].join("\n");
 };
 
 const safeLabel = (config: Config, label: string) => Array.from(outboundText(config, label)).slice(0, 75).join("");

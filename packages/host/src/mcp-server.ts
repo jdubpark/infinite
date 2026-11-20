@@ -33,7 +33,7 @@ export function createMcpServer(config: Config, api: McpRequestApi) {
     };
     protocol.registerTool("list_projects", { description: "List the projects available to this connector.", inputSchema: z.object({}).strict() }, () => result(() => api.listProjects(connectorId)));
     protocol.registerTool("start_request", { description: "Queue a tracked work request. Reuse requestId only for identical retries.", inputSchema: mcpStartSchema }, input => result(() => api.startRequest(connectorId, input)));
-    protocol.registerTool("get_request", { description: "Read request progress, current questions and permitted actions.", inputSchema: mcpGetSchema }, input => result(() => api.getRequest(connectorId, input.runId)));
+    protocol.registerTool("get_request", { description: "Read request progress, current questions and permitted actions. A question's recommendation is the asking agent's suggestion, not a decision: show it as the agent's and reply only with the answer the person chooses.", inputSchema: mcpGetSchema }, input => result(() => api.getRequest(connectorId, input.runId)));
     protocol.registerTool("reply_to_request", { description: "Reply at the current revision. This never approves a provider permission.", inputSchema: mcpReplySchema }, input => result(() => api.replyToRequest(connectorId, input)));
     protocol.registerTool("control_request", { description: "Pause, resume or cancel a started request at its current revision.", inputSchema: mcpControlSchema }, input => result(() => api.controlRequest(connectorId, input)));
     return protocol;

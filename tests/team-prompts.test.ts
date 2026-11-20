@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { ENTRY_PARAGRAPH_LIMIT_BYTES, entryCommand, entryInstructions, ownerDirectionLines, refreshReportingInstructions, reportCommand, retargetPrompt, teamContext, teamPrompt } from "../packages/host/src/team-prompts.js";
 import { hostEntry } from "../packages/host/src/evidence/host-entries.js";
 import { buildCapsule } from "../packages/host/src/eval-rules.js";
-import { teamReportSchema, type TeamBrief, type TeamMember, type TeamModelProfile, type TeamRun, type TeamScout, type TeamTask } from "../packages/host/src/team-types.js";
+import { recordedTeamReportSchema, teamReportSchema, type TeamBrief, type TeamMember, type TeamModelProfile, type TeamRun, type TeamScout, type TeamTask } from "../packages/host/src/team-types.js";
 import type { TeamRunRouting, TeamRunRoutingAuto } from "../packages/host/src/routing-types.js";
 
 const PROMPT_LIMIT_BYTES = 80 * 1024;
@@ -271,15 +271,16 @@ test("blocked reports accept bounded structured evidence and keep it in coordina
 });
 
 test("team question modes preserve legacy behavior and validate selectable semantics", () => {
+  // A recorded question from a member started before recommendations were required; the mode rules are the tool's too.
   const legacy = { kind: "question", question: "Which response format?", options: ["JSON", "Text"] };
-  assert.deepEqual(teamReportSchema.parse(legacy), legacy, "Two legacy options do not infer approval mode");
-  assert.deepEqual(teamReportSchema.parse({ ...legacy, options: [] }), { ...legacy, options: [] });
-  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "approval" }).success, true);
-  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "approval", options: ["Approve"] }).success, false);
-  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "multiple" }).success, true);
-  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "multiple", options: ["Only one"] }).success, false);
-  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "single", options: ["One"] }).success, true);
-  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "approval", options: ["Approve", "Deny", "Defer"] }).success, false);
+  assert.deepEqual(recordedTeamReportSchema.parse(legacy), legacy, "Two legacy options do not infer approval mode");
+  assert.deepEqual(recordedTeamReportSchema.parse({ ...legacy, options: [] }), { ...legacy, options: [] });
+  assert.equal(recordedTeamReportSchema.safeParse({ ...legacy, answerMode: "approval" }).success, true);
+  assert.equal(recordedTeamReportSchema.safeParse({ ...legacy, answerMode: "approval", options: ["Approve"] }).success, false);
+  assert.equal(recordedTeamReportSchema.safeParse({ ...legacy, answerMode: "multiple" }).success, true);
+  assert.equal(recordedTeamReportSchema.safeParse({ ...legacy, answerMode: "multiple", options: ["Only one"] }).success, false);
+  assert.equal(recordedTeamReportSchema.safeParse({ ...legacy, answerMode: "single", options: ["One"] }).success, true);
+  assert.equal(recordedTeamReportSchema.safeParse({ ...legacy, answerMode: "approval", options: ["Approve", "Deny", "Defer"] }).success, false);
 });
 
 test("team agent guidance distinguishes approval from choices and leaves authority with the owner", () => {
@@ -288,7 +289,8 @@ test("team agent guidance distinguishes approval from choices and leaves authori
   assert.match(prompt, /answerMode "approval" only for a real authorization proposal/);
   assert.match(prompt, /first meaning approve and the second meaning deny/);
   assert.match(prompt, /two arbitrary options never imply approval/);
-  assert.match(prompt, /Never choose or approve for the owner/);
+  assert.match(prompt, /"recommendation":\{"answers":\["\.\.\."\],"reason":"\.\.\."\}/);
+  assert.match(prompt, /Every question carries your recommendation: copy option text exactly .* A recommendation never decides anything\. Never choose or approve for the owner\./);
 });
 
 test("permission evidence stays complete inline and an over-budget review fails closed", () => {
@@ -436,7 +438,7 @@ function pinnedContexts() {
   const run = goalRun();
   return PIN_ROLES.map(role => JSON.stringify(teamContext(run, "Owner feedback excerpt.", { checks: PIN_CHECKS }, role), null, 2));
 }
-const PIN_PROMPTS_SHA256 = "d47d7a1e8fd478fb571e12c76b96714afecfec680d12b3cee5bc87d598859308";
+const PIN_PROMPTS_SHA256 = "d3c6439e21fad6364731c0bb4e0792ba9c2ca9cb2940d59568be9c994d8877fb";
 const PIN_CONTEXTS_SHA256 = "9ee8fe8ac898e2d70ddbb012ba398387d526294ea61739fb7aad4385b7a7412b";
 
 test("the switch off keeps every prompt and context byte", () => {

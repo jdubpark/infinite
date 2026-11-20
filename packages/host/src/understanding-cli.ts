@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import type { BehaviorCheckResult, BehaviorDefinition, BehaviorList, BehaviorModel, BehaviorPropertyResult, BehaviorRun, BehaviorSuite, KnowledgeBehavior, KnowledgeCatalog, KnowledgeClaim, KnowledgeComponent, KnowledgeMaintenance, KnowledgeRelationship, WorkspaceKnowledge } from "@infinite/remote";
+import type { BehaviorCheckResult, BehaviorDefinition, BehaviorList, BehaviorModel, BehaviorSuite, KnowledgeBehavior, KnowledgeCatalog, KnowledgeClaim, KnowledgeComponent, KnowledgeMaintenance, KnowledgeRelationship, WorkspaceKnowledge } from "@infinite/remote";
 import type { ProjectGroupList } from "./project-group-types.js";
 import type { DiagramGraph, GeneratedCatalogPage, KnowledgeRepositoryBrief, WorkspaceUnderstanding, UnderstandingArtifact, UnderstandingPlan, UnderstandingWork } from "@infinite/remote";
 import { behaviorDefinitionHash, validateBehaviorDefinition, checkBehaviorModel } from "./behavior-checker.js";

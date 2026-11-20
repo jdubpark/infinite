@@ -16,9 +16,9 @@ export type IntentItem = {
 
 const L = INTENT_REPORT_LIMITS;
 /** A non-empty string of at most `max` UTF-8 bytes. */
-const bytes = (max: number) => z.string().min(1).refine(value => Buffer.byteLength(value, "utf8") <= max, { message: `At most ${max} bytes` });
+export const bytes = (max: number) => z.string().min(1).refine(value => Buffer.byteLength(value, "utf8") <= max, { message: `At most ${max} bytes` });
 /** Any JSON value whose serialization is at most `max` bytes. `undefined` is refused, so the report tool's schema still builds. */
-const boundedJson = (max: number) => z.unknown().refine(value => value !== undefined && Buffer.byteLength(JSON.stringify(value) ?? "", "utf8") <= max, { message: `JSON of at most ${max} bytes` });
+export const boundedJson = (max: number) => z.unknown().refine(value => value !== undefined && Buffer.byteLength(JSON.stringify(value) ?? "", "utf8") <= max, { message: `JSON of at most ${max} bytes` });
 
 const questionSchema = z.object({
   text: bytes(L.questionBytes),

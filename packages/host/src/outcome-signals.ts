@@ -152,6 +152,8 @@ export function saveOutcomeRow(tx: EvidenceTx, row: OutcomeRow): void {
   row.accepted = computed.accepted;
   row.firstPass = computed.firstPass;
   row.held = computed.held;
+  // A replay row never informs a rate, so its levels stay unknown (C5).
+  if (row.source === "replay") row.accepted = row.firstPass = row.held = null;
   row.exclusion = rowExclusion(row.disposition, facts.signals) ?? null;
   row.payload.rounds = roundCounts(links);
   const flags: Flag[] = row.flags.filter(flag => flag !== "scan-gap");

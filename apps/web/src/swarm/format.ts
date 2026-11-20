@@ -39,7 +39,3 @@ export function clockTime(iso: string): string {
   return new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(iso));
 }
 
-/** Keeps the tail of a path so the file or deepest directory stays visible. */
-export function shortPath(path: string, max = 28): string {
-  return path.length <= max ? path : `…${path.slice(path.length - max + 1)}`;
-}

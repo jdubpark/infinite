@@ -1,5 +1,5 @@
 import type { EvidenceStore } from "./evidence/store.js";
-import { EvidenceError, type EvidenceDb, type EvidenceTx } from "./evidence/types.js";
+import { EvidenceError, type EvidenceDb } from "./evidence/types.js";
 import {
   LEGACY_LINE_CAP,
   type LegacyOutcome,

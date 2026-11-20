@@ -11,7 +11,7 @@ import {
   closeSync,
 } from "node:fs";
 import { resolve, join, dirname } from "node:path";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { randomBytes, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";

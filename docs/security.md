@@ -35,9 +35,13 @@ trust and persistent allow rules remain outside delegation. An owner who sets
 their own folders. Claude team launches load no project or local settings file
 (`--setting-sources user`), so hooks, allow rules and MCP servers that an
 earlier member committed to `.claude/settings.json` or `.mcp.json` never apply
-to a later member. Codex
-members may still load a project Codex configuration that earlier members
-edited. Headless OpenCode
+to a later member. A trusted Codex member does not start while its folder, or
+any folder above it up to the Git root, holds a `.codex` entry, so Codex
+settings, hooks and MCP servers that an earlier member committed do not reach
+it. That check runs just before the launch, so a file written in the moment
+between the check and Codex's start is not caught. Both checks cover what the
+repository carries, not the agent account's own provider configuration, which
+any agent-account process can edit. Headless OpenCode
 rejects unmet permissions instead of providing an interactive approval flow. Profile `dataUse` labels disclose
 configured contributor use without changing provider terms or retention. See
 [Goals and agent teams](teams.md) for scope, routing, limits, and recovery.
@@ -121,7 +125,7 @@ Mined tasks keep their material the same way. Validation stores file lists seale
 
 ## Eval grader account
 
-The grader account runs the focused tests and the guard checks of a replay candidate. It is an account of its own. It has no provider login, no repository credential, and no read access to host state. The host reaches it only through the launcher that [the grader install](../deploy/ubuntu/grader.md) sets up. The launcher admits eight operations, and it confines each one to the grader's root.
+The grader account runs the focused tests and the guard checks of a replay candidate. It is an account of its own. It has no provider login, no repository credential, and no read access to host state. The host reaches it only through the launcher that [the grader install](../deploy/ubuntu/grader.md) sets up. The launcher admits nine operations, and it confines each one to the grader's root.
 
 Before each task the host probes the account. The probe requires a user id that differs from the host's, a root of mode `0700` that the grader owns, no writable directory above that root, the tools the launcher needs, no readable canary, and a closed metadata address. Any other result is a named state, and no task starts. The probe runs before each task, not during one.
 
@@ -172,6 +176,60 @@ These are the owner's choices. The design does not impose them.
 - Untrusted code. Each focused test is code from the repository at an old commit, with old dependencies. It runs as the grader, with the launcher's limits and no host credential.
 
 The probe checks each canary before a task. It cannot see a path that becomes readable during a round, and that path is checked only at the next probe.
+
+## Eval member account
+
+The eval account runs the member of a replay trial: a model session that works on one task of a project, with its own provider logins. It is an account of its own. It has no repository credential, no GitHub grant, and no project environment. The host reaches it only through the launcher that [the eval member account install](../deploy/ubuntu/eval.md) sets up. Each launcher operation is one call, and it confines the call to the account's root, in which the member's workspace is one directory.
+
+Before each trial the host stops the account's processes, removes every trial workspace, resets the account's home from a root-owned template, and then probes the account. The probe runs before a trial, not during one. Only the state `ready` starts a trial. The other states are `not-configured`, `unavailable`, `misconfigured`, `exposed`, `network-open`, and `busy`, and each names the failed check.
+
+### What a trial member can reach
+
+| Channel | What the member can reach | Control |
+|---|---|---|
+| Production credentials | Nothing. The Manager launches a learning session with the eval account's own launch profile, never with a production one. The eval wrapper loads no project environment and unsets `INFINITE_GITHUB_GRANT` and `INFINITE_GITHUB_PROXY`. The launcher receives none of the host's variables. | The profile choice in the Manager, the wrapper, and the sudo rule's `!env_keep`. |
+| The repository | Only the replay base. The workspace is cloned from a bundle of one branch. The launcher removes the clone's remote and deletes the branch, and `check` proves that the reference commit and the other objects are absent and that `git remote` prints nothing. | `prepare` and `check`. |
+| Hidden tests and grading material | Nothing. Hidden material exists only in the grader's root, which the eval account cannot read. | The grader's root mode and the probe's canaries. |
+| Host state | Nothing that the probe lists: the evidence database, the vault key, the state, run, and team workspace directories, each GitHub mirror and project checkout, the grader's root, and the owner's `canaries`. | The probe. A readable canary gives `exposed`. |
+| Other trials and sessions | Nothing. One trial runs at a time. Before each one, the probe finds no entry in the trials root, no leftover in the home, and no System V object or file of the account in the shared directories `stop` empties. | `stop`, `clean`, `scrub`, and the probe. |
+| Earlier trials | The login files, which `scrub` keeps. The rest of the home, the temporary directory, and the trials root do not survive a trial. | `scrub` and `clean`. |
+| Provider endpoints | Reachable through the egress proxy with the `_eval` credential, which the proxy limits to its own list. A direct connection is refused by the network rule. | The `_eval` list and `eval.nft`. |
+| Processes | None survive a trial. The host runs `stop` and checks the process table, in up to three rounds, before and after each trial. | `stop` and the process check. |
+| Permission dialogs | The project's permission pipeline decides them, and for a project the host permission agent serves, that agent does. A dialog that nobody decides ends the trial `permission`. Nothing answers it. | The permission pipeline. |
+
+A trial is labelled `isolated` only when the probe is `ready`, its fetch of the repository fails both directly and through the proxy, and the source is clean. Otherwise it is labelled `none`. In observe mode the proxy lets `_eval` reach any public host, so the fetch succeeds and the trial is labelled `none`.
+
+### Loopback services
+
+| Service | Address | Credential the member holds |
+|---|---|---|
+| Hook listener | The address in the session's hook variables | Its own hook token, which serves only its session |
+| Egress proxy | `127.0.0.1:4785` | The `_eval` credential, limited to its own list |
+| GitHub credential proxy | `127.0.0.1:8417` | None. The wrapper removes the grant variables. |
+| API | `127.0.0.1:4780` | None |
+| Relay | `127.0.0.1:4790` | None. The owner lists the relay key in `canaries`. |
+
+### What stays with the owner
+
+These are the owner's choices. The design does not impose them.
+
+- The provider logins, and whether the provider keeps history and memory for them. Use the logins for nothing else (owner decision 2). The host cannot see what a provider keeps on its own side for a login.
+- The files of the home template, which every trial loads.
+- The `canaries` of the member and of the grader, the egress lists, and the network rule.
+- Whether cron and `at` deny the account, as the install of [the eval member account](../deploy/ubuntu/eval.md) says.
+- `/proc` hiding, a private `/tmp`, a disk quota, and a memory limit for the account.
+- The `trialsPerDay` cap, the job windows, and the choice of the candidate profiles.
+
+### What stays reachable
+
+- The login files. `scrub` keeps them, because the providers rewrite them on refresh. A member can therefore leave a value in them for the next trial of any task. The design accepts that channel.
+- Whatever a provider keeps for its login on its own side.
+- The package registries of `_eval-setup` for up to 15 minutes after setup, and any process setup left running or any file that holds its credential. Do not list a registry that serves the project's own later releases.
+- Other world-writable locations. `stop` removes the account's System V shared memory, semaphores, and message queues, and its own files in `/tmp`, `/var/tmp`, `/dev/shm`, `/dev/mqueue`, `/run/lock`, and `/var/crash`. It fails when any of them remains, and the probe reports `busy` for the account's objects and files there. Other accounts' readable files in those directories stay. A world-writable directory that the list does not name is not emptied, and a file the account leaves there survives, so an owner who adds such a directory to the machine adds it to the launcher's `STOP_DIRS` list. Abstract Unix sockets end with the processes, and the kernel's other per-user state, such as keyrings, is not inspected.
+- Process command lines in `/proc`. The host passes no secret in an argument. The launcher passes the setup and probe proxy credentials in the environment of the command, never in the arguments of a long-lived process: `env` holds them and runs `timeout`, so the arguments of `timeout` and of the command carry none. Another local account can still read the arguments of `prlimit` and `env` for the moment before each runs its successor.
+- Cron and `at` jobs, unless the owner denies them to the account. A job would outlive `stop`.
+- Any public host that the `_eval` list names, and every public host in observe mode.
+- The loopback services in the table above, each of which needs a credential the member does not hold.
 
 ## Remote machine transport
 
@@ -310,11 +368,12 @@ Use encrypted off-host backups with restore testing. Keep the backup decryption 
 - Native terminal recordings are not a complete audit of every filesystem operation or hidden model context. An agent can write a file without printing it.
 - Hook tokens are readable by the agent process. Each worker passes `INFINITE_HOOK_URL` and `INFINITE_HOOK_TOKEN` in the agent's environment, so the agent can post forged signals. Signals are evidence about the agent, never authority over it. They are labeled by source, never approve anything, and the screen checks run independently. The answer endpoint only presses keys for a dialog the terminal shows and checks it before and after.
 - Codex hooks are off by default, and they must stay off for a repository whose contents you do not trust. When `attention.hooks.codex` is enabled, the hooks are injected with `--dangerously-bypass-hook-trust`. Spike S2 (2026-11-13, Codex CLI 0.167) showed that the flag is wider than the hooks Infinite injects: for that one process it also lets hooks that the working directory defines run without review, outside the command sandbox. It persists no trust. `doctor` prints a warning that names the flag when Codex hooks are enabled.
+- With Codex hooks off, the host still passes Codex's `notify` setting to each session that has a hook listener: a team member, or a session under a handoff policy. An ordinary Codex session has no listener while Codex hooks are off, and gets no `notify`. This route passes no bypass flag and adds no hook trust, so a hook defined in the working directory that Codex was not already told to trust does not run because of it. Codex runs the command at each turn end with one JSON argument: the thread id, turn id, working directory, the turn's input messages and the last assistant message. Codex passes it as a command-line argument of the relay process, which lives at most 4 seconds. The host uses the thread id to find the Codex session file and reads it for usage. With Codex hooks off the host journals no attention signal from the notice; it uses the notice only to find and read the session record. No hook marks the start of a turn then, so a notice proves only that some turn ended, and the host reads the turn boundary from the record after the provider exits: the session's usage coverage can be `complete` only when that final read reached the end of the record and the last turn the record starts (`task_started`) has its own end row (`task_complete`). When the record shows a later turn that was cut short or aborted, coverage is `partial`. The JSON argument is visible to other local accounts in the process list while the program runs, unless process listings are hidden. Per-event signals (permission prompts, tool input) still need hooks and this route does not provide them.
 - Push is an optional outbound dependency of the host. Bodies are minimal by default and carry no session content; `push.detail: "full"` is opt-in. Messages go through Expo's push service and can be cached there. The Expo access token lives in a 0600 file outside the state directory. Push can be left disabled.
 - Signal payloads can contain commands and file contents. They are journaled encrypted like the rest of the recording and shown only to paired roles.
 - Transcript bytes reach the worker only through the authenticated hook relay, which runs as the agent and reads only a regular `.jsonl` file the provider's own hook named, and for Claude Code the subagent transcript files in that session's `subagents` folder, for their usage only. After a provider exits, the same relay runs once more in drain mode; on the Ubuntu deployment that runs through the root-owned `transcript-drain` wrapper, which takes no arguments, and the worker's authenticated reply names the file. The path checks do not change for the drain. These path checks prevent accidental reads. They are not a boundary against the agent's own account, which can read the same files. The worker records them as `message` events in the encrypted journal, so chat carries the same plaintext the provider already stores in its home. On the Linux deployment the hook variables must be in sudo's `env_keep`, or hooks and transcripts never leave the agent account.
 - The process census looks for processes left by an earlier API process after a restart. The host reads the process table itself and inspects processes of its own account. On the Ubuntu deployment it inspects the agent account through the root-owned `process-census` wrapper, which takes no arguments, takes its directory on standard input, and reads the working directories, open files and command lines of that account's processes. It reports only process ids and a reason, and it never signals, stops or changes a process. Its output crosses an account boundary and is validated before use. A process that refuses inspection is reported as such, and the host then says it cannot tell. The census is evidence about left-over processes; it is not a defense against a process of the agent account that hides on purpose or interferes with the census.
-- Chat summaries send recorded messages to the configured external model (`summaries`). With `jev` configured, the host can also send candidate sentences from an agent's last message and the clipped first line of a long default-titled prompt to TypeSafe; the summary writer's provider receives that prompt only when Jev finds its clipped first line unclear. A team run's long untitled request is handled the same way, except that local paths and file URLs are removed before either model sees it and, with no `jev` configured, the request goes to the summary writer directly. Configure `jev` with an absolute `apiKeyFile` to a private 0600 file outside the state directory, and optional `model` (default `jev-latest`) and `baseUrl` (default TypeSafe API URL). The summary writer's key file follows the same private-file rule. Provider retention policies remain separate boundaries. With no `jev` key configured, no TypeSafe calls occur. With `intake.slack.classify` on, the host also sends the owner's own Slack mention text, cut to 1,000 characters, to TypeSafe so the reading can choose between an answer and a request; nothing else from the thread, and no text from anyone else, is sent. Setting `jev.sessionReadings` to `false` (default `true`) stops both session flows, the last-message sentences and the clipped prompt line, and leaves only the intake route reading; the long-title question then goes to the summary writer directly.
+- Chat summaries send recorded messages to the configured external model (`summaries`). With `jev` configured, the host can also send candidate sentences from an agent's last message and the clipped first line of a long default-titled prompt to TypeSafe; the summary writer's provider receives that prompt only when Jev finds its clipped first line unclear. A team run's long untitled request is handled the same way, except that local paths and file URLs are removed before either model sees it and, with no `jev` configured, the request goes to the summary writer directly. Configure `jev` with an absolute `apiKeyFile` to a private 0600 file outside the state directory, and optional `model` (default `jev-latest`) and `baseUrl` (default TypeSafe API URL). The summary writer's key file follows the same private-file rule. Provider retention policies remain separate boundaries. With no `jev` key configured, no TypeSafe calls occur. With `intake.slack.classify` on, the host also sends the owner's own Slack request text, cut to 1,000 characters, to TypeSafe so the reading can choose between an answer and a request; nothing else from the thread, and no text from anyone else, is sent. Setting `jev.sessionReadings` to `false` (default `true`) stops both session flows, the last-message sentences and the clipped prompt line, and leaves only the intake route reading; the long-title question then goes to the summary writer directly.
 - Speech recognition runs in the platform's recognizer (Apple, Google, or the browser vendor), which may process audio on its own servers. With `dictation` configured, the transcript text goes to that model with `store: false`. Leave the block unset to send no transcripts to a model; clients then insert raw transcripts.
 - Confidential VMs can narrow provider/hypervisor threats, but they do not protect against compromised software inside the trusted guest. Attestation and external key release would be a separate security project, not a box to check on this service. [Confidential VM model](https://docs.cloud.google.com/confidential-computing/confidential-vm/docs/about-cvm).
 
@@ -353,13 +412,21 @@ Slack surface:
   `intake.linear.creatorId`. When a Slack thread is required, the thread must also
   hold a message from the owner's Slack user ID, `intake.slack.ownerUserId`, that
   mentions Linear's agent and was sent before the issue was filed. A direct
-  request, with `intake.slack.directRequests` on, starts only from an `app_mention`
-  of the bot by that Slack user in the configured workspace, with no bot ID. With
-  `intake.linear.admitIssues` false, the first route is off.
-- The bot acts only on `app_mention` events from the owner's Slack user in a thread
-  bound to a record. A mention or reply from anyone else in a bound thread is
-  dropped before anything is stored; the surface keeps only a count of dropped
-  events. Nothing from that message reaches the record, the mission, or an agent.
+  request, with `intake.slack.directRequests` on, starts from the owner's
+  mention of the bot in the configured workspace. In a configured request
+  channel, the owner's ordinary top-level message or explicit instruction to
+  take on a proposal can start the same flow. With `intake.linear.admitIssues`
+  false, the first route is off.
+- Only the configured owner's messages can answer, steer, or control a
+  mission. With `intake.slack.ownerOnlyInJoinedChannels` enabled, sender
+  identity gates every inbound response, including proposal reactions and
+  status replies. The policy applies to mentions and ordinary messages in
+  all joined public and private channels. With shared proposal channels enabled,
+  a teammate can receive a fixed 👀 reaction
+  on their proposal and ask for status in a bound thread. The public status
+  comes from that thread's records and contains counts and state. The host
+  neither stores the teammate's proposal text on arrival nor sends their
+  status request to a model. Channel membership grants no mission controls.
 - The thread the issue links is read once, at admission. The objective keeps only
   the owner's own messages from it. Messages from anyone else, and bot messages,
   are read at admission to check authorship and are not stored, shown to agents,
@@ -367,11 +434,11 @@ Slack surface:
   after an uncertain send; it stores nothing from that read.
 - For a direct request, other people's messages are read, because the owner's
   decision of 2026-11-14 is that they reach agents. The messages in the thread
-  at the time of the mention, sent no later than the mention, are put in the
+  through the owner's request are put in the
   mission objective, stored with the mission, and shown to agents. They are not
   logged, not copied into the Linear issue or any comment, and not posted to
   Slack. The host reads the thread when it files the request, and again if
-  filing is retried. It keeps messages whose timestamp is at or before the mention
+  filing is retried. It keeps messages whose timestamp is at or before the owner's request
   and discards later ones before anything is stored, passed to an agent, shown, or
   logged. A message edited before the read appears with its edited text. The
   tracker receives only the owner's text and the Slack link, and fixed receipts for
@@ -383,9 +450,10 @@ Slack surface:
 - A skipped issue's title and description are not stored. Its record keeps the
   issue's IDs, URL, times, and skip reason, and no text from the issue.
 
-The bot posts only into the thread a record is bound to. Every outbound Slack
-function takes an intake record and reads its thread; none takes a channel ID
-from an inbound event. Linear comments go only to the issue whose record they
+The bot posts messages only into the thread a record is bound to. A proposal
+reaction targets the original Slack message in a configured request channel.
+Everyone who can read that channel can read the questions and results posted
+there. Linear comments go only to the issue whose record they
 belong to. Neither surface changes a Linear issue's state, assignee, or labels,
 and neither approves a provider permission or marks work complete. Results are
 labelled as agent reports.
@@ -417,7 +485,7 @@ places: a mission service refusal (`TeamError`), a Slack request failure
 Residual risk: the objective carries the Linear title and description, and the
 owner's Slack messages, to the coordinator and subteams. For a direct request it
 also carries the other people's text in the thread, so anyone who can post in a
-thread where the owner mentions the bot can put words in front of agents. Agent reports posted in the
+thread where the owner starts a request can put words in front of agents. Agent reports posted in the
 thread may restate thread content, and pull requests the agents open are written by
 the agents. Anyone
 who can edit the issue before it is admitted can put instructions in its title or
@@ -428,12 +496,12 @@ guarantee, and it does not stop an injected request from the owner's own account
 
 ### Answers and the route
 
-With `intake.slack.answerQuestions` on, the first host action for an owner's mention
+With `intake.slack.answerQuestions` on, the first host action for an owner's Slack request
 can be chosen by a model reading. The bounds:
 
 - The owner's word wins. A mention that starts with `ask:` or `work:` takes that route
   and the reading is never asked.
-- Eligibility is fixed when the mention is saved. Only a record saved with
+- Eligibility is fixed when the request is saved. Only a record saved with
   `answerQuestions` on is routed or read by the reading service; a request saved
   before the setting was on stays work, including one whose Linear filing is
   pending, so reconciliation of an issue Linear may already hold is never
@@ -442,7 +510,7 @@ can be chosen by a model reading. The bounds:
   and a missing, failed, or slow (over six seconds) reading routes to work, which is
   the route that already existed. A reading can send a request to the answer route
   only when it is confident of an answer or unsure.
-- The only text sent to the reading service is the owner's own mention text, cut to
+- The only text sent to the reading service is the owner's own Slack request text, cut to
   1,000 characters, and only with `intake.slack.classify` on. Thread messages, other
   people's text, and bot text are never sent. The call is made in the intake cycle,
   not in the Slack event handler.

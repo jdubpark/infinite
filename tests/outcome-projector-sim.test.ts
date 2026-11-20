@@ -28,7 +28,8 @@ import { bump, type Counts, type Rand, rand, RunScript } from "./outcome-sim-scr
  * every handler it compares against; P5 and P6 recount with production's helpers or a copy of their logic; P7 checks
  * gap propagation only where a gap is already recorded. Rule semantics stay with tests/outcome-projector.test.ts,
  * tests/outcome-rules.test.ts and tests/outcome-signals.test.ts. For example, an empty repair answer that leaves its
- * round "answered", or a repair answer that keeps another base's links pending, passes every invariant (INF-316).
+ * round "answered", or a repair answer that keeps another base's links pending, passes every invariant; an example
+ * test in tests/outcome-projector.test.ts catches each (INF-316).
  *
  * Faults: a restart after the store took a flush and before any projection (close, then reopen the same path with the
  * same key and register everything again); the sealed outbox flushed again after that restart; a projector that throws

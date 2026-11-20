@@ -205,6 +205,9 @@ const CLAUDE_EVENTS = [
   "StopFailure",
   "SessionEnd",
 ];
+/** A TOML basic string. JSON escapes what TOML requires escaped, except DEL, which TOML also refuses raw. */
+const tomlString = (value: string) => JSON.stringify(value).replace(/\x7f/g, "\\u007f");
+
 const CODEX_EVENTS = [
   "SessionStart",
   "UserPromptSubmit",
@@ -424,24 +427,24 @@ export function buildLaunch(
       throw new Error("A Claude team launch chooses its own setting sources; remove --setting-sources from the profile.");
     args.push("--setting-sources", "user");
   }
-  if (hooks && provider === "codex" && enabled.codex) {
-    const command = [...relay, "codex"].join(" ");
-    for (const event of CODEX_EVENTS)
+  if (hooks && provider === "codex") {
+    // notify needs no hook trust, so it stays on when Codex hooks are off; turn-end usage then needs no bypass (INF-213).
+    args.push("-c", `notify=[${[...relay, "codex-notify"].map(tomlString).join(",")}]`);
+    if (enabled.codex) {
+      const command = [...relay, "codex"].join(" ");
+      for (const event of CODEX_EVENTS)
+        args.push(
+          "-c",
+          `hooks.${event}=[{hooks=[{type="command",command=${tomlString(command)}}]}]`,
+        );
+      args.push("--dangerously-bypass-hook-trust");
       args.push(
         "-c",
-        `hooks.${event}=[{hooks=[{type="command",command="${command}"}]}]`,
+        `tui.notifications=["agent-turn-complete","approval-requested","async-question"]`,
       );
-    args.push("--dangerously-bypass-hook-trust");
-    args.push(
-      "-c",
-      `notify=[${[...relay, "codex-notify"].map((a) => `"${a}"`).join(",")}]`,
-    );
-    args.push(
-      "-c",
-      `tui.notifications=["agent-turn-complete","approval-requested","async-question"]`,
-    );
-    args.push("-c", `tui.notification_method="osc9"`);
-    args.push("-c", `tui.notification_condition="always"`);
+      args.push("-c", `tui.notification_method="osc9"`);
+      args.push("-c", `tui.notification_condition="always"`);
+    }
   }
   if (trustedCwd && provider === "codex") args.push(...codexTrustArgs(trustedCwd));
   if (prompt)

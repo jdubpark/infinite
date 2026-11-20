@@ -17,7 +17,8 @@ import { MirroredProjects } from "./mirrored-projects.js";
 /**
  * Provider hooks injected at launch when the config does not say. Codex hooks stay off: spike S2
  * (2026-11-13) showed that `--dangerously-bypass-hook-trust`, which the injected `-c hooks.*` need,
- * also lets hooks defined in the working directory run without review.
+ * also lets hooks defined in the working directory run without review. The turn-end `notify` setting stays on
+ * without hooks (INF-213).
  */
 export const DEFAULT_HOOKS = { claude: true, codex: false } as const;
 /** The name that starts the host's tracker comments when `linear.reportName` is not set. */

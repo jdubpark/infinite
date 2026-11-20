@@ -433,12 +433,10 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | Hook
   if (route === "drain") { const started = drainOpen ? transcriptWatch.drainFinal() : undefined; return started ? { transcript: started } : undefined; }
   if (route === "transcript") return state.status === "running" || drainOpen ? onTranscript(body) : undefined;
   if (state.status !== "running") return;
-  const signals =
-    route === "claude"
-      ? mapClaudeHook(body)
-      : route === "codex"
-        ? mapCodexHook(body)
-        : mapCodexNotify(body);
+  const signals = route === "claude" ? mapClaudeHook(body) : route === "codex" ? mapCodexHook(body) : mapCodexNotify(body);
+  // With Codex hooks off, a notify only links the session record: its turn end reaches the transcript watch, and no
+  // attention signal is journaled, because no turn-start hook would follow to show later work (INF-213).
+  const linkOnly = route === "codex-notify" && !config.attention.hooks.codex;
   const agent = route === "claude" ? claudeAgent(body) : undefined;
   const b = body as Record<string, unknown>;
   const event =
@@ -475,15 +473,16 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | Hook
   const started = transcriptWatch.hook({
     subagent: b.agent_id !== undefined,
     turnEnd: closesTurn(signals, event),
+    endOnly: linkOnly,
     sessionEnd: event === "SessionEnd",
     ...(transcriptPath !== undefined ? { transcript: { path: transcriptPath, provider: route === "claude" ? "claude" : "codex" } } : {}),
   });
   let reply: HookReply | void = started ? { transcript: started } : undefined;
   if (!hooksReady) {
     hooksReady = true;
-    record({ kind: "hooks-ready", event: event.slice(0, 60) }, "hook");
+    if (!linkOnly) record({ kind: "hooks-ready", event: event.slice(0, 60) }, "hook");
   }
-  for (const signal of signals) {
+  for (const signal of linkOnly ? [] : signals) {
     if (signal.kind === "prompt-closed") {
       // A hook's close (PermissionDenied) names no prompt; it closes the open one, unless an
       // answer is pressing keys on it or its block is still on screen (the screen loop owns that).

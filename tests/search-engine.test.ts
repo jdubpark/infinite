@@ -46,7 +46,7 @@ const starts = (total: number, searches: number, oldest = false) => [oldest, ...
 /** Every condition holds unless a patch breaks one. */
 function facts(patch: FactsPatch = {}, policy: TeamSearch = {}): AdmissionFacts {
   const base: AdmissionFacts = {
-    id: "search-1", now: at(0), policy: searchPolicy({ mode: "live", ...policy }), checkMinutes: 60,
+    id: "search-1", now: at(0), policy: searchPolicy({ mode: "live", ...policy }),
     routing: { mode: "auto", coversStart: true, revoked: false },
     run: { goalCycle: true, recordDigest: true, requiredChecks: ["digest-lint", "digest-parser-test"], searches: 0, wideSearch: false },
     task: { role: "implementer", risk: "normal", firstAttempt: true, criterionId: "c1", criterionShared: false, duel: false,
@@ -364,6 +364,22 @@ test("a restart at rest repeats the launch that waits for its receipt, under its
   assert.equal(drive.search.state, "wide");
   drive.at(8, { kind: "resume" });
   assert.deepEqual(drive.last, []);
+});
+
+test("the allowance counts a gate run as 20 + gateMinutes, also when the check limit is shorter (Part 7)", () => {
+  const result = armed({}, { checkMinutes: 10 });
+  result.at(10, { kind: "result", memberId: CHAMPION }, { checkMinutes: 10 });
+  assert.equal(result.search.holdUntil, at(10 + 3 * 35 + 60));
+  const left = armed({}, { checkMinutes: 10 });
+  left.at(20, { kind: "left", memberId: CHAMPION, reason: "stall" }, { checkMinutes: 10 });
+  assert.equal(left.search.holdUntil, at(20 + 3 * 35 + 60));
+  const early = admitted();
+  early.at(3, { kind: "result", memberId: CHAMPION }, { checkMinutes: 10 });
+  assert.equal(early.search.holdUntil, at(3 + 4 * 35 + 60), "with the base run open");
+  // Widening checks the rest of the allowance against the deadline: 3 × 35 + 60 = 165 minutes from the leave.
+  const tight = armed({}, { checkMinutes: 10, deadline: at(20 + 164) });
+  tight.at(20, { kind: "left", memberId: CHAMPION, reason: "stall" }, { checkMinutes: 10, deadline: at(20 + 164) });
+  assert.deepEqual([tight.search.state, tight.search.endReason], ["abandoned", "deadline"]);
 });
 
 test("a stalled champion is stopped without a replacement and released only when the search ends (acceptance 10)", () => {

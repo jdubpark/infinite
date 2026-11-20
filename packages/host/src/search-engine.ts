@@ -123,7 +123,7 @@ export type RunView = {
   now: string;
   /** The run's pinned policy, read through `searchPolicy`. */
   policy: SearchPolicy;
-  /** `teams.checkMinutes`: the limit of one check command. */
+  /** `teams.checkMinutes`: the limit of one check command, which a `measure` window must leave before the deadline. */
   checkMinutes: number;
   /** The run's deadline, with any approved extension applied. */
   deadline?: string;
@@ -203,20 +203,14 @@ const reached = (now: string, at: string | undefined) => at !== undefined && Dat
 const pastDeadline = (deadline: string | undefined, at: string) => deadline !== undefined && Date.parse(at) > Date.parse(deadline);
 
 /**
- * One gate run in a `live` allowance: the clone and the setup command, then the command. PROPOSED: the allowance uses
- * the command's effective limit, `gateMinutes` or `checkMinutes` when shorter, as the gate run itself does (Part 3).
- */
-function gateRunMinutes(policy: SearchPolicy, checkMinutes: number): number {
-  return GATE_SETUP_MINUTES + Math.min(policy.gateMinutes, checkMinutes);
-}
-
-/**
  * A `live` search's allowance (Part 7): one gate run for each contestant, one more for a base run that has not ended,
- * and the wait. PROPOSED: "each contestant" is the policy's `attempts`, so admission, the champion's result and widening
- * all reckon with the full search; the design's example counts it so (4 × 35 + 60 = 200 with three attempts).
+ * and the wait. A gate run counts as Part 7 states it, 20 minutes for the clone and the setup command plus
+ * `gateMinutes`, also where Part 3 gives the command a shorter `teams.checkMinutes`. PROPOSED: "each contestant" is the
+ * policy's `attempts`, so admission, the champion's result and widening all reckon with the full search; the design's
+ * example counts it so (4 × 35 + 60 = 200 with three attempts).
  */
-function allowanceMinutes(policy: SearchPolicy, checkMinutes: number, baseOpen: boolean): number {
-  return (policy.attempts + (baseOpen ? 1 : 0)) * gateRunMinutes(policy, checkMinutes) + policy.waitMinutes;
+function allowanceMinutes(policy: SearchPolicy, baseOpen: boolean): number {
+  return (policy.attempts + (baseOpen ? 1 : 0)) * (GATE_SETUP_MINUTES + policy.gateMinutes) + policy.waitMinutes;
 }
 
 /** The run's measurement window (Part 3): 2 × (20 + `gateMinutes`) for each `measure` search that waits at the boundary. */
@@ -244,7 +238,6 @@ export type AdmissionFacts = {
   id: string;
   now: string;
   policy: SearchPolicy;
-  checkMinutes: number;
   routing: { mode: "off" | "shadow" | "auto"; coversStart: boolean; revoked: boolean };
   /** `wideSearch`: a search of the run is `wide` or has a launch that waits for its receipt. */
   run: { goalCycle: boolean; recordDigest: boolean; requiredChecks: readonly string[]; searches: number; wideSearch: boolean; deadline?: string };
@@ -285,7 +278,7 @@ export function admit(f: AdmissionFacts): Admission {
     [5, !task.duel && !task.exploratoryStart],
     [6, !f.run.wideSearch && f.run.searches < SEARCHES_PER_RUN && !f.project.paused],
     [7, !live || (shareFits(f.project.starts, policy.share)
-      && !pastDeadline(f.run.deadline, plus(f.now, allowanceMinutes(policy, f.checkMinutes, true))))],
+      && !pastDeadline(f.run.deadline, plus(f.now, allowanceMinutes(policy, true))))],
   ];
   const failed = checks.find(([, holds]) => !holds);
   if (failed) return { admitted: false, condition: failed[0] };
@@ -397,7 +390,7 @@ function widen(ctx: Ctx, arming: boolean): void {
   // PROPOSED: one launch at a time. A champion that fails or leaves while the launch of arming waits for its receipt
   // starts no second one; the receipt decides, and an empty one ends the search under rule 3.
   if (s.pending !== undefined) return;
-  const rest = s.holdUntil ?? plus(view.now, allowanceMinutes(view.policy, view.checkMinutes, false));
+  const rest = s.holdUntil ?? plus(view.now, allowanceMinutes(view.policy, false));
   if (pastDeadline(view.deadline, rest)) {
     // CONTRADICTION: condition 12 failing at widening makes "none can start", which rule 3 ends as `exhausted`; Part 7
     // and rule 9 say a `live` allowance that no longer fits is `abandoned`. This follows Part 7 and rule 9.
@@ -531,7 +524,7 @@ const HANDLERS: Handlers = {
     if (s.mode === "measure" || c === undefined || !isWorking(c)) return;
     c.resultAt = view.now;
     if (c === champion(s)) {
-      s.holdUntil = plus(view.now, allowanceMinutes(view.policy, view.checkMinutes, s.state === "admitting"));
+      s.holdUntil = plus(view.now, allowanceMinutes(view.policy, s.state === "admitting"));
       if (pastDeadline(view.deadline, s.holdUntil)) return end(ctx, "abandoned", "deadline");
       if (s.state === "admitting") return;
     }
@@ -576,7 +569,7 @@ const HANDLERS: Handlers = {
     }
     if (s.mode === "measure" || s.state === "admitting" || !CHAMPION_LEAVES.has(e.reason)) return end(ctx, "abandoned", `champion-${e.reason}`);
     out.push(stop([c], e.reason));
-    s.holdUntil = plus(view.now, allowanceMinutes(view.policy, view.checkMinutes, false));
+    s.holdUntil = plus(view.now, allowanceMinutes(view.policy, false));
     s.waitUntil = plus(view.now, view.policy.waitMinutes);
     // PROPOSED: a champion that leaves gets the deadline check of a champion's result (Part 7 names the result only).
     if (pastDeadline(view.deadline, s.holdUntil)) return end(ctx, "abandoned", "deadline");

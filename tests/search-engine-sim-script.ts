@@ -86,9 +86,8 @@ const NEXT: Readonly<Record<string, readonly string[]>> = {
   wide: ["wide", "resolved", "exhausted", "abandoned"],
 };
 
-/** Part 3 and Part 7 from the design's text (20 minutes of clone and setup), with the command's effective limit. */
-const gateRun = (p: SearchPolicy, check: number) => 20 + Math.min(p.gateMinutes, check);
-const allowance = (p: SearchPolicy, check: number, baseOpen: boolean) => (p.attempts + (baseOpen ? 1 : 0)) * gateRun(p, check) + p.waitMinutes;
+/** Part 7 and Part 3 from the design's text: a gate run is 20 minutes of clone and setup plus `gateMinutes`. */
+const allowance = (p: SearchPolicy, baseOpen: boolean) => (p.attempts + (baseOpen ? 1 : 0)) * (20 + p.gateMinutes) + p.waitMinutes;
 const windowMinutes = (p: SearchPolicy, searches: number) => 2 * (20 + p.gateMinutes) * searches;
 
 export type Engine = { admit: typeof admit; step: typeof step };
@@ -288,7 +287,7 @@ class RunSim {
     const searches = this.tasks.filter(other => other.search !== undefined).length;
     const wide = this.tasks.some(other => this.wide(other));
     const facts: AdmissionFacts = {
-      id: `${this.label}:${task.id}`, now: at(this.clock), policy: this.policy, checkMinutes: this.checkMinutes,
+      id: `${this.label}:${task.id}`, now: at(this.clock), policy: this.policy,
       routing: { mode: flips[0] ? "shadow" : "auto", coversStart: true, revoked: false },
       run: { goalCycle: true, recordDigest: true, requiredChecks: ["digest-check"], searches, wideSearch: wide,
         ...(this.deadline === undefined ? {} : { deadline: this.deadline }) },
@@ -580,9 +579,9 @@ class RunSim {
 
     // S7's times, from the events the simulator delivered, its clock, and the design's formulas.
     if (isOpen(next) && !meta.ghost) {
-      if (live && event.kind === "result" && event.memberId === championId) ledger.hold ??= now + allowance(this.policy, this.checkMinutes, ledger.base === undefined) * MINUTE;
+      if (live && event.kind === "result" && event.memberId === championId) ledger.hold ??= now + allowance(this.policy, ledger.base === undefined) * MINUTE;
       const left = live && event.kind === "left" && event.memberId === championId && (event.reason === "stall" || event.reason === "no-report") && ledger.base === "fail";
-      if (left) ledger.hold = now + allowance(this.policy, this.checkMinutes, false) * MINUTE;
+      if (left) ledger.hold = now + allowance(this.policy, false) * MINUTE;
       const failed = (event.kind === "gated" && !meta.stale && event.memberId === championId && event.outcome !== "pass")
         || (event.kind === "captured" && event.memberId === championId && (event.scope === "violation" || event.empty));
       if (live && (failed || left)) ledger.wait ??= now + this.policy.waitMinutes * MINUTE;

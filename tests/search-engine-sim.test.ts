@@ -141,6 +141,8 @@ const MUTATIONS: readonly Mutation[] = [
   }) },
   { name: "the measurement window counts the shorter check limit", invariant: "S7", engine: wrapStep((s, e, v) =>
     step(s, e, e.kind === "boundary" ? { ...v, policy: { ...v.policy, gateMinutes: Math.min(v.policy.gateMinutes, v.checkMinutes) } } : v)) },
+  { name: "the allowance counts the shorter check limit", invariant: "S7", engine: wrapStep((s, e, v) =>
+    step(s, e, e.kind === "boundary" ? v : { ...v, policy: { ...v.policy, gateMinutes: Math.min(v.policy.gateMinutes, v.checkMinutes) } })) },
   { name: "a hold that ends before the arming abandons the search", invariant: "S7", engine: wrapStep((s, e, v) => {
     const out = step(s, e, v);
     if (isOpen(s) && out.search.endReason === "hold" && out.search.armedAt === undefined) {

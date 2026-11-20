@@ -36,6 +36,7 @@ import { ENTRY_DROP_TEXT, ENTRY_INGEST_MS, EntryIngestQueue, ingestPass } from "
 import { MAX_OUTBOX_EVENTS, appendRunEvent as runEvent, pathField, planDigest, profileIdentity, runEventKey, runSummaryCounts, type MemberStopDetail, type MemberStopReason, type ReplacementCause } from "./run-events.js";
 import { taskFeatures } from "./task-features.js";
 import { teamUsage } from "./team-usage.js";
+import { teamListItem, type TeamListItem } from "./team-list.js";
 import { ProviderLimits, switchesMember, type LimitObservation } from "./provider-limits.js";
 import type { LinearService } from "./linear.js";
 import type { Readings } from "./readings.js";
@@ -1043,6 +1044,8 @@ export class TeamService {
   }
   private event(stored: Stored, text: string) { runEvent(stored.run, text); }
   list(): TeamView[] { return [...this.records.values()].filter(stored => !stored.run.replay).map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
+  /** Compact rows for `GET /api/teams?view=list`, in `list()` order. `list()` and `get()` keep the full record. */
+  listItems(): TeamListItem[] { return this.list().map(teamListItem); }
   /** Persisted team records for the read-only Understanding view; performs no tracker or usage refresh. */
   understandingRecords() { return [...this.records.values()].filter(stored => !stored.run.replay).map(stored => structuredClone(stored.run)); }
   pendingOperation(runId: string): boolean { return Boolean(this.records.get(runId)?.pending); }

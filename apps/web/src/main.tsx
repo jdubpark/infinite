@@ -40,7 +40,7 @@ import "@fontsource/instrument-sans/600.css";
 import "@xterm/xterm/css/xterm.css";
 import { useLiveRefresh } from "./live-refresh";
 import { useSessionControl } from "./session-control";
-import { TeamCreate, TeamDetail, TeamList, TeamPicker, clearTeamRequests, type TeamView } from "./teams";
+import { TeamCreate, TeamDetail, TeamList, TeamPicker, clearTeamRequests, type TeamListItem } from "./teams";
 import { GoalCreate, GoalDetail, GoalList, GoalPicker, clearGoalRequests, type ProductGoal } from "./goals";
 import { MissionPage, clearMissionRequests } from "./missions";
 import { CostPage, CostPicker } from "./cost";
@@ -74,7 +74,7 @@ function App() {
   const [key, setKey] = useState("");
   const [error, setError] = useState("");
   const [sessions, setSessions] = useState<Session[]>([]);
-  const [teams, setTeams] = useState<TeamView[]>([]);
+  const [teams, setTeams] = useState<TeamListItem[]>([]);
   const [goals, setGoals] = useState<ProductGoal[]>([]);
   const [halt, setHalt] = useState<HaltView | null>(null);
   const route = useSessionLocation(machines.active.id);
@@ -102,7 +102,7 @@ function App() {
     if (current()) setSessions(data.sessions.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
   }, 1800, me);
   const teamFeed = useLiveRefresh(async current => {
-    const data = await api<{ teams: TeamView[] }>("/teams");
+    const data = await api<{ teams: TeamListItem[] }>("/teams?view=list");
     if (current()) setTeams(data.teams.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
   }, 1800, me?.teams ? me : null);
   const goalFeed = useLiveRefresh(async current => {

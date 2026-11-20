@@ -359,7 +359,7 @@ struct TeamResumeFailure: Equatable {
     private func refreshTeams(_ generation: UUID, _ visibility: UUID) async {
         guard displayVisible, generation == connectionGeneration, visibility == displayGeneration, let client else { return }
         do {
-            let response = try await client.request("/teams")
+            let response = try await client.request("/teams?view=list")
             guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
             let next = TeamRun.blockedFirst(response["teams"].array.map(TeamRun.init).sorted {
                 if $0.needsYou != $1.needsYou { return $0.needsYou }
@@ -372,7 +372,7 @@ struct TeamResumeFailure: Equatable {
                 if retained != teamResumeFailures { teamResumeFailures = retained }
             }
             teamsLoaded = true
-            for team in next { teamModels[team.id]?.observe(team) }
+            for team in next { teamModels[team.id]?.observeListRow(team) }
             pruneDetailModels()
             if !teamsFresh { teamsFresh = true }
             teamFreshness.recovered()
@@ -471,6 +471,17 @@ struct TeamResumeFailure: Equatable {
         }
         resumingTeams.insert(id)
         teamResumeFailures[id] = nil
+        // A kept model holds its last full read. When the list has passed it, read the run again: resume names the
+        // run's revision, and the run may no longer be one a list can resume.
+        if model.behind { await model.poll() }
+        guard !model.behind, model.run.offersResume else {
+            resumingTeams.remove(id)
+            teamResumeFailures[id] = TeamResumeFailure(message: model.behind
+                ? "This team changed and could not be read again. Try again, or open the team."
+                : "This team can no longer be resumed from here. Open the team to see where it stands.")
+            pruneTeamModel(id)
+            return
+        }
         await model.perform("resume")
         resumingTeams.remove(id)
         teamResumeFailures[id] = model.noticeIsError ? TeamResumeFailure(message: model.notice) : nil

@@ -44,6 +44,25 @@ export type TeamView = {
   /** Omitted by older hosts. */
   workers?: { limit: number; max: number; running: number; ready: number };
 };
+/** A run as `GET /teams?view=list` lists it. The long detail (the request, check output, reports, task instructions) comes from `GET /teams/:id`. */
+export type TeamListItem = Pick<TeamView, "id" | "projectId" | "provider" | "title" | "parallelism" | "revision" | "status" | "createdAt" | "updatedAt"
+  | "workspace" | "branch" | "baseCommit" | "headCommit" | "decisions" | "events" | "reason" | "missionId" | "resumable" | "continuable" | "workers"> & {
+  members: (Omit<TeamMember, "cwd" | "baseCommit" | "modelProfile" | "usage"> & { startedAt?: string; reportedAt?: string; lastActivityAt?: string; pendingLimit?: boolean; stalledAt?: string;
+    modelProfile?: Pick<TeamModelProfile, "label" | "provider" | "tier">; usage?: Pick<UsageTotals, "cost"> })[];
+  tasks: (Pick<TeamTask, "id" | "title" | "status" | "paths" | "memberId" | "ownerRating"> & { changedPaths?: { paths: string[]; truncated: boolean } })[];
+  checks: Pick<TeamView["checks"][number], "status" | "revision">[];
+  lineup?: Pick<TeamLineup, "coordinator">;
+  goal?: Pick<NonNullable<TeamView["goal"]>, "id" | "revision" | "cycle">;
+  linear?: Omit<LinearTrackingView, "issue"> & { issue?: Pick<NonNullable<LinearTrackingView["issue"]>, "identifier" | "url" | "title" | "state"> };
+  review?: Pick<NonNullable<TeamView["review"]>, "verdict" | "revision">;
+  discovery?: { revision: number };
+  deliveryReceipt?: Omit<NonNullable<TeamView["deliveryReceipt"]>, "summary">;
+  pullRequest?: Omit<NonNullable<TeamView["pullRequest"]>, "summary">;
+  permissions?: { mode: "coordinator"; maxDecisions: number };
+  permissionsRevokedAt?: string;
+  permissionDecisions?: { targetSessionId: string; promptId: number; status: string }[];
+  usage?: Pick<TeamUsage, "total" | "unmeasuredMembers">;
+};
 type CreateRequest = { requestId: string; projectId: string; provider: string; title: string; objective: string; useConfiguredLineup?: boolean };
 type MutationRequest = { requestId: string; revision: number; text?: string; path: string; label: string };
 const creations = requestStore<CreateRequest, { id: string }>();
@@ -65,7 +84,7 @@ const date = (value: string) => new Date(value).toLocaleString([], { month: "sho
 const statusClass = (status: TeamStatus) => ["needs-input", "blocked", "paused"].includes(status) ? "waiting" : ["ready-for-review", "merged"].includes(status) ? "ready" : ["cancelled", "no-change"].includes(status) ? "inactive" : "";
 function Status({ status }: { status: TeamStatus }) { return <span className={"team-status " + statusClass(status)}><span className="dot" />{labels[status]}</span>; }
 function RoleGuide() { return <div className="team-roles" aria-label="Team responsibilities">{Object.entries(roles).map(([id, role]) => <div key={id}><strong>{role.name}</strong><p>{role.description}</p></div>)}</div>; }
-const leadLabel = (team: TeamView) => team.lineup ? "Coordinator: " + team.lineup.coordinator.label : names[team.provider] ?? team.provider;
+const leadLabel = (team: Pick<TeamListItem, "lineup" | "provider">) => team.lineup ? "Coordinator: " + team.lineup.coordinator.label : names[team.provider] ?? team.provider;
 /** Older hosts omit worker counts, so their reported parallelism backs the live status. */
 export function workerStatus(parallelism: number, workers?: NonNullable<TeamView["workers"]>) {
   if (!workers) return `Up to ${parallelism} workers`;
@@ -118,9 +137,9 @@ function SetupNotice({ me }: { me: Me }) {
 }
 
 /** Blocked runs lead every team list; each group keeps its received order. */
-const blockedFirst = (teams: TeamView[]) => [...teams.filter(team => team.status === "blocked"), ...teams.filter(team => team.status !== "blocked")];
+const blockedFirst = (teams: TeamListItem[]) => [...teams.filter(team => team.status === "blocked"), ...teams.filter(team => team.status !== "blocked")];
 
-export function TeamPicker({ teams, selected, loading, onSelect }: { teams: TeamView[]; selected: string | null; loading: boolean; onSelect: (id: string) => void }) {
+export function TeamPicker({ teams, selected, loading, onSelect }: { teams: TeamListItem[]; selected: string | null; loading: boolean; onSelect: (id: string) => void }) {
   return <nav className="session-list team-picker" aria-label="Agent teams">
     {blockedFirst(teams).map(team => <button className={"session-row " + (selected === team.id ? "selected" : "")} key={team.id} onClick={() => onSelect(team.id)} aria-current={selected === team.id ? "page" : undefined}>
       <div className="row-top"><Users size={15} /><strong>{team.title}</strong><ChevronRight size={16} /></div>
@@ -132,7 +151,7 @@ export function TeamPicker({ teams, selected, loading, onSelect }: { teams: Team
 }
 
 export function TeamList({ teams, me, fresh, stale, loading, failed, seen, onCreate, onSelect, refresh, openCost }: {
-  teams: TeamView[]; me: Me; fresh: boolean; stale: boolean; loading: boolean; failed: boolean; seen: string;
+  teams: TeamListItem[]; me: Me; fresh: boolean; stale: boolean; loading: boolean; failed: boolean; seen: string;
   onCreate: () => void; onSelect: (id: string) => void; refresh: () => void; openCost: () => void;
 }) {
   return <div className="team-page team-list-page">
@@ -152,7 +171,7 @@ export function TeamList({ teams, me, fresh, stale, loading, failed, seen, onCre
   </div>;
 }
 
-function TeamListResume({ team, fresh, refresh }: { team: TeamView; fresh: boolean; refresh: () => void }) {
+function TeamListResume({ team, fresh, refresh }: { team: TeamListItem; fresh: boolean; refresh: () => void }) {
   const api = useApi();
   const machine = useMachines().active.id;
   const key = machine + "/" + team.id;

@@ -386,3 +386,23 @@ test("a sibling manifest that cannot be read leaves the run cap undecided until 
     assert.deepEqual(shape(second!), { version: 1, sessionId: f.run.members[1]!.sessionId, state: "removed", caps, bytes: 80, at: undefined, reason: "run-cap", sessionRecord: "kept" });
   } finally { chmodSync(join(first!, MANIFEST), 0o600); teams.close(); f.close(); }
 });
+
+test("a session that still answers as live is not taken for exited when its metadata is missing", async () => {
+  const t = codexTeam(64, { memberBytes: 1000, runBytes: 5000 });
+  try {
+    await t.step();
+    const manager = t.f.manager, meta = manager.meta, state = manager.state, session = t.pm.sessionId;
+    manager.meta = (id: string) => {
+      if (id === session) throw Object.assign(new Error("Session metadata is unavailable."), { code: "ENOENT" });
+      return meta(id);
+    };
+    assert.equal((await manager.state(session)).status, "running");
+    await t.sweep(10_000);
+    assert.equal(manifest(t.directory()).state, "recording", "the live state wins over missing metadata");
+
+    // A session that neither answers nor has metadata is gone.
+    manager.state = async (id?: string) => id === session ? { ...await state(id), status: "unavailable" as const } : state(id);
+    await t.sweep(10_000);
+    assert.equal(manifest(t.directory()).state, "kept");
+  } finally { t.close(); }
+});

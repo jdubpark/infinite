@@ -64,9 +64,12 @@ export class TeamRetention {
     return {
       stateDir: this.host.config.stateDir,
       now: () => this.host.options?.now?.() ?? Date.now(),
-      // A session has exited when it says so, or when it no longer exists.
+      // A session has exited when it says so. Missing metadata counts as an exit only when the worker cannot be reached
+      // either: a session that still answers as live is live, whatever its metadata.
       exited: async sessionId => {
-        if ((await manager.state(sessionId)).status === "exited") return true;
+        const status = (await manager.state(sessionId)).status;
+        if (status === "exited") return true;
+        if (status !== "unavailable") return false;
         try { manager.meta(sessionId); return false; }
         catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return true; throw error; }
       },

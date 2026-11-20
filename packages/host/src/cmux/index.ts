@@ -277,6 +277,10 @@ export class CmuxSessions {
       record.nativeId = row.session_id;
       record.transcript = string(row.file) ?? record.transcript;
     }
+    // Every record already holds the hook and Vault changes merged above, and the next refresh's snapshot would hide
+    // them, so one record's failed journal append or save must not cost the others their saves. The first failure is
+    // thrown once every record is observed.
+    let failure: { error: unknown } | undefined;
     for (const record of this.records.values()) {
       const surface = record.surfaceId ? this.tree.get(record.surfaceId) : undefined;
       const live = surface?.workspaceId === record.workspaceId && surface?.type === "terminal" && (!record.pid || processAlive(record.pid));
@@ -313,16 +317,19 @@ export class CmuxSessions {
           }
         } catch { unreadable = true; }
       }
-      // Failure to refresh native Feed must never erase a known unanswered approval.
-      if (unreadable || feed.status === "rejected" && record.prompt?.feed) this.observe(record, "unavailable");
-      else {
-        const nativeFeed = matchingFeed(this.feed, { provider: record.session.provider as CmuxProvider, nativeId: record.nativeId, surfaceId: record.surfaceId });
-        this.observe(record, status, status === "running" ? pendingPrompt(record.session.provider as CmuxProvider, record.screen, nativeFeed) : undefined);
-      }
-      // Compared with the record before this refresh, on every path: observe() saves only what it changes itself, and
-      // in a lasting outage it changes nothing, so a hook or Vault change merged above is saved here.
-      if (JSON.stringify(record) !== previous.get(record.session.id)) this.save(record);
+      try {
+        // Failure to refresh native Feed must never erase a known unanswered approval.
+        if (unreadable || feed.status === "rejected" && record.prompt?.feed) this.observe(record, "unavailable");
+        else {
+          const nativeFeed = matchingFeed(this.feed, { provider: record.session.provider as CmuxProvider, nativeId: record.nativeId, surfaceId: record.surfaceId });
+          this.observe(record, status, status === "running" ? pendingPrompt(record.session.provider as CmuxProvider, record.screen, nativeFeed) : undefined);
+        }
+        // Compared with the record before this refresh, on every path: observe() saves only what it changes itself, and
+        // in a lasting outage it changes nothing, so a hook or Vault change merged above is saved here.
+        if (JSON.stringify(record) !== previous.get(record.session.id)) this.save(record);
+      } catch (error) { failure ??= { error }; }
     }
+    if (failure) throw failure.error;
   }
 
   private observe(record: Stored, status: Session["status"], pending?: PendingPrompt) {

@@ -321,6 +321,23 @@ test("a lasting cmux outage saves what the host learns meanwhile and keeps the t
   assert.equal(JSON.stringify((await f.sessions.list()).find(row => row.id === f.id)), JSON.stringify(failed), "a recording error reads the same on every poll");
 });
 
+test("one cmux record's failed journal write does not cost another record its save", { timeout: 20000 }, async (t) => {
+  const f = await fixture(t);
+  const history = randomUUID(), row = (file: string) => ({ agent: "claude", session_id: history, cwd: f.cwd, title: "Earlier conversation", file: join(f.root, file) });
+  f.setState({ vault: [row("first.jsonl")] });
+  const other = (await f.sessions.list()).find(listed => listed.nativeSession?.id === history)!;
+  assert.equal(other.status, "exited");
+  // In one refresh the live terminal closes, so its record must journal the change, and the other record's
+  // transcript moves. The live record's journal cannot be written.
+  const events = join(f.config.stateDir, "cmux", f.id, "events");
+  for (const name of readdirSync(events)) chmodSync(join(events, name), 0o400);
+  f.setState({ workspaces: [], vault: [row("moved.jsonl")] });
+  await assert.rejects(f.sessions.list(), { code: "EACCES" }, "the failure is still reported");
+  const saved = unseal<{ transcript?: string }>(f.key, `cmux:${other.id}:meta`, readFileSync(join(f.config.stateDir, "cmux", other.id, "meta.sealed"), "utf8"));
+  assert.equal(saved.transcript, join(f.root, "moved.jsonl"), "the other record's change is saved in the same refresh");
+  assert.equal((await f.sessions.list()).find(listed => listed.id === f.id)!.status, "recording-error");
+});
+
 test("cmux resume respects capacity before recording intent while existing receipts stay retryable", { timeout: 20000 }, async (t) => {
   const f = await fixture(t);
   f.config.maxSessions = 1;

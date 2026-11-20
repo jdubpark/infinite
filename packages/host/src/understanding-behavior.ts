@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync,
 } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, resolve, sep } from "node:path";
 import { z } from "zod";
 import type {
   BehaviorCheckResult, BehaviorDefinition, BehaviorList, BehaviorRun, BehaviorSuite,

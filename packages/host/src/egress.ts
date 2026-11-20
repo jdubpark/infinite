@@ -3,7 +3,7 @@ import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, readFil
 import { connect } from "node:net";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
-import type { Config } from "./types.js";
+import { learningPurpose, type Config, type SessionPurpose } from "./types.js";
 
 /**
  * Agent egress through the host egress proxy (scripts/egress-proxy.mjs, deploy/ubuntu/egress.md).
@@ -18,6 +18,8 @@ export const SESSION_CREDENTIAL_SECONDS = 30 * 24 * 60 * 60;
 /** Host-run commands mint a fresh credential per command. */
 export const HOST_CREDENTIAL_SECONDS = 24 * 60 * 60;
 export const HOST_IDENTITY = { project: "_host", session: "host" } as const;
+export const EVAL_EGRESS_PROJECT = "_eval", EVAL_SETUP_EGRESS_PROJECT = "_eval-setup",
+  EVAL_SETUP_CREDENTIAL_SECONDS = 900, EVAL_PROBE_CREDENTIAL_SECONDS = 60;
 export const EGRESS_NO_PROXY = "localhost,127.0.0.1,::1";
 const EGRESS_ENVIRONMENT = {
   HTTPS_PROXY: "HTTPS_PROXY",
@@ -30,10 +32,10 @@ const EGRESS_ENVIRONMENT = {
 } as const;
 export const EGRESS_ENVIRONMENT_NAMES: readonly string[] = Object.freeze(Object.values(EGRESS_ENVIRONMENT));
 const PROJECT_ID = /^[a-z0-9-]{1,80}$/;
-const PROJECT_LABEL = /^(?:_host|_none|[a-z0-9-]{1,80})$/;
+const PROJECT_LABEL = /^(?:_host|_none|_eval-setup|_eval|[a-z0-9-]{1,80})$/;
 const SESSION_LABEL = /^[A-Za-z0-9-]{1,64}$/;
 /** The summary's project names: projects, the reserved host and no-project labels, and requests without credentials. */
-export const EGRESS_PROJECT = /^(?:_unauthenticated|_host|_none|[a-z0-9-]{1,80})$/;
+export const EGRESS_PROJECT = /^(?:_unauthenticated|_host|_none|_eval-setup|_eval|[a-z0-9-]{1,80})$/;
 const KEY_BYTES = 32;
 const MAX_SUMMARY_BYTES = 16 * 1024 * 1024;
 /** Non-secret settings a host process passes to the workers it starts. */
@@ -125,8 +127,9 @@ export function egressUncredentialedEnvironment(proxyUrl: string): Record<string
   return proxyEnvironment(value);
 }
 
-/** A session's identity: its project, or `_none` when it has no valid one. */
-export function sessionEgressIdentity(projectId: string | undefined, sessionId: string): EgressIdentity {
+/** A session's identity: its project, or `_none` when it has no valid one. A learning session (replay or gate) is `_eval`. */
+export function sessionEgressIdentity(projectId: string | undefined, sessionId: string, purpose?: SessionPurpose): EgressIdentity {
+  if (learningPurpose(purpose)) return { project: EVAL_EGRESS_PROJECT, session: sessionId };
   return { project: projectId && PROJECT_ID.test(projectId) ? projectId : "_none", session: sessionId };
 }
 
@@ -191,7 +194,7 @@ export function agentModelClientEnvironment(base: NodeJS.ProcessEnv = process.en
  *   direct; the worker records the gap.
  * - `invalid`: the inherited proxy address is unusable. No session may start, since none could be routed.
  */
-export function workerEgressEnvironment(projectId: string | undefined, sessionId: string, env: NodeJS.ProcessEnv = process.env, nowMs = Date.now()):
+export function workerEgressEnvironment(projectId: string | undefined, sessionId: string, env: NodeJS.ProcessEnv = process.env, nowMs = Date.now(), purpose?: SessionPurpose):
   { status: "off" | "on" | "no-key" | "invalid"; env: Record<string, string> } {
   const proxyUrl = env[WORKER_PROXY_URL], keyPath = env[WORKER_KEY_FILE];
   if (proxyUrl === undefined && keyPath === undefined) return { status: "off", env: {} };
@@ -200,7 +203,22 @@ export function workerEgressEnvironment(projectId: string | undefined, sessionId
   if (!keyPath || !isAbsolute(keyPath)) return refused;
   let key: Buffer;
   try { key = readEgressKey(keyPath); } catch { return refused; }
-  return { status: "on", env: egressProxyEnvironment(proxyUrl, key, sessionEgressIdentity(projectId, sessionId), SESSION_CREDENTIAL_SECONDS, nowMs) };
+  return { status: "on", env: egressProxyEnvironment(proxyUrl, key, sessionEgressIdentity(projectId, sessionId, purpose), SESSION_CREDENTIAL_SECONDS, nowMs) };
+}
+
+/**
+ * The proxy URL with a fresh credential for an eval identity, from the state installHostEgress set up: undefined without
+ * the boundary; the URL with no credential (every request refused) when the key cannot be read.
+ */
+export function evalProxyUrl(project: "_eval" | "_eval-setup", session: string, lifetimeSeconds: number, nowMs = Date.now()): string | undefined {
+  if (!hostEgress) return undefined;
+  const address = new URL(hostEgress.proxyUrl).host;
+  if (!hostEgress.key) {
+    try { hostEgress.key = readEgressKey(hostEgress.keyPath); }
+    catch { return `http://${address}`; }
+  }
+  const { username, password } = egressCredential(hostEgress.key, project, session, Math.floor(nowMs / 1000) + lifetimeSeconds);
+  return `http://${username}:${password}@${address}`;
 }
 
 // ---------------------------------------------------------------------------

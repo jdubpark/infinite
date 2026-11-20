@@ -19,10 +19,13 @@ import {
   readEvalTask,
   retireTask,
 } from "../packages/host/src/eval-store.js";
-import { EVAL_MODULE, type Capsule, type CaptureStart, type EvalFeatures, type EvalHostApi, type EvalRefusal, type GraderState, type MiningStatus } from "../packages/host/src/eval-types.js";
+import { EVAL_MODULE, type Capsule, type CaptureStart, type EvalFeatures, type EvalHostApi, type EvalIdentityState, type EvalRefusal, type GraderState, type MiningStatus } from "../packages/host/src/eval-types.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import type { EvidenceTx } from "../packages/host/src/evidence/types.js";
+import { TrialJobs } from "../packages/host/src/eval-trial-jobs.js";
+import { evalTrialsModule, insertTrial, trialsSince } from "../packages/host/src/eval-trial-store.js";
 import { outcomeModule, writeOutcome, type OutcomeRow } from "../packages/host/src/outcome-store.js";
+import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 import type { Config } from "../packages/host/src/types.js";
 
 const NOW = "2026-11-16T12:00:00.000Z";
@@ -48,6 +51,12 @@ const CAPSULE: Capsule = {
   task: { id: "a", title: "Task a", instructions: "Do a", paths: ["a.txt"] },
 };
 const JOB = { kind: "validate", limits: { maxWallMinutes: 60 } };
+const TRIALS_PER_DAY = 6;
+const MODEL = "model-trial-zeta";
+const CLAUDE_TRIAL: TeamModelProfile = { id: "claude-trial", label: "Claude trial", provider: "claude", model: MODEL, effort: "high", tier: "strong" };
+const TRIAL_CONFIGURATION = { profile: CLAUDE_TRIAL, guidance: "as-of-base", knowledge: "none" };
+const BASELINE_JOB = { kind: "baseline", configurations: [TRIAL_CONFIGURATION], limits: { maxTrials: 10, maxWallMinutes: 60 } };
+const PATCH_TEXT = "patch-text-4c7e";
 const REQUEST = "11111111-1111-4111-8111-111111111111";
 const REQUEST_OTHER = "22222222-2222-4222-8222-222222222222";
 const READ_ROLES = ["owner", "controller", "viewer"];
@@ -70,6 +79,10 @@ type FixtureOptions = {
   rollback?: boolean;
   /** True writes a file that is not a database, so the store opens as unavailable. */
   damaged?: boolean;
+  /** The grader's state and launcher version, and the eval identity's state, as the host's probes would report them. */
+  grader?: GraderState;
+  graderVersion?: number | null;
+  identity?: EvalIdentityState;
 };
 
 type Reply = { status: number; text: string; body: any };
@@ -79,7 +92,7 @@ function projectConfig() {
   return {
     id: PROJECT, name: PROJECT, path: "/unused/project", source: { mode: "github" },
     team: {
-      eval: { capture: true, mine: true, focusedTest: FOCUSED, reportFormat: "junit" },
+      eval: { capture: true, mine: true, focusedTest: FOCUSED, reportFormat: "junit", trialsPerDay: TRIALS_PER_DAY, candidateProfiles: [CLAUDE_TRIAL] },
       features: { areas: [{ id: "host", paths: ["packages/host"] }] },
     },
   };
@@ -119,23 +132,36 @@ function fixture(options: FixtureOptions = {}): Fixture {
   if (options.outcomes !== false) store.register(outcomeModule({ now: () => NOW }));
   const corpus = evalCorpusModule(store, () => NOW);
   store.register(options.rollback === true ? { ...corpus, version: 1, readVersion: 1 } : corpus);
-  const config = { projects: [projectConfig(), wideConfig()] } as unknown as Pick<Config, "projects" | "eval">;
-  const jobs = new EvalJobs({ store, config, now: () => NOW });
-  const fake: Pick<Fixture, "mining" | "grader"> = { mining: waitingMining(), grader: "not-configured" };
+  store.register(evalTrialsModule(store, () => NOW));
+  const config = { projects: [projectConfig(), wideConfig()] } as unknown as Pick<Config, "projects" | "eval" | "teams">;
+  const trials = new TrialJobs({ store, config, now: () => NOW });
+  const jobs = new EvalJobs({ store, config, now: () => NOW, baseline: trials });
+  const fake = {
+    mining: waitingMining(), grader: options.grader ?? "not-configured" as GraderState,
+    graderVersion: options.graderVersion ?? null, identity: options.identity ?? "not-configured" as EvalIdentityState,
+  };
   const api: EvalHostApi = {
     summary: async projectId => {
       const project = config.projects.find(item => item.id === projectId);
       if (project === undefined) return { status: 404, code: "unknown-project" };
-      return evalSummary(store, { project, mining: fake.mining, grader: fake.grader, jobs: jobs.projectJobs(projectId, SUMMARY_JOBS), now: NOW });
+      // The host's own count: trials a project started since 00:00 UTC of today, and the cap the project sets.
+      const today = store.read(db => trialsSince(db, projectId, `${NOW.slice(0, 10)}T00:00:00.000Z`));
+      return evalSummary(store, {
+        project, mining: fake.mining, grader: fake.grader, graderVersion: fake.graderVersion, evalIdentity: fake.identity,
+        trials: { today, dailyCap: project.team?.eval?.trialsPerDay ?? null }, jobs: jobs.projectJobs(projectId, SUMMARY_JOBS), now: NOW,
+      });
     },
     jobs: () => jobs.list(),
     job: jobId => jobs.view(jobId) ?? { status: 404, code: "unknown-job" },
-    create: (projectId, request, requestId) => jobs.create(projectId, request, requestId),
+    // The host sends a baseline job to TrialJobs and a validate job to EvalJobs.
+    create: (projectId, request, requestId) => request.kind === "baseline"
+      ? trials.create(projectId, request, requestId)
+      : jobs.create(projectId, request, requestId),
     control: (jobId, action) => jobs.control(jobId, action),
     retire: taskId => retireOwned(store, taskId),
   };
   return {
-    store, api, ...fake, cleanup: () => {
+    store, api, mining: fake.mining, grader: fake.grader, cleanup: () => {
       store.close();
       rmSync(root, { recursive: true, force: true });
     },
@@ -492,6 +518,105 @@ test("the hot statements read through an index", () => {
       );
     }
   } finally {
+    f.cleanup();
+  }
+});
+
+test("the summary shows the eval identity and today's trials", async () => {
+  const f = fixture();
+  const server = await serve(f.api);
+  try {
+    const jobId = randomUUID();
+    const seed = (trialId: string, slot: number, at: string) => f.store.write(tx => insertTrial(tx, {
+      trialId, jobId, taskId: capturedTaskId("run-trial-day", MEMBER), projectId: PROJECT, configuration: TRIAL_CONFIGURATION,
+      harness: 1, slot, attempt: 1, keepDays: 365,
+    }, at));
+    seed(randomUUID(), 0, NOW);
+    seed(randomUUID(), 1, NOW);
+    // Yesterday, before 00:00 UTC of today: not counted.
+    seed(randomUUID(), 2, "2026-11-15T23:00:00.000Z");
+
+    const first = await call(server.base, "GET", `/api/eval/projects/${PROJECT}`, "viewer");
+    assert.equal(first.status, 200);
+    assert.equal(first.body.evalIdentity.state, "not-configured", "without eval.member the identity is not configured");
+    assert.equal(first.body.trials.today, 2, "two trials started today");
+    assert.equal(first.body.trials.dailyCap, TRIALS_PER_DAY, "the project's cap");
+    assert.equal(first.body.grader.version, null, "no probe has answered a version");
+
+    const wide = await call(server.base, "GET", `/api/eval/projects/${PROJECT_WIDE}`, "viewer");
+    assert.equal(wide.body.trials.dailyCap, null, "without trialsPerDay the cap is unknown, and the line says trials off");
+
+    const probed = fixture({ grader: "ready", graderVersion: 1, identity: "busy" });
+    const probedServer = await serve(probed.api);
+    try {
+      const reply = await call(probedServer.base, "GET", `/api/eval/projects/${PROJECT}`, "viewer");
+      assert.equal(reply.body.evalIdentity.state, "busy");
+      assert.equal(reply.body.grader.state, "ready");
+      assert.equal(reply.body.grader.version, 1, "a version 1 grader is reported as version 1");
+    } finally {
+      await probedServer.close();
+      probed.cleanup();
+    }
+  } finally {
+    await server.close();
+    f.cleanup();
+  }
+});
+
+test("a baseline job is created and listed", async () => {
+  const f = fixture();
+  const server = await serve(f.api);
+  try {
+    const objective = "Objective-trial-5d8e";
+    const file = "tests/trial-file-9a1c.test.ts";
+    const trialId = randomUUID();
+    const sessionId = randomUUID();
+    f.store.write(tx => setRow(tx, captureRow(tx, "run-trial", [file], { ...CAPSULE, objective }), "valid", "host"));
+
+    const created = await call(server.base, "POST", "/api/eval/jobs", "owner", { projectId: PROJECT, requestId: REQUEST, job: BASELINE_JOB });
+    assert.equal(created.status, 201);
+    assert.equal(created.body.created, true);
+    assert.equal(created.body.job.kind, "baseline");
+    assert.equal(created.body.job.tasks.planned, 1);
+    assert.equal(created.body.job.trials.planned, 3, "one task, one configuration, three trials per task");
+    assert.equal(created.body.job.dailyCap, TRIALS_PER_DAY);
+    const jobId: string = created.body.job.jobId;
+    const again = await call(server.base, "POST", "/api/eval/jobs", "owner", { projectId: PROJECT, requestId: REQUEST, job: BASELINE_JOB });
+    assert.equal(again.status, 200);
+    assert.equal(again.body.created, false);
+    assert.equal(again.body.job.jobId, jobId);
+
+    // A trial the baseline job started, with a session and a patch held in the sealed store.
+    f.store.write(tx => {
+      insertTrial(tx, {
+        trialId, jobId, taskId: capturedTaskId("run-trial", MEMBER), projectId: PROJECT, configuration: TRIAL_CONFIGURATION,
+        harness: 1, slot: 0, attempt: 1, keepDays: 365,
+      }, NOW);
+      tx.run("UPDATE eval_trials SET session_id = ? WHERE trial_id = ?", sessionId, trialId);
+      tx.run("INSERT INTO eval_trial_patches (trial_id, bytes, stored_at, expires_at, payload) VALUES (?, ?, ?, ?, ?)",
+        trialId, PATCH_TEXT.length, NOW, "2026-12-16T12:00:00.000Z", tx.seal("eval_trial_patches", trialId, { patch: PATCH_TEXT }));
+    });
+
+    const listed = await call(server.base, "GET", "/api/eval/jobs", "viewer");
+    assert.equal(listed.status, 200);
+    const row = listed.body.find((item: { jobId: string }) => item.jobId === jobId);
+    assert.ok(row, "the job is listed");
+    assert.equal(row.kind, "baseline");
+    assert.equal(row.tasks.planned, 1);
+    assert.equal(row.trials.started, 0, "a row with no start counts nothing");
+    assert.equal(row.trials.planned, 3);
+
+    assert.equal((await call(server.base, "POST", "/api/eval/jobs", "viewer", { projectId: PROJECT, requestId: REQUEST_OTHER, job: BASELINE_JOB })).status, 403);
+
+    const replies = [created, again, listed, await call(server.base, "GET", `/api/eval/jobs/${jobId}`, "viewer"),
+      await call(server.base, "GET", `/api/eval/projects/${PROJECT}`, "viewer")];
+    for (const reply of replies) {
+      for (const needle of [objective, file, COMMIT, trialId, sessionId, PATCH_TEXT, MODEL]) {
+        assert.ok(!reply.text.includes(needle), `a baseline route answer holds a sealed value of ${needle.length} characters`);
+      }
+    }
+  } finally {
+    await server.close();
     f.cleanup();
   }
 });

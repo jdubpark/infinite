@@ -51,7 +51,8 @@ export interface McpRequestView {
   status: "queued" | "planning" | "working" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "cancelled";
   revision?: number;
   tracking: { state: "pending" | "linked"; identifier?: string; url?: string };
-  questions: { id: string; question: string; options: string[] }[];
+  /** `recommendation` is what the asking agent would answer and why. It is never the person's answer. */
+  questions: { id: string; question: string; options: string[]; recommendation?: { answers: string[]; reason: string } }[];
   result?: { kind: "agent-report"; summary: string };
   message?: string;
   availableActions: ("reply" | "pause" | "resume" | "cancel")[];

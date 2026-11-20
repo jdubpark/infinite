@@ -9,7 +9,6 @@ export const ROUTING_ALGORITHM_VERSION = 1;
 /** A pin whose points name `escalation` or `scout`. A version-1 pin routes only `start`, whatever its points list. */
 export const POINTS_ALGORITHM_VERSION = 2;
 export const REWARD_VERSION = 1;
-export const VALUE_PRESETS = { cost: 0.5, balanced: 2, quality: 8 } as const;
 
 /** The read defaults of Part 1. Nothing writes them into a saved policy, so the routine digest is unchanged by them. */
 export const ROUTING_DEFAULTS: RoutingKnobs = {

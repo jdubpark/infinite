@@ -54,7 +54,7 @@ const COUNT_KEYS = [
 
 type RowRole = RowState["role"];
 type Data = Record<string, unknown>;
-type Facts = { projectId: string; goal?: OutcomePayload["goal"]; missionId?: string; gap: boolean };
+type Facts = { projectId: string; goal?: OutcomePayload["goal"]; missionId?: string; gap: boolean; source: "production" | "replay"; experimentRef: string | null };
 type Features = { area: string; kind: string | null; risk: string; featureVersion: number; featureMap: string };
 type Ctx = { tx: EvidenceTx; store: EvidenceStore; event: RunEvent; log: (line: string) => void };
 
@@ -119,6 +119,10 @@ function runCreated({ tx, event }: Ctx): void {
   if (goal) summary.payload.goal = goal;
   const missionId = str(data.missionId);
   if (missionId) summary.payload.missionId = missionId;
+  if (data.purpose === "replay" || data.purpose === "gate") {
+    summary.source = "replay";
+    summary.payload.trialId = str(data.trialId);
+  }
   summary.revision = event.revision;
   summary.createdAt = event.at;
   writeSummary(tx, summary);
@@ -611,12 +615,14 @@ function ensureSummary(tx: EvidenceTx, event: RunEvent, created = false): RunSum
 /** What a new row or member result copies from its run. A run with no summary yet has a gap. */
 function factsOf(tx: EvidenceDb, event: RunEvent): Facts {
   const summary = readSummary(tx, event.runId);
-  if (!summary) return { projectId: UNKNOWN, gap: true };
+  if (!summary) return { projectId: UNKNOWN, gap: true, source: "production", experimentRef: null };
   return {
     projectId: summary.payload.projectId,
     ...(summary.payload.goal ? { goal: summary.payload.goal } : {}),
     ...(summary.payload.missionId ? { missionId: summary.payload.missionId } : {}),
     gap: summary.flags.includes("gap"),
+    source: summary.source === "replay" ? "replay" : "production",
+    experimentRef: summary.payload.trialId ?? null,
   };
 }
 
@@ -632,7 +638,7 @@ function payloadFacts(facts: Facts): Pick<OutcomePayload, "projectId" | "goal" |
 function blankOutcome(ctx: Ctx, memberId: string, role: RowRole, facts: Facts, flags: Flag[]): OutcomeRow {
   return {
     outcomeId: outcomeId(ctx.event.runId, memberId),
-    source: "production",
+    source: facts.source,
     projectRef: "",
     taskRef: "",
     areaRef: "",
@@ -649,7 +655,7 @@ function blankOutcome(ctx: Ctx, memberId: string, role: RowRole, facts: Facts, f
     effort: null,
     profileEpoch: 0,
     configId: null,
-    experimentRef: null,
+    experimentRef: facts.experimentRef,
     kind: null,
     risk: UNKNOWN,
     featureVersion: 0,
@@ -686,7 +692,7 @@ function sentinelRow(ctx: Ctx, memberId: string, role: RowRole): OutcomeRow {
 function blankResult(ctx: Ctx, memberId: string, role: string, facts: Facts, flags: Flag[]): MemberResultRow {
   return {
     resultId: outcomeId(ctx.event.runId, memberId),
-    source: "production",
+    source: facts.source,
     projectRef: "",
     runId: ctx.event.runId,
     revision: ctx.event.revision,

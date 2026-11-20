@@ -887,14 +887,149 @@ The launcher ends E1 and E2 by itself after 35 seconds, and E3 after 660 seconds
 
 The Git commands that validation runs inside the grader's root are grader commands. They run through the grader launcher, with its environment and limits. They are not forms of `teams.commandPrefix`.
 
+### Eval trials
+
+A baseline job runs replay trials. A trial gives one implementer one task of the project's `valid` set, under one configuration, in a workspace that holds only the task's base. The grader then grades the result against the hidden tests. A trial spends model tokens on one member launch, which runs as the eval account. Read [the eval member account install](../deploy/ubuntu/eval.md) and [the eval member account](security.md#eval-member-account) before you turn trials on.
+
+Trials are off in every project until the owner sets `trialsPerDay`. A project with no `trialsPerDay` runs no trial, and its baseline job is refused `409` `eval-config-incomplete`.
+
+#### Turn it on
+
+1. Set up validation: steps 1 to 4 and 6 of [the grader install](../deploy/ubuntu/grader.md), and launcher version 2 of its section 2.2.
+2. Set up the eval member account: steps 1 to 10 of [the eval member account install](../deploy/ubuntu/eval.md).
+3. In the project's `eval` block, set `focusedTest`, `reportFormat`, and `trialsPerDay`.
+4. Create a baseline job with `infinite eval run PROJECT --file job.json --request-id UUID`, with `"kind": "baseline"` in the file.
+
+No trial starts before step 4. The code installs nothing: the launchers, the sudo rules, the network rules, the template, and the configuration are the owner's steps.
+
+#### Settings
+
+The project's `eval` block takes these fields. They are read only for a `github` project, and the schema is strict. The routine approval digest leaves them out, so changing them does not invalidate a routine approval.
+
+| Field | Limit | Default | Meaning |
+|---|---|---|---|
+| `trialsPerDay` | 1 to 50 | off | Trials a day, counted by UTC day, for a baseline job. It is the stand-in for a learning budget, see below. |
+| `trialMinutes` | 10 to 240 | 45 | Minutes a trial's member may run before it ends `timeout`. |
+| `candidateProfiles` | up to 8 model profiles | none | Profiles that the lineup does not have. A baseline job may use them, and no prompt shows them. |
+
+The host configuration has one new block, `eval.member`, beside `eval.grader`:
+
+| Field | Limit | Meaning |
+|---|---|---|
+| `prefix` | a command and its arguments | The eval launcher. The host runs `prefix` with the operation and `--` after its arguments. |
+| `root` | an absolute path | The launcher's root. Trials live in `root/trials`. |
+| `agents` | `claude`, `codex`, and `opencode` | The launch of each provider as the eval account. Grok and Demo have no eval launch. |
+| `canaries` | up to 32 absolute paths | Files that the eval account must not read. |
+
+#### Baseline jobs
+
+A baseline request has these fields. The schema is strict.
+
+| Field | Limit | Default |
+|---|---|---|
+| `configurations` | 1 to 4. Each is `{ profile, guidance: "as-of-base", knowledge: "none" }`, and no two share a configuration | none, required |
+| `taskFilter.taskIds`, `origins`, `areas`, `maxTasks` | task ids; up to 2 origins; up to 32 areas; 1 to 200 tasks | `maxTasks` 20 |
+| `trialsPerTask` | 1 to 5 | 3 |
+| `limits.maxTrials` | 1 to 1,000 | none, required |
+| `limits.maxWallMinutes` | 10 to 43,200 | none, required |
+| `windows`, `expiresAt` | as for a validate job; `expiresAt` up to 30 days ahead | any hour; 30 days |
+
+A profile must belong to a provider that has an eval launch (`claude`, `codex`, or `opencode`). It must be in the project's lineup pools or in `candidateProfiles`. A `contributor` profile also needs the project's `routing.allowContributor`. Any other profile is `409` `profile-not-approved`. Pinned guidance, forced knowledge, and prompt overrides are not in this slice.
+
+**Create.** A request id with the same body returns the same job. The same id with another body is `409` `request-conflict`. A project whose baseline job is `scheduled`, `running`, `paused`, or `blocked` gets `409` `job-active`. A validate job does not count. At creation the job fixes its plan: `planned.tasks` is the number of valid tasks the filter selects, at most `maxTasks`, and `planned.trials` is the smaller of `limits.maxTrials` and tasks times configurations times `trialsPerTask`.
+
+**Pinned configuration.** The job pins a digest of the validation settings, `trialMinutes`, `eval.grader`, `eval.member`, each configuration's prompt version, and the project's permission settings. A change to any of them blocks the job with `configuration-changed` before its next trial. `resume` pins the new values.
+
+**Reuse.** A baseline job runs every trial fresh. It never reuses an earlier trial.
+
+#### What a trial does
+
+1. **Source.** The grader exports the trial branch of the replay base, and the eval launcher clones it. The clone has no remote, and `check` proves that the reference commit, the integrated head, the hidden files, and the mirror head are absent.
+2. **Run.** The host creates a replay run: one implementer task seeded from the task, and no project manager, no publication, no Linear tracking, no corpus capture, and no question to the owner. The member launches as the eval account with its `eval.member` profile, never with `config.agents`, and it uses no `teams.commandPrefix`. The prompt is the production prompt for the task's capsule, without the shared project context, the blackboard, or the goal. No permission coordinator starts.
+3. **Ending.** The member's report decides the ending. See the table below.
+4. **Result.** After every process of the eval account has stopped, the host reads the member's result as a binary patch of at most 1 MiB, through the eval launcher. It checks the patch for secret shapes. A patch that matches one is dropped (`patch: "secret-shaped"`), and the grade is kept.
+5. **Grade.** The grader builds the grading commit on the replay base. It takes the result, then restores from the reference the hidden files and every test or `gradingPaths` file that either side changed, and it counts those as `overwritten`. It runs `focusedTest` with the hidden files. The guard checks run only when every expected case passed.
+6. **Clean up.** The host stops the account's processes, cleans the trial, and resets the home. The replay run's record is deleted with no tombstone once the trial is final, and its session an hour later.
+
+Only the runner report resolves a trial. An exit code never does, and a missing or unreadable report leaves `expectedPassed` null.
+
+**Endings.** A trial ends with one of these:
+
+| Ending | Meaning | Counts |
+|---|---|---|
+| `graded` | The member gave a result and the grader ran the focused test. | Resolved only when `expectedPassed` equals the total, the guard checks passed, and the total is above zero. |
+| `no-result` | The member exited without a report, or without a result commit. | A member failure, not a void, so it counts as not resolved. |
+| `escalated`, `question`, `blocked` | The member sent that report. No owner decision is asked. | Not resolved. |
+| `permission` | A permission dialog that nobody decided. Nothing answers it. | Not resolved. |
+| `stalled` | The member made no progress, and a production run would have replaced it. | Not resolved. |
+| `scope-violation` | The result changed a file outside the task's paths, or the patch is over 1 MiB. | Not resolved. |
+| `timeout` | The member ran past `trialMinutes`. | Not resolved. |
+| `void-limit` | The provider reported a limit. The job waits `provider-limit` until the reset. | Void. The slot runs again. |
+| `void-host` | The host restarted, a launcher refused or failed, a block code was unknown, or the replay run was lost. | Void. The slot runs again. |
+| `void-owner` | The owner halted the project or cancelled the job. | Void. The slot runs again later. |
+
+A slot gets at most three attempts. After three voids in a row, the job pauses with `trial-voids`. A dialog that the project's permission pipeline leaves to a person ends the trial `permission`. For a project that the host permission agent serves, the agent decides trial dialogs as it does production dialogs.
+
+**Grades.** A grade holds `expectedPassed`, `expectedTotal`, `guardPassed`, `resolved`, `overwritten`, `diff`, and `isolation`. An unknown count is `null`, never `0`. `expectedPassed` is null when no report parses. `diff` is null when the change counts cannot be read. A null `expectedPassed` never resolves a trial. A result larger than the 1 MiB limit ends `scope-violation`.
+
+**Isolation.** A trial is labelled `isolated` only when the eval identity is `ready`, its fetch of the repository is refused both directly and through the proxy, and the source is clean. Otherwise it is labelled `none`. Egress mode matters here: [egress](../deploy/ubuntu/egress.md#6-eval-identities) says why the proxy must be in enforce mode for that label.
+
+**Storage.** Trial rows are kept 365 days by default, and patches 90 days. The host keeps at most 256 MiB of patches. The hourly sweep removes what has expired. Sealed fields are the configuration, the probe facts, the grade, and the patch. The plain columns hold only ids, enumerations, counts, times, and blind indexes.
+
+#### Gates and waits
+
+One trial runs host-wide at a time. Validation and trials share the grader, one step at a time. A baseline job that cannot start a trial says why in its `waiting` field:
+
+| Wait | Cause |
+|---|---|
+| `eval-identity` | The eval identity is not `ready`, or the job's provider has no `eval.member.agents` entry. |
+| `grader` | The grader is not `ready`, or its launcher is version 1. |
+| `window` | The current hour is outside every window. |
+| `host-load` | The host load is high. It is checked before each trial. |
+| `halt` | The project is halted. |
+| `storage` | The grader has less than 10 GiB or 200,000 inodes free. |
+| `another-job` | A trial or a validation task of another job runs. |
+| `provider-limit` | The configuration's provider has an active limit. |
+| `session-slots` | Fewer than four host session slots are free. |
+| `daily-cap` | `trialsPerDay` trials have started today. |
+
+The reasons that stop a job are `trial-voids` (three voids in a row), `eval-processes-alive` (a process of the eval account survived `stop`, and the job is blocked until the owner resumes it), and `configuration-changed`, with the validate job's reasons.
+
+`trialsPerDay` is the stand-in for the learning budget. It bounds the count of trials and nothing else. It has no USD limits, no reservation, no estimate, and no learning floor, and no duel gate exists yet. The delegated adoption design's standing budget (delivery step 4, "The standing budget") replaces it, and removes the field.
+
+#### Missing while a launcher refuses
+
+Nothing in this change is installed. Until the owner installs each part, the state shows what is missing:
+
+- **No `eval.member`:** the summary shows `eval identity not-configured`, and a baseline job waits `eval-identity`.
+- **Launcher not installed, or failing:** the summary shows `eval identity unavailable`, and a baseline job waits `eval-identity`.
+- **Grader version 1:** the summary shows `grader ready (version 1: no trials)`, and a baseline job waits `grader`. Validation runs as before.
+- **A provider wrapper refused:** the replay launch fails, and the trial ends `void-host`. Three such trials pause the job `trial-voids`.
+
+The owner chooses these. The defaults are the ones this slice builds: the windows of a job (none, so any hour); `trialsPerDay` (off; the recommended first value is 6); the hosts in `_eval` and `_eval-setup` (none by default); the files of the home template; and the fallback estimate, which waits for the standing budget.
+
+#### Summary and status
+
+The summary and `infinite eval status PROJECT` add three things. The eval identity line is `eval identity STATE`. The trial line is `trials today N of CAP`, or `trials off` without a cap. The grader line shows `grader ready (version 1: no trials)` when the grader's version is below 2. A baseline job prints `tasks R of P (skipped S) · trials started N of P, graded N, resolved N, ended N, void N`.
+
+#### Not built yet
+
+These arrive in later steps of the delivery order:
+
+- the dev and holdout sets, the exposure of a group, and `excludeGroups`;
+- trial reuse, and the `compare` and `confirm` jobs;
+- the standing budget, with `reserve`, `settle`, `status`, the USD limits, the learning floor, and `estimate-unavailable`;
+- pinned guidance, forced knowledge, prompt overrides, and the `gate` purpose;
+- duel judges and the open-duel gate;
+- run-level replay and the blind rubric;
+- a `promptOrigins` filter.
+
 ### Not in this slice
 
 These arrive in later steps of the delivery order:
 
-- trials, the eval identity, grading, and `baseline` jobs;
 - the dev and holdout sets, and the exposure of a group;
 - reports, priors, and their routes;
-- `candidateProfiles`, `memberProfile`, and `trialMinutes`;
 - a scheduled revalidation. An owner starts one with `revalidate`.
 
 Also not in this slice:
@@ -1482,7 +1617,7 @@ Owner text lives in the sealed goal record, the pinned digest, the prompts and c
 
 Creation criteria go in `criteria` on `POST /api/goals`: one to seven criteria, each with a statement, a check, and a threshold. Routine goals never take criteria. A create that carries criteria is refused with `409` and `objective-source-invalid` when its goal fields cannot build a record, and nothing is stored. A create without criteria still works without a record, as before. A goal created over the relay can carry criteria, as it already carries the success text and steering, because the create route is owner-only. The relay also carries team views, so a relay client can read a cycle's pinned digest there, as it already reads the success text. The record reads and corrections stay off the relay.
 
-`POST /api/goals/:id/record` takes `{ requestId, version, ops }` from an owner device. A controller or viewer gets `403`. Four ops are available:
+`POST /api/goals/:id/record` takes `{ requestId, version, ops }` from an owner device. A controller or viewer gets `403`. Four criterion ops are available; the two register ops are in [Assumption register](#assumption-register):
 
 - `criterion.add` takes a `criterion` with a statement, a check, a threshold, and an optional producer.
 - `criterion.edit` takes an `id` and at least one of `statement`, `check`, or `threshold`.
@@ -1519,6 +1654,65 @@ infinite goal record ID apply --file PATH [--version N] [--request-id ID] [--jso
 Without `--version`, a correction reads the latest version first and then posts once. `apply` reads `{ "ops": [...] }` from a file of at most 64 KiB. The command checks the file before it sends anything, and an error names the op's index, not its text. When the post gets no answer, the command prints the retry with the version and request ID it used. Retry with the same body, version, and request ID only.
 
 Before a rollback to a host without this slice, remove `project.team.objective` from every project. The older host refuses the project schema with that key. A pending goal launch that carries a pinned digest also blocks on an older host.
+
+### Assumption register
+
+The register is the set of assumptions and open questions in a goal's objective record. Host tests set an assumption's status from results the host already holds, and an owner sets it by direction. A member can propose an assumption, but a proposal changes no status and is never tested. Without the setting below, a run is as it was before, byte for byte.
+
+**The setting.** `objective.register` takes `"on"` or `"off"` and has no default. Writing the key at all changes the routine approval digest, so active routines wait for the owner's approval again, as with `objective.intentCheck`. A run pins `register: "on"` when it is created, and only then. The team view shows the pin as `register`, so every device that reads the view sees it, a relay device included; nothing else of the register reaches a view. A mission subteam and a handoff run never pin it. A run created before this change never tests, even after a restart. A pin already taken never moves, so turning the key off does not stop a pinned run.
+
+**Tests.** Each test kind reads one thing, and none runs a command or reads command output:
+
+| Kind | Reads | Result |
+| --- | --- | --- |
+| `command` | The result the host recorded for that command in the revision's final check round | `passed` or `failed` decides, as `refutesOn` says |
+| `artifact` | One JSON file at the reviewed head, through form B1 below | Counts the entries of an array, with the threshold |
+| `citation` | The quoted lines at the reviewed head, or at the `@commit` the source names | Whether the quote is present, as `refutesOn` says |
+| `owner` | Nothing; an owner op sets it | See Owner results below |
+
+A command test reads only the final check round of the revision, and only a check run in that round, not one from a setup phase. It is `unknown` when its command is not one of the project's configured checks now, or when its result is interrupted, running, or absent. An outside citation is `unknown`, and so is a read that fails, is too large, or is not run. `unknown` never changes a status and is never a number.
+
+A pass runs when a run settles as `ready-for-review`, `merged`, or `blocked` and has a check for its current revision. It is `reviewed` when the head is checked and the run is approved at that revision. Otherwise it is a `check` pass, which tests command checks and command tests only and reads no blob. A pass reads the commit it was marked at, not the run's current head, so a pass that outlives a revision still reads and files receipts for its own commit. One pass runs at a time, oldest first. A pass plans at most 40 subjects and reads at most 40 distinct blobs. Each read is at most 1 MiB and 30 seconds, and a pass starts no read after 120 seconds. While 4 reads are stalled, no new read starts. A pass changes only the record and the run's register state. It never changes the run's status, and a refuted assumption does not hold the next cycle; the refutation writes one event until the interruptions slice (C18) is built.
+
+Form B1 is the only new Git form. It runs in the run's integration checkout, after the six `-c` settings of the capture section:
+
+| Form | Command | Limit | If refused |
+| --- | --- | --- | --- |
+| B1, one blob (new) | `git cat-file blob COMMIT:PATH`, with `GIT_NO_LAZY_FETCH=1` | 1,048,576 bytes and 30 seconds. `COMMIT` is 40 or 64 lowercase hexadecimal characters. `PATH` is a repository path of at most 300 characters, and not `.` | Every artifact and citation result is `unknown` with `read-failed`. Command tests still work. |
+
+The launcher must end B1 by itself after 35 seconds, as it ends the capture reads. Until the owner installs a launcher that admits B1, every artifact and citation result is `unknown`.
+
+**Receipts.** A test result is a receipt: its handle, kind, subject, ID, commit, outcome (`pass`, `fail`, or `unknown`), time, and a detail of enumerations and counts. The receipts of the latest pass, at most 40, live in the run's sealed record. No view shows them. A receipt sets an unpinned assumption to `verified` or `refuted` when its outcome differs from the status. It writes nothing when it agrees. A pinned assumption keeps its status and gains the receipt's handle only when the outcome differs. Each assumption keeps one `receipt:` handle. Criteria get receipts but no status.
+
+**Proposals.** A member proposes through the `assumption` field of a `finding` entry. The field either stances an existing assumption with `supports` or `contradicts`, or proposes a new one with a statement, a `refutedBy` observation, a test, and a criticality. Statements and `refutedBy` are at most 500 bytes each, and a test is at most 1,024 bytes of JSON. The entry route refuses a secret-shaped proposal with `422` and `entry-secret`. The host screens each proposal again before it applies it. A drop counts under its reason, and the first drop of a run writes one event.
+
+- A new proposal becomes an `unchecked` assumption with origin `member`. A command test in it must name a configured check, and the host never runs it.
+- A stance is attached to its assumption and changes nothing else.
+- Limits: 4 new assumptions per member attempt, 8 stances per assumption, 16 member assumptions, and 32 assumptions in the record, so one intent check's 16 items still fit. Proposals and stances stop at 300 log entries or 160 KiB of log, and at 24 KiB of capped record text, so intent checks and owner ops keep room.
+- A member assumption never enters the register digest, a prompt, the intent checker's context, or a receipt, and no owner op acts on it. Nobody adopts one yet, so it stays `unchecked` until a later slice adds adoption.
+
+**Owner results.** Two ops on `POST /api/goals/:id/record` record owner results. Only an owner device can send them, and the relay refuses the path. Both need `objective.register: "on"`, and otherwise answer `409` with `objective-register-off`.
+
+- `assumption.set` takes an `id` and a status, `verified` or `refuted`. The assumption must have an `owner` test and come from the intent check or the owner, or the op answers `409` with `objective-assumption-target`. The status is pinned, so no later receipt changes it.
+- `rating.record` takes a `subject` and a `score` from 1 to 5 in halves. It needs a reviewed cycle on the goal, or the op answers `409` with `objective-rating-no-head`. A subject that no active criterion or owner test of the intent check or the owner names answers `409` with `objective-rating-subject`. Each unpinned owner test on the subject from the intent check or the owner becomes `refuted` when the score is below its `below`, and `verified` otherwise. A member's assumption keeps its status. The entry stores the score, commit, and cycle even when no assumption changes.
+
+The record has no field for owner values, so the log holds them. The CLI sends the same ops:
+
+```
+infinite goal record ID set-assumption AID verified|refuted [--version N] [--request-id ID] [--json]
+infinite goal record ID rate SUBJECT SCORE [--version N] [--request-id ID] [--json]
+```
+
+A score must be 1 to 5 in halves, such as `3.5`. Any other score is a usage error, and the command sends no request.
+
+**Prompts.** With prompts and the register on, the goal digest gains `register`. It holds the intent-check and owner assumptions with their statuses and criticality, and the open questions. It has its own 6,144-byte budget, so the criteria digest is unchanged. It holds at most 32 assumptions and 8 questions. Items that do not fit are counted in `omitted`. In an autonomous run, a role that posts findings with entry tools is told to propose an assumption in place of "Ask for a user decision if a material scope decision is required." Without the register, prompts keep their bytes. The routing prompt version changes only for the two register shapes.
+
+**Rollback.** Before a rollback to a host without this slice:
+
+1. Remove `objective.register` from every project, or the whole `objective` block as above. The older host refuses the project schema with that key.
+2. Finish or cancel a goal whose pending launch holds a register digest. The older host refuses that digest, so the goal blocks.
+3. Owner results already recorded stay in the record. The older host reads the latest version, but a version before a register entry answers `409` with `objective-version-unavailable`.
+4. A run pinned `register: "on"` loses its tests and proposals. The older host ignores `run.register` and the sealed register state. Findings that carry `assumption` never reach its board, and its entry route refuses new ones with `400`.
 
 ### Standing objectives
 
@@ -2898,9 +3092,21 @@ member would load what an earlier member wrote. A repository's own
 `CLAUDE.md` instructions still load. A profile
 that sets `--setting-sources` cannot launch a Claude team role.
 
-Trust still lets Codex apply a project Codex configuration in member folders.
-Team members can edit that file, and later Codex members load the integrated
-result. Review it like the rest of a run's changes. Tool permission prompts,
+A trusted Codex launch loads the repository's `.codex` configuration: its
+settings, hooks and exec policy, and MCP servers whose commands run outside the
+command sandbox. A member that commits one would change how every later Codex
+member runs. So when a `.codex` entry of any type exists in a Codex member's
+folder, or in a folder above it up to the Git root, the host does not start that
+member and names the path in the session's exit reason. A folder the host cannot
+inspect is refused the same way. The launch pins `project_root_markers` to
+`.git`, so Codex finds the same root as the check. Remove the entry from the
+repository to start Codex members there. The check runs just before each
+launch. It does not cover a file written between the check and Codex's start,
+the agent account's own Codex configuration, or a managed Codex configuration
+that sets other root markers.
+
+Review a run's changes to `.codex`, `.claude` and `.mcp.json` before merging
+them: they apply to whoever opens the repository next. Tool permission prompts,
 delegation limits and the root ownership rules above are unchanged; sessions
 outside team runs never receive this trust.
 
@@ -2913,6 +3119,35 @@ ownership, or asks the owner for a material decision. Project-manager and
 delivery questions retain the direct decision path: an owner or controller
 answers from the team page, and a new assignment receives the recorded answer.
 Provider tool permission dialogs use their separate permission policy.
+
+Every question carries a recommendation: the answer the asking member would
+give and a one-line reason. For a question with options, the recommendation
+copies option text exactly, one option unless the question takes several; for
+a question without options, it is one short answer in words. The report tool
+refuses a question without one, and the refusal names the shape to send, so a
+member whose prompt predates this rule can add it. A question a member's
+session recorded before this rule still becomes a decision, with no
+recommendation. A session started before this rule keeps a worker that does
+not know the field. When that worker refuses a question for it, the reporter
+sends the question once more without its recommendation, so the member can
+still ask. The decision stores the
+recommendation and clients show it first, as the asking agent's. A worker's
+question reaches the project manager's recovery with its recommendation
+appended to the reason. When the decision is answered, by the owner, a mission
+coordinator, or a connector, the host records how the answer compared:
+`matched` when the answer selects exactly the recommended options, or repeats
+the recommended words of a question without options; `different` when it
+selects other options; and `other` when it is any other text. Free text
+matches only word for word; the host does not judge whether words agree. An
+answer is compared as it arrives, trimmed: options that differ only in
+surrounding spaces count as one answer, and an answer that reads as two
+different selections, as it can when one option's text looks like numbered
+lines, is `other`. A
+recommendation is evidence beside the question. Nothing answers a question
+with it, and the intent check's decisions carry none.
+The recommendation is part of the decision in the team view, so it reaches
+every paired device that reads the run or the team list, through the relay as
+well, exactly as the question and its options do. An older client ignores it.
 
 For a standalone team, steering records a new requirements revision. Earlier
 member results cannot satisfy it. The scheduler stops old assignments and replans from the integrated

@@ -1,7 +1,9 @@
 import type express from "express";
 import { z } from "zod";
 import { EvidenceError } from "./evidence/types.js";
-import type { EvalHostApi, EvalRefusal, ValidateJobRequest } from "./eval-types.js";
+import { validateJobSchema } from "./eval-jobs.js";
+import type { BaselineJobRequest, EvalHostApi, EvalRefusal, ValidateJobRequest } from "./eval-types.js";
+import { baselineJobSchema } from "./eval-trial-jobs.js";
 
 const uuid = z.uuid();
 const TASK_ID = /^(captured|mined):[A-Za-z0-9:._-]{1,200}$/;
@@ -21,6 +23,7 @@ const MESSAGES: Record<EvalRefusal["code"], string> = {
   "job-active": "This project already has an active validation job.",
   "request-conflict": "This request ID already names a different job.",
   "eval-config-incomplete": "The project's validation settings are incomplete.",
+  "profile-not-approved": "The trial profile is not approved for this project.",
   "invalid-job-transition": "The job cannot take this action in its current state.",
   "task-not-active": "The task is not a candidate or valid task.",
   "evidence-unavailable": "The evidence store is unavailable.",
@@ -57,8 +60,9 @@ export function evalRoutes(
   app.post("/api/eval/jobs", ownerGuard, guarded(async (req, res) => {
     const body = createBody.safeParse(req.body);
     if (!body.success) return refuse(res, invalid());
-    // The host parses `job` against its schema before any write, so the route passes it unchanged.
-    const result = host.create(body.data.projectId, body.data.job as unknown as ValidateJobRequest, body.data.requestId.toLowerCase());
+    const job = jobOf(body.data.job);
+    if (job === undefined) return refuse(res, invalid());
+    const result = host.create(body.data.projectId, job, body.data.requestId.toLowerCase());
     if (isRefusal(result)) return refuse(res, result);
     res.status(result.created ? 201 : 200).json(result);
   }));
@@ -88,6 +92,15 @@ function guarded(handler: (req: express.Request, res: express.Response) => Promi
       throw error;
     }
   };
+}
+
+/** A job body parsed by its own kind's schema, or undefined: a body with no known kind, or one that does not parse. */
+function jobOf(value: unknown): ValidateJobRequest | BaselineJobRequest | undefined {
+  const kind = typeof value === "object" && value !== null && "kind" in value ? value.kind : undefined;
+  const parsed = kind === "validate" ? validateJobSchema.safeParse(value)
+    : kind === "baseline" ? baselineJobSchema.safeParse(value)
+    : undefined;
+  return parsed?.success ? parsed.data : undefined;
 }
 
 /** A job ID is a UUID; the host stores it in lower case. */

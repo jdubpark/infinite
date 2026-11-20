@@ -421,3 +421,23 @@ test("each new run pins the intent check by mode and setting", async () => {
     assert.equal(replay.intentCheck, "on");
   } finally { teams.close(); f.close(); }
 });
+
+test("each new run pins the register by setting", async () => {
+  const f = teamFixture();
+  const teams = f.openTeam();
+  try {
+    f.config.projects[0]!.team!.objective = { register: "on" };
+    const mission = await teams.createForMission(teamRequest(), randomUUID(), lineup);
+    assert.equal(mission.register, undefined, "a mission subteam never pins the register");
+    assert.equal(f.readRecord<{ run: TeamRun }>("team", mission.id).run.register, undefined);
+
+    const standalone = await teams.create(teamRequest());
+    assert.equal(standalone.register, "on");
+    assert.equal(f.readRecord<{ run: TeamRun }>("team", standalone.id).run.register, "on");
+
+    f.config.projects[0]!.team!.objective = { register: "off" };
+    const off = await teams.create(teamRequest());
+    assert.equal(off.register, undefined, "the setting off pins nothing");
+    assert.equal("register" in f.readRecord<{ run: TeamRun }>("team", off.id).run, false);
+  } finally { teams.close(); f.close(); }
+});

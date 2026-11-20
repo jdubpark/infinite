@@ -10,13 +10,19 @@ import { fileURLToPath } from "node:url";
 // The launcher runs only as copies whose ROOT and ACCOUNT lines are rewritten, as the current user. The installed
 // file is never run here. `stop` kills every process of the account and deletes its temporary files, so in every copy
 // its first line becomes `exit 99`: a broken account check fails a test instead of ending the test runner's processes.
-// Every test skips on a platform other than Linux, and when the test runs as root.
+// Every test but the installed-file checks skips on a platform other than Linux, and when the test runs as root.
 const LAUNCHER = fileURLToPath(new URL("../deploy/ubuntu/grader-command.sh", import.meta.url));
 const SKIP = process.platform !== "linux" ? "the launcher runs on Linux only"
   : process.getuid?.() === 0 ? "the launcher test must not run as root" : false;
 const JOB = "11111111-2222-4333-8444-555555555555";
 const OTHER = "66666666-7777-4888-8999-aaaaaaaaaaaa";
 const UNUSED = "99999999-8888-4777-8666-555555555555";
+
+// The installed launcher caps the child with `prlimit --nproc=512`. On Linux that cap counts every thread the real
+// user owns, so a test user that owns more than 512 threads cannot fork. The copy drops the cap: prlimit then leaves
+// the limit alone, and no value has to fit under the user's hard limit (a raise above it fails with EPERM). The cap
+// itself is checked against the installed file by its own test, on every platform.
+const NPROC_CAP = /--nproc=512 /;
 
 type Sandbox = { dir: string; root: string; script: string };
 
@@ -29,11 +35,15 @@ function sandbox(account: string = userInfo().username): Sandbox {
   const source = readFileSync(LAUNCHER, "utf8");
   const kill = /^ {2}kill -KILL -1 .*$/m;
   assert.equal(source.match(new RegExp(kill.source, "gm"))?.length, 1, "the launcher's kill line moved; move this guard with it");
+  // Throws when the installed cap is no longer spelled as NPROC_CAP expects, so the rewrite cannot silently skip it.
+  assert.equal(source.match(new RegExp(NPROC_CAP.source, "g"))?.length, 1, "the launcher's --nproc=512 cap moved; move this guard with it");
   const text = source
     .replace(/^ROOT=.*$/m, `ROOT='${root}'`)
     .replace(/^ACCOUNT=.*$/m, `ACCOUNT='${account}'`)
-    .replace(kill, "  exit 99");
+    .replace(kill, "  exit 99")
+    .replace(NPROC_CAP, "");
   assert.doesNotMatch(text, /kill -KILL -1/);
+  assert.doesNotMatch(text, /--nproc=/);
   writeFileSync(script, text, { mode: 0o700 });
   chmodSync(script, 0o700);
   return { dir, root, script };
@@ -57,6 +67,11 @@ function grader(sb: Sandbox, args: readonly string[], options: { input?: string;
     timeout: 60_000,
   });
 }
+
+test("the installed launcher keeps its process cap", () => {
+  const source = readFileSync(LAUNCHER, "utf8");
+  assert.equal(source.match(new RegExp(NPROC_CAP.source, "g"))?.length, 1, "the installed launcher must still cap the child with --nproc=512");
+});
 
 test("the launcher starts the child with an empty environment", { skip: SKIP }, () => {
   const sb = sandbox();
@@ -250,6 +265,41 @@ test("the launcher refuses a root that is not a private directory", { skip: SKIP
     assert.equal(grader(sb, ["probe", "--"]).status, 64);
   } finally {
     chmodSync(sb.root, 0o700);
+    cleanup(sb);
+  }
+});
+
+test("the grader exports only the trial branch", { skip: SKIP }, () => {
+  const sb = sandbox();
+  try {
+    // C1 is the trial branch; C2 is on the default branch only, so the bundle must not carry it.
+    const identity = "-c user.name=t -c user.email=t@example.invalid";
+    const made = grader(sb, ["run", JOB, "task", "60", "--", "/bin/sh", "-c",
+      `git init -q && git ${identity} commit -q --allow-empty -m c1 && git branch trial && git ${identity} commit -q --allow-empty -m c2`]);
+    assert.equal(made.status, 0, made.stderr.toString("utf8"));
+
+    const exported = grader(sb, ["export", JOB]);
+    assert.equal(exported.status, 0, exported.stderr.toString("utf8"));
+    const out = join(sb.dir, "out");
+    mkdirSync(out);
+    const bundle = join(out, "trial.bundle");
+    writeFileSync(bundle, exported.stdout);
+    // The test's own git calls run in the sandbox, never in the checkout under test.
+    const heads = spawnSync("git", ["bundle", "list-heads", bundle], { cwd: out }).stdout.toString("utf8").trim().split("\n");
+    assert.deepEqual(heads.map(line => line.split(" ")[1]), ["refs/heads/trial"]);
+
+    const clone = join(out, "clone");
+    assert.equal(spawnSync("git", ["clone", "-q", "--branch", "trial", bundle, clone], { cwd: out }).status, 0);
+    assert.deepEqual(spawnSync("git", ["-C", clone, "log", "--all", "--format=%s"], { cwd: out }).stdout.toString("utf8").trim().split("\n"), ["c1"]);
+
+    // A missing trial branch refuses with status 2.
+    assert.equal(grader(sb, ["export", OTHER]).status, 2);
+
+    assert.equal(grader(sb, ["receive", JOB, "result.patch", "10"], { input: "0123456789" }).status, 0);
+    assert.equal(readFileSync(jobPath(sb, "in", "result.patch"), "utf8"), "0123456789");
+
+    assert.match(grader(sb, ["probe", "--"]).stdout.toString("utf8"), /"version":2/);
+  } finally {
     cleanup(sb);
   }
 });

@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { isAbsolute, relative, sep } from "node:path";
+import { isAbsolute } from "node:path";
 import { z } from "zod";
 import { parseMermaid, type Diagram, type UnderstandingBrief, type KnowledgeClaim, type KnowledgeComponent, type KnowledgeDelivery, type KnowledgeEnvironment, type KnowledgePlan, type KnowledgePullRequest } from "@infinite/remote";
 import { expectedIdentity, normalizeRemote, readGit } from "./checkout-identity.js";

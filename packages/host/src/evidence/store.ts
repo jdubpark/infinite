@@ -56,7 +56,7 @@ const SQL_WORD = /[A-Za-z_][A-Za-z0-9_$]*/y;
 const TCL_PARAMETER = /[$@:#][A-Za-z0-9_$:\u0080-\uffff]*\(/y;
 
 const EVIDENCE_CODES: ReadonlySet<string> = new Set<EvidenceErrorCode>([
-  "unavailable", "nested-write", "invalid-event", "event-too-large", "invalid-module", "invalid-statement",
+  "unavailable", "nested-write", "invalid-event", "event-too-large", "invalid-module", "invalid-statement", "unreadable",
 ]);
 /** The errno names a log line may carry. Anything else is logged as "unexpected". */
 const ERRNO_TOKENS: ReadonlySet<string> = new Set([

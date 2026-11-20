@@ -129,6 +129,21 @@ test("post accepts caller-supplied blocks while preserving its fallback, thread,
   assert.deepEqual(payload?.metadata, { event_type: "infinite_intake", event_payload: { key: "interaction:1" } });
 });
 
+test("acknowledgeProposal sends only the eyes reaction and treats a repeated acknowledgement as a no-op", async t => {
+  const { slack, client } = await setup();
+  t.after(() => slack.close());
+  await client.acknowledgeProposal(binding.channelId, binding.threadTs);
+  await client.acknowledgeProposal(binding.channelId, binding.threadTs);
+  const calls = slack.calls.filter(call => call.method === "reactions.add");
+  assert.deepEqual(calls.map(call => call.body), [
+    { channel: binding.channelId, timestamp: binding.threadTs, name: "eyes" },
+    { channel: binding.channelId, timestamp: binding.threadTs, name: "eyes" },
+  ]);
+  assert.equal(slack.calls.filter(call => call.method === "chat.postMessage").length, 0);
+  slack.unavailable(true);
+  await assert.rejects(client.acknowledgeProposal(binding.channelId, binding.threadTs), (error: SlackError) => error instanceof SlackError && error.transient);
+});
+
 test("a lost post response is a transient error and the message exists once", async t => {
   const { slack, client } = await setup();
   t.after(() => slack.close());
@@ -166,6 +181,27 @@ test("the client reconnects after the socket drops", async t => {
   const envelope = await slack.emit(mention());
   await waitFor(async () => received.map(item => item.envelopeId), ids => ids.includes(envelope));
   assert.equal(received.at(-1)?.event?.type, "app_mention");
+});
+
+test("Socket Mode projects admission metadata and fails closed on malformed fields", async t => {
+  const { slack, client } = await setup();
+  t.after(() => slack.close());
+  const seen: SlackEnvelope[] = [];
+  const connection = client.connect(async envelope => { seen.push(envelope); });
+  t.after(() => connection.close());
+  await waitFor(async () => connection.connected(), connected => connected);
+  const valid = await slack.emit({ ...mention(), type: "message", subtype: undefined, channel_type: "channel", app_id: undefined });
+  await waitFor(async () => slack.acks(), acks => acks.includes(valid));
+  const projected = seen.find(envelope => envelope.envelopeId === valid)?.event;
+  assert.deepEqual(projected, {
+    type: "message", user: "U00000000", channelType: "channel", channel: binding.channelId,
+    ts: "1700000100.000001", threadTs: binding.threadTs, text: "<@U00000001> build it",
+  });
+  for (const fields of [{ channel_type: 7 }, { hidden: true }, { edited: { user: "U00000000" } }]) {
+    const id = await slack.emit({ ...mention(), type: "message", ...fields });
+    await waitFor(async () => slack.acks(), acks => acks.includes(id));
+    assert.equal(seen.find(envelope => envelope.envelopeId === id)?.event, undefined);
+  }
 });
 
 test("a socket address outside Slack is refused before any TCP connection", async t => {

@@ -176,6 +176,9 @@ test("listing rows equal the rows built from meta and state, cold, warm, and aft
     const savedAt = new Date(statSync(join(recordDir(f, U1), "status.sealed")).mtimeMs).toISOString();
     assert.deepEqual([row(U1).state, row(U1).since], ["unavailable", savedAt], "a worker gone without recording its exit is unavailable since its status was saved");
     assert.deepEqual([row(U2).state, row(U2).since], ["unavailable", "2026-11-14T00:00:00.000Z"], "without a saved status, since its creation");
+    // Kept on purpose, pending the owner's decision: state() dates a worker that does not answer at the call. A
+    // mission's stall check reads lastActivityAt from it, and a worker does not save its status on every activity.
+    for (const id of [E, U1, U2]) assert.equal((await manager.state(id)).attention.lastActivityAt, new Date().toISOString(), `state() dates ${id === E ? "an exited" : "an unavailable"} row at the call`);
 
     const restarted = new Manager(f.config, f.key);
     const afterRestart = await restarted.list();

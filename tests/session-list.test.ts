@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import type express from "express";
 import { sessionListReader } from "../packages/remote/src/session-list.js";
+import { sendSessionList } from "../packages/host/src/session-list.js";
 import { claimControl, inProcessHost, waitFor } from "./helpers.js";
 
 type Row = { id: string; status: string };
@@ -58,6 +60,19 @@ test("GET /api/sessions answers a client that names the version it holds", { tim
       assert.equal(JSON.parse(refused.text).error, "Invalid request", query);
     }
   } finally { await host.stop(); }
+});
+
+test("a refused since is refused before the list is built", async () => {
+  let built = 0;
+  const list = async () => { built++; return [{ id: "a" }]; };
+  const sent: unknown[] = [];
+  const res = { json: (body: unknown) => sent.push(body), type: () => res, send: (body: unknown) => sent.push(body) };
+  const read = (since: unknown) => sendSessionList({ query: { since } } as unknown as express.Request, res as unknown as express.Response, list);
+  for (const since of ["A".repeat(129), "a.b", "a b", ["a", "b"]]) await assert.rejects(read(since), JSON.stringify(since));
+  assert.equal(built, 0, "a refused since never builds the list");
+  assert.deepEqual(sent, []);
+  await read("");
+  assert.equal(built, 1, "an accepted since builds it once");
 });
 
 test("an exited session reads the same on every poll, and the live list sends it once", { timeout: 60_000 }, async () => {

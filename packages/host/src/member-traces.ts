@@ -148,17 +148,24 @@ export async function removeMemberTraces(stateDir: string, runId: string) {
 
 /**
  * The manifest, opened without following a link and without blocking, so a FIFO in its place cannot hold the open;
- * the descriptor must then be a regular file. Undefined when there is none or it is no manifest.
+ * the descriptor must then be a regular file. Undefined when there is none, or when what is there is no manifest: a
+ * link, a FIFO or other non-regular file, an oversized file, or text that is not a valid manifest. A read that fails
+ * throws, so the caller retries instead of taking the manifest for absent.
  */
 async function readManifest(directory: string): Promise<Manifest | undefined> {
   let file;
   try { file = await open(join(directory, MANIFEST), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
-  catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
+  catch (error) {
+    // ELOOP: a link in its place; ENXIO and EOPNOTSUPP: a socket or a FIFO the platform refuses to open.
+    if (["ENOENT", "ELOOP", "ENXIO", "EOPNOTSUPP"].includes(errorCode(error))) return undefined;
+    throw error;
+  }
   try {
     const info = await file.stat();
-    if (!info.isFile() || info.size > MANIFEST_MAX_BYTES) throw traceError("trace-manifest-invalid", "A trace manifest is not a small regular file.");
+    if (!info.isFile() || info.size > MANIFEST_MAX_BYTES) return undefined;
+    const text = await file.readFile("utf8");
     let parsed: unknown;
-    try { parsed = JSON.parse(await file.readFile("utf8")); } catch { return undefined; }
+    try { parsed = JSON.parse(text); } catch { return undefined; }
     const result = manifestSchema.safeParse(parsed);
     return result.success ? result.data : undefined;
   } finally { await file.close(); }
@@ -168,12 +175,15 @@ async function writeManifest(directory: string, manifest: Manifest) {
   try { await file.chmod(0o600); await file.writeFile(manifestText(manifest)); } finally { await file.close(); }
   await rename(temporary, join(directory, MANIFEST));
 }
-/** Bytes of the run's traces in state `kept`, other than one member's. */
+/**
+ * Bytes of the run's traces in state `kept`, other than one member's. A sibling manifest that cannot be read throws:
+ * its usage is unknown, so the run cap is not decided until a later pass can read it.
+ */
 async function keptBytes(run: string, exceptMemberId: string) {
   let total = 0;
   for (const entry of await readdir(run, { withFileTypes: true })) {
     if (entry.name === exceptMemberId || !entry.isDirectory()) continue;
-    const manifest = await readManifest(join(run, entry.name)).catch(() => undefined);
+    const manifest = await readManifest(join(run, entry.name));
     if (manifest?.state === "kept") total += manifest.bytes ?? 0;
   }
   return total;

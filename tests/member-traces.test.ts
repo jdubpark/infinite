@@ -364,3 +364,25 @@ test("an exited Codex member's trace over a cap is removed and its manifest says
     assert.equal(readFileSync(join(kept.directory, MANIFEST), "utf8"), first, "a later tick does not measure the same session again");
   } finally { teams.close(); f.close(); }
 });
+
+test("a sibling manifest that cannot be read leaves the run cap undecided until it can be read", async () => {
+  const caps = { memberBytes: 100, runBytes: 150 };
+  const f = await tracedRun([{ exited: true, bytes: 80 }, { exited: false, bytes: 80 }], caps);
+  let clock = Date.now();
+  const teams = f.openTeam({ now: () => clock } as Parameters<typeof f.openTeam>[0]);
+  const [first, second] = f.run.members.map(member => traces(f.config.stateDir, f.run.id, member.memberId));
+  try {
+    await sweep(teams, f.run.id);
+    assert.equal(manifest(first!).state, "kept");
+    chmodSync(join(first!, MANIFEST), 0o000);
+    await f.manager.stopTeamSession(f.run.members[1]!.sessionId);
+    clock += 10_000;
+    const logged = await warnings(() => sweep(teams, f.run.id));
+    chmodSync(join(first!, MANIFEST), 0o600);
+    assert.equal(manifest(second!).state, "recording", "no cap is decided while a sibling's usage is unknown");
+    assert.match(logged.join("\n"), /EACCES/);
+    clock += 60_000;
+    await sweep(teams, f.run.id);
+    assert.deepEqual(shape(second!), { version: 1, sessionId: f.run.members[1]!.sessionId, state: "removed", caps, bytes: 80, at: undefined, reason: "run-cap", sessionRecord: "kept" });
+  } finally { chmodSync(join(first!, MANIFEST), 0o600); teams.close(); f.close(); }
+});

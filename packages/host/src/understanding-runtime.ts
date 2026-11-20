@@ -231,9 +231,10 @@ export class UnderstandingRuntime {
     this.queue = []; this.queued.clear();
     return new Promise(resolvePromise => {
       if (!this.running) return resolvePromise();
-      const timer = setInterval(() => { if (!this.running) { clearInterval(timer); resolvePromise(); } }, 10);
-      timer.unref();
-      setTimeout(() => { clearInterval(timer); resolvePromise(); }, 1500).unref();
+      // Both timers keep the process alive, so a caller that awaits close always gets an answer within the limit.
+      const done = () => { clearInterval(timer); clearTimeout(limit); resolvePromise(); };
+      const timer = setInterval(() => { if (!this.running) done(); }, 10);
+      const limit = setTimeout(done, 1500);
     });
   }
 

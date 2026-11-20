@@ -380,6 +380,23 @@ test("a failed guidance read gives nothing", async () => {
   }
 });
 
+test("a member's configuration records the prompt version of its objective shape", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "config-identity-"));
+  try {
+    execFileSync("git", ["init", "-q", "--template="], { cwd: dir });
+    execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-q", "--allow-empty", "-m", "empty"], { cwd: dir });
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim();
+    const input = { workspace: dir, baseCommit: head, role: "implementer" as const, provider: "claude" as const, publishHeads: true, entryTools: true };
+    const live = new AbortController().signal;
+    for (const shape of [false, true, "register", "register-autonomous"] as const) {
+      const configuration = await memberConfiguration({ ...input, objectiveDigest: shape }, live);
+      assert.equal(configuration?.promptVersion, promptVersion("implementer", "claude", undefined, true, true, shape), String(shape));
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("entry tools change the prompt version only for entry roles", () => {
   assert.notEqual(promptVersion("implementer", "claude", undefined, false, true), promptVersion("implementer", "claude", undefined, false));
   assert.equal(promptVersion("delivery", "claude", undefined, false, true), promptVersion("delivery", "claude", undefined, false));
@@ -394,7 +411,8 @@ test("entry tools change the prompt version only for entry roles", () => {
 // Base pin: with the switch off, every role and provider keeps the prompt version it had at the base commit.
 const PIN_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"] as const;
 const PIN_PROVIDERS = ["claude", "codex", "opencode"] as const;
-const PIN_VERSIONS_SHA256 = "2140e519361470e60a9034642a8a23885f77ed54af61cd633ad8f94f2090fbb4";
+// Moved from 2140e519 because questions now ask for a recommendation (INF-323).
+const PIN_VERSIONS_SHA256 = "1dfe7b9b8aff74f29c5570a3eca8b144da3f4b4e6c75af9b6681eadb766b9187";
 
 test("the switch off keeps every prompt version", () => {
   const versions = PIN_ROLES.flatMap(role => PIN_PROVIDERS.map(provider => promptVersion(role, provider, undefined, true)));
@@ -426,4 +444,16 @@ test("the intent checker's prompt version is its own", () => {
   const render = renderedPrompts("intent-checker", "opencode", profile, false);
   assert.ok(render[0].includes("<report-command>"));
   assert.deepEqual(render, [intentCheckerPrompt("opencode", profile).split(reportCommand()).join("<report-command>")], "the version digests the prompt the checker launches with");
+});
+
+test("the register changes the prompt version only where the prompt changes", () => {
+  // The implementer with entry tools: the flag, the register, and the register pinned autonomous give three versions.
+  const flag = promptVersion("implementer", "claude", undefined, false, true, true);
+  const register = promptVersion("implementer", "claude", undefined, false, true, "register");
+  const autonomous = promptVersion("implementer", "claude", undefined, false, true, "register-autonomous");
+  assert.equal(new Set([flag, register, autonomous]).size, 3);
+  // Without entry tools the propose sentence never renders, so the two register shapes give one version.
+  assert.equal(promptVersion("implementer", "claude", undefined, false, false, "register"), promptVersion("implementer", "claude", undefined, false, false, "register-autonomous"));
+  // A project manager posts no findings, so it has one version under both register shapes.
+  assert.equal(promptVersion("project-manager", "claude", undefined, false, true, "register"), promptVersion("project-manager", "claude", undefined, false, true, "register-autonomous"));
 });

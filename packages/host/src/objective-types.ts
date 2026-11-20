@@ -63,7 +63,7 @@ export type ObjectiveRecord = { schemaVersion: 1; owner: ObjectiveOwner; version
   questions: Question[]; rubricVersion: number; log: LogEntry[] };
 
 const L = OBJECTIVE_LIMITS;
-const ID_RE = /^[a-z][a-z0-9-]{0,39}$/;
+export const ID_RE = /^[a-z][a-z0-9-]{0,39}$/;
 const HANDLE_RE = /^[A-Za-z0-9:._-]{1,200}$/;
 const OP_RE = /^[a-z]+(?:[.-][a-z]+)*$/;
 const HEX64_RE = /^[0-9a-f]{64}$/;

@@ -154,19 +154,3 @@ export interface MemoryProcessingReservation {
   maxCostMicrounits: string;
 }
 
-/** Must atomically persist the budget reservation before authorizing an external request. */
-export interface MemoryProcessingGateway {
-  reserveEmbedding(input: {
-    partition: MemoryAdapterPartition;
-    query: string;
-    destination: { providerId: string; endpointId: string; modelId: string };
-  }): Promise<MemoryProcessingReservation>;
-  settleEmbedding(input: {
-    reservation: MemoryProcessingReservation;
-    outcome: "completed" | "uncertain";
-    inputBytes: number;
-    inputTokens: number;
-    costMicrounits: string;
-  }): Promise<void>;
-  assertReservationCurrent(reservationId: string, partition: MemoryAdapterPartition): Promise<void>;
-}

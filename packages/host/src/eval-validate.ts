@@ -5,7 +5,7 @@ import type { ChildProcess } from "node:child_process";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceTx } from "./evidence/types.js";
 import type { ValidationSettings } from "./eval-config.js";
-import { type Grader, type GraderDir, type GraderRun, stopGrader } from "./eval-grader.js";
+import { type Grader, type GraderDir, type GraderInput, type GraderRun, stopGrader } from "./eval-grader.js";
 import type { MineGit } from "./eval-mine-git.js";
 import { COMMIT_ID } from "./outcome-hold.js";
 import { parseReport, REPORT_MAX_BYTES } from "./eval-report.js";
@@ -49,7 +49,7 @@ type Step = "R1" | "guards" | "B1" | "R2" | "B2" | "R3";
 type Exec = { dir: GraderDir; seconds: number; argv: string[]; input?: Buffer; keepStdout?: boolean };
 
 /** Ends a task early with its outcome. Every task still ends with `stopGrader` and `clean`. */
-class Stop extends Error {
+export class Stop extends Error {
   constructor(readonly outcome: Outcome) {
     super("validation stopped");
   }
@@ -164,7 +164,7 @@ function pause(code: string): void {
   console.warn(`Eval validation paused (${code}).`);
 }
 
-function loadTask(store: EvidenceStore, taskId: string): Loaded {
+export function loadTask(store: EvidenceStore, taskId: string): Loaded {
   return store.read((db): Loaded => {
     const head = db.get<{ state: string }>("SELECT state FROM eval_tasks WHERE task_id=?", taskId);
     if (!head || (head.state !== "candidate" && head.state !== "valid")) return { kind: "absent" };
@@ -206,7 +206,7 @@ async function evaluate(task: EvalTaskRow, material: Material, ctx: ValidateCont
 }
 
 /** The digest check. A mismatch, a missing digest, or a job not yet streamed streams the bundle once more; a second mismatch is bundle-missing. */
-async function ensureBundle(ctx: ValidateContext): Promise<void> {
+export async function ensureBundle(ctx: ValidateContext): Promise<void> {
   if (ctx.bundle.job !== ctx.jobId && (await prepareJob(ctx, ctx.bundle.spawn)) !== "ready") fail("bundle-missing");
   if (await bundleMatches(ctx)) return;
   if ((await prepareJob(ctx, ctx.bundle.spawn)) !== "ready") fail("bundle-missing");
@@ -219,7 +219,7 @@ async function bundleMatches(ctx: ValidateContext): Promise<boolean> {
 }
 
 /** Stop and clean, then the clone of the bundle, then the commits it must hold. A commit missing from the bundle streams it once per job. */
-async function cloneTask(ctx: ValidateContext, ids: string[]): Promise<void> {
+export async function cloneTask(ctx: ValidateContext, ids: string[]): Promise<void> {
   const bundlePath = posix.join(ctx.graderRoot, "jobs", ctx.jobId, "in", "base.bundle");
   for (;;) {
     await reset(ctx);
@@ -233,13 +233,13 @@ async function cloneTask(ctx: ValidateContext, ids: string[]): Promise<void> {
   }
 }
 
-async function tagMined(ctx: ValidateContext, parent: string, commit: string): Promise<void> {
+export async function tagMined(ctx: ValidateContext, parent: string, commit: string): Promise<void> {
   expectZero(await exec(ctx, { dir: "task", seconds: PREPARE_SECONDS, argv: ["git", "update-ref", "refs/tags/eval-base", parent] }));
   expectZero(await exec(ctx, { dir: "task", seconds: PREPARE_SECONDS, argv: ["git", "update-ref", "refs/tags/eval-reference", commit] }));
 }
 
 /** A captured task: the anchor, then base-delta (when stored), tagged eval-base; then the reference, tagged eval-reference. */
-async function applyCaptured(ctx: ValidateContext, payload: CapturedPayload, material: Material): Promise<void> {
+export async function applyCaptured(ctx: ValidateContext, payload: CapturedPayload, material: Material): Promise<void> {
   if (payload.baseDelta === "missing" || (payload.baseDelta === "stored" && !material.baseDelta)) refuse("patch-missing");
   if (payload.reference !== "stored" || !material.reference) refuse("patch-missing");
   expectZero(await exec(ctx, {
@@ -252,7 +252,7 @@ async function applyCaptured(ctx: ValidateContext, payload: CapturedPayload, mat
   expectZero(await exec(ctx, { dir: "task", seconds: PREPARE_SECONDS, argv: ["git", "update-ref", "refs/tags/eval-reference", "HEAD"] }));
 }
 
-async function applyPatch(ctx: ValidateContext, name: "base-delta.patch" | "reference.patch", bytes: Buffer): Promise<void> {
+export async function applyPatch(ctx: ValidateContext, name: Exclude<GraderInput, "base.bundle">, bytes: Buffer): Promise<void> {
   const stored = await call(ctx, () => ctx.grader.receive(ctx.jobId, name, bytes, bytes.length));
   if (stored === "too-large") refuse("patch-too-large");
   if (stored !== "stored") fail("grader-failed");
@@ -265,10 +265,10 @@ async function applyPatch(ctx: ValidateContext, name: "base-delta.patch" | "refe
 }
 
 /** The names that differ between the two tags. Truncated output is too wide for a reference. */
-async function changedNames(ctx: ValidateContext): Promise<string[]> {
+export async function changedNames(ctx: ValidateContext, from = "eval-base", to = "eval-reference"): Promise<string[]> {
   const run = await exec(ctx, {
     dir: "task", seconds: PREPARE_SECONDS, keepStdout: true,
-    argv: ["git", "diff", "--name-only", "--no-renames", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "--diff-filter=d", "-z", "eval-base", "eval-reference", "--"],
+    argv: ["git", "diff", "--name-only", "--no-renames", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "--diff-filter=d", "-z", from, to, "--"],
   });
   if (run.failed) fail("grader-failed");
   if (run.truncated) refuse("reference-too-wide");
@@ -315,7 +315,7 @@ async function runStep(ctx: ValidateContext, step: Step, focus: string[], restor
   return partial;
 }
 
-async function guardChecks(ctx: ValidateContext, dir: GraderDir): Promise<"passed" | "failed"> {
+export async function guardChecks(ctx: ValidateContext, dir: GraderDir): Promise<"passed" | "failed"> {
   for (const check of ctx.settings.guardChecks) {
     const run = await exec(ctx, { dir, seconds: GUARD_SECONDS, argv: [check.command, ...check.args] });
     if (run.failed) fail("grader-failed");
@@ -325,7 +325,7 @@ async function guardChecks(ctx: ValidateContext, dir: GraderDir): Promise<"passe
 }
 
 /** The focused test's exit code is never read. Its report is read through the grader, and only the report decides. */
-async function focused(ctx: ValidateContext, dir: GraderDir, focus: string[], n: number): Promise<RoundOutcome> {
+export async function focused(ctx: ValidateContext, dir: GraderDir, focus: string[], n: number): Promise<RoundOutcome> {
   const format = ctx.settings.reportFormat;
   const reportName = `reports/round-${n}.${format === "junit" ? "xml" : "tap"}`;
   const reportPath = posix.join(ctx.graderRoot, "jobs", ctx.jobId, "work", reportName);
@@ -343,7 +343,7 @@ async function focused(ctx: ValidateContext, dir: GraderDir, focus: string[], n:
 }
 
 /** Halts a command the owner stopped. `stop` reaches the pending command; the host then waits for it to end. */
-async function call<T>(ctx: ValidateContext, start: () => Promise<T>): Promise<T> {
+export async function call<T>(ctx: ValidateContext, start: () => Promise<T>): Promise<T> {
   if (ctx.halted()) throw new Stop({ kind: "environment", cause: "halted" });
   const pending = start();
   let timer: NodeJS.Timeout | undefined;
@@ -363,24 +363,24 @@ async function call<T>(ctx: ValidateContext, start: () => Promise<T>): Promise<T
   throw new Stop({ kind: "environment", cause: "halted" });
 }
 
-function exec(ctx: ValidateContext, options: Exec): Promise<GraderRun> {
+export function exec(ctx: ValidateContext, options: Exec): Promise<GraderRun> {
   return call(ctx, () => ctx.grader.run(ctx.jobId, options.dir, options.seconds, options.argv, { input: options.input, keepStdout: options.keepStdout }));
 }
 
-function expectZero(run: GraderRun): void {
+export function expectZero(run: GraderRun): void {
   if (run.failed) fail("grader-failed");
   if (run.timedOut || run.exitCode !== 0) undecided("setup-failed");
 }
 
 /** Stops every grader process, then removes the job's work. Returns the cause when either fails. */
-async function finish(ctx: ValidateContext): Promise<EnvCause | undefined> {
+export async function finish(ctx: ValidateContext): Promise<EnvCause | undefined> {
   const stopped = await stopGrader(ctx.grader, ctx.uid, ctx.inventory);
   if (stopped === "alive") return "grader-processes-alive";
   if (stopped === "failed") return "grader-failed";
   return (await ctx.grader.clean(ctx.jobId)) ? undefined : "grader-failed";
 }
 
-async function reset(ctx: ValidateContext): Promise<void> {
+export async function reset(ctx: ValidateContext): Promise<void> {
   const cause = await finish(ctx);
   if (cause) fail(cause);
 }

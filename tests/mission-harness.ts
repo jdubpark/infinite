@@ -93,7 +93,8 @@ type FakeRun = { id: string; projectId: string; missionId: string; status: TeamV
   blockCode?: string; reason?: string; members?: TeamView["members"];
   usage?: UsageRollup; workspaceRemovedAt?: string;
   recovery?: { attempts: number; status: "stopping" | "planning" | "exhausted"; source: { code: string; memberId: string; revision: number; reportKind?: string; reason: string; at: string } };
-  decisions: { id: string; memberId: string; revision: number; question: string; options: string[]; answerMode?: "approval" | "single" | "multiple"; createdAt: string; answer?: string }[] };
+  decisions: { id: string; memberId: string; revision: number; question: string; options: string[]; answerMode?: "approval" | "single" | "multiple"; createdAt: string; answer?: string;
+    recommendation?: TeamView["decisions"][number]["recommendation"] }[] };
 
 /**
  * The real mission service over scripted coordinator sessions and subteams: each coordinator attempt

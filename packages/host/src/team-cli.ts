@@ -18,7 +18,7 @@ import { captureWorkspace } from "./workspace-checkpoint.js";
 import { uploadMissingChunks } from "./chunk-upload.js";
 import { localProjectPath } from "./mirrored-projects.js";
 import { readSyncState, stopSyncService, syncServiceRunning } from "./sync-service.js";
-import { canAskForBrief, chooseTeamBrief, failedTeamBriefRow, orderedTeamMembers, summaryMember, teamLogsText, teamMonitorText, teamSummaryText, teamWatchCommand, teamWatchFrame, teamWatchScreen, wrapText, type TeamBriefRow, type TeamBriefStatus, type TeamWatchCommand } from "./team-watch.js";
+import { canAskForBrief, chooseTeamBrief, failedTeamBriefRow, openQuestionLines, orderedTeamMembers, summaryMember, teamLogsText, teamMonitorText, teamSummaryText, teamWatchCommand, teamWatchFrame, teamWatchScreen, wrapText, type TeamBriefRow, type TeamBriefStatus, type TeamWatchCommand } from "./team-watch.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
 type Api = {
@@ -444,7 +444,7 @@ function outputTeam(team: any, json: boolean) {
     console.log(`Permission agent: ${clean(decision.result)}${decision.code ? ` (${clean(decision.code)})` : ""}${decision.interruptClass ? ` · class ${clean(decision.interruptClass)}` : ""} · member ${clean(decision.memberId)} (${clean(decision.role)})${decision.delivery ? ` · ${clean(decision.delivery)}` : ""}`);
   for (const member of team.members ?? []) if (member.permissionBlocked)
     console.log(`Member ${clean(member.memberId)} (${clean(member.role)}): blocked on a permission (${clean(member.permissionBlocked.code)})`);
-  for (const question of team.decisions ?? []) if (!question.answer) console.log(`Question ${clean(question.id)}: ${clean(question.question)}`);
+  for (const question of team.decisions ?? []) if (!question.answer) console.log(openQuestionLines(question).join("\n"));
 }
 function receipt(path: string, key: string, body: unknown) {
   const records = readPrivateJson(path, {}) as Record<string, unknown>;

@@ -29,7 +29,9 @@ export type EntryPage = { entries: EntryHead[]; cursor: number; more: boolean };
 export type MemberPostRecord = { seq: number; at: string; envelope: Extract<MemberEntryEnvelope, { op: "post" }> };
 /** One journaled read receipt of a member: a list or a get call, and the bytes it served. */
 export type MemberReadRecord = { seq: number; op: "list" | "get"; servedBytes: number };
-export type IngestOutcome = { result: "stored" | "unready" | "held" | "failed"; stored: number; dropped: number; invalid: number };
+export type IngestOutcome = { result: "stored" | "unready" | "held" | "failed"; stored: number; dropped: number; invalid: number;
+  /** Seqs of this call's posts that the store holds afterwards, inserted now or already present. Only on "stored". */
+  kept?: ReadonlySet<number> };
 export type LaunchSizes = { launchSeq: number | undefined; promptBytes: number; contextBytes: number; digestBytes?: number };
 export type MemberContextUsage = {
   memberId: string;
@@ -304,13 +306,15 @@ export class Blackboard {
       if (!this.ready() || !isRunShape(run)) return { ...failed, result: "unready" };
       const time = this.now();
       if (this.recent(this.failedAt.get(run.id), time)) return { ...failed, result: "held" };
-      if (posts.length === 0 && reads.length === 0) return { ...failed, result: "stored" };
+      if (posts.length === 0 && reads.length === 0) return { ...failed, result: "stored", kept: new Set<number>() };
 
       const counts = { stored: 0, dropped: 0, invalid: 0 };
+      const kept = new Set<number>();
       const written = this.store.tryWrite(tx => {
         counts.stored = 0;
         counts.dropped = 0;
         counts.invalid = 0;
+        kept.clear();
         // A page of receipts only records reads, so it needs no count.
         let members = posts.length === 0 ? 0 : (tx.get<{ n: number }>(MEMBER_COUNT_SQL, run.id)?.n ?? 0);
         for (const record of posts) {
@@ -319,12 +323,14 @@ export class Blackboard {
             counts.invalid += 1;
           } else if (tx.get("SELECT 1 AS n FROM entries WHERE entry_id=?", record.envelope.requestId) !== undefined) {
             counts.stored += 1;
+            kept.add(record.seq);
           } else if (members >= MAX_MEMBER_ENTRIES) {
             counts.dropped += 1;
           } else {
             this.insertMember(tx, run, member, record, entry);
             members += 1;
             counts.stored += 1;
+            kept.add(record.seq);
           }
         }
         recordReads(tx, run.id, member.memberId, reads);
@@ -336,7 +342,7 @@ export class Blackboard {
       this.failedAt.delete(run.id);
       this.dropped += counts.dropped;
       this.invalid += counts.invalid;
-      return { result: "stored", ...counts };
+      return { result: "stored", ...counts, kept };
     } catch {
       return failed;
     }

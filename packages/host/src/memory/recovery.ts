@@ -1,7 +1,6 @@
 import { createHash, createPublicKey, KeyObject, randomBytes, verify } from "node:crypto";
 
 export const MEMORY_RECOVERY_GENESIS_HASH = "0".repeat(64);
-const MAX_RECOVERY_BATCH = 100;
 const MAX_RECONCILIATION_DELTAS = 10_000;
 
 export type MemoryRecoveryAction = "revoke" | "erase" | "binding-retire" | "grant-revoke" | "source-revoke";

@@ -433,12 +433,10 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | Hook
   if (route === "drain") { const started = drainOpen ? transcriptWatch.drainFinal() : undefined; return started ? { transcript: started } : undefined; }
   if (route === "transcript") return state.status === "running" || drainOpen ? onTranscript(body) : undefined;
   if (state.status !== "running") return;
-  const signals =
-    route === "claude"
-      ? mapClaudeHook(body)
-      : route === "codex"
-        ? mapCodexHook(body)
-        : mapCodexNotify(body);
+  const signals = route === "claude" ? mapClaudeHook(body) : route === "codex" ? mapCodexHook(body) : mapCodexNotify(body);
+  // With Codex hooks off, a notify only links the session record: its turn end reaches the transcript watch, and no
+  // attention signal is journaled, because no turn-start hook would follow to show later work (INF-213).
+  const linkOnly = route === "codex-notify" && !config.attention.hooks.codex;
   const agent = route === "claude" ? claudeAgent(body) : undefined;
   const b = body as Record<string, unknown>;
   const event =
@@ -475,15 +473,16 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | Hook
   const started = transcriptWatch.hook({
     subagent: b.agent_id !== undefined,
     turnEnd: closesTurn(signals, event),
+    endOnly: linkOnly,
     sessionEnd: event === "SessionEnd",
     ...(transcriptPath !== undefined ? { transcript: { path: transcriptPath, provider: route === "claude" ? "claude" : "codex" } } : {}),
   });
   let reply: HookReply | void = started ? { transcript: started } : undefined;
   if (!hooksReady) {
     hooksReady = true;
-    record({ kind: "hooks-ready", event: event.slice(0, 60) }, "hook");
+    if (!linkOnly) record({ kind: "hooks-ready", event: event.slice(0, 60) }, "hook");
   }
-  for (const signal of signals) {
+  for (const signal of linkOnly ? [] : signals) {
     if (signal.kind === "prompt-closed") {
       // A hook's close (PermissionDenied) names no prompt; it closes the open one, unless an
       // answer is pressing keys on it or its block is still on screen (the screen loop owns that).
@@ -1669,7 +1668,7 @@ server.listen(socketPath(runDir, session.id), async () => {
     }
     // With autonomy.boundary.egress, the session reaches the network through the egress proxy under its own credential.
     // Without the key it gets the proxy with no credential, so its requests are refused rather than sent direct.
-    const egress = workerEgressEnvironment(session.projectId, session.id);
+    const egress = workerEgressEnvironment(session.projectId, session.id, process.env, Date.now(), session.purpose);
     if (egress.status === "invalid") throw new Error("The egress proxy address this worker inherited is unusable, so the session was not started");
     clearEgressEnvironment(env); Object.assign(env, egress.env);
     if (egress.status === "no-key") journal.append("lifecycle", { egress: "no-credential" });
@@ -1697,7 +1696,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       if (session.workspace) {
         hybrid = await createHybridWorkspace({
           workspace: session.workspace, directory: join(dir, "workspace"), sharedPoolDirectory: join(stateDir, "workspace-pool"),
-          command: profile.command, commandArgs: profile.args,
+          command: profile.command, commandArgs: profile.args, egress: egress.env,
           ...(profile.workspaceDir ? { workspaceDirectory: join(profile.workspaceDir, session.id), sharedWorkspace: profile.sharedWorkspace } : {}),
           record: data => { append("lifecycle", { execution: data }); },
           publish: execution => {

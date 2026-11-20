@@ -14,8 +14,8 @@ import { fileURLToPath } from "node:url";
 // The host mints credentials in this format (packages/host/src/egress.ts); both sides must agree.
 const CREDENTIAL_CONTEXT = "infinite-egress/v1";
 const MAX_CREDENTIAL_LIFETIME_SECONDS = 31 * 24 * 60 * 60;
-const PROJECT_LABEL = /^(?:_host|_none|[a-z0-9-]{1,80})$/;
-const CREDENTIAL = /^(_host|_none|[a-z0-9-]{1,80})\.([A-Za-z0-9-]{1,64}):v1\.([1-9][0-9]{0,11})\.([A-Za-z0-9_-]{43})$/;
+const PROJECT_LABEL = /^(?:_host|_none|_eval-setup|_eval|[a-z0-9-]{1,80})$/;
+const CREDENTIAL = /^(_host|_none|_eval-setup|_eval|[a-z0-9-]{1,80})\.([A-Za-z0-9-]{1,64}):v1\.([1-9][0-9]{0,11})\.([A-Za-z0-9_-]{43})$/;
 const UNAUTHENTICATED = "_unauthenticated";
 const DECISIONS = ["allowed", "would-deny", "refused", "unauthenticated"];
 const MAX_CONFIG_BYTES = 64 * 1024;
@@ -363,7 +363,7 @@ function listedIn(rules, target) {
 
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const SUMMARY_HOST = /^(?:-|[a-z0-9._:\[\]-]{1,260})$/;
-const SUMMARY_PROJECT = /^(?:_unauthenticated|_host|_none|[a-z0-9-]{1,80})$/;
+const SUMMARY_PROJECT = /^(?:_unauthenticated|_host|_none|_eval-setup|_eval|[a-z0-9-]{1,80})$/;
 
 function addCount(counts, decision, amount = 1) {
   counts[decision] = (counts[decision] ?? 0) + amount;
@@ -900,7 +900,7 @@ export function createEgressProxy(options) {
     const current = policy;
     if (!current) return { refuse: true, decision: "refused", reason: "no-policy" };
     if (!current.ports.has(target.port)) return { refuse: true, decision: "refused", reason: "port" };
-    const listed = listedIn(current.allow, target) || listedIn(current.projects.get(identity.project), target);
+    const listed = (!identity.project.startsWith("_eval") && listedIn(current.allow, target)) || listedIn(current.projects.get(identity.project), target);
     if (!listed && current.mode === "enforce") return { refuse: true, decision: "refused", reason: "not-listed" };
     const decision = listed ? "allowed" : "would-deny";
     let addresses;

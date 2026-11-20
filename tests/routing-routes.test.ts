@@ -170,6 +170,21 @@ test("the status route reads the objective digest version only when owner criter
         assert.equal(astraRows(status), expected, JSON.stringify(team));
       } finally { await served.close(); }
     }
+
+    // With the register and entry tools on, an autonomous project reads the version of the autonomous register shape.
+    store.write(tx => {
+      for (const [id, shape, count] of [["register", "register", 1], ["register-autonomous", "register-autonomous", 3]] as const) {
+        tx.run("INSERT INTO configurations (config_id, provider, model, effort, prompt_version, guidance, knowledge, routing, shape, first_seen_at) VALUES (?, 'codex', ?, 'xhigh', ?, 'g', 'k', 'off', 's', ?)",
+          id, ASTRA.model, promptVersion("implementer", "codex", ASTRA, true, true, shape), NOW);
+        for (let index = 0; index < count; index++) writeOutcome(tx, countedRow(`${id}-${index}`, id));
+      }
+    });
+    const team = { objective: { prompts: "on", register: "on" } };
+    const registered = await serve(store, { projects: [{ id: "rehearsal", autonomy: "autonomous", team }], teams: { lineup: READY_LINEUP, blackboard: { tools: true } } } as unknown as Config);
+    try {
+      const status = await (await registered.get("/api/routing/projects/rehearsal")).json() as RoutingStatus;
+      assert.equal(astraRows(status), 3);
+    } finally { await registered.close(); }
   } finally {
     store.close();
     rmSync(root, { recursive: true, force: true });

@@ -5,6 +5,7 @@ import { PROVIDER_NAMES, groupSessions, type InboxGroup } from "@infinite/attent
 import {
   api,
   connectionKey,
+  listSessions,
   type Connection,
   type Me,
   type SessionRow,
@@ -62,11 +63,11 @@ export function Inbox({
     deps: [],
     load: async () => {
       const [list, me] = await Promise.all([
-        api<{ sessions: SessionRow[] }>(connection, "/sessions"),
+        listSessions(connection),
         api<Me>(connection, "/me"),
       ]);
       return {
-        sessions: [...list.sessions].sort((a, b) =>
+        sessions: [...list].sort((a, b) =>
           b.createdAt.localeCompare(a.createdAt),
         ),
         me,

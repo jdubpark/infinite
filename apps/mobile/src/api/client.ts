@@ -1,5 +1,5 @@
 import type { Attention, Provider } from "@infinite/attention";
-import { createRemoteClient, RemoteError, type RemoteAccessToken, type RemoteEvents, type RemoteRequestOptions } from "@infinite/remote";
+import { createRemoteClient, RemoteError, sessionListReader, type RemoteAccessToken, type RemoteEvents, type RemoteRequestOptions } from "@infinite/remote";
 import * as Crypto from "expo-crypto";
 import { loadClientId } from "../store/connection";
 import type { TeamLineup, TeamProject, TeamRole, TeamStatus } from "../features/teams/model";
@@ -10,10 +10,13 @@ export const connectionKey = (connection: Connection) => connection.id ?? `${con
 /** `calls` counts api() requests in flight on this channel. */
 type Remote = { secrets: string; client: ReturnType<typeof createRemoteClient>; calls: number };
 const remotes = new Map<string, Remote>();
+/** Per channel, the session rows read last and their version; see listSessions. */
+const sessionReaders = new Map<string, ReturnType<typeof sessionListReader<SessionRow>>>();
 const remoteKey = (connection: Connection) => `${connectionKey(connection)}/${connection.url}/${connection.relay?.machineId ?? "direct"}`;
 export function closeConnection(connection: Connection) {
   remotes.get(remoteKey(connection))?.client.close();
   remotes.delete(remoteKey(connection));
+  sessionReaders.delete(remoteKey(connection));
 }
 function remote(connection: Connection) {
   const key = remoteKey(connection);
@@ -138,6 +141,14 @@ export async function api<T>(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** The machine's session list. Each read names the version of the rows this connection read last, so an unchanged list answers with its version alone. */
+export function listSessions(connection: Connection): Promise<SessionRow[]> {
+  const key = remoteKey(connection);
+  let read = sessionReaders.get(key);
+  if (!read) sessionReaders.set(key, read = sessionListReader<SessionRow>());
+  return read(path => api(connection, path));
 }
 
 export function openEvents(connection: Connection, options: {

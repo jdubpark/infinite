@@ -293,6 +293,41 @@ test("missing repair facts leave rounds unknown", () => {
   }
 });
 
+test("an empty repair answer resolves its round", () => {
+  const h = harness();
+  try {
+    h.flush([...repairScenario("run-empty", { answer: "no-commit" }), settled("run-empty", 11, "ready-for-review")]);
+    // The round is resolved with its links clear, so it is unattributed, not unknown.
+    assert.deepEqual(summaryOf(h.store, "run-empty")?.payload.rounds, { total: 1, attributed: 0, unattributed: 1, unknown: 0 });
+  } finally {
+    h.close();
+  }
+});
+
+test("an answer for another base clears that row's pending links", () => {
+  const h = harness();
+  try {
+    const otherBase = "f".repeat(40);
+    h.flush([
+      created("run-base"), prepared("run-base"), planned("run-base", "a", ["a.txt"]), planned("run-base", "b", ["b.txt"]),
+      started("run-base", "m-a", 2, { taskId: "a" }), integrated("run-base", "m-a", "a", 3),
+      started("run-base", "m-b", 4, { taskId: "b" }), integrated("run-base", "m-b", "b", 5),
+      review("run-base", 6, "changes-requested", { profileId: "rev", model: "r-1" }),
+      repairStarted("run-base", 7, 1),
+      // The round links both rows while they share the current base; the answer names another base.
+      ev("repair.integrated", "run-base", at(8), {
+        memberId: "integrator-1", parts: [1], data: { round: 1, commit: COMMIT_2, headCommit: HEAD, baseCommit: otherBase },
+      }),
+      review("run-base", 10, "approved", { profileId: "rev", model: "r-1" }),
+    ]);
+    // Clear links are not pending, so neither row waits for a path event.
+    assert.equal(rowOf(h.store, "run-base", "m-b")?.firstPass, 1);
+    assert.equal(rowOf(h.store, "run-base", "m-a")?.firstPass, 1);
+  } finally {
+    h.close();
+  }
+});
+
 test("a changes-requested review freezes as not accepted", () => {
   const h = harness();
   try {

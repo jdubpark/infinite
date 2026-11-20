@@ -55,9 +55,8 @@ import { runEventKey } from "../packages/host/src/run-events.js";
  * (4890-4893, 4938-4941); and a limit with no fallback profile, which blocks with provider-limit (4945-4947).
  */
 
-// Off: production can emit an empty repair answer after a cancel settle, which leaves the summary's rounds stale
-// (INF-316). Once INF-316 is fixed, switch this on and remove the `todo` from the directed case in the test file.
-export const EMPTY_REPAIR_AFTER_SETTLE = false;
+// On: production can emit an empty repair answer after a cancel settle; the summary's rounds must follow it (INF-316).
+export const EMPTY_REPAIR_AFTER_SETTLE = true;
 
 export type Counts = Record<string, number>;
 export type Rand = { next(): number; chance(p: number): boolean; int(lo: number, hi: number): number; pick<T>(items: readonly T[]): T };

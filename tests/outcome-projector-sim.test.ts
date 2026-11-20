@@ -470,10 +470,7 @@ test("the outcome projector keeps its invariants under seeded faults", t => {
   }
 });
 
-test("a repair answer with no commit after a cancel settle recounts the summary's rounds", {
-  todo: "INF-316: repairIntegrated (outcome-projector.ts:374-395) does not recount a settled summary's rounds; once fixed, "
-    + "drop this todo and switch on EMPTY_REPAIR_AFTER_SETTLE in tests/outcome-sim-script.ts",
-}, () => {
+test("a repair answer with no commit after a cancel settle recounts the summary's rounds", () => {
   // The smallest list without a gap, reduced from simulator seed 18 with EMPTY_REPAIR_AFTER_SETTLE on. Production emits
   // this order when the integrator's operation finished before an owner cancel: the cancel saves run.settled, then the
   // queued completion emits repair.integrated, with no commit when nothing changed (teams.ts:2279-2292, 2695-2704, 5575).

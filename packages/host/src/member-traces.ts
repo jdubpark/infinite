@@ -28,7 +28,11 @@ export const memberTraceSettingsSchema = z.discriminatedUnion("enabled", [
 ]);
 export type MemberTraceSettings = z.infer<typeof memberTraceSettingsSchema>;
 
-/** The host's own file in a member's trace directory. It holds no trace content. Every other entry counts as trace. */
+/**
+ * The host's own file in a member's trace directory. It holds no trace content. Every other entry is trace: an entry
+ * that is not a directory counts its lstat size, links included; directories are walked, not counted; and a leftover
+ * temporary manifest file is removed without being counted.
+ */
 const MANIFEST = "infinite-trace.json";
 /** A manifest write in progress, under a random name. One left by an interrupted write is removed when found. */
 const TEMPORARY = /^\.infinite-trace\.json\.[0-9a-f-]{36}\.tmp$/;

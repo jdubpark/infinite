@@ -522,8 +522,8 @@ default. Turning it on needs both caps, in bytes; the configuration refuses
   measured again; they are removed with the run. A measurement or removal that
   fails, including a manifest of the member or of a sibling that cannot be
   read, is tried again on a later pass, after a wait that doubles from 30
-  seconds up to 30 minutes. No cap is decided while a sibling's usage is
-  unknown. The host log names the run and member, not the path.
+  seconds up to 30 minutes. No run-cap decision is made while a sibling's
+  usage is unknown. The host log names the run and member, not the path.
 - **Cooperative caps.** In the one-account case a member can edit its own
   manifest: its caps, bytes and state. That can change its own settlement and a
   sibling's run-cap decision. It gives the member no access beyond what it
@@ -542,18 +542,26 @@ default. Turning it on needs both caps, in bytes; the configuration refuses
   sessions exit, and are removed with their runs.
 - **Deletion.** Removing a run (the owner's delete, cancelled-run retention, or
   forgetting a replay) removes `teams/traces/RUN_ID`. Workspace retention leaves
-  traces alone: they last as long as the run record. A record removal that
-  fails is tried again after the retention backoff, not on every scheduler
-  pass.
+  traces alone: they last as long as the run record. When cancelled-run
+  retention fails to remove the traces, it waits out its retention backoff
+  before trying the record again; every other record removal failure, the
+  evidence wait included, is retried on the next pass as before. Deletion sets
+  no overall deadline on its filesystem work, so a stalled filesystem holds the
+  owner's delete until it answers.
+- **Hosts that never kept traces.** The team service looks for `teams/traces`
+  once when it starts. While the setting is not on and no root was found or
+  created, the scheduler and run deletion do no trace work and make no
+  filesystem call under it.
 - **Links.** Before it reads or changes a trace directory, the host checks each
   level from `teams/traces` down with `lstat` and requires the directory to
   resolve to its place under the traces root. A run's or member's trace
   directory that is a link, or not a directory, is unlinked as itself and
   logged by id; its target is preserved, and the run's removal goes on. A link
   inside a trace counts as one entry and is unlinked as itself; a linked
-  directory's contents are not walked or removed. A traces root that is a link
-  is left alone: no trace is prepared under it, and run removal logs that it did
-  not look there. The checks leave one residual. Node has no `openat`, so the
+  directory's contents are not walked or removed. A `teams/traces` root that is
+  a link is left untouched: no trace is prepared under it, and run deletion logs
+  that it did not look there, so traces relocated behind such a link are never
+  erased by run deletion. The checks leave one residual. Node has no `openat`, so the
   host names each path again for every later operation. Another process
   running as the host's own account could swap a checked directory for a link
   before such an operation resolves it as an ancestor. That applies to reads,

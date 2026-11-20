@@ -280,6 +280,8 @@ export class TeamRetention {
     }
     try { if (!stored.run.replay) this.host.persistRetiredRunId(stored.run.id); }
     catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's deletion tombstone could not be saved; its record was kept."); }
+    // A settlement pass still running over the run's traces ends first, and nothing of the run is kept after it.
+    await this.traces.forget(stored.run);
     try { await removeMemberTraces(this.host.config.stateDir, stored.run.id); }
     catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's member traces could not be removed; its record was kept."); }
     try { await rmAsync(join(this.host.directory, `${stored.run.id}.sealed`), { force: true }); }

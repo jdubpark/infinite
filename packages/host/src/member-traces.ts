@@ -224,42 +224,65 @@ type Outcome = "settled" | "running";
 
 /**
  * The caps, enforced after the fact because Codex writes the files itself. The scheduler tick calls `settle` for each
- * run, whatever the setting is now: a trace keeps the caps its manifest recorded when its member started. Members are
- * looked at one run at a time, outside the team mutation queue, once each has started. A trace whose session still
- * runs is looked at again a few seconds later. Once that session exited, a trace over the member cap, or one that would
- * take the run's kept traces over the run cap, is marked `removing`, removed, and only then marked `removed`. A member
- * session counts as settled only after that work succeeded; a failure is retried on a later tick, after a wait that
- * doubles up to a bound.
+ * run, whatever the setting is now: a trace keeps the caps its manifest recorded when its member started. A run is
+ * looked at, outside the team mutation queue and one pass at a time, when a member session starts and when a member's
+ * wait is over. A trace whose session still runs is looked at again a few seconds later. Once that session exited, a
+ * trace over the member cap, or one that would take the run's kept traces over the run cap, is marked `removing`,
+ * removed, and only then marked `removed`. A failure is retried on a later tick, after a wait that doubles up to a
+ * bound. Writes Codex makes after its trace was settled are not measured again; they go with the run.
+ *
+ * Bookkeeping: the started sessions last looked at are kept per run object, so they go when the run's record goes;
+ * waits and passes are kept by run id, only while a member waits or a pass runs, and `forget` drops them when the run
+ * is deleted. A pass that ends after its run was forgotten records nothing.
  */
 export class MemberTraces {
-  private readonly settled = new Set<string>();
-  private readonly retryAt = new Map<string, { at: number; failures: number }>();
-  private readonly running = new Set<string>();
+  private readonly looked = new WeakMap<TeamRun, string>();
+  private readonly waits = new Map<string, Map<string, { at: number; failures: number }>>();
+  private readonly passes = new Map<string, Promise<void>>();
   settle(run: TeamRun, host: TraceSettlementHost): Promise<void> | undefined {
-    if (this.running.has(run.id)) return undefined;
-    const now = host.now();
+    if (this.passes.has(run.id)) return undefined;
     // A member has its start time only after its launch returned, so by then its directory was prepared if ever.
-    const due = run.members.filter(member => member.startedAt)
-      .map(member => ({ memberId: member.memberId, key: `${run.id}/${member.memberId}/${member.sessionId}` }))
-      .filter(({ key }) => !this.settled.has(key) && (this.retryAt.get(key)?.at ?? 0) <= now);
-    if (!due.length) return undefined;
-    this.running.add(run.id);
-    return (async () => {
+    const started = run.members.filter(member => member.startedAt);
+    const sessions = started.map(member => `${member.memberId}/${member.sessionId}`).join(" ");
+    const changed = this.looked.get(run) !== sessions, now = host.now(), waits = this.waits.get(run.id);
+    const due = [...new Set(started.map(member => member.memberId))]
+      .filter(memberId => { const wait = waits?.get(memberId); return wait ? wait.at <= now : changed; });
+    if (!due.length) { this.looked.set(run, sessions); return undefined; }
+    const outcomes = new Map<string, { at: number; failures: number } | undefined>();
+    // Assigned before the body's first await; the body compares it to tell whether the run was forgotten meanwhile.
+    let pass: Promise<void> | undefined = undefined;
+    pass = (async () => {
       let present: boolean | Error;
       try { present = SAFE_ID.test(run.id) && await traceDirectory(host.stateDir, [run.id]); } catch (error) { present = error as Error; }
-      for (const { memberId, key } of due) {
+      for (const memberId of due) {
         try {
           if (present instanceof Error) throw present;
           const outcome: Outcome = present && SAFE_ID.test(memberId) ? await this.settleMember(host, run.id, memberId) : "settled";
-          if (outcome === "settled") { this.settled.add(key); this.retryAt.delete(key); }
-          else this.retryAt.set(key, { at: host.now() + EXIT_RECHECK_MS, failures: 0 });
+          outcomes.set(memberId, outcome === "settled" ? undefined : { at: host.now() + EXIT_RECHECK_MS, failures: 0 });
         } catch (error) {
-          const failures = (this.retryAt.get(key)?.failures ?? 0) + 1;
-          this.retryAt.set(key, { at: host.now() + Math.min(FAILURE_RETRY_MAX_MS, FAILURE_RETRY_MS * 2 ** (failures - 1)), failures });
+          const failures = (waits?.get(memberId)?.failures ?? 0) + 1;
+          outcomes.set(memberId, { at: host.now() + Math.min(FAILURE_RETRY_MAX_MS, FAILURE_RETRY_MS * 2 ** (failures - 1)), failures });
           console.warn(`The trace of member ${memberId} in team ${run.id} could not be settled (${errorCode(error)}); the host tries again later.`);
         }
       }
-    })().finally(() => this.running.delete(run.id));
+      // A run forgotten while this pass ran keeps nothing of it.
+      if (this.passes.get(run.id) !== pass) return;
+      this.looked.set(run, sessions);
+      const startedIds = new Set(started.map(member => member.memberId));
+      const next = new Map([...(this.waits.get(run.id) ?? [])].filter(([memberId]) => startedIds.has(memberId)));
+      for (const [memberId, wait] of outcomes) if (wait) next.set(memberId, wait); else next.delete(memberId);
+      if (next.size) this.waits.set(run.id, next); else this.waits.delete(run.id);
+    })().finally(() => { if (this.passes.get(run.id) === pass) this.passes.delete(run.id); });
+    this.passes.set(run.id, pass);
+    return pass;
+  }
+  /** Drops what is kept for a run whose record is being deleted. Resolves once a pass still running over it has ended. */
+  async forget(run: TeamRun) {
+    const pass = this.passes.get(run.id);
+    this.passes.delete(run.id);
+    this.waits.delete(run.id);
+    this.looked.delete(run);
+    await pass?.catch(() => {});
   }
   private async settleMember(host: TraceSettlementHost, runId: string, memberId: string): Promise<Outcome> {
     if (!await traceDirectory(host.stateDir, [runId, memberId])) return "settled";

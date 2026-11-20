@@ -463,3 +463,52 @@ test("a session that still answers as live is not taken for exited when its meta
     assert.equal(manifest(t.directory()).state, "kept");
   } finally { t.close(); }
 });
+
+/** Entries the trace bookkeeping holds that name the run, across whatever maps and sets it keeps. */
+function traceEntries(teams: TeamService, runId: string) {
+  const traces = (teams as unknown as { retention: { traces: Record<string, unknown> } }).retention.traces;
+  let count = 0;
+  for (const value of Object.values(traces)) {
+    const keys = value instanceof Map ? [...value.keys()] : value instanceof Set ? [...value] : [];
+    count += keys.filter(key => String(key).includes(runId)).length;
+  }
+  return count;
+}
+
+test("trace bookkeeping holds nothing for members without a trace directory, and drops a run's entries when it is deleted", async () => {
+  // A started member without a trace directory.
+  const plain = schedulerFixture();
+  plain.writeTeam();
+  const plainTeams = plain.openTeam();
+  try {
+    await sweep(plainTeams, plain.run.id);
+    assert.equal(traceEntries(plainTeams, plain.run.id), 0);
+  } finally { plainTeams.close(); plain.close(); }
+
+  // A run deleted while a pass over its trace is still asking the session; the pass ends after the deletion.
+  const f = await tracedRun([{ exited: true, bytes: 64 }], { memberBytes: 1000, runBytes: 5000 });
+  f.run.members[0]!.status = "stopped";
+  f.writeTeam();
+  const teams = f.openTeam();
+  try {
+    const manager = f.manager, state = manager.state, session = f.run.members[0]!.sessionId;
+    let release!: () => void, asked!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; }), asking = new Promise<void>(resolve => { asked = resolve; });
+    let armed = true;
+    manager.state = async (id?: string) => {
+      if (id !== session || !armed) return state(id);
+      armed = false;
+      asked();
+      await gate;
+      return { ...await state(id), status: "running" as const };
+    };
+    const sweeping = sweep(teams, f.run.id);
+    await asking;
+    const removing = teams.removeRun(f.run.id);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    release();
+    await Promise.all([sweeping, removing]);
+    assert.equal(existsSync(traces(f.config.stateDir, f.run.id)), false);
+    assert.equal(traceEntries(teams, f.run.id), 0, "nothing of the deleted run is kept");
+  } finally { teams.close(); f.close(); }
+});

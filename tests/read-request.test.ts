@@ -84,13 +84,21 @@ test("unknown-profile fires for a profile outside the pool and for a missing pro
   assert.equal(covered.ok, true);
 });
 
-test("forward-reference fires for a missing target, a same-phase target and a target that is not a list", () => {
+test("forward-reference fires for a missing target, a same-phase target, a target that is not a list and a forEach target", () => {
   const missing = validateReadRequest(request([[step({ id: "fan", forEach: { step: "ghost", maxItems: 2 } })]]), grant());
   assert.deepEqual(codes(missing), ["forward-reference"]);
   const samePhase = validateReadRequest(request([[listStep("items"), step({ id: "fan", forEach: { step: "items", maxItems: 2 } })]]), grant());
   assert.deepEqual(codes(samePhase), ["forward-reference"]);
   const notList = validateReadRequest(request([[step({ id: "items" })], [step({ id: "fan", forEach: { step: "items", maxItems: 2 } })]]), grant());
   assert.deepEqual(codes(notList), ["forward-reference"]);
+  const overForEach = validateReadRequest(request([[listStep("items")], [step({ id: "fan", output: "list", forEach: { step: "items", maxItems: 2 } })],
+    [step({ id: "deep", forEach: { step: "fan", maxItems: 2 } })]]), grant());
+  assert.deepEqual(codes(overForEach), ["forward-reference"]);
+  if (!overForEach.ok) {
+    assert.equal(overForEach.errors[0].path, "phases[2].steps[0].forEach.step");
+    assert.match(overForEach.errors[0].message, /itself a forEach step, not one list/);
+    assert.equal(overForEach.errors[0].fix, "Name a list step that has no forEach.");
+  }
   const valid = validateReadRequest(request([[listStep("items")], [step({ id: "fan", forEach: { step: "items", maxItems: 2 } })]]), grant());
   assert.equal(valid.ok, true);
 });

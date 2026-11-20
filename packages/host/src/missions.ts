@@ -11,7 +11,8 @@ import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, type BlockerEvidence, 
 import type { ProductGoal } from "./goal-types.js";
 import type { ProjectGroup } from "./project-group-types.js";
 import { createMissionSchema, missionActionSchema, missionExtendSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionFollowUp, type MissionInputSource, type MissionOrigin, type MissionReport, type MissionSubtaskPlan } from "./mission-types.js";
-import { isDirectionMessage, missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, subteamReport, type MissionCoordinatorNote, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
+import { askedRecommendation, isDirectionMessage, missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, subteamReport, type MissionCoordinatorNote, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
+import { questionProblem, recommendationOutcome } from "./question-recommendation.js";
 import { addRollups, emptyRollup, teamUsage } from "./team-usage.js";
 import type { UsageService } from "./usage-service.js";
 import { ledgerRecord } from "./usage-store.js";
@@ -158,6 +159,8 @@ function trimFollowUps(mission: Mission) {
 const messageCannotFitReason = "The next coordinator message cannot fit with the mission state, even shortened. No empty coordinator attempt was started; start a new mission with a consolidated objective.";
 const subtaskStatus = (status: TeamView["status"]) => teamDone.has(status) ? "done" as const : status === "blocked" ? "blocked" as const : status === "cancelled" ? "cancelled" as const : "running" as const;
 const notFound = (error: unknown) => error instanceof TeamError && error.code === "team-not-found";
+/** The decision's recommendation with how this answer compared; nothing for a decision asked without one. */
+const comparedRecommendation = (decision: Mission["decisions"][number], answer: string) => decision.recommendation ? { recommendation: { ...decision.recommendation, outcome: recommendationOutcome(decision.options, decision.recommendation, answer) } } : {};
 
 /**
  * A mission splits one owner task across a project's repositories. Its coordinator only plans and
@@ -616,7 +619,7 @@ export class MissionService {
       this.admit(stored, `answer:${decisionId}`, body);
       // An answer is input, not a change to the halt's pause, so the release still resumes the mission.
       if (halted) stored.ownerHalt!.revision = mission.revision;
-      Object.assign(decision, { answer: body.text, answeredAt: now(), answeredBy: typeof source === "object" ? "connector" : "owner", ...(typeof source === "object" ? { source } : {}) });
+      Object.assign(decision, { answer: body.text, answeredAt: now(), answeredBy: typeof source === "object" ? "connector" : "owner", ...(typeof source === "object" ? { source } : {}), ...comparedRecommendation(decision, body.text) });
       stored.ownerInputs = (stored.ownerInputs ?? 0) + 1;
       const subtask = decision.subtaskId ? mission.subtasks.find(item => item.id === decision.subtaskId) : undefined;
       const message = { ...(typeof source === "object" ? { type: "connector-answer" as const, source } : { type: "owner-answer" as const }), decisionId, question: decision.question, answer: body.text };
@@ -997,7 +1000,7 @@ export class MissionService {
       if (!live.has(mission.status)) continue;
       for (const decision of team.decisions.filter(item => item.revision === team.revision && !item.answer))
         this.message(stored, `${team.id}:${decision.id}`, { type: "child-decision", subtaskId: subtask.id, teamId: team.id, decisionId: decision.id, question: decision.question, options: decision.options,
-          ...(decision.answerMode ? { answerMode: decision.answerMode } : {}) });
+          ...(decision.answerMode ? { answerMode: decision.answerMode } : {}), ...askedRecommendation(decision) });
       // A permission diagnostic can finish without changing the team's phase. Wake its
       // supervising coordinator once, with observations rather than approval authority.
       for (const outcome of team.permissionRecovery?.outcomes ?? []) {
@@ -1373,7 +1376,7 @@ export class MissionService {
         const escalated = mission.decisions.find(item => item.childDecisionId === decision.id && !item.answer);
         const answering = stored.ops.find(op => op.kind === "answer" && op.decisionId === decision.id);
         open.push({ subtaskId: subtask.id, teamId: team.id, decisionId: decision.id, question: decision.question, options: decision.options,
-          ...(decision.answerMode ? { answerMode: decision.answerMode } : {}),
+          ...(decision.answerMode ? { answerMode: decision.answerMode } : {}), ...askedRecommendation(decision),
           ...(escalated ? { ownerDecisionId: escalated.id } : {}), ...(answering ? { answerPendingBy: answering.by ?? "owner" } : {}) });
       }
     }
@@ -1516,7 +1519,7 @@ export class MissionService {
         if (!openChildDecision(report.decisionId)) return this.refuse(stored, report.kind, "That subteam decision is not open.");
         this.queueOp(stored, { kind: "answer", subtaskId: subtask!.id, teamId: subtask!.teamId!, decisionId: report.decisionId, text: report.text, by: this.connectorSource(mission) ? "connector" : "coordinator", ...(this.connectorSource(mission) ? { source: this.connectorSource(mission) } : {}) });
         for (const decision of mission.decisions.filter(item => item.childDecisionId === report.decisionId && !item.answer))
-          Object.assign(decision, { answer: report.text, answeredAt: now(), answeredBy: this.connectorSource(mission) ? "connector" : "coordinator", ...(this.connectorSource(mission) ? { source: this.connectorSource(mission) } : {}) });
+          Object.assign(decision, { answer: report.text, answeredAt: now(), answeredBy: this.connectorSource(mission) ? "connector" : "coordinator", ...(this.connectorSource(mission) ? { source: this.connectorSource(mission) } : {}), ...comparedRecommendation(decision, report.text) });
         this.event(stored, `The coordinator${this.connectorSource(mission) ? ` carrying ${inputSourceLabel(this.connectorSource(mission))} input` : ""} answered decision ${report.decisionId} of subtask ${subtask!.id}.`);
         break;
       }
@@ -1527,13 +1530,10 @@ export class MissionService {
         if (report.childDecisionId && mission.decisions.some(item => item.childDecisionId === report.childDecisionId && !item.answer))
           return this.refuse(stored, report.kind, "That subteam decision is already waiting for the owner.", false);
         if (mission.decisions.length >= 40) return this.refuse(stored, report.kind, "The mission reached its limit of 40 owner decisions.");
-        const answerMode = report.answerMode ?? forwardedDecision?.answerMode;
-        if (answerMode === "approval" && report.options.length !== 2)
-          return this.refuse(stored, report.kind, "Approval questions require exactly two options: approve first and deny second.");
-        if (answerMode === "multiple" && report.options.length < 2)
-          return this.refuse(stored, report.kind, "Multiple-selection questions require at least two options.");
+        const answerMode = report.answerMode ?? forwardedDecision?.answerMode, problem = questionProblem(report, answerMode);
+        if (problem) return this.refuse(stored, report.kind, problem.message);
         mission.decisions.push({ id: randomUUID(), question: report.question, options: report.options, createdAt: now(),
-          ...(answerMode ? { answerMode } : {}),
+          ...(answerMode ? { answerMode } : {}), ...(report.recommendation ? { recommendation: { ...report.recommendation } } : {}),
           ...(subtask ? { subtaskId: subtask.id } : {}), ...(report.childDecisionId ? { childDecisionId: report.childDecisionId } : {}) });
         this.event(stored, "The coordinator asked the owner a question.");
         break;

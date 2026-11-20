@@ -1,9 +1,23 @@
-# Output rules for the grader account. Replace GRADER_UID with the output of `id -u infinite-grader`, then load
-# with `nft -f` as root. Loopback and every other destination stay open; the listed private ranges are refused.
+#!/usr/sbin/nft -f
+# Infinite grader account output rule. See deploy/ubuntu/grader.md, step 4.
+#
+# Refuses the grader's output to link-local, private, carrier-grade NAT, and multicast ranges, over IPv4 and IPv6.
+# Loopback and public addresses stay open. infinite-grader-firewall.service loads it at boot and again after
+# nftables.service flushes the ruleset.
+#
+# nft resolves the account name when the file loads. A file that fails to load changes nothing: the table stays as it
+# was, or absent at boot. A second instance names its own account (infinite-NAME-grader) in its own copy.
+
+define grader_user = "infinite-grader"
+
+# Replace this table, and only this table, in one transaction.
+table inet infinite_grader
+delete table inet infinite_grader
+
 table inet infinite_grader {
-  chain output {
-    type filter hook output priority 0; policy accept;
-    meta skuid GRADER_UID ip daddr { 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 224.0.0.0/4 } reject
-    meta skuid GRADER_UID ip6 daddr { fe80::/10, fc00::/7, ff00::/8 } reject
-  }
+	chain output {
+		type filter hook output priority filter; policy accept;
+		meta skuid $grader_user ip daddr { 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 224.0.0.0/4 } reject
+		meta skuid $grader_user ip6 daddr { fe80::/10, fc00::/7, ff00::/8 } reject
+	}
 }

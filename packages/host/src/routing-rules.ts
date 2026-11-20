@@ -1,5 +1,5 @@
 import { TeamError } from "./team-workspace.js";
-import { autoPinned, autoRouted, fixedRuleFailure, memberLimit, scoutPool, type TeamMember, type TeamModelProfile, type TeamRun, type TeamTask } from "./team-types.js";
+import { autoPinned, autoRouted, coversPoint, escalationCandidates, fixedRuleFailure, memberLimit, scoutCandidates, scoutPool, type TeamMember, type TeamModelProfile, type TeamRun, type TeamScout, type TeamTask } from "./team-types.js";
 
 /** Refusal texts. `singleProvider` and `pool` are main's, verbatim; the others are new in `auto`. */
 export const PROFILE_MESSAGES = {
@@ -27,6 +27,8 @@ export function assertTaskProfiles(run: TeamRun, tasks: readonly { agentProfileI
       if (id !== undefined && !run.lineup.implementers.some(profile => profile.id === id)) throw new TeamError(409, "invalid-agent-profile", PROFILE_MESSAGES.autoPool);
       continue;
     }
+    // A covered run's scout may omit the profile: the host chooses it. A named one must still pass rule 1.
+    if (id === undefined && coversPoint(run, "scout")) continue;
     if (!id || !scoutPool(run).some(profile => profile.id === id)) throw new TeamError(409, "invalid-agent-profile", PROFILE_MESSAGES.scoutPool);
   }
 }
@@ -34,12 +36,12 @@ export function assertTaskProfiles(run: TeamRun, tasks: readonly { agentProfileI
 /**
  * The limit fallback predicate of an implementer or a scout in an auto-pinned run; undefined for every other role and run.
  * A member's fallback follows the rule of the pool it starts from: an implementer, escalated or not, passes rules 1 and 2;
- * a scout passes rule 1, as `scoutPool` does.
+ * a scout of a run that covers `scout` passes rules 1 and 2; any other scout passes rule 1, as `scoutPool` does.
  */
 export function fallbackRule(run: TeamRun, role: TeamMember["role"]): ((profile: TeamModelProfile) => boolean) | undefined {
   const { routing, lineup } = run;
   if (routing?.mode !== "auto" || !lineup || (role !== "implementer" && role !== "scout")) return undefined;
-  if (role === "scout") return profile => fixedRuleFailure(lineup, routing.knobs, profile) !== "contributor";
+  if (role === "scout" && !coversPoint(run, "scout")) return profile => fixedRuleFailure(lineup, routing.knobs, profile) !== "contributor";
   return profile => fixedRuleFailure(lineup, routing.knobs, profile) === undefined;
 }
 
@@ -62,4 +64,20 @@ export function spareAttempts(run: TeamRun): number {
 /** C7 component 5: run.routing.digest while autoRouted(run), else "off". */
 export function routingComponent(run: Pick<TeamRun, "routing" | "routingRevokedAt">): string {
   return autoRouted(run) && run.routing ? run.routing.digest : "off";
+}
+
+/** The worker's named escalation profile when it passes rules 1 and 2, else the first that does; never `ownProfileId`. */
+export function escalationFallback(run: TeamRun, ownProfileId: string | undefined, namedProfileId: string | undefined): TeamModelProfile | undefined {
+  const { lineup, routing } = run;
+  if (!lineup || !routing) return undefined;
+  const candidates = escalationCandidates(lineup, routing.knobs, ownProfileId);
+  return candidates.find(profile => profile.id === namedProfileId) ?? candidates[0];
+}
+
+/** The coordinator's named profile when it is a scout candidate, else the first scout candidate. Undefined when none exists. */
+export function scoutFallback(run: TeamRun, scout: Pick<TeamScout, "agentProfileId">): TeamModelProfile | undefined {
+  const { lineup, routing } = run;
+  if (!lineup || !routing) return undefined;
+  const candidates = scoutCandidates(lineup, routing.knobs);
+  return candidates.find(profile => profile.id === scout.agentProfileId) ?? candidates[0];
 }

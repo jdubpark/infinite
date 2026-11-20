@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { ENTRY_PARAGRAPH_LIMIT_BYTES, entryCommand, entryInstructions, ownerDirectionLines, refreshReportingInstructions, reportCommand, retargetPrompt, teamContext, teamPrompt } from "../packages/host/src/team-prompts.js";
 import { hostEntry } from "../packages/host/src/evidence/host-entries.js";
 import { buildCapsule } from "../packages/host/src/eval-rules.js";
-import { teamReportSchema, type TeamBrief, type TeamMember, type TeamModelProfile, type TeamRun, type TeamTask } from "../packages/host/src/team-types.js";
+import { recordedTeamReportSchema, teamReportSchema, type TeamBrief, type TeamMember, type TeamModelProfile, type TeamRun, type TeamScout, type TeamTask } from "../packages/host/src/team-types.js";
 import type { TeamRunRouting, TeamRunRoutingAuto } from "../packages/host/src/routing-types.js";
 
 const PROMPT_LIMIT_BYTES = 80 * 1024;
@@ -271,15 +271,16 @@ test("blocked reports accept bounded structured evidence and keep it in coordina
 });
 
 test("team question modes preserve legacy behavior and validate selectable semantics", () => {
+  // A recorded question from a member started before recommendations were required; the mode rules are the tool's too.
   const legacy = { kind: "question", question: "Which response format?", options: ["JSON", "Text"] };
-  assert.deepEqual(teamReportSchema.parse(legacy), legacy, "Two legacy options do not infer approval mode");
-  assert.deepEqual(teamReportSchema.parse({ ...legacy, options: [] }), { ...legacy, options: [] });
-  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "approval" }).success, true);
-  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "approval", options: ["Approve"] }).success, false);
-  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "multiple" }).success, true);
-  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "multiple", options: ["Only one"] }).success, false);
-  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "single", options: ["One"] }).success, true);
-  assert.equal(teamReportSchema.safeParse({ ...legacy, answerMode: "approval", options: ["Approve", "Deny", "Defer"] }).success, false);
+  assert.deepEqual(recordedTeamReportSchema.parse(legacy), legacy, "Two legacy options do not infer approval mode");
+  assert.deepEqual(recordedTeamReportSchema.parse({ ...legacy, options: [] }), { ...legacy, options: [] });
+  assert.equal(recordedTeamReportSchema.safeParse({ ...legacy, answerMode: "approval" }).success, true);
+  assert.equal(recordedTeamReportSchema.safeParse({ ...legacy, answerMode: "approval", options: ["Approve"] }).success, false);
+  assert.equal(recordedTeamReportSchema.safeParse({ ...legacy, answerMode: "multiple" }).success, true);
+  assert.equal(recordedTeamReportSchema.safeParse({ ...legacy, answerMode: "multiple", options: ["Only one"] }).success, false);
+  assert.equal(recordedTeamReportSchema.safeParse({ ...legacy, answerMode: "single", options: ["One"] }).success, true);
+  assert.equal(recordedTeamReportSchema.safeParse({ ...legacy, answerMode: "approval", options: ["Approve", "Deny", "Defer"] }).success, false);
 });
 
 test("team agent guidance distinguishes approval from choices and leaves authority with the owner", () => {
@@ -288,7 +289,8 @@ test("team agent guidance distinguishes approval from choices and leaves authori
   assert.match(prompt, /answerMode "approval" only for a real authorization proposal/);
   assert.match(prompt, /first meaning approve and the second meaning deny/);
   assert.match(prompt, /two arbitrary options never imply approval/);
-  assert.match(prompt, /Never choose or approve for the owner/);
+  assert.match(prompt, /"recommendation":\{"answers":\["\.\.\."\],"reason":"\.\.\."\}/);
+  assert.match(prompt, /Every question carries your recommendation: copy option text exactly .* A recommendation never decides anything\. Never choose or approve for the owner\./);
 });
 
 test("permission evidence stays complete inline and an over-budget review fails closed", () => {
@@ -436,7 +438,7 @@ function pinnedContexts() {
   const run = goalRun();
   return PIN_ROLES.map(role => JSON.stringify(teamContext(run, "Owner feedback excerpt.", { checks: PIN_CHECKS }, role), null, 2));
 }
-const PIN_PROMPTS_SHA256 = "d47d7a1e8fd478fb571e12c76b96714afecfec680d12b3cee5bc87d598859308";
+const PIN_PROMPTS_SHA256 = "d3c6439e21fad6364731c0bb4e0792ba9c2ca9cb2940d59568be9c994d8877fb";
 const PIN_CONTEXTS_SHA256 = "9ee8fe8ac898e2d70ddbb012ba398387d526294ea61739fb7aad4385b7a7412b";
 
 test("the switch off keeps every prompt and context byte", () => {
@@ -546,6 +548,74 @@ test("a member context never carries a task's routing, in any role or snapshot",
   const inline = teamPrompt(tagged, "implementer", tagged.tasks[0], undefined, "codex", AUTO_ASTRA, { checks: PIN_CHECKS }, [], true);
   assert.doesNotMatch(inline, /"routing":/, "the inline implementer task");
   assert.equal(inline, teamPrompt(plain, "implementer", plain.tasks[0], undefined, "codex", AUTO_ASTRA, { checks: PIN_CHECKS }, [], true));
+});
+
+// INF-292 step 4: the escalation target and the scout rule. Off, shadow, and version-1 runs keep step 2's bytes.
+const HOST_SCOUT_SENTENCE = "The host assigns each scout's profile; omit agentProfileId from scouts.";
+const HOST_ESCALATION = `If this task exceeds your reasoning capacity or the approach is failing, you may request one explicit escalation. The host selects the stronger profile. Report {"kind":"escalate","reason":"What failed or requires deeper reasoning; identify partial edits and remaining work"}. The host checks your partial edits, stops you, and continues in the same working copy. If this task already records an escalation, ask a material user question or report blocked; do not switch models yourself.`;
+const POINTS_PIN = { ...AUTO_PIN, algorithmVersion: 2, knobs: { ...AUTO_KNOBS, points: ["start", "escalation", "scout"] } } as unknown as TeamRunRoutingAuto;
+const OPUS_ESCALATION: TeamModelProfile = { id: "opus-escalation", label: "Opus escalation", provider: "claude", model: "claude-opus-5-5", effort: "xhigh" };
+const AUTO_ESCALATIONS = [AUTO_SPARK, AUTO_ASTRA, OPUS_ESCALATION];
+const ESCALATION_LINEUP = { ...AUTO_LINEUP, escalations: AUTO_ESCALATIONS } as TeamRun["lineup"];
+
+test("off, shadow, and version-1 prompts and contexts are byte-equal to step 2", () => {
+  const shadowV2 = { ...SHADOW_PIN("shadow"), algorithmVersion: 2, knobs: { ...AUTO_KNOBS, points: ["start", "escalation", "scout"] } } as unknown as TeamRunRouting;
+  const step2 = smallRun({ lineup: ESCALATION_LINEUP });
+  const shadowRun = smallRun({ lineup: ESCALATION_LINEUP, routing: shadowV2 });
+  const v1Run = smallRun({ lineup: ESCALATION_LINEUP, routing: { ...POINTS_PIN, algorithmVersion: 1 } as TeamRunRouting });
+  const step2Auto = smallRun({ lineup: ESCALATION_LINEUP, routing: AUTO_PIN });
+  for (const role of PIN_ROLES) {
+    const prompt = (run: TeamRun) => teamPrompt(run, role, undefined, undefined, "claude", AUTO_ASTRA, { checks: PIN_CHECKS }, [], true);
+    const context = (run: TeamRun) => JSON.stringify(teamContext(run, undefined, { checks: PIN_CHECKS }, role));
+    assert.equal(prompt(shadowRun), prompt(step2), `${role} prompt with a version-2 shadow pin`);
+    assert.equal(context(shadowRun), context(step2), `${role} context with a version-2 shadow pin`);
+    assert.equal(prompt(v1Run), prompt(step2Auto), `${role} prompt with a version-1 points pin`);
+    assert.equal(context(v1Run), context(step2Auto), `${role} context with a version-1 points pin`);
+  }
+  const revoked = smallRun({ lineup: ESCALATION_LINEUP, routing: POINTS_PIN, routingRevokedAt: "2026-11-02T00:00:00.000Z" });
+  assert.equal(coordinatorPrompt(revoked).includes(HOST_SCOUT_SENTENCE), false, "a revoked run names no host-selected scout");
+  assert.equal(teamPrompt(revoked, "implementer", undefined, undefined, "claude", AUTO_SPARK, { checks: PIN_CHECKS }, [], true).includes(HOST_ESCALATION), false, "a revoked run names no host-selected escalation");
+});
+
+test("a covered run tells the coordinator and the implementer that the host selects, with no routing value", () => {
+  const run = smallRun({ lineup: ESCALATION_LINEUP, routing: POINTS_PIN });
+  const coordinator = coordinatorPrompt(run);
+  const implementer = teamPrompt(run, "implementer", undefined, undefined, "claude", AUTO_SPARK, { checks: PIN_CHECKS }, [], true);
+  assert.equal(coordinator.split(HOST_SCOUT_SENTENCE).length, 2, "the host-selects scout sentence appears once");
+  assert.equal(coordinator.includes(SCOUT_POOL_SENTENCE), false, "the scout pool sentence is replaced");
+  assert.doesNotMatch(coordinator, /"agentProfileId"/, "the explore example names no profile");
+  assert.equal(implementer.split(HOST_ESCALATION).length, 2, "the host-selects escalation paragraph appears once");
+  assert.equal(implementer.includes("to this approved pool:"), false, "the escalation paragraph lists no pool");
+  assert.doesNotMatch(implementer, /"agentProfileId"/, "the escalation paragraph names no profile");
+  for (const prompt of [coordinator, implementer]) {
+    assert.doesNotMatch(prompt, ROUTING_VALUE_WORDS, "no routing value word");
+    assert.doesNotMatch(prompt.slice(0, 4000), ROUTING_VALUE_WORDS, "no routing value word in the first 4,000 characters");
+    assert.equal(prompt.includes(AUTO_DIGEST), false, "the policy digest stays out of the prompt");
+    assert.equal(prompt.slice(0, 4000).includes(AUTO_DIGEST), false, "the policy digest stays out of the first 4,000 characters");
+  }
+});
+
+test("every escalation profile on the reviewer's model keeps today's escalation prompt", () => {
+  const prompt = (run: TeamRun, modelProfile: TeamModelProfile) => teamPrompt(run, "implementer", undefined, undefined, "claude", modelProfile, { checks: PIN_CHECKS }, [], true);
+  const onlyOpus = { ...AUTO_LINEUP, escalations: [OPUS_ESCALATION] } as TeamRun["lineup"];
+  const pinnedOpus = smallRun({ lineup: onlyOpus, routing: POINTS_PIN });
+  const autoOpus = smallRun({ lineup: onlyOpus, routing: AUTO_PIN });
+  assert.equal(prompt(pinnedOpus, AUTO_SPARK), prompt(autoOpus, AUTO_SPARK), "the implementer prompt equals the same run under the version-1 pin");
+  assert.ok(prompt(pinnedOpus, AUTO_SPARK).includes(`to this approved pool: ${JSON.stringify([OPUS_ESCALATION])}`), "the reviewer's model stays in today's pool listing");
+  const mixedLineup = { ...AUTO_LINEUP, escalations: [AUTO_ASTRA, OPUS_ESCALATION] } as TeamRun["lineup"];
+  const mixedPinned = smallRun({ lineup: mixedLineup, routing: POINTS_PIN });
+  const mixedAuto = smallRun({ lineup: mixedLineup, routing: AUTO_PIN });
+  assert.equal(prompt(mixedPinned, AUTO_ASTRA), prompt(mixedAuto, AUTO_ASTRA), "an implementer whose only other candidate is the reviewer's model keeps today's paragraph");
+  assert.equal(prompt(mixedPinned, AUTO_SPARK).includes(HOST_ESCALATION), true, "an implementer with a rule-1 and rule-2 candidate gets the host-selects paragraph");
+});
+
+test("a scout's inline assignment never carries its routing", () => {
+  const run = smallRun({ lineup: ESCALATION_LINEUP, routing: POINTS_PIN });
+  const scout = { id: "inspect-flow", title: "Inspect the current flow", instructions: "A bounded research question", agentProfileId: AUTO_ASTRA.id, status: "pending" };
+  const tagged = { ...scout, routing: { profileId: AUTO_ASTRA.id, by: "router" } } as unknown as TeamScout;
+  const prompt = (item: TeamScout) => teamPrompt(run, "scout", item, undefined, "codex", AUTO_ASTRA, { checks: PIN_CHECKS }, [], true);
+  assert.doesNotMatch(prompt(tagged), /"routing":/, "the scout prompt carries no routing");
+  assert.equal(prompt(tagged), prompt(scout as unknown as TeamScout), "the scout prompt equals the same scout without routing");
 });
 
 // INF-282 step 3: a derived criterion is marked in the goal section; an intent decision prints fixed text and its ids.

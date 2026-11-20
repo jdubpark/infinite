@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { canonicalJson } from "../packages/host/src/evidence/crypto.js";
 import { AUTONOMOUS_DEFAULTS, ROUTING_DEFAULTS, effectiveRouting, pinRouting, policyDigest, teamRoutingSchema } from "../packages/host/src/routing-policy.js";
-import type { RoutingKnobs } from "../packages/host/src/routing-types.js";
+import type { RoutingKnobs, RoutingPoint } from "../packages/host/src/routing-types.js";
 import { mixedLineup } from "./team-fixture.js";
 
 const lineup = mixedLineup;
@@ -149,6 +149,35 @@ test("an auto pin needs a saved auto mode or the autonomous default, and a perio
   assert.equal(noEnd.source, "autonomous-default");
   assert.equal(noEnd.digest, AUTONOMOUS_DEFAULT_DIGEST);
   assert.equal("periodEndedAt" in noEnd, false);
+});
+
+/** SHA-256 hex of the digest's canonical form at one algorithm version, over the knobs a pin stores. */
+function digestAt(version: number, mode: "shadow" | "auto", knobs: RoutingKnobs): string {
+  return createHash("sha256").update(canonicalJson({ algorithmVersion: version, rewardVersion: 1, mode, knobs })).digest("hex");
+}
+
+test("a pin names version 2 only when its points list escalation or scout", () => {
+  for (const saved of [{ mode: "auto" }, { mode: "shadow" }] as const) {
+    const plain = pinRouting(saved, "supervised", lineup, PERIOD_END);
+    assert.ok(plain);
+    assert.equal(plain.algorithmVersion, 1, JSON.stringify(saved));
+    assert.equal(plain.digest, digestAt(1, plain.mode, plain.knobs), JSON.stringify(saved));
+  }
+  const listed: [RoutingPoint[], RoutingPoint[]][] = [
+    [["start", "escalation"], ["start", "escalation"]],
+    [["start", "scout"], ["start", "scout"]],
+    [["scout", "start", "escalation"], ["start", "escalation", "scout"]],
+  ];
+  for (const saved of [{ mode: "auto" }, { mode: "shadow" }] as const) {
+    for (const [points, ordered] of listed) {
+      const pin = pinRouting({ ...saved, points }, "supervised", lineup, PERIOD_END);
+      assert.ok(pin, JSON.stringify({ saved, points }));
+      assert.equal(pin.algorithmVersion, 2, JSON.stringify({ saved, points }));
+      assert.deepEqual(pin.knobs.points, ordered);
+      assert.equal(pin.digest, digestAt(2, pin.mode, { ...pin.knobs, points: ordered }), JSON.stringify({ saved, points }));
+    }
+  }
+  assert.equal(pinRouting({ mode: "auto", points: ["escalation"] }, "supervised", lineup, PERIOD_END), undefined);
 });
 
 test("the digest changes with every knob and with nothing else", () => {

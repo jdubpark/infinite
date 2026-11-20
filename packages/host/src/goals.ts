@@ -17,8 +17,8 @@ import { readSignals } from "./signals/consume.js";
 import { addToPendingWake, type PendingWake, type SignalReader } from "./signals/types.js";
 import { cadenceDue, classifyCycle, cycleWakeOf, defaultWakeMinGapMinutes, foldedCycles, isReviewed, keptCycles, latestReviewed, maxFailedCycles, maxPreviousWork, restoreWake, runObjectiveLimitBytes, unresolvedOperation, wakeObjective, retryableCreationFailure } from "./goal-standing.js";
 import { KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
-import { digestEvent, correctGoalObjective, createGoalObjective, goalObjectiveNote, goalObjectiveView, goalRecordDigest, goalRecordPort, loadGoalObjective, steerGoalObjective, type ObjectiveUnavailable } from "./objective-goals.js";
-import { objectivePromptsOn } from "./objective-digest.js";
+import { correctionGate, digestEvent, correctGoalObjective, createGoalObjective, goalObjectiveNote, goalObjectiveView, goalRecordDigest, goalRecordPort, loadGoalObjective, ratingStamp, steerGoalObjective, type ObjectiveUnavailable } from "./objective-goals.js";
+import { objectivePromptsOn, objectiveRegisterOn } from "./objective-digest.js";
 import { correctionSchema, type CriterionInput } from "./objective-input.js";
 import { objectiveError, recordView, type ObjectiveRecordView } from "./objective-record.js";
 
@@ -535,7 +535,7 @@ export class GoalService {
   objectiveRecord(id: string, version?: number) { return goalObjectiveView(this.record(id), version); }
   /**
    * The owner's correction of the criteria, applied exactly once. It writes the goal's sealed file once and answers the
-   * corrected record. A replay answers the latest view and writes nothing. Refused while objective prompts are off.
+   * corrected record. A replay answers the latest view and writes nothing. Criterion ops need objective prompts on; register ops need the register on.
    */
   correctObjective(id: string, input: unknown): Promise<ObjectiveRecordView> {
     const parsed = correctionSchema.safeParse(input);
@@ -545,8 +545,8 @@ export class GoalService {
       const stored = this.record(id), goal = stored.goal;
       if (this.replay(stored, "record", body)) return goalObjectiveView(stored);
       const project = this.config.projects.find(value => value.id === goal.projectId);
-      if (!objectivePromptsOn(project)) throw objectiveError("objective-prompts-off");
-      const next = correctGoalObjective(stored, body, { configured: project?.team?.checks ?? [], requestId: body.requestId, at: now() });
+      correctionGate(project, body);
+      const next = correctGoalObjective(stored, body, { configured: project?.team?.checks ?? [], requestId: body.requestId, at: now(), rating: ratingStamp(goal) });
       // The write works on a copy, so a failed write leaves the record, the receipts, the events, and updatedAt as they were.
       const draft: Stored = { ...stored, goal: { ...goal, events: [...goal.events] }, receipts: { ...stored.receipts, [body.requestId]: digest({ action: "record", ...body }) }, objectiveRecord: next };
       this.event(draft, correctionEvent(next.version));
@@ -850,7 +850,7 @@ export class GoalService {
     const goal = stored.goal;
     // The digest is built before the launch is saved, so a replay of that launch carries the same digest.
     const project = this.config.projects.find(value => value.id === goal.projectId);
-    const pinned = objectivePromptsOn(project) ? goalRecordDigest(stored, project?.team?.checks ?? []) : undefined;
+    const pinned = objectivePromptsOn(project) ? goalRecordDigest(stored, project?.team?.checks ?? [], objectiveRegisterOn(project)) : undefined;
     const note = digestEvent(goal.events, pinned);
     if (note) this.event(stored, note);
     const parent = latestReviewed(goal.cycles);

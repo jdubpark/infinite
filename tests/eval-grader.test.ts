@@ -5,6 +5,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, sy
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Writable } from "node:stream";
 import { launcherGrader, stopGrader } from "../packages/host/src/eval-grader.js";
 import type { EvalGraderConfig } from "../packages/host/src/eval-config.js";
 
@@ -173,5 +174,40 @@ test("stop reaches a round that is still running", async () => {
   assert.equal(outcome, "resolved", "the run resolves after the stop");
   assert.ok(Date.now() - started < 10_000, "the run resolves within 10 seconds of the stop");
   assert.equal(await client.clean(JOB), true, "a new call is accepted once the run has ended");
+});
+
+test("export keeps its limit", async () => {
+  const sb = sandbox();
+  const g = grader(sb);
+  let sent = 0;
+  const countingSink = () => new Writable({
+    write(chunk: Buffer, _encoding, callback) {
+      sent += chunk.length;
+      callback();
+    },
+  });
+  assert.equal(await g.export(JOB, countingSink(), 1 << 20), "failed", "a job without a task clone exported");
+  assert.equal(sent, 0);
+
+  // C1 is the trial branch, so the export has content; the fixture's run builds it under the launcher's environment.
+  const identity = "-c user.name=t -c user.email=t@example.invalid";
+  const made = await g.run(JOB, "task", 60, ["/bin/sh", "-c",
+    `git init -q && git ${identity} commit -q --allow-empty -m c1 && git branch trial && git ${identity} commit -q --allow-empty -m c2`]);
+  assert.equal(made.exitCode, 0);
+
+  assert.equal(await g.export(JOB, countingSink(), 10), "too-large");
+  assert.ok(sent <= 10, `the sink got ${sent} bytes past the limit of 10`);
+
+  sent = 0;
+  assert.equal(await g.export(JOB, countingSink(), 1 << 20), "exported");
+  assert.ok(sent > 10, `the sink got ${sent} bytes of the bundle`);
+
+  // A sink that fails, as a closed launcher's stdin does, ends the export as failed instead of throwing.
+  const broken = new Writable({ write(_chunk, _encoding, callback) { callback(new Error("the reader closed")); } });
+  assert.equal(await g.export(JOB, broken, 1 << 20), "failed");
+
+  // A version 2 launcher reports its version; a version 1 launcher's probe has none.
+  assert.equal((await grader(sb, { hostUid: OTHER_UID }).probe([])).version, 2);
+  assert.equal((await grader(sb, { hostUid: OTHER_UID }, ["--no-version"]).probe([])).version, undefined);
 });
 

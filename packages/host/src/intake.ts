@@ -89,6 +89,11 @@ const slackMicroseconds = (ts: string) => {
   const [seconds, fraction = ""] = ts.split(".");
   return BigInt(seconds || "0") * 1000000n + BigInt(fraction.slice(0, 6).padEnd(6, "0") || "0");
 };
+const slackTimestamp = /^\d{1,16}(?:\.\d{1,6})?$/;
+export function slackMessageAfter(ts: string, earlier: string | undefined): boolean {
+  return earlier !== undefined && slackTimestamp.test(ts) && slackTimestamp.test(earlier)
+    && slackMicroseconds(ts) > slackMicroseconds(earlier);
+}
 
 /**
  * One entry per message sent no later than `mentionTs`, oldest first. Every line break becomes `\n` first, empty lines
@@ -225,7 +230,11 @@ export function outboundText(config: Config, value: string): string {
 /** A direct request's tracker comment is a fixed receipt: agent text may quote other people's Slack messages. */
 /** The most time the reading service may take before the request goes to work. */
 const ROUTE_WAIT_MS = 6000;
-const ANSWER_RULE = "owner Slack mention of the bot (question)";
+const CHANNEL_MESSAGE_RULE = "owner message in Slack request channel";
+const directRule = (direct: IntakeRecord["direct"], question = false) => {
+  const rule = direct?.entrypoint === "channel-message" ? CHANNEL_MESSAGE_RULE : "owner Slack mention of the bot";
+  return question ? `${rule} (question)` : rule;
+};
 const ANSWER_MAX_MINUTES = 30;
 /** True for a record whose route is an answer: Linear is never involved with it. */
 export const isAnswerRecord = (record: IntakeRecord): boolean => record.direct?.route?.kind === "answer";
@@ -305,12 +314,12 @@ export class IntakeService {
   }
 
   /**
-   * Records the owner's Slack mention as a request to file: no Linear issue exists yet, so the record has an empty
+   * Records the owner's direct Slack request for filing: no Linear issue exists yet, so the record has an empty
    * identifier and no `request`, and the `file` step of the next cycle creates the issue. Synchronous and never throws
    * for a duplicate: a redelivered event (same `eventId`, or same message in the same channel) returns "duplicate".
    * It also returns "duplicate", creating nothing, when intake is not enabled or the service is closed.
    */
-  requestFromSlack(input: { thread: IntakeThread; ts: string; eventId: string; text: string }): "accepted" | "duplicate" {
+  requestFromSlack(input: { thread: IntakeThread; ts: string; eventId: string; text: string; entrypoint?: "channel-message" }): "accepted" | "duplicate" {
     if (!this.enabled() || this.closed) return "duplicate";
     if (this.store.list().some(record => record.direct && (record.direct.eventId === input.eventId
       || (record.direct.ts === input.ts && record.thread?.channelId === input.thread.channelId)))) return "duplicate";
@@ -328,7 +337,7 @@ export class IntakeService {
       issueId, identifier: "", url: "", title: (firstLine ?? "Request from a Slack thread").slice(0, 120),
       description: text.trim().slice(0, descriptionLimit), issueCreatedAt: now, issueUpdatedAt: now,
       state: "queued", thread: input.thread,
-      direct: { eventId: input.eventId, ts: input.ts, text, ...(slack?.answerQuestions ? { routable: true as const } : {}), ...(explicit ? { route: { kind: explicit.route, by: "owner" as const, at: now } } : {}) },
+      direct: { eventId: input.eventId, ts: input.ts, text, ...(input.entrypoint ? { entrypoint: input.entrypoint } : {}), ...(slack?.answerQuestions ? { routable: true as const } : {}), ...(explicit ? { route: { kind: explicit.route, by: "owner" as const, at: now } } : {}) },
       comments: {}, messages: [], questions: [], inbound: [], createdAt: now, updatedAt: now,
     });
     this.pendingMentions.delete(mention);
@@ -494,7 +503,7 @@ export class IntakeService {
     };
     this.store.update(record.issueId, next => {
       next.direct = { ...next.direct!, filedAt: new Date().toISOString() };
-      next.rule = ANSWER_RULE;
+      next.rule = directRule(direct, true);
       next.request = request;
       delete next.holdReason;
     });
@@ -545,7 +554,7 @@ export class IntakeService {
       Object.assign(next, this.facts(issue), { title: record.title, description });
       next.tracked = { title: issue.title, description: issue.description };
       next.direct = { ...direct, filedAt: new Date().toISOString() };
-      next.rule = "owner Slack mention of the bot";
+      next.rule = directRule(direct);
       next.request = request;
       delete next.holdReason;
     });

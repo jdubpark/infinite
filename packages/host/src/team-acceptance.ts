@@ -48,7 +48,7 @@ function validateTeamAcceptance(
 
   if (verdict !== "approved") return undefined;
   const byCriterion = new Map(entries.map(entry => [entry.criterion, entry]));
-  const incomplete = brief.acceptance.flatMap((criterion, index) => {
+  const incomplete = brief.acceptance.flatMap((_criterion, index) => {
     const number = index + 1;
     const entry = byCriterion.get(number);
     return !entry ? [`${number} (missing)`] : entry.verdict !== "verified" ? [`${number} (${entry.verdict})`] : [];

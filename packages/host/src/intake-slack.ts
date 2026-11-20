@@ -7,7 +7,10 @@ import type { TeamService } from "./teams.js";
 import { TeamError } from "./teams.js";
 import { SlackError, type SlackClient, type SlackEnvelope } from "./slack-client.js";
 import { splitSlackText } from "./slack-text.js";
-import { failureSummary, isAnswerRecord, outboundText } from "./intake.js";
+import { recommendationLine } from "./question-recommendation.js";
+import { failureSummary, isAnswerRecord, outboundText, slackMessageAfter } from "./intake.js";
+import { explicitRoute } from "./intake-route.js";
+import { formatThreadStatus } from "./slack-thread-status.js";
 
 const IDENTITY_RETRY_MS = 30_000;
 const RETRY_DELAYS_MS = [5_000, 30_000, 120_000];
@@ -34,12 +37,13 @@ const MINUTE_UNITS = new Set(["m", "min", "mins", "minute", "minutes"]);
 const PERMANENT_IDENTITY = new Set(["invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired", "credential_unavailable"]);
 const ANSWER_START = "Answering this from the repositories, read-only. No issue was filed.";
 const ANSWER_FOOTER = "No issue was filed. To start work, mention me with the change you want, or begin with \"work:\".";
+const CHANNEL_ANSWER_FOOTER = 'No issue was filed. To start work, mention me in this thread with "work:" and the change you want.';
 const WORK_HINT = "I took this as a request for a change. If you only wanted an answer, reply with a mention and \"cancel\", then mention me again starting with \"ask:\".";
 const WORK_HINT_QUEUED = "I took this as a request for a change. If you only wanted an answer, reply with a mention and \"cancel\" once it starts, then mention me again starting with \"ask:\".";
 const QUESTION = /^Q(\d+)(?!\w)\s*/i;
-const alternativePrompt = (n: number) => `What would you prefer instead? Reply with a mention and Q${n} followed by your alternative.`;
+const alternativePrompt = (n: number, channelReplies = false) => `What would you prefer instead? Reply ${channelReplies ? "in this thread with" : "with a mention and"} Q${n} followed by your alternative.`;
 
-export type DirectRequest = (input: { thread: IntakeThread; ts: string; eventId: string; text: string }) => "accepted" | "duplicate";
+export type DirectRequest = (input: { thread: IntakeThread; ts: string; eventId: string; text: string; entrypoint?: "channel-message" }) => "accepted" | "duplicate";
 
 interface Outcome { outcome: string; reply?: string }
 type SavedCall = NonNullable<IntakeInbound["call"]>;
@@ -58,6 +62,19 @@ function extendCommand(text: string): { minutes: number | undefined } | "invalid
   }
   return EXTEND_ATTEMPT.test(text) ? "invalid" : undefined;
 }
+/** A message addressed to a person or group is conversation among participants. References in the request body remain usable. */
+const addressedToSomeoneElse = (text: string) =>
+  /^(?:(?:hey|hi)[,\s]+)?(?:<@[UW][A-Z0-9]+(?:\|[^>]*)?>|<!(?:here|channel|everyone|subteam\^[^>]+)>)/i.test(text);
+
+function isChannelControl(text: string): boolean {
+  return ACTIONS.has(text.toLowerCase()) || QUESTION.test(text) || extendCommand(text) !== undefined
+    || /^(?:approve[d]?|deny|denied|yes|no)$/i.test(text);
+}
+
+/** A direct request starts at the owner's Slack message. For a tracker request the first confirmed thread post opens the conversation. */
+const afterThreadBinding = (record: IntakeRecord, ts: string) =>
+  slackMessageAfter(ts, record.direct?.ts ?? record.messages.find(message => message.ts)?.ts);
+
 /** A time to the minute in UTC, as `missions.ts` writes it. */
 const utcMinute = (iso: string) => `${iso.slice(0, 16).replace("T", " ")} UTC`;
 const extendedAmount = (minutes: number) => {
@@ -93,11 +110,15 @@ function addParts(config: Config, draft: IntakeRecord, key: string, kind: Intake
   });
 }
 
-const questionText = (decision: MissionDecision) => (n: number) => {
-  const options = decision.options.map((option, index) => `${index + 1}. ${option}`);
-  const footer = decision.answerMode === "multiple" ? "Choose one or more options, then Submit. You can also reply with a mention and your answer."
-    : options.length ? "Choose below, or reply with a mention and your answer." : "Reply with a mention and your answer.";
-  return [`**Q${n}: ${decision.question}**`, ...(options.length ? ["", ...options] : []), "", footer].join("\n");
+const questionText = (decision: MissionDecision, channelReplies = false) => (n: number) => {
+  const recommended = decision.recommendation?.answers ?? [];
+  const options = decision.options.map((option, index) => `${index + 1}. ${option}${recommended.includes(option) ? " (recommended)" : ""}`);
+  const how = channelReplies ? "in this thread with your answer." : "with a mention and your answer.";
+  const footer = decision.answerMode === "multiple" ? `Choose one or more options, then Submit. You can also reply ${how}`
+    : options.length ? `Choose below, or reply ${how}` : `Reply ${how}`;
+  // The recommendation comes first, before the options it names.
+  const recommendation = decision.recommendation ? ["", recommendationLine(decision.recommendation)] : [];
+  return [`**Q${n}: ${decision.question}**`, ...recommendation, ...(options.length ? ["", ...options] : []), "", footer].join("\n");
 };
 
 const safeLabel = (config: Config, label: string) => Array.from(outboundText(config, label)).slice(0, 75).join("");
@@ -228,6 +249,17 @@ export class IntakeSlackSurface {
     return this.directOn() ? FOLLOW_UP_DIRECT : FOLLOW_UP_LINEAR;
   }
 
+  /** Ordinary channel messages use the joined-channel policy or the legacy explicit channel map. */
+  private mappedChannel(channelId: string): boolean {
+    if (!this.directOn()) return false;
+    if (this.slack?.ownerOnlyInJoinedChannels) return /^[CG][A-Z0-9]{2,20}$/.test(channelId);
+    return (this.slack?.requestChannelIds ?? []).includes(channelId);
+  }
+
+  private threadReplies(thread: IntakeThread | undefined): boolean {
+    return Boolean(thread && this.mappedChannel(thread.channelId));
+  }
+
   // Outbound
 
   private reconcile(issueId: string): void {
@@ -304,13 +336,15 @@ export class IntakeSlackSurface {
       : draft.identifier ? `${draft.identifier} "${draft.title}" (${draft.url})` : `your request "${draft.title}"`;
     // A routed request that was not asked for by word says how to take the other route.
     const routed = draft.direct?.route?.kind === "work" && draft.direct.route.by !== "owner";
+    const channelReplies = this.threadReplies(draft.thread);
+    const replyHint = channelReplies ? "Reply in this thread to answer or steer." : "Reply with a mention to answer or steer.";
     const hint = routed ? `\n${WORK_HINT}` : "";
     // Before the mission exists a reply has nothing to cancel, so the owner is told to cancel once it starts.
     const queuedHint = routed ? `\n${WORK_HINT_QUEUED}` : "";
     if (draft.state === "started" && answer) {
       add("ack", "ack", ANSWER_START);
     } else if (draft.state === "started") {
-      add("ack", "ack", `Started on ${title}. I'll post questions and the result here.\nReply with a mention to answer or steer.${hint}`);
+      add("ack", "ack", `Started on ${title}. I'll post questions and the result here.\n${replyHint}${hint}`);
     } else if (draft.state === "queued" && draft.holdReason === "max-active") {
       add("ack", "ack", `Queued ${title}. It starts when a running request finishes. I'll post questions and the result here.${queuedHint}`);
     } else if (draft.state === "queued" && draft.holdReason) {
@@ -325,17 +359,22 @@ export class IntakeSlackSurface {
       add("started", "started", draft.direct ? `Started on ${draft.identifier} (${draft.url}).` : `Started on ${draft.identifier}.`);
     }
     if (mission) {
+      // This is a single durable milestone for live work. The stable key prevents revision churn from reposting it.
+      if (channelReplies && draft.state === "started" && mission.status === "working" && mission.subtasks.length > 0 && !answer) {
+        const count = mission.subtasks.length;
+        add("progress:first-dispatch", "status", `The coordinator dispatched ${count} subtask${count === 1 ? "" : "s"}. Reply here with \`status\` for progress.`);
+      }
       for (const decision of mission.decisions) {
         if (decision.answer || has(`q:${decision.id}`)) continue;
         const n = this.questionNumber(draft, decision.id);
-        addParts(this.config, draft, `q:${decision.id}`, "question", questionText(decision)(n), at, choiceBlocks(this.config, draft.issueId, decision));
+        addParts(this.config, draft, `q:${decision.id}`, "question", questionText(decision, channelReplies)(n), at, choiceBlocks(this.config, draft.issueId, decision));
       }
       if (mission.status === "ready-for-review" && mission.result) {
-        add(`result:${mission.result.revision}`, "result", this.resultText(mission, answer));
+        add(`result:${mission.result.revision}`, "result", this.resultText(mission, answer, channelReplies));
       }
       if (mission.status === "blocked") {
         const text = mission.stopReason === "deadline"
-          ? `Stopped at its time limit: ${mission.reason ?? NO_REASON}\n${EXTEND_PROMPT}`
+          ? `Stopped at its time limit: ${mission.reason ?? NO_REASON}\n${channelReplies ? 'Reply in this thread with "extend" (or "extend 6h") to give it more time, or "cancel".' : EXTEND_PROMPT}`
           : `Blocked: ${mission.reason ?? NO_REASON}\n${followUp}`;
         add(`status:blocked:${mission.revision}`, "status", text);
       }
@@ -343,7 +382,7 @@ export class IntakeSlackSurface {
         add(`status:cancelled:${mission.revision}`, "status", `Cancelled: ${mission.reason ?? NO_REASON}\n${followUp}`);
       }
       if (mission.status === "paused" && draft.closure) {
-        add(`status:paused:${mission.revision}`, "status", `Paused: ${draft.closure.reason}\nReply with a mention and "resume" or "cancel".`);
+        add(`status:paused:${mission.revision}`, "status", `Paused: ${draft.closure.reason}\n${channelReplies ? 'Reply in this thread with "resume" or "cancel".' : 'Reply with a mention and "resume" or "cancel".'}`);
       }
     }
     if (draft.editNotedAt && !answer) {
@@ -362,8 +401,8 @@ export class IntakeSlackSurface {
     return n;
   }
 
-  private resultText(mission: Mission, answer = false): string {
-    if (answer) return ["Answer (agent report):", mission.result!.summary, "", ANSWER_FOOTER].join("\n");
+  private resultText(mission: Mission, answer = false, channelReplies = false): string {
+    if (answer) return ["Answer (agent report):", mission.result!.summary, "", channelReplies ? CHANNEL_ANSWER_FOOTER : ANSWER_FOOTER].join("\n");
     const done = mission.subtasks.filter(subtask => subtask.status === "done");
     const noChange = done.length > 0 && done.every(subtask => subtask.teamStatus === "no-change");
     const views = mission.subtasks.flatMap(subtask => {
@@ -479,47 +518,82 @@ export class IntakeSlackSurface {
 
   private async receive(envelope: SlackEnvelope): Promise<void> {
     if (envelope.interaction) { await this.receiveInteraction(envelope); return; }
-    const slack = this.slack;
-    const event = envelope.event;
-    if (!slack || !event || envelope.teamId !== slack.teamId || event.type !== "app_mention" || event.user !== slack.ownerUserId
-      || event.botId !== undefined || !event.channel || !event.ts) {
+    const slack = this.slack, event = envelope.event;
+    if (!slack || !event || envelope.teamId !== slack.teamId || !event.channel || !event.ts || !event.user
+      || event.user === this.botUserId || event.botId !== undefined || event.appId !== undefined || event.botProfile
+      || event.subtype !== undefined || event.channelType === "im" || event.channelType === "mpim" || event.channel.startsWith("D")) {
       this.droppedCount += 1;
       return;
     }
-    const thread: IntakeThread = { channelId: event.channel, threadTs: event.threadTs ?? event.ts };
-    const text = this.commandText(event.text ?? "");
+    const owner = event.user === slack.ownerUserId;
+    const mapped = this.mappedChannel(event.channel);
+    const isChannel = event.channelType === "channel" || event.channelType === "group";
+    // Slack omits channel_type on app_mention. A private channel can have a C or G ID.
+    if (slack.ownerOnlyInJoinedChannels && (!owner || !mapped || (event.channelType !== undefined && !isChannel))) {
+      this.droppedCount += 1; return;
+    }
+    const mention = event.type === "app_mention";
+    const channelMessage = event.type === "message" && mapped && isChannel;
+    if (!mention && !channelMessage) { this.droppedCount += 1; return; }
+    const ts = event.ts, thread = { channelId: event.channel, threadTs: event.threadTs ?? ts };
+    const inThread = thread.threadTs !== ts;
+    if (channelMessage && !slackMessageAfter(ts, inThread ? thread.threadTs : "0")) {
+      this.droppedCount += 1;
+      return;
+    }
+
+    const raw = (event.text ?? "").trim(), text = this.commandText(raw);
+    // Slack can send both event types for a mention. The app_mention owns that message in either delivery order.
+    if (channelMessage && raw !== text) return;
+    if (channelMessage && (!text || addressedToSomeoneElse(text))) { this.droppedCount += 1; return; }
     const eventId = envelope.eventId ?? envelope.envelopeId;
-    const bound = this.store.boundTo(thread);
-    const ts = event.ts;
-    // A second event for a mention that already filed a request is dropped before any reply routing.
-    if (bound.some(record => record.direct && (record.direct.eventId === eventId || record.direct.ts === ts))) return;
-    const inThread = event.threadTs !== undefined && event.threadTs !== event.ts;
-    if (bound.length === 0) {
-      if (slack.bindByMention && this.bind(thread, text)) return;
-      // A bare top-level mention has nothing to file.
-      if (this.directOn() && (text !== "" || inThread)) { this.fileDirect(thread, ts, eventId, text); return; }
-      this.droppedCount += 1;
+    if (mapped && inThread && text.toLowerCase() === "status") {
+      this.postThreadStatus(this.store.boundTo(thread), ts, owner);
       return;
     }
+    if (!owner) {
+      if (mapped && !inThread && text && !isChannelControl(text)) {
+        try {
+          await this.client.acknowledgeProposal(event.channel, ts);
+          this.failures.delete("proposal");
+        } catch (error) {
+          if (error instanceof SlackError && error.transient) throw error;
+          this.log("Intake Slack proposal acknowledgement failed.", error);
+          this.failures.set("proposal", errorText(error));
+        }
+      } else { this.droppedCount += 1; }
+      return;
+    }
+
+    const bound = this.store.boundTo(thread);
+    if (bound.some(record => record.direct && (record.direct.eventId === eventId || record.direct.ts === ts))) return;
+    if (bound.length === 0) {
+      if (mention && slack.bindByMention && this.bind(thread, text)) return;
+      if (mapped && isChannelControl(text)) return;
+      const explicit = explicitRoute(text);
+      const channelRequest = explicit ? Boolean(explicit.text) && (explicit.route === "work" || slack.answerQuestions)
+        : !inThread && !isChannelControl(text);
+      if (this.directOn() && (mention ? Boolean(text || inThread) : channelRequest)) {
+        this.fileDirect(thread, ts, eventId, text, mention ? undefined : "channel-message");
+      } else { this.droppedCount += 1; }
+      return;
+    }
+    // A redelivered owner message can still have an unapplied call after an interrupted store write.
     const duplicate = (record: IntakeRecord) => record.inbound.some(item => item.eventId === eventId || item.ts === ts);
-    // A redelivered event, or a second event for the same message, is dropped with no write and no reply. An entry a
-    // failed store write left unhandled on the record that holds it is applied now.
     const holders = bound.filter(duplicate);
-    if (holders.length > 0) {
+    if (holders.length) {
       for (const record of holders) if (record.inbound.some(item => !item.handledAt)) void this.drain(record.issueId);
       return;
     }
-    // Only after the duplicate check, so a redelivered earlier reply never files a request.
-    if (this.directOn() && bound.every(record => record.state === "finished") && !this.routesToRecord(bound, text)) {
-      this.fileDirect(thread, ts, eventId, text);
-      return;
+    if (bound.every(record => record.state === "finished")) {
+      if (!mention) return;
+      if (this.directOn() && !this.routesToRecord(bound, text)) { this.fileDirect(thread, ts, eventId, text); return; }
     }
     const target = this.target(bound, text);
+    if (channelMessage && !afterThreadBinding(target.record, ts)) return;
     this.store.update(target.record.issueId, draft => {
-      if (duplicate(draft)) return;
-      const accepted: IntakeInbound = { eventId, ts, text: target.text, receivedAt: now() };
+      const accepted: IntakeInbound = { eventId, ts, text: target.text, receivedAt: now(), ...(channelMessage ? { entrypoint: "channel-message" } : {}) };
       if (target.reply) {
-        // Settled here: nothing is applied to any mission, and the reply says why.
         accepted.handledAt = now();
         accepted.outcome = target.outcome;
         addParts(this.config, draft, `reply:${eventId}`, "reply", target.reply, now());
@@ -527,6 +601,19 @@ export class IntakeSlackSurface {
       draft.inbound.push(accepted);
     });
     void this.drain(target.record.issueId);
+  }
+
+  /** A public status query writes only to the thread outbox. It never enters the owner's mission command log. */
+  private postThreadStatus(bound: IntakeRecord[], ts: string, owner: boolean): void {
+    if (!bound.length) return;
+    const key = `reply:thread-status:${ts}`;
+    if (bound.some(record => record.messages.some(message => message.key === key || message.key.startsWith(`${key}#`)))) return;
+    const visible = bound.filter(record => afterThreadBinding(record, ts));
+    if (!visible.length) return;
+    const active = visible.filter(record => record.state !== "finished");
+    const records = active.length ? active : visible.slice(-1);
+    const text = records.map(record => formatThreadStatus(record, record.missionId ? this.missions.peek(record.missionId) : undefined, owner)).join("\n\n");
+    this.store.update(records.at(-1)!.issueId, draft => addParts(this.config, draft, key, "reply", text, now()));
   }
 
   /** Validate an interactive callback against the configured owner, the persisted question, and the exact Slack post. */
@@ -580,8 +667,8 @@ export class IntakeSlackSurface {
     }
     let answerText: string | undefined;
     let reply: string | undefined;
-    if (action.actionId === "infinite_decision_other" && (mode === "single" || mode === "multiple") && action.value === "other") reply = alternativePrompt(question.n);
-    else if (action.actionId === "infinite_decision_deny" && mode === "approval" && action.value === "1") reply = alternativePrompt(question.n);
+    if (action.actionId === "infinite_decision_other" && (mode === "single" || mode === "multiple") && action.value === "other") reply = alternativePrompt(question.n, this.threadReplies(record.thread));
+    else if (action.actionId === "infinite_decision_deny" && mode === "approval" && action.value === "1") reply = alternativePrompt(question.n, this.threadReplies(record.thread));
     else if ((action.actionId === "infinite_decision_choice" || /^infinite_decision_choice_\d+$/.test(action.actionId))
       && (mode === "single" || mode === "approval") && validIndexes(values) && values.length === 1
       && (!action.actionId.endsWith("choice") || action.value === values[0])
@@ -605,10 +692,10 @@ export class IntakeSlackSurface {
     if (!reply) void this.drain(issueId);
   }
 
-  /** Files the owner's mention as a request. A failure is logged, counted and rethrown; nothing is posted. */
-  private fileDirect(thread: IntakeThread, ts: string, eventId: string, text: string): void {
+  /** Files an owner mention or opted-in channel message. A failure is logged, counted and rethrown; nothing is posted. */
+  private fileDirect(thread: IntakeThread, ts: string, eventId: string, text: string, entrypoint?: "channel-message"): void {
     try {
-      this.direct!({ thread, ts, eventId, text });
+      this.direct!({ thread, ts, eventId, text, ...(entrypoint ? { entrypoint } : {}) });
     } catch (error) {
       this.log("Intake Slack direct request failed.", error);
       this.droppedCount += 1;
@@ -705,7 +792,7 @@ export class IntakeSlackSurface {
     if (record.state === "finished") return { outcome: "finished", reply: `This request has finished. ${this.followUp()}` };
     const mission = record.missionId ? this.missions.peek(record.missionId) : undefined;
     if (!mission) return { outcome: "not-started", reply: NOT_STARTED };
-    const routed = this.route(record, mission, entry.text);
+    const routed = this.route(record, mission, entry.text, entry.entrypoint === "channel-message" ? entry.ts : undefined);
     if (!routed.call) return { outcome: routed.outcome, reply: routed.reply };
     const call: SavedCall = { ...routed.call, revision: mission.revision };
     this.rememberCall(record.issueId, entry.eventId, call);
@@ -713,7 +800,7 @@ export class IntakeSlackSurface {
   }
 
   /** Chooses the mission call for a reply from the mission's current state, or the reply that needs no call. */
-  private route(record: IntakeRecord, mission: Mission, text: string): Routed {
+  private route(record: IntakeRecord, mission: Mission, text: string, channelReplyTs?: string): Routed {
     const lower = text.toLowerCase();
     if (lower === "status") {
       const open = mission.decisions.filter(decision => !decision.answer).flatMap(decision => {
@@ -744,8 +831,15 @@ export class IntakeSlackSurface {
     } else {
       decision = open[0];
     }
+    if (channelReplyTs) {
+      const key = `q:${decision.id}`;
+      const post = record.messages.find(message => message.ts && (message.key === key || message.key === `${key}#1`));
+      if (!slackMessageAfter(channelReplyTs, post?.ts)) {
+        return { outcome: "question-not-visible", reply: "Please answer the open question in a new reply so I can match your answer to it." };
+      }
+    }
     const remainder = leading ? text.slice(leading[0].length).trim() : text;
-    if (remainder === "") return { outcome: "empty-answer", reply: "Reply with a mention and your answer." };
+    if (remainder === "") return { outcome: "empty-answer", reply: this.threadReplies(record.thread) ? "Reply in this thread with your answer." : "Reply with a mention and your answer." };
     const choice = /^\d+$/.test(remainder) ? Number(remainder) : undefined;
     const answer = choice !== undefined && choice >= 1 && choice <= decision.options.length ? decision.options[choice - 1] : remainder;
     return { outcome: "answered", call: { action: "answer", decisionId: decision.id, text: answer } };

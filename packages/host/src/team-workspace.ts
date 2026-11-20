@@ -242,7 +242,7 @@ const hostOwned = (stat: ReturnType<typeof lstatSync>) => {
   return typeof process.getuid !== "function" || stat.uid === process.getuid() || stat.uid === 0;
 };
 const unsafeTeamRoot = () => new TeamError(409, "team-root-unsafe", "Team roots must contain only host-owned real directories that are not writable by group or others.");
-function assertSecureAncestors(path: string) {
+export function assertSecureAncestors(path: string) {
   try {
     const canonical = realpathSync(path), root = parse(canonical).root;
     let current = root;

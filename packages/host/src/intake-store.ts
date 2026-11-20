@@ -8,6 +8,8 @@ const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 const metaScope = "intake:meta";
 const recordScope = (issueId: string) => `intake-record:${issueId}`;
 const now = () => new Date().toISOString();
+const oldestIssueFirst = (a: IntakeRecord, b: IntakeRecord) =>
+  a.issueCreatedAt.localeCompare(b.issueCreatedAt) || a.issueId.localeCompare(b.issueId);
 
 export class IntakeStore {
   private readonly directory: string;
@@ -52,7 +54,7 @@ export class IntakeStore {
 
   list(): IntakeRecord[] {
     return [...this.records.values()]
-      .sort((a, b) => a.issueCreatedAt.localeCompare(b.issueCreatedAt) || a.issueId.localeCompare(b.issueId))
+      .sort(oldestIssueFirst)
       .map(record => structuredClone(record));
   }
 
@@ -89,8 +91,10 @@ export class IntakeStore {
 
   /** Every record bound to the thread except skipped ones, oldest first, in the same order as `list`. */
   boundTo(thread: IntakeThread): IntakeRecord[] {
-    return this.list().filter(record =>
-      record.state !== "skipped" && record.thread?.channelId === thread.channelId && record.thread.threadTs === thread.threadTs);
+    return [...this.records.values()]
+      .filter(record => record.state !== "skipped" && record.thread?.channelId === thread.channelId && record.thread.threadTs === thread.threadTs)
+      .sort(oldestIssueFirst)
+      .map(record => structuredClone(record));
   }
 
   forMission(missionId: string): IntakeRecord | undefined {

@@ -22,7 +22,7 @@ test("GET /api/sessions answers a client that names the version it holds", { tim
     const plain = await waitFor(async () => [await list(), await list()], ([a, b]) =>
       a.text === b.text && (JSON.parse(a.text).sessions as Row[]).some(row => row.id === id && row.status === "running"), 20_000).then(([a]) => a);
 
-    // An installed client asks without a version and reads the body it always read.
+    // An installed client asks without a version and reads the envelope and content type it always read.
     assert.equal(plain.type, "application/json; charset=utf-8");
     const rows = JSON.parse(plain.text).sessions as Row[];
     assert.equal(plain.text, JSON.stringify({ sessions: rows }), "the default body carries only the rows");

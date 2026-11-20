@@ -1,4 +1,5 @@
 import type { TeamAssignment, TeamModelProfile } from "../team-types.js";
+import type { SessionPurpose } from "../types.js";
 import { haltReason, isHaltReason } from "../halt/rules.js";
 import type {
   FuseAdmission,
@@ -120,11 +121,12 @@ export function workLaunch(input: {
   provider: string;
   team: TeamAssignment;
   profile?: Pick<TeamModelProfile, "id">;
+  purpose?: SessionPurpose;
 }): FuseLaunch {
   return {
     launchId: input.launchId,
     projectId: input.projectId,
-    purpose: "work",
+    purpose: input.purpose ?? "work",
     role: input.team.role,
     profileId: input.profile?.id ?? input.provider,
     assignment: { runId: input.team.runId, memberId: input.team.memberId, revision: input.team.revision },

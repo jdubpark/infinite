@@ -1,9 +1,11 @@
 import type { ConnectorSource } from "./mcp-types.js";
 import { z } from "zod";
 import { featureMapSchema, TASK_KINDS } from "./task-features.js";
-import { evalProjectSchema } from "./eval-config.js";
+import { evalProjectSchema, CANDIDATE_PROFILES_MAX } from "./eval-config.js";
+import type { TrialEnding } from "./eval-types.js";
 import { POINTS_ALGORITHM_VERSION, teamRoutingSchema } from "./routing-policy.js";
 import { intentCheckReportSchema } from "./intent-report.js";
+import { questionRecommendationSchema, refineQuestion, requiredQuestionRecommendationSchema, type DecisionRecommendation } from "./question-recommendation.js";
 import type { RoutingKnobs, TeamRunRouting } from "./routing-types.js";
 import type { Prompt, AnswerResult } from "@infinite/attention";
 import type { Receipt } from "./types.js";
@@ -229,11 +231,11 @@ export const teamProjectSchema = z.object({
   handoffMaxTotalMinutes: z.number().int().min(5).max(1440).optional(),
   /** The private feature map. Read at acceptance; never sent to a member. No default, so the authority digest is unchanged when unset. */
   features: featureMapSchema.optional(),
-  eval: evalProjectSchema.optional(),
+  eval: evalProjectSchema.extend({ candidateProfiles: z.lazy(() => z.array(teamModelProfileSchema).max(CANDIDATE_PROFILES_MAX)).optional() }).optional(),
   /** The routing policy (owner-set). No default, so an unset policy leaves the authority digest unchanged. */
   routing: teamRoutingSchema.optional(),
   /** The objective switches. No default: an absent key leaves every routine digest and prompt unchanged. `intentCheck` overrides the mode's default. */
-  objective: z.strictObject({ prompts: z.enum(["on", "off"]).optional(), intentCheck: z.enum(["on", "off"]).optional() }).optional(),
+  objective: z.strictObject({ prompts: z.enum(["on", "off"]).optional(), intentCheck: z.enum(["on", "off"]).optional(), register: z.enum(["on", "off"]).optional() }).optional(),
 }).strict().superRefine((project, context) => {
   if (project.establishChecks ? project.checks.length > 0 : project.checks.length === 0)
     context.addIssue({ code: "custom", path: ["checks"], message: "Configure required checks, or explicitly authorize the team to establish them with an empty checks array." });
@@ -463,6 +465,30 @@ export const taskIdSchema = taskId;
 const ownedPath = z.string().min(1).max(300).refine(value => !value.startsWith("/") && !value.includes("\\") && !value.includes("\0") && !value.split("/").some(part => part === ".." || part === ".git" || part === "." || part === ""), "Use a repository-relative file or directory without glob syntax").refine(value => !/[*?\[\]:]/.test(value));
 export const ownedPathSchema = ownedPath;
 export const RECORD_DIGEST_BYTES = 6 * 1024;
+export const RECORD_REGISTER_BYTES = 6 * 1024;
+/** The register digest (part 8): intent-check and owner assumptions, then open questions. Its own budget; member text never enters. */
+export const registerDigestSchema = z.strictObject({
+  assumptions: z.array(z.strictObject({
+    id: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/),
+    status: z.enum(["refuted", "unchecked", "assumed", "verified"]),
+    criticality: z.enum(["outcome", "plan", "detail"]),
+    statement: z.string(), // 1 to 500 bytes
+  })).max(32),
+  questions: z.array(z.strictObject({ id: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/), text: z.string() /* 1 to 1,000 bytes */ })).max(8),
+  omitted: z.number().int().min(1).max(40).optional(),
+}).superRefine((register, context) => {
+  register.assumptions.forEach((item, index) => {
+    const bytes = Buffer.byteLength(item.statement);
+    if (bytes < 1 || bytes > 500) context.addIssue({ code: "custom", path: ["assumptions", index, "statement"], message: "An assumption statement is 1 to 500 bytes." });
+  });
+  register.questions.forEach((item, index) => {
+    const bytes = Buffer.byteLength(item.text);
+    if (bytes < 1 || bytes > 1000) context.addIssue({ code: "custom", path: ["questions", index, "text"], message: "A question is 1 to 1,000 bytes." });
+  });
+  if (registerDigestBytes(register) > RECORD_REGISTER_BYTES) context.addIssue({ code: "custom", path: ["assumptions"], message: "The register digest is over 6 KiB." });
+});
+export type RegisterDigest = z.infer<typeof registerDigestSchema>;
+export function registerDigestBytes(register: RegisterDigest): number { return Buffer.byteLength(JSON.stringify(register)); }
 export const RECORD_LABEL_BYTES = 120;
 /** Part 8's record digest. `c0` is first and its statement is empty: its text is the context's `successCriteria`. */
 export const recordDigestSchema = z.strictObject({
@@ -475,6 +501,8 @@ export const recordDigestSchema = z.strictObject({
     /** Marks a criterion the intent check derived from the objective, so the next cycle's prompt says so. */
     derived: z.literal(true).optional(),
   })).min(1).max(8),
+  /** The objective register (part 8). Its own 6 KiB budget, so a full criteria digest still leaves room for it. */
+  register: registerDigestSchema.optional(),
 }).superRefine((digest, context) => {
   const [first, ...rest] = digest.criteria;
   if (first?.id !== "c0" || rest.some(criterion => criterion.id === "c0")) context.addIssue({ code: "custom", path: ["criteria"], message: "The record digest must start with c0 and hold it once." });
@@ -490,7 +518,8 @@ export const recordDigestSchema = z.strictObject({
   if (recordDigestBytes(digest) > RECORD_DIGEST_BYTES) context.addIssue({ code: "custom", path: ["criteria"], message: "The record digest is over 6 KiB." });
 });
 export type RecordDigest = z.infer<typeof recordDigestSchema>;
-export function recordDigestBytes(digest: RecordDigest): number { return Buffer.byteLength(JSON.stringify(digest)); }
+/** Counts the criteria digest only, so a digest with or without a register counts exactly as it did before the register. */
+export function recordDigestBytes(digest: RecordDigest): number { return Buffer.byteLength(JSON.stringify({ version: digest.version, criteria: digest.criteria })); }
 export const teamGoalContextSchema = z.object({
   id: z.uuid(), revision: z.number().int().min(1), cycle: z.number().int().min(1),
   successCriteria: z.string().trim().min(1).max(8000),
@@ -553,7 +582,8 @@ export const blockerEvidenceSchema = z.object({
     context.addIssue({ code: "custom", message: "Blocker evidence must fit within 12 KiB of UTF-8 JSON" });
 });
 export type BlockerEvidence = z.infer<typeof blockerEvidenceSchema>;
-export const teamReportSchema = z.discriminatedUnion("kind", [
+const questionReportShape = { kind: z.literal("question"), question: z.string().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]), answerMode: z.enum(["approval", "single", "multiple"]).optional() };
+const teamReportVariants = [
   z.object({ kind: z.literal("permission-decision"), decisionId: z.uuid(), verdict: z.enum(["approve-once", "request-evidence", "escalate"]), summary: z.string().trim().min(1).max(2000), requestedPaths: z.array(z.string().trim().min(1).max(512)).max(8).optional() }).strict().superRefine((report, context) => {
     if (report.verdict === "request-evidence" && !report.requestedPaths?.length)
       context.addIssue({ code: "custom", path: ["requestedPaths"], message: "Request evidence with at least one repository-relative or approved scratch path." });
@@ -571,17 +601,20 @@ export const teamReportSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("delivery-repair"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("delivery-reconciliation"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), repository: githubRepository, branch: gitBranch, baseHeadCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), disposition: z.enum(["no-publication", "owned-branch", "pull-request"]), remoteHeadCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i).optional(), pullRequestUrl: z.string().trim().min(1).max(500).optional(), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("pull-request"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), pullRequestUrl: z.string().trim().min(1).max(500), summary: z.string().trim().min(1).max(4000) }).strict(),
-  z.object({ kind: z.literal("question"), question: z.string().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]), answerMode: z.enum(["approval", "single", "multiple"]).optional() }).strict().superRefine((report, context) => {
-    if (report.answerMode === "approval" && report.options.length !== 2)
-      context.addIssue({ code: "custom", path: ["options"], message: "Approval questions require exactly two options: approve first and deny second." });
-    if (report.answerMode === "multiple" && report.options.length < 2)
-      context.addIssue({ code: "custom", path: ["options"], message: "Multiple-selection questions require at least two options." });
-  }),
   z.object({ kind: z.literal("blocked"), summary: z.string().min(1).max(4000), blocker: blockerEvidenceSchema.optional() }).strict(),
   intentCheckReportSchema,
-]);
-export type TeamReport = z.infer<typeof teamReportSchema>;
-export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: teamReportSchema }).strict();
+] as const;
+/** What the report tool accepts from a member: every question carries the member's recommendation. */
+export const teamReportSchema = z.discriminatedUnion("kind", [...teamReportVariants,
+  z.object({ ...questionReportShape, recommendation: requiredQuestionRecommendationSchema }).strict().superRefine(refineQuestion)]);
+/**
+ * A report as the session journal and the run record hold it. A member started before recommendations were required
+ * may still ask a question without one, so the worker and the host read this form.
+ */
+export const recordedTeamReportSchema = z.discriminatedUnion("kind", [...teamReportVariants,
+  z.object({ ...questionReportShape, recommendation: questionRecommendationSchema.optional() }).strict().superRefine(refineQuestion)]);
+export type TeamReport = z.infer<typeof recordedTeamReportSchema>;
+export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: recordedTeamReportSchema }).strict();
 export type TeamReportEnvelope = z.infer<typeof teamReportEnvelopeSchema>;
 export type TeamRole = "permission-coordinator" | "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery" | "intent-checker";
 /** A mission coordinator's assignment carries the mission ID as `runId`; it reports `MissionReport`s. */
@@ -704,6 +737,11 @@ export interface TeamDecision {
   answeredAt?: string;
   /** Ids of the record questions this decision asks, set by the intent check. Authority surfaces print them in place of `question`. */
   intentQuestions?: string[];
+  /**
+   * What the asking member would answer and why, with how the recorded answer compared. Absent on the intent check's
+   * decisions and on a decision asked by a member started before recommendations were required.
+   */
+  recommendation?: DecisionRecommendation;
 }
 export interface TeamCheck {
   command: TeamCommand;
@@ -718,6 +756,7 @@ export interface TeamCheck {
   /** Correction round that launched this verification attempt. */
   round?: number;
 }
+export type ReplayLink = { jobId: string; trialId: string; purpose: "replay" | "gate"; ending?: TrialEnding; resultCommit?: string; resetsAt?: string };
 export interface TeamRun {
   /** Set when the run was created with the blackboard tools switch on and a ready store. Absent means today's behaviour. */
   blackboard?: { tools: true };
@@ -729,6 +768,8 @@ export interface TeamRun {
   autonomy?: AutonomyMode;
   /** The intent check pinned when the run is created; absent on runs created before the check existed. Pinned by createRun. */
   intentCheck?: "on" | "off";
+  /** Pinned by createRun when the project's register is on; absent otherwise and on runs created before the register existed. */
+  register?: "on";
   /** Explicit owner delegation pinned at creation. Old runs remain opted out. */
   permissions?: TeamPermissions;
   permissionsRevokedAt?: string;
@@ -796,6 +837,8 @@ export interface TeamRun {
   goal?: TeamGoalContext;
   /** Set when a mission started this run as one of its subteams; the board shows it only inside that mission. */
   missionId?: string;
+  /** Set once by createForReplay. Stripped from every TeamView. */
+  replay?: ReplayLink;
   /** Connector provenance pinned when a mission creates this subteam. */
   requestSource?: ConnectorSource;
   /** The integration and member clones were removed under the retention policy; the record, events and evidence remain. */

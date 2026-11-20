@@ -217,4 +217,15 @@ final class MissionBoardTests: XCTestCase {
         let owned = try parse(#"{"id":"s-3","status":"running"}"#)
         XCTAssertNil(try? owned["managedBy"].decoded(SessionManagement.self))
     }
+
+    func testDecisionRecommendationReadsOnlyWhenPresentAndNamesTheComparison() throws {
+        // Older decisions carry no recommendation, so nothing renders.
+        XCTAssertNil(DecisionRecommendation(try parse(#"{"id":"d-1","question":"Ship?"}"#)["recommendation"]))
+        XCTAssertNil(DecisionRecommendation(try parse(#"{"recommendation":{"answers":[],"reason":"x"}}"#)["recommendation"]))
+        let recommendation = try XCTUnwrap(DecisionRecommendation(try parse(#"{"recommendation":{"answers":["Yes"],"reason":"Tests pass.","outcome":"different"}}"#)["recommendation"]))
+        XCTAssertTrue(recommendation.recommends("Yes"))
+        XCTAssertFalse(recommendation.recommends("No"))
+        XCTAssertEqual(recommendation.comparisonNote, "Different from the recommendation")
+        XCTAssertNil(DecisionRecommendation(try parse(#"{"answers":["Later"],"outcome":"other"}"#))?.comparisonNote)
+    }
 }

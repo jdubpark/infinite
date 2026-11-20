@@ -1,10 +1,25 @@
 import { HANDOFF_INSTRUCTIONS } from "./handoff-types.js";
-import type { AgentProfile, Provider } from "./types.js";
+import { learningPurpose, type AgentProfile, type Config, type Provider, type SessionPurpose } from "./types.js";
 import { dirname, join } from "node:path";
 import { teamModelProfileSchema, type TeamModelProfile } from "./team-types.js";
+import { TeamError } from "./team-workspace.js";
 import { codexTrustArgs } from "./workspace-trust.js";
 import { sudoShape } from "./sudo-profile.js";
 import { EGRESS_ENVIRONMENT_NAMES } from "./egress.js";
+
+/** eval.member.agents[provider] for a learning purpose, else config.agents[provider]. Throws TeamError 409 "eval-identity-missing" for a learning purpose without an eval profile for the provider. */
+export function sessionAgentProfile(config: Pick<Config, "agents" | "eval">, provider: Provider, purpose: SessionPurpose | undefined): AgentProfile | undefined {
+  if (!learningPurpose(purpose)) return config.agents[provider];
+  const agents = config.eval?.member?.agents;
+  const profile = agents && (provider === "claude" || provider === "codex" || provider === "opencode") ? agents[provider] : undefined;
+  if (!profile) throw new TeamError(409, "eval-identity-missing", "The eval identity has no launch profile for this provider.");
+  return profile;
+}
+
+/** For a learning purpose, the snapshot with `text: ""` and `sources: []`: today's text is not the text of the work's time. */
+export function withoutSharedContext<T extends { text: string; sources: readonly unknown[] }>(context: T, purpose: SessionPurpose | undefined): T {
+  return learningPurpose(purpose) ? { ...context, text: "", sources: [] } : context;
+}
 
 /** Only model controls are added here; the configured provider permissions remain unchanged. */
 export function teamModelLaunch(profile: AgentProfile, input: TeamModelProfile): AgentProfile {

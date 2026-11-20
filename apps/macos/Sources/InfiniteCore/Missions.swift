@@ -180,6 +180,40 @@ public struct MissionDecision: Identifiable, Equatable, Sendable {
     public var answered: Bool { value["answer"] != .null }
 }
 
+/// The agent's suggested answer to a decision, with a one-line reason. Older decisions omit the
+/// `recommendation` key, so this reads to nil and the views render as they did before.
+public struct DecisionRecommendation: Equatable, Sendable {
+    public enum Outcome: String, Sendable { case matched, different, other }
+    /// The recommended option text, or several for a multiple-selection question; for a question without
+    /// options, the one short answer in words.
+    public let answers: [String]
+    public let reason: String
+    /// Set once the decision is answered.
+    public let outcome: Outcome?
+
+    /// Reads the host's `recommendation` value. Nil when it is absent or carries no answer.
+    public init?(_ value: JSON) {
+        let answers = value["answers"].array.map(\.string).filter { !$0.isEmpty }
+        guard !answers.isEmpty else { return nil }
+        self.answers = answers
+        reason = value["reason"].string
+        outcome = Outcome(rawValue: value["outcome"].string)
+    }
+
+    /// Whether an option is the recommended one.
+    public func recommends(_ option: String) -> Bool { answers.contains(option) }
+    /// The answer a one-click control sends for a question without options.
+    public var firstAnswer: String { answers[0] }
+    /// How an answered decision compared with the recommendation; nil when it did not record one.
+    public var comparisonNote: String? {
+        switch outcome {
+        case .matched: "Matched the recommendation"
+        case .different: "Different from the recommendation"
+        case .other, nil: nil
+        }
+    }
+}
+
 /// One owner request for a mission: its path and body, pinned to the decision and revision the owner
 /// acted on. A retry resends the identical request, so the host applies it at most once.
 public struct MissionRequest: Equatable, Sendable {

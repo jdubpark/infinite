@@ -12,11 +12,16 @@ type Options = Record<string, string | boolean>;
 export const GOAL_RECORD_USAGE = [
   "Usage: infinite goal record ID [--version N] [--json]",
   "       infinite goal record ID retire CID|confirm CID [--version N] [--request-id ID] [--json]",
+  "       infinite goal record ID set-assumption AID verified|refuted [--version N] [--request-id ID] [--json]",
+  "       infinite goal record ID rate SUBJECT SCORE [--version N] [--request-id ID] [--json]",
   "       infinite goal record ID apply --file PATH [--version N] [--request-id ID] [--json]",
 ].join("\n");
 /** A correction file is read whole, so it is capped before it is read. */
 export const CORRECTION_FILE_BYTES = 64 * 1024;
 const VERSION = /^[1-9][0-9]{0,5}$/;
+// A score is 1 to 5 in whole numbers or halves; the value is checked again against at most 5 below.
+const SCORE = /^[1-5](?:\.[05])?$/;
+const SCORE_USAGE = "Give SCORE as a number from 1 to 5 in halves, such as 3 or 3.5.";
 const UUID = z.uuid();
 // The body of a file is checked with this ID and version, which only the request body later fills in.
 const PLACEHOLDER_REQUEST_ID = "00000000-0000-4000-8000-000000000000";
@@ -71,6 +76,11 @@ function correctionFailure(error: unknown, retry: string): Error {
 
 const short = (hash: string) => hash.slice(0, 12);
 const list = (values: string[]) => values.length ? values.join(", ") : "none";
+/** The last evidence handle that a line shows: a receipt, an owner result, or a rating. Other handles print nowhere. */
+function shownHandle(evidence: string[]): string {
+  const shown = evidence.filter(handle => /^(?:receipt|owner|rating):/.test(handle));
+  return shown.length ? ` [${shown[shown.length - 1]}]` : "";
+}
 
 function checkText(check: ObjectiveRecordView["record"]["criteria"][number]["check"]): string {
   switch (check.kind) {
@@ -108,7 +118,10 @@ export function objectiveRecordLines(view: ObjectiveRecordView, goalId: string):
   ];
   const assumptions = record.assumptions;
   lines.push(assumptions.length ? "Assumptions:" : "Assumptions: none");
-  for (const assumption of assumptions) lines.push(`  ${assumption.id} ${assumption.status} ${assumption.criticality} ${assumption.origin}: ${assumption.statement}`);
+  for (const assumption of assumptions) {
+    const pinned = assumption.ownerPinned ? " pinned" : "";
+    lines.push(`  ${assumption.id} ${assumption.status}${pinned} ${assumption.criticality} ${assumption.origin}${shownHandle(assumption.evidence)}: ${assumption.statement}`);
+  }
   const openQuestions = record.questions.filter(question => question.state === "open");
   lines.push(openQuestions.length ? "Open questions:" : "Open questions: none");
   for (const question of openQuestions) lines.push(`  ${question.id} open${question.waits ? " waits" : ""}: ${question.text}`);
@@ -156,16 +169,34 @@ export function readCorrectionFile(path: string): CorrectionOp[] {
 type Form =
   | { kind: "read" }
   | { kind: "op"; verb: "retire" | "confirm"; id: string }
+  | { kind: "set"; id: string; status: "verified" | "refuted" }
+  | { kind: "rate"; subject: string; score: number }
   | { kind: "apply" };
 
-/** The three forms of `infinite goal record`. Anything else is a usage error, checked before any request. */
+/** The forms of `infinite goal record`. Anything else is a usage error, checked before any request. */
 function formOf(positional: string[]): Form {
-  const [verb, goalId, form, target, ...rest] = positional;
+  const [verb, goalId, form, target, value, ...rest] = positional;
   if (verb !== "record" || !goalId || rest.length > 0) throw new Error(GOAL_RECORD_USAGE);
   if (positional.length === 2) return { kind: "read" };
   if (positional.length === 3 && form === "apply") return { kind: "apply" };
   if (positional.length === 4 && (form === "retire" || form === "confirm") && target !== undefined) return { kind: "op", verb: form, id: target };
+  if (positional.length === 5 && form === "set-assumption" && target !== undefined && (value === "verified" || value === "refuted")) {
+    return { kind: "set", id: target, status: value };
+  }
+  if (positional.length === 5 && form === "rate" && target !== undefined && value !== undefined) {
+    if (!SCORE.test(value) || Number(value) > 5) throw new Error(SCORE_USAGE);
+    return { kind: "rate", subject: target, score: Number(value) };
+  }
   throw new Error(GOAL_RECORD_USAGE);
+}
+
+/** The one op and the command text of a form that sends one op. */
+function singleOpOf(form: Exclude<Form, { kind: "read" | "apply" }>): { op: CorrectionOp; text: string } {
+  switch (form.kind) {
+    case "op": return { op: { op: form.verb === "retire" ? "criterion.retire" : "criterion.confirm", id: form.id }, text: `${form.verb} ${form.id}` };
+    case "set": return { op: { op: "assumption.set", id: form.id, status: form.status }, text: `set-assumption ${form.id} ${form.status}` };
+    case "rate": return { op: { op: "rating.record", subject: form.subject, score: form.score }, text: `rate ${form.subject} ${form.score}` };
+  }
 }
 
 async function readView(api: GoalApi, goalId: string, version: string | undefined): Promise<ObjectiveRecordView> {
@@ -205,10 +236,10 @@ export async function handleGoalClientCommand(positional: string[], options: Opt
     ops = readCorrectionFile(file as string);
     formText = `apply --file ${file}`;
   } else {
-    const single = { op: form.verb === "retire" ? "criterion.retire" as const : "criterion.confirm" as const, id: form.id };
+    const { op: single, text } = singleOpOf(form);
     if (!correctionSchema.safeParse({ requestId, version: 1, ops: [single] }).success) throw new Error(OBJECTIVE_ERRORS["objective-op-invalid"].message);
     ops = [single];
-    formText = `${form.verb} ${form.id}`;
+    formText = text;
   }
 
   // The version the correction applies to: the one named, or the latest one read now.

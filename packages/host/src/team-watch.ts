@@ -1,4 +1,14 @@
+import { recommendationLine, type QuestionRecommendation } from "./question-recommendation.js";
+
 const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+
+/** An open team question as the CLI prints it: its text, the recommendation line when it has one, then its numbered options. */
+export function openQuestionLines(question: { id: unknown; question: unknown; options?: unknown; recommendation?: QuestionRecommendation }): string[] {
+  const options: unknown[] = Array.isArray(question.options) ? question.options : [];
+  return [`Question ${clean(question.id)}: ${clean(question.question)}`,
+    ...(question.recommendation ? [`  ${clean(recommendationLine(question.recommendation))}`] : []),
+    ...options.map((option, index) => `  ${index + 1}. ${clean(option)}`)];
+}
 const short = (value: unknown, max: number) => {
   const text = clean(value).trim();
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
@@ -45,6 +55,7 @@ export function teamMonitorText(team: any, checkedAt = "", detach = false): stri
   for (const question of team.decisions ?? []) {
     if (question?.answer || questions >= 3) continue;
     lines.push(`Question ${short(question.id, 40)}: ${short(question.question, 180)}`);
+    if (question.recommendation) lines.push(short(recommendationLine(question.recommendation), 240));
     questions += 1;
   }
   const events = Array.isArray(team.events) ? team.events : [];
@@ -166,6 +177,7 @@ function decisionLines(lines: string[], team: any) {
   lines.push("", `DECISIONS FOR YOU (${open.length})`);
   for (const question of open.slice(0, 3)) {
     lines.push(`  • ${short(question.question, 400)}`);
+    if (question.recommendation) lines.push(`    ${short(recommendationLine(question.recommendation), 400)}`);
     const options = Array.isArray(question.options) ? question.options.map((option: unknown) => short(option, 60)).filter(Boolean) : [];
     if (options.length) lines.push(`    Options: ${options.join(" / ")}`);
     lines.push(`    infinite team answer ${clean(team?.id)} ${clean(question.id)} "YOUR ANSWER"`);

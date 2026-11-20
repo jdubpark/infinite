@@ -6,7 +6,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSy
 import { rm as rmAsync } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep, basename } from "node:path";
-import type { Config, Session } from "./types.js";
+import { type Config, type Session, learningPurpose } from "./types.js";
 import { TeamStopRefused, type Manager } from "./manager.js";
 import { bootId, extendWitness, hostProcesses, newWitness, recordCommand, type CensusResult, type HostProcesses, type ProcessWitness } from "./process-census.js";
 import type { WorkerError } from "./ipc.js";
@@ -54,9 +54,12 @@ import type { PermissionDeliverySource } from "./permission-delivery.js";
 import { memberTaskOf, teamPermissionRequest, teamPermissionTarget, teamPermissionTask } from "./team-permission-adapter.js";
 import { planRunObjective, runObjectiveNote, runObjectiveView, steerRunObjective, type ObjectiveUnavailable } from "./objective-runs.js";
 import { TeamIntent, type GoalRecordPort, type IntentCheckState } from "./team-intent.js";
+import { TeamRegister, objectivePromptOf, registerPin, type RegisterState } from "./team-register.js";
+import { TeamReplay, type ReplayCreate, type ReplayState } from "./team-replay.js";
 import { autonomyStartEvent, intentCheckPin, startMode } from "./evaluator-profiles.js";
 export { TeamError } from "./team-workspace.js";
 import { changeIndex, changedPathList, diffStat } from "./team-changes.js";
+import { recommendationLine, recommendationOutcome } from "./question-recommendation.js";
 export { changeIndex };
 
 type Mutation = { requestId: string; revision: number; text: string };
@@ -189,7 +192,7 @@ type Stored = {
   /** The member each queued replacement continues, until it starts. Written only with `options.events`. */
   ledgerReplaces?: Record<string, { memberId: string; cause: ReplacementCause }>;
   /** The objective record of a standalone run (objective-runs.ts). Outside `run`, so no view, prompt, or digest reads it. */
-  objectiveRecord?: unknown; objectiveNotice?: ObjectiveUnavailable; intentCheck?: IntentCheckState;
+  objectiveRecord?: unknown; objectiveNotice?: ObjectiveUnavailable; intentCheck?: IntentCheckState; register?: RegisterState;
 };
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 /** Display names may change; durable replay binds connector identity to its kind and ID. */
@@ -266,6 +269,9 @@ const promptTooLargeReason = "The accumulated team requirements exceed the promp
 const missingAgentReportReason = "An agent exited without a valid structured report. Its task is unresolved.";
 const invalidNoChangeReason = "A no-change report is valid only before implementation tasks are planned and when the integration head is unchanged from the base.";
 const wrongAgentReportReason = "An agent's report does not match its assigned role.";
+/** Why a worker's question blocked the run. It carries the worker's recommendation, so the project manager's recovery reads it. */
+const agentQuestionReason = (role: TeamMember["role"], report: Extract<TeamReport, { kind: "question" }>) =>
+  `The ${role} requested an owner decision: ${report.question}${report.recommendation ? ` ${recommendationLine(report.recommendation)}` : ""}`;
 const automaticRecoveryCodes = new Set(["agent-blocked", "agent-question", "missing-agent-report", "invalid-no-change", "wrong-agent-report"]);
 const automaticRecoveryLimit = 2;
 const permissionRecoveryRoundLimit = 2;
@@ -504,7 +510,9 @@ export class TeamService {
   private fuse?: FuseGate;
   private missionReservations?: MissionReservationLookup;
   private readonly limits: ProviderLimits;
+  private readonly replays = new TeamReplay({ config: () => this.config, emit: (s, k, keys, ids, data) => this.emit(s as Stored, k, keys, ids, data), save: s => this.save(s as Stored), cancel: s => this.enqueue(() => this.stopRun(s as Stored, "cancel")), sessionStatus: async id => (await this.manager.state(id).catch(() => undefined))?.status, activeMember });
   private readonly intentChecks = new TeamIntent({ prepare: (s, r, f, o, p) => this.prepareMember(s as Stored, r, undefined, f, o, p), consume: (s, m) => this.consume(s as Stored, m), operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m), save: s => this.save(s as Stored), event: (s, t) => this.event(s as Stored, t), block: (s, e, m) => this.block(s as Stored, e, m), project: run => this.config.projects.find(project => project.id === run.projectId), limited: () => this.limits.limited(), prefix: () => this.config.teams?.commandPrefix });
+  private readonly objectiveTests = new TeamRegister({ holder: id => this.records.get(id), configured: run => this.config.projects.find(project => project.id === run.projectId)?.team?.checks ?? [], workspace: s => { try { this.assertRunPath(s as Stored, s.run.workspace); return s.run.workspace; } catch { return undefined; } }, enqueue: work => this.enqueue(work), save: s => this.save(s as Stored), event: (s, text) => this.event(s as Stored, text), prefix: () => this.config.teams?.commandPrefix, now: timestamp });
   private reconciledAt = 0;
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly startInProject: StartInProject, private readonly linear?: LinearService, private readonly titler?: Pick<Readings, "requestTitle">, private readonly options?: TeamServiceOptions) {
     this.directory = join(config.stateDir, "teams");
@@ -673,6 +681,7 @@ export class TeamService {
       for (const stored of this.records.values()) this.entryBacklog.add(stored.run.id);
       this.drainEntries();
     }
+    this.objectiveTests.restore(this.records.values());
   }
   /** The usage ledger this service prices member usage from; its tick also drives the ledger's reads. */
   useUsage(service: UsageService) { this.usage = service; }
@@ -683,7 +692,7 @@ export class TeamService {
   useRouter(router: RoutingRecorder) { this.router = router; }
   /** The launch-rate fuse. Without one, every member launches as before and no record gains a fuse reason. */
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
-  useGoalRecords(port: GoalRecordPort) { this.intentChecks.goals = port; }
+  useGoalRecords(port: GoalRecordPort) { this.intentChecks.goals = port; this.objectiveTests.goals = port; }
   /**
    * Applies a fuse result to the run's reason. True when the launch must wait. A reason that reports a member's
    * state stays as it is: the scheduler writes it again on every pass, so a fuse text there would be replaced and
@@ -740,9 +749,9 @@ export class TeamService {
   private assertRunPath(stored: Stored, path: string, create = false) {
     const root = stored.root ?? this.config.teams?.workspaceDir;
     if (!root) throw new TeamError(409, "invalid-workspace", "The team workspace is outside its configured root.");
-    if (!stored.anchor && root !== this.config.teams?.workspaceDir)
+    if (!stored.anchor && root !== this.config.teams?.workspaceDir && !(stored.run.replay && root === this.replays.root()))
       throw new TeamError(409, "team-root-unsafe", "A team root outside the configured workspace directory requires a trusted anchor.");
-    const canonical = stored.anchor ? ensureHostDirectory(stored.anchor, root, 0o750, create) : ensureDefaultTeamRoot(root, create);
+    const canonical = stored.anchor ? ensureHostDirectory(stored.anchor, root, 0o750, create) : stored.run.replay ? this.replays.canonicalRoot() : ensureDefaultTeamRoot(root, create);
     assertTeamPath(canonical, path);
   }
   private canResume(stored: Stored, linearStatus = stored.run.linear?.status, allowRemovedWorkspace = false) {
@@ -772,7 +781,7 @@ export class TeamService {
     const candidates = run.members.filter(member => member.revision === run.revision && member.status === "stopped" &&
       member.role !== "delivery" && member.role !== "permission-coordinator" && (
         code === "agent-blocked" ? member.report?.kind === "blocked" && member.report.summary === run.reason :
-          code === "agent-question" ? member.report?.kind === "question" && `The ${member.role} requested an owner decision: ${member.report.question}` === run.reason :
+          code === "agent-question" ? member.report?.kind === "question" && agentQuestionReason(member.role, member.report) === run.reason :
             code === "missing-agent-report" ? member.report === undefined && run.reason === missingAgentReportReason :
               code === "invalid-no-change" ? member.role === "project-manager" && member.report?.kind === "no-change" && run.reason === invalidNoChangeReason :
                 code === "wrong-agent-report" ? Boolean(member.report && !roleAcceptsReport(member.role, member.report.kind)) && run.reason === wrongAgentReportReason : false));
@@ -822,7 +831,7 @@ export class TeamService {
     return tracking.status === "error" || Boolean(tracking.retryAt) || Date.now() - Date.parse(tracking.checkedAt ?? run.createdAt) > 60000;
   }
   private view(stored: Stored): TeamView {
-    const { members, permissionRecovery, ...run } = structuredClone(stored.run);
+    const { members, permissionRecovery, replay, ...run } = structuredClone(stored.run);
     // Queue evidence from this exact state before a goal can use its sync gate
     // to continue from a newly reviewed or no-change result.
     const tracking = this.linear?.updateTeam(stored.run, stored.run.linearTracking === true, this.canResume(stored));
@@ -860,6 +869,7 @@ export class TeamService {
     }
     if (this.options?.events) this.emitStatusEvents(stored, retention.statusAt);
     this.endPermissionTask(stored);
+    this.objectiveTests.mark(stored);
     stored.run.updatedAt = timestamp();
     writeSealed(join(this.directory, `${stored.run.id}.sealed`), this.key, `team:${stored.run.id}`, stored);
     if (this.options?.events) this.flushOutbox(stored);
@@ -906,7 +916,7 @@ export class TeamService {
     if (!entries) return;
     if (this.entryQueue.size === 0) return;
     for (const result of ingestPass(this.entryQueue, id => this.records.get(id)?.run,
-      { events: (id, after, limit, types) => this.manager.events(id, after, limit, types), entries })) {
+      { events: (id, after, limit, types) => this.manager.events(id, after, limit, types), entries, kept: (run, member, posts) => this.objectiveTests.propose(run.id, member, posts) })) {
       const stored = this.records.get(result.run.id);
       if (stored === undefined) continue;
       const newDrop = result.dropped > 0 && !stored.run.events.some(event => event.text === ENTRY_DROP_TEXT);
@@ -1032,9 +1042,9 @@ export class TeamService {
     } catch { /* Best-effort naming never affects team creation or execution. */ }
   }
   private event(stored: Stored, text: string) { runEvent(stored.run, text); }
-  list(): TeamView[] { return [...this.records.values()].map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
+  list(): TeamView[] { return [...this.records.values()].filter(stored => !stored.run.replay).map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   /** Persisted team records for the read-only Understanding view; performs no tracker or usage refresh. */
-  understandingRecords() { return [...this.records.values()].map(stored => structuredClone(stored.run)); }
+  understandingRecords() { return [...this.records.values()].filter(stored => !stored.run.replay).map(stored => structuredClone(stored.run)); }
   pendingOperation(runId: string): boolean { return Boolean(this.records.get(runId)?.pending); }
   understandingOwnsSession(runId: string, memberId: string, sessionId: string, projectId: string): boolean {
     const stored = this.records.get(runId);
@@ -1042,7 +1052,7 @@ export class TeamService {
       member.memberId === memberId && member.sessionId === sessionId && member.runId === runId));
   }
   /** Status rows for owner alerts. Unlike list(), reading them does not refresh tracker state. */
-  statuses() { return [...this.records.values()].map(stored => ({ id: stored.run.id, title: stored.run.title, status: stored.run.status, reason: stored.run.reason, resumable: this.canResume(stored) && !stored.run.goal && !stored.run.missionId, goal: Boolean(stored.run.goal), mission: Boolean(stored.run.missionId) })); }
+  statuses() { return [...this.records.values()].filter(stored => !stored.run.replay).map(stored => ({ id: stored.run.id, title: stored.run.title, status: stored.run.status, reason: stored.run.reason, resumable: this.canResume(stored) && !stored.run.goal && !stored.run.missionId, goal: Boolean(stored.run.goal), mission: Boolean(stored.run.missionId) })); }
   /**
    * Who a member session's open prompt waits on. "coordinator" while a delegated decision is live
    * for it, "undecided" while the run could still start one, otherwise "user": the prompt stays
@@ -1094,8 +1104,18 @@ export class TeamService {
     this.save(stored);
     return run.parallelism;
   }
-  get(id: string): TeamView { return this.view(this.record(id)); }
-  objectiveRecord(id: string, version?: number) { return runObjectiveView(this.record(id), version); }
+  get(id: string): TeamView { return this.view(this.visible(id)); }
+  objectiveRecord(id: string, version?: number) { return runObjectiveView(this.visible(id), version); }
+  private visible(id: string) { const stored = this.record(id); if (stored.run.replay) throw new TeamError(404, "team-not-found", "This team does not exist."); return stored; }
+  private prefixFor(run: TeamRun) { return this.replays.prefixFor(run, this.config.teams?.commandPrefix); }
+  createForReplay(input: ReplayCreate): Promise<{ runId: string }> { return this.enqueue(() => {
+    const existing = this.records.get(input.trialId); if (existing) return { runId: existing.run.id };
+    const stored: Stored = { run: this.replays.seed(input, timestamp()), fingerprint: digest(input), receipts: {}, prepared: true, root: this.replays.root() };
+    this.records.set(stored.run.id, stored); this.replays.created(stored, input.features); this.save(stored); return { runId: stored.run.id }; }); }
+  replayState(trialId: string): Promise<ReplayState | undefined> { return this.enqueue(() => this.replays.state(this.records.get(trialId))); }
+  endReplay(trialId: string, ending: "timeout" | "void-owner" | "void-host"): Promise<void> { return this.enqueue(() => { const stored = this.records.get(trialId); if (stored?.run.replay) this.replays.end(stored, ending); }); }
+  forgetReplay(trialId: string): Promise<boolean> { return this.enqueue(async () => { const stored = this.records.get(trialId); if (!stored) return true; if (!stored.run.replay || !this.replays.forgettable(stored)) return false; await this.deleteRecord(stored, true); this.records.delete(trialId); return true; }); }
+  replayIds(): string[] { return [...this.records.values()].filter(stored => stored.run.replay).map(stored => stored.run.id); }
   private teamRoot(stored: Stored) {
     const root = stored.root ?? this.config.teams?.workspaceDir;
     if (!root) throw new TeamError(409, "invalid-workspace", "The team workspace is outside its configured root.");
@@ -1123,7 +1143,7 @@ export class TeamService {
     return teams?.publishHeads !== false;
   }
   private publicationTarget(stored: Stored) {
-    if (!this.publishHeadsEnabled()) return undefined;
+    if (!this.publishHeadsEnabled() || stored.run.replay) return undefined;
     const { run } = stored, project = this.config.projects.find(item => item.id === run.projectId);
     const repository = run.delivery?.repository ?? (project?.source?.mode === "github" ? project.source.repository : undefined);
     if (!repository) return undefined;
@@ -1394,7 +1414,7 @@ export class TeamService {
         console.warn("Run events for a removed team were not stored; its record is removed anyway.");
       }
     }
-    try { this.persistRetiredRunId(stored.run.id); }
+    try { if (!stored.run.replay) this.persistRetiredRunId(stored.run.id); }
     catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's deletion tombstone could not be saved; its record was kept."); }
     try { await rmAsync(join(this.directory, `${stored.run.id}.sealed`), { force: true }); }
     catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's record could not be removed."); }
@@ -1409,7 +1429,7 @@ export class TeamService {
   }
   removeRun(id: string): Promise<TeamView> {
     return this.enqueue(async () => {
-      const stored = this.record(id), run = stored.run;
+      const stored = this.visible(id), run = stored.run;
       if (this.needsPublication(stored)) throw new TeamError(409, "head-not-published", "The integrated head must be published to GitHub before this run can be removed.");
       if (this.removingRuns.has(id)) throw new TeamError(409, "team-operation-running", "A background workspace removal is still running. Retry deletion after it settles.");
       this.assertRunRetentionSafe(stored);
@@ -1431,7 +1451,7 @@ export class TeamService {
     });
   }
   rateTask(id: string, taskId: string, input: { requestId: string; score: number; note?: string }) {
-    const stored = this.record(id), task = stored.run.tasks.find(item => item.id === taskId);
+    const stored = this.visible(id), task = stored.run.tasks.find(item => item.id === taskId);
     if (!task) throw new TeamError(404, "task-not-found", "The team task was not found.");
     const fingerprint = digest({ taskId, score: input.score, ...(input.note ? { note: input.note } : {}) });
     const prior = stored.ratings?.[input.requestId];
@@ -1447,7 +1467,7 @@ export class TeamService {
     return task;
   }
   async bundle(id: string) {
-    const stored = this.record(id), run = stored.run;
+    const stored = this.visible(id), run = stored.run;
     if (run.workspaceRemovedAt) throw new TeamError(409, "team-workspace-removed", "This run's workspaces were removed under the retention policy; start a new run.");
     if (run.status !== "ready-for-review") throw new TeamError(409, "team-not-ready", "This team is not ready to pull.");
     const { revision, headCommit, branch, workspace } = run;
@@ -1463,7 +1483,7 @@ export class TeamService {
     return { workspace, branch, head: headCommit };
   }
   activeForProject(projectId: string) {
-    return [...this.records.values()].some(({ run }) => run.projectId === projectId && activeTeamRun(run.status));
+    return [...this.records.values()].some(({ run }) => !run.replay && run.projectId === projectId && activeTeamRun(run.status));
   }
   isActiveRun(id: string) { const stored = this.records.get(id); return Boolean(stored && activeTeamRun(stored.run.status)); }
   create(request: CreateTeam): Promise<TeamView> {
@@ -1583,6 +1603,7 @@ export class TeamService {
       if (routing) run.routing = routing;
       run.intentCheck = intentCheckPin({ autonomy: run.autonomy, setting: project.team.objective?.intentCheck, mission: Boolean(internal?.missionId), handoff: Boolean(internal?.handoff) });
       if (this.config.teams?.blackboard?.tools === true && this.options?.entries?.available()) run.blackboard = { tools: true };
+      if (registerPin({ setting: project.team.objective?.register, mission: Boolean(internal?.missionId), handoff: Boolean(internal?.handoff) })) run.register = "on";
       if (project.team.delivery) {
         if (!lineup || lineup.coordinator.tier !== "strong" || lineup.reviewer.tier !== "strong")
           throw new TeamError(409, "delivery-lineup-required", "Automatic delivery requires a configured strong coordinator and independent strong reviewer.");
@@ -1987,6 +2008,7 @@ export class TeamService {
       // An answer is input, not a change to how the run is held: the hold, and what a release does with it, stay.
       if (held) stored.ownerHalt = mark;
       decision.answer = body.text; decision.answeredBy = by; decision.answeredAt = timestamp();
+      if (decision.recommendation) decision.recommendation.outcome = recommendationOutcome(decision.options, decision.recommendation, body.text);
       if (source) decision.source = source;
       const next = this.intentChecks.answerNote(stored, decision) ?? (held ? "The requesting member will continue in a new attempt when the team resumes." : "The requesting member will continue in a new attempt.");
       this.event(stored, by === "connector" ? `${decisionAnswerLabel(decision)} decision was recorded as delegated agent input. ${next}` : by === "coordinator" ? `A mission coordinator decision was recorded. ${next}` : `A user decision was recorded. ${next}`); this.save(stored);
@@ -1999,7 +2021,7 @@ export class TeamService {
   revokePermissions(id: string, input: Action) {
     const body = teamActionSchema.parse(input);
     return this.enqueue(async () => {
-      const stored = this.record(id), run = stored.run;
+      const stored = this.visible(id), run = stored.run;
       if (!run.permissions && !this.agentEligible(stored) && !run.permissionAgentDecisions?.length)
         throw new TeamError(409, "permissions-not-enabled", "This team has no delegated permission policy to revoke.");
       if (this.replay(stored, "revoke-permissions", body)) return this.view(stored);
@@ -2468,11 +2490,12 @@ export class TeamService {
             const rows = await this.manager.list().catch(() => undefined);
             if (rows) {
               await this.usage?.tick(rows).catch(() => {});
-              await this.limits.reconcile(this.manager, rows).catch(() => {});
+              await this.limits.reconcile(this.manager, rows.filter(row => !learningPurpose(row.purpose))).catch(() => {});
             }
           }
           for (const stored of this.records.values()) await this.step(stored);
           this.drainEntries();
+          this.objectiveTests.drain();
           if (Date.now() - this.entryIngestAt >= ENTRY_INGEST_MS) { this.entryIngestAt = Date.now(); this.ingestEntries(); }
         }
         finally { this.tickQueued = false; }
@@ -2480,7 +2503,7 @@ export class TeamService {
     };
     this.timer = setInterval(tick, 500); this.timer.unref(); tick();
   }
-  close() { this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const timer of this.sampleTimers) clearTimeout(timer); this.sampleTimers.clear(); for (const controller of this.commands.values()) controller.abort(); for (const controller of this.publicationControllers.values()) controller.abort(); for (const controller of this.memberWorkSaveControllers.values()) controller.abort(); for (const controller of this.agentControllers.values()) controller.abort(); this.removeAgentSource?.(); }
+  close() { this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const timer of this.sampleTimers) clearTimeout(timer); this.sampleTimers.clear(); for (const controller of this.commands.values()) controller.abort(); for (const controller of this.publicationControllers.values()) controller.abort(); for (const controller of this.memberWorkSaveControllers.values()) controller.abort(); for (const controller of this.agentControllers.values()) controller.abort(); this.objectiveTests.close(); this.removeAgentSource?.(); }
   /** Settles once work queued before now has finished, so a caller can stop sessions it may still launch. */
   async idle() {
     await this.serial;
@@ -2757,6 +2780,7 @@ export class TeamService {
       this.queueAutomaticDeliveryRecovery(stored, member, member.report.summary);
   }
   private block(stored: Stored, error: unknown, sourceMember?: TeamMember) {
+    if (stored.run.replay) return void this.replays.blocked(stored, error);
     const pending = stored.pending, run = stored.run;
     const code = error instanceof TeamError ? error.code : undefined;
     if (!pending && sourceMember?.role === "delivery" && sourceMember.report?.kind === "blocked" &&
@@ -3102,6 +3126,7 @@ export class TeamService {
     return retryAt !== undefined && now < Date.parse(retryAt);
   }
   private async retire(stored: Stored) {
+    if (stored.run.replay) return;
     try {
       const { run } = stored, retention = this.retentionState(stored), policy = this.config.teams?.retention ?? DEFAULT_TEAM_RETENTION;
       if (run.status === "blocked" || run.status === "paused") await this.refreshOperationCensus(stored);
@@ -3436,6 +3461,7 @@ export class TeamService {
             // A prompt that waits on a person outranks one under review.
             else if (state.attention.state === "needs-you") {
               const holder = this.promptHolder(run, member.sessionId, state.attention.prompt?.id);
+              if (run.replay && holder === "user") return void this.replays.end(stored, "permission");
               run.reason = run.reason === providerInputReason || holder === "user" ? providerInputReason : holder === "agent" ? permissionAgentReason : permissionReviewReason;
             }
             // A coordinator back from an outage runs again only while its review is current; an obsolete or
@@ -3515,6 +3541,7 @@ export class TeamService {
         this.save(stored); return;
       }
       if (activeCount) return;
+      if (run.replay) return void this.replays.step(stored);
       if (run.establishChecks && !run.verification?.checks.length)
         throw new TeamError(409, "verification-required", "Required verification commands have not been established; review cannot start.");
       if (stored.checkHead !== run.headCommit) {
@@ -3992,7 +4019,7 @@ export class TeamService {
     const run = stored.run, runId = run.id, { memberId, sessionId } = member;
     const sessionRoot = realpathSync(member.cwd);
     this.assertRunPath(stored, sessionRoot);
-    const prefix = this.config.teams?.commandPrefix;
+    const prefix = this.prefixFor(run);
     const scratch = member.scratchDirectory ? [member.scratchDirectory] : [];
     // Today's bounded collection: the member's changed paths and the command sources the dialog names.
     const workspace = async () => {
@@ -4420,7 +4447,7 @@ export class TeamService {
       const sessionId = randomUUID(), stopRequestId = randomUUID(), startedAt = timestamp();
       this.operation(stored, "member", async signal => {
         this.assertRunPath(stored, run.workspace);
-        await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
+        await assertMemberReadOnly(member.cwd, member.baseCommit, this.prefixFor(run), signal);
       }, () => {
         member.sessionId = sessionId;
         member.stopRequestId = stopRequestId;
@@ -4490,8 +4517,8 @@ export class TeamService {
     this.save(stored);
     this.operation(stored, "member", async signal => {
       this.assertRunPath(stored, run.workspace);
-      const cwd = await prepareMemberWorkspace(run.workspace, member.memberId, member.baseCommit, this.config.teams?.commandPrefix, signal);
-      await assertMemberReadOnly(cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
+      const cwd = await prepareMemberWorkspace(run.workspace, member.memberId, member.baseCommit, this.prefixFor(run), signal);
+      await assertMemberReadOnly(cwd, member.baseCommit, this.prefixFor(run), signal);
       return cwd;
     }, cwd => {
       member.cwd = cwd; run.members.push(member); decision.status = "reviewing";
@@ -4861,6 +4888,7 @@ export class TeamService {
    * the same working copy. A second stall on the same assignment blocks the run for the owner.
    */
   private async replaceStalledMember(stored: Stored, member: TeamMember) {
+    if (stored.run.replay) return void this.replays.end(stored, "stalled");
     const run = stored.run, minutes = this.stallWindowFor(member) / 60000;
     const earlierStop = Boolean(member.stalledAt);
     member.stalledAt ??= timestamp();
@@ -4914,6 +4942,7 @@ export class TeamService {
    * fallback in the same working copy. The host only stops the member; it never sends it input.
    */
   private async switchLimitedMember(stored: Stored, member: TeamMember, limit: LimitSwitch) {
+    if (stored.run.replay) return void this.replays.end(stored, "void-limit", limit.resetsAt);
     const run = stored.run, provider = member.provider ?? run.provider, name = PROVIDER_NAMES[provider];
     const kind = limit.limit === "credits" ? "credit limit" : "usage limit", resets = limit.resetsAt ? clock(limit.resetsAt) : undefined;
     if (limit.confidence === "corroborated") this.limits.observe({ provider, detectedAt: limit.at, ...(limit.resetsAt ? { resetsAt: limit.resetsAt } : {}), sessionId: member.sessionId, runId: run.id, confidence: "corroborated" });
@@ -4994,7 +5023,7 @@ export class TeamService {
     this.operation(stored, "member", async signal => {
       this.assertRunPath(stored, run.workspace);
       if (continuationHead) await assertMemberReadOnly(run.workspace, continuationHead.headCommit, this.config.teams?.commandPrefix, signal, "integration");
-      const cwd = await prepareMemberWorkspace(run.workspace, member.memberId, member.baseCommit, this.config.teams?.commandPrefix, signal);
+      const cwd = run.replay ? run.workspace : await prepareMemberWorkspace(run.workspace, member.memberId, member.baseCommit, this.config.teams?.commandPrefix, signal);
       this.assertRunPath(stored, cwd);
       if (continuationHead) await assertMemberReadOnly(run.workspace, continuationHead.headCommit, this.config.teams?.commandPrefix, signal, "integration");
       // Bootstrap dependencies exist only after the first implementation. A failed
@@ -5003,11 +5032,11 @@ export class TeamService {
         ? role === "reviewer" ? run.verification?.setup : undefined
         : this.config.projects.find(project => project.id === run.projectId)!.team!.setup;
       if (setup) {
-        const result = await teamCommand(setup, cwd, signal, 600000, this.config.teams?.commandPrefix);
+        const setupCommand = this.replays.setupFor(run, this.config.teams?.commandPrefix); const result = await teamCommand(setup, cwd, signal, 600000, setupCommand.prefix, setupCommand.input);
         if (result.exitCode !== 0 || result.interrupted) throw new TeamError(409, "team-setup-failed", "A member's configured setup command failed. Its isolated workspace was preserved.");
-        await assertMemberReadOnly(cwd, member.baseCommit, this.config.teams?.commandPrefix, signal, "setup");
+        await assertMemberReadOnly(cwd, member.baseCommit, this.prefixFor(run), signal, "setup");
       }
-      if (role !== "permission-coordinator" && this.options?.graphs) {
+      if (role !== "permission-coordinator" && this.options?.graphs && !run.replay) {
         let graph: RepositoryGraphResult;
         try {
           // prepareMemberWorkspace created this checkout from baseCommit; the graph builder resolves
@@ -5032,7 +5061,7 @@ export class TeamService {
     });
   }
   private routerInput(run: TeamRun) {
-    return { publishHeads: this.publishHeadsEnabled(), entryTools: entryToolsFor(run, "implementer"), objectiveDigest: Boolean(run.goal?.record),
+    return { publishHeads: this.publishHeadsEnabled(), entryTools: entryToolsFor(run, "implementer"), objectiveDigest: objectivePromptOf(run),
       limited: this.limits.limited(), featureMap: (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features };
   }
   private queueDeliveryRetryAfterEvidence(stored: Stored, member: TeamMember, report: DeliveryReconciliationReport) {
@@ -5104,7 +5133,7 @@ export class TeamService {
       const attempt = stored.deliveryAttempt;
       if (attempt && (attempt.memberId !== member.memberId || attempt.revision !== member.revision || attempt.headCommit !== member.baseCommit))
         throw new TeamError(409, "delivery-reconciliation-required", "A different delivery attempt is unresolved; inspect the remote pull request before continuing.");
-      await assertMemberReadOnly(stored.run.workspace, member.baseCommit, this.config.teams?.commandPrefix, undefined, "integration");
+      await assertMemberReadOnly(stored.run.workspace, member.baseCommit, this.prefixFor(run), undefined, "integration");
       stored.deliveryAttempt = { memberId: member.memberId, revision: member.revision, headCommit: member.baseCommit };
       if (stored.run.deliveryRecovery && ["planning", "replanning"].includes(stored.run.deliveryRecovery.status)) {
         stored.run.deliveryRecovery.revision = member.revision;
@@ -5117,7 +5146,7 @@ export class TeamService {
     }
     // All launch fields were persisted with the queued member before this call.
     if (!this.hasLaunch(member) && member.role !== "permission-coordinator") {
-      if (!member.scratchDirectory) {
+      if (!member.scratchDirectory && !stored.run.replay) {
         member.scratchDirectory = prepareMemberScratch(stored.run.workspace, member.memberId);
         member.prompt += `\n\nHost-assigned task scratch directory: ${member.scratchDirectory}. Use this directory for temporary scripts, browser probes, and generated check outputs. Keep repository files unchanged in read-only roles. This directory belongs only to your current assignment; do not read other members' scratch files.`;
         this.save(stored);
@@ -5126,7 +5155,7 @@ export class TeamService {
       const intentContext = member.role === "intent-checker" ? this.intentChecks.context(stored, member) : undefined; if (intentContext === null) return;
       const launchSeq = this.options?.entries?.launchMark(stored.run.id);
       const digest = intentContext ? undefined : this.options?.entries?.memberDigest(stored.run, member, launchSeq);
-      const contextBytes = await writeTeamContext(member.cwd, { ...(intentContext ?? teamContext(stored.run, member.contextFeedback, configuredProject, member.role, this.permissionRecoveryHistory(stored.run))), ...(digest ? { entries: digest } : {}), assignment: assignment(member, true), memberBaseCommit: member.baseCommit, scratchDirectory: member.scratchDirectory }, this.config.teams?.commandPrefix);
+      const contextBytes = await writeTeamContext(member.cwd, { ...(intentContext ?? teamContext(stored.run, member.contextFeedback, configuredProject, member.role, this.permissionRecoveryHistory(stored.run))), ...(digest ? { entries: digest } : {}), assignment: assignment(member, true), memberBaseCommit: member.baseCommit, scratchDirectory: member.scratchDirectory }, this.prefixFor(run));
       this.options?.entries?.recordLaunch(stored.run, member, { launchSeq, promptBytes: Buffer.byteLength(member.prompt, "utf8"), contextBytes, digestBytes: digest ? Buffer.byteLength(canonicalJson(digest), "utf8") : 0 });
     }
     // The launch is charged once, right before its session starts. A member whose session exists is a replay.
@@ -5138,10 +5167,10 @@ export class TeamService {
       ...(member.role === "permission-coordinator" ? { continuation: member.continuation } : {}) };
     // The GitHub grant scope (used only with autonomy.boundary.github): delivery pushes the run's head branch, others fetch.
     const delivery = stored.run.delivery;
-    const github = sessionGithubScope({ kind: "team", role: member.role,
+    const github = stored.run.replay ? undefined : sessionGithubScope({ kind: "team", role: member.role,
       repository: delivery?.repository ?? projectGithubRepository(this.config.projects.find(project => project.id === stored.run.projectId)),
       ...(delivery ? { delivery: { mode: delivery.mode, repository: delivery.repository, headBranch: teamDeliveryBranch(stored.run) } } : {}) });
-    try { result = await this.startInProject(stored.run.projectId, () => this.manager.createTeamSession(request, assignment(member), member.cwd, member.modelProfile, stored.root, this.config.teams?.trustWorkspaces === true, {}, github)); }
+    try { result = await this.startInProject(stored.run.projectId, () => this.manager.createTeamSession(request, assignment(member), member.cwd, member.modelProfile, stored.root, this.replays.trusted(stored.run), this.replays.header(stored.run), github)); }
     catch (error) {
       this.fuse?.release(member.sessionId);
       if (error instanceof LaunchHeldError) { this.holdForHostLoad(stored, error.reason); return; }
@@ -5160,7 +5189,7 @@ export class TeamService {
     const replaces = stored.ledgerReplaces?.[member.memberId];
     if (member.role !== "permission-coordinator") this.emitWith(stored, "member.started", [member.memberId],
       { memberId: member.memberId, taskId: member.taskId, revision: member.revision }, () => ({
-        role: member.role, purpose: "work", sessionId: member.sessionId, startedAt: member.startedAt, baseCommit: member.baseCommit,
+        role: member.role, purpose: run.replay?.purpose ?? "work", sessionId: member.sessionId, startedAt: member.startedAt, baseCommit: member.baseCommit,
         ...profileIdentity(member.modelProfile, member.provider ?? run.provider),
         ...(result.status === "unavailable" ? { unavailable: true } : {}), ...(replaces ? { replaces } : {}),
       }));
@@ -5168,7 +5197,7 @@ export class TeamService {
     if (member.role !== "permission-coordinator") {
       const captured = { memberId: member.memberId, taskId: member.taskId, revision: member.revision, workspace: stored.run.workspace,
         baseCommit: member.baseCommit, role: member.role, provider: member.provider ?? run.provider, profile: member.modelProfile,
-        publishHeads: this.publishHeadsEnabled(), prefix: this.config.teams?.commandPrefix, entryTools: Boolean(member.entryTools), objectiveDigest: Boolean(stored.run.goal?.record), routing: routingComponent(stored.run) };
+        publishHeads: this.publishHeadsEnabled(), prefix: this.prefixFor(run), entryTools: Boolean(member.entryTools), objectiveDigest: objectivePromptOf(stored.run), routing: routingComponent(stored.run), shape: run.replay ? "trial" as const : "team" as const };
       this.enrich(stored, async signal => {
         const data = await memberConfiguration(captured, signal);
         if (!data) return undefined;
@@ -5199,17 +5228,18 @@ export class TeamService {
   }
   private consume(stored: Stored, member: TeamMember) {
     const run = stored.run, report = member.report!;
+    if (stored.run.replay && this.replays.consume(stored, member)) return;
     if (member.role === "permission-coordinator") { this.consumePermissionCoordinator(stored, member); return; }
     if (member.role === "intent-checker") { this.intentChecks.consume(stored, member); return; }
     if (report.kind === "blocked") { this.block(stored, new TeamError(409, "agent-blocked", report.summary), member); return; }
     if (report.kind === "question" && ["implementer", "scout", "integrator", "reviewer"].includes(member.role)) {
-      this.block(stored, new TeamError(409, "agent-question", `The ${member.role} requested an owner decision: ${report.question}`), member); return;
+      this.block(stored, new TeamError(409, "agent-question", agentQuestionReason(member.role, report)), member); return;
     }
     if (report.kind === "question") {
       if (run.decisions.length >= 40) { this.block(stored, new TeamError(409, "team-decision-limit", "The team reached its limit of 40 decisions. Review its evidence before starting another team.")); return; }
       member.status = "waiting";
       run.decisions.push({ id: randomUUID(), memberId: member.memberId, revision: run.revision, question: report.question, options: report.options,
-        ...(report.answerMode ? { answerMode: report.answerMode } : {}), createdAt: timestamp() });
+        ...(report.answerMode ? { answerMode: report.answerMode } : {}), ...(report.recommendation ? { recommendation: { ...report.recommendation } } : {}), createdAt: timestamp() });
       const task = member.role === "scout" ? run.discovery?.tasks.find(item => item.id === member.taskId) : run.tasks.find(item => item.id === member.taskId); if (task) task.status = "waiting";
       run.status = "needs-input"; this.event(stored, `${member.title} requested a user decision.`); this.save(stored); return;
     }
@@ -5220,8 +5250,8 @@ export class TeamService {
         this.block(stored, new TeamError(409, "invalid-no-change", invalidNoChangeReason), member); return;
       }
       this.operation(stored, "result", async signal => {
-        await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
-        await assertMemberReadOnly(run.workspace, run.headCommit!, this.config.teams?.commandPrefix, signal, "integration");
+        await assertMemberReadOnly(member.cwd, member.baseCommit, this.prefixFor(run), signal);
+        await assertMemberReadOnly(run.workspace, run.headCommit!, this.prefixFor(run), signal, "integration");
       }, () => {
         run.noChange = { summary: report.summary, evidence: report.evidence }; run.status = "no-change"; run.reason = undefined;
         if (run.recovery) run.recovery.status = "complete";
@@ -5234,7 +5264,7 @@ export class TeamService {
       assertTaskProfiles(run, report.tasks, "scouts");
       if (report.parallelism !== undefined && report.parallelism > capacityCeiling(run))
         throw new TeamError(409, "team-parallelism-limit", `The project manager selected ${report.parallelism} workers, above this run's capacity ceiling of ${capacityCeiling(run)}.`);
-      this.operation(stored, "result", signal => assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal), () => {
+      this.operation(stored, "result", signal => assertMemberReadOnly(member.cwd, member.baseCommit, this.prefixFor(run), signal), () => {
         this.applyProjectManagerCapacity(stored, report.parallelism);
         run.discovery = { revision: run.revision, summary: report.summary, tasks: report.tasks.map(task => ({ ...task, status: "pending" })) };
         run.status = "discovering";
@@ -5251,7 +5281,7 @@ export class TeamService {
     if (report.kind === "findings") {
       const scout = run.discovery?.tasks.find(task => task.id === member.taskId && task.memberId === member.memberId);
       if (!scout || run.discovery?.revision !== run.revision) throw new TeamError(409, "invalid-discovery", "The scout does not belong to the current discovery batch.");
-      this.operation(stored, "result", signal => assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal), () => {
+      this.operation(stored, "result", signal => assertMemberReadOnly(member.cwd, member.baseCommit, this.prefixFor(run), signal), () => {
         scout.status = "complete"; scout.summary = report.summary; scout.evidence = report.evidence;
         this.event(stored, `${member.title} returned evidence without changing its working copy.`);
         this.emitWith(stored, "scout.completed", [member.revision, scout.id], { memberId: member.memberId, taskId: scout.id, revision: member.revision }, () => ({}));
@@ -5264,7 +5294,7 @@ export class TeamService {
         : this.router.routeEscalation({ ...this.routerInput(run), run, task, ownProfileId: member.modelProfile?.id, namedProfileId: named?.id }) ?? named;
       if (!task || task.escalation || !profile || profile.id === member.modelProfile?.id)
         throw new TeamError(409, "invalid-escalation", "An implementer may escalate once to a different profile in the approved escalation pool.");
-      this.operation(stored, "result", signal => assertMemberScope(member.cwd, member.baseCommit, task.paths, this.config.teams?.commandPrefix, signal), () => {
+      this.operation(stored, "result", signal => assertMemberScope(member.cwd, member.baseCommit, task.paths, this.prefixFor(run), signal), () => {
         task.escalation = { ...(member.modelProfile ? { fromProfileId: member.modelProfile.id } : {}), toProfileId: profile.id, reason: report.reason, memberId: member.memberId, at: timestamp() };
         this.emitWith(stored, "task.escalated", [member.revision, task.id], { memberId: member.memberId, taskId: task.id, revision: member.revision }, () => ({
           fromProfileId: task.escalation?.fromProfileId, toProfileId: task.escalation?.toProfileId,
@@ -5303,7 +5333,7 @@ export class TeamService {
       if (run.goal && !report.brief) throw new TeamError(409, "goal-brief-required", "A goal plan must include an evidence-backed brief with acceptance criteria.");
       if (run.goal && report.tasks.some(task => task.paths.some(path => !teamPathAllowed(path, run.goal!.allowedPaths))))
         throw new TeamError(409, "goal-scope-violation", "The plan proposes paths outside the approved goal scope.");
-      this.operation(stored, "result", signal => assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal), () => {
+      this.operation(stored, "result", signal => assertMemberReadOnly(member.cwd, member.baseCommit, this.prefixFor(run), signal), () => {
         if (this.intentChecks.hold(stored, member)) return;
         this.applyProjectManagerCapacity(stored, report.parallelism);
         const remaining = [...report.tasks];
@@ -5355,8 +5385,8 @@ export class TeamService {
           throw new TeamError(409, "delivery-target-mismatch", "The inspected pull request must belong to the configured repository.");
       }
       this.operation(stored, "result", async signal => {
-        await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
-        await assertMemberReadOnly(run.workspace, member.baseCommit, this.config.teams?.commandPrefix, signal, "integration");
+        await assertMemberReadOnly(member.cwd, member.baseCommit, this.prefixFor(run), signal);
+        await assertMemberReadOnly(run.workspace, member.baseCommit, this.prefixFor(run), signal, "integration");
         if (report.disposition !== "no-publication" || report.baseHeadCommit === run.baseCommit) return undefined;
         if (run.goal || run.missionId || run.handoff)
           throw new TeamError(409, "delivery-baseline-parent-owned", "A moved-base delivery recovery requires standalone ownership; preserve this parent branch for explicit reconciliation.");
@@ -5381,10 +5411,10 @@ export class TeamService {
           throw new TeamError(409, "delivery-baseline-source-mismatch", "The host could not confirm the exact reported base head from the pinned source repository and branch.");
         const originalWorkspace = run.workspace;
         const recovered = await prepareRecoveryWorkspaceFromSource(originalWorkspace, source.mirrorPath(run.projectId), randomUUID(), report.baseHeadCommit,
-          this.config.teams?.commandPrefix, signal, run.branch);
+          this.prefixFor(run), signal, run.branch);
         this.assertRunPath(stored, recovered.workspace);
-        await assertMemberReadOnly(recovered.workspace, report.baseHeadCommit, this.config.teams?.commandPrefix, signal, "integration");
-        if (await teamHead(originalWorkspace, this.config.teams?.commandPrefix, signal) !== report.headCommit)
+        await assertMemberReadOnly(recovered.workspace, report.baseHeadCommit, this.prefixFor(run), signal, "integration");
+        if (await teamHead(originalWorkspace, this.prefixFor(run), signal) !== report.headCommit)
           throw new TeamError(409, "delivery-recovery-head-changed", "The original integration head changed while its fresh-base recovery copy was prepared.");
         return { workspace: recovered.workspace, originalWorkspace, baseHeadCommit: report.baseHeadCommit };
       }, result => {
@@ -5450,8 +5480,8 @@ export class TeamService {
           throw new TeamError(409, "delivery-target-mismatch", "The pull request must belong to the configured repository.");
       }
       this.operation(stored, "result", async signal => {
-        await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
-        await assertMemberReadOnly(run.workspace, member.baseCommit, this.config.teams?.commandPrefix, signal, "integration");
+        await assertMemberReadOnly(member.cwd, member.baseCommit, this.prefixFor(run), signal);
+        await assertMemberReadOnly(run.workspace, member.baseCommit, this.prefixFor(run), signal, "integration");
         if (report.kind === "delivery") {
           await this.enqueue(() => {
             if (this.closed) return;
@@ -5460,7 +5490,7 @@ export class TeamService {
               method: "merge", headCommit: report.headCommit, mergeCommit: report.mergeCommit }));
             this.save(stored);
           });
-          await captureDeliveryBaseline(run.workspace, member.cwd, member.baseCommit, report.mergeCommit, this.config.teams?.commandPrefix, signal);
+          await captureDeliveryBaseline(run.workspace, member.cwd, member.baseCommit, report.mergeCommit, this.prefixFor(run), signal);
         }
       }, () => {
         if (report.kind === "delivery-repair") {
@@ -5503,7 +5533,7 @@ export class TeamService {
         this.prepareMember(stored, "reviewer", undefined, `Review rejected: ${problem}\n${evidenceProblems.map(item => item.rule).join("\n")}`); return;
       }
       this.operation(stored, "result", async signal => {
-        await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
+        await assertMemberReadOnly(member.cwd, member.baseCommit, this.prefixFor(run), signal);
       }, () => {
         run.review = { verdict: report.verdict, summary: report.summary, revision: run.revision, ...(report.uiEvidence ? { uiEvidence: report.uiEvidence } : {}), ...(report.acceptance ? { acceptance: report.acceptance } : {}) };
         const rubricKept: { taskId: string; correctness: number; cleanliness: number; extensibility: number; docs: number }[] = [];
@@ -5547,12 +5577,12 @@ export class TeamService {
     if (member.role === "implementer" && !task) throw new TeamError(409, "invalid-task", "The implementer has no current task assignment.");
     run.status = "integrating";
     this.operation(stored, "result", async signal => {
-      const commit = await captureMemberResult(member.cwd, member.baseCommit, member.role === "implementer" ? task!.paths : run.goal?.allowedPaths, this.config.teams?.commandPrefix, signal);
-      const head = commit ? await integrateMemberResult(run.workspace, member.cwd, commit, this.config.teams?.commandPrefix, signal) : run.headCommit!;
+      const commit = await captureMemberResult(member.cwd, member.baseCommit, member.role === "implementer" ? task!.paths : run.goal?.allowedPaths, this.prefixFor(run), signal);
+      const head = commit ? (run.replay ? commit : await integrateMemberResult(run.workspace, member.cwd, commit, this.prefixFor(run), signal)) : run.headCommit!;
       // Diff stats are scorecard evidence only: a launcher that refuses the command must not block integration.
-      const diff = commit ? await teamCommand({ command: "git", args: teamGitArgs(run.workspace, ["diff", "--no-ext-diff", "--no-textconv", "--numstat", "--no-renames", "-z", member.baseCommit, commit, "--"]) }, run.workspace, signal, 30000, this.config.teams?.commandPrefix).catch(() => undefined) : undefined;
+      const diff = commit ? await teamCommand({ command: "git", args: teamGitArgs(run.workspace, ["diff", "--no-ext-diff", "--no-textconv", "--numstat", "--no-renames", "-z", member.baseCommit, commit, "--"]) }, run.workspace, signal, 30000, this.prefixFor(run)).catch(() => undefined) : undefined;
       // Change evidence is best-effort too: a refused or truncated read leaves the field absent and never fails integration.
-      const gitRead = (args: string[]) => teamCommand({ command: "git", args: teamGitArgs(run.workspace, args) }, run.workspace, signal, 30000, this.config.teams?.commandPrefix)
+      const gitRead = (args: string[]) => teamCommand({ command: "git", args: teamGitArgs(run.workspace, args) }, run.workspace, signal, 30000, this.prefixFor(run))
         .then(result => result.exitCode === 0 && !result.interrupted && !result.truncated ? result.stdout : undefined, () => undefined);
       const change = commit ? {
         nameStatus: await gitRead(["diff", "--no-ext-diff", "--no-textconv", "--name-status", "-M", "-z", run.baseCommit, head, "--"]),
@@ -5574,7 +5604,7 @@ export class TeamService {
         this.emitWith(stored, "task.integrated", [member.revision, task.id], { memberId: member.memberId, taskId: task.id, revision: member.revision }, () => ({
           commit, headCommit: head, baseCommit: run.baseCommit, memberBaseCommit: member.baseCommit, diff: task.diffStat,
         }));
-        if (commit && member.role === "implementer") this.captureIntegrated(stored, member, task, commit, head);
+        if (commit && member.role === "implementer" && !run.replay) this.captureIntegrated(stored, member, task, commit, head);
       }
       if (member.role === "integrator" && run.round > 0) {
         this.emitWith(stored, "repair.integrated", [member.revision, run.round], { memberId: member.memberId, revision: member.revision }, () => ({
@@ -5584,7 +5614,7 @@ export class TeamService {
         const repaired = { revision: member.revision, memberId: member.memberId, round: run.round, base: member.baseCommit, workspace: run.workspace };
         if (commit) this.enrich(stored, async signal => {
           const result = await teamCommand({ command: "git", args: teamGitArgs(repaired.workspace, ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", repaired.base, commit, "--"]) },
-            repaired.workspace, signal, 30000, this.config.teams?.commandPrefix).catch(() => undefined);
+            repaired.workspace, signal, 30000, this.prefixFor(run)).catch(() => undefined);
           const list = result && result.exitCode === 0 && !result.interrupted ? changedPathList(result.stdout) : undefined;
           return () => this.emitWith(stored, "repair.paths", [repaired.revision, repaired.round], { memberId: repaired.memberId, revision: repaired.revision }, () => ({
             round: repaired.round, commit, ...(list && !list.truncated ? pathField(list.paths) : { pathsOmitted: true }),

@@ -1,10 +1,18 @@
 import { isAbsolute } from "node:path";
 import { z } from "zod";
+import type { TeamCommand, TeamModelProfile } from "./team-types.js";
 
 export const EVAL_RETENTION_DAYS_DEFAULT = 365;
 export const GRADING_PATHS_MAX = 64;
 export const GUARD_CHECKS_MAX = 8;
 export const GRADER_CANARIES_MAX = 32;
+export const TRIALS_PER_DAY_MAX = 50;
+export const TRIAL_MINUTES_DEFAULT = 45;
+export const TRIAL_MINUTES_MIN = 10;
+export const TRIAL_MINUTES_MAX = 240;
+export const CANDIDATE_PROFILES_MAX = 8;
+export const MEMBER_CANARIES_MAX = 32;
+export const EVAL_AGENT_ARGS_MAX = 64;
 export const FILES_PLACEHOLDER = "{files}";
 export const REPORT_PLACEHOLDER = "{report}";
 
@@ -47,6 +55,10 @@ export const evalProjectSchema = z.object({
   focusedTest: focusedTest.optional(),
   reportFormat: z.enum(["junit", "tap"]).optional(),
   guardChecks: z.array(command).max(GUARD_CHECKS_MAX).optional(),
+  /** Trials a day for a baseline job; the stand-in for a provider budget. Off unless set. */
+  trialsPerDay: z.number().int().min(1).max(TRIALS_PER_DAY_MAX).optional(),
+  /** Minutes a trial's member may run before it ends `timeout`. */
+  trialMinutes: z.number().int().min(TRIAL_MINUTES_MIN).max(TRIAL_MINUTES_MAX).optional(),
 }).strict();
 
 export type EvalProjectSettings = z.infer<typeof evalProjectSchema>;
@@ -59,10 +71,31 @@ const graderSchema = z.object({
   canaries: z.array(absolutePath).max(GRADER_CANARIES_MAX).optional(),
 }).strict();
 
+// The AgentProfile fields a trial member may launch with. Mirrors the host agent profile without importing it.
+const evalAgentSchema = z.object({
+  command: z.string().min(1).max(4096),
+  args: z.array(z.string().max(4096)).max(EVAL_AGENT_ARGS_MAX),
+  appServerCommand: z.string().min(1).max(4096).optional(),
+  appServerArgs: z.array(z.string().max(4096)).max(EVAL_AGENT_ARGS_MAX).optional(),
+  workspaceDir: absolutePath.optional(),
+  sharedWorkspace: z.boolean().optional(),
+}).strict();
+
+const evalMemberSchema = z.object({
+  /** The eval launcher. */
+  prefix: command,
+  /** The launcher's ROOT. Trials live in ROOT/trials. */
+  root: absolutePath,
+  /** Claude Code, Codex, and OpenCode only; Grok and Demo have no eval launch. */
+  agents: z.object({ claude: evalAgentSchema.optional(), codex: evalAgentSchema.optional(), opencode: evalAgentSchema.optional() }).strict(),
+  canaries: z.array(absolutePath).max(MEMBER_CANARIES_MAX).optional(),
+}).strict();
+
 /** The host's replay eval block. Outside the routine approval digest. */
-export const evalHostSchema = z.object({ grader: graderSchema.optional() }).strict();
+export const evalHostSchema = z.object({ grader: graderSchema.optional(), member: evalMemberSchema.optional() }).strict();
 export type EvalHostConfig = z.infer<typeof evalHostSchema>;
 export type EvalGraderConfig = z.infer<typeof graderSchema>;
+export type EvalMemberConfig = z.infer<typeof evalMemberSchema>;
 
 export type ValidationSettings = {
   focusedTest: { command: string; args: string[] }; reportFormat: "junit" | "tap";
@@ -99,4 +132,32 @@ export function validationSettings(project: { source?: { mode: string }; team?: 
       ...(setup ? { setup } : {}),
     },
   };
+}
+
+export type TrialSettings = ValidationSettings & { trialsPerDay: number; trialMinutes: number; candidateProfiles: TeamModelProfile[] };
+
+/** The project as a trial reads it: the eval block carries the candidate profiles, which team-types adds to it. */
+type TrialProject = { source?: { mode: string }; team?: { eval?: EvalProjectSettings & { candidateProfiles?: TeamModelProfile[] }; checks?: { command: string; args: string[] }[]; setup?: { command: string; args: string[] } } } | undefined;
+
+/** What a baseline job needs, or the first missing key in the order source, focusedTest, reportFormat, trialsPerDay. */
+export function trialSettings(project: TrialProject):
+  { settings: TrialSettings } | { missing: "source" | "focusedTest" | "reportFormat" | "trialsPerDay" } {
+  const validation = validationSettings(project);
+  if ("missing" in validation) return validation;
+  const eval_ = project?.team?.eval;
+  if (eval_?.trialsPerDay === undefined) return { missing: "trialsPerDay" };
+  return {
+    settings: {
+      ...validation.settings,
+      trialsPerDay: eval_.trialsPerDay,
+      trialMinutes: eval_.trialMinutes ?? TRIAL_MINUTES_DEFAULT,
+      candidateProfiles: eval_.candidateProfiles ?? [],
+    },
+  };
+}
+
+/** `{ command: prefix.command, args: [...prefix.args, op, "--"] }`, the TeamCommand prefix of one launcher operation. Undefined without eval.member. */
+export function evalCommandPrefix(member: EvalMemberConfig | undefined, op: "exec" | "setup"): TeamCommand | undefined {
+  if (!member) return undefined;
+  return { command: member.prefix.command, args: [...member.prefix.args, op, "--"] };
 }

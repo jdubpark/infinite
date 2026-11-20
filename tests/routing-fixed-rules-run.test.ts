@@ -13,7 +13,12 @@ import { configurationModule, configurationProjector } from "../packages/host/sr
 import { outcomeModule } from "../packages/host/src/outcome-store.js";
 import { outcomeProjector } from "../packages/host/src/outcome-projector.js";
 import { registerRouting, taskDecisions } from "../packages/host/src/routing-store.js";
-import { type TeamAssignment, type TeamLineup, type TeamRun } from "../packages/host/src/team-types.js";
+import { recordDigestSchema, type TeamAssignment, type TeamLineup, type TeamRun } from "../packages/host/src/team-types.js";
+import { promptVersion } from "../packages/host/src/config-identity.js";
+import { recordDigestFor, registerDigestFor } from "../packages/host/src/objective-digest.js";
+import { goalRecord } from "../packages/host/src/objective-record.js";
+import { sealRecord } from "../packages/host/src/objective-write.js";
+import type { ProductGoal } from "../packages/host/src/goal-types.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { prepareMemberWorkspace } from "../packages/host/src/team-workspace.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
@@ -330,6 +335,40 @@ test("an auto member's configuration names the policy digest (control: no pin)",
     await teams.idle();
     const [event] = eventsOfKind(store, f.run.id, "member.configured");
     assert.equal((event!.data as { routing?: string }).routing, "off");
+  } finally { store.close(); f.close(); }
+});
+
+test("a register run's member configuration names the register prompt version", { timeout: 120000 }, async () => {
+  const f = schedulerFixture(), store = openStore(f);
+  try {
+    // A goal run whose pinned digest carries the register: its members' prompts, and so their configurations, have the register shape.
+    const goal = { id: randomUUID(), objective: "Find ranked sources.", successCriteria: "A ranked shortlist", nonGoals: [], allowedPaths: ["."], evidence: [], steering: [] };
+    const created = goalRecord(goal as unknown as ProductGoal, new Date().toISOString(), "created");
+    if (typeof created === "string") throw new Error(`the fixture record is ${created}`);
+    const record = sealRecord(created, { assumptions: [{ id: "a1", statement: "Sources exist.", status: "assumed", origin: "intent-check", criticality: "plan",
+      refutedBy: "No sources", test: { kind: "owner" }, evidence: [], proposals: [] }] }, []);
+    f.run.goal = { id: goal.id, revision: 1, cycle: 1, successCriteria: goal.successCriteria, nonGoals: [], allowedPaths: ["."], evidence: [], previousWork: [],
+      deadlineAt: new Date(Date.now() + 3_600_000).toISOString(), maxMembers: 4,
+      record: recordDigestSchema.parse({ ...recordDigestFor(record, []), register: registerDigestFor(record) }) };
+    f.run.autonomy = "supervised";
+    f.run.lineup = structuredClone(mixedLineup);
+    f.run.status = "implementing";
+    const memberId = randomUUID();
+    f.run.members = [{ ...f.run.members[0]!, memberId, sessionId: randomUUID(), role: "implementer", title: "Implementer: a", taskId: "a",
+      provider: "opencode", modelProfile: mixedLineup.implementers[0]!, status: "queued", cursor: 0, prompt: "Write a.txt" }];
+    f.run.tasks = [{ id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [], status: "running", memberId }];
+    f.writeTeam();
+    const teams = openTeam(f, store);
+    const scheduler = internal(teams);
+    await scheduler.step(scheduler.record(f.run.id));
+    await waitFor(() => eventsOfKind(store, f.run.id, "member.configured").length === 1, "member.configured is stored", 60000);
+    await teams.idle();
+    const [event] = eventsOfKind(store, f.run.id, "member.configured");
+    const publishHeads = (f.config.teams as { publishHeads?: boolean } | undefined)?.publishHeads !== false;
+    const profile = mixedLineup.implementers[0]!;
+    const registerVersion = promptVersion("implementer", "opencode", profile, publishHeads, false, "register");
+    assert.notEqual(registerVersion, promptVersion("implementer", "opencode", profile, publishHeads, false, true), "the register shape has its own prompt version");
+    assert.equal((event!.data as { promptVersion?: string }).promptVersion, registerVersion);
   } finally { store.close(); f.close(); }
 });
 

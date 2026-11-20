@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { captureSettings, evalHostSchema, evalProjectSchema, mineSettings, validationSettings } from "../packages/host/src/eval-config.js";
+import { captureSettings, evalCommandPrefix, evalHostSchema, evalProjectSchema, mineSettings, trialSettings, validationSettings } from "../packages/host/src/eval-config.js";
 import { teamProjectSchema } from "../packages/host/src/team-types.js";
+import { learningPurpose } from "../packages/host/src/types.js";
 
 const base = { checks: [], establishChecks: true } as const;
 
@@ -90,4 +91,57 @@ test("capture is on only for a GitHub project that asks for it", () => {
   assert.equal(captureSettings({ source: github, team: { eval: { capture: false } } }), undefined);
   assert.equal(captureSettings({ source: { mode: "laptop" }, team: { eval: { capture: true } } }), undefined);
   assert.deepEqual(captureSettings({ source: github, team: { eval: { capture: true } } }), { capture: true });
+});
+
+test("the trial settings parse with their limits", () => {
+  const project = (eval_: Record<string, unknown>) => teamProjectSchema.safeParse({ ...base, eval: eval_ });
+  const accepted = (eval_: Record<string, unknown>) => assert.equal(project(eval_).success, true, JSON.stringify(eval_));
+  const refused = (eval_: Record<string, unknown>) => assert.equal(project(eval_).success, false, JSON.stringify(eval_));
+  const profile = (id: string) => ({ id, label: "Trial", provider: "claude", model: "model", effort: "high", tier: "strong" });
+
+  accepted({ trialsPerDay: 1, trialMinutes: 10 });
+  accepted({ trialsPerDay: 50, trialMinutes: 240 });
+  refused({ trialsPerDay: 0 });
+  refused({ trialsPerDay: 51 });
+  refused({ trialMinutes: 9 });
+  refused({ trialMinutes: 241 });
+  accepted({ candidateProfiles: Array.from({ length: 8 }, (_, i) => profile(`p${i}`)) });
+  refused({ candidateProfiles: Array.from({ length: 9 }, (_, i) => profile(`p${i}`)) });
+  refused({ trialsPerDay: 4, unknownKey: 1 });
+
+  const member = { prefix: { command: "sudo", args: ["-n", "-u", "infinite-eval", "--", "/usr/local/libexec/infinite/eval-command"] }, root: "/var/lib/infinite-eval", agents: { claude: { command: "claude", args: [] } } };
+  assert.equal(evalHostSchema.safeParse({ member }).success, true);
+  assert.equal(evalHostSchema.safeParse({ member, unknownKey: 1 }).success, false);
+  assert.equal(evalHostSchema.safeParse({ member: { ...member, unknownKey: 1 } }).success, false);
+  assert.equal(evalHostSchema.safeParse({ member: { ...member, root: "relative/root" } }).success, false);
+  assert.equal(evalHostSchema.safeParse({ member: { ...member, agents: { grok: member.agents.claude } } }).success, false);
+  const args = (count: number) => ({ member: { ...member, agents: { claude: { command: "claude", args: Array.from({ length: count }, () => "-x") } } } });
+  assert.equal(evalHostSchema.safeParse(args(64)).success, true, "64 agent arguments parse");
+  assert.equal(evalHostSchema.safeParse(args(65)).success, false, "65 agent arguments are refused");
+
+  const github = { mode: "github" };
+  const checks = [{ command: "node", args: ["check.js"] }];
+  const focusedTest = { command: "node", args: ["--import", "tsx", "--test", "{files}", "--test-reporter-destination={report}"] };
+  const complete = { focusedTest, reportFormat: "junit" as const };
+  assert.deepEqual(trialSettings({ source: github, team: { checks, eval: complete } }), { missing: "trialsPerDay" });
+  assert.deepEqual(trialSettings({ source: github, team: { checks, eval: { reportFormat: "junit" as const } } }), { missing: "focusedTest" });
+  assert.deepEqual(trialSettings({ source: { mode: "laptop" }, team: { checks, eval: { ...complete, trialsPerDay: 4 } } }), { missing: "source" });
+  const settings = trialSettings({ source: github, team: { checks, eval: { ...complete, trialsPerDay: 4 } } });
+  assert.deepEqual(settings, {
+    settings: { focusedTest, reportFormat: "junit", gradingPaths: [], guardChecks: checks, trialsPerDay: 4, trialMinutes: 45, candidateProfiles: [] },
+  });
+  const withProfiles = trialSettings({ source: github, team: { checks, eval: { ...complete, trialsPerDay: 2, trialMinutes: 60, candidateProfiles: [profile("a")] } } });
+  assert.deepEqual(withProfiles, {
+    settings: { focusedTest, reportFormat: "junit", gradingPaths: [], guardChecks: checks, trialsPerDay: 2, trialMinutes: 60, candidateProfiles: [profile("a")] },
+  });
+
+  const parsed = evalHostSchema.parse({ member }).member;
+  assert.equal(evalCommandPrefix(undefined, "exec"), undefined);
+  assert.deepEqual(evalCommandPrefix(parsed, "setup"), { command: "sudo", args: ["-n", "-u", "infinite-eval", "--", "/usr/local/libexec/infinite/eval-command", "setup", "--"] });
+  assert.deepEqual(evalCommandPrefix(parsed, "exec")!.args.slice(-2), ["exec", "--"]);
+
+  assert.equal(learningPurpose("replay"), true);
+  assert.equal(learningPurpose("gate"), true);
+  assert.equal(learningPurpose("work"), false);
+  assert.equal(learningPurpose(undefined), false);
 });

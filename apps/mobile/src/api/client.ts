@@ -222,11 +222,6 @@ export type ProjectGroupSuggestion = { name: string; repos: string[]; groupIds: 
 export type ProjectGroupList = { groups: ProjectGroup[]; suggestions: ProjectGroupSuggestion[] };
 export type ProjectGroupUpdateRequest = { requestId: string; revision: number; name?: string; repos?: string[]; hidden?: boolean; primary?: string[] };
 export type MissionStatus = "planning" | "working" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "cancelled";
-export type CreateMissionRequest = {
-  requestId: string; groupId: string; title?: string; objective: string; maxSubtasks?: number; maxMinutes?: number;
-};
-export type MissionActionRequest = { requestId: string; revision: number };
-export type MissionTextRequest = MissionActionRequest & { text: string };
 export type MissionSubtask = {
   id: string; repoProjectId: string; title: string; objective: string; size: "solo" | "team"; parallelism: number;
   dependsOn: string[]; status: "queued" | "running" | "done" | "cancelled" | "blocked"; teamId?: string; teamStatus?: TeamStatus;

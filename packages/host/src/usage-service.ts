@@ -120,7 +120,6 @@ export function combineCoverage(parts: readonly { coverage: UsageCoverage; cover
  * a zero to a total. The sealed `usage.sealed` file is read once, when the store first imports it, and never written.
  */
 export class UsageService {
-  private index?: Map<string, UsageRecord[]>;
   private timer?: NodeJS.Timeout;
   private running = false;
   private closed = false;

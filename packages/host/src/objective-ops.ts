@@ -3,7 +3,7 @@ import { commandDigest, CORRECTION_LIMITS } from "./objective-input.js";
 import type { CheckInput, Correction, CorrectionOp, CriterionInput } from "./objective-input.js";
 import { objectiveError, logValue, type ObjectiveErrorCode } from "./objective-record.js";
 import { OBJECTIVE_LIMITS, canonicalBytes, cappedBytes, objectiveRecordSchema, producerOf, recordDigest, thresholdFits } from "./objective-types.js";
-import type { Assumption, Check, Criterion, LogEntry, ObjectiveRecord, Threshold } from "./objective-types.js";
+import type { Check, Criterion, LogEntry, ObjectiveRecord, Assumption } from "./objective-types.js";
 import { recordDigestFor } from "./objective-digest.js";
 import { RECORD_DIGEST_BYTES, recordDigestBytes } from "./team-types.js";
 import type { TeamCommand } from "./team-types.js";

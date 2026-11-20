@@ -15,7 +15,7 @@ import {
 } from "./routing-store.js";
 import { taskFeatures, type FeatureMap, type TaskFeatures } from "./task-features.js";
 import type { DecisionRow, ExploreGuards, RoutingKnobs, RoutingPayload } from "./routing-types.js";
-import type { TeamLineup, TeamModelProfile, TeamRun, TeamTask } from "./team-types.js";
+import type { TeamModelProfile, TeamRun, TeamTask } from "./team-types.js";
 import type { Provider } from "./types.js";
 
 /** The start decision's budget. A decision that takes longer writes no row. */

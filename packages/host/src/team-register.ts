@@ -8,7 +8,6 @@ import type { Proposal, ProposalDrop, ProposalsApplied } from "./objective-propo
 import { applyReceipts } from "./objective-register.js";
 import { passReads, passSubjects, receiptsFor } from "./objective-receipts.js";
 import type { BlobResult, ObjectiveReceipt, PassInput, PassKind, Subject } from "./objective-receipts.js";
-import type { ObjectiveRecord } from "./objective-types.js";
 import { TeamError } from "./team-workspace.js";
 import type { TeamCheck, TeamCommand, TeamMember, TeamRun, TeamStatus } from "./team-types.js";
 

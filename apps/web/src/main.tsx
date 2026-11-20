@@ -27,7 +27,7 @@ import {
   Waypoints,
   WifiOff,
 } from "lucide-react";
-import { useApi, ago, ApiError, isControlRefusal, isMissionManaged, missionManagedLine, names, pendingLabel, sourceLabel, type ControlLease, type Me, type ProjectDetail, type ProjectSourceStatus, type ProjectSyncStatus, type Session, type LogEvent } from "./api";
+import { useApi, ago, ApiError, isControlRefusal, isMissionManaged, missionManagedLine, names, pendingLabel, sourceLabel, type Me, type ProjectDetail, type ProjectSourceStatus, type ProjectSyncStatus, type Session, type LogEvent } from "./api";
 import { clearDrafts, readDraft, settleDraft, useSessionDraft, writeDraft, type PendingInput } from "./drafts";
 import { creations, lifecycles } from "./requests";
 import { MachinePicker, MachineProvider, useMachines } from "./machines";
@@ -38,7 +38,7 @@ import "@fontsource/instrument-sans/400.css";
 import "@fontsource/instrument-sans/500.css";
 import "@fontsource/instrument-sans/600.css";
 import "@xterm/xterm/css/xterm.css";
-import { foreground, useLiveRefresh } from "./live-refresh";
+import { useLiveRefresh } from "./live-refresh";
 import { useSessionControl } from "./session-control";
 import { TeamCreate, TeamDetail, TeamList, TeamPicker, clearTeamRequests, type TeamView } from "./teams";
 import { GoalCreate, GoalDetail, GoalList, GoalPicker, clearGoalRequests, type ProductGoal } from "./goals";

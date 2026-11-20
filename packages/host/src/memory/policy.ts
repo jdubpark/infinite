@@ -274,7 +274,6 @@ export function validateFoundationMutation(value: unknown): MemoryMutation {
   return { requestId, expectedRevision: Number(mutation.expectedRevision), expectedBindingEpoch: Number(mutation.expectedBindingEpoch), op };
 }
 
-export function isMemoryDigest(value: string): boolean { return DIGEST.test(value); }
 
 export function canonicalMemoryDigest(value: unknown): string {
   return createHash("sha256").update(canonicalMemoryJson(value), "utf8").digest("hex");

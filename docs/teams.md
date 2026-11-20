@@ -520,6 +520,8 @@ default. Turning it on needs both caps, in bytes; the configuration refuses
   forgetting a replay) removes `teams/traces/RUN_ID`, also after the setting was
   turned off. Workspace retention leaves traces alone: they last as long as the
   run record. Turning the setting off stops new traces only.
+- **Routines.** The setting is outside the routine approval digest: it changes
+  what the host keeps, not a routine's work.
 
 Who can read a trace depends on the launch model. Traces are plain JSON, not
 sealed like the host's records.

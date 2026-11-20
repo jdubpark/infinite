@@ -12,20 +12,25 @@ import { SHARE_EPSILON } from "./routing-guards.js";
  */
 
 /*
- * Host contract (the wiring phase). The engine is correct only when the host keeps these duties; the simulator
- * (tests/search-engine-sim-script.ts) models them. PROPOSED as a whole: the design states the outcomes, not this order.
+ * Host contract (the wiring phase). The engine is correct only when the host keeps these duties. PROPOSED as a whole:
+ * the design states the outcomes, not this order. The simulator (tests/search-engine-sim-script.ts) models no
+ * persistence boundary, so the replay order, the closed launch and the serialized brake are for host tests at wiring.
  *
  * Persistence order.
  * - The source of every event is durable before the event is delivered: the operation record of a base run, a capture
- *   or a gate run, the member's report or leave, the launch's receipt (below). After a restart the host delivers again
- *   every event whose step it had not saved; an event the search has already applied changes nothing.
+ *   or a gate run, the member's report or leave, the launch's receipt (below). An event the search has already applied
+ *   changes nothing.
  * - Before it acts on any decision, the host saves the step's state as `task.search` together with the step's decisions,
- *   in one write. It acts on each saved decision once, idempotently by search ID (a launch by its number, a count by the
- *   search ID), and after a restart it first finishes the saved decisions it had not finished.
- * - After a restart while the run has no workspace operation open, the host delivers `resume` to every open search and
- *   to every ended search whose `pending` is set. Resume re-derives an open search's base run, waiting captures, head
- *   gate run and pending launch, and an ended search's `cancel-launch`. A restart during a workspace operation of a
- *   search delivers `halt` with reason `restart` instead (Failure modes).
+ *   in one write. It acts on each saved decision once, idempotently by search ID (an operation by its kind and member,
+ *   a launch by its number, a count by the search ID), and after a restart it first finishes the saved decisions it had
+ *   not finished.
+ * - Replay order. After a restart the host next delivers every saved completion whose step it had not saved, in the
+ *   order the completions were recorded, each with the time its source recorded as `now`, and acts on those steps'
+ *   decisions. Capture order is delivery order: captures A then B replayed as B then A would let B win before A is gated.
+ * - Only then, while the run has no workspace operation open, does the host deliver `resume` to every open search and
+ *   to every ended search whose `pending` is set. Resume so derives only the work that no saved completion covers: an
+ *   open search's base run, waiting captures, head gate run and pending launch, and an ended search's `cancel-launch`.
+ *   A restart during a workspace operation of a search delivers `halt` with reason `restart` instead (Failure modes).
  *
  * Launches and receipts.
  * - Before it prepares any member of a `start-challengers`, the host saves the launch: search ID, number and profiles.
@@ -34,8 +39,9 @@ import { SHARE_EPSILON } from "./routing-guards.js";
  *   other: none when the spend fuse refused every profile, or when the launch was cancelled before any member was
  *   prepared. The host saves the receipt before it delivers it, never changes it, and delivers it again after a restart
  *   until the saved search no longer has that launch pending. An empty receipt is delivered like any other.
- * - A `start-challengers` repeated under the same number (at a resume) prepares only the profiles of that launch that
- *   have no saved member; the launch's one receipt names all of its members.
+ * - A saved final receipt closes its launch, empty or not: the host prepares no member for it afterwards, and a
+ *   `start-challengers` repeated under the same number only delivers that receipt again. Before the receipt is saved, a
+ *   repeated launch (at a resume) prepares only the profiles that have no saved member, and the receipt names them all.
  * - On `cancel-launch` the host prepares no further member for that launch. When the launch's receipt is not yet saved,
  *   it saves one naming the members already prepared, possibly none, and delivers it; when it is saved, it delivers
  *   that one. The engine stops every member the receipt names, and the receipt clears `pending`.
@@ -51,6 +57,11 @@ import { SHARE_EPSILON } from "./routing-guards.js";
  * - On `widened` the host appends the class to the project's widened history, once per search ID; on `pause` it stores
  *   the project's pause. Only the owner's resume clears the pause and starts the history again. Both reach the engine as
  *   inputs: `AdmissionFacts.project.paused` and `RunView.widened`.
+ * - The brake is serialized per project. One lock per project covers each step from its read of the history (and of
+ *   the pause, for an admission) until its `widened` and `pause` decisions are applied, and the owner's resume; a
+ *   count saved but not applied is applied before the history is read again. Each count is so judged against the
+ *   history with every count before it: two searches that end at once after eight counts cannot both read eight and
+ *   leave ten with no pause.
  *
  * Time: `view.now` is the host's effective time (Time, below).
  */
@@ -554,7 +565,8 @@ function end(ctx: Ctx, state: "resolved" | "exhausted" | "abandoned" | "measured
 /**
  * PROPOSED: the brake counts every search that widened, whatever its end, by its class (an abandoned one is `none`),
  * exactly once, and every count that leaves it engaged emits `pause`. The pause is the host's stored state, which only
- * the owner's resume clears (Part 8); a later rescue that disengages the brake does not.
+ * the owner's resume clears (Part 8); a later rescue that disengages the brake does not. The host serializes the brake
+ * per project, so `view.widened` holds every count before this one (Host contract).
  */
 function count(ctx: Ctx): void {
   const { s, view, out } = ctx;
@@ -683,7 +695,7 @@ const HANDLERS: Handlers = {
       for (const c of waiting) out.push({ kind: "capture", memberId: c.memberId });
       // PROPOSED (acceptance 16): the launch that waits for its receipt is decided again under its number. The host
       // prepares only the profiles of that launch that have no member yet and answers with one receipt of all of them,
-      // so no profile gets a second member.
+      // so no profile gets a second member; once that receipt is saved, it only delivers it again (Host contract).
       if (s.pending !== undefined) out.push({ kind: "start-challengers", launch: s.launches!, profileIds: [...s.pending], baseCommit: s.baseCommit });
     }
     const head = nextGate(s);

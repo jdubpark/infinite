@@ -72,10 +72,11 @@ import { bump, type Counts, type Rand, rand } from "./outcome-sim-script.js";
  * Each invariant has at least one mutant engine in tests/search-engine-sim.test.ts (an in-process wrapper of `admit` or
  * `step`) that the default corpus must catch through that invariant, and the test names the seed that did.
  *
- * What it does not check: the host's I/O (Git, the operation records, the outcome ledger), the host contract's saves (the
- * model host acts on each step's decisions at once; S13 checks the engine's side, that an event delivered again changes
- * nothing), plan order of integration, and the record events of Part 6. Rule semantics with exact values stay with
- * tests/search-engine.test.ts.
+ * What it does not check: the host's I/O (Git, the operation records, the outcome ledger), plan order of integration,
+ * and the record events of Part 6. It models no persistence boundary: the model host acts on each step's decisions at
+ * once and never crashes between a save and an action, so the host contract's replay order, closed launches and
+ * serialized brake are checked by host tests at wiring; S13 checks only the engine's side, that an event delivered
+ * again changes nothing. Rule semantics with exact values stay with tests/search-engine.test.ts.
  */
 
 const RUNS_PER_SEED = 4;

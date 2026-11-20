@@ -10,40 +10,52 @@ import { bump, type Counts, type Rand, rand } from "./outcome-sim-script.js";
 
 /*
  * A seeded simulator of the search engine's event orders (INF-336). Each seed runs four team runs in one project, so
- * the brake's history carries from run to run. A run has one to three tasks; the dispatcher prepares them at random
- * moments, and each may be admitted to a search. Members act on drawn plans: a result (with a scope violation, an
- * unchanged tree, and a gate outcome) or a leave. The model host keeps one workspace operation slot with a queue, as
- * the design's Part 7 describes: a `live` base run starts only when nothing else waits and yields when something
- * arrives; captures and gate runs wait their turn. Faults: production work arriving, a halt (steer, pause, cancel,
- * block, routing revoked, revision), a restart during an operation (the run blocks), a restart at rest (`resume`), a
- * gate run that the host cannot stop and that reports after its search ended, launches the spend fuse refuses, and the
- * host-load hold, under which queued operations wait.
+ * the brake's history and the project's pause carry from run to run. A run has one to three tasks; the dispatcher
+ * prepares them at random moments, and each may be admitted to a search. Members act on drawn plans: a result (with a
+ * scope violation, an unchanged tree, and a gate outcome) or a leave. The model host keeps one workspace operation slot
+ * with a queue, as the design's Part 7 describes: a `live` base run starts only when nothing else waits and yields when
+ * something arrives; captures and gate runs wait their turn. A launch is prepared and acknowledged on later steps, so
+ * its receipt can cross the hold or the wait or arrive after the end; some receipts arrive twice. Faults: production
+ * work arriving, a halt (steer, pause, cancel, block, routing revoked, revision), a restart during an operation (the run
+ * blocks), a restart at rest (`resume`, which loses launches not yet prepared), a gate run that the host cannot stop
+ * and that reports after its search ended, launches the spend fuse refuses, events of members and launches the search
+ * does not know, the owner pausing and resuming the project, and the host-load hold, under which queued operations wait.
  *
- * Invariants, checked after every step from the engine's output and the simulator's own counters. The simulator's
+ * Invariants, checked after every step from the engine's output and the simulator's own records. The simulator's
  * values are the truth: a mutant engine may see a tampered view, the checks never do.
  * S0 Every state parses with searchStateSchema, and the champion stays first.
- * S1 One winner: at most one `integrate` per search, only in the step that resolves it, naming the winner, whose gate
- *    passed; no other contestant has a pass.
+ * S1 One winner: at most one `integrate` per search, only in the step that resolves it, naming the winner. Against the
+ *    gate results the simulator delivered: a search resolves exactly at the first pass, for that member, and a pass
+ *    delivered before the hold always resolves it.
  * S2 Challengers: a `start-challengers` keeps the run's spareAttempts at 3 or more with them counted, fits the free slot
  *    pairs and `attempts`, names known families distinct from each other and the champion's, none limited, never while
- *    another search is wide; under after-fail only once the champion failed or left, under together also at arming.
- * S3 An ended search never changes and decides nothing; states move only forward along the design's transitions.
+ *    another search is wide or launching; under after-fail only once the champion failed or left, under together also
+ *    at arming; launches are numbered 1, 2, … and never start while one waits for its receipt.
+ * S3 An ended search never changes and decides nothing, except that the first receipt of its pending launch clears it
+ *    and stops every member it names; states move only forward along the design's transitions.
  * S4 Gate runs follow capture order, one outstanding at a time, at the captured commit; when a search resolves, every
  *    result captured before the winner failed its gate.
  * S5 Nothing is gated after a pass, also not in the step that resolves the search.
  * S6 A `live` search that ends releases the task exactly once when exhausted or abandoned and never when resolved; no
- *    challenger works after the end, and no champion works after another result won.
- * S7 Time: an open search is before its hold (and a `measure` one before its window); its hold fits before the deadline;
- *    no challenger works past the wait; every run ends with every search ended.
+ *    acknowledged challenger works after the end, and no champion works after another result won.
+ * S7 Time, from the simulator's own clock and the design's formulas: an open search is before its hold (and a `measure`
+ *    one before its window), and ends by the hold, the wait or the window not before that time; the hold ends a search
+ *    as `exhausted`; the hold and the window fit before the deadline; no challenger works past the wait, and a search
+ *    open past the wait has a capture made before it still waiting for its gate; every run ends with every search ended.
  * S8 Classes follow Part 8 from the winner and the champion's fate; `challenger-first` only under together; no class
  *    on a search that never armed.
  * S9 A search arms only in the step of a failed base run of a `live` search, always does when it stays open, and stays armed.
- * S10 The brake, restated from Part 8: admission refuses with condition 6 while it is engaged, not otherwise; a `pause`
- *    comes exactly from the widened search that engages it.
+ * S10 The brake and the pause: admission refuses with condition 6 exactly while the project is paused, the run has had
+ *    two searches, or a search is wide; a `pause` comes from every widened end that leaves the brake engaged, and the
+ *    pause holds until the owner resumes.
  * S11 A `measure` search starts no challenger, captures nothing, holds and releases nothing; its base run comes at the
  *    boundary; it is `measured` only after a failed base run with the champion's gate result.
  * S12 A restart at rest re-derives the search's queued base run, its waiting captures (a set: none has completed, so
- *    none has an order) and its outstanding gate run, and starts no challenger.
+ *    none has an order), its outstanding gate run, and the launch that waits for its receipt, and starts no new launch.
+ * S13 Receipts: every member of a launch's first receipt is a contestant or stopped in that step; a repeated receipt,
+ *    or an event of a member or launch the search does not know, does what the time passing alone does; no stop ever
+ *    names the winner.
+ * S14 A stop never names a member whose result arrived in an earlier step, and a stopped member is never captured or gated.
  *
  * Each invariant has at least one mutant engine below (an in-process wrapper of `admit` or `step`) that the default
  * corpus must catch through that invariant, and the test names the seed that did.
@@ -81,19 +93,33 @@ const CHALLENGER_LEAVES: readonly (readonly [number, LeaveReason])[] = [[8, "sta
   [3, "question"], [3, "blocked"], [3, "escalate"], [2, "prep-failed"]];
 /** Allowed moves of `state` in one step (Part 4). */
 const NEXT: Readonly<Record<string, readonly string[]>> = {
-  admitting: ["admitting", "armed", "abandoned", "measured"],
+  admitting: ["admitting", "armed", "abandoned", "measured", "exhausted"],
   armed: ["armed", "wide", "resolved", "exhausted", "abandoned"],
   wide: ["wide", "resolved", "exhausted", "abandoned"],
 };
 
+/** Part 3 and Part 7 from the design's text (20 minutes of clone and setup), with the command's effective limit. */
+const gateRun = (p: SearchPolicy, check: number) => 20 + Math.min(p.gateMinutes, check);
+const allowance = (p: SearchPolicy, check: number, baseOpen: boolean) => (p.attempts + (baseOpen ? 1 : 0)) * gateRun(p, check) + p.waitMinutes;
+const windowMinutes = (p: SearchPolicy, searches: number) => 2 * (20 + p.gateMinutes) * searches;
+
 type Engine = { admit: typeof admit; step: typeof step };
 type ResultPlan = { kind: "result"; scope: "ok" | "violation"; empty: boolean; gate: GateOutcome };
 type Plan = ResultPlan | { kind: "leave"; reason: LeaveReason };
-type Member = { id: string; taskId: string; profileId: string; challenger: boolean; working: boolean; plan: Plan };
+type Member = { id: string; taskId: string; profileId: string; challenger: boolean; working: boolean; acked: boolean; plan: Plan };
 type Op = { kind: "base" | "capture" | "gate" | "work"; taskId?: string; memberId?: string; outcome?: GateOutcome; stale?: boolean };
+/** A `start-challengers` decision as the host keeps it: the intent (memory only), the prepared members, receipts due. */
+type Launch = { n: number; profileIds: string[]; intent: boolean; members?: Member[]; acked: boolean; due: number; delay: number };
 /** What the simulator delivered to and received from one search: the facts the checks compare against. */
-type Ledger = { base?: GateOutcome | "yielded"; captures: string[]; outstanding?: string; integrates: number; releases: number };
-type Task = { id: string; prepared: boolean; done: boolean; champion?: Member; search?: SearchState; ledger: Ledger };
+type Ledger = {
+  base?: GateOutcome | "yielded"; captures: string[]; outstanding?: string; integrates: number; releases: number;
+  gated: { memberId: string; outcome: GateOutcome }[]; okCaptures: Map<string, number>; stopped: Set<string>; resulted: Set<string>;
+  hold?: number; wait?: number; window?: number;
+};
+type Task = { id: string; prepared: boolean; done: boolean; champion?: Member; search?: SearchState; ledger: Ledger; launches: Launch[] };
+/** How the simulator produced an event: a gate run that reported after its search ended, a launch receipt, a ghost. */
+type Meta = { stale?: boolean; receipt?: "first" | "again"; ghost?: boolean };
+type Project = { history: SearchClass[]; paused: boolean };
 
 class Violation extends Error {}
 
@@ -130,6 +156,7 @@ const championDone = (s: SearchState) => {
 };
 const at = (ms: number) => new Date(ms).toISOString();
 const commitOf = (memberId: string) => `${memberId}:commit`;
+const newLedger = (): Ledger => ({ captures: [], integrates: 0, releases: 0, gated: [], okCaptures: new Map(), stopped: new Set(), resulted: new Set() });
 
 class RunSim {
   private readonly policy: SearchPolicy;
@@ -149,13 +176,13 @@ class RunSim {
   private loadHold = false;
 
   constructor(private readonly r: Rand, private readonly engine: Engine, private readonly counts: Counts,
-    private readonly history: SearchClass[], private readonly label: string) {
+    private readonly project: Project, private readonly label: string) {
     const live = r.chance(0.75);
     this.policy = searchPolicy({ mode: live ? "live" : "measure", start: r.chance(0.35) ? "together" : "after-fail", share: r.pick([0.1, 0.25]),
       attempts: r.int(2, 4), gateMinutes: r.pick([5, 15, 30, 60]), waitMinutes: r.pick([5, 30, 60, 120]) });
     this.checkMinutes = r.pick([10, 30, 60]);
     const count = r.int(1, 3);
-    this.tasks = Array.from({ length: count }, (_, index) => ({ id: `t${index + 1}`, prepared: false, done: false, ledger: { captures: [], integrates: 0, releases: 0 } }));
+    this.tasks = Array.from({ length: count }, (_, index) => ({ id: `t${index + 1}`, prepared: false, done: false, ledger: newLedger(), launches: [] }));
     // spareAttempts starts at 2 to 9 once every champion is prepared, so the reserve often binds.
     this.limit = 2 * count + 3 + r.int(2, 9);
     this.deadline = r.chance(0.4) ? at(T0 + r.int(150, 700) * MINUTE) : undefined;
@@ -183,6 +210,7 @@ class RunSim {
   }
 
   private finished(): boolean {
+    if (this.tasks.some(task => task.launches.some(l => l.intent || l.due > 0))) return false;
     return this.halted || (this.tasks.every(task => task.prepared && (!task.search || !isOpen(task.search))) && this.current === undefined);
   }
 
@@ -190,12 +218,24 @@ class RunSim {
     return this.tasks.filter(task => task.search !== undefined && isOpen(task.search));
   }
 
+  /** A search the host sees as wide for conditions 6 and 9: `wide`, or open with a launch that waits for its receipt. */
+  private wide(task: Task): boolean {
+    return task.search !== undefined && isOpen(task.search) && (task.search.state === "wide" || task.launches.some(l => !l.acked));
+  }
+
   private actions(): (readonly [number, () => void])[] {
     const list: (readonly [number, () => void])[] = [];
     const later = (minutes: number, action: () => void) => () => { this.clock += minutes * MINUTE; action(); };
+    for (const task of this.tasks) {
+      for (const l of task.launches) {
+        if (l.intent) list.push([8, later(this.r.int(0, 2), () => this.prepareLaunch(task, l))]);
+        else if (l.members !== undefined && l.due > 0) list.push([8, later(l.delay, () => this.receipt(task, l))]);
+      }
+    }
+    if (this.halted) return list;
     const next = this.tasks.find(task => !task.prepared);
     if (next) list.push([3, later(this.r.int(0, 20), () => this.prepare(next))]);
-    for (const m of this.members) if (m.working) list.push([3, later(this.r.int(0, 12), () => this.act(m))]);
+    for (const m of this.members) if (m.working && (!m.challenger || m.acked)) list.push([3, later(this.r.int(0, 12), () => this.act(m))]);
     if (this.current) list.push([4, later(this.r.int(0, 12), () => this.complete())]);
     if (this.boundaryReady()) list.push([4, later(this.r.int(0, 5), () => this.boundary())]);
     if (this.openTasks().length > 0) {
@@ -204,6 +244,7 @@ class RunSim {
       list.push([0.06, later(this.r.int(0, 5), () => this.halt())]);
       list.push([0.12, later(this.r.int(0, 5), () => this.restart())]);
       list.push([0.4, later(this.r.int(0, 5), () => { this.loadHold = !this.loadHold; bump(this.counts, `load-hold:${this.loadHold ? "on" : "off"}`); })]);
+      list.push([0.2, later(this.r.int(0, 5), () => this.ghost())]);
     }
     if (list.length === 0) list.push([1, later(5, () => undefined)]);
     return list;
@@ -211,33 +252,30 @@ class RunSim {
 
   private newMember(task: Task, profileId: string, challenger: boolean): Member {
     const member: Member = { id: challenger ? `${task.id}-c${++this.serial}` : `${task.id}-m`, taskId: task.id, profileId, challenger, working: true,
-      plan: drawPlan(this.r, challenger) };
+      acked: !challenger, plan: drawPlan(this.r, challenger) };
     this.members.push(member);
     return member;
-  }
-
-  private member(id: string): Member {
-    return this.members.find(m => m.id === id)!;
   }
 
   private task(id: string): Task {
     return this.tasks.find(task => task.id === id)!;
   }
 
-  /** The run's spareAttempts: limit − members − tasks not yet integrated − 3. */
+  /** The run's spareAttempts: limit − members − launches not yet prepared − tasks not yet integrated − 3. */
   private spare(): number {
-    return this.limit - this.members.length - this.tasks.filter(task => !task.done).length - 3;
+    const launching = this.tasks.flatMap(task => task.launches).filter(l => l.intent).reduce((sum, l) => sum + l.profileIds.length, 0);
+    return this.limit - this.members.length - launching - this.tasks.filter(task => !task.done).length - 3;
   }
 
   private view(task: Task): RunView {
     const family = FAMILIES[task.champion!.profileId];
     return {
       now: at(this.clock), policy: this.policy, checkMinutes: this.checkMinutes, ...(this.deadline === undefined ? {} : { deadline: this.deadline }),
-      otherSearchWide: this.tasks.some(other => other !== task && other.search?.state === "wide"),
+      otherSearchWide: this.tasks.some(other => other !== task && this.wide(other)),
       ...(family === undefined ? {} : { championFamily: family }),
       candidates: this.candidates.filter(c => c.profileId !== task.champion!.profileId),
       spareWorkerSlots: this.r.pick([0, 1, 1, 2, 3, 4]), freeSessionSlots: this.r.pick([0, 1, 2, 2, 3, 4]),
-      spareAttempts: this.spare(), widened: [...this.history],
+      spareAttempts: this.spare(), widened: [...this.project.history],
     };
   }
 
@@ -247,16 +285,20 @@ class RunSim {
     task.prepared = true;
     const champion = this.newMember(task, this.r.pick(PROFILE_IDS), false);
     task.champion = champion;
-    if (engaged(this.history) && this.r.chance(0.3)) {
-      this.history.length = 0;
-      bump(this.counts, "brake:owner-resume");
+    // The owner resumes a paused project now and then, and the brake's count starts again; rarely the owner pauses it.
+    if (this.project.paused && this.r.chance(0.3)) {
+      Object.assign(this.project, { paused: false, history: [] });
+      bump(this.counts, "owner:resume");
+    } else if (!this.project.paused && this.r.chance(0.02)) {
+      this.project.paused = true;
+      bump(this.counts, "owner:pause");
     }
     const flips = [this.r.chance(0.03), this.r.chance(0.03), this.r.chance(0.03), this.r.chance(0.03), this.r.chance(0.03)];
     const criterion: Criterion = { id: `c-${task.id}`, origin: flips[2] ? "derived" : "owner", statement: "The check passes",
       check: { kind: "command", command: "digest-check" }, producer: "host", threshold: { kind: "pass" },
       pinned: [{ path: "tests/check.test.ts", blob: "a".repeat(40) }], state: "active" };
     const searches = this.tasks.filter(other => other.search !== undefined).length;
-    const wide = this.tasks.some(other => other.search?.state === "wide");
+    const wide = this.tasks.some(other => this.wide(other));
     const facts: AdmissionFacts = {
       id: `${this.label}:${task.id}`, now: at(this.clock), policy: this.policy, checkMinutes: this.checkMinutes,
       routing: { mode: flips[0] ? "shadow" : "auto", coversStart: true, revoked: false },
@@ -266,14 +308,14 @@ class RunSim {
         duel: false, exploratoryStart: flips[4]!, baseCommit: BASE, decisionKey: `decision-${task.id}` },
       champion: { memberId: champion.id, profileId: champion.profileId }, criterion,
       pins: { atBase: !flips[3], owned: false },
-      project: { widened: [...this.history], share: { searches: this.r.int(0, 6), of: this.r.int(20, 99) } },
+      project: { paused: this.project.paused, starts: Array.from({ length: this.r.int(15, 130) }, () => this.r.chance(0.07)) },
     };
     const admission = this.engine.admit(facts);
-    // S10: conditions 1 to 5 hold unless a flip broke one; then condition 6 is the brake, two searches, or a wide search.
+    // S10: conditions 1 to 5 hold unless a flip broke one; then condition 6 is the pause, two searches, or a wide search.
     if (!flips.some(Boolean)) {
-      const six = engaged(this.history) || searches >= 2 || wide;
+      const six = this.project.paused || searches >= 2 || wide;
       const refusedAtSix = !admission.admitted && admission.condition === 6;
-      if (six !== refusedAtSix) this.fail("S10", `admission ${JSON.stringify(admission.admitted ? "admitted" : admission.condition)} with the brake ${engaged(this.history) ? "engaged" : "off"}, ${searches} searches, wide ${wide}`, task);
+      if (six !== refusedAtSix) this.fail("S10", `admission ${JSON.stringify(admission.admitted ? "admitted" : admission.condition)} with the project ${this.project.paused ? "paused" : "not paused"}, ${searches} searches, wide ${wide}`, task);
     }
     if (!admission.admitted) {
       bump(this.counts, `admission:refused-${admission.condition}`);
@@ -322,13 +364,13 @@ class RunSim {
     if (op.kind === "work") return;
     const task = this.task(op.taskId!);
     if (op.kind === "base") return this.deliver(task, { kind: "base", outcome: op.outcome!, ms: this.r.int(1, 900) * 1000 });
-    const m = this.member(op.memberId!);
+    const m = this.members.find(member => member.id === op.memberId)!;
     const plan = m.plan as ResultPlan;
     if (op.kind === "capture") {
       return this.deliver(task, { kind: "captured", memberId: m.id, commit: commitOf(m.id), tree: `${m.id}:tree`, scope: plan.scope, empty: plan.empty });
     }
     if (op.stale) bump(this.counts, "fault:late-gate-result");
-    this.deliver(task, { kind: "gated", memberId: m.id, outcome: plan.gate, ms: this.r.int(1, 900) * 1000 });
+    this.deliver(task, { kind: "gated", memberId: m.id, outcome: plan.gate, ms: this.r.int(1, 900) * 1000 }, { stale: op.stale === true });
   }
 
   private boundaryReady(): boolean {
@@ -366,7 +408,45 @@ class RunSim {
       return;
     }
     bump(this.counts, "fault:restart-resume");
+    // A launch not yet prepared lived in memory; prepared members and their receipts are on record.
+    for (const task of this.tasks) for (const l of task.launches) if (l.members === undefined && l.intent) {
+      l.intent = false;
+      bump(this.counts, "fault:launch-lost");
+    }
     for (const task of this.openTasks()) this.deliver(task, { kind: "resume" });
+  }
+
+  /** An event of a member or a launch the search does not know. */
+  private ghost(): void {
+    const task = this.r.pick(this.openTasks());
+    const id = `${task.id}-ghost`;
+    const event = this.r.pick<SearchEvent>([{ kind: "result", memberId: id }, { kind: "left", memberId: id, reason: "stall" },
+      { kind: "captured", memberId: id, commit: commitOf(id), tree: `${id}:tree`, scope: "ok", empty: false },
+      { kind: "gated", memberId: id, outcome: "pass", ms: 1000 }, { kind: "started", launch: 99, challengers: [{ memberId: id, profileId: "p-gpt" }] }]);
+    bump(this.counts, `fault:unknown-${event.kind}`);
+    this.deliver(task, event, { ghost: true });
+  }
+
+  /** The host prepares a launch's challengers, each through the spend fuse, and owes the launch's receipt. */
+  private prepareLaunch(task: Task, l: Launch): void {
+    l.intent = false;
+    const admitted = l.profileIds.filter(() => !this.r.chance(0.12));
+    bump(this.counts, "fuse:refused", l.profileIds.length - admitted.length);
+    l.members = admitted.map(profileId => this.newMember(task, profileId, true));
+    bump(this.counts, "challengers:started", l.members.length);
+    l.due = this.r.chance(0.2) ? 2 : 1;
+    // Most receipts follow at once; some arrive late enough to cross the hold, the wait, or the end.
+    l.delay = this.r.chance(0.2) ? this.r.int(10, 60) : 0;
+  }
+
+  private receipt(task: Task, l: Launch): void {
+    l.due -= 1;
+    const first = !l.acked;
+    l.acked = true;
+    for (const m of l.members!) m.acked = true;
+    bump(this.counts, first ? (isOpen(task.search!) ? "receipt:first" : "receipt:after-end") : "receipt:repeat");
+    const challengers = l.members!.map(m => ({ memberId: m.id, profileId: m.profileId }));
+    this.deliver(task, { kind: "started", launch: l.n, challengers }, { receipt: first ? "first" : "again" });
   }
 
   // ---- The model host ----------------------------------------------------------------------------------------------
@@ -407,14 +487,6 @@ class RunSim {
     }
   }
 
-  private launch(task: Task, profileIds: string[]): void {
-    const admitted = profileIds.filter(() => !this.r.chance(0.12));
-    bump(this.counts, "fuse:refused", profileIds.length - admitted.length);
-    const challengers = admitted.map(profileId => ({ memberId: this.newMember(task, profileId, true).id, profileId }));
-    bump(this.counts, "challengers:started", challengers.length);
-    this.deliver(task, { kind: "started", challengers });
-  }
-
   private apply(task: Task, decisions: readonly Decision[], event?: SearchEvent): void {
     if (event?.kind === "resume") this.queue = this.queue.filter(op => op.taskId !== task.id);
     for (const d of decisions) {
@@ -424,24 +496,30 @@ class RunSim {
       else if (d.kind === "gate") {
         this.queue.push({ kind: "gate", taskId: task.id, memberId: d.memberId });
         task.ledger.outstanding = d.memberId;
-      } else if (d.kind === "start-challengers") this.launch(task, d.profileIds);
-      else if (d.kind === "stop") for (const id of d.memberIds) this.member(id).working = false;
-      else if (d.kind === "stop-operations") this.dropOps(task);
+      } else if (d.kind === "start-challengers") {
+        // A repeated decision prepares a launch whose intent a restart lost, or delivers the prepared one's receipt again.
+        const known = task.launches.find(l => l.n === d.launch);
+        if (known === undefined) task.launches.push({ n: d.launch, profileIds: [...d.profileIds], intent: true, acked: false, due: 0, delay: 0 });
+        else if (known.members === undefined) known.intent = true;
+        else known.due += 1;
+      } else if (d.kind === "stop") {
+        for (const id of d.memberIds) for (const m of this.members) if (m.id === id) m.working = false;
+      } else if (d.kind === "stop-operations") this.dropOps(task);
       else if (d.kind === "integrate") task.done = true;
       else if (d.kind === "release") {
         task.done = true;
         task.champion!.working = false; // A champion that still works goes on as a single attempt, outside the simulator.
-      }
+      } else if (d.kind === "pause") this.project.paused = true;
     }
   }
 
   /** Delivers one event to a task's search: the engine's step, the checks, then the host acts on the decisions. */
-  private deliver(task: Task, event: SearchEvent): void {
+  private deliver(task: Task, event: SearchEvent, meta: Meta = {}): void {
     const prev = task.search!;
     const view = this.view(task);
     const { search: next, decisions } = this.engine.step(prev, event, view);
     bump(this.counts, `event:${event.kind}`);
-    this.check(task, prev, next, decisions, event, view);
+    this.check(task, prev, next, decisions, event, view, meta);
     task.search = next;
     this.apply(task, decisions, event);
     this.checkAfter(task, prev, next);
@@ -455,49 +533,104 @@ class RunSim {
     if (s.contestants[0]!.memberId !== task.champion!.id) this.fail("S0", "the champion is not first", task);
   }
 
-  private check(task: Task, prev: SearchState, next: SearchState, decisions: readonly Decision[], event: SearchEvent, view: RunView): void {
+  private check(task: Task, prev: SearchState, next: SearchState, decisions: readonly Decision[], event: SearchEvent, view: RunView, meta: Meta): void {
     const fail = (invariant: string, message: string): never => this.fail(invariant, `${message} (event ${JSON.stringify(event)}, decisions ${JSON.stringify(decisions)})`, task);
     const ledger = task.ledger;
+    const now = this.clock;
+    const of = (kind: Decision["kind"]) => decisions.filter(d => d.kind === kind);
+    const stops = decisions.flatMap(d => (d.kind === "stop" ? d.memberIds : []));
     this.parse(next, task);
+
+    // S13
+    if (event.kind === "started" && meta.receipt === "first") {
+      for (const { memberId } of event.challengers) {
+        if (!next.contestants.some(c => c.memberId === memberId) && !stops.includes(memberId)) fail("S13", `${memberId} was acknowledged and is neither a contestant nor stopped`);
+      }
+      if (isOpen(prev) && !isOpen(next)) bump(this.counts, "receipt:crossing-timer");
+    }
+    if ((meta.receipt === "again" || meta.ghost) && !isDeepStrictEqual(this.engine.step(prev, { kind: "tick" }, view), { search: next, decisions })) {
+      fail("S13", "a repeated receipt or an unknown member's event did more than the time passing");
+    }
+    const winner = next.winner ?? prev.winner;
+    if (winner !== undefined && stops.includes(winner)) fail("S13", `the winner ${winner} was stopped`);
+
+    // S14
+    for (const id of stops) {
+      if (ledger.resulted.has(id)) fail("S14", `${id} is stopped after its result arrived`);
+      ledger.stopped.add(id);
+    }
+    for (const d of decisions) {
+      if ((d.kind === "gate" || d.kind === "capture") && ledger.stopped.has(d.memberId)) fail("S14", `${d.memberId} was stopped and is ${d.kind === "gate" ? "gated" : "captured"}`);
+    }
+    if (event.kind === "result" && !meta.ghost) ledger.resulted.add(event.memberId);
+
+    // S3
     if (!isOpen(prev)) {
-      if (!isDeepStrictEqual(prev, next)) fail("S3", `an ended (${prev.state}) search changed`);
-      if (decisions.length > 0) fail("S3", "an ended search decided");
+      const late = event.kind === "started" && meta.receipt === "first";
+      const { pending: _pending, ...settled } = prev;
+      if (!isDeepStrictEqual(next, late ? settled : prev)) fail("S3", `an ended (${prev.state}) search changed`);
+      const want = late && event.challengers.length > 0 ? [{ kind: "stop", memberIds: event.challengers.map(c => c.memberId), reason: "host" }] : [];
+      if (!isDeepStrictEqual(decisions, want)) fail("S3", "an ended search decided");
       return;
     }
     if (!NEXT[prev.state]!.includes(next.state)) fail("S3", `${prev.state} moved to ${next.state}`);
-    const of = (kind: Decision["kind"]) => decisions.filter(d => d.kind === kind);
     const ended = !isOpen(next);
     const live = next.mode === "live";
     const first = next.contestants[0]!;
+    const championId = task.champion!.id;
 
-    // Ledger: the base outcome the engine was given, and captures in the order they completed.
-    if (event.kind === "base") ledger.base = event.outcome;
+    // Ledger: the base outcome the engine was given, captures in the order they completed, delivered gate results.
+    if (!meta.ghost) {
+      if (event.kind === "base") ledger.base = event.outcome;
+      if (event.kind === "gated" && !meta.stale) ledger.gated.push({ memberId: event.memberId, outcome: event.outcome });
+      if (event.kind === "captured" && event.scope === "ok" && !event.empty && !ledger.okCaptures.has(event.memberId)) ledger.okCaptures.set(event.memberId, now);
+    }
     for (const c of next.contestants) {
       if (c.captured !== undefined && prev.contestants.find(p => p.memberId === c.memberId)?.captured === undefined) ledger.captures.push(c.memberId);
     }
     if (ledger.outstanding !== undefined && next.contestants.find(c => c.memberId === ledger.outstanding)?.gate !== undefined) ledger.outstanding = undefined;
 
+    // S7's times, from the events the simulator delivered, its clock, and the design's formulas.
+    if (isOpen(next) && !meta.ghost) {
+      if (live && event.kind === "result" && event.memberId === championId) ledger.hold ??= now + allowance(this.policy, this.checkMinutes, ledger.base === undefined) * MINUTE;
+      const left = live && event.kind === "left" && event.memberId === championId && (event.reason === "stall" || event.reason === "no-report") && ledger.base === "fail";
+      if (left) ledger.hold = now + allowance(this.policy, this.checkMinutes, false) * MINUTE;
+      const failed = (event.kind === "gated" && !meta.stale && event.memberId === championId && event.outcome !== "pass")
+        || (event.kind === "captured" && event.memberId === championId && (event.scope === "violation" || event.empty));
+      if (live && (failed || left)) ledger.wait ??= now + this.policy.waitMinutes * MINUTE;
+      if (!live && event.kind === "boundary") ledger.window ??= now + windowMinutes(this.policy, event.searches) * MINUTE;
+    }
+
     // S1
     const integrates = of("integrate");
     ledger.integrates += integrates.length;
     if (ledger.integrates > 1) fail("S1", "a second integrate");
-    const passes = next.contestants.filter(c => c.gate?.result === "pass");
     if (live) {
-      if (passes.length > 1) fail("S1", "two passing results");
       if ((next.state === "resolved") !== (next.winner !== undefined)) fail("S1", `state ${next.state} with winner ${next.winner}`);
-      if (next.winner !== undefined && passes[0]?.memberId !== next.winner) fail("S1", "the winner did not pass its gate");
       const resolvedNow = next.state === "resolved" && prev.state !== "resolved";
       if (resolvedNow !== (integrates.length === 1) || (resolvedNow && (integrates[0] as { memberId: string }).memberId !== next.winner)) {
         fail("S1", "an integrate outside the step that resolves, or of another member than the winner");
       }
+      const delivered = event.kind === "gated" && !meta.stale && !meta.ghost;
+      const passes = ledger.gated.filter(g => g.outcome === "pass");
+      if (resolvedNow && !(delivered && event.outcome === "pass" && passes.length === 1 && event.memberId === next.winner)) {
+        fail("S1", `resolved for ${next.winner}, the gate results delivered are ${JSON.stringify(ledger.gated)}`);
+      }
+      if (delivered && event.outcome === "pass" && !resolvedNow && !(ledger.hold !== undefined && now >= ledger.hold)) fail("S1", `the pass of ${event.memberId} did not resolve the search`);
     }
 
     // S2
     for (const d of of("start-challengers")) {
       if (d.kind !== "start-challengers") continue;
       if (!live) fail("S11", "a measure search started a challenger");
+      if (task.launches.some(l => l.n === d.launch)) {
+        if (event.kind !== "resume") fail("S2", `launch ${d.launch} decided again outside a restart`);
+        continue;
+      }
+      if (d.launch !== 1 + Math.max(0, ...task.launches.map(l => l.n))) fail("S2", `launch ${d.launch} after ${task.launches.length}`);
+      if (task.launches.some(l => !l.acked)) fail("S2", "a launch while another waits for its receipt");
       const championFamily = FAMILIES[task.champion!.profileId];
-      if (view.otherSearchWide) fail("S2", "challengers while another search is wide");
+      if (view.otherSearchWide) fail("S2", "challengers while another search is wide or launching");
       if (championFamily === undefined) fail("S2", "challengers for a champion of unknown family");
       const families = d.profileIds.map(p => FAMILIES[p]);
       if (families.some(f => f === undefined) || new Set([championFamily, ...families]).size !== families.length + 1) fail("S2", `families ${families.join(",")} against ${championFamily}`);
@@ -532,7 +665,7 @@ class RunSim {
     // S6: releases in this step.
     const releases = of("release");
     ledger.releases += releases.length;
-    if (live && ended && prev.state !== next.state) {
+    if (live && ended) {
       const want = next.state === "resolved" ? 0 : 1;
       if (releases.length !== want) fail("S6", `${releases.length} releases when the search ended ${next.state}`);
       if (releases.some(d => d.kind === "release" && d.memberId !== first.memberId)) fail("S6", "a release of another member than the champion");
@@ -555,13 +688,14 @@ class RunSim {
     // S10: the pause.
     if (ended) {
       const widened = live && next.contestants.length > 1;
-      const expectPause = widened && !engaged(this.history) && engaged([...this.history, next.class ?? "none"]);
+      const expectPause = widened && engaged([...this.project.history, next.class ?? "none"]);
       if (of("pause").length !== (expectPause ? 1 : 0)) fail("S10", `pause ${of("pause").length}, expected ${expectPause ? 1 : 0}`);
-      if (widened) this.history.push(next.class ?? "none");
+      if (widened) this.project.history.push(next.class ?? "none");
       bump(this.counts, `end:${next.state}`);
       bump(this.counts, `reason:${next.endReason ?? next.state}`);
       if (next.class !== undefined) bump(this.counts, `class:${next.class}`);
       if (widened) bump(this.counts, "end:widened");
+      if (expectPause) bump(this.counts, this.project.paused ? "pause:again" : "pause:first");
     } else if (of("pause").length > 0) fail("S10", "a pause from a search that goes on");
 
     // S11
@@ -579,39 +713,53 @@ class RunSim {
       // Captures that have not completed have no order yet, so they compare as a set; gate runs follow capture order.
       const queued = this.queue.filter(op => op.taskId === task.id);
       const want = { base: queued.filter(op => op.kind === "base").length, captures: queued.filter(op => op.kind === "capture").map(op => op.memberId).sort(),
-        gates: queued.filter(op => op.kind === "gate").map(op => op.memberId) };
+        gates: queued.filter(op => op.kind === "gate").map(op => op.memberId), launches: task.launches.filter(l => !l.acked).map(l => [l.n, l.profileIds]) };
       const got = { base: of("base-run").length, captures: of("capture").map(d => (d as { memberId: string }).memberId).sort(),
-        gates: gates.map(d => (d as { memberId: string }).memberId) };
-      if (!isDeepStrictEqual(got, want)) fail("S12", `resume decided ${JSON.stringify(got)}, the host had queued ${JSON.stringify(want)}`);
-      if (of("start-challengers").length > 0) fail("S12", "a restart started a challenger");
+        gates: gates.map(d => (d as { memberId: string }).memberId),
+        launches: of("start-challengers").map(d => (d.kind === "start-challengers" ? [d.launch, d.profileIds] : [])) };
+      if (!isDeepStrictEqual(got, want)) fail("S12", `resume decided ${JSON.stringify(got)}, the host had ${JSON.stringify(want)}`);
     }
   }
 
-  /** Checks on the simulator's members once the host has acted on the step's decisions. */
+  /** Checks on the simulator's members and its own clock once the host has acted on the step's decisions. */
   private checkAfter(task: Task, prev: SearchState, next: SearchState): void {
     const now = this.clock;
-    const challengers = this.members.filter(m => m.taskId === task.id && m.challenger && m.working);
-    if (next.mode === "live" && !isOpen(next) && isOpen(prev)) {
-      if (challengers.length > 0) this.fail("S6", `${challengers.map(m => m.id).join(", ")} still work after the search ended ${next.state}`, task);
-      if (next.state === "resolved" && next.winner !== task.champion!.id && task.champion!.working) this.fail("S6", "the champion works on after a challenger won", task);
+    const ledger = task.ledger;
+    const working = this.members.filter(m => m.taskId === task.id && m.challenger && m.acked && m.working);
+    if (next.mode === "live" && !isOpen(next)) {
+      if (working.length > 0) this.fail("S6", `${working.map(m => m.id).join(", ")} still work after the search ended ${next.state}`, task);
+      if (isOpen(prev) && next.state === "resolved" && next.winner !== task.champion!.id && task.champion!.working) this.fail("S6", "the champion works on after a challenger won", task);
+    }
+    if (isOpen(prev) && !isOpen(next)) {
+      const times: Record<string, number | undefined> = { hold: ledger.hold, wait: ledger.wait, window: ledger.window };
+      const reason = next.endReason ?? "";
+      if (reason in times && (times[reason] === undefined || now < times[reason]!)) this.fail("S7", `ended by its ${reason} at ${at(now)}, before ${times[reason] === undefined ? "any" : at(times[reason]!)}`, task);
+      if (reason === "hold" && next.state !== "exhausted") this.fail("S7", `the hold ended the search as ${next.state}, not exhausted (acceptance 11)`, task);
     }
     if (!isOpen(next)) return;
-    if (next.holdUntil !== undefined && now >= Date.parse(next.holdUntil)) this.fail("S7", `open at ${at(now)}, past its hold or window ${next.holdUntil}`, task);
-    if (next.mode === "live" && this.deadline !== undefined && next.holdUntil !== undefined && Date.parse(next.holdUntil) > Date.parse(this.deadline)) {
-      this.fail("S7", `hold ${next.holdUntil} past the deadline ${this.deadline}`, task);
+    const deadline = this.deadline === undefined ? undefined : Date.parse(this.deadline);
+    if (next.mode === "measure") {
+      if (ledger.window !== undefined && now >= ledger.window) this.fail("S7", `open at ${at(now)}, past its window ${at(ledger.window)}`, task);
+      if (deadline !== undefined && ledger.window !== undefined && ledger.window + this.checkMinutes * MINUTE > deadline) this.fail("S7", "a window that does not fit before the deadline", task);
+      return;
     }
-    if (next.waitUntil !== undefined && now >= Date.parse(next.waitUntil) && challengers.length > 0) {
-      this.fail("S7", `${challengers.map(m => m.id).join(", ")} work past the wait ${next.waitUntil}`, task);
+    if (ledger.hold !== undefined && now >= ledger.hold) this.fail("S7", `open at ${at(now)}, past its hold ${at(ledger.hold)}`, task);
+    if (deadline !== undefined && ledger.hold !== undefined && ledger.hold > deadline) this.fail("S7", `hold ${at(ledger.hold)} past the deadline ${this.deadline}`, task);
+    if (ledger.wait !== undefined && now >= ledger.wait) {
+      if (working.length > 0) this.fail("S7", `${working.map(m => m.id).join(", ")} work past the wait ${at(ledger.wait)}`, task);
+      const waiting = [...ledger.okCaptures].some(([id, t]) => t < ledger.wait! && !ledger.gated.some(g => g.memberId === id));
+      if (!waiting) this.fail("S7", `open past the wait ${at(ledger.wait)} with no capture made before it waiting for its gate`, task);
     }
   }
 }
 
-/** One seed: four runs in one project whose brake history starts from a random prior. */
+/** One seed: four runs in one project whose brake history starts from a random prior, paused when it engages the brake. */
 function simulate(seed: number, engine: Engine, counts: Counts): void {
   const r = rand(seed);
   const history: SearchClass[] = Array.from({ length: r.int(0, 14) }, () => weighted(r, [[25, "rescued"], [35, "none"], [30, "champion-pass"], [10, "challenger-first"]] as const));
+  const project: Project = { history, paused: engaged(history) };
   for (let run = 1; run <= RUNS_PER_SEED; run += 1) {
-    new RunSim(r, engine, counts, history, `seed ${seed} run ${run} (reproduce with SEARCH_SIM_SEED=${seed})`).run();
+    new RunSim(r, engine, counts, project, `seed ${seed} run ${run} (reproduce with SEARCH_SIM_SEED=${seed})`).run();
   }
 }
 
@@ -619,16 +767,17 @@ const sortedCounts = (counts: Counts) => Object.entries(counts).sort(([a], [b]) 
 
 /**
  * Floors for the default corpus at about half of what it produced, so a generator that stops producing a case fails.
- * `challenger-first` ran 9 times: it needs `together`, a widening at arming, and a challenger gated before the champion.
+ * `challenger-first` ran 3 times: it needs `together`, a widening at arming, and a challenger gated before the champion.
  */
 const FLOORS: Readonly<Record<string, number>> = {
-  "admission:admitted": 1400, "admission:refused-6": 270, "admission:refused-7": 270, "brake:owner-resume": 30, "decision:pause": 8,
-  "class:champion-pass": 100, "class:rescued": 23, "class:challenger-first": 4, "class:none": 470,
-  "end:resolved": 130, "end:exhausted": 340, "end:measured": 100, "end:widened": 200, "widen:arming": 100, "widen:champion-done": 130,
-  "reason:all-failed": 64, "reason:wait": 44, "reason:hold": 89, "reason:no-challenger": 157, "reason:deadline": 30, "reason:window": 64,
-  "reason:base-pass": 70, "reason:base-yielded": 77, "reason:champion-stall": 100, "reason:champion-question": 58,
-  "event:boundary": 238, "event:resume": 77, "fault:restart-during-operation": 60, "fault:unstoppable-gate": 21, "fault:late-gate-result": 13,
-  "fuse:refused": 44,
+  "admission:admitted": 1400, "admission:refused-6": 360, "admission:refused-7": 240, "owner:pause": 45, "owner:resume": 60, "decision:pause": 10,
+  "pause:again": 1, "class:champion-pass": 90, "class:rescued": 11, "class:challenger-first": 1, "class:none": 460,
+  "end:resolved": 100, "end:exhausted": 340, "end:measured": 110, "end:widened": 170, "widen:arming": 100, "widen:champion-done": 135,
+  "reason:all-failed": 49, "reason:wait": 90, "reason:hold": 70, "reason:no-challenger": 130, "reason:deadline": 40, "reason:window": 58,
+  "reason:base-pass": 60, "reason:base-yielded": 67, "reason:champion-stall": 88, "reason:champion-question": 54,
+  "event:boundary": 230, "event:resume": 90, "fault:restart-during-operation": 55, "fault:unstoppable-gate": 19, "fault:late-gate-result": 10,
+  "fault:launch-lost": 2, "fuse:refused": 34, "receipt:first": 200, "receipt:repeat": 50, "receipt:after-end": 39, "receipt:crossing-timer": 23,
+  "fault:unknown-started": 50, "fault:unknown-result": 40,
 };
 
 test("the search engine keeps its invariants under seeded event orders", t => {
@@ -648,11 +797,12 @@ test("the search engine keeps its invariants under seeded event orders", t => {
 type Mutation = { name: string; invariant: string; engine: Engine };
 
 const wrapStep = (wrap: (s: SearchState, e: SearchEvent, v: RunView) => ReturnType<typeof step>): Engine => ({ admit, step: wrap });
-const withoutKey = (s: SearchState, key: "holdUntil" | "waitUntil") => {
+const withoutKey = (s: SearchState, key: "holdUntil" | "waitUntil" | "pending") => {
   const copy = { ...s };
   delete copy[key];
   return copy;
 };
+const recorded = (s: SearchState, ids: readonly string[]) => ids.every(id => s.contestants.some(c => c.memberId === id));
 
 const MUTATIONS: readonly Mutation[] = [
   { name: "a recorded gate result loses its time", invariant: "S0", engine: wrapStep((s, e, v) => {
@@ -669,8 +819,19 @@ const MUTATIONS: readonly Mutation[] = [
   { name: "the reserve is off by one", invariant: "S2", engine: wrapStep((s, e, v) => step(s, e, { ...v, spareAttempts: v.spareAttempts + 1 })) },
   { name: "families are ignored", invariant: "S2", engine: wrapStep((s, e, v) => step(s, e, {
     ...v, candidates: v.candidates.map(c => ({ ...c, family: `${c.family ?? "unknown"}-${c.profileId}` })) })) },
-  { name: "attempts is off by one", invariant: "S2", engine: wrapStep((s, e, v) => step(s, e, { ...v, policy: { ...v.policy, attempts: v.policy.attempts + 1 } })) },
+  { name: "attempts is off by one where challengers are counted", invariant: "S2", engine: wrapStep((s, e, v) => {
+    const out = step(s, e, { ...v, policy: { ...v.policy, attempts: v.policy.attempts + 1 } });
+    const real = step(s, e, v);
+    if (real.search.holdUntil !== undefined) out.search.holdUntil = real.search.holdUntil;
+    return out;
+  }) },
   { name: "after-fail starts challengers at arming", invariant: "S2", engine: wrapStep((s, e, v) => step(s.start === "after-fail" ? { ...s, start: "together" } : s, e, v)) },
+  { name: "a champion's failure launches again while a launch waits for its receipt", invariant: "S2", engine: wrapStep((s, e, v) => {
+    if (s.pending === undefined || e.kind === "started" || e.kind === "resume") return step(s, e, v);
+    const out = step(withoutKey(s, "pending"), e, v);
+    out.search.pending ??= s.pending;
+    return out;
+  }) },
   { name: "an ended search records a late gate result", invariant: "S3", engine: wrapStep((s, e, v) => {
     if (isOpen(s) || e.kind !== "gated") return step(s, e, v);
     const search = structuredClone(s);
@@ -693,7 +854,7 @@ const MUTATIONS: readonly Mutation[] = [
   }) },
   { name: "the end of a search stops no challenger", invariant: "S6", engine: wrapStep((s, e, v) => {
     const out = step(s, e, v);
-    out.decisions = out.decisions.filter(d => !(d.kind === "stop" && d.reason === "host"));
+    out.decisions = out.decisions.filter(d => !(d.kind === "stop" && d.reason === "host" && recorded(out.search, d.memberIds)));
     return out;
   }) },
   { name: "an exhausted search does not release the task", invariant: "S6", engine: wrapStep((s, e, v) => {
@@ -716,6 +877,22 @@ const MUTATIONS: readonly Mutation[] = [
     if (out.search.waitUntil === undefined && s.waitUntil !== undefined) out.search.waitUntil = s.waitUntil;
     return out;
   }) },
+  { name: "a result that waits for its capture holds the search open past the wait", invariant: "S7", engine: wrapStep((s, e, v) => {
+    if (s.waitUntil === undefined || !s.contestants.some(c => c.resultAt !== undefined && c.captured === undefined && c.left === undefined)) return step(s, e, v);
+    const out = step(withoutKey(s, "waitUntil"), e, v);
+    out.search.waitUntil ??= s.waitUntil;
+    return out;
+  }) },
+  { name: "the measurement window counts the shorter check limit", invariant: "S7", engine: wrapStep((s, e, v) =>
+    step(s, e, e.kind === "boundary" ? { ...v, policy: { ...v.policy, gateMinutes: Math.min(v.policy.gateMinutes, v.checkMinutes) } } : v)) },
+  { name: "a hold that ends before the arming abandons the search", invariant: "S7", engine: wrapStep((s, e, v) => {
+    const out = step(s, e, v);
+    if (isOpen(s) && out.search.endReason === "hold" && out.search.armedAt === undefined) {
+      out.search.state = "abandoned";
+      out.decisions = out.decisions.map(d => (d.kind === "release" ? { ...d, state: "abandoned" } : d));
+    }
+    return out;
+  }) },
   { name: "challenger-first is labelled rescued", invariant: "S8", engine: wrapStep((s, e, v) => {
     const out = step(s, e, v);
     if (out.search.class === "challenger-first") out.search.class = "rescued";
@@ -723,7 +900,7 @@ const MUTATIONS: readonly Mutation[] = [
   }) },
   { name: "a base run that timed out arms the search", invariant: "S9", engine: wrapStep((s, e, v) =>
     step(s, e.kind === "base" && e.outcome === "timeout" && s.mode === "live" ? { ...e, outcome: "fail" } : e, v)) },
-  { name: "admission ignores the brake", invariant: "S10", engine: { step, admit: f => admit({ ...f, project: { ...f.project, widened: [] } }) } },
+  { name: "admission ignores the project's pause", invariant: "S10", engine: { step, admit: f => admit({ ...f, project: { ...f.project, paused: false } }) } },
   { name: "the pause is dropped", invariant: "S10", engine: wrapStep((s, e, v) => {
     const out = step(s, e, v);
     out.decisions = out.decisions.filter(d => d.kind !== "pause");
@@ -734,6 +911,29 @@ const MUTATIONS: readonly Mutation[] = [
   { name: "a restart forgets the outstanding gate run", invariant: "S12", engine: wrapStep((s, e, v) => {
     const out = step(s, e, v);
     if (e.kind === "resume") out.decisions = out.decisions.filter(d => d.kind !== "gate");
+    return out;
+  }) },
+  { name: "a restart forgets the launch that waits for its receipt", invariant: "S12", engine: wrapStep((s, e, v) => {
+    const out = step(s, e, v);
+    if (e.kind === "resume") out.decisions = out.decisions.filter(d => d.kind !== "start-challengers");
+    return out;
+  }) },
+  { name: "a late receipt's members are not stopped", invariant: "S13", engine: wrapStep((s, e, v) => {
+    const out = step(s, e, v);
+    if (e.kind === "started") out.decisions = out.decisions.filter(d => !(d.kind === "stop" && !recorded(out.search, d.memberIds)));
+    return out;
+  }) },
+  { name: "a receipt the search already had stops the members it names", invariant: "S13", engine: wrapStep((s, e, v) => {
+    const out = step(s, e, v);
+    if (e.kind === "started" && s.pending === undefined && e.challengers.length > 0) out.decisions.push({ kind: "stop", memberIds: e.challengers.map(c => c.memberId), reason: "host" });
+    return out;
+  }) },
+  { name: "a receipt counts for the pending launch whatever its number", invariant: "S13", engine: wrapStep((s, e, v) =>
+    step(s, e.kind === "started" && s.launches !== undefined ? { ...e, launch: s.launches } : e, v)) },
+  { name: "the wait also stops challengers whose result arrived", invariant: "S14", engine: wrapStep((s, e, v) => {
+    const out = step(s, e, v);
+    const reported = out.search.contestants.slice(1).filter(c => c.resultAt !== undefined && c.gate === undefined).map(c => c.memberId);
+    out.decisions = out.decisions.map(d => (d.kind === "stop" && d.reason === "wait" ? { ...d, memberIds: [...d.memberIds, ...reported] } : d));
     return out;
   }) },
 ];

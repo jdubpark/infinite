@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { Criterion } from "./objective-types.js";
-import { shareAllows } from "./routing-guards.js";
+import { SHARE_EPSILON } from "./routing-guards.js";
 
 /*
  * The search engine of search mode (docs/superpowers/specs/2026-11-18-search-mode-design.md, delivery phase 1). It
@@ -38,6 +38,8 @@ export function searchPolicy(saved: TeamSearch = {}): SearchPolicy {
 const GATE_SETUP_MINUTES = 20;
 /** Condition 6. */
 const SEARCHES_PER_RUN = 2;
+/** Condition 7: the share reads the project's last 100 applied `start` decisions. */
+const SHARE_WINDOW = 100;
 /** Condition 11: a challenger starts only while `spareAttempts(run)`, with it counted, stays at this or above. */
 const RESERVE = 3;
 /** Part 8: the brake reads the last 10 widened searches and pauses below 2 rescues. */
@@ -90,6 +92,11 @@ export const searchStateSchema = z.object({
   // PROPOSED: the moment the base run failed and a `live` search armed, when `search.started` is emitted. It is the
   // only record that tells an abandoned search that armed (source `search`) from one that did not (source `production`).
   armedAt: isoTime.optional(),
+  // PROPOSED: the number of `start-challengers` decisions the search made, and the profiles of the last one while it
+  // waits for its receipt. A receipt counts once, and only for that launch; a pending launch outlives the search's end
+  // so that members acknowledged late are stopped (rules 4 and 8).
+  launches: z.number().int().min(1).optional(),
+  pending: z.array(z.string().min(1)).min(1).max(3).optional(),
   // A `live` search: rule 6. PROPOSED: a `measure` search keeps the end of the run's measurement window here (Part 3).
   holdUntil: isoTime.optional(),
   waitUntil: isoTime.optional(),
@@ -112,6 +119,7 @@ export type Candidate = { profileId: string; family?: string; limited: boolean }
 
 /** What the host reads from the run and the project at the moment of an event. */
 export type RunView = {
+  /** The host's clock. The engine never runs it back past a moment the record already holds. */
   now: string;
   /** The run's pinned policy, read through `searchPolicy`. */
   policy: SearchPolicy;
@@ -119,7 +127,7 @@ export type RunView = {
   checkMinutes: number;
   /** The run's deadline, with any approved extension applied. */
   deadline?: string;
-  /** Condition 9: another search of the run is `wide`. */
+  /** Condition 9: another search of the run is `wide`, or has a launch that waits for its receipt. */
   otherSearchWide: boolean;
   /** Condition 9: the champion's family (C19), undefined when unknown. */
   championFamily?: string;
@@ -127,7 +135,7 @@ export type RunView = {
   /** Condition 10: free worker slots that no ready task needs, and free host session slots. */
   spareWorkerSlots: number;
   freeSessionSlots: number;
-  /** Condition 11: `spareAttempts(run)` before any challenger of this widening is counted. */
+  /** Condition 11: `spareAttempts(run)`, counting every launch of the run that waits for its receipt as members. */
   spareAttempts: number;
   /** The classes of the project's widened searches that ended since the owner last resumed searches, oldest first. */
   widened: readonly SearchClass[];
@@ -151,8 +159,8 @@ export type SearchEvent =
   /** A `gate` decision's run ended. */
   | { kind: "gated"; memberId: string; outcome: GateOutcome; ms: number; failures?: number }
   | { kind: "left"; memberId: string; reason: LeaveReason }
-  /** The challengers of a `start-challengers` decision that the spend fuse admitted, with their new member IDs. */
-  | { kind: "started"; challengers: { memberId: string; profileId: string }[] }
+  /** The receipt of launch `launch`: the members the host prepared for it, the challengers the spend fuse admitted. */
+  | { kind: "started"; launch: number; challengers: { memberId: string; profileId: string }[] }
   /** A `measure` champion's result was captured and integrated as today. */
   | { kind: "integrated"; memberId: string; commit: string; tree: string; empty: boolean }
   /** The `measure` boundary (Part 3); `searches` counts the run's `measure` searches waiting at it. */
@@ -170,8 +178,11 @@ export type Decision =
   | { kind: "capture"; memberId: string }
   /** Run the gate at this contestant's captured commit. At most one is outstanding per search, in capture order. */
   | { kind: "gate"; memberId: string; commit: string }
-  /** Prepare challengers on these profiles from the champion's base commit, each through the spend fuse. */
-  | { kind: "start-challengers"; profileIds: string[]; baseCommit: string }
+  /**
+   * Prepare challengers on these profiles from the champion's base commit, each through the spend fuse, and answer with
+   * one `started` receipt for `launch`. The host keeps each launch by search ID and number with the members it prepared.
+   */
+  | { kind: "start-challengers"; launch: number; profileIds: string[]; baseCommit: string }
   | { kind: "stop"; memberIds: string[]; reason: string }
   /** Stop the search's open gate run, and drop its queued captures and gate runs. PROPOSED: every end emits it. */
   | { kind: "stop-operations" }
@@ -179,7 +190,7 @@ export type Decision =
   | { kind: "integrate"; memberId: string }
   /** The champion is handled as if no search had run, once the search's open gate run has closed (rule 8). */
   | { kind: "release"; memberId: string; state: "exhausted" | "abandoned"; reason: string }
-  /** The brake engaged: searches pause for the project until the owner resumes them (Part 8). */
+  /** The brake is engaged: the host pauses searches for the project until the owner resumes them (Part 8). */
   | { kind: "pause" };
 
 export type Step = { search: SearchState; decisions: Decision[] };
@@ -192,8 +203,8 @@ const reached = (now: string, at: string | undefined) => at !== undefined && Dat
 const pastDeadline = (deadline: string | undefined, at: string) => deadline !== undefined && Date.parse(at) > Date.parse(deadline);
 
 /**
- * One gate run: the clone and the setup command, then the command. PROPOSED: the allowance and the measurement window
- * use the command's effective limit, `gateMinutes` or `checkMinutes` when shorter, as the gate run itself does.
+ * One gate run in a `live` allowance: the clone and the setup command, then the command. PROPOSED: the allowance uses
+ * the command's effective limit, `gateMinutes` or `checkMinutes` when shorter, as the gate run itself does (Part 3).
  */
 function gateRunMinutes(policy: SearchPolicy, checkMinutes: number): number {
   return GATE_SETUP_MINUTES + Math.min(policy.gateMinutes, checkMinutes);
@@ -208,9 +219,20 @@ function allowanceMinutes(policy: SearchPolicy, checkMinutes: number, baseOpen: 
   return (policy.attempts + (baseOpen ? 1 : 0)) * gateRunMinutes(policy, checkMinutes) + policy.waitMinutes;
 }
 
-/** The run's measurement window (Part 3): two gate runs for each `measure` search that waits at the boundary. */
-function measureWindowMinutes(policy: SearchPolicy, checkMinutes: number, searches: number): number {
-  return 2 * gateRunMinutes(policy, checkMinutes) * searches;
+/** The run's measurement window (Part 3): 2 × (20 + `gateMinutes`) for each `measure` search that waits at the boundary. */
+function measureWindowMinutes(policy: SearchPolicy, searches: number): number {
+  return 2 * (GATE_SETUP_MINUTES + policy.gateMinutes) * searches;
+}
+
+/**
+ * PROPOSED: the engine's clock never runs back. A step's time is `now`, or the latest moment the record already holds
+ * (the arming, the base run, a result, a gate run) when `now` is earlier, so a host clock that steps back records no
+ * earlier moment and starts no timer from one.
+ */
+function clock(s: SearchState, now: string): string {
+  const held = [s.armedAt, s.base?.at, ...s.contestants.flatMap(c => [c.resultAt, c.gate?.at])].filter((t): t is string => t !== undefined);
+  const latest = Math.max(...held.map(t => Date.parse(t)));
+  return latest > Date.parse(now) ? new Date(latest).toISOString() : now;
 }
 
 // ---- Admission (Part 1, conditions 1 to 7) -----------------------------------------------------------------------
@@ -224,6 +246,7 @@ export type AdmissionFacts = {
   policy: SearchPolicy;
   checkMinutes: number;
   routing: { mode: "off" | "shadow" | "auto"; coversStart: boolean; revoked: boolean };
+  /** `wideSearch`: a search of the run is `wide` or has a launch that waits for its receipt. */
   run: { goalCycle: boolean; recordDigest: boolean; requiredChecks: readonly string[]; searches: number; wideSearch: boolean; deadline?: string };
   task: {
     role: string; risk: "normal" | "elevated"; firstAttempt: boolean; criterionId?: string;
@@ -237,8 +260,12 @@ export type AdmissionFacts = {
   criterion?: Criterion;
   /** Condition 4, which the host reads from Git: every pinned file has its recorded blob at `baseCommit`; a pinned file matches an owned path. */
   pins: { atBase: boolean; owned: boolean };
-  /** The project's brake history (see `RunView.widened`) and its `live` searches among its last 100 applied `start` decisions. */
-  project: { widened: readonly SearchClass[]; share: { searches: number; of: number } };
+  project: {
+    /** The project's stored pause (Part 8): set by a `pause` decision or the owner, cleared only by the owner's resume. */
+    paused: boolean;
+    /** The project's applied `start` decisions before this task's, oldest first: true where the task had a `live` search. */
+    starts: readonly boolean[];
+  };
 };
 
 export type Admission =
@@ -256,10 +283,8 @@ export function admit(f: AdmissionFacts): Admission {
       && c.check.kind === "command" && c.producer === "host" && (c.pinned?.length ?? 0) >= 1 && f.run.requiredChecks.includes(c.check.command)],
     [4, f.pins.atBase && !f.pins.owned],
     [5, !task.duel && !task.exploratoryStart],
-    [6, !f.run.wideSearch && f.run.searches < SEARCHES_PER_RUN && !brakeEngaged(f.project.widened)],
-    // PROPOSED: the share rule is the router's explore share (`shareAllows`): one more search, itself included, keeps
-    // the window's share at or below `share`. The window's count is the host's, of the last 100 applied decisions.
-    [7, !live || (shareAllows({ exploratory: f.project.share.searches, of: f.project.share.of }, policy.share)
+    [6, !f.run.wideSearch && f.run.searches < SEARCHES_PER_RUN && !f.project.paused],
+    [7, !live || (shareFits(f.project.starts, policy.share)
       && !pastDeadline(f.run.deadline, plus(f.now, allowanceMinutes(policy, f.checkMinutes, true))))],
   ];
   const failed = checks.find(([, holds]) => !holds);
@@ -271,6 +296,15 @@ export function admit(f: AdmissionFacts): Admission {
   };
   // `measure` runs its base run at the boundary (Part 3); `live` runs it while the champion works.
   return { admitted: true, search, decisions: live ? [{ kind: "base-run", commit: task.baseCommit }] : [] };
+}
+
+/**
+ * Condition 7's share: with this task's decision the window holds the newest 99 earlier decisions and this one, and
+ * its `live` searches, this one included, stay at or below `share` of it. The router's own window works the same way.
+ */
+function shareFits(starts: readonly boolean[], share: number): boolean {
+  const tail = starts.slice(-(SHARE_WINDOW - 1));
+  return tail.filter(Boolean).length + 1 <= share * (tail.length + 1) + SHARE_EPSILON;
 }
 
 /** Part 8: at least 10 widened searches, and fewer than 2 `rescued` among the last 10. */
@@ -286,42 +320,41 @@ export function outcomeSource(search: SearchState | undefined): "search" | "prod
 // ---- Steps -------------------------------------------------------------------------------------------------------
 
 type Ctx = { s: SearchState; view: RunView; out: Decision[] };
+type Receipt = Extract<SearchEvent, { kind: "started" }>;
 
 export const isOpen = (s: SearchState) => s.state === "admitting" || s.state === "armed" || s.state === "wide";
 const isWorking = (c: Contestant) => c.left === undefined && c.resultAt === undefined;
 /** Failed its gate, or left. */
 const isDone = (c: Contestant) => c.left !== undefined || (c.gate !== undefined && c.gate.result !== "pass");
+const awaitsGate = (c: Contestant) => c.captured !== undefined && c.gate === undefined;
 const champion = (s: SearchState) => s.contestants[0]!;
 const find = (s: SearchState, memberId: string) => s.contestants.find(c => c.memberId === memberId);
-const stop = (members: Contestant[], reason: string): Decision => ({ kind: "stop", memberIds: members.map(c => c.memberId), reason });
+const stop = (members: readonly { memberId: string }[], reason: string): Decision => ({ kind: "stop", memberIds: members.map(c => c.memberId), reason });
 
 /** The captured result whose gate runs next: the earliest capture without a gate result, once the base run failed. */
 function nextGate(s: SearchState): Contestant | undefined {
   if (!isOpen(s) || s.base?.result !== "fail-check") return undefined;
   let head: Contestant | undefined;
   for (const c of s.contestants) {
-    if (c.captured !== undefined && c.gate === undefined && (head === undefined || c.captured < head.captured!)) head = c;
+    if (awaitsGate(c) && (head === undefined || c.captured! < head.captured!)) head = c;
   }
   return head;
 }
 
 /**
- * Applies the time rules at `view.now` (the hold, the wait, the measurement window) and then one event. Returns the
- * next state and what the host does. An ended search does not change. Events that do not apply to the current state
- * (a stale gate result, a second report) change nothing.
+ * Applies the time rules (the hold, the wait, the measurement window) and then one event. Returns the next state and
+ * what the host does. An ended search changes only when the receipt of its pending launch arrives. Events that do not
+ * apply to the current state (a stale gate result, a second report, an unknown member or launch) change nothing.
  */
 export function step(search: SearchState, event: SearchEvent, view: RunView): Step {
   const s = structuredClone(search);
-  const ctx: Ctx = { s, view, out: [] };
-  if (!isOpen(s)) {
-    // PROPOSED: challengers that launched after their search ended are stopped. The host delivers `started` in the
-    // same moment as its `start-challengers`, so only a clock that moved between the two reaches this.
-    if (event.kind === "started" && event.challengers.length > 0) ctx.out.push({ kind: "stop", memberIds: event.challengers.map(c => c.memberId), reason: "host" });
-    return { search: s, decisions: ctx.out };
-  }
+  const ctx: Ctx = { s, view: { ...view, now: clock(search, view.now) }, out: [] };
   const head = nextGate(s)?.memberId;
-  advance(ctx);
-  if (isOpen(s)) HANDLERS[event.kind](ctx, event as never);
+  // PROPOSED: the time rules apply before the step's event, a halt included: a hold that has passed ends the search as
+  // `exhausted` before a steer in the same step could abandon it.
+  if (isOpen(s)) advance(ctx);
+  if (event.kind === "started") receive(ctx, event);
+  else if (isOpen(s)) HANDLERS[event.kind](ctx, event as never);
   // PROPOSED: one gate decision is outstanding per search; the next is decided when its result arrives, so the engine,
   // not the host's queue, keeps capture order.
   const next = event.kind === "resume" ? undefined : nextGate(s);
@@ -329,7 +362,7 @@ export function step(search: SearchState, event: SearchEvent, view: RunView): St
   return { search: s, decisions: ctx.out };
 }
 
-/** The hold, the wait and the measurement window at `view.now`; when one step passes both, the earlier applies first. */
+/** The hold, the wait and the measurement window at `now`; when one step passes both, the earlier applies first. */
 function advance(ctx: Ctx): void {
   const { s, view } = ctx;
   if (s.mode === "measure") {
@@ -342,28 +375,28 @@ function advance(ctx: Ctx): void {
     if (working.length > 0) ctx.out.push(stop(working, "wait"));
     settle(ctx);
   }
-  if (isOpen(s) && reached(view.now, s.holdUntil)) {
-    // PROPOSED: a hold that ends before the base run did (the champion's result waited behind an open base run)
-    // abandons the search, which never armed, so it has no class and its rows keep source `production`.
-    end(ctx, s.armedAt === undefined ? "abandoned" : "exhausted", "hold");
-  }
+  // Acceptance 11: at `holdUntil` the search is `exhausted`, also when the base run has not ended.
+  if (isOpen(s) && reached(view.now, s.holdUntil)) end(ctx, "exhausted", "hold");
 }
 
 /**
- * Rule 7 for a `wide` search: every contestant failed its gate or left. The wait's own rule ("no captured result waits
- * for its gate") reduces to this once the wait has stopped every working challenger. PROPOSED: a result that arrived
- * before `waitUntil` and still waits for its capture also waits, so its capture and gate run follow (rule 6 names only
- * captured results).
+ * Rule 7: every contestant failed its gate or left, or `waitUntil` has passed and no captured result waits for its gate
+ * (a result that still waits for its capture does not count). The reason is `wait` when the wait decided it.
  */
 function settle(ctx: Ctx): void {
-  const { s } = ctx;
-  if (s.state !== "wide" || !s.contestants.every(isDone)) return;
-  end(ctx, "exhausted", s.contestants.some(c => c.left === "wait") ? "wait" : "all-failed");
+  const { s, view } = ctx;
+  if (!isOpen(s) || s.state === "admitting") return;
+  const allDone = s.state === "wide" && s.contestants.every(isDone);
+  const waitOver = reached(view.now, s.waitUntil) && !s.contestants.some(awaitsGate);
+  if (allDone || waitOver) end(ctx, "exhausted", !allDone || s.contestants.some(c => c.left === "wait") ? "wait" : "all-failed");
 }
 
 /** Conditions 9 to 12 and rule 3. `arming`: `start: "together"` at the failed base run, where nothing ends (rule 1). */
 function widen(ctx: Ctx, arming: boolean): void {
   const { s, view } = ctx;
+  // PROPOSED: one launch at a time. A champion that fails or leaves while the launch of arming waits for its receipt
+  // starts no second one; the receipt decides, and an empty one ends the search under rule 3.
+  if (s.pending !== undefined) return;
   const rest = s.holdUntil ?? plus(view.now, allowanceMinutes(view.policy, view.checkMinutes, false));
   if (pastDeadline(view.deadline, rest)) {
     // CONTRADICTION: condition 12 failing at widening makes "none can start", which rule 3 ends as `exhausted`; Part 7
@@ -373,8 +406,11 @@ function widen(ctx: Ctx, arming: boolean): void {
     return;
   }
   const profileIds = pickChallengers(s, view);
-  if (profileIds.length > 0) ctx.out.push({ kind: "start-challengers", profileIds, baseCommit: s.baseCommit });
-  else if (!arming) end(ctx, "exhausted", "no-challenger");
+  if (profileIds.length > 0) {
+    s.launches = (s.launches ?? 0) + 1;
+    s.pending = profileIds;
+    ctx.out.push({ kind: "start-challengers", launch: s.launches, profileIds, baseCommit: s.baseCommit });
+  } else if (!arming) end(ctx, "exhausted", "no-challenger");
 }
 
 /** Part 2 order under conditions 9 to 11: one challenger per free slot pair, up to `attempts − 1`, inside the reserve. */
@@ -390,6 +426,34 @@ function pickChallengers(s: SearchState, view: RunView): string[] {
     picked.push(candidate.profileId);
   }
   return picked;
+}
+
+/**
+ * The receipt of the pending launch, after the time rules (rules 4, 6 and 8). A receipt of another launch, or a second
+ * one, changes nothing, so a repeated receipt never stops a member twice or a winner at all. Members of the launch's
+ * profiles join an open search; every other member it names is stopped at once: all of them once the search has ended,
+ * and, PROPOSED, one on a profile the launch did not name. Members that join after `waitUntil` are stopped by the wait.
+ */
+function receive(ctx: Ctx, e: Receipt): void {
+  const { s, view, out } = ctx;
+  if (s.pending === undefined || e.launch !== s.launches) return;
+  const profiles = [...s.pending];
+  delete s.pending;
+  const fresh = e.challengers.filter((c, index) => find(s, c.memberId) === undefined && e.challengers.findIndex(o => o.memberId === c.memberId) === index);
+  const joining = !isOpen(s) ? [] : fresh.filter(c => {
+    const index = profiles.indexOf(c.profileId);
+    if (index >= 0) profiles.splice(index, 1);
+    return index >= 0;
+  });
+  const away = fresh.filter(c => !joining.includes(c));
+  if (away.length > 0) out.push(stop(away, "host"));
+  if (!isOpen(s)) return;
+  const cutoff = reached(view.now, s.waitUntil);
+  for (const { memberId, profileId } of joining) s.contestants.push({ memberId, profileId, ...(cutoff ? { left: "wait" } : {}) });
+  if (cutoff && joining.length > 0) out.push(stop(joining, "wait"));
+  if (joining.length > 0) s.state = "wide";
+  else if (isDone(champion(s))) return end(ctx, "exhausted", "no-challenger");
+  settle(ctx);
 }
 
 /** A gate result that is not a pass. A failed champion starts the wait and widens (rules 3 and 6). */
@@ -429,15 +493,18 @@ function end(ctx: Ctx, state: "resolved" | "exhausted" | "abandoned" | "measured
   if (running.length > 0) out.push(stop(running, "host"));
   if (state === "resolved") out.push({ kind: "integrate", memberId: s.winner! });
   else out.push({ kind: "release", memberId: champion(s).memberId, state: state === "exhausted" ? "exhausted" : "abandoned", reason: reason ?? state });
-  // PROPOSED: the brake counts every search that widened, whatever its end, by its class (an abandoned one is `none`).
-  if (s.contestants.length > 1 && !brakeEngaged(view.widened) && brakeEngaged([...view.widened, s.class ?? "none"])) out.push({ kind: "pause" });
+  // PROPOSED: the brake counts every search that widened, whatever its end, by its class (an abandoned one is `none`),
+  // and every end that leaves it engaged emits `pause`. The pause is the host's stored state, which only the owner's
+  // resume clears (Part 8); a later rescue that disengages the brake does not.
+  if (s.contestants.length > 1 && brakeEngaged([...view.widened, s.class ?? "none"])) out.push({ kind: "pause" });
 }
 
 /** Rule 2's leaves of the champion; its other leaves abandon the search (rule 9). */
 const CHAMPION_LEAVES: ReadonlySet<LeaveReason> = new Set(["stall", "no-report"]);
 const BASE_REASONS = { pass: "base-pass", timeout: "base-timeout", "setup-failed": "base-setup" } as const;
 
-type Handlers = { [K in SearchEvent["kind"]]: (ctx: Ctx, event: Extract<SearchEvent, { kind: K }>) => void };
+type Handled = Exclude<SearchEvent["kind"], "started">;
+type Handlers = { [K in Handled]: (ctx: Ctx, event: Extract<SearchEvent, { kind: K }>) => void };
 
 const HANDLERS: Handlers = {
   base(ctx, e) {
@@ -475,6 +542,8 @@ const HANDLERS: Handlers = {
     const { s, view } = ctx;
     const c = find(s, e.memberId);
     if (s.state === "admitting" || c === undefined || c.resultAt === undefined || c.captured !== undefined || c.left !== undefined) return;
+    // PROPOSED: a capture that completes at or after `waitUntil` is not gated; rule 6 gates the results captured before it.
+    if (reached(view.now, s.waitUntil)) return;
     Object.assign(c, { captured: 1 + Math.max(0, ...s.contestants.map(other => other.captured ?? 0)), commit: e.commit, tree: e.tree });
     if (e.scope === "violation" || e.empty) {
       record(c, e.scope === "violation" ? "fail-scope" : "fail-empty", view.now);
@@ -515,17 +584,6 @@ const HANDLERS: Handlers = {
     else settle(ctx);
   },
 
-  started(ctx, e) {
-    const { s } = ctx;
-    if (s.state !== "armed") return;
-    if (e.challengers.length === 0) {
-      if (isDone(champion(s))) end(ctx, "exhausted", "no-challenger");
-      return;
-    }
-    for (const { memberId, profileId } of e.challengers) s.contestants.push({ memberId, profileId });
-    s.state = "wide";
-  },
-
   integrated(ctx, e) {
     const { s, view } = ctx;
     const c = champion(s);
@@ -539,7 +597,7 @@ const HANDLERS: Handlers = {
   boundary(ctx, e) {
     const { s, view, out } = ctx;
     if (s.mode !== "measure" || s.holdUntil !== undefined || champion(s).captured === undefined) return;
-    const window = measureWindowMinutes(view.policy, view.checkMinutes, e.searches);
+    const window = measureWindowMinutes(view.policy, e.searches);
     if (pastDeadline(view.deadline, plus(view.now, window + view.checkMinutes))) return end(ctx, "abandoned", "deadline");
     s.holdUntil = plus(view.now, window);
     out.push({ kind: "base-run", commit: s.baseCommit });
@@ -558,7 +616,11 @@ const HANDLERS: Handlers = {
       // Captures that have not completed have no order yet.
       const waiting = s.contestants.filter(c => c.resultAt !== undefined && c.captured === undefined && c.left === undefined);
       for (const c of waiting) out.push({ kind: "capture", memberId: c.memberId });
-      if (s.state === "armed" && isDone(champion(s))) widen(ctx, false);
+      // PROPOSED (acceptance 16): the launch that waits for its receipt is decided again under its number. The host
+      // prepares only the profiles of that launch that have no member yet and answers with one receipt of all of them,
+      // so no profile gets a second member. After a restart it also delivers the receipt of every launch it prepared
+      // and did not acknowledge, for an ended search too, which then stops those members.
+      if (s.pending !== undefined) out.push({ kind: "start-challengers", launch: s.launches!, profileIds: [...s.pending], baseCommit: s.baseCommit });
     }
     const head = nextGate(s);
     if (head !== undefined) out.push({ kind: "gate", memberId: head.memberId, commit: head.commit! });

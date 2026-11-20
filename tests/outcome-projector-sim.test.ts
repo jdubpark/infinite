@@ -491,7 +491,8 @@ test("a repair answer with no commit after a cancel settle recounts the summary'
       event(4, "run.settled", [1, "cancelled", "t"], {}, { status: "cancelled" }),
       event(5, "repair.integrated", [1, 1], { memberId: "g1" }, { round: 1, headCommit: head, baseCommit: base }),
     ]);
-    // Shown: { total: 1, attributed: 0, unattributed: 0, unknown: 1 }; the round is resolved and its one link is clear.
+    // Before INF-316 the summary kept { total: 1, attributed: 0, unattributed: 0, unknown: 1 } here; the round is resolved
+    // and its one link is clear, so the recount gives { total: 1, attributed: 0, unattributed: 1, unknown: 0 }.
     live.store.read(db => assert.deepEqual(readSummary(db, "run-d")!.payload.rounds, roundTotals(db, "run-d")));
   } finally {
     live?.store.close();

@@ -75,6 +75,16 @@ export const githubBoundarySchema = z.object({
   keyPath: z.string().refine(isAbsolute, "The GitHub grant key path must be absolute"),
 }).strict();
 
+/**
+ * Review feedback (INF-324): the owner's changes-requested review on a run's delivered pull request steers that run.
+ * Off by default; switching it on needs the owner's GitHub login, which belongs in private runtime configuration.
+ */
+export const reviewFeedbackConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  ownerLogin: z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/, "Use a GitHub login").optional(),
+  pollMinutes: z.number().int().min(1).max(1440).default(5),
+}).strict().refine(value => !value.enabled || value.ownerLogin !== undefined, { message: "Review feedback needs the owner's GitHub login", path: ["ownerLogin"] });
+
 const schema = z
   .object({
     // Keep absent report names absent in routine authority digests; reportName() supplies the display default.
@@ -93,6 +103,7 @@ const schema = z
     usage: usageConfigSchema.optional(),
     sync: z.object({ sharedGroup: z.boolean().optional(), homeDir: z.string().refine(isAbsolute).optional() }).strict().optional(),
     source: z.object({ mirrorDir: z.string().refine(isAbsolute).optional(), refreshMinutes: z.number().int().min(1).max(1440).optional(), remoteOverrides: z.record(z.string(), z.string()).optional() }).strict().optional(),
+    github: z.object({ reviewFeedback: reviewFeedbackConfigSchema.optional() }).strict().optional(),
     eval: evalHostSchema.optional(),
     // Model-written chat digests. The key file is read once at startup and never logged.
     summaries: z.object({

@@ -6,6 +6,7 @@ import { runEventKey, runSummaryCounts } from "./run-events.js";
 import { hostGithubGrantEnvironment } from "./github-grants.js";
 import { ensureDefaultTeamRoot, ensureHostDirectory, publishTeamHead, removeMemberWorkspace, removeTeamWorkspace, snapshotMemberWork, TeamError } from "./team-workspace.js";
 import { activeMember, digest, filesystemEntryExists, type TeamKernel, teamRunDirectory } from "./team-kernel.js";
+import { intakeEndedByRemoval } from "./review-feedback.js";
 import type { RetentionState, Stored, TeamServiceOptions } from "./teams.js";
 
 /**
@@ -469,12 +470,14 @@ export class TeamRetention {
       }
       if (this.needsMemberWorkSaved(stored)) { this.startMemberWorkSave(stored); return; }
       if (!retentionDue) return;
+      const intakeEnded = intakeEndedByRemoval(run, stored.reviewIntake, this.host.config.github?.reviewFeedback?.enabled === true);
       run.workspaceRemovedAt = this.host.retentionNow();
       // The key names the fact, not the time, so a retried removal stores the same event once.
       const settledKey = runEventKey("run.settled", run.id, [run.revision, "blocked", "workspace-removed"]);
       if (run.status === "blocked") this.host.emit(stored, "run.settled", [run.revision, "blocked", "workspace-removed"], {}, { status: "blocked", summary: runSummaryCounts(run) });
       const startedAt = run.workspaceRemovedAt, previousEvents = run.events.slice();
       this.host.event(stored, "Workspace removal under the retention policy started.");
+      if (intakeEnded) this.host.event(stored, intakeEnded);
       try { this.host.save(stored); }
       catch (error) {
         run.workspaceRemovedAt = undefined;

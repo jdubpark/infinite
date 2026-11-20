@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { parseGhCommand } from "../scripts/github-proxy.mjs";
+import { reviewFeedbackConfigSchema } from "../packages/host/src/config.js";
 import { runRecord } from "../packages/host/src/objective-record.js";
 import {
-  REVIEW_TEXT_LIMIT, type ReviewIntake, type ReviewVerdict, intentStillCurrent, markReviewApplied, parsePullRequestView, pullRequestTarget,
+  REVIEW_TEXT_LIMIT, type ReviewIntake, type ReviewVerdict, intakeEndedByRemoval, intentStillCurrent, markReviewApplied, parsePullRequestView, pullRequestTarget,
   pullRequestViewArgs, recordReviewOutcome, reviewRequestId, reviewText, reviewVerdict,
 } from "../packages/host/src/review-feedback.js";
 import { ownerDirectionLines } from "../packages/host/src/team-prompts.js";
@@ -179,4 +180,20 @@ test("a review's steering is the owner's direction: prompts carry it as such and
 
   const connector = delivered(run => { run.steering = [{ text: "From Slack.", revision: 2, at, source: { kind: "connector", id: "c", name: "Slack" } }]; });
   assert.deepEqual(ownerDirectionLines(connector), [], "connector steering stays agent direction");
+});
+
+test("a workspace removal ends intake only for a pull request the switched-on host was watching", () => {
+  const ended = "Review feedback is no longer taken for this pull request: the run's workspace was removed. Start a new mission for further changes.";
+  assert.equal(intakeEndedByRemoval(delivered(), undefined, true), ended);
+  assert.equal(intakeEndedByRemoval(delivered(), undefined, false), undefined, "with the switch off a removal records what it did before");
+  assert.equal(intakeEndedByRemoval(delivered(run => { run.status = "planning"; }), undefined, true), undefined);
+  assert.equal(intakeEndedByRemoval(delivered(), intake({ ended: { at: ENABLED, reason: "closed" } }), true), undefined);
+});
+
+test("review feedback is off unless configured, and switching it on needs the owner's GitHub login", () => {
+  assert.deepEqual(reviewFeedbackConfigSchema.parse({}), { enabled: false, pollMinutes: 5 });
+  assert.equal(reviewFeedbackConfigSchema.safeParse({ enabled: true }).success, false);
+  assert.equal(reviewFeedbackConfigSchema.safeParse({ enabled: true, ownerLogin: "not a login" }).success, false);
+  assert.equal(reviewFeedbackConfigSchema.safeParse({ enabled: true, ownerLogin: OWNER, extra: 1 }).success, false);
+  assert.deepEqual(reviewFeedbackConfigSchema.parse({ enabled: true, ownerLogin: OWNER }), { enabled: true, ownerLogin: OWNER, pollMinutes: 5 });
 });

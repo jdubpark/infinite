@@ -93,6 +93,16 @@ export function recordedDeliveryBranch(run: Pick<TeamRun, "pullRequest" | "branc
   return pr.headRefName === run.branch || pr.headRefName === published ? pr.headRefName : undefined;
 }
 
+/**
+ * The event of a workspace removal that ends review intake for a watched pull request (decision 3), or undefined when
+ * the removal ends nothing. `run` is read as it was just before its removal started.
+ */
+export function intakeEndedByRemoval(run: TeamRun, intake: ReviewIntake | undefined, enabled: boolean) {
+  return enabled && watchedRun({ ...run, workspaceRemovedAt: undefined }, intake)
+    ? "Review feedback is no longer taken for this pull request: the run's workspace was removed. Start a new mission for further changes."
+    : undefined;
+}
+
 const COUNTED = new Set(["CHANGES_REQUESTED", "APPROVED", "DISMISSED"]);
 /** The owner's newest review in a counted state, by submission time and then by review id. A comment-only review never counts. */
 export function newestOwnerReview(pr: Pick<PullRequestRead, "reviews">, ownerLogin: string): OwnerReview | undefined {

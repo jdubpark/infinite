@@ -172,6 +172,8 @@ export interface Config {
   sync?: { sharedGroup?: boolean; homeDir?: string };
   /** GitHub-tracked project sources: mirror directory, refresh period, and test-only remote overrides (refused on cloud hosts). */
   source?: { mirrorDir?: string; refreshMinutes?: number; remoteOverrides?: Record<string, string> };
+  /** Review feedback (INF-324): off unless enabled; `ownerLogin` is the only GitHub login whose review counts. */
+  github?: { reviewFeedback?: { enabled?: boolean; ownerLogin?: string; pollMinutes?: number } };
   /** Replay eval host settings: the grader identity. Outside the routine approval digest. */
   eval?: import("./eval-config.js").EvalHostConfig;
   /** Chat digests written by a hosted model through an OpenAI-compatible Responses API. */

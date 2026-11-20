@@ -54,6 +54,8 @@ import type { PermissionHost } from "./team-permission-agent.js";
 import { TeamPermissionReview } from "./team-permission-review.js";
 import { TeamRetention, type RetentionHost } from "./team-retention.js";
 import { TeamPublisher, type PublisherHost } from "./team-publisher.js";
+import { TeamReviewFeedback, type ReviewFeedbackHost } from "./team-review-feedback.js";
+import type { ReviewIntake } from "./review-feedback.js";
 import { TeamRecovery, automaticOperationRecoveryCodes, deliveryBranchMatches, deliveryInspectionHash, genericOperationFailureReason, interruptedOperationReason, recoverableOperationFailure, recoverableUnattributedResult, type RecoveryHost } from "./team-recovery.js";
 import { planRunObjective, runObjectiveNote, runObjectiveView, steerRunObjective, type ObjectiveUnavailable } from "./objective-runs.js";
 import { TeamIntent, type GoalRecordPort, type IntentCheckState } from "./team-intent.js";
@@ -75,7 +77,7 @@ type MissionReservationLookup = (projectId: string, exceptMissionId?: string) =>
 export type TeamServiceOptions = {
   /** The process census; tests replace it. */
   processes?: HostProcesses;
-  source?: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status">;
+  source?: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status"> & Partial<Pick<ProjectSourceService, "onTick">>;
   graphs?: Pick<RepositoryGraphs, "refresh">;
   onMerged?: (projectId: string) => void;
   ownerActive?: (run: TeamRun) => boolean;
@@ -185,6 +187,8 @@ export type Stored = {
   ledgerReplaces?: Record<string, { memberId: string; cause: ReplacementCause }>;
   /** The objective record of a standalone run (objective-runs.ts). Outside `run`, so no view, prompt, or digest reads it. */
   objectiveRecord?: unknown; objectiveNotice?: ObjectiveUnavailable; intentCheck?: IntentCheckState; register?: RegisterState;
+  /** The owner's reviews of the delivered pull request that this run took or will apply (team-review-feedback.ts). */
+  reviewIntake?: ReviewIntake;
 };
 /** Display names may change; durable replay binds connector identity to its kind and ID. */
 const receiptDigest = <T extends object>(value: T & { source?: SteeringSource | string; by?: string }) => {
@@ -349,6 +353,11 @@ export class TeamService {
   private readonly recovery = new TeamRecovery(this.recoveryHost());
   /** Permission review, its recovery and the permission agent (team-permission-*.ts), on the kernel this service lends them. */
   private readonly permissions = new TeamPermissionReview(this.permissionHost());
+  /** The owner's GitHub review of a delivered pull request, applied once as a steer (team-review-feedback.ts). */
+  private readonly reviewFeedback = new TeamReviewFeedback((service => ({ get records() { return service.records; }, get config() { return service.config; },
+    get key() { return service.key; }, get directory() { return service.directory; }, save: stored => service.save(stored), event: (stored, text) => service.event(stored, text),
+    enqueue: task => service.enqueue(task), steer: (id, input, source) => service.steer(id, input, source), held: projectId => Boolean(service.fuse?.held?.([projectId])),
+    now: () => service.options?.now?.() ?? Date.now() }) satisfies ReviewFeedbackHost)(this));
   private readonly directory: string;
   private usage?: UsageService;
   private evidence?: EvidenceStore;
@@ -1876,8 +1885,9 @@ export class TeamService {
       }).catch(() => { this.tickQueued = false; });
     };
     this.timer = setInterval(tick, 500); this.timer.unref(); tick();
+    void this.reviewFeedback.start(listener => this.options?.source?.onTick?.(listener) ?? (() => {}));
   }
-  close() { this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const timer of this.sampleTimers) clearTimeout(timer); this.sampleTimers.clear(); for (const controller of this.commands.values()) controller.abort(); for (const controller of this.publicationControllers.values()) controller.abort(); for (const controller of this.memberWorkSaveControllers.values()) controller.abort(); for (const controller of this.agentControllers.values()) controller.abort(); this.objectiveTests.close(); this.removeAgentSource?.(); }
+  close() { this.reviewFeedback.close(); this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const timer of this.sampleTimers) clearTimeout(timer); this.sampleTimers.clear(); for (const controller of this.commands.values()) controller.abort(); for (const controller of this.publicationControllers.values()) controller.abort(); for (const controller of this.memberWorkSaveControllers.values()) controller.abort(); for (const controller of this.agentControllers.values()) controller.abort(); this.objectiveTests.close(); this.removeAgentSource?.(); }
   /** Settles once work queued before now has finished, so a caller can stop sessions it may still launch. */
   async idle() {
     await this.serial;

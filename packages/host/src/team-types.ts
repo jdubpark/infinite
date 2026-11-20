@@ -1,4 +1,5 @@
 import type { ConnectorSource } from "./mcp-types.js";
+import type { CheckScan } from "./team-check-output.js";
 import { z } from "zod";
 import { featureMapSchema, TASK_KINDS } from "./task-features.js";
 import { evalProjectSchema, CANDIDATE_PROFILES_MAX } from "./eval-config.js";
@@ -755,6 +756,10 @@ export interface TeamCheck {
   revision: number;
   /** Correction round that launched this verification attempt. */
   round?: number;
+  /** Prompt evidence for the repair feedback. Not sent to clients: the view strips it. */
+  // PROPOSED: a failed or interrupted check keeps its scan, so failure text from before the kept end of the output is stored
+  // with the run and reaches later members' context; a passed check keeps none.
+  scan?: CheckScan;
 }
 export type ReplayLink = { jobId: string; trialId: string; purpose: "replay" | "gate"; ending?: TrialEnding; resultCommit?: string; resetsAt?: string };
 export interface TeamRun {

@@ -2532,10 +2532,10 @@ test("permission decisions recorded before owner-authority pinning are retired o
     const run = teams.get(f.run.id);
     assert.deepEqual(run.permissionDecisions?.map(decision => decision.status), ["stale", "answered"], "only outstanding legacy reviews are retired");
     assert.match(run.permissionDecisions?.[0].reason ?? "", /before owner authority was pinned/);
-    const scheduler = teams as unknown as { record(id: string): { run: TeamRun }; permissionAnswerInvalidReason(stored: unknown, decision: unknown): Promise<string | undefined> };
+    const scheduler = teams as unknown as { record(id: string): { run: TeamRun }; permissions: { permissionAnswerInvalidReason(stored: unknown, decision: unknown): Promise<string | undefined> } };
     const stored = scheduler.record(f.run.id);
     const approvedWithoutHash = { ...legacy, id: randomUUID(), status: "approved" as const };
-    assert.match(await scheduler.permissionAnswerInvalidReason(stored, approvedWithoutHash) ?? "", /predates owner-authority pinning/);
+    assert.match(await scheduler.permissions.permissionAnswerInvalidReason(stored, approvedWithoutHash) ?? "", /predates owner-authority pinning/);
   } finally { f.close(); }
 });
 

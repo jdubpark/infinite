@@ -8,12 +8,17 @@ export interface LiveSource {
   session(id: string): Promise<unknown>;
   events(id: string, after: number): Promise<{ events: unknown[]; cursor: number; more: boolean }>;
 }
-type Listener = { topics: Set<LiveTopic>; cursors: Map<string, number>; values: Map<string, string>; refetch: Map<LiveTopic, number>; emit(update: LiveUpdate): void };
+type Listener = { topics: Set<LiveTopic>; cursors: Map<string, number>; values: Map<string, string>; sentAt: Map<LiveTopic, number>; refetch: Map<LiveTopic, number>; emit(update: LiveUpdate): void };
 type EventPage = { events: unknown[]; cursor: number; more: boolean };
 type EventRead = { topic: `session/${string}`; id: string; after: number };
 
 const MAX_EVENT_READS_PER_TICK = 32;
 const MAX_EVENT_READ_CONCURRENCY = 4;
+/**
+ * An unchanged inline session list is sent again after this long. A phone ages its rows from when it last received
+ * the list, and rows carry recorded times, so a quiet list would otherwise hold every age still.
+ */
+const UNCHANGED_SESSIONS_RESEND_MS = 60_000;
 
 /** Shared change snapshots for HTTP and encrypted remote event subscribers. */
 export class LiveFeed {
@@ -27,7 +32,7 @@ export class LiveFeed {
   }
 
   subscribe(topics: LiveTopic[], after: number, emit: (update: LiveUpdate) => void): () => void {
-    const listener: Listener = { topics: new Set(topics), cursors: new Map(), values: new Map(), refetch: new Map(), emit };
+    const listener: Listener = { topics: new Set(topics), cursors: new Map(), values: new Map(), sentAt: new Map(), refetch: new Map(), emit };
     for (const topic of topics) if (topic.startsWith("session/")) listener.cursors.set(topic, after);
     this.listeners.add(listener);
     if (!this.timer) this.timer = setInterval(() => { void this.tick(); }, this.intervalMs);
@@ -97,8 +102,12 @@ export class LiveFeed {
         }
         const serialized = JSON.stringify(data);
         const lastRefetch = listener.refetch.get(topic);
-        if (listener.values.get(topic) === serialized && (lastRefetch === undefined || Date.now() - lastRefetch < 15000)) continue;
+        const held = lastRefetch === undefined
+          ? topic !== "sessions" || Date.now() - (listener.sentAt.get(topic) ?? 0) < UNCHANGED_SESSIONS_RESEND_MS
+          : Date.now() - lastRefetch < 15000;
+        if (listener.values.get(topic) === serialized && held) continue;
         listener.values.set(topic, serialized);
+        listener.sentAt.set(topic, Date.now());
         const update = { topic, data };
         const eventBytes = Buffer.byteLength(JSON.stringify(update));
         if (eventBytes > MAX_EVENTS_EVENT_BYTES || lastRefetch !== undefined) listener.refetch.set(topic, Date.now());

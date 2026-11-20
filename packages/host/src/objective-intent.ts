@@ -7,6 +7,7 @@ import { commandDigest, criterionInputSchema } from "./objective-input.js";
 import type { CriterionInput } from "./objective-input.js";
 import { CORRECTION_LOG, criterionFromInput, nextCriterionId } from "./objective-ops.js";
 import { INTENT_OPS, logValue, objectiveError } from "./objective-record.js";
+import { assertLogRoom, nextRecordId, nextSeq, sealRecord } from "./objective-write.js";
 import type { ObjectiveState } from "./objective-record.js";
 import type { IntentCheckReport, IntentItem } from "./intent-report.js";
 import {
@@ -15,7 +16,6 @@ import {
   canonicalBytes,
   cappedBytes,
   objectiveRecordSchema,
-  recordDigest,
 } from "./objective-types.js";
 import type { Assumption, AssumptionTest, Criterion, Direction, LogEntry, LogValue, ObjectiveRecord, Question } from "./objective-types.js";
 import { RECORD_DIGEST_BYTES, recordDigestBytes, teamCommandSchema } from "./team-types.js";
@@ -72,16 +72,6 @@ function cut(text: string, max: number): string {
   return chars.length <= max ? text : `${chars.slice(0, max - 3).join("")}...`;
 }
 
-/** The next id with `prefix`: one more than the highest number among `existing`, so an id is never reused. */
-function nextId(prefix: string, existing: readonly string[]): string {
-  const pattern = new RegExp(`^${prefix}(\\d+)$`);
-  const highest = existing.reduce((max, id) => {
-    const match = pattern.exec(id);
-    return match ? Math.max(max, Number(match[1])) : max;
-  }, 0);
-  return `${prefix}${highest + 1}`;
-}
-
 function statementOf(record: ObjectiveRecord): IntentStatement {
   return { objective: record.statement.objective, directions: record.statement.directions.map(item => item.text) };
 }
@@ -102,26 +92,11 @@ function withoutDecision(question: Question): Question {
   return next;
 }
 
-function assertRoom(record: ObjectiveRecord, entry: LogEntry): void {
-  if (record.log.length + 1 > CORRECTION_LOG.entries || canonicalBytes([...record.log, entry]) > CORRECTION_LOG.bytes) {
-    throw objectiveError("objective-log-full");
-  }
-}
-
-/** Seals the record one version up with `entry` appended. A result the schema refuses is never returned. */
-function finish(record: ObjectiveRecord, changes: Partial<ObjectiveRecord>, entry: LogEntry): ObjectiveRecord {
-  const body = { ...record, ...changes, version: entry.version, log: [...record.log, entry] };
-  const next = { ...body, digest: recordDigest(body) } as ObjectiveRecord;
-  if (!objectiveRecordSchema.safeParse(next).success) throw objectiveError("objective-op-refused");
-  return next;
-}
-
-function nextSeq(record: ObjectiveRecord): number {
-  return (record.log[record.log.length - 1]?.seq ?? 0) + 1;
-}
-
 /** The test a report names, as the record stores it. A command must be a configured check; any other test must pass the record's schema. */
-function testOf(test: unknown, configured: readonly TeamCommand[]): Verdict<AssumptionTest, "shape" | "command"> {
+/** The verdict on one assumption test. `testOf` is the only rule for a command test. */
+export type TestVerdict = Verdict<AssumptionTest, "shape" | "command">;
+
+export function testOf(test: unknown, configured: readonly TeamCommand[]): TestVerdict {
   if (typeof test === "object" && test !== null && (test as { kind?: unknown }).kind === "command") {
     const parsed = reportCommandTest.safeParse(test);
     if (!parsed.success) return { ok: false, drop: "shape" };
@@ -273,7 +248,7 @@ function addItem(draft: Draft, item: IntentItem, env: Env): Step {
   if (question !== undefined && draft.questions.length >= L.questions) return { ok: false, drop: "cap" };
 
   const effect: Effect = { converted: convert, capQuestion: false, added: {} };
-  const assumptionId = nextId("a", draft.assumptions.map(item => item.id));
+  const assumptionId = nextRecordId("a", draft.assumptions.map(item => item.id));
   let questions = draft.questions;
   let questionId: string | undefined;
   if (question !== undefined) {
@@ -291,7 +266,7 @@ function addItem(draft: Draft, item: IntentItem, env: Env): Step {
       }
     }
     if (opens) {
-      questionId = nextId("q", questions.map(item => item.id));
+      questionId = nextRecordId("q", questions.map(item => item.id));
       const opened: Question = {
         id: questionId, text: questionTextOf(item, question), assumptions: [assumptionId], waits, state: "open",
       };
@@ -432,8 +407,8 @@ export function applyIntentReport(record: ObjectiveRecord, report: IntentCheckRe
     after: { inline: after },
     handle: context.checkerMemberId,
   };
-  assertRoom(record, entry);
-  const next = finish(record, { assumptions: draft.assumptions, questions: draft.questions, criteria: draft.criteria }, entry);
+  assertLogRoom(record, [entry]);
+  const next = sealRecord(record, { assumptions: draft.assumptions, questions: draft.questions, criteria: draft.criteria }, [entry]);
   return { record: next, decision: decisionFrom(next, context.decisionId), added, dropped, converted, ignored };
 }
 
@@ -454,7 +429,7 @@ export function answerIntentQuestions(record: ObjectiveRecord, answer: { decisio
   if (defaults) {
     wrapped = { inline: { mode: "defaults", questions: ids } };
   } else if (directions.length < ANSWER_DIRECTIONS_BELOW) {
-    const id = nextId("ans", directions.map(item => item.id));
+    const id = nextRecordId("ans", directions.map(item => item.id));
     const direction: Direction = { id, text: answer.text, source: "correction", at: answer.at };
     directions.push(direction);
     wrapped = logValue({ mode: "text", questions: ids, direction }, `${DIRECTION_REF}${id}`);
@@ -473,8 +448,8 @@ export function answerIntentQuestions(record: ObjectiveRecord, answer: { decisio
     after: wrapped,
     handle: answer.runId,
   };
-  assertRoom(record, entry);
-  return finish(record, { questions, statement: { ...record.statement, directions } }, entry);
+  assertLogRoom(record, [entry]);
+  return sealRecord(record, { questions, statement: { ...record.statement, directions } }, [entry]);
 }
 
 /** The questions waiting on `decisionId` stop waiting; undefined when none waits. One version up, one `intent-check.released` entry. Throws objectiveError("objective-log-full"). */
@@ -495,8 +470,8 @@ export function releaseIntentQuestions(record: ObjectiveRecord, input: { decisio
     after: { inline: { cause: input.cause, questions: ids } },
     handle: input.runId,
   };
-  assertRoom(record, entry);
-  return finish(record, { questions }, entry);
+  assertLogRoom(record, [entry]);
+  return sealRecord(record, { questions }, [entry]);
 }
 
 /** One `intent-check.skipped` entry at the current version; the body is unchanged. Undefined when the log has no room. */

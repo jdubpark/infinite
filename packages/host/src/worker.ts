@@ -1697,7 +1697,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       if (session.workspace) {
         hybrid = await createHybridWorkspace({
           workspace: session.workspace, directory: join(dir, "workspace"), sharedPoolDirectory: join(stateDir, "workspace-pool"),
-          command: profile.command, commandArgs: profile.args,
+          command: profile.command, commandArgs: profile.args, egress: egress.env,
           ...(profile.workspaceDir ? { workspaceDirectory: join(profile.workspaceDir, session.id), sharedWorkspace: profile.sharedWorkspace } : {}),
           record: data => { append("lifecycle", { execution: data }); },
           publish: execution => {

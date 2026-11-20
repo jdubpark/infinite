@@ -2,12 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { ProductGoal } from "../packages/host/src/goal-types.js";
 import type { Project } from "../packages/host/src/types.js";
-import type { Check, Criterion, ObjectiveRecord } from "../packages/host/src/objective-types.js";
+import type { Assumption, Check, Criterion, ObjectiveRecord, Question } from "../packages/host/src/objective-types.js";
 import { objectiveRecordSchema, recordDigest } from "../packages/host/src/objective-types.js";
 import { goalRecord } from "../packages/host/src/objective-record.js";
-import { checkLabel, objectivePromptsOn, recordDigestFor } from "../packages/host/src/objective-digest.js";
+import { checkLabel, objectivePromptFor, objectivePromptOf, objectivePromptsOn, objectiveRegisterOn, recordDigestFor, registerDigestFor } from "../packages/host/src/objective-digest.js";
 import { commandDigest } from "../packages/host/src/objective-input.js";
-import { RECORD_DIGEST_BYTES, RECORD_LABEL_BYTES, recordDigestBytes, recordDigestSchema } from "../packages/host/src/team-types.js";
+import { RECORD_DIGEST_BYTES, RECORD_LABEL_BYTES, RECORD_REGISTER_BYTES, recordDigestBytes, recordDigestSchema, registerDigestBytes } from "../packages/host/src/team-types.js";
 import type { TeamCommand } from "../packages/host/src/team-types.js";
 
 const GOAL_ID = "6f1c2a3e-8b4d-4c5e-9f60-718293a4b5c6";
@@ -137,4 +137,71 @@ test("the switch reads only on", () => {
   assert.equal(objectivePromptsOn(projectWith(undefined)), false, "a team without the key is off");
   assert.equal(objectivePromptsOn(projectWith({ prompts: "off" })), false, "off is off");
   assert.equal(objectivePromptsOn(projectWith({ prompts: "on" })), true, "on is on");
+});
+
+/** A record with the given assumptions and questions, on the host record's other fields. */
+const registerRecord = (assumptions: Assumption[], questions: Question[]): ObjectiveRecord => ({ ...hostRecord(), assumptions, questions });
+const assumption = (id: string, origin: Assumption["origin"], status: Assumption["status"], criticality: Assumption["criticality"], statement: string): Assumption =>
+  ({ id, statement, status, origin, criticality, refutedBy: "The owner refutes it.", test: { kind: "owner" }, evidence: [], proposals: [] });
+const question = (id: string, state: Question["state"], text: string): Question => ({ id, text, assumptions: [], waits: false, state });
+
+test("the register digest has its own budget and no member text", () => {
+  const statuses = ["refuted", "unchecked", "assumed", "verified"] as const;
+  const criticalities = ["outcome", "plan", "detail"] as const;
+  const assumptions = Array.from({ length: 32 }, (_, index): Assumption => {
+    const n = index + 1;
+    // Every fifth is a member's, so the non-member assumptions still cover every status.
+    const member = n % 5 === 0;
+    return assumption(`a${n}`, member ? "member" : n % 2 === 0 ? "owner" : "intent-check", statuses[n % 4]!, criticalities[n % 3]!, member ? `MEMBER-TEXT a${n}` : `Assumption a${n} ${"x".repeat(300)}`);
+  });
+  const questions = Array.from({ length: 10 }, (_, index) => question(`q${index + 1}`, index === 9 ? "answered" : "open", `Question ${index + 1} ${"y".repeat(200)}`));
+  const digest = registerDigestFor(registerRecord(assumptions, questions));
+
+  const memberIds = new Set(assumptions.filter(item => item.origin === "member").map(item => item.id));
+  assert.equal(digest.assumptions.some(item => memberIds.has(item.id)), false, "no member assumption enters the digest");
+  assert.equal(JSON.stringify(digest).includes("MEMBER-TEXT"), false, "no member text reaches the digest");
+
+  const rank = (item: Assumption) => statuses.indexOf(item.status) * 100 + criticalities.indexOf(item.criticality) * 10;
+  const ordered = assumptions.filter(item => item.origin !== "member")
+    .sort((a, b) => rank(a) - rank(b) || Number(a.id.slice(1)) - Number(b.id.slice(1)));
+  assert.deepEqual(digest.assumptions.map(item => item.id), ordered.slice(0, digest.assumptions.length).map(item => item.id), "the kept assumptions are the first of the rule's order");
+
+  assert.ok(registerDigestBytes(digest) <= RECORD_REGISTER_BYTES, "the register is within its own 6,144 bytes");
+  const openQuestions = questions.filter(item => item.state === "open");
+  const left = (ordered.length - digest.assumptions.length) + (openQuestions.length - digest.questions.length);
+  assert.equal(digest.omitted, left, "omitted counts every assumption and open question left out, and no member");
+  assert.ok(left > 0, "the fixture is large enough to cut");
+
+  const small = registerDigestFor(registerRecord([assumption("a1", "owner", "verified", "detail", "Small.")], [question("q1", "open", "Why?")]));
+  assert.deepEqual(small, { assumptions: [{ id: "a1", status: "verified", criticality: "detail", statement: "Small." }], questions: [{ id: "q1", text: "Why?" }] }, "a small record keeps everything with no omitted count");
+  assert.deepEqual(registerDigestFor(registerRecord([], [])), { assumptions: [], questions: [] }, "an empty record gives an empty register with no omitted count");
+
+  // The cut stops the list: a12 does not fit, so the later and smaller a13, and q1, stay out though either would fit.
+  const filler = Array.from({ length: 11 }, (_, index) => assumption(`a${index + 1}`, "owner", "refuted", "outcome", "z".repeat(470)));
+  const cut = registerDigestFor(registerRecord(
+    [...filler, assumption("a12", "owner", "refuted", "outcome", "z".repeat(470)), assumption("a13", "owner", "unchecked", "outcome", "Small.")],
+    [question("q1", "open", "Why?")],
+  ));
+  assert.deepEqual(cut.assumptions.map(item => item.id), filler.map(item => item.id));
+  assert.equal(cut.omitted, 3);
+});
+
+test("the objective prompt shape follows the digest, the register, and the mode", () => {
+  const digest = recordDigestFor(hostRecord(), [test1]);
+  const withRegister = { ...digest, register: { assumptions: [], questions: [] } };
+  assert.equal(objectivePromptOf({ goal: undefined, autonomy: undefined } as never), false, "no goal record gives false");
+  assert.equal(objectivePromptOf({ goal: { record: digest }, autonomy: undefined } as never), true, "a record without a register gives true");
+  assert.equal(objectivePromptOf({ goal: { record: withRegister }, autonomy: undefined } as never), "register", "an unpinned run with a register gives register");
+  assert.equal(objectivePromptOf({ goal: { record: withRegister }, autonomy: "supervised" } as never), "register", "a supervised run gives register");
+  assert.equal(objectivePromptOf({ goal: { record: withRegister }, autonomy: "autonomous" } as never), "register-autonomous", "an autonomous run gives register-autonomous");
+
+  assert.equal(objectivePromptFor(undefined, "autonomous"), false, "an undefined project gives false");
+  assert.equal(objectivePromptFor(projectWith({ prompts: "off", register: "on" }), "supervised"), false, "prompts off gives false");
+  assert.equal(objectivePromptFor(projectWith({ prompts: "on" }), "autonomous"), true, "prompts on with the register off gives true");
+  assert.equal(objectivePromptFor(projectWith({ prompts: "on", register: "on" }), "supervised"), "register", "both on, supervised, gives register");
+  assert.equal(objectivePromptFor(projectWith({ prompts: "on", register: "on" }), "autonomous"), "register-autonomous", "both on, autonomous, gives register-autonomous");
+
+  assert.equal(objectiveRegisterOn(undefined), false, "an undefined project has no register");
+  assert.equal(objectiveRegisterOn(projectWith({ register: "off" })), false, "off is not on");
+  assert.equal(objectiveRegisterOn(projectWith({ register: "on" })), true, "on is on");
 });

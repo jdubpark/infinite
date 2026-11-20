@@ -26,7 +26,8 @@ export type ObjectiveErrorCode = "objective-record-absent" | "objective-source-i
   | "objective-record-of-goal" | "objective-record-of-mission" | "objective-record-of-handoff" | "objective-version-not-found" | "objective-version-unavailable"
   | "objective-prompts-off" | "objective-op-invalid" | "objective-op-target" | "objective-op-c0" | "objective-op-refused"
   | "objective-version-stale" | "objective-criterion-misfit" | "objective-criterion-too-large" | "objective-command-unknown"
-  | "objective-secret" | "objective-criteria-limit" | "objective-too-large" | "objective-log-full" | "objective-digest-too-large";
+  | "objective-secret" | "objective-criteria-limit" | "objective-too-large" | "objective-log-full" | "objective-digest-too-large"
+  | "objective-register-off" | "objective-assumption-target" | "objective-rating-subject" | "objective-rating-no-head";
 
 export const OBJECTIVE_ERRORS: Record<ObjectiveErrorCode, { status: 400 | 404 | 409; message: string }> = {
   "objective-record-absent": { status: 404, message: "This run has no objective record yet. It gets one at its next accepted plan." },
@@ -52,6 +53,10 @@ export const OBJECTIVE_ERRORS: Record<ObjectiveErrorCode, { status: 400 | 404 | 
   "objective-too-large": { status: 409, message: "The corrected record would be over its size limit." },
   "objective-log-full": { status: 409, message: "The record's log is full. Start a new goal with consolidated criteria." },
   "objective-digest-too-large": { status: 409, message: "The active criteria would be over the 6 KiB prompt digest." },
+  "objective-register-off": { status: 409, message: "Turn on the assumption register for this goal's project before recording owner results." },
+  "objective-assumption-target": { status: 409, message: "A correction names an assumption that is missing, has no owner test, or was proposed by a member." },
+  "objective-rating-subject": { status: 409, message: "A rating names a subject that no active criterion or owner test names." },
+  "objective-rating-no-head": { status: 409, message: "The goal has no reviewed cycle to rate yet." },
 };
 
 const L = OBJECTIVE_LIMITS;
@@ -217,6 +222,15 @@ export const INTENT_OPS = {
 } as const;
 const INTENT_OP_SET = new Set<string>(Object.values(INTENT_OPS));
 
+/** The ops the assumption register writes. `rebuildVersion` undoes each of them. */
+export const REGISTER_OPS = {
+  tested: "test.recorded",
+  proposed: "proposal.recorded",
+  set: "assumption.set",
+  rated: "rating.recorded",
+} as const;
+const REGISTER_OP_SET = new Set<string>(Object.values(REGISTER_OPS));
+
 const CRITERION_OPS = new Set(["criterion.added", "criterion.edited", "criterion.retired", "criterion.confirmed"]);
 
 /** Undoes one criterion entry: the criterion its `after` names goes back to its `before`, or is removed for an add. */
@@ -318,6 +332,99 @@ function undoIntent(state: Undoable, entry: LogEntry): Undoable {
   return { ...state, questions: restoreQuestions(state.questions, entry.before) };
 }
 
+const STATUS = z.enum(["verified", "assumed", "refuted", "unchecked"]);
+/** `replaced` is the earlier handle with the same prefix, and `at` is its index in `evidence`. */
+const replacedHandle = z.strictObject({ handle: z.string(), at: z.number().int().min(0) });
+const statusesBefore = z.strictObject({
+  assumptions: z.array(z.strictObject({ id: z.string(), status: STATUS, replaced: replacedHandle.optional() })),
+});
+const statusesAfter = z.looseObject({ changed: z.array(z.strictObject({ id: z.string(), status: STATUS })) });
+const setBefore = z.strictObject({ status: STATUS, ownerPinned: z.boolean().optional(), replaced: replacedHandle.optional() });
+const setAfter = z.strictObject({ status: STATUS });
+const proposalAfter = z.looseObject({
+  added: z.array(z.string()),
+  addedDigest: z.string(),
+  attached: z.array(z.strictObject({ id: z.string(), entryId: z.string() })),
+});
+
+/** Takes off the handle an entry added, which must be `expected`, and puts `replaced` back at its index. */
+function restoreEvidence(evidence: string[], expected: string, replaced: { handle: string; at: number } | undefined): string[] {
+  if (evidence[evidence.length - 1] !== expected) throw unavailable();
+  const kept = evidence.slice(0, -1);
+  if (replaced === undefined) return kept;
+  if (replaced.at > kept.length) throw unavailable();
+  return [...kept.slice(0, replaced.at), replaced.handle, ...kept.slice(replaced.at)];
+}
+
+function indexOfAssumption(assumptions: Assumption[], id: string): number {
+  const index = assumptions.findIndex(item => item.id === id);
+  if (index === -1) throw unavailable();
+  return index;
+}
+
+/** Undoes a host test or an owner rating: each assumption it names gets back its status and handles. */
+function undoStatuses(state: Undoable, entry: LogEntry, handleOf: (id: string) => string): Undoable {
+  const before = statusesBefore.safeParse(inlineOf(entry.before));
+  const after = statusesAfter.safeParse(inlineOf(entry.after));
+  if (!before.success || !after.success || entry.handle === undefined) throw unavailable();
+  const changed = new Map(after.data.changed.map(item => [item.id, item.status]));
+  if (changed.size !== after.data.changed.length || changed.size !== before.data.assumptions.length) throw unavailable();
+  let assumptions = state.assumptions;
+  for (const item of before.data.assumptions) {
+    const index = indexOfAssumption(assumptions, item.id);
+    const current = assumptions[index]!;
+    if (changed.get(item.id) !== current.status) throw unavailable();
+    const evidence = restoreEvidence(current.evidence, handleOf(item.id), item.replaced);
+    assumptions = assumptions.map((assumption, position) => (position === index ? { ...assumption, status: item.status, evidence } : assumption));
+  }
+  return { ...state, assumptions };
+}
+
+/** Undoes an owner pin: the status and the pin go back, and an absent pin stays absent. */
+function undoSet(state: Undoable, entry: LogEntry): Undoable {
+  const before = setBefore.safeParse(inlineOf(entry.before));
+  const after = setAfter.safeParse(inlineOf(entry.after));
+  if (!before.success || !after.success || entry.handle === undefined) throw unavailable();
+  const index = indexOfAssumption(state.assumptions, entry.target);
+  const current = state.assumptions[index]!;
+  if (current.status !== after.data.status) throw unavailable();
+  const restored: Assumption = {
+    ...current,
+    status: before.data.status,
+    evidence: restoreEvidence(current.evidence, `owner:${entry.handle}`, before.data.replaced),
+  };
+  if (before.data.ownerPinned === undefined) delete restored.ownerPinned;
+  else restored.ownerPinned = before.data.ownerPinned;
+  return { ...state, assumptions: state.assumptions.map((item, position) => (position === index ? restored : item)) };
+}
+
+/** Undoes a member's proposal: its stances come off in reverse, then its added assumptions, which must hash to `addedDigest`. */
+function undoProposal(state: Undoable, entry: LogEntry): Undoable {
+  const parsed = proposalAfter.safeParse(inlineOf(entry.after));
+  if (!parsed.success || entry.before !== undefined) throw unavailable();
+  let assumptions = state.assumptions;
+  for (const item of [...parsed.data.attached].reverse()) {
+    const index = indexOfAssumption(assumptions, item.id);
+    const current = assumptions[index]!;
+    const last = current.proposals[current.proposals.length - 1];
+    if (last === undefined || last.entryId !== item.entryId) throw unavailable();
+    assumptions = assumptions.map((assumption, position) => (position === index ? { ...assumption, proposals: assumption.proposals.slice(0, -1) } : assumption));
+  }
+  const { added } = parsed.data;
+  const objects = assumptions.filter(item => added.includes(item.id));
+  if (objects.length !== added.length || digestOf(objects) !== parsed.data.addedDigest) throw unavailable();
+  return { ...state, assumptions: assumptions.filter(item => !added.includes(item.id)) };
+}
+
+function undoRegister(state: Undoable, entry: LogEntry): Undoable {
+  switch (entry.op) {
+    case REGISTER_OPS.tested: return undoStatuses(state, entry, id => `${entry.handle}:${id}`);
+    case REGISTER_OPS.rated: return undoStatuses(state, entry, () => `rating:${entry.handle}`);
+    case REGISTER_OPS.set: return undoSet(state, entry);
+    default: return undoProposal(state, entry);
+  }
+}
+
 /** Rebuilds the record as it was at `version` by undoing each later entry in descending seq. Throws objectiveError. */
 export function rebuildVersion(record: ObjectiveRecord, version: number): ObjectiveRecord {
   if (!Number.isInteger(version) || version < 1 || version > record.version) throw objectiveError("objective-version-not-found");
@@ -337,6 +444,10 @@ export function rebuildVersion(record: ObjectiveRecord, version: number): Object
     }
     if (INTENT_OP_SET.has(entry.op)) {
       state = undoIntent(state, entry);
+      continue;
+    }
+    if (REGISTER_OP_SET.has(entry.op)) {
+      state = undoRegister(state, entry);
       continue;
     }
     if (entry.op !== "direction.appended" && entry.op !== "direction.copied") throw objectiveError("objective-version-unavailable");

@@ -131,6 +131,15 @@ function testGrader(config: Config, seen: string[][] = []): Grader {
   return { ...inner, probe: canaries => { seen.push([...canaries]); return inner.probe([]); } };
 }
 
+/**
+ * Records, in the host process, each grader command the host starts. `call()` invokes `run` synchronously after its halt
+ * check, so a command that starts after `close()` is recorded here at once. The fixture's own record line is written only
+ * after its Node process boots, so it can land later than the host's start.
+ */
+function startLog(grader: Grader, started: string[]): Grader {
+  return { ...grader, run: (job, dir, seconds, argv, options) => { started.push(dir); return grader.run(job, dir, seconds, argv, options); } };
+}
+
 function alive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -316,7 +325,8 @@ test("no grader, no validation", { timeout: 600_000 }, async () => {
 
 test("a restart in the middle of a task counts no attempt", { timeout: 600_000 }, async () => {
   const r = rig();
-  const first = host(r);
+  const started: string[] = [];
+  const first = host(r, { grader: startLog(testGrader(configFor(r)), started) });
   let second: EvalHost | undefined;
   try {
     await mineAll(first);
@@ -329,9 +339,9 @@ test("a restart in the middle of a task counts no attempt", { timeout: 600_000 }
     }
     assert.ok(ops(r.record).includes("run"), "round 1 started");
     first.close();
-    const closedAt = ops(r.record).length;
+    const closedAt = started.length;
     await first.idle();
-    assert.deepEqual(ops(r.record).slice(closedAt).filter(op => op === "run"), [], "close halts the task in flight: no run after close");
+    assert.deepEqual(started.slice(closedAt), [], "close halts the task in flight: no command starts after close");
     // A restart is a new process: a new store on the same database. The corpus module registers once per store.
     const restart = (): void => {
       r.store.close();

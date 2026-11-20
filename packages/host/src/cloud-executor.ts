@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
+import { clearEgressEnvironment } from "./egress.js";
 
 const STARTUP_TIMEOUT = 15000;
 const STARTUP_ERROR = "The cloud executor did not become ready. No command was replayed.";
@@ -51,7 +52,7 @@ function endpoint(child: ChildProcess): Promise<string> {
 }
 
 /** Start a private executor against an already materialized cloud workspace. */
-export async function startCloudExecutor(options: { cwd: string; command?: string; commandArgs?: string[] }): Promise<{
+export async function startCloudExecutor(options: { cwd: string; command?: string; commandArgs?: string[]; egress?: Record<string, string> }): Promise<{
   environment: { environmentId: string; url: string; token: string; cwd: string };
   exited: Promise<void>;
   close(): Promise<void>;
@@ -62,10 +63,14 @@ export async function startCloudExecutor(options: { cwd: string; command?: strin
     if (!(await stat(cwd)).isDirectory()) throw new Error("Not a directory");
   } catch { throw new Error("The materialized cloud working directory is unavailable."); }
   const token = randomBytes(32).toString("hex");
+  // The session's egress environment, not the worker's: inherited proxy state is cleared first, as for the session.
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  clearEgressEnvironment(env);
+  Object.assign(env, options.egress ?? {});
   const child = spawn(process.execPath, ["-e", SUPERVISOR, options.command ?? "codex", ...(options.commandArgs ?? []), "exec-server",
     "--listen", "ws://127.0.0.1:0", "--ws-auth", "capability-token",
     "--ws-token-sha256", createHash("sha256").update(token).digest("hex")], {
-    cwd, env: process.env, stdio: ["pipe", "pipe", "pipe"],
+    cwd, env, stdio: ["pipe", "pipe", "pipe"],
   });
   let closed = false, closing: Promise<void> | undefined;
   const exited = new Promise<void>(resolve => child.once("close", () => { closed = true; resolve(); }));

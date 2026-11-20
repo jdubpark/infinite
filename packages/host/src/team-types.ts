@@ -234,7 +234,7 @@ export const teamProjectSchema = z.object({
   /** The routing policy (owner-set). No default, so an unset policy leaves the authority digest unchanged. */
   routing: teamRoutingSchema.optional(),
   /** The objective switches. No default: an absent key leaves every routine digest and prompt unchanged. `intentCheck` overrides the mode's default. */
-  objective: z.strictObject({ prompts: z.enum(["on", "off"]).optional(), intentCheck: z.enum(["on", "off"]).optional() }).optional(),
+  objective: z.strictObject({ prompts: z.enum(["on", "off"]).optional(), intentCheck: z.enum(["on", "off"]).optional(), register: z.enum(["on", "off"]).optional() }).optional(),
 }).strict().superRefine((project, context) => {
   if (project.establishChecks ? project.checks.length > 0 : project.checks.length === 0)
     context.addIssue({ code: "custom", path: ["checks"], message: "Configure required checks, or explicitly authorize the team to establish them with an empty checks array." });
@@ -464,6 +464,30 @@ export const taskIdSchema = taskId;
 const ownedPath = z.string().min(1).max(300).refine(value => !value.startsWith("/") && !value.includes("\\") && !value.includes("\0") && !value.split("/").some(part => part === ".." || part === ".git" || part === "." || part === ""), "Use a repository-relative file or directory without glob syntax").refine(value => !/[*?\[\]:]/.test(value));
 export const ownedPathSchema = ownedPath;
 export const RECORD_DIGEST_BYTES = 6 * 1024;
+export const RECORD_REGISTER_BYTES = 6 * 1024;
+/** The register digest (part 8): intent-check and owner assumptions, then open questions. Its own budget; member text never enters. */
+export const registerDigestSchema = z.strictObject({
+  assumptions: z.array(z.strictObject({
+    id: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/),
+    status: z.enum(["refuted", "unchecked", "assumed", "verified"]),
+    criticality: z.enum(["outcome", "plan", "detail"]),
+    statement: z.string(), // 1 to 500 bytes
+  })).max(32),
+  questions: z.array(z.strictObject({ id: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/), text: z.string() /* 1 to 1,000 bytes */ })).max(8),
+  omitted: z.number().int().min(1).max(40).optional(),
+}).superRefine((register, context) => {
+  register.assumptions.forEach((item, index) => {
+    const bytes = Buffer.byteLength(item.statement);
+    if (bytes < 1 || bytes > 500) context.addIssue({ code: "custom", path: ["assumptions", index, "statement"], message: "An assumption statement is 1 to 500 bytes." });
+  });
+  register.questions.forEach((item, index) => {
+    const bytes = Buffer.byteLength(item.text);
+    if (bytes < 1 || bytes > 1000) context.addIssue({ code: "custom", path: ["questions", index, "text"], message: "A question is 1 to 1,000 bytes." });
+  });
+  if (registerDigestBytes(register) > RECORD_REGISTER_BYTES) context.addIssue({ code: "custom", path: ["assumptions"], message: "The register digest is over 6 KiB." });
+});
+export type RegisterDigest = z.infer<typeof registerDigestSchema>;
+export function registerDigestBytes(register: RegisterDigest): number { return Buffer.byteLength(JSON.stringify(register)); }
 export const RECORD_LABEL_BYTES = 120;
 /** Part 8's record digest. `c0` is first and its statement is empty: its text is the context's `successCriteria`. */
 export const recordDigestSchema = z.strictObject({
@@ -476,6 +500,8 @@ export const recordDigestSchema = z.strictObject({
     /** Marks a criterion the intent check derived from the objective, so the next cycle's prompt says so. */
     derived: z.literal(true).optional(),
   })).min(1).max(8),
+  /** The objective register (part 8). Its own 6 KiB budget, so a full criteria digest still leaves room for it. */
+  register: registerDigestSchema.optional(),
 }).superRefine((digest, context) => {
   const [first, ...rest] = digest.criteria;
   if (first?.id !== "c0" || rest.some(criterion => criterion.id === "c0")) context.addIssue({ code: "custom", path: ["criteria"], message: "The record digest must start with c0 and hold it once." });
@@ -491,7 +517,8 @@ export const recordDigestSchema = z.strictObject({
   if (recordDigestBytes(digest) > RECORD_DIGEST_BYTES) context.addIssue({ code: "custom", path: ["criteria"], message: "The record digest is over 6 KiB." });
 });
 export type RecordDigest = z.infer<typeof recordDigestSchema>;
-export function recordDigestBytes(digest: RecordDigest): number { return Buffer.byteLength(JSON.stringify(digest)); }
+/** Counts the criteria digest only, so a digest with or without a register counts exactly as it did before the register. */
+export function recordDigestBytes(digest: RecordDigest): number { return Buffer.byteLength(JSON.stringify({ version: digest.version, criteria: digest.criteria })); }
 export const teamGoalContextSchema = z.object({
   id: z.uuid(), revision: z.number().int().min(1), cycle: z.number().int().min(1),
   successCriteria: z.string().trim().min(1).max(8000),
@@ -731,6 +758,8 @@ export interface TeamRun {
   autonomy?: AutonomyMode;
   /** The intent check pinned when the run is created; absent on runs created before the check existed. Pinned by createRun. */
   intentCheck?: "on" | "off";
+  /** Pinned by createRun when the project's register is on; absent otherwise and on runs created before the register existed. */
+  register?: "on";
   /** Explicit owner delegation pinned at creation. Old runs remain opted out. */
   permissions?: TeamPermissions;
   permissionsRevokedAt?: string;

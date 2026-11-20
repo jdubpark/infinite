@@ -24,8 +24,13 @@ export const intakeConfigSchema = z.object({
     bindByMention: z.boolean().default(false),
     /** True lets the owner's mention of the bot file a Linear issue and start a mission. */
     directRequests: z.boolean().default(false),
+    /** True accepts the owner's ordinary messages in joined public and private channels. Needs directRequests. */
+    ownerOnlyInJoinedChannels: z.boolean().optional(),
     /** True lets the owner's mention be a question: it is routed to a read-only answer or to a filed request. Needs directRequests. */
     answerQuestions: z.boolean().default(false),
+    /** Slack channels whose owner-authored messages can be filed directly as requests. Empty or absent disables channel intake. */
+    requestChannelIds: z.array(z.string().regex(/^[CG][A-Z0-9]{2,20}$/)).max(20)
+      .refine(ids => new Set(ids).size === ids.length, "requestChannelIds must be unique").optional(),
     /** True lets the reading service choose the route when the owner gave no word. Needs answerQuestions and the jev block. */
     classify: z.boolean().default(false),
     endpoint: z.url().optional(),
@@ -55,14 +60,18 @@ export interface IntakeMessage {
 }
 export interface IntakeInbound {
   eventId: string; ts: string; text: string; receivedAt: string; handledAt?: string; outcome?: string;
+  /** An ordinary channel reply can answer a question only after that question appeared in Slack. */
+  entrypoint?: "channel-message";
   /** The mission call chosen for this event, saved before the call; a replay performs exactly this call. */
   call?: { action: "answer" | "steer" | "pause" | "resume" | "cancel" | "extend"; decisionId?: string; text?: string; minutes?: number; revision: number };
   /** Interactive Slack action identity, stable across envelope redelivery. */
   interactionId?: string;
 }
-/** The owner's Slack mention a record was filed from; `filedAt` is set once Linear holds the issue. */
+/** The owner's direct Slack request a record was filed from; `filedAt` is set once Linear holds the issue. */
 export interface IntakeDirect {
   eventId: string; ts: string; text: string; filedAt?: string;
+  /** An ordinary owner request or sponsorship reply in an opted-in channel. Absent on old records and mentions. */
+  entrypoint?: "channel-message";
   /** Where the request went: absent on records made before routing existed or with answerQuestions off, and then it is work. */
   route?: IntakeRoute & { at: string };
   /** Set when the mention was saved with `answerQuestions` on: only such a record is routed. Any other direct record is work. */

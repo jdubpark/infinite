@@ -12,6 +12,7 @@ import { createUnderstandingAdapter } from "../packages/host/src/understanding-a
 import { runRepositoryContext } from "../packages/host/src/understanding-runtime.js";
 import type { Config } from "../packages/host/src/types.js";
 import { teamCommandEnvironment } from "../packages/host/src/team-workspace.js";
+import { startCloudExecutor } from "../packages/host/src/cloud-executor.js";
 // @ts-ignore -- a dependency-free script without type declarations
 import { verifyProxyAuthorization } from "../scripts/egress-proxy.mjs";
 
@@ -238,4 +239,30 @@ test("the egress block accepts only a bare loopback HTTP proxy address", () => {
     assert.equal(egressConfigSchema.safeParse({ proxyUrl, keyPath }).success, false, proxyUrl);
   assert.equal(egressConfigSchema.safeParse({ ...egress, keyPath: "relative.key" }).success, false);
   assert.equal(egressConfigSchema.safeParse({ ...egress, extra: true }).success, false);
+});
+
+test("the cloud executor's exec-server gets the session's egress variables, and no inherited proxy state", { timeout: 20000 }, async () => {
+  const dump = join(root, "executor-env.jsonl");
+  // Stands in for `codex exec-server`: it records its proxy environment, then announces a listening address.
+  const script = `require("node:fs").writeFileSync(${JSON.stringify(dump)}, JSON.stringify(Object.fromEntries(${JSON.stringify(PROXY_NAMES)}.map(name => [name, process.env[name] ?? null]))));
+console.log("ws://127.0.0.1:43210"); setInterval(() => {}, 1000);`;
+  const observe = async (options: { egress?: Record<string, string> }) => {
+    const executor = await startCloudExecutor({ cwd: root, command: process.execPath, commandArgs: ["-e", script], ...options });
+    try { return JSON.parse(readFileSync(dump, "utf8")) as Record<string, string | null>; }
+    finally { await executor.close(); rmSync(dump, { force: true }); }
+  };
+  await withStaleProxy(async () => {
+    const configured = await observe({ egress: workerEgressEnvironment("project-a", "0b6a3c52-6c1e-4b0e-9a55-3f1f2d0c9e71", { ...process.env, INFINITE_EGRESS_PROXY_URL: egress.proxyUrl, INFINITE_EGRESS_KEY_FILE: keyPath }).env });
+    assert.equal(configured.NODE_USE_ENV_PROXY, "1");
+    for (const name of ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]) {
+      const url = new URL(configured[name]!);
+      assert.equal(url.host, "127.0.0.1:3128", `${name} points at the proxy`);
+      assert.equal(decodeURIComponent(url.username), "project-a.0b6a3c52-6c1e-4b0e-9a55-3f1f2d0c9e71", `${name} carries the session's credential`);
+    }
+    assert.equal(configured.NO_PROXY, EGRESS_NO_PROXY);
+    assert.equal(configured.no_proxy, EGRESS_NO_PROXY);
+
+    const unconfigured = await observe({});
+    assert.deepEqual(unconfigured, Object.fromEntries(PROXY_NAMES.map(name => [name, null])), "no egress configured: the executor gets no proxy state");
+  });
 });

@@ -23,7 +23,10 @@ const slackLink = (thread: IntakeThread) => `https://example.slack.com/archives/
  * A real host through createApp, with Linear and (optionally) Slack fakes and two repository projects the mission
  * fixture agent can work in. Intake polls Linear every 30 seconds, so each issue is filed after the host starts.
  */
-async function intakeHost(withSlack: boolean, direct = false, answerQuestions = false) {
+async function intakeHost(withSlack: boolean, options: {
+  direct?: boolean; answerQuestions?: boolean; requestChannelIds?: string[]; ownerOnlyInJoinedChannels?: boolean;
+} = {}) {
+  const { direct, answerQuestions, requestChannelIds, ownerOnlyInJoinedChannels } = options;
   const root = realpathSync(mkdtempSync("/tmp/inf-intake-e2e-"));
   const receipts = join(root, "receipts");
   mkdirSync(receipts, { mode: 0o700 });
@@ -48,7 +51,9 @@ async function intakeHost(withSlack: boolean, direct = false, answerQuestions = 
     config.intake = {
       linear: { teamIds: [linear.teamId], creatorId: linear.ownerId, label: "infinite", commentsMirrorToSlack: false, ...(direct ? { admitIssues: false } : {}) },
       ...(slack ? { slack: { appTokenFile: slack.appTokenFile, botTokenFile: slack.botTokenFile, teamId: "T00000000", ownerUserId: OWNER,
-        linearAgentUserId: AGENT, bindByMention: false, endpoint: slack.endpoint, ...(direct ? { directRequests: true } : {}), ...(answerQuestions ? { answerQuestions: true } : {}) } } : {}),
+        linearAgentUserId: AGENT, bindByMention: false, endpoint: slack.endpoint, ...(direct ? { directRequests: true } : {}),
+        ...(answerQuestions ? { answerQuestions: true } : {}), ...(requestChannelIds ? { requestChannelIds } : {}),
+        ...(ownerOnlyInJoinedChannels ? { ownerOnlyInJoinedChannels } : {}) } } : {}),
       mission: { groupId: "api", maxSubtasks: 8, maxMinutes: 30 },
       maxActive: 3,
       requireSlackThread: slack !== undefined,
@@ -164,8 +169,111 @@ test("without a Slack block intake still starts missions and comments in Linear"
   }
 });
 
+test("a teammate proposes work and checks its progress while the owner runs the swarm from the thread", { timeout: 210_000 }, async () => {
+  const world = await intakeHost(true, { direct: true, answerQuestions: true, requestChannelIds: [BINDING.channelId] });
+  const { host, linear, receipts } = world, slack = world.slack!;
+  const teammate = "U22222222";
+  const proposal = "Exports need to include empty rows.";
+  const sponsor = "work: Update the export and its API.";
+  const messages = () => slack.posts(BINDING).map(post => post.text);
+  const channelEvent = (user: string, ts: string, text: string, thread?: string) => ({
+    type: "message", channel_type: "channel", user, channel: BINDING.channelId, ts, text, ...(thread ? { thread_ts: thread } : {}),
+  });
+  const send = async (event: Record<string, unknown>) => {
+    const id = await slack.emit(event);
+    await waitFor(async () => slack.acks().includes(id), Boolean, 5000);
+  };
+  try {
+    const group = await host.fetchApi("/project-groups", "owner", { requestId: randomUUID(), name: "Shop", repos: ["api", "web"] });
+    assert.equal(group.status, 200);
+    host.config.intake!.mission.groupId = group.body.id;
+    writeFileSync(join(receipts, "release-dispatch"), "go");
+    writeFileSync(join(receipts, "release-web-question"), "go");
+    await waitFor(async () => (await host.fetchApi("/intake")).body.slack?.connected, Boolean, 30_000);
+
+    slack.seedThread(BINDING, [{ user: teammate, text: proposal }]);
+    await send({ ...channelEvent(OWNER, BINDING.threadTs, "work: Update the export."), channel: "C1111111111" });
+    for (const fields of [{ subtype: "message_changed" }, { bot_profile: { name: "Example" } }, { channel_type: "im" }]) {
+      await send({ ...channelEvent(OWNER, BINDING.threadTs, "work: Update the export."), ...fields });
+    }
+    await send(channelEvent(teammate, BINDING.threadTs, proposal));
+    assert.ok(slack.calls.some(call => call.method === "reactions.add"));
+    await send(channelEvent(OWNER, "1700000900.000001", "Thanks for spotting that.", BINDING.threadTs));
+    assert.deepEqual((await host.fetchApi("/intake")).body.records, []);
+    assert.equal(linear.allIssues().length, 0);
+
+    const sponsorship = channelEvent(OWNER, "1700000900.000002", sponsor, BINDING.threadTs);
+    const earlyAnswer = channelEvent(OWNER, "1700000900.000003", "Q1 Text", BINDING.threadTs);
+    slack.seedThread(BINDING, [sponsorship, earlyAnswer]);
+    await send(sponsorship);
+    await send(sponsorship); // A second event ID for the same Slack message.
+    await waitFor(async () => messages(), list => list.some(text => text.startsWith("**Q1:")), 90_000);
+    const dispatch = messages().find(text => /\b2 subtasks\b/i.test(text));
+    assert.ok(dispatch, "The thread reports the first dispatch and its subtask count");
+    const [issue] = linear.allIssues();
+    assert.equal(linear.allIssues().length, 1);
+    assert.ok(issue);
+    assert.ok(issue.description.includes("Update the export and its API."));
+    assert.ok(!issue.description.includes(proposal), "Teammate context stays in the Slack thread and sealed mission");
+    const { records } = (await host.fetchApi("/intake")).body;
+    assert.equal(records.length, 1);
+    const mission = async () => (await host.fetchApi(`/missions/${records[0].missionId}`)).body;
+    assert.equal((await mission()).origin.rule, "owner message in Slack request channel");
+    assert.ok((await mission()).objective.includes(`other 1 | ${proposal}`));
+    // Slack delivered these after the question appeared. One predates sponsorship and the other predates the question.
+    await send(channelEvent(OWNER, "1700000900.000000", "cancel", BINDING.threadTs));
+    await send(earlyAnswer);
+    await waitFor(async () => messages(), list => list.some(text => text.includes("new reply")), 10_000);
+    assert.equal((await mission()).status, "needs-input");
+    assert.equal((await mission()).decisions[0].answer, undefined);
+    const beforeStatus = messages().length;
+
+    await send(channelEvent(teammate, "1700000900.000020", "cancel", BINDING.threadTs));
+    await send(channelEvent(teammate, "1700000900.000021", "Q1 Text", BINDING.threadTs));
+    await send(channelEvent(teammate, "1700000900.000022", "status", "1700000000.000099"));
+    assert.equal((await mission()).status, "needs-input");
+    assert.equal(messages().length, beforeStatus);
+    const status = channelEvent(teammate, "1700000900.000023", "status", BINDING.threadTs);
+    await send(status);
+    await send(status);
+    const afterStatus = await waitFor(async () => messages(), list => list.length > beforeStatus, 10_000);
+    const summary = afterStatus[beforeStatus]!;
+    assert.match(summary, /\b1 running\b/i);
+    assert.match(summary, /\b1 queued\b/i);
+    assert.match(summary, /(?:1\s+(?:open )?(?:question|decision)|(?:question|decision)s?\D{0,8}1)/i);
+    assert.doesNotMatch(summary, /Which response format|api\.txt|Build the API first|Exports need/);
+
+    const answer = channelEvent(OWNER, "1700000900.000024", "Q1 JSON", BINDING.threadTs);
+    await send(answer);
+    await send(answer);
+    await waitFor(async () => messages(), list => list.some(text => text.startsWith("Ready for review (agent report):")), 100_000);
+    assert.equal((await mission()).decisions[0].answer, "JSON");
+    assert.equal(messages().filter(text => text === "Received your answer to Q1.").length, 1);
+    assert.equal(messages().filter(text => text === dispatch).length, 1);
+    assert.equal(messages().filter(text => text === summary).length, 1);
+    assert.equal(slack.calls.filter(call => call.method === "chat.postMessage").length, messages().length);
+    await send(channelEvent(OWNER, "1700000900.000025", "Thanks!", BINDING.threadTs));
+    assert.equal((await host.fetchApi("/intake")).body.records.length, 1);
+    assert.equal(linear.allIssues().length, 1);
+
+    const next = { ...channelEvent(OWNER, "1700000900.000040", `<@${slack.botUserId}> work: HOLD-SUBTEAM review the export`, BINDING.threadTs), type: "app_mention" };
+    await send({ ...next, type: "message" }); // Slack can also deliver the ordinary message copy of a mention.
+    await send(next);
+    const requests = await waitFor(async () => (await host.fetchApi("/intake")).body.records, rows => rows.some((row: { identifier: string; missionId?: string }) => row.identifier === "TEST-2" && row.missionId), 30_000);
+    const followUp = requests.find((row: { identifier: string }) => row.identifier === "TEST-2");
+    await send(channelEvent(OWNER, "1700000900.000026", "cancel", BINDING.threadTs));
+    const saved = unseal<IntakeRecord>(readFileSync(host.config.keyFile), `intake-record:${followUp.issueId}`,
+      readFileSync(join(host.config.stateDir, "intake", "records", `${followUp.issueId}.sealed`), "utf8"));
+    assert.equal(saved.inbound.length, 0, "A late reply to the first request never enters the follow-up's command log");
+    assert.equal((await host.fetchApi(`/missions/${followUp.missionId}`)).body.origin.rule, "owner Slack mention of the bot");
+    assert.equal(linear.allIssues().length, 2);
+  } finally {
+    await world.close();
+  }
+});
+
 test("the owner's mention files one issue, starts the mission, and is acknowledged in the thread", { timeout: 150 * 1000 }, async () => {
-  const world = await intakeHost(true, true);
+  const world = await intakeHost(true, { direct: true });
   const { host, linear, slack } = world;
   try {
     slack!.seedThread(BINDING, [{ user: OWNER, text: "ANSWER-ONLY which exports failed?" }]);
@@ -191,34 +299,90 @@ test("the owner's mention files one issue, starts the mission, and is acknowledg
   }
 });
 
-test("an \"ask:\" mention is answered read-only in the thread, and Linear receives nothing", { timeout: 150 * 1000 }, async () => {
-  const world = await intakeHost(true, true, true);
-  const { host, linear, slack } = world;
+test("only the owner can get a response in joined public and private channels", { timeout: 150_000 }, async () => {
+  const world = await intakeHost(true, {
+    direct: true, answerQuestions: true, ownerOnlyInJoinedChannels: true, requestChannelIds: [BINDING.channelId],
+  });
+  const { host, linear, slack: peer } = world, slack = peer!;
+  const teammate = "U22222222";
+  const question = "ask: ANSWER-DIRECT which exports failed?";
+  const bindings = [
+    { channelId: "C0000000041", threadTs: "1700000100.000001", channelType: "channel" },
+    { channelId: "C0000000042", threadTs: "1700000100.000002", channelType: "group" },
+    { channelId: "G0000000043", threadTs: "1700000100.000003", channelType: "group" },
+  ];
+  const send = async (event: Record<string, unknown>) => {
+    const envelope = await slack.emit(event);
+    await waitFor(async () => slack.acks().includes(envelope), Boolean, 5000);
+  };
   try {
-    slack!.seedThread(BINDING, [{ user: OWNER, text: "ask: ANSWER-DIRECT which exports failed?" }]);
-    const texts = () => slack!.posts(BINDING).map(post => post.text);
-    const event = { type: "app_mention", user: OWNER, channel: BINDING.channelId, ts: "1700000900.000100", thread_ts: BINDING.threadTs, text: `<@${slack!.botUserId}> ask: ANSWER-DIRECT which exports failed?` };
-    await waitFor(async () => (await host.fetchApi("/intake")).body, body => body.slack?.connected === true, 30000);
-    await slack!.emit(event);
-
-    await waitFor(async () => texts(), list => list.length >= 2, 120000);
-    const { body } = await waitFor(async () => (await host.fetchApi("/intake")), response => response.body.records[0]?.state === "finished", 60000);
-    assert.deepEqual(texts(), [
-      "Answering this from the repositories, read-only. No issue was filed.",
-      'Answer (agent report):\nRows 14, 90 and 212 were empty.\n\nNo issue was filed. To start work, mention me with the change you want, or begin with "work:".',
-    ]);
-    assert.deepEqual(linear.calls, [], "Linear received no request of any kind");
-    assert.equal(linear.allIssues().length, 0);
-    assert.equal(body.records.length, 1);
-    assert.deepEqual([body.records[0].identifier, body.records[0].route.kind, body.records[0].route.by], ["", "answer", "owner"]);
-    assert.ok(body.records[0].missionId);
-  } finally {
-    await world.close();
-  }
+    await waitFor(async () => (await host.fetchApi("/intake")).body.slack?.connected, Boolean);
+    for (const type of ["message", "app_mention"]) {
+      await send({ type, channel_type: "channel", user: teammate, channel: BINDING.channelId, ts: BINDING.threadTs,
+        text: type === "message" ? question : `<@${slack.botUserId}> ${question}` });
+    }
+    assert.equal(slack.calls.filter(call => call.method === "reactions.add").length, 0, "Even a listed channel stays owner-only");
+    for (const binding of bindings) {
+      slack.seedThread(binding, [{ user: OWNER, text: question }]);
+      await send({ type: "message", channel_type: binding.channelType, user: OWNER, channel: binding.channelId, ts: binding.threadTs, text: question });
+      await waitFor(async () => slack.posts(binding), posts => posts.some(post => post.text.startsWith("Answer (agent report)")), 60_000);
+      const before = slack.posts(binding).length;
+      const reply = { channel_type: binding.channelType, channel: binding.channelId, thread_ts: binding.threadTs };
+      await send({ ...reply, type: "message", user: teammate, ts: "1700000999.000001", text: "status" });
+      const mention = { type: "app_mention", channel: binding.channelId, thread_ts: binding.threadTs, text: `<@${slack.botUserId}> status` };
+      await send({ ...mention, user: teammate, ts: "1700000999.000002" });
+      await send({ ...mention, user: OWNER, ts: "1700000999.000003" });
+      const posts = await waitFor(async () => slack.posts(binding), list => list.length > before);
+      assert.equal(posts.length, before + 1, "Only the owner's status query gets a reply");
+      assert.match(posts.at(-1)!.text, /Question ·/);
+    }
+    const { records } = (await host.fetchApi("/intake")).body;
+    assert.equal(records.length, bindings.length);
+    for (const { issueId } of records) {
+      const stored = unseal<IntakeRecord>(readFileSync(host.config.keyFile), `intake-record:${issueId}`,
+        readFileSync(join(host.config.stateDir, "intake", "records", `${issueId}.sealed`), "utf8"));
+      assert.equal(stored.messages.filter(message => message.kind === "reply").length, 1, "Only one status reply can be delivered or retried");
+    }
+    assert.deepEqual(linear.calls, []);
+  } finally { await world.close(); }
 });
 
+for (const entry of ["mention", "request channel"] as const) {
+  test(`a read-only question through a ${entry} gets a thread answer without contacting Linear`, { timeout: 150 * 1000 }, async () => {
+    const fromChannel = entry === "request channel";
+    const world = await intakeHost(true, { direct: true, answerQuestions: true, requestChannelIds: fromChannel ? [BINDING.channelId] : [] });
+    const { host, linear, slack } = world;
+    try {
+      const question = "ask: ANSWER-DIRECT which exports failed?";
+      slack!.seedThread(BINDING, [{ user: OWNER, text: question }]);
+      const texts = () => slack!.posts(BINDING).map(post => post.text);
+      const event = fromChannel
+        ? { type: "message", channel_type: "channel", user: OWNER, channel: BINDING.channelId, ts: BINDING.threadTs, text: question }
+        : { type: "app_mention", user: OWNER, channel: BINDING.channelId, ts: "1700000900.000100", thread_ts: BINDING.threadTs, text: `<@${slack!.botUserId}> ${question}` };
+      await waitFor(async () => (await host.fetchApi("/intake")).body, body => body.slack?.connected === true, 30000);
+      await slack!.emit(event);
+
+      await waitFor(async () => texts(), list => list.length >= 2, 120000);
+      const { body } = await waitFor(async () => (await host.fetchApi("/intake")), response => response.body.records[0]?.state === "finished", 60000);
+      assert.equal(texts().length, 2);
+      assert.equal(texts()[0], "Answering this from the repositories, read-only. No issue was filed.");
+      assert.match(texts()[1]!, /^Answer \(agent report\):\nRows 14, 90 and 212 were empty\./);
+      if (!fromChannel) assert.ok(texts()[1]!.endsWith('No issue was filed. To start work, mention me with the change you want, or begin with "work:".'));
+      assert.deepEqual(linear.calls, [], "Linear received no request of any kind");
+      assert.equal(linear.allIssues().length, 0);
+      assert.equal(body.records.length, 1);
+      assert.deepEqual([body.records[0].identifier, body.records[0].route.kind, body.records[0].route.by], ["", "answer", "owner"]);
+      assert.ok(body.records[0].missionId);
+      const mission = (await host.fetchApi(`/missions/${body.records[0].missionId}`)).body;
+      assert.equal(mission.origin.rule, fromChannel ? "owner message in Slack request channel (question)" : "owner Slack mention of the bot (question)");
+    } finally {
+      await world.close();
+    }
+  });
+}
+
 test("the correction the bot advertises works: cancel the mistaken request, then ask in the same thread", { timeout: 240 * 1000 }, async () => {
-  const world = await intakeHost(true, true, true);
+  const world = await intakeHost(true, { direct: true, answerQuestions: true });
   const { host, linear, slack } = world;
   try {
     slack!.seedThread(BINDING, [{ user: OWNER, text: "HOLD-SUBTEAM which exports failed?" }]);

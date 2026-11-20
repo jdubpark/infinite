@@ -22,6 +22,7 @@ import { memberEntryId, memberEntryPostSchema, memberScopeOf, type MemberEntryPo
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import type { TeamMember, TeamRun, TeamTask } from "../packages/host/src/team-types.js";
 import { hostEntryIds, hostEntryRun } from "./fixtures/host-entry-run.js";
+import { memberEntrySchema, memberListSchema } from "../packages/host/src/team-mcp-results.js";
 
 type Fixture = { path: string; key: Buffer; close: () => void };
 
@@ -238,6 +239,25 @@ function listOf(store: EvidenceStore, scope: MemberScope, query?: Parameters<typ
 
 const HEAD_KEYS = new Set(["entryId", "seq", "at", "kind", "author", "authority", "authorRole", "taskId", "paths",
   "summary", "bodyBytes", "supersedes", "state"]);
+
+test("the answers the real read functions build parse with the strict MCP result schemas", () => {
+  withStore((_f, store, board) => {
+    const w = seed(store, board);
+    const scope = scopeOf(store, w.implA);
+    const issues = (schema: { safeParse: (value: unknown) => { success: boolean; error?: { issues: unknown[] } } }, value: unknown) => {
+      const parsed = schema.safeParse(value);
+      return parsed.success ? [] : parsed.error?.issues;
+    };
+    assert.deepEqual(issues(memberListSchema, listOf(store, scope)), []);
+    const filtered = listOf(store, scope, { kinds: ["contract"] });
+    assert.ok(filtered.heads.length > 0);
+    assert.deepEqual(issues(memberListSchema, filtered), []);
+    const got = store.read(db => getForMember(db, scope, w.ids.C1));
+    assert.notEqual(got, undefined);
+    assert.notEqual(got, "too-large");
+    assert.deepEqual(issues(memberEntrySchema, got), []);
+  });
+});
 
 test("the default list follows the six groups", () => {
   withStore((_f, store, board) => {

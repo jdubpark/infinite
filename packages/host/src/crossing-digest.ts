@@ -92,7 +92,7 @@ function isRepoPath(value: string): boolean {
     && !value.startsWith("/") && !value.split("/").includes("..");
 }
 
-const boundedText = (max: number) => z.string().refine(
+export const boundedText = (max: number) => z.string().refine(
   value => bytes(value) <= max && !LONE_SURROGATE.test(value) && !UNSAFE_TEXT.test(value),
   `Use at most ${max} well-formed UTF-8 bytes in the normal form of the text rule`,
 );
@@ -191,8 +191,8 @@ export type ClaimInput = {
 type Row = Record<string, unknown>;
 const isRow = (value: unknown): value is Row => typeof value === "object" && value !== null && !Array.isArray(value);
 /** An own property of an object. Anything else, an inherited property included, reads as missing. */
-const field = (value: unknown, key: string): unknown => (isRow(value) && Object.hasOwn(value, key) ? value[key] : undefined);
-const listOf = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
+export const field = (value: unknown, key: string): unknown => (isRow(value) && Object.hasOwn(value, key) ? value[key] : undefined);
+export const listOf = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
 const isText = (value: unknown): value is string => typeof value === "string";
 const isPath = (value: unknown): value is string => isText(value) && isRepoPath(value);
 const isReceipt = (row: unknown): boolean => field(row, "by") === "receipt";
@@ -279,7 +279,7 @@ function zeroCounts(): Counts {
 }
 
 /** A received counter as a count, by rule (c). */
-function sanitize(value: unknown): number {
+export function sanitize(value: unknown): number {
   if (typeof value !== "number" || Number.isNaN(value) || value <= 0) return 0;
   return Math.min(Math.floor(value), OMITTED_MAX);
 }
@@ -296,7 +296,7 @@ function bump(omitted: Omitted, key: keyof Counts, amount = 1): void {
  * Normalizes text by the text rule and clips it to `max` UTF-8 bytes in the same pass, one whole character or escape
  * at a time, so a clip never splits either. Reads no further than the clip.
  */
-function cleanText(value: string, max = TEXT_BYTES): string {
+export function cleanText(value: string, max = TEXT_BYTES): string {
   let out = "";
   let used = 0;
   for (let index = 0; index < value.length;) {
@@ -325,7 +325,7 @@ function cleanText(value: string, max = TEXT_BYTES): string {
 
 // Row readers. Each returns a normalized row, or undefined for a malformed row, which the caller counts.
 
-function readTouched(row: unknown): Touched | undefined {
+export function readTouched(row: unknown): Touched | undefined {
   const path = field(row, "path");
   const op = oneOf(OPS, field(row, "op"));
   const by = oneOf(AUTHORITIES, field(row, "by"));
@@ -334,13 +334,13 @@ function readTouched(row: unknown): Touched | undefined {
   return { path, op, by, ...withIds(ids) };
 }
 
-function readDecision(row: unknown): Decision | undefined {
+export function readDecision(row: unknown): Decision | undefined {
   const what = field(row, "what");
   const why = field(row, "why");
   return isText(what) && isText(why) ? { what: cleanText(what), why: cleanText(why) } : undefined;
 }
 
-function readFailure(row: unknown): Failure | undefined {
+export function readFailure(row: unknown): Failure | undefined {
   const signal = field(row, "signal");
   const where = field(row, "where");
   const kind = oneOf(CLASSES, field(row, "class"));
@@ -358,7 +358,7 @@ function readSibling(row: unknown): Sibling | undefined {
 
 const readOpen = (item: unknown): string | undefined => (isText(item) ? cleanText(item) : undefined);
 
-const failureKey = (row: Failure) => JSON.stringify([row.signal, row.where ?? null]);
+export const failureKey = (row: Failure) => JSON.stringify([row.signal, row.where ?? null]);
 
 /**
  * The single builder. Reads every source through the row readers (text normalized and clipped, malformed rows and
@@ -418,7 +418,7 @@ function tiers<T>(rows: T[], fold: (rows: T[]) => T[], key: (row: T) => string):
 }
 
 /** Folds rows of one authority by path: the stronger operation wins and ids are unioned, newest first. */
-function unionTouched(rows: Touched[]): Touched[] {
+export function unionTouched(rows: Touched[]): Touched[] {
   const merged = new Map<string, Touched>();
   for (const row of rows) {
     const previous = merged.get(row.path);
@@ -453,7 +453,7 @@ function mergeSiblings(rows: Sibling[]): Sibling[] {
 }
 
 /** The first row per key, so the newest of each kept. */
-function unique<T>(items: T[], keyOf: (item: T) => string): T[] {
+export function unique<T>(items: T[], keyOf: (item: T) => string): T[] {
   const seen = new Set<string>();
   return items.filter(item => {
     const key = keyOf(item);

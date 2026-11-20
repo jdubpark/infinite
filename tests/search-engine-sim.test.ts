@@ -710,8 +710,9 @@ class RunSim {
 
     // S12
     if (event.kind === "resume" && isOpen(next)) {
-      // Captures that have not completed have no order yet, so they compare as a set; gate runs follow capture order.
-      const queued = this.queue.filter(op => op.taskId === task.id);
+      // Captures that have not completed have no order yet, so they compare as a set; gate runs follow capture order. Once
+      // the wait has passed, no capture is owed: none would be gated.
+      const queued = this.queue.filter(op => op.taskId === task.id && !(op.kind === "capture" && ledger.wait !== undefined && now >= ledger.wait));
       const want = { base: queued.filter(op => op.kind === "base").length, captures: queued.filter(op => op.kind === "capture").map(op => op.memberId).sort(),
         gates: queued.filter(op => op.kind === "gate").map(op => op.memberId), launches: task.launches.filter(l => !l.acked).map(l => [l.n, l.profileIds]) };
       const got = { base: of("base-run").length, captures: of("capture").map(d => (d as { memberId: string }).memberId).sort(),

@@ -610,11 +610,12 @@ const HANDLERS: Handlers = {
   tick() {},
 
   resume(ctx) {
-    const { s, out } = ctx;
+    const { s, view, out } = ctx;
     if (s.base === undefined && (s.mode === "live" || s.holdUntil !== undefined)) out.push({ kind: "base-run", commit: s.baseCommit });
     if (s.state === "armed" || s.state === "wide") {
-      // Captures that have not completed have no order yet.
-      const waiting = s.contestants.filter(c => c.resultAt !== undefined && c.captured === undefined && c.left === undefined);
+      // Captures that have not completed have no order yet; after the wait none would be gated (rule 6).
+      const waiting = reached(view.now, s.waitUntil) ? []
+        : s.contestants.filter(c => c.resultAt !== undefined && c.captured === undefined && c.left === undefined);
       for (const c of waiting) out.push({ kind: "capture", memberId: c.memberId });
       // PROPOSED (acceptance 16): the launch that waits for its receipt is decided again under its number. The host
       // prepares only the profiles of that launch that have no member yet and answers with one receipt of all of them,

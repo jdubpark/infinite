@@ -302,6 +302,8 @@ test("at the wait, a result that still waits for its capture does not hold the s
   gating.at(90, { kind: "tick" });
   assert.equal(gating.search.state, "wide", "m-c2's capture, made before the wait, is still gated");
   gating.at(91, { kind: "captured", memberId: "m-c1", commit: "commit-m-c1", tree: "tree-m-c1", scope: "ok", empty: false });
+  gating.at(92, { kind: "resume" });
+  assert.deepEqual(gating.last, [{ kind: "gate", memberId: "m-c2", commit: "commit-m-c2" }], "a restart after the wait captures nothing again");
   gating.at(95, { kind: "gated", memberId: "m-c2", outcome: "fail", ms: 1000 });
   assert.deepEqual(gating.last, [{ kind: "stop-operations" }, release("exhausted", "wait")], "the capture after the wait is not gated");
   assert.equal(gating.member("m-c1").gate, undefined);

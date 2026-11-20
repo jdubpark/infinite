@@ -81,7 +81,7 @@ export type OutcomePayload = {
 export type RunSummaryPayload = {
   projectId: string;
   goal?: { id: string; cycle: number };
-  missionId?: string;
+  missionId?: string; trialId?: string;
   counts?: RunSummaryCounts;
   attempts: Partial<Record<Disposition, number>>;
   rounds: { total: number; attributed: number; unattributed: number; unknown: number };

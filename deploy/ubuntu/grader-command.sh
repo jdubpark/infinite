@@ -3,10 +3,11 @@
 # runs one operation as ACCOUNT under ROOT. The owner sets ROOT and ACCOUNT at install and changes nothing else.
 #
 # Operations: probe -- [CANARY...] | receive JOB NAME MAXBYTES | run JOB DIR SECONDS -- ARGV... | read JOB REPORT MAXBYTES
-#             | digest JOB | stop | clean JOB | remove JOB
-# Exit codes: 0 done; 2 missing (read, digest); 3 over the byte limit (receive, read); 64 refused before a child
-# starts; 124 the time limit of run; 125 a launcher failure before a child starts. In run, once the child has
-# started: its status when it is below 64, 124 at the time limit, and 1 for any other status.
+#             | digest JOB | export JOB | stop | clean JOB | remove JOB
+# Exit codes: 0 done; 2 missing (read, digest, export: no task directory or no refs/heads/trial); 3 over the byte
+# limit (receive, read); 64 refused before a child starts; 124 the time limit of run and export; 125 a launcher
+# failure before a child starts. In run and export, once the child has started: its status when it is below 64,
+# 124 at the time limit, and 1 for any other status.
 set -eu
 ROOT=/var/lib/infinite-grader/root
 ACCOUNT=infinite-grader
@@ -42,7 +43,7 @@ valid_dir() {
 
 valid_name() {
   case "$1" in
-    base.bundle|base-delta.patch|reference.patch) return 0 ;;
+    base.bundle|base-delta.patch|reference.patch|result.patch) return 0 ;;
   esac
   return 1
 }
@@ -132,8 +133,9 @@ op_probe() {
   else
     meta=closed
   fi
-  printf '{"uid":%s,"root":"%s","rootMode":"%s","rootOwner":%s,"readable":[%s],"metadata":"%s","freeBytes":%s,"freeInodes":%s,"ancestorsWritable":%s,"tools":%s}\n' \
+  printf '{"uid":%s,"root":"%s","rootMode":"%s","rootOwner":%s,"readable":[%s],"metadata":"%s","freeBytes":%s,"freeInodes":%s,"ancestorsWritable":%s,"tools":%s,"version":2}\n' \
     "$uid" "$ROOT" "$mode" "$owner" "$readable" "$meta" "$((avail * bsize))" "$inodes" "$ancestors" "$tools"
+  # The launcher's version. Version 1 had no version field; the host reads its absence as version 1.
 }
 
 op_receive() {
@@ -154,6 +156,28 @@ op_receive() {
   /usr/bin/mv -f -T -- "$tmp" "$dest"
 }
 
+# Runs ARGV with the given time limit, from the current directory, under the fixed environment. Sets status.
+run_child() {
+  child_seconds=$1
+  shift
+  status=0
+  /usr/bin/setsid -w /usr/bin/prlimit --nproc=512 --fsize=4294967296 --core=0 --nofile=4096 \
+    /usr/bin/timeout --kill-after=10 "$child_seconds" \
+    /usr/bin/env -i \
+      PATH=/usr/local/bin:/usr/bin:/bin HOME="$JOBDIR/home" TMPDIR="$JOBDIR/tmp" \
+      LANG=C.UTF-8 LC_ALL=C.UTF-8 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+      GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 CI=1 \
+    "$@" || status=$?
+}
+
+# Exits with the child's status as run and export report it. 137 is timeout's KILL after the limit. The host checks
+# the elapsed time before it reads 124 as a time limit.
+finish_child() {
+  if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then exit 124; fi
+  if [ "$status" -lt 64 ]; then exit "$status"; fi
+  exit 1
+}
+
 op_run() {
   [ $# -ge 5 ] || refuse
   job=$1
@@ -171,19 +195,24 @@ op_run() {
   confined "$cwd"
   cd "$cwd" || die
 
-  status=0
-  /usr/bin/setsid -w /usr/bin/prlimit --nproc=512 --fsize=4294967296 --core=0 --nofile=4096 \
-    /usr/bin/timeout --kill-after=10 "$seconds" \
-    /usr/bin/env -i \
-      PATH=/usr/local/bin:/usr/bin:/bin HOME="$JOBDIR/home" TMPDIR="$JOBDIR/tmp" \
-      LANG=C.UTF-8 LC_ALL=C.UTF-8 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-      GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 CI=1 \
-    "$@" || status=$?
+  run_child "$seconds" "$@"
+  finish_child
+}
 
-  # 137 is timeout's KILL after the limit. The host checks the elapsed time before it reads 124 as a time limit.
-  if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then exit 124; fi
-  if [ "$status" -lt 64 ]; then exit "$status"; fi
-  exit 1
+# Streams a bundle of refs/heads/trial from the task clone to stdout, under the 600-second limit. A task clone without
+# the trial branch exits 2, from the child, before any bytes are written.
+op_export() {
+  [ $# -eq 1 ] || refuse
+  valid_job "$1" || refuse
+  tools_present || die
+  setup_job "$1"
+  cwd=$JOBDIR/work/task
+  if [ -L "$cwd" ] || [ ! -d "$cwd" ]; then exit 2; fi
+  confined "$cwd"
+  cd "$cwd" || die
+
+  run_child 600 /bin/sh -c 'git rev-parse --verify --quiet refs/heads/trial >/dev/null || exit 2; exec git bundle create - refs/heads/trial'
+  finish_child
 }
 
 op_read() {
@@ -275,6 +304,7 @@ case "$op" in
   run) op_run "$@" ;;
   read) op_read "$@" ;;
   digest) op_digest "$@" ;;
+  export) op_export "$@" ;;
   stop) op_stop "$@" ;;
   clean) op_clean "$@" ;;
   remove) op_remove "$@" ;;

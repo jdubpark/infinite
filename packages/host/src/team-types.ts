@@ -1,7 +1,8 @@
 import type { ConnectorSource } from "./mcp-types.js";
 import { z } from "zod";
 import { featureMapSchema, TASK_KINDS } from "./task-features.js";
-import { evalProjectSchema } from "./eval-config.js";
+import { evalProjectSchema, CANDIDATE_PROFILES_MAX } from "./eval-config.js";
+import type { TrialEnding } from "./eval-types.js";
 import { POINTS_ALGORITHM_VERSION, teamRoutingSchema } from "./routing-policy.js";
 import { intentCheckReportSchema } from "./intent-report.js";
 import type { RoutingKnobs, TeamRunRouting } from "./routing-types.js";
@@ -229,7 +230,7 @@ export const teamProjectSchema = z.object({
   handoffMaxTotalMinutes: z.number().int().min(5).max(1440).optional(),
   /** The private feature map. Read at acceptance; never sent to a member. No default, so the authority digest is unchanged when unset. */
   features: featureMapSchema.optional(),
-  eval: evalProjectSchema.optional(),
+  eval: evalProjectSchema.extend({ candidateProfiles: z.lazy(() => z.array(teamModelProfileSchema).max(CANDIDATE_PROFILES_MAX)).optional() }).optional(),
   /** The routing policy (owner-set). No default, so an unset policy leaves the authority digest unchanged. */
   routing: teamRoutingSchema.optional(),
   /** The objective switches. No default: an absent key leaves every routine digest and prompt unchanged. `intentCheck` overrides the mode's default. */
@@ -745,6 +746,7 @@ export interface TeamCheck {
   /** Correction round that launched this verification attempt. */
   round?: number;
 }
+export type ReplayLink = { jobId: string; trialId: string; purpose: "replay" | "gate"; ending?: TrialEnding; resultCommit?: string; resetsAt?: string };
 export interface TeamRun {
   /** Set when the run was created with the blackboard tools switch on and a ready store. Absent means today's behaviour. */
   blackboard?: { tools: true };
@@ -825,6 +827,8 @@ export interface TeamRun {
   goal?: TeamGoalContext;
   /** Set when a mission started this run as one of its subteams; the board shows it only inside that mission. */
   missionId?: string;
+  /** Set once by createForReplay. Stripped from every TeamView. */
+  replay?: ReplayLink;
   /** Connector provenance pinned when a mission creates this subteam. */
   requestSource?: ConnectorSource;
   /** The integration and member clones were removed under the retention policy; the record, events and evidence remain. */

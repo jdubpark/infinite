@@ -262,6 +262,8 @@ async function guidanceRead(workspace: string, commit: string, prefix: TeamComma
 export async function memberConfiguration(input: {
   workspace: string; baseCommit: string; role: TeamMember["role"]; provider: Provider;
   profile?: TeamModelProfile; publishHeads: boolean; entryTools?: boolean; objectiveDigest?: ObjectivePrompt; prefix?: TeamCommand;
+  /** A trial's run is `trial`; every team's is `team`. */
+  shape?: "team" | "trial";
   /** The routing component. Absent means `off`, as every configuration before routing was stored. */
   routing?: string;
 }, signal: AbortSignal): Promise<MemberConfiguration | undefined> {
@@ -273,8 +275,9 @@ export async function memberConfiguration(input: {
     const identity = profileIdentity(input.profile, input.provider);
     const profile: ProfileKey = { provider: identity.provider, model: identity.model ?? null, effort: identity.effort ?? null };
     const version = promptVersion(input.role, input.provider, input.profile, input.publishHeads, input.entryTools === true, input.objectiveDigest ?? false);
-    const components: ConfigComponents = { profile, promptVersion: version, guidance, knowledge: "none", routing, shape: "team" };
-    return { ...profile, promptVersion: version, guidance, knowledge: "none", routing, shape: "team", configId: configId(components) };
+    const shape = input.shape ?? "team";
+    const components: ConfigComponents = { profile, promptVersion: version, guidance, knowledge: "none", routing, shape };
+    return { ...profile, promptVersion: version, guidance, knowledge: "none", routing, shape, configId: configId(components) };
   } catch {
     return undefined;
   }

@@ -125,7 +125,7 @@ Mined tasks keep their material the same way. Validation stores file lists seale
 
 ## Eval grader account
 
-The grader account runs the focused tests and the guard checks of a replay candidate. It is an account of its own. It has no provider login, no repository credential, and no read access to host state. The host reaches it only through the launcher that [the grader install](../deploy/ubuntu/grader.md) sets up. The launcher admits eight operations, and it confines each one to the grader's root.
+The grader account runs the focused tests and the guard checks of a replay candidate. It is an account of its own. It has no provider login, no repository credential, and no read access to host state. The host reaches it only through the launcher that [the grader install](../deploy/ubuntu/grader.md) sets up. The launcher admits nine operations, and it confines each one to the grader's root.
 
 Before each task the host probes the account. The probe requires a user id that differs from the host's, a root of mode `0700` that the grader owns, no writable directory above that root, the tools the launcher needs, no readable canary, and a closed metadata address. Any other result is a named state, and no task starts. The probe runs before each task, not during one.
 
@@ -176,6 +176,60 @@ These are the owner's choices. The design does not impose them.
 - Untrusted code. Each focused test is code from the repository at an old commit, with old dependencies. It runs as the grader, with the launcher's limits and no host credential.
 
 The probe checks each canary before a task. It cannot see a path that becomes readable during a round, and that path is checked only at the next probe.
+
+## Eval member account
+
+The eval account runs the member of a replay trial: a model session that works on one task of a project, with its own provider logins. It is an account of its own. It has no repository credential, no GitHub grant, and no project environment. The host reaches it only through the launcher that [the eval member account install](../deploy/ubuntu/eval.md) sets up. Each launcher operation is one call, and it confines the call to the account's root, in which the member's workspace is one directory.
+
+Before each trial the host stops the account's processes, removes every trial workspace, resets the account's home from a root-owned template, and then probes the account. The probe runs before a trial, not during one. Only the state `ready` starts a trial. The other states are `not-configured`, `unavailable`, `misconfigured`, `exposed`, `network-open`, and `busy`, and each names the failed check.
+
+### What a trial member can reach
+
+| Channel | What the member can reach | Control |
+|---|---|---|
+| Production credentials | Nothing. The Manager launches a learning session with the eval account's own launch profile, never with a production one. The eval wrapper loads no project environment and unsets `INFINITE_GITHUB_GRANT` and `INFINITE_GITHUB_PROXY`. The launcher receives none of the host's variables. | The profile choice in the Manager, the wrapper, and the sudo rule's `!env_keep`. |
+| The repository | Only the replay base. The workspace is cloned from a bundle of one branch. The launcher removes the clone's remote and deletes the branch, and `check` proves that the reference commit and the other objects are absent and that `git remote` prints nothing. | `prepare` and `check`. |
+| Hidden tests and grading material | Nothing. Hidden material exists only in the grader's root, which the eval account cannot read. | The grader's root mode and the probe's canaries. |
+| Host state | Nothing that the probe lists: the evidence database, the vault key, the state, run, and team workspace directories, each GitHub mirror and project checkout, the grader's root, and the owner's `canaries`. | The probe. A readable canary gives `exposed`. |
+| Other trials and sessions | Nothing. One trial runs at a time. Before each one, the probe finds no entry in the trials root, no leftover in the home, and no System V object or file of the account in the shared directories `stop` empties. | `stop`, `clean`, `scrub`, and the probe. |
+| Earlier trials | The login files, which `scrub` keeps. The rest of the home, the temporary directory, and the trials root do not survive a trial. | `scrub` and `clean`. |
+| Provider endpoints | Reachable through the egress proxy with the `_eval` credential, which the proxy limits to its own list. A direct connection is refused by the network rule. | The `_eval` list and `eval.nft`. |
+| Processes | None survive a trial. The host runs `stop` and checks the process table, in up to three rounds, before and after each trial. | `stop` and the process check. |
+| Permission dialogs | The project's permission pipeline decides them, and for a project the host permission agent serves, that agent does. A dialog that nobody decides ends the trial `permission`. Nothing answers it. | The permission pipeline. |
+
+A trial is labelled `isolated` only when the probe is `ready`, its fetch of the repository fails both directly and through the proxy, and the source is clean. Otherwise it is labelled `none`. In observe mode the proxy lets `_eval` reach any public host, so the fetch succeeds and the trial is labelled `none`.
+
+### Loopback services
+
+| Service | Address | Credential the member holds |
+|---|---|---|
+| Hook listener | The address in the session's hook variables | Its own hook token, which serves only its session |
+| Egress proxy | `127.0.0.1:4785` | The `_eval` credential, limited to its own list |
+| GitHub credential proxy | `127.0.0.1:8417` | None. The wrapper removes the grant variables. |
+| API | `127.0.0.1:4780` | None |
+| Relay | `127.0.0.1:4790` | None. The owner lists the relay key in `canaries`. |
+
+### What stays with the owner
+
+These are the owner's choices. The design does not impose them.
+
+- The provider logins, and whether the provider keeps history and memory for them. Use the logins for nothing else (owner decision 2). The host cannot see what a provider keeps on its own side for a login.
+- The files of the home template, which every trial loads.
+- The `canaries` of the member and of the grader, the egress lists, and the network rule.
+- Whether cron and `at` deny the account, as the install of [the eval member account](../deploy/ubuntu/eval.md) says.
+- `/proc` hiding, a private `/tmp`, a disk quota, and a memory limit for the account.
+- The `trialsPerDay` cap, the job windows, and the choice of the candidate profiles.
+
+### What stays reachable
+
+- The login files. `scrub` keeps them, because the providers rewrite them on refresh. A member can therefore leave a value in them for the next trial of any task. The design accepts that channel.
+- Whatever a provider keeps for its login on its own side.
+- The package registries of `_eval-setup` for up to 15 minutes after setup, and any process setup left running or any file that holds its credential. Do not list a registry that serves the project's own later releases.
+- Other world-writable locations. `stop` removes the account's System V shared memory, semaphores, and message queues, and its own files in `/tmp`, `/var/tmp`, `/dev/shm`, `/dev/mqueue`, `/run/lock`, and `/var/crash`. It fails when any of them remains, and the probe reports `busy` for the account's objects and files there. Other accounts' readable files in those directories stay. A world-writable directory that the list does not name is not emptied, and a file the account leaves there survives, so an owner who adds such a directory to the machine adds it to the launcher's `STOP_DIRS` list. Abstract Unix sockets end with the processes, and the kernel's other per-user state, such as keyrings, is not inspected.
+- Process command lines in `/proc`. The host passes no secret in an argument. The launcher passes the setup and probe proxy credentials in the environment of the command, never in the arguments of a long-lived process: `env` holds them and runs `timeout`, so the arguments of `timeout` and of the command carry none. Another local account can still read the arguments of `prlimit` and `env` for the moment before each runs its successor.
+- Cron and `at` jobs, unless the owner denies them to the account. A job would outlive `stop`.
+- Any public host that the `_eval` list names, and every public host in observe mode.
+- The loopback services in the table above, each of which needs a credential the member does not hold.
 
 ## Remote machine transport
 

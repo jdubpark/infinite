@@ -887,14 +887,149 @@ The launcher ends E1 and E2 by itself after 35 seconds, and E3 after 660 seconds
 
 The Git commands that validation runs inside the grader's root are grader commands. They run through the grader launcher, with its environment and limits. They are not forms of `teams.commandPrefix`.
 
+### Eval trials
+
+A baseline job runs replay trials. A trial gives one implementer one task of the project's `valid` set, under one configuration, in a workspace that holds only the task's base. The grader then grades the result against the hidden tests. A trial spends model tokens on one member launch, which runs as the eval account. Read [the eval member account install](../deploy/ubuntu/eval.md) and [the eval member account](security.md#eval-member-account) before you turn trials on.
+
+Trials are off in every project until the owner sets `trialsPerDay`. A project with no `trialsPerDay` runs no trial, and its baseline job is refused `409` `eval-config-incomplete`.
+
+#### Turn it on
+
+1. Set up validation: steps 1 to 4 and 6 of [the grader install](../deploy/ubuntu/grader.md), and launcher version 2 of its section 2.2.
+2. Set up the eval member account: steps 1 to 10 of [the eval member account install](../deploy/ubuntu/eval.md).
+3. In the project's `eval` block, set `focusedTest`, `reportFormat`, and `trialsPerDay`.
+4. Create a baseline job with `infinite eval run PROJECT --file job.json --request-id UUID`, with `"kind": "baseline"` in the file.
+
+No trial starts before step 4. The code installs nothing: the launchers, the sudo rules, the network rules, the template, and the configuration are the owner's steps.
+
+#### Settings
+
+The project's `eval` block takes these fields. They are read only for a `github` project, and the schema is strict. The routine approval digest leaves them out, so changing them does not invalidate a routine approval.
+
+| Field | Limit | Default | Meaning |
+|---|---|---|---|
+| `trialsPerDay` | 1 to 50 | off | Trials a day, counted by UTC day, for a baseline job. It is the stand-in for a learning budget, see below. |
+| `trialMinutes` | 10 to 240 | 45 | Minutes a trial's member may run before it ends `timeout`. |
+| `candidateProfiles` | up to 8 model profiles | none | Profiles that the lineup does not have. A baseline job may use them, and no prompt shows them. |
+
+The host configuration has one new block, `eval.member`, beside `eval.grader`:
+
+| Field | Limit | Meaning |
+|---|---|---|
+| `prefix` | a command and its arguments | The eval launcher. The host runs `prefix` with the operation and `--` after its arguments. |
+| `root` | an absolute path | The launcher's root. Trials live in `root/trials`. |
+| `agents` | `claude`, `codex`, and `opencode` | The launch of each provider as the eval account. Grok and Demo have no eval launch. |
+| `canaries` | up to 32 absolute paths | Files that the eval account must not read. |
+
+#### Baseline jobs
+
+A baseline request has these fields. The schema is strict.
+
+| Field | Limit | Default |
+|---|---|---|
+| `configurations` | 1 to 4. Each is `{ profile, guidance: "as-of-base", knowledge: "none" }`, and no two share a configuration | none, required |
+| `taskFilter.taskIds`, `origins`, `areas`, `maxTasks` | task ids; up to 2 origins; up to 32 areas; 1 to 200 tasks | `maxTasks` 20 |
+| `trialsPerTask` | 1 to 5 | 3 |
+| `limits.maxTrials` | 1 to 1,000 | none, required |
+| `limits.maxWallMinutes` | 10 to 43,200 | none, required |
+| `windows`, `expiresAt` | as for a validate job; `expiresAt` up to 30 days ahead | any hour; 30 days |
+
+A profile must belong to a provider that has an eval launch (`claude`, `codex`, or `opencode`). It must be in the project's lineup pools or in `candidateProfiles`. A `contributor` profile also needs the project's `routing.allowContributor`. Any other profile is `409` `profile-not-approved`. Pinned guidance, forced knowledge, and prompt overrides are not in this slice.
+
+**Create.** A request id with the same body returns the same job. The same id with another body is `409` `request-conflict`. A project whose baseline job is `scheduled`, `running`, `paused`, or `blocked` gets `409` `job-active`. A validate job does not count. At creation the job fixes its plan: `planned.tasks` is the number of valid tasks the filter selects, at most `maxTasks`, and `planned.trials` is the smaller of `limits.maxTrials` and tasks times configurations times `trialsPerTask`.
+
+**Pinned configuration.** The job pins a digest of the validation settings, `trialMinutes`, `eval.grader`, `eval.member`, each configuration's prompt version, and the project's permission settings. A change to any of them blocks the job with `configuration-changed` before its next trial. `resume` pins the new values.
+
+**Reuse.** A baseline job runs every trial fresh. It never reuses an earlier trial.
+
+#### What a trial does
+
+1. **Source.** The grader exports the trial branch of the replay base, and the eval launcher clones it. The clone has no remote, and `check` proves that the reference commit, the integrated head, the hidden files, and the mirror head are absent.
+2. **Run.** The host creates a replay run: one implementer task seeded from the task, and no project manager, no publication, no Linear tracking, no corpus capture, and no question to the owner. The member launches as the eval account with its `eval.member` profile, never with `config.agents`, and it uses no `teams.commandPrefix`. The prompt is the production prompt for the task's capsule, without the shared project context, the blackboard, or the goal. No permission coordinator starts.
+3. **Ending.** The member's report decides the ending. See the table below.
+4. **Result.** After every process of the eval account has stopped, the host reads the member's result as a binary patch of at most 1 MiB, through the eval launcher. It checks the patch for secret shapes. A patch that matches one is dropped (`patch: "secret-shaped"`), and the grade is kept.
+5. **Grade.** The grader builds the grading commit on the replay base. It takes the result, then restores from the reference the hidden files and every test or `gradingPaths` file that either side changed, and it counts those as `overwritten`. It runs `focusedTest` with the hidden files. The guard checks run only when every expected case passed.
+6. **Clean up.** The host stops the account's processes, cleans the trial, and resets the home. The replay run's record is deleted with no tombstone once the trial is final, and its session an hour later.
+
+Only the runner report resolves a trial. An exit code never does, and a missing or unreadable report leaves `expectedPassed` null.
+
+**Endings.** A trial ends with one of these:
+
+| Ending | Meaning | Counts |
+|---|---|---|
+| `graded` | The member gave a result and the grader ran the focused test. | Resolved only when `expectedPassed` equals the total, the guard checks passed, and the total is above zero. |
+| `no-result` | The member exited without a report, or without a result commit. | A member failure, not a void, so it counts as not resolved. |
+| `escalated`, `question`, `blocked` | The member sent that report. No owner decision is asked. | Not resolved. |
+| `permission` | A permission dialog that nobody decided. Nothing answers it. | Not resolved. |
+| `stalled` | The member made no progress, and a production run would have replaced it. | Not resolved. |
+| `scope-violation` | The result changed a file outside the task's paths, or the patch is over 1 MiB. | Not resolved. |
+| `timeout` | The member ran past `trialMinutes`. | Not resolved. |
+| `void-limit` | The provider reported a limit. The job waits `provider-limit` until the reset. | Void. The slot runs again. |
+| `void-host` | The host restarted, a launcher refused or failed, a block code was unknown, or the replay run was lost. | Void. The slot runs again. |
+| `void-owner` | The owner halted the project or cancelled the job. | Void. The slot runs again later. |
+
+A slot gets at most three attempts. After three voids in a row, the job pauses with `trial-voids`. A dialog that the project's permission pipeline leaves to a person ends the trial `permission`. For a project that the host permission agent serves, the agent decides trial dialogs as it does production dialogs.
+
+**Grades.** A grade holds `expectedPassed`, `expectedTotal`, `guardPassed`, `resolved`, `overwritten`, `diff`, and `isolation`. An unknown count is `null`, never `0`. `expectedPassed` is null when no report parses. `diff` is null when the change counts cannot be read. A null `expectedPassed` never resolves a trial. A result larger than the 1 MiB limit ends `scope-violation`.
+
+**Isolation.** A trial is labelled `isolated` only when the eval identity is `ready`, its fetch of the repository is refused both directly and through the proxy, and the source is clean. Otherwise it is labelled `none`. Egress mode matters here: [egress](../deploy/ubuntu/egress.md#6-eval-identities) says why the proxy must be in enforce mode for that label.
+
+**Storage.** Trial rows are kept 365 days by default, and patches 90 days. The host keeps at most 256 MiB of patches. The hourly sweep removes what has expired. Sealed fields are the configuration, the probe facts, the grade, and the patch. The plain columns hold only ids, enumerations, counts, times, and blind indexes.
+
+#### Gates and waits
+
+One trial runs host-wide at a time. Validation and trials share the grader, one step at a time. A baseline job that cannot start a trial says why in its `waiting` field:
+
+| Wait | Cause |
+|---|---|
+| `eval-identity` | The eval identity is not `ready`, or the job's provider has no `eval.member.agents` entry. |
+| `grader` | The grader is not `ready`, or its launcher is version 1. |
+| `window` | The current hour is outside every window. |
+| `host-load` | The host load is high. It is checked before each trial. |
+| `halt` | The project is halted. |
+| `storage` | The grader has less than 10 GiB or 200,000 inodes free. |
+| `another-job` | A trial or a validation task of another job runs. |
+| `provider-limit` | The configuration's provider has an active limit. |
+| `session-slots` | Fewer than four host session slots are free. |
+| `daily-cap` | `trialsPerDay` trials have started today. |
+
+The reasons that stop a job are `trial-voids` (three voids in a row), `eval-processes-alive` (a process of the eval account survived `stop`, and the job is blocked until the owner resumes it), and `configuration-changed`, with the validate job's reasons.
+
+`trialsPerDay` is the stand-in for the learning budget. It bounds the count of trials and nothing else. It has no USD limits, no reservation, no estimate, and no learning floor, and no duel gate exists yet. The delegated adoption design's standing budget (delivery step 4, "The standing budget") replaces it, and removes the field.
+
+#### Missing while a launcher refuses
+
+Nothing in this change is installed. Until the owner installs each part, the state shows what is missing:
+
+- **No `eval.member`:** the summary shows `eval identity not-configured`, and a baseline job waits `eval-identity`.
+- **Launcher not installed, or failing:** the summary shows `eval identity unavailable`, and a baseline job waits `eval-identity`.
+- **Grader version 1:** the summary shows `grader ready (version 1: no trials)`, and a baseline job waits `grader`. Validation runs as before.
+- **A provider wrapper refused:** the replay launch fails, and the trial ends `void-host`. Three such trials pause the job `trial-voids`.
+
+The owner chooses these. The defaults are the ones this slice builds: the windows of a job (none, so any hour); `trialsPerDay` (off; the recommended first value is 6); the hosts in `_eval` and `_eval-setup` (none by default); the files of the home template; and the fallback estimate, which waits for the standing budget.
+
+#### Summary and status
+
+The summary and `infinite eval status PROJECT` add three things. The eval identity line is `eval identity STATE`. The trial line is `trials today N of CAP`, or `trials off` without a cap. The grader line shows `grader ready (version 1: no trials)` when the grader's version is below 2. A baseline job prints `tasks R of P (skipped S) · trials started N of P, graded N, resolved N, ended N, void N`.
+
+#### Not built yet
+
+These arrive in later steps of the delivery order:
+
+- the dev and holdout sets, the exposure of a group, and `excludeGroups`;
+- trial reuse, and the `compare` and `confirm` jobs;
+- the standing budget, with `reserve`, `settle`, `status`, the USD limits, the learning floor, and `estimate-unavailable`;
+- pinned guidance, forced knowledge, prompt overrides, and the `gate` purpose;
+- duel judges and the open-duel gate;
+- run-level replay and the blind rubric;
+- a `promptOrigins` filter.
+
 ### Not in this slice
 
 These arrive in later steps of the delivery order:
 
-- trials, the eval identity, grading, and `baseline` jobs;
 - the dev and holdout sets, and the exposure of a group;
 - reports, priors, and their routes;
-- `candidateProfiles`, `memberProfile`, and `trialMinutes`;
 - a scheduled revalidation. An owner starts one with `revalidate`.
 
 Also not in this slice:

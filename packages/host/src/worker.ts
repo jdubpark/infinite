@@ -1669,7 +1669,7 @@ server.listen(socketPath(runDir, session.id), async () => {
     }
     // With autonomy.boundary.egress, the session reaches the network through the egress proxy under its own credential.
     // Without the key it gets the proxy with no credential, so its requests are refused rather than sent direct.
-    const egress = workerEgressEnvironment(session.projectId, session.id);
+    const egress = workerEgressEnvironment(session.projectId, session.id, process.env, Date.now(), session.purpose);
     if (egress.status === "invalid") throw new Error("The egress proxy address this worker inherited is unusable, so the session was not started");
     clearEgressEnvironment(env); Object.assign(env, egress.env);
     if (egress.status === "no-key") journal.append("lifecycle", { egress: "no-credential" });

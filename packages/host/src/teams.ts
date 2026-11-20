@@ -61,6 +61,7 @@ import { autonomyStartEvent, intentCheckPin, startMode } from "./evaluator-profi
 export { TeamError } from "./team-workspace.js";
 import { changeIndex, changedPathList, diffStat } from "./team-changes.js";
 import { recommendationLine, recommendationOutcome } from "./question-recommendation.js";
+import { integrationGauge } from "./outcome-gauges.js";
 export { changeIndex };
 
 type Mutation = { requestId: string; revision: number; text: string };
@@ -5596,6 +5597,7 @@ export class TeamService {
         changes: change ? changeIndex(change.nameStatus, change.numstat, head, timestamp()) : undefined,
         changedPaths: change?.taskPaths !== undefined ? changedPathList(change.taskPaths) : undefined };
     }, ({ commit, head, diff, changes, changedPaths }) => {
+      const headBefore = run.headCommit;
       run.headCommit = head; stored.checkHead = undefined; run.review = undefined;
       // Only a new commit moves the range; a no-change result keeps the index it already recorded.
       if (commit) { if (changes) run.changes = changes; else delete run.changes; }
@@ -5606,6 +5608,7 @@ export class TeamService {
         if (changedPaths) task.changedPaths = changedPaths; else delete task.changedPaths;
         this.emitWith(stored, "task.integrated", [member.revision, task.id], { memberId: member.memberId, taskId: task.id, revision: member.revision }, () => ({
           commit, headCommit: head, baseCommit: run.baseCommit, memberBaseCommit: member.baseCommit, diff: task.diffStat,
+          integration: integrationGauge({ tasks: run.tasks, taskId: task.id, memberBase: member.baseCommit, headBefore, changedPaths: task.changedPaths ?? (commit ? undefined : { paths: [], truncated: false }) }),
         }));
         if (commit && member.role === "implementer" && !run.replay) this.captureIntegrated(stored, member, task, commit, head);
       }

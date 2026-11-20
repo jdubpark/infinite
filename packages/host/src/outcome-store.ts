@@ -54,7 +54,7 @@ export const OUTCOME_KINDS: readonly string[] = [
 export type MemberResultDisposition = "open" | "reported" | "stalled" | "no-report" | "limit" | "owner-stop" | "host-stop";
 
 /** Sealed in `outcomes.payload`. A row never holds an objective, instructions, a summary, a path, or a URL. */
-export type OutcomePayload = {
+export type OutcomePayload = import("./outcome-gauges.js").GaugePayload & {
   projectId: string;
   taskId: string;
   area: string;

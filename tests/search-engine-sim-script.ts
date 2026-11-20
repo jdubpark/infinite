@@ -30,8 +30,9 @@ import { bump, type Counts, type Rand, rand } from "./outcome-sim-script.js";
  *    pairs and `attempts`, names known families distinct from each other and the champion's, none limited, never while
  *    another search is wide or launching; under after-fail only once the champion failed or left, under together also
  *    at arming; launches are numbered 1, 2, … and never start while one waits for its receipt.
- * S3 An ended search never changes and decides nothing, except that the first receipt of its pending launch clears it
- *    and stops every member it names; states move only forward along the design's transitions.
+ * S3 An ended search changes only by the first receipt of its pending launch, which clears it and, when it names a
+ *    member, marks it widened; it decides only stops, its count, a pause and a cancel; states move only forward along
+ *    the design's transitions.
  * S4 Gate runs follow capture order, one outstanding at a time, at the captured commit; when a search resolves, every
  *    result captured before the winner failed its gate.
  * S5 Nothing is gated after a pass, also not in the step that resolves the search.
@@ -47,15 +48,20 @@ import { bump, type Counts, type Rand, rand } from "./outcome-sim-script.js";
  *    on a search that never armed.
  * S9 A search arms only in the step of a failed base run of a `live` search, always does when it stays open, and stays armed.
  * S10 The brake and the pause: admission refuses with condition 6 exactly while the project is paused, the run has had
- *    two searches, or a search is wide; a `pause` comes from every widened end that leaves the brake engaged, and the
- *    pause holds until the owner resumes.
+ *    two searches, or a search is wide or has a launch out (ended or not); a search counts toward the brake exactly
+ *    once, with the oracle's class, in the first step in which the simulator has delivered a first receipt that named a
+ *    member and the search has ended (so a receipt after the end counts it); a `pause` comes with every count that
+ *    leaves the brake engaged, and the pause holds until the owner resumes.
  * S11 A `measure` search starts no challenger, captures nothing, holds and releases nothing; its base run comes at the
  *    boundary; it is `measured` only after a failed base run with the champion's gate result.
- * S12 A restart at rest re-derives the search's queued base run, its waiting captures (a set: none has completed, so
- *    none has an order), its outstanding gate run, and the launch that waits for its receipt, and starts no new launch.
- * S13 Receipts: every member of a launch's first receipt is a contestant or stopped in that step; a repeated receipt,
- *    or an event of a member or launch the search does not know, does what the time passing alone does; no stop ever
- *    names the winner.
+ * S12 A restart at rest re-derives an open search's queued base run, its waiting captures (a set: none has completed,
+ *    so none has an order), its outstanding gate run, and the launch that waits for its receipt, and starts no new
+ *    launch. The host resumes every open search and every ended one with a launch out.
+ * S13 Receipts: every member of a launch's first receipt is a contestant or stopped in that step, and after the end
+ *    exactly those are stopped; a repeated receipt, or an event of a member or launch the search does not know, does
+ *    what the time passing alone does; no stop ever names the winner; the step that ends a search with a launch out
+ *    cancels that launch once, and so does a restart that finds it ended so; every launch has its receipt by the end
+ *    of the run (the model host answers a cancelled launch with the members it prepared, or none).
  * S14 A stop never names a member whose result arrived in an earlier step, and a stopped member is never captured or gated.
  *
  * Each invariant has at least one mutant engine in tests/search-engine-sim.test.ts (an in-process wrapper of `admit` or
@@ -99,12 +105,16 @@ type Plan = ResultPlan | { kind: "leave"; reason: LeaveReason };
 type Member = { id: string; taskId: string; profileId: string; challenger: boolean; working: boolean; acked: boolean; plan: Plan };
 type Op = { kind: "base" | "capture" | "gate" | "work"; taskId?: string; memberId?: string; outcome?: GateOutcome; stale?: boolean };
 /** A `start-challengers` decision as the host keeps it: the intent (memory only), the prepared members, receipts due. */
-type Launch = { n: number; profileIds: string[]; intent: boolean; members?: Member[]; acked: boolean; due: number; delay: number };
+type Launch = { n: number; profileIds: string[]; intent: boolean; members?: Member[]; acked: boolean; due: number; delay: number; slow: boolean };
 /** What the simulator delivered to and received from one search: the facts the checks compare against. */
 type Ledger = {
   base?: GateOutcome | "yielded"; captures: string[]; outstanding?: string; integrates: number; releases: number;
   gated: { memberId: string; outcome: GateOutcome }[]; okCaptures: Map<string, number>; stopped: Set<string>; resulted: Set<string>;
   hold?: number; wait?: number; window?: number;
+  /** A first receipt that named a member was delivered, and the search's count toward the brake was checked. */
+  widened: boolean; counted: boolean;
+  /** The class the design gives the search at its end, from the simulator's oracle. */
+  oracleClass?: SearchClass;
 };
 type Task = { id: string; prepared: boolean; done: boolean; champion?: Member; search?: SearchState; ledger: Ledger; launches: Launch[] };
 /** How the simulator produced an event: a gate run that reported after its search ended, a launch receipt, a ghost. */
@@ -146,7 +156,8 @@ const championDone = (s: SearchState) => {
 };
 const at = (ms: number) => new Date(ms).toISOString();
 const commitOf = (memberId: string) => `${memberId}:commit`;
-const newLedger = (): Ledger => ({ captures: [], integrates: 0, releases: 0, gated: [], okCaptures: new Map(), stopped: new Set(), resulted: new Set() });
+const newLedger = (): Ledger => ({ captures: [], integrates: 0, releases: 0, gated: [], okCaptures: new Map(), stopped: new Set(), resulted: new Set(),
+  widened: false, counted: false });
 
 class RunSim {
   private readonly policy: SearchPolicy;
@@ -171,7 +182,7 @@ class RunSim {
     private readonly project: Project, private readonly label: string) {
     const live = r.chance(0.75);
     this.policy = searchPolicy({ mode: live ? "live" : "measure", start: r.chance(0.35) ? "together" : "after-fail", share: r.pick([0.1, 0.25]),
-      attempts: r.int(2, 4), gateMinutes: r.pick([5, 15, 30, 60]), waitMinutes: r.pick([5, 30, 60, 120]) });
+      attempts: r.pick([2, 3, 4, 4]), gateMinutes: r.pick([5, 15, 30, 60]), waitMinutes: r.pick([5, 30, 60, 120]) });
     this.checkMinutes = r.pick([10, 30, 60]);
     const count = r.int(1, 3);
     this.tasks = Array.from({ length: count }, (_, index) => ({ id: `t${index + 1}`, prepared: false, done: false, ledger: newLedger(), launches: [] }));
@@ -191,6 +202,7 @@ class RunSim {
       this.settleOps();
     }
     for (const task of this.tasks) if (task.search && isOpen(task.search)) this.fail("S7", `${task.id}'s search is still ${task.search.state} at the end of the run`);
+    for (const task of this.tasks) for (const l of task.launches) if (!l.acked) this.fail("S13", `launch ${l.n} never got its receipt`, task);
   }
 
   private where(task?: Task): string {
@@ -222,9 +234,9 @@ class RunSim {
     return this.tasks.filter(task => task.search !== undefined && isOpen(task.search));
   }
 
-  /** A search the host sees as wide for conditions 6 and 9: `wide`, or open with a launch that waits for its receipt. */
+  /** A search the host sees as wide for conditions 6 and 9: `wide`, or with a launch that waits for its receipt, ended or not. */
   private wide(task: Task): boolean {
-    return task.search !== undefined && isOpen(task.search) && (task.search.state === "wide" || task.launches.some(l => !l.acked));
+    return (task.search !== undefined && isOpen(task.search) && task.search.state === "wide") || task.launches.some(l => !l.acked);
   }
 
   private actions(): (readonly [number, () => void])[] {
@@ -232,7 +244,7 @@ class RunSim {
     const later = (minutes: number, action: () => void) => () => { this.clock += minutes * MINUTE; action(); };
     for (const task of this.tasks) {
       for (const l of task.launches) {
-        if (l.intent) list.push([8, later(this.r.int(0, 2), () => this.prepareLaunch(task, l))]);
+        if (l.intent) list.push([l.slow ? 0.3 : 8, later(this.r.int(0, 2), () => this.prepareLaunch(task, l))]);
         else if (l.members !== undefined && l.due > 0) list.push([8, later(l.delay, () => this.receipt(task, l))]);
       }
     }
@@ -242,14 +254,20 @@ class RunSim {
     for (const m of this.members) if (m.working && (!m.challenger || m.acked)) list.push([3, later(this.r.int(0, 12), () => this.act(m))]);
     if (this.current) list.push([4, later(this.r.int(0, 12), () => this.complete())]);
     if (this.boundaryReady()) list.push([4, later(this.r.int(0, 5), () => this.boundary())]);
+    // A restart is likelier while a slow launch waits for its preparation, so that the restart loses it, and while an
+    // ended search's launch waits for its receipt, so that the restart finds the search ended.
+    const endedLaunch = this.tasks.some(task => task.search && !isOpen(task.search) && task.launches.some(l => !l.acked));
+    const slowLaunch = this.tasks.some(task => task.launches.some(l => l.intent && l.slow));
     if (this.openTasks().length > 0) {
       list.push([1, later(this.r.int(15, 90), () => this.tick())]);
       list.push([0.3, later(this.r.int(0, 5), () => this.queue.push({ kind: "work" }))]);
       list.push([0.06, later(this.r.int(0, 5), () => this.halt())]);
-      list.push([0.12, later(this.r.int(0, 5), () => this.restart())]);
+      list.push([endedLaunch || slowLaunch ? 1 : 0.12, later(this.r.int(0, 5), () => this.restart())]);
       list.push([0.4, later(this.r.int(0, 5), () => { this.loadHold = !this.loadHold; bump(this.counts, `load-hold:${this.loadHold ? "on" : "off"}`); })]);
       list.push([0.5, () => this.jump()]);
       list.push([0.2, later(this.r.int(0, 5), () => this.ghost())]);
+    } else if (endedLaunch) {
+      list.push([1, later(this.r.int(0, 5), () => this.restart())]);
     }
     if (list.length === 0) list.push([1, later(5, () => undefined)]);
     return list;
@@ -279,7 +297,7 @@ class RunSim {
       otherSearchWide: this.tasks.some(other => other !== task && this.wide(other)),
       ...(family === undefined ? {} : { championFamily: family }),
       candidates: this.candidates.filter(c => c.profileId !== task.champion!.profileId),
-      spareWorkerSlots: this.r.pick([0, 1, 1, 2, 3, 4]), freeSessionSlots: this.r.pick([0, 1, 2, 2, 3, 4]),
+      spareWorkerSlots: this.r.pick([0, 1, 2, 2, 3, 4]), freeSessionSlots: this.r.pick([0, 1, 2, 3, 3, 4]),
       spareAttempts: this.spare(), widened: [...this.project.history],
     };
   }
@@ -418,7 +436,8 @@ class RunSim {
       l.intent = false;
       bump(this.counts, "fault:launch-lost");
     }
-    for (const task of this.openTasks()) this.deliver(task, { kind: "resume" });
+    // The host resumes every open search, and every ended one whose launch still waits for its receipt.
+    for (const task of this.tasks) if (task.search && (isOpen(task.search) || task.launches.some(l => !l.acked))) this.deliver(task, { kind: "resume" });
   }
 
   /** An event of a member or a launch the search does not know. */
@@ -504,7 +523,8 @@ class RunSim {
       } else if (d.kind === "start-challengers") {
         // A repeated decision prepares a launch whose intent a restart lost, or delivers the prepared one's receipt again.
         const known = task.launches.find(l => l.n === d.launch);
-        if (known === undefined) task.launches.push({ n: d.launch, profileIds: [...d.profileIds], intent: true, acked: false, due: 0, delay: 0 });
+        // Some launches wait long for preparation, so the hold, the wait, a halt or a restart can overtake them.
+        if (known === undefined) task.launches.push({ n: d.launch, profileIds: [...d.profileIds], intent: true, acked: false, due: 0, delay: 0, slow: this.r.chance(0.2) });
         else if (known.members === undefined) known.intent = true;
         else known.due += 1;
       } else if (d.kind === "stop") {
@@ -514,6 +534,13 @@ class RunSim {
       else if (d.kind === "release") {
         task.done = true;
         task.champion!.working = false; // A champion that still works goes on as a single attempt, outside the simulator.
+      } else if (d.kind === "cancel-launch") {
+        // The host prepares nothing more for the launch and owes its one receipt: an empty one when nothing was prepared.
+        const l = task.launches.find(item => item.n === d.launch);
+        if (l !== undefined && !l.acked && l.members === undefined) {
+          bump(this.counts, l.intent ? "cancel:unprepared" : "cancel:lost-in-restart");
+          Object.assign(l, { intent: false, members: [], due: 1, delay: this.r.chance(0.3) ? this.r.int(5, 40) : 0 });
+        } else if (l !== undefined && !l.acked) bump(this.counts, "cancel:prepared");
       } else if (d.kind === "pause") this.project.paused = true;
     }
   }
@@ -546,6 +573,28 @@ class RunSim {
     const stops = decisions.flatMap(d => (d.kind === "stop" ? d.memberIds : []));
     this.parse(next, task);
 
+    // S10: a search counts toward the brake once, from the receipts the simulator delivered: in the first step in which
+    // a first receipt that named a member has been delivered and the search has ended (at its end, or at a receipt that
+    // arrives after it), with the oracle's class; a pause comes with every count that leaves the brake engaged.
+    const named = event.kind === "started" && meta.receipt === "first" && event.challengers.length > 0;
+    const checkCount = (endedNow: boolean) => {
+      if (named) ledger.widened = true;
+      const counted = decisions.filter(d => d.kind === "widened");
+      const pauses = of("pause").length;
+      if (!ledger.widened || isOpen(next) || ledger.counted) {
+        if (counted.length + pauses > 0) fail("S10", `${counted.length} counts and ${pauses} pauses from a search that owes none`);
+        return;
+      }
+      ledger.counted = true;
+      const searchClass = ledger.oracleClass ?? "none";
+      const expectPause = engaged([...this.project.history, searchClass]);
+      if (!isDeepStrictEqual(counted, [{ kind: "widened", class: searchClass }])) fail("S10", `counted ${JSON.stringify(counted)}, expected ${searchClass} once`);
+      if (pauses !== (expectPause ? 1 : 0)) fail("S10", `pause ${pauses}, expected ${expectPause ? 1 : 0}`);
+      this.project.history.push(searchClass);
+      bump(this.counts, endedNow ? "end:widened" : "count:late");
+      if (expectPause) bump(this.counts, this.project.paused ? "pause:again" : "pause:first");
+    };
+
     // S13
     if (event.kind === "started" && meta.receipt === "first") {
       for (const { memberId } of event.challengers) {
@@ -558,6 +607,12 @@ class RunSim {
     }
     const winner = next.winner ?? prev.winner;
     if (winner !== undefined && stops.includes(winner)) fail("S13", `the winner ${winner} was stopped`);
+    // An end with a launch out cancels it once, and so does a restart that finds the search ended with it out.
+    const out = task.launches.find(l => !l.acked);
+    const cancels = decisions.flatMap(d => (d.kind === "cancel-launch" ? [d.launch] : []));
+    const owed = out !== undefined && !isOpen(next) && (isOpen(prev) || event.kind === "resume");
+    if (!isDeepStrictEqual(cancels, owed ? [out.n] : [])) fail("S13", `cancelled ${JSON.stringify(cancels)} with launch ${out?.n ?? "none"} out`);
+    if (owed) bump(this.counts, isOpen(prev) ? "cancel:at-end" : "cancel:at-restart");
 
     // S14
     for (const id of stops) {
@@ -569,13 +624,16 @@ class RunSim {
     }
     if (event.kind === "result" && !meta.ghost) ledger.resulted.add(event.memberId);
 
-    // S3
+    // S3: an ended search changes only by its launch's first receipt, which clears it and, naming a member, widens it.
     if (!isOpen(prev)) {
       const late = event.kind === "started" && meta.receipt === "first";
       const { pending: _pending, ...settled } = prev;
-      if (!isDeepStrictEqual(next, late ? settled : prev)) fail("S3", `an ended (${prev.state}) search changed`);
-      const want = late && event.challengers.length > 0 ? [{ kind: "stop", memberIds: event.challengers.map(c => c.memberId), reason: "host" }] : [];
-      if (!isDeepStrictEqual(decisions, want)) fail("S3", "an ended search decided");
+      if (!isDeepStrictEqual(next, !late ? prev : named ? { ...settled, widened: true } : settled)) fail("S3", `an ended (${prev.state}) search changed`);
+      const other = decisions.filter(d => !["stop", "widened", "pause", "cancel-launch"].includes(d.kind));
+      if (other.length > 0) fail("S3", `an ended search decided ${other.map(d => d.kind).join(", ")}`);
+      const want = named ? [{ kind: "stop", memberIds: event.challengers.map(c => c.memberId), reason: "host" }] : [];
+      if (!isDeepStrictEqual(of("stop"), want)) fail("S13", "a receipt after the end stops other members than it names");
+      checkCount(false);
       return;
     }
     if (!NEXT[prev.state]!.includes(next.state)) fail("S3", `${prev.state} moved to ${next.state}`);
@@ -617,6 +675,12 @@ class RunSim {
       if (live && (failed || left)) ledger.wait ??= now + this.policy.waitMinutes * MINUTE;
       if (!live && event.kind === "boundary") ledger.window ??= now + windowMinutes(this.policy, event.searches) * MINUTE;
     }
+
+    // S9, first: arming is what the later checks build on.
+    const failedBase = event.kind === "base" && event.outcome === "fail";
+    if (prev.armedAt === undefined && next.armedAt !== undefined && !(failedBase && live)) fail("S9", "armed without a failed base run of a live search");
+    if (prev.armedAt !== undefined && next.armedAt !== prev.armedAt) fail("S9", "armedAt changed");
+    if (failedBase && live && prev.state === "admitting" && isOpen(next) && next.armedAt === undefined) fail("S9", "a failed base run left the search unarmed");
 
     // S1
     const integrates = of("integrate");
@@ -692,28 +756,18 @@ class RunSim {
     if (ended && live && next.armedAt !== undefined) {
       const expected: SearchClass = next.winner === undefined ? "none" : next.winner === first.memberId ? "champion-pass"
         : championDone(next) ? "rescued" : "challenger-first";
+      ledger.oracleClass = expected;
       if (next.class !== expected) fail("S8", `class ${next.class}, expected ${expected}`);
       if (next.class === "challenger-first" && this.policy.start !== "together") fail("S8", "challenger-first under after-fail");
     } else if (next.class !== undefined) fail("S8", `class ${next.class} on a search that is open, measured, or never armed`);
 
-    // S9
-    const failedBase = event.kind === "base" && event.outcome === "fail";
-    if (prev.armedAt === undefined && next.armedAt !== undefined && !(failedBase && live)) fail("S9", "armed without a failed base run of a live search");
-    if (prev.armedAt !== undefined && next.armedAt !== prev.armedAt) fail("S9", "armedAt changed");
-    if (failedBase && live && prev.state === "admitting" && isOpen(next) && next.armedAt === undefined) fail("S9", "a failed base run left the search unarmed");
-
-    // S10: the pause.
+    // S10
     if (ended) {
-      const widened = live && next.contestants.length > 1;
-      const expectPause = widened && engaged([...this.project.history, next.class ?? "none"]);
-      if (of("pause").length !== (expectPause ? 1 : 0)) fail("S10", `pause ${of("pause").length}, expected ${expectPause ? 1 : 0}`);
-      if (widened) this.project.history.push(next.class ?? "none");
       bump(this.counts, `end:${next.state}`);
       bump(this.counts, `reason:${next.endReason ?? next.state}`);
       if (next.class !== undefined) bump(this.counts, `class:${next.class}`);
-      if (widened) bump(this.counts, "end:widened");
-      if (expectPause) bump(this.counts, this.project.paused ? "pause:again" : "pause:first");
-    } else if (of("pause").length > 0) fail("S10", "a pause from a search that goes on");
+    }
+    checkCount(ended);
 
     // S11
     if (!live) {
@@ -774,7 +828,9 @@ class RunSim {
 /** One seed: four runs in one project whose brake history starts from a random prior, paused when it engages the brake. */
 export function simulate(seed: number, engine: Engine, counts: Counts): void {
   const r = rand(seed);
-  const history: SearchClass[] = Array.from({ length: r.int(0, 14) }, () => weighted(r, [[25, "rescued"], [35, "none"], [30, "champion-pass"], [10, "challenger-first"]] as const));
+  // A third of the projects start one widened search short of the brake's window, so that counts engage it often.
+  const length = r.chance(0.33) ? 9 : r.int(0, 14);
+  const history: SearchClass[] = Array.from({ length }, () => weighted(r, [[25, "rescued"], [35, "none"], [30, "champion-pass"], [10, "challenger-first"]] as const));
   const project: Project = { history, paused: engaged(history) };
   for (let run = 1; run <= RUNS_PER_SEED; run += 1) {
     new RunSim(r, engine, counts, project, `seed ${seed} run ${run} (reproduce with SEARCH_SIM_SEED=${seed})`).run();

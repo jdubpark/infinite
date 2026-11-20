@@ -23,17 +23,19 @@ const sortedCounts = (counts: Counts) => Object.entries(counts).sort(([a], [b]) 
 
 /**
  * Floors for the default corpus at about half of what it produced, so a generator that stops producing a case fails.
- * `challenger-first` ran 3 times: it needs `together`, a widening at arming, and a challenger gated before the champion.
+ * `challenger-first` ran 4 times: it needs `together`, a widening at arming, and a challenger gated before the champion.
+ * `pause:again` ran once: it needs a count that engages the brake while the project is already paused.
  */
 const FLOORS: Readonly<Record<string, number>> = {
-  "admission:admitted": 1400, "admission:refused-6": 360, "admission:refused-7": 240, "owner:pause": 45, "owner:resume": 60, "decision:pause": 10,
-  "pause:again": 1, "class:champion-pass": 90, "class:rescued": 11, "class:challenger-first": 1, "class:none": 460,
-  "end:resolved": 100, "end:exhausted": 340, "end:measured": 110, "end:widened": 170, "widen:arming": 100, "widen:champion-done": 135,
-  "reason:all-failed": 49, "reason:wait": 90, "reason:hold": 70, "reason:no-challenger": 130, "reason:deadline": 40, "reason:window": 58,
-  "reason:base-pass": 60, "reason:base-yielded": 67, "reason:champion-stall": 88, "reason:champion-question": 54,
-  "event:boundary": 230, "event:resume": 90, "fault:restart-during-operation": 55, "fault:unstoppable-gate": 19, "fault:late-gate-result": 10,
-  "fault:launch-lost": 2, "fuse:refused": 34, "receipt:first": 200, "receipt:repeat": 50, "receipt:after-end": 39, "receipt:crossing-timer": 23,
-  "fault:unknown-started": 50, "fault:unknown-result": 40, "clock:back": 320, "clock:forward": 210, "cutoff:holdUntil": 790, "cutoff:waitUntil": 300,
+  "admission:admitted": 1360, "admission:refused-6": 349, "admission:refused-7": 334, "owner:pause": 47, "owner:resume": 51, "decision:pause": 15,
+  "pause:again": 1, "class:champion-pass": 98, "class:rescued": 10, "class:challenger-first": 2, "class:none": 443, "end:resolved": 110,
+  "end:exhausted": 315, "end:measured": 101, "end:widened": 138, "widen:arming": 91, "widen:champion-done": 117, "reason:all-failed": 35,
+  "reason:wait": 89, "reason:hold": 55, "reason:no-challenger": 135, "reason:deadline": 28, "reason:window": 45, "reason:base-pass": 70,
+  "reason:base-yielded": 61, "reason:champion-stall": 87, "reason:champion-question": 57, "event:boundary": 217, "event:resume": 140,
+  "fault:restart-during-operation": 63, "fault:unstoppable-gate": 13, "fault:late-gate-result": 4, "fault:launch-lost": 31, "fuse:refused": 32,
+  "receipt:first": 151, "receipt:repeat": 36, "receipt:after-end": 57, "receipt:crossing-timer": 22, "fault:unknown-started": 45,
+  "fault:unknown-result": 48, "clock:back": 319, "clock:forward": 241, "cutoff:holdUntil": 761, "cutoff:waitUntil": 289, "cancel:at-end": 57,
+  "cancel:at-restart": 5, "cancel:lost-in-restart": 3, "cancel:prepared": 16, "cancel:unprepared": 43, "count:late": 11,
 };
 
 test("the search engine keeps its invariants under seeded event orders", t => {
@@ -86,6 +88,8 @@ const MUTATIONS: readonly Mutation[] = [
     if (s.pending === undefined || e.kind === "started" || e.kind === "resume") return step(s, e, v);
     const out = step(withoutKey(s, "pending"), e, v);
     out.search.pending ??= s.pending;
+    // Only the widening is wrong: an end in this step still cancels the launch that is out.
+    if (!isOpen(out.search) && !out.decisions.some(d => d.kind === "cancel-launch")) out.decisions.push({ kind: "cancel-launch", launch: out.search.launches! });
     return out;
   }) },
   { name: "an ended search records a late gate result", invariant: "S3", engine: wrapStep((s, e, v) => {
@@ -193,6 +197,21 @@ const MUTATIONS: readonly Mutation[] = [
   }) },
   { name: "a receipt counts for the pending launch whatever its number", invariant: "S13", engine: wrapStep((s, e, v) =>
     step(s, e.kind === "started" && s.launches !== undefined ? { ...e, launch: s.launches } : e, v)) },
+  { name: "the end of a search does not cancel its launch", invariant: "S13", engine: wrapStep((s, e, v) => {
+    const out = step(s, e, v);
+    if (isOpen(s)) out.decisions = out.decisions.filter(d => d.kind !== "cancel-launch");
+    return out;
+  }) },
+  { name: "a restart that finds the search ended does not cancel its launch", invariant: "S13", engine: wrapStep((s, e, v) => {
+    const out = step(s, e, v);
+    if (!isOpen(s)) out.decisions = out.decisions.filter(d => d.kind !== "cancel-launch");
+    return out;
+  }) },
+  { name: "a receipt after the end is not counted toward the brake", invariant: "S10", engine: wrapStep((s, e, v) => {
+    const out = step(s, e, v);
+    if (!isOpen(s) && e.kind === "started") out.decisions = out.decisions.filter(d => d.kind !== "widened" && d.kind !== "pause");
+    return out;
+  }) },
   { name: "the wait also stops challengers whose result arrived", invariant: "S14", engine: wrapStep((s, e, v) => {
     const out = step(s, e, v);
     const reported = out.search.contestants.slice(1).filter(c => c.resultAt !== undefined && c.gate === undefined).map(c => c.memberId);

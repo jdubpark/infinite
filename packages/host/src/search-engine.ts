@@ -93,10 +93,13 @@ export const searchStateSchema = z.object({
   // only record that tells an abandoned search that armed (source `search`) from one that did not (source `production`).
   armedAt: isoTime.optional(),
   // PROPOSED: the number of `start-challengers` decisions the search made, and the profiles of the last one while it
-  // waits for its receipt. A receipt counts once, and only for that launch; a pending launch outlives the search's end
-  // so that members acknowledged late are stopped (rules 4 and 8).
+  // waits for its receipt. A receipt counts once, and only for that launch. A pending launch outlives the search's end:
+  // the end cancels it, and its one receipt, which may name no member, clears it and stops the members it names.
   launches: z.number().int().min(1).optional(),
   pending: z.array(z.string().min(1)).min(1).max(3).optional(),
+  // PROPOSED: a receipt named at least one member, so the search counts once toward the brake (Part 8): at its end, or
+  // at that receipt when it arrives after the end.
+  widened: z.literal(true).optional(),
   // A `live` search: rule 6. PROPOSED: a `measure` search keeps the end of the run's measurement window here (Part 3).
   holdUntil: isoTime.optional(),
   waitUntil: isoTime.optional(),
@@ -190,6 +193,13 @@ export type Decision =
   | { kind: "integrate"; memberId: string }
   /** The champion is handled as if no search had run, once the search's open gate run has closed (rule 8). */
   | { kind: "release"; memberId: string; state: "exhausted" | "abandoned"; reason: string }
+  /**
+   * PROPOSED: the search ended, or a restart found it ended, while launch `launch` waits for its receipt. The host
+   * prepares no further member for it and delivers its one receipt, naming the members it already prepared (or none).
+   */
+  | { kind: "cancel-launch"; launch: number }
+  /** A widened search counts toward the brake: the host appends `class` to the project's widened history (Part 8). */
+  | { kind: "widened"; class: SearchClass }
   /** The brake is engaged: the host pauses searches for the project until the owner resumes them (Part 8). */
   | { kind: "pause" };
 
@@ -333,18 +343,23 @@ function nextGate(s: SearchState): Contestant | undefined {
 
 /**
  * Applies the time rules (the hold, the wait, the measurement window) and then one event. Returns the next state and
- * what the host does. An ended search changes only when the receipt of its pending launch arrives. Events that do not
- * apply to the current state (a stale gate result, a second report, an unknown member or launch) change nothing.
+ * what the host does. An ended search changes only when the receipt of its pending launch arrives, and decides only
+ * that receipt's stops and count, or, at a restart, the cancellation of that launch. Events that do not apply to the
+ * current state (a stale gate result, a second report, an unknown member or launch) change nothing.
  */
 export function step(search: SearchState, event: SearchEvent, view: RunView): Step {
   const s = structuredClone(search);
   const ctx: Ctx = { s, view, out: [] };
+  const wasOpen = isOpen(s);
   const head = nextGate(s)?.memberId;
   // PROPOSED: the time rules apply before the step's event, a halt included: a hold that has passed ends the search as
   // `exhausted` before a steer in the same step could abandon it.
-  if (isOpen(s)) advance(ctx);
+  if (wasOpen) advance(ctx);
   if (event.kind === "started") receive(ctx, event);
   else if (isOpen(s)) HANDLERS[event.kind](ctx, event as never);
+  // A search that ends with a launch out cancels it, and a restart that finds it so cancels it again, until the
+  // launch's receipt clears it. A receipt that arrives in the ending step needs no cancel.
+  if (!isOpen(s) && s.pending !== undefined && (wasOpen || event.kind === "resume")) ctx.out.push({ kind: "cancel-launch", launch: s.launches! });
   // PROPOSED: one gate decision is outstanding per search; the next is decided when its result arrives, so the engine,
   // not the host's queue, keeps capture order.
   const next = event.kind === "resume" ? undefined : nextGate(s);
@@ -423,6 +438,7 @@ function pickChallengers(s: SearchState, view: RunView): string[] {
  * one, changes nothing, so a repeated receipt never stops a member twice or a winner at all. Members of the launch's
  * profiles join an open search; every other member it names is stopped at once: all of them once the search has ended,
  * and, PROPOSED, one on a profile the launch did not name. Members that join after `waitUntil` are stopped by the wait.
+ * The first receipt that names a member makes the search widened; one that arrives after the end counts it at once.
  */
 function receive(ctx: Ctx, e: Receipt): void {
   const { s, view, out } = ctx;
@@ -437,7 +453,12 @@ function receive(ctx: Ctx, e: Receipt): void {
   });
   const away = fresh.filter(c => !joining.includes(c));
   if (away.length > 0) out.push(stop(away, "host"));
-  if (!isOpen(s)) return;
+  const first = fresh.length > 0 && s.widened === undefined;
+  if (first) s.widened = true;
+  if (!isOpen(s)) {
+    if (first) count(ctx);
+    return;
+  }
   const cutoff = reached(view.now, s.waitUntil);
   for (const { memberId, profileId } of joining) s.contestants.push({ memberId, profileId, ...(cutoff ? { left: "wait" } : {}) });
   if (cutoff && joining.length > 0) out.push(stop(joining, "wait"));
@@ -470,7 +491,7 @@ function classify(s: SearchState): SearchClass {
 
 /** Ends the search: stops what still works for it, then integrates the winner or releases the task (rules 4 and 8). */
 function end(ctx: Ctx, state: "resolved" | "exhausted" | "abandoned" | "measured", reason?: string): void {
-  const { s, view, out } = ctx;
+  const { s, out } = ctx;
   if (s.mode === "live" && s.armedAt !== undefined) s.class = classify(s);
   s.state = state;
   if (reason !== undefined) s.endReason = reason;
@@ -483,10 +504,19 @@ function end(ctx: Ctx, state: "resolved" | "exhausted" | "abandoned" | "measured
   if (running.length > 0) out.push(stop(running, "host"));
   if (state === "resolved") out.push({ kind: "integrate", memberId: s.winner! });
   else out.push({ kind: "release", memberId: champion(s).memberId, state: state === "exhausted" ? "exhausted" : "abandoned", reason: reason ?? state });
-  // PROPOSED: the brake counts every search that widened, whatever its end, by its class (an abandoned one is `none`),
-  // and every end that leaves it engaged emits `pause`. The pause is the host's stored state, which only the owner's
-  // resume clears (Part 8); a later rescue that disengages the brake does not.
-  if (s.contestants.length > 1 && brakeEngaged([...view.widened, s.class ?? "none"])) out.push({ kind: "pause" });
+  if (s.widened) count(ctx);
+}
+
+/**
+ * PROPOSED: the brake counts every search that widened, whatever its end, by its class (an abandoned one is `none`),
+ * exactly once, and every count that leaves it engaged emits `pause`. The pause is the host's stored state, which only
+ * the owner's resume clears (Part 8); a later rescue that disengages the brake does not.
+ */
+function count(ctx: Ctx): void {
+  const { s, view, out } = ctx;
+  const counted = s.class ?? "none";
+  out.push({ kind: "widened", class: counted });
+  if (brakeEngaged([...view.widened, counted])) out.push({ kind: "pause" });
 }
 
 /** Rule 2's leaves of the champion; its other leaves abandon the search (rule 9). */
@@ -609,8 +639,7 @@ const HANDLERS: Handlers = {
       for (const c of waiting) out.push({ kind: "capture", memberId: c.memberId });
       // PROPOSED (acceptance 16): the launch that waits for its receipt is decided again under its number. The host
       // prepares only the profiles of that launch that have no member yet and answers with one receipt of all of them,
-      // so no profile gets a second member. After a restart it also delivers the receipt of every launch it prepared
-      // and did not acknowledge, for an ended search too, which then stops those members.
+      // so no profile gets a second member.
       if (s.pending !== undefined) out.push({ kind: "start-challengers", launch: s.launches!, profileIds: [...s.pending], baseCommit: s.baseCommit });
     }
     const head = nextGate(s);

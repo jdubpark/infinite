@@ -124,6 +124,9 @@ function widened(policy: TeamSearch = {}): Drive {
 const kinds = (decisions: Decision[]) => decisions.map(d => d.kind);
 const release = (state: "exhausted" | "abandoned", reason: string): Decision => ({ kind: "release", memberId: CHAMPION, state, reason });
 const stop = (reason: string, ...memberIds: string[]): Decision => ({ kind: "stop", memberIds, reason });
+const counted = (searchClass: SearchClass): Decision => ({ kind: "widened", class: searchClass });
+const cancel = (n: number): Decision => ({ kind: "cancel-launch", launch: n });
+const history = (rescued: number, total = 10): SearchClass[] => Array.from({ length: total }, (_, index) => (index < rescued ? "rescued" : "none"));
 
 test("live: a failing base run arms the search with one implementer; any other base end abandons it with production rows (acceptance 3, 18)", () => {
   const admission = admit(facts());
@@ -216,7 +219,7 @@ test("the first result to pass in capture order wins; the others stop and a wait
   drive.at(50, { kind: "gated", memberId: "m-c2", outcome: "pass", ms: 1000 });
   assert.equal(drive.search.winner, "m-c2");
   assert.equal(drive.search.class, "rescued");
-  assert.deepEqual(drive.last, [{ kind: "stop-operations" }, stop("host", "m-c3"), { kind: "integrate", memberId: "m-c2" }]);
+  assert.deepEqual(drive.last, [{ kind: "stop-operations" }, stop("host", "m-c3"), { kind: "integrate", memberId: "m-c2" }, counted("rescued")]);
 
   const after = drive.search;
   const decided = drive.all.length;
@@ -256,7 +259,7 @@ test("every result failing, the wait, and the hold each end the search as exhaus
   allFail.at(45, { kind: "gated", memberId: "m-c1", outcome: "fail", ms: 1000 });
   assert.equal(allFail.search.state, "wide");
   allFail.at(50, { kind: "left", memberId: "m-c2", reason: "stall" });
-  assert.deepEqual(allFail.last, [stop("stall", "m-c2"), { kind: "stop-operations" }, release("exhausted", "all-failed")]);
+  assert.deepEqual(allFail.last, [stop("stall", "m-c2"), { kind: "stop-operations" }, release("exhausted", "all-failed"), counted("none")]);
   assert.equal(allFail.search.class, "none");
 
   // The champion failed at 30, so the wait ends at 90. m-c2's result was captured before then and is still gated.
@@ -266,7 +269,7 @@ test("every result failing, the wait, and the hold each end the search as exhaus
   assert.deepEqual(wait.last, [stop("wait", "m-c1")]);
   assert.equal(wait.search.state, "wide");
   wait.at(100, { kind: "gated", memberId: "m-c2", outcome: "fail", ms: 1000 });
-  assert.deepEqual(wait.last, [{ kind: "stop-operations" }, release("exhausted", "wait")]);
+  assert.deepEqual(wait.last, [{ kind: "stop-operations" }, release("exhausted", "wait"), counted("none")]);
 
   // The champion's result arrived at 10, so the hold ends at 10 + 3 × 35 + 60 = 175, before the wait (150 + 60).
   const hold = armed();
@@ -278,7 +281,7 @@ test("every result failing, the wait, and the hold each end the search as exhaus
   const steered = new Drive(hold.search);
   hold.at(175, { kind: "tick" });
   assert.deepEqual([hold.search.state, hold.search.endReason], ["exhausted", "hold"]);
-  assert.deepEqual(hold.last, [{ kind: "stop-operations" }, stop("host", "m-c2"), release("exhausted", "hold")]);
+  assert.deepEqual(hold.last, [{ kind: "stop-operations" }, stop("host", "m-c2"), release("exhausted", "hold"), counted("none")]);
   const released = hold.search;
   hold.at(180, { kind: "gated", memberId: "m-c1", outcome: "pass", ms: 1000 });
   assert.deepEqual(hold.search, released, "a gate run that closes after the hold changes nothing");
@@ -294,7 +297,7 @@ test("at the wait, a result that still waits for its capture does not hold the s
   assert.deepEqual(drive.last, [{ kind: "capture", memberId: "m-c1" }]);
   drive.at(90, { kind: "tick" });
   assert.deepEqual([drive.search.state, drive.search.endReason], ["exhausted", "wait"]);
-  assert.deepEqual(drive.last, [stop("wait", "m-c2"), { kind: "stop-operations" }, release("exhausted", "wait")]);
+  assert.deepEqual(drive.last, [stop("wait", "m-c2"), { kind: "stop-operations" }, release("exhausted", "wait"), counted("none")]);
 
   const gating = widened();
   gating.deliver(80, "m-c2");
@@ -305,7 +308,7 @@ test("at the wait, a result that still waits for its capture does not hold the s
   gating.at(92, { kind: "resume" });
   assert.deepEqual(gating.last, [{ kind: "gate", memberId: "m-c2", commit: "commit-m-c2" }], "a restart after the wait captures nothing again");
   gating.at(95, { kind: "gated", memberId: "m-c2", outcome: "fail", ms: 1000 });
-  assert.deepEqual(gating.last, [{ kind: "stop-operations" }, release("exhausted", "wait")], "the capture after the wait is not gated");
+  assert.deepEqual(gating.last, [{ kind: "stop-operations" }, release("exhausted", "wait"), counted("none")], "the capture after the wait is not gated");
   assert.equal(gating.member("m-c1").gate, undefined);
 });
 
@@ -317,7 +320,8 @@ test("a launch's receipt: members acknowledged after the end or the wait are sto
   assert.deepEqual(crossing.last, [launch(1, "p-gpt", "p-gemini")]);
   crossing.at(175, receipt(1, ["m-c1", "p-gpt"], ["m-c2", "p-gemini"]));
   assert.deepEqual([crossing.search.state, crossing.search.endReason], ["exhausted", "hold"]);
-  assert.deepEqual(crossing.last, [{ kind: "stop-operations" }, release("exhausted", "hold"), stop("host", "m-c1", "m-c2")]);
+  assert.deepEqual(crossing.last, [{ kind: "stop-operations" }, release("exhausted", "hold"), stop("host", "m-c1", "m-c2"), counted("none")],
+    "the receipt of the ending step needs no cancel, and it counts the search as widened");
   const ended = crossing.search;
   crossing.at(176, receipt(1, ["m-c1", "p-gpt"], ["m-c2", "p-gemini"]));
   assert.deepEqual([crossing.last, crossing.search], [[], ended], "a repeated receipt stops nothing twice");
@@ -328,7 +332,7 @@ test("a launch's receipt: members acknowledged after the end or the wait are sto
   afterWait.at(30, { kind: "gated", memberId: CHAMPION, outcome: "fail", ms: 1000 });
   afterWait.at(95, receipt(1, ["m-c1", "p-gpt"]));
   assert.deepEqual([afterWait.search.state, afterWait.search.endReason], ["exhausted", "wait"]);
-  assert.deepEqual(afterWait.last, [{ kind: "stop-operations" }, release("exhausted", "wait"), stop("host", "m-c1")]);
+  assert.deepEqual(afterWait.last, [{ kind: "stop-operations" }, release("exhausted", "wait"), stop("host", "m-c1"), counted("none")]);
 
   const won = widened();
   won.deliver(40, "m-c1");
@@ -354,6 +358,7 @@ test("a launch's receipt: members acknowledged after the end or the wait are sto
   assert.deepEqual(inFlight.last, [], "one launch at a time");
   inFlight.at(31, receipt(1));
   assert.deepEqual([inFlight.search.state, inFlight.search.endReason], ["exhausted", "no-challenger"], "the fuse refused every challenger");
+  assert.ok(!kinds(inFlight.last).includes("widened"), "an empty receipt does not widen the search");
 });
 
 test("a restart at rest repeats the launch that waits for its receipt, under its number, and nothing once it arrived (acceptance 16)", () => {
@@ -382,6 +387,51 @@ test("the allowance counts a gate run as 20 + gateMinutes, also when the check l
   assert.deepEqual([tight.search.state, tight.search.endReason], ["abandoned", "deadline"]);
 });
 
+test("a search that ends with a launch out cancels it, a restart cancels it again, and the launch's one receipt clears it (acceptance 16)", () => {
+  // The champion's result arrived at 10, so the hold ends at 175. It fails at 150, and the host restarts at 176 before
+  // preparing the launch: the resume handler never runs, as the hold ends the search first.
+  const drive = armed();
+  drive.deliver(10, CHAMPION);
+  drive.at(150, { kind: "gated", memberId: CHAMPION, outcome: "fail", ms: 1000 });
+  assert.deepEqual(drive.last, [launch(1, "p-gpt", "p-gemini")]);
+  drive.at(176, { kind: "resume" });
+  assert.deepEqual([drive.search.state, drive.search.endReason], ["exhausted", "hold"]);
+  assert.deepEqual(drive.last, [{ kind: "stop-operations" }, release("exhausted", "hold"), cancel(1)]);
+  drive.at(177, { kind: "resume" });
+  assert.deepEqual(drive.last, [cancel(1)], "a restart before the receipt cancels again");
+  const prepared = new Drive(drive.search);
+  drive.at(178, receipt(1));
+  assert.deepEqual([drive.last, drive.search.pending], [[], undefined], "the empty final receipt clears the launch");
+  drive.at(179, { kind: "resume" });
+  assert.deepEqual(drive.last, []);
+  prepared.at(178, receipt(1, ["m-c1", "p-gpt"]));
+  assert.deepEqual(prepared.last, [stop("host", "m-c1"), counted("none")], "a member prepared before the cancel is stopped and counts");
+
+  const halted = armed({ start: "together" });
+  halted.at(6, { kind: "halt", reason: "steer" });
+  assert.deepEqual(halted.last, [{ kind: "stop-operations" }, release("abandoned", "steer"), cancel(1)]);
+});
+
+test("a receipt that arrives after the end counts the search as widened once, and pauses when that engages the brake (acceptance 17)", () => {
+  // The champion fails at 30, so the wait ends at 90; the search ends at 176 and the receipt arrives at 180.
+  const drive = armed();
+  drive.deliver(10, CHAMPION);
+  drive.at(30, { kind: "gated", memberId: CHAMPION, outcome: "fail", ms: 1000 });
+  drive.at(176, { kind: "tick" });
+  assert.deepEqual(drive.last, [{ kind: "stop-operations" }, release("exhausted", "wait"), cancel(1)], "not counted: no receipt named a member yet");
+  drive.at(180, receipt(1, ["m-c1", "p-gpt"]), { widened: history(1, 9) });
+  assert.deepEqual(drive.last, [stop("host", "m-c1"), counted("none"), { kind: "pause" }]);
+  drive.at(181, receipt(1, ["m-c1", "p-gpt"]), { widened: history(1) });
+  assert.deepEqual(drive.last, [], "counted once");
+
+  const empty = armed();
+  empty.deliver(10, CHAMPION);
+  empty.at(30, { kind: "gated", memberId: CHAMPION, outcome: "fail", ms: 1000 });
+  empty.at(176, { kind: "tick" });
+  empty.at(180, receipt(1), { widened: history(1, 9) });
+  assert.deepEqual(empty.last, [], "a receipt that names no member does not count");
+});
+
 test("a stalled champion is stopped without a replacement and released only when the search ends (acceptance 10)", () => {
   const drive = armed();
   drive.at(20, { kind: "left", memberId: CHAMPION, reason: "stall" });
@@ -392,7 +442,7 @@ test("a stalled champion is stopped without a replacement and released only when
   drive.at(30, { kind: "left", memberId: "m-c1", reason: "limit" });
   assert.ok(!kinds(drive.all).includes("release"));
   drive.at(40, { kind: "left", memberId: "m-c2", reason: "permission" });
-  assert.deepEqual(drive.last.at(-1), release("exhausted", "all-failed"));
+  assert.deepEqual(drive.last.slice(-2), [release("exhausted", "all-failed"), counted("none")]);
 });
 
 test("a champion's question abandons the search, stops every challenger, and the attempts keep source search (acceptance 12, 18)", () => {
@@ -400,7 +450,7 @@ test("a champion's question abandons the search, stops every challenger, and the
   drive.at(5, receipt(1, ["m-c1", "p-gpt"], ["m-c2", "p-gemini"]));
   drive.at(20, { kind: "left", memberId: CHAMPION, reason: "question" });
   assert.equal(drive.search.state, "abandoned");
-  assert.deepEqual(drive.last, [{ kind: "stop-operations" }, stop("host", "m-c1", "m-c2"), release("abandoned", "champion-question")]);
+  assert.deepEqual(drive.last, [{ kind: "stop-operations" }, stop("host", "m-c1", "m-c2"), release("abandoned", "champion-question"), counted("none")]);
   assert.equal(outcomeSource(drive.search), "search");
   assert.equal(drive.search.class, "none");
 });
@@ -411,7 +461,7 @@ test("together: a challenger that passes while the champion works wins as challe
   drive.deliver(20, "m-c1");
   drive.at(30, { kind: "gated", memberId: "m-c1", outcome: "pass", ms: 1000 });
   assert.equal(drive.search.class, "challenger-first");
-  assert.deepEqual(drive.last, [{ kind: "stop-operations" }, stop("host", CHAMPION, "m-c2"), { kind: "integrate", memberId: "m-c1" }]);
+  assert.deepEqual(drive.last, [{ kind: "stop-operations" }, stop("host", CHAMPION, "m-c2"), { kind: "integrate", memberId: "m-c1" }, counted("challenger-first")]);
 });
 
 test("the reserve: no challenger below spareAttempts 3; eight attempts left and one open task start one challenger, not two (acceptance 13)", () => {
@@ -472,8 +522,6 @@ test("no challenger starts when every free worker slot has a ready task, and the
 });
 
 test("the brake: an end that leaves 10 widened searches with 1 rescue emits the pause; only the owner's pause state refuses admission (acceptance 17)", () => {
-  const history = (rescued: number, total = 10): SearchClass[] =>
-    Array.from({ length: total }, (_, index) => (index < rescued ? "rescued" : "none"));
   assert.deepEqual(admit(facts({ project: { paused: true } })), { admitted: false, condition: 6 }, "a pause with no widened search");
   assert.deepEqual(admit(facts({ project: { paused: true } }, { mode: "measure" })), { admitted: false, condition: 6 });
 

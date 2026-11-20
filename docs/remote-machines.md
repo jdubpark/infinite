@@ -78,6 +78,7 @@ Concurrent cmux observations share queued work. Each queue admits at most eight 
 
 | Operation | Endpoint | Contract |
 | --- | --- | --- |
+| Session list | `GET /api/sessions?since=` | Optional version held; answers `{ version, unchanged: true }` or `{ version, sessions }` ([architecture](architecture.md)) |
 | Chat | `GET /api/sessions/:id/messages` | Optional opaque `after` and bounded `limit`; returns messages, cursor, more, source |
 | File preview | `GET /api/sessions/:id/file?path=` | Project-relative text or supported image |
 | Resume | `POST /api/sessions/:id/resume` | Owner, stable requestId, explicit native continuation |

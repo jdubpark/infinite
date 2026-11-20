@@ -7,6 +7,12 @@ import { createInterface } from "node:readline";
 if (process.argv[2] === "--command-prefix") {
   const [, receiptDir, command, ...args] = process.argv.slice(2);
   appendFileSync(join(receiptDir, "commands.jsonl"), JSON.stringify({ command, args, cwd: process.cwd() }) + "\n", { mode: 0o600 });
+  const cat = command === "git" && args.includes("cat-file");
+  // refuse-cat-file: a cat-file exits 128, as a launcher that refuses the blob form does.
+  if (cat && existsSync(join(receiptDir, "refuse-cat-file"))) process.exit(128);
+  // hold-cat-file: a cat-file waits, at most 30 seconds, until release-cat-file exists.
+  const deadline = Date.now() + 30_000;
+  while (cat && existsSync(join(receiptDir, "hold-cat-file")) && !existsSync(join(receiptDir, "release-cat-file")) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
   const child = spawn(command, args, { stdio: "inherit", env: { ...process.env, INFINITE_TEST_COMMAND_IDENTITY: "team-prefix" } });
   child.once("error", () => process.exit(127));
   child.once("exit", code => process.exit(code ?? 128));
@@ -142,6 +148,9 @@ const providerIndex = process.argv.indexOf("--fixture-provider");
 const receipt = { ...assignment, cwd: process.cwd(), pid: process.pid, startedAt: Date.now(),
   ...(process.env.INFINITE_TRUSTED_WORKSPACE ? { trustedWorkspace: process.env.INFINITE_TRUSTED_WORKSPACE } : {}),
   ...(providerIndex >= 0 ? { provider: process.argv[providerIndex + 1], argv: process.argv.slice(2) } : {}) };
+// A test that writes record-context keeps a copy of each member's context file.
+if (existsSync(join(receiptDir, "record-context")) && existsSync(join(".git", "infinite-team-context.json")))
+  writeFileSync(join(receiptDir, `${assignment.memberId}.context.json`), readFileSync(join(".git", "infinite-team-context.json")), { mode: 0o600 });
 if (receipt.provider === "opencode") {
   const args = process.argv.slice(providerIndex + 2), boundary = args.indexOf("--");
   if (args[0] !== "run" || boundary < 1 || boundary !== args.length - 2
@@ -257,6 +266,11 @@ async function main() {
     process.exit(0);
   }
   if (assignment.role === "project-manager") {
+    // Under explore-unnamed, the project manager asks for one scout before its first plan, and names no scout profile.
+    if (existsSync(join(receiptDir, "explore-unnamed")) && !(receipt.prompt ?? process.argv.at(-1) ?? "").includes("The team's one discovery batch is already used")) {
+      await report({ kind: "explore", summary: "Read the module before planning", tasks: [{ id: "s1", title: "Read the module", instructions: "Read the module and report what it exports" }] });
+      return;
+    }
     // A project manager corrected after an intent check waits for its release while the hold flag exists.
     const corrected = JSON.parse(readFileSync(join(".git", "infinite-team-context.json"), "utf8")).feedback;
     if (typeof corrected === "string" && corrected.startsWith("The intent check held your plan") && existsSync(join(receiptDir, "intent-hold"))) {
@@ -274,7 +288,8 @@ async function main() {
     }
     if (scenario === "limit" && !existsSync(join(receiptDir, "limit-owner-question-asked"))) {
       writeFileSync(join(receiptDir, "limit-owner-question-asked"), "asked", { mode: 0o600 });
-      await report({ kind: "question", question: "Which display label should the first file use?", options: ["Detailed", "Compact"] });
+      await report({ kind: "question", question: "Which display label should the first file use?", options: ["Detailed", "Compact"],
+        recommendation: { answers: ["Compact"], reason: "The label fits the narrow layout." } });
       return;
     }
     if (scenario.startsWith("agent-blocked-") && assignment.revision > 1) {
@@ -296,6 +311,7 @@ async function main() {
       const recoveryQuestion = join(receiptDir, `${assignment.runId}.mixed-recovery-asked`);
       if (!existsSync(recoveryQuestion)) {
         writeFileSync(recoveryQuestion, "asked", { mode: 0o600 });
+        // No recommendation: a member started before recommendations were required still reaches its decision.
         await report({ kind: "question", question: "Which display label should the second file use?", options: ["Detailed", "Compact"] });
         return;
       }
@@ -316,7 +332,8 @@ async function main() {
     const asked = join(receiptDir, `${assignment.runId}.asked`);
     if (scenario === "question" && !existsSync(asked)) {
       writeFileSync(asked, "asked", { mode: 0o600 });
-      await report({ kind: "question", question: "Which display label should the implementation use?", options: ["Detailed", "Compact"] });
+      await report({ kind: "question", question: "Which display label should the implementation use?", options: ["Detailed", "Compact"],
+        recommendation: { answers: ["Compact"], reason: "Both files share one short label." } });
       return;
     }
     const tasks = [
@@ -373,6 +390,8 @@ async function main() {
         await report({ ...plan, verification: undefined });
       }
     } else await report(plan);
+  } else if (assignment.role === "scout") {
+    await report({ kind: "findings", summary: "Read the module", evidence: [{ source: "module.txt", observation: "The module exports one function." }] });
   } else if (assignment.role === "intent-checker") {
     // The checker copies its context and launch prompt for the test, then waits, exits, edits, or reports as the flags say.
     writeFileSync(join(receiptDir, `${assignment.memberId}.intent-context.json`), readFileSync(join(".git", "infinite-team-context.json")), { mode: 0o600 });
@@ -470,10 +489,27 @@ async function main() {
         await new Promise(resolve => setTimeout(resolve, 40));
       }
     }
+    // Under escalate-unnamed, the first implementer of task a escalates without a profile. A refused report is kept in a file,
+    // and the report repeats with the profile named in escalate-to. The escalated member writes its file, then reports as usual.
+    const launchPrompt = receipt.prompt ?? process.argv.at(-1) ?? "";
+    if (launchPrompt.includes("The previous implementer requested escalation")) writeFileSync(join(receiptDir, `${assignment.memberId}.escalated`), "escalated", { mode: 0o600 });
+    else if (existsSync(join(receiptDir, "escalate-unnamed")) && assignment.taskId === "a" && !existsSync(join(receiptDir, `${assignment.runId}.a-escalated`))) {
+      writeFileSync(join(receiptDir, `${assignment.runId}.a-escalated`), "requested", { mode: 0o600 });
+      const escalation = { kind: "escalate", reason: "Needs the stronger model" };
+      let rejection;
+      try { await report(escalation); }
+      catch (error) { rejection = error instanceof Error ? error.message : String(error); }
+      if (rejection) {
+        writeFileSync(join(receiptDir, `${assignment.memberId}.rejection.txt`), rejection, { mode: 0o600 });
+        await report({ ...escalation, agentProfileId: readFileSync(join(receiptDir, "escalate-to"), "utf8").trim() });
+      }
+      return;
+    }
     const asked = join(receiptDir, `${assignment.runId}.${assignment.taskId}.asked`);
     if ((scenario === "mixed" || (scenario === "bootstrap-replan" || scenario === "bootstrap-change") && assignment.revision === 1) && assignment.taskId === "b" && !existsSync(asked)) {
       writeFileSync(asked, "asked", { mode: 0o600 });
-      await report({ kind: "question", question: "Which display label should the second file use?", options: ["Detailed", "Compact"] });
+      await report({ kind: "question", question: "Which display label should the second file use?", options: ["Detailed", "Compact"],
+        recommendation: { answers: ["Compact"], reason: "The first file already uses it." } });
       return;
     }
     if (scenario.startsWith("limit") && receipt.provider === "claude" && receipt.argv[receipt.argv.indexOf("--model") + 1] === "claude-haiku-5-5") {

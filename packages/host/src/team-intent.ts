@@ -23,7 +23,7 @@ import type {
   IntentSkipReason,
   IntentStatement,
 } from "./objective-intent.js";
-import { readStoredRecord } from "./objective-record.js";
+import { heldRecordState, writeHeldRecord } from "./objective-holder.js";
 import type { ObjectiveState, ObjectiveUnavailable } from "./objective-record.js";
 import { planRunObjective, runObjectiveNote } from "./objective-runs.js";
 import type { ObjectiveRecord } from "./objective-types.js";
@@ -84,7 +84,6 @@ export const INTENT_EVENTS: {
 
 /** Team decisions a run may hold; the decision that would be the 41st is blocked before anything is written. */
 const DECISION_LIMIT = 40;
-const UNAVAILABLE: ObjectiveState = { kind: "unavailable", reason: "record-invalid" };
 /** A report with no items: applying it writes nothing but the entry, so it tells whether the log has room for an applied entry. */
 const PROBE_REPORT: IntentCheckReport = { kind: "intent-check", summary: "Probe.", items: [] };
 
@@ -501,12 +500,7 @@ export class TeamIntent {
 
   /** The record in its place: a goal's through the port, a standalone run's in its sealed holder. Unreadable is unavailable. */
   private stateOfRecord(holder: IntentHolder): ObjectiveState {
-    try {
-      if (holder.run.goal) return this.goals ? this.goals.read(holder.run.goal.id) : UNAVAILABLE;
-      return readStoredRecord(holder.objectiveRecord, { kind: "run", runId: holder.run.id });
-    } catch {
-      return UNAVAILABLE;
-    }
+    return heldRecordState(holder, this.goals);
   }
 
   private readyRecord(holder: IntentHolder): ObjectiveRecord | undefined {
@@ -515,11 +509,6 @@ export class TeamIntent {
   }
 
   private writeRecord(holder: IntentHolder, previous: ObjectiveRecord, next: ObjectiveRecord): void {
-    if (holder.run.goal) {
-      if (!this.goals) throw new Error("the goal has no record port");
-      this.goals.write(holder.run.goal.id, previous.version, next);
-      return;
-    }
-    holder.objectiveRecord = next;
+    writeHeldRecord(holder, this.goals, previous, next);
   }
 }

@@ -138,9 +138,3 @@ export interface MemoryStore {
 
 export type { MemoryCollection, MemoryMutation, MemoryRecord, MemoryRecordPayload, MemoryWorkspace };
 
-export type MemoryFoundationOperation =
-  | Extract<MemoryMutation["op"], { type: "collection_create" }>
-  | Extract<MemoryMutation["op"], { type: "record_create" | "record_propose" }>
-  | Extract<MemoryMutation["op"], { type: "grant_set" | "grant_revoke" }>
-  | Extract<MemoryMutation["op"], { type: "source_enroll" | "source_pause" | "source_revoke" }>
-  | Extract<MemoryMutation["op"], { type: "record_archive" | "record_erase" | "workspace_review_binding" }>;

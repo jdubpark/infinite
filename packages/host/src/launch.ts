@@ -1,10 +1,25 @@
 import { HANDOFF_INSTRUCTIONS } from "./handoff-types.js";
-import type { AgentProfile, Provider } from "./types.js";
+import { learningPurpose, type AgentProfile, type Config, type Provider, type SessionPurpose } from "./types.js";
 import { dirname, join } from "node:path";
 import { teamModelProfileSchema, type TeamModelProfile } from "./team-types.js";
+import { TeamError } from "./team-workspace.js";
 import { codexTrustArgs } from "./workspace-trust.js";
 import { sudoShape } from "./sudo-profile.js";
 import { EGRESS_ENVIRONMENT_NAMES } from "./egress.js";
+
+/** eval.member.agents[provider] for a learning purpose, else config.agents[provider]. Throws TeamError 409 "eval-identity-missing" for a learning purpose without an eval profile for the provider. */
+export function sessionAgentProfile(config: Pick<Config, "agents" | "eval">, provider: Provider, purpose: SessionPurpose | undefined): AgentProfile | undefined {
+  if (!learningPurpose(purpose)) return config.agents[provider];
+  const agents = config.eval?.member?.agents;
+  const profile = agents && (provider === "claude" || provider === "codex" || provider === "opencode") ? agents[provider] : undefined;
+  if (!profile) throw new TeamError(409, "eval-identity-missing", "The eval identity has no launch profile for this provider.");
+  return profile;
+}
+
+/** For a learning purpose, the snapshot with `text: ""` and `sources: []`: today's text is not the text of the work's time. */
+export function withoutSharedContext<T extends { text: string; sources: readonly unknown[] }>(context: T, purpose: SessionPurpose | undefined): T {
+  return learningPurpose(purpose) ? { ...context, text: "", sources: [] } : context;
+}
 
 /** Only model controls are added here; the configured provider permissions remain unchanged. */
 export function teamModelLaunch(profile: AgentProfile, input: TeamModelProfile): AgentProfile {
@@ -190,6 +205,9 @@ const CLAUDE_EVENTS = [
   "StopFailure",
   "SessionEnd",
 ];
+/** A TOML basic string. JSON escapes what TOML requires escaped, except DEL, which TOML also refuses raw. */
+const tomlString = (value: string) => JSON.stringify(value).replace(/\x7f/g, "\\u007f");
+
 const CODEX_EVENTS = [
   "SessionStart",
   "UserPromptSubmit",
@@ -400,24 +418,33 @@ export function buildLaunch(
   // A served headless session: the permission channel's hooks and the signal hooks in one settings layer, with no
   // user, project or local settings loaded, so no settings file can switch them off or answer before them.
   if (hooks && provider === "claude" && channel) args.push(...headlessChannelArgs(relayPath, enabled.claude));
-  if (hooks && provider === "codex" && enabled.codex) {
-    const command = [...relay, "codex"].join(" ");
-    for (const event of CODEX_EVENTS)
+  // Every other Claude team launch (member, mission coordinator, permission coordinator) loads the agent account's own
+  // settings and no project or local file. A Codex member can commit `.claude/settings.json` or `.mcp.json`; Claude Code
+  // runs their hooks and MCP server commands in any folder and applies their allow rules in a trusted one, so a later
+  // member would load what an earlier one wrote. Managed settings and the host's `--settings` layer load either way.
+  if (team && provider === "claude" && !channel) {
+    if (profile.args.some(arg => arg === "--setting-sources" || arg.startsWith("--setting-sources=")))
+      throw new Error("A Claude team launch chooses its own setting sources; remove --setting-sources from the profile.");
+    args.push("--setting-sources", "user");
+  }
+  if (hooks && provider === "codex") {
+    // notify needs no hook trust, so it stays on when Codex hooks are off; turn-end usage then needs no bypass (INF-213).
+    args.push("-c", `notify=[${[...relay, "codex-notify"].map(tomlString).join(",")}]`);
+    if (enabled.codex) {
+      const command = [...relay, "codex"].join(" ");
+      for (const event of CODEX_EVENTS)
+        args.push(
+          "-c",
+          `hooks.${event}=[{hooks=[{type="command",command=${tomlString(command)}}]}]`,
+        );
+      args.push("--dangerously-bypass-hook-trust");
       args.push(
         "-c",
-        `hooks.${event}=[{hooks=[{type="command",command="${command}"}]}]`,
+        `tui.notifications=["agent-turn-complete","approval-requested","async-question"]`,
       );
-    args.push("--dangerously-bypass-hook-trust");
-    args.push(
-      "-c",
-      `notify=[${[...relay, "codex-notify"].map((a) => `"${a}"`).join(",")}]`,
-    );
-    args.push(
-      "-c",
-      `tui.notifications=["agent-turn-complete","approval-requested","async-question"]`,
-    );
-    args.push("-c", `tui.notification_method="osc9"`);
-    args.push("-c", `tui.notification_condition="always"`);
+      args.push("-c", `tui.notification_method="osc9"`);
+      args.push("-c", `tui.notification_condition="always"`);
+    }
   }
   if (trustedCwd && provider === "codex") args.push(...codexTrustArgs(trustedCwd));
   if (prompt)

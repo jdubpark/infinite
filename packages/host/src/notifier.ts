@@ -4,6 +4,7 @@ import type { PushSender, PushStore } from "./push.js";
 import type { FuseService, FuseInterrupt } from "./fuse/service.js";
 import type { PermissionDeliveryService } from "./permission-agent-types.js";
 import { INTERRUPT_CLASSES, type InterruptClass } from "./permission-policy.js";
+import { learningPurpose, type SessionPurpose } from "./types.js";
 import { createHash } from "node:crypto";
 
 /** The subject part of a fuse collapse id. A push service limits the id's length, and a project id has no limit, so a long one is replaced by a digest. */
@@ -11,7 +12,7 @@ const fuseSubject = (projectId: string | undefined) =>
   projectId === undefined ? "host" : projectId.length <= 40 ? projectId : createHash("sha256").update(projectId, "utf8").digest("hex").slice(0, 32);
 
 type Row = {
-  id: string; title: string; provider: Provider; attention: Attention; reading?: { now?: { text: string } };
+  id: string; title: string; provider: Provider; attention: Attention; reading?: { now?: { text: string } }; purpose?: SessionPurpose;
   /** A headless session's permission channel: the call that waits for the owner, and the latest call it could not hold. */
   permissionChannel?: { waiting?: { interruptClass: string }; notice?: { id: string; interruptClass?: string } };
   /** Set by the notifier on the copy of a row that announces a permission notice. */
@@ -90,7 +91,8 @@ export class Notifier {
   async tick() {
     const due: Row[] = [];
     try {
-      const rows = (await this.manager.list()) as unknown as Row[];
+      // A learning session (replay or gate) never reaches the owner's devices.
+      const rows = ((await this.manager.list()) as unknown as Row[]).filter(row => !learningPurpose(row.purpose));
       const now = Date.now();
       for (const row of rows) {
         const key = `${row.attention.state}:${row.attention.prompt?.id ?? ""}`;

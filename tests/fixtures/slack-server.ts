@@ -40,7 +40,8 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
   const hidden = new Set<string>();
   const posts: StoredMessage[] = [];
   const postPayloads: Record<string, any>[] = [];
-  const calls: { method: string; token: string }[] = [];
+  const calls: { method: string; token: string; body?: Record<string, any> }[] = [];
+  const reactions = new Set<string>();
   const acked: string[] = [];
   const sent = new Map<string, string>();
   const sockets = new Set<WebSocket>();
@@ -61,7 +62,8 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
       const method = request.url?.match(/^\/api\/([\w.]+)$/)?.[1];
       if (request.method !== "POST" || !method) { reply(404, { ok: false, error: "unknown_method" }); return; }
       const token = bearer(request);
-      calls.push({ method, token });
+      const call = { method, token } as { method: string; token: string; body?: Record<string, any> };
+      calls.push(call);
       if (down) { reply(503, { ok: false, error: "service_unavailable" }); return; }
       if (limited) { response.writeHead(429, { "Content-Type": "text/plain", "Retry-After": "30" }).end("ratelimited"); return; }
       const raw = await readBody(request);
@@ -70,6 +72,7 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
         if (!(request.headers["content-type"] ?? "").startsWith("application/x-www-form-urlencoded")) { reply(200, { ok: false, error: "invalid_arguments" }); return; }
         body = Object.fromEntries(new URLSearchParams(raw));
       } else body = JSON.parse(raw || "{}");
+      call.body = body;
       const appMethod = method === "apps.connections.open";
       if (appMethod ? !token.startsWith("xapp-") : !token.startsWith("xoxb-")) { reply(200, { ok: false, error: "invalid_auth" }); return; }
       switch (method) {
@@ -104,6 +107,15 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
           list?.push(message);
           if (loseNext) { loseNext = false; request.socket.destroy(); return; }
           reply(200, { ok: true, channel: body.channel, ts: message.ts }); return;
+        }
+        case "reactions.add": {
+          if (![body.channel, body.timestamp, body.name].every(value => typeof value === "string" && value !== "")) {
+            reply(200, { ok: false, error: "invalid_arguments" }); return;
+          }
+          const key = `${body.channel}:${body.timestamp}:${body.name}`;
+          if (reactions.has(key)) { reply(200, { ok: false, error: "already_reacted" }); return; }
+          reactions.add(key);
+          reply(200, { ok: true }); return;
         }
         default:
           reply(200, { ok: false, error: "unknown_method" });

@@ -151,6 +151,20 @@ A step's **key** is the SHA-256 of its normalized instructions (whitespace colla
 
 The session worker refuses at most 2 times per requester attempt, and records the third report as sent. *(My call: 2 matches `automaticRecoveryLimit`.)*
 
+**Proposed by slice 1 (INF-303), not yet accepted.** The validator in `packages/host/src/read-request.ts` needed rules that this design does not state. Each is marked `PROPOSED` in the code. A host must not use the validator until the owner has accepted or changed these:
+
+- A request whose shape does not match the schema is refused with a new code, `malformed`: one error per schema issue, and one error in all for a value of the wrong type. A parse issue is `over-ceiling` only when the table lists it: too many phases or steps, or a `maxItems`, `concurrency`, or lead `maxAttempts` above its bound. Too many `paths` or `refs` is `malformed`.
+- A `source` reference is at most 2,048 characters, and an `evidence:N` reference names an item from 1 to 9999.
+- A scout lead's request and its own second attempt are charged to its reservation alone, so the grant's allowance left excludes every reservation. A project manager's request is charged to that allowance.
+- A step that sets both `verify` and `source` is refused with `not-granted`, because a verifier's artifact-only context and a quarantined reader cannot be one member.
+- A step's key treats its paths and its `source` refs as sets, so their order and any repeated entry do not change the key.
+- A step with both `forEach` and `lead` counts as `maxItems` times (1 plus `maxAttempts`) steps.
+- The host fills the grant within fixed caps: 64 profiles, 64 outside-read profiles, 256 active steps, and 100 requests sent. A grant outside them refuses every read as a host fault. A grant without a lineage state refuses every `source` step, and a scout lead's grant without a reservation refuses its request.
+- A location holds at most 16 `symbols`.
+- A `forEach` whose named step is itself a `forEach` step is refused with `forward-reference` at the `forEach.step` path, because this design gives no total for a `forEach` over a `forEach`. The phase engine refuses it at admission as well (added with INF-308).
+
+One more is the builder's choice under "Left to the builder", listed here so that it is visible. Result strings have bounds: the `list` and `locations` summaries 4,000 characters, as today's `findings`; a list item's `key` 120, `title` 200, and `source` 1,000; a location's `path` 512, each symbol 200, and `role` 240; and a verdict's `criterion` 1,000.
+
 **In the host process, before launch.** `consume` runs the function again against the current run. A difference can come only from work that started after the requester launched. A late duplicate is not an error: the host marks the step `joined` to the earlier one. A `joined` step settles when the step it joined settles, and takes that step's status and output handle. If the allowance fell below the request, the host admits whole phases in order and records the rest as `refused: allowance`. Any other failure, the third report included, refuses the request. A refusal never blocks the run. The host records `read.refused` with the errors and starts the requester's next attempt with them in its context file.
 
 ### 4. Phases and results
@@ -166,6 +180,23 @@ Read preparation has its own operation lane, separate from the run's single pend
 Each output is ingested as a `report` entry (blackboard part 3) with a crossing record (part 9). When the last phase ends, the host starts the requester's next attempt. For a project manager, that is the planning attempt that follows discovery today. Its context file has a `reads` key with each step's status, crossing digest, and entry handle. Its prompt has one line per step, at most 4 KiB in total. Until the project's rollout stage reaches `tools` (part 12), the context file also carries the full outputs of this request, at most 256 KiB, cutting the earliest phases to digests first.
 
 A reader that changes a file fails its step, and its clone is removed. The run does not block. *(My call: today `read-only-role-changed-files` starts PM recovery, which a read step does not need.)*
+
+**Proposed by slice 2 (INF-308), not yet accepted.** The phase engine in `packages/host/src/read-phases.ts` needed rules that this design does not state. Each is marked `PROPOSED` in the code. A host must not use the engine until the owner has accepted or changed these:
+
+- A run keeps at most 32 read requests. The next admission is refused with a new refusal, `request-limit`, which this design does not have.
+- A step holds at most four member ids. This is storage room only, for two attempts per step (part 6) for each of a scout lead's two attempts (part 5). The launcher must still enforce the attempt limits.
+- A `forEach` child's id is its parent's id, a dot, and its zero-based item index, such as `review.0`. The child carries its parent's key and list flag.
+- A `forEach` step takes the status `expanded` when its phase starts and never runs itself. It counts as settled for phase order, and its children are the steps that run.
+- A request is `running` while an admitted phase is unsettled and `ended` once every admitted phase has settled. A request with no admitted phase is still recorded in `run.reads`, with status `refused`.
+- A late duplicate joins an earlier step of the same revision that is queued, running, complete, or partial. A queued or a partial step is a target. A failed step is not, so its work runs again.
+- A `forEach` step and its children never join and are never join targets, because a `forEach` key names its source by an id that is unique only within its request. A joined step is never a target either, so a third duplicate joins the original step.
+- A start for a running step records the new attempt's member id. A start whose member id the step already holds changes nothing, whatever the step's status, so the host can replay its journal. When to retry is left to a later slice.
+- A `complete` or `partial` result carries the handle of its output entry, and a `list` result also carries its item count, from 0 to 32. A `failed` result carries neither.
+- A replayed admission with the same request id must match the first one on everything except the allowance left. The engine compares a SHA-256 digest of the revision, the requester, and the parsed request, and it stores no request text. Any other difference is refused with `conflicting-admission`, and the first admission's phases stand.
+- A joined step still counts in its phase's total at admission, because the totals come from `expandedTotal` unchanged.
+- A `forEach` over another `forEach` is refused at admission with a new refusal, `nested-for-each`, because this design gives no total or item count for it. The validator refuses it as well (part 3).
+- A `forEach` over a joined list expands from the item count that the joined step took from its target.
+- A joined step takes its target's result only when its own phase starts, never earlier. This design says that a joined step settles when the step it joined settles. Waiting keeps phase order for a joined step in a later phase.
 
 ### 5. Scout leads and depth
 

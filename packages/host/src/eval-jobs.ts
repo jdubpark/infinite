@@ -6,7 +6,7 @@ import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceDb, EvidenceTx } from "./evidence/types.js";
 import { validationSettings, type EvalGraderConfig, type ValidationSettings } from "./eval-config.js";
 import type { GraderProbe } from "./eval-grader.js";
-import type { EvalJobReason, EvalJobView, EvalJobWait, EvalRefusal, ValidateJobRequest } from "./eval-types.js";
+import type { BaselineJobView, EvalJobReason, EvalJobView, EvalJobWait, EvalRefusal, ValidateJobRequest } from "./eval-types.js";
 import type { TaskValidation } from "./eval-validate.js";
 import type { RoutineStatus } from "./routine-types.js";
 import type { Config } from "./types.js";
@@ -42,9 +42,9 @@ export const validateJobSchema: z.ZodType<ValidateJobRequest> = z.object({
 /** One task of the project, through `eval_tasks_next`: the next candidate or valid row after the cursor. */
 export const NEXT_TASK_SQL = "SELECT task_id, origin, area_ref, validated_at FROM eval_tasks WHERE project_ref = ? AND state = ? AND task_id > ? ORDER BY task_id LIMIT 200";
 /** The jobs in one status, oldest first, through `eval_jobs_status`. */
-export const ACTIVE_JOBS_SQL = "SELECT * FROM eval_jobs WHERE status = ? ORDER BY created_at, job_id LIMIT ?";
-/** Whether a project has a job that holds its slot, through `eval_jobs_project`. */
-export const ACTIVE_PROJECT_JOBS_SQL = "SELECT job_id FROM eval_jobs WHERE project_ref = ? AND status IN ('scheduled', 'running', 'paused', 'blocked') LIMIT 1";
+export const ACTIVE_JOBS_SQL = "SELECT * FROM eval_jobs WHERE status = ? AND kind = 'validate' ORDER BY created_at, job_id LIMIT ?";
+/** Whether a project has a job of one kind that holds its slot, through `eval_jobs_project`. */
+export const ACTIVE_PROJECT_JOBS_SQL = "SELECT job_id FROM eval_jobs WHERE project_ref = ? AND kind = ? AND status IN ('scheduled', 'running', 'paused', 'blocked') LIMIT 1";
 /** The newest jobs of a project, through `eval_jobs_project`. */
 export const PROJECT_JOBS_SQL = "SELECT * FROM eval_jobs WHERE project_ref = ? ORDER BY created_at DESC, job_id DESC LIMIT ?";
 /** The newest jobs, in index order through `eval_jobs_created`, with no predicate, so the plan is a scan that stops at LIMIT. */
@@ -67,6 +67,7 @@ export type Gates = { grader: GraderProbe; hostLoadHeld: boolean; halted: (proje
 /** Sealed in `eval_jobs.payload`: the normalized request, its digest, and the digest pinned at the last approval. */
 type JobPayload = { projectId: string; request: ValidateJobRequest; requestDigest: string; jobDigest: string };
 
+export type EvalJobRow = JobRow;
 type JobRow = {
   job_id: string; project_ref: string; kind: string; status: RoutineStatus; reason: EvalJobReason | null;
   waiting: EvalJobWait | null; request_id: string; created_at: string; started_at: string | null; expires_at: string;
@@ -82,17 +83,25 @@ type JobUpdate = Partial<Record<JobColumn, SQLInputValue>>;
 
 const NONE: NextWork = { kind: "none" };
 
+/** The baseline job's views and resume digest, supplied by TrialJobs for rows of kind `baseline`. */
+export type BaselineJobHooks = {
+  views(db: EvidenceDb, rows: readonly EvalJobRow[]): Map<string, BaselineJobView>;
+  digest(projectId: string, jobId: string): string | undefined;
+};
+
 export class EvalJobs {
   private readonly store: EvidenceStore;
   private readonly config: Pick<Config, "projects" | "eval">;
   private readonly now: () => string;
+  private readonly baseline: BaselineJobHooks | undefined;
   /** The job whose task `next` handed out and `record` has not yet closed. One task runs at a time. */
   private inFlight: string | undefined;
 
-  constructor(options: { store: EvidenceStore; config: Pick<Config, "projects" | "eval">; now?: () => string }) {
+  constructor(options: { store: EvidenceStore; config: Pick<Config, "projects" | "eval">; now?: () => string; baseline?: BaselineJobHooks }) {
     this.store = options.store;
     this.config = options.config;
     this.now = options.now ?? (() => new Date().toISOString());
+    this.baseline = options.baseline;
   }
 
   create(projectId: string, request: ValidateJobRequest, requestId: string): { created: boolean; job: EvalJobView } | EvalRefusal {
@@ -120,7 +129,7 @@ export class EvalJobs {
       const found = validationSettings(project);
       if ("missing" in found) return refusal(409, "eval-config-incomplete");
       const ref = tx.index("project", projectId);
-      if (tx.get(ACTIVE_PROJECT_JOBS_SQL, ref) !== undefined) return refusal(409, "job-active");
+      if (tx.get(ACTIVE_PROJECT_JOBS_SQL, ref, "validate") !== undefined) return refusal(409, "job-active");
       const jobId = randomUUID();
       const at = this.now();
       const payload: JobPayload = {
@@ -162,10 +171,11 @@ export class EvalJobs {
         if (row.status === "blocked") {
           // The owner's resume approves the configuration as it is now, so the job pins the current digest.
           const projectId = this.refs(tx).get(row.project_ref);
-          const pinned = projectId === undefined ? undefined : this.pinnedDigest(projectId);
-          if (pinned === undefined || projectId === undefined) return refusal(409, "eval-config-incomplete");
+          const digest = projectId === undefined ? undefined : row.kind === "baseline"
+            ? this.baseline?.digest(projectId, jobId) : this.pinnedDigest(projectId)?.digest;
+          if (digest === undefined || projectId === undefined) return refusal(409, "eval-config-incomplete");
           const payload = tx.open<JobPayload>("eval_jobs", jobId, row.payload);
-          values.payload = tx.seal("eval_jobs", jobId, { ...payload, jobDigest: pinned.digest });
+          values.payload = tx.seal("eval_jobs", jobId, { ...payload, jobDigest: digest });
         }
         update(tx, jobId, at, values);
       } else {
@@ -187,16 +197,14 @@ export class EvalJobs {
 
   list(limit = JOB_LIST_MAX): EvalJobView[] {
     return this.store.read(db => {
-      const refs = this.refs(db);
-      return db.all<JobRow>(JOBS_SQL, Math.min(limit, JOB_LIST_MAX))
-        .map(row => viewWith(row, refs.get(row.project_ref) ?? null));
+      return this.viewsOf(db, db.all<JobRow>(JOBS_SQL, Math.min(limit, JOB_LIST_MAX)), this.refs(db));
     });
   }
 
   projectJobs(projectId: string, limit: number): EvalJobView[] {
     return this.store.read(db => {
       const ref = db.index("project", projectId);
-      return db.all<JobRow>(PROJECT_JOBS_SQL, ref, Math.min(limit, JOB_LIST_MAX)).map(row => viewWith(row, projectId));
+      return this.viewsOf(db, db.all<JobRow>(PROJECT_JOBS_SQL, ref, Math.min(limit, JOB_LIST_MAX)), new Map([[ref, projectId]]));
     });
   }
 
@@ -367,7 +375,14 @@ export class EvalJobs {
   }
 
   private viewOf(db: EvidenceDb, row: JobRow): EvalJobView {
-    return viewWith(row, this.refs(db).get(row.project_ref) ?? null);
+    return this.viewsOf(db, [row], this.refs(db))[0];
+  }
+
+  /** Validate rows take `viewWith`; baseline rows take the views of TrialJobs, read once for the page. */
+  private viewsOf(db: EvidenceDb, rows: readonly JobRow[], refs: Map<string, string>): EvalJobView[] {
+    const baseline = this.baseline?.views(db, rows.filter(row => row.kind === "baseline"));
+    return rows.map(row => (row.kind === "baseline" ? baseline?.get(row.job_id) : undefined)
+      ?? viewWith(row, refs.get(row.project_ref) ?? null));
   }
 
   private rowOf(db: EvidenceDb, jobId: string): JobRow | undefined {
@@ -446,7 +461,7 @@ function matches(
 }
 
 /** A window is [start, end) in UTC hours; an end below its start crosses midnight. */
-function inWindow(windows: readonly { startHourUtc: number; endHourUtc: number }[], nowMs: number): boolean {
+export function inWindow(windows: readonly { startHourUtc: number; endHourUtc: number }[], nowMs: number): boolean {
   const hour = new Date(nowMs).getUTCHours();
   return windows.some(window => window.startHourUtc < window.endHourUtc
     ? hour >= window.startHourUtc && hour < window.endHourUtc

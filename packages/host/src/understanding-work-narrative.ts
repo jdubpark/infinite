@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { UnderstandingBrief, WorkNarrativeStatus } from "@infinite/remote";
+import type { WorkNarrativeStatus } from "@infinite/remote";
 import type { UnderstandingAdapter, UnderstandingAdapterOptions } from "./understanding-runtime.js";
 import { readGit } from "./checkout-identity.js";
 import type { TeamRun } from "./team-types.js";
@@ -139,7 +139,7 @@ export class WorkNarrativeStore {
     if (current.state === "pending") return { narrative: current, queued: false };
     if (current.state === "failed") return { narrative: unavailable("A failed narrative is cooling down; try again after 10 minutes."), queued: false };
     if (!this.options.adapter.explainWork || !this.options.config.repositoryBriefings) return { narrative: unavailable("No summary writer is configured on this host."), queued: false };
-    const gate = this.gate(workspaceId, workId, run);
+    const gate = this.gate(workId, run);
     if (gate) return { narrative: gate, queued: false };
     const state = this.state(workspaceId);
     if (state.jobs >= DAILY_JOBS) return { narrative: unavailable("The daily work narrative budget is exhausted."), queued: false };
@@ -166,7 +166,7 @@ export class WorkNarrativeStore {
     await this.chain;
   }
 
-  private gate(workspaceId: string, workId: string, run: TeamRun | null): WorkNarrativeStatus | null {
+  private gate(workId: string, run: TeamRun | null): WorkNarrativeStatus | null {
     if (!workId.startsWith("team:")) return unavailable("Narratives cover team runs; open a subteam.");
     if (!run || workId !== `team:${run.id}`) return unavailable("The team run is not available.");
     if (!settledStatuses.has(run.status)) return unavailable("The run is still active; its narrative is available once it settles.");
@@ -196,11 +196,11 @@ export class WorkNarrativeStore {
     const currentJob = () => this.pending.get(jobKey)?.requestedAt === requestedAt && this.pending.get(jobKey)?.key === expectedKey;
     try {
       const run = currentRun();
-      if (!run || !currentJob() || narrativeKey(workId, run.baseCommit ?? null, run.headCommit ?? null) !== expectedKey || this.gate(workspaceId, workId, run)) return;
+      if (!run || !currentJob() || narrativeKey(workId, run.baseCommit ?? null, run.headCommit ?? null) !== expectedKey || this.gate(workId, run)) return;
       if (this.closed) return;
       const result = await this.options.adapter.explainWork!({ root: run.workspace, baseCommit: run.baseCommit, question: workQuestion(run) }, adapterOptions);
       const latest = currentRun();
-      if (this.closed || !latest || !currentJob() || narrativeKey(workId, latest.baseCommit ?? null, latest.headCommit ?? null) !== expectedKey || latest.workspace !== run.workspace || this.gate(workspaceId, workId, latest)) return;
+      if (this.closed || !latest || !currentJob() || narrativeKey(workId, latest.baseCommit ?? null, latest.headCommit ?? null) !== expectedKey || latest.workspace !== run.workspace || this.gate(workId, latest)) return;
       const state = this.state(workspaceId);
       const record: NarrativeRecord = {
         key: expectedKey,
@@ -219,7 +219,7 @@ export class WorkNarrativeStore {
       this.persist(workspaceId, state);
     } catch (error) {
       const latest = currentRun();
-      if (!this.closed && latest && currentJob() && narrativeKey(workId, latest.baseCommit ?? null, latest.headCommit ?? null) === expectedKey && !this.gate(workspaceId, workId, latest)) {
+      if (!this.closed && latest && currentJob() && narrativeKey(workId, latest.baseCommit ?? null, latest.headCommit ?? null) === expectedKey && !this.gate(workId, latest)) {
         const state = this.state(workspaceId);
         const at = this.now().toISOString();
         const reason = (error instanceof Error ? error.message : "Narrative generation failed.").slice(0, 500);

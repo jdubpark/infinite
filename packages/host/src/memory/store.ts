@@ -51,7 +51,6 @@ import {
 import type {
   MemoryCapability,
   MemoryCollection,
-  MemoryError,
   MemoryGrant,
   MemoryMutation,
   MemoryMutationReceipt,
@@ -490,7 +489,6 @@ export class MemoryStoreService implements MemoryStoreContract {
   private workspaceKey(workspaceId: string): string { return this.opaque("workspace", workspaceId); }
   private principalKey(principalId: string): string { return this.opaque("principal", principalId); }
   private deviceKey(deviceId: string): string { return this.opaque("device", deviceId); }
-  private taskKey(taskBindingId: string): string { return this.opaque("task", taskBindingId); }
   private recordKey(recordId: string): string { return this.opaque("record", recordId); }
   private collectionObjectKey(collectionId: string): string { return this.opaque("collection", collectionId); }
   private grantObjectKey(grantId: string): string { return this.opaque("grant", grantId); }
@@ -855,7 +853,6 @@ export class MemoryStoreService implements MemoryStoreContract {
       let resourceKey = "";
       let resultingRevision = 1;
       let affectedCollectionId = targetCollectionId;
-      let payloadDigest = requestDigest;
 
       switch (operation.type) {
         case "collection_create": {

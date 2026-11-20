@@ -17,7 +17,8 @@ import { MirroredProjects } from "./mirrored-projects.js";
 /**
  * Provider hooks injected at launch when the config does not say. Codex hooks stay off: spike S2
  * (2026-11-13) showed that `--dangerously-bypass-hook-trust`, which the injected `-c hooks.*` need,
- * also lets hooks defined in the working directory run without review.
+ * also lets hooks defined in the working directory run without review. The turn-end `notify` setting stays on
+ * without hooks (INF-213).
  */
 export const DEFAULT_HOOKS = { claude: true, codex: false } as const;
 /** The name that starts the host's tracker comments when `linear.reportName` is not set. */
@@ -237,6 +238,8 @@ export function validateIntakeConfig(config: Config): void {
   // Without admission and without direct requests nothing could ever start a mission.
   if (intake.linear.admitIssues === false && !slack?.directRequests && !config.mcp) throw new Error("admitIssues false needs intake.slack.directRequests or mcp");
   if (slack?.answerQuestions && !slack.directRequests) throw new Error("answerQuestions needs intake.slack.directRequests");
+  if (slack?.requestChannelIds?.length && !slack.directRequests) throw new Error("requestChannelIds needs intake.slack.directRequests");
+  if (slack?.ownerOnlyInJoinedChannels && !slack.directRequests) throw new Error("ownerOnlyInJoinedChannels needs intake.slack.directRequests");
   if (slack?.classify && !slack.answerQuestions) throw new Error("classify needs intake.slack.answerQuestions");
   if (slack?.classify && !config.jev) throw new Error("classify needs the jev block");
   if (slack) {

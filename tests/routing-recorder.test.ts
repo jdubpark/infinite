@@ -8,14 +8,15 @@ import { advanceEpoch, configurationModule } from "../packages/host/src/configur
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import type { EvidenceTx } from "../packages/host/src/evidence/types.js";
 import { outcomeModule, writeOutcome, type OutcomePayload, type OutcomeRow } from "../packages/host/src/outcome-store.js";
-import { pinRouting } from "../packages/host/src/routing-policy.js";
-import { RoutingRecorder, type RouterStart } from "../packages/host/src/routing-recorder.js";
+import { AUTO_LOG } from "../packages/host/src/routing-auto.js";
+import { pinRouting, type TeamRouting } from "../packages/host/src/routing-policy.js";
+import { RoutingRecorder, type RouterEscalation, type RouterScout, type RouterStart } from "../packages/host/src/routing-recorder.js";
 import { TIER_COSTS } from "../packages/host/src/routing-choice.js";
 import { decisionSeed } from "../packages/host/src/routing-sample.js";
-import { decisionKey, PAYLOAD_LIMIT_BYTES, routingModule, taskDecisions } from "../packages/host/src/routing-store.js";
+import { decisionKey, PAYLOAD_LIMIT_BYTES, routingModule, shadowProgress, taskDecisions } from "../packages/host/src/routing-store.js";
 import { featureMapDigest, taskFeatures, type FeatureMap } from "../packages/host/src/task-features.js";
 import type { RoutingPayload } from "../packages/host/src/routing-types.js";
-import type { TeamLineup, TeamModelProfile, TeamRun, TeamTask } from "../packages/host/src/team-types.js";
+import type { TeamLineup, TeamModelProfile, TeamRun, TeamScout, TeamTask } from "../packages/host/src/team-types.js";
 import { mixedLineup } from "./team-fixture.js";
 
 const NOW = "2026-11-15T12:00:00.000Z";
@@ -533,4 +534,210 @@ test("a shadow decision counts an applied row in full, and an auto pin records n
   }
   assert.equal(reads, 0);
   assert.equal(countRows(store), rows);
+}));
+
+/** Task 6's lineup: two escalations that pass rules 1 and 2 and one more that the fixed rules remove, and a light and a strong implementer. */
+const POINT_LINEUP: TeamLineup = {
+  ...mixedLineup,
+  implementers: [
+    mixedLineup.implementers[0]!,
+    mixedLineup.implementers[1]!,
+    { id: "haiku-light", label: "Haiku implementer", provider: "claude", model: "claude-haiku-5-5", effort: "medium", tier: "light" },
+    { id: "opus-strong", label: "Opus implementer", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
+  ],
+  escalations: [
+    { id: "opus-escalation", label: "Opus escalation", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
+    { id: "astra-escalation", label: "Astra escalation", provider: "codex", model: "gpt-6-astra", effort: "high", tier: "strong" },
+    { id: "sonnet-escalation", label: "Sonnet escalation", provider: "claude", model: "claude-sonnet-5-5", effort: "high", tier: "strong" },
+    { id: "spark-escalation", label: "Spark escalation", provider: "opencode", model: "meta/muse-spark-1.3-contributor", variant: "high", tier: "strong", dataUse: "contributor" },
+  ],
+};
+const ASTRA_E = POINT_LINEUP.escalations![1]!;
+const SONNET_E = POINT_LINEUP.escalations![2]!;
+const ASTRA_I = POINT_LINEUP.implementers[1]!;
+/** A period that ended 20 days ago, so an auto pin is taken. */
+const ENDED = ago(20);
+const POINTS_PIN = { mode: "auto", points: ["start", "escalation", "scout"] } as unknown as TeamRouting;
+const AUTO_UNAVAILABLE = AUTO_LOG.unavailable;
+
+/** A run that carries the fields the recorder reads, with no events yet. */
+const pointRun = (lineup: TeamLineup, routing: TeamRun["routing"], id: string) =>
+  ({ id, revision: 1, projectId: "rehearsal", lineup, routing, events: [], tasks: [], members: [] }) as unknown as TeamRun;
+const escalationInput = (run: TeamRun, task: TeamTask, ownProfileId: string | undefined, namedProfileId?: string): RouterEscalation =>
+  ({ ...startOf(run, task), ownProfileId, namedProfileId });
+const scoutOf = (id: string, agentProfileId?: string) =>
+  ({ id, title: id, instructions: "look", ...(agentProfileId === undefined ? {} : { agentProfileId }) }) as unknown as TeamScout;
+const scoutInput = (run: TeamRun, scout: TeamScout): RouterScout => ({ run, scout, featureMap: undefined, limited: new Set() });
+const countReads = (store: EvidenceStore, fn: () => void): number => {
+  const original = store.read.bind(store) as EvidenceStore["read"];
+  let reads = 0;
+  (store as { read: EvidenceStore["read"] }).read = ((callback: Parameters<EvidenceStore["read"]>[0]) => {
+    reads += 1;
+    return original(callback);
+  }) as EvidenceStore["read"];
+  try {
+    fn();
+  } finally {
+    (store as { read: EvidenceStore["read"] }).read = original;
+  }
+  return reads;
+};
+
+/** A store whose evidence directory is a file, so it opens unavailable. */
+function withBrokenStore(fn: (store: EvidenceStore) => void): void {
+  const root = mkdtempSync(join(tmpdir(), "infinite-routing-recorder-broken-"));
+  try {
+    mkdirSync(join(root, "state"), { recursive: true });
+    writeFileSync(join(root, "state", "evidence"), "not a directory");
+    const broken = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: Buffer.alloc(32, 7) });
+    try {
+      fn(broken);
+    } finally {
+      broken.close();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/** Task 6's evidence: ten integrated escalations of sonnet-escalation, and ten starts of astra-escalation that do not count there. */
+function seedPointRows(store: EvidenceStore): void {
+  const escalated = (spec: Parameters<typeof integrated>[0]): OutcomeRow => {
+    const row = integrated(spec);
+    return { ...row, payload: { ...row.payload, replaces: { memberId: "m0", cause: "escalation" } } };
+  };
+  store.write(tx => {
+    for (let index = 0; index < 10; index++) writeOutcome(tx, escalated({ id: `esc-sonnet-${index}`, profile: SONNET_E, configId: "none", endedAt: NOW }));
+    for (let index = 0; index < 10; index++) writeOutcome(tx, integrated({ id: `start-astra-${index}`, profile: ASTRA_E, configId: "none", endedAt: NOW }));
+  });
+}
+
+test("a shadow pin of version 2 records the new points, and a version-1 pin records none", () => {
+  withStore(store => {
+    const shadow = pinRouting({ mode: "shadow", points: ["start", "escalation", "scout"] } as unknown as TeamRouting, "supervised", POINT_LINEUP);
+    assert.equal(shadow?.algorithmVersion, 2);
+    const run = pointRun(POINT_LINEUP, shadow, "run-shadow-points");
+    const lines: string[] = [];
+    const rec = recorder(store, lines);
+    assert.equal(rec.routeEscalation(escalationInput(run, taskOf("task-s"), "astra-xhigh", "sonnet-escalation")), undefined);
+    assert.equal(rec.routeScout(scoutInput(run, scoutOf("scout-s", "astra-xhigh"))), undefined);
+    assert.deepEqual(lines, []);
+
+    const [escalation] = rowsOf(store, run.id, "task-s");
+    assert.equal(rowsOf(store, run.id, "task-s").length, 1);
+    assert.equal(escalation?.point, "escalation");
+    assert.equal(escalation?.mode, "shadow");
+    assert.equal(escalation?.state, "recorded");
+    assert.equal(escalation?.coordinatorProfileId, "sonnet-escalation");
+    assert.equal(escalation?.algorithmVersion, 2);
+    assert.equal(escalation?.memberId, null);
+    const [scout] = rowsOf(store, run.id, "scout-s");
+    assert.equal(rowsOf(store, run.id, "scout-s").length, 1);
+    assert.equal(scout?.point, "scout");
+    assert.equal(scout?.role, "scout");
+    assert.equal(scout?.state, "recorded");
+    assert.equal(scout?.coordinatorProfileId, "astra-xhigh");
+    // Shadow rows at the new points count nowhere in the start progress.
+    assert.equal(store.read(db => shadowProgress(db, "rehearsal")).decisions, 0);
+
+    const before = countRows(store);
+    const v1 = pinRouting({ mode: "shadow", points: ["start"] } as unknown as TeamRouting, "supervised", POINT_LINEUP);
+    assert.equal(v1?.algorithmVersion, 1);
+    const old = pointRun(POINT_LINEUP, v1, "run-shadow-v1");
+    const v1Rec = recorder(store, lines);
+    assert.equal(v1Rec.routeEscalation(escalationInput(old, taskOf("task-v1"), "astra-xhigh", "sonnet-escalation")), undefined);
+    assert.equal(v1Rec.routeScout(scoutInput(old, scoutOf("scout-v1", "astra-xhigh"))), undefined);
+    assert.equal(countRows(store), before, "a version-1 pin writes no row at a new point");
+    // A pin made before this slice keeps version 1 and routes only start, whatever its points say.
+    const older = pointRun(POINT_LINEUP, { ...shadow!, algorithmVersion: 1 }, "run-shadow-older");
+    assert.equal(v1Rec.routeEscalation(escalationInput(older, taskOf("task-older"), "astra-xhigh", "sonnet-escalation")), undefined);
+    assert.equal(v1Rec.routeScout(scoutInput(older, scoutOf("scout-older", "astra-xhigh"))), undefined);
+    assert.equal(countRows(store), before, "a version-1 pin that lists the new points writes no row at them");
+    // A version-2 pin records only the points it lists.
+    const scoutOnly = pinRouting({ mode: "shadow", points: ["start", "scout"] } as unknown as TeamRouting, "supervised", POINT_LINEUP);
+    assert.equal(scoutOnly?.algorithmVersion, 2);
+    const partial = pointRun(POINT_LINEUP, scoutOnly, "run-shadow-scout-only");
+    assert.equal(v1Rec.routeEscalation(escalationInput(partial, taskOf("task-partial"), "astra-xhigh")), undefined);
+    assert.equal(countRows(store), before, "an escalation the pin does not list writes no row");
+    assert.deepEqual(lines, []);
+  });
+
+  // Without its evidence store the shadow path logs the unavailable line once over both calls, and writes nothing.
+  withBrokenStore(store => {
+    const shadow = pinRouting({ mode: "shadow", points: ["start", "escalation", "scout"] } as unknown as TeamRouting, "supervised", POINT_LINEUP);
+    const run = pointRun(POINT_LINEUP, shadow, "run-shadow-broken");
+    const lines: string[] = [];
+    const rec = recorder(store, lines);
+    assert.doesNotThrow(() => rec.routeEscalation(escalationInput(run, taskOf("task-b"), "astra-xhigh", "sonnet-escalation")));
+    assert.doesNotThrow(() => rec.routeScout(scoutInput(run, scoutOf("scout-b", "astra-xhigh"))));
+    assert.deepEqual(lines, [UNAVAILABLE]);
+  });
+});
+
+test("an auto run routes covered points, a revoked run falls back without a run line, and an uncovered run follows today's path", () => withStore(store => {
+  seedPointRows(store);
+  const routing = pinRouting(POINTS_PIN, "supervised", POINT_LINEUP, ENDED)!;
+  const lines: string[] = [];
+  const rec = recorder(store, lines);
+
+  // Covered: the escalation is the router's greedy pick, and the scout takes the lowest tier cost (the first light one).
+  const run = pointRun(POINT_LINEUP, routing, "run-covered");
+  assert.deepEqual(rec.routeEscalation(escalationInput(run, taskOf("task-e"), "astra-xhigh")), SONNET_E);
+  const scout = scoutOf("scout-1");
+  assert.deepEqual(rec.routeScout(scoutInput(run, scout)), ASTRA_I);
+  assert.deepEqual(scout.routing, { profileId: "astra-xhigh", by: "router" });
+  // A kept scout routing that is still a candidate is returned without a read.
+  const rowsCovered = countRows(store);
+  assert.equal(countReads(store, () => { assert.deepEqual(rec.routeScout(scoutInput(run, scout)), ASTRA_I); }), 0);
+  assert.equal(countRows(store), rowsCovered);
+  assert.deepEqual(run.events, [], "a router pick writes no run line");
+  assert.deepEqual(lines, []);
+
+  // Revoked, unnamed: the fallback profiles, with no row and no run line.
+  const revoked = { ...pointRun(POINT_LINEUP, routing, "run-revoked"), routingRevokedAt: NOW } as unknown as TeamRun;
+  assert.deepEqual(rec.routeEscalation(escalationInput(revoked, taskOf("task-r"), "astra-xhigh")), ASTRA_E);
+  const revokedScout = scoutOf("scout-r");
+  assert.deepEqual(rec.routeScout(scoutInput(revoked, revokedScout)), ASTRA_I);
+  assert.deepEqual(revokedScout.routing, { profileId: "astra-xhigh", by: "fallback" });
+  // Revoked, named: today's path applies.
+  assert.equal(rec.routeEscalation(escalationInput(revoked, taskOf("task-r2"), "astra-xhigh", "sonnet-escalation")), undefined);
+  assert.equal(rec.routeScout(scoutInput(revoked, scoutOf("scout-r2", "haiku-light"))), undefined);
+  assert.equal(countRows(store), rowsCovered, "the revoked fallbacks write no row");
+  assert.deepEqual(revoked.events, [], "a revoked fallback writes no run line");
+  assert.deepEqual(lines, []);
+
+  // Uncovered: the only escalation is the reviewer's model, so no escalation is covered.
+  const onlyOpus = { ...POINT_LINEUP, escalations: [POINT_LINEUP.escalations![0]!] };
+  const uncovered = pointRun(onlyOpus, pinRouting(POINTS_PIN, "supervised", onlyOpus, ENDED), "run-uncovered");
+  assert.equal(rec.routeEscalation(escalationInput(uncovered, taskOf("task-u"), "astra-xhigh")), undefined);
+  // The member's own profile is the only escalation candidate, so the point is uncovered for that member.
+  const sonnetOnly = { ...POINT_LINEUP, escalations: [SONNET_E] };
+  const ownOnly = pointRun(sonnetOnly, pinRouting(POINTS_PIN, "supervised", sonnetOnly, ENDED), "run-own-only");
+  assert.equal(rec.routeEscalation(escalationInput(ownOnly, taskOf("task-o"), SONNET_E.id)), undefined);
+  // A version-1 auto pin routes only start.
+  const v1 = pointRun(POINT_LINEUP, pinRouting({ mode: "auto", points: ["start"] } as unknown as TeamRouting, "supervised", POINT_LINEUP, ENDED), "run-v1");
+  assert.equal(rec.routeEscalation(escalationInput(v1, taskOf("task-v"), "astra-xhigh")), undefined);
+  assert.equal(countRows(store), rowsCovered, "an uncovered run writes no row");
+  assert.deepEqual(lines, []);
+}));
+
+test("a fallback at a new point writes one run line and logs once per reason", () => withBrokenStore(store => {
+  const routing = pinRouting(POINTS_PIN, "supervised", POINT_LINEUP, ENDED)!;
+  const run = pointRun(POINT_LINEUP, routing, "run-broken");
+  const lines: string[] = [];
+  const rec = recorder(store, lines);
+  assert.deepEqual(rec.routeEscalation(escalationInput(run, taskOf("task-a"), "astra-xhigh")), ASTRA_E);
+  assert.deepEqual(rec.routeEscalation(escalationInput(run, taskOf("task-b"), "astra-xhigh")), ASTRA_E);
+  assert.deepEqual(lines, [AUTO_UNAVAILABLE], "the escalation fallback logs its reason");
+  const scoutA = scoutOf("scout-a");
+  assert.deepEqual(rec.routeScout(scoutInput(run, scoutA)), ASTRA_I);
+  assert.deepEqual(rec.routeScout(scoutInput(run, scoutOf("scout-b"))), ASTRA_I);
+  assert.deepEqual(scoutA.routing, { profileId: "astra-xhigh", by: "fallback" });
+  assert.deepEqual(run.events.map(event => event.text), [
+    `Host routing could not choose an escalation profile for task task-a; it is assigned ${ASTRA_E.label}.`,
+    `Host routing could not choose an escalation profile for task task-b; it is assigned ${ASTRA_E.label}.`,
+    `Host routing could not choose a profile for scout scout-a; it is assigned ${ASTRA_I.label}.`,
+    `Host routing could not choose a profile for scout scout-b; it is assigned ${ASTRA_I.label}.`,
+  ]);
+  assert.deepEqual(lines, [AUTO_UNAVAILABLE]);
 }));

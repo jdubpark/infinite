@@ -1,6 +1,8 @@
 import Foundation
 
-// The host's usage contract (`packages/host/src/usage-api.ts`), mirrored field for field. Money is
+// The host's usage responses as the cost views decode them. The host defines them in
+// `packages/host/src/usage-service.ts` (summary, daily, projects), `packages/host/src/scorecard.ts`
+// (models) and `packages/host/src/usage-api.ts` (the shared money, balance and account types). Money is
 // USD in dollars; a figure with `unpriced > 0` is a floor, never an exact amount. A balance exists
 // only when the provider's own API returned one; `nil` renders as "—", never as an estimate.
 

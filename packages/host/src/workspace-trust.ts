@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -13,11 +13,49 @@ function trustable(cwd: string) {
 const isObject = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === "object" && !Array.isArray(value);
 
-/** A per-launch Codex override; nothing is written to the account's configuration. */
+function inspected(path: string, follow = false) {
+  try { return follow ? statSync(path) : lstatSync(path); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return undefined;
+    throw new Error(`Cannot check ${path} for repository Codex configuration (${code ?? "error"})`);
+  }
+}
+
+/** Codex 0.163's project root marker under `project_root_markers=[".git"]`: a `.git` file, or a `.git` folder holding `HEAD`. */
+function gitRootMarker(dir: string) {
+  const git = inspected(join(dir, ".git"), true);
+  return git !== undefined && (!git.isDirectory() || inspected(join(dir, ".git", "HEAD"), true) !== undefined);
+}
+
+/**
+ * The `.codex` entries a trusted Codex launch in `cwd` reads as project configuration: one in the folder itself or in
+ * any folder above it up to its project root, of any file type. Without a root marker only the folder itself counts.
+ * A linked worktree's main checkout supplies hooks only beside a `.codex` folder of the worktree's own.
+ */
+export function repositoryCodexConfig(cwd: string): string[] {
+  const chain: string[] = [];
+  for (let dir = cwd; ; dir = dirname(dir)) {
+    chain.push(dir);
+    if (gitRootMarker(dir)) break;
+    if (dirname(dir) === dir) { chain.length = 1; break; }
+  }
+  return chain.map(dir => join(dir, ".codex")).filter(path => inspected(path) !== undefined);
+}
+
+/**
+ * A per-launch Codex override; nothing is written to the account's configuration. In a trusted folder Codex loads the
+ * repository's `.codex` settings, hooks and exec policy, and starts its MCP server commands outside the command
+ * sandbox, so a member that commits one would change how every later Codex member runs. Such a folder is refused.
+ * The root markers are pinned so Codex finds the same project root as this check.
+ */
 export function codexTrustArgs(cwd: string): string[] {
   if (!trustable(cwd)) throw new Error("Workspace trust requires an absolute folder path");
+  const planted = repositoryCodexConfig(cwd);
+  if (planted.length)
+    throw new Error(`Codex member not started: the repository carries Codex project configuration (${planted.join(", ")}), which a trusted Codex launch would load. Remove it from the repository to start Codex members here.`);
   // A JSON string is a valid TOML basic string once control characters are excluded.
-  return ["-c", `projects={${JSON.stringify(cwd)}={trust_level="trusted"}}`];
+  return ["-c", 'project_root_markers=[".git"]', "-c", `projects={${JSON.stringify(cwd)}={trust_level="trusted"}}`];
 }
 
 /** The global config file Claude Code reads, including its legacy `.claude/.config.json`. */

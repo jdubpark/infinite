@@ -2,7 +2,7 @@ import type { CandidateRecord, RoutingExplain, RoutingStatus, StatusProfile } fr
 
 type Options = Record<string, string | boolean>;
 type RoutingApi = { json<T = unknown>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<T> };
-type Me = { teams?: { routing?: number; routingAuto?: number } };
+type Me = { teams?: { routing?: number; routingAuto?: number; routingPoints?: number } };
 type ExplorePause = { projectId: string; explorePausedAt: string | null };
 
 const USAGE = "Usage: infinite routing status PROJECT [--json] | infinite routing explain RUN_ID TASK_ID [--json] | infinite routing pause-explore PROJECT [--json] | infinite routing resume-explore PROJECT [--json]";
@@ -17,7 +17,7 @@ const decimal = (value: number | undefined) => value === undefined ? "unknown" :
 
 /** The settings the three --routing options name, checked before any request. Undefined when none is given. */
 export function requestedRouting(options: Options): Record<string, unknown> | undefined {
-  if (["--routing", "--routing-value", "--routing-contributor"].every(name => options[name] === undefined)) return undefined;
+  if (["--routing", "--routing-value", "--routing-contributor", "--routing-points"].every(name => options[name] === undefined)) return undefined;
   const choice: Record<string, unknown> = {};
   if (options["--routing"] !== undefined) {
     const mode = String(options["--routing"]);
@@ -35,7 +35,22 @@ export function requestedRouting(options: Options): Record<string, unknown> | un
     if (answer !== "allow" && answer !== "deny") throw new Error("--routing-contributor must be allow or deny.");
     choice.allowContributor = answer === "allow";
   }
+  if (options["--routing-points"] !== undefined) {
+    const points = String(options["--routing-points"]).split(",").map(point => point.trim());
+    const known = points.every(point => point === "start" || point === "escalation" || point === "scout");
+    if (!known || new Set(points).size !== points.length || !points.includes("start"))
+      throw new Error("--routing-points must list start, and may add escalation and scout, separated by commas.");
+    choice.points = points;
+  }
   return choice;
+}
+
+/** The host support checks for the routing options, run before any request. */
+export function assertRoutingSupport(choice: Record<string, unknown> | undefined, me: Me): void {
+  if (choice && me.teams?.routing !== 1) throw new Error("This host does not support routing settings. Upgrade the host before using --routing.");
+  if (choice?.mode === "auto" && me.teams?.routingAuto !== 1) throw new Error("This host does not support auto routing. Upgrade the host before using --routing auto.");
+  if (Array.isArray(choice?.points) && choice.points.some(point => point !== "start") && me.teams?.routingPoints !== 1)
+    throw new Error("This host does not support escalation and scout routing. Upgrade the host before using --routing-points.");
 }
 
 function profileLine(profile: StatusProfile): string {

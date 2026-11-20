@@ -37,6 +37,8 @@ export type RetentionHost = Pick<TeamKernel, "records" | "commands" | "manager" 
 
 /** How long a failed workspace removal waits before the scheduler tries it again. */
 const REMOVAL_RETRY_MS = 5 * 60_000;
+/** A record removal that failed in member trace cleanup, the one record failure retention waits out before retrying. */
+class TraceRemovalError extends TeamError {}
 /** A run's record waits at most this long for its events to reach the evidence store before retention removes it. */
 const EVIDENCE_WAIT_MS = 24 * 3600_000;
 function pathStrictlyInside(root: string, target: string) {
@@ -283,7 +285,7 @@ export class TeamRetention {
     // A settlement pass still running over the run's traces ends first, and nothing of the run is kept after it.
     await this.traces.forget(stored.run);
     try { await removeMemberTraces(this.host.config.stateDir, stored.run.id); }
-    catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's member traces could not be removed; its record was kept."); }
+    catch { throw new TraceRemovalError(500, "team-record-removal-failed", "The settled team's member traces could not be removed; its record was kept."); }
     try { await rmAsync(join(this.host.directory, `${stored.run.id}.sealed`), { force: true }); }
     catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's record could not be removed."); }
     this.host.commands.get(stored.run.id)?.abort();
@@ -371,11 +373,18 @@ export class TeamRetention {
     const retryAt = retention.retryAt?.[scope];
     return retryAt !== undefined && now < Date.parse(retryAt);
   }
-  /** Removes a cancelled run's record under the retention policy, unless the last attempt failed within its backoff. */
+  /**
+   * Removes a cancelled run's record under the retention policy. Only a failed member trace cleanup waits out a backoff
+   * before the next attempt; every other failure, the evidence wait included, is tried again on the next pass.
+   */
   private async removeRetainedRecord(stored: Stored) {
-    if (this.removalBackoffActive(this.host.retentionState(stored), "record", this.host.options?.now?.() ?? Date.now())) return;
+    const retention = this.host.retentionState(stored), now = this.host.options?.now?.() ?? Date.now();
+    if (this.removalBackoffActive(retention, "traces", now)) return;
     try { await this.deleteRecord(stored, true); }
-    catch (error) { await this.reportRemovalFailure(stored, "record", error); }
+    catch (error) {
+      if (error instanceof TraceRemovalError) (retention.retryAt ??= {}).traces = new Date(now + REMOVAL_RETRY_MS).toISOString();
+      await this.reportRemovalFailure(stored, "record", error);
+    }
   }
   async retire(stored: Stored) {
     // Trace caps apply to replay runs too, and to traces recorded before the setting was turned off. The measurement

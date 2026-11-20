@@ -104,3 +104,17 @@ test("the client reader reads a host that ignores since, and follows an answer i
   await assert.rejects(read(get), /cannot read/);
   assert.deepEqual(asked, ["/sessions?since=", "/sessions?since=v1", "/sessions?since=v1", "/sessions", "/sessions?since=", "/sessions?since=", "/sessions"]);
 });
+
+test("the client reader keeps the newer rows when two overlapping reads answer out of order", async () => {
+  const read = sessionListReader<{ id: string }>(), asked: string[] = [], answer: ((body: unknown) => void)[] = [];
+  const get = (path: string) => { asked.push(path); return new Promise<unknown>(resolve => answer.push(resolve)); };
+  const older = read(get), newer = read(get);
+  answer[1]!({ version: "v2", sessions: [{ id: "new" }] });
+  assert.deepEqual(await newer, [{ id: "new" }]);
+  answer[0]!({ version: "v1", sessions: [{ id: "old" }] });
+  assert.deepEqual(await older, [{ id: "new" }], "the late answer to the earlier read resolves to the rows held");
+  const next = read(get);
+  answer[2]!({ version: "v2", unchanged: true });
+  assert.deepEqual(await next, [{ id: "new" }]);
+  assert.deepEqual(asked, ["/sessions?since=", "/sessions?since=", "/sessions?since=v2"], "the next read names the newer version");
+});

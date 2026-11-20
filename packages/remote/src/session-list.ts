@@ -21,15 +21,17 @@ function readAnswer<T>(body: unknown, asked?: Held<T>): Held<T> | undefined {
  * Reads one host's session list, asking only for a change since the rows it read last: the host then answers
  * `{ version, unchanged: true }` in place of the rows. `get` sends a GET to the host's API path and resolves its JSON.
  * An unreadable answer is followed by a plain `GET /sessions`, the read every host answers; the reader then asks for
- * a version again on its next read. Use one reader per host.
+ * a version again on its next read. Reads may overlap: an answer that arrives after the answer to a later read is
+ * older than the rows held, so it is not kept and that read resolves to the rows held. Use one reader per host.
  */
 export function sessionListReader<T>(): (get: (path: string) => Promise<unknown>) => Promise<T[]> {
-  let held: Held<T> | undefined;
+  let held: Held<T> | undefined, started = 0, kept = 0;
   return async get => {
-    const asked = held;
+    const read = ++started, asked = held;
     const next = readAnswer<T>(await get(`/sessions?since=${asked?.version ?? ""}`), asked) ?? readAnswer<T>(await get("/sessions"));
     if (!next) throw new Error("The machine sent a session list this app cannot read.");
-    held = next;
+    if (read < kept) return held!.sessions;
+    held = next; kept = read;
     return next.sessions;
   };
 }

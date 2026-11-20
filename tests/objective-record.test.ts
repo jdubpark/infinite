@@ -6,7 +6,8 @@ import type { ProductGoal } from "../packages/host/src/goal-types.js";
 import type { TeamRun } from "../packages/host/src/team-types.js";
 import { canonicalBytes, cappedBytes, objectiveRecordSchema, recordDigest } from "../packages/host/src/objective-types.js";
 import type { Assumption, Criterion, Direction, LogEntry, ObjectiveRecord, Question } from "../packages/host/src/objective-types.js";
-import { INTENT_OPS, goalRecord, logValue, readStoredRecord, rebuildVersion, recordView, runRecord, syncDirections } from "../packages/host/src/objective-record.js";
+import { INTENT_OPS, OBJECTIVE_ERRORS, goalRecord, logValue, objectiveError, readStoredRecord, rebuildVersion, recordView, runRecord, syncDirections } from "../packages/host/src/objective-record.js";
+import type { ObjectiveErrorCode } from "../packages/host/src/objective-record.js";
 
 const GOAL_ID = "6f1c2a3e-8b4d-4c5e-9f60-718293a4b5c6";
 const OTHER_GOAL_ID = "4b2d5f60-1c3e-4a7b-8d9f-a0b1c2d3e4f5";
@@ -451,4 +452,140 @@ test("the steering limit fits the log", () => {
   assert.equal(objectiveRecordSchema.safeParse(record).success, true);
   assert.equal(record.log.length, 21);
   assert.ok(canonicalBytes(record.log) < 16 * 1024);
+});
+
+test("a rebuild undoes the register", () => {
+  const COMMAND = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+  const COMMIT = "a".repeat(40);
+  const OWNER_REQUEST = REQUEST_IDS[2];
+  const RATING_REQUEST = REQUEST_IDS[3];
+  const FINDING = "finding-3";
+  const OLD_HANDLE = `receipt:${RUN_ID}:1:a1`;
+  const digestOf = (value: unknown) => createHash("sha256").update(canonicalJson(JSON.parse(JSON.stringify(value)))).digest("hex");
+  const sealed = (record: Omit<ObjectiveRecord, "digest">): ObjectiveRecord => {
+    const body = { ...record, digest: "" } as ObjectiveRecord;
+    body.digest = recordDigest(body);
+    return body;
+  };
+  const draft = (id: string, extra: Partial<Assumption>): Assumption => ({
+    id, statement: `Assumption ${id} holds.`, status: "unchecked", origin: "intent-check", criticality: "plan",
+    refutedBy: `Assumption ${id} fails.`, test: { kind: "owner" }, evidence: [], proposals: [], ...extra,
+  });
+  const base = goalRecord(goalFixture(), AT, "created") as ObjectiveRecord;
+
+  // Version 1: four assumptions. a1 already holds an earlier receipt handle, which version 2 replaces at index 0.
+  const a1v1 = draft("a1", { test: { kind: "command", command: COMMAND, refutesOn: "fail" }, evidence: [OLD_HANDLE] });
+  const a2v1 = draft("a2", { test: { kind: "command", command: COMMAND, refutesOn: "fail" } });
+  const a4v1 = draft("a4", { origin: "owner", test: { kind: "owner" } });
+  const a5v1 = draft("a5", { origin: "owner", test: { kind: "owner", rating: { subject: "quality", below: 4 } } });
+  const v1 = [a1v1, a2v1, a4v1, a5v1];
+
+  // Version 2: a test sets a1 verified and a2 refuted, and each new handle is last in its evidence.
+  const test2 = {
+    revision: 2, kind: "command",
+    changed: [{ id: "a1", status: "verified" }, { id: "a2", status: "refuted" }],
+  };
+  const entry2: LogEntry = {
+    seq: 2, at: at(2), version: 2, actor: "host", authority: "receipt", op: "test.recorded", target: RUN_ID, handle: `receipt:${RUN_ID}:2`,
+    before: { inline: { assumptions: [
+      { id: "a1", status: "unchecked", replaced: { handle: OLD_HANDLE, at: 0 } },
+      { id: "a2", status: "unchecked" },
+    ] } },
+    after: { inline: test2 },
+  };
+  const a1v2 = { ...a1v1, status: "verified" as const, evidence: [`receipt:${RUN_ID}:2:a1`] };
+  const a2v2 = { ...a2v1, status: "refuted" as const, evidence: [`receipt:${RUN_ID}:2:a2`] };
+  const v2 = [a1v2, a2v2, a4v1, a5v1];
+
+  // Version 3: a member proposes a6 and attaches a stance to a2.
+  const a6 = draft("a6", { origin: "member", criticality: "detail", statement: "Members keep the export format." });
+  const proposal = {
+    revision: 3, added: ["a6"], addedDigest: digestOf([a6]),
+    attached: [{ id: "a2", entryId: FINDING }],
+  };
+  const entry3: LogEntry = {
+    seq: 3, at: at(3), version: 3, actor: "member", authority: "claim", op: "proposal.recorded", target: MEMBER, handle: RUN_ID,
+    after: { inline: proposal },
+  };
+  const stance = { entryId: FINDING, stance: "contradicts" as const, summary: "The export has no dates.", authorRole: "researcher" };
+  const a2v3 = { ...a2v2, proposals: [stance] };
+  const v3 = [a1v2, a2v3, a4v1, a5v1, a6];
+
+  // Version 4: the owner pins a4 verified.
+  const entry4: LogEntry = {
+    seq: 4, at: at(4), version: 4, actor: "owner", authority: "direction", op: "assumption.set", target: "a4", handle: OWNER_REQUEST,
+    before: { inline: { status: "unchecked" } },
+    after: { inline: { status: "verified" } },
+  };
+  const a4v4 = { ...a4v1, status: "verified" as const, ownerPinned: true, evidence: [`owner:${OWNER_REQUEST}`] };
+  const v4 = [a1v2, a2v3, a4v4, a5v1, a6];
+
+  // Version 5: the owner rates quality 3, which refutes a5 (below 4).
+  const entry5: LogEntry = {
+    seq: 5, at: at(5), version: 5, actor: "owner", authority: "direction", op: "rating.recorded", target: "quality", handle: RATING_REQUEST,
+    before: { inline: { assumptions: [{ id: "a5", status: "unchecked" }] } },
+    after: { inline: { subject: "quality", score: 3, commit: COMMIT, cycle: 2, changed: [{ id: "a5", status: "refuted" }] } },
+  };
+  const a5v5 = { ...a5v1, status: "refuted" as const, evidence: [`rating:${RATING_REQUEST}`] };
+  const v5Assumptions = [a1v2, a2v3, a4v4, a5v5, a6];
+  const log = [base.log[0], entry2, entry3, entry4, entry5];
+  const v5 = sealed({ ...base, version: 5, assumptions: v5Assumptions, log });
+  assert.equal(objectiveRecordSchema.safeParse(v5).success, true);
+
+  const snapshot = (version: number, assumptions: Assumption[]): ObjectiveRecord =>
+    sealed({ ...base, version, assumptions, log: log.filter(item => item.version <= version) });
+  assert.deepEqual(rebuildVersion(v5, 1), snapshot(1, v1));
+  assert.deepEqual(rebuildVersion(v5, 2), snapshot(2, v2));
+  assert.deepEqual(rebuildVersion(v5, 3), snapshot(3, v3));
+  assert.deepEqual(rebuildVersion(v5, 4), snapshot(4, v4));
+
+  // An addedDigest one byte off.
+  const flipped = digestOf([a6]).replace(/.$/, last => (last === "0" ? "1" : "0"));
+  const drifted = withEntry(v5, 3, { after: { inline: { ...proposal, addedDigest: flipped } } });
+  assert.throws(() => rebuildVersion(drifted, 2), { status: 409, code: "objective-version-unavailable" });
+
+  // A stance that is not the assumption's last proposal.
+  const stanceNotLast = sealed({
+    ...v5, assumptions: v5.assumptions.map(item => (item.id === "a2" ? { ...item, proposals: [stance, { ...stance, entryId: "finding-9" }] } : item)),
+  });
+  assert.throws(() => rebuildVersion(stanceNotLast, 2), { status: 409, code: "objective-version-unavailable" });
+
+  // A last handle that differs from the entry's, for an owner pin and for a rating.
+  const pinHandleDiffers = sealed({
+    ...v5, assumptions: v5.assumptions.map(item => (item.id === "a4" ? { ...item, evidence: ["owner:other-request"] } : item)),
+  });
+  assert.throws(() => rebuildVersion(pinHandleDiffers, 3), { status: 409, code: "objective-version-unavailable" });
+  const ratingHandleDiffers = sealed({
+    ...v5, assumptions: v5.assumptions.map(item => (item.id === "a5" ? { ...item, evidence: ["rating:other-request"] } : item)),
+  });
+  assert.throws(() => rebuildVersion(ratingHandleDiffers, 4), { status: 409, code: "objective-version-unavailable" });
+
+  // A current status that differs from the entry's `after`, for a rating and for an owner pin.
+  const rated = { subject: "quality", score: 3, commit: COMMIT, cycle: 2 };
+  const ratingStatusDiffers = withEntry(v5, 5, { after: { inline: { ...rated, changed: [{ id: "a5", status: "verified" }] } } });
+  assert.throws(() => rebuildVersion(ratingStatusDiffers, 4), { status: 409, code: "objective-version-unavailable" });
+  const pinStatusDiffers = withEntry(v5, 4, { after: { inline: { status: "refuted" } } });
+  assert.throws(() => rebuildVersion(pinStatusDiffers, 3), { status: 409, code: "objective-version-unavailable" });
+
+  // A test whose `changed` names an assumption its `before` does not, and a proposal that carries a `before`.
+  const extraChanged = withEntry(v5, 2, { after: { inline: { ...test2, changed: [...test2.changed, { id: "a5", status: "refuted" }] } } });
+  assert.throws(() => rebuildVersion(extraChanged, 1), { status: 409, code: "objective-version-unavailable" });
+  const proposalWithBefore = withEntry(v5, 3, { before: { inline: { assumptions: [] } } });
+  assert.throws(() => rebuildVersion(proposalWithBefore, 2), { status: 409, code: "objective-version-unavailable" });
+});
+
+test("register refusals have fixed codes and sentences", () => {
+  const expected: [ObjectiveErrorCode, number, string][] = [
+    ["objective-register-off", 409, "Turn on the assumption register for this goal's project before recording owner results."],
+    ["objective-assumption-target", 409, "A correction names an assumption that is missing, has no owner test, or was proposed by a member."],
+    ["objective-rating-subject", 409, "A rating names a subject that no active criterion or owner test names."],
+    ["objective-rating-no-head", 409, "The goal has no reviewed cycle to rate yet."],
+  ];
+  for (const [code, status, message] of expected) {
+    assert.deepEqual(OBJECTIVE_ERRORS[code], { status, message }, code);
+    const error = objectiveError(code);
+    assert.equal(error.status, status, code);
+    assert.equal(error.code, code);
+    assert.equal(error.message, message);
+  }
 });

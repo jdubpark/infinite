@@ -243,7 +243,7 @@ test("posts are stored once as member claims", () => {
       post(implA, finding("finding-marker")),
       post(implA, handoff("handoff-marker", "a")),
     ];
-    assert.deepEqual(board.ingest(run, implA, posts, []), { result: "stored", stored: 3, dropped: 0, invalid: 0 });
+    assert.deepEqual(board.ingest(run, implA, posts, []), { result: "stored", stored: 3, dropped: 0, invalid: 0, kept: new Set([0]) });
 
     const page = board.list(run.id, { kinds: [...MEMBER_ENTRY_KINDS] });
     assert.equal(page.entries.length, 3);
@@ -254,7 +254,7 @@ test("posts are stored once as member claims", () => {
     }
     assert.equal(page.entries.find(head => head.kind === "handoff")?.taskId, "a");
 
-    assert.deepEqual(board.ingest(run, implA, posts, []), { result: "stored", stored: 3, dropped: 0, invalid: 0 });
+    assert.deepEqual(board.ingest(run, implA, posts, []), { result: "stored", stored: 3, dropped: 0, invalid: 0, kept: new Set([0]) });
     assert.equal(rowCount(store), 3);
 
     const rows = store.read(db => db.all<Record<string, unknown>>("SELECT * FROM entries"));
@@ -283,7 +283,7 @@ test("a post that does not match its member stores nothing", () => {
       [rev, post(rev, finding("reviewer-without-tools"))],
     ];
     for (const [member, record] of cases) {
-      assert.deepEqual(board.ingest(run, member, [record], []), { result: "stored", stored: 0, dropped: 0, invalid: 1 });
+      assert.deepEqual(board.ingest(run, member, [record], []), { result: "stored", stored: 0, dropped: 0, invalid: 1, kept: new Set() });
     }
     assert.equal(rowCount(store), 0);
     assert.equal(store.describe().counts["blackboard.invalid"], 6);
@@ -304,10 +304,10 @@ test("the run holds at most 400 member entries", () => {
     assert.equal(board.ingest(run, implA, second, []).stored, 199);
 
     const third = [0, 1, 2].map(index => post(implB, contract(`third-${index}`)));
-    assert.deepEqual(board.ingest(run, implB, third, []), { result: "stored", stored: 1, dropped: 2, invalid: 0 });
+    assert.deepEqual(board.ingest(run, implB, third, []), { result: "stored", stored: 1, dropped: 2, invalid: 0, kept: new Set([0]) });
     assert.equal(store.describe().counts["blackboard.dropped"], 2);
     assert.equal(rowCount(store, run.id), 8 + 50 + 400);
-    assert.deepEqual(board.ingest(run, implB, [post(implB, contract("fourth"))], []), { result: "stored", stored: 0, dropped: 1, invalid: 0 });
+    assert.deepEqual(board.ingest(run, implB, [post(implB, contract("fourth"))], []), { result: "stored", stored: 0, dropped: 1, invalid: 0, kept: new Set() });
   });
 });
 
@@ -506,6 +506,47 @@ test("withdraw hides nothing from the owner and changes state once", () => {
     } finally {
       wrong.close();
     }
+  } finally {
+    f.close();
+  }
+});
+
+/** The same post record at a journal seq. */
+function atSeq(record: MemberPostRecord, seq: number): MemberPostRecord {
+  return { ...record, seq };
+}
+
+test("the store reports which posts it holds", () => {
+  withBoard((store, board) => {
+    const run = entryRun();
+    const implA = memberOf(run, hostEntryIds.implA);
+    // 399 member entries are stored, so the page's first new post takes the 400th place.
+    const first = Array.from({ length: 200 }, (_, index) => post(implA, contract(`first-${index}`)));
+    const second = Array.from({ length: 199 }, (_, index) => post(implA, contract(`second-${index}`)));
+    assert.equal(board.ingest(run, implA, first, []).stored, 200);
+    assert.equal(board.ingest(run, implA, second, []).stored, 199);
+
+    const fresh = atSeq(post(implA, contract("fresh-entry")), 12);
+    const stored = atSeq(first[0], 11);
+    const wrongBinding = atSeq(post(implA, contract("wrong-binding"), { revision: implA.revision + 1 }), 13);
+    const overLimit = atSeq(post(implA, contract("over-limit")), 14);
+    assert.deepEqual(
+      board.ingest(run, implA, [fresh, stored, wrongBinding, overLimit], []),
+      { result: "stored", stored: 2, dropped: 1, invalid: 1, kept: new Set([11, 12]) },
+    );
+  });
+
+  // An unready store keeps nothing.
+  const f = fixture();
+  try {
+    const store = open(f);
+    const board = new Blackboard(store);
+    store.close();
+    const run = entryRun();
+    const implA = memberOf(run, hostEntryIds.implA);
+    const outcome = board.ingest(run, implA, [atSeq(post(implA, contract("after-close")), 15)], []);
+    assert.equal(outcome.result, "unready");
+    assert.equal(outcome.kept, undefined);
   } finally {
     f.close();
   }

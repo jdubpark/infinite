@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { TeamAssignment, TeamMember, TeamRole, TeamRun, TeamTask } from "../team-types.js";
 import { ownedPathSchema, taskIdSchema, teamEvidenceSchema } from "../team-types.js";
 import { canonicalJson } from "./crypto.js";
+import { memberProposalSchema } from "./member-proposal.js";
 import { ENTRY_KINDS } from "./entry-types.js";
 import type { MemberEntryKind } from "./entry-types.js";
 export { ENTRY_ROLES, entryToolsFor } from "../entry-roles.js";
@@ -48,6 +49,7 @@ const contractBody = z.object({
 
 const findingBody = z.object({
   items: z.array(teamEvidenceSchema).min(1).max(8),
+  assumption: memberProposalSchema.optional(),
 }).strict();
 
 const blockerBody = z.object({
@@ -159,7 +161,7 @@ const FIELD_NAMES: ReadonlySet<string> = new Set([
   "interface", "change", "sources", "cause", "status", "detail", "issueRefs", "sourceRefs", "attemptedFixes",
   "fix", "outcome", "proposedRecovery", "prevention", "validationEvidence", "sourceRef", "done", "remaining",
   "notes", "commands", "op", "runId", "memberId", "revision", "requestId", "query", "kinds", "path", "since",
-  "limit", "entryId",
+  "limit", "entryId", "assumption", "propose", "id", "stance", "statement", "refutedBy", "test", "criticality",
 ]);
 
 /** A zod issue path as `entry.body.items.0.source`: indexes and schema field names only. */

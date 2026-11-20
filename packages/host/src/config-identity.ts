@@ -2,11 +2,14 @@ import { createHash } from "node:crypto";
 import { basename } from "node:path";
 import { canonicalJson } from "./evidence/crypto.js";
 import { intentCheckerPrompt } from "./intent-prompt.js";
+import type { ObjectivePrompt } from "./objective-digest.js";
 import { profileIdentity } from "./run-events.js";
 import { entryCommand, reportCommand, teamPrompt } from "./team-prompts.js";
 import { teamCommand, teamGitArgs } from "./team-workspace.js";
-import type { RecordDigest, TeamCommand, TeamMember, TeamModelProfile, TeamRun, TeamScout, TeamTask } from "./team-types.js";
+import type { RecordDigest, RegisterDigest, TeamCommand, TeamMember, TeamModelProfile, TeamRun, TeamScout, TeamTask } from "./team-types.js";
 import type { Provider } from "./types.js";
+
+export type { ObjectivePrompt } from "./objective-digest.js";
 
 /** Guidance files whose blobs a configuration identity covers (umbrella C7, component 3, default set). */
 export const GUIDANCE_FILES = ["AGENTS.md", "CLAUDE.md"] as const;
@@ -91,6 +94,11 @@ const FIXTURE_RECORD: RecordDigest = {
     { id: "c1", statement: "Fixture owner criterion.", check: "command:npm test", producer: "host" },
   ],
 };
+/** The register the "register" and "register-autonomous" shapes add to the fixture record. Fixed text, never a live record. */
+const FIXTURE_REGISTER: RegisterDigest = {
+  assumptions: [{ id: "a1", status: "unchecked", criticality: "plan", statement: "Fixture assumption." }],
+  questions: [{ id: "q1", text: "Fixture question? Default: keep." }],
+};
 /** Two fixed runs, each with its work item. Rendering them is the prompt version; no live run is read. */
 const FIXTURES: { run: TeamRun; work: TeamTask | TeamScout }[] = [
   {
@@ -128,16 +136,30 @@ function waitIn<T>(waiters: Set<(value: T | undefined) => void>, signal: AbortSi
 }
 
 /**
+ * The goal fixture's run for an objective shape. `true` gives the criteria digest alone. "register" pins the run
+ * supervised and adds the fixture register; "register-autonomous" pins it autonomous. A run without a goal is unchanged.
+ */
+function objectiveFixture(plain: TeamRun, objectiveDigest: ObjectivePrompt): TeamRun {
+  if (objectiveDigest === false || !plain.goal) return plain;
+  if (objectiveDigest === true) return { ...plain, goal: { ...plain.goal, record: FIXTURE_RECORD } };
+  return {
+    ...plain,
+    autonomy: objectiveDigest === "register-autonomous" ? "autonomous" : "supervised",
+    goal: { ...plain.goal, record: { ...FIXTURE_RECORD, register: FIXTURE_REGISTER } },
+  };
+}
+
+/**
  * The fixture renders of `teamPrompt`. The report command holds the Node path and the reporter's own file path,
  * which change with the install directory and not with the wording, so a placeholder stands in for it.
  * Throws when teamPrompt throws.
  */
-export function renderedPrompts(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean, entryTools = false, objectiveDigest = false): string[] {
+export function renderedPrompts(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean, entryTools = false, objectiveDigest: ObjectivePrompt = false): string[] {
   const command = reportCommand();
   if (role === "intent-checker") return [intentCheckerPrompt(provider, profile).split(command).join("<report-command>")];
   const entry = entryCommand();
   return FIXTURES.map(({ run: plain, work }) => {
-    const run = objectiveDigest && plain.goal ? { ...plain, goal: { ...plain.goal, record: FIXTURE_RECORD } } : plain;
+    const run = objectiveFixture(plain, objectiveDigest);
     return teamPrompt(entryTools ? { ...run, blackboard: { tools: true } } : run, role, work, undefined, provider, profile, { checks: FIXTURE_CHECKS }, [], publishHeads)
       .split(command).join("<report-command>").split(entry).join("<entry-command>");
   });
@@ -147,7 +169,7 @@ export function renderedPrompts(role: TeamMember["role"], provider: Provider, pr
  * The digest of `renderedPrompts`. Cached per exact render input: the prompt prints the whole profile object, so
  * every profile field is part of the key. Throws when teamPrompt throws.
  */
-export function promptVersion(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean, entryTools = false, objectiveDigest = false): string {
+export function promptVersion(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean, entryTools = false, objectiveDigest: ObjectivePrompt = false): string {
   const key = JSON.stringify([role, provider, profile ?? null, publishHeads, entryTools, objectiveDigest]);
   const cached = promptCache.get(key);
   if (cached !== undefined) return cached;
@@ -239,7 +261,7 @@ async function guidanceRead(workspace: string, commit: string, prefix: TeamComma
 /** The data of `member.configured`, or undefined when any component is unknown. Never throws. */
 export async function memberConfiguration(input: {
   workspace: string; baseCommit: string; role: TeamMember["role"]; provider: Provider;
-  profile?: TeamModelProfile; publishHeads: boolean; entryTools?: boolean; objectiveDigest?: boolean; prefix?: TeamCommand;
+  profile?: TeamModelProfile; publishHeads: boolean; entryTools?: boolean; objectiveDigest?: ObjectivePrompt; prefix?: TeamCommand;
   /** The routing component. Absent means `off`, as every configuration before routing was stored. */
   routing?: string;
 }, signal: AbortSignal): Promise<MemberConfiguration | undefined> {
@@ -250,7 +272,7 @@ export async function memberConfiguration(input: {
     if (guidance === undefined) return undefined;
     const identity = profileIdentity(input.profile, input.provider);
     const profile: ProfileKey = { provider: identity.provider, model: identity.model ?? null, effort: identity.effort ?? null };
-    const version = promptVersion(input.role, input.provider, input.profile, input.publishHeads, input.entryTools === true, input.objectiveDigest === true);
+    const version = promptVersion(input.role, input.provider, input.profile, input.publishHeads, input.entryTools === true, input.objectiveDigest ?? false);
     const components: ConfigComponents = { profile, promptVersion: version, guidance, knowledge: "none", routing, shape: "team" };
     return { ...profile, promptVersion: version, guidance, knowledge: "none", routing, shape: "team", configId: configId(components) };
   } catch {

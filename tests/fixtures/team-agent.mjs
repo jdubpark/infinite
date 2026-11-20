@@ -7,6 +7,12 @@ import { createInterface } from "node:readline";
 if (process.argv[2] === "--command-prefix") {
   const [, receiptDir, command, ...args] = process.argv.slice(2);
   appendFileSync(join(receiptDir, "commands.jsonl"), JSON.stringify({ command, args, cwd: process.cwd() }) + "\n", { mode: 0o600 });
+  const cat = command === "git" && args.includes("cat-file");
+  // refuse-cat-file: a cat-file exits 128, as a launcher that refuses the blob form does.
+  if (cat && existsSync(join(receiptDir, "refuse-cat-file"))) process.exit(128);
+  // hold-cat-file: a cat-file waits, at most 30 seconds, until release-cat-file exists.
+  const deadline = Date.now() + 30_000;
+  while (cat && existsSync(join(receiptDir, "hold-cat-file")) && !existsSync(join(receiptDir, "release-cat-file")) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
   const child = spawn(command, args, { stdio: "inherit", env: { ...process.env, INFINITE_TEST_COMMAND_IDENTITY: "team-prefix" } });
   child.once("error", () => process.exit(127));
   child.once("exit", code => process.exit(code ?? 128));

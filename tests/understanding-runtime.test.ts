@@ -254,16 +254,19 @@ test("a plan edit during another repository's final observation rejects the whol
 });
 
 test("close settles while a job is held, with nothing else keeping the process alive", { timeout: 80000 }, async t => {
-  let entered = false;
-  const s = setup(t, { adapter: { context: async () => { entered = true; return new Promise<never>(() => {}); },
+  let entered = false, fail: ((error: Error) => void) | undefined;
+  const s = setup(t, { adapter: { context: async () => { entered = true; return new Promise<never>((_, reject) => { fail = reject; }); },
     synthesize: async input => ({ components: input.components, coverage: [] }),
     delivery: async input => ({ repositoryId: input.repositoryId, state: "ready", observedAt: new Date().toISOString(), pullRequests: [], environments: [], coverage: [] }) } });
   s.runtime.refresh("workspace");
   await waitUntil(() => entered);
   // Nothing but close's own wait is pending here. If that wait cannot keep the process alive, the runner cancels this test and every test after it.
-  const started = Date.now();
+  const started = performance.now();
   await s.runtime.close();
-  assert.ok(Date.now() - started >= 1000, "close waited for the held job up to its limit");
+  assert.ok(performance.now() - started >= 1000, "close waited for the held job up to its limit");
+  // End the held job before the test does, so it cannot resume inside a later test.
+  fail!(new Error("released"));
+  await waitUntil(() => !(s.runtime as unknown as { running: boolean }).running);
 });
 
 test("restart recovers an admitted running job without resetting its daily budget", { timeout: 80000 }, async t => {

@@ -5,7 +5,7 @@ import type { Manager } from "./manager.js";
 import type { Prompt } from "@infinite/attention";
 import { TeamError } from "./team-workspace.js";
 import { isCollapsedPermissionPrompt, permissionEvidenceHash } from "./team-permissions.js";
-import { activeMember, automaticRecoveryLimit, boundedRecoveryText, coordinatorPermissionPrompt, digest, livePermissionRecoveryStatuses, permissionPromptKey, timestamp } from "./team-kernel.js";
+import { activeMember, automaticRecoveryLimit, boundedRecoveryText, coordinatorPermissionPrompt, deliveredAtRevision, digest, livePermissionRecoveryStatuses, permissionPromptKey, timestamp } from "./team-kernel.js";
 import { coordinatorRetiredReason, TeamPermissionAgent } from "./team-permission-agent.js";
 import type { Stored } from "./teams.js";
 
@@ -156,7 +156,7 @@ export class TeamPermissionRecovery extends TeamPermissionAgent {
   }
   queuePermissionRecoveryPm(stored: Stored, request: TeamPermissionRecoveryRequest, cause: string, decisionId?: string) {
     const { run } = stored;
-    const canRecover = run.permissions && !run.permissionsRevokedAt && !stored.halt && !run.stopReason && !stored.deliveryAttempt && !run.deliveryReceipt && !run.pullRequest &&
+    const canRecover = run.permissions && !run.permissionsRevokedAt && !stored.halt && !run.stopReason && !stored.deliveryAttempt && !run.deliveryReceipt && !deliveredAtRevision(run) &&
       !(run.permissions && (run.permissionDecisions ?? []).some(item => item.status === "uncertain" || item.status === "answering")) &&
       (!run.linearTracking || run.linear?.status === "synced") && !["paused", "cancelled", "blocked"].includes(run.status);
     const attempts = run.recovery?.attempts ?? 0;

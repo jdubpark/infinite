@@ -57,17 +57,20 @@ export class TeamPublisher {
     const failure = run.publication?.failure;
     if (failure?.commit === commit && now < Date.parse(failure.retryAt)) return false;
     const id = run.id, runBranch = run.branch, controller = new AbortController();
+    // A run steered after its delivery publishes to a checkpoint branch with no pull request. Its pull request moves only
+    // when delivery pushes a head the checks and the independent review passed (INF-324).
+    const checkpoint = run.pullRequest && run.pullRequest.revision !== run.revision ? `${runBranch}-${commit.slice(0, 8)}` : undefined;
     this.publishingRuns.add(id);
     this.publicationControllers.set(id, controller);
     let task: Promise<void>;
     task = (async () => {
       let outcome: Awaited<ReturnType<typeof publishTeamHead>> = { published: false, category: "other" };
-      let branch = runBranch, diverged = false;
+      let branch = checkpoint ?? runBranch, diverged = false;
       // With the GitHub proxy configured, each push carries a host grant for exactly the ref it publishes.
       const grantEnv = (ref: string) => hostGithubGrantEnvironment(this.host.config, { sid: `publish:${id}`, project: run.projectId, repo: target.repository, ops: ["push"], refs: [ref] });
       try {
-        outcome = await publishTeamHead(run.workspace, target.remoteUrl, commit, runBranch, this.host.config.teams?.commandPrefix, controller.signal, grantEnv);
-        if (!outcome.published && outcome.category === "rejected") {
+        outcome = await publishTeamHead(run.workspace, target.remoteUrl, commit, branch, this.host.config.teams?.commandPrefix, controller.signal, grantEnv);
+        if (!checkpoint && !outcome.published && outcome.category === "rejected") {
           branch = `${runBranch}-${commit.slice(0, 8)}`;
           outcome = await publishTeamHead(run.workspace, target.remoteUrl, commit, branch, this.host.config.teams?.commandPrefix, controller.signal, grantEnv);
           diverged = outcome.published;
@@ -83,6 +86,7 @@ export class TeamPublisher {
           run.publication = { repository: target.repository, branch, commit, publishedAt: at };
           this.host.event(stored, diverged
             ? `Published head ${commit.slice(0, 12)} to GitHub ${target.repository} ${branch}; GitHub's run branch had diverged, so the head was published as the sibling branch.`
+            : checkpoint ? `Published head ${commit.slice(0, 12)} to GitHub ${target.repository} ${branch} as a checkpoint. The pull request is updated only by delivery, after checks and the independent review pass.`
             : `Published head ${commit.slice(0, 12)} to GitHub ${target.repository} ${branch}.`);
         } else {
           const previous = previousPublication?.repository === target.repository ? previousPublication : undefined;

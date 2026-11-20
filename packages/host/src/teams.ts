@@ -1,5 +1,5 @@
 import type { ConnectorSource } from "./mcp-types.js";
-import { inputSourceLabel, decisionAnswerLabel } from "./team-types.js";
+import { inputSourceLabel, decisionAnswerLabel, type SteeringSource } from "./team-types.js";
 import type { HandoffPolicy, TeamHandoffContext } from "./handoff-types.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync } from "node:fs";
@@ -14,7 +14,7 @@ import { PROVIDER_NAMES, recoveryTurnEnd, type Prompt, type SignalData } from "@
 import { autonomyOf, type AutonomyMode } from "./autonomy.js";
 import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamBrief, type TeamContinue, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamPermissionRecoveryView, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, hostClosedBlockedReason, autoPinned, coversPoint, escalationPool, hostProfilesFor, memberLimit, switchFallback } from "./team-types.js";
 import { memberConfiguration, type MemberConfiguration } from "./config-identity.js";
-import { refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
+import { pullRequestBranch, refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
 import { reviewEvidenceProblems } from "./team-acceptance.js";
 import { teamModelLaunch } from "./launch.js";
 import { CheckOutputScanner, checkFeedback } from "./team-check-output.js";
@@ -49,7 +49,7 @@ import { HOST_LOAD_REASON_PREFIX, LaunchHeldError } from "./host-load.js";
 import { permissionEvidenceHash } from "./team-permissions.js";
 import { storageShortfall, volumeUsage, type VolumeUsage } from "./storage.js";
 import type { PermissionAgentServices } from "./permission-agent-types.js";
-import { activeMember, activeTeamRun, assignment, automaticRecoveryLimit, boundedRecoveryText, commitId, coordinatorPermissionPrompt, digest, filesystemEntryExists, livePermissionRecoveryStatuses, permissionCoordinatorDecision, permissionRequestCount, teamRunDirectory, terminalPermissionCoordinator, timestamp } from "./team-kernel.js";
+import { activeMember, activeTeamRun, assignment, automaticRecoveryLimit, boundedRecoveryText, commitId, coordinatorPermissionPrompt, deliveredAtRevision, digest, filesystemEntryExists, livePermissionRecoveryStatuses, permissionCoordinatorDecision, permissionRequestCount, recoveriesUsed, teamRunDirectory, terminalPermissionCoordinator, timestamp } from "./team-kernel.js";
 import type { PermissionHost } from "./team-permission-agent.js";
 import { TeamPermissionReview } from "./team-permission-review.js";
 import { TeamRetention, type RetentionHost } from "./team-retention.js";
@@ -187,7 +187,7 @@ export type Stored = {
   objectiveRecord?: unknown; objectiveNotice?: ObjectiveUnavailable; intentCheck?: IntentCheckState; register?: RegisterState;
 };
 /** Display names may change; durable replay binds connector identity to its kind and ID. */
-const receiptDigest = <T extends object>(value: T & { source?: ConnectorSource | string; by?: string }) => {
+const receiptDigest = <T extends object>(value: T & { source?: SteeringSource | string; by?: string }) => {
   const { source, by, ...body } = value;
   // Owner/coordinator actions keep the receipt shape used before connector provenance existed.
   return digest({ ...body, ...(by && by !== "coordinator" ? { by } : {}),
@@ -619,7 +619,7 @@ export class TeamService {
   private recoverLegacyBlocked(stored: Stored) {
     const run = stored.run, code = run.blockCode;
     if (run.status !== "blocked" || stored.run.recovery || !stored.prepared || stored.pending || stored.deliveryAttempt ||
-        run.deliveryReceipt || run.pullRequest || run.goal || run.missionId || run.handoff || run.stopReason || run.permissionsRevokedAt ||
+        run.deliveryReceipt || deliveredAtRevision(run) || run.goal || run.missionId || run.handoff || run.stopReason || run.permissionsRevokedAt ||
         run.linearTracking && run.linear?.status !== "synced" ||
         (run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering", "escalated", "uncertain"].includes(decision.status)) ||
         !code || !automaticRecoveryCodes.has(code)) return;
@@ -1314,7 +1314,7 @@ export class TeamService {
     // The owner acted on the run, so a halt release leaves it as the owner set it.
     stored.ownerHalt = undefined;
   }
-  steer(id: string, input: Mutation, source?: ConnectorSource | "coordinator") {
+  steer(id: string, input: Mutation, source?: SteeringSource) {
     const body = { ...teamMutationSchema.parse(input), ...(source === undefined ? {} : { source }) };
     return this.enqueue(async () => {
       const stored = this.record(id);
@@ -1334,6 +1334,9 @@ export class TeamService {
         stored.run.recovery.status = "exhausted";
         this.event(stored, `${source ? inputSourceLabel(source) : "User"} steering superseded automatic recovery; its original report remains recorded as evidence.`);
       }
+      // A delivered run delivers again to its pull request's branch; an earlier delivery recovery's record would refuse that report, so only its count stays (INF-324).
+      if (stored.run.pullRequest) stored.run.pullRequest.branch = pullRequestBranch(stored.run);
+      if (stored.run.pullRequest && stored.run.deliveryRecovery) { stored.run.deliveryRecoveryAttempts = recoveriesUsed(stored.run); delete stored.run.deliveryRecovery; }
       stored.run.revision++; stored.run.steering.push({ text: body.text, revision: stored.run.revision, at: timestamp(), ...(source ? { source } : {}) });
       const objectiveNote = runObjectiveNote(stored, steerRunObjective(stored, body.requestId, timestamp())); if (objectiveNote) this.event(stored, objectiveNote);
       this.emit(stored, "run.revision-advanced", [stored.run.revision], {}, { cause: "steer", fromRevision: stored.run.revision - 1, baseChanged: false });
@@ -1410,7 +1413,7 @@ export class TeamService {
       if (run.status === "cancelled" || run.status === "paused" || stored.halt || !member || member.role !== "reviewer" || member.report ||
           !["unavailable", "running"].includes(member.status) || member.sessionId !== body.sessionId || member.baseCommit !== run.headCommit ||
           member.baseCommit !== stored.checkHead || stored.pending || this.commands.has(id) || stored.deliveryAttempt || run.deliveryReceipt ||
-          run.pullRequest || run.stopReason || (run.permissionDecisions ?? []).some(decision => decision.targetSessionId === body.sessionId &&
+          deliveredAtRevision(run) || run.stopReason || (run.permissionDecisions ?? []).some(decision => decision.targetSessionId === body.sessionId &&
             ["pending", "reviewing", "approved", "answering", "uncertain"].includes(decision.status))) throw unavailable();
       this.assertBudget(run, true);
       const revision = run.revision, sessionId = member.sessionId, baseCommit = member.baseCommit;
@@ -2117,7 +2120,7 @@ export class TeamService {
         this.queueAutomaticDeliveryRecovery(stored, sourceMember, sourceMember.report.summary)) return;
     const operationSource = pending && recoverableOperationFailure(stored, pending);
     const unattributedOperation = pending && recoverableUnattributedResult(stored, pending);
-    if ((operationSource || unattributedOperation) && !stored.deliveryAttempt && !run.deliveryReceipt && !run.pullRequest && !run.stopReason &&
+    if ((operationSource || unattributedOperation) && !stored.deliveryAttempt && !run.deliveryReceipt && !deliveredAtRevision(run) && !run.stopReason &&
         !run.permissionsRevokedAt && (!run.linearTracking || run.linear?.status === "synced") && !["paused", "cancelled"].includes(run.status) &&
         !["pause", "cancel", "steer"].includes(stored.halt ?? "")) {
       const attempts = run.recovery?.attempts ?? 0;
@@ -2137,7 +2140,7 @@ export class TeamService {
     const permissionUncertain = (run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering", "escalated", "uncertain"].includes(decision.status));
     const recoverable = Boolean(code && automaticRecoveryCodes.has(code) && sourceMember && sourceMember.revision === run.revision &&
       sourceMember.role !== "delivery" && sourceMember.role !== "permission-coordinator" && !pending && !stored.deliveryAttempt &&
-      !run.deliveryReceipt && !run.pullRequest && !run.stopReason && !run.permissionsRevokedAt && !permissionUncertain &&
+      !run.deliveryReceipt && !deliveredAtRevision(run) && !run.stopReason && !run.permissionsRevokedAt && !permissionUncertain &&
       (!run.linearTracking || run.linear?.status === "synced") && !["paused", "cancelled"].includes(run.status));
     if (recoverable && code && sourceMember) {
       const attempts = run.recovery?.attempts ?? 0;
@@ -3172,6 +3175,9 @@ export class TeamService {
           report.disposition === "owned-branch" && (report.remoteHeadCommit !== report.headCommit || report.pullRequestUrl !== undefined) ||
           report.disposition === "pull-request" && (report.remoteHeadCommit !== report.headCommit || !report.pullRequestUrl))
         throw new TeamError(409, "delivery-remote-head-mismatch", "The inspected remote branch or pull request does not identify the exact reviewed head.");
+      // A recorded pull request rules out clean-base recovery, which would drop the commits it needs to fast-forward (INF-324).
+      if (run.pullRequest && (report.disposition !== "pull-request" || report.pullRequestUrl?.toLowerCase() !== run.pullRequest.pullRequestUrl.toLowerCase()))
+        throw new TeamError(409, "delivery-pull-request-recorded", "This run delivers only to its recorded pull request; report that pull request at the reviewed head, or report blocked.");
       if (report.disposition === "pull-request") {
         const reconciliationPullRequestUrl = report.pullRequestUrl;
         if (!reconciliationPullRequestUrl) throw new TeamError(409, "delivery-target-mismatch", "The inspected pull request URL is missing.");
@@ -3191,7 +3197,7 @@ export class TeamService {
         if (!source?.isGithub(run.projectId))
           throw new TeamError(409, "delivery-baseline-source-unavailable", "The host cannot confirm the moved delivery base from its configured GitHub source.");
         this.assertBudget(run, true);
-        const attempts = Math.max(run.deliveryRecovery?.attempts ?? 0, run.recovery?.attempts ?? 0);
+        const attempts = recoveriesUsed(run);
         if (attempts >= automaticRecoveryLimit)
           throw new TeamError(409, "delivery-recovery-exhausted", "The team exhausted its automatic delivery recovery allowance. Its reviewed work and remote evidence remain retained.");
         // A direct moved-base report can arrive without an earlier blocked report. Charge
@@ -3217,7 +3223,7 @@ export class TeamService {
       }, result => {
         if (report.disposition === "pull-request" && run.delivery?.mode === "pr") {
           stored.deliveryAttempt = undefined;
-          run.pullRequest = { revision: run.revision, headCommit: report.headCommit, pullRequestUrl: report.pullRequestUrl!, summary: report.summary, reportedAt: timestamp() };
+          run.pullRequest = { revision: run.revision, headCommit: report.headCommit, pullRequestUrl: report.pullRequestUrl!, summary: report.summary, reportedAt: timestamp(), branch: report.branch };
           this.emitWith(stored, "delivery.recorded", [member.revision, member.memberId], { memberId: member.memberId, revision: member.revision }, () => ({
             method: "pull-request", headCommit: report.headCommit }));
           run.status = "ready-for-review"; run.reason = undefined;
@@ -3275,6 +3281,8 @@ export class TeamService {
         const prefix = `/${run.delivery!.repository}/pull/`.toLowerCase();
         if (url.origin !== "https://github.com" || url.username || url.password || url.search || url.hash || !url.pathname.toLowerCase().startsWith(prefix) || !/^[1-9][0-9]*$/.test(url.pathname.slice(prefix.length)))
           throw new TeamError(409, "delivery-target-mismatch", "The pull request must belong to the configured repository.");
+        if (report.kind === "pull-request" && run.pullRequest && report.pullRequestUrl.toLowerCase() !== run.pullRequest.pullRequestUrl.toLowerCase())
+          throw new TeamError(409, "delivery-target-mismatch", "A continued delivery updates the run's recorded pull request; it cannot open another.");
       }
       this.operation(stored, "result", async signal => {
         await assertMemberReadOnly(member.cwd, member.baseCommit, this.prefixFor(run), signal);
@@ -3302,7 +3310,8 @@ export class TeamService {
           this.repair(stored, `Delivery requires a scoped repair before checks and independent review run again. No merge was reported.\n${report.summary}`, "delivery");
         } else if (report.kind === "pull-request") {
           stored.deliveryAttempt = undefined;
-          run.pullRequest = { revision: run.revision, headCommit: report.headCommit, pullRequestUrl: report.pullRequestUrl, summary: report.summary, reportedAt: timestamp() };
+          // The branch delivery was granted, read before the record changes: the recorded pull request's, or the published head's.
+          run.pullRequest = { revision: run.revision, headCommit: report.headCommit, pullRequestUrl: report.pullRequestUrl, summary: report.summary, reportedAt: timestamp(), branch: teamDeliveryBranch(run) };
           this.emitWith(stored, "delivery.recorded", [member.revision, member.memberId], { memberId: member.memberId, revision: member.revision }, () => ({
             method: "pull-request", headCommit: report.headCommit }));
           run.status = "ready-for-review"; run.reason = undefined;

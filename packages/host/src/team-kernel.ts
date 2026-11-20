@@ -44,6 +44,14 @@ export function permissionCoordinatorDecision(run: TeamRun, member: TeamMember) 
 const inactiveTeamStatuses = new Set(["cancelled", "ready-for-review", "merged", "no-change"]);
 export const activeTeamRun = (status: string) => !inactiveTeamStatuses.has(status);
 export const automaticRecoveryLimit = 2;
+/**
+ * A pull request recorded at the run's current revision. A run steered after its delivery keeps the earlier record, so
+ * the owner keeps the link, and works and delivers again (INF-324). Delivery recovery keeps testing `run.pullRequest`.
+ */
+export const deliveredAtRevision = (run: Pick<TeamRun, "pullRequest" | "revision">) => run.pullRequest?.revision === run.revision;
+/** Automatic recoveries the run has used, including those a steer took off the run with their delivery recovery record. */
+export const recoveriesUsed = (run: Pick<TeamRun, "deliveryRecovery" | "recovery" | "deliveryRecoveryAttempts">) =>
+  Math.max(run.deliveryRecovery?.attempts ?? 0, run.recovery?.attempts ?? 0, run.deliveryRecoveryAttempts ?? 0);
 export const livePermissionRecoveryStatuses = new Set(["expanding", "diagnosing", "reviewing-evidence"]);
 export const screenPermissionPrompt = (prompt: Prompt) => prompt.source === "screen" && prompt.kind === "permission" && prompt.pinned === true && Boolean(prompt.hash);
 export const coordinatorPermissionPrompt = (prompt: Prompt) => oneShotPermissionOption(prompt) !== undefined || isCollapsedPermissionPrompt(prompt) || screenPermissionPrompt(prompt);

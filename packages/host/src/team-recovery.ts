@@ -2,10 +2,10 @@ import type { ConnectorSource } from "./mcp-types.js";
 import { inputSourceLabel, type TeamContinuation, type TeamContinue, teamContinueSchema, type TeamDeliveryReconcile, teamDeliveryReconcileSchema, type TeamMember, type TeamReport, type TeamRun, type TeamScout, type TeamTask, teamVerificationReconcileSchema, type TeamView } from "./team-types.js";
 import { randomUUID } from "node:crypto";
 import { dirname, relative } from "node:path";
-import { teamDeliveryBranch } from "./team-prompts.js";
+import { pullRequestBranch, teamDeliveryBranch } from "./team-prompts.js";
 import type { LinearService } from "./linear.js";
 import { assertMemberReadOnly, prepareRecoveredWorkspace, TeamError, teamHead } from "./team-workspace.js";
-import { activeMember, automaticRecoveryLimit, commitId, digest, type TeamKernel, terminalPermissionCoordinator, timestamp } from "./team-kernel.js";
+import { activeMember, automaticRecoveryLimit, commitId, deliveredAtRevision, digest, recoveriesUsed, type TeamKernel, terminalPermissionCoordinator, timestamp } from "./team-kernel.js";
 import { runObjectiveNote, steerRunObjective } from "./objective-runs.js";
 import type { Action, PendingOperation, Stored, VerificationMutation } from "./teams.js";
 
@@ -54,7 +54,7 @@ export function recoverableOperationFailure(stored: Stored, pending: PendingOper
   const { run } = stored, source = pending.source, failure = pending.failure;
   if (!source || !failure || !failure.code || !automaticOperationRecoveryCodes.has(failure.code) || pending.kind !== "result" || pending.revision !== run.revision ||
       source.role === "delivery" || source.role === "permission-coordinator" || source.headCommit !== run.headCommit ||
-      stored.deliveryAttempt || run.deliveryReceipt || run.pullRequest || run.stopReason || run.permissionsRevokedAt ||
+      stored.deliveryAttempt || run.deliveryReceipt || deliveredAtRevision(run) || run.stopReason || run.permissionsRevokedAt ||
       run.linearTracking && run.linear?.status !== "synced" || ["paused", "cancelled"].includes(run.status) || stored.halt === "pause" || stored.halt === "cancel" ||
       (run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering", "uncertain"].includes(decision.status))) return undefined;
   const member = run.members.find(item => item.memberId === source.memberId && item.revision === pending.revision && item.role === source.role &&
@@ -68,14 +68,20 @@ export function recoverableUnattributedResult(stored: Stored, pending: PendingOp
     Boolean(failureCode && automaticOperationRecoveryCodes.has(failureCode)));
   if (pending.kind !== "result" || pending.source || !failureCode ||
       !automaticOperationRecoveryCodes.has(failureCode) && failureCode !== "unattributed-result" || !pending.failure && !settledLegacy ||
-      pending.revision !== run.revision || stored.deliveryAttempt || run.deliveryReceipt || run.pullRequest ||
+      pending.revision !== run.revision || stored.deliveryAttempt || run.deliveryReceipt || deliveredAtRevision(run) ||
       run.stopReason || run.permissionsRevokedAt || run.linearTracking && run.linear?.status !== "synced" ||
       ["paused", "cancelled"].includes(run.status) || ["pause", "cancel", "steer"].includes(stored.halt ?? "") ||
       (run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering", "uncertain"].includes(decision.status))) return false;
   return true;
 }
-/** Delivery evidence may name the run branch (recorded before publication) or the branch the host published the head to. */
-export function deliveryBranchMatches(run: TeamRun, branch: string) { return branch === run.branch || branch === teamDeliveryBranch(run); }
+/**
+ * Delivery evidence may name the run branch (recorded before publication) or the branch the host published the head to.
+ * Once a pull request records its branch, only that branch (INF-324).
+ */
+export function deliveryBranchMatches(run: TeamRun, branch: string) {
+  const recorded = pullRequestBranch(run);
+  return recorded ? branch === recorded : branch === run.branch || branch === teamDeliveryBranch(run);
+}
 
 /**
  * Delivery reconciliation and the bounded recovery of blocked runs: the owner's delivery and verification
@@ -122,7 +128,7 @@ export class TeamRecovery {
       const previous = attempt && run.members.find(member => member.memberId === attempt.memberId);
       const reconciliation = previous?.report?.kind === "delivery-reconciliation" ? previous.report : undefined;
       const failureCodes = new Set(["workspace-operation-failed", "invalid-workspace-baseline", "workspace-copy-changed", "delivery-baseline-source-mismatch"]);
-      const recoveryAttempts = Math.max(run.deliveryRecovery?.attempts ?? 0, run.recovery?.attempts ?? 0);
+      const recoveryAttempts = recoveriesUsed(run);
       const failedPendingEligible = Boolean(failedOperation && pending?.kind === "result" && pending.revision === run.revision &&
         pending.failure?.code && failureCodes.has(pending.failure.code) && pending.source?.role === "delivery" && pending.source.workspace === "member" &&
         pending.source.memberId === previous?.memberId && pending.source.memberId === attempt?.memberId && pending.source.cwd === previous?.cwd &&
@@ -236,7 +242,7 @@ export class TeamRecovery {
       if (!pending || pending.kind !== "check" || pending.failure || pending.revision !== run.revision)
         throw unavailable("Only an unresolved restart-interrupted check can be reconciled; other uncertain operations remain fenced.");
       if (pending.id !== body.pendingId) throw new TeamError(409, "verification-reconciliation-operation-changed", "The pending check changed. Refresh the team and inspect its evidence.");
-      if (this.host.commands.has(id) || stored.deliveryAttempt || run.deliveryReceipt || run.pullRequest || run.stopReason || run.permissionsRevokedAt ||
+      if (this.host.commands.has(id) || stored.deliveryAttempt || run.deliveryReceipt || deliveredAtRevision(run) || run.stopReason || run.permissionsRevokedAt ||
           run.members.some(member => member.status !== "stopped") ||
           (run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering", "uncertain"].includes(decision.status)))
         throw unavailable("Members, permission decisions, delivery state, or the operation are not fully quiescent for verification reconciliation.");
@@ -397,7 +403,7 @@ export class TeamRecovery {
     try { this.host.assertDelivery(stored); } catch { return false; }
     const prior = run.deliveryRecovery;
     const failureHash = digest({ headCommit: run.headCommit, policyHash, reason });
-    const attempts = Math.max(prior?.attempts ?? 0, run.recovery?.attempts ?? 0);
+    const attempts = recoveriesUsed(run);
     if (attempts >= automaticRecoveryLimit || prior?.lastFailureHash === failureHash) {
       run.deliveryRecovery = { ...prior, attempts, status: "exhausted", revision: run.revision, headCommit: run.headCommit, policyHash,
         sourceMemberId: member.memberId, lastFailureHash: failureHash };
@@ -478,7 +484,7 @@ export class TeamRecovery {
     if (recovery.source.code === "delivery-recovery") return this.startAutomaticDeliveryRecovery(stored, trackingReady);
     const operationPending = Boolean(stored.pending && (recoverableOperationFailure(stored, stored.pending) || recoverableUnattributedResult(stored, stored.pending)) &&
       stored.pending.revision === recovery.source.revision && (recovery.source.memberId === "unattributed" || recovery.source.memberId === stored.pending.source?.memberId));
-    if (!trackingReady || stored.pending && !operationPending || stored.deliveryAttempt || run.deliveryReceipt || run.pullRequest || run.stopReason ||
+    if (!trackingReady || stored.pending && !operationPending || stored.deliveryAttempt || run.deliveryReceipt || deliveredAtRevision(run) || run.stopReason ||
         run.permissionsRevokedAt ||
         run.linearTracking && run.linear?.status !== "synced" ||
         run.members.some(member => member.revision === recovery.source.revision && activeMember(member) && !terminalPermissionCoordinator(run, member)) ||
@@ -554,7 +560,7 @@ export class TeamRecovery {
   queueDeliveryRetryAfterEvidence(stored: Stored, member: TeamMember, report: DeliveryReconciliationReport) {
     const { run } = stored, policyHash = digest(run.delivery ?? null), prior = run.deliveryRecovery;
     const evidenceHash = deliveryInspectionHash(report);
-    const attempts = Math.max(prior?.attempts ?? 0, run.recovery?.attempts ?? 0);
+    const attempts = recoveriesUsed(run);
     if (attempts >= automaticRecoveryLimit || prior?.lastEvidenceHash === evidenceHash) {
       run.deliveryRecovery = { attempts, status: "exhausted", revision: run.revision, headCommit: report.headCommit, policyHash,
         sourceMemberId: member.memberId, lastEvidenceHash: evidenceHash, baseHeadCommit: report.baseHeadCommit, disposition: report.disposition };

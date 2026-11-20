@@ -106,6 +106,8 @@ const MUTATIONS: readonly Mutation[] = [
     out.decisions = out.decisions.map(d => (d.kind === "gate" && newest ? { ...d, memberId: newest.memberId, commit: newest.commit! } : d));
     return out;
   }) },
+  { name: "a challenger's capture is never recorded", invariant: "S4", engine: wrapStep((s, e, v) =>
+    step(s, e.kind === "captured" && e.scope === "ok" && !e.empty && e.memberId !== s.contestants[0]!.memberId ? { kind: "tick" } : e, v)) },
   { name: "a pass also queues the next capture's gate run", invariant: "S5", engine: wrapStep((s, e, v) => {
     const out = step(s, e, v);
     const waiting = out.search.contestants.find(c => c.captured !== undefined && c.gate === undefined);
@@ -123,6 +125,7 @@ const MUTATIONS: readonly Mutation[] = [
     return out;
   }) },
   { name: "the hold is ignored", invariant: "S7", engine: wrapStep((s, e, v) => {
+    if (s.mode !== "live") return step(s, e, v);
     const out = step(withoutKey(s, "holdUntil"), e, v);
     if (out.search.holdUntil === undefined && s.holdUntil !== undefined) out.search.holdUntil = s.holdUntil;
     return out;
@@ -163,6 +166,16 @@ const MUTATIONS: readonly Mutation[] = [
   { name: "challenger-first is labelled rescued", invariant: "S8", engine: wrapStep((s, e, v) => {
     const out = step(s, e, v);
     if (out.search.class === "challenger-first") out.search.class = "rescued";
+    return out;
+  }) },
+  { name: "under together, a rescue's end forgets the champion's stall and labels it challenger-first", invariant: "S8", engine: wrapStep((s, e, v) => {
+    const out = step(s, e, v);
+    const first = out.search.contestants[0]!;
+    if (s.start === "together" && out.search.class === "rescued" && (first.left === "stall" || first.left === "no-report")) {
+      delete first.left;
+      out.search.class = "challenger-first";
+      out.decisions = out.decisions.map(d => (d.kind === "widened" ? { ...d, class: "challenger-first" } : d));
+    }
     return out;
   }) },
   { name: "a base run that timed out arms the search", invariant: "S9", engine: wrapStep((s, e, v) =>
@@ -211,6 +224,10 @@ const MUTATIONS: readonly Mutation[] = [
     const out = step(s, e, v);
     if (!isOpen(s) && e.kind === "started") out.decisions = out.decisions.filter(d => d.kind !== "widened" && d.kind !== "pause");
     return out;
+  }) },
+  { name: "a result delivered again is applied again", invariant: "S13", engine: wrapStep((s, e, v) => {
+    if (e.kind !== "result") return step(s, e, v);
+    return step({ ...s, contestants: s.contestants.map(c => (c.memberId === e.memberId && c.captured === undefined ? { ...c, resultAt: undefined } : c)) }, e, v);
   }) },
   { name: "the wait also stops challengers whose result arrived", invariant: "S14", engine: wrapStep((s, e, v) => {
     const out = step(s, e, v);

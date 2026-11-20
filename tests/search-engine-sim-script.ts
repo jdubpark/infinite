@@ -33,8 +33,10 @@ import { bump, type Counts, type Rand, rand } from "./outcome-sim-script.js";
  * S3 An ended search changes only by the first receipt of its pending launch, which clears it and, when it names a
  *    member, marks it widened; it decides only stops, its count, a pause and a cancel; states move only forward along
  *    the design's transitions.
- * S4 Gate runs follow capture order, one outstanding at a time, at the captured commit; when a search resolves, every
- *    result captured before the winner failed its gate.
+ * S4 Against the captures and gate results the simulator delivered: gate runs follow the order in which it delivered
+ *    captures in scope and changed before the wait, one outstanding at a time, at the captured commit; when a search
+ *    resolves, every such capture delivered before the winner's had a failing gate result delivered; no search ends by
+ *    the wait while such a capture waits for its gate.
  * S5 Nothing is gated after a pass, also not in the step that resolves the search.
  * S6 A `live` search that ends releases the task exactly once when exhausted or abandoned and never when resolved; no
  *    acknowledged challenger works after the end, and no champion works after another result won.
@@ -44,8 +46,10 @@ import { bump, type Counts, type Rand, rand } from "./outcome-sim-script.js";
  *    hold ends a search as `exhausted`; the hold and the window fit before the deadline; no challenger works past the
  *    wait, and a search open past the wait has a capture made before it still waiting for its gate; every run ends with
  *    every search ended.
- * S8 Classes follow Part 8 from the winner and the champion's fate; `challenger-first` only under together; no class
- *    on a search that never armed.
+ * S8 Classes follow Part 8 from what the simulator delivered: the pass that resolved the search, and the champion's
+ *    fate delivered after the arming in earlier steps (a failed gate run, a capture out of scope or unchanged, a stall
+ *    or an exit without a report); `challenger-first` only under together; no class on a search that never armed. The
+ *    arming is read from the delivered failed base run and the simulator's own hold.
  * S9 A search arms only in the step of a failed base run of a `live` search, always does when it stays open, and stays armed.
  * S10 The brake and the pause: admission refuses with condition 6 exactly while the project is paused, the run has had
  *    two searches, or a search is wide or has a launch out (ended or not); a search counts toward the brake exactly
@@ -59,7 +63,8 @@ import { bump, type Counts, type Rand, rand } from "./outcome-sim-script.js";
  *    launch. The host resumes every open search and every ended one with a launch out.
  * S13 Receipts: every member of a launch's first receipt is a contestant or stopped in that step, and after the end
  *    exactly those are stopped; a repeated receipt, or an event of a member or launch the search does not know, does
- *    what the time passing alone does; no stop ever names the winner; the step that ends a search with a launch out
+ *    what the time passing alone does, and so does any event delivered again at once (the host contract redelivers
+ *    events whose step it had not saved); no stop ever names the winner; the step that ends a search with a launch out
  *    cancels that launch once, and so does a restart that finds it ended so; every launch has its receipt by the end
  *    of the run (the model host answers a cancelled launch with the members it prepared, or none).
  * S14 A stop never names a member whose result arrived in an earlier step, and a stopped member is never captured or gated.
@@ -67,8 +72,10 @@ import { bump, type Counts, type Rand, rand } from "./outcome-sim-script.js";
  * Each invariant has at least one mutant engine in tests/search-engine-sim.test.ts (an in-process wrapper of `admit` or
  * `step`) that the default corpus must catch through that invariant, and the test names the seed that did.
  *
- * What it does not check: the host's I/O (Git, the operation records, the outcome ledger), plan order of integration,
- * and the record events of Part 6. Rule semantics with exact values stay with tests/search-engine.test.ts.
+ * What it does not check: the host's I/O (Git, the operation records, the outcome ledger), the host contract's saves (the
+ * model host acts on each step's decisions at once; S13 checks the engine's side, that an event delivered again changes
+ * nothing), plan order of integration, and the record events of Part 6. Rule semantics with exact values stay with
+ * tests/search-engine.test.ts.
  */
 
 const RUNS_PER_SEED = 4;
@@ -108,8 +115,13 @@ type Op = { kind: "base" | "capture" | "gate" | "work"; taskId?: string; memberI
 type Launch = { n: number; profileIds: string[]; intent: boolean; members?: Member[]; acked: boolean; due: number; delay: number; slow: boolean };
 /** What the simulator delivered to and received from one search: the facts the checks compare against. */
 type Ledger = {
-  base?: GateOutcome | "yielded"; captures: string[]; outstanding?: string; integrates: number; releases: number;
-  gated: { memberId: string; outcome: GateOutcome }[]; okCaptures: Map<string, number>; stopped: Set<string>; resulted: Set<string>;
+  base?: GateOutcome | "yielded"; outstanding?: string; integrates: number; releases: number;
+  gated: { memberId: string; outcome: GateOutcome }[]; stopped: Set<string>; resulted: Set<string>;
+  /** Delivered captures in scope and changed, in delivery order: true when delivered before the wait, so gateable. */
+  okCaptures: Map<string, boolean>;
+  /** A failed base run was delivered and armed the search; the champion's fate (a failed gate run, a capture out of
+   * scope or unchanged, a stall or an exit without a report) was delivered after the arming. */
+  armed: boolean; championDone: boolean;
   hold?: number; wait?: number; window?: number;
   /** A first receipt that named a member was delivered, and the search's count toward the brake was checked. */
   widened: boolean; counted: boolean;
@@ -156,8 +168,8 @@ const championDone = (s: SearchState) => {
 };
 const at = (ms: number) => new Date(ms).toISOString();
 const commitOf = (memberId: string) => `${memberId}:commit`;
-const newLedger = (): Ledger => ({ captures: [], integrates: 0, releases: 0, gated: [], okCaptures: new Map(), stopped: new Set(), resulted: new Set(),
-  widened: false, counted: false });
+const newLedger = (): Ledger => ({ integrates: 0, releases: 0, gated: [], okCaptures: new Map(), stopped: new Set(), resulted: new Set(),
+  armed: false, championDone: false, widened: false, counted: false });
 
 class RunSim {
   private readonly policy: SearchPolicy;
@@ -555,6 +567,11 @@ class RunSim {
     task.search = next;
     this.apply(task, decisions, event);
     this.checkAfter(task, prev, next);
+    // S13, last: the host contract redelivers an event whose step it had not saved. Delivered again at once, the event
+    // does what the time passing alone does.
+    if (event.kind !== "resume" && event.kind !== "tick" && !isDeepStrictEqual(this.engine.step(next, event, view), this.engine.step(next, { kind: "tick" }, view))) {
+      this.fail("S13", `an event delivered again did more than the time passing (event ${JSON.stringify(event)})`, task);
+    }
   }
 
   // ---- Invariants --------------------------------------------------------------------------------------------------
@@ -642,16 +659,20 @@ class RunSim {
     const first = next.contestants[0]!;
     const championId = task.champion!.id;
 
-    // Ledger: the base outcome the engine was given, captures in the order they completed, delivered gate results.
+    // Ledger: what the simulator delivered. The arming is read from the delivered failed base run and the simulator's
+    // own hold, since a hold that has passed ends the search before a base result in the same step applies.
     if (!meta.ghost) {
+      if (live && event.kind === "base" && event.outcome === "fail" && ledger.base === undefined && !(ledger.hold !== undefined && now >= ledger.hold)) ledger.armed = true;
       if (event.kind === "base") ledger.base = event.outcome;
-      if (event.kind === "gated" && !meta.stale) ledger.gated.push({ memberId: event.memberId, outcome: event.outcome });
-      if (event.kind === "captured" && event.scope === "ok" && !event.empty && !ledger.okCaptures.has(event.memberId)) ledger.okCaptures.set(event.memberId, now);
+      if (event.kind === "gated" && !meta.stale) {
+        ledger.gated.push({ memberId: event.memberId, outcome: event.outcome });
+        if (ledger.outstanding === event.memberId) ledger.outstanding = undefined;
+      }
+      const okCapture = (event.kind === "captured" && event.scope === "ok" && !event.empty) || (event.kind === "integrated" && !event.empty && event.memberId === championId);
+      if (okCapture && !ledger.okCaptures.has(event.memberId)) ledger.okCaptures.set(event.memberId, ledger.wait === undefined || now < ledger.wait);
     }
-    for (const c of next.contestants) {
-      if (c.captured !== undefined && prev.contestants.find(p => p.memberId === c.memberId)?.captured === undefined) ledger.captures.push(c.memberId);
-    }
-    if (ledger.outstanding !== undefined && next.contestants.find(c => c.memberId === ledger.outstanding)?.gate !== undefined) ledger.outstanding = undefined;
+    const gateable = [...ledger.okCaptures].filter(([, before]) => before).map(([id]) => id);
+    const waiting = gateable.filter(id => !ledger.gated.some(g => g.memberId === id));
 
     // S7: each cutoff the step sets is at most its design duration after the host time of the step, and none moves.
     for (const key of ["holdUntil", "waitUntil"] as const) {
@@ -725,23 +746,26 @@ class RunSim {
       if (!arming && !championDone(next)) fail("S2", "a challenger while the champion still works");
     }
 
-    // S4, S5
+    // S4, S5: against the captures and gate results the simulator delivered.
     const gates = of("gate");
     if (gates.length > 1) fail("S4", "two gate runs at once");
     for (const g of gates) {
-      if (g.kind !== "gate" || event.kind === "resume") continue;
+      if (g.kind !== "gate") continue;
+      if (g.memberId !== waiting[0]) fail("S4", `gated ${g.memberId}, the first capture delivered before the wait and waiting is ${waiting[0]}`);
+      if (g.commit !== commitOf(g.memberId)) fail("S4", "a gate run off the captured commit");
+      if (event.kind === "resume") continue;
       if (ended || next.state === "resolved") fail("S5", "a gate run for an ended or resolved search");
       if (ledger.outstanding !== undefined) fail("S4", `a gate run while ${ledger.outstanding}'s is outstanding`);
-      const expected = ledger.captures.find(id => next.contestants.find(c => c.memberId === id)!.gate === undefined);
-      if (g.memberId !== expected) fail("S4", `gated ${g.memberId}, the first capture waiting is ${expected}`);
-      if (g.commit !== commitOf(g.memberId)) fail("S4", "a gate run off the captured commit");
     }
     if (next.state === "resolved" && prev.state !== "resolved") {
-      for (const id of ledger.captures.slice(0, ledger.captures.indexOf(next.winner!))) {
-        const gate = next.contestants.find(c => c.memberId === id)!.gate;
-        if (gate === undefined || gate.result === "pass") fail("S4", `${id} was captured before the winner and not failed`);
+      const place = gateable.indexOf(next.winner!);
+      if (place < 0) fail("S4", `the winner ${next.winner} has no capture delivered before the wait`);
+      for (const id of gateable.slice(0, place)) {
+        const result = ledger.gated.find(g => g.memberId === id);
+        if (result === undefined || result.outcome === "pass") fail("S4", `${id} was captured before the winner and not failed`);
       }
     }
+    if (ended && next.endReason === "wait" && waiting.length > 0) fail("S4", `ended by the wait while ${waiting[0]}'s capture, delivered before it, waits for its gate`);
 
     // S6: releases in this step.
     const releases = of("release");
@@ -752,14 +776,22 @@ class RunSim {
       if (releases.some(d => d.kind === "release" && d.memberId !== first.memberId)) fail("S6", "a release of another member than the champion");
     } else if (releases.length > 0) fail("S6", "a release while the search goes on");
 
-    // S8
-    if (ended && live && next.armedAt !== undefined) {
-      const expected: SearchClass = next.winner === undefined ? "none" : next.winner === first.memberId ? "champion-pass"
-        : championDone(next) ? "rescued" : "challenger-first";
+    // S8: the class from what the simulator delivered: the pass that resolved the search (S1 ties the resolution to it)
+    // and the champion's fate delivered in earlier steps. Then this step's fate, for later steps.
+    if (ended && live && ledger.armed) {
+      const winner = next.state === "resolved" && event.kind === "gated" ? event.memberId : undefined;
+      const expected: SearchClass = winner === undefined ? "none" : winner === championId ? "champion-pass"
+        : ledger.championDone ? "rescued" : "challenger-first";
       ledger.oracleClass = expected;
       if (next.class !== expected) fail("S8", `class ${next.class}, expected ${expected}`);
       if (next.class === "challenger-first" && this.policy.start !== "together") fail("S8", "challenger-first under after-fail");
     } else if (next.class !== undefined) fail("S8", `class ${next.class} on a search that is open, measured, or never armed`);
+    if (ledger.armed && !meta.ghost && !meta.stale) {
+      const fate = (event.kind === "gated" && event.memberId === championId && event.outcome !== "pass")
+        || (event.kind === "captured" && event.memberId === championId && (event.scope === "violation" || event.empty))
+        || (event.kind === "left" && event.memberId === championId && (event.reason === "stall" || event.reason === "no-report"));
+      if (fate) ledger.championDone = true;
+    }
 
     // S10
     if (ended) {
@@ -819,7 +851,7 @@ class RunSim {
     if (deadline !== undefined && ledger.hold !== undefined && ledger.hold > deadline) this.fail("S7", `hold ${at(ledger.hold)} past the deadline ${this.deadline}`, task);
     if (ledger.wait !== undefined && now >= ledger.wait) {
       if (working.length > 0) this.fail("S7", `${working.map(m => m.id).join(", ")} work past the wait ${at(ledger.wait)}`, task);
-      const waiting = [...ledger.okCaptures].some(([id, t]) => t < ledger.wait! && !ledger.gated.some(g => g.memberId === id));
+      const waiting = [...ledger.okCaptures].some(([id, before]) => before && !ledger.gated.some(g => g.memberId === id));
       if (!waiting) this.fail("S7", `open past the wait ${at(ledger.wait)} with no capture made before it waiting for its gate`, task);
     }
   }

@@ -11,6 +11,50 @@ import { SHARE_EPSILON } from "./routing-guards.js";
  * wiring phase; `CONTRADICTION:` marks a place where two statements of the design disagree.
  */
 
+/*
+ * Host contract (the wiring phase). The engine is correct only when the host keeps these duties; the simulator
+ * (tests/search-engine-sim-script.ts) models them. PROPOSED as a whole: the design states the outcomes, not this order.
+ *
+ * Persistence order.
+ * - The source of every event is durable before the event is delivered: the operation record of a base run, a capture
+ *   or a gate run, the member's report or leave, the launch's receipt (below). After a restart the host delivers again
+ *   every event whose step it had not saved; an event the search has already applied changes nothing.
+ * - Before it acts on any decision, the host saves the step's state as `task.search` together with the step's decisions,
+ *   in one write. It acts on each saved decision once, idempotently by search ID (a launch by its number, a count by the
+ *   search ID), and after a restart it first finishes the saved decisions it had not finished.
+ * - After a restart while the run has no workspace operation open, the host delivers `resume` to every open search and
+ *   to every ended search whose `pending` is set. Resume re-derives an open search's base run, waiting captures, head
+ *   gate run and pending launch, and an ended search's `cancel-launch`. A restart during a workspace operation of a
+ *   search delivers `halt` with reason `restart` instead (Failure modes).
+ *
+ * Launches and receipts.
+ * - Before it prepares any member of a `start-challengers`, the host saves the launch: search ID, number and profiles.
+ *   It saves each prepared member under its launch before that member starts work.
+ * - Each launch has exactly one receipt, the final one. It names every member the host prepared for the launch and no
+ *   other: none when the spend fuse refused every profile, or when the launch was cancelled before any member was
+ *   prepared. The host saves the receipt before it delivers it, never changes it, and delivers it again after a restart
+ *   until the saved search no longer has that launch pending. An empty receipt is delivered like any other.
+ * - A `start-challengers` repeated under the same number (at a resume) prepares only the profiles of that launch that
+ *   have no saved member; the launch's one receipt names all of its members.
+ * - On `cancel-launch` the host prepares no further member for that launch. When the launch's receipt is not yet saved,
+ *   it saves one naming the members already prepared, possibly none, and delivers it; when it is saved, it delivers
+ *   that one. The engine stops every member the receipt names, and the receipt clears `pending`.
+ * - Conditions 6 and 9: `wideSearch` and `otherSearchWide` hold while a search of the run is `wide` or has `pending`
+ *   set, ended or not. Condition 11: `spareAttempts` counts each profile of a pending launch without a saved member as
+ *   a member.
+ *
+ * Member events.
+ * - No `result`, `captured`, `gated` or `left` event of a challenger is delivered before the receipt that names it; the
+ *   host holds such an event until that receipt is delivered. The engine ignores events of members it does not know.
+ *
+ * The brake.
+ * - On `widened` the host appends the class to the project's widened history, once per search ID; on `pause` it stores
+ *   the project's pause. Only the owner's resume clears the pause and starts the history again. Both reach the engine as
+ *   inputs: `AdmissionFacts.project.paused` and `RunView.widened`.
+ *
+ * Time: `view.now` is the host's effective time (Time, below).
+ */
+
 // ---- Policy (Part 1) ---------------------------------------------------------------------------------------------
 
 /** The saved policy. No key has a schema default; `searchPolicy` applies the read defaults (umbrella C11). */
@@ -358,7 +402,7 @@ export function step(search: SearchState, event: SearchEvent, view: RunView): St
   if (event.kind === "started") receive(ctx, event);
   else if (isOpen(s)) HANDLERS[event.kind](ctx, event as never);
   // A search that ends with a launch out cancels it, and a restart that finds it so cancels it again, until the
-  // launch's receipt clears it. A receipt that arrives in the ending step needs no cancel.
+  // launch's receipt clears it (Host contract, above). A receipt that arrives in the ending step needs no cancel.
   if (!isOpen(s) && s.pending !== undefined && (wasOpen || event.kind === "resume")) ctx.out.push({ kind: "cancel-launch", launch: s.launches! });
   // PROPOSED: one gate decision is outstanding per search; the next is decided when its result arrives, so the engine,
   // not the host's queue, keeps capture order.

@@ -1,4 +1,4 @@
-import { inputSourceLabel, decisionAnswerLabel, decisionAuthorityQuestion, autoPinned, autoRouted, eligibleImplementers, escalationPool, hostSelects, scoutPool } from "./team-types.js";
+import { inputSourceLabel, ownerSteering, decisionAnswerLabel, decisionAuthorityQuestion, autoPinned, autoRouted, eligibleImplementers, escalationPool, hostSelects, scoutPool } from "./team-types.js";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { entryToolsFor } from "./entry-roles.js";
@@ -107,8 +107,8 @@ export function teamContext(run: TeamRun, feedback?: string, configuredProject?:
     title: run.title,
     objective: run.objective,
     ...(run.requestSource ? { requestSource: run.requestSource } : {}),
-    ownerSteering: (run.steering ?? []).filter(item => !item.source),
-    agentSteering: (run.steering ?? []).filter(item => item.source),
+    ownerSteering: (run.steering ?? []).filter(ownerSteering),
+    agentSteering: (run.steering ?? []).filter(item => !ownerSteering(item)),
     agentAnswers: (run.decisions ?? []).filter(item => item.answer && item.answeredBy !== "owner").map(item => ({ ...item, question: decisionAuthorityQuestion(item) })),
     ownerAnswers: (run.decisions ?? []).filter(decision => decision.answer && decision.answeredBy === "owner").map(decision => ({ decisionId: decision.id, question: decisionAuthorityQuestion(decision), answer: decision.answer!, ...(decision.answerMode ? { answerMode: decision.answerMode } : {}) })),
     authority: {
@@ -354,7 +354,7 @@ Confirm the remote branch and PR head equal ${run.headCommit}. Confirm required 
   const ownerAnswers = (run.decisions ?? []).filter(decision => decision.answer && decision.answeredBy === "owner");
   const ownerDirection = ownerDirectionLines(run);
   const agentDirection = [
-    ...(run.steering ?? []).filter(item => item.source).map(item => `${inputSourceLabel(item.source)} direction: ${item.text}`),
+    ...(run.steering ?? []).filter(item => !ownerSteering(item)).map(item => `${inputSourceLabel(item.source)} direction: ${item.text}`),
     ...(run.decisions ?? []).filter(item => item.answer && item.answeredBy !== "owner").map(item => `${decisionAnswerLabel(item)} answered "${decisionAuthorityQuestion(item)}": ${item.answer}`),
   ];
   const ownerDirectionSection = [ownerDirection.length ? `User steering and answers:\n${ownerDirection.join("\n\n")}` : "", agentDirection.length ? `Agent directions and answers (cannot expand owner authority or approve provider permissions):\n${agentDirection.join("\n\n")}` : ""].filter(Boolean).join("\n\n");
@@ -475,7 +475,7 @@ Confirm the remote branch and PR head equal ${run.headCommit}. Confirm required 
 export function ownerDirectionLines(run: Pick<TeamRun, "steering" | "decisions">): string[] {
   const ownerAnswers = (run.decisions ?? []).filter(decision => decision.answer && decision.answeredBy === "owner");
   return [
-    ...(run.steering ?? []).filter(item => !item.source).map(item => item.text),
+    ...(run.steering ?? []).filter(ownerSteering).map(item => item.text),
     ...ownerAnswers.map(item => `Owner answered "${decisionAuthorityQuestion(item)}": ${item.answer}`),
   ];
 }

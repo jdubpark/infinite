@@ -73,7 +73,7 @@ function answeredDecisions(run: TeamRun): TeamDecision[] {
 }
 
 function reportingMembers(run: TeamRun): TeamMember[] {
-  return list(run.members).filter(member => member.report !== undefined && member.role !== "permission-coordinator");
+  return list(run.members).filter(member => member.report !== undefined && member.role !== "permission-coordinator" && member.role !== "evaluator");
 }
 
 /** Continuation tasks, then the run's own tasks. The first integrated task of each member wins. */

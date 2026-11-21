@@ -119,3 +119,9 @@ test("the intent checker gets no GitHub grant", () => {
   assert.equal(sessionGithubScope({ kind: "team", role: "intent-checker", repository: "example/product" }), undefined);
   assert.ok(sessionGithubScope({ kind: "team", role: "scout", repository: "example/product" })?.ops.includes("fetch"));
 });
+
+test("the evaluator gets no grant", () => {
+  assert.equal(sessionGithubScope({ kind: "team", role: "evaluator", repository: "example/product" }), undefined);
+  const delivery = { mode: "github" as const, repository: "example/product", headBranch: "infinite/team-one" };
+  assert.equal(sessionGithubScope({ kind: "team", role: "evaluator", repository: "example/product", delivery }), undefined);
+});

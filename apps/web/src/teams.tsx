@@ -11,7 +11,7 @@ import { LinearTracking } from "./linear";
 import { DictationNotice, MicButton, useDictation } from "./dictation";
 
 type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
-type TeamRole = "project-manager" | "intent-checker" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
+type TeamRole = "project-manager" | "intent-checker" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery" | "evaluator";
 type TeamCommand = { command: string; args: string[] };
 export type TeamTask = { id: string; title: string; instructions: string; paths: string[]; dependsOn: string[]; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; memberId?: string; commit?: string; summary?: string; agentProfileId?: string; escalation?: { fromProfileId?: string; toProfileId: string; reason: string; memberId: string; at: string }; limitSwitches?: LimitSwitch[]; usage?: TaskUsage; ownerRating?: OwnerRating; rubric?: Rubric };
 type TeamContinuation = { revision: number; requestId: string; at: string; reason: string; headCommit: string; tasks: TeamTask[]; review?: TeamView["review"]; brief?: TeamBrief };
@@ -79,6 +79,7 @@ const roles: Record<TeamRole, { name: string; description: string }> = {
   integrator: { name: "Integrator", description: "Repairs failed checks and review findings." },
   delivery: { name: "Delivery", description: "Publishes and merges reviewed changes under the repository policy." },
   reviewer: { name: "Reviewer", description: "Reviews the result against your request." },
+  evaluator: { name: "Evaluator", description: "Reads the finished work and reports a provisional verdict against the objective." },
 };
 const date = (value: string) => new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 const statusClass = (status: TeamStatus) => ["needs-input", "blocked", "paused"].includes(status) ? "waiting" : ["ready-for-review", "merged"].includes(status) ? "ready" : ["cancelled", "no-change"].includes(status) ? "inactive" : "";

@@ -215,3 +215,21 @@ test("the intent checker sorts after the project manager", () => {
   });
   assert.deepEqual(ordered.map(member => member.memberId), ["pm", "checker", "scout"]);
 });
+
+test("the evaluator has a name and a place", () => {
+  const team = {
+    id: "team-3",
+    revision: 1,
+    title: "Run",
+    status: "reviewing",
+    members: [
+      { memberId: "evaluator", sessionId: "s-eval", role: "evaluator", revision: 1, title: "Evaluate", status: "running" },
+      { memberId: "delivery", sessionId: "s-del", role: "delivery", revision: 1, title: "Deliver", status: "running" },
+      { memberId: "reviewer", sessionId: "s-rev", role: "reviewer", revision: 1, title: "Review", status: "running" },
+    ],
+  };
+  const ordered = orderedTeamMembers(team).map(member => member.memberId);
+  assert.equal(ordered.indexOf("evaluator") > ordered.indexOf("reviewer"), true);
+  assert.equal(ordered.indexOf("evaluator") < ordered.indexOf("delivery"), true);
+  assert.match(teamMonitorText({ ...team, workspace: "w", branch: "b", projectId: "p" }), /Evaluator/);
+});

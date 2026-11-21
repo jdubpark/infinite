@@ -19,10 +19,6 @@ One model feeds three views. Switching between them does not refetch.
 | Wall | `#/swarm/wall` | One fixed-size tile per agent: role, model, state, activity, tool in flight, cost. |
 | Graph | `#/swarm/graph` | Every live swarm beside the code areas its agents touched, with links between them. |
 
-## Decisions view
-
-The web client's `#/decisions` view reads `GET /api/decision-queue` and shows one waiting decision at a time, oldest first. Answers go through the existing session, team, or mission route; recommendations never answer for the owner. A terminal-only prompt links back to its session terminal.
-
 Cost counts measured usage only. A cost ends in `+` when some agents of that
 run, mission, or the solo group have no usage data, and a dash replaces it when
 no measured usage gives a figure.
@@ -153,3 +149,28 @@ or its team or session leaves the view.
 - The active machine only.
 - No history or replay.
 - No controls.
+
+## Decisions view
+
+A separate route, `#/decisions`, shows what waits on a person: session
+prompts, team decisions, and mission decisions from `GET /api/decision-queue`,
+one at a time, oldest first. The sidebar says how many wait.
+
+- An option is selected first and sent second. A number key or a click
+  selects. Enter or the submit button sends. The `r` key selects the agent's
+  recommendation and sends nothing.
+- The recommended option is listed first. An approval question keeps its own
+  order: approve first, deny second.
+- A destructive session prompt takes an accepting option from a click only,
+  not from a number key.
+- Answers go through the existing session, team, and mission routes, so the
+  same roles, control lease, and revision checks apply. A viewer reads the
+  queue and cannot answer. Only the owner answers a mission decision.
+- A prompt that only its terminal can answer links to that session's terminal.
+- The view reads the queue every 1.8 seconds while it is open, and every 10
+  seconds otherwise for the sidebar count. The last queue the host reported
+  stays on screen while a read is in flight or fails, and takes no answers
+  until a read succeeds. After about three seconds without one, the decision
+  dims and a notice says since when the queue has not refreshed.
+- A decision answered here leaves the queue at once. If the host still lists
+  it five reads later, it shows again.

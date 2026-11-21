@@ -82,6 +82,11 @@ const roles: Record<TeamRole, { name: string; description: string }> = {
   reviewer: { name: "Reviewer", description: "Reviews the result against your request." },
 };
 const date = (value: string) => new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+/** The name of the role that asked a decision, or "Team" when its member is no longer listed. */
+function askedBy(team: TeamView, decision: TeamDecision) {
+  const member = team.members.find(item => item.memberId === decision.memberId);
+  return member ? roles[member.role].name : "Team";
+}
 const statusClass = (status: TeamStatus) => ["needs-input", "blocked", "paused"].includes(status) ? "waiting" : ["ready-for-review", "merged"].includes(status) ? "ready" : ["cancelled", "no-change"].includes(status) ? "inactive" : "";
 function Status({ status }: { status: TeamStatus }) { return <span className={"team-status " + statusClass(status)}><span className="dot" />{labels[status]}</span>; }
 function RoleGuide() { return <div className="team-roles" aria-label="Team responsibilities">{Object.entries(roles).map(([id, role]) => <div key={id}><strong>{role.name}</strong><p>{role.description}</p></div>)}</div>; }
@@ -475,7 +480,7 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
       {team.pullRequest && <p className="team-notice team-ready"><Check size={18} /><span>The delivery agent reports an open pull request for the reviewed commit. The host records this report; it does not independently verify GitHub. {/^https:\/\//.test(team.pullRequest.pullRequestUrl) ? <a href={team.pullRequest.pullRequestUrl} target="_blank" rel="noreferrer">Open the pull request</a> : null}</span></p>}
       {team.goal && <p className="goal-team-origin"><a href={goalHref}>Open goal</a> · cycle {team.goal.cycle} · goal revision {team.goal.revision}</p>}
       {team.noChange && <section className="team-section"><h2>No change proposed</h2><p className="team-prose">{team.noChange.summary}</p><EvidenceList evidence={team.noChange.evidence} /></section>}
-      {openDecisions.length > 0 && <section className="team-section team-decisions"><h2>{missionManaged ? "Open decisions" : "Decisions for you"} <span className="quiet">{openDecisions.length}</span></h2>{openDecisions.map(decision => <Decision key={decision.id} decision={decision} disabled={!canSteer || team.status === "paused" || busy || Boolean(pending)} member={team.members.find(member => member.memberId === decision.memberId)} answer={text => void mutate("/teams/" + id + "/decisions/" + decision.id + "/answer", "Answer", text)} readOnly={missionManaged} />)}</section>}
+      {openDecisions.length > 0 && <section className="team-section team-decisions"><h2>{missionManaged ? "Open decisions" : "Decisions for you"} <span className="quiet">{openDecisions.length}</span></h2>{openDecisions.map(decision => <Decision key={decision.id} decision={decision} disabled={!canSteer || team.status === "paused" || busy || Boolean(pending)} from={askedBy(team, decision)} answer={text => void mutate("/teams/" + id + "/decisions/" + decision.id + "/answer", "Answer", text)} readOnly={missionManaged} />)}</section>}
       {attention.length > 0 && <section className="team-section team-decisions"><h2>Agent sessions need you</h2><p className="quiet">The host answers ordinary prompts in a member’s own workspace. These sessions still wait on a provider prompt; respond in the session.</p>{attention.map(session => <button className="team-session-link" key={session.id} onClick={() => openSession(session.id)}><span><strong>{session.title}</strong><small>{session.attention?.now ?? "Open the session to respond."}</small></span><ArrowUpRight size={18} /></button>)}</section>}
       <ProviderLimitNotice limits={team.providerLimits} />
       <section className="team-section"><h2>Your request</h2><p className="team-prose">{team.objective}</p></section>

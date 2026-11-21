@@ -3,8 +3,8 @@ import test from "node:test";
 import type { Prompt } from "@infinite/attention";
 import type { QueueDecision } from "../apps/web/src/api.ts";
 import {
-  applyDecisionQueueKey, createDecisionQueueState, formatWaitDuration, moveDecisionQueue,
-  reconcileDecisionQueue, removeAnsweredDecision, selectableOptions, selectDecisionAnswers,
+  ANSWERED_HIDE_READS, applyDecisionQueueKey, createDecisionQueueState, formatWaitDuration, moveDecisionQueue,
+  reconcileDecisionQueue, removeAnsweredDecision, selectableOptions, selectDecisionAnswers, settleAnsweredKeys,
 } from "../apps/web/src/decision-queue-model.ts";
 
 function session(key: string, prompt: Prompt, terminalOnly = false): QueueDecision {
@@ -146,6 +146,15 @@ test("recommendation options display first and Enter returns only an explicit se
   assert.equal(applyDecisionQueueKey({ ...recommended, activeKey: undefined }, { key: "Enter" }, context).handled, false);
 });
 
+test("an approval question keeps its order, so the first key approves and the recommendation key selects the recommended option", () => {
+  const row = team("approve", { answerMode: "approval", options: ["Approve the merge", "Deny"], recommendation: { answers: ["Deny"], reason: "The check is red" } });
+  const context = { options: selectableOptions(row), recommendedAnswers: ["Deny"], canAnswer: true };
+  assert.deepEqual(context.options.map(option => option.value), ["Approve the merge", "Deny"]);
+  const state = createDecisionQueueState([row]);
+  assert.deepEqual(applyDecisionQueueKey(state, { key: "1" }, context).state.selectedAnswers, ["Approve the merge"]);
+  assert.deepEqual(applyDecisionQueueKey(state, { key: "r" }, context).state.selectedAnswers, ["Deny"]);
+});
+
 test("multiple-answer selection toggles and recommendation selects the full recommendation", () => {
   const row = team("multi", { answerMode: "multiple", recommendation: { answers: ["East", "North"], reason: "Both" } });
   const context = { options: selectableOptions(row), recommendedAnswers: ["East", "North"], canAnswer: true, multiple: true };
@@ -155,6 +164,21 @@ test("multiple-answer selection toggles and recommendation selects the full reco
   assert.deepEqual(state.selectedAnswers, []);
   state = applyDecisionQueueKey(state, { key: "r" }, context).state;
   assert.deepEqual(state.selectedAnswers, ["East", "North"]);
+});
+
+test("an answered decision stays hidden until a read that began after the answer drops it", () => {
+  const hidden = new Map([["a", 4]]);
+  assert.deepEqual([...settleAnsweredKeys(hidden, 3, new Set(["a"]))], [["a", 4]], "a read that began before the answer still lists it");
+  assert.deepEqual([...settleAnsweredKeys(hidden, 3, new Set())], [["a", 4]], "a read that began before the answer settles nothing");
+  assert.deepEqual([...settleAnsweredKeys(hidden, 4, new Set())], [], "the host dropped it");
+  assert.deepEqual([...settleAnsweredKeys(hidden, 4, new Set(["a"]))], [["a", 4]], "the host still lists it: hidden for now");
+});
+
+test("an answered decision the host keeps listing shows again", () => {
+  const hidden = new Map([["a", 4], ["b", 9]]);
+  assert.deepEqual([...settleAnsweredKeys(hidden, 4 + ANSWERED_HIDE_READS - 1, new Set(["a", "b"]))], [["a", 4], ["b", 9]]);
+  assert.deepEqual([...settleAnsweredKeys(hidden, 4 + ANSWERED_HIDE_READS, new Set(["a", "b"]))], [["b", 9]]);
+  assert.equal(hidden.size, 2, "the input is not changed");
 });
 
 test("wait duration uses readable units", () => {

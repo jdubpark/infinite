@@ -1,18 +1,17 @@
 .decision-queue-page { width: 100%; max-width: 880px; min-height: 0; margin: 0 auto; padding: 42px 36px 36px; overflow: auto; }
-.decision-queue-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 22px; margin-bottom: 28px; }
-.decision-queue-heading > div { min-width: 0; }
+.decision-queue-heading { margin-bottom: 28px; }
 .decision-queue-heading h1 { margin: 0 0 10px; font-size: 32px; letter-spacing: -.03em; }
 .decision-queue-heading p { margin: 0; line-height: 1.5; }
-.decision-queue-eyebrow { margin-bottom: 8px !important; color: var(--green); font-size: 11px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; }
-.decision-queue-refresh { flex: 0 0 auto; min-height: 44px; }
+.decision-queue-heading .decision-queue-eyebrow { margin-bottom: 8px; color: var(--green); font-size: 11px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; }
 .decision-queue-message, .decision-queue-empty { padding: 28px 0; color: var(--muted); }
 .decision-queue-message p { margin: 6px 0; }
 .decision-queue-message.is-error { padding: 16px; border-left: 3px solid #a34332; background: #f7e8ce; color: #724314; }
 .decision-queue-message.is-error p { color: inherit; }
-.decision-queue-elsewhere { padding: 11px 14px; border-left: 3px solid var(--green); background: #edf0e7; color: #35533c; font-size: 13px; }
 .decision-queue-count { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin: 0 0 10px; color: var(--muted); font-size: 12px; }
 .decision-queue-count strong { color: var(--ink); font-size: 14px; font-variant-numeric: tabular-nums; }
-.decision-queue-card { min-width: 0; padding: 24px; border: 1px solid var(--rule); border-radius: 12px; background: var(--paper); }
+.decision-queue-card { min-width: 0; padding: 24px; border: 1px solid var(--rule); border-radius: 12px; background: var(--paper); transition: opacity 140ms ease-out; }
+/* A queue that has gone without a refresh dims in place; the notice below says since when. */
+.decision-queue-card.is-stale { opacity: .6; }
 .decision-queue-card:focus-visible { outline: 3px solid #518d75; outline-offset: 3px; }
 .decision-queue-origin { padding-bottom: 18px; border-bottom: 1px solid var(--rule); }
 .decision-queue-kind { color: var(--green); font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
@@ -21,32 +20,36 @@
 .decision-queue-session-link { display: inline-flex; align-items: center; min-height: 44px; margin-top: 8px; color: var(--green); font-size: 12px; font-weight: 600; }
 .decision-queue-session-link:focus-visible { outline: 3px solid #518d75; outline-offset: 3px; }
 .decision-queue-session, .decision-queue-decision { min-width: 0; padding-top: 18px; }
-.decision-queue-terminal-copy { margin: 0 0 14px; color: #724314; font-size: 13px; font-weight: 600; }
-.decision-queue-control { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin: 0 0 14px; }
-.decision-queue-control .primary { min-height: 44px; }
+/* One line that is always there: it says why the prompt can or cannot be answered, and holds the control button. */
+.decision-queue-control { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 46px; margin: 0 0 14px; }
+.decision-queue-control p { min-width: 0; margin: 0; font-size: 13px; line-height: 1.5; }
+.decision-queue-control .primary { flex: none; }
+/* The session page caps a prompt's height because it sits above the composer. Here the prompt is the page. */
+.decision-queue-prompt .prompt-decision { max-height: none; overflow: visible; margin-bottom: 0; }
 .decision-queue-prompt .prompt-options button, .decision-queue-prompt .prompt-options form button, .decision-queue-prompt .prompt-decision > button { min-height: 44px; }
-.decision-queue-prompt .prompt-options button[aria-pressed="true"] { border-color: var(--green); background: #edf0e7; color: var(--green); font-weight: 600; }
-.decision-queue-submit { min-height: 44px; margin: 12px 0 0; }
-.decision-queue-held, .decision-queue-owner-only { margin: 0 0 14px; padding: 11px 13px; border-left: 3px solid #9c761b; background: #f7e8ce; color: #724314; font-size: 13px; line-height: 1.5; }
-.decision-queue-owner-only { border-color: var(--rule); background: #edf0e7; color: var(--muted); }
-.decision-queue-answer-error { padding: 10px 12px; color: #9d382a; font-size: 13px; }
+.decision-queue-prompt .prompt-options button[aria-pressed="true"] { border-color: var(--green); background: #edf0e7; color: var(--green); }
+.decision-queue-prompt .prompt-decision > button.decision-queue-submit { padding: 13px 18px; border: 0; background: var(--green); color: #fff; font-size: 13px; }
+.decision-queue-submit { min-height: 46px; margin: 12px 0 0; }
+.decision-queue-held, .decision-queue-readonly { margin: 0 0 14px; padding: 11px 13px; border-left: 3px solid #9c761b; background: #f7e8ce; color: #724314; font-size: 13px; line-height: 1.5; }
+.decision-queue-readonly { border-color: var(--rule); background: #edf0e7; color: var(--muted); }
 .decision-queue-navigation { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 16px; }
 .decision-queue-navigation button { min-height: 44px; }
-.decision-queue-navigation .primary { justify-content: center; }
 .decision-queue-keys { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 22px; color: var(--muted); font-size: 11px; line-height: 1.7; }
 .decision-queue-keys strong { margin-right: 4px; color: var(--ink); }
 .decision-queue-keys kbd { min-width: 22px; padding: 1px 5px; border: 1px solid var(--rule); border-radius: 4px; background: var(--paper); color: var(--ink); font: inherit; text-align: center; }
+/* Notices sit after everything else and stick to the bottom edge, so nothing above them moves when one appears. */
+.decision-queue-notice { position: sticky; bottom: 12px; display: flex; flex-direction: column; gap: 4px; margin-top: 16px; padding: 10px 12px; border: 1px solid #dfc491; border-radius: 8px; background: #fff7e8; color: #724314; font-size: 12px; line-height: 1.5; }
+.decision-queue-notice > div { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.decision-queue-notice span { min-width: 0; overflow-wrap: anywhere; }
+.decision-queue-notice button { flex: none; min-height: 44px; }
+.decision-queue-dismiss { display: inline-flex; align-items: center; justify-content: center; width: 44px; margin: -8px -8px -8px 0; padding: 0; border: 0; background: transparent; color: inherit; }
 
 @media (max-width: 560px) {
   .decision-queue-page { padding: 28px 16px 24px; }
-  .decision-queue-heading { gap: 8px; margin-bottom: 22px; }
+  .decision-queue-heading { margin-bottom: 22px; }
   .decision-queue-heading h1 { font-size: 28px; }
-  .decision-queue-heading > div > p:last-child { max-width: 29ch; font-size: 13px; }
-  .decision-queue-refresh { padding: 8px 5px; }
   .decision-queue-card { padding: 18px 14px; }
   .decision-queue-count { align-items: flex-start; }
   .decision-queue-count span { text-align: right; }
-  .decision-queue-navigation { align-items: stretch; }
-  .decision-queue-navigation > * { flex: 1; justify-content: center; }
   .decision-queue-keys { gap: 5px; }
 }

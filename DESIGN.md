@@ -309,7 +309,7 @@ A person runs a team through its coordinator, not its agents. Team agents leave 
 
 Native copy stays terse. Icons, counts, and chips carry state; sentences remain only where a decision or an honesty qualifier needs them, shortened to markers such as "agent claim", "not approval", and "Offline · last received".
 
-The web workspace navigation leads with Swarm, the landing view, followed by Sessions, Teams, Goals, and Cost.
+The web workspace navigation leads with Swarm, the landing view, followed by Sessions, Decisions, Teams, Goals, and Cost, three to a row. Decisions names in words how many decisions wait on a person, under its label, and shows no count when none wait or when the count cannot be read.
 
 Web detail exposes Catch up, Full terminal, and Context. Native session detail exposes Chat, Activity, and Files; native team detail exposes Overview, Tasks, Agents, and Activity, with tasks as issue rows carrying an assignee avatar. Selected web tabs use the primary color and underline; the selected native segment is a raised lens. Labels stay in sentence case. The back control returns to the list.
 

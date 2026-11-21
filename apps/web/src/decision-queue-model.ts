@@ -1,4 +1,5 @@
 import type { QueueDecision } from "./api";
+import { decisionChoices } from "./decision-answer";
 
 export type DecisionQueueState = {
   decisions: QueueDecision[];
@@ -49,6 +50,22 @@ export function removeAnsweredDecision(state: DecisionQueueState, key: string): 
     selectedAnswers: [], answeredElsewhere: false };
 }
 
+/** How many reads a decision the person answered here stays hidden while the host still lists it. */
+export const ANSWERED_HIDE_READS = 5;
+
+/**
+ * Which answered keys stay hidden after a read. Each entry holds the number of the first read that began after the
+ * answer was confirmed. It ends when such a read no longer lists the key, or after ANSWERED_HIDE_READS of them: a
+ * decision the host still lists then shows again, because the host says it still waits.
+ */
+export function settleAnsweredKeys(hidden: ReadonlyMap<string, number>, read: number, listed: ReadonlySet<string>): Map<string, number> {
+  const next = new Map<string, number>();
+  for (const [key, firstRead] of hidden) {
+    if (read < firstRead || (listed.has(key) && read < firstRead + ANSWERED_HIDE_READS)) next.set(key, firstRead);
+  }
+  return next;
+}
+
 export function selectDecisionAnswers(state: DecisionQueueState, answers: readonly string[]): DecisionQueueState {
   return { ...state, selectedAnswers: [...answers], answeredElsewhere: false };
 }
@@ -56,9 +73,8 @@ export function selectDecisionAnswers(state: DecisionQueueState, answers: readon
 export function selectableOptions(decision: QueueDecision | undefined): QueueSelectableOption[] {
   if (!decision) return [];
   if (decision.kind === "session") return decision.prompt.options.map(option => ({ value: String(option.index), sessionIndex: option.index, role: option.role }));
-  const recommended = [...new Set(decision.decision.recommendation?.answers ?? [])];
-  const values = [...recommended, ...decision.decision.options.filter(option => !recommended.includes(option))];
-  return values.map(value => ({ value }));
+  const { options, recommendation, answerMode } = decision.decision;
+  return decisionChoices(options, recommendation?.answers, answerMode).map(value => ({ value }));
 }
 
 export function recommendationAnswers(decision: QueueDecision | undefined): string[] {

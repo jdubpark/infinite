@@ -150,19 +150,19 @@ export function PromptDecision({ sessionId, backend, prompt, canAnswer, controlI
   useEffect(() => {
     if (submitSignal === undefined || handledSubmit.current === submitSignal) return;
     handledSubmit.current = submitSignal;
-    if (selectedOption !== undefined && !terminalOnly && !pending.current) void deliver(selectedOption);
+    if (selectedOption !== undefined && !terminalOnly && !pending.current && prompt.options.some(option => option.index === selectedOption)) void deliver(selectedOption);
   }, [submitSignal, selectedOption, terminalOnly]);
   return <section className="prompt-decision" aria-label="Session needs your decision">
     <strong>{prompt.title}</strong>{prompt.detail && <pre>{prompt.detail}</pre>}
     {prompt.destructive && <p className="error">Destructive command: {prompt.destructive.pattern.replace(/-/g, " ")}</p>}
     {terminalOnly ? backend === "cmux" ? <p className="quiet">Answer this prompt in native cmux on the machine.</p> : <button className="text-button" onClick={openTerminal}>Open Terminal to answer this prompt</button> : <div className="prompt-options">
       {prompt.options.map(option => <button key={option.index} aria-pressed={selectionOnly ? selectedOption === option.index : undefined}
-        disabled={!canAnswer || busy || Boolean(pending.current)} onClick={() => selectionOnly ? onOptionSelection?.(option.index) : void deliver(option.index)}>{option.label}</button>)}
+        disabled={!canAnswer || busy || Boolean(pending.current)} onClick={() => selectionOnly ? onOptionSelection?.(option.index) : void deliver(option.index)}>{option.label}{selectionOnly && selectedOption === option.index && <span className="team-recommended-tag" aria-hidden="true">Selected</span>}</button>)}
       {textReply && <form onSubmit={event => { event.preventDefault(); void deliver(undefined, reply.trim()); }}><textarea aria-label="Reply instead" value={reply} onChange={event => setReply(event.target.value)} disabled={busy || Boolean(pending.current)} placeholder="Reply instead…" maxLength={32000} rows={feedText && !prompt.options.length ? 3 : 2} /><button disabled={!canAnswer || busy || Boolean(pending.current) || !reply.trim()}>Send reply</button></form>}
-      {selectionOnly && prompt.options.length > 0 && <button type="button" className="primary decision-queue-submit" data-decision-queue-submit disabled={!canAnswer || busy || Boolean(pending.current) || selectedOption === undefined || !prompt.options.some(option => option.index === selectedOption)} onClick={() => { if (selectedOption !== undefined) void deliver(selectedOption); }}>Submit selected answer</button>}
       {backend === "cmux" && prompt.acceptsText && !textReply && <p className="quiet">To reply with text, answer in native cmux on the machine.</p>}
     </div>}
-    {!canAnswer && <p className="quiet">Connect with a controller or owner key and take control to answer.</p>}
+    {selectionOnly && !terminalOnly && prompt.options.length > 0 && <button type="button" className="primary decision-queue-submit" data-decision-queue-submit disabled={!canAnswer || busy || Boolean(pending.current) || selectedOption === undefined || !prompt.options.some(option => option.index === selectedOption)} onClick={() => { if (selectedOption !== undefined) void deliver(selectedOption); }}>Submit selected answer</button>}
+    {!canAnswer && !selectionOnly && <p className="quiet">Connect with a controller or owner key and take control to answer.</p>}
     <p className="prompt-feedback" role="status">{!busy && message}</p>
     {pending.current && !busy && !(selectionOnly && terminalOnly) && <button disabled={!canAnswer} onClick={() => void deliver()}>Retry same answer</button>}
   </section>;

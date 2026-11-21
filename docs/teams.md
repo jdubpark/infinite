@@ -2546,11 +2546,11 @@ Each request passes these steps in order:
    is locked and gets no model turn until the owner unlocks it. An identical
    request under the same authority is answered from its recorded verdict.
    A verdict that the strong model reached after it asked the host for
-   source files is the exception. It answers only the delivery that follows
-   that review, which reads the files again. An identical request is reviewed
-   again, and that review can ask for the files as they are then. A second
-   attempt at the same dialog, after a refused delivery or a host restart,
-   leaves an allow of this kind with the owner.
+   source files is the exception: it cannot answer a new dialog. The delivery
+   that follows the review checks again any file the adapter collected. An
+   identical request is reviewed again, and that review can ask for the files
+   as they are then. A later attempt at the same dialog, after a refused
+   delivery or a host restart, leaves a recorded allow with the owner.
    The authority is the owner's delegation together with the policy text, the
    class rules and the tier profiles in force, and the project's halt epoch.
    A release or a configuration change that alters any of them sets aside

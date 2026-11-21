@@ -246,6 +246,7 @@ function ProvisionalStop({ reason, disabled, busy, onSubmit }: { reason: string;
       <Button compact busy={busy} title="Achieved" disabled={disabled || !ready} onPress={() => onSubmit({ result: "achieved", ...value })} />
       <Button compact secondary title="Not achieved, continue" disabled={disabled || !ready} onPress={() => onSubmit({ result: "not-achieved", ...value, continue: true })} />
     </View>
+    <Text style={t.note}>To record not achieved without continuing, or inconclusive, use “Record your assessment” below.</Text>
   </View>;
 }
 

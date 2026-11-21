@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ActivityIndicator, Alert, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
-import { api, connectionKey, type Connection, type Me } from "../../api/client";
+import { api, connectionKey, type Connection, type GoalAssessment, type GoalVerdictView, type Me } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
 import { useKeyboardPadding } from "../../components/keyboard";
@@ -19,6 +19,7 @@ import {
 import { Choices, Clamp, Disclosure, LinearChip, LineupView, RequestStatus, RunPill, Section, SteerBox, t } from "./parts";
 import { useRunRequest } from "./useRunRequest";
 import { CostLine, MoneyText } from "../cost/parts";
+import { ASSESSMENT_LABEL, awaitsProvisionalAnswer, countsText, criterionState, newestVerdictId, ownerOutcomeLabel, PRODUCER_LABELS, resultText, type AssessedGoal } from "./goal-verdicts";
 
 /** One product goal: its outcome, limits, active cycle, earlier cycles, and the person's assessment. */
 export function GoalDetail({ connection, id }: { connection: Connection; id: string }) {
@@ -29,7 +30,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
   const { data: me } = usePoll(() => api<Me>(connection, "/me"), 10000, [connection]);
   // A mutation's result shows at once; a poll that started before it cannot undo it.
   const [recorded, setRecorded] = useState<ProductGoal | null>(null);
-  const goal = poll.data ? newer(recorded, poll.data.goal) : recorded;
+  const goal: AssessedGoal | null = poll.data ? newer(recorded, poll.data.goal) : recorded;
   const activeId = goal?.activeTeamId;
   const active = usePoll(() => activeId ? api<TeamView>(connection, `/teams/${activeId}`) : Promise.resolve(null), 4000, [connection, activeId]);
   const activeTeam = active.data?.id === activeId ? active.data : null;
@@ -64,7 +65,9 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
   const decisions = activeTeam ? openDecisions(activeTeam) : [];
   const previous = goal.cycles.filter(cycle => cycle.teamId !== goal.activeTeamId);
   const project = me?.projects?.find(value => value.id === goal.projectId)?.name ?? goal.projectId;
-  const send = (action: string, label: string, fields?: Record<string, string | number>) => request.send(`/goals/${id}/${action}`, label, goal.revision, fields);
+  const send = (action: string, label: string, fields?: Record<string, string | number | boolean>) => request.send(`/goals/${id}/${action}`, label, goal.revision, fields as Record<string, string | number> | undefined);
+  const verdictId = newestVerdictId(goal.cycles);
+  const provisional = awaitsProvisionalAnswer(goal);
 
   return <View style={[s.fill, s.overlayRoot, { paddingBottom: keyboardPadding }]}>
     {header}
@@ -95,7 +98,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
           ])} />
         </View> : null}
       </View>
-      {goal.reason ? <Card attention><Text style={t.warning}>{goal.reason}</Text></Card> : null}
+      {goal.reason && !provisional ? <Card attention><Text style={t.warning}>{goal.reason}</Text></Card> : null}
 
       {goal.activeTeamId ? <Section title="Active cycle">
         <Card attention={decisions.length > 0}>
@@ -131,6 +134,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
           <RunPill label={TEAM_LABELS[cycle.status as TeamStatus] ?? cycle.status} tone={cycle.status in TEAM_LABELS ? teamTone(cycle.status as TeamStatus) : "muted"} />
           <Text style={t.note}>Goal revision {cycle.goalRevision} · {cycle.memberCount} members · {shortDate(cycle.startedAt)}</Text>
           {cycle.reason ? <Clamp text={cycle.reason} lines={3} /> : null}
+          {cycle.assessment ? <CycleAssessment connection={connection} goalId={id} teamId={cycle.teamId} assessment={cycle.assessment} /> : null}
           {cycle.branch ? <Text selectable style={t.mono}>{cycle.branch}</Text> : null}
           <Button compact title="Review team" secondary onPress={() => openTeam(cycle.teamId)} />
         </View>) : <Text style={t.note}>No earlier cycles recorded.</Text>}
@@ -159,13 +163,17 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
 
       <Section title="Product outcome">
         {goal.outcomes.length ? goal.outcomes.map((outcome, index) => <View key={`${outcome.at}/${index}`} style={s.record}>
-          <Text style={t.strong}>{OUTCOME_LABELS[outcome.result]} (human assessment)</Text>
+          <Text style={t.strong}>{ownerOutcomeLabel(outcome, OUTCOME_LABELS[outcome.result])} (human assessment)</Text>
           <Text style={t.note}>Revision {outcome.revision} · {shortDate(outcome.at)}</Text>
           <Clamp text={outcome.summary} lines={3} />
           <Text style={t.note}>Evidence</Text>
           <Clamp text={outcome.evidence} lines={3} />
         </View>) : <Text style={t.note}>Not assessed yet.</Text>}
-        {me && me.role !== "viewer" ? goalStopped(goal)
+        {provisional ? <Text style={t.note}>{ASSESSMENT_LABEL}. Only your assessment can record the goal as achieved.</Text> : null}
+        {provisional && me?.role === "viewer" && goal.reason ? <Text style={t.warning}>{goal.reason}</Text> : null}
+        {provisional && me && me.role !== "viewer" && verdictId ? <ProvisionalStop key={goal.outcomes.length} reason={goal.reason ?? ""} disabled={!controls.outcome || locked} busy={request.busy}
+          onSubmit={value => send("outcome", "Your outcome assessment", { ...value, verdictId })} /> : null}
+        {!provisional && me && me.role !== "viewer" ? goalStopped(goal)
           ? <OutcomeForm key={goal.outcomes.length} disabled={!controls.outcome || locked} busy={request.busy} onSubmit={value => send("outcome", "Your outcome assessment", value)} />
           : <Text style={t.note}>Assess once the goal stops.</Text> : null}
       </Section>
@@ -188,6 +196,56 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
         onSend={() => { const text = direction.trim(); if (text) send("steer", "Direction", { text }); }} />
     </View>
     <RequestStatus request={request} bottom={dockHeight + 10} canRetry={fresh && me?.role !== undefined && me.role !== "viewer" && (me.role === "owner" || /\/(steer|outcome)$/.test(request.pending?.path ?? ""))} />
+  </View>;
+}
+
+/** One cycle's agent assessment. Its criteria rows are read only when the person opens them. */
+function CycleAssessment({ connection, goalId, teamId, assessment }: { connection: Connection; goalId: string; teamId: string; assessment: GoalAssessment }) {
+  return <View style={s.record}>
+    <Text style={t.strong}>{ASSESSMENT_LABEL}</Text>
+    <Text style={t.body}>{resultText(assessment)}</Text>
+    <Text style={t.note}>{countsText(assessment.counts)}</Text>
+    <Disclosure title="Criteria"><CriteriaRows connection={connection} goalId={goalId} teamId={teamId} /></Disclosure>
+  </View>;
+}
+
+/** Mounted only while its disclosure is open, so closed cycles make no request. */
+function CriteriaRows({ connection, goalId, teamId }: { connection: Connection; goalId: string; teamId: string }) {
+  const [row, setRow] = useState<GoalVerdictView | null>(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let live = true;
+    api<{ verdicts: GoalVerdictView[] }>(connection, `/goals/${goalId}/verdicts`)
+      .then(value => { if (live) setRow(value.verdicts.find(item => item.teamId === teamId) ?? null); })
+      .catch(failure => { if (live) setError((failure as Error).message); });
+    return () => { live = false; };
+  }, [connection, goalId, teamId]);
+  if (error) return <Text style={t.warning}>{error}</Text>;
+  if (!row) return <ActivityIndicator />;
+  if (row.detail === "expired") return <Text style={t.note}>The criteria detail is no longer kept. Only the counts above remain.</Text>;
+  return <>{row.criteria.map(item => <View key={item.id} style={s.record}>
+    <Text style={t.mono}>{item.id}</Text>
+    <Text style={t.body}>{criterionState(item.state)} · {PRODUCER_LABELS[item.label]}{item.receipt ? ` · receipt ${item.receipt.outcome}` : ""}</Text>
+    {item.note ? <Text style={t.note}>Agent note: {item.note}</Text> : null}
+  </View>)}</>;
+}
+
+/** A goal stopped by an agent assessment: only these two answers. "Achieved" is the person's own. */
+function ProvisionalStop({ reason, disabled, busy, onSubmit }: { reason: string; disabled: boolean; busy: boolean; onSubmit: (value: { result: GoalResult; summary: string; evidence: string; continue?: boolean }) => void }) {
+  const [summary, setSummary] = useState("");
+  const [evidence, setEvidence] = useState("");
+  const ready = Boolean(summary.trim() && evidence.trim());
+  const value = { summary: summary.trim(), evidence: evidence.trim() };
+  return <View style={s.record}>
+    <Card attention><Text style={t.warning}>{reason}</Text></Card>
+    <Text style={t.label}>Your assessment</Text>
+    <TextInput accessibilityLabel="Your assessment" value={summary} onChangeText={setSummary} editable={!disabled} multiline maxLength={4000} style={[t.input, t.multiline]} />
+    <Text style={t.label}>Evidence for your assessment</Text>
+    <TextInput accessibilityLabel="Evidence for your assessment" value={evidence} onChangeText={setEvidence} editable={!disabled} multiline maxLength={8000} style={[t.input, t.multiline]} />
+    <View style={s.metaRow}>
+      <Button compact busy={busy} title="Achieved" disabled={disabled || !ready} onPress={() => onSubmit({ result: "achieved", ...value })} />
+      <Button compact secondary title="Not achieved, continue" disabled={disabled || !ready} onPress={() => onSubmit({ result: "not-achieved", ...value, continue: true })} />
+    </View>
   </View>;
 }
 

@@ -225,3 +225,25 @@ export function ago(iso?: string, now = Date.now()) {
   const s = Math.max(0, Math.floor((now - Date.parse(iso)) / 1000));
   return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : `${Math.floor(s / 3600)}h ago`;
 }
+
+/** One cycle's agent assessment as the host reports it: ids, enumerations, and counts only. */
+export type AssessedState = "met" | "not-met" | "inconclusive";
+export type ComposedState = AssessedState | "pending-owner";
+export type VerdictCounts = { met: number; notMet: number; inconclusive: number; pendingOwner: number };
+export type GoalAssessment = {
+  verdictId: string; revision: number; head: string; kind: "reviewed" | "no-change";
+  result: AssessedState; evaluatorResult?: AssessedState;
+  reason?: "no-independent-evaluator" | "evaluator-unavailable" | "record-unavailable" | "context-too-large";
+  counts: VerdictCounts; criteria: { id: string; state: ComposedState }[]; at: string; progress: number;
+};
+/** One row of GET /api/goals/:id/verdicts. */
+export type GoalVerdictView = {
+  cycle: number; teamId: string; verdictId: string; kind: "reviewed" | "no-change"; head: string; at: string;
+  label: "Agent assessment, provisional";
+  result: AssessedState; evaluatorResult?: AssessedState; differs: boolean; reason?: string; counts: VerdictCounts; progress: number;
+  owner?: { result: "achieved" | "not-achieved" | "inconclusive"; agrees?: boolean };
+  criteria: { id: string; producer: "host" | "evaluator" | "owner"; state: ComposedState; label: "host receipt" | "agent assessment" | "waiting for you";
+    reason?: string; evaluatorState?: AssessedState; receipt?: { handle: string; outcome: "pass" | "fail" | "unknown" }; handles?: string[]; note?: string }[];
+  evaluator?: { profileId: string; family: string; sharedFamily: boolean; alsoReviewed: boolean };
+  detail: "available" | "expired";
+};

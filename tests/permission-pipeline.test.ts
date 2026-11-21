@@ -663,6 +663,12 @@ test("a change to the rules or tier profiles in force retires earlier verdicts: 
   assert.equal(f.pipeline.applicable(pending.decisionId), false);
   decided(await f.pipeline.decide(request()), "allow");
   assert.equal(f.core.reviews.length, 4);
+
+  // A rollback to exactly the earlier rules brings back the verdicts reached under them, as it brings back their
+  // replay result, and sets aside the verdicts of the rules it leaves.
+  f.core.rules = "rules-1";
+  assert.equal(f.pipeline.applicable(pending.decisionId), true);
+  assert.equal(f.pipeline.applicable(again.decisionId), false);
 }));
 
 test("owner controls replay a request ID, refuse a conflicting one, and refuse what is not a reviewer's reject", () => withFixture(async f => {

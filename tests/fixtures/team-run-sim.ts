@@ -31,7 +31,8 @@ import { schedulerFixture } from "./team-scheduler.js";
  * I1 An acknowledged request took effect exactly once: revision, status, halt, steering, answers, revocation,
  *    continuations, its event line, and its receipt, across any stop and retry. A request the host admitted before a
  *    stop is acknowledged on retry.
- * I2 A retry of an acknowledged request with the same request id is acknowledged, keeps its receipt, and writes nothing.
+ * I2 A retry of an acknowledged request with the same request id is acknowledged, keeps its receipt, and does not write
+ *    the team record.
  * I3 The record loads after every stop, and its whole projection is the model's before the cut request, after it, or
  *    the intermediate state INTERMEDIATE names for that request and write. After the host's own pass only the halt may
  *    have changed.
@@ -39,11 +40,12 @@ import { schedulerFixture } from "./team-scheduler.js";
  *    the end of the member's journal and never advance here: only the scheduler's full pass reads reports.
  * I5 A settled run stays settled: once a cancelled record is written, every later record is cancelled at the same
  *    revision, and no new request is acknowledged.
- * I6 A refused request writes nothing.
+ * I6 A refused request does not write the team record.
  * I7 A request is acknowledged only at the revision it names, and a request id belongs to one action: the same id with
  *    another action or body is refused as a request conflict.
  * Two values are observed, not modeled: each receipt's digest (I2 checks it never changes), and whether a host pass
  * ended the halt (I3 allows either).
+ * I2 and I6 watch the team record only: its bytes and its captured writes. Other state files are not compared.
  */
 
 export class Violation extends Error {}
@@ -492,7 +494,7 @@ class Sim {
     const result = await this.host.call(service => send(service, this.f.run.id, request), request.kind, step.stopAt);
     this.durableChecks(result.writes, `the ${request.kind}`);
     if (result.stopped) {
-      // A refused request writes nothing (I6), so a request that wrote before the stop was admitted.
+      // A refused request does not write the record (I6), so a request that wrote before the stop was admitted.
       if (request.body.revision !== pre.revision) this.fail("I7", `a ${request.kind} issued against revision ${request.body.revision} wrote the record at revision ${pre.revision} before the stop`);
       if (SETTLED.has(pre.status)) this.fail("I5", `a new ${request.kind} wrote the ${pre.status} record before the stop`);
       bump(this.counts, `cut:${request.kind}:${step.stopAt}`);

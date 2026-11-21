@@ -180,17 +180,17 @@ for (const [seed, kind] of [[5, "pause"], [29, "cancel"]] as const) {
   });
 }
 
-// The allowance covers only write 1 of a pause or cancel: a pause or cancel whose event line is lost after its second
-// write still fails, with and without the allowance.
+// The allowance covers only write 1 of a pause or cancel. `eventLost` drops every "Team paused." and "Team cancelled."
+// line. In each seed below the first failure is then a pause or a cancel cut after write 2 (step 3 of both), through
+// I3, with and without the allowance. An allowance widened to every cut lets that step pass, and this test fails.
 const eventLost: Variant = { patch: service => {
   const host = internals(service), event = host.event.bind(host);
   host.event = (stored, text) => { if (text !== "Team paused." && text !== "Team cancelled.") event(stored, text); };
 } };
-for (const strict of [false, true]) {
-  test(`the ${KNOWN_DEFECT} allowance does not hide a pause or cancel that loses its event line after write 2${strict ? " (strict)" : ""}`, { skip: ONLY !== undefined && "TEAM_SIM_SEED reruns one corpus seed" }, async t => {
-    const violation = await sweep(SEEDS, {}, { ...eventLost, strict });
-    assert.ok(violation, `none of ${SEEDS.length} seeds caught it`);
-    assert.match(violation.message, /\((pause|cancel) [0-9a-f]{8}.*: I[13]: .*events is /);
-    t.diagnostic(`caught at ${violation.message.split("; rerun")[0]}`);
+for (const [seed, kind] of [[1, "pause"], [10, "cancel"]] as const) for (const strict of [false, true]) {
+  test(`the ${KNOWN_DEFECT} allowance does not hide a ${kind} that loses its event line after write 2: seed ${seed}${strict ? " (strict)" : ""}`, { skip: ONLY !== undefined && "TEAM_SIM_SEED reruns one corpus seed" }, async () => {
+    const violation = await sweep([seed], {}, { ...eventLost, strict });
+    assert.ok(violation, `seed ${seed} no longer fails with the ${kind} event line dropped`);
+    assert.match(violation.message, new RegExp(`\\(${kind} [0-9a-f]{8}, stop after write 2.*: I3: the reopened record .*against the state after it: events is `));
   });
 }

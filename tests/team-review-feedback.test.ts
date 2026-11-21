@@ -25,6 +25,7 @@ const ghRead = ["gh", "pr", "view", "7", "--json", PULL_REQUEST_FIELDS, "--repo"
 const fakeGh = `const fs = require("node:fs"); const [dir, command, ...args] = process.argv.slice(1);
 fs.appendFileSync(dir + "/commands.log", JSON.stringify([command, ...args]) + "\\n");
 if (command !== "gh") process.exit(3);
+if (fs.existsSync(dir + "/gate")) { const cell = new Int32Array(new SharedArrayBuffer(4)); while (!fs.existsSync(dir + "/release")) Atomics.wait(cell, 0, 0, 20); }
 process.stdout.write(fs.readFileSync(dir + "/pull-request.json", "utf8"));`;
 
 /** A run delivered as a pull request at revision 1 and ready for review, with review feedback switched as asked. */
@@ -43,7 +44,17 @@ function delivered(f: Fixture, enabled = true) {
     show: (reviews: Review[], extra: object = {}) => writeFileSync(join(dir, "pull-request.json"),
       JSON.stringify({ state: "OPEN", isCrossRepository: false, baseRefName: "main", headRefName: branch, headRefOid: head, reviews, ...extra })),
     commands: (): string[][] => existsSync(join(dir, "commands.log")) ? readFileSync(join(dir, "commands.log"), "utf8").trim().split("\n").map(line => JSON.parse(line)) : [],
+    /** Holds every later read until `release`. */
+    gate: () => writeFileSync(join(dir, "gate"), ""),
+    release: () => writeFileSync(join(dir, "release"), ""),
   };
+}
+/** Waits until `ready` holds, checking every 20 ms for at most 10 s. */
+async function until(ready: () => boolean) {
+  for (let tries = 0; !ready(); tries++) {
+    assert.ok(tries < 500, "the condition holds within 10 s");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
 }
 
 const poller = (teams: TeamService) => (teams as unknown as { reviewFeedback: TeamReviewFeedback }).reviewFeedback;
@@ -251,6 +262,36 @@ test("a held review whose pull request is retargeted before the halt lifts start
       assert.deepEqual(saved.run.reviewFeedback?.map(entry => [entry.reviewId, entry.outcome]), [["PRR_1", "superseded"]]);
       assert.ok(events(saved).includes("The owner's review PRR_1 was not applied: GitHub shows the pull request on another base or head branch than the one this run delivered to."));
       assert.equal(saved.reviewIntake?.ended?.reason, reason, "the run then leaves the watched set");
+    } finally { f.close(); }
+  }
+});
+
+test("closing the host while a pull request read runs saves nothing and steers nothing", async () => {
+  for (const phase of ["watch", "drain"] as const) {
+    const f = schedulerFixture();
+    try {
+      const gh = delivered(f);
+      gh.show([gh.review("PRR_1", owner, "CHANGES_REQUESTED")]);
+      let halted = phase === "drain";
+      const teams = f.openTeam(), feedback = poller(teams);
+      teams.useFuse({ held: () => halted ? { reason: "halt" } : undefined } as unknown as FuseGate);
+      await feedback.start();
+      // For the drain, the review is first accepted under a halt, so the read in flight is the check before its steer.
+      if (phase === "drain") { await feedback.poll(); halted = false; }
+      const before = f.readRecord<Saved>("team", f.run.id), reads = gh.commands().length;
+      gh.gate();
+      const pass = feedback.poll();
+      await until(() => gh.commands().length === reads + 1);
+      let idle = false;
+      const idled = teams.idle().then(() => { idle = true; });
+      await new Promise(resolve => setTimeout(resolve, 200));
+      assert.equal(idle, false, `${phase}: idle waits for the read in flight`);
+      const closed = teams.close();
+      gh.release();
+      await Promise.all([pass, closed, idled]);
+      await teams.idle();
+      assert.deepEqual(f.readRecord<Saved>("team", f.run.id), before, `${phase}: nothing is saved after close`);
+      assert.equal(gh.commands().length, reads + 1);
     } finally { f.close(); }
   }
 });

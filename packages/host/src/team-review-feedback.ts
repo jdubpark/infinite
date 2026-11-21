@@ -44,6 +44,8 @@ export class TeamReviewFeedback {
   private running?: Promise<void>;
   private stopTick?: () => void;
   private closed = false;
+  /** Ends a read in flight at close; after close, nothing is saved or steered (checked after every wait). */
+  private readonly abort = new AbortController();
   constructor(private readonly host: ReviewFeedbackHost) {}
 
   private settings() {
@@ -70,7 +72,10 @@ export class TeamReviewFeedback {
     this.stopTick = onTick?.(() => { if (this.host.now() - this.lastPoll >= settings.pollMs) void this.poll(); });
     return this.pass(false);
   }
-  close() { this.closed = true; this.stopTick?.(); }
+  /** Stops the timer and the read in flight. Resolves once the current pass has ended. */
+  close() { this.closed = true; this.stopTick?.(); this.abort.abort(); return this.settled(); }
+  /** Resolves when no pass is running. */
+  settled(): Promise<void> { return this.running ?? Promise.resolve(); }
   /** One pass over every run: drain its pending intents, then read its pull request. */
   poll() {
     this.lastPoll = this.host.now();
@@ -82,7 +87,7 @@ export class TeamReviewFeedback {
     while (this.running) await this.running;
     this.running = (async () => {
       const settings = this.settings();
-      if (!settings || !this.enabledAt) return;
+      if (!settings || !this.enabledAt || this.closed) return;
       for (const id of [...this.host.records.keys()]) {
         if (this.closed) return;
         try {
@@ -100,6 +105,7 @@ export class TeamReviewFeedback {
   private async drain(id: string, ownerLogin: string, enabledAt: string) {
     const pending = this.host.records.get(id)?.reviewIntake?.intents.filter(intent => intent.state === "pending") ?? [];
     for (const intent of pending) {
+      if (this.closed) return;
       const done = await this.host.enqueue(() => {
         const stored = this.current(id, intent);
         if (!stored) return true;
@@ -112,6 +118,7 @@ export class TeamReviewFeedback {
       if (!stored || this.host.held(stored.run.projectId)) continue;
       const target = pullRequestTarget(stored.run);
       const read = target ? await this.read(stored, target) : undefined;
+      if (this.closed) return;
       if (target && !read) continue;
       if (!read || !intentStillCurrent(intent, stored.run, read, ownerLogin, enabledAt)) {
         const moved = read && (read.baseRefName !== stored.run.delivery?.baseBranch || read.headRefName !== stored.run.pullRequest?.branch);
@@ -132,10 +139,10 @@ export class TeamReviewFeedback {
     if (!snapshot || !watchedRun(snapshot.run, snapshot.reviewIntake) || snapshot.reviewIntake?.intents.some(intent => intent.state === "pending")) return;
     const target = pullRequestTarget(snapshot.run)!;
     const read = await this.read(snapshot, target);
-    if (!read) return;
+    if (!read || this.closed) return;
     const intent = await this.host.enqueue(() => {
       const stored = this.host.records.get(id);
-      if (!stored || !watchedRun(stored.run, stored.reviewIntake) || stored.reviewIntake?.intents.some(item => item.state === "pending")) return undefined;
+      if (this.closed || !stored || !watchedRun(stored.run, stored.reviewIntake) || stored.reviewIntake?.intents.some(item => item.state === "pending")) return undefined;
       const { run } = stored, verdict = reviewVerdict(stored, read, ownerLogin, enabledAt), at = new Date(this.host.now()).toISOString();
       if (verdict.kind === "quiet" || verdict.kind === "known") return undefined;
       if (verdict.kind === "unwatched") {
@@ -166,6 +173,7 @@ export class TeamReviewFeedback {
 
   /** Makes the intent's steer off the team queue, then acknowledges its result on it. A transient failure leaves it pending. */
   private async apply(id: string, intent: ReviewIntent) {
+    if (this.closed) return;
     let outcome: "applied" | "refused" | undefined, reason: string | undefined;
     try {
       await this.host.steer(id, { requestId: intent.requestId, revision: intent.targetRevision, text: intent.text }, githubReviewSource(intent.reviewId));
@@ -181,8 +189,9 @@ export class TeamReviewFeedback {
     });
   }
 
-  /** The run's record while this intent is still pending in it. */
+  /** The run's record while this intent is still pending in it and the poller is open; a closed poller acknowledges nothing. */
   private current(id: string, intent: ReviewIntent) {
+    if (this.closed) return undefined;
     const stored = this.host.records.get(id);
     const saved = stored?.reviewIntake?.intents.find(item => item.requestId === intent.requestId);
     if (saved && saved !== intent) Object.assign(intent, saved);
@@ -210,11 +219,12 @@ export class TeamReviewFeedback {
   private async read(stored: Stored, target: { repository: string; number: number }): Promise<PullRequestRead | undefined> {
     const { config } = this.host, run = stored.run;
     try {
-      const result = await teamCommand({ command: "gh", args: pullRequestViewArgs(target) }, stored.root ?? config.teams?.workspaceDir ?? this.host.directory, undefined,
+      const result = await teamCommand({ command: "gh", args: pullRequestViewArgs(target) }, stored.root ?? config.teams?.workspaceDir ?? this.host.directory, this.abort.signal,
         READ_TIMEOUT_MS, config.teams?.commandPrefix, undefined, hostGithubGrantEnvironment(config, { sid: `review:${run.id}`, project: run.projectId, repo: target.repository, ops: ["pr"] }));
       if (result.exitCode !== 0 || result.interrupted || result.truncated) throw new Error(`gh exited with ${result.exitCode}${result.truncated ? " (output truncated)" : ""}`);
       return parsePullRequestView(result.stdout);
     } catch (error) {
+      if (this.closed) return undefined;
       // The output may hold review text, so only the failure's kind is logged.
       console.warn(`Review feedback could not read pull request ${target.repository}#${target.number}; it is read again at the next interval.`, error instanceof Error && !(error instanceof SyntaxError) && !("issues" in error) ? error.message : "unreadable output");
       return undefined;

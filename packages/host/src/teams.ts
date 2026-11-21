@@ -1887,9 +1887,11 @@ export class TeamService {
     this.timer = setInterval(tick, 500); this.timer.unref(); tick();
     void this.reviewFeedback.start(listener => this.options?.source?.onTick?.(listener) ?? (() => {}));
   }
-  close() { this.reviewFeedback.close(); this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const timer of this.sampleTimers) clearTimeout(timer); this.sampleTimers.clear(); for (const controller of this.commands.values()) controller.abort(); for (const controller of this.publicationControllers.values()) controller.abort(); for (const controller of this.memberWorkSaveControllers.values()) controller.abort(); for (const controller of this.agentControllers.values()) controller.abort(); this.objectiveTests.close(); this.removeAgentSource?.(); }
+  /** Resolves once the review-feedback pass that was running has ended; everything else stops at once. */
+  close(): Promise<void> { const reviewFeedback = this.reviewFeedback.close(); this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const timer of this.sampleTimers) clearTimeout(timer); this.sampleTimers.clear(); for (const controller of this.commands.values()) controller.abort(); for (const controller of this.publicationControllers.values()) controller.abort(); for (const controller of this.memberWorkSaveControllers.values()) controller.abort(); for (const controller of this.agentControllers.values()) controller.abort(); this.objectiveTests.close(); this.removeAgentSource?.(); return reviewFeedback; }
   /** Settles once work queued before now has finished, so a caller can stop sessions it may still launch. */
   async idle() {
+    await this.reviewFeedback.settled();
     await this.serial;
     // Drain a bounded number of removal generations; retries queued by later ticks are not "work queued before now".
     for (let pass = 0; pass < 5 && this.removalTasks.size; pass++) {

@@ -567,13 +567,15 @@ test("Codex argument signatures match registered MCP input schemas", { timeout: 
         .map(argument => ({ name: argument.replace(/\?$/, ""), optional: argument.endsWith("?") })).sort((a, b) => a.name.localeCompare(b.name));
       assert.deepEqual(args, actual, `${name} handwritten arguments match tools/list`);
     }
-    // What the rule says of a failed call is what this server answers: an error result with text and no structuredContent.
+    // What the rule says of a tool error is what the member server answers: an error result with a reason as text and
+    // no structuredContent. This is the server's contract; how a provider hands the result to a program is not tested here.
     const failed = asRecord(asRecord(await rpc("tools/call", { name: "entry_get", arguments: {} })).result);
     assert.equal(failed.isError, true);
     assert.equal("structuredContent" in failed, false);
     assert.ok(Array.isArray(failed.content));
     const [first] = failed.content as unknown[];
-    assert.equal(typeof asRecord(first).text, "string");
+    const reason = asRecord(first).text;
+    assert.ok(typeof reason === "string" && reason.trim().length > 0, "the error result carries a reason");
   } finally {
     const exited = child.exitCode !== null || child.signalCode !== null ? Promise.resolve() : new Promise<void>(resolveExit => child.once("exit", () => resolveExit()));
     child.stdin!.end();

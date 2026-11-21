@@ -173,8 +173,8 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
         {provisional && me?.role === "viewer" && goal.reason ? <Text style={t.warning}>{goal.reason}</Text> : null}
         {provisional && me && me.role !== "viewer" && verdictId ? <ProvisionalStop key={goal.outcomes.length} reason={goal.reason ?? ""} disabled={!controls.outcome || locked} busy={request.busy}
           onSubmit={value => send("outcome", "Your outcome assessment", { ...value, verdictId })} /> : null}
-        {!provisional && me && me.role !== "viewer" ? goalStopped(goal)
-          ? <OutcomeForm key={goal.outcomes.length} disabled={!controls.outcome || locked} busy={request.busy} onSubmit={value => send("outcome", "Your outcome assessment", value)} />
+        {me && me.role !== "viewer" ? provisional || goalStopped(goal)
+          ? <OutcomeForm key={goal.outcomes.length} disabled={!controls.outcome || locked} busy={request.busy} onSubmit={value => send("outcome", "Your outcome assessment", provisional && verdictId ? { ...value, verdictId } : value)} />
           : <Text style={t.note}>Assess once the goal stops.</Text> : null}
       </Section>
 

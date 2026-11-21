@@ -4,9 +4,18 @@ import { foreground } from "./live-refresh";
 
 export function useSessionControl(id: string) {
   const api = useApi();
-  const [lease, setLease] = useState<ControlLease | null>(null);
-  const [holder, setHolder] = useState<ControlLease | null>(null);
-  const [message, setMessage] = useState("");
+  const [leaseState, setLeaseState] = useState<{ id: string; value: ControlLease | null }>({ id, value: null });
+  const [holderState, setHolderState] = useState<{ id: string; value: ControlLease | null }>({ id, value: null });
+  const [messageState, setMessageState] = useState<{ id: string; value: string }>({ id, value: "" });
+  const lease = leaseState.id === id ? leaseState.value : null;
+  const holder = holderState.id === id ? holderState.value : null;
+  const message = messageState.id === id ? messageState.value : "";
+  const setLease = (value: ControlLease | null) => setLeaseState({ id, value });
+  const setHolder = (value: ControlLease | null | ((current: ControlLease | null) => ControlLease | null)) => setHolderState(previous => {
+    const current = previous.id === id ? previous.value : null;
+    return { id, value: typeof value === "function" ? value(current) : value };
+  });
+  const setMessage = (value: string) => setMessageState({ id, value });
   const [busy, setBusy] = useState(false);
   const owned = useRef<ControlLease | null>(null);
   const claiming = useRef(false);

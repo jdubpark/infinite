@@ -408,7 +408,9 @@ test("entry tools change the prompt version only for entry roles", () => {
   }
 });
 
-// Moved from a2505cbe because INF-343 adds project-manager and reviewer guidance across providers.
+// Moved from 1dfe7b9b: Codex members get the working rule for tools (INF-350), and the project manager and the
+// reviewer get one sentence each on every provider (INF-343). Without those two sentences the Claude and OpenCode
+// pin is 8075cde0, its value before both changes.
 const PIN_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"] as const;
 const PIN_PROVIDERS = ["claude", "codex", "opencode"] as const;
 const PIN_VERSIONS_SHA256 = "08ae370cd80e29585b7959874c8e934b537f29893e2a4c5d06f7757bc321d016";

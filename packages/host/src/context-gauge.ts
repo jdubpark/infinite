@@ -177,7 +177,7 @@ export class ContextGaugeTail {
   }
 
   private pushClaude(row: Record<string, unknown>): void {
-    if (row.isSidechain === true) return;
+    if (row.isSidechain === true || row.isVirtual === true) return;
     const message = object(row.message);
     if (!message) return;
     if (row.type === "assistant") {

@@ -8,6 +8,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { join, resolve } from "node:path";
 import { Manager } from "../packages/host/src/manager.js";
 import { workerCall } from "../packages/host/src/ipc.js";
+import { headlessChannelArgs } from "../packages/host/src/launch.js";
 import {
   HeadlessPermissionChannel, channelToken, deferredCallOpen, deliveryKey, type ChannelReply,
 } from "../packages/host/src/permission-headless.js";
@@ -288,6 +289,52 @@ function workerRig(replies: Array<ChannelReply | Error>) {
   };
 }
 const owner: ChannelReply = { result: "owner", interruptClass: "production-or-staging", rule: "production-deploy", sessionRoot: "/workspace", decisionId: randomUUID(), deliveryKey: "d".repeat(64) };
+
+const claudeModeHooks = (name: string) => readFileSync(new URL(`./fixtures/claude-code-mode/${name}`, import.meta.url), "utf8")
+  .trim().split("\n").map(line => JSON.parse(line) as Record<string, unknown>);
+
+test("Code Mode deferred Write resumes the same captured call id", async () => {
+  const rows = claudeModeHooks("defer-hooks.jsonl");
+  const w = workerRig([{ result: "none" }, { ...owner, rule: "write-owner" }]);
+  const launchArgs = headlessChannelArgs("/repo/hook-relay.js", true);
+  const settings: { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> } = JSON.parse(launchArgs[launchArgs.indexOf("--settings") + 1]!);
+  const routes = (event: string) => settings.hooks[event]?.[0]?.hooks.map(({ command }) => command.split(" ").slice(-2).join(" ")) ?? [];
+  assert.deepEqual(routes("PreToolUse"), ["/repo/hook-relay.js claude", "/repo/permission-hook.js check"]);
+  assert.deepEqual(routes("PermissionRequest"), ["/repo/permission-hook.js request"]);
+  assert.deepEqual(routes("PostToolUse"), ["/repo/hook-relay.js claude"]);
+  assert.deepEqual(routes("UserPromptSubmit"), ["/repo/hook-relay.js claude"]);
+  const bash = rows.find(row => row.hook_event_name === "PreToolUse" && row.tool_name === "Bash")!;
+  const original = rows.find(row => row.hook_event_name === "PreToolUse" && row.tool_name === "Write")!;
+  const resumed = rows.find(row => row.hook_event_name === "PreToolUse" && row.tool_name === "Write" && row !== original)!;
+  const callId = original.tool_use_id;
+  assert.equal(typeof callId, "string");
+  assert.equal(resumed.tool_use_id, callId);
+
+  assert.deepEqual(await w.channel.check(bash), { decision: "none" });
+  assert.deepEqual(await w.channel.check(original), { decision: "defer", reason: "This call waits for the owner's answer. The session resumes with that answer." });
+  const deferred = w.records.find(record => record.event === "deferred");
+  assert.equal(deferred?.callId, callId);
+  assert.equal(deferred?.rule, "write-owner");
+  assert.equal(w.channel.exited(0), true);
+  w.channel.answer({ requestId: "fixture-owner-answer", promptId: w.prompts[0]!, option: 0 });
+  assert.deepEqual(await w.channel.check(resumed), { decision: "allow" });
+  assert.equal(w.records.find(record => record.event === "delivered")?.callId, callId);
+  assert.equal(w.channel.waiting(), false);
+});
+
+test("Code Mode PermissionRequest without an id inherits its nested call id", async () => {
+  const rows = claudeModeHooks("hooks.jsonl");
+  const w = workerRig([{ result: "none" }, { result: "none" }, { result: "deny", code: "unsafe", notice: "ignored" }]);
+  const check = rows.find(row => row.hook_event_name === "PreToolUse" && row.tool_name === "Bash")!;
+  await w.channel.check(check);
+  const write = rows.find(row => row.hook_event_name === "PreToolUse" && row.tool_name === "Write")!;
+  await w.channel.check(write);
+  const permission = rows.find(row => row.hook_event_name === "PermissionRequest")!;
+  assert.equal("tool_use_id" in permission, false);
+  await w.channel.request(permission);
+  const decide = w.requests.find(request => (request as { op?: string }).op === "decide") as { call: { toolUseId?: string } };
+  assert.equal(decide.call.toolUseId, write.tool_use_id);
+});
 
 test("while a call waits, every other call of the session is denied as pending", async () => {
   const w = workerRig([owner]);

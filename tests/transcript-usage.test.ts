@@ -62,6 +62,19 @@ test("Claude classes do not overlap", () => {
   assert.equal(record.tokens.cacheRead, 5000);
 });
 
+test("Code Mode transcript usage counts each real model message and skips virtual rows", () => {
+  const tail = new UsageTail({ provider: "claude" });
+  const rows = readFileSync(new URL("./fixtures/claude-code-mode/transcript.jsonl", import.meta.url), "utf8").trim().split("\n");
+  const records = rows.flatMap(line => tail.push(JSON.parse(line)));
+  assert.deepEqual(records.map(record => record.messageId), ["msg_010001", "msg_010002"]);
+  assert.deepEqual(records.reduce((total, record) => {
+    for (const key of TOKEN_CLASSES) total[key] += record.tokens[key];
+    return total;
+  }, { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }), {
+    input: 4, output: 247, reasoning: 112, cacheRead: 17094, cacheWrite: 17529,
+  });
+});
+
 test("a Claude message that grows is emitted again", () => {
   const tail = new UsageTail({ provider: "claude" });
   const first = tail.push(claudeRow("msg_grow_01", { output_tokens: 10 }));

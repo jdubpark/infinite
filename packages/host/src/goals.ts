@@ -217,6 +217,15 @@ export class GoalService {
       goal.nextCycleAt = new Date(cadenceDue(last, goal.standing.cadenceMinutes, Date.now())).toISOString();
     return { ...goal, tasks };
   }
+  private acceptsDecision(goal: ProductGoal, teamId: string, held: boolean) {
+    const live = ["running", "needs-input"].includes(goal.status) || held && goal.status === "paused";
+    return goal.activeTeamId === teamId && live && Date.now() < Date.parse(goal.deadlineAt);
+  }
+  /** The goal wrapper's answer guard, without building a team or goal view. */
+  decisionAnswerable(teamId: string, held: boolean) {
+    const goalId = this.teams.goalIdOf(teamId), stored = goalId ? this.records.get(goalId) : undefined;
+    return Boolean(stored && this.acceptsDecision(stored.goal, teamId, held));
+  }
   answer(teamId: string, decisionId: string, body: Action & { text: string }) {
     return this.enqueue(async () => {
       const team = this.teams.get(teamId);
@@ -224,8 +233,7 @@ export class GoalService {
       // A goal the halt paused still takes the answer for its run held where it waits; the run starts nothing until it resumes.
       return this.teams.answer(teamId, decisionId, body, held => {
         const { goal } = this.record(team.goal!.id);
-        const live = ["running", "needs-input"].includes(goal.status) || held && goal.status === "paused";
-        if (goal.activeTeamId !== teamId || !live || Date.now() >= Date.parse(goal.deadlineAt))
+        if (!this.acceptsDecision(goal, teamId, held))
           throw new TeamError(409, "goal-not-running", "Only the active team of a running goal can receive a decision.");
       });
     });

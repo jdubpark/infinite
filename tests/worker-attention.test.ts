@@ -2,13 +2,56 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { existsSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { initialAttention } from "@infinite/attention";
 import { publicAttention, withDefaultAttention } from "../packages/host/src/manager.js";
+import type { QueueDecision } from "../packages/host/src/decision-queue.js";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
+import { fixture } from "./team-fixture.js";
 
 const attention = { idleAfterMs: 3000, hooks: { claude: true, codex: true } };
+
+test("decision queue returns a session prompt and team decision with answerable paths", { timeout: 90000 }, async () => {
+  const f = await fixture("question", undefined, {
+    attention,
+    agents: { claude: { command: process.execPath, args: [resolve("tests/fixtures/hook-agent.mjs")] } },
+  });
+  try {
+    const teamCreated = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(teamCreated.status), JSON.stringify(teamCreated.body));
+    const team = await waitFor(() => f.get(teamCreated.body.id), run => run.decisions.length === 1 && run.status === "needs-input", 30000);
+
+    const sessionId = randomUUID();
+    const sessionCreated = await f.host.fetchApi("/sessions", "owner", {
+      requestId: sessionId, provider: "claude", projectId: "rehearsal", title: "Queue prompt", prompt: "merge",
+    });
+    assert.equal(sessionCreated.status, 201, JSON.stringify(sessionCreated.body));
+    const session = await waitFor(() => f.host.fetchApi(`/sessions/${sessionId}`), response => response.body.attention?.state === "needs-you" && response.body.attention.prompt?.hash, 15000);
+
+    const response = await f.host.fetchApi("/decision-queue");
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+    const decisions = response.body.decisions as QueueDecision[];
+    const sessionItem = decisions.find((item): item is Extract<QueueDecision, { kind: "session" }> => item.kind === "session");
+    const teamItem = decisions.find((item): item is Extract<QueueDecision, { kind: "team" }> => item.kind === "team");
+    assert.ok(sessionItem);
+    assert.ok(teamItem);
+    assert.equal(sessionItem.origin.id, sessionId);
+    assert.equal(sessionItem.answerPath, `/api/sessions/${sessionId}/answer`);
+    assert.equal(teamItem.origin.id, team.id);
+    assert.equal(teamItem.answerPath, `/api/teams/${team.id}/decisions/${teamItem.decision.id}/answer`);
+
+    const route = (path: string) => path.replace(/^\/api/, "");
+    const sessionAnswer = await f.host.fetchApi(route(sessionItem.answerPath), "owner", {
+      requestId: randomUUID(), promptId: sessionItem.prompt.id, option: 0,
+    });
+    assert.equal(sessionAnswer.status, 200, JSON.stringify(sessionAnswer.body));
+    const teamAnswer = await f.host.fetchApi(route(teamItem.answerPath), "owner", {
+      requestId: randomUUID(), revision: teamItem.revision, text: "Compact",
+    });
+    assert.equal(teamAnswer.status, 200, JSON.stringify(teamAnswer.body));
+  } finally { await f.close(); }
+});
 
 type SignalRow = { seq: number; data: { kind: string; promptId?: number; source: string; type?: string; title?: string; detail?: string } };
 const signalsOf = async (host: Host, id: string) =>

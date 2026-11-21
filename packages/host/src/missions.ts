@@ -23,6 +23,7 @@ import { HOST_LOAD_REASON_PREFIX, LaunchHeldError, holdsHostLoadReason } from ".
 import { applyFuseReason, workLaunch } from "./fuse/rules.js";
 import type { FuseAdmission, FuseCheck, FuseGate } from "./fuse/types.js";
 import { HALT_PAUSED_TEAM, KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
+import { missionDecisionQueueCandidates } from "./decision-queue.js";
 
 /** The mission's only view of projects; the project group service implements it. */
 export type ProjectGroupLookup = { get(id: string): ProjectGroup };
@@ -261,10 +262,8 @@ export class MissionService {
     return () => { this.listeners.delete(listener); };
   }
   /** The stored mission without computed usage, for callers that read on every change. */
-  peek(id: string): Mission | undefined {
-    const stored = this.records.get(id);
-    return stored && structuredClone(stored.mission);
-  }
+  peek(id: string): Mission | undefined { const stored = this.records.get(id); return stored && structuredClone(stored.mission); }
+  decisionQueueCandidates() { return missionDecisionQueueCandidates(this.records.values(), live); }
   private save(stored: Stored) {
     const attempt = stored.attempts.at(-1), mission = stored.mission;
     mission.coordinator = attempt && { memberId: attempt.memberId, sessionId: attempt.sessionId,

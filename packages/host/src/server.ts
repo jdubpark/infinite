@@ -52,6 +52,7 @@ import { Blackboard } from "./evidence/blackboard.js";
 import { ENTRY_KINDS } from "./evidence/entry-types.js";
 import { usagePlanSchema } from "./usage-api.js";
 import { TeamService, TeamError } from "./teams.js";
+import { readDecisionQueue } from "./decision-queue-read.js";
 import { objectiveRoutes } from "./objective-routes.js";
 import { sendSessionList } from "./session-list.js";
 import { parseGoalCreateBody } from "./objective-input.js";
@@ -1297,9 +1298,9 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     app.post(`/api/missions/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await missions[action](id.parse(req.params.id), missionActionSchema.parse(req.body))));
   app.post("/api/missions/:id/extend", requireRole(["owner"]), async (req, res) => res.json(await missions.extend(id.parse(req.params.id), missionExtendSchema.parse(req.body))));
   app.get("/api/board", (_req, res) => {
-    const memberships = projectGroups.membershipSnapshot();
-    return res.json(missionBoard(missions.list(), teams.list(), goals.list(), config.projects, id => memberships.get(id)));
+    const memberships = projectGroups.membershipSnapshot(); return res.json(missionBoard(missions.list(), teams.list(), goals.list(), config.projects, id => memberships.get(id)));
   });
+  app.get("/api/decision-queue", async (_req, res) => res.json(await readDecisionQueue({ config, manager, cmux, permissions: sessionPermissions, teams, goals, missions })));
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
   // Which files each agent's recorded tool inputs pointed at. Read-only; observed inputs are not evidence of use or of a landed change.
   const contextTouches = new ContextTouches({

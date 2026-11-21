@@ -1,0 +1,219 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { initialAttention, type Attention, type Prompt } from "@infinite/attention";
+import { buildDecisionQueue } from "../packages/host/src/decision-queue.js";
+import type { MissionDecision } from "../packages/host/src/mission-types.js";
+import type { TeamDecision } from "../packages/host/src/team-types.js";
+import { promptOwner } from "../packages/host/src/notifier.js";
+
+type QueueInput = Parameters<typeof buildDecisionQueue>[0];
+type SessionInput = QueueInput["sessions"][number];
+type TeamInput = QueueInput["teams"][number];
+type MissionInput = QueueInput["missions"][number];
+
+const at = (minute: number) => `2026-11-21T12:${String(minute).padStart(2, "0")}:00.000Z`;
+
+function prompt(id: number, tool?: Prompt["tool"]): Prompt {
+  return {
+    id,
+    kind: "permission",
+    title: "Run this command?",
+    options: [{ index: 1, label: "Run", role: "accept" }],
+    acceptsText: false,
+    source: "hook",
+    ...(tool === undefined ? {} : { tool }),
+  };
+}
+
+function attention(since: string, state: Attention["state"] = "needs-you", currentPrompt?: Prompt): Attention {
+  return {
+    ...initialAttention(since, true),
+    state,
+    ...(currentPrompt === undefined ? {} : { prompt: currentPrompt }),
+  };
+}
+
+function session(id: string, overrides: Partial<Omit<SessionInput, "id" | "title">> = {}): SessionInput {
+  return {
+    id,
+    title: `Session ${id}`,
+    projectId: `project-${id}`,
+    status: "running",
+    attention: attention(at(10), "needs-you", prompt(1)),
+    owner: "user",
+    team: undefined,
+    ...overrides,
+  };
+}
+
+function teamDecision(id: string, revision = 1, answer?: string): TeamDecision {
+  return {
+    id,
+    memberId: "member-1",
+    revision,
+    question: `Question ${id}`,
+    options: ["Keep", "Change"],
+    createdAt: at(20),
+    ...(answer === undefined ? {} : { answer }),
+  };
+}
+
+function team(id: string, overrides: Partial<Omit<TeamInput, "id" | "title">> = {}): TeamInput {
+  return {
+    id,
+    title: `Team ${id}`,
+    projectId: `project-${id}`,
+    revision: 1,
+    status: "needs-input",
+    missionId: undefined,
+    goal: false,
+    goalCanAnswer: false,
+    decisions: [],
+    ...overrides,
+  };
+}
+
+function missionDecision(id: string, answer?: string): MissionDecision {
+  return {
+    id,
+    question: `Question ${id}`,
+    options: ["Keep", "Change"],
+    createdAt: at(20),
+    ...(answer === undefined ? {} : { answer }),
+  };
+}
+
+function mission(id: string, overrides: Partial<Omit<MissionInput, "id" | "title">> = {}): MissionInput {
+  return {
+    id,
+    title: `Mission ${id}`,
+    projectId: `project-${id}`,
+    revision: 1,
+    status: "needs-input",
+    takesAnswers: true,
+    decisions: [],
+    ...overrides,
+  };
+}
+
+test("session decisions require a live user-owned needs-you prompt and expose no tool input", () => {
+  const queued = buildDecisionQueue({
+    sessions: [
+      session("visible", {
+        projectId: "project-a",
+        team: { id: "team-a", title: "Team A", role: "implementer" },
+        attention: attention(at(10), "needs-you", prompt(7, { name: "Bash", input: { command: "private command" }, inputComplete: true })),
+      }),
+      session("working", { attention: attention(at(11), "working", prompt(8)) }),
+      session("exited", { status: "exited" }),
+      session("no-prompt", { attention: attention(at(12), "needs-you") }),
+      session("coordinator-owned", { owner: "coordinator" }),
+      session("undecided", { owner: "undecided" }),
+    ],
+    teams: [],
+    missions: [],
+  });
+
+  assert.equal(queued.decisions.length, 1);
+  assert.deepEqual(queued.decisions[0], {
+    kind: "session",
+    key: "session:visible:7",
+    since: at(10),
+    origin: {
+      id: "visible",
+      title: "Session visible",
+      projectId: "project-a",
+      team: { id: "team-a", title: "Team A", role: "implementer" },
+    },
+    answerPath: "/api/sessions/visible/answer",
+    prompt: {
+      id: 7,
+      kind: "permission",
+      title: "Run this command?",
+      options: [{ index: 1, label: "Run", role: "accept" }],
+      acceptsText: false,
+      source: "hook",
+      tool: { name: "Bash", input: {} },
+    },
+  });
+});
+
+test("shared prompt ownership checks the permission holder before the team coordinator", () => {
+  const row = { id: "session", attention: attention(at(1), "needs-you", prompt(9)) };
+  let teamCalls = 0;
+  const teams = { promptOwner: () => { teamCalls++; return "user" as const; } };
+
+  assert.equal(promptOwner(row, { holder: () => "agent" }, teams), "coordinator");
+  assert.equal(teamCalls, 0);
+  assert.equal(promptOwner(row, { holder: () => "undecided" }, teams), "undecided");
+  assert.equal(teamCalls, 0);
+  assert.equal(promptOwner(row, { holder: () => "owner" }, { promptOwner: () => "coordinator" }), "coordinator");
+  assert.equal(promptOwner(row, { holder: () => { throw new Error("unavailable"); } }), "user");
+});
+
+test("team decisions must be unanswered and belong to the current revision", () => {
+  const queued = buildDecisionQueue({
+    sessions: [],
+    teams: [team("team-a", { decisions: [teamDecision("old", 0), teamDecision("answered", 1, "Keep"), teamDecision("current")] })],
+    missions: [],
+  });
+
+  assert.deepEqual(queued.decisions, [{
+    kind: "team",
+    key: "team:team-a:current",
+    since: at(20),
+    origin: { id: "team-a", title: "Team team-a", projectId: "project-team-a" },
+    answerPath: "/api/teams/team-a/decisions/current/answer",
+    revision: 1,
+    decision: teamDecision("current"),
+  }]);
+});
+
+test("paused, closed, and mission-owned teams are excluded while answerable goals remain", () => {
+  const queued = buildDecisionQueue({
+    sessions: [],
+    teams: [
+      team("paused", { status: "paused", decisions: [teamDecision("d")] }),
+      team("merged", { status: "merged", revision: 2, decisions: [teamDecision("old-open-looking", 2)] }),
+      team("reviewed", { status: "ready-for-review", decisions: [teamDecision("d")] }),
+      team("unchanged", { status: "no-change", decisions: [teamDecision("d")] }),
+      team("cancelled", { status: "cancelled", decisions: [teamDecision("d")] }),
+      team("mission-owned", { missionId: "mission-a", decisions: [teamDecision("d")] }),
+      team("goal-hidden", { goal: true, goalCanAnswer: false, decisions: [teamDecision("d")] }),
+      team("goal-answerable", { goal: true, goalCanAnswer: true, decisions: [teamDecision("d")] }),
+    ],
+    missions: [],
+  });
+
+  assert.deepEqual(queued.decisions.map(decision => decision.key), ["team:goal-answerable:d"]);
+});
+
+test("mission-held subteam decisions appear once while the mission takes answers", () => {
+  const queued = buildDecisionQueue({
+    sessions: [],
+    teams: [team("subteam", { missionId: "accepting", decisions: [teamDecision("child")] })],
+    missions: [
+      mission("accepting", { decisions: [missionDecision("answered", "Keep"), { ...missionDecision("forwarded"), childDecisionId: "child" }, missionDecision("open")] }),
+      mission("read-only", { takesAnswers: false, decisions: [missionDecision("open")] }),
+    ],
+  });
+
+  assert.deepEqual(queued.decisions.map(decision => decision.key), ["mission:accepting:forwarded", "mission:accepting:open"]);
+  assert.equal(queued.decisions[0].kind, "mission");
+  assert.equal(queued.decisions[0].kind === "mission" && queued.decisions[0].decision.childDecisionId, "child");
+});
+
+test("queue order is oldest first, then stable key", () => {
+  const queued = buildDecisionQueue({
+    sessions: [session("b", { attention: attention(at(1), "needs-you", prompt(1)) })],
+    teams: [team("late", { decisions: [{ ...teamDecision("d"), createdAt: at(3) }] })],
+    missions: [mission("z", { decisions: [{ ...missionDecision("d"), createdAt: at(2) }] }), mission("a", { decisions: [{ ...missionDecision("d"), createdAt: at(2) }] })],
+  });
+
+  assert.deepEqual(queued.decisions.map(decision => [decision.key, decision.since]), [
+    ["session:b:1", at(1)],
+    ["mission:a:d", at(2)],
+    ["mission:z:d", at(2)],
+    ["team:late:d", at(3)],
+  ]);
+});

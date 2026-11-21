@@ -256,8 +256,9 @@ paths for the web [Swarm view](swarm.md): a project's directory-level code map
 session (`/api/teams/:id/context`, `/api/sessions/:id/context`). They carry
 directory names, repository-relative file paths, and counts, which is the
 class of data the file listing and session events already serve, and no source
-text. `terminal-open`, `terminal-send`,
-`terminal-close`, and the `events-*` messages
+text. The allowlist also admits `GET /api/decision-queue` as a read; global API
+authentication still applies, and the route adds no role guard. `terminal-open`,
+`terminal-send`, `terminal-close`, and the `events-*` messages
 travel inside ciphertext, together with device credentials and session identifiers.
 Server `terminal-event` frames carry original output, snapshots, state, receipts,
 and refusals. The host connects only to its own loopback terminal gateway; it

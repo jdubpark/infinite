@@ -125,6 +125,7 @@ process.exit(child.status ?? 1);
         ...(scenario === "lifecycle" ? [{ command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--hold-check", receipts] }] : []),
       ] }) } }],
     ...config,
+    agents: { ...agents, ...(config.agents ?? {}) },
     // Head publication pushes to GitHub, so only tests with a local remote override turn it on.
     teams: { workspaceDir: join(root, "teams"), publishHeads: false, ...(lineup ? { lineup } : {}), ...(options.trustWorkspaces ? { trustWorkspaces: true } : {}), ...(scenario === "success" || scenario === "reviewer-recording-error" ? {
       commandPrefix: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--command-prefix", receipts] },

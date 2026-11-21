@@ -2694,7 +2694,7 @@ export class TeamService {
     let selected = pinnedProfile ?? this.memberProfile(run, role, task);
     const limit = selected && this.limits.active().find(item => item.provider === selected!.provider);
     const fallback = limit && run.lineup ? resolveLimitFallback(run.lineup, selected!.id, this.limits.limited(), fallbackRule(run, role)) : undefined;
-    const retargeted = fallback && prompt !== undefined ? retargetPrompt(prompt, { provider: fallback.provider, profile: fallback }) : undefined;
+    const retargeted = fallback && prompt !== undefined ? retargetPrompt(prompt, { provider: fallback.provider, profile: fallback, role, entryTools: entryToolsFor(run, role) }) : undefined;
     // Without a resolvable fallback, or with a passed prompt it cannot carry, the launch proceeds: the limit may have lifted.
     if (selected && limit && fallback && (prompt === undefined || retargeted !== undefined)) {
       runEvent(run, `${selected.label} launched on ${fallback.label}: ${PROVIDER_NAMES[limit.provider]} is limited until ${clock(limit.expiresAt)}`);
@@ -2704,7 +2704,7 @@ export class TeamService {
     const provider = modelProfile?.provider ?? run.provider;
     const configuredProject = this.config.projects.find(project => project.id === run.projectId)?.team;
     const permissionRecoveryHistory = this.permissionRecoveryHistory(run);
-    let instructions = prompt === undefined ? teamPrompt(run, role, task, undefined, provider, modelProfile, configuredProject, permissionRecoveryHistory, this.publishHeadsEnabled()) : refreshReportingInstructions(prompt, provider);
+    let instructions = prompt === undefined ? teamPrompt(run, role, task, undefined, provider, modelProfile, configuredProject, permissionRecoveryHistory, this.publishHeadsEnabled()) : refreshReportingInstructions(prompt, provider, role);
     // Carried questions and recovery notes can outgrow an otherwise bounded prompt.
     // Keep them complete in the context file and rebuild the role's current authority.
     if (role !== "permission-coordinator" && Buffer.byteLength(instructions) > 80 * 1024)
@@ -2845,7 +2845,7 @@ export class TeamService {
     this.operation(stored, "result", signal => editing ? assertMemberScope(member.cwd, member.baseCommit, task ? task.paths : run.goal?.allowedPaths, prefix, signal) : assertMemberReadOnly(member.cwd, member.baseCommit, prefix, signal), () => {
       // The prompt keeps its feedback and user answers. An unrecognized prompt is rebuilt with its answers.
       const configuredProject = this.config.projects.find(project => project.id === run.projectId)?.team;
-      const carried = retargetPrompt(member.prompt, { provider: fallback.provider, profile: fallback }) ?? [teamPrompt(run, member.role, task ?? scout, undefined, fallback.provider, fallback, configuredProject, this.permissionRecoveryHistory(run), this.publishHeadsEnabled()),
+      const carried = retargetPrompt(member.prompt, { provider: fallback.provider, profile: fallback, role: member.role, entryTools: entryToolsFor(run, member.role) }) ?? [teamPrompt(run, member.role, task ?? scout, undefined, fallback.provider, fallback, configuredProject, this.permissionRecoveryHistory(run), this.publishHeadsEnabled()),
         ...run.decisions.filter(decision => decision.answer && run.members.some(prior => prior.memberId === decision.memberId && prior.role === member.role && prior.taskId === member.taskId && prior.revision === member.revision)).map(decision => `${decisionAnswerLabel(decision)} answered: ${decision.answer}`)].join("\n\n");
       const next = this.newMember(run, member.role, member.cwd, member.baseCommit, member.taskId, `${carried}\n\n${note}`, fallback);
       next.contextFeedback = [member.contextFeedback ?? member.prompt, note].filter(Boolean).join("\n\n");

@@ -2206,7 +2206,7 @@ test("Codex sandbox guidance covers members but excludes the permission coordina
   assert.doesNotMatch(coordinator, /Codex sandbox guidance:/);
   const switchedCoordinator = retargetPrompt(
     teamPrompt(run, "permission-coordinator", undefined, "evidence", "claude", limitLineup.coordinator),
-    { provider: "codex", profile: limitLineup.coordinator },
+    { provider: "codex", profile: limitLineup.coordinator, role: "permission-coordinator", entryTools: false },
   );
   assert.doesNotMatch(switchedCoordinator!, /Codex sandbox guidance:/);
 });
@@ -2215,24 +2215,24 @@ test("retargeting a member prompt keeps its answers, swaps reporting and profile
   const run = { provider: "codex", revision: 1, objective: "Create a.txt", baseCommit: "base", headCommit: "head", steering: [], tasks: [], checks: [], lineup: limitLineup } as unknown as TeamRun;
   const [haiku, astra] = limitLineup.implementers, deepseek = limitLineup.fallbacks![0];
   const answered = (provider: TeamModelProfile["provider"], profile: TeamModelProfile) => `${teamPrompt(run, "implementer", undefined, undefined, provider, profile)}\n\nUser answered: Compact`;
-  assert.equal(retargetPrompt(answered("claude", haiku), { provider: "opencode", profile: deepseek }), answered("opencode", deepseek));
+  assert.equal(retargetPrompt(answered("claude", haiku), { provider: "opencode", profile: deepseek, role: "implementer", entryTools: false }), answered("opencode", deepseek));
   const oldHelper = teamPrompt(run, "implementer", undefined, undefined, "opencode", astra);
-  const refreshed = refreshReportingInstructions(oldHelper, "codex");
+  const refreshed = refreshReportingInstructions(oldHelper, "codex", "implementer");
   assert.match(refreshed, /report tool of the infinite_team MCP server/);
   assert.doesNotMatch(refreshed, /Pipe a JSON object matching the above schema to this command:/);
-  assert.equal(retargetPrompt(oldHelper, { provider: "codex", profile: astra }), teamPrompt(run, "implementer", undefined, undefined, "codex", astra));
-  assert.match(retargetPrompt(oldHelper, { provider: "codex", profile: astra })!, /Codex sandbox guidance:/);
+  assert.equal(retargetPrompt(oldHelper, { provider: "codex", profile: astra, role: "implementer", entryTools: false }), teamPrompt(run, "implementer", undefined, undefined, "codex", astra));
+  assert.match(retargetPrompt(oldHelper, { provider: "codex", profile: astra, role: "implementer", entryTools: false })!, /Codex sandbox guidance:/);
   // A Codex prompt written by an earlier release names its helper, at another release's path.
   const older = oldHelper.replace(/to this command: [^\n]+?\. The helper/, "to this command: 'node' 'dist/team-report.js'. The helper");
   assert.notEqual(older, oldHelper);
-  assert.equal(refreshReportingInstructions(`${older}\n\nUser answered: Compact`, "codex"), `${refreshed}\n\nUser answered: Compact`);
-  assert.equal(retargetPrompt(answered("claude", haiku), { provider: "codex", profile: astra }), answered("codex", astra));
-  const oldCodex = teamPrompt(run, "implementer", undefined, undefined, "codex", astra).replace(/Codex sandbox guidance:[^\n]+\n\n/, "");
-  assert.match(retargetPrompt(oldCodex, { provider: "codex", profile: astra })!, /Codex sandbox guidance:/, "an older accumulated Codex prompt gains the current paragraph");
-  const switchedAway = retargetPrompt(answered("codex", astra), { provider: "opencode", profile: deepseek });
+  assert.equal(refreshReportingInstructions(`${older}\n\nUser answered: Compact`, "codex", "implementer"), `${refreshed}\n\nUser answered: Compact`);
+  assert.equal(retargetPrompt(answered("claude", haiku), { provider: "codex", profile: astra, role: "implementer", entryTools: false }), answered("codex", astra));
+  const oldCodex = teamPrompt(run, "implementer", undefined, undefined, "codex", astra).replace(/Codex sandbox guidance:[^\n]+\n\nWorking rule for tools:[^\n]+\n\n/, "");
+  assert.match(retargetPrompt(oldCodex, { provider: "codex", profile: astra, role: "implementer", entryTools: false })!, /Codex sandbox guidance:/, "an older accumulated Codex prompt gains the current paragraph");
+  const switchedAway = retargetPrompt(answered("codex", astra), { provider: "opencode", profile: deepseek, role: "implementer", entryTools: false });
   assert.equal(switchedAway, answered("opencode", deepseek));
   assert.doesNotMatch(switchedAway!, /Codex sandbox guidance:/);
-  assert.equal(retargetPrompt("Do the work and say when you are done.", { provider: "opencode", profile: deepseek }), undefined);
+  assert.equal(retargetPrompt("Do the work and say when you are done.", { provider: "opencode", profile: deepseek, role: "implementer", entryTools: false }), undefined);
 });
 
 test("project-manager prompts list configured setup and checks and forbid unauthorized verification", () => {

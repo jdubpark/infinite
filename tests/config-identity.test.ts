@@ -408,15 +408,22 @@ test("entry tools change the prompt version only for entry roles", () => {
   }
 });
 
-// Base pin: with the switch off, every role and provider keeps the prompt version it had at the base commit.
+// Moved from 1dfe7b9b: Codex members get the working rule for tools (INF-350), and the project manager and the
+// reviewer get one sentence each on every provider (INF-343). Without those two sentences the Claude and OpenCode
+// pin is 8075cde0, its value before both changes.
 const PIN_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"] as const;
 const PIN_PROVIDERS = ["claude", "codex", "opencode"] as const;
-// Moved from 2140e519 because questions now ask for a recommendation (INF-323).
-const PIN_VERSIONS_SHA256 = "1dfe7b9b8aff74f29c5570a3eca8b144da3f4b4e6c75af9b6681eadb766b9187";
+const PIN_VERSIONS_SHA256 = "08ae370cd80e29585b7959874c8e934b537f29893e2a4c5d06f7757bc321d016";
+const PIN_CODEX_VERSIONS_SHA256 = "39610cc28024e7641ae55f511218e2d094d82fbeab195c0560ae8cb4312ad61a";
+const PIN_NON_CODEX_VERSIONS_SHA256 = "804d29fbd0d0bc826c7ef1cbcceff6b985ac61ed83b43996001ff4657418154c";
 
 test("the switch off keeps every prompt version", () => {
   const versions = PIN_ROLES.flatMap(role => PIN_PROVIDERS.map(provider => promptVersion(role, provider, undefined, true)));
   assert.equal(createHash("sha256").update(JSON.stringify(versions)).digest("hex"), PIN_VERSIONS_SHA256);
+  const codex = PIN_ROLES.map(role => promptVersion(role, "codex", undefined, true));
+  const nonCodex = PIN_ROLES.flatMap(role => (["claude", "opencode"] as const).map(provider => promptVersion(role, provider, undefined, true)));
+  assert.equal(createHash("sha256").update(JSON.stringify(codex)).digest("hex"), PIN_CODEX_VERSIONS_SHA256);
+  assert.equal(createHash("sha256").update(JSON.stringify(nonCodex)).digest("hex"), PIN_NON_CODEX_VERSIONS_SHA256, "Claude and OpenCode versions include the all-provider guidance");
   for (const role of PIN_ROLES) for (const provider of PIN_PROVIDERS) {
     assert.equal(promptVersion(role, provider, undefined, true, false, false), promptVersion(role, provider, undefined, true));
   }

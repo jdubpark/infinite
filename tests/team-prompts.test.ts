@@ -1,11 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { ENTRY_PARAGRAPH_LIMIT_BYTES, entryCommand, entryInstructions, ownerDirectionLines, refreshReportingInstructions, reportCommand, retargetPrompt, teamContext, teamPrompt } from "../packages/host/src/team-prompts.js";
+import { createInterface } from "node:readline";
+import { resolve } from "node:path";
+import { ENTRY_PARAGRAPH_LIMIT_BYTES, codexMemberToolInstructions, codexSandboxInstructions, contextAccessInstructions, entryCommand, entryInstructions, ownerDirectionLines, refreshReportingInstructions, reportCommand, reportingInstructions, retargetPrompt, teamContext, teamPrompt } from "../packages/host/src/team-prompts.js";
 import { hostEntry } from "../packages/host/src/evidence/host-entries.js";
 import { buildCapsule } from "../packages/host/src/eval-rules.js";
+import { outputSchemas } from "../packages/host/src/team-mcp-results.js";
 import { recordedTeamReportSchema, teamReportSchema, type TeamBrief, type TeamMember, type TeamModelProfile, type TeamRun, type TeamScout, type TeamTask } from "../packages/host/src/team-types.js";
 import type { TeamRunRouting, TeamRunRoutingAuto } from "../packages/host/src/routing-types.js";
+import { ENTRY_PROFILE, ENTRY_PROVIDERS, smallRun } from "./fixtures/team-prompt-run.js";
 
 const PROMPT_LIMIT_BYTES = 80 * 1024;
 
@@ -337,34 +342,13 @@ test("a member context never carries the feature map or the eval block", () => {
 });
 
 const ENTRY_ROLES_UNDER_TEST = ["project-manager", "scout", "implementer", "integrator", "reviewer"] as const;
-const ENTRY_PROVIDERS = ["claude", "codex", "opencode"] as const;
-const ENTRY_PROFILE: TeamModelProfile = { id: "fixture-profile", label: "Fixture profile", provider: "claude", model: "fixture-model", effort: "high" };
 const CONTEXT_ACCESS_END = "even when their complete inline text is present.";
+const MEMBER_ROLES_UNDER_TEST = ["permission-coordinator", ...ENTRY_ROLES_UNDER_TEST, "delivery"] as const;
+const entryToolRoles = new Set<string>(ENTRY_ROLES_UNDER_TEST);
 
-function smallRun(extra: Partial<TeamRun> = {}): TeamRun {
-  return {
-    id: "00000000-0000-4000-8000-000000000011",
-    projectId: "example-project",
-    provider: "claude",
-    title: "Entry prompt run",
-    objective: "Preserve the owner-visible contract.",
-    parallelism: 1,
-    revision: 1,
-    status: "implementing",
-    createdAt: "2026-11-01T00:00:00.000Z",
-    updatedAt: "2026-11-01T00:00:00.000Z",
-    workspace: "/home/dev/projects/example",
-    branch: "infinite/team-entry",
-    baseCommit: "a".repeat(40),
-    tasks: [],
-    members: [],
-    decisions: [],
-    checks: [],
-    steering: [],
-    events: [],
-    round: 1,
-    ...extra,
-  } as TeamRun;
+function declaredOutputFields(schema: { properties?: Record<string, unknown>; required?: string[] }) {
+  const required = new Set(schema.required ?? []);
+  return Object.keys(schema.properties ?? {}).map(field => `${field}${required.has(field) ? "" : "?"}`);
 }
 
 test("the entry paragraph is the only change and only with tools on", () => {
@@ -375,7 +359,11 @@ test("the entry paragraph is the only change and only with tools on", () => {
     for (const role of ENTRY_ROLES_UNDER_TEST) {
       const off = teamPrompt(smallRun(), role, undefined, undefined, provider, ENTRY_PROFILE);
       const on = teamPrompt(smallRun({ blackboard: { tools: true } }), role, undefined, undefined, provider, ENTRY_PROFILE);
-      assert.equal(on, off.replace(CONTEXT_ACCESS_END, `${CONTEXT_ACCESS_END}\n\n${paragraph}`), `${role} ${provider}`);
+      const withEntry = off.replace(CONTEXT_ACCESS_END, `${CONTEXT_ACCESS_END}\n\n${paragraph}`);
+      const expected = provider === "codex" && entryToolRoles.has(role)
+        ? withEntry.replace(codexMemberToolInstructions(false), codexMemberToolInstructions(true))
+        : withEntry;
+      assert.equal(on, expected, `${role} ${provider}`);
     }
     for (const role of ["delivery", "permission-coordinator"] as const) {
       assert.equal(
@@ -387,16 +375,212 @@ test("the entry paragraph is the only change and only with tools on", () => {
   }
 });
 
+test("planning and rewrite-review guidance is limited to its role across providers", () => {
+  const improvementPlan = "When the objective requests an improvement such as faster, smaller, cheaper, or more reliable, include the measured baseline, a numeric target, and the command that measures both in the plan.";
+  const generatedRewriteReview = "For a rewrite or port, confirm the new behavior was compared with the original using generated inputs, not only hand-picked examples.";
+  for (const provider of ENTRY_PROVIDERS) {
+    const profile = { ...ENTRY_PROFILE, provider };
+    for (const role of MEMBER_ROLES_UNDER_TEST) {
+      const prompt = teamPrompt(smallRun(), role, undefined, undefined, provider, profile);
+      assert.equal(prompt.split(improvementPlan).length - 1, role === "project-manager" ? 1 : 0, `${role} ${provider} planning guidance`);
+      assert.equal(prompt.split(generatedRewriteReview).length - 1, role === "reviewer" ? 1 : 0, `${role} ${provider} rewrite-review guidance`);
+    }
+  }
+});
+
+test("Codex tool guidance follows provider, role, and available entry tools", () => {
+  for (const provider of ENTRY_PROVIDERS) {
+    const profile = { ...ENTRY_PROFILE, provider };
+    for (const role of MEMBER_ROLES_UNDER_TEST) for (const toolsOn of [false, true]) {
+      const run = smallRun(toolsOn ? { blackboard: { tools: true } } : {});
+      const prompt = teamPrompt(run, role, undefined, undefined, provider, profile);
+      const codexMember = provider === "codex" && role !== "permission-coordinator";
+      const hasEntryTools = toolsOn && entryToolRoles.has(role);
+      assert.equal(prompt.split(codexSandboxInstructions).length - 1, codexMember ? 1 : 0, `${role} ${provider} sandbox`);
+      assert.equal(prompt.split(codexMemberToolInstructions(hasEntryTools)).length - 1, codexMember ? 1 : 0, `${role} ${provider} signatures`);
+      if (codexMember && hasEntryTools) {
+        assert.match(prompt, /entry_list\(/, `${role} Codex entry list`);
+        assert.match(prompt, /entry_get\(/, `${role} Codex entry get`);
+        assert.match(prompt, /entry_post\(/, `${role} Codex entry post`);
+      }
+    }
+  }
+});
+
+test("Codex tool signatures expose the declared result fields and stay concise", () => {
+  const tools = [
+    { name: "report", schema: outputSchemas.report },
+    { name: "entry_list", schema: outputSchemas.entry_list },
+    { name: "entry_get", schema: outputSchemas.entry_get },
+    { name: "entry_post", schema: outputSchemas.entry_post },
+  ] as const;
+  const paragraph = codexMemberToolInstructions(true);
+  assert.ok(Buffer.byteLength(paragraph, "utf8") < 1200);
+  assert.ok(paragraph.startsWith("Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results."));
+  assert.doesNotMatch(paragraph, /session record keeps each nested call/);
+  assert.match(paragraph, /When a program lists or reads items, print how many it listed, read, and matched/);
+  assert.match(paragraph, /Read the context file with a shell call inside a program, and select only the fields needed for your next decision\./);
+  assert.match(paragraph, /Tool signatures \(arguments -> fields of a successful result's structuredContent\):/);
+  const signatures = [...paragraph.matchAll(/([a-z_]+)\([^)]*\) -> \{([^}]*)\}/g)];
+  assert.deepEqual(signatures.map(match => match[1]), tools.map(tool => tool.name));
+  for (const [index, { schema }] of tools.entries()) {
+    assert.deepEqual(signatures[index]![2]!.split(", "), declaredOutputFields(schema), `${tools[index]!.name} result fields match its output schema`);
+  }
+  assert.doesNotMatch(codexMemberToolInstructions(false), /entry_(?:list|get|post)\(/);
+});
+
+test("Codex argument signatures match registered MCP input schemas", { timeout: 20000 }, async () => {
+  const child = spawn(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/team-mcp.ts")], {
+    cwd: process.cwd(), env: { ...process.env, INFINITE_TEAM_ENTRY_TOOLS: "1", INFINITE_HANDOFF_SESSION: "", INFINITE_MISSION_ASSIGNMENT: "" }, stdio: ["pipe", "pipe", "pipe"],
+  });
+  type ReplyWaiter = { resolve: (value: unknown) => void; reject: (error: Error) => void };
+  const pending = new Map<number, ReplyWaiter>();
+  const asRecord = (value: unknown): Record<string, unknown> => {
+    assert.ok(value !== null && typeof value === "object" && !Array.isArray(value));
+    return value as Record<string, unknown>;
+  };
+  const lines = createInterface({ input: child.stdout! });
+  lines.on("line", line => {
+    let message: unknown;
+    try { message = JSON.parse(line) as unknown; } catch { return; }
+    const reply = message !== null && typeof message === "object" && !Array.isArray(message) ? message as Record<string, unknown> : undefined;
+    if (reply && typeof reply.id === "number") pending.get(reply.id)?.resolve(reply);
+    if (reply && typeof reply.id === "number") pending.delete(reply.id);
+  });
+  child.stderr?.resume();
+  child.on("exit", () => {
+    for (const waiter of pending.values()) waiter.reject(new Error("team-mcp exited before replying"));
+    pending.clear();
+  });
+  let requestId = 0;
+  const rpc = (method: string, params: unknown = {}) => new Promise<unknown>((resolveReply, reject) => {
+    const id = ++requestId;
+    pending.set(id, { resolve: resolveReply, reject });
+    child.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+  });
+  try {
+    const initialized = asRecord(await rpc("initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "team prompt test", version: "1" } }));
+    assert.equal(asRecord(initialized.result).protocolVersion, "2025-11-25");
+    child.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+    const listing = asRecord(asRecord(await rpc("tools/list")).result);
+    assert.ok(Array.isArray(listing.tools));
+    const registered = new Map((listing.tools as unknown[]).map(value => {
+      const tool = asRecord(value);
+      return [tool.name as string, tool] as const;
+    }));
+    const names = ["report", "entry_list", "entry_get", "entry_post"];
+    const signatures = [...codexMemberToolInstructions(true).matchAll(/([a-z_]+)\(([^)]*)\) -> \{([^}]*)\}/g)];
+    assert.deepEqual(signatures.map(match => match[1]), names);
+    for (const [index, name] of names.entries()) {
+      const tool = registered.get(name);
+      assert.ok(tool, `${name} is listed`);
+      const schema = asRecord(tool.inputSchema);
+      const properties = asRecord(schema.properties);
+      const required = new Set(Array.isArray(schema.required) ? schema.required.filter((item): item is string => typeof item === "string") : []);
+      const actual = Object.keys(properties).map(argument => ({ name: argument, optional: !required.has(argument) })).sort((a, b) => a.name.localeCompare(b.name));
+      const args = signatures[index]![2]!.replace(/^\{|\}$/g, "").split(", ").filter(Boolean)
+        .map(argument => ({ name: argument.replace(/\?$/, ""), optional: argument.endsWith("?") })).sort((a, b) => a.name.localeCompare(b.name));
+      assert.deepEqual(args, actual, `${name} handwritten arguments match tools/list`);
+    }
+  } finally {
+    const exited = child.exitCode !== null || child.signalCode !== null ? Promise.resolve() : new Promise<void>(resolveExit => child.once("exit", () => resolveExit()));
+    child.stdin!.end();
+    await exited;
+    lines.close();
+  }
+});
+
 test("a retarget swaps the entry paragraph", () => {
   const prompt = teamPrompt(smallRun({ blackboard: { tools: true } }), "implementer", undefined, undefined, "claude", ENTRY_PROFILE);
   assert.ok(prompt.includes(entryInstructions("claude")));
-  const retargeted = retargetPrompt(prompt, { provider: "codex", profile: { ...ENTRY_PROFILE, provider: "codex" } });
+  const retargeted = retargetPrompt(prompt, { provider: "codex", profile: { ...ENTRY_PROFILE, provider: "codex" }, role: "implementer", entryTools: true });
   assert.ok(retargeted);
   assert.equal(retargeted.split(entryInstructions("codex")).length - 1, 1);
   assert.equal(retargeted.includes(entryInstructions("claude")), false);
+  assert.equal(retargeted.split(codexSandboxInstructions).length - 1, 1);
+  assert.equal(retargeted.split(codexMemberToolInstructions(true)).length - 1, 1);
+  const codexAgain = retargetPrompt(retargeted, { provider: "codex", profile: { ...ENTRY_PROFILE, provider: "codex" }, role: "implementer", entryTools: true });
+  assert.ok(codexAgain);
+  assert.equal(codexAgain.split(codexSandboxInstructions).length - 1, 1);
+  assert.equal(codexAgain.split(codexMemberToolInstructions(true)).length - 1, 1);
+  const back = retargetPrompt(codexAgain, { provider: "claude", profile: ENTRY_PROFILE, role: "implementer", entryTools: true });
+  assert.ok(back);
+  assert.equal(back.includes(codexSandboxInstructions), false);
+  assert.equal(back.includes(codexMemberToolInstructions(true)), false);
+  const backAgain = retargetPrompt(back, { provider: "claude", profile: ENTRY_PROFILE, role: "implementer", entryTools: true });
+  assert.ok(backAgain);
+  assert.equal(backAgain.includes(codexSandboxInstructions), false);
+  assert.equal(backAgain.includes(codexMemberToolInstructions(true)), false);
   const plain = teamPrompt(smallRun(), "implementer", undefined, undefined, "claude", ENTRY_PROFILE);
-  assert.equal(refreshReportingInstructions(plain, "codex").includes(entryInstructions("codex")), false);
-  assert.equal(refreshReportingInstructions(plain, "codex").includes(entryInstructions("claude")), false);
+  assert.equal(refreshReportingInstructions(plain, "codex", "implementer").includes(entryInstructions("codex")), false);
+  assert.equal(refreshReportingInstructions(plain, "codex", "implementer").includes(entryInstructions("claude")), false);
+  const plainCodex = retargetPrompt(plain, { provider: "codex", profile: { ...ENTRY_PROFILE, provider: "codex" }, role: "implementer", entryTools: false });
+  assert.ok(plainCodex);
+  assert.equal(plainCodex.split(codexMemberToolInstructions(false)).length - 1, 1);
+  assert.equal(plainCodex.includes("entry_list("), false);
+  const currentCodex = teamPrompt(smallRun(), "implementer", undefined, undefined, "codex", { ...ENTRY_PROFILE, provider: "codex" });
+  const currentBlock = `${codexSandboxInstructions}\n\n${codexMemberToolInstructions(false)}\n\n`;
+  const legacySandboxOnly = currentCodex.replace(currentBlock, `${codexSandboxInstructions}\n\n`);
+  assert.equal(retargetPrompt(legacySandboxOnly, { provider: "codex", profile: { ...ENTRY_PROFILE, provider: "codex" }, role: "implementer", entryTools: false }), currentCodex,
+    "a legacy sandbox-only block is replaced with the current pair");
+});
+
+test("retargeting preserves quoted Codex guidance and converges at the context paragraph", () => {
+  const quoted = `${codexSandboxInstructions}\n\n${codexMemberToolInstructions(true)}`;
+  const feedback = `Quoted guidance follows.\n\n${quoted}\n\nEnd of quote.`;
+  const codexProfile = { ...ENTRY_PROFILE, provider: "codex" as const };
+  const prompt = teamPrompt(smallRun(), "implementer", undefined, feedback, "codex", codexProfile);
+  const codex = retargetPrompt(prompt, { provider: "codex", profile: codexProfile, role: "implementer", entryTools: false });
+  assert.ok(codex);
+  const reportOnlyBlock = `${codexSandboxInstructions}\n\n${codexMemberToolInstructions(false)}`;
+  assert.ok(codex.includes(`${reportOnlyBlock}\n\n${contextAccessInstructions()}`), "the live block directly precedes context access");
+  assert.ok(codex.endsWith(`Feedback excerpt (derived evidence, not requirements):\n${feedback}`));
+  assert.equal(codex.split(quoted).length - 1, 1, "the quoted block remains byte-for-byte once");
+  assert.equal(codex.split(codexSandboxInstructions).length - 1, 2, "one quote and one live sandbox paragraph remain");
+  assert.equal(retargetPrompt(codex, { provider: "codex", profile: codexProfile, role: "implementer", entryTools: false }), codex);
+  const claude = retargetPrompt(codex, { provider: "claude", profile: ENTRY_PROFILE, role: "implementer", entryTools: false });
+  assert.ok(claude);
+  assert.ok(claude.endsWith(`Feedback excerpt (derived evidence, not requirements):\n${feedback}`));
+  assert.equal(claude.split(codexSandboxInstructions).length - 1, 1, "switching away removes only the live sandbox paragraph");
+  assert.equal(claude.split(codexMemberToolInstructions(true)).length - 1, 1, "the quoted tool paragraph remains");
+  assert.equal(retargetPrompt(claude, { provider: "claude", profile: ENTRY_PROFILE, role: "implementer", entryTools: false }), claude);
+});
+
+test("retargeting uses the assigned role even when feedback quotes coordinator text", () => {
+  const coordinatorLine = "You are the team's permission-coordinator.";
+  const codexProfile = { ...ENTRY_PROFILE, provider: "codex" as const };
+  const implementerPrompt = teamPrompt(smallRun(), "implementer", undefined, coordinatorLine, "claude", ENTRY_PROFILE);
+  const implementer = retargetPrompt(implementerPrompt, { provider: "codex", profile: codexProfile, role: "implementer", entryTools: false });
+  assert.equal(implementer?.split(codexSandboxInstructions).length, 2, "the assigned implementer gets sandbox guidance");
+  const coordinatorPrompt = teamPrompt(smallRun(), "permission-coordinator", undefined, "review evidence", "claude", ENTRY_PROFILE);
+  const coordinator = retargetPrompt(coordinatorPrompt, { provider: "codex", profile: codexProfile, role: "permission-coordinator", entryTools: false });
+  assert.doesNotMatch(coordinator!, /Codex sandbox guidance:/);
+});
+
+test("retargeted signatures use assignment entry tools despite a quoted entry paragraph", () => {
+  const quoted = entryInstructions("codex");
+  const codexProfile = { ...ENTRY_PROFILE, provider: "codex" as const };
+  const reportOnlyPrompt = teamPrompt(smallRun(), "implementer", undefined, quoted, "claude", ENTRY_PROFILE);
+  const reportOnly = retargetPrompt(reportOnlyPrompt, { provider: "codex", profile: codexProfile, role: "implementer", entryTools: false });
+  assert.ok(reportOnly);
+  assert.ok(reportOnly.includes(`${codexSandboxInstructions}\n\n${codexMemberToolInstructions(false)}\n\n${contextAccessInstructions()}`));
+  assert.ok(reportOnly.endsWith(`Feedback excerpt (derived evidence, not requirements):\n${quoted}`));
+  assert.doesNotMatch(reportOnly, /entry_(?:list|get|post)\(/);
+  const entryPrompt = teamPrompt(smallRun({ blackboard: { tools: true } }), "implementer", undefined, undefined, "claude", ENTRY_PROFILE);
+  const entryEnabled = retargetPrompt(entryPrompt, { provider: "codex", profile: codexProfile, role: "implementer", entryTools: true });
+  assert.ok(entryEnabled);
+  assert.ok(entryEnabled.includes(`${codexSandboxInstructions}\n\n${codexMemberToolInstructions(true)}\n\n${contextAccessInstructions()}`));
+  assert.equal(entryEnabled.split(codexMemberToolInstructions(true)).length - 1, 1, "the actual entry-enabled assignment gets four signatures");
+});
+
+test("retargeting falls back to the reporting paragraph when context access is absent", () => {
+  const prompt = teamPrompt(smallRun(), "implementer", undefined, undefined, "claude", ENTRY_PROFILE).replace(contextAccessInstructions(), "");
+  const codexProfile = { ...ENTRY_PROFILE, provider: "codex" as const };
+  const codex = retargetPrompt(prompt, { provider: "codex", profile: codexProfile, role: "implementer", entryTools: false });
+  assert.ok(codex?.includes(`${codexSandboxInstructions}\n\n${codexMemberToolInstructions(false)}\n\n${reportingInstructions("codex")}`));
+  const claude = retargetPrompt(codex!, { provider: "claude", profile: ENTRY_PROFILE, role: "implementer", entryTools: false });
+  assert.ok(claude);
+  assert.doesNotMatch(claude, /Codex sandbox guidance:/);
 });
 
 test("a member context never carries the feature map, the eval block, or routing", () => {
@@ -420,7 +604,7 @@ test("a member context never carries the feature map, the eval block, or routing
   }
 });
 
-// Byte pins: the prompts and contexts of a goal run, with the switch off, equal the output at the base commit.
+// Moved from 31fd3fb3 because INF-343 adds planning and rewrite-review guidance across providers; contexts stay byte-identical.
 const PIN_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"] as const;
 const PIN_CHECKS = [{ command: "npm", args: ["test"] }];
 const PIN_GOAL = { id: "00000000-0000-4000-8000-000000000012", revision: 1, cycle: 1, successCriteria: "Owner success text.", nonGoals: ["Do not change billing."], allowedPaths: ["src"], evidence: [], previousWork: [], deadlineAt: "2026-12-01T00:00:00.000Z", maxMembers: 2 } as NonNullable<TeamRun["goal"]>;
@@ -438,7 +622,7 @@ function pinnedContexts() {
   const run = goalRun();
   return PIN_ROLES.map(role => JSON.stringify(teamContext(run, "Owner feedback excerpt.", { checks: PIN_CHECKS }, role), null, 2));
 }
-const PIN_PROMPTS_SHA256 = "d3c6439e21fad6364731c0bb4e0792ba9c2ca9cb2940d59568be9c994d8877fb";
+const PIN_PROMPTS_SHA256 = "0e41cbab28a8a0a622df32e76613e89ac31b2b2abc732609832b7dc671ab0a60";
 const PIN_CONTEXTS_SHA256 = "9ee8fe8ac898e2d70ddbb012ba398387d526294ea61739fb7aad4385b7a7412b";
 
 test("the switch off keeps every prompt and context byte", () => {

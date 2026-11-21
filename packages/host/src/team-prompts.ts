@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { entryToolsFor } from "./entry-roles.js";
 import { registerText, scopeSentence } from "./register-prompt.js";
+import { outputSchemas } from "./team-mcp-results.js";
 import { TeamError } from "./team-workspace.js";
 import type { BlockerEvidence, TeamMember, TeamModelProfile, TeamProject, TeamRun, TeamScout, TeamTask, TeamPermissionRecoveryStep, TeamPermissionRecoveryView, TeamView } from "./team-types.js";
 import type { Provider } from "./types.js";
@@ -12,6 +13,23 @@ const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
 const profileSuffix = ". These are the host's configured model choices; they do not establish which backend actually served a turn. Do not switch models or change tool permissions.";
 export const profileInstructions = (modelProfile: TeamModelProfile) => `Requested runtime profile: ${JSON.stringify(modelProfile)}${profileSuffix}`;
 export const codexSandboxInstructions = "Codex sandbox guidance: The shell may restrict network access, local listeners, IPC sockets, and Git metadata writes. Prefer operations that work there. When a necessary development operation cannot run in the sandbox, request one-time execution of the complete command within your assigned role and pinned owner scope so the strong coordinator can review it. This includes repository inspection, scoped staging, test planning, builds, tests, and local browser checks when authorized; delivery still requires its separate pinned policy. Never request persistent approval or switch tools to bypass a denial. Report skipped checks and why; the host runs accepted checks after integration.";
+const resultFields = (tool: keyof typeof outputSchemas) => {
+  const schema = outputSchemas[tool];
+  const required = new Set(schema.required ?? []);
+  return Object.keys(schema.properties ?? {}).map(field => `${field}${required.has(field) ? "" : "?"}`).join(", ");
+};
+/** Codex member guidance for concise tool results, with signatures limited to the member's available tools. */
+export const codexMemberToolInstructions = (entryTools: boolean) => {
+  const signatures = [
+    `report({report}) -> {${resultFields("report")}}`,
+    ...(entryTools ? [
+      `entry_list({kinds?, taskId?, path?, since?, limit?}) -> {${resultFields("entry_list")}}`,
+      `entry_get({entryId}) -> {${resultFields("entry_get")}}`,
+      `entry_post({entry}) -> {${resultFields("entry_post")}}`,
+    ] : []),
+  ];
+  return `Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results. When a program lists or reads items, print how many it listed, read, and matched. Read the context file with a shell call inside a program, and select only the fields needed for your next decision. Tool signatures (arguments -> fields of a successful result's structuredContent): ${signatures.join("; ")}.`;
+};
 /** Every member and session reads it: a reject is final, and the same effect is never reached another way. */
 export const permissionRejectInstructions = "A rejected permission request is final for that request. Do not reach the same effect with another tool, command, or route.";
 /** What every asking agent reads about the recommendation its question must carry. */
@@ -306,41 +324,127 @@ export function reportingInstructions(provider: Provider, command = reportComman
   if (provider === "codex") return `You MUST explicitly submit exactly one final structured report by calling the report tool of the infinite_team MCP server with {"report": <the report object matching the above schema>}. Wait for its success receipt. If the tool is unavailable or permission is denied, stop and request user attention. Never use a shell command, direct HTTP, or another tool as a reporting workaround. After a successful report, stop work and wait; the host will stop this member process.`;
   return `You MUST explicitly submit exactly one final structured report. Pipe a JSON object matching the above schema to this command: ${command}. The helper adds the assignment identity and authenticates it. Wait for its success receipt. Do not infer successful reporting from terminal text. If a provider denies the helper or another required tool, stop and request user intervention; do not bypass the denial. OpenCode run mode may reject permission requests without an interactive prompt. After a successful report, stop work and wait; the host will stop this member process.`;
 }
-const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-const [commandHead, commandTail] = reportingInstructions("opencode", "\0").split("\0");
-/** Current MCP paragraphs and helper commands from prompts written by earlier releases. */
-const reportingPattern = () => new RegExp(`${escape(reportingInstructions("claude"))}|${escape(reportingInstructions("codex"))}|${escape(commandHead)}[^\\n]+?${escape(commandTail)}`, "g");
-const profilePattern = new RegExp(`Requested runtime profile: [^\\n]+?${escape(profileSuffix)}`);
-const codexSandboxPattern = () => new RegExp(`(?:^|\\n\\n)?${escape(codexSandboxInstructions)}(?=\\n\\n|$)`, "g");
-/** Refreshes a carried prompt's report channel without changing prompts that have no known paragraph. */
-/** The entry paragraphs of every provider. The "other" form holds the helper's command, which may vary by install. */
-const entryPattern = () => {
-  const [head, tail] = entryInstructions("opencode", "\0").split("\0");
-  return new RegExp(`${escape(entryInstructions("claude"))}|${escape(entryInstructions("codex"))}|${escape(head!)}[^\\n]+?${escape(tail!)}`, "g");
-};
-export function refreshReportingInstructions(prompt: string, provider: Provider) {
-  const withEntry = entryPattern().test(prompt) ? prompt.replace(entryPattern(), () => entryInstructions(provider)) : prompt;
-  return reportingPattern().test(withEntry) ? withEntry.replace(reportingPattern(), () => reportingInstructions(provider)) : withEntry;
+const [reportCommandHead, reportCommandTail] = reportingInstructions("opencode", "\0").split("\0");
+const [entryCommandHead, entryCommandTail] = entryInstructions("opencode", "\0").split("\0");
+const REPORT_PARAGRAPHS = [reportingInstructions("claude"), reportingInstructions("codex")];
+const ENTRY_PARAGRAPHS = [entryInstructions("claude"), entryInstructions("codex")];
+const CONTEXT_PARAGRAPH = contextAccessInstructions();
+const RULE_PARAGRAPHS = [codexMemberToolInstructions(false), codexMemberToolInstructions(true)];
+type PromptParagraphKind = "report" | "entry" | "context" | "sandbox" | "rule" | "profile" | "readonly";
+type PromptLayoutRole = TeamMember["role"];
+type PromptLayout = { report: number; entry?: number; context?: number; profile?: number };
+function commandParagraph(text: string, head: string, tail: string) {
+  if (!text.startsWith(head) || !text.endsWith(tail)) return false;
+  const command = text.slice(head.length, -tail.length);
+  return command.length > 0 && !/[\r\n]/.test(command);
 }
-function refreshCodexSandboxInstructions(prompt: string, provider: Provider) {
-  const withoutPreviousGuidance = prompt.replace(codexSandboxPattern(), "");
-  const permissionCoordinator = /^You are the team's permission-coordinator\./m.test(prompt);
-  if (provider !== "codex" || permissionCoordinator) return withoutPreviousGuidance;
-  const report = reportingInstructions(provider);
-  const contextInstructions = contextAccessInstructions();
-  return withoutPreviousGuidance.includes(contextInstructions)
-    ? withoutPreviousGuidance.replace(contextInstructions, `${codexSandboxInstructions}\n\n${contextInstructions}`)
-    : withoutPreviousGuidance.replace(report, `${codexSandboxInstructions}\n\n${report}`);
+/** Future rule wording variants must be listed by exact paragraph so quoted text stays unclassified. */
+function paragraphKind(text: string | undefined): PromptParagraphKind | undefined {
+  if (text === undefined) return undefined;
+  if (REPORT_PARAGRAPHS.includes(text) || commandParagraph(text, reportCommandHead!, reportCommandTail!)) return "report";
+  if (ENTRY_PARAGRAPHS.includes(text) || commandParagraph(text, entryCommandHead!, entryCommandTail!)) return "entry";
+  if (text === CONTEXT_PARAGRAPH) return "context";
+  if (text === codexSandboxInstructions) return "sandbox";
+  if (RULE_PARAGRAPHS.includes(text)) return "rule";
+  if (text === readOnlyWorkspaceInstructions) return "readonly";
+  const profilePrefix = "Requested runtime profile: ";
+  if (text.startsWith(profilePrefix) && text.endsWith(profileSuffix)) {
+    try { JSON.parse(text.slice(profilePrefix.length, -profileSuffix.length)); return "profile"; }
+    catch { /* A profile paragraph is a complete serialized host profile. */ }
+  }
+  return undefined;
+}
+function promptLayout(paragraphs: string[], role: PromptLayoutRole): PromptLayout | undefined {
+  const kinds = paragraphs.map(paragraphKind);
+  const at = (index: number) => index >= 0 ? kinds[index] : undefined;
+  const reports = kinds.flatMap((kind, index) => kind === "report" ? [index] : []);
+  if (role === "intent-checker") {
+    const contexts = kinds.filter(kind => kind === "context").length;
+    if (contexts > 1) return undefined;
+    const blocks = reports.flatMap(report => {
+      // Without CONTEXT, a previous Codex retarget places its guidance between PROFILE and REPORT.
+      const profile = at(report - 1) === "profile" ? report - 1
+        : contexts === 0 && at(report - 1) === "rule" && at(report - 2) === "sandbox" && at(report - 3) === "profile" ? report - 3
+          : -1;
+      if (profile < 0) return [];
+      const priorShape = at(profile - 1) === "readonly"
+        || (at(profile - 1) === "sandbox" && at(profile - 2) === "readonly");
+      return priorShape ? [{ report, profile }] : [];
+    });
+    if (blocks.length !== 1) return undefined;
+    const { report, profile } = blocks[0]!;
+    const context = kinds.indexOf("context");
+    return { report, profile, ...(context >= 0 ? { context } : {}) };
+  }
+  const profile = at(1) === "profile" ? 1 : undefined;
+  if (role === "permission-coordinator") {
+    return reports.length === 1 ? { report: reports[0]!, ...(profile !== undefined ? { profile } : {}) } : undefined;
+  }
+  const blocks: PromptLayout[] = [];
+  for (let index = 0; index < paragraphs.length; index++) {
+    if (at(index) !== "context") continue;
+    if (at(index + 1) === "report") blocks.push({ context: index, report: index + 1, ...(profile !== undefined ? { profile } : {}) });
+    else if (at(index + 1) === "entry" && at(index + 2) === "report")
+      blocks.push({ context: index, entry: index + 1, report: index + 2, ...(profile !== undefined ? { profile } : {}) });
+  }
+  if (blocks.length === 1) return blocks[0];
+  const contexts = kinds.includes("context");
+  if (contexts) return undefined;
+  if (reports.length !== 1) return undefined;
+  const report = reports[0]!;
+  const entry = at(report - 1) === "entry" ? report - 1
+    : at(report - 1) === "rule" && at(report - 2) === "sandbox" && at(report - 3) === "entry" ? report - 3
+      : at(report - 1) === "sandbox" && at(report - 2) === "entry" ? report - 2
+        : undefined;
+  return { report, ...(profile !== undefined ? { profile } : {}), ...(entry !== undefined ? { entry } : {}) };
+}
+/** Refresh only report and optional entry paragraphs in the assigned role's host block. */
+export function refreshReportingInstructions(prompt: string, provider: Provider, role: TeamMember["role"]) {
+  const paragraphs = prompt.split("\n\n");
+  const layout = promptLayout(paragraphs, role);
+  if (!layout) return prompt;
+  paragraphs[layout.report] = reportingInstructions(provider);
+  if (layout.entry !== undefined) paragraphs[layout.entry] = entryInstructions(provider);
+  return paragraphs.join("\n\n");
+}
+/** Remove or refresh only Codex guidance immediately adjacent to the recognized role anchor. */
+function updateCodexGuidance(paragraphs: string[], role: PromptLayoutRole, provider: Provider, entryTools: boolean) {
+  let layout = promptLayout(paragraphs, role);
+  if (!layout) return false;
+  if (role === "intent-checker" && layout.profile !== undefined
+    && paragraphKind(paragraphs[layout.profile - 1]) === "sandbox"
+    && paragraphKind(paragraphs[layout.profile - 2]) === "readonly") {
+    paragraphs.splice(layout.profile - 1, 1);
+    layout = promptLayout(paragraphs, role);
+    if (!layout) return false;
+  }
+  let anchor = layout.context ?? layout.report;
+  if (paragraphKind(paragraphs[anchor - 2]) === "sandbox" && paragraphKind(paragraphs[anchor - 1]) === "rule") {
+    paragraphs.splice(anchor - 2, 2);
+  } else if (paragraphKind(paragraphs[anchor - 1]) === "sandbox") {
+    paragraphs.splice(anchor - 1, 1);
+  }
+  layout = promptLayout(paragraphs, role);
+  if (!layout) return false;
+  if (provider === "codex" && role !== "permission-coordinator") {
+    anchor = layout.context ?? layout.report;
+    paragraphs.splice(anchor, 0, codexSandboxInstructions, codexMemberToolInstructions(entryTools));
+  }
+  return true;
 }
 /**
  * Points a member's accumulated prompt, feedback and answers included, at another provider and
  * profile. Returns undefined when the prompt lacks a recognizable reporting paragraph or profile
  * line, so a caller never launches a member with another provider's reporting instructions.
  */
-export function retargetPrompt(prompt: string, to: { provider: Provider; profile: TeamModelProfile }) {
-  if (!reportingPattern().test(prompt) || !profilePattern.test(prompt)) return undefined;
-  const retargeted = refreshReportingInstructions(prompt, to.provider).replace(profilePattern, () => profileInstructions(to.profile));
-  return refreshCodexSandboxInstructions(retargeted, to.provider);
+export function retargetPrompt(prompt: string, to: { provider: Provider; profile: TeamModelProfile; role: TeamMember["role"]; entryTools: boolean }) {
+  const paragraphs = prompt.split("\n\n");
+  const layout = promptLayout(paragraphs, to.role);
+  if (!layout || layout.profile === undefined) return undefined;
+  paragraphs[layout.report] = reportingInstructions(to.provider);
+  if (layout.entry !== undefined) paragraphs[layout.entry] = entryInstructions(to.provider);
+  paragraphs[layout.profile] = profileInstructions(to.profile);
+  return updateCodexGuidance(paragraphs, to.role, to.provider, to.entryTools) ? paragraphs.join("\n\n") : undefined;
 }
 /** The coordinator's explore paragraph when the host selects each scout's profile (`hostSelects(run, "scout")`). */
 const HOST_SCOUT_SENTENCE = "The host assigns each scout's profile; omit agentProfileId from scouts.";
@@ -420,6 +524,8 @@ Confirm the remote branch and PR head equal ${run.headCommit}. Confirm required 
     run.delivery && role === "delivery" && !continuedPullRequest(run) ? `If an attempt may have stopped after remote inspection or a delivery failure, inspect the exact configured repository, branch, base branch, and pull request before any write. When the base moved and no publication occurred, report exactly {"kind":"delivery-reconciliation","headCommit":"${run.headCommit}","repository":"${run.delivery.repository}","branch":"${deliveryBranch}","baseHeadCommit":"exact observed base commit","disposition":"no-publication","summary":"What the remote inspection showed"}. For an existing branch at exactly the reviewed head with no PR, use disposition "owned-branch" and include remoteHeadCommit. For an existing PR at exactly the reviewed head, use disposition "pull-request" and include remoteHeadCommit and pullRequestUrl. These are agent-reported observations, not host verification. Never claim no publication from incomplete evidence; never create a duplicate PR, rewrite an owned branch, force-push, or switch credentials/tools. The host may start bounded clean-base recovery only for no-publication evidence; subsequent work must pass checks and independent review again.` : "",
     `Original source commit: ${run.baseCommit}. Current integration commit: ${run.headCommit}. Reviewers must inspect the full git diff from the original source commit to the current integration commit.`,
     roleInstructions,
+    role === "project-manager" ? "When the objective requests an improvement such as faster, smaller, cheaper, or more reliable, include the measured baseline, a numeric target, and the command that measures both in the plan." : "",
+    role === "reviewer" ? "For a rewrite or port, confirm the new behavior was compared with the original using generated inputs, not only hand-picked examples." : "",
     role === "delivery" && publishHeads && run.headCommit && run.publication?.commit === run.headCommit && run.publication.repository === run.delivery?.repository && !continuedPullRequest(run)
       ? `The host has already published ${run.headCommit} to the pinned repository's branch ${run.publication.branch}, so a remote branch already at that exact commit is the expected unchanged head. That host publication alone is not a delivery: if no pull request exists for it and the base moved, report the "no-publication" disposition.` : "",
     role === "project-manager" && !run.goal && !run.handoff
@@ -472,7 +578,7 @@ Confirm the remote branch and PR head equal ${run.headCommit}. Confirm required 
       : role === "delivery"
       ? `The delivery policy is the only publication authority for this assignment. Delivery must use the existing provider tools and permissions. Do not approve or change provider permissions. ${permissionRejectInstructions} If a material scope decision is needed, report a blocker; do not expand scope. A delivery report claims a merge; a delivery-repair report asks the host to reintegrate and repeat checks and review, and does not claim a merge.`
       : `Do not publish, merge, deploy, change repository remotes, or approve provider permissions. ${permissionRejectInstructions} Report a blocking issue or request a user decision when needed. Questions must use {"kind":"question","question":"...","options":["..."],${recommendationExample}}; when feasible, offer concrete selectable options. Omit answerMode for freeform or legacy single-choice behavior; use answerMode "single" for mutually exclusive alternatives, answerMode "multiple" only for compatible choices the owner may select together, and answerMode "approval" only for a real authorization proposal. Approval questions require exactly two options, with the first meaning approve and the second meaning deny; two arbitrary options never imply approval. ${questionRecommendationInstructions} Never choose or approve for the owner. Blockers use {"kind":"blocked","summary":"..."} and may add "blocker":{"cause":{"status":"observed","detail":"..."},"issueRefs":[],"sourceRefs":[],"attemptedFixes":[{"fix":"...","outcome":"..."}],"proposedRecovery":"...","prevention":"...","validationEvidence":[{"sourceRef":"path or check","observation":"..."}]}; cause status is observed, hypothesis, or unknown. Add blocker only with source or check evidence; never include credentials. Independent teammates can continue while a decision is pending.`,
-    provider === "codex" && role !== "permission-coordinator" ? codexSandboxInstructions : "",
+    provider === "codex" && role !== "permission-coordinator" ? `${codexSandboxInstructions}\n\n${codexMemberToolInstructions(entryToolsFor(run, role))}` : "",
     [role === "permission-coordinator" ? "" : contextAccessInstructions(), entryToolsFor(run, role) ? entryInstructions(provider) : ""].filter(Boolean).join("\n\n"),
     reportingInstructions(provider),
   ];

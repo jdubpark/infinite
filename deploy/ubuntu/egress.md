@@ -137,11 +137,7 @@ If the key cannot be read, the host still hands out the proxy address, without a
 
 If `teams.commandPrefix` runs a root-owned launcher that resets the environment, make it keep `HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`, `http_proxy`, `NO_PROXY`, `no_proxy`, and `NODE_USE_ENV_PROXY`. This repository does not ship that launcher, so update the server copy. Otherwise team Git fetches and pushes run as the agent account without the proxy: logged in observe, refused in enforce. Without `teams.commandPrefix`, those commands run as the host account, which the firewall rule does not match, so only the proxy variables route them.
 
-Git's default `http.proxyAuthMethod=anyauth` first opens each HTTPS connection without the credential, so the proxy logs one `unauthenticated` (`missing`) line before every authenticated connection. To send the credential on the first attempt, set it in the system configuration of each git on the host, and again after installing a new git build. A git built with its own prefix reads `PREFIX/etc/gitconfig`; `git config --system --show-origin --list` names the file.
-
-```sh
-sudo git config --system http.proxyAuthMethod basic
-```
+Each Git connection through the proxy logs two lines: one `unauthenticated` (`missing`) line, then the authenticated one. Git's default `http.proxyAuthMethod=anyauth` first connects without the credential. The host runs Git with `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null`, so a system or user Git setting cannot change this. The unauthenticated lines carry no project and open no upstream connection; leave them out when reading the records.
 
 Codex starts stdio MCP servers with a restricted environment. Variables outside its built-in environment are forwarded only when named in that server's `env_vars`, and unset names are omitted. For each owner-configured Codex MCP server that needs egress, add this line to its `[mcp_servers.<server-name>]` table:
 

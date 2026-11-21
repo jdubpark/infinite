@@ -5,13 +5,14 @@ export type DecisionQueueState = {
   decisions: QueueDecision[];
   activeKey?: string;
   selectedAnswers: string[];
-  answeredElsewhere: boolean;
+  /** The decision shown before is no longer in the queue, and it was not answered here. The queue does not say why. */
+  activeLeft: boolean;
 };
 
 export type QueueSelectableOption = { value: string; sessionIndex?: number; role?: string };
 
 export function createDecisionQueueState(decisions: readonly QueueDecision[] = []): DecisionQueueState {
-  return { decisions: [...decisions], activeKey: decisions[0]?.key, selectedAnswers: [], answeredElsewhere: false };
+  return { decisions: [...decisions], activeKey: decisions[0]?.key, selectedAnswers: [], activeLeft: false };
 }
 
 function selectionShape(decision: QueueDecision | undefined): string {
@@ -30,15 +31,15 @@ export function reconcileDecisionQueue(state: DecisionQueueState, decisions: rea
   const previous = state.decisions.find(decision => decision.key === state.activeKey);
   const reset = moved || selectionShape(previous) !== selectionShape(current);
   return { decisions: next, activeKey: active?.key, selectedAnswers: reset ? [] : state.selectedAnswers,
-    answeredElsewhere: moved || (state.answeredElsewhere && state.activeKey === active?.key) };
+    activeLeft: moved || (state.activeLeft && state.activeKey === active?.key) };
 }
 
 export function moveDecisionQueue(state: DecisionQueueState, offset: -1 | 1): DecisionQueueState {
   if (!state.decisions.length) return state;
   const index = state.decisions.findIndex(decision => decision.key === state.activeKey);
   const nextIndex = Math.max(0, Math.min(state.decisions.length - 1, (index < 0 ? 0 : index) + offset));
-  if (nextIndex === index) return { ...state, answeredElsewhere: false };
-  return { ...state, activeKey: state.decisions[nextIndex].key, selectedAnswers: [], answeredElsewhere: false };
+  if (nextIndex === index) return { ...state, activeLeft: false };
+  return { ...state, activeKey: state.decisions[nextIndex].key, selectedAnswers: [], activeLeft: false };
 }
 
 export function removeAnsweredDecision(state: DecisionQueueState, key: string): DecisionQueueState {
@@ -47,27 +48,28 @@ export function removeAnsweredDecision(state: DecisionQueueState, key: string): 
   const decisions = state.decisions.filter(decision => decision.key !== key);
   if (key !== state.activeKey) return { ...state, decisions };
   return { ...state, decisions, activeKey: decisions[Math.min(index, decisions.length - 1)]?.key,
-    selectedAnswers: [], answeredElsewhere: false };
+    selectedAnswers: [], activeLeft: false };
 }
 
-/** How many reads a decision the person answered here stays hidden while the host still lists it. */
-export const ANSWERED_HIDE_READS = 5;
+/** Counted from the answer, the read at which a decision answered here shows again if the host still lists it. */
+export const ANSWERED_RESTORE_READ = 5;
 
 /**
  * Which answered keys stay hidden after a read. Each entry holds the number of the first read that began after the
- * answer was confirmed. It ends when such a read no longer lists the key, or after ANSWERED_HIDE_READS of them: a
- * decision the host still lists then shows again, because the host says it still waits.
+ * answer was confirmed. An entry ends when such a read no longer lists the key. It also ends at the read numbered
+ * ANSWERED_RESTORE_READ among them, if that read still lists the key: the host says the decision still waits, so it
+ * shows again.
  */
 export function settleAnsweredKeys(hidden: ReadonlyMap<string, number>, read: number, listed: ReadonlySet<string>): Map<string, number> {
   const next = new Map<string, number>();
   for (const [key, firstRead] of hidden) {
-    if (read < firstRead || (listed.has(key) && read < firstRead + ANSWERED_HIDE_READS)) next.set(key, firstRead);
+    if (read < firstRead || (listed.has(key) && read < firstRead + ANSWERED_RESTORE_READ - 1)) next.set(key, firstRead);
   }
   return next;
 }
 
 export function selectDecisionAnswers(state: DecisionQueueState, answers: readonly string[]): DecisionQueueState {
-  return { ...state, selectedAnswers: [...answers], answeredElsewhere: false };
+  return { ...state, selectedAnswers: [...answers], activeLeft: false };
 }
 
 export function selectableOptions(decision: QueueDecision | undefined): QueueSelectableOption[] {

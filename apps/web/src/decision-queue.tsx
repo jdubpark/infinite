@@ -30,6 +30,8 @@ export type DecisionQueueViewProps = {
   stale: boolean;
   failed: boolean;
   failureSince?: string;
+  /** True when the host has no decision queue route, so there is nothing to retry. */
+  unavailable: boolean;
   role: Me["role"];
   /** False on a host that takes no prompt answers from a client. */
   promptAnswers: boolean;
@@ -64,7 +66,7 @@ function shorten(text: string) {
  * decision shown: an option is selected first and sent second, and a recommendation only marks an option.
  * Temporary states change words and disabled states in place; they add and remove no lines.
  */
-export function DecisionQueueView({ queue, readAt, current, stale, failed, failureSince, role, promptAnswers, projects, refresh, confirmAnswered, navigateSession, answer }: DecisionQueueViewProps) {
+export function DecisionQueueView({ queue, readAt, current, stale, failed, failureSince, unavailable, role, promptAnswers, projects, refresh, confirmAnswered, navigateSession, answer }: DecisionQueueViewProps) {
   const api = useApi();
   const machine = useMachines().active.id;
   const [state, setState] = useState(() => createDecisionQueueState(queue?.decisions));
@@ -237,7 +239,7 @@ export function DecisionQueueView({ queue, readAt, current, stale, failed, failu
   const activeControlId = controlReady ? control.lease?.id : undefined;
   const selectedSessionOption = active?.kind === "session" && state.selectedAnswers.length ? Number(state.selectedAnswers[0]) : undefined;
   const answerMessage = answerRequest.message && answerRequest.message !== dismissedMessage ? answerRequest.message : "";
-  const noticeShown = Boolean(queue) && (stale || Boolean(answerMessage) || Boolean(pendingAnswer) || state.answeredElsewhere);
+  const noticeShown = Boolean(queue) && (stale || Boolean(answerMessage) || Boolean(pendingAnswer) || state.activeLeft);
 
   return <section className="decision-queue-page" ref={page}>
     <header className="decision-queue-heading">
@@ -246,7 +248,8 @@ export function DecisionQueueView({ queue, readAt, current, stale, failed, failu
       <p className="quiet">Answer one decision at a time, oldest first.</p>
     </header>
 
-    {!queue ? failed ? <section className="decision-queue-message is-error" role="alert">
+    {!queue ? unavailable ? <p className="decision-queue-message" role="status">The decision queue is not available on this host.</p>
+    : failed ? <section className="decision-queue-message is-error" role="alert">
       <strong>The decision queue could not be read.</strong><p>Failing since {clockTime(failureSince)}.</p><button className="text-button" type="button" onClick={refresh}>Try again</button>
     </section> : <p className="decision-queue-message" role="status">Reading decisions…</p>
     : !active ? <section className="decision-queue-empty"><p>No decisions wait on you.</p></section> : <>
@@ -294,7 +297,7 @@ export function DecisionQueueView({ queue, readAt, current, stale, failed, failu
       {stale && <div><span>The decision queue has not refreshed since {clockTime(readAt)}. Answers are off until it does.</span></div>}
       {answerMessage && <div><span>{answerMessage}</span><button type="button" className="decision-queue-dismiss" aria-label="Dismiss notice" onClick={() => setDismissedMessage(answerMessage)}><X size={15} /></button></div>}
       {pendingAnswer && active && active.kind !== "session" && <div><span>Unconfirmed answer: {shorten(pendingAnswer.text)}</span><button type="button" className="text-button" disabled={!canAnswer || busyHere} onClick={() => { void sendAnswer(active, pendingAnswer.text); }}>Retry same answer</button></div>}
-      {state.answeredElsewhere && <div><span>Answered elsewhere.</span></div>}
+      {state.activeLeft && <div><span>The decision shown before is no longer in the queue.</span></div>}
     </div>}
   </section>;
 }

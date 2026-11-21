@@ -169,8 +169,16 @@ one at a time, oldest first. The sidebar says how many wait.
 - A prompt that only its terminal can answer links to that session's terminal.
 - The view reads the queue every 1.8 seconds while it is open, and every 10
   seconds otherwise for the sidebar count. The last queue the host reported
-  stays on screen while a read is in flight or fails, and takes no answers
-  until a read succeeds. After about three seconds without one, the decision
-  dims and a notice says since when the queue has not refreshed.
-- A decision answered here leaves the queue at once. If the host still lists
-  it five reads later, it shows again.
+  stays on screen while a read is in flight or fails.
+- The queue takes answers only while it is the host's current answer. A
+  failed read turns answers off at once. So does a read that has not come
+  back three seconds after it was due. After about three seconds without a
+  current queue, the decision dims, a notice says since when the queue has
+  not refreshed, and the sidebar shows no count.
+- A decision answered here leaves the queue at once. If the fifth read after
+  the answer still lists it, it shows again.
+- A decision that leaves the queue while it is on screen is reported as no
+  longer in the queue. The view does not say that it was answered, because
+  the queue does not say why it left.
+- A host without the queue route gets one line that says the queue is not
+  available there.

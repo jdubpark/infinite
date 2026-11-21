@@ -3,7 +3,7 @@ import test from "node:test";
 import type { Prompt } from "@infinite/attention";
 import type { QueueDecision } from "../apps/web/src/api.ts";
 import {
-  ANSWERED_HIDE_READS, applyDecisionQueueKey, createDecisionQueueState, formatWaitDuration, moveDecisionQueue,
+  ANSWERED_RESTORE_READ, applyDecisionQueueKey, createDecisionQueueState, formatWaitDuration, moveDecisionQueue,
   reconcileDecisionQueue, removeAnsweredDecision, selectableOptions, selectDecisionAnswers, settleAnsweredKeys,
 } from "../apps/web/src/decision-queue-model.ts";
 
@@ -53,23 +53,23 @@ test("own answer removes the active row and advances immediately", () => {
   assert.deepEqual(next.decisions.map(item => item.key), ["a", "c"]);
   assert.equal(next.activeKey, "c");
   assert.deepEqual(next.selectedAnswers, []);
-  assert.equal(next.answeredElsewhere, false);
+  assert.equal(next.activeLeft, false, "an answer given here is not reported as a decision that left");
 });
 
-test("refresh reports another answer and chooses the row at the removed position", () => {
+test("a decision that leaves the queue is reported as gone, and the row at its position becomes active", () => {
   let state = createDecisionQueueState([team("a"), team("b"), team("c")]);
   state = moveDecisionQueue(state, 1);
   state = selectDecisionAnswers(state, ["South"]);
   const next = reconcileDecisionQueue(state, [team("a"), team("c")]);
   assert.equal(next.activeKey, "c");
-  assert.equal(next.answeredElsewhere, true);
+  assert.equal(next.activeLeft, true);
   assert.deepEqual(next.selectedAnswers, []);
   const sameQueue = reconcileDecisionQueue(next, [team("a"), team("c")]);
-  assert.equal(sameQueue.answeredElsewhere, true);
-  assert.equal(moveDecisionQueue(sameQueue, -1).answeredElsewhere, false);
+  assert.equal(sameQueue.activeLeft, true);
+  assert.equal(moveDecisionQueue(sameQueue, -1).activeLeft, false);
   const empty = reconcileDecisionQueue(sameQueue, []);
   assert.equal(empty.activeKey, undefined);
-  assert.equal(empty.answeredElsewhere, true);
+  assert.equal(empty.activeLeft, true);
 });
 
 test("a changed decision revision clears a stale selection while keeping its key active", () => {
@@ -174,10 +174,12 @@ test("an answered decision stays hidden until a read that began after the answer
   assert.deepEqual([...settleAnsweredKeys(hidden, 4, new Set(["a"]))], [["a", 4]], "the host still lists it: hidden for now");
 });
 
-test("an answered decision the host keeps listing shows again", () => {
+test("an answered decision the host still lists at the fifth read after the answer shows again", () => {
+  assert.equal(ANSWERED_RESTORE_READ, 5);
+  // Read 4 is the first read that began after the answer to "a", so read 8 is the fifth.
   const hidden = new Map([["a", 4], ["b", 9]]);
-  assert.deepEqual([...settleAnsweredKeys(hidden, 4 + ANSWERED_HIDE_READS - 1, new Set(["a", "b"]))], [["a", 4], ["b", 9]]);
-  assert.deepEqual([...settleAnsweredKeys(hidden, 4 + ANSWERED_HIDE_READS, new Set(["a", "b"]))], [["b", 9]]);
+  for (const read of [4, 5, 6, 7]) assert.deepEqual([...settleAnsweredKeys(hidden, read, new Set(["a", "b"]))], [["a", 4], ["b", 9]], `read ${read} keeps both hidden`);
+  assert.deepEqual([...settleAnsweredKeys(hidden, 8, new Set(["a", "b"]))], [["b", 9]], "the fifth read shows it again");
   assert.equal(hidden.size, 2, "the input is not changed");
 });
 

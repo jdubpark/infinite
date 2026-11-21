@@ -104,7 +104,7 @@ const INERT_NODE_OPTIONS = [
   /^--dns-result-order=(?:verbatim|ipv4first|ipv6first)$/,
 ];
 /** Shared syntax for leading, wrapper, and declaration assignments, including shell append forms. */
-const ENVIRONMENT_ASSIGNMENT = /^([A-Za-z_][A-Za-z0-9_]*)\+?=(.*)$/s;
+const ENVIRONMENT_ASSIGNMENT = /^([A-Za-z_][A-Za-z0-9_]*)(\+?=)(.*)$/s;
 
 /** Environment assignments that change what code a command or interpreter can run. */
 const CODE_ENVIRONMENT_ASSIGNMENTS: ReadonlyArray<{ names: readonly string[]; raises: (value: string) => boolean }> = [
@@ -157,12 +157,13 @@ const CODE_ENVIRONMENT_ASSIGNMENTS: ReadonlyArray<{ names: readonly string[]; ra
 function isCodeEnvironmentAssignment(word: string): boolean {
   const assignment = ENVIRONMENT_ASSIGNMENT.exec(word);
   if (!assignment) return false;
-  const [, name, value] = assignment;
+  const [, name, operator, value] = assignment;
+  // Appends concatenate with an unknown existing value, so suffix exemptions cannot apply.
   return CODE_ENVIRONMENT_ASSIGNMENTS.some(rule => rule.names.some(pattern => {
     if (!pattern.endsWith("*")) return name === pattern;
     const prefix = pattern.slice(0, -1);
     return name.startsWith(prefix) && name.length > prefix.length;
-  }) && rule.raises(value));
+  }) && (operator === "+=" || rule.raises(value)));
 }
 
 /** Paths an interpreter reads as its standard input, as it reads `-`. */

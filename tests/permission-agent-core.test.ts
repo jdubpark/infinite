@@ -382,27 +382,33 @@ test("declaration builtins read code environment assignments with the same exemp
   assert.ok(readShell("export GIT_SSH_COMMAND=x && git fetch").opaqueReasons.includes("code-environment"));
 });
 
-test("append environment assignments use the same rules at every assignment boundary", () => {
+test("listed environment appends always raise because the resulting value is unknown", () => {
+  const concatenated = "export PYTHONPATH=.; export PYTHONPATH+=.; python -m pytest";
+  assert.ok(readShell(concatenated).opaqueReasons.includes("code-environment"));
+  assert.ok(raise(bash(concatenated), { rejectHistory: false }).includes("raise:opaque"));
+  for (const command of ["PATH_SUFFIX+=x true", "CFLAGS+=-O2 make"])
+    assert.deepEqual(raise(bash(command), { rejectHistory: false }), [], command);
   for (const prefix of ["", "env ", "env -- ", "export ", "declare -x ", "typeset -x ", "readonly "]) {
     const suffix = ["", "env ", "env -- "].includes(prefix) ? " node app.js" : "; npm test";
-    for (const assignment of ["NODE_OPTIONS+=--require=./setup.cjs", "GIT_SSH_COMMAND+=x", "PYTHONPATH+=../lib"]) {
+    for (const assignment of ["NODE_OPTIONS+=--require=./setup.cjs", "GIT_SSH_COMMAND+=x", "PYTHONPATH+=../lib",
+      "GIT_PAGER+=cat", "PYTHONPATH+=src", "GIT_DIR+=.git", "GIT_CONFIG_GLOBAL+=/dev/null", "NODE_OPTIONS+=--no-warnings", "NODE_OPTIONS+="]) {
       const command = `${prefix}${assignment}${suffix}`;
       assert.ok(readShell(command).opaqueReasons.includes("code-environment"), command);
       assert.ok(raise(bash(command), { rejectHistory: false }).includes("raise:opaque"), command);
     }
-    for (const assignment of ["CI+=1", "GIT_PAGER+=cat", "PYTHONPATH+=src", "NODE_OPTIONS+=--no-warnings"])
+    for (const assignment of ["CI+=1", "PATH_SUFFIX+=x", "CFLAGS+=-O2"])
       assert.deepEqual(raise(bash(`${prefix}${assignment}${suffix}`), { rejectHistory: false }), [], `${prefix}${assignment}`);
   }
 });
 
 test("wrapper environment options preserve code environment checks", () => {
   for (const prefix of ["strace -E ", "strace -E", "strace --env ", "strace --env=", "run0 --setenv ", "run0 --setenv="]) {
-    for (const assignment of ["NODE_OPTIONS=--require=./setup.cjs", "NODE_OPTIONS+=--import=./setup.mjs", "GIT_SSH_COMMAND=x"]) {
+    for (const assignment of ["NODE_OPTIONS=--require=./setup.cjs", "NODE_OPTIONS+=--import=./setup.mjs", "NODE_OPTIONS+=--max-old-space-size=4096", "GIT_SSH_COMMAND=x"]) {
       const command = `${prefix}${assignment} node app.js`;
       assert.ok(readShell(command).opaqueReasons.includes("code-environment"), command);
       assert.ok(raise(bash(command), { rejectHistory: false }).includes("raise:opaque"), command);
     }
-    for (const assignment of ["CI=1", "NODE_OPTIONS=--no-warnings", "NODE_OPTIONS+=--max-old-space-size=4096", "GIT_PAGER=cat"]) {
+    for (const assignment of ["CI=1", "PATH_SUFFIX+=x", "NODE_OPTIONS=--no-warnings", "GIT_PAGER=cat"]) {
       const command = `${prefix}${assignment} node app.js`;
       assert.deepEqual(readShell(command).opaqueReasons, [], command);
       assert.ok(!raise(bash(command), { rejectHistory: false }).includes("raise:opaque"), command);

@@ -6,9 +6,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { AddressInfo } from "node:net";
 import express from "express";
+import { createRemoteClient, type RemoteError } from "@infinite/remote";
+import { httpRunner } from "./remote-fixture.js";
 import { EvalJobs } from "../packages/host/src/eval-jobs.js";
 import { evalRoutes } from "../packages/host/src/eval-routes.js";
 import { AREA_COUNTS_SQL, STATE_COUNTS_SQL, SUMMARY_JOBS, VALID_CAPTURED_SQL, evalSummary } from "../packages/host/src/eval-summary.js";
+import { setCounts } from "../packages/host/src/eval-sets.js";
 import { groupStats } from "../packages/host/src/eval-groups.js";
 import { insertMined, minedTaskId } from "../packages/host/src/eval-miner.js";
 import {
@@ -22,8 +25,12 @@ import {
 import { EVAL_MODULE, type Capsule, type CaptureStart, type EvalFeatures, type EvalHostApi, type EvalIdentityState, type EvalRefusal, type GraderState, type MiningStatus } from "../packages/host/src/eval-types.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import type { EvidenceTx } from "../packages/host/src/evidence/types.js";
+import { configurationModule } from "../packages/host/src/configuration-store.js";
 import { TrialJobs } from "../packages/host/src/eval-trial-jobs.js";
-import { evalTrialsModule, insertTrial, trialsSince } from "../packages/host/src/eval-trial-store.js";
+import { ComparisonPass, reportFor } from "../packages/host/src/eval-comparison.js";
+import { readPriors } from "../packages/host/src/eval-priors.js";
+import { configRef, TRIAL_HARNESS_VERSION } from "../packages/host/src/eval-trial-rules.js";
+import { evalTrialsModule, finishTrial, insertTrial, startTrial, trialsSince } from "../packages/host/src/eval-trial-store.js";
 import { outcomeModule, writeOutcome, type OutcomeRow } from "../packages/host/src/outcome-store.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 import type { Config } from "../packages/host/src/types.js";
@@ -54,13 +61,21 @@ const JOB = { kind: "validate", limits: { maxWallMinutes: 60 } };
 const TRIALS_PER_DAY = 6;
 const MODEL = "model-trial-zeta";
 const CLAUDE_TRIAL: TeamModelProfile = { id: "claude-trial", label: "Claude trial", provider: "claude", model: MODEL, effort: "high", tier: "strong" };
+const MODEL_OTHER = "model-trial-eta";
+const CLAUDE_TRIAL_B: TeamModelProfile = { id: "claude-trial-b", label: "Claude trial b", provider: "claude", model: MODEL_OTHER, effort: "high", tier: "strong" };
 const TRIAL_CONFIGURATION = { profile: CLAUDE_TRIAL, guidance: "as-of-base", knowledge: "none" };
+const TRIAL_CONFIGURATION_B = { profile: CLAUDE_TRIAL_B, guidance: "as-of-base", knowledge: "none" };
+const LIMITS = { maxTrials: 100, maxWallMinutes: 60 };
+const COMPARE_JOB = { kind: "compare", configurations: [TRIAL_CONFIGURATION, TRIAL_CONFIGURATION_B], limits: LIMITS };
+const CONFIRM_JOB = { kind: "confirm", configurations: [TRIAL_CONFIGURATION, TRIAL_CONFIGURATION_B], limits: LIMITS };
+const REQUEST_THIRD = "33333333-3333-4333-8333-333333333333";
 const BASELINE_JOB = { kind: "baseline", configurations: [TRIAL_CONFIGURATION], limits: { maxTrials: 10, maxWallMinutes: 60 } };
 const PATCH_TEXT = "patch-text-4c7e";
 const REQUEST = "11111111-1111-4111-8111-111111111111";
 const REQUEST_OTHER = "22222222-2222-4222-8222-222222222222";
 const READ_ROLES = ["owner", "controller", "viewer"];
 const PROJECT_WIDE = "project-wide";
+const PROJECT_PLAIN = "project-plain";
 /** Seventy feature-map areas, sorted so that the last seven are the ones the 64-area cap folds. */
 const WIDE_AREAS = Array.from({ length: 70 }, (_, index) => `area-${String(index).padStart(2, "0")}`);
 
@@ -69,6 +84,7 @@ type Fixture = {
   mining: MiningStatus;
   grader: GraderState;
   api: EvalHostApi;
+  pass: ComparisonPass;
   cleanup: () => void;
 };
 
@@ -92,10 +108,15 @@ function projectConfig() {
   return {
     id: PROJECT, name: PROJECT, path: "/unused/project", source: { mode: "github" },
     team: {
-      eval: { capture: true, mine: true, focusedTest: FOCUSED, reportFormat: "junit", trialsPerDay: TRIALS_PER_DAY, candidateProfiles: [CLAUDE_TRIAL] },
+      eval: { capture: true, mine: true, focusedTest: FOCUSED, reportFormat: "junit", trialsPerDay: TRIALS_PER_DAY, candidateProfiles: [CLAUDE_TRIAL, CLAUDE_TRIAL_B] },
       features: { areas: [{ id: "host", paths: ["packages/host"] }] },
     },
   };
+}
+
+/** A project with no `team.eval`, which behaves as it did before the sets existed. */
+function plainConfig() {
+  return { id: PROJECT_PLAIN, name: PROJECT_PLAIN, path: "/unused/plain", source: { mode: "github" }, team: { features: { areas: [{ id: "host", paths: ["packages/host"] }] } } };
 }
 
 /** A project that does not mine, keeps 1,000 days of records, and has seventy areas. */
@@ -133,13 +154,15 @@ function fixture(options: FixtureOptions = {}): Fixture {
   const corpus = evalCorpusModule(store, () => NOW);
   store.register(options.rollback === true ? { ...corpus, version: 1, readVersion: 1 } : corpus);
   store.register(evalTrialsModule(store, () => NOW));
-  const config = { projects: [projectConfig(), wideConfig()] } as unknown as Pick<Config, "projects" | "eval" | "teams">;
+  store.register(configurationModule());
+  const config = { projects: [projectConfig(), wideConfig(), plainConfig()] } as unknown as Pick<Config, "projects" | "eval" | "teams">;
   const trials = new TrialJobs({ store, config, now: () => NOW });
   const jobs = new EvalJobs({ store, config, now: () => NOW, baseline: trials });
   const fake = {
     mining: waitingMining(), grader: options.grader ?? "not-configured" as GraderState,
     graderVersion: options.graderVersion ?? null, identity: options.identity ?? "not-configured" as EvalIdentityState,
   };
+  const pass = new ComparisonPass({ store, config, now: () => NOW });
   const api: EvalHostApi = {
     summary: async projectId => {
       const project = config.projects.find(item => item.id === projectId);
@@ -154,16 +177,20 @@ function fixture(options: FixtureOptions = {}): Fixture {
     jobs: () => jobs.list(),
     job: jobId => jobs.view(jobId) ?? { status: 404, code: "unknown-job" },
     // The host sends a baseline job to TrialJobs and a validate job to EvalJobs.
-    create: (projectId, request, requestId) => request.kind === "baseline"
-      ? trials.create(projectId, request, requestId)
-      : request.kind === "validate" ? jobs.create(projectId, request, requestId) : { status: 400, code: "invalid-eval-request" },
-    report: () => ({ status: 404, code: "no-report" }),
-    priors: () => ({ status: 404, code: "unknown-project" }),
+    create: (projectId, request, requestId) => request.kind === "validate"
+      ? jobs.create(projectId, request, requestId)
+      : trials.create(projectId, request, requestId),
+    report: jobId => store.read(db => reportFor(db, jobId)),
+    priors: projectId => {
+      const project = config.projects.find(item => item.id === projectId);
+      if (project === undefined) return { status: 404, code: "unknown-project" };
+      return { projectId, priors: store.read(db => readPriors(db, project)) };
+    },
     control: (jobId, action) => jobs.control(jobId, action),
     retire: taskId => retireOwned(store, taskId),
   };
   return {
-    store, api, mining: fake.mining, grader: fake.grader, cleanup: () => {
+    store, api, pass, mining: fake.mining, grader: fake.grader, cleanup: () => {
       store.close();
       rmSync(root, { recursive: true, force: true });
     },
@@ -281,9 +308,13 @@ test("the summary counts every state and keeps unknowns unknown", async () => {
       { area: "other", candidate: 1, valid: 0 },
       { area: "root", candidate: 1, valid: 0 },
     ]);
-    assert.equal(summary.tasks.bySet, null);
+    // The project has `team.eval`, so the sets are counted. Capture drew each run group into a set, so the split is the store's.
+    const sets = f.store.read(db => setCounts(db, db.index("project", PROJECT)));
+    assert.equal(sets.dev + sets.holdout, 1, "the one valid task is in exactly one set");
+    assert.equal(summary.tasks.bySet.dev, sets.dev);
+    assert.equal(summary.tasks.bySet.holdout, sets.holdout);
     const expectedGroups = f.store.read(db => groupStats(db, db.index("project", PROJECT)));
-    assert.deepEqual(summary.groups, { ...expectedGroups, holdout: 0, exposed: 0 });
+    assert.deepEqual(summary.groups, { ...expectedGroups, holdout: sets.holdoutGroups, exposed: sets.exposedGroups });
     assert.equal(summary.capture.on, true);
     assert.equal(summary.mining.on, true);
     assert.equal(summary.mining.visited, null, "no mining row: visited is unknown, never 0");
@@ -620,5 +651,224 @@ test("a baseline job is created and listed", async () => {
   } finally {
     await server.close();
     f.cleanup();
+  }
+});
+
+const taskName = (n: number) => `captured:rt${String(n).padStart(3, "0")}`;
+const groupName = (n: number) => `group-route-${String(n).padStart(3, "0")}`;
+
+/** Valid tasks, each in its own group row, in the holdout set or the dev set. Returns the task ids. */
+function seedSet(f: Fixture, count: number, holdout: boolean, first = 0, projectId = PROJECT): string[] {
+  const ids: string[] = [];
+  f.store.write(tx => {
+    const ref = tx.index("project", projectId);
+    for (let i = first; i < first + count; i += 1) {
+      tx.run(
+        "INSERT INTO eval_groups (group_id, kind, project_ref, root_id, created_at, holdout, set_at) VALUES (?, 'run', ?, ?, ?, ?, ?)",
+        groupName(i), ref, groupName(i), NOW, holdout ? 1 : 0, holdout ? NOW : null,
+      );
+      tx.run(
+        "INSERT INTO eval_tasks (task_id, origin, run_id, member_id, project_ref, state, material, base, captured_at, checked_at, payload, "
+        + "group_id, prompt_origin, area_ref, kind) VALUES (?, 'captured', 'run', 'member', ?, 'valid', 'stored', 'proven', ?, ?, '{}', ?, "
+        + "'assignment', ?, 'bugfix')",
+        taskName(i), ref, NOW, NOW, groupName(i), tx.index("area", "host"),
+      );
+      ids.push(taskName(i));
+    }
+  });
+  return ids;
+}
+
+/** A graded, isolated, final trial of one configuration on one task. */
+function gradeTrial(f: Fixture, jobId: string, taskId: string, configuration: typeof TRIAL_CONFIGURATION, slot: number, resolved: boolean): void {
+  const trialId = randomUUID();
+  f.store.write(tx => {
+    insertTrial(tx, {
+      trialId, jobId, taskId, configRef: configRef(configuration), harness: TRIAL_HARNESS_VERSION, slot, attempt: 0,
+      projectId: PROJECT, configuration, keepDays: 365,
+    } as Parameters<typeof insertTrial>[1], NOW);
+    startTrial(tx, trialId, NOW);
+    finishTrial(tx, trialId, {
+      grade: { ending: "graded", expectedPassed: 1, expectedTotal: 1, guardPassed: true, resolved, overwritten: 0, diff: null, isolation: "isolated" },
+      configId: "config-id", profileEpoch: 1, sessionId: null, patchKeepDays: 90,
+    }, NOW);
+  });
+}
+
+const post = (base: string, body: unknown, requestId: string, role = "owner") =>
+  call(base, "POST", "/api/eval/jobs", role, { projectId: PROJECT, requestId, job: body });
+
+test("a compare job is created, reported, and read", async () => {
+  const f = fixture();
+  const server = await serve(f.api);
+  try {
+    seedSet(f, 4, false);
+    const created = await post(server.base, COMPARE_JOB, REQUEST);
+    assert.equal(created.status, 201);
+    assert.equal(created.body.job.kind, "compare");
+    assert.equal(created.body.job.set, "dev");
+    assert.equal(created.body.job.trials.resolved, null);
+    const jobId: string = created.body.job.jobId;
+
+    const early = await call(server.base, "GET", `/api/eval/jobs/${jobId}/report`, "owner");
+    assert.equal(early.status, 409);
+    assert.equal(early.body.code, "report-not-ready");
+
+    assert.equal((await call(server.base, "POST", `/api/eval/jobs/${jobId}/cancel`, "owner")).status, 200);
+    assert.equal(f.pass.step(), "reported");
+    const report = await call(server.base, "GET", `/api/eval/jobs/${jobId}/report`, "owner");
+    assert.equal(report.status, 200);
+    assert.equal(report.body.pairs.length, 1);
+    const viewer = await call(server.base, "GET", `/api/eval/jobs/${jobId}/report`, "viewer");
+    assert.equal(viewer.status, 200);
+    assert.equal((await call(server.base, "GET", `/api/eval/jobs/${jobId}/report`, "controller")).status, 200);
+    assert.equal((await call(server.base, "GET", `/api/eval/jobs/${jobId}/report`, undefined)).status, 401);
+    assert.equal((await post(server.base, COMPARE_JOB, REQUEST_OTHER, "viewer")).status, 403);
+    assert.equal((await call(server.base, "GET", "/api/eval/jobs/not-a-uuid/report", "owner")).status, 400);
+    assert.equal((await call(server.base, "GET", `/api/eval/jobs/${randomUUID()}/report`, "owner")).status, 404);
+  } finally {
+    await server.close();
+    f.cleanup();
+  }
+});
+
+test("a second confirm answers 409", async () => {
+  const f = fixture();
+  const server = await serve(f.api);
+  try {
+    seedSet(f, 16, true);
+    const first = await post(server.base, CONFIRM_JOB, REQUEST);
+    assert.equal(first.status, 201);
+    assert.equal(first.body.job.kind, "confirm");
+    assert.equal(first.body.job.set, "holdout");
+    assert.equal((await call(server.base, "POST", `/api/eval/jobs/${first.body.job.jobId}/cancel`, "owner")).status, 200);
+    const second = await post(server.base, CONFIRM_JOB, REQUEST_OTHER);
+    assert.equal(second.status, 409);
+    assert.equal(second.body.code, "subject-confirmed");
+    const withIds = await post(server.base, { ...CONFIRM_JOB, taskFilter: { taskIds: [taskName(0)] } }, REQUEST_THIRD);
+    assert.equal(withIds.status, 400);
+  } finally {
+    await server.close();
+    f.cleanup();
+  }
+});
+
+test("the priors route lists the export", async () => {
+  const f = fixture();
+  const server = await serve(f.api);
+  try {
+    const tasks = seedSet(f, 2, false);
+    const created = await post(server.base, BASELINE_JOB, REQUEST);
+    assert.equal(created.status, 201);
+    const jobId: string = created.body.job.jobId;
+    for (const task of tasks) for (let slot = 0; slot < 3; slot += 1) gradeTrial(f, jobId, task, TRIAL_CONFIGURATION, slot, slot === 0);
+    assert.equal((await call(server.base, "POST", `/api/eval/jobs/${jobId}/cancel`, "owner")).status, 200);
+    assert.equal(f.pass.step(), "reported");
+    for (const role of READ_ROLES) {
+      const reply = await call(server.base, "GET", `/api/eval/projects/${PROJECT}/priors`, role);
+      assert.equal(reply.status, 200);
+      assert.equal(reply.body.projectId, PROJECT);
+      assert.equal(reply.body.priors.length, 1);
+      assert.equal(reply.body.priors[0].jobId, jobId);
+      assert.equal(reply.body.priors[0].trials, 6);
+      assert.equal(reply.body.priors[0].resolved, 2);
+    }
+    const unknown = await call(server.base, "GET", "/api/eval/projects/no-such-project/priors", "viewer");
+    assert.equal(unknown.status, 404);
+    assert.equal(unknown.body.code, "unknown-project");
+  } finally {
+    await server.close();
+    f.cleanup();
+  }
+});
+
+test("the summary shows the sets", async () => {
+  const f = fixture();
+  const server = await serve(f.api);
+  try {
+    seedSet(f, 3, false);
+    seedSet(f, 2, true, 3);
+    f.store.write(tx => tx.run("UPDATE eval_groups SET exposed = 1 WHERE group_id = ?", groupName(0)));
+    const reply = await call(server.base, "GET", `/api/eval/projects/${PROJECT}`, "viewer");
+    assert.equal(reply.status, 200);
+    assert.equal(reply.body.tasks.bySet.dev, 3);
+    assert.equal(reply.body.tasks.bySet.holdout, 2);
+    assert.equal(reply.body.groups.holdout, 2);
+    assert.equal(reply.body.groups.exposed, 1);
+    seedSet(f, 1, true, 10, PROJECT_PLAIN);
+    const plain = await call(server.base, "GET", `/api/eval/projects/${PROJECT_PLAIN}`, "viewer");
+    assert.equal(plain.status, 200);
+    assert.equal(plain.body.tasks.bySet, null);
+    assert.equal(plain.body.groups.holdout, 0);
+  } finally {
+    await server.close();
+    f.cleanup();
+  }
+});
+
+test("a report and the priors hold no corpus text", async () => {
+  const f = fixture();
+  const server = await serve(f.api);
+  try {
+    const objective = "Objective-report-2b9d";
+    const tasks = seedSet(f, 3, false);
+    f.store.write(tx => tx.run("UPDATE eval_tasks SET payload = ? WHERE task_id = ?", tx.seal("eval_tasks", tasks[0]!, { objective }), tasks[0]!));
+    const created = await post(server.base, COMPARE_JOB, REQUEST);
+    assert.equal(created.status, 201);
+    const jobId: string = created.body.job.jobId;
+    for (const task of tasks) for (let slot = 0; slot < 3; slot += 1) {
+      gradeTrial(f, jobId, task, TRIAL_CONFIGURATION, slot, slot === 0);
+      gradeTrial(f, jobId, task, TRIAL_CONFIGURATION_B, slot, slot < 2);
+    }
+    assert.equal((await call(server.base, "POST", `/api/eval/jobs/${jobId}/cancel`, "owner")).status, 200);
+    assert.equal(f.pass.step(), "reported");
+    const report = await call(server.base, "GET", `/api/eval/jobs/${jobId}/report`, "owner");
+    const priors = await call(server.base, "GET", `/api/eval/projects/${PROJECT}/priors`, "owner");
+    assert.equal(report.status, 200);
+    assert.equal(priors.status, 200);
+    assert.ok(priors.body.priors.length > 0, "the compare job exported rows");
+    const group = groupName(0);
+    for (const needle of [objective, ...tasks, group, COMMIT, PATCH_TEXT]) {
+      assert.ok(!report.text.includes(needle), `the report holds text of ${needle.length} characters`);
+      assert.ok(!priors.text.includes(needle), `the priors hold text of ${needle.length} characters`);
+    }
+    for (const model of [MODEL, MODEL_OTHER]) {
+      assert.ok(!report.text.includes(model), "the report names no model");
+      assert.ok(priors.text.includes(model), "the priors name the model, as the spec's shape does");
+    }
+  } finally {
+    await server.close();
+    f.cleanup();
+  }
+});
+
+test("an unavailable store answers 503 on the two reads", async () => {
+  const f = fixture({ damaged: true });
+  const server = await serve(f.api);
+  try {
+    for (const path of [`/api/eval/jobs/${randomUUID()}/report`, `/api/eval/projects/${PROJECT}/priors`]) {
+      const reply = await call(server.base, "GET", path, "viewer");
+      assert.equal(reply.status, 503);
+      assert.equal(reply.body.code, "evidence-unavailable");
+    }
+  } finally {
+    await server.close();
+    f.cleanup();
+  }
+});
+
+test("the relay refuses the report and priors reads", async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    // The relay's allow rules name no eval path, so these reads reach the host over a direct connection only.
+    for (const path of [`/eval/jobs/${randomUUID()}/report`, `/eval/projects/${PROJECT}/priors`]) {
+      await assert.rejects(client.request(path), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    }
+    assert.equal(runner.requests.length, 1, "a refused read does not reach the host");
+  } finally {
+    client.close();
+    runner.close();
   }
 });

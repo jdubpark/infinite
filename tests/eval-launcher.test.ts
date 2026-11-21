@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { randomInt } from "node:crypto";
-import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, closeSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -425,8 +425,9 @@ test("stop removes the account's System V objects and its files in the added dir
     assert.equal(leftovers(sb), 0, "the probe counts nothing for a user that owns nothing");
     let writable = true;
     try { accessSync("/run/lock", constants.W_OK); } catch { writable = false; }
-    // `wx` fails on a file that already exists, so the test never takes over, and later removes, a file it did not make.
-    if (writable) { writeFileSync(lockFile, "x", { flag: "wx" }); created = true; }
+    // `wx` fails on a file that already exists, so the test never takes over, and later removes, a file it did not
+    // make. Nothing is written, so no failed write can leave a file that cleanup does not know about.
+    if (writable) { closeSync(openSync(lockFile, "wx")); created = true; }
     else t.diagnostic("/run/lock is not writable by the test user, so the file in it is not asserted");
     const made = spawnSync("/usr/bin/ipcmk", ["-M", "4096"], { encoding: "utf8" });
     assert.equal(made.status, 0, made.stderr);
@@ -435,8 +436,8 @@ test("stop removes the account's System V objects and its files in the added dir
     // The probe reports the segment, and the file when there is one, as leftovers.
     assert.equal(leftovers(sb), writable ? 2 : 1, "the probe counts the account's shared memory and its file, and nothing else");
     // The last look before stop, again without the launcher: the user owns what the test made and nothing else. From
-    // here to the removal the copy starts a shell and reads the tables, with no wait, so stop can take only an
-    // object that some other process of the user makes in those few milliseconds.
+    // here to the removal the copy starts a shell and a few commands and reads the tables, with no wait, so stop can
+    // take only an object that some other process of the user makes in that short time.
     assert.deepEqual(ownSysV(), [`shm:${segment}`], "the user owns the test's segment and no other System V object");
     assert.deepEqual(ownEntries("/run/lock"), writable ? [lockFile] : [], "the user owns the test's file in /run/lock and nothing else there");
 
@@ -448,9 +449,12 @@ test("stop removes the account's System V objects and its files in the added dir
     assert.equal(leftovers(sb), 0);
   } finally {
     // Only what the test made, and the segment only while the kernel still lists that id as the user's.
-    if (segment && ownSysV().includes(`shm:${segment}`)) spawnSync("/usr/bin/ipcrm", ["-m", segment]);
-    if (created) rmSync(lockFile, { force: true });
-    cleanup(sb);
+    try {
+      if (segment && ownSysV().includes(`shm:${segment}`)) spawnSync("/usr/bin/ipcrm", ["-m", segment]);
+    } finally {
+      if (created) rmSync(lockFile, { force: true });
+      cleanup(sb);
+    }
   }
 });
 
@@ -459,14 +463,18 @@ test("the probe counts the test user's System V objects as the kernel lists them
   // skips. Its own shared directory is empty, so the probe's count is the user's System V objects alone.
   const sb = sandbox(undefined, { kernelTables: true });
   try {
+    // Another process of the user can make or remove an object while the probe runs. A round counts only when the
+    // user's objects were the same before and after it, and even then an object that came and went in between can
+    // put the probe one off. So one round that agrees passes, and the test fails only when every such round disagreed.
+    const disagreed: string[] = [];
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const before = ownSysV(), counted = leftovers(sb), after = ownSysV();
-      // Another process of the user made or removed an object during the probe: count again.
       if (before.join() !== after.join()) continue;
-      assert.equal(counted, before.length, "the probe counts the user's objects, and no other user's");
-      return;
+      if (counted === before.length) return;
+      disagreed.push(`${counted} for ${before.length}`);
     }
-    t.skip("the test user's System V objects changed during every probe");
+    if (disagreed.length === 0) { t.skip("the test user's System V objects changed during every probe"); return; }
+    assert.fail(`the probe counts the user's objects, and no other user's: it counted ${disagreed.join(", ")}`);
   } finally {
     cleanup(sb);
   }

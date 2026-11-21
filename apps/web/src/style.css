@@ -1206,11 +1206,12 @@ small,
 }
 
 /* Agent teams share the journal frame while keeping their work and evidence distinct. */
-.workspace-navigation { display: flex; gap: 4px; padding: 14px 8px 0; }
-/* Icon above label, sized to the label: five views fit the sidebar without squeezing the icons out. */
-.workspace-navigation button { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; flex: 1 1 auto; min-width: 0; min-height: 44px; padding: 6px 2px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); font-size: 11px; }
+.workspace-navigation { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; padding: 14px 8px 0; }
+/* Three columns keep the decision count readable without changing the sidebar height when it appears. */
+.workspace-navigation button { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; min-width: 0; height: 72px; padding: 6px 2px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); font-size: 11px; }
 .workspace-navigation button svg { flex: none; }
 .workspace-navigation button[aria-current="page"] { background: #dce3d5; color: var(--green); font-weight: 600; }
+.workspace-navigation .decision-nav-count { min-height: 1.1em; font-size: 10px; line-height: 1.1; }
 .team-page { width: 100%; max-width: 1120px; margin: 0 auto; padding: 46px 42px; overflow: auto; min-height: 0; }
 .team-page-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 28px; margin-bottom: 30px; }
 .team-page-heading > div { max-width: 600px; }
@@ -1332,6 +1333,8 @@ small,
 .team-recommendation > .quiet { font-size: 11px; color: #724314; margin: 0 0 4px; }
 .team-recommendation > .team-prose { margin: 0; font-size: 14px; }
 .team-recommendation > .team-prose + .quiet { margin: 4px 0 0; }
+.team-decision-readonly-options { margin: 16px 0 0; padding-left: 22px; color: var(--muted); font-size: 13px; line-height: 1.8; }
+.team-decision-readonly-options li { overflow-wrap: anywhere; }
 .team-decision-options button.recommended { border-color: var(--green); }
 .team-recommended-tag { margin-left: 8px; font-size: 11px; color: var(--green); }
 .team-session-link { width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 14px; text-align: left; border: 0; border-bottom: 1px solid var(--rule); background: transparent; min-height: 60px; padding: 14px 0; }

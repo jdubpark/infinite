@@ -19,6 +19,10 @@ One model feeds three views. Switching between them does not refetch.
 | Wall | `#/swarm/wall` | One fixed-size tile per agent: role, model, state, activity, tool in flight, cost. |
 | Graph | `#/swarm/graph` | Every live swarm beside the code areas its agents touched, with links between them. |
 
+## Decisions view
+
+The web client's `#/decisions` view reads `GET /api/decision-queue` and shows one waiting decision at a time, oldest first. Answers go through the existing session, team, or mission route; recommendations never answer for the owner. A terminal-only prompt links back to its session terminal.
+
 Cost counts measured usage only. A cost ends in `+` when some agents of that
 run, mission, or the solo group have no usage data, and a dash replaces it when
 no measured usage gives a figure.

@@ -1,6 +1,6 @@
 import { createContext, useContext } from "react";
 import { createRemoteClient, RemoteError, sessionListReader } from "@infinite/remote";
-import type { Attention } from "@infinite/attention";
+import type { Attention, Prompt } from "@infinite/attention";
 export type Connection = { id: string; label: string; url: string; token: string; relay?: { machineId: string } };
 export type ControlLease = { id: string; label: string; expiresAt: number };
 export type Session = {
@@ -30,6 +30,19 @@ export type Session = {
   /** Set while a mission coordinator runs this session; people may only answer its provider prompts. */
   managedBy?: { kind: "mission"; missionId: string; teamId?: string };
 };
+export type DecisionRecommendation = { answers: string[]; reason: string; outcome?: "matched" | "different" | "other" };
+export type QueueOrigin = { id: string; title: string; projectId?: string; team?: { id: string; title: string; role: string } };
+export type QueueDecisionRecord = {
+  id: string; question: string; options: string[]; answerMode?: "approval" | "single" | "multiple"; createdAt: string;
+  revision?: number; memberId?: string; answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator" | "connector";
+  source?: { kind: "connector"; id: string; name: string }; intentQuestions?: string[]; subtaskId?: string; childDecisionId?: string;
+  recommendation?: DecisionRecommendation;
+};
+export type QueueDecision =
+  | { kind: "session"; key: string; since: string; origin: QueueOrigin; answerPath: string; prompt: Prompt; terminalOnly?: true }
+  | { kind: "team"; key: string; since: string; origin: QueueOrigin; answerPath: string; revision: number; decision: QueueDecisionRecord; held?: true }
+  | { kind: "mission"; key: string; since: string; origin: QueueOrigin; answerPath: string; revision: number; decision: QueueDecisionRecord };
+export type DecisionQueue = { decisions: QueueDecision[] };
 export type LogEvent = {
   seq: number;
   at: string;
@@ -158,6 +171,7 @@ export async function api<T>(
     clearTimeout(timeout);
   }
 }
+export const getDecisionQueue = (request: Api = api) => request<DecisionQueue>("/decision-queue");
 export const names: Record<string, string> = {
   claude: "Claude Code",
   codex: "Codex",
@@ -169,6 +183,10 @@ export const names: Record<string, string> = {
 export type Api = typeof api;
 export const ApiContext = createContext<Api>(api);
 export const useApi = () => useContext(ApiContext);
+export function postDecisionAnswer<T>(request: Api, answerPath: string, body: { requestId: string; revision: number; text: string }) {
+  const path = answerPath.startsWith("/api/") ? answerPath.slice(4) : answerPath;
+  return request<T>(path, body);
+}
 const sessionReaders = new WeakMap<Api, ReturnType<typeof sessionListReader<Session>>>();
 /** The host's session list. Each read names the version of the rows this API read last, so an unchanged list answers with its version alone. */
 export function readSessions(api: Api): Promise<Session[]> {

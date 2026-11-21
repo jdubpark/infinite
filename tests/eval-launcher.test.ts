@@ -287,6 +287,38 @@ test("nothing outlives a trial", { skip: SKIP }, () => {
   }
 });
 
+// Runs the launcher from a directory its account cannot enter, as a caller in another account's home does.
+function fromClosed(sb: Sandbox, args: readonly string[]) {
+  const closed = mkdtempSync(join(sb.dir, "closed-"));
+  return spawnSync("/bin/sh", ["-c", 'cd "$1" && chmod 000 . && shift && exec /bin/sh "$@"', "sh", closed, sb.script, ...args], {
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },
+    maxBuffer: 1 << 20,
+    timeout: 120_000,
+  });
+}
+
+test("probe, clean, and scrub work from a directory the account cannot enter", { skip: SKIP }, () => {
+  const sb = sandbox();
+  try {
+    writeFileSync(join(sb.tmp, "solution.txt"), "x");
+    writeFileSync(join(sb.home, "planted"), "x");
+    const probe = fromClosed(sb, ["probe", "--"]);
+    assert.equal(probe.status, 0, probe.stderr.toString("utf8"));
+    assert.equal(probe.stderr.toString("utf8"), "");
+    assert.equal(JSON.parse(probe.stdout.toString("utf8")).leftovers, 2);
+
+    const cleaned = fromClosed(sb, ["clean"]);
+    assert.equal(cleaned.status, 0, cleaned.stderr.toString("utf8"));
+    assert.equal(existsSync(join(sb.tmp, "solution.txt")), false);
+    const scrubbed = fromClosed(sb, ["scrub"]);
+    assert.equal(scrubbed.status, 0, scrubbed.stderr.toString("utf8"));
+    assert.equal(existsSync(join(sb.home, "planted")), false);
+    assert.equal(leftovers(sb), 0);
+  } finally {
+    cleanup(sb);
+  }
+});
+
 test("stop refuses another account", { skip: SKIP }, async () => {
   const sb = sandbox(`not-${userInfo().username}`);
   const sleeper = spawn("sleep", [String(randomInt(100_000, 900_000))], { stdio: "ignore" });

@@ -182,6 +182,31 @@ test("clean and remove empty a read-only tree", { skip: SKIP }, () => {
   }
 });
 
+test("clean and remove work from a directory the account cannot enter", { skip: SKIP }, () => {
+  const sb = sandbox();
+  // Runs the launcher from a closed directory, as a caller in another account's home does.
+  const fromClosed = (args: readonly string[]) => {
+    const closed = mkdtempSync(join(sb.dir, "closed-"));
+    return spawnSync("/bin/sh", ["-c", 'cd "$1" && chmod 000 . && shift && exec /bin/sh "$@"', "sh", closed, sb.script, ...args], {
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },
+      maxBuffer: 1 << 20,
+      timeout: 60_000,
+    });
+  };
+  try {
+    assert.equal(grader(sb, ["receive", JOB, "base.bundle", "1000"], { input: "bundle-bytes" }).status, 0);
+    mkdirSync(join(sb.root, "node_modules"));
+    const cleaned = fromClosed(["clean", JOB]);
+    assert.equal(cleaned.status, 0, cleaned.stderr.toString("utf8"));
+    assert.equal(existsSync(join(sb.root, "node_modules")), false);
+    const removed = fromClosed(["remove", JOB]);
+    assert.equal(removed.status, 0, removed.stderr.toString("utf8"));
+    assert.equal(existsSync(join(sb.root, "jobs", JOB)), false);
+  } finally {
+    cleanup(sb);
+  }
+});
+
 test("receive and read keep their limits", { skip: SKIP }, () => {
   const sb = sandbox();
   try {

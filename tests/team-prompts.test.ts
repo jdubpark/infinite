@@ -399,6 +399,19 @@ test("the entry paragraph is the only change and only with tools on", () => {
   }
 });
 
+test("planning and rewrite-review guidance is limited to its role across providers", () => {
+  const improvementPlan = "When the objective requests an improvement such as faster, smaller, cheaper, or more reliable, include the measured baseline, a numeric target, and the command that measures both in the plan.";
+  const generatedRewriteReview = "For a rewrite or port, confirm the new behavior was compared with the original using generated inputs, not only hand-picked examples.";
+  for (const provider of ENTRY_PROVIDERS) {
+    const profile = { ...ENTRY_PROFILE, provider };
+    for (const role of MEMBER_ROLES_UNDER_TEST) {
+      const prompt = teamPrompt(smallRun(), role, undefined, undefined, provider, profile);
+      assert.equal(prompt.split(improvementPlan).length - 1, role === "project-manager" ? 1 : 0, `${role} ${provider} planning guidance`);
+      assert.equal(prompt.split(generatedRewriteReview).length - 1, role === "reviewer" ? 1 : 0, `${role} ${provider} rewrite-review guidance`);
+    }
+  }
+});
+
 test("Codex tool guidance follows provider, role, and available entry tools", () => {
   for (const provider of ENTRY_PROVIDERS) {
     const profile = { ...ENTRY_PROFILE, provider };
@@ -489,7 +502,7 @@ test("a member context never carries the feature map, the eval block, or routing
   }
 });
 
-// Byte pins: Codex member prompts include the tool-output rule and available signatures; contexts stay byte-identical.
+// Moved from 31fd3fb3 because INF-343 adds planning and rewrite-review guidance across providers; contexts stay byte-identical.
 const PIN_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"] as const;
 const PIN_CHECKS = [{ command: "npm", args: ["test"] }];
 const PIN_GOAL = { id: "00000000-0000-4000-8000-000000000012", revision: 1, cycle: 1, successCriteria: "Owner success text.", nonGoals: ["Do not change billing."], allowedPaths: ["src"], evidence: [], previousWork: [], deadlineAt: "2026-12-01T00:00:00.000Z", maxMembers: 2 } as NonNullable<TeamRun["goal"]>;
@@ -507,7 +520,7 @@ function pinnedContexts() {
   const run = goalRun();
   return PIN_ROLES.map(role => JSON.stringify(teamContext(run, "Owner feedback excerpt.", { checks: PIN_CHECKS }, role), null, 2));
 }
-const PIN_PROMPTS_SHA256 = "31fd3fb30819c9999bb9cb49acf5790dc6b5cce4377a30dcfd89556e8895e580";
+const PIN_PROMPTS_SHA256 = "b1529a6a1d41fcaf2f6a85a72c551481ef066341404225fbe7078e5151a93a52";
 const PIN_CONTEXTS_SHA256 = "9ee8fe8ac898e2d70ddbb012ba398387d526294ea61739fb7aad4385b7a7412b";
 
 test("the switch off keeps every prompt and context byte", () => {

@@ -42,6 +42,8 @@ export class TeamReviewFeedback {
   private enabledAt?: string;
   private lastPoll = 0;
   private running?: Promise<void>;
+  /** The one pass waiting for the running one. */
+  private next?: { watch: boolean; done: Promise<void> };
   private stopTick?: () => void;
   private closed = false;
   /** Ends a read in flight at close; after close, nothing is saved or steered (checked after every wait). */
@@ -74,31 +76,42 @@ export class TeamReviewFeedback {
   }
   /** Stops the timer and the read in flight. Resolves once the current pass has ended. */
   close() { this.closed = true; this.stopTick?.(); this.abort.abort(); return this.settled(); }
-  /** Resolves when no pass is running. */
-  settled(): Promise<void> { return this.running ?? Promise.resolve(); }
+  /** Resolves when no pass is running or waiting. */
+  settled(): Promise<void> { return this.next?.done ?? this.running ?? Promise.resolve(); }
   /** One pass over every run: drain its pending intents, then read its pull request. */
   poll() {
     this.lastPoll = this.host.now();
     return this.pass(true);
   }
 
-  /** Passes run one at a time; a poll that arrives during the startup drain runs after it instead of being lost. */
-  private async pass(watch: boolean): Promise<void> {
-    while (this.running) await this.running;
-    this.running = (async () => {
-      const settings = this.settings();
-      if (!settings || !this.enabledAt || this.closed) return;
-      for (const id of [...this.host.records.keys()]) {
-        if (this.closed) return;
-        try {
-          await this.drain(id, settings.ownerLogin, this.enabledAt);
-          if (watch) await this.watch(id, settings.ownerLogin, this.enabledAt);
-        } catch (error) {
-          console.warn("Review feedback could not process a run; it is retried at the next interval.", error instanceof Error ? error.message : "unknown error");
-        }
-      }
-    })().finally(() => { this.running = undefined; });
+  /**
+   * Passes run one at a time. Every request made while one runs, the startup drain included, joins a single next pass,
+   * which watches when any of them asked it to, so a slow read never queues a backlog of passes.
+   */
+  private pass(watch: boolean): Promise<void> {
+    if (this.next) { this.next.watch ||= watch; return this.next.done; }
+    if (!this.running) return this.begin(watch);
+    const next = { watch, done: Promise.resolve() };
+    next.done = this.running.then(() => { this.next = undefined; return this.begin(next.watch); });
+    this.next = next;
+    return next.done;
+  }
+  private begin(watch: boolean) {
+    this.running = this.run(watch).finally(() => { this.running = undefined; });
     return this.running;
+  }
+  private async run(watch: boolean) {
+    const settings = this.settings();
+    if (!settings || !this.enabledAt || this.closed) return;
+    for (const id of [...this.host.records.keys()]) {
+      if (this.closed) return;
+      try {
+        await this.drain(id, settings.ownerLogin, this.enabledAt);
+        if (watch) await this.watch(id, settings.ownerLogin, this.enabledAt);
+      } catch (error) {
+        console.warn("Review feedback could not process a run; it is retried at the next interval.", error instanceof Error ? error.message : "unknown error");
+      }
+    }
   }
 
   /** Each pending intent: a receipt acknowledges it; otherwise, unless the owner's halt holds it, GitHub decides whether its steer runs. */

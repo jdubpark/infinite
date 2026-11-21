@@ -266,6 +266,42 @@ test("a held review whose pull request is retargeted before the halt lifts start
   }
 });
 
+test("polls that arrive while a pass is slow coalesce into one more pass", async () => {
+  for (const phase of ["watch", "startup drain"] as const) {
+    const f = schedulerFixture();
+    try {
+      const gh = delivered(f), review = gh.review("PRR_1", owner, "CHANGES_REQUESTED");
+      let feedback: TeamReviewFeedback, first: Promise<void> | undefined, before: number;
+      if (phase === "watch") {
+        gh.show([]);
+        feedback = poller(f.openTeam());
+        await feedback.start();
+        before = gh.commands().length;
+        gh.gate();
+        first = feedback.poll();
+      } else {
+        // A review accepted under a halt is drained by the next host; GitHub has since shown a newer approval.
+        gh.show([review]);
+        const held = f.openTeam(), heldFeedback = poller(held);
+        held.useFuse({ held: () => ({ reason: "halt" }) } as unknown as FuseGate);
+        await heldFeedback.start();
+        await heldFeedback.poll();
+        await held.close();
+        gh.show([review, { ...gh.review("PRR_2", owner, "APPROVED", "Looks good."), submittedAt: new Date(Date.now() + 120_000).toISOString() }]);
+        before = gh.commands().length;
+        gh.gate();
+        feedback = poller(f.openTeam());
+        first = feedback.start();
+      }
+      await until(() => gh.commands().length === before + 1);
+      const more = [feedback.poll(), feedback.poll(), feedback.poll()];
+      gh.release();
+      await Promise.all([first, ...more]);
+      assert.equal(gh.commands().length - before, 2, `${phase}: three requests during a slow pass run one more pass`);
+    } finally { f.close(); }
+  }
+});
+
 test("closing the host while a pull request read runs saves nothing and steers nothing", async () => {
   for (const phase of ["watch", "drain"] as const) {
     const f = schedulerFixture();

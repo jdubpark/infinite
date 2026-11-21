@@ -31,7 +31,9 @@ test("a stopped bundle pull ends a writer outside the host's group kill", { time
     await reader.read().catch(() => undefined);
 
     const cause = await waitFor(async () => ended(), text => text !== "", 10000).catch(() => "");
-    assert.equal(cause, "EPIPE", "the closed pipe ended the writer after the pull stopped");
+    // The writer's stdout is one end of a socket pair. When the host closes the other end with bytes still unread,
+    // macOS answers the writer's next write with EPIPE, and Linux with EPIPE or ECONNRESET, by where the write was.
+    assert.ok(["EPIPE", "ECONNRESET"].includes(cause), `the closed pipe ended the writer after the pull stopped; the writer recorded '${cause}'`);
   } finally {
     // Closing the fixture ends the host, which holds the only other end of the pipe, so a writer that is still
     // blocked ends here too.

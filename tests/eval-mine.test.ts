@@ -78,7 +78,7 @@ test("the mining forms are exact and checked", async () => {
     assert.equal((await git.numstat(mirror, base, to)).state, "read");
     assert.deepEqual(argv(), ["git", ...teamGitArgs(mirror, numstatArgs(base, to))]);
 
-    assert.deepEqual(messageArgs(to), ["log", "--no-walk=unsorted", "--no-show-signature", "--no-notes", "--encoding=UTF-8", "--format=%ct%x00%B", to]);
+    assert.deepEqual(messageArgs(to), ["log", "--no-walk=unsorted", "--no-show-signature", "--no-notes", "--encoding=UTF-8", "--format=%ct%x00%B", to, "--"]);
     assert.equal((await git.message(mirror, to)).state, "read");
     assert.deepEqual(argv(), ["git", ...teamGitArgs(mirror, messageArgs(to))]);
 
@@ -97,6 +97,8 @@ test("the mining forms are exact and checked", async () => {
     assert.equal(await git.present(mirror, to), "yes");
     assert.deepEqual(argv(), ["git", ...teamGitArgs(mirror, ["log", "--no-walk=unsorted", "--no-show-signature", "--format=%H %T %P", to])]);
     assert.equal(await git.present(mirror, ABSENT), "no", "Git ran and holds no such commit");
+    // An id of the mirror's other hash length is never read as a path: the read fails.
+    assert.deepEqual(await git.message(mirror, "e".repeat(to.length === 40 ? 64 : 40)), { state: "failed" });
 
     // A malformed id never reaches an argument.
     for (const bad of ["HEAD", "-x", FAKE_HEX]) {

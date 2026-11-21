@@ -18,9 +18,9 @@ export function numstatArgs(parent: string, commit: string): string[] {
   return ["diff", "--no-ext-diff", "--no-textconv", "--numstat", "--no-renames", "--ignore-submodules=none", "--diff-algorithm=myers", "-z", commitId(parent), commitId(commit), "--"];
 }
 
-/** E2. The committer time and the message of one commit, as `SECONDS NUL BODY`. */
+/** E2. The committer time and the message of one commit, as `SECONDS NUL BODY`. The closing `--` keeps Git from reading an id it does not hold as a path. */
 export function messageArgs(commit: string): string[] {
-  return ["log", "--no-walk=unsorted", "--no-show-signature", "--no-notes", "--encoding=UTF-8", "--format=%ct%x00%B", commitId(commit)];
+  return ["log", "--no-walk=unsorted", "--no-show-signature", "--no-notes", "--encoding=UTF-8", "--format=%ct%x00%B", commitId(commit), "--"];
 }
 
 /** Form 1. */

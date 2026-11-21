@@ -6,7 +6,7 @@ import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceDb, EvidenceTx } from "./evidence/types.js";
 import { validationSettings, type EvalGraderConfig, type ValidationSettings } from "./eval-config.js";
 import type { GraderProbe } from "./eval-grader.js";
-import type { BaselineJobView, EvalJobReason, EvalJobView, EvalJobWait, EvalRefusal, ValidateJobRequest } from "./eval-types.js";
+import type { EvalJobReason, EvalJobView, EvalJobWait, EvalRefusal, ValidateJobRequest } from "./eval-types.js";
 import type { TaskValidation } from "./eval-validate.js";
 import type { RoutineStatus } from "./routine-types.js";
 import type { Config } from "./types.js";
@@ -85,7 +85,7 @@ const NONE: NextWork = { kind: "none" };
 
 /** The baseline job's views and resume digest, supplied by TrialJobs for rows of kind `baseline`. */
 export type BaselineJobHooks = {
-  views(db: EvidenceDb, rows: readonly EvalJobRow[]): Map<string, BaselineJobView>;
+  views(db: EvidenceDb, rows: readonly EvalJobRow[]): Map<string, EvalJobView>;
   digest(projectId: string, jobId: string): string | undefined;
 };
 
@@ -171,7 +171,7 @@ export class EvalJobs {
         if (row.status === "blocked") {
           // The owner's resume approves the configuration as it is now, so the job pins the current digest.
           const projectId = this.refs(tx).get(row.project_ref);
-          const digest = projectId === undefined ? undefined : row.kind === "baseline"
+          const digest = projectId === undefined ? undefined : row.kind !== "validate"
             ? this.baseline?.digest(projectId, jobId) : this.pinnedDigest(projectId)?.digest;
           if (digest === undefined || projectId === undefined) return refusal(409, "eval-config-incomplete");
           const payload = tx.open<JobPayload>("eval_jobs", jobId, row.payload);
@@ -380,8 +380,8 @@ export class EvalJobs {
 
   /** Validate rows take `viewWith`; baseline rows take the views of TrialJobs, read once for the page. */
   private viewsOf(db: EvidenceDb, rows: readonly JobRow[], refs: Map<string, string>): EvalJobView[] {
-    const baseline = this.baseline?.views(db, rows.filter(row => row.kind === "baseline"));
-    return rows.map(row => (row.kind === "baseline" ? baseline?.get(row.job_id) : undefined)
+    const baseline = this.baseline?.views(db, rows.filter(row => row.kind !== "validate"));
+    return rows.map(row => (row.kind !== "validate" ? baseline?.get(row.job_id) : undefined)
       ?? viewWith(row, refs.get(row.project_ref) ?? null));
   }
 

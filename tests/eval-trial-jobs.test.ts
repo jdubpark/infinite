@@ -10,12 +10,13 @@ import type { Provider } from "../packages/host/src/types.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 import type { EvalProbe } from "../packages/host/src/eval-identity.js";
 import type { GraderProbe } from "../packages/host/src/eval-grader.js";
-import type { BaselineJobRequest, EvalRefusal, TrialConfiguration, TrialGrade } from "../packages/host/src/eval-types.js";
+import type { BaselineJobRequest, ComparisonJobRequest, EvalRefusal, TrialConfiguration, TrialGrade } from "../packages/host/src/eval-types.js";
 import { evalCorpusModule } from "../packages/host/src/eval-store.js";
 import { ACTIVE_JOBS_SQL, ACTIVE_PROJECT_JOBS_SQL, EvalJobs } from "../packages/host/src/eval-jobs.js";
 import {
   BASELINE_JOBS_SQL,
   TrialJobs,
+  type NextTrial,
   type TrialGates,
 } from "../packages/host/src/eval-trial-jobs.js";
 import {
@@ -23,9 +24,11 @@ import {
   finishTrial,
   insertTrial,
   liveTrials,
+  openTrialCounts,
   startTrial,
 } from "../packages/host/src/eval-trial-store.js";
-import { configRef, TRIAL_HARNESS_VERSION } from "../packages/host/src/eval-trial-rules.js";
+import { configRef, TRIAL_HARNESS_VERSION, trialProfileKey } from "../packages/host/src/eval-trial-rules.js";
+import { advanceEpoch, configurationModule } from "../packages/host/src/configuration-store.js";
 
 const DAY_MS = 86_400_000;
 const START = Date.parse("2026-11-16T10:00:00.000Z");
@@ -78,6 +81,7 @@ function fixture() {
   const now = () => new Date(clock).toISOString();
   store.register(evalCorpusModule(store, now));
   store.register(evalTrialsModule(store, now));
+  store.register(configurationModule());
   const config = {
     projects: [
       project(PROJECT, { mine: true, focusedTest: FOCUSED, reportFormat: "junit", trialsPerDay: 1 }),
@@ -440,6 +444,256 @@ test("a job ends done at maxTasks and expired at its expiry time", async () => {
     f.setClock(START + 3_600_000);
     assert.deepEqual(await f.trial.next(f.gates()), { kind: "none" }, "a job is expired at its expiry time");
     assert.equal(f.jobs.view(second.job.jobId)?.status, "expired");
+  } finally {
+    f.cleanup();
+  }
+});
+
+const GRADED: TrialGrade = { ending: "graded", expectedPassed: 1, expectedTotal: 1, guardPassed: true, resolved: true, overwritten: 0, diff: null, isolation: "isolated" };
+const REQUEST_SIX = "66666666-6666-4666-8666-666666666666";
+const taskName = (n: number) => `captured:run-1:c${String(n).padStart(3, "0")}`;
+
+/** A valid task in its own root group, in the dev set or in the holdout set. */
+function addGrouped(f: Fixture, taskId: string, holdout: boolean): void {
+  const at = new Date(START).toISOString();
+  f.store.write(tx => {
+    const ref = tx.index("project", PROJECT);
+    tx.run(
+      "INSERT OR IGNORE INTO eval_groups (group_id, kind, project_ref, root_id, created_at, holdout, set_at) VALUES (?, 'run', ?, ?, ?, ?, ?)",
+      `group-${taskId}`, ref, `group-${taskId}`, at, holdout ? 1 : 0, holdout ? at : null,
+    );
+    tx.run(
+      "INSERT INTO eval_tasks (task_id, origin, run_id, member_id, project_ref, state, material, base, material_bytes, "
+      + "captured_at, checked_at, payload, group_id, area_ref, validated_at) "
+      + "VALUES (?, 'captured', 'run-1', 'member-1', ?, 'valid', 'stored', 'proven', 0, ?, ?, ?, ?, 'host', ?)",
+      taskId, ref, at, at, tx.seal("eval_tasks", taskId, { projectId: PROJECT }), `group-${taskId}`, at,
+    );
+  });
+}
+
+function compareRequest(kind: "compare" | "confirm", extra: Partial<ComparisonJobRequest> = {}): ComparisonJobRequest {
+  return { kind, configurations: [configuration(CLAUDE), configuration(CODEX)], limits: { maxTrials: 200, maxWallMinutes: 600 }, trialsPerTask: 1, ...extra };
+}
+
+function raiseCap(f: Fixture): void {
+  (f.config.projects[0] as unknown as { team: { eval: Record<string, unknown> } }).team.eval.trialsPerDay = 100;
+}
+
+/** Records the trial that `next` handed out as a started, graded trial of its own slot. */
+function runTrial(f: Fixture, next: Extract<NextTrial, { kind: "trial" }>): void {
+  const trialId = randomUUID();
+  f.store.write(tx => {
+    insertTrial(tx, {
+      trialId, jobId: next.jobId, taskId: next.taskId, configRef: next.configRef, harness: TRIAL_HARNESS_VERSION,
+      slot: next.slot, attempt: next.attempt, projectId: PROJECT, configuration: next.configuration, keepDays: 365,
+    }, f.now());
+    startTrial(tx, trialId, f.now());
+    finishTrial(tx, trialId, { grade: GRADED, configId: "config-id", profileEpoch: 1, sessionId: null, patchKeepDays: 90 }, f.now());
+  });
+}
+
+/** Runs trials until the scheduler hands out none; returns the task of each trial in order. */
+async function drain(f: Fixture): Promise<string[]> {
+  const order: string[] = [];
+  for (let turn = 0; turn < 100; turn += 1) {
+    const next = await f.trial.next(f.gates());
+    if (next.kind !== "trial") return order;
+    order.push(next.taskId);
+    runTrial(f, next);
+  }
+  throw new Error("The scheduler never stopped.");
+}
+
+function created(result: unknown): { created: boolean; job: { jobId: string } } {
+  assert.ok(result && typeof result === "object" && "job" in result, `expected a job, got ${JSON.stringify(result)}`);
+  return result as { created: boolean; job: { jobId: string } };
+}
+
+function countOf(f: Fixture, sql: string, ...params: string[]): number {
+  return f.store.read(db => db.get<{ n: number }>(sql, ...params)?.n ?? -1);
+}
+
+test("baseline reads the dev set only", async () => {
+  const f = fixture();
+  try {
+    raiseCap(f);
+    for (let n = 1; n <= 3; n += 1) addGrouped(f, taskName(n), false);
+    addGrouped(f, taskName(4), true);
+    const made = created(f.trial.create(PROJECT, request({ trialsPerTask: 1 }), REQUEST_ONE));
+    const view = f.jobs.view(made.job.jobId);
+    assert.ok(view && view.kind === "baseline");
+    assert.equal(view.tasks.planned, 3, "the holdout task is not planned");
+    const order = await drain(f);
+    assert.equal(order.length, 3);
+    assert.equal(order.includes(taskName(4)), false, "no trial starts for the holdout task");
+    assert.equal(f.jobs.view(made.job.jobId)?.reason, "done");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("a compare job runs its fixed list in order", async () => {
+  const f = fixture();
+  try {
+    raiseCap(f);
+    for (let n = 1; n <= 3; n += 1) addGrouped(f, taskName(n), false);
+    const made = created(f.trial.create(PROJECT, compareRequest("compare"), REQUEST_ONE));
+    addGrouped(f, taskName(4), false);
+    f.store.write(tx => {
+      tx.run("UPDATE eval_tasks SET state = 'retired' WHERE task_id = ?", taskName(2));
+    });
+    const order = await drain(f);
+    assert.equal(order.length, 4, "two configurations on two remaining tasks");
+    assert.deepEqual([...new Set(order)], [taskName(1), taskName(3)], "the list's order, without the retired and the added task");
+    const view = f.jobs.view(made.job.jobId);
+    assert.ok(view && view.kind === "compare");
+    assert.equal(view.status, "completed");
+    assert.equal(view.reason, "done");
+    assert.equal(view.tasks.planned, 3);
+    assert.equal(view.tasks.skipped, 1, "the retired task counts as skipped");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("a fully reused compare completes at creation", async () => {
+  const f = fixture();
+  try {
+    raiseCap(f);
+    const ended = new Date(START - DAY_MS).toISOString();
+    for (let n = 1; n <= 2; n += 1) addGrouped(f, taskName(n), false);
+    for (const [index, taskId] of [taskName(1), taskName(2)].entries()) {
+      for (const [side, item] of [configuration(CLAUDE), configuration(CODEX)].entries()) {
+        const jobId = `seed-job-${index}-${side}`;
+        f.store.write(tx => {
+          tx.run("INSERT INTO eval_jobs (job_id, project_ref, kind, status, request_id, created_at, expires_at, updated_at, payload) "
+            + "VALUES (?, 'ref', 'baseline', 'completed', ?, ?, ?, ?, '{}')", jobId, jobId, ended, ended, ended);
+          openTrialCounts(tx, jobId, { tasks: 1, trials: 1 });
+          const trialId = randomUUID();
+          insertTrial(tx, {
+            trialId, jobId, taskId, configRef: configRef(item), harness: TRIAL_HARNESS_VERSION, slot: 0, attempt: 0,
+            projectId: PROJECT, configuration: item, keepDays: 365,
+          }, ended);
+          startTrial(tx, trialId, ended);
+          finishTrial(tx, trialId, { grade: GRADED, configId: "config-id", profileEpoch: 1, sessionId: null, patchKeepDays: 90 }, ended);
+        });
+      }
+    }
+    const made = created(f.trial.create(PROJECT, compareRequest("compare"), REQUEST_ONE));
+    const view = f.jobs.view(made.job.jobId);
+    assert.ok(view && view.kind === "compare");
+    assert.equal(view.status, "completed");
+    assert.equal(view.reason, "done");
+    assert.equal(view.trials.reused, 4);
+    assert.equal(countOf(f, "SELECT count(*) AS n FROM eval_trials WHERE job_id = ?", made.job.jobId), 4, "only the copies exist");
+    assert.equal(countOf(f, "SELECT count(*) AS n FROM eval_trials WHERE job_id = ? AND reused_from IS NOT NULL", made.job.jobId), 4);
+    assert.equal((await f.trial.next(f.gates())).kind, "none");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("a changed identity ends the job", async () => {
+  const f = fixture();
+  try {
+    raiseCap(f);
+    for (let n = 1; n <= 2; n += 1) addGrouped(f, taskName(n), false);
+    const made = created(f.trial.create(PROJECT, compareRequest("compare"), REQUEST_ONE));
+    const first = await f.trial.next(f.gates());
+    assert.equal(first.kind, "trial");
+    if (first.kind === "trial") runTrial(f, first);
+    f.setClock(START + 60_000);
+    advanceEpoch(f.store, { profile: trialProfileKey(CLAUDE), requestId: REQUEST_TWO, now: new Date(START + 30_000).toISOString() });
+    assert.equal((await f.trial.next(f.gates())).kind, "none", "no trial starts after the epoch moved");
+    const view = f.jobs.view(made.job.jobId);
+    assert.equal(view?.status, "completed");
+    assert.equal(view?.reason, "identity-changed");
+    assert.equal(countOf(f, "SELECT count(*) AS n FROM eval_trials WHERE job_id = ?", made.job.jobId), 1, "no further trial row exists");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("a repeated request creates one job", () => {
+  const f = fixture();
+  try {
+    for (let n = 1; n <= 15; n += 1) addGrouped(f, taskName(n), true);
+    const body = compareRequest("confirm");
+    const first = created(f.trial.create(PROJECT, body, REQUEST_ONE));
+    assert.equal(first.created, true);
+    const again = created(f.trial.create(PROJECT, body, REQUEST_ONE));
+    assert.equal(again.created, false);
+    assert.equal(again.job.jobId, first.job.jobId);
+    assert.equal(countOf(f, "SELECT count(*) AS n FROM eval_jobs"), 1, "one job");
+    assert.equal(countOf(f, "SELECT count(*) AS n FROM eval_subjects"), 1, "one subject row");
+    assert.equal(countOf(f, "SELECT count(*) AS n FROM eval_groups WHERE holdout = 1 AND confirms = 1"), 15, "each root counts once");
+    assert.equal(countOf(f, "SELECT count(*) AS n FROM eval_groups WHERE confirms != 1"), 0);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("one active job per kind", () => {
+  const f = fixture();
+  try {
+    for (let n = 1; n <= 3; n += 1) addGrouped(f, taskName(n), false);
+    for (let n = 11; n <= 25; n += 1) addGrouped(f, taskName(n), true);
+    created(f.trial.create(PROJECT, compareRequest("compare"), REQUEST_ONE));
+    assertRefusal(f.trial.create(PROJECT, compareRequest("compare", { trialsPerTask: 2 }), REQUEST_TWO), 409, "job-active");
+    const confirm = created(f.trial.create(PROJECT, compareRequest("confirm"), REQUEST_THREE));
+    assert.equal(confirm.created, true, "a confirm job beside an active compare job is created");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("an interim view shows no result", async () => {
+  const f = fixture();
+  try {
+    raiseCap(f);
+    for (let n = 1; n <= 2; n += 1) addGrouped(f, taskName(n), false);
+    const made = created(f.trial.create(PROJECT, compareRequest("compare"), REQUEST_ONE));
+    const next = await f.trial.next(f.gates());
+    assert.equal(next.kind, "trial");
+    if (next.kind === "trial") runTrial(f, next);
+    const running = f.jobs.view(made.job.jobId);
+    assert.ok(running && running.kind === "compare");
+    assert.equal(running.status, "running");
+    assert.equal(running.trials.resolved, null, "no resolved count while the job runs");
+    assert.equal(running.report, null);
+    assert.equal(running.set, "dev");
+    assert.ok(!("code" in f.jobs.control(made.job.jobId, "cancel")));
+    const pending = f.jobs.view(made.job.jobId);
+    assert.ok(pending && pending.kind === "compare");
+    assert.equal(pending.report, "pending");
+    assert.equal(pending.trials.resolved, null, "a finished job without a report shows no result");
+    f.store.write(tx => {
+      tx.run("UPDATE eval_jobs SET reported_at = ? WHERE job_id = ?", f.now(), made.job.jobId);
+    });
+    const ready = f.jobs.view(made.job.jobId);
+    assert.ok(ready && ready.kind === "compare");
+    assert.equal(ready.report, "ready");
+    assert.equal(ready.trials.resolved, 1, "the resolved count shows once reported");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("a comparison job waits for the trial gates", async () => {
+  const f = fixture();
+  try {
+    for (let n = 1; n <= 2; n += 1) addGrouped(f, taskName(n), false);
+    const made = created(f.trial.create(PROJECT, compareRequest("compare"), REQUEST_ONE));
+    f.gate.limited = new Set<Provider>(["claude"]);
+    const limited = await f.trial.next(f.gates());
+    assert.equal(limited.kind, "wait");
+    assert.equal(limited.kind === "wait" && limited.waiting, "provider-limit");
+    assert.equal(limited.kind === "wait" && limited.jobId, made.job.jobId);
+    f.gate.limited = new Set<Provider>();
+    insertAt(f, "other-job", 0, { taskId: taskName(9) });
+    const capped = await f.trial.next(f.gates());
+    assert.equal(capped.kind, "wait");
+    assert.equal(capped.kind === "wait" && capped.waiting, "daily-cap");
   } finally {
     f.cleanup();
   }

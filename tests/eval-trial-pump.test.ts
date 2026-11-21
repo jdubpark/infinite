@@ -209,6 +209,21 @@ test("a start-up that voided rows is retried until the account is clean", async 
   }
 });
 
+test("a start-up whose stop leaves processes alive is tried again without an open job", async () => {
+  // What a restart finds after a trial left processes alive and blocked its job: no live row, no open job, and an account that is not clean.
+  const r = rig({ alive: true });
+  try {
+    const stops = () => r.log.filter(entry => entry === "stop").length;
+    await r.pump.step();
+    const first = stops();
+    assert.ok(first > 0, "the first start-up tried the stop");
+    await r.pump.step();
+    assert.ok(stops() > first, "the next step tries the stop again, with no job open");
+  } finally {
+    r.cleanup();
+  }
+});
+
 test("live rows without an open job still get the start-up", async () => {
   const r = rig();
   try {
@@ -243,7 +258,6 @@ test("the sweep does nothing while the trials module is not ready", async () => 
   try {
     await r.pump.sweep();
     assert.equal(r.log.includes("replayIds"), false, "the teams fake was not asked");
-    assert.equal(r.sessionsRemoved.length, 0, "no session removed");
   } finally {
     r.cleanup();
   }

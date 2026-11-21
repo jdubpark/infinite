@@ -1382,6 +1382,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     const stop = () => {
       if (!child || finished) return;
       try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch { /* Already exited. */ }
+      child.stdout.destroy(); // The host cannot signal a writer that the launcher runs as another account. Closing the pipe ends it.
     };
     const disconnect = () => { if (!res.writableEnded) { stop(); finished = true; clearTimeout(timer); } };
     req.once("aborted", disconnect);

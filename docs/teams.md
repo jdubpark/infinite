@@ -986,7 +986,7 @@ Every mirror read runs through `teams.commandPrefix`, with the six `-c` settings
 | Form | Command | Limit | While refused |
 |---|---|---|---|
 | E1, change counts | `git diff --no-ext-diff --no-textconv --numstat --no-renames --ignore-submodules=none --diff-algorithm=myers -z PARENT COMMIT --`, in the mirror | 30 seconds; 64 KiB, and a longer output is too large | No commit is mined. Mining is `failing`. Nothing is claimed about any commit. |
-| E2, time and message | `git log --no-walk=unsorted --no-show-signature --no-notes --encoding=UTF-8 --format=%ct%x00%B COMMIT`, in the mirror | 30 seconds; 64 KiB | No commit is mined. |
+| E2, time and message | `git log --no-walk=unsorted --no-show-signature --no-notes --encoding=UTF-8 --format=%ct%x00%B COMMIT --`, in the mirror | 30 seconds; 64 KiB | No commit is mined. |
 | E3, base bundle | `git bundle create - refs/heads/BRANCH`, in the mirror | 600 seconds; streamed, at most 1 GiB | No validation starts. The job waits `bundle`. |
 | Forms 1 to 4, base scan | The base-scan forms of the outcome ledger: `merge-base --is-ancestor`, the first-parent lists, and `git log --no-walk` for up to 50 ids | 30 seconds each | Mining is `failing`. Validation waits `mirror` and counts no attempt. |
 

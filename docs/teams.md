@@ -1132,7 +1132,7 @@ These arrive in later steps of the delivery order:
 
 ### Eval comparisons
 
-A `compare` job runs two to four configurations over the same tasks of the dev set, and its report says which one resolves more of them. A `confirm` job runs one pair of configurations once over the holdout set, to check a result that the dev set suggested. Both are trial jobs: they use the trials above, with their gates, their eval account, and their one trial at a time.
+A `compare` job runs two to four configurations over the same tasks of the dev set, and its report gives, for each pair, the difference in resolved tasks with an interval and a p-value. It names no winner. A `confirm` job runs one pair of configurations once over the holdout set, to check a result that the dev set suggested. Both are trial jobs: they use the trials above, with their gates, their eval account, and their one trial at a time.
 
 The comparison adds no setting and installs nothing. It needs `trialsPerDay` and the installs of [Eval trials](#eval-trials), and a project without `team.eval` behaves as before. Only the owner creates a job. The owner, a controller, and a viewer read reports and priors. A relay device reads neither.
 
@@ -1140,7 +1140,7 @@ The comparison adds no setting and installs nothing. It needs `trialsPerDay` and
 
 Every task belongs to the dev set or the holdout set. The set belongs to the task's group, and a task takes the set of its group's root. A task with no group row is in the dev set. No group spans both sets.
 
-**The draw.** The host draws a group's set once, when it creates the group row: a captured run's group, or a mined group. The draw is an HMAC of the group id under the evidence store's vault key, so nobody without the key can tell which groups are in the holdout set. The group goes to the holdout set when the first 8 hex digits of the draw, read as an unsigned integer, are below 1,288,490,189. That is about 30% of groups. The host stores the draw time as `set_at`.
+**The draw.** The host draws a group's set once, when it creates the group row: a captured run's group, or a mined group. The draw is an HMAC of the group id under the evidence store's vault key, so nobody can predict or choose a group's set before the host draws it. The group goes to the holdout set when the first 8 hex digits of the draw, read as an unsigned integer, are below 1,288,490,189. That is about 30% of groups. The host stores the draw time as `set_at`.
 
 **Migration.** The first start on corpus version 3 draws every existing root the same way. A root goes to the dev set instead when it has the dev-only mark, or when one of its tasks already has a trial row. Its `set_at` is the time the group was created.
 
@@ -1148,13 +1148,15 @@ Every task belongs to the dev set or the holdout set. The set belongs to the tas
 
 **Exposure.** A design that shows a task's content to a member outside the task's own trial marks the task's group exposed. An exposed group is in the dev set from that moment, and it never returns. The calibration read does this for every task it returns (see below).
 
-**Rotation.** A holdout group moves to the dev set after five confirm jobs, or 120 days after its `set_at`. The group's confirm count grows by one when a confirm job is created with one of its tasks. The hourly sweep moves at most 100 roots per pass. It moves no root of a project that has a confirm job without a report, because the job still reads them. A newly validated group is drawn like any other, so it can replace one that left.
+**Rotation.** A holdout group moves to the dev set after five confirm jobs, or 120 days after its `set_at`. The group's confirm count grows by one when a confirm job is created with one of its tasks. The hourly sweep moves at most 100 roots per pass, and only while the corpus module is ready. It moves no root of a project that has a confirm job without a report, because the job still reads them, and such a project's roots do not count toward the 100. A paused or blocked confirm job has no report and never expires, so its project's holdout groups stay until the owner resumes or cancels it. A newly validated group is drawn like any other, so it can replace one that left.
 
 **Who reads which set.** A `baseline` or `compare` job reads the dev set only. A baseline job used to read every valid task. It now skips the holdout tasks.
 
 **Counts.** The summary and `infinite eval status PROJECT` show the task count of each set, and the number of holdout groups and exposed groups. A project without `team.eval` has no set counts.
 
-**The calibration read.** A host-internal function returns pairs for the duels design: for one dev task, the newest resolved and the newest unresolved graded trial patch. It admits dev tasks only, returns at most one pair per task and at most 20 pairs per call, and skips a task that has a patch on only one side. It marks the group of each returned task exposed in the same write. No route, command, log line, or event carries a pair. No caller exists yet.
+**What the holdout set keeps back.** It keeps outcomes, not membership. No baseline or compare job runs a trial on a holdout task, so no result of a holdout task exists before a confirm job, and a confirm report holds aggregates only. Which tasks are in the holdout set is not a secret from the owner: a `taskIds` filter, a job's planned count, the `too-few-tasks` refusal, and the counts above each let the owner work it out. The host does not hide it. It stops the owner from shaping a confirm job's task list by name: a `confirm` request admits no task ids and no group ids.
+
+**The calibration read.** A host-internal function returns pairs for the duels design: for one dev task, the newest resolved and the newest unresolved graded trial patch. It admits dev tasks only, returns at most one pair per task and at most 20 pairs per call, and skips a task that has a patch on only one side. It marks the group of each returned task exposed in the same write. A group that left the holdout set is a dev group, so the read can return the patch of a confirm job's trial from that time. No route, command, log line, or event carries a pair. No caller exists yet.
 
 #### Compare and confirm requests
 
@@ -1167,13 +1169,13 @@ The request has the shape of a baseline request, with these differences. The sch
 | `taskFilter.taskIds` | up to 200 ids. A `confirm` request admits none | all |
 | `taskFilter.origins`, `areas` | up to 2 origins; up to 32 areas | all |
 | `taskFilter.promptOrigins` | `assignment`, `run-objective`, `commit-message` | all |
-| `taskFilter.excludeGroups` | up to 200 group ids, each up to 64 characters | none |
+| `taskFilter.excludeGroups` | up to 200 group ids, each up to 64 characters. A `confirm` request admits none | none |
 | `taskFilter.maxTasks` | 1 to 200 | 20 |
 | `trialsPerTask` | 1 to 5 | 3 |
 | `limits.maxTrials`, `limits.maxWallMinutes` | 1 to 1,000; 10 to 43,200 | none, required |
 | `windows`, `expiresAt` | as for a baseline job | any hour; 30 days |
 
-The kind fixes the set: `compare` reads the dev set and `confirm` reads the holdout set. The request has no `set` field. A `confirm` request names no task, so the owner cannot pick holdout tasks that a configuration is known to win.
+The kind fixes the set: `compare` reads the dev set and `confirm` reads the holdout set. The request has no `set` field. A `confirm` request names no task and no group, so the owner cannot pick its holdout tasks one by one. The filters by origin, area, and prompt origin and `maxTasks` still narrow the list, and the job view shows them.
 
 **The task list.** When the owner creates the job, the host selects the tasks that pass the filter, in task id order, up to `maxTasks`, and seals the list in the job. The `POST` is the approval. A task added later is never reached. A task that is no longer `valid` when its turn comes is skipped and counted. `planned.trials` is the smaller of `limits.maxTrials` and the slots (tasks times configurations times `trialsPerTask`) minus the reused copies.
 
@@ -1229,7 +1231,7 @@ The report names each configuration by its index (the order of the request), `pr
 
 A job with more than two configurations reports every pair. The spec names no control configuration. The same figures appear for each prompt origin and each area, with their n, and Holm runs within each group.
 
-**Inconclusive.** A report says `conclusive: false` when fewer than 90% of the planned tasks were analysed, or none was. Below that share, the tasks that survive can favour one configuration. The CLI prints `inconclusive: under 90% of tasks kept every valid trial`.
+**Inconclusive.** A report says `conclusive: false` when fewer than 90% of the planned tasks were analysed, or none was. Below that share, the tasks that survive can favour one configuration. The CLI prints `inconclusive: under 90% of tasks kept every valid trial`. `conclusive: true` says only that the share rule is met, and the CLI prints `share rule met`. It is not a finding that the configurations differ: read the interval and the p-value for that. The CLI rounds the share down.
 
 **Attrition.** For each configuration: the void trials by ending (`void-limit`, `void-host`, `void-owner`), `changed` (trials that did not match the pins), and `short` (tasks with fewer than `trialsPerTask` valid trials). `tasks.leftHoldout` counts the confirm tasks that left the holdout set.
 
@@ -1263,7 +1265,7 @@ The report never names a model. The priors read does, because the router needs i
 
 ```text
 report JOB compare (dev set) · completed · done · 3 trials per task
-tasks 12 of 12 analysed (100%) · conclusive
+tasks 12 of 12 analysed (100%) · share rule met
 configuration 0: PROFILE (PROVIDER, epoch 1)
 1 vs 0: +0.194 [+0.056, +0.333] · sign 7-1-4, p 0.0703 (Holm 0.0703) · detectable 0.214 (planning 0.283 to 0.332)
 sensitivity 1 vs 0: +0.167 over 10 tasks

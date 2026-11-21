@@ -88,9 +88,10 @@ the two modes stays apart, and identities recorded before the mode existed stay
 the same. Routing reads its evidence at the prompt version a new member would
 start with. It estimates that mode from this setting and the shape of the
 Claude launch profile, and counts a headless launch whose shape the permission
-channel can serve as served. When the channel does not admit such a launch, the
-member starts without Code Mode while routing still expects the mode, and
-routing counts that member's outcomes as earlier evidence.
+channel can serve as served. When the setting enables Code Mode for that shape
+but the channel does not admit the launch, the member starts without Code Mode
+while routing still expects the mode, and routing counts that member's outcomes
+as earlier evidence.
 
 A session records whether the host asked for Code Mode. Resuming the same
 conversation asks again when the record says so, whatever the setting says by

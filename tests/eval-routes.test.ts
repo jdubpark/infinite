@@ -605,6 +605,8 @@ test("a baseline job is created and listed", async () => {
     const trialId = randomUUID();
     const sessionId = randomUUID();
     f.store.write(tx => setRow(tx, captureRow(tx, "run-trial", [file], { ...CAPSULE, objective }), "valid", "host"));
+    // The capture drew the group's set, holdout in three runs of ten. A baseline job reads the dev set only, so the group goes to dev.
+    f.store.write(tx => { tx.run("UPDATE eval_groups SET holdout = 0, set_at = NULL"); });
 
     const created = await call(server.base, "POST", "/api/eval/jobs", "owner", { projectId: PROJECT, requestId: REQUEST, job: BASELINE_JOB });
     assert.equal(created.status, 201);

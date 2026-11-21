@@ -47,7 +47,9 @@ const promptOf = (run: TeamRun, role: TeamMember["role"]) =>
 // moved from 96ea12db when INF-323 added the recommendation to the question format line, the only change, and from
 // a4ff6934 when INF-374 and INF-343 added three lines and changed no other: the Codex working rule for tools, the
 // planner's line on a measured target, and the reviewer's line on comparing a rewrite with the original.
-const PIN_PROMPTS_SHA256 = "fc8cea0d6d22094856f2d995b1a33130c195f472655058201b3eefdb6a0cc938";
+// INF-383 moved it to aabe1e82: the Codex working rule's signature sentences now name the callable form and the nested
+// result type, generated from the declared schemas. No other prompt byte changed.
+const PIN_PROMPTS_SHA256 = "aabe1e82064216dce8a69fbf2cd1ff28e708ac83112eafacc0dcfba2bbbad0c6";
 
 test("without the register the goal section is byte for byte", () => {
   const prompts: string[] = [];

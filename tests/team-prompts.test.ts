@@ -8,6 +8,7 @@ import { ENTRY_PARAGRAPH_LIMIT_BYTES, codexMemberToolInstructions, codexSandboxI
 import { hostEntry } from "../packages/host/src/evidence/host-entries.js";
 import { buildCapsule } from "../packages/host/src/eval-rules.js";
 import { outputSchemas } from "../packages/host/src/team-mcp-results.js";
+import { schemaType, toolSignature } from "../packages/host/src/tool-signature.js";
 import { recordedTeamReportSchema, teamReportSchema, type TeamBrief, type TeamMember, type TeamModelProfile, type TeamRun, type TeamScout, type TeamTask } from "../packages/host/src/team-types.js";
 import type { TeamRunRouting, TeamRunRoutingAuto } from "../packages/host/src/routing-types.js";
 import { ENTRY_PROFILE, ENTRY_PROVIDERS, smallRun } from "./fixtures/team-prompt-run.js";
@@ -346,9 +347,13 @@ const CONTEXT_ACCESS_END = "even when their complete inline text is present.";
 const MEMBER_ROLES_UNDER_TEST = ["permission-coordinator", ...ENTRY_ROLES_UNDER_TEST, "delivery"] as const;
 const entryToolRoles = new Set<string>(ENTRY_ROLES_UNDER_TEST);
 
-function declaredOutputFields(schema: { properties?: Record<string, unknown>; required?: string[] }) {
-  const required = new Set(schema.required ?? []);
-  return Object.keys(schema.properties ?? {}).map(field => `${field}${required.has(field) ? "" : "?"}`);
+/** Every property name a declared schema carries, at any depth, so a schema change cannot hide a field from the prompt. */
+function declaredFieldNames(schema: unknown): string[] {
+  if (typeof schema !== "object" || schema === null) return [];
+  const node = schema as Record<string, unknown>;
+  const properties = typeof node.properties === "object" && node.properties !== null ? node.properties as Record<string, unknown> : {};
+  const members = [node.items, ...(Array.isArray(node.anyOf) ? node.anyOf : []), ...(Array.isArray(node.oneOf) ? node.oneOf : [])];
+  return [...Object.keys(properties), ...Object.values(properties).flatMap(declaredFieldNames), ...members.flatMap(declaredFieldNames)];
 }
 
 test("the entry paragraph is the only change and only with tools on", () => {
@@ -407,7 +412,7 @@ test("Codex tool guidance follows provider, role, and available entry tools", ()
   }
 });
 
-test("Codex tool signatures expose the declared result fields and stay concise", () => {
+test("Codex tool signatures name the callable form and carry the declared result shape", () => {
   const tools = [
     { name: "report", schema: outputSchemas.report },
     { name: "entry_list", schema: outputSchemas.entry_list },
@@ -415,18 +420,56 @@ test("Codex tool signatures expose the declared result fields and stay concise",
     { name: "entry_post", schema: outputSchemas.entry_post },
   ] as const;
   const paragraph = codexMemberToolInstructions(true);
-  assert.ok(Buffer.byteLength(paragraph, "utf8") < 1200);
   assert.ok(paragraph.startsWith("Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results."));
   assert.doesNotMatch(paragraph, /session record keeps each nested call/);
+  assert.doesNotMatch(paragraph, /\n/);
   assert.match(paragraph, /When a program lists or reads items, print how many it listed, read, and matched/);
   assert.match(paragraph, /Read the context file with a shell call inside a program, and select only the fields needed for your next decision\./);
-  assert.match(paragraph, /Tool signatures \(arguments -> fields of a successful result's structuredContent\):/);
-  const signatures = [...paragraph.matchAll(/([a-z_]+)\([^)]*\) -> \{([^}]*)\}/g)];
-  assert.deepEqual(signatures.map(match => match[1]), tools.map(tool => tool.name));
-  for (const [index, { schema }] of tools.entries()) {
-    assert.deepEqual(signatures[index]![2]!.split(", "), declaredOutputFields(schema), `${tools[index]!.name} result fields match its output schema`);
+  assert.match(paragraph, /Tool signatures inside exec \(generated from the tools' declared schemas, no lookup needed\): await tools\.mcp__infinite_team__report\(/);
+  const sentences = paragraph.split("await tools.").slice(1).map(sentence => `await tools.${sentence}`.trim());
+  assert.deepEqual(sentences.map(sentence => /^await tools\.mcp__infinite_team__(\w+)\(/.exec(sentence)?.[1]), tools.map(tool => tool.name));
+  for (const [index, { name, schema }] of tools.entries()) {
+    const sentence = sentences[index]!;
+    assert.ok(sentence.endsWith(` returns { structuredContent: ${schemaType(schema)} }.`), `${name} result type is generated from its schema`);
+    for (const field of declaredFieldNames(schema)) assert.match(sentence, new RegExp(`[{,] ${field}\\??: `), `${name} signature carries ${field}`);
   }
   assert.doesNotMatch(codexMemberToolInstructions(false), /entry_(?:list|get|post)\(/);
+});
+
+test("Codex tool signatures list only the tools a member can call", () => {
+  const count = (text: string) => text.split("await tools.mcp__infinite_team__").length - 1;
+  const reportOnly = codexMemberToolInstructions(false);
+  assert.equal(count(reportOnly), 1);
+  assert.ok(reportOnly.endsWith("await tools.mcp__infinite_team__report({ report }) returns { structuredContent: { requestId: string, runId: string, memberId: string, revision: number, message: string } }."));
+  assert.equal(count(codexMemberToolInstructions(true)), 4);
+});
+
+test("tool signature types render each schema form from the declared schema", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      id: { type: "string", format: "uuid" },
+      count: { type: "integer" },
+      ratio: { type: "number" },
+      ok: { type: "boolean" },
+      kind: { type: "string", enum: ["a", "b", "c"] },
+      fixed: { const: "x" },
+      tags: { type: "array", items: { type: "string" } },
+      items: { type: "array", items: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
+      choice: { anyOf: [{ type: "string" }, { type: "number" }] },
+      nested: { type: "object", properties: { inner: { type: "boolean" }, note: { type: "string" } }, required: ["inner"] },
+      any: {},
+      extra: { type: "string" },
+      unlisted: { type: "array", items: { type: "string", enum: ["p", "q"] } },
+    },
+    required: ["id", "count", "ratio", "ok", "kind", "fixed", "tags", "items", "choice", "nested", "any"],
+  };
+  assert.equal(schemaType(schema), '{ id: string, count: number, ratio: number, ok: boolean, kind: "a"|"b"|"c", fixed: "x", tags: string[], items: Array<{ name: string }>, choice: string|number, nested: { inner: boolean, note?: string }, any: unknown, extra?: string, unlisted?: ("p"|"q")[] }');
+  assert.equal(schemaType({}), "unknown");
+  assert.equal(schemaType({ type: "object" }), "unknown");
+  assert.equal(schemaType({ type: "array", items: { anyOf: [{ type: "string" }, { type: "number" }] } }), "(string|number)[]");
+  assert.equal(toolSignature("demo_server", "echo", "{ text }", { type: "object", properties: { text: { type: "string" } }, required: ["text"] }),
+    "await tools.mcp__demo_server__echo({ text }) returns { structuredContent: { text: string } }.");
 });
 
 test("Codex argument signatures match registered MCP input schemas", { timeout: 20000 }, async () => {
@@ -469,7 +512,7 @@ test("Codex argument signatures match registered MCP input schemas", { timeout: 
       return [tool.name as string, tool] as const;
     }));
     const names = ["report", "entry_list", "entry_get", "entry_post"];
-    const signatures = [...codexMemberToolInstructions(true).matchAll(/([a-z_]+)\(([^)]*)\) -> \{([^}]*)\}/g)];
+    const signatures = [...codexMemberToolInstructions(true).matchAll(/await tools\.mcp__infinite_team__([a-z_]+)\(([^)]*)\) returns/g)];
     assert.deepEqual(signatures.map(match => match[1]), names);
     for (const [index, name] of names.entries()) {
       const tool = registered.get(name);
@@ -478,7 +521,7 @@ test("Codex argument signatures match registered MCP input schemas", { timeout: 
       const properties = asRecord(schema.properties);
       const required = new Set(Array.isArray(schema.required) ? schema.required.filter((item): item is string => typeof item === "string") : []);
       const actual = Object.keys(properties).map(argument => ({ name: argument, optional: !required.has(argument) })).sort((a, b) => a.name.localeCompare(b.name));
-      const args = signatures[index]![2]!.replace(/^\{|\}$/g, "").split(", ").filter(Boolean)
+      const args = signatures[index]![2]!.trim().replace(/^\{|\}$/g, "").split(",").map(argument => argument.trim()).filter(Boolean)
         .map(argument => ({ name: argument.replace(/\?$/, ""), optional: argument.endsWith("?") })).sort((a, b) => a.name.localeCompare(b.name));
       assert.deepEqual(args, actual, `${name} handwritten arguments match tools/list`);
     }
@@ -622,7 +665,9 @@ function pinnedContexts() {
   const run = goalRun();
   return PIN_ROLES.map(role => JSON.stringify(teamContext(run, "Owner feedback excerpt.", { checks: PIN_CHECKS }, role), null, 2));
 }
-const PIN_PROMPTS_SHA256 = "0e41cbab28a8a0a622df32e76613e89ac31b2b2abc732609832b7dc671ab0a60";
+// INF-383 moved this pin to a5496297: the Codex working rule's signature sentences now name the callable form and the
+// nested result type, generated from the declared schemas. No other prompt or context byte changed.
+const PIN_PROMPTS_SHA256 = "a5496297d275be9aaa90fc01a5792e93a200366fe3ae40b98419915fa36eadaf";
 const PIN_CONTEXTS_SHA256 = "9ee8fe8ac898e2d70ddbb012ba398387d526294ea61739fb7aad4385b7a7412b";
 
 test("the switch off keeps every prompt and context byte", () => {

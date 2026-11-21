@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  EARLIER_RULE_WITHOUT_ENTRY,
+  EARLIER_RULE_WITH_ENTRY,
   codexMemberToolInstructions,
   codexSandboxInstructions,
   contextAccessInstructions,
@@ -305,5 +307,25 @@ test("seeded retarget comparisons preserve quoted prompt evidence across every r
   } catch (error) {
     console.error(`retarget comparison seed=${seed}; returned=${returnedPrompts}; elapsedMs=${Math.round(performance.now() - started)}`);
     throw error;
+  }
+});
+
+test("a prompt written by the earlier release is retargeted to one current working rule", () => {
+  const codexProfile = { ...ENTRY_PROFILE, provider: "codex" as const };
+  for (const entryTools of [false, true]) {
+    const current = codexMemberToolInstructions(entryTools);
+    const earlier = entryTools ? EARLIER_RULE_WITH_ENTRY : EARLIER_RULE_WITHOUT_ENTRY;
+    const prompt = teamPrompt(smallRun(entryTools ? { blackboard: { tools: true } } : {}), "implementer", undefined, undefined, "codex", codexProfile);
+    assert.equal(prompt.split(current).length - 1, 1, `entryTools ${entryTools} current prompt carries the rule once`);
+    const carried = prompt.replace(current, earlier);
+    assert.notEqual(carried, prompt);
+    const codex = retargetPrompt(carried, { provider: "codex", profile: codexProfile, role: "implementer", entryTools });
+    assert.equal(codex, prompt, `entryTools ${entryTools} the earlier rule is replaced by the current one`);
+    assert.equal(codex!.split(current).length - 1, 1);
+    assert.equal(codex!.includes(earlier), false);
+    const claude = retargetPrompt(codex!, { provider: "claude", profile: ENTRY_PROFILE, role: "implementer", entryTools });
+    assert.ok(claude);
+    assert.equal(claude.includes(current), false, `entryTools ${entryTools} no Codex rule reaches Claude`);
+    assert.equal(claude.includes(earlier), false);
   }
 });

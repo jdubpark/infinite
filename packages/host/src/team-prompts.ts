@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { entryToolsFor } from "./entry-roles.js";
 import { registerText, scopeSentence } from "./register-prompt.js";
 import { outputSchemas } from "./team-mcp-results.js";
+import { toolSignature } from "./tool-signature.js";
 import { TeamError } from "./team-workspace.js";
 import type { BlockerEvidence, TeamMember, TeamModelProfile, TeamProject, TeamRun, TeamScout, TeamTask, TeamPermissionRecoveryStep, TeamPermissionRecoveryView, TeamView } from "./team-types.js";
 import type { Provider } from "./types.js";
@@ -13,23 +14,22 @@ const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
 const profileSuffix = ". These are the host's configured model choices; they do not establish which backend actually served a turn. Do not switch models or change tool permissions.";
 export const profileInstructions = (modelProfile: TeamModelProfile) => `Requested runtime profile: ${JSON.stringify(modelProfile)}${profileSuffix}`;
 export const codexSandboxInstructions = "Codex sandbox guidance: The shell may restrict network access, local listeners, IPC sockets, and Git metadata writes. Prefer operations that work there. When a necessary development operation cannot run in the sandbox, request one-time execution of the complete command within your assigned role and pinned owner scope so the strong coordinator can review it. This includes repository inspection, scoped staging, test planning, builds, tests, and local browser checks when authorized; delivery still requires its separate pinned policy. Never request persistent approval or switch tools to bypass a denial. Report skipped checks and why; the host runs accepted checks after integration.";
-const resultFields = (tool: keyof typeof outputSchemas) => {
-  const schema = outputSchemas[tool];
-  const required = new Set(schema.required ?? []);
-  return Object.keys(schema.properties ?? {}).map(field => `${field}${required.has(field) ? "" : "?"}`).join(", ");
-};
 /** Codex member guidance for concise tool results, with signatures limited to the member's available tools. */
 export const codexMemberToolInstructions = (entryTools: boolean) => {
   const signatures = [
-    `report({report}) -> {${resultFields("report")}}`,
+    toolSignature("infinite_team", "report", "{ report }", outputSchemas.report),
     ...(entryTools ? [
-      `entry_list({kinds?, taskId?, path?, since?, limit?}) -> {${resultFields("entry_list")}}`,
-      `entry_get({entryId}) -> {${resultFields("entry_get")}}`,
-      `entry_post({entry}) -> {${resultFields("entry_post")}}`,
+      toolSignature("infinite_team", "entry_list", "{ kinds?, taskId?, path?, since?, limit? }", outputSchemas.entry_list),
+      toolSignature("infinite_team", "entry_get", "{ entryId }", outputSchemas.entry_get),
+      toolSignature("infinite_team", "entry_post", "{ entry }", outputSchemas.entry_post),
     ] : []),
   ];
-  return `Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results. When a program lists or reads items, print how many it listed, read, and matched. Read the context file with a shell call inside a program, and select only the fields needed for your next decision. Tool signatures (arguments -> fields of a successful result's structuredContent): ${signatures.join("; ")}.`;
+  return `Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results. When a program lists or reads items, print how many it listed, read, and matched. Read the context file with a shell call inside a program, and select only the fields needed for your next decision. Tool signatures inside exec (generated from the tools' declared schemas, no lookup needed): ${signatures.join(" ")}`;
 };
+// The working rule of the earlier release, frozen as text: a prompt written by that release must still be recognised
+// and retargeted, so these stay even though the rule above has moved on.
+export const EARLIER_RULE_WITHOUT_ENTRY = "Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results. When a program lists or reads items, print how many it listed, read, and matched. Read the context file with a shell call inside a program, and select only the fields needed for your next decision. Tool signatures (arguments -> fields of a successful result's structuredContent): report({report}) -> {requestId, runId, memberId, revision, message}.";
+export const EARLIER_RULE_WITH_ENTRY = "Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results. When a program lists or reads items, print how many it listed, read, and matched. Read the context file with a shell call inside a program, and select only the fields needed for your next decision. Tool signatures (arguments -> fields of a successful result's structuredContent): report({report}) -> {requestId, runId, memberId, revision, message}; entry_list({kinds?, taskId?, path?, since?, limit?}) -> {notice, heads, more, cursor?, unreadable}; entry_get({entryId}) -> {notice, head, body}; entry_post({entry}) -> {entryId, state, message}.";
 /** Every member and session reads it: a reject is final, and the same effect is never reached another way. */
 export const permissionRejectInstructions = "A rejected permission request is final for that request. Do not reach the same effect with another tool, command, or route.";
 /** What every asking agent reads about the recommendation its question must carry. */
@@ -329,7 +329,7 @@ const [entryCommandHead, entryCommandTail] = entryInstructions("opencode", "\0")
 const REPORT_PARAGRAPHS = [reportingInstructions("claude"), reportingInstructions("codex")];
 const ENTRY_PARAGRAPHS = [entryInstructions("claude"), entryInstructions("codex")];
 const CONTEXT_PARAGRAPH = contextAccessInstructions();
-const RULE_PARAGRAPHS = [codexMemberToolInstructions(false), codexMemberToolInstructions(true)];
+const RULE_PARAGRAPHS = [codexMemberToolInstructions(false), codexMemberToolInstructions(true), EARLIER_RULE_WITHOUT_ENTRY, EARLIER_RULE_WITH_ENTRY];
 type PromptParagraphKind = "report" | "entry" | "context" | "sandbox" | "rule" | "profile" | "readonly";
 type PromptLayoutRole = TeamMember["role"];
 type PromptLayout = { report: number; entry?: number; context?: number; profile?: number };

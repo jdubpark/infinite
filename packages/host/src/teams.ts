@@ -551,7 +551,11 @@ export class TeamService {
   useRouter(router: RoutingRecorder) { this.router = router; }
   /** The launch-rate fuse. Without one, every member launches as before and no record gains a fuse reason. */
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
-  useGoalRecords(port: GoalRecordPort) { this.intentChecks.goals = port; this.objectiveTests.goals = port; this.verdicts.goals = port; }
+  useGoalRecords(port: GoalRecordPort) {
+    this.intentChecks.goals = port;
+    this.objectiveTests.goals = port;
+    this.verdicts.goals = port;
+  }
   /**
    * Applies a fuse result to the run's reason. True when the launch must wait. A reason that reports a member's
    * state stays as it is: the scheduler writes it again on every pass, so a fuse text there would be replaced and

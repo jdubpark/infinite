@@ -208,6 +208,18 @@ export class HostPermissionPipeline implements PermissionPipeline {
     return { ...coverage, authorityHash: sha256(["permission-authority", coverage.authorityHash, this.core.binding(), epoch]) };
   }
 
+  /**
+   * A digest of what a review reads besides the request, the authority and the journal: the task text, and the
+   * raise rules that match the request as its paths resolve now. A request whose task the owner narrowed, or whose
+   * path now resolves outside the session root, is another request to the pipeline: no earlier verdict answers it.
+   * The reject history is left out; it comes from the journal, and it selects the tier of a fresh turn only.
+   */
+  private reviewInputs(request: PermissionRequest): string {
+    const { title, text } = request.requester.task;
+    const raised = [...new Set(this.core.raise(request, { rejectHistory: false }))].sort();
+    return sha256(["permission-review-inputs", title, text, raised]);
+  }
+
   /** A halt that cannot be read counts as a halt. */
   halted(projectId: string): boolean {
     try { return this.haltedOf?.(projectId) ?? false; }
@@ -247,13 +259,16 @@ export class HostPermissionPipeline implements PermissionPipeline {
     const served = this.coverage(request.requester.projectId);
     if (!served.served) return { kind: "not-served", reason: served.reason };
     if (this.halted(request.requester.projectId)) return { kind: "held" };
-    const decisionId = decisionIdFor(request, served.coverage.authorityHash);
+    let inputs: string;
+    try { inputs = this.reviewInputs(request); }
+    catch { return { kind: "undeliverable", reason: "The permission agent could not read this request." }; }
+    const decisionId = decisionIdFor(request, served.coverage.authorityHash, inputs);
     const running = this.inFlight.get(decisionId);
     if (running) return running;
     const work = (async (): Promise<PermissionOutcome> => {
       try {
         // A delivery retry of one raised request gets the decision already recorded, so a repeat counts once.
-        return this.recordedOutcome(decisionId) ?? await this.decideFresh(request, served.coverage, decisionId, options);
+        return this.recordedOutcome(decisionId) ?? await this.decideFresh(request, served.coverage, decisionId, inputs, options);
       } catch (error) {
         console.warn(`[Infinite] The permission pipeline could not decide a request (${error instanceof Error ? error.name : "error"}).`);
         return { kind: "undeliverable", reason: "The permission agent could not record a decision for this request." };
@@ -309,12 +324,13 @@ export class HostPermissionPipeline implements PermissionPipeline {
     request: PermissionRequest,
     coverage: Covered,
     decisionId: string,
+    inputs: string,
     options: PermissionDecideOptions,
   ): Promise<PermissionOutcome> {
     const requester = request.requester;
     const familyText = this.core.familyOf({ provider: requester.provider, ...(requester.model ? { model: requester.model } : {}) });
     const family = familyText ? familyText : undefined;
-    const reuseKey = request.reuseKey ? reuseKeyFor(request.reuseKey, coverage) : undefined;
+    const reuseKey = request.reuseKey ? reuseKeyFor(request.reuseKey, coverage, inputs) : undefined;
     const base = {
       id: decisionId,
       workspaceId: coverage.workspaceId,
@@ -528,14 +544,20 @@ export class HostPermissionPipeline implements PermissionPipeline {
  */
 const READ_SOURCE = "host:read-source";
 
-/** One raised request under one authority has one decision id. A changed request or a new authority gets another. */
-function decisionIdFor(request: PermissionRequest, authorityHash: string): string {
-  return `pd-${sha256(["permission-decision", request.requester.sessionId, request.id, request.evidenceHash, authorityHash]).slice(0, 32)}`;
+/**
+ * One raised request under one authority, read with one set of review inputs, has one decision id. A changed
+ * request, a new authority or a changed input gets another.
+ */
+function decisionIdFor(request: PermissionRequest, authorityHash: string, inputs: string): string {
+  return `pd-${sha256(["permission-decision", request.requester.sessionId, request.id, request.evidenceHash, authorityHash, inputs]).slice(0, 32)}`;
 }
 
-/** The stored reuse key. It changes with the authority, so a new owner act, a direction text or a change to the rules in force stops replay. */
-function reuseKeyFor(requestKey: string, coverage: Covered): string {
-  return sha256(["permission-reuse", coverage.projectId, coverage.authorityHash, requestKey]);
+/**
+ * The stored reuse key. It changes with the authority, so a new owner act, a direction text or a change to the rules
+ * in force stops replay, and with the review inputs, so a changed task text or path resolution does.
+ */
+function reuseKeyFor(requestKey: string, coverage: Covered, inputs: string): string {
+  return sha256(["permission-reuse", coverage.projectId, coverage.authorityHash, requestKey, inputs]);
 }
 
 function rejectRef(decision: PermissionDecision): PermissionRejectRef {

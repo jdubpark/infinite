@@ -2545,6 +2545,11 @@ Each request passes these steps in order:
 3. **Lock and replay.** An assignment that repeated one rejected request twice
    is locked and gets no model turn until the owner unlocks it. An identical
    request under the same authority is answered from its recorded verdict.
+   A verdict belongs to the request as the host read it: the task text the
+   reviewer saw, and the raise rules that matched as the request's paths
+   resolved. After the owner narrows a session's task, or a path in the
+   command comes to resolve outside the session's directory, the identical
+   request is reviewed again, and so is a later attempt at the same dialog.
    A verdict that the strong model reached after it asked the host for
    source files is the exception: it cannot answer a new dialog. The delivery
    that follows the review checks again any file the adapter collected. An

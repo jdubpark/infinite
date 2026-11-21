@@ -52,11 +52,18 @@ export function assertVerdictAnswer(goal: ProductGoal, body: GoalOutcomeInput, n
   if (body.continue !== true) return;
   if (goal.stopReason !== "provisional-met" || newestAssessed(goal.cycles)?.assessment?.verdictId !== body.verdictId)
     throw new TeamError(409, "goal-not-provisional", "Continue applies only to a goal stopped by a provisional agent assessment.");
-  if (nowMs >= Date.parse(goal.deadlineAt) || nowMs >= Date.parse(ceilingOf(goal)) || goal.memberCount >= goal.maxMembers)
-    throw new TeamError(409, "goal-limit-reached", "The goal's time or member allowance is spent. Start a new goal to continue.");
+  if (nowMs >= Date.parse(goal.deadlineAt) || nowMs >= Date.parse(ceilingOf(goal)) || goal.memberCount >= goal.maxMembers || goal.cycles.length >= (goal.maxRuns ?? 0))
+    throw new TeamError(409, "goal-limit-reached", "The goal's time, member, or feature-run allowance is spent. Start a new goal to continue.");
   const directions = [goal.objective, ...goal.steering.map(item => `User direction: ${item.text}`), `User direction: ${body.summary}`];
   if (goal.steering.length >= STEERING_ENTRIES || Buffer.byteLength(directions.join("\n\n")) > STEERING_BYTES)
     throw new TeamError(409, "goal-steering-limit", "Start a new goal with consolidated directions.");
+}
+
+/** An owner outcome on a provisional stop ends it: the host drops the stop reason and its text. Any other stop is left alone. */
+export function answerProvisional(goal: Pick<ProductGoal, "stopReason" | "reason">): void {
+  if (goal.stopReason !== "provisional-met") return;
+  delete goal.stopReason;
+  delete goal.reason;
 }
 
 /**
@@ -91,7 +98,7 @@ export function criteriaRowsFor(holder: GoalHolder, project: Pick<Project, "team
   const rows: CriteriaRow[] = [];
   for (const item of state.record.criteria) {
     const status = states.get(item.id);
-    if (item.state === "active" && status !== undefined) rows.push({ criterion: item.id, status, check: checkLabel(item.check, configured) });
+    if (item.state === "active" && status !== undefined && item.latest?.verdictId === assessed.verdictId) rows.push({ criterion: item.id, status, check: checkLabel(item.check, configured) });
   }
   return rows.length === 0 ? {} : { criteria: rows };
 }

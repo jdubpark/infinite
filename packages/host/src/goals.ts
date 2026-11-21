@@ -19,7 +19,7 @@ import { cadenceDue, classifyCycle, cycleWakeOf, defaultWakeMinGapMinutes, folde
 import { KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 import { correctionGate, digestEvent, correctGoalObjective, createGoalObjective, goalObjectiveNote, goalObjectiveView, goalRecordDigest, goalRecordPort, loadGoalObjective, ratingStamp, steerGoalObjective, type ObjectiveUnavailable } from "./objective-goals.js";
 import { objectivePromptsOn, objectiveRegisterOn } from "./objective-digest.js";
-import { assertVerdictAnswer, continueGoal, criteriaRowsFor, cycleVerdict, provisionalStop, verdictFailed, CONTINUE_EVENT, PROVISIONAL_EVENT, PROVISIONAL_REASON } from "./goal-verdicts.js";
+import { answerProvisional, assertVerdictAnswer, continueGoal, criteriaRowsFor, cycleVerdict, provisionalStop, verdictFailed, CONTINUE_EVENT, PROVISIONAL_EVENT, PROVISIONAL_REASON } from "./goal-verdicts.js";
 import { correctionSchema, type CriterionInput } from "./objective-input.js";
 import { objectiveError, recordView, type ObjectiveRecordView } from "./objective-record.js";
 
@@ -579,6 +579,7 @@ export class GoalService {
       assertVerdictAnswer(goal, body, Date.now());
       this.admit(stored, "outcome", body);
       goal.outcomes.push({ result: body.result, summary: body.summary, evidence: body.evidence, at: now(), revision: goal.revision, ...(body.verdictId ? { verdictId: body.verdictId } : {}) });
+      answerProvisional(goal);
       if (body.result === "achieved") goal.status = "achieved";
       else if (body.continue) {
         const note = continueGoal(stored, body, now());
@@ -982,7 +983,7 @@ export class GoalService {
       else this.hold(stored, "blocked", "external-operation", unresolved);
       return;
     }
-    if (cycle.class === "failed" || verdictFailed(cycle)) goal.failedCycles = (goal.failedCycles ?? 0) + 1;
+    if (cycle.class === "failed" || (cycle.class === "reviewed" && verdictFailed(cycle))) goal.failedCycles = (goal.failedCycles ?? 0) + 1;
     else if (cycle.class !== "excluded") goal.failedCycles = 0;
     if (!["running", "needs-input"].includes(goal.status)) return;
     goal.status = "running"; goal.reason = undefined;

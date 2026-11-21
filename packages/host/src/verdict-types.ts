@@ -75,5 +75,5 @@ export const criteriaRowsSchema = z.array(criteriaRowSchema).min(1).max(L.criter
  * It lives here, not beside the evaluator's prompt, so team-prompts can import it without an import cycle.
  */
 export function criteriaRowsText(rows: readonly CriteriaRow[]): string {
-  return ["Agent assessment, provisional, of the previous cycle:", ...rows.map(row => `- ${row.criterion}: ${row.status} (${row.check})`)].join("\n");
+  return ["Agent assessment, provisional, of the latest assessed cycle:", ...rows.map(row => `- ${row.criterion}: ${row.status} (${row.check})`)].join("\n");
 }

@@ -23,6 +23,11 @@ export function dialogCommand(prompt: Pick<Prompt, "title" | "detail">): string 
   return command.join("\n");
 }
 
+/** True when answering this provider prompt changes an account-wide setting. */
+export function accountSettingPrompt(prompt: Pick<Prompt, "title">): boolean {
+  return prompt.title.replace(/[^a-z0-9]/gi, "").toLowerCase() === "codemodeexperimental";
+}
+
 /**
  * The exact one-shot option a delegated coordinator may recommend for this prompt, or undefined
  * when the prompt stays with its owner. Evidence must be complete: hook tool input that storage
@@ -30,7 +35,7 @@ export function dialogCommand(prompt: Pick<Prompt, "title" | "detail">): string 
  * whole command. Agent output scrolls above the provider's own input area, so it is never pinned.
  */
 export function oneShotPermissionOption(prompt: Prompt): number | undefined {
-  if (prompt.kind !== "permission" || !["screen", "hook"].includes(prompt.source) || !prompt.hash ||
+  if (accountSettingPrompt(prompt) || prompt.kind !== "permission" || !["screen", "hook"].includes(prompt.source) || !prompt.hash ||
       prompt.multiSelect || prompt.destructive || prompt.options.length < 2 || hasTruncatedEvidence(prompt.detail))
     return undefined;
   const toolEvidence = Boolean(prompt.tool?.name) && prompt.tool!.inputComplete === true && Object.keys(prompt.tool!.input).length > 0 && !hasTruncatedEvidence(prompt.tool!.input);

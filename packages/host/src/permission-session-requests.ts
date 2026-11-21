@@ -11,7 +11,7 @@
 import { realpathSync } from "node:fs";
 import { relative, isAbsolute, resolve } from "node:path";
 import { createHash } from "node:crypto";
-import { dialogCommand, matchDestructive, oneShotPermissionOption, type AnswerResult, type Prompt, type PromptOption } from "@infinite/attention";
+import { accountSettingPrompt, dialogCommand, matchDestructive, oneShotPermissionOption, type AnswerResult, type Prompt, type PromptOption } from "@infinite/attention";
 import { handoffNativePrompt } from "./handoff-types.js";
 import { oneShotRejectOption, permissionEvidenceHash, permissionReuseKey, refusedBeforeSend } from "./team-permissions.js";
 import { collectPermissionEvidence, permissionEvidenceDigest } from "./team-permission-evidence.js";
@@ -59,13 +59,14 @@ const isReject = (option: PromptOption) => option.role === "reject" || option.ro
  * would end the session is not one.
  */
 export function permissionChoices(prompt: Prompt): { accept?: number; reject?: number; shape: PermissionRequestShape } {
+  const accountSetting = accountSettingPrompt(prompt);
   const structural: Prompt = { ...prompt, destructive: undefined };
   const accept = oneShotPermissionOption(structural);
   const completeEvidence = oneShotPermissionOption({ ...structural, options: CANONICAL_CHOICES }) !== undefined;
-  const offeredAccept = oneShotPermissionOption({ ...COMPLETE_PROBE, options: [...prompt.options.filter(option => !isReject(option)), { index: -1, label: "No", role: "reject" }] });
+  const offeredAccept = accountSetting ? undefined : oneShotPermissionOption({ ...COMPLETE_PROBE, options: [...prompt.options.filter(option => !isReject(option)), { index: -1, label: "No", role: "reject" }] });
   const oneShotReject = prompt.options.find(option => option.index === oneShotRejectOption(prompt));
   const reject = oneShotReject && !PERSISTENT_LABEL.test(oneShotReject.label) ? oneShotReject.index : undefined;
-  const persistentOnly = offeredAccept === undefined &&
+  const persistentOnly = accountSetting || offeredAccept === undefined &&
     prompt.options.some(option => option.role === "accept-always" || option.role === "accept" && PERSISTENT_LABEL.test(option.label));
   return {
     ...(accept !== undefined ? { accept } : {}),

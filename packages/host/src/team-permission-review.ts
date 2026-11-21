@@ -2,7 +2,7 @@ import type { TeamMember, TeamPermissionDecision, TeamPermissionRecoveryOutcome,
 import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import type { Manager } from "./manager.js";
-import type { Prompt } from "@infinite/attention";
+import { accountSettingPrompt, type Prompt } from "@infinite/attention";
 import { ownerDirectionLines, permissionFollowUpPrompt, teamDeliveryBranch, teamPrompt, withoutRouting } from "./team-prompts.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { assertMemberReadOnly, memberChangedPaths, prepareMemberWorkspace, TeamError } from "./team-workspace.js";
@@ -42,6 +42,7 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
     let state;
     try { state = observedState ?? await this.host.manager.state(target.sessionId, true); } catch { return false; }
     const prompt = state.attention.prompt;
+    if (prompt && accountSettingPrompt(prompt)) return false;
     const pendingExpansion = (run.permissionRecovery?.requests ?? []).filter(item => item.revision === run.revision &&
       item.targetMemberId === target.memberId && item.targetSessionId === target.sessionId && item.status === "expanding" &&
       item.expansion && ["expanded", "uncertain"].includes(item.expansion.status)).at(-1);

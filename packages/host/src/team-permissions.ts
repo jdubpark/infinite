@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { dialogCommand, oneShotPermissionOption, type Prompt } from "@infinite/attention";
+import { accountSettingPrompt, dialogCommand, oneShotPermissionOption, type Prompt } from "@infinite/attention";
 import type { WorkerError } from "./ipc.js";
 import type { PermissionRequestShape } from "./permission-agent-types.js";
 import { ContentError } from "./session-content.js";
@@ -24,7 +24,7 @@ export function agentAcceptOption(prompt: Prompt): number | undefined {
  * complete evidence: rejecting what the host cannot read is a valid answer.
  */
 export function oneShotRejectOption(prompt: Prompt): number | undefined {
-  if (prompt.kind !== "permission" || !["screen", "hook"].includes(prompt.source) || !prompt.hash || prompt.multiSelect ||
+  if (accountSettingPrompt(prompt) || prompt.kind !== "permission" || !["screen", "hook"].includes(prompt.source) || !prompt.hash || prompt.multiSelect ||
       prompt.options.length < 2) return undefined;
   const rejects = prompt.options.filter(option => (option.role === "reject" || option.role === "reject-with-feedback") &&
     !PERSISTENT_LABEL.test(option.label));
@@ -35,15 +35,16 @@ const TRUST_TITLE = /\btrust\b.*\b(?:folder|files|workspace|project|directory)\b
 
 /** Structural facts about a dialog for the permission agent's qualify step and class rules. */
 export function permissionRequestShape(prompt: Prompt): PermissionRequestShape {
+  const accountSetting = accountSettingPrompt(prompt);
   const accept = agentAcceptOption(prompt);
-  const oneShotAccept = prompt.options.filter(option => option.role === "accept" && !PERSISTENT_LABEL.test(option.label)).length === 1;
+  const oneShotAccept = !accountSetting && prompt.options.filter(option => option.role === "accept" && !PERSISTENT_LABEL.test(option.label)).length === 1;
   const persistent = prompt.options.some(option => option.role === "accept-always" || option.role === "accept" && PERSISTENT_LABEL.test(option.label));
   const trustPrompt = TRUST_TITLE.test(prompt.title) || prompt.options.some(option => /\btrust\b/i.test(option.label));
   return {
     completeEvidence: accept !== undefined || completeDialogEvidence(prompt),
-    oneShotAccept: !trustPrompt && oneShotAccept,
-    oneShotReject: oneShotRejectOption(prompt) !== undefined,
-    persistentOnly: !oneShotAccept && persistent,
+    oneShotAccept: !accountSetting && !trustPrompt && oneShotAccept,
+    oneShotReject: !accountSetting && oneShotRejectOption(prompt) !== undefined,
+    persistentOnly: accountSetting || !oneShotAccept && persistent,
     trustPrompt,
   };
 }

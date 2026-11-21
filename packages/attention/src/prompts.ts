@@ -1,5 +1,6 @@
 import type { PromptKind, PromptOption, Provider } from "./types.js";
 import { roleForLabel } from "./roles.js";
+import { accountSettingPrompt } from "./delegation.js";
 
 export interface DetectedPrompt {
   kind: PromptKind;
@@ -31,6 +32,12 @@ const QUESTION_OPTION = /^(chat about this|other|skip|type something)/i;
 const MULTI = /a to select all|n to select none/i;
 const YES_NO = /(\[(y\/N|Y\/n|y\/n)\]|\((y\/n|yes\/no)\))\s*:?\s*$/i;
 const KEY_HINT = /^(Enter to|Esc to|Press )/i;
+/**
+ * The Code Mode dialog's feedback line and key hint with whitespace removed, each optional. Every other character
+ * counts, so an idle cursor after an older menu is not footer text. The separator is optional: a narrow wrap can
+ * leave it alone on a line, where it reads as a rule.
+ */
+const CODE_MODE_FOOTER = /^(Tellushowitgoeswith\/feedback)?(Entertoconfirm·?Esctostartwithoutit)?$/i;
 
 /** The non-empty lines of `text`, each with its whitespace runs collapsed to one space. */
 export function normalisedLines(text?: string): string[] {
@@ -44,6 +51,9 @@ export function cleanLine(line: string): string {
 
 export function detectPrompt(lines: string[], provider: Provider): DetectedPrompt | null {
   const clean = lines.map(cleanLine);
+  // This detector only claims a dialog that ends the screen, so an older menu above it is not read as open.
+  const codeMode = detectCodeModeConfirmation(clean);
+  if (codeMode) return codeMode;
   const block = lastOptionBlock(clean, lines);
   if (block) {
     const { start, end, options, highlighted } = block;
@@ -64,11 +74,10 @@ export function detectPrompt(lines: string[], provider: Provider): DetectedPromp
     const detailLines = above.filter((_, i) => i !== titleIndex && above[i] !== title);
     // A cut must be visible: delegation treats "… [+N chars]" as incomplete evidence, so a dialog
     // whose command runs past the cap can never qualify as a complete one-shot request.
-    const joined = detailLines.join("\n");
-    const detail = !detailLines.length ? undefined : joined.length > DETAIL_LIMIT ? `${joined.slice(0, DETAIL_LIMIT)}… [+${joined.length - DETAIL_LIMIT} chars]` : joined;
+    const detail = boundedDetail(detailLines);
     const footer = clean.slice(end + 1, end + 3).join(" ");
     const multiSelect = MULTI.test(footer);
-    const pinned = clean.slice(end + 1).every((l) => l === "" || RULE.test(l) || KEY_HINT.test(l));
+    const pinned = pinnedAfter(clean, end);
     let kind: PromptKind = "menu";
     if (PERMISSION.test(title)) kind = "permission";
     else if (options.some((o) => QUESTION_OPTION.test(o.label))) kind = "question";
@@ -138,7 +147,86 @@ function lastOptionBlock(clean: string[], raw: string[]) {
   return best;
 }
 
-const compact = (line: string) => line.replace(/[^a-z0-9]/gi, "").toLowerCase();
+function compact(line: string): string {
+  return line.replace(/[^a-z0-9]/gi, "").toLowerCase();
+}
+
+function boundedDetail(lines: string[]): string | undefined {
+  if (!lines.length) return undefined;
+  const joined = lines.join("\n");
+  return joined.length > DETAIL_LIMIT ? `${joined.slice(0, DETAIL_LIMIT)}… [+${joined.length - DETAIL_LIMIT} chars]` : joined;
+}
+
+function pinnedAfter(clean: string[], end: number): boolean {
+  return clean.slice(end + 1).every(line => line === "" || RULE.test(line) || KEY_HINT.test(line));
+}
+
+function compactedOptionAt(clean: string[], start: number, expected: string) {
+  let accumulated = "";
+  for (let end = start; end < Math.min(clean.length, start + 4); end++) {
+    const part = compact(clean[end].replace(/^[❯›>]\s*/, "").trim());
+    if (!part || !expected.startsWith(accumulated + part)) return undefined;
+    accumulated += part;
+    if (accumulated === expected) {
+      const line = clean[start];
+      return { start, end, highlighted: line.includes("❯") || line.includes("›") || line.trimStart().startsWith(">") };
+    }
+  }
+  return undefined;
+}
+
+/** Claude's first-run Code Mode setting is an unnumbered, owner-reserved two-option menu. */
+function detectCodeModeConfirmation(clean: string[]): DetectedPrompt | null {
+  const titleIndex = findLastIndex(clean, line => accountSettingPrompt({ title: line }));
+  if (titleIndex < 0) return null;
+  let firstOption: ReturnType<typeof compactedOptionAt>;
+  let secondOption: ReturnType<typeof compactedOptionAt>;
+  let firstRole: "reject" | "accept" | undefined;
+  for (let start = titleIndex + 1; start < clean.length; start++) {
+    const noFirst = compactedOptionAt(clean, start, "nostartwithoutit");
+    const yesFirst = noFirst ? undefined : compactedOptionAt(clean, start, "yesturnoncodemode");
+    const first = noFirst ?? yesFirst;
+    if (!first) continue;
+    const otherRole = noFirst ? "accept" : "reject";
+    const second = compactedOptionAt(clean, first.end + 1, otherRole === "accept" ? "yesturnoncodemode" : "nostartwithoutit");
+    if (!second) continue;
+    // Only this dialog's own footer may follow. A general key hint would also admit another prompt's line, such as
+    // "Press y to proceed or n to cancel [Y/n]", and return the older menu above it.
+    const tail = clean.slice(second.end + 1).filter(line => !RULE.test(line)).join("").replace(/\s+/g, "");
+    if (!CODE_MODE_FOOTER.test(tail)) continue;
+    firstOption = first;
+    secondOption = second;
+    firstRole = noFirst ? "reject" : "accept";
+    break;
+  }
+  if (!firstOption || !secondOption || firstOption.highlighted === secondOption.highlighted) return null;
+  const end = secondOption.end;
+  const options = firstRole === "reject"
+    ? [
+        { index: 0, label: "No, start without it", role: "reject" as const },
+        { index: 1, label: "Yes, turn on Code Mode", role: "accept" as const },
+      ]
+    : [
+        { index: 0, label: "Yes, turn on Code Mode", role: "accept" as const },
+        { index: 1, label: "No, start without it", role: "reject" as const },
+      ];
+  const marked = firstOption.highlighted ? 0 : 1;
+  const detailLines = clean.slice(titleIndex + 1, firstOption.start).filter(line => line !== "" && !RULE.test(line));
+  const detail = boundedDetail(detailLines);
+  return {
+    kind: "permission",
+    title: clean[titleIndex],
+    detail,
+    options,
+    highlighted: marked,
+    acceptsText: false,
+    multiSelect: false,
+    pinned: true,
+    fingerprint: [clean[titleIndex], ...normalisedLines(detail), ...options.map(option => option.label)].join("\n"),
+    blockStart: firstOption.start,
+    blockEnd: end,
+  };
+}
 
 /** Claude's first-run folder question is an unnumbered two-option menu, not `1. Yes`. */
 function detectWorkspaceTrust(clean: string[]): DetectedPrompt | null {
@@ -177,7 +265,7 @@ function detectWorkspaceTrust(clean: string[]): DetectedPrompt | null {
     highlighted: marked,
     acceptsText: false,
     multiSelect: false,
-    pinned: clean.slice(end + 1).every((line) => line === "" || RULE.test(line) || KEY_HINT.test(line)),
+    pinned: pinnedAfter(clean, end),
     fingerprint: [title, ...normalisedLines(detail), ...options.map((option) => option.label)].join("\n"),
     blockStart: start,
     blockEnd: end,

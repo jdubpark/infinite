@@ -420,6 +420,9 @@ test("Codex tool signatures name the callable form and carry the declared result
     { name: "entry_post", schema: outputSchemas.entry_post },
   ] as const;
   const paragraph = codexMemberToolInstructions(true);
+  // The types come from the schemas, so a schema change grows every Codex member prompt: these bounds make that a decision.
+  assert.ok(Buffer.byteLength(paragraph, "utf8") < 2400, "the rule with the entry tools stays under 2,400 bytes");
+  assert.ok(Buffer.byteLength(codexMemberToolInstructions(false), "utf8") < 800, "the rule with the report tool alone stays under 800 bytes");
   assert.ok(paragraph.startsWith("Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results."));
   assert.doesNotMatch(paragraph, /session record keeps each nested call/);
   assert.doesNotMatch(paragraph, /\n/);
@@ -468,6 +471,7 @@ test("tool signature types render each schema form from the declared schema", ()
   assert.equal(schemaType({}), "unknown");
   assert.equal(schemaType({ type: "object" }), "unknown");
   assert.equal(schemaType({ type: "array", items: { anyOf: [{ type: "string" }, { type: "number" }] } }), "(string|number)[]");
+  assert.equal(schemaType({ anyOf: [{ type: "string" }, { type: "null" }] }), "string|null");
   assert.equal(toolSignature("demo_server", "echo", "{ text }", { type: "object", properties: { text: { type: "string" } }, required: ["text"] }),
     "await tools.mcp__demo_server__echo({ text }) returns { structuredContent: { text: string } }.");
 });

@@ -21,6 +21,7 @@ export function schemaType(schema: unknown): string {
     case "integer":
     case "number": return "number";
     case "boolean": return "boolean";
+    case "null": return "null";
     case "array": {
       // Object elements keep the brace form; a union of primitives needs parentheses before the `[]`.
       const item = schemaType(schema.items);

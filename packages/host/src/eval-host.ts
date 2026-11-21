@@ -8,7 +8,7 @@ import { applyDuplicateRule, GroupPass, rootOf, sweepGroups } from "./eval-group
 import { launcherEvalIdentity, type EvalIdentity } from "./eval-identity.js";
 import { ACTIVE_JOBS_SQL, EvalJobs, JOB_LIST_MAX, type NextWork } from "./eval-jobs.js";
 import { TrialJobs } from "./eval-trial-jobs.js";
-import { trialsSince } from "./eval-trial-store.js";
+import { evalTrialsModule, trialsSince } from "./eval-trial-store.js";
 import { TrialPump, type TrialTeams } from "./eval-trial-pump.js";
 import { mineGit, type MineGit } from "./eval-mine-git.js";
 import { Miner } from "./eval-miner.js";
@@ -109,6 +109,8 @@ export class EvalHost implements EvalHostApi {
     });
     this.groups = new GroupPass({ store: this.store, runs: options.runs, now: this.now });
     this.miner = new Miner({ config: this.config, store: this.store, source: this.source, git: this.git, runs: options.runs, now: this.now });
+    // The trial tables. Nothing else registers them, and every trial job, trial, and count below writes to them.
+    this.store.register(evalTrialsModule(this.store, this.now));
     this.trialJobs = new TrialJobs({ store: this.store, config: this.config, now: this.now });
     this.evalJobs = new EvalJobs({
       store: this.store, config: this.config, now: this.now,

@@ -406,8 +406,10 @@ op_setup() {
 
 # Prints the ids of the account's System V objects of one kind (m shared memory, s semaphores, q message queues), one
 # per line, digits only. It reads the kernel's own table, which gives the owner as a number: ipcs prints the owner as
-# a name cut to ten characters, which a longer account name never equals. Fails when the table cannot be read or has
-# no uid column, so that a caller never reads a failed listing as an empty one.
+# a name cut to ten characters, which a longer account name never equals. An object counts as the account's when the
+# account owns it or created it: the creator can still remove an object whose owner it changed. Fails when the table
+# cannot be read, is longer than 4 MiB, or has no uid or cuid column, so that a caller never reads a failed listing as
+# an empty one.
 ipc_ids() {
   ipc_uid=$(/usr/bin/id -u)
   case "$1" in
@@ -417,8 +419,10 @@ ipc_ids() {
     *) return 1 ;;
   esac
   [ -r "$ipc_table" ] || return 1
-  listing=$(/usr/bin/head -c 4194304 "$ipc_table" 2>/dev/null) || return 1
+  listing=$(/usr/bin/head -c 4194305 "$ipc_table" 2>/dev/null) || return 1
+  [ "${#listing}" -le 4194304 ] || return 1
   ipc_column=0
+  ipc_creator=0
   ipc_header=1
   while read -r ipc_line; do
     # Word splitting is wanted here: the table's columns are separated by spaces. No pattern character can expand.
@@ -432,14 +436,17 @@ ipc_ids() {
       for ipc_name in "$@"; do
         ipc_index=$((ipc_index + 1))
         if [ "$ipc_name" = uid ]; then ipc_column=$ipc_index; fi
+        if [ "$ipc_name" = cuid ]; then ipc_creator=$ipc_index; fi
       done
-      [ "$ipc_column" -gt 2 ] || return 1
+      [ "$ipc_column" -gt 2 ] && [ "$ipc_creator" -gt "$ipc_column" ] || return 1
       continue
     fi
-    [ $# -ge "$ipc_column" ] || continue
+    [ $# -ge "$ipc_creator" ] || continue
     ipc_id=$2
     shift $((ipc_column - 1))
-    [ "$1" = "$ipc_uid" ] || continue
+    ipc_owner=$1
+    shift $((ipc_creator - ipc_column))
+    [ "$ipc_owner" = "$ipc_uid" ] || [ "$1" = "$ipc_uid" ] || continue
     case "$ipc_id" in
       ''|*[!0-9]*) continue ;;
     esac

@@ -233,8 +233,8 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
     let applicable = false;
     try { applicable = pipeline.applicable(decisionId, request); } catch { applicable = false; }
     if (!applicable) {
-      record("refusal", "The decision's authority was retired before delivery.");
-      return { handled: false, reason: "The decision's authority was retired before delivery." };
+      record("refusal", "The decision no longer applies to this request.");
+      return { handled: false, reason: "The decision no longer applies to this request." };
     }
     if (choice === "accept" && request.destructive && !strongTier) {
       record("refusal", "A request with the destructive flag is delivered only on a strong verdict.");

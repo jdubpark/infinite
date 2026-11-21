@@ -222,8 +222,8 @@ export class HostPermissionPipeline implements PermissionPipeline {
    * comes from the journal, and it selects the tier of a fresh turn only.
    */
   private read(request: PermissionRequest, coverage: Covered): Reading {
-    const match = this.core.classify(request, coverage.interruptClasses);
-    const raised = [...new Set(this.core.raise(request, { rejectHistory: false }))];
+    const rules = this.core.readRules(request, coverage.interruptClasses);
+    const match = rules.match, raised = [...new Set(rules.raised)];
     const { title, text } = request.requester.task;
     const inputs = sha256(["permission-review-inputs", title, text, match ? [match.interruptClass, match.rule] : null, [...raised].sort()]);
     return { match, raised, inputs };
@@ -336,13 +336,14 @@ export class HostPermissionPipeline implements PermissionPipeline {
     if (decision.rules.includes(READ_SOURCE)) {
       return { kind: "undeliverable", reason: "The source files that this allow depends on cannot be read again." };
     }
-    // A recorded allow answers a second attempt only while a new identical request could replay it: the assignment
-    // is not locked, no open effect reject of the task is newer, and the requester's family may still receive it.
-    if (this.journal.isLocked(decision.assignment)
-      || !this.journal.replayEligible(decisionId, { taskId: decision.taskId, requesterFamily: this.familyOf(request) })) {
-      return { kind: "undeliverable", reason: "A lock or a later reject of this task stands before the recorded allow." };
-    }
-    return this.outcomeOf(decision);
+    // A recorded allow answers a second attempt only while a new identical request would replay the same verdict:
+    // the assignment is not locked, no open effect reject of the task is newer, the requester's family may still
+    // receive it, and no later verdict for the request stands before it.
+    const family = this.familyOf(request);
+    const stillAnswers = !this.journal.isLocked(decision.assignment) && (decision.reuseKey === undefined
+      ? this.journal.replayEligible(decisionId, { taskId: decision.taskId, requesterFamily: family })
+      : sourceOf(this.replayCandidate(decision.taskId, decision.reuseKey, family)) === sourceOf(decision));
+    return stillAnswers ? this.outcomeOf(decision) : { kind: "undeliverable", reason: "The recorded allow no longer answers this request." };
   }
 
   private async decideFresh(
@@ -583,6 +584,11 @@ function decisionIdFor(request: PermissionRequest, authorityHash: string, inputs
  */
 function reuseKeyFor(requestKey: string, coverage: Covered, inputs: string): string {
   return sha256(["permission-reuse", coverage.projectId, coverage.authorityHash, requestKey, inputs]);
+}
+
+/** The reviewed verdict a decision carries: itself, or the decision it replays. Replays are stored against their source. */
+function sourceOf(decision: PermissionDecision | undefined): string | undefined {
+  return decision && (decision.replayOf ?? decision.id);
 }
 
 function rejectRef(decision: PermissionDecision): PermissionRejectRef {

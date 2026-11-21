@@ -184,6 +184,12 @@ export interface PermissionAgentCore {
   qualify(request: PermissionRequest): PermissionQualification;
   /** The raise rules that match. They only select the tier of a fresh turn. */
   raise(request: PermissionRequest, context: { rejectHistory: boolean }): string[];
+  /**
+   * The class rule and the raise rules that match, from one reading of the request in which each path is resolved
+   * once. The reject history is not among them. A decision takes both results from here, so they describe the same
+   * file system.
+   */
+  readRules(request: PermissionRequest, interruptClasses: readonly string[]): { match: PermissionClassMatch | undefined; raised: string[] };
   /** Runs the light turn, the strong turn, or both. Never throws for a model failure: that is `reject` with `unavailable`. */
   review(request: PermissionRequest, context: PermissionReviewContext): Promise<PermissionReview>;
 }

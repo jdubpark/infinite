@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, normalize } from "node:path";
 import { classify, classRulesDigest, EMBEDDED_COMMAND_LIMITS, raise } from "../packages/host/src/permission-classes.js";
 import { detectPrompt, type Prompt } from "@infinite/attention";
 import { familyOf } from "../packages/host/src/permission-families.js";
@@ -650,10 +650,10 @@ test("one reading resolves each path once, so the class rules and the raise rule
   const resolvePath = (path: string) => {
     const seen = (calls.get(path) ?? 0) + 1;
     calls.set(path, seen);
-    return path.endsWith("/notes") && seen > 1 ? "/etc/sudoers" : path;
+    return path.endsWith("/notes") && seen > 1 ? "/etc/sudoers" : normalize(path);
   };
   const core = createPermissionAgentCore({ settings: settings(), launcher: fakeLauncher(() => "no-report").launcher, resolvePath });
-  const rules = core.readRules(bash("cp draft.txt ../shared/notes"), CLASSES);
+  const rules = core.readRules(bash("cat ../shared/notes && sh -c \"cat ../shared/notes\" && cp draft.txt ../shared/notes"), CLASSES);
   assert.deepEqual([...calls.values()].filter(count => count > 1), [], "no path is resolved twice in one reading");
   assert.equal(rules.match, undefined);
   assert.ok(rules.raised.includes("raise:outside-root"));

@@ -2555,9 +2555,10 @@ Each request passes these steps in order:
    the reading changed while the review ran; the task text in that check is
    the one the request was handed with. A pending dialog is not handed to the
    agent again only because its reading changed. A recorded allow answers a
-   second attempt at the same dialog only while a new identical request could
-   replay it: a lock of the assignment, or an open effect reject of the task
-   newer than the allow, leaves it with the owner.
+   second attempt at the same dialog only while a new identical request would
+   replay the same verdict: a lock of the assignment, an open effect reject of
+   the task newer than the allow, or a later verdict for the request leaves
+   it with the owner.
    A verdict that the strong model reached after it asked the host for
    source files is the exception: it cannot answer a new dialog. The delivery
    that follows the review checks again any file the adapter collected. An

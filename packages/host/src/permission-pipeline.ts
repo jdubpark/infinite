@@ -297,6 +297,11 @@ export class HostPermissionPipeline implements PermissionPipeline {
     if (!this.state.decision(decisionId)) {
       return { kind: "undeliverable", reason: "The permission agent could not record this decision's authority." };
     }
+    // A second attempt at the same request (after a refused delivery or a restart) cannot read again what the
+    // review read. An allow that depended on it is left with the owner; the decision and its count stay as recorded.
+    if (decision.verdict === "allow" && decision.rules.includes(READ_SOURCE)) {
+      return { kind: "undeliverable", reason: "The source files that this allow depends on cannot be read again." };
+    }
     return this.outcomeOf(decision);
   }
 
@@ -365,8 +370,8 @@ export class HostPermissionPipeline implements PermissionPipeline {
     if (!canAllow) raised.push("not-qualified");
 
     // 6. The review, with the task's open rejects, the assignment's evidence rejects and the owner's direction.
-    // A verdict reached after the review read source files depends on what those files held then. Its own
-    // delivery reads them again; an identical later request would not, so such a verdict is never replayed.
+    // A verdict reached after the review read source files depends on what those files held then. The delivery
+    // that follows reads them again. No later request or attempt can, so the decision is marked and answers neither.
     let readSource = false;
     const collect = options.collect;
     const context: PermissionReviewContext = {
@@ -397,6 +402,7 @@ export class HostPermissionPipeline implements PermissionPipeline {
       ...raised.map(rule => rule.startsWith("raise:") ? rule : `raise:${rule}`),
       ...(qualification.qualified ? [] : [`qualify:${qualification.reason}`]),
       ...verdict.rules,
+      ...(readSource ? [READ_SOURCE] : []),
     ];
     const decision: PermissionDecision = {
       ...base,
@@ -411,7 +417,7 @@ export class HostPermissionPipeline implements PermissionPipeline {
       ...(verdict.repeats === undefined ? {} : { repeats: verdict.repeats }),
     };
     try {
-      return this.record(decision, coverage, !isHostCode(decision.code) && !readSource);
+      return this.record(decision, coverage, !isHostCode(decision.code));
     } catch {
       // The journal refused the report as recorded (for example its tier list). That is a report with no verdict.
       const { note: _note, repeats: _repeats, code: _code, interruptClass: _class, ...rest } = decision;
@@ -426,7 +432,9 @@ export class HostPermissionPipeline implements PermissionPipeline {
     const candidateId = this.state.latestReplayable(taskId, reuseKey);
     if (!candidateId) return undefined;
     const candidate = this.journal.decision(candidateId);
-    if (!candidate || candidate.verdict === "owner") return undefined;
+    // The latest verdict for the request stops the lookup when it cannot be replayed itself: an older one behind
+    // it is not consulted. That holds for an owner verdict and for a verdict that read source files.
+    if (!candidate || candidate.verdict === "owner" || candidate.rules.includes(READ_SOURCE)) return undefined;
     return this.journal.replayEligible(candidateId, { taskId, requesterFamily: family }) ? candidate : undefined;
   }
 
@@ -513,6 +521,12 @@ export class HostPermissionPipeline implements PermissionPipeline {
     return { kind: "allow", decisionId: decision.id, strongTier: source?.tiers.at(-1)?.tier === "strong" };
   }
 }
+
+/**
+ * Marks a decision whose review read source files through the adapter's collection. The verdict depends on what
+ * those files held then, and the adapter can read them again only for the delivery that follows that review.
+ */
+const READ_SOURCE = "host:read-source";
 
 /** One raised request under one authority has one decision id. A changed request or a new authority gets another. */
 function decisionIdFor(request: PermissionRequest, authorityHash: string): string {

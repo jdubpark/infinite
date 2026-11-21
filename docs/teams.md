@@ -2545,9 +2545,12 @@ Each request passes these steps in order:
 3. **Lock and replay.** An assignment that repeated one rejected request twice
    is locked and gets no model turn until the owner unlocks it. An identical
    request under the same authority is answered from its recorded verdict.
-   A verdict that the strong model reached after it read source files is the
-   exception: it is never replayed, so the identical request is reviewed
-   again and the files are read again.
+   A verdict that the strong model reached after it asked the host for
+   source files is the exception. It answers only the delivery that follows
+   that review, which reads the files again. An identical request is reviewed
+   again, and that review can ask for the files as they are then. A second
+   attempt at the same dialog, after a refused delivery or a host restart,
+   leaves an allow of this kind with the owner.
    The authority is the owner's delegation together with the policy text, the
    class rules and the tier profiles in force, and the project's halt epoch.
    A release or a configuration change that alters any of them sets aside

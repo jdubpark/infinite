@@ -32,7 +32,8 @@ const QUESTION_OPTION = /^(chat about this|other|skip|type something)/i;
 const MULTI = /a to select all|n to select none/i;
 const YES_NO = /(\[(y\/N|Y\/n|y\/n)\]|\((y\/n|yes\/no)\))\s*:?\s*$/i;
 const KEY_HINT = /^(Enter to|Esc to|Press )/i;
-const CODE_MODE_FEEDBACK = "tellushowitgoeswithfeedback";
+/** The Code Mode dialog's feedback line and key hint, compacted and joined, each optional. */
+const CODE_MODE_FOOTER = /^(tellushowitgoeswithfeedback)?(entertoconfirmesctostartwithoutit)?$/;
 
 /** The non-empty lines of `text`, each with its whitespace runs collapsed to one space. */
 export function normalisedLines(text?: string): string[] {
@@ -152,8 +153,8 @@ function boundedDetail(lines: string[]): string | undefined {
   return joined.length > DETAIL_LIMIT ? `${joined.slice(0, DETAIL_LIMIT)}… [+${joined.length - DETAIL_LIMIT} chars]` : joined;
 }
 
-function pinnedAfter(clean: string[], end: number, extraChrome?: (line: string) => boolean): boolean {
-  return clean.slice(end + 1).every(line => line === "" || RULE.test(line) || KEY_HINT.test(line) || extraChrome?.(line) === true);
+function pinnedAfter(clean: string[], end: number): boolean {
+  return clean.slice(end + 1).every(line => line === "" || RULE.test(line) || KEY_HINT.test(line));
 }
 
 function compactedOptionAt(clean: string[], start: number, expected: string) {
@@ -185,9 +186,10 @@ function detectCodeModeConfirmation(clean: string[]): DetectedPrompt | null {
     const otherRole = noFirst ? "accept" : "reject";
     const second = compactedOptionAt(clean, first.end + 1, otherRole === "accept" ? "yesturnoncodemode" : "nostartwithoutit");
     if (!second) continue;
+    // Only this dialog's own footer may follow. A general key hint would also admit another prompt's line, such as
+    // "Press y to proceed or n to cancel [Y/n]", and return the older menu above it.
     const tail = clean.slice(second.end + 1).filter(line => line !== "" && !RULE.test(line)).map(compact).join("");
-    const footerChrome = /^(tellushowitgoeswithfeedback)?(entertoconfirmesctostartwithoutit)?$/.test(tail);
-    if (!footerChrome && !pinnedAfter(clean, second.end, line => compact(line) === CODE_MODE_FEEDBACK)) continue;
+    if (!CODE_MODE_FOOTER.test(tail)) continue;
     firstOption = first;
     secondOption = second;
     firstRole = noFirst ? "reject" : "accept";

@@ -98,6 +98,17 @@ test("an old Code Mode menu above a yes-no prompt leaves the yes-no prompt open"
   assert.equal(prompt?.title, "Continue? [y/N]");
 });
 
+test("another prompt's key hint is not the Code Mode footer", () => {
+  // The line starts like a key hint and is a live yes-no prompt. Read as footer text, it would return the old menu.
+  for (const cursor of ["no", "yes"] as const) {
+    const prompt = detectPrompt([...staleCodeModeMenu(cursor), "", "Press y to proceed or n to cancel [Y/n]"], "claude");
+    assert.equal(prompt?.kind, "yes-no", cursor);
+    assert.equal(prompt?.title, "Press y to proceed or n to cancel [Y/n]", cursor);
+  }
+  for (const hint of ["Press Enter to continue", "Esc to cancel", "Enter to confirm"])
+    assert.notEqual(detectPrompt([...staleCodeModeMenu("no"), hint], "claude")?.title, "Code Mode (experimental)", hint);
+});
+
 test("an old Code Mode menu followed by transcript text is not an open prompt", () => {
   assert.equal(detectPrompt([...staleCodeModeMenu("no"), "Task continued in the transcript."], "claude"), null);
 });

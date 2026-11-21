@@ -867,9 +867,11 @@ test("a subteam's first paused record carries the halt's mark, so a restart keep
     const save = internal.save.bind(first.teams);
     internal.save = stored => { save(stored); if (stored.run.id === teamId && stored.run.status === "paused") throw new Error("The host stopped."); };
     await assert.rejects(first.applyOps(), /The host stopped/);
-    const durable = f.readRecord<{ run: TeamRun; ownerHalt?: { haltId?: string } }>("team", teamId);
+    const durable = f.readRecord<{ run: TeamRun; ownerHalt?: { haltId?: string; reason: string } }>("team", teamId);
     assert.equal(durable.run.status, "paused");
     assert.equal(durable.ownerHalt?.haltId, first.stored.ownerHalt?.token, "the first paused record already carries the halt's mark");
+    assert.equal(durable.run.reason, durable.ownerHalt?.reason, "and the halt's reason");
+    assert.ok(durable.run.events.some(event => event.text === `Team paused: ${durable.ownerHalt?.reason}`), "and its event line");
     first.close();
 
     second = missionWithSubteam(f, missionId);

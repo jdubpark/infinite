@@ -75,6 +75,8 @@ type StoredAnswer = { digest: string; receipt: { requestId: string; state: "deli
 
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const clean = (text: string, limit: number) => text.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, " ").trim().slice(0, limit);
+/** Calls of one agent with the same tool and input share this key. */
+const callKey = (call: ChannelCall, inputHash: string) => `${call.agentId ?? ""}\n${call.toolName}\n${inputHash}`;
 
 /** The hook payload fields the channel reads. Anything else in the payload is ignored. */
 function readCall(body: unknown): (ChannelCall & { nativeSessionId?: string }) | undefined {
@@ -97,8 +99,13 @@ export class HeadlessChannelWorker {
   private served = false;
   private nativeSessionId?: string;
   private deferred?: Deferred;
-  /** Tool calls the class check saw, by agent, tool and input, for the PermissionRequest that has no call id. */
-  private recent = new Map<string, string>();
+  /**
+   * Calls left to the provider's own rules, by agent, tool and input, for the PermissionRequest that has no call id.
+   * The value is the one such call's id. It is a count when the call has no id or identical calls are open together:
+   * their requests cannot be told apart, so none of them takes a call id. A call the provider settles without a
+   * request stays here, so the request of a later identical call takes no id either.
+   */
+  private recent = new Map<string, string | number>();
   /** Call ids that already received the owner's answer. A repeat is denied. */
   private consumed = new Set<string>();
   private answers = new Map<string, StoredAnswer>();
@@ -119,6 +126,31 @@ export class HeadlessChannelWorker {
   }
 
   private deny(code: RejectCode): ChannelAnswer { return { decision: "deny", reason: requesterNotice(code) }; }
+
+  /** A call left to the provider's own rules. Only such a call can come back as a PermissionRequest. */
+  private leftOpen(key: string, callId?: string) {
+    const held = this.recent.get(key);
+    if (callId !== undefined && held === callId) return;
+    // Set again at the end, so the key dropped at the bound is the one whose last call is the oldest.
+    this.recent.delete(key);
+    this.recent.set(key, held === undefined ? callId ?? 1 : typeof held === "number" ? held + 1 : 2);
+    if (this.recent.size > 256) this.recent.delete(this.recent.keys().next().value!);
+  }
+
+  /**
+   * The call id of a PermissionRequest: its own when it names one, else the id of the one identical call left open.
+   * With several left open it takes none, and each of their requests counts one of them off.
+   */
+  private callOf(key: string, own?: string): string | undefined {
+    const held = this.recent.get(key);
+    if (typeof held === "number") {
+      if (held > 1) this.recent.set(key, held - 1);
+      else this.recent.delete(key);
+      return own;
+    }
+    if (held !== undefined && (!own || held === own)) this.recent.delete(key);
+    return own ?? held;
+  }
 
   /** Recorded only in the session's own journal. */
   private pending(tool: string): ChannelAnswer {
@@ -176,14 +208,13 @@ export class HeadlessChannelWorker {
       return settle("allow", "receipt", "Headless: the owner's allow was returned to the resumed call.", { decision: "allow" });
     }
     if (deferred) return this.pending(call.toolName);
-    if (call.toolUseId) {
-      this.recent.set(`${call.agentId ?? ""}\n${call.toolName}\n${inputHash}`, call.toolUseId);
-      if (this.recent.size > 256) this.recent.delete(this.recent.keys().next().value!);
-    }
     let reply: ChannelReply;
     try { reply = await this.ask({ op: "class", call }, CLASS_CHECK_MS); }
     catch { return this.deny("unavailable"); }
-    if (reply.result === "not-served" || reply.result === "none") return { decision: "none" };
+    if (reply.result === "not-served" || reply.result === "none") {
+      this.leftOpen(callKey(call, inputHash), call.toolUseId);
+      return { decision: "none" };
+    }
     if (reply.result === "deny") {
       // The host recorded no owner decision this call could wait on: under a halt it is denied as unavailable;
       // otherwise it is denied with needs-owner and the owner is told with the class.
@@ -222,11 +253,10 @@ export class HeadlessChannelWorker {
     const call = readCall(body);
     if (!call) return this.deny("unavailable");
     this.first(call);
-    if (this.deferred) return this.pending(call.toolName);
     const inputHash = hash(call.toolInput);
-    const key = `${call.agentId ?? ""}\n${call.toolName}\n${inputHash}`;
-    const callId = call.toolUseId ?? this.recent.get(key);
-    if (callId) this.recent.delete(key);
+    // Counted off before any answer: this call raises no second request, whatever this one is told.
+    const callId = this.callOf(callKey(call, inputHash), call.toolUseId);
+    if (this.deferred) return this.pending(call.toolName);
     // Stable for this raised request; an uncorrelated request gets an id of its own.
     const requestId = `headless:${this.host.sessionId}:${callId ?? `r${++this.requests}-${inputHash.slice(0, 24)}`}`;
     const forwarded: ChannelCall = { toolName: call.toolName, toolInput: call.toolInput, ...(callId ? { toolUseId: callId } : {}), ...(call.agentId ? { agentId: call.agentId } : {}) };

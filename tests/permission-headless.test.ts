@@ -456,6 +456,114 @@ test("a PermissionRequest carries the call id of its PreToolUse and only host te
   assert.match(decide.requestId, /:toolu_7$/);
 });
 
+/** The decide requests a worker sent, in order. */
+const decides = (w: ReturnType<typeof workerRig>) =>
+  w.requests.filter(request => (request as { op?: string }).op === "decide") as Array<{ requestId: string; call: { toolUseId?: string } }>;
+/** A PermissionRequest hook for a Bash command. The provider sends it without a call id. */
+const raise = (w: ReturnType<typeof workerRig>, command: string, extra: Record<string, unknown> = {}) =>
+  w.channel.request({ hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: { command }, ...extra });
+
+test("identical calls open together: no PermissionRequest takes a call id until all of them are counted off", async () => {
+  const w = workerRig([]);
+  await w.pre("git status", "toolu_a");
+  await w.pre("git status", "toolu_b");
+  await raise(w, "git status");
+  // A third identical call starts while one of the first two is still open.
+  await w.pre("git status", "toolu_c");
+  await raise(w, "git status");
+  await raise(w, "git status");
+  assert.deepEqual(decides(w).map(decide => decide.call.toolUseId), [undefined, undefined, undefined]);
+  assert.equal(new Set(decides(w).map(decide => decide.requestId)).size, 3, "each request has an id of its own");
+  assert.equal(decides(w).some(decide => /toolu_/.test(decide.requestId)), false);
+
+  // All three are counted off, so the next identical call is alone and its request takes its id.
+  await w.pre("git status", "toolu_d");
+  await raise(w, "git status");
+  assert.equal(decides(w)[3]!.call.toolUseId, "toolu_d");
+  assert.match(decides(w)[3]!.requestId, /:toolu_d$/);
+});
+
+test("identical calls one after the other each keep their own id, and a call seen twice is one call", async () => {
+  const w = workerRig([]);
+  await w.pre("git status", "toolu_a");
+  await raise(w, "git status");
+  await w.pre("git status", "toolu_b");
+  await w.pre("git status", "toolu_b");
+  await raise(w, "git status");
+  assert.deepEqual(decides(w).map(decide => decide.call.toolUseId), ["toolu_a", "toolu_b"]);
+});
+
+test("a call the worker denied is not held, so its retry is alone and its request takes the retry's id", async () => {
+  const w = workerRig([new Error("ECONNREFUSED")]);
+  assert.deepEqual(await w.pre("ls", "toolu_1"), { decision: "deny", reason: requesterNotice("unavailable") });
+  assert.deepEqual(await w.pre("ls", "toolu_2"), { decision: "none" });
+  await raise(w, "ls");
+  assert.equal(decides(w)[0]!.call.toolUseId, "toolu_2");
+});
+
+test("a PermissionRequest that names its call keeps that id among identical calls and counts one of them off", async () => {
+  const w = workerRig([]);
+  await w.pre("git status", "toolu_a");
+  await w.pre("git status", "toolu_b");
+  await raise(w, "git status", { tool_use_id: "toolu_b" });
+  await raise(w, "git status");
+  await w.pre("git status", "toolu_c");
+  await raise(w, "git status", { tool_use_id: "toolu_c" });
+  await raise(w, "git status");
+  assert.deepEqual(decides(w).map(decide => decide.call.toolUseId), ["toolu_b", undefined, "toolu_c", undefined]);
+});
+
+test("a PermissionRequest that names another call leaves the held call for its own request", async () => {
+  const w = workerRig([]);
+  await w.pre("git status", "toolu_a");
+  await raise(w, "git status", { tool_use_id: "toolu_z" });
+  await raise(w, "git status");
+  assert.deepEqual(decides(w).map(decide => decide.call.toolUseId), ["toolu_z", "toolu_a"]);
+});
+
+test("a call without an id is counted as open too, so its request never takes an identical call's id", async () => {
+  const w = workerRig([]);
+  const bare = (command: string) => w.channel.check({ hook_event_name: "PreToolUse", session_id: "native-1", tool_name: "Bash", tool_input: { command } });
+  await w.pre("git status", "toolu_a");
+  await bare("git status");
+  await raise(w, "git status");
+  await raise(w, "git status");
+  // Alone, it is counted off by its own request and holds nothing back from the next call.
+  await bare("git status");
+  await raise(w, "git status");
+  await w.pre("git status", "toolu_b");
+  await raise(w, "git status");
+  assert.deepEqual(decides(w).map(decide => decide.call.toolUseId), [undefined, undefined, undefined, "toolu_b"]);
+});
+
+test("a PermissionRequest denied as pending still counts its call off, so the retry's request takes the retry's id", async () => {
+  const w = workerRig([{ result: "none" }, owner]);
+  await w.pre("npm test", "toolu_1");
+  assert.equal((await w.pre("deploy production", "toolu_2")).decision, "defer");
+  assert.deepEqual(await raise(w, "npm test"), { decision: "deny", reason: PENDING_NOTICE });
+  w.channel.retire("stopped");
+  await w.pre("npm test", "toolu_3");
+  await raise(w, "npm test");
+  assert.deepEqual(decides(w).map(decide => decide.call.toolUseId), ["toolu_3"]);
+});
+
+test("at its bound the worker drops the key whose last call is the oldest, not one with a call just left open", async () => {
+  const w = workerRig([]);
+  await w.pre("git status", "toolu_a");
+  for (let other = 0; other < 255; other++) await w.pre(`echo ${other}`, `toolu_other_${other}`);
+  // The first key again: two identical calls are now open, and it is no longer the oldest.
+  await w.pre("git status", "toolu_b");
+  await w.pre("echo one-more", "toolu_more");
+  await w.pre("git status", "toolu_c");
+  await raise(w, "git status");
+  // Had the bound dropped the first key, the third call would look alone and this request would take its id.
+  assert.equal(decides(w)[0]!.call.toolUseId, undefined);
+  // The key that was dropped is the oldest other one: its request finds no call.
+  await raise(w, "echo 0");
+  await raise(w, "echo 1");
+  assert.deepEqual(decides(w).slice(1).map(decide => decide.call.toolUseId), [undefined, "toolu_other_1"]);
+});
+
 /* ------------------------------------------------------------------ the host half */
 
 function hostRig(pipeline: PermissionPipeline, headless: Session["headless"] = { channel: true },

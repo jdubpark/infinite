@@ -2508,6 +2508,8 @@ These rulings settle the points marked "Ruling needed" and add build rules. Wher
 10. **Test runs.** Every test command runs in the foreground, with `NODE_OPTIONS=--max-old-space-size=2048` and a time bound: `perl -e 'alarm shift; exec @ARGV' 900 node --import tsx --test FILE...`. No worker starts a Monitor, a background run, the full suite, or a mutation tool.
 11. **Commits.** A worker never commits, stashes, resets, or checks out. The coordinator reads each task's diff and commits it.
 12. **Reference tree.** The build starts on `main` at `84f9a8c3`. Since `21bebd00`, `main` changed no file this slice writes except `docs/teams.md` (Task 15).
+13. **Priors leave out copies** (added during the build). The report pass exports a job's prior rows from the trials that job ran itself. A reused copy's source trial is exported by the job that ran it, so exporting the copy would count one trial twice. `priorCells` stays as Task 9 fixes it; the filter is in the report pass (Task 10), with the test `the prior export leaves out copies`. A compare job whose every slot is reused writes a report and no prior row.
+14. **A job whose priors cannot be built does not block the queue** (added during the build). The report pass builds a job's prior cells before it writes them. When the build throws, the job keeps its `reported_at` stamp, gets no prior row, and the process logs `Eval report unreadable.` once. A failed store write still rolls back and is retried. Task 10 adds the test `a job whose priors cannot be built does not block the next job`.
 
 ## Trust boundary, and what a review checks
 

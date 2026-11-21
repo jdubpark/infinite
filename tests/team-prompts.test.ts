@@ -665,3 +665,18 @@ test("an intent decision's question reaches no authority surface", () => {
     answer: "Use A", answeredBy: "owner", answeredAt: "2026-11-16T00:01:00.000Z" }] as TeamRun["decisions"] });
   assert.deepEqual(ownerDirectionLines(legacy), ['Owner answered "Which path?": Use A'], "a decision without intentQuestions prints as today");
 });
+
+test("a continued delivery prompt allows one set of earlier heads, and no other sentence narrows or widens it", () => {
+  const delivered = "d".repeat(40), repaired = "e".repeat(40), reviewed = "f".repeat(40), branch = "infinite/team-entry";
+  const repair = { runId: "00000000-0000-4000-8000-000000000011", memberId: "m-repair", revision: 2, role: "delivery", sessionId: "s-repair", title: "delivery", status: "stopped",
+    cwd: "/home/dev/projects/example", baseCommit: repaired, prompt: "", cursor: 0, stopRequestId: "x", report: { kind: "delivery-repair", headCommit: repaired, summary: "CI failed." } } as TeamMember;
+  // Delivered A at revision 1; revision 2 pushed B, which needed a repair; C is the reviewed commit now.
+  const run = smallRun({ revision: 2, status: "delivering", headCommit: reviewed, members: [repair], delivery: { mode: "pr", repository: "example/app", baseBranch: "main" },
+    pullRequest: { revision: 1, headCommit: delivered, pullRequestUrl: "https://github.com/example/app/pull/7", summary: "Opened.", reportedAt: "2026-11-01T00:00:00.000Z", branch } });
+  const prompt = teamPrompt(run, "delivery");
+  const rule = `If the branch exists, allow only an unchanged head or a fast-forward from a head recorded for this run, its earlier repair heads or the head it delivered to its pull request: ${JSON.stringify([repaired, delivered])}.`;
+  const push = `Push ${branch} to the pinned repository only if its remote head is unchanged or is a fast-forward from one of the heads listed above.`;
+  assert.deepEqual(prompt.match(/[^.]*fast-forward[^.]*\./g)?.map(sentence => sentence.trim()), [rule, push], "every push rule names the same set");
+  assert.ok(!/neither|nor the reviewed commit/.test(prompt), "no sentence blocks a head the rule allows");
+  assert.equal(prompt.split(delivered).length - 1, 2, "the delivered head appears in the rule and in the sentence that names the pull request");
+});

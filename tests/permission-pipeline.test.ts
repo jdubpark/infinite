@@ -379,11 +379,53 @@ test("halt epochs that cannot be read serve nothing, and earlier decisions apply
 
 test("the adapter's evidence collection reaches the review, and no collection exists without it", () => withFixture(async f => {
   f.delegate();
-  const collect = async () => ({ files: [], limitations: [], digest: "none" });
+  const asked: string[][] = [];
+  const evidence = { files: [], limitations: [], digest: "none" };
+  const collect = async (paths: string[]) => { asked.push(paths); return evidence; };
   await f.pipeline.decide(request({ action: "npm test" }), { collect });
-  assert.equal(f.core.reviews[0].context.collect, collect);
+  assert.equal(await f.core.reviews[0].context.collect?.(["src/index.ts"]), evidence);
+  assert.deepEqual(asked, [["src/index.ts"]]);
   await f.pipeline.decide(request({ action: "npm run lint" }));
   assert.equal(f.core.reviews[1].context.collect, undefined);
+}));
+
+test("a verdict reached after the review read source files answers only the delivery that follows it", () => withFixture(async f => {
+  f.delegate();
+  const asked: string[][] = [];
+  const collect = async (paths: string[]) => { asked.push(paths); return { files: [], limitations: [], digest: "source-1" }; };
+  const build = () => request({ action: "node scripts/build.mjs" });
+
+  // An allow reached with no file read. An open reject that is newer stops its replay, so the request is reviewed again.
+  decided(await f.pipeline.decide(build(), { collect }), "allow");
+  f.core.next = () => reject("unsafe");
+  const newer = decided(await f.pipeline.decide(request({ action: "rm -rf ../shared", assignment: "task-1:reviewer" })), "reject");
+  // This review asks for the script before it allows: the verdict depends on what the file held then.
+  f.core.next = (_request, context) => { void context.collect?.(["scripts/build.mjs"]); return allow(); };
+  const dialog = build();
+  const read = decided(await f.pipeline.decide(dialog, { collect }), "allow");
+  assert.deepEqual(asked, [["scripts/build.mjs"]]);
+  assert.equal(f.core.reviews.length, 3);
+
+  // Another attempt at the same dialog, after a refused delivery or a restart, cannot read that file again.
+  // The allow is not handed out a second time, and the request is not reviewed or counted again.
+  assert.equal((await f.pipeline.decide(dialog, { collect })).kind, "undeliverable");
+  f.restart();
+  assert.equal((await f.pipeline.decide(dialog, { collect })).kind, "undeliverable");
+  assert.equal(f.pipeline.applicable(read.decisionId), true, "the decision itself stays as recorded");
+  assert.equal(f.core.reviews.length, 3);
+
+  // An identical request is reviewed again. Neither that allow nor the older one behind it answers, also once
+  // the open reject that stopped the older one is gone.
+  f.controls.reopen(newer.decisionId, { requestId: randomUUID() }, actor);
+  f.core.next = () => allow();
+  const second = decided(await f.pipeline.decide(build(), { collect }), "allow");
+  assert.equal(f.journal.decision(second.decisionId)?.replayOf, undefined, "no earlier allow is replayed");
+  assert.equal(f.core.reviews.length, 4);
+
+  // That review read no file, so its verdict replays as before.
+  const third = decided(await f.pipeline.decide(build(), { collect }), "allow");
+  assert.equal(f.journal.decision(third.decisionId)?.replayOf, second.decisionId);
+  assert.equal(f.core.reviews.length, 4);
 }));
 
 test("a request that did not qualify is never allowed, and one with no one-shot reject is undeliverable", () => withFixture(async f => {

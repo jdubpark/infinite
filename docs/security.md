@@ -50,33 +50,44 @@ configured contributor use without changing provider terms or retention. See
 
 Claude Code has an experimental Code Mode: the model writes one program that
 calls several tools, where it would otherwise call them one at a time. The host
-asks for it only when the top-level `codeMode.claude` setting says so:
+asks for it when it starts a new session and the top-level `codeMode.claude`
+setting says so:
 
-- `off`, the default, also when the key is absent: the host never asks for it.
-- `headless`: served headless Claude sessions start in Code Mode.
+- `off`, the default, also when the key is absent: no new session asks for it.
+- `headless`: served headless Claude sessions ask for it.
 - `all`: interactive Claude sessions do too, the owner's and team members'.
 
-Some launches never get it. A permission coordinator and a mission coordinator
-run with tool lists that leave out the program tool, so Code Mode cannot start
-there. Permission-reviewer turns, headless launches that the permission channel
-does not serve, evaluation and learning sessions, other providers, and launches
-outside the host's worker stay as they are.
+The host only asks. It does not check that Claude Code turned Code Mode on. A
+profile whose tool list leaves out the program tool, a restricted launch, an
+older model, or a custom API endpoint starts without it, and the host's record
+still says that it asked.
 
-Each tool call inside a program raises its own hooks, so the permission channel
-still decides each call.
+Some launches never ask. A permission coordinator and a mission coordinator
+run with tool lists that leave out the program tool. Permission-reviewer turns,
+headless launches that the permission channel does not serve, evaluation and
+learning sessions, other providers, and launches outside the host's worker stay
+as they are. A headless run takes the request only from its `--settings`
+argument, and only a served launch carries one.
 
-A session records whether the host started it in Code Mode. Resuming the same
-conversation keeps that choice, whatever the setting says by then. The record is
-not part of any API response.
+In a served session each tool call inside a program raises its own hooks, so
+the permission channel still decides each call.
+
+A session records whether the host asked for Code Mode. Resuming the same
+conversation asks again when the record says so, whatever the setting says by
+then, and does not ask when the record says no or the session is older than
+this setting. One case differs: an owner resume has no permission channel, so a
+conversation resumed through a headless profile starts without Code Mode, and
+its new record says so. The record is not part of any API response.
 
 Before setting `all`:
 
-- Claude Code asks for a confirmation once per operating-system account. Only
-  the owner answers it; the host hands it to no agent. Accept it once in a
-  terminal on the account that runs the agents. Until then every interactive
-  launch stops at the confirmation.
-- Claude Code 2.1.328 or newer is needed. The host does not check the installed
-  version, and an older version ignores the request.
+- Claude Code asks for a confirmation once per operating-system account. The
+  host does not answer it, and this setting does not accept it in advance.
+  Accept it once in a terminal on the account that runs the agents. Until then
+  every interactive launch stops at the confirmation.
+- Claude Code's documentation names 2.1.328 as the first version with the hook
+  behaviour described here, and the host was measured against 2.1.330. The host
+  does not check the installed version.
 - A Code Mode session cannot use Remote Control, Claude in Chrome, or computer
   use.
 - Where agents start through `sudo`, an interactive launch carries the request

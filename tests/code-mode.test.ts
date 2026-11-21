@@ -31,4 +31,7 @@ test("native relaunch follows the recorded conversation mode", () => {
   assert.equal(codeModeEnabled("all", "claude", { headless: true, served: true, excluded: false }, false), false);
   assert.equal(codeModeEnabled("off", "claude", { headless: false, served: false, excluded: true }, true), false);
   assert.equal(codeModeEnabled("off", "claude", { headless: false, served: false, excluded: false }, true, "replay"), false);
+  assert.equal(codeModeEnabled("off", "claude", { headless: true, served: true, excluded: false }, true), true);
+  // A headless run ignores the environment variable, so a record cannot carry Code Mode into an unserved one.
+  assert.equal(codeModeEnabled("all", "claude", { headless: true, served: false, excluded: false }, true), false);
 });

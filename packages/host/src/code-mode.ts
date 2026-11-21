@@ -17,7 +17,8 @@ export function codeModeEnabled(
   purpose?: SessionPurpose,
 ): boolean {
   if (provider !== "claude" || learningPurpose(purpose)) return false;
-  if (facts.excluded) return false;
+  // A headless run takes the request only from its --settings argument, and only a served launch carries one.
+  if (facts.excluded || (facts.headless && !facts.served)) return false;
   if (recorded !== undefined) return recorded;
-  return facts.headless ? facts.served && (level === "headless" || level === "all") : level === "all";
+  return facts.headless ? level === "headless" || level === "all" : level === "all";
 }

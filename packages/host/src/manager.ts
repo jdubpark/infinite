@@ -78,7 +78,7 @@ export interface CreateSession {
   resumeNativeSession?: { id: string; source: "hook" | "protocol" };
   continuation?: NativeContinuation;
 }
-type ManagedCreateSession = CreateSession & { recordedCodeMode?: boolean };
+type ManagedCreateSession = CreateSession & { recordedCodeMode?: true };
 interface StoredSession {
   session: Session;
   fingerprint: string;
@@ -983,7 +983,7 @@ export class Manager {
     const args = session.provider === "claude" ? ["--resume", native.id]
       : session.provider === "codex" ? ["resume", native.id] : ["--session", native.id];
     const request: ManagedCreateSession = { requestId, provider: session.provider, projectId: session.projectId,
-      title: session.title, prompt: "", nativeArgs: args, resumedFrom: sessionId, resumeNativeSession: native, recordedCodeMode: session.codeMode === true };
+      title: session.title, prompt: "", nativeArgs: args, resumedFrom: sessionId, resumeNativeSession: native, ...(session.codeMode === true ? { recordedCodeMode: true as const } : {}) };
     if (project) {
       const cwd = relative(realpathSync(project.path), session.cwd);
       if (cwd) request.cwd = cwd;
@@ -1147,7 +1147,10 @@ export class Manager {
     const coordinator = request.team?.role === "permission-coordinator" || request.team?.role === "mission-coordinator";
     const facts = { headless: headlessLaunch(request.provider, launchProfile).headless, served: session.headless?.channel === true, excluded: coordinator };
     // Learning runs keep a stable member identity and must not mix Code Mode into replay evidence.
-    session.codeMode = codeModeEnabled(this.config.codeMode?.claude, request.provider, facts, request.recordedCodeMode, request.purpose);
+    // A resume keeps its source's choice. A source that recorded none did not ask for Code Mode, and its resume request
+    // is the one an earlier host built, so a resume that host had started still matches its fingerprint.
+    const recorded = request.recordedCodeMode ?? (request.resumedFrom === undefined ? undefined : false);
+    session.codeMode = codeModeEnabled(this.config.codeMode?.claude, request.provider, facts, recorded, request.purpose);
     // Keep the native prompt exact. Only opted-in, qualified sessions receive the
     // separate handoff MCP capability; the context snapshot stays in the record.
     const prompt = request.nativeArgs !== undefined ? "" : [

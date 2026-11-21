@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { claimControl, startHost, waitFor } from "./helpers.js";
 
@@ -106,7 +106,7 @@ test("owner resume keeps the native conversation's recorded Code Mode after conf
   const root = mkdtempSync(join(tmpdir(), "infinite-code-mode-resume-"));
   const launchLog = join(root, "launches.jsonl");
   const fixture = join(root, "agent.mjs");
-  const nativeIds = [randomUUID(), randomUUID()];
+  const nativeIds = [randomUUID(), randomUUID(), randomUUID()];
   writeFileSync(fixture, `
 import { appendFileSync } from 'node:fs';
 const args = process.argv.slice(2);
@@ -163,6 +163,37 @@ setInterval(() => {}, 1000);
     assert.equal(disabledResume.status, 200, JSON.stringify(disabledResume.body));
     await waitFor(() => readLaunches(), launches => launches.length === 4);
     assert.equal(Object.hasOwn(readLaunches()[3]!, "mode"), false);
+
+    // A plain conversation's resume request is the one the host built before the switch existed. So a resume that an
+    // earlier host had started, with the record written and the receipt not yet, is found again by its fingerprint.
+    const key = readFileSync(host.config.keyFile);
+    const record = (id: string) => unseal<{ session: Record<string, any>; fingerprint: string }>(key, `${id}:meta`,
+      readFileSync(join(host.config.stateDir, "sessions", id, "meta.sealed"), "utf8"));
+    const plain = disabledResume.body.id as string;
+    const earlierRequest = { requestId: plain, provider: "claude", projectId: "rehearsal", title: "Code Mode", prompt: "",
+      nativeArgs: ["--resume", nativeIds[1]], resumedFrom: disabled, resumeNativeSession: record(plain).session.resumeNativeSession };
+    assert.equal(record(plain).fingerprint, createHash("sha256").update(JSON.stringify(earlierRequest)).digest("hex"));
+    assert.equal(record(plain).session.codeMode, false);
+    rmSync(join(host.config.stateDir, "resumptions", `${plain}.sealed`));
+    const retried = await host.fetchApi(`/sessions/${disabled}/resume`, "owner", { requestId: plain });
+    assert.equal(retried.status, 200, JSON.stringify(retried.body));
+    assert.equal(retried.body.id, plain);
+    assert.equal(readLaunches().length, 4, "the retry starts nothing");
+
+    // A headless run takes Code Mode only from its --settings argument, and an owner resume has no permission channel
+    // to carry one. So a recorded Code Mode conversation resumed through a headless profile starts without the
+    // variable, and its record says so.
+    const recorded = await start(nativeIds[2]!);
+    assert.equal(readLaunches()[4]!.mode, "1");
+    await stop(recorded);
+    host.config.agents = { claude: { command: process.execPath, args: [fixture, "-p"] } };
+    await setModeAndRestartApi("all");
+    const headlessResume = await host.fetchApi(`/sessions/${recorded}/resume`, "owner", { requestId: randomUUID() });
+    assert.equal(headlessResume.status, 200, JSON.stringify(headlessResume.body));
+    await waitFor(() => readLaunches(), launches => launches.length === 6);
+    assert.equal(readLaunches()[5]!.nativeId, nativeIds[2]);
+    assert.equal(Object.hasOwn(readLaunches()[5]!, "mode"), false);
+    assert.equal(record(headlessResume.body.id as string).session.codeMode, false);
   } finally {
     await host.stop();
     rmSync(root, { recursive: true, force: true });

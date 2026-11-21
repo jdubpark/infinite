@@ -187,7 +187,7 @@ test("clean and remove work from a directory the account cannot enter", { skip: 
   // Runs the launcher from a closed directory, as a caller in another account's home does.
   const fromClosed = (args: readonly string[]) => {
     const closed = mkdtempSync(join(sb.dir, "closed-"));
-    return spawnSync("/bin/sh", ["-c", 'cd "$1" && chmod 000 . && shift && exec /bin/sh "$@"', "sh", closed, sb.script, ...args], {
+    return spawnSync("/bin/sh", ["-c", 'cd "$1" && chmod 000 . && [ ! -r . ] && shift && exec /bin/sh "$@"', "sh", closed, sb.script, ...args], {
       env: { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },
       maxBuffer: 1 << 20,
       timeout: 60_000,

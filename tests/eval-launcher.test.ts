@@ -290,7 +290,7 @@ test("nothing outlives a trial", { skip: SKIP }, () => {
 // Runs the launcher from a directory its account cannot enter, as a caller in another account's home does.
 function fromClosed(sb: Sandbox, args: readonly string[]) {
   const closed = mkdtempSync(join(sb.dir, "closed-"));
-  return spawnSync("/bin/sh", ["-c", 'cd "$1" && chmod 000 . && shift && exec /bin/sh "$@"', "sh", closed, sb.script, ...args], {
+  return spawnSync("/bin/sh", ["-c", 'cd "$1" && chmod 000 . && [ ! -r . ] && shift && exec /bin/sh "$@"', "sh", closed, sb.script, ...args], {
     env: { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },
     maxBuffer: 1 << 20,
     timeout: 120_000,

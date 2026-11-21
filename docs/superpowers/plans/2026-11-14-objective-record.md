@@ -2807,3 +2807,1012 @@ export class TeamRegister {
 - **Receipts in the outcome ledger.**
 - **Record screens** on the web, the phone, and the Mac.
 - **The launcher change for B1,** which the owner approves and installs.
+
+---
+
+# Slice: verdicts
+
+This slice covers part 5 of spec `2026-11-13-objective-record-design.md` (the evaluator, composition, use in a goal, criterion status in the next cycle, the owner override, display, and the ledger), the verdict rows of part 8, and delivery order 5 with acceptance 6, 7, 10, and 11. After it, on a run that the owner opted in, the host starts one read-only `evaluator` member when a revision is reviewed or a goal cycle reports no change. It composes the evaluator's report with host receipts and owner values into one provisional verdict, labelled an agent assessment. In an autonomous finite goal, a composed `met` stops the goal as `ready-for-review` with `stopReason: "provisional-met"`; the owner records `achieved`, or `not-achieved` with `continue`. In a standing goal, a verdict feeds the failure count. The next cycle's coordinator reads each criterion's status and check label. It builds on steps 1 to 4 on `main` (the record, owner corrections, the digest, the intent check, and tests and proposals) and on C19's family function (`familyOf`).
+
+**Line numbers.** Every line number is on the reference tree, `main` at `21bebd00`. Each edit quotes the code it changes, so a worker finds it by that code if `main` moves. Within a task, apply edits from the bottom up.
+
+## My calls, for the coordinator to confirm
+
+Each call names the reason. "Ruling needed" marks the ones that change product behaviour or the spec's text.
+
+1. **Off by default, pinned when the run is created.** A new key, `project.team.objective.evaluator`, takes `"on"` or `"off"` and has no default. It is inside the routine authority digest, because `digestedProjectTeam` strips only `eval`. Writing it therefore blocks active routines until the owner approves them again. `createRun` pins `run.verdicts = "on"` only when the key is `"on"`, the run pins `register: "on"`, and the run is neither a mission subteam nor a handoff run. Otherwise the field stays absent, and views and sealed runs keep today's bytes. A run created before this slice never gets a verdict, even after a restart. *(Ruling needed. Part 5 and C12 read as "on in autonomous mode", and step 3's `intentCheckPin` took that default. The brief makes every new behaviour off by default, and this plan follows the brief.)*
+2. **Verdicts need the register.** Host criteria take their state from host test receipts (composition rule 1), and only the register (step 4) produces receipts. A verdict without the register would make every command and artifact criterion `inconclusive`, so the pin needs both keys. *(My call: one code path, and no verdict that is `inconclusive` only because a setting is missing.)*
+3. **The evaluator holds the run before it settles.** Settled runs are never stepped (`teams.ts` line 2377), so an evaluator after settle would need a second member loop. The host holds at two points, as the intent check holds a plan:
+   - **Reviewed:** after the review approves the revision and before delivery or settle (`teams.ts` line 2593), and before line 2594's read-only check of the integration checkout, so a held tick runs no Git command.
+   - **No change:** when the project manager's `no-change` report arrives on a goal cycle that started from a reviewed head (`teams.ts` line 3073). The held report is consumed again once the verdict is done.
+
+   A blocked or cancelled run gets none, as part 5 says. The verdict delays delivery by one read-only member. *(My call.)*
+4. **The register's pass runs first.** At the reviewed hold, the verdict asks the register for a reviewed pass at the head (`TeamRegister.markReviewed`, Task 4) and waits until it is done. The evaluator then reads the receipts in its context, and composition reads the same receipts. The register's own `mark` at `ready-for-review` later finds the reviewed pass of the same revision and adds none.
+5. **Where verdicts live.** No new store holds text.
+   - **Full detail** (the evaluator's report, each criterion's composed state, resolved handles, notes, and the profile): `Stored.verdict`, in the run's sealed file, outside `run`. Only the current revision's verdict is kept. It expires with the run, as receipts do.
+   - **Summary on the run:** `run.assessment` (ids, enumerations, and counts). It reaches every team view and relay device.
+   - **Summary on the goal:** `GoalCycle.assessment`, copied when the goal refreshes the cycle, plus `progress`. It reaches every goal view and relay device. It outlives the run.
+   - **The record:** each active criterion's `latest` (`{ state, verdictId }`, no note) and one `verdict.recorded` log entry per verdict, plus one `evaluator-contradicted-receipt` entry per contradicted criterion.
+   - **The ledger:** one `objective_verdicts` row per verdict, projected from a run event, with numbers and enumerations only.
+
+   *(Ruling needed against part 5, which puts the note in `latest`. With notes, one verdict needs up to 8 log entries of about 1.3 KiB, and the log's 300-entry share would fill in about 20 cycles; `objective_log` overflow is not built. Without notes, one entry per verdict holds every criterion's `latest` within the 2 KiB inline limit. The notes stay on the run for the owner's display.)*
+6. **The evaluator's text stays sealed.** `screen` moves the full report into `Stored.verdict` and leaves a stub on the member (`{ kind: "verdict", result, criteria: [{ id, state, evidence: [] }] }`), so no team view, relay device, blackboard entry, or later member context holds a note or a handle. `memberReports` (`team-prompts.ts` line 188) and `reportingMembers` (`evidence/host-entries.ts` line 76) skip the role. The owner reads notes and handles through `GET /api/goals/:id/verdicts`.
+7. **Evidence handles resolve by form and membership.** A handle resolves when it is:
+   - a receipt handle from the context's `receipts`;
+   - `file:PATH` or `file:PATH#Lfrom-Lto` whose PATH passes `isScopedPath`, is at most 300 characters, and is one of the context's changed paths or a path that an active criterion's check or `pinned` names.
+
+   Citation handles never resolve in this slice: citation checks are delivery step 7. A state is kept only when every handle it gives resolves, and a `met` gives at least one. Otherwise the state becomes `inconclusive` (`unresolved-evidence`). *(My call: no Git read per handle. Up to 64 handles per verdict would need 64 reads, and the host already knows the changed paths.)*
+8. **`merged` and `landed` receipt criteria are `inconclusive` at the verdict** (`before-delivery`), because the verdict is taken before delivery. A goal whose record holds one never reaches a provisional `met`; the owner retires or edits that criterion. `checks-passed` and `review-approved` are host facts at the hold. *(Ruling needed: the alternative is a second composition step on the goal after delivery, which adds a goal-side rule.)*
+9. **The no-change verdict** reads `run.headCommit`, which equals `run.baseCommit` on a no-change run. It runs only on a goal cycle whose context names `parentRunId`, so the head is the goal's latest reviewed head. Its receipts are the parent run's reviewed-pass receipts when that pass ran at the same commit; otherwise host criteria are `inconclusive` (`no-receipt`). A first cycle that reports no change gets no verdict.
+10. **Standalone runs** get a verdict at the reviewed hold, for display only, as part 5 says. Their row has no goal index.
+11. **What a verdict changes.** Only an autonomous goal acts on it (`autonomyOf(goal) === "autonomous"`). A supervised goal and a standalone run show it and change nothing.
+    - **Finite goal, composed `met` on a reviewed cycle:** the goal stops as `ready-for-review` with `stopReason: "provisional-met"` and a fixed reason. Its status is never `achieved`.
+    - **Finite goal, anything else:** the next feature starts, as today.
+    - **Standing goal:** a `met` is recorded, and the next cycle starts at its cadence. A cycle with a verdict fails when its composed result is not `met` and its progress is not positive; three failed cycles in a row pause the goal with `repeated-failures`, as today. A cycle with no verdict is classified as today.
+    - **`until-met`:** not built. The continuous autonomy design's delivery step 5 adds it and reads `GoalCycle.assessment`.
+12. **The owner override uses the outcome route, as part 5 says.** `POST /api/goals/:id/outcome` gains `verdictId` and `continue`. The route keeps its roles (owner and controller) and its relay rule (allowed), because a controller records outcomes and steers today. *(Ruling needed: whether `continue` is owner only. Making it owner only changes `server.ts` line 1286's middleware in place; the relay cannot refuse by body.)* `continue` appends the owner's summary as a steering entry, through the path that `steer` uses, so the next cycle's objective prints it (`goals.ts` line 873) and the record gets direction `s<revision>` (`direction.appended`). *(My call against part 5's "a `correction` direction": no step writes correction directions yet, and a correction direction would not reach the next run's objective.)*
+13. **Criterion status reaches the next cycle through `TeamGoalContext.criteria`.** C17's goal digest (`goal-digest.ts`) is not wired, and wiring it brings history, touched paths, failures, decisions, and open items that are C17's work. This slice adds only the digest's `criteria` rows (`{ criterion, status, check }`, at most 8, check labels at most 120 bytes) to the goal context, built from the previous cycle's assessment, and prints them in the project manager's prompt only. When C17 wires its digest, the rows move into it. *(Ruling needed: part 5 says "through the goal digest of C17, and through no other channel".)*
+14. **Agreement waits.** Part 5 stores in the row whether the owner agreed. `goals.ts` has no line to spare and no writer into the evidence outbox, and run events need the run, which may be gone. This slice stores `verdictId` on the owner's outcome and shows agreement in the verdicts read. The row's `owner_agrees` column and the per-profile agreement cell wait for a goal event path. *(Ruling needed.)*
+15. **No router change.** The router does not avoid `evaluators` profiles for a cycle's tasks. When every eligible profile's model authored integrated work, the verdict is `inconclusive` with `no-independent-evaluator` (part 5). *(My call on part 5's "left to the builder" question: the router change touches routing evidence and is its own slice.)*
+16. **The lineup warning waits.** Acceptance 11's last clause ("the lineup check warned about it") needs a warning in the enrollment view and `repo init`. This slice exports the pure rule `evaluatorOverlaps(lineup)` and shows its result nowhere yet. *(Ruling needed: include `repo-enrollment.ts` and `team-cli.ts` here, or defer.)*
+17. **No new interruption (C18).** The provisional stop is today's goal stop (`ready-for-review`), and the failure pause is today's `repeated-failures` hold. No notification, decision, or push is added. The bound: one stop per goal until the owner continues it, one failure pause per three failed cycles, and one fixed event per verdict.
+18. **The report tool schema.** The `verdict` variant joins `teamReportVariants`, as `intent-check` did in step 3. The report tool's input schema therefore grows for every role, with the key absent too. Prompt text, context files, events, views, and the prompt version do not change, because the version hashes rendered prompts. *(Ruling needed if the tool schema must also stay byte for byte; that needs a per-role report schema in `worker.ts`, which is at its baseline.)*
+
+## Coordinator rulings (2026-11-21)
+
+These rulings settle the calls above. Where a task's text differs, the ruling wins.
+
+1. **Call 1 is confirmed.** `objective.evaluator` has no default and is off unless set, in every mode, and the pin needs `register: "on"` too. A verdict needs the register, which the owner opts in to, so a default of its own would turn on half a feature. Task 16 amends the spec's "on in autonomous mode".
+2. **Call 5 is confirmed.** `latest` holds `{ state, verdictId }` and no note.
+3. **Call 8 is confirmed for this slice.** `merged` and `landed` criteria are `inconclusive` (`before-delivery`). This is a known limit: the docs and the pull request name it. The goal-side step after delivery is a later slice.
+4. **Call 12 is confirmed.** `continue` keeps the outcome route's roles and its relay rule. It has the authority of the outcome it rides on, and no middleware changes.
+5. **Call 13 is confirmed.** The criteria rows go through `TeamGoalContext.criteria` and reach only the project manager's prompt, pinned by Task 10's test. They move into C17's digest when it lands.
+6. **Call 14 is confirmed.** Agreement waits for a goal event path.
+7. **Call 16 is confirmed.** The lineup warning waits. Acceptance 11's last clause stays open, and the pull request says so.
+8. **Call 18 is confirmed.** The `verdict` variant joins `teamReportVariants`. `roleAcceptsReport` (`teams.ts`) gains `evaluator: ["verdict"]` and no other role gains `verdict`, so a `verdict` report from another role is a wrong report, as today. Task 12's `without verdicts a run is as today` also asserts that a `verdict` report from an implementer gives no assessment and no `Stored.verdict`.
+9. **Lines in baseline files.** This overrides "every change stays on its line" in Tasks 5, 12, and 13.
+   - A hook that extends an existing expression, list, or type on its line stays on that line.
+   - A new import, a new field, or a new statement gets its own lines, one statement per line. No task joins statements to hold a line count.
+   - The task raises that file's entry in `scripts/file-size-baseline.json` by hand, by exactly the lines it added: at most 3 for `server.ts` (Task 5), 16 for `teams.ts` (Task 12), and 10 for `goals.ts` (Task 13). No task runs the script with `--update`. The pull request states each raise and its reason.
+   - `manager.ts` and `worker.ts` gain a list element in place and no line.
+10. **Test runs.** This overrides "in the background". Every test command runs in the foreground, with `NODE_OPTIONS=--max-old-space-size=2048` and a time bound: `perl -e 'alarm shift; exec @ARGV' 900 node --import tsx --test FILE...`. No worker starts a Monitor, a background run, the full suite, or a mutation tool.
+11. **Commits.** A worker never commits, stashes, resets, or checks out. The coordinator reads each task's diff and commits it.
+12. **Waves.** At most four implementers at once. The first wave is Tasks 1 to 4; Task 5 runs with the second wave.
+13. **Reference tree.** The build starts on `main` at `84f9a8c3`. Since `21bebd00`, `main` changed only permission files, `docs/teams.md`, and an egress document, so the line numbers of the files this slice writes still hold, except in `docs/teams.md` (Task 16).
+
+## Where the code and the design disagree
+
+- **Hold point.** Part 5 says "when a cycle's run settles". Settled runs are never stepped, so the evaluator runs before settle (call 3).
+- **Storage.** `GoalCycle.assessment` exists in no code; this slice adds it with counts only. `latest` has a `note` in the schema (`objective-types.ts` line 123); this slice never writes it (call 5). The record has no `objective_log` overflow, so verdict entries have a share (Sizes).
+- **The goal digest.** Part 5's channel is unwired; the rows go into `TeamGoalContext` (call 13).
+- **`until-met`.** Part 5 and acceptance 7 name a standing `until-met` goal. `goalStandingSchema` has only `shape: "objective"`. Acceptance 7's `until-met` half waits; its finite-goal analogue is tested here.
+- **The owner override.** Part 5's correction direction does not reach a run's objective (call 12). The outcome route admits controllers and the relay (`server.ts` line 1286, `remote-access.ts` line 49).
+- **Receipts.** Step 4 makes no receipt for `receipt`-kind criteria. This slice reads `checks-passed` and `review-approved` from the run; `merged` and `landed` are `inconclusive` (call 8). `citations` and `citation-form` criteria have no receipt until step 7.
+- **Owner criteria.** `rating.record` stamps the goal's latest reviewed cycle, which is the previous cycle at the next verdict. So an owner criterion is `pending-owner` at every verdict except a no-change cycle on the rated head. This is part 5's rule 3 as written.
+- **Acceptance 10's label.** It writes `citation-form:research/founders/shortlist.json`. `checkLabel` (`objective-digest.ts` line 14) is the label the record digest prints, and the rows reuse it, so the label reads as `checkLabel` prints it. The test pins `checkLabel`'s output, not acceptance 10's spelling.
+- **Acceptance 11** holds under part 5's rule as written: the second profile fails the hard rule by model, so the reviewer's profile is the only eligible one. A third evaluator profile of a family that neither authored nor reviewed would be preferred over the reviewer's (rule 2); Task 2 tests both.
+
+## Trust boundary, and what a review checks
+
+These inputs originate outside the host:
+
+- **The evaluator.** Its report arrives through the report tool. It passes these checks:
+  - At the report route: the strict envelope and `verdictReportSchema` (Task 1). A report of another kind becomes fixed text at `screen`, and the evaluator counts as failed.
+  - At consume: the member is the current evaluator of the current revision and the held state; `assertMemberReadOnly` on its working copy (the operation's read-only check, as the intent check runs it).
+  - At composition (Task 6): unknown criterion ids are dropped and counted; every handle is checked by form and membership; notes are kept only as sealed bytes.
+
+  Evaluator text (notes and handles) lands only in `Stored.verdict`. It never reaches a prompt, a context file of another member, an event, a log line, an error body, a view, a plain column, or the record's log.
+- **Repositories.** The evaluator reads the head in its own read-only working copy, as every member does. The host reads nothing from the repository for a verdict; receipts come from the register, which reads through form B1.
+- **Members.** Member reports, briefs, findings, and blackboard entries never reach the evaluator's context (Task 7's builder takes none of them).
+- **The owner.** `verdictId` is a UUID that must name a cycle assessment of the goal. `continue` carries the outcome's `summary`, which is screened as steering is today, and passes the steering limits.
+- **Other device roles.** Viewers read `GET /api/goals/:id/verdicts`. The relay refuses that path, because its goal pattern (`remote-access.ts` line 49) has no `verdicts` branch. Through views, every device sees `run.verdicts`, `run.assessment`, `GoalCycle.assessment`, and an outcome's `verdictId`: ids, enumerations, and counts only.
+
+What can reach prompt and context text:
+
+- **The evaluator's context:** the record's statement, definitions, rules, non-goals, and active criteria; the head and base; the run's changed paths; the final check round's names and statuses; the receipts' handles, kinds, ids, and outcomes; and the rubric items. All of it is owner text, host facts, or step 4's receipts.
+- **The evaluator's prompt:** fixed text.
+- **The coordinator's prompt:** the criteria rows (criterion id, status, check label), labelled an agent assessment. No note, score, threshold, count, model, or profile.
+- **Nothing else.** No verdict row, agreement, evaluator identity, note, or handle reaches any member. `team-prompts.ts` imports nothing from `verdict-store.ts` (Task 10 test).
+
+## Sizes, cost, and sequences
+
+**Sizes.**
+
+- **The report.** At most 8 criteria, each with at most 8 handles of at most 400 characters and a note of at most 500 bytes. About 30 KiB at most.
+- **The context.** At most 1 MiB (`VERDICT_CONTEXT_BYTES`). Over that, the verdict is `inconclusive` with `context-too-large`.
+- **The prompt.** At most 8 KiB (`VERDICT_PROMPT_BYTES`), fixed.
+- **`Stored.verdict`.** One verdict: the report (30 KiB at most) and the composed criteria (about 6 KiB at most).
+- **`run.assessment` and `GoalCycle.assessment`.** About 500 bytes each. A standing goal keeps 50 cycles, so at most about 25 KiB on its sealed record.
+- **The criteria rows.** At most 8 rows of at most 200 bytes.
+- **Log entries.** `verdict.recorded`: `before` and `after` each hold at most 8 `latest` values of about 70 bytes, inline. `evaluator-contradicted-receipt`: about 150 bytes. Verdict entries write only while the log stays under 300 entries and 160 KiB; otherwise the verdict stands everywhere else and the record write is skipped (`log-full`).
+- **A row.** About 300 bytes.
+
+**Cost.**
+
+- **Verdicts off.** `createRun` reads one more setting. Each hook makes one call that returns at once on a run without `run.verdicts`. The goal's refresh reads one absent field.
+- **Verdicts on.** Per reviewed revision: one register pass (step 4's cost), one evaluator member, two record parses, one record write, one run save per state change, and one event. Per goal refresh: a scan of at most 50 cycles in memory for the previous assessment.
+- **Held runs.** While a verdict holds a run, each tick makes one `reviewed` or `step` call for it, which reads memory only; the hook comes before line 2594's Git check, so a held tick runs no command. A hold lasts at most the register pass (120 seconds of reads) plus two evaluator attempts under the member stall rule.
+- **Scale.** No list route, view, or periodic tick reads the store, a journal, or a sealed file per member, session, run, task, or criterion. `GET /api/goals/:id/verdicts` reads in-memory run records for at most 50 cycles. 1,000 sessions and 10,000 outcome rows change nothing.
+
+The slice must survive these sequences. Each has a named test.
+
+| Sequence | Expected | Test |
+|---|---|---|
+| No key; `evaluator: "off"`; evaluator on with the register off; a mission subteam or handoff run; a run created before this slice, after a restart | No evaluator, no `Stored.verdict`, no `run.verdicts`, no `run.assessment`, no `cycle.assessment`, no criteria rows; prompts, context files, events, views, and the prompt version as today | Task 12 `without verdicts a run is as today`; Task 2 `the verdict pin needs both keys and a plain run`; Task 10 `without criteria rows the prompts are byte for byte`; Task 13 `without verdicts a goal is as today` |
+| The key written, then a routine's next check | The routine blocks; without the key it keeps its authority | Task 1 `the evaluator setting is inside the routine approval digest` |
+| Acceptance 6 | Every criterion `met` by the evaluator while `rank-verify` failed: composed `not-met`, `evaluator-contradicted-receipt` in the log | Task 6 `acceptance 6: a failing receipt overrides the evaluator`; Task 12 `acceptance 6 end to end` |
+| Acceptance 7, finite half | A composed `met` stops an autonomous finite goal as `ready-for-review` with `provisional-met`, never `achieved`; `not-achieved` with `continue` starts the next cycle on a new record version | Task 13 `acceptance 7: a provisional met stops the goal and continue resumes it` |
+| A standing goal: `met`; three verdicts with no progress | `met` recorded and the next cycle at its cadence; the third failed cycle pauses with `repeated-failures`; an owner resume resets the count | Task 13 `a standing goal records met and counts verdict failures` |
+| Acceptance 10 | Cycle 2's project manager prompt lists `c2` `not-met` with its check label, labelled an agent assessment, with no note, threshold, count, or profile; no other role's prompt holds a row | Task 10 `criteria rows reach only the coordinator`; Task 13 `acceptance 10 end to end` |
+| Acceptance 11 | The reviewer's profile evaluates; the row has `also_reviewed` 1 and `shared_family` 0; the profile of the implementer's model is never chosen | Task 2 `the evaluator rule excludes authors by model and prefers independence`; Task 12 `acceptance 11 end to end` |
+| No eligible profile; every eligible provider limited | `inconclusive` with `no-independent-evaluator` or `evaluator-unavailable`; no member started; the run proceeds | Task 11 `a verdict without an evaluator is inconclusive and releases the run` |
+| The evaluator stalls, hits a limit, or exits without a report, once and then again | One replacement by the same rule; then `inconclusive` with `evaluator-unavailable`; the run proceeds | Task 11 `one replacement, then evaluator-unavailable`; Task 12 `a stalled evaluator is replaced once` |
+| The evaluator sends another report kind, or unknown ids, or unresolved handles | Fixed text and a failure; unknown ids dropped and counted; unresolved states `inconclusive` | Task 11 `a wrong report kind is a failure, never text`; Task 6 `handles resolve by form and membership` |
+| The fuse refuses the evaluator's launch | The verdict waits with the fuse; nothing is skipped | Task 12 `an open fuse holds the verdict` |
+| A pause, steer, or resume (a new revision) while the evaluator runs | The old verdict writes nothing; the new revision is reviewed and held again | Task 11 `a verdict never outlives its revision` |
+| A restart in each state | Each verdict composes once; one `verdict.recorded` per verdict | Task 11 `seeded verdicts with restarts compose each verdict once` |
+| An unreadable record, a full log, a goal record write that fails | The verdict composes from what it has (`record-unavailable` gives `inconclusive` for every criterion); the record write is skipped with one event; the run proceeds | Task 11 `record failures never hold the run` |
+| A pinned file changed in the cycle | That criterion cannot be `met`; it is `inconclusive` (`pinned-changed`) | Task 6 `a changed pinned file voids met` |
+| An owner value on the head, on an older head, or none | `met` or `not-met` by the threshold; else `pending-owner`, which never blocks `met` | Task 6 `owner criteria read only a rating on the head` |
+| Evaluator text where it must not be | No note or handle in a view, an event, a later member's context, the blackboard, a log entry, or a row | Task 12 `evaluator text stays sealed`; Task 5 `rows hold no text` |
+| `verdictId` naming no assessment; `continue` on a goal not stopped by `provisional-met`, with `achieved`, past the deadline, or at the steering limit | 409 `verdict-not-found`, `goal-not-provisional`, 400 from the schema, `goal-limit-reached`, `goal-steering-limit`; nothing written | Task 9 `the outcome rules refuse a wrong verdict answer`; Task 13 `continue is refused outside a provisional stop` |
+| `GET /api/goals/:id/verdicts` from the relay | Refused by the relay | Task 14 `the relay refuses the verdicts read` |
+| Random verdict writes, register writes, owner ops, and intent applies, with a reload between steps | Every version rebuilds and parses | Task 11 `every version rebuilds after random verdict writes` |
+| A rollback to a host without this slice | See the right column | No test. `docs/teams.md` lists the steps (Task 16). The old strict schema refuses a config with `objective.evaluator`, so remove the key first. A pending goal launch whose context holds `criteria` fails the old strict `teamGoalContextSchema` and blocks that goal. A record with verdict entries parses (`OP_RE` accepts both op names), but versions before them answer 409 `objective-version-unavailable`; the latest version still reads. An old host ignores `run.verdicts`, `run.assessment`, `Stored.verdict`, `cycle.assessment`, and `verdictId`. A run with a live `evaluator` member fails the old role schema; finish or cancel such runs before a rollback. An old host reads `stopReason: "provisional-met"` as a value it does not know, so record the owner's outcome on every goal stopped that way before a rollback. |
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `packages/host/src/verdict-types.ts` (create) | Pure: the report schema and its limits, the run summary, the criteria row, the composed states, and the reason codes; imports zod and `objective-types.ts` only |
+| `packages/host/src/team-types.ts` (modify) | The setting, `TeamRun.verdicts`, `TeamRun.assessment`, the report variant, the role, and the goal context's `criteria` |
+| `packages/host/src/evaluator-profiles.ts` (modify) | The evaluator rule, the pin, and `evaluatorOverlaps` |
+| `packages/host/src/objective-record.ts` (modify) | The two verdict op names and their undo |
+| `packages/host/src/team-register.ts` (modify) | `markReviewed` and `reviewedReceipts` |
+| `packages/host/src/verdict-store.ts` (create), `server.ts` (modify, in place) | The `objective_verdicts` module, its projector, and its sweep |
+| `packages/host/src/verdict-compose.ts` (create) | Pure: handle resolution, the composition rules, the result, counts, and the record write |
+| `packages/host/src/verdict-prompt.ts` (create) | Pure: the evaluator's fixed prompt, its context, and the criteria rows' prompt text |
+| `packages/host/src/manager.ts`, `worker.ts`, `team-mcp-results.ts`, `fuse/baseline.ts`, `github-grants.ts`, `team-watch.ts`, `evidence/host-entries.ts`, `apps/web/src/teams.tsx`, `apps/mobile/src/features/teams/model.ts` (modify) | The role in every role list; no grant; no blackboard report |
+| `packages/host/src/goal-types.ts` (modify), `goal-verdicts.ts` (create) | `GoalCycle.assessment`, `stopReason`, the outcome's `verdictId` and `continue`; the pure goal rules |
+| `packages/host/src/team-prompts.ts`, `objective-digest.ts`, `config-identity.ts` (modify) | The rows in the coordinator's prompt and nowhere else; the prompt shapes; the evaluator's prompt version |
+| `packages/host/src/team-verdicts.ts` (create) | The runtime: the hold, the states, the hooks, the events |
+| `packages/host/src/teams.ts` (modify, in place) | Seventeen hooks, each in an existing line (Task 12) |
+| `packages/host/src/goals.ts` (modify, in place) | Twelve hooks, each in an existing line (Task 13) |
+| `packages/host/src/verdict-view.ts` (create), `objective-routes.ts`, `objective-cli.ts` (modify) | `GET /api/goals/:id/verdicts` and `infinite goal verdicts` |
+| `apps/web/src/api.ts`, `apps/web/src/goals.tsx`, `apps/mobile/src/api/client.ts`, `apps/mobile/src/features/teams/GoalDetail.tsx` (modify) | The verdict on the goal page and the phone's goal screen; the continue action |
+| `tests/fixtures/team-agent.mjs`, `tests/fixtures/goal-agent.mjs` (modify) | The fake evaluator |
+| `docs/teams.md`, the spec (modify) | The setting, the role, the rules, the rollback steps, and the amendments |
+| `tests/{verdict-schemas,verdict-store,verdict-compose,verdict-prompt,goal-verdicts,team-verdicts,verdict-rebuild,verdict-host,verdict-goals,verdict-routes}.test.ts` (create); `tests/{routines,evaluator-profiles,objective-record,team-register,fuse-baseline,github-grants,team-watch,host-entries,team-prompts,objective-digest,config-identity,autonomy-pins,objective-cli,remote-access}.test.ts` (modify) | Pure rules, the runtime with a fake host, and the host with the fake agents |
+
+**Touch points in baseline files.** Every baseline file below is at its baseline today, so every hook changes an existing line in place and adds none.
+
+- **`teams.ts`** (3,578, baseline 3,578). Only Task 12 writes it: lines 62, 189, 244, 370, 551, 1223, 2483, 2567, 2593, 2737, 2777, 2826, 2882, 2891, 2980, 3058, and 3073.
+- **`goals.ts`** (1,042, baseline 1,042). Only Task 13 writes it: lines 8, 21, 571, 578, 579, 581, 582, 612, 795, 796, 871, and 977.
+- **`server.ts`** (2,285, baseline 2,285). Only Task 5 writes it: lines 43, 262, and 405.
+- **`manager.ts`** (1,244, baseline 1,244) and **`worker.ts`** (1,903, baseline 1,903). Only Task 8 writes them: `manager.ts` lines 604 and 742, `worker.ts` lines 1127 and 1384, each a role list on one line.
+- **Not touched:** `client.ts`, `team-cli.ts`, `missions.ts`, `outcome-store.ts`, `evidence/store.ts`, `tests/teams.test.ts`, and `tests/goals.test.ts`.
+
+**Other files near the limit.** `team-types.ts` is 929 lines and grows by at most 10 (Task 1). `team-prompts.ts` is 951 and grows by at most 8 (Task 10). New files stay under 1,000 lines; the largest, `team-verdicts.ts`, is expected near 420.
+
+**Order and owners.**
+
+- **First wave, in parallel:** Task 1, Task 2, Task 3, Task 4, and Task 5. No two share a file.
+- **Second wave, in parallel:** Task 6 (needs 1 and 3), Task 7 (needs 1), Task 8 (needs 1), Task 9 (needs 1), and Task 15 (needs 1 and 9's types; it may start with Task 9 from this plan's fixed shapes).
+- **Third wave, in parallel:** Task 10 (needs 1 and 7) and Task 11 (needs 1, 2, 3, 4, 6, and 7).
+- **Then:** Task 12 (needs 5, 8, 10, and 11).
+- **Then, in parallel:** Task 13 (needs 9 and 12) and Task 14 (needs 9 and 12).
+- **Last:** Task 16.
+
+If the coordinator caps implementers at four at once, the first wave runs Tasks 1, 2, 3, and 4, then Task 5 with the second wave.
+
+**One writer per file.** No file has two writers in this slice. Every name, signature, limit, status code, entry shape, event text, and test name below is fixed, so the workers of one wave never need to talk.
+
+**Checks.**
+
+- `check:size` holds after every task. Each task confirms its counts with `wc -l`.
+- The host typecheck does not cover `tests/`, so each task runs its test files. A task reports any cancelled test as a failure.
+- Focused command for every task: `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/FILE.test.ts`. No task runs the full suite.
+
+**Workers.**
+
+- Every worker in a worktree is told never to use `git stash`. It compares with `git show HEAD:<path>` and sets work aside with a WIP commit.
+- Workers run test batches that start a host in the background, so a steer can reach them.
+
+**Lessons from earlier waves.**
+
+- **Large values.** A test checks `state` or a length before a `deepEqual` on a record, a report, or a context.
+- **Ticks.** A host test whose assertion depends on a tick hook calls the service's `start()`.
+- **Byte pins.** Tests that pin bytes from the base commit (Tasks 1, 10, and 12) re-pin from `main`'s own output when the build starts, because prompt bytes move whenever `main` changes a prompt.
+- **Goal tests.** A test that runs goal cycles with a fake agent (Task 13) sets `objective.intentCheck: "off"` and writes the fake agent's plan-brief flag file.
+- **Signals.** No test signals a child that already ended, runs a real launcher's stop, or runs a launcher as root.
+
+## Review Focus
+
+1. **The host inferring completion.** A verdict that sets `achieved`, a provisional stop on a supervised goal, or a `met` that hides a failing host receipt. Expect none.
+   - Tests: Task 13 `acceptance 7: a provisional met stops the goal and continue resumes it` and `a supervised goal shows the verdict and changes nothing`; Task 6 `acceptance 6: a failing receipt overrides the evaluator`.
+   - Lines whose deletion the tests must catch:
+     - in `composeVerdict`, the host-producer branch that ignores the evaluator's state;
+     - in `provisionalStop`, the `autonomyOf(goal) === "autonomous"` check and the `standing` check;
+     - in `continueGoal`, the absence of any write to `goal.status = "achieved"`: the only `achieved` stays at `goals.ts` line 580.
+2. **A model grading its own work.** An evaluator whose model authored integrated work in the run, or whose family is unknown or the coordinator's. Expect none.
+   - Tests: Task 2 `the evaluator rule excludes authors by model and prefers independence`; Task 12 `acceptance 11 end to end`.
+   - Lines: in `chooseEvaluator`, the `authorModels.has(model)` check and the `family === undefined` check.
+3. **Evaluator text where it must not be.** A note or a handle in a view, an event, the blackboard, a later member's context or prompt, a log entry, or a row. Expect none.
+   - Tests: Task 12 `evaluator text stays sealed`; Task 5 `rows hold no text`; Task 10 `criteria rows reach only the coordinator`.
+   - Lines: in `screen`, the stub that replaces the member's report; in `memberReports` and `reportingMembers`, the `evaluator` exclusion; in `verdictLogEntries`, the `latest` values without `note`.
+4. **Something on by default.** Expect today's bytes without the key.
+   - Tests: Task 12 `without verdicts a run is as today`; Task 13 `without verdicts a goal is as today`; Task 10 `without criteria rows the prompts are byte for byte`; Task 1 `the evaluator setting is inside the routine approval digest`.
+   - Lines: `verdictPin`'s `evaluator === "on" && register === "on"`; the `run.verdicts !== "on"` guards in `reviewed`, `holdNoChange`, and `step`; `cycleVerdict`'s `{}` when neither side has an assessment; `criteriaRowsFor`'s `{}`.
+5. **A run held forever, or a verdict written twice.** A failure that never releases the hold; a verdict composed twice after a restart; an old revision's verdict applied to a new one. Expect one composition per verdict and a release on every path.
+   - Tests: Task 11 `seeded verdicts with restarts compose each verdict once`, `a verdict never outlives its revision`, `one replacement, then evaluator-unavailable`, and `record failures never hold the run`.
+   - Lines: in `complete`, the guard that the state is still this verdict's; in `step`, the revision check that discards the state; in `failure`, the move to `done` on the second failure.
+
+### Task 1: the report, the setting, and the run fields
+
+**Files:** `packages/host/src/verdict-types.ts` (create), `packages/host/src/team-types.ts` (at most +10), `tests/verdict-schemas.test.ts` (create), `tests/routines.test.ts`. Runs first.
+
+**Interfaces (produces):**
+```ts
+// verdict-types.ts: imports zod and objective-types only.
+export const VERDICT_LIMITS = { criteria: 8, handles: 8, handleChars: 400, noteBytes: 500, labelBytes: 120 } as const;
+export type AssessedState = "met" | "not-met" | "inconclusive";
+export type ComposedState = AssessedState | "pending-owner";
+export const verdictReportSchema = z.object({
+  kind: z.literal("verdict"),
+  result: z.enum(["met", "not-met", "inconclusive"]),
+  criteria: z.array(z.object({
+    id: z.string().regex(ID_RE),                             // the record's id rule (objective-types.ts line 66)
+    state: z.enum(["met", "not-met", "inconclusive"]),
+    evidence: z.array(z.string().min(1).max(400)).max(8),
+    note: z.string().optional(),                             // 1 to 500 UTF-8 bytes
+  }).strict()).min(1).max(8),
+}).strict().superRefine(/* unique ids; note bytes */);
+export type VerdictReport = z.infer<typeof verdictReportSchema>;
+/** Why a verdict has no evaluator answer. */
+export type VerdictReason = "no-independent-evaluator" | "evaluator-unavailable" | "record-unavailable" | "context-too-large";
+/** Why one criterion is inconclusive or waits. */
+export type CriterionReason = "no-receipt" | "receipt-unknown" | "before-delivery" | "pinned-changed" | "unresolved-evidence" | "not-assessed" | "no-evaluator";
+export type VerdictCounts = { met: number; notMet: number; inconclusive: number; pendingOwner: number };
+/** The run's summary: ids, enumerations, and counts only. It reaches every team view and relay device. */
+export type RunAssessment = {
+  verdictId: string; revision: number; head: string; kind: "reviewed" | "no-change";
+  result: AssessedState; evaluatorResult?: AssessedState; reason?: VerdictReason;
+  counts: VerdictCounts; criteria: { id: string; state: ComposedState }[]; at: string;
+};
+export const runAssessmentSchema: z.ZodType<RunAssessment>;
+export const criteriaRowSchema = z.object({
+  criterion: z.string().regex(ID_RE),
+  status: z.enum(["met", "not-met", "inconclusive", "pending-owner"]),
+  check: z.string(),                                         // 1 to 120 UTF-8 bytes
+}).strict();
+export type CriteriaRow = z.infer<typeof criteriaRowSchema>;
+export const criteriaRowsSchema = z.array(criteriaRowSchema).min(1).max(8);
+
+// team-types.ts
+// line 239, in place: objective gains evaluator: z.enum(["on", "off"]).optional()   — no default
+// teamReportVariants, after intentCheckReportSchema (line 606): verdictReportSchema,
+// TeamRole (line 620), in place: … | "intent-checker" | "evaluator"
+// teamGoalContextSchema (line 524), as its last key: criteria: criteriaRowsSchema.optional()
+// TeamRun, after register (line 777):
+//   /** Pinned by createRun when the project's evaluator and register are on; absent otherwise and on runs created before verdicts existed. */
+//   verdicts?: "on";
+//   /** The current revision's verdict summary; absent until one is composed. */
+//   assessment?: RunAssessment;
+```
+
+**Decisions:**
+
+- **No default.** Without the key, every routine digest, prompt, context, and view is unchanged. Writing the key changes `RoutineService.authority`, because `digestedProjectTeam` strips only `eval`.
+- **The role and the report.** `evaluator` reports only `verdict`, as `intent-checker` reports only `intent-check`.
+- **The criteria rows.** They live in the goal context, beside `record`. They hold no note, threshold, score, count, model, or profile, by schema.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `the verdict report is strict and bounded` (verdict-schemas) | **Accepted:** a report with 8 criteria, each with 8 handles of 400 characters and a 500-byte note. `teamReportSchema` accepts it. **Refused:** 9 criteria; 9 handles; a 401-character handle; a 501-byte note; two criteria with one id; an unknown key; state `"pending-owner"`; result `"achieved"`. |
+| `the evaluator setting and the run fields stand alone` (verdict-schemas) | `{ evaluator: "on" }` and `{ evaluator: "off", register: "on" }` parse; `{ evaluator: "maybe" }` is refused. A goal context without `criteria` serializes equal to the string pinned from the base commit. A context with 9 rows, a 121-byte label, a row with a `note`, or an empty `criteria` array is refused. `runAssessmentSchema` refuses a key outside the type. |
+| `the evaluator setting is inside the routine approval digest` (routines) | The pattern of step 2's test. A routine keeps its stored authority across a reload without the key. It blocks at its next check after the project gains `objective: { evaluator: "on" }`. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/verdict-schemas.test.ts tests/routines.test.ts tests/intent-schemas.test.ts tests/register-schemas.test.ts` and the host typecheck. Confirm with `wc -l` that `team-types.ts` is at most 939 lines.
+
+### Task 2: the evaluator rule and the pin
+
+**Files:** `packages/host/src/evaluator-profiles.ts`, `tests/evaluator-profiles.test.ts`. Runs first.
+
+**Interfaces (produces):** pure.
+```ts
+export type EvaluatorChoice =
+  | { profile: TeamModelProfile; family: string; sharedFamily: boolean; alsoReviewed: boolean }
+  | { skipped: "no-independent-evaluator" | "evaluator-unavailable" };
+/**
+ * C14 rules 1 to 3 over evaluatorProfiles(lineup). `authors`: the profiles of implementer and integrator members whose work
+ * integrated in the run. `reviewers`: the run's reviewer profiles. `excluded`: profile ids that already failed this verdict.
+ */
+export function chooseEvaluator(lineup: TeamLineup | undefined,
+  cycle: { authors: readonly TeamModelProfile[]; reviewers: readonly TeamModelProfile[] },
+  limited: ReadonlySet<Provider>, excluded?: ReadonlySet<string>): EvaluatorChoice;
+/** True only for evaluator "on" with register "on", on a run that is neither a mission subteam nor a handoff run. */
+export function verdictPin(input: { evaluator?: "on" | "off"; register?: "on" | "off"; mission: boolean; handoff: boolean }): boolean;
+/** The ids of evaluator profiles whose model is also an implementer's or an escalation's (the lineup warning of part 5). */
+export function evaluatorOverlaps(lineup: TeamLineup): string[];
+```
+
+**Decisions:**
+
+- **A model** is `provider` and `model` together; a profile without `model` is its provider's default and matches only another profile without `model` on that provider.
+- **Eligible** (the hard rule): `familyOf(profile)` is known and differs from `familyOf(lineup.coordinator)`, which must be known; and the profile's model is not an author's model.
+- **Unavailable** is separate from ineligible. If eligible profiles exist but every one is on a `limited` provider or in `excluded`, the result is `evaluator-unavailable`. If none is eligible, it is `no-independent-evaluator`.
+- **Preference** among the remaining, in lineup order: the first whose family neither authored nor reviewed; else the first whose family authored nothing; else the first.
+- **Flags.** `sharedFamily`: the chosen family is an author's family. `alsoReviewed`: the chosen model is a reviewer's model.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `the evaluator rule excludes authors by model and prefers independence` | **Acceptance 11's lineup.** Coordinator of family A; reviewer of family B; implementers of family C; `evaluators` lists the reviewer's profile, then a second profile of the implementer's model. With that implementer as an author and the reviewer as a reviewer, the choice is the reviewer's profile, with `sharedFamily` false and `alsoReviewed` true. The second profile is never chosen, even when listed first. **Preference.** With a third evaluator of family D that neither authored nor reviewed, D is chosen. |
+| `an unknown family is never eligible` | An evaluator whose `familyOf` is undefined is skipped. An unknown coordinator family gives `no-independent-evaluator`. A lineup without evaluators and without a strong reviewer gives `no-independent-evaluator`. |
+| `limits and failures make the evaluator unavailable, not ineligible` | One eligible profile on a limited provider gives `evaluator-unavailable`; in `excluded` too; with a second eligible profile, the second is chosen. |
+| `the verdict pin needs both keys and a plain run` | `verdictPin` is true only for `{ evaluator: "on", register: "on", mission: false, handoff: false }`. It is false for each of: evaluator absent or `"off"`, register absent or `"off"`, a mission subteam, a handoff run. |
+| `evaluator overlaps name shared models` | Acceptance 11's lineup gives the second profile's id only. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/evaluator-profiles.test.ts` and the host typecheck.
+
+### Task 3: the verdict ops in the record log
+
+**Files:** `packages/host/src/objective-record.ts`, `tests/objective-record.test.ts`. Runs first.
+
+**Interfaces (produces):**
+```ts
+export const VERDICT_OPS = { recorded: "verdict.recorded", contradicted: "evaluator-contradicted-receipt" } as const;
+// verdict.recorded: actor "host", authority "receipt", target "c0", handle `verdict:<verdictId>`,
+//   before: { inline: { latest: Record<criterionId, { state: ComposedState; verdictId: string } | null> } },
+//   after:  { inline: { latest: Record<criterionId, { state: ComposedState; verdictId: string }>; result: AssessedState; kind: "reviewed" | "no-change"; revision: number; head: string } }
+// evaluator-contradicted-receipt: actor "host", authority "receipt", target the criterion id, handle `verdict:<verdictId>`,
+//   after: { inline: { evaluator: "met" | "not-met"; receipt: "met" | "not-met"; handle?: string } }   // handle: the receipt's, when there is one
+// rebuildVersion: verdict.recorded sets each named criterion's `latest` to before.inline.latest[id] (removed when null);
+//   evaluator-contradicted-receipt changes nothing.
+```
+
+**Decisions:** both op names pass `OP_RE`. Every value is inline: 8 `latest` values of about 70 bytes fit 2 KiB, and no note is logged.
+
+- [ ] **Step 1: Write the failing test.**
+
+| Test name | Assertions |
+|---|---|
+| `verdict ops rebuild their latest states` | A record at version v gets a `verdict.recorded` entry and a contradicted entry at v + 1, changing `latest` on c0 and c1. `rebuildVersion(record, v)` gives c0 and c1 without `latest`; after a second verdict at v + 2, `rebuildVersion(record, v + 1)` gives the first verdict's `latest`. An entry with an unknown op still answers `objective-version-unavailable`. |
+
+- [ ] **Step 2: Run and confirm it fails.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/objective-record.test.ts tests/register-rebuild.test.ts` and the host typecheck.
+
+### Task 4: the register's reviewed pass at the hold
+
+**Files:** `packages/host/src/team-register.ts`, `tests/team-register.test.ts`. Runs first.
+
+**Interfaces (produces):**
+```ts
+// TeamRegister gains:
+/** At the verdict's hold: marks a reviewed pass for the run's current revision when the reviewed-head rule holds, whatever the
+ *  run's status. True when such a pass exists after the call. Saves through host.save when it marks. Never throws. */
+markReviewed(holder: RegisterHolder): boolean;
+/** The receipts of the run's latest pass when it is a reviewed pass at `head`: "pending" while it runs; undefined otherwise. */
+reviewedReceipts(runId: string, head: string): readonly ObjectiveReceipt[] | "pending" | undefined;
+```
+
+**Decisions:** `mark` is unchanged. A later `mark` at `ready-for-review` or `merged` finds the reviewed pass of the same revision and adds none, by the existing replacement rule.
+
+- [ ] **Step 1: Write the failing test.**
+
+| Test name | Assertions |
+|---|---|
+| `a verdict's reviewed pass is the run's only pass` | On a pinned run at `reviewing` with the reviewed-head rule, `markReviewed` returns true and saves one pending pass. `reviewedReceipts` gives `"pending"`; after `drain` and the apply, it gives the receipts. A later `mark` at `ready-for-review` adds no pass. A wrong head gives undefined. An unpinned run, or one without the rule, gives false and no pass. |
+
+- [ ] **Step 2: Run and confirm it fails.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/team-register.test.ts` and the host typecheck.
+
+### Task 5: the verdict ledger
+
+**Files:** `packages/host/src/verdict-store.ts` (create), `packages/host/src/server.ts` (lines 43, 262, and 405, in place), `tests/verdict-store.test.ts` (create). Runs first.
+
+**Interfaces (produces):**
+```ts
+export const VERDICTS_MODULE = "objective_verdicts";
+export const VERDICT_RETENTION_DAYS = 730;
+export const verdictEventDataSchema = z.strictObject({
+  verdictId: z.uuid(), goalId: z.uuid().optional(), cycle: z.number().int().min(1).optional(),
+  kind: z.enum(["reviewed", "no-change"]), recordVersion: z.number().int().min(1), rubricVersion: z.number().int().min(1),
+  profileId: z.string().regex(ID_RE).optional(), provider: z.enum(["claude", "codex", "opencode"]).optional(),
+  model: z.string().max(180).regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/).optional(), family: z.string().regex(ID_RE).optional(),   // the lineup's id rules (team-types.ts line 252)
+  sharedFamily: z.boolean(), alsoReviewed: z.boolean(),
+  result: z.enum(["met", "not-met", "inconclusive"]), evaluatorResult: z.enum(["met", "not-met", "inconclusive"]).optional(),
+  reason: z.enum(["no-independent-evaluator", "evaluator-unavailable", "record-unavailable", "context-too-large"]).optional(),
+  met: count, notMet: count, inconclusive: count, pendingOwner: count,           // count: z.number().int().min(0).max(8)
+});
+export type VerdictEventData = z.infer<typeof verdictEventDataSchema>;
+/** The pattern of outcomeModule: one table, two blind indexes, a deleteRun hook that stamps and never removes. */
+export function verdictModule(options?: { now?: () => string }): EvidenceModule;
+/** Projects run events of kind "verdict.recorded" into one row each; a repeated verdictId writes nothing. */
+export function verdictProjector(store: EvidenceStore): EventProjector;
+/** Registers the module, then its projector. */
+export function registerVerdicts(store: EvidenceStore, outbox: EventOutbox): void;
+/** Deletes rows whose `at` is more than VERDICT_RETENTION_DAYS before `now`, at most `limit` (default 100) per call. */
+export function sweepExpiredVerdicts(store: EvidenceStore, now: string, limit?: number): number;
+```
+
+The table:
+```sql
+CREATE TABLE objective_verdicts (
+  verdict_id TEXT PRIMARY KEY, project_ref BLOB NOT NULL, goal_ref BLOB, run_id TEXT NOT NULL, cycle INTEGER,
+  revision INTEGER NOT NULL, kind TEXT NOT NULL, record_version INTEGER NOT NULL, rubric_version INTEGER NOT NULL,
+  profile_id TEXT, provider TEXT, model TEXT, family TEXT, shared_family INTEGER NOT NULL, also_reviewed INTEGER NOT NULL,
+  result TEXT NOT NULL, evaluator_result TEXT, reason TEXT,
+  met INTEGER NOT NULL, not_met INTEGER NOT NULL, inconclusive INTEGER NOT NULL, pending_owner INTEGER NOT NULL,
+  at TEXT NOT NULL, run_deleted_at TEXT);
+CREATE INDEX objective_verdicts_project ON objective_verdicts (project_ref, at);
+CREATE INDEX objective_verdicts_goal ON objective_verdicts (goal_ref, at);
+```
+
+```ts
+// server.ts, in place (find each by its code):
+// 43:  import { EXCLUSION_REASONS, … } from "./outcome-store.js"; import { registerVerdicts, sweepExpiredVerdicts } from "./verdict-store.js";
+// 262: evidence.register(outcomeModule()); registerVerdicts(evidence, outbox);
+// 405: sweepExpiredOutcomes(evidence, new Date().toISOString(), undefined, config.teams?.outcomes?.retentionDays); sweepExpiredVerdicts(evidence, new Date().toISOString());
+```
+
+**Decisions:**
+
+- **No text.** Every column is an id, an enumeration, a number, a flag, or a time. `project_ref` and `goal_ref` are `tx.index("project", …)` and `tx.index("goal", …)`. A profile id, provider, and model are configuration ids, as the outcome rows hold them.
+- **No agreement column.** The owner's answer stays in the sealed goal record (call 14).
+- **Rows outlive their run** until the retention sweep, as outcome rows do. They are written only when the outcome ledger's events are on (`options.events`), because the row is projected from a run event.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `a verdict event projects one row` | A `verdict.recorded` event with valid data writes one row with every column as given and the two blind indexes. The same event again writes nothing. An event whose data fails `verdictEventDataSchema` writes no row and does not block later events. |
+| `rows hold no text` | Every column's SQLite type is INTEGER, BLOB, or TEXT holding an id, an enumeration, or an ISO time: the test lists the table's columns from `PRAGMA table_info` and checks each TEXT column against its enumeration or id pattern. A data object with a `note` or `summary` key is refused by the schema. |
+| `rows outlive their run and expire after 730 days` | `deleteRun` stamps `run_deleted_at` and removes nothing. `sweepExpiredVerdicts` at 731 days removes at most 100 rows per call and keeps a row of 729 days. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/verdict-store.test.ts tests/outcome-store.test.ts` and the host typecheck. Confirm with `wc -l` that `server.ts` is 2,285 lines.
+
+### Task 6: composition
+
+**Files:** `packages/host/src/verdict-compose.ts` (create), `tests/verdict-compose.test.ts` (create). Needs Tasks 1 and 3.
+
+**Interfaces (produces):** pure.
+```ts
+export type ComposeInput = {
+  record: ObjectiveRecord; head: string; kind: "reviewed" | "no-change"; configured: readonly TeamCommand[];
+  /** Step 4's receipts at `head`; undefined when no pass ran there. */
+  receipts?: readonly ObjectiveReceipt[];
+  /** Host facts at `head`; undefined when the host cannot tell. */
+  facts: { checksPassed?: boolean; reviewApproved?: boolean };
+  changedPaths: { paths: readonly string[]; truncated: boolean };
+  /** The evaluator's screened report; absent when no evaluator answered, with `reason`. */
+  report?: VerdictReport; reason?: VerdictReason;
+};
+export type ComposedCriterion = {
+  id: string; producer: "host" | "evaluator" | "owner"; state: ComposedState; reason?: CriterionReason;
+  evaluatorState?: AssessedState; receipt?: { handle: string; outcome: ReceiptOutcome };
+  handles: string[]; note?: string; contradicted?: true;
+};
+export type ComposedVerdict = {
+  result: AssessedState; evaluatorResult?: AssessedState; reason?: VerdictReason;
+  criteria: ComposedCriterion[]; counts: VerdictCounts; dropped: { unknownIds: number; handles: number };
+};
+/** Form and membership only (call 7). */
+export function resolveHandle(handle: string, input: Pick<ComposeInput, "receipts" | "changedPaths" | "record">): boolean;
+export function composeVerdict(input: ComposeInput): ComposedVerdict;
+/** `latest` on every active criterion and the log entries, sealed at one version with sealRecord; "log-full" when the entries
+ *  would pass 300 log entries or 160 KiB. Never writes a note. */
+export function verdictRecord(record: ObjectiveRecord, verdict: ComposedVerdict,
+  meta: { verdictId: string; kind: "reviewed" | "no-change"; revision: number; head: string; at: string }): ObjectiveRecord | "log-full";
+```
+
+**Decisions: the composition rule.** Each active criterion of the record, in record order, gets one state:
+
+| Producer and check | Reads | State |
+|---|---|---|
+| host, `command` or `artifact` | the receipt with `subject: "criterion"`, its id, and `commit === head` | `pass` gives `met`; `fail` gives `not-met`; `unknown` gives `inconclusive` (`receipt-unknown`); none gives `inconclusive` (`no-receipt`) |
+| host, `receipt` `checks-passed` or `review-approved` | `facts` | true gives `met`; false gives `not-met`; undefined gives `inconclusive` (`no-receipt`) |
+| host, `receipt` `merged` or `landed` | nothing | `inconclusive` (`before-delivery`) |
+| host, `citations` or `citation-form` | nothing | `inconclusive` (`no-receipt`); step 7 adds the check |
+| evaluator, `judgement` | the report's entry for the id | its state when every handle resolves and a `met` has at least one; else `inconclusive` (`unresolved-evidence`); no entry gives `inconclusive` (`not-assessed`); no report gives `inconclusive` (`no-evaluator`) |
+| owner, `owner-rating` | the newest `rating.recorded` log entry whose `after.inline.subject` is the check's subject and whose `after.inline.commit` is `head` | score at least the threshold's `min` gives `met`, else `not-met`; no such entry gives `pending-owner` |
+
+Then, in order:
+
+1. **Pinned files.** A criterion with `pinned` whose path is in `changedPaths.paths`, or any `pinned` criterion when `changedPaths.truncated`, cannot be `met`: `met` becomes `inconclusive` (`pinned-changed`).
+2. **Contradiction.** A host criterion whose state is `met` or `not-met`, where the report gives the opposite state for it, gets `contradicted: true`. The host state stands. An evaluator `inconclusive` is no contradiction.
+3. **The result.** `not-met` when any criterion is `not-met`, whatever its producer, owner criteria included. Else `inconclusive` when any criterion is `inconclusive`. Else `met`. `pending-owner` never blocks `met`.
+4. **Kept from the report:** `evaluatorResult` is the report's own `result`. Unknown and retired ids are dropped and counted. Handles that do not resolve are dropped and counted. Notes are kept on the criterion, as sealed text.
+
+`c0` is always an evaluator criterion, so every result holds an agent judgement and carries the agent assessment label. When the record is unreadable, there is nothing to compose: the runtime records `inconclusive` with `record-unavailable`, no criteria, and zero counts (Task 11).
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `acceptance 6: a failing receipt overrides the evaluator` | Part 9's record. The report gives every criterion `met` with resolved handles; c4's receipt is `fail`. c4 is `not-met` with `contradicted: true`; the result is `not-met`; `evaluatorResult` is `met`. `verdictRecord` writes one `verdict.recorded` entry and one `evaluator-contradicted-receipt` entry targeting c4. |
+| `the result follows the composition rules` | Table-driven, one row per line of the rule table and per rule 1 to 3. Includes: every state `met` with one `pending-owner` gives `met`; one owner `not-met` gives `not-met`; one `inconclusive` and no `not-met` gives `inconclusive`; no report gives `inconclusive` with every evaluator criterion `no-evaluator` and host criteria still composed. |
+| `handles resolve by form and membership` | **Resolve:** a receipt handle in `receipts`; `file:src/a.ts` and `file:src/a.ts#L1-L9` with `src/a.ts` in the changed paths; `file:research/x.json` when a criterion's artifact check names it. **Do not resolve:** `file:../a`, `file:/abs`, a path in neither set, a receipt handle of another run, `citation:…`, and a 401-character string. A `met` with no handle becomes `inconclusive` (`unresolved-evidence`); a `not-met` with one bad handle becomes `inconclusive` too. |
+| `a changed pinned file voids met` | c4 pinned on `research/founders/rank-verify.mjs`: with that path changed, c4 `met` becomes `inconclusive` (`pinned-changed`); with `truncated: true` and no listed change, the same; without a change, `met`. |
+| `owner criteria read only a rating on the head` | c5 with threshold 4 of 5: a rating of 4.5 on `head` gives `met`; 3.5 on `head` gives `not-met`; 5 on an older commit gives `pending-owner`; no rating gives `pending-owner`. |
+| `the record write holds latest without notes and fits one entry` | 8 active criteria with 500-byte notes: the `verdict.recorded` entry's `before` and `after` are each inline and at most 2,048 bytes; no `latest` holds `note`; the version is one up. At 299 log entries, a write with two entries gives `"log-full"`. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/verdict-compose.test.ts` and the host typecheck.
+
+### Task 7: the evaluator's prompt and context
+
+**Files:** `packages/host/src/verdict-prompt.ts` (create), `tests/verdict-prompt.test.ts` (create). Needs Task 1.
+
+**Interfaces (produces):** pure.
+```ts
+export const VERDICT_PROMPT_BYTES = 8 * 1024;
+export const VERDICT_CONTEXT_BYTES = 1024 * 1024;
+/** Rubric version 1: the items a judgement criterion may name. */
+export const RUBRIC_V1 = ["owner-text", "method-applied"] as const;
+/** Fixed text only: it takes no run, so no run data can reach it. */
+export function evaluatorPrompt(provider: Provider, profile?: TeamModelProfile): string;
+export type VerdictContext = {
+  kind: "verdict-context"; verdictKind: "reviewed" | "no-change"; head: string; base: string;
+  record: { objective: string; directions: string[]; definitions: { term: string; meaning: string }[]; rules: string[]; nonGoals: string[];
+    criteria: { id: string; statement: string; check: Check; producer: "host" | "evaluator" | "owner"; threshold: Threshold }[] };
+  rubric: { version: number; items: readonly string[] };
+  changedPaths: { paths: string[]; truncated: boolean };
+  checks: { name: string; status: string }[];                                   // the final check round at the head
+  receipts: { handle: string; kind: string; id: string; outcome: ReceiptOutcome }[];   // criterion receipts at the head only
+};
+/** Undefined when the JSON is over VERDICT_CONTEXT_BYTES. Active criteria only; c0's statement is resolved from statementOf. */
+export function verdictContext(input: { run: TeamRun; record: ObjectiveRecord; head: string; kind: "reviewed" | "no-change";
+  receipts?: readonly ObjectiveReceipt[] }): VerdictContext | undefined;
+/** The coordinator's lines for the rows, led by "Agent assessment, provisional, of the previous cycle:". */
+export function criteriaRowsText(rows: readonly CriteriaRow[]): string;
+```
+
+**Decisions:**
+
+- **The prompt** reuses `readOnlyWorkspaceInstructions`, `contextAccessInstructions`, `reportingInstructions`, and the Codex sandbox text, as `intentCheckerPrompt` does. It tells the evaluator to judge each criterion from the context and the head only, gives the three states, the handle forms (`receipt:…` from the context, `file:PATH` or `file:PATH#Lfrom-Lto`), the limits, and that a `met` needs a handle. It names no member, report, or earlier verdict.
+- **The context** holds owner text and host facts only. It holds no assumption, question, proposal, log entry, `latest`, member report, brief, finding, goal digest, earlier verdict, owner assessment, rubric score, task rating, usage figure, routing data, ledger row, or evaluator identity (part 5).
+- **Rubric items.** A judgement criterion names one of the two items; the prompt states what each means. A project adds items in a later slice with the rubric version (C15 class B).
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `the evaluator prompt is fixed and bounded` | At most 8,192 bytes for each provider. The bytes are equal for two runs with different objectives. It names `verdict`, the three states, both handle forms, and the limits from `VERDICT_LIMITS`. |
+| `the verdict context holds owner text and host facts only` | A run and record planted with distinct marker strings in an assumption, a question, a log entry, a criterion's `latest`, a member report, a brief, a finding, and a previous assessment. None of the markers appears in the context's JSON. The criteria are the active ones, with c0's statement resolved. Receipts hold criterion receipts at `head` only. |
+| `an oversized context is undefined` | A run with changed paths that push the JSON over 1 MiB gives undefined. |
+| `criteria rows print labelled an agent assessment` | Two rows print as one lead line and one line per row: id, status, and check label. The text holds no note, threshold, or count. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/verdict-prompt.test.ts` and the host typecheck.
+
+### Task 8: the role in every role list
+
+**Files:** `packages/host/src/manager.ts` (lines 604 and 742, in place), `packages/host/src/worker.ts` (lines 1127 and 1384, in place), `packages/host/src/team-mcp-results.ts` (line 53), `packages/host/src/fuse/baseline.ts` (line 13), `packages/host/src/github-grants.ts` (line 157), `packages/host/src/team-watch.ts` (lines 18 and 105), `packages/host/src/evidence/host-entries.ts` (line 76), `apps/web/src/teams.tsx` and `apps/mobile/src/features/teams/model.ts` (the role names), `tests/{fuse-baseline,github-grants,team-watch,host-entries}.test.ts`. Needs Task 1.
+
+**Interfaces (produces):**
+```ts
+// each role list on one line gains "evaluator" in place: manager.ts 604 and 742, worker.ts 1127 and 1384, team-mcp-results.ts 53, fuse/baseline.ts 13
+// github-grants.ts 157, in place: … || context.role === "intent-checker" || context.role === "evaluator") return undefined;
+// team-watch.ts 18: "evaluator": "Evaluator";   105: the rank puts "evaluator" after "reviewer"
+// evidence/host-entries.ts 76, in place: … && member.role !== "permission-coordinator" && member.role !== "evaluator");
+// apps/web/src/teams.tsx and apps/mobile/src/features/teams/model.ts: the role's display name "Evaluator"
+```
+
+**Decisions:** the evaluator gets no GitHub grant, no entry tools (`ENTRY_ROLES` does not list it; unchanged), and no blackboard report entry. Its launches pass fuse admission as every member's do.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `the evaluator launches under the fuse` (fuse-baseline) | `LAUNCH_ROLES` includes `evaluator`; a launch of that role is admitted and counted as any member's. |
+| `the evaluator gets no grant` (github-grants) | `sessionGithubScope` for role `evaluator` is undefined with and without delivery. |
+| `the evaluator has a name and a place` (team-watch) | The watch line names "Evaluator" and orders it after the reviewer. |
+| `an evaluator's report never becomes an entry` (host-entries) | A run with an evaluator member holding a `verdict` report gives no `report:` entry for it. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/fuse-baseline.test.ts tests/github-grants.test.ts tests/team-watch.test.ts tests/host-entries.test.ts`, the host typecheck, `npm run lint -w @infinite/mobile`, and `npx tsc --noEmit` in `apps/mobile`. Confirm with `wc -l` that `manager.ts` is 1,244 and `worker.ts` is 1,903 lines.
+
+### Task 9: the goal rules
+
+**Files:** `packages/host/src/goal-types.ts`, `packages/host/src/goal-verdicts.ts` (create), `tests/goal-verdicts.test.ts` (create). Needs Task 1.
+
+**Interfaces (produces):**
+```ts
+// goal-types.ts
+export type GoalAssessment = RunAssessment & { progress: number };
+// GoalCycle gains, after `class`:  /** The cycle's agent assessment, provisional; copied from its run. */ assessment?: GoalAssessment;
+// ProductGoal.stopReason (line 110), in place: "deadline" | "member-limit" | "provisional-met"
+// ProductGoal.outcomes (line 147), in place: each outcome gains verdictId?: string
+// goalOutcomeSchema (line 69) gains: verdictId: z.uuid().optional(), continue: z.literal(true).optional(),
+//   refined: `continue` needs `verdictId` and result "not-achieved".
+export type GoalOutcomeInput = z.infer<typeof goalOutcomeSchema>;
+
+// goal-verdicts.ts: imports goal-types, team-types, verdict-types, autonomy, objective-goals, objective-digest, and team-workspace's TeamError.
+export const PROVISIONAL_REASON = "An agent assessment, provisional, found every criterion met. Record your assessment: achieved, or not achieved with continue.";
+export const PROVISIONAL_EVENT = "Agent assessment, provisional: every criterion met. The goal stopped for your assessment and is not marked achieved.";
+export const CONTINUE_EVENT = "You recorded not achieved and continued the goal. The next cycle reads your direction.";
+/** For refresh's Object.assign: {} when neither the team nor the cycle has an assessment; the team's current one with its
+ *  progress; { assessment: undefined } when the cycle has one and the team's is gone or of another revision. */
+export function cycleVerdict(goal: Pick<ProductGoal, "cycles">, cycle: GoalCycle, team: Pick<TeamView, "revision" | "assessment">): { assessment?: GoalAssessment };
+/** A cycle with a verdict fails when its result is not met and its progress is not positive. */
+export function verdictFailed(cycle: Pick<GoalCycle, "assessment">): boolean;
+/** True for a pinned-autonomous finite goal whose cycle for `team` holds a current reviewed `met` assessment. */
+export function provisionalStop(goal: Pick<ProductGoal, "autonomy" | "standing" | "cycles">, team: Pick<TeamView, "id" | "revision" | "assessment">): boolean;
+/** Throws TeamError before anything is admitted; see the codes below. */
+export function assertVerdictAnswer(goal: ProductGoal, body: GoalOutcomeInput, nowMs: number): void;
+/** Appends body.summary as a steering entry, syncs the record with steerGoalObjective, and sets the goal running with no
+ *  stopReason and no reason. Returns goalObjectiveNote's text, or undefined. Never sets `achieved`. */
+export function continueGoal(holder: GoalHolder, body: GoalOutcomeInput, at: string): string | undefined;
+/** { criteria } for the next cycle's context, or {}: see the decisions. */
+export function criteriaRowsFor(holder: GoalHolder, project: Pick<Project, "team"> | undefined): { criteria?: CriteriaRow[] };
+```
+
+**Decisions:**
+
+- **Progress** is the cycle's `met` count minus the `met` count of the newest earlier cycle with an assessment, or its `met` count when there is none. It is computed when the assessment is copied, from at most 50 cycles in memory.
+- **The refusals of `assertVerdictAnswer`:**
+  - 409 `verdict-not-found` ("That agent assessment is not one of this goal's."): `verdictId` names no cycle's assessment.
+  - 409 `goal-not-provisional` ("Continue applies only to a goal stopped by a provisional agent assessment."): `continue` on a goal whose `stopReason` is not `provisional-met`, or whose newest assessed cycle's `verdictId` differs.
+  - 409 `goal-limit-reached` ("The goal's time or member allowance is spent. Start a new goal to continue."): `continue` at or past `deadlineAt` or `ceilingAt`, or with `memberCount` at `maxMembers`.
+  - 409 `goal-steering-limit`: `continue` when the goal holds 20 steering entries, or the objective with every direction and the summary passes 24,000 bytes, as `steer` checks.
+- **Criteria rows** are `{}` unless all of these hold:
+  - the project's `objective.prompts` and `objective.evaluator` are `"on"`;
+  - the goal is pinned `autonomous`;
+  - a cycle holds an assessment, and the record reads.
+
+  Then the rows are the newest assessment's criteria that are still active in the record, in record order, with `checkLabel(check, configured)` cut to 120 bytes on a character boundary. In a supervised goal the verdict changes nothing, so no rows.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `cycle verdicts copy the current revision and compute progress` | A team at revision 2 with an assessment of revision 2 gives that assessment with progress; one of revision 1 gives `{ assessment: undefined }` when the cycle holds one, and `{}` when it does not. Three cycles with 1, 3, and 3 met give progress 1, 2, and 0. |
+| `a provisional stop needs an autonomous finite goal and a met reviewed verdict` | True only for an autonomous finite goal and a current reviewed `met`. False for a supervised goal, an unpinned goal, a standing goal, a `no-change` assessment, `not-met`, `inconclusive`, and a stale revision. |
+| `verdict failures follow the result and the progress` | `verdictFailed` is true for `not-met` with progress 0 and `inconclusive` with progress −1. It is false for `met` with progress 0, `not-met` with progress 1, and no assessment. |
+| `the outcome rules refuse a wrong verdict answer` | Each code above from its case, with nothing changed on the goal. `continue` with `achieved` or without `verdictId` is refused by the schema. |
+| `continue appends one direction and restarts the goal` | A goal stopped by `provisional-met`: `continueGoal` adds one steering entry, the record gains direction `s<revision>` as `direction.appended` at one version up, and the goal is `running` with no `stopReason` and no `reason`. Its outcomes are unchanged by `continueGoal` itself. |
+| `criteria rows follow the latest verdict, the record, and the switches` | Rows from the newest assessment; a criterion retired since is left out; a 200-byte label is cut to at most 120 bytes; each switch off, a supervised goal, no assessment, or an unreadable record gives `{}`. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/goal-verdicts.test.ts tests/objective-goals.test.ts` and the host typecheck.
+
+### Task 10: the rows in the coordinator's prompt, and the prompt version
+
+**Files:** `packages/host/src/team-prompts.ts` (at most +8), `packages/host/src/objective-digest.ts`, `packages/host/src/config-identity.ts`, `tests/team-prompts.test.ts`, `tests/objective-digest.test.ts`, `tests/config-identity.test.ts`. Needs Tasks 1 and 7.
+
+**Interfaces (produces):**
+```ts
+// team-prompts.ts
+// 140 and 141, in place: goalContextText(goal, role) leaves `criteria` out of the goal JSON for every role, and for "project-manager"
+//   appends criteriaRowsText(goal.criteria) after it. Without `criteria`, its output is byte for byte today's.
+// 521, in place: … goalContextText(run.goal, role) …
+// 166, in place: goal: run.goal && role !== "project-manager" ? withoutCriteria(run.goal) : run.goal,
+// 188, in place: memberReports: (run.members ?? []).filter(member => member.role !== "permission-coordinator" && member.role !== "evaluator").map(…)
+function withoutCriteria(goal: NonNullable<TeamRun["goal"]>): NonNullable<TeamRun["goal"]>;   // the same object when it has no criteria
+
+// objective-digest.ts
+export type ObjectivePrompt = boolean | "register" | "register-autonomous" | "criteria" | "register-criteria" | "register-autonomous-criteria";
+// objectivePromptOf(run): today's value, with "-criteria" added (true becomes "criteria") when run.goal.criteria is present.
+// objectivePromptFor(project, mode): unchanged; it previews an implementer, whose prompt never holds rows.
+
+// config-identity.ts
+// objectiveFixture: the three criteria shapes add two fixed rows to the fixture goal.
+// 159, after the intent-checker line, in place on one line: if (role === "evaluator") return [evaluatorPrompt(provider, profile).split(command).join("<report-command>")];
+```
+
+**Decisions:**
+
+- **Only the coordinator reads the rows**, in its prompt and its context file, as part 8 says. Every other role's prompt and context file stays as without rows.
+- **The version follows the bytes.** `promptVersion` hashes rendered prompts, so the implementer's version is equal with and without rows, and the project manager's differs.
+- **The evaluator's version** is its fixed prompt's hash, as the intent checker's is.
+- **The rows can fall inside the permission agent's 4,000-character read** of the coordinator's prompt. They hold ids, statuses, and check labels that the record digest already prints.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `without criteria rows the prompts are byte for byte` (team-prompts) | For each role, the prompt and the context file of a goal run without `criteria` equal the strings pinned from the base commit. |
+| `criteria rows reach only the coordinator` (team-prompts) | A goal run with acceptance 10's rows. **The project manager:** its prompt holds `c2`, `not-met`, the check label, and "Agent assessment, provisional"; its context file holds the rows. **Every other role:** no row in its prompt or its context file. **Nowhere:** a note, a threshold, a count of failing entries, or a profile name. |
+| `team-prompts imports no verdict storage` (team-prompts) | The source of `team-prompts.ts` imports neither `verdict-store.ts` nor `outcome-store.ts`. |
+| `the criteria shapes follow the goal's rows` (objective-digest) | `objectivePromptOf` gives `"criteria"`, `"register-criteria"`, and `"register-autonomous-criteria"` with rows, and today's values without. |
+| `the criteria shapes change the coordinator's prompt version only` (config-identity) | The implementer's `promptVersion` is equal for `true` and `"criteria"`; the project manager's differs. The evaluator's version is stable across two calls and differs from the intent checker's. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/team-prompts.test.ts tests/objective-digest.test.ts tests/config-identity.test.ts tests/register-prompt.test.ts` and the host typecheck. Confirm with `wc -l` that `team-prompts.ts` is at most 959 lines.
+
+### Task 11: the runtime
+
+**Files:** `packages/host/src/team-verdicts.ts` (create), `tests/team-verdicts.test.ts` (create), `tests/verdict-rebuild.test.ts` (create). Needs Tasks 1, 2, 3, 4, 6, and 7.
+
+**Interfaces (produces):**
+```ts
+export { verdictPin } from "./evaluator-profiles.js";
+export type VerdictState = {
+  revision: number; head: string; kind: "reviewed" | "no-change"; verdictId: string;
+  status: "testing" | "queued" | "evaluating" | "releasing" | "done";
+  failures: 0 | 1; excluded?: string[];                 // profile ids that failed this verdict
+  receiptsFrom: string;                                 // the run whose reviewed pass gives the receipts: this run, or the parent run
+  evaluatorMemberId?: string; heldMemberId?: string;    // heldMemberId: the project manager whose no-change report waits
+  choice?: { profileId: string; provider: Provider; model?: string; family: string; sharedFamily: boolean; alsoReviewed: boolean };
+  report?: VerdictReport; composed?: ComposedVerdict; reason?: VerdictReason;
+  written?: "wrote" | "log-full" | "record-unavailable" | "write-failed";
+};
+/** The part of teams.ts' Stored that verdicts read and write. */
+export type VerdictHolder = { run: TeamRun; verdict?: VerdictState; objectiveRecord?: unknown; checkHead?: string };
+/** Closures over TeamService's private methods, built in one field initializer in teams.ts (Task 12). */
+export type VerdictHost = {
+  holder(runId: string): VerdictHolder | undefined;
+  prepare(holder: VerdictHolder, onPrepared: (member: TeamMember) => void, prebuilt: { prompt: string; profile: TeamModelProfile }): void;
+  consume(holder: VerdictHolder, member: TeamMember): void;
+  operation(holder: VerdictHolder, perform: (signal: AbortSignal) => Promise<boolean | undefined>, complete: (clean: boolean | undefined) => void, member: TeamMember): void;
+  save(holder: VerdictHolder): void;
+  event(holder: VerdictHolder, text: string): void;
+  emit(holder: VerdictHolder, data: VerdictEventData): void;          // the run event "verdict.recorded"
+  configured(run: TeamRun): readonly TeamCommand[];
+  limited(): Set<Provider>;
+  prefix(): TeamCommand | undefined;
+  register: Pick<TeamRegister, "markReviewed" | "reviewedReceipts">;
+  now(): string;
+  uuid(): string;
+};
+export const VERDICT_EVENTS = {
+  held: "The host is assessing this revision against the objective record before it settles.",
+  recorded: (result: AssessedState, counts: VerdictCounts) =>
+    `Agent assessment, provisional: ${result}. ${counts.met} met, ${counts.notMet} not met, ${counts.inconclusive} inconclusive, ${counts.pendingOwner} waiting for the owner.`,
+  contradicted: (count: number) => `The evaluator contradicted ${count} host receipts; the receipts stand.`,
+  replaced: "The evaluator stopped without a usable report; one replacement starts.",
+  skipped: {
+    "no-independent-evaluator": "No evaluator of another model family that authored nothing in this run is listed, so the assessment is inconclusive.",
+    "evaluator-unavailable": "The evaluator could not finish, so the assessment is inconclusive.",
+    "record-unavailable": "The objective record could not be read, so the assessment is inconclusive.",
+    "context-too-large": "The evaluator's context would pass its limit, so the assessment is inconclusive.",
+  },
+  logFull: "The objective record's log is full, so the assessment was kept on the run and the goal but not written to the record.",
+  writeFailed: "The objective record could not be saved, so the assessment was kept on the run and the goal but not written to the record.",
+} as const;
+export type VerdictDetail = {
+  verdictId: string; kind: "reviewed" | "no-change"; revision: number; head: string;
+  result: AssessedState; evaluatorResult?: AssessedState; reason?: VerdictReason;
+  criteria: ComposedCriterion[]; evaluator?: VerdictState["choice"]; written?: VerdictState["written"];
+};
+export class TeamVerdicts {
+  goals?: GoalRecordPort;
+  constructor(host: VerdictHost);
+  /** teams.ts 2593, once the review approved: true holds the run (no delivery, no settle). */
+  reviewed(holder: VerdictHolder): boolean;
+  /** teams.ts 3073, on a project manager's no-change report: true holds the report. */
+  holdNoChange(holder: VerdictHolder, member: TeamMember): boolean;
+  /** teams.ts 2567, where a new project manager would start: true when the verdict owns the run's next step. */
+  step(holder: VerdictHolder): boolean;
+  /** teams.ts 2737: keeps the full report in the state and returns the stub; any other kind becomes fixed blocked text. */
+  screen(holder: VerdictHolder, member: TeamMember, report: TeamReport): TeamReport;
+  /** teams.ts 3058: every report of an evaluator member. Only the current evaluator's verdict report is applied. */
+  consume(holder: VerdictHolder, member: TeamMember): void;
+  /** teams.ts 2483, 2777, 2826: true for an evaluator (handled), false for every other role. */
+  failed(holder: VerdictHolder, member: TeamMember): boolean;
+  /** teams.ts 2980: the evaluator's context; null after the verdict finished without it and the member stopped. */
+  context(holder: VerdictHolder, member: TeamMember): VerdictContext | null;
+  /** For the verdicts read: the done verdict of the run's current revision, from memory. */
+  detail(runId: string): VerdictDetail | undefined;
+}
+```
+
+**Decisions: the states.**
+
+| Status | Entered when | Next |
+|---|---|---|
+| `testing` | `reviewed` holds a new reviewed verdict and calls `register.markReviewed` | `queued` when `reviewedReceipts(run.id, head)` is not `"pending"` |
+| `queued` | from `testing`; at `holdNoChange` (receipts from the parent run); after one failure; when the evaluator member is gone before it was prepared | `evaluating` after `prepare`; `done` when the record does not read, no profile is chosen, or the context is too large |
+| `evaluating` | `prepare` started the evaluator | the consume's completion composes and writes, then `done` (reviewed) or `releasing` (no change); a failure goes to `queued` once, then `done` with `evaluator-unavailable` |
+| `releasing` | a no-change verdict is composed | `step` consumes the held report again, then `done` |
+| `done` | composed, with or without an evaluator | `reviewed` and `holdNoChange` return false; the run proceeds |
+
+- **Every path ends in `done`.** A finish without an evaluator still composes host and owner criteria, sets `run.assessment`, emits the row event, adds one fixed event, and saves.
+- **The authors and reviewers** of `chooseEvaluator` come from the run's members: implementers whose task is `integrated` and integrators that reported a `result`, by their `modelProfile`; and every reviewer member.
+- **Facts.** For a reviewed verdict, `checksPassed` is true when the final check round at `checkHead === head` has every row passed, as `receiptsFor` reads the final round, and `reviewApproved` is true. For a no-change verdict, both come from the parent run's holder in the same way, and are undefined when it is gone.
+- **The record.** It is read with `heldRecordState` and written with `writeHeldRecord` (`objective-holder.ts`), as the intent check and the register write it. The evaluator reads the latest version (part 2).
+- **A verdict never outlives its revision.** `reviewed`, `step`, and the completion compare the state's revision and head with the run's. A mismatch discards the state, removes a stale `run.assessment`, writes nothing, and saves.
+- **A completion writes once.** It checks that the state is still `evaluating` for this evaluator member, revision, and verdict id.
+- **No run status of its own.** The evaluator runs as `reviewing` (Task 12). A verdict adds no status, so the outcome ledger records no new outcome event.
+- **Events** carry results and counts only: `held` once, `recorded` once, `contradicted` once when any, and one skip or write event when it applies.
+
+- [ ] **Step 1: Write the failing tests.** Each test uses a fake host, unless the row says otherwise.
+
+| Test name | Assertions |
+|---|---|
+| `a reviewed revision gets one verdict` | `reviewed` on a pinned run gives true and `testing`; while `reviewedReceipts` is `"pending"` it stays; then `queued`, and `prepare` is called once with the chosen profile and the fixed prompt. The consume's completion composes, writes the record one version up, sets `run.assessment`, emits one event with the counts, adds `held` and `recorded`, and sets `done`. A second `reviewed` returns false. An unpinned run returns false and changes nothing. |
+| `a no-change cycle is held and released` | `holdNoChange` on a goal run with `parentRunId` holds once, with receipts from the parent; after the verdict, `step` calls `consume` with the held member once and the state is `done`; `holdNoChange` then returns false. A run without `parentRunId` is not held. |
+| `a verdict without an evaluator is inconclusive and releases the run` | `no-independent-evaluator`, every eligible provider limited (`evaluator-unavailable`), an unreadable record, and a context over 1 MiB: each gives `done` with its reason, host criteria composed where the record reads, one skip event, and `reviewed` false next. |
+| `one replacement, then evaluator-unavailable` | `failed` on the current evaluator moves to `queued` with the profile excluded and one `replaced` event; the second evaluator's failure gives `done` with `evaluator-unavailable`. `failed` returns true for an evaluator that is not current and changes nothing. |
+| `a wrong report kind is a failure, never text` | `screen` turns a `review` report into a `blocked` report with fixed text, and `consume` then counts a failure. A `verdict` report's member keeps only the stub: no note and no handle. |
+| `a verdict never outlives its revision` | A new revision while `evaluating`: the completion writes nothing, `run.assessment` of the old revision is removed, and the next `reviewed` starts a new verdict. |
+| `record failures never hold the run` | A goal port whose write throws gives `written: "write-failed"` and one event; a log at its share gives `"log-full"`; in both, `run.assessment` is set and the state is `done`. |
+| `seeded verdicts with restarts compose each verdict once` | **Seeded:** 100 seeds, with the seed printed on failure. **The sequences** are random: holds, pass completions, prepares, reports, failures, new revisions, and restarts. A restart is a new `TeamVerdicts` over a JSON round trip of the holders and the goal record. **Invariants:** at most one `verdict.recorded` entry and one row event per verdict id; every state ends `done` or discarded; the final record equals the one from the same sequence without restarts. |
+| `every version rebuilds after random verdict writes` (verdict-rebuild) | **Seeded:** 200 seeds. **The writes** are random `verdictRecord`, `applyReceipts`, `applyProposals`, owner ops, and intent applies, with a JSON round trip between steps. **The check:** for each version, `rebuildVersion(final, v)` deep-equals the snapshot after the last write at `v`, checked by `version` and criteria count first; every snapshot parses. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/team-verdicts.test.ts tests/verdict-rebuild.test.ts` and the host typecheck. Confirm with `wc -l` that `team-verdicts.ts` is under 1,000 lines.
+
+### Task 12: the hooks in `teams.ts`
+
+**Files:** `packages/host/src/teams.ts` (17 lines in place, net 0), `tests/fixtures/team-agent.mjs` (the fake evaluator), `tests/verdict-host.test.ts` (create), `tests/autonomy-pins.test.ts` (one test). Needs Tasks 5, 8, 10, and 11. Task 12 is the only task that writes `teams.ts`.
+
+**Interfaces (produces):**
+```ts
+// teams.ts, by line on the reference tree (apply bottom-up; find each by its code). Every change stays on its line.
+// 62:   import { TeamRegister, … } from "./team-register.js"; import { TeamVerdicts, verdictPin, type VerdictState } from "./team-verdicts.js";
+// 189:  objectiveRecord?: unknown; objectiveNotice?: ObjectiveUnavailable; intentCheck?: IntentCheckState; register?: RegisterState; verdict?: VerdictState;
+// 244:  … delivery: [ … ], "intent-checker": ["intent-check"], evaluator: ["verdict"],
+// 370:  private readonly objectiveTests = new TeamRegister({ … }); readonly verdicts = new TeamVerdicts({ holder: id => this.records.get(id),
+//         prepare: (s, o, p) => this.prepareMember(s as Stored, "evaluator", undefined, undefined, o, p), consume: (s, m) => this.consume(s as Stored, m),
+//         operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m), save: s => this.save(s as Stored), event: (s, t) => this.event(s as Stored, t),
+//         emit: (s, d) => this.emitWith(s as Stored, "verdict.recorded", [d.verdictId], { revision: s.run.revision }, () => d),
+//         configured: run => this.config.projects.find(p => p.id === run.projectId)?.team?.checks ?? [], limited: () => this.limits.limited(),
+//         prefix: () => this.config.teams?.commandPrefix, register: this.objectiveTests, now: timestamp, uuid: randomUUID });          // one line
+// 551:  useGoalRecords(port: GoalRecordPort) { this.intentChecks.goals = port; this.objectiveTests.goals = port; this.verdicts.goals = port; }
+// 1223: if (registerPin({ … })) run.register = "on"; if (verdictPin({ evaluator: project.team.objective?.evaluator, register: project.team.objective?.register, mission: Boolean(internal?.missionId), handoff: Boolean(internal?.handoff) })) run.verdicts = "on";
+// 2483: if (this.intentChecks.failed(stored, member) || this.verdicts.failed(stored, member)) return;
+// 2567: if (this.intentChecks.step(stored) || this.verdicts.step(stored)) return;
+// 2593: if (run.review.verdict === "approved") { if (this.verdicts.reviewed(stored)) return;
+// 2737: member.report = member.role === "intent-checker" ? this.intentChecks.screen(stored, member, envelope.report) : member.role === "evaluator" ? this.verdicts.screen(stored, member, envelope.report) : envelope.report; …rest as today
+// 2777: if (this.intentChecks.failed(stored, member) || this.verdicts.failed(stored, member)) return;
+// 2826: if (this.intentChecks.failed(stored, member) || this.verdicts.failed(stored, member)) return;
+// 2882: … : role === "reviewer" || role === "evaluator" ? "reviewing" : …
+// 2891: const setup = role === "permission-coordinator" || role === "intent-checker" || role === "evaluator" ? undefined : run.establishChecks
+// 2980: const intentContext = member.role === "intent-checker" ? this.intentChecks.context(stored, member) : member.role === "evaluator" ? this.verdicts.context(stored, member) : undefined; if (intentContext === null) return;
+// 3058: if (member.role === "intent-checker") { this.intentChecks.consume(stored, member); return; } if (member.role === "evaluator") { this.verdicts.consume(stored, member); return; }
+// 3073: if (report.kind === "no-change") { if (this.verdicts.holdNoChange(stored, member)) return;
+```
+
+**Decisions:**
+
+- **One call per hook.** Each hook makes one call into `TeamVerdicts`. `teams.ts` reads nothing new from the store, a journal, or a sealed file.
+- **`verdicts` is public and read-only,** so the verdicts read (Task 14) reaches `detail` without a new method.
+- **The evaluator's working copy** is prepared at `run.headCommit`, as every member's is (`newMember`, line 2873). It gets no setup, no entry tools, no blackboard digest (the context replaces it at line 2982), and no GitHub grant.
+- **The views.** `run.verdicts` and `run.assessment` reach every view and relay device through the team view. `Stored.verdict` is outside `run` and reaches no view. The evaluator member's report in the view is the stub.
+- **The fake evaluator.** In `team-agent.mjs`, the `evaluator` role reads `verdict.json` from the agent's state directory when it exists and reports it; otherwise it reports every criterion in its context `met` with the first changed path as a handle. With `stall-evaluator`, it never reports.
+- **The evaluator's session transcript** holds its own text, as every member's does. Session reads keep their roles; this slice changes none.
+
+- [ ] **Step 1: Write the failing tests.** They run on `tests/fixtures/team-scheduler.ts` with the fake agent, the register on, and `teams.commandPrefix` as the fake prefix. Each test calls the service's `start()`.
+
+| Test name | Assertions |
+|---|---|
+| `acceptance 6 end to end` | Part 9's record on a standalone run; the project's checks hold `rank-verify`, whose final round fails. The fake evaluator reports every criterion `met`. The run settles `ready-for-review` after the verdict; `run.assessment.result` is `not-met`, `evaluatorResult` `met`; the record's log holds `evaluator-contradicted-receipt` on c4; one row event is in the outbox. |
+| `acceptance 11 end to end` | Acceptance 11's lineup; an implementer's work integrates. The evaluator member's `modelProfile` is the reviewer's profile; the row event has `alsoReviewed` true and `sharedFamily` false. |
+| `without verdicts a run is as today` | The same run without `run.verdicts`: no evaluator member, no `Stored.verdict`, no `assessment` and no `verdicts` key in `teams.get(id)`, no verdict event, and the settle as today. |
+| `a stalled evaluator is replaced once` | With `stall-evaluator`, the first evaluator stalls, one replacement starts, and after it stalls the run settles with `reason: "evaluator-unavailable"`. |
+| `an open fuse holds the verdict` | With the launch fuse open, no evaluator launches and the run stays held; after the fuse closes, the evaluator runs and the run settles. |
+| `evaluator text stays sealed` | The fake evaluator reports notes and handles carrying marker strings. None of the markers appears in `teams.get(id)`, the run's events, the outbox, the blackboard, the record's log, or a later delivery member's prompt and context file. The member's report in the view has empty `evidence`. |
+| `each new run pins verdicts by setting` (autonomy-pins) | `create()` pins `verdicts: "on"` only with `objective: { evaluator: "on", register: "on" }`. `createForMission()` and a handoff run never pin it. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/verdict-host.test.ts tests/autonomy-pins.test.ts tests/intent-check.test.ts tests/register-host.test.ts tests/objective-runs.test.ts` in the background, and the host typecheck. Confirm with `wc -l` that `teams.ts` is 3,578 lines.
+
+### Task 13: the hooks in `goals.ts`
+
+**Files:** `packages/host/src/goals.ts` (12 lines in place, net 0), `tests/fixtures/goal-agent.mjs` (the fake evaluator), `tests/verdict-goals.test.ts` (create). Needs Tasks 9 and 12. Task 13 is the only task that writes `goals.ts`.
+
+**Interfaces (produces):**
+```ts
+// goals.ts, by line on the reference tree (apply bottom-up; find each by its code). Every change stays on its line.
+// 8:   import { goalActionSchema, …, type GoalOutcomeInput, type ProductGoal } from "./goal-types.js";
+// 21:  import { objectivePromptsOn, objectiveRegisterOn } from "./objective-digest.js"; import { assertVerdictAnswer, continueGoal, criteriaRowsFor, cycleVerdict, provisionalStop, verdictFailed, CONTINUE_EVENT, PROVISIONAL_EVENT, PROVISIONAL_REASON } from "./goal-verdicts.js";
+// 571: outcome(id: string, input: GoalOutcomeInput) {
+// 578: assertVerdictAnswer(goal, body, Date.now()); this.admit(stored, "outcome", body);
+// 579: goal.outcomes.push({ result: body.result, summary: body.summary, evidence: body.evidence, at: now(), revision: goal.revision, ...(body.verdictId ? { verdictId: body.verdictId } : {}) });
+// 581: else if (body.continue) { const note = continueGoal(stored, body, now()); if (note) this.event(stored, note); } else if (goal.status === "achieved") goal.status = …as today…;
+// 582: this.event(stored, body.continue ? CONTINUE_EVENT : "A user recorded a product outcome with supporting evidence.");
+// 612: Object.assign(cycle, { status: team.status, …as today… }, cycleVerdict(stored.goal, cycle, team));
+// 795: const stop = provisionalStop(goal, team); goal.status = stop ? "ready-for-review" : "running"; goal.reason = stop ? PROVISIONAL_REASON : undefined; if (stop) goal.stopReason = "provisional-met";
+// 796: this.event(stored, stop ? PROVISIONAL_EVENT : "A feature passed checks and independent review. The next feature will use its recorded commit.");
+// 871: extendMinutes: …, ...(pinned && "digest" in pinned ? { record: pinned.digest } : {}), ...criteriaRowsFor(stored, project) };
+// 977: if (cycle.class === "failed" || verdictFailed(cycle)) goal.failedCycles = (goal.failedCycles ?? 0) + 1;
+```
+
+**Decisions:**
+
+- **The outcome route keeps its roles and its relay rule** (call 12). `continue` admits once: a replay of the same `requestId` and body answers the goal and writes nothing, as today.
+- **A provisional stop is a stop.** The goal is `ready-for-review`, so no cycle launches, and the owner records an outcome as today. Only `continue` or a new goal starts more work.
+- **The failure count** reads `verdictFailed` after `classifyCycle`. A reviewed or no-change cycle with a failing verdict counts as failed; `cycle.class` keeps its value, so `latestReviewed` and the next cycle's parent are unchanged.
+- **The next cycle's context** carries the rows only when `criteriaRowsFor` gives them. A launch replay carries the same rows, because the context is built before the launch is saved.
+- **The fake evaluator.** In `goal-agent.mjs`, the `evaluator` role reports from `verdict-<cycle>.json` in its state directory when it exists, else every criterion `met`.
+
+- [ ] **Step 1: Write the failing tests.** They run goal cycles with `goal-agent.mjs`, `objective: { evaluator: "on", register: "on", prompts: "on", intentCheck: "off" }`, an autonomous project, and the plan-brief flag file. Each test calls the service's `start()`.
+
+| Test name | Assertions |
+|---|---|
+| `acceptance 7: a provisional met stops the goal and continue resumes it` | A finite goal; cycle 1's verdict is `met`. The goal is `ready-for-review` with `stopReason: "provisional-met"`, never `achieved`, and holds one `PROVISIONAL_EVENT`. `outcome` with `not-achieved`, `continue`, and the cycle's `verdictId` sets it `running`; the record is one version up with direction `s<revision>`; cycle 2 starts, and its objective prints "User direction:" with the summary. `achieved` with the same `verdictId` sets `achieved`. |
+| `continue is refused outside a provisional stop` | `continue` on a goal stopped by its deadline gives 409 `goal-not-provisional`; past the deadline after a provisional stop, 409 `goal-limit-reached`; with an unknown `verdictId`, 409 `verdict-not-found`. Each leaves the goal, its receipts, and its events unchanged. |
+| `a standing goal records met and counts verdict failures` | A standing goal: a `met` verdict leaves it `running`, and the next cycle starts at its cadence. Three cycles with `not-met` verdicts and no progress pause it with `repeated-failures`; an owner resume resets the count. |
+| `acceptance 10 end to end` | Part 9's record; cycle 1's verdict has c2 `not-met`. Cycle 2's project manager prompt holds c2, `not-met`, and c2's check label with "Agent assessment, provisional", and no note, threshold, count, or profile. Cycle 2's implementer prompt holds no row. |
+| `a supervised goal shows the verdict and changes nothing` | A supervised goal with the same switches: `cycle.assessment` is set, a `met` does not stop the goal, no rows reach cycle 2, and the failure count is as today. |
+| `without verdicts a goal is as today` | Without `objective.evaluator`: no `assessment` on any cycle, no `stopReason: "provisional-met"`, cycle 2's context equal to today's, and `outcome` without `verdictId` as today. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/verdict-goals.test.ts tests/register-goals.test.ts tests/objective-goals.test.ts tests/standing-goals.test.ts` in the background, and the host typecheck. Confirm with `wc -l` that `goals.ts` is 1,042 lines.
+
+### Task 14: the verdicts read and the CLI
+
+**Files:** `packages/host/src/verdict-view.ts` (create), `packages/host/src/objective-routes.ts`, `packages/host/src/objective-cli.ts`, `tests/verdict-routes.test.ts` (create), `tests/objective-cli.test.ts`, `tests/remote-access.test.ts`. Needs Tasks 9 and 12.
+
+**Interfaces (produces):**
+```ts
+// verdict-view.ts: pure.
+export type GoalVerdictView = {
+  cycle: number; teamId: string; verdictId: string; kind: "reviewed" | "no-change"; head: string; at: string;
+  label: "Agent assessment, provisional";
+  result: AssessedState; evaluatorResult?: AssessedState; differs: boolean; reason?: VerdictReason; counts: VerdictCounts; progress: number;
+  owner?: { result: "achieved" | "not-achieved" | "inconclusive"; agrees?: boolean };   // the owner outcome with this verdictId
+  criteria: { id: string; producer: "host" | "evaluator" | "owner"; state: ComposedState; label: "host receipt" | "agent assessment" | "waiting for you";
+    reason?: CriterionReason; evaluatorState?: AssessedState; receipt?: { handle: string; outcome: ReceiptOutcome }; handles?: string[]; note?: string }[];
+  evaluator?: { profileId: string; family: string; sharedFamily: boolean; alsoReviewed: boolean };
+  detail: "available" | "expired";                       // expired: the run's record is gone; only the cycle's summary remains
+};
+export function goalVerdictsView(goal: ProductGoal, details: (teamId: string) => VerdictDetail | undefined): { verdicts: GoalVerdictView[] };
+
+// objective-routes.ts: services.goals gains "get"; services.teams gains "verdicts".
+//   app.get("/api/goals/:id/verdicts", read, (req, res) => res.json(goalVerdictsView(services.goals.get(recordId(req.params.id)), id => services.teams.verdicts.detail(id))));
+// objective-cli.ts: `infinite goal verdicts ID [--json]`, through handleGoalClientCommand; the text form prints one block per cycle.
+```
+
+**Decisions:**
+
+- **Roles.** The read is for owner, controller, and viewer devices, as the record read is. The relay refuses it (`remote-access.ts` line 49 has no `verdicts` branch); no relay code changes.
+- **Agreement** is `met` with `achieved` or `not-met` with `not-achieved`; any other pair leaves `agrees` absent.
+- **Cost.** One goal view and at most 50 in-memory `detail` calls. No store, journal, or sealed-file read.
+- **The CLI's text** labels the result "Agent assessment, provisional" and each criterion by its label; it prints notes only with `--json`.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `the verdicts read joins cycles, details, and owner answers` (verdict-routes) | Two cycles with assessments, one run gone: the first view has its criteria with notes and handles; the second has `detail: "expired"` and the summary only. An owner outcome with the first `verdictId` and `not-achieved` on a `not-met` verdict gives `agrees: true`. `differs` is true when `evaluatorResult` differs from `result`. |
+| `the verdicts read keeps the record roles` (verdict-routes) | Owner, controller, and viewer devices get 200; an unknown goal gets 404. |
+| `the relay refuses the verdicts read` (remote-access) | `GET /api/goals/<uuid>/verdicts` is refused through the relay. |
+| `goal verdicts prints the labels` (objective-cli) | The text form holds "Agent assessment, provisional", each criterion's label, and no note; `--json` prints the response. |
+
+- [ ] **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/verdict-routes.test.ts tests/objective-cli.test.ts tests/remote-access.test.ts` and the host typecheck.
+
+### Task 15: the goal page and the phone's goal screen
+
+**Files:** `apps/web/src/api.ts`, `apps/web/src/goals.tsx`, `apps/mobile/src/api/client.ts`, `apps/mobile/src/features/teams/GoalDetail.tsx`. Needs Task 1; it builds on this plan's fixed shapes (`GoalAssessment`, `GoalVerdictView`, `GoalOutcomeInput`) and may start beside Task 9.
+
+**Decisions:**
+
+- **Each cycle with an assessment** shows "Agent assessment, provisional", the result, the four counts, and, when they differ, the evaluator's own result. The owner's outcome shows as "Your assessment" and is the only source of `achieved`.
+- **A goal stopped by `provisional-met`** shows its reason and two actions: "Achieved", and "Not achieved, continue", which takes the summary and sends `continue` with the newest `verdictId`.
+- **The criteria rows** come from `GET /api/goals/:id/verdicts` on demand, when the owner opens a cycle; the list view reads nothing new.
+- **The Mac app** is not in this slice.
+
+- [ ] **Step 1: Write the failing tests.** Web: the goal page renders the assessment and the two actions from a mock API. Phone: the goal screen's model renders the same from a fixture. **Step 2: Run and confirm they fail.** **Step 3: Implement.** **Step 4: Run** the web build, `npm run lint -w @infinite/mobile`, and `npx tsc --noEmit` in `apps/mobile`.
+
+### Task 16: the docs and the spec
+
+**Files:** `docs/teams.md`, the spec. Runs last; the contract is fixed in this plan.
+
+**Decisions:**
+
+- **`docs/teams.md`, in the goal record section, covers:**
+  - **The setting:** `objective.evaluator`, off by default, inside the routine approval digest, needing `objective.register`; the pin at `createRun`.
+  - **The evaluator:** when it runs, the hold, the rule for its profile, what it reads, what it reports, its limits, and its failures.
+  - **Composition:** the rule table and the result.
+  - **Goals:** the provisional stop, `continue`, the failure count, and the criteria rows.
+  - **Reads:** the API, the CLI, and what relay devices see.
+  - **Rollback:** the steps from this section's rollback row.
+- **The spec:**
+  - **Part 5:** the hold before settle; the default (call 1, as ruled); `latest` without notes; the rows' channel (call 13, as ruled); `continue` as steering; agreement deferred (call 14, as ruled); `merged` and `landed` (call 8, as ruled).
+  - **Part 8:** the coordinator reads the rows from `TeamGoalContext.criteria` until C17 wires its digest.
+  - **The delivery order and "Left to the builder":** the router question answered "no change" (call 15).
+
+- [ ] **Step 1: Amend the docs and the spec.** **Step 2: Run** the privacy scan of `AGENTS.md` over the diff.
+- [ ] **Step 3: After every task, the coordinator runs `npm run check` once on the integrated branch, requests the independent review, and commits.**
+
+## Not in this slice
+
+- **`until-met` standing goals** and acceptance 7's `until-met` half (continuous autonomy delivery step 5).
+- **C17's goal digest:** history, touched paths, failures, decisions, open items, and moving the rows into it.
+- **The owner's agreement in `objective_verdicts`** and the per-profile agreement cell (call 14).
+- **The outcome ledger's goal roll-up** showing the latest agent assessment.
+- **The lineup warning** in the enrollment view and `repo init` (call 16).
+- **The router avoiding `evaluators` profiles** for a cycle's tasks (call 15).
+- **`merged` and `landed` receipts at the verdict** (call 8).
+- **Citation handles and the `citations` and `citation-form` criteria** (delivery step 7).
+- **Rubric items beyond `owner-text` and `method-applied`,** and rubric versions above 1.
+- **`objective_log` overflow** for records whose log reaches its share.
+- **C18 attention events** and the daily digest's verdict items.
+- **The Mac app's verdict display.**
+- **Follow-ups** (delivery step 6) and **finding measures** (delivery step 7).

@@ -275,7 +275,7 @@ sudo -u infinite-host -- sudo -n -u infinite-eval -- /usr/local/libexec/infinite
 pgrep -u infinite-eval -l sleep                                # prints nothing
 ```
 
-`stop` also removes the account's System V shared memory, semaphores, and message queues, and its files in `/tmp`, `/var/tmp`, `/dev/shm`, `/dev/mqueue`, `/run/lock`, and `/var/crash`. After it, `ipcs` lists no object owned by the account, and `sudo find /tmp /var/tmp /dev/shm /dev/mqueue /run/lock /var/crash -xdev -user infinite-eval` prints nothing.
+`stop` also removes the account's System V shared memory, semaphores, and message queues, and its files in `/tmp`, `/var/tmp`, `/dev/shm`, `/dev/mqueue`, `/run/lock`, and `/var/crash`. After it, `ipcs` lists no object owned by the account, and `sudo find /tmp /var/tmp /dev/shm /dev/mqueue /run/lock /var/crash -xdev -user infinite-eval 2>/dev/null` prints nothing (the redirection hides the error for a directory that the host does not have).
 
 Clean. Plant a file in the temporary directory and remove it with `clean`:
 

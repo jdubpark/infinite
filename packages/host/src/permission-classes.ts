@@ -635,46 +635,11 @@ function embeddedCommand(request: PermissionRequest, reading: RequestReading, fa
   return unread ? "unread" : undefined;
 }
 
-/** At most this many line breaks of a screen dialog's command are read as possible screen wraps. */
-export const WRAP_READING_LIMIT = 16;
-
-/**
- * A screen dialog shows its command wrapped to the terminal's width, and the screen does not say which line
- * breaks are the command's own. The other readings of a dialog command with line breaks: every break a word
- * wrap (a space), and each single break a cut inside a long word (nothing) with the others word wraps.
- * Undefined when the command has more breaks than the limit. A tool request carries its own text, so it has none.
- */
-export function wrapReadings(request: PermissionRequest): string[] | undefined {
-  if (request.tool !== "dialog" || request.input !== undefined) return [];
-  const lines = request.action.split("\n");
-  if (lines.length - 1 > WRAP_READING_LIMIT) return undefined;
-  const joined = (cut: number) => lines.reduce((text, line, index) => text + (index === cut ? "" : " ") + line);
-  return lines.length === 1 ? [] : [joined(-1), ...lines.slice(1).map((_, index) => joined(index + 1))];
-}
-
 /**
  * The raise rules that match. They only select the strong tier for a fresh turn. `facts` are the host
- * facts the class rules use, for the embedded-command rule. A rule or a class rule that matches only a
- * wrap reading of a screen dialog is raised as `raise:wrapped-<rule>`; the class decision stays with the shown text.
+ * facts the class rules use, for the embedded-command rule.
  */
 export function raise(request: PermissionRequest, context: { rejectHistory: boolean }, reading = readRequest(request), facts: HostRuleFacts = {}): string[] {
-  const raised = raiseRules(request, context, reading, facts);
-  const wraps = wrapReadings(request);
-  if (wraps === undefined) return [...raised, "raise:wrapped-unread"];
-  for (const action of wraps) {
-    const wrapped = { ...request, action };
-    const wrappedReading = readRequest(wrapped, reading.resolve);
-    const found = raiseRules(wrapped, context, wrappedReading, facts);
-    if (CLASS_RULES.some(rule => rule.test(wrapped, wrappedReading, facts, false))) found.push("raise:class-rule");
-    for (const rule of found) {
-      const name = rule.replace(/^raise:/, "raise:wrapped-");
-      if (!raised.includes(rule) && !raised.includes(name)) raised.push(name);
-    }
-  }
-  return raised;
-}
-
-function raiseRules(request: PermissionRequest, context: { rejectHistory: boolean }, reading: RequestReading, facts: HostRuleFacts): string[] {
   const raised: string[] = [];
   const words = reading.commands.flatMap(command => command.words);
   const text = `${request.tool}\n${request.action}\n${safeJson(request.input ?? {})}`;
@@ -703,6 +668,9 @@ function raiseRules(request: PermissionRequest, context: { rejectHistory: boolea
   const embedded = reading.shell ? embeddedCommand(request, reading, facts) : undefined;
   if (embedded === "found") raised.push("raise:embedded-command");
   if (reading.opaque || embedded === "unread" || reading.unresolved.length > 0 || (!reading.shell && !KNOWN_TOOLS.test(request.tool))) raised.push("raise:opaque");
+  // A screen dialog shows its command wrapped to the terminal's width, and the screen does not say which line
+  // breaks are the command's own. Any reading of such a command is a guess, so the light tier never decides it.
+  if (request.tool === "dialog" && request.input === undefined && request.action.includes("\n")) raised.push("raise:wrapped-dialog");
   if (context.rejectHistory) raised.push("raise:reject-history");
   return raised;
 }

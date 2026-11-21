@@ -117,28 +117,23 @@ test("each interrupt class routes a concrete request through a class rule, and n
   assert.equal(classify(bash("gh auth login"), CLASSES.filter(name => name !== "credentials")), undefined);
 });
 
-test("a screen dialog's command is also read as if its line breaks were screen wraps, and what that reading finds raises the request", async () => {
+test("a screen dialog's command that spans more than one line is raised, because the screen does not say which breaks are wraps", async () => {
   // A dialog without tool evidence carries only the command as the screen showed it, one screen line per line.
   const dialog = (action: string) => caseRequest(item({ tool: "dialog", action }));
   const raised = (action: string) => raise(dialog(action), { rejectHistory: false });
 
   // INF-313: a fetch from another run's checkout, wrapped once at a space and once inside the long path.
   const fetch = "git fetch --no-tags\n/home/dev/projects/sample-runs/form-fix-41a7\nb2/integration abc1234";
-  assert.deepEqual(raised(fetch.replaceAll("\n", " ")), ["raise:outside-root"], "the same command on one line");
-  assert.deepEqual(raised(fetch), ["raise:wrapped-outside-root"]);
-  // A cut that lands exactly at the end of the session root: only the joined word is outside it.
-  assert.deepEqual(raised(`cat ${ROOT}\n-old/notes.txt`), ["raise:wrapped-outside-root"]);
-  // A command that a class rule names only once its lines are joined raises the request. The owner is not interrupted by a guess.
+  assert.deepEqual(raised("git fetch --no-tags /home/dev/projects/sample-runs/form-fix-41a7b2/integration abc1234"), ["raise:outside-root"], "the same command on one line");
+  assert.deepEqual(raised(fetch), ["raise:wrapped-dialog"]);
+  // A wrap may hide a class rule too. The class decision stays with the shown text, so a guess never interrupts the owner.
   assert.equal(classify(dialog("npm\nlogin"), CLASSES), undefined);
-  assert.ok(raised("npm\nlogin").includes("raise:wrapped-class-rule"));
-  // A rule the shown text already matched is not repeated.
-  assert.deepEqual(raised("cat /etc/hosts\n/etc/hostname"), ["raise:outside-root"]);
-  // A routine command that wraps inside the session root raises nothing.
-  assert.deepEqual(raised("npx vitest run src/components/address-form\n.test.tsx --reporter verbose"), []);
-  // A tool request carries its own line breaks, so it is read only as given.
+  assert.deepEqual(raised("npm\nlogin"), ["raise:wrapped-dialog"]);
+  // A routine command on one line raises nothing; the same command wrapped is raised.
+  assert.deepEqual(raised("npx vitest run src/components/address-form.test.tsx --reporter verbose"), []);
+  assert.deepEqual(raised("npx vitest run src/components/address-form\n.test.tsx --reporter verbose"), ["raise:wrapped-dialog"]);
+  // A tool request carries its own text, line breaks included, so it is read as given.
   assert.deepEqual(raise(bash("cd src\n/usr/bin/make"), { rejectHistory: false }), []);
-  // A command with more line breaks than the host reads this way is raised without being read.
-  assert.deepEqual(raised(Array.from({ length: 18 }, (_, index) => `echo line-${index}`).join("\n")), ["raise:wrapped-unread"]);
 
   // The raised fetch never gets a light verdict.
   const fake = fakeLauncher(turn => turn.tier === "light" ? { verdict: "allow", note: "Fine." } : { verdict: "reject", code: "outside-workspace", note: "Another run." });

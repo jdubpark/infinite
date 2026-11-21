@@ -2408,12 +2408,10 @@ Each request passes these steps in order:
    reaches outside the session's directory, uses a release verb or a push,
    needs privilege, names a credential or a payment, changes a settings file,
    installs globally, cannot be read by the host, or follows a reject in the
-   same assignment. A screen dialog shows its command wrapped to the
+   same assignment. A screen dialog whose command spans more than one line is
+   raised too (`raise:wrapped-dialog`): the dialog wraps the command to the
    terminal's width and does not say which line breaks are the command's own,
-   so the host also reads the command with each break as a wrap point. A rule
-   or a class rule that only such a reading matches raises the request as
-   `raise:wrapped-<rule>`; it never sends the request to the owner by itself.
-   A dialog command with more than 16 line breaks is raised unread. The
+   so a path or a command cut across lines is not one the host can read. The
    strong model comes from a model family other than the
    requester's. It allows the request, rejects it with a reason code, or names
    the owner with a class.

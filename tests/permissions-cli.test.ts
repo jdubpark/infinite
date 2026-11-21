@@ -83,6 +83,8 @@ test("a replay start or poll that the host does not answer in time is asked agai
       async json<T>(path: string, body?: unknown): Promise<T> {
         if (path === "/permissions/status") return { readiness: { ready: false, reasons: [] } } as T;
         if (path === "/permissions/replays") { starts.push(body as { requestId: string }); return start(starts.length) as T; }
+        assert.equal(path, `/permissions/replays/${job.id}`);
+        assert.equal(body, undefined, "a poll is a read");
         return poll(++polls) as T;
       },
     };
@@ -104,8 +106,11 @@ test("a replay start or poll that the host does not answer in time is asked agai
   assert.equal(busy.starts[1].requestId, busy.starts[0].requestId);
   assert.deepEqual(JSON.parse(printed.join("\n")), { cases: 1 });
 
-  // An answer that refuses the start is not asked again.
+  // An answer that refuses the start is not asked again, and neither is a failure other than a timeout.
   const refusing = fakeHost(() => { throw new Error("Host returned HTTP 409."); }, () => assert.fail("no poll"));
   await assert.rejects(replay(refusing.api), /HTTP 409/);
   assert.equal(refusing.starts.length, 1);
+  const redirected = fakeHost(() => { throw new TypeError("fetch failed"); }, () => assert.fail("no poll"));
+  await assert.rejects(replay(redirected.api), /fetch failed/);
+  assert.equal(redirected.starts.length, 1);
 });

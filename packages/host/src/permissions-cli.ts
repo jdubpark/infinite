@@ -98,9 +98,9 @@ const REPLAY_POLL_MS = 2_000;
 /** How long the CLI keeps asking a host that does not answer a replay start or poll, from its last answer. */
 const REPLAY_CONTACT_MS = 120_000;
 
-/** A request the host did not answer in time, or a connection that failed. The host may still have acted on it. */
+/** A request the host did not answer in time. The host may still have acted on it. */
 function unanswered(error: unknown): boolean {
-  return (error as { name?: unknown } | null)?.name === "TimeoutError" || error instanceof TypeError;
+  return (error as { name?: unknown } | null)?.name === "TimeoutError";
 }
 
 const stringOption = (options: Options, name: string) => {
@@ -333,7 +333,7 @@ export async function handlePermissionsClientCommand(positional: string[], optio
         } catch (error) {
           if (!unanswered(error)) throw error;
           if (Date.now() - answered >= REPLAY_CONTACT_MS)
-            throw new Error(`The host did not answer for ${REPLAY_CONTACT_MS / 60_000} minutes. The replay may still run: run this command again with --request-id ${requestId} to follow it.`);
+            throw new Error(`The host did not answer for ${REPLAY_CONTACT_MS / 60_000} minutes. The replay may still run: run this command again with --request-id ${requestId} to follow it. If the host restarted meanwhile, that starts the replay again.`);
           await delay(REPLAY_POLL_MS);
         }
       }

@@ -1286,19 +1286,27 @@ applies to every such steer, whether or not review feedback (below) is switched 
 
 - The run counts as delivered only at the revision its pull request records. After
   the steer, member recovery and the other rules of a working run apply again.
-- Each new integrated head is published to a checkpoint branch
-  `<run branch>-<first 8 hex characters of the commit>`, never to the pull
-  request's branch. Checkpoint branches are not removed.
-- Delivery pushes the reviewed head to the pull request's recorded branch as a
-  fast-forward from the delivered head, after the checks and the independent
-  review pass, and reports the same pull request URL.
+- The steer removes an active delivery recovery record and keeps the number of
+  delivery recoveries already used, so that limit stays cumulative.
+- When head publication (`teams.publishHeads`) is on, each new integrated head is
+  published to a checkpoint branch `<run branch>-<first 8 hex characters of the
+  commit>`, never to the pull request's branch. Checkpoint branches are not
+  removed.
+- Delivery pushes the reviewed head to the pull request's recorded branch, after
+  the checks and the independent review pass. The remote branch must be unchanged
+  or move by fast-forward from the delivered head or from this run's earlier
+  repair heads. Delivery reports the same pull request URL.
 - The host refuses a delivery report that names another pull request, and the
   `no-publication` and `owned-branch` dispositions.
 - When the delivery of a continued revision fails, the run blocks for the owner
   without automatic delivery recovery.
-- A pull request recorded before the host kept its branch has no recorded branch.
-  A steer on that run is refused with `delivery-branch-unknown` until review
-  feedback reads the branch from GitHub; the host never guesses it.
+- A pull request recorded before the host kept its branch has no recorded branch,
+  and the host does not infer one. A new steer on that run is refused with
+  `delivery-branch-unknown`. A run that was already continued from such a record
+  blocks at delivery with the same code instead of delivering. Only review
+  feedback's read of GitHub records the branch, and only while the run waits for
+  review at its delivered revision. With review feedback off, such a run refuses
+  every new steer and never gets its branch recorded; start a new run instead.
 
 With `github.reviewFeedback` switched on, the owner's changes-requested review of
 that pull request steers the run the same way, once per review. Only the review

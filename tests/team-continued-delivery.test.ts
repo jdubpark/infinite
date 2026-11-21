@@ -59,6 +59,9 @@ test("a steer on a delivered pull request recovers a blocked member, publishes o
     assert.deepEqual([delivery.branch, delivery.head, delivery.continued], [branch, view.headCommit, true], "delivery pushes to the pull request's own branch");
     assert.ok(delivery.prompt.includes(`This run continues its pull request ${PULL_REQUEST} on branch ${branch}`));
     assert.ok(delivery.prompt.includes(`${checkpoint} as a checkpoint`));
+    assert.ok(delivery.prompt.includes(`If the branch exists, allow only an unchanged head or a fast-forward from a head recorded for this run, its earlier repair heads or the head it delivered to its pull request: ${JSON.stringify([first])}.`),
+      "one push rule names the delivered head");
+    assert.ok(!delivery.prompt.includes("a fast-forward from an earlier repair head recorded for this run"));
     assert.ok(!delivery.prompt.includes('report the "no-publication" disposition.'), "the prompt does not offer clean-base recovery");
 
     writeFileSync(join(f.receipts, "delivery-continued-release"), "continue");

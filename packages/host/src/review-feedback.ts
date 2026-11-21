@@ -74,8 +74,8 @@ export function pullRequestViewArgs(target: { repository: string; number: number
 
 /**
  * A run whose pull request the host reads: delivered as a `pr` at its current revision, ready for review, its workspace
- * still present, and not owned by a goal, a handoff, or a replay. Mission runs wait for the mission's destination
- * (build step 4), so the first build leaves them out.
+ * still present, and not owned by a goal, a handoff, or a replay. Routines start goals, so their runs are left out too.
+ * Mission runs wait for the mission's destination (build step 4), so the first build leaves them out.
  */
 export function watchedRun(run: TeamRun, intake?: ReviewIntake) {
   return run.status === "ready-for-review" && run.delivery?.mode === "pr" && run.pullRequest?.revision === run.revision &&
